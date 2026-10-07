@@ -32,6 +32,39 @@ documented end to end in [docs/DEPLOY.md](docs/DEPLOY.md).
   URLs are now joined by concatenation, so `rabbitUrl` may carry a sub-path.
 - **`rabbitUrl` was not validated.** A URL carrying a query string or fragment
   silently produced wrong endpoints; it now fails at startup, naming the setting.
+- **Work dispatched while a machine's event stream was down was lost forever.**
+  An offer is a single event. If it was published in the window after a relay
+  restart but before the machines re-attached their streams, nothing ever
+  re-delivered it: the lease sat at `offered` until the sweep expired it, while
+  both machines reported `online=true` and idle. The relay now re-delivers every
+  unclaimed (`queued`/`offered`) lease when a stream attaches — `running` is
+  excluded so a task that has already begun can never be handed out twice.
+- **The re-delivery path itself was broken and had never run.** It called
+  `this.logger(...)` unconditionally — where `logger: null` is the documented
+  "quiet" setting — after the response headers were already sent, so the
+  `TypeError` was caught by the top-level handler, which then tried to answer a
+  second time and produced `Cannot write headers after they are sent`. Any
+  reconnect with pending work destroyed the event stream. Logging now goes
+  through a call that tolerates a missing, null or throwing logger, and an error
+  raised after headers are out ends the stream and records the stack instead of
+  attempting a second response. The previous behaviour is also why the original
+  bug hid for so long: the secondary error masked the real one.
+- **A cursor from a previous relay process silently swallowed events.** Sequence
+  numbers restart at 0, so an agent reconnecting with `Last-Event-ID: 42` made
+  the new process believe those events had been consumed — dropping not only the
+  offer but every `task.cancel` and `notice` in that range. The relay now
+  recognises a cursor beyond its own last sequence, reports
+  `REPLAY_TRUNCATED` (with `reason: cursor_ahead_of_relay`) and re-aligns the
+  replay to the head of its window; the agent no longer sends a cursor that was
+  issued by a different relay process, and re-attaches without one instead.
+  > A delivery guarantee must come from re-delivery, which is cursor-independent.
+  > Desynchronisation detection is a diagnostic, not a safety net: the
+  > `from > lastSeq + 1` test was shown to miss a stale cursor once a few events
+  > filled the gap.
+- **`last_available_seq` and `oldest_available_seq` described different
+  windows** — one counted the un-buffered `ready` frame — so a client computing
+  its re-alignment point from them could land in the wrong place. Both now use
+  the ring-buffer window.
 
 ### Added
 
@@ -76,6 +109,19 @@ documented end to end in [docs/DEPLOY.md](docs/DEPLOY.md).
   the operator token, which is called out under Breaking.
 - A 0.0.1 client can still pair, take work and report results against a 0.1.2
   relay. It cannot submit tasks, because it does not know about operator tokens.
+
+### Verification
+
+315 tests, 314 pass, 1 skip (POSIX mode bits are meaningless on NTFS):
+relay 91, agent 105, plugin 73, end-to-end + crossnetwork 46. CI runs the matrix
+on Windows (node 20 and 22), macOS and Linux, plus a job proving the release
+artifact is reproducible from source.
+
+The lost-offer bug above is covered by a regression test that reproduces the
+exact sequence — stream attached, relay killed, task dispatched into the gap,
+stream reconnecting with a stale cursor — and asserts the offer arrives. It is
+deliberately not a timing-dependent test: the window it exercises is the one that
+was broken.
 
 ## [0.0.1] — 2026-10-07
 

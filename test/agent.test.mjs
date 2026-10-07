@@ -91,6 +91,7 @@ import {
   backoffDelay,
   buildEnvelope,
   createAgent,
+  cursorUsableFor,
   evaluateGate,
   matchAllowedCommand,
   parseAllowedCommands,
@@ -1023,6 +1024,13 @@ async function startFakeRabbit({ basePath = '' } = {}) {
     streams: [],
     receivedTokens: [],
     paths: [],
+    /**
+     * One entry per SSE attach, recording exactly what the agent sent, so a test
+     * can assert on the cursor it did (or did not) resume from (task-18).
+     *
+     * @type {Array<{seq: string|null, lastEventId: string|null, url: string}>}
+     */
+    attaches: [],
   };
 
   const server = createServer((request, response) => {
@@ -1049,6 +1057,11 @@ async function startFakeRabbit({ basePath = '' } = {}) {
       const pathname = basePath === '' ? url.pathname : url.pathname.slice(basePath.length);
 
       if (pathname === '/v1/stream') {
+        state.attaches.push({
+          seq: url.searchParams.get('seq'),
+          lastEventId: request.headers['last-event-id'] ?? null,
+          url: request.url,
+        });
         response.writeHead(200, {
           'content-type': 'text/event-stream',
           'cache-control': 'no-cache',
@@ -1698,12 +1711,19 @@ describe('cross-network reconnection (v0.1.2 §8)', () => {
       assert.equal(agent.state.seq, cursorBefore, 'an unchanged relay_id must not reset the cursor');
       assert.equal(agent.state.relayIdChanges, 0);
 
-      // A restarted relay numbers events from 1 again: adopt the new position.
+      // A restarted relay numbers events from 1 again: the cursor is **discarded**
+      // (not adopted), and the stream it was sent on is dropped in favour of a
+      // cursor-less attach -- see the task-18 cases below.
       second.close();
       const third = await rabbit.stream();
       third.send('ready', { protocol_version: 1, relay_id: 'relay-B', seq: 1, machine_id: 'rabbit' });
       await waitFor(() => agent.state.relayIdChanges === 1, { label: 'relay restart detected' });
-      assert.equal(agent.state.seq, 1, 'a new relay_id must reset the seq cursor');
+      assert.equal(
+        agent.state.seq,
+        0,
+        'a new relay_id must discard the seq cursor rather than adopt the ready frame position',
+      );
+      assert.equal(agent.state.cursorRelayId, null, 'a discarded cursor has no owning relay');
       assert.equal(agent.state.relayId, 'relay-B');
       assert.ok(
         logs.some((entry) => entry.level === 'warn' && /relay restarted/.test(entry.message)),
@@ -1944,6 +1964,233 @@ describe('cross-network reconnection (v0.1.2 §8)', () => {
       agent.stop();
       await running;
       await new Promise((resolve) => server.close(resolve));
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// task-18: the event cursor belongs to one relay process
+// ---------------------------------------------------------------------------
+
+describe('event cursor lifecycle across relay restarts (task-18)', () => {
+  it('sends the cursor only when it is usable', () => {
+    // Nothing to resume.
+    assert.equal(cursorUsableFor({ seq: 0, cursorRelayId: null, relayId: null }), false);
+    assert.equal(cursorUsableFor({ seq: 0, cursorRelayId: 'A', relayId: 'A' }), false);
+    assert.equal(cursorUsableFor({}), false);
+    // A pre-v0.1.2 relay sends no relay_id: there is nothing to compare against,
+    // so the v1 resume behaviour is kept.
+    assert.equal(cursorUsableFor({ seq: 7, cursorRelayId: null, relayId: null }), true);
+    // Same relay: resume, or every reconnect becomes a full replay.
+    assert.equal(cursorUsableFor({ seq: 7, cursorRelayId: 'A', relayId: 'A' }), true);
+    // Different relay process: the cursor means nothing to it.
+    assert.equal(cursorUsableFor({ seq: 7, cursorRelayId: 'A', relayId: 'B' }), false);
+    // The relay identifies itself but the cursor predates that identity.
+    assert.equal(cursorUsableFor({ seq: 7, cursorRelayId: null, relayId: 'B' }), false);
+  });
+
+  it('still resumes from the cursor when relay_id is unchanged', async () => {
+    const rabbit = await startFakeRabbit();
+    const project = await makeRepo('cursor-same-relay');
+    /** @type {object|null} */
+    let agent = null;
+    /** @type {Promise<void>|null} */
+    let running = null;
+    try {
+      agent = makeAgent({
+        rabbit: rabbit.url,
+        project,
+        allowed: [['node', '-e']],
+        once: false,
+        name: 'cursor-same',
+      });
+      running = agent.start();
+      const first = await rabbit.stream();
+      first.send('ready', { protocol_version: 1, relay_id: 'relay-S', machine_id: 'rabbit' });
+      await waitFor(() => agent.state.cursorRelayId === 'relay-S', { label: 'cursor attributed' });
+      first.send('peer.hello', { machine_id: 'peer-1' });
+      first.send('peer.hello', { machine_id: 'peer-2' });
+      await waitFor(() => agent.state.seq >= 3, { label: 'cursor advanced' });
+
+      assert.equal(rabbit.state.attaches.length, 1);
+      assert.equal(rabbit.state.attaches[0].lastEventId, null, 'nothing to resume on a first attach');
+      assert.equal(rabbit.state.attaches[0].seq, null);
+
+      // Same relay, new socket (proxy idle timeout): the cursor MUST be sent.
+      first.close();
+      const second = await waitFor(() => rabbit.state.attaches[1] ?? null, { label: 'second attach' });
+      assert.equal(second.lastEventId, '3', 'an unchanged relay_id must still resume');
+      assert.equal(second.seq, '4', 'and must still ask for the next seq');
+      assert.equal(agent.state.relayIdChanges, 0);
+    } finally {
+      // A leaked running agent keeps reconnecting on a timer and would keep the
+      // whole test process alive forever.
+      agent?.stop();
+      if (running) await running.catch(() => {});
+      await rabbit.close();
+    }
+  });
+
+  it('discards the cursor and re-attaches without one when relay_id changes', async () => {
+    const rabbit = await startFakeRabbit();
+    const project = await makeRepo('cursor-new-relay');
+    const logs = [];
+    /** @type {object|null} */
+    let agent = null;
+    /** @type {Promise<void>|null} */
+    let running = null;
+    try {
+      agent = makeAgent({
+        rabbit: rabbit.url,
+        project,
+        allowed: [['node', '-e']],
+        once: false,
+        name: 'cursor-new',
+        logs,
+      });
+      running = agent.start();
+      const first = await rabbit.stream();
+      first.send('ready', { protocol_version: 1, relay_id: 'relay-1', machine_id: 'rabbit' });
+      await waitFor(() => agent.state.cursorRelayId === 'relay-1', { label: 'cursor attributed' });
+      first.send('peer.hello', { machine_id: 'peer-1' });
+      first.send('peer.hello', { machine_id: 'peer-2' });
+      first.send('peer.hello', { machine_id: 'peer-3' });
+      await waitFor(() => agent.state.seq >= 4, { label: 'cursor advanced' });
+
+      // The process behind the URL is replaced. Until `ready` arrives we cannot
+      // know, so this attach still carries the old cursor -- that is precisely
+      // the window the fix closes.
+      first.close();
+      const doomed = await waitFor(() => rabbit.state.attaches[1] ?? null, { label: 'attach to relay-2' });
+      assert.equal(doomed.lastEventId, '4', 'context: the doomed attach still carried the old cursor');
+
+      const second = await rabbit.stream();
+      second.send('ready', { protocol_version: 1, relay_id: 'relay-2', seq: 1, machine_id: 'rabbit' });
+
+      // The agent must throw that stream away and attach again with no cursor at
+      // all, so relay-2 replays from its own beginning (its seq 1 offer).
+      const fresh = await waitFor(() => rabbit.state.attaches[2] ?? null, {
+        label: 'cursor-less re-attach',
+      });
+      assert.equal(fresh.lastEventId, null, 'a restarted relay must not receive the old cursor');
+      assert.equal(fresh.seq, null, 'and must not be asked for a seq from the old process');
+      assert.equal(agent.state.relayIdChanges, 1);
+      assert.equal(agent.state.relayId, 'relay-2');
+      assert.equal(agent.state.seq, 0, 'the cursor is discarded, not adopted');
+      assert.equal(agent.state.cursorRelayId, null);
+      assert.ok(
+        logs.some(
+          (entry) =>
+            entry.level === 'warn' &&
+            /discarding seq cursor and re-attaching without one/.test(entry.message),
+        ),
+        `the discard must be visible in the log: ${logs.map((entry) => entry.message).join(' | ')}`,
+      );
+    } finally {
+      agent?.stop();
+      if (running) await running.catch(() => {});
+      await rabbit.close();
+    }
+  });
+
+  it('re-attaches with no cursor on the very next attempt, and then resumes the new relay', async () => {
+    const rabbit = await startFakeRabbit();
+    const project = await makeRepo('cursor-new-relay-resume');
+    /** @type {object|null} */
+    let agent = null;
+    /** @type {Promise<void>|null} */
+    let running = null;
+    try {
+      agent = makeAgent({
+        rabbit: rabbit.url,
+        project,
+        allowed: [['node', '-e']],
+        once: false,
+        name: 'cursor-new-resume',
+      });
+      running = agent.start();
+      const first = await rabbit.stream();
+      first.send('ready', { protocol_version: 1, relay_id: 'relay-X', machine_id: 'rabbit' });
+      await waitFor(() => agent.state.cursorRelayId === 'relay-X', { label: 'cursor attributed' });
+      first.send('peer.hello', { machine_id: 'peer-1' });
+      first.send('peer.hello', { machine_id: 'peer-2' });
+      await waitFor(() => agent.state.seq >= 3, { label: 'cursor advanced' });
+
+      first.close();
+      const second = await rabbit.stream();
+      second.send('ready', { protocol_version: 1, relay_id: 'relay-Y', seq: 1, machine_id: 'rabbit' });
+
+      // Wait for the cursor-less re-attach rather than for "a stream": the
+      // server-side close of the dropped stream is asynchronous, so polling for
+      // a new attach is the only race-free signal.
+      const fresh = await waitFor(() => rabbit.state.attaches[2] ?? null, {
+        label: 'cursor-less re-attach',
+      });
+      assert.equal(fresh.lastEventId, null, 'the replaced relay must not receive the old cursor');
+
+      // On the new relay the cursor is live again: relay-Y's events advance it,
+      // and a later reconnect resumes from it (no permanent full replay).
+      const third = await rabbit.stream();
+      third.send('ready', { protocol_version: 1, relay_id: 'relay-Y', seq: 1, machine_id: 'rabbit' });
+      await waitFor(() => agent.state.cursorRelayId === 'relay-Y', { label: 'new cursor attributed' });
+      third.send('peer.hello', { machine_id: 'peer-1' });
+      third.send('peer.hello', { machine_id: 'peer-2' });
+      await waitFor(() => agent.state.seq >= 3, { label: 'new cursor advanced' });
+
+      third.close();
+      const resumed = await waitFor(() => rabbit.state.attaches[3] ?? null, { label: 'fourth attach' });
+      assert.equal(resumed.lastEventId, '3', 'once the cursor belongs to relay-Y it is resumed again');
+      assert.equal(resumed.seq, '4');
+    } finally {
+      agent?.stop();
+      if (running) await running.catch(() => {});
+      await rabbit.close();
+    }
+  });
+
+  it('aligns the cursor downward when the new relay window is smaller', async () => {
+    const rabbit = await startFakeRabbit();
+    const project = await makeRepo('cursor-replay-down');
+    /** @type {object|null} */
+    let agent = null;
+    /** @type {Promise<void>|null} */
+    let running = null;
+    try {
+      agent = makeAgent({
+        rabbit: rabbit.url,
+        project,
+        allowed: [['node', '-e']],
+        once: false,
+        name: 'cursor-replay-down',
+      });
+      running = agent.start();
+      const first = await rabbit.stream();
+      first.send('ready', { protocol_version: 1, relay_id: 'relay-T', machine_id: 'rabbit' });
+      await waitFor(() => agent.state.cursorRelayId === 'relay-T', { label: 'cursor attributed' });
+      first.send('peer.hello', { seq: 42, machine_id: 'jump' });
+      await waitFor(() => agent.state.seq === 42, { label: 'cursor at 42' });
+
+      // A window that starts far below the cursor we arrived with: the alignment
+      // must move *down*, so it cannot be a `max`.
+      first.send('notice', {
+        level: 'warn',
+        code: 'REPLAY_TRUNCATED',
+        message: 'short window',
+        oldest_available_seq: 3,
+      });
+      await waitFor(() => agent.state.seq === 2, { label: 'cursor aligned downward' });
+      assert.equal(agent.state.replayTruncated.previous_seq, 42);
+      assert.equal(agent.state.replayTruncated.oldest_available_seq, 3);
+
+      // And the aligned cursor is what the next attach uses.
+      first.close();
+      const resumed = await waitFor(() => rabbit.state.attaches[1] ?? null, { label: 're-attach' });
+      assert.equal(resumed.lastEventId, '2');
+      assert.equal(resumed.seq, '3', 'the next attach asks for oldest_available_seq');
+    } finally {
+      agent?.stop();
+      if (running) await running.catch(() => {});
+      await rabbit.close();
     }
   });
 });

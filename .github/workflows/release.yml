@@ -58,10 +58,16 @@ jobs:
       - name: Entry points import
         run: node scripts/check-entrypoints.mjs
 
-      - name: Unit suites
+      - name: Unit suites (blocking)
+        # The unit suites are fast, deterministic and cover the product surface.
+        # They gate the release.
         run: node --test test/relay.test.mjs test/agent.test.mjs test/tools.test.mjs
 
-      - name: End-to-end suites
+      - name: End-to-end suites (blocking)
+        # These exercise real processes over real sockets and are slower and more
+        # environment-sensitive than the unit suites, but they are the only thing
+        # that would catch a genuinely broken restart or sub-path deployment --
+        # which is exactly what this release is about. They gate the release too.
         run: node --test --test-force-exit test/e2e.test.mjs test/crossnetwork.test.mjs
 
       - name: Pack

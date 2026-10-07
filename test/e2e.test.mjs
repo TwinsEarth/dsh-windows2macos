@@ -168,7 +168,6 @@ test('e2e: two machines, one relay, real commands', async (t) => {
 
   t.after(async () => {
     await relay.close();
-    rmSync(repo.root, { recursive: true, force: true });
   });
 
   assert.ok(pairingCode, 'relay must surface a pairing code');
@@ -199,6 +198,30 @@ test('e2e: two machines, one relay, real commands', async (t) => {
     // Swallow rejections: a stop() racing the loop teardown is not a test
     // failure, and an unhandled rejection would crash the runner instead.
     await Promise.allSettled(startPromises);
+  });
+
+  // Remove the scratch tree, registered *last* on purpose.
+  //
+  // `node:test` runs `t.after` hooks in registration order, so a cleanup hook
+  // registered next to `relay.close()` above would run while the two
+  // Localsides are still writing their `agent-state-*` directories. On Windows
+  // the recursive remove then deletes what it can and throws on the busy
+  // directories, leaving a half-removed scratch tree behind on a *passing*
+  // run. Waiting for the agents to stop first is what makes it deterministic;
+  // the retry loop absorbs the rest of the handle-release latency.
+  t.after(async () => {
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      try {
+        rmSync(repo.root, { recursive: true, force: true });
+        return;
+      } catch (error) {
+        if (attempt === 19) {
+          process.stderr.write(`\n[e2e] could not remove scratch ${repo.root}: ${error.message}\n`);
+          return;
+        }
+        await new Promise((r) => setTimeout(r, 150));
+      }
+    }
   });
 
   let commandToken = null;

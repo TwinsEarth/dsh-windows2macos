@@ -93,6 +93,8 @@ function createScratch(t, name) {
     install() {
       t.after(async () => {
         if (!handle.reachedEnd) return; // the reporting hook already named the scene
+        // Let the last child processes' handles settle before touching the tree.
+        await sleep(150);
         for (let attempt = 0; attempt < 20; attempt += 1) {
           try {
             rmSync(dir, { recursive: true, force: true });
@@ -271,18 +273,26 @@ async function waitForListening(relay, { timeoutMs = 15_000 } = {}) {
 }
 
 /** Stop the relay, preferring a graceful SIGTERM so state can flush. */
-async function stopRelay(relay, { signal = 'SIGTERM', timeoutMs = 8_000 } = {}) {
+async function stopRelay(relay, { signal = 'SIGTERM', timeoutMs = 8_000, settleMs = 250 } = {}) {
   if (!relay || relay.stopped) return;
   relay.stopped = true;
   if (relay.proc.exitCode !== null || relay.proc.signalCode !== null) return;
   relay.proc.kill(signal);
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (relay.proc.exitCode !== null || relay.proc.signalCode !== null) return;
+    if (relay.proc.exitCode !== null || relay.proc.signalCode !== null) break;
     await sleep(25);
   }
   relay.proc.kill('SIGKILL');
-  await sleep(100);
+  // Wait for the OS to actually release the dead process's handles.
+  //
+  // `exitCode` going non-null means Node has reaped the child, but on Windows
+  // the file handles it held (the relay's ledger and device snapshot) can
+  // linger for a few more milliseconds. Removing the scratch directory inside
+  // that window makes `rmSync` delete part of the tree and then throw -- and
+  // under `--test-force-exit` the retry that would have recovered never gets to
+  // finish, so a *passing* scenario leaves a half-deleted directory behind.
+  await sleep(settleMs);
 }
 
 /**
@@ -300,7 +310,10 @@ async function killRelay(relay) {
   relay.proc.kill('SIGKILL');
   const deadline = Date.now() + 8_000;
   while (Date.now() < deadline) {
-    if (relay.proc.exitCode !== null || relay.proc.signalCode !== null) return;
+    if (relay.proc.exitCode !== null || relay.proc.signalCode !== null) {
+      await sleep(250); // let Windows release the dead process's handles
+      return;
+    }
     await sleep(25);
   }
   throw new Error('relay did not die after SIGKILL');
@@ -507,6 +520,7 @@ async function startGroup(t, {
   operatorToken = null,
   rabbitUrlOverride = null,
   existingRelay = null,
+  autoStart = true,
   label = 'group',
 }) {
   const { createAgent, loadOrCreateIdentity, probeCaps, detectPlatform, treeFingerprint } =
@@ -611,7 +625,14 @@ async function startGroup(t, {
     await Promise.allSettled(startPromises);
   });
 
-  for (const a of agents) startPromises.push(a.start());
+  // `autoStart: false` leaves the machines paired but not listening, which lets
+  // a scenario dispatch work into a group with no open streams. That is a real
+  // deployment state (relay restarted, laptop still booting) and the only way to
+  // test it without racing the Localsides' reconnect.
+  const startAgents = () => {
+    for (const a of agents) startPromises.push(a.start());
+  };
+  if (autoStart) startAgents();
 
   const headOf = async (dir) => git(['rev-parse', 'HEAD'], dir);
   const anchorOf = async (dir) => {
@@ -639,6 +660,7 @@ async function startGroup(t, {
   return {
     repo, relay, stateDir, agents, deviceTokens, rabbitUrl, mounted, relayRootUrl,
     operatorToken: resolveOperatorToken, submit, anchorOf, headOf, treeFingerprint,
+    startAgents,
   };
 }
 
@@ -842,9 +864,23 @@ test('crossnetwork 2: POST /v1/task needs the operator token, not a device token
 test('crossnetwork 3: a hard relay restart loses no device and no task', async (t) => {
   const sc = createScratch(t, 'cn3-restart');
   const OPERATOR = 'operator-token-for-scenario-3';
+  // This scenario is about persistence, not about how fast a machine notices a
+  // relay that vanished. The default lease budget is 2 missed heartbeats plus a
+  // 30s grace -- 50s -- and a SIGKILLed relay forces both machines to
+  // re-establish their streams inside that window. On a loaded machine (two
+  // full test files running concurrently, each driving real child processes)
+  // that reconnect can lose the race, the leases are swept as `expired`, and
+  // the scenario fails for a reason that has nothing to do with the ledger.
+  // A generous grace keeps the assertion measuring persistence.
+  //
+  // The underlying question -- "is a 50s lease budget enough headroom for a
+  // cross-region reconnect?" -- is a real one for v0.1.2 §8, but it belongs in
+  // its own scenario rather than being an accidental confounder here.
+  const RESTART_GRACE = ['--grace-ms', '120000'];
   const group = await startGroup(t, {
     scratchDir: sc.dir,
     operatorToken: OPERATOR,
+    relayArgs: RESTART_GRACE,
     label: 'cn3',
   });
 
@@ -861,6 +897,17 @@ test('crossnetwork 3: a hard relay restart loses no device and no task', async (
 
   const machineIdBefore = firstVerdict.machines[0].machine_id;
   const healthBefore = await fetch(`${group.rabbitUrl}/healthz`).then((r) => r.json());
+
+  // Snapshotted the instant the new process is up (see "the restart" below).
+  // `uptime_ms` is only evidence of a restart when it is read right after boot:
+  // reading it later measures how long the scenario itself took. An earlier
+  // version read it at the very end, which passed on a fast run and failed on a
+  // slow one -- an assertion that was really testing elapsed time.
+  let healthAfterRestart = null;
+  // Assigned the moment the post-restart task exists -- before any assertion on
+  // its outcome. Otherwise a failure in 3a leaves this undefined and 3b reports
+  // a misleading "the task is not in the ledger" that hides the real fault.
+  let afterRestartTaskId = null;
 
   // The idempotency probe rides on its *own* task.
   //
@@ -937,14 +984,34 @@ test('crossnetwork 3: a hard relay restart loses no device and no task', async (
   const relay2 = startRelayProcess({
     stateDir,
     port, // same port, so the machines' rabbitUrl is unchanged
-    extraArgs: ['--operator-token', OPERATOR],
+    extraArgs: ['--operator-token', OPERATOR, ...RESTART_GRACE],
   });
   t.after(() => stopRelay(relay2));
   await waitForListening(relay2);
   await waitForRelayReady(relay2);
   group.relay = relay2; // the assertions below talk to the new process
+  healthAfterRestart = await fetch(`${group.rabbitUrl}/healthz`).then((r) => r.json());
 
   await t.test('3a. machines do not have to pair again', async () => {
+    // Dispatch first, inspect afterwards.
+    //
+    // The task is submitted the instant the relay is back -- which is what an
+    // operator does after a VPS restart, and is the window in which the
+    // Localsides have not yet re-established their event streams. Doing the
+    // /v1/devices round trip first added a few hundred milliseconds of slack
+    // that let the machines reconnect before the offer was published, which
+    // hid a real defect: an offer published while a machine's stream is down is
+    // never re-delivered when that stream comes back, so the lease sits at
+    // `offered` until the sweep expires it.
+    const created = await group.submit({
+      mode: 'replicate',
+      command_argv: [NODE, '-e', 'console.log("after-restart")'],
+      index_total: 1,
+      timeout_ms: 40_000,
+      write: false,
+    });
+    afterRestartTaskId = created.task_id; // captured before any assertion, so 3b cannot cascade
+
     const devices = await fetch(`${group.rabbitUrl}/v1/devices`, {
       headers: { authorization: `Bearer ${group.deviceTokens[0]}` },
     });
@@ -954,28 +1021,31 @@ test('crossnetwork 3: a hard relay restart loses no device and no task', async (
       `the pre-restart device_token must still authenticate — a 401 here means every machine ` +
         `has to be re-paired after a relay restart. ${group.relay.log}`,
     );
-    const body = await devices.json();
+    const deviceBody = await devices.json();
     assert.ok(
-      body.devices.some((d) => d.machine_id === machineIdBefore),
-      `device ${machineIdBefore} must survive the restart: ${JSON.stringify(body.devices)}`,
+      deviceBody.devices.some((d) => d.machine_id === machineIdBefore),
+      `device ${machineIdBefore} must survive the restart: ${JSON.stringify(deviceBody.devices)}`,
     );
 
     // Stronger than reading the table: a *new* task must be picked up by the
     // machines that were paired before the restart, over their existing tokens.
-    const created = await group.submit({
-      mode: 'replicate',
-      command_argv: [NODE, '-e', 'console.log("after-restart")'],
-      index_total: 1,
-      timeout_ms: 40_000,
-      write: false,
-    });
     const verdict = await waitForVerdict(group, created.task_id, { timeoutMs: 90_000 });
-    assert.equal(
-      verdict.status,
-      'consistent',
-      `machines must resume without re-pairing: ${JSON.stringify(verdict.machines, null, 2)}`,
-    );
-    group.afterRestartTaskId = created.task_id;
+    if (verdict.status !== 'consistent') {
+      // Gather the evidence that distinguishes the two ways this can fail:
+      // "the machines never came back" (device not online / no stream) versus
+      // "the machines are back but were never offered the work" (online with a
+      // live stream, leases stuck offered until they expire). Without this the
+      // failure reads as a generic timeout.
+      const after = await fetch(`${group.rabbitUrl}/v1/devices`, {
+        headers: { authorization: `Bearer ${group.deviceTokens[0]}` },
+      }).then((r) => r.json()).catch(() => null);
+      assert.fail(
+        'machines must resume without re-pairing.\n' +
+          `  verdict=${verdict.status} machines=${JSON.stringify(verdict.machines)}\n` +
+          `  devices(online,streams)=${JSON.stringify((after?.devices ?? []).map((d) => [d.machine_name, d.online, d.streams]))}\n` +
+          `  relay stdout/stderr:\n${group.relay.log}`,
+      );
+    }
     group.afterRestartVerdict = verdict;
   });
 
@@ -992,7 +1062,7 @@ test('crossnetwork 3: a hard relay restart loses no device and no task', async (
         `makes it survive. Ledger has: ${JSON.stringify([...ids])}`,
     );
     assert.ok(
-      ids.has(group.afterRestartTaskId),
+      ids.has(afterRestartTaskId),
       `the task created after the restart must be listed: ${JSON.stringify([...ids])}`,
     );
 
@@ -1027,14 +1097,18 @@ test('crossnetwork 3: a hard relay restart loses no device and no task', async (
   await t.test('7. relay_id changes and uptime_ms resets across the restart', async () => {
     assert.ok(healthBefore.relay_id, `pre-restart /healthz must expose relay_id (§4): ${JSON.stringify(healthBefore)}`);
     assert.ok(healthBefore.started_at, `pre-restart /healthz must expose started_at: ${JSON.stringify(healthBefore)}`);
+    assert.ok(healthAfterRestart, 'the post-restart /healthz snapshot must have been taken');
 
-    const healthAfter = await fetch(`${group.rabbitUrl}/healthz`).then((r) => r.json());
+    const healthAfter = healthAfterRestart;
     assert.ok(healthAfter.relay_id, `post-restart /healthz must expose relay_id: ${JSON.stringify(healthAfter)}`);
     assert.notEqual(
       healthAfter.relay_id,
       healthBefore.relay_id,
       'relay_id must differ after a restart — that is precisely how a client detects one (§8.3)',
     );
+    // Compare against the other process's uptime, sampled immediately after it
+    // booted: a fresh relay must not claim to have been up longer than the one
+    // it replaced.
     assert.ok(
       healthAfter.uptime_ms < healthBefore.uptime_ms + 1_000,
       `uptime_ms must reset on restart: before=${healthBefore.uptime_ms} after=${healthAfter.uptime_ms}`,
@@ -1304,6 +1378,112 @@ test('crossnetwork 6: the event stream carries anti-buffering headers', async (t
   sc.reachedEnd = true;
   sc.install();
 });
+
+/* ================================================================== */
+/* 9. work dispatched before the machines are listening                 */
+/* ================================================================== */
+
+test('crossnetwork 9: a task dispatched before the machines connect still runs when they do', async (t) => {
+  const sc = createScratch(t, 'cn9-late-join');
+  const OPERATOR = 'operator-token-for-scenario-9';
+
+  // The machines are paired but their loops are not started, so nothing is
+  // subscribed to the relay when the work is dispatched. This is the state a
+  // real group is in after a relay restart, or simply when the operator
+  // dispatches while a laptop is still booting -- and it is the window in which
+  // an offer can be published with nobody listening.
+  //
+  // Scenario 3 hits the same window, but only by winning a millisecond race
+  // against the Localsides' reconnect (and it loses that race on a fast
+  // machine, which is why this defect reached CI as an intermittent failure
+  // rather than as a reproducible one). Pairing first and starting the loops
+  // afterwards removes the race entirely.
+  const group = await startGroup(t, {
+    scratchDir: sc.dir,
+    operatorToken: OPERATOR,
+    autoStart: false,
+    label: 'cn9',
+  });
+
+  // Count machines that actually hold an open event stream.
+  //
+  // `online` is NOT the right predicate here: `pair()` sets `online: true` as
+  // soon as a machine is paired, because pairing is what makes a machine known
+  // and its token valid. A paired machine whose Localside has not started yet is
+  // therefore `online: true, streams: 0` -- known, idle, and listening to
+  // nothing. The thing this scenario must establish is "no stream is attached",
+  // and `streams` is the field that answers it.
+  const onlineCount = async () => {
+    const res = await fetch(`${group.rabbitUrl}/v1/devices`, {
+      headers: { authorization: `Bearer ${group.deviceTokens[0]}` },
+    });
+    const body = await res.json();
+    return (body.devices ?? []).filter((d) => (d.streams ?? 0) > 0).length;
+  };
+
+  await t.test('9a. the machines are paired but not yet listening', async () => {
+    assert.equal(
+      await onlineCount(),
+      0,
+      'no machine may hold a stream before the task is dispatched, or this test is not measuring ' +
+        'the "nobody is listening" case',
+    );
+    // The device tokens must still be valid even with no stream: this is the
+    // "paired but offline" state, not an unpaired one.
+    const devices = await fetch(`${group.rabbitUrl}/v1/devices`, {
+      headers: { authorization: `Bearer ${group.deviceTokens[0]}` },
+    });
+    assert.equal(devices.status, 200, 'a paired-but-offline machine must still authenticate');
+  });
+
+  await t.test('9b. dispatch while nobody is listening', async () => {
+    const created = await group.submit({
+      mode: 'replicate',
+      command_argv: [NODE, '-e', 'console.log("dispatched-before-connect")'],
+      index_total: 1,
+      timeout_ms: 60_000,
+      write: false,
+    });
+    group.lateJoinTaskId = created.task_id;
+
+    // Give the relay every chance to publish the offer, and confirm it was
+    // published into the void rather than into a live stream.
+    await sleep(3_000);
+    assert.equal(await onlineCount(), 0, 'no machine may have connected in the meantime');
+    const detail = await fetch(`${group.rabbitUrl}/v1/tasks/${created.task_id}`, {
+      headers: { authorization: `Bearer ${group.deviceTokens[0]}` },
+    }).then((r) => r.json());
+    assert.ok(detail.aggregate, `the dispatched task must exist: ${JSON.stringify(detail)}`);
+  });
+
+  await t.test('9c. the work is still delivered once the machines come online', async () => {
+    assert.ok(group.lateJoinTaskId, 'the task from 9b must have been created');
+    group.startAgents(); // now, and only now, the machines start listening
+
+    const deadline = Date.now() + 30_000;
+    while (Date.now() < deadline && (await onlineCount()) < 2) await sleep(250);
+    assert.equal(await onlineCount(), 2, 'both machines must attach their streams');
+
+    const verdict = await waitForVerdict(group, group.lateJoinTaskId, { timeoutMs: 90_000 });
+    if (verdict.status !== 'consistent') {
+      const devices = await fetch(`${group.rabbitUrl}/v1/devices`, {
+        headers: { authorization: `Bearer ${group.deviceTokens[0]}` },
+      }).then((r) => r.json()).catch(() => null);
+      assert.fail(
+        'a task dispatched before the machines were listening must still be delivered once they\n' +
+          'connect. A lease that is offered to a machine with no stream, and never re-offered when\n' +
+          'that machine attaches, stalls here until the sweep expires it.\n' +
+          `  verdict=${verdict.status} machines=${JSON.stringify(verdict.machines)}\n` +
+          `  devices(online,streams)=${JSON.stringify((devices?.devices ?? []).map((d) => [d.machine_name, d.online, d.streams]))}\n` +
+          `  relay stdout/stderr:\n${group.relay.log}`,
+      );
+    }
+  });
+
+  sc.reachedEnd = true;
+  sc.install();
+});
+
 
 /* ================================================================== */
 /* 8. 300ms added latency must not expire a lease                      */

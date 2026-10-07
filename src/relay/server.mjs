@@ -288,7 +288,7 @@ export class RelayServer {
       });
     }
     const handler = (req, res) => {
-      this.handle(req, res).catch((err) => sendError(res, err));
+      this.handle(req, res).catch((err) => this.reportError(req, res, err));
     };
     if (this.tlsCertPath) {
       let cert;
@@ -324,6 +324,34 @@ export class RelayServer {
     this.server.headersTimeout = options.headersTimeoutMs ?? 60_000;
 
     this._buildStartupMessages();
+  }
+
+  /**
+   * Diagnostics sink. `logger: null` is the documented "silent" value, and a
+   * caller-supplied logger may throw — neither may break a request. (A direct
+   * `this.logger(...)` call after `res.writeHead()` once threw a TypeError that
+   * surfaced as "Cannot write headers after they are sent to the client".)
+   */
+  _log(message) {
+    if (typeof this.logger !== 'function') return;
+    try {
+      this.logger(message);
+    } catch { /* a broken logger must never break the relay */ }
+  }
+
+  /**
+   * Last-resort error path for a request whose handler rejected.
+   * Once the status line is on the wire (SSE, streamed report) the response can no
+   * longer be rewritten — the only honest action is to end the stream, loudly.
+   */
+  reportError(req, res, err) {
+    if (res.headersSent) {
+      this._log(`[w2m-rabbit] !! error after the response had started on ${req.method} ${req.url}: `
+        + `${err?.stack ?? err}`);
+      try { res.end(); } catch { /* already gone */ }
+      return;
+    }
+    sendError(res, err);
   }
 
   _initOperatorToken(options) {
@@ -410,8 +438,8 @@ export class RelayServer {
         }, this.sweepIntervalMs);
         this._sweepTimer.unref?.();
         if (this.logger) {
-          this.logger(`[w2m-rabbit] listening on ${this.url}  pairing code: ${this.pairingCode}`);
-          for (const message of this.startupMessages) this.logger(message);
+          this._log(`[w2m-rabbit] listening on ${this.url}  pairing code: ${this.pairingCode}`);
+          for (const message of this.startupMessages) this._log(message);
         }
         resolve({
           host: this.host,
@@ -744,7 +772,24 @@ export class RelayServer {
 
     if (from !== null) {
       const oldest = this.state.oldestBufferedSeq();
-      if (from < oldest && oldest > 1) {
+      const lastBuffered = this.state.lastBufferedSeq();
+      // `fromFuture` is judged against EVERY seq this process has allocated (a client
+      // can legitimately hold a `ready` seq, which is not buffered), while the
+      // reported window bounds describe the replay ring the client can actually use.
+      const lastSeq = this.state.lastSeq();
+      // Two distinct ways for a cursor to be out of sync with THIS process:
+      //
+      //   from < oldest     the cursor is older than the replay window (buffer rot)
+      //   from > lastSeq+1  the cursor cannot exist here at all. Sequence numbers
+      //                     restart at 1 in every process, so a cursor from a
+      //                     previous relay process is AHEAD of a freshly started
+      //                     relay. This was the silent case: `13 < 1` is false, the
+      //                     client got no notice, `replayEntries(13)` matched
+      //                     nothing, and the agent then reset its cursor to the
+      //                     `ready` seq -- stepping over every event it had missed.
+      const tooOld = from < oldest && oldest > 1;
+      const fromFuture = from > lastSeq + 1;
+      if (tooOld || fromFuture) {
         // §8.4: tell the client where to re-align, not just that replay failed.
         writeEvent({
           type: 'notice',
@@ -752,18 +797,45 @@ export class RelayServer {
           rabbit_time: this.state.nowIso(),
           level: 'warn',
           code: 'REPLAY_TRUNCATED',
-          message: `requested seq ${from} is older than the buffer head ${oldest}`,
+          message: tooOld
+            ? `requested seq ${from} is older than the buffer head ${oldest}`
+            : `requested seq ${from} is beyond this process' last seq ${lastSeq}: the cursor came from a `
+              + 'previous relay process, whose sequence numbering restarted at 1',
           machine_id: machineId,
           requested_seq: from,
           oldest_available_seq: oldest,
+          last_available_seq: lastBuffered,
+          relay_id: this.relayId,
+          reason: tooOld ? 'buffer_truncated' : 'cursor_ahead_of_relay',
         });
       }
-      for (const entry of this.state.replayEntries(from)) deliver(entry);
+      // A cursor from a previous process is meaningless here, so honouring it
+      // literally (replay from `from`) would deliver NOTHING and also lose every
+      // event that fell into the gap -- not only offers, but `task.cancel`,
+      // `notice`, `peer.*`. Re-align to the head of the window instead: the client
+      // asked to be resynchronised, and the ring is exactly what we still have.
+      const replayFrom = fromFuture ? oldest : from;
+      for (const entry of this.state.replayEntries(replayFrom)) deliver(entry);
     }
 
     live = true;
     for (const entry of queue) deliver(entry);
     queue.length = 0;
+
+    // §8.6: re-state work this machine was handed while its stream was down.
+    //
+    // An offer is a single event; if the stream is not connected at that instant
+    // -- after a relay restart, a tunnel drop, or any interruption -- the event
+    // is lost and the lease waits out its whole window before being swept. The
+    // machine is meanwhile online and idle. Re-delivering on connect is what
+    // makes a reconnect recover work instead of silently losing it.
+    //
+    // Only unclaimed leases are re-offered; `running` is excluded so a task that
+    // has already begun cannot be handed out a second time and executed twice.
+    const redelivered = this.state.redeliverPendingOffers(machineId);
+    if (redelivered.count > 0) {
+      this._log(`[w2m-rabbit] re-offered ${redelivered.count} pending task(s) to ${machineId} on reconnect`);
+    }
 
     // §3.2: `: keepalive` comment every 15s.
     sub.timer = setInterval(() => {

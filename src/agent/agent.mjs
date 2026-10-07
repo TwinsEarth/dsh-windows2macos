@@ -107,6 +107,14 @@ export const AGENT_STATE_SCHEMA_VERSION = 1;
  */
 export const AGENT_STATE_PUBLISH_INTERVAL_MS = 30_000;
 
+/**
+ * How many times a relay identity change may trigger an *immediate* cursor-less
+ * re-attach before the agent falls back to the normal backoff ladder. A healthy
+ * relay identifies itself once per stream, so more than a couple in a row means
+ * something is wrong and hammering it would not help.
+ */
+export const MAX_IMMEDIATE_RESTART_RECONNECTS = 3;
+
 /** Refusal reason codes this agent can produce. */
 export const REFUSAL = {
   COMMAND_NOT_ALLOWED: 'COMMAND_NOT_ALLOWED',
@@ -214,6 +222,34 @@ export function summarizeRtt(samples, window = RTT_WINDOW) {
   if (kept.length === 0) return { last: null, avg: null, samples: [] };
   const avg = Math.round(kept.reduce((sum, value) => sum + value, 0) / kept.length);
   return { last: kept[kept.length - 1], avg, samples: kept };
+}
+
+/**
+ * Decide whether the stored event cursor may be sent when attaching.
+ *
+ * A cursor is only meaningful to the relay process that issued it. `seq` is
+ * per-process (v0.1.2 §8.3), so after a restart the new process numbers events
+ * from 1 again: replaying `Last-Event-ID: 42` tells it we are already past
+ * events 1..42 -- including the `task.offer` that landed at seq 1, which is
+ * exactly the event the agent then waits forever for. The cursor therefore
+ * travels with the `relay_id` that issued it, and is withheld whenever that
+ * differs from the relay we are attaching to.
+ *
+ * Two cases must NOT be over-corrected:
+ *   * a pre-v0.1.2 relay sends no `relay_id`, so there is nothing to compare
+ *     against and the v1 behaviour (resume) is kept;
+ *   * an unchanged `relay_id` must still resume, or every reconnect becomes a
+ *     full replay.
+ *
+ * @param {{seq?: number, cursorRelayId?: string|null, relayId?: string|null}} cursor
+ * @returns {boolean}
+ */
+export function cursorUsableFor({ seq, cursorRelayId = null, relayId = null } = {}) {
+  if (!Number.isInteger(seq) || seq <= 0) return false;
+  // No relay identity to compare against: keep the v1 resume behaviour.
+  if (relayId === null || relayId === undefined) return true;
+  // The relay identifies itself, so only a cursor it issued can be replayed.
+  return cursorRelayId === relayId;
 }
 
 // ---------------------------------------------------------------------------
@@ -721,6 +757,17 @@ export function createAgent(options) {
     stopped: false,
     /** `relay_id` of the relay we are currently talking to (v0.1.2 §8.3). */
     relayId: null,
+    /**
+     * `relay_id` that issued `state.seq`, or null when the cursor cannot be
+     * attributed to a relay process (pre-v0.1.2 relay, or none yet).
+     */
+    cursorRelayId: null,
+    /**
+     * Set when a relay restart makes the *current* stream unusable: it was
+     * opened with the previous process's cursor, so it has already skipped the
+     * new process's early events and must be replaced.
+     */
+    streamRestartRequested: false,
     /** How many times a relay restart was detected. */
     relayIdChanges: 0,
     /** Last `REPLAY_TRUNCATED` notice we had to act on (v0.1.2 §8.4). */
@@ -763,6 +810,20 @@ export function createAgent(options) {
   let heartbeat = null;
   /** Consecutive unstable reconnects; drives the backoff ladder (§8.1). */
   let reconnectAttempt = 0;
+  /**
+   * Consecutive immediate re-attaches caused by a relay identity change. Capped
+   * so a relay that cannot keep a stable identity degrades to plain backoff
+   * instead of a hot loop.
+   */
+  let restartReconnects = 0;
+  /**
+   * What the current stream was opened with, so `ready` can tell whether the
+   * events on it are complete. `seq: null` means no cursor was sent, i.e. this
+   * stream starts from the relay's own beginning and is never "tainted".
+   *
+   * @type {{seq: number|null, attributionRelayId: string|null}}
+   */
+  let attachInfo = { seq: null, attributionRelayId: null };
   /** @type {NodeJS.Timeout|null} Idle refresh of the diagnostics file. */
   let statePublishTimer = null;
 
@@ -1401,12 +1462,30 @@ export function createAgent(options) {
   async function streamOnce() {
     const headers = { accept: 'text/event-stream' };
     if (token()) headers.authorization = `Bearer ${token()}`;
-    if (state.seq > 0) headers['last-event-id'] = String(state.seq);
-    // Built by concatenation so a relay mounted under a sub-path
+    // Decide *before* connecting whether the cursor may be replayed: sending a
+    // stale one is what makes a restarted relay believe we are already caught
+    // up (task-18). Built by concatenation so a relay mounted under a sub-path
     // (https://host/w2m) keeps its prefix -- see ./url.mjs.
+    const resume = cursorUsableFor({
+      seq: state.seq,
+      cursorRelayId: state.cursorRelayId,
+      relayId: state.relayId,
+    });
     const query = new URLSearchParams();
     query.set('machine_id', identity.machine_id);
-    if (state.seq > 0) query.set('seq', String(state.seq + 1));
+    if (resume) {
+      headers['last-event-id'] = String(state.seq);
+      query.set('seq', String(state.seq + 1));
+    }
+    // Remembered so `ready` can decide whether this stream is trustworthy.
+    attachInfo = { seq: resume ? state.seq : null, attributionRelayId: resume ? state.cursorRelayId : null };
+    log('info', 'attaching to event stream', {
+      from_seq: resume ? state.seq + 1 : null,
+      cursor: resume ? state.seq : null,
+      cursor_relay_id: resume ? state.cursorRelayId : null,
+      relay_id: state.relayId,
+      withheld_cursor: !resume && state.seq > 0,
+    });
     const streamUrl = joinUrl(baseUrl, `/v1/stream?${query.toString()}`);
 
     const response = await fetchImpl(streamUrl, { headers, signal: streamAbort.signal });
@@ -1453,18 +1532,34 @@ export function createAgent(options) {
         const relayId =
           typeof payload.relay_id === 'string' && payload.relay_id !== '' ? payload.relay_id : null;
         const previousRelayId = state.relayId;
-        if (relayId && previousRelayId && relayId !== previousRelayId) {
-          // The relay restarted: it numbers events from 1 again, so our cursor
-          // points at a sequence that will never exist. Drop it and adopt the
-          // position of this fresh stream.
-          state.relayIdChanges += 1;
-          state.seq = Number.isInteger(payload.seq) ? payload.seq : 0;
-          log('warn', `relay restarted (relay_id ${previousRelayId} -> ${relayId}); seq cursor reset to ${state.seq}`, {
+        // A stream is only "tainted" when it was opened *with* a cursor that
+        // this relay process never issued. Such a stream has already skipped
+        // everything the process emitted before `ready` -- including the
+        // `task.offer` at seq 1 -- so it must be dropped and re-attached
+        // cursor-less (task-18). A stream opened without a cursor has seen
+        // everything from the start and is kept: reconnecting there would be
+        // pure churn.
+        const tainted =
+          attachInfo.seq !== null && relayId !== null && attachInfo.attributionRelayId !== relayId;
+        if (tainted) {
+          state.relayIdChanges += previousRelayId !== null && previousRelayId !== relayId ? 1 : 0;
+          state.seq = 0;
+          state.cursorRelayId = null;
+          state.relayId = relayId;
+          state.streamRestartRequested = true;
+          log('warn', `relay restarted (relay_id ${previousRelayId ?? '<unknown>'} -> ${relayId}); discarding seq cursor and re-attaching without one`, {
             previous_relay_id: previousRelayId,
             relay_id: relayId,
+            discarded_cursor: attachInfo.seq,
           });
+          publishState();
+          streamAbort?.abort();
+          break;
         }
         if (relayId) state.relayId = relayId;
+        // The cursor we hold was issued by this relay, so attribute it: that is
+        // what lets a later restart be told apart from a plain reconnect.
+        state.cursorRelayId = relayId ?? state.cursorRelayId;
         log('info', 'stream ready', {
           seq: payload.seq,
           protocol_version: payload.protocol_version,
@@ -1510,9 +1605,15 @@ export function createAgent(options) {
               oldest_available_seq: oldest,
               previous_seq: state.seq,
             };
+            // A plain assignment, not a `max`: after a restart the new process
+            // may hold a *smaller* window than the cursor we arrived with, and
+            // aligning downward (even to 0) is the whole point. The aligned
+            // cursor belongs to the relay that sent this notice.
             state.seq = oldest - 1;
+            state.cursorRelayId = state.relayId ?? state.cursorRelayId;
             log('warn', `replay window truncated; seq cursor aligned to ${state.seq} (next connect asks for ${oldest})`, {
               oldest_available_seq: oldest,
+              previous_seq: state.replayTruncated.previous_seq,
             });
             publishState();
           } else {
@@ -1671,6 +1772,7 @@ export function createAgent(options) {
     try {
       while (!state.stopped) {
         streamAbort = new AbortController();
+        state.streamRestartRequested = false;
         const openedAt = Date.now();
         /** @type {Error|null} */
         let failure = null;
@@ -1684,8 +1786,32 @@ export function createAgent(options) {
         publishState();
 
         const livedMs = Date.now() - openedAt;
+        if (state.streamRestartRequested) {
+          // The relay changed identity, so the cursor this stream was opened
+          // with is void and the stream itself has already skipped the new
+          // process's early events. Re-attach at once, without a cursor: any
+          // delay here would widen exactly the window this fix closes.
+          state.streamRestartRequested = false;
+          restartReconnects += 1;
+          if (restartReconnects <= MAX_IMMEDIATE_RESTART_RECONNECTS) {
+            reconnectAttempt = 0;
+            log('warn', `re-attaching after relay change without a cursor (attempt ${restartReconnects})`, {
+              lived_ms: livedMs,
+            });
+            continue;
+          }
+          // A relay that keeps changing identity would otherwise spin us; fall
+          // through to the normal backoff from here on.
+          log('warn', 'relay identity keeps changing; falling back to backoff between attaches', {
+            restarts: restartReconnects,
+          });
+        }
+
         const stable = livedMs >= STABLE_STREAM_MS;
-        if (stable) reconnectAttempt = 0;
+        if (stable) {
+          reconnectAttempt = 0;
+          restartReconnects = 0;
+        }
         // A stream that ends immediately is treated as a failure even when the
         // socket closed cleanly; otherwise a flapping tunnel becomes a hot loop.
         const delay = stable ? RECONNECT_DELAY_AFTER_STABLE_MS : backoffDelay(reconnectAttempt);

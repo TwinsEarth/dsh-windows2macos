@@ -513,6 +513,14 @@ export class RabbitState {
   }
 
   oldestBufferedSeq() { return this.buffer.length ? this.buffer[0].seq : this.seq + 1; }
+  /**
+   * Highest seq present in the replay ring (0 when empty).
+   *
+   * Deliberately different from `lastSeq()`: `ready` frames allocate seq numbers
+   * without being buffered, so `lastSeq()` can run ahead of anything a client can
+   * actually replay. Diagnostics that describe the REPLAY WINDOW must use this one.
+   */
+  lastBufferedSeq() { return this.buffer.length ? this.buffer[this.buffer.length - 1].seq : 0; }
   lastSeq() { return this.seq; }
 
   /** Replay entries with seq >= from (used by GET /v1/stream?seq=|Last-Event-ID). */
@@ -897,6 +905,68 @@ export class RabbitState {
     const task = this.tasks.get(taskId);
     if (!task) throw new ProtocolError('NOT_FOUND', 'unknown task_id', { task_id: taskId });
     return task;
+  }
+
+  /**
+   * Re-offer the work a machine was handed but has not yet started (v0.1.2 §8.6).
+   *
+   * WHY THIS EXISTS
+   *
+   * An offer is a point-in-time event on a stream. `createTask` publishes
+   * `task.offer` once, and if the target machine's stream happens to be down at
+   * that instant -- the ordinary situation after a relay restart, a tunnel drop,
+   * or any cross-network interruption -- the event is simply gone. The lease sits
+   * in `offered` until the sweep expires it, the task never runs, and the
+   * operator sees a timeout with no explanation. Measured: the machine is back
+   * online with a live stream within milliseconds, and still receives nothing.
+   *
+   * So the relay re-states unclaimed work when a machine connects. This is safe
+   * because the state it acts on is durable: the lease the offer refers to is
+   * still in the ledger.
+   *
+   * WHY ONLY `offered` AND `queued`
+   *
+   * `running` is deliberately excluded, and that exclusion is the whole safety
+   * argument. A running lease means a machine has already STARTED the command --
+   * it acknowledged the offer and is heartbeating. Re-offering it would make that
+   * machine execute the work a second time, so the fix for a lost offer would
+   * introduce the one failure this project is built to avoid: two machines, or
+   * one machine twice, running the same side-effecting command.
+   *
+   * A machine that dies mid-run therefore does not get its work back here; that
+   * path stays with the sweep, which expires the lease and hands the index to
+   * another machine with `attempt + 1`.
+   *
+   * Re-emitted offers are new events and are replayed like any other, so a client
+   * that reconnects repeatedly can see the same offer more than once. That is
+   * intentional: the agent already de-duplicates by `task_id` (it ignores an
+   * offer whose task is queued or running), and an at-least-once offer with a
+   * client-side dedupe is strictly better than an at-most-once offer that is
+   * silently dropped.
+   *
+   * @param {string} machineId
+   * @returns {{count: number, task_ids: string[]}}
+   */
+  redeliverPendingOffers(machineId) {
+    const taskIds = [];
+    const now = this.nowMs();
+
+    for (const task of this.tasks.values()) {
+      if (task.cancelled === true) continue;
+      const lease = task.leases.get(machineId);
+      if (!lease) continue;
+      // Only work the machine has not begun. See the note above: `running` is
+      // excluded on purpose, not by omission.
+      if (lease.state !== 'offered' && lease.state !== 'queued') continue;
+      // Do not resurrect a lease the sweep has already written off; the takeover
+      // path owns that decision.
+      if (this.isLeaseExpired(lease, now)) continue;
+
+      this.emitOffer(task, lease);
+      taskIds.push(task.task_id);
+    }
+
+    return { count: taskIds.length, task_ids: taskIds };
   }
 
   listTasks({ limit = 50 } = {}) {

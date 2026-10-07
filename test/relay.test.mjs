@@ -274,6 +274,17 @@ function removeStateDir(dir) {
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
 }
 
+/** Poll until `fn()` is truthy (bounded); returns the final value. */
+async function waitUntil(fn, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = fn();
+    if (value) return value;
+    if (Date.now() >= deadline) return value;
+    await sleep(10);
+  }
+}
+
 const DEFAULT_PLATFORM = { os: 'windows', os_version: '10.0.26100', arch: 'x64', shell: 'pwsh', shell_version: '7.4.0' };
 const DEFAULT_CAPS = {
   case_sensitive_fs: false, symlinks: false, exec_bit: false,
@@ -728,6 +739,7 @@ describe('SSE (§3)', () => {
         const notice = await sse.waitFor((f) => f.event === 'notice' && f.json.code === 'REPLAY_TRUNCATED');
         assert.equal(notice.json.level, 'warn');
         assert.equal(notice.json.requested_seq, 1);
+        assert.equal(notice.json.reason, 'buffer_truncated');
         assert.ok(Number.isInteger(notice.json.oldest_available_seq),
           '§8.4: the client must learn where to re-align');
         assert.ok(notice.json.oldest_available_seq > 1);
@@ -2122,5 +2134,263 @@ describe('v0.1.2 TLS (§3 form B)', () => {
       () => createRelayServer({ tlsCert: 'no-such-cert.pem', tlsKey: 'no-such-key.pem', persist: false, logger: null }),
       (err) => err.code === 'BAD_REQUEST' && /cannot read TLS material/.test(err.message),
     );
+  });
+});
+
+/* ================================================================== */
+/* v0.1.2 §8.6 — offers lost while a stream is down                    */
+/* ================================================================== */
+
+/**
+ * The release blocker: an offer is a single event. If the machine's stream is not
+ * attached at that instant, the event is gone and the lease waits out its whole
+ * 50s window while the machine sits online and idle. These cases pin down the
+ * recovery path deterministically -- the stream is torn down and re-established
+ * under test control, so nothing depends on a millisecond-wide race.
+ */
+describe('v0.1.2 lost-offer recovery (§8.6)', () => {
+  it('re-offers work that was dispatched while the machine had no stream', async () => {
+    await withRelay({ pairRateLimitPerMinute: 0 }, async (relay) => {
+      const { token } = await pairDevice(relay, 'm1'); // paired, never connected
+      assert.equal(relay.subscribers.size, 0, 'the machine has no stream yet');
+
+      const created = await postTask(relay, taskBody());
+      assert.equal(created.status, 200);
+      const task = relay.state.getTask(created.json.task_id);
+      const lease = task.leases.get('m1');
+      assert.equal(lease.state, 'offered', 'the offer was emitted into the void');
+      assert.equal(relay.subscribers.size, 0);
+
+      const sse = await openSse(`${relay.url}/v1/stream?machine_id=m1`, { token });
+      try {
+        const ready = await sse.waitFor((f) => f.event === 'ready');
+        const offer = await sse.waitFor((f) => f.event === 'task.offer');
+        assert.equal(offer.json.task_id, created.json.task_id);
+        assert.equal(offer.json.machine_id, 'm1');
+        assert.ok(offer.json.seq > ready.json.seq, 'the re-offer is emitted during attach, after ready');
+        assert.equal(lease.offered_seq, offer.json.seq, 'the lease itself was re-offered');
+        assert.equal(lease.state, 'offered');
+      } finally {
+        sse.close();
+      }
+    });
+  });
+
+  it('recovers the offer across a relay restart and a stale cursor (the reported bug)', async () => {
+    const dir = makeStateDir();
+    try {
+      /* ---- process 1: the agent is connected, works normally, then both die ---- */
+      const relay1 = await startRelay({
+        stateDir: dir, pairingCode: 'PAIR-REDLV001', pairRateLimitPerMinute: 0,
+      });
+      const { token: deviceToken } = await pairDevice(relay1, 'm1', { code: 'PAIR-REDLV001' });
+      const sse1 = await openSse(`${relay1.url}/v1/stream?machine_id=m1`, { token: deviceToken });
+      await sse1.waitFor((f) => f.event === 'ready');
+      const first = await postTask(relay1, taskBody());
+      await sse1.waitFor((f) => f.event === 'task.offer');
+      // finish task 1 so its lease is terminal and must NOT be re-offered
+      await request(`${relay1.url}/v1/result`, {
+        method: 'POST', token: deviceToken, body: envelopeForTask(first.json.task_id, 'm1'),
+      });
+      // Give the OLD process a longer history than the new one -- that is the shape of
+      // the diagnosis (the agent had seen ~12 events before the restart, while the
+      // fresh process had produced 2). It is also what makes the stale cursor land
+      // beyond everything the new process has produced, which is the case that used
+      // to pass in total silence. These tasks are all completed, so they stay out of
+      // the re-offer set.
+      for (let i = 0; i < 3; i += 1) {
+        const extra = await postTask(relay1, taskBody());
+        await request(`${relay1.url}/v1/result`, {
+          method: 'POST', token: deviceToken, body: envelopeForTask(extra.json.task_id, 'm1'),
+        });
+      }
+      const staleCursor = relay1.state.lastSeq(); // everything the agent had seen
+      sse1.close();
+      assert.ok(await waitUntil(() => relay1.subscribers.size === 0));
+      const relay1Id = relay1.relayId;
+      await relay1.close();
+
+      /* ---- process 2: same state dir (same device token), seq restarts at 1 ---- */
+      const relay2 = await startRelay({ stateDir: dir, pairRateLimitPerMinute: 0 });
+      try {
+        assert.notEqual(relay2.relayId, relay1Id, 'a restart is a new process with a new relay_id');
+        assert.equal(relay2.state.lastSeq(), 0, 'sequence numbering restarts at 1');
+        assert.equal(relay2.state.getTask(first.json.task_id).leases.get('m1').state, 'done');
+
+        // The task is dispatched INTO THE GAP: after the restart, before the agent's
+        // stream is back. This is the exact window from the diagnosis.
+        const second = await postTask(relay2, taskBody());
+        // ...and a second ordinary event lands in the gap too, to prove the recovery
+        // is not offer-specific (a lost `task.cancel` would be far worse than a
+        // lost offer: the machine would keep running a cancelled command).
+        await pairDevice(relay2, 'm2');
+        const lastSeqBeforeAttach = relay2.state.lastSeq();
+        assert.ok(lastSeqBeforeAttach >= 2);
+        assert.equal(relay2.subscribers.size, 0, 'still nobody attached: the events are in the gap');
+        const replayFrom = staleCursor + 1;
+        assert.ok(
+          replayFrom > lastSeqBeforeAttach + 1,
+          `replay from ${replayFrom} provably has nothing to send (last seq ${lastSeqBeforeAttach}), and the `
+          + 'cursor is beyond everything this process produced: normal replay cannot deliver anything here',
+        );
+
+        /* ---- the agent reconnects carrying the previous process's cursor ---- */
+        const sse2 = await openSse(`${relay2.url}/v1/stream?machine_id=m1`, {
+          token: deviceToken,
+          headers: { 'last-event-id': String(staleCursor) },
+        });
+        try {
+          const ready = await sse2.waitFor((f) => f.event === 'ready');
+          assert.equal(ready.json.relay_id, relay2.relayId, 'the client can tell the relay restarted');
+          assert.ok(
+            staleCursor + 1 > lastSeqBeforeAttach,
+            `the cursor from the previous process (${staleCursor}) points past everything this process had `
+            + `produced (${lastSeqBeforeAttach}) -- the reverse of buffer truncation, and the case that used `
+            + 'to pass silently',
+          );
+          assert.ok(ready.json.seq > lastSeqBeforeAttach, 'the fresh process numbers its frames from scratch');
+
+          // the mismatch is now reported instead of passing silently
+          const truncated = await sse2.waitFor((f) => f.event === 'notice' && f.json.code === 'REPLAY_TRUNCATED');
+          assert.equal(truncated.json.level, 'warn');
+          assert.equal(truncated.json.reason, 'cursor_ahead_of_relay');
+          assert.equal(truncated.json.requested_seq, replayFrom);
+          assert.equal(truncated.json.oldest_available_seq, 1, 'the client learns where to re-align');
+          assert.equal(truncated.json.last_available_seq, lastSeqBeforeAttach);
+          assert.equal(truncated.json.relay_id, relay2.relayId);
+
+          // a plain event that fell into the same gap is recovered as well
+          const gapHello = await sse2.waitFor((f) => f.event === 'peer.hello' && f.json.machine_id === 'm2');
+          assert.ok(gapHello.json.seq <= lastSeqBeforeAttach, 'replayed from the ring, not re-emitted');
+
+          // THE FIX: the offer that fell into the gap is recovered -- twice over, and
+          // both copies are safe because (machine_id, task_id, attempt) is idempotent.
+          // (a) the re-alignment replay hands back the original event from the ring
+          const replayed = await sse2.waitFor((f) => f.event === 'task.offer'
+            && f.json.task_id === second.json.task_id && f.json.seq <= lastSeqBeforeAttach);
+          assert.equal(replayed.json.machine_id, 'm1');
+          // (b) the re-offer re-states the lease itself, with a fresh seq
+          const redelivered = await sse2.waitFor((f) => f.event === 'task.offer'
+            && f.json.task_id === second.json.task_id && f.json.seq > ready.json.seq);
+          assert.equal(redelivered.id, String(redelivered.json.seq));
+          const lease = relay2.state.getTask(second.json.task_id).leases.get('m1');
+          assert.equal(lease.offered_seq, redelivered.json.seq, 'the relay re-issued the offer');
+          assert.equal(lease.state, 'offered');
+
+          // and the already-finished tasks are not resurrected
+          const offeredTaskIds = [...new Set(sse2.frames
+            .filter((f) => f.event === 'task.offer')
+            .map((f) => f.json.task_id))];
+          assert.deepEqual(offeredTaskIds, [second.json.task_id],
+            'the terminal leases must not be re-offered');
+        } finally {
+          sse2.close();
+        }
+      } finally {
+        await relay2.close();
+      }
+    } finally {
+      removeStateDir(dir);
+    }
+  });
+
+  it('reports a cursor that is ahead of this process even without a restart', async () => {
+    await withRelay({ pairRateLimitPerMinute: 0 }, async (relay) => {
+      const { token } = await pairDevice(relay, 'm1');
+      await postTask(relay, taskBody());
+      const lastSeq = relay.state.lastSeq();
+      const foreignCursor = lastSeq + 500;
+
+      const sse = await openSse(`${relay.url}/v1/stream?machine_id=m1`, {
+        token, headers: { 'last-event-id': String(foreignCursor) },
+      });
+      try {
+        await sse.waitFor((f) => f.event === 'ready');
+        const notice = await sse.waitFor((f) => f.event === 'notice' && f.json.code === 'REPLAY_TRUNCATED');
+        assert.equal(notice.json.reason, 'cursor_ahead_of_relay');
+        assert.equal(notice.json.requested_seq, foreignCursor + 1);
+        assert.equal(notice.json.oldest_available_seq, 1);
+        assert.equal(notice.json.relay_id, relay.relayId);
+      } finally {
+        sse.close();
+      }
+    });
+  });
+
+  it('never re-offers a lease that is running, done or refused', async () => {
+    await withRelay({ pairRateLimitPerMinute: 0 }, async (relay) => {
+      const { token } = await pairDevice(relay, 'm1');
+
+      const done = await postTask(relay, taskBody());
+      await request(`${relay.url}/v1/result`, {
+        method: 'POST', token, body: envelopeForTask(done.json.task_id, 'm1'),
+      });
+      const running = await postTask(relay, taskBody());
+      relay.state.heartbeat({ task_id: running.json.task_id, machine_id: 'm1', phase: 'running' });
+      const refused = await postTask(relay, taskBody({ requirements: { platform: ['macos'] } }));
+      const pending = await postTask(relay, taskBody()); // the positive control
+
+      assert.equal(relay.state.getTask(done.json.task_id).leases.get('m1').state, 'done');
+      assert.equal(relay.state.getTask(running.json.task_id).leases.get('m1').state, 'running');
+      assert.equal(relay.state.getTask(refused.json.task_id).leases.get('m1').state, 'refused');
+
+      const sse = await openSse(`${relay.url}/v1/stream?machine_id=m1`, { token });
+      try {
+        // the positive control arriving proves the re-offer pass has already run
+        const offer = await sse.waitFor((f) => f.event === 'task.offer');
+        assert.equal(offer.json.task_id, pending.json.task_id);
+        await sleep(30);
+        assert.deepEqual(
+          sse.frames.filter((f) => f.event === 'task.offer').map((f) => f.json.task_id),
+          [pending.json.task_id],
+          'a running lease must never be re-offered: that would execute the command twice',
+        );
+        assert.equal(relay.state.getTask(running.json.task_id).leases.get('m1').state, 'running');
+        assert.equal(relay.state.getTask(done.json.task_id).leases.get('m1').state, 'done');
+      } finally {
+        sse.close();
+      }
+    });
+  });
+
+  it('survives a logger that throws, on startup and while re-offering', async () => {
+    // `logger: null` is the documented silent value and a caller-supplied logger may
+    // throw. Either one used to escape AFTER res.writeHead(), which surfaced as
+    // "Cannot write headers after they are sent to the client" on the SSE path.
+    await withRelay({ logger: () => { throw new Error('logger exploded'); }, pairRateLimitPerMinute: 0 }, async (relay) => {
+      const { token } = await pairDevice(relay, 'm1');
+      const created = await postTask(relay, taskBody()); // offer emitted with nobody attached
+      const sse = await openSse(`${relay.url}/v1/stream?machine_id=m1`, { token });
+      try {
+        await sse.waitFor((f) => f.event === 'ready');
+        const offer = await sse.waitFor((f) => f.event === 'task.offer'); // this path logs
+        assert.equal(offer.json.task_id, created.json.task_id);
+      } finally {
+        sse.close();
+      }
+      const hz = await request(`${relay.url}/healthz`);
+      assert.equal(hz.status, 200, 'a broken logger must not take the relay down');
+    });
+  });
+
+  it('does not resurrect a lease the sweep has already expired', async () => {
+    const clock = makeClock();
+    await withRelay({ now: clock.now, pairRateLimitPerMinute: 0 }, async (relay) => {
+      const { token } = await pairDevice(relay, 'm1');
+      const created = await postTask(relay, taskBody());
+      clock.advance(50_000);
+      assert.equal(relay.state.sweepExpired().length, 1, 'the lease is expired and owned by the sweep');
+
+      const sse = await openSse(`${relay.url}/v1/stream?machine_id=m1`, { token });
+      try {
+        await sse.waitFor((f) => f.event === 'ready');
+        await sleep(30);
+        assert.deepEqual(sse.frames.filter((f) => f.event === 'task.offer'), [],
+          'an expired lease must not be revived by a reconnect');
+        assert.equal(relay.state.getTask(created.json.task_id).leases.get('m1').state, 'expired');
+      } finally {
+        sse.close();
+      }
+    });
   });
 });
