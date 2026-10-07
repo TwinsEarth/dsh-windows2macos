@@ -1,122 +1,75 @@
-# W2M v0.0.1 发布状态
+# W2M 发布状态
 
-> 项目：**DSH: Windows2MacOS** · 版本 **0.0.1** · 发布日 2026-10-07
-> 本文记录**已完成的发布动作**与**仍需跟进的事项**，供下次继续。
+> 项目：**DSH: Windows2MacOS** · 当前版本 **0.1.2**（跨区域 / 跨网络）
+> 上一版本 **0.0.1**（同一局域网）。本文记录已完成的发布动作与仍需跟进的事项。
 
 ---
 
-## 1. 已完成 ✅
+## 1. 当前版本 v0.1.2（跨区域 / 跨网络）✅
 
 | 事项 | 结果 | 凭据 |
 |---|---|---|
-| 源码仓库 | https://github.com/TwinsEarth/dsh-windows2macos （public） | main 分支，工作区干净 |
-| 首版提交 | `35fcdc8` DSH: Windows2MacOS v0.0.1（33 文件 / 13,825 行） | `git log` |
-| 修复提交 | `dbaad9a` 修复插件 re-export 与 CLI 工厂名 + 两个门禁 | `git log` |
-| CI 提交 | `8c99e11` 三平台 CI；`6393d3f` 修复两个跨平台测试缺陷 | `git log` |
-| Release | https://github.com/TwinsEarth/dsh-windows2macos/releases/tag/v0.0.1 | tag `v0.0.1` |
-| 资产 | `twinsearth-w2m-dsh-plugin-0.0.1.tgz`（94,830 B）+ `SHA256SUMS` | `state=uploaded` |
-| tarball sha256 | `28f78a9ed22c829a5b0ee1f78c074062c25a2c10044fd126b9c3371b3d60e3fc` | 与 `gh release view --json assets` 的 `digest` 一致 |
-| **CI 徽章** | **CI - passing**（5/5 job 全绿） | https://github.com/TwinsEarth/dsh-windows2macos/actions/workflows/ci.yml |
-| Topics | `dsh-plugin` `deepseek-harness` `deepseek` `windows2macos` `multi-machine` `orchestration` | `gh repo view` |
-| 商店投稿 PR | https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/6783 | **open**，**仅 1 个文件 +7 行** |
-| 本地端到端 | 195 用例（relay 61 / agent 79 / tools 45 / e2e 10）全绿 | `scripts/verify.ps1` |
+| 版本 | `0.1.2` | `package.json` |
+| Release | https://github.com/TwinsEarth/dsh-windows2macos/releases/tag/v0.1.2 | tag `v0.1.2` |
+| 资产 | `twinsearth-w2m-dsh-plugin-0.1.2.tgz`（159,660 B）+ `SHA256SUMS` | 由 **CI 自动构建并发布**（`release.yml`），不是手工上传 |
+| 资产 sha256 | `2b55d7d10a1b292b8d4ce6add9631085027a443d6f5ad1c9974346fc7f52f344` | 与本地重建**逐字节一致**（已验证） |
+| CI | **5/5 全绿**：windows 20/22、macos 22、ubuntu 22、可复现性 job | run 37646434086 |
+| Release workflow | **success** | run 37646442275 |
+| 测试 | **315 用例 / 314 pass / 1 skip / 0 fail** | relay 91 · agent 105 · plugin 73 · e2e+crossnetwork 46 |
+| 商店投稿 | PR [#6783](https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/6783) **OPEN / MERGEABLE / 1 文件**，已更新到 0.1.2 | 2 commits |
 
-### CI 覆盖矩阵（`.github/workflows/ci.yml`）
+### v0.1.2 修掉的三个真实缺陷
+1. **子路径部署完全不可用** —— `new URL('/v1/stream', rabbitUrl)` 会吃掉路径前缀，挂在 `/w2m` 下的中继对所有请求回 404（含插件）。改为纯拼接。
+2. **重启后下发的任务会永久丢失** —— 中继重启后、机器流重连前发出的 offer 再也不会送达，lease 一路 `offered` 到被 sweep 判 expired（而两台机器全程 `online=true streams=1`）。两条独立原因：
+   - 补投路径**从未真正可达**：`this.logger(...)` 在响应头已发出后无条件调用（`logger:null` 是文档里的静默取值）→ `TypeError` → 顶层 catch 二次响应 → `Cannot write headers after they are sent`，正好摧毁它要修的那条 SSE 路径。次生错误掩盖了真实错误，这也是它藏这么久的原因。
+   - **上一个进程的游标被采信**：seq 从 0 重来，`Last-Event-ID: 42` 让新进程以为那些事件已消费，连同 `task.cancel` / `notice` 一起吞掉。
+3. **发布产物跨平台不可复现** —— zlib 把宿主 OS 写进 gzip 头第 9 字节（Windows=10/NTFS，Linux=3/Unix）；tar 载荷完全相同，只差这一个字节。原先的"可复现"检查只在同一台 runner 上 pack 两次，检测不到宿主相关字节。
 
-| job | 平台 | Node |
-|---|---|---|
-| test | `windows-latest` | 20 与 22 |
-| test | `macos-latest` | 22 |
-| test | `ubuntu-latest` | 22 |
-| pack | `ubuntu-latest` | 22 —— 打包两次，字节不一致即失败 |
+> **教训（已写进源码注释）**：送达保证必须来自**补投**（与游标无关）；失步判定只能当诊断，不能当安全网 —— `from > lastSeq + 1` 这个判定在 gap 里多塞几个事件后就会静默失效。
 
-> **CI 立刻抓到了两个真实缺陷，而它们在只跑 Windows 时是隐形的**：
-> ① 一个测试把 `.git/objects` 的整个 `readdir` 与快照比对，而 git 自己会异步写 `maintenance.lock`，导致 macOS 上列表不同；
-> ② 一个测试要求出现 `phase: 'running'` 的心跳，但该心跳间隔 10s、而任务不到 1s 就跑完 —— 它实际断言的是"机器足够慢"，macOS 跑太快所以失败。
-> 两者都是**测试缺陷而非产品缺陷**，已修复（`6393d3f`）。这正是加 CI 的价值。
+---
 
-### ⚠️ 发布资产的时效规则
+## 2. 上一版本 v0.0.1（局域网）✅
 
-`package.json` 的 `files` 打包了 `README.md` / `PROTOCOL.md` / `CHANGELOG.md` / `test/**`，所以**任何文档或测试改动都会改变 tarball 哈希**。当前线上资产对应 HEAD = `6393d3f`，已核对一致。
+| 事项 | 结果 |
+|---|---|
+| Release | https://github.com/TwinsEarth/dsh-windows2macos/releases/tag/v0.0.1 |
+| 资产 sha256 | `28f78a9ed22c829a5b0ee1f78c074062c25a2c10044fd126b9c3371b3d60e3fc` |
+| 说明 | 该资产是 CI 自动化之前手工上传的；**0.1.2 起改由 `release.yml` 在打 tag 时自动构建并发布**，不再手工同步哈希 |
 
-**发新版本时**：先冻结代码与文档 → 再 `pack` → 再 upload → 更新 `SHA256SUMS` → 更新本文件的哈希。顺序颠倒就会出现"线上资产与 tag 指向的源码不一致"。
-（本文件**不在** tarball 内，改它不影响哈希。）
-| Topics | `dsh-plugin` `deepseek-harness` `deepseek` `windows2macos` `multi-machine` `orchestration` | `gh repo view` |
-| 商店投稿 PR | https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/6783 | **open**，**仅 1 个文件 +7 行** |
-| 本地端到端 | 195 用例全绿（relay 61 / agent 79 / tools 45 / e2e 10）+ CLI 冒烟通过 | `scripts/verify.ps1` |
+### 自动发版流程（0.1.2 起）
+```
+1. 冻结代码 → 确认全部测试通过
+2. git tag -a v<version> && git push origin v<version>
+3. release.yml 自动：校验 tag 与 package.json 一致 → 跑全部测试 → pack
+   → 解包验证 5 个工具能注册 → 建 Release 并上传 tgz + SHA256SUMS
+```
+**不要再手工 pack/upload** —— 那正是 0.0.1 出现"线上资产与 tag 源码不一致"的原因。
 
-### 本地验证命令（可复跑）
+---
+
+## 3. 待跟进 ⏳
+
+1. **PR #6783 仍 OPEN**：唯一硬性阻塞是 upstream 的「仓库创建满 1 天」（2026-10-08T13:19:15Z 后自动满足）。**不要 force-push、不要关掉重开**（first-time contributor 的 fork PR 需维护者批准 workflow，前一个 PR #6352 就卡在这里）。
+2. **三种部署形态的真实网络层未实测**：Tailscale/WireGuard、公网 VPS+TLS、Cloudflare Tunnel/ngrok 都只做了语义等价测试（127.0.0.1 + 注入头）。`docs/DEPLOY.md` §7 列了每项的验证命令与"未在本机验证"标注。
+3. **真实的 Windows↔macOS 互联未实测**：CI 矩阵证明各平台跑得过，但矩阵里的两台机器不会互相通信；机器到机器链路目前只在同一主机的两个进程间验证过。
+4. **npm 未发布**：本机无 npmjs 凭据。tarball 通道已验证可用，商店也接受只给 tarball（4414 条中有 347 条如此）。
+5. **跨机状态视图**：当前 RTT 走同机状态文件；跨区域下"插件在 A 机、agent 在 B 机"时无效。正确做法是走中继（心跳 body 带 `rtt_ms`），属 v0.1.3 范畴。
+
+---
+
+## 4. 复跑验证（任何人可复现）
+
 ```powershell
+cd E:\DS\w2m
 $node = 'C:\Users\fangw\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\node\bin\node.exe'
-& $node E:\DS\w2m\scripts\check-entrypoints.mjs     # 入口可导入（曾抓到真实缺陷）
-& $node E:\DS\w2m\scripts\pack.mjs --out E:\DS\w2m\dist
-$env:DSH_HOME='E:\DS\_work\w2m\install-test2'
-$dsh = 'E:\DS\resources\runtime\cli\bin\dsh.cmd'
-& $dsh plugin --profile w2mtest add (Resolve-Path E:\DS\w2m\dist\twinsearth-w2m-dsh-plugin-0.0.1.tgz).Path
-& $node E:\DS\w2m\scripts\verify-installed.mjs "$env:DSH_HOME\profiles\w2mtest\node_modules\@twinsearth\w2m-dsh-plugin"
+& $node scripts/check-entrypoints.mjs                    # 入口可导入（曾抓到真实缺陷）
+& $node --test --test-force-exit test/relay.test.mjs test/agent.test.mjs test/tools.test.mjs
+& $node --test --test-force-exit test/e2e.test.mjs test/crossnetwork.test.mjs
+& $node scripts/pack.mjs --out dist                      # 应与线上资产同哈希
+& $node scripts/probe-restart.mjs                        # 重启丢 offer 的原始诊断探针
 ```
 
----
-
-## 2. 待跟进 ⏳
-
-### 2.1 PR #6783 需要仓库满 1 天（**唯一硬性阻塞，自愈**）
-- 仓库创建于 **2026-10-07T13:19:15Z** → **2026-10-08T13:19:15Z** 之后即满足 upstream 的「仓库创建满 1 天」要求。
-- **不需要重新提交或 force-push**。upstream `contributing.md` 明确：未满 1 天是自愈条件。
-- 我在 PR 正文里已主动声明这一点。
-
-### 2.2 CI 不会立刻跑（**不是内容问题，无法自行修复**）
-- `gh pr checks 6783` → `no checks reported`。
-- 原因（task-1 的前例已证实）：TwinsEarth 在该仓库是 **first-time contributor**，fork PR 的 workflow **需维护者点批准**才会执行。前一个 PR #6352 至今停留在这个状态。
-- **正确做法：等待，或在 PR 里礼貌 ping 维护者。不要 force-push、不要关掉重开。**
-
-### 2.3 上游 main 可能前进
-- 我的分支基于 `08f3df4`。若 upstream 在我们之前合并了其他 PR，需要 rebase 到最新 main 再推（**普通 rebase + push，不要 force-push 到别人的分支**；推自己的 fork 分支可以 force）。
-
-### 2.4 尚未做（非阻塞）
-- **npm 发布**：本机无 npmjs 凭据（`pnpm whoami` → 未登录）。tarball 通道已验证可用，商店的一键安装会优先用「经仓库验证的 npm 包」，但**只给 tarball 也完全可以**（4414 条中有 347 条只有 tarball）。若你想发 npm，需要先 `pnpm login`。
-- **Mac 真机验证**：所有实测都在 Windows 上完成。代码是平台中立的，但**未在 Mac 上跑过**。
-- **`write: true` 的合并**：v0.0.1 只执行不合并。
-
----
-
-## 3. 商店规范（复核用，来源：upstream `scripts/lib/entries.mjs`）
-
-字段白名单 = `url / name / category / description / tarball`（`file` 由读取器注入）。
-**`npm:` 是禁止字段**，写了会校验失败；npm 由 `probe-npm.mjs` 从仓库自动探测。
-
-我们的条目：
-```yaml
-url: https://github.com/TwinsEarth/dsh-windows2macos
-name: TwinsEarth/dsh-windows2macos
-category: remote
-tarball: https://github.com/TwinsEarth/dsh-windows2macos/releases/download/v0.0.1/twinsearth-w2m-dsh-plugin-0.0.1.tgz
-description:
-  en: '...'
-  zh: '...'
-```
-- 文件名必须 = `slugFor(url)` = `TwinsEarth__dsh-windows2macos.yml` ✅
-- `category: remote` 依据：该分类收录「局域网访问 / SSH / 跨机」类插件（例：`dsh-web-url-view`、`dsh-ssh-logs`）。选错不会被打回，维护者会改。
-- tarball 必须 `https` + host ∈ {github.com, objects.githubusercontent.com, release-assets.githubusercontent.com} + 以 `.tgz`/`.tar.gz` 结尾 ✅
-- **不要用 `releases/latest/download/<带版本号的名字>.tgz`**：下次发版即 404，站点会把它丢掉。我们用钉住 tag 的 URL ✅
-
-**已用 upstream 自己的校验器验证通过**：
-```powershell
-cd E:\DS\_work\w2m\market\upstream
-& $node --input-type=module -e "import('./scripts/lib/entries.mjs').then(m=>{const p=m.validateEntries(m.readEntries()); console.log(p.length?p.join('\n'):'ENTRY OK'); process.exit(p.length?1:0)})"
-# → ENTRY OK
-```
-
----
-
-## 4. v0.0.1 修过的两个真实缺陷（值得记住）
-
-两者都**通过了 `node --check` 与全部单元测试**，只会在 DSH 挂载插件时暴露：
-
-1. `lib/tools.js` 重新导出了一个 `default` 绑定，而 `src/plugin/tools.mjs` **没有** default 导出。
-   - `node --check` 只解析、不解析导入；单元测试直接 import `src/`，绕过了 `lib/`。
-2. `bin/w2m-rabbit.mjs` 从 relay 导入 `createRelay`，而实际导出是 `createRelayServer`。
-
-现在由两个门禁守着：`scripts/check-entrypoints.mjs`（导入真实挂载点）与 `scripts/verify-installed.mjs`（验证 profile 里**已安装的那份**副本）。
-
-> 教训：**"装上了"不等于"能加载"**。发布前必须验证已安装副本的 import 与注册数。
+**两个易踩的坑**：
+- `npm test` 曾因 `node --test test/` 在 Node 24 上被当成模块路径，**一个测试都没跑却报失败**；已改为显式文件列表 + `--test-force-exit`。
+- 端到端套件必须带 `--test-force-exit`：每个模拟机器都持有 SSE 长连，否则断言跑完事件循环也不退出。

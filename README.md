@@ -291,14 +291,14 @@ a product.
 
 | Suite | Tests | What it covers |
 |---|---|---|
-| relay | 61 | pairing, auth, SSE with `ready`-first and `seq` replay, leases with heartbeat renewal and expiry, dedupe, all six aggregation states, report generation |
-| agent | 79 | whitelist allow/deny, timeout, output truncation, exit codes, anchors on clean and dirty trees, four concurrent fingerprint computations, spool |
-| plugin | 45 | five tools registered, schemas, typed errors, polling |
-| end to end | 10 | two Localsides on two checkouts against one relay running real commands: consistent / divergent / failed / refused / unverifiable / deduped / long-lease / split |
+| relay | 91 | pairing, auth, SSE with `ready`-first and `seq` replay, leases with heartbeat renewal and expiry, dedupe, all six aggregation states, report generation, operation token, rate limiting, persistence and restart recovery, TLS, and the lost-offer recovery path |
+| agent | 105 | whitelist allow/deny, timeout, output truncation, exit codes, anchors on clean and dirty trees, four concurrent fingerprint computations, spool, a 40-case URL join matrix, cursor lifecycle across relay restarts |
+| plugin | 73 | five tools registered, schemas, typed errors, polling, operator-token enforcement (no request is sent without it), sub-path endpoints |
+| end to end + crossnetwork | 46 | two Localsides on two checkouts against one relay running real commands: consistent / divergent / failed / refused / unverifiable / deduped / long-lease / split, plus sub-path deployment, the two credential kinds, a SIGKILLed relay restarting with its ledger intact, pairing rate limiting, proxy-header trust boundaries, and the anti-buffering headers |
 
 Run them with `scripts/verify.ps1` (Windows) or `scripts/verify.sh` (macOS/Linux).
 One agent test skips on Windows — it asserts POSIX mode bits, which NTFS does not
-carry — so the count there is 78 pass + 1 skip.
+carry — so the count there is 104 pass + 1 skip.
 
 Two behaviours are checked but not covered by a test file, because both concern
 the real binaries rather than the modules:
