@@ -1,0 +1,196 @@
+# ============================================================================
+#  W2M relay behind nginx  --  example reverse-proxy configuration
+# ============================================================================
+#
+#  This file is a TEMPLATE. Replace every <placeholder> before using it.
+#  Nothing here contains a real domain, IP or token.
+#
+#  Validated how: nginx is not installed on the authoring machine, so this
+#  file was NOT checked with `nginx -t`. It was written against the nginx
+#  directives' documented semantics, and the three Server-Sent-Events settings
+#  it depends on were verified against the relay's actual response headers
+#  (see docs/DEPLOY.md, "SSE and reverse proxies").
+#
+#  ---------------------------------------------------------------------------
+#  THE THREE THINGS THAT MAKE SSE WORK (drop any one and events silently stop)
+#  ---------------------------------------------------------------------------
+#   1. `proxy_buffering off;`      nginx otherwise buffers the event stream and
+#                                  holds frames until its buffer fills, so the
+#                                  client connects, receives nothing, and looks
+#                                  "connected but dead".
+#   2. `proxy_read_timeout <long>;` the stream is a long-lived response with no
+#                                  data between keepalives (the relay sends
+#                                  `: keepalive` every 15s). The nginx default
+#                                  of 60s is survivable, but any shorter value
+#                                  kills idle connections.
+#   3. `proxy_http_version 1.1;`   SSE is an HTTP/1.1 chunked response. With the
+#                                  nginx default (1.0) the connection is closed
+#                                  at the end of the first response, so the
+#                                  stream ends immediately after it starts.
+#  The relay also sends `X-Accel-Buffering: no` and
+#  `Cache-Control: no-cache, no-transform`, which handles (1) for nginx
+#  automatically -- but keep `proxy_buffering off` anyway, because that header
+#  is nginx-specific and you do not want correctness to depend on one vendor.
+#
+#  ---------------------------------------------------------------------------
+#  TWO DEPLOYMENT SHAPES -- pick ONE
+#  ---------------------------------------------------------------------------
+#   Shape 1 (recommended, simplest): the relay is mounted at the ROOT of a
+#   dedicated hostname. Everything below marked [ROOT] applies; delete the
+#   sub-path block at the bottom. Relay flags: no --base-path.
+#
+#   Shape 2: the relay shares a hostname and lives under a prefix, e.g.
+#   https://<your-domain>/w2m/. Everything marked [ROOT] applies, PLUS the
+#   sub-path block at the bottom, and the relay MUST be started with
+#   `--base-path /w2m`. See docs/DEPLOY.md, "Sub-path deployments".
+# ============================================================================
+
+# Upstream: the relay listening on loopback. Keep it on loopback and let nginx
+# be the only thing exposed; the relay then needs no TLS of its own.
+upstream w2m_relay {
+    server 127.0.0.1:8787;
+    keepalive 16;
+}
+
+# ---------------------------------------------------------------------------
+# HTTP -> HTTPS redirect.
+# Remove this block if something else (CDN, load balancer) already redirects.
+# ---------------------------------------------------------------------------
+server {
+    listen 80;
+    listen [::]:80;
+    server_name <your-domain>;
+
+    # Let's Encrypt HTTP-01 challenge. Keep this even after issuance: renewal
+    # needs it every ~60 days.
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# ---------------------------------------------------------------------------
+# The relay itself.
+# ---------------------------------------------------------------------------
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name <your-domain>;
+
+    # --- certificates -------------------------------------------------------
+    # Paths are what certbot writes by default; adjust to your own layout.
+    ssl_certificate     /etc/letsencrypt/live/<your-domain>/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/<your-domain>/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    # --- request size -------------------------------------------------------
+    # Task results carry command output inline, so the default 1m is too small
+    # for a build log. Match `max_frame_bytes` on the relay side; 16m is a
+    # comfortable default for text output.
+    client_max_body_size 16m;
+
+    # --- SSE-friendly defaults ---------------------------------------------
+    # HTTP/1.1 is required for chunked event streams (reason 3 above). gzip
+    # must stay OFF here: compressing an event stream makes nginx buffer it,
+    # which reintroduces the exact failure this file exists to prevent.
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    gzip off;
+
+    # --- identity headers ---------------------------------------------------
+    # Host is what the relay (and its rate limiter) sees. X-Forwarded-* are
+    # only believed by the relay when it is started with --trust-proxy, which
+    # is exactly the case here, so these three must be set correctly.
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host  $host;
+    # The port the client actually used, needed when it is not the scheme
+    # default (the relay uses it to build its public URL hints).
+    proxy_set_header X-Forwarded-Port  $server_port;
+
+    # ======================= [ROOT] health check ==========================
+    # Kept unauthenticated so `curl https://<your-domain>/healthz` from a
+    # laptop answers "is the relay alive, and has it restarted?".
+    location = /healthz {
+        proxy_pass http://w2m_relay/healthz;
+
+        # --- the three SSE settings also apply to this endpoint's server block
+        # but buffering is harmless for a small JSON body, so only the timeout
+        # matters here.
+        proxy_read_timeout 30s;
+    }
+
+    # ======================= [ROOT] event stream ==========================
+    # The SSE endpoint gets its own location so the long timeout and disabled
+    # buffering cannot be forgotten for the one route that needs them.
+    location = /v1/stream {
+        proxy_pass http://w2m_relay/v1/stream;
+
+        # 1. no buffering: frames must leave immediately
+        proxy_buffering off;
+        proxy_cache off;
+        # 2. long-lived response: keepalives arrive every 15s; allow a wide
+        #    margin (this is 24h, i.e. effectively "do not time out")
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+        # 3. HTTP/1.1 chunked (set for the whole server block above; repeated
+        #    here so this file is safe to copy location-by-location)
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+    }
+
+    # ======================= [ROOT] everything else =======================
+    location / {
+        proxy_pass http://w2m_relay;
+
+        proxy_buffering off;
+        proxy_read_timeout 120s;
+        proxy_send_timeout 120s;
+    }
+
+    # ======================= Shape 2: sub-path ============================
+    # Uncomment this block ONLY if the relay is mounted under a prefix.
+    #
+    #   nginx passes the prefix through unchanged (`proxy_pass` with no URI),
+    #   and the relay is started with `--base-path /w2m`, which is the
+    #   combination PROTOCOL-v0.1.2 §3 describes as "反代原样透传".
+    #
+    #   Client `rabbitUrl` must then include the same prefix:
+    #       https://<your-domain>/w2m
+    #
+    #   Do NOT use a trailing-slash rewrite (`proxy_pass http://w2m_relay/;`)
+    #   here: stripping the prefix in nginx while the relay also expects it is
+    #   the single most common misconfiguration, and it produces 404 on every
+    #   /v1/* call.
+    #
+    # location /w2m/ {
+    #     proxy_pass http://w2m_relay;
+    #
+    #     proxy_http_version 1.1;
+    #     proxy_set_header Connection "";
+    #     proxy_set_header Host              $host;
+    #     proxy_set_header X-Real-IP         $remote_addr;
+    #     proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    #     proxy_set_header X-Forwarded-Proto $scheme;
+    #     proxy_set_header X-Forwarded-Port  $server_port;
+    #
+    #     proxy_buffering off;
+    #     proxy_read_timeout 86400s;
+    #     proxy_send_timeout 86400s;
+    # }
+    #
+    # # The relay answers /healthz both with and without the prefix, so a
+    # # monitoring probe pointed at the bare path keeps working:
+    # location = /healthz {
+    #     proxy_pass http://w2m_relay/healthz;
+    #     proxy_read_timeout 30s;
+    # }
+}

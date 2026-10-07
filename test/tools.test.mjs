@@ -97,8 +97,12 @@ async function register(config = {}) {
  * Install a routing `fetch` for one test, and a stub `Response` when the runtime under test has
  * none (the plugin's fallback path reads `response.body` through `arrayBuffer()` in that case).
  *
+ * A route may also carry `responses: [...]`, which answers the 1st, 2nd, … call with the successive
+ * entries and repeats the last one after that. That is how a test drives "the relay restarted
+ * between two calls" without inventing two different URLs for the same endpoint.
+ *
  * @param {Array<{method?: string, path: string, status?: number, body?: unknown, text?: string,
- *                contentType?: string, headers?: object}>} routes
+ *                contentType?: string, headers?: object, responses?: object[]}>} routes
  * @returns {{calls: Array<{method: string, url: string, headers: object, body: unknown}>, restore: () => void}}
  */
 function installFetch(routes) {
@@ -122,10 +126,18 @@ function installFetch(routes) {
       throw new Error(`test route missing: ${method} ${parsed.pathname}`);
     }
 
-    const status = route.status ?? 200;
-    const text = route.text ?? JSON.stringify(route.body ?? {});
-    const contentType = route.contentType ?? 'application/json';
-    const responseHeaders = { 'content-type': contentType, ...(route.headers ?? {}) };
+    let answer = route;
+    if (Array.isArray(route.responses) && route.responses.length > 0) {
+      const seen = calls.filter(
+        (call) => call.path === parsed.pathname && call.method === method,
+      ).length;
+      answer = route.responses[Math.min(seen - 1, route.responses.length - 1)];
+    }
+
+    const status = answer.status ?? 200;
+    const text = answer.text ?? JSON.stringify(answer.body ?? {});
+    const contentType = answer.contentType ?? 'application/json';
+    const responseHeaders = { 'content-type': contentType, ...(answer.headers ?? {}) };
 
     if (hasResponse) {
       return new previousResponse(text, { status, headers: responseHeaders });
@@ -153,6 +165,9 @@ function installFetch(routes) {
     },
   };
 }
+
+/** The operator credential (PROTOCOL-v0.1.2 §5). Only w2m_run may use it. */
+const OPERATOR_TOKEN = 'opr-test-xyz';
 
 /** A device.json that satisfies the paired-device path. */
 const PAIRED_DEVICE = {
@@ -240,7 +255,7 @@ function finalTask(overrides = {}) {
 describe('registration shape', () => {
   it('declares the tools service and registers exactly five tools', async () => {
     assert.deepEqual(plugin.inject, ['tools']);
-    const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE) });
+    const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
     assert.equal(tools.size, 5);
     assert.deepEqual(
       [...tools.keys()].sort(),
@@ -424,7 +439,7 @@ describe('argument gating', () => {
   it('rejects a missing task_id rather than asking the Rabbit about "undefined"', async () => {
     const fetchStub = installFetch([]);
     try {
-      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE) });
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
       for (const name of ['w2m_wait', 'w2m_report']) {
         await assert.rejects(() => tools.get(name).execute({}, {}), /task_id/, name);
       }
@@ -437,7 +452,7 @@ describe('argument gating', () => {
   it('rejects an empty or non-string argv array before calling the Rabbit', async () => {
     const fetchStub = installFetch([]);
     try {
-      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE) });
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
       const run = tools.get('w2m_run');
       for (const bad of [undefined, [], ['node', 7], ['node', ''], 'node --test']) {
         await assert.rejects(
@@ -455,7 +470,7 @@ describe('argument gating', () => {
   it('rejects an unknown mode and an impossible index_total', async () => {
     const fetchStub = installFetch([]);
     try {
-      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE) });
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
       const run = tools.get('w2m_run');
       await assert.rejects(() => run.execute(runArgs({ mode: 'broadcast' }), {}), /`replicate` or `split`/);
       await assert.rejects(() => run.execute(runArgs({ mode: 'split', index_total: 0 }), {}), /index_total/);
@@ -472,7 +487,7 @@ describe('argument gating', () => {
   it('refuses a write with no write_scope instead of silently running read-only', async () => {
     const fetchStub = installFetch([]);
     try {
-      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE) });
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
       await assert.rejects(
         () => tools.get('w2m_run').execute(runArgs({ write: true }), {}),
         (error) => {
@@ -494,6 +509,7 @@ describe('argument gating', () => {
         rabbitUrl: RABBIT,
         stateDir: await makeStateDir(PAIRED_DEVICE),
         allowedCommands: ['node', 'git'],
+        operatorToken: OPERATOR_TOKEN,
       });
       const value = JSON.parse(await tools.get('w2m_run').execute(runArgs({ command_argv: ['rm', '-rf', '/'] }), {}));
       assert.equal(value.ok, false);
@@ -514,6 +530,7 @@ describe('argument gating', () => {
         stateDir: await makeStateDir(PAIRED_DEVICE),
         allowedCommands: ['Node.exe'],
         projectDir: await makeNonRepoDir(),
+        operatorToken: OPERATOR_TOKEN,
       });
       const value = JSON.parse(await tools.get('w2m_run').execute(runArgs({ command_argv: ['C:\\Program Files\\nodejs\\node.exe', '--test'] }), {}));
       assert.equal(value.ok, true);
@@ -527,7 +544,7 @@ describe('argument gating', () => {
     const fetchStub = installFetch([{ method: 'POST', path: '/v1/task', body: { task_id: '01J', leases: [], seq: 1 } }]);
     try {
       const nonRepo = await makeNonRepoDir();
-      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), projectDir: nonRepo });
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), projectDir: nonRepo, operatorToken: OPERATOR_TOKEN });
       const value = JSON.parse(await tools.get('w2m_run').execute(runArgs({ command_argv: ['echo', 'hi'] }), {}));
       assert.equal(value.ok, true);
       assert.equal(fetchStub.calls.length, 1);
@@ -569,7 +586,7 @@ describe('happy paths', () => {
       },
     ]);
     try {
-      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE) });
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
       const value = JSON.parse(await tools.get('w2m_devices').execute({}, {}));
 
       assert.equal(fetchStub.calls.length, 1);
@@ -601,7 +618,7 @@ describe('happy paths', () => {
       { path: '/v1/devices', body: { devices: [{ machine_id: 'bbb', state: 'expired' }] } },
     ]);
     try {
-      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE) });
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
       const value = JSON.parse(await tools.get('w2m_devices').execute({ include_stale: true }, {}));
       assert.equal(value.count, 1);
       assert.equal(value.excluded_stale, 0);
@@ -632,6 +649,7 @@ describe('happy paths', () => {
         stateDir: await makeStateDir(PAIRED_DEVICE),
         projectDir: nonRepo,
         machineName: 'win-desktop',
+        operatorToken: OPERATOR_TOKEN,
       });
       const value = JSON.parse(
         await tools.get('w2m_run').execute(runArgs({ cwd_rel: 'src', timeout_ms: 60_000 }), {}),
@@ -641,7 +659,9 @@ describe('happy paths', () => {
       const call = fetchStub.calls[0];
       assert.equal(call.method, 'POST');
       assert.equal(call.path, '/v1/task');
-      assert.equal(call.headers.authorization, 'Bearer tok-test-abc');
+      // §5: dispatching carries the OPERATOR credential, not this machine's device token.
+      assert.equal(call.headers.authorization, `Bearer ${OPERATOR_TOKEN}`);
+      assert.notEqual(call.headers.authorization, `Bearer ${PAIRED_DEVICE.device_token}`);
       assert.equal(call.headers['content-type'], 'application/json');
 
       const body = call.body;
@@ -701,7 +721,7 @@ describe('happy paths', () => {
 
     const fetchStub = installFetch([{ method: 'POST', path: '/v1/task', body: { task_id: '01J', leases: [], seq: 1 } }]);
     try {
-      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), projectDir: repo });
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), projectDir: repo, operatorToken: OPERATOR_TOKEN });
       const value = JSON.parse(await tools.get('w2m_run').execute(runArgs(), {}));
 
       assert.equal(value.anchors.base_commit, head);
@@ -742,7 +762,7 @@ describe('happy paths', () => {
       return new globalThis.Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
     };
     try {
-      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE) });
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
       const value = JSON.parse(
         await tools.get('w2m_wait').execute({ task_id: '01JABCDEF', wait_ms: 5000, poll_ms: 25 }, {}),
       );
@@ -771,7 +791,7 @@ describe('happy paths', () => {
       { path: '/v1/tasks/01JX', body: taskResponse(finalTask({ status: 'probably-fine' })) },
     ]);
     try {
-      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE) });
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
       const value = JSON.parse(await tools.get('w2m_wait').execute({ task_id: '01JX', wait_ms: 1000 }, {}));
       assert.equal(value.ok, true);
       assert.equal(value.state, 'probably-fine');
@@ -786,7 +806,7 @@ describe('happy paths', () => {
     unknown.machines[0].envelope.something_new_from_the_rabbit = 1;
     const fetchStub = installFetch([{ path: '/v1/tasks/01JY', body: taskResponse(unknown) }]);
     try {
-      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE) });
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
       const value = JSON.parse(await tools.get('w2m_wait').execute({ task_id: '01JY', wait_ms: 1000 }, {}));
       assert.deepEqual(value.unknown_fields, ['something_new_from_the_rabbit']);
     } finally {
@@ -799,7 +819,7 @@ describe('happy paths', () => {
     big.machines[0].envelope.stdout_head = 'x'.repeat(50_000);
     const fetchStub = installFetch([{ path: '/v1/tasks/01JBIG', body: taskResponse(big) }]);
     try {
-      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE) });
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
       const value = JSON.parse(await tools.get('w2m_wait').execute({ task_id: '01JBIG', wait_ms: 1000 }, {}));
       const head = value.machines[0].envelope.stdout_head;
       assert.ok(head.length < 50_000);
@@ -820,7 +840,7 @@ describe('happy paths', () => {
     });
     const fetchStub = installFetch([{ path: '/v1/tasks/01JFAIL', body: taskResponse(failing) }]);
     try {
-      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE) });
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
       const value = JSON.parse(await tools.get('w2m_wait').execute({ task_id: '01JFAIL', wait_ms: 1000 }, {}));
       assert.equal(value.ok, true);
       assert.equal(value.state, 'failed');
@@ -843,7 +863,7 @@ describe('happy paths', () => {
     });
     const fetchStub = installFetch([{ path: '/v1/tasks/01JREF', body: taskResponse(refused) }]);
     try {
-      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE) });
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
       const value = JSON.parse(await tools.get('w2m_wait').execute({ task_id: '01JREF', wait_ms: 5000, poll_ms: 25 }, {}));
       assert.equal(fetchStub.calls.length, 1, 'refused is a terminal verdict, not a reason to keep polling');
       assert.equal(value.complete, true);
@@ -866,7 +886,7 @@ describe('happy paths', () => {
     });
     const fetchStub = installFetch([{ path: '/v1/tasks/01JPART', body: taskResponse(partial) }]);
     try {
-      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE) });
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
       const value = JSON.parse(await tools.get('w2m_wait').execute({ task_id: '01JPART', wait_ms: 1000 }, {}));
       assert.equal(value.state, 'partial');
       assert.deepEqual(value.states, ['ok', 'refused']);
@@ -893,7 +913,7 @@ describe('happy paths', () => {
       return new globalThis.Response(JSON.stringify(waiting), { status: 200, headers: { 'content-type': 'application/json' } });
     };
     try {
-      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE) });
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
       const value = JSON.parse(await tools.get('w2m_wait').execute({ task_id: '01JWAIT', wait_ms: 120, poll_ms: 25 }, {}));
       assert.ok(polls >= 2, 'a machine still running is not a terminal state');
       assert.equal(value.complete, false);
@@ -914,7 +934,7 @@ describe('happy paths', () => {
       },
     ]);
     try {
-      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE) });
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
       const value = JSON.parse(await tools.get('w2m_wait').execute({ task_id: '01JSLOW', wait_ms: 120, poll_ms: 25 }, {}));
       assert.equal(value.ok, true);
       assert.equal(value.complete, false);
@@ -931,7 +951,7 @@ describe('happy paths', () => {
   it('w2m_wait keeps polling through a retryable Rabbit error and says so if it times out', async () => {
     const fetchStub = installFetch([{ path: '/v1/tasks/01J503', status: 503, body: { error: { code: 'INTERNAL', message: 'busy' } } }]);
     try {
-      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE) });
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
       const value = JSON.parse(await tools.get('w2m_wait').execute({ task_id: '01J503', wait_ms: 100, poll_ms: 25 }, {}));
       assert.equal(value.state, 'timeout');
       assert.equal(value.last_error, 'HTTP 503 (INTERNAL)');
@@ -947,7 +967,7 @@ describe('happy paths', () => {
       { path: '/v1/tasks/nope', status: 404, body: { error: { code: 'NOT_FOUND', message: 'no such task' } } },
     ]);
     try {
-      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE) });
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
       await assert.rejects(
         () => tools.get('w2m_wait').execute({ task_id: 'nope', wait_ms: 1000 }, {}),
         (error) => {
@@ -969,7 +989,7 @@ describe('happy paths', () => {
       { path: '/v1/tasks/01JREP2/report', body: { task_id: '01JREP2', state: 'consistent' } },
     ]);
     try {
-      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE) });
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
 
       const md = JSON.parse(await tools.get('w2m_report').execute({ task_id: '01JREP' }, {}));
       assert.equal(fetchStub.calls[0].method, 'GET');
@@ -993,7 +1013,7 @@ describe('happy paths', () => {
   it('w2m_report defaults to md and refuses an unknown format by falling back to md', async () => {
     const fetchStub = installFetch([{ path: '/v1/tasks/01JDEF/report', text: 'x', contentType: 'text/markdown' }]);
     try {
-      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE) });
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
       const value = JSON.parse(await tools.get('w2m_report').execute({ task_id: '01JDEF', format: 'pdf' }, {}));
       assert.equal(value.format, 'md');
       assert.equal(fetchStub.calls[0].search, '?format=md');
@@ -1083,7 +1103,7 @@ describe('bounds and cancellation', () => {
       },
     ]);
     try {
-      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE) });
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
       await assert.rejects(
         () => tools.get('w2m_report').execute({ task_id: '01JHUGE' }, {}),
         (error) => {
@@ -1100,7 +1120,7 @@ describe('bounds and cancellation', () => {
   it('honours exec.signal before any network call', async () => {
     const fetchStub = installFetch([]);
     try {
-      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE) });
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
       const controller = new AbortController();
       controller.abort(new Error('caller cancelled'));
       await assert.rejects(
@@ -1121,7 +1141,7 @@ describe('bounds and cancellation', () => {
         init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true });
       });
     try {
-      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE) });
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
       const pending = tools.get('w2m_devices').execute({}, { signal: controller.signal });
       controller.abort(new Error('stop now'));
       await assert.rejects(() => pending, /W2M_ABORTED/);
@@ -1136,7 +1156,7 @@ describe('bounds and cancellation', () => {
       throw new TypeError('connect ECONNREFUSED 127.0.0.1:8787');
     };
     try {
-      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE) });
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
       await assert.rejects(
         () => tools.get('w2m_devices').execute({}, {}),
         (error) => {
@@ -1171,3 +1191,653 @@ describe('bounds and cancellation', () => {
     assert.match(warnings[0], /production/i);
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+// 6. v0.1.2 — operator token (§5)
+// ---------------------------------------------------------------------------------------------
+
+describe('v0.1.2 operator token', () => {
+  it('w2m_run refuses without an operatorToken and names the setting, before touching the wire', async () => {
+    const fetchStub = installFetch([]);
+    try {
+      // A paired device with a perfectly good device token: §5 says that is still not enough.
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE) });
+      await assert.rejects(
+        () => tools.get('w2m_run').execute(runArgs(), {}),
+        (error) => {
+          assert.equal(error.code, 'W2M_CONFIG');
+          assert.match(error.message, /operatorToken/, 'must name the missing setting');
+          assert.match(error.message, /device token cannot dispatch tasks/i, 'must say why the device token will not do');
+          assert.match(error.message, /W2M_OPERATOR_TOKEN/, 'must name the environment fallback');
+          assert.match(error.message, /operator-token\.txt/, 'must say where the relay keeps the value');
+          return true;
+        },
+      );
+      assert.equal(fetchStub.calls.length, 0, 'a missing operator token must not reach the relay');
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('never silently falls back to the device token', async () => {
+    const fetchStub = installFetch([{ method: 'POST', path: '/v1/task', body: { task_id: '01J', leases: [], seq: 1 } }]);
+    try {
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE) });
+      await assert.rejects(() => tools.get('w2m_run').execute(runArgs(), {}), /operatorToken/);
+      assert.equal(
+        fetchStub.calls.length,
+        0,
+        'trying the device token first would turn a missing setting into a confusing remote 401',
+      );
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('reads W2M_OPERATOR_TOKEN from the environment when the config omits it', async () => {
+    const fetchStub = installFetch([{ method: 'POST', path: '/v1/task', body: { task_id: '01JENV', leases: [], seq: 2 } }]);
+    const previous = process.env.W2M_OPERATOR_TOKEN;
+    process.env.W2M_OPERATOR_TOKEN = 'opr-from-env';
+    try {
+      const nonRepo = await makeNonRepoDir();
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), projectDir: nonRepo });
+      const value = JSON.parse(await tools.get('w2m_run').execute(runArgs(), {}));
+      assert.equal(value.ok, true);
+      assert.equal(fetchStub.calls[0].headers.authorization, 'Bearer opr-from-env');
+    } finally {
+      if (previous === undefined) delete process.env.W2M_OPERATOR_TOKEN;
+      else process.env.W2M_OPERATOR_TOKEN = previous;
+      fetchStub.restore();
+    }
+  });
+
+  it('prefers the configured operatorToken over the environment', async () => {
+    const fetchStub = installFetch([{ method: 'POST', path: '/v1/task', body: { task_id: '01JCFG', leases: [], seq: 3 } }]);
+    const previous = process.env.W2M_OPERATOR_TOKEN;
+    process.env.W2M_OPERATOR_TOKEN = 'opr-from-env';
+    try {
+      const nonRepo = await makeNonRepoDir();
+      const { tools } = await register({
+        rabbitUrl: RABBIT,
+        stateDir: await makeStateDir(PAIRED_DEVICE),
+        projectDir: nonRepo,
+        operatorToken: 'opr-from-config',
+      });
+      await tools.get('w2m_run').execute(runArgs(), {});
+      assert.equal(fetchStub.calls[0].headers.authorization, 'Bearer opr-from-config');
+    } finally {
+      if (previous === undefined) delete process.env.W2M_OPERATOR_TOKEN;
+      else process.env.W2M_OPERATOR_TOKEN = previous;
+      fetchStub.restore();
+    }
+  });
+
+  it('keeps the other four tools on the device token', async () => {
+    const fetchStub = installFetch([
+      { path: '/v1/devices', body: { devices: [] } },
+      { path: '/v1/tasks/01JDEV', body: taskResponse(finalTask()) },
+      { path: '/v1/tasks/01JDEV/report', text: '# r', contentType: 'text/markdown' },
+    ]);
+    try {
+      // An operator token IS configured here, and must still not leak into the device endpoints.
+      const { tools } = await register({
+        rabbitUrl: RABBIT,
+        stateDir: await makeStateDir(PAIRED_DEVICE),
+        operatorToken: OPERATOR_TOKEN,
+      });
+      await tools.get('w2m_devices').execute({}, {});
+      await tools.get('w2m_wait').execute({ task_id: '01JDEV', wait_ms: 1000 }, {});
+      await tools.get('w2m_report').execute({ task_id: '01JDEV' }, {});
+
+      assert.equal(fetchStub.calls.length, 3);
+      for (const call of fetchStub.calls) {
+        assert.equal(
+          call.headers.authorization,
+          `Bearer ${PAIRED_DEVICE.device_token}`,
+          `${call.path} must authorise with the device token, not the operator token`,
+        );
+      }
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('explains OPERATOR_REQUIRED when the relay rejects the dispatch', async () => {
+    const fetchStub = installFetch([
+      {
+        method: 'POST',
+        path: '/v1/task',
+        status: 401,
+        body: { error: { code: 'OPERATOR_REQUIRED', message: 'this is a device token; dispatching needs the operator token' } },
+      },
+    ]);
+    try {
+      const nonRepo = await makeNonRepoDir();
+      const { tools } = await register({
+        rabbitUrl: RABBIT,
+        stateDir: await makeStateDir(PAIRED_DEVICE),
+        projectDir: nonRepo,
+        operatorToken: 'opr-wrong',
+      });
+      await assert.rejects(
+        () => tools.get('w2m_run').execute(runArgs(), {}),
+        (error) => {
+          assert.match(error.message, /OPERATOR_REQUIRED/);
+          assert.match(error.message, /operatorToken/);
+          assert.match(error.message, /device token cannot dispatch tasks/i);
+          assert.match(String(error.hint ?? ''), /operator-token\.txt/);
+          return true;
+        },
+      );
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('reports operator-token state in w2m_status without claiming to have validated it', async () => {
+    const fetchStub = installFetch([
+      { path: '/healthz', body: { ok: true, protocol_version: 1, operator_token_required: true } },
+    ]);
+    try {
+      const nonRepo = await makeNonRepoDir();
+      const { tools } = await register({
+        rabbitUrl: RABBIT,
+        stateDir: await makeStateDir(PAIRED_DEVICE),
+        projectDir: nonRepo,
+        operatorToken: OPERATOR_TOKEN,
+      });
+      const value = JSON.parse(await tools.get('w2m_status').execute({}, {}));
+      assert.equal(value.config.operatorToken_configured, true);
+      assert.equal(value.config.operatorToken_source, 'config');
+      assert.equal(value.config.operatorToken_required_by_relay, true);
+      assert.equal(value.config.operatorToken, undefined, 'the token itself must never be echoed');
+      assert.ok(value.notes.some((note) => /relay requires an operator token/.test(note)) === false);
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('warns in w2m_status when the relay wants an operator token and none is configured', async () => {
+    const fetchStub = installFetch([
+      { path: '/healthz', body: { ok: true, protocol_version: 1, operator_token_required: true } },
+    ]);
+    try {
+      const nonRepo = await makeNonRepoDir();
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), projectDir: nonRepo });
+      const value = JSON.parse(await tools.get('w2m_status').execute({}, {}));
+      assert.equal(value.config.operatorToken_configured, false);
+      assert.equal(value.config.operatorToken_required_by_relay, true);
+      assert.ok(
+        value.notes.some((note) => /requires an operator token for POST \/v1\/task and none is configured/.test(note)),
+        'the mismatch is the single most useful thing this tool can say',
+      );
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('flags a relay that explicitly does not require an operator token', async () => {
+    const fetchStub = installFetch([
+      { path: '/healthz', body: { ok: true, protocol_version: 1, operator_token_required: false } },
+    ]);
+    try {
+      const nonRepo = await makeNonRepoDir();
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), projectDir: nonRepo });
+      const value = JSON.parse(await tools.get('w2m_status').execute({}, {}));
+      assert.equal(value.config.operatorToken_required_by_relay, false);
+      assert.ok(value.notes.some((note) => /does not require an operator token/.test(note)));
+    } finally {
+      fetchStub.restore();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// 7. v0.1.2 — sub-path base addresses (§2)
+// ---------------------------------------------------------------------------------------------
+
+describe('v0.1.2 sub-path rabbitUrl', () => {
+  it('keeps the deployment sub-path on every endpoint', async () => {
+    const fetchStub = installFetch([
+      { path: '/team-a/w2m/v1/devices', body: { devices: [] } },
+      { method: 'POST', path: '/team-a/w2m/v1/task', body: { task_id: '01JSUB', leases: [], seq: 9 } },
+      { path: '/team-a/w2m/v1/tasks/01JSUB', body: taskResponse(finalTask({ task_id: '01JSUB' })) },
+      { path: '/team-a/w2m/v1/tasks/01JSUB/report', text: '# r', contentType: 'text/markdown' },
+      { path: '/team-a/w2m/healthz', body: { ok: true, protocol_version: 1 } },
+    ]);
+    try {
+      const nonRepo = await makeNonRepoDir();
+      const { tools } = await register({
+        rabbitUrl: 'https://w2m.example.com/team-a/w2m',
+        stateDir: await makeStateDir(PAIRED_DEVICE),
+        projectDir: nonRepo,
+        operatorToken: OPERATOR_TOKEN,
+      });
+
+      await tools.get('w2m_devices').execute({}, {});
+      await tools.get('w2m_run').execute(runArgs(), {});
+      await tools.get('w2m_wait').execute({ task_id: '01JSUB', wait_ms: 1000 }, {});
+      await tools.get('w2m_report').execute({ task_id: '01JSUB' }, {});
+      await tools.get('w2m_status').execute({}, {});
+
+      assert.deepEqual(
+        fetchStub.calls.map((call) => call.path),
+        [
+          '/team-a/w2m/v1/devices',
+          '/team-a/w2m/v1/task',
+          '/team-a/w2m/v1/tasks/01JSUB',
+          '/team-a/w2m/v1/tasks/01JSUB/report',
+          '/team-a/w2m/healthz',
+        ],
+        'new URL(path, base) would have dropped /team-a/w2m and 404ed on all five',
+      );
+      for (const call of fetchStub.calls) {
+        assert.ok(call.url.startsWith('https://w2m.example.com/team-a/w2m/'), call.url);
+      }
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('treats a trailing slash on the base as the same base', async () => {
+    const fetchStub = installFetch([{ path: '/w2m/v1/devices', body: { devices: [] } }]);
+    try {
+      const { tools } = await register({
+        rabbitUrl: 'https://h.example.com/w2m/',
+        stateDir: await makeStateDir(PAIRED_DEVICE),
+      });
+      await tools.get('w2m_devices').execute({}, {});
+      assert.equal(fetchStub.calls[0].path, '/w2m/v1/devices');
+      assert.ok(!fetchStub.calls[0].url.includes('/w2m//'), 'a trailing slash must not produce a doubled slash');
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('accepts a Tailscale base and a ported base unchanged', async () => {
+    const fetchStub = installFetch([
+      { path: '/v1/devices', body: { devices: [] } },
+      // A base with a sub-path: the routes are keyed by the real request path, prefix included.
+      { path: '/w2m/v1/devices', body: { devices: [] } },
+    ]);
+    try {
+      const dir = await makeStateDir(PAIRED_DEVICE);
+      const tailscale = await register({ rabbitUrl: 'http://100.64.0.5:8787', stateDir: dir });
+      await tailscale.tools.get('w2m_devices').execute({}, {});
+      assert.equal(fetchStub.calls[0].url, 'http://100.64.0.5:8787/v1/devices');
+
+      const ported = await register({ rabbitUrl: 'https://w2m.example.com:8443/w2m', stateDir: dir });
+      await ported.tools.get('w2m_devices').execute({}, {});
+      assert.equal(fetchStub.calls[1].url, 'https://w2m.example.com:8443/w2m/v1/devices');
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('refuses a base with a query string or fragment, naming rabbitUrl and the reason', async () => {
+    await assert.rejects(
+      () => register({ rabbitUrl: 'https://w2m.example.com?prefix=/w2m' }),
+      (error) => {
+        assert.match(error.message, /rabbitUrl/);
+        assert.match(error.message, /query/i);
+        return true;
+      },
+    );
+    await assert.rejects(
+      () => register({ rabbitUrl: 'https://w2m.example.com/w2m#top' }),
+      (error) => {
+        assert.match(error.message, /rabbitUrl/);
+        assert.match(error.message, /fragment/i);
+        return true;
+      },
+    );
+  });
+
+  it('refuses a non-http scheme with a message that names the scheme', async () => {
+    await assert.rejects(
+      () => register({ rabbitUrl: 'ftp://example.invalid' }),
+      (error) => {
+        assert.match(error.message, /rabbitUrl/);
+        assert.match(error.message, /scheme/i);
+        return true;
+      },
+    );
+  });
+
+  it('does not use new URL(path, base), which is the defect §2 exists to fix', async () => {
+    // Pins the exact failure mode: if the two-argument constructor came back, this expectation
+    // would be the thing that breaks.
+    const broken = new URL('/v1/devices', 'https://h/w2m').href;
+    assert.equal(broken, 'https://h/v1/devices', 'the broken spelling really does drop the prefix');
+
+    const { joinUrl } = await import('../src/agent/url.mjs');
+    assert.equal(joinUrl('https://h/w2m', '/v1/devices'), 'https://h/w2m/v1/devices');
+  });
+
+  it('agrees with the agent-side url.mjs helper it imports', async () => {
+    const agentUrl = await import('../src/agent/url.mjs');
+    const bases = ['https://h', 'https://h/', 'https://h/w2m', 'https://h/w2m/', 'http://100.64.0.5:8787', 'https://h:8443/a/b/'];
+    const paths = ['/v1/devices', 'v1/devices', '/v1/tasks/01J/report', '/healthz'];
+    for (const base of bases) {
+      for (const p of paths) {
+        const expected = `${agentUrl.resolveBaseUrl(base)}${p.startsWith('/') ? p : `/${p}`}`;
+        assert.equal(agentUrl.joinUrl(agentUrl.resolveBaseUrl(base), p), expected);
+      }
+    }
+    // The plugin must reject exactly what the agent rejects.
+    for (const bad of ['not-a-url', 'ftp://h/x', 'https://h?q=1', 'https://h#f']) {
+      assert.throws(() => agentUrl.resolveBaseUrl(bad), `agent must reject ${bad}`);
+      await assert.rejects(() => register({ rabbitUrl: bad }), `plugin must reject ${bad}`);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// 8. v0.1.2 — cross-region diagnostics in w2m_status (§4, §8.2)
+// ---------------------------------------------------------------------------------------------
+
+/** A `/healthz` body carrying every v0.1.2 diagnostic field. */
+function healthz(overrides = {}) {
+  return {
+    ok: true,
+    protocol_version: 1,
+    rabbit_time: '2026-10-07T12:00:00Z',
+    uptime_ms: 3_724_000,
+    relay_id: 'relay-7f3a91',
+    started_at: '2026-10-07T10:58:00Z',
+    effective_scheme: 'https',
+    base_path: '/w2m',
+    operator_token_required: true,
+    pair_rate_limit: 5,
+    persistence: { enabled: true, dir: '/var/lib/w2m', revived_devices: 2, revived_tasks: 7 },
+    ...overrides,
+  };
+}
+
+describe('v0.1.2 cross-region diagnostics', () => {
+  it('surfaces every §4 relay field', async () => {
+    // The base carries /w2m, so the probe lands on /w2m/healthz — the route keys on the real path.
+    const fetchStub = installFetch([{ path: '/w2m/healthz', body: healthz() }]);
+    try {
+      const nonRepo = await makeNonRepoDir();
+      const { tools } = await register({
+        rabbitUrl: 'https://w2m.example.com/w2m',
+        stateDir: await makeStateDir(PAIRED_DEVICE),
+        projectDir: nonRepo,
+      });
+      const value = JSON.parse(await tools.get('w2m_status').execute({}, {}));
+
+      assert.equal(value.relay.reachable, true);
+      assert.equal(value.relay.relay_id, 'relay-7f3a91');
+      assert.equal(value.relay.uptime_ms, 3_724_000);
+      assert.equal(value.relay.started_at, '2026-10-07T10:58:00Z');
+      assert.equal(value.relay.base_path, '/w2m');
+      assert.equal(value.relay.effective_scheme, 'https');
+      assert.equal(value.relay.operator_token_required, true);
+      assert.equal(value.relay.pair_rate_limit, 5);
+      assert.equal(value.relay.persistence.revived_devices, 2);
+      assert.deepEqual(value.relay.diagnostics_present, [
+        'relay_id',
+        'uptime_ms',
+        'base_path',
+        'effective_scheme',
+        'operator_token_required',
+      ]);
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('lets a reader tell a restarted relay from the same one', async () => {
+    const fetchStub = installFetch([
+      {
+        path: '/healthz',
+        responses: [
+          { body: healthz({ relay_id: 'relay-7f3a91', uptime_ms: 3_724_000 }) },
+          { body: healthz({ relay_id: 'relay-0c11be', uptime_ms: 1_200 }) },
+        ],
+      },
+    ]);
+    try {
+      const nonRepo = await makeNonRepoDir();
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), projectDir: nonRepo });
+
+      const before = JSON.parse(await tools.get('w2m_status').execute({}, {}));
+      const after = JSON.parse(await tools.get('w2m_status').execute({}, {}));
+
+      assert.equal(before.relay.relay_id, 'relay-7f3a91');
+      assert.equal(after.relay.relay_id, 'relay-0c11be');
+      assert.notEqual(before.relay.relay_id, after.relay.relay_id);
+      assert.ok(after.relay.uptime_ms < before.relay.uptime_ms, 'a restart resets uptime');
+      assert.ok(before.notes.some((note) => /record this id/.test(note)), 'the id must come with an instruction');
+      assert.ok(before.notes.some((note) => /relay-7f3a91/.test(note)));
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('degrades field by field when a pre-v0.1.2 relay sends none of them', async () => {
+    // The v1 healthz body, verbatim: no relay_id, no base_path, nothing from §4.
+    const fetchStub = installFetch([
+      { path: '/healthz', body: { ok: true, protocol_version: 1, rabbit_time: '2026-10-07T12:00:00Z', uptime_ms: 12 } },
+    ]);
+    try {
+      const nonRepo = await makeNonRepoDir();
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), projectDir: nonRepo });
+      const value = JSON.parse(await tools.get('w2m_status').execute({}, {}));
+
+      assert.equal(value.ok, true, 'a missing diagnostic is not an error');
+      assert.equal(value.relay.reachable, true);
+      assert.equal(value.relay.uptime_ms, 12, 'the v1 field that does exist is still reported');
+      assert.equal(value.relay.relay_id, null);
+      assert.equal(value.relay.base_path, null);
+      assert.equal(value.relay.effective_scheme, null);
+      assert.equal(value.relay.operator_token_required, null, 'unknown is not the same as false');
+      // `uptime_ms` is a v1 field, so it is expected to be present even on an old relay; the §4
+      // additions are what must be absent.
+      assert.deepEqual(
+        value.relay.diagnostics_present,
+        ['uptime_ms'],
+        'only the fields the relay actually sent may be listed',
+      );
+      assert.ok(
+        value.notes.some((note) => /predates v0\.1\.2/.test(note)),
+        'the reader must be told the relay is older, not left to infer it from nulls',
+      );
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('degrades when the healthz body is empty or not JSON', async () => {
+    const fetchStub = installFetch([{ path: '/healthz', status: 200, text: '', contentType: 'text/plain' }]);
+    try {
+      const nonRepo = await makeNonRepoDir();
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), projectDir: nonRepo });
+      const value = JSON.parse(await tools.get('w2m_status').execute({}, {}));
+      assert.equal(value.relay.reachable, true);
+      assert.equal(value.relay.relay_id, null);
+      assert.equal(value.relay.operator_token_required, null);
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('still answers when the relay is unreachable, with the diagnostics left unknown', async () => {
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = async () => {
+      throw new TypeError('connect ECONNREFUSED');
+    };
+    try {
+      const nonRepo = await makeNonRepoDir();
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), projectDir: nonRepo });
+      const value = JSON.parse(await tools.get('w2m_status').execute({}, {}));
+      assert.equal(value.ok, true);
+      assert.equal(value.relay.reachable, false);
+      assert.equal(value.relay.relay_id, null);
+      assert.equal(value.relay.operator_token_required, null);
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
+  });
+
+  it('reports RTT from a state file the agent published, with last/avg/samples', async () => {
+    const dir = await makeStateDir(PAIRED_DEVICE);
+    await fs.writeFile(
+      path.join(dir, 'agent-state.json'),
+      JSON.stringify({ rttMs: { last: 87, avg: 91.5, samples: [70, 95, 110, 87, 95] } }),
+      'utf8',
+    );
+    const fetchStub = installFetch([{ path: '/healthz', body: healthz() }]);
+    try {
+      const nonRepo = await makeNonRepoDir();
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: dir, projectDir: nonRepo });
+      const value = JSON.parse(await tools.get('w2m_status').execute({}, {}));
+
+      assert.equal(value.rtt.available, true);
+      assert.equal(value.rtt.last, 87);
+      assert.equal(value.rtt.avg, 91.5);
+      assert.deepEqual(value.rtt.samples, [70, 95, 110, 87, 95]);
+      assert.equal(value.rtt.source, 'state-file');
+      assert.ok(value.notes.some((note) => /round trip to the relay: last 87 ms/.test(note)));
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('finds the state file the CLI agent writes in its default layout', async () => {
+    // `stateDir` is documented as the directory holding device.json, while the
+    // agent keeps its own state one level below it (`.../xclient/localside`).
+    // Without the `localside/` probe the default deployment can never report
+    // RTT, and it degrades silently, so this is asserted against the real
+    // layout rather than against a file dropped in `stateDir` itself.
+    const dir = await makeStateDir(PAIRED_DEVICE);
+    const localside = path.join(dir, 'localside');
+    await fs.mkdir(localside, { recursive: true });
+    await fs.writeFile(
+      path.join(localside, 'agent-state.json'),
+      JSON.stringify({
+        schema_version: 1,
+        machine_id: PAIRED_DEVICE.machine_id,
+        updated_at: '2026-10-07T12:00:00.000Z',
+        connected: true,
+        relay_id: 'relay-7f3a91',
+        rttMs: { last: 33, avg: 30, samples: [33, 30] },
+        reconnect_attempts: 0,
+        replay_truncated: false,
+      }),
+      'utf8',
+    );
+    const fetchStub = installFetch([{ path: '/healthz', body: healthz() }]);
+    try {
+      const nonRepo = await makeNonRepoDir();
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: dir, projectDir: nonRepo });
+      const value = JSON.parse(await tools.get('w2m_status').execute({}, {}));
+
+      assert.equal(value.rtt.available, true, JSON.stringify(value.rtt));
+      assert.equal(value.rtt.source, 'state-file');
+      assert.equal(value.rtt.last, 33);
+      assert.equal(value.rtt.avg, 30);
+      assert.deepEqual(value.rtt.samples, [33, 30]);
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('normalises the looser RTT shapes an agent might publish', async () => {
+    const cases = [
+      [{ rttMs: 42 }, { last: 42, avg: 42, samples: [42] }],
+      [{ rttMs: [10, 20, 30] }, { last: 30, avg: 20, samples: [10, 20, 30] }],
+      [{ rttMs: { lastMs: 55, average: 60 } }, { last: 55, avg: 60, samples: [55] }],
+      [{ rtt: { last_ms: 12 } }, { last: 12, avg: 12, samples: [12] }],
+    ];
+    for (const [published, expected] of cases) {
+      const dir = await makeStateDir(PAIRED_DEVICE);
+      await fs.writeFile(path.join(dir, 'agent-state.json'), JSON.stringify(published), 'utf8');
+      const fetchStub = installFetch([{ path: '/healthz', body: healthz() }]);
+      try {
+        const nonRepo = await makeNonRepoDir();
+        const { tools } = await register({ rabbitUrl: RABBIT, stateDir: dir, projectDir: nonRepo });
+        const value = JSON.parse(await tools.get('w2m_status').execute({}, {}));
+        assert.equal(value.rtt.available, true, JSON.stringify(published));
+        assert.equal(value.rtt.last, expected.last, JSON.stringify(published));
+        assert.equal(value.rtt.avg, expected.avg, JSON.stringify(published));
+        assert.deepEqual(value.rtt.samples, expected.samples, JSON.stringify(published));
+      } finally {
+        fetchStub.restore();
+      }
+    }
+  });
+
+  it('degrades RTT to unavailable, with a reason, when the agent is not running here', async () => {
+    const fetchStub = installFetch([{ path: '/healthz', body: healthz() }]);
+    try {
+      const nonRepo = await makeNonRepoDir();
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), projectDir: nonRepo });
+      const value = JSON.parse(await tools.get('w2m_status').execute({}, {}));
+
+      assert.equal(value.ok, true, 'a missing RTT must not be an error');
+      assert.equal(value.rtt.available, false);
+      assert.equal(value.rtt.last, null);
+      assert.deepEqual(value.rtt.samples, []);
+      assert.match(value.rtt.reason, /no agent round-trip time is available/);
+      assert.ok(value.notes.some((note) => /round-trip time unavailable/.test(note)));
+      // The relay half is still fully reported: partial knowledge, not a failed call.
+      assert.equal(value.relay.relay_id, 'relay-7f3a91');
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('ignores an unparseable agent state file instead of throwing', async () => {
+    const dir = await makeStateDir(PAIRED_DEVICE);
+    await fs.writeFile(path.join(dir, 'agent-state.json'), '{ this is not json', 'utf8');
+    const fetchStub = installFetch([{ path: '/healthz', body: healthz() }]);
+    try {
+      const nonRepo = await makeNonRepoDir();
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: dir, projectDir: nonRepo });
+      const value = JSON.parse(await tools.get('w2m_status').execute({}, {}));
+      assert.equal(value.ok, true);
+      assert.equal(value.rtt.available, false);
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('says which base_path the relay reports next to the rabbitUrl in use', async () => {
+    const fetchStub = installFetch([{ path: '/w2m/healthz', body: healthz({ base_path: '/w2m' }) }]);
+    try {
+      const nonRepo = await makeNonRepoDir();
+      const { tools } = await register({
+        rabbitUrl: 'https://w2m.example.com/w2m',
+        stateDir: await makeStateDir(PAIRED_DEVICE),
+        projectDir: nonRepo,
+      });
+      const value = JSON.parse(await tools.get('w2m_status').execute({}, {}));
+      assert.equal(value.relay.base_path, '/w2m');
+      assert.ok(value.notes.some((note) => /base_path `\/w2m`/.test(note)));
+      assert.ok(value.notes.some((note) => /rabbitUrl` in use is `https:\/\/w2m\.example\.com\/w2m`/.test(note)));
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('does not leak the operator token into w2m_status output', async () => {
+    const fetchStub = installFetch([{ path: '/healthz', body: healthz() }]);
+    try {
+      const nonRepo = await makeNonRepoDir();
+      const { tools } = await register({
+        rabbitUrl: RABBIT,
+        stateDir: await makeStateDir(PAIRED_DEVICE),
+        projectDir: nonRepo,
+        operatorToken: 'opr-super-secret',
+      });
+      const raw = await tools.get('w2m_status').execute({}, {});
+      assert.ok(!raw.includes('opr-super-secret'), 'the credential must never be echoed back');
+      assert.ok(!raw.includes('tok-test-abc'), 'nor the device token');
+    } finally {
+      fetchStub.restore();
+    }
+  });
+});
+

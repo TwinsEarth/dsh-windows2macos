@@ -11,6 +11,11 @@
 import { after, before, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import https from 'node:https';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 
 import {
   MAX_FRAME_BYTES,
@@ -24,7 +29,8 @@ import {
   sha256Hex,
 } from '../src/relay/state.mjs';
 import { aggregate, aggregateTask, renderReportMarkdown } from '../src/relay/report.mjs';
-import { createRelayServer } from '../src/relay/server.mjs';
+import { createRelayServer, normalizeBasePath, SlidingWindowRateLimiter } from '../src/relay/server.mjs';
+import { Persistence } from '../src/relay/persistence.mjs';
 
 /* ------------------------------------------------------------------ */
 /* helpers                                                             */
@@ -49,11 +55,14 @@ function request(url, { method = 'GET', token, body, rawBody, headers = {} } = {
     const payload = rawBody !== undefined
       ? Buffer.from(rawBody, 'utf8')
       : (body === undefined ? null : Buffer.from(JSON.stringify(body), 'utf8'));
-    const req = http.request({
+    const transport = u.protocol === 'https:' ? https : http;
+    const req = transport.request({
       hostname: u.hostname,
       port: u.port,
       path: u.pathname + u.search,
       method,
+      // the TLS test uses a self-signed fixture certificate
+      rejectUnauthorized: false,
       headers: {
         ...(token ? { authorization: `Bearer ${token}` } : {}),
         ...(payload ? { 'content-type': 'application/json', 'content-length': payload.length } : {}),
@@ -226,10 +235,25 @@ function openSse(url, { token, headers = {}, timeoutMs = 4000 } = {}) {
   });
 }
 
+/**
+ * v0.1.2 §5: `POST /v1/task` takes the OPERATOR token, not a device token.
+ * Tests opt out of persistence by default so nothing is written to the real
+ * `~/.w2m` state dir; persistence tests pass an explicit `stateDir`.
+ */
+const OP = 'test-operator-token';
+const SERVER_URL = new URL('../src/relay/server.mjs', import.meta.url).href;
+
 async function startRelay(options = {}) {
-  const relay = createRelayServer({ logger: null, ...options });
+  // Persistence is opt-in by stateDir so no test ever touches the real ~/.w2m.
+  const persist = options.persist ?? (options.stateDir !== undefined);
+  const relay = createRelayServer({ logger: null, operatorToken: OP, ...options, persist });
   await relay.listen({ host: '127.0.0.1', port: 0 });
   return relay;
+}
+
+/** Dispatch a task with the operator credential. */
+function postTask(relay, body, token = OP) {
+  return request(`${relay.url}/v1/task`, { method: 'POST', token, body });
 }
 
 async function withRelay(options, fn) {
@@ -239,6 +263,15 @@ async function withRelay(options, fn) {
   } finally {
     await relay.close();
   }
+}
+
+/** Isolated state dir for the persistence tests. */
+function makeStateDir() {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'w2m-relay-test-'));
+}
+
+function removeStateDir(dir) {
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
 }
 
 const DEFAULT_PLATFORM = { os: 'windows', os_version: '10.0.26100', arch: 'x64', shell: 'pwsh', shell_version: '7.4.0' };
@@ -516,22 +549,31 @@ describe('auth (§1/§7)', () => {
     assert.equal(res.json.protocol_version, 1);
   });
 
-  it('every protected route answers 401 UNAUTHORIZED without a token', async () => {
+  it('every protected route answers 401 without a token, with the §7 shape', async () => {
+    // v0.1.2 §5: POST /v1/task no longer answers UNAUTHORIZED — it demands the
+    // operator token. Every other protected route is unchanged.
     const routes = [
-      ['GET', '/v1/stream?machine_id=m1'],
-      ['POST', '/v1/heartbeat'],
-      ['POST', '/v1/result'],
-      ['POST', '/v1/task'],
-      ['GET', '/v1/devices'],
-      ['GET', '/v1/tasks'],
-      ['GET', '/v1/tasks/whatever'],
-      ['GET', '/v1/tasks/whatever/report?format=json'],
+      ['GET', '/v1/stream?machine_id=m1', 'UNAUTHORIZED'],
+      ['POST', '/v1/heartbeat', 'UNAUTHORIZED'],
+      ['POST', '/v1/result', 'UNAUTHORIZED'],
+      ['POST', '/v1/task', 'OPERATOR_REQUIRED'],
+      ['GET', '/v1/devices', 'UNAUTHORIZED'],
+      ['GET', '/v1/tasks', 'UNAUTHORIZED'],
+      ['GET', '/v1/tasks/whatever', 'UNAUTHORIZED'],
+      ['GET', '/v1/tasks/whatever/report?format=json', 'UNAUTHORIZED'],
     ];
-    for (const [method, path] of routes) {
+    for (const [method, path, code] of routes) {
       const res = await request(`${relay.url}${path}`, { method, body: method === 'POST' ? {} : undefined });
       assert.equal(res.status, 401, `${method} ${path} must be 401`);
-      assert.deepEqual(res.json, { error: { code: 'UNAUTHORIZED', message: 'missing or invalid device_token', detail: {} } });
+      assert.equal(res.json.error.code, code, `${method} ${path}`);
+      assert.equal(typeof res.json.error.message, 'string');
+      assert.equal(typeof res.json.error.detail, 'object');
+      assert.deepEqual(Object.keys(res.json), ['error'], '§7 shape: the body is exactly {error:{...}}');
     }
+    const deviceRoute = await request(`${relay.url}/v1/devices`);
+    assert.deepEqual(deviceRoute.json, {
+      error: { code: 'UNAUTHORIZED', message: 'missing or invalid device_token', detail: {} },
+    }, 'unchanged v1 device-auth error body');
   });
 
   it('rejects a bogus bearer token', async () => {
@@ -581,7 +623,7 @@ describe('SSE (§3)', () => {
         assert.equal(ready.json.machine_id, 'm1');
         assert.ok(Number.isInteger(ready.json.seq) && ready.json.seq >= 1);
 
-        const created = await request(`${relay.url}/v1/task`, { method: 'POST', token, body: taskBody() });
+        const created = await request(`${relay.url}/v1/task`, { method: 'POST', token: OP, body: taskBody() });
         assert.equal(created.status, 200);
 
         const offer = await sse.waitFor((f) => f.event === 'task.offer');
@@ -619,14 +661,14 @@ describe('SSE (§3)', () => {
       const { token } = await pairDevice(relay, 'm1');
       const sse1 = await openSse(`${relay.url}/v1/stream?machine_id=m1`, { token });
       await sse1.waitFor((f) => f.event === 'ready');
-      const first = await request(`${relay.url}/v1/task`, { method: 'POST', token, body: taskBody() });
+      const first = await request(`${relay.url}/v1/task`, { method: 'POST', token: OP, body: taskBody() });
       const offer1 = await sse1.waitFor((f) => f.event === 'task.offer');
       const lastSeq = offer1.json.seq;
       sse1.close();
 
       // while disconnected: m2 pairs (broadcast peer.hello) and a second task is offered to m1
       await pairDevice(relay, 'm2');
-      const second = await request(`${relay.url}/v1/task`, { method: 'POST', token, body: taskBody() });
+      const second = await request(`${relay.url}/v1/task`, { method: 'POST', token: OP, body: taskBody() });
       assert.equal(second.status, 200);
       assert.notEqual(second.json.task_id, first.json.task_id);
 
@@ -650,12 +692,12 @@ describe('SSE (§3)', () => {
       const { token } = await pairDevice(relay, 'm1');
       const sse1 = await openSse(`${relay.url}/v1/stream?machine_id=m1`, { token });
       await sse1.waitFor((f) => f.event === 'ready');
-      await request(`${relay.url}/v1/task`, { method: 'POST', token, body: taskBody() });
+      await request(`${relay.url}/v1/task`, { method: 'POST', token: OP, body: taskBody() });
       const offer1 = await sse1.waitFor((f) => f.event === 'task.offer');
       const last = offer1.json.seq;
       sse1.close();
 
-      const second = await request(`${relay.url}/v1/task`, { method: 'POST', token, body: taskBody() });
+      const second = await request(`${relay.url}/v1/task`, { method: 'POST', token: OP, body: taskBody() });
       const sse2 = await openSse(`${relay.url}/v1/stream?machine_id=m1`, {
         token,
         headers: { 'last-event-id': String(last) },
@@ -673,7 +715,9 @@ describe('SSE (§3)', () => {
   });
 
   it('warns when the requested seq is older than the ring buffer head', async () => {
-    await withRelay({ eventBufferSize: 5 }, async (relay) => {
+    // Pairs 7 devices from 127.0.0.1: the §6 limiter is irrelevant here, and its
+    // default of 5/min would (correctly) kick in, so it is switched off.
+    await withRelay({ eventBufferSize: 5, pairRateLimitPerMinute: 0 }, async (relay) => {
       const { token } = await pairDevice(relay, 'm1');
       for (let i = 0; i < 6; i += 1) {
         await pairDevice(relay, `filler-${i}`);
@@ -683,6 +727,10 @@ describe('SSE (§3)', () => {
         await sse.waitFor((f) => f.event === 'ready');
         const notice = await sse.waitFor((f) => f.event === 'notice' && f.json.code === 'REPLAY_TRUNCATED');
         assert.equal(notice.json.level, 'warn');
+        assert.equal(notice.json.requested_seq, 1);
+        assert.ok(Number.isInteger(notice.json.oldest_available_seq),
+          '§8.4: the client must learn where to re-align');
+        assert.ok(notice.json.oldest_available_seq > 1);
       } finally {
         sse.close();
       }
@@ -729,7 +777,7 @@ describe('tasks (§4)', () => {
       try {
         await sseA.waitFor((f) => f.event === 'ready');
         await sseB.waitFor((f) => f.event === 'ready');
-        const created = await request(`${relay.url}/v1/task`, { method: 'POST', token: a.token, body: taskBody() });
+        const created = await request(`${relay.url}/v1/task`, { method: 'POST', token: OP, body: taskBody() });
         assert.equal(created.status, 200);
         assert.equal(created.json.leases.length, 2);
         assert.deepEqual(created.json.leases.map((l) => l.machine_id).sort(), ['m1', 'm2']);
@@ -755,7 +803,7 @@ describe('tasks (§4)', () => {
       await pairDevice(relay, 'm2');
       const created = await request(`${relay.url}/v1/task`, {
         method: 'POST',
-        token: a.token,
+        token: OP,
         body: taskBody({ target_machines: ['m2'] }),
       });
       assert.equal(created.status, 200);
@@ -770,7 +818,7 @@ describe('tasks (§4)', () => {
       await pairDevice(relay, 'm3');
       const created = await request(`${relay.url}/v1/task`, {
         method: 'POST',
-        token: a.token,
+        token: OP,
         body: taskBody({ mode: 'split', index_total: 2 }),
       });
       assert.equal(created.status, 200);
@@ -787,7 +835,7 @@ describe('tasks (§4)', () => {
         await sse.waitFor((f) => f.event === 'ready');
         const created = await request(`${relay.url}/v1/task`, {
           method: 'POST',
-          token: weak.token,
+          token: OP,
           body: taskBody({ requirements: { toolchain: { node: '>=20' } } }),
         });
         assert.equal(created.status, 200);
@@ -805,7 +853,7 @@ describe('tasks (§4)', () => {
       const a = await pairDevice(relay, 'm1');
       const created = await request(`${relay.url}/v1/task`, {
         method: 'POST',
-        token: a.token,
+        token: OP,
         body: taskBody({ requirements: { platform: ['macos'] } }),
       });
       assert.equal(created.json.leases[0].state, 'refused');
@@ -815,12 +863,13 @@ describe('tasks (§4)', () => {
 
   it('applies the §6.1 capability gate: READ_ONLY_MACHINE', async () => {
     await withRelay({}, async (relay) => {
-      const ro = await pairDevice(relay, 'ro', { caps: { ...DEFAULT_CAPS, write: false } });
+      await pairDevice(relay, 'ro', { caps: { ...DEFAULT_CAPS, write: false } });
       const created = await request(`${relay.url}/v1/task`, {
         method: 'POST',
-        token: ro.token,
+        token: OP,
         body: taskBody({ write: true, write_scope: ['src/'] }),
       });
+      assert.equal(created.status, 200, created.text);
       assert.equal(created.json.leases[0].state, 'refused');
       assert.equal(created.json.leases[0].refusal_reason, 'READ_ONLY_MACHINE');
     });
@@ -840,9 +889,9 @@ describe('tasks (§4)', () => {
     await withRelay({}, async (relay) => {
       const a = await pairDevice(relay, 'm1');
       const body = taskBody({ task_id: '01JDUPLICATE0000000000000000' });
-      const first = await request(`${relay.url}/v1/task`, { method: 'POST', token: a.token, body });
+      const first = await request(`${relay.url}/v1/task`, { method: 'POST', token: OP, body });
       assert.equal(first.status, 200);
-      const second = await request(`${relay.url}/v1/task`, { method: 'POST', token: a.token, body });
+      const second = await request(`${relay.url}/v1/task`, { method: 'POST', token: OP, body });
       assert.equal(second.status, 409);
       assert.equal(second.json.error.code, 'TASK_EXISTS');
     });
@@ -858,20 +907,20 @@ describe('tasks (§4)', () => {
         taskBody({ halt: 'maybe' }),
         taskBody({ index_total: 0 }),
       ]) {
-        const res = await request(`${relay.url}/v1/task`, { method: 'POST', token: a.token, body: bad });
+        const res = await request(`${relay.url}/v1/task`, { method: 'POST', token: OP, body: bad });
         assert.equal(res.status, 400, JSON.stringify(bad));
         assert.equal(res.json.error.code, 'BAD_REQUEST');
       }
       const notJson = await request(`${relay.url}/v1/task`, {
         method: 'POST',
-        token: a.token,
+        token: OP,
         headers: { 'content-type': 'application/json', 'content-length': '0' },
       });
       assert.equal(notJson.status, 400, 'empty body → {} → command_argv missing');
       assert.equal(notJson.json.error.code, 'BAD_REQUEST');
 
       const badJson = await request(`${relay.url}/v1/task`, {
-        method: 'POST', token: a.token, rawBody: '{not json',
+        method: 'POST', token: OP, rawBody: '{not json',
       });
       assert.equal(badJson.status, 400, 'unparsable JSON');
       assert.equal(badJson.json.error.code, 'BAD_REQUEST');
@@ -888,7 +937,7 @@ describe('leases (§4.3)', () => {
     const clock = makeClock();
     await withRelay({ now: clock.now }, async (relay) => {
       const a = await pairDevice(relay, 'm1');
-      const created = await request(`${relay.url}/v1/task`, { method: 'POST', token: a.token, body: taskBody() });
+      const created = await request(`${relay.url}/v1/task`, { method: 'POST', token: OP, body: taskBody() });
       const taskId = created.json.task_id;
 
       clock.advance(40_000);
@@ -997,7 +1046,7 @@ describe('results & dedupe', () => {
     await withRelay({}, async (relay) => {
       const a = await pairDevice(relay, 'm1');
       const b = await pairDevice(relay, 'm2');
-      const created = await request(`${relay.url}/v1/task`, { method: 'POST', token: a.token, body: taskBody() });
+      const created = await request(`${relay.url}/v1/task`, { method: 'POST', token: OP, body: taskBody() });
       const taskId = created.json.task_id;
 
       const envA = envelopeForTask(taskId, 'm1');
@@ -1026,7 +1075,7 @@ describe('results & dedupe', () => {
   it('records an envelope with missing required fields as unverifiable (§5.1)', async () => {
     await withRelay({}, async (relay) => {
       const a = await pairDevice(relay, 'm1');
-      const created = await request(`${relay.url}/v1/task`, { method: 'POST', token: a.token, body: taskBody() });
+      const created = await request(`${relay.url}/v1/task`, { method: 'POST', token: OP, body: taskBody() });
       const env = envelopeForTask(created.json.task_id, 'm1');
       delete env.stdout_bytes;
       delete env.warnings;
@@ -1095,7 +1144,7 @@ describe('frame limit', () => {
   it('accepts a body just under the limit', async () => {
     await withRelay({}, async (relay) => {
       const a = await pairDevice(relay, 'm1');
-      const created = await request(`${relay.url}/v1/task`, { method: 'POST', token: a.token, body: taskBody() });
+      const created = await request(`${relay.url}/v1/task`, { method: 'POST', token: OP, body: taskBody() });
       const env = envelopeForTask(created.json.task_id, 'm1', { stdout_head: 'z'.repeat(60 * 1024) });
       const res = await request(`${relay.url}/v1/result`, { method: 'POST', token: a.token, body: env });
       assert.equal(res.status, 200, res.text.slice(0, 200));
@@ -1282,7 +1331,7 @@ describe('reports', () => {
     await withRelay({}, async (relay) => {
       const a = await pairDevice(relay, 'm1');
       await pairDevice(relay, 'm2');
-      const created = await request(`${relay.url}/v1/task`, { method: 'POST', token: a.token, body: taskBody() });
+      const created = await request(`${relay.url}/v1/task`, { method: 'POST', token: OP, body: taskBody() });
       const taskId = created.json.task_id;
       for (const m of ['m1', 'm2']) {
         const res = await request(`${relay.url}/v1/result`, {
@@ -1333,7 +1382,7 @@ describe('reports', () => {
     await withRelay({}, async (relay) => {
       const a = await pairDevice(relay, 'm1');
       for (let i = 0; i < 3; i += 1) {
-        await request(`${relay.url}/v1/task`, { method: 'POST', token: a.token, body: taskBody() });
+        await request(`${relay.url}/v1/task`, { method: 'POST', token: OP, body: taskBody() });
       }
       const all = await request(`${relay.url}/v1/tasks`, { token: a.token });
       assert.equal(all.json.tasks.length, 3);
@@ -1351,5 +1400,727 @@ describe('reports', () => {
       assert.equal(res.status, 404);
       assert.equal(res.json.error.code, 'NOT_FOUND');
     });
+  });
+});
+
+/* ================================================================== */
+/* v0.1.2 §3 — deployment base path                                    */
+/* ================================================================== */
+
+describe('v0.1.2 base path (§3)', () => {
+  it('normalizeBasePath normalises the prefix', () => {
+    assert.equal(normalizeBasePath(undefined), '/');
+    assert.equal(normalizeBasePath(null), '/');
+    assert.equal(normalizeBasePath(''), '/');
+    assert.equal(normalizeBasePath('/'), '/');
+    assert.equal(normalizeBasePath('w2m'), '/w2m');
+    assert.equal(normalizeBasePath('/w2m/'), '/w2m');
+    assert.equal(normalizeBasePath('//w2m//team//'), '/w2m/team');
+    assert.equal(normalizeBasePath('/w2m'), '/w2m');
+  });
+
+  it('routes under the prefix; /healthz answers at prefix AND root', async () => {
+    await withRelay({ basePath: '/w2m' }, async (relay) => {
+      assert.equal(relay.basePath, '/w2m');
+      assert.ok(relay.url.endsWith('/w2m'), `url should carry the prefix: ${relay.url}`);
+      const origin = `http://127.0.0.1:${relay.port}`;
+
+      const prefixedHealth = await request(`${relay.url}/healthz`);
+      assert.equal(prefixedHealth.status, 200);
+      const rootHealth = await request(`${origin}/healthz`);
+      assert.equal(rootHealth.status, 200, '/healthz must also answer at the root');
+      assert.equal(rootHealth.json.base_path, '/w2m');
+      assert.equal(rootHealth.json.relay_id, relay.relayId);
+
+      // /v1/* works under the prefix…
+      const { token } = await pairDevice(relay, 'm1');
+      const devices = await request(`${relay.url}/v1/devices`, { token });
+      assert.equal(devices.status, 200);
+      assert.equal(devices.json.devices.length, 1);
+
+      // …and 404s outside it — including with a perfectly valid token.
+      const outside = await request(`${origin}/v1/devices`, { token });
+      assert.equal(outside.status, 404, 'outside the prefix must be 404, not 401 and not 502');
+      assert.equal(outside.json.error.code, 'NOT_FOUND');
+      assert.equal(outside.json.error.detail.base_path, '/w2m');
+
+      const outsideAnonymous = await request(`${origin}/v1/devices`);
+      assert.equal(outsideAnonymous.status, 404);
+      assert.equal(outsideAnonymous.json.error.code, 'NOT_FOUND');
+    });
+  });
+
+  it('accepts a trailing slash on the configured prefix', async () => {
+    await withRelay({ basePath: '/team-a/w2m/' }, async (relay) => {
+      assert.equal(relay.basePath, '/team-a/w2m');
+      const hz = await request(`${relay.url}/healthz`);
+      assert.equal(hz.status, 200);
+      assert.equal(hz.json.base_path, '/team-a/w2m');
+    });
+  });
+});
+
+/* ================================================================== */
+/* v0.1.2 §3/§4 — proxy headers                                        */
+/* ================================================================== */
+
+describe('v0.1.2 trust-proxy (§3/§4)', () => {
+  it('ignores X-Forwarded-* unless trustProxy is on', async () => {
+    await withRelay({ trustProxy: false }, async (relay) => {
+      const hz = await request(`${relay.url}/healthz`, { headers: { 'x-forwarded-proto': 'https' } });
+      assert.equal(hz.json.effective_scheme, 'http', 'a forged X-Forwarded-Proto must be ignored');
+    });
+    await withRelay({ trustProxy: true }, async (relay) => {
+      const forwarded = await request(`${relay.url}/healthz`, { headers: { 'x-forwarded-proto': 'https' } });
+      assert.equal(forwarded.json.effective_scheme, 'https');
+      const bare = await request(`${relay.url}/healthz`);
+      assert.equal(bare.json.effective_scheme, 'http', 'falls back to the real listener scheme');
+    });
+  });
+
+  it('a forged X-Forwarded-For cannot buy extra pair attempts when trustProxy is off', async () => {
+    await withRelay({ pairRateLimitPerMinute: 2, trustProxy: false }, async (relay) => {
+      const attempt = (ip) => request(`${relay.url}/v1/pair`, {
+        method: 'POST',
+        headers: { 'x-forwarded-for': ip },
+        body: { pairing_code: 'PAIR-NOSUCH00', machine_id: 'm1' },
+      });
+      assert.equal((await attempt('198.51.100.1')).status, 400, 'bad code, but it counts');
+      assert.equal((await attempt('198.51.100.2')).status, 400);
+      const third = await attempt('198.51.100.3');
+      assert.equal(third.status, 429, 'rotating XFF must NOT reset the budget');
+      assert.equal(third.json.error.code, 'RATE_LIMITED');
+    });
+  });
+
+  it('honours the first X-Forwarded-For hop per client when trustProxy is on', async () => {
+    await withRelay({ pairRateLimitPerMinute: 1, trustProxy: true }, async (relay) => {
+      const attempt = (xff) => request(`${relay.url}/v1/pair`, {
+        method: 'POST',
+        headers: { 'x-forwarded-for': xff },
+        body: { pairing_code: 'PAIR-NOSUCH00', machine_id: 'm1' },
+      });
+      assert.equal((await attempt('203.0.113.7')).status, 400);
+      assert.equal((await attempt('203.0.113.8')).status, 400, 'a different client IP has its own budget');
+      assert.equal((await attempt('203.0.113.7, 10.0.0.1')).status, 429, 'only the first hop identifies the client');
+    });
+  });
+});
+
+/* ================================================================== */
+/* v0.1.2 §5 — operator token                                          */
+/* ================================================================== */
+
+describe('v0.1.2 operator token (§5)', () => {
+  it('accepts the operator token, rejects device tokens and missing tokens', async () => {
+    await withRelay({}, async (relay) => {
+      const a = await pairDevice(relay, 'm1');
+
+      const ok = await postTask(relay, taskBody());
+      assert.equal(ok.status, 200, ok.text);
+      assert.ok(ok.json.task_id);
+
+      const asDevice = await postTask(relay, taskBody(), a.token);
+      assert.equal(asDevice.status, 401, 'a device token must NOT be able to dispatch');
+      assert.equal(asDevice.json.error.code, 'OPERATOR_REQUIRED');
+      assert.equal(asDevice.json.error.detail.device_token_detected, true);
+      assert.match(asDevice.json.error.message, /device_token/);
+      assert.match(asDevice.json.error.message, /operator_token/);
+
+      const missing = await request(`${relay.url}/v1/task`, { method: 'POST', body: taskBody() });
+      assert.equal(missing.status, 401);
+      assert.equal(missing.json.error.code, 'OPERATOR_REQUIRED');
+      assert.match(missing.json.error.message, /operator token/i);
+
+      const junk = await postTask(relay, taskBody(), 'not-the-operator-token');
+      assert.equal(junk.status, 401);
+      assert.equal(junk.json.error.code, 'OPERATOR_REQUIRED');
+      assert.equal(junk.json.error.detail.device_token_detected, false);
+
+      // §5.3: the operator token is NOT a master key for the device endpoints
+      const wrongEndpoint = await request(`${relay.url}/v1/devices`, { token: OP });
+      assert.equal(wrongEndpoint.status, 401);
+      assert.equal(wrongEndpoint.json.error.code, 'UNAUTHORIZED');
+
+      // device tokens still work on their own endpoints
+      const heartbeat = await request(`${relay.url}/v1/heartbeat`, {
+        method: 'POST', token: a.token, body: { task_id: ok.json.task_id, machine_id: 'm1' },
+      });
+      assert.equal(heartbeat.status, 200);
+    });
+  });
+
+  it('--operator-token "" disables the requirement and warns loudly', async () => {
+    const dir = makeStateDir();
+    try {
+      await withRelay({ operatorToken: '', stateDir: dir }, async (relay) => {
+        assert.equal(relay.operatorTokenRequired, false);
+        assert.equal(relay.operatorToken, null);
+        const hz = await request(`${relay.url}/healthz`);
+        assert.equal(hz.json.operator_token_required, false);
+        assert.ok(
+          relay.startupMessages.some((m) => /OPERATOR TOKEN DISABLED/.test(m) && /WARNING/.test(m)),
+          `startup banner must warn: ${JSON.stringify(relay.startupMessages)}`,
+        );
+
+        // escape hatch = v1 semantics: a paired device may dispatch…
+        const a = await pairDevice(relay, 'm1');
+        assert.equal((await postTask(relay, taskBody(), a.token)).status, 200);
+        // …but the endpoint is not simply unauthenticated
+        const anon = await request(`${relay.url}/v1/task`, { method: 'POST', body: taskBody() });
+        assert.equal(anon.status, 401);
+        assert.equal(anon.json.error.code, 'UNAUTHORIZED');
+      });
+    } finally {
+      removeStateDir(dir);
+    }
+  });
+
+  it('generates a token, persists it 0600 and reuses it across restarts', async () => {
+    const dir = makeStateDir();
+    try {
+      const first = await startRelay({ operatorToken: undefined, stateDir: dir });
+      const token1 = first.operatorToken;
+      assert.match(token1, /^[0-9a-f]{64}$/, 'a generated operator token is 32 random bytes');
+      assert.equal(first.operatorTokenRequired, true);
+      await first.close();
+
+      const tokenFile = path.join(dir, 'operator-token.txt');
+      assert.equal(fs.readFileSync(tokenFile, 'utf8').trim(), token1, '§5.1: written to <state>/operator-token.txt');
+
+      const second = await startRelay({ operatorToken: undefined, stateDir: dir });
+      assert.equal(second.operatorToken, token1, 'a restart must not silently invalidate the plugin config');
+      assert.equal(second.operatorTokenSource, 'restored');
+      await second.close();
+    } finally {
+      removeStateDir(dir);
+    }
+  });
+
+  it('a supplied --pairing-code is registered and immediately usable (v0.1.2 BUG-1)', async () => {
+    const dir = makeStateDir();
+    try {
+      await withRelay({ pairingCode: 'PAIR-FIXEDTEST', stateDir: dir }, async (relay) => {
+        assert.equal(relay.pairingCode, 'PAIR-FIXEDTEST');
+        const hz = await request(`${relay.url}/healthz`);
+        assert.equal(hz.json.pairing_codes, 1, 'the supplied code must be registered in the state, not just advertised');
+
+        const paired = await request(`${relay.url}/v1/pair`, {
+          method: 'POST',
+          body: { pairing_code: 'PAIR-FIXEDTEST', machine_id: 'scripted-m1', platform: DEFAULT_PLATFORM, caps: DEFAULT_CAPS },
+        });
+        assert.equal(paired.status, 200, paired.text);
+        assert.ok(typeof paired.json.device_token === 'string' && paired.json.device_token.length > 0);
+      });
+    } finally {
+      removeStateDir(dir);
+    }
+  });
+
+  it('the default logger writes diagnostics to stderr, never stdout (BUG-2)', () => {
+    // Done in a child process with FILE-backed stdio: capturing the parent's
+    // stdout would also capture the test runner's own protocol output, and pipes
+    // are unavailable under some sandboxes.
+    const dir = makeStateDir();
+    try {
+      const outFile = path.join(dir, 'child-stdout.txt');
+      const errFile = path.join(dir, 'child-stderr.txt');
+      const script = [
+        `import { startRelayServer } from ${JSON.stringify(SERVER_URL)};`,
+        'const relay = await startRelayServer({ persist: false });',
+        "process.stdout.write(JSON.stringify({ url: relay.url, relayId: relay.relayId }) + '\\n');",
+        'await relay.close();',
+      ].join('\n');
+      const fdOut = fs.openSync(outFile, 'w');
+      const fdErr = fs.openSync(errFile, 'w');
+      let result;
+      try {
+        result = spawnSync(process.execPath, ['--input-type=module', '-e', script], {
+          stdio: ['ignore', fdOut, fdErr],
+        });
+      } finally {
+        fs.closeSync(fdOut);
+        fs.closeSync(fdErr);
+      }
+      const stdout = fs.readFileSync(outFile, 'utf8');
+      const stderr = fs.readFileSync(errFile, 'utf8');
+      assert.equal(result.status, 0, `child failed: ${stderr}`);
+
+      const lines = stdout.split('\n').filter((l) => l.trim() !== '');
+      assert.equal(lines.length, 1, `stdout must carry exactly the machine output, got:\n${stdout}`);
+      const parsed = JSON.parse(lines[0]); // throws if prose polluted stdout
+      assert.match(parsed.url, /^http:\/\/127\.0\.0\.1:\d+$/);
+      assert.match(parsed.relayId, /^[0-9a-f]{16}$/);
+
+      assert.match(stderr, /\[w2m-rabbit\]/, 'diagnostics belong on stderr');
+      assert.match(stderr, /operator token/);
+    } finally {
+      removeStateDir(dir);
+    }
+  });
+});
+
+/* ================================================================== */
+/* v0.1.2 §6 — /v1/pair rate limiting                                  */
+/* ================================================================== */
+
+describe('v0.1.2 pair rate limit (§6)', () => {
+  it('maps the v0.1.2 error codes to the contract HTTP statuses', () => {
+    // Regression guard: a code missing from ERROR_STATUS degrades to HTTP 500
+    // while keeping the right `code`, so the status must be pinned explicitly.
+    assert.equal(new ProtocolError('OPERATOR_REQUIRED', 'x').status, 401, '§5.2 requires 401');
+    assert.equal(new ProtocolError('RATE_LIMITED', 'x').status, 429, '§6 requires 429');
+    assert.equal(new ProtocolError('UNAUTHORIZED', 'x').status, 401);
+    assert.equal(new ProtocolError('FRAME_TOO_LARGE', 'x').status, 413);
+  });
+
+  it('SlidingWindowRateLimiter counts every attempt, successes included', () => {
+    const clock = makeClock();
+    const limiter = new SlidingWindowRateLimiter({ limit: 2, windowMs: 60_000, now: clock.now });
+    assert.equal(limiter.hit('ip').allowed, true);
+    assert.equal(limiter.hit('ip').allowed, true);
+    const blocked = limiter.hit('ip');
+    assert.equal(blocked.allowed, false);
+    assert.equal(blocked.retry_after_seconds, 60);
+    assert.equal(limiter.hit('other-ip').allowed, true, 'buckets are per key');
+    clock.advance(60_000);
+    assert.equal(limiter.hit('ip').allowed, true, 'sliding window frees the slot');
+  });
+
+  it('answers 429 RATE_LIMITED with retry_after_seconds and Recovers after the window', async () => {
+    const clock = makeClock();
+    await withRelay({ now: clock.now, pairRateLimitPerMinute: 2 }, async (relay) => {
+      // A SUCCESSFUL pair rotates the code, so each attempt mints a fresh one —
+      // this is exactly the "successes count too" case §6 calls out.
+      const pair = () => request(`${relay.url}/v1/pair`, {
+        method: 'POST',
+        body: {
+          pairing_code: relay.state.createPairingCode(),
+          machine_id: `m-${Math.random().toString(36).slice(2)}`,
+          platform: DEFAULT_PLATFORM,
+          caps: DEFAULT_CAPS,
+        },
+      });
+      assert.equal((await pair()).status, 200, 'successful pairs count toward the budget');
+      assert.equal((await pair()).status, 200);
+
+      const limited = await pair();
+      assert.equal(limited.status, 429);
+      assert.equal(limited.json.error.code, 'RATE_LIMITED');
+      assert.ok(Number.isInteger(limited.json.error.detail.retry_after_seconds));
+      assert.ok(limited.json.error.detail.retry_after_seconds >= 1
+        && limited.json.error.detail.retry_after_seconds <= 60);
+      assert.equal(limited.json.error.detail.limit, 2);
+      assert.equal(limited.json.error.detail.window_seconds, 60);
+      assert.equal(limited.headers['retry-after'], String(limited.json.error.detail.retry_after_seconds));
+      assert.equal(limited.json.retry_after_seconds, limited.json.error.detail.retry_after_seconds,
+        'the value is mirrored top-level as well as inside error.detail');
+
+      clock.advance(60_001);
+      const afterWindow = await pair();
+      assert.equal(afterWindow.status, 200, 'the budget refills after 60s');
+    });
+  });
+
+  it('pair_rate_limit 0 disables the limiter', async () => {
+    await withRelay({ pairRateLimitPerMinute: 0 }, async (relay) => {
+      for (let i = 0; i < 8; i += 1) {
+        const res = await request(`${relay.url}/v1/pair`, {
+          method: 'POST',
+          body: { pairing_code: 'PAIR-NOSUCH00', machine_id: 'm' },
+        });
+        assert.equal(res.status, 400, `attempt ${i} must reach the pairing logic, not the limiter`);
+      }
+    });
+  });
+});
+
+/* ================================================================== */
+/* v0.1.2 §7 — persistence                                             */
+/* ================================================================== */
+
+describe('v0.1.2 persistence (§7)', () => {
+  it('revives devices, tasks and the dedupe index after a restart', async () => {
+    const dir = makeStateDir();
+    try {
+      const first = await startRelay({ stateDir: dir, pairingCode: 'PAIR-RESTORE1' });
+      const paired = await pairDevice(first, 'm1', { code: 'PAIR-RESTORE1' });
+      const deviceToken = paired.token;
+      const created = await postTask(first, taskBody({ task_id: '01JRESTORE0000000000000000' }));
+      const taskId = created.json.task_id;
+      const envelope = envelopeForTask(taskId, 'm1');
+      const stored = await request(`${first.url}/v1/result`, { method: 'POST', token: deviceToken, body: envelope });
+      assert.equal(stored.json.deduped, false);
+      const firstRelayId = first.relayId;
+      await first.close();
+
+      // devices.json is an atomic snapshot; the ledger is append-only JSONL
+      assert.ok(fs.existsSync(path.join(dir, 'devices.json')));
+      assert.ok(fs.existsSync(path.join(dir, 'ledger.jsonl')));
+      assert.equal(fs.readdirSync(dir).some((f) => f.includes('.tmp-')), false, 'no temp snapshot left behind');
+
+      const second = await startRelay({ stateDir: dir });
+      try {
+        assert.notEqual(second.relayId, firstRelayId, '§8.3: a restart gets a new relay_id');
+        assert.equal(second.state.devices.get('m1').online, false,
+          'a restored snapshot proves the device exists, not that it is connected');
+        const hz = await request(`${second.url}/healthz`);
+        assert.equal(hz.json.persistence.enabled, true);
+        assert.equal(hz.json.persistence.revived_devices, 1);
+        assert.equal(hz.json.persistence.revived_tasks, 1);
+        assert.equal(hz.json.persistence.devices_corrupt, false);
+
+        // the SAME device token still authenticates: no re-pairing needed
+        const devices = await request(`${second.url}/v1/devices`, { token: deviceToken });
+        assert.equal(devices.status, 200);
+        assert.equal(devices.json.devices.length, 1);
+        assert.equal(devices.json.devices[0].machine_id, 'm1');
+        assert.equal(devices.json.devices[0].streams, 0, 'no SSE stream yet after the restart');
+
+        // task + lease + result survived
+        const view = await request(`${second.url}/v1/tasks/${taskId}`, { token: deviceToken });
+        assert.equal(view.status, 200);
+        assert.equal(view.json.aggregate.status, 'consistent');
+        assert.equal(view.json.task.task_id, taskId);
+
+        // dedupe index survived: the identical redelivery is still deduped
+        const repeated = await request(`${second.url}/v1/result`, { method: 'POST', token: deviceToken, body: envelope });
+        assert.equal(repeated.status, 200);
+        assert.equal(repeated.json.deduped, true, 'the dedupe key was rebuilt from the ledger');
+      } finally {
+        await second.close();
+      }
+    } finally {
+      removeStateDir(dir);
+    }
+  });
+
+  it('reports a corrupt devices.json loudly instead of silently wiping it', async () => {
+    const dir = makeStateDir();
+    try {
+      const damaged = '{ this is not json';
+      fs.writeFileSync(path.join(dir, 'devices.json'), damaged);
+      const relay = await startRelay({ stateDir: dir });
+      try {
+        const hz = await request(`${relay.url}/healthz`);
+        assert.equal(hz.json.persistence.enabled, true);
+        assert.equal(hz.json.persistence.devices_corrupt, true);
+        assert.equal(hz.json.devices, 0, 'starts from an empty table');
+        assert.ok(
+          hz.json.persistence.warnings.some((w) => w.file === 'devices.json'),
+          'the damage must be reported in /healthz',
+        );
+        assert.ok(
+          relay.startupMessages.some((m) => /CORRUPT/.test(m)),
+          `the startup log must say it loudly: ${JSON.stringify(relay.startupMessages)}`,
+        );
+        assert.equal(fs.readFileSync(path.join(dir, 'devices.json'), 'utf8'), damaged,
+          'the damaged snapshot is left untouched for forensics');
+      } finally {
+        await relay.close();
+      }
+    } finally {
+      removeStateDir(dir);
+    }
+  });
+
+  it('skips one corrupt ledger line, keeps the rest and counts warnings', async () => {
+    const dir = makeStateDir();
+    try {
+      const first = await startRelay({ stateDir: dir, pairingCode: 'PAIR-LEDGER01' });
+      const paired = await pairDevice(first, 'm1', { code: 'PAIR-LEDGER01' });
+      const created = await postTask(first, taskBody({ task_id: '01JLEDGER00000000000000000' }));
+      const taskId = created.json.task_id;
+      await first.close();
+
+      const ledgerFile = path.join(dir, 'ledger.jsonl');
+      const lines = fs.readFileSync(ledgerFile, 'utf8').split('\n').filter((l) => l.trim() !== '');
+      const good = lines.length;
+      lines.splice(1, 0, '{"type":"task.created", THIS IS NOT JSON');
+      lines.push(''); // trailing newline
+      fs.writeFileSync(ledgerFile, lines.join('\n'));
+
+      const second = await startRelay({ stateDir: dir });
+      try {
+        const hz = await request(`${second.url}/healthz`);
+        assert.equal(hz.json.persistence.ledger_lines_skipped, 1);
+        assert.equal(hz.json.persistence.ledger_lines_read, good + 1);
+        assert.equal(hz.json.persistence.revived_tasks, 1, 'the intact entries still replay');
+        assert.ok(hz.json.persistence.warnings.some((w) => w.file === 'ledger.jsonl' && w.line === 2));
+        const view = await request(`${second.url}/v1/tasks/${taskId}`, { token: paired.token });
+        assert.equal(view.status, 200, 'the relay started despite the corruption');
+      } finally {
+        await second.close();
+      }
+    } finally {
+      removeStateDir(dir);
+    }
+  });
+
+  it('persist:false is pure in-memory (v1 behaviour) and reports enabled:false', async () => {
+    const dir = makeStateDir();
+    try {
+      await withRelay({ persist: false, stateDir: dir }, async (relay) => {
+        const a = await pairDevice(relay, 'm1');
+        await postTask(relay, taskBody());
+        const hz = await request(`${relay.url}/healthz`);
+        assert.equal(hz.json.persistence.enabled, false);
+        assert.equal(hz.json.persistence.dir, null);
+        assert.equal(hz.json.devices, 1, 'still works in memory');
+        assert.equal(hz.json.tasks, 1);
+        assert.equal(a.token.length > 0, true);
+      });
+      assert.deepEqual(fs.readdirSync(dir), [], 'nothing may be written when persistence is off');
+    } finally {
+      removeStateDir(dir);
+    }
+  });
+});
+
+/* ================================================================== */
+/* v0.1.2 §4/§8 — healthz fields, SSE hardening, relay_id              */
+/* ================================================================== */
+
+describe('v0.1.2 observability (§4/§8)', () => {
+  it('/healthz exposes the cross-region operations fields', async () => {
+    await withRelay({ basePath: '/w2m', trustProxy: true, pairRateLimitPerMinute: 7 }, async (relay) => {
+      const hz = await request(`${relay.url}/healthz`, { headers: { 'x-forwarded-proto': 'https' } });
+      assert.equal(hz.status, 200);
+      assert.equal(hz.json.ok, true);
+      assert.equal(hz.json.protocol_version, 1);
+      assert.equal(hz.json.relay_id, relay.relayId);
+      assert.match(hz.json.relay_id, /^[0-9a-f]{16}$/);
+      assert.match(hz.json.started_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
+      assert.match(hz.json.rabbit_time, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
+      assert.equal(hz.json.effective_scheme, 'https');
+      assert.equal(hz.json.base_path, '/w2m');
+      assert.equal(hz.json.operator_token_required, true);
+      assert.equal(hz.json.pair_rate_limit, 7);
+      assert.deepEqual(
+        Object.keys(hz.json.persistence).sort(),
+        ['devices_corrupt', 'devices_missing', 'dir', 'enabled', 'ledger_lines_read',
+          'ledger_lines_skipped', 'revived_devices', 'revived_tasks', 'warnings'],
+      );
+      assert.equal(hz.json.persistence.enabled, false);
+      const serialized = JSON.stringify(hz.json);
+      assert.equal(serialized.includes(OP), false, '/healthz must never leak the operator token');
+    });
+  });
+
+  it('SSE carries the anti-buffering headers and a ready frame with relay_id', async () => {
+    await withRelay({}, async (relay) => {
+      const { token } = await pairDevice(relay, 'm1');
+      const sse = await openSse(`${relay.url}/v1/stream?machine_id=m1`, { token });
+      try {
+        assert.equal(sse.headers['x-accel-buffering'], 'no');
+        assert.equal(sse.headers['cache-control'], 'no-cache, no-transform');
+        assert.match(sse.headers['content-type'], /text\/event-stream/);
+        const ready = await sse.waitFor((f) => f.event === 'ready');
+        assert.equal(ready.json.relay_id, relay.relayId, '§8.3: clients detect a restart via relay_id');
+        assert.equal(ready.json.machine_id, 'm1');
+      } finally {
+        sse.close();
+      }
+    });
+  });
+
+  it('no HTTP response and no SSE frame leaks a credential', async () => {
+    // Credentials may only appear in the /v1/pair response (which hands a machine
+    // its OWN device_token) and in the startup banner on stderr. Everything here is
+    // something a user would pipe into a log file, so all of it is scanned.
+    const dir = makeStateDir();
+    try {
+      const relay = await startRelay({
+        stateDir: dir, operatorToken: undefined, pairingCode: 'PAIR-NOLEAK01', pairRateLimitPerMinute: 0,
+      });
+      try {
+        const operatorToken = relay.operatorToken;
+        assert.match(operatorToken, /^[0-9a-f]{64}$/);
+        const { token: deviceToken } = await pairDevice(relay, 'm1', { code: 'PAIR-NOLEAK01' });
+        const created = await postTask(relay, taskBody());
+        const taskId = created.json.task_id;
+        await request(`${relay.url}/v1/result`, {
+          method: 'POST', token: deviceToken, body: envelopeForTask(taskId, 'm1'),
+        });
+
+        const sse = await openSse(`${relay.url}/v1/stream?machine_id=m1`, { token: deviceToken });
+        const seen = [];
+        const grab = async (label, promise) => {
+          const res = await promise;
+          seen.push([label, res.text]);
+          return res;
+        };
+
+        await grab('healthz', request(`${relay.url}/healthz`));
+        await grab('healthz-forwarded', request(`${relay.url}/healthz`, {
+          headers: { 'x-forwarded-proto': 'https', 'x-forwarded-for': '203.0.113.9' },
+        }));
+        await grab('devices', request(`${relay.url}/v1/devices`, { token: deviceToken }));
+        await grab('tasks', request(`${relay.url}/v1/tasks`, { token: deviceToken }));
+        await grab('task', request(`${relay.url}/v1/tasks/${taskId}`, { token: deviceToken }));
+        await grab('task-404', request(`${relay.url}/v1/tasks/nope`, { token: deviceToken }));
+        await grab('report-json', request(`${relay.url}/v1/tasks/${taskId}/report?format=json`, { token: deviceToken }));
+        await grab('report-md', request(`${relay.url}/v1/tasks/${taskId}/report?format=md`, { token: deviceToken }));
+        await grab('heartbeat', request(`${relay.url}/v1/heartbeat`, {
+          method: 'POST', token: deviceToken, body: { task_id: taskId, machine_id: 'm1' },
+        }));
+        await grab('result-repeat', request(`${relay.url}/v1/result`, {
+          method: 'POST', token: deviceToken, body: envelopeForTask(taskId, 'm1'),
+        }));
+        await grab('task-created', postTask(relay, taskBody()));
+        // error paths carry `detail` too — the easiest place to leak by accident
+        await grab('err-operator-missing', request(`${relay.url}/v1/task`, { method: 'POST', body: taskBody() }));
+        await grab('err-operator-device-token', postTask(relay, taskBody(), deviceToken));
+        await grab('err-unauthorized', request(`${relay.url}/v1/devices`));
+        await grab('err-not-found', request(`${relay.url}/v1/nope`, { token: deviceToken }));
+        await grab('err-bad-request', request(`${relay.url}/v1/task`, {
+          method: 'POST', token: operatorToken, body: { mode: 'nope' },
+        }));
+        await grab('err-pairing-invalid', request(`${relay.url}/v1/pair`, {
+          method: 'POST', body: { pairing_code: 'PAIR-WRONGXXX', machine_id: 'x' },
+        }));
+
+        // the pairing response legitimately carries the machine's own device_token
+        const pairResponse = await request(`${relay.url}/v1/pair`, {
+          method: 'POST',
+          body: {
+            pairing_code: relay.state.createPairingCode(),
+            machine_id: 'm2', platform: DEFAULT_PLATFORM, caps: DEFAULT_CAPS,
+          },
+        });
+        assert.equal(pairResponse.status, 200);
+        assert.equal(pairResponse.text.includes(operatorToken), false, '/v1/pair must not echo the operator token');
+
+        await sse.waitFor((f) => f.event === 'ready');
+        await sleep(50); // let offer/result frames flush
+        for (const frame of sse.frames) {
+          assert.equal(frame.raw.includes(operatorToken), false, `SSE frame leaked the operator token: ${frame.raw}`);
+          assert.equal(frame.raw.includes(deviceToken), false, `SSE frame leaked a device token: ${frame.raw}`);
+        }
+        sse.close();
+
+        for (const [label, text] of seen) {
+          assert.equal(text.includes(operatorToken), false, `${label} leaked the OPERATOR token`);
+          assert.equal(text.includes(deviceToken), false, `${label} leaked a DEVICE token`);
+        }
+        const healthz = JSON.parse(seen.find(([l]) => l === 'healthz')[1]);
+        // A boolean presence flag is fine; a field carrying the secret itself is not.
+        assert.equal('operator_token' in healthz, false, '/healthz must not carry an operator_token field');
+        assert.equal('device_token' in healthz, false, '/healthz must not carry a device_token field');
+        assert.equal('token' in healthz, false, '/healthz must not carry a bare token field');
+        assert.deepEqual(
+          Object.keys(healthz).filter((k) => /token/i.test(k)),
+          ['operator_token_required'],
+          'the only token-named field is the boolean presence flag',
+        );
+        assert.equal(typeof healthz.operator_token_required, 'boolean');
+        assert.equal(healthz.operator_token_required, true, 'presence is reported instead of the value');
+      } finally {
+        await relay.close();
+      }
+    } finally {
+      removeStateDir(dir);
+    }
+  });
+});
+
+/* ================================================================== */
+/* v0.1.2 §3 — TLS termination (deployment form B)                     */
+/* ================================================================== */
+
+// Self-signed fixture for 127.0.0.1/localhost, valid until 2036-10-04.
+// Generated once with openssl; embedded so the suite needs no external tooling.
+const TLS_CERT_PEM = `-----BEGIN CERTIFICATE-----
+MIIDJTCCAg2gAwIBAgIUG5xkW4DDAsICThEbauwpZLDrlDcwDQYJKoZIhvcNAQEL
+BQAwFDESMBAGA1UEAwwJMTI3LjAuMC4xMB4XDTI2MTAwNzE0MTEyNloXDTM2MTAw
+NDE0MTEyNlowFDESMBAGA1UEAwwJMTI3LjAuMC4xMIIBIjANBgkqhkiG9w0BAQEF
+AAOCAQ8AMIIBCgKCAQEA3ixZLoj8AmGX4Xm4tGlR5/kqbjwtOTUReuqp93pEDZEp
+Bwe+KztvbF6Q2RVCIsQihzpLBXU+AgPa7+E/U4vAmFEM5ubo/xHj79wxT856XwXW
+rXocS4TyTX0Przk45ZyDmpRBObsZkO+e5OD/CSsBb0t4WUNTJjBPeNudbZiIqK+4
+BU1QpsomZAEbQ01yXT1s7BAlgAjX+kZeMaAmk41S24v7kn3M1H86Zk4IpJg+714Z
+/0I7RuQp6noAWxWDtnLXMdv3igPC2AH25UuC7lTp6m89EqsbT6bgf50Nmv3+FtpI
+ii1d2Me4KnATdHCo0H5cVScKMnSSAweKGmJP8GI69wIDAQABo28wbTAdBgNVHQ4E
+FgQUhfSqlMoKSPx3XcRlj1yXPeEcrqkwHwYDVR0jBBgwFoAUhfSqlMoKSPx3XcRl
+j1yXPeEcrqkwDwYDVR0TAQH/BAUwAwEB/zAaBgNVHREEEzARhwR/AAABgglsb2Nh
+bGhvc3QwDQYJKoZIhvcNAQELBQADggEBANJ2xPZIEqxhK1GOlsafFDkZX42FnkG8
+4840gXg49LJ1joxFXJgGsC65i7uFBBVyjFsv8PQ8P869i8jWNrTede3+5s/nBppn
+iD3e5tx+Rq2fbZUEidcKicKNWs0ztX+ie7W66V4KgUp34IeTq5Kxf/hZOskWAwWq
+zlvuT4JEhY+qo6nTN5SDDyxHqeAsE/TkS3QQe/1X5B6S0w/f4M/sn6BIqVEcFEUd
+LWESZl6dI0NTKvAzH9ZMuYR+chma1LySiTGj953A05/q/kOmI6NBuVbj9DhUgMLJ
++SMKzFNkzygE1zxDRHnrf5qZKrezj95aMZl9niFHM4o03ANl+GItfx8=
+-----END CERTIFICATE-----`;
+
+const TLS_KEY_PEM = `-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDeLFkuiPwCYZfh
+ebi0aVHn+SpuPC05NRF66qn3ekQNkSkHB74rO29sXpDZFUIixCKHOksFdT4CA9rv
+4T9Ti8CYUQzm5uj/EePv3DFPznpfBdatehxLhPJNfQ+vOTjlnIOalEE5uxmQ757k
+4P8JKwFvS3hZQ1MmME94251tmIior7gFTVCmyiZkARtDTXJdPWzsECWACNf6Rl4x
+oCaTjVLbi/uSfczUfzpmTgikmD7vXhn/QjtG5CnqegBbFYO2ctcx2/eKA8LYAfbl
+S4LuVOnqbz0SqxtPpuB/nQ2a/f4W2kiKLV3Yx7gqcBN0cKjQflxVJwoydJIDB4oa
+Yk/wYjr3AgMBAAECggEADyiurqwnqPBVV2V7IsqLQIarTHll17qbn+vImQ6KLvRk
+/KPPzk29EB0Lr3Dx4dyVqbn8FtOldw6ISHtX9Mon4+/aL4I5CsS2IE5bCi6OaIYs
+QnEYfFaf3OwLJYUdl4N5JazqUZdG6uROm4Z2hrIDSqXqZwmSIzYcotecadC3uLqg
+1wf4T7HzXEBeIrzqlf6zjykldbPODHyQNEd7pchqAKP6rv3JsUH8TmOAtfQuqWzL
+9F4Z+rxXjo4l+QG+KxiIXhNmnKYBJxArx6Geil1qWE7NeWte6d3K7RqY24hSG1Xu
+knF7qo5TyM4KeKFgX5SIzz0PFMJlS1cUGnlygaoEgQKBgQDvTdH2LZagzDsw039X
+psWuOu56XJee2VdelNJir94zOY/rQ/hSrrW+iOCmgxKUQQqoAFUON1kAtfKxUODm
+6qpFhpq6kBhvS4TL5PjgOGCt1e7CVdgTIFYsN7W+qlJ6OnUPaC9BjYGod31iFxFe
+HGz/QcTe50RlNxuJARsk64VmoQKBgQDtrI7VTkWBthAFax55/l53QGZbKyfpTiBP
+ATFWxEjXWHQZS/PW2yDZhxrbcN2XNyl7aOejIaOf2E3MoGCsdRzB7i6geWoc0z48
+cIWUFBlKzDtyu5XNDgBBtMw+H8D4X5CZ6PIDVKm/sKUmGARAmHG0bfvVUHZWd4lh
+8iUDf59ylwKBgQCJLVLui7OM+YX0t0iINlGbTqzl963yoSQ0U5tGdwoo0xZtBsmS
+nBQS5OPij8BWu/If3BDl1VRv090LSBGkTWDN+hs4VuGq6t91Agyoe6jv/XKgdBUo
+4aCEOGs2oOwmpNv1uQNd0IBC0jxNvmt2R1Uz/b+dB3Vtj+l43+lvgJM4AQKBgQCJ
+h7ejIMbBtztwFzssdo/tS5uvF7rhmy7A6LzHK4/G5M1RsgyogGZy2WYmIxpmnSno
+2pxnXljTbxQd25P1V1NLuOrMO1W21loGGUqClFrKWIHx8zBM1tQ5MUiajj9Yudvv
+48bfPId5f9sgvvb+9fed46K9HfFMOaGKxta6PohigwKBgArgTgnXV+BaFxDIdUle
+bDXUoqerJVRC3JMe6Kj9PE5qFjzryh1jhS3TviL4dA6lsjkE2rWIocHsvqQ8ETh9
+y7w2vF5vwt5kkSCBNMV0R56cEONh9McoF3IaAUj+mRzflTfUnQF5kimSPXo3WYkZ
+LaVs1OiuMgeq+iC/GDluXOLZ
+-----END PRIVATE KEY-----`;
+
+describe('v0.1.2 TLS (§3 form B)', () => {
+  it('terminates TLS itself when tlsCert/tlsKey are given', async () => {
+    const dir = makeStateDir();
+    const certPath = path.join(dir, 'cert.pem');
+    const keyPath = path.join(dir, 'key.pem');
+    fs.writeFileSync(certPath, TLS_CERT_PEM);
+    fs.writeFileSync(keyPath, TLS_KEY_PEM);
+    const relay = await startRelay({ tlsCert: certPath, tlsKey: keyPath, persist: false });
+    try {
+      assert.equal(relay.scheme, 'https');
+      assert.match(relay.url, /^https:\/\//);
+      assert.equal(relay.server.constructor.name, 'Server');
+      const hz = await request(`${relay.url}/healthz`);
+      assert.equal(hz.status, 200);
+      assert.equal(hz.json.effective_scheme, 'https');
+
+      const paired = await request(`${relay.url}/v1/pair`, {
+        method: 'POST',
+        body: {
+          pairing_code: relay.state.createPairingCode(),
+          machine_id: 'tls-m1', platform: DEFAULT_PLATFORM, caps: DEFAULT_CAPS,
+        },
+      });
+      assert.equal(paired.status, 200);
+    } finally {
+      await relay.close();
+      removeStateDir(dir);
+    }
+  });
+
+  it('refuses half a TLS configuration and unreadable material instead of downgrading', async () => {
+    assert.throws(
+      () => createRelayServer({ tlsCert: 'x.pem', persist: false, logger: null }),
+      (err) => err.code === 'BAD_REQUEST' && /together/.test(err.message),
+    );
+    assert.throws(
+      () => createRelayServer({ tlsKey: 'x.pem', persist: false, logger: null }),
+      (err) => err.code === 'BAD_REQUEST',
+    );
+    assert.throws(
+      () => createRelayServer({ tlsCert: 'no-such-cert.pem', tlsKey: 'no-such-key.pem', persist: false, logger: null }),
+      (err) => err.code === 'BAD_REQUEST' && /cannot read TLS material/.test(err.message),
+    );
   });
 });

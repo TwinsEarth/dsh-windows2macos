@@ -26,6 +26,7 @@ import { formatError, resolveStateDir } from '../src/util/cli.mjs';
 import { createAgent, parseAllowedCommands } from '../src/agent/agent.mjs';
 import { probeCapsDetailed, detectPlatform } from '../src/agent/caps.mjs';
 import { loadOrCreateIdentity, saveDeviceToken } from '../src/agent/identity.mjs';
+import { resolveBaseUrl } from '../src/agent/url.mjs';
 
 const USAGE = `w2m-localside — W2M Localside agent (protocol v1)
 
@@ -35,7 +36,9 @@ Usage:
                 [--state <dir>] [--once] [--once-idle-ms <ms>]
 
 Options:
-  --rabbit <url>            Rabbit base URL (default: $W2M_RABBIT_URL)
+  --rabbit <url>            Rabbit base address (default: $W2M_RABBIT_URL).
+                            A sub-path is supported: https://host/w2m
+                            Query strings and fragments are rejected.
   --pair <CODE>             One-time pairing code, e.g. PAIR-7K2M9QX4
   --project <dir>           Project root to run in (default: current directory)
   --name <name>             machine_name (default: <os>-<hostname>)
@@ -44,6 +47,9 @@ Options:
                             Nothing is allowed when omitted.
   --state <dir>             State directory for spool/state
                             (default: <DSH_HOME>/xclient/localside)
+  --operator-token <t>      Operator token (or $W2M_OPERATOR_TOKEN). Only needed
+                            when this host also submits tasks; the Localside
+                            agent itself never sends it.
   --once                    Handle one offer, then exit
   --once-idle-ms <ms>       With --once: give up if no offer arrives in <ms>
   --heartbeat-ms <ms>       Lease heartbeat interval (default: 10000)
@@ -67,6 +73,7 @@ function parseCli(argv) {
       project: { type: 'string' },
       name: { type: 'string' },
       'allowed-commands': { type: 'string' },
+      'operator-token': { type: 'string' },
       state: { type: 'string' },
       once: { type: 'boolean', default: false },
       'once-idle-ms': { type: 'string' },
@@ -97,6 +104,17 @@ async function main() {
     process.stderr.write('error: --rabbit <url> is required (or set W2M_RABBIT_URL)\n\n' + `${USAGE}\n`);
     return 2;
   }
+  // Validate the base address before doing anything else: a sub-path is fine,
+  // a query string / fragment / non-http scheme is a usage error (v0.1.2 §2).
+  let baseUrl;
+  try {
+    baseUrl = resolveBaseUrl(rabbitUrl);
+  } catch (error) {
+    process.stderr.write(`error: ${formatError(error)}\n`);
+    return 2;
+  }
+
+  const operatorToken = flags['operator-token'] ?? process.env.W2M_OPERATOR_TOKEN ?? null;
 
   let allowedCommands;
   try {
@@ -130,7 +148,7 @@ async function main() {
   try {
     const { identity, path: identityPath, created } = loadOrCreateIdentity({
       name: flags.name,
-      rabbitUrl,
+      rabbitUrl: baseUrl,
     });
     log('info', `${created ? 'created' : 'loaded'} identity ${identity.machine_id} (${identityPath})`);
 
@@ -143,7 +161,7 @@ async function main() {
     if (detail.notes.length > 0) log('warn', 'capability probe notes', { notes: detail.notes });
 
     const agent = createAgent({
-      rabbitUrl,
+      rabbitUrl: baseUrl,
       project,
       stateDir,
       identity,
@@ -153,8 +171,14 @@ async function main() {
       once: flags.once === true,
       onceIdleMs,
       heartbeatIntervalMs: heartbeatMs,
+      operatorToken,
       log,
     });
+    if (operatorToken) {
+      log('info', 'operator token configured (submit-capable host); the agent itself never sends it', {
+        length: operatorToken.length,
+      });
+    }
 
     if (flags.pair) {
       const paired = await agent.pair(flags.pair);

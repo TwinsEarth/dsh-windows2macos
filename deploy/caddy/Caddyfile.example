@@ -1,0 +1,118 @@
+# ============================================================================
+#  W2M relay behind Caddy  --  example configuration
+# ============================================================================
+#
+#  This file is a TEMPLATE. Replace every <placeholder> before using it.
+#
+#  Validated how: caddy is not installed on the authoring machine, so this file
+#  was NOT checked with `caddy validate`. Run that on the server before
+#  reloading -- docs/DEPLOY.md gives the exact commands.
+#
+#  ---------------------------------------------------------------------------
+#  WHY CADDY NEEDS ONE EXPLICIT SETTING FOR SSE
+#  ---------------------------------------------------------------------------
+#  Caddy 2 enables automatic HTTPS (issuance + renewal) with no extra
+#  configuration, which is its main advantage over nginx here. It also buffers
+#  responses by default, like nginx -- but unlike nginx it does NOT honour the
+#  relay's `X-Accel-Buffering: no` header, because that header is an
+#  nginx-specific convention.
+#
+#  So the setting that matters is:
+#
+#      flush_interval -1
+#
+#  Without it the browser connects to /v1/stream, receives no events, and the
+#  UI looks "connected but dead" -- the same failure `proxy_buffering off`
+#  prevents under nginx.
+#
+#  Caddy handles HTTP/1.1 and HTTP/2 correctly by itself, so the other two
+#  nginx-side SSE requirements have no Caddy equivalent.
+#
+#  ---------------------------------------------------------------------------
+#  SHAPE 1: served at the root of a dedicated hostname (recommended).
+#  Replace <your-domain> with a name whose A/AAAA record points at this server.
+#  Relay flags: no --base-path, no --tls-cert/--tls-key (Caddy terminates TLS).
+# ============================================================================
+
+<your-domain> {
+	# ---- the event stream: this route alone needs flush_interval ----------
+	@stream path /v1/stream
+	handle @stream {
+		reverse_proxy 127.0.0.1:8787 {
+			# Disable response buffering: frames must reach the client as
+			# they are written. This is the Caddy equivalent of nginx's
+			# `proxy_buffering off`, and it is the single most important
+			# line in this file.
+			flush_interval -1
+
+			# The stream is long-lived and quiet between the relay's 15s
+			# keepalive comments, so let it stay open indefinitely.
+			transport http {
+				read_timeout 0
+				write_timeout 0
+			}
+		}
+	}
+
+	# ---- health check, unauthenticated on purpose -------------------------
+	handle /healthz {
+		reverse_proxy 127.0.0.1:8787
+	}
+
+	# ---- everything else --------------------------------------------------
+	handle {
+		reverse_proxy 127.0.0.1:8787 {
+			flush_interval -1
+		}
+	}
+
+	# ---- logging ----------------------------------------------------------
+	# Off by default in Caddy. Turn it on while bringing a deployment up: it is
+	# the fastest way to see whether a client reached /v1/stream, and whether
+	# Caddy itself (not the relay) answered 401/403/404.
+	log {
+		output file /var/log/caddy/w2m-access.log {
+			roll_size 10MiB
+			roll_keep 5
+		}
+		format json
+	}
+}
+
+# ============================================================================
+#  SHAPE 2: served under a sub-path, e.g. https://<your-domain>/w2m/
+# ============================================================================
+#  Uncomment and adapt when the relay must share a hostname with something else.
+#
+#  Start the relay with `--base-path /w2m` and forward the prefix UNCHANGED.
+#  Caddy's `handle_path` strips the prefix -- using it here is the classic
+#  mistake and produces 404 on every /v1/* call. `handle` preserves the path.
+#
+#  Client `rabbitUrl` must carry the same prefix:
+#      https://<your-domain>/w2m
+# ============================================================================
+
+# <your-domain> {
+# 	@stream path /w2m/v1/stream
+# 	handle @stream {
+# 		reverse_proxy 127.0.0.1:8787 {
+# 			flush_interval -1
+# 			transport http {
+# 				read_timeout 0
+# 				write_timeout 0
+# 			}
+# 		}
+# 	}
+#
+# 	# The relay answers /healthz both with and without the prefix, so a probe
+# 	# on either path keeps working; this keeps the bare one reachable.
+# 	handle /healthz {
+# 		reverse_proxy 127.0.0.1:8787
+# 	}
+#
+# 	handle /w2m/* {
+# 		reverse_proxy 127.0.0.1:8787 {
+# 			flush_interval -1
+# 		}
+# 	}
+# }

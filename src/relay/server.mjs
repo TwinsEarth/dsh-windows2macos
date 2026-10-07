@@ -1,10 +1,20 @@
 /**
- * W2M Rabbit relay — node:http server (PROTOCOL §1 endpoints, §3 SSE, §7 errors).
+ * W2M Rabbit relay — node:http / node:https server.
+ *
+ * PROTOCOL.md §1 endpoints, §3 SSE, §7 errors
+ * PROTOCOL-v0.1.2.md §3 deployment params, §4 /healthz, §5 operator token,
+ *                     §6 pair rate limit, §7 persistence, §8 SSE hardening.
  *
  * Zero third-party dependencies: only `node:` builtins.
  */
 
 import http from 'node:http';
+import https from 'node:https';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { randomBytes } from 'node:crypto';
+
 import {
   MAX_FRAME_BYTES,
   PROTOCOL_VERSION,
@@ -12,17 +22,36 @@ import {
   RabbitState,
   rfc3339,
 } from './state.mjs';
+import { Persistence } from './persistence.mjs';
 import { aggregateTask, buildReport } from './report.mjs';
 
 export const DEFAULT_SSE_KEEPALIVE_MS = 15_000; // §3.2: every 15s a `: keepalive` line
 export const DEFAULT_SWEEP_INTERVAL_MS = 1_000;
+export const DEFAULT_PAIR_RATE_LIMIT_PER_MINUTE = 5; // v0.1.2 §6
+export const RATE_LIMIT_WINDOW_MS = 60_000;
+export const DEFAULT_STATE_DIR = path.join(os.homedir(), '.w2m');
 
 /* ------------------------------------------------------------------ */
 /* helpers                                                             */
 /* ------------------------------------------------------------------ */
 
+/** v0.1.2 §3: `/w2m/` → `/w2m`; '' / '/' → '/'. Never returns a trailing slash. */
+export function normalizeBasePath(value) {
+  if (value === undefined || value === null || value === '') return '/';
+  let p = String(value).trim();
+  if (p === '' || p === '/') return '/';
+  if (!p.startsWith('/')) p = `/${p}`;
+  p = p.replace(/\/{2,}/g, '/').replace(/\/+$/, '');
+  return p === '' ? '/' : p;
+}
+
+function normalizePath(pathname) {
+  if (!pathname) return '/';
+  return pathname.length > 1 ? pathname.replace(/\/+$/, '') : pathname;
+}
+
 function sendJson(res, status, body, extraHeaders = {}) {
-  if (res.writableEnded) return;
+  if (res.writableEnded) return undefined;
   const payload = Buffer.from(JSON.stringify(body), 'utf8');
   res.writeHead(status, {
     'content-type': 'application/json; charset=utf-8',
@@ -30,12 +59,18 @@ function sendJson(res, status, body, extraHeaders = {}) {
     'cache-control': 'no-store',
     ...extraHeaders,
   });
-  res.end(payload);
+  return res.end(payload);
 }
 
 function sendError(res, err) {
   if (err instanceof ProtocolError) {
-    sendJson(res, err.status, err.toBody());
+    const body = err.toBody();
+    // §6 just says the 429 "carries retry_after_seconds" without pinning the
+    // location, so it is emitted both inside error.detail (the §7 shape) and as a
+    // top-level convenience field. Both are additive.
+    const retryAfter = err.detail?.retry_after_seconds;
+    if (typeof retryAfter === 'number') body.retry_after_seconds = retryAfter;
+    sendJson(res, err.status, body, err.headers ?? {});
     return;
   }
   sendJson(res, 500, {
@@ -52,6 +87,13 @@ function bearerToken(req) {
   if (typeof header !== 'string') return null;
   const m = /^Bearer\s+(.+)$/i.exec(header.trim());
   return m ? m[1].trim() : null;
+}
+
+function firstHeaderValue(value) {
+  const raw = Array.isArray(value) ? value[0] : value;
+  if (typeof raw !== 'string') return null;
+  const first = raw.split(',')[0].trim();
+  return first === '' ? null : first;
 }
 
 /**
@@ -111,37 +153,246 @@ async function readJson(req, limit) {
 }
 
 /* ------------------------------------------------------------------ */
+/* pair rate limiting (v0.1.2 §6)                                      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Per-IP sliding window. Successful pairs count too, otherwise a working pairing
+ * code could be used to flush the failure budget.
+ */
+export class SlidingWindowRateLimiter {
+  constructor({ limit = DEFAULT_PAIR_RATE_LIMIT_PER_MINUTE, windowMs = RATE_LIMIT_WINDOW_MS, now = Date.now } = {}) {
+    this.limit = limit;
+    this.windowMs = windowMs;
+    this._now = now;
+    /** @type {Map<string, number[]>} */
+    this.buckets = new Map();
+  }
+
+  get windowSeconds() { return Math.round(this.windowMs / 1000); }
+
+  /** Records one attempt and reports whether it is allowed. */
+  hit(key) {
+    if (this.limit <= 0) {
+      return { allowed: true, retry_after_seconds: 0, limit: 0, window_seconds: this.windowSeconds, remaining: Infinity };
+    }
+    const now = this._now();
+    const cutoff = now - this.windowMs;
+    let hits = this.buckets.get(key);
+    if (!hits) {
+      hits = [];
+      this.buckets.set(key, hits);
+    }
+    while (hits.length > 0 && hits[0] <= cutoff) hits.shift();
+
+    if (hits.length >= this.limit) {
+      const retryMs = hits[0] + this.windowMs - now;
+      return {
+        allowed: false,
+        retry_after_seconds: Math.max(1, Math.ceil(retryMs / 1000)),
+        limit: this.limit,
+        window_seconds: this.windowSeconds,
+        remaining: 0,
+      };
+    }
+    hits.push(now);
+    return {
+      allowed: true,
+      retry_after_seconds: 0,
+      limit: this.limit,
+      window_seconds: this.windowSeconds,
+      remaining: this.limit - hits.length,
+    };
+  }
+
+  /** Drop idle buckets so a long-running relay cannot leak memory. */
+  prune() {
+    const cutoff = this._now() - this.windowMs;
+    for (const [key, hits] of this.buckets) {
+      while (hits.length > 0 && hits[0] <= cutoff) hits.shift();
+      if (hits.length === 0) this.buckets.delete(key);
+    }
+  }
+
+  reset() { this.buckets.clear(); }
+}
+
+/* ------------------------------------------------------------------ */
 /* server                                                              */
 /* ------------------------------------------------------------------ */
 
 export class RelayServer {
   constructor(options = {}) {
     this.options = options;
-    this.state = options.state ?? new RabbitState(options);
+    this.basePath = normalizeBasePath(options.basePath);
+    this.trustProxy = options.trustProxy === true;
     this.frameLimitBytes = options.frameLimitBytes ?? MAX_FRAME_BYTES;
     this.keepaliveMs = options.keepaliveMs ?? DEFAULT_SSE_KEEPALIVE_MS;
     this.sweepIntervalMs = options.sweepIntervalMs ?? DEFAULT_SWEEP_INTERVAL_MS;
-    this.logger = options.logger ?? null;
+    this.pairRateLimitPerMinute = Number.isFinite(options.pairRateLimitPerMinute)
+      ? options.pairRateLimitPerMinute : DEFAULT_PAIR_RATE_LIMIT_PER_MINUTE;
 
-    this.pairingCode = options.pairingCode ?? this.state.createPairingCode();
+    // §3: `logger: null` silences. The default writes to STDERR on purpose —
+    // stdout belongs to protocol output (e.g. the CLI's `--json` line), and mixing
+    // prose into it breaks `| ConvertFrom-Json` / `| jq`.
+    this.logger = options.logger === undefined
+      ? ((msg) => process.stderr.write(`${msg}\n`))
+      : options.logger;
+    this.startupMessages = [];
+
+    /* ---- persistence (§7) ---- */
+    const rawStateDir = options.stateDir ?? (typeof options.state === 'string' ? options.state : null);
+    const persistEnabled = options.persist !== false && rawStateDir !== '';
+    const stateDir = persistEnabled
+      ? path.resolve(rawStateDir === null || rawStateDir === undefined ? DEFAULT_STATE_DIR : String(rawStateDir))
+      : null;
+    this.persistence = new Persistence({
+      dir: stateDir,
+      now: () => (this.state ? this.state.nowMs() : Date.now()),
+    });
+
+    /* ---- state ---- */
+    const injected = options.state && typeof options.state === 'object' ? options.state : null;
+    this.state = injected ?? new RabbitState({ ...options, persistence: this.persistence });
+    this.state.setPersistence(this.persistence);
+
+    this.relayId = this.state.relayId;
+    this._startedAtMs = this.state.nowMs();
+
+    /* ---- startup recovery (§7) ---- */
+    if (this.persistence.enabled) {
+      const snapshot = this.persistence.loadDevices();
+      this.persistence.devicesMissing = snapshot.missing;
+      const ledger = this.persistence.loadLedger();
+      const revived = this.state.restore({ devices: snapshot.devices, ledger });
+      this.persistence.revivedDevices = revived.revived_devices;
+      this.persistence.revivedTasks = revived.revived_tasks;
+    }
+
+    /* ---- operator token (§5) ---- */
+    this._initOperatorToken(options);
+
+    /* ---- /v1/pair rate limit (§6) ---- */
+    this.pairLimiter = new SlidingWindowRateLimiter({
+      limit: this.pairRateLimitPerMinute,
+      windowMs: RATE_LIMIT_WINDOW_MS,
+      now: () => this.state.nowMs(),
+    });
+
+    /* ---- transport ---- */
+    this.tlsCertPath = options.tlsCert ?? null;
+    this.tlsKeyPath = options.tlsKey ?? null;
+    if ((this.tlsCertPath && !this.tlsKeyPath) || (!this.tlsCertPath && this.tlsKeyPath)) {
+      throw new ProtocolError('BAD_REQUEST', 'tlsCert and tlsKey must be provided together', {
+        tls_cert: this.tlsCertPath, tls_key: this.tlsKeyPath,
+      });
+    }
+    const handler = (req, res) => {
+      this.handle(req, res).catch((err) => sendError(res, err));
+    };
+    if (this.tlsCertPath) {
+      let cert;
+      let key;
+      try {
+        cert = fs.readFileSync(this.tlsCertPath);
+        key = fs.readFileSync(this.tlsKeyPath);
+      } catch (err) {
+        // Never silently fall back to plain HTTP: that would be a security downgrade.
+        throw new ProtocolError('BAD_REQUEST', `cannot read TLS material: ${err.message}`, {
+          tls_cert: this.tlsCertPath, tls_key: this.tlsKeyPath,
+        });
+      }
+      this.server = https.createServer({ cert, key }, handler);
+      this.scheme = 'https';
+    } else {
+      this.server = http.createServer(handler);
+      this.scheme = 'http';
+    }
+
+    // v0.1.2 BUG-1: an externally supplied code must be REGISTERED, not merely
+    // assigned — otherwise the banner advertises a code /v1/pair does not know.
+    this.pairingCode = typeof options.pairingCode === 'string' && options.pairingCode.trim() !== ''
+      ? this.state.registerPairingCode(options.pairingCode, { ttlMs: options.pairingCodeTtlMs })
+      : this.state.createPairingCode();
     this.subscribers = new Set();
     this.host = null;
     this.port = null;
     this._sweepTimer = null;
-    this._startedAtMs = this.state.nowMs();
 
-    this.server = http.createServer((req, res) => {
-      this.handle(req, res).catch((err) => sendError(res, err));
-    });
     // SSE connections are long-lived: never let Node time the request out.
     this.server.requestTimeout = options.requestTimeoutMs ?? 0;
     this.server.headersTimeout = options.headersTimeoutMs ?? 60_000;
+
+    this._buildStartupMessages();
+  }
+
+  _initOperatorToken(options) {
+    const wantsRequired = options.operatorTokenRequired !== false;
+    const explicit = options.operatorToken;
+    const persisted = this.persistence.enabled ? this.persistence.readOperatorToken() : null;
+
+    if (!wantsRequired || explicit === '') {
+      this.operatorToken = null;
+      this.operatorTokenRequired = false;
+      this.operatorTokenSource = 'disabled';
+      return;
+    }
+    this.operatorTokenRequired = true;
+    if (typeof explicit === 'string' && explicit.length > 0) {
+      this.operatorToken = explicit;
+      this.operatorTokenSource = 'option';
+      this.persistence.writeOperatorToken(explicit);
+      return;
+    }
+    if (persisted) {
+      // §5.1 + §7: keep the token stable across restarts, otherwise every restart
+      // would silently invalidate the plugin's configured operatorToken.
+      this.operatorToken = persisted;
+      this.operatorTokenSource = 'restored';
+      return;
+    }
+    this.operatorToken = randomBytes(32).toString('hex');
+    this.operatorTokenSource = 'generated';
+    this.persistence.writeOperatorToken(this.operatorToken);
+  }
+
+  _buildStartupMessages() {
+    const m = this.startupMessages;
+    m.push(`[w2m-rabbit] relay_id=${this.relayId}`);
+    m.push(`[w2m-rabbit] base_path=${this.basePath}${this.basePath === '/' ? ' (root)' : ''}`);
+    m.push(`[w2m-rabbit] trust_proxy=${this.trustProxy}${this.trustProxy ? '' : ' (X-Forwarded-* ignored)'}`);
+    m.push(`[w2m-rabbit] pair_rate_limit=${this.pairRateLimitPerMinute === 0 ? 'disabled' : `${this.pairRateLimitPerMinute}/min/IP`}`);
+    if (this.persistence.enabled) {
+      m.push(`[w2m-rabbit] persistence=on dir=${this.persistence.dir} `
+        + `revived_devices=${this.persistence.revivedDevices} revived_tasks=${this.persistence.revivedTasks}`);
+    } else {
+      m.push('[w2m-rabbit] persistence=off (in-memory only; devices and tasks are lost on restart)');
+    }
+    if (this.persistence.devicesCorrupt) {
+      m.push('[w2m-rabbit] !! WARNING: devices.json was CORRUPT — started from an EMPTY device table; '
+        + 'every machine must pair again. The damaged file was left untouched.');
+    }
+    for (const w of this.persistence.warnings) {
+      m.push(`[w2m-rabbit] !! ${w.file}: ${w.message}`);
+    }
+    if (this.operatorTokenRequired) {
+      m.push(`[w2m-rabbit] operator token (${this.operatorTokenSource}) - required for POST /v1/task:`);
+      m.push(`[w2m-rabbit]   ${this.operatorToken}`);
+      if (this.persistence.operatorTokenFile) {
+        m.push(`[w2m-rabbit]   stored at ${this.persistence.operatorTokenFile} (0600)`);
+      }
+    } else {
+      m.push('[w2m-rabbit] !! WARNING: OPERATOR TOKEN DISABLED (--operator-token "") - '
+        + 'any device that can reach this relay can dispatch tasks to the whole group. '
+        + 'Only acceptable on a trusted LAN / for debugging; /v1/task then requires a device token.');
+    }
   }
 
   get url() {
     if (this.host === null || this.port === null) return null;
     const host = this.host.includes(':') ? `[${this.host}]` : this.host;
-    return `http://${host}:${this.port}`;
+    const prefix = this.basePath === '/' ? '' : this.basePath;
+    return `${this.scheme}://${host}:${this.port}${prefix}`;
   }
 
   listen({ host = '127.0.0.1', port = 0 } = {}) {
@@ -153,12 +404,26 @@ export class RelayServer {
         const addr = this.server.address();
         this.host = addr.address;
         this.port = addr.port;
-        this._sweepTimer = setInterval(() => this.sweep(), this.sweepIntervalMs);
+        this._sweepTimer = setInterval(() => {
+          this.sweep();
+          this.pairLimiter.prune();
+        }, this.sweepIntervalMs);
         this._sweepTimer.unref?.();
         if (this.logger) {
           this.logger(`[w2m-rabbit] listening on ${this.url}  pairing code: ${this.pairingCode}`);
+          for (const message of this.startupMessages) this.logger(message);
         }
-        resolve({ host: this.host, port: this.port, url: this.url, pairingCode: this.pairingCode });
+        resolve({
+          host: this.host,
+          port: this.port,
+          url: this.url,
+          pairingCode: this.pairingCode,
+          relayId: this.relayId,
+          basePath: this.basePath,
+          operatorToken: this.operatorToken,
+          operatorTokenRequired: this.operatorTokenRequired,
+          scheme: this.scheme,
+        });
       });
     });
   }
@@ -177,6 +442,26 @@ export class RelayServer {
     });
   }
 
+  /* ---------------- proxy awareness (v0.1.2 §3) ---------------- */
+
+  /** `X-Forwarded-For` first hop is honoured ONLY under `trustProxy`. */
+  clientIp(req) {
+    if (this.trustProxy) {
+      const forwarded = firstHeaderValue(req.headers['x-forwarded-for']);
+      if (forwarded) return forwarded;
+    }
+    return req.socket?.remoteAddress ?? 'unknown';
+  }
+
+  /** `X-Forwarded-Proto` is honoured ONLY under `trustProxy`. */
+  effectiveScheme(req) {
+    if (this.trustProxy) {
+      const proto = firstHeaderValue(req.headers['x-forwarded-proto']);
+      if (proto) return proto.toLowerCase();
+    }
+    return this.scheme;
+  }
+
   /* ---------------- request dispatch ---------------- */
 
   async handle(req, res) {
@@ -186,22 +471,43 @@ export class RelayServer {
     } catch {
       throw new ProtocolError('BAD_REQUEST', 'malformed request URL');
     }
-    const path = url.pathname.length > 1 ? url.pathname.replace(/\/+$/, '') : url.pathname;
+    const rawPath = url.pathname;
     const method = (req.method ?? 'GET').toUpperCase();
 
-    /* ---- public endpoints (§1: no bearer auth) ---- */
-    if (method === 'GET' && path === '/healthz') {
-      return sendJson(res, 200, {
-        ok: true,
-        protocol_version: PROTOCOL_VERSION,
-        rabbit_time: this.state.nowIso(),
-        uptime_ms: this.state.nowMs() - this._startedAtMs,
-        ...this.state.stats(),
+    // §3: strip the deployment prefix, then route. `/healthz` also answers at the
+    // root because health checks are usually pointed straight at the container.
+    let path;
+    if (this.basePath === '/') {
+      path = normalizePath(rawPath);
+    } else if (rawPath === this.basePath) {
+      path = '/';
+    } else if (rawPath.startsWith(`${this.basePath}/`)) {
+      path = normalizePath(rawPath.slice(this.basePath.length));
+    } else if (rawPath === '/healthz') {
+      path = '/healthz';
+    } else {
+      // Outside the prefix: an explicit 404, never a gateway-style 502.
+      throw new ProtocolError('NOT_FOUND', `path is outside the configured base path ${this.basePath}`, {
+        path: rawPath, base_path: this.basePath,
       });
     }
+
+    /* ---- public endpoints ---- */
+    if (method === 'GET' && path === '/healthz') {
+      return sendJson(res, 200, this.healthBody(req));
+    }
     if (method === 'POST' && path === '/v1/pair') {
+      this.enforcePairRateLimit(req);
       const body = await readJson(req, this.frameLimitBytes);
       const result = this.state.pair(body);
+      return sendJson(res, 200, result);
+    }
+    // §5: dispatching tasks needs the operator token, not a device token.
+    if (method === 'POST' && path === '/v1/task') {
+      const principal = this.authorizeTaskDispatch(req);
+      const body = await readJson(req, this.frameLimitBytes);
+      if (principal.machine_id && !body.created_by) body.created_by = principal.machine_id;
+      const result = this.state.createTask(body);
       return sendJson(res, 200, result);
     }
 
@@ -227,11 +533,6 @@ export class RelayServer {
       const result = this.state.submitResult(body);
       const { _instanceKey, ...clean } = result;
       return sendJson(res, 200, clean);
-    }
-    if (method === 'POST' && path === '/v1/task') {
-      const body = await readJson(req, this.frameLimitBytes);
-      const result = this.state.createTask(body);
-      return sendJson(res, 200, result);
     }
     if (method === 'GET' && path === '/v1/devices') {
       return sendJson(res, 200, {
@@ -290,6 +591,91 @@ export class RelayServer {
     throw new ProtocolError('NOT_FOUND', `no route for ${method} ${path}`, { method, path });
   }
 
+  /** §4: the operations answer — "is the relay there, did it restart, are my machines connected". */
+  healthBody(req) {
+    return {
+      ...this.state.stats(),
+      ok: true,
+      protocol_version: PROTOCOL_VERSION,
+      rabbit_time: this.state.nowIso(),
+      uptime_ms: this.state.nowMs() - this._startedAtMs,
+      relay_id: this.relayId,
+      started_at: rfc3339(this._startedAtMs),
+      effective_scheme: this.effectiveScheme(req),
+      base_path: this.basePath,
+      operator_token_required: this.operatorTokenRequired,
+      pair_rate_limit: this.pairRateLimitPerMinute,
+      persistence: this.persistence.describe(),
+    };
+  }
+
+  /* ---------------- auth helpers ---------------- */
+
+  /** §6: every /v1/pair attempt counts, success included. */
+  enforcePairRateLimit(req) {
+    if (this.pairRateLimitPerMinute <= 0) return;
+    const ip = this.clientIp(req);
+    const verdict = this.pairLimiter.hit(ip);
+    if (verdict.allowed) return;
+    const err = new ProtocolError(
+      'RATE_LIMITED',
+      `too many /v1/pair attempts from ${ip}: limit is ${verdict.limit} per ${verdict.window_seconds}s`,
+      {
+        retry_after_seconds: verdict.retry_after_seconds,
+        limit: verdict.limit,
+        window_seconds: verdict.window_seconds,
+        scope: 'pair',
+      },
+    );
+    err.headers = { 'retry-after': String(verdict.retry_after_seconds) };
+    throw err;
+  }
+
+  /**
+   * §5: `POST /v1/task` needs the operator token.
+   *  - required (default): operator token, else 401 OPERATOR_REQUIRED
+   *  - disabled (`--operator-token ''`): falls back to v1 semantics, i.e. a paired device token
+   */
+  authorizeTaskDispatch(req) {
+    const token = bearerToken(req);
+    if (this.operatorTokenRequired) {
+      if (!token) {
+        throw new ProtocolError(
+          'OPERATOR_REQUIRED',
+          'POST /v1/task requires the operator token. A device_token is machine credentials and cannot '
+          + `dispatch tasks; read the operator token from ${this.persistence.operatorTokenFile ?? '<state>/operator-token.txt'} `
+          + 'or pass --operator-token / W2M_OPERATOR_TOKEN.',
+          { operator_token_file: this.persistence.operatorTokenFile ?? null },
+        );
+      }
+      if (token !== this.operatorToken) {
+        const asDevice = this.state.authenticate(token);
+        throw new ProtocolError(
+          'OPERATOR_REQUIRED',
+          asDevice
+            ? 'this is a device_token (machine credentials); dispatching tasks requires the operator_token — '
+              + 'they are two different credentials'
+            : 'invalid operator token: it does not match the relay operator token',
+          {
+            device_token_detected: Boolean(asDevice),
+            machine_id: asDevice?.machine_id ?? null,
+            operator_token_file: this.persistence.operatorTokenFile ?? null,
+          },
+        );
+      }
+      return { role: 'operator', machine_id: null };
+    }
+    const device = token ? this.state.authenticate(token) : null;
+    if (!device) {
+      throw new ProtocolError(
+        'UNAUTHORIZED',
+        'the operator token requirement is disabled on this relay, but /v1/task still requires a valid device_token',
+        {},
+      );
+    }
+    return { role: 'device', machine_id: device.machine_id };
+  }
+
   /* ---------------- SSE (§3) ---------------- */
 
   handleStream(req, res, url, device) {
@@ -317,6 +703,8 @@ export class RelayServer {
       from = last + 1;
     }
 
+    // §8.5: these two headers are the fix for "connects but no events" behind
+    // nginx-style proxies and tunnels, which buffer event streams by default.
     res.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',
       'cache-control': 'no-cache, no-transform',
@@ -343,7 +731,7 @@ export class RelayServer {
       deliver(entry);
     });
 
-    // §3.1: the first frame MUST be `ready`.
+    // §3.1: the first frame MUST be `ready`; §8.3 adds `relay_id`.
     const readySeq = this.state.reserveSeq();
     writeEvent({
       type: 'ready',
@@ -351,11 +739,13 @@ export class RelayServer {
       protocol_version: PROTOCOL_VERSION,
       rabbit_time: this.state.nowIso(),
       machine_id: machineId,
+      relay_id: this.relayId,
     });
 
     if (from !== null) {
       const oldest = this.state.oldestBufferedSeq();
       if (from < oldest && oldest > 1) {
+        // §8.4: tell the client where to re-align, not just that replay failed.
         writeEvent({
           type: 'notice',
           seq: this.state.reserveSeq(),
@@ -364,6 +754,8 @@ export class RelayServer {
           code: 'REPLAY_TRUNCATED',
           message: `requested seq ${from} is older than the buffer head ${oldest}`,
           machine_id: machineId,
+          requested_seq: from,
+          oldest_available_seq: oldest,
         });
       }
       for (const entry of this.state.replayEntries(from)) deliver(entry);
@@ -422,5 +814,12 @@ export async function startRelayServer(options = {}) {
   return relay;
 }
 
-export { ProtocolError, RabbitState, MAX_FRAME_BYTES, PROTOCOL_VERSION, rfc3339 };
+export {
+  Persistence,
+  ProtocolError,
+  RabbitState,
+  MAX_FRAME_BYTES,
+  PROTOCOL_VERSION,
+  rfc3339,
+};
 export default createRelayServer;

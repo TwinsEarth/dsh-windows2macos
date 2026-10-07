@@ -12,6 +12,8 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import {
   mkdirSync,
   mkdtempSync,
@@ -23,7 +25,7 @@ import {
   existsSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
 
 import {
@@ -72,14 +74,19 @@ import {
   validateIdentity,
 } from '../src/agent/identity.mjs';
 import {
+  AGENT_STATE_FILE,
+  AGENT_STATE_SCHEMA_VERSION,
   BACKOFF_MS,
   ENVELOPE_VERSION,
   HEARTBEAT_INTERVAL_MS,
   Heartbeat,
   PROTOCOL_VERSION,
+  RECONNECT_DELAY_AFTER_STABLE_MS,
   REFUSAL,
   REQUIRED_ENVELOPE_FIELDS,
+  RTT_WINDOW,
   SHELL_ID,
+  STABLE_STREAM_MS,
   SseParser,
   backoffDelay,
   buildEnvelope,
@@ -88,12 +95,18 @@ import {
   matchAllowedCommand,
   parseAllowedCommands,
   satisfiesVersion,
+  summarizeRtt,
   verifyEnvelope,
 } from '../src/agent/agent.mjs';
+import { endpointUrl, joinUrl, resolveBaseUrl } from '../src/agent/url.mjs';
+import { createRelayServer } from '../src/relay/server.mjs';
+import * as plugin from '../src/plugin/tools.mjs';
 
 const HAS_GIT = resolveGit() !== null;
 const IS_WINDOWS = process.platform === 'win32';
 const NODE = process.execPath;
+/** The real CLI, spawned as a separate process in the task-16 integration test. */
+const CLI_PATH = join(dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'w2m-localside.mjs');
 
 /** @type {string} */
 let root;
@@ -995,14 +1008,21 @@ describe('lease heartbeat', () => {
 // pairing and end-to-end execution against a fake Rabbit
 // ---------------------------------------------------------------------------
 
-/** Minimal Rabbit: pairing, SSE stream and result intake. */
-async function startFakeRabbit() {
+/**
+ * Minimal Rabbit: pairing, SSE stream and result intake.
+ *
+ * `basePath` mounts the whole thing under a sub-path (`https://host/w2m`), which
+ * is the deployment shape v0.1.2 exists for; every request path is recorded so a
+ * test can prove the prefix was not eaten.
+ */
+async function startFakeRabbit({ basePath = '' } = {}) {
   const state = {
     pairs: [],
     results: [],
     heartbeats: [],
     streams: [],
     receivedTokens: [],
+    paths: [],
   };
 
   const server = createServer((request, response) => {
@@ -1017,9 +1037,18 @@ async function startFakeRabbit() {
         body = null;
       }
       const url = new URL(request.url, 'http://127.0.0.1');
+      state.paths.push(url.pathname);
       state.receivedTokens.push(request.headers.authorization ?? null);
+      // Everything is served under `basePath`; anything outside it is a 404,
+      // exactly like a relay behind `--base-path`.
+      if (basePath !== '' && !url.pathname.startsWith(`${basePath}/`)) {
+        response.writeHead(404, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ error: { code: 'NOT_FOUND' } }));
+        return;
+      }
+      const pathname = basePath === '' ? url.pathname : url.pathname.slice(basePath.length);
 
-      if (url.pathname === '/v1/stream') {
+      if (pathname === '/v1/stream') {
         response.writeHead(200, {
           'content-type': 'text/event-stream',
           'cache-control': 'no-cache',
@@ -1050,19 +1079,19 @@ async function startFakeRabbit() {
         return;
       }
 
-      if (url.pathname === '/v1/pair') {
+      if (pathname === '/v1/pair') {
         state.pairs.push(body);
         response.writeHead(200, { 'content-type': 'application/json' });
         response.end(JSON.stringify({ device_token: 'tok-e2e', protocol_version: 1, rabbit_time: '2026-10-07T12:00:00Z' }));
         return;
       }
-      if (url.pathname === '/v1/heartbeat') {
+      if (pathname === '/v1/heartbeat') {
         state.heartbeats.push(body);
         response.writeHead(200, { 'content-type': 'application/json' });
         response.end(JSON.stringify({ lease_until: '2026-10-07T12:10:00Z', cancel: false }));
         return;
       }
-      if (url.pathname === '/v1/result') {
+      if (pathname === '/v1/result') {
         state.results.push(body);
         response.writeHead(200, { 'content-type': 'application/json' });
         response.end(JSON.stringify({ ok: true, deduped: false }));
@@ -1093,40 +1122,49 @@ async function startFakeRabbit() {
   };
 }
 
-describe('Localside agent end to end', () => {
-  /**
-   * @param {object} options
-   * @param {string} options.rabbit
-   * @param {string} options.project
-   * @param {string[]} options.allowed
-   */
-  function makeAgent({ rabbit, project, allowed, once = true, name = 'e2e', stringForm = false }) {
-    const stateDir = join(root, `e2e-state-${name}`);
-    const serialized = allowed.map((prefix) => prefix.join(' '));
-    return createAgent({
-      rabbitUrl: rabbit,
-      project,
-      stateDir,
-      identity: {
-        machine_id: '3f2a1111-2222-4333-8444-555566667777',
-        machine_name: 'win-e2e',
-        device_token: 'tok-e2e',
-        rabbit_url: rabbit,
-      },
-      caps: { case_sensitive_fs: false, symlinks: false, exec_bit: false, python: null, npm: null, node: process.version },
-      platform: { os: 'windows', os_version: '10.0', arch: 'x64', shell: 'cmd', shell_version: null },
-      // The documented API accepts both forms; `stringForm` exercises the raw
-      // `['node -e']` shape that a caller would read straight off the CLI.
-      allowedCommands: stringForm ? serialized : parseAllowedCommands(JSON.stringify(serialized)),
-      once,
-      // The contract's cadence is 10s (asserted via HEARTBEAT_INTERVAL_MS); the
-      // end-to-end tests use a fast cadence so cancel does not cost 10s.
-      heartbeatIntervalMs: 150,
-      log: () => {},
-      tmpDir: root,
-    });
-  }
+/**
+ * Build an agent wired to the shared fixtures.
+ *
+ * Module scope so every describe block -- including the v0.1.2 reconnection
+ * suite -- constructs the agent identically.
+ *
+ * @param {object} options
+ * @param {string} options.rabbit
+ * @param {string} options.project
+ * @param {string[]} options.allowed
+ * @param {Array<{level: string, message: string, extra: object}>} [options.logs]
+ */
+function makeAgent({ rabbit, project, allowed, once = true, name = 'e2e', stringForm = false, logs }) {
+  const stateDir = join(root, `e2e-state-${name}`);
+  const serialized = allowed.map((prefix) => prefix.join(' '));
+  const log = logs
+    ? (level, message, extra) => logs.push({ level, message, extra: extra ?? {} })
+    : () => {};
+  return createAgent({
+    rabbitUrl: rabbit,
+    project,
+    stateDir,
+    identity: {
+      machine_id: '3f2a1111-2222-4333-8444-555566667777',
+      machine_name: 'win-e2e',
+      device_token: 'tok-e2e',
+      rabbit_url: rabbit,
+    },
+    caps: { case_sensitive_fs: false, symlinks: false, exec_bit: false, python: null, npm: null, node: process.version },
+    platform: { os: 'windows', os_version: '10.0', arch: 'x64', shell: 'cmd', shell_version: null },
+    // The documented API accepts both forms; `stringForm` exercises the raw
+    // `['node -e']` shape that a caller would read straight off the CLI.
+    allowedCommands: stringForm ? serialized : parseAllowedCommands(JSON.stringify(serialized)),
+    once,
+    // The contract's cadence is 10s (asserted via HEARTBEAT_INTERVAL_MS); the
+    // end-to-end tests use a fast cadence so cancel does not cost 10s.
+    heartbeatIntervalMs: 150,
+    log,
+    tmpDir: root,
+  });
+}
 
+describe('Localside agent end to end', () => {
   it('accepts the documented string form of allowedCommands and runs a task', async () => {
     const rabbit = await startFakeRabbit();
     const project = await makeRepo('e2e-stringform');
@@ -1486,5 +1524,1000 @@ describe('Localside agent end to end', () => {
     } finally {
       await new Promise((resolve) => server.close(resolve));
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.1.2 §2: base address and endpoint joining
+// ---------------------------------------------------------------------------
+
+describe('base URL and endpoint joining (v0.1.2 §2)', () => {
+  const BASES = [
+    'http://127.0.0.1:8787',
+    'http://100.64.0.5:8787',
+    'https://w2m.example.com',
+    'https://w2m.example.com/',
+    'https://w2m.example.com/w2m',
+    'https://w2m.example.com/w2m/',
+    'https://w2m.example.com/team-a/w2m',
+    'http://[::1]:8787',
+  ];
+  const NORMALIZED = [
+    'http://127.0.0.1:8787',
+    'http://100.64.0.5:8787',
+    'https://w2m.example.com',
+    'https://w2m.example.com',
+    'https://w2m.example.com/w2m',
+    'https://w2m.example.com/w2m',
+    'https://w2m.example.com/team-a/w2m',
+    'http://[::1]:8787',
+  ];
+  const PATHS = ['/v1/stream', 'v1/stream', '/v1/stream?machine_id=x&seq=2', '/healthz', 'v1/pair'];
+
+  it('normalises eight base shapes', () => {
+    assert.equal(BASES.length, 8);
+    BASES.forEach((base, index) => {
+      assert.equal(resolveBaseUrl(base), NORMALIZED[index], base);
+    });
+  });
+
+  it('joins eight bases x five paths without eating a sub-path or collapsing the scheme', () => {
+    assert.equal(PATHS.length, 5);
+    for (const [index, base] of BASES.entries()) {
+      const normalized = NORMALIZED[index];
+      for (const path of PATHS) {
+        const joined = joinUrl(resolveBaseUrl(base), path);
+        assert.equal(joined, `${normalized}/${path.replace(/^\/+/, '')}`, `joinUrl(${base}, ${path})`);
+        assert.match(joined, /^https?:\/\//, 'the scheme double slash must survive');
+        assert.ok(joined.startsWith(`${normalized}/`), 'the base must survive verbatim');
+      }
+    }
+    assert.equal(BASES.length * PATHS.length, 40, 'the matrix is 40 combinations');
+  });
+
+  it('keeps exactly the sub-path that the v1 client used to eat', () => {
+    const base = resolveBaseUrl('https://h/w2m');
+    assert.equal(joinUrl(base, '/v1/stream'), 'https://h/w2m/v1/stream');
+    assert.equal(
+      joinUrl(base, '/v1/stream?machine_id=m1&seq=2'),
+      'https://h/w2m/v1/stream?machine_id=m1&seq=2',
+    );
+    assert.equal(joinUrl('https://h/w2m/', 'v1/result'), 'https://h/w2m/v1/result');
+    assert.equal(joinUrl('https://h/w2m/', '/v1/result'), 'https://h/w2m/v1/result');
+    // Stated as the wrong answer so nobody "simplifies" it back to a URL resolve.
+    assert.notEqual(joinUrl(base, '/v1/stream'), 'https://h/v1/stream');
+  });
+
+  it('rejects unusable rabbitUrl values, naming rabbitUrl and the reason', () => {
+    const bad = [
+      'https://w2m.example.com?x=1',
+      'https://w2m.example.com/w2m?a=1',
+      'https://w2m.example.com#frag',
+      'https://w2m.example.com/w2m#frag',
+      'https://w2m.example.com/w2m?',
+      'ftp://w2m.example.com',
+      'file:///tmp/w2m',
+      'not a url',
+      '',
+      '   ',
+      null,
+      undefined,
+      42,
+    ];
+    for (const value of bad) {
+      assert.throws(
+        () => resolveBaseUrl(value),
+        (error) => {
+          assert.equal(error.code, 'RABBIT_URL_INVALID');
+          assert.match(error.message, /rabbitUrl/);
+          return true;
+        },
+        `expected ${JSON.stringify(value)} to be rejected`,
+      );
+    }
+    assert.throws(() => resolveBaseUrl('https://h/w2m?x=1'), /query string/);
+    assert.throws(() => resolveBaseUrl('https://h/w2m#f'), /fragment/);
+    assert.throws(() => resolveBaseUrl('ftp://h'), /http or https/);
+  });
+
+  it('fails at agent construction, not at first request', () => {
+    const project = scratch('url-guard');
+    const build = (rabbitUrl, name) =>
+      createAgent({
+        rabbitUrl,
+        project,
+        stateDir: join(root, `url-guard-state-${name}`),
+        identity: { machine_id: newMachineId(), machine_name: 'x', device_token: 't', rabbit_url: null },
+        caps: {},
+        platform: { os: 'windows' },
+        allowedCommands: [],
+        log: () => {},
+      });
+    assert.throws(() => build('https://h?x=1', 'a'), /rabbitUrl/);
+    assert.throws(() => build('', 'b'), /rabbitUrl/);
+    // A sub-path is not a problem: it is normalised and exposed for logging.
+    assert.equal(build('https://h/w2m/', 'c').baseUrl, 'https://h/w2m');
+  });
+
+  it('composes endpoints through endpointUrl too', () => {
+    assert.equal(endpointUrl('https://h/w2m/', '/v1/task'), 'https://h/w2m/v1/task');
+    assert.equal(endpointUrl('http://[::1]:8787', 'healthz'), 'http://[::1]:8787/healthz');
+    assert.equal(endpointUrl('http://[::1]:8787/', '/healthz'), 'http://[::1]:8787/healthz');
+  });
+
+  it('contains no base-resolving URL constructor or posix join in client code', () => {
+    // Regression guard for the exact defect: `new URL(path, base)` and
+    // `path.posix.join` both destroy a deployment sub-path or the scheme.
+    const stripComments = (src) =>
+      src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+    const agentDir = join(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'agent');
+    for (const file of ['url.mjs', 'agent.mjs']) {
+      const source = stripComments(readFileSync(join(agentDir, file), 'utf8'));
+      assert.doesNotMatch(source, /new URL\([^)]*,/, `${file} must not resolve a path against a base`);
+      assert.doesNotMatch(source, /posix\.join/, `${file} must not use path.posix.join`);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.1.2 §8: relay restarts, RTT visibility, replay window, reconnect logging
+// ---------------------------------------------------------------------------
+
+describe('cross-network reconnection (v0.1.2 §8)', () => {
+  it('resets the seq cursor when relay_id changes, keeps it when it does not', async () => {
+    const rabbit = await startFakeRabbit();
+    const project = await makeRepo('relay-id');
+    const logs = [];
+    try {
+      const agent = makeAgent({
+        rabbit: rabbit.url,
+        project,
+        allowed: [['node', '-e']],
+        once: false,
+        name: 'relayid',
+        logs,
+      });
+      const running = agent.start();
+      const readyCount = () => logs.filter((entry) => entry.message === 'stream ready').length;
+
+      const first = await rabbit.stream();
+      first.send('ready', { protocol_version: 1, relay_id: 'relay-A', machine_id: 'rabbit' });
+      await waitFor(() => readyCount() === 1, { label: 'first ready' });
+      first.send('peer.hello', { machine_id: 'peer-1' });
+      first.send('peer.hello', { machine_id: 'peer-2' });
+      await waitFor(() => agent.state.seq >= 3, { label: 'cursor advanced' });
+      const cursorBefore = agent.state.seq;
+      assert.equal(agent.state.relayId, 'relay-A');
+
+      // Same relay reconnects (proxy idle timeout): the cursor must survive.
+      first.close();
+      const second = await rabbit.stream();
+      assert.notEqual(second, first);
+      second.send('ready', { protocol_version: 1, relay_id: 'relay-A', seq: 1, machine_id: 'rabbit' });
+      await waitFor(() => readyCount() === 2, { label: 'second ready' });
+      assert.equal(agent.state.seq, cursorBefore, 'an unchanged relay_id must not reset the cursor');
+      assert.equal(agent.state.relayIdChanges, 0);
+
+      // A restarted relay numbers events from 1 again: adopt the new position.
+      second.close();
+      const third = await rabbit.stream();
+      third.send('ready', { protocol_version: 1, relay_id: 'relay-B', seq: 1, machine_id: 'rabbit' });
+      await waitFor(() => agent.state.relayIdChanges === 1, { label: 'relay restart detected' });
+      assert.equal(agent.state.seq, 1, 'a new relay_id must reset the seq cursor');
+      assert.equal(agent.state.relayId, 'relay-B');
+      assert.ok(
+        logs.some((entry) => entry.level === 'warn' && /relay restarted/.test(entry.message)),
+        'a relay restart must be logged as a warning',
+      );
+
+      agent.stop();
+      await running;
+    } finally {
+      await rabbit.close();
+    }
+  });
+
+  it('summarises heartbeat round trips into a five-sample window', () => {
+    assert.equal(RTT_WINDOW, 5);
+    assert.deepEqual(summarizeRtt([]), { last: null, avg: null, samples: [] });
+    assert.deepEqual(summarizeRtt([10.4, 20.6]), { last: 21, avg: 16, samples: [10, 21] });
+    const summary = summarizeRtt([10, 20, 30, 40, 50, 60, 70]);
+    assert.deepEqual(summary.samples, [30, 40, 50, 60, 70], 'only the newest five are kept');
+    assert.equal(summary.last, 70);
+    assert.equal(summary.avg, 50);
+    assert.deepEqual(summarizeRtt([Number.NaN, 5, Number.POSITIVE_INFINITY]), {
+      last: 5,
+      avg: 5,
+      samples: [5],
+    });
+  });
+
+  it('records RTT on agent state without adding an envelope field', async () => {
+    const rabbit = await startFakeRabbit();
+    const project = await makeRepo('rtt');
+    try {
+      const agent = makeAgent({
+        rabbit: rabbit.url,
+        project,
+        allowed: [['node', '-e']],
+        once: true,
+        name: 'rtt',
+      });
+      assert.deepEqual(agent.state.rttMs, { last: null, avg: null, samples: [] });
+
+      const running = agent.start();
+      const stream = await rabbit.stream();
+      stream.send('ready', { protocol_version: 1, machine_id: 'rabbit' });
+      stream.send('task.offer', {
+        task_id: '01J-E2E-RTT',
+        attempt: 1,
+        mode: 'replicate',
+        index: 0,
+        index_total: 1,
+        command_argv: [NODE, '-e', 'process.stdout.write("rtt")'],
+        cwd_rel: '.',
+        write: false,
+        timeout_ms: 20_000,
+        dedupe_key: 'dk-e2e-rtt',
+      });
+      await running;
+
+      assert.ok(rabbit.state.heartbeats.length >= 1, 'the run must have heartbeated');
+      assert.ok(agent.state.rttMs.samples.length >= 1, 'a heartbeat must record an RTT sample');
+      assert.ok(agent.state.rttMs.samples.length <= RTT_WINDOW);
+      assert.equal(typeof agent.state.rttMs.last, 'number');
+      assert.equal(typeof agent.state.rttMs.avg, 'number');
+      assert.ok(agent.state.rttMs.last >= 0);
+
+      const envelope = rabbit.state.results[0];
+      assert.equal(
+        Object.keys(envelope).some((key) => /rtt/i.test(key)),
+        false,
+        'RTT must not leak into the comparable envelope',
+      );
+    } finally {
+      await rabbit.close();
+    }
+  });
+
+  it('aligns the seq cursor from a REPLAY_TRUNCATED notice', async () => {
+    const rabbit = await startFakeRabbit();
+    const project = await makeRepo('replay');
+    const logs = [];
+    try {
+      const agent = makeAgent({
+        rabbit: rabbit.url,
+        project,
+        allowed: [['node', '-e']],
+        once: false,
+        name: 'replay',
+        logs,
+      });
+      const running = agent.start();
+      const stream = await rabbit.stream();
+      stream.send('ready', { protocol_version: 1, relay_id: 'relay-R', machine_id: 'rabbit' });
+      await waitFor(() => logs.some((entry) => entry.message === 'stream ready'), { label: 'ready' });
+
+      stream.send('notice', {
+        level: 'warn',
+        code: 'REPLAY_TRUNCATED',
+        message: 'replay window truncated',
+        oldest_available_seq: 10,
+      });
+      await waitFor(() => agent.state.replayTruncated !== null, { label: 'replay notice handled' });
+      assert.equal(agent.state.seq, 9, 'the cursor must realign to oldest_available_seq - 1');
+      assert.equal(agent.state.replayTruncated.oldest_available_seq, 10);
+      assert.ok(
+        logs.some((entry) => entry.level === 'warn' && /seq cursor aligned to 9/.test(entry.message)),
+        'the realignment must be visible in the log',
+      );
+
+      // Without the field there is nothing to align to: leave the cursor alone.
+      const cursorBefore = agent.state.seq;
+      const noticesBefore = logs.filter((entry) => /oldest_available_seq/.test(entry.message)).length;
+      stream.send('notice', {
+        level: 'warn',
+        code: 'REPLAY_TRUNCATED',
+        message: 'replay window truncated, no detail',
+      });
+      await waitFor(
+        () => logs.filter((entry) => /oldest_available_seq/.test(entry.message)).length > noticesBefore,
+        { label: 'second notice handled' },
+      );
+      assert.equal(agent.state.seq, cursorBefore, 'a notice without the field must not move the cursor');
+
+      agent.stop();
+      await running;
+    } finally {
+      await rabbit.close();
+    }
+  });
+
+  it('logs the reconnect number and the next delay, climbing the ladder', async () => {
+    let streamRequests = 0;
+    const server = createServer((request, response) => {
+      if (request.url.startsWith('/v1/stream')) {
+        streamRequests += 1;
+        // Always unavailable: every attempt is an "unstable" connection, so the
+        // backoff ladder has to climb.
+        response.writeHead(503, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ error: { code: 'INTERNAL' } }));
+        return;
+      }
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end('{}');
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address();
+
+    const logs = [];
+    const agent = createAgent({
+      rabbitUrl: `http://127.0.0.1:${port}`,
+      project: await makeRepo('reconnect-log'),
+      stateDir: join(root, 'e2e-state-reconnect-log'),
+      identity: { machine_id: newMachineId(), machine_name: 'x', device_token: 'tok', rabbit_url: null },
+      caps: { case_sensitive_fs: false, symlinks: false, exec_bit: false, python: null, npm: null, node: process.version },
+      platform: { os: 'windows', os_version: '1', arch: 'x64', shell: 'cmd', shell_version: null },
+      allowedCommands: [],
+      once: false,
+      log: (level, message, extra) => logs.push({ level, message, extra: extra ?? {} }),
+    });
+    const running = agent.start();
+    try {
+      const reconnectLine = (n) =>
+        logs.find((entry) => new RegExp(`reconnect #${n} in \\d+ms`).test(entry.message));
+      await waitFor(() => reconnectLine(3), { label: 'third reconnect attempt' });
+      agent.stop();
+      await running;
+
+      const ranges = [
+        [250, 500],
+        [500, 1000],
+        [1000, 2000],
+      ];
+      for (let n = 1; n <= 3; n += 1) {
+        const entry = reconnectLine(n);
+        assert.ok(entry, `missing reconnect #${n} log line`);
+        assert.equal(entry.level, 'warn');
+        assert.match(entry.message, /stream error/, 'the reason must be visible');
+        assert.equal(entry.extra.attempt, n, 'the attempt number must be 1-based and explicit');
+        const [low, high] = ranges[n - 1];
+        assert.ok(
+          entry.extra.delay_ms >= low && entry.extra.delay_ms <= high,
+          `reconnect #${n} delay ${entry.extra.delay_ms}ms outside ${low}-${high}ms`,
+        );
+      }
+      assert.ok(streamRequests >= 3);
+    } finally {
+      agent.stop();
+      await running;
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+
+  it('keeps retrying gently instead of hot-looping on a cleanly closed stream', async () => {
+    let requests = 0;
+    const server = createServer((request, response) => {
+      if (request.url.startsWith('/v1/stream')) {
+        requests += 1;
+        // Accept, send nothing, close immediately: a flapping tunnel.
+        response.writeHead(200, { 'content-type': 'text/event-stream' });
+        response.end();
+        return;
+      }
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end('{}');
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address();
+    const logs = [];
+    const agent = createAgent({
+      rabbitUrl: `http://127.0.0.1:${port}`,
+      project: await makeRepo('hot-loop'),
+      stateDir: join(root, 'e2e-state-hot-loop'),
+      identity: { machine_id: newMachineId(), machine_name: 'x', device_token: 'tok', rabbit_url: null },
+      caps: { case_sensitive_fs: false, symlinks: false, exec_bit: false, python: null, npm: null, node: process.version },
+      platform: { os: 'windows', os_version: '1', arch: 'x64', shell: 'cmd', shell_version: null },
+      allowedCommands: [],
+      once: false,
+      log: (level, message, extra) => logs.push({ level, message, extra: extra ?? {} }),
+    });
+    const started = Date.now();
+    const running = agent.start();
+    try {
+      await waitFor(() => logs.some((entry) => /reconnect #3 /.test(entry.message)), {
+        label: 'three backoff reconnects',
+      });
+      const elapsed = Date.now() - started;
+      // Log line #3 is written after the first two sleeps (>=250+500ms); a hot
+      // loop would reach it in a few milliseconds.
+      assert.ok(
+        elapsed >= 700,
+        `three unstable reconnects must back off, took only ${elapsed}ms (hot loop?)`,
+      );
+      assert.ok(
+        logs.some((entry) => /event stream closed by server/.test(entry.message)),
+        'a clean close is still reported as a disconnect',
+      );
+      assert.ok(STABLE_STREAM_MS >= 500 && RECONNECT_DELAY_AFTER_STABLE_MS >= 0);
+    } finally {
+      agent.stop();
+      await running;
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CLI (v0.1.2: sub-path rabbitUrl, --operator-token)
+// ---------------------------------------------------------------------------
+
+describe('w2m-localside CLI', () => {
+  const CLI = join(dirname(fileURLToPath(import.meta.url)), '..', 'bin', 'w2m-localside.mjs');
+
+  /**
+   * @param {string[]} args
+   * @returns {Promise<{code: number|null, stdout: string, stderr: string}>}
+   */
+  function runCli(args, { timeoutMs = 15_000 } = {}) {
+    return new Promise((resolve) => {
+      const child = spawn(process.execPath, [CLI, ...args], {
+        env: { ...process.env, DSH_HOME: join(root, 'cli-dsh-home') },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (chunk) => {
+        stdout += chunk;
+      });
+      child.stderr.on('data', (chunk) => {
+        stderr += chunk;
+      });
+      const timer = setTimeout(() => child.kill('SIGKILL'), timeoutMs);
+      child.on('close', (code) => {
+        clearTimeout(timer);
+        resolve({ code, stdout, stderr });
+      });
+    });
+  }
+
+  it('documents --operator-token and rejects an unusable rabbitUrl as a usage error', async () => {
+    const help = await runCli(['--help']);
+    assert.equal(help.code, 0);
+    assert.match(help.stdout, /--operator-token/);
+    assert.match(help.stdout, /sub-path/);
+
+    const bad = await runCli(['--rabbit', 'https://h/w2m?x=1', '--project', root]);
+    assert.equal(bad.code, 2, 'a bad base address is a usage error, not a crash');
+    assert.match(bad.stderr, /rabbitUrl/);
+    assert.match(bad.stderr, /query string/);
+  });
+
+  it('runs a task against a relay mounted under a sub-path', async () => {
+    const rabbit = await startFakeRabbit({ basePath: '/w2m' });
+    const project = await makeRepo('cli-subpath');
+    try {
+      const childPromise = runCli([
+        '--rabbit',
+        `${rabbit.url}/w2m/`,
+        '--project',
+        project,
+        '--name',
+        'cli-subpath',
+        '--allowed-commands',
+        '["node -e"]',
+        '--operator-token',
+        'op-token-for-test',
+        '--state',
+        join(root, 'cli-subpath-state'),
+        '--once',
+      ]);
+
+      // If the prefix were eaten this would never arrive: the relay 404s
+      // everything outside /w2m.
+      const stream = await rabbit.stream(15_000);
+      stream.send('ready', { protocol_version: 1, relay_id: 'relay-cli', machine_id: 'rabbit' });
+      stream.send('task.offer', {
+        task_id: '01J-CLI-SUBPATH',
+        attempt: 1,
+        mode: 'replicate',
+        index: 0,
+        index_total: 1,
+        command_argv: [NODE, '-e', 'process.stdout.write("subpath\\n")'],
+        cwd_rel: '.',
+        write: false,
+        timeout_ms: 20_000,
+        dedupe_key: 'dk-cli-subpath',
+      });
+
+      const result = await childPromise;
+      assert.equal(result.code, 0, `CLI exited ${result.code}: ${result.stderr}`);
+      assert.equal(rabbit.state.results.length, 1);
+      assert.equal(rabbit.state.results[0].status, 'ok');
+      assert.equal(rabbit.state.results[0].stdout_sha256, sha256Hex('subpath\n'));
+
+      // Every request went under the prefix, including the SSE stream.
+      assert.ok(rabbit.state.paths.includes('/w2m/v1/stream'), `paths: ${rabbit.state.paths.join(', ')}`);
+      assert.ok(rabbit.state.paths.includes('/w2m/v1/heartbeat'));
+      assert.ok(rabbit.state.paths.includes('/w2m/v1/result'));
+      assert.ok(
+        rabbit.state.paths.every((path) => path.startsWith('/w2m/')),
+        `a request escaped the prefix: ${rabbit.state.paths.join(', ')}`,
+      );
+      assert.match(result.stdout, new RegExp(`${rabbit.url}/w2m`), 'the effective base URL is logged');
+    } finally {
+      await rabbit.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// task-16: the cross-process diagnostics channel (agent writes, plugin reads)
+// ---------------------------------------------------------------------------
+
+/**
+ * Register the *real* plugin against a fake `ctx.tools`, exactly as
+ * `tools.test.mjs` does, so `w2m_status` here is the shipping tool and not a
+ * re-implementation of it.
+ *
+ * @param {object} config
+ * @returns {Promise<Map<string, object>>}
+ */
+async function registerPluginTools(config) {
+  const tools = new Map();
+  const ctx = {
+    tools: {
+      register(definition) {
+        tools.set(definition.name, definition);
+        return definition;
+      },
+    },
+    logger: { warn: () => {}, info: () => {} },
+  };
+  await plugin.apply(ctx, config);
+  return tools;
+}
+
+describe('agent state file for cross-process diagnostics (task-16)', () => {
+  it('publishes agent-state.json that the plugin reads from another process', async () => {
+    // Real relay implementation, real HTTP, real operator token.
+    const relayDir = scratch('state16-relay');
+    const relay = createRelayServer({ stateDir: relayDir, pairingCodeReusable: true });
+    const listen = await relay.listen({ host: '127.0.0.1', port: 0 });
+    const operatorToken = await waitFor(
+      () => {
+        try {
+          return readFileSync(join(relayDir, 'operator-token.txt'), 'utf8').trim() || null;
+        } catch {
+          return null;
+        }
+      },
+      { label: 'operator token' },
+    );
+
+    const project = await makeRepo('state16-project');
+    // The documented default layout: DSH_HOME/xclient/device.json (identity) and
+    // DSH_HOME/xclient/localside/... (agent state). No --state override, so this
+    // test covers what a user gets out of the box.
+    const dshHome = scratch('state16-dsh');
+    const agentStateDir = join(dshHome, 'xclient', 'localside');
+    const stateFile = join(agentStateDir, AGENT_STATE_FILE);
+    const identityPath = join(dshHome, 'xclient', 'device.json');
+
+    /** @type {import('node:child_process').ChildProcess|null} */
+    let child = null;
+    let childOut = '';
+    let childErr = '';
+    try {
+      child = spawn(
+        NODE,
+        [
+          CLI_PATH,
+          '--rabbit', listen.url,
+          '--pair', listen.pairingCode,
+          '--project', project,
+          '--name', 'state16',
+          '--allowed-commands', '["node -e"]',
+          '--once',
+          '--once-idle-ms', '60000',
+        ],
+        { env: { ...process.env, DSH_HOME: dshHome }, stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+      child.stdout.on('data', (chunk) => {
+        childOut += chunk;
+      });
+      child.stderr.on('data', (chunk) => {
+        childErr += chunk;
+      });
+
+      const device = await waitFor(
+        () => {
+          try {
+            const parsed = JSON.parse(readFileSync(identityPath, 'utf8'));
+            return parsed.device_token ? parsed : null;
+          } catch {
+            return null;
+          }
+        },
+        { label: 'paired device identity', timeoutMs: 30_000 },
+      );
+
+      // The agent must be attached to the relay before work is worth submitting.
+      await waitFor(
+        async () => {
+          const response = await fetch(`${listen.url}/v1/devices`, {
+            headers: { authorization: `Bearer ${device.device_token}` },
+          });
+          if (!response.ok) return null;
+          const body = await response.json();
+          return body.devices?.some((entry) => entry.machine_id === device.machine_id) ?? false;
+        },
+        { label: 'agent online', timeoutMs: 30_000 },
+      );
+
+      const anchor = await treeFingerprint({ cwd: project });
+      assert.equal(anchor.error, null);
+      const submitted = await fetch(`${listen.url}/v1/task`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${operatorToken}`, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          mode: 'replicate',
+          // Long enough that the snapshot is read while the agent is still connected.
+          command_argv: [NODE, '-e', 'setTimeout(() => process.stdout.write("state16\\n"), 1200)'],
+          cwd_rel: '.',
+          index_total: 1,
+          timeout_ms: 30_000,
+          write: false,
+          base_commit: await git(project, ['rev-parse', 'HEAD']),
+          base_tree: anchor.fingerprint,
+          compare_policy: { strip_ansi: true, normalize_crlf: true, strip_trailing_blank_lines: true },
+          halt: 'never',
+          created_by: 'state16-test',
+        }),
+      });
+      const submittedText = await submitted.text();
+      assert.ok(submitted.ok, `POST /v1/task -> ${submitted.status} ${submittedText}`);
+      const task = JSON.parse(submittedText);
+
+      // Read the file from *outside* the agent, as the plugin does. No access to
+      // the agent object at all: this process never created it.
+      const published = await waitFor(
+        () => {
+          try {
+            const parsed = JSON.parse(readFileSync(stateFile, 'utf8'));
+            return typeof parsed?.rttMs?.last === 'number' ? parsed : null;
+          } catch {
+            return null;
+          }
+        },
+        { label: `published RTT in ${stateFile}`, timeoutMs: 30_000 },
+      );
+
+      assert.equal(published.schema_version, AGENT_STATE_SCHEMA_VERSION);
+      assert.equal(published.machine_id, device.machine_id);
+      assert.equal(typeof published.rttMs.last, 'number');
+      assert.ok(published.rttMs.samples.length >= 1, 'a heartbeat must have been recorded');
+      assert.equal(published.connected, true, 'read while the stream was up');
+      assert.equal(published.replay_truncated, false);
+      assert.equal(typeof published.reconnect_attempts, 'number');
+      assert.match(published.updated_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/, 'RFC3339 UTC');
+
+      // relay_id must agree with the relay's own /healthz, not with a guess.
+      const health = await (await fetch(`${listen.url}/healthz`)).json();
+      assert.ok(health.relay_id, 'v0.1.2 relay must publish a relay_id');
+      assert.equal(published.relay_id, health.relay_id);
+
+      // machine_id must agree with the relay's device table.
+      const devicesResponse = await fetch(`${listen.url}/v1/devices`, {
+        headers: { authorization: `Bearer ${device.device_token}` },
+      });
+      const devicesBody = await devicesResponse.json();
+      const deviceIds = (devicesBody.devices ?? []).map((entry) => entry.machine_id);
+      assert.ok(
+        deviceIds.includes(published.machine_id),
+        `relay device table ${JSON.stringify(deviceIds)} must contain ${published.machine_id}`,
+      );
+
+      // No credential of any kind may reach a world-readable-ish diagnostics file.
+      const raw = readFileSync(stateFile, 'utf8');
+      assert.equal(raw.includes(device.device_token), false, 'device_token must never be published');
+      assert.equal(raw.includes(operatorToken), false, 'operator_token must never be published');
+      assert.doesNotMatch(raw, /token/i, 'no token-shaped field belongs in this file');
+
+      // And the real plugin, pointed at the directory its docs describe
+      // (the one holding device.json), must find it.
+      const tools = await registerPluginTools({
+        rabbitUrl: listen.url,
+        stateDir: join(dshHome, 'xclient'),
+        projectDir: project,
+      });
+      const status = JSON.parse(await tools.get('w2m_status').execute({}, {}));
+      assert.equal(status.rtt.available, true, JSON.stringify(status.rtt));
+      assert.equal(status.rtt.source, 'state-file');
+      assert.equal(status.rtt.last, published.rttMs.last);
+      assert.deepEqual(status.rtt.samples, published.rttMs.samples);
+
+      // The run really happened: the agent exits by itself in --once mode, and a
+      // non-empty spool would mean the result was never acknowledged.
+      const exitCode = await new Promise((resolve) => child.on('close', resolve));
+      assert.equal(exitCode, 0, `agent must stop cleanly; stderr: ${childErr}`);
+      assert.ok(
+        childOut.includes(`result delivered for ${task.task_id}`),
+        `the relay must have accepted the result; stdout: ${childOut}`,
+      );
+      const spoolDir = join(agentStateDir, 'spool');
+      assert.equal(
+        readdirSync(spoolDir).length,
+        0,
+        `spool must be empty after an acknowledged result: ${readdirSync(spoolDir).join(', ')}`,
+      );
+      child = null;
+    } finally {
+      if (child) child.kill();
+      await relay.close();
+    }
+  });
+
+  it('never publishes a half-written document', async () => {
+    const rabbit = await startFakeRabbit();
+    const project = await makeRepo('state16-atomic');
+    const stateDir = scratch('state16-atomic-state');
+    const stateFile = join(stateDir, AGENT_STATE_FILE);
+    try {
+      const agent = createAgent({
+        rabbitUrl: rabbit.url,
+        project,
+        stateDir,
+        identity: { machine_id: newMachineId(), machine_name: 'atomic', device_token: 'tok', rabbit_url: null },
+        caps: { case_sensitive_fs: false, symlinks: false, exec_bit: false, python: null, npm: null, node: process.version },
+        platform: { os: 'windows', os_version: '1', arch: 'x64', shell: 'cmd', shell_version: null },
+        allowedCommands: parseAllowedCommands('["node -e"]'),
+        once: true,
+        // A very fast heartbeat makes the writer race the reader hard.
+        heartbeatIntervalMs: 20,
+        log: () => {},
+      });
+      const running = agent.start();
+      const stream = await rabbit.stream();
+      stream.send('ready', { protocol_version: 1, relay_id: 'relay-atomic', machine_id: 'rabbit' });
+      stream.send('task.offer', {
+        task_id: '01J-E2E-ATOMIC',
+        attempt: 1,
+        mode: 'replicate',
+        index: 0,
+        index_total: 1,
+        command_argv: [NODE, '-e', 'setTimeout(() => {}, 900)'],
+        cwd_rel: '.',
+        write: false,
+        timeout_ms: 20_000,
+        dedupe_key: 'dk-e2e-atomic',
+      });
+
+      const deadline = Date.now() + 1200;
+      let reads = 0;
+      let parsed = 0;
+      while (Date.now() < deadline) {
+        try {
+          const text = readFileSync(stateFile, 'utf8');
+          reads += 1;
+          JSON.parse(text);
+          parsed += 1;
+        } catch (error) {
+          if (error.code !== 'ENOENT') throw error;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 2));
+      }
+      await running;
+
+      assert.ok(reads > 20, `expected to catch the file mid-flight, only ${reads} reads`);
+      assert.equal(parsed, reads, 'every read that saw the file must have seen complete JSON');
+      assert.deepEqual(
+        readdirSync(stateDir).filter((name) => name.includes('.tmp-')),
+        [],
+        'an atomic publish must not leave temp files behind',
+      );
+    } finally {
+      await rabbit.close();
+    }
+  });
+
+  it('keeps running when the state directory cannot be written', async () => {
+    const rabbit = await startFakeRabbit();
+    const project = await makeRepo('state16-blocked');
+    const stateDir = scratch('state16-blocked-state');
+    const logs = [];
+    try {
+      const agent = createAgent({
+        rabbitUrl: rabbit.url,
+        project,
+        stateDir,
+        identity: { machine_id: newMachineId(), machine_name: 'blocked', device_token: 'tok', rabbit_url: null },
+        caps: { case_sensitive_fs: false, symlinks: false, exec_bit: false, python: null, npm: null, node: process.version },
+        platform: { os: 'windows', os_version: '1', arch: 'x64', shell: 'cmd', shell_version: null },
+        allowedCommands: parseAllowedCommands('["node -e"]'),
+        once: true,
+        heartbeatIntervalMs: 20,
+        log: (level, message, extra) => logs.push({ level, message, extra: extra ?? {} }),
+      });
+      const running = agent.start();
+      const stream = await rabbit.stream();
+      stream.send('ready', { protocol_version: 1, relay_id: 'relay-blocked', machine_id: 'rabbit' });
+      await waitFor(() => agent.state.statePublishedAt !== null, { label: 'first publish' });
+
+      // Break only the *publish* path: a directory where the file must go makes
+      // the final rename fail while the spool (which the task needs) stays
+      // healthy. That isolates "diagnostics write failed" from "task cannot run".
+      rmSync(join(stateDir, AGENT_STATE_FILE), { force: true });
+      mkdirSync(join(stateDir, AGENT_STATE_FILE));
+
+      stream.send('task.offer', {
+        task_id: '01J-E2E-BLOCKED',
+        attempt: 1,
+        mode: 'replicate',
+        index: 0,
+        index_total: 1,
+        command_argv: [NODE, '-e', 'process.stdout.write("blocked-but-alive\\n")'],
+        cwd_rel: '.',
+        write: false,
+        timeout_ms: 20_000,
+        dedupe_key: 'dk-e2e-blocked',
+      });
+      await running;
+
+      // The task still ran, was delivered, and the agent stopped cleanly.
+      assert.equal(rabbit.state.results.length, 1);
+      assert.equal(rabbit.state.results[0].status, 'ok');
+      assert.equal(rabbit.state.results[0].stdout_sha256, sha256Hex('blocked-but-alive\n'));
+      assert.ok(agent.state.rttMs.samples.length >= 1, 'RTT is still tracked in memory');
+      assert.ok(
+        logs.some((entry) => entry.level === 'warn' && /could not publish agent-state\.json/.test(entry.message)),
+        'a failed publish must be reported once, not swallowed',
+      );
+    } finally {
+      await rabbit.close();
+    }
+  });
+
+  it('keeps updated_at fresh while idle, so a reader can tell the agent is alive', async () => {
+    const rabbit = await startFakeRabbit();
+    const project = await makeRepo('state16-idle');
+    const stateDir = scratch('state16-idle-state');
+    const stateFile = join(stateDir, AGENT_STATE_FILE);
+    try {
+      const agent = createAgent({
+        rabbitUrl: rabbit.url,
+        project,
+        stateDir,
+        identity: { machine_id: newMachineId(), machine_name: 'idle', device_token: 'tok', rabbit_url: null },
+        caps: { case_sensitive_fs: false, symlinks: false, exec_bit: false, python: null, npm: null, node: process.version },
+        platform: { os: 'windows', os_version: '1', arch: 'x64', shell: 'cmd', shell_version: null },
+        allowedCommands: [],
+        once: false,
+        // No task is ever offered here: only idleness can move the timestamp.
+        statePublishIntervalMs: 40,
+        log: () => {},
+      });
+      const running = agent.start();
+      const stream = await rabbit.stream();
+      stream.send('ready', { protocol_version: 1, relay_id: 'relay-idle', machine_id: 'rabbit' });
+
+      const read = () => {
+        try {
+          return JSON.parse(readFileSync(stateFile, 'utf8'));
+        } catch {
+          return null;
+        }
+      };
+      const first = await waitFor(() => {
+        const snapshot = read();
+        return snapshot?.connected === true ? snapshot : null;
+      }, { label: 'connected publish' });
+
+      const refreshed = await waitFor(() => {
+        const snapshot = read();
+        return snapshot && snapshot.updated_at !== first.updated_at ? snapshot : null;
+      }, { label: 'idle refresh', timeoutMs: 5000 });
+
+      assert.equal(refreshed.connected, true, 'idle refresh must not fake a disconnect');
+      assert.equal(refreshed.relay_id, 'relay-idle');
+      assert.ok(refreshed.updated_at > first.updated_at, 'the timestamp must advance');
+
+      agent.stop();
+      await running;
+      // The interval must not outlive the agent.
+      const afterStop = read();
+      assert.equal(afterStop.connected, false);
+    } finally {
+      await rabbit.close();
+    }
+  });
+
+  it('refuses to run an offer it cannot spool, and says so', async () => {
+    const rabbit = await startFakeRabbit();
+    const project = await makeRepo('state16-nospool');
+    const stateDir = scratch('state16-nospool-state');
+    const logs = [];
+    try {
+      const agent = createAgent({
+        rabbitUrl: rabbit.url,
+        project,
+        stateDir,
+        identity: { machine_id: newMachineId(), machine_name: 'nospool', device_token: 'tok', rabbit_url: null },
+        caps: { case_sensitive_fs: false, symlinks: false, exec_bit: false, python: null, npm: null, node: process.version },
+        platform: { os: 'windows', os_version: '1', arch: 'x64', shell: 'cmd', shell_version: null },
+        allowedCommands: parseAllowedCommands('["node -e"]'),
+        once: true,
+        log: (level, message, extra) => logs.push({ level, message, extra: extra ?? {} }),
+      });
+      // The spool directory is created at construction; break it afterwards so
+      // only `saveTask` fails.
+      rmSync(join(stateDir, 'spool'), { recursive: true, force: true });
+      writeFileSync(join(stateDir, 'spool'), 'not a directory', 'utf8');
+
+      const running = agent.start();
+      const stream = await rabbit.stream();
+      stream.send('ready', { protocol_version: 1, relay_id: 'relay-nospool', machine_id: 'rabbit' });
+      stream.send('task.offer', {
+        task_id: '01J-E2E-NOSPOOL',
+        attempt: 1,
+        mode: 'replicate',
+        index: 0,
+        index_total: 1,
+        command_argv: [NODE, '-e', 'process.stdout.write("must not run\\n")'],
+        cwd_rel: '.',
+        write: false,
+        timeout_ms: 20_000,
+        dedupe_key: 'dk-e2e-nospool',
+      });
+      await running;
+
+      assert.equal(rabbit.state.results.length, 0, 'an unspooled offer must not produce a result');
+      assert.ok(
+        logs.some((entry) => /could not spool 01J-E2E-NOSPOOL; not running it/.test(entry.message)),
+        `expected an explicit refusal to run; logs: ${logs.map((entry) => entry.message).join(' | ')}`,
+      );
+      // The agent survived and released the task slot rather than wedging.
+      assert.equal(agent.state.current, null);
+      assert.equal(agent.state.handled, 1);
+    } finally {
+      await rabbit.close();
+    }
+  });
+
+  it('stops cleanly when the relay is unreachable, without a state-file write crash', async () => {
+    // A port nothing listens on: bind, read the port, release it.
+    const probe = createServer(() => {});
+    await new Promise((resolve) => probe.listen(0, '127.0.0.1', resolve));
+    const deadPort = probe.address().port;
+    await new Promise((resolve) => probe.close(resolve));
+
+    const dshHome = scratch('state16-dead-dsh');
+    const stateDir = join(dshHome, 'xclient', 'localside');
+    const child = spawn(
+      NODE,
+      [
+        CLI_PATH,
+        '--rabbit', `http://127.0.0.1:${deadPort}`,
+        '--project', await makeRepo('state16-dead-project'),
+        '--state', stateDir,
+        '--once',
+        '--once-idle-ms', '1200',
+      ],
+      { env: { ...process.env, DSH_HOME: dshHome }, stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    let stderr = '';
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk;
+    });
+    const exitCode = await new Promise((resolve) => child.on('close', resolve));
+
+    assert.equal(exitCode, 0, `an unreachable relay must not be fatal; stderr: ${stderr}`);
+    assert.equal(stderr.trim(), '', 'no stack trace may reach stderr');
+    // The file is published even while disconnected, which is how an operator
+    // can tell "agent running, relay down" from "no agent here".
+    const published = JSON.parse(readFileSync(join(stateDir, AGENT_STATE_FILE), 'utf8'));
+    assert.equal(published.connected, false);
+    assert.equal(published.rttMs.last, null);
+    assert.ok(published.reconnect_attempts >= 1, 'it must have tried to reconnect');
   });
 });

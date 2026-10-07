@@ -6,7 +6,7 @@ English | [中文](#中文说明)
 
 [![CI](https://github.com/TwinsEarth/dsh-windows2macos/actions/workflows/ci.yml/badge.svg)](https://github.com/TwinsEarth/dsh-windows2macos/actions/workflows/ci.yml)
 [![DSH plugin](https://img.shields.io/badge/DSH-plugin-4c6ef5)](#install)
-[![version](https://img.shields.io/badge/version-0.0.1-blue)](#changelog)
+[![version](https://img.shields.io/badge/version-0.1.2-blue)](#changelog)
 [![dependencies](https://img.shields.io/badge/runtime%20dependencies-0-brightgreen)](#design-notes)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![platforms](https://img.shields.io/badge/CI-windows%20%7C%20macos%20%7C%20linux-4c6ef5)](#verified-and-not-verified)
@@ -200,12 +200,68 @@ Measured: with that line, a `core.autocrlf=true` checkout and a
 `core.autocrlf=false` checkout produce byte-identical working trees. Without it,
 one is CRLF and the other LF.
 
+## Across networks and regions
+
+> **New in 0.1.2.** Before this version the relay only worked at the root of a
+> host: endpoints were built with `new URL('/v1/stream', rabbitUrl)`, which
+> discards a path prefix, so anything mounted under `/w2m` answered 404 to
+> everything. Sub-path deployment now works, and sending work requires its own
+> credential. See [CHANGELOG](CHANGELOG.md#012--2026-10-07).
+
+Machines only ever make **outbound** connections, so the relay can be anywhere
+both sides can reach. Three shapes are supported and documented end to end in
+[docs/DEPLOY.md](docs/DEPLOY.md):
+
+| Shape | TLS terminated by | `rabbitUrl` looks like |
+|---|---|---|
+| **Tailscale / WireGuard** (recommended) | the network — WireGuard encrypts | `http://100.x.y.z:8787` |
+| **Public VPS + domain** | the relay (`--tls-cert`/`--tls-key`) or a proxy | `https://w2m.example.com` |
+| **Tunnel** (Cloudflare Tunnel, ngrok) | the tunnel service | `https://<sub>.example.com` or with a sub-path |
+
+> **Plain `http://` over a Tailscale address is not a mistake.** WireGuard already
+> provides end-to-end encryption and authenticates both peers; adding TLS on top
+> would add certificate plumbing without adding a property you do not already
+> have. That is why shape A is the recommended default rather than a compromise.
+
+If your proxy or tunnel mounts the relay under a prefix — `https://host/w2m/` —
+then start it with `--base-path /w2m` and put the same prefix in `rabbitUrl`.
+Sub-path deployment works because URLs are joined by concatenation; see
+[CHANGELOG](CHANGELOG.md#012--2026-10-07) for the bug that made this impossible
+before 0.1.2.
+
+### Two credentials, on purpose
+
+| Credential | Held by | Authorises |
+|---|---|---|
+| `device_token` | each machine | taking work, reporting results |
+| `operator_token` | **only you** | **sending work** (`POST /v1/task`) |
+
+A machine that can be told what to do should not automatically be able to tell the
+others. The relay writes the operator token to `<state>/operator-token.txt` on
+first start and prints it once; the plugin takes it as `operatorToken`. Starting
+the relay with `--operator-token ''` removes the requirement — it warns loudly,
+and that is only appropriate for a trusted LAN.
+
+### Surviving a restart
+
+`devices.json` plus `ledger.jsonl` mean a restarted relay keeps its paired
+machines and its task history, which matters once the relay lives on a VPS you
+will eventually reboot. A corrupt ledger line is skipped and reported; a corrupt
+device file starts empty **and says so** rather than silently forgetting every
+machine. `--no-persist` restores in-memory behaviour.
+
 ## Security
 
-Read this before binding to `0.0.0.0`.
+Read this before exposing the relay to anything.
 
-- **Admission** is a single-use pairing code, then a per-device bearer token
-  stored in `device.json` (mode `0600`).
+- **Admission** is a single-use, rotating pairing code, then a per-device bearer
+  token stored in `device.json` (mode `0600`). Pairing attempts are rate limited
+  (5 per IP per minute by default, successes included).
+- **Sending work needs the operator token**, not a device token.
+- **`--trust-proxy` is off by default and should stay off** unless the relay
+  really is behind a proxy you control: it makes the relay believe
+  `X-Forwarded-For`, and believing that header without a proxy in front lets any
+  client forge its address and walk past the rate limit.
 - **The relay holds no model credentials and no working copy.** It can forge
   tasks, which is exactly why the machine-side whitelist is the load-bearing
   control.
@@ -216,8 +272,10 @@ Read this before binding to `0.0.0.0`.
   `--allowed-commands`.
 - **Read-only by default.** `replicate` tasks run with `write: false`; there is
   no code path that writes to your project in that mode.
-- **No TLS.** For anything beyond a trusted LAN, put a reverse proxy in front, or
-  run the relay over WireGuard/Tailscale.
+- **TLS is your choice, but a deliberate one.** Shape A gets it from WireGuard;
+  shapes B and C get it from the relay's `--tls-cert`/`--tls-key` or from the
+  proxy. Running shape B or C over plain `http://` would put the operator token
+  and every result on the wire in clear text — do not.
 - The plugin **does not read** `.credentials.yaml`.
 
 ## Verified, and not verified

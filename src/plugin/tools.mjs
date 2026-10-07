@@ -50,6 +50,12 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+// The base-address rules live in one place (§2), shared with the agent side. Importing them — rather
+// than re-deriving them here — is what stops the plugin and the agent from disagreeing about what
+// `https://host/w2m` means, which is the defect §2 exists to fix.
+// `src/agent/` does not import `src/plugin/`, so the dependency runs one way and cannot cycle.
+import { joinUrl, resolveBaseUrl } from '../agent/url.mjs';
+
 /** Services this plugin needs. The harness refuses to load the plugin without them. */
 export const inject = ['tools'];
 
@@ -356,27 +362,7 @@ async function loadDefineTool() {
 function readConfig(config = {}) {
   const cwd = process.cwd();
   const raw = config.rabbitUrl;
-  let rabbitUrl = null;
-  if (typeof raw === 'string' && raw.trim() !== '') {
-    let parsed;
-    try {
-      parsed = new URL(raw.trim());
-    } catch (error) {
-      throw configError(
-        'rabbitUrl',
-        `\`${raw}\` is not an absolute URL (${error instanceof Error ? error.message : String(error)})`,
-        'set `rabbitUrl` to the Rabbit base URL, for example http://127.0.0.1:8787',
-      );
-    }
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      throw configError(
-        'rabbitUrl',
-        `scheme \`${parsed.protocol}\` is not supported`,
-        'use an http:// or https:// URL',
-      );
-    }
-    rabbitUrl = raw.trim().replace(/\/+$/, '');
-  }
+  const rabbitUrl = typeof raw === 'string' && raw.trim() !== '' ? checkedRabbitBase(raw) : null;
 
   const stateDir = typeof config.stateDir === 'string' && config.stateDir.trim() !== ''
     ? path.resolve(config.stateDir.trim())
@@ -399,6 +385,12 @@ function readConfig(config = {}) {
       ? config.pairingCode.trim()
       : (typeof process.env.W2M_PAIRING_CODE === 'string' && process.env.W2M_PAIRING_CODE.trim() !== ''
         ? process.env.W2M_PAIRING_CODE.trim()
+        : null),
+    // §5: the operator credential. Only `w2m_run` uses it.
+    operatorToken: typeof config.operatorToken === 'string' && config.operatorToken.trim() !== ''
+      ? config.operatorToken.trim()
+      : (typeof process.env.W2M_OPERATOR_TOKEN === 'string' && process.env.W2M_OPERATOR_TOKEN.trim() !== ''
+        ? process.env.W2M_OPERATOR_TOKEN.trim()
         : null),
   };
 }
@@ -440,9 +432,233 @@ function requireStateDir(cfg) {
   return cfg.stateDir;
 }
 
+/**
+ * Require the operator token, naming the setting when it is absent (PROTOCOL-v0.1.2 §5).
+ *
+ * `POST /v1/task` is the one endpoint that authorises with the operator token rather than the
+ * device token. There is deliberately **no fallback** to the device token: a relay that has the
+ * requirement enabled answers such an attempt with `401 OPERATOR_REQUIRED`, and a plugin that
+ * quietly tried the device token first would turn a missing setting into a confusing remote
+ * refusal. Failing here names the setting the operator has to set.
+ *
+ * @param {{operatorToken: string|null}} cfg
+ * @returns {string}
+ */
+function requireOperatorToken(cfg) {
+  if (cfg.operatorToken) return cfg.operatorToken;
+  throw configError(
+    'operatorToken',
+    'is not set, so this tool cannot dispatch a task — a device token cannot dispatch tasks; ' +
+      '`POST /v1/task` requires the operator token',
+    'set `operatorToken` in this plugin\'s profile patch (or `W2M_OPERATOR_TOKEN` in the environment) ' +
+      'to the value the relay printed at startup, or read it from `<state>/operator-token.txt`',
+  );
+}
+
 // ---------------------------------------------------------------------------------------------
-// HTTP
+// Base URL and endpoint joining (PROTOCOL-v0.1.2 §2)
 // ---------------------------------------------------------------------------------------------
+
+/**
+ * Validate a `rabbitUrl` and reduce it to a base address, as a plugin-shaped error.
+ *
+ * The rule itself lives in `../agent/url.mjs` (imported above) so both sides cannot drift. This
+ * wrapper exists only to translate its `TypeError` into the `W2M_CONFIG` error every other
+ * configuration fault in this file uses, whose message names the setting **and** what to do — the
+ * caller is a model reading tool output, not a developer reading a stack trace.
+ *
+ * @param {unknown} raw
+ * @returns {string} Base with every trailing slash removed.
+ */
+function checkedRabbitBase(raw) {
+  try {
+    return resolveBaseUrl(String(raw ?? ''));
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    // The shared validator reports a bad scheme as "got ftp://"; naming a "scheme" is friendlier to
+    // whoever has to act on it, so the plugin-shaped message says the word.
+    const scheme = /got\s+([a-z][a-z0-9+.-]*:)/i.exec(reason);
+    const why = scheme
+      ? `uses scheme \`${scheme[1]}\`, which is not supported (only http and https are)`
+      : `is not usable as a base address — ${reason}`;
+    throw configError(
+      'rabbitUrl',
+      why,
+      'set `rabbitUrl` to the relay base address, for example http://127.0.0.1:8787, ' +
+        'http://100.64.0.5:8787, or https://w2m.example.com/w2m (a deployment sub-path is allowed; ' +
+        'a query string or fragment is not)',
+    );
+  }
+}
+
+/**
+ * Build a `URL` from a joined string, for `fetch`.
+ *
+ * The joining already produced an absolute URL; this only gives `fetch` the object it prefers, and
+ * turns "not absolute after all" into a named configuration error instead of `Invalid URL`.
+ *
+ * @param {string} url
+ * @returns {URL}
+ */
+function toRequestUrl(url) {
+  try {
+    return new URL(url);
+  } catch (error) {
+    throw new W2MError('W2M_CONFIG', `W2M_CONFIG: the joined endpoint \`${url}\` is not an absolute URL (${error instanceof Error ? error.message : String(error)})`, {
+      hint: 'set `rabbitUrl` to an absolute base such as https://w2m.example.com/w2m',
+      cause: error,
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Agent RTT (PROTOCOL-v0.1.2 §8.2)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * A status getter reachable from this process, when the plugin started relay+agent itself.
+ *
+ * Set by {@link startLocalStack}. Null in the normal case, where the agent runs as its own process
+ * and its state is not reachable from here at all — see {@link readRtt}.
+ *
+ * @type {(() => object)|null}
+ */
+let inProcessAgentStatus = null;
+
+/**
+ * File names an agent may publish its state under, most specific first.
+ *
+ * The `localside/` entry is not decoration: `stateDir` here is documented as the
+ * directory holding `device.json`, and `w2m-localside` keeps its own state one
+ * level below it (`<DSH_HOME>/xclient/localside`, see `resolveStateDir(_, 'localside')`).
+ * Without this entry the default CLI layout could never be read, and RTT would
+ * silently stay unavailable in exactly the cross-region deployment it is for.
+ */
+const AGENT_STATE_FILES = ['agent-state.json', 'agent.json', 'localside-state.json', path.join('localside', 'agent-state.json')];
+
+/**
+ * Normalise whatever the agent published into `{last, avg, samples}`.
+ *
+ * Tolerant on purpose: this is a cross-process, cross-version boundary, and a reader that demanded
+ * one exact spelling would report "no RTT" for a perfectly healthy agent. Field aliases cover the
+ * obvious spellings; an array is read as the rolling samples; a bare number is read as the last.
+ *
+ * @param {unknown} rtt
+ * @returns {{last: number|null, avg: number|null, samples: number[]}|null}
+ */
+function normaliseRtt(rtt) {
+  if (rtt === null || rtt === undefined) return null;
+
+  if (typeof rtt === 'number' && Number.isFinite(rtt)) {
+    return { last: rtt, avg: rtt, samples: [rtt] };
+  }
+
+  if (Array.isArray(rtt)) {
+    const samples = rtt.filter((value) => typeof value === 'number' && Number.isFinite(value));
+    if (samples.length === 0) return null;
+    return { last: samples[samples.length - 1], avg: round(samples.reduce((a, b) => a + b, 0) / samples.length), samples };
+  }
+
+  if (typeof rtt !== 'object') return null;
+
+  const pick = (...keys) => {
+    for (const key of keys) {
+      const value = rtt[key];
+      if (typeof value === 'number' && Number.isFinite(value)) return value;
+    }
+    return null;
+  };
+  const rawSamples = Array.isArray(rtt.samples)
+    ? rtt.samples.filter((value) => typeof value === 'number' && Number.isFinite(value))
+    : [];
+
+  const last = pick('last', 'lastMs', 'last_ms', 'current');
+  const avg = pick('avg', 'average', 'mean');
+  if (last === null && avg === null && rawSamples.length === 0) return null;
+
+  const samples = rawSamples.length > 0 ? rawSamples : [last ?? avg];
+  return { last: last ?? samples[samples.length - 1], avg: avg ?? round(samples.reduce((a, b) => a + b, 0) / samples.length), samples };
+}
+
+/**
+ * Round to one decimal: RTT is a diagnostic, and false precision invites false conclusions.
+ *
+ * @param {number} value
+ * @returns {number}
+ */
+function round(value) {
+  return Math.round(value * 10) / 10;
+}
+
+/**
+ * Read the local agent's round-trip time, or explain why it is unavailable (§8.2).
+ *
+ * §8.2 puts `rttMs` on the agent's in-memory state. When the plugin started the agent inside this
+ * process, that state is reachable directly. When the agent is its own process — the normal
+ * deployment — it is not, so this also looks for a state file under `stateDir`. Neither source
+ * being present is reported as `available: false` with a reason, never as an error: cross-region
+ * diagnosis fails loudly, but this tool must still answer when the agent has not been started.
+ *
+ * @param {{stateDir: string|null}} cfg
+ * @returns {Promise<{available: boolean, source: string|null, last: number|null, avg: number|null,
+ *                    samples: number[], ms: number|null, reason: string|null, path: string|null}>}
+ */
+async function readRtt(cfg) {
+  const empty = {
+    available: false,
+    source: null,
+    last: null,
+    avg: null,
+    samples: [],
+    ms: null,
+    reason: null,
+    path: null,
+  };
+
+  if (inProcessAgentStatus) {
+    try {
+      const status = inProcessAgentStatus();
+      const rtt = normaliseRtt(status?.rttMs ?? status?.rtt ?? null);
+      if (rtt) return { ...empty, ...rtt, available: true, source: 'in-process-agent' };
+      return { ...empty, source: 'in-process-agent', reason: 'the in-process agent has not recorded a round trip yet' };
+    } catch (error) {
+      return {
+        ...empty,
+        source: 'in-process-agent',
+        reason: `the in-process agent status getter threw: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  }
+
+  if (!cfg.stateDir) {
+    return { ...empty, reason: 'stateDir is not set, so no agent state could be located' };
+  }
+
+  for (const name of AGENT_STATE_FILES) {
+    const file = path.join(cfg.stateDir, name);
+    let text;
+    try {
+      text = await fs.readFile(file, 'utf8');
+    } catch {
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(text);
+      const rtt = normaliseRtt(parsed?.rttMs ?? parsed?.rtt ?? null);
+      if (rtt) return { ...empty, ...rtt, available: true, source: 'state-file', path: file };
+    } catch {
+      continue;
+    }
+  }
+
+  return {
+    ...empty,
+    reason:
+      'no agent round-trip time is available: the agent is not running in this process and no ' +
+      `agent state file was found under ${cfg.stateDir}`,
+  };
+}
+
 
 /**
  * Read a response body, refusing to buffer more than `maxBytes`.
@@ -516,6 +732,10 @@ function parseErrorBody(text) {
   return null;
 }
 
+// ---------------------------------------------------------------------------------------------
+// HTTP
+// ---------------------------------------------------------------------------------------------
+
 /**
  * Perform one request against the Rabbit.
  *
@@ -552,7 +772,9 @@ async function request(options) {
     });
   }
 
-  const target = new URL(pathname, `${rabbitUrl}/`);
+  // §2: base + path, joined by hand. `new URL(pathname, base)` would resolve against the origin
+  // and drop a deployment sub-path (`https://h/w2m` + `/v1/task` → `https://h/v1/task` → 404).
+  const target = toRequestUrl(joinUrl(rabbitUrl, pathname));
   for (const [key, value] of Object.entries(query ?? {})) {
     if (value !== undefined && value !== null) target.searchParams.set(key, String(value));
   }
@@ -1023,6 +1245,51 @@ function readAggregate(body) {
 // ---------------------------------------------------------------------------------------------
 
 /**
+ * Build the short cross-region hints `w2m_status` returns alongside its data.
+ *
+ * These are the three questions §4 says an operator asks first — is the relay there, has it
+ * restarted, do I have the credential it wants — answered in one place so a model does not have to
+ * compare fields itself.
+ *
+ * @param {object} relay The relay block built by `w2m_status`.
+ * @param {object} rtt The block from {@link readRtt}.
+ * @param {ReturnType<typeof readConfig>} cfg
+ * @returns {string[]}
+ */
+function statusNotes(relay, rtt, cfg) {
+  const notes = [];
+
+  if (relay.reachable === true && relay.relay_id) {
+    notes.push(
+      `relay_id \`${relay.relay_id}\` has been up ${Math.round((relay.uptime_ms ?? 0) / 1000)}s — ` +
+        'record this id: a different one on a later call means the relay restarted and every machine reconnected to a new process',
+    );
+  } else if (relay.reachable === true && relay.relay_id === null) {
+    notes.push('the relay answered /healthz but sent no relay_id, so it predates v0.1.2 and a restart cannot be detected from here');
+  }
+
+  if (relay.reachable === true && relay.base_path !== null && cfg.rabbitUrl) {
+    notes.push(`the relay reports base_path \`${relay.base_path}\`; \`rabbitUrl\` in use is \`${cfg.rabbitUrl}\``);
+  }
+
+  if (relay.operator_token_required === true && cfg.operatorToken === null) {
+    notes.push(
+      'this relay requires an operator token for POST /v1/task and none is configured, so w2m_run will refuse before sending anything — set `operatorToken` or `W2M_OPERATOR_TOKEN`',
+    );
+  } else if (relay.operator_token_required === false) {
+    notes.push('this relay does not require an operator token (an explicit escape hatch, not the default), so an unauthenticated dispatch can succeed');
+  }
+
+  if (rtt.available) {
+    notes.push(`round trip to the relay: last ${rtt.last} ms, average ${rtt.avg} ms over ${rtt.samples.length} sample(s) (source: ${rtt.source})`);
+  } else if (rtt.reason) {
+    notes.push(`round-trip time unavailable — ${rtt.reason}`);
+  }
+
+  return notes;
+}
+
+/**
  * Register the five W2M tools.
  *
  * @param {object} ctx Cordis context, carrying the `tools` service.
@@ -1260,7 +1527,9 @@ export async function apply(ctx, config = {}) {
         );
       }
 
-      const token = await resolveToken(cfg);
+      // §5: dispatching a task is the operator's privilege, not the device's. The operator token is
+      // required and there is no device-token fallback — see requireOperatorToken.
+      const token = requireOperatorToken(cfg);
       const anchors = await resolveGitAnchors({ projectDir: cfg.projectDir, timeoutMs: Math.min(15_000, timeoutMs) });
 
       const payload = {
@@ -1290,13 +1559,18 @@ export async function apply(ctx, config = {}) {
       });
 
       if (!result.ok) {
+        // OPERATOR_REQUIRED gets its own guidance: it is the one refusal whose fix is a client-side
+        // setting rather than something on the relay.
+        const operatorRequired = result.error?.code === 'OPERATOR_REQUIRED' || result.status === 401;
         throw new W2MError(
           'W2M_RABBIT_REFUSED',
-          `W2M_RABBIT_REFUSED: the Rabbit refused POST /v1/task with HTTP ${result.status}${result.error ? ` (${result.error.code}: ${result.error.message})` : ''}; ${result.error?.code === 'NO_ONLINE_DEVICE' ? 'no machine is currently streaming — start the agent on each machine, then w2m_devices shows who is online' : 'check the Rabbit log for the reason it gave'}`,
+          `W2M_RABBIT_REFUSED: the Rabbit refused POST /v1/task with HTTP ${result.status}${result.error ? ` (${result.error.code}: ${result.error.message})` : ''}; ${operatorRequired ? 'this relay requires the operator token to dispatch tasks and the one sent was not accepted — set `operatorToken` (or `W2M_OPERATOR_TOKEN`) to the value the relay printed at startup; a device token cannot dispatch tasks' : result.error?.code === 'NO_ONLINE_DEVICE' ? 'no machine is currently streaming — start the agent on each machine, then w2m_devices shows who is online' : 'check the Rabbit log for the reason it gave'}`,
           {
-            hint: result.error?.code === 'NO_ONLINE_DEVICE'
-              ? 'no machine is currently streaming; start the agent on each machine (w2m_devices shows who is online)'
-              : 'check the Rabbit log for the reason it gave',
+            hint: operatorRequired
+              ? 'set `operatorToken` (or `W2M_OPERATOR_TOKEN`) to the value the relay printed at startup, or read it from `<state>/operator-token.txt`'
+              : result.error?.code === 'NO_ONLINE_DEVICE'
+                ? 'no machine is currently streaming; start the agent on each machine (w2m_devices shows who is online)'
+                : 'check the Rabbit log for the reason it gave',
           },
         );
       }
@@ -1549,9 +1823,11 @@ export async function apply(ctx, config = {}) {
     name: 'w2m_status',
     description:
       'Report this plugin\'s view of itself: the machine identity on disk, whether the Rabbit ' +
-      'answers, the paired token presence, and the project\'s base_commit/base_tree. Read-only, ' +
-      'and deliberately usable while the configuration is still broken, because it is the tool ' +
-      'you reach for when w2m_devices says rabbitUrl is unset.',
+      'answers, the paired token presence, the relay\'s cross-region diagnostics (relay_id, ' +
+      'uptime, deployment base_path, effective_scheme, whether it demands an operator token), ' +
+      'this machine\'s round-trip time to the relay, and the project\'s base_commit/base_tree. ' +
+      'Read-only, degrades field by field, and deliberately usable while the configuration is ' +
+      'still broken, because it is the tool you reach for when w2m_devices says rabbitUrl is unset.',
     parameters: {},
     output: jsonOutput,
     async execute(_args, exec) {
@@ -1570,6 +1846,16 @@ export async function apply(ctx, config = {}) {
         http_status: null,
         protocol_version: null,
         error: null,
+        // §4 cross-region diagnostics. Null until `/healthz` answers, and individually null when a
+        // relay predates v0.1.2: a missing field is reported as missing, never invented.
+        relay_id: null,
+        uptime_ms: null,
+        started_at: null,
+        base_path: null,
+        effective_scheme: null,
+        operator_token_required: null,
+        pair_rate_limit: null,
+        persistence: null,
       };
       const probeBase = cfg.rabbitUrl ?? device.rabbit_url ?? null;
       if (probeBase) {
@@ -1582,27 +1868,42 @@ export async function apply(ctx, config = {}) {
             timeoutMs: PROBE_TIMEOUT_MS,
             maxBytes: 64 * 1024,
           });
+          const health = probe.json ?? {};
           relay = {
             configured_url: cfg.rabbitUrl,
             probed_url: target,
             reachable: probe.ok,
             http_status: probe.status,
-            protocol_version: probe.json?.protocol_version ?? null,
+            protocol_version: health.protocol_version ?? null,
             error: probe.ok ? null : (probe.error?.code ?? `HTTP ${probe.status}`),
+            relay_id: health.relay_id ?? null,
+            uptime_ms: typeof health.uptime_ms === 'number' ? health.uptime_ms : null,
+            started_at: health.started_at ?? null,
+            base_path: health.base_path ?? null,
+            effective_scheme: health.effective_scheme ?? null,
+            operator_token_required:
+              typeof health.operator_token_required === 'boolean' ? health.operator_token_required : null,
+            pair_rate_limit: typeof health.pair_rate_limit === 'number' ? health.pair_rate_limit : null,
+            persistence: health.persistence ?? null,
+            // Which of the §4 fields this relay actually sent. A v1 relay sends none of them, and a
+            // reader should be able to tell "field absent" from "field false".
+            diagnostics_present: ['relay_id', 'uptime_ms', 'base_path', 'effective_scheme', 'operator_token_required']
+              .filter((key) => health[key] !== undefined && health[key] !== null),
           };
         } catch (error) {
           relay = {
+            ...relay,
             configured_url: cfg.rabbitUrl,
             probed_url: target,
             reachable: false,
             http_status: null,
-            protocol_version: null,
             error: error instanceof Error ? error.message : String(error),
           };
         }
       }
 
       const anchors = await resolveGitAnchors({ projectDir: cfg.projectDir });
+      const rtt = await readRtt(cfg);
 
       return JSON.stringify(
         {
@@ -1617,6 +1918,7 @@ export async function apply(ctx, config = {}) {
             device_error: device.error,
           },
           relay: { ...relay, healthz: '/healthz' },
+          rtt,
           config: {
             rabbitUrl: cfg.rabbitUrl,
             stateDir: cfg.stateDir,
@@ -1624,6 +1926,16 @@ export async function apply(ctx, config = {}) {
             autoStartAgent: cfg.autoStartAgent,
             allowedCommands: cfg.allowedCommands,
             pairingCode_configured: cfg.pairingCode !== null,
+            // §5: `validated` reports presence only. The plugin cannot tell a correct token from a
+            // wrong one without spending a dispatch, and `required_by_relay` is what makes the two
+            // halves of the mismatch (client has none / relay demands one) visible side by side.
+            operatorToken_configured: cfg.operatorToken !== null,
+            operatorToken_source: cfg.operatorToken !== null
+              ? (typeof config?.operatorToken === 'string' && config.operatorToken.trim() !== ''
+                ? 'config'
+                : 'environment')
+              : null,
+            operatorToken_required_by_relay: relay.operator_token_required ?? null,
           },
           project: {
             base_commit: anchors.base_commit,
@@ -1634,6 +1946,7 @@ export async function apply(ctx, config = {}) {
             fingerprint_algo: 'git-temp-index-tree/v1',
             error: anchors.error,
           },
+          notes: statusNotes(relay, rtt, cfg),
         },
         null,
         2,
@@ -1737,7 +2050,14 @@ async function startLocalStack(ctx, cfg) {
   await agent.start();
   ctx.logger?.info?.(`w2m: agent started as ${JSON.stringify(agent.identity?.() ?? null)}`);
 
+  // §8.2: when the agent runs inside this process its `rttMs` is reachable directly, so `w2m_status`
+  // can report it without a file. When the agent is its own process this stays null and the tool
+  // says so instead of guessing.
+  const statusGetter = agent.status ?? agent.state ?? null;
+  inProcessAgentStatus = typeof statusGetter === 'function' ? statusGetter.bind(agent) : null;
+
   return async () => {
+    inProcessAgentStatus = null;
     await agent.stop();
     await relay.close();
   };

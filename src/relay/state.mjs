@@ -15,7 +15,12 @@ import { createHash, randomBytes } from 'node:crypto';
 
 export const PROTOCOL_VERSION = 1;
 
-/** PROTOCOL §1 table + §7 code table. */
+/**
+ * PROTOCOL §1 table + §7 code table, plus the two v0.1.2 additions:
+ * `OPERATOR_REQUIRED` (§5.2 → 401) and `RATE_LIMITED` (§6 → 429).
+ * A code missing from this map silently degrades to HTTP 500 via
+ * `ProtocolError`, which keeps the right error code but lies about the status.
+ */
 export const ERROR_STATUS = Object.freeze({
   UNAUTHORIZED: 401,
   BAD_REQUEST: 400,
@@ -26,6 +31,8 @@ export const ERROR_STATUS = Object.freeze({
   FRAME_TOO_LARGE: 413,
   NO_ONLINE_DEVICE: 503,
   INTERNAL: 500,
+  OPERATOR_REQUIRED: 401, // v0.1.2 §5.2
+  RATE_LIMITED: 429,      // v0.1.2 §6
 });
 
 /** §5.1 required envelope fields — missing any one means `unverifiable`. */
@@ -296,6 +303,14 @@ export class RabbitState {
     this.leaseGraceMs = options.leaseGraceMs ?? DEFAULT_LEASE_GRACE_MS;
 
     this.startedAtMs = this._now();
+    /** v0.1.2 §8.3: random per-process id; a change tells clients the relay restarted. */
+    this.relayId = options.relayId ?? randomBytes(8).toString('hex');
+    /** v0.1.2 §7: optional injected Persistence instance (state.mjs never touches fs itself). */
+    this._persist = options.persistence ?? null;
+    /** True while replaying a ledger — suppresses event emission and re-persistence. */
+    this._restoring = false;
+    /** Ledger entries that could not be replayed. */
+    this.replayWarnings = [];
     this.seq = 0;
     /** @type {{seq:number,event:object,target:string|null}[]} ring buffer, last N events */
     this.buffer = [];
@@ -316,6 +331,148 @@ export class RabbitState {
 
   /** §4.3 lease window = 2 missed heartbeats (20s) + grace (30s) = 50s. */
   leaseWindowMs() { return this.heartbeatIntervalMs * this.missedHeartbeats + this.leaseGraceMs; }
+
+  /* ---------------- persistence hooks (v0.1.2 §7) ---------------- */
+
+  /** Inject/replace the persistence backend (also used by tests). */
+  setPersistence(persistence) { this._persist = persistence ?? null; return this._persist; }
+
+  /** Snapshot the device table; failures must never break the request path. */
+  _saveDevices() {
+    if (this._restoring || !this._persist) return false;
+    try {
+      return this._persist.saveDevices(this.devices);
+    } catch (err) {
+      this._persist.warn?.('devices.json', `snapshot failed: ${err.message}`);
+      return false;
+    }
+  }
+
+  /** Append one ledger entry; failures must never break the request path. */
+  _ledger(entry) {
+    if (this._restoring || !this._persist) return false;
+    try {
+      return this._persist.append(entry);
+    } catch (err) {
+      this._persist.warn?.('ledger.jsonl', `append failed: ${err.message}`);
+      return false;
+    }
+  }
+
+  _ledgerLease(task, lease) {
+    this._ledger({ type: 'lease.changed', task_id: task.task_id, machine_id: lease.machine_id, lease: { ...lease } });
+  }
+
+  /**
+   * v0.1.2 §7 startup recovery: rebuild the device table, token index, tasks,
+   * leases and the result/dedupe index from a devices snapshot + ledger replay.
+   * Never emits events and never writes back what it just read.
+   */
+  restore({ devices = {}, ledger = [] } = {}) {
+    this._restoring = true;
+    try {
+      for (const [machineId, d] of Object.entries(devices)) {
+        if (!d || typeof d !== 'object') continue;
+        const pairedAt = Date.parse(d.paired_at ?? '');
+        const device = {
+          machine_id: machineId,
+          machine_name: typeof d.machine_name === 'string' && d.machine_name ? d.machine_name : machineId,
+          platform: d.platform ?? {},
+          caps: d.caps ?? {},
+          user_id: d.user_id ?? null,
+          device_token: typeof d.device_token === 'string' ? d.device_token : null,
+          paired_at_ms: Number.isFinite(pairedAt) ? pairedAt : this.nowMs(),
+          re_paired: d.re_paired === true,
+          last_seen_at_ms: this.nowMs(),
+          // a snapshot proves the device exists, not that it is connected
+          online: false,
+          streams: 0,
+        };
+        this.devices.set(machineId, device);
+        if (device.device_token) this.tokens.set(device.device_token, machineId);
+      }
+
+      let revivedTasks = 0;
+      for (const entry of ledger) {
+        try {
+          if (this._applyLedgerEntry(entry) === true) revivedTasks += 1;
+        } catch (err) {
+          this.replayWarnings.push({ type: entry?.type ?? '<unknown>', message: err.message });
+        }
+      }
+      return { revived_devices: this.devices.size, revived_tasks: revivedTasks };
+    } finally {
+      this._restoring = false;
+    }
+  }
+
+  /** @returns {boolean} true when a new task was created. */
+  _applyLedgerEntry(entry) {
+    if (!entry || typeof entry.type !== 'string') return false;
+    switch (entry.type) {
+      case 'task.created': {
+        const t = entry.task;
+        if (!t || typeof t.task_id !== 'string') return false;
+        const createdAt = Number.isFinite(t.created_at_ms) ? t.created_at_ms : Date.parse(entry.ts ?? '');
+        const task = {
+          task_id: t.task_id,
+          mode: t.mode ?? 'replicate',
+          command_argv: t.command_argv ?? [],
+          cwd_rel: t.cwd_rel ?? '.',
+          index_total: t.index_total ?? 1,
+          timeout_ms: t.timeout_ms ?? 300_000,
+          write: t.write === true,
+          write_scope: t.write_scope ?? [],
+          require_exclusive_write: t.require_exclusive_write === true,
+          base_commit: t.base_commit ?? null,
+          base_tree: t.base_tree ?? null,
+          requirements: t.requirements ?? {},
+          compare_policy: t.compare_policy ?? {},
+          halt: t.halt ?? 'never',
+          created_by: t.created_by ?? null,
+          created_at_ms: Number.isFinite(createdAt) ? createdAt : this.nowMs(),
+          command_hash: t.command_hash ?? null,
+          attempt: t.attempt ?? 1,
+          leases: new Map(),
+          cancelled: false,
+          cancel_reason: null,
+          degraded: t.degraded ?? null,
+          deadline_ms: t.deadline_ms ?? 0,
+          result_seqs: [],
+        };
+        for (const lease of entry.leases ?? []) {
+          if (lease && typeof lease.machine_id === 'string') task.leases.set(lease.machine_id, { ...lease });
+        }
+        this.tasks.set(task.task_id, task);
+        return true;
+      }
+      case 'lease.changed': {
+        const task = this.tasks.get(entry.task_id);
+        const lease = task?.leases.get(entry.machine_id);
+        if (!lease) return false;
+        Object.assign(lease, entry.lease ?? {});
+        return false;
+      }
+      case 'result.stored': {
+        const record = entry.result;
+        if (!record || typeof record.instance_key !== 'string') return false;
+        this.results.set(record.instance_key, { ...record });
+        const task = this.tasks.get(record.envelope?.task_id);
+        if (task && Number.isInteger(record.seq)) task.result_seqs.push(record.seq);
+        return false;
+      }
+      case 'task.cancelled': {
+        const task = this.tasks.get(entry.task_id);
+        if (task) {
+          task.cancelled = true;
+          task.cancel_reason = entry.reason ?? null;
+        }
+        return false;
+      }
+      default:
+        return false; // unknown entry type: forward compatible, ignored
+    }
+  }
 
   /* ---------------- events (§3) ---------------- */
 
@@ -379,6 +536,24 @@ export class RabbitState {
   rotatePairingCode(opts) {
     for (const rec of this.pairingCodes.values()) rec.used = true;
     return this.createPairingCode(opts);
+  }
+
+  /**
+   * Register an externally supplied code (`--pairing-code <c>`).
+   *
+   * v0.1.2 BUG-1: assigning the code to `relay.pairingCode` without registering it
+   * advertised a code that `/v1/pair` then rejected with PAIRING_INVALID, so every
+   * documented scripted-onboarding flow failed. "Which code do we use" and "is the
+   * code registered" are two different questions; this answers the second.
+   */
+  registerPairingCode(code, { ttlMs = this.pairingTtlMs } = {}) {
+    if (typeof code !== 'string' || code.trim() === '') {
+      throw new ProtocolError('BAD_REQUEST', 'pairing code must be a non-empty string', { pairing_code: code });
+    }
+    const value = code.trim();
+    const now = this.nowMs();
+    this.pairingCodes.set(value, { code: value, created_at_ms: now, expires_at_ms: now + ttlMs, used: false });
+    return value;
   }
 
   /** §2.2 step 3: validate a one-time code. */
@@ -453,6 +628,15 @@ export class RabbitState {
         pairing_code: nextCode,
       });
     }
+
+    // §7: a device change is snapshotted immediately.
+    this._saveDevices();
+    this._ledger({
+      type: 'device.paired',
+      machine_id: machineId,
+      machine_name: device.machine_name,
+      re_paired: device.re_paired,
+    });
 
     return {
       device_token: token,
@@ -633,6 +817,32 @@ export class RabbitState {
 
     this.tasks.set(taskId, task);
 
+    this._ledger({
+      type: 'task.created',
+      task: {
+        task_id: task.task_id,
+        mode: task.mode,
+        command_argv: task.command_argv,
+        cwd_rel: task.cwd_rel,
+        index_total: task.index_total,
+        timeout_ms: task.timeout_ms,
+        write: task.write,
+        write_scope: task.write_scope,
+        require_exclusive_write: task.require_exclusive_write,
+        base_commit: task.base_commit,
+        base_tree: task.base_tree,
+        requirements: task.requirements,
+        compare_policy: task.compare_policy,
+        halt: task.halt,
+        created_by: task.created_by,
+        created_at_ms: task.created_at_ms,
+        command_hash: task.command_hash,
+        attempt: task.attempt,
+        deadline_ms: task.deadline_ms,
+      },
+      leases: [...task.leases.values()].map((l) => ({ ...l })),
+    });
+
     const refusedOnly = [...task.leases.values()].every((l) => l.state === 'refused');
     if (refusedOnly) {
       // §6.3 Step 0 territory: a task nobody may execute is still a valid, reportable task.
@@ -720,6 +930,7 @@ export class RabbitState {
       if (ACTIVE_LEASE_STATES.includes(lease.state)) lease.state = 'cancelled';
     }
     this.emit('task.cancel', { task_id: taskId, reason });
+    this._ledger({ type: 'task.cancelled', task_id: taskId, reason });
     return task;
   }
 
@@ -758,6 +969,7 @@ export class RabbitState {
       return { lease_until: rfc3339(lease.lease_until_ms), cancel: true, reason: 'LEASE_EXPIRED_TAKEN_OVER' };
     }
 
+    const stateBefore = lease.state;
     lease.last_heartbeat_ms = now;
     lease.lease_until_ms = now + this.leaseWindowMs();
     lease.heartbeat_count += 1;
@@ -768,6 +980,9 @@ export class RabbitState {
     // A live heartbeat is stronger evidence than a timer: with halt=never nobody took
     // the work away, so the late-but-alive agent re-claims its own lease.
     if (lease.state === 'expired') { lease.state = 'running'; lease.expired_at_ms = null; }
+
+    // §7 ledger records lease STATE changes, not every 10s heartbeat.
+    if (lease.state !== stateBefore) this._ledgerLease(task, lease);
 
     return { lease_until: rfc3339(lease.lease_until_ms), cancel: false, phase: lease.phase, progress: lease.progress };
   }
@@ -794,6 +1009,7 @@ export class RabbitState {
         lease.expired_at_ms = nowMs;
         changed = true;
         expired.push({ task, lease });
+        this._ledgerLease(task, lease);
         this.emit('notice', {
           level: 'warn',
           code: 'LEASE_EXPIRED',
@@ -855,6 +1071,7 @@ export class RabbitState {
       target.dedupe_key = computeDedupeKey(task.task_id, target.index, task.command_hash, task.base_tree);
       task.leases.set(device.machine_id, target);
       this.emitOffer(task, target);
+      this._ledgerLease(task, target);
     }
 
     this.emit('notice', {
@@ -995,6 +1212,13 @@ export class RabbitState {
       deduped: false,
       validation_errors: record.validation.missing,
     });
+
+    // §7: results go into the ledger so the dedupe index survives a restart.
+    this._ledger({ type: 'result.stored', task_id: taskId, machine_id: machineId, result: record });
+    if (machineId) {
+      const changed = task.leases.get(machineId);
+      if (changed) this._ledgerLease(task, changed);
+    }
 
     return { deduped: false, task_id: taskId, dedupe_key: dedupeKey, seq, _instanceKey: instanceKey };
   }

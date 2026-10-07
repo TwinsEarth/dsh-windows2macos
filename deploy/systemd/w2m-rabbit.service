@@ -1,0 +1,150 @@
+# ============================================================================
+#  w2m-rabbit.service  --  systemd unit for the W2M relay
+# ============================================================================
+#
+#  This file is a TEMPLATE. Replace the @PLACEHOLDERS@ before installing.
+#
+#  Install (Linux server, systemd):
+#      sudo useradd --system --home /var/lib/w2m --shell /usr/sbin/nologin w2m
+#      sudo install -d -o w2m -g w2m -m 0750 /var/lib/w2m
+#      sudo install -d -o w2m -g w2m -m 0750 /etc/w2m
+#      sudo install -m 0644 deploy/systemd/w2m-rabbit.service \
+#           /etc/systemd/system/w2m-rabbit.service
+#      sudo systemctl daemon-reload
+#      sudo systemctl enable --now w2m-rabbit
+#      journalctl -u w2m-rabbit -f          # watch the pairing code / operator token
+#
+#  Validated how: systemd is not available on the authoring machine, so this
+#  file was NOT checked with `systemd-analyze verify`. It follows the unit
+#  directives' documented semantics; docs/DEPLOY.md names the exact command to
+#  run before trusting it.
+#
+#  ---------------------------------------------------------------------------
+#  WHAT THIS UNIT DELIBERATELY DOES
+#  ---------------------------------------------------------------------------
+#  * Binds 127.0.0.1, never 0.0.0.0. In every supported shape something else
+#    terminates TLS (nginx/Caddy/tunnel) or the network is already encrypted
+#    (Tailscale/WireGuard), so the relay must not be reachable directly.
+#  * Keeps state in /var/lib/w2m via StateDirectory=, so devices and the task
+#    ledger survive restarts. Without this, every restart forces every machine
+#    to pair again -- see docs/TROUBLESHOOTING.md, "everything needs re-pairing".
+#  * Writes nothing to the user's home and needs no writable directory except
+#    its state dir and /run for the pairing-code file.
+#  * Restarts on failure but not in a tight loop (RestartSec + StartLimit*).
+# ============================================================================
+
+[Unit]
+Description=W2M relay (Rabbit) - task relay for cross-machine execution
+Documentation=https://github.com/TwinsEarth/dsh-windows2macos/blob/main/docs/DEPLOY.md
+# Start after the network is up; the relay itself does not need DNS, but
+# ordering here keeps journal timestamps meaningful on a cold boot.
+After=network-online.target
+Wants=network-online.target
+# If the relay sits behind a reverse proxy on the same host, uncomment so the
+# proxy outlives a relay restart without logging connection errors:
+# After=nginx.service
+
+[Service]
+Type=simple
+User=w2m
+Group=w2m
+
+# --- state -----------------------------------------------------------------
+# systemd creates /var/lib/w2m owned by User/Group.
+# `%S` is the *state root* (/var/lib), so `--state %S/w2m` is /var/lib/w2m --
+# the same directory StateDirectory= names. Using the full `%S/w2m` path rather
+# than $STATE_DIRECTORY keeps the flag self-explanatory in `ps` output.
+StateDirectory=w2m
+StateDirectoryMode=0750
+Environment=DSH_HOME=/var/lib/w2m
+# Files created by the relay (operator-token.txt is written 0600, devices.json
+# and ledger.jsonl hold device tokens) must not be world-readable.
+UMask=0077
+
+# --- relay flags -----------------------------------------------------------
+# Keep the relay on loopback and let the proxy/tunnel terminate TLS.
+#
+# Shape A (Tailscale): change the bind address to the tailnet address and read
+#   the "Shape A" section of docs/DEPLOY.md instead; the relay must be
+#   reachable from the tailnet, and 127.0.0.1 is not.
+#
+# Shape B (VPS + TLS): the relay stays here on loopback; nginx/Caddy owns 443.
+#   If you prefer the relay to terminate TLS itself, replace the two flags
+#   below with --tls-cert / --tls-key and give it a --port clients can reach,
+#   then delete the reverse proxy. Pick one, never both.
+#
+# Shape C (tunnel): the tunnel client runs as its own unit (see docs) and
+#   dials 127.0.0.1:8787, so this line does not change. If the tunnel publishes
+#   the relay under a prefix, add --base-path here AND keep the two in sync.
+ExecStart=@RELAY_BIN@ --host 127.0.0.1 --port 8787 --state %S/w2m
+# Extra flags (uncomment what the deployment shape needs):
+#   --base-path /w2m            # only when the tunnel/proxy forwards the prefix
+#   --trust-proxy               # only behind a proxy you control
+#   --pair-rate-limit 5         # default; raise only on a trusted network
+#   --operator-token-file %S/w2m/operator-token.txt   # if the CLI supports it
+#
+# Multi-line form when the flag list grows (systemd joins lines ending in \)：
+# ExecStart=@RELAY_BIN@ \
+#     --host 127.0.0.1 \
+#     --port 8787 \
+#     --state %S/w2m \
+#     --base-path /w2m \
+#     --trust-proxy
+
+# --- secrets ---------------------------------------------------------------
+# Do NOT put the operator token in this file: the unit is world-readable and
+# the token authorises SENDING work to every paired machine.
+# Preferred: let the relay generate one and read /var/lib/w2m/operator-token.txt.
+# If you must inject your own, keep it in an EnvironmentFile with mode 0600
+# owned by root, and let systemd read it:
+# EnvironmentFile=-/etc/w2m/relay.env      # W2M_OPERATOR_TOKEN=...
+# (the leading '-' means "start anyway if the file is missing")
+#
+# NOTE: the relay prints the operator token and the pairing code to stdout, so
+# they end up in the journal. For a public deployment, restrict journal access
+# (sudo usermod -aG systemd-journal <user>) or send them elsewhere.
+
+# --- restart policy --------------------------------------------------------
+Restart=on-failure
+RestartSec=3
+# Give up only after repeated fast failures rather than flapping forever.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+# The relay handles SIGTERM by closing the server and exiting 0; give it time
+# to let clients see a clean disconnect.
+TimeoutStopSec=15
+KillSignal=SIGTERM
+
+# --- hardening -------------------------------------------------------------
+# The relay needs only: loopback sockets, its state dir, and enough of the
+# filesystem to load its own JS. Everything else is denied.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+# Loopback + (for shape A) the tailnet interface. AF_UNIX is needed by the
+# Node runtime for internal sockets on some builds; AF_INET/AF_INET6 carry the
+# relay itself.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# ProtectSystem=strict makes everything read-only except paths named here.
+ReadWritePaths=/var/lib/w2m
+
+# --- logs ------------------------------------------------------------------
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=w2m-rabbit
+# Uncomment to make the startup banner (pairing code, operator token) land in a
+# file an operator can read without journal access. Keep that file 0600.
+# StandardOutput=append:/var/lib/w2m/relay.log
+
+[Install]
+WantedBy=multi-user.target

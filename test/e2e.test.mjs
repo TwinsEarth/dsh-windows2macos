@@ -173,6 +173,25 @@ test('e2e: two machines, one relay, real commands', async (t) => {
 
   assert.ok(pairingCode, 'relay must surface a pairing code');
 
+  // v0.1.2 §5 splits the credentials in two: a `device_token` authenticates a
+  // *machine* on every endpoint except sending work, and the `operator_token`
+  // authorises dispatching work. The relay writes the operator token to
+  // <state>/operator-token.txt. Both are used below, each where the protocol
+  // says it belongs -- this file previously submitted tasks with the device
+  // token, which the v0.1.2 security fix deliberately makes impossible.
+  const operatorTokenPath = join(stateDir, 'operator-token.txt');
+  let operatorToken = null;
+  for (let i = 0; i < 50 && !operatorToken; i += 1) {
+    if (existsSync(operatorTokenPath)) {
+      operatorToken = readFileSync(operatorTokenPath, 'utf8').trim() || null;
+    }
+    if (!operatorToken) await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.ok(
+    operatorToken,
+    `relay must write an operator token to ${operatorTokenPath} (§5.1): ${existsSync(operatorTokenPath) ? 'file exists but is empty' : 'file missing'}`,
+  );
+
   const agents = [];
   const startPromises = [];
   t.after(async () => {
@@ -259,9 +278,11 @@ test('e2e: two machines, one relay, real commands', async (t) => {
     const anchored = body.base_tree === undefined
       ? { base_commit: await headOf(repo.a), base_tree: await currentAnchor() }
       : {};
+    // Dispatching work is an operator action (§5.2), so this carries the
+    // operator token. A device token here would be a 401, by design.
     const res = await fetch(`${baseUrl}/v1/task`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json', authorization: `Bearer ${commandToken}` },
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${operatorToken}` },
       body: JSON.stringify({ ...anchored, ...body }),
     });
     const text = await res.text();
@@ -465,6 +486,10 @@ test('e2e: two machines, one relay, real commands', async (t) => {
       duration_ms: 1,
       exit_code: 0,
       status: 'ok',
+      // §5.1 lists `refusal_reason` as a required envelope field, so a replay
+      // probe that omits it is not a well-formed envelope and would be judged
+      // `unverifiable` on its own merits rather than on its dedupe_key.
+      refusal_reason: null,
       stdout_sha256: 'c'.repeat(64),
       stdout_bytes: 0,
       stderr_sha256: 'd'.repeat(64),
@@ -518,5 +543,47 @@ test('e2e: two machines, one relay, real commands', async (t) => {
     const verdict = await waitForVerdict(baseUrl, created.task_id, commandToken);
     const indexes = verdict.machines.map((m) => m.index).sort();
     assert.deepEqual(indexes, [0, 1], `split must hand out both shards: ${JSON.stringify(verdict.machines)}`);
+  });
+
+  await t.test('10. a device token cannot dispatch work; only the operator token can', async () => {
+    // This is the v0.1.2 security fix (§5) exercised against the whole system.
+    // Every scenario above goes through `submit()`, which now carries the
+    // operator token -- so if the relay ever went back to accepting a device
+    // token here, only this scenario would notice.
+    const body = {
+      base_commit: await headOf(repo.a),
+      base_tree: await currentAnchor(),
+      mode: 'replicate',
+      command_argv: [NODE, '-e', 'console.log("must not run")'],
+      index_total: 1,
+      timeout_ms: 20_000,
+      write: false,
+    };
+
+    const denied = await fetch(`${baseUrl}/v1/task`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${commandToken}` },
+      body: JSON.stringify(body),
+    });
+    const deniedBody = await denied.json().catch(() => null);
+    assert.equal(
+      denied.status,
+      401,
+      `a paired machine must not be able to dispatch work to the group: got ${denied.status} ${JSON.stringify(deniedBody)}`,
+    );
+    assert.equal(
+      deniedBody?.error?.code,
+      'OPERATOR_REQUIRED',
+      `the refusal must name the missing credential: ${JSON.stringify(deniedBody)}`,
+    );
+
+    // Positive control: the operator token performs the same POST successfully.
+    // Without this, a relay that rejected *every* POST /v1/task would pass.
+    const allowed = await fetch(`${baseUrl}/v1/task`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${operatorToken}` },
+      body: JSON.stringify(body),
+    });
+    assert.equal(allowed.status, 200, `the operator token must still be able to dispatch: ${allowed.status}`);
   });
 });

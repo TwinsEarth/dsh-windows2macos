@@ -23,7 +23,9 @@
 
 import { Readable } from 'node:stream';
 import { access, constants as fsConstants } from 'node:fs/promises';
-import { basename, extname } from 'node:path';
+import { mkdirSync, renameSync, writeFileSync } from 'node:fs';
+import { basename, extname, join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 
 import {
   EMPTY_SHA256,
@@ -45,6 +47,7 @@ import {
   resolveProjectCwd,
 } from './git.mjs';
 import { createSpool } from './spool.mjs';
+import { joinUrl, resolveBaseUrl } from './url.mjs';
 
 /** Wire protocol version (§1). */
 export const PROTOCOL_VERSION = 1;
@@ -63,6 +66,46 @@ export const HEARTBEAT_INTERVAL_MS = 10_000;
 
 /** Default task timeout when the offer does not carry one. */
 export const DEFAULT_TIMEOUT_MS = 300_000;
+
+/** Rolling window of heartbeat round-trip times kept for `w2m_status` (§8.2). */
+export const RTT_WINDOW = 5;
+
+/**
+ * A stream that stayed up at least this long is considered healthy, so the
+ * next reconnect starts from the bottom of the backoff ladder again.
+ */
+export const STABLE_STREAM_MS = 1000;
+
+/**
+ * Delay before reconnecting after a *healthy* stream ended (relay restart,
+ * proxy idle timeout). Small but non-zero: reconnecting in a hot loop would
+ * hammer a relay that is merely restarting, which is exactly the situation
+ * v0.1.2 is about.
+ */
+export const RECONNECT_DELAY_AFTER_STABLE_MS = 500;
+
+/**
+ * Diagnostics file the agent publishes for *other processes* (task-16).
+ *
+ * §8.2 puts RTT on the agent's in-memory state, which only helps a plugin that
+ * started the agent inside its own process. In a cross-region deployment the
+ * agent is its own process, so the same numbers are mirrored to
+ * `<stateDir>/agent-state.json`, which is what the plugin's `w2m_status` reads.
+ */
+export const AGENT_STATE_FILE = 'agent-state.json';
+
+/** Schema version of {@link AGENT_STATE_FILE}. */
+export const AGENT_STATE_SCHEMA_VERSION = 1;
+
+/**
+ * How often the diagnostics file is refreshed while the agent sits idle.
+ *
+ * Without this, `updated_at` only moves when a heartbeat or a connection change
+ * happens -- so an idle-but-healthy agent would look frozen, and a reader could
+ * not tell "running, nothing to do" from "killed an hour ago". Cheap: one small
+ * atomic write per interval.
+ */
+export const AGENT_STATE_PUBLISH_INTERVAL_MS = 30_000;
 
 /** Refusal reason codes this agent can produce. */
 export const REFUSAL = {
@@ -151,6 +194,26 @@ export function backoffDelay(attempt, rand = Math.random) {
   const base = BACKOFF_MS[index];
   const factor = 0.5 + Math.min(Math.max(rand(), 0), 1) * 0.5;
   return Math.round(base * factor);
+}
+
+/**
+ * Summarise heartbeat round-trip samples for `state.rttMs` (§8.2).
+ *
+ * Exported so the shape the plugin reads through `w2m_status` is testable
+ * without a live relay.
+ *
+ * @param {number[]} samples Round-trip times in milliseconds, oldest first.
+ * @param {number} [window]
+ * @returns {{last: number|null, avg: number|null, samples: number[]}}
+ */
+export function summarizeRtt(samples, window = RTT_WINDOW) {
+  const kept = (Array.isArray(samples) ? samples : [])
+    .filter((value) => Number.isFinite(value))
+    .slice(-window)
+    .map((value) => Math.round(value));
+  if (kept.length === 0) return { last: null, avg: null, samples: [] };
+  const avg = Math.round(kept.reduce((sum, value) => sum + value, 0) / kept.length);
+  return { last: kept[kept.length - 1], avg, samples: kept };
 }
 
 // ---------------------------------------------------------------------------
@@ -503,6 +566,7 @@ export class Heartbeat {
    * @param {number} [options.intervalMs]
    * @param {(error: unknown) => void} [options.onError]
    * @param {() => void} [options.onCancel]
+   * @param {(ms: number) => void} [options.onRtt] Called with each successful round trip.
    */
   constructor(options) {
     this.send = options.send;
@@ -512,6 +576,7 @@ export class Heartbeat {
     this.intervalMs = options.intervalMs ?? HEARTBEAT_INTERVAL_MS;
     this.onError = options.onError ?? (() => {});
     this.onCancel = options.onCancel ?? (() => {});
+    this.onRtt = options.onRtt ?? (() => {});
     this.phase = 'preparing';
     this.progress = 0;
     this.ticks = 0;
@@ -528,6 +593,7 @@ export class Heartbeat {
   /** Send one heartbeat; returns the decoded response. */
   async tick() {
     this.ticks += 1;
+    const startedHr = process.hrtime.bigint();
     try {
       const response = await this.send({
         task_id: this.taskId,
@@ -536,6 +602,9 @@ export class Heartbeat {
         phase: this.phase,
         progress: this.progress,
       });
+      // Measured on success only: a timeout is not a round-trip time, and
+      // folding it in would make "latency to the relay" look catastrophic.
+      this.onRtt(Number(process.hrtime.bigint() - startedHr) / 1e6);
       if (response && response.cancel === true) {
         this.cancelled = true;
         this.onCancel();
@@ -568,7 +637,8 @@ export class Heartbeat {
 
 /**
  * @typedef {object} AgentOptions
- * @property {string} rabbitUrl Base URL, e.g. `http://127.0.0.1:8787`.
+ * @property {string} rabbitUrl Base address; a sub-path is allowed
+ *   (`https://host/w2m`), a query string or fragment is rejected. See ./url.mjs.
  * @property {string} project Absolute project root.
  * @property {string} stateDir Directory for spool/state (never the project).
  * @property {object} identity `{machine_id, machine_name, device_token, rabbit_url}`.
@@ -584,6 +654,10 @@ export class Heartbeat {
  * @property {string} [tmpDir]
  * @property {number} [onceIdleMs]
  * @property {number} [resultRetries]
+ * @property {number} [statePublishIntervalMs] Idle refresh cadence for the
+ *   diagnostics file; 0 disables it (task-16).
+ * @property {string|null} [operatorToken] Only needed when this host submits
+ *   tasks itself (v0.1.2 §5); never sent by the Localside agent.
  */
 
 /**
@@ -607,6 +681,8 @@ export function createAgent(options) {
     tmpDir,
     onceIdleMs = 0,
     resultRetries = 4,
+    operatorToken = null,
+    statePublishIntervalMs = AGENT_STATE_PUBLISH_INTERVAL_MS,
   } = options;
 
   // Normalise here so every caller gets the same contract: the documented
@@ -620,14 +696,41 @@ export function createAgent(options) {
   if (!identity?.machine_id) throw new TypeError('createAgent: identity.machine_id is required');
   if (typeof fetchImpl !== 'function') throw new TypeError('createAgent: no fetch implementation available');
 
+  // Validate + normalise once, at construction: a `rabbitUrl` carrying a query
+  // string, a fragment or a non-http scheme must fail loudly here rather than
+  // turn into mysterious 404s at request time. Sub-paths are preserved.
+  const baseUrl = resolveBaseUrl(rabbitUrl);
+
   const log = options.log ?? (() => {});
   const spool = createSpool(stateDir);
+
+  /**
+   * Absolute path of the cross-process diagnostics file (task-16).
+   *
+   * Deliberately under `stateDir` (the `--state` directory), not next to
+   * `device.json`: the spool, the state and this file belong together, and a
+   * read-only project must never be written to.
+   */
+  const stateFilePath = join(stateDir, AGENT_STATE_FILE);
+  let statePublishWarned = false;
 
   const state = {
     seq: 0,
     connected: false,
     handled: 0,
     stopped: false,
+    /** `relay_id` of the relay we are currently talking to (v0.1.2 §8.3). */
+    relayId: null,
+    /** How many times a relay restart was detected. */
+    relayIdChanges: 0,
+    /** Last `REPLAY_TRUNCATED` notice we had to act on (v0.1.2 §8.4). */
+    replayTruncated: null,
+    /** Rolling heartbeat round-trip times, read by `w2m_status` (§8.2). */
+    rttMs: summarizeRtt([]),
+    /** Path of the published diagnostics file. */
+    stateFile: stateFilePath,
+    /** `updated_at` of the last successful publish, or null. */
+    statePublishedAt: null,
     /** @type {object|null} */
     current: null,
   };
@@ -658,7 +761,10 @@ export function createAgent(options) {
   let runAbort = null;
   /** @type {Heartbeat|null} */
   let heartbeat = null;
-  let backoffAttempt = 0;
+  /** Consecutive unstable reconnects; drives the backoff ladder (§8.1). */
+  let reconnectAttempt = 0;
+  /** @type {NodeJS.Timeout|null} Idle refresh of the diagnostics file. */
+  let statePublishTimer = null;
 
   /**
    * @param {string|null|undefined} dedupeKey
@@ -679,7 +785,84 @@ export function createAgent(options) {
     }
   }
 
+  // -- Cross-process diagnostics file (task-16) ----------------------------
+
+  /**
+   * Snapshot published to `<stateDir>/agent-state.json`.
+   *
+   * An allow-list, not a spread of internal state: the plugin reads this
+   * cross-process, so the only safe rule is that a field must be named here to
+   * exist. No token -- device or operator -- can ever appear, because neither
+   * is referenced.
+   *
+   * @returns {object}
+   */
+  function agentStateSnapshot() {
+    return {
+      schema_version: AGENT_STATE_SCHEMA_VERSION,
+      machine_id: identity.machine_id,
+      machine_name: identity.machine_name ?? null,
+      updated_at: new Date().toISOString(),
+      connected: state.connected === true,
+      relay_id: state.relayId ?? null,
+      rttMs: {
+        last: state.rttMs.last,
+        avg: state.rttMs.avg,
+        samples: [...state.rttMs.samples],
+      },
+      reconnect_attempts: reconnectAttempt,
+      replay_truncated: state.replayTruncated !== null,
+    };
+  }
+
+  /**
+   * Atomically publish the snapshot: temp file in the same directory, then
+   * rename, so a reader never sees half a JSON document.
+   *
+   * Never throws. A full disk or a state directory that vanished must not take
+   * the agent (or a running task) down -- the file is a diagnostic, not a
+   * delivery guarantee -- so failure is logged once and otherwise ignored.
+   *
+   * @returns {object|null} The snapshot written, or null when the write failed.
+   */
+  function publishState() {
+    const snapshot = agentStateSnapshot();
+    try {
+      mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+      const tmp = `${stateFilePath}.tmp-${process.pid}-${randomUUID().slice(0, 8)}`;
+      writeFileSync(tmp, `${JSON.stringify(snapshot, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+      renameSync(tmp, stateFilePath);
+      state.statePublishedAt = snapshot.updated_at;
+      statePublishWarned = false;
+      return snapshot;
+    } catch (error) {
+      if (!statePublishWarned) {
+        statePublishWarned = true;
+        log('warn', `could not publish ${AGENT_STATE_FILE} (diagnostics only; continuing)`, {
+          path: stateFilePath,
+          error: error?.message ?? String(error),
+        });
+      }
+      return null;
+    }
+  }
+
   const token = () => identity.device_token;
+
+  /**
+   * Fold one heartbeat round trip into the rolling window (§8.2).
+   *
+   * Exposed as `state.rttMs` for `w2m_status`; deliberately *not* added to the
+   * result envelope, which must stay comparable across machines.
+   *
+   * @param {number} ms
+   */
+  function recordRtt(ms) {
+    state.rttMs = summarizeRtt([...state.rttMs.samples, ms]);
+    // Publish on every successful heartbeat: this is the moment the numbers a
+    // remote operator cares about actually changed (task-16).
+    publishState();
+  }
 
   /** Detected tool versions, resolved once per process (git needs a spawn). */
   let toolchainCache = null;
@@ -702,8 +885,11 @@ export function createAgent(options) {
 
   // -- HTTP helpers --------------------------------------------------------
 
-  /** @param {string} path @returns {string} */
-  const url = (path) => new URL(path, rabbitUrl).toString();
+  /**
+   * @param {string} path
+   * @returns {string}
+   */
+  const url = (path) => joinUrl(baseUrl, path);
 
   /**
    * POST JSON and decode the response body.
@@ -787,7 +973,7 @@ export function createAgent(options) {
       throw error;
     }
     identity.device_token = response.json.device_token;
-    identity.rabbit_url = rabbitUrl;
+    identity.rabbit_url = baseUrl;
     log('info', 'paired', { machine_id: identity.machine_id });
     return response.json;
   }
@@ -944,12 +1130,26 @@ export function createAgent(options) {
     };
 
     // ---- 1. spool before anything else (§0) ------------------------------
-    spool.saveTask({
-      task_id: offer.task_id,
-      attempt: offer.attempt,
-      dedupe_key: offer.dedupe_key,
-      offer,
-    });
+    // Fail closed: if the durable copy cannot be written, running the command
+    // would produce a result we could never replay, so the offer is dropped
+    // with an explicit reason instead of executing unspooled. This also keeps
+    // `state.current` from being left pointing at a task that never started.
+    try {
+      spool.saveTask({
+        task_id: offer.task_id,
+        attempt: offer.attempt,
+        dedupe_key: offer.dedupe_key,
+        offer,
+      });
+    } catch (error) {
+      log('error', `could not spool ${offer.task_id}; not running it (spool-first, §0)`, {
+        error: error?.message ?? String(error),
+      });
+      runAbort = null;
+      state.current = null;
+      state.handled += 1;
+      return;
+    }
     log('info', `offer ${offer.task_id} attempt ${offer.attempt ?? 1}`, {
       argv: commandArgv,
       cwd_rel: cwdRel,
@@ -964,6 +1164,7 @@ export function createAgent(options) {
       attempt: Number(offer.attempt) || 1,
       intervalMs: heartbeatIntervalMs,
       onError: (error) => log('warn', 'heartbeat failed', { error: error.message }),
+      onRtt: recordRtt,
       onCancel: () => {
         log('warn', `Rabbit cancelled ${offer.task_id} via heartbeat`);
         controller.abort();
@@ -1201,11 +1402,14 @@ export function createAgent(options) {
     const headers = { accept: 'text/event-stream' };
     if (token()) headers.authorization = `Bearer ${token()}`;
     if (state.seq > 0) headers['last-event-id'] = String(state.seq);
-    const streamUrl = new URL('/v1/stream', rabbitUrl);
-    streamUrl.searchParams.set('machine_id', identity.machine_id);
-    if (state.seq > 0) streamUrl.searchParams.set('seq', String(state.seq + 1));
+    // Built by concatenation so a relay mounted under a sub-path
+    // (https://host/w2m) keeps its prefix -- see ./url.mjs.
+    const query = new URLSearchParams();
+    query.set('machine_id', identity.machine_id);
+    if (state.seq > 0) query.set('seq', String(state.seq + 1));
+    const streamUrl = joinUrl(baseUrl, `/v1/stream?${query.toString()}`);
 
-    const response = await fetchImpl(streamUrl.toString(), { headers, signal: streamAbort.signal });
+    const response = await fetchImpl(streamUrl, { headers, signal: streamAbort.signal });
     if (!response.ok) {
       const body = await response.text().catch(() => '');
       const error = new Error(`stream HTTP ${response.status} ${body.slice(0, 200)}`.trim());
@@ -1226,6 +1430,7 @@ export function createAgent(options) {
       }
     }
     state.connected = false;
+    publishState();
   }
 
   /** @param {{event: string, data: string, id: string|null}} frame */
@@ -1242,16 +1447,34 @@ export function createAgent(options) {
     else if (frame.id && /^\d+$/.test(frame.id)) state.seq = Math.max(state.seq, Number(frame.id));
 
     switch (type) {
-      case 'ready':
+      case 'ready': {
         // §3.1: nothing counts as connected before `ready` arrives.
         state.connected = true;
-        backoffAttempt = 0;
+        const relayId =
+          typeof payload.relay_id === 'string' && payload.relay_id !== '' ? payload.relay_id : null;
+        const previousRelayId = state.relayId;
+        if (relayId && previousRelayId && relayId !== previousRelayId) {
+          // The relay restarted: it numbers events from 1 again, so our cursor
+          // points at a sequence that will never exist. Drop it and adopt the
+          // position of this fresh stream.
+          state.relayIdChanges += 1;
+          state.seq = Number.isInteger(payload.seq) ? payload.seq : 0;
+          log('warn', `relay restarted (relay_id ${previousRelayId} -> ${relayId}); seq cursor reset to ${state.seq}`, {
+            previous_relay_id: previousRelayId,
+            relay_id: relayId,
+          });
+        }
+        if (relayId) state.relayId = relayId;
         log('info', 'stream ready', {
           seq: payload.seq,
           protocol_version: payload.protocol_version,
           machine_id: payload.machine_id,
+          relay_id: relayId,
         });
+        // Connection state changed: make it visible to other processes.
+        publishState();
         break;
+      }
       case 'task.offer':
         enqueue(payload);
         break;
@@ -1273,9 +1496,33 @@ export function createAgent(options) {
       case 'peer.bye':
         log('info', `peer offline: ${payload.machine_id} (${payload.reason ?? ''})`);
         break;
-      case 'notice':
+      case 'notice': {
         log(payload.level === 'error' ? 'error' : 'info', `notice ${payload.code ?? ''}: ${payload.message ?? ''}`);
+        if (payload.code === 'REPLAY_TRUNCATED') {
+          // v0.1.2 §8.4: the relay tells us the oldest seq it still holds, so we
+          // can re-align instead of only learning that we missed events. The
+          // cursor moves to `oldest_available_seq - 1` because the next connect
+          // asks for `cursor + 1`.
+          const oldest = payload.oldest_available_seq;
+          if (Number.isInteger(oldest) && oldest >= 1) {
+            state.replayTruncated = {
+              at: new Date().toISOString(),
+              oldest_available_seq: oldest,
+              previous_seq: state.seq,
+            };
+            state.seq = oldest - 1;
+            log('warn', `replay window truncated; seq cursor aligned to ${state.seq} (next connect asks for ${oldest})`, {
+              oldest_available_seq: oldest,
+            });
+            publishState();
+          } else {
+            log('warn', 'REPLAY_TRUNCATED without a usable oldest_available_seq; cursor left unchanged', {
+              oldest_available_seq: oldest ?? null,
+            });
+          }
+        }
         break;
+      }
       case 'task.result':
         // Added by the relay after this contract was frozen: a result reached
         // Rabbit. Nothing to do here, but reporting it beats "unknown event".
@@ -1366,9 +1613,15 @@ export function createAgent(options) {
   function stop() {
     if (state.stopped) return;
     state.stopped = true;
+    if (statePublishTimer) clearInterval(statePublishTimer);
+    statePublishTimer = null;
     heartbeat?.stop();
     runAbort?.abort();
     streamAbort?.abort();
+    // Final snapshot: a reader must be able to tell "stopped" from "crashed
+    // mid-write", and from "still running but not connected".
+    state.connected = false;
+    publishState();
   }
 
   /**
@@ -1378,13 +1631,23 @@ export function createAgent(options) {
    */
   async function start() {
     log('info', `localside ${identity.machine_name} (${identity.machine_id})`, {
-      rabbit: rabbitUrl,
+      rabbit: baseUrl,
       project,
       state: stateDir,
       allowed_commands: allowedCommands.map((prefix) => prefix.join(' ')),
     });
     if (allowedCommands.length === 0) {
       log('warn', 'no --allowed-commands configured: every offer will be refused (default-deny)');
+    }
+
+    // Publish immediately so the file appears with the agent, not only after
+    // the first heartbeat: "is an agent running here?" is the first question a
+    // remote operator asks (task-16).
+    publishState();
+    if (statePublishIntervalMs > 0) {
+      statePublishTimer = setInterval(() => publishState(), statePublishIntervalMs);
+      // Never keep the process alive just to refresh a diagnostics file.
+      if (typeof statePublishTimer.unref === 'function') statePublishTimer.unref();
     }
 
     if (token()) {
@@ -1408,24 +1671,37 @@ export function createAgent(options) {
     try {
       while (!state.stopped) {
         streamAbort = new AbortController();
+        const openedAt = Date.now();
+        /** @type {Error|null} */
+        let failure = null;
         try {
           await streamOnce();
-          // A clean end of stream is still a disconnect: reconnect, but do not
-          // punish the server for it with a long delay.
-          if (!state.stopped) {
-            backoffAttempt = 0;
-            log('warn', 'event stream closed by server; reconnecting');
-          }
         } catch (error) {
-          if (state.stopped) break;
-          state.connected = false;
-          const delay = backoffDelay(backoffAttempt);
-          log('warn', `stream error: ${error?.message ?? String(error)}; retrying in ${delay}ms`, {
-            attempt: backoffAttempt,
-          });
-          backoffAttempt += 1;
-          await sleep(delay, undefined);
+          failure = error instanceof Error ? error : new Error(String(error));
         }
+        if (state.stopped) break;
+        state.connected = false;
+        publishState();
+
+        const livedMs = Date.now() - openedAt;
+        const stable = livedMs >= STABLE_STREAM_MS;
+        if (stable) reconnectAttempt = 0;
+        // A stream that ends immediately is treated as a failure even when the
+        // socket closed cleanly; otherwise a flapping tunnel becomes a hot loop.
+        const delay = stable ? RECONNECT_DELAY_AFTER_STABLE_MS : backoffDelay(reconnectAttempt);
+        reconnectAttempt += 1;
+        const reason = failure
+          ? `stream error: ${failure.message}`
+          : `event stream closed by server after ${livedMs}ms`;
+        // Cross-region debugging needs to answer "is it retrying, how often, and
+        // how long until the next try" without attaching a debugger (§8.1).
+        log('warn', `${reason}; reconnect #${reconnectAttempt} in ${delay}ms`, {
+          attempt: reconnectAttempt,
+          delay_ms: delay,
+          lived_ms: livedMs,
+          stable,
+        });
+        await sleep(delay, undefined);
       }
     } finally {
       if (idleTimer) clearTimeout(idleTimer);
@@ -1449,6 +1725,20 @@ export function createAgent(options) {
     caps,
     platform,
     allowedCommands,
+    /** Write the diagnostics file now (also done automatically; task-16). */
+    publishState,
+    /** Absolute path of the published diagnostics file. */
+    stateFile: stateFilePath,
+    /** Normalised base address actually used for every request (v0.1.2 §2). */
+    baseUrl,
+    /**
+     * Operator token, when this host also submits tasks (v0.1.2 §5).
+     *
+     * The Localside agent never POSTs `/v1/task`, so this is carried for local
+     * tooling (`w2m_status`, host-side scripts) and is never put on the wire by
+     * this process. It is deliberately not persisted to disk either.
+     */
+    operatorToken: operatorToken ?? null,
   };
 }
 

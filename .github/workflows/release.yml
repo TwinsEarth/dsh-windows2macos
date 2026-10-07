@@ -1,0 +1,97 @@
+name: Release
+
+# Publishing by hand is what went wrong in 0.0.1: the tarball was uploaded before
+# the documentation stopped changing, so the published bytes no longer matched
+# the tagged source, and the release had to be re-cut. Reproducing the artifact
+# from the tag inside CI removes the human step that caused it.
+#
+# Trigger: push a tag like v0.1.2
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to release (e.g. v0.1.2)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: verify, pack and publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: The tag and package.json must agree
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          pkg="v$(node -p "require('./package.json').version")"
+          echo "tag: $tag"
+          echo "package.json: $pkg"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::tag $tag does not match package.json version $pkg — refusing to publish a mislabelled artifact"
+            exit 1
+          fi
+
+      # Releasing an artifact from a commit whose tests never ran is how a broken
+      # package reaches users. The tag points at a specific commit; this proves
+      # that commit passes before anything is published.
+      - name: Configure a git identity for the test fixtures
+        run: |
+          git config --global user.name "ci"
+          git config --global user.email "ci@example.invalid"
+          git config --global init.defaultBranch main
+          git config --global core.autocrlf false
+
+      - name: Entry points import
+        run: node scripts/check-entrypoints.mjs
+
+      - name: Unit suites
+        run: node --test test/relay.test.mjs test/agent.test.mjs test/tools.test.mjs
+
+      - name: End-to-end suites
+        run: node --test --test-force-exit test/e2e.test.mjs test/crossnetwork.test.mjs
+
+      - name: Pack
+        run: |
+          set -euo pipefail
+          node scripts/pack.mjs --out dist
+          cd dist
+          sha256sum *.tgz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: The packed artifact loads and registers its tools
+        run: |
+          set -euo pipefail
+          mkdir -p unpacked
+          tar -xzf dist/*.tgz -C unpacked
+          node scripts/verify-installed.mjs "$(pwd)/unpacked/package"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag exists; uploading assets with --clobber"
+            gh release upload "$tag" dist/*.tgz dist/SHA256SUMS --clobber
+          else
+            gh release create "$tag" \
+              --title "DSH: Windows2MacOS $tag" \
+              --generate-notes \
+              dist/*.tgz dist/SHA256SUMS
+          fi
+          gh release view "$tag" --json assets,url

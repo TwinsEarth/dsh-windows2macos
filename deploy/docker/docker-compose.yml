@@ -1,0 +1,131 @@
+# ============================================================================
+#  W2M relay -- docker compose example
+# ============================================================================
+#
+#  This file is a TEMPLATE. Read the comments before starting it: the default
+#  port binding is deliberately host-loopback-only, which is the safe choice
+#  for every one of the three supported deployment shapes.
+#
+#  Quick start (from the repository root):
+#      docker compose -f deploy/docker/docker-compose.yml up -d --build
+#      docker compose -f deploy/docker/docker-compose.yml logs -f relay
+#  The log contains the pairing code and the operator token on first start.
+#
+#  Verified how: docker is not installed on the authoring machine, so
+#  `docker compose config` / `up` were NOT run here. The structure was checked
+#  with a YAML sanity pass (see docs/DEPLOY.md, "What was verified").
+#
+#  ---------------------------------------------------------------------------
+#  WHICH SHAPE THIS FILE SERVES
+#  ---------------------------------------------------------------------------
+#  It runs the relay as a container and publishes it on 127.0.0.1:8787 of the
+#  host. That is the correct base for:
+#
+#    Shape B (VPS + domain + TLS): a host-installed nginx/Caddy terminates TLS
+#      on 443 and proxies to 127.0.0.1:8787 (see deploy/nginx, deploy/caddy).
+#      In this shape set `--trust-proxy` in the relay command below, because
+#      the proxy is the only thing that can tell the relay the real client IP.
+#
+#    Shape C (tunnel): cloudflared/ngrok runs on the host and dials
+#      127.0.0.1:8787. Also add `--trust-proxy` only if the tunnel sets
+#      X-Forwarded-* AND you control it -- a free tunnel is still "yours", so
+#      this is usually fine, but see docs/DEPLOY.md for the caveat.
+#
+#    Shape A (Tailscale/WireGuard): a container is usually NOT what you want,
+#      because the relay must bind the tailnet address. If you do containerise
+#      it, put the container on the tailnet (e.g. `network_mode: host` with
+#      Tailscale on the host, or a Tailscale sidecar) and bind the tailnet
+#      address directly. docs/DEPLOY.md covers the non-Docker path first.
+#
+#  ---------------------------------------------------------------------------
+#  SECRETS
+#  ---------------------------------------------------------------------------
+#  Do NOT put the operator token in this file. Leave `--operator-token` out and
+#  the relay generates one, writing it to
+#  <state>/operator-token.txt (0600) inside the volume. Read it with:
+#      docker compose -f deploy/docker/docker-compose.yml exec relay \
+#          cat /var/lib/w2m/operator-token.txt
+#  If you must inject your own, use an .env file that is git-ignored and
+#  reference it as ${W2M_OPERATOR_TOKEN:?set W2M_OPERATOR_TOKEN in .env} so a
+#  missing value fails loudly instead of starting an unprotected relay.
+# ============================================================================
+
+services:
+  relay:
+    build:
+      # Build context is the repository root, so the Dockerfile's COPY paths
+      # (package.json, bin/, src/, lib/) resolve. `docker compose` resolves
+      # this relative to THIS file, hence the two levels up.
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    image: w2m-relay:0.1.2
+    container_name: w2m-relay
+    restart: unless-stopped
+
+    # --- the relay command --------------------------------------------------
+    # Default: loopback publish, no proxy trust. Add flags per the shape you
+    # picked above. Keep this list and docs/DEPLOY.md's tables in sync.
+    command:
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8787"
+      - --state
+      - /var/lib/w2m
+      # Uncomment for Shape B / Shape C (a proxy or tunnel you control):
+      # - --trust-proxy
+      # Uncomment ONLY when the proxy/tunnel forwards the prefix unchanged:
+      # - --base-path
+      # - /w2m
+
+    # --- ports --------------------------------------------------------------
+    # 127.0.0.1:8787 on the host means "reachable only from this machine",
+    # which is exactly right when nginx/Caddy/cloudflared runs on the same
+    # host. Changing this to "8787:8787" (or "0.0.0.0:8787:8787") exposes the
+    # relay directly, with no TLS and no proxy in front: do that only on a
+    # trusted private network such as a Tailscale interface.
+    ports:
+      - "127.0.0.1:8787:8787"
+
+    # --- persistence --------------------------------------------------------
+    # The named volume holds devices.json, ledger.jsonl and
+    # operator-token.txt. Deleting it forces every machine to pair again.
+    volumes:
+      - w2m-state:/var/lib/w2m
+
+    # --- runtime hygiene ----------------------------------------------------
+    # The image already drops to uid 10001; these make the isolation explicit
+    # and keep the container from gaining privileges it does not need.
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    # `read_only: true` needs writable scratch space for Node itself.
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+
+    # --- logging ------------------------------------------------------------
+    # The startup banner (pairing code + operator token) goes to the container
+    # log. Keep enough history to recover the pairing code after a restart,
+    # but treat the log as sensitive: it contains both credentials.
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
+    # --- health -------------------------------------------------------------
+    # Inherited from the image's HEALTHCHECK; docker compose reports it as
+    # (healthy) once /healthz answers inside the container.
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  w2m-state:
+    # A named volume survives `docker compose down`; `down -v` deletes it and
+    # with it every paired device. Back it up with:
+    #   docker run --rm -v w2m_w2m-state:/data -v "$PWD:/backup" \
+    #       alpine tar czf /backup/w2m-state.tgz -C /data .
