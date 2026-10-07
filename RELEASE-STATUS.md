@@ -9,14 +9,38 @@
 
 | 事项 | 结果 | 凭据 |
 |---|---|---|
-| 源码仓库 | https://github.com/TwinsEarth/dsh-windows2macos （public） | 2 次提交，main 分支 |
+| 源码仓库 | https://github.com/TwinsEarth/dsh-windows2macos （public） | main 分支，工作区干净 |
 | 首版提交 | `35fcdc8` DSH: Windows2MacOS v0.0.1（33 文件 / 13,825 行） | `git log` |
-| 修复提交 | `dbaad9a` 修复插件 re-export 与 CLI 工厂名 + 新增两个门禁 | `git log` |
+| 修复提交 | `dbaad9a` 修复插件 re-export 与 CLI 工厂名 + 两个门禁 | `git log` |
+| CI 提交 | `8c99e11` 三平台 CI；`6393d3f` 修复两个跨平台测试缺陷 | `git log` |
 | Release | https://github.com/TwinsEarth/dsh-windows2macos/releases/tag/v0.0.1 | tag `v0.0.1` |
-| 资产 | `twinsearth-w2m-dsh-plugin-0.0.1.tgz`（94,045 B）+ `SHA256SUMS` | `state=uploaded` |
-| tarball sha256 | `d8297370e53791bfc54d6a1ed520c14c4b22be6fc7543c18a05ee83b174d4dee` | `gh release view --json assets` 的 `digest` 一致 |
+| 资产 | `twinsearth-w2m-dsh-plugin-0.0.1.tgz`（94,830 B）+ `SHA256SUMS` | `state=uploaded` |
+| tarball sha256 | `28f78a9ed22c829a5b0ee1f78c074062c25a2c10044fd126b9c3371b3d60e3fc` | 与 `gh release view --json assets` 的 `digest` 一致 |
+| **CI 徽章** | **CI - passing**（5/5 job 全绿） | https://github.com/TwinsEarth/dsh-windows2macos/actions/workflows/ci.yml |
+| Topics | `dsh-plugin` `deepseek-harness` `deepseek` `windows2macos` `multi-machine` `orchestration` | `gh repo view` |
+| 商店投稿 PR | https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/6783 | **open**，**仅 1 个文件 +7 行** |
+| 本地端到端 | 195 用例（relay 61 / agent 79 / tools 45 / e2e 10）全绿 | `scripts/verify.ps1` |
 
-> ⚠️ **哈希会随文档变化**：tarball 里打包了 `README.md` / `PROTOCOL.md` / `CHANGELOG.md`，所以任何文档编辑都会改变哈希。**改完文档必须重新 `pack` + 重新 upload + 更新 `SHA256SUMS`**，否则线上资产与源码不一致（本文件的修改**不影响**，因为 `RELEASE-STATUS.md` 不在 `files` 列表里）。
+### CI 覆盖矩阵（`.github/workflows/ci.yml`）
+
+| job | 平台 | Node |
+|---|---|---|
+| test | `windows-latest` | 20 与 22 |
+| test | `macos-latest` | 22 |
+| test | `ubuntu-latest` | 22 |
+| pack | `ubuntu-latest` | 22 —— 打包两次，字节不一致即失败 |
+
+> **CI 立刻抓到了两个真实缺陷，而它们在只跑 Windows 时是隐形的**：
+> ① 一个测试把 `.git/objects` 的整个 `readdir` 与快照比对，而 git 自己会异步写 `maintenance.lock`，导致 macOS 上列表不同；
+> ② 一个测试要求出现 `phase: 'running'` 的心跳，但该心跳间隔 10s、而任务不到 1s 就跑完 —— 它实际断言的是"机器足够慢"，macOS 跑太快所以失败。
+> 两者都是**测试缺陷而非产品缺陷**，已修复（`6393d3f`）。这正是加 CI 的价值。
+
+### ⚠️ 发布资产的时效规则
+
+`package.json` 的 `files` 打包了 `README.md` / `PROTOCOL.md` / `CHANGELOG.md` / `test/**`，所以**任何文档或测试改动都会改变 tarball 哈希**。当前线上资产对应 HEAD = `6393d3f`，已核对一致。
+
+**发新版本时**：先冻结代码与文档 → 再 `pack` → 再 upload → 更新 `SHA256SUMS` → 更新本文件的哈希。顺序颠倒就会出现"线上资产与 tag 指向的源码不一致"。
+（本文件**不在** tarball 内，改它不影响哈希。）
 | Topics | `dsh-plugin` `deepseek-harness` `deepseek` `windows2macos` `multi-machine` `orchestration` | `gh repo view` |
 | 商店投稿 PR | https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/6783 | **open**，**仅 1 个文件 +7 行** |
 | 本地端到端 | 195 用例全绿（relay 61 / agent 79 / tools 45 / e2e 10）+ CLI 冒烟通过 | `scripts/verify.ps1` |
