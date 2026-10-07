@@ -111,6 +111,12 @@ jobs:
       # A published tarball whose hash cannot be reproduced from source is a
       # tarball nobody can verify. Packing twice must produce identical bytes,
       # which is the property scripts/pack.mjs is built around.
+      #
+      # It also compares against the *published* asset for the current version.
+      # Testing only against a second pack on the same machine would have missed
+      # the real defect: gzip stamps an OS byte from the host, so a Windows pack
+      # and a Linux pack of identical sources differed in one byte and nothing
+      # here would have noticed.
       - name: Pack twice and compare
         run: |
           node scripts/pack.mjs --out dist-a
@@ -123,7 +129,29 @@ jobs:
             echo "::error::packing the same sources twice produced different bytes"
             exit 1
           fi
-          echo "reproducible: $a"
+          echo "reproducible on this runner: $a"
+
+      - name: The local build matches the published release asset
+        run: |
+          set -uo pipefail
+          version=$(node -p "require('./package.json').version")
+          tag="v$version"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            echo "no published release for $tag yet; nothing to compare (this is expected before the first publish)"
+            exit 0
+          fi
+          gh release download "$tag" --pattern '*.tgz' --dir published --clobber
+          published=$(sha256sum published/*.tgz | cut -d' ' -f1)
+          local=$(sha256sum dist-a/*.tgz | cut -d' ' -f1)
+          echo "published: $published"
+          echo "local    : $local"
+          if [ "$published" != "$local" ]; then
+            echo "::error::the published asset for $tag does not match a rebuild from this commit"
+            exit 1
+          fi
+          echo "the published artifact is reproducible from source"
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: The manifest's declared paths all exist
         run: node -e "

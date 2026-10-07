@@ -202,6 +202,16 @@ function packTarball() {
 
   const tar = Buffer.concat(parts);
   const gz = gzipSync(tar, { level: 9, mtime: 0 });
+
+  // Force the gzip OS byte to 3 ("Unix").
+  //
+  // zlib stamps this from the host: Windows writes 10 (NTFS), Linux writes 3.
+  // Everything else in the archive is already fixed, so without this the same
+  // sources pack to two different files depending on who runs the command -- and
+  // a published hash would stop being a statement about the sources. The tar
+  // payload is byte-identical across platforms (verified by unpacking both and
+  // comparing), so this single byte was the whole difference.
+  gz[9] = 3;
   return { gz, manifest, entries };
 }
 
