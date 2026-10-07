@@ -131,25 +131,41 @@ jobs:
           fi
           echo "reproducible on this runner: $a"
 
-      - name: The local build matches the published release asset
+      - name: The published release asset is reproducible from its tag
         run: |
           set -uo pipefail
           version=$(node -p "require('./package.json').version")
           tag="v$version"
           if ! gh release view "$tag" >/dev/null 2>&1; then
-            echo "no published release for $tag yet; nothing to compare (this is expected before the first publish)"
+            echo "no published release for $tag yet; nothing to compare (expected before the first publish)"
             exit 0
+          fi
+          # Compare against the *tag*, not against this branch's working tree.
+          # The tarball carries README.md, PROTOCOL.md, CHANGELOG.md and the
+          # tests, so any documentation edit legitimately changes the hash --
+          # checking main against a released tag would fail for a reason that is
+          # not a defect. What must hold is that the tagged sources produce the
+          # published bytes.
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            git worktree add --detach ../tagtree "$tag" >/dev/null 2>&1 || git worktree add --detach ../tagtree "$tag"
+            ( cd ../tagtree && node scripts/pack.mjs --out ../tagdist )
+            taghash=$(sha256sum ../tagdist/*.tgz | cut -d' ' -f1)
+          else
+            echo "tag $tag is not present locally; fetching it"
+            git fetch --depth=1 origin "refs/tags/$tag:refs/tags/$tag"
+            git worktree add --detach ../tagtree "$tag"
+            ( cd ../tagtree && node scripts/pack.mjs --out ../tagdist )
+            taghash=$(sha256sum ../tagdist/*.tgz | cut -d' ' -f1)
           fi
           gh release download "$tag" --pattern '*.tgz' --dir published --clobber
           published=$(sha256sum published/*.tgz | cut -d' ' -f1)
-          local=$(sha256sum dist-a/*.tgz | cut -d' ' -f1)
-          echo "published: $published"
-          echo "local    : $local"
-          if [ "$published" != "$local" ]; then
-            echo "::error::the published asset for $tag does not match a rebuild from this commit"
+          echo "published    : $published"
+          echo "from $tag tag: $taghash"
+          if [ "$published" != "$taghash" ]; then
+            echo "::error::the published asset for $tag does not match a rebuild from that tag"
             exit 1
           fi
-          echo "the published artifact is reproducible from source"
+          echo "the published artifact is reproducible from its tag"
         env:
           GH_TOKEN: ${{ github.token }}
 
