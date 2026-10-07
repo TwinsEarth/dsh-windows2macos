@@ -1,0 +1,353 @@
+# DSH: Windows2MacOS
+
+**One DeepSeek account. One instruction. Every machine you own runs the same project.**
+
+English | [中文](#中文说明)
+
+[![DSH plugin](https://img.shields.io/badge/DSH-plugin-4c6ef5)](#install)
+[![version](https://img.shields.io/badge/version-0.0.1-blue)](#changelog)
+[![dependencies](https://img.shields.io/badge/runtime%20dependencies-0-brightgreen)](#design-notes)
+[![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
+---
+
+## The problem
+
+You have a Windows desktop and a Mac laptop. You are working on one project. You
+want to say *"run the test suite"* once, and have **both** machines run it — then
+see whether they agree.
+
+DeepSeek Harness cannot do this today, and not by accident:
+
+- one `dsh` process serves **one machine** — a profile is a local pnpm workspace;
+- its transport is **loopback only** (the web server accepts `127.0.0.1`/`0.0.0.0`
+  and the CLI refuses `--host 0.0.0.0`, because it ships no TLS or origin policy);
+- the official agent-team feature is explicit that it does **not** support
+  teammates with separate working directories or **several processes
+  coordinating over one team**.
+
+So the cross-machine capability has to be built. This is that build.
+
+## What you get
+
+```
+        you, on any machine, talking to DSH
+                       │
+                       ▼
+   ┌──────────────────────────────────┐        ┌──────────────────────────┐
+   │  Windows · DSH session           │        │  macOS · DSH session     │
+   │   w2m plugin (5 tools)           │        │   w2m plugin (5 tools)   │
+   │        │                         │        │        │                 │
+   │   Localside agent                │        │   Localside agent        │
+   │    · three anchors               │        │    · three anchors       │
+   │    · local spool                 │        │    · local spool         │
+   │    · executes argv               │        │    · executes argv       │
+   └──────────┬───────────────────────┘        └──────────┬───────────────┘
+              │  outbound POST + SSE                      │
+              ▼                                           ▼
+        ┌──────────────────────────────────────────────────────────┐
+        │  Rabbit relay — devices, tasks, leases, six-state report │
+        └──────────────────────────────────────────────────────────┘
+```
+
+Both machines only ever make **outbound** connections. No public IP, no port
+forwarding, no SSH server on Windows (which, measured, is not installed by
+default — `ssh.exe` exists, `sshd` does not).
+
+### Two coordination modes
+
+| Mode | What it does | When to use |
+|---|---|---|
+| `replicate` | every machine runs the **same** command; results compared side by side | "does this change pass on both platforms?" |
+| `split` | work divided by `index` (`explicit` or `modulo` sharding) | one large test suite, several machines |
+
+### Six aggregation states
+
+Not four — because "the environments differ" and "the results differ" are
+different findings, and collapsing them turns noise into bug reports.
+
+| State | Meaning |
+|---|---|
+| `consistent` | every machine agreed on every comparable field |
+| `divergent` | machines disagreed — the report names the field and each machine's value |
+| `divergent-platform` | only toolchain/platform differ, and the difference is confined to stdout text — expected |
+| `failed` | every machine failed |
+| `partial` | some succeeded, some failed |
+| `unverifiable` | an **anchor** did not match, so comparison is refused |
+
+## Install
+
+> **This package can run three ways, and all three start the same binaries.**
+>
+> ```bash
+> node bin/w2m-rabbit.mjs ...        # from a clone (what the examples below use)
+> npx @twinsearth/w2m-dsh-plugin ... # if it is on a registry
+> w2m-rabbit ...                     # once installed, via its bin entry
+> ```
+>
+> The examples use the clone form because that is what is verified in this
+> repository. Nothing needs to be installed to use the relay or the agent: they
+> are plain Node scripts with **no runtime dependencies**.
+
+### 1. The relay (once, on any always-on machine)
+
+```bash
+node bin/w2m-rabbit.mjs --host 0.0.0.0 --port 8787 --state ~/.dsh/xclient/rabbit
+```
+
+It prints a **pairing code**. Pair the first machine, and the relay immediately
+prints a **new** code — so you can pair the second machine without restarting
+anything. (For scripted onboarding, start it with `pairingCodeReusable: true`
+and one code stays valid for its whole TTL.)
+
+### 2. Localside (on every machine that should run the project)
+
+```bash
+node bin/w2m-localside.mjs \
+  --rabbit http://<relay-host>:8787 \
+  --pair PAIR-XXXXXXXX \
+  --project /path/to/your/project \
+  --name win-desktop \
+  --state ~/.dsh/xclient/localside-win
+```
+
+`--allowed-commands` is a **default-deny whitelist** as a JSON array. Nothing
+runs unless it matches a prefix:
+
+```bash
+  --allowed-commands '["node --test","git status --porcelain"]'
+```
+
+> ⚠️ **v0.0.1 note:** Localside is verified as a standalone process. Running it
+> *in-process* from the plugin (`autoStartAgent: true`) is implemented but has
+> not been exercised end-to-end in this release — start it as its own process.
+
+### 3. The DSH plugin
+
+```bash
+dsh plugin --profile <profile-name> add @twinsearth/w2m-dsh-plugin@0.0.1
+```
+
+Then give it the relay URL in that profile's `cordis.patch.yml`:
+
+```yaml
+- id: w2m
+  config:
+    rabbitUrl: http://127.0.0.1:8787
+    stateDir: !!js (process.env.DSH_HOME + '/xclient')
+    machineName: win-desktop
+```
+
+Restart DSH. You should see five tools: `w2m_devices`, `w2m_run`, `w2m_wait`,
+`w2m_report`, `w2m_status`.
+
+> `dsh` may not be on your `PATH`. On a packaged install it lives under
+> `resources/runtime/cli/bin/`. If `dsh` is not found, call it by path.
+
+**No npm package yet?** Install straight from the release tarball — it needs no
+registry at all:
+
+```bash
+dsh plugin --profile <profile-name> add \
+  https://github.com/TwinsEarth/dsh-windows2macos/releases/download/v0.0.1/twinsearth-w2m-dsh-plugin-0.0.1.tgz
+```
+
+## Use
+
+Then just talk to DSH:
+
+> List my machines, then run `node --test` on all of them at the same commit and
+> tell me whether the output matches.
+
+The model calls `w2m_devices` → `w2m_run` → `w2m_wait` → `w2m_report` and hands
+you the comparison.
+
+## Why you can trust the comparison
+
+A commit SHA alone is not enough. Measured: on a **dirty** working tree,
+`git checkout --detach <sha>` **exits 0 and keeps the local changes** — HEAD
+matches the base while the working tree does not. Compare on SHA alone and you
+will report a logic difference that is really a "these are not the same files"
+difference.
+
+So every result carries **three anchors**:
+
+| Anchor | What it proves |
+|---|---|
+| `base_commit` | both machines started from the same commit |
+| `pre_tree_fingerprint` | both had the **same working-tree bytes**, including untracked files |
+| `command_hash` | both ran the same argv, in the same shell mode, in the same relative cwd |
+
+The fingerprint algorithm is `git-temp-index-tree/v1`: a throwaway index file
+(`git read-tree` → `git add -A` → `git write-tree`) that never touches your
+working tree. Each call gets its **own** temporary index — sharing one
+`GIT_INDEX_FILE` across processes makes them fail with `idx.lock: File exists`.
+
+`git stash create` is *not* used: measured, it drops untracked files and returns
+an empty string in both the "clean" and "only untracked files" cases, so the two
+are indistinguishable.
+
+**Prerequisite:** put this in your project root, or the two machines will never
+fingerprint alike:
+
+```gitattributes
+* text=auto eol=lf
+```
+
+Measured: with that line, a `core.autocrlf=true` checkout and a
+`core.autocrlf=false` checkout produce byte-identical working trees. Without it,
+one is CRLF and the other LF.
+
+## Security
+
+Read this before binding to `0.0.0.0`.
+
+- **Admission** is a single-use pairing code, then a per-device bearer token
+  stored in `device.json` (mode `0600`).
+- **The relay holds no model credentials and no working copy.** It can forge
+  tasks, which is exactly why the machine-side whitelist is the load-bearing
+  control.
+- **Commands are never shell strings.** argv arrays are passed to
+  `spawn(cmd, args, { shell: false })`, so nothing a caller types can be
+  reinterpreted as shell syntax.
+- **Default-deny whitelist.** A machine runs nothing that does not match
+  `--allowed-commands`.
+- **Read-only by default.** `replicate` tasks run with `write: false`; there is
+  no code path that writes to your project in that mode.
+- **No TLS.** For anything beyond a trusted LAN, put a reverse proxy in front, or
+  run the relay over WireGuard/Tailscale.
+- The plugin **does not read** `.credentials.yaml`.
+
+## Verified, and not verified
+
+This project's rule is that claims carry their evidence.
+
+**Verified on Windows** (this release):
+
+- relay: 61 tests — pairing, auth, SSE with `ready`-first and `seq` replay,
+  leases with heartbeat renewal and expiry, dedupe, all six aggregation states,
+  report generation;
+- agent: 79 tests — whitelist allow/deny, timeout, output truncation, exit codes,
+  anchors on clean and dirty trees, four concurrent fingerprint computations,
+  spool;
+- plugin: 45 tests — five tools registered, schemas, typed errors, polling;
+- end to end: 10 tests — two Localsides on two checkouts against one relay
+  running real commands, covering consistent / divergent / failed / refused /
+  unverifiable / deduped / long-lease / split;
+- **CLI smoke test** (`scripts/smoke-cli.ps1`): real `w2m-rabbit` plus two real
+  `w2m-localside` processes, ending in a `consistent` verdict and a rendered
+  markdown report.
+
+Run them with `scripts/verify.ps1` (Windows) or `scripts/verify.sh` (macOS/Linux).
+
+**Not verified:**
+
+- **macOS.** Every measurement above was taken on Windows. The code is
+  platform-neutral (`node:path`, `spawn` without a shell, `fetch`), but do not
+  read "ported" as "tested".
+- **A single account driving both machines' model sessions.** This release
+  executes commands deterministically; it does not inject prompts into a remote
+  DSH session. Whether one account can run two concurrent model sessions at once
+  depends on your account's limits and is untested here.
+
+## Design notes
+
+- **Zero third-party runtime dependencies.** Only `node:` built-in modules. The
+  relay is `node:http`; the downlink is Server-Sent Events and the uplink is
+  ordinary POST, so there is no WebSocket handshake to get wrong.
+- **`@deepseek-ai/dsh-tools` is an optional peer dependency**, resolved at
+  runtime by DSH. It is deliberately *not* a hard dependency: declaring it would
+  pull roughly 287 `@deepseek-ai/*` packages into the install for one import.
+- **Long lease + progress heartbeat**, never a fixed timeout. Measured risk: a
+  machine running a 40-minute test would be declared dead and the task re-sent to
+  another machine — both machines then running it, both producing side effects.
+  Only a *failed renewal* marks a lease dead, and only the relay's clock decides.
+
+The full wire contract — every endpoint, field and state transition — is in
+[PROTOCOL.md](PROTOCOL.md). It is frozen: changing it is a breaking change.
+
+## Development
+
+```bash
+node --test test/                          # everything
+node --test test/relay.test.mjs
+node --test test/agent.test.mjs
+node --test test/tools.test.mjs
+node --test --test-force-exit test/e2e.test.mjs   # see note
+```
+
+> The end-to-end suite needs `--test-force-exit`: each simulated machine holds an
+> open SSE connection, and a long-lived stream keeps Node's event loop alive
+> after the assertions finish. The suite also needs a git binary on `PATH`.
+
+## Contributing
+
+Issues and pull requests are welcome. If you change observable behaviour, update
+`PROTOCOL.md` in the same commit — that file is the contract three components
+agree on.
+
+## License
+
+[MIT](LICENSE)
+
+---
+
+## 中文说明
+
+**同一个 DeepSeek 账号，一条指令，让在线的 Windows 与 Mac 跑同一个项目。**
+
+### 为什么需要它
+
+DSH 目前**不能**跨机器协作，而且不是疏忽：
+
+- 一个 `dsh` 进程只服务**一台机器**（一个 profile 就是一个本地 pnpm workspace）；
+- 传输层是**仅回环**的（web 服务器只接受 `127.0.0.1`/`0.0.0.0`，CLI 明确拒绝 `--host 0.0.0.0`，因为它自身不带 TLS 与来源策略）；
+- 官方 agent-team 明确**不支持** teammates 各自独立的工作目录，也**不支持多个进程协作同一个 team**。
+
+所以跨机器能力必须自建。这就是那个实现。
+
+### 核心设计
+
+| 设计 | 理由 |
+|---|---|
+| **星型中继 + 反向连接** | 两端只做出站连接：不需要公网 IP、不改防火墙、Windows 没有 `sshd` 也不影响 |
+| **默认只读**（`replicate` 且 `write: false`） | 一次性消除重复提交、覆盖写、推送竞争这三类最常见的事故 |
+| **三锚校验** | 实测：脏工作区上 `git checkout --detach <sha>` **退出码 0 却保留本地改动** —— 只看 commit SHA 会把"不是同一份代码"误判成"结果分歧" |
+| **六态聚合** | "环境不同"与"结果不同"是两件事，合并记账会把噪声当 bug |
+| **能力不匹配 → `refused`** | 拒绝执行，而不是静默降级 |
+| **长租约 + 进度心跳** | 固定超时会让跑 40 分钟的机器被判死并重投 → **两台同时跑、同时产生副作用** |
+| **零第三方运行时依赖** | 只用 `node:` 内置模块；下行 SSE + 上行 POST，不用 WebSocket |
+
+### 快速开始
+
+```bash
+# 1) 中继（任一台常开的机器，一次）
+node bin/w2m-rabbit.mjs --host 0.0.0.0 --port 8787 --state ~/.dsh/xclient/rabbit
+#    它会打印一次性配对码 PAIR-XXXXXXXX
+
+# 2) 每台参与机器（在其项目目录所在机器上跑）
+node bin/w2m-localside.mjs --rabbit http://<中继地址>:8787 --pair PAIR-XXXXXXXX \
+  --project /path/to/your/project --name win-desktop \
+  --allowed-commands '["node --test","git status --porcelain"]'
+
+# 3) 装 DSH 插件
+dsh plugin --profile <profile-name> add @twinsearth/w2m-dsh-plugin@0.0.1
+```
+
+然后在 profile 的 `cordis.patch.yml` 里给插件 `rabbitUrl`，重启 DSH，即可直接用自然语言指挥：
+
+> 列出我的机器，然后在所有机器上跑 `node --test`，告诉我输出是否一致。
+
+### 项目前置条件
+
+项目根必须有 `.gitattributes` 写 `* text=auto eol=lf`，否则两台机器的指纹永远不一致（实测：加了之后 `autocrlf=true` 与 `=false` 两种配置的工作区字节完全相同）。
+
+### 已实测 / 未实测
+
+- ✅ **Windows 上已实测**：中继（配对、鉴权、SSE 首帧 ready 与按 seq 重放、租约续期与过期、去重、六态、报告）、执行侧（白名单、超时、输出截断、退出码、干净/脏工作区锚、四路并发指纹、spool）、以及双 worktree 双 Localside 的端到端真实执行。
+- ⚠️ **macOS 未实测**：代码是平台中立的（`node:path`、无 shell 的 `spawn`、`fetch`），但请勿把"已移植"读成"已测试"。
+- ⚠️ **单账号驱动两台机器的模型会话未实测**：本版本执行的是**确定性命令**，不向远端 DSH 会话注入 prompt。同账号能否并发跑两个模型会话取决于你的账号额度，本项目未验证。
+
+### 许可
+
+[MIT](LICENSE)

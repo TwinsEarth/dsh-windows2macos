@@ -1,0 +1,35 @@
+# Node
+node_modules/
+npm-debug.log*
+pnpm-debug.log*
+yarn-error.log*
+
+# Runtime state produced by the relay and by each machine's Localside.
+# Never commit these: device.json holds a device token.
+.w2m/
+*.spool
+spool/
+state/
+*.log
+
+# Test scratch space
+e2e-tmp/
+test-tmp/
+coverage/
+
+# Build output. The release tarball is uploaded to the GitHub Release as an
+# asset rather than committed: a binary in the tree would be a second copy to
+# keep in sync, and `scripts/pack.mjs` reproduces it byte-for-byte from source.
+dist/
+
+# OS noise
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors
+.vscode/*
+!.vscode/settings.json.example
+.idea/
+*.swp
+*~

@@ -1,0 +1,21 @@
+# Your patch layer for this dsh profile, applied after every bundle layer.
+#
+# This file is the bundle patch declared by package.json's `dsh.bundle.patch`.
+# It mounts the plugin explicitly at `./tools` rather than relying on a
+# "root export is the plugin" convention, so reading this file tells you which
+# module of the package becomes the plugin.
+#
+# The relay URL is deliberately left for the user: a plugin that guessed an
+# endpoint would be a plugin that silently talked to the wrong machine.
+# Set it in your own profile patch (see README, "Install"), for example:
+#
+#   - id: w2m
+#     config:
+#       rabbitUrl: http://127.0.0.1:8787
+#       stateDir: !!js (process.env.DSH_HOME + '/xclient')
+- id: w2m
+  name: '@twinsearth/w2m-dsh-plugin/tools'
+  config:
+    autoStartAgent: false
+    machineName: ''
+    allowedCommands: []

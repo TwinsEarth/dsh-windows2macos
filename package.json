@@ -1,0 +1,78 @@
+{
+  "name": "@twinsearth/w2m-dsh-plugin",
+  "version": "0.0.1",
+  "description": "DSH: Windows2MacOS — drive the same project on online Windows and macOS machines from one DeepSeek account. Rabbit relay + per-machine Localside + five DSH tools (replicate / split).",
+  "type": "module",
+  "main": "lib/index.js",
+  "bin": {
+    "w2m-rabbit": "bin/w2m-rabbit.mjs",
+    "w2m-localside": "bin/w2m-localside.mjs"
+  },
+  "exports": {
+    ".": "./lib/index.js",
+    "./tools": "./lib/tools.js",
+    "./rabbit": "./bin/w2m-rabbit.mjs",
+    "./localside": "./bin/w2m-localside.mjs",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "src",
+    "bin",
+    "cordis.patch.yml",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "PROTOCOL.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {},
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    }
+  },
+  "scripts": {
+    "test": "node --test test/",
+    "test:relay": "node --test test/relay.test.mjs",
+    "test:agent": "node --test test/agent.test.mjs",
+    "test:tools": "node --test test/tools.test.mjs",
+    "test:e2e": "node --test test/e2e.test.mjs",
+    "verify": "node --test test/"
+  },
+  "keywords": [
+    "dsh-bundle",
+    "dsh-plugin",
+    "deepseek-harness",
+    "deepseek",
+    "windows2macos",
+    "w2m",
+    "cross-platform",
+    "multi-machine",
+    "orchestration",
+    "replicate",
+    "sharding"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TwinsEarth/dsh-windows2macos.git"
+  },
+  "homepage": "https://github.com/TwinsEarth/dsh-windows2macos",
+  "bugs": {
+    "url": "https://github.com/TwinsEarth/dsh-windows2macos/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "MIT"
+}

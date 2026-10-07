@@ -1,0 +1,435 @@
+/**
+ * W2M Rabbit relay — §6.3 six-state aggregation + markdown/JSON reports.
+ *
+ * The step order is part of the contract: Step 0 → Step 1 → Step 2 → Step 3.
+ * Steps are NEVER merged, because the order changes the verdict.
+ */
+
+import {
+  COMPARABLE_FIELDS,
+  FAILURE_STATUSES,
+  ProtocolError,
+  PROTOCOL_VERSION,
+  jcs,
+  rfc3339,
+} from './state.mjs';
+
+/** Aggregate statuses this module can return. */
+export const AGGREGATE_STATUSES = Object.freeze([
+  'consistent',
+  'divergent',
+  'divergent-platform',
+  'failed',
+  'partial',
+  'unverifiable',
+  // not one of §6.3's six states, but a task can legitimately have no verdict yet
+  'refused',
+  'pending',
+]);
+
+/** Comparable fields that are derived purely from the stdout byte stream. */
+const STDOUT_DERIVED_FIELDS = Object.freeze([
+  'stdout_sha256',
+  'stdout_bytes',
+  'stdout_normalized_sha256',
+]);
+
+function valueOf(envelope, field) {
+  return envelope === null || envelope === undefined ? undefined : envelope[field];
+}
+
+function canon(value) {
+  return value === undefined ? '<absent>' : jcs(value);
+}
+
+function truncate(text, max = 160) {
+  const s = typeof text === 'string' ? text : String(text);
+  return s.length <= max ? s : `${s.slice(0, max - 1)}…`;
+}
+
+/**
+ * §6.3 six-state aggregation.
+ *
+ * @param {object} task            Rabbit task record (state.mjs `createTask` result)
+ * @param {Iterable<object>} resultRecords  result records from `RabbitState#results`
+ * @param {{nowMs?:number}} [opts]
+ * @returns {object} aggregation report data
+ */
+export function aggregate(task, resultRecords = [], opts = {}) {
+  if (!task) throw new ProtocolError('NOT_FOUND', 'task is required for aggregation');
+  const nowMs = opts.nowMs ?? Date.now();
+
+  const records = [...resultRecords].filter((r) => r?.envelope?.task_id === task.task_id);
+  // latest attempt per machine wins
+  const byMachine = new Map();
+  for (const rec of records) {
+    const prev = byMachine.get(rec.machine_id);
+    if (!prev || rec.received_at_ms >= prev.received_at_ms) byMachine.set(rec.machine_id, rec);
+  }
+
+  const expected = {
+    base_commit: task.base_commit ?? null,
+    base_tree: task.base_tree ?? null,
+    command_hash: task.command_hash ?? null,
+  };
+
+  const machines = [];
+  for (const lease of task.leases.values()) {
+    const rec = byMachine.get(lease.machine_id) ?? null;
+    machines.push({
+      machine_id: lease.machine_id,
+      machine_name: lease.machine_name ?? null,
+      index: lease.index,
+      attempt: lease.attempt,
+      lease_state: lease.state,
+      lease_expired: lease.state === 'expired',
+      refused_reason: lease.refusal_reason ?? null,
+      gate_refused: lease.state === 'refused',
+      result: rec,
+      envelope: rec?.envelope ?? null,
+      outcome: null,
+      reasons: [],
+    });
+  }
+  // results from machines with no lease (e.g. takeover / manual upload)
+  for (const [machineId, rec] of byMachine) {
+    if (machines.some((m) => m.machine_id === machineId)) continue;
+    machines.push({
+      machine_id: machineId,
+      machine_name: rec.envelope.machine_name ?? null,
+      index: rec.envelope.index ?? null,
+      attempt: rec.attempt,
+      lease_state: 'unleased',
+      lease_expired: false,
+      refused_reason: rec.envelope.refusal_reason ?? null,
+      gate_refused: false,
+      result: rec,
+      envelope: rec.envelope,
+      outcome: null,
+      reasons: [],
+    });
+  }
+
+  const steps = [];
+  const notes = [];
+
+  /* -------- Step 0: refusals are booked per machine, they never block others -------- */
+  const step0 = { step: 0, name: 'refusal', refused: [], passed: [] };
+  for (const m of machines) {
+    const refusedByGate = m.gate_refused;
+    const refusedByEnvelope = m.envelope?.status === 'refused';
+    if (refusedByGate || refusedByEnvelope) {
+      m.outcome = 'refused';
+      m.refusal_reason = refusedByGate
+        ? (m.refused_reason ?? 'REFUSED')
+        : (m.envelope.refusal_reason ?? 'REFUSED');
+      step0.refused.push({ machine_id: m.machine_id, refusal_reason: m.refusal_reason });
+    } else {
+      step0.passed.push(m.machine_id);
+    }
+  }
+  steps.push(step0);
+
+  const participants = machines.filter((m) => m.outcome !== 'refused');
+
+  /* -------- Step 1: anchors — any violation refuses aggregation entirely -------- */
+  const step1 = { step: 1, name: 'anchors', violations: [], passed: [], pending: [] };
+  for (const m of participants) {
+    const env = m.envelope;
+    if (!env) {
+      const expired = m.lease_expired;
+      m.outcome = expired ? 'expired' : 'pending';
+      step1.pending.push(m.machine_id);
+      continue;
+    }
+    const validation = m.result?.validation ?? { missing: [], problems: [] };
+    const missing = [...(validation.missing ?? [])];
+    if (m.result?.effective_status === 'unverifiable' && missing.length === 0) {
+      m.reasons.push('envelope status = unverifiable');
+    }
+    if (missing.length > 0) m.reasons.push(`missing required fields: ${missing.join(',')}`);
+    if (canon(valueOf(env, 'base_commit')) !== canon(expected.base_commit)) {
+      m.reasons.push(`base_commit ${truncate(canon(env.base_commit), 24)} != expected ${truncate(canon(expected.base_commit), 24)}`);
+    }
+    if (expected.base_tree !== null && canon(valueOf(env, 'pre_tree_fingerprint')) !== canon(expected.base_tree)) {
+      m.reasons.push('pre_tree_fingerprint != base_tree');
+    }
+    if (canon(valueOf(env, 'command_hash')) !== canon(expected.command_hash)) {
+      m.reasons.push('command_hash mismatch');
+    }
+    if (env.status === 'unverifiable' && m.reasons.length === 0) {
+      m.reasons.push('envelope status = unverifiable');
+    }
+    if (m.reasons.length > 0) {
+      m.outcome = 'unverifiable';
+      step1.violations.push({ machine_id: m.machine_id, reasons: [...m.reasons] });
+    } else {
+      m.outcome = 'ok-pending-step2';
+      step1.passed.push(m.machine_id);
+    }
+  }
+  steps.push(step1);
+
+  const runnable = participants.filter((m) => m.outcome === 'ok-pending-step2');
+  const expiredMachines = participants.filter((m) => m.outcome === 'expired');
+  const pendingMachines = participants.filter((m) => m.outcome === 'pending');
+
+  let status;
+  const step2 = { step: 2, name: 'execution', ok: [], failed: [], partial: false, expired: [], pending: [] };
+  const step3 = { step: 3, name: 'comparison', differences: [], consistent: false, platform_only: false };
+
+  if (step1.violations.length > 0) {
+    /* §6.3 Step 1: 拒绝汇总 */
+    status = 'unverifiable';
+    step2.skipped = 'step1_unverifiable';
+    step3.skipped = 'step1_unverifiable';
+    notes.push('aggregation refused: Step 1 anchor violation (see unverifiable machines)');
+  } else if (runnable.length === 0 && expiredMachines.length === 0 && pendingMachines.length === 0 && step0.refused.length > 0) {
+    status = 'refused';
+    step2.skipped = 'all_refused';
+    step3.skipped = 'all_refused';
+  } else if (runnable.length === 0 && expiredMachines.length === 0) {
+    status = 'pending';
+    step2.skipped = 'no_results_yet';
+    step3.skipped = 'no_results_yet';
+    notes.push('no result envelope has been received yet');
+  } else {
+    for (const m of runnable) {
+      const s = m.envelope.status;
+      if (s === 'ok') { m.outcome = 'ok'; step2.ok.push(m.machine_id); }
+      else {
+        // {nonzero_exit,timeout,crashed} plus anything outside the §5.1 enum
+        m.outcome = 'failed';
+        step2.failed.push({
+          machine_id: m.machine_id,
+          status: s,
+          exit_code: m.envelope.exit_code ?? null,
+          known_failure: FAILURE_STATUSES.includes(s),
+        });
+      }
+    }
+    for (const m of expiredMachines) step2.expired.push(m.machine_id);
+    for (const m of pendingMachines) step2.pending.push(m.machine_id);
+
+    if (step2.expired.length > 0) {
+      /* §4.3: halt=never → booked and marked partial */
+      status = 'partial';
+      step2.partial = true;
+      notes.push(`lease expired on ${step2.expired.length} machine(s) → partial (§4.3)`);
+      step3.skipped = 'lease_expired';
+    } else if (step2.pending.length > 0) {
+      status = 'partial';
+      step2.partial = true;
+      notes.push(`waiting for ${step2.pending.length} machine(s) to report`);
+      step3.skipped = 'machines_pending';
+    } else if (step2.failed.length === 0 && step2.ok.length > 0) {
+      /* §6.3 Step 2: 全部 ok → Step 3 */
+      const okMachines = runnable.filter((m) => m.outcome === 'ok');
+      const comparable = {};
+      for (const field of COMPARABLE_FIELDS) {
+        comparable[field] = {};
+        for (const m of okMachines) {
+          const v = valueOf(m.envelope, field);
+          if (v !== undefined) comparable[field][m.machine_id] = v;
+        }
+      }
+      const differences = [];
+      for (const field of COMPARABLE_FIELDS) {
+        const values = okMachines.map((m) => canon(valueOf(m.envelope, field)));
+        if (values.length > 1 && values.some((v) => v !== values[0])) {
+          differences.push({
+            field,
+            values: Object.fromEntries(okMachines.map((m) => [m.machine_id, valueOf(m.envelope, field)])),
+          });
+        }
+      }
+      step3.comparable = comparable;
+      step3.differences = differences;
+
+      const metaDiffers = (field) => {
+        const vals = okMachines.map((m) => canon(valueOf(m.envelope, field)));
+        return vals.length > 1 && vals.some((v) => v !== vals[0]);
+      };
+      const platformMetaDiffers = metaDiffers('toolchain') || metaDiffers('platform');
+
+      if (differences.length === 0) {
+        status = 'consistent';
+        step3.consistent = true;
+      } else if (platformMetaDiffers && differences.every((d) => STDOUT_DERIVED_FIELDS.includes(d.field))) {
+        /* §6.3 Step 3: expected — only toolchain/platform differ and the drift is stdout-only */
+        status = 'divergent-platform';
+        step3.platform_only = true;
+        notes.push('divergence is confined to stdout bytes across differing toolchain/platform (expected, no alert)');
+      } else {
+        status = 'divergent';
+        notes.push(`divergent fields: ${differences.map((d) => d.field).join(', ')}`);
+      }
+    } else if (step2.ok.length > 0) {
+      /* §6.3 Step 2: 部分 ok、部分失败 → partial */
+      status = 'partial';
+      step2.partial = true;
+    } else {
+      /* §6.3 Step 2: 全部失败 → failed */
+      status = 'failed';
+    }
+  }
+
+  steps.push(step2);
+  steps.push(step3);
+
+  return {
+    protocol_version: PROTOCOL_VERSION,
+    task_id: task.task_id,
+    status,
+    computed_at: rfc3339(nowMs),
+    mode: task.mode,
+    index_total: task.index_total,
+    halt: task.halt,
+    write: task.write,
+    created_at: rfc3339(task.created_at_ms),
+    created_by: task.created_by ?? null,
+    cancelled: task.cancelled === true,
+    expected,
+    machines: machines.map((m) => ({
+      machine_id: m.machine_id,
+      machine_name: m.machine_name,
+      index: m.index,
+      attempt: m.attempt,
+      lease_state: m.lease_state,
+      outcome: m.outcome,
+      status: m.envelope?.status ?? null,
+      refusal_reason: m.refusal_reason ?? null,
+      exit_code: m.envelope?.exit_code ?? null,
+      reasons: m.reasons,
+    })),
+    steps,
+    differences: step3.differences ?? [],
+    notes,
+    counts: {
+      refused: step0.refused.length,
+      unverifiable: step1.violations.length,
+      ok: step2.ok?.length ?? 0,
+      failed: step2.failed?.length ?? 0,
+      expired: step2.expired?.length ?? 0,
+      pending: step2.pending?.length ?? 0,
+    },
+  };
+}
+
+/** Convenience wrapper: pull the task + its results out of a RabbitState. */
+export function aggregateTask(state, taskId, opts = {}) {
+  const task = state.getTask(taskId);
+  if (!task) throw new ProtocolError('NOT_FOUND', 'unknown task_id', { task_id: taskId });
+  return aggregate(task, state.results.values(), opts);
+}
+
+const STATUS_LABEL = Object.freeze({
+  consistent: '✅ consistent',
+  divergent: '❌ divergent',
+  'divergent-platform': '🟡 divergent-platform',
+  failed: '❌ failed',
+  partial: '🟠 partial',
+  unverifiable: '⚠️ unverifiable',
+  refused: '⛔ refused',
+  pending: '⏳ pending',
+});
+
+function fmt(value) {
+  if (value === undefined) return '—';
+  if (value === null) return 'null';
+  if (typeof value === 'string') return value.length > 80 ? `${value.slice(0, 79)}…` : value;
+  return truncate(jcs(value), 80);
+}
+
+/** Markdown summary report (GET /v1/tasks/{id}/report?format=md). */
+export function renderReportMarkdown(agg, task = null) {
+  const L = [];
+  L.push(`# W2M 汇总报告 — \`${agg.task_id}\``);
+  L.push('');
+  L.push(`**判定：${STATUS_LABEL[agg.status] ?? agg.status}**`);
+  L.push('');
+  L.push('| 字段 | 值 |');
+  L.push('|---|---|');
+  L.push(`| protocol_version | ${agg.protocol_version} |`);
+  L.push(`| 模式 | ${agg.mode} |`);
+  L.push(`| index_total | ${agg.index_total} |`);
+  L.push(`| 写入 | ${agg.write} |`);
+  L.push(`| halt | ${agg.halt} |`);
+  L.push(`| 创建者 | ${fmt(agg.created_by)} |`);
+  L.push(`| 创建时间 | ${agg.created_at} |`);
+  L.push(`| 汇总时间 | ${agg.computed_at} |`);
+  L.push(`| base_commit | \`${fmt(agg.expected.base_commit)}\` |`);
+  L.push(`| base_tree | \`${fmt(agg.expected.base_tree)}\` |`);
+  L.push(`| command_hash | \`${fmt(agg.expected.command_hash)}\` |`);
+  L.push('');
+  L.push('## 逐机结果');
+  L.push('');
+  L.push('| machine_id | index | lease | 判定 | status | exit_code | 说明 |');
+  L.push('|---|---|---|---|---|---|---|');
+  for (const m of agg.machines) {
+    L.push(`| \`${m.machine_id}\` | ${fmt(m.index)} | ${m.lease_state} | ${m.outcome ?? '—'} | ${fmt(m.status)} `
+      + `| ${fmt(m.exit_code)} | ${m.reasons.length ? m.reasons.join('; ') : (m.refusal_reason ?? '')} |`);
+  }
+  L.push('');
+  if (agg.differences.length > 0) {
+    L.push('## 可比字段差异');
+    L.push('');
+    for (const d of agg.differences) {
+      L.push(`### \`${d.field}\``);
+      L.push('');
+      L.push('| machine_id | value |');
+      L.push('|---|---|');
+      for (const [machine, value] of Object.entries(d.values)) {
+        L.push(`| \`${machine}\` | \`${fmt(value)}\` |`);
+      }
+      L.push('');
+    }
+  }
+  L.push('## 判定步骤（§6.3，顺序不可合并）');
+  L.push('');
+  for (const s of agg.steps) {
+    L.push(`- **Step ${s.step} · ${s.name}** — ${truncate(jcs(s), 400)}`);
+  }
+  L.push('');
+  if (agg.notes.length > 0) {
+    L.push('## 备注');
+    L.push('');
+    for (const n of agg.notes) L.push(`- ${n}`);
+    L.push('');
+  }
+  if (task) {
+    L.push('## 原始命令');
+    L.push('');
+    L.push('```');
+    L.push(jcs(task.command_argv));
+    L.push('```');
+    L.push('');
+  }
+  return L.join('\n');
+}
+
+/** JSON report (GET /v1/tasks/{id}/report?format=json). */
+export function renderReportJson(agg) {
+  return JSON.stringify(agg, null, 2);
+}
+
+/**
+ * Build a report of the requested format.
+ * @returns {{contentType:string, body:string, aggregate:object}}
+ */
+export function buildReport(state, taskId, { format = 'json', nowMs } = {}) {
+  const agg = aggregateTask(state, taskId, { nowMs });
+  const task = state.getTask(taskId);
+  if (format === 'md' || format === 'markdown') {
+    return { contentType: 'text/markdown; charset=utf-8', body: renderReportMarkdown(agg, task), aggregate: agg };
+  }
+  if (format === 'json') {
+    return { contentType: 'application/json; charset=utf-8', body: renderReportJson(agg), aggregate: agg };
+  }
+  throw new ProtocolError('BAD_REQUEST', 'format must be md|json', { format });
+}
+
+/** Machine-readable verdict used by GET /v1/tasks/{id}. */
+export function taskStatus(state, taskId, opts = {}) {
+  return aggregateTask(state, taskId, opts);
+}
