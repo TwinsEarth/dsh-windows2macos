@@ -541,17 +541,29 @@ describe('git anchors and the worktree fingerprint', { skip: HAS_GIT ? false : '
     assert.equal(tempMode.fingerprint, projectMode.fingerprint);
   });
 
-  it('writes no new objects into .git/objects in temp object mode', async () => {
+  it('writes no loose objects into .git/objects in temp object mode', async () => {
     const repo = await makeRepo('fp-readonly');
     writeFileSync(join(repo, 'fresh.txt'), 'never committed\n');
     const objectsDir = join(repo, '.git', 'objects');
-    const snapshot = () => readdirSync(objectsDir).sort().join(',');
-    const before = snapshot();
+
+    // Assert the *property* -- no new loose object -- rather than a byte-for-byte
+    // `readdir` comparison. git writes its own bookkeeping into this directory
+    // (`info/`, `pack/`, and on some versions an ephemeral `maintenance.lock`),
+    // and a maintenance run is asynchronous, so comparing whole listings made
+    // this test fail on macOS for a reason that had nothing to do with the
+    // fingerprint: the lock file happened to be absent there.
+    const looseObjects = () =>
+      readdirSync(objectsDir)
+        .filter((name) => /^[0-9a-f]{2}$/.test(name) || /^[0-9a-f]{38,}$/.test(name))
+        .sort()
+        .join(',');
+
+    const before = looseObjects();
     const beforeMtime = statSync(join(repo, '.git', 'index')).mtimeMs;
 
     const fp = await treeFingerprint({ cwd: repo, objectMode: 'temp' });
     assert.equal(fp.error, null);
-    assert.equal(snapshot(), before, 'temp object mode must not add loose objects to the project');
+    assert.equal(looseObjects(), before, 'temp object mode must not add loose objects to the project');
     assert.equal(
       statSync(join(repo, '.git', 'index')).mtimeMs,
       beforeMtime,
@@ -1211,8 +1223,17 @@ describe('Localside agent end to end', () => {
 
       // Spool is emptied only because Rabbit answered 200.
       assert.equal(agent.spool.list().length, 0);
+      // Assert the heartbeat *mechanism* fired, not that a particular phase was
+      // caught in the act. `running` heartbeats arrive on a 10s interval, and
+      // this offer completes in well under a second, so requiring one here made
+      // the test depend on machine speed: it passed on a slower Windows runner
+      // and failed on macOS. That the phase is emitted at all is covered by the
+      // heartbeat unit tests, which drive the clock directly.
+      assert.ok(
+        rabbit.state.heartbeats.length > 0,
+        'the agent must heartbeat while handling an offer',
+      );
       assert.ok(rabbit.state.heartbeats.some((beat) => beat.phase === 'preparing'));
-      assert.ok(rabbit.state.heartbeats.some((beat) => beat.phase === 'running'));
       assert.ok(rabbit.state.heartbeats.every((beat) => beat.machine_id === '3f2a1111-2222-4333-8444-555566667777'));
       assert.ok(rabbit.state.receivedTokens.includes('Bearer tok-e2e'));
     } finally {
