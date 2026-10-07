@@ -240,6 +240,16 @@ This project's rule is that claims carry their evidence.
 
 Run them with `scripts/verify.ps1` (Windows) or `scripts/verify.sh` (macOS/Linux).
 
+Two extra gates exist because "it installed" is not "it loads" — the first
+version of this package shipped a re-export naming a symbol that did not exist,
+and it passed `node --check` and every unit test, failing only when DSH mounted
+the plugin:
+
+```bash
+node scripts/check-entrypoints.mjs   # imports lib/tools.js, the exact specifier cordis.patch.yml mounts
+node scripts/verify-installed.mjs <path-to-installed-package>   # asserts the installed copy registers 5 tools
+```
+
 **Not verified:**
 
 - **macOS.** Every measurement above was taken on Windows. The code is
