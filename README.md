@@ -4,10 +4,12 @@
 
 English | [中文](#中文说明)
 
+[![CI](https://github.com/TwinsEarth/dsh-windows2macos/actions/workflows/ci.yml/badge.svg)](https://github.com/TwinsEarth/dsh-windows2macos/actions/workflows/ci.yml)
 [![DSH plugin](https://img.shields.io/badge/DSH-plugin-4c6ef5)](#install)
 [![version](https://img.shields.io/badge/version-0.0.1-blue)](#changelog)
 [![dependencies](https://img.shields.io/badge/runtime%20dependencies-0-brightgreen)](#design-notes)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![platforms](https://img.shields.io/badge/CI-windows%20%7C%20macos%20%7C%20linux-4c6ef5)](#verified-and-not-verified)
 
 ---
 
@@ -222,23 +224,33 @@ Read this before binding to `0.0.0.0`.
 
 This project's rule is that claims carry their evidence.
 
-**Verified on Windows** (this release):
+**The same suites run on three platforms in CI** — see the badge above, or
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml). The matrix is
+`windows-latest` × node 20/22, `macos-latest` × node 22, `ubuntu-latest` ×
+node 22. That matters here more than in most projects: a Windows-and-macOS
+coordination tool whose macOS half had never been executed would be a claim, not
+a product.
 
-- relay: 61 tests — pairing, auth, SSE with `ready`-first and `seq` replay,
-  leases with heartbeat renewal and expiry, dedupe, all six aggregation states,
-  report generation;
-- agent: 79 tests — whitelist allow/deny, timeout, output truncation, exit codes,
-  anchors on clean and dirty trees, four concurrent fingerprint computations,
-  spool;
-- plugin: 45 tests — five tools registered, schemas, typed errors, polling;
-- end to end: 10 tests — two Localsides on two checkouts against one relay
-  running real commands, covering consistent / divergent / failed / refused /
-  unverifiable / deduped / long-lease / split;
+| Suite | Tests | What it covers |
+|---|---|---|
+| relay | 61 | pairing, auth, SSE with `ready`-first and `seq` replay, leases with heartbeat renewal and expiry, dedupe, all six aggregation states, report generation |
+| agent | 79 | whitelist allow/deny, timeout, output truncation, exit codes, anchors on clean and dirty trees, four concurrent fingerprint computations, spool |
+| plugin | 45 | five tools registered, schemas, typed errors, polling |
+| end to end | 10 | two Localsides on two checkouts against one relay running real commands: consistent / divergent / failed / refused / unverifiable / deduped / long-lease / split |
+
+Run them with `scripts/verify.ps1` (Windows) or `scripts/verify.sh` (macOS/Linux).
+One agent test skips on Windows — it asserts POSIX mode bits, which NTFS does not
+carry — so the count there is 78 pass + 1 skip.
+
+Two behaviours are checked but not covered by a test file, because both concern
+the real binaries rather than the modules:
+
 - **CLI smoke test** (`scripts/smoke-cli.ps1`): real `w2m-rabbit` plus two real
   `w2m-localside` processes, ending in a `consistent` verdict and a rendered
   markdown report.
-
-Run them with `scripts/verify.ps1` (Windows) or `scripts/verify.sh` (macOS/Linux).
+- **Release-artifact reproducibility**: CI packs the sources twice and fails if
+  the two tarballs differ, so a published hash is a statement about the sources
+  rather than about when the command ran.
 
 Two extra gates exist because "it installed" is not "it loads" — the first
 version of this package shipped a re-export naming a symbol that did not exist,
@@ -252,13 +264,17 @@ node scripts/verify-installed.mjs <path-to-installed-package>   # asserts the in
 
 **Not verified:**
 
-- **macOS.** Every measurement above was taken on Windows. The code is
-  platform-neutral (`node:path`, `spawn` without a shell, `fetch`), but do not
-  read "ported" as "tested".
+- **A real Windows↔macOS pair.** The CI matrix proves each platform runs the
+  suites, but the two halves of a matrix job never talk to each other: CI does
+  not pair a Windows runner with a macOS runner over the network. The
+  machine-to-machine link has only been exercised between two processes on one
+  host. Burn-in on your own two machines is still the last step.
 - **A single account driving both machines' model sessions.** This release
   executes commands deterministically; it does not inject prompts into a remote
   DSH session. Whether one account can run two concurrent model sessions at once
   depends on your account's limits and is untested here.
+- **`write: true`.** A write-enabled task is executed, but there is no branch
+  merge in 0.0.1.
 
 ## Design notes
 
@@ -355,8 +371,10 @@ dsh plugin --profile <profile-name> add @twinsearth/w2m-dsh-plugin@0.0.1
 ### 已实测 / 未实测
 
 - ✅ **Windows 上已实测**：中继（配对、鉴权、SSE 首帧 ready 与按 seq 重放、租约续期与过期、去重、六态、报告）、执行侧（白名单、超时、输出截断、退出码、干净/脏工作区锚、四路并发指纹、spool）、以及双 worktree 双 Localside 的端到端真实执行。
-- ⚠️ **macOS 未实测**：代码是平台中立的（`node:path`、无 shell 的 `spawn`、`fetch`），但请勿把"已移植"读成"已测试"。
+- ✅ **三平台 CI**：同一套用例在 `windows-latest`（node 20/22）、`macos-latest`（node 22）、`ubuntu-latest`（node 22）上跑，见上方徽章与 `.github/workflows/ci.yml`。
+- ⚠️ **真实的 Windows↔macOS 互联未实测**：CI 矩阵只证明**各平台都能跑**这套代码；矩阵里的两台机器**并不会互相通信**。真正的机器到机器链路目前仅在**同一台主机上的两个进程之间**验证过。最后一步仍建议在你自己的两台机器上跑一次。
 - ⚠️ **单账号驱动两台机器的模型会话未实测**：本版本执行的是**确定性命令**，不向远端 DSH 会话注入 prompt。同账号能否并发跑两个模型会话取决于你的账号额度，本项目未验证。
+- ⚠️ **`write: true` 不合并**：写模式的任务会执行，但 0.0.1 没有分支合并。
 
 ### 许可
 

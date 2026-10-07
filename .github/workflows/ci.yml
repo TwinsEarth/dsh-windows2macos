@@ -1,0 +1,134 @@
+name: CI
+
+# Runs on every push and pull request.
+#
+# The matrix is not decoration. This project claims to drive a Windows machine
+# and a macOS machine, and until this workflow existed every measurement had been
+# taken on Windows only -- the README said so. Running the same suites on
+# macos-latest and ubuntu-latest is what turns "ported" into "tested", and it is
+# the cheapest way to find out that a path separator, a line ending or a missing
+# tool assumption was baked in somewhere.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One failing platform must not hide the others: the interesting
+      # information in a cross-platform project is exactly *which* platform
+      # failed, so let them all finish.
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+        # 20 is the floor declared in package.json engines; 22 is what most
+        # users will have. The suite also runs on 24 locally.
+        node: ['20', '22']
+        exclude:
+          # The floor and the common case are both worth testing, but not on
+          # every OS -- that would be 9 jobs for no extra signal.
+          - os: ubuntu-latest
+            node: '20'
+          - os: macos-latest
+            node: '20'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Report environment
+        shell: bash
+        run: |
+          node --version
+          npm --version || true
+          git --version
+          echo "platform: $RUNNER_OS"
+
+      # The test fixtures create throwaway git repositories and commit to them.
+      # GitHub runners have no global identity configured, and `git commit`
+      # fails without one. These are deliberately fake values.
+      - name: Configure a git identity for the test fixtures
+        shell: bash
+        run: |
+          git config --global user.name "ci"
+          git config --global user.email "ci@example.invalid"
+          git config --global init.defaultBranch main
+          # Make the line-ending behaviour explicit rather than runner-dependent:
+          # the end-to-end suite asserts that two checkouts fingerprint
+          # identically, and an inherited autocrlf setting would make that flaky
+          # for reasons that have nothing to do with this project.
+          git config --global core.autocrlf false
+
+      - name: Entry points import (the specifier cordis.patch.yml mounts)
+        working-directory: .
+        run: node scripts/check-entrypoints.mjs
+
+      - name: Install the package and assert it registers five tools
+        shell: bash
+        run: node scripts/verify-installed.mjs "$(pwd)"
+
+      - name: Unit suites (relay / agent / plugin)
+        run: node --test test/relay.test.mjs test/agent.test.mjs test/tools.test.mjs
+
+      - name: End-to-end suite
+        # --test-force-exit is required: each simulated machine holds an open SSE
+        # connection, which keeps the event loop alive after the assertions pass.
+        run: node --test --test-force-exit test/e2e.test.mjs
+
+      - name: Packer reproduces the manifest (and refuses missing paths)
+        run: node scripts/pack.mjs --out dist
+
+  pack:
+    name: release artifact is reproducible
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # A published tarball whose hash cannot be reproduced from source is a
+      # tarball nobody can verify. Packing twice must produce identical bytes,
+      # which is the property scripts/pack.mjs is built around.
+      - name: Pack twice and compare
+        run: |
+          node scripts/pack.mjs --out dist-a
+          node scripts/pack.mjs --out dist-b
+          a=$(sha256sum dist-a/*.tgz | cut -d' ' -f1)
+          b=$(sha256sum dist-b/*.tgz | cut -d' ' -f1)
+          echo "first : $a"
+          echo "second: $b"
+          if [ "$a" != "$b" ]; then
+            echo "::error::packing the same sources twice produced different bytes"
+            exit 1
+          fi
+          echo "reproducible: $a"
+
+      - name: The manifest's declared paths all exist
+        run: node -e "
+          const m = require('./package.json');
+          const fs = require('fs');
+          const missing = [];
+          for (const [k, v] of Object.entries(m.bin ?? {})) if (!fs.existsSync(v)) missing.push('bin.' + k + ' -> ' + v);
+          for (const [k, v] of Object.entries(m.exports ?? {})) {
+            if (typeof v === 'string' && v.startsWith('./') && !fs.existsSync(v)) missing.push('exports.' + k + ' -> ' + v);
+          }
+          if (missing.length) { console.error('missing:', missing.join(', ')); process.exit(1); }
+          console.log('all manifest paths exist');
+          "
