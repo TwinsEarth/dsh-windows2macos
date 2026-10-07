@@ -13,8 +13,10 @@
 | 首版提交 | `35fcdc8` DSH: Windows2MacOS v0.0.1（33 文件 / 13,825 行） | `git log` |
 | 修复提交 | `dbaad9a` 修复插件 re-export 与 CLI 工厂名 + 新增两个门禁 | `git log` |
 | Release | https://github.com/TwinsEarth/dsh-windows2macos/releases/tag/v0.0.1 | tag `v0.0.1` |
-| 资产 | `twinsearth-w2m-dsh-plugin-0.0.1.tgz`（93,847 B）+ `SHA256SUMS` | `state=uploaded` |
-| tarball sha256 | `7b3edbb32c29ef3ced32cfec91708a6292dc96d47d23973f68d534f6be8b2fb9` | 经 `gh release download` 复核一致 |
+| 资产 | `twinsearth-w2m-dsh-plugin-0.0.1.tgz`（94,045 B）+ `SHA256SUMS` | `state=uploaded` |
+| tarball sha256 | `d8297370e53791bfc54d6a1ed520c14c4b22be6fc7543c18a05ee83b174d4dee` | `gh release view --json assets` 的 `digest` 一致 |
+
+> ⚠️ **哈希会随文档变化**：tarball 里打包了 `README.md` / `PROTOCOL.md` / `CHANGELOG.md`，所以任何文档编辑都会改变哈希。**改完文档必须重新 `pack` + 重新 upload + 更新 `SHA256SUMS`**，否则线上资产与源码不一致（本文件的修改**不影响**，因为 `RELEASE-STATUS.md` 不在 `files` 列表里）。
 | Topics | `dsh-plugin` `deepseek-harness` `deepseek` `windows2macos` `multi-machine` `orchestration` | `gh repo view` |
 | 商店投稿 PR | https://github.com/awesome-dsh-plugin/awesome-dsh-plugin/pull/6783 | **open**，**仅 1 个文件 +7 行** |
 | 本地端到端 | 195 用例全绿（relay 61 / agent 79 / tools 45 / e2e 10）+ CLI 冒烟通过 | `scripts/verify.ps1` |
