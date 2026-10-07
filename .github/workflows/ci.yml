@@ -99,6 +99,32 @@ jobs:
       - name: Packer reproduces the manifest (and refuses missing paths)
         run: node scripts/pack.mjs --out dist
 
+  # The real-GitHub test is deliberately *not* part of the blocking matrix above.
+  #
+  # GitHub allows 60 unauthenticated API requests per hour per IP and hosted runners share IPs, so
+  # that test failed on macos-latest with HTTP 403 RATE_LIMITED while every other job passed. A
+  # release gate that depends on someone else's rate-limit budget is a coin flip, and the usual
+  # sequel is that someone deletes the test rather than fixing it.
+  #
+  # Here it runs with the workflow token, which raises the limit, and it does not gate anything:
+  # its outcome is reported and nothing more. The mocked coverage of the same code paths always runs
+  # in the matrix above.
+  live-api:
+    name: live GitHub API (non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Real GitHub release lookup
+        env:
+          W2M_NETWORK_TESTS: '1'
+          W2M_UPDATE_TOKEN: ${{ github.token }}
+        run: node --test test/update-source.test.mjs
+
   pack:
     name: release artifact is reproducible
     runs-on: ubuntu-latest

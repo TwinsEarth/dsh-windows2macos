@@ -103,6 +103,13 @@ invariant a drifting implementation breaks slowly and invisibly.
   production is the first thing to watch on the next version bump.
 - The updater has not been observed through a full sleep/wake cycle on real
   hardware; the catch-up rule is covered by tests against a simulated clock.
+- The real-GitHub test is **opt-in** (`W2M_NETWORK_TESTS=1`) rather than part of
+  the default run. It failed on CI with HTTP 403 `RATE_LIMITED` because GitHub
+  allows 60 unauthenticated requests per hour *per IP* and hosted runners share
+  IPs — a gate that depends on someone else's rate-limit budget eventually blocks
+  a release for an unrelated reason. CI still exercises it in a separate
+  non-blocking job with the workflow token; the same code paths are covered by
+  mocked tests in the blocking matrix.
 
 
 All notable changes to this project are documented here.

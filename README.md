@@ -355,13 +355,21 @@ a product.
 | end to end + crossnetwork | 46 | two Localsides on two checkouts against one relay running real commands: consistent / divergent / failed / refused / unverifiable / deduped / long-lease / split, plus sub-path deployment, the two credential kinds, a SIGKILLed relay restarting with its ledger intact, pairing rate limiting, proxy-header trust boundaries, and the anti-buffering headers |
 | schedule | 39 | the daily slots as exact UTC instants, zones that shift by 30 minutes for DST, a full simulated year of consecutive arming, and catch-up collapsing several missed slots into one run |
 | auto-update | 34 | the install/skip decision, no downgrade, prerelease refused, an unverified tarball refused, a failed lookup recorded as an error rather than as "current", and no token ever persisted |
-| update-source | 50 | version ordering, streaming SHA-256 verification, timeouts that really abort, rate-limit reporting, and one real GitHub API call |
+| update-source | 50 | version ordering, streaming SHA-256 verification, timeouts that really abort, rate-limit reporting, and one real GitHub API call (opt-in — see below) |
 | update-install | 28 | zero writes on a hash mismatch, byte-for-byte restore, atomic staging, dry run, and two real-pnpm integration runs in throwaway profiles |
 | update-wiring | 15 | configuration validation that names the setting, and one `ctx.effect` owning the timer whose disposer stops it |
 
 435 unit tests total: 434 pass, 1 skip. Run them with `scripts/verify.ps1`
 (Windows) or `scripts/verify.sh` (macOS/Linux). The skip is one agent test that
 asserts POSIX mode bits, which NTFS does not carry.
+
+The one test that calls GitHub for real is **opt-in** (`W2M_NETWORK_TESTS=1`).
+GitHub allows 60 unauthenticated API requests per hour *per IP* and hosted CI
+runners share IPs, so it failed on `macos-latest` with HTTP 403 `RATE_LIMITED`
+while every other job passed — and a release gate that depends on someone else's
+rate-limit budget eventually blocks a release for a reason unrelated to the code.
+CI still runs it in a separate **non-blocking** job with the workflow token, and
+the same code paths are covered without a network in the blocking matrix.
 
 Two behaviours are checked but not covered by a test file, because both concern
 the real binaries rather than the modules:
