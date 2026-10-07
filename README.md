@@ -38,7 +38,7 @@ So the cross-machine capability has to be built. This is that build.
                        ▼
    ┌──────────────────────────────────┐        ┌──────────────────────────┐
    │  Windows · DSH session           │        │  macOS · DSH session     │
-   │   w2m plugin (5 tools)           │        │   w2m plugin (5 tools)   │
+   │   w2m plugin (6 tools)           │        │   w2m plugin (6 tools)   │
    │        │                         │        │        │                 │
    │   Localside agent                │        │   Localside agent        │
    │    · three anchors               │        │    · three anchors       │
@@ -140,8 +140,8 @@ Then give it the relay URL in that profile's `cordis.patch.yml`:
     machineName: win-desktop
 ```
 
-Restart DSH. You should see five tools: `w2m_devices`, `w2m_run`, `w2m_wait`,
-`w2m_report`, `w2m_status`.
+Restart DSH. You should see six tools: `w2m_devices`, `w2m_run`, `w2m_wait`,
+`w2m_report`, `w2m_status`, `w2m_update`.
 
 > `dsh` may not be on your `PATH`. On a packaged install it lives under
 > `resources/runtime/cli/bin/`. If `dsh` is not found, call it by path.
@@ -250,6 +250,64 @@ will eventually reboot. A corrupt ledger line is skipped and reported; a corrupt
 device file starts empty **and says so** rather than silently forgetting every
 machine. `--no-persist` restores in-memory behaviour.
 
+## Staying up to date
+
+> **New in 0.2.3.** A machine running this plugin checks its own GitHub releases
+> at **00:00, 03:00 and 05:00 Beijing time** and installs a newer version if there
+> is one. This is **off by default** — an updater that replaces the installed
+> plugin is opt-in.
+
+Turn it on in the profile patch:
+
+```yaml
+# ~/.dsh/profiles/<profile>/cordis.patch.yml
+- insert:
+    - id: w2m-tools
+      name: '@twinsearth/w2m-dsh-plugin/tools'
+      config:
+        rabbitUrl: 'http://100.x.y.z:8787'
+        autoUpdate: true          # default false
+        # autoUpdateTimes: ['00:00:00', '03:00:00', '05:00:00']   # Beijing wall clock
+        # autoUpdateTimeZone: Asia/Shanghai                       # default
+        # autoUpdateDryRun: true                                  # verify, install nothing
+        # updateRepo: TwinsEarth/dsh-windows2macos                # default
+```
+
+Ask it what it is doing from any session with `w2m_update` (`action: "status"` to
+inspect, `action: "check"` to run one cycle now).
+
+**What it does and does not do:**
+
+- Compares the newest GitHub release against the version it was built as. It
+  installs **only a strictly newer, non-prerelease** version — a downgrade is
+  worse than a missed update, and a release candidate outranks the release it
+  precedes by SemVer, so the gate is explicit.
+- Downloads the tarball and **verifies the SHA-256 published in that release's
+  `SHA256SUMS`** before anything is written. A mismatch installs nothing.
+- Backs up the profile's `package.json` and `pnpm-lock.yaml`, then installs
+  through `dsh plugin --profile <p> add <tarball>` (falling back to the runtime's
+  own pnpm). If the install fails, the manifest is restored byte-for-byte.
+- **It does not restart DSH.** The new version loads on the next start; the
+  running process keeps the code it loaded. `w2m_status` reports
+  `restart_required` once an install has happened, and the installed tarball
+  lives in `<profile>/.w2m-update/` so the dependency does not dangle.
+- **It does not hot-swap the running plugin.** Nothing may rewrite the module a
+  live Cordis container already loaded, so claiming otherwise would be a lie in
+  the status output.
+
+**Honest limits.**
+
+- A missed slot runs once on the next start if it was missed by less than 90
+  minutes (a machine asleep across one slot). Wider than that and the check waits
+  for the next slot rather than firing at an arbitrary hour.
+- If pnpm fails *after* it has already changed `node_modules`, restoring the
+  manifest is not enough to guarantee DSH still starts. The result then carries
+  `rollbackComplete: false` and a `reconciliation` command; `w2m_status` surfaces
+  it as `reconciliation_needed`. This is the one state that needs a human.
+- A negative result is never reported as success: a GitHub lookup that fails is
+  recorded as an **error**, not as "already up to date", because those two look
+  identical in a log and only one of them is a problem.
+
 ## Security
 
 Read this before exposing the relay to anything.
@@ -293,12 +351,17 @@ a product.
 |---|---|---|
 | relay | 91 | pairing, auth, SSE with `ready`-first and `seq` replay, leases with heartbeat renewal and expiry, dedupe, all six aggregation states, report generation, operation token, rate limiting, persistence and restart recovery, TLS, and the lost-offer recovery path |
 | agent | 105 | whitelist allow/deny, timeout, output truncation, exit codes, anchors on clean and dirty trees, four concurrent fingerprint computations, spool, a 40-case URL join matrix, cursor lifecycle across relay restarts |
-| plugin | 73 | five tools registered, schemas, typed errors, polling, operator-token enforcement (no request is sent without it), sub-path endpoints |
+| plugin | 73 | six tools registered, schemas, typed errors, polling, operator-token enforcement (no request is sent without it), sub-path endpoints |
 | end to end + crossnetwork | 46 | two Localsides on two checkouts against one relay running real commands: consistent / divergent / failed / refused / unverifiable / deduped / long-lease / split, plus sub-path deployment, the two credential kinds, a SIGKILLed relay restarting with its ledger intact, pairing rate limiting, proxy-header trust boundaries, and the anti-buffering headers |
+| schedule | 39 | the daily slots as exact UTC instants, zones that shift by 30 minutes for DST, a full simulated year of consecutive arming, and catch-up collapsing several missed slots into one run |
+| auto-update | 34 | the install/skip decision, no downgrade, prerelease refused, an unverified tarball refused, a failed lookup recorded as an error rather than as "current", and no token ever persisted |
+| update-source | 50 | version ordering, streaming SHA-256 verification, timeouts that really abort, rate-limit reporting, and one real GitHub API call |
+| update-install | 28 | zero writes on a hash mismatch, byte-for-byte restore, atomic staging, dry run, and two real-pnpm integration runs in throwaway profiles |
+| update-wiring | 15 | configuration validation that names the setting, and one `ctx.effect` owning the timer whose disposer stops it |
 
-Run them with `scripts/verify.ps1` (Windows) or `scripts/verify.sh` (macOS/Linux).
-One agent test skips on Windows — it asserts POSIX mode bits, which NTFS does not
-carry — so the count there is 104 pass + 1 skip.
+435 unit tests total: 434 pass, 1 skip. Run them with `scripts/verify.ps1`
+(Windows) or `scripts/verify.sh` (macOS/Linux). The skip is one agent test that
+asserts POSIX mode bits, which NTFS does not carry.
 
 Two behaviours are checked but not covered by a test file, because both concern
 the real binaries rather than the modules:

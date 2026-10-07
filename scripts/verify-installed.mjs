@@ -55,7 +55,11 @@ if (warnings.length > 0) {
   process.stdout.write(`warnings:\n${warnings.map((w) => `  ${w}`).join('\n')}\n`);
 }
 
-const expected = ['w2m_devices', 'w2m_report', 'w2m_run', 'w2m_status', 'w2m_wait'];
-const ok = registered.length === 5 && expected.every((e) => names.includes(e));
-process.stdout.write(ok ? '\nPASS: five tools registered\n' : `\nFAIL: expected ${expected.join(', ')}\n`);
+const expected = ['w2m_devices', 'w2m_report', 'w2m_run', 'w2m_status', 'w2m_update', 'w2m_wait'];
+const ok = registered.length === expected.length && expected.every((e) => names.includes(e));
+process.stdout.write(
+  ok
+    ? `\nPASS: ${expected.length} tools registered\n`
+    : `\nFAIL: expected ${expected.length} tools (${expected.join(', ')}), got ${names.join(', ')}\n`,
+);
 process.exit(ok ? 0 : 1);

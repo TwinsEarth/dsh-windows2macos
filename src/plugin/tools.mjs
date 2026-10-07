@@ -49,18 +49,31 @@ import { execFile } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // The base-address rules live in one place (§2), shared with the agent side. Importing them — rather
 // than re-deriving them here — is what stops the plugin and the agent from disagreeing about what
 // `https://host/w2m` means, which is the defect §2 exists to fix.
 // `src/agent/` does not import `src/plugin/`, so the dependency runs one way and cannot cycle.
 import { joinUrl, resolveBaseUrl } from '../agent/url.mjs';
+import { createAutoUpdater, resolveCurrentVersion } from './auto-update.mjs';
+import { DEFAULT_DAILY_TIMES, DEFAULT_TIME_ZONE } from './schedule.mjs';
 
 /** Services this plugin needs. The harness refuses to load the plugin without them. */
 export const inject = ['tools'];
 
 /** Line protocol version this plugin speaks. Reported by `w2m_status`, never negotiated here. */
 const PROTOCOL_VERSION = 1;
+
+/**
+ * This plugin's own version, baked in at pack time.
+ *
+ * The updater compares the newest release against this string, so a wrong value here means either a
+ * downgrade (worse than a missed update) or a permanent no-op. It is therefore read from
+ * `package.json` during `scripts/pack.mjs` rather than hand-maintained, and `W2M_PLUGIN_VERSION`
+ * overrides it at runtime for tests and packagers.
+ */
+const PLUGIN_VERSION = '__W2M_PLUGIN_VERSION__';
 
 /** How long any single HTTP call may take before it is aborted, in milliseconds. */
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
@@ -392,7 +405,172 @@ function readConfig(config = {}) {
       : (typeof process.env.W2M_OPERATOR_TOKEN === 'string' && process.env.W2M_OPERATOR_TOKEN.trim() !== ''
         ? process.env.W2M_OPERATOR_TOKEN.trim()
         : null),
+    // ---------------------------------------------------------------------------------------------
+    // v0.2.3: daily self-update
+    // ---------------------------------------------------------------------------------------------
+    // These belong to this plugin's own maintenance, not to the W2M line protocol, which is why
+    // they are read here rather than from the profile's Rabbit settings.
+    update: readUpdateConfig(config, stateDir),
+    // Carried through so the updater can find the profile it must install into. Resolved here
+    // rather than at use time so `w2m_status` can report the same path the installer will use.
+    profileDir: resolveProfileDir(config),
   };
+}
+
+/**
+ * Read the self-update settings.
+ *
+ * Split out from `readConfig` because a malformed time or zone here must be a **loud startup error**
+ * naming the setting, not a silently-substituted default: a typo in `autoUpdateTimes` would
+ * otherwise move the check to an hour the user never chose, and nothing would say so.
+ *
+ * @param {Record<string, unknown>} config - Raw plugin config.
+ * @param {string|null} stateDir - Resolved state directory, if any.
+ * @returns {object} Normalized update settings.
+ */
+function readUpdateConfig(config, stateDir) {
+  const env = process.env;
+
+  const boolFromEnv = (name) => {
+    const raw = env[name];
+    if (typeof raw !== 'string' || raw.trim() === '') return null;
+    const v = raw.trim().toLowerCase();
+    if (['1', 'true', 'yes', 'on'].includes(v)) return true;
+    if (['0', 'false', 'no', 'off'].includes(v)) return false;
+    return null;
+  };
+
+  // Off unless asked for. An updater that replaces the installed plugin on its own is not
+  // something to switch on behind an operator's back.
+  const enabledRaw = config.autoUpdate ?? boolFromEnv('W2M_AUTO_UPDATE');
+  const enabled = enabledRaw === true;
+
+  const timesRaw = Array.isArray(config.autoUpdateTimes) && config.autoUpdateTimes.length > 0
+    ? config.autoUpdateTimes
+    : (typeof env.W2M_AUTO_UPDATE_TIMES === 'string' && env.W2M_AUTO_UPDATE_TIMES.trim() !== ''
+      ? env.W2M_AUTO_UPDATE_TIMES.split(',')
+      : DEFAULT_DAILY_TIMES);
+
+  let times;
+  try {
+    times = normalizeUpdateTimes(timesRaw);
+  } catch (error) {
+    throw configError(
+      'autoUpdateTimes',
+      error instanceof Error ? error.message : String(error),
+      'use 24-hour "HH:mm:ss" values in the configured zone, for example ["00:00:00","03:00:00","05:00:00"]',
+    );
+  }
+
+  const timeZone = typeof config.autoUpdateTimeZone === 'string' && config.autoUpdateTimeZone.trim() !== ''
+    ? config.autoUpdateTimeZone.trim()
+    : (typeof env.W2M_AUTO_UPDATE_TZ === 'string' && env.W2M_AUTO_UPDATE_TZ.trim() !== ''
+      ? env.W2M_AUTO_UPDATE_TZ.trim()
+      : DEFAULT_TIME_ZONE);
+
+  // Validate the zone now, so a typo fails at load rather than at 03:00 in a log nobody reads.
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone }).format(new Date());
+  } catch {
+    throw configError(
+      'autoUpdateTimeZone',
+      `is not a time zone this runtime knows: ${JSON.stringify(timeZone)}`,
+      'use an IANA zone name such as Asia/Shanghai',
+    );
+  }
+
+  const repoRaw = typeof config.updateRepo === 'string' && config.updateRepo.trim() !== ''
+    ? config.updateRepo.trim()
+    : (typeof env.W2M_UPDATE_REPO === 'string' && env.W2M_UPDATE_REPO.trim() !== ''
+      ? env.W2M_UPDATE_REPO.trim()
+      : 'TwinsEarth/dsh-windows2macos');
+  if (!/^[\w.-]+\/[\w.-]+$/.test(repoRaw)) {
+    throw configError(
+      'updateRepo',
+      `must look like "owner/name", got ${JSON.stringify(repoRaw)}`,
+      'for example TwinsEarth/dsh-windows2macos',
+    );
+  }
+
+  /** @param {unknown} value @param {number} fallback */
+  const positive = (value, fallback) => (Number.isFinite(value) && Number(value) > 0 ? Number(value) : fallback);
+
+  return {
+    enabled,
+    times,
+    timeZone,
+    repo: repoRaw,
+    // Catch-up window: how late a missed slot may be and still run. Kept well under a day so a
+    // process that starts at 14:00 does not invent a check at an hour nobody asked for.
+    catchUpMs: positive(config.autoUpdateCatchUpMs, 90 * 60_000),
+    dryRun: config.autoUpdateDryRun === true,
+    allowPrerelease: config.autoUpdateAllowPrerelease === true,
+    timeoutMs: positive(config.autoUpdateTimeoutMs, 30_000),
+    // Read from the environment only: a repository token in a tracked config file is a token in git.
+    token: typeof env.W2M_UPDATE_TOKEN === 'string' && env.W2M_UPDATE_TOKEN.trim() !== ''
+      ? env.W2M_UPDATE_TOKEN.trim()
+      : null,
+    restartCommand: typeof config.autoUpdateRestartCommand === 'string' && config.autoUpdateRestartCommand.trim() !== ''
+      ? config.autoUpdateRestartCommand.trim()
+      : null,
+    stateDir,
+  };
+}
+
+/**
+ * Normalize the update slot list, rejecting anything that is not `HH:mm:ss`.
+ *
+ * @param {unknown[]} times - Raw entries.
+ * @returns {string[]} Ascending unique `HH:mm:ss` values.
+ */
+function normalizeUpdateTimes(times) {
+  const out = [];
+  for (const entry of times) {
+    const value = typeof entry === 'string' ? entry.trim() : '';
+    if (!/^\d{2}:\d{2}:\d{2}$/.test(value)) {
+      throw new Error(`invalid time ${JSON.stringify(entry)}: expected HH:mm:ss`);
+    }
+    const [h, m, s] = value.split(':').map(Number);
+    if (h > 23 || m > 59 || s > 59) {
+      throw new Error(`invalid time ${JSON.stringify(entry)}: out of range`);
+    }
+    out.push(value);
+  }
+  const unique = [...new Set(out)].sort((a, b) => a.localeCompare(b));
+  if (unique.length === 0) throw new Error('at least one time is required');
+  return unique;
+}
+
+/**
+ * Locate the DSH profile directory that contains this plugin.
+ *
+ * The updater installs into the profile, so it has to name it. Two facts make this reliable: the
+ * plugin is loaded from `<profile>/node_modules/@twinsearth/w2m-dsh-plugin`, and the profile root is
+ * the directory holding that `node_modules` plus a `package.json`. We walk up and verify rather than
+ * string-slicing a fixed depth, because a pnpm layout can add a `.pnpm` segment.
+ *
+ * Returns `null` when no ancestor looks like a profile -- a checkout run directly from a clone has
+ * none. The caller must treat that as "cannot self-update here" and say so, not guess a path and
+ * write into it.
+ *
+ * @param {Record<string, unknown>} config - Raw plugin config; `profileDir` wins when set.
+ * @returns {string|null} Absolute profile directory, or null.
+ */
+function resolveProfileDir(config) {
+  if (typeof config.profileDir === 'string' && config.profileDir.trim() !== '') {
+    return path.resolve(config.profileDir.trim());
+  }
+
+  let dir = path.dirname(fileURLToPath(import.meta.url));
+  for (let depth = 0; depth < 8; depth += 1) {
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+    if (path.basename(dir) !== 'node_modules') continue;
+    const root = path.dirname(dir);
+    if (existsSync(path.join(root, 'package.json'))) return root;
+  }
+  return null;
 }
 
 /**
@@ -1961,6 +2139,86 @@ export async function apply(ctx, config = {}) {
   if (cfg.autoStartAgent) {
     ctx.effect?.(() => startLocalStack(ctx, cfg));
   }
+
+  // ---------------------------------------------------------------------------------------------
+  // v0.2.3: daily self-update check
+  // ---------------------------------------------------------------------------------------------
+  // Compiled-in version, overridable via W2M_PLUGIN_VERSION. When it is unknown the updater
+  // refuses to act rather than assuming it is old, which is why this may legitimately be null.
+  const currentVersion = resolveCurrentVersion(PLUGIN_VERSION, process.env);
+  const updater = createAutoUpdater({
+    profileDir: cfg.profileDir,
+    currentVersion,
+    repo: cfg.update.repo,
+    times: cfg.update.times,
+    timeZone: cfg.update.timeZone,
+    catchUpMs: cfg.update.catchUpMs,
+    enabled: cfg.update.enabled,
+    dryRun: cfg.update.dryRun,
+    allowPrerelease: cfg.update.allowPrerelease,
+    timeoutMs: cfg.update.timeoutMs,
+    token: cfg.update.token,
+    restartCommand: cfg.update.restartCommand,
+    stateDir: cfg.update.stateDir,
+    log: (message) => ctx.logger?.info?.(`w2m update: ${message}`),
+    // A failing check is a normal Tuesday, not a crash: the scheduler keeps its slot.
+    onError: (error) => ctx.logger?.warn?.(`w2m update: ${error.message}`),
+  });
+
+  // Reversible side effect. `ctx.effect` is provided by Cordis 4 (verified against 4.0.4). When the
+  // feature is on and the host cannot track the effect, we fail loudly: a silently skipped effect
+  // means a timer that is never released, a daily job leaking across every reload. When the feature
+  // is off there is no timer to own, so the missing service must not take the tool set down with it.
+  if (cfg.update.enabled) {
+    if (typeof ctx.effect !== 'function') {
+      throw new W2MError(
+        'W2M_NO_EFFECT',
+        'autoUpdate is enabled, so this plugin needs `ctx.effect` to own its scheduled job, and the context does not provide it',
+        { hint: 'load the plugin in a Cordis 4 host, where ctx.effect tracks reversible side effects' },
+      );
+    }
+    ctx.effect(() => {
+      updater.start();
+      return () => updater.stop();
+    });
+  } else {
+    // Still resolvable and inspectable through `w2m_update`; just never scheduled.
+    updater.start();
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // 6. w2m_update -- read-only unless asked to act
+  // ---------------------------------------------------------------------------------------------
+  ctx.tools.register(defineTool({
+    name: 'w2m_update',
+    description:
+      'Inspect and drive this plugin\'s own updater. It checks the project\'s GitHub releases at ' +
+      '00:00, 03:00 and 05:00 Beijing time by default and installs a newer release only after ' +
+      'verifying the hash published with it. Action "status" reports the schedule, the installed ' +
+      'version, the last check and whether a restart is still pending; "check" runs one ' +
+      'check-and-install cycle now and does not throw -- a network failure comes back as a recorded ' +
+      'error, which is exactly how it differs from "already up to date". A new version is installed ' +
+      'for the *next* start: this tool never restarts the Harness and never hot-swaps running code.',
+    parameters: {
+      action: {
+        type: 'string',
+        description:
+          'status (default) reports the updater; check runs one check-and-install cycle now and ' +
+          'records the outcome. One of: status, check.',
+      },
+    },
+    output: jsonOutput,
+    execute: async (args) => {
+      const action = typeof args?.action === 'string' && args.action !== '' ? args.action : 'status';
+      if (action === 'status') {
+        return { ok: true, action, update: updater.describe() };
+      }
+      const result = await updater.check('manual');
+      // `ok:false` inside `result` means "the check could not complete", never "the tool failed".
+      return { ok: true, action, result, update: updater.describe() };
+    },
+    presentCall: () => ({ card: 'generic', title: 'w2m update', kind: 'read', rawInput: {} }),
+  }));
 }
 
 /**

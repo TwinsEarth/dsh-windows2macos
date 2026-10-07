@@ -253,13 +253,13 @@ function finalTask(overrides = {}) {
 // ---------------------------------------------------------------------------------------------
 
 describe('registration shape', () => {
-  it('declares the tools service and registers exactly five tools', async () => {
+  it('declares the tools service and registers exactly six tools', async () => {
     assert.deepEqual(plugin.inject, ['tools']);
     const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
-    assert.equal(tools.size, 5);
+    assert.equal(tools.size, 6);
     assert.deepEqual(
       [...tools.keys()].sort(),
-      ['w2m_devices', 'w2m_report', 'w2m_run', 'w2m_status', 'w2m_wait'],
+      ['w2m_devices', 'w2m_report', 'w2m_run', 'w2m_status', 'w2m_update', 'w2m_wait'],
     );
   });
 
@@ -1178,10 +1178,10 @@ describe('bounds and cancellation', () => {
     // earlier test happened to populate the cache with.
     plugin.resetDefineToolCacheForTests();
     const { tools, warnings } = await register({ rabbitUrl: RABBIT });
-    assert.equal(tools.size, 5, 'the plugin must register all five tools on either path');
+    assert.equal(tools.size, 6, 'the plugin must register all six tools on either path');
 
     if (warnings.length === 0) {
-      // The package resolved: the real defineTool accepted all five definitions, which is the
+      // The package resolved: the real defineTool accepted all six definitions, which is the
       // stronger outcome. Nothing degraded, so there is nothing more to assert here.
       return;
     }

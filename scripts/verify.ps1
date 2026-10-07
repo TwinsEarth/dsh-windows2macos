@@ -32,7 +32,7 @@ Write-Host "node: $node"
 & $node -v
 Write-Host ''
 
-$all = @('relay', 'agent', 'tools', 'e2e')
+$all = @('relay', 'agent', 'tools', 'schedule', 'auto-update', 'update-source', 'update-install', 'update-wiring', 'e2e')
 $selected = if ($Suites -and $Suites.Count -gt 0) { $Suites } else { $all }
 
 $results = [ordered]@{}

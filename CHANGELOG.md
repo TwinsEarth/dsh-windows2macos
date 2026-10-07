@@ -1,5 +1,110 @@
 # Changelog
 
+All notable changes to this project are documented here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
+adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.2.3] — 2026-10-08
+
+### Added
+
+- **Daily self-update.** A machine running the plugin checks its own GitHub
+  releases at **00:00, 03:00 and 05:00 Beijing time** and installs a newer
+  version, verifying the published SHA-256 before writing anything. Off by
+  default; `autoUpdate: true` turns it on. New tool **`w2m_update`** reports the
+  schedule, the installed version, the last check and whether a restart is
+  pending, and can run one cycle on demand.
+- **A timezone-aware daily scheduler** (`src/plugin/schedule.mjs`), used by the
+  updater. The host's own `@deepseek-ai/dsh-schedule` was evaluated and rejected
+  for this job: its reminders are bound to an Agent Session and delivered as
+  inbox messages, and its README states it "cannot be mounted alone in a
+  headless or SDK-only composition" and that the shipped Web composition carries
+  no `schedule` row. A plugin-owned recurring job has no Session to bind to, so
+  it owns its timer — reversibly, via `ctx.effect`.
+
+### Why the updater is built the way it is
+
+Each of these is a decision, not an implementation detail:
+
+- **Never a downgrade.** `isNewer` is a strict-greater test, and a prerelease is
+  refused separately: `0.2.0-rc.1` outranks `0.1.2` by SemVer, so a comparison
+  alone would ship candidates to stable installs. The comparison answers "which
+  is higher"; the policy layer answers "may we install it".
+- **Verify, then write.** The tarball must match the `SHA256SUMS` published with
+  that release. A mismatch writes zero bytes — no staging directory, no backup.
+- **Back up and roll back.** `package.json` and `pnpm-lock.yaml` are restored
+  byte-for-byte on failure, through the supported `dsh plugin` entry point rather
+  than by editing `node_modules` by hand.
+- **Say what a rollback really guarantees.** Restoring the manifest does not undo
+  what pnpm already did to `node_modules`. Rather than claim "rolled back", the
+  result carries `rollbackComplete` (does the installed tree match the restored
+  manifest again?) plus a `reconciliation` command, and the plugin exposes it as
+  `reconciliation_needed`.
+- **A lookup failure is not "up to date".** They look identical in a log and only
+  one of them is a problem, so a failed check is recorded as an error.
+- **The updater does not restart DSH.** Installing changes what loads next start.
+  Rewriting a module that a live Cordis container has already loaded is not
+  something a plugin may do safely, so the status says `restart_required`
+  instead of implying the new code is live.
+
+### Fixed
+
+- **`ctx.effect` was called through optional chaining.** `ctx.effect?.(...)` in
+  `apply()` meant that on any host without it the scheduled job would be
+  registered nowhere and released never — no error, no log, just a daily task
+  that silently does not exist. It is now a required call that fails loudly by
+  name (`W2M_NO_EFFECT`) when the feature is enabled, and is skipped entirely
+  when it is not. Verified against the real runtime that Cordis 4.0.4 does
+  provide it, so the strict call does not break the current host.
+- **The plugin's own version is now baked in at pack time.** `PLUGIN_VERSION` is
+  a placeholder in the repository and is substituted from `package.json` by
+  `scripts/pack.mjs`, which fails if the placeholder goes missing. A
+  hand-maintained version string would eventually disagree with the release, and
+  the updater compares against exactly that string.
+- **A malformed update setting fails loudly.** `autoUpdateTimes`,
+  `autoUpdateTimeZone` and `updateRepo` are validated at load and name
+  themselves in the error. Silently falling back to a default would move the
+  check to an hour nobody chose, and nothing would say so.
+
+### Compatibility
+
+- `PROTOCOL_VERSION` stays **1**. This release adds no wire changes: everything
+  here is local to the plugin, plus one new tool.
+- The tool count goes from five to six with `w2m_update`. Nothing existing
+  changed shape.
+
+### Verification
+
+435 unit tests, 434 pass, 1 skip (POSIX mode bits are meaningless on NTFS):
+
+| suite | tests | covers |
+|---|---|---|
+| relay | 91 | unchanged from 0.1.2 |
+| agent | 105 | unchanged from 0.1.2 |
+| plugin | 73 | six tools registered, operator token, sub-path, diagnostics, plus config validation and `ctx.effect` ownership |
+| schedule | 39 | zone maths, exact UTC instants for each slot, DST zones, a year of consecutive arming, catch-up collapse |
+| auto-update | 34 | the install/skip decision, no downgrade, prerelease refusal, unverified tarball refused, lookup failure recorded as an error, token never persisted |
+| update-source | 50 | version ordering, streaming SHA-256, timeouts, rate limits, one real GitHub call |
+| update-install | 28 | zero writes on hash mismatch, byte-for-byte restore, atomic staging, dry run |
+| update-wiring | 15 | config validation is loud, one `ctx.effect` owns the timer, its disposer stops it |
+
+The schedule is checked against a whole simulated year: every arming must advance,
+land exactly on its configured slot, and never shift the Beijing offset — the
+invariant a drifting implementation breaks slowly and invisibly.
+
+### Not verified
+
+- **No real install has been performed against a live DSH profile by this
+  release's test suite.** The installer's integration tests use throwaway
+  profiles in temp directories; `C:\Users\fangw\.dsh` was never written to.
+- **The end-to-end "a new release is published and a running machine picks it up
+  by itself" path has not been exercised against a real new release.** Every
+  stage is covered in isolation and with injected transports; the loop closing in
+  production is the first thing to watch on the next version bump.
+- The updater has not been observed through a full sleep/wake cycle on real
+  hardware; the catch-up rule is covered by tests against a simulated clock.
+
+
 All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 

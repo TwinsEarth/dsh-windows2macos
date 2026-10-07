@@ -180,6 +180,43 @@ function assertManifestPathsExist(manifest) {
   }
 }
 
+/**
+ * The placeholder `src/plugin/tools.mjs` carries for its own version.
+ *
+ * The shipped artifact must know which version it is: the daily self-update compares the newest
+ * GitHub release against this string, and a stale value means either a downgrade (worse than a
+ * missed update) or a permanent no-op. Baking it in at pack time keeps it from being
+ * hand-maintained in two places and drifting.
+ */
+const VERSION_PLACEHOLDER = '__W2M_PLUGIN_VERSION__';
+
+/** Files whose placeholder is substituted with the real version during packing. */
+const VERSION_BEARING_FILES = new Set(['src/plugin/tools.mjs']);
+
+/**
+ * Substitute the version placeholder in a file's bytes.
+ *
+ * Works on the raw buffer so the substitution cannot introduce an encoding change, and fails loudly
+ * when a file that should carry the placeholder does not -- silently shipping a literal
+ * `__W2M_PLUGIN_VERSION__` would make the updater compare against nonsense forever.
+ *
+ * @param {string} relPath - Path relative to the package root, POSIX-separated.
+ * @param {Buffer} content - File bytes.
+ * @param {string} version - Version from `package.json`.
+ * @returns {Buffer} Bytes to pack.
+ */
+function substituteVersion(relPath, content, version) {
+  if (!VERSION_BEARING_FILES.has(relPath)) return content;
+  const text = content.toString('utf8');
+  if (!text.includes(VERSION_PLACEHOLDER)) {
+    throw new Error(
+      `pack: ${relPath} no longer contains ${VERSION_PLACEHOLDER}. The updater needs the shipped ` +
+        'version baked in; restore the placeholder or update VERSION_BEARING_FILES.',
+    );
+  }
+  return Buffer.from(text.split(VERSION_PLACEHOLDER).join(version), 'utf8');
+}
+
 function packTarball() {
   const manifest = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
   assertManifestPathsExist(manifest);
@@ -187,8 +224,8 @@ function packTarball() {
 
   const parts = [];
   for (const { absPath, relPath } of entries) {
-    const content = readFileSync(absPath);
     const name = `package/${relPath.split(sep).join('/')}`;
+    const content = substituteVersion(name.replace(/^package\//, ''), readFileSync(absPath), manifest.version);
     parts.push(tarHeader({
       name,
       size: content.length,

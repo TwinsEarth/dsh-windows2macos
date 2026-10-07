@@ -1,17 +1,43 @@
 # W2M 发布状态
 
-> 项目：**DSH: Windows2MacOS** · 当前版本 **0.1.2**（跨区域 / 跨网络）
-> 上一版本 **0.0.1**（同一局域网）。本文记录已完成的发布动作与仍需跟进的事项。
+> 项目：**DSH: Windows2MacOS** · 当前版本 **0.2.3**（每日自更新）
+> 上一版本 **0.1.2**（跨区域 / 跨网络）、**0.0.1**（同一局域网）。
+> 本文记录已完成的发布动作与仍需跟进的事项。
 
 ---
 
-## 1. 当前版本 v0.1.2（跨区域 / 跨网络）✅
+## 0. 当前版本 v0.2.3（每日自更新）✅
+
+| 事项 | 结果 |
+|---|---|
+| 版本 | `0.2.3` |
+| 新增 | 插件内置**时区感知调度器**：北京时间每天 **00:00 / 03:00 / 05:00** 检查 GitHub 更新，有新版则校验 SHA-256 后自动安装；新增第 6 个工具 `w2m_update` |
+| 默认 | **关闭**（`autoUpdate: true` 开启）。会替换自己安装的插件不应在用户不知情时启动 |
+| 测试 | **435 用例 / 434 pass / 1 skip / 0 fail**（relay 91 · agent 105 · plugin 73 · schedule 39 · auto-update 34 · update-source 50 · update-install 28 · update-wiring 15） |
+
+### 为什么不用宿主的 `@deepseek-ai/dsh-schedule`
+它**存在**于运行时（已实测），但**不适用**：其提醒绑定到 Agent Session、通过往 Session 收件箱投递消息；其 README 明确写 *"cannot be mounted alone in a headless or SDK-only composition"*，且**发布的 Web 组合默认不含 `schedule` 行**。插件自有的周期任务没有 Session 可绑，因此自带定时器 —— 通过 `ctx.effect` 可逆持有。
+
+### 设计上刻意做的取舍（每条都有测试）
+1. **绝不降级**：`isNewer` 严格大于；**预发布单独拦截**（`0.2.0-rc.1` 按 SemVer 高于 `0.1.2`，只靠比较会把候选版推给稳定安装）。比较函数回答"谁更高"，策略层回答"能不能装"。
+2. **先校验再落盘**：tarball 必须匹配该 Release 的 `SHA256SUMS`；不匹配**零字节写入**（连 staging 都不建）。
+3. **回滚保证的是清单，不是树**：还原 `package.json`/`pnpm-lock.yaml` 不会撤销 pnpm 对 `node_modules` 已做的事。所以结果里带 `rollbackComplete`（树是否重新与还原后的清单一致？）+ `reconciliation` 对账命令，插件侧暴露为 `reconciliation_needed`。**这是唯一需要人的状态。**
+4. **查询失败 ≠ 已是最新**：两者在日志里长得一样，只有一个有问题，所以失败记为 **error**。
+5. **不重启 DSH**：安装改变的是**下次启动**加载什么；重写一个活跃 Cordis 容器已加载的模块不是插件该做的事，所以状态报 `restart_required` 而不是暗示新代码已生效。
+
+### 修掉的两个真实缺陷
+- **`ctx.effect?.(...)` 曾用可选链调用**（`apply()` 内）。宿主没有该方法时，计划任务**注册不到任何地方、也永不释放** —— 无报错、无日志，只是每天该跑的东西静默不存在。已改为必备调用，启用该功能时缺失即按名报错（`W2M_NO_EFFECT`）；实测 Cordis 4.0.4 确实提供它，所以严格化不会打断当前宿主。
+- **CI 的显式文件列表没有包含新套件**：`ci.yml`/`release.yml` 只跑了 relay/agent/tools/e2e，新增的 4 个套件（166 用例）**在 CI 里根本不会执行**。已补齐，并核验"仓库里每个 `*.test.mjs` 都被 CI 与 Release 覆盖"。`scripts/verify.{ps1,sh}` 的默认套件列表同样过时，已补。
+
+---
+
+## 1. 上一版本 v0.1.2（跨区域 / 跨网络）✅
 
 | 事项 | 结果 | 凭据 |
 |---|---|---|
 | 版本 | `0.1.2` | `package.json` |
 | Release | https://github.com/TwinsEarth/dsh-windows2macos/releases/tag/v0.1.2 | tag `v0.1.2` |
-| 资产 | `twinsearth-w2m-dsh-plugin-0.1.2.tgz`（159,660 B）+ `SHA256SUMS` | 由 **CI 自动构建并发布**（`release.yml`），不是手工上传 |
+| 资产 | `twinsearth-w2m-dsh-plugin-0.1.2.tgz` + `SHA256SUMS` | 由 **CI 自动构建并发布**（`release.yml`），不是手工上传 |
 | 资产 sha256 | `2b55d7d10a1b292b8d4ce6add9631085027a443d6f5ad1c9974346fc7f52f344` | 与本地重建**逐字节一致**（已验证） |
 | CI | **5/5 全绿**：windows 20/22、macos 22、ubuntu 22、可复现性 job | run 37646434086 |
 | Release workflow | **success** | run 37646442275 |

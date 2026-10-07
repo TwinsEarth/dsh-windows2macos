@@ -84,7 +84,7 @@ jobs:
         run: node scripts/verify-installed.mjs "$(pwd)"
 
       - name: Unit suites (relay / agent / plugin)
-        run: node --test test/relay.test.mjs test/agent.test.mjs test/tools.test.mjs
+        run: node --test test/relay.test.mjs test/agent.test.mjs test/tools.test.mjs test/schedule.test.mjs test/auto-update.test.mjs test/update-source.test.mjs test/update-install.test.mjs test/update-wiring.test.mjs
 
       - name: End-to-end suites
         # --test-force-exit is required: each simulated machine holds an open SSE

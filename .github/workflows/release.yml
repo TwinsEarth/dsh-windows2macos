@@ -61,7 +61,7 @@ jobs:
       - name: Unit suites (blocking)
         # The unit suites are fast, deterministic and cover the product surface.
         # They gate the release.
-        run: node --test test/relay.test.mjs test/agent.test.mjs test/tools.test.mjs
+        run: node --test test/relay.test.mjs test/agent.test.mjs test/tools.test.mjs test/schedule.test.mjs test/auto-update.test.mjs test/update-source.test.mjs test/update-install.test.mjs test/update-wiring.test.mjs
 
       - name: End-to-end suites (blocking)
         # These exercise real processes over real sockets and are slower and more
