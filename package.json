@@ -54,7 +54,7 @@
   },
   "scripts": {
     "test": "node --test --test-force-exit test/relay.test.mjs test/agent.test.mjs test/tools.test.mjs test/schedule.test.mjs test/auto-update.test.mjs test/update-source.test.mjs test/update-install.test.mjs test/update-wiring.test.mjs test/signing.test.mjs",
-    "test:e2e": "node --test --test-force-exit test/e2e.test.mjs test/crossnetwork.test.mjs test/signing-e2e.test.mjs",
+    "test:e2e": "node --test --test-force-exit test/e2e.test.mjs test/crossnetwork.test.mjs test/signing-e2e.test.mjs test/outbound-only.test.mjs",
     "test:relay": "node --test test/relay.test.mjs",
     "test:agent": "node --test test/agent.test.mjs",
     "test:tools": "node --test test/tools.test.mjs",

@@ -141,7 +141,7 @@ jobs:
         # wrong: sub-path mounting, the two credential kinds, relay restart
         # recovery, pairing rate limits, proxy-header trust, and the
         # anti-buffering headers a tunnel needs.
-        run: node --test --test-force-exit test/e2e.test.mjs test/crossnetwork.test.mjs test/signing-e2e.test.mjs
+        run: node --test --test-force-exit test/e2e.test.mjs test/crossnetwork.test.mjs test/signing-e2e.test.mjs test/outbound-only.test.mjs
 
       - name: Packer reproduces the manifest (and refuses missing paths)
         run: node scripts/pack.mjs --out dist
