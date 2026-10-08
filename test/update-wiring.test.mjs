@@ -228,7 +228,7 @@ describe('findProfileDir (the branch ESLint found, not the tests)', () => {
     const made = await register({ rabbitUrl: 'http://127.0.0.1:1', profileDir });
     const out = await updateStatus(made.tools);
     assert.equal(out.update.profile_dir, profileDir);
-    assert.equal(made.tools.size, 6);
+    assert.equal(made.tools.size, 8);
   });
 });
 
@@ -293,6 +293,143 @@ describe('config validation is loud, not silently defaulted', () => {
   });
 });
 
+describe('w2m_history and w2m_stats (v0.3.0)', () => {
+  /** Register against a routing fetch stub and hand back the calls it made. */
+  function withRelay(routes) {
+    const calls = [];
+    const original = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      const path = String(url).replace(/^https?:\/\/[^/]+/, '');
+      calls.push({ path });
+      const route = routes.find((r) => path === r.path || path.startsWith(`${r.path}?`));
+      if (!route) {
+        const body = JSON.stringify({ error: { code: 'NOT_FOUND' } });
+        return {
+          ok: false,
+          status: 404,
+          json: async () => JSON.parse(body),
+          text: async () => body,
+          // The plugin reads the raw bytes first, because a signed request's body must not be
+          // re-serialised. A stub that only offers json()/text() fails there, not in the assertion.
+          arrayBuffer: async () => new TextEncoder().encode(body).buffer,
+        };
+      }
+      const body = JSON.stringify(route.body);
+      return {
+        ok: route.status === undefined || route.status < 400,
+        status: route.status ?? 200,
+        json: async () => route.body,
+        text: async () => body,
+        arrayBuffer: async () => new TextEncoder().encode(body).buffer,
+      };
+    };
+    return { calls, restore: () => { globalThis.fetch = original; } };
+  }
+
+  const TASKS = {
+    protocol_version: 1,
+    rabbit_time: '2026-10-08T00:00:00Z',
+    tasks: [
+      { task_id: 'T2', mode: 'split', created_at: '2026-10-08T00:00:02Z', created_by: 'op', index_total: 4, cancelled: false, degraded: null, leases: ['m1', 'm2'], lease_states: { m1: 'done', m2: 'done' } },
+      { task_id: 'T1', mode: 'replicate', created_at: '2026-10-08T00:00:01Z', created_by: 'op', index_total: 1, cancelled: true, degraded: null, leases: ['m1'], lease_states: { m1: 'cancelled' } },
+    ],
+  };
+
+  it('lists recent tasks in the order the relay gave, without fetching any result', async () => {
+    const profileDir = makeProfile();
+    const { tools } = await register({ rabbitUrl: 'http://relay.test', profileDir, operatorToken: 'op' });
+    const stub = withRelay([{ path: '/v1/tasks', body: TASKS }]);
+    try {
+      const out = JSON.parse(await tools.get('w2m_history').execute({}, {}));
+      assert.equal(out.ok, true);
+      assert.equal(out.returned, 2);
+      assert.equal(out.held, 2);
+      assert.deepEqual(out.tasks.map((t) => t.task_id), ['T2', 'T1']);
+      assert.deepEqual(stub.calls.map((c) => c.path), ['/v1/tasks?limit=20']);
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it('filters by mode, and says when a filter hid everything', async () => {
+    const profileDir = makeProfile();
+    const { tools } = await register({ rabbitUrl: 'http://relay.test', profileDir, operatorToken: 'op' });
+    const stub = withRelay([{ path: '/v1/tasks', body: TASKS }]);
+    try {
+      const one = JSON.parse(await tools.get('w2m_history').execute({ mode: 'replicate' }, {}));
+      assert.equal(one.returned, 1);
+      assert.equal(one.held, 2, 'the number the relay holds is reported separately');
+
+      const none = JSON.parse(await tools.get('w2m_history').execute({ mode: 'pipeline' }, {}));
+      assert.equal(none.returned, 0);
+      assert.equal(none.held, 2);
+      // An empty result must not be indistinguishable from an empty relay.
+      assert.match(none.notes.join(' '), /filtered out/);
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it('excludes cancelled tasks only when asked to', async () => {
+    const profileDir = makeProfile();
+    const { tools } = await register({ rabbitUrl: 'http://relay.test', profileDir, operatorToken: 'op' });
+    const stub = withRelay([{ path: '/v1/tasks', body: TASKS }]);
+    try {
+      assert.equal(JSON.parse(await tools.get('w2m_history').execute({}, {})).returned, 2);
+      assert.equal(JSON.parse(await tools.get('w2m_history').execute({ include_cancelled: false }, {})).returned, 1);
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it('clamps a huge limit instead of asking the relay for it', async () => {
+    const profileDir = makeProfile();
+    const { tools } = await register({ rabbitUrl: 'http://relay.test', profileDir, operatorToken: 'op' });
+    const stub = withRelay([{ path: '/v1/tasks', body: TASKS }]);
+    try {
+      await tools.get('w2m_history').execute({ limit: 1_000_000 }, {});
+      assert.equal(stub.calls[0].path, '/v1/tasks?limit=200', 'the local cap must win');
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it('summarises the fleet even when per-machine detail is unavailable', async () => {
+    const profileDir = makeProfile();
+    const { tools } = await register({ rabbitUrl: 'http://relay.test', profileDir });
+    const stub = withRelay([
+      { path: '/healthz', body: { protocol_version: 1, rabbit_time: 'now', relay_id: 'r1', uptime_ms: 1000, devices: 2, tasks: 5, results: 4, rtt: { machines_reporting: 1, min_ms: 40, max_ms: 40, avg_ms: 40, machines_stale: 0, machines_unknown: 1 } } },
+      { path: '/v1/devices', status: 401, body: { error: { code: 'UNAUTHORIZED' } } },
+    ]);
+    try {
+      const out = JSON.parse(await tools.get('w2m_stats').execute({}, {}));
+      assert.equal(out.ok, true);
+      assert.equal(out.counts.devices, 2);
+      assert.equal(out.counts.tasks, 5);
+      assert.equal(out.rtt.avg_ms, 40);
+      assert.equal(out.machines, null, 'the per-machine half is dropped rather than failing the summary');
+      assert.match(out.notes.join(' '), /per-machine detail is unavailable/);
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it('reports an unreported RTT as null, never as zero', async () => {
+    const profileDir = makeProfile();
+    const { tools } = await register({ rabbitUrl: 'http://relay.test', profileDir });
+    const stub = withRelay([{ path: '/healthz', body: { protocol_version: 1, devices: 1, tasks: 0, results: 0 } }]);
+    try {
+      const out = JSON.parse(await tools.get('w2m_stats').execute({}, {}));
+      // 0ms means "instantaneous"; a relay that does not report it means "unknown". Conflating the
+      // two is how a dead fleet reads as a healthy one.
+      assert.equal(out.rtt, null);
+      assert.equal(out.relay.relay_id, null);
+    } finally {
+      stub.restore();
+    }
+  });
+});
+
 describe('the scheduled job is owned by ctx.effect', () => {
   it('registers exactly one effect when enabled, and arms one unref\u2019d timer', async () => {
     const profileDir = makeProfile();
@@ -316,9 +453,9 @@ describe('the scheduled job is owned by ctx.effect', () => {
   });
 
   it('does not require ctx.effect when the feature is off', async () => {
-    // A host without `ctx.effect` must still be able to run the five W2M tools.
+    // A host without `ctx.effect` must still be able to run the W2M tools.
     const { tools } = await register({ rabbitUrl: 'http://127.0.0.1:1' }, { withEffect: false });
-    assert.equal(tools.size, 6);
+    assert.equal(tools.size, 8);
     assert.equal((await updateStatus(tools)).update.enabled, false);
   });
 

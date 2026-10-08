@@ -38,7 +38,7 @@ So the cross-machine capability has to be built. This is that build.
                        ▼
    ┌──────────────────────────────────┐        ┌──────────────────────────┐
    │  Windows · DSH session           │        │  macOS · DSH session     │
-   │   w2m plugin (6 tools)           │        │   w2m plugin (6 tools)   │
+   │   w2m plugin (8 tools)           │        │   w2m plugin (8 tools)   │
    │        │                         │        │        │                 │
    │   Localside agent                │        │   Localside agent        │
    │    · three anchors               │        │    · three anchors       │
@@ -140,8 +140,8 @@ Then give it the relay URL in that profile's `cordis.patch.yml`:
     machineName: win-desktop
 ```
 
-Restart DSH. You should see six tools: `w2m_devices`, `w2m_run`, `w2m_wait`,
-`w2m_report`, `w2m_status`, `w2m_update`.
+Restart DSH. You should see eight tools: `w2m_devices`, `w2m_run`, `w2m_wait`,
+`w2m_report`, `w2m_status`, `w2m_update`, `w2m_history`, `w2m_stats`.
 
 > `dsh` may not be on your `PATH`. On a packaged install it lives under
 > `resources/runtime/cli/bin/`. If `dsh` is not found, call it by path.
@@ -351,7 +351,7 @@ a product.
 |---|---|---|
 | relay | 91 | pairing, auth, SSE with `ready`-first and `seq` replay, leases with heartbeat renewal and expiry, dedupe, all six aggregation states, report generation, operation token, rate limiting, persistence and restart recovery, TLS, and the lost-offer recovery path |
 | agent | 105 | whitelist allow/deny, timeout, output truncation, exit codes, anchors on clean and dirty trees, four concurrent fingerprint computations, spool, a 40-case URL join matrix, cursor lifecycle across relay restarts |
-| plugin | 73 | six tools registered, schemas, typed errors, polling, operator-token enforcement (no request is sent without it), sub-path endpoints |
+| plugin | 73 | eight tools registered, schemas, typed errors, polling, operator-token enforcement (no request is sent without it), sub-path endpoints |
 | end to end + crossnetwork | 46 | two Localsides on two checkouts against one relay running real commands: consistent / divergent / failed / refused / unverifiable / deduped / long-lease / split, plus sub-path deployment, the two credential kinds, a SIGKILLed relay restarting with its ledger intact, pairing rate limiting, proxy-header trust boundaries, and the anti-buffering headers |
 | schedule | 39 | the daily slots as exact UTC instants, zones that shift by 30 minutes for DST, a full simulated year of consecutive arming, and catch-up collapsing several missed slots into one run |
 | auto-update | 34 | the install/skip decision, no downgrade, prerelease refused, an unverified tarball refused, a failed lookup recorded as an error rather than as "current", and no token ever persisted |

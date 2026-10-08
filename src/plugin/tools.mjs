@@ -65,6 +65,14 @@ export const inject = ['tools'];
 const PROTOCOL_VERSION = 1;
 
 /**
+ * Upper bound on how many tasks w2m_history will ask the relay for.
+ *
+ * The relay has its own cap; this one exists so a model asking for a very large page cannot make
+ * *this* machine allocate it, and so the number is visible where the tool that uses it lives.
+ */
+const MAX_HISTORY_LIMIT = 200;
+
+/**
  * This plugin's own version, baked in at pack time.
  *
  * The updater compares the newest release against this string, so a wrong value here means either a
@@ -2212,6 +2220,211 @@ export async function apply(ctx, config = {}) {
       return { ok: true, action, result, update: updater.describe() };
     },
     presentCall: () => ({ card: 'generic', title: 'w2m update', kind: 'read', rawInput: {} }),
+  }));
+
+  // -------------------------------------------------------------------------------------------
+  // 7. w2m_history -- what this fleet has been asked to do
+  // -------------------------------------------------------------------------------------------
+  ctx.tools.register(defineTool({
+    name: 'w2m_history',
+    description:
+      'List recent tasks the Rabbit still remembers, newest first: task id, mode, how many shards, ' +
+      'which machines hold leases, and whether it was cancelled. Read-only, and deliberately ' +
+      'narrower than w2m_status or w2m_wait: it answers "what has been run lately" without fetching ' +
+      'any result envelope. The relay keeps a bounded history, so an empty list can mean "nothing ' +
+      'recent" rather than "nothing ever" -- the count of what the relay holds is reported alongside.',
+    parameters: {
+      limit: {
+        type: 'number',
+        description: `How many tasks to return, newest first. Defaults to 20, and the relay caps it at ${MAX_HISTORY_LIMIT}.`,
+        default: 20,
+      },
+      mode: {
+        type: 'string',
+        description: 'Only tasks whose mode matches this, for example "replicate" or "split". Omit for all modes.',
+      },
+      include_cancelled: {
+        type: 'boolean',
+        description: 'Include tasks an operator cancelled. Defaults to true, because a cancel is part of the history.',
+      },
+    },
+    output: jsonOutput,
+    async execute(args, exec) {
+      throwIfAborted(exec?.signal);
+      const base = requireRabbit(cfg);
+      const token = await resolveToken(cfg);
+
+      const requested = typeof args?.limit === 'number' && Number.isFinite(args.limit)
+        ? Math.floor(args.limit)
+        : 20;
+      // Clamp locally as well as at the relay: asking for a million rows from a machine you cannot
+      // see is how a status call turns into a memory problem on someone else's relay.
+      const limit = Math.min(Math.max(requested, 1), MAX_HISTORY_LIMIT);
+
+      const result = await request({
+        rabbitUrl: base,
+        token,
+        signal: exec?.signal,
+        pathname: `/v1/tasks?limit=${limit}`,
+      });
+      if (!result.ok) {
+        throw new W2MError(
+          'W2M_RABBIT_REFUSED',
+          `W2M_RABBIT_REFUSED: the Rabbit refused GET /v1/tasks with HTTP ${result.status}` +
+            `${result.error ? ` (${result.error.code}: ${result.error.message})` : ''}; ` +
+            (result.status === 401
+              ? 'this machine is not paired, or its device_token is stale - pair the agent again'
+              : 'check the Rabbit log for the reason it gave'),
+          {
+            hint: result.status === 401
+              ? 'this machine is not paired, or its device_token is stale; pair the agent again'
+              : 'check the Rabbit log for the reason it gave',
+          },
+        );
+      }
+
+      // `GET /v1/tasks` answers `{protocol_version, rabbit_time, tasks:[...]}`. Filtering happens
+      // here rather than at the relay because the endpoint takes only a limit: a relay-side filter
+      // would be a protocol change for a display concern.
+      const all = Array.isArray(result.json?.tasks) ? result.json.tasks : [];
+      const wantedMode = typeof args?.mode === 'string' && args.mode.trim() !== '' ? args.mode.trim() : null;
+      const includeCancelled = args?.include_cancelled !== false;
+      const tasks = all.filter((t) => {
+        if (!includeCancelled && t?.cancelled === true) return false;
+        if (wantedMode !== null && t?.mode !== wantedMode) return false;
+        return true;
+      });
+
+      return JSON.stringify(
+        {
+          ok: true,
+          protocol_version: PROTOCOL_VERSION,
+          rabbit_time: result.json?.rabbit_time ?? null,
+          // Both numbers, because they answer different questions: `returned` is what the caller
+          // sees, `held` is what the relay has. A filter that hides everything must not look
+          // identical to an empty relay.
+          returned: tasks.length,
+          held: all.length,
+          limit,
+          filters: { mode: wantedMode, include_cancelled: includeCancelled },
+          tasks: tasks.map((t) => ({
+            task_id: t?.task_id ?? null,
+            mode: t?.mode ?? null,
+            created_at: t?.created_at ?? null,
+            created_by: t?.created_by ?? null,
+            index_total: t?.index_total ?? null,
+            cancelled: t?.cancelled === true,
+            degraded: t?.degraded ?? null,
+            machines: Array.isArray(t?.leases) ? t.leases : [],
+            lease_states: t?.lease_states ?? {},
+          })),
+          notes: tasks.length === 0 && all.length > 0
+            ? ['every task the relay holds was filtered out; widen the filters to see them']
+            : [],
+        },
+        null,
+        2,
+      );
+    },
+    presentCall: () => ({ card: 'generic', title: 'w2m history', kind: 'read', rawInput: {} }),
+  }));
+
+  // -------------------------------------------------------------------------------------------
+  // 8. w2m_stats -- the fleet at a glance, without reading any task
+  // -------------------------------------------------------------------------------------------
+  ctx.tools.register(defineTool({
+    name: 'w2m_stats',
+    description:
+      'Summarise the fleet in one read-only call: how many machines the relay holds, how many are ' +
+      'online, the round-trip time it has measured for each (null means never measured, which is ' +
+      'not the same as 0ms), task and result counts, and whether the relay restarted since your ' +
+      'last look. Cheaper than w2m_devices plus w2m_history when you only need the shape of things.',
+    parameters: {},
+    output: jsonOutput,
+    async execute(_args, exec) {
+      throwIfAborted(exec?.signal);
+      const base = requireRabbit(cfg);
+
+      // Two reads rather than one: `/healthz` is the only place the relay reports the aggregate RTT
+      // view, and `/v1/devices` is the only place it reports per-machine state. Neither requires a
+      // device token, so a machine that is not paired can still report on the fleet.
+      const health = await request({ rabbitUrl: base, signal: exec?.signal, pathname: '/healthz' });
+      if (!health.ok) {
+        throw new W2MError(
+          'W2M_RABBIT_REFUSED',
+          `W2M_RABBIT_REFUSED: the Rabbit refused GET /healthz with HTTP ${health.status}; ` +
+            'the relay is the only source of fleet state, so there is nothing to summarise',
+          { hint: 'check the relay is running and rabbitUrl points at it' },
+        );
+      }
+
+      let devices = null;
+      try {
+        const token = await resolveToken(cfg);
+        const res = await request({ rabbitUrl: base, token, signal: exec?.signal, pathname: '/v1/devices' });
+        devices = res.ok ? res.json : null;
+      } catch {
+        // A machine that is not paired can still report the fleet from /healthz. Dropping the
+        // per-machine half is better than failing a summary.
+        devices = null;
+      }
+
+      const h = health.json ?? {};
+      const rtt = h.rtt ?? null;
+      const list = Array.isArray(devices?.devices) ? devices.devices : [];
+      const online = list.filter((d) => d?.online === true).length;
+
+      return JSON.stringify(
+        {
+          ok: true,
+          protocol_version: PROTOCOL_VERSION,
+          rabbit_time: h.rabbit_time ?? null,
+          relay: {
+            relay_id: h.relay_id ?? null,
+            uptime_ms: h.uptime_ms ?? null,
+            started_at: h.started_at ?? null,
+            effective_scheme: h.effective_scheme ?? null,
+            base_path: h.base_path ?? null,
+            operator_token_required: h.operator_token_required ?? null,
+          },
+          counts: {
+            devices: h.devices ?? list.length,
+            online: devices === null ? null : online,
+            tasks: h.tasks ?? null,
+            results: h.results ?? null,
+            pairing_codes: h.pairing_codes ?? null,
+          },
+          // `null` throughout means "the relay did not report it", never "zero". Collapsing those
+          // two is how a broken relay reads as an idle one.
+          rtt: rtt === null
+            ? null
+            : {
+                machines_reporting: rtt.machines_reporting ?? null,
+                min_ms: rtt.min_ms ?? null,
+                max_ms: rtt.max_ms ?? null,
+                avg_ms: rtt.avg_ms ?? null,
+                machines_stale: rtt.machines_stale ?? null,
+                machines_unknown: rtt.machines_unknown ?? null,
+              },
+          machines: devices === null
+            ? null
+            : list.map((d) => ({
+                machine_id: d?.machine_id ?? null,
+                machine_name: d?.machine_name ?? null,
+                online: d?.online === true,
+                rtt_ms: d?.rtt_ms ?? null,
+                rtt_stale: d?.rtt_stale ?? null,
+                last_heartbeat_at: d?.last_heartbeat_at ?? null,
+              })),
+          notes: devices === null
+            ? ['per-machine detail is unavailable (this machine could not read /v1/devices); the fleet totals above still come from the relay']
+            : [],
+        },
+        null,
+        2,
+      );
+    },
+    presentCall: () => ({ card: 'generic', title: 'w2m stats', kind: 'read', rawInput: {} }),
   }));
 }
 

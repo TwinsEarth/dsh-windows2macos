@@ -55,7 +55,16 @@ if (warnings.length > 0) {
   process.stdout.write(`warnings:\n${warnings.map((w) => `  ${w}`).join('\n')}\n`);
 }
 
-const expected = ['w2m_devices', 'w2m_report', 'w2m_run', 'w2m_status', 'w2m_update', 'w2m_wait'];
+const expected = [
+  'w2m_devices',
+  'w2m_history',
+  'w2m_report',
+  'w2m_run',
+  'w2m_stats',
+  'w2m_status',
+  'w2m_update',
+  'w2m_wait',
+];
 const ok = registered.length === expected.length && expected.every((e) => names.includes(e));
 process.stdout.write(
   ok

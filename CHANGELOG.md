@@ -31,9 +31,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   method, the routed path, a timestamp, a nonce and the exact body bytes. It defends replay,
   tampering and a leaked log. It is **not** end-to-end encryption and not a replacement for TLS, and
   the module says so in its first paragraph — a security claim that overreaches is worse than none.
+- **`w2m_history` and `w2m_stats`**, taking the tool count from six to eight. `w2m_history` lists
+  recent tasks newest-first with their modes, shard counts, lease holders and cancellation state,
+  without fetching a single result envelope; it reports how many tasks the relay *holds* alongside
+  how many it returned, because a page emptied by a filter must not be indistinguishable from an
+  empty relay. `w2m_stats` summarises the fleet in one call — machine and task counts, the aggregate
+  RTT, whether the relay restarted — and degrades to the relay-reported totals when this machine
+  cannot read the per-machine roster. In both, `null` means "the relay did not report it" and never
+  "zero".
+- **A mechanical outbound-only check** (`test/outbound-only.test.mjs`). The project's central promise
+  is that no public IP, port forwarding or SSH server is needed because every machine only dials
+  out; that is easy to state and easy to break. The test runs real processes and asserts that a
+  registered agent binds nothing, that the relay's default bind is loopback and says so in its
+  banner, and that an unbindable host is a startup failure rather than a silent fallback.
 - **One-click installers**: `scripts/install.ps1` and `scripts/install.sh`, both verifying the
   published SHA-256 before writing anything, and both re-reading the installed package afterwards to
-  confirm the six tools actually register ("it installed" is not "it loads").
+  confirm the tools actually register ("it installed" is not "it loads").
 - **ESLint and Prettier**, with `docs/LINT-AUDIT.md` recording the current state honestly: 1 real
   defect, 27 style findings, 46 deliberately accepted. Prettier is configured but not applied —
   measured, it would rewrite 23,715 of 26,383 lines (89.9 %), and obliterating `git blame` for the
@@ -194,7 +207,7 @@ Each of these is a decision, not an implementation detail:
 |---|---|---|
 | relay | 91 | unchanged from 0.1.2 |
 | agent | 105 | unchanged from 0.1.2 |
-| plugin | 73 | six tools registered, operator token, sub-path, diagnostics, plus config validation and `ctx.effect` ownership |
+| plugin | 73 | eight tools registered, operator token, sub-path, diagnostics, plus config validation and `ctx.effect` ownership |
 | schedule | 39 | zone maths, exact UTC instants for each slot, DST zones, a year of consecutive arming, catch-up collapse |
 | auto-update | 34 | the install/skip decision, no downgrade, prerelease refusal, unverified tarball refused, lookup failure recorded as an error, token never persisted |
 | update-source | 50 | version ordering, streaming SHA-256, timeouts, rate limits, one real GitHub call |
