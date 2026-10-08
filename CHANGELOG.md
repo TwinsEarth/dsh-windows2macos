@@ -4,6 +4,55 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.7] — 2026-10-08
+
+### Fixed
+
+- **A flaky assertion in the agent suite, which failed on CI and passed locally every time.**
+  `never publishes a half-written document` asserted `reads > 20` inside a fixed 1200 ms wall-clock
+  deadline. That is a **throughput** threshold, not the property under test: whether the loop manages 20
+  iterations depends on how loaded the runner is, so on a busy machine it failed at 15 reads while the
+  atomic-publish code was perfectly correct. It passed here every time because this machine is fast.
+
+  The test now waits until the writer has actually published the file — so the loop cannot pass
+  vacuously by reading a file that never existed — and asserts `reads > 0` plus `parsed === reads`,
+  which is the real invariant and a torn write would break it. Verified over five consecutive runs of
+  the specific test and a full agent suite pass.
+
+  Worth recording because of where it surfaced: CI, not here. A test that measures machine speed will
+  always pass on the author's machine, which is exactly why the timestamped evidence has to come from
+  somewhere other than the machine that wrote the code.
+
+- **Two wrong metric-type and metric-set decisions corrected before release**, both pushed back on by
+  the teammate who implemented the renderer, and both worth stating because the reasoning is the
+  valuable part:
+
+  - `w2m_task_status_total{status}` is declared **`gauge`, not `counter`** despite the `_total` suffix. The
+    values are the *current* count of tasks in each state, so a task moving from `pending` to
+    `consistent` decrements one bucket and increments another. A counter is monotonic by definition, so
+    declaring this one would make `rate()` produce nonsense and violate the "counters reset on restart"
+    convention. The `_total` name is kept deliberately — a dashboard or recording rule may already point
+    at it — and this note is the record that the suffix is a name, not a claim about the type.
+  - `w2m_rtt_stale{machine_id}` was added (0/1, emitted only for machines that reported an RTT), because
+    `w2m_rtt_ms` alone cannot distinguish "genuinely slow" from "reported 40 ms once and then vanished
+    forever" — a stale series reads as a healthy machine. With both, the operator's query works:
+    `w2m_rtt_ms > 500 and on(machine_id) w2m_rtt_stale == 0`.
+
+  The implementer also **proved the null-versus-zero assertion has teeth by mutation**: pushing a
+  fabricated `rtt_ms: 0` for a silent machine turned three assertions red, then the mutant was deleted.
+
+### Verification
+
+621 unit tests, 619 pass, 2 skip, 0 fail, 0 todo; 63 end-to-end. 20 suites wired into `ci.yml`,
+`release.yml` and `package.json` with exhaustiveness checked. ESLint: 0 errors, 56 warnings, all
+pre-reviewed. The `Docker` workflow built both architectures successfully on the runner — which
+upgrades the multi-arch images added in 0.3.5 from "unverified" to **built**, though still not pushed
+anywhere.
+
+### Still not done
+
+**UI cards** — the last of the four v0.3.3 items.
+
 ## [0.3.6] — 2026-10-08
 
 ### Added
