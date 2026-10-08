@@ -281,6 +281,26 @@ export function aggregate(task, resultRecords = [], opts = {}) {
     } else if (step2.failed.length === 0 && step2.ok.length > 0) {
       /* §6.3 Step 2: 全部 ok → Step 3 */
       const okMachines = runnable.filter((m) => m.outcome === 'ok');
+
+      // Compare **within a shard**, not across the whole task.
+      //
+      // `index` is a comparable field, and `split` assigns it per machine by design -- so comparing
+      // every machine against every other made `index` differ on any successful fan-out, and every
+      // split task was reported `divergent`. That is a false alarm on the normal case: `divergent`
+      // tells an operator the machines disagreed, when in fact they did exactly what was asked.
+      //
+      // Grouping by `index` fixes it without special-casing the field: machines meant to produce the
+      // same output are compared with each other, and machines given different slices are not
+      // compared at all. For `replicate` every machine has index 0, so there is a single group and
+      // the behaviour is exactly as before -- which is why the existing 140 relay tests still pass
+      // unchanged.
+      const shards = new Map();
+      for (const m of okMachines) {
+        const key = m.index ?? 0;
+        if (!shards.has(key)) shards.set(key, []);
+        shards.get(key).push(m);
+      }
+
       const comparable = {};
       for (const field of COMPARABLE_FIELDS) {
         comparable[field] = {};
@@ -289,22 +309,38 @@ export function aggregate(task, resultRecords = [], opts = {}) {
           if (v !== undefined) comparable[field][m.machine_id] = v;
         }
       }
+
+      /**
+       * Fields that differ within some shard, with the shard that disagreed.
+       *
+       * `index` is reported with the shard so a genuine mixed-mode divergence ("shard 0 agreed,
+       * shard 1 did not") stays unambiguous.
+       */
       const differences = [];
-      for (const field of COMPARABLE_FIELDS) {
-        const values = okMachines.map((m) => canon(valueOf(m.envelope, field)));
-        if (values.length > 1 && values.some((v) => v !== values[0])) {
-          differences.push({
-            field,
-            values: Object.fromEntries(okMachines.map((m) => [m.machine_id, valueOf(m.envelope, field)])),
-          });
+      for (const [shardIndex, members] of shards) {
+        if (members.length < 2) continue; // one machine cannot disagree with itself
+        for (const field of COMPARABLE_FIELDS) {
+          const values = members.map((m) => canon(valueOf(m.envelope, field)));
+          if (values.some((v) => v !== values[0])) {
+            differences.push({
+              field,
+              index: shardIndex,
+              values: Object.fromEntries(members.map((m) => [m.machine_id, valueOf(m.envelope, field)])),
+            });
+          }
         }
       }
       step3.comparable = comparable;
       step3.differences = differences;
 
+      /** Metadata drift within any shard, for the `divergent-platform` branch. */
       const metaDiffers = (field) => {
-        const vals = okMachines.map((m) => canon(valueOf(m.envelope, field)));
-        return vals.length > 1 && vals.some((v) => v !== vals[0]);
+        for (const members of shards.values()) {
+          if (members.length < 2) continue;
+          const vals = members.map((m) => canon(valueOf(m.envelope, field)));
+          if (vals.some((v) => v !== vals[0])) return true;
+        }
+        return false;
       };
       const platformMetaDiffers = metaDiffers('toolchain') || metaDiffers('platform');
 

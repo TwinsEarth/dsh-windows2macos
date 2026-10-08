@@ -4,6 +4,72 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] — 2026-10-08
+
+The CI hardening the v0.3.0 batch called for, plus a correctness fix those tests found.
+
+### Fixed
+
+- **Every successful `split` was reported `divergent`.** `index` is a comparable field, the relay
+  hands each machine its own slice by index, and Step 3 of the aggregation flagged any comparable
+  field that differed. So a fan-out where every machine did exactly what it was asked produced a
+  verdict that `README.md` defines as "machines disagreed" — a false alarm on the normal case, every
+  time. Step 3 now compares **within a shard**: machines meant to produce the same output are
+  compared with each other, and machines given different slices are not compared at all.
+
+  The fix is a grouping rather than a special case, which is why it is safe: for `replicate` every
+  machine has index 0, so there is a single group and the behaviour is byte-identical. The 140
+  existing relay tests passing unchanged is the evidence for that, not a new test asserting it.
+  `step3.comparable` still reports each machine's index — it is simply not treated as disagreement.
+
+  Found by the stress suite written in the same release, not by inspection: no test anywhere covered
+  split aggregation, because the only split test asserted index *assignment*.
+
+### Added
+
+- **`test/stress.test.mjs`** — bounded load, asserted on the ledger rather than on status codes: 200
+  concurrent dispatches (ids unique, all retrievable, `/healthz` and `GET /v1/tasks` agreeing), 24
+  concurrent redeliveries of one instance recorded exactly once (checked in `results`, `taskResults`,
+  `result_seqs` and `dedupeReport`, with a verified `envelope_sha256`), 50 devices with no lease lost
+  and split indices matching `i % index_total`, and a limit-3/burst-12 refusal test with two controls
+  — failed attempts consume the same budget, and with the limiter off the same burst yields zero 429s.
+- **`test/recovery.test.mjs`** — the disconnect story against real processes: relay killed mid-task
+  and restarted, with the agent noticing on its own and the outcome still delivered; the witness file
+  showing the command ran exactly once across the reconnect; a cleanly closed stream treated as a
+  disconnect with a laddering backoff rather than a hot loop; and a 401 result staying spooled with
+  exactly one attempt.
+- **`scripts/scan-mojibake.mjs`** — the corruption that hit user-visible strings earlier is invisible
+  in review because the bytes are valid UTF-8; they just spell the wrong thing. This scans for it.
+
+### Notes on what these tests had to get right
+
+Both new suites produced failures that were in the tests, not the product, and the distinction
+mattered each time:
+
+- The recovery suite's `waitFor` used a truthiness check on an exit code, so `0` — success — read as
+  "not yet" and the case timed out while the product was working correctly. Confirmed with an
+  isolated repro before changing anything.
+- The stress suite's split assertion initially encoded the buggy expectation (`differences` non-empty)
+  alongside the correct one. Fixing the product meant inverting that assertion, which is exactly the
+  signal that the recorded defect was real rather than a misreading.
+- The stress suite's independent check read `m.envelope`, which `aggregateTask` deliberately omits
+  from its machine projection; it now reads `step3.comparable`, which is the field that actually
+  carries the compared values.
+
+### Verification
+
+568 unit tests, 566 pass, 2 skip, 0 fail, **0 todo**; 61 end-to-end. All 16 suites are wired into
+`ci.yml`, `release.yml` and `package.json`, and that exhaustiveness is itself checked — an earlier
+release had suites that no script ever ran. ESLint: 0 errors, 53 warnings, all pre-reviewed.
+
+### Not in this release
+
+- **`pipeline`** — the semantics question is answered (the whole chain runs on one machine, so
+  `broadcast` chooses where and `pipeline` describes the sequence) but the implementation is not
+  written. The reasoning and the required changes are in `docs/PIPELINE-DESIGN.md`; the relay rejects
+  `mode: "pipeline"` with `BAD_REQUEST` rather than silently falling back to `replicate`.
+- **Shared config, UI cards, metrics, multi-arch images** — untouched; the next batch.
+
 ## [0.3.2] — 2026-10-08
 
 The first half of the v0.3.3 batch: a third dispatch mode.
