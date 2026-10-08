@@ -24,6 +24,7 @@ import {
 } from './state.mjs';
 import { Persistence } from './persistence.mjs';
 import { aggregateTask, buildReport } from './report.mjs';
+import { renderMetrics, METRICS_CONTENT_TYPE } from './metrics.mjs';
 // v0.3.0 §9: request signing. This import is the entire point of the module --
 // until the HTTP layer calls it, HMAC support does not exist for any real request.
 import { DEFAULT_SKEW_SECONDS, NonceCache, verifyRequest } from '../signing.mjs';
@@ -351,6 +352,13 @@ export class RelayServer {
     ].filter((s) => s !== null); // newest first: keyIndex 0 = current, 1 = previous
     this.signingConfigured = this.signingSecrets.length > 0;
     this.requireSignature = options.requireSignature === true;
+    /**
+     * v0.3.3: whether `GET /metrics` exists.
+     *
+     * Defaults to off. A monitoring endpoint that appears without being asked for is a surface nobody
+     * chose, and the operator can turn it on with `--metrics` when a scraper exists.
+     */
+    this.metricsEnabled = options.metrics === true;
     this.signatureSkewSeconds = Number.isFinite(options.signatureSkewSeconds)
       ? options.signatureSkewSeconds : DEFAULT_SKEW_SECONDS;
     // One cache per relay instance: replay defence is stateful, and two relays
@@ -640,6 +648,32 @@ export class RelayServer {
       this.enforcePairRateLimit(req);
       const result = this.state.pair(takeJson());
       return sendJson(res, 200, result);
+    }
+    /**
+     * v0.3.3 `/metrics`: machine-readable fleet state for a monitoring system.
+     *
+     * Token-free, like `/healthz` and for the same reason: a scraper that needs the operator token
+     * would put that token in a Prometheus config file, which is a credential in a place nobody
+     * reviews. It is also exempt from signature checks for the same reason -- there is no secret to
+     * sign with on the scraper side.
+     *
+     * Exposed only when the relay was asked for it (`--metrics`). A monitoring endpoint that appears
+     * by default is a surface nobody chose, and the whole point of the defaults elsewhere is that the
+     * relay binds nothing the operator did not ask for.
+     */
+    if (method === 'GET' && path === '/metrics') {
+      if (!this.metricsEnabled) {
+        // 404 rather than 403: a disabled endpoint should look absent, not forbidden. A 403 tells a
+        // scanner the surface exists.
+        throw new ProtocolError('NOT_FOUND', 'metrics are not enabled on this relay', { hint: 'start the relay with --metrics' });
+      }
+      const body = renderMetrics(this.state, { nowMs: this.state.nowMs() });
+      res.writeHead(200, {
+        'content-type': METRICS_CONTENT_TYPE,
+        'content-length': Buffer.byteLength(body, 'utf8'),
+        'cache-control': 'no-store',
+      });
+      return res.end(body);
     }
     // §5: dispatching tasks needs the operator token, not a device token.
     if (method === 'POST' && path === '/v1/task') {

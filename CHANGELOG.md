@@ -4,6 +4,50 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.6] — 2026-10-08
+
+### Added
+
+- **`GET /metrics`**, Prometheus text format, off unless `--metrics` is passed. It is **token-free**
+  like `/healthz` and for the same reason: a scraper that needs the operator token puts that token in a
+  Prometheus config file, which is a credential in a place nobody reviews. It is likewise exempt from
+  signature checks, because the scraper has no secret to sign with — requiring one would make metrics
+  unreachable on exactly the hardened deployments that most want them.
+
+  Disabled answers **404, not 403**: a 403 tells a scanner the surface exists, and an endpoint that
+  appears without being asked for is a surface nobody chose.
+
+  The renderer was implemented separately from the route on purpose, and this release is the evidence
+  for why the two are different: the module had 16 green tests while `GET /metrics` still returned 401,
+  because a correct renderer behind an unreachable route is indistinguishable from an unimplemented
+  feature. `test/metrics-route.test.mjs` now covers the route itself — absent by default, token-free
+  when enabled, reachable under `--require-signature`, and never leaking the operator token or the
+  signing secret into a body that gets scraped into long-lived storage.
+
+  Where the renderer's rule lives: a machine that never reported an RTT has **no series at all**, not a
+  `0`. In Prometheus `0` is a real measurement meaning "instantaneous" while a missing series is
+  `absent()` — the same null-versus-zero distinction the relay-side RTT work turns on.
+
+### Fixed
+
+- **`--signing-secret`, `--signing-secret-previous`, `--require-signature` and `--signature-skew` were
+  parsed but missing from `--help`**, so an operator could not discover them from the CLI. A flag
+  nobody can find is a flag that does not exist in practice. Found by the teammate building the Docker
+  images, who reported it rather than fixing it outside their scope.
+- A fourth mojibake casualty: `cannot dispatch a tas` in the operator-token error, another word the
+  earlier GBK round trip truncated.
+
+### Verification
+
+621 unit tests, 619 pass, 2 skip, 0 fail, 0 todo. 20 suites wired into `ci.yml`, `release.yml` and
+`package.json` with exhaustiveness checked. ESLint: 0 errors, 55 warnings, all pre-reviewed.
+`/metrics` was also confirmed against a live relay process: 404 without `--metrics`, and 200 with the
+correct content type and metric series with it.
+
+### Still not done
+
+**UI cards** — the last of the four v0.3.3 items. The eight tools render through the generic card.
+
 ## [0.3.5] — 2026-10-08
 
 Two of the four remaining v0.3.3 items: shared configuration and multi-arch images.

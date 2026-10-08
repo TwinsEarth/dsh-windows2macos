@@ -50,6 +50,25 @@ Credentials and state:
                          restart.
   --pairing-code <c>     Use a fixed pairing code instead of a generated one.
 
+Request signing (v0.3.0):
+  --signing-secret <s>   Shared secret for HMAC-signed requests. Unset means the relay does
+                         not verify signatures at all, which is the v0.2.3 behaviour.
+                         Pass an empty string to switch signing off explicitly.
+                         [env W2M_SIGNING_SECRET]
+  --signing-secret-previous <s>
+                         The outgoing secret during a rotation. Both are accepted, so machines
+                         can be moved over one at a time instead of all at once.
+                         Requires --signing-secret.
+  --require-signature    Reject unsigned requests with 401 SIGNATURE_REQUIRED. Only takes
+                         effect once a secret is configured; the relay refuses to start if
+                         this is set without one, rather than silently verifying nothing.
+  --signature-skew <s>   Allowed clock difference in seconds. Default 120.
+
+Observability:
+  --metrics              Serve GET /metrics in Prometheus text format. Off by default, and
+                         token-free like /healthz, so a scraper never needs a credential in
+                         its own config file.
+
 Tuning:
   --heartbeat-ms <n>     Expected heartbeat interval. Default 10000.
   --grace-ms <n>         Extra grace before a silent lease is expired. Default 30000.
@@ -87,6 +106,7 @@ try {
       'signing-secret': { type: 'string' },
       'signing-secret-previous': { type: 'string' },
       'require-signature': { type: 'boolean', default: false },
+  metrics: { type: 'boolean', default: false },
       'signature-skew': { type: 'string' },
       'no-persist': { type: 'boolean', default: false },
       json: { type: 'boolean', default: false },
@@ -240,6 +260,7 @@ try {
     signingSecret,
     signingSecretPrevious,
     requireSignature,
+    metrics: values.metrics === true,
     signatureSkewSeconds,
   });
   // The pairing code rotates on every successful pairing, so the CLI has to
