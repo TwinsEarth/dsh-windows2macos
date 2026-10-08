@@ -145,9 +145,38 @@ export function jcs(value) {
   return JSON.stringify(String(value));
 }
 
+/**
+ * Upper bound on the stages a `pipeline` may contain.
+ *
+ * Each stage is another command run on someone else's machine, so an unbounded list is an unbounded
+ * amount of work created by one request. The limit is generous for the intended use (build, test,
+ * package) and exists so the failure is a clear refusal rather than a fleet-wide surprise.
+ */
+export const MAX_PIPELINE_STAGES = 16;
+
 /** §4.4 helper: command_hash = sha256(JCS(argv)+"|"+shell_id+"|"+cwd_rel). */
 export function computeCommandHash(commandArgv, shellId = SHELL_ID_DIRECT, cwdRel = '.') {
   return sha256Hex(`${jcs(commandArgv)}|${shellId}|${cwdRel}`);
+}
+
+/**
+ * `command_hash` for a whole pipeline.
+ *
+ * The hash must bind **every** stage, not just the first. Bound to stage 0 alone, two pipelines that
+ * differ after the first stage would carry the same hash -- so an envelope produced by the wrong
+ * chain would still verify, and making "the machine ran what I asked" checkable is the entire point
+ * of this field. Each stage's cwd participates for the same reason.
+ *
+ * The `|pipeline` suffix means this can never collide with a single-command hash: the two hash over
+ * different shapes, and that difference is deliberate rather than incidental.
+ */
+export function computePipelineCommandHash(stages, shellId = SHELL_ID_DIRECT) {
+  const canonical = stages.map((s) => ({
+    command_argv: s.command_argv,
+    cwd_rel: s.cwd_rel ?? '.',
+    continue_on_failure: s.continue_on_failure === true,
+  }));
+  return sha256Hex(`${jcs(canonical)}|${shellId}|pipeline`);
 }
 
 /** §4.4: dedupe_key = sha256(task_id + "|" + index + "|" + command_hash + "|" + base_tree). */
@@ -918,10 +947,73 @@ export class RabbitState {
    */
   createTask(input = {}) {
     const mode = input.mode ?? 'replicate';
-    if (mode !== 'replicate' && mode !== 'split' && mode !== 'broadcast') {
-      throw new ProtocolError('BAD_REQUEST', 'mode must be replicate|split|broadcast', { mode });
+    if (mode !== 'replicate' && mode !== 'split' && mode !== 'broadcast' && mode !== 'pipeline' && mode !== 'compose') {
+      throw new ProtocolError(
+        'BAD_REQUEST',
+        'mode must be replicate|split|broadcast|pipeline|compose',
+        { mode },
+      );
     }
-    const commandArgv = input.command_argv;
+    /**
+     * v0.3.3 `pipeline`: the whole chain runs on each machine, stage after stage.
+     *
+     * The semantics were chosen against the alternative (fan out stage 1, converge its outputs into
+     * stage 2) because that one has no well-defined input: on a fleet, stage 1 produces n different
+     * outputs, and "feed them all to stage 2" does not say in what order, or whether stage 2 then
+     * runs once or n times. Worse, two machines finishing in a different order would produce
+     * different stage-2 inputs, so one task_id would no longer describe one reproducible execution --
+     * which is the property the rest of this system is built on. See docs/PIPELINE-DESIGN.md.
+     *
+     * So: a pipeline is `replicate` applied to a sequence. Every machine runs the whole chain, there
+     * is no cross-machine data flow, and nothing new can be silently dropped in transit.
+     */
+    const rawStages = Array.isArray(input.stages) ? input.stages : null;
+    const isPipeline = mode === 'pipeline';
+    if (isPipeline) {
+      if (rawStages === null || rawStages.length === 0) {
+        throw new ProtocolError('BAD_REQUEST', 'mode=pipeline requires a non-empty `stages` array', {
+          stages: rawStages === null ? null : rawStages.length,
+        });
+      }
+      if (rawStages.length > MAX_PIPELINE_STAGES) {
+        throw new ProtocolError('BAD_REQUEST', `stages must have at most ${MAX_PIPELINE_STAGES} entries`, {
+          stages: rawStages.length,
+        });
+      }
+      rawStages.forEach((stage, i) => {
+        const argv = stage?.command_argv;
+        if (!Array.isArray(argv) || argv.length === 0 || argv.some((a) => typeof a !== 'string')) {
+          throw new ProtocolError('BAD_REQUEST', `stages[${i}].command_argv must be a non-empty string[]`, { index: i });
+        }
+      });
+      // A chain is one execution on one machine; sharding it would mean each machine ran a chain of
+      // its own slice, which is a different feature and not what the caller asked for.
+      if (Number.isInteger(input.index_total) && input.index_total !== 1) {
+        throw new ProtocolError('BAD_REQUEST', 'mode=pipeline runs the whole chain per machine, so index_total must be 1', {
+          index_total: input.index_total,
+        });
+      }
+    } else if (rawStages !== null) {
+      // Refused rather than ignored: the caller believes they described a sequence, and running only
+      // `command_argv` would silently drop every stage after the first.
+      throw new ProtocolError('BAD_REQUEST', '`stages` is only valid with mode=pipeline', { mode, stages: rawStages.length });
+    }
+
+    /**
+     * Normalized stage list. For every mode there is at least one stage, so downstream code has a
+     * single shape to reason about and `pipeline` is not a special case at the execution layer.
+     */
+    const stages = isPipeline
+      ? rawStages.map((s, i) => ({
+        index: i,
+        command_argv: [...s.command_argv],
+        cwd_rel: typeof s.cwd_rel === 'string' && s.cwd_rel ? s.cwd_rel : (typeof input.cwd_rel === 'string' && input.cwd_rel ? input.cwd_rel : '.'),
+        timeout_ms: Number.isInteger(s.timeout_ms) ? s.timeout_ms : null,
+        continue_on_failure: s.continue_on_failure === true,
+      }))
+      : null;
+
+    const commandArgv = isPipeline ? [...rawStages[0].command_argv] : input.command_argv;
     if (!Array.isArray(commandArgv) || commandArgv.length === 0 || commandArgv.some((a) => typeof a !== 'string')) {
       throw new ProtocolError('BAD_REQUEST', 'command_argv must be a non-empty string[]');
     }
@@ -939,7 +1031,9 @@ export class RabbitState {
     const now = this.nowMs();
     const cwdRel = typeof input.cwd_rel === 'string' && input.cwd_rel ? input.cwd_rel : '.';
     const baseTree = input.base_tree ?? null;
-    const commandHash = input.command_hash ?? computeCommandHash(commandArgv, SHELL_ID_DIRECT, cwdRel);
+    const commandHash = input.command_hash ?? (isPipeline
+      ? computePipelineCommandHash(stages, SHELL_ID_DIRECT)
+      : computeCommandHash(commandArgv, SHELL_ID_DIRECT, cwdRel));
     const timeoutMs = Number.isInteger(input.timeout_ms) ? input.timeout_ms : 300_000;
 
     // v0.3.3 `broadcast`: one machine runs the command, every other machine is told the outcome.
@@ -992,6 +1086,14 @@ export class RabbitState {
       result_seqs: [],
       /** v0.3.3: which machine actually executes under `broadcast`; null for the other modes. */
       executor_machine_id: executorMachineId,
+      /**
+       * v0.3.3: the normalized stage list for `pipeline`, or null.
+       *
+       * Sent to the machine in the offer so it can run the whole chain. Kept on the task as well so
+       * a report can say how many stages were supposed to run even when the machine crashed before
+       * reporting any of them.
+       */
+      stages,
     };
 
     const all = [...this.devices.values()];
@@ -1129,6 +1231,10 @@ export class RabbitState {
       index: lease.index,
       index_total: task.index_total,
       command_argv: task.command_argv,
+      // v0.3.3: present only for `pipeline`, and only then does the machine run a chain. Omitted
+      // entirely otherwise, so an offer for a single-command task is byte-identical to before --
+      // which is what keeps a v0.2.3 agent working against this relay.
+      ...(task.stages ? { stages: task.stages } : {}),
       cwd_rel: task.cwd_rel,
       write: task.write,
       timeout_ms: task.timeout_ms,

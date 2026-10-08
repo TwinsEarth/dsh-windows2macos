@@ -44,6 +44,7 @@ import {
   envelopeSha256,
   gitVersion,
   normalizeRelPath,
+  pipelineCommandHash,
   resolveProjectCwd,
 } from './git.mjs';
 import { createSpool } from './spool.mjs';
@@ -153,9 +154,17 @@ export const REFUSAL = {
   INVALID_OFFER: 'INVALID_OFFER',
 };
 
+/**
+ * Upper bound on the stages a single offer may carry (v0.3.3 `pipeline`).
+ *
+ * Mirrors the relay's `MAX_PIPELINE_STAGES`. Kept as a separate literal rather than imported so the
+ * agent's validation does not depend on the relay module: the agent must refuse an oversized chain
+ * on its own authority, and a shared import would make "the relay said so" the only reason it does.
+ */
+const MAX_STAGES = 16;
+
 /** Required envelope fields (§5.1). Missing any one makes a result unverifiable. */
-export const REQUIRED_ENVELOPE_FIELDS = [
-  'envelope_version',
+export const REQUIRED_ENVELOPE_FIELDS = [  'envelope_version',
   'task_id',
   'attempt',
   'dedupe_key',
@@ -1330,10 +1339,27 @@ export function createAgent(options) {
       endedAt,
       toolchain,
       comparePolicy,
+      pipeline,
+      protocolViolations,
     } = context;
 
     const stdout = execution?.stdout ?? Buffer.alloc(0);
     const normalized = normalizeOutput(stdout, comparePolicy ?? {});
+
+    /**
+     * The stage descriptors the pipeline hash is taken over, or null for a single command.
+     *
+     * Normalized exactly as the relay normalizes them (`cwd_rel` defaults to the task cwd,
+     * `continue_on_failure` to false), because the two sides must hash the same shape or every
+     * pipeline anchors as `unverifiable`.
+     */
+    const pipelineHashMaterial = pipeline && Array.isArray(pipeline.stages) && pipeline.total_stages > 1
+      ? pipeline.stages.map((s) => ({
+        command_argv: s.command_argv,
+        cwd_rel: s.cwd_rel ?? cwdRel,
+        continue_on_failure: s.continue_on_failure === true,
+      }))
+      : null;
 
     const envelope = {
       envelope_version: ENVELOPE_VERSION,
@@ -1357,7 +1383,17 @@ export function createAgent(options) {
       head_commit: anchorsAfter?.head_commit ?? anchorsBefore?.head_commit ?? null,
       dirty_before: anchorsBefore?.dirty_before === true,
       command_argv: commandArgv,
-      command_hash: commandHash(commandArgv, SHELL_ID, cwdRel),
+      // A pipeline's hash covers the whole chain, matching the relay's `computePipelineCommandHash`.
+      // Hashing only stage 0 would make every pipeline `unverifiable` at the anchor -- the machine ran
+      // exactly what it was asked and the relay still could not confirm it.
+      command_hash: pipelineHashMaterial === null
+        ? commandHash(commandArgv, SHELL_ID, cwdRel)
+        : pipelineCommandHash(pipelineHashMaterial, SHELL_ID),
+      // The material the pipeline hash was taken over. Kept in the envelope so a mismatch can be
+      // diagnosed from the result itself rather than by re-running with instrumentation -- which is
+      // what was needed to find the relay/agent disagreement this field now prevents. Present only for
+      // a chain, so a single-command envelope is byte-unchanged.
+      ...(pipelineHashMaterial === null ? {} : { pipeline_hash_material: pipelineHashMaterial }),
       shell_id: SHELL_ID,
       started_at: startedAt,
       ended_at: endedAt,
@@ -1383,6 +1419,18 @@ export function createAgent(options) {
     };
     if (execution?.signal) envelope.signal = execution.signal;
     if (offer.write === true) envelope.write = true;
+
+    // v0.3.3 `pipeline` (§5.2 optional). Present only for a chain, so a single-command envelope is
+    // byte-identical to before -- which is what keeps a v0.2.3 relay able to verify this one.
+    //
+    // The per-stage record is the point: a final exit code cannot distinguish "stage 3 failed" from
+    // "stages 3..5 never ran", and those need different responses from a reader.
+    if (pipeline && typeof pipeline === 'object') {
+      envelope.pipeline = pipeline;
+    }
+    if (Array.isArray(protocolViolations) && protocolViolations.length > 0) {
+      envelope.protocol_violations = protocolViolations;
+    }
     return buildEnvelope(envelope);
   }
 
@@ -1395,6 +1443,17 @@ export function createAgent(options) {
     if (!Array.isArray(offer.command_argv) || offer.command_argv.length === 0) return 'MISSING_COMMAND_ARGV';
     if (!offer.command_argv.every((part) => typeof part === 'string')) return 'COMMAND_ARGV_NOT_STRINGS';
     if (offer.index !== undefined && !Number.isInteger(offer.index)) return 'INDEX_NOT_INTEGER';
+    // v0.3.3: a pipeline carries its chain in `stages`. Validated here rather than trusted, because
+    // a malformed chain would otherwise run partially and report a result for work it never did.
+    if (offer.stages !== undefined) {
+      if (offer.mode !== 'pipeline') return 'STAGES_WITHOUT_PIPELINE_MODE';
+      if (!Array.isArray(offer.stages) || offer.stages.length === 0) return 'STAGES_NOT_NON_EMPTY_ARRAY';
+      if (offer.stages.length > MAX_STAGES) return 'TOO_MANY_STAGES';
+      for (const stage of offer.stages) {
+        if (!Array.isArray(stage?.command_argv) || stage.command_argv.length === 0) return 'STAGE_COMMAND_ARGV_MISSING';
+        if (!stage.command_argv.every((part) => typeof part === 'string')) return 'STAGE_COMMAND_ARGV_NOT_STRINGS';
+      }
+    }
     return null;
   }
 
@@ -1542,21 +1601,114 @@ export function createAgent(options) {
       }
 
       // ---- 6. execute ------------------------------------------------------
-      heartbeat.setPhase('running', 50);
-      const execution = await runArgv(commandArgv, {
-        cwd: cwdOutcome.cwd,
-        timeoutMs: Number.isFinite(offer.timeout_ms) ? offer.timeout_ms : DEFAULT_TIMEOUT_MS,
-        maxOutputBytes,
-        signal: controller.signal,
-      });
+      //
+      // Every offer has at least one stage: a single-command task is the one-stage case (the relay
+      // normalizes it that way), so there is no separate branch for the chain. `pipeline` adds
+      // ordering and stop-on-failure, not a second execution path.
+      const isPipeline = Array.isArray(offer.stages) && offer.stages.length > 0;
+      const plannedStages = isPipeline
+        ? offer.stages.map((s, i) => ({
+          index: i,
+          command_argv: [...s.command_argv],
+          cwd_rel: typeof s.cwd_rel === 'string' && s.cwd_rel ? s.cwd_rel : (offer.cwd_rel ?? '.'),
+          continue_on_failure: s.continue_on_failure === true,
+        }))
+        : [{ index: 0, command_argv: [...offer.command_argv], cwd_rel: offer.cwd_rel ?? '.', continue_on_failure: false }];
+
+      // The task's timeout is a budget for the whole chain, not per stage. Giving each stage the full
+      // timeout would let a 16-stage pipeline run 16x longer than the caller asked for, and the relay
+      // would have given up long before.
+      const totalBudgetMs = Number.isFinite(offer.timeout_ms) ? offer.timeout_ms : DEFAULT_TIMEOUT_MS;
+      const chainStartedAt = Date.now();
+
+      const stageReports = [];
+      /** The last stage's execution, used for the envelope's top-level exit code and output hashes. */
+      let execution = null;
+      let stoppedAt = null;
+      const protocolViolations = [];
+
+      for (const stage of plannedStages) {
+        heartbeat.setPhase('running', 50);
+
+        const stageCwdOutcome = resolveProjectCwd(project, stage.cwd_rel);
+        if (!stageCwdOutcome.ok) {
+          // A stage whose cwd is outside the project is a refusal of the whole chain: continuing
+          // would run later stages against a working directory the caller never asked for.
+          protocolViolations.push(`stage ${stage.index}: ${stageCwdOutcome.reason}`);
+          stageReports.push({
+            index: stage.index,
+            command_argv: stage.command_argv,
+            cwd_rel: stage.cwd_rel,
+            status: 'refused',
+            refusal_reason: stageCwdOutcome.reason,
+            exit_code: null,
+            duration_ms: 0,
+          });
+          stoppedAt = stage.index;
+          break;
+        }
+
+        const elapsedMs = Date.now() - chainStartedAt;
+        const remainingMs = totalBudgetMs - elapsedMs;
+        if (remainingMs <= 0) {
+          warnings.push('PIPELINE_BUDGET_EXHAUSTED');
+          stageReports.push({
+            index: stage.index,
+            command_argv: stage.command_argv,
+            cwd_rel: stage.cwd_rel,
+            status: 'timeout',
+            exit_code: null,
+            duration_ms: 0,
+          });
+          stoppedAt = stage.index;
+          break;
+        }
+
+        const ran = await runArgv(stage.command_argv, {
+          cwd: stageCwdOutcome.cwd,
+          timeoutMs: remainingMs,
+          maxOutputBytes,
+          signal: controller.signal,
+        });
+        execution = ran;
+        for (const warning of ran.warnings) if (!warnings.includes(warning)) warnings.push(warning);
+
+        const stageStatus = classifyExit(ran);
+        stageReports.push({
+          index: stage.index,
+          command_argv: stage.command_argv,
+          cwd_rel: stageCwdOutcome.cwd_rel ?? stage.cwd_rel,
+          // Carried so the agent's pipeline hash covers the same shape the relay hashes. Omitting it
+          // would make the two disagree the moment a caller sets `continue_on_failure: true`.
+          continue_on_failure: stage.continue_on_failure,
+          status: stageStatus,
+          exit_code: ran.exit_code,
+          duration_ms: ran.duration_ms,
+          stdout_sha256: ran.stdout_sha256,
+          stderr_sha256: ran.stderr_sha256,
+        });
+
+        if (ran.timed_out) log('warn', `${offer.task_id} stage ${stage.index} timed out`);
+        if (ran.cancelled) log('warn', `${offer.task_id} stage ${stage.index} was cancelled`);
+
+        if (stageStatus !== 'ok' && !stage.continue_on_failure) {
+          stoppedAt = stage.index;
+          break;
+        }
+      }
 
       heartbeat.setPhase('finalizing', 90);
-      for (const warning of execution.warnings) if (!warnings.includes(warning)) warnings.push(warning);
-      if (execution.timed_out) log('warn', `${offer.task_id} timed out after ${offer.timeout_ms}ms`);
-      if (execution.cancelled) log('warn', `${offer.task_id} was cancelled`);
+      if (execution === null) {
+        // Nothing ran at all (a refused first stage, or a budget already spent). `execution` stays
+        // null, which `finish` renders as an empty-output envelope -- the honest shape for "no
+        // command produced output".
+        log('warn', `${offer.task_id} ran no pipeline stage`);
+      }
+      if (execution?.timed_out) log('warn', `${offer.task_id} timed out after ${offer.timeout_ms}ms`);
+      if (execution?.cancelled) log('warn', `${offer.task_id} was cancelled`);
 
       const anchorsAfter = await safeAnchors(warnings);
-      const status = classifyExit(execution);
+      const status = execution ? classifyExit(execution) : (protocolViolations.length > 0 ? 'refused' : 'unverifiable');
 
       await finish({
         offer,
@@ -1570,6 +1722,17 @@ export function createAgent(options) {
         warnings,
         startedAt,
         endedAt: new Date().toISOString(),
+        // v0.3.3: the per-stage record travels with the envelope so a reader can see which stage
+        // failed and which never ran, instead of only a final exit code.
+        pipeline: isPipeline
+          ? {
+            total_stages: plannedStages.length,
+            completed_stages: stageReports.length,
+            stopped_at: stoppedAt,
+            stages: stageReports,
+          }
+          : null,
+        protocolViolations,
       });
     } catch (error) {
       // Never leave a claimed task unspooled: emit a crashed envelope so the
@@ -1585,7 +1748,10 @@ export function createAgent(options) {
           execution: null,
           status: 'crashed',
           refusalReason: null,
-          warnings: [...warnings, 'AGENT_ERROR'],
+          // The error text travels with the envelope. Without it, a crashed pipeline is visible only as
+          // `status: crashed` on the wire and the cause has to be reproduced to be seen -- which is
+          // exactly the situation this field was added to end.
+          warnings: [...warnings, 'AGENT_ERROR', `AGENT_ERROR_DETAIL: ${error?.message ?? String(error)}`],
           startedAt,
           endedAt: new Date().toISOString(),
         });

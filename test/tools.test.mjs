@@ -301,12 +301,115 @@ describe('registration shape', () => {
     assert.notEqual(write.required, true);
   });
 
-  it('makes command_argv a required string array and never a shell string', async () => {
+  it('makes command_argv a string array, and not a shell string', async () => {
     const { tools } = await register({ rabbitUrl: RABBIT });
     const argv = paramsOf(tools.get('w2m_run')).command_argv;
     assert.equal(argv.type, 'array');
     assert.equal(argv.items.type, 'string');
-    assert.equal(argv.required, true);
+    // No longer `required: true`. As of v0.3.3 a pipeline states its commands in `stages` and the
+    // relay derives this from stage 0, so an unconditional `required` would make a pipeline task
+    // impossible to express. The obligation moved into the executor rather than disappearing -- the
+    // test below is what holds that in place.
+    assert.notEqual(argv.required, true);
+    assert.match(argv.description, /Omit under mode=pipeline/);
+  });
+
+  it('still refuses a missing command outside pipeline mode', async () => {
+    // The obligation moved, it did not disappear: without this, dropping `required` would have made a
+    // task with no command at all expressible.
+    const fetchStub = installFetch([]);
+    try {
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
+      const run = tools.get('w2m_run');
+      await assert.rejects(() => run.execute(runArgs({ command_argv: undefined }), {}), /command_argv/);
+      await assert.rejects(
+        () => run.execute(runArgs({ mode: 'pipeline', command_argv: undefined }), {}),
+        /without `stages`/,
+      );
+      assert.equal(fetchStub.calls.length, 0, 'neither may reach the relay');
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('refuses a pipeline with no stages, too many stages, an empty stage, or stages outside pipeline', async () => {
+    const fetchStub = installFetch([]);
+    try {
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
+      const run = tools.get('w2m_run');
+      await assert.rejects(
+        () => run.execute(runArgs({ mode: 'pipeline', command_argv: undefined, stages: [] }), {}),
+        /missing or empty/,
+      );
+      await assert.rejects(
+        () => run.execute(
+          runArgs({ mode: 'pipeline', command_argv: undefined, stages: Array.from({ length: 17 }, () => 'node --test') }),
+          {},
+        ),
+        /at most 16/,
+      );
+      await assert.rejects(
+        () => run.execute(runArgs({ mode: 'pipeline', command_argv: undefined, stages: ['node --test', '   '] }), {}),
+        /stages\[1\]/,
+      );
+      await assert.rejects(
+        () => run.execute(runArgs({ mode: 'replicate', stages: ['node --test'] }), {}),
+        /only applies to mode=pipeline/,
+      );
+      await assert.rejects(
+        () => run.execute(
+          runArgs({ mode: 'pipeline', command_argv: undefined, stages: ['node --test'], index_total: 2 }),
+          {},
+        ),
+        /index_total` must be 1/,
+      );
+      assert.equal(fetchStub.calls.length, 0);
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('sends each pipeline stage as a relay stage, and checks every stage against the allow-list', async () => {
+    // The allow-list is default-deny. Checking only stage 0 would let a pipeline smuggle a disallowed
+    // command into a later stage while the first stage satisfied the list.
+    const fetchStub = installFetch([
+      { path: '/v1/task', method: 'POST', body: { task_id: 'T1', seq: 1, leases: [] } },
+    ]);
+    try {
+      const { tools } = await register({
+        rabbitUrl: RABBIT,
+        stateDir: await makeStateDir(PAIRED_DEVICE),
+        operatorToken: OPERATOR_TOKEN,
+        allowedCommands: ['node'],
+      });
+      const run = tools.get('w2m_run');
+
+      await run.execute(
+        runArgs({ mode: 'pipeline', command_argv: undefined, stages: ['node --test', 'node scripts/pack.mjs'] }),
+        {},
+      );
+      const sent = fetchStub.calls.at(-1).body;
+      assert.equal(sent.mode, 'pipeline');
+      assert.deepEqual(sent.stages, [
+        { command_argv: ['node', '--test'] },
+        { command_argv: ['node', 'scripts/pack.mjs'] },
+      ]);
+      assert.equal('command_argv' in sent, false, 'the relay derives stage 0, so it must not be sent');
+
+      // A disallowed command in the *second* stage is refused, and the refusal names the stage.
+      const refused = JSON.parse(
+        await run.execute(
+          runArgs({ mode: 'pipeline', command_argv: undefined, stages: ['node --test', 'rm -rf /'] }),
+          {},
+        ),
+      );
+      assert.equal(refused.state, 'refused');
+      assert.equal(refused.stage_index, 1, 'the refusal must name which stage was rejected');
+      assert.match(refused.message, /stage 1/);
+      assert.equal(fetchStub.calls.length, 1, 'nothing may reach the relay once a stage is refused');
+    } finally {
+      fetchStub.restore();
+    }
   });
 
   it('requires task_id for both w2m_wait and w2m_report', async () => {
@@ -474,9 +577,12 @@ describe('argument gating', () => {
       const run = tools.get('w2m_run');
       // `broadcast` used to be the unknown-mode example here. It is a real mode as of v0.3.3, so the
       // example had to move to something genuinely unknown.
+      // `pipeline` used to be the unknown-mode example; it is a real mode as of v0.3.3, so the example
+      // moved to something genuinely unknown. A pipeline without stages is still refused, by its own
+      // check -- asserted separately below.
       await assert.rejects(
-        () => run.execute(runArgs({ mode: 'pipeline' }), {}),
-        /`replicate`, `split` or `broadcast`/,
+        () => run.execute(runArgs({ mode: 'teleport' }), {}),
+        /`replicate`, `split`, `broadcast` or `pipeline`/,
       );
       await assert.rejects(() => run.execute(runArgs({ mode: 'split', index_total: 0 }), {}), /index_total/);
       await assert.rejects(

@@ -127,6 +127,33 @@ export function commandHash(argv, shellId, cwdRel) {
 }
 
 /**
+ * `command_hash` for a whole pipeline (v0.3.3).
+ *
+ * Must produce exactly what the relay's `computePipelineCommandHash` produces, or the anchor check in
+ * the relay's Step 1 sees `command_hash mismatch` and every pipeline is `unverifiable` -- which is what
+ * happened on the first end-to-end run. The two implementations are deliberately independent
+ * (neither imports the other) and the shared shape is asserted by a test that recomputes both, so a
+ * drift in either is caught rather than silently agreeing.
+ *
+ * The hash binds **every** stage: bound to stage 0 alone, two chains differing after the first stage
+ * would share a hash, and an envelope from the wrong chain would still verify.
+ *
+ * @param {Array<{command_argv: string[], cwd_rel?: string, continue_on_failure?: boolean}>} stages
+ * @param {string} shellId
+ * @returns {string}
+ */
+export function pipelineCommandHash(stages, shellId) {
+  if (!Array.isArray(stages)) throw new TypeError('pipelineCommandHash: stages must be an array');
+  const canonical = stages.map((s) => ({
+    command_argv: s.command_argv,
+    cwd_rel: normalizeRelPath(s.cwd_rel ?? '.'),
+    continue_on_failure: s.continue_on_failure === true,
+  }));
+  const material = `${jcs(canonical)}|${shellId}|pipeline`;
+  return createHash('sha256').update(material, 'utf8').digest('hex');
+}
+
+/**
  * `envelope_sha256` per §5.1: JCS hash of the envelope without that field.
  *
  * @param {Record<string, unknown>} envelope

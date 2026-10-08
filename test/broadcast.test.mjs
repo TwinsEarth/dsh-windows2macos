@@ -1,16 +1,21 @@
 /**
- * `broadcast` mode (v0.3.3): one machine runs, every other machine is told the outcome.
+ * `broadcast` and `pipeline` modes (v0.3.3).
  *
- * The property this file exists to protect: **a machine that did not run must never be counted as
- * agreeing.** That is the failure this mode can most easily produce, and it would be invisible in a
- * status line -- the aggregate would simply say `consistent`, and the reader would conclude that the
- * whole fleet had verified the result when in fact one machine ran and the others were told about it.
+ * `broadcast`: one machine runs, every other machine is told the outcome. The property this file
+ * exists to protect is that **a machine that did not run must never be counted as agreeing.** That is
+ * the failure this mode can most easily produce, and it would be invisible in a status line -- the
+ * aggregate would simply say `consistent`, and the reader would conclude that the whole fleet had
+ * verified the result when in fact one machine ran and the others were told about it.
  *
  * So the tests are written around that distinction rather than around the happy path:
  *   * observers hold an `observing` lease and are excluded from every aggregation step;
  *   * a broadcast with a silent executor is `pending`, not `consistent` with zero participants;
  *   * an observer that never reports does not hold the verdict open, because it was never asked to;
  *   * the executor is deterministic, so the same task record describes the same execution twice.
+ *
+ * `pipeline`: the whole chain runs on each machine, stage after stage. The property here is that the
+ * **command hash binds every stage**, so an envelope produced by the wrong chain cannot verify -- and
+ * that a chain stopping early is distinguishable from one that completed.
  */
 
 import { describe, it } from 'node:test';
@@ -225,13 +230,14 @@ describe('broadcast: one executor, the rest are told', () => {
     );
   });
 
-  it('rejects a mode that is still not implemented instead of silently replicating', () => {
-    // `pipeline` is not built yet. Accepting it and behaving like `replicate` would run the command
-    // on every machine -- a silent, expensive misreading of the request.
+  it('rejects an unknown mode instead of silently replicating', () => {
+    // `pipeline` used to be the example here; it is implemented as of v0.3.3, so the example moved to
+    // a mode that is genuinely not a mode. Accepting one and behaving like `replicate` would run the
+    // command on every machine -- a silent, expensive misreading of the request.
     const h = harness();
     assert.throws(
-      () => h.state.createTask({ mode: 'pipeline', command_argv: ARGV, index_total: 1 }),
-      (err) => err.code === 'BAD_REQUEST' && /replicate\|split\|broadcast/.test(err.message),
+      () => h.state.createTask({ mode: 'teleport', command_argv: ARGV, index_total: 1 }),
+      (err) => err.code === 'BAD_REQUEST' && /replicate\|split\|broadcast\|pipeline\|compose/.test(err.message),
     );
   });
 
@@ -259,5 +265,147 @@ describe('broadcast: one executor, the rest are told', () => {
     // truth for what a reader may encounter.
     assert.ok(AGGREGATE_STATUSES.length >= 9);
     assert.equal(typeof computeCommandHash(ARGV, 'direct-exec', '.'), 'string');
+  });
+});
+
+describe('pipeline: the whole chain runs on each machine', () => {
+  /** A two-stage chain, deliberately with different cwds so the hash has to bind both. */
+  const STAGES = [
+    { command_argv: ['node', '-e', 'console.log(1)'] },
+    { command_argv: ['node', '-e', 'console.log(2)'], cwd_rel: 'sub' },
+  ];
+
+  /** Create a pipeline task and return the full record. */
+  function makePipeline(h, over = {}) {
+    const created = h.state.createTask({
+      mode: 'pipeline',
+      command_argv: STAGES[0].command_argv, // the relay normalizes stage 0 into this
+      stages: STAGES,
+      base_commit: BASE_COMMIT,
+      base_tree: BASE_TREE,
+      timeout_ms: 60_000,
+      ...over,
+    });
+    return h.state.getTask(created.task_id);
+  }
+
+  it('records the normalized stage list and exposes stage 0 as command_argv', () => {
+    const h = harness();
+    const task = makePipeline(h);
+    assert.equal(task.mode, 'pipeline');
+    assert.equal(task.stages.length, 2);
+    assert.deepEqual(task.stages.map((s) => s.index), [0, 1]);
+    assert.deepEqual(task.stages[1].command_argv, ['node', '-e', 'console.log(2)']);
+    assert.equal(task.stages[1].cwd_rel, 'sub');
+    // `command_argv` stays populated because every other part of the system (dedupe, reports,
+    // the tool's display) already reads it, and a pipeline is still a task that runs a command.
+    assert.deepEqual(task.command_argv, STAGES[0].command_argv);
+  });
+
+  it('binds every stage in command_hash, not just the first', () => {
+    // If the hash covered stage 0 alone, a chain differing only after the first stage would carry the
+    // same hash -- and an envelope from the wrong chain would still verify against the anchor.
+    const h = harness();
+    const a = makePipeline(h);
+    const b = makePipeline(h, {
+      stages: [STAGES[0], { command_argv: ['node', '-e', 'console.log(999)'], cwd_rel: 'sub' }],
+    });
+    assert.notEqual(a.command_hash, b.command_hash, 'a later stage must change the hash');
+
+    // And the cwd of a later stage counts too, since it changes what the command does.
+    const c = makePipeline(h, {
+      stages: [STAGES[0], { command_argv: STAGES[1].command_argv, cwd_rel: 'elsewhere' }],
+    });
+    assert.notEqual(a.command_hash, c.command_hash, "a later stage's cwd must change the hash");
+  });
+
+  it('sends the chain to every machine, since a pipeline is replicate over a sequence', () => {
+    const h = harness();
+    const task = makePipeline(h);
+    assert.equal(task.executor_machine_id, null, 'a pipeline has no single executor');
+    assert.deepEqual([...task.leases.values()].map((l) => l.state), ['offered', 'offered', 'offered']);
+    assert.deepEqual([...task.leases.values()].map((l) => l.index), [0, 0, 0]);
+  });
+
+  it('carries the stages in the offer, and omits the key for every other mode', () => {
+    const h = harness();
+    const offers = [];
+    h.state.onEvent((e) => {
+      if (e.event.type === 'task.offer') offers.push(e.event);
+    });
+    makePipeline(h);
+    assert.equal(offers.length, 3);
+    assert.equal(offers[0].stages.length, 2, 'the machine needs the whole chain, not just stage 0');
+
+    // Byte-compatibility: a v0.2.3 agent must not see a field it does not know. Omitted entirely
+    // rather than set to null, because `'stages' in offer` is the check the agent makes.
+    const h2 = harness();
+    const plain = [];
+    h2.state.onEvent((e) => {
+      if (e.event.type === 'task.offer') plain.push(e.event);
+    });
+    h2.state.createTask({ command_argv: ARGV, base_tree: BASE_TREE, base_commit: BASE_COMMIT });
+    assert.equal('stages' in plain[0], false);
+  });
+
+  it('refuses a pipeline without stages, too many stages, a bad stage, or a shard count', () => {
+    const h = harness();
+    const bad = (over, pattern) => {
+      assert.throws(
+        () => h.state.createTask({ mode: 'pipeline', command_argv: ARGV, base_tree: BASE_TREE, ...over }),
+        (err) => err.code === 'BAD_REQUEST' && pattern.test(err.message),
+        `expected BAD_REQUEST matching ${pattern}`,
+      );
+    };
+    bad({}, /requires a non-empty `stages`/);
+    bad({ stages: [] }, /requires a non-empty `stages`/);
+    bad({ stages: Array.from({ length: 17 }, () => ({ command_argv: ARGV })) }, /at most 16/);
+    bad({ stages: [{ command_argv: [] }] }, /stages\[0\]\.command_argv/);
+    bad({ stages: [{ command_argv: [1, 2] }] }, /stages\[0\]\.command_argv/);
+    bad({ stages: STAGES, index_total: 3 }, /index_total must be 1/);
+
+    // And `stages` outside pipeline mode is refused rather than ignored: the caller believes they
+    // described a sequence, and running only stage 0 would silently drop the rest.
+    assert.throws(
+      () => h.state.createTask({ mode: 'replicate', command_argv: ARGV, stages: STAGES, base_tree: BASE_TREE }),
+      (err) => err.code === 'BAD_REQUEST' && /only valid with mode=pipeline/.test(err.message),
+    );
+  });
+
+  it('aggregates a pipeline like a replicate task, because that is what it is', () => {
+    const h = harness();
+    const task = makePipeline(h);
+    for (const lease of task.leases.values()) {
+      h.state.submitResult(envelope(task, lease.machine_id, { index: 0 }));
+    }
+    const agg = aggregate(task, h.state.results.values(), { nowMs: T0 + 1000 });
+    // Every machine ran the same chain and agreed, so a complete fan-out is `consistent`. The
+    // per-stage detail lives in the envelopes; the verdict compares machines, not stages.
+    assert.equal(agg.status, 'consistent');
+    assert.equal(agg.counts.ok, 3);
+  });
+
+  it('keeps a one-machine pipeline distinguishable from a single command', () => {
+    const h = harness();
+    const single = h.state.createTask({
+      mode: 'pipeline',
+      command_argv: ARGV,
+      stages: [{ command_argv: ARGV }],
+      base_tree: BASE_TREE,
+      base_commit: BASE_COMMIT,
+    });
+    const plain = h.state.createTask({
+      mode: 'replicate',
+      command_argv: ARGV,
+      base_tree: BASE_TREE,
+      base_commit: BASE_COMMIT,
+    });
+    const singleTask = h.state.getTask(single.task_id);
+    const plainTask = h.state.getTask(plain.task_id);
+    // Same command, but only one of them is a chain. If the hashes matched, the `|pipeline` suffix
+    // would be doing nothing and the two modes would be indistinguishable at the anchor.
+    assert.notEqual(singleTask.command_hash, plainTask.command_hash);
+    assert.equal(singleTask.stages.length, 1);
+    assert.equal(plainTask.stages, null);
   });
 });

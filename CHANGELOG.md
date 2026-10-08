@@ -4,6 +4,70 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.4] — 2026-10-08
+
+### Added
+
+- **`pipeline` mode.** Every machine runs the whole chain from `stages`, in order, stopping at the
+  first stage that fails. The semantics were chosen against the alternative — fan stage 1 out, converge
+  its outputs into stage 2 — because that one has **no well-defined input**: on a fleet, stage 1
+  produces *n* different outputs, and "feed them all to stage 2" does not say in what order, or
+  whether stage 2 then runs once or *n* times. Worse, two machines finishing in a different order would
+  produce different stage-2 inputs, so one `task_id` would no longer describe one reproducible
+  execution — which is the property this system is built on. A pipeline is therefore `replicate`
+  applied to a sequence: no cross-machine data flow, so nothing can be silently dropped in transit.
+  The reasoning is in `docs/PIPELINE-DESIGN.md`.
+
+  The chain's `command_hash` binds **every** stage. Bound to stage 0 alone, two chains differing after
+  the first stage would share a hash, and an envelope produced by the wrong chain would still verify —
+  defeating the point of the anchor. The agent and the relay compute this hash with independent
+  implementations, and a test recomputes both to catch a drift rather than letting them agree silently.
+
+  A per-stage record travels in the envelope, so a reader can tell "stage 1 failed" from "stages 2..n
+  never ran" — a single exit code cannot, and the two call for different responses.
+
+### Fixed
+
+- **`pipelineCommandHash` was never imported into the agent.** Referenced but not bound, so every
+  pipeline offer threw `ReferenceError` at envelope-build time and was reported as `crashed`. The
+  mistake survived an import check because a *comment* in the same file mentioned the name: the check
+  searched the file text instead of the import block, so it reported success. The check now matches the
+  import statement itself.
+
+### Verified
+
+`test/pipeline-e2e.test.mjs` drives a real relay and a real agent: the stages append to a witness file,
+so the ordering evidence is written by the stages themselves and cannot be right unless they ran in
+that order. The second case proves the chain stops — a failing second stage means the third never
+writes to the witness at all.
+
+### Notes on what the e2e had to get right
+
+Five versions of this file failed before it passed, and every failure was the test reaching for
+something that does not exist:
+
+- `GET /v1/tasks/{id}/report` returns a *string* body, not parsed JSON, and the aggregate lives under
+  `body`. `GET /v1/tasks/{id}` returns parsed JSON — and requires a **device** token, not the operator
+  token, which is what the first version sent.
+- `aggregate.machines` is a projection that deliberately omits envelopes, so
+  `aggregate.machines[0].envelope` is `undefined` by design. The per-stage shape is asserted in
+  `broadcast.test.mjs` against the state object instead; the e2e asserts only what the wire publishes.
+- `base_tree` must be the agent's `treeFingerprint` (`git-temp-index-tree/v1`), not
+  `git rev-parse HEAD^{tree}`. A git tree SHA is a different value, and sending one made every task
+  `unverifiable`.
+- The agent's allow-list is **default-deny**; without `--allowed-commands` every offer is refused
+  `COMMAND_NOT_ALLOWED`, correctly, with a startup warning saying so.
+
+### Verification
+
+578 unit tests, 576 pass, 2 skip, 0 fail, 0 todo; 61 end-to-end plus 2 pipeline end-to-end. All 17
+suites are wired into `ci.yml`, `release.yml` and `package.json` with exhaustiveness checked. ESLint:
+0 errors, 54 warnings, all pre-reviewed.
+
+### Still not done
+
+Shared config, UI cards, metrics and multi-arch images from the v0.3.3 batch remain untouched.
+
 ## [0.3.3] — 2026-10-08
 
 The CI hardening the v0.3.0 batch called for, plus a correctness fix those tests found.

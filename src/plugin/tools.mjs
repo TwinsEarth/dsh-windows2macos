@@ -73,6 +73,15 @@ const PROTOCOL_VERSION = 1;
 const MAX_HISTORY_LIMIT = 200;
 
 /**
+ * Upper bound on `stages` for a pipeline task, mirroring the relay's limit.
+ *
+ * Declared here rather than imported so the plugin refuses an oversized chain on its own authority:
+ * a request that is going to be rejected by the relay anyway should not have to cross the network to
+ * find out, and the message the caller sees should name the stage rather than the HTTP status.
+ */
+const MAX_STAGES = 16;
+
+/**
  * This plugin's own version, baked in at pack time.
  *
  * The updater compares the newest release against this string, so a wrong value here means either a
@@ -1599,17 +1608,34 @@ export async function apply(ctx, config = {}) {
       command_argv: {
         type: 'array',
         items: { type: 'string' },
-        required: true,
-        description: 'The command as an argv array, for example ["node","--test"]. Never a shell string.',
+        // Not `required`: a pipeline states its commands in `stages`, and the relay derives
+        // `command_argv` from stage 0. Marking it required would make a pipeline task impossible to
+        // express, so the check below is conditional instead.
+        description: 'The command as an argv array, for example ["node","--test"]. Never a shell string. Omit under mode=pipeline.',
       },
       mode: {
         type: 'string',
-        enum: ['replicate', 'split', 'broadcast'],
+        enum: ['replicate', 'split', 'broadcast', 'pipeline'],
         description:
           'replicate: every machine runs the whole command. split: each machine takes its share by index. ' +
           'broadcast: one machine runs it and every other machine is told the outcome without running anything ' +
-          '(pair with executor_machine_id to choose which). Defaults to replicate.',
+          '(pair with executor_machine_id to choose which). pipeline: every machine runs the whole chain from ' +
+          '`stages`, in order, stopping at the first stage that fails. Defaults to replicate.',
         default: 'replicate',
+      },
+      stages: {
+        type: 'array',
+        // Array of strings, matching `command_argv`'s existing convention: the tool shim can check
+        // that shape, and an array of objects would be declared as `object` items that nothing
+        // validates. A stage that needs its own cwd is not supported through this tool; the chain
+        // inherits the task's `cwd_rel`, and per-stage cwd stays available to the relay API.
+        items: { type: 'string' },
+        description:
+          'mode=pipeline only: the chain, in order, one argv per stage with elements separated by spaces ' +
+          '(for example ["node --test", "node scripts/pack.mjs"]). At most 16. Every machine runs the entire ' +
+          'chain, so there is no cross-machine data flow and nothing can be dropped in transit. The timeout ' +
+          'covers the whole chain, not each stage. A stage containing a space inside one argument cannot be ' +
+          'expressed here; use the relay API for that.',
       },
       executor_machine_id: {
         type: 'string',
@@ -1662,22 +1688,88 @@ export async function apply(ctx, config = {}) {
       // `required` is enforced by DSH's schema layer in production, and by the shim offline; this
       // check is here so a caller that bypassed both still gets a named reason instead of a
       // confusing failure several layers down.
+      const mode0 = args?.mode ?? 'replicate';
       const argv = args?.command_argv;
-      if (!Array.isArray(argv) || argv.length === 0 || argv.some((part) => typeof part !== 'string' || part === '')) {
+      const argvUsable = Array.isArray(argv) && argv.length > 0 && argv.every((part) => typeof part === 'string' && part !== '');
+      // Under `pipeline` the commands live in `stages` and the relay derives stage 0 into
+      // `command_argv`; every other mode needs it here.
+      if (!argvUsable && mode0 !== 'pipeline') {
         throw new W2MError('W2M_INVALID_ARGV', '`command_argv` must be a non-empty array of non-empty strings', {
           hint: 'pass the command as separate array elements, for example ["node","--test"]',
         });
       }
-
-      const mode = args?.mode ?? 'replicate';
-      if (mode !== 'replicate' && mode !== 'split' && mode !== 'broadcast') {
+      if (!argvUsable && mode0 === 'pipeline' && !Array.isArray(args?.stages)) {
+        // Only when `stages` is absent outright. An empty array is caught by the pipeline check
+        // below, which names the real problem ("pipeline needs a chain") instead of talking about
+        // `command_argv` -- and the argv guard must not pre-empt that message.
         throw new W2MError(
-          'W2M_BAD_MODE',
-          `W2M_BAD_MODE: \`mode\` must be \`replicate\`, \`split\` or \`broadcast\`, not \`${mode}\`; ` +
-            'replicate runs the whole command on every machine, split hands each machine a slice by index, ' +
-            'broadcast runs it on one machine and tells every other machine the outcome',
+          'W2M_INVALID_ARGV',
+          '`command_argv` is missing and `mode` is `pipeline` without `stages`, so there is no command to run',
+          { hint: 'pass stages: ["node --test", ...] for a pipeline, or command_argv for a single command' },
         );
       }
+
+      const mode = args?.mode ?? 'replicate';
+      if (mode !== 'replicate' && mode !== 'split' && mode !== 'broadcast' && mode !== 'pipeline') {
+        throw new W2MError(
+          'W2M_BAD_MODE',
+          `W2M_BAD_MODE: \`mode\` must be \`replicate\`, \`split\`, \`broadcast\` or \`pipeline\`, not \`${mode}\`; ` +
+            'replicate runs the whole command on every machine, split hands each machine a slice by index, ' +
+            'broadcast runs it on one machine and tells the rest, pipeline runs a chain on every machine',
+        );
+      }
+
+      // v0.3.3 `pipeline`: validated here as well as at the relay, because a malformed chain would
+      // otherwise be rejected only after the request crossed the network -- and the caller would get a
+      // relay error instead of a sentence naming the stage that is wrong.
+      const stageStrings = Array.isArray(args?.stages) ? args.stages : null;
+      /**
+       * The chain as the relay wants it: `{ command_argv }` per stage.
+       *
+       * Each tool-level stage is one string whose elements are space-separated. That is a deliberate
+       * narrowing of what the relay accepts (which takes a full argv per stage): the tool schema can
+       * only declare an array of strings, and an array of objects would validate as "whatever". An
+       * argument containing a space therefore cannot be expressed through this tool, which the
+       * parameter description says outright rather than failing obscurely later.
+       */
+      const stagesPayload = stageStrings === null
+        ? null
+        : stageStrings.map((s) => ({ command_argv: String(s).split(' ').filter((part) => part !== '') }));
+      if (mode === 'pipeline') {
+        if (stagesPayload === null || stagesPayload.length === 0) {
+          throw new W2MError(
+            'W2M_BAD_STAGES',
+            'W2M_BAD_STAGES: `mode` is `pipeline` but `stages` is missing or empty; pipeline runs a chain, so ' +
+              'give at least one stage as an array of argvs, for example ["node --test", "node scripts/pack.mjs"]',
+            { hint: 'pass stages: ["node --test", ...], or use mode=replicate for a single command' },
+          );
+        }
+        if (stagesPayload.length > MAX_STAGES) {
+          throw new W2MError(
+            'W2M_BAD_STAGES',
+            `W2M_BAD_STAGES: \`stages\` has ${stagesPayload.length} entries but at most ${MAX_STAGES} are allowed; ` +
+              'each stage is another command run on every machine, so the count is bounded deliberately',
+          );
+        }
+        stagesPayload.forEach((stage, i) => {
+          if (stage.command_argv.length === 0) {
+            throw new W2MError(
+              'W2M_BAD_STAGES',
+              `W2M_BAD_STAGES: \`stages[${i}]\` is empty or whitespace; every stage must name a command`,
+            );
+          }
+        });
+      } else if (stagesPayload !== null) {
+        // Refused rather than ignored: the caller described a chain, and running only stage 0 would
+        // silently drop every later stage while reporting success.
+        throw new W2MError(
+          'W2M_BAD_STAGES',
+          `W2M_BAD_STAGES: \`stages\` only applies to mode=pipeline, but \`mode\` is \`${mode}\`; ` +
+            'under the other modes the relay runs `command_argv`, so every stage after the first would be dropped without a word',
+          { hint: 'use mode=pipeline with stages, or drop stages and pass command_argv' },
+        );
+      }
+
       const indexTotal = Number.isInteger(args?.index_total) ? args.index_total : 1;
       if (indexTotal < 1) {
         throw new W2MError(
@@ -1703,6 +1795,17 @@ export async function apply(ctx, config = {}) {
           { hint: 'use mode=broadcast with index_total=1, or mode=split to distribute slices' },
         );
       }
+
+      // A pipeline is a sequence, not a sharded sequence: sharding it would mean each machine ran its
+      // own slice's chain, which is a different feature and not what was asked for.
+      if (mode === 'pipeline' && indexTotal !== 1) {
+        throw new W2MError(
+          'W2M_BAD_INDEX',
+          `W2M_BAD_INDEX: mode=pipeline runs the whole chain on each machine, so \`index_total\` must be 1, not \`${indexTotal}\``,
+          { hint: 'use mode=pipeline with index_total=1, or mode=split for independent slices' },
+        );
+      }
+
       const executorMachineId =
         typeof args?.executor_machine_id === 'string' && args.executor_machine_id !== ''
           ? args.executor_machine_id
@@ -1719,13 +1822,31 @@ export async function apply(ctx, config = {}) {
       }
 
       // Plugin-side allow-list check: only when one is configured. See checkAllowedCommand.
-      const refused = checkAllowedCommand(cfg.allowedCommands, argv);
-      if (refused) {
-        return JSON.stringify(
-          { ok: false, state: 'refused', refusal_reason: refused.code, message: refused.message, allowed: refused.allowed },
-          null,
-          2,
-        );
+      //
+      // **Every** stage is checked, not just the first. Checking only `command_argv` would let a
+      // pipeline smuggle a disallowed command in stage 2 while stage 1 satisfied the list -- the
+      // allow-list is a default-deny control, and a chain is not an exemption from it.
+      const commandsToCheck = mode === 'pipeline' && stagesPayload !== null
+        ? stagesPayload.map((s) => s.command_argv)
+        : [argv];
+      for (const [stageIndex, stageArgv] of commandsToCheck.entries()) {
+        const refused = checkAllowedCommand(cfg.allowedCommands, stageArgv);
+        if (refused) {
+          return JSON.stringify(
+            {
+              ok: false,
+              state: 'refused',
+              refusal_reason: refused.code,
+              message: commandsToCheck.length > 1
+                ? `stage ${stageIndex}: ${refused.message}`
+                : refused.message,
+              stage_index: commandsToCheck.length > 1 ? stageIndex : null,
+              allowed: refused.allowed,
+            },
+            null,
+            2,
+          );
+        }
       }
 
       const timeoutMs = Math.min(
@@ -1751,7 +1872,10 @@ export async function apply(ctx, config = {}) {
 
       const payload = {
         mode,
-        command_argv: argv,
+        // Under pipeline the relay derives this from stage 0; sending the caller's value when there is
+        // none would put `undefined` on the wire, which JSON drops -- so it is omitted explicitly and
+        // the relay's normalization is the single source of that field.
+        ...(argvUsable ? { command_argv: argv } : {}),
         cwd_rel: typeof args?.cwd_rel === 'string' && args.cwd_rel !== '' ? args.cwd_rel : '.',
         index_total: indexTotal,
         timeout_ms: timeoutMs,
@@ -1767,6 +1891,9 @@ export async function apply(ctx, config = {}) {
         // Only sent for broadcast; the relay ignores it otherwise, and the validation above already
         // refused the combination, so this cannot silently mean nothing.
         ...(executorMachineId !== null ? { executor_machine_id: executorMachineId } : {}),
+        // Only for pipeline. The relay ignores `stages` under the other modes and the validation
+        // above refuses the combination, so this can never silently mean nothing.
+        ...(mode === 'pipeline' && stagesPayload !== null ? { stages: stagesPayload } : {}),
       };
 
       const result = await request({

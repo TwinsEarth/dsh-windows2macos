@@ -68,7 +68,7 @@ jobs:
         # environment-sensitive than the unit suites, but they are the only thing
         # that would catch a genuinely broken restart or sub-path deployment --
         # which is exactly what this release is about. They gate the release too.
-        run: node --test --test-force-exit test/e2e.test.mjs test/crossnetwork.test.mjs test/signing-e2e.test.mjs test/outbound-only.test.mjs test/recovery.test.mjs test/recovery.test.mjs
+        run: node --test --test-force-exit test/e2e.test.mjs test/crossnetwork.test.mjs test/signing-e2e.test.mjs test/outbound-only.test.mjs test/recovery.test.mjs test/pipeline-e2e.test.mjs test/recovery.test.mjs
 
       - name: Pack
         run: |
