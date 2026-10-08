@@ -1,10 +1,10 @@
 /**
- * Request-signing tests (v0.3.0 搂9).
+ * Request-signing tests (v0.3.0 §9).
  *
  * Signing is the kind of feature whose tests matter more than usual, because a mistake does not look
  * like a mistake: if both sides are wrong in the same way, every request verifies and the scheme
  * protects nothing. So these tests deliberately check the properties that would still hold if the
- * whole thing were a no-op 鈥?a tampered body, a moved path, a replayed nonce, a stale timestamp 鈥? * rather than only checking that a signature round-trips.
+ * whole thing were a no-o - a tampered body, a moved path, a replayed nonce, a stale timestam -  * rather than only checking that a signature round-trips.
  */
 
 import { describe, it } from 'node:test';

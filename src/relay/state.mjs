@@ -33,6 +33,22 @@ export const ERROR_STATUS = Object.freeze({
   INTERNAL: 500,
   OPERATOR_REQUIRED: 401, // v0.1.2 §5.2
   RATE_LIMITED: 429,      // v0.1.2 §6
+
+  /* v0.3.0 §9 request signing. Every client-side signature failure is a 401.
+   * `SIGNING_NOT_CONFIGURED` is deliberately NOT 401: the relay was started with
+   * `--require-signature` but no secret, so the fault is the relay's own
+   * configuration. Reporting that as 401 would send every operator to debug the
+   * client -- the one side that is not broken. 500 rather than 503 because
+   * retrying never fixes a missing configuration, so nothing should be invited to
+   * retry. */
+  SIGNATURE_REQUIRED: 401,
+  SIGNATURE_INCOMPLETE: 401,
+  SIGNATURE_MISMATCH: 401,
+  SIGNATURE_BAD_TIMESTAMP: 401,
+  SIGNATURE_BAD_NONCE: 401,
+  SIGNATURE_EXPIRED: 401,
+  SIGNATURE_REPLAY: 401,
+  SIGNING_NOT_CONFIGURED: 500,
 });
 
 /** §5.1 required envelope fields — missing any one means `unverifiable`. */

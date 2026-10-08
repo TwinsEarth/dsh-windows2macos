@@ -47,6 +47,7 @@ import {
   resolveProjectCwd,
 } from './git.mjs';
 import { createSpool } from './spool.mjs';
+import { createSigner } from '../signing.mjs';
 import { joinUrl, resolveBaseUrl } from './url.mjs';
 
 /** Wire protocol version (§1). */
@@ -841,6 +842,28 @@ export function createAgent(options) {
   // turn into mysterious 404s at request time. Sub-paths are preserved.
   const baseUrl = resolveBaseUrl(rabbitUrl);
 
+  // ---- v0.3.0 request signing ------------------------------------------
+  // Absent/`null`/`''` means "signing is not configured", and in that case **not
+  // one signing header is added anywhere** -- the wire stays byte-identical to
+  // v0.2.3, which is the backward-compatibility gate the tests pin down. The
+  // empty string is the explicit "off" spelling (same convention as the relay's
+  // `--require-signature` settings), so it disables rather than throws.
+  //
+  // Any *other* unusable value is an error instead of a silent downgrade: a
+  // caller who passes a number, an object or `true` meant to configure signing,
+  // and quietly giving them an unsigned link is exactly the silent degradation
+  // §0 forbids. `signing.mjs`'s `BAD_SECRET` exists for this distinction.
+  const signingSecret = options.signingSecret ?? null;
+  if (signingSecret !== null && typeof signingSecret !== 'string') {
+    throw new TypeError(
+      `createAgent: signingSecret must be a string (got ${typeof signingSecret}); ` +
+        "pass '' or omit it to disable signing",
+    );
+  }
+  const signer = signingSecret === null || signingSecret === ''
+    ? null
+    : createSigner({ secret: signingSecret, ...(options.signerOptions ?? {}) });
+
   const log = options.log ?? (() => {});
   const spool = createSpool(stateDir);
 
@@ -898,6 +921,12 @@ export function createAgent(options) {
     stateFile: stateFilePath,
     /** `updated_at` of the last successful publish, or null. */
     statePublishedAt: null,
+    /**
+     * Last non-2xx response from the relay, with its own error code preserved
+     * (v0.3.0). On a signed link this is what distinguishes "your clock drifted
+     * outside the window" from "your secret is wrong".
+     */
+    lastRelayError: null,
     /** @type {object|null} */
     current: null,
   };
@@ -1077,6 +1106,58 @@ export function createAgent(options) {
   const url = (path) => joinUrl(baseUrl, path);
 
   /**
+   * Signing headers for one request, or nothing at all.
+   *
+   * The signed `path` is the **API-relative** path plus its query
+   * (`/v1/stream?machine_id=…&seq=5`), never the URL as sent.
+   *
+   * That looks backwards -- surely the signature should cover the bytes on the
+   * wire? -- so here is the case that settles it. With `rabbitUrl =
+   * https://host/w2m` there are two proxy shapes, and the client cannot tell
+   * them apart:
+   *
+   *   * the proxy forwards `/w2m/v1/heartbeat` and the relay strips its
+   *     `--base-path` itself;
+   *   * the proxy strips `/w2m` and the relay never sees the prefix at all.
+   *
+   * In the second shape the relay *cannot* reconstruct `/w2m/v1/heartbeat` --
+   * those bytes never reached it -- so a signature over the wire path can never
+   * verify there, and every request 401s. The one value both sides always agree
+   * on is the path *after* routing: `/v1/heartbeat`. That is what is signed.
+   * (The verifier's side of the same argument is PROTOCOL-v0.3.0 §9.4.)
+   *
+   * The gate is deliberately absolute: with no secret configured this returns an
+   * empty object, so the wire is byte-identical to v0.2.3 (a hard
+   * backward-compatibility requirement, asserted in the tests). A relay that
+   * *requires* signatures then answers 401 with its own code, which the caller
+   * surfaces rather than masking.
+   *
+   * @param {'GET'|'POST'} method
+   * @param {string} apiPath API-relative path, query included when there is one.
+   * @param {string|Buffer} [bodyText] Exact body bytes that will be sent.
+   * @returns {Record<string, string>}
+   */
+  function signingHeaders(method, apiPath, bodyText = '') {
+    if (!signer) return {};
+    return signer.headers({ method, path: apiPath, body: bodyText });
+  }
+
+  /**
+   * The relay's machine-readable error code from a response body.
+   *
+   * Kept separate so a 401 says `SIGNATURE_REQUIRED` (or whatever the relay
+   * decided) instead of a generic "unauthorized": on a signed link the code is
+   * the difference between "your clock is off" and "your secret is wrong".
+   *
+   * @param {{json?: any}} response
+   * @returns {string|null}
+   */
+  function relayErrorCode(response) {
+    const code = response?.json?.error?.code;
+    return typeof code === 'string' && code !== '' ? code : null;
+  }
+
+  /**
    * POST JSON and decode the response body.
    *
    * @param {string} path
@@ -1086,10 +1167,15 @@ export function createAgent(options) {
   async function postJson(path, body, opts = {}) {
     const headers = { 'content-type': 'application/json', accept: 'application/json' };
     if (opts.auth !== false && token()) headers.authorization = `Bearer ${token()}`;
-    const response = await fetchImpl(url(path), {
+    const target = url(path);
+    // Stringify once: the signature must cover the exact bytes that go on the
+    // wire, so it can never be computed from a second, differently-ordered copy.
+    const bodyText = JSON.stringify(body);
+    Object.assign(headers, signingHeaders('POST', path, bodyText));
+    const response = await fetchImpl(target, {
       method: 'POST',
       headers,
-      body: JSON.stringify(body),
+      body: bodyText,
     });
     const text = await response.text();
     let json = null;
@@ -1098,7 +1184,18 @@ export function createAgent(options) {
     } catch {
       json = null;
     }
-    return { status: response.status, ok: response.ok, json, text };
+    const result = { status: response.status, ok: response.ok, json, text };
+    if (!response.ok) {
+      // Remember the last refusal so diagnostics can name it (and so a 401 is
+      // distinguishable from a 500 at a glance).
+      state.lastRelayError = {
+        at: new Date().toISOString(),
+        http_status: response.status,
+        code: relayErrorCode(result) ?? `HTTP_${response.status}`,
+        path,
+      };
+    }
+    return result;
   }
 
   /** @param {string} path @param {object} body @param {number} [retries] */
@@ -1109,7 +1206,9 @@ export function createAgent(options) {
       try {
         const response = await postJson(path, body);
         if (response.ok) return response;
-        if (response.status >= 400 && response.status < 500) return response; // permanent
+        // A 4xx is permanent: retrying a rejected signature or a bad request
+        // only burns the lease window.
+        if (response.status >= 400 && response.status < 500) return response;
         lastError = new Error(`HTTP ${response.status}`);
       } catch (error) {
         lastError = error;
@@ -1180,6 +1279,9 @@ export function createAgent(options) {
       } else {
         log('warn', `spooled result ${record.task_id} still undelivered`, {
           status: response.status,
+          // The relay's own code, not a paraphrase: SIGNATURE_EXPIRED and
+          // SIGNATURE_REQUIRED need different fixes.
+          code: relayErrorCode(response),
         });
       }
     }
@@ -1583,6 +1685,7 @@ export function createAgent(options) {
     }
     log('warn', `result kept in spool for ${envelope.task_id}`, {
       status: response?.status ?? null,
+      code: relayErrorCode(response),
     });
     return false;
   }
@@ -1618,12 +1721,33 @@ export function createAgent(options) {
       withheld_cursor: !resume && state.seq > 0,
     });
     const streamUrl = joinUrl(baseUrl, `/v1/stream?${query.toString()}`);
+    // Signed once, at attach time, over the *API* path including its query: a
+    // long-lived GET has no body, so the query (machine_id, and the resume seq
+    // when we have a cursor) is the part of the request that must be bound.
+    // Signing only the pathname is the classic mistake -- the tests prove such a
+    // signature does not verify -- and signing the base-prefixed wire path would
+    // break the "proxy strips the prefix" deployment (see signingHeaders).
+    Object.assign(headers, signingHeaders('GET', `/v1/stream?${query.toString()}`));
 
     const response = await fetchImpl(streamUrl, { headers, signal: streamAbort.signal });
     if (!response.ok) {
       const body = await response.text().catch(() => '');
+      let code = null;
+      try {
+        code = JSON.parse(body)?.error?.code ?? null;
+      } catch {
+        code = null;
+      }
       const error = new Error(`stream HTTP ${response.status} ${body.slice(0, 200)}`.trim());
-      error.code = `HTTP_${response.status}`;
+      // Preserve the relay's own code (SIGNATURE_REQUIRED, SIGNATURE_EXPIRED, …)
+      // so a signed link can be diagnosed without guessing.
+      error.code = code ?? `HTTP_${response.status}`;
+      state.lastRelayError = {
+        at: new Date().toISOString(),
+        http_status: response.status,
+        code: error.code,
+        path: '/v1/stream',
+      };
       throw error;
     }
     if (!response.body) throw new Error('stream response had no body');
@@ -2056,6 +2180,8 @@ export function createAgent(options) {
     publishState,
     /** Send one idle diagnostic heartbeat now (v0.3.0). */
     sendIdleHeartbeat,
+    /** Whether request signing is configured (v0.3.0). */
+    signingEnabled: signer !== null,
     /** Absolute path of the published diagnostics file. */
     stateFile: stateFilePath,
     /** Normalised base address actually used for every request (v0.1.2 §2). */

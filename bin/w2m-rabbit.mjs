@@ -83,6 +83,11 @@ try {
       'tls-key': { type: 'string' },
       'pair-rate-limit': { type: 'string' },
       'operator-token': { type: 'string' },
+      // v0.3.0 request signing. `--signing-secret ''` switches signing off explicitly.
+      'signing-secret': { type: 'string' },
+      'signing-secret-previous': { type: 'string' },
+      'require-signature': { type: 'boolean', default: false },
+      'signature-skew': { type: 'string' },
       'no-persist': { type: 'boolean', default: false },
       json: { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h', default: false },
@@ -152,6 +157,59 @@ const operatorToken = operatorTokenValue === undefined
   : (String(operatorTokenValue) === '' ? null : String(operatorTokenValue));
 const operatorTokenRequired = !(operatorTokenFlag && operatorToken === null);
 
+/* ---------- v0.3.0 request signing ---------- */
+
+// `''` means "explicitly off", the same convention as --operator-token. A *non-string* value is a
+// configuration error and must not become "signing disabled": silently losing signature
+// verification because a flag was misspelled is precisely the failure the signing module is written
+// to prevent, and it is invisible from the client side.
+/**
+ * Resolve one signing secret from a flag, falling back to an environment variable.
+ *
+ * @param {unknown} flagValue - Value from `--signing-secret*`.
+ * @param {string} envName - Environment variable to fall back to.
+ * @param {string} label - Flag name for the error message.
+ * @returns {string|undefined} The secret, or undefined when not configured.
+ */
+function resolveSigningSecret(flagValue, envName, label) {
+  const raw = flagValue ?? process.env[envName];
+  if (raw === undefined) return undefined;
+  if (typeof raw !== 'string') {
+    fail(
+      `${label} must be a string; got ${typeof raw}. Signing is never silently disabled -- ` +
+        'pass an empty string to switch it off deliberately.',
+    );
+  }
+  if (raw === '') return undefined; // explicit opt-out
+  return raw;
+}
+
+const signingSecret = resolveSigningSecret(values['signing-secret'], 'W2M_SIGNING_SECRET', '--signing-secret');
+const signingSecretPrevious = resolveSigningSecret(
+  values['signing-secret-previous'],
+  'W2M_SIGNING_SECRET_PREVIOUS',
+  '--signing-secret-previous',
+);
+const requireSignature = values['require-signature'] === true;
+
+// Requiring a signature with no secret to verify against is a contradiction, and the relay must say
+// so at startup rather than accept every request and report 500 on each one.
+if (requireSignature && signingSecret === undefined) {
+  fail(
+    '--require-signature needs --signing-secret (or W2M_SIGNING_SECRET). Refusing to start: ' +
+      'every request would be rejected as a server misconfiguration instead of being verified.',
+  );
+}
+if (signingSecretPrevious !== undefined && signingSecret === undefined) {
+  fail('--signing-secret-previous only makes sense alongside --signing-secret. Refusing to start.');
+}
+
+const skewRaw = values['signature-skew'];
+const signatureSkewSeconds = skewRaw === undefined ? undefined : Number(skewRaw);
+if (signatureSkewSeconds !== undefined && (!Number.isFinite(signatureSkewSeconds) || signatureSkewSeconds <= 0)) {
+  fail(`--signature-skew must be a positive number of seconds, got ${JSON.stringify(skewRaw)}`);
+}
+
 const stateDir = resolveStateDir(values.state, 'rabbit');
 // Diagnostics go to stderr, data goes to stdout. `--json` promises one machine
 // readable line on stdout, so the pairing-code rotation notice must not land
@@ -177,6 +235,12 @@ try {
     operatorTokenRequired,
     pairRateLimitPerMinute: pairRateLimit,
     persist: !values['no-persist'],
+    // v0.3.0 request signing. Undefined means "not configured", which the relay treats as
+    // "do not verify" -- byte-for-byte the v0.2.3 behaviour.
+    signingSecret,
+    signingSecretPrevious,
+    requireSignature,
+    signatureSkewSeconds,
   });
   // The pairing code rotates on every successful pairing, so the CLI has to
   // follow it rather than print it once: an operator pairing a second machine

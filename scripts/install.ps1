@@ -56,6 +56,10 @@
 .PARAMETER Repo
   GitHub repository, owner/name. Overridden in tests.
 
+.PARAMETER ReleaseBase
+  Directory (or URL) that holds `SHA256SUMS` and the tarball, instead of GitHub.
+  For mirrors and air-gapped hosts. The checksum is still mandatory on this path.
+
 .PARAMETER Force
   Reinstall even when the profile already has the target version.
 
@@ -74,6 +78,7 @@ param(
   [string]$DshPath = '',
   [string]$DshHome = '',
   [string]$Repo = 'TwinsEarth/dsh-windows2macos',
+  [string]$ReleaseBase = '',
   [switch]$Force,
   [switch]$Help
 )
@@ -203,6 +208,22 @@ function Invoke-Download {
   }
 }
 
+# An artifact is either an https URL or a path, so a release can be served from a
+# local mirror (`-ReleaseBase \\share\w2m` or a directory) exactly like GitHub.
+function Get-Artifact {
+  param([string]$Source, [string]$Dest)
+  if ($Source -match '^https?://') { return Invoke-Download -Url $Source -Dest $Dest }
+  if (-not (Test-Path -LiteralPath $Source)) {
+    return @{ ok = $false; reason = "no such file: $Source" }
+  }
+  try {
+    Copy-Item -LiteralPath $Source -Destination $Dest -Force
+    return @{ ok = $true }
+  } catch {
+    return @{ ok = $false; reason = "$($_.Exception.Message) while copying $Source" }
+  }
+}
+
 function Invoke-Json {
   param([string]$Url)
   try {
@@ -214,27 +235,39 @@ function Invoke-Json {
 }
 
 function Get-ReleaseInfo {
-  param([string]$RepoName, [string]$Pinned, [string]$WorkDir)
+  param([string]$RepoName, [string]$Pinned, [string]$WorkDir, [string]$InstalledHint = '', [string]$Base = '')
 
   $tag = $Pinned
-  if (-not $tag) {
+  if (-not $Base -and -not $tag) {
     $api = Invoke-Json "https://api.github.com/repos/$RepoName/releases/latest"
     if ($api -and $api.tag_name) { $tag = $api.tag_name }
   }
 
-  $sumsUrl = if ($tag) {
+  # `-ReleaseBase` serves the same two files as a release: SHA256SUMS and the
+  # tarball. It is how a mirror or an air-gapped host installs, and it keeps the
+  # checksum mandatory on that path too.
+  $sumsSource = if ($Base) {
+    if ($Base -match '^https?://') { "$Base/SHA256SUMS" } else { Join-Path $Base 'SHA256SUMS' }
+  } elseif ($tag) {
     "https://github.com/$RepoName/releases/download/$tag/SHA256SUMS"
   } else {
     "https://github.com/$RepoName/releases/latest/download/SHA256SUMS"
   }
   $sumsPath = Join-Path $WorkDir 'SHA256SUMS'
-  $sums = Invoke-Download -Url $sumsUrl -Dest $sumsPath
+  $sums = Get-Artifact -Source $sumsSource -Dest $sumsPath
   if (-not $sums.ok) {
-    Fail "could not download SHA256SUMS from $sumsUrl ($($sums.reason))." @(
+    $next = @(
       "check network/proxy access to github.com (a proxy may need HTTPS_PROXY set)",
       "or install a local file instead: -Tarball <path.tgz> -Sha256 <expected>",
+      "or point at a mirror directory that holds SHA256SUMS and the tarball: -ReleaseBase <dir>",
       "or pin a specific release: -Version v0.3.0"
     )
+    if ($InstalledHint) {
+      # Without the release metadata we cannot tell whether the installed copy is
+      # already the newest, so say what is known rather than leaving a dead end.
+      $next = @("this profile already has $PackageName $InstalledHint; if that is the version you want, no action is needed") + $next
+    }
+    Fail "could not read SHA256SUMS from $sumsSource ($($sums.reason))." $next
   }
 
   $entry = $null
@@ -253,13 +286,19 @@ function Get-ReleaseInfo {
 
   $version = $null
   if ($entry.file -match 'twinsearth-w2m-dsh-plugin-(.+)\.tgz$') { $version = $Matches[1] }
-  $base = if ($tag) { "https://github.com/$RepoName/releases/download/$tag" } else { "https://github.com/$RepoName/releases/latest/download" }
+  $url = if ($Base) {
+    if ($Base -match '^https?://') { "$Base/$($entry.file)" } else { Join-Path $Base $entry.file }
+  } elseif ($tag) {
+    "https://github.com/$RepoName/releases/download/$tag/$($entry.file)"
+  } else {
+    "https://github.com/$RepoName/releases/latest/download/$($entry.file)"
+  }
   return @{
     tag = $tag
     version = $version
     file = $entry.file
     sha256 = $entry.sha256
-    url = "$base/$($entry.file)"
+    url = $url
   }
 }
 
@@ -382,7 +421,7 @@ if ($Tarball) {
   }
   Write-Info "source  : local file $($source.url)"
 } else {
-  $source = Get-ReleaseInfo -RepoName $Repo -Pinned $Version -WorkDir $stagingDir
+  $source = Get-ReleaseInfo -RepoName $Repo -Pinned $Version -WorkDir $stagingDir -InstalledHint $installedVersion -Base $ReleaseBase
   Write-Info "source  : $($source.url)"
   Write-Info "release : $($source.tag)"
 }
@@ -401,15 +440,16 @@ $tmpDownload = "$stagedTarball.part"
 Write-Head 'download'
 if ($source.local) {
   Copy-Item -LiteralPath $source.url -Destination $tmpDownload -Force
-  Write-Ok "staged local file -> $stagedTarball"
+  Write-Ok "copied local file to a temporary file for verification"
 } else {
-  $download = Invoke-Download -Url $source.url -Dest $tmpDownload
+  $download = Get-Artifact -Source $source.url -Dest $tmpDownload
   if (-not $download.ok) {
     if (Test-Path -LiteralPath $tmpDownload) { Remove-Item -LiteralPath $tmpDownload -Force }
     Fail "download failed: $($download.reason)" @(
       "check network/proxy access to github.com (set HTTPS_PROXY if you are behind a proxy)",
       "retry: same command",
-      "offline install: download $($source.file) and run with -Tarball <path> -Sha256 <hash from SHA256SUMS>"
+      "offline install: download $($source.file) and run with -Tarball <path> -Sha256 <hash from SHA256SUMS>",
+      "or point at a mirror directory: -ReleaseBase <dir>"
     )
   }
   Write-Ok "downloaded $($source.file)"

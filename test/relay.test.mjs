@@ -18,6 +18,16 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
 import {
+  NonceCache,
+  SIGNATURE_HEADER,
+  TIMESTAMP_HEADER,
+  NONCE_HEADER,
+  canonicalString,
+  createSigner,
+  signRequest,
+} from '../src/signing.mjs';
+
+import {
   MAX_FRAME_BYTES,
   ProtocolError,
   RabbitState,
@@ -31,6 +41,26 @@ import {
 import { AGGREGATE_STATUSES, aggregate, aggregateTask, renderReportMarkdown } from '../src/relay/report.mjs';
 import { createRelayServer, normalizeBasePath, SlidingWindowRateLimiter } from '../src/relay/server.mjs';
 import { Persistence } from '../src/relay/persistence.mjs';
+
+/**
+ * Issue a request signed over the EXACT bytes that go on the wire.
+ *
+ * `signedPath` defaults to the URL path+query, which is what the relay routes on
+ * when no base path is configured. Tests that mount the relay under a prefix pass
+ * the routed path explicitly (see the deployment-independence case).
+ */
+function signedFetch(url, { method = 'POST', token, body, signer, signedPath, headers = {} } = {}) {
+  const u = new URL(url);
+  const raw = body === undefined ? null : (typeof body === 'string' ? body : JSON.stringify(body));
+  const path = signedPath ?? `${u.pathname}${u.search}`;
+  const signatureHeaders = signer.headers({ method, path, body: raw ?? '' });
+  return request(url, {
+    method,
+    token,
+    rawBody: raw === null ? undefined : raw,
+    headers: { ...signatureHeaders, ...headers },
+  });
+}
 
 /* ------------------------------------------------------------------ */
 /* helpers                                                             */
@@ -3011,6 +3041,608 @@ describe('v0.3.0 idle (diagnostic) heartbeats', () => {
       assert.equal(status.json.rtt_age_ms, 0);
       assert.equal(status.json.last_heartbeat_at, rfc3339(clock.now()));
       assert.equal(status.json.connected, false, 'no stream, but the machine is demonstrably alive');
+    });
+  });
+});
+
+/* ================================================================== */
+/* v0.3.0 §9 — request signing wired into the HTTP layer               */
+/* ================================================================== */
+
+/**
+ * Until the HTTP layer calls it, HMAC support does not exist for any real
+ * request. These cases pin the three-step migration discipline:
+ *   no secret      -> byte-identical to today (hard backward-compat gate)
+ *   secret set     -> signatures accepted, unsigned still tolerated
+ *   + require flag -> unsigned becomes 401 SIGNATURE_REQUIRED
+ */
+describe('v0.3.0 request signing (§9)', () => {
+  const SECRET = 'current-secret-0123456789';
+  const OLD_SECRET = 'previous-secret-9876543210';
+  const NEW_SIGNER = () => createSigner({ secret: SECRET });
+  const OLD_SIGNER = () => createSigner({ secret: OLD_SECRET });
+
+  async function readyRelay(relay) {
+    const { token } = await pairDevice(relay, 'm1');
+    const created = await postTask(relay, taskBody());
+    return { token, taskId: created.json.task_id };
+  }
+  const beatBody = (taskId) => ({ task_id: taskId, machine_id: 'm1', phase: 'running' });
+
+  /* ---- 1. the hard gate: no secret means nothing changes ---- */
+
+  it('with no secret configured every legacy request behaves exactly as before', async () => {
+    await withRelay({ pairRateLimitPerMinute: 0 }, async (relay) => {
+      assert.equal(relay.signingConfigured, false);
+      assert.deepEqual(relay.signingSecrets, []);
+
+      const { token, taskId } = await readyRelay(relay); // unsigned operator task dispatch
+      const hb = await request(`${relay.url}/v1/heartbeat`, { method: 'POST', token, body: beatBody(taskId) });
+      assert.equal(hb.status, 200, 'an unsigned v0.2.3 heartbeat still works');
+      const res = await request(`${relay.url}/v1/result`, {
+        method: 'POST', token, body: envelopeForTask(taskId, 'm1'),
+      });
+      assert.equal(res.status, 200);
+      assert.equal((await request(`${relay.url}/v1/devices`, { token })).status, 200);
+      assert.equal((await request(`${relay.url}/healthz`)).status, 200);
+
+      const hz = await request(`${relay.url}/healthz`);
+      assert.deepEqual(hz.json.signing, {
+        configured: false, required: false, previous_secret_accepted: false, skew_seconds: 120,
+      });
+    });
+  });
+
+  /* ---- 2. secret configured but not required: tolerate unsigned ---- */
+
+  it('with a secret configured but not required, unsigned requests still succeed', async () => {
+    await withRelay({ signingSecret: SECRET, pairRateLimitPerMinute: 0 }, async (relay) => {
+      assert.equal(relay.signingConfigured, true);
+      assert.equal(relay.requireSignature, false);
+
+      const { token, taskId } = await readyRelay(relay);
+      const hb = await request(`${relay.url}/v1/heartbeat`, { method: 'POST', token, body: beatBody(taskId) });
+      assert.equal(hb.status, 200, 'turning signing on must not kick the fleet offline');
+      const res = await request(`${relay.url}/v1/result`, {
+        method: 'POST', token, body: envelopeForTask(taskId, 'm1'),
+      });
+      assert.equal(res.status, 200, 'fleet-wide rollout would be impossible otherwise');
+    });
+  });
+
+  /* ---- 3. the explicit hard mode ---- */
+
+  it('with requireSignature an unsigned write is 401 SIGNATURE_REQUIRED', async () => {
+    await withRelay({ signingSecret: SECRET, requireSignature: true, pairRateLimitPerMinute: 0 }, async (relay) => {
+      const { token, taskId } = await readyRelay(relay);
+      const hb = await request(`${relay.url}/v1/heartbeat`, { method: 'POST', token, body: beatBody(taskId) });
+      assert.equal(hb.status, 401);
+      assert.equal(hb.json.error.code, 'SIGNATURE_REQUIRED');
+      assert.equal(hb.json.error.detail.code, 'SIGNATURE_REQUIRED');
+      assert.match(hb.json.error.detail.reason, /requires a signed request/);
+      assert.match(hb.json.error.detail.hint, /require-signature/);
+
+      const unsignedTask = await postTask(relay, taskBody());
+      assert.equal(unsignedTask.status, 401, 'task dispatch is a write too');
+      assert.equal(unsignedTask.json.error.code, 'SIGNATURE_REQUIRED');
+    });
+  });
+
+  /* ---- 4. a correct signature works ---- */
+
+  it('accepts a correctly signed write', async () => {
+    await withRelay({ signingSecret: SECRET, requireSignature: true, pairRateLimitPerMinute: 0 }, async (relay) => {
+      const { token } = await pairDevice(relay, 'm1');
+      const created = await signedFetch(`${relay.url}/v1/task`, { token: OP, body: taskBody(), signer: NEW_SIGNER() });
+      assert.equal(created.status, 200, created.text);
+      const taskId = created.json.task_id;
+
+      const hb = await signedFetch(`${relay.url}/v1/heartbeat`, { token, body: beatBody(taskId), signer: NEW_SIGNER() });
+      assert.equal(hb.status, 200);
+
+      const res = await signedFetch(`${relay.url}/v1/result`, {
+        token, body: envelopeForTask(taskId, 'm1'), signer: NEW_SIGNER(),
+      });
+      assert.equal(res.status, 200);
+      assert.equal(res.json.deduped, false);
+    });
+  });
+
+  /* ---- 5. each tampering case maps to its own code ---- */
+
+  it('detects a tampered body', async () => {
+    await withRelay({ signingSecret: SECRET, pairRateLimitPerMinute: 0 }, async (relay) => {
+      const { token, taskId } = await readyRelay(relay);
+      const signer = NEW_SIGNER();
+      // sign one body, send another
+      const signedFor = JSON.stringify(beatBody(taskId));
+      const headers = signer.headers({ method: 'POST', path: '/v1/heartbeat', body: signedFor });
+      const res = await request(`${relay.url}/v1/heartbeat`, {
+        method: 'POST', token,
+        rawBody: JSON.stringify({ ...beatBody(taskId), progress: 0.99 }), // one extra field
+        headers,
+      });
+      assert.equal(res.status, 401);
+      assert.equal(res.json.error.code, 'SIGNATURE_MISMATCH');
+    });
+  });
+
+  it('detects a signature moved to another path or method', async () => {
+    await withRelay({ signingSecret: SECRET, pairRateLimitPerMinute: 0 }, async (relay) => {
+      const { token, taskId } = await readyRelay(relay);
+      const signer = NEW_SIGNER();
+      const body = JSON.stringify(beatBody(taskId));
+
+      const otherPath = signer.headers({ method: 'POST', path: '/v1/result', body });
+      const pathRes = await request(`${relay.url}/v1/heartbeat`, {
+        method: 'POST', token, rawBody: body, headers: otherPath,
+      });
+      assert.equal(pathRes.status, 401);
+      assert.equal(pathRes.json.error.code, 'SIGNATURE_MISMATCH', 'a signature must not be movable between endpoints');
+
+      const otherMethod = signer.headers({ method: 'GET', path: '/v1/heartbeat', body });
+      const methodRes = await request(`${relay.url}/v1/heartbeat`, {
+        method: 'POST', token, rawBody: body, headers: otherMethod,
+      });
+      assert.equal(methodRes.status, 401);
+      assert.equal(methodRes.json.error.code, 'SIGNATURE_MISMATCH');
+    });
+  });
+
+  it('rejects a stale timestamp and says it is the clock window', async () => {
+    await withRelay({ signingSecret: SECRET, pairRateLimitPerMinute: 0 }, async (relay) => {
+      const { token, taskId } = await readyRelay(relay);
+      const staleSigner = createSigner({ secret: SECRET, now: () => Date.now() - 500_000 }); // ~8 min old
+      const res = await signedFetch(`${relay.url}/v1/heartbeat`, { token, body: beatBody(taskId), signer: staleSigner });
+      assert.equal(res.status, 401);
+      assert.equal(res.json.error.code, 'SIGNATURE_EXPIRED');
+      assert.match(res.json.error.detail.reason, /outside the ±120s window/);
+      assert.match(res.json.error.detail.hint, /clock/i, 'the hint points at the sending machine clock');
+    });
+  });
+
+  it('rejects a replayed nonce and says it is a replay', async () => {
+    await withRelay({ signingSecret: SECRET, pairRateLimitPerMinute: 0 }, async (relay) => {
+      const { token, taskId } = await readyRelay(relay);
+      const fixedNonce = 'fixed-nonce-for-replay-test';
+      const signer = createSigner({ secret: SECRET, makeNonce: () => fixedNonce });
+      const body = beatBody(taskId);
+
+      const first = await signedFetch(`${relay.url}/v1/heartbeat`, { token, body, signer });
+      assert.equal(first.status, 200, 'the first use is legitimate');
+
+      const replay = await signedFetch(`${relay.url}/v1/heartbeat`, { token, body, signer });
+      assert.equal(replay.status, 401);
+      assert.equal(replay.json.error.code, 'SIGNATURE_REPLAY', 'a replay is distinguishable from a bad signature');
+      assert.match(replay.json.error.detail.reason, /already been used/);
+      assert.match(replay.json.error.detail.hint, /fresh nonce/);
+    });
+  });
+
+  it('rejects a partially signed request instead of falling back to unsigned', async () => {
+    await withRelay({ signingSecret: SECRET, pairRateLimitPerMinute: 0 }, async (relay) => {
+      const { token, taskId } = await readyRelay(relay);
+      const signer = NEW_SIGNER();
+      const full = signer.headers({ method: 'POST', path: '/v1/heartbeat', body: JSON.stringify(beatBody(taskId)) });
+
+      for (const missing of [SIGNATURE_HEADER, TIMESTAMP_HEADER, NONCE_HEADER]) {
+        const headers = { ...full };
+        delete headers[missing];
+        const res = await request(`${relay.url}/v1/heartbeat`, {
+          method: 'POST', token, rawBody: JSON.stringify(beatBody(taskId)), headers,
+        });
+        assert.equal(res.status, 401, `missing ${missing}`);
+        assert.equal(res.json.error.code, 'SIGNATURE_INCOMPLETE',
+          'a half-signed request is a broken proxy or a probe, never a legacy client');
+      }
+
+      const shortNonce = { ...full, [NONCE_HEADER]: 'abc' };
+      const shortRes = await request(`${relay.url}/v1/heartbeat`, {
+        method: 'POST', token, rawBody: JSON.stringify(beatBody(taskId)), headers: shortNonce,
+      });
+      assert.equal(shortRes.status, 401);
+      assert.equal(shortRes.json.error.code, 'SIGNATURE_BAD_NONCE',
+        'signing.mjs checks the nonce length before the HMAC, so the code names the real cause');
+
+      const badTs = { ...full, [TIMESTAMP_HEADER]: 'not-a-number' };
+      const badTsRes = await request(`${relay.url}/v1/heartbeat`, {
+        method: 'POST', token, rawBody: JSON.stringify(beatBody(taskId)), headers: badTs,
+      });
+      assert.equal(badTsRes.status, 401);
+      assert.equal(badTsRes.json.error.code, 'SIGNATURE_BAD_TIMESTAMP');
+    });
+  });
+
+  /* ---- 6. rotation ---- */
+
+  it('accepts both secrets during a rotation, and rejects a secret that is gone', async () => {
+    await withRelay({
+      signingSecret: SECRET, signingSecretPrevious: OLD_SECRET, requireSignature: true, pairRateLimitPerMinute: 0,
+    }, async (relay) => {
+      const { token } = await pairDevice(relay, 'm1');
+      const current = await signedFetch(`${relay.url}/v1/task`, { token: OP, body: taskBody(), signer: NEW_SIGNER() });
+      assert.equal(current.status, 200, 'the new secret works');
+      const previous = await signedFetch(`${relay.url}/v1/task`, { token: OP, body: taskBody(), signer: OLD_SIGNER() });
+      assert.equal(previous.status, 200, 'the old secret still works while rotating');
+
+      // keyIndex identifies which one matched, which is how an operator knows a
+      // machine has not picked up the new secret yet
+      const decisionNow = relay.verifySignature(
+        { headers: NEW_SIGNER().headers({ method: 'POST', path: '/v1/task', body: '{}' }) },
+        { method: 'POST', signedPath: '/v1/task', body: '{}' },
+      );
+      assert.equal(decisionNow.ok, true);
+      assert.equal(decisionNow.keyIndex, 0, 'index 0 = current secret');
+      const decisionOld = relay.verifySignature(
+        { headers: OLD_SIGNER().headers({ method: 'POST', path: '/v1/task', body: '{}' }) },
+        { method: 'POST', signedPath: '/v1/task', body: '{}' },
+      );
+      assert.equal(decisionOld.keyIndex, 1, 'index 1 = previous secret');
+
+      const hz = await request(`${relay.url}/healthz`);
+      assert.equal(hz.json.signing.previous_secret_accepted, true);
+    });
+
+    await withRelay({ signingSecret: SECRET, requireSignature: true, pairRateLimitPerMinute: 0 }, async (relay) => {
+      const { token } = await pairDevice(relay, 'm1');
+      const retired = await signedFetch(`${relay.url}/v1/task`, { token: OP, body: taskBody(), signer: OLD_SIGNER() });
+      assert.equal(retired.status, 401, 'once rotation is finished the old secret is dead');
+      assert.equal(retired.json.error.code, 'SIGNATURE_MISMATCH');
+      assert.match(retired.json.error.detail.hint, /rotat/i, 'the hint points at rotation, the usual cause');
+      const hz = await request(`${relay.url}/healthz`);
+      assert.equal(hz.json.signing.previous_secret_accepted, false);
+    });
+  });
+
+  /* ---- 7. my ruling on read endpoints ---- */
+
+  it('RULING: reads are not signature-checked unless requireSignature is on', async () => {
+    await withRelay({ signingSecret: SECRET, pairRateLimitPerMinute: 0 }, async (relay) => {
+      const { token } = await readyRelay(relay);
+      // A deliberately garbage signature on a read is ignored, because an unsigned
+      // read is accepted anyway -- checking would be theatre while adding a new way
+      // for polls and SSE reconnects to fail.
+      const bogus = {
+        [SIGNATURE_HEADER]: 'v1=deadbeef',
+        [TIMESTAMP_HEADER]: String(Math.floor(Date.now() / 1000)),
+        [NONCE_HEADER]: 'garbage-nonce-1234',
+      };
+      const devices = await request(`${relay.url}/v1/devices`, { token, headers: bogus });
+      assert.equal(devices.status, 200, 'a bad signature on a read is ignored in the default mode');
+      const tasks = await request(`${relay.url}/v1/tasks`, { token, headers: bogus });
+      assert.equal(tasks.status, 200);
+    });
+
+    await withRelay({ signingSecret: SECRET, requireSignature: true, pairRateLimitPerMinute: 0 }, async (relay) => {
+      const { token } = await readyRelay(relay);
+      const unsignedRead = await request(`${relay.url}/v1/devices`, { token });
+      assert.equal(unsignedRead.status, 401, 'hard mode means hard mode: reads included');
+      assert.equal(unsignedRead.json.error.code, 'SIGNATURE_REQUIRED');
+
+      const signedRead = await signedFetch(`${relay.url}/v1/devices`, { method: 'GET', token, signer: NEW_SIGNER() });
+      assert.equal(signedRead.status, 200);
+      const signedList = await signedFetch(`${relay.url}/v1/tasks?limit=5`, { method: 'GET', token, signer: NEW_SIGNER() });
+      assert.equal(signedList.status, 200, 'query strings are part of the signed path');
+    });
+  });
+
+  it('always exempts /healthz and /v1/pair, even under requireSignature', async () => {
+    await withRelay({ signingSecret: SECRET, requireSignature: true, pairRateLimitPerMinute: 0 }, async (relay) => {
+      const hz = await request(`${relay.url}/healthz`);
+      assert.equal(hz.status, 200, 'an operations probe must never need a credential');
+      assert.equal(hz.json.signing.required, true);
+      assert.equal(hz.json.signing.configured, true);
+
+      const paired = await request(`${relay.url}/v1/pair`, {
+        method: 'POST',
+        body: {
+          pairing_code: relay.state.createPairingCode(),
+          machine_id: 'bootstrap', platform: DEFAULT_PLATFORM, caps: DEFAULT_CAPS,
+        },
+      });
+      assert.equal(paired.status, 200, 'pairing is the bootstrap: the two sides share no secret yet');
+    });
+  });
+
+  /* ---- 8. the secret must never escape ---- */
+
+  it('/healthz reports signature posture without leaking any secret material', async () => {
+    await withRelay({
+      signingSecret: SECRET, signingSecretPrevious: OLD_SECRET, requireSignature: true, pairRateLimitPerMinute: 0,
+    }, async (relay) => {
+      const hz = await request(`${relay.url}/healthz`);
+      assert.deepEqual(hz.json.signing, {
+        configured: true, required: true, previous_secret_accepted: true, skew_seconds: 120,
+      });
+      const raw = hz.text;
+      assert.equal(raw.includes(SECRET), false, 'the current secret must never appear');
+      assert.equal(raw.includes(OLD_SECRET), false, 'nor the previous one');
+      assert.equal(raw.includes(SECRET.slice(0, 8)), false, 'not even a prefix');
+
+      // and the startup banner reports the posture without the material
+      const banner = relay.startupMessages.join('\n');
+      assert.match(banner, /request signing=ON/);
+      assert.equal(banner.includes(SECRET), false);
+      assert.equal(banner.includes(OLD_SECRET), false);
+    });
+  });
+
+  /* ---- 9. relay misconfiguration is never a 401 ---- */
+
+  it('SIGNING_NOT_CONFIGURED is a relay error (500), never a client 401', async () => {
+    await withRelay({ requireSignature: true, pairRateLimitPerMinute: 0 }, async (relay) => {
+      const { token, taskId } = await readyRelay(relay); // pair + task are exempt/signed-free at setup
+      const res = await request(`${relay.url}/v1/heartbeat`, { method: 'POST', token, body: beatBody(taskId) });
+      assert.equal(res.status, 500, 'reporting this as 401 would send everyone to debug the wrong side');
+      assert.equal(res.json.error.code, 'SIGNING_NOT_CONFIGURED');
+      assert.match(res.json.error.detail.reason, /no signing secret is configured/);
+      assert.match(res.json.error.detail.hint, /RELAY configuration error/);
+
+      const hz = await request(`${relay.url}/healthz`);
+      assert.deepEqual(
+        { configured: hz.json.signing.configured, required: hz.json.signing.required },
+        { configured: false, required: true },
+        '/healthz is where an operator can see the contradiction',
+      );
+      const banner = relay.startupMessages.join('\n');
+      assert.match(banner, /CONFIGURATION ERROR/, 'the startup banner says it out loud');
+    });
+  });
+
+  /* ---- 10. nonce cache lifecycle ---- */
+
+  it('prunes the nonce cache from the maintenance tick so it cannot grow unbounded', async () => {
+    await withRelay({
+      signingSecret: SECRET, signingSecretConfigured: true,
+      nonceCacheRetentionMs: 1000, pairRateLimitPerMinute: 0,
+    }, async (relay) => {
+      const { token, taskId } = await readyRelay(relay);
+      for (let i = 0; i < 3; i += 1) {
+        const signer = createSigner({ secret: SECRET, makeNonce: () => `nonce-${i}-padding` });
+        const res = await signedFetch(`${relay.url}/v1/heartbeat`, { token, body: beatBody(taskId), signer });
+        assert.equal(res.status, 200);
+      }
+      assert.equal(relay.nonceCache.size, 3);
+
+      // age the entries past the retention window, then run the same maintenance
+      // tick the sweep timer runs
+      relay.state.nowMs = () => Date.now() + 5000;
+      relay.maintenance();
+      assert.equal(relay.nonceCache.size, 0, 'the timer path must actually prune');
+    });
+  });
+
+  it('refuses a configured-but-unusable secret instead of silently disabling signing', async () => {
+    assert.throws(
+      () => createRelayServer({ signingSecret: 12345, persist: false, logger: null }),
+      (err) => err.code === 'BAD_REQUEST' && /signingSecret/.test(err.message),
+      'a non-string secret is a configuration mistake, not "no signing"',
+    );
+    const relay = createRelayServer({ signingSecret: '', persist: false, logger: null });
+    assert.equal(relay.signingConfigured, false, 'an empty string is the explicit "off"');
+    assert.equal(relay.startupMessages.join('\n').includes('CONFIGURATION ERROR'), false);
+  });
+
+  /* ---- 11. deployment independence ---- */
+
+  it('signs the ROUTED path, so a base-path mount verifies the same signature', async () => {
+    await withRelay({
+      signingSecret: SECRET, requireSignature: true, basePath: '/w2m', pairRateLimitPerMinute: 0,
+    }, async (relay) => {
+      const paired = await request(`${relay.url}/v1/pair`, {
+        method: 'POST',
+        body: {
+          pairing_code: relay.state.createPairingCode(),
+          machine_id: 'm1', platform: DEFAULT_PLATFORM, caps: DEFAULT_CAPS,
+        },
+      });
+      assert.equal(paired.status, 200);
+      const token = paired.json.device_token;
+
+      // The client signs /v1/task, NOT /w2m/v1/task -- the same signature must work
+      // whether a proxy passes the prefix through or strips it.
+      const signed = await signedFetch(`${relay.url}/v1/task`, {
+        token: OP, body: taskBody(), signer: NEW_SIGNER(), signedPath: '/v1/task',
+      });
+      assert.equal(signed.status, 200, signed.text);
+
+      const rawPathSigned = await signedFetch(`${relay.url}/v1/task`, {
+        token: OP, body: taskBody(), signer: NEW_SIGNER(), signedPath: '/w2m/v1/task',
+      });
+      assert.equal(rawPathSigned.status, 401, 'signing the raw URL path is a mismatch: document it, do not accept both');
+    });
+  });
+
+  /* ---- 12. end to end, fully signed ---- */
+
+  it('runs a complete signed task end to end', async () => {
+    await withRelay({
+      signingSecret: SECRET, requireSignature: true, pairRateLimitPerMinute: 0,
+    }, async (relay) => {
+      const signer = NEW_SIGNER();
+
+      const paired = await request(`${relay.url}/v1/pair`, {
+        method: 'POST',
+        body: {
+          pairing_code: relay.state.createPairingCode(),
+          machine_id: 'm1', machine_name: 'm1', platform: DEFAULT_PLATFORM, caps: DEFAULT_CAPS,
+        },
+      });
+      assert.equal(paired.status, 200);
+      const token = paired.json.device_token;
+
+      // 1. the agent opens the SSE stream, signed
+      const sse = await openSse(`${relay.url}/v1/stream?machine_id=m1`, {
+        token,
+        headers: signer.headers({ method: 'GET', path: '/v1/stream?machine_id=m1', body: '' }),
+      });
+      try {
+        const ready = await sse.waitFor((f) => f.event === 'ready');
+        assert.equal(ready.json.protocol_version, 1);
+
+        // 2. the operator dispatches a signed task
+        const created = await signedFetch(`${relay.url}/v1/task`, { token: OP, body: taskBody(), signer });
+        assert.equal(created.status, 200, created.text);
+        const taskId = created.json.task_id;
+
+        // 3. the offer reaches the machine
+        const offer = await sse.waitFor((f) => f.event === 'task.offer');
+        assert.equal(offer.json.task_id, taskId);
+
+        // 4. signed heartbeats renew the lease
+        const hb = await signedFetch(`${relay.url}/v1/heartbeat`, {
+          token, body: { task_id: taskId, machine_id: 'm1', attempt: 1, phase: 'running', progress: 0.5, rtt_ms: 12 },
+          signer,
+        });
+        assert.equal(hb.status, 200);
+        assert.equal(hb.json.cancel, false);
+        assert.equal(hb.json.lease_until, rfc3339(relay.state.nowMs() + 50_000));
+
+        // 5. a signed idle heartbeat keeps the RTT view fresh without a lease
+        const idle = await signedFetch(`${relay.url}/v1/heartbeat`, {
+          token, body: { diagnostic: true, rtt_ms: 12 }, signer,
+        });
+        assert.equal(idle.status, 200);
+        assert.equal(idle.json.diagnostic, true);
+
+        // 6. a signed result
+        const result = await signedFetch(`${relay.url}/v1/result`, {
+          token, body: envelopeForTask(taskId, 'm1'), signer,
+        });
+        assert.equal(result.status, 200);
+        assert.equal(result.json.deduped, false);
+
+        // 7. a signed read of the verdict
+        const view = await signedFetch(`${relay.url}/v1/tasks/${taskId}`, { method: 'GET', token, signer });
+        assert.equal(view.status, 200);
+        assert.equal(view.json.aggregate.status, 'consistent');
+        assert.equal(view.json.aggregate.machines[0].outcome, 'ok');
+      } finally {
+        sse.close();
+      }
+    });
+  });
+
+  it('exposes the verify adapter over the frozen signing module contract', async () => {
+    await withRelay({ signingSecret: SECRET, pairRateLimitPerMinute: 0 }, async (relay) => {
+      const headers = NEW_SIGNER().headers({ method: 'POST', path: '/v1/result', body: '{"a":1}' });
+      const good = relay.verifySignature({ headers }, { method: 'POST', signedPath: '/v1/result', body: '{"a":1}' });
+      assert.deepEqual(good, { ok: true, signed: true, keyIndex: 0 });
+      const bad = relay.verifySignature({ headers }, { method: 'POST', signedPath: '/v1/result', body: '{"a":2}' });
+      assert.equal(bad.ok, false);
+      assert.equal(bad.code, 'SIGNATURE_MISMATCH');
+      // one cache per relay instance
+      assert.ok(relay.nonceCache instanceof NonceCache);
+      assert.notEqual(relay.nonceCache, createRelayServer({ persist: false, logger: null }).nonceCache);
+    });
+  });
+});
+
+/* ================================================================== */
+/* v0.3.0 §9.4.1 — cross-team signing test vectors                     */
+/* ================================================================== */
+
+/**
+ * PROTOCOL-v0.3.0.md §9.4.1 publishes these vectors so the sending side and the
+ * verifying side can each compute them independently and compare. They are pinned
+ * here byte-for-byte, so any change to the algorithm on EITHER side turns this red
+ * instead of silently producing signatures that only one end accepts.
+ *
+ * The constants below must stay identical to §9.4.1.
+ */
+describe('signing test vectors (§9.4.1)', () => {
+  const VECTOR_SECRET = 'test-secret-abc';
+
+  const V1 = {
+    method: 'POST',
+    path: '/v1/heartbeat',
+    timestamp: 1780000000,
+    nonce: 'abcdef0123456789',
+    body: '{"task_id":"T1","machine_id":"m1"}',
+  };
+  const V1_CANONICAL = [
+    'v1',
+    'POST',
+    '/v1/heartbeat',
+    '1780000000',
+    'abcdef0123456789',
+    'c132705f2342284320b7e59ef2f32f9d580f6ecf1b83116ae22b71ad6fa09d28',
+  ].join('\n');
+  const V1_SIGNATURE = 'v1=a8de86289154861c7289b87e3bb4f39121c5ca0f59d50f819285efe3265778db';
+
+  const V2 = {
+    method: 'GET',
+    path: '/v1/stream?machine_id=m1&seq=4',
+    timestamp: 1780000001,
+    nonce: '0123456789abcdef',
+    body: '',
+  };
+  const V2_CANONICAL = [
+    'v1',
+    'GET',
+    '/v1/stream?machine_id=m1&seq=4',
+    '1780000001',
+    '0123456789abcdef',
+    'b613679a0814d9ec772f95d778c35fc5ff1697c493715653c6c712144292c5ad',
+  ].join('\n');
+  const V2_SIGNATURE = 'v1=a9c899e05b70be0c4fce37ef7cbedacd8bdf36984faeafc8499f13a135776ce6';
+
+  it('reproduces the published canonical strings and signatures byte for byte', () => {
+    assert.equal(canonicalString(V1), V1_CANONICAL);
+    assert.equal(canonicalString(V2), V2_CANONICAL);
+    assert.equal(signRequest({ secret: VECTOR_SECRET, ...V1 }), V1_SIGNATURE);
+    assert.equal(signRequest({ secret: VECTOR_SECRET, ...V2 }), V2_SIGNATURE);
+    assert.match(V1_SIGNATURE, /^v1=[0-9a-f]{64}$/);
+  });
+
+  it('proves prefix sensitivity: the same request signed with a base path differs', () => {
+    const withPrefix = signRequest({ secret: VECTOR_SECRET, ...V1, path: '/w2m/v1/heartbeat' });
+    assert.equal(withPrefix, 'v1=20c0f143fd27a61c86d876fdd802d143645d5238a301b7d91269205e37a6300d');
+    assert.notEqual(withPrefix, V1_SIGNATURE, 'signing the wrong path can never verify');
+  });
+
+  it('a live relay accepts vector 1 exactly as published', async () => {
+    // The relay clock is frozen at the vector's timestamp so this stays deterministic:
+    // no sleep, no skew window dependency.
+    const frozenMs = V1.timestamp * 1000;
+    await withRelay({
+      now: () => frozenMs,
+      signingSecret: VECTOR_SECRET,
+      requireSignature: true,
+      pairRateLimitPerMinute: 0,
+    }, async (relay) => {
+      const paired = await request(`${relay.url}/v1/pair`, {
+        method: 'POST',
+        body: {
+          pairing_code: relay.state.createPairingCode(),
+          machine_id: 'm1', platform: DEFAULT_PLATFORM, caps: DEFAULT_CAPS,
+        },
+      });
+      assert.equal(paired.status, 200);
+      const token = paired.json.device_token;
+
+      // a task literally called "T1", because the vector's body names it
+      const signer = createSigner({ secret: VECTOR_SECRET, now: () => frozenMs });
+      const created = await signedFetch(`${relay.url}/v1/task`, {
+        token: OP, body: taskBody({ task_id: 'T1' }), signer,
+      });
+      assert.equal(created.status, 200, created.text);
+      assert.equal(created.json.task_id, 'T1');
+
+      // now replay the published vector verbatim: exact bytes, headers and all
+      const res = await request(`${relay.url}/v1/heartbeat`, {
+        method: 'POST',
+        token,
+        rawBody: V1.body,
+        headers: {
+          [SIGNATURE_HEADER]: V1_SIGNATURE,
+          [TIMESTAMP_HEADER]: String(V1.timestamp),
+          [NONCE_HEADER]: V1.nonce,
+        },
+      });
+      assert.equal(res.status, 200, `the published vector must be accepted by a real relay: ${res.text}`);
+      assert.equal(res.json.cancel, false);
+      assert.equal(res.json.lease_until, rfc3339(frozenMs + 50_000));
     });
   });
 });

@@ -271,17 +271,184 @@ rtt_stale = (rtt_ms === null) 或 (now - rtt_at > rttStaleMs)
 
 ---
 
-## 9. 不当错误码
+## 9. 请求签名（HMAC）接入 HTTP 层（**裁定**）
 
-本版**不新增错误码**：`rtt_ms` 非法不产生任何错误（§2）。新端点复用已有的 `NOT_FOUND`(404) 与 `UNAUTHORIZED`(401)。
+> 线格式与密码学细节由 `src/signing.mjs` 定义并自带 33 条用例。本节定义**中继如何接线**：哪些端点校验、配置项、错误映射、以及迁移纪律。
+
+### 9.1 配置项（中继）
+
+| `createRelayServer` 选项 | 建议 CLI 参数 | 默认 | 语义 |
+|---|---|---|---|
+| `signingSecret` | `--signing-secret <s>` | 无 | 当前签名密钥。**未配置 = 完全不校验**，行为与 v0.2.3 逐字节一致 |
+| `signingSecretPrevious` | `--signing-secret-previous <s>` | 无 | 轮换期间的旧密钥（仍被接受）。列表顺序 = `[当前, 旧]`，`keyIndex` 0/1 |
+| `requireSignature` | `--require-signature` | `false` | **唯一的强制开关**。开启后未签名 = `401 SIGNATURE_REQUIRED` |
+| `signatureSkewSeconds` | `--signature-skew <n>` | `120` | 允许的时钟偏移（秒），由 `signing.mjs` 的 `DEFAULT_SKEW_SECONDS` 定义 |
+
+> `signingSecret` 若**存在但不是非空字符串**（例如数字、对象）→ 中继**构造时即报错**。绝不静默降级成"没配签名" —— 那正是 `signing.mjs` 开头点名要避免的失败模式。
+
+### 9.2 端点覆盖（本版裁定）
+
+| 端点 | 未配置密钥 | 配置了密钥（默认） | 配置了 + `--require-signature` |
+|---|---|---|---|
+| `GET /healthz` | 公开 | 公开 | **仍然公开**（永久豁免） |
+| `POST /v1/pair` | 公开 | 公开 | **仍然公开**（永久豁免） |
+| 写端点：`POST /v1/task`、`/v1/heartbeat`、`/v1/result` | 不校验 | **有签名则校验；未签名仍接受** | **必须签名** |
+| 读端点：`GET /v1/devices`、`/v1/tasks`、`/v1/tasks/{id}`、`/v1/tasks/{id}/report`、`/v1/agents/{id}/status`、`/v1/stream` | 不校验 | **不校验**（签名头被忽略） | **必须签名** |
+
+**两个永久豁免的理由**：
+- `/healthz` 是运维探针（systemd / Docker healthcheck / 负载均衡 / uptime 监控）。要求它带凭据会把这些系统的密钥暴露面乘以它们的数量，而且是本版唯一能让**监控整体失联**的改动。
+- `/v1/pair` 是**引导步骤**：此刻双方还没有共享密钥。要求签名等于要求在配对前分发签名密钥，会让 `signing.mjs` 那句"不需要额外分发密钥"的立论失效。
+
+### 9.3 读端点裁定：默认不校验（与 lead 的倾向一致，理由如下）
+
+**写端点默认校验；读端点默认不校验，只有 `--require-signature` 才校验。**
+
+1. **未签名的读本来就被接受，所以"有签名才校验"是安全剧场。** 攻击者只需**不发送**那三个头就能降级——除非同时也拒绝未签名，否则校验不产生任何实际防护。
+2. **读泄露的是拓扑，不是可执行能力。** `/v1/devices`、`/v1/tasks` 已经要求 `device_token`。签名要防的是**重放**与**中间盒篡改**；重放一次 GET 是无害的（幂等、返回同样的数据），篡改一个 GET 请求只能改 `limit` 这类由调用方自己控制的参数。
+3. **代价不对称。** 写端点被伪造/重放会产生**状态变更**；读端点加校验只增加 CPU 与一种新的失败模式——而 `/v1/stream` 恰好是我们刚花两个任务修好的重连路径，不该再给它加新的失败方式。
+4. **硬模式必须名副其实。** 名字叫 `--require-signature` 却在读端点上不要求，是对操作者的误导。开启它就要求**除两个引导端点外的全部 `/v1/*`**，规则单一、无需按方法记忆。
+
+### 9.4 签名覆盖的"路径"是**路由后的路径**（⚠️ 客户端必读）
+
+签名的 `path` 是**剥掉部署前缀之后的路由路径 + 查询串**，**不是**原始 URL。
+
+```
+客户端对 https://host/w2m/v1/result 发起请求时，签名的 path 是： /v1/result
+```
+
+理由：v0.1.2 §3 的三种部署形态下，同一个客户端必须产生**同一个**签名 —— 反代可能把 `/w2m/v1/result` 原样透传，也可能剥成 `/v1/result`。**路由后的路径是双方在三种形态下唯一都能达成一致的值**。若签原始 URL 路径，则"加一层反代"就会让全部签名失效，而人们遇到这种情况的做法通常是关掉签名。
+
+**因此：客户端永远签 `/v1/result`，而不是 `https://host/w2m/v1/result`。** 中继**只接受**路由路径一种形式（不接受两种），因为"两者都收"会让同一个签名在两个不同端点上有效，削弱绑定；而且一旦接受两种形式，就**没有任何用例能证明客户端签对了**——错的也会通过。
+
+### 9.4.1 确定性测试向量（**双方必须逐字节一致**）
+
+> 用途：发送方与验证方各自算一遍再比对，比任何单边自证都强。这两条向量**已被 `test/relay.test.mjs` 的 `signing test vectors (§9.4.1)` 用例钉死**：canonical string、签名值、以及"真实中继接受该签名"三步。任何一侧改算法都会立刻变红。
+> 密钥：`test-secret-abc`（**仅供测试向量使用，切勿用于任何真实部署**）
+
+**向量 1 —— `POST /v1/heartbeat`**
+
+| 输入 | 值 |
+|---|---|
+| `method` | `POST` |
+| `path` | `/v1/heartbeat` |
+| `timestamp` | `1780000000` |
+| `nonce` | `abcdef0123456789` |
+| `body` | `{"task_id":"T1","machine_id":"m1"}` |
+
+```
+canonical string（6 段，以 \n 连接）:
+v1
+POST
+/v1/heartbeat
+1780000000
+abcdef0123456789
+c132705f2342284320b7e59ef2f32f9d580f6ecf1b83116ae22b71ad6fa09d28
+
+X-W2M-Timestamp: 1780000000
+X-W2M-Nonce:     abcdef0123456789
+X-W2M-Signature: v1=a8de86289154861c7289b87e3bb4f39121c5ca0f59d50f819285efe3265778db
+```
+
+**向量 2 —— `GET /v1/stream`（含 query）**
+
+| 输入 | 值 |
+|---|---|
+| `method` | `GET` |
+| `path` | `/v1/stream?machine_id=m1&seq=4` |
+| `timestamp` | `1780000001` |
+| `nonce` | `0123456789abcdef` |
+| `body` | *(空)* |
+
+```
+canonical string:
+v1
+GET
+/v1/stream?machine_id=m1&seq=4
+1780000001
+0123456789abcdef
+b613679a0814d9ec772f95d778c35fc5ff1697c493715653c6c712144292c5ad
+
+X-W2M-Signature: v1=a9c899e05b70be0c4fce37ef7cbedacd8bdf36984faeafc8499f13a135776ce6
+```
+
+> 第 6 段是 **body 的 HMAC-SHA256（以空密钥）十六进制**，不是 body 本身。空 body 时它是 `b613679a…c5ad`（即 `HMAC-SHA256(key="", msg="")`）。
+
+**前缀敏感性对照**（相同输入与密钥，仅 `path` 不同）——必须不同，这就是"签错 path 必然验不过"的可验证证据：
+
+| path | signature |
+|---|---|
+| `/v1/heartbeat` | `v1=a8de86289154861c7289b87e3bb4f39121c5ca0f59d50f819285efe3265778db` |
+| `/w2m/v1/heartbeat` | `v1=20c0f143fd27a61c86d876fdd802d143645d5238a301b7d91269205e37a6300d` |
+
+**复算方式**（两侧都应能独立复现）：
+
+```js
+import { canonicalString, signRequest } from './src/signing.mjs';
+const input = { method: 'POST', path: '/v1/heartbeat', timestamp: 1780000000,
+                nonce: 'abcdef0123456789', body: '{"task_id":"T1","machine_id":"m1"}' };
+canonicalString(input);                      // 应与上面的 6 行逐字节相同
+signRequest({ secret: 'test-secret-abc', ...input }); // v1=a8de86…
+```
+
+### 9.5 错误码 → HTTP 状态映射
+
+| `verifyRequest` code | HTTP | `error.detail` | 说明 |
+|---|---|---|---|
+| `SIGNATURE_REQUIRED` | **401** | `code`/`reason`/`hint` | 开了强制但请求未签名 |
+| `SIGNATURE_INCOMPLETE` | **401** | 同上 | 三个头只带了一部分（半个签名永远是坏代理或探测，**不**降级为"未签名"） |
+| `SIGNATURE_MISMATCH` | **401** | 同上 | 与所有已配置密钥都不匹配（含密钥轮换没跟上） |
+| `SIGNATURE_BAD_TIMESTAMP` | **401** | 同上 | `X-W2M-Timestamp` 不是数字 |
+| `SIGNATURE_BAD_NONCE` | **401** | 同上 | nonce 短于 8 字符 |
+| `SIGNATURE_EXPIRED` | **401** | 同上 | 时间戳超出 ±120s 窗口 → hint 指向**发送方时钟** |
+| `SIGNATURE_REPLAY` | **401** | 同上 | nonce 已用过 → hint 指向**每次请求换 nonce** |
+| `SIGNING_NOT_CONFIGURED` | **500** | 同上 | ⚠️ **中继自己配错了**：开了 `--require-signature` 却没有密钥 |
+
+**为什么 `SIGNING_NOT_CONFIGURED` 必须是 5xx 而不是 401**：那是**中继的配置错误**。报成 401 会让每一个操作者去排查客户端 —— **唯一没有坏的那一侧**。选 **500 而非 503**：503 意味着"稍后重试"，而重试永远修不好一个缺失的配置，不应诱导任何重试循环。启动横幅与 `/healthz.signing` 都会同时暴露这个矛盾。
+
+### 9.6 `/healthz` 新增 `signing`
+
+```json
+"signing": { "configured": true, "required": true, "previous_secret_accepted": true, "skew_seconds": 120 }
+```
+
+**绝不暴露密钥本身，连前缀都不行**（有用例对原始响应文本做 `includes(secret)` 与 `includes(secret.slice(0,8))` 断言）。
+
+### 9.7 迁移纪律（三步，每步都有用例）
+
+| 步骤 | 配置 | 效果 |
+|---|---|---|
+| 0. 现状 | 无 | 不校验，v0.2.3 客户端零影响（**硬门禁**） |
+| 1. 灰度 | `--signing-secret S` | 校验**存在**的签名，未签名仍放行 → 可以安全地逐台升级 agent；不匹配的签名**已经会 401**，所以能提前发现密钥分发错误 |
+| 2. 收紧 | 再 `--require-signature` | 未签名 = 401。此时舰队应已全部会签名 |
+
+轮换：`--signing-secret NEW --signing-secret-previous OLD` → 两者都接受；`keyIndex`（0=新，1=旧）可用来判断哪台机器还没拿到新密钥；确认全部切换后再去掉 `--signing-secret-previous`。
+
+### 9.8 兼容矩阵（签名部分）
+
+| 场景 | 结果 |
+|---|---|
+| v0.2.3 agent（不签名）→ v0.3.0 中继（未配置密钥） | 完全一致 |
+| v0.2.3 agent（不签名）→ v0.3.0 中继（配置了密钥、未强制） | **照常工作**（步骤 1 的存在意义） |
+| v0.2.3 agent（不签名）→ v0.3.0 中继（强制） | `401 SIGNATURE_REQUIRED` —— **这是操作者显式选择的结果**，不是意外 |
+| v0.3.0 agent（签名）→ v0.2.3 中继 | 三个签名头是**未知请求头**，老中继忽略 → 照常工作 |
+| 中继开了强制但忘配密钥 | `500 SIGNING_NOT_CONFIGURED`（不是 401） |
 
 ---
 
-## 10. 本版不做
+## 10. 不当错误码
+
+本版的 `rtt_ms` 非法**不产生任何错误**（§2）。签名相关的新错误码见 §9.5，全部复用 §7 的错误体形状。
+
+---
+
+## 11. 本版不做
 
 - ❌ **不做 RTT 历史/时序**（只保留最近一次测量；跨区域排障要看趋势时再单开一版）
 - ❌ **不做 RTT 的持久化或账本重放**（§6）
 - ❌ **不做按 RTT 的调度/选机**：本版只做"可见"，不做"据此决策"
 - ❌ **不做空闲心跳的频率协商**：60s 是协议推荐值，中继不校验、不限流；一台机器发得太频只会浪费它自己的带宽
+- ❌ **不做请求体加密 / 端到端加密**：签名证明"谁发的、有没有被改"，**不隐藏内容**。隐藏由 TLS 或 WireGuard 负责（v0.1.2 §1）
+- ❌ **不做非对称签名**：见 `signing.mjs` 开头"为什么用共享密钥"——复用配对时已下发的 `device_token` 派生，零额外密钥分发
+- ❌ **不做签名的时间戳缓存/时钟同步**：窗口固定 ±120s，超出即 401 并提示查时钟
 
 > ✅ **已做**（原计划不做，后因用户缺陷范围而纳入）：**空闲心跳**。理由见 §2.1 —— 跨机视图若在机器空闲时冻结，就等于在最需要它的时刻失效。

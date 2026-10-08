@@ -24,6 +24,9 @@ import {
 } from './state.mjs';
 import { Persistence } from './persistence.mjs';
 import { aggregateTask, buildReport } from './report.mjs';
+// v0.3.0 §9: request signing. This import is the entire point of the module --
+// until the HTTP layer calls it, HMAC support does not exist for any real request.
+import { DEFAULT_SKEW_SECONDS, NonceCache, verifyRequest } from '../signing.mjs';
 
 export const DEFAULT_SSE_KEEPALIVE_MS = 15_000; // §3.2: every 15s a `: keepalive` line
 export const DEFAULT_SWEEP_INTERVAL_MS = 1_000;
@@ -132,13 +135,25 @@ function readBody(req, limit) {
   });
 }
 
-async function readJson(req, limit) {
+/**
+ * Read the raw body bytes with a hard byte cap.
+ *
+ * v0.3.0 §9: the body is read exactly ONCE per request and the bytes are kept,
+ * because an HMAC covers the exact received octets -- re-serialising parsed JSON
+ * would produce different bytes (key order, whitespace) and break every signature.
+ */
+async function readRawBody(req, limit) {
   const body = await readBody(req, limit);
   if (body.tooLarge) {
     throw new ProtocolError('FRAME_TOO_LARGE', `request frame exceeds ${limit} bytes`, { limit_bytes: limit });
   }
   if (body.aborted) throw new ProtocolError('BAD_REQUEST', 'request aborted before the body was complete');
-  const raw = body.buffer.toString('utf8');
+  return body.buffer;
+}
+
+/** Parse an already-read body buffer as a JSON object. */
+function parseJsonBody(buffer) {
+  const raw = buffer === null || buffer === undefined ? '' : buffer.toString('utf8');
   if (raw.trim() === '') return {};
   try {
     const parsed = JSON.parse(raw);
@@ -150,6 +165,63 @@ async function readJson(req, limit) {
     if (err instanceof ProtocolError) throw err;
     throw new ProtocolError('BAD_REQUEST', 'request body is not valid JSON', { parse_error: String(err.message) });
   }
+}
+
+/** Methods that can carry a body the signature must cover. */
+function methodHasBody(method) {
+  return method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE';
+}
+
+/* ------------------------------------------------------------------ */
+/* request signing (v0.3.0 §9)                                         */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Operator-facing hints. The `code` says what happened; the hint says what to do
+ * about it, because "signature mismatch" without a direction is a support ticket.
+ */
+const SIGNATURE_HINTS = Object.freeze({
+  SIGNATURE_REQUIRED: 'this relay runs with --require-signature; sign the request (PROTOCOL-v0.3.0.md §9)',
+  SIGNATURE_INCOMPLETE: 'all three of X-W2M-Signature, X-W2M-Timestamp and X-W2M-Nonce must be present together',
+  SIGNATURE_MISMATCH: 'the signature matches no configured secret — check for a stale or half-rotated secret',
+  SIGNATURE_EXPIRED: 'the timestamp is outside the accepted clock-skew window — check the sending machine clock',
+  SIGNATURE_REPLAY: 'this nonce was already used — generate a fresh nonce for every request',
+  SIGNATURE_BAD_TIMESTAMP: 'X-W2M-Timestamp must be whole unix seconds',
+  SIGNATURE_BAD_NONCE: 'X-W2M-Nonce must be at least 8 characters',
+  SIGNING_NOT_CONFIGURED:
+    'the relay has --require-signature enabled but no --signing-secret configured; '
+    + 'this is a RELAY configuration error, not a client problem',
+});
+
+const SIGNATURE_PROTOCOL_CODES = new Set(Object.keys(SIGNATURE_HINTS));
+
+/** Turn a `verifyRequest` rejection into the §7 error envelope.
+ *  `ProtocolError` resolves the HTTP status from `ERROR_STATUS`, so the mapping
+ *  table lives in exactly one place (state.mjs) instead of being duplicated here. */
+function signatureError(decision) {
+  const code = SIGNATURE_PROTOCOL_CODES.has(decision.code) ? decision.code : 'SIGNATURE_MISMATCH';
+  return new ProtocolError(code, decision.error, {
+    code,
+    reason: decision.error,
+    hint: SIGNATURE_HINTS[code] ?? null,
+  });
+}
+
+/**
+ * Read an optional secret, failing loudly on a value that is present but unusable.
+ *
+ * `signing.mjs` calls a silently-disabled secret the failure mode it exists to
+ * prevent. Treating `signingSecret: 12345` (or `{}`) as "not configured" would do
+ * exactly that at the wiring layer, so it is an error instead.
+ */
+function readSecretValue(value, label) {
+  if (value === undefined || value === null || value === '') return null;
+  if (typeof value !== 'string') {
+    throw new ProtocolError('BAD_REQUEST',
+      `${label} must be a non-empty string when provided (got ${typeof value}); `
+      + 'refusing to silently run without the signing you asked for', { option: label, received_type: typeof value });
+  }
+  return value;
 }
 
 /* ------------------------------------------------------------------ */
@@ -272,6 +344,23 @@ export class RelayServer {
     /* ---- operator token (§5) ---- */
     this._initOperatorToken(options);
 
+    /* ---- v0.3.0 §9 request signing ---- */
+    this.signingSecrets = [
+      readSecretValue(options.signingSecret, 'signingSecret'),
+      readSecretValue(options.signingSecretPrevious, 'signingSecretPrevious'),
+    ].filter((s) => s !== null); // newest first: keyIndex 0 = current, 1 = previous
+    this.signingConfigured = this.signingSecrets.length > 0;
+    this.requireSignature = options.requireSignature === true;
+    this.signatureSkewSeconds = Number.isFinite(options.signatureSkewSeconds)
+      ? options.signatureSkewSeconds : DEFAULT_SKEW_SECONDS;
+    // One cache per relay instance: replay defence is stateful, and two relays
+    // sharing a cache would let a nonce blocked on one be replayed on the other.
+    this.nonceCache = options.nonceCache ?? new NonceCache({
+      max: options.nonceCacheMax ?? 20_000,
+      retentionMs: options.nonceCacheRetentionMs ?? 10 * 60_000,
+    });
+    this.nonceRetentionMs = options.nonceCacheRetentionMs ?? 10 * 60_000;
+
     /* ---- /v1/pair rate limit (§6) ---- */
     this.pairLimiter = new SlidingWindowRateLimiter({
       limit: this.pairRateLimitPerMinute,
@@ -390,6 +479,18 @@ export class RelayServer {
     m.push(`[w2m-rabbit] base_path=${this.basePath}${this.basePath === '/' ? ' (root)' : ''}`);
     m.push(`[w2m-rabbit] trust_proxy=${this.trustProxy}${this.trustProxy ? '' : ' (X-Forwarded-* ignored)'}`);
     m.push(`[w2m-rabbit] pair_rate_limit=${this.pairRateLimitPerMinute === 0 ? 'disabled' : `${this.pairRateLimitPerMinute}/min/IP`}`);
+    // §9: report the posture, never the material.
+    if (this.signingConfigured) {
+      m.push(`[w2m-rabbit] request signing=ON (${this.signingSecrets.length} secret(s)`
+        + `${this.signingSecrets.length > 1 ? ', rotation active' : ''})`
+        + `${this.requireSignature ? ' - REQUIRED: unsigned /v1/* is rejected with 401' : ' - optional: unsigned requests are still accepted'}`);
+    } else if (this.requireSignature) {
+      m.push('[w2m-rabbit] !! CONFIGURATION ERROR: --require-signature is set but no --signing-secret was provided. '
+        + 'Every /v1/* request will fail with 500 SIGNING_NOT_CONFIGURED (this is the RELAY\'s fault, not the client\'s). '
+        + 'Either set --signing-secret or drop --require-signature.');
+    } else {
+      m.push('[w2m-rabbit] request signing=off (no signing secret configured; behaviour is identical to v0.2.3)');
+    }
     if (this.persistence.enabled) {
       m.push(`[w2m-rabbit] persistence=on dir=${this.persistence.dir} `
         + `revived_devices=${this.persistence.revivedDevices} revived_tasks=${this.persistence.revivedTasks}`);
@@ -433,8 +534,7 @@ export class RelayServer {
         this.host = addr.address;
         this.port = addr.port;
         this._sweepTimer = setInterval(() => {
-          this.sweep();
-          this.pairLimiter.prune();
+          this.maintenance();
         }, this.sweepIntervalMs);
         this._sweepTimer.unref?.();
         if (this.logger) {
@@ -504,36 +604,48 @@ export class RelayServer {
 
     // §3: strip the deployment prefix, then route. `/healthz` also answers at the
     // root because health checks are usually pointed straight at the container.
-    let path;
+    // `stripped` keeps the literal request path (no trailing-slash normalisation)
+    // because that is what a signature covers; `path` is the normalised route key.
+    let stripped;
     if (this.basePath === '/') {
-      path = normalizePath(rawPath);
+      stripped = rawPath;
     } else if (rawPath === this.basePath) {
-      path = '/';
+      stripped = '/';
     } else if (rawPath.startsWith(`${this.basePath}/`)) {
-      path = normalizePath(rawPath.slice(this.basePath.length));
+      stripped = rawPath.slice(this.basePath.length);
     } else if (rawPath === '/healthz') {
-      path = '/healthz';
+      stripped = '/healthz';
     } else {
       // Outside the prefix: an explicit 404, never a gateway-style 502.
       throw new ProtocolError('NOT_FOUND', `path is outside the configured base path ${this.basePath}`, {
         path: rawPath, base_path: this.basePath,
       });
     }
+    const path = normalizePath(stripped);
+    const signedPath = `${stripped}${url.search}`;
+
+    // v0.3.0 §9: read the body ONCE, before routing. An HMAC covers the exact
+    // received bytes, so no route may consume the stream first and re-serialise.
+    const rawBody = methodHasBody(method) ? await readRawBody(req, this.frameLimitBytes) : null;
+    const takeJson = () => parseJsonBody(rawBody);
 
     /* ---- public endpoints ---- */
+    // `/healthz` and `/v1/pair` are permanently exempt from signature checks:
+    // the first is an operations probe that must not need credentials, the second
+    // is the bootstrap step that happens before the two sides share a secret.
     if (method === 'GET' && path === '/healthz') {
       return sendJson(res, 200, this.healthBody(req));
     }
     if (method === 'POST' && path === '/v1/pair') {
       this.enforcePairRateLimit(req);
-      const body = await readJson(req, this.frameLimitBytes);
-      const result = this.state.pair(body);
+      const result = this.state.pair(takeJson());
       return sendJson(res, 200, result);
     }
     // §5: dispatching tasks needs the operator token, not a device token.
     if (method === 'POST' && path === '/v1/task') {
       const principal = this.authorizeTaskDispatch(req);
-      const body = await readJson(req, this.frameLimitBytes);
+      this.enforceSignature(req, { method, signedPath, body: rawBody });
+      const body = takeJson();
       if (principal.machine_id && !body.created_by) body.created_by = principal.machine_id;
       const result = this.state.createTask(body);
       return sendJson(res, 200, result);
@@ -547,17 +659,22 @@ export class RelayServer {
     }
     this.state.touchDevice(device.machine_id);
 
+    // v0.3.0 §9: writes are always checked (tolerating unsigned unless required);
+    // reads are only checked when the relay was explicitly told to require
+    // signatures. See `enforceSignature` for the reasoning.
+    this.enforceSignature(req, { method, signedPath, body: rawBody });
+
     if (method === 'GET' && path === '/v1/stream') {
       return this.handleStream(req, res, url, device);
     }
     if (method === 'POST' && path === '/v1/heartbeat') {
-      const body = await readJson(req, this.frameLimitBytes);
+      const body = takeJson();
       body.machine_id = body.machine_id ?? device.machine_id;
       const result = this.state.heartbeat(body);
       return sendJson(res, 200, result);
     }
     if (method === 'POST' && path === '/v1/result') {
-      const body = await readJson(req, this.frameLimitBytes);
+      const body = takeJson();
       const result = this.state.submitResult(body);
       const { _instanceKey, ...clean } = result;
       return sendJson(res, 200, clean);
@@ -652,8 +769,76 @@ export class RelayServer {
       // v0.3.0: fleet-wide latency. Every numeric field is null (never 0) when no
       // machine has reported a FRESH measurement.
       rtt: this.state.rttSummary(),
+      // v0.3.0 §9: signature status only — never the secret, not even a prefix.
+      signing: {
+        configured: this.signingConfigured,
+        required: this.requireSignature,
+        previous_secret_accepted: this.signingSecrets.length > 1,
+        skew_seconds: this.signatureSkewSeconds,
+      },
       persistence: this.persistence.describe(),
     };
+  }
+
+  /* ---------------- request signing (v0.3.0 §9) ---------------- */
+
+  /**
+   * Should this request be signature-checked at all?
+   *
+   * RULING (see PROTOCOL-v0.3.0.md §9.4): every WRITE is checked; READS are
+   * checked only when `--require-signature` is on.
+   *
+   * Reads are not checked in the default modes because unsigned reads are
+   * accepted anyway, so "verify when a signature happens to be present" would be
+   * theatre -- an attacker simply omits the headers -- while adding a brand new
+   * way for a poll or an SSE reconnect to fail. What a read leaks is topology,
+   * which the device token already gates; what a write can do is change state,
+   * which is what replay and tampering actually threaten.
+   */
+  shouldCheckSignature(method) {
+    if (this.requireSignature) return true; // explicit hard mode: nothing is exempt
+    const isRead = method === 'GET' || method === 'HEAD' || method === 'OPTIONS';
+    return !isRead;
+  }
+
+  /** Run `verifyRequest` and throw the mapped §7 error on rejection. */
+  enforceSignature(req, { method, signedPath, body }) {
+    if (!this.shouldCheckSignature(method)) return { skipped: true };
+    const decision = this.verifySignature(req, { method, signedPath, body });
+    if (decision.ok !== true) throw signatureError(decision);
+    return decision;
+  }
+
+  /**
+   * Thin adapter over the frozen `signing.mjs` contract.
+   *
+   * `path` is the ROUTED path with the query string, NOT the raw request URL: with
+   * `--base-path /w2m` the same client must produce the same signature whether a
+   * proxy passes `/w2m/v1/result` through or strips it to `/v1/result`. The routed
+   * path is the only value both sides agree on in all three deployment forms, so
+   * clients sign `/v1/result` and never `https://host/w2m/v1/result`.
+   */
+  verifySignature(req, { method, signedPath, body }) {
+    return verifyRequest({
+      headers: req.headers, // plain Node object; signing.mjs reads it case-insensitively
+      method,
+      path: signedPath,
+      body: body ?? '',
+      secrets: this.signingSecrets,
+      nonces: this.nonceCache,
+      nowMs: this.state.nowMs(),
+      skewSeconds: this.signatureSkewSeconds,
+      required: this.requireSignature,
+    });
+  }
+
+  /** Periodic maintenance, called by the sweep timer. */
+  maintenance() {
+    const expired = this.sweep();
+    this.pairLimiter.prune();
+    // Keep the nonce cache from growing without bound in a long-running process.
+    this.nonceCache.prune(this.nonceRetentionMs, this.state.nowMs());
+    return expired;
   }
 
   /* ---------------- auth helpers ---------------- */

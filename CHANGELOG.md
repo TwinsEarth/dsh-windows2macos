@@ -4,6 +4,103 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-10-08
+
+### Added
+
+- **Cross-machine RTT, carried by the relay.** The round-trip time used to live only in a local
+  state file, so with the plugin on machine A and the agent on machine B — the normal cross-region
+  shape — there was no view at all. The heartbeat now carries `rtt_ms`; the relay stores it and
+  exposes it per device (`/v1/devices`), in aggregate (`/healthz.rtt`), and per machine
+  (`/v1/agents/{id}/status`).
+- **Idle diagnostic heartbeats.** An agent with no work now reports every 60 s, because the moment
+  you look at a machine is the moment it has nothing to do. Without this the cross-machine view
+  freezes at whatever the last task measured — and once `rtt_stale` flipped, it read as "the machine
+  is up but slow", which is worse than "unknown".
+- **Three new aggregate verdicts**, so the status field says what actually happened:
+
+  | verdict | replaces |
+  |---|---|
+  | `timeout` | `pending` forever, which made "nobody will ever answer" look like "still in flight" |
+  | `cancelled` | indistinguishable from `failed`, which reports a deliberate stop as a malfunction |
+  | `degraded` | `partial`, which also means "machines are still out" |
+
+  `partial` keeps its original meaning: work is outstanding. The three additions are verdicts, not
+  phase flags, which is why they sit in `AGGREGATE_STATUSES` rather than beside `pending`.
+- **Request signing** (`src/signing.mjs`, wired into the relay in this same release). HMAC over the
+  method, the routed path, a timestamp, a nonce and the exact body bytes. It defends replay,
+  tampering and a leaked log. It is **not** end-to-end encryption and not a replacement for TLS, and
+  the module says so in its first paragraph — a security claim that overreaches is worse than none.
+- **One-click installers**: `scripts/install.ps1` and `scripts/install.sh`, both verifying the
+  published SHA-256 before writing anything, and both re-reading the installed package afterwards to
+  confirm the six tools actually register ("it installed" is not "it loads").
+- **ESLint and Prettier**, with `docs/LINT-AUDIT.md` recording the current state honestly: 1 real
+  defect, 27 style findings, 46 deliberately accepted. Prettier is configured but not applied —
+  measured, it would rewrite 23,715 of 26,383 lines (89.9 %), and obliterating `git blame` for the
+  whole repository to satisfy a formatter is a bad trade. The CI job reports the number instead.
+
+### Fixed
+
+- **`resolveProfileDir` called `existsSync` without importing it.** Under ESM that is a
+  `ReferenceError`, so `apply()` threw for any plugin loaded from a profile — the normal installed
+  layout. It survived 458 green tests because no test ever executed that branch. ESLint's `no-undef`
+  found it. Fixed by importing it *and* by moving the function out of the closure into an exported,
+  directly testable helper with seven tests: the import alone would leave the next such mistake just
+  as invisible.
+- **A signing-path disagreement between the two sides.** The agent signed the raw request URL; the
+  relay verified the routed path. Both unit suites passed. The mismatch breaks only the third
+  documented deployment — a reverse proxy that strips the prefix — where the relay never sees the
+  prefixed string at all, so no reconstruction is possible. The client now signs the routed path
+  (query included), and `test/signing-e2e.test.mjs` drives a real relay behind `--base-path` with a
+  real signature so the contract cannot drift again.
+- **Mojibake in user-visible strings.** An earlier PowerShell edit round-trip wrote parts of
+  `src/plugin/tools.mjs` through GBK, turning em-dashes into CJK sequences inside error messages and
+  tool descriptions — text a model and a human actually read. Repaired with
+  `scripts/fix-mojibake.mjs`, which uses only escape sequences so it cannot be corrupted by the same
+  round-trip, plus `scripts/scan-truncations.mjs` to catch words the corruption had truncated
+  (`unavailable` had become `unavailabl`, and only a test noticed).
+- **`npm test` and both verify scripts listed three suites**, so the v0.2.3 suites never ran through
+  them. Every `test/*.test.mjs` now appears in `ci.yml`, `release.yml` and `package.json`, and that
+  exhaustiveness is itself checked.
+- **`engines` claimed Node >= 20.0.0** while ESLint 10 requires >= 20.19.0.
+- **`PROTOCOL-v0.3.0.md` was not in `package.json` `files`**, so the compatibility matrix would not
+  have shipped.
+
+### Compatibility
+
+- `PROTOCOL_VERSION` stays **1**. Everything here is additive: new optional request fields, new
+  response fields, one new endpoint, and optional verification.
+- An unsigned request is accepted exactly as before unless a relay is given a signing secret **and**
+  `--require-signature`. The relay suite's pre-existing tests passed unchanged when signing was
+  wired in, which is the evidence for that claim rather than a new test asserting it.
+- A v0.2.3 agent works against a v0.3.0 relay and vice versa. Two caveats, both documented in
+  `PROTOCOL-v0.3.0.md`: a v0.2.3 relay answers an idle heartbeat with `404` (the agent must tolerate
+  it, and does — as debug-only, with no retry storm), and a v0.3.0 relay reports `rtt_ms: null` for a
+  machine that never reports one. `null` means "never measured"; `0` means "very fast", and the two
+  are never conflated.
+
+### Verification
+
+534 unit tests, 532 pass, 2 skip (POSIX mode bits on NTFS); 46 end-to-end + crossnetwork; 8 signing
+end-to-end driving real relay processes.
+
+The signing vectors from `PROTOCOL-v0.3.0.md` §9.4.1 are pinned in **both** suites and recomputed
+independently in each, so a drift in either implementation turns one of them red — a shared constant
+would let both agree on a wrong value.
+
+### Not verified
+
+- **ESLint has not been run in this working tree** (no npm registry access, so `devDependencies` are
+  not installed). The `lint` CI job runs it on the hosted runner. The one defect it found was fixed
+  by inspection, and the `no-undef` rule is what will confirm that.
+- **`scripts/install.sh` has not been executed** — there is no macOS or Linux shell on the
+  development machine. It is statically reviewed only, and the script says so itself.
+- **macOS remains unverified on real hardware.** CI runs the agent logic on `macos-latest`, which is
+  not the same as two machines reaching one relay.
+- **No real signed deployment has been exercised across a proxy.** The sub-path case is covered
+  against a real relay with `--base-path`; a real nginx/Caddy stripping the prefix is not available
+  here.
+
 ## [0.2.3] — 2026-10-08
 
 ### Added

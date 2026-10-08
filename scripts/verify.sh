@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# W2M acceptance run 鈥?macOS / Linux entry point.
+# W2M acceptance ru - macOS / Linux entry point.
 #
 # Same job as verify.ps1: run every suite, summarise, and let the exit code be
 # the verdict. Kept as a separate file rather than one clever cross-platform

@@ -105,6 +105,15 @@ import {
 import { endpointUrl, joinUrl, resolveBaseUrl } from '../src/agent/url.mjs';
 import { createRelayServer } from '../src/relay/server.mjs';
 import * as plugin from '../src/plugin/tools.mjs';
+import {
+  NONCE_HEADER,
+  NonceCache,
+  SIGNATURE_HEADER,
+  TIMESTAMP_HEADER,
+  canonicalString,
+  signRequest,
+  verifyRequest,
+} from '../src/signing.mjs';
 
 const HAS_GIT = resolveGit() !== null;
 const IS_WINDOWS = process.platform === 'win32';
@@ -1019,7 +1028,12 @@ describe('lease heartbeat', () => {
  * is the deployment shape v0.1.2 exists for; every request path is recorded so a
  * test can prove the prefix was not eaten.
  */
-async function startFakeRabbit({ basePath = '', heartbeatExtra = null, heartbeatIdleStatus = 200 } = {}) {
+async function startFakeRabbit({
+  basePath = '',
+  heartbeatExtra = null,
+  heartbeatIdleStatus = 200,
+  resultError = null,
+} = {}) {
   const state = {
     pairs: [],
     results: [],
@@ -1036,6 +1050,14 @@ async function startFakeRabbit({ basePath = '', heartbeatExtra = null, heartbeat
      * @type {Array<{seq: string|null, lastEventId: string|null, url: string}>}
      */
     attaches: [],
+    /**
+     * Every request, verbatim: method, path *with query* (what `req.url` holds
+     * on the relay side), headers, and the exact body text -- everything
+     * `verifyRequest` needs in order to check a signature for real (task-26).
+     *
+     * @type {Array<{method: string, path: string, headers: Record<string,string>, rawBody: string, body: object|null}>}
+     */
+    requests: [],
   };
 
   const server = createServer((request, response) => {
@@ -1052,6 +1074,14 @@ async function startFakeRabbit({ basePath = '', heartbeatExtra = null, heartbeat
       const url = new URL(request.url, 'http://127.0.0.1');
       state.paths.push(url.pathname);
       state.receivedTokens.push(request.headers.authorization ?? null);
+      state.requests.push({
+        method: request.method ?? 'GET',
+        // `req.url` on the relay side is path + query, sub-path included.
+        path: `${url.pathname}${url.search}`,
+        headers: { ...request.headers },
+        rawBody: raw,
+        body,
+      });
       // Everything is served under `basePath`; anything outside it is a 404,
       // exactly like a relay behind `--base-path`.
       if (basePath !== '' && !url.pathname.startsWith(`${basePath}/`)) {
@@ -1123,6 +1153,16 @@ async function startFakeRabbit({ basePath = '', heartbeatExtra = null, heartbeat
         return;
       }
       if (pathname === '/v1/result') {
+        if (resultError) {
+          // Play a relay that refuses the result for a protocol reason (a bad
+          // signature, a missing operator token, …) so the agent's reporting of
+          // *why* can be asserted.
+          response.writeHead(resultError.status, { 'content-type': 'application/json' });
+          response.end(
+            JSON.stringify({ error: { code: resultError.code, message: resultError.message ?? 'refused' } }),
+          );
+          return;
+        }
         state.results.push(body);
         response.writeHead(200, { 'content-type': 'application/json' });
         response.end(JSON.stringify({ ok: true, deduped: false }));
@@ -1174,6 +1214,7 @@ function makeAgent({
   stringForm = false,
   logs,
   idleHeartbeatIntervalMs,
+  signingSecret,
 }) {
   const stateDir = join(root, `e2e-state-${name}`);
   const serialized = allowed.map((prefix) => prefix.join(' '));
@@ -1200,6 +1241,7 @@ function makeAgent({
     // end-to-end tests use a fast cadence so cancel does not cost 10s.
     heartbeatIntervalMs: 150,
     ...(idleHeartbeatIntervalMs === undefined ? {} : { idleHeartbeatIntervalMs }),
+    ...(signingSecret === undefined ? {} : { signingSecret }),
     log,
     tmpDir: root,
   });
@@ -3238,5 +3280,397 @@ describe('idle diagnostic heartbeats (v0.3.0)', () => {
       if (running) await running.catch(() => {});
       await rabbit.close();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.3.0: request signing (HMAC over method + path-with-query + body)
+// ---------------------------------------------------------------------------
+
+describe('request signing (v0.3.0)', () => {
+  const SIGNING_SECRET = 'test-signing-secret-do-not-use';
+  const SIGNING_HEADERS = [SIGNATURE_HEADER, TIMESTAMP_HEADER, NONCE_HEADER];
+
+  /** Does this recorded request carry any signing header? */
+  const signedHeadersPresent = (request) =>
+    SIGNING_HEADERS.filter((name) => Object.prototype.hasOwnProperty.call(request.headers, name));
+
+  /**
+   * Verify one recorded request with the real verifier.
+   *
+   * @param {object} request
+   * @param {object} [options]
+   */
+  function verifyRecorded(request, options = {}) {
+    return verifyRequest({
+      headers: request.headers,
+      method: request.method,
+      path: options.path ?? request.path,
+      body: request.rawBody,
+      secrets: options.secrets ?? SIGNING_SECRET,
+      nonces: options.nonces ?? new NonceCache(),
+    });
+  }
+
+  it('adds no signing header at all when no secret is configured', async () => {
+    const rabbit = await startFakeRabbit();
+    const project = await makeRepo('sign-off');
+    /** @type {object|null} */
+    let agent = null;
+    /** @type {Promise<void>|null} */
+    let running = null;
+    try {
+      agent = makeAgent({ rabbit: rabbit.url, project, allowed: [['node', '-e']], once: true, name: 'sign-off' });
+      assert.equal(agent.signingEnabled, false);
+      running = agent.start();
+      const stream = await rabbit.stream();
+      stream.send('ready', { protocol_version: 1, relay_id: 'relay-plain', machine_id: 'rabbit' });
+      stream.send('task.offer', {
+        task_id: '01J-E2E-SIGNOFF',
+        attempt: 1,
+        mode: 'replicate',
+        index: 0,
+        index_total: 1,
+        command_argv: [NODE, '-e', 'process.stdout.write("unsigned\\n")'],
+        cwd_rel: '.',
+        write: false,
+        timeout_ms: 20_000,
+        dedupe_key: 'dk-e2e-sign-off',
+      });
+      await running;
+
+      // The backward-compatibility gate: not one signing header, on any request,
+      // so the wire stays byte-identical to v0.2.3.
+      assert.ok(rabbit.state.requests.length >= 3, 'stream + heartbeat + result were all seen');
+      for (const request of rabbit.state.requests) {
+        assert.deepEqual(
+          signedHeadersPresent(request),
+          [],
+          `unsigned agent sent ${signedHeadersPresent(request).join(', ')} on ${request.method} ${request.path}`,
+        );
+      }
+      assert.equal(rabbit.state.results.length, 1);
+    } finally {
+      agent?.stop();
+      if (running) await running.catch(() => {});
+      await rabbit.close();
+    }
+  });
+
+  it('signs every /v1 request so the real verifier accepts it', async () => {
+    const rabbit = await startFakeRabbit();
+    const project = await makeRepo('sign-on');
+    /** @type {object|null} */
+    let agent = null;
+    /** @type {Promise<void>|null} */
+    let running = null;
+    try {
+      agent = makeAgent({
+        rabbit: rabbit.url,
+        project,
+        allowed: [['node', '-e']],
+        once: true,
+        name: 'sign-on',
+        signingSecret: SIGNING_SECRET,
+      });
+      assert.equal(agent.signingEnabled, true);
+      running = agent.start();
+      const stream = await rabbit.stream();
+      stream.send('ready', { protocol_version: 1, relay_id: 'relay-signed', machine_id: 'rabbit' });
+      stream.send('task.offer', {
+        task_id: '01J-E2E-SIGNON',
+        attempt: 1,
+        mode: 'replicate',
+        index: 0,
+        index_total: 1,
+        command_argv: [NODE, '-e', 'process.stdout.write("signed\\n")'],
+        cwd_rel: '.',
+        write: false,
+        timeout_ms: 20_000,
+        dedupe_key: 'dk-e2e-sign-on',
+      });
+      await running;
+
+      assert.ok(rabbit.state.requests.length >= 3);
+      assert.ok(
+        rabbit.state.requests.some((request) => request.method === 'GET' && request.path.startsWith('/v1/stream')),
+        'the SSE attach must be among the signed requests',
+      );
+      for (const request of rabbit.state.requests) {
+        assert.ok(request.path.startsWith('/v1/'), `unexpected path ${request.path}`);
+        assert.deepEqual(
+          signedHeadersPresent(request).sort(),
+          [...SIGNING_HEADERS].sort(),
+          `${request.method} ${request.path} is missing a signing header`,
+        );
+        const verdict = verifyRecorded(request);
+        assert.equal(verdict.ok, true, `${request.method} ${request.path} failed verification: ${JSON.stringify(verdict)}`);
+        assert.equal(verdict.signed, true);
+      }
+      // A wrong secret must not verify, or the assertion above would be vacuous.
+      const wrong = verifyRecorded(rabbit.state.requests[0], { secrets: 'not-the-secret' });
+      assert.equal(wrong.ok, false);
+      assert.equal(wrong.code, 'SIGNATURE_MISMATCH');
+    } finally {
+      agent?.stop();
+      if (running) await running.catch(() => {});
+      await rabbit.close();
+    }
+  });
+
+  it('binds the SSE query, so a pathname-only signature does not verify', async () => {
+    const rabbit = await startFakeRabbit();
+    const project = await makeRepo('sign-query');
+    /** @type {object|null} */
+    let agent = null;
+    /** @type {Promise<void>|null} */
+    let running = null;
+    try {
+      agent = makeAgent({
+        rabbit: rabbit.url,
+        project,
+        allowed: [['node', '-e']],
+        once: false,
+        name: 'sign-query',
+        signingSecret: SIGNING_SECRET,
+      });
+      running = agent.start();
+      const first = await rabbit.stream();
+      first.send('ready', { protocol_version: 1, relay_id: 'relay-q', machine_id: 'rabbit' });
+      await waitFor(() => agent.state.cursorRelayId === 'relay-q', { label: 'cursor attributed' });
+      first.send('peer.hello', { machine_id: 'peer-1' });
+      first.send('peer.hello', { machine_id: 'peer-2' });
+      await waitFor(() => agent.state.seq >= 3, { label: 'cursor advanced' });
+
+      // Reconnect: the attach URL now carries the resume seq, which is exactly
+      // the case that a pathname-only signature gets wrong.
+      first.close();
+      const reattach = await waitFor(
+        () =>
+          rabbit.state.requests.find(
+            (request) => request.method === 'GET' && request.path.includes('/v1/stream?') && request.path.includes('seq='),
+          ) ?? null,
+        { label: 'signed SSE re-attach with a query' },
+      );
+      assert.match(reattach.path, /^\/v1\/stream\?machine_id=/, reattach.path);
+      assert.match(reattach.path, /seq=4/, `expected the resume seq in ${reattach.path}`);
+
+      const withQuery = verifyRecorded(reattach);
+      assert.equal(withQuery.ok, true, JSON.stringify(withQuery));
+
+      // The regression guard: signing the pathname alone produces a signature
+      // the relay can never accept, and it fails silently as a 401 in production.
+      const pathnameOnly = verifyRecorded(reattach, { path: '/v1/stream' });
+      assert.equal(pathnameOnly.ok, false, 'a pathname-only signature must not verify');
+      assert.equal(pathnameOnly.code, 'SIGNATURE_MISMATCH');
+
+      // Replay is caught too, which is what makes the nonce more than decoration.
+      const nonces = new NonceCache();
+      assert.equal(verifyRecorded(reattach, { nonces }).ok, true);
+      const replay = verifyRecorded(reattach, { nonces });
+      assert.equal(replay.ok, false);
+      assert.equal(replay.code, 'SIGNATURE_REPLAY');
+    } finally {
+      agent?.stop();
+      if (running) await running.catch(() => {});
+      await rabbit.close();
+    }
+  });
+
+  it("keeps the relay's own error code when a signed request is refused", async () => {
+    const rabbit = await startFakeRabbit({
+      resultError: { status: 401, code: 'SIGNATURE_REQUIRED', message: 'this relay requires a signed request' },
+    });
+    const project = await makeRepo('sign-401');
+    const logs = [];
+    /** @type {object|null} */
+    let agent = null;
+    /** @type {Promise<void>|null} */
+    let running = null;
+    try {
+      agent = makeAgent({
+        rabbit: rabbit.url,
+        project,
+        allowed: [['node', '-e']],
+        once: true,
+        name: 'sign-401',
+        logs,
+        signingSecret: SIGNING_SECRET,
+      });
+      running = agent.start();
+      const stream = await rabbit.stream();
+      stream.send('ready', { protocol_version: 1, relay_id: 'relay-401', machine_id: 'rabbit' });
+      stream.send('task.offer', {
+        task_id: '01J-E2E-SIGN401',
+        attempt: 1,
+        mode: 'replicate',
+        index: 0,
+        index_total: 1,
+        command_argv: [NODE, '-e', 'process.stdout.write("x\\n")'],
+        cwd_rel: '.',
+        write: false,
+        timeout_ms: 20_000,
+        dedupe_key: 'dk-e2e-sign-401',
+      });
+      await running;
+
+      // The relay's code, not a paraphrase: SIGNATURE_EXPIRED and
+      // SIGNATURE_REQUIRED need completely different fixes.
+      assert.equal(agent.state.lastRelayError?.code, 'SIGNATURE_REQUIRED', JSON.stringify(agent.state.lastRelayError));
+      assert.equal(agent.state.lastRelayError.http_status, 401);
+      assert.equal(agent.state.lastRelayError.path, '/v1/result');
+
+      const kept = logs.find((entry) => /result kept in spool/.test(entry.message));
+      assert.ok(kept, `expected the delivery failure to be logged: ${logs.map((e) => e.message).join(' | ')}`);
+      assert.equal(kept.extra.code, 'SIGNATURE_REQUIRED');
+      assert.equal(kept.extra.status, 401);
+
+      // A refused result stays spooled (never silently dropped), and a 4xx is
+      // not retried into a storm.
+      assert.equal(agent.spool.pendingResults().length, 1);
+      assert.equal(rabbit.state.results.length, 0);
+    } finally {
+      agent?.stop();
+      if (running) await running.catch(() => {});
+      await rabbit.close();
+    }
+  });
+
+  it('signs the API path, not the base-prefixed wire path', async () => {
+    // With a deployment prefix there are two proxy shapes and the client cannot
+    // tell them apart: one forwards `/w2m/v1/heartbeat` and the relay strips its
+    // base path, the other strips it before the relay ever sees it. Only the
+    // routed path (`/v1/heartbeat`) is knowable to both sides, so that is what
+    // gets signed -- signing what is on the wire would 401 every request behind
+    // a stripping proxy.
+    const rabbit = await startFakeRabbit({ basePath: '/w2m' });
+    const project = await makeRepo('sign-subpath');
+    /** @type {object|null} */
+    let agent = null;
+    /** @type {Promise<void>|null} */
+    let running = null;
+    try {
+      agent = makeAgent({
+        rabbit: `${rabbit.url}/w2m`,
+        project,
+        allowed: [['node', '-e']],
+        once: true,
+        name: 'sign-subpath',
+        signingSecret: SIGNING_SECRET,
+      });
+      running = agent.start();
+      const stream = await rabbit.stream(15_000);
+      stream.send('ready', { protocol_version: 1, relay_id: 'relay-sub', machine_id: 'rabbit' });
+      stream.send('task.offer', {
+        task_id: '01J-E2E-SIGNSUB',
+        attempt: 1,
+        mode: 'replicate',
+        index: 0,
+        index_total: 1,
+        command_argv: [NODE, '-e', 'process.stdout.write("sub\\n")'],
+        cwd_rel: '.',
+        write: false,
+        timeout_ms: 20_000,
+        dedupe_key: 'dk-e2e-sign-sub',
+      });
+      await running;
+
+      assert.ok(rabbit.state.requests.length >= 3);
+      for (const request of rabbit.state.requests) {
+        // The request still goes to the prefixed URL...
+        assert.ok(request.path.startsWith('/w2m/v1/'), `expected the base path on the wire: ${request.path}`);
+        // ...but the signature covers the routed path.
+        const routed = request.path.slice('/w2m'.length);
+        const verdict = verifyRecorded(request, { path: routed });
+        assert.equal(verdict.ok, true, `${routed}: ${JSON.stringify(verdict)}`);
+
+        // And the wire-path signature is exactly what a stripping proxy could
+        // never verify -- pinned here so nobody "fixes" it back.
+        const wireSigned = verifyRecorded(request, { path: request.path });
+        assert.equal(wireSigned.ok, false, 'a base-prefixed signature must not verify');
+        assert.equal(wireSigned.code, 'SIGNATURE_MISMATCH');
+      }
+    } finally {
+      agent?.stop();
+      if (running) await running.catch(() => {});
+      await rabbit.close();
+    }
+  });
+
+  it('treats an empty secret as explicitly off, and any other unusable value as an error', () => {
+    const project = scratch('sign-config');
+    const build = (signingSecret, name) =>
+      createAgent({
+        rabbitUrl: 'http://127.0.0.1:1',
+        project,
+        stateDir: join(root, `sign-config-state-${name}`),
+        identity: { machine_id: newMachineId(), machine_name: 'x', device_token: 't', rabbit_url: null },
+        caps: {},
+        platform: { os: 'windows' },
+        allowedCommands: [],
+        log: () => {},
+        ...(signingSecret === undefined ? {} : { signingSecret }),
+      });
+
+    // Absent, null and '' all mean "no signing at all" -- the wire stays exactly
+    // as v0.2.3 sent it.
+    assert.equal(build(undefined, 'a').signingEnabled, false);
+    assert.equal(build(null, 'b').signingEnabled, false);
+    assert.equal(build('', 'c').signingEnabled, false, "'' is the explicit off switch, not an error");
+    assert.equal(build('a-real-secret', 'd').signingEnabled, true);
+
+    // Anything else is a configuration mistake, and a configuration mistake must
+    // never be downgraded into "unsigned link that looks fine" (§0).
+    for (const bad of [42, true, {}, [], Symbol('s')]) {
+      assert.throws(
+        () => build(bad, `bad-${typeof bad}`),
+        (error) => error instanceof TypeError && /signingSecret must be a string/.test(error.message),
+        `expected ${String(bad)} to be rejected`,
+      );
+    }
+  });
+
+  it('matches the verifier byte-for-byte on the frozen test vectors', () => {
+    // Published by the relay side (task-25) and reproduced here against the
+    // frozen signing module: if either side ever changes the canonical string,
+    // one of these two assertions goes red immediately instead of showing up as
+    // a 401 in production.
+    const secret = 'test-secret-abc';
+    const vector1 = {
+      method: 'POST',
+      path: '/v1/heartbeat',
+      timestamp: 1_780_000_000,
+      nonce: 'abcdef0123456789',
+      body: '{"task_id":"T1","machine_id":"m1"}',
+    };
+    const vector2 = {
+      method: 'GET',
+      path: '/v1/stream?machine_id=m1&seq=4',
+      timestamp: 1_780_000_001,
+      nonce: '0123456789abcdef',
+      body: '',
+    };
+    assert.equal(
+      canonicalString(vector1),
+      'v1\nPOST\n/v1/heartbeat\n1780000000\nabcdef0123456789\nc132705f2342284320b7e59ef2f32f9d580f6ecf1b83116ae22b71ad6fa09d28',
+    );
+    assert.equal(
+      signRequest({ secret, ...vector1 }),
+      'v1=a8de86289154861c7289b87e3bb4f39121c5ca0f59d50f819285efe3265778db',
+    );
+    assert.equal(
+      canonicalString(vector2),
+      'v1\nGET\n/v1/stream?machine_id=m1&seq=4\n1780000001\n0123456789abcdef\nb613679a0814d9ec772f95d778c35fc5ff1697c493715653c6c712144292c5ad',
+    );
+    assert.equal(
+      signRequest({ secret, ...vector2 }),
+      'v1=a9c899e05b70be0c4fce37ef7cbedacd8bdf36984faeafc8499f13a135776ce6',
+    );
+    // The control the relay side published: a prefix changes the signature, so
+    // the choice in the test above is not cosmetic.
+    assert.notEqual(
+      signRequest({ secret, ...vector1, path: '/w2m/v1/heartbeat' }),
+      signRequest({ secret, ...vector1 }),
+    );
   });
 });
