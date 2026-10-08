@@ -14,14 +14,6 @@ import {
   rfc3339,
 } from './state.mjs';
 
-/**
- * A machine ran and reported a failure, but the aggregate still has a verdict worth reading.
- *
- * Not a state: a machine outcome. Listed here so `degraded` can be defined against it rather than
- * against a string literal repeated in three places.
- */
-const FAILURE_OUTCOME = 'failed';
-
 /** Aggregate statuses this module can return. */
 export const AGGREGATE_STATUSES = Object.freeze([
   // ---- the six verdicts of §6.3 ----

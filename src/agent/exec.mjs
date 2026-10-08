@@ -308,8 +308,15 @@ export function classifyExit(result) {
   return result.exit_code === 0 ? 'ok' : 'nonzero_exit';
 }
 
+// Control characters are the point of these patterns: they match the ANSI escape sequences a
+// terminal emits. `no-control-regex` exists to catch control characters that slipped in by accident,
+// which is the opposite of what is happening here, so the rule is disabled per line rather than
+// globally -- a genuinely accidental control character elsewhere must still be reported.
+// eslint-disable-next-line no-control-regex -- matches ANSI OSC terminators by definition
 const ANSI_OSC = /\u001B\][^\u0007\u001B]*(?:\u0007|\u001B\\)/g;
+// eslint-disable-next-line no-control-regex -- matches ANSI CSI introducers by definition
 const ANSI_CSI = /\u001B\[[0-9;?]*[ -/]*[@-~]/g;
+// eslint-disable-next-line no-control-regex -- matches ANSI single-character escapes by definition
 const ANSI_OTHER = /\u001B[@-Z\\-_]/g;
 
 /**

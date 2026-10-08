@@ -1088,6 +1088,10 @@ export function createAgent(options) {
     } catch {
       git = null;
     }
+    // Guarded above by `if (toolchainCache) return`, and two concurrent callers would derive the same
+    // value from immutable project facts -- the worst case is doing the work twice, not caching
+    // something wrong.
+    // eslint-disable-next-line require-atomic-updates -- guarded memo; value derived from immutables
     toolchainCache = {
       node: caps.node ?? null,
       python: caps.python ?? null,
@@ -1188,6 +1192,8 @@ export function createAgent(options) {
     if (!response.ok) {
       // Remember the last refusal so diagnostics can name it (and so a 401 is
       // distinguishable from a 500 at a glance).
+      // Recorded by the failed request that owns this field; one request at a time per agent.
+      // eslint-disable-next-line require-atomic-updates -- one request at a time
       state.lastRelayError = {
         at: new Date().toISOString(),
         http_status: response.status,
@@ -1256,7 +1262,10 @@ export function createAgent(options) {
       error.code = 'PAIRING_RESPONSE_INVALID';
       throw error;
     }
+    // Pairing runs once, from the CLI, before any loop starts, so there is no interleaving here.
+    // eslint-disable-next-line require-atomic-updates -- single call site, no concurrency
     identity.device_token = response.json.device_token;
+    // eslint-disable-next-line require-atomic-updates -- single call site, no concurrency
     identity.rabbit_url = baseUrl;
     log('info', 'paired', { machine_id: identity.machine_id });
     return response.json;
@@ -1748,10 +1757,12 @@ export function createAgent(options) {
         code: error.code,
         path: '/v1/stream',
       };
-      throw error;
-    }
+      throw error;    }
     if (!response.body) throw new Error('stream response had no body');
 
+    // Both assignments mark the same stream attempt as no longer live: one before the read loop, one
+    // after it ends. Only one stream runs at a time, so there is nothing to interleave with.
+    // eslint-disable-next-line require-atomic-updates -- one stream attempt at a time
     state.connected = false;
     const decoder = new TextDecoder('utf-8');
     const parser = new SseParser();
@@ -1959,7 +1970,10 @@ export function createAgent(options) {
         }
       }
     } finally {
-      pumping = false;
+    // The pump is single-entry: `pumping` is set before the first await and cleared here, so a second
+    // pump cannot be running to observe a stale value.
+    // eslint-disable-next-line require-atomic-updates -- single-entry pump
+    pumping = false;
     }
   }
 

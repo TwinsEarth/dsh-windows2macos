@@ -1090,7 +1090,7 @@ function requireToken(device) {
   if (!device.present) {
     throw new W2MError(
       'W2M_NO_TOKEN',
-      `W2M_NO_TOKEN: no paired device at \`${device.path ?? 'device.json'}\ - the file does not exist; ` +
+      `W2M_NO_TOKEN: no paired device at \`${device.path ?? 'device.json'}\` - the file does not exist; ` +
         'start the agent once so it can pair, or set `stateDir` to the directory holding an already-paired device.json',
       { hint: 'start the agent once so it can pair, or set `stateDir` to the directory holding an already-paired device.json' },
     );
@@ -1098,13 +1098,13 @@ function requireToken(device) {
   if (device.error) {
     throw new W2MError(
       'W2M_NO_TOKEN',
-      `W2M_NO_TOKEN: could not read a device token from \`${device.path}\ - ${device.error}; repair or delete the file and pair again`,
+      `W2M_NO_TOKEN: could not read a device token from \`${device.path}\` - ${device.error}; repair or delete the file and pair again`,
       { hint: 'repair or delete the file and pair again' },
     );
   }
   throw new W2MError(
     'W2M_NO_TOKEN',
-    `W2M_NO_TOKEN: \`${device.path}\` has no \`device_token\ - the device has not completed POST /v1/pair yet; run the agent once to pair it`,
+    `W2M_NO_TOKEN: \`${device.path}\` has no \`device_token\` - the device has not completed POST /v1/pair yet; run the agent once to pair it`,
     { hint: 'the device has not completed POST /v1/pair yet; run the agent once to pair it' },
   );
 }

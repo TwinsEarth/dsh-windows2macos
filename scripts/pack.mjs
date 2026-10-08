@@ -26,7 +26,7 @@
 import { createHash } from 'node:crypto';
 import { gzipSync, gunzipSync } from 'node:zlib';
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, statSync, existsSync } from 'node:fs';
-import { dirname, join, resolve, relative, sep } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));

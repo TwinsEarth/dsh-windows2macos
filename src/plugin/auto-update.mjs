@@ -42,7 +42,6 @@ import {
   DEFAULT_REPO,
   fetchLatestRelease,
   isNewer,
-  parseSha256Sums,
   requireChecksum,
 } from './update-source.mjs';
 import { installUpdate } from './update-install.mjs';

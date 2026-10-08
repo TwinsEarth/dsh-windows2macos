@@ -194,7 +194,19 @@ export function zonedParts(epochMs, timeZone) {
   };
 }
 
-/** Milliseconds since local midnight in the zone, for an instant. */
+/**
+ * Milliseconds since local midnight in the zone, for an instant.
+ *
+ * Currently unreferenced: `nextOccurrence` works from zone parts directly. Kept because it names
+ * the inverse of what `nextOccurrence` computes and is the obvious place a future caller will look.
+ * Prefixed `_`-less and exported nowhere, so the linter is told about it rather than silencing it
+ * globally.
+ *
+ * @param {number} epochMs - The instant.
+ * @param {string} timeZone - IANA zone name.
+ * @returns {number} Seconds since local midnight.
+ */
+// eslint-disable-next-line no-unused-vars -- kept as the documented inverse of nextOccurrence
 function secondOfDayIn(epochMs, timeZone) {
   const p = zonedParts(epochMs, timeZone);
   return p.hour * 3600 + p.minute * 60 + p.second;
