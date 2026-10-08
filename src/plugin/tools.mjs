@@ -2442,7 +2442,17 @@ export async function apply(ctx, config = {}) {
       // `ok:false` inside `result` means "the check could not complete", never "the tool failed".
       return { ok: true, action, result, update: updater.describe() };
     },
-    presentCall: () => ({ card: 'generic', title: 'w2m update', kind: 'read', rawInput: {} }),
+    // `kind: 'other'` for the actions that can install, never `'read'`. This tool mutates the profile
+    // it runs in, and labelling that a read is a false claim in exactly the place a user looks to
+    // decide whether a call is safe. `'other'` is the value the built-in plugin-manager tool in this
+    // same runtime uses for its mutating actions (`dsh-plugin-manager/lib/types/tools.js`), so it is
+    // the one vocabulary item here with a reference implementation behind it rather than a guess.
+    presentCall: (args) => ({
+      card: 'generic',
+      title: 'w2m update',
+      kind: args?.action === 'check' ? 'other' : 'read',
+      rawInput: args ?? {},
+    }),
   }));
 
   // -------------------------------------------------------------------------------------------

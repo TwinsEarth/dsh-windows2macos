@@ -25,6 +25,73 @@ The process lesson is the one that cost the most here: a flaky test does not jus
 block every release behind it until someone notices that the failures share a cause. Three consecutive
 release runs failed before the pattern was visible in the release list.
 
+## [0.3.8] — 2026-10-08
+
+The last open v0.3.3 item, resolved by reading the shipped runtime rather than guessing.
+
+### The finding
+
+**UI cards: there is nothing to add.** `defineTool` treats `presentCall`'s return value as an opaque
+hint and never validates it —
+
+```js
+if (userPresentCall) tool.presentCall = (args) => {
+  if (validate(args).length > 0) return void 0;
+  return userPresentCall(args);
+};
+```
+
+— which means two things. There is **no registry of card types** to choose from: nothing in the shipped
+bundle reads `card` at all. And a wrong field **cannot be caught by the runtime**; it would fail
+silently in the UI. That is precisely why guessing a richer card was the wrong move, and why this item
+sat open rather than being closed by inventing something.
+
+The shipped runtime contains exactly two reference implementations, and they are the only evidence for
+what the fields mean:
+
+| where | card | kind |
+|---|---|---|
+| built-in `run_code` (`dsh-tools/lib/index.js:1445`) | `"generic"` | `"execute"` |
+| the plugin manager (`dsh-plugin-manager/lib/types/tools.js:85`) | `'generic'` | `action.startsWith('list_') ? 'read' : 'other'` |
+
+Both use `generic`. `kind` varies by whether the action mutates. That is the whole vocabulary with a
+reference behind it.
+
+### Fixed
+
+- **`w2m_update` reported `kind: 'read'` for its check-and-install action**, which can install a new
+  version into the very profile it runs in. A false "read" is worse than no hint, because the hint is
+  what a user reads to decide whether a call is safe — the same class of defect as the `intervalDays`
+  option that silently did nothing, and fixed for the same reason. It now reports `other` for `check`
+  and `read` for `status`, matching the plugin manager's vocabulary for exactly that distinction.
+
+  `w2m_run` keeps `write` when `write: true`: it executes on other machines, which `read` would
+  understate. The other six tools were already accurate.
+
+- **`rawInput` is now asserted never to carry a credential.** It is handed to the UI, so anything in it
+  is rendered — and the shared-config work in 0.3.5 was specifically about keeping tokens out of files
+  that travel. The same rule applies to a card.
+
+`presentResult` was deliberately **not** adopted: it is a second, equally unvalidated hook whose
+result-side contract appears nowhere in the shipped bundle. Adopting it would be the same guess this
+release declines to make. The reasoning is recorded in `docs/UI-CARDS.md` so the question is not
+re-opened from memory.
+
+### Verification
+
+626 unit tests, 624 pass, 2 skip, 0 fail, 0 todo; 21 suites wired into `ci.yml`, `release.yml` and
+`package.json` with exhaustiveness checked. ESLint 0 errors, 56 warnings. Five new tests in
+`test/tool-cards.test.mjs`, including the credential check and a call with no arguments — which is what
+the runtime itself does on a schema-invalid call.
+
+### v0.3.3 is now complete
+
+broadcast, pipeline, shared configuration, metrics and multi-arch images were delivered in 0.3.2
+through 0.3.6; UI cards are settled here. The two items from the v0.3.0 batch that remain undone are
+the optional WebSocket transport and the optional libp2p fallback package — both judged to duplicate
+what HMAC signing plus the existing backoff already provide, and neither is required by any acceptance
+criterion.
+
 ## [0.3.7] — 2026-10-08
 
 ### Fixed
