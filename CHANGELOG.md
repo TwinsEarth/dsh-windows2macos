@@ -81,12 +81,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Verification
 
-534 unit tests, 532 pass, 2 skip (POSIX mode bits on NTFS); 46 end-to-end + crossnetwork; 8 signing
-end-to-end driving real relay processes.
+539 unit tests, 537 pass, 2 skip (POSIX mode bits on NTFS); 54 end-to-end + crossnetwork.
+ESLint reports **0 errors, 46 warnings**, every warning being one of the two classes
+`docs/LINT-AUDIT.md` already classified as benign and deliberately accepted.
+
+Two of the lint findings were not cosmetic, and both were restored rather than deleted:
+
+- An agent test counted stream attempts in `requests` and never read it. The test is named
+  "keeps retrying gently instead of hot-looping" — the counter *was* the assertion, so an
+  implementation that backed off for the log line while opening a connection per millisecond would
+  have passed. The bound is back.
+- `auto-update.mjs` accepted an `intervalDays` option and never enforced it. A declared guard that
+  silently does nothing is worse than no option at all, because it reads as protection. It is now
+  enforced against the last *successful* install, checked before any network work.
 
 The signing vectors from `PROTOCOL-v0.3.0.md` §9.4.1 are pinned in **both** suites and recomputed
 independently in each, so a drift in either implementation turns one of them red — a shared constant
 would let both agree on a wrong value.
+
+> The `v0.3.0` tag was moved once, from the commit that first carried this version to the commit
+> containing these fixes. The first tag had no published release associated with it yet, and the
+> difference was in shipped source (a missing guard, three malformed error messages), so leaving the
+> tag behind would have published code that does not match this changelog.
 
 ### Not verified
 
