@@ -56,6 +56,7 @@ import path from 'node:path';
 // `src/agent/` does not import `src/plugin/`, so the dependency runs one way and cannot cycle.
 import { joinUrl, resolveBaseUrl } from '../agent/url.mjs';
 import { createAutoUpdater, findProfileDir, resolveCurrentVersion } from './auto-update.mjs';
+import { loadSharedConfig, describeSharedConfig } from './shared-config.mjs';
 import { DEFAULT_DAILY_TIMES, DEFAULT_TIME_ZONE } from './schedule.mjs';
 
 /** Services this plugin needs. The harness refuses to load the plugin without them. */
@@ -397,6 +398,33 @@ function readConfig(config = {}) {
     ? path.resolve(config.stateDir.trim())
     : null;
 
+  /**
+   * v0.3.3 shared config: `.w2m.json` in the project, overridden by `~/.w2m/machine.json`, overridden
+   * by the host's own config object.
+   *
+   * `allowedCommands` and the timeout participate here so that a fleet shares one allow-list instead
+   * of one per machine -- the machine whose copy drifted is the one nobody looks at until it refuses
+   * a command. The host layer is `config` itself, so an explicit setting always wins and nothing that
+   * used to work stops working.
+   *
+   * A broken file throws. Running on defaults while the operator believes their settings apply is the
+   * silently-wrong outcome this project refuses everywhere else, and a config file is no exception.
+   */
+  const shared = loadSharedConfig({
+    projectDir: typeof config.projectDir === 'string' && config.projectDir.trim() !== ''
+      ? path.resolve(config.projectDir.trim())
+      : cwd,
+    machineDir: typeof config.machineDir === 'string' && config.machineDir.trim() !== ''
+      ? path.resolve(config.machineDir.trim())
+      : undefined,
+    explicit: {
+      ...(Array.isArray(config.allowedCommands) ? { allowedCommands: config.allowedCommands } : {}),
+      ...(Number.isInteger(config.defaultTimeoutMs) ? { defaultTimeoutMs: config.defaultTimeoutMs } : {}),
+      ...(Number.isInteger(config.maxOutputBytes) ? { maxOutputBytes: config.maxOutputBytes } : {}),
+      ...(Array.isArray(config.writeScope) ? { writeScope: config.writeScope } : {}),
+    },
+  });
+
   return {
     rabbitUrl,
     stateDir,
@@ -407,9 +435,13 @@ function readConfig(config = {}) {
       ? config.machineName.trim()
       : os.hostname(),
     autoStartAgent: config.autoStartAgent === true,
-    allowedCommands: Array.isArray(config.allowedCommands)
-      ? config.allowedCommands.filter((entry) => typeof entry === 'string').map((entry) => entry.trim()).filter(Boolean)
-      : [],
+    // From the merged layers, not from `config` alone: this is the value the fleet shares.
+    allowedCommands: shared.values.allowedCommands
+      .filter((entry) => typeof entry === 'string')
+      .map((entry) => entry.trim())
+      .filter(Boolean),
+    defaultTimeoutMs: shared.values.defaultTimeoutMs,
+    sharedConfig: shared,
     pairingCode: typeof config.pairingCode === 'string' && config.pairingCode.trim() !== ''
       ? config.pairingCode.trim()
       : (typeof process.env.W2M_PAIRING_CODE === 'string' && process.env.W2M_PAIRING_CODE.trim() !== ''
@@ -632,7 +664,7 @@ function requireOperatorToken(cfg) {
   if (cfg.operatorToken) return cfg.operatorToken;
   throw configError(
     'operatorToken',
-    'is not set, so this tool cannot dispatch a tas - a device token cannot dispatch tasks; ' +
+    'is not set, so this tool cannot dispatch a task - a device token cannot dispatch tasks; ' +
       '`POST /v1/task` requires the operator token',
     'set `operatorToken` in this plugin\'s profile patch (or `W2M_OPERATOR_TOKEN` in the environment) ' +
       'to the value the relay printed at startup, or read it from `<state>/operator-token.txt`',
@@ -1656,8 +1688,13 @@ export async function apply(ctx, config = {}) {
       },
       timeout_ms: {
         type: 'number',
-        description: `How long each machine may spend on the command, in milliseconds. Defaults to 300000, capped at ${MAX_TASK_TIMEOUT_MS}.`,
-        default: 300_000,
+        // No `default` here on purpose. If the schema carried one, DSH would fill it in before
+        // `execute` ran, so a timeout set in the shared config would be silently overridden by the
+        // schema on every call -- and the operator would see their setting have no effect. Leaving it
+        // unset lets `execute` fall back to the merged config, and an explicit per-call value still wins.
+        description:
+          'How long each machine may spend on the command, in milliseconds. Defaults to the shared config ' +
+          `(defaultTimeoutMs, itself 300000 unless set), capped at ${MAX_TASK_TIMEOUT_MS}.`,
       },
       write: {
         type: 'boolean',
@@ -1849,8 +1886,11 @@ export async function apply(ctx, config = {}) {
         }
       }
 
+      // The default comes from the merged shared config, so a fleet that agrees on a timeout gets it
+      // from one committed file instead of every machine's own settings. The per-call argument still
+      // wins, and MAX_TASK_TIMEOUT_MS still bounds the result.
       const timeoutMs = Math.min(
-        Math.max(1, Number.isFinite(args?.timeout_ms) ? Number(args.timeout_ms) : 300_000),
+        Math.max(1, Number.isFinite(args?.timeout_ms) ? Number(args.timeout_ms) : cfg.defaultTimeoutMs),
         MAX_TASK_TIMEOUT_MS,
       );
       const write = args?.write === true;
@@ -2284,6 +2324,21 @@ export async function apply(ctx, config = {}) {
                 : 'environment')
               : null,
             operatorToken_required_by_relay: relay.operator_token_required ?? null,
+          },
+          /**
+           * v0.3.3 shared config, with the source of every value.
+           *
+           * The sources are the point, not decoration: "the setting is there but something overrides
+           * it" is the characteristic failure of layered configuration, and it must be answerable from
+           * one call rather than by editing files and observing what changes.
+           */
+          shared_config: {
+            files: cfg.sharedConfig.files,
+            values: cfg.sharedConfig.values,
+            sources: cfg.sharedConfig.sources,
+            // Pre-rendered too, because the human reading this in a terminal is usually the one who
+            // has to decide which file to edit.
+            summary: describeSharedConfig(cfg.sharedConfig),
           },
           project: {
             base_commit: anchors.base_commit,

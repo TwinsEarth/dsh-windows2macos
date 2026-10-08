@@ -430,6 +430,116 @@ describe('w2m_history and w2m_stats (v0.3.0)', () => {
   });
 });
 
+describe('shared config reaches the wire (v0.3.3)', () => {
+  /** A fetch stub that records the request bodies it was given. */
+  function withRelay(body = { task_id: 'T1', seq: 1, leases: [] }) {
+    const calls = [];
+    const original = globalThis.fetch;
+    globalThis.fetch = async (url, init = {}) => {
+      const path = String(url).replace(/^https?:\/\/[^/]+/, '');
+      calls.push({ path, body: init.body === undefined ? null : JSON.parse(String(init.body)) });
+      const text = JSON.stringify(body);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => JSON.parse(text),
+        text: async () => text,
+        arrayBuffer: async () => new TextEncoder().encode(text).buffer,
+      };
+    };
+    return { calls, restore: () => { globalThis.fetch = original; } };
+  }
+
+  /** A project directory containing a `.w2m.json`. */
+  function projectWith(sharedDoc) {
+    const dir = makeProfile();
+    if (sharedDoc !== null) {
+      writeFileSync(path.join(dir, '.w2m.json'), typeof sharedDoc === 'string' ? sharedDoc : JSON.stringify(sharedDoc), 'utf8');
+    }
+    return dir;
+  }
+
+  it('sends the timeout from the shared config instead of the built-in default', async () => {
+    const projectDir = projectWith({ defaultTimeoutMs: 12345 });
+    const { tools } = await register({ rabbitUrl: 'http://relay.test', projectDir, operatorToken: 'op' }, { withEffect: false });
+    const stub = withRelay();
+    try {
+      await tools.get('w2m_run').execute({ command_argv: ['node', '--test'] }, {});
+      const sent = stub.calls.find((c) => c.path === '/v1/task');
+      assert.ok(sent, 'the run must reach POST /v1/task');
+      // The assertion that matters: the body, not the config object. A loader that parses but is never
+      // consulted would pass every other test in the suite.
+      assert.equal(sent.body.timeout_ms, 12345);
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it('lets an explicit per-call timeout win over the shared config', async () => {
+    const projectDir = projectWith({ defaultTimeoutMs: 12345 });
+    const { tools } = await register({ rabbitUrl: 'http://relay.test', projectDir, operatorToken: 'op' }, { withEffect: false });
+    const stub = withRelay();
+    try {
+      await tools.get('w2m_run').execute({ command_argv: ['node', '--test'], timeout_ms: 999 }, {});
+      assert.equal(stub.calls.find((c) => c.path === '/v1/task').body.timeout_ms, 999);
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it('refuses to start on an unparsable shared config rather than running on defaults', async () => {
+    // Running with defaults while the operator believes their settings apply is the silently-wrong
+    // outcome; a fleet whose allow-list silently reverted to empty is the specific danger.
+    const projectDir = projectWith('{ not json');
+    await assert.rejects(
+      () => register({ rabbitUrl: 'http://relay.test', projectDir, operatorToken: 'op' }, { withEffect: false }),
+      (err) => err.code === 'W2M_CONFIG_UNPARSABLE',
+    );
+  });
+
+  it('refuses a shared config that tries to carry a credential', async () => {
+    const projectDir = projectWith({ operatorToken: 'oops' });
+    await assert.rejects(
+      () => register({ rabbitUrl: 'http://relay.test', projectDir, operatorToken: 'op' }, { withEffect: false }),
+      (err) => err.code === 'W2M_CONFIG_SECRET_REFUSED',
+    );
+  });
+
+  it('reports the source of every shared value through w2m_status', async () => {
+    // The layered-config failure is "the value is in the file I edited and something else wins". The
+    // answer has to be readable from one call.
+    const projectDir = projectWith({ defaultTimeoutMs: 4242 });
+    const { tools } = await register({ rabbitUrl: 'http://relay.test', projectDir, operatorToken: 'op' }, { withEffect: false });
+    const stub = withRelay({
+      protocol_version: 1,
+      ok: true,
+      devices: 1,
+    });
+    try {
+      const out = JSON.parse(await tools.get('w2m_status').execute({}, {}));
+      assert.ok(out.shared_config, 'w2m_status must report the shared config');
+      assert.equal(out.shared_config.sources.defaultTimeoutMs, 'shared');
+      assert.equal(out.shared_config.values.defaultTimeoutMs, 4242);
+      assert.match(out.shared_config.summary, /defaultTimeoutMs = 4242\s+\[shared\]/);
+    } finally {
+      stub.restore();
+    }
+  });
+
+  it('reports defaults as defaults when no file exists', async () => {
+    const projectDir = projectWith(null);
+    const { tools } = await register({ rabbitUrl: 'http://relay.test', projectDir, operatorToken: 'op' }, { withEffect: false });
+    const stub = withRelay({ protocol_version: 1, ok: true, devices: 0 });
+    try {
+      const out = JSON.parse(await tools.get('w2m_status').execute({}, {}));
+      assert.equal(out.shared_config.sources.defaultTimeoutMs, 'default');
+      assert.equal(out.shared_config.values.defaultTimeoutMs, 300000);
+    } finally {
+      stub.restore();
+    }
+  });
+});
+
 describe('the scheduled job is owned by ctx.effect', () => {
   it('registers exactly one effect when enabled, and arms one unref\u2019d timer', async () => {
     const profileDir = makeProfile();

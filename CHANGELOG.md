@@ -4,6 +4,71 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.5] — 2026-10-08
+
+Two of the four remaining v0.3.3 items: shared configuration and multi-arch images.
+
+### Added
+
+- **Shared configuration** (`src/plugin/shared-config.mjs`). One committed file, `.w2m.json` at the
+  project root, that every machine reads — so the allow-list, the timeout and the update schedule stop
+  drifting per machine. Layering is `.w2m.json` → `~/.w2m/machine.json` → the host's own config object,
+  highest wins key by key.
+
+  It lives **in the project, not on the relay**, because a relay-hosted config would mean the relay
+  holds the fleet's credentials or the config splits into secret and non-secret halves — and the
+  operator ruled that the relay must not hold credentials. A file in the project needs nothing from the
+  relay, works while the relay is unreachable, and is reviewed in the same pull request as the code it
+  governs.
+
+  Four decisions worth stating, each of which is a way config systems fail their users:
+
+  - **Secrets are refused, not ignored.** A key matching `token`/`secret`/`password`/`credential`/
+    `apikey` is rejected with a message naming the key. Silently dropping it would let the operator
+    believe a token is in effect, and a token in a committed file is a leak that survives every later
+    decision.
+  - **A typo'd key is refused.** A silently-dropped key is indistinguishable from a setting that works,
+    which is the worse of the two failures.
+  - **Absence is tolerated, breakage is not.** No file is the normal case and yields defaults; a file
+    that exists and does not parse is a loud error. Running on defaults while the operator believes
+    their settings apply is exactly the silently-wrong outcome this project refuses elsewhere.
+  - **Every effective value reports its source** through `w2m_status`. "The setting is in the file I
+    edited and something else wins" is the characteristic failure of layered configuration, and the
+    answer must be readable from one call instead of by bisecting the layers.
+
+  `timeout_ms` lost its schema `default` for a related reason: with a default in the parameter map, DSH
+  fills it in before `execute` runs, so a timeout set in the shared config would be silently overridden
+  on every call and the operator would see their setting do nothing.
+
+- **Multi-arch Docker images** (`deploy/docker/`, `.github/workflows/docker.yml`) for `linux/amd64`
+  and `linux/arm64`. The relay's real import closure was computed to prove the image installs **no npm
+  packages**: 7 files, ~175 KiB, all `node:` builtins. The image is non-root with a `VOLUME` state dir
+  and a token-free `HEALTHCHECK`.
+
+### Verification
+
+600 unit tests, 598 pass, 2 skip, 0 fail, 0 todo. 19 suites wired into `ci.yml`, `release.yml` and
+`package.json` with exhaustiveness checked. ESLint: 0 errors, 55 warnings, all pre-reviewed.
+
+### Not verified
+
+- **No Docker image was built.** Docker, Podman and buildah are all absent from this machine, and
+  Docker Hub is unreachable from it, so every build/push/platform claim is unverified. What *was*
+  verified without Docker: all COPY sources exist, all 7 closure files are covered by the COPY set, no
+  package manager appears anywhere, the base tag is an exact patch version, and — the strongest one —
+  the container's `CMD` was executed directly against the same file set, starting the relay, answering
+  `/healthz` without a token, exiting 0 from the exact `HEALTHCHECK` command, and writing the pairing
+  code to stderr.
+- The base tag `node:22.23.3-bookworm-slim` could not be confirmed against the registry. The version
+  itself was verified against `nodejs.org/dist/index.json`.
+- `metrics` is implemented but **not yet routed**; `GET /metrics` still 401s. See v0.3.6.
+
+### Reported, not fixed
+
+`--signing-secret` and `--require-signature` are parsed by `bin/w2m-rabbit.mjs` but missing from its
+`--help` output, so an operator cannot discover them from the CLI. Outside the scope of the task that
+found it.
+
 ## [0.3.4] — 2026-10-08
 
 ### Added

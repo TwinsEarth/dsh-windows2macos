@@ -1,0 +1,98 @@
+name: Docker
+
+# Separate workflow on purpose: an image build is minutes of QEMU-emulated work
+# and belongs nowhere near the fast lint/test matrix in ci.yml. Keeping it in its
+# own file also means a red image build does not make a pull request look like a
+# test failure, and a broken test suite does not hide an image problem.
+#
+# The paths filter is the other half of that: this runs only when something that
+# can change the image changes, so documentation-only pull requests do not pay
+# for a multi-arch build.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'deploy/docker/**'
+      - 'bin/w2m-rabbit.mjs'
+      - 'src/relay/**'
+      - 'src/util/cli.mjs'
+      - 'src/signing.mjs'
+      - '.github/workflows/docker.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'deploy/docker/**'
+      - 'bin/w2m-rabbit.mjs'
+      - 'src/relay/**'
+      - 'src/util/cli.mjs'
+      - 'src/signing.mjs'
+      - '.github/workflows/docker.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build linux/amd64 + linux/arm64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # QEMU is what lets an x86 runner execute the arm64 build stages. Without
+      # it the arm64 half fails with "exec format error" during any RUN.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Show the builder
+        run: docker buildx inspect --bootstrap
+
+      # push: false and load: false — this job PROVES both architectures build
+      # and nothing else. There are no registry credentials in this repository,
+      # so a push would fail by design; the explicit `push: false` keeps that a
+      # decision rather than an accident.
+      #
+      # `load: false` is required alongside multiple platforms: the docker
+      # driver cannot hold a multi-arch manifest in the local image store, so
+      # `load: true` would error out. If you want a locally-usable image, build
+      # the single platform you are on.
+      - name: Build (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: false
+          load: false
+          # Layer cache in the GitHub Actions cache. `scope` keeps this cache
+          # separate from any other workflow that later uses the same backend.
+          cache-from: type=gha,scope=w2m-relay
+          cache-to: type=gha,mode=max,scope=w2m-relay
+          provenance: false
+          sbom: false
+
+      # A build that only proves "it compiled" is weak evidence for an image
+      # whose whole promise is that it needs nothing installed. This step
+      # re-reads the Dockerfile and fails if a package manager ever appears in
+      # it, which is the one change that would silently break that promise.
+      - name: Assert the image installs nothing from npm
+        run: |
+          if grep -nE '^[[:space:]]*(RUN[[:space:]]+)?(npm|pnpm|yarn|corepack)[[:space:]]+(install|ci|add|i)\b' deploy/docker/Dockerfile; then
+            echo "::error file=deploy/docker/Dockerfile::a package-manager install appeared in the image; the relay has zero runtime dependencies and the image must install nothing"
+            exit 1
+          fi
+          echo "no package-manager install in the Dockerfile"
+
+      - name: Image labels (informational)
+        run: |
+          echo "repo    : ${{ github.repository }}"
+          echo "sha     : ${{ github.sha }}"
+          echo "ref     : ${{ github.ref }}"
