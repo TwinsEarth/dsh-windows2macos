@@ -4,6 +4,34 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] — 2026-10-08
+
+Two tools that landed after 0.3.0 was published, so they get their own version rather than a moved
+tag: a published release is a promise about a specific tarball, and rewriting it would break anyone
+who already downloaded it.
+
+### Added
+
+- **`w2m_history`** — recent tasks newest-first with their modes, shard counts, lease holders and
+  cancellation state, without fetching a single result envelope. It reports how many tasks the relay
+  *holds* alongside how many it returned, because a page emptied by a filter and an empty relay
+  produce identical lists and only one of them is a problem. The limit is clamped locally so a model
+  cannot make this machine allocate a million rows.
+- **`w2m_stats`** — the fleet in one call: machine and task counts, aggregate RTT, whether the relay
+  restarted. It degrades rather than failing: if this machine cannot read the per-machine roster it
+  still reports the relay's own totals, with a note naming which half is missing.
+
+In both, `null` means "the relay did not report it" and never "zero" — the same distinction the
+0.3.0 relay-side RTT work turns on, applied at the tool boundary.
+
+The tool count is now **eight**, which is the number the original request asked for.
+
+### Verification
+
+545 unit tests, 543 pass, 2 skip, 0 fail; 57 end-to-end. `scripts/verify-installed.mjs` confirms
+eight tools register in both the repository and the packed artifact, and the CI `lint` job reports
+0 errors.
+
 ## [0.3.0] — 2026-10-08
 
 ### Added
