@@ -918,8 +918,8 @@ export class RabbitState {
    */
   createTask(input = {}) {
     const mode = input.mode ?? 'replicate';
-    if (mode !== 'replicate' && mode !== 'split') {
-      throw new ProtocolError('BAD_REQUEST', 'mode must be replicate|split', { mode });
+    if (mode !== 'replicate' && mode !== 'split' && mode !== 'broadcast') {
+      throw new ProtocolError('BAD_REQUEST', 'mode must be replicate|split|broadcast', { mode });
     }
     const commandArgv = input.command_argv;
     if (!Array.isArray(commandArgv) || commandArgv.length === 0 || commandArgv.some((a) => typeof a !== 'string')) {
@@ -941,6 +941,29 @@ export class RabbitState {
     const baseTree = input.base_tree ?? null;
     const commandHash = input.command_hash ?? computeCommandHash(commandArgv, SHELL_ID_DIRECT, cwdRel);
     const timeoutMs = Number.isInteger(input.timeout_ms) ? input.timeout_ms : 300_000;
+
+    // v0.3.3 `broadcast`: one machine runs the command, every other machine is told the outcome.
+    //
+    // The executor choice is deterministic rather than random. A random leader makes a task
+    // impossible to reproduce from its own record -- the same task id would run somewhere else on a
+    // retry -- and this project's whole value rests on being able to say exactly where something ran.
+    // The first target in the relay's own device order is stable for a given device table.
+    //
+    // Observers get a lease so they are tracked and notified, but their lease is `observing`, which
+    // every aggregation step treats as "did not run". That distinction is the point: a machine that
+    // never executed anything agreeing with a result would be a fabrication, and it is exactly the
+    // fabrication this mode could most easily produce.
+    //
+    // Resolved before the task literal because the literal records it. (`targets` is computed below,
+    // so the executor is re-validated against it after that.)
+    const targetIds = Array.isArray(input.target_machines) && input.target_machines.length > 0
+      ? input.target_machines
+      : [...this.devices.keys()];
+    const executorMachineId = mode === 'broadcast'
+      ? (typeof input.executor_machine_id === 'string' && input.executor_machine_id !== ''
+        ? input.executor_machine_id
+        : targetIds[0] ?? null)
+      : null;
 
     const task = {
       task_id: taskId,
@@ -967,12 +990,23 @@ export class RabbitState {
       degraded: null,
       deadline_ms: now + timeoutMs,
       result_seqs: [],
+      /** v0.3.3: which machine actually executes under `broadcast`; null for the other modes. */
+      executor_machine_id: executorMachineId,
     };
 
     const all = [...this.devices.values()];
     const targets = Array.isArray(input.target_machines) && input.target_machines.length > 0
       ? all.filter((d) => input.target_machines.includes(d.machine_id))
       : all;
+
+    // v0.3.3 `broadcast`: validated here, where `targets` is known. The executor id itself was
+    // resolved before the task literal because the literal records it.
+    if (mode === 'broadcast' && executorMachineId !== null && !targets.some((d) => d.machine_id === executorMachineId)) {
+      throw new ProtocolError('BAD_REQUEST', 'executor_machine_id is not among the target machines', {
+        executor_machine_id: executorMachineId,
+        targets: targets.map((d) => d.machine_id),
+      });
+    }
 
     if (targets.length === 0) {
       throw new ProtocolError('NO_ONLINE_DEVICE', 'no paired device available for this task', {
@@ -987,12 +1021,16 @@ export class RabbitState {
     let lastSeq = this.seq;
     targets.forEach((device, i) => {
       const index = mode === 'replicate' ? 0 : i % indexTotal;
+      const observing = mode === 'broadcast' && device.machine_id !== executorMachineId;
       const lease = {
         machine_id: device.machine_id,
         machine_name: device.machine_name,
         index,
         attempt: 1,
-        state: 'queued',
+        // `observing` is a lease state, not an outcome: the machine holds a place in this task and
+        // will be told what happened, but it was never handed the command. `gateMachine` below is
+        // skipped for it because refusing to do work you were never asked to do is not a refusal.
+        state: observing ? 'observing' : 'queued',
         refusal_reason: null,
         refusal_detail: null,
         dedupe_key: computeDedupeKey(taskId, index, commandHash, baseTree),
@@ -1006,6 +1044,13 @@ export class RabbitState {
         finished_at_ms: null,
         heartbeat_count: 0,
       };
+      if (observing) {
+        // No capability gate and no offer: the machine is not being asked to run anything, so there
+        // is nothing to refuse and nothing to hand out. It is recorded so the task can tell it the
+        // outcome afterwards.
+        task.leases.set(device.machine_id, lease);
+        return;
+      }
       const gate = gateMachine(task, device);
       if (gate) {
         lease.state = 'refused';

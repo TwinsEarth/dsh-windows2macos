@@ -472,13 +472,72 @@ describe('argument gating', () => {
     try {
       const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
       const run = tools.get('w2m_run');
-      await assert.rejects(() => run.execute(runArgs({ mode: 'broadcast' }), {}), /`replicate` or `split`/);
+      // `broadcast` used to be the unknown-mode example here. It is a real mode as of v0.3.3, so the
+      // example had to move to something genuinely unknown.
+      await assert.rejects(
+        () => run.execute(runArgs({ mode: 'pipeline' }), {}),
+        /`replicate`, `split` or `broadcast`/,
+      );
       await assert.rejects(() => run.execute(runArgs({ mode: 'split', index_total: 0 }), {}), /index_total/);
       await assert.rejects(
         () => run.execute(runArgs({ mode: 'replicate', index_total: 3 }), {}),
         /`index_total` must be 1/,
       );
       assert.equal(fetchStub.calls.length, 0);
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('refuses an executor_machine_id outside broadcast instead of accepting a no-op restriction', async () => {
+    // The relay reads this field only for broadcast. Accepting it under replicate would look like
+    // "only this machine runs it" while the command in fact runs everywhere -- a promise that is not
+    // enforced is worse than no parameter at all.
+    const fetchStub = installFetch([]);
+    try {
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
+      const run = tools.get('w2m_run');
+      await assert.rejects(
+        () => run.execute(runArgs({ mode: 'replicate', executor_machine_id: 'm1' }), {}),
+        /only applies to mode=broadcast/,
+      );
+      await assert.rejects(
+        () => run.execute(runArgs({ mode: 'split', index_total: 2, executor_machine_id: 'm1' }), {}),
+        /only applies to mode=broadcast/,
+      );
+      // A broadcast with more than one shard is refused rather than coerced: running one shard while
+      // recording a split task would put work in the report that never happened.
+      await assert.rejects(
+        () => run.execute(runArgs({ mode: 'broadcast', index_total: 2 }), {}),
+        /mode=broadcast runs the command on one machine/,
+      );
+      assert.equal(fetchStub.calls.length, 0, 'none of these may reach the relay');
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('sends executor_machine_id only for broadcast', async () => {
+    const fetchStub = installFetch([
+      { path: '/v1/task', method: 'POST', body: { task_id: 'T1', seq: 1, leases: [] } },
+    ]);
+    try {
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
+      const run = tools.get('w2m_run');
+
+      await run.execute(runArgs({ mode: 'broadcast', executor_machine_id: 'm2' }), {});
+      const broadcastBody = fetchStub.calls.at(-1).body;
+      assert.equal(broadcastBody.mode, 'broadcast');
+      assert.equal(broadcastBody.executor_machine_id, 'm2');
+
+      await run.execute(runArgs({}), {});
+      const replicateBody = fetchStub.calls.at(-1).body;
+      assert.equal(replicateBody.mode, 'replicate');
+      assert.equal(
+        'executor_machine_id' in replicateBody,
+        false,
+        'the relay must not receive a field it ignores',
+      );
     } finally {
       fetchStub.restore();
     }

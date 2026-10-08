@@ -1604,8 +1604,19 @@ export async function apply(ctx, config = {}) {
       },
       mode: {
         type: 'string',
-        description: 'replicate: every machine runs the whole command. split: each machine takes its share by index. Defaults to replicate.',
+        enum: ['replicate', 'split', 'broadcast'],
+        description:
+          'replicate: every machine runs the whole command. split: each machine takes its share by index. ' +
+          'broadcast: one machine runs it and every other machine is told the outcome without running anything ' +
+          '(pair with executor_machine_id to choose which). Defaults to replicate.',
         default: 'replicate',
+      },
+      executor_machine_id: {
+        type: 'string',
+        description:
+          'mode=broadcast only: which machine runs the command. Defaults to the first machine the relay lists, ' +
+          'chosen deterministically so the same task record describes the same execution twice. Every other ' +
+          'machine is recorded as an observer and is never counted as having verified the result.',
       },
       index_total: {
         type: 'number',
@@ -1659,10 +1670,12 @@ export async function apply(ctx, config = {}) {
       }
 
       const mode = args?.mode ?? 'replicate';
-      if (mode !== 'replicate' && mode !== 'split') {
+      if (mode !== 'replicate' && mode !== 'split' && mode !== 'broadcast') {
         throw new W2MError(
           'W2M_BAD_MODE',
-          `W2M_BAD_MODE: \`mode\` must be \`replicate\` or \`split\`, not \`${mode}\`; replicate runs the whole command on every machine, split hands each machine a slice by index`,
+          `W2M_BAD_MODE: \`mode\` must be \`replicate\`, \`split\` or \`broadcast\`, not \`${mode}\`; ` +
+            'replicate runs the whole command on every machine, split hands each machine a slice by index, ' +
+            'broadcast runs it on one machine and tells every other machine the outcome',
         );
       }
       const indexTotal = Number.isInteger(args?.index_total) ? args.index_total : 1;
@@ -1677,6 +1690,31 @@ export async function apply(ctx, config = {}) {
           'W2M_BAD_INDEX',
           `W2M_BAD_INDEX: mode=replicate means every machine runs the whole command, so \`index_total\` must be 1, not \`${indexTotal}\`; use mode=split with index_total>1 to hand each machine a slice`,
           { hint: 'use mode=split with index_total>1 to hand each machine a slice' },
+        );
+      }
+
+      // `broadcast` runs the command on exactly one machine. Accepting a multi-shard index_total here
+      // would record a split task while executing a single shard, and the report would then describe
+      // work that never happened -- so it is refused rather than quietly coerced.
+      if (mode === 'broadcast' && indexTotal !== 1) {
+        throw new W2MError(
+          'W2M_BAD_INDEX',
+          `W2M_BAD_INDEX: mode=broadcast runs the command on one machine, so \`index_total\` must be 1, not \`${indexTotal}\`; use mode=split to hand each machine a slice`,
+          { hint: 'use mode=broadcast with index_total=1, or mode=split to distribute slices' },
+        );
+      }
+      const executorMachineId =
+        typeof args?.executor_machine_id === 'string' && args.executor_machine_id !== ''
+          ? args.executor_machine_id
+          : null;
+      if (executorMachineId !== null && mode !== 'broadcast') {
+        // The relay only reads this field for broadcast, so accepting it elsewhere would promise a
+        // restriction that nothing enforces: the command would still run everywhere.
+        throw new W2MError(
+          'W2M_BAD_EXECUTOR',
+          `W2M_BAD_EXECUTOR: \`executor_machine_id\` only applies to mode=broadcast, but \`mode\` is \`${mode}\`; ` +
+            'under replicate and split the relay decides the targets, so passing this would look like a restriction that is not applied',
+          { hint: 'use mode=broadcast with executor_machine_id, or drop executor_machine_id' },
         );
       }
 
@@ -1726,6 +1764,9 @@ export async function apply(ctx, config = {}) {
         compare_policy: { strip_ansi: true, normalize_crlf: true, strip_trailing_blank_lines: true, redact: [] },
         halt: args?.halt === 'now' ? 'now' : 'never',
         created_by: cfg.machineName,
+        // Only sent for broadcast; the relay ignores it otherwise, and the validation above already
+        // refused the combination, so this cannot silently mean nothing.
+        ...(executorMachineId !== null ? { executor_machine_id: executorMachineId } : {}),
       };
 
       const result = await request({
@@ -1743,7 +1784,7 @@ export async function apply(ctx, config = {}) {
         const operatorRequired = result.error?.code === 'OPERATOR_REQUIRED' || result.status === 401;
         throw new W2MError(
           'W2M_RABBIT_REFUSED',
-          `W2M_RABBIT_REFUSED: the Rabbit refused POST /v1/task with HTTP ${result.status}${result.error ? ` (${result.error.code}: ${result.error.message})` : ''}; ${operatorRequired ? 'this relay requires the operator token to dispatch tasks and the one sent was not accepte - set `operatorToken` (or `W2M_OPERATOR_TOKEN`) to the value the relay printed at startup; a device token cannot dispatch tasks' : result.error?.code === 'NO_ONLINE_DEVICE' ? 'no machine is currently streamin - start the agent on each machine, then w2m_devices shows who is online' : 'check the Rabbit log for the reason it gave'}`,
+          `W2M_RABBIT_REFUSED: the Rabbit refused POST /v1/task with HTTP ${result.status}${result.error ? ` (${result.error.code}: ${result.error.message})` : ''}; ${operatorRequired ? 'this relay requires the operator token to dispatch tasks and the one sent was not accepted - set `operatorToken` (or `W2M_OPERATOR_TOKEN`) to the value the relay printed at startup; a device token cannot dispatch tasks' : result.error?.code === 'NO_ONLINE_DEVICE' ? 'no machine is currently streaming - start the agent on each machine, then w2m_devices shows who is online' : 'check the Rabbit log for the reason it gave'}`,
           {
             hint: operatorRequired
               ? 'set `operatorToken` (or `W2M_OPERATOR_TOKEN`) to the value the relay printed at startup, or read it from `<state>/operator-token.txt`'

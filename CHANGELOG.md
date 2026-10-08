@@ -4,6 +4,56 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] — 2026-10-08
+
+The first half of the v0.3.3 batch: a third dispatch mode.
+
+### Added
+
+- **`broadcast` mode.** One machine runs the command and every other machine is told the outcome
+  without running anything. Useful when the point is not redundancy but *notification* — a migration
+  applied once, a deploy, a cache purge — and the other machines need to know it happened.
+
+  The design is built around one hazard: **a machine that did not run must never be counted as
+  agreeing.** If observers were ordinary participants, a broadcast of a successful command would
+  aggregate to `consistent`, and a reader would reasonably conclude that the whole fleet had verified
+  the result when in fact one machine ran and the others were merely told. So observers hold an
+  `observing` lease, which Step 0 of the aggregation routes out of the participant set entirely:
+  they cannot pass, cannot refuse, and cannot contribute to a verdict. `step0.observing` lists them
+  explicitly so the report says who was informed rather than implying they were involved.
+
+  Three consequences worth stating, because each is a bug the obvious implementation would have:
+
+  - Without treating `observing` as "not a participant", an observer has no envelope and never will,
+    so the anchor step classifies it `pending` and **the task can never reach a verdict** — every
+    broadcast would hang. Covered by `does not hold the verdict open for a silent observer`.
+  - A broadcast whose executor has not reported yet must be `pending`, not `consistent`. With only
+    observers participating, a naive aggregation sees zero machines and zero failures, which reads as
+    success. Covered by `is pending, not consistent, while the executor has not reported`.
+  - The executor is chosen **deterministically** (the first machine the relay lists), not randomly. A
+    random leader makes a task impossible to reproduce from its own record — the same `task_id` would
+    run somewhere else on a retry — and being able to say exactly where something ran is the point of
+    this project.
+
+  `executor_machine_id` selects the machine explicitly and is **refused outside broadcast** rather
+  than ignored: the relay reads it only for `broadcast`, so accepting it under `replicate` would look
+  like "only this machine runs it" while the command ran everywhere. A restriction that is not
+  enforced is worse than no parameter. For the same reason `broadcast` with `index_total > 1` is
+  refused instead of coerced — running one shard while recording a split task would put work in the
+  report that never happened.
+
+### Verification
+
+559 unit tests, 557 pass, 2 skip, 0 fail; 57 end-to-end. Twelve new tests in
+`test/broadcast.test.mjs`, written around the failure this mode can most easily produce rather than
+around the happy path. ESLint 0 errors.
+
+### Not in this release
+
+`pipeline` and the composable mode are **not implemented**. The relay rejects `mode: "pipeline"` with
+`BAD_REQUEST` rather than falling back to `replicate`: silently running a chained request on every
+machine would be an expensive misreading of what was asked.
+
 ## [0.3.1] — 2026-10-08
 
 Two tools that landed after 0.3.0 was published, so they get their own version rather than a moved

@@ -103,6 +103,10 @@ export function aggregate(task, resultRecords = [], opts = {}) {
       lease_expired: lease.state === 'expired',
       refused_reason: lease.refusal_reason ?? null,
       gate_refused: lease.state === 'refused',
+      // v0.3.3 `broadcast`: a machine that was told the outcome but never handed the command. It has
+      // no envelope and never will, so without this marker the anchor step classified it `pending`
+      // and the task could never reach a verdict -- a broadcast would hang forever.
+      observing: lease.state === 'observing',
       result: rec,
       envelope: rec?.envelope ?? null,
       outcome: null,
@@ -132,8 +136,15 @@ export function aggregate(task, resultRecords = [], opts = {}) {
   const notes = [];
 
   /* -------- Step 0: refusals are booked per machine, they never block others -------- */
-  const step0 = { step: 0, name: 'refusal', refused: [], passed: [] };
+  const step0 = { step: 0, name: 'refusal', refused: [], passed: [], observing: [] };
   for (const m of machines) {
+    if (m.observing) {
+      // Not a participant: it was never asked to run, so it cannot refuse, cannot pass, and must
+      // never be counted as agreeing. Recording the outcome is the whole reason it is listed.
+      m.outcome = 'observing';
+      step0.observing.push(m.machine_id);
+      continue;
+    }
     const refusedByGate = m.gate_refused;
     const refusedByEnvelope = m.envelope?.status === 'refused';
     if (refusedByGate || refusedByEnvelope) {
@@ -148,7 +159,7 @@ export function aggregate(task, resultRecords = [], opts = {}) {
   }
   steps.push(step0);
 
-  const participants = machines.filter((m) => m.outcome !== 'refused');
+  const participants = machines.filter((m) => m.outcome !== 'refused' && m.outcome !== 'observing');
 
   /* -------- Step 1: anchors — any violation refuses aggregation entirely -------- */
   const step1 = { step: 1, name: 'anchors', violations: [], passed: [], pending: [] };
