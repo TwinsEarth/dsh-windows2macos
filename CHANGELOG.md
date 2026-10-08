@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+### The v0.3.5 / v0.3.6 release gap
+
+Both versions are tagged, and **neither was ever published**. The flake fixed above failed inside the
+`Release` workflow, so those two tags have no GitHub release and no downloadable tarball. The evidence
+for the cause is the release list itself: v0.3.4 published, v0.3.7 published, and the two in between
+absent.
+
+They cannot be published retroactively, and this is worth stating precisely rather than papering over:
+a tag pins the tree that ran, and the tree at those tags **contains the flaky test**. Re-running their
+`Release` workflow fails again for the same reason. Moving a tag forward to pick up the fix would
+publish the right code under the wrong version — `package.json` at v0.3.5's commit says `0.3.5`, so the
+tarball would be named 0.3.5 while containing later code.
+
+What that means in practice: **v0.3.7 is the first published artifact that contains the shared config
+(v0.3.5) and the metrics endpoint (v0.3.6).** Anyone installing from releases gets all three. The gap is
+cosmetic in effect and real in the record, which is why it is written down instead of skipped.
+
+The process lesson is the one that cost the most here: a flaky test does not just fail a build, it can
+block every release behind it until someone notices that the failures share a cause. Three consecutive
+release runs failed before the pattern was visible in the release list.
+
 ## [0.3.7] — 2026-10-08
 
 ### Fixed
