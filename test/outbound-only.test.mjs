@@ -186,14 +186,6 @@ async function startAgent({ rabbitUrl, pairingCode, project, stateDir, dshHome }
   return { proc, stdout: () => out, stderr: () => err };
 }
 
-/** Run git in a directory, failing loudly. */
-function git(args, cwd) {
-  const { spawnSync } = require('node:child_process');
-  const r = spawnSync('git', args, { cwd, encoding: 'utf8' });
-  if (r.status !== 0) throw new Error(`git ${args.join(' ')}: ${r.stderr}`);
-  return r.stdout.trim();
-}
-
 describe('the link is outbound-only', () => {
   it('a running agent listens on nothing', async () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'w2m-oo-relay-'));
