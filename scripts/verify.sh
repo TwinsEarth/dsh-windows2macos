@@ -28,7 +28,7 @@ echo "node: ${node_bin}"
 "${node_bin}" -v
 echo
 
-all_suites=(relay agent tools schedule auto-update update-source update-install update-wiring e2e)
+all_suites=(relay agent tools schedule auto-update update-source update-install update-wiring signing e2e)
 if [[ $# -gt 0 ]]; then
   suites=("$@")
 else
