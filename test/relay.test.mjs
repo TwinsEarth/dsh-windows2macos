@@ -28,7 +28,7 @@ import {
   satisfiesRange,
   sha256Hex,
 } from '../src/relay/state.mjs';
-import { aggregate, aggregateTask, renderReportMarkdown } from '../src/relay/report.mjs';
+import { AGGREGATE_STATUSES, aggregate, aggregateTask, renderReportMarkdown } from '../src/relay/report.mjs';
 import { createRelayServer, normalizeBasePath, SlidingWindowRateLimiter } from '../src/relay/server.mjs';
 import { Persistence } from '../src/relay/persistence.mjs';
 
@@ -1221,14 +1221,18 @@ describe('six-state aggregation (§6.3)', () => {
     assert.equal(agg.counts.ok, 0);
   });
 
-  it('partial: some ok, some failed', () => {
+  it('degraded: every machine reported, some ok and some failed', () => {
+    // v0.3.0: this used to be `partial`. `partial` also means "machines are still out", so a
+    // finished task in a bad state was indistinguishable from one still in flight -- in the one
+    // field a reader looks at first. Every machine here has reported, so this is a verdict.
     const task = fakeTask({ machines: ['m1', 'm2'] });
     const e1 = makeEnvelope({ machine_id: 'm1' });
     const e2 = makeEnvelope({ machine_id: 'm2', status: 'crashed', exit_code: null });
     const agg = aggregate(task, [rec('m1', e1), rec('m2', e2)]);
-    assert.equal(agg.status, 'partial');
+    assert.equal(agg.status, 'degraded');
     assert.equal(agg.counts.ok, 1);
     assert.equal(agg.counts.failed, 1);
+    assert.match(agg.notes.join(' '), /1 machine\(s\) succeeded and 1 failed/);
   });
 
   it('unverifiable: missing required field on any machine refuses aggregation', () => {
@@ -1307,10 +1311,64 @@ describe('six-state aggregation (§6.3)', () => {
     assert.equal(agg.counts.refused, 1);
   });
 
-  it('pending: no result yet', () => {
+  it('pending: no result yet, and the deadline has not passed', () => {
+    // `nowMs` is supplied explicitly rather than relying on the wall clock. Without it the fixture's
+    // `deadline_ms` is compared against the real current time, which made this test pass only
+    // because the previous code had no deadline branch -- a time bomb that goes off the moment the
+    // clock passes the fixture's date, and which is exactly how v0.3.0's `timeout` state surfaced.
     const task = fakeTask({ machines: ['m1', 'm2'] });
-    const agg = aggregate(task, []);
+    const agg = aggregate(task, [], { nowMs: task.deadline_ms - 1 });
     assert.equal(agg.status, 'pending');
+    assert.equal(agg.steps[2].skipped, 'no_results_yet');
+  });
+
+  it('timeout: no result and the deadline has passed', () => {
+    // The other half of the same question. `pending` means more may still arrive; once the caller's
+    // own deadline has passed and machines are still silent, that is a verdict, and calling it
+    // `pending` forever leaves a reader unable to tell a stuck task from a slow one.
+    const task = fakeTask({ machines: ['m1', 'm2'] });
+    const agg = aggregate(task, [], { nowMs: task.deadline_ms });
+    assert.equal(agg.status, 'timeout');
+    assert.equal(agg.steps[2].skipped, 'deadline_passed');
+    assert.match(agg.notes.join(' '), /deadline/);
+  });
+
+  it('timeout is not reported while a result has arrived from anyone', () => {
+    // A deadline that passes after one machine reported is not a timeout: the verdict is about the
+    // machine that stayed silent, which `partial` already covers.
+    const task = fakeTask({ machines: [{ machine_id: 'm1' }, { machine_id: 'm2', state: 'expired' }] });
+    const agg = aggregate(task, [rec('m1', makeEnvelope({ machine_id: 'm1' }))], { nowMs: task.deadline_ms + 60_000 });
+    assert.equal(agg.status, 'partial');
+  });
+
+  it('cancelled: a chosen stop is a verdict, not a malfunction', () => {
+    const task = fakeTask({ machines: ['m1', 'm2'] });
+    task.cancelled = true;
+    task.cancel_reason = 'operator stopped the rollout';
+    const agg = aggregate(task, [], { nowMs: task.deadline_ms + 60_000 });
+    assert.equal(agg.status, 'cancelled');
+    assert.match(agg.notes.join(' '), /operator stopped the rollout/);
+    assert.equal(agg.steps[2].skipped, 'task_cancelled');
+  });
+
+  it('cancelled outranks every other verdict, including a passing run', () => {
+    // Once someone has deliberately stopped the work, reporting `consistent` (or `failed`, or
+    // `timeout`) would describe a decision as a result. Cancellation wins.
+    const task = fakeTask({ machines: ['m1', 'm2'] });
+    task.cancelled = true;
+    const both = ['m1', 'm2'].map((id) => rec(id, makeEnvelope({ machine_id: id })));
+    const agg = aggregate(task, both);
+    assert.equal(agg.status, 'cancelled');
+  });
+
+  it('the three new verdicts are in the published status list', () => {
+    for (const state of ['timeout', 'cancelled', 'degraded']) {
+      assert.ok(AGGREGATE_STATUSES.includes(state), `${state} must be a documented aggregate status`);
+    }
+    // and the six §6.3 verdicts are still there
+    for (const state of ['consistent', 'divergent', 'divergent-platform', 'failed', 'partial', 'unverifiable']) {
+      assert.ok(AGGREGATE_STATUSES.includes(state), `${state} must remain an aggregate status`);
+    }
   });
 
   it('partial: an expired lease is booked as partial (§4.3)', () => {
@@ -2391,6 +2449,568 @@ describe('v0.1.2 lost-offer recovery (§8.6)', () => {
       } finally {
         sse.close();
       }
+    });
+  });
+});
+
+/* ================================================================== */
+/* v0.3.0 — cross-machine RTT through the relay                        */
+/* ================================================================== */
+
+/**
+ * The plugin may run on machine A while the agent runs on machine B, so latency
+ * has to travel through the relay instead of a local state file. These cases
+ * deliberately touch only relay endpoints (never `aggregate`), so they stay
+ * independent of the concurrent nine-state work in report.mjs.
+ */
+describe('v0.3.0 relay RTT (heartbeat rtt_ms)', () => {
+  /** Pair a machine and give it a task, so heartbeats are accepted. */
+  async function pairWithTask(relay, machineId = 'm1') {
+    const { token } = await pairDevice(relay, machineId);
+    const created = await postTask(relay, taskBody());
+    return { token, taskId: created.json.task_id, created };
+  }
+
+  const beat = (relay, token, body) => request(`${relay.url}/v1/heartbeat`, { method: 'POST', token, body });
+  const devices = (relay, token) => request(`${relay.url}/v1/devices`, { token });
+  const agentStatus = (relay, token, machineId) => request(`${relay.url}/v1/agents/${machineId}/status`, { token });
+
+  it('records a reported rtt_ms and exposes it on /v1/devices', async () => {
+    const clock = makeClock();
+    await withRelay({ now: clock.now, pairRateLimitPerMinute: 0 }, async (relay) => {
+      const { token, taskId } = await pairWithTask(relay);
+
+      const before = await devices(relay, token);
+      assert.equal(before.json.devices[0].rtt_ms, null, 'never measured is null, not 0');
+      assert.equal(before.json.devices[0].rtt_at, null);
+      assert.equal(before.json.devices[0].rtt_age_ms, null);
+      assert.equal(before.json.devices[0].rtt_stale, true, 'unknown is not fresh');
+      assert.equal(before.json.devices[0].last_heartbeat_at, null);
+
+      const hb = await beat(relay, token, { task_id: taskId, machine_id: 'm1', phase: 'running', rtt_ms: 42.5 });
+      assert.equal(hb.status, 200);
+      assert.equal(hb.json.cancel, false);
+
+      const after = await devices(relay, token);
+      const device = after.json.devices[0];
+      assert.equal(device.rtt_ms, 42.5, 'the fractional value is preserved');
+      assert.equal(device.rtt_at, rfc3339(clock.now()));
+      assert.equal(device.rtt_age_ms, 0);
+      assert.equal(device.rtt_stale, false);
+      assert.equal(device.last_heartbeat_at, rfc3339(clock.now()));
+
+      // the same data through the single-machine endpoint
+      const status = await agentStatus(relay, token, 'm1');
+      assert.equal(status.status, 200);
+      assert.equal(status.json.rtt_ms, 42.5);
+      assert.equal(status.json.rtt_stale, false);
+      assert.equal(status.json.relay_id, relay.relayId);
+    });
+  });
+
+  it('null and 0 mean different things and stay distinguishable', async () => {
+    await withRelay({ pairRateLimitPerMinute: 0 }, async (relay) => {
+      const { token: quiet } = await pairDevice(relay, 'never-reports');
+      const { token: fast, taskId } = await pairWithTask(relay, 'instant');
+
+      const hb = await beat(relay, fast, { task_id: taskId, machine_id: 'instant', rtt_ms: 0 });
+      assert.equal(hb.status, 200);
+
+      const list = await devices(relay, quiet);
+      const byId = Object.fromEntries(list.json.devices.map((d) => [d.machine_id, d]));
+      assert.equal(byId['instant'].rtt_ms, 0, '0 is a measurement: extremely fast');
+      assert.equal(byId['never-reports'].rtt_ms, null, 'null is the absence of a measurement');
+      assert.notEqual(byId['instant'].rtt_ms, byId['never-reports'].rtt_ms);
+      assert.equal(byId['instant'].rtt_stale, false, 'a 0ms measurement is fresh');
+      assert.equal(byId['never-reports'].rtt_stale, true);
+
+      // a JSON round-trip must not collapse the two
+      const roundTripped = JSON.parse(JSON.stringify(byId));
+      assert.equal(roundTripped['instant'].rtt_ms, 0);
+      assert.equal(roundTripped['never-reports'].rtt_ms, null);
+    });
+  });
+
+  it('accepts a v0.2.3 heartbeat with no rtt_ms at all, keeping everything else working', async () => {
+    const clock = makeClock();
+    await withRelay({ now: clock.now, pairRateLimitPerMinute: 0 }, async (relay) => {
+      const { token, taskId } = await pairWithTask(relay);
+
+      // exactly what a v0.2.3 agent sends: no rtt_ms key
+      const hb = await beat(relay, token, { task_id: taskId, machine_id: 'm1', attempt: 1, phase: 'running', progress: 0.5 });
+      assert.equal(hb.status, 200, 'an old client must be unaffected');
+      assert.equal(hb.json.cancel, false);
+      assert.equal(hb.json.lease_until, rfc3339(clock.now() + 50_000), 'the lease still renews');
+
+      const device = (await devices(relay, token)).json.devices[0];
+      assert.equal(device.rtt_ms, null);
+      assert.equal(device.rtt_at, null);
+      assert.equal(device.rtt_stale, true);
+      assert.equal(device.last_heartbeat_at, rfc3339(clock.now()),
+        'liveness is still recorded even though latency is unknown');
+
+      assert.equal(relay.state.getTask(taskId).leases.get('m1').state, 'running');
+    });
+  });
+
+  it('ignores an invalid rtt_ms: the heartbeat still succeeds and the old value survives', async () => {
+    const clock = makeClock();
+    await withRelay({ now: clock.now, pairRateLimitPerMinute: 0 }, async (relay) => {
+      const { token, taskId } = await pairWithTask(relay);
+      await beat(relay, token, { task_id: taskId, machine_id: 'm1', rtt_ms: 25 });
+      const goodAt = clock.now();
+
+      for (const bad of [-1, -0.5, 'abc', '12', Number.NaN, Number.POSITIVE_INFINITY, null, true, {}, [], 1e12, 86_400_001]) {
+        clock.advance(1000);
+        const hb = await beat(relay, token, { task_id: taskId, machine_id: 'm1', phase: 'running', rtt_ms: bad });
+        assert.equal(hb.status, 200, `rtt_ms=${JSON.stringify(bad)} must not reject the heartbeat`);
+        assert.equal(hb.json.cancel, false, 'the lease is still renewed');
+
+        const device = (await devices(relay, token)).json.devices[0];
+        assert.equal(device.rtt_ms, 25, `rtt_ms=${JSON.stringify(bad)} must not clobber the known value`);
+        assert.equal(device.rtt_at, rfc3339(goodAt), 'and must not refresh its timestamp');
+        assert.equal(device.last_heartbeat_at, rfc3339(clock.now()), 'but liveness does advance');
+      }
+    });
+  });
+
+  it('ignores unknown extra fields entirely (forward compatibility)', async () => {
+    await withRelay({ pairRateLimitPerMinute: 0 }, async (relay) => {
+      const { token, taskId } = await pairWithTask(relay);
+      const hb = await beat(relay, token, {
+        task_id: taskId,
+        machine_id: 'm1',
+        rtt_ms: 12,
+        // fields that do not exist yet in this relay version
+        future_field: 'whatever',
+        nested: { deep: [1, 2, 3] },
+        rtt_ms_v2: 99,
+      });
+      assert.equal(hb.status, 200, 'an extra field must never reject a heartbeat');
+      const device = (await devices(relay, token)).json.devices[0];
+      assert.equal(device.rtt_ms, 12, 'the known field is used');
+      assert.equal('future_field' in device, false, 'unknown fields are not echoed into state');
+      assert.equal('nested' in device, false);
+      assert.equal('rtt_ms_v2' in device, false);
+    });
+  });
+
+  it('flags a measurement as stale once it ages past the window', async () => {
+    const clock = makeClock();
+    await withRelay({ now: clock.now, rttStaleMs: 30_000, pairRateLimitPerMinute: 0 }, async (relay) => {
+      const { token, taskId } = await pairWithTask(relay);
+      await beat(relay, token, { task_id: taskId, machine_id: 'm1', rtt_ms: 80 });
+
+      const read = async () => (await devices(relay, token)).json.devices[0];
+      assert.equal((await read()).rtt_stale, false);
+      assert.equal((await read()).rtt_age_ms, 0);
+
+      clock.advance(30_000);
+      const atBoundary = await read();
+      assert.equal(atBoundary.rtt_stale, false, 'exactly at the window is still fresh');
+      assert.equal(atBoundary.rtt_age_ms, 30_000);
+
+      clock.advance(1);
+      const aged = await read();
+      assert.equal(aged.rtt_stale, true, 'one tick past the window is stale');
+      assert.equal(aged.rtt_ms, 80, 'the number is still reported, but marked untrustworthy');
+      assert.equal(aged.rtt_age_ms, 30_001);
+    });
+  });
+
+  it('/healthz aggregates RTT and reports null (not 0) when there is no data', async () => {
+    const clock = makeClock();
+    await withRelay({ now: clock.now, rttStaleMs: 30_000, pairRateLimitPerMinute: 0 }, async (relay) => {
+      // no devices at all
+      const empty = await request(`${relay.url}/healthz`);
+      assert.deepEqual(empty.json.rtt, {
+        machines_reporting: 0, min_ms: null, max_ms: null, avg_ms: null,
+        machines_stale: 0, machines_unknown: 0,
+      }, 'no data must be null, never 0');
+
+      // one device that never reports
+      const { token: silent } = await pairDevice(relay, 'silent');
+      const unknown = await request(`${relay.url}/healthz`);
+      assert.equal(unknown.json.rtt.machines_reporting, 0);
+      assert.equal(unknown.json.rtt.machines_unknown, 1);
+      assert.equal(unknown.json.rtt.avg_ms, null);
+
+      // two reporting machines
+      for (const [id, rtt] of [['a', 100], ['b', 200]]) {
+        const { token, taskId } = await pairWithTask(relay, id);
+        await beat(relay, token, { task_id: taskId, machine_id: id, rtt_ms: rtt });
+      }
+      const two = await request(`${relay.url}/healthz`);
+      assert.equal(two.json.rtt.machines_reporting, 2);
+      assert.equal(two.json.rtt.min_ms, 100);
+      assert.equal(two.json.rtt.max_ms, 200);
+      assert.equal(two.json.rtt.avg_ms, 150);
+      assert.equal(two.json.rtt.machines_unknown, 1, 'the silent device is still counted separately');
+      void silent;
+
+      // a third, slower machine
+      const { token: cToken, taskId: cTask } = await pairWithTask(relay, 'c');
+      await beat(relay, cToken, { task_id: cTask, machine_id: 'c', rtt_ms: 900 });
+      const three = await request(`${relay.url}/healthz`);
+      assert.equal(three.json.rtt.machines_reporting, 3);
+      assert.equal(three.json.rtt.min_ms, 100);
+      assert.equal(three.json.rtt.max_ms, 900);
+      assert.equal(three.json.rtt.avg_ms, 400, '(100+200+900)/3');
+    });
+  });
+
+  it('/healthz keeps stale and unknown machines out of the aggregate', async () => {
+    const clock = makeClock();
+    await withRelay({ now: clock.now, rttStaleMs: 30_000, pairRateLimitPerMinute: 0 }, async (relay) => {
+      const { token, taskId } = await pairWithTask(relay, 'live');
+      await beat(relay, token, { task_id: taskId, machine_id: 'live', rtt_ms: 50 });
+
+      clock.advance(60_000); // the measurement goes stale, and the lease with it
+      const stale = await request(`${relay.url}/healthz`);
+      assert.equal(stale.json.rtt.machines_reporting, 0, 'a stale number must not describe the fleet');
+      assert.equal(stale.json.rtt.machines_stale, 1);
+      assert.equal(stale.json.rtt.min_ms, null);
+      assert.equal(stale.json.rtt.max_ms, null);
+      assert.equal(stale.json.rtt.avg_ms, null);
+
+      // a fresh heartbeat brings it back
+      const relive = await beat(relay, token, { task_id: taskId, machine_id: 'live', rtt_ms: 60 });
+      assert.equal(relive.status, 200, 'the expired lease is reclaimed by a live heartbeat');
+      const fresh = await request(`${relay.url}/healthz`);
+      assert.equal(fresh.json.rtt.machines_reporting, 1);
+      assert.equal(fresh.json.rtt.avg_ms, 60);
+    });
+  });
+
+  it('GET /v1/agents/{machine_id}/status is the single-machine view', async () => {
+    const clock = makeClock();
+    await withRelay({ now: clock.now, pairRateLimitPerMinute: 0 }, async (relay) => {
+      const { token, taskId } = await pairWithTask(relay, 'm1');
+      await beat(relay, token, { task_id: taskId, machine_id: 'm1', rtt_ms: 33 });
+
+      const sse = await openSse(`${relay.url}/v1/stream?machine_id=m1`, { token });
+      try {
+        await sse.waitFor((f) => f.event === 'ready');
+        const status = await agentStatus(relay, token, 'm1');
+        assert.equal(status.status, 200);
+        const body = status.json;
+        assert.equal(body.protocol_version, 1);
+        assert.equal(body.machine_id, 'm1');
+        assert.equal(body.relay_id, relay.relayId, 'a reader can spot a relay restart');
+        assert.equal(body.connected, true, 'an SSE stream is attached');
+        assert.equal(body.streams, 1);
+        assert.equal(body.rtt_ms, 33);
+        assert.equal(body.rtt_stale, false);
+        assert.equal(body.rtt_age_ms, 0);
+        assert.equal(body.rtt_at, rfc3339(clock.now()));
+        assert.equal(body.last_heartbeat_at, rfc3339(clock.now()));
+        assert.equal(body.reconnect_attempts, 0, 'the first attach is not a reconnect');
+        assert.equal(body.paired_at, rfc3339(clock.now()));
+        assert.ok(typeof body.machine_name === 'string');
+        assert.equal('device_token' in body, false, 'no credentials in a status view');
+      } finally {
+        sse.close();
+      }
+      assert.ok(await waitUntil(() => relay.subscribers.size === 0));
+      const offline = await agentStatus(relay, token, 'm1');
+      assert.equal(offline.json.connected, false, 'connected tracks the live stream');
+      assert.equal(offline.json.streams, 0);
+    });
+  });
+
+  it('counts relay-observed reconnects per machine', async () => {
+    await withRelay({ pairRateLimitPerMinute: 0 }, async (relay) => {
+      const { token } = await pairWithTask(relay, 'm1');
+      for (let i = 0; i < 3; i += 1) {
+        const sse = await openSse(`${relay.url}/v1/stream?machine_id=m1`, { token });
+        await sse.waitFor((f) => f.event === 'ready');
+        sse.close();
+        assert.ok(await waitUntil(() => relay.subscribers.size === 0));
+      }
+      const status = await agentStatus(relay, token, 'm1');
+      assert.equal(status.json.stream_connects, 3);
+      assert.equal(status.json.reconnect_attempts, 2, 'three attaches = two reconnects');
+    });
+  });
+
+  it('answers 404 for an unknown machine and 401 without a token', async () => {
+    await withRelay({ pairRateLimitPerMinute: 0 }, async (relay) => {
+      const { token } = await pairWithTask(relay, 'm1');
+      const missing = await agentStatus(relay, token, 'ghost');
+      assert.equal(missing.status, 404);
+      assert.equal(missing.json.error.code, 'NOT_FOUND');
+
+      const anonymous = await request(`${relay.url}/v1/agents/m1/status`);
+      assert.equal(anonymous.status, 401);
+      assert.equal(anonymous.json.error.code, 'UNAUTHORIZED');
+    });
+  });
+
+  it('RTT does not survive a restart: the relay never claims stale knowledge', async () => {
+    const dir = makeStateDir();
+    try {
+      const first = await startRelay({ stateDir: dir, pairingCode: 'PAIR-RTT00001', pairRateLimitPerMinute: 0 });
+      const { token, taskId } = await pairWithTask(first, 'm1');
+      await beat(first, token, { task_id: taskId, machine_id: 'm1', rtt_ms: 17 });
+      const live = (await devices(first, token)).json.devices[0];
+      assert.equal(live.rtt_ms, 17, 'measured before the restart');
+      await first.close();
+
+      const second = await startRelay({ stateDir: dir, pairRateLimitPerMinute: 0 });
+      try {
+        const restored = (await devices(second, token)).json.devices;
+        assert.equal(restored.length, 1, 'the device table itself is restored');
+        assert.equal(restored[0].rtt_ms, null, 'RTT is volatile: it must NOT be restored');
+        assert.equal(restored[0].rtt_at, null);
+        assert.equal(restored[0].rtt_stale, true, 'so a reader cannot mistake it for a fresh value');
+        assert.equal(restored[0].last_heartbeat_at, null, 'nothing has been heard in this process yet');
+
+        const status = await agentStatus(second, token, 'm1');
+        assert.equal(status.json.rtt_ms, null);
+        assert.equal(status.json.relay_id, second.relayId);
+        assert.equal(status.json.connected, false);
+      } finally {
+        await second.close();
+      }
+    } finally {
+      removeStateDir(dir);
+    }
+  });
+
+  it('a v0.2.3 client completes a whole task against a v0.3.0 relay', async () => {
+    // End-to-end simulation of the old agent: never sends rtt_ms, and never reads
+    // anything new. Everything it used before must still work.
+    await withRelay({ pairRateLimitPerMinute: 0 }, async (relay) => {
+      const { token } = await pairDevice(relay, 'legacy');
+      const sse = await openSse(`${relay.url}/v1/stream?machine_id=legacy`, { token });
+      try {
+        const ready = await sse.waitFor((f) => f.event === 'ready');
+        assert.equal(ready.json.protocol_version, 1, 'PROTOCOL_VERSION stays 1');
+        assert.ok(ready.json.relay_id, 'the only ready-frame addition is additive');
+
+        const created = await postTask(relay, taskBody());
+        const offer = await sse.waitFor((f) => f.event === 'task.offer');
+        assert.equal(offer.json.task_id, created.json.task_id);
+        assert.equal('rtt_ms' in offer.json, false, 'offers are unchanged');
+
+        const hb = await beat(relay, token, {
+          task_id: created.json.task_id, machine_id: 'legacy', attempt: 1, phase: 'running', progress: 1,
+        });
+        assert.equal(hb.status, 200);
+        assert.equal(hb.json.cancel, false);
+
+        const result = await request(`${relay.url}/v1/result`, {
+          method: 'POST', token, body: envelopeForTask(created.json.task_id, 'legacy'),
+        });
+        assert.equal(result.status, 200);
+        assert.equal(result.json.deduped, false);
+
+        const view = await request(`${relay.url}/v1/tasks/${created.json.task_id}`, { token });
+        assert.equal(view.status, 200);
+        assert.equal(view.json.aggregate.status, 'consistent', 'the single-machine verdict is unchanged');
+
+        const hz = await request(`${relay.url}/healthz`);
+        assert.equal(hz.json.protocol_version, 1);
+        assert.equal(hz.json.rtt.machines_reporting, 0, 'the old client reports no RTT, and that is fine');
+        assert.equal(hz.json.rtt.avg_ms, null);
+      } finally {
+        sse.close();
+      }
+    });
+  });
+});
+
+/* ================================================================== */
+/* v0.3.0 — idle (diagnostic) heartbeats                               */
+/* ================================================================== */
+
+/**
+ * The cross-machine view is only useful if it stays fresh while a machine has no
+ * work: an IDLE machine is exactly the one an operator looks at. Without this, a
+ * machine that finishes its last task freezes its RTT at the last task's value and
+ * then goes stale -- which reads as "the machine is there but very slow", worse
+ * than an honest "unknown".
+ *
+ * The dangerous half is the lease: an idle ping must never touch one.
+ */
+describe('v0.3.0 idle (diagnostic) heartbeats', () => {
+  async function pairWithTask(relay, machineId = 'm1') {
+    const { token } = await pairDevice(relay, machineId);
+    const created = await postTask(relay, taskBody());
+    return { token, taskId: created.json.task_id, created };
+  }
+  const beat = (relay, token, body) => request(`${relay.url}/v1/heartbeat`, { method: 'POST', token, body });
+  const devices = (relay, token) => request(`${relay.url}/v1/devices`, { token });
+  const readDevice = async (relay, token, id) =>
+    (await devices(relay, token)).json.devices.find((d) => d.machine_id === id);
+
+  it('THE INVARIANT: an idle heartbeat never resurrects an expired lease', async () => {
+    const clock = makeClock();
+    await withRelay({ now: clock.now, pairRateLimitPerMinute: 0 }, async (relay) => {
+      const { token, taskId } = await pairWithTask(relay, 'm1');
+      clock.advance(50_000);
+      assert.equal(relay.state.sweepExpired().length, 1, 'the lease is expired');
+      const task = relay.state.getTask(taskId);
+      const expiredAt = task.leases.get('m1').expired_at_ms;
+      assert.equal(task.leases.get('m1').state, 'expired');
+      assert.equal(task.degraded, 'partial');
+
+      clock.advance(1_000); // the idle ping lands after the lease died
+      const idle = await beat(relay, token, { diagnostic: true, rtt_ms: 30 });
+      assert.equal(idle.status, 200);
+      assert.equal(idle.json.diagnostic, true);
+      assert.equal(idle.json.lease_until, null, 'no lease was involved');
+      assert.equal(idle.json.cancel, false, 'and there is nothing to cancel');
+
+      assert.equal(task.leases.get('m1').state, 'expired', 'still expired: the sweep owns this decision');
+      assert.equal(task.degraded, 'partial', 'the book-keeping is not washed away');
+      assert.equal(task.attempt, 1, 'and no takeover was manufactured');
+      assert.equal(task.leases.get('m1').expired_at_ms, expiredAt, 'the expiry timestamp is untouched');
+      assert.equal(task.leases.get('m1').lease_until_ms < clock.now(), true, 'no lease window was extended');
+
+      // while the diagnostics DID refresh -- that is the point of the idle ping
+      const device = await readDevice(relay, token, 'm1');
+      assert.equal(device.rtt_ms, 30);
+      assert.equal(device.rtt_stale, false);
+      assert.equal(device.last_heartbeat_at, rfc3339(clock.now()));
+    });
+  });
+
+  it('works for a machine that has never held a lease', async () => {
+    const clock = makeClock();
+    await withRelay({ now: clock.now, pairRateLimitPerMinute: 0 }, async (relay) => {
+      const { token } = await pairDevice(relay, 'idle-only'); // paired, no task at all
+      assert.equal(relay.state.tasks.size, 0);
+
+      const idle = await beat(relay, token, { diagnostic: true, rtt_ms: 77 });
+      assert.equal(idle.status, 200, 'an idle machine must be observable without a task');
+      assert.equal(idle.json.lease_until, null);
+      assert.equal(idle.json.machine_id, 'idle-only');
+
+      const device = await readDevice(relay, token, 'idle-only');
+      assert.equal(device.rtt_ms, 77);
+      assert.equal(device.rtt_stale, false);
+
+      const hz = await request(`${relay.url}/healthz`);
+      assert.equal(hz.json.rtt.machines_reporting, 1, 'idle machines count in the fleet aggregate');
+      assert.equal(hz.json.rtt.avg_ms, 77);
+    });
+  });
+
+  it('keeps the RTT fresh across a long idle period, with no flapping', async () => {
+    const clock = makeClock();
+    await withRelay({ now: clock.now, pairRateLimitPerMinute: 0 }, async (relay) => {
+      const { token } = await pairDevice(relay, 'idle');
+      await beat(relay, token, { diagnostic: true, rtt_ms: 10 });
+
+      // Sample at the WORST moment of each cycle: just before the next ping is due.
+      // At 60s cadence against a 180s window the value must never be stale, or
+      // `rtt_stale === false` would stop being a dependable predicate.
+      for (let i = 1; i <= 10; i += 1) {
+        clock.advance(60_000);
+        const justBefore = await readDevice(relay, token, 'idle');
+        assert.equal(justBefore.rtt_age_ms, 60_000);
+        assert.equal(justBefore.rtt_stale, false,
+          `minute ${i}: 60s of age against a 180s window must stay fresh (no flapping)`);
+        const hb = await beat(relay, token, { diagnostic: true, rtt_ms: 10 + i });
+        assert.equal(hb.status, 200);
+      }
+
+      const final = await readDevice(relay, token, 'idle');
+      assert.equal(final.rtt_ms, 20);
+      assert.equal(final.rtt_stale, false, 'after 10 minutes of idling the view is still live');
+    });
+  });
+
+  it('goes stale only after the window is genuinely exceeded', async () => {
+    const clock = makeClock();
+    await withRelay({ now: clock.now, rttStaleMs: 180_000, pairRateLimitPerMinute: 0 }, async (relay) => {
+      const { token } = await pairDevice(relay, 'gone');
+      await beat(relay, token, { diagnostic: true, rtt_ms: 15 });
+
+      clock.advance(180_000);
+      assert.equal((await readDevice(relay, token, 'gone')).rtt_stale, false, 'at the boundary: still fresh');
+      clock.advance(1);
+      const stale = await readDevice(relay, token, 'gone');
+      assert.equal(stale.rtt_stale, true, 'one tick past: stale');
+      assert.equal(stale.rtt_ms, 15, 'the last value is still reported, marked untrustworthy');
+    });
+  });
+
+  it('a heartbeat with neither task_id nor diagnostic is refused loudly', async () => {
+    await withRelay({ pairRateLimitPerMinute: 0 }, async (relay) => {
+      const { token } = await pairDevice(relay, 'm1');
+      const res = await beat(relay, token, { phase: 'running', progress: 0.5 });
+      assert.equal(res.status, 400, 'a missing task_id must not silently renew nothing');
+      assert.equal(res.json.error.code, 'BAD_REQUEST');
+      assert.match(res.json.error.message, /task_id/);
+      assert.match(res.json.error.message, /diagnostic/);
+    });
+  });
+
+  it('task_id wins when both are present, and idle diagnostics are validated too', async () => {
+    const clock = makeClock();
+    await withRelay({ now: clock.now, pairRateLimitPerMinute: 0 }, async (relay) => {
+      const { token, taskId } = await pairWithTask(relay, 'm1');
+      // a task_id means "this is a lease heartbeat"; the redundant flag is ignored
+      const hb = await beat(relay, token, { task_id: taskId, machine_id: 'm1', diagnostic: true, rtt_ms: 5 });
+      assert.equal(hb.status, 200);
+      assert.equal(hb.json.diagnostic, undefined, 'the lease path answers with a lease');
+      assert.equal(hb.json.lease_until, rfc3339(clock.now() + 50_000), 'the lease really was renewed');
+
+      // validation still applies on the idle path
+      const badPhase = await beat(relay, token, { diagnostic: true, phase: 'bogus' });
+      assert.equal(badPhase.status, 400);
+      const badProgress = await beat(relay, token, { diagnostic: true, progress: 2 });
+      assert.equal(badProgress.status, 400);
+    });
+  });
+
+  it('idle heartbeats are liberal about bad rtt_ms and unknown fields', async () => {
+    const clock = makeClock();
+    await withRelay({ now: clock.now, pairRateLimitPerMinute: 0 }, async (relay) => {
+      const { token } = await pairDevice(relay, 'm1');
+      await beat(relay, token, { diagnostic: true, rtt_ms: 40 });
+
+      const bad = await beat(relay, token, { diagnostic: true, rtt_ms: -5, future_field: 'x' });
+      assert.equal(bad.status, 200, 'a bad value must not reject an idle ping either');
+      assert.equal(bad.json.rtt_ms, 40, 'the response echoes the value actually stored');
+      assert.equal((await readDevice(relay, token, 'm1')).rtt_ms, 40);
+
+      const unknownOnly = await beat(relay, token, { diagnostic: true, mystery: { deep: true } });
+      assert.equal(unknownOnly.status, 200);
+      assert.equal(unknownOnly.json.rtt_ms, 40, 'unknown fields neither reject nor clobber');
+    });
+  });
+
+  it('an idle heartbeat from an unknown machine is a 404, and needs a token', async () => {
+    await withRelay({ pairRateLimitPerMinute: 0 }, async (relay) => {
+      const { token } = await pairDevice(relay, 'known');
+      const ghost = await beat(relay, token, { diagnostic: true, machine_id: 'ghost' });
+      assert.equal(ghost.status, 404);
+      assert.equal(ghost.json.error.code, 'NOT_FOUND');
+
+      const anonymous = await request(`${relay.url}/v1/heartbeat`, {
+        method: 'POST', body: { diagnostic: true },
+      });
+      assert.equal(anonymous.status, 401);
+    });
+  });
+
+  it('an idle machine shows up live on the single-machine view', async () => {
+    const clock = makeClock();
+    await withRelay({ now: clock.now, pairRateLimitPerMinute: 0 }, async (relay) => {
+      const { token } = await pairDevice(relay, 'watched');
+      clock.advance(5000);
+      await beat(relay, token, { diagnostic: true, rtt_ms: 123.5 });
+
+      const status = await request(`${relay.url}/v1/agents/watched/status`, { token });
+      assert.equal(status.status, 200);
+      assert.equal(status.json.rtt_ms, 123.5);
+      assert.equal(status.json.rtt_stale, false);
+      assert.equal(status.json.rtt_age_ms, 0);
+      assert.equal(status.json.last_heartbeat_at, rfc3339(clock.now()));
+      assert.equal(status.json.connected, false, 'no stream, but the machine is demonstrably alive');
     });
   });
 });

@@ -80,6 +80,8 @@ import {
   ENVELOPE_VERSION,
   HEARTBEAT_INTERVAL_MS,
   Heartbeat,
+  IDLE_HEARTBEAT_INTERVAL_MS,
+  MAX_HEARTBEAT_RTT_MS,
   PROTOCOL_VERSION,
   RECONNECT_DELAY_AFTER_STABLE_MS,
   REFUSAL,
@@ -93,6 +95,7 @@ import {
   createAgent,
   cursorUsableFor,
   evaluateGate,
+  heartbeatDiagnostics,
   matchAllowedCommand,
   parseAllowedCommands,
   satisfiesVersion,
@@ -1016,7 +1019,7 @@ describe('lease heartbeat', () => {
  * is the deployment shape v0.1.2 exists for; every request path is recorded so a
  * test can prove the prefix was not eaten.
  */
-async function startFakeRabbit({ basePath = '' } = {}) {
+async function startFakeRabbit({ basePath = '', heartbeatExtra = null, heartbeatIdleStatus = 200 } = {}) {
   const state = {
     pairs: [],
     results: [],
@@ -1024,6 +1027,8 @@ async function startFakeRabbit({ basePath = '' } = {}) {
     streams: [],
     receivedTokens: [],
     paths: [],
+    /** Status codes returned for lease-less (diagnostic) heartbeats. */
+    idleHeartbeatStatuses: [],
     /**
      * One entry per SSE attach, recording exactly what the agent sent, so a test
      * can assert on the cursor it did (or did not) resume from (task-18).
@@ -1100,8 +1105,21 @@ async function startFakeRabbit({ basePath = '' } = {}) {
       }
       if (pathname === '/v1/heartbeat') {
         state.heartbeats.push(body);
+        // An idle diagnostic heartbeat (v0.3.0) carries no `task_id`; a
+        // pre-v0.3.0 relay answers it with 404 because it insists on a lease.
+        const isIdle = !body || !Object.prototype.hasOwnProperty.call(body, 'task_id');
+        if (isIdle && heartbeatIdleStatus !== 200) {
+          state.idleHeartbeatStatuses.push(heartbeatIdleStatus);
+          response.writeHead(heartbeatIdleStatus, { 'content-type': 'application/json' });
+          response.end(JSON.stringify({ error: { code: 'NOT_FOUND' } }));
+          return;
+        }
         response.writeHead(200, { 'content-type': 'application/json' });
-        response.end(JSON.stringify({ lease_until: '2026-10-07T12:10:00Z', cancel: false }));
+        // `heartbeatExtra` lets a test play a *newer* relay that answers with
+        // fields this agent has never heard of (v0.3.0 compatibility).
+        response.end(
+          JSON.stringify({ lease_until: '2026-10-07T12:10:00Z', cancel: false, ...(heartbeatExtra ?? {}) }),
+        );
         return;
       }
       if (pathname === '/v1/result') {
@@ -1147,7 +1165,16 @@ async function startFakeRabbit({ basePath = '' } = {}) {
  * @param {string[]} options.allowed
  * @param {Array<{level: string, message: string, extra: object}>} [options.logs]
  */
-function makeAgent({ rabbit, project, allowed, once = true, name = 'e2e', stringForm = false, logs }) {
+function makeAgent({
+  rabbit,
+  project,
+  allowed,
+  once = true,
+  name = 'e2e',
+  stringForm = false,
+  logs,
+  idleHeartbeatIntervalMs,
+}) {
   const stateDir = join(root, `e2e-state-${name}`);
   const serialized = allowed.map((prefix) => prefix.join(' '));
   const log = logs
@@ -1172,6 +1199,7 @@ function makeAgent({ rabbit, project, allowed, once = true, name = 'e2e', string
     // The contract's cadence is 10s (asserted via HEARTBEAT_INTERVAL_MS); the
     // end-to-end tests use a fast cadence so cancel does not cost 10s.
     heartbeatIntervalMs: 150,
+    ...(idleHeartbeatIntervalMs === undefined ? {} : { idleHeartbeatIntervalMs }),
     log,
     tmpDir: root,
   });
@@ -2446,7 +2474,12 @@ describe('agent state file for cross-process diagnostics (task-16)', () => {
       assert.ok(published.rttMs.samples.length >= 1, 'a heartbeat must have been recorded');
       assert.equal(published.connected, true, 'read while the stream was up');
       assert.equal(published.replay_truncated, false);
-      assert.equal(typeof published.reconnect_attempts, 'number');
+      assert.equal(typeof published.unstable_reconnects, 'number');
+      assert.equal(
+        Object.prototype.hasOwnProperty.call(published, 'reconnect_attempts'),
+        false,
+        'the relay owns `reconnect_attempts`; the file channel must not reuse it',
+      );
       assert.match(published.updated_at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/, 'RFC3339 UTC');
 
       // relay_id must agree with the relay's own /healthz, not with a guess.
@@ -2765,6 +2798,445 @@ describe('agent state file for cross-process diagnostics (task-16)', () => {
     const published = JSON.parse(readFileSync(join(stateDir, AGENT_STATE_FILE), 'utf8'));
     assert.equal(published.connected, false);
     assert.equal(published.rttMs.last, null);
-    assert.ok(published.reconnect_attempts >= 1, 'it must have tried to reconnect');
+    assert.ok(published.unstable_reconnects >= 1, 'it must have tried to reconnect');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.3.0: RTT and link diagnostics travel to the relay with the heartbeat
+// ---------------------------------------------------------------------------
+
+describe('heartbeat diagnostics over the wire (v0.3.0)', () => {
+  it('reports rtt_ms only when a round trip was actually measured', () => {
+    // No measurement: the key must be ABSENT, not null and not 0. `null` would
+    // add a shape for the relay to handle and `0` would be read as "extremely
+    // fast", turning "unknown" into a good score.
+    const unmeasured = heartbeatDiagnostics({ rttMs: { last: null }, reconnectAttempts: 0 });
+    assert.equal(Object.prototype.hasOwnProperty.call(unmeasured, 'rtt_ms'), false);
+    assert.equal('rtt_ms' in unmeasured, false);
+    assert.deepEqual(unmeasured, { unstable_reconnects: 0 });
+    // The relay publishes its own `reconnect_attempts`; the agent must not
+    // reuse that name for a different quantity.
+    assert.equal('reconnect_attempts' in unmeasured, false);
+
+    // A measured sub-millisecond round trip is genuinely 0, and that is a
+    // measurement, not a placeholder -- so it is sent.
+    assert.deepEqual(heartbeatDiagnostics({ rttMs: { last: 0 }, reconnectAttempts: 2 }), {
+      rtt_ms: 0,
+      unstable_reconnects: 2,
+    });
+    // Integers only, rounded.
+    assert.equal(heartbeatDiagnostics({ rttMs: { last: 12.6 } }).rtt_ms, 13);
+    assert.equal(Number.isInteger(heartbeatDiagnostics({ rttMs: { last: 12.4 } }).rtt_ms), true);
+  });
+
+  it('drops an out-of-range sample instead of clamping it', () => {
+    const huge = heartbeatDiagnostics({ rttMs: { last: MAX_HEARTBEAT_RTT_MS + 1 }, reconnectAttempts: 0 });
+    assert.equal('rtt_ms' in huge, false, 'a bogus sample must not reach the relay aggregate');
+    assert.equal(heartbeatDiagnostics({ rttMs: { last: 1e9 } }).rtt_ms, undefined);
+    assert.equal('rtt_ms' in heartbeatDiagnostics({ rttMs: { last: 1e9 } }), false);
+    for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, -1, -0.5]) {
+      const result = heartbeatDiagnostics({ rttMs: { last: bad } });
+      assert.equal('rtt_ms' in result, false, `${bad} must not be reported`);
+    }
+    // The boundary itself is a real measurement and is kept.
+    assert.equal(heartbeatDiagnostics({ rttMs: { last: MAX_HEARTBEAT_RTT_MS } }).rtt_ms, MAX_HEARTBEAT_RTT_MS);
+    // And the tolerance is an option, so a caller can tighten it.
+    assert.equal('rtt_ms' in heartbeatDiagnostics({ rttMs: { last: 500 } }, { maxRttMs: 100 }), false);
+  });
+
+  it('merges diagnostics into the heartbeat body and survives a broken provider', async () => {
+    const sent = [];
+    const heartbeat = new Heartbeat({
+      send: async (body) => {
+        sent.push(body);
+        return { cancel: false };
+      },
+      taskId: 'T',
+      machineId: 'M',
+      attempt: 3,
+      diagnostics: () => ({ rtt_ms: 7, unstable_reconnects: 1 }),
+    });
+    heartbeat.setPhase('running', 50);
+    await heartbeat.tick();
+    assert.deepEqual(sent[0], {
+      task_id: 'T',
+      machine_id: 'M',
+      attempt: 3,
+      phase: 'running',
+      progress: 50,
+      rtt_ms: 7,
+      unstable_reconnects: 1,
+    });
+
+    // A diagnostics provider that throws must not cost us the lease renewal.
+    const second = [];
+    const broken = new Heartbeat({
+      send: async (body) => {
+        second.push(body);
+        return { cancel: false };
+      },
+      taskId: 'T',
+      machineId: 'M',
+      attempt: 1,
+      diagnostics: () => {
+        throw new Error('provider exploded');
+      },
+    });
+    await broken.tick();
+    assert.deepEqual(second[0], {
+      task_id: 'T',
+      machine_id: 'M',
+      attempt: 1,
+      phase: 'preparing',
+      progress: 0,
+    });
+
+    // No provider at all: exactly the v0.2.3 body.
+    const third = [];
+    const plain = new Heartbeat({
+      send: async (body) => {
+        third.push(body);
+        return {};
+      },
+      taskId: 'T',
+      machineId: 'M',
+      attempt: 1,
+    });
+    await plain.tick();
+    assert.equal('rtt_ms' in third[0], false);
+  });
+
+  it('puts rtt_ms in the real heartbeat request, and only after a measurement', async () => {
+    const rabbit = await startFakeRabbit();
+    const project = await makeRepo('rtt-wire');
+    /** @type {object|null} */
+    let agent = null;
+    /** @type {Promise<void>|null} */
+    let running = null;
+    const hasRtt = (body) => Object.prototype.hasOwnProperty.call(body, 'rtt_ms');
+    try {
+      agent = makeAgent({
+        rabbit: rabbit.url,
+        project,
+        allowed: [['node', '-e']],
+        once: true,
+        name: 'rtt-wire',
+      });
+      running = agent.start();
+      const stream = await rabbit.stream();
+      stream.send('ready', { protocol_version: 1, relay_id: 'relay-rtt', machine_id: 'rabbit' });
+      stream.send('task.offer', {
+        task_id: '01J-E2E-RTTWIRE',
+        attempt: 1,
+        mode: 'replicate',
+        index: 0,
+        index_total: 1,
+        // Long enough for several heartbeat intervals (150ms in this harness).
+        command_argv: [NODE, '-e', 'setTimeout(() => process.stdout.write("x"), 1200)'],
+        cwd_rel: '.',
+        write: false,
+        timeout_ms: 20_000,
+        dedupe_key: 'dk-e2e-rtt-wire',
+      });
+
+      // The first heartbeat fires the moment the lease is claimed -- before any
+      // round trip has completed -- so its body must not carry the field at all.
+      const first = await waitFor(() => rabbit.state.heartbeats[0] ?? null, { label: 'first heartbeat' });
+      assert.equal(hasRtt(first), false, `no measurement yet, so no key: ${JSON.stringify(first)}`);
+      assert.equal('rtt_ms' in first, false);
+      assert.equal(first.rtt_ms, undefined);
+      assert.equal(first.unstable_reconnects, 0, 'the counter is sent from the start');
+      assert.equal('reconnect_attempts' in first, false, 'the relay owns that name');
+
+      // Once a round trip has been measured, every later heartbeat carries it.
+      const withRtt = await waitFor(
+        () => rabbit.state.heartbeats.find((body) => hasRtt(body)) ?? null,
+        { label: 'heartbeat carrying rtt_ms' },
+      );
+      assert.equal(Number.isInteger(withRtt.rtt_ms), true, JSON.stringify(withRtt));
+      assert.ok(withRtt.rtt_ms >= 0 && withRtt.rtt_ms <= MAX_HEARTBEAT_RTT_MS);
+      assert.equal(Number.isInteger(withRtt.unstable_reconnects), true);
+      assert.equal(withRtt.phase === 'running' || withRtt.phase === 'preparing', true);
+
+      await running;
+
+      // Every body that carries the key carries a sane integer; no body ever
+      // carries null or a non-number.
+      for (const body of rabbit.state.heartbeats) {
+        if (hasRtt(body)) {
+          assert.equal(
+            Number.isInteger(body.rtt_ms) && body.rtt_ms >= 0 && body.rtt_ms <= MAX_HEARTBEAT_RTT_MS,
+            true,
+            `bad rtt_ms on the wire: ${JSON.stringify(body)}`,
+          );
+        }
+      }
+      assert.equal(rabbit.state.results.length, 1);
+      assert.equal(rabbit.state.results[0].status, 'ok');
+
+      // The local file channel is still written, and the two agree -- this is
+      // the "relay primary, file fallback" pair, not a replacement.
+      const published = JSON.parse(readFileSync(agent.state.stateFile, 'utf8'));
+      assert.equal(typeof published.rttMs.last, 'number');
+      assert.equal(published.unstable_reconnects, agent.state.unstableReconnects);
+      assert.equal(
+        Object.prototype.hasOwnProperty.call(published, 'reconnect_attempts'),
+        false,
+        'the file must use the new name too, not keep the relay\'s',
+      );
+      const lastOnWire = [...rabbit.state.heartbeats].reverse().find((body) => hasRtt(body));
+      // The relay receives a *sample stream* while the file holds the *current*
+      // value, so the two need not be equal at the instant we read: one more
+      // round trip can complete after the final heartbeat. What must hold is
+      // that the number we sent came from the same rolling window the file
+      // publishes -- i.e. it was a real measurement, not a different number.
+      assert.ok(
+        published.rttMs.samples.includes(lastOnWire.rtt_ms),
+        `the value sent (${lastOnWire.rtt_ms}) must come from the file's window ${JSON.stringify(published.rttMs.samples)}`,
+      );
+      assert.ok(
+        Number.isInteger(published.rttMs.last) && published.rttMs.last >= 0,
+        'the file still holds a real measurement (0 is a legal sub-millisecond one)',
+      );
+    } finally {
+      agent?.stop();
+      if (running) await running.catch(() => {});
+      await rabbit.close();
+    }
+  });
+
+  it('ignores fields a newer relay adds to the heartbeat response', async () => {
+    const rabbit = await startFakeRabbit({
+      heartbeatExtra: {
+        rtt_ms: 999,
+        rtt_avg_ms: 42,
+        // The relay's own counter, which is a different quantity from the
+        // agent's `unstable_reconnects` -- both names may legitimately appear.
+        reconnect_attempts: 0,
+        link: { quality: 'good', samples: [1, 2, 3] },
+        future_field: null,
+      },
+    });
+    const project = await makeRepo('rtt-unknown-response');
+    /** @type {object|null} */
+    let agent = null;
+    /** @type {Promise<void>|null} */
+    let running = null;
+    try {
+      agent = makeAgent({
+        rabbit: rabbit.url,
+        project,
+        allowed: [['node', '-e']],
+        once: true,
+        name: 'rtt-unknown-response',
+      });
+      running = agent.start();
+      const stream = await rabbit.stream();
+      stream.send('ready', { protocol_version: 1, relay_id: 'relay-future', machine_id: 'rabbit' });
+      stream.send('task.offer', {
+        task_id: '01J-E2E-FUTURE',
+        attempt: 1,
+        mode: 'replicate',
+        index: 0,
+        index_total: 1,
+        command_argv: [NODE, '-e', 'setTimeout(() => process.stdout.write("y"), 600)'],
+        cwd_rel: '.',
+        write: false,
+        timeout_ms: 20_000,
+        dedupe_key: 'dk-e2e-future',
+      });
+      await running;
+
+      // The run is unaffected: unknown response fields are ignored, and the
+      // relay's echoed value never leaks into our own measurement.
+      assert.equal(rabbit.state.results.length, 1);
+      assert.equal(rabbit.state.results[0].status, 'ok');
+      assert.ok(rabbit.state.heartbeats.length >= 2, 'the lease must keep being renewed');
+      assert.notEqual(agent.state.rttMs.last, 999, 'a value echoed by the relay is not our measurement');
+      assert.ok(agent.state.rttMs.last <= MAX_HEARTBEAT_RTT_MS);
+    } finally {
+      agent?.stop();
+      if (running) await running.catch(() => {});
+      await rabbit.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.3.0: idle diagnostic heartbeats (a machine with nothing to do is exactly
+// the one an operator looks at, and it used to go silent)
+// ---------------------------------------------------------------------------
+
+describe('idle diagnostic heartbeats (v0.3.0)', () => {
+  /** Bodies that carry no lease: the diagnostic shape. */
+  const idleBodies = (rabbit) =>
+    rabbit.state.heartbeats.filter((body) => !Object.prototype.hasOwnProperty.call(body, 'task_id'));
+
+  it('sends the documented idle body shape while no task is running', async () => {
+    assert.equal(IDLE_HEARTBEAT_INTERVAL_MS, 60_000, 'the production cadence is one minute');
+    assert.equal(HEARTBEAT_INTERVAL_MS, 10_000, 'the lease cadence is unchanged');
+
+    const rabbit = await startFakeRabbit();
+    const project = await makeRepo('idle-body');
+    /** @type {object|null} */
+    let agent = null;
+    /** @type {Promise<void>|null} */
+    let running = null;
+    try {
+      agent = makeAgent({
+        rabbit: rabbit.url,
+        project,
+        allowed: [['node', '-e']],
+        once: false,
+        name: 'idle-body',
+        idleHeartbeatIntervalMs: 80,
+      });
+      running = agent.start();
+
+      const first = await waitFor(() => idleBodies(rabbit)[0] ?? null, { label: 'first idle heartbeat' });
+      assert.equal(first.diagnostic, true, 'the explicit flag is what keeps it off the lease path');
+      assert.equal('task_id' in first, false, 'an idle heartbeat must not impersonate a lease');
+      assert.equal(first.machine_id, agent.identity.machine_id);
+      assert.equal(Number.isInteger(first.unstable_reconnects), true, JSON.stringify(first));
+      assert.equal(
+        Object.prototype.hasOwnProperty.call(first, 'rtt_ms'),
+        false,
+        'the very first beat has no measurement yet',
+      );
+      // No lease heartbeat may be produced by an idle agent.
+      assert.equal(
+        rabbit.state.heartbeats.every((body) => !Object.prototype.hasOwnProperty.call(body, 'task_id')),
+        true,
+        'an idle agent must not emit lease heartbeats',
+      );
+
+      // Once an idle round trip completes it is a real measurement, and it is
+      // reported exactly like the lease heartbeat reports one.
+      const withRtt = await waitFor(
+        () => idleBodies(rabbit).find((body) => Object.prototype.hasOwnProperty.call(body, 'rtt_ms')) ?? null,
+        { label: 'idle heartbeat carrying rtt_ms' },
+      );
+      assert.equal(Number.isInteger(withRtt.rtt_ms), true, JSON.stringify(withRtt));
+      assert.ok(withRtt.rtt_ms >= 0 && withRtt.rtt_ms <= MAX_HEARTBEAT_RTT_MS);
+
+      // And the local file keeps being written with the same numbers.
+      const published = JSON.parse(readFileSync(agent.state.stateFile, 'utf8'));
+      assert.equal(typeof published.rttMs.last, 'number');
+      assert.equal(published.unstable_reconnects, agent.state.unstableReconnects);
+    } finally {
+      agent?.stop();
+      if (running) await running.catch(() => {});
+      await rabbit.close();
+    }
+  });
+
+  it('never touches lease or task state, even when the relay answers cancel:true', async () => {
+    // A lease heartbeat treats `cancel: true` as "stop the task". An idle
+    // heartbeat holds no lease, so the same response must be inert -- otherwise
+    // a relay that cancels *some other* task could stop an idle agent.
+    const rabbit = await startFakeRabbit({ heartbeatExtra: { cancel: true, lease_until: null } });
+    const project = await makeRepo('idle-cancel');
+    /** @type {object|null} */
+    let agent = null;
+    /** @type {Promise<void>|null} */
+    let running = null;
+    try {
+      agent = makeAgent({
+        rabbit: rabbit.url,
+        project,
+        allowed: [['node', '-e']],
+        once: false,
+        name: 'idle-cancel',
+        idleHeartbeatIntervalMs: 60,
+      });
+      running = agent.start();
+
+      await waitFor(() => idleBodies(rabbit).length >= 3, { label: 'three idle heartbeats' });
+      assert.equal(agent.state.stopped, false, 'an idle agent must not be stopped by a heartbeat response');
+      assert.equal(agent.state.current, null, 'no local task slot may be occupied');
+      assert.equal(agent.state.handled, 0, 'and no task may be considered handled');
+      assert.equal(rabbit.state.results.length, 0);
+    } finally {
+      agent?.stop();
+      if (running) await running.catch(() => {});
+      await rabbit.close();
+    }
+  });
+
+  it('tolerates a pre-v0.3.0 relay answering 404, without a retry storm', async () => {
+    const rabbit = await startFakeRabbit({ heartbeatIdleStatus: 404 });
+    const project = await makeRepo('idle-404');
+    const logs = [];
+    /** @type {object|null} */
+    let agent = null;
+    /** @type {Promise<void>|null} */
+    let running = null;
+    try {
+      agent = makeAgent({
+        rabbit: rabbit.url,
+        project,
+        allowed: [['node', '-e']],
+        once: true,
+        name: 'idle-404',
+        logs,
+        idleHeartbeatIntervalMs: 60,
+      });
+      const startedAt = Date.now();
+      running = agent.start();
+      const stream = await rabbit.stream();
+      stream.send('ready', { protocol_version: 1, relay_id: 'relay-old', machine_id: 'rabbit' });
+
+      // Let the idle cadence hit the 404ing endpoint *before* any task exists:
+      // an agent with nothing to do is the case this whole feature is for.
+      await waitFor(() => rabbit.state.idleHeartbeatStatuses.length >= 2, { label: 'idle 404s' });
+
+      // A real task must then run normally: the diagnostic traffic is best
+      // effort, not part of the task path.
+      stream.send('task.offer', {
+        task_id: '01J-E2E-IDLE404',
+        attempt: 1,
+        mode: 'replicate',
+        index: 0,
+        index_total: 1,
+        command_argv: [NODE, '-e', 'setTimeout(() => process.stdout.write("ok\\n"), 500)'],
+        cwd_rel: '.',
+        write: false,
+        timeout_ms: 20_000,
+        dedupe_key: 'dk-e2e-idle-404',
+      });
+      await running;
+      const elapsedMs = Date.now() - startedAt;
+
+      assert.equal(rabbit.state.results.length, 1, 'the task must complete despite 404s');
+      assert.equal(rabbit.state.results[0].status, 'ok');
+      assert.equal(rabbit.state.results[0].stdout_sha256, sha256Hex('ok\n'));
+      assert.ok(rabbit.state.idleHeartbeatStatuses.length >= 1, 'the 404s really happened');
+      assert.ok(
+        rabbit.state.idleHeartbeatStatuses.every((status) => status === 404),
+        'every rejected idle beat answered 404',
+      );
+
+      // One request per interval, not a retry storm.
+      const intervalMs = 60;
+      const allowed = Math.ceil(elapsedMs / intervalMs) + 3;
+      assert.ok(
+        rabbit.state.idleHeartbeatStatuses.length <= allowed,
+        `${rabbit.state.idleHeartbeatStatuses.length} idle attempts in ${elapsedMs}ms exceeds ${allowed} ` +
+          '(an unretried cadence sends one per interval)',
+      );
+      // And it is reported at debug level only: a diagnostic the relay simply
+      // does not implement must not become warn/error noise.
+      const noisy = logs.filter((entry) => entry.level !== 'debug' && /idle heartbeat/.test(entry.message));
+      assert.deepEqual(noisy, [], `idle failures must not be warn/error: ${JSON.stringify(noisy)}`);
+      assert.ok(
+        logs.some((entry) => entry.level === 'debug' && /HTTP 404/.test(entry.message)),
+        'the 404 must still be visible at debug level',
+      );
+    } finally {
+      agent?.stop();
+      if (running) await running.catch(() => {});
+      await rabbit.close();
+    }
   });
 });

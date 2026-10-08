@@ -14,15 +14,41 @@ import {
   rfc3339,
 } from './state.mjs';
 
+/**
+ * A machine ran and reported a failure, but the aggregate still has a verdict worth reading.
+ *
+ * Not a state: a machine outcome. Listed here so `degraded` can be defined against it rather than
+ * against a string literal repeated in three places.
+ */
+const FAILURE_OUTCOME = 'failed';
+
 /** Aggregate statuses this module can return. */
 export const AGGREGATE_STATUSES = Object.freeze([
+  // ---- the six verdicts of §6.3 ----
   'consistent',
   'divergent',
   'divergent-platform',
   'failed',
   'partial',
   'unverifiable',
-  // not one of §6.3's six states, but a task can legitimately have no verdict yet
+  // ---- added in v0.3.0 ----
+  //
+  // These three are *verdicts*, not phase flags, which is why they belong in this list rather than
+  // beside `pending`. Each answers a question the original six could not express:
+  //
+  //   timeout    nobody reported and the work is no longer waiting on anybody. `partial` said "some
+  //              machines are still out"; `timeout` says "we waited as long as we agreed to wait,
+  //              and the machines that never answered are not coming back".
+  //   cancelled  the operator stopped it. Distinct from `failed`: nothing went wrong, we chose this.
+  //              A cancellation must not be reported as a defect, or every intentional stop becomes
+  //              noise that trains people to ignore the status.
+  //   degraded   every machine reported, some succeeded and some failed. `partial` used to carry
+  //              this, but `partial` also means "still in flight", so a reader could not tell a
+  //              finished task in a bad state from one that had not finished. Both are now explicit.
+  'timeout',
+  'cancelled',
+  'degraded',
+  // ---- not verdicts: no terminal answer exists yet, or none was ever possible ----
   'refused',
   'pending',
 ]);
@@ -184,15 +210,42 @@ export function aggregate(task, resultRecords = [], opts = {}) {
     step2.skipped = 'step1_unverifiable';
     step3.skipped = 'step1_unverifiable';
     notes.push('aggregation refused: Step 1 anchor violation (see unverifiable machines)');
+  } else if (task.cancelled === true) {
+    /* v0.3.0: the operator stopped it. A chosen stop is not a defect. */
+    //
+    // Checked before `unverifiable`-adjacent outcomes and before any timeout: once someone has
+    // deliberately stopped the work, reporting "failed" or "timed out" would describe a decision as
+    // a malfunction, and enough of those trains a reader to ignore the status entirely.
+    status = 'cancelled';
+    step2.skipped = 'task_cancelled';
+    step3.skipped = 'task_cancelled';
+    notes.push(
+      task.cancel_reason ? `cancelled by the operator: ${task.cancel_reason}` : 'cancelled by the operator',
+    );
   } else if (runnable.length === 0 && expiredMachines.length === 0 && pendingMachines.length === 0 && step0.refused.length > 0) {
     status = 'refused';
     step2.skipped = 'all_refused';
     step3.skipped = 'all_refused';
   } else if (runnable.length === 0 && expiredMachines.length === 0) {
-    status = 'pending';
-    step2.skipped = 'no_results_yet';
-    step3.skipped = 'no_results_yet';
-    notes.push('no result envelope has been received yet');
+    /* v0.3.0: distinguish "still waiting" from "waited long enough". */
+    //
+    // `pending` means the task is live and more envelopes may still arrive. Once the deadline the
+    // caller set has passed and machines are still silent, that is a verdict, and calling it
+    // `pending` forever leaves a reader unable to tell a stuck task from a slow one.
+    const deadline = Number.isFinite(task.deadline_ms) ? task.deadline_ms : 0;
+    if (deadline > 0 && nowMs >= deadline) {
+      status = 'timeout';
+      step2.skipped = 'deadline_passed';
+      step3.skipped = 'deadline_passed';
+      notes.push(
+        `no result envelope by the ${task.timeout_ms}ms deadline (${pendingMachines.length} machine(s) still silent)`,
+      );
+    } else {
+      status = 'pending';
+      step2.skipped = 'no_results_yet';
+      step3.skipped = 'no_results_yet';
+      notes.push('no result envelope has been received yet');
+    }
   } else {
     for (const m of runnable) {
       const s = m.envelope.status;
@@ -265,9 +318,16 @@ export function aggregate(task, resultRecords = [], opts = {}) {
         notes.push(`divergent fields: ${differences.map((d) => d.field).join(', ')}`);
       }
     } else if (step2.ok.length > 0) {
-      /* §6.3 Step 2: 部分 ok、部分失败 → partial */
-      status = 'partial';
+      /* v0.3.0 §6.3 Step 2: 部分 ok、部分失败 → degraded */
+      //
+      // This used to be `partial`, which was wrong in a way that mattered: `partial` is also the
+      // answer while machines are still out, so "finished, and half of it failed" was
+      // indistinguishable from "still running" in the one field a reader looks at first. Every
+      // machine here has reported, so the task is over and the verdict is `degraded` -- some of the
+      // work succeeded, the rest did not, and nothing further is coming.
+      status = 'degraded';
       step2.partial = true;
+      notes.push(`${step2.ok.length} machine(s) succeeded and ${step2.failed.length} failed`);
     } else {
       /* §6.3 Step 2: 全部失败 → failed */
       status = 'failed';
@@ -330,6 +390,11 @@ const STATUS_LABEL = Object.freeze({
   failed: '❌ failed',
   partial: '🟠 partial',
   unverifiable: '⚠️ unverifiable',
+  // v0.3.0 verdicts. Each keeps a distinct shape because these are read at a glance: `partial`
+  // (still out), `degraded` (finished badly) and `timeout` (never answered) must not look alike.
+  degraded: '🟧 degraded',
+  timeout: '⏱️ timeout',
+  cancelled: '🚫 cancelled',
   refused: '⛔ refused',
   pending: '⏳ pending',
 });

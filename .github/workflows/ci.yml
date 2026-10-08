@@ -24,6 +24,53 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Lint is deliberately its own job rather than a step inside `test`.
+  #
+  # It is the cheapest signal in the workflow (seconds, one OS) and it fails for
+  # a completely different reason than a test failure, so separating them keeps
+  # "the code does not parse / has an unbound identifier" from being reported as
+  # "the relay behaved differently on macOS".
+  #
+  # Why `npm install` and not `npm ci`: this project commits no lockfile on
+  # purpose, so `npm ci` cannot run at all. The devDependencies carry caret
+  # ranges and are resolved fresh on every run, which is the same behaviour a
+  # developer gets locally. Nothing here is a runtime dependency; the published
+  # package still declares `"dependencies": {}`.
+  lint:
+    name: lint (eslint + prettier check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dev tooling
+        run: npm install --no-audit --no-fund
+
+      # A blocking gate: eslint errors are real findings (unbound identifiers,
+      # unused bindings, dead code). Warnings do not fail the run by design --
+      # see docs/LINT-AUDIT.md for which rules are warnings and why.
+      - name: ESLint
+        run: npm run lint
+
+      # Reported, not blocking. Prettier in this repository is a tool for new
+      # files, not a formatter for the existing tree: matching the hand-written
+      # style exactly is not possible with Prettier's options, and running it
+      # would rewrite ~90% of the lines in the project. Measuring costs nothing;
+      # gating would demand that rewrite or a permanent ignore list.
+      #
+      # Once the tree is formatted (or the scope narrowed), flip `|| true` into
+      # a hard failure by deleting it -- the job already does the right thing.
+      - name: Prettier (informational)
+        run: |
+          echo "::group::prettier --check ."
+          npm run format:check || true
+          echo "::endgroup::"
+          changed=$(npx --no-install prettier --list-different . | wc -l)
+          echo "::warning title=Prettier::$changed file(s) are not prettier-formatted; this is informational, see docs/LINT-AUDIT.md"
+          echo "files prettier would change: $changed"
+
   test:
     name: ${{ matrix.os }} / node ${{ matrix.node }}
     runs-on: ${{ matrix.os }}

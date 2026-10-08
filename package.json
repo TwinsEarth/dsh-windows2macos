@@ -26,7 +26,8 @@
     "CHANGELOG.md",
     "LICENSE",
     "PROTOCOL.md",
-    "PROTOCOL-v0.1.2.md"
+    "PROTOCOL-v0.1.2.md",
+    "PROTOCOL-v0.3.0.md"
   ],
   "dsh": {
     "bundle": {
@@ -34,9 +35,15 @@
     }
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=20.19.0"
   },
   "dependencies": {},
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.12.0",
+    "globals": "^17.13.0",
+    "prettier": "^3.9.9"
+  },
   "peerDependencies": {
     "@deepseek-ai/dsh-tools": "*"
   },
@@ -46,7 +53,7 @@
     }
   },
   "scripts": {
-    "test": "node --test --test-force-exit test/relay.test.mjs test/agent.test.mjs test/tools.test.mjs",
+    "test": "node --test --test-force-exit test/relay.test.mjs test/agent.test.mjs test/tools.test.mjs test/schedule.test.mjs test/auto-update.test.mjs test/update-source.test.mjs test/update-install.test.mjs test/update-wiring.test.mjs",
     "test:e2e": "node --test --test-force-exit test/e2e.test.mjs test/crossnetwork.test.mjs",
     "test:relay": "node --test test/relay.test.mjs",
     "test:agent": "node --test test/agent.test.mjs",
@@ -54,6 +61,10 @@
     "test:crossnetwork": "node --test --test-force-exit test/crossnetwork.test.mjs",
     "test:all": "node --test --test-force-exit test/relay.test.mjs test/agent.test.mjs test/tools.test.mjs test/e2e.test.mjs test/crossnetwork.test.mjs",
     "pack": "node scripts/pack.mjs",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
     "verify": "node scripts/check-entrypoints.mjs && node --test --test-force-exit test/relay.test.mjs test/agent.test.mjs test/tools.test.mjs test/e2e.test.mjs test/crossnetwork.test.mjs"
   },
   "keywords": [

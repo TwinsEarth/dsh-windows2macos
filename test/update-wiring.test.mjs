@@ -13,8 +13,10 @@ import fs from 'node:fs';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import * as plugin from '../src/plugin/tools.mjs';
+import { findProfileDir } from '../src/plugin/auto-update.mjs';
 
 const cleanup = [];
 after(() => {
@@ -151,6 +153,86 @@ describe('w2m_update tool', () => {
   });
 });
 
+describe('findProfileDir (the branch ESLint found, not the tests)', () => {
+  /**
+   * Build a real installed layout on disk and resolve from inside it.
+   *
+   * The origin of this test: `resolveProfileDir` used to be a closure inside `apply()`, and it called
+   * `existsSync` without importing it. ESM throws `ReferenceError` for an unbound identifier, so the
+   * plugin would have failed to load from any mounted profile -- the normal installed layout. It
+   * survived a fully green suite because no test ever executed that branch. A test that only checks
+   * the return value would repeat the mistake; this one walks a real directory tree.
+   *
+   * @param {string} rel - Path of the module inside the profile.
+   * @returns {{root: string, moduleUrl: string}}
+   */
+  function installedAt(rel) {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'w2m-profile-probe-'));
+    cleanup.push(root);
+    writeFileSync(path.join(root, 'package.json'), JSON.stringify({ name: 'dsh-profile-test' }), 'utf8');
+    const moduleUrl = pathToFileURL(path.join(root, rel)).href;
+    return { root, moduleUrl };
+  }
+
+  it('finds the profile root from a plain node_modules layout', () => {
+    const { root, moduleUrl } = installedAt(
+      path.join('node_modules', '@twinsearth', 'w2m-dsh-plugin', 'src', 'plugin', 'tools.mjs'),
+    );
+    assert.equal(findProfileDir({ moduleUrl }), root);
+  });
+
+  it('finds the root through a pnpm .pnpm segment, which is why it walks instead of slicing', () => {
+    // A fixed-depth slice would land on `.pnpm` here and return a path that is not a profile.
+    const { root, moduleUrl } = installedAt(
+      path.join('node_modules', '.pnpm', '@twinsearth+w2m-dsh-plugin@0.3.0', 'node_modules', '@twinsearth', 'w2m-dsh-plugin', 'lib', 'tools.js'),
+    );
+    assert.equal(findProfileDir({ moduleUrl }), root);
+  });
+
+  it('returns null when there is no profile above the module', () => {
+    // A checkout run from a clone: no enclosing package root, so self-update is unavailable and the
+    // caller must say so rather than invent a target.
+    const { moduleUrl } = installedAt(path.join('src', 'plugin', 'tools.mjs'));
+    assert.equal(findProfileDir({ moduleUrl }), null);
+  });
+
+  it('requires the root to look like a package, not just any node_modules parent', () => {
+    // `node_modules` alone is not evidence of a profile; without a package.json the walk keeps going.
+    const root = mkdtempSync(path.join(os.tmpdir(), 'w2m-no-manifest-'));
+    cleanup.push(root);
+    const moduleUrl = pathToFileURL(
+      path.join(root, 'node_modules', '@twinsearth', 'w2m-dsh-plugin', 'src', 'plugin', 'tools.mjs'),
+    ).href;
+    assert.equal(findProfileDir({ moduleUrl }), null);
+  });
+
+  it('prefers an explicitly configured profileDir', () => {
+    const explicit = mkdtempSync(path.join(os.tmpdir(), 'w2m-explicit-'));
+    cleanup.push(explicit);
+    const { moduleUrl } = installedAt(path.join('node_modules', 'x', 'y.mjs'));
+    assert.equal(findProfileDir({ explicit, moduleUrl }), explicit);
+  });
+
+  it('survives unusable input instead of throwing at load time', () => {
+    // This runs while the plugin is being constructed, so a throw here takes the whole tool set down.
+    for (const input of [{}, { moduleUrl: '' }, { moduleUrl: 'not a url' }, { explicit: '   ', moduleUrl: null }]) {
+      assert.equal(findProfileDir(input), null, JSON.stringify(input));
+    }
+  });
+
+  it('the plugin actually loads from a mounted profile layout', async () => {
+    // The end-to-end version of the same property: `apply()` resolves the profile as part of
+    // building its config, so a broken walk fails the load, not just the updater.
+    const profileDir = mkdtempSync(path.join(os.tmpdir(), 'w2m-mounted-'));
+    cleanup.push(profileDir);
+    writeFileSync(path.join(profileDir, 'package.json'), JSON.stringify({ name: 'dsh-profile-mounted' }), 'utf8');
+    const made = await register({ rabbitUrl: 'http://127.0.0.1:1', profileDir });
+    const out = await updateStatus(made.tools);
+    assert.equal(out.update.profile_dir, profileDir);
+    assert.equal(made.tools.size, 6);
+  });
+});
+
 describe('config validation is loud, not silently defaulted', () => {
   it('names autoUpdateTimes when a slot is malformed', async () => {
     // A silently-substituted default would move the check to an hour nobody chose, and nothing
@@ -260,4 +342,5 @@ describe('the scheduled job is owned by ctx.effect', () => {
     );
   });
 });
+
 

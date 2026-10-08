@@ -1,0 +1,35 @@
+# Paths Prettier must not touch.
+#
+# The repository's own style is hand-maintained and deliberately denser than
+# Prettier's output (see docs/LINT-AUDIT.md, "Prettier"); this file keeps the
+# check honest by excluding things that are not source at all.
+
+# Generated / never committed
+node_modules/
+dist/
+dist-*/
+*.tgz
+coverage/
+.w2m/
+e2e-tmp/
+test-tmp/
+
+# Runtime state a relay or agent may leave behind
+*.log
+spool/
+state/
+
+# Deployment templates. These are copied verbatim onto servers and read by
+# other tools (nginx, systemd, docker, cloudflared); reformatting them would
+# change files whose exact text is operationally meaningful, and the docker
+# image copies deploy/ into the build context.
+deploy/
+
+# Files whose formatting is externally owned:
+#   * LICENSE      - verbatim licence text
+#   * package.json - npm rewrites it on publish; churn here is pure noise
+#   * .gitattributes / .gitignore - line-ending policy, byte-meaningful
+LICENSE
+package.json
+.gitattributes
+.gitignore

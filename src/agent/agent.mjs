@@ -71,6 +71,34 @@ export const DEFAULT_TIMEOUT_MS = 300_000;
 export const RTT_WINDOW = 5;
 
 /**
+ * Largest round-trip time the agent will report to the relay (v0.3.0).
+ *
+ * A minute to answer a `POST /v1/heartbeat` is not a latency measurement any
+ * more; it is a symptom (a stalled socket, a suspended laptop, a clock jump).
+ * An out-of-range sample is **omitted rather than clamped**, because clamping
+ * would publish a number nobody measured -- the relay's aggregate can tolerate
+ * a missing sample, but not a fabricated one.
+ */
+export const MAX_HEARTBEAT_RTT_MS = 60_000;
+
+/**
+ * Idle diagnostic heartbeat cadence (v0.3.0).
+ *
+ * A machine with nothing to do is exactly the one an operator looks at -- "is
+ * that Mac still up, and how far away is it?" -- while a lease heartbeat only
+ * exists while a task does. Without this the relay's view of an idle machine
+ * freezes at its last task, and a `rtt_stale` flag that is permanently true
+ * reads like "the machine is there, just slow", which is worse than no value
+ * at all.
+ *
+ * The request is explicitly marked `diagnostic: true`. That flag is what tells
+ * the relay "touch no lease": a heartbeat that merely *lacks* `task_id` is
+ * indistinguishable from one whose field was lost, and §0 forbids trading a
+ * loud error for a quiet false success.
+ */
+export const IDLE_HEARTBEAT_INTERVAL_MS = 60_000;
+
+/**
  * A stream that stayed up at least this long is considered healthy, so the
  * next reconnect starts from the bottom of the backoff ladder again.
  */
@@ -250,6 +278,59 @@ export function cursorUsableFor({ seq, cursorRelayId = null, relayId = null } = 
   if (relayId === null || relayId === undefined) return true;
   // The relay identifies itself, so only a cursor it issued can be replayed.
   return cursorRelayId === relayId;
+}
+
+/**
+ * Extra fields the heartbeat carries so a *remote* reader can see this
+ * machine's link quality (v0.3.0): the relay stores them and exposes them
+ * through its per-machine status endpoint, which is the only way a plugin on
+ * another host can see the latency.
+ *
+ * Rules, all of them about not inventing data:
+ *
+ *   * `rtt_ms` is present **only** when a round trip was actually measured.
+ *     Absence means "unknown"; `null` would be an extra shape for the relay to
+ *     handle, and `0` would be read as "extremely fast", turning ignorance into
+ *     a good score.
+ *   * The value is a non-negative integer (`last` is already rounded), and a
+ *     sample above {@link MAX_HEARTBEAT_RTT_MS} is dropped rather than clamped.
+ *   * `unstable_reconnects` is always sent: it is a counter the agent owns, and
+ *     its absence would be indistinguishable from zero.
+ *
+ * `unstable_reconnects` deliberately does **not** reuse the name
+ * `reconnect_attempts`: the relay publishes its own `reconnect_attempts`
+ * (attaches - 1, see `src/relay/state.mjs`), and two different quantities under
+ * one name would make "this link is flapping right now" and "this machine has
+ * reconnected N times in total" look like the same fact. The relay's count is
+ * authoritative during a crash (it keeps counting); this one is the only thing
+ * that can say the link is unstable *at the moment*.
+ *
+ * The local file channel keeps working in parallel -- same numbers, different
+ * failure modes: it is faster on the same host and still correct when the relay
+ * is unreachable, while this one is the only channel that crosses machines.
+ *
+ * @param {{rttMs?: {last: number|null}|null, reconnectAttempts?: number|null}} snapshot
+ *   `reconnectAttempts` is the in-process counter (also exposed as
+ *   `state.unstableReconnects`); it is published as `unstable_reconnects`.
+ * @param {{maxRttMs?: number}} [options]
+ * @returns {Record<string, number>}
+ */
+export function heartbeatDiagnostics(snapshot = {}, options = {}) {
+  const maxRttMs = options.maxRttMs ?? MAX_HEARTBEAT_RTT_MS;
+  /** @type {Record<string, number>} */
+  const extra = {};
+
+  const last = snapshot?.rttMs?.last;
+  if (typeof last === 'number' && Number.isFinite(last) && last >= 0 && last <= maxRttMs) {
+    extra.rtt_ms = Math.round(last);
+  }
+
+  const attempts = snapshot?.reconnectAttempts;
+  if (typeof attempts === 'number' && Number.isFinite(attempts) && attempts >= 0) {
+    extra.unstable_reconnects = Math.trunc(attempts);
+  }
+
+  return extra;
 }
 
 // ---------------------------------------------------------------------------
@@ -603,6 +684,7 @@ export class Heartbeat {
    * @param {(error: unknown) => void} [options.onError]
    * @param {() => void} [options.onCancel]
    * @param {(ms: number) => void} [options.onRtt] Called with each successful round trip.
+   * @param {() => object} [options.diagnostics] Extra body fields per heartbeat (v0.3.0).
    */
   constructor(options) {
     this.send = options.send;
@@ -613,6 +695,7 @@ export class Heartbeat {
     this.onError = options.onError ?? (() => {});
     this.onCancel = options.onCancel ?? (() => {});
     this.onRtt = options.onRtt ?? (() => {});
+    this.diagnostics = options.diagnostics ?? null;
     this.phase = 'preparing';
     this.progress = 0;
     this.ticks = 0;
@@ -626,18 +709,38 @@ export class Heartbeat {
     if (typeof progress === 'number') this.progress = progress;
   }
 
+  /**
+   * The body of one heartbeat, including whatever diagnostics the caller
+   * supplies.
+   *
+   * @returns {object}
+   */
+  heartbeatBody() {
+    const body = {
+      task_id: this.taskId,
+      machine_id: this.machineId,
+      attempt: this.attempt,
+      phase: this.phase,
+      progress: this.progress,
+    };
+    if (this.diagnostics) {
+      try {
+        Object.assign(body, this.diagnostics() ?? {});
+      } catch {
+        // A broken diagnostics provider must never cost us the lease renewal:
+        // the heartbeat's job is to keep the task alive, and the extra fields
+        // are exactly that -- extra.
+      }
+    }
+    return body;
+  }
+
   /** Send one heartbeat; returns the decoded response. */
   async tick() {
     this.ticks += 1;
     const startedHr = process.hrtime.bigint();
     try {
-      const response = await this.send({
-        task_id: this.taskId,
-        machine_id: this.machineId,
-        attempt: this.attempt,
-        phase: this.phase,
-        progress: this.progress,
-      });
+      const response = await this.send(this.heartbeatBody());
       // Measured on success only: a timeout is not a round-trip time, and
       // folding it in would make "latency to the relay" look catastrophic.
       this.onRtt(Number(process.hrtime.bigint() - startedHr) / 1e6);
@@ -719,6 +822,7 @@ export function createAgent(options) {
     resultRetries = 4,
     operatorToken = null,
     statePublishIntervalMs = AGENT_STATE_PUBLISH_INTERVAL_MS,
+    idleHeartbeatIntervalMs = IDLE_HEARTBEAT_INTERVAL_MS,
   } = options;
 
   // Normalise here so every caller gets the same contract: the documented
@@ -774,6 +878,22 @@ export function createAgent(options) {
     replayTruncated: null,
     /** Rolling heartbeat round-trip times, read by `w2m_status` (§8.2). */
     rttMs: summarizeRtt([]),
+    /**
+     * Consecutive unstable reconnects: 0 once a stream has stayed up for
+     * {@link STABLE_STREAM_MS}, incremented for each reconnect before that.
+     *
+     * Published as `unstable_reconnects` in both channels (the heartbeat and
+     * `agent-state.json`) so they agree by construction. The JavaScript property
+     * keeps the shorter historical name because `scripts/probe-restart.mjs`
+     * reads it; `unstableReconnects` is the same value under the published name.
+     */
+    get reconnectAttempts() {
+      return reconnectAttempt;
+    },
+    /** Alias of {@link reconnectAttempts}, spelled like the published field. */
+    get unstableReconnects() {
+      return reconnectAttempt;
+    },
     /** Path of the published diagnostics file. */
     stateFile: stateFilePath,
     /** `updated_at` of the last successful publish, or null. */
@@ -826,6 +946,8 @@ export function createAgent(options) {
   let attachInfo = { seq: null, attributionRelayId: null };
   /** @type {NodeJS.Timeout|null} Idle refresh of the diagnostics file. */
   let statePublishTimer = null;
+  /** @type {NodeJS.Timeout|null} Idle diagnostic heartbeat (v0.3.0). */
+  let idleHeartbeatTimer = null;
 
   /**
    * @param {string|null|undefined} dedupeKey
@@ -871,7 +993,9 @@ export function createAgent(options) {
         avg: state.rttMs.avg,
         samples: [...state.rttMs.samples],
       },
-      reconnect_attempts: reconnectAttempt,
+      // Named to match the heartbeat field (and to stay distinct from the
+      // relay's own `reconnect_attempts`, which answers a different question).
+      unstable_reconnects: reconnectAttempt,
       replay_truncated: state.replayTruncated !== null,
     };
   }
@@ -1226,6 +1350,13 @@ export function createAgent(options) {
       intervalMs: heartbeatIntervalMs,
       onError: (error) => log('warn', 'heartbeat failed', { error: error.message }),
       onRtt: recordRtt,
+      // v0.3.0: the same numbers the local file carries, sent to the relay so a
+      // plugin on another machine can see them.
+      diagnostics: () =>
+        heartbeatDiagnostics({
+          rttMs: state.rttMs,
+          reconnectAttempts: state.reconnectAttempts,
+        }),
       onCancel: () => {
         log('warn', `Rabbit cancelled ${offer.task_id} via heartbeat`);
         controller.abort();
@@ -1710,12 +1841,79 @@ export function createAgent(options) {
 
   // -- Lifecycle -----------------------------------------------------------
 
+  /**
+   * The idle diagnostic heartbeat (v0.3.0): `POST /v1/heartbeat` with
+   * `diagnostic: true` and **no** `task_id`.
+   *
+   * Three properties matter, and each of them is a way this could go wrong:
+   *
+   *   1. It holds no lease, so nothing in the response may change local state.
+   *      The body is deliberately not inspected -- not even `cancel`, which on a
+   *      lease heartbeat means "stop the task". (A relay answering `cancel:
+   *      true` here must not stop an idle agent.)
+   *   2. It is best effort. A pre-v0.3.0 relay answers 404 because it demands a
+   *      `task_id`; that is expected, is logged at debug level, and must never
+   *      be retried in a storm, affect a task, or end the process.
+   *   3. It is skipped while a task holds the lease: the 10s lease heartbeat is
+   *      already reporting, and two cadences reporting the same numbers would
+   *      just be noise.
+   *
+   * A successful round trip *is* a real measurement, so it feeds the same
+   * rolling window the lease heartbeat uses -- that is what keeps the relay's
+   * view fresh while the machine has nothing to do.
+   *
+   * @returns {Promise<{status: number, ok: boolean}|null>}
+   */
+  async function sendIdleHeartbeat() {
+    if (state.stopped || state.current) return null;
+    if (!token()) return null; // nothing to authenticate with; not worth a 401
+    const startedHr = process.hrtime.bigint();
+    try {
+      const response = await postJson('/v1/heartbeat', {
+        diagnostic: true,
+        machine_id: identity.machine_id,
+        ...heartbeatDiagnostics({
+          rttMs: state.rttMs,
+          reconnectAttempts: state.reconnectAttempts,
+        }),
+      });
+      if (response.ok) {
+        // Measured on success only, exactly like the lease heartbeat.
+        recordRtt(Number(process.hrtime.bigint() - startedHr) / 1e6);
+      } else {
+        log('debug', `idle heartbeat rejected (HTTP ${response.status}); diagnostics only, continuing`, {
+          body: response.json?.error?.code ?? null,
+        });
+      }
+      return response;
+    } catch (error) {
+      log('debug', `idle heartbeat failed: ${error?.message ?? String(error)}; diagnostics only, continuing`, {});
+      return null;
+    }
+  }
+
+  /**
+   * Start the idle diagnostic cadence. Deliberately does **not** fire
+   * immediately: the first beat lands one interval in, so booting an agent
+   * stays quiet and a short-lived run produces no diagnostic traffic at all.
+   */
+  function startIdleHeartbeat() {
+    if (idleHeartbeatIntervalMs <= 0 || idleHeartbeatTimer) return;
+    idleHeartbeatTimer = setInterval(() => {
+      void sendIdleHeartbeat();
+    }, idleHeartbeatIntervalMs);
+    // A diagnostic must never be the reason the process stays alive.
+    if (typeof idleHeartbeatTimer.unref === 'function') idleHeartbeatTimer.unref();
+  }
+
   /** Stop the stream, the running command and the heartbeat. */
   function stop() {
     if (state.stopped) return;
     state.stopped = true;
     if (statePublishTimer) clearInterval(statePublishTimer);
     statePublishTimer = null;
+    if (idleHeartbeatTimer) clearInterval(idleHeartbeatTimer);
+    idleHeartbeatTimer = null;
     heartbeat?.stop();
     runAbort?.abort();
     streamAbort?.abort();
@@ -1750,6 +1948,9 @@ export function createAgent(options) {
       // Never keep the process alive just to refresh a diagnostics file.
       if (typeof statePublishTimer.unref === 'function') statePublishTimer.unref();
     }
+    // v0.3.0: keep the relay's view of *this* machine fresh even when it has
+    // nothing to do. Best effort by construction -- see sendIdleHeartbeat().
+    startIdleHeartbeat();
 
     if (token()) {
       await flushSpool();
@@ -1853,6 +2054,8 @@ export function createAgent(options) {
     allowedCommands,
     /** Write the diagnostics file now (also done automatically; task-16). */
     publishState,
+    /** Send one idle diagnostic heartbeat now (v0.3.0). */
+    sendIdleHeartbeat,
     /** Absolute path of the published diagnostics file. */
     stateFile: stateFilePath,
     /** Normalised base address actually used for every request (v0.1.2 §2). */

@@ -34,7 +34,8 @@
 
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
+import * as urlModule from 'node:url';
 
 import { createDailyScheduler, DEFAULT_DAILY_TIMES, DEFAULT_TIME_ZONE } from './schedule.mjs';
 import {
@@ -168,6 +169,52 @@ export function loadState(file) {
   } catch (error) {
     return { ...empty, lastError: `state file unreadable: ${error instanceof Error ? error.message : String(error)}` };
   }
+}
+
+/**
+ * Find the DSH profile directory that contains this plugin.
+ *
+ * The updater installs into the profile, so it must name it. Two facts make that reliable: the
+ * plugin is loaded from `<profile>/node_modules/@twinsearth/w2m-dsh-plugin`, and the profile root is
+ * the directory holding that `node_modules` plus a `package.json`. We walk up and *verify* rather
+ * than slicing a fixed number of path segments, because a pnpm layout can insert a `.pnpm` segment.
+ *
+ * Lives here rather than inside `apply()` on purpose. As a closure it was unreachable from any test,
+ * and a missing `existsSync` import in it survived a fully green suite until ESLint's `no-undef`
+ * caught it. Exporting it is what makes that class of mistake visible next time.
+ *
+ * @param {object} input - Resolution input.
+ * @param {unknown} [input.explicit] - A configured `profileDir`; used verbatim when non-empty.
+ * @param {string} input.moduleUrl - `import.meta.url` of the calling module.
+ * @param {(p: string) => boolean} [input.exists] - Existence probe, injectable for tests.
+ * @param {number} [input.maxDepth] - Ancestor levels to search.
+ * @returns {string|null} Absolute profile directory, or null when there is none.
+ */
+export function findProfileDir({ explicit, moduleUrl, exists = existsSync, maxDepth = 8 } = {}) {
+  if (typeof explicit === 'string' && explicit.trim() !== '') {
+    return resolve(explicit.trim());
+  }
+  if (typeof moduleUrl !== 'string' || moduleUrl === '') return null;
+
+  const { fileURLToPath } = urlModule;
+  let dir;
+  try {
+    dir = dirname(fileURLToPath(moduleUrl));
+  } catch {
+    return null;
+  }
+
+  for (let depth = 0; depth < maxDepth; depth += 1) {
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+    if (basename(dir) !== 'node_modules') continue;
+    const root = dirname(dir);
+    // A `node_modules` directory is not enough on its own; the profile root must look like a package.
+    if (exists(join(root, 'package.json'))) return root;
+    continue;
+  }
+  return null;
 }
 
 /**

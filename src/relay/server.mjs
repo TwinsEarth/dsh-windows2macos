@@ -587,6 +587,22 @@ export class RelayServer {
 
     const taskMatch = /^\/v1\/tasks\/([^/]+)$/.exec(path);
     const reportMatch = /^\/v1\/tasks\/([^/]+)\/report$/.exec(path);
+    // v0.3.0: cross-machine RTT status. The plugin may run on a different machine
+    // than the agent, so this has to come from the relay, not from a local file.
+    const agentStatusMatch = /^\/v1\/agents\/([^/]+)\/status$/.exec(path);
+
+    if (method === 'GET' && agentStatusMatch) {
+      const machineId = decodeURIComponent(agentStatusMatch[1]);
+      const status = this.state.deviceStatus(machineId);
+      if (!status) {
+        throw new ProtocolError('NOT_FOUND', 'unknown machine_id', { machine_id: machineId });
+      }
+      return sendJson(res, 200, {
+        protocol_version: PROTOCOL_VERSION,
+        rabbit_time: this.state.nowIso(),
+        ...status,
+      });
+    }
 
     if (method === 'GET' && reportMatch) {
       const taskId = decodeURIComponent(reportMatch[1]);
@@ -633,6 +649,9 @@ export class RelayServer {
       base_path: this.basePath,
       operator_token_required: this.operatorTokenRequired,
       pair_rate_limit: this.pairRateLimitPerMinute,
+      // v0.3.0: fleet-wide latency. Every numeric field is null (never 0) when no
+      // machine has reported a FRESH measurement.
+      rtt: this.state.rttSummary(),
       persistence: this.persistence.describe(),
     };
   }
@@ -848,6 +867,9 @@ export class RelayServer {
     sub.unsubscribe = unsubscribe;
     this.subscribers.add(sub);
     device.streams = (device.streams ?? 0) + 1;
+    // v0.3.0: relay-observed reconnect counter. A first attach is not a reconnect,
+    // so the reported `reconnect_attempts` is (attaches - 1).
+    this.state.noteStreamConnect(machineId);
 
     const onClose = () => this._closeSubscriber(sub);
     req.on('close', onClose);

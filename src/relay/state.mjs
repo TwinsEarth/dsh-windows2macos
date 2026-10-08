@@ -75,6 +75,16 @@ export const DEFAULT_PAIRING_TTL_MS = 24 * 60 * 60 * 1000; // §2.2: 24h
 export const DEFAULT_EVENT_BUFFER_SIZE = 1000;       // §requirement: keep last 1000 events
 export const MAX_FRAME_BYTES = 64 * 1024;            // 64 KiB single frame
 export const SHELL_ID_DIRECT = 'direct-exec';        // §5.1: v0.0.1 only direct exec
+/** v0.3.0: RTT sanity ceiling — anything above 24h is treated as a broken value. */
+export const MAX_RTT_MS = 24 * 60 * 60 * 1000;
+/** v0.3.0: an RTT measurement older than this is reported as stale.
+ *  Must stay comfortably ABOVE the idle-heartbeat interval (60s): at 1x the value
+ *  would flip stale just before every refresh and flap, which would make
+ *  `rtt_stale === false` useless as a "trust this number" predicate. 3x gives two
+ *  consecutive missed idle heartbeats of margin. See PROTOCOL-v0.3.0.md §7. */
+export const DEFAULT_RTT_STALE_MS = 180_000;
+/** v0.3.0: recommended cadence for an agent with no lease (reference for the agent side). */
+export const DEFAULT_IDLE_HEARTBEAT_MS = 60_000;
 export const ENVELOPE_VERSION = '1.0';
 export const FINGERPRINT_ALGO = 'git-temp-index-tree/v1';
 
@@ -301,6 +311,8 @@ export class RabbitState {
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS;
     this.missedHeartbeats = options.missedHeartbeats ?? DEFAULT_MISSED_HEARTBEATS;
     this.leaseGraceMs = options.leaseGraceMs ?? DEFAULT_LEASE_GRACE_MS;
+    /** v0.3.0: age beyond which a reported RTT is flagged stale. */
+    this.rttStaleMs = Number.isFinite(options.rttStaleMs) ? options.rttStaleMs : DEFAULT_RTT_STALE_MS;
 
     this.startedAtMs = this._now();
     /** v0.1.2 §8.3: random per-process id; a change tells clients the relay restarted. */
@@ -387,6 +399,14 @@ export class RabbitState {
           // a snapshot proves the device exists, not that it is connected
           online: false,
           streams: 0,
+          // v0.3.0: RTT is volatile and is NEVER restored. Even if a snapshot on
+          // disk happens to carry `rtt_ms`, it is dropped here: after a restart the
+          // relay genuinely does not know the latency any more, and reporting a
+          // pre-restart number as current would be a lie that no reader can detect.
+          rtt_ms: null,
+          rtt_at_ms: null,
+          last_heartbeat_at_ms: null,
+          stream_connects: 0,
         };
         this.devices.set(machineId, device);
         if (device.device_token) this.tokens.set(device.device_token, machineId);
@@ -603,6 +623,11 @@ export class RabbitState {
       last_seen_at_ms: now,
       online: true,
       streams: existing?.streams ?? 0,
+      // v0.3.0 RTT: starts unknown. `null` is "never measured"; 0 would mean "instant".
+      rtt_ms: null,
+      rtt_at_ms: null,
+      last_heartbeat_at_ms: null,
+      stream_connects: existing?.stream_connects ?? 0,
     };
     this.devices.set(machineId, device);
     this.tokens.set(token, machineId);
@@ -688,6 +713,159 @@ export class RabbitState {
     return device;
   }
 
+  /* ---------------- RTT (v0.3.0 §R) ---------------- */
+
+  /**
+   * Validate an inbound `rtt_ms`.
+   *
+   * The contract is deliberately liberal: a MISSING or INVALID value must never
+   * reject the heartbeat and must never clobber a previously known good value.
+   * RTT is a diagnostic; it must not be able to break lease renewal.
+   *
+   * Sanity ceiling: anything above `MAX_RTT_MS` (24h) is treated as invalid. A
+   * single garbage value would otherwise poison the fleet aggregate.
+   */
+  static normalizeRtt(value) {
+    if (value === undefined) return { provided: false, valid: false };
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+      return { provided: true, valid: false };
+    }
+    if (value > MAX_RTT_MS) return { provided: true, valid: false };
+    return { provided: true, valid: true, value };
+  }
+
+  /**
+   * RTT is a VOLATILE diagnostic: it is intentionally NOT written to
+   * `devices.json` and NOT replayed from the ledger, so a restarted relay reports
+   * `rtt_ms: null` until a machine heartbeats again. A persisted value would be
+   * indistinguishable from a fresh one and would let the relay claim knowledge it
+   * lost when the process died.
+   */
+  rttStaleAfterMs() { return this.rttStaleMs; }
+
+  /**
+   * v0.3.0: absorb the optional `rtt_ms` carried by a heartbeat.
+   *
+   * Deliberately liberal, because RTT is a diagnostic and must never be able to
+   * break lease renewal:
+   *   - the field is optional; a v0.2.3 agent never sends it
+   *   - a MISSING or INVALID value is IGNORED, keeping the previous value, and the
+   *     heartbeat still succeeds
+   *   - unknown extra fields are ignored entirely (forward compatibility)
+   *
+   * `last_heartbeat_at` advances on EVERY accepted heartbeat, with or without a
+   * usable RTT: it answers "is the machine alive", while `rtt_at` answers "when
+   * was this number measured". Keeping them separate is what lets a reader tell a
+   * genuinely slow machine from one that is simply gone.
+   */
+  recordHeartbeatMetrics(machineId, input = {}, nowMs = this.nowMs()) {
+    const device = this.devices.get(machineId);
+    if (!device) return null;
+    device.last_heartbeat_at_ms = nowMs;
+    const rtt = RabbitState.normalizeRtt(input.rtt_ms);
+    if (rtt.valid) {
+      device.rtt_ms = rtt.value;
+      device.rtt_at_ms = nowMs;
+    }
+    return device;
+  }
+
+  /** True when there is no value, or the value is older than the staleness window. */
+  isRttStale(device, nowMs = this.nowMs()) {
+    if (!device || device.rtt_ms === null || device.rtt_ms === undefined) return true;
+    if (device.rtt_at_ms === null || device.rtt_at_ms === undefined) return true;
+    return nowMs - device.rtt_at_ms > this.rttStaleMs;
+  }
+
+  /** How old the RTT measurement is, in ms; null when there is none. */
+  rttAgeMs(device, nowMs = this.nowMs()) {
+    if (!device || device.rtt_at_ms === null || device.rtt_at_ms === undefined) return null;
+    return Math.max(0, nowMs - device.rtt_at_ms);
+  }
+
+  /** Record that a machine attached a stream (a reconnect is any attach after the first). */
+  noteStreamConnect(machineId) {
+    const device = this.devices.get(machineId);
+    if (!device) return null;
+    device.stream_connects = (device.stream_connects ?? 0) + 1;
+    return device.stream_connects;
+  }
+
+  /**
+   * v0.3.0 aggregate for `/healthz`.
+   *
+   * Only FRESH measurements count. A machine that has been gone for a day must not
+   * drag min/max/avg around, and with no fresh data every numeric field is null --
+   * never 0, which would read as "instantaneous".
+   */
+  rttSummary(nowMs = this.nowMs()) {
+    const fresh = [];
+    let stale = 0;
+    let unknown = 0;
+    for (const device of this.devices.values()) {
+      if (device.rtt_ms === null || device.rtt_ms === undefined) { unknown += 1; continue; }
+      if (this.isRttStale(device, nowMs)) { stale += 1; continue; }
+      fresh.push(device.rtt_ms);
+    }
+    if (fresh.length === 0) {
+      return {
+        machines_reporting: 0,
+        min_ms: null,
+        max_ms: null,
+        avg_ms: null,
+        machines_stale: stale,
+        machines_unknown: unknown,
+      };
+    }
+    const sum = fresh.reduce((a, b) => a + b, 0);
+    return {
+      machines_reporting: fresh.length,
+      min_ms: Math.min(...fresh),
+      max_ms: Math.max(...fresh),
+      avg_ms: Math.round((sum / fresh.length) * 10) / 10,
+      machines_stale: stale,
+      machines_unknown: unknown,
+    };
+  }
+
+  /**
+   * v0.3.0 single-machine status view.
+   *
+   * `last_heartbeat_at` and `rtt_at` answer different questions, and the gap
+   * between them is the whole point: a machine can be heartbeating (alive) while
+   * its RTT number is old (a v0.2.3 agent that never sends `rtt_ms`), and a
+   * machine can be gone while a plausible-looking RTT is still on file.
+   */
+  deviceStatus(machineId, nowMs = this.nowMs()) {
+    const device = this.devices.get(machineId);
+    if (!device) return null;
+    const rttAt = device.rtt_at_ms ?? null;
+    const lastHeartbeat = device.last_heartbeat_at_ms ?? null;
+    return {
+      machine_id: device.machine_id,
+      machine_name: device.machine_name,
+      relay_id: this.relayId,
+      connected: (device.streams ?? 0) > 0,
+      streams: device.streams ?? 0,
+      online: device.online === true,
+      rtt_ms: device.rtt_ms ?? null,
+      rtt_at: rttAt === null ? null : rfc3339(rttAt),
+      rtt_age_ms: this.rttAgeMs(device, nowMs),
+      rtt_stale: this.isRttStale(device, nowMs),
+      last_heartbeat_at: lastHeartbeat === null ? null : rfc3339(lastHeartbeat),
+      last_seen_at: device.last_seen_at_ms === null || device.last_seen_at_ms === undefined
+        ? null : rfc3339(device.last_seen_at_ms),
+      reconnect_attempts: Math.max(0, (device.stream_connects ?? 0) - 1),
+      stream_connects: device.stream_connects ?? 0,
+      paired_at: device.paired_at_ms === null || device.paired_at_ms === undefined
+        ? null : rfc3339(device.paired_at_ms),
+      platform: device.platform,
+      caps: device.caps,
+      user_id: device.user_id ?? null,
+      now: rfc3339(nowMs),
+    };
+  }
+
   /** Public device view — never leaks device_token. */
   publicDevice(device) {
     return {
@@ -700,6 +878,14 @@ export class RabbitState {
       streams: device.streams,
       paired_at: rfc3339(device.paired_at_ms),
       last_seen_at: rfc3339(device.last_seen_at_ms),
+      // v0.3.0: `null` means "never measured", which is NOT the same as 0ms.
+      rtt_ms: device.rtt_ms ?? null,
+      rtt_at: device.rtt_at_ms === null || device.rtt_at_ms === undefined ? null : rfc3339(device.rtt_at_ms),
+      rtt_age_ms: this.rttAgeMs(device),
+      rtt_stale: this.isRttStale(device),
+      last_heartbeat_at: device.last_heartbeat_at_ms === null || device.last_heartbeat_at_ms === undefined
+        ? null : rfc3339(device.last_heartbeat_at_ms),
+      reconnect_attempts: Math.max(0, (device.stream_connects ?? 0) - 1),
     };
   }
 
@@ -1006,18 +1192,8 @@ export class RabbitState {
 
   /* ---------------- leases / heartbeat (§4.3) ---------------- */
 
-  /**
-   * §4.3 POST /v1/heartbeat — renews the lease using SERVER time only.
-   * @returns {{lease_until:string, cancel:boolean, phase?:string, progress?:number}}
-   */
-  heartbeat(input = {}) {
-    const task = this.requireTask(input.task_id);
-    const lease = task.leases.get(input.machine_id);
-    if (!lease) {
-      throw new ProtocolError('NOT_FOUND', 'no lease for this machine on this task', {
-        task_id: input.task_id, machine_id: input.machine_id,
-      });
-    }
+  /** Shared `phase`/`progress` validation for both heartbeat modes. */
+  _validatePhaseProgress(input) {
     if (input.phase !== undefined && input.phase !== null && !LEASE_PHASES.includes(input.phase)) {
       throw new ProtocolError('BAD_REQUEST', 'phase must be preparing|running|finalizing', { phase: input.phase });
     }
@@ -1025,9 +1201,88 @@ export class RabbitState {
       && (typeof input.progress !== 'number' || input.progress < 0 || input.progress > 1)) {
       throw new ProtocolError('BAD_REQUEST', 'progress must be a number in [0,1]', { progress: input.progress });
     }
+  }
+
+  /**
+   * v0.3.0 IDLE (diagnostic) heartbeat — an agent with no lease keeps its latency
+   * and liveness visible to other machines.
+   *
+   * This path deliberately NEVER looks at `this.tasks`. That is the whole safety
+   * argument, and it is structural rather than a matter of remembering a rule: an
+   * idle heartbeat cannot renew, resurrect or otherwise touch a lease because it
+   * never obtains one. Without that, an idle ping from a machine whose lease had
+   * expired would flip `expired` back to `running` and manufacture a live task out
+   * of nothing -- a fake "the work is still being done" signal, which is the most
+   * dangerous lie this relay can tell.
+   */
+  diagnosticHeartbeat(input = {}) {
+    const machineId = typeof input.machine_id === 'string' && input.machine_id !== ''
+      ? input.machine_id : null;
+    if (machineId === null) {
+      throw new ProtocolError('BAD_REQUEST', 'machine_id is required', {});
+    }
+    if (!this.devices.has(machineId)) {
+      throw new ProtocolError('NOT_FOUND', 'unknown machine_id', { machine_id: machineId });
+    }
+    this._validatePhaseProgress(input);
+
+    const device = this.touchDevice(machineId);
+    this.recordHeartbeatMetrics(machineId, input);
+    return {
+      // No lease is involved, and the response says so instead of inventing one.
+      lease_until: null,
+      cancel: false,
+      diagnostic: true,
+      machine_id: machineId,
+      rtt_ms: device?.rtt_ms ?? null,
+    };
+  }
+
+  /**
+   * §4.3 POST /v1/heartbeat — renews the lease using SERVER time only.
+   *
+   * Two modes since v0.3.0:
+   *   - `task_id` present            -> LEASE heartbeat (unchanged §4.3 behaviour)
+   *   - `diagnostic: true`, no task  -> IDLE heartbeat (diagnostics only, no lease)
+   *   - neither                      -> 400. A heartbeat that silently renewed
+   *     nothing would let an agent whose `task_id` went missing stop renewing while
+   *     believing it was fine, ending in a falsely `expired` task. §0 forbids
+   *     silent degradation, so this is loud.
+   *
+   * @returns {{lease_until:string|null, cancel:boolean, phase?:string, progress?:number, diagnostic?:boolean}}
+   */
+  heartbeat(input = {}) {
+    const hasTask = typeof input.task_id === 'string' && input.task_id !== '';
+    if (!hasTask) {
+      if (input.diagnostic !== true) {
+        throw new ProtocolError('BAD_REQUEST',
+          'a heartbeat must carry task_id (lease renewal) or diagnostic:true (idle diagnostics); '
+          + 'refusing to treat a missing task_id as a no-op renewal', {
+            received_keys: Object.keys(input).sort(),
+          });
+      }
+      return this.diagnosticHeartbeat(input);
+    }
+    if (input.diagnostic === true) {
+      // task_id wins: a heartbeat that names a task IS a lease heartbeat.
+      // (documented; the flag is simply redundant here)
+    }
+    return this.leaseHeartbeat(input);
+  }
+
+  leaseHeartbeat(input = {}) {
+    const task = this.requireTask(input.task_id);
+    const lease = task.leases.get(input.machine_id);
+    if (!lease) {
+      throw new ProtocolError('NOT_FOUND', 'no lease for this machine on this task', {
+        task_id: input.task_id, machine_id: input.machine_id,
+      });
+    }
+    this._validatePhaseProgress(input);
 
     const now = this.nowMs();
     this.touchDevice(input.machine_id);
+    this.recordHeartbeatMetrics(input.machine_id, input, now);
 
     if (task.cancelled) {
       return { lease_until: rfc3339(lease.lease_until_ms), cancel: true, reason: task.cancel_reason };

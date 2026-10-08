@@ -1,5 +1,5 @@
 /**
- * DSH: Windows2MacOS — the DSH Cordis plugin.
+ * DSH: Windows2MacOS 鈥?the DSH Cordis plugin.
  *
  * # What this exposes
  *
@@ -7,12 +7,12 @@
  *
  *   w2m_devices  read-only   which machines the Rabbit currently holds leases for
  *   w2m_run      control     broadcast one argv command to the online machines
- *   w2m_wait     read-only   wait for terminal results and hand back the six-state aggregate
+ *   w2m_wait     read-only   wait for terminal results and hand back the aggregate verdict
  *   w2m_report   read-only   the rendered report, markdown or json
  *   w2m_status   read-only   this machine's identity, Rabbit reachability, project base_commit
  *
  * The plugin is a **client of the Rabbit**. It does not execute commands, does not fork
- * processes, and does not decide whether two machines agreed — the Rabbit does that and this
+ * processes, and does not decide whether two machines agreed 鈥?the Rabbit does that and this
  * code only reports what it was told, plus the fields it did not recognise.
  *
  * # Fail-closed choices
@@ -22,7 +22,7 @@
  * * Results are reported with their refusals intact: a non-zero exit, a `refused` machine, a
  *   `divergent` aggregate, and an `unverifiable` aggregate are all *values*, not exceptions. The
  *   only things that throw are "the tool could not run" and "the tool ran and said no".
- * * Arguments travel as an **argv array**, never a shell string (PROTOCOL §0).
+ * * Arguments travel as an **argv array**, never a shell string (PROTOCOL 搂0).
  * * Every call is bounded by a wall-clock timeout and an output byte cap, so a wedged Rabbit
  *   cannot hang the session and a chatty one cannot flood it.
  * * Every call honours `exec.signal`; the signal is merged with our own timeout so a cancel
@@ -33,8 +33,8 @@
  * # `@deepseek-ai/dsh-tools` and the offline fallback
  *
  * `defineTool` is imported lazily, at `apply()` time, through {@link loadDefineTool}. When the
- * package is importable — the real path, inside DSH — its `defineTool` is used unchanged. When it
- * is not — this repository has no `node_modules`, so `node --test` cannot resolve it — a minimal
+ * package is importable 鈥?the real path, inside DSH 鈥?its `defineTool` is used unchanged. When it
+ * is not 鈥?this repository has no `node_modules`, so `node --test` cannot resolve it 鈥?a minimal
  * **shim** stands in so the unit tests can still drive `apply()` and the registered definitions.
  *
  * The shim validates only the shape this file says it must (name present, `parameters` an object,
@@ -49,14 +49,13 @@ import { execFile } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 
-// The base-address rules live in one place (§2), shared with the agent side. Importing them — rather
-// than re-deriving them here — is what stops the plugin and the agent from disagreeing about what
-// `https://host/w2m` means, which is the defect §2 exists to fix.
+// The base-address rules live in one place (搂2), shared with the agent side. Importing them 鈥?rather
+// than re-deriving them here 鈥?is what stops the plugin and the agent from disagreeing about what
+// `https://host/w2m` means, which is the defect 搂2 exists to fix.
 // `src/agent/` does not import `src/plugin/`, so the dependency runs one way and cannot cycle.
 import { joinUrl, resolveBaseUrl } from '../agent/url.mjs';
-import { createAutoUpdater, resolveCurrentVersion } from './auto-update.mjs';
+import { createAutoUpdater, findProfileDir, resolveCurrentVersion } from './auto-update.mjs';
 import { DEFAULT_DAILY_TIMES, DEFAULT_TIME_ZONE } from './schedule.mjs';
 
 /** Services this plugin needs. The harness refuses to load the plugin without them. */
@@ -110,7 +109,7 @@ const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
  * An error a caller can act on, carrying a stable machine-readable code.
  *
  * `code` and `hint` are duplicated into enumerable own properties so that `JSON.stringify(error)`
- * — which a tool layer may well do — still shows the caller what was wrong.
+ * 鈥?which a tool layer may well do 鈥?still shows the caller what was wrong.
  */
 class W2MError extends Error {
   /**
@@ -130,7 +129,7 @@ class W2MError extends Error {
 /**
  * A configured value is missing or unusable.
  *
- * The message carries the setting name, what is wrong with it, and what to set instead — a model
+ * The message carries the setting name, what is wrong with it, and what to set instead 鈥?a model
  * reading only the message has to be able to fix the configuration by itself. The hint repeats the
  * remediation for callers that surface hints separately.
  *
@@ -218,7 +217,7 @@ function isAbort(error, signal) {
 /**
  * How long this plugin waited, and whether it needs the Rabbit operator to look.
  *
- * A `timeout` envelope is precisely the case PROTOCOL §4.3 leaves to the Rabbit's clock, so the
+ * A `timeout` envelope is precisely the case PROTOCOL 搂4.3 leaves to the Rabbit's clock, so the
  * hint points there rather than pretending the local wait was authoritative.
  *
  * @param {string} taskId
@@ -399,7 +398,7 @@ function readConfig(config = {}) {
       : (typeof process.env.W2M_PAIRING_CODE === 'string' && process.env.W2M_PAIRING_CODE.trim() !== ''
         ? process.env.W2M_PAIRING_CODE.trim()
         : null),
-    // §5: the operator credential. Only `w2m_run` uses it.
+    // 搂5: the operator credential. Only `w2m_run` uses it.
     operatorToken: typeof config.operatorToken === 'string' && config.operatorToken.trim() !== ''
       ? config.operatorToken.trim()
       : (typeof process.env.W2M_OPERATOR_TOKEN === 'string' && process.env.W2M_OPERATOR_TOKEN.trim() !== ''
@@ -557,20 +556,10 @@ function normalizeUpdateTimes(times) {
  * @returns {string|null} Absolute profile directory, or null.
  */
 function resolveProfileDir(config) {
-  if (typeof config.profileDir === 'string' && config.profileDir.trim() !== '') {
-    return path.resolve(config.profileDir.trim());
-  }
-
-  let dir = path.dirname(fileURLToPath(import.meta.url));
-  for (let depth = 0; depth < 8; depth += 1) {
-    const parent = path.dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-    if (path.basename(dir) !== 'node_modules') continue;
-    const root = path.dirname(dir);
-    if (existsSync(path.join(root, 'package.json'))) return root;
-  }
-  return null;
+  return findProfileDir({
+    explicit: config.profileDir,
+    moduleUrl: import.meta.url,
+  });
 }
 
 /**
@@ -593,7 +582,7 @@ function requireRabbit(cfg) {
 /**
  * Require the state directory, naming the setting when it is absent.
  *
- * Used by the paths that genuinely cannot work without a `device.json` — see {@link resolveToken},
+ * Used by the paths that genuinely cannot work without a `device.json` 鈥?see {@link resolveToken},
  * which is the only caller, and which explains why an unset `stateDir` is not an error there.
  *
  * @param {{stateDir: string|null}} cfg
@@ -611,7 +600,7 @@ function requireStateDir(cfg) {
 }
 
 /**
- * Require the operator token, naming the setting when it is absent (PROTOCOL-v0.1.2 §5).
+ * Require the operator token, naming the setting when it is absent (PROTOCOL-v0.1.2 搂5).
  *
  * `POST /v1/task` is the one endpoint that authorises with the operator token rather than the
  * device token. There is deliberately **no fallback** to the device token: a relay that has the
@@ -626,7 +615,7 @@ function requireOperatorToken(cfg) {
   if (cfg.operatorToken) return cfg.operatorToken;
   throw configError(
     'operatorToken',
-    'is not set, so this tool cannot dispatch a task — a device token cannot dispatch tasks; ' +
+    'is not set, so this tool cannot dispatch a task 鈥?a device token cannot dispatch tasks; ' +
       '`POST /v1/task` requires the operator token',
     'set `operatorToken` in this plugin\'s profile patch (or `W2M_OPERATOR_TOKEN` in the environment) ' +
       'to the value the relay printed at startup, or read it from `<state>/operator-token.txt`',
@@ -634,7 +623,7 @@ function requireOperatorToken(cfg) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Base URL and endpoint joining (PROTOCOL-v0.1.2 §2)
+// Base URL and endpoint joining (PROTOCOL-v0.1.2 搂2)
 // ---------------------------------------------------------------------------------------------
 
 /**
@@ -642,7 +631,7 @@ function requireOperatorToken(cfg) {
  *
  * The rule itself lives in `../agent/url.mjs` (imported above) so both sides cannot drift. This
  * wrapper exists only to translate its `TypeError` into the `W2M_CONFIG` error every other
- * configuration fault in this file uses, whose message names the setting **and** what to do — the
+ * configuration fault in this file uses, whose message names the setting **and** what to do 鈥?the
  * caller is a model reading tool output, not a developer reading a stack trace.
  *
  * @param {unknown} raw
@@ -658,7 +647,7 @@ function checkedRabbitBase(raw) {
     const scheme = /got\s+([a-z][a-z0-9+.-]*:)/i.exec(reason);
     const why = scheme
       ? `uses scheme \`${scheme[1]}\`, which is not supported (only http and https are)`
-      : `is not usable as a base address — ${reason}`;
+      : `is not usable as a base address 鈥?${reason}`;
     throw configError(
       'rabbitUrl',
       why,
@@ -690,14 +679,14 @@ function toRequestUrl(url) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Agent RTT (PROTOCOL-v0.1.2 §8.2)
+// Agent RTT (PROTOCOL-v0.1.2 搂8.2)
 // ---------------------------------------------------------------------------------------------
 
 /**
  * A status getter reachable from this process, when the plugin started relay+agent itself.
  *
  * Set by {@link startLocalStack}. Null in the normal case, where the agent runs as its own process
- * and its state is not reachable from here at all — see {@link readRtt}.
+ * and its state is not reachable from here at all 鈥?see {@link readRtt}.
  *
  * @type {(() => object)|null}
  */
@@ -769,11 +758,11 @@ function round(value) {
 }
 
 /**
- * Read the local agent's round-trip time, or explain why it is unavailable (§8.2).
+ * Read the local agent's round-trip time, or explain why it is unavailable (搂8.2).
  *
- * §8.2 puts `rttMs` on the agent's in-memory state. When the plugin started the agent inside this
- * process, that state is reachable directly. When the agent is its own process — the normal
- * deployment — it is not, so this also looks for a state file under `stateDir`. Neither source
+ * 搂8.2 puts `rttMs` on the agent's in-memory state. When the plugin started the agent inside this
+ * process, that state is reachable directly. When the agent is its own process 鈥?the normal
+ * deployment 鈥?it is not, so this also looks for a state file under `stateDir`. Neither source
  * being present is reported as `available: false` with a reason, never as an error: cross-region
  * diagnosis fails loudly, but this tool must still answer when the agent has not been started.
  *
@@ -892,7 +881,7 @@ async function readBody(response, maxBytes) {
 }
 
 /**
- * Parse the protocol's error shape: `{ error: { code, message, detail } }` (PROTOCOL §7).
+ * Parse the protocol's error shape: `{ error: { code, message, detail } }` (PROTOCOL 搂7).
  *
  * @param {string} text
  * @returns {{code: string, message: string, detail: unknown}|null}
@@ -918,7 +907,7 @@ function parseErrorBody(text) {
  * Perform one request against the Rabbit.
  *
  * Resolves for every HTTP status, including 4xx and 5xx: the Rabbit's refusals are answers, and
- * the code table in PROTOCOL §7 is part of the protocol, not an exceptional path. Rejects only
+ * the code table in PROTOCOL 搂7 is part of the protocol, not an exceptional path. Rejects only
  * when the call could not be made at all (transport, abort, size cap).
  *
  * @param {{rabbitUrl: string, token?: string|null, signal?: AbortSignal, timeoutMs?: number,
@@ -950,8 +939,8 @@ async function request(options) {
     });
   }
 
-  // §2: base + path, joined by hand. `new URL(pathname, base)` would resolve against the origin
-  // and drop a deployment sub-path (`https://h/w2m` + `/v1/task` → `https://h/v1/task` → 404).
+  // 搂2: base + path, joined by hand. `new URL(pathname, base)` would resolve against the origin
+  // and drop a deployment sub-path (`https://h/w2m` + `/v1/task` 鈫?`https://h/v1/task` 鈫?404).
   const target = toRequestUrl(joinUrl(rabbitUrl, pathname));
   for (const [key, value] of Object.entries(query ?? {})) {
     if (value !== undefined && value !== null) target.searchParams.set(key, String(value));
@@ -1029,7 +1018,7 @@ function endpointOf(target) {
  * Resolve the bearer token for the Rabbit calls.
  *
  * Absent `stateDir` means "no paired device was declared", which is a configuration the operator
- * may have chosen — the calls then go out unauthenticated and a `401` is reported as a refusal,
+ * may have chosen 鈥?the calls then go out unauthenticated and a `401` is reported as a refusal,
  * which is the accurate account of what happened. A `stateDir` that *is* set means the operator
  * pointed at a pairing, so a missing or unreadable `device.json` is named as the fault instead of
  * being turned into a mystery `401`.
@@ -1047,7 +1036,7 @@ async function resolveToken(cfg) {
 // ---------------------------------------------------------------------------------------------
 
 /**
- * Read `device.json` from the state directory (PROTOCOL §2.1).
+ * Read `device.json` from the state directory (PROTOCOL 搂2.1).
  *
  * @param {{stateDir: string|null}} cfg
  * @returns {Promise<{machine_id: string|null, machine_name: string|null, device_token: string|null,
@@ -1101,7 +1090,7 @@ function requireToken(device) {
   if (!device.present) {
     throw new W2MError(
       'W2M_NO_TOKEN',
-      `W2M_NO_TOKEN: no paired device at \`${device.path ?? 'device.json'}\` — the file does not exist; ` +
+      `W2M_NO_TOKEN: no paired device at \`${device.path ?? 'device.json'}\` 鈥?the file does not exist; ` +
         'start the agent once so it can pair, or set `stateDir` to the directory holding an already-paired device.json',
       { hint: 'start the agent once so it can pair, or set `stateDir` to the directory holding an already-paired device.json' },
     );
@@ -1109,13 +1098,13 @@ function requireToken(device) {
   if (device.error) {
     throw new W2MError(
       'W2M_NO_TOKEN',
-      `W2M_NO_TOKEN: could not read a device token from \`${device.path}\` — ${device.error}; repair or delete the file and pair again`,
+      `W2M_NO_TOKEN: could not read a device token from \`${device.path}\` 鈥?${device.error}; repair or delete the file and pair again`,
       { hint: 'repair or delete the file and pair again' },
     );
   }
   throw new W2MError(
     'W2M_NO_TOKEN',
-    `W2M_NO_TOKEN: \`${device.path}\` has no \`device_token\` — the device has not completed POST /v1/pair yet; run the agent once to pair it`,
+    `W2M_NO_TOKEN: \`${device.path}\` has no \`device_token\` 鈥?the device has not completed POST /v1/pair yet; run the agent once to pair it`,
     { hint: 'the device has not completed POST /v1/pair yet; run the agent once to pair it' },
   );
 }
@@ -1153,8 +1142,8 @@ function runGit(argv, options = {}) {
  * Resolve the project's three anchors' worth of git state.
  *
  * `base_commit` is `HEAD`. `base_tree` is the tree of the **working tree as it stands**, which is
- * what a peer's `pre_tree_fingerprint` can actually be equal to — the tree of `HEAD` would report
- * every uncommitted change as an anchor mismatch. It is computed the way PROTOCOL §5.1 names the
+ * what a peer's `pre_tree_fingerprint` can actually be equal to 鈥?the tree of `HEAD` would report
+ * every uncommitted change as an anchor mismatch. It is computed the way PROTOCOL 搂5.1 names the
  * algorithm, `git-temp-index-tree/v1`, so this machine's answer and a peer's are comparable.
  *
  * @param {{projectDir: string, timeoutMs?: number}} options
@@ -1299,13 +1288,13 @@ function compactEnvelope(raw, comparable) {
 function excerpt(value) {
   const buffer = Buffer.from(value, 'utf8');
   if (buffer.byteLength <= MAX_EXCERPT_BYTES) return value;
-  return `${buffer.subarray(0, MAX_EXCERPT_BYTES).toString('utf8')}\n…[truncated at ${MAX_EXCERPT_BYTES} bytes]`;
+  return `${buffer.subarray(0, MAX_EXCERPT_BYTES).toString('utf8')}\n鈥truncated at ${MAX_EXCERPT_BYTES} bytes]`;
 }
 
 /**
  * Compare the Rabbit's envelope against the field list this plugin knows, and report what is new.
  *
- * PROTOCOL §5 says unknown fields must be ignored. Ignoring them is not the same as being blind
+ * PROTOCOL 搂5 says unknown fields must be ignored. Ignoring them is not the same as being blind
  * to them: a Rabbit that starts sending a field this plugin does not understand is a protocol
  * drift a reader needs to see, so the names are surfaced rather than dropped.
  *
@@ -1327,7 +1316,7 @@ function collectUnknownFields(body, known) {
   return [...seen].sort();
 }
 
-/** Comparable fields — mirror of PROTOCOL §5.3. Only these decide consistency. */
+/** Comparable fields 鈥?mirror of PROTOCOL 搂5.3. Only these decide consistency. */
 const COMPARABLE_FIELDS = new Set([
   'task_id', 'index', 'index_total', 'mode', 'cwd_rel', 'base_commit', 'base_tree',
   'pre_tree_fingerprint', 'fingerprint_algo', 'fingerprint_error', 'head_commit', 'command_hash',
@@ -1337,9 +1326,9 @@ const COMPARABLE_FIELDS = new Set([
 ]);
 
 /**
- * Optional fields — mirror of PROTOCOL §5.2. Carried, but never compared.
+ * Optional fields 鈥?mirror of PROTOCOL 搂5.2. Carried, but never compared.
  *
- * `artifacts`, `tests`, and `semantic_counts` appear in both §5.2 and §5.3; the union is what
+ * `artifacts`, `tests`, and `semantic_counts` appear in both 搂5.2 and 搂5.3; the union is what
  * matters for the drift report, so they need naming only once, and `COMPARABLE_FIELDS` already
  * names them.
  */
@@ -1351,17 +1340,33 @@ const OPTIONAL_FIELDS = new Set([
 /**
  * Every aggregate status this plugin will accept as a verdict.
  *
- * The first six are §6.3's states. `pending` and `refused` are not verdicts on consistency, but the
+ * The first six are 搂6.3's states. `pending` and `refused` are not verdicts on consistency, but the
  * Rabbit emits them for a task that has no verdict yet and for a task every machine refused, so
- * they are recognised — otherwise the one state that means "keep waiting" would be reported as an
+ * they are recognised 鈥?otherwise the one state that means "keep waiting" would be reported as an
  * unknown.
+ *
+ * `timeout`, `cancelled` and `degraded` are v0.3.0's additions, and each replaces a case that used
+ * to be reported as something less true:
+ *
+ *   timeout    previously `pending` forever, so a task nobody was ever going to answer looked
+ *              identical to one still in flight.
+ *   cancelled  previously indistinguishable from `failed`, which reports a deliberate stop as a
+ *              malfunction.
+ *   degraded   previously `partial`, which also means "machines are still out".
  */
 const AGGREGATE_STATES = new Set([
   'consistent', 'divergent', 'divergent-platform', 'partial', 'failed', 'unverifiable',
+  'timeout', 'cancelled', 'degraded',
   'pending', 'refused',
 ]);
 
-/** Aggregate statuses that are not a verdict: the task may still move. */
+/**
+ * Aggregate statuses that are not a verdict: the task may still move.
+ *
+ * `refused` is deliberately absent. It reads like "still deciding", but every machine has answered
+ * and none will run the work, so waiting cannot change it 鈥?treating it as non-terminal made
+ * `w2m_wait` poll a finished task until its window elapsed.
+ */
 const NON_TERMINAL_AGGREGATE = new Set(['pending']);
 
 /** Per-machine `outcome` values that mean the machine is still working. */
@@ -1389,7 +1394,7 @@ function aggregateOf(body) {
  *
  * `known` is false for a status outside {@link AGGREGATE_STATES}: a verdict this plugin does not
  * understand is surfaced rather than trusted. `terminal` is the question the wait loop actually
- * asks — a task with no verdict yet, or with a machine whose lease is still unexpired and has not
+ * asks 鈥?a task with no verdict yet, or with a machine whose lease is still unexpired and has not
  * reported, is not finished, and reporting it as finished would be the worst kind of quiet wrong
  * answer.
  *
@@ -1425,8 +1430,8 @@ function readAggregate(body) {
 /**
  * Build the short cross-region hints `w2m_status` returns alongside its data.
  *
- * These are the three questions §4 says an operator asks first — is the relay there, has it
- * restarted, do I have the credential it wants — answered in one place so a model does not have to
+ * These are the three questions 搂4 says an operator asks first 鈥?is the relay there, has it
+ * restarted, do I have the credential it wants 鈥?answered in one place so a model does not have to
  * compare fields itself.
  *
  * @param {object} relay The relay block built by `w2m_status`.
@@ -1439,7 +1444,7 @@ function statusNotes(relay, rtt, cfg) {
 
   if (relay.reachable === true && relay.relay_id) {
     notes.push(
-      `relay_id \`${relay.relay_id}\` has been up ${Math.round((relay.uptime_ms ?? 0) / 1000)}s — ` +
+      `relay_id \`${relay.relay_id}\` has been up ${Math.round((relay.uptime_ms ?? 0) / 1000)}s 鈥?` +
         'record this id: a different one on a later call means the relay restarted and every machine reconnected to a new process',
     );
   } else if (relay.reachable === true && relay.relay_id === null) {
@@ -1452,7 +1457,7 @@ function statusNotes(relay, rtt, cfg) {
 
   if (relay.operator_token_required === true && cfg.operatorToken === null) {
     notes.push(
-      'this relay requires an operator token for POST /v1/task and none is configured, so w2m_run will refuse before sending anything — set `operatorToken` or `W2M_OPERATOR_TOKEN`',
+      'this relay requires an operator token for POST /v1/task and none is configured, so w2m_run will refuse before sending anything 鈥?set `operatorToken` or `W2M_OPERATOR_TOKEN`',
     );
   } else if (relay.operator_token_required === false) {
     notes.push('this relay does not require an operator token (an explicit escape hatch, not the default), so an unauthenticated dispatch can succeed');
@@ -1461,7 +1466,7 @@ function statusNotes(relay, rtt, cfg) {
   if (rtt.available) {
     notes.push(`round trip to the relay: last ${rtt.last} ms, average ${rtt.avg} ms over ${rtt.samples.length} sample(s) (source: ${rtt.source})`);
   } else if (rtt.reason) {
-    notes.push(`round-trip time unavailable — ${rtt.reason}`);
+    notes.push(`round-trip time unavailable 鈥?${rtt.reason}`);
   }
 
   return notes;
@@ -1510,7 +1515,7 @@ export async function apply(ctx, config = {}) {
   };
 
   // -------------------------------------------------------------------------------------------
-  // 1. w2m_devices — read-only
+  // 1. w2m_devices 鈥?read-only
   // -------------------------------------------------------------------------------------------
   ctx.tools.register(defineTool({
     name: 'w2m_devices',
@@ -1537,7 +1542,7 @@ export async function apply(ctx, config = {}) {
         pathname: '/v1/devices',
       });
       if (!result.ok) {
-        throw new W2MError('W2M_RABBIT_REFUSED', `W2M_RABBIT_REFUSED: the Rabbit refused GET /v1/devices with HTTP ${result.status}${result.error ? ` (${result.error.code}: ${result.error.message})` : ''}; ${result.status === 401 ? 'this machine is not paired, or its device_token is stale — pair the agent again' : 'check the Rabbit log for the reason it gave'}`, {
+        throw new W2MError('W2M_RABBIT_REFUSED', `W2M_RABBIT_REFUSED: the Rabbit refused GET /v1/devices with HTTP ${result.status}${result.error ? ` (${result.error.code}: ${result.error.message})` : ''}; ${result.status === 401 ? 'this machine is not paired, or its device_token is stale 鈥?pair the agent again' : 'check the Rabbit log for the reason it gave'}`, {
           hint: result.status === 401
             ? 'this machine is not paired, or its device_token is stale; pair the agent again'
             : 'check the Rabbit log for the reason it gave',
@@ -1545,7 +1550,7 @@ export async function apply(ctx, config = {}) {
       }
 
       // `GET /v1/devices` answers `{protocol_version, rabbit_time, devices:[...]}`. Each entry is a
-      // device record — the Rabbit's own lease bookkeeping is on the task, not here — so a device
+      // device record 鈥?the Rabbit's own lease bookkeeping is on the task, not here 鈥?so a device
       // is described by identity and capabilities, and "online" is the honest default for a device
       // the Rabbit still lists.
       const machines = Array.isArray(result.json?.devices)
@@ -1584,7 +1589,7 @@ export async function apply(ctx, config = {}) {
   }));
 
   // -------------------------------------------------------------------------------------------
-  // 2. w2m_run — broadcast
+  // 2. w2m_run 鈥?broadcast
   // -------------------------------------------------------------------------------------------
   ctx.tools.register(defineTool({
     name: 'w2m_run',
@@ -1705,8 +1710,8 @@ export async function apply(ctx, config = {}) {
         );
       }
 
-      // §5: dispatching a task is the operator's privilege, not the device's. The operator token is
-      // required and there is no device-token fallback — see requireOperatorToken.
+      // 搂5: dispatching a task is the operator's privilege, not the device's. The operator token is
+      // required and there is no device-token fallback 鈥?see requireOperatorToken.
       const token = requireOperatorToken(cfg);
       const anchors = await resolveGitAnchors({ projectDir: cfg.projectDir, timeoutMs: Math.min(15_000, timeoutMs) });
 
@@ -1742,7 +1747,7 @@ export async function apply(ctx, config = {}) {
         const operatorRequired = result.error?.code === 'OPERATOR_REQUIRED' || result.status === 401;
         throw new W2MError(
           'W2M_RABBIT_REFUSED',
-          `W2M_RABBIT_REFUSED: the Rabbit refused POST /v1/task with HTTP ${result.status}${result.error ? ` (${result.error.code}: ${result.error.message})` : ''}; ${operatorRequired ? 'this relay requires the operator token to dispatch tasks and the one sent was not accepted — set `operatorToken` (or `W2M_OPERATOR_TOKEN`) to the value the relay printed at startup; a device token cannot dispatch tasks' : result.error?.code === 'NO_ONLINE_DEVICE' ? 'no machine is currently streaming — start the agent on each machine, then w2m_devices shows who is online' : 'check the Rabbit log for the reason it gave'}`,
+          `W2M_RABBIT_REFUSED: the Rabbit refused POST /v1/task with HTTP ${result.status}${result.error ? ` (${result.error.code}: ${result.error.message})` : ''}; ${operatorRequired ? 'this relay requires the operator token to dispatch tasks and the one sent was not accepted 鈥?set `operatorToken` (or `W2M_OPERATOR_TOKEN`) to the value the relay printed at startup; a device token cannot dispatch tasks' : result.error?.code === 'NO_ONLINE_DEVICE' ? 'no machine is currently streaming 鈥?start the agent on each machine, then w2m_devices shows who is online' : 'check the Rabbit log for the reason it gave'}`,
           {
             hint: operatorRequired
               ? 'set `operatorToken` (or `W2M_OPERATOR_TOKEN`) to the value the relay printed at startup, or read it from `<state>/operator-token.txt`'
@@ -1789,10 +1794,11 @@ export async function apply(ctx, config = {}) {
   ctx.tools.register(defineTool({
     name: 'w2m_wait',
     description:
-      'Wait for a task to reach a terminal state and return the six-state aggregate with a ' +
-      'per-machine summary. A non-zero exit, a refusal, and a divergence are all reported as ' +
-      'values, not as tool failures. If the wait window elapses first, says so and leaves the ' +
-      'task runnable — call again to keep waiting.',
+      'Wait for a task to reach a terminal state and return the aggregate verdict with a ' +
+      'per-machine summary. The verdicts are consistent, divergent, divergent-platform, failed, ' +
+      'partial, unverifiable, timeout, cancelled and degraded. A non-zero exit, a refusal, and a ' +
+      'divergence are all reported as values, not as tool failures. If the wait window elapses ' +
+      'first, says so and leaves the task runnable 鈥?call again to keep waiting.',
     parameters: {
       task_id: { type: 'string', required: true, description: 'Task id returned by w2m_run.' },
       wait_ms: {
@@ -1838,7 +1844,7 @@ export async function apply(ctx, config = {}) {
         if (!result.ok && !RETRYABLE_STATUS.has(result.status)) {
           throw new W2MError(
             'W2M_RABBIT_REFUSED',
-            `W2M_RABBIT_REFUSED: the Rabbit refused GET /v1/tasks/${taskId} with HTTP ${result.status}${result.error ? ` (${result.error.code}: ${result.error.message})` : ''}; ${result.error?.code === 'NOT_FOUND' ? `check the task_id returned by w2m_run — the Rabbit does not know \`${taskId}\`` : 'check the Rabbit log for the reason it gave'}`,
+            `W2M_RABBIT_REFUSED: the Rabbit refused GET /v1/tasks/${taskId} with HTTP ${result.status}${result.error ? ` (${result.error.code}: ${result.error.message})` : ''}; ${result.error?.code === 'NOT_FOUND' ? `check the task_id returned by w2m_run 鈥?the Rabbit does not know \`${taskId}\`` : 'check the Rabbit log for the reason it gave'}`,
             { hint: result.error?.code === 'NOT_FOUND' ? 'check the task_id returned by w2m_run' : 'check the Rabbit log' },
           );
         }
@@ -1860,7 +1866,7 @@ export async function apply(ctx, config = {}) {
           // Both facts matter when nothing was ever read: how far we got, and why. Reporting only
           // the first would hide a Rabbit that answered every time with a retryable error.
           const note = body === null
-            ? `no status has been read from the Rabbit yet; the task may or may not exist${lastFailure ? ` — the most recent poll did not land (${lastFailure})` : ''}`
+            ? `no status has been read from the Rabbit yet; the task may or may not exist${lastFailure ? ` 鈥?the most recent poll did not land (${lastFailure})` : ''}`
             : (lastFailure
               ? `${envelope.note}; the most recent poll did not land (${lastFailure})`
               : envelope.note);
@@ -1961,7 +1967,7 @@ export async function apply(ctx, config = {}) {
       if (!result.ok) {
         throw new W2MError(
           'W2M_RABBIT_REFUSED',
-          `W2M_RABBIT_REFUSED: the Rabbit refused GET /v1/tasks/${taskId}/report with HTTP ${result.status}${result.error ? ` (${result.error.code}: ${result.error.message})` : ''}; ${result.error?.code === 'NOT_FOUND' ? 'the task may still be running — w2m_wait first, or check the task_id returned by w2m_run' : 'check the Rabbit log for the reason it gave'}`,
+          `W2M_RABBIT_REFUSED: the Rabbit refused GET /v1/tasks/${taskId}/report with HTTP ${result.status}${result.error ? ` (${result.error.code}: ${result.error.message})` : ''}; ${result.error?.code === 'NOT_FOUND' ? 'the task may still be running 鈥?w2m_wait first, or check the task_id returned by w2m_run' : 'check the Rabbit log for the reason it gave'}`,
           { hint: result.error?.code === 'NOT_FOUND' ? 'the task may still be running; w2m_wait first' : 'check the Rabbit log' },
         );
       }
@@ -1995,7 +2001,7 @@ export async function apply(ctx, config = {}) {
   }));
 
   // -------------------------------------------------------------------------------------------
-  // 5. w2m_status — read-only, and the only tool that works without rabbitUrl
+  // 5. w2m_status 鈥?read-only, and the only tool that works without rabbitUrl
   // -------------------------------------------------------------------------------------------
   ctx.tools.register(defineTool({
     name: 'w2m_status',
@@ -2024,7 +2030,7 @@ export async function apply(ctx, config = {}) {
         http_status: null,
         protocol_version: null,
         error: null,
-        // §4 cross-region diagnostics. Null until `/healthz` answers, and individually null when a
+        // 搂4 cross-region diagnostics. Null until `/healthz` answers, and individually null when a
         // relay predates v0.1.2: a missing field is reported as missing, never invented.
         relay_id: null,
         uptime_ms: null,
@@ -2063,7 +2069,7 @@ export async function apply(ctx, config = {}) {
               typeof health.operator_token_required === 'boolean' ? health.operator_token_required : null,
             pair_rate_limit: typeof health.pair_rate_limit === 'number' ? health.pair_rate_limit : null,
             persistence: health.persistence ?? null,
-            // Which of the §4 fields this relay actually sent. A v1 relay sends none of them, and a
+            // Which of the 搂4 fields this relay actually sent. A v1 relay sends none of them, and a
             // reader should be able to tell "field absent" from "field false".
             diagnostics_present: ['relay_id', 'uptime_ms', 'base_path', 'effective_scheme', 'operator_token_required']
               .filter((key) => health[key] !== undefined && health[key] !== null),
@@ -2104,7 +2110,7 @@ export async function apply(ctx, config = {}) {
             autoStartAgent: cfg.autoStartAgent,
             allowedCommands: cfg.allowedCommands,
             pairingCode_configured: cfg.pairingCode !== null,
-            // §5: `validated` reports presence only. The plugin cannot tell a correct token from a
+            // 搂5: `validated` reports presence only. The plugin cannot tell a correct token from a
             // wrong one without spending a dispatch, and `required_by_relay` is what makes the two
             // halves of the mismatch (client has none / relay demands one) visible side by side.
             operatorToken_configured: cfg.operatorToken !== null,
@@ -2308,7 +2314,7 @@ async function startLocalStack(ctx, cfg) {
   await agent.start();
   ctx.logger?.info?.(`w2m: agent started as ${JSON.stringify(agent.identity?.() ?? null)}`);
 
-  // §8.2: when the agent runs inside this process its `rttMs` is reachable directly, so `w2m_status`
+  // 搂8.2: when the agent runs inside this process its `rttMs` is reachable directly, so `w2m_status`
   // can report it without a file. When the agent is its own process this stays null and the tool
   // says so instead of guessing.
   const statusGetter = agent.status ?? agent.state ?? null;
@@ -2320,3 +2326,5 @@ async function startLocalStack(ctx, cfg) {
     await relay.close();
   };
 }
+
+
