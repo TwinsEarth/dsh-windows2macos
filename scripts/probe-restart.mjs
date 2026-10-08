@@ -80,7 +80,6 @@ await import('node:fs').then(({ writeFileSync }) => {
 });
 git(['add', '-A'], origin);
 git(['-c', 'user.name=t', '-c', 'user.email=t@e.invalid', 'commit', '-m', 'base'], origin);
-const base = git(['rev-parse', 'HEAD'], origin);
 const dirs = [join(root, 'ma'), join(root, 'mb')];
 for (const d of dirs) git(['clone', '--quiet', '--no-hardlinks', origin, d], root);
 

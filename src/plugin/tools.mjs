@@ -1502,18 +1502,6 @@ export async function apply(ctx, config = {}) {
     render: (_args, value) => [{ type: 'text', text: value }],
   };
 
-  /** The message a caller sees when a transport-level call failed. Never a silent success. */
-  const transportError = (error, tool) => {
-    const detail = {
-      error: true,
-      tool,
-      code: error instanceof W2MError ? error.code : 'W2M_INTERNAL',
-      message: error instanceof Error ? error.message : String(error),
-      ...(error instanceof W2MError && error.hint ? { hint: error.hint } : {}),
-    };
-    throw new Error(JSON.stringify(detail, null, 2));
-  };
-
   // -------------------------------------------------------------------------------------------
   // 1. w2m_device - read-only
   // -------------------------------------------------------------------------------------------

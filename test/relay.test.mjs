@@ -40,7 +40,6 @@ import {
 } from '../src/relay/state.mjs';
 import { AGGREGATE_STATUSES, aggregate, aggregateTask, renderReportMarkdown } from '../src/relay/report.mjs';
 import { createRelayServer, normalizeBasePath, SlidingWindowRateLimiter } from '../src/relay/server.mjs';
-import { Persistence } from '../src/relay/persistence.mjs';
 
 /**
  * Issue a request signed over the EXACT bytes that go on the wire.
@@ -841,7 +840,7 @@ describe('tasks (§4)', () => {
 
   it('honours target_machines', async () => {
     await withRelay({}, async (relay) => {
-      const a = await pairDevice(relay, 'm1');
+      await pairDevice(relay, 'm1');
       await pairDevice(relay, 'm2');
       const created = await request(`${relay.url}/v1/task`, {
         method: 'POST',
@@ -855,7 +854,7 @@ describe('tasks (§4)', () => {
 
   it('split mode assigns indices modulo index_total', async () => {
     await withRelay({}, async (relay) => {
-      const a = await pairDevice(relay, 'm1');
+      await pairDevice(relay, 'm1');
       await pairDevice(relay, 'm2');
       await pairDevice(relay, 'm3');
       const created = await request(`${relay.url}/v1/task`, {
@@ -892,7 +891,7 @@ describe('tasks (§4)', () => {
 
   it('applies the §6.1 capability gate: PLATFORM_MISMATCH', async () => {
     await withRelay({}, async (relay) => {
-      const a = await pairDevice(relay, 'm1');
+      await pairDevice(relay, 'm1');
       const created = await request(`${relay.url}/v1/task`, {
         method: 'POST',
         token: OP,
@@ -929,7 +928,7 @@ describe('tasks (§4)', () => {
 
   it('answers TASK_EXISTS for a duplicate task_id', async () => {
     await withRelay({}, async (relay) => {
-      const a = await pairDevice(relay, 'm1');
+      await pairDevice(relay, 'm1');
       const body = taskBody({ task_id: '01JDUPLICATE0000000000000000' });
       const first = await request(`${relay.url}/v1/task`, { method: 'POST', token: OP, body });
       assert.equal(first.status, 200);
@@ -941,7 +940,7 @@ describe('tasks (§4)', () => {
 
   it('rejects malformed task bodies with BAD_REQUEST', async () => {
     await withRelay({}, async (relay) => {
-      const a = await pairDevice(relay, 'm1');
+      await pairDevice(relay, 'm1');
       for (const bad of [
         taskBody({ mode: 'nope' }),
         taskBody({ command_argv: [] }),
@@ -3259,7 +3258,7 @@ describe('v0.3.0 request signing (§9)', () => {
     await withRelay({
       signingSecret: SECRET, signingSecretPrevious: OLD_SECRET, requireSignature: true, pairRateLimitPerMinute: 0,
     }, async (relay) => {
-      const { token } = await pairDevice(relay, 'm1');
+      await pairDevice(relay, 'm1');
       const current = await signedFetch(`${relay.url}/v1/task`, { token: OP, body: taskBody(), signer: NEW_SIGNER() });
       assert.equal(current.status, 200, 'the new secret works');
       const previous = await signedFetch(`${relay.url}/v1/task`, { token: OP, body: taskBody(), signer: OLD_SIGNER() });
@@ -3284,7 +3283,7 @@ describe('v0.3.0 request signing (§9)', () => {
     });
 
     await withRelay({ signingSecret: SECRET, requireSignature: true, pairRateLimitPerMinute: 0 }, async (relay) => {
-      const { token } = await pairDevice(relay, 'm1');
+      await pairDevice(relay, 'm1');
       const retired = await signedFetch(`${relay.url}/v1/task`, { token: OP, body: taskBody(), signer: OLD_SIGNER() });
       assert.equal(retired.status, 401, 'once rotation is finished the old secret is dead');
       assert.equal(retired.json.error.code, 'SIGNATURE_MISMATCH');
@@ -3437,7 +3436,6 @@ describe('v0.3.0 request signing (§9)', () => {
         },
       });
       assert.equal(paired.status, 200);
-      const token = paired.json.device_token;
 
       // The client signs /v1/task, NOT /w2m/v1/task -- the same signature must work
       // whether a proxy passes the prefix through or strips it.

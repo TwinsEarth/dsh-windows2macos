@@ -2030,6 +2030,18 @@ describe('cross-network reconnection (v0.1.2 §8)', () => {
         'a clean close is still reported as a disconnect',
       );
       assert.ok(STABLE_STREAM_MS >= 500 && RECONNECT_DELAY_AFTER_STABLE_MS >= 0);
+
+      // The assertion the counter existed for. `requests` was incremented on every stream attempt
+      // and never read, so the test's own subject -- that reconnects stay *few* -- went unchecked:
+      // an implementation that backed off for the log line while also opening a connection per
+      // millisecond would have passed. Three reconnects are expected within the window the wait
+      // above allows, so anything close to the elapsed time means a hot loop regardless of the
+      // backoff messages.
+      assert.ok(
+        requests <= 12,
+        `a flapping stream must not be reconnected in a tight loop; ${requests} attempts in ` +
+          `${Date.now() - started}ms`,
+      );
     } finally {
       agent.stop();
       await running;

@@ -365,6 +365,32 @@ export function createAutoUpdater(options) {
         return { ...entry, ok: !lookupFailed };
       }
 
+      // A minimum gap between installs.
+      //
+      // Without this the only thing preventing a repeat install is the version comparison, which
+      // covers the normal case but not two real ones: a relay serving a stale `latest` while a newer
+      // version is already installed, and a retry loop that installs successfully and then fails to
+      // observe the new version (a test environment, or a profile whose manifest is rewritten by
+      // something else). Both would reinstall at every slot. Measured against the last *successful*
+      // install, so a failed attempt never delays the next try -- and it short-circuits before the
+      // network work, which is the point of having an interval at all.
+      if (state.lastInstallMs !== null && intervalDays > 0) {
+        const elapsedDays = (nowMs() - state.lastInstallMs) / 86_400_000;
+        if (elapsedDays < intervalDays) {
+          const entry = {
+            ...base,
+            outcome: 'skipped',
+            reason:
+              `installed ${elapsedDays.toFixed(3)} day(s) ago and the minimum interval is ` +
+              `${intervalDays} day(s), so nothing was checked`,
+            tag: null,
+          };
+          record(entry);
+          log(`no update: ${entry.reason}`);
+          return { ...entry, ok: true };
+        }
+      }
+
       const tag = decision.tag;
       const previous = release.tag;
 

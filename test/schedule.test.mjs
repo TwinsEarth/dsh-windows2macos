@@ -124,7 +124,6 @@ describe('zone wall-clock conversion', () => {
 });
 
 describe('next occurrence in Beijing', () => {
-  const midnight = parseTimeOfDay('00:00:00');
   const three = parseTimeOfDay('03:00:00');
 
   it('resolves the three default slots to exact UTC instants', () => {

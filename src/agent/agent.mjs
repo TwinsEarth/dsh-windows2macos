@@ -1191,9 +1191,8 @@ export function createAgent(options) {
     const result = { status: response.status, ok: response.ok, json, text };
     if (!response.ok) {
       // Remember the last refusal so diagnostics can name it (and so a 401 is
-      // distinguishable from a 500 at a glance).
-      // Recorded by the failed request that owns this field; one request at a time per agent.
-      // eslint-disable-next-line require-atomic-updates -- one request at a time
+      // distinguishable from a 500 at a glance). One request at a time per agent, so there is no
+      // concurrent writer here and no disable is needed.
       state.lastRelayError = {
         at: new Date().toISOString(),
         http_status: response.status,
@@ -1334,7 +1333,6 @@ export function createAgent(options) {
     } = context;
 
     const stdout = execution?.stdout ?? Buffer.alloc(0);
-    const stderr = execution?.stderr ?? Buffer.alloc(0);
     const normalized = normalizeOutput(stdout, comparePolicy ?? {});
 
     const envelope = {
