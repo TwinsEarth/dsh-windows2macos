@@ -6,6 +6,7 @@ English | [中文](#中文说明)
 
 [![CI](https://github.com/TwinsEarth/dsh-windows2macos/actions/workflows/ci.yml/badge.svg)](https://github.com/TwinsEarth/dsh-windows2macos/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/@twinsearth/w2m-dsh-plugin?label=npm)](https://www.npmjs.com/package/@twinsearth/w2m-dsh-plugin)
+[![Listed on dsh-plugin.org](https://dsh-plugin.org/badges/listed.svg)](https://dsh-plugin.org/plugins/twinsearth/dsh-windows2macos)
 [![DSH plugin](https://img.shields.io/badge/DSH-plugin-4c6ef5)](#install)
 [![dependencies](https://img.shields.io/badge/runtime%20dependencies-0-brightgreen)](#design-notes)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)

@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.8] — 2026-10-09
+
+### Added
+
+* **The listing badge, with the URL it actually resolves to.** The plugin is listed on
+  dsh-plugin.org as `twinsearth/dsh-windows2macos` under Workflow & Automation, marked
+  **Verified** — it was auto-discovered through the `dsh-plugin` topic and reviewed by hand
+  before this release. The badge links to that page rather than to a guessed slug.
+
+### Notes
+
+* The listing's own snapshot was stale (it still showed v0.3.8 and an install command the hub
+  derived itself), so a submission issue was filed with the hub's template —
+  [dshplugin/dsh-plugin-hub#141](https://github.com/dshplugin/dsh-plugin-hub/issues/141) — which
+  is what triggers a re-scan. Nothing about being listed had to be requested: the topic is the
+  entry point, and this repository already carried it.
+* The package is on npm as `@twinsearth/w2m-dsh-plugin` (latest 0.4.7 at the time of this
+  release). With the package now existing, npm **trusted publishing** can be configured for this
+  repository and `release.yml` — after that every future release publishes itself with provenance,
+  and no token or one-time code is involved.
+
 ## [0.4.7] — 2026-10-09
 
 ### Fixed
