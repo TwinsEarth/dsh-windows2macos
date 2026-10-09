@@ -4,6 +4,153 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-10-09
+
+The direct path becomes the default, and the P2P feature that v0.3.9 shipped but
+did not wire up finally carries the task.
+
+v0.3.9's own §8 said it plainly: the transport existed, `p2p.mode` was documented
+as defaulting to `auto`, **nothing read it**, the Localside announcer was not
+implemented, and `w2m_run` still dispatched through the relay — so a deployment
+could believe it was on a direct path while every byte crossed the relay. This
+release is that gap closed, with the same rule as before: what is not measured is
+written down as not measured.
+
+### Added
+
+* **`src/agent/p2p-node.mjs`** — the announcer and dialer v0.3.9 did not have. One
+  UDP socket per process: STUN discovery, mapping classification, candidate
+  announcement with a 60 s TTL refreshed every 20 s on an `unref()`ed timer, a
+  persistent accept loop, and `dial(machineId)` that returns a `P2PChannel` or a
+  named failure. `start()`, `announceNow()`, `dial()` and `close()` never throw:
+  a machine that cannot punch must still work over the relay.
+* **`accept()` in `src/agent/p2p.mjs`** — the responder half of `punch()`, so an
+  idle machine can receive a punch without having initiated one. `punch`,
+  `P2PChannel`, `connect` and `deriveSession` are unchanged.
+* **`src/relay/stun-server.mjs` + `bin/w2m-stun.mjs`** — an RFC 5389 Binding
+  responder, so a fleet does not depend on three third-party STUN servers being
+  reachable from every network it runs in. `XOR-MAPPED-ADDRESS`,
+  `MAPPED-ADDRESS` and `SOFTWARE`; malformed datagrams are dropped and counted;
+  `0x0111`/400 only for an unknown comprehension-required attribute.
+* **The shared server, as a default rather than an instruction.**
+  `SHARED_SERVER` in `src/agent/p2p-node.mjs`: `http://202.182.123.154:8787` for
+  the relay and `202.182.123.154:3478` as the first STUN server. An empty
+  `rabbitUrl` now means the shared server; `w2m_status` reports
+  `rabbit_source: config | env | shared-default`, so "it works" and "it works
+  because someone set it" stay distinguishable.
+* **`deploy/shared-server/`** — one command to stand up the whole rendezvous
+  host: Node, the relay, the STUN responder, an SSE-safe nginx front on :80, the
+  ufw rules, and optionally the host itself as a fleet machine. The reference
+  instance was built with it.
+* **`p2pMode` / `stunServers` configuration** on the plugin (`W2M_P2P_MODE`,
+  `W2M_STUN_SERVERS`) and `--p2p-mode` / `--stun-servers` on the Localside CLI.
+  Both are validated loudly at load: an unknown mode is a startup error naming
+  the setting, not a silent fallback to `auto`.
+* **`transport` and `p2p` on every result**, plus a trailing `路径` column in the
+  markdown report: which path the offer took (`offer_path`), which path the result
+  took (`result_path`), the punch RTT, the peer address, and a named `reason` when
+  the direct path was not used.
+* **`PROTOCOL-v0.4.0.md`**, `deploy/systemd/w2m-stun.service`, and four new test
+  suites (`p2p-node`, `p2p-transport-fields`, `p2p-plugin`, `p2p-agent`) plus
+  `stun-server`.
+
+### Changed
+
+* **The direct path is the default connection method between machines.**
+  `p2pMode: auto` is now real behaviour: the dispatching machine announces,
+  punches to each target, and pushes the offer over the punched channel. The relay
+  **holds its own copy of that offer back for `p2pOfferGraceMs` (1200 ms)** and
+  offers it anyway if the punch does not land — without that hold the direct path
+  could never win, because an SSE push over an already-open connection beats a
+  punch that costs a round trip. Measured on loopback while writing it: the relay
+  copy won every time. The hold is cancelled by the executor's own lease
+  heartbeat, so no new message was needed to say "the direct copy arrived".
+* **The result notice travels back over the same channel, and the payload does
+  not.** `{type:'task.result', task_id, machine_id}` is acknowledged with
+  `result.ack`; the envelope is not on that frame, because `result_path` is one of
+  the envelope's fields and `envelope_sha256` covers it, so the acknowledgement has
+  to be known before the envelope is built. The direct path saves the dispatcher the
+  wait for the relay's copy, **not the bytes** — stated here because "the payload
+  path is direct" would otherwise be read as more than it is. A task's channel is
+  released 30 s after its attempt (`p2pChannelLingerMs`), so duplicates of a
+  finished attempt are still answerable and sessions do not accumulate.
+* **`w2m_run` now dispatches with intent**: `origin_machine_id` and `p2p: {mode}`
+  travel in `POST /v1/task`, so the executor knows who might dial it and the relay
+  records how the task was meant to travel.
+* **`w2m_wait` and `w2m_status` surface the path** — per machine in `w2m_wait`,
+  and as a `p2p` block (mode, mapping, reflexive address, announcements, punches
+  in/out, direct-result inbox depth) in `w2m_status`.
+* **`scripts/verify.ps1` / `verify.sh` pass `--test-force-exit`** and run the five
+  new suites. They previously ran every suite without it, which can hang a green
+  end-to-end suite on an open SSE stream — a local verification that hangs is
+  indistinguishable from one that never finished.
+* **`release.yml` / `ci.yml` carry the new suites** in the explicit lists, and the
+  duplicated `recovery.test.mjs` entry in both e2e lines is gone.
+
+### Fixed
+
+* **A STUN response's attribute padding.** The responder's first draft omitted the
+  mandatory 4-byte padding after a 15-byte `ERROR-CODE` value, so every `0x0111`
+  response was one byte short with a declared length of 39 instead of 40. The
+  existing client decoder did not notice and neither did a hand-written hex
+  expectation — both were written from the same wrong assumption. It was caught by
+  a vector built numerically from the RFC layout, and it is invisible on the
+  success path because all three success attributes are already multiples of four.
+  The regression is pinned by an explicit length assertion plus a whole-buffer
+  comparison.
+* **The allow-list trap that hid a suite failure.** A string entry in
+  `--allowed-commands` is split on whitespace, so a single path containing a space
+  (`C:\Program Files\nodejs\node.exe`) can never match and has to be written as an
+  array entry. This is why `test/pipeline-e2e.test.mjs` passes on CI runners and
+  can fail locally on a Windows box whose Node lives under `Program Files`; it is
+  now documented in `docs/TROUBLESHOOTING.md` §10 rather than left to be
+  rediscovered.
+
+### Compatibility
+
+* **Protocol version stays 1.** Everything here is additive: two optional task
+  fields, two optional result fields, three new files, one new CLI. A v0.3.9
+  agent against a v0.4.0 relay and the reverse both keep working, and a v0.3.9
+  result envelope with no `transport` still compares exactly as it did.
+* **`transport`/`p2p` are deliberately NOT comparable fields.** A path is not a
+  result: two machines that ran identical bytes and differ only in how the offer
+  reached them stay `consistent`. A test asserts exactly that, because the
+  opposite would turn a network difference into a false bug report.
+* **A p2p-mode difference is not silent.** Both sides validate the mode at load;
+  the relay refuses an unknown `p2p.mode` in a task body with `BAD_REQUEST` naming
+  the field, and creates no task.
+
+### Verification
+
+* Every claim in this entry has a suite behind it. Run them with
+  `scripts/verify.ps1` (Windows) or `scripts/verify.sh` (macOS/Linux), which now
+  include the five new suites.
+* **What is measured across a real network, and what is not.** One WAN hop was
+  exercised end to end: the dispatcher on a Chinese residential network behind a
+  **symmetric** NAT, the executor on the shared server in Tokyo. Measured, with
+  numbers rather than adjectives:
+  * the client network is `endpoint-dependent` — three STUN servers reported three
+    different mapped ports for one socket (36028, 5855, 26713), punchable: false —
+    so nothing can dial *into* it;
+  * a punch it **initiates** to a public peer still lands: `HELLO` → `HELLO_ACK` in
+    **331.61 ms**, over a channel the punched path opened, and the ledger for that
+    machine records `transport: "p2p"` with `result_path: "p2p"`;
+  * a machine that has to *accept* a punch needs its UDP port reachable. On the
+    shared server that meant one `ufw` rule for the agent's punch port, and the port
+    is ephemeral today — a fixed `--p2p-port` is the obvious follow-up, and the
+    absence of it is why this is a documented step rather than a one-liner.
+* **Still unverified, and named as such:** a punch between two hosts behind two
+  *different* NATs (the second network that would make it possible was not
+  available), punching through a cone NAT, the direct path under real packet loss
+  or reordering, IPv6 (not implemented in the transport; the responder's IPv6
+  branch is unexercised), and the authenticity of the UDP channel itself — a
+  direct path is not more trustworthy than the relay, and `PROTOCOL-v0.4.0.md` §9
+  says so rather than implying otherwise.
+* A loopback punch is not evidence of NAT traversal, and neither the tests nor
+  this entry claim it is. The WAN measurement is one hop with one NAT, and it is
+  labelled as one hop with one NAT.
+
+
 ## [0.3.9] — 2026-10-09
 
 P2P hole punching, so the payload path no longer has to cross the relay.

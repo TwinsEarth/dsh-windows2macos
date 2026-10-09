@@ -1,0 +1,69 @@
+# ============================================================================
+#  w2m-stun.service  --  systemd unit for the W2M STUN responder
+# ============================================================================
+#
+#  This file is a TEMPLATE. Replace the @PLACEHOLDERS@ before installing.
+#
+#  Install (Linux server, systemd):
+#      sudo install -m 0644 deploy/systemd/w2m-stun.service \
+#           /etc/systemd/system/w2m-stun.service
+#      sudo systemctl daemon-reload
+#      sudo systemctl enable --now w2m-stun
+#      journalctl -u w2m-stun -f
+#
+#  Anything that has to reach it needs UDP :3478 open -- `ufw allow 3478/udp`.
+#  There is nothing to open for TCP: STUN is UDP only in this implementation.
+#
+#  ---------------------------------------------------------------------------
+#  WHAT THIS UNIT DELIBERATELY DOES
+#  ---------------------------------------------------------------------------
+#  * Binds 0.0.0.0. A STUN server that only listened on loopback would discover
+#    nothing: the whole answer it gives is "the address and port the NAT gave
+#    you", which is only meaningful when the query arrives from outside.
+#  * Holds no state and writes nothing. It is the one W2M service that can be
+#    restarted at any time without a single client noticing anything except a
+#    lost query, so it gets no StateDirectory and no writable path at all.
+#  * Runs as the same unprivileged `w2m` user as the relay, because 3478 is
+#    above 1024 and no capability is needed.
+#  * Restarts on failure but not in a tight loop (RestartSec + StartLimit*).
+#
+#  NOT verified: `systemd-analyze verify` was not run (systemd is unavailable on
+#  the authoring machine). The unit that shipped is the one in this repository's
+#  own deployment script, and docs/DEPLOY.md names the command to check it.
+# ============================================================================
+
+[Unit]
+Description=W2M STUN responder - reflexive address discovery for P2P hole punching
+Documentation=https://github.com/TwinsEarth/dsh-windows2macos/blob/main/docs/DEPLOY.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=w2m
+Group=w2m
+
+# --- the listener ----------------------------------------------------------
+# 3478 is the IANA-registered STUN port. Machines are pointed at it by
+# `stunServers`, whose default already lists the shared server first.
+ExecStart=/usr/local/bin/node /opt/w2m/app/bin/w2m-stun.mjs --host 0.0.0.0 --port 3478 --log-level info
+
+Restart=always
+RestartSec=2
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# --- hardening -------------------------------------------------------------
+# No filesystem access is needed at all: no state, no log file (journal only).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+
+[Install]
+WantedBy=multi-user.target

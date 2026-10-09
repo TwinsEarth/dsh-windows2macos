@@ -467,6 +467,126 @@ export class P2PChannel extends EventEmitter {
 }
 
 /**
+ * The responder's half of a punch: wait for a HELLO, answer it, hand back a channel.
+ *
+ * This is the mirror of {@link punch}, and it exists because the two ends of a punch do
+ * genuinely different things. The initiator knows the session and every candidate and
+ * has to keep sending; the responder knows nothing, waits, and learns both the session
+ * and the address from the HELLO that reaches it. That asymmetry is what lets a peer be
+ * dialled without any prior arrangement — and it is why adoption (`allowSessionAdoption`)
+ * exists in `punch()`: a responder that invented its own id would discard the very
+ * datagram it is waiting for.
+ *
+ * Two decisions worth stating:
+ *
+ *   * **A claimed session is re-acknowledged, never adopted.** When the HELLO's session
+ *     already has a live channel, the answer is another HELLO_ACK and no second channel:
+ *     the initiator retransmits HELLOs while punching, so a lost ACK has to be
+ *     answerable again, but two channels on one session would each assemble and deliver
+ *     every payload and the peer would see each message twice. The caller owns that
+ *     `claimed` set, because a claim has to outlive one call to this function.
+ *   * **`rttMs` is `null`.** The responder never sent anything before the HELLO arrived,
+ *     so there is no round trip to measure. Reporting the time spent waiting as an RTT
+ *     would be a fabricated number in a field named for a measurement.
+ *
+ * @param {object} options
+ * @param {import('node:dgram').Socket} options.socket Already bound; the same socket the
+ *        punch was aimed at, and the same one a channel will use.
+ * @param {number} [options.timeoutMs] How long to wait before giving up.
+ * @param {Set<number>|Map<number, unknown>} [options.claimed] Sessions that already have
+ *        a live channel. Read, never written.
+ * @param {number} [options.intervalMs] Floor between re-acknowledgements of the same
+ *        claimed session within one call, so a peer that sprays HELLOs cannot make the
+ *        responder answer every single one. The default matches `punch()`'s send
+ *        interval, so a retransmission is always answered; `0` disables the floor.
+ * @returns {Promise<{ok:boolean, channel:P2PChannel|null, peer:{address:string,port:number}|null,
+ *                    session:number, rttMs:number|null, error:string|null}>}
+ */
+export async function accept(options) {
+  const { socket } = options;
+  if (!socket) throw new TypeError('accept: a bound UDP socket is required');
+
+  const timeoutMs = options.timeoutMs ?? 5000;
+  const intervalMs = options.intervalMs ?? 250;
+  const claimed = options.claimed ?? null;
+
+  return new Promise((resolve) => {
+    let settled = false;
+    /** session -> last re-ack timestamp, so the floor is per session, not per socket. */
+    const reackedAt = new Map();
+
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.removeListener('message', onMessage);
+      socket.removeListener('close', onSocketClose);
+      resolve(result);
+    };
+
+    const timer = setTimeout(() => {
+      finish({
+        ok: false,
+        channel: null,
+        peer: null,
+        session: 0,
+        rttMs: null,
+        error: `P2P_ACCEPT_TIMEOUT: no HELLO within ${timeoutMs}ms`,
+      });
+    }, timeoutMs);
+
+    // A wait on a socket that goes away must end now, not at the end of the timeout:
+    // this is what makes a node's `close()` a barrier instead of a five-second stall.
+    const onSocketClose = () => {
+      finish({
+        ok: false,
+        channel: null,
+        peer: null,
+        session: 0,
+        rttMs: null,
+        error: 'P2P_SOCKET_CLOSED: the socket went away while waiting for a HELLO',
+      });
+    };
+
+    const onMessage = (datagram, rinfo) => {
+      const parsed = parseFrame(datagram);
+      // Only a HELLO is this function's business. DATA/ACK/PING/PONG belong to whichever
+      // channels are already listening; a second consumer of them would be a second
+      // delivery, which is the bug the `claimed` set exists to prevent.
+      if (!parsed || parsed.kind !== KIND.HELLO) return;
+      const session = parsed.session;
+
+      if (claimed !== null && claimed.has(session)) {
+        const now = Date.now();
+        const last = reackedAt.get(session) ?? Number.NEGATIVE_INFINITY;
+        if (now - last >= intervalMs) {
+          reackedAt.set(session, now);
+          socket.send(frame(KIND.HELLO_ACK, session), rinfo.port, rinfo.address, () => {});
+        }
+        return;
+      }
+
+      socket.send(frame(KIND.HELLO_ACK, session), rinfo.port, rinfo.address, () => {});
+      finish({
+        ok: true,
+        channel: new P2PChannel({
+          socket,
+          peer: { address: rinfo.address, port: rinfo.port },
+          session,
+        }),
+        peer: { address: rinfo.address, port: rinfo.port },
+        session,
+        rttMs: null,
+        error: null,
+      });
+    };
+
+    socket.on('message', onMessage);
+    socket.once('close', onSocketClose);
+  });
+}
+
+/**
  * Punch, then return a reliable channel on the opened path.
  *
  * @param {object} options Same as {@link punch}, plus `tuning` for the channel.

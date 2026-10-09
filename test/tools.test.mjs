@@ -23,6 +23,7 @@ import path from 'node:path';
 import { after, describe, it } from 'node:test';
 
 import * as plugin from '../src/plugin/tools.mjs';
+import { SHARED_SERVER } from '../src/agent/p2p-node.mjs';
 
 const RABBIT = 'http://127.0.0.1:8787';
 
@@ -89,7 +90,13 @@ function makeCtx() {
  */
 async function register(config = {}) {
   const { ctx, tools, warnings } = makeCtx();
-  await plugin.apply(ctx, config);
+  // v0.4.0: the direct path is on by default, and a node that starts fires an unawaited
+  // `POST /v1/peer/announce` through the same `request()` helper every other call uses. In a suite
+  // whose subject is *the exact HTTP call list*, that extra call lands in whichever `installFetch`
+  // stub is live and shifts `calls[0]`. This suite therefore pins `p2pMode: 'relay'` — the mode that
+  // binds no socket and makes no announcement — unless a test asks for something else. The direct
+  // path itself is covered against real sockets in `test/p2p-plugin.test.mjs`.
+  await plugin.apply(ctx, { p2pMode: 'relay', ...config });
   return { tools, warnings };
 }
 
@@ -440,40 +447,56 @@ describe('registration shape', () => {
 // ---------------------------------------------------------------------------------------------
 
 describe('missing configuration', () => {
-  it('refuses every Rabbit tool with the setting named, and does not claim success', async () => {
-    const { tools } = await register({ stateDir: await makeStateDir(PAIRED_DEVICE) });
-    const cases = [
-      ['w2m_devices', {}],
-      ['w2m_run', runArgs()],
-      ['w2m_wait', { task_id: '01J' }],
-      ['w2m_report', { task_id: '01J' }],
-    ];
-    for (const [name, args] of cases) {
-      await assert.rejects(
-        () => tools.get(name).execute(args, {}),
-        (error) => {
-          assert.match(error.message, /rabbitUrl/, `${name} must name the missing setting`);
-          assert.match(error.message, /W2M_CONFIG/, `${name} must carry a typed code`);
-          return true;
-        },
-        `${name} must fail closed without rabbitUrl`,
+  it('refuses to load at all when rabbitUrl is unusable, naming the setting', async () => {
+    // v0.4.0: an *unset* rabbitUrl is the shared server, not an error (see the test below). What
+    // must still fail closed is a configured value that cannot be used, and it must fail at load
+    // rather than on the first dispatch.
+    const stateDir = await makeStateDir(PAIRED_DEVICE);
+    await assert.rejects(
+      () => register({ rabbitUrl: 'ftp://relay.example', stateDir }),
+      (error) => {
+        assert.match(error.message, /rabbitUrl/, 'the message must name the setting');
+        assert.match(error.message, /W2M_CONFIG/, 'the message must carry a typed code');
+        return true;
+      },
+    );
+  });
+
+  it('an unset rabbitUrl is the shared server, and the tools really dial it', async () => {
+    const fetchStub = installFetch([
+      { method: 'GET', path: '/v1/devices', body: { protocol_version: 1, devices: [] } },
+    ]);
+    try {
+      // No rabbitUrl anywhere: v0.4.0 resolves to SHARED_SERVER.rabbitUrl, so the call must go
+      // there rather than throwing the way v0.3.9 did.
+      const { tools } = await register({ stateDir: await makeStateDir(PAIRED_DEVICE) });
+      await tools.get('w2m_devices').execute({}, {});
+      const deviceCall = fetchStub.calls.find((call) => call.path === '/v1/devices');
+      assert.ok(deviceCall, 'w2m_devices must have called the relay');
+      assert.ok(
+        deviceCall.url.startsWith(SHARED_SERVER.rabbitUrl),
+        `expected the shared server ${SHARED_SERVER.rabbitUrl}, got ${deviceCall.url}`,
       );
+    } finally {
+      fetchStub.restore();
     }
   });
 
-  it('still answers w2m_status with no URL anywhere, saying nothing was probed', async () => {
-    const fetchStub = installFetch([]);
+  it('still answers w2m_status with nothing configured, and says the endpoint was not chosen', async () => {
+    const fetchStub = installFetch([
+      { path: '/healthz', body: { ok: true, protocol_version: 1 } },
+    ]);
     try {
-      // No paired device either, so there is genuinely no URL to probe — the case this test is
-      // named for. A paired device.json carries its own rabbit_url, and probing that is the
-      // fallback `w2m_status falls back to device.json rabbit_url` covers.
+      // v0.3.9 asserted "nothing was probed" here. v0.4.0 probes the shared server instead — which
+      // is a deliberate behaviour change, so what this test pins is the *provenance*: the address
+      // came from nobody, and the status says so rather than looking like a configured fleet.
       const { tools } = await register({ stateDir: await makeStateDir(null) });
       const value = JSON.parse(await tools.get('w2m_status').execute({}, {}));
       assert.equal(value.ok, true);
-      assert.equal(value.relay.configured_url, null);
-      assert.equal(value.relay.reachable, null);
-      assert.equal(value.relay.probed_url, null);
-      assert.equal(fetchStub.calls.length, 0, 'nothing should be probed when no URL is configured');
+      assert.equal(value.relay.configured_url, SHARED_SERVER.rabbitUrl);
+      assert.equal(value.relay.probed_url, SHARED_SERVER.rabbitUrl);
+      assert.equal(value.rabbit_source, 'shared-default');
+      assert.match(value.notes.join(' '), /shared W2M server/);
     } finally {
       fetchStub.restore();
     }
@@ -1237,16 +1260,20 @@ describe('happy paths', () => {
     }
   });
 
-  it('w2m_status falls back to device.json rabbit_url when rabbitUrl is unset', async () => {
+  it('w2m_status prefers the shared default over a device.json rabbit_url, and says which it dropped', async () => {
     const dir = await makeStateDir(PAIRED_DEVICE);
     const fetchStub = installFetch([{ path: '/healthz', body: { ok: true, protocol_version: 1 } }]);
     try {
       const nonRepo = await makeNonRepoDir();
       const { tools } = await register({ stateDir: dir, projectDir: nonRepo });
       const value = JSON.parse(await tools.get('w2m_status').execute({}, {}));
-      assert.equal(value.relay.probed_url, RABBIT);
-      assert.equal(value.relay.configured_url, null);
-      assert.equal(value.relay.reachable, true);
+      // v0.3.9 probed device.json's rabbit_url here. v0.4.0 makes the precedence explicit —
+      // config > env > shared default — so a stale address in device.json can no longer silently
+      // win, and the status names the override it ignored instead of hiding it.
+      assert.equal(value.relay.probed_url, SHARED_SERVER.rabbitUrl);
+      assert.equal(value.relay.configured_url, SHARED_SERVER.rabbitUrl);
+      assert.equal(value.rabbit_source, 'shared-default');
+      assert.equal(value.config.rabbit_url_override_ignored, 'device.rabbit_url');
     } finally {
       fetchStub.restore();
     }

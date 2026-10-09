@@ -27,7 +27,8 @@
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { createServer } from 'node:net';
+import { createSocket } from 'node:dgram';
+import { connect, createServer } from 'node:net';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -51,8 +52,7 @@ after(() => {
 });
 
 /** Allocate a free port by binding and immediately releasing it. */
-function freePort() {
-  return new Promise((resolve, reject) => {
+function freePort() {  return new Promise((resolve, reject) => {
     const srv = createServer();
     srv.on('error', reject);
     srv.listen(0, '127.0.0.1', () => {
@@ -63,8 +63,7 @@ function freePort() {
 }
 
 /**
- * Start the relay CLI and wait for its listening line.
- *
+ * Start the relay CLI and wait for its listening line. *
  * @param {object} opts - Launch options.
  * @param {string} opts.stateDir - Relay state directory.
  * @param {number} [opts.port] - Port; 0 lets the OS choose.
@@ -132,7 +131,7 @@ async function startRelay({ stateDir, port = 0, extraArgs = [] }) {
  * @param {string} opts.stateDir - Agent state directory.
  * @param {string} opts.dshHome - Isolated `DSH_HOME` for this agent.
  */
-async function startAgent({ rabbitUrl, pairingCode, project, stateDir, dshHome }) {
+async function startAgent({ rabbitUrl, pairingCode, project, stateDir, dshHome, extraArgs = [] }) {
   const proc = spawn(
     NODE,
     [
@@ -142,6 +141,7 @@ async function startAgent({ rabbitUrl, pairingCode, project, stateDir, dshHome }
       '--project', project,
       '--state', stateDir,
       '--name', 'outbound-check',
+      ...extraArgs,
     ],
     {
       cwd: REPO,
@@ -184,6 +184,58 @@ async function startAgent({ rabbitUrl, pairingCode, project, stateDir, dshHome }
     tick();
   });
   return { proc, stdout: () => out, stderr: () => err };
+}
+
+/** Poll an agent's output for a line matching `pattern`, and return that line. */
+async function waitForLog(agent, pattern, timeoutMs = 20_000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const line = `${agent.stdout()}${agent.stderr()}`
+      .split('\n')
+      .find((candidate) => pattern.test(candidate));
+    if (line) return line;
+    if (Date.now() > deadline) {
+      throw new Error(`no log line matched ${pattern}: ${`${agent.stdout()}${agent.stderr()}`.slice(0, 600)}`);
+    }
+    await new Promise((resolve) => {
+      setTimeout(resolve, 100);
+    });
+  }
+}
+
+/** Resolve when a TCP connection is accepted, reject when it is refused. */
+function connectTcp(port) {
+  return new Promise((resolve, reject) => {
+    const socket = connect({ host: '127.0.0.1', port });
+    socket.setTimeout(2_000);
+    socket.once('connect', () => {
+      socket.destroy();
+      resolve('accepted');
+    });
+    socket.once('timeout', () => {
+      socket.destroy();
+      reject(new Error(`TCP ${port} neither accepted nor refused`));
+    });
+    socket.once('error', (error) => {
+      socket.destroy();
+      reject(error);
+    });
+  });
+}
+
+/** Send one datagram to a port and resolve once it is on the wire. */
+function sendUdp(port, payload) {
+  return new Promise((resolve, reject) => {
+    const socket = createSocket('udp4');
+    socket.once('error', (error) => {
+      socket.close();
+      reject(error);
+    });
+    socket.send(payload, port, '127.0.0.1', () => {
+      socket.close();
+      resolve();
+    });
+  });
 }
 
 describe('the link is outbound-only', () => {
@@ -276,8 +328,79 @@ describe('the link is outbound-only', () => {
     agent.proc.kill('SIGKILL');
   });
 
-  it('the relay binds only the loopback address it was given', async () => {
-    const stateDir = mkdtempSync(join(tmpdir(), 'w2m-oo-relay2-'));
+  it("the default mode binds one UDP port for the punch, and 'relay' mode binds none", async () => {
+    // v0.4.0's headline behaviour is a direct path, and a direct path needs a bound UDP socket -- so
+    // the claim this file exists for ("one listening socket, and it is the relay's") has to be
+    // restated rather than quietly dropped. What must stay true:
+    //
+    //   * the punch adds exactly ONE socket, and it is UDP: the same socket STUN measured, or the
+    //     mapping a peer was told about is not the mapping its datagrams arrive on;
+    //   * nothing accepts TCP on it -- a TCP listener would be a new inbound surface with none of the
+    //     session-id filtering the channel does;
+    //   * a datagram from a stranger does not take the agent down, because anyone can send one;
+    //   * `--p2p-mode relay` binds no socket at all, which is what makes the direct path opt-out-able
+    //     and keeps the v0.3.9 property available.
+    const stateDir = mkdtempSync(join(tmpdir(), 'w2m-oo-relay3-'));
+    const autoState = mkdtempSync(join(tmpdir(), 'w2m-oo-auto-'));
+    const relayStateDir = mkdtempSync(join(tmpdir(), 'w2m-oo-relaymode-'));
+    const project = mkdtempSync(join(tmpdir(), 'w2m-oo-proj3-'));
+    const autoHome = mkdtempSync(join(tmpdir(), 'w2m-oo-home3a-'));
+    const relayHome = mkdtempSync(join(tmpdir(), 'w2m-oo-home3b-'));
+    scratch.push(stateDir, autoState, relayStateDir, project, autoHome, relayHome);
+
+    const relay = await startRelay({ stateDir });
+
+    const autoAgent = await startAgent({
+      rabbitUrl: relay.url,
+      pairingCode: relay.info.pairingCode,
+      project,
+      stateDir: autoState,
+      dshHome: autoHome,
+      extraArgs: ['--p2p-mode', 'auto'],
+    });
+    const nodeLine = await waitForLog(autoAgent, /p2p: auto node on 0\.0\.0\.0:\d+/);
+    const port = Number(nodeLine.match(/:(\d+)/)[1]);
+    assert.ok(port > 0, `the node must report the port it bound: ${nodeLine}`);
+    const bindCount = (`${autoAgent.stdout()}${autoAgent.stderr()}`.match(/p2p: auto node on/g) ?? []).length;
+    assert.equal(bindCount, 1, 'exactly one punch socket, shared by discovery and the punch');
+
+    await assert.rejects(
+      connectTcp(port),
+      'nothing may accept TCP on the punch port: the punch socket is UDP and carries no TCP listener',
+    );
+    await sendUdp(port, Buffer.from([0, 1, 2, 3]));
+    await new Promise((resolve) => {
+      setTimeout(resolve, 300);
+    });
+    assert.equal(autoAgent.proc.exitCode, null, 'a malformed datagram must not kill the agent');
+    autoAgent.proc.kill('SIGKILL');
+
+    // A second relay for the second agent: a pairing code is single-use and rotates after every
+    // successful pairing, and reaching for the rotated code would make this test depend on the CLI's
+    // banner format. A fresh relay is cheaper to read and impossible to misread.
+    const relayModeRelay = await startRelay({ stateDir: relayStateDir });
+    const relayModeAgent = await startAgent({
+      rabbitUrl: relayModeRelay.url,
+      pairingCode: relayModeRelay.info.pairingCode,
+      project,
+      stateDir: relayStateDir,
+      dshHome: relayHome,
+      extraArgs: ['--p2p-mode', 'relay'],
+    });
+    await new Promise((resolve) => {
+      setTimeout(resolve, 1_500);
+    });
+    const relayModeOut = `${relayModeAgent.stdout()}${relayModeAgent.stderr()}`;
+    assert.equal(
+      /p2p: (auto|direct) node on/.test(relayModeOut),
+      false,
+      `relay mode must bind no socket at all: ${relayModeOut.slice(0, 400)}`,
+    );
+    assert.equal(relayModeAgent.proc.exitCode, null, 'relay mode must stay up without a node');
+    relayModeAgent.proc.kill('SIGKILL');
+  });
+
+  it('the relay binds only the loopback address it was given', async () => {    const stateDir = mkdtempSync(join(tmpdir(), 'w2m-oo-relay2-'));
     scratch.push(stateDir);
     const port = await freePort();
     const relay = await startRelay({ stateDir, port });

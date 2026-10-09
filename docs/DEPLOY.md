@@ -13,21 +13,22 @@
 
 ---
 
-## 0. The three shapes at a glance
+## 0. The four shapes at a glance
 
-| | A. Tailscale / WireGuard | B. Public VPS + domain + TLS | C. Tunnel (Cloudflare / ngrok) |
-|---|---|---|---|
-| **TLS terminated by** | the network (WireGuard) | the relay (`--tls-cert`) **or** a proxy | the tunnel service |
-| **Relay listens on** | the tailnet address, e.g. `100.x.y.z:8787` | `127.0.0.1:8787` (proxy) or `0.0.0.0:8443` (self-TLS) | `127.0.0.1:8787` |
-| **Client `rabbitUrl`** | `http://100.x.y.z:8787` | `https://w2m.<your-domain>` | `https://<random>.example.com` or `https://<host>/w2m` |
-| **Plaintext HTTP on the wire?** | **yes, and that is correct** — see §2.3 | no | no |
-| **Certificate to manage** | none | yes (Let's Encrypt or self-signed) | none (the tunnel service has one) |
-| **Firewall opens** | nothing (tailnet only) | 443 only | nothing inbound |
-| **Best for** | machines you own, private mesh | a stable public endpoint you control | quick access, no public IP, no DNS |
-| **Main risk** | none added — but you must not bind `0.0.0.0` by mistake | a public hostname, so pairing/rate limits are your only fence | free tiers reconnect and rotate hostnames |
+| | **0. The shared server** (v0.4.0 default) | A. Tailscale / WireGuard | B. Public VPS + domain + TLS | C. Tunnel (Cloudflare / ngrok) |
+|---|---|---|---|---|
+| **TLS terminated by** | nothing — plaintext, stated up front | the network (WireGuard) | the relay (`--tls-cert`) **or** a proxy | the tunnel service |
+| **Relay listens on** | `0.0.0.0:8787`, plus `:80` through nginx | the tailnet address, e.g. `100.x.y.z:8787` | `127.0.0.1:8787` (proxy) or `0.0.0.0:8443` (self-TLS) | `127.0.0.1:8787` |
+| **Client `rabbitUrl`** | `http://202.182.123.154:8787` (already the default) | `http://100.x.y.z:8787` | `https://w2m.<your-domain>` | `https://<random>.example.com` or `https://<host>/w2m` |
+| **Plaintext HTTP on the wire?** | **yes** — see §10 | **yes, and that is correct** — see §2.3 | no | no |
+| **Certificate to manage** | none (and none to leak) | none | yes (Let's Encrypt or self-signed) | none (the tunnel service has one) |
+| **Firewall opens** | 8787/tcp, 3478/udp (+80 for the proxy) | nothing (tailnet only) | 443 only | nothing inbound |
+| **Best for** | getting two machines talking today, and as a fallback rendezvous | machines you own, private mesh | a stable public endpoint you control | quick access, no public IP, no DNS |
+| **Main risk** | tokens and results are readable on the path; the allow-list is the load-bearing control | none added — but you must not bind `0.0.0.0` by mistake | a public hostname, so pairing/rate limits are your only fence | free tiers reconnect and rotate hostnames |
 
-**All three need the same client-side step**: pair each machine with a pairing
-code, then point it at the relay with `--rabbit`.
+**All four need the same client-side step**: pair each machine with a pairing
+code, then point it at the relay with `--rabbit` (or leave `rabbitUrl` empty for
+shape 0).
 
 ---
 
@@ -38,9 +39,11 @@ that must take part, and where it can stay up:
 
 | Situation | Recommended shape |
 |---|---|
+| You have neither a mesh nor a VPS, and want it working now | **0** — the shared server is already running, and it is the default |
 | All machines can join a private mesh (Tailscale/WireGuard) | **A** — least moving parts, no certificates |
 | You have a VPS and a domain | **B** |
-| You have neither, and want it working in ten minutes | **C** |
+| You have a public host but no domain | **0 with your own host** — `deploy/shared-server/install.sh` |
+| You have neither, and want a throwaway | **C** |
 
 Whichever you pick, three things stay true:
 
@@ -828,6 +831,72 @@ repository — pass it through an environment variable as above.
 
 ## 9. Where to go next
 
-- `TROUBLESHOOTING.md` — cross-region symptoms, causes and fixes.
-- `PROTOCOL-v0.1.2.md` — the wire contract this document implements.
-- `README.md` — what W2M is and how the five tools are used.
+- `TROUBLESHOOTING.md` — cross-region symptoms, causes and fixes (including the
+  P2P fallback reasons and the allow-list trap, §9 and §10 there).
+- `PROTOCOL-v0.4.0.md` — the current wire additions: path selection, the shared
+  server's constants, the announce/punch/offer flow and the `transport` fields.
+- `PROTOCOL-v0.1.2.md` — the wire contract shape B and C were written against.
+- `README.md` — what W2M is and how the eight tools are used.
+
+---
+
+## 10. Shape 0 — the shared server
+
+v0.4.0 ships a default rendezvous so that "install it and try it" does not begin
+with provisioning a host. With an empty `rabbitUrl` the plugin and the agent use:
+
+| Constant | Value |
+|---|---|
+| `SHARED_SERVER.rabbitUrl` | `http://202.182.123.154:8787` |
+| `SHARED_SERVER.stun` | `202.182.123.154:3478` (first entry of the default STUN list) |
+
+Precedence: `rabbitUrl` in the profile patch → `W2M_RABBIT_URL` → the shared
+default. `w2m_status` reports which one was used (`rabbit_source`).
+
+**What is running there.** The relay (`:8787`, and `:80` through nginx), an
+RFC 5389 STUN responder (`:3478/udp`), and — for this project's own verification —
+a Localside agent, so the host is also a machine in the fleet. `deploy/shared-server/`
+builds exactly this on a fresh host:
+
+```bash
+scp twinsearth-w2m-dsh-plugin-0.4.0.tgz root@<host>:/tmp/w2m-pkg.tgz
+scp deploy/shared-server/install.sh      root@<host>:/tmp/
+ssh root@<host> 'bash /tmp/install.sh /tmp/w2m-pkg.tgz [PAIR-XXXXXXXX]'
+```
+
+**TLS: there is none, and this document will not pretend otherwise.** Without a
+hostname there is nothing to issue a certificate for. Pairing codes, device
+tokens, the operator token and every result cross the wire in clear text. What
+limits the damage:
+
+* the payload path is the direct one when the network allows it, so the relay sees
+  the ledger rather than the traffic (`transport` says which happened);
+* the relay holds no project code and no model credentials — it can forge tasks,
+  and the machine-side allow-list is the load-bearing control;
+* the operator token is a bearer credential: treat it as compromised if the path is
+  hostile, and rotate it by deleting `operator-token.txt` and restarting the relay.
+
+To add TLS, point a subdomain at the host, issue a certificate (the nginx block the
+installer writes already serves `/` on :80 for the HTTP-01 challenge), and add the
+443 server from `deploy/nginx/w2m.conf.example`. Only `rabbitUrl` changes on the
+machines.
+
+**Verify it, rather than trusting it:**
+
+```bash
+# the relay answers, with the shared server's identity in the reply
+curl -fsS http://202.182.123.154:8787/healthz | head -c 200
+curl -fsS http://202.182.123.154/healthz       | head -c 120   # the :80 path
+
+# the STUN responder answers, and this number is what the punch will aim at
+node -e "import('./src/agent/stun.mjs').then(async (s) => {
+  const { socket } = await s.bindUdpSocket();
+  console.log(await s.stunQuery(socket, '202.182.123.154:3478')); socket.close(); })"
+```
+
+If the second command reports an address, the responder is reachable from where
+you are. If you then run `discoverReflexive` against it **and two public STUN
+servers** and the three mapped ports differ, your network is symmetric and the
+punch cannot succeed from it — see `TROUBLESHOOTING.md` §9. That is a property of
+your network, not of this deployment.
+

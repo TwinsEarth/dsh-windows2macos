@@ -126,12 +126,12 @@ jobs:
         working-directory: .
         run: node scripts/check-entrypoints.mjs
 
-      - name: Install the package and assert it registers five tools
+      - name: Install the package and assert it registers eight tools
         shell: bash
         run: node scripts/verify-installed.mjs "$(pwd)"
 
       - name: Unit suites (relay / agent / plugin)
-        run: node --test test/relay.test.mjs test/broadcast.test.mjs test/agent.test.mjs test/tools.test.mjs test/schedule.test.mjs test/auto-update.test.mjs test/update-source.test.mjs test/update-install.test.mjs test/update-wiring.test.mjs test/signing.test.mjs test/stress.test.mjs test/metrics.test.mjs test/metrics-route.test.mjs test/shared-config.test.mjs test/tool-cards.test.mjs test/p2p-stun.test.mjs test/p2p-transport.test.mjs test/p2p-signaling.test.mjs
+        run: node --test test/relay.test.mjs test/broadcast.test.mjs test/agent.test.mjs test/tools.test.mjs test/schedule.test.mjs test/auto-update.test.mjs test/update-source.test.mjs test/update-install.test.mjs test/update-wiring.test.mjs test/signing.test.mjs test/stress.test.mjs test/metrics.test.mjs test/metrics-route.test.mjs test/shared-config.test.mjs test/tool-cards.test.mjs test/p2p-stun.test.mjs test/p2p-transport.test.mjs test/p2p-signaling.test.mjs test/p2p-node.test.mjs test/p2p-transport-fields.test.mjs test/p2p-plugin.test.mjs test/stun-server.test.mjs
 
       - name: End-to-end suites
         # --test-force-exit is required: each simulated machine holds an open SSE
@@ -141,7 +141,7 @@ jobs:
         # wrong: sub-path mounting, the two credential kinds, relay restart
         # recovery, pairing rate limits, proxy-header trust, and the
         # anti-buffering headers a tunnel needs.
-        run: node --test --test-force-exit test/e2e.test.mjs test/crossnetwork.test.mjs test/signing-e2e.test.mjs test/outbound-only.test.mjs test/recovery.test.mjs test/pipeline-e2e.test.mjs test/recovery.test.mjs
+        run: node --test --test-force-exit test/e2e.test.mjs test/crossnetwork.test.mjs test/signing-e2e.test.mjs test/outbound-only.test.mjs test/recovery.test.mjs test/pipeline-e2e.test.mjs test/p2p-agent.test.mjs
 
       - name: Packer reproduces the manifest (and refuses missing paths)
         run: node scripts/pack.mjs --out dist

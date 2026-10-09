@@ -35,7 +35,7 @@ Write-Host ''
 # Kept in step with the explicit list in .github/workflows/ci.yml. A suite that is
 # not named here is silently not run, which is how four suites (166 cases) once
 # shipped without ever executing in CI.
-$all = @('relay', 'broadcast', 'agent', 'tools', 'schedule', 'auto-update', 'update-source', 'update-install', 'update-wiring', 'signing', 'stress', 'metrics', 'metrics-route', 'shared-config', 'tool-cards', 'p2p-stun', 'p2p-transport', 'p2p-signaling', 'e2e', 'crossnetwork', 'signing-e2e', 'outbound-only', 'recovery', 'pipeline-e2e')
+$all = @('relay', 'broadcast', 'agent', 'tools', 'schedule', 'auto-update', 'update-source', 'update-install', 'update-wiring', 'signing', 'stress', 'metrics', 'metrics-route', 'shared-config', 'tool-cards', 'p2p-stun', 'p2p-transport', 'p2p-signaling', 'p2p-node', 'p2p-transport-fields', 'p2p-plugin', 'p2p-agent', 'stun-server', 'e2e', 'crossnetwork', 'signing-e2e', 'outbound-only', 'recovery', 'pipeline-e2e')
 $selected = if ($Suites -and $Suites.Count -gt 0) { $Suites } else { $all }
 
 $results = [ordered]@{}
@@ -47,7 +47,11 @@ foreach ($suite in $selected) {
     continue
   }
   Write-Host "=== $suite ===" -ForegroundColor Cyan
-  & $node --test $file
+  # --test-force-exit: the end-to-end suites each hold an open SSE connection, and a
+  # long-lived stream keeps Node's event loop alive after the assertions have passed.
+  # Without this flag a green suite can still hang the run, which is indistinguishable
+  # from a suite that never finished.
+  & $node --test --test-force-exit $file
   $code = $LASTEXITCODE
   $results[$suite] = if ($code -eq 0) { 'pass' } else { "FAIL($code)" }
   Write-Host ''

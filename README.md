@@ -6,7 +6,7 @@ English | [中文](#中文说明)
 
 [![CI](https://github.com/TwinsEarth/dsh-windows2macos/actions/workflows/ci.yml/badge.svg)](https://github.com/TwinsEarth/dsh-windows2macos/actions/workflows/ci.yml)
 [![DSH plugin](https://img.shields.io/badge/DSH-plugin-4c6ef5)](#install)
-[![version](https://img.shields.io/badge/version-0.1.2-blue)](#changelog)
+[![version](https://img.shields.io/badge/version-0.4.0-blue)](#changelog)
 [![dependencies](https://img.shields.io/badge/runtime%20dependencies-0-brightgreen)](#design-notes)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![platforms](https://img.shields.io/badge/CI-windows%20%7C%20macos%20%7C%20linux-4c6ef5)](#verified-and-not-verified)
@@ -48,13 +48,51 @@ So the cross-machine capability has to be built. This is that build.
               │  outbound POST + SSE                      │
               ▼                                           ▼
         ┌──────────────────────────────────────────────────────────┐
-        │  Rabbit relay — devices, tasks, leases, six-state report │
+        │  Rabbit relay: rendezvous, ledger, STUN responder        │
         └──────────────────────────────────────────────────────────┘
 ```
 
-Both machines only ever make **outbound** connections. No public IP, no port
+Every machine only ever makes **outbound** connections. No public IP, no port
 forwarding, no SSH server on Windows (which, measured, is not installed by
-default — `ssh.exe` exists, `sshd` does not).
+default — `ssh.exe` exists, `sshd` does not). The relay is the rendezvous and the
+ledger; the payload path is a UDP hole punch between the machines themselves — on
+by default in v0.4.0 — and it falls back to the relay loudly, naming the reason,
+when the network will not allow it.
+
+### The direct path (v0.4.0, default)
+
+Both machines announce the address a STUN server sees them as, the dispatching
+machine punches to the other's candidate, and the task offer travels over the
+punched channel instead of the relay. The relay holds its own copy of that offer
+back for about a second while the punch is attempted, and offers it anyway if the
+punch does not land — so a failed punch costs latency, not the task.
+
+The result *notice* returns the same way, with one stated limit: the frame carries
+the task and machine identity, not the result payload. `result_path` is one of the
+envelope's own fields and the envelope's hash covers it, so the acknowledgement has
+to be known before the envelope is built. The direct path therefore saves the
+dispatcher the wait for the relay's copy, not the bytes — the payload still reaches
+everyone through the ledger, which is the only writer allowed to hold it.
+
+```yaml
+- id: w2m
+  config:
+    p2pMode: auto          # auto (default) | direct | relay
+    # stunServers: ['202.182.123.154:3478']   # default: the shared server, then three public ones
+```
+
+`auto` tries the direct path and falls back with the reason attached; `direct`
+refuses the relay copy rather than falling back, so a punch failure becomes a
+visible failure; `relay` is byte-for-byte v0.3.9 — no UDP socket is bound at all.
+Every result carries `transport` plus a `p2p` object saying which path the offer
+took and which path the result took, and `w2m_wait` shows it per machine.
+
+**Why `auto` and not `direct`.** Punching cannot succeed behind a symmetric NAT,
+and that is measured rather than assumed. On the reference Windows client network
+(China Mobile), three STUN servers reported three different mapped ports for one
+socket — `endpoint-dependent`, punchable: false. A default that hard-required the
+direct path would break every deployment on such a network the moment it
+upgraded. See [PROTOCOL-v0.4.0.md](PROTOCOL-v0.4.0.md) §1.
 
 ### Two coordination modes
 
@@ -91,16 +129,31 @@ different findings, and collapsing them turns noise into bug reports.
 > repository. Nothing needs to be installed to use the relay or the agent: they
 > are plain Node scripts with **no runtime dependencies**.
 
-### 1. The relay (once, on any always-on machine)
+### 1. The relay + STUN (once, on any always-on machine)
+
+> **v0.4.0 defaults to a shared server, so this step is optional.** With no
+> `rabbitUrl` configured, the plugin uses `http://202.182.123.154:8787` — a
+> rendezvous, ledger and STUN responder that is already running. Point it at your
+> own host when you want your own; nothing else changes.
 
 ```bash
 node bin/w2m-rabbit.mjs --host 0.0.0.0 --port 8787 --state ~/.dsh/xclient/rabbit
+node bin/w2m-stun.mjs   --host 0.0.0.0 --port 3478        # the punch needs this
 ```
 
-It prints a **pairing code**. Pair the first machine, and the relay immediately
-prints a **new** code — so you can pair the second machine without restarting
-anything. (For scripted onboarding, start it with `pairingCodeReusable: true`
-and one code stays valid for its whole TTL.)
+`w2m-rabbit` prints a **pairing code**. Pair the first machine, and the relay
+immediately prints a **new** code — so you can pair the second machine without
+restarting anything. (For scripted onboarding, start it with
+`pairingCodeReusable: true` and one code stays valid for its whole TTL.)
+
+`w2m-stun` answers "what address does the world see me as", which is the address a
+peer has to aim at. Machines fall back to three public STUN servers if it is not
+there, so leaving it out degrades the punch rather than breaking it.
+
+Deploying both on a fresh host, with the proxy and firewall rules, is one command:
+`deploy/shared-server/install.sh` — see
+[deploy/shared-server/README.md](deploy/shared-server/README.md), including the
+part about TLS that this shape does not have by default.
 
 ### 2. Localside (on every machine that should run the project)
 
@@ -110,7 +163,8 @@ node bin/w2m-localside.mjs \
   --pair PAIR-XXXXXXXX \
   --project /path/to/your/project \
   --name win-desktop \
-  --state ~/.dsh/xclient/localside-win
+  --state ~/.dsh/xclient/localside-win \
+  --p2p-mode auto
 ```
 
 `--allowed-commands` is a **default-deny whitelist** as a JSON array. Nothing
@@ -120,6 +174,11 @@ runs unless it matches a prefix:
   --allowed-commands '["node --test","git status --porcelain"]'
 ```
 
+> The allow-list matches the whole `argv`, token by token, and a string entry is
+> split on whitespace — so `node -e console.log` does **not** allow
+> `node -e console.log(1)`, and a path containing a space has to be written as an
+> array entry. See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) §10.
+
 > ⚠️ **v0.0.1 note:** Localside is verified as a standalone process. Running it
 > *in-process* from the plugin (`autoStartAgent: true`) is implemented but has
 > not been exercised end-to-end in this release — start it as its own process.
@@ -127,17 +186,20 @@ runs unless it matches a prefix:
 ### 3. The DSH plugin
 
 ```bash
-dsh plugin --profile <profile-name> add @twinsearth/w2m-dsh-plugin@0.0.1
+dsh plugin --profile <profile-name> add @twinsearth/w2m-dsh-plugin@0.4.0
 ```
 
-Then give it the relay URL in that profile's `cordis.patch.yml`:
+Then give it the relay URL in that profile's `cordis.patch.yml` — or leave
+`rabbitUrl` empty to use the shared server:
 
 ```yaml
 - id: w2m
   config:
-    rabbitUrl: http://127.0.0.1:8787
+    rabbitUrl: ''            # empty => the shared server's default
+    operatorToken: ''        # required to dispatch; the relay prints it once
     stateDir: !!js (process.env.DSH_HOME + '/xclient')
     machineName: win-desktop
+    p2pMode: auto
 ```
 
 Restart DSH. You should see eight tools: `w2m_devices`, `w2m_run`, `w2m_wait`,
@@ -151,7 +213,7 @@ registry at all:
 
 ```bash
 dsh plugin --profile <profile-name> add \
-  https://github.com/TwinsEarth/dsh-windows2macos/releases/download/v0.0.1/twinsearth-w2m-dsh-plugin-0.0.1.tgz
+  https://github.com/TwinsEarth/dsh-windows2macos/releases/download/v0.4.0/twinsearth-w2m-dsh-plugin-0.4.0.tgz
 ```
 
 ## Use
@@ -209,19 +271,27 @@ one is CRLF and the other LF.
 > credential. See [CHANGELOG](CHANGELOG.md#012--2026-10-07).
 
 Machines only ever make **outbound** connections, so the relay can be anywhere
-both sides can reach. Three shapes are supported and documented end to end in
+both sides can reach. Four shapes are supported and documented end to end in
 [docs/DEPLOY.md](docs/DEPLOY.md):
 
 | Shape | TLS terminated by | `rabbitUrl` looks like |
 |---|---|---|
-| **Tailscale / WireGuard** (recommended) | the network — WireGuard encrypts | `http://100.x.y.z:8787` |
-| **Public VPS + domain** | the relay (`--tls-cert`/`--tls-key`) or a proxy | `https://w2m.example.com` |
+| **The shared server** (v0.4.0 default) | nothing — plain `http://` on a public IP | `http://202.182.123.154:8787` |
+| **Your own VPS** | the relay (`--tls-cert`/`--tls-key`) or a proxy | `https://w2m.example.com` |
+| **Tailscale / WireGuard** | the network — WireGuard encrypts | `http://100.x.y.z:8787` |
 | **Tunnel** (Cloudflare Tunnel, ngrok) | the tunnel service | `https://<sub>.example.com` or with a sub-path |
+
+> **The shared server has no TLS, and that is stated rather than implied.** There is
+> no hostname to issue a certificate for. Pairing codes, tokens and results cross
+> the wire in clear text; the direct path keeps the payload off the relay, and the
+> machine-side allow-list is the load-bearing control. With a domain, add TLS and
+> put `https://` in `rabbitUrl` — nothing else changes:
+> [deploy/shared-server/README.md](deploy/shared-server/README.md).
 
 > **Plain `http://` over a Tailscale address is not a mistake.** WireGuard already
 > provides end-to-end encryption and authenticates both peers; adding TLS on top
 > would add certificate plumbing without adding a property you do not already
-> have. That is why shape A is the recommended default rather than a compromise.
+> have.
 
 If your proxy or tunnel mounts the relay under a prefix — `https://host/w2m/` —
 then start it with `--base-path /w2m` and put the same prefix in `rabbitUrl`.
@@ -340,29 +410,45 @@ Read this before exposing the relay to anything.
 
 This project's rule is that claims carry their evidence.
 
-### v0.3.9 P2P hole punching — partial, and labelled as such
+### v0.4.0 — the direct path is the default, and here is what that is worth
 
-The P2P **transport** is implemented and tested: STUN discovery and mapping
-classification, hole punching, a reliable fragmenting channel over the punched path,
-and the two signalling endpoints (`POST /v1/peer/announce`,
-`GET /v1/peer/{machine_id}`). 56 tests cover them.
+v0.3.9 shipped the P2P transport and admitted in its own §8 that nothing read
+`p2p.mode`, the announcer did not exist and the task path still went through the
+relay. v0.4.0 is that admission paid off:
 
-The **task path is not switched over yet.** `p2p.mode` defaults to `auto` per the
-contract in [`PROTOCOL-v0.3.9.md`](PROTOCOL-v0.3.9.md) §1, but nothing reads the
-setting, the Localside announcer is not implemented, and `w2m_run` still dispatches
-through the relay. **So the data path behaves exactly as v0.3.8 today.** This is
-written down rather than left implicit, because a deployment that believed it was on
-a direct path when it was not is the worst outcome this feature can produce.
+* **the announcer exists** — a machine binds one UDP socket, asks the STUN servers
+  what the world sees, announces its candidates and refreshes them;
+* **the offer can arrive over the punched path**, and the result can return over it;
+* **exactly-once survives both copies arriving** — the relay's offer is still
+  emitted, and a second copy of the same `task_id`+`attempt` is never executed;
+* **every result says which path it took** (`transport`, `p2p.offer_path`,
+  `p2p.result_path`, and a `路径` column in the report);
+* **the relay is still the ledger** — the direct copy is additional, never a
+  replacement, so the comparison cannot become less trustworthy because a network
+  was faster.
 
-Two things are worth knowing before relying on any of it:
+Three things are worth knowing before relying on it:
 
-* **Punching cannot succeed against a symmetric NAT.** Measured here, behind an
-  iPhone hotspot: three STUN servers reported three different mapped ports for the
-  same socket. That is why the default is `auto` with a *reported* fallback rather
-  than `direct`.
-* **A real NAT traversal is still unverified.** Two sockets on one host share a
-  loopback path with no translator between them, so the passing punch tests say
-  nothing about crossing a NAT. That needs two hosts behind two different NATs.
+* **Punching cannot succeed against a symmetric NAT**, and this is measured twice
+  on two real networks: an iPhone hotspot (v0.3.9) and the reference Windows
+  client network, China Mobile (v0.4.0 — three servers, three mapped ports: 36028,
+  5855, 26713). Nothing can dial *into* such a network, which is why the default is
+  `auto` with a *reported* fallback rather than `direct`.
+* **A punch from a symmetric NAT to a public peer still lands** — measured:
+  `HELLO` → `HELLO_ACK` in **331.61 ms** from that same Chinese network to the
+  shared server in Tokyo, with the ledger recording `transport: p2p` for the
+  Japanese machine. A punch you initiate opens the mapping, and the peer's answer
+  to the datagram it just received comes back through it. That asymmetry is why the
+  dispatcher dials the executor.
+* **A machine that must accept a punch needs a reachable UDP port.** On a public
+  host that is a firewall rule for the agent's punch port (the shared server has
+  one); behind a NAT it is the hole the punch opens. The port is ephemeral today,
+  so the rule has to cover the range — a fixed `--p2p-port` is the follow-up.
+* **A two-NAT punch is still unverified.** Two sockets on one host share a path
+  with no translator between them, so the loopback tests prove the protocol and
+  nothing about NAT. What *has* now been measured is one real WAN hop: dispatcher
+  on a Chinese residential network, executor on the shared server in Tokyo. That is
+  one NAT, and it is labelled as one NAT.
 
 **The same suites run on three platforms in CI** — see the badge above, or
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml). The matrix is
@@ -489,7 +575,8 @@ DSH 目前**不能**跨机器协作，而且不是疏忽：
 
 | 设计 | 理由 |
 |---|---|
-| **星型中继 + 反向连接** | 两端只做出站连接：不需要公网 IP、不改防火墙、Windows 没有 `sshd` 也不影响 |
+| **P2P 直连优先**（v0.4.0 默认） | 两端各报自己的反射地址，由派发方打洞并把任务直接送过去；打不通才回落到中继，并且**报告用了哪条路** |
+| **中继 = 会合点 + 账本 + 回落** | 中继仍然收下每一条结果：它是账本，账本不完整，比较就不可信 |
 | **默认只读**（`replicate` 且 `write: false`） | 一次性消除重复提交、覆盖写、推送竞争这三类最常见的事故 |
 | **三锚校验** | 实测：脏工作区上 `git checkout --detach <sha>` **退出码 0 却保留本地改动** —— 只看 commit SHA 会把"不是同一份代码"误判成"结果分歧" |
 | **六态聚合** | "环境不同"与"结果不同"是两件事，合并记账会把噪声当 bug |
@@ -500,20 +587,23 @@ DSH 目前**不能**跨机器协作，而且不是疏忽：
 ### 快速开始
 
 ```bash
-# 1) 中继（任一台常开的机器，一次）
+# 1) 中继 + STUN（任一台常开的机器，一次）
+#    v0.4.0 已内置共享服务器作为默认值，这一步是可选的：
+#    http://202.182.123.154:8787 与 202.182.123.154:3478
 node bin/w2m-rabbit.mjs --host 0.0.0.0 --port 8787 --state ~/.dsh/xclient/rabbit
-#    它会打印一次性配对码 PAIR-XXXXXXXX
+node bin/w2m-stun.mjs   --host 0.0.0.0 --port 3478
+#    中继会打印一次性配对码 PAIR-XXXXXXXX
 
 # 2) 每台参与机器（在其项目目录所在机器上跑）
 node bin/w2m-localside.mjs --rabbit http://<中继地址>:8787 --pair PAIR-XXXXXXXX \
-  --project /path/to/your/project --name win-desktop \
+  --project /path/to/your/project --name win-desktop --p2p-mode auto \
   --allowed-commands '["node --test","git status --porcelain"]'
 
 # 3) 装 DSH 插件
-dsh plugin --profile <profile-name> add @twinsearth/w2m-dsh-plugin@0.0.1
+dsh plugin --profile <profile-name> add @twinsearth/w2m-dsh-plugin@0.4.0
 ```
 
-然后在 profile 的 `cordis.patch.yml` 里给插件 `rabbitUrl`，重启 DSH，即可直接用自然语言指挥：
+然后在 profile 的 `cordis.patch.yml` 里给插件 `rabbitUrl`（留空即用共享服务器）与 `operatorToken`，重启 DSH，即可直接用自然语言指挥：
 
 > 列出我的机器，然后在所有机器上跑 `node --test`，告诉我输出是否一致。
 
@@ -523,11 +613,16 @@ dsh plugin --profile <profile-name> add @twinsearth/w2m-dsh-plugin@0.0.1
 
 ### 已实测 / 未实测
 
-- ✅ **Windows 上已实测**：中继（配对、鉴权、SSE 首帧 ready 与按 seq 重放、租约续期与过期、去重、六态、报告）、执行侧（白名单、超时、输出截断、退出码、干净/脏工作区锚、四路并发指纹、spool）、以及双 worktree 双 Localside 的端到端真实执行。
+- ✅ **P2P 直连已接通（v0.4.0）**：宣告（announce）、打洞、任务通过直连通道送达、结果沿同一通道返回、两条路径同时到达时**只执行一次**、以及每条结果都带 `transport` / `p2p.offer_path` / `p2p.result_path`。回落到中继时带**具体原因**（`P2P_PUNCH_TIMEOUT` 等），不是一句"没走直连"。
+- ✅ **跨真网一跳已实测**：派发端在**中国移动的对称 NAT 之后**（三台 STUN 服务器给出三个不同的映射端口：36028 / 5855 / 26713，`endpoint-dependent`，punchable: false），执行端在东京的共享服务器上。**实测打洞成功：`HELLO` → `HELLO_ACK` 331.61 ms**，账本为那台日本机器记录 `transport: p2p`（`result_path: p2p`）。对称 NAT 挡住的是"被拨入"，挡不住"主动拨出" —— 这正是派发方负责打洞的原因。
+- ⚠️ **要接受打洞的机器必须有可达的 UDP 端口**：公网主机上就是一条防火墙规则（共享服务器已加）；今天端口是临时的，所以规则要覆盖区间 —— 固定 `--p2p-port` 是下一步。
+- ✅ **共享服务器已上线**：中继（`:8787` 与经 nginx 的 `:80`）、STUN 响应器（`:3478/udp`）、systemd 单元、ufw 规则，一条命令可复现：`deploy/shared-server/install.sh`。
 - ✅ **三平台 CI**：同一套用例在 `windows-latest`（node 20/22）、`macos-latest`（node 22）、`ubuntu-latest`（node 22）上跑，见上方徽章与 `.github/workflows/ci.yml`。
-- ⚠️ **真实的 Windows↔macOS 互联未实测**：CI 矩阵只证明**各平台都能跑**这套代码；矩阵里的两台机器**并不会互相通信**。真正的机器到机器链路目前仅在**同一台主机上的两个进程之间**验证过。最后一步仍建议在你自己的两台机器上跑一次。
-- ⚠️ **单账号驱动两台机器的模型会话未实测**：本版本执行的是**确定性命令**，不向远端 DSH 会话注入 prompt。同账号能否并发跑两个模型会话取决于你的账号额度，本项目未验证。
-- ⚠️ **`write: true` 不合并**：写模式的任务会执行，但 0.0.1 没有分支合并。
+- ⚠️ **两个 NAT 之后的互通仍未实测**：本机环回上的打洞只证明协议正确，不证明能穿透 NAT；目前实测的是**一跳、一个 NAT**（见上）。
+- ⚠️ **真实的 Windows↔macOS 互联未实测**：CI 矩阵只证明**各平台都能跑**这套代码；矩阵里的两台机器**并不会互相通信**。
+- ⚠️ **UDP 直连通道本身不认证**（与 v0.3.9 §6 相同）：session id 是 32 位随机数，UDP 源地址可伪造 —— 直连不比中继更可信，威胁模型包含路上攻击者时请开启请求签名。
+- ⚠️ **单账号驱动两台机器的模型会话未实测**：本版本执行的是**确定性命令**，不向远端 DSH 会话注入 prompt。
+- ⚠️ **`write: true` 不合并**：写模式的任务会执行，但没有分支合并。
 
 ### 许可
 

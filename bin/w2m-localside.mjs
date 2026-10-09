@@ -26,6 +26,7 @@ import { formatError, resolveStateDir } from '../src/util/cli.mjs';
 import { createAgent, parseAllowedCommands } from '../src/agent/agent.mjs';
 import { probeCapsDetailed, detectPlatform } from '../src/agent/caps.mjs';
 import { loadOrCreateIdentity, saveDeviceToken } from '../src/agent/identity.mjs';
+import { normalizeP2PMode, stunServersWithShared } from '../src/agent/p2p-node.mjs';
 import { resolveBaseUrl } from '../src/agent/url.mjs';
 
 const USAGE = `w2m-localside — W2M Localside agent (protocol v1)
@@ -33,7 +34,8 @@ const USAGE = `w2m-localside — W2M Localside agent (protocol v1)
 Usage:
   w2m-localside --rabbit <url> [--pair <CODE>] [--project <dir>]
                 [--name <name>] [--allowed-commands <json>]
-                [--state <dir>] [--once] [--once-idle-ms <ms>]
+                [--state <dir>] [--p2p-mode <mode>] [--stun-servers <list>]
+                [--once] [--once-idle-ms <ms>]
 
 Options:
   --rabbit <url>            Rabbit base address (default: $W2M_RABBIT_URL).
@@ -47,6 +49,15 @@ Options:
                             Nothing is allowed when omitted.
   --state <dir>             State directory for spool/state
                             (default: <DSH_HOME>/xclient/localside)
+  --p2p-mode <mode>         auto (default) | direct | relay
+                            (default: $W2M_P2P_MODE)
+                            auto:   accept an offer over either path
+                            direct: refuse an offer that did not arrive
+                                    directly (P2P_UNAVAILABLE)
+                            relay:  v0.3.9 - no UDP socket is bound at all
+  --stun-servers <list>     Comma-separated STUN servers, queried in order,
+                            after the shared server (default: $W2M_STUN_SERVERS)
+                            Example: stun.internal:3478,stun.l.google.com:19302
   --operator-token <t>      Operator token (or $W2M_OPERATOR_TOKEN). Only needed
                             when this host also submits tasks; the Localside
                             agent itself never sends it.
@@ -75,6 +86,8 @@ function parseCli(argv) {
       'allowed-commands': { type: 'string' },
       'operator-token': { type: 'string' },
       state: { type: 'string' },
+      'p2p-mode': { type: 'string' },
+      'stun-servers': { type: 'string' },
       once: { type: 'boolean', default: false },
       'once-idle-ms': { type: 'string' },
       'heartbeat-ms': { type: 'string' },
@@ -140,10 +153,40 @@ async function main() {
     return 2;
   }
 
+  // v0.4.0. The flag wins over the environment, and both go through the same loud validator the
+  // node and the agent use: a typo is a usage error (exit 2) naming the setting, exactly like
+  // `--rabbit` or `--once-idle-ms`, and never a silent fallback to the default. A mode that
+  // silently became `auto` would turn `direct` into a promise the operator only discovers was
+  // broken when a punch failed.
+  const p2pModeInput = flags['p2p-mode'] ?? process.env.W2M_P2P_MODE ?? undefined;
+  const p2pModeResult = normalizeP2PMode(p2pModeInput === undefined ? 'auto' : p2pModeInput);
+  if (!p2pModeResult.ok) {
+    const source = flags['p2p-mode'] !== undefined ? '--p2p-mode' : 'W2M_P2P_MODE';
+    process.stderr.write(`error: ${source}: ${p2pModeResult.reason}\n`);
+    return 2;
+  }
+  const p2pMode = p2pModeResult.mode;
+
+  // Same precedence rule, same reason. An empty list means "the shared server and the public
+  // fallbacks", i.e. the default -- `stunServersWithShared()` accepts '' and drops it -- so an
+  // accidentally blank variable is harmless rather than a node that cannot discover anything.
+  const stunInput = flags['stun-servers'] ?? process.env.W2M_STUN_SERVERS ?? '';
+  let stunServers;
+  try {
+    stunServers = stunServersWithShared(stunInput);
+  } catch (error) {
+    const source = flags['stun-servers'] !== undefined ? '--stun-servers' : 'W2M_STUN_SERVERS';
+    process.stderr.write(`error: ${source}: ${formatError(error)}\n`);
+    return 2;
+  }
+
   const log = (level, message, extra) => {
     const suffix = extra && Object.keys(extra).length > 0 ? ` ${JSON.stringify(extra)}` : '';
     process.stdout.write(`${new Date().toISOString()} ${level.padEnd(7)} ${message}${suffix}\n`);
   };
+
+  /** One-shot guard for the resolved-P2P startup line (see `onP2PStatus` below). */
+  let p2pLogged = false;
 
   try {
     const { identity, path: identityPath, created } = loadOrCreateIdentity({
@@ -172,7 +215,25 @@ async function main() {
       onceIdleMs,
       heartbeatIntervalMs: heartbeatMs,
       operatorToken,
+      p2pMode,
+      stunServers,
       log,
+      // The startup line has to name the *resolved* mode, the STUN list and whether the node
+      // actually started. `p2p_mode` is what was asked for; `started` is what happened, and a
+      // machine that cannot punch reports `started: false` with the reason right there -- which is
+      // the whole point of "a failure to start the node is never fatal".
+      onP2PStatus: (status) => {
+        // One line, for every mode including `relay`. It is emitted when the fact is final --
+        // the node started, the node failed to start, or there is no node to start -- so the line
+        // never says "starting" and never repeats as the status is refreshed on each heartbeat.
+        const final = status.running || !status.enabled || status.start_error !== null;
+        if (p2pLogged || !final) return;
+        p2pLogged = true;
+        log(status.start_error === null ? 'info' : 'warn', `p2p mode=${status.mode} node ${status.running ? 'started' : 'not started'}`, {
+          stun_servers: stunServers,
+          ...(status.start_error === null ? {} : { error: status.start_error }),
+        });
+      },
     });
     if (operatorToken) {
       log('info', 'operator token configured (submit-capable host); the agent itself never sends it', {
@@ -193,7 +254,9 @@ async function main() {
       if (stopping) return;
       stopping = true;
       log('warn', `received ${signal}, stopping`);
-      agent.stop();
+      // Awaited so the node's socket is really gone before the process leaves; an unawaited
+      // `stop()` would let the event loop drain with a dgram handle still open.
+      void agent.stop();
     };
     process.on('SIGINT', () => onSignal('SIGINT'));
     process.on('SIGTERM', () => onSignal('SIGTERM'));

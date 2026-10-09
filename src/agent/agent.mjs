@@ -48,6 +48,7 @@ import {
   resolveProjectCwd,
 } from './git.mjs';
 import { createSpool } from './spool.mjs';
+import { DEFAULT_P2P_MODE, P2PNode, normalizeP2PMode } from './p2p-node.mjs';
 import { createSigner } from '../signing.mjs';
 import { joinUrl, resolveBaseUrl } from './url.mjs';
 
@@ -152,8 +153,39 @@ export const REFUSAL = {
   READ_ONLY_MACHINE: 'READ_ONLY_MACHINE',
   CWD_OUTSIDE_PROJECT: 'CWD_OUTSIDE_PROJECT',
   INVALID_OFFER: 'INVALID_OFFER',
+  /**
+   * v0.4.0: an offer arrived over the relay while this agent is configured `direct`.
+   *
+   * See `p2pRefusal()` for why this is the one refusal the *mode* decides rather than the offer:
+   * `direct` exists to make a silent fallback impossible, so accepting the relay's copy would
+   * quietly turn the mode back into `auto` on the machine whose configuration said otherwise.
+   */
+  P2P_UNAVAILABLE: 'P2P_UNAVAILABLE',
 };
 
+/**
+ * How long the agent waits for the dispatcher's `result.ack` on a direct channel (v0.4.0).
+ *
+ * This bound is the whole reason the direct copy is safe to attempt at all. The relay copy is
+ * posted only once this wait is over, because `result_path` has to be inside the envelope when
+ * `envelope_sha256` is computed -- attaching it afterwards would leave a hash that does not cover
+ * the bytes it claims to cover. So the wait is a real delay on the relay copy, and a *bounded* one
+ * is the difference between "the fast path is usually faster" and "a wedged dispatcher stalls the
+ * ledger". Two seconds is far above any plausible loopback or cross-network ack and far below the
+ * relay's lease window, so the relay copy still lands long before anyone would call it late.
+ */
+export const P2P_RESULT_ACK_TIMEOUT_MS = 2_000;
+
+/**
+ * How long a task's direct channel outlives the attempt that used it.
+ *
+ * Long enough to answer a duplicate of a finished attempt over the same channel (the relay replaying
+ * an offer, a dispatcher retrying a push), short enough that a long-lived agent does not accumulate
+ * one live session per task it has ever run. Injectable as `p2pChannelLingerMs`, because a test that
+ * asserts "the channel is released" should be able to make that fact observable in milliseconds
+ * rather than describe a 30-second wait.
+ */
+export const P2P_CHANNEL_LINGER_MS = 30_000;
 /**
  * Upper bound on the stages a single offer may carry (v0.3.3 `pipeline`).
  *
@@ -341,6 +373,104 @@ export function heartbeatDiagnostics(snapshot = {}, options = {}) {
   }
 
   return extra;
+}
+
+// ---------------------------------------------------------------------------
+// P2P transport facts (v0.4.0)
+// ---------------------------------------------------------------------------
+
+/**
+ * The two transports an offer or a result can travel over.
+ *
+ * Duplicated from `src/relay/state.mjs`'s `TRANSPORT_VALUES` on purpose, for the same reason
+ * `P2PNode` duplicates the relay's IPv4 rule: they are wire values that two independently
+ * deployed ends must agree on, and a shared import would make one side's edit silently change
+ * what the other accepts.
+ */
+export const TRANSPORT_VALUES = Object.freeze(['p2p', 'relay']);
+
+/**
+ * A JSON *frame* arriving on a P2P channel.
+ *
+ * The channel carries opaque bytes (`P2PNode` deliberately does not parse them) and the W2M
+ * convention is that the bytes are the relay's own JSON frames. Parsing happens here, in the
+ * agent, because "what a frame means for a task" is a task-layer question; from this point on
+ * the payload takes `handleFrame`'s path with `transport: 'p2p'`, which is what makes a direct
+ * offer and an SSE offer the *same* code path rather than two that have to be kept in step.
+ *
+ * @param {unknown} payload The channel's message body.
+ * @returns {object|null} The payload object, or null when it is not a JSON object with a `type`.
+ */
+export function parseP2PFrame(payload) {
+  const text = Buffer.isBuffer(payload) ? payload.toString('utf8') : payload;
+  let parsed;
+  try {
+    parsed = JSON.parse(typeof text === 'string' ? text : String(text));
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  if (typeof parsed.type !== 'string' || parsed.type === '') return null;
+  return parsed;
+}
+
+/**
+ * Which path an offer arrived on, and -- when it arrived over the relay -- why the direct path
+ * was not the answer.
+ *
+ * The transport value is taken from `offer.p2p_transport`, which the agent itself stamps on a
+ * channel-delivered offer and only there. Nothing on the wire can set it: a relay frame that
+ * carried the field would still be stamped `'relay'` by the SSE path, so a dispatcher cannot
+ * claim a direct path it never opened.
+ *
+ * The reason is named only when the relay really was the answer. `P2P_NO_CANDIDATES` is not a
+ * guess about the dispatcher's punch -- it is the agent's own finding for *this* task: a relay
+ * offer means no direct channel exists for this `task_id`, and the reason says exactly that.
+ * `P2P_DISABLED` covers the mechanical case (`mode: 'relay'`, where no direct path exists at all);
+ * `P2P_UNREACHABLE` covers the rare ordering where the offer beat the node's own startup.
+ *
+ * @param {object|null} offer
+ * @param {{mode: string, running: boolean}} p2p
+ * @returns {{offer_path: 'p2p'|'relay', reason: string|null}}
+ */
+export function offerTransportOf(offer, p2p) {
+  if (offer?.p2p_transport === 'p2p') return { offer_path: 'p2p', reason: null };
+  if (p2p.mode === 'relay') {
+    return {
+      offer_path: 'relay',
+      reason: 'P2P_DISABLED: p2pMode is "relay", so no direct path is attempted',
+    };
+  }
+  if (p2p.running !== true) {
+    return {
+      offer_path: 'relay',
+      reason: 'P2P_UNREACHABLE: the P2P node is not running, so no direct path was available',
+    };
+  }
+  return {
+    offer_path: 'relay',
+    reason: 'P2P_NO_CANDIDATES: no direct channel was open for this task, so the relay carried the offer',
+  };
+}
+
+/**
+ * The result-delivery mark: how the *envelope* is being carried, as opposed to how the offer
+ * arrived.
+ *
+ * Kept as a plain object so it can be handed through `finish()`/`makeEnvelope()` unchanged, and
+ * `asked` distinguishes "nothing to acknowledge over" from "asked, and nobody answered" -- both
+ * end up as `result_path: null`, but only the second one is worth a metric.
+ *
+ * @param {{path: 'p2p'|null, asked: boolean, rtt_ms: number|null, error: string|null}} value
+ * @returns {{path: 'p2p'|null, asked: boolean, rtt_ms: number|null, error: string|null}}
+ */
+export function p2pDeliveryMark(value = {}) {
+  return {
+    path: value.path === 'p2p' ? 'p2p' : null,
+    asked: value.asked === true,
+    rtt_ms: typeof value.rtt_ms === 'number' && Number.isFinite(value.rtt_ms) ? value.rtt_ms : null,
+    error: typeof value.error === 'string' && value.error !== '' ? value.error : null,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -807,6 +937,21 @@ export class Heartbeat {
  *   diagnostics file; 0 disables it (task-16).
  * @property {string|null} [operatorToken] Only needed when this host submits
  *   tasks itself (v0.1.2 §5); never sent by the Localside agent.
+ * @property {string} [p2pMode] `auto` (default), `direct` or `relay` (v0.4.0). Anything
+ *   else is a `TypeError` naming {@link normalizeP2PMode}'s reason: a mode is a wire value,
+ *   so a typo must fail at the call site rather than degrade into a silent default.
+ * @property {string[]|string} [stunServers] Complete STUN list, in query order, for the
+ *   agent's own node. See {@link stunServersWithShared}.
+ * @property {P2PNode|((options: object) => P2PNode)} [p2pNode] The node to use. An
+ *   instance is adopted; a function is called with the derived options. Injectable
+ *   because a test needs a real socket and a deterministic discovery answer, and
+ *   because `test/outbound-only.test.mjs` counts binds through it.
+ * @property {object} [p2pNodeOptions] Extra `P2PNode` constructor options, merged last.
+ * @property {number} [p2pAckTimeoutMs] Bounded wait for `result.ack` on the direct
+ *   channel; see {@link P2P_RESULT_ACK_TIMEOUT_MS}.
+ * @property {(status: object) => void} [onP2PStatus] Called with a snapshot of the agent's
+ *   P2P facts whenever they change (the node starting, an announcement, an error). Push,
+ *   not poll: the plugin's `w2m_status` must not have to ask repeatedly.
  */
 
 /**
@@ -833,6 +978,9 @@ export function createAgent(options) {
     operatorToken = null,
     statePublishIntervalMs = AGENT_STATE_PUBLISH_INTERVAL_MS,
     idleHeartbeatIntervalMs = IDLE_HEARTBEAT_INTERVAL_MS,
+    onP2PStatus = () => {},
+    p2pAckTimeoutMs = P2P_RESULT_ACK_TIMEOUT_MS,
+    p2pChannelLingerMs = P2P_CHANNEL_LINGER_MS,
   } = options;
 
   // Normalise here so every caller gets the same contract: the documented
@@ -845,6 +993,19 @@ export function createAgent(options) {
   if (!stateDir) throw new TypeError('createAgent: stateDir is required');
   if (!identity?.machine_id) throw new TypeError('createAgent: identity.machine_id is required');
   if (typeof fetchImpl !== 'function') throw new TypeError('createAgent: no fetch implementation available');
+
+  // v0.4.0: the mode is validated at construction, with the same loud helper the node and the
+  // CLI use. `normalizeP2PMode` rejects `'AUTO'`, `' auto '` and friends by name; doing that here
+  // means an unusable mode can never reach `start()` as a half-started agent.
+  const p2pModeInput = options.p2pMode === undefined ? DEFAULT_P2P_MODE : options.p2pMode;
+  const normalizedMode = normalizeP2PMode(p2pModeInput);
+  if (!normalizedMode.ok) throw new TypeError(`createAgent: ${normalizedMode.reason}`);
+  const p2pMode = normalizedMode.mode;
+
+  if (typeof onP2PStatus !== 'function') throw new TypeError('createAgent: onP2PStatus must be a function');
+  if (typeof p2pAckTimeoutMs !== 'number' || !Number.isFinite(p2pAckTimeoutMs) || p2pAckTimeoutMs < 0) {
+    throw new TypeError('createAgent: p2pAckTimeoutMs must be a non-negative number of milliseconds');
+  }
 
   // Validate + normalise once, at construction: a `rabbitUrl` carrying a query
   // string, a fragment or a non-http scheme must fail loudly here rather than
@@ -875,6 +1036,279 @@ export function createAgent(options) {
 
   const log = options.log ?? (() => {});
   const spool = createSpool(stateDir);
+
+  // -- P2P transport (v0.4.0) ----------------------------------------------
+  //
+  // Everything the direct path owns lives in these few bindings, and the shape is deliberate:
+  // the agent does not *have* a P2P stack, it *borrows* one node and treats every failure as a
+  // reportable fact. `p2pMode: 'relay'` leaves the whole block inert -- `configureP2P()` never
+  // constructs a node, so no UDP socket exists and no STUN server is ever queried, which is what
+  // makes the setting a mechanical statement ("this machine is exactly v0.3.9") rather than a
+  // promise about behaviour.
+
+  /** @type {P2PNode|null} The node, once one exists. Null in `relay` mode, forever. */
+  let p2pNode = null;
+  /** @type {Promise<object>|null} In-flight start, so `stop()` can await it. */
+  let p2pStarting = null;
+  /** @type {object|null} Start outcome, so the status can report *why* the node is not running. */
+  let p2pStartResult = null;
+  /** @type {object|null} Last snapshot handed to `onP2PStatus`, so a no-op change is not pushed. */
+  let lastP2PStatusJson = null;
+
+  /**
+   * Result envelopes awaiting a `result.ack` over a direct channel.
+   *
+   * Keyed by `task_id` (one result per task and attempt is the whole point of the dedupe work), so
+   * a late ack for a re-delivered attempt resolves the live waiter rather than a stale one.
+   *
+   * @type {Map<string, {settle: (acked: boolean, error: string|null) => void}>}
+   */
+  const p2pResultWaiters = new Map();
+
+  /**
+   * Live channels per `task_id`, for the direct result copy *and* for knowing which tasks the
+   * dispatcher can already reach us about. Populated only from a `task.offer` that arrived on a
+   * channel: a channel that was opened but never used for an offer has no task to be the result of.
+   *
+   * `onClose` is the listener attached to the channel, kept here so a channel replaced for the
+   * same task can have its old listener removed instead of leaking one per re-punch.
+   *
+   * @type {Map<string, {channel: object, onClose: () => void}>}
+   */
+  const p2pChannels = new Map();
+
+  /** The agent's P2P facts, always a fresh plain object. */
+  function p2pStatusSnapshot() {
+    const nodeStatus = p2pNode?.status ?? null;
+    const startError = p2pStartResult?.ok === false ? p2pStartResult.error ?? null : null;
+    return {
+      mode: p2pMode,
+      enabled: p2pMode !== 'relay',
+      running: nodeStatus?.running === true,
+      machine_id: identity.machine_id,
+      rabbit_url: baseUrl,
+      local: nodeStatus?.local ?? null,
+      reflexive: nodeStatus?.reflexive ?? null,
+      mapping: nodeStatus?.mapping ?? null,
+      candidates: nodeStatus?.candidates ?? [],
+      announced_at: nodeStatus?.announced_at ?? null,
+      announce_ok: nodeStatus?.announce_ok === true,
+      announce_failures: nodeStatus?.announce_failures ?? 0,
+      last_announce_error: nodeStatus?.last_announce_error ?? null,
+      punches_out: nodeStatus?.punches_out ?? 0,
+      punches_in: nodeStatus?.punches_in ?? 0,
+      dial_failures: nodeStatus?.dial_failures ?? 0,
+      channels: p2pChannels.size,
+      start_error: startError,
+      last_error: startError ?? nodeStatus?.last_error ?? null,
+    };
+  }
+
+  /**
+   * Push the current facts to `onP2PStatus`, but only when they actually changed.
+   *
+   * Deduplicated on the serialised snapshot: `publishState()` runs on every heartbeat and an
+   * unconditional push would turn a 10s cadence into a stream of identical callbacks. The
+   * comparison is on JSON, not on object identity, because every read builds a new object by
+   * design (no caller may hold a reference into the agent's state).
+   */
+  function refreshP2PStatus() {
+    const snapshot = p2pStatusSnapshot();
+    const json = JSON.stringify(snapshot);
+    if (json === lastP2PStatusJson) return snapshot;
+    lastP2PStatusJson = json;
+    try {
+      onP2PStatus(snapshot);
+    } catch (error) {
+      // A diagnostic consumer that throws must not cost the agent anything: the callback belongs
+      // to a *reader* (the plugin), and "the reporter is broken" is not a transport failure.
+      log('warn', 'onP2PStatus threw; P2P status is still in state.p2p', {
+        error: error?.message ?? String(error),
+      });
+    }
+    return snapshot;
+  }
+
+  /**
+   * Build (but do not start) the node, unless the mode says there is no direct path.
+   *
+   * A node the caller injected is adopted as-is -- including its mode, which is why an injected
+   * node and `p2pMode` disagreeing is logged rather than silently resolved: the injected node is
+   * the one that would actually bind a socket, so it is the one that decides, and a caller
+   * comparing the two configuration surfaces deserves to know they are not the same thing.
+   */
+  function configureP2P() {
+    if (p2pMode === 'relay') return;
+    if (p2pNode !== null) return;
+
+    const injected = options.p2pNode ?? null;
+    const extra = options.p2pNodeOptions ?? {};
+    const derived = {
+      mode: p2pMode,
+      rabbitUrl: baseUrl,
+      machineId: identity.machine_id,
+      postJson: (path, body) => postJson(path, body),
+      getJson: (path) => getJson(path),
+      ...(options.stunServers === undefined ? {} : { stunServers: options.stunServers }),
+      log: (line) => log('info', line, {}),
+      ...extra,
+    };
+
+    try {
+      if (typeof injected === 'function') {
+        p2pNode = injected(derived);
+      } else if (injected !== null && typeof injected === 'object') {
+        p2pNode = injected;
+        if (p2pNode.mode !== p2pMode) {
+          log('warn', 'injected p2pNode mode differs from p2pMode; the node decides', {
+            p2pMode,
+            node_mode: p2pNode.mode,
+          });
+        }
+      } else {
+        p2pNode = new P2PNode(derived);
+      }
+    } catch (error) {
+      // Never fatal, for the same reason as a failed start: a machine whose P2P configuration is
+      // wrong must still work over the relay.
+      p2pStartResult = {
+        ok: false,
+        enabled: p2pMode !== 'relay',
+        error: `P2P_NODE_INVALID: ${error?.message ?? String(error)}`,
+      };
+      log('error', 'could not build the P2P node; the relay path is unaffected', {
+        error: p2pStartResult.error,
+      });
+      return;
+    }
+
+    p2pNode.on('message', (event) => handleP2PMessage(event));
+    // `'announce'` is the only event that changes the facts a reader cares about between
+    // heartbeats, so it is what refreshes the published status.
+    p2pNode.on('announce', () => refreshP2PStatus());
+    // Deliberately after `configureP2P`: a node so broken it binds twice is the *only* thing this
+    // catches, and it is a bug in the node rather than anything the agent can recover from.
+    p2pNode.on('error', (error) => {
+      log('warn', `p2p: ${error?.message ?? String(error)}`, {});
+    });
+  }
+
+  /**
+   * Bring the direct path up. Failures are recorded, never thrown.
+   *
+   * The guard is the whole point: a machine that cannot punch (no UDP egress, a symmetric NAT, an
+   * unreachable relay route from `POST /v1/peer/announce`) is still a working W2M machine, because
+   * the relay is always still there. An agent that refused to start because a *fast path* was
+   * unavailable would have turned an optimisation into a new failure mode.
+   *
+   * @returns {Promise<{ok: boolean, enabled: boolean, error: string|null}>}
+   */
+  async function startP2P() {
+    if (p2pMode === 'relay') return { ok: true, enabled: false, error: null };
+    configureP2P();
+    if (p2pNode === null) return p2pStartResult ?? { ok: false, enabled: true, error: 'P2P_NODE_INVALID' };
+    if (p2pStarting !== null) return p2pStarting;
+
+    const started = (async () => {
+      let result;
+      try {
+        result = await p2pNode.start();
+      } catch (error) {
+        result = { ok: false, enabled: true, error: `P2P_START_THREW: ${error?.message ?? String(error)}` };
+      }
+      p2pStartResult = result;
+      log(result.ok ? 'info' : 'warn', `p2p ${p2pMode}: ${result.ok ? 'node started' : 'node did not start'}`, {
+        error: result.error ?? null,
+      });
+      refreshP2PStatus();
+      return result;
+    })();
+    p2pStarting = started;
+
+    try {
+      return await started;
+    } finally {
+      // Only the caller that owns the in-flight start clears it. Clearing unconditionally would be
+      // safe today (the promise is shared and idempotent) but would break the moment a second start
+      // could begin while the first was still running.
+      if (p2pStarting === started) p2pStarting = null;
+    }
+  }
+
+  /** Stop the node and let go of every channel. Idempotent and awaitable. */
+  async function closeP2P() {
+    // Await a start that is still in flight first: closing a node that is halfway through binding
+    // would race the bind and could leave a socket nobody references.
+    if (p2pStarting !== null) await p2pStarting.catch(() => null);
+    const node = p2pNode;
+    if (node === null) return;
+    try {
+      await node.close();
+    } catch (error) {
+      log('warn', 'p2p: closing the node failed', { error: error?.message ?? String(error) });
+    }
+    p2pChannels.clear();
+    refreshP2PStatus();
+  }
+
+  /** Remember which channel a task's result should travel back over, and release it on close. */
+  function rememberChannel(taskId, channel) {
+    const previous = p2pChannels.get(taskId);
+    if (previous?.channel === channel) return;
+    if (previous) previous.channel.removeListener('close', previous.onClose);
+    const onClose = () => {
+      if (p2pChannels.get(taskId)?.channel === channel) p2pChannels.delete(taskId);
+    };
+    p2pChannels.set(taskId, { channel, onClose });
+    channel.on('close', onClose);
+  }
+
+  /** The channel a task's result can be acknowledged over, or null when there is none. */
+  const channelFor = (taskId) => p2pChannels.get(taskId)?.channel ?? null;
+
+  /**
+   * Release the channel a task used, once the attempt is over.
+   *
+   * A channel exists for one attempt: the offer arrives on it and the result notice is acknowledged
+   * on it, and nothing else is expected. Without this, an agent accumulated one live session per task
+   * it ever handled -- and a session whose peer has gone away is invisible in every status surface
+   * except the channel count, which is exactly how a leak becomes a mystery months later. Closing is
+   * cheap: the mapping is re-punchable, and a duplicate offer that arrives afterwards simply has no
+   * channel to answer on (the relay copy is the durable one).
+   */
+  function releaseChannel(taskId) {
+    const entry = p2pChannels.get(taskId);
+    if (!entry) return;
+    p2pChannels.delete(taskId);
+    entry.channel.removeListener('close', entry.onClose);
+    clearTimeout(entry.lingerTimer);
+    try {
+      entry.channel.close('attempt-complete');
+    } catch {
+      /* the path is already gone; that is the state this function produces */
+    }
+  }
+
+  /**
+   * Release a task's channel after a bounded linger.
+   *
+   * The linger is the difference between "no leak" and "a duplicate cannot be answered": a
+   * re-delivery of a finished attempt (the relay replaying an offer, or a dispatcher retrying a push)
+   * is answered over the channel, and that is only possible while the channel exists. 30 seconds is
+   * long enough to cover a retry and short enough that a long-lived agent does not accumulate one
+   * session per task it has ever run.
+   */
+  function scheduleChannelRelease(taskId) {
+    const entry = p2pChannels.get(taskId);
+    if (!entry) return;
+    clearTimeout(entry.lingerTimer);
+    const timer = setTimeout(() => releaseChannel(taskId), p2pChannelLingerMs);
+    timer.unref?.();
+    entry.lingerTimer = timer;
+  }
+
+  /** The STUN list the node is actually querying, for a status surface that can be quoted. */
+  const p2pStunServers = () => p2pNode?.stunServers ?? null;
 
   /**
    * Absolute path of the cross-process diagnostics file (task-16).
@@ -936,12 +1370,39 @@ export function createAgent(options) {
      * outside the window" from "your secret is wrong".
      */
     lastRelayError: null,
+    /**
+     * The agent's P2P facts (v0.4.0): mode, whether the node is running, what it announced, how
+     * many punches went each way, and the start error when there is one.
+     *
+     * A getter rather than a field because every read must be a *fresh* plain object: this is
+     * published to another process (the plugin's `w2m_status`), and a shared object would let a
+     * reader mutate the agent's own view of its transport. The full node status -- including the
+     * reflexive address and candidate list -- is available from `agent.p2pNode`.
+     */
+    get p2p() {
+      return p2pStatusSnapshot();
+    },
     /** @type {object|null} */
     current: null,
   };
 
   /** @type {object[]} */
   const queue = [];
+  /**
+   * Offers whose attempt is already queued or running, keyed by {@link identityKeyFor}.
+   *
+   * This is v0.4.0's exactly-once guard, and it is deliberately *synchronous*: `enqueue` checks it
+   * and writes to it without an `await` anywhere between, so two copies of one offer -- one over
+   * the relay, one over a channel, in either order -- cannot both reach the queue. `completed` and
+   * the spool cannot do this job on their own: neither knows anything until an envelope exists,
+   * which is exactly the window a duplicate arrives in.
+   *
+   * Released in `pump`'s `finally`, once the attempt has delivered (or failed to). It is not
+   * released in `handleOffer` so an offer that throws is still retryable.
+   *
+   * @type {Set<string>}
+   */
+  const claimed = new Set();
   /**
    * Recently delivered envelopes, keyed by `dedupe_key#attempt`.
    *
@@ -988,14 +1449,14 @@ export function createAgent(options) {
   let idleHeartbeatTimer = null;
 
   /**
-   * @param {string|null|undefined} dedupeKey
-   * @param {number} attempt
-   * @returns {string|null}
+   * Remember a delivered envelope, bounded.
+   *
+   * The key is {@link identityKeyFor}'s, not a second spelling of the same idea: a cache keyed
+   * differently from the dedupe check would be a cache that never hits.
+   *
+   * @param {string|null} key
+   * @param {object} envelope
    */
-  const cacheKeyFor = (dedupeKey, attempt) =>
-    dedupeKey ? `${dedupeKey}#${Number(attempt) || 1}` : null;
-
-  /** @param {string|null} key @param {object} envelope */
   function rememberCompleted(key, envelope) {
     if (!key) return;
     completed.delete(key);
@@ -1035,6 +1496,37 @@ export function createAgent(options) {
       // relay's own `reconnect_attempts`, which answers a different question).
       unstable_reconnects: reconnectAttempt,
       replay_truncated: state.replayTruncated !== null,
+      // v0.4.0: the direct path's facts, so a plugin on another host can answer "which path is this
+      // machine actually using?" without asking the agent process. A summarised shape on purpose --
+      // the candidate list and the reflexive address are available in-process from `agent.p2p`.
+      p2p: p2pSummary(),
+    };
+  }
+
+  /**
+   * The published (cross-process) subset of the P2P facts.
+   *
+   * Deliberately not the whole {@link p2pStatusSnapshot}: this is written to disk and read by a
+   * plugin in another process, so it names a fixed set of fields rather than mirroring whatever
+   * the node happens to expose.
+   *
+   * @returns {object}
+   */
+  function p2pSummary() {
+    const snapshot = p2pStatusSnapshot();
+    return {
+      mode: snapshot.mode,
+      enabled: snapshot.enabled,
+      running: snapshot.running,
+      mapping: snapshot.mapping,
+      reflexive: snapshot.reflexive,
+      candidates: snapshot.candidates.length,
+      announced_at: snapshot.announced_at,
+      punches_out: snapshot.punches_out,
+      punches_in: snapshot.punches_in,
+      dial_failures: snapshot.dial_failures,
+      channels: snapshot.channels,
+      last_error: snapshot.last_error,
     };
   }
 
@@ -1233,6 +1725,43 @@ export function createAgent(options) {
     return null;
   }
 
+  /**
+   * GET JSON and decode the response body (v0.4.0).
+   *
+   * The mirror of {@link postJson} for the one read the direct path needs: a peer's announced
+   * candidates (`GET /v1/peer/{machineId}`). Signed exactly like every other request, so the
+   * P2P signalling routes cannot be the one place a signed link silently stops being signed.
+   *
+   * It deliberately does **not** record `state.lastRelayError` the way `postJson` does. A 404 here
+   * is the ordinary answer for "this machine has not announced", which is a normal state in
+   * `auto` mode -- recording it as the last relay error would make a healthy link look broken
+   * every time a relay-only peer was dialled.
+   *
+   * @param {string} path
+   * @returns {Promise<{status: number, ok: boolean, json: any, text: string, error: string|null}>}
+   */
+  async function getJson(path) {
+    const headers = { accept: 'application/json' };
+    if (token()) headers.authorization = `Bearer ${token()}`;
+    Object.assign(headers, signingHeaders('GET', path));
+    let response;
+    try {
+      response = await fetchImpl(url(path), { method: 'GET', headers });
+    } catch (error) {
+      // Returned rather than thrown: `P2PNode.dial()` names a lookup failure with its own code, and
+      // an exception crossing that boundary would be reported as a punch failure instead.
+      return { status: 0, ok: false, json: null, text: '', error: error?.message ?? String(error) };
+    }
+    const text = await response.text();
+    let json = null;
+    try {
+      json = text === '' ? null : JSON.parse(text);
+    } catch {
+      json = null;
+    }
+    return { status: response.status, ok: response.ok, json, text, error: null };
+  }
+
   // -- Pairing -------------------------------------------------------------
 
   /**
@@ -1318,6 +1847,59 @@ export function createAgent(options) {
   }
 
   // -- Envelope assembly ---------------------------------------------------
+
+  /**
+   * The `p2p` block of a result envelope (v0.4.0 §6).
+   *
+   * It is built **before** `envelope_sha256` is computed, because the hash covers the whole
+   * envelope: attaching these fields afterwards would leave a hash that does not cover the bytes
+   * it claims to cover, and `verifyEnvelope` would fail on an envelope nobody tampered with. That
+   * is also why the direct copy uses the very same object -- one envelope, two deliveries.
+   *
+   * Every field answers a question a reader of a *stored* result actually asks:
+   *
+   *   * `mode`      -- this agent's configured mode, or the dispatcher's when it stated one. The
+   *                   dispatcher's value is used when present because a task dispatched by an
+   *                   `auto` machine may be executed by a `direct` one, and "why did this path
+   *                   win" is a question about the dispatcher's intent.
+   *   * `offer_path`-- how the offer got here, as this agent observed it (never as claimed on the
+   *                   wire: only the channel path can set it).
+   *   * `result_path`-- `'p2p'` **only** when the envelope was acknowledged over the direct
+   *                   channel. Absent means "no direct result", which is not the same fact as
+   *                   `'relay'` and must not be spelled as one.
+   *   * `reason`    -- why the direct path was not the answer, or null when it was.
+   *   * `rtt_ms`    -- the punch's measured round trip, or null. Null rather than 0: a round trip
+   *                   that was never measured is not an instantaneous one.
+   *   * `peer`      -- the peer's address as seen by this agent, or null for an inbound channel
+   *                   (a HELLO carries a session, not an identity).
+   *   * `session`   -- the punch's session id, which is what correlates two agents' logs.
+   *   * `mapping`   -- the NAT mapping this agent's announcement measured.
+   *
+   * @param {object} context
+   * @returns {object}
+   */
+  function envelopeP2P(context) {
+    const offer = context.offer ?? {};
+    const transport = context.p2pTransport ?? offerTransportOf(offer, p2pStatusSnapshot());
+    const delivery = context.p2pDelivery ?? p2pDeliveryMark();
+    const record = context.p2pRecord ?? null;
+    const dispatcherMode = offer?.p2p?.mode;
+    return {
+      mode: typeof dispatcherMode === 'string' && dispatcherMode !== '' ? dispatcherMode : p2pMode,
+      offer_path: transport.offer_path,
+      ...(delivery.path === null ? {} : { result_path: delivery.path }),
+      // The key is OMITTED when there is nothing to explain, and that is not the same as setting it
+      // to `undefined`: `JSON.stringify` would drop that, but the envelope hash is computed with JCS,
+      // whose implementation (rightly) refuses a non-JSON value. Measured -- `reason: undefined`
+      // here made every direct-path result fail to build its envelope with
+      // `jcs: property reason is undefined`, so the task executed and then vanished from the ledger.
+      ...(typeof transport.reason === 'string' && transport.reason !== '' ? { reason: transport.reason } : {}),
+      rtt_ms: delivery.rtt_ms ?? record?.rtt_ms ?? null,
+      peer: record?.peer ?? null,
+      session: record?.session ?? null,
+      mapping: p2pNode?.status.mapping ?? null,
+    };
+  }
 
   /**
    * Turn a finished (or refused) run into a complete §5.1 envelope.
@@ -1431,6 +2013,16 @@ export function createAgent(options) {
     if (Array.isArray(protocolViolations) && protocolViolations.length > 0) {
       envelope.protocol_violations = protocolViolations;
     }
+
+    // v0.4.0 §6. Always present, like the relay's own offer fields and for the same reason: a
+    // v0.3.9 machine and an `auto` one are then distinguishable from the stored envelope alone,
+    // instead of `transport` being absent both when the direct path was never tried and when it
+    // was tried and lost. `transport` is how the *offer* arrived; `p2p.result_path` is how the
+    // *result* left. They are different facts and are allowed to differ -- a relay offer can be
+    // answered over a channel the agent opened for that task.
+    const transport = context.p2pTransport ?? offerTransportOf(offer, p2pStatusSnapshot());
+    envelope.transport = transport.offer_path;
+    envelope.p2p = envelopeP2P({ ...context, p2pTransport: transport });
     return buildEnvelope(envelope);
   }
 
@@ -1458,6 +2050,28 @@ export function createAgent(options) {
   }
 
   /**
+   * Does this agent's mode allow the offer to run at all (v0.4.0 §1)?
+   *
+   * `direct` is the one mode where the *transport* is a gate rather than a preference, and it is
+   * deliberately total: any offer that did not arrive over a channel is refused, including one
+   * that arrived over the relay while a punch for the same task was still being attempted. The
+   * alternative -- accepting the relay's copy when a channel happens to exist -- would make the
+   * mode's meaning depend on a race, which is exactly the ambiguity `direct` exists to remove
+   * ("a failed punch is not hidden").
+   *
+   * @param {object} offer
+   * @returns {{reason: string, detail: string}|null}
+   */
+  function p2pRefusal(offer) {
+    if (p2pMode !== 'direct') return null;
+    if (offer.p2p_transport === 'p2p') return null;
+    return {
+      reason: REFUSAL.P2P_UNAVAILABLE,
+      detail: 'p2pMode is "direct" and this offer arrived over the relay',
+    };
+  }
+
+  /**
    * The full lifecycle of one offer.
    *
    * @param {object} offer
@@ -1479,8 +2093,34 @@ export function createAgent(options) {
       task_id: offer.task_id,
       attempt: Number(offer.attempt) || 1,
       controller,
-      key: cacheKeyFor(offer.dedupe_key, offer.attempt),
+      key: identityKeyFor(offer),
     };
+
+    // ---- 0. mode gate (v0.4.0 §1) ----------------------------------------
+    // Checked before the spool: a refusal is not a run. Spooling it would leave a `claimed` entry
+    // whose envelope is written by `deliver`, which would in turn claim a task that never executed
+    // -- so the refusal is answered and the attempt is done.
+    const refusal = p2pRefusal(offer);
+    if (refusal) {
+      log('warn', `refused ${offer.task_id}: ${refusal.reason}`, { detail: refusal.detail });
+      runAbort = null;
+      state.current = null;
+      state.handled += 1;
+      await finish({
+        offer,
+        cwdRel,
+        commandArgv,
+        anchorsBefore: null,
+        anchorsAfter: null,
+        execution: null,
+        status: 'refused',
+        refusalReason: refusal.reason,
+        warnings: [`P2P_UNAVAILABLE: ${refusal.detail}`],
+        startedAt: new Date().toISOString(),
+        endedAt: new Date().toISOString(),
+      });
+      return;
+    }
 
     // ---- 1. spool before anything else (§0) ------------------------------
     // Fail closed: if the durable copy cannot be written, running the command
@@ -1825,6 +2465,109 @@ export function createAgent(options) {
     }
   }
 
+  /**
+   * Try the direct path for one attempt, before the envelope exists.
+   *
+   * WHY THIS RUNS FIRST, AND WHY THE FRAME IS NOT THE ENVELOPE
+   *
+   * `result_path` is `'p2p'` only when the envelope was *actually acknowledged* over the channel,
+   * and `envelope_sha256` covers the whole envelope -- so the fact has to be known before the
+   * envelope is built, or the hash would not cover the bytes it claims to cover. The obvious way
+   * out would be to send the finished envelope and stamp `result_path` afterwards, which is
+   * precisely the mutation that would break `verifyEnvelope`. So the order is inverted instead:
+   * announce the result on the channel (`{type:'task.result', task_id}`), wait for the dispatcher's
+   * `{type:'result.ack', task_id}`, and only then build the one envelope that describes what
+   * happened.
+   *
+   * The direct frame therefore carries the frame *type* and the task identity rather than the whole
+   * envelope. That is a deliberate narrowing, and it is worth stating plainly: the fast path
+   * currently saves the dispatcher the wait for the relay's copy, not the bytes. Carrying the full
+   * envelope on the channel would need the envelope before the acknowledgement that decides one of
+   * its fields -- see the note in the v0.4.0 report and `PROTOCOL-v0.4.0.md`'s open question.
+   *
+   * @param {object} offer
+   * @returns {Promise<ReturnType<typeof p2pDeliveryMark>>}
+   */
+  async function planDirectDelivery(offer) {
+    if (channelFor(offer?.task_id) === null) return p2pDeliveryMark();
+    const direct = await sendResultDirect(offer.task_id);
+    if (direct.delivered) {
+      log('info', `result acknowledged over the direct channel for ${offer.task_id}`, {
+        rtt_ms: direct.rtt_ms,
+      });
+      return p2pDeliveryMark({ path: 'p2p', asked: true, rtt_ms: direct.rtt_ms });
+    }
+    // A timeout is a reported failure; "no channel at all" is not, and `asked` keeps the two
+    // apart for anything reading the agent's own diagnostics.
+    log('warn', `direct result delivery failed for ${offer.task_id}; the relay copy is unaffected`, {
+      error: direct.error,
+    });
+    return p2pDeliveryMark({ asked: true, error: direct.error });
+  }
+
+  /**
+   * Announce one result on its direct channel and wait for the acknowledgement, bounded.
+   *
+   * This is the fast path, and it is deliberately *only* a fast path: the relay copy is posted by
+   * the caller whatever happens here, so nothing in this function can lose a result. The wait is
+   * bounded by {@link P2P_ACK_TIMEOUT_MS} for the same reason -- a dispatcher that stops answering
+   * must cost the ledger a bounded delay, never a hang.
+   *
+   * It is deliberately **not** retried. `P2PChannel.send` already retransmits every fragment until
+   * the peer acknowledges it; a retry on top would be a second retransmission protocol layered on
+   * the first, and "the dispatcher is gone" is not a condition that improves by asking again.
+   *
+   * @param {string} taskId
+   * @returns {Promise<{delivered: boolean, rtt_ms: number|null, error: string|null}>}
+   */
+  async function sendResultDirect(taskId) {
+    const channel = channelFor(taskId);
+    if (channel === null) return { delivered: false, rtt_ms: null, error: null };
+
+    /** Why the wait ended without an ack, when the channel itself said so. */
+    let lastAckError = null;
+    let registration = null;
+    const acked = new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        p2pResultWaiters.delete(taskId);
+        resolve(false);
+      }, p2pAckTimeoutMs);
+      // Never keep the process alive for an acknowledgement.
+      timer.unref?.();
+      registration = {
+        settle: (value, reason) => {
+          clearTimeout(timer);
+          if (p2pResultWaiters.get(taskId) === registration) p2pResultWaiters.delete(taskId);
+          if (value === false && typeof reason === 'string' && reason !== '') lastAckError = reason;
+          resolve(value);
+        },
+      };
+      p2pResultWaiters.set(taskId, registration);
+    });
+
+    const startedAt = process.hrtime.bigint();
+    // `machine_id` travels with the notice because the dispatcher has to be able to say *which*
+    // machine finished without waiting for the relay's copy — the plugin names its direct-result
+    // inbox file after it. The frame still carries no envelope: `result_path` is decided by the
+    // acknowledgement this frame is waiting for, and `envelope_sha256` covers `result_path`, so
+    // sending the envelope first and stamping it afterwards would break the hash it is signed with.
+    const frame = JSON.stringify({ type: 'task.result', task_id: taskId, machine_id: identity.machine_id });
+    try {
+      await channel.send(frame);
+    } catch (error) {
+      registration.settle(false, `P2P_SEND_FAILED: ${error?.message ?? String(error)}`);
+    }
+
+    const delivered = await acked;
+    const elapsed = Number(process.hrtime.bigint() - startedAt) / 1e6;
+    if (delivered) return { delivered: true, rtt_ms: Math.round(elapsed * 100) / 100, error: null };
+    return {
+      delivered: false,
+      rtt_ms: null,
+      error: lastAckError ?? `P2P_ACK_TIMEOUT: no result.ack within ${p2pAckTimeoutMs}ms`,
+    };
+  }
+
   /** Build, spool, send and acknowledge one envelope. */
   async function finish(context) {
     const anchorsAfter = context.anchorsAfter ?? (await safePostState(context.offer, context.warnings));
@@ -1834,12 +2577,26 @@ export function createAgent(options) {
       anchorsAfter,
       toolchain,
       comparePolicy: context.offer.compare_policy,
+      // The bounded wait happens *before* the envelope is built, because `result_path` has to be
+      // inside the envelope when `envelope_sha256` is taken; see `sendResultDirect`.
+      p2pDelivery: context.p2pDelivery ?? (await planDirectDelivery(context.offer)),
     });
     await deliver(envelope);
+    // The attempt is over. The channel lingers (bounded) so a duplicate of this attempt can still be
+    // answered on it, and is released afterwards.
+    scheduleChannelRelease(envelope.task_id);
     return envelope;
   }
 
-  /** Spool -> POST -> ack (delete only after Rabbit confirms). */
+  /**
+   * Spool -> POST to the relay -> ack.
+   *
+   * The spool is written first, so a crash anywhere later leaves a replayable envelope; the relay
+   * copy is posted **unconditionally**, because the relay is the ledger and the only writer allowed
+   * to store a machine's result. The direct copy has already been attempted and boundedly awaited
+   * by the time this runs (`planDirectDelivery`), and a failure there changes nothing here -- which
+   * is the property `test/p2p-agent.test.mjs` pins down with a dispatcher that stops answering.
+   */
   async function deliver(envelope) {
     spool.saveEnvelope({
       task_id: envelope.task_id,
@@ -1852,8 +2609,12 @@ export function createAgent(options) {
       spool.ack({ task_id: envelope.task_id, attempt: envelope.attempt });
       // Keep the delivered envelope around (bounded) so a transport re-delivery
       // of this same attempt is answered instead of executed again.
-      rememberCompleted(cacheKeyFor(envelope.dedupe_key, envelope.attempt), envelope);
-      log('info', `result delivered for ${envelope.task_id}`, { status: envelope.status });
+      rememberCompleted(identityKeyFor(envelope), envelope);
+      log('info', `result delivered for ${envelope.task_id}`, {
+        status: envelope.status,
+        transport: envelope.transport,
+        result_path: envelope.p2p?.result_path ?? 'relay',
+      });
       return true;
     }
     log('warn', `result kept in spool for ${envelope.task_id}`, {
@@ -1942,7 +2703,16 @@ export function createAgent(options) {
     publishState();
   }
 
-  /** @param {{event: string, data: string, id: string|null}} frame */
+  /**
+   * Decode one SSE frame and dispatch it.
+   *
+   * A thin wrapper on purpose (v0.4.0): the dispatch itself is `dispatchFrame`, so an SSE frame and
+   * a JSON frame off a P2P channel reach *the same* handler. The alternative -- a second switch for
+   * the direct path -- is how "the offer runs over either transport" quietly becomes "the offer
+   * runs over the relay, and something almost like it runs over the channel".
+   *
+   * @param {{event: string, data: string, id: string|null}} frame
+   */
   function handleFrame(frame) {
     let payload;
     try {
@@ -1951,12 +2721,63 @@ export function createAgent(options) {
       log('warn', 'ignoring unparseable SSE frame', { event: frame.event, data: frame.data.slice(0, 120) });
       return;
     }
-    const type = payload?.type ?? frame.event;
-    if (Number.isInteger(payload?.seq)) state.seq = Math.max(state.seq, payload.seq);
-    else if (frame.id && /^\d+$/.test(frame.id)) state.seq = Math.max(state.seq, Number(frame.id));
+    dispatchFrame(payload, { event: frame.event, id: frame.id ?? null, transport: 'relay' });
+  }
+
+  /**
+   * One message arrived on a P2P channel.
+   *
+   * The body is a frame, not an offer: the W2M convention is the relay's own frame shape
+   * (`{type:'task.offer', ...}`), so it is parsed with {@link parseP2PFrame} and then dispatched
+   * exactly like an SSE frame would be.
+   *
+   * @param {{from: string|null, channel: object, peer: object, session: number, payload: unknown}} event
+   */
+  function handleP2PMessage(event) {
+    const payload = parseP2PFrame(event.payload);
+    if (payload === null) {
+      log('warn', 'ignoring non-JSON frame on a P2P channel', {
+        peer: event.peer ?? null,
+        session: event.session ?? null,
+        bytes: Buffer.isBuffer(event.payload) ? event.payload.length : null,
+      });
+      return;
+    }
+    dispatchFrame(payload, { event: payload.type, id: null, transport: 'p2p', channel: event.channel });
+  }
+
+  /**
+   * The one dispatcher both transports feed.
+   *
+   * `transport` is the only difference between an offer from the relay and an offer from a channel,
+   * and it is stamped onto the offer itself (`p2p_transport`) rather than carried alongside: the
+   * dedupe path hands offers to `handleOffer` by reference and drops duplicates before they get
+   * there, so the fact has to travel *with* the offer or it would be lost exactly when two copies
+   * race -- which is the case it exists for.
+   *
+   * `state.seq` is advanced for relay frames only. A channel frame carries no `seq` (it never went
+   * through the relay's event ring), and letting one move the cursor would make the agent tell the
+   * relay it had already seen events it had not.
+   *
+   * @param {object} payload
+   * @param {{event: string, id: string|null, transport: 'p2p'|'relay', channel?: object}} source
+   */
+  function dispatchFrame(payload, source) {
+    const type = payload?.type ?? source.event;
+    if (source.transport === 'relay') {
+      if (Number.isInteger(payload?.seq)) state.seq = Math.max(state.seq, payload.seq);
+      else if (source.id && /^\d+$/.test(source.id)) state.seq = Math.max(state.seq, Number(source.id));
+    }
 
     switch (type) {
       case 'ready': {
+        // A channel frame with this type is not the relay's `ready`: it is a dispatcher pushing a
+        // frame it had no business pushing, and treating it as "connected" would mark an agent with
+        // no stream as connected.
+        if (source.transport !== 'relay') {
+          log('info', 'ignoring a `ready` frame that did not come from the relay');
+          break;
+        }
         // §3.1: nothing counts as connected before `ready` arrives.
         state.connected = true;
         const relayId =
@@ -2000,19 +2821,36 @@ export function createAgent(options) {
         publishState();
         break;
       }
-      case 'task.offer':
-        enqueue(payload);
-        break;
-      case 'task.cancel': {
-        const taskId = payload.task_id;
-        const index = queue.findIndex((item) => item.task_id === taskId);
-        if (index !== -1) queue.splice(index, 1);
-        if (state.current && state.current.task_id === taskId) {
-          log('warn', `task.cancel for running ${taskId}: ${payload.reason ?? ''}`);
-          state.current.controller.abort();
-        } else {
-          log('info', `task.cancel for idle ${taskId}`);
+      case 'task.offer': {
+        // The transport travels *on* the offer (see this function's note). Any `p2p_transport` a
+        // peer tried to put on the wire is overwritten, so a relay frame can never claim the
+        // direct path -- the only thing that sets `'p2p'` here is the channel having delivered it.
+        const offer = { ...payload, p2p_transport: source.transport };
+        if (source.transport === 'p2p') {
+          if (typeof offer.task_id !== 'string' || offer.task_id === '') {
+            log('warn', 'ignoring a direct offer with no task_id');
+            break;
+          }
+          // Remembered before the offer is queued: the result path must exist by the time the
+          // result is produced, and a channel lost between the two would leave `result_path` null
+          // with no way to tell why.
+          rememberChannel(offer.task_id, source.channel);
         }
+        enqueue(offer);
+        break;
+      }
+      case 'task.cancel': {
+        cancelTask(payload.task_id, payload.reason);
+        break;
+      }
+      case 'result.ack': {
+        // Only meaningful on a channel: an ack the relay relays is not evidence about the direct
+        // path, and `result_path` must never be set from it.
+        if (source.transport !== 'p2p') {
+          log('info', `ignoring result.ack for ${payload.task_id} on the relay path`);
+          break;
+        }
+        settleResultAck(payload.task_id);
         break;
       }
       case 'peer.hello':
@@ -2055,8 +2893,16 @@ export function createAgent(options) {
         break;
       }
       case 'task.result':
-        // Added by the relay after this contract was frozen: a result reached
-        // Rabbit. Nothing to do here, but reporting it beats "unknown event".
+        // Two different frames wear this type. From the relay it is the notice that a result
+        // reached Rabbit. From a channel it is a *dispatcher* pushing a result at this agent
+        // (machine A's result travelling to machine B directly) -- which this agent does not
+        // consume in v0.4.0, and says so rather than pretending it was the relay's notice.
+        if (source.transport === 'p2p') {
+          log('info', `result for ${payload.task_id} arrived over a direct channel (not consumed by the executor)`, {
+            status: payload.status,
+          });
+          break;
+        }
         log('info', `result accepted for ${payload.task_id}`, {
           status: payload.status,
           deduped: payload.deduped === true,
@@ -2067,49 +2913,125 @@ export function createAgent(options) {
     }
   }
 
+  /** Resolve the waiter for one result acknowledgement, if there is one. */
+  function settleResultAck(taskId) {
+    if (typeof taskId !== 'string' || taskId === '') return;
+    const waiter = p2pResultWaiters.get(taskId);
+    if (!waiter) {
+      // An ack for an already-settled wait is ordinary: the direct copy is sent once, and a
+      // dispatcher that re-acks a frame it processed twice must not resurrect anything.
+      log('info', `result.ack for ${taskId} with no wait in flight`);
+      return;
+    }
+    waiter.settle(true, null);
+  }
+
+  /** Drop a queued task and abort a running one (§3.4). Shared by both transports. */
+  function cancelTask(taskId, reason) {
+    const index = queue.findIndex((item) => item.task_id === taskId);
+    if (index !== -1) queue.splice(index, 1);
+    if (state.current && state.current.task_id === taskId) {
+      log('warn', `task.cancel for running ${taskId}: ${reason ?? ''}`);
+      state.current.controller.abort();
+    } else {
+      log('info', `task.cancel for idle ${taskId}`);
+    }
+  }
+
   /**
-   * Queue an offer, unless we already have it.
+   * The dedupe identity of one offer (v0.4.0).
    *
-   * Dedupe by `dedupe_key` (§4.4): a re-delivery of a task we already finished
-   * is answered from the spool instead of being executed a second time, which
-   * matters for `write: true` offers.
+   * Two facts drive this, and the second one is new:
+   *
+   *   * Rabbit's idempotency triple is `(machine_id, dedupe_key, attempt)` (§4.4), so `attempt` is
+   *     part of the identity: a new attempt is a genuine retry and must run again.
+   *   * The same offer now arrives over **two transports** -- pushed over a channel by the
+   *     dispatcher and published over the relay's SSE stream -- and either may arrive first. They
+   *     carry the same `task_id` and the same `dedupe_key`, so the identity must be computed from
+   *     the lease's facts and never from the path the copy took. A P2P copy that deduped differently
+   *     from the relay copy would execute a `write: true` command twice, which is the failure this
+   *     whole mechanism exists to prevent.
+   *
+   * `task_id#attempt` is the fallback for an offer with no `dedupe_key`. It is intentionally
+   * *weaker* than the documented triple and only reached by a dispatcher that omitted the field, so
+   * it widens dedupe rather than narrowing it -- for the two-transport case the alternative is not
+   * "no dedupe", it is "no dedupe at all", which is strictly worse.
+   *
+   * @param {{task_id?: string, dedupe_key?: string|null, attempt?: number}|null} offer
+   * @returns {string|null}
+   */
+  function identityKeyFor(offer) {
+    const taskId = typeof offer?.task_id === 'string' && offer.task_id !== '' ? offer.task_id : null;
+    if (taskId === null) return null;
+    const attempt = Number(offer?.attempt) || 1;
+    const dedupeKey = typeof offer?.dedupe_key === 'string' && offer.dedupe_key !== '' ? offer.dedupe_key : null;
+    return dedupeKey === null ? `${taskId}#${attempt}` : `${dedupeKey}#${attempt}`;
+  }
+
+  /**
+   * Queue an offer, unless we already have it -- over either transport.
+   *
+   * Dedupe by the lease's identity (§4.4 plus v0.4.0's two-transport rule): a re-delivery of a task
+   * we already finished is answered from the cache or the spool instead of being executed a second
+   * time, which matters for `write: true` offers.
+   *
+   * The three checks are in the order that keeps the promise above true:
+   *
+   *   1. **already claimed** -- queued, running, or already executed. Answered without touching the
+   *      queue. This is the branch the direct-path duplicate hits while the first copy is still
+   *      running: the second copy is recorded (its channel, if it came over one) and dropped.
+   *   2. **cached envelope** -- the attempt finished and the relay accepted it. The envelope is
+   *      re-delivered, which is v0.3.9's behaviour and is safe because the relay dedupes it.
+   *   3. **spooled envelope** -- the attempt finished but the relay has not confirmed it yet.
+   *
+   * A copy that arrives *while* the first is running therefore never re-executes and never produces
+   * a second result. `pump` is single-entry and `claimed` is written synchronously, so there is no
+   * interleaving between the check and the write.
    *
    * @param {object} offer
    */
   function enqueue(offer) {
     const attempt = Number(offer?.attempt) || 1;
-    const key = cacheKeyFor(offer?.dedupe_key, attempt);
-    const running = state.current;
-    if (key && running && running.key === key) {
-      log('info', `ignoring re-delivery of running task ${offer.task_id}`);
+    const key = identityKeyFor(offer);
+
+    if (key !== null && claimed.has(key)) {
+      // The claim covers exactly the window in which a second copy must not start a second run:
+      // from here until `handleOffer` has delivered its envelope. The channel (if this copy came
+      // over one) was already remembered by `dispatchFrame`, so the result will reach it.
+      log('info', `ignoring duplicate offer ${offer.task_id} attempt ${attempt} (already claimed, arrived over ${offer.p2p_transport ?? 'relay'})`);
       return;
     }
-    if (key && queue.some((item) => cacheKeyFor(item.dedupe_key, item.attempt) === key)) {
-      log('info', `ignoring duplicate queued offer ${offer.task_id}`);
-      return;
-    }
-    if (key) {
+
+    if (key !== null) {
       const cached = completed.get(key);
       if (cached) {
         log('info', `dedupe hit: resending cached result for ${offer.task_id} attempt ${attempt}`);
         void deliver(cached);
+        // If this copy arrived over a channel, the dispatcher is waiting for an answer on it. The
+        // relay copy above is the durable one; this notice is what stops the dispatcher's bounded
+        // wait from expiring on a task that is already finished. Fire-and-forget: the answer is a
+        // courtesy, and failing to give it must never affect the spooled envelope.
+        if (offer.p2p_transport === 'p2p' && channelFor(offer.task_id) !== null) {
+          void sendResultDirect(offer.task_id).catch(() => {});
+        }
         return;
       }
-      const spooled = spool
-        .pendingResults()
-        .find(
-          (record) =>
-            record.envelope &&
-            record.dedupe_key === offer.dedupe_key &&
-            record.attempt === attempt,
-        );
+      const spooled = spool.pendingResults().find((record) => {
+        if (!record.envelope) return false;
+        return identityKeyFor({
+          task_id: record.task_id,
+          dedupe_key: record.dedupe_key ?? record.envelope.dedupe_key,
+          attempt: record.attempt,
+        }) === key;
+      });
       if (spooled) {
         log('info', `dedupe hit: resending spooled result for ${offer.task_id} attempt ${attempt}`);
         void deliver(spooled.envelope);
         return;
       }
+      claimed.add(key);
     }
-    queue.push(offer);
+    queue.push({ offer, key });
     void pump();
   }
 
@@ -2119,7 +3041,8 @@ export function createAgent(options) {
     pumping = true;
     try {
       while (queue.length > 0 && !state.stopped) {
-        const offer = queue.shift();
+        const item = queue.shift();
+        const offer = item.offer;
         try {
           await handleOffer(offer);
         } catch (error) {
@@ -2127,6 +3050,10 @@ export function createAgent(options) {
           log('error', `unhandled failure in ${offer?.task_id ?? 'offer'}`, {
             error: error?.message ?? String(error),
           });
+        } finally {
+          // Released here, not in `handleOffer`: an offer that threw before delivering must still
+          // become runnable again, or a bug would turn into a task that can never be retried.
+          if (item.key !== null) claimed.delete(item.key);
         }
         if (once) {
           stop();
@@ -2208,9 +3135,18 @@ export function createAgent(options) {
     if (typeof idleHeartbeatTimer.unref === 'function') idleHeartbeatTimer.unref();
   }
 
-  /** Stop the stream, the running command and the heartbeat. */
+  /**
+   * Stop the stream, the running command, the heartbeat and the direct path.
+   *
+   * Returns a promise so a caller can wait for the node's socket to be gone -- `close()` on the node
+   * is asynchronous (it waits for the accept loop to end). Callers that do not care still get the
+   * old fire-and-forget behaviour by ignoring the value; `w2m-localside` does not, because "the
+   * process exited" and "the port was released" are different facts on Windows.
+   *
+   * @returns {Promise<void>}
+   */
   function stop() {
-    if (state.stopped) return;
+    if (state.stopped) return Promise.resolve();
     state.stopped = true;
     if (statePublishTimer) clearInterval(statePublishTimer);
     statePublishTimer = null;
@@ -2223,6 +3159,9 @@ export function createAgent(options) {
     // mid-write", and from "still running but not connected".
     state.connected = false;
     publishState();
+    // The node is closed last: it is the only part of `stop()` that is asynchronous, and everything
+    // above must already be winding down before a channel can deliver a payload into a stopped agent.
+    return closeP2P();
   }
 
   /**
@@ -2236,10 +3175,15 @@ export function createAgent(options) {
       project,
       state: stateDir,
       allowed_commands: allowedCommands.map((prefix) => prefix.join(' ')),
+      p2p_mode: p2pMode,
     });
     if (allowedCommands.length === 0) {
       log('warn', 'no --allowed-commands configured: every offer will be refused (default-deny)');
     }
+
+    // v0.4.0: bring the direct path up first, so a channel exists before the first offer can arrive
+    // on one. Failures are recorded, never fatal -- see `startP2P`.
+    await startP2P();
 
     // Publish immediately so the file appears with the agent, not only after
     // the first heartbeat: "is an agent running here?" is the first question a
@@ -2358,6 +3302,44 @@ export function createAgent(options) {
     publishState,
     /** Send one idle diagnostic heartbeat now (v0.3.0). */
     sendIdleHeartbeat,
+    /**
+     * The direct path, for a caller that needs more than the summary (v0.4.0).
+     *
+     * Null in `relay` mode forever, and null until `start()` has built one. Exposed rather than
+     * hidden because "which port did this machine announce?" is a question an operator asks with
+     * `netstat` open, and the answer belongs to the object that owns the socket.
+     */
+    get p2pNode() {
+      return p2pNode;
+    },
+    /** The mode this agent was built with, validated at construction. */
+    p2pMode,
+    /** The STUN list the node queries, in order; null when there is no node. */
+    p2pStunServers,
+    /** Bring the direct path up on its own (also done by `start()`); never fatal. */
+    startP2P,
+    /** Close the direct path on its own (also done by `stop()`). */
+    closeP2P,
+    /**
+     * Feed one already-decoded frame into the dispatcher both transports use (v0.4.0).
+     *
+     * Exists because "an offer from a channel" and "an offer from the relay" differ in exactly one
+     * value, and a caller that needs a specific arrival order -- a test, or a future tool that
+     * injects a frame -- should not have to open a socket to express it. `transport` is the only
+     * thing it controls; the dedupe, the queue and the result path are the same code either way,
+     * which is what makes an injected frame a fair test of the real path.
+     *
+     * @param {object} payload A frame (`{type:'task.offer', ...}`).
+     * @param {{transport?: 'p2p'|'relay', channel?: object}} [origin]
+     */
+    ingest(payload, origin = {}) {
+      dispatchFrame(payload, {
+        event: typeof payload?.type === 'string' ? payload.type : 'message',
+        id: null,
+        transport: origin.transport === 'p2p' ? 'p2p' : 'relay',
+        channel: origin.channel,
+      });
+    },
     /** Whether request signing is configured (v0.3.0). */
     signingEnabled: signer !== null,
     /** Absolute path of the published diagnostics file. */

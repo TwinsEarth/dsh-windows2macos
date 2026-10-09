@@ -31,7 +31,7 @@ echo
 # Kept in step with the explicit list in .github/workflows/ci.yml. A suite that is
 # not named here is silently not run, which is how four suites (166 cases) once
 # shipped without ever executing in CI.
-all_suites=(relay broadcast agent tools schedule auto-update update-source update-install update-wiring signing stress metrics metrics-route shared-config tool-cards p2p-stun p2p-transport p2p-signaling e2e crossnetwork signing-e2e outbound-only recovery pipeline-e2e)
+all_suites=(relay broadcast agent tools schedule auto-update update-source update-install update-wiring signing stress metrics metrics-route shared-config tool-cards p2p-stun p2p-transport p2p-signaling p2p-node p2p-transport-fields p2p-plugin p2p-agent stun-server e2e crossnetwork signing-e2e outbound-only recovery pipeline-e2e)
 if [[ $# -gt 0 ]]; then
   suites=("$@")
 else
@@ -51,7 +51,10 @@ for suite in "${suites[@]}"; do
     continue
   fi
   echo "=== ${suite} ==="
-  if "${node_bin}" --test "${file}"; then
+  # --test-force-exit: the end-to-end suites hold open SSE connections, and a long-lived
+  # stream keeps Node's event loop alive after the assertions have passed. Without it a
+  # green suite can hang the run, which looks exactly like a suite that never finished.
+  if "${node_bin}" --test --test-force-exit "${file}"; then
     names+=("${suite}")
     states+=("pass")
   else

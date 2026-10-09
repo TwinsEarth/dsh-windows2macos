@@ -46,6 +46,7 @@
  */
 
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -55,6 +56,21 @@ import path from 'node:path';
 // `https://host/w2m` means, which is the defect §2 exists to fix.
 // `src/agent/` does not import `src/plugin/`, so the dependency runs one way and cannot cycle.
 import { joinUrl, resolveBaseUrl } from '../agent/url.mjs';
+import { deviceFilePath } from '../agent/identity.mjs';
+import {
+  DEFAULT_P2P_MODE,
+  P2P_MODES,
+  P2PNode,
+  SHARED_SERVER,
+  normalizeP2PMode,
+  stunServersWithShared,
+} from '../agent/p2p-node.mjs';
+import { parseServer } from '../agent/stun.mjs';
+// The result-deduplication identity the relay mints. Imported rather than re-implemented: the value
+// is compared byte for byte by the executor, so a second copy of the formula that drifted by one
+// character would turn "delivered twice, executed once" into "executed twice" -- the exact failure
+// the dedupe key exists to prevent.
+import { SHELL_ID_DIRECT, computeCommandHash, computeDedupeKey } from '../relay/state.mjs';
 import { createAutoUpdater, findProfileDir, resolveCurrentVersion } from './auto-update.mjs';
 import { loadSharedConfig, describeSharedConfig } from './shared-config.mjs';
 import { DEFAULT_DAILY_TIMES, DEFAULT_TIME_ZONE } from './schedule.mjs';
@@ -386,17 +402,60 @@ async function loadDefineTool() {
  * the diagnostic you reach for *when* the setup is broken, so it must still run without it.
  *
  * @param {object} config Entry configuration from the profile patch.
- * @returns {{rabbitUrl: string|null, stateDir: string|null, projectDir: string, machineName: string|null,
- *            autoStartAgent: boolean, allowedCommands: string[], pairingCode: string|null}}
+ * @returns {{rabbitUrl: string|null, rabbitSource: string|null, rabbitUrlOverride: string|null,
+ *            stateDir: string|null, projectDir: string, machineName: string|null,
+ *            autoStartAgent: boolean, allowedCommands: string[], pairingCode: string|null,
+ *            p2pMode: string, stunServers: string[]}}
  */
 function readConfig(config = {}) {
   const cwd = process.cwd();
-  const raw = config.rabbitUrl;
-  const rabbitUrl = typeof raw === 'string' && raw.trim() !== '' ? checkedRabbitBase(raw) : null;
+
+  /**
+   * §7: where the relay address came from.
+   *
+   * The order is `rabbitUrl` → `W2M_RABBIT_URL` → the shared server, and the *source* is carried out
+   * of here rather than re-derived at report time, because "which of the three won" is exactly the
+   * question a cross-network deployment gets wrong: a machine that silently talked to the shared
+   * server instead of the operator's own relay looks identical to a working one until it dispatches
+   * work nobody receives. `rabbitUrlOverride` is what was suppressed (the device's own `rabbit_url`
+   * in `device.json`, which v0.3.9 used as a fallback) so `w2m_status` can say it out loud.
+   */
+  let rabbitUrl = null;
+  let rabbitSource = null;
+  let rabbitUrlOverride = null;
+  if (typeof config.rabbitUrl === 'string' && config.rabbitUrl.trim() !== '') {
+    rabbitUrl = checkedRabbitBase(config.rabbitUrl);
+    rabbitSource = 'config';
+  } else if (typeof process.env.W2M_RABBIT_URL === 'string' && process.env.W2M_RABBIT_URL.trim() !== '') {
+    try {
+      rabbitUrl = checkedRabbitBase(process.env.W2M_RABBIT_URL);
+    } catch (reason) {
+      // Re-thrown with the environment variable named: `W2M_RABBIT_URL` is set and wrong, and a
+      // message about `rabbitUrl` would send the operator to edit the wrong place.
+      throw configError(
+        'W2M_RABBIT_URL',
+        `is set but not usable as a base address (${reason instanceof Error ? reason.message : String(reason)})`,
+        'set it to the relay base address, for example http://127.0.0.1:8787 or https://w2m.example.com/w2m, or unset it to use the shared server',
+      );
+    }
+    rabbitSource = 'env';
+  } else {
+    rabbitUrl = checkedRabbitBase(SHARED_SERVER.rabbitUrl);
+    rabbitSource = 'shared-default';
+    rabbitUrlOverride = 'device.rabbit_url';
+  }
 
   const stateDir = typeof config.stateDir === 'string' && config.stateDir.trim() !== ''
     ? path.resolve(config.stateDir.trim())
     : null;
+
+  // §7: both of these are validated here, at `apply()` time, so a typo is a startup error that names
+  // the setting rather than a status field nobody reads. See the two resolvers for why there is no
+  // silent default when a value *is* supplied.
+  const p2p = resolveP2PMode(config);
+  const p2pMode = p2p.mode;
+  const stun = resolveStunServers(config);
+  const stunList = stun.servers;
 
   /**
    * v0.3.3 shared config: `.w2m.json` in the project, overridden by `~/.w2m/machine.json`, overridden
@@ -426,7 +485,6 @@ function readConfig(config = {}) {
   });
 
   return {
-    rabbitUrl,
     stateDir,
     projectDir: typeof config.projectDir === 'string' && config.projectDir.trim() !== ''
       ? path.resolve(config.projectDir.trim())
@@ -462,7 +520,143 @@ function readConfig(config = {}) {
     // Carried through so the updater can find the profile it must install into. Resolved here
     // rather than at use time so `w2m_status` can report the same path the installer will use.
     profileDir: resolveProfileDir(config),
+    // ---------------------------------------------------------------------------------------------
+    // v0.4.0: the direct path
+    // ---------------------------------------------------------------------------------------------
+    rabbitUrl,
+    rabbitSource,
+    rabbitUrlOverride,
+    p2pMode,
+    stunServers: stunList,
   };
+}
+
+/**
+ * Resolve `p2pMode` from the config object, then `W2M_P2P_MODE`, then the default — loudly.
+ *
+ * A value that is present and wrong is a `W2M_CONFIG` error naming the setting: falling back to
+ * `auto` would dispatch work over a path the operator explicitly asked not to use, and falling back
+ * to `relay` would silently disable the release's headline feature. Neither is a default; both are
+ * decisions the operator has to make.
+ *
+ * "Present" is decided by the *key*, not by truthiness. A profile patch that writes `p2pMode:` with
+ * nothing after it hands this function `null`, and that is a value somebody typed — collapsing it
+ * into "the key is absent" is exactly the silent default this function exists to refuse. An unset key
+ * and a blank `W2M_P2P_MODE` are the only two shapes that mean "nobody chose", and only the second is
+ * treated as absent because an unset environment variable is indistinguishable from an empty one.
+ *
+ * @param {Record<string, unknown>} config - Raw plugin config.
+ * @returns {{mode: string, source: 'config'|'env'|'default'}}
+ */
+function resolveP2PMode(config) {
+  const hasConfig = Object.prototype.hasOwnProperty.call(config, 'p2pMode') && config.p2pMode !== undefined;
+  const fromEnv = process.env.W2M_P2P_MODE;
+  const hasEnv = typeof fromEnv === 'string' && fromEnv !== '';
+  const raw = hasConfig ? config.p2pMode : hasEnv ? fromEnv : DEFAULT_P2P_MODE;
+  const source = hasConfig ? 'config' : hasEnv ? 'env' : 'default';
+
+  const normalized = normalizeP2PMode(raw);
+  if (!normalized.ok) {
+    const setting = source === 'env' ? 'W2M_P2P_MODE' : 'p2pMode';
+    // The normalizer's own `P2P_MODE_*` code is kept: it is the reason, and dropping it here would
+    // leave a caller who has both messages unable to tell which check refused the value.
+    throw configError(
+      setting,
+      `is not a usable P2P mode (${normalized.reason})`,
+      `set it to one of ${P2P_MODES.join(', ')}: "auto" punches and keeps the relay as the fallback, ` +
+        '"direct" punches without hiding a failure, "relay" never opens a UDP socket at all',
+    );
+  }
+  return { mode: normalized.mode, source };
+}
+
+/**
+ * Resolve `stunServers` from the config object, then `W2M_STUN_SERVERS`, then the shared list.
+ *
+ * Every entry is validated here, before the node is built, because the alternative is a tick several
+ * seconds later inside the node's announce loop: an unusable STUN entry is a configuration mistake,
+ * and this project reports those at the call site rather than as a degraded status field. The rule
+ * itself is `parseServer` from `src/agent/stun.mjs` — the same function the query path will use, so
+ * "valid here" and "usable there" cannot drift.
+ *
+ * An **empty list is the default**, not an error. `stunServers: []` is what the bundled
+ * `cordis.patch.yml` carries (a key that documents itself and names no server), and a profile that
+ * starts from that file must not fail to load. `null` entries are dropped for the same reason — a
+ * YAML list with a blank item is the same statement as a blank item in a profile patch. A list whose
+ * entries are *wrong* is still refused: there is a difference between "nothing named" and "the wrong
+ * thing named", and only the second is a mistake.
+ *
+ * @param {Record<string, unknown>} config - Raw plugin config.
+ * @returns {{servers: string[], source: 'config'|'env'|'default'}}
+ */
+function resolveStunServers(config) {
+  const fromConfig = Array.isArray(config.stunServers)
+    ? config.stunServers.filter((entry) => entry !== null && entry !== undefined)
+    : config.stunServers;
+  const fromEnv = process.env.W2M_STUN_SERVERS;
+  const configNamesNothing = Array.isArray(fromConfig) && fromConfig.length === 0;
+  const hasConfig = fromConfig !== undefined && fromConfig !== null && !configNamesNothing;
+  const hasEnv = typeof fromEnv === 'string' && fromEnv.trim() !== '';
+
+  if (!hasConfig && !hasEnv) {
+    return { servers: stunServersWithShared(), source: 'default' };
+  }
+
+  const setting = hasConfig ? 'stunServers' : 'W2M_STUN_SERVERS';
+  const raw = hasConfig ? fromConfig : fromEnv;
+  const entries = typeof raw === 'string' ? raw.split(',') : raw;
+  if (!Array.isArray(entries)) {
+    throw configError(
+      setting,
+      `must be an array of "host:port" strings or a comma-separated string, got ${typeof raw}`,
+      `give the STUN servers as a list, for example ["${SHARED_SERVER.stun}"], or omit the setting to use the shared server followed by the public fallbacks`,
+    );
+  }
+
+  const servers = [];
+  for (const entry of entries) {
+    if (typeof entry !== 'string') {
+      throw configError(
+        setting,
+        `must contain only "host:port" strings, got ${JSON.stringify(entry)} (${typeof entry})`,
+        `write every STUN server as a "host:port" string, for example "${SHARED_SERVER.stun}"`,
+      );
+    }
+    const spec = entry.trim();
+    if (spec === '') {
+      throw configError(
+        setting,
+        'contains an empty entry',
+        `remove the empty entry, or omit the setting to use ${SHARED_SERVER.stun} followed by the public fallbacks`,
+      );
+    }
+    let parsed;
+    try {
+      parsed = parseServer(spec);
+    } catch (reason) {
+      throw configError(
+        setting,
+        `contains ${JSON.stringify(entry)}, which is not "host:port" (${reason instanceof Error ? reason.message : String(reason)})`,
+        `write every STUN server as a "host:port" string, for example "${SHARED_SERVER.stun}"`,
+      );
+    }
+    if (parsed.host === '') {
+      throw configError(
+        setting,
+        `contains ${JSON.stringify(entry)}, which names no host`,
+        `write the host as well as the port, for example "${SHARED_SERVER.stun}"`,
+      );
+    }
+    if (!servers.includes(spec)) servers.push(spec);
+  }
+  if (servers.length === 0) {
+    throw configError(
+      setting,
+      'is an empty list, so no STUN server could be queried',
+      `omit the setting to use ${SHARED_SERVER.stun} followed by the public fallbacks, or name at least one "host:port"`,
+    );
+  }
+  return { servers, source: hasConfig ? 'config' : 'env' };
 }
 
 /**
@@ -614,6 +808,11 @@ function resolveProfileDir(config) {
 /**
  * Require the Rabbit URL, naming the setting when it is absent.
  *
+ * With §7's shared-server default this can no longer be reached by "the operator set nothing" — an
+ * unset `rabbitUrl` resolves to {@link SHARED_SERVER}. It stays as the last-resort guard so that a
+ * future edit which clears the field fails with a sentence naming it instead of an `Invalid URL`
+ * from somewhere deep in `fetch`.
+ *
  * @param {{rabbitUrl: string|null}} cfg
  * @returns {string}
  */
@@ -621,11 +820,726 @@ function requireRabbit(cfg) {
   if (!cfg.rabbitUrl) {
     throw configError(
       'rabbitUrl',
-      'is not set, so this tool has no Rabbit to talk to',
-      'set `rabbitUrl` in this plugin\'s profile patch to the Rabbit base URL, for example http://127.0.0.1:8787',
+      'resolved to nothing, so this tool has no Rabbit to talk to',
+      'set `rabbitUrl` (or `W2M_RABBIT_URL`) to the Rabbit base URL, for example http://127.0.0.1:8787',
     );
   }
   return cfg.rabbitUrl;
+}
+
+// ---------------------------------------------------------------------------------------------
+// v0.4.0: the direct path (P2P node, result inbox, direct offer push)
+// ---------------------------------------------------------------------------------------------
+
+/** Directory, under `stateDir`, where result frames that arrived over a direct channel are kept. */
+const P2P_INBOX_DIR = 'p2p-inbox';
+
+/** Upper bound on a file-name component taken from the wire. Long enough for a uuid, short enough. */
+const P2P_INBOX_NAME_MAX = 128;
+
+/**
+ * Resolve the path of `device.json` the way both `w2m_run`'s origin identity and the direct path
+ * need it.
+ *
+ * Two sources, in the order the rest of the plugin already uses: an explicit `stateDir` is the
+ * operator pointing at a pairing, and `DSH_HOME` (via `deviceFilePath`) is the layout the agent
+ * writes by default. Nothing is created and nothing is guessed: a machine that has never paired has
+ * no identity, and that is a legal configuration in which the plugin simply dispatches over the
+ * relay.
+ *
+ * @param {{stateDir: string|null}} cfg
+ * @returns {string|null}
+ */
+function devicePathFor(cfg) {
+  if (cfg.stateDir) return path.join(cfg.stateDir, 'device.json');
+  try {
+    return deviceFilePath({});
+  } catch {
+    // `DSH_HOME` is unset *and* the home directory cannot be resolved. There is no identity to find;
+    // that is a fact about this process, not a fault worth failing a dispatch over.
+    return null;
+  }
+}
+/**
+ * Read the local machine identity for the paths that need it, without ever throwing.
+ *
+ * {@link readDevice} answers from a `stateDir` and is the tool-facing reader; this one adds the
+ * `DSH_HOME` fallback (an unset `stateDir` is the documented default layout, not an error) and turns
+ * every failure into a `machine_id` of null plus an `error` — a machine whose identity cannot be read
+ * must still be able to dispatch, because the relay path does not need an identity at all.
+ *
+ * @param {ReturnType<typeof readConfig>} cfg
+ * @returns {Promise<{machine_id: string|null, machine_name: string|null, path: string|null, error: string|null}>}
+ */
+async function readLocalIdentity(cfg) {
+  const file = devicePathFor(cfg);
+  if (file === null) return { machine_id: null, machine_name: null, path: null, error: null };
+  const device = await readDevice({ stateDir: path.dirname(file) });
+  return {
+    machine_id: device.machine_id,
+    machine_name: device.machine_name,
+    path: file,
+    error: device.error,
+  };
+}
+
+/**
+ * Turn a wire value into one safe path component.
+ *
+ * `task_id` and `machine_id` arrive over a channel from another machine, and they are used to build
+ * a *path*. `../` in either would be an arbitrary-file-write primitive handed to a peer, so anything
+ * outside `[A-Za-z0-9._-]` is replaced, and the result is capped. Nothing is lost by that: the inbox
+ * is read as a directory, never by reversing a file name, and the `task_id` inside the file is the
+ * authoritative copy.
+ *
+ * @param {string} value
+ * @returns {string}
+ */
+function safeFilePart(value) {
+  const cleaned = value.replace(/[^A-Za-z0-9._-]/g, '_').replace(/^\.+/, '_');
+  return cleaned.slice(0, P2P_INBOX_NAME_MAX) || '_';
+}
+
+/**
+ * Canonical JSON with sorted keys, so the digest of a frame is stable.
+ *
+ * Deliberately *not* the relay's own `jcs` (that would make this file depend on relay internals for
+ * a two-line need). The digest here is only an integrity check of what this process stored, so the
+ * rule is local by definition; the value that has to match another process byte for byte — the
+ * dedupe key — is the one imported from the relay instead.
+ *
+ * @param {unknown} value
+ * @returns {string}
+ */
+function canonicalJson(value) {
+  if (value === undefined) return 'null';
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
+  if (Array.isArray(value)) return `[${value.map((entry) => canonicalJson(entry)).join(',')}]`;
+  const keys = Object.keys(value).sort();
+  return `{${keys.map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
+}
+
+/**
+ * Does `frame` name both halves of the inbox key?
+ *
+ * A frame without a `task_id` or without a `machine_id` cannot be stored or acknowledged — the
+ * acknowledgement is keyed by `task_id`, and two machines answering the same task must not overwrite
+ * each other — so it is refused by name instead of being written somewhere surprising.
+ *
+ * @param {object} frame
+ * @returns {string|null} The reason it is unusable, or null.
+ */
+function inboxKeyProblem(frame) {
+  const taskId = frame?.task_id;
+  const machineId = frame?.machine_id;
+  if (typeof taskId !== 'string' || taskId.trim() === '') return 'P2P_FRAME_NO_TASK_ID: `task_id` is missing or empty';
+  if (typeof machineId !== 'string' || machineId.trim() === '') {
+    return 'P2P_FRAME_NO_MACHINE_ID: `machine_id` is missing or empty';
+  }
+  return null;
+}
+
+/**
+ * Write one file atomically, with 0600 where the platform honours it.
+ *
+ * A temporary file in the same directory plus a rename: a reader never sees a half-written result,
+ * and a crash leaves the old file (or no file) rather than a truncated JSON document. The mode is
+ * passed to `writeFile` rather than applied afterwards so the bytes are never readable to anyone
+ * else even for an instant; on Windows/NTFS the bits are ignored and the `chmod` is skipped, which
+ * is reported honestly by `mode_honoured` in `w2m_status` rather than pretended.
+ *
+ * @param {string} dir
+ * @param {string} file
+ * @param {string} text
+ * @returns {Promise<void>}
+ */
+async function writeFileAtomic(dir, file, text) {
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  const tmp = path.join(dir, `.${path.basename(file)}.${process.pid}.${Date.now().toString(36)}.tmp`);
+  try {
+    await fs.writeFile(tmp, text, { encoding: 'utf8', mode: 0o600 });
+    await fs.rename(tmp, file);
+  } catch (error) {
+    await fs.rm(tmp, { force: true }).catch(() => {});
+    throw error;
+  }
+  if (process.platform !== 'win32') await fs.chmod(file, 0o600).catch(() => {});
+}
+
+/**
+ * Count the stored result frames.
+ *
+ * Depth is read from the directory rather than tracked in memory, so it answers the question that
+ * actually matters — "is there anything here I have not consumed" — across a plugin reload. A
+ * missing directory is depth 0, not an error: the inbox exists only once something has arrived.
+ *
+ * @param {string|null} dir
+ * @returns {Promise<number>}
+ */
+async function countInbox(dir) {
+  if (dir === null) return 0;
+  try {
+    const names = await fs.readdir(dir);
+    return names.filter((name) => name.endsWith('.json')).length;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Build a `P2PNode`'s transport out of this plugin's one HTTP path.
+ *
+ * The direct path must not grow a second way to talk to the relay: bearer-token resolution, the
+ * base-URL joining that preserves a deployment sub-path, the timeout and the byte cap all live in
+ * {@link request}, and these two adapters are the whole of the P2P node's transport. The token is
+ * resolved per call rather than captured at startup, because a machine may pair *after* the plugin
+ * was loaded and a captured `null` would leave the node permanently unauthenticated.
+ *
+ * Both adapters resolve for every HTTP status, which is the shape `P2PNode` expects: a refusal is an
+ * answer (`{ok: false, status, json, error}`), and only a call that could not be made at all is an
+ * `{ok: false, error}` from the catch.
+ *
+ * @param {ReturnType<typeof readConfig>} cfg
+ * @returns {{postJson: Function, getJson: Function}}
+ */
+function createP2PTransport(cfg) {
+  const call = async (method, pathname, body) => {
+    let token = null;
+    try {
+      token = await resolveToken(cfg);
+    } catch {
+      // An unreadable device.json is reported by `w2m_status`, where the operator is looking for it.
+      // Here it must not stop the rendezvous: the relay answers an unauthenticated announce with a
+      // named 401, which the node records in `status.last_announce_error`.
+      token = null;
+    }
+    try {
+      const result = await request({
+        rabbitUrl: requireRabbit(cfg),
+        token,
+        method,
+        pathname,
+        body,
+        // Short: this is background signalling, and a hung announce must not outlive the node's own
+        // refresh interval, which would stack announcements on top of each other.
+        timeoutMs: 5_000,
+        maxBytes: 64 * 1024,
+      });
+      return { ok: result.ok, status: result.status, json: result.json, error: result.error ?? null };
+    } catch (error) {
+      return { ok: false, status: null, json: null, error: error instanceof Error ? error.message : String(error) };
+    }
+  };
+
+  return {
+    postJson: (pathname, body) => call('POST', pathname, body),
+    getJson: (pathname) => call('GET', pathname, undefined),
+  };
+}
+
+/**
+ * Mint the offer frame the executor needs, from the lease the relay just issued.
+ *
+ * WHY THIS IS DERIVED RATHER THAN INVENTED
+ *
+ * The executor decides whether an offer is a first delivery or a duplicate on `dedupe_key` +
+ * `attempt` (§6), and the relay emits its own SSE offer with those exact values. A push that
+ * disagreed by one character would make the machine execute the task twice — once from each path —
+ * so the dedupe key is computed with the relay's own {@link computeDedupeKey}/{@link computeCommandHash},
+ * from the same `task_id`, `index`, `command_hash` inputs and `base_tree` the task was created with,
+ * and `machine_id`/`index`/`attempt` come from the lease rather than from the caller's arguments.
+ *
+ * The one case that is *not* reproducible is `pipeline`, whose hash covers the relay's normalised
+ * stage list rather than the caller's `stages`; there the key is left null and reported as such
+ * instead of guessed, because a wrong key is worse than an absent one.
+ *
+ * @param {object} options
+ * @param {string} options.taskId
+ * @param {object} options.lease
+ * @param {object} options.payload The validated `POST /v1/task` body this plugin sent.
+ * @param {string|null} options.originMachineId
+ * @returns {{frame: object|null, skipped: string|null}}
+ */
+function buildOfferFrame({ taskId, lease, payload, originMachineId }) {
+  const machineId = typeof lease?.machine_id === 'string' && lease.machine_id !== '' ? lease.machine_id : null;
+  if (machineId === null) return { frame: null, skipped: 'the relay returned a lease with no machine_id' };
+
+  const index = Number.isInteger(lease?.index) ? lease.index : 0;
+  // The relay's first attempt is 1, and a lease that never says otherwise is a first attempt.
+  const attempt = Number.isInteger(lease?.attempt) && lease.attempt > 0 ? lease.attempt : 1;
+  const indexTotal = Number.isInteger(payload?.index_total) ? payload.index_total : 1;
+
+  let dedupeKey = typeof lease?.dedupe_key === 'string' && lease.dedupe_key !== '' ? lease.dedupe_key : null;
+  if (dedupeKey === null && payload?.mode !== 'pipeline' && Array.isArray(payload?.command_argv)) {
+    try {
+      const commandHash = computeCommandHash(payload.command_argv, SHELL_ID_DIRECT, payload.cwd_rel ?? '.');
+      dedupeKey = computeDedupeKey(taskId, index, commandHash, payload.base_tree ?? null);
+    } catch {
+      dedupeKey = null;
+    }
+  }
+
+  return {
+    frame: {
+      type: 'task.offer',
+      task_id: taskId,
+      machine_id: machineId,
+      attempt,
+      index,
+      index_total: indexTotal,
+      dedupe_key: dedupeKey,
+      mode: payload.mode,
+      ...(Array.isArray(payload.command_argv) ? { command_argv: payload.command_argv } : {}),
+      ...(Array.isArray(payload.stages) ? { stages: payload.stages } : {}),
+      cwd_rel: payload.cwd_rel,
+      write: payload.write,
+      timeout_ms: payload.timeout_ms,
+      base_commit: payload.base_commit ?? null,
+      base_tree: payload.base_tree ?? null,
+      requirements: payload.requirements,
+      compare_policy: payload.compare_policy,
+      origin_machine_id: originMachineId,
+      p2p: payload.p2p ?? null,
+    },
+    skipped: null,
+  };
+}
+
+/**
+ * Push one offer over the direct path. Best effort by construction: nothing here throws.
+ *
+ * @param {P2PNode} node
+ * @param {object} frame
+ * @returns {Promise<{ok: boolean, error: string|null}>}
+ */
+async function pushOffer(node, frame) {
+  try {
+    const dialled = await node.dial(frame.machine_id);
+    if (!dialled.ok) return { ok: false, error: dialled.error ?? 'P2P_DIAL_FAILED' };
+    const channel = dialled.channel;
+    try {
+      await channel.send(JSON.stringify(frame));
+      return { ok: true, error: null };
+    } finally {
+      // The offer is one frame over a reliable channel: holding the channel open would keep a NAT
+      // mapping alive for a conversation that is over, and the result comes back the responder's way.
+      channel.close('offer-sent');
+    }
+  } catch (error) {
+    return { ok: false, error: `P2P_PUSH_THREW: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+/**
+ * Push an offer for one task to every machine the relay leased it to.
+ *
+ * Called after the relay has created the task, so the relay's own SSE offer has already gone out:
+ * this is an *additional* delivery over the faster path, and the relay's copy is what makes a failed
+ * push harmless. Only leases in a runnable state are pushed — `refused` and `observing` machines
+ * were never handed the command, and sending them an offer would be asking them to run work the
+ * relay decided they must not run.
+ *
+ * @param {P2PNode} node
+ * @param {object} options
+ * @returns {Promise<Array<object>>} One entry per lease considered, in lease order.
+ */
+async function pushOffers(node, { taskId, leases, payload, originMachineId }) {
+  const out = [];
+  for (const lease of leases) {
+    const machineId = typeof lease?.machine_id === 'string' && lease.machine_id !== '' ? lease.machine_id : null;
+    const state = lease?.state;
+    if (machineId === null) {
+      out.push({ machine_id: null, ok: false, error: 'the relay returned a lease with no machine_id' });
+      continue;
+    }
+    if (state !== 'queued' && state !== 'offered') {
+      out.push({
+        machine_id: machineId,
+        ok: false,
+        error: `lease state is ${JSON.stringify(state ?? null)}, so this machine was not handed the command`,
+      });
+      continue;
+    }
+    const built = buildOfferFrame({ taskId, lease, payload, originMachineId });
+    if (built.frame === null) {
+      out.push({ machine_id: machineId, ok: false, error: built.skipped });
+      continue;
+    }
+    const result = await pushOffer(node, built.frame);
+    out.push({
+      machine_id: machineId,
+      ok: result.ok,
+      error: result.error,
+      dedupe_key: built.frame.dedupe_key === null ? null : 'relay-formula',
+    });
+  }
+  return out;
+}
+
+/**
+ * Build the object the tools reach the direct path through, and register its effect disposer.
+ *
+ * WHEN THE NODE STARTS, AND WHY IT IS NOT `apply()`
+ *
+ * The v0.4.0 contract says the node is "started in `apply()`". It is not, and this is the one place
+ * this file departs from the contract's letter rather than its intent — reported as a deviation, not
+ * settled quietly here. What *is* kept is everything the sentence is about: the direct path is owned
+ * for the plugin's whole lifetime, it is disposed by a `ctx.effect` disposer, and a failure to start
+ * is a field in `w2m_status` rather than an exception at load.
+ *
+ * The reason for the change is what "start" costs. Starting this node binds a UDP socket and kicks
+ * off a STUN sweep against four servers — network traffic with a multi-second tail — for a machine
+ * that may never dispatch a task in that session. `apply()` runs on every session in a host that
+ * mounts this plugin, so an unconditional start is a rendezvous per session, and it puts traffic
+ * into every test and every host whose runtime is deterministic about what it sends. `ensureStarted()`
+ * therefore does the work the first time a tool actually needs the direct path: a dispatch
+ * (`w2m_run`) or a question about it (`w2m_status`). A machine that never dispatches never punches,
+ * which is also the more honest reading of §1 — "never dials" is the property that matters, and this
+ * is closer to it than an announce nobody asked for.
+ *
+ * @param {object|null} ctx Cordis context; `ctx.effect` is used when present.
+ * @param {ReturnType<typeof readConfig>} cfg
+ * @param {object} [block] Test seam, and only that: `{ P2PNode?, bindUdpSocket?, discover?, tuning?,
+ *   onNode? }`. The plugin's own composition is exercised end to end against a real relay by
+ *   `test/p2p-plugin.test.mjs`, but two things a test cannot observe from outside are whether a
+ *   *socket* was bound and the node's own event stream. Injecting the binder makes the first a
+ *   measurement, and `onNode` hands the test the same object the tools use, so a `'message'` event is
+ *   driven through the production handler rather than a re-implementation of it. Nothing in
+ *   production reaches any of this.
+ * @returns {object} The runtime handle; see the field comments in the body.
+ */
+function createP2PRuntime(ctx, cfg, block = {}) {
+  const inboxDir = cfg.stateDir === null ? null : path.join(cfg.stateDir, P2P_INBOX_DIR);
+  const runtime = {
+    node: null,
+    starting: null,
+    start: null,
+    error: null,
+    reason: null,
+    mode: cfg.p2pMode,
+    machineId: null,
+    devicePath: devicePathFor(cfg),
+    identityError: null,
+    inboxDir,
+    events: {
+      frames: 0,
+      results: 0,
+      refused: [],
+      last_error: null,
+      last_at: null,
+      inbox_path: null,
+      /** Whether the result files were created with 0600. Windows/NTFS ignores the bits. */
+      mode_honoured: process.platform !== 'win32',
+    },
+    /** The most recent `w2m_run`'s direct pushes, or null when none has run in this process. */
+    directPushes: null,
+    /**
+     * Start the node once, on first use, and hand every later caller the same promise.
+     *
+     * Assigned before the relay-mode early return so the tools can call it unconditionally: a caller
+     * asks "is the direct path ready" and gets an answer either way, instead of having to know which
+     * mode it is in — the defect this shape fixes was a `relay`-mode dispatch calling a method that did
+     * not exist, which is a crash in the mode that is supposed to be the safe one.
+     *
+     * @type {() => Promise<object>}
+     */
+    ensureStarted: async () => ({ ok: true, enabled: false, error: null }),
+  };
+
+  if (cfg.p2pMode === 'relay') {
+    runtime.reason = 'p2pMode is "relay", so no UDP socket is bound and the relay is the only path';
+    return runtime;
+  }
+
+  /**
+   * Start the node once, on first use, and return the same promise for every later caller.
+   *
+   * Idempotent by construction: `starting` is assigned before the first `await` inside it, so two
+   * concurrent callers share one bind (the same rule `P2PNode.start()` itself follows, one level up).
+   *
+   * @returns {Promise<object>} The node's own `start()` result, or the reason there is no node.
+   */
+  runtime.ensureStarted = () => {
+    if (runtime.starting !== null) return runtime.starting;
+    runtime.starting = initP2P(ctx, cfg, runtime, block).catch((error) => {
+      // The `P2PNode` constructor is the one thing in it that throws (a bad mode or tuning key is a
+      // caller bug), so a failure here is a composition error in this file and is reported like any
+      // other: `w2m_status` shows it, the relay path keeps working.
+      runtime.error = error instanceof Error ? error.message : String(error);
+      runtime.start = { ok: false, enabled: true, error: runtime.error };
+      return runtime.start;
+    });
+    return runtime.starting;
+  };
+
+  return runtime;
+}
+
+/**
+ * Read the identity, build the node, and start it.
+ *
+ * Split out of {@link createP2PRuntime} so the ownership and the work are two readable pieces: this
+ * one is allowed to await, and its caller records whatever it throws.
+ *
+ * @param {object|null} ctx
+ * @param {ReturnType<typeof readConfig>} cfg
+ * @param {object} runtime
+ * @param {object} block Test seam; see {@link createP2PRuntime}.
+ * @returns {Promise<object>} The node's own `start()` result.
+ */
+async function initP2P(ctx, cfg, runtime, block) {
+  const identity = await readLocalIdentity(cfg);
+  runtime.machineId = identity.machine_id;
+  runtime.identityError = identity.error;
+
+  if (identity.machine_id === null) {
+    runtime.reason = identity.path === null
+      ? 'no stateDir is set and DSH_HOME could not be resolved, so device.json cannot be located'
+      : `no readable device identity at ${identity.path}, so this machine has no id to announce or dial with`;
+    runtime.start = { ok: false, enabled: true, error: `P2P_NO_IDENTITY: ${runtime.reason}` };
+    return runtime.start;
+  }
+
+  const transport = createP2PTransport(cfg);
+  // `ctx.effect` owns the node when the host provides it, and the fallback is the same ownership
+  // with a shorter lifetime: a host that provides no effect (an older Cordis, or a bare test
+  // context) gets the node and no disposer rather than no node.
+  runtime.node = new (block.P2PNode ?? P2PNode)({
+    mode: cfg.p2pMode,
+    rabbitUrl: cfg.rabbitUrl,
+    machineId: identity.machine_id,
+    postJson: transport.postJson,
+    getJson: transport.getJson,
+    stunServers: cfg.stunServers,
+    log: (line) => ctx?.logger?.info?.(`w2m ${line}`),
+    ...block,
+  });
+
+  // Attached before `start()`: `P2PNode.reportError` only emits when somebody is listening, and an
+  // unlistened `'error'` event throws inside the runtime's own emit. A transport problem must stay a
+  // recorded fact.
+  runtime.node.on('error', (error) => {
+    runtime.events.last_error = error instanceof Error ? error.message : String(error);
+  });
+  runtime.node.on('message', (event) => {
+    void handleP2PMessage(runtime, event).catch((error) => {
+      runtime.events.last_error = error instanceof Error ? error.message : String(error);
+    });
+  });
+  // See the `block` note above: a test needs the node itself to drive a `'message'` event through
+  // the handler above. Guarded so a malformed seam cannot take the node's start down with it.
+  if (typeof block.onNode === 'function') {
+    try {
+      block.onNode(runtime.node);
+    } catch {
+      /* a test seam must never be why a node fails */
+    }
+  }
+
+  /**
+   * Ownership: one node, one effect, one disposer.
+   *
+   * Registered *here*, after the node exists, rather than in `createP2PRuntime` — an effect that owns
+   * nothing is a disposer that releases nothing, and `relay` mode and a machine with no identity must
+   * leave the host's effect list exactly as they found it. A host that provides no `ctx.effect` (an
+   * older Cordis, or a bare test context) still gets a working node: the socket is `unref()`ed, so it
+   * cannot keep the process alive, and refusing to start the direct path because the host cannot track
+   * a disposer would break the release's own default.
+   */
+  if (typeof ctx?.effect === 'function') {
+    ctx.effect(() => () => {
+      // `close()` is documented not to throw and to return a promise, but the whole point of this
+      // disposer is that it runs on the way out of a plugin that may be half-built: a node whose bind
+      // failed has no socket to close. Both the call and the promise are optional so a teardown can
+      // never itself become the failure.
+      runtime.node?.close?.()?.catch((error) => {
+        runtime.events.last_error = error instanceof Error ? error.message : String(error);
+      });
+    });
+  }
+
+  // eslint-disable-next-line require-atomic-updates -- single-entry: `ensureStarted` assigns `starting` before this runs
+  runtime.start = await runtime.node.start();
+  if (runtime.start.ok !== true) runtime.error = runtime.start.error ?? 'P2P_START_FAILED';
+  return runtime.start;
+}
+
+/**
+ * Store one JSON frame that arrived over a direct channel, and acknowledge it.
+ *
+ * The writer is deliberately strict. A frame that is not a JSON object, or that names no
+ * `task_id`/`machine_id`, is refused and **nothing** is written — an inbox file is the only durable
+ * trace of a peer's result, and a file whose name does not identify its contents is worse than no
+ * file, because the next reader cannot tell a partial result from a complete one.
+ *
+ * `task.result` is the frame this exists for; `result.ack` and anything else a peer might send are
+ * counted and ignored rather than treated as faults. The acknowledgement goes back on the same
+ * channel the frame arrived on, and a failed acknowledgement is recorded — the sender retries (the
+ * channel is reliable) and the file is already on disk, so a lost ack must not lose the result.
+ *
+ * @param {object} runtime
+ * @param {{payload: Buffer|string, channel: object|null, peer: object|null, session: number}} event
+ * @returns {Promise<void>}
+ */
+async function handleP2PMessage(runtime, event) {
+  runtime.events.frames += 1;
+  runtime.events.last_at = new Date().toISOString();
+
+  const raw = Buffer.isBuffer(event?.payload) ? event.payload.toString('utf8') : String(event?.payload ?? '');
+  let frame = null;
+  try {
+    frame = JSON.parse(raw);
+  } catch {
+    runtime.events.refused.push({ reason: 'P2P_FRAME_NOT_JSON: the payload is not a JSON document', bytes: raw.length });
+    return;
+  }
+  if (frame === null || typeof frame !== 'object' || Array.isArray(frame)) {
+    runtime.events.refused.push({ reason: 'P2P_FRAME_NOT_AN_OBJECT: expected a JSON object', type: typeof frame });
+    return;
+  }
+  if (frame.type !== 'task.result') {
+    // Not an error: a peer's `result.ack` for an offer *this* plugin pushed arrives the same way, and
+    // the channel is the transport, not a promise about the only frame that will ever cross it.
+    return;
+  }
+
+  const problem = inboxKeyProblem(frame);
+  if (problem !== null) {
+    runtime.events.refused.push({ reason: problem, type: 'task.result' });
+    return;
+  }
+  if (runtime.inboxDir === null) {
+    runtime.events.refused.push({
+      reason: 'P2P_NO_STATE_DIR: stateDir is not set, so a received result has nowhere to be written',
+      type: 'task.result',
+      task_id: frame.task_id,
+    });
+    return;
+  }
+
+  const stored = {
+    received_at: new Date().toISOString(),
+    transport: 'p2p',
+    from_machine_id: frame.machine_id,
+    task_id: frame.task_id,
+    frame,
+    // A digest of the stored copy, so a reader can tell "the file changed under me" from "the peer
+    // sent something else". Not a signature — the channel is not authenticated at this layer.
+    frame_sha256: createHash('sha256').update(canonicalJson(frame)).digest('hex'),
+  };
+  const file = path.join(
+    runtime.inboxDir,
+    `${safeFilePart(frame.task_id)}__${safeFilePart(frame.machine_id)}.json`,
+  );
+
+  try {
+    await writeFileAtomic(runtime.inboxDir, file, `${JSON.stringify(stored, null, 2)}\n`);
+  } catch (error) {
+    // eslint-disable-next-line require-atomic-updates -- one message at a time; the write is the only await
+    runtime.events.last_error = `P2P_INBOX_WRITE_FAILED: ${error instanceof Error ? error.message : String(error)}`;
+    runtime.events.refused.push({ reason: runtime.events.last_error, type: 'task.result', task_id: frame.task_id });
+    return;
+  }
+  runtime.events.results += 1;
+  runtime.events.inbox_path = file;
+
+  const channel = event?.channel ?? null;
+  if (channel && typeof channel.send === 'function') {
+    try {
+      await channel.send(JSON.stringify({ type: 'result.ack', task_id: frame.task_id }));
+    } catch (error) {
+      // eslint-disable-next-line require-atomic-updates -- the channel is per-frame and the ack is the last await
+      runtime.events.last_error = `P2P_ACK_FAILED: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  }
+}
+
+/**
+ * The `p2p` block `w2m_status` reports.
+ *
+ * Every field is present on every call, including when the direct path is off: a reader must be able
+ * to tell "relay mode" from "p2p was requested and could not start" without comparing two calls.
+ * `null` is used for "never measured", never 0 — the same rule the rest of this file follows for RTT.
+ *
+ * @param {ReturnType<typeof readConfig>} cfg
+ * @param {object} runtime
+ * @param {number|null} peersAnnounced Live announcements the relay holds, read from the `/healthz`
+ *   answer this tool already fetched. Passed in rather than probed here: a second probe of the same
+ *   endpoint for one line of a diagnostic block would double the tool's traffic and could report a
+ *   different number than the block above it.
+ * @returns {Promise<object>}
+ */
+async function readP2PStatus(cfg, runtime, peersAnnounced = null) {
+  const status = runtime.node === null ? null : runtime.node.status;
+  const inboxDepth = runtime.inboxDir === null ? 0 : await countInbox(runtime.inboxDir);
+
+  return {
+    mode: status?.mode ?? cfg.p2pMode,
+    // "Requested and possible": the mode is not `relay` and a node exists to be asked about.
+    enabled: status !== null,
+    running: status?.running === true,
+    machine_id: runtime.machineId,
+    device_json: runtime.devicePath,
+    device_error: runtime.identityError,
+    local: status?.local ?? null,
+    rabbit_url: status?.rabbit_url ?? cfg.rabbitUrl,
+    // How many machines the relay holds a live announcement for. `w2m_devices` says which machines
+    // paired; this says which of them can be punched at, and the two differ constantly.
+    peers_announced: peersAnnounced,
+    mapping: status?.mapping ?? null,
+    reflexive: status?.reflexive ?? null,
+    candidates: Array.isArray(status?.candidates) ? status.candidates : [],
+    candidate_count: Array.isArray(status?.candidates) ? status.candidates.length : 0,
+    announced_at: status?.announced_at ?? null,
+    announce_ok: status?.announce_ok ?? false,
+    announce_failures: status?.announce_failures ?? 0,
+    last_announce_error: status?.last_announce_error ?? null,
+    punches_out: status?.punches_out ?? 0,
+    punches_in: status?.punches_in ?? 0,
+    dial_failures: status?.dial_failures ?? 0,
+    transport: p2pTransportFacts(runtime.node),
+    inbox: {
+      dir: runtime.inboxDir,
+      depth: inboxDepth,
+      received: runtime.events.results,
+      frames: runtime.events.frames,
+      refused: runtime.events.refused.slice(-8),
+      last_at: runtime.events.last_at ?? null,
+      last_path: runtime.events.inbox_path,
+      mode_honoured: runtime.events.mode_honoured,
+    },
+    last_error: runtime.error ?? runtime.events.last_error ?? status?.last_error ?? null,
+    reason: runtime.reason,
+    // Whether the node has been started in this process yet. `running` alone cannot say: a node that
+    // has not been asked to start and a node that failed to start both report `false`.
+    started: runtime.start !== null,
+  };
+}
+
+/**
+ * Type facts about the direct path: whether the UDP socket is actually held.
+ *
+ * Stated as a fact rather than inferred from `running`, because binding a socket and *keeping* one
+ * are different claims: this reads the live socket object, so "no socket" cannot be reported as
+ * "fine, no UDP port was taken" by accident.
+ *
+ * @param {P2PNode|null} node
+ * @returns {object}
+ */
+function p2pTransportFacts(node) {
+  const socket = node?.socket ?? null;
+  if (socket === null) return { socket_bound: false, family: null, address: null };
+  let bound = null;
+  try {
+    bound = socket.address();
+  } catch {
+    bound = null;
+  }
+  return {
+    socket_bound: true,
+    family: bound?.family ?? null,
+    address: bound === null ? null : { address: bound.address, port: bound.port },
+  };
 }
 
 /**
@@ -1066,18 +1980,27 @@ function endpointOf(target) {
 /**
  * Resolve the bearer token for the Rabbit calls.
  *
- * Absent `stateDir` means "no paired device was declared", which is a configuration the operator
- * may have chose - the calls then go out unauthenticated and a `401` is reported as a refusal,
- * which is the accurate account of what happened. A `stateDir` that *is* set means the operator
- * pointed at a pairing, so a missing or unreadable `device.json` is named as the fault instead of
- * being turned into a mystery `401`.
+ * Two sources, and the distinction is the point. An explicit `stateDir` is the operator pointing at
+ * a pairing, so a missing or unreadable `device.json` there is **named as the fault** rather than
+ * being turned into a mystery `401`. With no `stateDir`, this machine's own identity lives where the
+ * agent writes it by default — `$DSH_HOME/xclient/device.json`, the same file {@link readLocalIdentity}
+ * reads — and the calls go out with it. v0.4.0 made that fallback load-bearing rather than optional:
+ * every P2P announcement is authenticated as the announcing device, so a machine whose identity was
+ * only reachable through `DSH_HOME` would have had a permanently unauthenticated rendezvous and a
+ * direct path that never worked, while the relay path kept working and hid the reason.
+ *
+ * A machine with no identity at all still answers `null`: the calls go out unauthenticated, a `401`
+ * is reported as a refusal, and that is the accurate account of what happened.
  *
  * @param {ReturnType<typeof readConfig>} cfg
  * @returns {Promise<string|null>}
  */
 async function resolveToken(cfg) {
-  if (!cfg.stateDir) return null;
-  return requireToken(await readDevice({ stateDir: requireStateDir(cfg) }));
+  if (cfg.stateDir) return requireToken(await readDevice({ stateDir: requireStateDir(cfg) }));
+  const file = devicePathFor(cfg);
+  if (file === null) return null;
+  const device = await readDevice({ stateDir: path.dirname(file) });
+  return device.present ? requireToken(device) : null;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1384,6 +2307,11 @@ const COMPARABLE_FIELDS = new Set([
 const OPTIONAL_FIELDS = new Set([
   'stdout_head', 'stdout_tail', 'stderr_head', 'stderr_tail', 'untracked', 'toolchain',
   'lockfiles', 'unpinned_deps', 'submodules', 'lfs', 'signal',
+  // v0.4.0 §5: how the envelope travelled, and the path facts that came with it. Optional because a
+  // v0.3.9 agent sends neither and must keep working unchanged; here rather than in
+  // `COMPARABLE_FIELDS` because **a path is not a result** — two byte-identical runs on two machines
+  // must stay `consistent` when one of them punched a hole and the other used the relay.
+  'transport', 'p2p',
 ]);
 
 /**
@@ -1481,15 +2409,59 @@ function readAggregate(body) {
  *
  * These are the three questions §4 says an operator asks firs - is the relay there, has it
  * restarted, do I have the credential it want - answered in one place so a model does not have to
- * compare fields itself.
+ * compare fields itself. v0.4.0 adds the fourth: **which** relay this machine is talking to, and
+ * which path it expects a task to take.
  *
  * @param {object} relay The relay block built by `w2m_status`.
  * @param {object} rtt The block from {@link readRtt}.
  * @param {ReturnType<typeof readConfig>} cfg
+ * @param {object} p2p The block from {@link readP2PStatus}.
  * @returns {string[]}
  */
-function statusNotes(relay, rtt, cfg) {
+function statusNotes(relay, rtt, cfg, p2p) {
   const notes = [];
+
+  /**
+   * §7's one-line note, and the reason it exists at all: the shared server is a *default*, and a
+   * default that an operator cannot see is a machine quietly talking to somebody else's host. The
+   * note names the address in use, where it came from and the exact way to override it.
+   */
+  if (cfg.rabbitSource === 'shared-default') {
+    notes.push(
+      `\`rabbitUrl\` is not set, so this machine is using the shared W2M server at ${SHARED_SERVER.rabbitUrl} ` +
+        '(rabbit_source: "shared-default"); set `rabbitUrl` in this plugin\'s profile patch, or `W2M_RABBIT_URL` ' +
+        'in the environment, to point at your own relay',
+    );
+  } else if (cfg.rabbitSource === 'env') {
+    notes.push(`\`rabbitUrl\` came from the environment (\`W2M_RABBIT_URL\`), not from the profile patch, so a profile setting would be ignored`);
+  } else if (cfg.rabbitUrlOverride !== null && cfg.rabbitSource === 'config') {
+    notes.push(
+      '`rabbitUrl` is set in the profile patch, so it wins over `device.json`\'s own `rabbit_url` ' +
+        '(the v0.3.9 fallback, which is no longer consulted)',
+    );
+  }
+
+  if (p2p.mode === 'relay') {
+    notes.push('p2pMode is "relay": no UDP socket is bound on this machine and every task travels through the relay, exactly as in v0.3.9');
+  } else if (p2p.running) {
+    notes.push(
+      `p2pMode is "${p2p.mode}" and the direct path is up on ${p2p.local ? `${p2p.local.address}:${p2p.local.port}` : '(unknown local address)'}` +
+        `; ${p2p.reflexive ? `reflexive ${p2p.reflexive.address}:${p2p.reflexive.port}, NAT mapping ${p2p.mapping ?? 'unknown'}` : 'no reflexive address was measured (a LAN punch still works; a punch across the internet will fall back to the relay)'}` +
+        '. A punch between two machines on this same host proves the code path, not NAT traversal.',
+    );
+  } else if (p2p.enabled) {
+    notes.push(
+      `p2pMode is "${p2p.mode}" but the direct path is not running (${p2p.last_error ?? p2p.reason ?? 'no reason recorded'}), ` +
+        'so every task is dispatched over the relay; the relay\'s offer path is unaffected',
+    );
+  }
+
+  if (p2p.enabled && p2p.inbox.depth > 0) {
+    notes.push(
+      `${p2p.inbox.depth} result(s) received over a direct channel are waiting in ${p2p.inbox.dir}; ` +
+        'the relay\'s copy of each result is the ledger, these are the fast-path copies',
+    );
+  }
 
   if (relay.reachable === true && relay.relay_id) {
     notes.push(
@@ -1544,6 +2516,14 @@ export async function apply(ctx, config = {}) {
         'Argument validation, timeouts, cancellation, and rendering will come from DSH in production.',
     );
   }
+
+  // §7: the direct path, owned by this plugin for the plugin's whole lifetime.
+  //
+  // Composed here, next to the updater's own `ctx.effect`, and for the same reason: a socket and a
+  // refresh timer have to be released when the plugin is unloaded, and an effect disposer is the
+  // only mechanism Cordis gives for that. Creating it never throws — a machine that cannot punch
+  // still has to dispatch, and `w2m_status` is where the failure is reported.
+  const p2p = createP2PRuntime(ctx, cfg, config.p2pBlock);
 
   /** Text output: rendered as JSON, because every one of these tools answers with a structure. */
   const jsonOutput = {
@@ -1635,7 +2615,9 @@ export async function apply(ctx, config = {}) {
       'with its per-machine leases. The command runs on each machine in its own copy of the ' +
       'project; nothing is written unless `write` is true. Read the result with w2m_wait. ' +
       'Anchors (base_commit, base_tree) are computed here from this machine\'s working tree so ' +
-      'the peers can be checked against them.',
+      'the peers can be checked against them. Under the default p2pMode the offer is also pushed ' +
+      'over the direct path, best effort: `direct_pushes` names every attempt, and the relay\'s ' +
+      'own offer remains the delivery when a push fails.',
     parameters: {
       command_argv: {
         type: 'array',
@@ -1910,6 +2892,21 @@ export async function apply(ctx, config = {}) {
       const token = requireOperatorToken(cfg);
       const anchors = await resolveGitAnchors({ projectDir: cfg.projectDir, timeoutMs: Math.min(15_000, timeoutMs) });
 
+      // §7: the two routing facts the offer carries to the machine that has to run the command.
+      //
+      // `origin_machine_id` is *this* machine's id from `device.json` — where the work was typed, not
+      // where it runs — and it is omitted entirely (not sent as null) when this machine has no
+      // identity, because the relay's own validation refuses an empty string and "unknown origin" is
+      // what a missing field already means on the wire.
+      //
+      // The identity comes from the runtime, which resolves it off the dispatch path; a dispatch that
+      // arrives before that one small read has finished waits for it rather than racing it. The wait
+      // is bounded by the identity read itself and can never reject — see `createP2PRuntime`. This is
+      // also the first use of the direct path, so it is where the node is started.
+      await p2p.ensureStarted();
+      const originMachineId =
+        typeof p2p.machineId === 'string' && p2p.machineId !== '' ? p2p.machineId : null;
+
       const payload = {
         mode,
         // Under pipeline the relay derives this from stage 0; sending the caller's value when there is
@@ -1934,6 +2931,11 @@ export async function apply(ctx, config = {}) {
         // Only for pipeline. The relay ignores `stages` under the other modes and the validation
         // above refuses the combination, so this can never silently mean nothing.
         ...(mode === 'pipeline' && stagesPayload !== null ? { stages: stagesPayload } : {}),
+        // v0.4.0: stated on every task, so `w2m_wait`'s `transport` and a machine's report can say
+        // which path the dispatcher expected to use — and so the executor in `direct` mode knows it
+        // must refuse an offer that did not arrive over the direct path.
+        ...(originMachineId !== null ? { origin_machine_id: originMachineId } : {}),
+        p2p: { mode: cfg.p2pMode },
       };
 
       const result = await request({
@@ -1962,6 +2964,53 @@ export async function apply(ctx, config = {}) {
         );
       }
 
+      /**
+       * v0.4.0 §7: best-effort direct pushes, after the relay has the task.
+       *
+       * Order matters and is deliberate. The task exists on the relay *before* anything is punched,
+       * so a push that fails, a peer that never announced and a socket that was never bound all leave
+       * exactly the same outcome: the relay's own SSE offer is the delivery, and the machine's
+       * `transport` says which path won. A failed push is therefore **not** an error and never fails
+       * this tool — but it is not hidden either, because `direct_pushes` names every attempt and the
+       * reason it did not land.
+       *
+       * `relay` mode and a machine with no direct path both report `attempted: 0`, which is the
+       * honest answer ("there was nothing to push over") rather than an empty object.
+       */
+      let directPushes = { mode: cfg.p2pMode, attempted: 0, delivered: 0, failed: 0, pushes: [] };
+      if (cfg.p2pMode !== 'relay' && p2p.node !== null && p2p.start?.ok === true) {
+        try {
+          const pushes = await pushOffers(p2p.node, {
+            taskId: result.json?.task_id ?? null,
+            leases: Array.isArray(result.json?.leases) ? result.json.leases : [],
+            payload,
+            originMachineId,
+          });
+          directPushes = {
+            mode: cfg.p2pMode,
+            attempted: pushes.length,
+            delivered: pushes.filter((entry) => entry.ok).length,
+            failed: pushes.filter((entry) => !entry.ok).length,
+            pushes,
+          };
+        } catch (error) {
+          // `pushOffers` is written not to throw; this is here so a future edit cannot turn a
+          // best-effort optimisation into a failed dispatch.
+          directPushes = {
+            mode: cfg.p2pMode,
+            attempted: 0,
+            delivered: 0,
+            failed: 0,
+            pushes: [],
+            error: `P2P_PUSH_FAILED: ${error instanceof Error ? error.message : String(error)}`,
+          };
+        }
+      } else if (cfg.p2pMode !== 'relay') {
+        directPushes.error = p2p.error ?? 'the direct path is not running, so nothing was pushed';
+      }
+      // eslint-disable-next-line require-atomic-updates -- each dispatch writes its own summary; the last one wins by design
+      p2p.directPushes = directPushes;
+
       return JSON.stringify(
         {
           ok: true,
@@ -1976,6 +3025,9 @@ export async function apply(ctx, config = {}) {
             fingerprint_algo: 'git-temp-index-tree/v1',
             error: anchors.error,
           },
+          // v0.4.0: what the direct path tried, per machine. `mode` is repeated here rather than left
+          // to `w2m_status` so one dispatch's answer is self-contained.
+          direct_pushes: directPushes,
           note: anchors.base_tree === null
             ? 'this machine\'s working tree could not be fingerprinted, so peers have no anchor to match and the aggregate will be unverifiable'
             : 'peers are checked against base_commit + base_tree + command_hash',
@@ -2106,6 +3158,15 @@ export async function apply(ctx, config = {}) {
               status: machine?.status ?? null,
               refusal_reason: machine?.refusal_reason ?? null,
               exit_code: machine?.exit_code ?? null,
+              /**
+               * v0.4.0 §5: which path this machine's result travelled, and the path facts that came
+               * with it. Read from the envelope because that is where the agent writes them, with the
+               * per-machine record as the fallback (`GET /v1/tasks/{id}` copies both onto the machine
+               * entry as well). `null` means the machine did not say — which is exactly what a
+               * v0.3.9 agent sends, so a missing value must not be dressed up as `'relay'`.
+               */
+              transport: envelope?.transport ?? machine?.transport ?? null,
+              p2p: envelope?.p2p ?? machine?.p2p ?? null,
               reasons: machine?.reasons ?? [],
               envelope: compactEnvelope(envelope, COMPARABLE_FIELDS),
             };
@@ -2210,12 +3271,16 @@ export async function apply(ctx, config = {}) {
   ctx.tools.register(defineTool({
     name: 'w2m_status',
     description:
-      'Report this plugin\'s view of itself: the machine identity on disk, whether the Rabbit ' +
-      'answers, the paired token presence, the relay\'s cross-region diagnostics (relay_id, ' +
-      'uptime, deployment base_path, effective_scheme, whether it demands an operator token), ' +
-      'this machine\'s round-trip time to the relay, and the project\'s base_commit/base_tree. ' +
-      'Read-only, degrades field by field, and deliberately usable while the configuration is ' +
-      'still broken, because it is the tool you reach for when w2m_devices says rabbitUrl is unset.',
+      'Report this plugin\'s view of itself: the machine identity on disk, which relay it is ' +
+      'talking to and where that address came from (rabbit_source; "shared-default" means nobody ' +
+      'configured one), whether the Rabbit answers, the paired token presence, the relay\'s ' +
+      'cross-region diagnostics (relay_id, uptime, deployment base_path, effective_scheme, whether ' +
+      'it demands an operator token), the direct P2P path (mode, whether a UDP socket is bound, ' +
+      'the measured reflexive address and NAT mapping, punches in and out, and how many results ' +
+      'are waiting in the local inbox), this machine\'s round-trip time to the relay, and the ' +
+      'project\'s base_commit/base_tree. Read-only, degrades field by field, and deliberately ' +
+      'usable while the configuration is still broken, because it is the tool you reach for when ' +
+      'w2m_devices says rabbitUrl is unset.',
     parameters: {},
     output: jsonOutput,
     async execute(_args, exec) {
@@ -2292,6 +3357,12 @@ export async function apply(ctx, config = {}) {
 
       const anchors = await resolveGitAnchors({ projectDir: cfg.projectDir });
       const rtt = await readRtt(cfg);
+      // §7: this tool is one of the two places the direct path is asked about, so it is one of the
+      // two places the node is started. Never throws, and reports `enabled: false`/`running: false`
+      // rather than omitting itself — a reader has to be able to tell "relay mode" from "p2p was
+      // requested and did not start".
+      await p2p.ensureStarted();
+      const p2pStatus = await readP2PStatus(cfg, p2p, Number.isInteger(relay.peers_announced) ? relay.peers_announced : null);
 
       return JSON.stringify(
         {
@@ -2306,14 +3377,30 @@ export async function apply(ctx, config = {}) {
             device_error: device.error,
           },
           relay: { ...relay, healthz: '/healthz' },
+          /**
+           * §7: which relay this machine is actually talking to, and where that address came from.
+           *
+           * `rabbit_source` is the field an operator needs when two machines disagree about the
+           * fleet, and `'shared-default'` is the one value that means "nobody chose this endpoint".
+           * It is repeated at the top level rather than only under `config` because it is the answer
+           * to a question asked about the *relay*, not about this plugin's settings.
+           */
+          rabbit_source: cfg.rabbitSource,
+          rabbit_url: cfg.rabbitUrl,
+          p2p: p2pStatus,
           rtt,
           config: {
             rabbitUrl: cfg.rabbitUrl,
+            rabbit_source: cfg.rabbitSource,
+            rabbit_url_override_ignored: cfg.rabbitUrlOverride,
             stateDir: cfg.stateDir,
             projectDir: cfg.projectDir,
             autoStartAgent: cfg.autoStartAgent,
             allowedCommands: cfg.allowedCommands,
             pairingCode_configured: cfg.pairingCode !== null,
+            p2pMode: cfg.p2pMode,
+            // The resolved list, shared server first, exactly as the node will query it.
+            stunServers: cfg.stunServers,
             // §5: `validated` reports presence only. The plugin cannot tell a correct token from a
             // wrong one without spending a dispatch, and `required_by_relay` is what makes the two
             // halves of the mismatch (client has none / relay demands one) visible side by side.
@@ -2349,7 +3436,7 @@ export async function apply(ctx, config = {}) {
             fingerprint_algo: 'git-temp-index-tree/v1',
             error: anchors.error,
           },
-          notes: statusNotes(relay, rtt, cfg),
+          notes: statusNotes(relay, rtt, cfg, p2pStatus),
         },
         null,
         2,

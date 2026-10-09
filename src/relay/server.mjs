@@ -576,6 +576,8 @@ export class RelayServer {
     return new Promise((resolve) => {
       if (this._sweepTimer) clearInterval(this._sweepTimer);
       this._sweepTimer = null;
+      // v0.4.0: a deferred P2P offer is a pending timer, and a closed relay must not fire one.
+      this.state.clearPendingOffers?.();
       for (const sub of [...this.subscribers]) this._closeSubscriber(sub);
       this.server.close(() => resolve());
       this.server.closeAllConnections?.();

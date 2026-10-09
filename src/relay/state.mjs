@@ -87,6 +87,15 @@ export const ACTIVE_LEASE_STATES = Object.freeze(['queued', 'offered', 'running'
 export const DEFAULT_HEARTBEAT_INTERVAL_MS = 10_000; // §4.3: agent heartbeats every 10s
 export const DEFAULT_MISSED_HEARTBEATS = 2;          // §4.3: 2 missed cycles = 20s
 export const DEFAULT_LEASE_GRACE_MS = 30_000;        // §4.3: + grace 30s
+/**
+ * v0.4.0: the bounded hold on the relay's own offer when a dispatcher is pushing it directly.
+ *
+ * Sized against what it has to cover: one punch round trip (measured 15-370 ms on the reference
+ * networks) plus the executor's first heartbeat POST. 1.2 s covers a 300 ms WAN path with room to
+ * spare, and a failed punch pays it once per task -- which is the whole cost of preferring the
+ * direct path.
+ */
+export const DEFAULT_P2P_OFFER_GRACE_MS = 1_200;
 export const DEFAULT_PAIRING_TTL_MS = 24 * 60 * 60 * 1000; // §2.2: 24h
 export const DEFAULT_EVENT_BUFFER_SIZE = 1000;       // §requirement: keep last 1000 events
 export const MAX_FRAME_BYTES = 64 * 1024;            // 64 KiB single frame
@@ -153,6 +162,34 @@ export function jcs(value) {
  * package) and exists so the failure is a clear refusal rather than a fleet-wide surprise.
  */
 export const MAX_PIPELINE_STAGES = 16;
+
+/**
+ * v0.4.0: upper bound on `POST /v1/task`'s `origin_machine_id`.
+ *
+ * A machine id is an identifier, not a payload: 128 characters is far beyond any id this system
+ * mints, and the ceiling is what stops the field from becoming an unbounded free-text channel into
+ * every offer frame the relay emits.
+ */
+export const MAX_ORIGIN_MACHINE_ID_LENGTH = 128;
+
+/**
+ * v0.4.0: the P2P modes a task may be dispatched under (§1 of the frozen v0.4.0 contract).
+ *
+ * Mirrored here rather than imported from `src/agent/p2p-node.mjs`: the relay is a standalone
+ * process that must not depend on agent code, and a mode list is three strings. A value outside
+ * this list is a configuration error, never a silent fall back to the default.
+ */
+export const P2P_MODES = Object.freeze(['auto', 'direct', 'relay']);
+
+/**
+ * v0.4.0: how a result travelled — the direct P2P channel or the relay.
+ *
+ * A **transport is not a result**: how an envelope arrived must never take part in the consistency
+ * judgement (§5 of the contract), or two machines that produced byte-identical output would be
+ * reported `divergent` merely because one of them punched a hole. Hence: not required, not
+ * comparable, and absent on every v0.3.9 envelope.
+ */
+export const TRANSPORT_VALUES = Object.freeze(['p2p', 'relay']);
 
 /** §4.4 helper: command_hash = sha256(JCS(argv)+"|"+shell_id+"|"+cwd_rel). */
 export function computeCommandHash(commandArgv, shellId = SHELL_ID_DIRECT, cwdRel = '.') {
@@ -356,6 +393,26 @@ export class RabbitState {
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS;
     this.missedHeartbeats = options.missedHeartbeats ?? DEFAULT_MISSED_HEARTBEATS;
     this.leaseGraceMs = options.leaseGraceMs ?? DEFAULT_LEASE_GRACE_MS;
+    /**
+     * v0.4.0: how long the relay holds its own offer back when the dispatcher says it will push the
+     * offer over the direct path (`origin_machine_id` + `p2p.mode`).
+     *
+     * Without this, the direct path could never win: the relay's offer goes out over an SSE stream
+     * that is already open, while a punch costs at least one round trip, so the relay copy would
+     * arrive first essentially always and `transport` would read `relay` even on a network where
+     * the punch succeeded. Measured on loopback, and it is exactly what the first version of this
+     * release did.
+     *
+     * The hold is bounded and self-healing: the executor renews its lease (a heartbeat) the moment
+     * it starts work on the direct copy, which moves the lease out of `queued`, and the deferred
+     * offer is then dropped. If the punch fails, nothing renews the lease and the relay offers
+     * normally once the grace expires -- so a failed punch costs this much latency and nothing else.
+     */
+    this.p2pOfferGraceMs = Number.isFinite(options.p2pOfferGraceMs) && options.p2pOfferGraceMs >= 0
+      ? options.p2pOfferGraceMs
+      : DEFAULT_P2P_OFFER_GRACE_MS;
+    /** Deferred offers, keyed `task_id:machine_id`, so they can be cleared on close(). */
+    this._pendingOffers = new Map();
     /** v0.3.0: age beyond which a reported RTT is flagged stale. */
     this.rttStaleMs = Number.isFinite(options.rttStaleMs) ? options.rttStaleMs : DEFAULT_RTT_STALE_MS;
 
@@ -503,6 +560,10 @@ export class RabbitState {
           cancel_reason: null,
           degraded: t.degraded ?? null,
           deadline_ms: t.deadline_ms ?? 0,
+          // v0.4.0 routing metadata. Read defensively: a ledger written by v0.3.9 has neither key,
+          // and a replayed task with `null` for both is exactly a v0.3.9 task.
+          origin_machine_id: t.origin_machine_id ?? null,
+          p2p: t.p2p ?? null,
           result_seqs: [],
         };
         for (const lease of entry.leases ?? []) {
@@ -939,6 +1000,80 @@ export class RabbitState {
   /* ---------------- tasks (§4) ---------------- */
 
   /**
+   * v0.4.0: validate the routing metadata a `POST /v1/task` body may carry.
+   *
+   * A machine, not a mode, is `origin_machine_id`: where the task was typed (`device.json`), so an
+   * offer can carry that fact to the machine that has to run it. `p2p.mode` is the dispatcher's
+   * resolved mode for this particular task — the plugin may be configured `direct` while a
+   * scheduled run is `relay`.
+   *
+   * Validation is deliberately shallow and strictly typed, in the house style of this file: a
+   * missing value is the v0.3.9 shape and stays valid, while a present-but-wrong value is refused
+   * by name. Accepting a non-string here would put a number into `origin_machine_id` and only fail
+   * later, on a machine that cannot tell a bad field from a bad relay.
+   *
+   * @returns {{origin_machine_id:string|null, p2p:{mode:string}|null}}
+   */
+  static validateTaskRouting(input = {}) {
+    let originMachineId = null;
+    if (input.origin_machine_id !== undefined && input.origin_machine_id !== null) {
+      if (typeof input.origin_machine_id !== 'string'
+        || input.origin_machine_id.length === 0
+        || input.origin_machine_id.length > MAX_ORIGIN_MACHINE_ID_LENGTH) {
+        throw new ProtocolError(
+          'BAD_REQUEST',
+          `origin_machine_id must be a non-empty string of at most ${MAX_ORIGIN_MACHINE_ID_LENGTH} characters`,
+          { origin_machine_id: input.origin_machine_id },
+        );
+      }
+      originMachineId = input.origin_machine_id;
+    }
+
+    let p2p = null;
+    if (input.p2p !== undefined && input.p2p !== null) {
+      if (typeof input.p2p !== 'object' || Array.isArray(input.p2p)) {
+        throw new ProtocolError('BAD_REQUEST', 'p2p must be an object with a `mode` field', { p2p: input.p2p });
+      }
+      if (!P2P_MODES.includes(input.p2p.mode)) {
+        throw new ProtocolError(
+          'BAD_REQUEST',
+          `p2p.mode must be one of ${P2P_MODES.join('|')}`,
+          { 'p2p.mode': input.p2p.mode ?? null },
+        );
+      }
+      // Copied rather than referenced: the recorded task must not be mutable through the request
+      // body the caller still holds.
+      p2p = { ...input.p2p };
+    }
+
+    return { origin_machine_id: originMachineId, p2p };
+  }
+
+  /**
+   * v0.4.0 §5.2: validate the optional transport fields of a result envelope.
+   *
+   * Same reasoning as `validateTaskRouting`: `transport` is an enum and `p2p` is an opaque object,
+   * so anything else is refused by name at the door. Both fields stay OUT of
+   * `REQUIRED_ENVELOPE_FIELDS` (a missing one is a v0.3.9 envelope, not an incomplete one) and out
+   * of `COMPARABLE_FIELDS` (a path is not a result).
+   */
+  static validateTransportFields(envelope = {}) {
+    if (envelope.transport !== undefined && envelope.transport !== null) {
+      if (!TRANSPORT_VALUES.includes(envelope.transport)) {
+        throw new ProtocolError(
+          'BAD_REQUEST',
+          `transport must be one of ${TRANSPORT_VALUES.join('|')}`,
+          { transport: envelope.transport },
+        );
+      }
+    }
+    if (envelope.p2p !== undefined && envelope.p2p !== null
+      && (typeof envelope.p2p !== 'object' || Array.isArray(envelope.p2p))) {
+      throw new ProtocolError('BAD_REQUEST', 'p2p must be an object', { p2p: envelope.p2p });
+    }
+  }
+
+  /**
    * §4.1 POST /v1/task.
    * Machine selection is not specified by the PROTOCOL; we implement:
    *   - `target_machines` (optional explicit list), else every paired device
@@ -946,6 +1081,10 @@ export class RabbitState {
    *   - index assignment: replicate -> 0, split -> round-robin modulo index_total
    */
   createTask(input = {}) {
+    // v0.4.0: refused BEFORE the task literal is built and before any offer is emitted, so a bad
+    // value cannot leave a half-created task behind. `POST /v1/task` is all-or-nothing.
+    const routing = RabbitState.validateTaskRouting(input);
+
     const mode = input.mode ?? 'replicate';
     if (mode !== 'replicate' && mode !== 'split' && mode !== 'broadcast' && mode !== 'pipeline' && mode !== 'compose') {
       throw new ProtocolError(
@@ -1094,6 +1233,17 @@ export class RabbitState {
        * reporting any of them.
        */
       stages,
+      /**
+       * v0.4.0: where the task came from and under which P2P mode it was dispatched, or null.
+       *
+       * Kept on the task (not just passed to `emitOffer`) because an offer is emitted more than
+       * once: `redeliverPendingOffers` re-states unclaimed work on every reconnect and
+       * `_takeover` re-offers a freed index. A machine that reconnects must see the same routing
+       * facts as the machine that was connected at dispatch time, or the direct-push half of the
+       * feature would work exactly once and then quietly stop.
+       */
+      origin_machine_id: routing.origin_machine_id,
+      p2p: routing.p2p,
     };
 
     const all = [...this.devices.values()];
@@ -1168,8 +1318,15 @@ export class RabbitState {
         return;
       }
       task.leases.set(device.machine_id, lease);
-      const event = this.emitOffer(task, lease);
-      lastSeq = event.seq;
+      const grace = this._p2pOfferGraceMs(task);
+      if (grace > 0) {
+        // v0.4.0: the dispatcher is pushing this offer over the direct path right now. Hold the
+        // relay's copy for `grace` ms so the direct one can win; see `p2pOfferGraceMs`.
+        this._scheduleOffer(task, lease, grace);
+      } else {
+        const event = this.emitOffer(task, lease);
+        lastSeq = event.seq;
+      }
     });
 
     this.tasks.set(taskId, task);
@@ -1196,6 +1353,9 @@ export class RabbitState {
         command_hash: task.command_hash,
         attempt: task.attempt,
         deadline_ms: task.deadline_ms,
+        // v0.4.0: routing metadata, so a restarted relay re-offers with the same facts.
+        origin_machine_id: task.origin_machine_id ?? null,
+        p2p: task.p2p ?? null,
       },
       leases: [...task.leases.values()].map((l) => ({ ...l })),
     });
@@ -1217,10 +1377,69 @@ export class RabbitState {
         machine_id: l.machine_id,
         index: l.index,
         state: l.state,
+        // v0.4.0: the dispatcher pushes an offer over the direct path, and the executor dedupes it
+        // against the relay's copy by (task_id, attempt, dedupe_key). Without this field the
+        // dispatcher has to reproduce the §4.4 formula locally, which works for a single-command
+        // task and cannot work for a pipeline one -- the key covers the relay's normalised stage
+        // list. Publishing it makes the pushed copy recognisably the same work item, which is what
+        // keeps the direct path from turning exactly-once into at-least-twice.
+        dedupe_key: l.dedupe_key ?? null,
+        attempt: l.attempt,
         ...(l.refusal_reason ? { refusal_reason: l.refusal_reason } : {}),
       })),
       seq: lastSeq,
     };
+  }
+
+  /**
+   * v0.4.0: should the relay hold its offer back for this task?
+   *
+   * Only when the dispatcher said two things: that it is a machine (`origin_machine_id`), and that
+   * the direct path is in play (`p2p.mode` of `auto` or `direct`). A `relay` mode or a v0.3.9
+   * dispatcher gets the old behaviour exactly, which is why this predicate is the only gate on the
+   * change and every pre-existing test still sees an immediate offer.
+   *
+   * @param {object} task
+   * @returns {number} milliseconds to hold, or 0 for "offer now"
+   */
+  _p2pOfferGraceMs(task) {
+    if (this.p2pOfferGraceMs <= 0) return 0;
+    const origin = task?.origin_machine_id;
+    if (typeof origin !== 'string' || origin === '') return 0;
+    const mode = task?.p2p?.mode;
+    if (mode !== 'auto' && mode !== 'direct') return 0;
+    return this.p2pOfferGraceMs;
+  }
+
+  /**
+   * v0.4.0: emit `lease`'s offer after `delayMs`, unless the direct path got there first.
+   *
+   * "Got there first" is one fact and it is already tracked: the executor renews the lease
+   * (`POST /v1/heartbeat`) as its first act on any offer it accepts, and a renewal moves the lease
+   * out of `queued`. So the check is the lease's own state — no new message, no new endpoint, and
+   * nothing the executor has to know about.
+   *
+   * The timer is `unref()`ed: a relay with nothing else to do must still be able to exit, and a
+   * pending offer is not a reason to keep a process alive.
+   */
+  _scheduleOffer(task, lease, delayMs) {
+    const key = `${task.task_id}:${lease.machine_id}`;
+    const timer = setTimeout(() => {
+      this._pendingOffers.delete(key);
+      // A lease that was re-created (takeover) or swept is not this one any more.
+      if (task.leases.get(lease.machine_id) !== lease) return;
+      if (lease.state !== 'queued') return; // the direct copy won; nothing to fall back to
+      if (this.isLeaseExpired(lease, this.nowMs())) return; // the sweep owns it now
+      this.emitOffer(task, lease);
+    }, delayMs);
+    timer.unref?.();
+    this._pendingOffers.set(key, timer);
+  }
+
+  /** Drop every deferred offer. Called by the relay's own teardown path. */
+  clearPendingOffers() {
+    for (const timer of this._pendingOffers.values()) clearTimeout(timer);
+    this._pendingOffers.clear();
   }
 
   emitOffer(task, lease) {
@@ -1235,6 +1454,17 @@ export class RabbitState {
       // entirely otherwise, so an offer for a single-command task is byte-identical to before --
       // which is what keeps a v0.2.3 agent working against this relay.
       ...(task.stages ? { stages: task.stages } : {}),
+      /**
+       * v0.4.0: always present, `null` when the caller supplied nothing.
+       *
+       * Deliberately NOT conditional (unlike `stages` above, which is omitted so a single-command
+       * offer stays byte-identical for an old agent): the contract fixes the shape of these two as
+       * `string|null` and `{mode}|null`, and `null` is the honest value for "the dispatcher did not
+       * say" — which is exactly the v0.3.9 case. They are additive keys in an event whose consumers
+       * already ignore unknown fields.
+       */
+      origin_machine_id: task.origin_machine_id ?? null,
+      p2p: task.p2p ?? null,
       cwd_rel: task.cwd_rel,
       write: task.write,
       timeout_ms: task.timeout_ms,
@@ -1621,6 +1851,14 @@ export class RabbitState {
   submitResult(envelope = {}) {
     const { missing, problems, malformed } = RabbitState.validateEnvelope(envelope);
     if (malformed) throw new ProtocolError('BAD_REQUEST', 'result must be a JSON object');
+
+    /**
+     * v0.4.0: `transport` / `p2p` are OPTIONAL envelope fields, and they are validated as values
+     * rather than added to the §5.1 required set. A v0.3.9 agent sends neither and must keep
+     * working unchanged; an agent that sends `transport: 'satellite'` is refused by name instead of
+     * storing a value the report would then show as a path that does not exist.
+     */
+    RabbitState.validateTransportFields(envelope);
 
     const taskId = envelope.task_id;
     if (typeof taskId !== 'string' || taskId.length === 0) {

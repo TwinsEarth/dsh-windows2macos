@@ -471,3 +471,88 @@ statuses — `401` for `UNAUTHORIZED` and `OPERATOR_REQUIRED`, `429` for
 `RATE_LIMITED`, `404` for `NOT_FOUND` — **and** a JSON `error.code`. Use the
 status for retry/backoff decisions and the code for diagnosis; the code is the
 stable contract (`PROTOCOL.md`), the status is the HTTP-idiomatic view of it.
+
+---
+
+## 9. The direct path is never used (`transport: "relay"`)
+
+Start with the field that was put there for exactly this: `w2m_wait` reports
+`transport` and `p2p.reason` per machine, and `w2m_report` prints the same as a
+`路径` column. The reason names the failure; guessing from "it feels slow" does not.
+
+| `p2p.reason` | What it means | What to do |
+|---|---|---|
+| `P2P_PUNCH_TIMEOUT` | HELLOs went out, nothing came back within the budget | read `p2p.mapping` — see below |
+| `P2P_NO_CANDIDATES` | the peer has never announced, or its announcement expired | is the agent running, and is `p2pMode` not `relay` on it? `w2m_status` shows `peers_announced` on the relay |
+| `P2P_DISABLED` | this side is `p2pMode: relay` | set `p2pMode: auto` (or `direct`) and restart |
+| `P2P_UNAVAILABLE` | `p2pMode: direct` and the punch failed, so the relay offer was refused on purpose | that is the mode working; use `auto` if you want the fallback |
+
+**`mapping: "endpoint-dependent"` is the answer, not a mystery.** Ask three STUN
+servers for your address from one socket:
+
+```bash
+node -e "import('./src/agent/stun.mjs').then(async (s) => {
+  const { socket } = await s.bindUdpSocket();
+  console.log(await s.discoverReflexive({ socket, servers: ['202.182.123.154:3478','stun.cloudflare.com:3478','stun.l.google.com:19302'] }));
+  socket.close(); })"
+```
+
+If each server reports a **different port**, the network is a symmetric NAT: the
+address a peer is told about is not the address your packets will come from, and
+**no change on any server can fix that**. Measured twice on real networks
+(iPhone hotspot in v0.3.9, China Mobile in v0.4.0 — three servers, three ports:
+36028, 5855, 26713). Use the relay, or put both machines on a WireGuard/Tailscale
+network where there is no NAT between them.
+
+One direction still works through a symmetric NAT, and it is worth understanding
+why: a **punch you initiate** opens a mapping, and the peer's answer to the
+datagram it just received returns through that mapping. So a symmetric-NAT
+machine can reach a public peer (the shared server, a VPS) directly, while the
+reverse — being dialled — cannot work. That is why the dispatcher dials the
+executor and not the other way round.
+
+**A punch that succeeds on one host proves nothing about NAT traversal.** Two
+sockets on one machine share a path with no translator between them. If you are
+debugging, make sure the two ends are actually on two networks.
+
+**Windows Defender Firewall is a second NAT you cannot see in `mapping`.** The
+punch socket is an ordinary inbound UDP port, so a *dialled* Windows machine can
+drop an unsolicited HELLO while its own outbound dials work fine. That asymmetry
+matters because the dispatcher is the side that dials: a Windows machine running
+DSH reaches its peers directly, but a Windows machine acting as the executor for
+somebody else may need an inbound rule for `node.exe` (UDP) before it answers.
+If a punch fails in exactly one direction and `mapping` looks punchable on both
+sides, look here first.
+
+---
+
+## 10. `refused` with `COMMAND_NOT_ALLOWED`, and the command looks allowed
+
+The allow-list matches **the whole argv, token by token**, and a string entry is
+split on whitespace:
+
+```jsonc
+["node --test", "git status --porcelain"]   // tokens: [node, --test] / [git, status, --porcelain]
+```
+
+Two consequences that are easy to walk into:
+
+* `node -e console.log` does **not** allow `node -e console.log(1)`: the third
+  token differs. Allow the prefix you actually mean (`node -e`), and remember that
+  this is a shell-free prefix match, not a glob.
+* A single path containing a space **cannot** be written as a string entry —
+  `C:\Program Files\nodejs\node.exe` splits into two tokens and matches nothing.
+  Use an array entry, which is taken verbatim:
+
+  ```jsonc
+  [["C:\\Program Files\\nodejs\\node.exe", "-e"]]
+  ```
+
+  (This is why the pipeline end-to-end suite passes on CI runners — Node lives at
+  a path without spaces there — and can fail locally on a Windows box where Node
+  is installed under `C:\Program Files`.)
+
+To see what the machine actually received, ask the relay for the last task and
+read the machine's `refusal_reason`, or run the agent in the foreground: the
+refusal is logged with the full `argv` next to it.
+

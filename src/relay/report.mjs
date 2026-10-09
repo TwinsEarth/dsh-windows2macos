@@ -439,6 +439,14 @@ export function aggregate(task, resultRecords = [], opts = {}) {
       status: m.envelope?.status ?? null,
       refusal_reason: m.refusal_reason ?? null,
       exit_code: m.envelope?.exit_code ?? null,
+      /* v0.4.0: how this machine's envelope travelled, straight off the stored envelope.
+       *
+       * `null` means "the envelope did not say" -- every v0.3.9 result, and the honest answer for a
+       * relay that simply does not know. These two fields are REPORTED, never judged: they are not
+       * in COMPARABLE_FIELDS, so a machine that answered over P2P and one that answered over the
+       * relay still produce the same verdict. A path is not a result. */
+      transport: m.envelope?.transport ?? null,
+      p2p: m.envelope?.p2p ?? null,
       reasons: m.reasons,
     })),
     steps,
@@ -508,11 +516,15 @@ export function renderReportMarkdown(agg, task = null) {
   L.push('');
   L.push('## 逐机结果');
   L.push('');
-  L.push('| machine_id | index | lease | 判定 | status | exit_code | 说明 |');
-  L.push('|---|---|---|---|---|---|---|');
+  L.push('| machine_id | index | lease | 判定 | status | exit_code | 说明 | 路径 |');
+  L.push('|---|---|---|---|---|---|---|---|');
   for (const m of agg.machines) {
+    // v0.4.0: the trailing 路径 column is APPENDED, so every existing column keeps its name and
+    // position and a reader written against v0.3.9 output is unaffected. `-` is "the envelope did
+    // not say" (every v0.3.9 result), which is not the same claim as `relay`.
     L.push(`| \`${m.machine_id}\` | ${fmt(m.index)} | ${m.lease_state} | ${m.outcome ?? '—'} | ${fmt(m.status)} `
-      + `| ${fmt(m.exit_code)} | ${m.reasons.length ? m.reasons.join('; ') : (m.refusal_reason ?? '')} |`);
+      + `| ${fmt(m.exit_code)} | ${m.reasons.length ? m.reasons.join('; ') : (m.refusal_reason ?? '')} `
+      + `| ${m.transport ?? '-'} |`);
   }
   L.push('');
   if (agg.differences.length > 0) {
