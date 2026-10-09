@@ -4,6 +4,34 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.6] — 2026-10-09
+
+### Added
+
+* **Published to npm.** `@twinsearth/w2m-dsh-plugin` is now installable by name:
+
+  ```bash
+  dsh plugin --profile <profile-name> add @twinsearth/w2m-dsh-plugin
+  ```
+
+  which is the form the marketplaces and every reader's muscle memory expect, and the form the
+  README had to warn against until now. It is the **same file** the GitHub release publishes —
+  `release.yml` packs with `scripts/pack.mjs`, the release uploads the tarball and `SHA256SUMS`, and
+  the npm publish uploads that fetched-back tarball after checking it against those sums. Nothing
+  is repacked, so "which artifact did you install?" has one answer rather than three.
+* **`release.yml` gained an `npm` job** with two ways to authenticate, preferred first: **trusted
+  publishing (OIDC)** — nothing stored in the repository, configured once on npmjs.com against this
+  repo and workflow — or an `NPM_TOKEN` repository secret. It is `continue-on-error` on purpose:
+  those credentials live outside the repository, so an unconfigured npm account must not paint
+  every future release red, but it must not pass silently either. It also skips cleanly when the
+  version is already published, so re-running a release is idempotent.
+
+### Changed
+
+* The README's install section leads with the npm form, the version badge is replaced by a live npm
+  badge, and the "not from npm yet" warning is gone — it was true for exactly one release cycle and
+  would have been the first thing a visitor to the npm page read.
+
 ## [0.4.5] — 2026-10-09
 
 ### Fixed

@@ -5,8 +5,8 @@
 English | [中文](#中文说明)
 
 [![CI](https://github.com/TwinsEarth/dsh-windows2macos/actions/workflows/ci.yml/badge.svg)](https://github.com/TwinsEarth/dsh-windows2macos/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/@twinsearth/w2m-dsh-plugin?label=npm)](https://www.npmjs.com/package/@twinsearth/w2m-dsh-plugin)
 [![DSH plugin](https://img.shields.io/badge/DSH-plugin-4c6ef5)](#install)
-[![version](https://img.shields.io/badge/version-0.4.0-blue)](#changelog)
 [![dependencies](https://img.shields.io/badge/runtime%20dependencies-0-brightgreen)](#design-notes)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![platforms](https://img.shields.io/badge/CI-windows%20%7C%20macos%20%7C%20linux-4c6ef5)](#verified-and-not-verified)
@@ -187,12 +187,17 @@ runs unless it matches a prefix:
 
 ### 3. The DSH plugin
 
-**From the release tarball** — this is the form verified in this repository, and it needs
-no registry at all:
+**From npm** — the shortest form, and the one the marketplaces install:
+
+```bash
+dsh plugin --profile <profile-name> add @twinsearth/w2m-dsh-plugin
+```
+
+**From the release tarball** — the same bytes, and it needs no registry at all:
 
 ```bash
 dsh plugin --profile <profile-name> add \
-  https://github.com/TwinsEarth/dsh-windows2macos/releases/download/v0.4.3/twinsearth-w2m-dsh-plugin-0.4.3.tgz
+  https://github.com/TwinsEarth/dsh-windows2macos/releases/download/v0.4.6/twinsearth-w2m-dsh-plugin-0.4.6.tgz
 ```
 
 **From the repository** — the form a marketplace's one-click installer uses (it clones
@@ -202,10 +207,10 @@ the repo, builds nothing, and registers `cordis.patch.yml`):
 dsh plugin --profile <profile-name> install TwinsEarth/dsh-windows2macos
 ```
 
-**Not from npm yet.** The package is named `@twinsearth/w2m-dsh-plugin` and
-`dsh plugin --profile <profile-name> add @twinsearth/w2m-dsh-plugin@0.4.3` will work the
-day it is published; today that form fails with a registry 404, which is why the two
-forms above carry the version instead of the name.
+All three end up with the same package: `release.yml` packs the tarball with
+`scripts/pack.mjs`, the release publishes it with `SHA256SUMS`, and the npm publish uses
+that exact file rather than repacking — so "which artifact did you install?" has one
+answer, not three.
 
 > Whichever form you use, the installer must end up with the plugin in the profile's
 > `node_modules` **and** a row in the profile's `cordis.patch.yml`. A bundle that is

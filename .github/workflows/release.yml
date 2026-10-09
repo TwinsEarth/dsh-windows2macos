@@ -106,3 +106,69 @@ jobs:
               dist/*.tgz dist/SHA256SUMS
           fi
           gh release view "$tag" --json assets,url
+
+  # ---------------------------------------------------------------------------------------------
+  # npm
+  #
+  # It publishes **the file the release just published**, fetched back from the release and checked
+  # against SHA256SUMS, not a fresh `npm pack`. One artifact, one answer to "which bytes did you
+  # install" -- the same reason the packer is shared.
+  #
+  # Two ways to authenticate, in order of preference, and neither is required for a release to be
+  # green:
+  #
+  #   1. **Trusted publishing (OIDC)** -- nothing stored in this repository. On npmjs.com, in the
+  #      package's settings, add a Trusted Publisher: GitHub Actions, repo
+  #      TwinsEarth/dsh-windows2macos, workflow release.yml. `id-token: write` below is what makes
+  #      the exchange possible, and `--provenance` attaches the attestation.
+  #   2. **`NPM_TOKEN` repository secret** -- a granular/automation token with publish rights.
+  #
+  # `continue-on-error` is deliberate. These credentials live outside the repository, so an
+  # unconfigured or expired npm credential must not paint every future release red -- but it must
+  # not pass silently either, which is why the step prints why it skipped and the job still shows up
+  # as failed when it tried and could not.
+  # ---------------------------------------------------------------------------------------------
+  npm:
+    name: publish to npm
+    needs: release
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Publish the tarball the release published
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          version="$(node -p "require('./package.json').version")"
+          asset="twinsearth-w2m-dsh-plugin-${version}.tgz"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}"
+
+          if [ -z "${NODE_AUTH_TOKEN:-}" ] && [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+            echo "::warning::skipping npm: no NPM_TOKEN secret and no OIDC token available"
+            exit 0
+          fi
+
+          curl -fsSL -o "/tmp/${asset}" "${base}/${asset}"
+          curl -fsSL -o /tmp/SHA256SUMS "${base}/SHA256SUMS"
+          ( cd /tmp && grep " ${asset}\$" SHA256SUMS | sha256sum -c - )
+
+          if npm view "@twinsearth/w2m-dsh-plugin@${version}" version >/dev/null 2>&1; then
+            echo "already on npm: ${version} -- nothing to do"
+            exit 0
+          fi
+
+          npm publish "/tmp/${asset}" --access public --provenance
+          npm view "@twinsearth/w2m-dsh-plugin@${version}" version dist.integrity
