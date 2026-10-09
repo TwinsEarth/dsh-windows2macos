@@ -15,6 +15,10 @@
 | 默认 | **P2P 直连**：`p2pMode: auto` 真正生效（此前 `p2p.mode` 无人读取）；`rabbitUrl` 留空即用共享服务器 `http://202.182.123.154:8787`，STUN 默认第一位是 `202.182.123.154:3478`；`w2m_status` 用 `rabbit_source` 说明地址来源 |
 | 共享服务器 | 中继（`:8787`，另有 nginx `:80`）、STUN（`:3478/udp`）、systemd 单元、ufw 规则、以及作为舰队一员的 Localside（`jp-shared`），全部在线 |
 | 测试 | **29 个套件**：新增 `p2p-node`、`p2p-transport-fields`、`p2p-plugin`、`p2p-agent`、`stun-server`，已写入 `npm test` / `test:all` / `test:p2p` / `scripts/verify.{ps1,sh}` / `ci.yml` / `release.yml` |
+| Release | https://github.com/TwinsEarth/dsh-windows2macos/releases/tag/v0.4.0 |
+| 资产 | `twinsearth-w2m-dsh-plugin-0.4.0.tgz`（392,552 B）+ `SHA256SUMS`，由 `release.yml` 构建并发布（不是手工上传） |
+| CI / Release | CI **#32 成功**（windows node 20/22、macos 22、ubuntu 22 矩阵 + lint + 打包可复现）；Release **#17 成功**（单元套件、e2e 套件、打包、解包验证 8 个工具、发布资产，全部通过） |
+| 共享服务器 | 202.182.123.154：`w2m-rabbit`（`:8787`）、`w2m-stun`（`:3478/udp`）、`w2m-localside`（`jp-shared`，`p2pMode: auto`）三个 systemd 单元在线；nginx `:80` 反代到中继 |
 
 ### 三个实测结论，不是推理结论
 
