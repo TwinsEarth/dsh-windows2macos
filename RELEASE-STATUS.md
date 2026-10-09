@@ -267,3 +267,45 @@ v0.4.4 发布后 CI #41 在 **ESLint** 步骤失败：`deploy/windows/` 不在"�
 - 任务 `Running`；agent 日志打印**完整九条**允许清单；`stream ready` 到达
 - 真实舰队派发：两机 `consistent`（本机那次走中继，理由字段 `P2P_NO_CANDIDATES` 写明是回落而非失败）
 - Release v0.4.4（#22）/ v0.4.5（#23）与 CI #42 全绿；v0.4.5 资产 `twinsearth-w2m-dsh-plugin-0.4.5.tgz` 411,888 B + `SHA256SUMS`
+
+---
+
+## 10. npm 发布（v0.4.7 起）
+
+| 事项 | 结果 |
+|---|---|
+| 包 | `@twinsearth/w2m-dsh-plugin`，`latest = 0.4.7` |
+| 安装 | `dsh plugin --profile desktop add @twinsearth/w2m-dsh-plugin@0.4.7` —— **本机实测装成**，profile 依赖从 `file:…0.4.2.tgz` 变成注册表语义版本 `0.4.7` |
+| 字节一致 | npm 上发布的就是 **GitHub Release 那个 tarball**（`sha256 c075a55f…` 与 `SHA256SUMS` 相同），不是重新打包 |
+| 自动化 | `release.yml` 新增 `npm` 作业：优先 **Trusted Publishing（OIDC，仓库里不存任何 token）**，其次 `NPM_TOKEN` secret；已发版本自动跳过，可重跑 |
+
+### 过程中的两个真实结论
+
+1. **npm 已禁止"绕过 2FA 的 token"直接发布**（CLI 会提示该弃用）。用这种 token 发布不会报错，而是被**降级为暂存**（`npm publish` 返回 `202`，索引里出现占位版本 `0.0.0-stage`，而 `npm stage list` 对这个 token 不可见），表现为"命令成功、包却 404"。**解开它的唯一办法是在场证明**：`npm publish … --otp=<6 位验证码>` 一次通过（本次即如此）。
+2. **`add <包名>` 会被同名旧依赖挡住**：profile 里原有 `@twinsearth/w2m-dsh-plugin: file:…tgz`，`pnpm add @twinsearth/w2m-dsh-plugin` 判定"Already up to date"而不改解析。带版本（`@0.4.7`）才会真正从注册表解析。README 现在同时给出两种写法。
+
+> ⚠️ 安全提示：本次发布用的 6 位 TOTP 是一次性的；账号所有者还曾在会话中贴出 **5 个恢复码**，那是账号级长期凭据，建议**立即在 npm 重新生成一组恢复码**使其作废。仓库与代码中没有任何 token 落盘（`.npmrc` 在 `%USERPROFILE%\.dsh\w2m\`，仅本机、且已改用 `${NPM_TOKEN}` 环境变量插值）。
+
+---
+
+## 11. dsh-plugin.org 收录与"已验证"（v0.4.7）
+
+该站是社区站（与 DeepSeek 官方无关联）：**扫 `dsh-plugin` topic 自动收录**，人工核验后把 `unconfirmed` 改成 `verified`；提交方式就是**在 `dshplugin/dsh-plugin-hub` 开一个固定模板的 issue**。
+
+| 事项 | 结果 |
+|---|---|
+| 收录 | topic 已在（另加 `dsh`/`cordis-plugin`/`p2p`），自动扫描无需申请 |
+| 核验提交 | **[dshplugin/dsh-plugin-hub#141](https://github.com/dshplugin/dsh-plugin-hub/issues/141)**（按官方模板：仓库 / 一句话价值 / 分类 / 安装命令 / 兼容性 / 许可 / 真实输出 / 权限与限制 / 自测清单） |
+| 状态 | `open`，等待人工核验 |
+
+### 提交前发现的、**真会影响收录**的缺陷（v0.4.7 修）
+
+该站的四条硬要求之一是"插件必须导出 `apply(ctx)`"，其 FAQ 把"不导出 apply(ctx)"列为**四大被拒原因**之一。而我们包的根入口 `lib/index.js` 是**故意空的**（`export {}`，一行注释说明 profile 通过 `cordis.patch.yml` 挂 `/tools` 子路径）。实测：
+
+```
+import('@twinsearth/w2m-dsh-plugin')  ->  Object.keys() === []   typeof apply === 'undefined'
+```
+
+**挂载完全正常、但对任何检查包的人来说这个包是空的。** 现在根入口 `re-export` `apply`/`inject`（实现仍只有一份，在 `tools.js`），并加测试锁住；实测打包产物根入口 `exports: apply,inject,resetDefineToolCacheForTests`。挂载行为未变 —— patch 仍指名子路径，这正是不让八个工具被注册两次的原因。
+
+核验 issue 里还附了**可核对的事实**而非形容词：两机 `consistent` 的真实输出、`transport: p2p` 与回落时的 `P2P_NO_CANDIDATES` 理由、CI 三平台矩阵、`disclosure` 字段、以及那条容易被误解的边界（**它不会向对端机器的模型会话注入提示词**）。
