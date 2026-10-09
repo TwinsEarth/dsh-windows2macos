@@ -1,12 +1,44 @@
 # W2M 发布状态
 
-> 项目：**DSH: Windows2MacOS** · 当前版本 **0.4.0**（P2P 直连默认 + 共享服务器）
-> 上一版本 **0.3.9**（P2P 传输层，未接入任务路径）、**0.2.3**（每日自更新）、**0.1.2**（跨区域 / 跨网络）、**0.0.1**（同一局域网）。
+> 项目：**DSH: Windows2MacOS** · 当前版本 **0.4.1**（允许清单预检 + 可固定打洞端口）
+> 上一版本 **0.4.0**（P2P 直连默认 + 共享服务器）、**0.3.9**、**0.2.3**、**0.1.2**、**0.0.1**。
 > 本文记录已完成的发布动作与仍需跟进的事项。
 
 ---
 
-## 0. 当前版本 v0.4.0（P2P 成为默认路径）✅
+## 0. 当前版本 v0.4.1（用起来才发现的两个缺陷）✅
+
+| 事项 | 结果 |
+|---|---|
+| 版本 | `0.4.1` |
+| Release | https://github.com/TwinsEarth/dsh-windows2macos/releases/tag/v0.4.1 |
+| 资产 | `twinsearth-w2m-dsh-plugin-0.4.1.tgz`（398,344 B）+ `SHA256SUMS`，`release.yml` 构建发布（本地 `pack.mjs` 复现同一字节数） |
+| CI / Release | Release **#18 成功**、CI **#34 成功**（三平台矩阵） |
+| 修掉 | ① 插件派发前预检只比 `argv[0]`，多词条目永远匹配不上（文档推荐的 `["node --test"]` 配置会让每次派发都被拒）；② 打洞端口无法固定，防火墙规则每次重启都要重指 |
+| 新增 | `src/agent/allowed-commands.mjs`（agent 与插件共用一套匹配规则）、`--p2p-port` / `W2M_P2P_PORT`、`normalizeP2PPort`、+10 用例 |
+| 协议 | **不变**：protocol version 仍为 1，v0.4.0 对端双向兼容 |
+
+### 两个缺陷都是「用起来」才暴露的，不是读代码读出来的
+
+- **预检与执行门对同一个配置理解不同。** 插件比较 `argv[0]` 的 basename 与整条条目字符串，于是 `git rev-parse` 这种条目永远匹配不上，报错还是 `COMMAND_NOT_ALLOWED: git is not in this plugin's allowedCommands (git rev-parse, …)` —— 提示里明明白白列着 `git rev-parse`。agent 一直是按 token 前缀匹配。现在两边共用 `allowed-commands.mjs`，且预检**不比原来更严**（`Node.exe` 这类带扩展名的条目仍然匹配）。
+- **端口每次重启都变。** 实测：中继重启后 agent 换了临时端口，ufw 规则还指着旧端口，于是每次派发都悄悄回落到中继（派发侧 `P2P_PUNCH_TIMEOUT`、账本里 `offer_path: "relay"`）。现在共享服务器已固定为 `--p2p-port 41234`，ufw 只剩一条端口规则。
+
+### 共享服务器与两台机器的当前状态（都已核验）
+
+| 位置 | 状态 |
+|---|---|
+| `202.182.123.154` | v0.4.1；`w2m-rabbit`（`:8787`）+ nginx `:80`、`w2m-stun`（`:3478/udp`）、`w2m-localside`（`jp-shared`，`--p2p-mode auto --p2p-port 41234`）三个单元 active；ufw：`8787/tcp`、`3478/udp`、`41234/udp` |
+| 本机 Windows | 插件 v0.4.0 已装入 `desktop` profile（`rabbit_source: config`，`operatorToken` 已配置）；agent 由**计划任务 `W2M Localside agent`** 在登录时自启并守护重启，日志 `%USERPROFILE%\.dsh\w2m\agent.log`，允许清单为 `node --version / node --test / node -e / git status --porcelain / git rev-parse / git log / git diff / npm test / npm run` |
+| 实测 | `w2m_run` 两机 `consistent`，两台均 `transport: p2p`；反方向（东京 → 本机，broadcast）`ok`，走中继 —— 本机在对称 NAT 之后，别人拨不进来，这是网络事实而非缺陷 |
+| Mac Mini | **尚未配对**（roster 里没有它）。当前配对码 `PAIR-6DWZPSGT` |
+
+### 计划任务为什么带守护循环
+
+第一版计划任务只起一次 agent：它跑完一个任务后约 40 秒整棵进程树消失，返回 `0xC000013A`（`STATUS_CONTROL_C_EXIT`，控制台被关闭），且**连一行日志都没有** —— 因为日志写在启动器里，启动器一起死了。现在启动器是监督循环：agent 退出就带一分钟退避重启，每次重启写一行日志。**要完全避免"会话控制台被关闭"这一类死法，正确做法是注册 Windows 服务（需要管理员）**；计划任务 + 守护循环是免提权下的可行近似，这一点写在这里而不是含糊过去。
+
+---
+
+## 1. 上一版本 v0.4.0（P2P 成为默认路径）✅
 
 | 事项 | 结果 |
 |---|---|
@@ -54,7 +86,7 @@ node --test --test-force-exit test/p2p-agent.test.mjs   # Windows：14 pass / 0 
 ```
 
 ---
-## 1. 上一版本 v0.2.3（每日自更新）✅
+## 2. 上一版本 v0.2.3（每日自更新）✅
 
 | 事项 | 结果 |
 |---|---|
@@ -79,7 +111,7 @@ node --test --test-force-exit test/p2p-agent.test.mjs   # Windows：14 pass / 0 
 
 ---
 
-## 2. 上一版本 v0.1.2（跨区域 / 跨网络）✅
+## 3. 上一版本 v0.1.2（跨区域 / 跨网络）✅
 
 | 事项 | 结果 | 凭据 |
 |---|---|---|
@@ -103,7 +135,7 @@ node --test --test-force-exit test/p2p-agent.test.mjs   # Windows：14 pass / 0 
 
 ---
 
-## 3. 上一版本 v0.0.1（局域网）✅
+## 4. 上一版本 v0.0.1（局域网）✅
 
 | 事项 | 结果 |
 |---|---|
@@ -122,7 +154,7 @@ node --test --test-force-exit test/p2p-agent.test.mjs   # Windows：14 pass / 0 
 
 ---
 
-## 4. 待跟进 ⏳
+## 5. 待跟进 ⏳
 
 1. **PR #6783 仍 OPEN**：唯一硬性阻塞是 upstream 的「仓库创建满 1 天」（2026-10-08T13:19:15Z 后自动满足）。**不要 force-push、不要关掉重开**（first-time contributor 的 fork PR 需维护者批准 workflow，前一个 PR #6352 就卡在这里）。
 2. **三种部署形态的真实网络层未实测**：Tailscale/WireGuard、公网 VPS+TLS、Cloudflare Tunnel/ngrok 都只做了语义等价测试（127.0.0.1 + 注入头）。`docs/DEPLOY.md` §7 列了每项的验证命令与"未在本机验证"标注。
@@ -132,7 +164,7 @@ node --test --test-force-exit test/p2p-agent.test.mjs   # Windows：14 pass / 0 
 
 ---
 
-## 5. 复跑验证（任何人可复现）
+## 6. 复跑验证（任何人可复现）
 
 ```powershell
 cd E:\DS\w2m
