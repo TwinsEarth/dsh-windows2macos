@@ -270,6 +270,19 @@ describe('registration shape', () => {
     );
   });
 
+  it('exposes apply(ctx) from the PACKAGE ROOT, not only from the /tools subpath', async () => {
+    // Measured before this test existed: `import('@twinsearth/w2m-dsh-plugin')` yielded
+    // `Object.keys() === []` and `typeof apply === 'undefined'`. The plugin mounted fine through the
+    // patch (which names the subpath), but every ecosystem checklist -- including dsh-plugin.org's
+    // listing requirements, which name a missing `apply(ctx)` export as a common rejection reason --
+    // inspects the package root. A plugin that looks empty to an inspector is a listing risk for no
+    // benefit, so the root re-exports and this asserts it stays that way.
+    const root = await import('../lib/index.js');
+    assert.equal(typeof root.apply, 'function', 'the package root must export apply(ctx)');
+    assert.deepEqual(root.inject, ['tools'], 'the root must carry the same inject as the subpath');
+    assert.ok(Object.keys(root).length >= 2, 'the root entry must not be an empty module');
+  });
+
   it('gives every tool a non-empty description and a callable execute', async () => {
     const { tools } = await register({ rabbitUrl: RABBIT });
     for (const [name, tool] of tools) {

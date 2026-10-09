@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.7] — 2026-10-09
+
+### Fixed
+
+* **The package root exported nothing, and the ecosystem checks the root.** `lib/index.js` was
+  deliberately documentation-only — the profile mounts `@twinsearth/w2m-dsh-plugin/tools` because
+  `cordis.patch.yml` names that subpath — so `import('@twinsearth/w2m-dsh-plugin')` returned
+  `Object.keys() === []` and `typeof apply === 'undefined'`. A plugin that mounts perfectly and
+  looks like an empty package to every tool that inspects it is a listing risk with no upside: the
+  DSH plugin listing requirements ask for a package that "exports an `apply(ctx)` module", and a
+  missing root export is one of the most common reasons a submission is refused. The root now
+  re-exports `apply`, `inject` and the test helper from `./tools.js` — one implementation, two
+  entry points — and `test/tools.test.mjs` asserts it, so it cannot silently regress.
+
+### Notes
+
+* Nothing about the mounted plugin changed: the patch still names the subpath rather than relying on
+  the "root is the plugin" convention, which is what keeps the eight tools from being registered
+  twice.
+* `tools.test.mjs`: 83 pass, 0 fail.
+
 ## [0.4.6] — 2026-10-09
 
 ### Added
