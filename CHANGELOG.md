@@ -4,6 +4,41 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.3] — 2026-10-09
+
+Documentation and metadata only — no source change, and the protocol is untouched. The
+reason for a release at all is the same reason the marketplace needs one: the ecosystem's
+listing standard treats a version bump as the signal that something changed, so metadata
+that changes without a bump is metadata nobody re-reads.
+
+### Changed
+
+* **The install section now names targets that exist.** It led with
+  `dsh plugin ... add @twinsearth/w2m-dsh-plugin@0.4.0`, an **npm name that is not
+  published** — a copy-paste that fails with a registry 404. It now leads with the release
+  tarball (the form verified in this repository), documents the repository form a
+  marketplace's one-click installer uses (`install TwinsEarth/dsh-windows2macos`), and
+  says plainly that the npm-name form starts working the day the package is published.
+  Both language sections carry the current version instead of a two-releases-stale one.
+* **`package.json` declares what the plugin is and what it touches.** `dsh` gains
+  `plugin: true` and `kind: "server"`, and a `disclosure` object states: cloud required,
+  the default endpoints, no offline mode, where the two credentials live, which
+  filesystem and network reaches are used, and that the reference deployment moves data
+  between CN and JP. The README carries the same table for a human, because a disclosure
+  a reader cannot find is not a disclosure.
+* **`stateDir` in the documented config is an absolute path.** The example used
+  `!!js (process.env.DSH_HOME + '/xclient')`, which on this build evaluated to
+  `…/desktop/undefined/xclient` — a path that does not exist, silently, so the plugin had
+  no device identity and the direct path stayed down. Measured, not theorised.
+
+### Notes
+
+* The repository already carried the `dsh-plugin` topic, which is the listing entry
+  point for the topic-driven marketplaces; they scan it on their own schedule. Nothing in
+  this release is an application to any of them.
+* Still not on npm. Publishing needs the scope owner's token, which is a decision for a
+  human rather than something a release can assume.
+
 ## [0.4.2] — 2026-10-09
 
 ### Fixed

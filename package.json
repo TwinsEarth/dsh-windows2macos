@@ -1,6 +1,6 @@
 {
   "name": "@twinsearth/w2m-dsh-plugin",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "DSH: Windows2MacOS \u2014 drive the same project on online Windows and macOS machines from one DeepSeek account, across networks and regions. P2P hole punching is the default path (relay + shared server as rendezvous, ledger and fallback), with a bundled STUN responder, Tailscale/public-VPS/tunnel shapes, Rabbit relay + per-machine Localside + eight DSH tools (replicate / split), nine aggregate verdicts and signed requests.",
   "type": "module",
   "main": "lib/index.js",
@@ -34,9 +34,44 @@
     "PROTOCOL-v0.4.0.md"
   ],
   "dsh": {
+    "plugin": true,
+    "kind": "server",
     "bundle": {
       "patch": "cordis.patch.yml"
     }
+  },
+  "disclosure": {
+    "cloud": true,
+    "network": [
+      "http://202.182.123.154:8787",
+      "202.182.123.154:3478",
+      "stun.cloudflare.com:3478",
+      "stun.l.google.com:19302",
+      "stun.nextcloud.com:443"
+    ],
+    "offlineMode": false,
+    "apiKeys": [
+      {
+        "env": "W2M_OPERATOR_TOKEN",
+        "storage": "profile-config"
+      },
+      {
+        "env": null,
+        "storage": "file-0600"
+      }
+    ],
+    "permissions": {
+      "network": "the configured relay (default: the shared server above), STUN servers, and UDP to the peer machines",
+      "filesystem": "read/write inside the project directory and DSH_HOME; the agent writes its spool and state under --state",
+      "env": [
+        "W2M_*"
+      ]
+    },
+    "jurisdiction": [
+      "CN",
+      "JP"
+    ],
+    "retention": "server"
   },
   "engines": {
     "node": ">=20.19.0"

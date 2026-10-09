@@ -187,9 +187,30 @@ runs unless it matches a prefix:
 
 ### 3. The DSH plugin
 
+**From the release tarball** — this is the form verified in this repository, and it needs
+no registry at all:
+
 ```bash
-dsh plugin --profile <profile-name> add @twinsearth/w2m-dsh-plugin@0.4.0
+dsh plugin --profile <profile-name> add \
+  https://github.com/TwinsEarth/dsh-windows2macos/releases/download/v0.4.3/twinsearth-w2m-dsh-plugin-0.4.3.tgz
 ```
+
+**From the repository** — the form a marketplace's one-click installer uses (it clones
+the repo, builds nothing, and registers `cordis.patch.yml`):
+
+```bash
+dsh plugin --profile <profile-name> install TwinsEarth/dsh-windows2macos
+```
+
+**Not from npm yet.** The package is named `@twinsearth/w2m-dsh-plugin` and
+`dsh plugin --profile <profile-name> add @twinsearth/w2m-dsh-plugin@0.4.3` will work the
+day it is published; today that form fails with a registry 404, which is why the two
+forms above carry the version instead of the name.
+
+> Whichever form you use, the installer must end up with the plugin in the profile's
+> `node_modules` **and** a row in the profile's `cordis.patch.yml`. A bundle that is
+> listed in `package.json` but never composed is the failure this project hit once
+> already — see `cordis.patch.yml`'s header for what that looked like.
 
 Then give it the relay URL in that profile's `cordis.patch.yml` — or leave
 `rabbitUrl` empty to use the shared server:
@@ -199,7 +220,7 @@ Then give it the relay URL in that profile's `cordis.patch.yml` — or leave
   config:
     rabbitUrl: ''            # empty => the shared server's default
     operatorToken: ''        # required to dispatch; the relay prints it once
-    stateDir: !!js (process.env.DSH_HOME + '/xclient')
+    stateDir: /absolute/path/to/$DSH_HOME/xclient   # `!!js process.env.DSH_HOME` can evaluate to undefined
     machineName: win-desktop
     p2pMode: auto
 ```
@@ -210,13 +231,19 @@ Restart DSH. You should see eight tools: `w2m_devices`, `w2m_run`, `w2m_wait`,
 > `dsh` may not be on your `PATH`. On a packaged install it lives under
 > `resources/runtime/cli/bin/`. If `dsh` is not found, call it by path.
 
-**No npm package yet?** Install straight from the release tarball — it needs no
-registry at all:
+### What this plugin touches, before you install it
 
-```bash
-dsh plugin --profile <profile-name> add \
-  https://github.com/TwinsEarth/dsh-windows2macos/releases/download/v0.4.0/twinsearth-w2m-dsh-plugin-0.4.0.tgz
-```
+Stated here and machine-readably in `package.json`'s `disclosure`, because installing a
+plugin runs its code with your permissions:
+
+| | |
+|---|---|
+| **Cloud** | yes — a relay is required. The default is the shared server (`202.182.123.154:8787`, STUN on `:3478`); point `rabbitUrl` at your own host, or run the relay yourself with `deploy/shared-server/install.sh` |
+| **Offline** | no. The relay is the ledger; peer-to-peer only moves the task offer, and the result still reaches the ledger |
+| **Credentials** | the operator token (profile config or `W2M_OPERATOR_TOKEN`) authorises *dispatched work*; the device token lives in `$DSH_HOME/xclient/device.json` (mode 0600 where the platform honours it) and authorises *taking* work |
+| **Filesystem** | reads and writes inside your project directory (anchors, fingerprints), plus its own spool and state under `--state` |
+| **Network** | the configured relay, the STUN servers, and UDP to the peer machines. Peers can reach this machine's punch port, which is ephemeral unless you pin it with `--p2p-port` |
+| **Jurisdiction** | data crosses between wherever your machines are and wherever the relay is; the reference deployment is CN ↔ JP |
 
 ## Use
 
@@ -604,7 +631,8 @@ node bin/w2m-localside.mjs --rabbit http://<中继地址>:8787 --pair PAIR-XXXXX
   --allowed-commands '["node --test","git status --porcelain"]'
 
 # 3) 装 DSH 插件
-dsh plugin --profile <profile-name> add @twinsearth/w2m-dsh-plugin@0.4.0
+dsh plugin --profile <profile-name> add \
+  https://github.com/TwinsEarth/dsh-windows2macos/releases/download/v0.4.3/twinsearth-w2m-dsh-plugin-0.4.3.tgz
 ```
 
 然后在 profile 的 `cordis.patch.yml` 里给插件 `rabbitUrl`（留空即用共享服务器）与 `operatorToken`，重启 DSH，即可直接用自然语言指挥：
