@@ -229,3 +229,41 @@ $node = 'C:\Users\fangw\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\node\
 - `@deepseek-ai/dsh-tools` 用 **peerDependencies**（可选），不是 dependencies —— 避免遮蔽宿主接口
 - 安装脚本在 `scripts/` 而**不在根目录**（根目录放 install 脚本会误导用户手动执行，是该市场的反模式 §6.1）
 - 零第三方运行时依赖；`lib/` 为产物型（main/exports 指向的文件都在仓库里）
+
+---
+
+## 9. Windows 服务版（v0.4.4 / v0.4.5）
+
+需求是"让本机 agent 不依赖这个会话"：会话一结束、控制台一关，agent 就没了。做法与实测结论：
+
+| 形态 | 开机启动 | 注销后仍在 | 需要提权 | 需要第三方二进制 |
+|---|---|---|---|---|
+| **服务型计划任务**（`install-service.ps1`，默认 S4U、会话 0） | ✅ | ✅ | ✅ | ❌ |
+| 真 SCM 服务（WinSW / NSSM，模板见 `deploy/windows/winsw/`） | ✅ | ✅ | ✅ | ✅ 服务宿主 |
+| 交互式计划任务（`-Interactive`，本机当前在用的就是这个） | ❌ 登录时 | ❌ | ❌ | ❌ |
+
+**本机实测的硬约束**：S4U 注册被拒（`Access is denied`，S4U 需要 `SeBatchLogonRight`，`-AtStartup` 触发器同样要提权）。所以本机目前跑的是 `-Interactive` 形态，服务型那条命令留给管理员执行（脚本会打印出来，不会半装）。
+
+### 服务化过程中实测到的三个缺陷（都是**跑起来**才发现的）
+
+1. **JSON 参数过不了服务管理器。** 经计划任务注册后，`--allowed-commands "[\"node --version\"]"` 存回来变成 `"[node --version]"`（转义没了），agent 读到 `[node` 直接 exit 2 `ALLOWED_COMMANDS_INVALID`。这是本项目第三次被同一类问题咬（前两次是 `cmd` 与 PowerShell 5.1），于是允许清单改为落在 `%USERPROFILE%\.dsh\w2m\agent.json`，命令行只传 `--config <路径>`。
+2. **`-AgentArgs '--p2p-mode','auto'` 经 `powershell -File` 变成一个 token** `--p2p-mode,auto`（`ERR_PARSE_ARGS_UNKNOWN_OPTION`）。现在是一个字符串、按逗号与空白切分。
+3. **PowerShell 5.1 的 `Set-Content -Encoding utf8` 会写 BOM**，`JSON.parse` 拒绝，监督器在**打开日志之前**就 exit 78 —— 失败得毫无痕迹。现在安装脚本写无 BOM，监督器也容忍 BOM（配置文件是给人改的，记事本同样写 BOM）。
+
+另有一个静默缺陷：监督器最初在配置文件里只认 kebab-case 键（`allowed-commands`），而 JSON 自然写成驼峰（`allowedCommands`），于是"配置完全正确却悄悄退回四条的默认清单"。现在两种键名都认。
+
+### 为什么是"监督器"而不是直接起 agent
+
+实测两次：直接起的 agent 会在跑完一个任务约 40 秒后整棵进程树消失，返回 `0xC000013A`（`STATUS_CONTROL_C_EXIT`，控制台被关闭），**且一行日志都没有** —— 因为日志写在启动器里，启动器一起死了。现在监督器持有子进程：退出就带退避重启，每次运行写一行，于是"悄悄消失"变成"run 3 exited code=3221225786 after 41s -- restarting"。
+
+### v0.4.5 为什么存在
+
+v0.4.4 发布后 CI #41 在 **ESLint** 步骤失败：`deploy/windows/` 不在"入口点允许 console"的规则块里（而监督器的唯一输出通道就是 console 与它 tee 的日志文件），并且带了一个草稿期的未使用 import。发布本身没问题，**仓库有问题**。没有重打 tag 而是发了 0.4.5：`deploy/` 在已发布包内，把 v0.4.4 指向另一份字节会让 tag 与 tarball 不一致 —— 正是本项目此前抱怨过的漂移。
+
+教训与 v0.4.2 那次相同，值得重复：**被过滤过的 lint 输出不等于 lint 输出。** 本地那次管道接的是 `Select-Object -Last 1`，打印了一个空行，五个 error 就这么过去了。
+
+### 核验（装完脚本之后实测）
+
+- 任务 `Running`；agent 日志打印**完整九条**允许清单；`stream ready` 到达
+- 真实舰队派发：两机 `consistent`（本机那次走中继，理由字段 `P2P_NO_CANDIDATES` 写明是回落而非失败）
+- Release v0.4.4（#22）/ v0.4.5（#23）与 CI #42 全绿；v0.4.5 资产 `twinsearth-w2m-dsh-plugin-0.4.5.tgz` 411,888 B + `SHA256SUMS`
