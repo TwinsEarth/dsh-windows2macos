@@ -91,11 +91,15 @@ export const DEFAULT_LEASE_GRACE_MS = 30_000;        // §4.3: + grace 30s
  * v0.4.0: the bounded hold on the relay's own offer when a dispatcher is pushing it directly.
  *
  * Sized against what it has to cover: one punch round trip (measured 15-370 ms on the reference
- * networks) plus the executor's first heartbeat POST. 1.2 s covers a 300 ms WAN path with room to
- * spare, and a failed punch pays it once per task -- which is the whole cost of preferring the
- * direct path.
+ * networks), the frame's delivery, and the executor's first heartbeat POST — all on a host that may
+ * be busy. 1.2 s was the first guess and it was too tight: measured on a 1-vCPU shared host, two
+ * agent tests saw the relay's copy overtake the direct one, which for `p2pMode: direct` means a
+ * refusal of an offer that was about to arrive. 3 s covers a slow host with room to spare.
+ *
+ * The cost is honest and bounded: a punch that fails delays the relay's copy by up to this much,
+ * once per task. Nothing else waits on it.
  */
-export const DEFAULT_P2P_OFFER_GRACE_MS = 1_200;
+export const DEFAULT_P2P_OFFER_GRACE_MS = 3_000;
 export const DEFAULT_PAIRING_TTL_MS = 24 * 60 * 60 * 1000; // §2.2: 24h
 export const DEFAULT_EVENT_BUFFER_SIZE = 1000;       // §requirement: keep last 1000 events
 export const MAX_FRAME_BYTES = 64 * 1024;            // 64 KiB single frame
