@@ -4,6 +4,77 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.9] — 2026-10-09
+
+P2P hole punching, so the payload path no longer has to cross the relay.
+
+### Added
+
+* **`src/agent/stun.mjs`** — an RFC 5389 Binding client on `node:dgram`, no third-party
+  dependency. It discovers the reflexive address and classifies **mapping behaviour** by
+  comparing the mapped port across several servers: one port everywhere is
+  `endpoint-independent` and can be punched; a different port per destination is
+  `endpoint-dependent` (symmetric) and cannot.
+* **`src/agent/p2p.mjs`** — hole punching plus a reliable, fragmenting channel over the
+  punched path: selective per-fragment ACK, retransmission with doubling RTO, an 8 MiB
+  ceiling, and named failures (`P2P_PUNCH_TIMEOUT`, `P2P_NO_CANDIDATES`,
+  `P2P_FRAGMENT_UNACKED`, `P2P_MESSAGE_TOO_LARGE`).
+* **`src/relay/peers.mjs`** and two endpoints — `POST /v1/peer/announce` and
+  `GET /v1/peer/{machine_id}` — the candidate rendezvous. Announcements are ephemeral
+  and deliberately never persisted; `/healthz` reports `peers_announced`.
+* **`PROTOCOL-v0.3.9.md`** — the wire contract, the frame format, and the path-reporting
+  rule.
+* 56 tests across `test/p2p-stun.test.mjs`, `test/p2p-transport.test.mjs` and
+  `test/p2p-signaling.test.mjs`, wired into `npm test` and `npm run test:all`.
+
+### Changed
+
+* **`p2p.mode` defaults to `auto`**: try the direct path, fall back to the relay, and
+  **report which path was used**. See "Why `auto` and not `direct`" below.
+
+### Why `auto` and not `direct`
+
+Punching cannot succeed against a symmetric NAT, and that is not hypothetical: measured
+on the authoring machine, behind an iPhone hotspot, three STUN servers reported three
+different mapped ports for the same socket — `endpoint-dependent`, so no punch from that
+network can work. A default that hard-required the direct path would break every
+deployment on such a network the moment it upgraded.
+
+The fallback is never silent. Every offer and result carries `transport: "p2p" | "relay"`
+and, on the relay path, the reason it fell back. A fallback that is not reported is
+indistinguishable from a slow direct path, and the operator then debugs the wrong thing.
+
+### Two mistakes the tests caught, kept here because they are the interesting part
+
+1. **The STUN address family was read from the wrong byte offset.** RFC 5389 has a
+   reserved byte before `Family`; `value[0]` yields the reserved byte, so every address
+   decoded to `null` — which is indistinguishable from a server that sent no address at
+   all. A self-written fake STUN server agreed with the wrong offset perfectly. Only a
+   real server disagreed, which is why the suite has a live layer and a frozen captured
+   response.
+2. **Both peers generated their own random session id**, so each discarded the other's
+   `HELLO` and the punch timed out looking exactly like a NAT failure. `punch()` now
+   requires an agreed id (or an explicit `allowSessionAdoption`), and **throws** rather
+   than inventing one — a misleading timeout is the most expensive possible
+   misdiagnosis here.
+
+### Not yet wired
+
+The `p2p.mode` setting is defined and documented but nothing reads it yet; the Localside
+announcer and direct-path dispatch are not implemented. **The task path therefore behaves
+exactly as v0.3.8.** Stated here, in `PROTOCOL-v0.3.9.md` §8 and in the README, so that no
+deployment believes it is on a direct path when it is not.
+
+### Verified / not verified
+
+Verified on macOS 27.0 / arm64: STUN against Cloudflare, Google and Nextcloud; the
+mapping classifier against a real symmetric NAT; the punch, fragmentation, selective ACK,
+retransmission under injected loss, and every failure mode, over real UDP sockets.
+
+**Not verified, and impossible on one machine:** a punch across a real NAT. Two sockets on
+one host share a loopback path with no translator between them, so "the punch succeeded"
+says nothing about traversal. That still needs two hosts behind two different NATs.
+
 ### The v0.3.5 / v0.3.6 release gap
 
 Both versions are tagged, and **neither was ever published**. The flake fixed above failed inside the

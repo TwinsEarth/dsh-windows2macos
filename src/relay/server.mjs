@@ -23,6 +23,7 @@ import {
   rfc3339,
 } from './state.mjs';
 import { Persistence } from './persistence.mjs';
+import { PeerRegistry } from './peers.mjs';
 import { aggregateTask, buildReport } from './report.mjs';
 import { renderMetrics, METRICS_CONTENT_TYPE } from './metrics.mjs';
 // v0.3.0 §9: request signing. This import is the entire point of the module --
@@ -328,6 +329,9 @@ export class RelayServer {
     const injected = options.state && typeof options.state === 'object' ? options.state : null;
     this.state = injected ?? new RabbitState({ ...options, persistence: this.persistence });
     this.state.setPersistence(this.persistence);
+
+    // v0.3.9: P2P signalling. Ephemeral by design -- see src/relay/peers.mjs.
+    this.peers = options.peers ?? new PeerRegistry({ nowMs: () => this.state.nowMs() });
 
     this.relayId = this.state.relayId;
     this._startedAtMs = this.state.nowMs();
@@ -741,6 +745,45 @@ export class RelayServer {
     // v0.3.0: cross-machine RTT status. The plugin may run on a different machine
     // than the agent, so this has to come from the relay, not from a local file.
     const agentStatusMatch = /^\/v1\/agents\/([^/]+)\/status$/.exec(path);
+    // v0.3.9: P2P candidate rendezvous. `/announce` is checked before the read route
+    // so that a machine literally named "announce" cannot shadow it.
+    const peerReadMatch = /^\/v1\/peer\/([^/]+)$/.exec(path);
+
+    /* ---- v0.3.9 P2P signalling ---- */
+    if (method === 'POST' && path === '/v1/peer/announce') {
+      const body = takeJson();
+      try {
+        // `device.machine_id`, never `body.machine_id`: a paired machine may only
+        // announce addresses for itself, or it could aim a peer's punch at a third party.
+        const result = this.peers.announce(device.machine_id, body);
+        return sendJson(res, 200, {
+          protocol_version: PROTOCOL_VERSION,
+          rabbit_time: this.state.nowIso(),
+          ...result,
+        });
+      } catch (error) {
+        throw new ProtocolError('BAD_REQUEST', error.message, { code: error.code ?? 'BAD_ANNOUNCEMENT' });
+      }
+    }
+
+    if (method === 'GET' && peerReadMatch) {
+      const machineId = decodeURIComponent(peerReadMatch[1]);
+      const entry = this.peers.get(machineId);
+      if (!entry) {
+        // A named 404 rather than an empty list: "this machine has not announced" and
+        // "this machine announced nothing reachable" call for different responses, and
+        // an empty candidate list would send the caller into a punch that cannot work.
+        throw new ProtocolError('NOT_FOUND', `no live P2P announcement for ${machineId}`, {
+          machine_id: machineId,
+          hint: 'the peer must POST /v1/peer/announce first, and announcements expire',
+        });
+      }
+      return sendJson(res, 200, {
+        protocol_version: PROTOCOL_VERSION,
+        rabbit_time: this.state.nowIso(),
+        peer: entry,
+      });
+    }
 
     if (method === 'GET' && agentStatusMatch) {
       const machineId = decodeURIComponent(agentStatusMatch[1]);
@@ -790,6 +833,9 @@ export class RelayServer {
   healthBody(req) {
     return {
       ...this.state.stats(),
+      // v0.3.9: how many machines currently have a live P2P announcement. Ephemeral,
+      // so this drops to 0 by itself when nobody is refreshing.
+      ...this.peers.stats(),
       ok: true,
       protocol_version: PROTOCOL_VERSION,
       rabbit_time: this.state.nowIso(),
@@ -870,6 +916,7 @@ export class RelayServer {
   maintenance() {
     const expired = this.sweep();
     this.pairLimiter.prune();
+    this.peers.sweep();
     // Keep the nonce cache from growing without bound in a long-running process.
     this.nonceCache.prune(this.nonceRetentionMs, this.state.nowMs());
     return expired;

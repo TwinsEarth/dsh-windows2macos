@@ -340,6 +340,30 @@ Read this before exposing the relay to anything.
 
 This project's rule is that claims carry their evidence.
 
+### v0.3.9 P2P hole punching — partial, and labelled as such
+
+The P2P **transport** is implemented and tested: STUN discovery and mapping
+classification, hole punching, a reliable fragmenting channel over the punched path,
+and the two signalling endpoints (`POST /v1/peer/announce`,
+`GET /v1/peer/{machine_id}`). 56 tests cover them.
+
+The **task path is not switched over yet.** `p2p.mode` defaults to `auto` per the
+contract in [`PROTOCOL-v0.3.9.md`](PROTOCOL-v0.3.9.md) §1, but nothing reads the
+setting, the Localside announcer is not implemented, and `w2m_run` still dispatches
+through the relay. **So the data path behaves exactly as v0.3.8 today.** This is
+written down rather than left implicit, because a deployment that believed it was on
+a direct path when it was not is the worst outcome this feature can produce.
+
+Two things are worth knowing before relying on any of it:
+
+* **Punching cannot succeed against a symmetric NAT.** Measured here, behind an
+  iPhone hotspot: three STUN servers reported three different mapped ports for the
+  same socket. That is why the default is `auto` with a *reported* fallback rather
+  than `direct`.
+* **A real NAT traversal is still unverified.** Two sockets on one host share a
+  loopback path with no translator between them, so the passing punch tests say
+  nothing about crossing a NAT. That needs two hosts behind two different NATs.
+
 **The same suites run on three platforms in CI** — see the badge above, or
 [`.github/workflows/ci.yml`](.github/workflows/ci.yml). The matrix is
 `windows-latest` × node 20/22, `macos-latest` × node 22, `ubuntu-latest` ×

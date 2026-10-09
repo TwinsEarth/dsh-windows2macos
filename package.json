@@ -1,7 +1,7 @@
 {
   "name": "@twinsearth/w2m-dsh-plugin",
-  "version": "0.3.8",
-  "description": "DSH: Windows2MacOS — drive the same project on online Windows and macOS machines from one DeepSeek account, across networks and regions (Tailscale, public VPS with TLS, or a tunnel). Rabbit relay + per-machine Localside + eight DSH tools (replicate / split), with nine aggregate verdicts and signed requests.",
+  "version": "0.3.9",
+  "description": "DSH: Windows2MacOS \u2014 drive the same project on online Windows and macOS machines from one DeepSeek account, across networks and regions (P2P hole punching, Tailscale, public VPS with TLS, or a tunnel). Rabbit relay + per-machine Localside + eight DSH tools (replicate / split), with nine aggregate verdicts and signed requests.",
   "type": "module",
   "main": "lib/index.js",
   "bin": {
@@ -27,7 +27,8 @@
     "LICENSE",
     "PROTOCOL.md",
     "PROTOCOL-v0.1.2.md",
-    "PROTOCOL-v0.3.0.md"
+    "PROTOCOL-v0.3.0.md",
+    "PROTOCOL-v0.3.9.md"
   ],
   "dsh": {
     "bundle": {
@@ -53,19 +54,20 @@
     }
   },
   "scripts": {
-    "test": "node --test --test-force-exit test/relay.test.mjs test/broadcast.test.mjs test/agent.test.mjs test/tools.test.mjs test/schedule.test.mjs test/auto-update.test.mjs test/update-source.test.mjs test/update-install.test.mjs test/update-wiring.test.mjs test/signing.test.mjs test/stress.test.mjs test/shared-config.test.mjs test/metrics.test.mjs test/metrics-route.test.mjs test/tool-cards.test.mjs",
+    "test": "node --test --test-force-exit test/relay.test.mjs test/broadcast.test.mjs test/agent.test.mjs test/tools.test.mjs test/schedule.test.mjs test/auto-update.test.mjs test/update-source.test.mjs test/update-install.test.mjs test/update-wiring.test.mjs test/signing.test.mjs test/stress.test.mjs test/shared-config.test.mjs test/metrics.test.mjs test/metrics-route.test.mjs test/tool-cards.test.mjs test/p2p-stun.test.mjs test/p2p-transport.test.mjs test/p2p-signaling.test.mjs",
     "test:e2e": "node --test --test-force-exit test/e2e.test.mjs test/crossnetwork.test.mjs test/signing-e2e.test.mjs test/outbound-only.test.mjs test/recovery.test.mjs test/pipeline-e2e.test.mjs",
     "test:relay": "node --test test/relay.test.mjs",
     "test:agent": "node --test test/agent.test.mjs",
     "test:tools": "node --test test/tools.test.mjs",
     "test:crossnetwork": "node --test --test-force-exit test/crossnetwork.test.mjs",
-    "test:all": "node --test --test-force-exit test/relay.test.mjs test/broadcast.test.mjs test/agent.test.mjs test/tools.test.mjs test/schedule.test.mjs test/auto-update.test.mjs test/update-source.test.mjs test/update-install.test.mjs test/update-wiring.test.mjs test/signing.test.mjs test/stress.test.mjs test/e2e.test.mjs test/crossnetwork.test.mjs test/signing-e2e.test.mjs test/outbound-only.test.mjs test/recovery.test.mjs test/pipeline-e2e.test.mjs test/shared-config.test.mjs test/metrics.test.mjs test/metrics-route.test.mjs test/tool-cards.test.mjs",
+    "test:all": "node --test --test-force-exit test/relay.test.mjs test/broadcast.test.mjs test/agent.test.mjs test/tools.test.mjs test/schedule.test.mjs test/auto-update.test.mjs test/update-source.test.mjs test/update-install.test.mjs test/update-wiring.test.mjs test/signing.test.mjs test/stress.test.mjs test/e2e.test.mjs test/crossnetwork.test.mjs test/signing-e2e.test.mjs test/outbound-only.test.mjs test/recovery.test.mjs test/pipeline-e2e.test.mjs test/shared-config.test.mjs test/metrics.test.mjs test/metrics-route.test.mjs test/tool-cards.test.mjs test/p2p-stun.test.mjs test/p2p-transport.test.mjs test/p2p-signaling.test.mjs",
     "pack": "node scripts/pack.mjs",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "verify": "node scripts/check-entrypoints.mjs && node --test --test-force-exit test/relay.test.mjs test/broadcast.test.mjs test/agent.test.mjs test/tools.test.mjs test/e2e.test.mjs test/crossnetwork.test.mjs"
+    "verify": "node scripts/check-entrypoints.mjs && node --test --test-force-exit test/relay.test.mjs test/broadcast.test.mjs test/agent.test.mjs test/tools.test.mjs test/e2e.test.mjs test/crossnetwork.test.mjs",
+    "test:p2p": "node --test --test-force-exit test/p2p-stun.test.mjs test/p2p-transport.test.mjs test/p2p-signaling.test.mjs"
   },
   "keywords": [
     "dsh-bundle",
