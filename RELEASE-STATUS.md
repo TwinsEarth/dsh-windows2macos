@@ -203,3 +203,29 @@ $node = 'C:\Users\fangw\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\node\
 **两个易踩的坑**：
 - `npm test` 曾因 `node --test test/` 在 Node 24 上被当成模块路径，**一个测试都没跑却报失败**；已改为显式文件列表 + `--test-force-exit`。
 - 端到端套件必须带 `--test-force-exit`：每个模拟机器都持有 SSE 长连，否则断言跑完事件循环也不退出。
+
+---
+
+## 8. 插件市场收录（v0.4.3，2026-10-09）
+
+生态里的"DSH 插件市场"不是一个站，而是**若干互相独立**的入口；各自的收录方式不同，所以这里逐条写清做了什么、还差什么。
+
+| 入口 | 收录方式 | 现状 |
+|---|---|---|
+| topic 型市场（如 `bradeGithub/DSH-Plugins-Marketplace`、`mengxingGG/dsh-plugin-marketplace`、dsh-plugin.org 等） | 扫 GitHub **`dsh-plugin` topic**，每约 2 小时增量收录，**无需申请** | ✅ topic 早已存在；本次又补了 `dsh`、`cordis-plugin`、`p2p`，便于分类与搜索 |
+| 策展清单 `awesome-dsh-plugin`（`dsh-market` 等聚合它的数据） | 提 **PR 加一个文件** `data/plugins/<owner>__<repo>.yml`（README 由脚本生成，禁止手改） | ✅ **PR #6989** 已提交：单文件、含 `tarball`（按投稿指南**钉 tag**，不用 `latest/download/`）、可合并 |
+| dsh-plugin.org 的"已验证"徽章 | 第三方中立验证（`dsh-plugin-verify`） | ⏳ 未做——它需要人工在站点提交并接受复现核验 |
+| npm 包（`@twinsearth/w2m-dsh-plugin`） | `npm publish` | ❌ 未发布：需要 scope 所有者的 token。**这不影响收录**（清单两边都写明"发不发布都收"），只是 README 里 `dsh plugin add <包名>` 那种写法今天会 404 |
+
+### 为收录对照规范补齐的三件事
+
+1. **README 的安装 target 必须真实存在。** 原先首条命令是 `dsh plugin ... add @twinsearth/w2m-dsh-plugin@0.4.0` —— 一个**从未发布到 npm** 的包名，复制即 404。现在首条是可下载的 release tarball（本仓库实测过），并列出市场一键安装用的仓库形态，同时明说 npm 形式"发布当天才可用"。
+2. **`package.json` 补上能力声明与披露。** `dsh` 增加 `plugin: true` / `kind: "server"`；新增 `disclosure`：需要云端中继（含默认端点）、无离线模式、两个凭据各自的存放位置、文件系统与网络触达范围、参考部署跨越 CN↔JP。README 里同样有一张给人看的表——"读者找不到的披露不算披露"。
+3. **`stateDir` 示例改成绝对路径。** 原来的 `!!js (process.env.DSH_HOME + '/xclient')` 在本构建上求值成 `…/desktop/undefined/xclient`（实测），路径不存在却不报错，于是插件拿不到设备身份、直连一直是关的。
+
+### 顺带确认过的规范项（本来就没问题）
+
+- 根 `package.json` 声明 `dsh.bundle.patch` 且根目录有 `cordis.patch.yml`（清单 CI 的第一道硬门槛）
+- `@deepseek-ai/dsh-tools` 用 **peerDependencies**（可选），不是 dependencies —— 避免遮蔽宿主接口
+- 安装脚本在 `scripts/` 而**不在根目录**（根目录放 install 脚本会误导用户手动执行，是该市场的反模式 §6.1）
+- 零第三方运行时依赖；`lib/` 为产物型（main/exports 指向的文件都在仓库里）
