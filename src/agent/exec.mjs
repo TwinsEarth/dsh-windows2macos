@@ -17,6 +17,7 @@
 
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { resolveCommand } from './resolve.mjs';
 
 /** Per-stream default retention cap (task-8: 2 MiB each). */
 export const DEFAULT_MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
@@ -133,6 +134,11 @@ function createCollector(maxOutputBytes) {
  * @param {AbortSignal} [options.signal] Cancellation (task.cancel / shutdown).
  * @param {string} [options.killSignal]
  * @param {number} [options.killGraceMs] Delay before escalating to SIGKILL.
+ * @param {boolean} [options.resolveExecutable] Look `argv[0]` up the way the
+ *        capability probe does — PATH first, DSH's bundled runtime second —
+ *        instead of handing the bare name to `spawn`. Defaults to true, so a
+ *        capability the probe advertised is one a task can actually use. Set
+ *        false to spawn `argv[0]` verbatim.
  * @returns {Promise<ExecResult>}
  */
 export function runArgv(argv, options = {}) {
@@ -156,6 +162,7 @@ export function runArgv(argv, options = {}) {
     signal,
     killSignal = 'SIGTERM',
     killGraceMs = 2000,
+    resolveExecutable = true,
   } = options;
 
   return new Promise((resolve) => {
@@ -241,9 +248,15 @@ export function runArgv(argv, options = {}) {
     };
 
     try {
-      child = spawn(argv[0], argv.slice(1), {
+      // The probe resolves a tool by PATH first, then in DSH's bundled runtime, so a machine with no
+      // system `node` still reports a real `caps.node`. Execution has to use the same order, or the
+      // capability is one the machine advertises and cannot use: `spawn('node', …, {shell:false})`
+      // only ever searches PATH.
+      const childEnv = extraEnv ? { ...process.env, ...extraEnv } : process.env;
+      const executable = resolveExecutable ? resolveCommand(argv[0], { env: childEnv }) : argv[0];
+      child = spawn(executable, argv.slice(1), {
         cwd,
-        env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
+        env: childEnv,
         shell: false, // non-negotiable
         windowsHide: true,
         stdio: ['ignore', 'pipe', 'pipe'],

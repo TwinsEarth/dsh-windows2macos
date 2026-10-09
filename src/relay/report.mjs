@@ -66,6 +66,45 @@ function truncate(text, max = 160) {
 }
 
 /**
+ * Warning codes that explain *why* a machine failed, in a sentence a reader can act on.
+ *
+ * The envelope already carried these codes; nothing downstream read them. A spawn failure was
+ * therefore rendered as `status: crashed`, `exit_code: null`, and an empty 说明 column -- the three
+ * facts that together say nothing. Measured on macOS: a task whose `argv[0]` was not on PATH came
+ * back exactly that way, with `warnings: ["PATH_INVALID"]` sitting unread in the envelope.
+ *
+ * Only codes whose meaning is unambiguous belong here. Inventing prose for a code we do not
+ * understand would be worse than the empty cell, so anything unlisted stays unreported.
+ */
+const FAILURE_WARNING_REASONS = {
+  PATH_INVALID: 'the command could not be started: an executable in the argv was not found (PATH_INVALID)',
+};
+
+/**
+ * Fill in a failed machine's `reasons` from its execution warnings.
+ *
+ * `reasons` is what the human report renders in the 说明 column, and it was only ever populated by
+ * anchor/comparison problems -- so a machine that never started had nothing to say for itself.
+ *
+ * @param {object} m Machine record being aggregated.
+ * @param {string} status The envelope's execution status.
+ */
+function explainExecutionFailure(m, status) {
+  if (m.reasons.length > 0) return;
+  // `nonzero_exit` is self-explanatory: the command ran and `exit_code` reports what it returned.
+  // Only a machine that produced no exit status at all needs the warning spelled out.
+  if (status !== 'crashed' && status !== 'timeout') return;
+  const warnings = Array.isArray(m.envelope?.warnings) ? m.envelope.warnings : [];
+  for (const warning of warnings) {
+    const reason = FAILURE_WARNING_REASONS[warning];
+    if (reason) {
+      m.reasons.push(reason);
+      return;
+    }
+  }
+}
+
+/**
  * §6.3 six-state aggregation.
  *
  * @param {object} task            Rabbit task record (state.mjs `createTask` result)
@@ -256,6 +295,7 @@ export function aggregate(task, resultRecords = [], opts = {}) {
       else {
         // {nonzero_exit,timeout,crashed} plus anything outside the §5.1 enum
         m.outcome = 'failed';
+        explainExecutionFailure(m, s);
         step2.failed.push({
           machine_id: m.machine_id,
           status: s,

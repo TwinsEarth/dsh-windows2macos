@@ -20,88 +20,27 @@
  * leaks into an envelope.
  */
 
-import { accessSync, chmodSync, constants, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
-import { homedir, tmpdir, release as osRelease } from 'node:os';
-import { basename, delimiter, extname, join } from 'node:path';
+import { chmodSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir, release as osRelease } from 'node:os';
+import { basename, extname, join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { runArgv } from './exec.mjs';
+import { dshDependenciesDir, findExecutable } from './resolve.mjs';
 
-/** The DSH runtime directory layout we fall back to (task-8, measured). */
-export const DSH_RUNTIME_RELATIVE = join('dsh-runtimes', 'dsh-primary-runtime', 'dependencies');
+// The executable search order is shared with the executor, so the probe and the
+// run agree on what "this machine has node" means. Re-exported from here because
+// this module is where callers have always imported them from.
+export {
+  DSH_RUNTIME_RELATIVE,
+  bundledBinDirs,
+  dshDependenciesDir,
+  dshHome,
+  findExecutable,
+  resolveCommand,
+} from './resolve.mjs';
 
 /** Keys of the contract's `caps` object — nothing else may be added. */
 export const CAPS_KEYS = ['case_sensitive_fs', 'symlinks', 'exec_bit', 'python', 'npm', 'node'];
-
-/**
- * `%DSH_HOME%` (or `~/.dsh`) — the root the bundled runtimes live under.
- *
- * @param {Record<string,string|undefined>} [env]
- * @returns {string}
- */
-export function dshHome(env = process.env) {
-  const explicit = env.DSH_HOME && env.DSH_HOME.trim() !== '' ? env.DSH_HOME : null;
-  return explicit ?? join(homedir(), '.dsh');
-}
-
-/**
- * Absolute path of the bundled DSH dependency directory, or `null` when absent.
- *
- * `DSH_RUNTIME_DEPS` overrides the guess, which keeps tests hermetic.
- *
- * @param {Record<string,string|undefined>} [env]
- * @returns {string|null}
- */
-export function dshDependenciesDir(env = process.env) {
-  const override = env.DSH_RUNTIME_DEPS && env.DSH_RUNTIME_DEPS.trim() !== '';
-  const dir = override ? env.DSH_RUNTIME_DEPS : join(dshHome(env), DSH_RUNTIME_RELATIVE);
-  try {
-    return statSync(dir).isDirectory() ? dir : null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Windows only: the extensions `CreateProcess` will accept for a bare name.
- * (`.cmd`/`.bat` are listed so we can *report* them, but they cannot be
- * started with `shell: false`, so they are never returned as executable.)
- */
-const WIN_EXTENSIONS = ['.exe', '.com'];
-
-/**
- * Find a real executable on PATH (then, optionally, in the DSH runtime tree).
- *
- * @param {string} name Bare command name, e.g. `node`, `python3`.
- * @param {object} [options]
- * @param {Record<string,string|undefined>} [options.env]
- * @param {string[]} [options.extraDirs] Absolute directories to try after PATH.
- * @param {string[]} [options.extensions] Override the candidate extensions.
- * @returns {string|null} Absolute path.
- */
-export function findExecutable(name, options = {}) {
-  const env = options.env ?? process.env;
-  const isWin = process.platform === 'win32';
-  const extensions = options.extensions ?? (isWin ? ['', ...WIN_EXTENSIONS] : ['']);
-  const dirs = [
-    ...String(env.PATH ?? '')
-      .split(delimiter)
-      .filter((d) => d.trim() !== ''),
-    ...(options.extraDirs ?? []),
-  ];
-
-  for (const dir of dirs) {
-    for (const ext of extensions) {
-      const candidate = join(dir, name + ext);
-      try {
-        accessSync(candidate, isWin ? constants.F_OK : constants.F_OK | constants.X_OK);
-        if (statSync(candidate).isFile()) return candidate;
-      } catch {
-        /* keep looking */
-      }
-    }
-  }
-  return null;
-}
 
 /**
  * Run `<exe> <args>` and return the first regex capture of stdout+stderr.

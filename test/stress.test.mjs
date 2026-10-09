@@ -67,7 +67,26 @@ const CAPS = {
   python: null, npm: null, node: 'v24.21.0', write: true,
 };
 
-function request(url, { method = 'GET', token, body, headers = {} } = {}) {
+/**
+ * A connect that the kernel refused is not an answer from the relay.
+ *
+ * macOS clamps the listen backlog to `kern.ipc.somaxconn`, which is **128** on a stock system, and
+ * ignores a larger `backlog` argument. A burst of 200 simultaneous loopback connects therefore
+ * overflows the accept queue and the kernel answers the excess with RST — before the relay's
+ * handler ever runs. Measured on macOS 27.0 / arm64 (2026-10-09): a bare 24-line `http.createServer`
+ * with no W2M code reproduces it exactly (N=128 → 0 errors, N=200 → ~70 ECONNRESET, `backlog: 4096`
+ * changes nothing).
+ *
+ * Retrying those connects keeps this suite measuring what it is about — the relay's ledger under
+ * volume — instead of accidentally asserting the host's `somaxconn`. Every assertion on the relay's
+ * own state is untouched: all 200 dispatches must still be accepted, unique and retrievable.
+ *
+ * Only `ECONNRESET` at connect is retried, and only a bounded number of times: a relay that is
+ * genuinely refusing connections must still fail this suite.
+ */
+const CONNECT_RETRIES = 8;
+
+function request(url, { method = 'GET', token, body, headers = {}, attempt = 0 } = {}) {
   return new Promise((resolve, reject) => {
     const u = new URL(url);
     const payload = body === undefined ? null : Buffer.from(JSON.stringify(body), 'utf8');
@@ -92,7 +111,16 @@ function request(url, { method = 'GET', token, body, headers = {} } = {}) {
       });
       res.on('error', reject);
     });
-    req.on('error', reject);
+    req.on('error', (error) => {
+      if (error?.code === 'ECONNRESET' && attempt < CONNECT_RETRIES) {
+        // Stagger the retry so the accept queue can drain rather than being hit again immediately.
+        setTimeout(() => {
+          request(url, { method, token, body, headers, attempt: attempt + 1 }).then(resolve, reject);
+        }, 5 * (attempt + 1)).unref?.();
+        return;
+      }
+      reject(error);
+    });
     if (payload) req.end(payload);
     else req.end();
   });

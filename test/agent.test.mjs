@@ -23,6 +23,7 @@ import {
   statSync,
   writeFileSync,
   existsSync,
+  chmodSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -45,6 +46,7 @@ import {
   probeCapsDetailed,
   probeFilesystemCaps,
   findExecutable,
+  resolveCommand,
 } from '../src/agent/caps.mjs';
 import {
   FINGERPRINT_ALGO,
@@ -965,6 +967,76 @@ describe('capability probing', () => {
     assert.equal('detail' in caps, false);
     assert.equal('dsh_dependencies_dir' in caps, false);
     assert.ok(detail.dsh_dependencies_dir === null || typeof detail.dsh_dependencies_dir === 'string');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Executable resolution: the probe and the executor must agree
+// ---------------------------------------------------------------------------
+
+/**
+ * Measured on macOS 27.0 / arm64, 2026-10-09.
+ *
+ * `caps.node` reported `v24.21.0` with source `bundled` -- real and correct, because DSH ships node
+ * under `$DSH_HOME/dsh-runtimes/...`. The same machine could not run `node --test`: the executor
+ * handed the bare name to `spawn(..., {shell:false})`, which only searches PATH, so every such task
+ * came back `crashed` with `exit_code: null`. These cases reproduce that in miniature: a tool that
+ * exists only in the bundled tree, and a PATH that cannot see it.
+ */
+describe('executable resolution (probe and executor share one search order)', () => {
+  let root;
+  before(() => {
+    root = mkdtempSync(join(tmpdir(), 'w2m-resolve-'));
+    const binDir = join(root, 'node', 'bin');
+    mkdirSync(binDir, { recursive: true });
+    const fake = join(binDir, 'w2m-fake-tool');
+    writeFileSync(fake, '#!/bin/sh\necho resolved-ok\n');
+    chmodSync(fake, 0o755);
+  });
+  after(() => rmSync(root, { recursive: true, force: true }));
+
+  const env = () => ({ PATH: '', DSH_RUNTIME_DEPS: root });
+
+  it('finds a bundled tool that PATH does not have', () => {
+    assert.equal(findExecutable('w2m-fake-tool', { env: env() }), null);
+    assert.equal(
+      resolveCommand('w2m-fake-tool', { env: env() }),
+      join(root, 'node', 'bin', 'w2m-fake-tool'),
+    );
+  });
+
+  it('keeps PATH ahead of the bundled runtime', () => {
+    // `sh` is on PATH everywhere this suite runs; if the bundle won, this would change.
+    const resolved = resolveCommand('sh', { env: { ...env(), PATH: '/bin:/usr/bin' } });
+    assert.equal(resolved, '/bin/sh');
+  });
+
+  it('leaves an unfindable name alone so the honest ENOENT survives', () => {
+    assert.equal(resolveCommand('w2m-truly-missing', { env: env() }), 'w2m-truly-missing');
+  });
+
+  it('never rewrites an explicit path', () => {
+    assert.equal(resolveCommand('/bin/sh'), '/bin/sh');
+    assert.equal(resolveCommand('./relative-tool'), './relative-tool');
+  });
+
+  it('starts a bundled-only tool from runArgv even when PATH cannot see it', async () => {
+    const result = await runArgv(['w2m-fake-tool'], { env: env() });
+    assert.equal(result.spawn_error, null);
+    assert.equal(result.exit_code, 0);
+    assert.match(result.stdout.toString('utf8'), /resolved-ok/);
+  });
+
+  it('still reports a spawn failure, unchanged, for a command that exists nowhere', async () => {
+    const result = await runArgv(['w2m-truly-missing'], { env: env() });
+    assert.equal(result.spawn_error.code, 'ENOENT');
+    assert.equal(classifyExit(result), 'crashed');
+    assert.ok(result.warnings.includes(WARN_PATH_INVALID));
+  });
+
+  it('can be told to spawn argv[0] verbatim', async () => {
+    const result = await runArgv(['w2m-fake-tool'], { env: env(), resolveExecutable: false });
+    assert.equal(result.spawn_error.code, 'ENOENT');
   });
 });
 

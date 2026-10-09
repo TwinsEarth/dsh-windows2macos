@@ -1250,6 +1250,32 @@ describe('six-state aggregation (§6.3)', () => {
     assert.equal(agg.counts.ok, 0);
   });
 
+  it('a spawn failure explains itself instead of leaving the 说明 column blank', () => {
+    // Measured on macOS 27.0 / arm64 (2026-10-09): a task whose argv[0] was not on PATH came back
+    // `crashed` / `exit_code: null` / an empty explanation. The envelope had carried
+    // `warnings: ["PATH_INVALID"]` the whole way; nothing downstream ever read it, so the three facts
+    // a reader was given together said nothing at all.
+    const task = fakeTask({ machines: ['m1'] });
+    const env = makeEnvelope({
+      machine_id: 'm1',
+      status: 'crashed',
+      exit_code: null,
+      warnings: ['PATH_INVALID'],
+    });
+    const agg = aggregate(task, [rec('m1', env)]);
+    assert.equal(agg.status, 'failed');
+    assert.match(agg.machines[0].reasons.join(' '), /PATH_INVALID/);
+    assert.match(renderReportMarkdown(agg, task), /PATH_INVALID/);
+  });
+
+  it('does not invent an explanation for a plain nonzero exit', () => {
+    // The command ran and `exit_code` says what it returned; prose here would be noise.
+    const task = fakeTask({ machines: ['m1'] });
+    const env = makeEnvelope({ machine_id: 'm1', status: 'nonzero_exit', exit_code: 3 });
+    const agg = aggregate(task, [rec('m1', env)]);
+    assert.deepEqual(agg.machines[0].reasons, []);
+  });
+
   it('degraded: every machine reported, some ok and some failed', () => {
     // v0.3.0: this used to be `partial`. `partial` also means "machines are still out", so a
     // finished task in a bad state was indistinguishable from one still in flight -- in the one
