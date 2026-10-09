@@ -77,11 +77,20 @@ function makeProfile() {
   return dir;
 }
 
-/** Read the update status the way a model would: through the tool. */
+/**
+ * Read the update status the way a model would: through the tool, and from its text.
+ *
+ * The tool has to return a **string** — the host rejects anything else with
+ * `returned invalid output: "value" must be a string` — so this parses what it returns. The first
+ * version of this helper read fields off the returned value directly, which is how v0.4.2's fix
+ * (returning JSON text) broke four cases here: they had been written against the defect.
+ */
 async function updateStatus(tools) {
   const tool = tools.get('w2m_update');
   assert.ok(tool, 'w2m_update must be registered');
-  return tool.execute({ action: 'status' }, {});
+  const text = await tool.execute({ action: 'status' }, {});
+  assert.equal(typeof text, 'string', 'a tool must return a string; the host refuses anything else');
+  return JSON.parse(text);
 }
 
 describe('w2m_update tool', () => {

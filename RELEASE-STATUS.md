@@ -1,12 +1,27 @@
 # W2M 发布状态
 
-> 项目：**DSH: Windows2MacOS** · 当前版本 **0.4.1**（允许清单预检 + 可固定打洞端口）
-> 上一版本 **0.4.0**（P2P 直连默认 + 共享服务器）、**0.3.9**、**0.2.3**、**0.1.2**、**0.0.1**。
+> 项目：**DSH: Windows2MacOS** · 当前版本 **0.4.2**（`w2m_update` 返回类型）
+> 上一版本 **0.4.1**（允许清单预检 + 可固定打洞端口）、**0.4.0**（P2P 直连默认 + 共享服务器）、**0.3.9**、**0.2.3**、**0.1.2**、**0.0.1**。
 > 本文记录已完成的发布动作与仍需跟进的事项。
 
 ---
 
-## 0. 当前版本 v0.4.1（用起来才发现的两个缺陷）✅
+## 0. 当前版本 v0.4.2（第三个"用起来才发现"的缺陷）✅
+
+| 事项 | 结果 |
+|---|---|
+| 版本 | `0.4.2` |
+| Release | https://github.com/TwinsEarth/dsh-windows2macos/releases/tag/v0.4.2 |
+| 资产 | `twinsearth-w2m-dsh-plugin-0.4.2.tgz`（398,893 B）+ `SHA256SUMS` |
+| 修掉 | `w2m_update` 的 `execute` 返回对象而宿主要求**字符串**，于是**这个工具在 0.4.0/0.4.1 里从来没能被调用过**（宿主直接拒绝：`returned invalid output: "value" must be a string`）。`output: jsonOutput` 是渲染器不是序列化器，另外七个工具都是自己 `JSON.stringify` 的 |
+| 新增 | 一条覆盖全部八个工具的契约用例（两个 `w2m_update` 动作都调，网络查询打桩为失败以免真的安装）：**每个返回值都必须是能解析的 JSON 字符串** —— 让这一类错误无法再出现 |
+| 测试 | `tools.test.mjs` **82 通过 / 0 失败**（修复前该文件 79 通过） |
+
+三个缺陷（0.4.1 的预检与端口、0.4.2 的返回类型）都不是读代码读出来的，而是**真的把它用起来**才暴露的：调工具、看账本、重启后重新派发。这也是把它们逐个发出去、而不是攒成一个大版本的原因。
+
+---
+
+## 1. 上一版本 v0.4.1（用起来才发现的两个缺陷）✅
 
 | 事项 | 结果 |
 |---|---|
@@ -38,7 +53,7 @@
 
 ---
 
-## 1. 上一版本 v0.4.0（P2P 成为默认路径）✅
+## 2. 上一版本 v0.4.0（P2P 成为默认路径）✅
 
 | 事项 | 结果 |
 |---|---|
@@ -86,7 +101,7 @@ node --test --test-force-exit test/p2p-agent.test.mjs   # Windows：14 pass / 0 
 ```
 
 ---
-## 2. 上一版本 v0.2.3（每日自更新）✅
+## 3. 上一版本 v0.2.3（每日自更新）✅
 
 | 事项 | 结果 |
 |---|---|
@@ -111,7 +126,7 @@ node --test --test-force-exit test/p2p-agent.test.mjs   # Windows：14 pass / 0 
 
 ---
 
-## 3. 上一版本 v0.1.2（跨区域 / 跨网络）✅
+## 4. 上一版本 v0.1.2（跨区域 / 跨网络）✅
 
 | 事项 | 结果 | 凭据 |
 |---|---|---|
@@ -135,7 +150,7 @@ node --test --test-force-exit test/p2p-agent.test.mjs   # Windows：14 pass / 0 
 
 ---
 
-## 4. 上一版本 v0.0.1（局域网）✅
+## 5. 上一版本 v0.0.1（局域网）✅
 
 | 事项 | 结果 |
 |---|---|
@@ -154,7 +169,7 @@ node --test --test-force-exit test/p2p-agent.test.mjs   # Windows：14 pass / 0 
 
 ---
 
-## 5. 待跟进 ⏳
+## 6. 待跟进 ⏳
 
 1. **PR #6783 仍 OPEN**：唯一硬性阻塞是 upstream 的「仓库创建满 1 天」（2026-10-08T13:19:15Z 后自动满足）。**不要 force-push、不要关掉重开**（first-time contributor 的 fork PR 需维护者批准 workflow，前一个 PR #6352 就卡在这里）。
 2. **三种部署形态的真实网络层未实测**：Tailscale/WireGuard、公网 VPS+TLS、Cloudflare Tunnel/ngrok 都只做了语义等价测试（127.0.0.1 + 注入头）。`docs/DEPLOY.md` §7 列了每项的验证命令与"未在本机验证"标注。
@@ -164,7 +179,7 @@ node --test --test-force-exit test/p2p-agent.test.mjs   # Windows：14 pass / 0 
 
 ---
 
-## 6. 复跑验证（任何人可复现）
+## 7. 复跑验证（任何人可复现）
 
 ```powershell
 cd E:\DS\w2m
