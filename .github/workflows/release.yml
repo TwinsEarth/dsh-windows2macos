@@ -66,7 +66,7 @@ jobs:
         # release gate until it is added here. That has bitten this project once
         # already (v0.2.3: four new suites, 166 cases, never executed in CI). When
         # you add test/*.test.mjs, add it here AND in ci.yml.
-        run: node --test test/relay.test.mjs test/broadcast.test.mjs test/agent.test.mjs test/tools.test.mjs test/schedule.test.mjs test/auto-update.test.mjs test/update-source.test.mjs test/update-install.test.mjs test/update-wiring.test.mjs test/signing.test.mjs test/stress.test.mjs test/metrics.test.mjs test/metrics-route.test.mjs test/shared-config.test.mjs test/tool-cards.test.mjs test/p2p-stun.test.mjs test/p2p-transport.test.mjs test/p2p-signaling.test.mjs test/p2p-node.test.mjs test/p2p-transport-fields.test.mjs test/p2p-plugin.test.mjs test/stun-server.test.mjs
+        run: node --test --test-force-exit test/relay.test.mjs test/broadcast.test.mjs test/agent.test.mjs test/tools.test.mjs test/schedule.test.mjs test/auto-update.test.mjs test/update-source.test.mjs test/update-install.test.mjs test/update-wiring.test.mjs test/signing.test.mjs test/stress.test.mjs test/metrics.test.mjs test/metrics-route.test.mjs test/shared-config.test.mjs test/tool-cards.test.mjs test/p2p-stun.test.mjs test/p2p-transport.test.mjs test/p2p-signaling.test.mjs test/p2p-node.test.mjs test/p2p-transport-fields.test.mjs test/p2p-plugin.test.mjs test/stun-server.test.mjs
 
       - name: End-to-end suites (blocking)
         # These exercise real processes over real sockets and are slower and more
