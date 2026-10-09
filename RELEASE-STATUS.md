@@ -15,7 +15,16 @@
 | 资产 | `twinsearth-w2m-dsh-plugin-0.4.2.tgz`（398,893 B）+ `SHA256SUMS` |
 | 修掉 | `w2m_update` 的 `execute` 返回对象而宿主要求**字符串**，于是**这个工具在 0.4.0/0.4.1 里从来没能被调用过**（宿主直接拒绝：`returned invalid output: "value" must be a string`）。`output: jsonOutput` 是渲染器不是序列化器，另外七个工具都是自己 `JSON.stringify` 的 |
 | 新增 | 一条覆盖全部八个工具的契约用例（两个 `w2m_update` 动作都调，网络查询打桩为失败以免真的安装）：**每个返回值都必须是能解析的 JSON 字符串** —— 让这一类错误无法再出现 |
-| 测试 | `tools.test.mjs` **82 通过 / 0 失败**（修复前该文件 79 通过） |
+| CI / Release | Release **#20 成功**、CI **#37 成功**（`b91927d`）；此前的 Release #19 / CI #36 是**同一版本的两次失败**，见下 |
+| 测试 | `tools.test.mjs` **82 通过 / 0 失败**、`update-wiring.test.mjs` + `tools.test.mjs` 合计 **116 通过 / 0 失败** |
+| 本机安装 | 已升到 **0.4.2**，tarball 放在稳定路径 `%USERPROFILE%\.dsh\w2m\`（此前 profile 清单指着 `E:\DS\DSH\repo\dist\...0.4.0.tgz`，那个文件被删掉后 pnpm 解析旧依赖直接 `ENOENT`，升级失败——这条路径现在不再依赖任何 checkout） |
+
+### 这一版自己的两个坑（都留在记录里）
+
+- **tag 打错了 commit。** 一次带引号的 commit 消息被 PowerShell 拆开（`output:` 那行被当成 git 参数），提交失败但同一条命令里的 `git tag` 仍然执行了 —— 于是 `v0.4.2` 指向了上一版提交，Release #19 卡在 "The tag and package.json must agree"。已删本地与远端 tag 重新指向 `b91927d`，Release #20 通过。
+- **修复本身弄挂了四个 CI 用例。** `test/update-wiring.test.mjs` 的 `updateStatus` 直接读取返回值的字段（`out.update.enabled`），也就是**照着缺陷写的**；工具改成返回字符串后，四个平台同时报 `Cannot read properties of undefined (reading 'enabled')`。该 helper 现在断言字符串契约并 `JSON.parse`。**本地没发现，是 CI 发现的** —— 因为提交前只跑了 `tools.test.mjs`，没跑这个文件；这正是 v0.4.0 发布说明里点名过的老毛病（新套件没被跑到）。
+
+- ⚠️ **运行中的 DSH 仍然加载着 0.4.0 的模块。** 插件装到 0.4.2 之后，`w2m_update` 在本会话里**依旧**报同一个 `invalid output` —— 这是插件自己写明的限制："新版本下次启动才加载，运行中的进程保留它已加载的代码"。重启 DSH 后该工具即可用；其余七个工具不受影响。
 
 三个缺陷（0.4.1 的预检与端口、0.4.2 的返回类型）都不是读代码读出来的，而是**真的把它用起来**才暴露的：调工具、看账本、重启后重新派发。这也是把它们逐个发出去、而不是攒成一个大版本的原因。
 
