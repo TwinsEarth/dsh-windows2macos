@@ -4,6 +4,25 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.5] — 2026-10-09
+
+### Fixed
+
+* **The supervisor v0.4.4 shipped would have failed the lint job.** `deploy/windows/` was not in the
+  rule block that turns `no-console` off for entry points — and a supervisor's only output channel
+  *is* the console and the log it tees into — and it carried an unused import left over from an
+  earlier draft. CI #41 caught it after v0.4.4 was published; the release itself was fine, the
+  repository was not. `deploy/**/*.mjs` now shares the entry-point block with `bin/**/*.mjs`.
+
+### Notes
+
+* Released as its own version rather than re-tagged, because `deploy/` is inside the published
+  package: re-pointing v0.4.4 at different bytes would make the tag and the tarball disagree, which
+  is exactly the drift this project's release notes have complained about before.
+* The lesson is the same one v0.4.2 taught and it is worth repeating: a *filtered* view of the lint
+  output is not the lint output. The local run ended in `Select-Object -Last 1`, printed a blank
+  line, and 5 errors went past unread.
+
 ## [0.4.4] — 2026-10-09
 
 ### Added

@@ -37,9 +37,6 @@
 import { spawn } from 'node:child_process';
 import { createWriteStream, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
-
-const HERE = dirname(fileURLToPath(import.meta.url));
 
 /** Minimal `--flag value` / `--flag` parser: no dependency, no surprises. */
 function parseArgs(argv) {

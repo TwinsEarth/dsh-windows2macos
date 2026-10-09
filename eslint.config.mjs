@@ -20,16 +20,7 @@ export default [
   // committed, and the deploy/ copies are templates rather than code.
   // ---------------------------------------------------------------------
   {
-    ignores: [
-      'dist/',
-      'dist-*/',
-      'node_modules/',
-      '*.tgz',
-      '.w2m/',
-      'coverage/',
-      'e2e-tmp/',
-      'test-tmp/',
-    ],
+    ignores: ['dist/', 'dist-*/', 'node_modules/', '*.tgz', '.w2m/', 'coverage/', 'e2e-tmp/', 'test-tmp/'],
   },
 
   // ---------------------------------------------------------------------
@@ -59,16 +50,19 @@ export default [
       // `no-undef` is the closest thing to a type checker this project has: it
       // catches "renamed a helper but missed a call site".
       'no-undef': 'error',
-      'no-unused-vars': ['error', {
-        // `_`-prefixed bindings are the codebase's existing convention for
-        // "intentionally unused" (catch bindings, destructuring discards).
-        args: 'after-used',
-        argsIgnorePattern: '^_',
-        varsIgnorePattern: '^_',
-        caughtErrors: 'all',
-        caughtErrorsIgnorePattern: '^_',
-        ignoreRestSiblings: true,
-      }],
+      'no-unused-vars': [
+        'error',
+        {
+          // `_`-prefixed bindings are the codebase's existing convention for
+          // "intentionally unused" (catch bindings, destructuring discards).
+          args: 'after-used',
+          argsIgnorePattern: '^_',
+          varsIgnorePattern: '^_',
+          caughtErrors: 'all',
+          caughtErrorsIgnorePattern: '^_',
+          ignoreRestSiblings: true,
+        },
+      ],
 
       // ---- correctness: async / promise mistakes ------------------------
       // Parser-free substitutes for the type-aware rules; see the header note.
@@ -152,9 +146,13 @@ export default [
 
   // ---------------------------------------------------------------------
   // CLI entry points: console is the interface here, so allow it.
+  //
+  // deploy/windows/*.mjs belongs in this list for the same reason as bin/: the supervisor is a
+  // long-running process whose *only* output channel is the console and the log file it tees it
+  // into. There is nothing to return a value to.
   // ---------------------------------------------------------------------
   {
-    files: ['bin/**/*.mjs'],
+    files: ['bin/**/*.mjs', 'deploy/**/*.mjs'],
     rules: {
       'no-console': 'off',
     },
