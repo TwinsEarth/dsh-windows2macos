@@ -26,7 +26,7 @@ import { formatError, resolveStateDir } from '../src/util/cli.mjs';
 import { createAgent, parseAllowedCommands } from '../src/agent/agent.mjs';
 import { probeCapsDetailed, detectPlatform } from '../src/agent/caps.mjs';
 import { loadOrCreateIdentity, saveDeviceToken } from '../src/agent/identity.mjs';
-import { normalizeP2PMode, stunServersWithShared } from '../src/agent/p2p-node.mjs';
+import { normalizeP2PMode, normalizeP2PPort, stunServersWithShared } from '../src/agent/p2p-node.mjs';
 import { resolveBaseUrl } from '../src/agent/url.mjs';
 
 const USAGE = `w2m-localside — W2M Localside agent (protocol v1)
@@ -34,7 +34,8 @@ const USAGE = `w2m-localside — W2M Localside agent (protocol v1)
 Usage:
   w2m-localside --rabbit <url> [--pair <CODE>] [--project <dir>]
                 [--name <name>] [--allowed-commands <json>]
-                [--state <dir>] [--p2p-mode <mode>] [--stun-servers <list>]
+                [--state <dir>] [--p2p-mode <mode>] [--p2p-port <n>]
+                [--stun-servers <list>]
                 [--once] [--once-idle-ms <ms>]
 
 Options:
@@ -55,6 +56,12 @@ Options:
                             direct: refuse an offer that did not arrive
                                     directly (P2P_UNAVAILABLE)
                             relay:  v0.3.9 - no UDP socket is bound at all
+  --p2p-port <n>            Local UDP port for the punch socket, 1..65535
+                            (default: $W2M_P2P_PORT, or an ephemeral port)
+                            Pin this on a machine that must *accept* a punch:
+                            an ephemeral port changes on every restart, so the
+                            firewall rule has to be re-pointed each time and
+                            every dispatch falls back to the relay until it is.
   --stun-servers <list>     Comma-separated STUN servers, queried in order,
                             after the shared server (default: $W2M_STUN_SERVERS)
                             Example: stun.internal:3478,stun.l.google.com:19302
@@ -87,6 +94,7 @@ function parseCli(argv) {
       'operator-token': { type: 'string' },
       state: { type: 'string' },
       'p2p-mode': { type: 'string' },
+      'p2p-port': { type: 'string' },
       'stun-servers': { type: 'string' },
       once: { type: 'boolean', default: false },
       'once-idle-ms': { type: 'string' },
@@ -167,6 +175,20 @@ async function main() {
   }
   const p2pMode = p2pModeResult.mode;
 
+  // Same precedence rule, same reason, and the same loud validator the node and the agent use.
+  // Omitting the setting keeps the ephemeral port, which is the right default for a machine that
+  // only dials. A value that *is* written must be a real port: `0` is refused by name rather than
+  // read as "let the OS choose", because an operator who writes `0` is asking for a stable port and
+  // would silently get a random one -- see `normalizeP2PPort`.
+  const p2pPortInput = flags['p2p-port'] ?? process.env.W2M_P2P_PORT ?? undefined;
+  const p2pPortResult = normalizeP2PPort(p2pPortInput);
+  if (!p2pPortResult.ok) {
+    const source = flags['p2p-port'] !== undefined ? '--p2p-port' : 'W2M_P2P_PORT';
+    process.stderr.write(`error: ${source}: ${p2pPortResult.reason}\n`);
+    return 2;
+  }
+  const p2pPort = p2pPortResult.port;
+
   // Same precedence rule, same reason. An empty list means "the shared server and the public
   // fallbacks", i.e. the default -- `stunServersWithShared()` accepts '' and drops it -- so an
   // accidentally blank variable is harmless rather than a node that cannot discover anything.
@@ -216,6 +238,7 @@ async function main() {
       heartbeatIntervalMs: heartbeatMs,
       operatorToken,
       p2pMode,
+      p2pPort,
       stunServers,
       log,
       // The startup line has to name the *resolved* mode, the STUN list and whether the node

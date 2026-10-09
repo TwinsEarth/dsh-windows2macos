@@ -165,6 +165,8 @@ node bin/w2m-localside.mjs \
   --name win-desktop \
   --state ~/.dsh/xclient/localside-win \
   --p2p-mode auto
+  # --p2p-port 41234    # v0.4.1: pin the punch socket, so an inbound firewall
+  #                     # rule names one port and survives a restart
 ```
 
 `--allowed-commands` is a **default-deny whitelist** as a JSON array. Nothing
@@ -442,8 +444,10 @@ Three things are worth knowing before relying on it:
   dispatcher dials the executor.
 * **A machine that must accept a punch needs a reachable UDP port.** On a public
   host that is a firewall rule for the agent's punch port (the shared server has
-  one); behind a NAT it is the hole the punch opens. The port is ephemeral today,
-  so the rule has to cover the range — a fixed `--p2p-port` is the follow-up.
+  one); behind a NAT it is the hole the punch opens. **v0.4.1 pins it**: `--p2p-port <n>`
+  (or `W2M_P2P_PORT`) makes the rule name one port instead of a range, which v0.4.0 could not
+  do — the node always bound an ephemeral one, so the rule had to be re-pointed after every
+  restart.
 * **A two-NAT punch is still unverified.** Two sockets on one host share a path
   with no translator between them, so the loopback tests prove the protocol and
   nothing about NAT. What *has* now been measured is one real WAN hop: dispatcher
@@ -615,7 +619,7 @@ dsh plugin --profile <profile-name> add @twinsearth/w2m-dsh-plugin@0.4.0
 
 - ✅ **P2P 直连已接通（v0.4.0）**：宣告（announce）、打洞、任务通过直连通道送达、结果沿同一通道返回、两条路径同时到达时**只执行一次**、以及每条结果都带 `transport` / `p2p.offer_path` / `p2p.result_path`。回落到中继时带**具体原因**（`P2P_PUNCH_TIMEOUT` 等），不是一句"没走直连"。
 - ✅ **跨真网一跳已实测**：派发端在**中国移动的对称 NAT 之后**（三台 STUN 服务器给出三个不同的映射端口：36028 / 5855 / 26713，`endpoint-dependent`，punchable: false），执行端在东京的共享服务器上。**实测打洞成功：`HELLO` → `HELLO_ACK` 331.61 ms**，账本为那台日本机器记录 `transport: p2p`（`result_path: p2p`）。对称 NAT 挡住的是"被拨入"，挡不住"主动拨出" —— 这正是派发方负责打洞的原因。
-- ⚠️ **要接受打洞的机器必须有可达的 UDP 端口**：公网主机上就是一条防火墙规则（共享服务器已加）；今天端口是临时的，所以规则要覆盖区间 —— 固定 `--p2p-port` 是下一步。
+- ✅ **要接受打洞的机器必须有可达的 UDP 端口**：公网主机上就是一条防火墙规则（共享服务器已加）。**v0.4.1 起可以用 `--p2p-port <n>`（或 `W2M_P2P_PORT`）固定端口**，规则只需写一个端口，不必覆盖区间。
 - ✅ **共享服务器已上线**：中继（`:8787` 与经 nginx 的 `:80`）、STUN 响应器（`:3478/udp`）、systemd 单元、ufw 规则，一条命令可复现：`deploy/shared-server/install.sh`。
 - ✅ **三平台 CI**：同一套用例在 `windows-latest`（node 20/22）、`macos-latest`（node 22）、`ubuntu-latest`（node 22）上跑，见上方徽章与 `.github/workflows/ci.yml`。
 - ⚠️ **两个 NAT 之后的互通仍未实测**：本机环回上的打洞只证明协议正确，不证明能穿透 NAT；目前实测的是**一跳、一个 NAT**（见上）。

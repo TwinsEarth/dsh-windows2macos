@@ -4,6 +4,69 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] — 2026-10-09
+
+Two defects that v0.4.0 shipped, both found by using it against a live two-machine
+fleet rather than by reading it. No wire change, no new endpoint: protocol version
+stays **1** and a v0.4.0 peer keeps working in both directions.
+
+### Fixed
+
+* **The plugin's dispatch-time allow-list could never match a multi-token entry.**
+  `checkAllowedCommand` compared `argv[0]`'s basename against each entry *whole*, so
+  the documented configuration — `allowedCommands: ['node --test', 'git status
+  --porcelain']` — refused every dispatch:
+
+      COMMAND_NOT_ALLOWED: `git` is not in this plugin's allowedCommands (git rev-parse, node --test, …)
+
+  The agent's own matcher has always been token-wise (`['node','--test']` allows
+  `node --test --reporter=tap`, refuses `node -e …`), so the dispatcher's pre-flight
+  and the machine that actually runs the command disagreed about the same setting.
+  Both now use **one** implementation, moved to `src/agent/allowed-commands.mjs` and
+  re-exported from `src/agent/agent.mjs`, so the public surface and every existing
+  import are unchanged. The pre-flight stays *no stricter* than before: an entry
+  naming an executable with an extension (`Node.exe`) still matches, which is the
+  tolerance the old check had.
+* **There was no way to pin the UDP punch port.** The node always bound an ephemeral
+  port, so a machine that has to *accept* a punch — the executor — needed its
+  firewall rule re-pointed after every restart. Measured on the shared server: with
+  the rule stale, every dispatch fell back to the relay (`P2P_PUNCH_TIMEOUT` on the
+  dispatcher, `offer_path: "relay"` in the ledger). `--p2p-port <n>` (and
+  `W2M_P2P_PORT`) now pins it, validated loudly: `0`, `65536` and a non-numeric value
+  are usage errors that name the setting, and an invalid value at the agent level is
+  a recorded, non-fatal `P2P_PORT_INVALID` start failure rather than a silently
+  ignored option. `p2pMode: relay` still binds no socket at all.
+
+### Added
+
+* **`src/agent/allowed-commands.mjs`** — `parseAllowedCommands` and
+  `matchAllowedCommand`, one implementation for the agent and the plugin, with the
+  rule they encode written down next to it: a string entry splits on whitespace, the
+  executable is compared by path or by basename, and every later token is compared
+  verbatim.
+* **`normalizeP2PPort`**, exported next to `normalizeP2PMode`, because the CLI and
+  the agent must not disagree about what a legal port is.
+* **10 tests** across `p2p-node`, `tools`, `p2p-agent` and `outbound-only`: the
+  multi-token allow-list in both directions, the default bind being exactly
+  `{address:'0.0.0.0', port:0}`, a pinned port reaching the binder and being reported
+  in `status.local`, the real CLI pinning a real port, and a bad value exiting 2.
+
+### Verification
+
+* Required suites (`p2p-node`, `agent`, `tools`, `p2p-plugin`, `p2p-agent`,
+  `outbound-only`): **297 tests, 294 pass, 2 skipped, 1 failure** — the failure is
+  the pre-existing `finds python in the bundled DSH runtime when PATH has none`,
+  reproducible at HEAD. Baseline on the same files: 287 tests, 284 pass → exactly
+  +10 tests, +10 passing.
+* The whole repository (`test:all`): **896 tests, 888 pass, 3 failures, 5 skipped**,
+  and the three are the same pre-existing environment cases documented in
+  `RELEASE-STATUS.md` (`agent` python; `pipeline-e2e` × 2, an allow-list entry
+  containing a space plus Node installed under `C:\Program Files`).
+* Not verified: the pinned port was exercised on loopback and through the CLI, not
+  against a live firewall. The claim it fixes — "a firewall rule no longer has to be
+  re-pointed after every restart" — is the mechanism, and it is stated as the
+  mechanism rather than as a measurement.
+
 ## [0.4.0] — 2026-10-09
 
 The direct path becomes the default, and the P2P feature that v0.3.9 shipped but

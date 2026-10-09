@@ -1349,6 +1349,68 @@ describe("v0.4.0 agent: p2pMode 'relay'", () => {
 /* Start failures are recorded, never fatal                                    */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * A UDP port nothing holds, by binding one and releasing it.
+ *
+ * The port has to be *free* rather than merely unused-looking: this agent really binds it, and a
+ * collision would fail the case for a reason that has nothing to do with the property under test.
+ */
+async function freeUdpPort() {
+  const { socket, local } = await bindUdpSocket();
+  await new Promise((resolve) => socket.close(resolve));
+  return local.port;
+}
+
+describe('v0.4.0 agent: a pinned punch port', () => {
+  it('binds the port it was given, so a firewall rule survives a restart', async () => {
+    const { relay } = await startRelay();
+    const repo = makeRepo('pinned-port');
+    const port = await freeUdpPort();
+    const agent = await makeAgent({
+      relay,
+      project: repo.dir,
+      stateDir: scratchDir('agent-state'),
+      options: { p2pPort: port },
+    });
+
+    try {
+      startAgentLoop(agent);
+      await waitFor(() => agent.state.p2p.running, { label: 'the pinned-port node to start' });
+      // The real socket, not a recorded preference: `status.local` is what the OS answered.
+      assert.equal(agent.p2pNode.bindPort, port, 'the port reaches the node');
+      assert.equal(agent.p2pNode.status.local.port, port, 'and the real socket holds it');
+      assert.equal(agent.state.p2p.local.port, port, 'and the published status says so');
+    } finally {
+      await teardown({ agent, relay });
+    }
+  });
+
+  it('reports an unusable p2pPort as a named start failure, never as a crash', async () => {
+    const { relay } = await startRelay();
+    const repo = makeRepo('invalid-port');
+    const agent = await makeAgent({
+      relay,
+      project: repo.dir,
+      stateDir: scratchDir('agent-state'),
+      options: { p2pPort: 0 },
+    });
+
+    try {
+      // `start()` must not reject: a machine whose P2P settings are wrong is still a working W2M
+      // machine, exactly as for a bind failure.
+      startAgentLoop(agent);
+      await waitFor(() => agent.state.p2p.start_error !== null, { label: 'the invalid port to be recorded' });
+      assert.match(agent.state.p2p.start_error, /^P2P_PORT_INVALID: P2P_PORT_ZERO/);
+      assert.equal(agent.p2pNode, null, 'no node is built from an unusable port');
+      assert.equal(agent.state.p2p.running, false);
+      assert.equal(agent.state.p2p.enabled, true, 'the direct path is still what was asked for');
+      assert.equal(agent.state.p2p.last_error, agent.state.p2p.start_error);
+    } finally {
+      await teardown({ agent, relay });
+    }
+  });
+});
+
 describe('v0.4.0 agent: a node that cannot start', () => {
   it('records the failure in the status and still runs the task over the relay', async () => {
     const { relay } = await startRelay();

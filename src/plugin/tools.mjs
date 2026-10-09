@@ -57,6 +57,10 @@ import path from 'node:path';
 // `src/agent/` does not import `src/plugin/`, so the dependency runs one way and cannot cycle.
 import { joinUrl, resolveBaseUrl } from '../agent/url.mjs';
 import { deviceFilePath } from '../agent/identity.mjs';
+// The allow-list matcher is shared with the agent on purpose: this plugin's pre-flight exists so a
+// dispatcher does not send work the target machine would refuse, so the two ends must apply the
+// same rule, token for token. See `src/agent/allowed-commands.mjs`.
+import { matchAllowedCommand, parseAllowedCommands } from '../agent/allowed-commands.mjs';
 import {
   DEFAULT_P2P_MODE,
   P2P_MODES,
@@ -2190,18 +2194,28 @@ async function resolveTreeFingerprint(projectDir, timeoutMs) {
 // ---------------------------------------------------------------------------------------------
 
 /**
- * Reduce an executable reference to a comparable form: basename, lower case, no `.exe`/`.cmd`/`.bat`.
+ * The comparable form of an **executable token**: basename, lower case, no `.exe`/`.cmd`/`.bat`/`.com`.
+ *
+ * Applied to `argv[0]` and to the first token of an entry, never to the arguments after it --
+ * `--reporter=TAP` and `--reporter=tap` are different arguments, and collapsing them would authorise
+ * something nobody wrote.
+ *
+ * This is the plugin's long-documented tolerance (`allowedCommands: ['Node.exe']` accepts
+ * `C:\Program Files\nodejs\node.exe`), and it is deliberately platform-independent: the old check
+ * normalised the separator itself rather than asking `path`, which is what makes the documented
+ * entry work the same on a POSIX dispatcher. Everything *after* the executable token is compared
+ * verbatim by the shared matcher, which is where the prefix rule lives.
  *
  * @param {string} value
  * @returns {string}
  */
-function normalizeCommand(value) {
+function normalizeExecToken(value) {
   const base = path.basename(String(value).trim().replace(/\\/g, '/')).toLowerCase();
   return base.replace(/\.(exe|cmd|bat|com)$/, '');
 }
 
 /**
- * Check `argv[0]` against the configured allow-list.
+ * Check one argv against the configured allow-list, with the **same rule the agent applies**.
  *
  * Returns `null` when the call may proceed. When `allowedCommands` is unset or empty this plugin
  * does **not** refuse: the execution gate belongs to the machine that runs the command, and the
@@ -2209,18 +2223,39 @@ function normalizeCommand(value) {
  * that policy badly or hide it behind a silent allow, so the plugin only enforces what it was
  * explicitly told.
  *
- * @param {string[]} allowedCommands
+ * The matcher is imported rather than re-implemented because this pre-flight exists for one reason:
+ * a dispatcher must not send work the target machine would itself refuse. An executable-only
+ * comparison (`argv[0]` against each entry) could never match a multi-token entry at all, so the
+ * documented config `['node --test','git status --porcelain']` refused `['git','rev-parse','HEAD']`
+ * -- stricter than the gate, which is the direction that silently loses work.
+ *
+ * @param {string[]} allowedCommands Entries as configured, e.g. `['node --test']`.
  * @param {string[]} argv
  * @returns {{code: string, message: string, allowed: string[]}|null}
  */
 function checkAllowedCommand(allowedCommands, argv) {
   if (allowedCommands.length === 0) return null;
-  const allowed = new Set(allowedCommands.map(normalizeCommand));
-  if (allowed.has(normalizeCommand(argv[0]))) return null;
+  let prefixes;
+  try {
+    prefixes = parseAllowedCommands(allowedCommands);
+  } catch (error) {
+    // Fail closed: an unparseable list is not an empty one, and a control that cannot be evaluated
+    // must refuse rather than wave the command through.
+    return {
+      code: 'COMMAND_NOT_ALLOWED',
+      message: `the plugin's allowedCommands could not be parsed (${error?.message ?? String(error)})`,
+      allowed: [],
+    };
+  }
+  // Prefixes "as written": the configured entries, whitespace-normalised, in a stable order.
+  const allowed = prefixes.map((prefix) => prefix.join(' ')).sort();
+  const entries = prefixes.map((prefix) => [normalizeExecToken(prefix[0]), ...prefix.slice(1)]);
+  const command = [normalizeExecToken(argv[0]), ...argv.slice(1)];
+  if (matchAllowedCommand(command, entries).allowed) return null;
   return {
     code: 'COMMAND_NOT_ALLOWED',
-    message: `\`${argv[0]}\` is not in this plugin's allowedCommands (${[...allowed].sort().join(', ')})`,
-    allowed: [...allowed].sort(),
+    message: `\`${argv.join(' ')}\` is not in this plugin's allowedCommands (${allowed.join(', ')})`,
+    allowed,
   };
 }
 

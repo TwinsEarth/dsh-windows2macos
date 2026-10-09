@@ -522,7 +522,9 @@ matters because the dispatcher is the side that dials: a Windows machine running
 DSH reaches its peers directly, but a Windows machine acting as the executor for
 somebody else may need an inbound rule for `node.exe` (UDP) before it answers.
 If a punch fails in exactly one direction and `mapping` looks punchable on both
-sides, look here first.
+sides, look here first. On a host you control, pin the port with `--p2p-port <n>` so the
+rule survives a restart: until v0.4.1 the node bound an ephemeral port, and a stale rule
+is invisible except as a punch that times out and a task that quietly uses the relay.
 
 ---
 

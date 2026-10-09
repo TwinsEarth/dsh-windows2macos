@@ -105,5 +105,14 @@ tail -f /var/log/w2m/rabbit.log /var/log/w2m/stun.log
   every paired machine and the task history. Losing that directory means every machine pairs
   again — see `docs/TROUBLESHOOTING.md`.
 * `ufw` needs `8787/tcp` and `3478/udp`; port 80 only if you use the proxy path.
+* **If this host must *accept* a punch** (it runs a Localside agent and a peer dials it), its punch
+  socket needs a reachable UDP port *and* the port has to survive a restart. Pin it — until v0.4.1
+  the node bound an ephemeral one, so the rule had to be re-pointed after every agent start, and a
+  stale rule showed up only as a punch that timed out and tasks that quietly used the relay:
+
+  ```bash
+  # add to the agent's ExecStart, then: ufw allow 41234/udp
+  --p2p-port 41234
+  ```
 * Upgrades are the same command: fetch the new tarball, run `install.sh` again. The relay
   restarts; machines reconnect on their own (the agent's stream reconnects with backoff).

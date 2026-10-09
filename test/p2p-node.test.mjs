@@ -35,6 +35,7 @@ import {
   PUBLIC_STUN_SERVERS,
   SHARED_SERVER,
   normalizeP2PMode,
+  normalizeP2PPort,
   stunServersWithShared,
 } from '../src/agent/p2p-node.mjs';
 
@@ -124,21 +125,39 @@ function fakeRelay() {
 }
 
 /**
- * A counting stand-in for `bindUdpSocket`: a real socket, plus the two facts a test
- * needs (whether a bind happened, and what local address the node is told about).
+ * A counting stand-in for `bindUdpSocket`: a real socket, plus the three facts a test
+ * needs (whether a bind happened, what endpoint the node asked for, and what local
+ * address the node is told about).
+ *
+ * Every call's options are recorded verbatim, so "the node binds exactly once" and "the
+ * node binds the endpoint it was configured with" are assertions about the arguments
+ * rather than about a description of them.
+ *
+ * `reportRequestedPort` makes the binder answer with the port the *caller* asked for, which
+ * is how a pinned `bindPort` is exercised without depending on that port being free on the
+ * machine running the suite.
+ *
+ * @param {{reportedAddress?: string|null, reportRequestedPort?: boolean}} [options]
  */
-function countingBinder({ reportedAddress = null } = {}) {
+function countingBinder({ reportedAddress = null, reportRequestedPort = false } = {}) {
   const calls = [];
   const sockets = [];
   return {
     calls,
     sockets,
-    bindUdpSocket: async () => {
-      calls.push(calls.length + 1);
+    bindUdpSocket: async (options = {}) => {
+      calls.push({ ...options });
       const bound = await bindUdpSocket();
       sockets.push(bound.socket);
-      if (reportedAddress === null) return bound;
-      return { socket: bound.socket, local: { address: reportedAddress, port: bound.local.port } };
+      if (reportedAddress === null && !reportRequestedPort) return bound;
+      const pinned = reportRequestedPort && Number.isInteger(options.port) && options.port > 0;
+      return {
+        socket: bound.socket,
+        local: {
+          address: reportedAddress ?? bound.local.address,
+          port: pinned ? options.port : bound.local.port,
+        },
+      };
     },
   };
 }
@@ -210,6 +229,8 @@ function makeNode(machineId, relay, options = {}) {
     getJson: options.getJson ?? client.getJson,
     discover: options.discover ?? loopbackDiscovery(),
     bindUdpSocket: options.bindUdpSocket ?? countingBinder({ reportedAddress: '127.0.0.1' }).bindUdpSocket,
+    ...(options.bindAddress === undefined ? {} : { bindAddress: options.bindAddress }),
+    ...(options.bindPort === undefined ? {} : { bindPort: options.bindPort }),
     tuning: options.tuning ?? testTuning(),
     log: options.log ?? (() => {}),
   });
@@ -330,7 +351,65 @@ describe('p2p-node: mode normalisation', () => {
     assert.throws(() => new P2PNode({ machineId: 'm', tuning: { refreshMs: 0 } }), /positive number/);
     assert.throws(() => new P2PNode({ machineId: 'm', postJson: 'nope' }), /postJson must be a function/);
     assert.throws(() => new P2PNode({ machineId: 'm', stunServers: [] }), /stunServers must be a non-empty/);
-    assert.equal(new P2PNode({ machineId: 'm' }).status.mode, DEFAULT_P2P_MODE);
+    assert.throws(
+      () => new P2PNode({ machineId: 'm', bindPort: 65536 }),
+      /bindPort must be an integer in 0\.\.65535/,
+    );
+    assert.throws(
+      () => new P2PNode({ machineId: 'm', bindPort: -1 }),
+      /bindPort must be an integer in 0\.\.65535/,
+    );
+    assert.throws(
+      () => new P2PNode({ machineId: 'm', bindPort: 1.5 }),
+      /bindPort must be an integer in 0\.\.65535/,
+    );
+    assert.throws(() => new P2PNode({ machineId: 'm', bindAddress: '' }), /bindAddress must be a non-empty/);
+    assert.throws(() => new P2PNode({ machineId: 'm', bindAddress: 7 }), /bindAddress must be a non-empty/);
+    const defaults = new P2PNode({ machineId: 'm' });
+    assert.equal(defaults.status.mode, DEFAULT_P2P_MODE);
+    assert.equal(defaults.bindAddress, '0.0.0.0', 'the documented default endpoint');
+    assert.equal(defaults.bindPort, 0, '0 means an ephemeral port');
+  });
+});
+
+describe('p2p-node: punch port normalisation', () => {
+  it('accepts a fixed port, a numeric string, and the ephemeral spelling', () => {
+    // The default: no port written at all.
+    assert.deepEqual(normalizeP2PPort(undefined), { ok: true, port: null });
+    assert.deepEqual(normalizeP2PPort(null), { ok: true, port: null });
+    // The CLI/env shape, which arrives as a string.
+    assert.deepEqual(normalizeP2PPort('41234'), { ok: true, port: 41234 });
+    assert.deepEqual(normalizeP2PPort(' 41234 '), { ok: true, port: 41234 });
+    assert.deepEqual(normalizeP2PPort(1), { ok: true, port: 1 });
+    assert.deepEqual(normalizeP2PPort(65535), { ok: true, port: 65535 });
+  });
+
+  it('refuses 0 and everything outside 1..65535, by name, never by coercion', () => {
+    const cases = [
+      [0, 'P2P_PORT_ZERO'],
+      ['0', 'P2P_PORT_ZERO'],
+      [65536, 'P2P_PORT_OUT_OF_RANGE'],
+      [-1, 'P2P_PORT_OUT_OF_RANGE'],
+      ['', 'P2P_PORT_EMPTY'],
+      ['abc', 'P2P_PORT_NOT_AN_INTEGER'],
+      // `Number()` would turn both of these into a port nobody wrote.
+      ['0x10', 'P2P_PORT_NOT_AN_INTEGER'],
+      ['1e3', 'P2P_PORT_NOT_AN_INTEGER'],
+      [1.5, 'P2P_PORT_NOT_AN_INTEGER'],
+      [true, 'P2P_PORT_NOT_AN_INTEGER'],
+      [{ port: 41234 }, 'P2P_PORT_NOT_AN_INTEGER'],
+    ];
+    for (const [value, code] of cases) {
+      const result = normalizeP2PPort(value);
+      assert.equal(result.ok, false, `${JSON.stringify(value)} must not be accepted`);
+      assert.equal('port' in result, false, 'a rejected input must not come back with a port');
+      assert.deepEqual(Object.keys(result).sort(), ['ok', 'reason']);
+      assert.match(result.reason, new RegExp(`^${code}: `), `${JSON.stringify(value)} -> ${result.reason}`);
+    }
+    // The zero case has to explain the alternative, because it is the value an operator is most
+    // likely to reach for ("let the OS choose") and the one that breaks the firewall rule.
+    assert.match(normalizeP2PPort(0).reason, /ephemeral/);
+    assert.match(normalizeP2PPort(65536).reason, /1\.\.65535/);
   });
 });
 
@@ -438,6 +517,12 @@ describe('p2p-node: announcement', () => {
     const [payload] = await first;
 
     assert.equal(bind.calls.length, 1, 'one socket for the whole life of the node');
+    // The documented endpoint, and the reason a firewall rule has to be re-pointed after every
+    // restart unless `bindPort` pins one: the OS chooses, so the port is a different number next
+    // time. `{address, port}` is the whole argument, so the default cannot drift unnoticed.
+    assert.deepEqual(bind.calls, [{ address: '0.0.0.0', port: 0 }], 'the default bind endpoint');
+    assert.equal(node.bindPort, 0);
+    assert.equal(node.bindAddress, '0.0.0.0');
     assert.equal(node.status.running, true);
     assert.equal(node.status.local.address, '192.168.44.7');
     assert.ok(node.status.local.port > 0, 'an ephemeral port');
@@ -486,6 +571,48 @@ describe('p2p-node: announcement', () => {
     const afterClose = relay.posts.length;
     await new Promise((resolve) => setTimeout(resolve, 200));
     assert.equal(relay.posts.length, afterClose, 'a closed node must stop announcing');
+  });
+
+  it('binds the port it was configured with, so a firewall rule can outlive a restart', async () => {
+    // The defect this pins: the node called the binder with no arguments at all, so a machine that
+    // must *accept* a punch got a fresh ephemeral port on every start, `ufw allow <port>/udp` had to
+    // be redone each time, and every dispatch fell back to the relay until it was.
+    const relay = fakeRelay();
+    const bind = countingBinder({ reportedAddress: '192.168.44.7', reportRequestedPort: true });
+    const pinned = makeNode('machine-pinned', relay, {
+      bindUdpSocket: bind.bindUdpSocket,
+      bindPort: 41234,
+    });
+
+    await startAnnounced(pinned);
+    assert.deepEqual(bind.calls, [{ address: '0.0.0.0', port: 41234 }], 'the pinned port reaches the binder');
+    assert.deepEqual(pinned.status.local, { address: '192.168.44.7', port: 41234 });
+    assert.equal(pinned.bindPort, 41234);
+    // And it is the pinned port that is announced, not whatever the OS would have handed out: a
+    // firewall rule is only useful if the peer is told the same port.
+    const lanCandidate = pinned.status.candidates.find(
+      (candidate) => candidate.address === '192.168.44.7' && candidate.port === 41234,
+    );
+    assert.ok(
+      lanCandidate,
+      `the LAN candidate must carry the pinned port: ${JSON.stringify(pinned.status.candidates)}`,
+    );
+
+    await pinned.close();
+    assert.equal(pinned.status.local, null);
+  });
+
+  it('binds the address it was configured with too', async () => {
+    const relay = fakeRelay();
+    const bind = countingBinder();
+    const node = makeNode('machine-bound-address', relay, {
+      bindUdpSocket: bind.bindUdpSocket,
+      bindAddress: '127.0.0.1',
+    });
+
+    await startAnnounced(node);
+    assert.deepEqual(bind.calls, [{ address: '127.0.0.1', port: 0 }]);
+    await node.close();
   });
 
   it('de-duplicates the candidate list and caps it at maxCandidates', async () => {

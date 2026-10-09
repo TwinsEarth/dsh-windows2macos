@@ -24,7 +24,7 @@
 import { Readable } from 'node:stream';
 import { access, constants as fsConstants } from 'node:fs/promises';
 import { mkdirSync, renameSync, writeFileSync } from 'node:fs';
-import { basename, extname, join } from 'node:path';
+import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import {
@@ -48,7 +48,8 @@ import {
   resolveProjectCwd,
 } from './git.mjs';
 import { createSpool } from './spool.mjs';
-import { DEFAULT_P2P_MODE, P2PNode, normalizeP2PMode } from './p2p-node.mjs';
+import { matchAllowedCommand, parseAllowedCommands } from './allowed-commands.mjs';
+import { DEFAULT_P2P_MODE, P2PNode, normalizeP2PMode, normalizeP2PPort } from './p2p-node.mjs';
 import { createSigner } from '../signing.mjs';
 import { joinUrl, resolveBaseUrl } from './url.mjs';
 
@@ -477,103 +478,11 @@ export function p2pDeliveryMark(value = {}) {
 // Command allow-list (default-deny)
 // ---------------------------------------------------------------------------
 
-/**
- * Parse `--allowed-commands`.
- *
- * Accepts the JSON array form the CLI documents (`'["node --test","git status"]'`),
- * an already-parsed array of strings, or an array of arrays for entries whose
- * executable path contains spaces.  Each string entry is split on whitespace
- * into a **prefix sequence**.
- *
- * Commas are deliberately *not* a separator: `["node --test, git status"]`
- * would silently authorise something nobody meant.
- *
- * @param {string|Array<string|string[]>} input
- * @returns {string[][]} Prefixes.
- */
-export function parseAllowedCommands(input) {
-  let parsed = input;
-  if (typeof input === 'string') {
-    const text = input.trim();
-    if (text === '') return [];
-    try {
-      parsed = JSON.parse(text);
-    } catch (error) {
-      const err = new TypeError(
-        `--allowed-commands must be a JSON array, e.g. '["node --test","git status"]' (${error.message})`,
-      );
-      err.code = 'ALLOWED_COMMANDS_INVALID';
-      throw err;
-    }
-  }
-  if (!Array.isArray(parsed)) {
-    const err = new TypeError('allowed commands must be a JSON array');
-    err.code = 'ALLOWED_COMMANDS_INVALID';
-    throw err;
-  }
-  const prefixes = [];
-  for (const entry of parsed) {
-    if (typeof entry === 'string') {
-      const parts = entry.split(/\s+/).filter((part) => part !== '');
-      if (parts.length === 0) {
-        const err = new TypeError('allowed command entries must not be empty');
-        err.code = 'ALLOWED_COMMANDS_INVALID';
-        throw err;
-      }
-      prefixes.push(parts);
-      continue;
-    }
-    if (Array.isArray(entry) && entry.length > 0 && entry.every((part) => typeof part === 'string')) {
-      prefixes.push([...entry]);
-      continue;
-    }
-    const err = new TypeError('allowed command entries must be strings or arrays of strings');
-    err.code = 'ALLOWED_COMMANDS_INVALID';
-    throw err;
-  }
-  return prefixes;
-}
-
-/** Executable name without directory or extension (`C:\x\node.exe` -> `node`). */
-function execName(value) {
-  const base = basename(value);
-  const ext = extname(base);
-  return ext === '' ? base : base.slice(0, -ext.length);
-}
-
-/** Windows paths are case-insensitive; POSIX ones are not. */
-function sameName(a, b) {
-  return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
-}
-
-/**
- * Default-deny prefix match.
- *
- * `['node','--test']` is allowed by the prefix `node --test`, and so is
- * `['node','--test','--reporter=tap']`; `['node','-e','...']` and a bare
- * `['node']` are refused.
- *
- * @param {string[]} argv
- * @param {string[][]} prefixes
- * @returns {{allowed: boolean, prefix: string[]|null}}
- */
-export function matchAllowedCommand(argv, prefixes) {
-  if (!Array.isArray(argv) || argv.length === 0) return { allowed: false, prefix: null };
-  for (const prefix of prefixes ?? []) {
-    if (!Array.isArray(prefix) || prefix.length === 0) continue;
-    if (argv.length < prefix.length) continue;
-    if (!sameName(argv[0], prefix[0]) && !sameName(execName(argv[0]), prefix[0])) continue;
-    let ok = true;
-    for (let i = 1; i < prefix.length; i += 1) {
-      if (argv[i] !== prefix[i]) {
-        ok = false;
-        break;
-      }
-    }
-    if (ok) return { allowed: true, prefix };
-  }
-  return { allowed: false, prefix: null };
-}
+// The matcher itself lives in `./allowed-commands.mjs`, because the plugin's dispatch-time
+// pre-flight must apply the *same* rule (see that file's header). It is imported above for this
+// module's own use and re-exported here so the exports of this module are unchanged: the CLI and
+// `test/agent.test.mjs` have always imported these two names from the agent.
+export { parseAllowedCommands, matchAllowedCommand } from './allowed-commands.mjs';
 
 // ---------------------------------------------------------------------------
 // Capability gate (§6.1)
@@ -942,6 +851,14 @@ export class Heartbeat {
  *   so a typo must fail at the call site rather than degrade into a silent default.
  * @property {string[]|string} [stunServers] Complete STUN list, in query order, for the
  *   agent's own node. See {@link stunServersWithShared}.
+ * @property {number|null} [p2pPort] Local UDP port the punch socket binds, 1..65535; `null`
+ *   or omitted means an ephemeral port, which is the default. A machine that must **accept**
+ *   a punch needs a stable port: an ephemeral one changes on every restart, so a firewall
+ *   rule has to be re-pointed after each start and every dispatch falls back to the relay in
+ *   the meantime (`P2P_PUNCH_TIMEOUT` on the dispatcher, `offer_path: relay` in the ledger).
+ *   Anything that is not a valid port is reported as a `P2P_PORT_INVALID` start failure, never
+ *   thrown -- see {@link normalizeP2PPort} and `startP2P()`, which treats it like every other
+ *   P2P error: recorded, and never fatal to the relay path.
  * @property {P2PNode|((options: object) => P2PNode)} [p2pNode] The node to use. An
  *   instance is adopted; a function is called with the derived options. Injectable
  *   because a test needs a real socket and a deterministic discovery answer, and
@@ -1001,6 +918,15 @@ export function createAgent(options) {
   const normalizedMode = normalizeP2PMode(p2pModeInput);
   if (!normalizedMode.ok) throw new TypeError(`createAgent: ${normalizedMode.reason}`);
   const p2pMode = normalizedMode.mode;
+
+  // The punch port is validated at construction with the same named helper the CLI uses, but an
+  // unusable value is *not* thrown: a machine whose P2P settings are wrong must still work over the
+  // relay, so it becomes a start failure (`P2P_PORT_INVALID`) reported by `startP2P()` exactly like
+  // `P2P_NODE_INVALID` or `P2P_BIND_FAILED`. The error is recorded here and logged where the node
+  // would have been built.
+  const p2pPortResult = normalizeP2PPort(options.p2pPort);
+  const p2pPort = p2pPortResult.ok ? p2pPortResult.port : null;
+  const p2pPortError = p2pPortResult.ok ? null : `P2P_PORT_INVALID: ${p2pPortResult.reason}`;
 
   if (typeof onP2PStatus !== 'function') throw new TypeError('createAgent: onP2PStatus must be a function');
   if (typeof p2pAckTimeoutMs !== 'number' || !Number.isFinite(p2pAckTimeoutMs) || p2pAckTimeoutMs < 0) {
@@ -1140,6 +1066,16 @@ export function createAgent(options) {
   function configureP2P() {
     if (p2pMode === 'relay') return;
     if (p2pNode !== null) return;
+    if (p2pPortError !== null) {
+      // Loud, and before anything is built. `relay` mode above is deliberately checked first: an
+      // operator who asked for no direct path at all should not be told about a port that would
+      // never be bound.
+      p2pStartResult = { ok: false, enabled: true, error: p2pPortError };
+      log('error', 'refusing to build the P2P node with an unusable p2pPort; the relay path is unaffected', {
+        error: p2pPortError,
+      });
+      return;
+    }
 
     const injected = options.p2pNode ?? null;
     const extra = options.p2pNodeOptions ?? {};
@@ -1152,6 +1088,10 @@ export function createAgent(options) {
       ...(options.stunServers === undefined ? {} : { stunServers: options.stunServers }),
       log: (line) => log('info', line, {}),
       ...extra,
+      // After `extra`, so the *validated* named option is the one that decides: `p2pNodeOptions` is
+      // an escape hatch for the node's other constructor options, and letting an unvalidated
+      // `bindPort` there silently win would route around the check above.
+      ...(p2pPort === null ? {} : { bindPort: p2pPort }),
     };
 
     try {

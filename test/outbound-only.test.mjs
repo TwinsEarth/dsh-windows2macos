@@ -63,6 +63,53 @@ function freePort() {  return new Promise((resolve, reject) => {
 }
 
 /**
+ * Allocate a free **UDP** port by binding and immediately releasing it.
+ *
+ * Deliberately UDP and not `freePort()`: the punch socket is UDP, and a TCP port being free says
+ * nothing about the UDP port of the same number.
+ */
+function freeUdpPort() {
+  return new Promise((resolve, reject) => {
+    const socket = createSocket('udp4');
+    socket.once('error', reject);
+    socket.bind(0, '0.0.0.0', () => {
+      const { port } = socket.address();
+      socket.close(() => resolve(port));
+    });
+  });
+}
+
+/**
+ * Run the Localside CLI to completion, for the paths that must exit before doing any work.
+ *
+ * @param {string[]} args - CLI arguments.
+ * @param {object} [env] - Extra environment variables.
+ * @returns {Promise<{code: number|null, stdout: string, stderr: string}>}
+ */
+function runCli(args, env = {}) {
+  return new Promise((resolve) => {
+    const proc = spawn(NODE, [join(REPO, 'bin', 'w2m-localside.mjs'), ...args], {
+      cwd: REPO,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+      env: { ...process.env, ...env },
+    });
+    procs.push(proc);
+    let out = '';
+    let err = '';
+    proc.stdout.setEncoding('utf8');
+    proc.stderr.setEncoding('utf8');
+    proc.stdout.on('data', (c) => {
+      out += c;
+    });
+    proc.stderr.on('data', (c) => {
+      err += c;
+    });
+    proc.on('exit', (code) => resolve({ code, stdout: out, stderr: err }));
+  });
+}
+
+/**
  * Start the relay CLI and wait for its listening line. *
  * @param {object} opts - Launch options.
  * @param {string} opts.stateDir - Relay state directory.
@@ -130,8 +177,9 @@ async function startRelay({ stateDir, port = 0, extraArgs = [] }) {
  * @param {string} opts.project - Project directory.
  * @param {string} opts.stateDir - Agent state directory.
  * @param {string} opts.dshHome - Isolated `DSH_HOME` for this agent.
+ * @param {object} [opts.env] - Extra environment variables for this agent.
  */
-async function startAgent({ rabbitUrl, pairingCode, project, stateDir, dshHome, extraArgs = [] }) {
+async function startAgent({ rabbitUrl, pairingCode, project, stateDir, dshHome, extraArgs = [], env = {} }) {
   const proc = spawn(
     NODE,
     [
@@ -147,7 +195,7 @@ async function startAgent({ rabbitUrl, pairingCode, project, stateDir, dshHome, 
       cwd: REPO,
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
-      env: { ...process.env, DSH_HOME: dshHome },
+      env: { ...process.env, DSH_HOME: dshHome, ...env },
     },
   );
   procs.push(proc);
@@ -398,6 +446,66 @@ describe('the link is outbound-only', () => {
     );
     assert.equal(relayModeAgent.proc.exitCode, null, 'relay mode must stay up without a node');
     relayModeAgent.proc.kill('SIGKILL');
+  });
+
+  it('binds the port --p2p-port pins, so a firewall rule does not have to be redone', async () => {
+    // The defect this pins: the node always bound an ephemeral port, so `ufw allow <port>/udp` had to
+    // be re-pointed after every agent restart and every dispatch fell back to the relay until it was
+    // (`P2P_PUNCH_TIMEOUT` on the dispatcher, `offer_path: relay` in the ledger). A machine that must
+    // *accept* a punch needs a port it can name to its firewall.
+    const stateDir = mkdtempSync(join(tmpdir(), 'w2m-oo-relay5-'));
+    const agentState = mkdtempSync(join(tmpdir(), 'w2m-oo-agent5-'));
+    const project = mkdtempSync(join(tmpdir(), 'w2m-oo-proj5-'));
+    const dshHome = mkdtempSync(join(tmpdir(), 'w2m-oo-home5-'));
+    scratch.push(stateDir, agentState, project, dshHome);
+    const port = await freeUdpPort();
+
+    const relay = await startRelay({ stateDir });
+    const agent = await startAgent({
+      rabbitUrl: relay.url,
+      pairingCode: relay.info.pairingCode,
+      project,
+      stateDir: agentState,
+      dshHome,
+      extraArgs: ['--p2p-port', String(port)],
+      // The flag must win over the environment. `0` is a usage error in its own right, so if the
+      // environment were consulted anyway this agent would never pair and the case would fail loudly
+      // rather than pass for the wrong reason.
+      env: { W2M_P2P_PORT: '0' },
+    });
+
+    const nodeLine = await waitForLog(agent, /p2p: auto node on 0\.0\.0\.0:\d+/);
+    assert.match(
+      nodeLine,
+      new RegExp(`node on 0\\.0\\.0\\.0:${port}\\b`),
+      `the node must bind the pinned port, not an ephemeral one: ${nodeLine}`,
+    );
+    // A datagram at the pinned port must not take the agent down -- anyone can send one, and that is
+    // the property the accept loop exists for. It also proves something is really bound there.
+    await sendUdp(port, Buffer.from([0, 1, 2, 3]));
+    await new Promise((resolve) => {
+      setTimeout(resolve, 300);
+    });
+    assert.equal(agent.proc.exitCode, null, 'a pinned port must not stop the agent');
+    agent.proc.kill('SIGKILL');
+  });
+
+  it('refuses an unusable --p2p-port or W2M_P2P_PORT as a usage error naming the setting', async () => {
+    // `--rabbit` is deliberately valid so the *port* is what refuses the run: the check happens
+    // before any identity is created or any network is touched, so no relay is needed here.
+    for (const bad of ['0', '65536', 'abc']) {
+      const flagged = await runCli(['--rabbit', 'http://127.0.0.1:1', '--p2p-port', bad]);
+      assert.equal(flagged.code, 2, `--p2p-port ${bad} must be a usage error: ${flagged.stderr}`);
+      assert.match(flagged.stderr, /--p2p-port/, 'the message must name the flag');
+    }
+
+    const fromEnv = await runCli(['--rabbit', 'http://127.0.0.1:1'], { W2M_P2P_PORT: '65536' });
+    assert.equal(fromEnv.code, 2, `W2M_P2P_PORT=65536 must be a usage error: ${fromEnv.stderr}`);
+    assert.match(fromEnv.stderr, /W2M_P2P_PORT/, 'the message must name the environment variable');
+
+    const fromEnvZero = await runCli(['--rabbit', 'http://127.0.0.1:1'], { W2M_P2P_PORT: '0' });
+    assert.equal(fromEnvZero.code, 2, '0 is refused by name rather than read as "ephemeral"');
+    assert.match(fromEnvZero.stderr, /P2P_PORT_ZERO/);
   });
 
   it('the relay binds only the loopback address it was given', async () => {    const stateDir = mkdtempSync(join(tmpdir(), 'w2m-oo-relay2-'));

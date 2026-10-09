@@ -710,6 +710,74 @@ describe('argument gating', () => {
     }
   });
 
+  it('allows a multi-token entry to match the argv it describes, exactly like the agent', async () => {
+    // The defect this pins: the pre-flight compared `argv[0]` -- a basename -- against each entry as
+    // a whole string, so `'git rev-parse'` could never match `['git','rev-parse','HEAD']`. It was
+    // *stricter* than the agent's own gate, and the dispatch simply never happened.
+    const fetchStub = installFetch([{ method: 'POST', path: '/v1/task', body: { task_id: '01J', leases: [], seq: 1 } }]);
+    try {
+      const { tools } = await register({
+        rabbitUrl: RABBIT,
+        stateDir: await makeStateDir(PAIRED_DEVICE),
+        allowedCommands: ['git rev-parse'],
+        projectDir: await makeNonRepoDir(),
+        operatorToken: OPERATOR_TOKEN,
+      });
+
+      const allowed = JSON.parse(
+        await tools.get('w2m_run').execute(runArgs({ command_argv: ['git', 'rev-parse', 'HEAD'] }), {}),
+      );
+      assert.equal(
+        allowed.ok,
+        true,
+        `the command the agent would run must be dispatched: ${JSON.stringify(allowed)}`,
+      );
+      assert.equal(fetchStub.calls.length, 1, 'it must reach the Rabbit');
+
+      const refused = JSON.parse(
+        await tools.get('w2m_run').execute(runArgs({ command_argv: ['git', 'push'] }), {}),
+      );
+      assert.equal(refused.ok, false);
+      assert.equal(refused.state, 'refused');
+      assert.equal(refused.refusal_reason, 'COMMAND_NOT_ALLOWED');
+      assert.deepEqual(refused.allowed, ['git rev-parse'], 'the entries are listed as written');
+      assert.match(refused.message, /git push/, 'the message names the refused command');
+      assert.match(refused.message, /git rev-parse/, 'and the configured entries');
+      assert.equal(fetchStub.calls.length, 1, 'a refused command must not reach the Rabbit');
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('allows a multi-token entry over a longer argv, and refuses a different one', async () => {
+    const fetchStub = installFetch([{ method: 'POST', path: '/v1/task', body: { task_id: '01J', leases: [], seq: 1 } }]);
+    try {
+      const { tools } = await register({
+        rabbitUrl: RABBIT,
+        stateDir: await makeStateDir(PAIRED_DEVICE),
+        allowedCommands: ['node --test'],
+        projectDir: await makeNonRepoDir(),
+        operatorToken: OPERATOR_TOKEN,
+      });
+
+      const allowed = JSON.parse(
+        await tools.get('w2m_run').execute(runArgs({ command_argv: ['node', '--test', '--reporter=tap'] }), {}),
+      );
+      assert.equal(allowed.ok, true, `a longer argv must match the prefix: ${JSON.stringify(allowed)}`);
+      assert.equal(fetchStub.calls.length, 1);
+
+      const refused = JSON.parse(
+        await tools.get('w2m_run').execute(runArgs({ command_argv: ['node', '-e', '1'] }), {}),
+      );
+      assert.equal(refused.ok, false);
+      assert.equal(refused.refusal_reason, 'COMMAND_NOT_ALLOWED');
+      assert.deepEqual(refused.allowed, ['node --test']);
+      assert.equal(fetchStub.calls.length, 1, 'a different flag must not be waved through');
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
   it('accepts a configured command regardless of .exe suffix and path', async () => {
     const fetchStub = installFetch([{ method: 'POST', path: '/v1/task', body: { task_id: '01J', leases: [], seq: 1 } }]);
     try {
@@ -736,6 +804,22 @@ describe('argument gating', () => {
       const value = JSON.parse(await tools.get('w2m_run').execute(runArgs({ command_argv: ['echo', 'hi'] }), {}));
       assert.equal(value.ok, true);
       assert.equal(fetchStub.calls.length, 1);
+
+      // "Unset" and "an explicit empty list" are the same statement here, and neither is the
+      // plugin's to enforce: the machine that runs the command owns that gate, and it refuses with
+      // its own `COMMAND_NOT_ALLOWED` if its list is empty.
+      const { tools: emptyListTools } = await register({
+        rabbitUrl: RABBIT,
+        stateDir: await makeStateDir(PAIRED_DEVICE),
+        projectDir: nonRepo,
+        allowedCommands: [],
+        operatorToken: OPERATOR_TOKEN,
+      });
+      const empty = JSON.parse(
+        await emptyListTools.get('w2m_run').execute(runArgs({ command_argv: ['rm', '-rf', '/'] }), {}),
+      );
+      assert.equal(empty.ok, true, 'an empty list must not be read as "refuse everything" here');
+      assert.equal(fetchStub.calls.length, 2);
     } finally {
       fetchStub.restore();
     }

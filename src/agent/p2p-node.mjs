@@ -119,6 +119,69 @@ export function normalizeP2PMode(value) {
 }
 
 /**
+ * Validate a **fixed** local UDP port for the punch socket.
+ *
+ * The node binds an ephemeral port by default, and that is the right default for a machine that
+ * only ever *dials*: nothing has to reach it, so nothing has to be predictable. It is the wrong
+ * one for a machine that must **accept** a punch through a firewall, because the port changes on
+ * every restart and the `ufw allow <port>/udp` rule has to be re-pointed each time; until it is,
+ * every dispatch falls back to the relay. This helper is how a caller states a stable port, and
+ * both the CLI and the agent go through it so the two cannot disagree about what is legal.
+ *
+ * `null`/`undefined` means "an ephemeral port" and is the default. A numeric string is accepted
+ * (an environment variable arrives as one) but anything non-canonical -- `'0x10'`, `'1e3'`,
+ * `'abc'`, `''` -- is refused rather than coerced, because `Number()` would happily turn two of
+ * those into a port nobody wrote.
+ *
+ * `0` is refused on purpose even though {@link P2PNode}'s own `bindPort` accepts it as
+ * "ephemeral": an operator who *writes* `0` is asking for a fixed port and would silently get a
+ * random one, which is exactly the failure this setting exists to remove.
+ *
+ * @param {unknown} value
+ * @returns {{ok:true, port:number|null}|{ok:false, reason:string}} `reason` always begins with a
+ *   `P2P_PORT_*` code followed by `: ` and a message naming the offending value.
+ */
+export function normalizeP2PPort(value) {
+  if (value === undefined || value === null) return { ok: true, port: null };
+
+  let candidate = value;
+  if (typeof candidate === 'string') {
+    const text = candidate.trim();
+    if (text === '') {
+      return {
+        ok: false,
+        reason: 'P2P_PORT_EMPTY: the port is an empty string (omit the setting for an ephemeral port)',
+      };
+    }
+    if (!/^\d+$/.test(text)) {
+      return {
+        ok: false,
+        reason: `P2P_PORT_NOT_AN_INTEGER: ${JSON.stringify(candidate)} is not an integer in 1..65535 (omit the setting for an ephemeral port)`,
+      };
+    }
+    candidate = Number(text);
+  }
+
+  if (typeof candidate !== 'number' || !Number.isInteger(candidate)) {
+    return {
+      ok: false,
+      reason: `P2P_PORT_NOT_AN_INTEGER: ${String(value)} is not an integer in 1..65535 (omit the setting for an ephemeral port)`,
+    };
+  }
+  if (candidate === 0) {
+    return {
+      ok: false,
+      reason:
+        'P2P_PORT_ZERO: 0 selects an ephemeral port, which changes on every restart and has to be re-allowed through the firewall; give a fixed port in 1..65535, or omit the setting',
+    };
+  }
+  if (candidate < 1 || candidate > 65535) {
+    return { ok: false, reason: `P2P_PORT_OUT_OF_RANGE: ${candidate} is not in 1..65535` };
+  }
+  return { ok: true, port: candidate };
+}
+
+/**
  * The one server every W2M machine can rendezvous through.
  *
  * It hosts the relay, a STUN server and a reverse proxy on the same host, which is why
@@ -338,6 +401,19 @@ export class P2PNode extends EventEmitter {
    * @param {(options?:object)=>Promise<{socket:object, local:{address:string,port:number}}>} [options.bindUdpSocket]
    *   Socket binder; defaults to `bindUdpSocket` from `./stun.mjs`. Injectable so a
    *   test can count binds — the assertion behind "`relay` binds no socket at all".
+   *   It is called with `{address, port}` taken from `bindAddress` and `bindPort`
+   *   below, so a caller can state the exact local endpoint.
+   * @param {string} [options.bindAddress] Local address the punch socket binds,
+   *   default `'0.0.0.0'` (every interface). A machine that must accept a punch from a
+   *   peer on one network can narrow this, and the wildcard default is what makes the
+   *   socket reachable on whichever interface the punch arrives at.
+   * @param {number} [options.bindPort] Local UDP port the punch socket binds,
+   *   `0` (default) meaning an ephemeral port. A **stable** port is what lets a
+   *   firewall rule survive a restart: with an ephemeral port the operator has to
+   *   re-allow the new port after every start, and until that is done every dispatch
+   *   falls back to the relay. Must be an integer in `0..65535`; `0` is the only
+   *   spelling that means "let the OS choose". Note that a port already in use makes
+   *   `start()` return a `P2P_BIND_FAILED`, which is reported and never fatal.
    */
   constructor(options = {}) {
     super();
@@ -353,6 +429,8 @@ export class P2PNode extends EventEmitter {
       nowMs = () => Date.now(),
       discover = discoverReflexiveDefault,
       bindUdpSocket = bindUdpSocketDefault,
+      bindAddress = '0.0.0.0',
+      bindPort = 0,
     } = options;
 
     const normalized = normalizeP2PMode(mode);
@@ -383,6 +461,22 @@ export class P2PNode extends EventEmitter {
     this.nowMs = nowMs;
     this.discover = discover;
     this.bindUdpSocket = bindUdpSocket;
+
+    // The local endpoint is validated here rather than left to `dgram`, for the same reason the
+    // mode is: a caller that wrote a nonsense address or a port outside the range has a bug at the
+    // call site, and `socket.bind()` would report it as an opaque `EINVAL` twenty seconds later.
+    if (typeof bindAddress !== 'string' || bindAddress.trim() === '') {
+      throw new TypeError('P2PNode: bindAddress must be a non-empty local address string');
+    }
+    if (!Number.isInteger(bindPort) || bindPort < 0 || bindPort > 65535) {
+      throw new TypeError(
+        `P2PNode: bindPort must be an integer in 0..65535 (0 means an ephemeral port), got ${JSON.stringify(bindPort)}`,
+      );
+    }
+    /** @type {string} Local address passed to the binder. */
+    this.bindAddress = bindAddress;
+    /** @type {number} Local port passed to the binder; 0 means an ephemeral one. */
+    this.bindPort = bindPort;
 
     const unknownTuning = Object.keys(tuning).filter((key) => !TUNING_KEYS.includes(key));
     if (unknownTuning.length > 0) {
@@ -559,7 +653,9 @@ export class P2PNode extends EventEmitter {
     const generation = this.generation;
     let bound;
     try {
-      bound = await this.bindUdpSocket();
+      // The documented endpoint: `{address: '0.0.0.0', port: 0}` unless the caller stated a port
+      // (and/or an address), which is what lets a firewall rule outlive a restart.
+      bound = await this.bindUdpSocket({ address: this.bindAddress, port: this.bindPort });
     } catch (error) {
       const reason = `P2P_BIND_FAILED: ${messageOf(error)}`;
       this.reportError(reason);
@@ -1058,9 +1154,9 @@ export class P2PNode extends EventEmitter {
    * Restartability is a choice, not an accident: the alternative (a permanent tombstone)
    * would force a caller that wants to reconnect to build a second node and re-wire
    * every listener, and would leave `start()` failing for a reason the caller cannot
-   * act on. A restarted node binds a *new* socket on a *new* ephemeral port — the old
-   * mapping is gone with the old port, which is why the announcement is reset too rather
-   * than left to look live.
+   * act on. A restarted node binds a *new* socket — on a new ephemeral port, unless `bindPort`
+   * pinned one — and the old mapping is gone with the old socket, which is why the announcement is
+   * reset too rather than left to look live.
    *
    * @returns {Promise<void>}
    */
