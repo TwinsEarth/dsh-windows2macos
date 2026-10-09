@@ -308,4 +308,20 @@ import('@twinsearth/w2m-dsh-plugin')  ->  Object.keys() === []   typeof apply ==
 
 **挂载完全正常、但对任何检查包的人来说这个包是空的。** 现在根入口 `re-export` `apply`/`inject`（实现仍只有一份，在 `tools.js`），并加测试锁住；实测打包产物根入口 `exports: apply,inject,resetDefineToolCacheForTests`。挂载行为未变 —— patch 仍指名子路径，这正是不让八个工具被注册两次的原因。
 
+### 收录是既成事实，而且早就是 Verified
+
+查站点时发现：**插件已被收录，且状态就是 `Verified`** —— [dsh-plugin.org/plugins/twinsearth/dsh-windows2macos](https://dsh-plugin.org/plugins/twinsearth/dsh-windows2macos)，Workflow & Automation，收录日期 2026-10-08。它是通过 `dsh-plugin` topic **自动发现 + 人工核验**的，我们没有申请过任何东西。
+
+所以"提交已验证"这件事的真实缺口不是状态，而是**页面数据过期**：站点快照还写着 v0.3.8、安装命令是它自己推导的 `github:twinsearth/dsh-windows2macos`（我们的 README 现在主推 npm 形式）。issue #141 就是触发重扫的信号，同时把版本、安装命令与披露一并更新过去。
+
+v0.4.8 把官方徽章加进 README（链接指向真实页面 URL，不是猜的 slug），并进入 npm 包内 —— 保持"仓库 README = 已发布 tarball 内 README"这条一直守着的规矩。
+
+### npm 的下一步（0.4.8 尚未上 npm）
+
+| 现状 | 说明 |
+|---|---|
+| npm `latest` = **0.4.7** | 已可安装、已实测 |
+| 0.4.8 未上 npm | Release #26 的 `publish to npm` 作业**失败但不阻塞** —— 设计如此：既无 trusted publisher 也无 `NPM_TOKEN` 时它会尝试 OIDC 后失败，release 仍为绿 |
+| 方案 A（推荐，一次配置永久生效） | 在 npmjs.com 该包设置里加 **Trusted Publisher → GitHub Actions → repo `TwinsEarth/dsh-windows2macos` / workflow `release.yml`**；之后重跑失败的作业或再发一版，**无需任何 token 或验证码**，且自动带 provenance |
+| 方案 B（30 秒） | 再给一个 6 位 2FA 验证码，我用 `npm publish … --otp=` 直接把 0.4.8 发上去 |
 核验 issue 里还附了**可核对的事实**而非形容词：两机 `consistent` 的真实输出、`transport: p2p` 与回落时的 `P2P_NO_CANDIDATES` 理由、CI 三平台矩阵、`disclosure` 字段、以及那条容易被误解的边界（**它不会向对端机器的模型会话注入提示词**）。
