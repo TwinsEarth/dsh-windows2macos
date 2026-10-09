@@ -985,17 +985,27 @@ describe('capability probing', () => {
  */
 describe('executable resolution (probe and executor share one search order)', () => {
   let root;
+  let pathDir;
   before(() => {
     root = mkdtempSync(join(tmpdir(), 'w2m-resolve-'));
+    pathDir = join(root, 'on-path');
     const binDir = join(root, 'node', 'bin');
     mkdirSync(binDir, { recursive: true });
-    const fake = join(binDir, 'w2m-fake-tool');
-    writeFileSync(fake, '#!/bin/sh\necho resolved-ok\n');
-    chmodSync(fake, 0o755);
+    mkdirSync(pathDir, { recursive: true });
+    // The SAME name in both places, so "which one won" is the only question. The
+    // first version of this block asserted against a real `/bin/sh`, which is a
+    // POSIX-only assumption: Windows splits PATH on `;` rather than `:`, and has no
+    // `/bin/sh` at all. CI caught it on windows-latest, which is the whole reason
+    // the matrix exists.
+    for (const dir of [binDir, pathDir]) {
+      const tool = join(dir, 'w2m-fake-tool');
+      writeFileSync(tool, '#!/bin/sh\necho resolved-ok\n');
+      chmodSync(tool, 0o755);
+    }
   });
   after(() => rmSync(root, { recursive: true, force: true }));
 
-  const env = () => ({ PATH: '', DSH_RUNTIME_DEPS: root });
+  const env = (extra = {}) => ({ PATH: '', DSH_RUNTIME_DEPS: root, ...extra });
 
   it('finds a bundled tool that PATH does not have', () => {
     assert.equal(findExecutable('w2m-fake-tool', { env: env() }), null);
@@ -1006,9 +1016,10 @@ describe('executable resolution (probe and executor share one search order)', ()
   });
 
   it('keeps PATH ahead of the bundled runtime', () => {
-    // `sh` is on PATH everywhere this suite runs; if the bundle won, this would change.
-    const resolved = resolveCommand('sh', { env: { ...env(), PATH: '/bin:/usr/bin' } });
-    assert.equal(resolved, '/bin/sh');
+    // Same name in both trees; PATH must win. Expressed with a directory that
+    // exists on every platform rather than with a hard-coded `/bin:/usr/bin`.
+    const resolved = resolveCommand('w2m-fake-tool', { env: env({ PATH: pathDir }) });
+    assert.equal(resolved, join(pathDir, 'w2m-fake-tool'));
   });
 
   it('leaves an unfindable name alone so the honest ENOENT survives', () => {
@@ -1020,12 +1031,25 @@ describe('executable resolution (probe and executor share one search order)', ()
     assert.equal(resolveCommand('./relative-tool'), './relative-tool');
   });
 
-  it('starts a bundled-only tool from runArgv even when PATH cannot see it', async () => {
-    const result = await runArgv(['w2m-fake-tool'], { env: env() });
-    assert.equal(result.spawn_error, null);
-    assert.equal(result.exit_code, 0);
-    assert.match(result.stdout.toString('utf8'), /resolved-ok/);
-  });
+  // POSIX only, and named as such. A shell script is not a Windows executable:
+  // `CreateProcess` needs a real PE image, and fabricating one as a test fixture is
+  // out of proportion. The resolution case above is the cross-platform half of the
+  // same defect, and this half proves `runArgv` actually consults the resolver.
+  it(
+    'starts a bundled-only tool from runArgv even when PATH cannot see it',
+    {
+      skip:
+        process.platform === 'win32'
+          ? 'a POSIX shell script is not a Windows executable; see the resolution case above'
+          : false,
+    },
+    async () => {
+      const result = await runArgv(['w2m-fake-tool'], { env: env() });
+      assert.equal(result.spawn_error, null);
+      assert.equal(result.exit_code, 0);
+      assert.match(result.stdout.toString('utf8'), /resolved-ok/);
+    },
+  );
 
   it('still reports a spawn failure, unchanged, for a command that exists nowhere', async () => {
     const result = await runArgv(['w2m-truly-missing'], { env: env() });
