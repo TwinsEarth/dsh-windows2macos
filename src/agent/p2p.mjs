@@ -99,8 +99,6 @@ function parseFrame(datagram) {
   return { kind, session, body: datagram.subarray(HEADER_BYTES) };
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
 // ---------------------------------------------------------------------------------------------
 // Punching
 // ---------------------------------------------------------------------------------------------

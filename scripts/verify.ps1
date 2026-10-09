@@ -32,7 +32,10 @@ Write-Host "node: $node"
 & $node -v
 Write-Host ''
 
-$all = @('relay', 'agent', 'tools', 'schedule', 'auto-update', 'update-source', 'update-install', 'update-wiring', 'signing', 'e2e')
+# Kept in step with the explicit list in .github/workflows/ci.yml. A suite that is
+# not named here is silently not run, which is how four suites (166 cases) once
+# shipped without ever executing in CI.
+$all = @('relay', 'broadcast', 'agent', 'tools', 'schedule', 'auto-update', 'update-source', 'update-install', 'update-wiring', 'signing', 'stress', 'metrics', 'metrics-route', 'shared-config', 'tool-cards', 'p2p-stun', 'p2p-transport', 'p2p-signaling', 'e2e', 'crossnetwork', 'signing-e2e', 'outbound-only', 'recovery', 'pipeline-e2e')
 $selected = if ($Suites -and $Suites.Count -gt 0) { $Suites } else { $all }
 
 $results = [ordered]@{}

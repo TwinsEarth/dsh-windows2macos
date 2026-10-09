@@ -8,7 +8,7 @@
  * two hosts behind two different NATs; a punch across loopback has no NAT to cross.
  */
 
-import { describe, it, before, after } from 'node:test';
+import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import dgram from 'node:dgram';
 
@@ -273,7 +273,7 @@ describe('p2p: reliable channel', () => {
   });
 
   it('rejects a message larger than the ceiling instead of allocating it', async () => {
-    const { ca, cb, close } = await connectedPair();
+    const { ca, close } = await connectedPair();
     try {
       await assert.rejects(
         () => ca.send(Buffer.alloc(MAX_MESSAGE_BYTES + 1)),
@@ -304,7 +304,7 @@ describe('p2p: reliable channel', () => {
   });
 
   it('rejects in-flight sends when the channel closes', async () => {
-    const { ca, cb, close } = await connectedPair({ rtoMs: 5000, maxAttempts: 50 });
+    const { ca, close } = await connectedPair({ rtoMs: 5000, maxAttempts: 50 });
     try {
       const pending = ca.send(Buffer.alloc(64 * 1024, 7));
       ca.close('test-close');

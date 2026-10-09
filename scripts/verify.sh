@@ -28,7 +28,10 @@ echo "node: ${node_bin}"
 "${node_bin}" -v
 echo
 
-all_suites=(relay agent tools schedule auto-update update-source update-install update-wiring signing e2e)
+# Kept in step with the explicit list in .github/workflows/ci.yml. A suite that is
+# not named here is silently not run, which is how four suites (166 cases) once
+# shipped without ever executing in CI.
+all_suites=(relay broadcast agent tools schedule auto-update update-source update-install update-wiring signing stress metrics metrics-route shared-config tool-cards p2p-stun p2p-transport p2p-signaling e2e crossnetwork signing-e2e outbound-only recovery pipeline-e2e)
 if [[ $# -gt 0 ]]; then
   suites=("$@")
 else

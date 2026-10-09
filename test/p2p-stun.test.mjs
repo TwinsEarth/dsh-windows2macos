@@ -307,9 +307,12 @@ describe('stun: against real public servers', () => {
       assert.match(result.reflexive.address, /^\d+\.\d+\.\d+\.\d+$/);
       assert.ok(result.reflexive.port > 0 && result.reflexive.port <= 65535);
       assert.ok(['none', 'endpoint-independent', 'endpoint-dependent', 'unknown'].includes(result.mapping));
-      console.log(
+      // `process.stdout.write`, not `console.log`: the lint config bans console
+      // statements outright, and this project's convention for informational output
+      // is stdout directly (see scripts/verify-installed.mjs).
+      process.stdout.write(
         `      live: local ${local.port} -> reflexive ${result.reflexive.address}:${result.reflexive.port} ` +
-          `mapping=${result.mapping}`,
+          `mapping=${result.mapping}\n`,
       );
     } finally {
       socket.close();
