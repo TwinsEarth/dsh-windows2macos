@@ -3557,12 +3557,17 @@ export async function apply(ctx, config = {}) {
     output: jsonOutput,
     execute: async (args) => {
       const action = typeof args?.action === 'string' && args.action !== '' ? args.action : 'status';
+      // A STRING, like every other tool here. Measured: the first version returned the plain object
+      // and the host rejected the call outright -- `tool "w2m_update" returned invalid output:
+      // "value" must be a string` -- so this tool could never be used at all, in v0.4.0 or v0.4.1.
+      // `jsonOutput` is a renderer, not a serialiser; the tool still owns turning its value into
+      // text.
       if (action === 'status') {
-        return { ok: true, action, update: updater.describe() };
+        return JSON.stringify({ ok: true, action, update: updater.describe() }, null, 2);
       }
       const result = await updater.check('manual');
       // `ok:false` inside `result` means "the check could not complete", never "the tool failed".
-      return { ok: true, action, result, update: updater.describe() };
+      return JSON.stringify({ ok: true, action, result, update: updater.describe() }, null, 2);
     },
     // `kind: 'other'` for the actions that can install, never `'read'`. This tool mutates the profile
     // it runs in, and labelling that a read is a false claim in exactly the place a user looks to

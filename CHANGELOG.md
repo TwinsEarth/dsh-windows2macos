@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] — 2026-10-09
+
+### Fixed
+
+* **`w2m_update` could never be called.** Its `execute` returned the plain object
+  `{ ok, action, update }` while the host requires a **string** from a tool, so every
+  call was rejected before it ran:
+
+      tool "w2m_update" returned invalid output: "value" must be a string
+
+  `output: jsonOutput` is a renderer, not a serialiser — the tool still owns turning its
+  value into text, which is what the other seven do. It now returns
+  `JSON.stringify(value, null, 2)` on both branches. Broken in v0.4.0 and v0.4.1, found
+  by actually calling the tool rather than by reading it.
+
+### Added
+
+* **One test that makes the whole class impossible to repeat**: it calls all eight tools
+  (including both `w2m_update` actions, with the updater's network lookup stubbed to
+  fail so nothing installs) and asserts every result is a string that parses as JSON.
+  `test/tools.test.mjs`: 82 pass, 0 fail.
+
 ## [0.4.1] — 2026-10-09
 
 Two defects that v0.4.0 shipped, both found by using it against a live two-machine

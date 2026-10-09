@@ -1,6 +1,6 @@
 {
   "name": "@twinsearth/w2m-dsh-plugin",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "DSH: Windows2MacOS \u2014 drive the same project on online Windows and macOS machines from one DeepSeek account, across networks and regions. P2P hole punching is the default path (relay + shared server as rendezvous, ledger and fallback), with a bundled STUN responder, Tailscale/public-VPS/tunnel shapes, Rabbit relay + per-machine Localside + eight DSH tools (replicate / split), nine aggregate verdicts and signed requests.",
   "type": "module",
   "main": "lib/index.js",

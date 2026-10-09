@@ -281,6 +281,50 @@ describe('registration shape', () => {
     }
   });
 
+  it('every tool returns a STRING, because that is what the host accepts', async () => {
+    // Measured against the DSH host: a tool returning a plain object is rejected with
+    // `returned invalid output: "value" must be a string`, so `w2m_update` was unusable in v0.4.0 and
+    // v0.4.1 for exactly this reason. `output: jsonOutput` is a renderer, not a serialiser -- the
+    // tool still owns producing text. This asserts the contract for all eight, so the next tool
+    // cannot repeat it.
+    const fetchStub = installFetch([
+      { path: '/healthz', body: { ok: true, protocol_version: 1 } },
+      { path: '/v1/devices', body: { protocol_version: 1, devices: [] } },
+      { path: '/v1/tasks', body: { protocol_version: 1, tasks: [] } },
+      { path: '/v1/tasks/01J', body: taskResponse({ status: 'consistent', machines: [] }) },
+      { path: '/v1/tasks/01J/report', text: '# report', contentType: 'text/markdown' },
+      { method: 'POST', path: '/v1/task', body: { task_id: '01J', leases: [], seq: 1 } },
+      // The updater's network lookup: refuse it, so `check` records an error instead of installing
+      // anything -- and still returns a string, which is the point.
+      { path: '/repos/TwinsEarth/dsh-windows2macos/releases/latest', status: 500, body: { message: 'stubbed' } },
+    ]);
+    try {
+      const { tools } = await register({
+        rabbitUrl: RABBIT,
+        stateDir: await makeStateDir(PAIRED_DEVICE),
+        operatorToken: OPERATOR_TOKEN,
+      });
+      const calls = [
+        ['w2m_devices', {}],
+        ['w2m_history', {}],
+        ['w2m_stats', {}],
+        ['w2m_status', {}],
+        ['w2m_run', runArgs()],
+        ['w2m_wait', { task_id: '01J', wait_ms: 50 }],
+        ['w2m_report', { task_id: '01J' }],
+        ['w2m_update', {}],
+        ['w2m_update', { action: 'status' }],
+      ];
+      for (const [name, args] of calls) {
+        const value = await tools.get(name).execute(args, {});
+        assert.equal(typeof value, 'string', `${name} must return a string, not ${typeof value}`);
+        assert.doesNotThrow(() => JSON.parse(value), `${name} must return JSON text`);
+      }
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
   it('declares only types, required flags, and defaults the shim can check', async () => {
     const { tools } = await register({ rabbitUrl: RABBIT });
     for (const [name, tool] of tools) {
