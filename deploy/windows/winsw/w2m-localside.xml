@@ -1,0 +1,50 @@
+<!--
+  WinSW service definition for the W2M Localside agent.
+
+  This file is a TEMPLATE. Replace the two @PLACEHOLDERS@, then -- from an elevated shell:
+
+      w2m-localside.exe install
+      w2m-localside.exe start
+
+  WHY IT RUNS THE SUPERVISOR AND NOT THE AGENT
+
+  A service manager restarts a process that exits; it cannot see anything about *why*, and a
+  process that dies with its console (0xC000013A -- measured twice on this project) leaves no
+  trace at all. The supervisor owns the child, respawns it with a capped backoff, and writes one
+  line per run to the log file below, so "the agent is not running" always has a preceding line
+  that says what happened.
+
+  WHY THE PORT IS PINNED
+
+  With `--p2p-port`, one inbound firewall rule survives every restart. Without it the node binds
+  an ephemeral port, the rule goes stale silently, and every task falls back to the relay with
+  `offer_path: "relay"` in the ledger.
+-->
+<service>
+  <id>w2mlocalside</id>
+  <name>W2M Localside agent</name>
+  <description>Runs the same project on this machine on behalf of a W2M fleet: relay stream plus a UDP punch socket. Executes only argv prefixes allowed by its allow-list.</description>
+
+  <executable>C:\Program Files\nodejs\node.exe</executable>
+  <!--
+    The allow-list is NOT on this command line. Task Scheduler and services both mangle a JSON
+    argument (measured: `--allowed-commands "[\\"node --version\\"]"` came back as
+    `"[node --version]"`, escapes gone, agent exiting 2 with ALLOWED_COMMANDS_INVALID). It lives in
+    agent.json, which install-service.ps1 writes and this command line merely points at.
+  -->
+  <arguments>@REPO@\deploy\windows\w2m-agent-supervisor.mjs --config "%USERPROFILE%\.dsh\w2m\agent.json"</arguments>
+  <workingdirectory>@REPO@\deploy\windows</workingdirectory>
+
+  <startmode>Automatic</startmode>
+  <delayedAutoStart>true</delayedAutoStart>
+  <onfailure action="restart" delay="60 sec" />
+  <resetfailure>1 hour</resetfailure>
+
+  <!-- The supervisor already logs; these two keep the wrapper's own output for the case where the
+       supervisor cannot start at all (a missing plugin, a wrong path). -->
+  <log mode="roll-by-size">
+    <logpath>%USERPROFILE%\.dsh\w2m</logpath>
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>4</keepFiles>
+  </log>
+</service>

@@ -4,6 +4,45 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.4] — 2026-10-09
+
+### Added
+
+* **`deploy/windows/` — the agent as a Windows service.** `install-service.ps1` registers one task
+  (`-AtStartup` + `-AtLogOn`, `LogonType S4U`) that runs a new
+  **`w2m-agent-supervisor.mjs`**: the agent runs in session 0 with no console, survives sign-out,
+  and the supervisor respawns it with a capped backoff and logs one line per run. `-Interactive`
+  registers the same thing without elevation (sign-in only). `winsw/w2m-localside.xml` is the
+  template for a real SCM service if you need an entry in `services.msc` — that path puts a
+  third-party binary on the machine as the service host, which is your decision and not the
+  project's, so it is documented rather than scripted.
+
+### Fixed
+
+* **Three defects in the service path, all found by running it rather than reading it.**
+  1. A JSON argument does not survive being passed to a task: `--allowed-commands
+     "[\"node --version\"]"` came back stored as `"[node --version]"`, the agent read `[node` and
+     exited 2 with `ALLOWED_COMMANDS_INVALID`. That is the third layer to eat those quotes
+     (`cmd`, PowerShell 5.1, Task Scheduler), so the allow-list now lives in
+     `%USERPROFILE%\.dsh\w2m\agent.json` and the command line only carries `--config <path>`.
+  2. `-AgentArgs '--p2p-mode','auto'` through `powershell -File` arrived as the single token
+     `--p2p-mode,auto` (`ERR_PARSE_ARGS_UNKNOWN_OPTION`); it is now one string, split on commas and
+     whitespace.
+  3. PowerShell 5.1's `Set-Content -Encoding utf8` writes a **BOM**, `JSON.parse` refuses it, and
+     the supervisor exited 78 *before opening its log* — a failure with no trace at all. The
+     installer writes without a BOM; the supervisor strips one if present, because the file is
+     meant to be hand-edited and Notepad writes them too.
+
+### Notes
+
+* The supervisor also reads the camelCase keys a JSON file wants (`allowedCommands`, `agentArgs`)
+  as well as the kebab-case flags the command line uses. The first version looked only for the
+  kebab key in the file, so a correct config silently fell back to the default four-entry
+  allow-list — silent, because a missing key is not an error.
+* Verified after installing through the script: the task reports `Running`, the agent logs the full
+  nine-entry allow-list, `stream ready` arrives, and a real fleet dispatch finishes `consistent`
+  on both machines.
+
 ## [0.4.3] — 2026-10-09
 
 Documentation and metadata only — no source change, and the protocol is untouched. The
