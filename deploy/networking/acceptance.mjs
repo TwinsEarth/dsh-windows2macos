@@ -47,6 +47,7 @@
 //  that synthesised its own punches would prove that the script can punch, which nobody doubts.
 // ============================================================================
 import { headCommit, treeFingerprint } from '../../src/agent/git.mjs';
+import { mintPunchId } from '../../src/agent/p2p.mjs';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -160,12 +161,24 @@ function localIdentity() {
   }
 }
 
-/** One machine's recorded path, read as a rung of the ladder. */
+/**
+ * One machine's recorded path, read as a rung of the ladder.
+ *
+ * `opened_by` is the precise answer when the build provides it: it names which mechanism opened the
+ * channel (`dispatcher-punch`, `simultaneous-punch`, `result-reverse-dial`). Without it, `transport`
+ * plus `offer_path` still separate "the result found its own way back" (rung 3) from "the relay
+ * carried everything" (rung 5) -- that is why the two halves are recorded separately and why this
+ * script never reads `transport` alone.
+ */
 function classify(machine) {
   const transport = machine.transport ?? null;
   const offerPath = machine.p2p?.offer_path ?? null;
-  const reason = machine.p2p?.reason ?? null;
+  const openedBy = machine.p2p?.opened_by ?? null;
+  const reason = machine.p2p?.reverse_dial_reason ?? machine.p2p?.reason ?? null;
   if (machine.outcome === 'ok' && transport === 'p2p') {
+    if (openedBy === 'result-reverse-dial') return { rung: 3, label: 'reverse dial (B)', reason };
+    if (openedBy === 'simultaneous-punch') return { rung: 2, label: 'simultaneous punch (A)', reason };
+    if (openedBy === 'dispatcher-punch') return { rung: 2, label: 'dispatcher punch', reason };
     return {
       rung: offerPath === 'relay' ? 3 : 2,
       label: offerPath === 'relay' ? 'reverse dial (offer by relay, result direct)' : 'direct channel',
@@ -208,7 +221,14 @@ const body = {
   compare_policy: { strip_ansi: true, normalize_crlf: true, strip_trailing_blank_lines: true, redact: [] },
   halt: 'never',
   created_by: identity.name ?? 'acceptance',
-  p2p: { mode: 'auto' },
+  // THE PUNCH FACTS ARE THE WHOLE POINT OF THIS SCRIPT.
+  //
+  // A v0.4.x-style body (`p2p: {mode}`) exercises neither A nor B: the executor only dials back when
+  // the offer actually publishes a punch id (or candidates), so a task without one lands on rung 5 by
+  // construction and would make this script report the old behaviour forever. Measured, by the very
+  // work that added the rungs. `mintPunchId` is imported from the node's own module rather than
+  // re-implemented, so the script mints exactly what a real dispatcher mints.
+  p2p: { mode: 'auto', punch: mintPunchId() },
   ...(identity.machine_id ? { origin_machine_id: identity.machine_id } : {}),
 };
 

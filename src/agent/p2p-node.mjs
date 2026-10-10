@@ -1107,7 +1107,9 @@ export class P2PNode extends EventEmitter {
     const claimedMeanwhile = this.channels.get(session);
     if (claimedMeanwhile !== undefined && claimedMeanwhile !== outcome.channel) {
       try {
-        outcome.channel.close('session-claimed');
+        // Silent: this is a duplicate local view of a live session, not the end of one. A BYE here
+        // would close the peer's channel for the session the survivor is about to use.
+        outcome.channel.close('session-claimed', { silent: true });
       } catch {
         /* the path is already gone */
       }
@@ -1164,7 +1166,9 @@ export class P2PNode extends EventEmitter {
       // still live -- which is the state that lets a peer open a second channel on this session.
       this.channels.delete(details.session);
       try {
-        previous.close('session-replaced');
+        // Silent, for the same reason as the duplicate in `dial()`: the session is not over, it is
+        // being represented by a better channel, and a BYE would close the peer's view of it.
+        previous.close('session-replaced', { silent: true });
       } catch {
         /* the path is already gone; that is the state this replacement produces */
       }

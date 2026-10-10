@@ -349,6 +349,75 @@ describe('v0.4.0 task body: origin_machine_id and p2p reach every offer', () => 
     });
   });
 
+  it('carries the punch facts a reverse dial needs, and every unknown key beside them', async () => {
+    // v0.4.x: the block a dispatcher publishes is how an executor behind a NAT it cannot reach learns
+    // which punch to join and where to dial. The relay's part is to not care about any of it: `p2p` is
+    // an opaque object with a `mode`, so a key this relay has never heard of must survive verbatim
+    // instead of being dropped or refused -- that is what makes the extension safe for a v0.4.x peer,
+    // which ignores keys it does not read.
+    await withRelay(async (relay) => {
+      const a = await pairDevice(relay, 'machine-a');
+      const sse = await openSse(`${relay.url}/v1/stream`, { token: a.token });
+      try {
+        await sse.waitFor((f) => f.event === 'ready');
+        const published = {
+          mode: 'auto',
+          punch: 'a1b2c3d4e5f60718',
+          candidates: [
+            { address: '203.0.113.7', port: 51820 },
+            { address: '192.168.44.7', port: 51820 },
+          ],
+          session: 1_234_567_890,
+          future_key: { ignored: true },
+        };
+        const created = await postTask(
+          relay,
+          taskBody({ origin_machine_id: 'win-cgnat', p2p: published }),
+        );
+        assert.equal(created.status, 200, created.text);
+
+        const stored = relay.state.getTask(created.json.task_id);
+        assert.deepEqual(stored.p2p, published, 'stored verbatim, unknown keys included');
+        assert.deepEqual(stored.origin_machine_id, 'win-cgnat');
+
+        const offer = await sse.waitFor(
+          (f) => f.event === 'task.offer' && f.json?.task_id === created.json.task_id,
+        );
+        assert.deepEqual(offer.json.p2p, published, 'and republished verbatim on the offer');
+      } finally {
+        sse.close();
+      }
+    });
+  });
+
+  it('still refuses a p2p block whose mode is missing or outside the frozen list', async () => {
+    // The extension must not have loosened the one thing the relay does check. Without this, "the
+    // relay passes p2p through" could quietly become "the relay passes anything through".
+    await withRelay(async (relay) => {
+      await pairDevice(relay, 'machine-a');
+      for (const value of [
+        { punch: 'a1b2c3d4e5f60718' },
+        { mode: 'auto-2', punch: 'a1b2c3d4e5f60718' },
+        { mode: 'AUTO' },
+        { mode: null },
+      ]) {
+        const res = await postTask(relay, taskBody({ p2p: value }));
+        assert.equal(res.status, 400, `p2p ${JSON.stringify(value)} must be refused: ${res.text}`);
+        assert.match(res.json.error.message, /p2p/);
+      }
+      // ... while an unknown *extra* key is not its business, and an offer still goes out.
+      const accepted = await postTask(
+        relay,
+        taskBody({ p2p: { mode: 'auto', future_key: 'anything at all' } }),
+      );
+      assert.equal(accepted.status, 200, accepted.text);
+      assert.deepEqual(relay.state.getTask(accepted.json.task_id).p2p, {
+        mode: 'auto',
+        future_key: 'anything at all',
+      });
+    });
+  });
+
   it('keeps both fields on a re-offered offer, so a reconnect sees the same routing facts', async () => {    // The offer is emitted more than once in real life (a stream that was down at dispatch time is
     // re-stated on reconnect). If the fields only existed on the first emission, the direct-push
     // path would work exactly once and then silently stop.

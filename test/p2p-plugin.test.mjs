@@ -463,7 +463,8 @@ function assertP2PBlock(block, mode) {
 }
 
 /** One authenticated call against the relay, in the shape `P2PNode` expects. */
-async function relayFetch(relay, token, method, pathname, body) {  const result = await request(`${relay.url}${pathname}`, { method, token, body });
+async function relayFetch(relay, token, method, pathname, body) {
+  const result = await request(`${relay.url}${pathname}`, { method, token, body });
   return {
     ok: result.status >= 200 && result.status < 300,
     status: result.status,

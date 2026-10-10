@@ -4,6 +4,72 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — 2026-10-10
+
+The release that stops treating "the relay carried it" as the only answer for a machine behind a
+symmetric NAT. Measured before it: a dispatcher behind carrier-grade NAT (an iPhone hotspot, in this
+fleet) could not push an offer to a peer, the peer's result could not come back, and both halves fell
+to the relay on **every** task — `P2P_PUNCH_TIMEOUT` on the push, `transport: relay` on the result.
+
+### Added
+
+* **Simultaneous two-way punch.** The dispatcher publishes its punch in the offer it puts on the relay
+  (`POST /v1/task`'s `p2p`: `{mode, punch, candidates?}`), and the executor — which previously could
+  only wait in `accept()` — **dials the dispatcher back** on the same derived session, concurrently
+  with execution, bounded by the new `tuning.reverseDialTimeoutMs` (default **8000 ms**). Two NATs
+  that each open a mapping toward the other can then meet; one of them no longer has to be dialable.
+* **Reverse dial on the result path.** `planDirectDelivery` dials the dispatcher before falling back
+  to the relay, reusing the offer-time attempt when there was one (one bounded window per task, never
+  two) and starting its own when the channel died in between. This is the direction that works for a
+  symmetric-NAT machine: it dials *out*.
+* **The ladder is now recorded, rung by rung.** `p2p.opened_by` names the mechanism
+  (`dispatcher-punch` | `simultaneous-punch` | `result-reverse-dial`); `p2p.reverse_dial`,
+  `p2p.reverse_dial_ms` and `p2p.reverse_dial_reason` say whether a dial was attempted, what it cost
+  and why it lost (`P2P_REVERSE_DIAL_TIMEOUT`, `P2P_REVERSE_DIAL_FAILED`, `P2P_CHANNEL_LIVE`,
+  `P2P_NO_SESSION`, `P2P_NO_ORIGIN`, `P2P_DISABLED`, `P2P_UNREACHABLE`, `P2P_NO_TASK_ID`). The
+  mechanism is shared with the plugin (`punchSession()` lives in one place, imported, not copied).
+* **`deploy/networking/`** — the ladder written down: five rungs with what the ledger shows for each,
+  `acceptance.mjs` to measure which rung a real dispatch takes (it mints a real punch id, because a
+  body without one exercises neither new path), and `wireguard/server-setup.sh` for rung 4.
+
+### Fixed
+
+* **`P2PChannel.close()` could never send its BYE.** It set `closed = true` and *then* called
+  `sendFrame(BYE, …)`, and `sendFrame` refuses to send once closed — so the goodbye was unreachable
+  dead code. The measured consequence sat exactly on the path this release is about: `pushOffer`
+  closes the channel it pushed over, the executor kept a channel it believed was live, sent its result
+  into it and fell back only after `P2P_FRAGMENT_UNACKED … after 8 attempts` — **with no reverse dial
+  attempted**, because a channel for the task still existed. Change B alone could not have fixed the
+  measured failure; this is the other half. `close(reason, {silent: true})` exists for discarding a
+  duplicate local view of a live session (a simultaneous punch legitimately creates two channel
+  objects on one side, and a BYE there would tear down the peer's working channel).
+
+### Changed
+
+* **`transport` widens.** It is `p2p` when the direct path carried **either** half — the offer over a
+  channel **or** the result acknowledged over one — and `relay` only when the relay carried both.
+  `p2p.offer_path` keeps its exact meaning ("how the offer arrived"), which is what keeps the two
+  halves distinguishable: `transport: p2p` + `offer_path: relay` is a result that found its own way
+  home. Anything reading `transport` alone should read `offer_path`/`opened_by` beside it.
+
+### Compatibility
+
+No protocol version bump: `envelope_version` stays `1.0`, the new keys live inside the optional `p2p`
+object, and `transport`'s value set is unchanged. A v0.4.x relay stores and republishes the extended
+object **verbatim**, and a v0.4.x agent ignores keys it does not know — both are pinned by tests, on
+both sides, rather than argued from intent.
+
+### Verification
+
+* Required suites: **424 tests, 421 pass, 1 fail, 2 skipped** (baseline 407/404/1/2 → +17 new tests,
+  all passing). The failure is the pre-existing bundled-python case.
+* Every other suite: 340 tests, 335 pass, 2 fail (the pre-existing `pipeline-e2e` cases).
+* `eslint .`: 0 errors, the same 79 pre-existing warnings.
+* **Not verified, and it matters:** every punch in the suites is loopback, which crosses no NAT, and
+  no genuine v0.4.x binary was run — compatibility is argued from the relay's validation code plus
+  round-trip tests. Real traversal needs a fleet running this build; that is the next measurement, not
+  a claim in this entry.
+
 ## [0.4.9] — 2026-10-10
 
 ### Fixed

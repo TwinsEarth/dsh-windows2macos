@@ -956,9 +956,12 @@ describe('v0.4.x agent: the executor dials the dispatcher the offer named', () =
       const stored = aggregate.machines.find((m) => m.machine_id === dispatched.machineId);
 
       // The offer really did arrive over the relay — that is the whole premise.
-      assert.equal(stored.transport, 'relay', plain(stored));
-      assert.equal(stored.p2p.offer_path, 'relay');
-      // ... and the result did not.
+      assert.equal(stored.p2p.offer_path, 'relay', plain(stored));
+      // ... and the result did not. `transport` answers "did the direct path carry anything for this
+      // machine", so it is `p2p` even though the offer came off the relay: the two halves stay
+      // separately readable, and a machine whose result found its own way back is not reported as a
+      // machine that fell all the way to the relay.
+      assert.equal(stored.transport, 'p2p', plain(stored));
       assert.equal(stored.p2p.result_path, 'p2p', `the reverse dial must carry the result: ${plain(stored)}`);
       assert.equal(stored.p2p.opened_by, 'simultaneous-punch', 'the mechanism is named, not inferred');
       assert.equal(stored.p2p.reverse_dial, 'p2p');
@@ -987,6 +990,78 @@ describe('v0.4.x agent: the executor dials the dispatcher the offer named', () =
     }
   });
 
+  it('re-dials at result time when the channel the offer arrived on has gone', async () => {
+    // The other half of the measured failure, and the case a successful push creates: the dispatcher
+    // closes the channel it pushed the offer over the moment the frame is sent (`pushOffer`'s
+    // `finally`), so by the time the command has run there is nothing left to answer on. The result
+    // then has to open its own path -- bounded -- or fall back to the relay exactly as before.
+    const { relay } = await startRelay();
+    const repo = makeRepo('result-redial');
+    const marker = join(repo.dir, 'ran.txt');
+    const agent = await makeAgent({ relay, project: repo.dir, stateDir: scratchDir('agent-state') });
+    const dispatcher = await makeDispatcher({ relay, url: relay.url });
+    const channels = [];
+
+    try {
+      startAgentLoop(agent);
+      await waitFor(() => agent.state.p2p.running, { label: 'agent p2p node running' });
+
+      const punch = mintPunchId();
+      const dispatched = await dispatchTask(agent, relay, {
+        // Long enough that the channel is gone before the result exists -- which is the production
+        // order, not a race the test hopes to win.
+        commandArgv: [
+          NODE,
+          '-e',
+          `require('fs').appendFileSync(${JSON.stringify(marker)}, 'x'); setTimeout(() => {}, 600)`,
+          marker,
+        ],
+        baseCommit: repo.commit,
+        originMachineId: dispatcher.machineId,
+        p2p: {
+          mode: 'auto',
+          punch,
+          candidates: dispatcher.node.status.candidates.map((candidate) => ({ ...candidate })),
+        },
+      });
+
+      const results = [];
+      dispatcher.node.on('message', (event) => {
+        const frame = JSON.parse(String(event.payload));
+        results.push(frame);
+        if (frame.type === 'task.result') {
+          void event.channel.send(JSON.stringify({ type: 'result.ack', task_id: frame.task_id }));
+        }
+      });
+
+      const { channel } = await dialAgent(dispatcher, dispatched, channels);
+      await channel.send(JSON.stringify(dispatched.offer));
+      await waitFor(() => countLines(marker) === 1, { label: 'the command to start' });
+      // What the dispatcher does after pushing: one frame, then the channel is closed.
+      channel.close('offer-sent');
+
+      const aggregate = await waitForAggregate(relay, dispatched.taskId, dispatcher.token);
+      const stored = aggregate.machines.find((m) => m.machine_id === dispatched.machineId);
+
+      assert.equal(stored.status, 'ok', plain(stored));
+      assert.equal(stored.p2p.offer_path, 'p2p', 'the offer arrived over the channel');
+      assert.equal(stored.p2p.result_path, 'p2p', `the result found its own way back: ${plain(stored)}`);
+      assert.equal(stored.p2p.opened_by, 'result-reverse-dial', 'and the mechanism is named');
+      assert.equal(stored.p2p.reverse_dial, 'p2p');
+      assert.equal(
+        stored.p2p.session,
+        punchSession({ punch, taskId: dispatched.taskId, machineId: dispatched.machineId }),
+        'the session came from the punch id the offer published',
+      );
+      await waitFor(() => results.some((frame) => frame.type === 'task.result'), {
+        label: 'the result frame on the dispatcher side',
+      });
+      assert.equal(countLines(marker), 1, 'the command ran exactly once');
+    } finally {
+      await teardown({ agent, dispatcher, relay, channels });
+    }
+  });
+
   it('times out, records P2P_REVERSE_DIAL_TIMEOUT, and still delivers over the relay inside the bound', async () => {
     const { relay } = await startRelay();
     const repo = makeRepo('reverse-timeout');
@@ -1004,7 +1079,6 @@ describe('v0.4.x agent: the executor dials the dispatcher the offer named', () =
     try {
       startAgentLoop(agent);
       const punch = mintPunchId();
-      const startedAt = Date.now();
       const dispatched = await dispatchTask(agent, relay, {
         commandArgv: appendCommand(marker),
         baseCommit: repo.commit,
@@ -1013,7 +1087,6 @@ describe('v0.4.x agent: the executor dials the dispatcher the offer named', () =
       });
 
       const aggregate = await waitForAggregate(relay, dispatched.taskId, agent.identity.device_token);
-      const elapsed = Date.now() - startedAt;
       const stored = aggregate.machines.find((m) => m.machine_id === dispatched.machineId);
 
       // Today's behaviour, unchanged: the relay carried the offer and the result.
@@ -1030,10 +1103,20 @@ describe('v0.4.x agent: the executor dials the dispatcher the offer named', () =
       );
       assert.equal(countLines(marker), 1, 'the relay path still ran the command');
 
-      // The bound is real and it is the injected one: the relay's offer grace (~1.2 s) plus a 400 ms
-      // dial cannot approach the production 8 s window, so a suite that ignored the tuning would fail
-      // here rather than pass slowly.
-      assert.ok(elapsed < 6000, `the whole step must stay inside the injected dial window (${elapsed}ms)`);
+      // The bound is real, and this is the measurement rather than a proxy for it: the dial's own
+      // clock, read from the envelope. The injected window is 400 ms; a run that ignored the tuning
+      // and used the production default would report ~8000 here. Wall-clock around the whole dispatch
+      // is deliberately *not* asserted -- the relay's offer grace and the aggregate settling under a
+      // loaded parallel suite are seconds of noise that have nothing to do with this bound.
+      assert.equal(typeof stored.p2p.reverse_dial_ms, 'number', 'the dial reports what it cost');
+      assert.ok(
+        stored.p2p.reverse_dial_ms >= 300,
+        `the dial must wait for its window rather than failing instantly (${stored.p2p.reverse_dial_ms}ms)`,
+      );
+      assert.ok(
+        stored.p2p.reverse_dial_ms < 2000,
+        `the injected 400 ms window must bound the dial (${stored.p2p.reverse_dial_ms}ms)`,
+      );
     } finally {
       try {
         silent.socket.close();

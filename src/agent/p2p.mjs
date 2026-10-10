@@ -552,9 +552,36 @@ export class P2PChannel extends EventEmitter {
     });
   }
 
-  /** Stop the channel. The socket is NOT closed: the caller owns it. */
-  close(reason = 'closed') {
+  /**
+   * Stop the channel. The socket is NOT closed: the caller owns it.
+   *
+   * @param {string} [reason] Reported on the `'close'` event and in the rejection of every pending
+   *   send.
+   * @param {{silent?: boolean}} [options] `silent: true` drops this channel **without telling the
+   *   peer**, which is what discarding a *duplicate local view* of a live session requires. A punch
+   *   can produce two channel objects for one session (both ends dialled, and the accept loop answered
+   *   while the punch was still in flight); keeping the observed-address one and closing the other is
+   *   right, but a BYE there would tell the peer a session that is very much alive was over, and would
+   *   tear down the channel the survivor is about to use.
+   */
+  close(reason = 'closed', options = {}) {
     if (this.closed) return;
+    // The BYE goes out BEFORE `closed` is set, and that ordering is the whole fix. `sendFrame`
+    // refuses to send once the channel is closed -- a guard that is right for retransmissions and was
+    // silently wrong for the goodbye: with `closed` set first, the BYE below could never leave, so the
+    // peer was never told the path was over and kept writing into a channel nothing was listening on.
+    // Measured, on the path this release is about: a dispatcher's `pushOffer` closes the channel it
+    // pushed the offer over, and without the BYE the executor's side still looked live for the whole
+    // task, so its result was sent into that dead channel and only fell back to the relay after eight
+    // unacknowledged fragments (`P2P_FRAGMENT_UNACKED`) -- the "result came back relay" half of the
+    // failure, with no reverse dial attempted because a channel appeared to exist.
+    if (reason !== 'peer-closed' && options.silent !== true) {
+      try {
+        this.sendFrame(KIND.BYE, Buffer.alloc(0));
+      } catch {
+        /* the path is already gone */
+      }
+    }
     this.closed = true;
     this.socket.removeListener('message', this.onDatagram);
     for (const entry of this.outgoing.values()) {
@@ -563,13 +590,6 @@ export class P2PChannel extends EventEmitter {
     }
     this.outgoing.clear();
     this.incoming.clear();
-    if (reason !== 'peer-closed') {
-      try {
-        this.sendFrame(KIND.BYE, Buffer.alloc(0));
-      } catch {
-        /* the path is already gone */
-      }
-    }
     this.emit('close', reason);
   }
 }

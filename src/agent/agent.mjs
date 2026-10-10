@@ -1379,17 +1379,21 @@ export function createAgent(options) {
     }
     if (session === null && published.length > 0) {
       // A dispatcher that published where to dial but not which session: this end picks one and the
-      // far end adopts it. The 404-free lookup is the point -- `p2p.candidates` came with the offer.
+      // far end's `accept()` adopts it -- that asymmetry is what `allowSessionAdoption` exists for.
       session = reverseDialSession({ originMachineId: dispatcher, taskId, machineId });
       from = 'derived session';
     }
     if (session === null) {
+      // A v0.4.x dispatcher: it published no punch, so there is no session to join and no address it
+      // asked to be reached at. Dialling anyway would be a punch this end invented against a machine
+      // that never said a two-way punch was in play, so the offer is treated exactly as it was before
+      // this change -- the relay carries the result, and the reason says why.
       return {
         ok: false,
         code: 'P2P_NO_SESSION',
         reason:
-          'P2P_NO_SESSION: the offer published neither a session nor candidates, so this is a v0.4.x ' +
-          'dispatcher and the relay carries the result exactly as it did before',
+          'P2P_NO_SESSION: the offer published no session or candidates, so there is nothing to dial ' +
+          '(a v0.4.x dispatcher, whose relay copy is the delivery)',
       };
     }
 
@@ -2159,6 +2163,9 @@ export function createAgent(options) {
    *                   failure and must not be spelled as one.
    *   * `reverse_dial_reason` -- the named code when the dial did not open a channel
    *                   (`P2P_REVERSE_DIAL_TIMEOUT`, `P2P_REVERSE_DIAL_FAILED`), or null.
+   *   * `reverse_dial_ms` -- what the dial cost, in milliseconds. The window is a bound the contract
+   *                   states, and a bound nobody measures is a claim: this is the number that says
+   *                   whether the result path really stayed inside it.
    *   * `result_error` -- why the direct copy of *this result* did not land, when one was attempted
    *                   and not acknowledged (`P2P_ACK_TIMEOUT: …`). Null otherwise; this is the
    *                   `delivery.error` that `p2pDeliveryMark` has always carried and the envelope
@@ -2207,6 +2214,7 @@ export function createAgent(options) {
       ...(reverse !== null && typeof reverse.reason === 'string' && reverse.reason !== ''
         ? { reverse_dial_reason: reverse.reason }
         : {}),
+      ...(typeof reverse?.ms === 'number' ? { reverse_dial_ms: reverse.ms } : {}),
       // The key is OMITTED when there is nothing to explain, and that is not the same as setting it
       // to `undefined`: `JSON.stringify` would drop that, but the envelope hash is computed with JCS,
       // whose implementation (rightly) refuses a non-JSON value. Measured -- `reason: undefined`
@@ -2344,11 +2352,19 @@ export function createAgent(options) {
     // v0.4.0 §6. Always present, like the relay's own offer fields and for the same reason: a
     // v0.3.9 machine and an `auto` one are then distinguishable from the stored envelope alone,
     // instead of `transport` being absent both when the direct path was never tried and when it
-    // was tried and lost. `transport` is how the *offer* arrived; `p2p.result_path` is how the
-    // *result* left. They are different facts and are allowed to differ -- a relay offer can be
-    // answered over a channel the agent opened for that task.
+    // was tried and lost.
+    //
+    // v0.4.x widens what `transport` answers, without moving either of the two facts it is read for.
+    // It is "did the direct path carry anything for this machine" -- `p2p` when the offer arrived over
+    // a channel *or* when the result was acknowledged over one, `relay` when the relay carried both.
+    // `p2p.offer_path` and `p2p.result_path` remain the halves, so a reader that needs "which way did
+    // the offer come" still has it verbatim; what changed is that a machine whose *result* found its
+    // own way back no longer looks like a machine that fell all the way to the relay. That is the
+    // reading the relay's own report already documents ("how this machine's envelope travelled"), and
+    // the one a deployment-level question like "is P2P working here" needs answered.
     const transport = context.p2pTransport ?? offerTransportOf(offer, p2pStatusSnapshot());
-    envelope.transport = transport.offer_path;
+    const directResult = (context.p2pDelivery ?? p2pDeliveryMark()).path === 'p2p';
+    envelope.transport = transport.offer_path === 'p2p' || directResult ? 'p2p' : transport.offer_path;
     envelope.p2p = envelopeP2P({ ...context, p2pTransport: transport });
     return buildEnvelope(envelope);
   }
@@ -3301,7 +3317,16 @@ export function createAgent(options) {
   /** Drop a queued task and abort a running one (§3.4). Shared by both transports. */
   function cancelTask(taskId, reason) {
     const index = queue.findIndex((item) => item.task_id === taskId);
-    if (index !== -1) queue.splice(index, 1);
+    if (index !== -1) {
+      queue.splice(index, 1);
+      // A task cancelled before it ran never reaches `finish`, which is where a task's direct-path
+      // bookkeeping is normally released: the channel its offer arrived on (or the one its own dial
+      // opened) and the dial record. Nothing will ever be answered on that channel now, so it is let
+      // go here rather than left holding a mapping until the node closes.
+      releaseChannel(taskId);
+      log('info', `task.cancel for queued ${taskId}: dropped before it ran`);
+      return;
+    }
     if (state.current && state.current.task_id === taskId) {
       log('warn', `task.cancel for running ${taskId}: ${reason ?? ''}`);
       state.current.controller.abort();

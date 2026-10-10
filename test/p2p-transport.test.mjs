@@ -455,6 +455,59 @@ describe('p2p: connect()', () => {
   });
 });
 
+describe('p2p: closing a channel', () => {
+  /** Two channels punched onto one session, one per side. */
+  async function channelPair(session) {
+    const { a, b, close } = await twoSockets();
+    const [ra, rb] = await Promise.all([
+      connect({ socket: a.socket, remote: [loopback(b)], timeoutMs: 4000, session }),
+      connect({ socket: b.socket, remote: [loopback(a)], timeoutMs: 4000, session }),
+    ]);
+    assert.equal(ra.ok && rb.ok, true, `both ends must open: ${ra.error ?? ''} ${rb.error ?? ''}`);
+    return { a: ra.channel, b: rb.channel, close };
+  }
+
+  it('sends a BYE, so a channel that is closed here is closed there', async () => {
+    // The measured defect this pins down: the goodbye used to be unreachable -- `close()` set
+    // `closed = true` and `sendFrame` refuses to send once a channel is closed -- so a peer kept a
+    // channel it believed was live and wrote its result into a path nobody was reading. That is one
+    // half of "the result came back over the relay": it fell back only after eight unacknowledged
+    // fragments.
+    const pair = await channelPair(deriveSession('bye-on-close'));
+    try {
+      const closed = new Promise((resolve) => {
+        pair.b.once('close', resolve);
+      });
+      pair.a.close('attempt-complete');
+      assert.equal(await closed, 'peer-closed', 'the peer learns the session is over');
+      assert.equal(pair.a.closed, true);
+      assert.equal(pair.b.closed, true, 'and its channel is unusable rather than silently dead');
+      await assert.rejects(() => pair.b.send('after the bye'), /P2P_CHANNEL_CLOSED/);
+    } finally {
+      pair.close();
+    }
+  });
+
+  it('stays quiet for a duplicate local view, so the surviving channel is not torn down', async () => {
+    // A simultaneous punch legitimately produces two channel objects for one session on a side; the
+    // node keeps one and drops the other. A BYE there would tell the peer a live session was over.
+    const pair = await channelPair(deriveSession('bye-suppressed'));
+    try {
+      const closed = [];
+      pair.b.on('close', (reason) => closed.push(reason));
+      pair.a.close('session-claimed', { silent: true });
+      await new Promise((resolve) => {
+        setTimeout(resolve, 60);
+      });
+      assert.deepEqual(closed, [], 'the peer must not hear about a session that is still live');
+      assert.equal(pair.a.closed, true, 'this end still let go of the duplicate');
+      assert.equal(pair.b.closed, false);
+    } finally {
+      pair.close();
+    }
+  });
+});
+
 describe('p2p: loopback is not a NAT traversal test', () => {
   it('documents why the punch cases above cannot prove traversal', () => {
     // Stated as an executable note so nobody reads the suite above as NAT evidence:
