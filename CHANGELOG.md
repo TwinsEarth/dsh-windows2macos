@@ -4,6 +4,25 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.9] — 2026-10-10
+
+### Fixed
+
+* **The Windows supervisor silently dropped every `-AgentArgs` value.** `install-service.ps1` writes
+  `agentArgs` into `agent.json`, and `ConvertTo-Json` collapses a single-element array to a string —
+  while the supervisor's passthrough only handled an array. So `-AgentArgs '--p2p-mode auto'` was
+  accepted, written, and then ignored, and the agent ran on its defaults. Nothing failed; the field
+  simply had no effect. It now accepts both shapes (a string is split on whitespace) — the same class
+  of bug as the camelCase key mismatch fixed in v0.4.4: **a config field that is read but not
+  understood is indistinguishable from one that was never set.**
+* Found while pinning this machine's punch port (`--p2p-port 51820`), which was the first agent
+  argument whose absence would have been visible — that is what exposed the dropped-arguments path.
+
+### Notes
+
+* No protocol change, and no behavioural change for an `agentArgs` that was already an array (what
+  the installer writes for two or more arguments). This makes the documented `-AgentArgs` real.
+
 ## [0.4.8] — 2026-10-09
 
 ### Added

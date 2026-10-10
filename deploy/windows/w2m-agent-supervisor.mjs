@@ -128,7 +128,12 @@ const consumed = new Set([
 ]);
 const passthrough = [];
 const fileAgentArgs = file.agentArgs ?? file['agent-args'];
+// BOTH SHAPES, because both happen. The installer writes an array, but `ConvertTo-Json` collapses a
+// single-element array to a string -- and this only handled the array, so `--p2p-mode auto` was
+// silently dropped and the agent ran on its defaults. Silent, because an ignored field is not an
+// error. A string is split on whitespace instead.
 if (Array.isArray(fileAgentArgs)) passthrough.push(...fileAgentArgs.map(String));
+else if (typeof fileAgentArgs === 'string') passthrough.push(...fileAgentArgs.split(/\s+/).filter(Boolean));
 if (typeof args['agent-args'] === 'string') passthrough.push(...args['agent-args'].split(/\s+/).filter(Boolean));
 for (const [key, value] of Object.entries(args)) {
   if (consumed.has(key)) continue;
