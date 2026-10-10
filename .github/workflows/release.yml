@@ -187,4 +187,18 @@ jobs:
           fi
 
           npm publish "/tmp/${asset}" --access public --provenance
-          npm view "@twinsearth/w2m-dsh-plugin@${version}" version dist.integrity
+
+          # The registry does not serve a version the instant the publish returns. Measured: an
+          # immediate `npm view` answered 404, and `set -e` turned a *successful* publish into a red
+          # job -- the log shows the provenance statement was already signed before that 404. So this
+          # polls, and a version that is merely slow to appear is a warning, never a failure.
+          for attempt in 1 2 3 4 5 6; do
+            if out="$(npm view "@twinsearth/w2m-dsh-plugin@${version}" version dist.integrity 2>/dev/null)"; then
+              echo "on npm:"
+              echo "${out}"
+              exit 0
+            fi
+            echo "not served by the registry yet (attempt ${attempt}/6)"
+            sleep 10
+          done
+          echo "::warning::published ${version}, but the registry had not served it after 60s -- check npm before assuming the publish failed"
