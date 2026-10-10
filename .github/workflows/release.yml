@@ -144,11 +144,22 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-          registry-url: 'https://registry.npmjs.org'
+          # No `registry-url` here on purpose. It writes an .npmrc whose auth line expands from
+          # NODE_AUTH_TOKEN; with no token secret that line is empty and shadows the OIDC exchange
+          # instead of falling through to it. The token is configured explicitly below, only when
+          # the secret actually exists.
+
+      - name: An npm CLI new enough for the OIDC exchange
+        # Node 22 bundles npm 10.x, and trusted publishing needs npm >= 11.5.1. Without this the job
+        # fails with an auth error that looks like a permissions problem and is not one.
+        run: |
+          set -euo pipefail
+          npm install -g 'npm@^11.5.1'
+          npm --version
 
       - name: Publish the tarball the release published
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
           tag="${{ github.event.inputs.tag || github.ref_name }}"
@@ -156,8 +167,13 @@ jobs:
           asset="twinsearth-w2m-dsh-plugin-${version}.tgz"
           base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}"
 
-          if [ -z "${NODE_AUTH_TOKEN:-}" ] && [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
-            echo "::warning::skipping npm: no NPM_TOKEN secret and no OIDC token available"
+          if [ -n "${NPM_TOKEN:-}" ]; then
+            npm config set //registry.npmjs.org/:_authToken "${NPM_TOKEN}"
+            echo "authenticating with the NPM_TOKEN secret"
+          elif [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+            echo "no token secret: relying on trusted publishing (OIDC)"
+          else
+            echo "::warning::skipping npm: neither NPM_TOKEN nor an OIDC token is available"
             exit 0
           fi
 
