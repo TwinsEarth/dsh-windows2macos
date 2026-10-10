@@ -35,7 +35,7 @@
 //
 // Nothing here is Windows-specific except the defaults; the same supervisor works on POSIX hosts.
 import { spawn } from 'node:child_process';
-import { createWriteStream, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { createWriteStream, existsSync, mkdirSync, openSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 /** Minimal `--flag value` / `--flag` parser: no dependency, no surprises. */
@@ -149,6 +149,9 @@ if (!existsSync(bin)) {
 
 mkdirSync(dirname(logPath), { recursive: true });
 const log = createWriteStream(logPath, { flags: 'a' });
+// A second handle on the same file, as a descriptor: this is what the detached agent writes into,
+// because a descriptor is not connected to this process's console or to any pipe of ours.
+const logFd = openSync(logPath, 'a');
 const stamp = () => new Date().toISOString();
 const say = (line) => {
   console.log(line);
@@ -177,14 +180,33 @@ let runs = 0;
 while (!stopping) {
   runs += 1;
   const startedAt = Date.now();
-  const child = spawn(process.execPath, argv, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
-  child.stdout.on('data', (chunk) => {
-    process.stdout.write(chunk);
-    log.write(chunk);
-  });
-  child.stderr.on('data', (chunk) => {
-    process.stderr.write(chunk);
-    log.write(chunk);
+  // ---------------------------------------------------------------------------------------------
+  // THE AGENT MUST NOT SHARE THIS PROCESS'S CONSOLE.
+  //
+  // Measured twice on the fleet: the whole tree -- supervisor and agent together -- is killed with
+  // 0xC000013A (STATUS_CONTROL_C_EXIT, "the console went away"), the log ends mid-sentence, and
+  // nothing restarts it. A supervisor that shares the console dies with the thing it supervises,
+  // which was its one job. A study of v2rayN (GPL-3.0, read-only; see deploy/networking/LESSONS.md)
+  // turned up why its core cannot die this way: it is started with no console window and redirected
+  // stdio at all.
+  //
+  // `detached: true` plus stdio that is NOT connected to this process is the documented way to make
+  // a long-running child independent of its parent's console: with `detached`, a long-running child
+  // "will not stay running in the background after the parent exits unless it is provided with a
+  // `stdio` configuration that is not connected to the parent". So the agent gets file descriptors --
+  // never `inherit`, never pipes -- and that is the whole of the console-severing change.
+  //
+  // NOT `child.unref()`. It was the obvious-looking addition and it is wrong here: unref'ing the
+  // child leaves this process with no handle at all, so its event loop drains and **the supervisor
+  // exits immediately after spawning the agent** -- measured, and caught by noticing that no
+  // supervisor process existed at all. `unref()` is for a parent that intends to leave; this one
+  // exists to stay. Pipes would be the other trap: a detached child writing into a pipe whose reader
+  // has died blocks instead of failing loudly, which is why the log is a descriptor.
+  // ---------------------------------------------------------------------------------------------
+  const child = spawn(process.execPath, argv, {
+    detached: true,
+    stdio: ['ignore', logFd, logFd],
+    windowsHide: true,
   });
 
   const result = await new Promise((resolve) => {
