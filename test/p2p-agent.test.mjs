@@ -31,7 +31,7 @@ import { createRelayServer } from '../src/relay/server.mjs';
 import { AGENT_STATE_FILE, createAgent } from '../src/agent/agent.mjs';
 import { loadOrCreateIdentity } from '../src/agent/identity.mjs';
 import { bindUdpSocket } from '../src/agent/stun.mjs';
-import { deriveSession } from '../src/agent/p2p.mjs';
+import { deriveSession, mintPunchId, punchSession } from '../src/agent/p2p.mjs';
 import { P2PNode, P2P_DEFAULTS, SHARED_SERVER } from '../src/agent/p2p-node.mjs';
 
 const NODE = process.execPath;
@@ -221,12 +221,16 @@ function relayTransport(baseUrl, token) {
  * same identity. `originMachineId` is that same dispatcher machine, because an offer which claims
  * an origin that never announced is exactly the fallback case under test.
  */
-async function dispatchTask(agent, relay, { commandArgv, machineId, originMachineId, p2pMode = 'auto', baseCommit }) {
+async function dispatchTask(agent, relay, { commandArgv, machineId, originMachineId, p2pMode = 'auto', baseCommit, p2p = null }) {
   // The stream must be attached before the task is posted, or the offer waits for the relay's
   // re-offer path (`redeliverPendingOffers`) instead of arriving as the live event these tests are
   // about. Waiting for the observable fact beats sleeping and hoping.
   await waitForOnline(relay, machineId ?? agentMachineId(agent), agent.identity.device_token);
   const target = machineId ?? agentMachineId(agent);
+  // v0.4.x: the whole `p2p` block a caller supplies wins, because a test of the two-way punch has to
+  // publish the punch id and the dispatcher's candidates exactly as the plugin does -- and those are
+  // the only way the executor can dial back.
+  const block = p2p ?? { mode: p2pMode };
   const body = {
     mode: 'replicate',
     command_argv: commandArgv,
@@ -239,7 +243,7 @@ async function dispatchTask(agent, relay, { commandArgv, machineId, originMachin
     requirements: {},
     compare_policy: {},
     origin_machine_id: originMachineId ?? DISPATCHER,
-    p2p: { mode: p2pMode },
+    p2p: block,
   };
   const res = await request(`${relay.url}/v1/task`, { method: 'POST', token: OP, body });
   assert.equal(res.status, 200, `POST /v1/task failed: ${res.text}`);
@@ -271,7 +275,7 @@ async function dispatchTask(agent, relay, { commandArgv, machineId, originMachin
       requirements: {},
       compare_policy: {},
       origin_machine_id: originMachineId ?? DISPATCHER,
-      p2p: { mode: p2pMode },
+      p2p: block,
     },
   };
 }
@@ -384,7 +388,7 @@ function testTuning(over = {}) {
 }
 
 /** Build an agent for this machine: a real relay, a real UDP socket, a deterministic discovery. */
-async function makeAgent({ relay, project, stateDir, mode = 'auto', options = {} }) {
+async function makeAgent({ relay, project, stateDir, mode = 'auto', options = {}, p2pNodeOptions = {} }) {
   const identity = loadOrCreateIdentity({ dir: stateDir, name: `p2p-${mode}`, rabbitUrl: relay.url }).identity;
   const paired = await request(`${relay.url}/v1/pair`, {
     method: 'POST',
@@ -408,7 +412,9 @@ async function makeAgent({ relay, project, stateDir, mode = 'auto', options = {}
     platform: PLATFORM,
     allowedCommands: [['node', '-e']],
     p2pMode: mode,
-    p2pNodeOptions: { discover: loopbackDiscovery(), tuning: testTuning() },
+    // Merged, not replaced: a case that injects a binder or a shorter dial window must keep the
+    // deterministic discovery and the loopback timings every other case here relies on.
+    p2pNodeOptions: { discover: loopbackDiscovery(), tuning: testTuning(), ...p2pNodeOptions },
     heartbeatIntervalMs: 5_000,
     idleHeartbeatIntervalMs: 0,
     // Set W2M_TEST_LOG=1 to see the agent's own narration while debugging a case in this file. It is
@@ -628,6 +634,46 @@ function plain(value) {
 }
 
 /**
+ * Record every datagram a socket sends, without changing what it sends.
+ *
+ * The agent's own dial is invisible from the outside: the peer either answers or it does not. A case
+ * that has to prove *the executor sent HELLOs*, and that they carried the session the offer named,
+ * needs the socket — which is what {@link trackingBinder} keeps.
+ *
+ * @param {import('node:dgram').Socket} socket
+ * @returns {Array<{bytes: Buffer, port: number, address: string}>}
+ */
+function recordSends(socket) {
+  const sent = [];
+  const original = socket.send.bind(socket);
+  socket.send = (msg, port, address, callback) => {
+    sent.push({ bytes: Buffer.from(msg), port, address });
+    return original(msg, port, address, callback);
+  };
+  return sent;
+}
+
+/** The HELLO frames a recorder saw, decoded from the framing table in `p2p.mjs`. */
+function hellosOf(sent) {
+  return sent
+    .filter((entry) => entry.bytes.length >= 5 && entry.bytes.readUInt8(0) === 1)
+    .map((entry) => ({ session: entry.bytes.readUInt32BE(1), to: entry.port }));
+}
+
+/** A binder that keeps what it bound, so a case can watch the datagrams the agent's node sends. */
+function trackingBinder() {
+  const bound = [];
+  return {
+    bound,
+    bindUdpSocket: async (options = {}) => {
+      const result = await bindUdpSocket(options);
+      bound.push(result);
+      return result;
+    },
+  };
+}
+
+/**
  * The agent main loops started in this file, so `teardown` can settle them.
  *
  * Module scope, and reset by `teardown`: a loop is a promise that only settles after `stop()`, and
@@ -836,6 +882,218 @@ describe('v0.4.0 agent: an offer that arrives over the relay', () => {
       );
     } finally {
       await teardown({ agent, observers: [observer], relay });
+    }
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* The executor's own dial (v0.4.x)                                            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The measured failure these cases exist for.
+ *
+ * A dispatcher behind a symmetric NAT (CGNAT in practice) cannot push an offer: its HELLOs are
+ * addressed from a mapped port nobody was told about, so the punch times out on its side
+ * (`P2P_PUNCH_TIMEOUT: no answer from 2 candidate(s) in 5000ms`). The executor never dialled, so its
+ * NAT filter was never opened towards the dispatcher, and the result came back `transport: relay` too.
+ * The two changes under test are the executor's half of that punch and the result path's re-dial.
+ *
+ * The dispatcher here is a real `P2PNode` that announces — so the punch is a real loopback punch and
+ * the channel a real reliable channel — but the *offer* carries the punch id and the candidate list,
+ * exactly as the plugin publishes them, because in the measured failure the dispatcher's own push
+ * never arrived.
+ */
+describe('v0.4.x agent: the executor dials the dispatcher the offer named', () => {
+  it('opens the channel itself and sends the result back over it', async () => {
+    const { relay } = await startRelay();
+    const repo = makeRepo('reverse-dial');
+    const marker = join(repo.dir, 'ran.txt');
+    const binder = trackingBinder();
+    const agent = await makeAgent({
+      relay,
+      project: repo.dir,
+      stateDir: scratchDir('agent-state'),
+      p2pNodeOptions: { bindUdpSocket: binder.bindUdpSocket },
+    });
+    const dispatcher = await makeDispatcher({ relay, url: relay.url });
+
+    try {
+      startAgentLoop(agent);
+      await waitFor(() => agent.state.p2p.running, { label: 'agent p2p node running' });
+      assert.equal(binder.bound.length, 1, 'the agent node binds exactly one socket');
+      const sent = recordSends(binder.bound[0].socket);
+
+      const punch = mintPunchId();
+      const candidates = dispatcher.node.status.candidates.map((candidate) => ({ ...candidate }));
+      assert.ok(candidates.length >= 1, 'the dispatcher must have announced somewhere to dial');
+
+      // What the plugin does with a result that arrives over a channel: acknowledge it on the same
+      // channel. Without this the result would be delivered but never acknowledged, and `result_path`
+      // is only claimed when the acknowledgement arrived.
+      const results = [];
+      dispatcher.node.on('message', (event) => {
+        const frame = JSON.parse(String(event.payload));
+        results.push(frame);
+        if (frame.type === 'task.result') {
+          void event.channel.send(JSON.stringify({ type: 'result.ack', task_id: frame.task_id }));
+        }
+      });
+
+      const dispatched = await dispatchTask(agent, relay, {
+        commandArgv: appendCommand(marker),
+        baseCommit: repo.commit,
+        originMachineId: dispatcher.machineId,
+        p2p: { mode: 'auto', punch, candidates },
+      });
+
+      // The session both ends compute from the published punch id. If the executor invented its own,
+      // this is the assertion that says so.
+      const session = punchSession({ punch, taskId: dispatched.taskId, machineId: dispatched.machineId });
+      assert.ok(Number.isInteger(session) && session > 0);
+
+      const aggregate = await waitForAggregate(relay, dispatched.taskId, dispatcher.device.token);
+      const stored = aggregate.machines.find((m) => m.machine_id === dispatched.machineId);
+
+      // The offer really did arrive over the relay — that is the whole premise.
+      assert.equal(stored.transport, 'relay', plain(stored));
+      assert.equal(stored.p2p.offer_path, 'relay');
+      // ... and the result did not.
+      assert.equal(stored.p2p.result_path, 'p2p', `the reverse dial must carry the result: ${plain(stored)}`);
+      assert.equal(stored.p2p.opened_by, 'simultaneous-punch', 'the mechanism is named, not inferred');
+      assert.equal(stored.p2p.reverse_dial, 'p2p');
+      assert.equal(stored.p2p.session, session, 'the published punch id decided the session');
+      assert.equal('reverse_dial_reason' in stored.p2p, false, 'a dial that worked has nothing to explain');
+
+      // The HELLO really left this socket, at the published candidate, carrying the published session.
+      const hellos = hellosOf(sent);
+      assert.ok(hellos.length >= 1, 'the executor must have dialled');
+      assert.equal(hellos[0].session, session);
+      assert.ok(
+        candidates.some((candidate) => candidate.port === hellos[0].to),
+        `the HELLO must be addressed at a candidate the offer published: ${plain(hellos[0])}`,
+      );
+
+      // And the dispatcher received the result on the channel this machine opened.
+      await waitFor(() => results.some((frame) => frame.type === 'task.result'), {
+        label: 'the result frame on the dispatcher side',
+      });
+      const notice = results.find((frame) => frame.type === 'task.result');
+      assert.equal(notice.task_id, dispatched.taskId);
+      assert.equal(notice.machine_id, dispatched.machineId);
+      assert.equal(countLines(marker), 1, 'and the command ran exactly once');
+    } finally {
+      await teardown({ agent, dispatcher, relay });
+    }
+  });
+
+  it('times out, records P2P_REVERSE_DIAL_TIMEOUT, and still delivers over the relay inside the bound', async () => {
+    const { relay } = await startRelay();
+    const repo = makeRepo('reverse-timeout');
+    const marker = join(repo.dir, 'ran.txt');
+    // A silent peer: bound, never answering. The punch has to reach its deadline, and the *injected*
+    // window is what keeps this case fast -- the production default is asserted in the node suite.
+    const silent = await bindUdpSocket();
+    const agent = await makeAgent({
+      relay,
+      project: repo.dir,
+      stateDir: scratchDir('agent-state'),
+      p2pNodeOptions: { tuning: testTuning({ reverseDialTimeoutMs: 400 }) },
+    });
+
+    try {
+      startAgentLoop(agent);
+      const punch = mintPunchId();
+      const startedAt = Date.now();
+      const dispatched = await dispatchTask(agent, relay, {
+        commandArgv: appendCommand(marker),
+        baseCommit: repo.commit,
+        originMachineId: 'win-cgnat-dispatcher',
+        p2p: { mode: 'auto', punch, candidates: [{ address: '127.0.0.1', port: silent.local.port }] },
+      });
+
+      const aggregate = await waitForAggregate(relay, dispatched.taskId, agent.identity.device_token);
+      const elapsed = Date.now() - startedAt;
+      const stored = aggregate.machines.find((m) => m.machine_id === dispatched.machineId);
+
+      // Today's behaviour, unchanged: the relay carried the offer and the result.
+      assert.equal(stored.status, 'ok', plain(stored));
+      assert.equal(stored.transport, 'relay');
+      assert.equal(stored.p2p.offer_path, 'relay');
+      assert.equal('result_path' in stored.p2p, false, 'nothing was acknowledged over a channel');
+      // ... and the attempt is a recorded fact with its own code, not a silence.
+      assert.equal(stored.p2p.reverse_dial, 'relay');
+      assert.match(
+        stored.p2p.reverse_dial_reason,
+        /^P2P_REVERSE_DIAL_TIMEOUT: /,
+        `the reverse dial has its own code: ${stored.p2p.reverse_dial_reason}`,
+      );
+      assert.equal(countLines(marker), 1, 'the relay path still ran the command');
+
+      // The bound is real and it is the injected one: the relay's offer grace (~1.2 s) plus a 400 ms
+      // dial cannot approach the production 8 s window, so a suite that ignored the tuning would fail
+      // here rather than pass slowly.
+      assert.ok(elapsed < 6000, `the whole step must stay inside the injected dial window (${elapsed}ms)`);
+    } finally {
+      try {
+        silent.socket.close();
+      } catch {
+        /* already closed */
+      }
+      await teardown({ agent, relay });
+    }
+  });
+
+  it('accepts an offer that carries unknown keys inside p2p, and ignores them', async () => {
+    const { relay } = await startRelay();
+    const repo = makeRepo('p2p-extension');
+    const marker = join(repo.dir, 'ran.txt');
+    const agent = await makeAgent({ relay, project: repo.dir, stateDir: scratchDir('agent-state') });
+    const dispatcher = await makeDispatcher({ relay, url: relay.url });
+
+    try {
+      startAgentLoop(agent);
+      await waitFor(() => agent.state.p2p.running, { label: 'agent p2p node running' });
+      dispatcher.node.on('message', (event) => {
+        const frame = JSON.parse(String(event.payload));
+        if (frame.type === 'task.result') {
+          void event.channel.send(JSON.stringify({ type: 'result.ack', task_id: frame.task_id }));
+        }
+      });
+
+      const punch = mintPunchId();
+      // A future version's keys, next to the ones this version reads. This is the compatibility case
+      // in both directions: the relay must store and republish the whole object (it treats `p2p` as
+      // opaque), and the executor must run the task without reading a single unknown key.
+      const extended = {
+        mode: 'auto',
+        punch,
+        candidates: dispatcher.node.status.candidates.map((candidate) => ({ ...candidate })),
+        vendor_extension: { future: true },
+        session_hint: 'not a key this version reads',
+      };
+      const dispatched = await dispatchTask(agent, relay, {
+        commandArgv: appendCommand(marker),
+        baseCommit: repo.commit,
+        originMachineId: dispatcher.machineId,
+        p2p: extended,
+      });
+
+      // The relay kept every key verbatim: a v0.4.x relay does exactly this (`validateTaskRouting`
+      // checks `mode` and copies the rest), which is why an older peer parses the offer fine.
+      assert.deepEqual(relay.state.getTask(dispatched.taskId).p2p, extended);
+
+      const aggregate = await waitForAggregate(relay, dispatched.taskId, dispatcher.device.token);
+      const stored = aggregate.machines.find((m) => m.machine_id === dispatched.machineId);
+
+      assert.equal(stored.status, 'ok', plain(stored));
+      assert.equal(countLines(marker), 1, 'an unknown key must not stop the task');
+      // The executor's own block describes paths, never the dispatcher's extension keys.
+      assert.equal('vendor_extension' in stored.p2p, false);
+      assert.equal('session_hint' in stored.p2p, false);
+      assert.equal(stored.p2p.result_path, 'p2p', 'and the keys it does read still work');
+    } finally {
+      await teardown({ agent, dispatcher, relay });
     }
   });
 });

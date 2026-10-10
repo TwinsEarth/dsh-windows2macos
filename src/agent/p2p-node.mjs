@@ -252,6 +252,16 @@ export const P2P_DEFAULTS = Object.freeze({
   refreshMs: 20_000,
   punchTimeoutMs: 5_000,
   acceptTimeoutMs: 5_000,
+  /**
+   * How long an executor may spend dialling a dispatcher it did not punch first.
+   *
+   * Deliberately longer than `punchTimeoutMs`. A punch between two peers that both expected it
+   * succeeds in one round trip or not at all; a *reverse* dial is racing the other end's own
+   * punch attempt and a NAT filter that only opens once the other side's packet has arrived, so
+   * it needs room for several HELLO rounds. 8 s is the window the v0.4.x contract states, and it
+   * is bounded on purpose: the relay copy of an offer and of a result is never held behind it.
+   */
+  reverseDialTimeoutMs: 8_000,
   maxCandidates: 8,
 });
 
@@ -945,13 +955,23 @@ export class P2PNode extends EventEmitter {
    *   initiator has to pick one, and a caller with a task id should pass one derived
    *   from it so two concurrent tasks do not share a session.
    * @param {number} [options.timeoutMs] Punch deadline; default `tuning.punchTimeoutMs`.
+   * @param {Array<{address:string, port:number}>} [options.candidates] Addresses to punch
+   *   at, used **instead of** asking the relay. This is how an executor dials a dispatcher
+   *   whose candidates travelled inside the offer (`p2p.candidates`): the offer is evidence
+   *   the dispatcher itself produced moments ago, and a relay lookup would be a second,
+   *   slower opinion about the same machine — one that answers 404 for a dispatcher whose
+   *   announcement has already expired. The list is validated here exactly like the relay's
+   *   answer is, so an offer cannot smuggle in a wildcard address or a zero port.
    * @param {number} [options.acceptTimeoutMs] Accepted for interface symmetry with
    *   {@link accept} and unused here: the initiator waits for the HELLO_ACK, which is
    *   the punch itself, and never waits to be accepted.
    * @returns {Promise<{ok:boolean, channel:import('./p2p.mjs').P2PChannel|null,
    *   peer:{address:string,port:number}|null, session:number, error:string|null,
-   *   attempts:number, rttMs:number|null, peersAnnounced:number}>} `peersAnnounced` is
-   *   how many candidate addresses the relay held for that machine.
+   *   attempts:number, rttMs:number|null, peersAnnounced:number, reused:boolean}>}
+   *   `peersAnnounced` is how many candidate addresses the caller (or the relay) held for
+   *   that machine; `reused` says the session already had a live channel and no punch was
+   *   needed, which is what keeps a simultaneous punch from producing two channels for one
+   *   session — and therefore two deliveries of every message.
    */
   async dial(machineId, options = {}) {
     const empty = {
@@ -963,6 +983,7 @@ export class P2PNode extends EventEmitter {
       attempts: 0,
       rttMs: null,
       peersAnnounced: 0,
+      reused: false,
     };
 
     if (!this.isEnabled()) {
@@ -973,9 +994,6 @@ export class P2PNode extends EventEmitter {
     }
     if (typeof machineId !== 'string' || machineId === '') {
       return { ...empty, error: "P2P_BAD_MACHINE_ID: dial() needs the peer's machine id" };
-    }
-    if (typeof this.getJson !== 'function') {
-      return { ...empty, error: "P2P_NO_GET_JSON: dial() needs getJson to read the peer's candidates" };
     }
 
     let session = options.session;
@@ -997,25 +1015,44 @@ export class P2PNode extends EventEmitter {
       return { ...empty, session, error, ...extra };
     };
 
-    let lookup = null;
-    try {
-      lookup = await this.getJson(`/v1/peer/${encodeURIComponent(machineId)}`);
-    } catch (error) {
-      return fail(`P2P_LOOKUP_FAILED: ${messageOf(error)}`);
-    }
-    if (this.socket !== socket || !this.started) {
-      return { ...empty, session, error: 'P2P_NODE_NOT_RUNNING: the node closed while dialling' };
-    }
-    if (lookup?.ok !== true) {
-      if (lookup?.status === 404) {
-        // A 404 is the relay saying "this machine has not announced" — an ordinary state
-        // (the peer may be relay-only, or between refreshes), and it has its own code.
-        return fail(`P2P_NO_CANDIDATES: the relay holds no live announcement for ${machineId}`);
+    // "One session, one channel" is enforced where a simultaneous punch actually collides: after the
+    // punch resolves, against whatever the accept loop claimed while it was in flight (see
+    // `claimedMeanwhile` below and `adoptChannel`). There is deliberately no cheap pre-check here: a
+    // caller that dials a session this node already holds is still punching, the far end
+    // re-acknowledges it, and that contract is what the re-ack case in `test/p2p-node.test.mjs` pins
+    // down. Suppressing the punch would change it to save one datagram.
+
+    // `options.candidates` present and non-empty means "punch at these" -- an empty array is the same
+    // statement as the field being absent ("nobody told me where"), and falls through to the relay.
+    const fromOffer = Array.isArray(options.candidates) && options.candidates.length > 0;
+
+    let announced = [];
+    if (fromOffer) {
+      announced = options.candidates;
+    } else {
+      if (typeof this.getJson !== 'function') {
+        return { ...empty, error: "P2P_NO_GET_JSON: dial() needs getJson to read the peer's candidates" };
       }
-      return fail(`P2P_LOOKUP_FAILED: ${describeLookupFailure(lookup)}`);
+      let lookup = null;
+      try {
+        lookup = await this.getJson(`/v1/peer/${encodeURIComponent(machineId)}`);
+      } catch (error) {
+        return fail(`P2P_LOOKUP_FAILED: ${messageOf(error)}`);
+      }
+      if (this.socket !== socket || !this.started) {
+        return { ...empty, session, error: 'P2P_NODE_NOT_RUNNING: the node closed while dialling' };
+      }
+      if (lookup?.ok !== true) {
+        if (lookup?.status === 404) {
+          // A 404 is the relay saying "this machine has not announced" — an ordinary state
+          // (the peer may be relay-only, or between refreshes), and it has its own code.
+          return fail(`P2P_NO_CANDIDATES: the relay holds no live announcement for ${machineId}`);
+        }
+        return fail(`P2P_LOOKUP_FAILED: ${describeLookupFailure(lookup)}`);
+      }
+      announced = Array.isArray(lookup.json?.peer?.candidates) ? lookup.json.peer.candidates : [];
     }
 
-    const announced = Array.isArray(lookup.json?.peer?.candidates) ? lookup.json.peer.candidates : [];
     const remote = [];
     for (const candidate of announced) {
       const usable = usableCandidate(candidate);
@@ -1025,7 +1062,15 @@ export class P2PNode extends EventEmitter {
       if (remote.length >= this.tuning.maxCandidates) break;
     }
     if (remote.length === 0) {
-      return fail(`P2P_NO_CANDIDATES: ${machineId} announced no usable address`);
+      // `peersAnnounced` still counts what was offered, not what survived validation: a caller
+      // reading "the punch failed" needs to see that there *was* a list, and that every entry in it
+      // was unusable -- a wildcard address, a zero port -- rather than that nobody had an address.
+      return fail(
+        fromOffer
+          ? `P2P_NO_CANDIDATES: the offer's candidate list for ${machineId} held no usable address`
+          : `P2P_NO_CANDIDATES: ${machineId} announced no usable address`,
+        { peersAnnounced: announced.length },
+      );
     }
 
     let outcome = null;
@@ -1055,6 +1100,29 @@ export class P2PNode extends EventEmitter {
     }
 
     this.punchesOut += 1;
+    // The accept loop may have claimed this session while the punch was in flight — the far end
+    // dialled us at the same moment we dialled it, which is the whole point of a simultaneous
+    // punch. Its channel is the better one: its peer is the address the far end's packet actually
+    // came from, while ours is the address that end merely *announced*. Keep the observed one.
+    const claimedMeanwhile = this.channels.get(session);
+    if (claimedMeanwhile !== undefined && claimedMeanwhile !== outcome.channel) {
+      try {
+        outcome.channel.close('session-claimed');
+      } catch {
+        /* the path is already gone */
+      }
+      return {
+        ok: true,
+        channel: claimedMeanwhile,
+        peer: { ...claimedMeanwhile.peer },
+        session,
+        error: null,
+        attempts: outcome.punch.attempts,
+        rttMs: outcome.punch.rttMs,
+        peersAnnounced: announced.length,
+        reused: true,
+      };
+    }
     this.adoptChannel(outcome.channel, { from: machineId, session: outcome.channel.session });
     return {
       ok: true,
@@ -1065,12 +1133,21 @@ export class P2PNode extends EventEmitter {
       attempts: outcome.punch.attempts,
       rttMs: outcome.punch.rttMs,
       peersAnnounced: announced.length,
+      reused: false,
     };
   }
 
   /**
    * Wire one channel into the node: deliver its payloads as `'message'` events, claim
    * its session, and drop the claim when it closes.
+   *
+   * **One session, one channel — enforced here, not assumed.** The map is keyed by session and a
+   * second channel for a session already in it is *closed*, because `P2PChannel` filters incoming
+   * datagrams by session alone: two live channels on one session would each assemble and deliver
+   * every message of that session, so the caller would see each payload twice and `result_path`
+   * would be decided by whichever listener was registered last. A simultaneous punch makes that
+   * the normal case rather than a corner case, since both ends' HELLOs arrive while both are still
+   * dialling. See `dial()`, which returns the surviving channel rather than the one it just opened.
    *
    * The claim is released on close on purpose. `claimed` means "this session has a live
    * channel"; a broken path has to be re-punchable with the same session, and holding
@@ -1080,6 +1157,18 @@ export class P2PNode extends EventEmitter {
    * @param {{from:string|null, session:number}} details
    */
   adoptChannel(channel, details) {
+    const previous = this.channels.get(details.session);
+    if (previous !== undefined && previous !== channel) {
+      // Closed *before* the claim is taken: the old channel's own `'close'` handler deletes the
+      // session from `claimed`, and running it after the new claim would drop a claim that is
+      // still live -- which is the state that lets a peer open a second channel on this session.
+      this.channels.delete(details.session);
+      try {
+        previous.close('session-replaced');
+      } catch {
+        /* the path is already gone; that is the state this replacement produces */
+      }
+    }
     this.channels.set(details.session, channel);
     this.claimed.add(details.session);
     channel.on('message', (payload) => {
@@ -1093,7 +1182,9 @@ export class P2PNode extends EventEmitter {
     });
     channel.on('close', () => {
       if (this.channels.get(details.session) === channel) this.channels.delete(details.session);
-      this.claimed.delete(details.session);
+      // The claim belongs to whichever channel currently holds the session, so a *replaced*
+      // channel's close must not drop a claim its replacement depends on.
+      if (this.channels.get(details.session) === undefined) this.claimed.delete(details.session);
     });
     // P2PChannel documents an `'error'` event. Listening is not optional bookkeeping:
     // an unhandled `'error'` emit would throw, and the whole point of this node is that

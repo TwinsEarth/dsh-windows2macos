@@ -49,7 +49,8 @@ import {
 } from './git.mjs';
 import { createSpool } from './spool.mjs';
 import { matchAllowedCommand, parseAllowedCommands } from './allowed-commands.mjs';
-import { DEFAULT_P2P_MODE, P2PNode, normalizeP2PMode, normalizeP2PPort } from './p2p-node.mjs';
+import { DEFAULT_P2P_MODE, P2P_DEFAULTS, P2PNode, normalizeP2PMode, normalizeP2PPort } from './p2p-node.mjs';
+import { punchSession, reverseDialSession } from './p2p.mjs';
 import { createSigner } from '../signing.mjs';
 import { joinUrl, resolveBaseUrl } from './url.mjs';
 
@@ -187,6 +188,42 @@ export const P2P_RESULT_ACK_TIMEOUT_MS = 2_000;
  * rather than describe a 30-second wait.
  */
 export const P2P_CHANNEL_LINGER_MS = 30_000;
+
+/**
+ * Why this agent's own outbound dial did not open a channel (v0.4.x), with its own codes.
+ *
+ * These are reported in the result envelope's `p2p.reverse_dial_reason`, never thrown and never
+ * fatal: a reverse dial that fails changes nothing about the relay path, and "the punch timed out"
+ * and "there was nothing to punch at" are different facts that need different responses. A timeout
+ * is the ordinary outcome for a dispatcher behind a symmetric NAT that answered nothing -- the same
+ * code the dispatcher's own failed push reports (`P2P_PUNCH_TIMEOUT`), prefixed so a reader can tell
+ * which end dialled.
+ */
+export const P2P_REVERSE_DIAL_TIMEOUT = 'P2P_REVERSE_DIAL_TIMEOUT';
+export const P2P_REVERSE_DIAL_FAILED = 'P2P_REVERSE_DIAL_FAILED';
+
+/**
+ * The plan code for "there is a live channel, so there is nothing to dial".
+ *
+ * Not a failure: it is the ordinary answer when the dispatcher's own push landed. It is a distinct
+ * code because the *result* path re-plans on it: a channel that existed when the offer arrived and is
+ * gone when the result is ready (the dispatcher closes the channel it pushed the offer over) gets the
+ * one reverse-dial attempt the contract allows, whereas every other skip reason stays skipped.
+ */
+export const P2P_CHANNEL_LIVE = 'P2P_CHANNEL_LIVE';
+
+/**
+ * The mechanism names that go into `p2p.opened_by`.
+ *
+ * Named rather than inferred at the reader's end: `result_path: 'p2p'` says the result travelled
+ * directly, and this says *what opened the path* -- the dispatcher's punch, this machine's dial at
+ * offer time (the simultaneous punch), or this machine's dial once the result was ready.
+ */
+export const P2P_OPENED_BY = Object.freeze({
+  DISPATCHER_PUNCH: 'dispatcher-punch',
+  SIMULTANEOUS_PUNCH: 'simultaneous-punch',
+  RESULT_REVERSE_DIAL: 'result-reverse-dial',
+});
 /**
  * Upper bound on the stages a single offer may carry (v0.3.3 `pipeline`).
  *
@@ -1003,6 +1040,50 @@ export function createAgent(options) {
    */
   const p2pChannels = new Map();
 
+  /**
+   * The dispatcher address a task's channel actually travels to, remembered past the channel.
+   *
+   * This is the *observed* address for a channel that arrived inbound (`accept()` answers to the
+   * `rinfo` of the HELLO it received, never to the address that peer announced) and the punched
+   * address for one this agent opened. It outlives the channel on purpose: when the dispatcher
+   * closes the channel it pushed the offer over -- which it does, right after the offer -- the
+   * result still has somewhere to go, and the observed address is the one address a symmetric NAT
+   * on the dispatcher's side is still holding a mapping for. Retyping the announced candidate
+   * instead is the punch that already failed.
+   *
+   * @type {Map<string, {address: string, port: number}>}
+   */
+  const p2pPeers = new Map();
+
+  /**
+   * One reverse-dial attempt per `task_id` — the executor's own half of a two-way punch.
+   *
+   * A record exists for every offer this agent takes on, including the ones it decides *not* to
+   * dial for, and that is deliberate: "we did not try, because a channel was already live" and "we
+   * tried and it timed out" must be distinguishable at result time, and a missing record must not
+   * silently mean a second attempt. `promise` settles when the dial is over; it is awaited by the
+   * result path (bounded by the same tuning window), never by the offer path.
+   *
+   * @type {Map<string, {task_id: string, attempted: boolean, ok: boolean, code: string|null,
+   *   reason: string|null, stage: 'offer'|'result', session: number|null, candidates: number,
+   *   channel: object|null, promise: Promise<object>|null, ms: number|null}>}
+   */
+  const p2pReverseDials = new Map();
+
+  /**
+   * How long this agent may spend dialling a dispatcher, from the node's own tuning.
+   *
+   * Read from the node rather than fixed here so the number lives beside `punchTimeoutMs` and
+   * `acceptTimeoutMs`: an operator tuning a slow path tunes one object, and a test that cannot wait
+   * eight seconds injects one.
+   */
+  function reverseDialTimeoutMs() {
+    const configured = p2pNode?.tuning?.reverseDialTimeoutMs;
+    return typeof configured === 'number' && Number.isFinite(configured) && configured > 0
+      ? configured
+      : P2P_DEFAULTS.reverseDialTimeoutMs;
+  }
+
   /** The agent's P2P facts, always a fresh plain object. */
   function p2pStatusSnapshot() {
     const nodeStatus = p2pNode?.status ?? null;
@@ -1193,6 +1274,17 @@ export function createAgent(options) {
 
   /** Remember which channel a task's result should travel back over, and release it on close. */
   function rememberChannel(taskId, channel) {
+    const peer = channel?.peer;
+    if (
+      peer !== null &&
+      typeof peer?.address === 'string' &&
+      peer.address !== '' &&
+      Number.isInteger(peer?.port) &&
+      peer.port > 0
+    ) {
+      // Kept even though this channel may be replaced or closed below: see `p2pPeers`.
+      p2pPeers.set(taskId, { address: peer.address, port: peer.port });
+    }
     const previous = p2pChannels.get(taskId);
     if (previous?.channel === channel) return;
     if (previous) previous.channel.removeListener('close', previous.onClose);
@@ -1207,7 +1299,227 @@ export function createAgent(options) {
   const channelFor = (taskId) => p2pChannels.get(taskId)?.channel ?? null;
 
   /**
-   * Release the channel a task used, once the attempt is over.
+   * What a reverse dial would need, or the named reason there is nothing to dial.
+   *
+   * WHY THE EXECUTOR DIALS AT ALL
+   *
+   * The dispatcher pushes first, and if it is behind a symmetric NAT (CGNAT, in practice) its HELLOs
+   * are addressed from a mapped port that nobody was told about, so they reach nothing. Its own
+   * outbound packet still opened a mapping *towards this machine*, though -- and that is half a path.
+   * The other half is a packet from here, addressed at the dispatcher: the moment this machine sends
+   * one, its own NAT lets the dispatcher's HELLO through and the second packet lands on a path that is
+   * already open. Neither end can do it alone, which is why a peer that only ever accepted cannot
+   * rescue a CGNAT initiator.
+   *
+   * WHERE THE ADDRESSES COME FROM
+   *
+   * The offer's own `p2p.candidates` when the dispatcher published them (it knows its own announced
+   * addresses better than a relay lookup that may already have expired), with the address this task's
+   * channel actually reached first when there was one, and the relay's `/v1/peer/{id}` answer as the
+   * node's own fallback when neither is available.
+   *
+   * @param {object} offer
+   * @returns {{ok:true, machineId:string, session:number, candidates:Array<object>, from:string}
+   *   |{ok:false, code:string, reason:string}}
+   */
+  function reverseDialPlan(offer) {
+    const taskId = typeof offer?.task_id === 'string' && offer.task_id !== '' ? offer.task_id : null;
+    if (taskId === null) {
+      return { ok: false, code: 'P2P_NO_TASK_ID', reason: 'P2P_NO_TASK_ID: the offer names no task to dial for' };
+    }
+    if (p2pMode === 'relay') {
+      return {
+        ok: false,
+        code: 'P2P_DISABLED',
+        reason: 'P2P_DISABLED: p2pMode is "relay", so this machine never dials (the relay path is the only path)',
+      };
+    }
+    if (p2pNode === null || p2pNode.status.running !== true) {
+      return {
+        ok: false,
+        code: 'P2P_UNREACHABLE',
+        reason: 'P2P_UNREACHABLE: the P2P node is not running, so no direct path can be dialled',
+      };
+    }
+    if (channelFor(taskId) !== null) {
+      return {
+        ok: false,
+        code: P2P_CHANNEL_LIVE,
+        reason: `P2P_CHANNEL_LIVE: a direct channel for ${taskId} is already open, so there is nothing to dial`,
+      };
+    }
+
+    const block = offer?.p2p;
+    if (block === null || typeof block !== 'object' || Array.isArray(block)) {
+      return {
+        ok: false,
+        code: 'P2P_NO_SESSION',
+        reason: 'P2P_NO_SESSION: the offer published no `p2p` block, so there is no session to join',
+      };
+    }
+    const dispatcher =
+      typeof offer?.origin_machine_id === 'string' && offer.origin_machine_id !== ''
+        ? offer.origin_machine_id
+        : null;
+    if (dispatcher === null) {
+      return {
+        ok: false,
+        code: 'P2P_NO_ORIGIN',
+        reason: 'P2P_NO_ORIGIN: the offer does not name the machine that dispatched it, so there is nothing to dial',
+      };
+    }
+
+    const machineId = identity.machine_id;
+    const published = Array.isArray(block.candidates) ? block.candidates : [];
+    let session = Number.isInteger(block.session) && block.session > 0 ? block.session : null;
+    let from = 'offer session';
+    if (session === null) {
+      session = punchSession({ punch: block.punch, taskId, machineId });
+      from = 'offer punch';
+    }
+    if (session === null && published.length > 0) {
+      // A dispatcher that published where to dial but not which session: this end picks one and the
+      // far end adopts it. The 404-free lookup is the point -- `p2p.candidates` came with the offer.
+      session = reverseDialSession({ originMachineId: dispatcher, taskId, machineId });
+      from = 'derived session';
+    }
+    if (session === null) {
+      return {
+        ok: false,
+        code: 'P2P_NO_SESSION',
+        reason:
+          'P2P_NO_SESSION: the offer published neither a session nor candidates, so this is a v0.4.x ' +
+          'dispatcher and the relay carries the result exactly as it did before',
+      };
+    }
+
+    const observed = p2pPeers.get(taskId) ?? null;
+    return {
+      ok: true,
+      machineId: dispatcher,
+      session,
+      candidates: observed === null ? [...published] : [observed, ...published],
+      from: observed === null ? from : `${from} + observed peer`,
+    };
+  }
+
+  /**
+   * Start (or reuse) this task's one reverse-dial attempt. Never awaited by the offer path.
+   *
+   * @param {object} offer
+   * @param {{stage?: 'offer'|'result', afterLiveChannel?: boolean}} [options]
+   * @returns {object|null} The record; `promise` settles when the dial is over.
+   */
+  function startReverseDial(offer, options = {}) {
+    const taskId = typeof offer?.task_id === 'string' && offer.task_id !== '' ? offer.task_id : null;
+    if (taskId === null) return null;
+    const stage = options.stage === 'result' ? 'result' : 'offer';
+
+    const existing = p2pReverseDials.get(taskId) ?? null;
+    if (existing !== null) {
+      // One attempt per task, with exactly one exception: a decision that said "a channel is already
+      // live" is re-planned at result time, because that channel may be gone by then and the result
+      // is what the dial exists for. Everything else -- attempted, disabled, unreachable, no session
+      // -- is final, so a result never pays for a second eight-second wait.
+      const rePlannable = existing.attempted !== true && existing.code === P2P_CHANNEL_LIVE;
+      if (!(options.afterLiveChannel === true && rePlannable)) return existing;
+    }
+
+    const plan = reverseDialPlan(offer);
+    /** @type {object} */
+    const record = {
+      task_id: taskId,
+      attempted: plan.ok === true,
+      ok: false,
+      code: plan.ok === true ? null : plan.code,
+      reason: plan.ok === true ? null : plan.reason,
+      stage,
+      session: plan.ok === true ? plan.session : null,
+      candidates: plan.ok === true ? plan.candidates.length : 0,
+      from: plan.ok === true ? plan.from : null,
+      channel: null,
+      promise: null,
+      ms: null,
+    };
+    p2pReverseDials.set(taskId, record);
+
+    if (!plan.ok) {
+      record.promise = Promise.resolve(record);
+      if (plan.code !== P2P_CHANNEL_LIVE) {
+        log('info', `not dialling back for ${taskId}: ${plan.reason}`);
+      }
+      return record;
+    }
+
+    const timeoutMs = reverseDialTimeoutMs();
+    const startedAt = process.hrtime.bigint();
+    record.promise = (async () => {
+      let dialled;
+      try {
+        dialled = await p2pNode.dial(plan.machineId, {
+          session: plan.session,
+          candidates: plan.candidates,
+          timeoutMs,
+        });
+      } catch (error) {
+        // `dial()` documents that it never throws; caught anyway, because this runs detached from
+        // every caller and an unhandled rejection is the one failure that could take the process down.
+        dialled = { ok: false, error: `P2P_REVERSE_DIAL_FAILED: ${error?.message ?? String(error)}` };
+      }
+      record.ms = Math.round(Number(process.hrtime.bigint() - startedAt) / 1e5) / 10;
+      if (dialled?.ok === true) {
+        record.ok = true;
+        record.channel = dialled.channel;
+        record.reused = dialled.reused === true;
+        rememberChannel(taskId, dialled.channel);
+        log('info', `reverse dial to ${plan.machineId} opened a channel for ${taskId}`, {
+          session: dialled.session,
+          ms: record.ms,
+          reused: record.reused,
+          candidates: plan.candidates.length,
+        });
+        return record;
+      }
+      const text = typeof dialled?.error === 'string' && dialled.error !== '' ? dialled.error : 'the dial reported no reason';
+      record.reason = text.startsWith('P2P_PUNCH_TIMEOUT')
+        ? `${P2P_REVERSE_DIAL_TIMEOUT}: ${text}`
+        : `${P2P_REVERSE_DIAL_FAILED}: ${text}`;
+      // A distinct code from the reason: the full message names the candidates and the window, and
+      // this is what a reader or a metric can match on without parsing prose.
+      record.code = record.reason.slice(0, record.reason.indexOf(':'));
+      log('warn', `reverse dial for ${taskId} did not open a channel; the relay path is unaffected`, {
+        reason: record.reason,
+        ms: record.ms,
+      });
+      return record;
+    })();
+
+    return record;
+  }
+
+  /**
+   * The reverse-dial facts one result envelope reports, or null when there was no record.
+   *
+   * @param {string} taskId
+   * @returns {object|null}
+   */
+  function reverseDialSummary(taskId) {
+    const record = p2pReverseDials.get(taskId) ?? null;
+    if (record === null) return null;
+    return {
+      attempted: record.attempted === true,
+      ok: record.ok === true,
+      code: record.code,
+      reason: record.reason,
+      stage: record.stage,
+      session: record.session,
+      candidates: record.candidates,
+      ms: record.ms,
+      channel: record.channel ?? null,
+    };
+  }
+
+  /** Release the channel a task used, once the attempt is over.
    *
    * A channel exists for one attempt: the offer arrives on it and the result notice is acknowledged
    * on it, and nothing else is expected. Without this, an agent accumulated one live session per task
@@ -1217,6 +1529,8 @@ export function createAgent(options) {
    * channel to answer on (the relay copy is the durable one).
    */
   function releaseChannel(taskId) {
+    p2pReverseDials.delete(taskId);
+    p2pPeers.delete(taskId);
     const entry = p2pChannels.get(taskId);
     if (!entry) return;
     p2pChannels.delete(taskId);
@@ -1237,14 +1551,30 @@ export function createAgent(options) {
    * is answered over the channel, and that is only possible while the channel exists. 30 seconds is
    * long enough to cover a retry and short enough that a long-lived agent does not accumulate one
    * session per task it has ever run.
+   *
+   * Scheduled even when there is no channel: the timer is also what releases this task's remembered
+   * peer address, and a task whose dial timed out has exactly that and no channel.
    */
   function scheduleChannelRelease(taskId) {
     const entry = p2pChannels.get(taskId);
-    if (!entry) return;
-    clearTimeout(entry.lingerTimer);
+    if (entry) clearTimeout(entry.lingerTimer);
     const timer = setTimeout(() => releaseChannel(taskId), p2pChannelLingerMs);
     timer.unref?.();
-    entry.lingerTimer = timer;
+    if (entry) entry.lingerTimer = timer;
+  }
+
+  /**
+   * Let go of one task's dial record, once its envelope has been built.
+   *
+   * That envelope is the record's last reader: the record exists to decide `result_path` and to name
+   * the mechanism that opened the channel, and both are inside the envelope by the time this runs. A
+   * re-attempt of the same task (`attempt + 1`) is a new decision and starts a fresh dial, which is
+   * why this is not left to the linger timer -- that one waits 30 s, and a retry can arrive sooner.
+   *
+   * @param {string} taskId
+   */
+  function releaseDialRecord(taskId) {
+    p2pReverseDials.delete(taskId);
   }
 
   /** The STUN list the node is actually querying, for a status surface that can be quoted. */
@@ -1815,6 +2145,25 @@ export function createAgent(options) {
    *   * `session`   -- the punch's session id, which is what correlates two agents' logs.
    *   * `mapping`   -- the NAT mapping this agent's announcement measured.
    *
+   * v0.4.x adds three more, because "the result came back over the relay" and "the result came back
+   * over the relay *after this machine spent eight seconds dialling*" are different operational
+   * facts and the v0.4.0 block could not tell them apart:
+   *
+   *   * `opened_by` -- which mechanism opened the channel, named rather than inferred:
+   *                   `dispatcher-punch` (the dispatcher's outbound HELLO landed), `simultaneous-punch`
+   *                   (this machine dialled as the offer arrived, and that is what opened both
+   *                   filters), `result-reverse-dial` (this machine dialled once the result was
+   *                   ready). Absent when no channel carried anything.
+   *   * `reverse_dial` -- `'p2p'` when this machine's own dial opened a channel, `'relay'` when it was
+   *                   attempted and did not. Absent when it was never attempted, which is not a
+   *                   failure and must not be spelled as one.
+   *   * `reverse_dial_reason` -- the named code when the dial did not open a channel
+   *                   (`P2P_REVERSE_DIAL_TIMEOUT`, `P2P_REVERSE_DIAL_FAILED`), or null.
+   *   * `result_error` -- why the direct copy of *this result* did not land, when one was attempted
+   *                   and not acknowledged (`P2P_ACK_TIMEOUT: …`). Null otherwise; this is the
+   *                   `delivery.error` that `p2pDeliveryMark` has always carried and the envelope
+   *                   never reported.
+   *
    * @param {object} context
    * @returns {object}
    */
@@ -1823,11 +2172,41 @@ export function createAgent(options) {
     const transport = context.p2pTransport ?? offerTransportOf(offer, p2pStatusSnapshot());
     const delivery = context.p2pDelivery ?? p2pDeliveryMark();
     const record = context.p2pRecord ?? null;
+    const reverse = context.p2pReverse ?? null;
     const dispatcherMode = offer?.p2p?.mode;
+
+    /**
+     * Which mechanism opened the channel that carried the offer or the result.
+     *
+     * Identity, not timing: the record keeps the channel object its dial opened, so "the reverse dial
+     * is what carried this result" is a comparison of two references rather than a guess from the
+     * order things happened in. A channel that arrived on its own can only be the dispatcher's punch.
+     */
+    const usedChannel = channelFor(offer?.task_id);
+    let openedBy = null;
+    if (delivery.path === 'p2p') {
+      if (reverse?.ok === true && reverse.channel !== null && reverse.channel === usedChannel) {
+        openedBy = reverse.stage === 'result'
+          ? P2P_OPENED_BY.RESULT_REVERSE_DIAL
+          : P2P_OPENED_BY.SIMULTANEOUS_PUNCH;
+      } else {
+        openedBy = P2P_OPENED_BY.DISPATCHER_PUNCH;
+      }
+    } else if (transport.offer_path === 'p2p') {
+      openedBy = P2P_OPENED_BY.DISPATCHER_PUNCH;
+    }
+
     return {
       mode: typeof dispatcherMode === 'string' && dispatcherMode !== '' ? dispatcherMode : p2pMode,
       offer_path: transport.offer_path,
       ...(delivery.path === null ? {} : { result_path: delivery.path }),
+      ...(openedBy === null ? {} : { opened_by: openedBy }),
+      ...(reverse === null || reverse.attempted !== true
+        ? {}
+        : { reverse_dial: reverse.ok === true ? 'p2p' : 'relay' }),
+      ...(reverse !== null && typeof reverse.reason === 'string' && reverse.reason !== ''
+        ? { reverse_dial_reason: reverse.reason }
+        : {}),
       // The key is OMITTED when there is nothing to explain, and that is not the same as setting it
       // to `undefined`: `JSON.stringify` would drop that, but the envelope hash is computed with JCS,
       // whose implementation (rightly) refuses a non-JSON value. Measured -- `reason: undefined`
@@ -1835,9 +2214,17 @@ export function createAgent(options) {
       // `jcs: property reason is undefined`, so the task executed and then vanished from the ledger.
       ...(typeof transport.reason === 'string' && transport.reason !== '' ? { reason: transport.reason } : {}),
       rtt_ms: delivery.rtt_ms ?? record?.rtt_ms ?? null,
-      peer: record?.peer ?? null,
-      session: record?.session ?? null,
+      // The peer address and session of whichever channel this machine holds for the task: the one
+      // that carried the offer, or the one its own dial opened. For an inbound channel `peer` stays
+      // null (a HELLO carries a session, not an identity) -- but a channel *this* machine dialled has
+      // a peer address it chose, and reporting "no peer" there would hide the one address the punch
+      // actually used.
+      peer: record?.peer ?? (reverse?.ok === true && reverse.channel !== null ? { ...reverse.channel.peer } : null),
+      session: record?.session ?? reverse?.session ?? null,
       mapping: p2pNode?.status.mapping ?? null,
+      ...(delivery.asked === true && delivery.path === null && typeof delivery.error === 'string' && delivery.error !== ''
+        ? { result_error: delivery.error }
+        : {}),
     };
   }
 
@@ -2088,6 +2475,15 @@ export function createAgent(options) {
       cwd_rel: cwdRel,
       write: offer.write === true,
     });
+
+    // ---- 1b. the two-way punch (v0.4.x) ----------------------------------
+    // Started here, and *started* rather than awaited: the dispatcher may be behind a symmetric NAT
+    // that swallowed its push, and a packet from this machine is the only thing that can open the
+    // other half of that path. Everything the relay does today happens exactly as it did -- the
+    // lease heartbeat, the gates, the command, the relay copy of the result -- while this runs
+    // beside it for a bounded window. Nothing below waits for it; the result path is the one place
+    // that reads its outcome, and even there only to decide `result_path`.
+    startReverseDial(offer);
 
     // ---- 2. lease heartbeat ---------------------------------------------
     heartbeat = new Heartbeat({
@@ -2425,10 +2821,39 @@ export function createAgent(options) {
    * envelope on the channel would need the envelope before the acknowledgement that decides one of
    * its fields -- see the note in the v0.4.0 report and `PROTOCOL-v0.4.0.md`'s open question.
    *
+   * A channel is no longer a precondition (v0.4.x): when there is none, this dials the dispatcher
+   * first (see `reverseDialPlan`) and uses the channel that opens. What has *not* changed is the
+   * bound and the order -- the relay copy still goes out after this returns, whatever it decided, and
+   * the whole function still costs at most one dial window plus one ack window.
+   *
    * @param {object} offer
+   * @param {string|null} [status] The outcome this envelope is about to report. A `refused` attempt
+   *   has no direct result worth dialling for: nothing ran, the envelope that says so travels over
+   *   the relay exactly as it does today, and paying the dial window for it would delay a refusal
+   *   for no gain. The value matters only when no decision was recorded at offer time (the refusal
+   *   path returns before the offer-time dial is started).
    * @returns {Promise<ReturnType<typeof p2pDeliveryMark>>}
    */
-  async function planDirectDelivery(offer) {
+  async function planDirectDelivery(offer, status = null) {
+    const taskId = typeof offer?.task_id === 'string' && offer.task_id !== '' ? offer.task_id : null;
+
+    if (taskId !== null && channelFor(taskId) === null) {
+      // ---- the result-path reverse dial (v0.4.x) ---------------------------
+      // No channel: the offer came over the relay, or it came over a channel the dispatcher has since
+      // closed (it closes the one it pushed the offer over, immediately after the push). Before the
+      // relay carries the result -- which it still does, unchanged, in every failure case -- this
+      // machine tries once, bounded, to dial the dispatcher itself. The attempt is *reused* when the
+      // offer-time dial is still running or already finished, so a task pays for one window at most,
+      // never two.
+      if (!(status === 'refused' && p2pReverseDials.get(taskId) === undefined)) {
+        const record = startReverseDial(offer, { stage: 'result', afterLiveChannel: true });
+        if (record !== null && record.attempted === true && record.promise !== null) {
+          // Bounded by construction: `dial()` resolves at the tuning window or on the first answer.
+          await record.promise;
+        }
+      }
+    }
+
     if (channelFor(offer?.task_id) === null) return p2pDeliveryMark();
     const direct = await sendResultDirect(offer.task_id);
     if (direct.delivered) {
@@ -2512,18 +2937,25 @@ export function createAgent(options) {
   async function finish(context) {
     const anchorsAfter = context.anchorsAfter ?? (await safePostState(context.offer, context.warnings));
     const toolchain = await toolchainInfo();
+    // The bounded wait happens *before* the envelope is built, because `result_path` has to be
+    // inside the envelope when `envelope_sha256` is taken; see `sendResultDirect`.
+    const p2pDelivery = context.p2pDelivery ?? (await planDirectDelivery(context.offer, context.status));
+    // Read once, here, and handed to `makeEnvelope`: the envelope has to describe the dial that
+    // decided its `result_path`, and the record is released with the channel a moment later.
+    const p2pReverse = context.p2pReverse ?? reverseDialSummary(context.offer?.task_id);
     const envelope = makeEnvelope({
       ...context,
       anchorsAfter,
       toolchain,
       comparePolicy: context.offer.compare_policy,
-      // The bounded wait happens *before* the envelope is built, because `result_path` has to be
-      // inside the envelope when `envelope_sha256` is taken; see `sendResultDirect`.
-      p2pDelivery: context.p2pDelivery ?? (await planDirectDelivery(context.offer)),
+      p2pDelivery,
+      p2pReverse,
     });
     await deliver(envelope);
     // The attempt is over. The channel lingers (bounded) so a duplicate of this attempt can still be
-    // answered on it, and is released afterwards.
+    // answered on it, and is released afterwards; the dial's own bookkeeping is consumed by the
+    // envelope above and released with it, so a long-lived agent keeps one record per *live* task.
+    releaseDialRecord(envelope.task_id);
     scheduleChannelRelease(envelope.task_id);
     return envelope;
   }

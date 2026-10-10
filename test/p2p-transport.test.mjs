@@ -17,11 +17,17 @@ import {
   KIND,
   MAX_FRAGMENT_PAYLOAD,
   MAX_MESSAGE_BYTES,
+  MAX_PUNCH_ID_LENGTH,
   P2PChannel,
   P2P_VERSION,
+  PUNCH_SESSION_LABEL,
   connect,
   deriveSession,
+  isPunchId,
+  mintPunchId,
   punch,
+  punchSession,
+  reverseDialSession,
 } from '../src/agent/p2p.mjs';
 import { bindUdpSocket } from '../src/agent/stun.mjs';
 
@@ -175,6 +181,66 @@ describe('p2p: punching', () => {
     } finally {
       close();
     }
+  });
+});
+
+describe('p2p: a published punch id (v0.4.x)', () => {
+  it('derives one session on both ends from the punch id, the task and the executor', () => {
+    // The two ends compute this from different sources -- the dispatcher from the lease, the
+    // executor from the offer and its own identity -- and the values have to be equal, or the
+    // executor's HELLO carries a session the dispatcher's in-flight punch is filtering out.
+    const published = { punch: 'a1b2c3d4e5f60718', taskId: 'task-01', machineId: 'mac-peer' };
+    const dispatcherSide = punchSession(published);
+    const executorSide = punchSession({ ...published });
+    assert.equal(dispatcherSide, executorSide);
+    assert.ok(Number.isInteger(dispatcherSide) && dispatcherSide > 0);
+  });
+
+  it('keeps two machines leased one dispatch on different sessions', () => {
+    // The reason the published value is a punch id and not a session: one dispatch leases one task to
+    // several machines, and a shared session would make the second machine's HELLO look like a
+    // re-acknowledgement of the first machine's live channel.
+    const punch = 'deadbeefdeadbeef';
+    const one = punchSession({ punch, taskId: 'task-01', machineId: 'mac-a' });
+    const two = punchSession({ punch, taskId: 'task-01', machineId: 'mac-b' });
+    assert.notEqual(one, two);
+    assert.notEqual(one, punchSession({ punch, taskId: 'task-02', machineId: 'mac-a' }));
+    assert.notEqual(one, punchSession({ punch: 'other-punch', taskId: 'task-01', machineId: 'mac-a' }));
+  });
+
+  it('answers null rather than a session when the punch id is unusable', () => {
+    // `null` is the caller's cue to fall back to an id of its own -- see `reverseDialSession`. A
+    // made-up session here would be worse than none: the executor would punch at an id nobody uses.
+    for (const punch of [undefined, null, '', 0, -1, 2 ** 33, 1.5, {}, [], 'x'.repeat(MAX_PUNCH_ID_LENGTH + 1)]) {
+      assert.equal(isPunchId(punch), false, `${JSON.stringify(punch)} must not be a punch id`);
+      assert.equal(punchSession({ punch, taskId: 'task-01', machineId: 'mac-a' }), null);
+    }
+    assert.equal(punchSession({ punch: 'ok', taskId: '', machineId: 'mac-a' }), null);
+    assert.equal(punchSession({ punch: 'ok', taskId: 'task-01', machineId: '' }), null);
+    // Both shapes a JSON hop can carry are accepted, and a number means what it says.
+    assert.equal(isPunchId('0f0f'), true);
+    assert.equal(isPunchId(42), true);
+    assert.equal(punchSession({ punch: 42, taskId: 't', machineId: 'm' }), deriveSession(PUNCH_SESSION_LABEL, 42, 't', 'm'));
+  });
+
+  it('mints a fresh id that its own validator accepts', () => {
+    const first = mintPunchId();
+    const second = mintPunchId();
+    assert.equal(isPunchId(first), true);
+    assert.match(first, /^[0-9a-f]{16}$/);
+    assert.notEqual(first, second, 'two dispatches must not share a punch');
+  });
+
+  it('derives a local session for a dispatcher that published candidates but no punch', () => {
+    // The compatibility path: the executor picks the id and the far end's `accept()` adopts whatever
+    // the HELLO carries, which is exactly what `allowSessionAdoption` exists for.
+    const local = reverseDialSession({ originMachineId: 'win-cgnat', taskId: 'task-01', machineId: 'mac-a' });
+    assert.ok(Number.isInteger(local) && local > 0);
+    assert.equal(local, reverseDialSession({ originMachineId: 'win-cgnat', taskId: 'task-01', machineId: 'mac-a' }));
+    assert.notEqual(local, reverseDialSession({ originMachineId: 'win-other', taskId: 'task-01', machineId: 'mac-a' }));
+    assert.notEqual(local, reverseDialSession({ originMachineId: 'win-cgnat', taskId: 'task-01', machineId: 'mac-b' }));
+    assert.equal(reverseDialSession({ originMachineId: '', taskId: 'task-01', machineId: 'mac-a' }), null);
+    assert.equal(reverseDialSession({ originMachineId: 'win', taskId: 'task-01' }), null);
   });
 });
 

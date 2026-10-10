@@ -69,6 +69,11 @@ import {
   normalizeP2PMode,
   stunServersWithShared,
 } from '../agent/p2p-node.mjs';
+// The punch identity both ends have to agree on (v0.4.x). Imported from the transport that will use
+// it, never re-derived here: the session is the only thing that tells one punch's frames from
+// another's, so a second implementation of the formula that drifted by one input would make every
+// reverse dial time out while both ends insisted they were sending.
+import { mintPunchId, punchSession } from '../agent/p2p.mjs';
 import { parseServer } from '../agent/stun.mjs';
 // The result-deduplication identity the relay mints. Imported rather than re-implemented: the value
 // is compared byte for byte by the executor, so a second copy of the formula that drifted by one
@@ -1042,6 +1047,81 @@ function createP2PTransport(cfg) {
 }
 
 /**
+ * The `p2p` block a dispatch publishes through the relay, and what it is for.
+ *
+ * WHAT THE EXECUTOR CANNOT DO WITHOUT IT
+ *
+ * A dispatcher behind a symmetric NAT (CGNAT, in practice) can send all it likes and still be heard
+ * by nobody: its outbound HELLO opens its own mapping, but the peer's filter stays shut until
+ * *something of the peer's* has gone the other way. So the executor has to dial first — and to dial
+ * it needs two things the offer itself can carry: where the dispatcher says it is, and which punch
+ * to join. Without them the executor has only the relay lookup, which is a second opinion about the
+ * same machine that answers 404 for a dispatcher whose announcement has just expired.
+ *
+ * WHY A PUNCH ID RATHER THAN A SESSION ID
+ *
+ * The session id cannot be known when this request is written: one dispatch leases one task to
+ * several machines, and the relay decides which — in the same request that mints the task id. A
+ * single session shared by those machines would be a defect, not a simplification: on the
+ * dispatcher's own node the second machine's HELLO would look like a re-acknowledgement of the
+ * first machine's live channel, so one of them would have its result delivered to the other's
+ * address. The block therefore publishes a per-dispatch *punch id*, and both ends derive the same
+ * per-machine session from it (`punchSession` in `src/agent/p2p.mjs`): the dispatcher from the
+ * lease, the executor from the offer plus its own machine id. The pushed frame — which is addressed
+ * to one machine, so the value *is* known — carries the derived `session` as well.
+ *
+ * COMPATIBILITY
+ *
+ * Both keys are additions *inside* an object the relay already treats as opaque (`validateTaskRouting`
+ * checks `p2p` is an object with a valid `mode` and copies the rest verbatim), and both a v0.4.x
+ * relay and a v0.4.x agent ignore keys they do not read. `relay` mode publishes `{mode}` alone: there
+ * is no punch, and saying so is better than publishing a stale one.
+ *
+ * @param {ReturnType<typeof readConfig>} cfg
+ * @param {object} runtime The P2P runtime handle from {@link createP2PRuntime}.
+ * @returns {{mode: string, punch?: string, candidates?: Array<{address:string, port:number}>}}
+ */
+function buildP2POfferBlock(cfg, runtime) {
+  const block = { mode: cfg.p2pMode };
+  if (cfg.p2pMode === 'relay') return block;
+  // Minted here, before the task exists, because it has to travel in the request that *creates* the
+  // task: the relay republishes the stored block to the executor, and there is no way to amend it
+  // afterwards.
+  block.punch = mintPunchId();
+  // Announced candidates, when the node has already announced. Not waited for: `start()` kicks the
+  // first announce off rather than awaiting the STUN sweep, and a dispatch delayed by four STUN
+  // servers would trade a fast path for a slower one. Absent means "ask the relay", which is exactly
+  // what the executor does when the field is missing.
+  const candidates = runtime?.node?.status?.candidates;
+  if (Array.isArray(candidates) && candidates.length > 0) {
+    block.candidates = candidates.map((candidate) => ({ address: candidate.address, port: candidate.port }));
+  }
+  return block;
+}
+
+/**
+ * One machine's copy of the `p2p` block: everything published, plus the session for *this* machine.
+ *
+ * The added `session` is what makes the push and a reverse dial one punch rather than two: an
+ * executor that received the offer over a channel may still have to dial back (the dispatcher closes
+ * the channel it pushed over, immediately after the push), and a dial carrying a session the
+ * dispatcher is not filtering for would be answered by its `accept()` at best — a second session,
+ * a second channel, and two live sessions for one task where one would do.
+ *
+ * @param {unknown} published The block from {@link buildP2POfferBlock}, or whatever the caller sent.
+ * @param {{taskId: string, machineId: string}} identity
+ * @returns {object|null}
+ */
+function offerP2PFor(published, { taskId, machineId }) {
+  if (published === null || published === undefined) return null;
+  if (typeof published !== 'object' || Array.isArray(published)) return null;
+  const block = { ...published };
+  const session = punchSession({ punch: block.punch, taskId, machineId });
+  if (session !== null) block.session = session;
+  return block;
+}
+
+/**
  * Mint the offer frame the executor needs, from the lease the relay just issued.
  *
  * WHY THIS IS DERIVED RATHER THAN INVENTED
@@ -1103,7 +1183,7 @@ function buildOfferFrame({ taskId, lease, payload, originMachineId }) {
       requirements: payload.requirements,
       compare_policy: payload.compare_policy,
       origin_machine_id: originMachineId,
-      p2p: payload.p2p ?? null,
+      p2p: offerP2PFor(payload.p2p, { taskId, machineId }),
     },
     skipped: null,
   };
@@ -1112,25 +1192,40 @@ function buildOfferFrame({ taskId, lease, payload, originMachineId }) {
 /**
  * Push one offer over the direct path. Best effort by construction: nothing here throws.
  *
+ * The session comes from the frame's own `p2p.session` — minted per machine by
+ * {@link offerP2PFor} from the punch id the relay is publishing for this same task. Dialling with a
+ * session of the node's own invention would leave the two ends on two sessions, and an executor
+ * whose reverse dial happened to arrive first would open a *second* channel beside this one instead of
+ * the same one. `reused` in the answer is the honest report of the case where the executor's dial got
+ * there first and this push therefore travelled over the channel that dial opened.
+ *
  * @param {P2PNode} node
  * @param {object} frame
- * @returns {Promise<{ok: boolean, error: string|null}>}
+ * @returns {Promise<{ok: boolean, error: string|null, session: number|null, reused: boolean}>}
  */
 async function pushOffer(node, frame) {
+  const session = Number.isInteger(frame?.p2p?.session) && frame.p2p.session > 0 ? frame.p2p.session : undefined;
   try {
-    const dialled = await node.dial(frame.machine_id);
-    if (!dialled.ok) return { ok: false, error: dialled.error ?? 'P2P_DIAL_FAILED' };
+    const dialled = await node.dial(frame.machine_id, session === undefined ? {} : { session });
+    if (!dialled.ok) {
+      return { ok: false, error: dialled.error ?? 'P2P_DIAL_FAILED', session: dialled.session ?? null, reused: false };
+    }
     const channel = dialled.channel;
     try {
       await channel.send(JSON.stringify(frame));
-      return { ok: true, error: null };
+      return { ok: true, error: null, session: dialled.session ?? null, reused: dialled.reused === true };
     } finally {
       // The offer is one frame over a reliable channel: holding the channel open would keep a NAT
       // mapping alive for a conversation that is over, and the result comes back the responder's way.
       channel.close('offer-sent');
     }
   } catch (error) {
-    return { ok: false, error: `P2P_PUSH_THREW: ${error instanceof Error ? error.message : String(error)}` };
+    return {
+      ok: false,
+      error: `P2P_PUSH_THREW: ${error instanceof Error ? error.message : String(error)}`,
+      session: session ?? null,
+      reused: false,
+    };
   }
 }
 
@@ -1175,6 +1270,13 @@ async function pushOffers(node, { taskId, leases, payload, originMachineId }) {
       ok: result.ok,
       error: result.error,
       dedupe_key: built.frame.dedupe_key === null ? null : 'relay-formula',
+      // The session this push and the executor's reverse dial meet on, so a machine's own
+      // `p2p.session` in the ledger can be matched to the dispatcher's attempt without reading two
+      // logs side by side. `null` when there was nothing to punch over (a v0.4.x-shaped frame).
+      session: result.session,
+      // True when the executor's dial got there first and this push travelled over the channel that
+      // dial opened — a two-way punch that worked, reported as such rather than as a plain push.
+      reused: result.reused === true,
     });
   }
   return out;
@@ -2942,6 +3044,14 @@ export async function apply(ctx, config = {}) {
       const originMachineId =
         typeof p2p.machineId === 'string' && p2p.machineId !== '' ? p2p.machineId : null;
 
+      /**
+       * v0.4.x: the punch this dispatch will use, published with the task so the executor can join
+       * the same session instead of waiting to be reached. See {@link buildP2POfferBlock} for why the
+       * block carries a punch id rather than the session itself, and why `relay` mode publishes
+       * `{mode}` alone.
+       */
+      const p2pOffer = buildP2POfferBlock(cfg, p2p);
+
       const payload = {
         mode,
         // Under pipeline the relay derives this from stage 0; sending the caller's value when there is
@@ -2970,7 +3080,7 @@ export async function apply(ctx, config = {}) {
         // which path the dispatcher expected to use — and so the executor in `direct` mode knows it
         // must refuse an offer that did not arrive over the direct path.
         ...(originMachineId !== null ? { origin_machine_id: originMachineId } : {}),
-        p2p: { mode: cfg.p2pMode },
+        p2p: p2pOffer,
       };
 
       const result = await request({
@@ -3012,7 +3122,17 @@ export async function apply(ctx, config = {}) {
        * `relay` mode and a machine with no direct path both report `attempted: 0`, which is the
        * honest answer ("there was nothing to push over") rather than an empty object.
        */
-      let directPushes = { mode: cfg.p2pMode, attempted: 0, delivered: 0, failed: 0, pushes: [] };
+      let directPushes = {
+        mode: cfg.p2pMode,
+        // The punch this dispatch published and dialled with. Repeated here so one dispatch's answer
+        // is self-contained: an operator correlating it with a machine's `p2p.session` or with the
+        // machine's own log has the value in hand without a second call.
+        punch: p2pOffer.punch ?? null,
+        attempted: 0,
+        delivered: 0,
+        failed: 0,
+        pushes: [],
+      };
       if (cfg.p2pMode !== 'relay' && p2p.node !== null && p2p.start?.ok === true) {
         try {
           const pushes = await pushOffers(p2p.node, {
@@ -3022,21 +3142,22 @@ export async function apply(ctx, config = {}) {
             originMachineId,
           });
           directPushes = {
-            mode: cfg.p2pMode,
+            ...directPushes,
             attempted: pushes.length,
             delivered: pushes.filter((entry) => entry.ok).length,
             failed: pushes.filter((entry) => !entry.ok).length,
             pushes,
+            // How many of the machines that were reached were reached over a channel *this* machine
+            // did not open — the executor dialled first, and the push landed on that path. Zero on a
+            // fleet where only the dispatcher initiates, which is what makes the two-way punch
+            // visible in one dispatch's own answer instead of only in the ledger.
+            reused_channels: pushes.filter((entry) => entry.reused === true).length,
           };
         } catch (error) {
           // `pushOffers` is written not to throw; this is here so a future edit cannot turn a
           // best-effort optimisation into a failed dispatch.
           directPushes = {
-            mode: cfg.p2pMode,
-            attempted: 0,
-            delivered: 0,
-            failed: 0,
-            pushes: [],
+            ...directPushes,
             error: `P2P_PUSH_FAILED: ${error instanceof Error ? error.message : String(error)}`,
           };
         }

@@ -25,7 +25,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { networkInterfaces } from 'node:os';
 
-import { P2PChannel, accept, deriveSession } from '../src/agent/p2p.mjs';
+import { P2PChannel, accept, connect, deriveSession, punchSession } from '../src/agent/p2p.mjs';
 import { bindUdpSocket } from '../src/agent/stun.mjs';
 import {
   DEFAULT_P2P_MODE,
@@ -72,6 +72,34 @@ function helloFrame(session) {
   out.writeUInt8(1, 0); // HELLO
   out.writeUInt32BE(session >>> 0, 1);
   return out;
+}
+
+/**
+ * Record every datagram a socket sends, without changing what it sends.
+ *
+ * The node's outbound traffic is otherwise invisible from outside: `dial()` returns a result and the
+ * peer either answers or does not. A case that has to prove *this end sent something*, and that the
+ * something carried the right session, needs the socket itself — which is exactly what
+ * `countingBinder` already hands back.
+ *
+ * @param {import('node:dgram').Socket} socket
+ * @returns {Array<{bytes: Buffer, port: number, address: string}>}
+ */
+function recordSends(socket) {
+  const sent = [];
+  const original = socket.send.bind(socket);
+  socket.send = (msg, port, address, callback) => {
+    sent.push({ bytes: Buffer.from(msg), port, address });
+    return original(msg, port, address, callback);
+  };
+  return sent;
+}
+
+/** The frames a recorder saw, decoded from the framing table in the p2p.mjs header. */
+function framesOf(sent) {
+  return sent
+    .filter((entry) => entry.bytes.length >= 5)
+    .map((entry) => ({ kind: entry.bytes.readUInt8(0), session: entry.bytes.readUInt32BE(1), to: entry.port }));
 }
 
 /** The relay's two P2P routes, in memory, with the real server's response shapes. */
@@ -459,12 +487,20 @@ describe('p2p-node: shared server and STUN list', () => {
       refreshMs: 20_000,
       punchTimeoutMs: 5_000,
       acceptTimeoutMs: 5_000,
+      // v0.4.x: the window an executor may spend dialling a dispatcher it did not punch first. Part
+      // of this frozen object on purpose -- "the relay copy is never held behind it" is a claim about
+      // a number, and the number belongs where the contract can quote it.
+      reverseDialTimeoutMs: 8_000,
       maxCandidates: 8,
     });
     assert.equal(Object.isFrozen(P2P_DEFAULTS), true);
     assert.ok(
       P2P_DEFAULTS.refreshMs * 2 < P2P_DEFAULTS.announceTtlMs,
       'two missed refreshes must still leave a live announcement on the relay',
+    );
+    assert.ok(
+      P2P_DEFAULTS.reverseDialTimeoutMs > P2P_DEFAULTS.punchTimeoutMs,
+      'a reverse dial races the other end\'s own punch, so it needs more room than a punch does',
     );
   });
 });
@@ -950,6 +986,166 @@ describe('p2p-node: dialling over real sockets', () => {
       assert.match(badSession.error, /^P2P_BAD_SESSION/);
       assert.equal(node.status.dial_failures, 1);
     } finally {
+      await node.close();
+    }
+  });
+
+  it('dials the candidates an offer published, with the session it named, and asks the relay nothing', async () => {
+    const relay = fakeRelay();
+    const bind = countingBinder({ reportedAddress: '127.0.0.1' });
+    const node = makeNode('mac-executor', relay, { bindUdpSocket: bind.bindUdpSocket });
+    // The dispatcher, behind a NAT that swallowed its own push: a bare socket that answers HELLOs and
+    // records them. Nothing about this end is a `P2PNode`, which is the point -- the reverse dial has
+    // to work against a peer that has only ever *been* dialled.
+    const dispatcher = await bindUdpSocket();
+    const hellos = [];
+    dispatcher.socket.on('message', (datagram, rinfo) => {
+      if (datagram.length < 5 || datagram.readUInt8(0) !== 1) return; // 1 = HELLO
+      hellos.push({ session: datagram.readUInt32BE(1), from: rinfo.port });
+      const ack = Buffer.alloc(5);
+      ack.writeUInt8(2, 0); // HELLO_ACK
+      ack.writeUInt32BE(datagram.readUInt32BE(1), 1);
+      dispatcher.socket.send(ack, rinfo.port, rinfo.address, () => {});
+    });
+
+    try {
+      await startAnnounced(node);
+      const sent = recordSends(node.socket);
+      // The session the offer named, derived the way both ends derive it from the published punch id.
+      const session = punchSession({ punch: 'feedfacefeedface', taskId: 'task-9', machineId: 'mac-executor' });
+      const result = await node.dial('win-cgnat', {
+        session,
+        candidates: [{ address: '127.0.0.1', port: dispatcher.local.port }],
+      });
+
+      assert.equal(result.ok, true, result.error ?? '');
+      assert.equal(result.session, session);
+      assert.equal(result.peersAnnounced, 1, 'the published list is what was punched at');
+
+      // The HELLO really left this socket, addressed at the published candidate, carrying the
+      // published session -- not one this node invented.
+      const hellosOut = framesOf(sent).filter((frame) => frame.kind === 1);
+      assert.ok(hellosOut.length >= 1, 'a reverse dial must send HELLOs');
+      assert.equal(hellosOut[0].session, session);
+      assert.equal(hellosOut[0].to, dispatcher.local.port);
+      assert.ok(hellos.length >= 1, 'and the far end must have received one');
+      assert.equal(hellos[0].session, session);
+
+      // The relay was never asked: an offer that carried its own candidate list is the whole point of
+      // publishing one, and a lookup here would be a second, slower opinion about the same machine.
+      assert.equal(
+        relay.gets.some((entry) => entry.path.startsWith('/v1/peer/')),
+        false,
+        'no relay lookup for a candidate list the offer already carried',
+      );
+      assert.equal(node.status.punches_out, 1);
+      assert.equal(node.status.dial_failures, 0);
+    } finally {
+      try {
+        dispatcher.socket.close();
+      } catch {
+        /* already closed */
+      }
+      await node.close();
+    }
+  });
+
+  it('refuses an unusable candidate an offer published, by name', async () => {
+    const relay = fakeRelay();
+    const node = makeNode('mac-executor', relay);
+    try {
+      await startAnnounced(node);
+      // An offer is peer-supplied data that ends up as a datagram destination. The wildcard is the
+      // case that matters: it is syntactically an address and means "nowhere to send".
+      const result = await node.dial('win-cgnat', {
+        session: 0x5eed0009,
+        candidates: [{ address: '0.0.0.0', port: 1234 }],
+      });
+      assert.equal(result.ok, false);
+      assert.match(result.error, /^P2P_NO_CANDIDATES: /);
+      assert.equal(result.peersAnnounced, 1, 'the announced count is what was offered, not what was usable');
+      assert.equal(node.status.dial_failures, 1);
+    } finally {
+      await node.close();
+    }
+  });
+
+  it('leaves one channel per session when both ends punch at the same time', async () => {
+    // The case a two-way punch creates and a one-way one never did: both nodes dial with the SAME
+    // session, so each side's accept loop claims it while its own punch is still in flight. Two live
+    // channels on one session would each assemble and deliver every payload, and the peer would see
+    // each message twice.
+    const relay = fakeRelay();
+    const a = makeNode('machine-a', relay);
+    const b = makeNode('machine-b', relay);
+    try {
+      await startAnnounced(a);
+      await startAnnounced(b);
+      const session = deriveSession('simultaneous', 'machine-a', 'machine-b');
+
+      const deliveries = [];
+      b.on('message', (event) => deliveries.push(event.payload.toString('utf8')));
+      const [fromA, fromB] = await Promise.all([
+        a.dial('machine-b', { session }),
+        b.dial('machine-a', { session }),
+      ]);
+      assert.equal(fromA.ok, true, `A -> B must open: ${fromA.error ?? ''}`);
+      assert.equal(fromB.ok, true, `B -> A must open: ${fromB.error ?? ''}`);
+
+      assert.equal(a.channels.size, 1, 'A must hold exactly one channel for the session');
+      assert.equal(b.channels.size, 1, 'B must hold exactly one channel for the session');
+      assert.equal(a.status.punches_in, 1);
+      assert.equal(b.status.punches_in, 1);
+      assert.equal(a.claimed.has(session), true);
+      assert.equal(b.claimed.has(session), true);
+
+      // One send, one delivery: a second channel would have delivered it twice.
+      await fromA.channel.send('once');
+      while (deliveries.length < 1) await nextEvent(b, 'message');
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      assert.deepEqual(deliveries, ['once']);
+    } finally {
+      await a.close();
+      await b.close();
+    }
+  });
+
+  it('still answers a punch it never dialled for (the passive path, unchanged)', async () => {
+    // The regression guard for the two-way work: a node that only ever accepts must behave exactly as
+    // it did. The initiator here is a bare socket, so this node's accept loop is the only thing that
+    // can open the channel.
+    const relay = fakeRelay();
+    const node = makeNode('machine-passive', relay);
+    const dialler = await bindUdpSocket();
+    try {
+      await startAnnounced(node);
+      const session = deriveSession('passive-regression');
+      const inbound = nextEvent(node, 'message');
+
+      const opened = await connect({
+        socket: dialler.socket,
+        remote: [{ address: '127.0.0.1', port: node.status.local.port }],
+        timeoutMs: 3000,
+        session,
+      });
+      assert.equal(opened.ok, true, opened.error ?? '');
+      assert.equal(opened.channel.session, session);
+
+      await opened.channel.send('hello from an unknown peer');
+      const [received] = await inbound;
+      assert.equal(received.payload.toString('utf8'), 'hello from an unknown peer');
+      assert.equal(received.from, null, 'a HELLO carries a session, not an identity');
+      assert.equal(received.session, session);
+      assert.equal(node.status.punches_in, 1);
+      assert.equal(node.status.punches_out, 0, 'accepting is not dialling');
+      assert.equal(node.channels.size, 1);
+      opened.channel.close();
+    } finally {
+      try {
+        dialler.socket.close();
+      } catch {
+        /* already closed */
+      }
       await node.close();
     }
   });

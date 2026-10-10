@@ -22,6 +22,15 @@
  *     address the peer's packets will come from. `punch()` reports failure with the
  *     attempts it made, and the caller falls back to the relay -- explicitly, never
  *     silently.
+ *   * **Both ends may send, and one of them usually should not have to.** A peer behind
+ *     a CGNAT can send all it likes and still never be heard: its own outbound HELLO opens
+ *     its mapping, but the *other* end's filter stays shut until something of its own has
+ *     gone the other way. That is why `punch()` and `accept()` are not alternatives: an
+ *     executor that normally only accepts can also dial the dispatcher with the session the
+ *     offer published (see {@link punchSession}), and the two outbound packets together open
+ *     a path that neither alone could. Both ends use the address the *other's* packet came
+ *     from -- the observed `rinfo` -- rather than the address that was announced, which is
+ *     the one property that makes a symmetric NAT survivable at all.
  *
  * Framing (all integers big-endian):
  *
@@ -121,6 +130,105 @@ export function deriveSession(...parts) {
   const hash = createHash('sha256').update(parts.map(String).join('\u0000')).digest();
   const value = hash.readUInt32BE(0);
   return value === 0 ? 1 : value;
+}
+
+/**
+ * Derivation labels, named once so `deriveSession` is never called with a hand-typed
+ * string on one side and a different one on the other.
+ *
+ * The label is part of the hash: two peers that disagreed about it would compute
+ * different session ids for the same punch, discard each other's HELLO, and report a
+ * timeout that looks exactly like a NAT problem. That is the most expensive possible
+ * misdiagnosis, which is why the strings live next to `deriveSession` rather than at
+ * the two call sites.
+ */
+export const PUNCH_SESSION_LABEL = 'w2m-p2p-punch';
+export const REVERSE_DIAL_SESSION_LABEL = 'w2m-p2p-reverse';
+
+/** Longest accepted punch id, so a hostile offer cannot make either end hash a novel. */
+export const MAX_PUNCH_ID_LENGTH = 64;
+
+/**
+ * Is `value` a usable punch id?
+ *
+ * A punch id is what a dispatcher publishes through the relay so the executor can join the
+ * *same* session; it is deliberately not the session itself. One dispatcher leases one task
+ * to several machines at once, and a single shared session id would make the second machine's
+ * HELLO look like a re-acknowledgement of the first machine's live channel -- two peers on one
+ * session, and a result delivered to the wrong address. The published id is therefore an
+ * *input* to {@link punchSession}, which mixes in the machine id and yields a session that is
+ * unique per (dispatch, task, machine) while still being computable by both ends without a
+ * second round trip.
+ *
+ * Both shapes a JSON hop can carry are accepted: a hex string (what {@link mintPunchId}
+ * produces) and a positive integer (what a caller that treats the id as a number would write).
+ * Numbers are bounded to 32 bits so `deriveSession`'s string form of them is stable.
+ *
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+export function isPunchId(value) {
+  if (typeof value === 'number') return Number.isInteger(value) && value > 0 && value <= 0xffffffff;
+  return typeof value === 'string' && value !== '' && value.length <= MAX_PUNCH_ID_LENGTH;
+}
+
+/**
+ * Mint a punch id for one dispatch.
+ *
+ * Random rather than derived: the session id ends up as the only thing that identifies a
+ * channel's frames (`P2PChannel.onDatagram` discards anything carrying another session), so
+ * a value an off-path observer could predict would be a value an off-path observer could
+ * inject with. Eight random bytes is the cheapest size that makes guessing hopeless.
+ *
+ * @returns {string} 16 lower-case hex characters.
+ */
+export function mintPunchId() {
+  return randomBytes(8).toString('hex');
+}
+
+/**
+ * The session a dispatcher punches with, derived from the punch id it published.
+ *
+ * Deterministic on purpose, and identical on both ends: the dispatcher knows the punch id, the
+ * task id and the peer's machine id from the lease; the executor knows the first two from the
+ * offer and the third because it is its own id. No extra round trip, and the executor's HELLO
+ * carries the very session the dispatcher's in-flight punch is filtering for -- which is what
+ * makes the two halves one punch instead of two punches that time out against each other.
+ *
+ * @param {object} options
+ * @param {unknown} options.punch The published punch id; see {@link isPunchId}.
+ * @param {unknown} options.taskId
+ * @param {unknown} options.machineId The *executor's* machine id, not the dispatcher's.
+ * @returns {number|null} `null` when the inputs cannot produce one, so a caller can fall back
+ *   to its own id instead of punching at a session the far end is not using.
+ */
+export function punchSession({ punch, taskId, machineId } = {}) {
+  if (!isPunchId(punch)) return null;
+  if (typeof taskId !== 'string' || taskId === '') return null;
+  if (typeof machineId !== 'string' || machineId === '') return null;
+  return deriveSession(PUNCH_SESSION_LABEL, punch, taskId, machineId);
+}
+
+/**
+ * The session an executor uses when the offer named where to dial but no session to join.
+ *
+ * This is the compatibility path: a dispatcher that publishes its candidates without a punch
+ * id (or an older one that publishes nothing at all, where the caller never gets here). The
+ * executor picks the id, and the dispatcher's `accept()` adopts whatever the HELLO carries --
+ * that asymmetry is exactly what `allowSessionAdoption` exists for, and it is why a dial can
+ * still be attempted against a peer that never named a session.
+ *
+ * @param {object} options
+ * @param {unknown} options.originMachineId The dispatcher's machine id, from the offer.
+ * @param {unknown} options.taskId
+ * @param {unknown} options.machineId The executor's own machine id.
+ * @returns {number|null}
+ */
+export function reverseDialSession({ originMachineId, taskId, machineId } = {}) {
+  if (typeof originMachineId !== 'string' || originMachineId === '') return null;
+  if (typeof taskId !== 'string' || taskId === '') return null;
+  if (typeof machineId !== 'string' || machineId === '') return null;
+  return deriveSession(REVERSE_DIAL_SESSION_LABEL, originMachineId, taskId, machineId);
 }
 
 /**
