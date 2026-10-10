@@ -286,6 +286,27 @@ function sendUdp(port, payload) {
   });
 }
 
+/**
+ * Wait until a spawned process has really left, so the sockets it held are really closed.
+ *
+ * Used by the TCP probe below, which has to know that a listener it finds *after* the agent is killed
+ * cannot be the agent's. `exitCode` alone is set before the OS has finished reaping, hence the event.
+ *
+ * @param {import('node:child_process').ChildProcess} proc
+ * @param {number} [timeoutMs] Bound, because this is a test and a hung process must not hang it.
+ * @returns {Promise<void>}
+ */
+function waitForExit(proc, timeoutMs = 5_000) {
+  if (proc.exitCode !== null || proc.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, timeoutMs);
+    proc.once('exit', () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
 describe('the link is outbound-only', () => {
   it('a running agent listens on nothing', async () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'w2m-oo-relay-'));
@@ -407,21 +428,62 @@ describe('the link is outbound-only', () => {
       extraArgs: ['--p2p-mode', 'auto'],
     });
     const nodeLine = await waitForLog(autoAgent, /p2p: auto node on 0\.0\.0\.0:\d+/);
-    const port = Number(nodeLine.match(/:(\d+)/)[1]);
+    // The port is read from the part of the line that states a port, and *only* from there.
+    //
+    // MEASURED DEFECT, fixed here. This used to be `nodeLine.match(/:(\d+)/)[1]`, which takes the first
+    // colon-and-digits anywhere in the line -- and the line begins with the log timestamp. The "port"
+    // was therefore the timestamp's UTC **minute**, and both of CI's red jobs failed on that number
+    // rather than on anything about the agent:
+    //
+    //   * CI #53 (windows-latest / node 20) logged the node line at `11:00:02.010Z`, so the minute was
+    //     `00`, this expression read `0`, and the run went red with "the node must report the port it
+    //     bound: …p2p: auto node on 0.0.0.0:53493…" -- the real port printed inside the very message
+    //     that was failing to read it. Reproduced on demand locally by shifting only the clock.
+    //   * CI #54 (ubuntu-latest / node 22) logged it in a minute whose number (1..59) the runner had
+    //     something listening on, so the TCP probe below connected to *that* process and the job failed
+    //     with "Missing expected rejection". Also reproduced on demand: force the minute to 58, put a
+    //     listener on 58, run the file.
+    //
+    // Neither symptom involved the punch socket, and neither was caused by the agent's code: the number
+    // under test was a clock reading. The assertion below is kept as a guard against the node reporting
+    // a nonsense port, which is the only way it can fire now.
+    const port = Number(nodeLine.match(/node on 0\.0\.0\.0:(\d+)/)[1]);
     assert.ok(port > 0, `the node must report the port it bound: ${nodeLine}`);
     const bindCount = (`${autoAgent.stdout()}${autoAgent.stderr()}`.match(/p2p: auto node on/g) ?? []).length;
     assert.equal(bindCount, 1, 'exactly one punch socket, shared by discovery and the punch');
 
-    await assert.rejects(
-      connectTcp(port),
-      'nothing may accept TCP on the punch port: the punch socket is UDP and carries no TCP listener',
-    );
+    // Nothing may accept TCP on the punch port: the punch socket is UDP and carries no TCP listener.
+    //
+    // The probe disambiguates rather than guessing. A UDP port number and a TCP port number are
+    // separate namespaces, so "something accepted a connection on that number" is not by itself
+    // evidence about the punch socket -- an unrelated process can hold a TCP listener on the same
+    // number. So the probe is repeated after the agent is gone: a listener that outlives the agent
+    // belongs to somebody else and says nothing about this machine, while one that disappears with it
+    // *was* the agent's, and that is the failure this asserts.
+    const tcpListenerOn = async (candidate) => {
+      try {
+        await connectTcp(candidate);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const acceptedWhileRunning = await tcpListenerOn(port);
     await sendUdp(port, Buffer.from([0, 1, 2, 3]));
     await new Promise((resolve) => {
       setTimeout(resolve, 300);
     });
     assert.equal(autoAgent.proc.exitCode, null, 'a malformed datagram must not kill the agent');
     autoAgent.proc.kill('SIGKILL');
+    if (acceptedWhileRunning) {
+      await waitForExit(autoAgent.proc);
+      assert.equal(
+        await tcpListenerOn(port),
+        true,
+        'the punch port accepted TCP and stopped accepting when the agent died: ' +
+          'the punch socket must be UDP-only',
+      );
+    }
 
     // A second relay for the second agent: a pairing code is single-use and rotates after every
     // successful pairing, and reaching for the rotated code would make this test depend on the CLI's
