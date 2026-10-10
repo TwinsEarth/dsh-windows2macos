@@ -1339,11 +1339,28 @@ export function createAgent(options) {
     p2pChannels.delete(taskId);
     entry.channel.removeListener('close', entry.onClose);
     clearTimeout(entry.lingerTimer);
+    // v0.4.9: a session is derived from the two machine ids, not from the task id, so two
+    // concurrent tasks between the same pair share ONE channel. Closing it when the first of them
+    // finishes would pull the path out from under the second, whose result would then have nowhere
+    // to go -- and would find a closed channel rather than no channel, which is worse. So the
+    // channel is closed only once no task still holds it; the last one out turns off the light.
+    if (channelIsReferenced(entry.channel)) return;
     try {
       entry.channel.close('attempt-complete');
     } catch {
       /* the path is already gone; that is the state this function produces */
     }
+  }
+
+  /**
+   * Is this channel still the live channel of some task?
+   *
+   * @param {import('./p2p.mjs').P2PChannel} channel
+   * @returns {boolean}
+   */
+  function channelIsReferenced(channel) {
+    for (const other of p2pChannels.values()) if (other.channel === channel) return true;
+    return false;
   }
 
   /**
