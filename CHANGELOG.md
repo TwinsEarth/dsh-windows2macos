@@ -4,6 +4,40 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] — 2026-10-10
+
+### Fixed
+
+* **The agent no longer dies with its console.** Measured twice on the fleet: the whole process
+  tree — supervisor and agent together — was killed with code `0xC000013A` (`STATUS_CONTROL_C_EXIT`,
+  its console went away), the log ended mid-sentence, and Task Scheduler did not restart it, so the
+  fleet silently lost the machine. A supervisor that shares the console dies with the thing it
+  supervises, which was its one job. The supervisor now spawns the agent with `detached: true` and
+  **file-descriptor stdio** — never `inherit`, never pipes, because a detached child writing into a
+  pipe whose reader has died blocks instead of failing loudly.
+* **The scheduled task heals itself, without elevation.** The interactive mode now also registers a
+  repeating trigger (default every 5 minutes) which, with `MultipleInstances IgnoreNew`, means "be
+  running, or start": a death from any cause is repaired at the next tick. It exists because
+  `RestartCount 999` was measured not to fire at all.
+
+### Added
+
+* **`deploy/networking/LESSONS.md`** — a read-only study of 2dust/v2rayN (GPL-3.0, so description
+  with citations only and nothing copied) recording the transport disciplines this project was
+  missing, and the decision it changed: **no TUN/VPN mode.** v2rayN never creates an adapter itself
+  and contains no peer-to-peer anywhere; a tunnel is hub-and-spoke by construction, so it would make
+  our "the data path is peer-to-peer" claim false for exactly the traffic a tunnel exists to carry.
+
+### Notes
+
+* A regression introduced and caught during the fix is recorded in the code: the first version also
+  called `child.unref()`, which leaves the supervisor with no handle at all, so its event loop
+  drains and it exits immediately after spawning the agent. The evidence was that no supervisor
+  process existed — found while looking for a different property.
+* Verified on the machine that had the defect: supervisor and agent both present, and killing the
+  supervisor leaves the agent alive with its punch socket still bound (`0.0.0.0:41235`).
+* Also included: the test fix for `test/outbound-only.test.mjs`, whose port was being read from the
+  timestamp rather than from the field that states it (commit `57dbc5f`).
 ## [0.5.0] — 2026-10-10
 
 The release that stops treating "the relay carried it" as the only answer for a machine behind a
