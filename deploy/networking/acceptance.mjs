@@ -47,7 +47,6 @@
 //  that synthesised its own punches would prove that the script can punch, which nobody doubts.
 // ============================================================================
 import { headCommit, treeFingerprint } from '../../src/agent/git.mjs';
-import { computeCommandHash, SHELL_ID_DIRECT } from '../../src/relay/state.mjs';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -136,7 +135,9 @@ async function get(path) {
       lastError = error;
       const transient = error?.cause?.code !== undefined || /fetch failed|timeout/i.test(String(error?.message ?? ''));
       if (!transient) throw error;
-      await new Promise((resolve) => setTimeout(resolve, 2000 * attempt));
+      await new Promise((resolve) => {
+        setTimeout(resolve, 2000 * attempt);
+      });
     }
   }
   throw new Error(`GET ${path} failed after 5 attempts: ${lastError?.message ?? lastError}`);
@@ -232,7 +233,9 @@ while (Date.now() - started < timeoutMs) {
   const leases = status.leases ?? [];
   if (leases.length > 0 && leases.every((lease) => TERMINAL.has(lease.state))) break;
   if (aggregate && aggregate.state && aggregate.state !== 'pending' && leases.length === 0) break;
-  await new Promise((resolve) => setTimeout(resolve, pollMs));
+  await new Promise((resolve) => {
+    setTimeout(resolve, pollMs);
+  });
 }
 
 if (!aggregate) {
@@ -243,7 +246,9 @@ if (!aggregate) {
 if (asJson) {
   console.log(JSON.stringify({ task_id: taskId, anchors: { base_commit: commit, base_tree: tree.fingerprint }, aggregate }, null, 2));
 } else {
-  const verdict = aggregate.state ?? aggregate.verdict ?? (aggregate.states ?? []).join(', ') ?? 'unknown';
+  // `|| 'unknown'` rather than `??`: an empty `states` array joins to '' and `??` would happily
+  // print nothing, which is the one thing a verdict line must not do.
+  const verdict = aggregate.state ?? aggregate.verdict ?? ((aggregate.states ?? []).join(', ') || 'unknown');
   console.log(`verdict  ${verdict}\n`);
   const rows = (aggregate.machines ?? []).map((machine) => {
     const verdict = classify(machine);

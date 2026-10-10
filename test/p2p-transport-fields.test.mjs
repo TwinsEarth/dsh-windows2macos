@@ -349,8 +349,7 @@ describe('v0.4.0 task body: origin_machine_id and p2p reach every offer', () => 
     });
   });
 
-  it('keeps both fields on a re-offered offer, so a reconnect sees the same routing facts', async () => {
-    // The offer is emitted more than once in real life (a stream that was down at dispatch time is
+  it('keeps both fields on a re-offered offer, so a reconnect sees the same routing facts', async () => {    // The offer is emitted more than once in real life (a stream that was down at dispatch time is
     // re-stated on reconnect). If the fields only existed on the first emission, the direct-push
     // path would work exactly once and then silently stop.
     await withRelay(async (relay) => {

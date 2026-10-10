@@ -441,9 +441,29 @@ async function statusOf(tools) {
   return JSON.parse(await tools.get('w2m_status').execute({}, {}));
 }
 
+/**
+ * Assert the shape of a published `p2p` block: the mode verbatim, plus the punch facts (v0.4.x).
+ *
+ * WHY THIS IS NOT A `deepEqual` ANY MORE
+ *
+ * The block is the dispatcher's half of the two-way punch, and the executor can only dial back if it
+ * travels on the wire: `punch` is the id both ends derive the session from, and `candidates` is where
+ * to dial when the dispatcher's own push is swallowed by a symmetric NAT. Those keys are additive —
+ * the relay treats `p2p` as an opaque object with a `mode`, and a v0.4.x peer ignores keys it does not
+ * read — so the assertion is on what the block *says* rather than on the exact set of keys it has.
+ *
+ * @param {object} block
+ * @param {string} mode
+ * @returns {object} The block, for chaining.
+ */
+function assertP2PBlock(block, mode) {
+  assert.equal(block.mode, mode, 'the mode is stated verbatim');
+  assert.match(block.punch, /^[0-9a-f]{16}$/, 'a punch id travels with the mode');
+  return block;
+}
+
 /** One authenticated call against the relay, in the shape `P2PNode` expects. */
-async function relayFetch(relay, token, method, pathname, body) {
-  const result = await request(`${relay.url}${pathname}`, { method, token, body });
+async function relayFetch(relay, token, method, pathname, body) {  const result = await request(`${relay.url}${pathname}`, { method, token, body });
   return {
     ok: result.status >= 200 && result.status < 300,
     status: result.status,
@@ -938,17 +958,29 @@ describe('v0.4.0 w2m_run routes the offer', () => {
         assert.ok(call, 'w2m_run must POST /v1/task');
         assert.equal(call.headers.authorization, `Bearer ${OP}`, 'a dispatch carries the operator token');
         assert.equal(call.body.origin_machine_id, device.machine_id, 'the origin is this machine');
-        assert.deepEqual(call.body.p2p, { mode: 'auto' });
+        assertP2PBlock(call.body.p2p, 'auto');
+        // The dispatcher's announced candidates travel with the mode once it has announced: they are
+        // the address the executor dials back at, published by the machine that knows it best. A node
+        // whose first announce is still in flight publishes none, and that is a legal block — the
+        // executor falls back to asking the relay.
+        if (call.body.p2p.candidates !== undefined) {
+          assert.ok(
+            call.body.p2p.candidates.every(
+              (candidate) => typeof candidate.address === 'string' && Number.isInteger(candidate.port),
+            ),
+            'every published candidate is an {address, port} pair',
+          );
+        }
 
         // What the relay actually recorded — the assertion that matters, because the offer the
         // executor sees is built from the stored task, not from this request body.
         const task = relay.state.getTask(value.task_id);
         assert.equal(task.origin_machine_id, device.machine_id);
-        assert.deepEqual(task.p2p, { mode: 'auto' });
+        assert.deepEqual(task.p2p, call.body.p2p, 'the relay stores the block verbatim');
 
         const offer = await offerFor(relay, value.task_id);
         assert.equal(offer.origin_machine_id, device.machine_id);
-        assert.deepEqual(offer.p2p, { mode: 'auto' });
+        assert.deepEqual(offer.p2p, call.body.p2p, 'and republishes it verbatim on the offer');
       } finally {
         await session.stop();
       }
@@ -970,7 +1002,8 @@ describe('v0.4.0 w2m_run routes the offer', () => {
         const value = JSON.parse(await session.tools.get('w2m_run').execute({ command_argv: ARGV }, {}));
         const call = session.calls.find((entry) => entry.path === '/v1/task');
         assert.equal('origin_machine_id' in call.body, false, 'no identity means no field');
-        assert.deepEqual(call.body.p2p, { mode: 'auto' }, 'the mode is still stated');
+        assertP2PBlock(call.body.p2p, 'auto');
+        assert.equal(call.body.p2p.candidates, undefined, 'nothing was announced, so nothing is published');
         assert.equal(relay.state.getTask(value.task_id).origin_machine_id, null);
       } finally {
         await session.stop();
@@ -1089,7 +1122,20 @@ describe('v0.4.0 w2m_run routes the offer', () => {
         assert.equal(frame.machine_id, 'machine-target');
         assert.deepEqual(frame.command_argv, ARGV);
         assert.equal(frame.origin_machine_id, 'machine-origin');
-        assert.deepEqual(frame.p2p, { mode: 'auto' });
+        // The pushed frame carries the same block the relay published, plus the session for *this*
+        // machine: the value the dispatcher's punch and the executor's reverse dial have to meet on,
+        // which is only knowable per machine and therefore only in the pushed copy.
+        assertP2PBlock(frame.p2p, 'auto');
+        assert.deepEqual(
+          frame.p2p.candidates,
+          relay.state.getTask(value.task_id).p2p.candidates,
+          'the push publishes the same candidates the relay holds',
+        );
+        assert.equal(
+          Number.isInteger(frame.p2p.session),
+          true,
+          `the push names the session: ${JSON.stringify(frame.p2p)}`,
+        );
 
         // The invariant the whole fast path rests on: the pushed identity is the relay's own, so the
         // executor's dedupe sees one delivery whether the frame arrives over the channel or the SSE.
