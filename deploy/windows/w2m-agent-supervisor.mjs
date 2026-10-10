@@ -35,7 +35,7 @@
 //
 // Nothing here is Windows-specific except the defaults; the same supervisor works on POSIX hosts.
 import { spawn } from 'node:child_process';
-import { createWriteStream, existsSync, mkdirSync, openSync, readFileSync } from 'node:fs';
+import { createWriteStream, existsSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
 /** Minimal `--flag value` / `--flag` parser: no dependency, no surprises. */
@@ -176,7 +176,108 @@ for (const signal of ['SIGINT', 'SIGTERM', 'SIGBREAK']) {
   });
 }
 
+// Declared before the heartbeat block, which reads it: a `let` referenced earlier in the same scope
+// would be a temporal-dead-zone throw, not an undefined value.
 let runs = 0;
+
+// ---------------------------------------------------------------------------------------------
+// HEARTBEAT AND DEGRADED MARKER
+//
+// WHY FILES AND NOT LOG LINES: the failure this exists for is a console-teardown death, and a death
+// that arrives with the console cannot be logged from inside the process it kills -- the log simply
+// stops. A file that an outside observer reads has no such dependency, so a watchdog task, a human,
+// or (later) the fleet can answer "is this machine working?" without parsing a log that may itself be
+// truncated.
+//
+// The state is one of:
+//   running   a worker is alive right now
+//   backoff   between runs, within the healthy band
+//   degraded  the crash-loop breaker has tripped: too many exits inside the window, so the fleet
+//             should see a machine that is present but unhealthy rather than one that is gone
+//
+// Written atomically (temp file + rename) so a reader never sees half a JSON document.
+// ---------------------------------------------------------------------------------------------
+const heartbeatPath = join(dirname(logPath), 'supervisor-heartbeat.json');
+const degradedAfter = Number.isFinite(Number(pick('degraded-after', 3))) ? Number(pick('degraded-after', 3)) : 3;
+const degradedWindowMs = 10 * 60_000;
+const degradedBackoffMs = Number.isFinite(Number(pick('degraded-backoff-ms', 300_000)))
+  ? Number(pick('degraded-backoff-ms', 300_000))
+  : 300_000;
+const exitTimes = [];
+
+function writeHeartbeat(patch) {
+  const recent = exitTimes.filter((at) => Date.now() - at < degradedWindowMs).length;
+  const state = patch.state ?? (recent >= degradedAfter ? 'degraded' : 'backoff');
+  const record = {
+    updated_at: stamp(),
+    state,
+    supervisor_pid: process.pid,
+    run: patch.run ?? runs,
+    child_pid: patch.child_pid ?? null,
+    child_started_at: patch.child_started_at ?? null,
+    restarts_total: Math.max(0, runs - 1),
+    restarts_within_10min: recent,
+    last_exit_code: patch.last_exit_code ?? null,
+    last_exit_at: patch.last_exit_at ?? null,
+    // The known killer, recorded in decimal because that is how Node reports it: 3221225786 is
+    // 0xC000013A, STATUS_CONTROL_C_EXIT. Signed, it is -1073741510.
+    note: 'exit code 3221225786 means the console went away; it is not a crash of the agent logic',
+    project,
+    rabbit,
+  };
+  try {
+    const tmp = `${heartbeatPath}.tmp`;
+    writeFileSync(tmp, `${JSON.stringify(record, null, 2)}\n`, 'utf8');
+    renameSync(tmp, heartbeatPath);
+  } catch (error) {
+    say(`[w2m-supervisor] could not write the heartbeat: ${error.message}`);
+  }
+  return record;
+}
+
+writeHeartbeat({ state: 'backoff' });
+// ---------------------------------------------------------------------------------------------
+// START-TIME REAPING -- the cost of detaching the agent, paid here
+//
+// Detaching the agent is what stops a console teardown from taking the machine off the fleet, and it
+// has a price that was measured: every supervisor generation that dies without stopping its child
+// leaves an orphan behind. Three agents with one identity were found running at once, the newest
+// unable to bind the punch port (`P2P_BIND_FAILED: EADDRINUSE 0.0.0.0:41235`) because an orphan held
+// it -- two streams on one device token, and a port that pins nothing.
+//
+// So the supervisor reaps what it did not start: the heartbeat names the last child, and if that pid
+// is still alive when a new supervisor starts, it is a previous generation's orphan and is terminated
+// before anything else runs. "Trust a graceful exit" is exactly the assumption that failed.
+// ---------------------------------------------------------------------------------------------
+try {
+  const previous = JSON.parse(readFileSync(heartbeatPath, 'utf8').replace(/^\uFEFF/, ''));
+  const orphan = Number(previous.child_pid);
+  if (Number.isInteger(orphan) && orphan > 0 && orphan !== process.pid) {
+    let alive = true;
+    try {
+      process.kill(orphan, 0);
+    } catch {
+      alive = false;
+    }
+    if (alive) {
+      try {
+        process.kill(orphan);
+        say(`[w2m-supervisor] reaped orphan agent pid=${orphan} left by an earlier supervisor`);
+        await new Promise((resolve) => {
+          setTimeout(resolve, 1500);
+        });
+      } catch (error) {
+        say(`[w2m-supervisor] could not reap orphan pid=${orphan}: ${error.message}`);
+      }
+    }
+  }
+} catch {
+  // No heartbeat yet, or unreadable: nothing to reap, and that is not an error worth stopping for.
+}
+// A periodic beat, so "the supervisor itself is alive but a worker is wedged" is visible too.
+const beat = setInterval(() => writeHeartbeat({}), 30_000);
+beat.unref();
+
 while (!stopping) {
   runs += 1;
   const startedAt = Date.now();
@@ -208,6 +309,7 @@ while (!stopping) {
     stdio: ['ignore', logFd, logFd],
     windowsHide: true,
   });
+  writeHeartbeat({ state: 'running', child_pid: child.pid ?? null, child_started_at: stamp() });
 
   const result = await new Promise((resolve) => {
     child.on('exit', (exitCode, signal) => resolve({ exitCode, signal }));
@@ -216,6 +318,7 @@ while (!stopping) {
       resolve({ exitCode: null, signal: null });
     });
   });
+  exitTimes.push(Date.now());
 
   const lived = Math.round((Date.now() - startedAt) / 1000);
   say(
@@ -223,10 +326,22 @@ while (!stopping) {
       `${stopping ? ' (stopping)' : ' -- restarting'}`,
   );
   if (stopping) break;
+  const record = writeHeartbeat({ last_exit_code: result.exitCode, last_exit_at: stamp() });
+  // Degraded is not "give up": it is "stop hammering and say so". The marker file is what makes the
+  // difference visible from outside -- the fleet can then see a machine that is present and unwell
+  // instead of one that silently vanished, which is the failure this whole file exists for.
+  const wait = record.state === 'degraded' ? degradedBackoffMs : backoffMs;
+  if (record.state === 'degraded') {
+    say(
+      `[w2m-supervisor] degraded: ${record.restarts_within_10min} exits within 10 minutes -- ` +
+        `backing off ${Math.round(wait / 1000)}s and marking ${heartbeatPath}`,
+    );
+  }
   // Deliberately NOT unref'ed: an unref'ed timer with nothing else pending lets Node exit during the
   // backoff, which is the silent death this loop exists to prevent.
   await new Promise((resolve) => {
-    setTimeout(resolve, backoffMs);
+    setTimeout(resolve, wait);
   });
 }
+writeHeartbeat({ state: 'stopped' });
 log.end();
