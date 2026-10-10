@@ -178,6 +178,23 @@ export const REFUSAL = {
 export const P2P_RESULT_ACK_TIMEOUT_MS = 2_000;
 
 /**
+ * How long the executor spends punching back at the dispatcher (v0.4.9 A/B).
+ *
+ * Two-sided punching is the whole point: a one-sided punch opens exactly one NAT mapping, so it only
+ * lands when the far side's NAT or firewall already permits inbound from us. That is why a
+ * cone-to-cone pair behind a stateful firewall never connected, and why a symmetric NAT was hopeless.
+ * Punching from both ends opens both mappings.
+ *
+ * The session id needs no agreement on the wire: `dial()` derives it from the two machine ids,
+ * sorted, so both ends compute the same number independently.
+ *
+ * Kept short because the dial-back in {@link P2P_B_DIALBACK} runs on the result path, where every
+ * millisecond is a millisecond the relay copy waits. The dial on offer receipt (A) usually wins
+ * first, so this is the fallback for a punch that lost the first time.
+ */
+export const P2P_REVERSE_PUNCH_TIMEOUT_MS = 2_000;
+
+/**
  * How long a task's direct channel outlives the attempt that used it.
  *
  * Long enough to answer a duplicate of a finished attempt over the same channel (the relay replaying
@@ -898,6 +915,7 @@ export function createAgent(options) {
     onP2PStatus = () => {},
     p2pAckTimeoutMs = P2P_RESULT_ACK_TIMEOUT_MS,
     p2pChannelLingerMs = P2P_CHANNEL_LINGER_MS,
+    p2pReversePunchMs = P2P_REVERSE_PUNCH_TIMEOUT_MS,
   } = options;
 
   // Normalise here so every caller gets the same contract: the documented
@@ -931,6 +949,9 @@ export function createAgent(options) {
   if (typeof onP2PStatus !== 'function') throw new TypeError('createAgent: onP2PStatus must be a function');
   if (typeof p2pAckTimeoutMs !== 'number' || !Number.isFinite(p2pAckTimeoutMs) || p2pAckTimeoutMs < 0) {
     throw new TypeError('createAgent: p2pAckTimeoutMs must be a non-negative number of milliseconds');
+  }
+  if (typeof p2pReversePunchMs !== 'number' || !Number.isFinite(p2pReversePunchMs) || p2pReversePunchMs < 0) {
+    throw new TypeError('createAgent: p2pReversePunchMs must be a non-negative number of milliseconds');
   }
 
   // Validate + normalise once, at construction: a `rabbitUrl` carrying a query
@@ -1205,6 +1226,102 @@ export function createAgent(options) {
 
   /** The channel a task's result can be acknowledged over, or null when there is none. */
   const channelFor = (taskId) => p2pChannels.get(taskId)?.channel ?? null;
+
+  /**
+   * The peer a dial-back for this offer would go to, or `null` when there is no point trying.
+   *
+   * @param {object} offer
+   * @returns {string|null}
+   */
+  function dialBackTarget(offer) {
+    if (p2pNode === null || typeof p2pNode.dial !== 'function') return null;
+    if (typeof p2pNode.isEnabled !== 'function' || p2pNode.isEnabled() !== true) return null;
+    if (p2pMode === 'relay') return null;
+    const origin = typeof offer?.origin_machine_id === 'string' ? offer.origin_machine_id.trim() : '';
+    if (origin === '') return null;
+    // Dialling ourselves is a hairpin through our own NAT; it never opens and only costs time.
+    if (origin === identity.machine_id) return null;
+    return origin;
+  }
+
+  /**
+   * Punch back at the dispatcher while it is punching at us (v0.4.9 A).
+   *
+   * A one-sided punch opens one NAT mapping. Two-sided opens both, which is the difference between
+   * "works when the far side happens to be reachable" and "works between two machines behind stateful
+   * firewalls" -- the case measured here: same LAN, cone NATs on both sides, all inbound UDP dropped
+   * on the Windows host, so the dispatcher's 32 HELLOs to the announced port got no answer.
+   *
+   * Not awaited, deliberately: it has to *overlap* the dispatcher's punch rather than delay the
+   * command, and losing costs nothing because the offer already arrived over the relay. When it wins,
+   * the channel is remembered so the result can travel back over it (which is also what B needs).
+   *
+   * @param {object} offer
+   */
+  function startReversePunch(offer) {
+    const target = dialBackTarget(offer);
+    if (target === null) return;
+    // An offer that arrived over the direct path already has a channel; a second one for the same
+    // session would be re-acknowledged rather than useful.
+    if (channelFor(offer.task_id) !== null) return;
+
+    const taskId = offer.task_id;
+    p2pNode
+      .dial(target, { timeoutMs: p2pReversePunchMs })
+      .then((outcome) => {
+        if (outcome?.ok === true && outcome.channel) {
+          rememberChannel(taskId, outcome.channel);
+          log('info', `reverse punch opened the direct path for ${taskId}`, {
+            peer: outcome.peer,
+            rtt_ms: outcome.rttMs,
+            attempts: outcome.attempts,
+          });
+          return;
+        }
+        log('info', `reverse punch did not open for ${taskId}`, { error: outcome?.error ?? null });
+      })
+      .catch((error) => {
+        log('warn', `reverse punch threw for ${taskId}`, { error: error?.message ?? String(error) });
+      });
+  }
+
+  /**
+   * Dial the dispatcher so the result has a direct way home (v0.4.9 B).
+   *
+   * The favourable direction, and it was simply unused: when the executor is the one behind a
+   * symmetric NAT or a blocking firewall, *its* outbound packet is what opens the mapping. The
+   * previous code only ever reused a channel that the (blocked) dispatcher-side punch had failed to
+   * create, so `result_path` could never be `p2p` unless the offer itself arrived over the direct
+   * path.
+   *
+   * Bounded and best-effort: the relay copy of the result is posted by the caller either way, so the
+   * only cost of failing here is the timeout.
+   *
+   * @param {object} offer
+   * @returns {Promise<import('./p2p.mjs').P2PChannel|null>}
+   */
+  async function dialBackForResult(offer) {
+    const target = dialBackTarget(offer);
+    if (target === null) return null;
+    try {
+      const outcome = await p2pNode.dial(target, { timeoutMs: p2pReversePunchMs });
+      if (outcome?.ok === true && outcome.channel) {
+        rememberChannel(offer.task_id, outcome.channel);
+        log('info', `dialled back to return the result for ${offer.task_id}`, {
+          peer: outcome.peer,
+          rtt_ms: outcome.rttMs,
+        });
+        return outcome.channel;
+      }
+      log('info', `dial-back for ${offer.task_id} did not open the direct path`, {
+        error: outcome?.error ?? null,
+      });
+      return null;
+    } catch (error) {
+      log('warn', `dial-back for ${offer.task_id} threw`, { error: error?.message ?? String(error) });
+      return null;
+    }
+  }
 
   /**
    * Release the channel a task used, once the attempt is over.
@@ -2062,6 +2179,11 @@ export function createAgent(options) {
       return;
     }
 
+    // ---- 0.5 reverse punch (v0.4.9 A) ------------------------------------
+    // The dispatcher is punching at us right now; punch back so both NAT mappings open. Not awaited:
+    // it has to overlap the dispatcher's punch rather than delay the command.
+    startReversePunch(offer);
+
     // ---- 1. spool before anything else (§0) ------------------------------
     // Fail closed: if the durable copy cannot be written, running the command
     // would produce a result we could never replay, so the offer is dropped
@@ -2429,7 +2551,13 @@ export function createAgent(options) {
    * @returns {Promise<ReturnType<typeof p2pDeliveryMark>>}
    */
   async function planDirectDelivery(offer) {
-    if (channelFor(offer?.task_id) === null) return p2pDeliveryMark();
+    // v0.4.9 B: if the dispatcher's punch never landed there is no channel to reuse -- so open one
+    // ourselves. This is the favourable direction (our outbound packet is what opens our own
+    // mapping), and reusing only channels the dispatcher managed to create meant `result_path: p2p`
+    // was unreachable in exactly the case it was most needed.
+    let channel = channelFor(offer?.task_id) ?? null;
+    if (channel === null) channel = await dialBackForResult(offer);
+    if (channel === null) return p2pDeliveryMark();
     const direct = await sendResultDirect(offer.task_id);
     if (direct.delivered) {
       log('info', `result acknowledged over the direct channel for ${offer.task_id}`, {
