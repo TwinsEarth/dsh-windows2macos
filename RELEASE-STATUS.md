@@ -284,6 +284,23 @@ v0.4.4 发布后 CI #41 在 **ESLint** 步骤失败：`deploy/windows/` 不在"�
 1. **npm 已禁止"绕过 2FA 的 token"直接发布**（CLI 会提示该弃用）。用这种 token 发布不会报错，而是被**降级为暂存**（`npm publish` 返回 `202`，索引里出现占位版本 `0.0.0-stage`，而 `npm stage list` 对这个 token 不可见），表现为"命令成功、包却 404"。**解开它的唯一办法是在场证明**：`npm publish … --otp=<6 位验证码>` 一次通过（本次即如此）。
 2. **`add <包名>` 会被同名旧依赖挡住**：profile 里原有 `@twinsearth/w2m-dsh-plugin: file:…tgz`，`pnpm add @twinsearth/w2m-dsh-plugin` 判定"Already up to date"而不改解析。带版本（`@0.4.7`）才会真正从注册表解析。README 现在同时给出两种写法。
 
+### Trusted Publishing 已接通（0.4.8 起，无需任何 token）
+
+账号所有者在 npm 上为该包配置了 **Trusted Publisher → GitHub Actions → repo `TwinsEarth/dsh-windows2macos` / workflow `release.yml`**。之后 `workflow_dispatch` 触发一次即成功：
+
+| 证据 | 值 |
+|---|---|
+| npm | `latest = 0.4.8` |
+| **provenance** | `dist.attestations.predicateType = https://slsa.dev/provenance/v1` —— 手工发布的 0.4.6/0.4.7 **没有**这个字段，这条差异本身就是"确实走了 OIDC"的证明 |
+| Release #28 | `verify, pack and publish` **success** + `publish to npm` **success** |
+
+### 接通路上修掉的三个坑（都不是"照着文档抄"能避开的）
+
+1. **Node 22 自带 npm 10.x，而 OIDC 交换要 npm ≥ 11.5.1** —— 作业里显式升级 CLI，否则报的是看着像权限问题的认证错误。
+2. **`setup-node` 的 `registry-url` 会写出一行基于 `NODE_AUTH_TOKEN` 的认证**；没有 token secret 时它是空值，会**遮蔽** OIDC 交换而不是回退。已去掉，改为仅在 secret 存在时显式写入 token。
+3. **发布后的即时校验会误报失败。** 第一次 OIDC 发布的日志里，`npm publish` 已经 `Signed provenance statement` 并上传成功，紧接着的 `npm view` 却回 `404 No match found for version 0.4.8`（注册表尚未传播），`set -e` 直接把成功变成红灯。现在改成轮询，且"只是还没出现"只记为警告。**这一条值得单独记：报错的是校验，不是发布。**
+
+另一条背景，解释了本轮开头那次"命令成功、包却 404"：**npm 在 2025 年底撤销了所有个人 token**，因此用 token 直接发布会走**分阶段（staged）**流程而非被拒。
 > ⚠️ 安全提示：本次发布用的 6 位 TOTP 是一次性的；账号所有者还曾在会话中贴出 **5 个恢复码**，那是账号级长期凭据，建议**立即在 npm 重新生成一组恢复码**使其作废。仓库与代码中没有任何 token 落盘（`.npmrc` 在 `%USERPROFILE%\.dsh\w2m\`，仅本机、且已改用 `${NPM_TOKEN}` 环境变量插值）。
 
 ---
