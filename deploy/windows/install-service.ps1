@@ -56,6 +56,7 @@ param(
   [string]$Bin = '',
   [string]$AgentArgs = '',
   [int]$RestartBackoffMs = 60000,
+  [int]$WatchdogMinutes = 5,
   [switch]$Interactive,
   [switch]$Uninstall,
   [switch]$WhatIfOnly
@@ -133,11 +134,34 @@ $json = $config | ConvertTo-Json -Depth 4
 Write-Host "wrote $configPath"
 
 $action = New-ScheduledTaskAction -Execute $node -Argument ($arguments -join ' ') -WorkingDirectory $PSScriptRoot
+# ---------------------------------------------------------------------------------------------
+# SELF-HEALING WITHOUT ELEVATION
+#
+# Measured twice on this machine: the whole process tree (supervisor + agent) is killed with
+# 0xC000013A (STATUS_CONTROL_C_EXIT -- its console went away), the log ends mid-sentence, and Task
+# Scheduler does NOT bring it back even with RestartCount 999: the task simply ends. The fleet then
+# silently loses the machine, which is exactly the failure a supervisor was supposed to prevent --
+# a supervisor that shares the console dies with it.
+#
+# A repeating trigger fixes that without any administrator right: combined with
+# `MultipleInstances IgnoreNew` the task means "be running, or start", so a death from any cause is
+# repaired at the next tick. The window is the repetition interval, and that is the honest trade:
+# up to N minutes offline after a console-close death, versus needing elevation for a session-0
+# service (the real fix, and the default mode above).
+# ---------------------------------------------------------------------------------------------
+$repetition = if ($Interactive) {
+  # `[TimeSpan]::MaxValue` is NOT a valid duration here -- Task Scheduler rejects it and the whole
+  # registration fails (measured: the script had already stopped the old task, so the machine was
+  # left with no agent at all). Ten years is the idiomatic stand-in for "repeat indefinitely".
+  New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
+    -RepetitionInterval (New-TimeSpan -Minutes $WatchdogMinutes) `
+    -RepetitionDuration ([TimeSpan]::FromDays(3650))
+} else { $null }
 # AtStartup only makes sense for the session-0 (S4U) shape, which also runs whether or not anyone is
 # signed in. Registering an AtStartup trigger on an interactive task is refused without elevation --
 # measured, and the reason this list is conditional rather than always two entries.
 $triggers = if ($Interactive) {
-  @(New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME")
+  @((New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"), $repetition)
 } else {
   @(
     (New-ScheduledTaskTrigger -AtStartup),
