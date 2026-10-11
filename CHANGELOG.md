@@ -4,6 +4,35 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.3] — 2026-10-11
+
+### Added
+
+* **The peer-to-peer data plane can now be encrypted.** Stage 1 of `docs/P2P-CRYPTO.md`: each machine
+  holds an X25519 keypair beside its device identity, the relay carries each peer's static public key
+  inside the offer it already sends — so **nobody fills in a `[Peer]` block by hand** — and the direct
+  channel completes a two-message IK-shaped handshake before a single frame is trusted. Triple DH gives
+  mutual authentication and forward secrecy; ChaCha20-Poly1305 with WireGuard's nonce layout carries the
+  frames; a 64-message replay window and an HKDF epoch ratchet (2^20 messages or 120 s, previous key
+  retained 15 s) keep it going without a round trip in the data path.
+* A handshake failure is **terminal for that peer, never a silent downgrade to plaintext**: a peer that
+  has no key for us gets the plain channel it would have had and the ledger records
+  `p2p.encrypted: false` with a reason. A machine is never lost to a security upgrade — only told that
+  the upgrade did not complete.
+* `PROTOCOL.md` §9; `w2m_status` reports `p2p.encryption`.
+
+### Notes
+
+* **The tests earned their keep: they caught seven real defects**, including a replay window that
+  accepted replays of frame 2, a lookahead bound that capped our own send epoch, and a plain-ACK race
+  that could downgrade a live encrypted session to plaintext — the exact failure the design forbids, now
+  structurally impossible.
+* `mac1`/`mac2` are **not** implemented: keyed BLAKE2s is not exposed by `node:crypto`. They mitigate
+  CPU-exhaustion denial of service, not confidentiality or authenticity, and the omission is a named
+  value in the code rather than a silence.
+* Every socket in the new suite is loopback and crosses no NAT; that is stated in the suite header and
+  is not evidence that a real translation can be crossed.
+* No protocol version bump: `envelope_version` stays `1.0` and a v0.4.x/v0.5.x peer is unaffected.
 ## [0.5.2] — 2026-10-10
 
 ### Fixed

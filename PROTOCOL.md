@@ -337,3 +337,125 @@ Step 3  比对全部"可比字段"：
 - 不做写回合并（`write: true` 时仅记录分支名，不做 merge）
 - 不做跨机浏览器看板（那是设计文档的 P6）
 - 不做 Mac 真机验证（本机无 Mac；代码跨平台但需用户在 Mac 上复验）
+
+---
+
+## 9. P2P 数据面加密（v0.6.0 新增，**附加式扩展，不升版本**）
+
+> **不破坏冻结。** `protocol_version` 仍为 `1`，`envelope_version` 仍为 `1.0`。本节全部内容是
+> **可选对象 `p2p` 内部的新键**，以及对**已存在的可选字段** `p2p.encrypted` 的赋值规则；不知道
+> 这些键的一端（v0.4.x / v0.5.x）会原样忽略它们，行为与本文件冻结时一致。
+> 设计契约见 `docs/P2P-CRYPTO.md`（§4 是规范，§7 是验收清单）。
+
+### 9.1 设备静态密钥
+
+| 项 | 值 |
+|---|---|
+| 算法 | X25519（`generateKeyPairSync('x25519')`） |
+| 私钥存放 | 与 `device.json` 同目录的 `device.key`，权限 0600（**Windows/NTFS 无 POSIX 位，见下**） |
+| 生成时机 | 首次配对时生成，此后永不更换；文件损坏 → 硬错误，**绝不静默换新**（换新会使所有认识旧公钥的peer拒绝本机） |
+| 公钥编码 | 32 字节 X25519 公钥的标准 base64（44 字符，含 `=` 填充） |
+
+`device.key` 内容（JSON，原子写入）：
+```json
+{ "format": "w2m-device-key/1", "algo": "x25519", "machine_id": "<uuid>", "private_key": "<base64 32B>" }
+```
+只存私钥标量，公钥由私钥推导——手改文件无法发布与私钥不匹配的公钥。
+
+**0600 的诚实表述**：在 POSIX 平台上按 0600 写入。**Windows 无 POSIX 权限位**，`chmod` 是
+尽力而为且不报错，该文件的实际保护来自用户 profile 目录继承的 ACL，而非本实现。能读到该 profile
+目录的本地用户即可读到该私钥。
+
+### 9.2 公钥分发（无人手工填 `[Peer]`）
+
+公钥随**已有的**两条信令一起走，没有新端点：
+
+| 位置 | 字段 | 说明 |
+|---|---|---|
+| `POST /v1/peer/announce` 请求体 | `static_key` | 可选。非 32 字节 base64 X25519 公钥 → `BAD_REQUEST`（`BAD_STATIC_KEY`）。**缺省即缺省**，不写 `null`——"没有密钥"与"密钥未知"不能同值 |
+| `GET /v1/peer/{machine_id}` 响应 `peer` | `static_key` | 与 `candidates` 同级；该机未公告密钥时**该键不存在** |
+| `POST /v1/task` 请求体 `p2p` | `static_keys` | `{ "<machine_id>": "<base64 公钥>" }`。中继按既有规则**原样转发**（`validateTaskRouting` 只校验 `p2p.mode` 并整体复制），不解释该键 |
+| `task.offer` 帧 `p2p` | `static_keys` | 同上；下发帧在此基础上追加**该帧目标机**的公钥 |
+
+一台机器由此从"要求它谈话的那份 offer"里学到**恰好那些 peer** 的公钥，无需任何本地配置。
+
+### 9.3 握手（两帧，Noise IK 形状）
+
+握手消息**寄生在既有帧类型内**：`HELLO`/`HELLO_ACK` 的 **body 首字节为魔数 `0xA5`** 即为握手消息；
+**body 为空**即为 v0.5.x 的普通打洞。v0.5.x 端从不读 body，因此对握手 `HELLO` 会回普通 `HELLO_ACK`；
+本端在无对端密钥时也回普通 `HELLO_ACK`。两端都无需预先知道对方是哪个版本。
+
+| 帧 | body 布局（大端） | 长度 |
+|---|---|---|
+| `HELLO` | `A5 \| ver u8 \| session u32 \| e_i[32] \| idLen u8 \| machineId \| mac[48]` | 88 + idLen |
+| `HELLO_ACK` | 同上，`e_r` 替代 `e_i` | 88 + idLen |
+| `REFUSE` | `A5 \| ver u8 \| session u32 \| code u8 \| idLen u8 \| machineId` | 8 + idLen |
+
+`mac` = `AEAD(k0, nonce=0, BLAKE2s-256(prologue ‖ ver u8 ‖ session u32 ‖ s_i.pub ‖ s_r.pub))`，48 字节
+（32 密文 + 16 tag）。`mac'` = 同 `k0`，消息为 `BLAKE2s-256(HELLO ‖ e_r)`。
+`k0 = HKDF-SHA256(ECDH(s_i, s_r))`；会话密钥 `k = HKDF-SHA256(ECDH(e_i,e_r) ‖ ECDH(s_i,e_r) ‖ ECDH(e_i,s_r))`
+展开为四个互不相同的 32 字节子密钥（两个握手 MAC、两个方向的数据密钥）。
+
+> **相对 `docs/P2P-CRYPTO.md` §4 的两处偏离，均属更强而非更弱**：MAC 额外绑定了 `session` 与握手
+> 版本（否则同一对机器在任何一次打洞中捕获的 `HELLO` 都可在下一次重放）；`mac1`/`mac2` **未实现**
+> ——keyed BLAKE2s 未被 `node:crypto` 暴露，它们缓解的是握手路径的 **CPU 耗尽 DoS**，与机密性、
+> 真实性无关。该省略以常量 `HANDSHAKE_MAC_FIELDS_OMITTED` 落在代码里，不是沉默。
+
+`REFUSE.code`：`1`=UNKNOWN_PEER、`2`=BAD_MAC、`3`=REPLAY、`4`=NO_KEY、`5`=VERSION、`6`=NO_PEER_KEY。
+`REFUSE` 本身**不认证**（它正是在无法认证对端时发出的），因此不携带任何证明。
+
+### 9.4 数据面帧加密
+
+启用后**所有帧类型**（`DATA`/`ACK`/`DONE`/`PING`/`PONG`/`BYE`）一律加密，不只 `DATA`：
+
+```
+frame = kind u8 | session u32 | A5 | epoch u8 | counter u64le | ciphertext | tag[16]
+```
+- 前 5 字节**明文但参与认证**（AAD）：改 kind 或 session 即验证失败。
+- nonce = `00000000 ‖ counter u64le`（12 字节），ChaCha20-Poly1305，tag 16 字节。整帧开销 **26 字节**。
+- `counter` 每方向独立、从 0 起、**跨 epoch 单调不减**（不复位）。
+- 64 条滑动重放窗口；窗口外或已见过的计数器 → 丢弃（`P2P_CRYPTO_REPLAYED_FRAME`）。
+- **重协商（rekey）**：发送满 2^20 帧或满 120 秒即 `epoch+1`，双方各自沿 HKDF 链推导，无需往返；
+  旧 epoch 密钥保留 15 秒以接住在途帧。未认证帧**绝不**用其它 epoch 密钥重试。
+
+### 9.5 拒绝与回退（**拒绝永远具名，回退永不静默**）
+
+| 码 | 含义 |
+|---|---|
+| `P2P_CRYPTO_NO_KEY` | 本机无密钥，或对端无本机密钥 → 明文通道，已记录 |
+| `P2P_CRYPTO_UNKNOWN_PEER` | 握手来自本机未持有公钥的 `machine_id` |
+| `P2P_CRYPTO_BAD_MAC` | 对端已知但证明不成立（密钥过期或有人在冒充）→ **不建通道** |
+| `P2P_CRYPTO_REPLAY` | 同一 `e_i` 二次出现；重传会收到**逐字节相同**的应答 |
+| `P2P_CRYPTO_AUTH_FAILED` | 数据帧 tag 校验失败 → 丢弃，不处理 |
+| `P2P_CRYPTO_REPLAYED_FRAME` | 计数器已在窗口内 |
+| `P2P_CRYPTO_STALE_EPOCH` / `EPOCH_TOO_FAR` | 密钥已过期 / epoch 超出推导上限 |
+| `P2P_CRYPTO_HANDSHAKE_TIMEOUT` | 路径已通但握手未完成 → 不建通道 |
+| `P2P_CRYPTO_VERSION_MISMATCH` / `MALFORMED` | 版本或报文形状不可用 |
+| `P2P_CRYPTO_PLAINTEXT_PEER` | 对端未学得密钥（v0.5.x 情形）→ 明文通道 |
+
+**回退规则**：握手失败 → 任务**照旧走中继**，信封记录 `p2p.encrypted: false` 与原因；机器**绝不**
+因为安全升级而丢失。唯一不允许的降级是"已持有对端密钥、握手失败后仍建明文通道"——那是一次攻击者
+可触发的降级。
+
+### 9.6 信封字段
+
+`p2p` 对象新增（均为可选；`encrypted` 恒存在）：
+
+| 字段 | 类型 | 含义 |
+|---|---|---|
+| `encrypted` | bool | **仅当**该任务的直连通道确实完成握手并被密封时为 `true` |
+| `encryption_reason` | string | `encrypted: false` 时的具名原因（`P2P_CRYPTO_*` 或直接路径未建立的原因） |
+| `encryption_session` | number | 可选。承载该任务的会话 id |
+
+`encrypted` 进入 `p2p` 块，因此**在 `envelope_sha256` 覆盖范围之内**——中继无法在不破坏哈希的前提下
+改写它。它也**不进入** `COMPARABLE_FIELDS`：传输路径不是执行结果。
+
+### 9.7 兼容性矩阵
+
+| 对端 | 结果 |
+|---|---|
+| v0.4.x / v0.5.x（无 `static_keys`） | 本端发**普通** `HELLO`，明文通道，任务照常完成，`p2p.encrypted: false` + 具名原因 |
+| v0.6.0（`static_keys` 齐备） | 握手完成，通道密封，`p2p.encrypted: true` |
+| v0.6.0，但本端无对端公钥 | 对端回 `REFUSE(6)`＋普通 `HELLO_ACK` → 明文通道，原因为 `P2P_CRYPTO_NO_KEY` |
+| 公钥错误 / 有人在冒充 | `REFUSE(2)` → **不建通道**，任务走中继，账本记 `encrypted: false` + `P2P_CRYPTO_BAD_MAC` |
+| 自打洞（relay 把任务租给下发机自己） | 明文通道（自连接无路径可保护，且不得失败）

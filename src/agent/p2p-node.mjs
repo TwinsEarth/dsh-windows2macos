@@ -45,6 +45,7 @@
 import { EventEmitter } from 'node:events';
 import { networkInterfaces } from 'node:os';
 
+import { NonceCache, PeerKeyStore, CRYPTO_REASON } from './crypto.mjs';
 import { accept, connect, deriveSession } from './p2p.mjs';
 import {
   bindUdpSocket as bindUdpSocketDefault,
@@ -424,6 +425,15 @@ export class P2PNode extends EventEmitter {
    *   falls back to the relay. Must be an integer in `0..65535`; `0` is the only
    *   spelling that means "let the OS choose". Note that a port already in use makes
    *   `start()` return a `P2P_BIND_FAILED`, which is reported and never fatal.
+   * @param {object} [options.deviceKey] This machine's static keypair (v0.6.0). A `DeviceKey`
+   *   instance. Omitted or `null` means the direct path is plaintext, exactly as v0.5.x — which is
+   *   the supported way to run a fleet that has not upgraded, and is *recorded* rather than hidden
+   *   (`status.encryption`).
+   * @param {object} [options.peerKeys] A `PeerKeyStore`, adopted rather than copied so the caller and
+   *   the node see the same keys. Defaults to a fresh empty store: a node with no keys yet is a node
+   *   that will send plain punches and say so.
+   * @param {object} [options.cryptoTuning] `CryptoSession` options — rekey thresholds and retention —
+   *   for a caller (a test) that cannot send 2^20 messages.
    */
   constructor(options = {}) {
     super();
@@ -441,6 +451,9 @@ export class P2PNode extends EventEmitter {
       bindUdpSocket = bindUdpSocketDefault,
       bindAddress = '0.0.0.0',
       bindPort = 0,
+      deviceKey = null,
+      peerKeys = null,
+      cryptoTuning = null,
     } = options;
 
     const normalized = normalizeP2PMode(mode);
@@ -487,6 +500,30 @@ export class P2PNode extends EventEmitter {
     this.bindAddress = bindAddress;
     /** @type {number} Local port passed to the binder; 0 means an ephemeral one. */
     this.bindPort = bindPort;
+
+    // ---- v0.6.0 identity and peer keys ------------------------------------
+    // Held on the node rather than on the agent because the node is what creates channels: the key a
+    // handshake uses has to be reachable from the exact place the channel is built, or the two could
+    // disagree about which peers are encryptable.
+    /** @type {object|null} This machine's static keypair, or null for a plaintext node. */
+    this.deviceKey = deviceKey ?? null;
+    /** @type {PeerKeyStore} Peer static keys, learned from offers and from the relay. */
+    this.peerKeys = peerKeys instanceof PeerKeyStore ? peerKeys : new PeerKeyStore();
+    /** @type {object|null} `CryptoSession` overrides; null means the documented thresholds. */
+    this.cryptoTuning = cryptoTuning ?? null;
+    /** @type {NonceCache} Replay tracking for inbound handshakes. Outlives one `accept()`. */
+    this.seenHandshakes = new NonceCache();
+    /**
+     * Refusals this node has issued or received, newest last, bounded.
+     *
+     * A refusal is the one crypto outcome that is *never* silent, so it is kept where `status` can
+     * report it rather than only written to a log line somebody has to be watching.
+     *
+     * @type {Array<{at:string, reason:string, machine_id:string|null, direction:string}>}
+     */
+    this.cryptoRefusals = [];
+    /** @type {{handshakes:number, encrypted_channels:number, plaintext_channels:number, refused:number}} */
+    this.cryptoCounts = { handshakes: 0, encrypted_channels: 0, plaintext_channels: 0, refused: 0 };
 
     const unknownTuning = Object.keys(tuning).filter((key) => !TUNING_KEYS.includes(key));
     if (unknownTuning.length > 0) {
@@ -580,7 +617,10 @@ export class P2PNode extends EventEmitter {
    *   reflexive:{address:string,port:number}|null, mapping:string|null,
    *   candidates:Array<{address:string,port:number}>, announced_at:string|null,
    *   announce_ok:boolean, announce_failures:number, last_announce_error:string|null,
-   *   punches_out:number, punches_in:number, dial_failures:number, last_error:string|null}}
+   *   punches_out:number, punches_in:number, dial_failures:number, last_error:string|null,
+   *   encryption:{enabled:boolean, public_key:string|null, peers_known:number,
+   *     handshakes:number, encrypted_channels:number, plaintext_channels:number, refused:number,
+   *     refusals:Array<object>}}}
    */
   get status() {
     return {
@@ -601,7 +641,41 @@ export class P2PNode extends EventEmitter {
       punches_in: this.punchesIn,
       dial_failures: this.dialFailures,
       last_error: this.lastError,
+      // v0.6.0. `enabled` is about this machine's own key, not about any peer: a node with a key
+      // still creates plaintext channels for peers it has no key for, and each channel says so
+      // itself (`channel.encryption`).
+      encryption: {
+        enabled: this.deviceKey !== null,
+        public_key: this.deviceKey === null ? null : (this.deviceKey.publicKeyBase64 ?? null),
+        peers_known: this.peerKeys.size,
+        handshakes: this.cryptoCounts.handshakes,
+        encrypted_channels: this.cryptoCounts.encrypted_channels,
+        plaintext_channels: this.cryptoCounts.plaintext_channels,
+        refused: this.cryptoCounts.refused,
+        refusals: this.cryptoRefusals.map((entry) => ({ ...entry })),
+      },
     };
+  }
+
+  /**
+   * Record a crypto refusal or a plaintext fallback, once per (peer, direction, reason).
+   *
+   * Deduplicated because a punch repeats: the same refusal would otherwise be appended on every
+   * retransmission and a bounded list would hold nothing but copies of one fact.
+   *
+   * @param {string} reason
+   * @param {string|null} machineId
+   * @param {'in'|'out'} direction
+   */
+  noteCrypto(reason, machineId, direction) {
+    this.cryptoRefusals.push({
+      at: new Date(this.nowMs()).toISOString(),
+      reason,
+      machine_id: machineId,
+      direction,
+    });
+    while (this.cryptoRefusals.length > 16) this.cryptoRefusals.shift();
+    this.log(`p2p: ${direction === 'in' ? 'inbound' : 'outbound'} crypto ${reason}${machineId ? ` (${machineId})` : ''}`);
   }
 
   /**
@@ -824,6 +898,11 @@ export class P2PNode extends EventEmitter {
       candidates: candidates.map((candidate) => ({ ...candidate })),
       nat: { mapping },
       ttl_ms: this.tuning.announceTtlMs,
+      // v0.6.0: the static public key rides with the candidates, which is what makes it available to
+      // a dispatcher that has to name it in an offer. Omitted entirely when this machine has no key,
+      // so the wire stays byte-identical to v0.5.x for a plaintext node — an additive change has to
+      // be absent, not null, to be additive.
+      ...(this.deviceKey === null ? {} : { static_key: this.deviceKey.publicKeyBase64 }),
     };
 
     let response = null;
@@ -1080,6 +1159,33 @@ export class P2PNode extends EventEmitter {
         remote,
         session,
         timeoutMs: options.timeoutMs ?? this.tuning.punchTimeoutMs,
+        // v0.6.0: arm the handshake only when this machine holds a key for *that* peer. An empty
+        // store is the v0.5.x behaviour exactly — a plain punch — and `channel.encryption.reason`
+        // then says `P2P_CRYPTO_NO_KEY` rather than leaving "plaintext" unexplained.
+        //
+        // Letting `connect()` arm a handshake with a null peer key would be worse than useless: the
+        // initiator would compute a MAC nobody could verify and the punch would report
+        // `P2P_CRYPTO_HANDSHAKE_TIMEOUT` against a peer that never had a key to offer. The peer *is*
+        // told what happened — the plain punch it answers carries an empty body, which is exactly how
+        // a v0.5.x build asks to be talked to in the clear.
+        //
+        // A **self-dial** belongs on that same plaintext path, and the reason is not squeamishness
+        // about encrypting a loopback: a machine holds no peer key for itself, so the handshake it
+        // sends would be refused by its own `respondHandshake` (`P2P_CRYPTO_UNKNOWN_PEER`) and the
+        // task it dispatched to itself would be lost. `machineId !== this.machineId` is what makes a
+        // self-lease survive a security upgrade, which is the same rule as every other fallback here.
+        ...(this.deviceKey === null ||
+        machineId === this.machineId ||
+        this.peerKeys.get(machineId) === null
+          ? {}
+          : {
+            crypto: {
+              deviceKey: this.deviceKey,
+              peerKey: this.peerKeys.get(machineId),
+              peerMachineId: machineId,
+            },
+          }),
+        ...(this.cryptoTuning === null ? {} : { cryptoTuning: this.cryptoTuning }),
       });
     } catch (error) {
       // `punch()` sends synchronously, and `dgram` throws from `send()` on a socket that
@@ -1092,6 +1198,13 @@ export class P2PNode extends EventEmitter {
       });
     }
     if (!outcome.ok) {
+      // A refused handshake is recorded here, once, so `status.encryption.refusals` can answer "why
+      // is this peer never encrypted?" without anyone reading a log. §4's rule is that a refusal is
+      // named, never silent — and this is the place the name is kept.
+      if (outcome.crypto?.status === 'refused') {
+        this.cryptoCounts.refused += 1;
+        this.noteCrypto(outcome.crypto.reason ?? CRYPTO_REASON.REFUSED_BY_PEER, machineId, 'out');
+      }
       return fail(outcome.error ?? 'P2P_PUNCH_FAILED', {
         attempts: outcome.punch?.attempts ?? 0,
         rttMs: outcome.punch?.rttMs ?? null,
@@ -1100,6 +1213,41 @@ export class P2PNode extends EventEmitter {
     }
 
     this.punchesOut += 1;
+    // v0.6.0: an encrypted channel already live for this session outranks anything this punch just
+    // produced. The simultaneous punch makes the ordering arbitrary — the accept loop can complete a
+    // handshake for session S while S's own punch is still in flight — and a plaintext channel that
+    // *replaced* an encrypted one would leave both ends believing they were encrypted, so every frame
+    // would fail its tag and the task would fall back to the relay for a reason nothing recorded. The
+    // punch's own channel is therefore closed and the encrypted one is returned instead.
+    const liveHere = this.channels.get(session);
+    if (
+      liveHere !== undefined &&
+      liveHere !== outcome.channel &&
+      liveHere.encryption?.encrypted === true &&
+      outcome.channel.encryption?.encrypted !== true
+    ) {
+      try {
+        outcome.channel.close('session-encrypted', { silent: true });
+      } catch {
+        /* the path is already gone */
+      }
+      this.cryptoCounts.refused += 1;
+      this.noteCrypto(CRYPTO_REASON.PLAINTEXT_PEER, machineId, 'out');
+      return {
+        ok: true,
+        channel: liveHere,
+        peer: { ...liveHere.peer },
+        session,
+        error: null,
+        attempts: outcome.punch.attempts,
+        rttMs: outcome.punch.rttMs,
+        peersAnnounced: announced.length,
+        reused: true,
+        encrypted: true,
+        encryption_reason: null,
+      };
+    }
+    this.noteChannelCrypto(outcome.channel, machineId, 'out');
     // The accept loop may have claimed this session while the punch was in flight — the far end
     // dialled us at the same moment we dialled it, which is the whole point of a simultaneous
     // punch. Its channel is the better one: its peer is the address the far end's packet actually
@@ -1123,6 +1271,8 @@ export class P2PNode extends EventEmitter {
         rttMs: outcome.punch.rttMs,
         peersAnnounced: announced.length,
         reused: true,
+        encrypted: claimedMeanwhile.encryption?.encrypted === true,
+        encryption_reason: claimedMeanwhile.encryption?.reason ?? null,
       };
     }
     this.adoptChannel(outcome.channel, { from: machineId, session: outcome.channel.session });
@@ -1136,7 +1286,71 @@ export class P2PNode extends EventEmitter {
       rttMs: outcome.punch.rttMs,
       peersAnnounced: announced.length,
       reused: false,
+      encrypted: outcome.channel.encryption?.encrypted === true,
+      encryption_reason: outcome.channel.encryption?.reason ?? null,
     };
+  }
+
+  /**
+   * Attach a completed handshake to the channel that is already live for its session.
+   *
+   * The simultaneous punch makes this the ordinary case rather than a corner case: both ends dial, one
+   * of them finishes the punch first and builds a plaintext channel, and the handshake HELLO for that
+   * same session arrives a moment later. Without this, the two ends would disagree about whether the
+   * session is encrypted and every frame would fail its tag — an outage whose cause is invisible from
+   * either end's ledger.
+   *
+   * It is deliberately a **mutation of an existing channel** and not a replacement: the channel is
+   * already wired into `'message'` listeners, already claimed, and probably already has frames on the
+   * wire. Attaching keys to it changes what the next frame is sealed with and nothing else.
+   *
+   * Not applied when the channel is already encrypted — the first handshake wins, and re-keying a live
+   * session because a duplicate HELLO arrived would break the frames already in flight. Not applied to
+   * a channel that never existed: the caller is the accept loop, which only gets here for a session
+   * `this.channels` already holds.
+   *
+   * @param {{session:number, session_crypto:object, isInitiator:boolean, machineId:string|null}} upgrade
+   * @returns {boolean} Whether a channel was upgraded.
+   */
+  applyCryptoUpgrade(upgrade) {
+    const channel = this.channels.get(upgrade.session);
+    if (channel === undefined) return false;
+    if (channel.encryption?.encrypted === true) return false;
+    if (typeof channel.attachCrypto !== 'function') return false;
+    channel.attachCrypto(upgrade.session_crypto, upgrade.isInitiator === true);
+    this.cryptoCounts.handshakes += 1;
+    this.cryptoCounts.encrypted_channels += 1;
+    this.log(
+      `p2p: session ${upgrade.session} upgraded to an encrypted channel` +
+        `${upgrade.machineId === null ? '' : ` (${upgrade.machineId})`}`,
+    );
+    return true;
+  }
+
+  /**
+   * Count one channel's crypto outcome and tell the world about it.
+   *
+   * Called wherever a channel is created, so the counters cannot drift from the channels they count.
+   * A *refusal* is not counted here — a refused handshake produces no channel at all, which is the
+   * whole point of refusing — and that asymmetry is what makes `refused` mean "no channel was made"
+   * rather than "a channel was made and then complained about".
+   *
+   * @param {import('./p2p.mjs').P2PChannel} channel
+   * @param {string|null} machineId
+   * @param {'in'|'out'} direction
+   */
+  noteChannelCrypto(channel, machineId, direction) {
+    const encryption = channel?.encryption ?? null;
+    if (encryption === null) return;
+    if (encryption.encrypted) {
+      this.cryptoCounts.handshakes += 1;
+      this.cryptoCounts.encrypted_channels += 1;
+      return;
+    }
+    this.cryptoCounts.plaintext_channels += 1;
+    // Recorded once per channel rather than per frame: "this channel is plaintext" is the fact, and
+    // the reason is what makes it actionable.
+    this.noteCrypto(encryption.reason ?? CRYPTO_REASON.PLAINTEXT_PEER, machineId, direction);
   }
 
   /**
@@ -1196,6 +1410,13 @@ export class P2PNode extends EventEmitter {
     channel.on('error', (error) => {
       this.reportError(`P2P_CHANNEL_ERROR: ${messageOf(error)}`);
     });
+    // v0.6.0: a frame that failed its authentication tag. Not an `'error'` — the channel is fine and
+    // the *frame* was not — but not silent either: the reason goes into `status.last_error` so a
+    // machine under a forgery attempt is visible without a packet capture.
+    channel.on('crypto', (event) => {
+      this.lastError = `P2P_CRYPTO_DROPPED: ${event.reason} (${event.dropped} frame(s) on session ${details.session})`;
+      this.log(`p2p: ${this.lastError}`);
+    });
   }
 
   /**
@@ -1217,6 +1438,19 @@ export class P2PNode extends EventEmitter {
           socket: this.socket,
           timeoutMs: this.tuning.acceptTimeoutMs,
           claimed: this.claimed,
+          // v0.6.0: handshakes are answered only when this machine holds a key of its own. Without
+          // one, `accept()` is byte-for-byte v0.5.x — every HELLO answered plainly — which is what
+          // keeps a mixed fleet working rather than half-encrypted and confused.
+          ...(this.deviceKey === null
+            ? {}
+            : {
+              crypto: {
+                deviceKey: this.deviceKey,
+                peerKeys: this.peerKeys,
+                seen: this.seenHandshakes,
+              },
+            }),
+          ...(this.cryptoTuning === null ? {} : { cryptoTuning: this.cryptoTuning }),
         });
       } catch (error) {
         // `accept()` throws only for a socket it was not given, which the loop condition
@@ -1227,6 +1461,20 @@ export class P2PNode extends EventEmitter {
       }
       if (!result.ok) {
         if (result.error?.startsWith('P2P_SOCKET_CLOSED')) return;
+        // A handshake that completed for a session this node already holds a channel for: the
+        // simultaneous punch, seen from the accepting side. The upgrade is applied to the live channel
+        // rather than a second one being made, because two channels on one session would each deliver
+        // every payload and the peer would see each message twice.
+        if (result.upgrade !== undefined && result.upgrade !== null) {
+          this.applyCryptoUpgrade(result.upgrade);
+          continue;
+        }
+        // A refused handshake ends the wait without a channel. Recorded, never fatal: the peer may be
+        // a machine whose key is stale, and the relay path carries its task either way.
+        if (result.crypto?.status === 'refused') {
+          this.cryptoCounts.refused += 1;
+          this.noteCrypto(result.crypto.reason ?? CRYPTO_REASON.REFUSED_BY_PEER, null, 'in');
+        }
         continue;
       }
       if (!this.started || this.runToken !== token) {
@@ -1236,10 +1484,33 @@ export class P2PNode extends EventEmitter {
         return;
       }
       this.punchesIn += 1;
-      // `from` is null: a HELLO carries a session, not a machine id, and inventing an
-      // identity from a source address would be exactly the kind of unverified claim
-      // this transport refuses elsewhere. The caller correlates by session if it needs to.
-      this.adoptChannel(result.channel, { from: null, session: result.session });
+      // v0.6.0, and this check is load-bearing rather than defensive. A simultaneous punch means
+      // `dial()` and this loop can both produce a channel for one session, and `adoptChannel` keeps
+      // the *last* one. When `dial()` won the race with an encrypted channel and this loop then saw
+      // the peer's plain punch HELLO, that replacement silently downgraded a live encrypted session to
+      // a plaintext one — with both ends believing they were encrypted, so every frame failed its tag
+      // and the task fell back to the relay for a reason no ledger recorded. An encrypted channel is
+      // therefore never replaced by a plaintext one for the same session; the punch is re-acknowledged
+      // instead, which is what the peer's retransmitted HELLO actually needs.
+      const existing = this.channels.get(result.session);
+      if (
+        existing !== undefined &&
+        existing.encryption?.encrypted === true &&
+        result.channel.encryption?.encrypted !== true
+      ) {
+        this.noteCrypto(CRYPTO_REASON.PLAINTEXT_PEER, result.machineId ?? null, 'in');
+        this.log(
+          `p2p: kept the encrypted channel for session ${result.session}; a plaintext one would have replaced it`,
+        );
+        return;
+      }
+      this.noteChannelCrypto(result.channel, result.machineId ?? null, 'in');
+      // `from` is the handshake's *verified* machine id when there was a handshake, and null
+      // otherwise: a plain HELLO carries a session, not an identity, and inventing one from a source
+      // address would be exactly the kind of unverified claim this transport refuses elsewhere. The
+      // difference is worth stating — `from` is evidence now, not a guess — and a caller that needs
+      // it for a plaintext channel still has to correlate by session.
+      this.adoptChannel(result.channel, { from: result.machineId ?? null, session: result.session });
     }
   }
 

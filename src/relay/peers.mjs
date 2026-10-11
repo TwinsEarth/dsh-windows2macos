@@ -20,6 +20,15 @@
  *   * **Bounded.** Candidate count, address shape and TTL are all validated, because
  *     this is the one place where a peer supplies an address another peer will send
  *     UDP datagrams to.
+ *   * **The static public key is a *distribution* channel, not an authority (v0.6.0).** A machine
+ *     announces its own X25519 public key with its candidates, and a peer reads it back — which is
+ *     what removes the `[Peer]` block nobody wants to fill in by hand. What the relay can and cannot
+ *     do here is worth stating plainly: it can substitute a key, because a peer learns the key from
+ *     the relay's answer (or from the dispatcher's offer, which the relay also carries verbatim). It
+ *     cannot *use* a substituted key, because a handshake needs the matching private half, so a
+ *     substituted key produces a refusal rather than a silent interception. §8 of
+ *     `docs/P2P-CRYPTO.md` names the cheap improvement — a key-change notice — and leaves it for
+ *     stage 2; until then a changed key is visible as `P2P_CRYPTO_BAD_MAC` rather than as silence.
  */
 
 /** Most candidates a single machine may announce. Enough for several interfaces, not for a scan. */
@@ -30,6 +39,33 @@ export const DEFAULT_TTL_MS = 60_000;
 
 /** Upper bound a caller may request, so an announcement cannot be pinned indefinitely. */
 export const MAX_TTL_MS = 10 * 60_000;
+
+/**
+ * Bytes in an X25519 public key (v0.6.0).
+ *
+ * The key itself is base64, so this is what the validator decodes to. Kept as a literal rather than
+ * imported from `src/agent/crypto.mjs` for the same reason `P2P_MODES` is duplicated in
+ * `state.mjs`: the relay is a standalone process that must not depend on an agent module, and the
+ * value is a wire fact two independently deployed ends have to agree on.
+ */
+export const STATIC_KEY_BYTES = 32;
+
+/**
+ * Is `value` a usable static public key?
+ *
+ * Strict about the encoding, because a key that "almost" decodes is the input to a MAC that fails for
+ * a reason indistinguishable from an attack. `Buffer.from(x, 'base64')` ignores characters it does
+ * not recognise, so the decode is only trusted after re-encoding it and getting the same string back.
+ *
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+export function isStaticKey(value) {
+  if (typeof value !== 'string' || value === '') return false;
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(value)) return false;
+  const decoded = Buffer.from(value, 'base64');
+  return decoded.length === STATIC_KEY_BYTES && decoded.toString('base64') === value;
+}
 
 const IPV4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
 
@@ -112,10 +148,26 @@ export class PeerRegistry {
     const ttlMs = Math.max(1000, Math.min(requestedTtl, MAX_TTL_MS));
     const now = this.nowMs();
 
+    // v0.6.0: the machine's static public key, when it sent one. Validated here because this is the
+    // one place a peer supplies a value another peer will use to authenticate it — a malformed key
+    // stored and served would make a handshake fail with a MAC error that looks exactly like an
+    // attack. Absent (a v0.5.x machine, or one with no key) stays absent rather than becoming `null`:
+    // "this machine has no key" and "this machine's key is unknown" must not be the same value.
+    let staticKey = null;
+    if (body.static_key !== undefined && body.static_key !== null) {
+      if (!isStaticKey(body.static_key)) {
+        throw Object.assign(new Error('static_key is not a 32-byte base64 X25519 public key'), {
+          code: 'BAD_STATIC_KEY',
+        });
+      }
+      staticKey = body.static_key;
+    }
+
     const entry = {
       machine_id: machineId,
       candidates,
       nat: { mapping: typeof body.nat?.mapping === 'string' ? body.nat.mapping : null },
+      static_key: staticKey,
       announced_at_ms: now,
       expires_at_ms: now + ttlMs,
     };
@@ -124,6 +176,7 @@ export class PeerRegistry {
     return {
       machine_id: machineId,
       candidates,
+      ...(staticKey === null ? {} : { static_key: staticKey }),
       expires_at: new Date(entry.expires_at_ms).toISOString(),
       ttl_ms: ttlMs,
     };
@@ -148,6 +201,9 @@ export class PeerRegistry {
       machine_id: entry.machine_id,
       candidates: entry.candidates.map((c) => ({ ...c })),
       nat: { ...entry.nat },
+      ...(entry.static_key === null || entry.static_key === undefined
+        ? {}
+        : { static_key: entry.static_key }),
       announced_at: new Date(entry.announced_at_ms).toISOString(),
       expires_at: new Date(entry.expires_at_ms).toISOString(),
     };

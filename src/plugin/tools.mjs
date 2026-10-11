@@ -74,6 +74,10 @@ import {
 // another's, so a second implementation of the formula that drifted by one input would make every
 // reverse dial time out while both ends insisted they were sending.
 import { mintPunchId, punchSession } from '../agent/p2p.mjs';
+// v0.6.0: the device keypair and the offer's key distribution (`docs/P2P-CRYPTO.md` §4). Imported
+// rather than reimplemented: the dispatcher and the executor have to derive the *same* keys, and two
+// implementations of a handshake are two chances to disagree about it.
+import { DeviceKey } from '../agent/crypto.mjs';
 import { parseServer } from '../agent/stun.mjs';
 // The result-deduplication identity the relay mints. Imported rather than re-implemented: the value
 // is compared byte for byte by the executor, so a second copy of the formula that drifted by one
@@ -1077,9 +1081,27 @@ function createP2PTransport(cfg) {
  * relay and a v0.4.x agent ignore keys they do not read. `relay` mode publishes `{mode}` alone: there
  * is no punch, and saying so is better than publishing a stale one.
  *
+ * v0.6.0 adds one more key to the same block, and it is the whole of the key distribution problem:
+ *
+ *   `static_keys: { [machine_id]: base64(x25519 public key) }`
+ *
+ * WHY A MAP RATHER THAN ONE KEY
+ *
+ * The executor needs the *dispatcher's* key before it can dial back, and the dispatcher needs the
+ * *executor's* key before it can push — and at dispatch time the relay has not yet said which
+ * machines the task went to (`leases` come back in the same response that creates it). So the block
+ * carries this machine's own key, which is known before the request is written, and
+ * {@link offerP2PFor} adds the target's once the lease names it. Reading the field is therefore
+ * "look up the machine you are about to talk to", never "assume the only entry is the peer" — a
+ * machine that receives an offer for a fleet of three has three entries and uses one.
+ *
+ * What that buys, in the document's own terms: no `[Peer]` block for anyone to fill in. A machine
+ * learns the keys of exactly the peers it has been asked to talk to, from the offer that asked it.
+ *
  * @param {ReturnType<typeof readConfig>} cfg
  * @param {object} runtime The P2P runtime handle from {@link createP2PRuntime}.
- * @returns {{mode: string, punch?: string, candidates?: Array<{address:string, port:number}>}}
+ * @returns {{mode: string, punch?: string, candidates?: Array<{address:string, port:number}>,
+ *   static_keys?: Record<string, string>}}
  */
 function buildP2POfferBlock(cfg, runtime) {
   const block = { mode: cfg.p2pMode };
@@ -1096,6 +1118,14 @@ function buildP2POfferBlock(cfg, runtime) {
   if (Array.isArray(candidates) && candidates.length > 0) {
     block.candidates = candidates.map((candidate) => ({ address: candidate.address, port: candidate.port }));
   }
+  // This machine's own static public key. Absent (not null) when there is none, so the wire stays
+  // byte-identical to v0.5.x for a machine that has no key — an additive change has to be absent to
+  // be additive.
+  const own = runtime?.encryption?.public_key;
+  const machineId = runtime?.machineId;
+  if (typeof own === 'string' && own !== '' && typeof machineId === 'string' && machineId !== '') {
+    block.static_keys = { [machineId]: own };
+  }
   return block;
 }
 
@@ -1108,16 +1138,25 @@ function buildP2POfferBlock(cfg, runtime) {
  * dispatcher is not filtering for would be answered by its `accept()` at best — a second session,
  * a second channel, and two live sessions for one task where one would do.
  *
+ * v0.6.0 adds the *target's* key to `static_keys` when the caller supplies one, which is the half of
+ * the distribution the published block could not carry: the dispatcher learns the executor's key from
+ * the relay's peer record and hands it over in the frame addressed to that machine.
+ *
  * @param {unknown} published The block from {@link buildP2POfferBlock}, or whatever the caller sent.
- * @param {{taskId: string, machineId: string}} identity
+ * @param {{taskId: string, machineId: string, peerKey?: string|null}} identity
  * @returns {object|null}
  */
-function offerP2PFor(published, { taskId, machineId }) {
+function offerP2PFor(published, { taskId, machineId, peerKey = null }) {
   if (published === null || published === undefined) return null;
   if (typeof published !== 'object' || Array.isArray(published)) return null;
   const block = { ...published };
   const session = punchSession({ punch: block.punch, taskId, machineId });
   if (session !== null) block.session = session;
+  if (typeof peerKey === 'string' && peerKey !== '') {
+    const keys = block.static_keys !== null && typeof block.static_keys === 'object' ? { ...block.static_keys } : {};
+    keys[machineId] = peerKey;
+    block.static_keys = keys;
+  }
   return block;
 }
 
@@ -1142,9 +1181,11 @@ function offerP2PFor(published, { taskId, machineId }) {
  * @param {object} options.lease
  * @param {object} options.payload The validated `POST /v1/task` body this plugin sent.
  * @param {string|null} options.originMachineId
+ * @param {string|null} [options.peerKey] The target's static public key (v0.6.0), added to the
+ *   frame's `p2p.static_keys` under that machine's id.
  * @returns {{frame: object|null, skipped: string|null}}
  */
-function buildOfferFrame({ taskId, lease, payload, originMachineId }) {
+function buildOfferFrame({ taskId, lease, payload, originMachineId, peerKey = null }) {
   const machineId = typeof lease?.machine_id === 'string' && lease.machine_id !== '' ? lease.machine_id : null;
   if (machineId === null) return { frame: null, skipped: 'the relay returned a lease with no machine_id' };
 
@@ -1183,7 +1224,7 @@ function buildOfferFrame({ taskId, lease, payload, originMachineId }) {
       requirements: payload.requirements,
       compare_policy: payload.compare_policy,
       origin_machine_id: originMachineId,
-      p2p: offerP2PFor(payload.p2p, { taskId, machineId }),
+      p2p: offerP2PFor(payload.p2p, { taskId, machineId, peerKey }),
     },
     skipped: null,
   };
@@ -1201,19 +1242,55 @@ function buildOfferFrame({ taskId, lease, payload, originMachineId }) {
  *
  * @param {P2PNode} node
  * @param {object} frame
- * @returns {Promise<{ok: boolean, error: string|null, session: number|null, reused: boolean}>}
+ * @param {{peerKey?: string|null, peerKeys?: object|null}} [crypto]
+ *   `peerKey` is the target's static public key, published in this very frame
+ *   (`frame.p2p.static_keys[machine_id]`) so the executor can dial back; it is handed to `dial()` as
+ *   well because the *dispatcher* is the initiator here and needs the executor's key to handshake.
+ *   `peerKeys` is the node's own store, taught the same key so the accept side can verify the
+ *   executor's handshake later without a second relay lookup.
+ * @returns {Promise<{ok: boolean, error: string|null, session: number|null, reused: boolean,
+ *   encrypted: boolean, encryption_reason: string|null}>}
  */
-async function pushOffer(node, frame) {
+async function pushOffer(node, frame, crypto = {}) {
   const session = Number.isInteger(frame?.p2p?.session) && frame.p2p.session > 0 ? frame.p2p.session : undefined;
+  const peerKey = typeof crypto.peerKey === 'string' && crypto.peerKey !== '' ? crypto.peerKey : null;
+  if (peerKey !== null && crypto.peerKeys !== null && crypto.peerKeys !== undefined) {
+    // Recorded before the dial: the executor's handshake answer arrives on the same socket, and the
+    // `accept()` loop that has to verify it runs on this node. A key learned only from the relay's
+    // answer would be a second lookup racing that datagram.
+    crypto.peerKeys.set(frame.machine_id, peerKey, 'relay');
+  }
+  // The dial's own options, built here rather than inline because the *presence* of `crypto` is the
+  // decision: `P2PNode.dial` arms a handshake only when this dispatcher holds a key for that peer, and
+  // a peer with no published key is dialled exactly as v0.5.x dialled it — plaintext, recorded, and
+  // never a failure. That is §4's fallback clause applied to the push: a fleet must never lose a
+  // machine to a security upgrade. It is not a silent downgrade, because the peer never offered a key
+  // to downgrade *from*; a peer whose key we hold and whose handshake fails produces `ok: false` and
+  // no channel at all.
+  const dialOptions = session === undefined ? {} : { session };
   try {
-    const dialled = await node.dial(frame.machine_id, session === undefined ? {} : { session });
+    const dialled = await node.dial(frame.machine_id, dialOptions);
     if (!dialled.ok) {
-      return { ok: false, error: dialled.error ?? 'P2P_DIAL_FAILED', session: dialled.session ?? null, reused: false };
+      return {
+        ok: false,
+        error: dialled.error ?? 'P2P_DIAL_FAILED',
+        session: dialled.session ?? null,
+        reused: false,
+        encrypted: false,
+        encryption_reason: dialled.encryption_reason ?? null,
+      };
     }
     const channel = dialled.channel;
     try {
       await channel.send(JSON.stringify(frame));
-      return { ok: true, error: null, session: dialled.session ?? null, reused: dialled.reused === true };
+      return {
+        ok: true,
+        error: null,
+        session: dialled.session ?? null,
+        reused: dialled.reused === true,
+        encrypted: channel?.encryption?.encrypted === true,
+        encryption_reason: channel?.encryption?.reason ?? null,
+      };
     } finally {
       // The offer is one frame over a reliable channel: holding the channel open would keep a NAT
       // mapping alive for a conversation that is over, and the result comes back the responder's way.
@@ -1225,6 +1302,8 @@ async function pushOffer(node, frame) {
       error: `P2P_PUSH_THREW: ${error instanceof Error ? error.message : String(error)}`,
       session: session ?? null,
       reused: false,
+      encrypted: false,
+      encryption_reason: null,
     };
   }
 }
@@ -1238,11 +1317,19 @@ async function pushOffer(node, frame) {
  * were never handed the command, and sending them an offer would be asking them to run work the
  * relay decided they must not run.
  *
+ * v0.6.0: each target's static key is fetched from the relay's peer record before the push, which is
+ * the one moment the dispatcher learns the key of a machine it did not already know. It is fetched
+ * **here** rather than sourced from the stored `p2p` block because the block is written *before* the
+ * relay decides which machines the task goes to — the offer that carries the key is the one addressed
+ * to the machine that key belongs to. A missing key is not an error: the push proceeds and the
+ * executor records `P2P_CRYPTO_NO_KEY` for its plaintext channel, which is the documented outcome for
+ * a peer that never announced.
+ *
  * @param {P2PNode} node
  * @param {object} options
  * @returns {Promise<Array<object>>} One entry per lease considered, in lease order.
  */
-async function pushOffers(node, { taskId, leases, payload, originMachineId }) {
+async function pushOffers(node, { taskId, leases, payload, originMachineId, getJson = null }) {
   const out = [];
   for (const lease of leases) {
     const machineId = typeof lease?.machine_id === 'string' && lease.machine_id !== '' ? lease.machine_id : null;
@@ -1259,12 +1346,13 @@ async function pushOffers(node, { taskId, leases, payload, originMachineId }) {
       });
       continue;
     }
-    const built = buildOfferFrame({ taskId, lease, payload, originMachineId });
+    const peerKey = await readPeerStaticKey(getJson, machineId);
+    const built = buildOfferFrame({ taskId, lease, payload, originMachineId, peerKey });
     if (built.frame === null) {
       out.push({ machine_id: machineId, ok: false, error: built.skipped });
       continue;
     }
-    const result = await pushOffer(node, built.frame);
+    const result = await pushOffer(node, built.frame, { peerKey, peerKeys: node?.peerKeys ?? null });
     out.push({
       machine_id: machineId,
       ok: result.ok,
@@ -1277,9 +1365,40 @@ async function pushOffers(node, { taskId, leases, payload, originMachineId }) {
       // True when the executor's dial got there first and this push travelled over the channel that
       // dial opened — a two-way punch that worked, reported as such rather than as a plain push.
       reused: result.reused === true,
+      // v0.6.0: whether the offer actually travelled sealed, and why not when it did not. Reported
+      // per machine because it is a per-machine fact: one peer can be encrypted and the next one a
+      // v0.5.x build in the same dispatch.
+      encrypted: result.encrypted === true,
+      ...(result.encryption_reason === null || result.encryption_reason === undefined
+        ? {}
+        : { encryption_reason: result.encryption_reason }),
+      ...(peerKey === null ? {} : { static_key: 'published' }),
     });
   }
   return out;
+}
+
+/**
+ * Read one machine's static public key from the relay's peer record, or explain why not.
+ *
+ * Never throws and never fails a dispatch: a relay that answers 404 (the peer never announced, or its
+ * announcement expired between the task and the push) leaves this machine unencrypted for that peer
+ * and says so, which is precisely §4's "a fleet must never lose a machine because a security upgrade
+ * could not complete".
+ *
+ * @param {((path: string) => Promise<object>)|null} getJson
+ * @param {string} machineId
+ * @returns {Promise<string|null>}
+ */
+async function readPeerStaticKey(getJson, machineId) {
+  if (typeof getJson !== 'function') return null;
+  try {
+    const answer = await getJson(`/v1/peer/${encodeURIComponent(machineId)}`);
+    const key = answer?.json?.peer?.static_key;
+    return typeof key === 'string' && key !== '' ? key : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -1382,6 +1501,40 @@ function createP2PRuntime(ctx, cfg, block = {}) {
 }
 
 /**
+ * Read the dispatcher's own static keypair, or explain why there is none (v0.6.0).
+ *
+ * The key lives beside `device.json`, which is the one directory this plugin already knows how to
+ * find (§ the note on `readDevice`): a `stateDir` when the operator set one, otherwise the
+ * `DSH_HOME/xclient` default. Generating it here is the same "generated the first time a machine
+ * pairs" rule the agent follows, and the two processes read the *same file*, so a machine that both
+ * dispatches and executes has one identity on the direct path rather than two.
+ *
+ * Never throws. A caller cannot fix an unreadable key file from a tool call, and a dispatch that
+ * refused because a *security upgrade* could not complete would be exactly the fleet-losing failure
+ * §4 forbids — so the failure becomes a reason string, the node runs without a key, and every offer
+ * this machine publishes is plainly labelled as having none.
+ *
+ * @param {object|null} injected Test seam: a `DeviceKey`, or null to use the file.
+ * @param {string|null} deviceFile Absolute path of `device.json`, or null when unknown.
+ * @returns {{key: object|null, error: string|null}}
+ */
+function loadDeviceKey(injected, deviceFile) {
+  if (injected !== null && injected !== undefined) return { key: injected, error: null };
+  if (typeof deviceFile !== 'string' || deviceFile === '') {
+    return { key: null, error: 'P2P_CRYPTO_NO_KEY: device.json was not located, so device.key has no directory' };
+  }
+  try {
+    const loaded = DeviceKey.load({ dir: path.dirname(deviceFile) });
+    return { key: loaded.key, error: null };
+  } catch (error) {
+    return {
+      key: null,
+      error: `P2P_CRYPTO_KEY_UNREADABLE: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}
+
+/**
  * Read the identity, build the node, and start it.
  *
  * Split out of {@link createP2PRuntime} so the ownership and the work are two readable pieces: this
@@ -1406,6 +1559,19 @@ async function initP2P(ctx, cfg, runtime, block) {
     return runtime.start;
   }
 
+  // v0.6.0: the dispatcher's own static keypair, beside device.json. A failure here is *not* fatal
+  // and must not stop the node: a machine with an unreadable key file is still a working W2M machine
+  // whose tasks travel over the relay, which is the same rule every other crypto failure follows.
+  // What it must not do is pretend: the key stays null, `runtime.encryption.reason` names the
+  // failure, and every offer this machine publishes says no keys.
+  const keyLoad = loadDeviceKey(block.deviceKey ?? null, identity.path);
+  runtime.deviceKey = keyLoad.key;
+  runtime.encryption = {
+    enabled: keyLoad.key !== null,
+    public_key: keyLoad.key === null ? null : keyLoad.key.publicKeyBase64,
+    error: keyLoad.error,
+  };
+
   const transport = createP2PTransport(cfg);
   // `ctx.effect` owns the node when the host provides it, and the fallback is the same ownership
   // with a shorter lifetime: a host that provides no effect (an older Cordis, or a bare test
@@ -1418,6 +1584,7 @@ async function initP2P(ctx, cfg, runtime, block) {
     getJson: transport.getJson,
     stunServers: cfg.stunServers,
     log: (line) => ctx?.logger?.info?.(`w2m ${line}`),
+    ...(keyLoad.key === null ? {} : { deviceKey: keyLoad.key }),
     ...block,
   });
 
@@ -1604,6 +1771,22 @@ async function readP2PStatus(cfg, runtime, peersAnnounced = null) {
     punches_in: status?.punches_in ?? 0,
     dial_failures: status?.dial_failures ?? 0,
     transport: p2pTransportFacts(runtime.node),
+    // v0.6.0: the crypto facts, named one by one rather than mirrored wholesale. `enabled` is about
+    // *this* machine's key; `encrypted_channels` and `plaintext_channels` are about the channels it
+    // has actually made, and they can both be non-zero on a mixed fleet. `error` is the reason there
+    // is no key when there is none — a reader has to be able to tell "this build has no crypto" from
+    // "the key file is unreadable" without reading a log.
+    encryption: {
+      enabled: runtime.encryption?.enabled === true,
+      public_key: runtime.encryption?.public_key ?? null,
+      error: runtime.encryption?.error ?? null,
+      peers_known: status?.encryption?.peers_known ?? 0,
+      handshakes: status?.encryption?.handshakes ?? 0,
+      encrypted_channels: status?.encryption?.encrypted_channels ?? 0,
+      plaintext_channels: status?.encryption?.plaintext_channels ?? 0,
+      refused: status?.encryption?.refused ?? 0,
+      refusals: Array.isArray(status?.encryption?.refusals) ? status.encryption.refusals : [],
+    },
     inbox: {
       dir: runtime.inboxDir,
       depth: inboxDepth,
@@ -3140,6 +3323,9 @@ export async function apply(ctx, config = {}) {
             leases: Array.isArray(result.json?.leases) ? result.json.leases : [],
             payload,
             originMachineId,
+            // v0.6.0: where each target's static public key is read from, so the offer addressed to a
+            // machine can carry the key that machine needs to authenticate the dispatcher's handshake.
+            getJson: p2p.node?.getJson ?? null,
           });
           directPushes = {
             ...directPushes,

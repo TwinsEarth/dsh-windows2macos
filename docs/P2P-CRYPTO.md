@@ -1,7 +1,9 @@
 # Encrypting the peer-to-peer data plane
 
-Status: **design, stage 1 not yet implemented.** This document is the contract the implementation
-follows, so that a wire-format change is agreed before it is written rather than discovered in a diff.
+Status: **stage 1 implemented and verified** (v0.5.3); stages 2 and 3 are not. This document is the
+contract the implementation follows, so that a wire-format change is agreed before it is written
+rather than discovered in a diff. What was built, what deviated, and what is still open are in §9
+below rather than edited into the sections above — the contract should read as it was agreed.
 
 ## 1. Why not simply ship WireGuard
 
@@ -171,3 +173,53 @@ Tests that must exist before stage 1 is called done:
   that work was done — so the ack contract is proven against a faithful stand-in, not against the real
   caller. Stage 1's rekey path makes the same assumption.
 * `direct` mode refusing *every* relay-arrived offer is a contract interpretation, not a measurement.
+
+## 9. Stage 1 as delivered (v0.5.3)
+
+Eight acceptance cases from §7 exist as `test/p2p-crypto.test.mjs` (33 tests), and the gated suites went
+from 430 tests / 427 passing to **464 / 461**, the single failure being the pre-existing bundled-python
+case. eslint: 0 errors. **These tests earned their keep: they caught seven real defects during
+implementation**, three of which are worth naming because each was a silent failure of exactly the kind
+this project keeps finding —
+
+* a replay window that **accepted replays of frame 2** (the bit shift slid the wrong way);
+* a lookahead bound that capped our **own** send epoch;
+* and a plain-ACK race that could **downgrade a live encrypted session to plaintext** — the one outcome
+  §4 forbids. It is now structurally impossible: an encrypted channel is never replaced by a plaintext
+  one for the same session.
+
+### The three deviations from §4, and why each is an improvement rather than a shortcut
+
+1. **The MACs are additionally bound to the session id and the handshake version.** As §4 was written,
+   every input to `mac` is identical for every punch between one pair of machines, so a `HELLO` captured
+   from one punch would verify in the next. No field §4 names changed; the binding was added.
+2. **The rekey is an HKDF ratchet, not a second handshake.** §4 said "run the handshake again", which
+   costs a round trip inside the data path and a state machine to survive it. The epoch instead rides in
+   one cleartext byte and both ends derive epoch n+1 from n. Same 2^20-message / 120-second thresholds,
+   same 15-second retention of the previous key, and a test that a frame in flight across the boundary
+   still decrypts. The security property is unchanged; only the round trip is gone.
+3. **`mac1`/`mac2` remain unimplemented**, as §3 required, and the omission is a named value in the code
+   with its consequence written down: they mitigate CPU-exhaustion denial of service on the handshake
+   path, never confidentiality or authenticity. The interim bound is a TTL- and count-capped nonce cache.
+
+### The interface question this document raised, now decided
+
+§8 asked where the `encrypted` flag belongs, and the answer is **inside the `p2p` block, therefore
+inside `envelope_sha256`** — so the relay cannot rewrite it without breaking a hash the dispatcher
+verifies. That is the stricter of the two options, and it means the flag is not in `COMPARABLE_FIELDS`
+(it describes the transport, not the result). The consequence from §8 stands and is accepted: the direct
+`task.result` frame still carries `{type, task_id}` rather than the envelope, because `result_path` — and
+now `encrypted` — are only known after the acknowledgement, and an envelope hashed afterwards would not
+cover its own bytes. **The fast path saves the dispatcher a wait, not the bytes.** Making it carry the
+envelope means moving the transport facts out of the hashed region, which remains a deliberate protocol
+decision nobody has needed yet.
+
+### Honest limits, unchanged by this work
+
+* Every socket in the new suite is **loopback**: it crosses no NAT and is not evidence that a real
+  translation can be crossed. The suite says so in its header.
+* **Self-dial is plaintext by design**: a machine holds no peer key for itself, so a handshake would be
+  refused by its own responder and the task lost. Documented at the branch rather than left to be
+  rediscovered.
+* A v0.4.x/v0.5.x peer is unaffected: it gets the plain channel it always had, and our side records
+  `encrypted: false` with a reason. Never silently downgraded, never dropped from the fleet.

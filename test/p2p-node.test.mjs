@@ -1460,6 +1460,7 @@ describe('p2p-node: lifecycle', () => {
       'candidates',
       'dial_failures',
       'enabled',
+      'encryption',
       'last_announce_error',
       'last_error',
       'local',
@@ -1472,6 +1473,22 @@ describe('p2p-node: lifecycle', () => {
       'reflexive',
       'running',
     ]);
+    // v0.6.0: the crypto facts, named one by one for the same reason the list above exists. A node
+    // built with no key (this one) reports `enabled: false` and no public key rather than an absent
+    // block: "this machine has no identity on the direct path" is a fact, not a missing field.
+    assert.deepEqual(Object.keys(status.encryption).sort(), [
+      'enabled',
+      'encrypted_channels',
+      'handshakes',
+      'peers_known',
+      'plaintext_channels',
+      'public_key',
+      'refusals',
+      'refused',
+    ]);
+    assert.equal(status.encryption.enabled, false);
+    assert.equal(status.encryption.public_key, null);
+    assert.equal(status.encryption.peers_known, 0);
     // Plain objects, no class instances: the whole thing has to survive JSON.
     assert.equal(Object.getPrototypeOf(status), Object.prototype);
     assert.equal(Object.getPrototypeOf(status.local), Object.prototype);

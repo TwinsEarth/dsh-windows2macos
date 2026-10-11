@@ -49,6 +49,7 @@ import {
 } from './git.mjs';
 import { createSpool } from './spool.mjs';
 import { matchAllowedCommand, parseAllowedCommands } from './allowed-commands.mjs';
+import { CRYPTO_REASON, DeviceKey, PeerKeyStore } from './crypto.mjs';
 import { DEFAULT_P2P_MODE, P2P_DEFAULTS, P2PNode, normalizeP2PMode, normalizeP2PPort } from './p2p-node.mjs';
 import { punchSession, reverseDialSession } from './p2p.mjs';
 import { createSigner } from '../signing.mjs';
@@ -1018,6 +1019,39 @@ export function createAgent(options) {
   /** @type {object|null} Last snapshot handed to `onP2PStatus`, so a no-op change is not pushed. */
   let lastP2PStatusJson = null;
 
+  // -- v0.6.0: the machine's identity on the direct path --------------------
+  //
+  // Loaded here, at construction, rather than lazily at `start()`: the key file is also what a
+  // *dispatcher* publishes in an offer, and "which key will this machine present" must not depend on
+  // whether a particular code path happened to have run yet. `loadOrCreate` is the documented rule
+  // ("generated the first time a machine pairs"), and a failure is never fatal — see `deviceKeyError`.
+  const deviceKeyOutcome = loadDeviceKey(options.deviceKey ?? null, stateDir, identity.machine_id);
+  /** @type {object|null} This machine's static keypair, or null when there is none. */
+  const deviceKey = deviceKeyOutcome.key;
+  /** @type {string|null} Why there is no key, when there is none. Reported, never thrown. */
+  const deviceKeyError = deviceKeyOutcome.error;
+  /**
+   * Peer static keys, learned from offers.
+   *
+   * One store for the whole agent, handed to the node rather than copied: the agent learns a key when
+   * an offer arrives (which is the only place it is ever told one) and the node needs it moments later
+   * when it dials. Two stores would be two chances to have the key in the wrong one.
+   *
+   * @type {PeerKeyStore}
+   */
+  const peerKeys = new PeerKeyStore();
+  /**
+   * What each task's direct channel actually was, for the result envelope.
+   *
+   * Keyed by `task_id`, alongside the channel map rather than on the channel itself, because the
+   * envelope is built *after* `planDirectDelivery` may have released the channel — and
+   * `p2p.encrypted` has to describe the channel that carried this attempt, not whichever channel
+   * happens to be live when the envelope is written.
+   *
+   * @type {Map<string, {encrypted: boolean, reason: string|null, session: number|null, epoch: number}>}
+   */
+  const p2pEncryption = new Map();
+
   /**
    * Result envelopes awaiting a `result.ack` over a direct channel.
    *
@@ -1105,6 +1139,17 @@ export function createAgent(options) {
       punches_out: nodeStatus?.punches_out ?? 0,
       punches_in: nodeStatus?.punches_in ?? 0,
       dial_failures: nodeStatus?.dial_failures ?? 0,
+      encryption: {
+        enabled: deviceKey !== null,
+        public_key: deviceKey === null ? null : deviceKey.publicKeyBase64,
+        error: deviceKeyError,
+        peers_known: peerKeys.size,
+        encrypted_channels: nodeStatus?.encryption?.encrypted_channels ?? 0,
+        plaintext_channels: nodeStatus?.encryption?.plaintext_channels ?? 0,
+        handshakes: nodeStatus?.encryption?.handshakes ?? 0,
+        refused: nodeStatus?.encryption?.refused ?? 0,
+        refusals: nodeStatus?.encryption?.refusals ?? [],
+      },
       channels: p2pChannels.size,
       start_error: startError,
       last_error: startError ?? nodeStatus?.last_error ?? null,
@@ -1144,8 +1189,7 @@ export function createAgent(options) {
    * the one that would actually bind a socket, so it is the one that decides, and a caller
    * comparing the two configuration surfaces deserves to know they are not the same thing.
    */
-  function configureP2P() {
-    if (p2pMode === 'relay') return;
+  function configureP2P() {    if (p2pMode === 'relay') return;
     if (p2pNode !== null) return;
     if (p2pPortError !== null) {
       // Loud, and before anything is built. `relay` mode above is deliberately checked first: an
@@ -1173,6 +1217,12 @@ export function createAgent(options) {
       // an escape hatch for the node's other constructor options, and letting an unvalidated
       // `bindPort` there silently win would route around the check above.
       ...(p2pPort === null ? {} : { bindPort: p2pPort }),
+      // Also after `extra`, and for the same reason: the device key and the peer-key store are this
+      // agent's identity and its view of its peers, and an escape hatch that could substitute either
+      // one would be a way to run an agent that cannot be authenticated by the machine that dialled
+      // it. Omitted entirely when there is no key, so the node is exactly a v0.5.x node.
+      ...(deviceKey === null ? {} : { deviceKey }),
+      peerKeys,
     };
 
     try {
@@ -1293,10 +1343,76 @@ export function createAgent(options) {
     };
     p2pChannels.set(taskId, { channel, onClose });
     channel.on('close', onClose);
+    // v0.6.0: the encryption facts go with the channel, recorded here so every caller that wires a
+    // channel into a task records them without having to remember to.
+    rememberChannelEncryption(taskId, channel);
   }
 
   /** The channel a task's result can be acknowledged over, or null when there is none. */
   const channelFor = (taskId) => p2pChannels.get(taskId)?.channel ?? null;
+
+  /**
+   * Remember what a task's direct channel was, encryption included (v0.6.0).
+   *
+   * `encrypted` is read from the channel itself, never from configuration: a machine with a keypair
+   * still creates plaintext channels for peers it has no key for, and the ledger's job is to say what
+   * happened rather than what was possible. `reason` is the named code from that same channel, so
+   * `p2p.encrypted: false` always arrives with a *why*.
+   *
+   * It is called from both places a channel becomes a task's channel — the offer that arrived on one
+   * and the dial that opened one — and the most recent call wins, which is right: a task's result
+   * travels over the channel that is live *now*.
+   *
+   * @param {string} taskId
+   * @param {object|null} channel
+   */
+  function rememberChannelEncryption(taskId, channel) {
+    if (typeof taskId !== 'string' || taskId === '') return;
+    const encryption = channel?.encryption ?? null;
+    if (encryption === null) return;
+    p2pEncryption.set(taskId, {
+      encrypted: encryption.encrypted === true,
+      reason: encryption.encrypted === true ? null : (encryption.reason ?? CRYPTO_REASON.PLAINTEXT_PEER),
+      session: Number.isInteger(channel?.session) ? channel.session : null,
+      epoch: Number.isInteger(encryption.epoch) ? encryption.epoch : 0,
+    });
+  }
+
+  /**
+   * The encryption facts of one task, or null when no channel ever existed for it.
+   *
+   * @param {string} taskId
+   * @returns {object|null}
+   */
+  function encryptionFor(taskId) {
+    const record = p2pEncryption.get(taskId);
+    return record === undefined ? null : { ...record };
+  }
+
+  /**
+   * Record that a task had no direct channel at all, and why (v0.6.0).
+   *
+   * Without this, a task executed entirely over the relay reports `encrypted: false` with no
+   * explanation, and a reader cannot tell "this machine has no crypto" from "no direct channel was the
+   * answer for this task" — entirely different operational facts. The reason is the *same* string
+   * `offerTransportOf` puts in `p2p.reason`, deliberately: one sentence, decided in one place.
+   *
+   * It never overwrites a channel's own record: once a channel carried something for this task, which
+   * channel it was and whether it was sealed is the more specific answer.
+   *
+   * @param {string} taskId
+   * @param {string|null} reason
+   */
+  function rememberNoChannel(taskId, reason) {
+    if (typeof taskId !== 'string' || taskId === '') return;
+    if (p2pEncryption.has(taskId)) return;
+    p2pEncryption.set(taskId, {
+      encrypted: false,
+      reason: typeof reason === 'string' && reason !== '' ? reason : CRYPTO_REASON.PLAINTEXT_PEER,
+      session: null,
+      epoch: 0,
+    });
+  }
 
   /**
    * What a reverse dial would need, or the named reason there is nothing to dial.
@@ -1535,6 +1651,7 @@ export function createAgent(options) {
   function releaseChannel(taskId) {
     p2pReverseDials.delete(taskId);
     p2pPeers.delete(taskId);
+    p2pEncryption.delete(taskId);
     const entry = p2pChannels.get(taskId);
     if (!entry) return;
     p2pChannels.delete(taskId);
@@ -2181,6 +2298,16 @@ export function createAgent(options) {
     const record = context.p2pRecord ?? null;
     const reverse = context.p2pReverse ?? null;
     const dispatcherMode = offer?.p2p?.mode;
+    /**
+     * Was this task's direct channel sealed?
+     *
+     * Read from what the agent *recorded* when it held the channel, not from a live object: by the
+     * time the envelope is built the channel may have been released, and `p2p.encrypted` has to
+     * describe the channel that carried this attempt. `null` means no channel was ever involved —
+     * a task executed entirely over the relay — which reports `encrypted: false` because that is the
+     * truth about this task's data plane, whatever this machine's keypair could have done.
+     */
+    const encryption = encryptionFor(offer?.task_id);
 
     /**
      * Which mechanism opened the channel that carried the offer or the result.
@@ -2206,6 +2333,17 @@ export function createAgent(options) {
     return {
       mode: typeof dispatcherMode === 'string' && dispatcherMode !== '' ? dispatcherMode : p2pMode,
       offer_path: transport.offer_path,
+      // v0.6.0, and it is the field the whole of stage 1 exists to be believed about: `true` only
+      // when a handshake completed and the frames on this task's direct channel were sealed. There is
+      // deliberately no "probably": a machine with a keypair that could not complete a handshake with
+      // this peer records `false` *and* the named reason, so "the relay carried it" and "the relay
+      // carried it because the crypto did not land" are different, readable facts.
+      //
+      // `encrypted` is always present, like `mode`, because a reader has to be able to tell "no
+      // encryption" from "this build does not say" without comparing two machines' envelopes.
+      encrypted: encryption?.encrypted === true,
+      ...(encryption === null || encryption.encrypted === true ? {} : { encryption_reason: encryption.reason }),
+      ...(encryption === null || encryption.session === null ? {} : { encryption_session: encryption.session }),
       ...(delivery.path === null ? {} : { result_path: delivery.path }),
       ...(openedBy === null ? {} : { opened_by: openedBy }),
       ...(reverse === null || reverse.attempted !== true
@@ -2372,8 +2510,7 @@ export function createAgent(options) {
   // -- Task handling -------------------------------------------------------
 
   /** @param {object} offer */
-  function validateOffer(offer) {
-    if (!offer || typeof offer !== 'object') return 'NOT_AN_OBJECT';
+  function validateOffer(offer) {    if (!offer || typeof offer !== 'object') return 'NOT_AN_OBJECT';
     if (typeof offer.task_id !== 'string' || offer.task_id === '') return 'MISSING_TASK_ID';
     if (!Array.isArray(offer.command_argv) || offer.command_argv.length === 0) return 'MISSING_COMMAND_ARGV';
     if (!offer.command_argv.every((part) => typeof part === 'string')) return 'COMMAND_ARGV_NOT_STRINGS';
@@ -2870,7 +3007,12 @@ export function createAgent(options) {
       }
     }
 
-    if (channelFor(offer?.task_id) === null) return p2pDeliveryMark();
+    if (channelFor(offer?.task_id) === null) {
+      // No channel at all, so nothing about this task's data plane was ever sealed — and the reason
+      // recorded here is the one `offerTransportOf` already decided for `p2p.reason`.
+      rememberNoChannel(offer?.task_id, offerTransportOf(offer, p2pStatusSnapshot()).reason);
+      return p2pDeliveryMark();
+    }
     const direct = await sendResultDirect(offer.task_id);
     if (direct.delivered) {
       log('info', `result acknowledged over the direct channel for ${offer.task_id}`, {
@@ -3214,6 +3356,18 @@ export function createAgent(options) {
         // peer tried to put on the wire is overwritten, so a relay frame can never claim the
         // direct path -- the only thing that sets `'p2p'` here is the channel having delivered it.
         const offer = { ...payload, p2p_transport: source.transport };
+        // v0.6.0: the block's `static_keys` is the *entire* key-distribution mechanism — a machine
+        // learns the keys of exactly the peers it was asked to talk to, from the offer that asked it,
+        // and never from a config file. Learned here, before the offer is queued, because the reverse
+        // dial starts inside `handleOffer` and a key merged any later would miss the handshake this
+        // offer exists to enable. A malformed entry is skipped rather than fatal (`merge` says so):
+        // one broken key must not cost this machine its ability to punch at all.
+        if (offer.p2p !== null && typeof offer.p2p === 'object') {
+          const learned = peerKeys.merge(offer.p2p.static_keys, source.transport === 'p2p' ? 'offer' : 'relay');
+          if (learned > 0) {
+            log('info', `learned ${learned} peer static key(s) from the offer for ${offer.task_id ?? '?'}`);
+          }
+        }
         if (source.transport === 'p2p') {
           if (typeof offer.task_id !== 'string' || offer.task_id === '') {
             log('warn', 'ignoring a direct offer with no task_id');
@@ -3223,6 +3377,10 @@ export function createAgent(options) {
           // result is produced, and a channel lost between the two would leave `result_path` null
           // with no way to tell why.
           rememberChannel(offer.task_id, source.channel);
+          // ...and the *encryption* of that channel, remembered with it for the same reason. The
+          // envelope is written after the channel may have been released, so "was this task's direct
+          // channel sealed" has to be a fact recorded here rather than read off a live object later.
+          rememberChannelEncryption(offer.task_id, source.channel);
         }
         enqueue(offer);
         break;
@@ -3752,6 +3910,42 @@ export function createAgent(options) {
      */
     operatorToken: operatorToken ?? null,
   };
+}
+
+/**
+ * Load this machine's static keypair, or explain why there is none (v0.6.0).
+ *
+ * Never throws. A machine whose key file is unreadable is still a working W2M machine — every task
+ * still travels over the relay — and `agent.state.p2p.encryption.error` names the file that could not
+ * be read so an operator can fix it. Refusing to start an agent because a *security upgrade* could not
+ * complete is exactly the fleet-losing failure `docs/P2P-CRYPTO.md` §4 forbids.
+ *
+ * The key lives beside the spool and `agent-state.json` (the `--state` directory), which is where
+ * `identity.mjs` puts `device.json` when the agent is run with `--state`. A caller that injected a
+ * `DeviceKey` gets that one, which is the test seam and the way a caller supplies a key from
+ * somewhere else entirely.
+ *
+ * @param {object|null} injected A `DeviceKey`, or null to load or generate one from the state dir.
+ * @param {string} stateDir
+ * @param {string} machineId
+ * @returns {{key: object|null, error: string|null}}
+ */
+function loadDeviceKey(injected, stateDir, machineId) {
+  if (injected !== null && injected !== undefined) {
+    if (typeof injected.sharedSecret !== 'function' || typeof injected.publicKeyBase64 !== 'string') {
+      return { key: null, error: 'P2P_CRYPTO_NO_KEY: the injected deviceKey is not a DeviceKey' };
+    }
+    return { key: injected, error: null };
+  }
+  try {
+    const loaded = DeviceKey.load({ dir: stateDir, machineId });
+    return { key: loaded.key, error: null };
+  } catch (error) {
+    return {
+      key: null,
+      error: `P2P_CRYPTO_KEY_UNREADABLE: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
 }
 
 /**
