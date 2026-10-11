@@ -4,6 +4,39 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2] — 2026-10-10
+
+### Fixed
+
+* **The supervisor now says what it is doing, in a file.** A death that arrives with the console
+  cannot be logged from inside the process it kills — the log simply stops — so the supervisor
+  records `supervisor-heartbeat.json` (written atomically) with its state (`running` / `backoff` /
+  `degraded` / `stopped`), the child pid, restarts within ten minutes, the last exit code, and a note
+  that `3221225786` is `0xC000013A` rather than a crash of the agent logic. After three exits inside
+  ten minutes the state becomes `degraded` and the backoff grows to five minutes: not "give up", but
+  "stop hammering and say so", so the fleet sees a machine that is present and unwell instead of one
+  that vanished.
+* **Orphan agents are reaped at start.** Detaching the agent (v0.5.1) is what stops a console
+  teardown from taking the machine off the fleet, and it leaked: three agents with one identity were
+  found running at once, the newest unable to bind the punch port (`P2P_BIND_FAILED: EADDRINUSE
+  0.0.0.0:41235`) because an orphan held it, while `MultipleInstances IgnoreNew` kept a fresh
+  supervisor from starting at all. The heartbeat names the last child, so a new supervisor terminates
+  that pid before it spawns anything.
+
+### Added
+
+* **`docs/AUDIT.md`** — what is implemented, what is running and how it works, with every claim
+  labelled `[M]` measured live, `[T]` asserted by the suites, or `[?]` **not verified**. It records
+  the uncomfortable half on purpose: A and B have no live proof yet, the macOS machine's state is
+  unconfirmed, the WireGuard hub has never seen a handshake, the session-0 service has never been
+  executed, and the link from the Windows machine to the relay is intermittently down. Its last
+  section is the commands to re-run each check, so the next reader need not trust the snapshot.
+
+### Notes
+
+* This release exists because `deploy/` and `docs/` are inside the published package: after v0.5.1 the
+  tag and the tarball had drifted, and a release is the only honest way to close that.
+* No runtime change to the eight tools.
 ## [0.5.1] — 2026-10-10
 
 ### Fixed
