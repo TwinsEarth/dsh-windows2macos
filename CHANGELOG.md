@@ -54,6 +54,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 * Still unverified, and not claimed: how the control *renders*. No browser was opened. What is proven is
   the entire host side — the entry activates, the eight tools register, the boot-graph row is composed
   from the shipped bundle, the route is registered and attached — plus the seat shape in a VM test.
+## [0.5.7] — 2026-10-11
+
+### Fixed
+
+* **v0.5.6 shipped without its own documents.** `TROUBLESHOOTING.md` and `SECURITY.md` were written,
+  reviewed and committed, and then **not packed**, because `files` names the documents individually
+  rather than by pattern. Anyone installing v0.5.6 got the code and none of the guidance. They are in the
+  package now, and `test/claims.test.mjs` is the place this class of defect belongs.
+* **v0.5.6 shipped without its own gates wired in.** `test/claims.test.mjs`, `test/loader-entry.test.mjs`
+  and the two mDNS suites existed and passed, but were listed in none of `test`, `test:all` or `verify` —
+  a test that does not run protects nothing, which is the exact defect this release's own study
+  identified in someone else's repository. All four are wired in.
+* A typographic character (a smart quote) in `test/mdns-discover.test.mjs`, caught by the repository's
+  own mojibake scan.
+
+### Notes
+
+* Fix-forward, not a rewrite: v0.5.6 is published and stays published, because the alternative is
+  rewriting history someone may already have. Both defects are mine, and both are the class this project
+  keeps naming — a claim that nothing checks.
+* No runtime change: the code in v0.5.7 is the code in v0.5.6.
 ## [0.5.6] — 2026-10-11
 
 ### Fixed

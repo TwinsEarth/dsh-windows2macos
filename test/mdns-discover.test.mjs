@@ -711,7 +711,7 @@ describe('a network without multicast', () => {
   it('returns a refusal instead of throwing when the query cannot be sent', async () => {
     // A port the socket layer rejects, so the *send* fails rather than the bind: this is the shape a
     // container with no multicast route produces (`ENETUNREACH` instead), and the handling is the same
-    // path — the failure is a value, the scan reports itself unavailable, and no candidate is invented.
+    // path -- the failure is a value, the scan reports itself unavailable, and no candidate is invented.
     const result = await discoverServices({
       targets: [{ address: MDNS_GROUP, port: 0 }],
       bindAddress: '127.0.0.1',
