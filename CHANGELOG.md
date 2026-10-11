@@ -4,6 +4,198 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] — 2026-10-11
+
+### Added
+
+* **The pre-flight became a ledger, with a self-test of its own.** `scripts/preflight.mjs` grew from 886
+  lines to 2,077 and the claims suite it reuses from 775 to 1,581. Every gate it delegates to is now an
+  **artifact bound to the registered check that measures it, in both directions**: a gate with no check is
+  a finding, a check with no gate is a finding, and a registered check that produces no result at all is
+  a `FAIL` rather than a silence. The ledger that enforces that is itself exercised on every run — a
+  silent check, a throwing check and an honest one must classify `FAIL`/`FAIL`/`PASS`, and an
+  `UNVERIFIABLE` whose reason is not on the accepted list is refused rather than reported. Measured on
+  this tree: 12 artifacts inventoried, 11 registered checks, 0 unbound.
+* **The packed tarball is checked against an expectation derived from the tree, not a hand-written list.**
+  Every document in the tree is either shipped or named in `DOCUMENT_EXCLUSIONS` **with a reason** (18 in
+  the tree, 17 shipped, 1 excluded, 0 neither), the packed `package.json` is compared with the tree's
+  **field for field**, and every manifest-declared path must ship. Both directions are asserted, so "the
+  packer stopped shipping a document" and "a document was added and the packer was not told" fail the
+  same check instead of one of them passing quietly.
+* **Workflow wiring is a check rather than a convention.** `ci.yml` and `release.yml` must each run every
+  suite `package.json#scripts.test` names and must not hand-list a suite set, and the pre-flight asserts
+  that the loader gate keeps its triggers on the two occasions that matter — every pull request and every
+  release. That gate was the one a hand-edited suite list quietly dropped, which is how six suites that
+  exist and pass came to run in no workflow at all.
+* **Accepted reasons are named per claim, and every skip is printed with its reason.** `UNVERIFIABLE` is
+  not a pass: each accepted entry carries the exact text it accepts and the one claim it may be used for.
+  On this host the declared suite produces 4 skips, each on the accepted list, each printed in the
+  pre-flight's own output rather than summarised as a count.
+* **The compatibility gate classifies every result line, and reads the assertions out of the test file.**
+  `.github/workflows/compat.yml`'s verdict program used to check nine hand-listed titles plus the page
+  half, so a tenth assertion that skipped could leave the job green; and it decided the accepted reason
+  from the **runner** (`BROWSER === ''`), so a page assertion skipped for a reason that is a property of
+  our own composition printed ``Accepted reason `no-browser` `` and exited 0. The accepted list is now
+  matched against the **skip directive's own text**, only the page half may use it, the assertions the
+  file declares are read from the file, and an assertion that produced no result line at all is a `FAIL`.
+* **The operator token is no longer printed on every start.** The relay prints it in its banner **only on
+  the start that generated it**; every other start prints `OPERATOR TOKEN — not printed (this start did
+  not generate it)` with the path and the mode to read it from. That banner lands in journald, a
+  container log or a CI transcript, and this token authorises dispatching to the whole fleet, so a
+  restored token in a log is a credential in a log. `--print-operator-token`
+  (`W2M_PRINT_OPERATOR_TOKEN=1`, or `printOperatorToken: true` for an embedder) asks for the old
+  behaviour explicitly, and `docs/DEPLOY.md` states that on the generating start the value still appears
+  **twice on purpose** — once on stderr as the log copy, once in the CLI's own box on stdout as the
+  handoff a human reads.
+
+### Fixed
+
+* **A punch could be refused by a datagram that was not a refusal at all — about one handshake in 256.**
+  `decodeRefuse` accepted exactly one body length and validated nothing else, and a `REFUSE` rides inside
+  the same `HELLO_ACK` frame as a handshake answer. A genuine `HELLO_ACK`'s byte 6 is the first byte of
+  the responder's random ephemeral, so when that byte happened to equal the length the parser expected,
+  an honest encrypted answer was read as a refusal: reported with a refusal reason the peer never sent,
+  and — in the codes that are terminal — handing back no channel at all. It was found while adding the
+  `k_ref` seal to `REFUSE`. The parse now checks the version byte, both legal lengths and that the
+  machine id carries no control bytes, and a test bends a real acknowledgement's length byte into that
+  exact collision.
+* **`REFUSE` is sealed, and a refusal that cannot be corroborated is dropped.** A `REFUSE` may be
+  unauthenticated by design — it is sent precisely when the two ends could not agree a key — which made
+  it a downgrade oracle: anything able to forge one could turn "the peer never answered" into "the peer
+  refused". `k_ref = HKDF(ECDH(e_i, s_r), REFUSE_MAC_LABEL)` is a key the initiator derives as easily as
+  the responder, over a label distinct from every handshake MAC and over a **different input**
+  (`ECDH(e_i, s_r)`, not `ECDH(s_i, s_r)`); a refusal must now come from the address and the session the
+  punch agreed and carry a `k_ref` MAC. Four codes name the **ignored datagram** rather than a failed
+  punch (`P2P_CRYPTO_REFUSE_SESSION_MISMATCH`, `..._UNPUNCHED_SOURCE`, `..._BAD_MAC`,
+  `..._UNCORROBORATED`), so a refusal that was thrown away is never reported as a refusal that happened.
+* **A started node held the process open, and the comment claimed an `unref()` that existed nowhere.**
+  With no `ctx.effect` — an older Cordis, or a bare test context — the plugin composed a node and never
+  released the handles that keep a Node.js process alive: the bound UDP socket, the announce refresh
+  timer, and the accept loop's pending wait timeout. `src/agent/p2p-node.mjs` now has a real `unref()`,
+  **remembered rather than applied once** (a `close()` followed by a `start()` binds a second socket and
+  arms a second wait, so a call that took effect only on the first would not be a promise), the accept
+  loop reads the flag on every round, and the plugin calls it when no disposer will ever be called.
+  Found by an independent verifier against the `w2m_status` test's bare context.
+* **A failed state publish left its temp file behind: one live state directory had accumulated 266
+  `agent-state.json.tmp-*` files.** `publishState()` renames a temp file over `agent-state.json` while
+  another process may be reading it, and on Windows that contention comes back as `EPERM`/`EACCES` from
+  the rename although both paths are fine and the condition clears within milliseconds. The rename is now
+  retried (5 attempts, 3 ms × attempt, **retryable errors only** — a permanent failure is rethrown
+  exactly as a bare `renameSync` would be), and a publish that fails outright unlinks its own temp file.
+* **`test:agent` masked a hang for more than 283 seconds.** The suite had finished asserting and could
+  not exit; without `--test-force-exit` the verdict was a timeout rather than a result, and the same was
+  true of `test:relay` and `test:tools`. All three carry the flag now, as `test`, `test:e2e` and
+  `test:all` already did.
+* **`test/p2p-crypto.test.mjs` was still not in `test:all`.** 33 tests covering the data-plane
+  encryption rode `npm test` and not the suite a release runs, so the crypto suite did not ride the full
+  gate. The one path the v0.5.9 entry asked its owner for is appended after
+  `test/mdns-discover.test.mjs`.
+* **The allow-list is one rule at both ends, and it is a grant rather than a sandbox.** The plugin's
+  pre-flight reduced `argv[0]` to a basename before matching, so it would wave `E:\Temp\evil\node.exe`
+  through while the agent refused it; the argv is handed over verbatim now, to the same matcher the agent
+  uses. Three narrower rules sit on top of the prefix match, each with its own code because each has its
+  own remedy: `COMMAND_REPARSING_ARGUMENT` refuses code-loading **trailing** arguments
+  (`--test-reporter`, `--import`, `--require`, `-r`, `--experimental-loader`, `-e`/`--eval`,
+  `-p`/`--print`, `python -c`/`-m`, `bash -c`, `git -c`/`--exec-path`, `make -f`, `tar --to-command`, and
+  their equivalents in the interpreters in common use) unless the entry names them;
+  `COMMAND_EXECUTABLE_PATH_MISMATCH` admits an absolute `argv[0]` only when it resolves to the same file
+  the entry's executable does; and `COMMAND_EXECUTABLE_RELATIVE_PATH` refuses a relative `argv[0]`
+  outright, because the working directory comes from the offer. **The limit is stated rather than
+  implied: an entry is a code-execution grant, not a sandbox.** `node --test` allows
+  `node --test <any file>`, and the test runner loads and runs whatever file it is handed. The list says
+  which program may run, not what that program can be told to do.
+* **The Windows supervisor: one supervisor, one agent, and the punch port held by the agent that is
+  actually running.** Measured on this machine: **fourteen `w2m` processes, nine of them `w2m-localside`
+  agents sharing one identity, with port 41235 held by an agent from thirteen hours earlier** — so every
+  dispatch fell back to the relay (`P2P_UNREACHABLE`) while the heartbeat said nothing. A second
+  generation could start while a healthy one ran, and the start-time reap could only ever see the single
+  pid the heartbeat remembered. There is now a **single-instance lock** (`open(…, 'wx')`, i.e.
+  `O_CREAT|O_EXCL`, so of two generations racing exactly one creates the file): a generation that finds
+  it held logs a no-op line and exits without spawning, and a lock whose holder is gone or whose file is
+  unreadable is **taken over loudly** rather than blocking the machine forever. The reap matches **by
+  identity** — process table plus command line naming the same state directory, with the supervisor
+  excluded — because a supervisor's own command line carries the agent stub's path and an identity-only
+  reap killed its own program (measured: it did). `orphans_reaped`, `orphans_reaped_pids` and
+  `lock.takeovers_total` are in the heartbeat, so the machine's own account of what it reaped is readable
+  without a debugger.
+* **The scheduled task was registered `MultipleInstances IgnoreNew`, which cannot recover from a
+  supervisor death.** IgnoreNew refuses the second start — the right-looking answer and the wrong one,
+  because the watchdog tick that should have replaced a dead generation was itself the start being
+  ignored, and the machine stayed down until a human noticed. `install-service.ps1` now registers
+  **`MultipleInstances Parallel`**, which is safe precisely because the supervisor's own lock is what
+  prevents a second *agent*, and it prints the setting it wrote so the correction is visible in the
+  install transcript rather than inferred. `deploy/windows/verify-supervisor.mjs` is the reproducible,
+  no-elevation check of the whole property: it builds the broken state on purpose — orphan agents already
+  holding a free port, a lock left behind by a killed supervisor — and then asserts that exactly one agent
+  is left, that it owns the port, and that the heartbeat names the pids it reaped.
+* **Documentation corrections, each of which was a false statement in a shipped document.**
+  * **`SECURITY.md` had been telling users to install a six-release-old build.** Its supported-version
+    table read "v0.5.3 and everything before it" and listed v0.5.6-and-later as "not yet released" —
+    three releases after v0.5.6 had shipped. It names **v0.5.9** as the supported line now and says why
+    v0.5.4 and v0.5.5 are withdrawn (they fail during DSH's web boot and take the whole application with
+    them, all eight tools included), and the install commands in `SECURITY.md` and `TROUBLESHOOTING.md`
+    point at a release that exists.
+  * **`TROUBLESHOOTING.md` named the wrong cause for a vanished `cordis.patch.yml`.** `dsh plugin add`
+    does **not** rewrite it — the CLI shares the plugin manager's package operations, which write
+    `package.json` and `pnpm-lock.yaml`. What removes the file is Desktop's fatal-recovery
+    `sanitizeProfile`, which renames it to `cordis.patch.yml.bak-<unix-ms>`; the `.bak-<timestamp>`
+    sibling is the receipt to look for, and the backup habit matters more before an upgrade, not less.
+    The same section now shows the `insert:` form and states what a bare `- id:` actually does — replace
+    fields on a row that already exists, so against a row nothing created it is a silent no-op and the
+    loader says `patch: entry "w2m" not found` while the install reports success.
+  * **`docs/P2P-CRYPTO.md` dated the data plane's encryption to a release that does not exist.** Stage 1
+    shipped in **v0.5.3**, and the file said v0.6.0. This is the first v0.6.0, and the reference now says
+    v0.5.3.
+  * **The `p2pOfferGraceMs` line in the v0.4.0 entry said 1200 ms and the shipped constant is 3000 ms.**
+    The widening rode *inside* v0.4.0 (commit `eea80c7`, the commit the tag points at) without its own
+    CHANGELOG line, which `CONTRIBUTING.md` §5 requires for a behaviour change. The line matches the
+    shipped constant now and the omission is recorded rather than left to be rediscovered from a diff;
+    `README.md` and `PROTOCOL-v0.4.0.md` carry the same correction.
+  * **`docs/PIPELINE-DESIGN.md` opened with "unresolved, and `pipeline` is deliberately not
+    implemented"**, which had been false since v0.3.4, and it recommended Option A while **Option C** is
+    what shipped. The analysis is kept as written and the divergence is stated: editing the argument to
+    match its conclusion would destroy the only thing that file is good for.
+  * **`deploy/networking/LESSONS.md` stated the tunnel invariant in a form that contradicts the
+    ledger.** It said "tunnelled traffic must never be reported as `p2p`"; `transport` is the **socket
+    path**, rung 4 *is* a socket between the two machines, and calling that a lie would make the field
+    useless. The rule that actually holds is that the **tunnel must be named explicitly** wherever it
+    carried the traffic, and that "direct" must never be read as "the bytes avoided a server".
+    `deploy/networking/README.md` states it in the same words, and the two files now agree with each
+    other and with `docs/AUDIT.md`.
+
+### Notes
+
+* **What is new behaviour here, and what is a document catching up to behaviour that already shipped.**
+  The REFUSE parse and its `k_ref` seal, the node `unref()`, the state-publish retry and cleanup, the
+  shared allow-list matcher and its three narrower rules, the operator-token printing gate, the
+  supervisor's lock / reap-by-identity / `MultipleInstances` correction, the pre-flight's ledger, the
+  compat gate's structural classification, and the `test:all` + `--test-force-exit` wiring are **code
+  changes in this release**. The client-entry requirement (`id: w2m`, the **bare** package name, and the
+  `insert:` form) and the loader driver's **registry-wide failure sweep** shipped in v0.5.4–v0.5.6; what
+  is new here is that both are documented as requirements a reader can act on, and that the compatibility
+  gate requires the sweep's own result line (`sweeps every fiber in the process and finds no failure`) by
+  name instead of trusting nine hand-listed titles.
+* **LAN discovery remains opt-in, and it is unverified on a real network.** Every socket in
+  `test/mdns-wire.test.mjs` and `test/mdns-discover.test.mjs` is loopback, and no mDNS packet has crossed
+  a real LAN in this project's testing; `README.md` names both suites in its table now rather than
+  leaving them to be found. Discovery is a **hint, never an authorisation**: a machine the LAN announced
+  but the relay does not list is not a target.
+* **One check is `UNVERIFIABLE` on this machine and is printed as such rather than passed quietly.** This
+  host's `%DSH_HOME%` holds no `dsh-runtimes\`, while `src/agent/resolve.mjs` looks for the bundled
+  runtime at `dsh-runtimes/dsh-primary-runtime/dependencies` and the application bundle carries it at
+  `E:\DS\resources\runtime\primary-runtime\dependencies`. The suite is run against a throwaway home with
+  the documented layout, and the host mismatch is printed next to the verdict.
+* **Unverified from this machine, stated rather than implied.** The GitHub Release assets behind the
+  documented tarball URLs (`test/claims.test.mjs` skips that claim without `W2M_NETWORK_TESTS=1`), and
+  **the first CI run of the compatibility gate in its new form**: its verdict program is extracted out of
+  the workflow and exercised by `test/claims.test.mjs` against synthetic TAP captures — an honest
+  no-browser skip, an injected extra assertion, an unaccepted reason — but the gate itself is judged by a
+  runner that is not this machine.
+* The numbers in `README.md`'s suite table are the **v0.5.9** measurements and stay labelled that way.
+  Adding `test/p2p-crypto.test.mjs` to `test:all` changes that row's suite and test counts, and neither
+  was re-measured for v0.6.0 on this host — a full `test:all` on this machine takes long enough that
+  running it to refresh a table would be the wrong trade.
+
 ## [0.5.9] — 2026-10-11
 
 ### Added
@@ -71,8 +263,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   was not being run at all between that edit and this release.
 * **`test/p2p-crypto.test.mjs` was named by no script at all.** 33 tests, green, and wired into
   nothing — the exact defect v0.5.7's release note identified in someone else's repository. A suite
-  that never runs protects nothing, and that is now asserted rather than assumed. It is in `test` and
-  `test:all`.
+  that never runs protects nothing, and that is now asserted rather than assumed. **It is in `test`,
+  and as of this entry it is still *not* in `test:all`** — that is a wiring gap, not a rounding
+  detail, because `test:all` is the suite a release runs: 35 paths are named there and
+  `test/p2p-crypto.test.mjs` is not one of them, so the crypto suite still does not ride the full
+  gate. This entry previously claimed both; the claim is now the measured one. The fix is one path in
+  `package.json#scripts["test:all"]`, appended after `test/mdns-discover.test.mjs` — the file is owned
+  by the integrator, so the line is reported rather than edited here.
 
 ### Notes
 
@@ -789,12 +986,20 @@ written down as not measured.
 * **The direct path is the default connection method between machines.**
   `p2pMode: auto` is now real behaviour: the dispatching machine announces,
   punches to each target, and pushes the offer over the punched channel. The relay
-  **holds its own copy of that offer back for `p2pOfferGraceMs` (1200 ms)** and
+  **holds its own copy of that offer back for `p2pOfferGraceMs` (3000 ms)** and
   offers it anyway if the punch does not land — without that hold the direct path
   could never win, because an SSE push over an already-open connection beats a
   punch that costs a round trip. Measured on loopback while writing it: the relay
   copy won every time. The hold is cancelled by the executor's own lease
   heartbeat, so no new message was needed to say "the direct copy arrived".
+  The first value was **1200 ms and it was too tight** — measured on a 1-vCPU
+  shared host, two agent tests saw the relay's copy overtake the direct one, which
+  under `p2pMode: direct` refuses an offer that was about to arrive. This entry said
+  1200 ms for the whole of v0.4.0; the widening to 3000 ms rode **inside** v0.4.0
+  (commit `eea80c7`, the commit the tag points at) **without its own CHANGELOG
+  line**, which `CONTRIBUTING.md` §5 requires for a behaviour change. The line now
+  matches the shipped constant, and the omission is recorded here rather than left
+  for a reader to rediscover from a diff.
 * **The result notice travels back over the same channel, and the payload does
   not.** `{type:'task.result', task_id, machine_id}` is acknowledged with
   `result.ack`; the envelope is not on that frame, because `result_path` is one of

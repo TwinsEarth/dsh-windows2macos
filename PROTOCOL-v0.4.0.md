@@ -100,10 +100,17 @@ essentially always, and `transport` reads `relay` on networks where the punch su
 was measured on loopback while writing this contract: the direct copy consistently lost.
 
 So when — and only when — the task carries both `origin_machine_id` and a `p2p.mode` of `auto`
-or `direct`, the relay defers its own offer by `p2pOfferGraceMs` (default **1200 ms**) and
+or `direct`, the relay defers its own offer by `p2pOfferGraceMs` (default **3000 ms**) and
 cancels it if the lease has moved out of `queued` by then. No new message is needed for that
 test: the executor's first act on any offer it accepts is a lease heartbeat, which is exactly
 the fact that says "the direct copy arrived".
+
+> **This contract first said 1200 ms, and 1200 ms was too tight.** Measured on a 1-vCPU shared
+> host, two agent tests saw the relay's copy overtake the direct one, which under `p2pMode: direct`
+> means refusing an offer that was about to arrive. The constant was widened to 3000 ms inside
+> v0.4.0 (`DEFAULT_P2P_OFFER_GRACE_MS` in `src/relay/state.mjs`), which is why this file — written
+> before that commit — is corrected here rather than frozen wrong. The cost stays bounded: one
+> delayed copy per task, once.
 
 Consequences, stated because they are the cost of the feature:
 
@@ -192,8 +199,9 @@ Every result carries the path it actually took:
 * **Neither field is comparable.** A path is not a result: two machines that ran the same
   bytes and disagree only about how the offer reached them are `consistent`, and a test says
   so explicitly. Adding a transport field to `COMPARABLE_FIELDS` would turn a network
-  difference into a false bug report, which is the exact failure the six aggregation states
-  exist to prevent.
+  difference into a false bug report, which is the exact failure the **nine** aggregation states
+  exist to prevent. (This line said "six" through v0.5.9; the verdict list has been nine since
+  v0.3.0 — see `AGGREGATE_STATUSES` in `src/relay/report.mjs`.)
 
 ## 7. The relay, extended
 

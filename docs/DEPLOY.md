@@ -141,14 +141,27 @@ real one):
 [w2m-rabbit] trust_proxy=false (X-Forwarded-* ignored)
 [w2m-rabbit] pair_rate_limit=5/min/IP
 [w2m-rabbit] persistence=on dir=/var/lib/w2m revived_devices=0 revived_tasks=0
-  ... plus a banner repeating the OPERATOR TOKEN, which is also written to
-      <state>/operator-token.txt with mode 0600
+  ... plus the OPERATOR TOKEN **on the start that generated it**, and otherwise
+      only where it is stored: <state>/operator-token.txt with mode 0600.
+      Later starts print "operator token (restored) ... NOT printed" instead,
+      because this banner lands in journald / a container log / CI output and
+      that token authorises dispatching to the whole fleet. Print it anyway with
+      --print-operator-token (or W2M_PRINT_OPERATOR_TOKEN=1).
 ```
+
+On that one generating start the value appears **twice, deliberately**: once in
+the `[w2m-rabbit]` line above (stderr — the log copy) and once in the CLI's
+`OPERATOR TOKEN` box (stdout — the handoff a human reads). Two sinks on the start
+that minted the token is not the defect this behaviour fixes; printing it on
+*every* start, restored ones included, was. Every other start prints it in
+neither place unless the opt-in above asks for it.
 
 With `--json`, all of the above goes to **stderr** and stdout carries exactly
 one JSON line; the operator token is reported only as
 `"operatorTokenPresent": true`. Read the token from
-`<state>/operator-token.txt`, never from stdout.
+`<state>/operator-token.txt`, never from stdout — the one exception is the start
+that generated it, which prints it once so a first-time operator is not left
+without it.
 
 - the **pairing code** (`PAIR-XXXXXXXX`) — hand this to each machine, once. It
   **rotates after every successful pairing**, and the new one is printed, so you

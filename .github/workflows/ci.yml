@@ -130,18 +130,24 @@ jobs:
         shell: bash
         run: node scripts/verify-installed.mjs "$(pwd)"
 
-      - name: Unit suites (relay / agent / plugin)
-        run: node --test --test-force-exit test/relay.test.mjs test/broadcast.test.mjs test/agent.test.mjs test/tools.test.mjs test/schedule.test.mjs test/auto-update.test.mjs test/update-source.test.mjs test/update-install.test.mjs test/update-wiring.test.mjs test/signing.test.mjs test/stress.test.mjs test/metrics.test.mjs test/metrics-route.test.mjs test/shared-config.test.mjs test/tool-cards.test.mjs test/p2p-stun.test.mjs test/p2p-transport.test.mjs test/p2p-signaling.test.mjs test/p2p-node.test.mjs test/p2p-transport-fields.test.mjs test/p2p-plugin.test.mjs test/stun-server.test.mjs
+      - name: Unit and release suites (package.json#scripts.test, via npm test)
+        # THE LIST IS NOT HERE ON PURPOSE. It used to be: twenty-three paths, hand-maintained,
+        # and stale -- six suites that exist, are named by `scripts.test`, and pass on a developer's
+        # machine ran in no workflow at all, `test/claims.test.mjs` among them. `npm test` runs
+        # whatever `package.json#scripts.test` names today, so adding a suite to the release suite is
+        # one edit in one place. `scripts/preflight.mjs` verifies that this workflow still covers
+        # every suite that script declares (check name: "workflow wiring"), and refuses a workflow
+        # that hand-lists two or more suite paths on one `node --test` line.
+        run: npm test
 
-      - name: End-to-end suites
-        # --test-force-exit is required: each simulated machine holds an open SSE
-        # connection, which keeps the event loop alive after the assertions pass.
+      - name: End-to-end suites (package.json#scripts.test:e2e, via npm run test:e2e)
+        # Same rule, same reason. `--test-force-exit` is inside the script: each simulated machine
+        # holds an open SSE connection, which keeps the event loop alive after the assertions pass.
         #
-        # crossnetwork.test.mjs covers what only a networked deployment can get
-        # wrong: sub-path mounting, the two credential kinds, relay restart
-        # recovery, pairing rate limits, proxy-header trust, and the
+        # test:e2e covers what only a networked deployment can get wrong: sub-path mounting, the two
+        # credential kinds, relay restart recovery, pairing rate limits, proxy-header trust, and the
         # anti-buffering headers a tunnel needs.
-        run: node --test --test-force-exit test/e2e.test.mjs test/crossnetwork.test.mjs test/signing-e2e.test.mjs test/outbound-only.test.mjs test/recovery.test.mjs test/pipeline-e2e.test.mjs test/p2p-agent.test.mjs
+        run: npm run test:e2e
 
       - name: Packer reproduces the manifest (and refuses missing paths)
         run: node scripts/pack.mjs --out dist
@@ -215,10 +221,11 @@ jobs:
       #
       # The property still holds and is still enforced -- but from a position with
       # no race: the release workflow verifies the tag matches package.json, runs
-      # the full suite, packs, unpacks the artifact and confirms it registers its
-      # five tools, and only then publishes. Cross-platform reproducibility (the
-      # gzip OS byte) is covered by packing twice on Linux and comparing against
-      # Windows builds during development.
+      # the end-to-end suites and the pre-flight (which packs, asserts the tarball
+      # and confirms the packed copy registers its eight tools), and only then
+      # publishes. Cross-platform reproducibility (the gzip OS byte) is covered by
+      # packing twice on Linux and comparing against Windows builds during
+      # development.
 
       - name: The manifest's declared paths all exist
         run: node -e "
@@ -232,3 +239,42 @@ jobs:
           if (missing.length) { console.error('missing:', missing.join(', ')); process.exit(1); }
           console.log('all manifest paths exist');
           "
+
+  # The release pre-flight, wired into CI so that the release path runs the same gate a human runs.
+  #
+  # WHY THIS JOB EXISTS AT ALL: `scripts/preflight.mjs` used to be invoked by zero workflows and by no
+  # npm script, and `test/claims.test.mjs` -- the suite that catches a version bump with no CHANGELOG
+  # entry -- was named by no workflow. Both were "gates" that ran only when a human remembered to run
+  # them, and a gate nobody runs before publishing is a post-mortem, which is what this repository's
+  # v0.5.6 / v0.5.7 / v0.5.8 sequence was. This job runs the whole pre-flight on every push and pull
+  # request: the wiring checks, lint, the mojibake scan, the declared suite, the pack, the
+  # tree-derived tarball assertions, the claims suite and the CHANGELOG shape.
+  #
+  # One operating system, deliberately: the matrix above is the cross-platform signal, and the
+  # pre-flight is a statement about the release process rather than about a platform. Its declared
+  # suite is the same list on all three.
+  preflight:
+    name: release pre-flight (the gate a human runs)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # One of the pre-flight's checks is eslint with 0 errors required, so it needs the dev tooling.
+      # `npm install` and not `npm ci`: this project commits no lockfile on purpose.
+      - name: Install dev tooling
+        run: npm install --no-audit --no-fund
+
+      # The test fixtures create throwaway git repositories and commit to them; runners have no
+      # global identity. Same step, same values, as the matrix job above.
+      - name: Configure a git identity for the test fixtures
+        run: |
+          git config --global user.name "ci"
+          git config --global user.email "ci@example.invalid"
+          git config --global init.defaultBranch main
+          git config --global core.autocrlf false
+
+      - name: Pre-flight (exit 1 is RED, do not bump)
+        run: node scripts/preflight.mjs

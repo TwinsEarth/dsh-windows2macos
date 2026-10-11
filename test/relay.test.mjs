@@ -16,6 +16,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 import {
   NonceCache,
@@ -1783,6 +1784,151 @@ describe('v0.1.2 operator token (§5)', () => {
       removeStateDir(dir);
     }
   });
+
+  /* ---------------------------------------------------------------- */
+  /* v0.5.9 MEDIUM-6 — the token is material, the posture is not       */
+  /* ---------------------------------------------------------------- */
+
+  describe('v0.5.9 MEDIUM-6 the operator token is printed once, by the start that generated it', () => {
+    /** The value the banner would print, when it prints one. */
+    const tokenLines = (messages, token) => messages.filter((m) => m.includes(token));
+
+    it('prints the value on the generating start only, and always says where it is stored', () => {
+      const dir = makeStateDir();
+      try {
+        const first = createRelayServer({ logger: null, stateDir: dir });
+        assert.equal(first.operatorTokenSource, 'generated');
+        assert.equal(first.operatorTokenPrintable, true);
+        const generatedBanner = first.startupMessages;
+        assert.equal(tokenLines(generatedBanner, first.operatorToken).length, 1, 'printed exactly once');
+        assert.match(tokenLines(generatedBanner, first.operatorToken)[0], /\[w2m-rabbit\] {3}\S+$/);
+        assert.ok(
+          generatedBanner.some((m) => /stored at .*operator-token\.txt \(0600\)/.test(m)),
+          `the storage path must be named: ${JSON.stringify(generatedBanner)}`,
+        );
+
+        // The restart that restores the same token: same posture, no material.
+        const second = createRelayServer({ logger: null, stateDir: dir });
+        assert.equal(second.operatorToken, first.operatorToken, 'the token survives a restart (§5.1)');
+        assert.equal(second.operatorTokenSource, 'restored');
+        assert.equal(second.operatorTokenPrintable, false);
+        const restoredBanner = second.startupMessages;
+        assert.deepEqual(tokenLines(restoredBanner, second.operatorToken), []);
+        assert.ok(
+          restoredBanner.some((m) => m.includes('NOT printed') && m.includes('restored')),
+          `the banner must say the token was not printed and why: ${JSON.stringify(restoredBanner)}`,
+        );
+        assert.ok(
+          restoredBanner.some((m) => /read it from .*operator-token\.txt/.test(m) && m.includes('(0600)')),
+          'and where to read it, in the same breath',
+        );
+        assert.ok(
+          restoredBanner.some((m) => m.includes('W2M_PRINT_OPERATOR_TOKEN=1')),
+          'and how to ask for it anyway',
+        );
+
+        // A token supplied by option is the caller's own material: never echoed back at them.
+        const supplied = createRelayServer({ logger: null, stateDir: dir, operatorToken: 'opr-supplied-canary' });
+        assert.equal(supplied.operatorTokenSource, 'option');
+        assert.deepEqual(tokenLines(supplied.startupMessages, 'opr-supplied-canary'), []);
+        assert.ok(
+          supplied.startupMessages.some((m) => /stored at .*operator-token\.txt \(0600\)/.test(m)),
+          'the option path stores it too, and says so',
+        );
+      } finally {
+        removeStateDir(dir);
+      }
+    });
+
+    it('prints it on any start when asked, through the option or the environment', () => {
+      const dir = makeStateDir();
+      try {
+        const first = createRelayServer({ logger: null, stateDir: dir });
+        const token = first.operatorToken;
+
+        const byOption = createRelayServer({ logger: null, stateDir: dir, printOperatorToken: true });
+        assert.equal(byOption.operatorTokenPrintable, true);
+        assert.equal(byOption.operatorTokenPrintReason, 'option');
+        assert.equal(tokenLines(byOption.startupMessages, token).length, 1);
+
+        process.env.W2M_PRINT_OPERATOR_TOKEN = '1';
+        try {
+          const byEnv = createRelayServer({ logger: null, stateDir: dir });
+          assert.equal(byEnv.operatorTokenPrintable, true);
+          assert.equal(byEnv.operatorTokenPrintReason, 'env');
+          assert.equal(tokenLines(byEnv.startupMessages, token).length, 1);
+          assert.ok(byEnv.startupMessages.some((m) => m.includes('env asked for it')));
+        } finally {
+          delete process.env.W2M_PRINT_OPERATOR_TOKEN;
+        }
+
+        // And the switch is off again once the environment stops asking.
+        const afterOptIn = createRelayServer({ logger: null, stateDir: dir });
+        assert.deepEqual(tokenLines(afterOptIn.startupMessages, token), []);
+      } finally {
+        removeStateDir(dir);
+      }
+    });
+
+    it('keeps the material off the CLI banner of a restart, and on it when asked', async () => {
+      // The CLI is the process whose STDOUT lands in journald, a container log or a CI transcript, and
+      // the review's "before" measurement was taken from exactly here. `--json` is deliberately NOT
+      // passed: the prose banner is the surface in question.
+      const dir = makeStateDir();
+      const cli = fileURLToPath(new URL('../bin/w2m-rabbit.mjs', import.meta.url));
+      const { spawn } = await import('node:child_process');
+      // Pre-seed the state dir so the child restores a token rather than generating one, which is the
+      // case the defect leaked on every single restart.
+      const seeded = 'opr-seeded-canary-0123456789abcdef';
+      fs.writeFileSync(path.join(dir, 'operator-token.txt'), `${seeded}\n`, { mode: 0o600 });
+
+      const runCli = (extraArgs) => new Promise((resolve, reject) => {
+        const proc = spawn(process.execPath, [cli, '--state', dir, '--port', '0', ...extraArgs], {
+          stdio: ['ignore', 'pipe', 'pipe'],
+          windowsHide: true,
+        });
+        let stdout = '';
+        let stderr = '';
+        let done = false;
+        const finish = () => {
+          if (done) return;
+          done = true;
+          try {
+            proc.kill();
+          } catch {
+            /* already gone */
+          }
+          resolve({ stdout, stderr });
+        };
+        proc.stdout.setEncoding('utf8');
+        proc.stderr.setEncoding('utf8');
+        proc.stdout.on('data', (chunk) => {
+          stdout += chunk;
+          // "is listening" is printed before the credential section, so waiting for the URL instead
+          // would be waiting for a line that comes before the part under test.
+          if (/W2M relay \(Rabbit\) is listening/.test(stdout)) setTimeout(finish, 250);
+        });
+        proc.stderr.on('data', (chunk) => { stderr += chunk; });
+        proc.on('error', reject);
+        setTimeout(finish, 12_000).unref?.();
+      });
+
+      try {
+        const quiet = await runCli([]);
+        assert.match(quiet.stdout, /is listening/, `the child must have started: ${quiet.stderr}`);
+        assert.equal(quiet.stdout.includes(seeded), false, `the token reached stdout:\n${quiet.stdout}`);
+        assert.equal(quiet.stderr.includes(seeded), false, `and stderr:\n${quiet.stderr}`);
+        assert.match(quiet.stdout, /OPERATOR TOKEN — not printed/, 'and says so where an operator looks');
+        assert.match(quiet.stdout, /operator-token\.txt \(0600\)/, 'with the path to read it from');
+        assert.match(quiet.stdout, /--print-operator-token/, 'and the way to change the answer');
+
+        const loud = await runCli(['--print-operator-token']);
+        assert.equal(loud.stdout.includes(seeded), true, `--print-operator-token must print it:\n${loud.stdout}`);
+      } finally {
+        removeStateDir(dir);
+      }
+    });
+  });
 });
 
 /* ================================================================== */
@@ -3514,13 +3660,31 @@ describe('v0.3.0 request signing (§9)', () => {
         assert.equal(offer.json.task_id, taskId);
 
         // 4. signed heartbeats renew the lease
-        const hb = await signedFetch(`${relay.url}/v1/heartbeat`, {
-          token, body: { task_id: taskId, machine_id: 'm1', attempt: 1, phase: 'running', progress: 0.5, rtt_ms: 12 },
-          signer,
-        });
+        //
+        // The relay stamps `lease_until` from its own clock *during* the request, so the clock is
+        // frozen across the round trip -- the style the lease-window siblings above use, and the only
+        // way this assertion is about the lease rather than about the test's own timing. Reading the
+        // clock once *after* the round trip (v0.5.9 and earlier) turned a sub-millisecond crossing of
+        // a second boundary into a one-second mismatch: measured 1 failure in 300 heartbeats with 10
+        // in flight, on a product value that was correct and is decided by the relay's clock.
+        // `nowMs` reads `this._now`, so the saved reference is bound before it is shadowed.
+        const realNowMs = relay.state.nowMs.bind(relay.state);
+        const frozenMs = realNowMs();
+        relay.state.nowMs = () => frozenMs;
+        let hb;
+        try {
+          hb = await signedFetch(`${relay.url}/v1/heartbeat`, {
+            token, body: { task_id: taskId, machine_id: 'm1', attempt: 1, phase: 'running', progress: 0.5, rtt_ms: 12 },
+            signer,
+          });
+        } finally {
+          // Not a read-modify-write: `realNowMs` is the bound method captured above, restored verbatim.
+          // eslint-disable-next-line require-atomic-updates -- restoring a captured reference, not updating shared state
+          relay.state.nowMs = realNowMs;
+        }
         assert.equal(hb.status, 200);
         assert.equal(hb.json.cancel, false);
-        assert.equal(hb.json.lease_until, rfc3339(relay.state.nowMs() + 50_000));
+        assert.equal(hb.json.lease_until, rfc3339(frozenMs + 50_000));
 
         // 5. a signed idle heartbeat keeps the RTT view fresh without a lease
         const idle = await signedFetch(`${relay.url}/v1/heartbeat`, {

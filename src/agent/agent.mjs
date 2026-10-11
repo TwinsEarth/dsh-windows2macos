@@ -23,7 +23,7 @@
 
 import { Readable } from 'node:stream';
 import { access, constants as fsConstants } from 'node:fs/promises';
-import { mkdirSync, renameSync, writeFileSync } from 'node:fs';
+import { mkdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
@@ -140,6 +140,24 @@ export const AGENT_STATE_SCHEMA_VERSION = 1;
  * atomic write per interval.
  */
 export const AGENT_STATE_PUBLISH_INTERVAL_MS = 30_000;
+
+/**
+ * How many times `publishState()` tries the final `renameSync` before giving up, and the base of
+ * the synchronous backoff between tries (attempt N waits N * base).
+ *
+ * The publish renames a temp file *over* `agent-state.json` while another process may be reading
+ * it -- the plugin in the DSH host, an editor, a backup agent, or an antivirus scanner. On Windows
+ * that contention comes back as `EPERM`/`EACCES` from the rename even though both paths are fine,
+ * and the condition clears within milliseconds; without a retry the publish is lost, and (before
+ * v0.5.10) its temp file was left behind, which is how one live state directory accumulated 266
+ * `agent-state.json.tmp-*` files.
+ *
+ * Bounded on purpose: 5 attempts, and only a retryable error is retried, so a permanent failure
+ * (the destination is a directory, the volume is gone, the paths are on different devices) costs at
+ * most 30ms of synchronous backoff on a diagnostics-only path.
+ */
+export const STATE_RENAME_ATTEMPTS = 5;
+export const STATE_RENAME_BACKOFF_MS = 3;
 
 /**
  * How many times a relay identity change may trigger an *immediate* cursor-less
@@ -855,6 +873,56 @@ export class Heartbeat {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
   }
+}
+
+/**
+ * Block the current thread for a few milliseconds.
+ *
+ * Only for {@link renameStateFile}'s backoff, and only on the failing path: `publishState()` is
+ * synchronous by design (an async publish would need a queue to keep two publishes from
+ * interleaving), and `Atomics.wait` on a throwaway shared buffer is the one way to wait without
+ * either a busy loop or an async boundary. There is no `await` here to yield at, and each wait is
+ * a handful of milliseconds.
+ *
+ * @param {number} ms
+ */
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/** Is this rename failure the transient Windows-contention kind, rather than a real one? */
+function isRetryableRenameError(error) {
+  const code = error?.code;
+  return code === 'EPERM' || code === 'EACCES' || code === 'EBUSY';
+}
+
+/**
+ * `renameSync` over the state file, retried briefly while the failure is transient.
+ *
+ * See {@link STATE_RENAME_ATTEMPTS} for why this exists at all. Only a retryable error is retried
+ * and only a bounded number of times, so the caller's "never throws" contract is preserved: the
+ * last error is rethrown for a permanent failure, exactly as a bare `renameSync` would have.
+ *
+ * @param {string} from The temp file this call created.
+ * @param {string} to The published path.
+ * @returns {number} The 1-based attempt that succeeded (a caller-visible fact for tests).
+ */
+function renameStateFile(from, to) {
+  /** @type {unknown} */
+  let lastError = null;
+  for (let attempt = 1; attempt <= STATE_RENAME_ATTEMPTS; attempt += 1) {
+    try {
+      renameSync(from, to);
+      return attempt;
+    } catch (error) {
+      lastError = error;
+      if (attempt === STATE_RENAME_ATTEMPTS || !isRetryableRenameError(error)) throw error;
+      sleepSync(STATE_RENAME_BACKOFF_MS * attempt);
+    }
+  }
+  // Unreachable: the loop either returns or throws. Kept so a future edit cannot make this
+  // function fall off the end and return `undefined` to a caller that expects a count.
+  throw lastError;
 }
 
 // ---------------------------------------------------------------------------
@@ -1929,19 +1997,47 @@ export function createAgent(options) {
    * the agent (or a running task) down -- the file is a diagnostic, not a
    * delivery guarantee -- so failure is logged once and otherwise ignored.
    *
+   * v0.5.10 adds the two halves of "the temp file is ours to clean up": the rename is retried
+   * briefly (see {@link renameStateFile}), and a publish that fails outright unlinks its own temp
+   * file. Before that, every failed rename left a `agent-state.json.tmp-*` behind, and a live state
+   * directory that could not rename for a few hours had accumulated 266 of them / 187 KB with the
+   * agent still warning once and carrying on.
+   *
    * @returns {object|null} The snapshot written, or null when the write failed.
    */
   function publishState() {
     const snapshot = agentStateSnapshot();
+    /** @type {string|null} The temp file this call created; null once it has been renamed away. */
+    let tmp = null;
     try {
       mkdirSync(stateDir, { recursive: true, mode: 0o700 });
-      const tmp = `${stateFilePath}.tmp-${process.pid}-${randomUUID().slice(0, 8)}`;
+      tmp = `${stateFilePath}.tmp-${process.pid}-${randomUUID().slice(0, 8)}`;
       writeFileSync(tmp, `${JSON.stringify(snapshot, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
-      renameSync(tmp, stateFilePath);
+      const attempts = renameStateFile(tmp, stateFilePath);
+      // Renamed: the temp name is gone, so the catch below must not be handed it.
+      tmp = null;
+      if (attempts > 1) {
+        // Named, not silent: contention on this path was invisible before v0.5.10, and the only
+        // trace of it was a growing pile of temp files. One line per publish that needed a retry
+        // is the evidence an operator needs to recognise "something is holding the state file".
+        log('info', `published ${AGENT_STATE_FILE} after ${attempts} rename attempts`, {
+          path: stateFilePath,
+        });
+      }
       state.statePublishedAt = snapshot.updated_at;
       statePublishWarned = false;
       return snapshot;
     } catch (error) {
+      // A publish that failed is a publish whose temp file must not survive it. The unlink is
+      // itself best-effort and never rethrows: this function's contract is "never throws", and the
+      // file it is trying to remove is by definition one nobody wants.
+      if (tmp !== null) {
+        try {
+          unlinkSync(tmp);
+        } catch {
+          /* already gone, or the directory is unwritable -- nothing left to do here */
+        }
+      }
       if (!statePublishWarned) {
         statePublishWarned = true;
         log('warn', `could not publish ${AGENT_STATE_FILE} (diagnostics only; continuing)`, {
@@ -2692,9 +2788,14 @@ export function createAgent(options) {
       }
 
       // ---- 5. allow-list (default-deny) -----------------------------------
+      //
+      // `commandArgv` is the offer's own command line, which for a `pipeline` the relay sets to
+      // `stages[0].command_argv` -- so this check covers the first stage and nothing else. Every
+      // stage is checked below, before any of them runs; see the note there for why the second check
+      // has to exist even though the plugin's pre-flight also checks every stage.
       const allowed = matchAllowedCommand(commandArgv, allowedCommands);
       if (!allowed.allowed) {
-        log('warn', `refused ${offer.task_id}: COMMAND_NOT_ALLOWED`, { argv: commandArgv });
+        log('warn', `refused ${offer.task_id}: ${allowed.reason_code ?? REFUSAL.COMMAND_NOT_ALLOWED}`, { argv: commandArgv });
         await finish({
           offer,
           cwdRel,
@@ -2703,7 +2804,11 @@ export function createAgent(options) {
           anchorsAfter: null,
           execution: null,
           status: 'refused',
-          refusalReason: REFUSAL.COMMAND_NOT_ALLOWED,
+          // The matcher's own code, not a second spelling of it: the plugin's dispatch pre-flight
+          // reports the same literal for the same argv, and `COMMAND_REPARSING_ARGUMENT` and the two
+          // executable-identity codes have to travel the same way or the two ends would disagree
+          // about *why* one command was refused.
+          refusalReason: allowed.reason_code ?? REFUSAL.COMMAND_NOT_ALLOWED,
           warnings,
           startedAt,
           endedAt: new Date().toISOString(),
@@ -2743,6 +2848,48 @@ export function createAgent(options) {
           continue_on_failure: s.continue_on_failure === true,
         }))
         : [{ index: 0, command_argv: [...offer.command_argv], cwd_rel: offer.cwd_rel ?? '.', continue_on_failure: false }];
+
+      // ---- 6a. allow-list, again, for **every** stage ----------------------
+      //
+      // Step 5 checked the offer's `command_argv`, which the relay sets to `stages[0].command_argv`
+      // (src/relay/state.mjs) -- so on a chain it vouched for the first stage alone. The plugin's
+      // dispatch-time pre-flight does check every stage (src/plugin/tools.mjs), and its comment says
+      // why: "the allow-list is a default-deny control, and a chain is not an exemption from it".
+      // But that pre-flight runs on the *dispatcher*, and a dispatcher that posts straight to
+      // `/v1/task` with the operator token never calls it. Enforcement on the machine that executes
+      // is the only control that survives a hostile dispatcher, so it has to be here as well.
+      //
+      // The whole chain is refused before anything runs, not at the offending stage: running stages
+      // 1..n-1 of a chain that will not finish would leave side effects from work the caller was
+      // never allowed to ask for, and the plugin's pre-flight refuses the dispatch as a whole for the
+      // same reason. The refusal names the stage index, because "this chain is not allowed" is not
+      // actionable without knowing which stage.
+      for (const stage of plannedStages) {
+        const stageAllowed = matchAllowedCommand(stage.command_argv, allowedCommands);
+        if (stageAllowed.allowed) continue;
+        const code = stageAllowed.reason_code ?? REFUSAL.COMMAND_NOT_ALLOWED;
+        log('warn', `refused ${offer.task_id}: ${code} at stage ${stage.index}`, {
+          argv: stage.command_argv,
+        });
+        await finish({
+          offer,
+          cwdRel,
+          commandArgv,
+          anchorsBefore,
+          anchorsAfter: null,
+          execution: null,
+          status: 'refused',
+          refusalReason: code,
+          warnings,
+          startedAt,
+          endedAt: new Date().toISOString(),
+          // `protocol_violations` is the field a reader already finds a refused stage in (see the
+          // cwd refusal below), and the stage index is the fact that makes it actionable. The
+          // top-level `refusal_reason` carries the code the plugin's pre-flight would have reported.
+          protocolViolations: [`stage ${stage.index}: ${code} - ${stageAllowed.detail}`],
+        });
+        return;
+      }
 
       // The task's timeout is a budget for the whole chain, not per stage. Giving each stage the full
       // timeout would let a 16-stage pipeline run 16x longer than the caller asked for, and the relay

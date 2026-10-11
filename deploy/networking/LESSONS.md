@@ -36,7 +36,24 @@ says plainly that this does not do what it sounds like:
 and the truth of our central claim, while solving only part of what the delivery ladder already
 addresses. If it is ever added, two invariants have to hold, and both belong in the ladder's
 documentation rather than in a commit message: the control plane and the punch sockets must be
-exempted from the tunnel, and tunnelled traffic must never be reported as `p2p`.
+exempted from the tunnel, and **tunnelled traffic must never be reported as a server-free direct path**.
+
+> **The second invariant, stated precisely — this is a correction to how it was first written.** This
+> file said "tunnelled traffic must never be reported as `p2p`". That, taken literally, contradicts
+> what the ledger does and should do. `transport` is the **socket path**: rung 4 *is* a socket between
+> the two machines, so it reads `transport: p2p`, and calling that a lie would make the field useless.
+> The rule that actually holds, and that `deploy/networking/README.md` states in the same words, is:
+>
+> * the ledger's `transport` **may** describe the socket path;
+> * the tunnel **must be named explicitly** wherever it carried the traffic — the `p2p` block's
+>   `opened_by` / `offer_path`, or an equivalent field;
+> * and "direct" means **"a socket between the two machines, forwarded by the hub"** — **never** "the
+>   bytes avoided a server".
+>
+> The intent of the original sentence is unchanged: a hub-and-spoke tunnel must not be able to pass
+> itself off as a server-free path. What changed is the mechanism — name the tunnel, do not falsify the
+> socket. `docs/AUDIT.md` §4 already put it this way ("direct socket over a tunnel the VPS forwards" —
+> not "the bytes avoided a server"); this note is what makes the two files agree.
 
 ## Disciplines worth adopting, in the order we should adopt them
 

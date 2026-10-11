@@ -10,6 +10,15 @@ whose evidence cannot be told apart from its assumptions is worse than no audit:
 
 Re-run the checks in §5 rather than trusting this file; it records a moment, not a guarantee.
 
+> **SUPERSEDED — kept as the historical record.** This audit covers **v0.4.1 … v0.5.1**, and it is
+> superseded by **v0.6.0 (2026-10-11)**. It is not being rewritten: what it recorded was true of the
+> build it measured, and a reader who wants to know what that build did should still read it. Two
+> figures in it were **already stale when it was written**, and are called out here rather than
+> silently corrected below: §1's npm row says `@0.5.1, latest`, and §2 says `v0.5.0 installed` — the
+> audit describes the session that built v0.4.1 … v0.5.1, and both rows name a version that had
+> already been superseded by the time a reader could act on them. For the current state, use
+> `CHANGELOG.md` and `README.md`.
+
 ## 1. Designed features: implemented?
 
 | Designed feature | State | Evidence |
@@ -29,7 +38,7 @@ Re-run the checks in §5 rather than trusting this file; it records a moment, no
 | Delivery-ladder documentation + acceptance script | ✅ | **[M]** `deploy/networking/acceptance.mjs` ran against the live fleet; baseline recorded (all three machines on rung 5 for a relay-dispatched task) |
 | npm publication with Trusted Publishing | ✅ | **[M]** `@twinsearth/w2m-dsh-plugin@0.5.1`, latest, with a SLSA provenance attestation |
 | dsh-plugin.org listing | ✅ | **[M]** listed and marked *Verified*; the page's own snapshot is stale (submission issue #141 asks for a re-scan) |
-| TUN/VPN mode | ❌ **deliberately not built** | Decision and reasoning in `deploy/networking/LESSONS.md`: a tunnel is hub-and-spoke, so it would make "the data path is peer-to-peer" false for exactly the traffic a tunnel exists to carry |
+| TUN/VPN mode | ❌ **deliberately not built** | Decision and reasoning in `deploy/networking/LESSONS.md`: a tunnel is hub-and-spoke, so it would make "the data path is peer-to-peer" false for exactly the traffic a tunnel exists to carry. That reasoning applies to adding a **TUN** adapter. It does not describe rung 4, which **is** deployed: a self-hosted WireGuard hub whose tunnelled traffic is named explicitly rather than passed off as server-free. See `deploy/networking/README.md`. |
 
 **Also not built, and known:** the ladder is not yet ordered *data* with per-rung budgets; the
 plugin has no `p2pPort` of its own (only the agent CLI needs one, since a dispatcher only dials out).

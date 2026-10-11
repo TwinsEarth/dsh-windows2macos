@@ -36,6 +36,32 @@ export const DEFAULT_PAIR_RATE_LIMIT_PER_MINUTE = 5; // v0.1.2 §6
 export const RATE_LIMIT_WINDOW_MS = 60_000;
 export const DEFAULT_STATE_DIR = path.join(os.homedir(), '.w2m');
 
+/**
+ * The environment variable that opts in to printing the operator token on a start that did not
+ * generate it (MEDIUM-6 of the v0.5.9 review).
+ *
+ * The value is printed **once, on the start that generated it**, because that is the only moment at
+ * which it exists nowhere else yet; every other start has `<state>/operator-token.txt` to read it
+ * from, and a relay's stdout ends up in journald, a container log or a CI transcript — where a
+ * credential that authorises dispatching to the whole fleet does not belong. `W2M_PRINT_OPERATOR_TOKEN=1`
+ * (or `printOperatorToken: true`, which is the same switch for an embedder) restores the old
+ * behaviour for an operator who genuinely needs it in the log, and says so in the banner when it does.
+ */
+export const PRINT_OPERATOR_TOKEN_ENV = 'W2M_PRINT_OPERATOR_TOKEN';
+
+/**
+ * Resolve that opt-in, so the relay and the CLI agree on one answer.
+ *
+ * @param {object} [options] Relay options; `printOperatorToken: true` is the programmatic spelling.
+ * @returns {'option'|'env'|null} Why printing was asked for, or null.
+ */
+export function printOperatorTokenOptIn(options = {}) {
+  if (options.printOperatorToken === true) return 'option';
+  const raw = process.env[PRINT_OPERATOR_TOKEN_ENV];
+  if (raw === '1' || raw === 'true') return 'env';
+  return null;
+}
+
 /* ------------------------------------------------------------------ */
 /* helpers                                                             */
 /* ------------------------------------------------------------------ */
@@ -459,11 +485,19 @@ export class RelayServer {
     const wantsRequired = options.operatorTokenRequired !== false;
     const explicit = options.operatorToken;
     const persisted = this.persistence.enabled ? this.persistence.readOperatorToken() : null;
+    /**
+     * Why the token may be printed, when it may be: `'generated'` is the one start whose token exists
+     * nowhere else until this process writes it, and `'option'`/`'env'` are the documented opt-ins.
+     * @type {'generated'|'option'|'env'|null}
+     */
+    this.operatorTokenPrintReason = printOperatorTokenOptIn(options);
 
     if (!wantsRequired || explicit === '') {
       this.operatorToken = null;
       this.operatorTokenRequired = false;
       this.operatorTokenSource = 'disabled';
+      this.operatorTokenPrintable = false;
+      this.operatorTokenPrintReason = null;
       return;
     }
     this.operatorTokenRequired = true;
@@ -471,18 +505,22 @@ export class RelayServer {
       this.operatorToken = explicit;
       this.operatorTokenSource = 'option';
       this.persistence.writeOperatorToken(explicit);
-      return;
-    }
-    if (persisted) {
+    } else if (persisted) {
       // §5.1 + §7: keep the token stable across restarts, otherwise every restart
       // would silently invalidate the plugin's configured operatorToken.
       this.operatorToken = persisted;
       this.operatorTokenSource = 'restored';
-      return;
+    } else {
+      this.operatorToken = randomBytes(32).toString('hex');
+      this.operatorTokenSource = 'generated';
+      this.persistence.writeOperatorToken(this.operatorToken);
     }
-    this.operatorToken = randomBytes(32).toString('hex');
-    this.operatorTokenSource = 'generated';
-    this.persistence.writeOperatorToken(this.operatorToken);
+    // MEDIUM-6: the material is printed only by the start that generated it, or when the operator has
+    // explicitly asked for it. "The posture, never the material" still holds everywhere else.
+    if (this.operatorTokenSource === 'generated') {
+      this.operatorTokenPrintReason = this.operatorTokenPrintReason ?? 'generated';
+    }
+    this.operatorTokenPrintable = this.operatorTokenPrintReason !== null;
   }
 
   _buildStartupMessages() {
@@ -517,10 +555,30 @@ export class RelayServer {
       m.push(`[w2m-rabbit] !! ${w.file}: ${w.message}`);
     }
     if (this.operatorTokenRequired) {
-      m.push(`[w2m-rabbit] operator token (${this.operatorTokenSource}) - required for POST /v1/task:`);
-      m.push(`[w2m-rabbit]   ${this.operatorToken}`);
-      if (this.persistence.operatorTokenFile) {
-        m.push(`[w2m-rabbit]   stored at ${this.persistence.operatorTokenFile} (0600)`);
+      // MEDIUM-6: the token is material, not posture, so it is printed as rarely as it can be — on the
+      // start that generated it (`operatorTokenSource === 'generated'`) or when `printOperatorToken` /
+      // `W2M_PRINT_OPERATOR_TOKEN=1` asked for it — and once, never twice. Where it is stored is said in
+      // every case, including the case where there is nowhere to store it.
+      //
+      // DELIBERATE, do not "fix": on that one start the CLI prints the value a second time, in its own
+      // stdout banner. Two sinks for one start is not a leak — the defect was printing it on *every*
+      // start, restored ones included — and the box is the documented first-start handoff a human reads
+      // (docs/DEPLOY.md §2.4, test/crossnetwork.test.mjs). Collapsing the pair would trade a documented
+      // behaviour for one saved line on one start.
+      const tokenFile = this.persistence.operatorTokenFile ?? null;
+      const stored = tokenFile === null
+        ? 'persistence is off, so this token exists only in this process and cannot be read back later'
+        : `stored at ${tokenFile} (0600)`;
+      if (this.operatorTokenPrintable) {
+        m.push(`[w2m-rabbit] operator token (${this.operatorTokenSource}) - required for POST /v1/task:`);
+        m.push(`[w2m-rabbit]   ${this.operatorToken}`);
+        m.push(`[w2m-rabbit]   printed once because ${this.operatorTokenPrintReason === 'generated'
+          ? 'this start generated it' : `${this.operatorTokenPrintReason} asked for it (${PRINT_OPERATOR_TOKEN_ENV})`}`
+          + ` - and ${stored}`);
+      } else {
+        m.push(`[w2m-rabbit] operator token (${this.operatorTokenSource}) - required for POST /v1/task, NOT printed`);
+        m.push(`[w2m-rabbit]   read it from ${tokenFile ?? '<state>/operator-token.txt'} - ${stored}`);
+        m.push(`[w2m-rabbit]   set ${PRINT_OPERATOR_TOKEN_ENV}=1 to print it on this start as well`);
       }
     } else {
       m.push('[w2m-rabbit] !! WARNING: OPERATOR TOKEN DISABLED (--operator-token "") - '
@@ -562,6 +620,11 @@ export class RelayServer {
           basePath: this.basePath,
           operatorToken: this.operatorToken,
           operatorTokenRequired: this.operatorTokenRequired,
+          // The CLI prints its own banner, so it has to reach the same conclusion this class did rather
+          // than re-deriving one from the token's presence (MEDIUM-6).
+          operatorTokenSource: this.operatorTokenSource,
+          operatorTokenPrintable: this.operatorTokenPrintable === true,
+          operatorTokenPrintReason: this.operatorTokenPrintReason ?? null,
           scheme: this.scheme,
         });
       });

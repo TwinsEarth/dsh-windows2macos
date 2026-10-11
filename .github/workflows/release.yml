@@ -58,22 +58,38 @@ jobs:
       - name: Entry points import
         run: node scripts/check-entrypoints.mjs
 
-      - name: Unit suites (blocking)
-        # The unit suites are fast, deterministic and cover the product surface.
-        # They gate the release.
-        #
-        # NOTE: this list is explicit, which means a new suite is invisible to the
-        # release gate until it is added here. That has bitten this project once
-        # already (v0.2.3: four new suites, 166 cases, never executed in CI). When
-        # you add test/*.test.mjs, add it here AND in ci.yml.
-        run: node --test --test-force-exit test/relay.test.mjs test/broadcast.test.mjs test/agent.test.mjs test/tools.test.mjs test/schedule.test.mjs test/auto-update.test.mjs test/update-source.test.mjs test/update-install.test.mjs test/update-wiring.test.mjs test/signing.test.mjs test/stress.test.mjs test/metrics.test.mjs test/metrics-route.test.mjs test/shared-config.test.mjs test/tool-cards.test.mjs test/p2p-stun.test.mjs test/p2p-transport.test.mjs test/p2p-signaling.test.mjs test/p2p-node.test.mjs test/p2p-transport-fields.test.mjs test/p2p-plugin.test.mjs test/stun-server.test.mjs
+      # Same reasoning as ci.yml's lint job: this project commits no lockfile on purpose, so
+      # `npm install` rather than `npm ci`. The pre-flight below lints as one of its checks.
+      - name: Install dev tooling
+        run: npm install --no-audit --no-fund
 
-      - name: End-to-end suites (blocking)
-        # These exercise real processes over real sockets and are slower and more
-        # environment-sensitive than the unit suites, but they are the only thing
-        # that would catch a genuinely broken restart or sub-path deployment --
-        # which is exactly what this release is about. They gate the release too.
-        run: node --test --test-force-exit test/e2e.test.mjs test/crossnetwork.test.mjs test/signing-e2e.test.mjs test/outbound-only.test.mjs test/recovery.test.mjs test/pipeline-e2e.test.mjs test/p2p-agent.test.mjs
+      - name: End-to-end suites (package.json#scripts.test:e2e, via npm run test:e2e)
+        # The e2e suites exercise real processes over real sockets -- restart, sub-path mounting, the
+        # credential kinds -- and they gate the release. The list lives in `scripts.test:e2e` and is
+        # not repeated here: it used to be, and the copy went stale. `scripts/preflight.mjs` fails the
+        # run if this workflow stops covering every suite `package.json#scripts.test` declares.
+        run: npm run test:e2e
+
+      - name: Release pre-flight (the same gate a human runs, exit 1 is RED)
+        # THE RELEASE GATE IS ONE COMMAND, AND IT IS THE SAME COMMAND A HUMAN RUNS.
+        #
+        # This step replaces two hand-maintained suite lists. Both were stale in the same way: six
+        # suites that exist, are named by `package.json#scripts.test`, and pass locally ran in no
+        # workflow at all -- including `test/claims.test.mjs`, which is the suite that catches a
+        # version bump with no CHANGELOG entry. The comment that used to sit on the unit-suite step
+        # ("a new suite is invisible to the release gate until it is added here ... that has bitten
+        # this project once already") is the honest measure of what a comment is worth next to a list.
+        #
+        # `scripts/preflight.mjs` reads `package.json#scripts.test`, so a suite added to the release
+        # suite is run here with no second edit. It asserts, in this order: that every gate it
+        # delegates to exists; that the ledger catches a check which reports nothing; that every suite
+        # on disk is named by a script; that this workflow and ci.yml still run every suite
+        # `scripts.test` declares and that neither hand-lists a suite set; lint with 0 errors; a
+        # mojibake scan; the declared suite; a deterministic pack plus tarball assertions derived from
+        # the *tree* (documents, entry points, the whole manifest, forbidden paths, the eight tools
+        # from the packed copy); the claims suite -- where zero executed claims is a FAIL; and the
+        # CHANGELOG's shape.
+        run: node scripts/preflight.mjs
 
       - name: Pack
         run: |

@@ -28,7 +28,15 @@ It registers **one** task that runs `w2m-agent-supervisor.mjs`, which owns the a
 
 * `-AtStartup` **and** `-AtLogOn`, `LogonType S4U` → runs whether the user is signed in or not,
   in session 0, with no console for anything to close;
-* `MultipleInstances IgnoreNew` → two agents must never share one device identity;
+* a **watchdog trigger** every 5 minutes (`-WatchdogMinutes`), because a supervisor killed by a
+  console teardown cannot be restarted by `RestartCount` alone — the task simply ends;
+* `MultipleInstances Parallel` → the trigger may start a second supervisor, which is safe because
+  the supervisor's own lock is what prevents a second *agent*: a generation that finds the lock held
+  logs a no-op line and exits without spawning. (This replaced `IgnoreNew`, which could not recover
+  from the one death that matters: measured, a task whose supervisor died while the task still
+  reported `Running` refused every later start with `0x800710E0` and stayed dead — one supervisor,
+  one agent, the port bound, and no way back. Re-register an existing installation with
+  `-UpdateTask`, which needs no elevation and touches only the triggers and settings.)
 * `RestartCount 999` / 1 min, `ExecutionTimeLimit 0`, `-StartWhenAvailable`.
 
 Everything except the task's own command line goes into **`%USERPROFILE%\.dsh\w2m\agent.json`**,
@@ -101,10 +109,21 @@ back to the relay with `offer_path: "relay"` in the ledger.
 
 ## Verify it, rather than trusting it
 
+The supervisor's invariants — one generation, one agent, the punch port bound by that agent — have a
+runnable check that needs no administrator right and cannot disturb a live installation (it drives
+the supervisor against a stub worker on ports the OS picks):
+
+```powershell
+node deploy\windows\verify-supervisor.mjs          # 8 checks; --keep leaves the temp tree behind
+```
+
 ```powershell
 # the task is running, and in which session
 Get-ScheduledTask -TaskName 'W2M Localside agent' | Select-Object State
 Get-Process node | Where-Object { $_.SessionId -eq 0 } | Select-Object Id, SessionId, StartTime
+
+# the supervisor's own account of itself: state, the live child, the reaped pids, the punch port
+Get-Content "$env:USERPROFILE\.dsh\w2m\supervisor-heartbeat.json"
 
 # the agent's own narration: "stream ready" is the line that means the fleet can reach it
 Get-Content "$env:USERPROFILE\.dsh\w2m\agent.log" -Tail 20

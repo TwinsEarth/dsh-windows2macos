@@ -65,8 +65,13 @@ when the network will not allow it.
 Both machines announce the address a STUN server sees them as, the dispatching
 machine punches to the other's candidate, and the task offer travels over the
 punched channel instead of the relay. The relay holds its own copy of that offer
-back for about a second while the punch is attempted, and offers it anyway if the
-punch does not land — so a failed punch costs latency, not the task.
+back for **3000 ms** (`DEFAULT_P2P_OFFER_GRACE_MS`) while the punch is attempted,
+and offers it anyway if the punch does not land — so a failed punch costs latency,
+not the task. The constant was 1200 ms first and that was **too tight**: measured on
+a 1-vCPU shared host, two agent tests saw the relay's copy overtake the direct one,
+which under `p2pMode: direct` means refusing an offer that was about to arrive.
+3000 ms covers a slow host with room to spare, and the cost is bounded — one delayed
+copy per task, once.
 
 The result *notice* returns the same way, with one stated limit: the frame carries
 the task and machine identity, not the result payload. `result_path` is one of the
@@ -95,26 +100,51 @@ socket — `endpoint-dependent`, punchable: false. A default that hard-required 
 direct path would break every deployment on such a network the moment it
 upgraded. See [PROTOCOL-v0.4.0.md](PROTOCOL-v0.4.0.md) §1.
 
-### Two coordination modes
+### Four coordination modes
+
+Four — and the third and fourth are the ones people fail to find, which is why they are named here.
 
 | Mode | What it does | When to use |
 |---|---|---|
 | `replicate` | every machine runs the **same** command; results compared side by side | "does this change pass on both platforms?" |
 | `split` | work divided by `index` (`explicit` or `modulo` sharding) | one large test suite, several machines |
+| `broadcast` | **exactly one** machine runs it, chosen with `executor_machine_id` (or the composer's selected target); every other machine holds an `observing` lease and is told the outcome | "run this migration on the database host, and tell everyone what happened" |
+| `pipeline` | **every** machine runs the whole `stages` chain, in order, stopping at the first stage that fails | "check out, build, then test — as one task with one verdict" |
 
-### Six aggregation states
+Two properties of the last two are worth stating because they are what stop them from being footguns:
 
-Not four — because "the environments differ" and "the results differ" are
-different findings, and collapsing them turns noise into bug reports.
+* **Observers are never counted as agreeing.** An `observing` lease is excluded from every aggregation
+  step, so a machine that did not run the command cannot be reported as having produced the same result.
+* **A pipeline has no cross-machine data flow.** It is `replicate` applied to a sequence: stage 2 on a
+  machine consumes that machine's stage 1, never a peer's. The alternative — fan stage 1 out, converge
+  the outputs into stage 2 — has no well-defined input on a fleet, and two machines finishing in a
+  different order would make one `task_id` describe two different executions. The reasoning is in
+  [docs/PIPELINE-DESIGN.md](docs/PIPELINE-DESIGN.md), which also records that the chain's `command_hash`
+  binds **every** stage, not just the first.
+
+### Nine aggregation states
+
+Nine, not four — because "the environments differ" and "the results differ" are different findings, and
+collapsing them turns noise into bug reports. Three more were added in v0.3.0, each replacing a case that
+used to be reported as something less true.
 
 | State | Meaning |
 |---|---|
 | `consistent` | every machine agreed on every comparable field |
 | `divergent` | machines disagreed — the report names the field and each machine's value |
 | `divergent-platform` | only toolchain/platform differ, and the difference is confined to stdout text — expected |
+| `degraded` | every machine reported; some succeeded and some failed. Distinct from `partial`, which also means "still in flight" |
 | `failed` | every machine failed |
-| `partial` | some succeeded, some failed |
+| `partial` | some succeeded, some failed, and machines are still out |
+| `timeout` | the deadline passed and the machines that never answered are not coming back |
+| `cancelled` | the operator stopped it — not a defect, so it must not be reported as `failed` |
 | `unverifiable` | an **anchor** did not match, so comparison is refused |
+
+Two more values are **not verdicts**, because no terminal answer exists yet or none was ever possible:
+`pending` (before the first result lands) and `refused` (every machine was refused at the capability
+gate). `pending` is the only non-terminal one; `refused` reads like "still deciding" but every machine
+has already answered, so waiting cannot change it. All nine verdicts are declared in
+`src/relay/report.mjs`'s `AGGREGATE_STATUSES`.
 
 ## Install
 
@@ -181,6 +211,28 @@ runs unless it matches a prefix:
 > split on whitespace — so `node -e console.log` does **not** allow
 > `node -e console.log(1)`, and a path containing a space has to be written as an
 > array entry. See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) §10.
+>
+> **What an entry actually grants — read this before trusting a list.** An entry
+> names a tool and the arguments up to a point; whatever follows is still that
+> tool's own behaviour, so `node --test` allows `node --test <any file>`, and the
+> test runner loads and runs whatever file it is handed. **A prefix entry is not a
+> sandbox**: it says which program may run, not what that program will do. Two
+> narrower rules sit on top of the prefix match:
+>
+> * **Code-loading trailing arguments are refused** (`COMMAND_REPARSING_ARGUMENT`):
+>   `--test-reporter`, `--import`, `--require`, `-r`, `--experimental-loader`,
+>   `-e`/`--eval`, `-p`/`--print`, `python -c`/`-m`, `bash -c`, `git -c`/`--exec-path`,
+>   `make -f`, `tar --to-command`, and their equivalents in the interpreters in
+>   common use. If a machine is meant to run one of them, name it **in the entry**
+>   (`["node --test --test-reporter=tap"]`) — the entry is the explicit grant, and
+>   the refusal says so.
+> * **The executable is compared by identity, not by spelling.** A bare name is
+>   resolved through PATH as before; an absolute path is admitted only when it
+>   resolves to the same file the entry's executable does (otherwise
+>   `COMMAND_EXECUTABLE_PATH_MISMATCH`), and a relative path is refused outright
+>   (`COMMAND_EXECUTABLE_RELATIVE_PATH`) because the working directory comes from
+>   the offer. A copy of some other program at `E:\Temp\evil\node.exe` is not
+>   `node`, however it is named.
 
 > ⚠️ **v0.0.1 note:** Localside is verified as a standalone process. Running it
 > *in-process* from the plugin (`autoStartAgent: true`) is implemented but has
@@ -198,7 +250,7 @@ dsh plugin --profile <profile-name> add @twinsearth/w2m-dsh-plugin
 
 ```bash
 dsh plugin --profile <profile-name> add \
-  https://github.com/TwinsEarth/dsh-windows2macos/releases/download/v0.4.6/twinsearth-w2m-dsh-plugin-0.4.6.tgz
+  https://github.com/TwinsEarth/dsh-windows2macos/releases/download/v0.5.9/twinsearth-w2m-dsh-plugin-0.5.9.tgz
 ```
 
 **From the repository** — the form a marketplace's one-click installer uses (it clones
@@ -342,10 +394,14 @@ before 0.1.2.
 | `operator_token` | **only you** | **sending work** (`POST /v1/task`) |
 
 A machine that can be told what to do should not automatically be able to tell the
-others. The relay writes the operator token to `<state>/operator-token.txt` on
-first start and prints it once; the plugin takes it as `operatorToken`. Starting
-the relay with `--operator-token ''` removes the requirement — it warns loudly,
-and that is only appropriate for a trusted LAN.
+others. The relay writes the operator token to `<state>/operator-token.txt` (mode
+0600) on first start and prints it once — on that first start only, because a
+relay's stdout ends up in journald, a container log or a CI transcript and this
+token authorises dispatching to the whole fleet. Every later start names the file
+instead of the value; `--print-operator-token` (or `W2M_PRINT_OPERATOR_TOKEN=1`)
+prints it anyway for an operator who needs it there. The plugin takes it as
+`operatorToken`. Starting the relay with `--operator-token ''` removes the
+requirement — it warns loudly, and that is only appropriate for a trusted LAN.
 
 ### Surviving a restart
 
@@ -367,8 +423,8 @@ Turn it on in the profile patch:
 ```yaml
 # ~/.dsh/profiles/<profile>/cordis.patch.yml
 - insert:
-    - id: w2m-tools
-      name: '@twinsearth/w2m-dsh-plugin/tools'
+    - id: w2m
+      name: '@twinsearth/w2m-dsh-plugin'
       config:
         rabbitUrl: 'http://100.x.y.z:8787'
         autoUpdate: true          # default false
@@ -377,6 +433,16 @@ Turn it on in the profile patch:
         # autoUpdateDryRun: true                                  # verify, install nothing
         # updateRepo: TwinsEarth/dsh-windows2macos                # default
 ```
+
+> **The id is `w2m` and the name is the bare package — both matter, and neither is cosmetic.**
+> `w2m` is the id the packaged `cordis.patch.yml` inserts, so a second row under a different id
+> is a second plugin instance rather than a configuration of the first. `@twinsearth/w2m-dsh-plugin`
+> must be the **bare** package name: a subpath such as
+> `@twinsearth/w2m-dsh-plugin/tools` resolves to no `package.json`, so `dsh.client` is never read
+> and **the client half is silently disabled** — the composer control never registers, and nothing
+> on the host side reports a problem. `./tools` remains a supported mount point; it is simply not
+> the one this bundle uses, and using it costs you the browser half. See
+> [TROUBLESHOOTING.md](TROUBLESHOOTING.md) §2.
 
 Ask it what it is doing from any session with `w2m_update` (`action: "status"` to
 inspect, `action: "check"` to run one cycle now).
@@ -431,8 +497,11 @@ Read this before exposing the relay to anything.
 - **Commands are never shell strings.** argv arrays are passed to
   `spawn(cmd, args, { shell: false })`, so nothing a caller types can be
   reinterpreted as shell syntax.
-- **Default-deny whitelist.** A machine runs nothing that does not match
-  `--allowed-commands`.
+- **Default-deny whitelist, with its limit stated.** A machine runs nothing that
+  does not match `--allowed-commands`, and the matching rules are in §2 above.
+  The list controls *which program* may run; a prefix entry grants what that
+  program can be told to do with the arguments it is given (`node --test` runs
+  the test files it is handed), so it is a control, not a sandbox.
 - **Read-only by default.** `replicate` tasks run with `write: false`; there is
   no code path that writes to your project in that mode.
 - **TLS is your choice, but a deliberate one.** Shape A gets it from WireGuard;
@@ -496,19 +565,103 @@ a product.
 
 | Suite | Tests | What it covers |
 |---|---|---|
-| relay | 91 | pairing, auth, SSE with `ready`-first and `seq` replay, leases with heartbeat renewal and expiry, dedupe, all six aggregation states, report generation, operation token, rate limiting, persistence and restart recovery, TLS, and the lost-offer recovery path |
-| agent | 105 | whitelist allow/deny, timeout, output truncation, exit codes, anchors on clean and dirty trees, four concurrent fingerprint computations, spool, a 40-case URL join matrix, cursor lifecycle across relay restarts |
-| plugin | 73 | eight tools registered, schemas, typed errors, polling, operator-token enforcement (no request is sent without it), sub-path endpoints |
-| end to end + crossnetwork | 46 | two Localsides on two checkouts against one relay running real commands: consistent / divergent / failed / refused / unverifiable / deduped / long-lease / split, plus sub-path deployment, the two credential kinds, a SIGKILLed relay restarting with its ledger intact, pairing rate limiting, proxy-header trust boundaries, and the anti-buffering headers |
+| relay | 142 | pairing, auth, SSE with `ready`-first and `seq` replay, leases with heartbeat renewal and expiry, dedupe, all **nine** aggregation states plus `pending`/`refused`, report generation, operator token, rate limiting, persistence and restart recovery, TLS, and the lost-offer recovery path |
+| agent | 129 | allow-list allow/deny, timeout, output truncation, exit codes, anchors on clean and dirty trees, four concurrent fingerprint computations, spool, a 40-case URL join matrix, cursor lifecycle across relay restarts, and the bundled-runtime resolver |
+| tools | 89 | eight tools registered, schemas, typed errors, polling, operator-token enforcement (no request is sent without it), sub-path endpoints, and the credential canaries |
+| broadcast | 19 | exactly one executor, the rest `observing`; observers excluded from every aggregation step so a machine that did not run is never counted as agreeing |
+| claims | 19 | the document claims themselves: the version, the bundle patch, the tool list, every documented tarball URL, and the CHANGELOG's shape |
+| fleet-target | 37 | the composer's target selection, and the `executor_machine_id` narrowing that overrides it |
+| client-bundle | 25 | the browser half builds, exports, and resolves against `PLATFORM_MODULES` |
 | schedule | 39 | the daily slots as exact UTC instants, zones that shift by 30 minutes for DST, a full simulated year of consecutive arming, and catch-up collapsing several missed slots into one run |
 | auto-update | 34 | the install/skip decision, no downgrade, prerelease refused, an unverified tarball refused, a failed lookup recorded as an error rather than as "current", and no token ever persisted |
 | update-source | 50 | version ordering, streaming SHA-256 verification, timeouts that really abort, rate-limit reporting, and one real GitHub API call (opt-in — see below) |
 | update-install | 28 | zero writes on a hash mismatch, byte-for-byte restore, atomic staging, dry run, and two real-pnpm integration runs in throwaway profiles |
-| update-wiring | 15 | configuration validation that names the setting, and one `ctx.effect` owning the timer whose disposer stops it |
+| update-wiring | 34 | configuration validation that names the setting, and one `ctx.effect` owning the timer whose disposer stops it |
+| signing | 33 | request signing: mismatch, expiry, replay and required-signature refusals |
+| stress | 9 | sustained load on the relay's frame handling |
+| shared-config | 16 | the fleet-wide config file, including its refusal of secret-looking keys |
+| metrics / metrics-route | 16 + 5 | the Prometheus exposition and its route, with no credential ever rendered |
+| tool-cards | 8 | the tool descriptions the model actually reads |
+| p2p-stun | 18 | the STUN responder and reflexive-address discovery |
+| p2p-transport | 28 | the reliable ordered channel over UDP |
+| p2p-signaling | 17 | peer candidates: announce, fetch, expiry |
+| p2p-node | 38 | the node that binds the punch socket, announces, punches and dials |
+| p2p-transport-fields | 28 | `transport` / `p2p.offer_path` / `p2p.result_path` / `p2p.opened_by` on every result |
+| p2p-plugin | 32 | the plugin half of the direct path, including the pushes and their named failures |
+| p2p-crypto | 33 | stage 1 of the data-plane encryption: the handshake, the refusal codes, the replay window and the epoch ratchet |
+| stun-server | 27 | the standalone `w2m-stun` binary |
+| loader-entry | 10 | the entry DSH actually mounts, packed and installed — the gate v0.5.4 needed |
+| mdns-wire / mdns-discover | 38 + 45 | the DNS wire codec, and LAN discovery |
+| e2e + crossnetwork | 11 + 35 | two Localsides on two checkouts against one relay running real commands: consistent / divergent / failed / refused / unverifiable / deduped / long-lease / split, plus sub-path deployment, the two credential kinds, a SIGKILLed relay restarting with its ledger intact, pairing rate limiting, proxy-header trust boundaries, and the anti-buffering headers |
+| signing-e2e | 8 | a signed task end to end |
+| outbound-only | 7 | a running agent binds no TCP listener, and `relay` mode binds no UDP socket at all |
+| recovery | 4 | restart and lost-offer recovery |
+| pipeline-e2e | 2 | a real relay and a real agent running a chain: the stages append to a witness file, so the ordering evidence is written by the stages themselves; the second case proves the chain stops at the first failure |
+| p2p-agent | 21 | the agent half of the direct path, including the reverse dial for results |
 
-435 unit tests total: 434 pass, 1 skip. Run them with `scripts/verify.ps1`
-(Windows) or `scripts/verify.sh` (macOS/Linux). The skip is one agent test that
-asserts POSIX mode bits, which NTFS does not carry.
+**The numbers above are from v0.5.9 on `win32 x64`, Node `v24.18.1`** — the floor this package
+declares is `>=20.19.0`, and Node 24 is what DSH ships on this host. **36 suites on disk, 1,139 tests:**
+1,131 pass, **2 fail**, 6 skip. The two failures are `test/pipeline-e2e.test.mjs`'s two cases on this
+Windows host; **everything else is green.** Three suites are environment-sensitive and their counts
+move with it: `claims` is 19 tests here and **22 when `dist/` holds a packed tarball**, which is when
+its two tarball-vs-`package.json` checks run instead of skipping — so a checkout with `dist/` measures
+**1,142 tests / 1,134 pass / 4 skip**, and that is the number to expect from a release tree.
+
+**Which script runs which suite matters, because they are not the same set:**
+
+| Command | Suites | Result on this host (v0.5.9) |
+|---|---|---|
+| `npm test` — the unit suite | 29 | 1,051 tests, **all pass**, 6 skip |
+| `npm run test:all` — units + end-to-end | 35 | 1,106 tests, 1,098 pass, **2 fail** (`pipeline-e2e`), 6 skip |
+| `pwsh scripts/verify.ps1` — the acceptance run | 29 | 1,050 tests, 1,048 pass, **2 fail** (`pipeline-e2e`), 6 skip |
+
+> **`test:all` and `verify.ps1` are not supersets of each other.** At v0.5.9 `test:all` was still
+> missing `test/p2p-crypto.test.mjs` — 33 tests covering the data-plane encryption, absent from the
+> suite a release runs, and `CHANGELOG.md`'s v0.5.9 entry says so instead of claiming otherwise.
+> **v0.6.0 applied the one-line fix that entry asked its owner for**, so the file is now in `npm test`
+> and in `test:all`; `verify.ps1`'s own suite list still does not name it.
+
+`%DSH_HOME%\dsh-runtimes\` is absent on this host, which is why `verify.ps1` falls back to the
+`node` on `PATH`; the resolver's own bundled-runtime case is exercised against a throwaway home in
+`test/agent.test.mjs`, and “Not verified” below says what that does and does not prove.
+
+> **`pipeline-e2e` fails 2/2 at the v0.5.9 tag on this host, and the cause is the test, not the
+> product.** Both cases die with `ENOENT … order.txt` / `stop.txt`: the witness files the stages are
+> supposed to append to were never created, because **no stage ever ran**. In that revision the suite
+> passes its agent `--allowed-commands` as the *string* entry `process.execPath`
+> (`pipeline-e2e.test.mjs`, `allowedCommands = [NODE]`). A string entry is split on whitespace **by
+> design**, and on a machine whose Node lives under `C:\Program Files\`, that entry becomes the two
+> tokens `C:\Program` and `Files\nodejs\node.exe`, which match nothing — so the agent refused the
+> chain with `COMMAND_NOT_ALLOWED` before its first stage. It is therefore **not a Node-24 artifact**:
+> it is a test defect that appears wherever the interpreter's path contains a space, and it is
+> consistent with this suite passing on CI runners, whose Node is unpacked to a space-free path.
+> **The working tree already repairs it** (array-form entry naming `-e`, plus a third case asserting
+> that a stage outside the allow-list refuses the whole chain and runs nothing), and measured on this
+> host that repair takes the suite to **3/3 pass**. The failure is recorded here because v0.5.9 is
+> what a reader installs, and the honest label for the tag is **failing on Windows under
+> `C:\Program Files`** rather than "passes".
+
+**Skips are per platform, not a single number, and the difference is one test.** On this Windows host
+(Node 24.18.1, `dist/` present, network tests not enabled) there are **4**:
+
+| Suite | Skipped case | Why |
+|---|---|---|
+| agent | `writes 0600 where the platform honours POSIX bits` | NTFS carries no POSIX mode bits. **Skips on Windows; runs on macOS/Linux.** |
+| agent | `starts a bundled-only tool from runArgv even when PATH cannot see it` | A POSIX shell script is not a Windows executable. **Skips on Windows; runs on macOS/Linux.** |
+| claims | `every documented tarball exists as a release asset` | network check off unless `W2M_NETWORK_TESTS=1` |
+| update-source | `fetches, parses and verifies the published release end to end` | same gate |
+
+Two further cases are environment-conditional rather than platform-conditional, and skip only when
+their input is missing: `claims`'s two tarball-vs-`package.json` checks run when `dist/` holds a
+packed tarball and skip when it does not, and `agent`'s `git anchors` suite skips when `git` is not on
+`PATH`. On this machine `git` is present, so that one does not fire.
+
+The consequence, stated rather than generalised: **macOS and Linux run the two agent cases Windows
+cannot, and skip `reports the windows filesystem honestly`, which is Windows-only**, so their skip
+count is set by the same network gate plus whichever platform case applies — **it is not this host's
+number, and calling it one is exactly the generalisation this section used to make.** No macOS or
+Linux run was performed for this table; only the CI matrix measures those, and by this project's own
+labelling rule the figure above is `[M]` for Windows and `[?]` for the other two.
 
 The one test that calls GitHub for real is **opt-in** (`W2M_NETWORK_TESTS=1`).
 GitHub allows 60 unauthenticated API requests per hour *per IP* and hosted CI
@@ -618,7 +771,7 @@ DSH 目前**不能**跨机器协作，而且不是疏忽：
 | **中继 = 会合点 + 账本 + 回落** | 中继仍然收下每一条结果：它是账本，账本不完整，比较就不可信 |
 | **默认只读**（`replicate` 且 `write: false`） | 一次性消除重复提交、覆盖写、推送竞争这三类最常见的事故 |
 | **三锚校验** | 实测：脏工作区上 `git checkout --detach <sha>` **退出码 0 却保留本地改动** —— 只看 commit SHA 会把"不是同一份代码"误判成"结果分歧" |
-| **六态聚合** | "环境不同"与"结果不同"是两件事，合并记账会把噪声当 bug |
+| **九态聚合** | "环境不同"与"结果不同"是两件事，合并记账会把噪声当 bug；另有 `pending` / `refused` 两个非判定值不计入结论 |
 | **能力不匹配 → `refused`** | 拒绝执行，而不是静默降级 |
 | **长租约 + 进度心跳** | 固定超时会让跑 40 分钟的机器被判死并重投 → **两台同时跑、同时产生副作用** |
 | **零第三方运行时依赖** | 只用 `node:` 内置模块；下行 SSE + 上行 POST，不用 WebSocket |
@@ -640,7 +793,7 @@ node bin/w2m-localside.mjs --rabbit http://<中继地址>:8787 --pair PAIR-XXXXX
 
 # 3) 装 DSH 插件
 dsh plugin --profile <profile-name> add \
-  https://github.com/TwinsEarth/dsh-windows2macos/releases/download/v0.4.3/twinsearth-w2m-dsh-plugin-0.4.3.tgz
+  https://github.com/TwinsEarth/dsh-windows2macos/releases/download/v0.5.9/twinsearth-w2m-dsh-plugin-0.5.9.tgz
 ```
 
 然后在 profile 的 `cordis.patch.yml` 里给插件 `rabbitUrl`（留空即用共享服务器）与 `operatorToken`，重启 DSH，即可直接用自然语言指挥：

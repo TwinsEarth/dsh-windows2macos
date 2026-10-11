@@ -590,6 +590,12 @@ export class P2PNode extends EventEmitter {
     this.announcing = null;
     /** @type {NodeJS.Timeout|null} */
     this.refreshTimer = null;
+    /**
+     * Asked not to hold the process open (see `unref()`). Remembered rather than applied once:
+     * `close()` followed by `start()` binds a *second* socket, and a promise that covered only the
+     * first one would not be a promise.
+     */
+    this.unreferenced = false;
     /** @type {symbol|null} Identifies the current run; a stale loop/announce is ignored. */
     this.runToken = null;
     /** @type {Promise<void>|null} */
@@ -691,6 +697,33 @@ export class P2PNode extends EventEmitter {
   }
 
   /**
+   * Take the node off the process's liveness budget.
+   *
+   * A running node holds three things that would otherwise keep a Node.js process alive on their
+   * own, and all three are handled here: the bound UDP socket (a referenced handle), the announce
+   * refresh timer, and the accept loop's own wait timeout — a node that is simply waiting for a
+   * punch has that timer pending essentially all of the time. An embedder that has no disposer to
+   * call — a bare context with no `ctx.effect`, or an older host — has no other way to say so, and
+   * the alternative is a process that can never exit.
+   *
+   * The flag is remembered rather than applied once (`unreferenced`), because `close()` followed by
+   * `start()` binds a *second* socket and arms a *second* accept wait; the socket is unref'd as it
+   * binds, and the accept loop reads the flag on every round. A call made *after* `start()` therefore
+   * takes effect on the next round, which is bounded by the accept timeout. `close()` still releases
+   * everything; this only changes whether those handles hold the loop open.
+   *
+   * Idempotent, and safe before `start()` (and on a `relay` node, which never binds at all).
+   *
+   * @returns {this}
+   */
+  unref() {
+    this.unreferenced = true;
+    this.socket?.unref?.();
+    this.refreshTimer?.unref?.();
+    return this;
+  }
+
+  /**
    * Bring the node up: bind the socket, start the accept loop, and start announcing.
    *
    * The first announcement is *kicked off*, not awaited. Awaiting it would make every
@@ -771,6 +804,9 @@ export class P2PNode extends EventEmitter {
     });
 
     this.socket = socket;
+    // `unref()` is remembered across binds: a caller that asked not to hold the process open must
+    // not start holding it open again just because this is the second socket the node has owned.
+    if (this.unreferenced) socket.unref?.();
     this.local = local;
     this.started = true;
     this.runToken = Symbol('p2p-run');
@@ -1438,6 +1474,10 @@ export class P2PNode extends EventEmitter {
           socket: this.socket,
           timeoutMs: this.tuning.acceptTimeoutMs,
           claimed: this.claimed,
+          // Read on every round, not once: `unref()` can be called after `start()`, and the wait
+          // this loop is about to arm is then the only handle that could still hold the process
+          // open. See `unref()`.
+          unrefWait: this.unreferenced,
           // v0.6.0: handshakes are answered only when this machine holds a key of its own. Without
           // one, `accept()` is byte-for-byte v0.5.x — every HELLO answered plainly — which is what
           // keeps a mixed fleet working rather than half-encrypted and confused.

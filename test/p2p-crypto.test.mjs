@@ -39,15 +39,22 @@ import {
   HANDSHAKE_MAC_FIELDS_OMITTED,
   NonceCache,
   PeerKeyStore,
+  REFUSE,
   ReplayWindow,
   decodeHello,
+  decodeKey,
+  decodeRefuse,
   derive,
   encodeKey,
+  encodeRefuse,
   isPublicKey,
   rawPrivateOf,
   rawPublicOf,
+  refusalMacKey,
   respondHandshake,
+  sealRefuse,
   startHandshake,
+  verifyRefuseMac,
   x25519BasePoint,
 } from '../src/agent/crypto.mjs';
 import {
@@ -56,7 +63,15 @@ import {
   FRAME_MAGIC,
   MAX_EPOCH_LOOKAHEAD,
 } from '../src/agent/crypto.mjs';
-import { KIND, MAX_FRAGMENT_PAYLOAD, P2PChannel, accept, punch } from '../src/agent/p2p.mjs';
+import {
+  KIND,
+  MAX_FRAGMENT_PAYLOAD,
+  P2PChannel,
+  REFUSE_GUARD,
+  accept,
+  connect,
+  punch,
+} from '../src/agent/p2p.mjs';
 import { verifyEnvelope } from '../src/agent/agent.mjs';
 import { bindUdpSocket } from '../src/agent/stun.mjs';
 
@@ -464,6 +479,10 @@ describe('crypto: §7.2 a peer with the wrong static key is refused, by name', (
       assert.equal(dialled.crypto.status, 'refused');
       assert.equal(dialled.crypto.reason, CRYPTO_REASON.BAD_MAC);
       assert.match(dialled.error, /P2P_CRYPTO_BAD_MAC/);
+      // And the refusal is *proved*, which is only possible because it is sealed with the key derived
+      // from the handshake's own ephemeral. Sealing it with `k0` would fail exactly here: B's record of
+      // A's key is the wrong one, which is what `BAD_MAC` means, so the two ends cannot agree on `k0`.
+      assert.equal(dialled.crypto.refusal_authenticated, true);
 
       // The responder records its own refusal and hands back nothing either: there is no path this
       // build will use in the clear with a peer whose key it cannot verify.
@@ -471,6 +490,7 @@ describe('crypto: §7.2 a peer with the wrong static key is refused, by name', (
       assert.equal(accepted.channel, null);
       assert.equal(accepted.crypto.status, 'refused');
       assert.equal(accepted.crypto.reason, CRYPTO_REASON.BAD_MAC);
+      assert.equal(accepted.crypto.refusal_authenticated, true);
     } finally {
       close();
     }
@@ -540,6 +560,326 @@ describe('crypto: §7.2 a peer with the wrong static key is refused, by name', (
         }
       }
     }
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* MEDIUM-4 — a REFUSE datagram is not evidence by itself                      */
+/* -------------------------------------------------------------------------- */
+
+describe('crypto: MEDIUM-4 a spoofed REFUSE cannot rewrite a punch', () => {
+  /** The attack datagram of the v0.5.9 review: a bare `HELLO_ACK` carrying REFUSE(NO_PEER_KEY). */
+  const bareRefuse = (session) => frameOf(KIND.HELLO_ACK, session, encodeRefuse(session, REFUSE.NO_PEER_KEY));
+
+  /**
+   * The dial side of the attack. `attacker` is a THIRD socket — an address this punch never dialled —
+   * which is exactly how the review reproduced it: 13 bytes, no key, no session knowledge beyond the
+   * id the ledger is public about.
+   *
+   * @param {{attack: boolean, responderPort?: number}} options
+   */
+  async function dialWith(deps, { attack, attackSession }) {
+    const { a, b, x } = deps;
+    const session = 0x5eed004d;
+    const keysA = DeviceKey.generate('machine-a');
+    const keysB = DeviceKey.generate('machine-b');
+    // The peer acknowledges plainly and never completes a handshake: the "responsive, not encrypted"
+    // peer the defect needs, because only an answer opens the path and lets a refusal settle it.
+    b.socket.on('message', (_datagram, rinfo) => {
+      b.socket.send(frameOf(KIND.HELLO_ACK, session), rinfo.port, rinfo.address, () => {});
+    });
+    let sent = null;
+    if (attack) {
+      sent = bareRefuse(attackSession ?? session);
+      setTimeout(() => x.socket.send(sent, a.local.port, '127.0.0.1', () => {}), 200);
+    }
+    const result = await connect({
+      socket: a.socket,
+      remote: [loopback(b)],
+      session,
+      timeoutMs: 1500,
+      intervalMs: 100,
+      crypto: { deviceKey: keysA, peerKey: keysB.publicKeyBase64, peerMachineId: 'machine-b' },
+    });
+    return { result, bytes: sent === null ? 0 : sent.length, peerPort: b.local.port, attackerPort: x.local.port };
+  }
+
+  /** Three bound sockets, closed together. */
+  async function threeSockets() {
+    const a = await bindUdpSocket();
+    const b = await bindUdpSocket();
+    const x = await bindUdpSocket();
+    return {
+      a,
+      b,
+      x,
+      close: () => {
+        for (const entry of [a, b, x]) {
+          try {
+            entry.socket.close();
+          } catch {
+            /* closed */
+          }
+        }
+      },
+    };
+  }
+
+  it('ignores the 13-byte third-socket refusal, and records which guard dropped it', async () => {
+    const control = await threeSockets();
+    const attacked = await threeSockets();
+    try {
+      // Without the attacker the punch refuses by name and hands back no channel: the behaviour the
+      // review's "before" measurement recorded, and the one the attack used to overwrite.
+      const before = await dialWith(control, { attack: false });
+      assert.equal(before.result.ok, false);
+      assert.equal(before.result.crypto.status, 'refused');
+      assert.equal(before.result.crypto.reason, CRYPTO_REASON.HANDSHAKE_TIMEOUT);
+      assert.equal(before.result.channel, null);
+
+      const after = await dialWith(attacked, { attack: true });
+      assert.equal(after.bytes, 13, 'the attack datagram is 13 bytes: 5 of frame header, 8 of REFUSE');
+      assert.notEqual(after.attackerPort, after.peerPort, 'it came from an address this punch never dialled');
+      // THE FIX: the outcome is the one without the attacker, not the plaintext channel the datagram asked for.
+      assert.equal(after.result.ok, false, 'a refusal from nowhere may not hand back a channel');
+      assert.equal(after.result.channel, null);
+      assert.equal(after.result.crypto.status, 'refused');
+      assert.equal(after.result.crypto.reason, CRYPTO_REASON.HANDSHAKE_TIMEOUT);
+
+      const ignored = after.result.crypto.ignored_refusals ?? [];
+      assert.equal(ignored.length >= 1, true, 'the drop is reported rather than silent');
+      assert.equal(ignored.at(-1).reason_code, CRYPTO_REASON.REFUSE_UNPUNCHED_SOURCE);
+      assert.match(ignored.at(-1).detail, /neither one of the 1 address\(es\) this punch dialled/);
+      assert.equal(ignored.at(-1).from, `127.0.0.1:${after.attackerPort}`, 'and it names where the drop came from');
+      assert.equal(ignored.at(-1).datagram_bytes, 13, 'and it names the datagram that was dropped');
+    } finally {
+      control.close();
+      attacked.close();
+    }
+  });
+
+  it('ignores a refusal that names a session this punch did not agree', async () => {
+    const deps = await threeSockets();
+    try {
+      const { result } = await dialWith(deps, { attack: true, attackSession: 0xdeadbeef });
+      assert.equal(result.ok, false);
+      assert.equal(result.channel, null);
+      const ignored = result.crypto.ignored_refusals ?? [];
+      assert.equal(ignored.at(-1).reason_code, CRYPTO_REASON.REFUSE_SESSION_MISMATCH);
+      assert.match(ignored.at(-1).detail, /names the agreed session/);
+    } finally {
+      deps.close();
+    }
+  });
+
+  it('drops a sealed refusal whose MAC does not verify, even from the dialled address', async () => {
+    // Condition 3 of REFUSE_GUARD, from the address that *is* a candidate: a `NO_PEER_KEY` sealed with
+    // a key that is not `k_ref` cannot choose the plaintext outcome. An honest peer that cannot derive
+    // `k_ref` sends no MAC at all, which is the claim path — so nothing legitimate is lost here.
+    const { a, b, close } = await twoSockets();
+    try {
+      const session = 0x5eed004e;
+      const keysA = DeviceKey.generate('machine-a');
+      const keysB = DeviceKey.generate('machine-b');
+      b.socket.on('message', (_datagram, rinfo) => {
+        // A sealed refusal built with a key that is not this exchange's `k_ref`: a valid-looking seal
+        // that verifies nowhere. An honest peer either seals correctly or sends no MAC at all.
+        const forged = sealRefuse(session, REFUSE.NO_PEER_KEY, 'machine-b', Buffer.alloc(32, 9));
+        b.socket.send(frameOf(KIND.HELLO_ACK, session), rinfo.port, rinfo.address, () => {});
+        b.socket.send(frameOf(KIND.HELLO_ACK, session, forged), rinfo.port, rinfo.address, () => {});
+      });
+      const result = await connect({
+        socket: a.socket,
+        remote: [loopback(b)],
+        session,
+        timeoutMs: 1500,
+        intervalMs: 100,
+        crypto: { deviceKey: keysA, peerKey: keysB.publicKeyBase64, peerMachineId: 'machine-b' },
+      });
+      assert.equal(result.ok, false);
+      assert.equal(result.channel, null);
+      const ignored = result.crypto.ignored_refusals ?? [];
+      assert.equal(ignored.length >= 1, true);
+      assert.equal(ignored.at(-1).reason_code, CRYPTO_REASON.REFUSE_BAD_MAC);
+    } finally {
+      close();
+    }
+  });
+
+  it('still falls back to plaintext when the peer honestly refuses, and says it was proved', async () => {
+    // THE OTHER DIRECTION, with the real responder: `accept()` on a machine that holds a keypair and no
+    // key for the dialler. §4's fallback clause has to survive the hardening, and the sealed refusal
+    // makes it *stronger* than before rather than weaker — the plaintext outcome now rests on proof.
+    const { a, b, close } = await twoSockets();
+    try {
+      const session = 0x5eed004f;
+      const keysA = DeviceKey.generate('machine-a');
+      const keysB = DeviceKey.generate('machine-b');
+      const dialling = connect({
+        socket: a.socket,
+        remote: [loopback(b)],
+        session,
+        timeoutMs: 2500,
+        intervalMs: 100,
+        crypto: { deviceKey: keysA, peerKey: keysB.publicKeyBase64, peerMachineId: 'machine-b' },
+      });
+      const answering = accept({
+        socket: b.socket,
+        timeoutMs: 2500,
+        crypto: { deviceKey: keysB, peerKeys: new Map(), seen: new NonceCache() },
+      });
+      const [dialled, accepted] = await Promise.all([dialling, answering]);
+
+      assert.equal(accepted.crypto.status, 'plaintext', 'the responder keeps the v0.5.x compatibility path');
+      assert.equal(dialled.ok, true, dialled.error ?? 'the documented fallback must still happen');
+      assert.equal(dialled.crypto.status, 'plaintext');
+      assert.equal(dialled.crypto.reason, CRYPTO_REASON.NO_KEY);
+      assert.equal(dialled.crypto.refusal_authenticated, true, 'the refusal was sealed with k_ref');
+      assert.equal(dialled.crypto.ignored_refusals, undefined, 'and nothing was dropped');
+      assert.equal(dialled.channel.encryption.encrypted, false);
+      assert.equal(dialled.channel.encryption.reason, CRYPTO_REASON.NO_KEY);
+      dialled.channel.close('done');
+      accepted.channel.close('done');
+    } finally {
+      close();
+    }
+  });
+
+  it('still falls back for an older peer that cannot seal, from the endpoint that acknowledged', async () => {
+    // THE COMPATIBILITY PATH, and the reason the downgrade cannot simply *require* a seal: a peer
+    // running a build without `k_ref` sends a bare refusal. That form is honoured when it comes from
+    // the endpoint that answered the punch, which is what a real responder does — one socket, the
+    // refusal first and the plain acknowledgement after it.
+    const { a, b, close } = await twoSockets();
+    try {
+      const session = 0x5eed0052;
+      const keysA = DeviceKey.generate('machine-a');
+      const keysB = DeviceKey.generate('machine-b');
+      b.socket.on('message', (_datagram, rinfo) => {
+        b.socket.send(
+          frameOf(KIND.HELLO_ACK, session, encodeRefuse(session, REFUSE.NO_PEER_KEY)),
+          rinfo.port,
+          rinfo.address,
+          () => {},
+        );
+        b.socket.send(frameOf(KIND.HELLO_ACK, session), rinfo.port, rinfo.address, () => {});
+      });
+      const result = await connect({
+        socket: a.socket,
+        remote: [loopback(b)],
+        session,
+        timeoutMs: 2000,
+        intervalMs: 100,
+        crypto: { deviceKey: keysA, peerKey: keysB.publicKeyBase64, peerMachineId: 'machine-b' },
+      });
+      assert.equal(result.ok, true, result.error ?? 'the documented fallback must survive the guard');
+      assert.equal(result.crypto.status, 'plaintext');
+      assert.equal(result.crypto.reason, CRYPTO_REASON.NO_KEY);
+      assert.equal(result.crypto.refusal_authenticated, null, 'unsealed: the older peer\'s form');
+      assert.equal(result.crypto.ignored_refusals, undefined, 'and it is honoured, not dropped');
+      assert.equal(result.channel.encryption.encrypted, false);
+      result.channel.close('done');
+    } finally {
+      close();
+    }
+  });
+
+  it('drops an unsealed downgrade that no acknowledgement from that endpoint backs', async () => {
+    // Condition 4, with two candidates: the punch dials both, one answers plainly (that endpoint is the
+    // punched peer), and the *other* sends the bare refusal. The refusal is a candidate and names the
+    // right session, so it passes conditions 1 and 2 — and it still may not choose a plaintext channel,
+    // because nothing from that address ever acknowledged the punch.
+    const { a, b, x, close } = await threeSockets();
+    try {
+      const session = 0x5eed0053;
+      const keysA = DeviceKey.generate('machine-a');
+      const keysB = DeviceKey.generate('machine-b');
+      b.socket.on('message', (_datagram, rinfo) => {
+        b.socket.send(frameOf(KIND.HELLO_ACK, session), rinfo.port, rinfo.address, () => {});
+      });
+      x.socket.on('message', (_datagram, rinfo) => {
+        x.socket.send(
+          frameOf(KIND.HELLO_ACK, session, encodeRefuse(session, REFUSE.NO_PEER_KEY)),
+          rinfo.port,
+          rinfo.address,
+          () => {},
+        );
+      });
+      const result = await connect({
+        socket: a.socket,
+        // Both are "the peer" as far as the punch knows: two candidates from one offer.
+        remote: [loopback(b), loopback(x)],
+        session,
+        timeoutMs: 2000,
+        intervalMs: 100,
+        crypto: { deviceKey: keysA, peerKey: keysB.publicKeyBase64, peerMachineId: 'machine-b' },
+      });
+      assert.equal(result.ok, false, 'a downgrade from an unacknowledged candidate is not a downgrade');
+      assert.equal(result.channel, null);
+      const ignored = result.crypto.ignored_refusals ?? [];
+      assert.equal(ignored.length >= 1, true, 'the drop is recorded');
+      assert.equal(ignored.at(-1).reason_code, CRYPTO_REASON.REFUSE_UNCORROBORATED);
+      assert.equal(ignored.at(-1).from, `127.0.0.1:${x.local.port}`);
+      assert.match(ignored.at(-1).detail, /answered this punch is 127\.0\.0\.1:/);
+    } finally {
+      close();
+    }
+  });
+
+  it('writes the guard down as a value, so a later edit has to argue with it', () => {
+    assert.equal(REFUSE_GUARD.requires.length, 4);
+    assert.match(REFUSE_GUARD.requires[0], /names the session this punch agreed/);
+    assert.match(REFUSE_GUARD.requires[1], /address this punch dialled/);
+    assert.match(REFUSE_GUARD.requires[2], /k_ref MAC that verifies/);
+    assert.match(REFUSE_GUARD.requires[3], /comes from the address that answered the punch/);
+    assert.match(REFUSE_GUARD.residual, /plaintext outcome/, 'the residual claim is stated, not implied');
+  });
+
+  it('never reads a handshake body as a refusal, and round-trips both refusal forms', () => {
+    // The parse is what stands between "a refusal arrived" and "a HELLO_ACK arrived", and both are
+    // `magic|version|session|…` with a byte that can look like an id length. A bare decode accepted one
+    // length and validated nothing else, so a genuine ACK could be read as a refusal — body[6] (the
+    // first byte of a random ephemeral) becoming the code. Crafted here rather than waited for: byte 7
+    // is rewritten to the value that makes the lengths agree, which is the collision itself.
+    const keysA = DeviceKey.generate('machine-a');
+    const keysB = DeviceKey.generate('machine-b');
+    const start = startHandshake({
+      deviceKey: keysA,
+      peerMachineId: 'machine-b',
+      peerPublicKey: keysB.publicKeyBase64,
+      session: 0x5eed0050,
+    });
+    const answered = respondHandshake({
+      deviceKey: keysB,
+      body: start.body,
+      peerKeys: new Map([['machine-a', keysA.publicKeyBase64]]),
+      seen: new NonceCache(),
+    });
+    const ackBody = Buffer.from(answered.body);
+    assert.equal(decodeRefuse(ackBody), null, 'a real HELLO_ACK is not a refusal');
+    ackBody.writeUInt8(ackBody.length - 8, 7);
+    ackBody.writeUInt8(REFUSE.NO_PEER_KEY, 6);
+    assert.equal(
+      decodeRefuse(ackBody),
+      null,
+      'nor is one whose length byte has been bent to collide: key material is not a machine id',
+    );
+
+    // Both forms round-trip, and the seal is checked with k_ref rather than trusted.
+    const session = 0x5eed0051;
+    const bare = encodeRefuse(session, REFUSE.NO_PEER_KEY, 'machine-b');
+    assert.equal(bare.length, 8 + 'machine-b'.length);
+    assert.deepEqual(decodeRefuse(bare).mac, null);
+    const key = refusalMacKey({ privateKey: keysA.privateKey, peerPublicRaw: decodeKey(keysB.publicKeyBase64) });
+    const sealed = sealRefuse(session, REFUSE.NO_PEER_KEY, 'machine-b', key);
+    assert.equal(sealed.length, bare.length + 48);
+    const decoded = decodeRefuse(sealed);
+    assert.equal(decoded.code, REFUSE.NO_PEER_KEY);
+    assert.equal(decoded.mac.length, 48);
+    assert.equal(verifyRefuseMac(key, sealed), true);
+    assert.equal(verifyRefuseMac(Buffer.alloc(32, 7), sealed), false);
+    assert.equal(verifyRefuseMac(key, bare), null, 'no MAC is not a failed MAC');
+    assert.equal(verifyRefuseMac(null, sealed), false, 'a MAC we cannot check is not evidence');
   });
 });
 
@@ -1033,10 +1373,13 @@ describe('crypto: §7.6 an older peer that never learned a key still completes i
       identity: identity.identity,
       caps: { write: true, node: process.version, python: null, npm: null, case_sensitive_fs: true, symlinks: true, exec_bit: true },
       platform: { os: 'linux', os_version: '6.0', arch: 'x64', shell: 'bash', shell_version: null },
-      // The allow-list is default-deny and matches on an argv *prefix*, so the prefix is the
-      // interpreter alone. 	est/e2e.test.mjs and 	est/p2p-agent.test.mjs run their commands the
-      // same way, and for the same reason: a real git project and a real child process.
-      allowedCommands: [[process.execPath]],
+      // The allow-list is default-deny and matches on an argv *prefix*, and the entry names `-e`
+      // because that is the argument this test's command uses. A trailing `-e` is deliberately
+      // refused by `src/agent/allowed-commands.mjs`: an entry that named only the interpreter would
+      // otherwise admit "run this source", which is a grant the entry never spelled out. test/e2e.test.mjs
+      // and test/p2p-agent.test.mjs run their commands the same way, and for the same reason: a real
+      // git project and a real child process.
+      allowedCommands: [[process.execPath, '-e']],
       p2pMode: 'auto',
       // No `deviceKey` and no `p2pNodeOptions`: this agent has a keypair like every v0.6.0 machine
       // (it is generated in the state dir), and what makes the peer "older" is that the *offer* carries

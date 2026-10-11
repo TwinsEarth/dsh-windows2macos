@@ -81,12 +81,24 @@ minutes ago — not a broken release. See §11.
 `rabbitUrl` points at the shared server, `operatorToken` is empty, `stateDir` and `machineName` are
 blank, the allow-list is empty. Nothing errored.
 
-**Cause.** `dsh plugin add` (and the updater) **rewrites** `cordis.patch.yml`. It preserves its own
-bundle rows and can drop entries it does not recognise. This project has already lost a full config
-block that way — `rabbitUrl`, `operatorToken`, `stateDir`, `projectDir`, `machineName`, `p2pMode` and
-`allowedCommands` — and the only reason it was noticed is that someone looked.
+**Cause.** Two different mechanisms, and the one this section used to name was wrong. **`dsh plugin add`
+does not rewrite `cordis.patch.yml`** — the CLI shares the plugin manager's package operations, which
+are `pnpm` plus the profile manifest and lockfile: `package.json` and `pnpm-lock.yaml` are what a package
+operation writes, and a failed or cancelled install restores exactly those two. The manager's own patch
+writes are _plugin toggles_ in the Web plugin page, not installs.
 
-A second, sharper version of the same trap: a **fresh** profile's `cordis.patch.yml` is the
+What actually removes the file is **Desktop's fatal-recovery `sanitizeProfile`**. When DSH hits a native
+fatal error it recovers the profile without loading plugins: it **renames `cordis.patch.yml` to
+`cordis.patch.yml.bak-<unix-ms>`** and rewrites the bundle list. That is consistent with what was
+observed here — the configuration block vanished around a crash, and a `.bak-<timestamp>` sibling is the
+signature to look for. So the failure mode is not "the installer ate my settings"; it is "the app
+crashed, recovered, and the patch went with it".
+
+**This is why the backup habit below still matters, and matters more before an upgrade.** An upgrade is
+when a crash is most likely to be provoked and least likely to be watched; the `.bak-<timestamp>` file is
+what makes the settings recoverable afterwards, and it costs one `cp`.
+
+A second, sharper trap, unrelated to either mechanism: a **fresh** profile's `cordis.patch.yml` is the
 placeholder `[]`. That is an empty YAML _sequence_. Appending a mapping block to it produces invalid
 YAML, and the loader fails on the file as a whole — one bad row takes the entire profile down, not
 just this plugin. Both cases are why this file is treated as hand-edited state, not as a generated
@@ -128,7 +140,7 @@ in the profile's row and the mounted package disagree — usually because one of
    ```
 
 2. **If the file is the `[]` placeholder, delete the placeholder before writing your block.** Do not
-   append to `[]`:
+   append to `[]`, and use the `insert:` form to create the row:
 
    ```yaml
    # WRONG -- a sequence followed by a mapping is invalid YAML, and it takes the profile down
@@ -136,20 +148,36 @@ in the profile's row and the mounted package disagree — usually because one of
    - id: w2m
      config: { ... }
 
-   # RIGHT -- one top-level list, with your row inside it
+   # ALSO WRONG, and quieter -- a bare `- id:` is a NON-insert patch: it replaces supplied fields on
+   # an entry an earlier layer already created. No earlier layer creates `w2m`, so the loader warns
+   # `patch: entry "w2m" not found` and skips the whole row. The install succeeds, DSH starts, and
+   # none of the eight tools exist.
    - id: w2m
      name: '@twinsearth/w2m-dsh-plugin'
      config:
        rabbitUrl: ''
-       operatorToken: ''
-       stateDir: /absolute/path/to/$DSH_HOME/xclient
-       machineName: win-desktop
-       p2pMode: auto
-       allowedCommands: []
+
+   # RIGHT -- `insert:` appends the entry, which is what creating a row means
+   - insert:
+       - id: w2m
+         name: '@twinsearth/w2m-dsh-plugin'
+         config:
+           rabbitUrl: ''
+           operatorToken: ''
+           stateDir: /absolute/path/to/$DSH_HOME/xclient
+           machineName: win-desktop
+           p2pMode: auto
+           allowedCommands: []
    ```
 
-   In other words: replace the `[]` with your list, or append `- id: w2m` as a new list item at the
-   same indentation as the existing items. Never leave the `[]` above your block.
+   **When each form is appropriate.** `insert:` is for _creating_ a row — it is the only form that can,
+   and it is what the packaged `cordis.patch.yml` uses for exactly that reason. A bare `- id:` (with no
+   `insert:`) is for _overriding fields on a row that already exists_, which is what the home-level patch
+   and a plugin toggle do; used against a row that nothing created, it is a silent no-op.
+
+   In other words: replace the `[]` with an `insert:` list, or add your `- insert:` item at the same
+   indentation as the existing items. Never leave the `[]` above your block, and never reach for the
+   bare `- id:` form to create something new.
 
 3. **The `name:` must be the bare package.** `@twinsearth/w2m-dsh-plugin` — not
    `@twinsearth/w2m-dsh-plugin/tools`, not a path, not `.js`. A client package is identified by the
@@ -159,8 +187,9 @@ in the profile's row and the mounted package disagree — usually because one of
 5. If the file is unparseable, restore the backup and restart; a malformed patch file is a whole-file
    failure.
 
-**Not us.** The rewrite itself is the installer's behaviour, not this plugin's. Treat the file as
-shared state: your edits can be reverted by any tool that manages the profile.
+**Not us.** Neither mechanism is this plugin's: the install writes the manifest and lockfile, and the
+crash-recovery rename is the host's. Treat the file as shared state — your edits can be reverted by any
+tool that manages the profile, and the `.bak-<timestamp>` sibling is the receipt.
 
 ---
 
@@ -185,14 +214,16 @@ in **v0.5.4 and v0.5.5**: the loader entry failed, so the whole host entry was s
 node -p "require('$DSH_HOME/profiles/<profile>/node_modules/@twinsearth/w2m-dsh-plugin/package.json').version"
 ```
 
-**Fix.** Install a version that is not withdrawn. v0.5.3 and earlier are installable; v0.5.4 and
-v0.5.5 are not. `CHANGELOG.md` carries `DO NOT INSTALL` on the withdrawn entries — check it before
+**Fix.** Install a version that is not withdrawn. **v0.5.9 is the current release and is installable**;
+v0.5.4 and v0.5.5 are not, because they prevent the application from starting. Everything else from
+v0.5.6 on is installable too, and v0.5.3 and earlier install but predate the client half.
+`CHANGELOG.md` carries `DO NOT INSTALL` on the withdrawn entries — check it before
 installing a version you have not run before.
 
 ```bash
 # Uninstall the broken copy, then install a known-good one
 dsh plugin --profile <profile> remove @twinsearth/w2m-dsh-plugin
-dsh plugin --profile <profile> add @twinsearth/w2m-dsh-plugin@0.5.3
+dsh plugin --profile <profile> add @twinsearth/w2m-dsh-plugin@0.5.9
 ```
 
 The plugin being uninstalled must not leave a dangling row: if the profile still lists the package
@@ -375,6 +406,14 @@ not over the executable alone. Two consequences surprise people:
   match too, and here the third token differs (`console.log` vs `console.log(1)`).
 - A string entry is split on whitespace. A path containing a space therefore cannot be expressed as a
   string entry — write it as a **JSON array element** instead.
+- **An empty list means two opposite things, one per side, and the symptom looks the same.** The
+  plugin's list (`allowedCommands`) is **not a gate when empty**: with nothing configured the plugin
+  declines to refuse, deliberately, because the gate belongs to the machine that runs the command and it
+  will not duplicate a policy it was not given. The agent's list (`--allowed-commands`) is
+  **default-deny with nothing configured**: an empty list refuses **every** offer, with
+  `COMMAND_NOT_ALLOWED` and the detail _"the configured allow-list is empty, so every command is
+  refused"_. So "I set nothing on either side" runs nothing at all, and "I set nothing on the plugin
+  side" runs exactly what the agent allows — check both lists before concluding which one refused you.
 
 **Decision procedure.**
 
@@ -590,7 +629,7 @@ If step 1 lists the version and step 2 is a non-zero number of minutes, that is 
 # Wait for the gate to pass (a tarball URL bypasses the resolver entirely -- but read the release
 # notes first, and prefer a version that is not withdrawn; see CHANGELOG.md).
 dsh plugin --profile <profile> add \
-  https://github.com/TwinsEarth/dsh-windows2macos/releases/download/v0.5.3/twinsearth-w2m-dsh-plugin-0.5.3.tgz
+  https://github.com/TwinsEarth/dsh-windows2macos/releases/download/v0.5.9/twinsearth-w2m-dsh-plugin-0.5.9.tgz
 ```
 
 Or raise the gate for this machine — a deliberate supply-chain trade, so make it deliberately:
@@ -738,25 +777,25 @@ Relative to `$DSH_HOME`, which is `%DSH_HOME%` or `~/.dsh` on Windows and `$DSH_
 elsewhere. `<kind>` is the sub-directory a program is started with: `localside` for an agent,
 `rabbit` for a relay.
 
-| What                                 | Path                                                          | Created by                             | Windows                                                  | macOS / Linux                                | Notes                                                                                                                                                                      |
-| ------------------------------------ | ------------------------------------------------------------- | -------------------------------------- | -------------------------------------------------------- | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Device identity (`machine_id`, name) | `$DSH_HOME/xclient/device.json`                               | the agent, on first use                | `%USERPROFILE%\.dsh\xclient\device.json`                 | `~/.dsh/xclient/device.json`                 | Override the _file_ with `DSH_DEVICE_FILE`; mode 0600 where the platform honours it                                                                                        |
-| Device private key                   | beside `device.json` — `$DSH_HOME/xclient/device.key`         | the agent, on first use                | `%USERPROFILE%\.dsh\xclient\device.key`                  | `~/.dsh/xclient/device.key`                  | JSON key material, mode 0600. **NTFS carries no POSIX modes: `chmod` there is best-effort and does not restrict other users**                                              |
-| Agent state / spool root             | `--state <dir>`, default `$DSH_HOME/xclient/<kind>`           | `w2m-localside` (`--state`)            | `%USERPROFILE%\.dsh\xclient\localside`                   | `~/.dsh/xclient/localside`                   | Explicit `--state` wins; then `$DSH_HOME/xclient/<kind>`; then `~/.dsh/xclient/<kind>`                                                                                     |
-| Agent snapshot                       | `<state>/agent-state.json`                                    | the agent, continuously                | `…\xclient\localside\agent-state.json`                   | `…/xclient/localside/agent-state.json`       | The answer to "was the agent ever up", no network needed                                                                                                                   |
-| Write-ahead spool                    | `<state>/spool/<task_id>__a<attempt>/`                        | the agent, per task                    | `…\localside\spool\`                                     | `…/localside/spool/`                         | `meta.json`, `task.json`, `envelope.json`. Offers are spooled **before** execution and envelopes before the POST; an entry is deleted only after the relay acknowledges it |
-| Auto-update bookkeeping              | `$DSH_HOME/xclient/auto-update-state.json`                    | the plugin's updater                   | `%USERPROFILE%\.dsh\xclient\auto-update-state.json`      | `~/.dsh/xclient/auto-update-state.json`      | Only exists if `autoUpdate` was turned on                                                                                                                                  |
-| Relay ledger                         | `<relay state>/ledger.jsonl`                                  | `w2m-rabbit`                           | `%USERPROFILE%\.dsh\xclient\rabbit\ledger.jsonl`         | `~/.dsh/xclient/rabbit/ledger.jsonl`         | Append-only, one JSON object per line. A corrupt line is skipped and counted, not fatal                                                                                    |
-| Relay device table                   | `<relay state>/devices.json`                                  | `w2m-rabbit`                           | `…\xclient\rabbit\devices.json`                          | `…/xclient/rabbit/devices.json`              | Atomic snapshot (temp file + rename). On a server, `deploy/` puts this at `/var/lib/w2m/`                                                                                  |
-| Relay operator token                 | `<relay state>/operator-token.txt`                            | `w2m-rabbit`, **once**, on first start | `…\xclient\rabbit\operator-token.txt`                    | `…/xclient/rabbit/operator-token.txt`        | Printed once on stderr and deliberately absent from `--json` output. Treat as a credential; do not paste it into a report                                                  |
-| Profile plugin list and patch        | `$DSH_HOME/profiles/<profile>/cordis.patch.yml`               | DSH, then you / the installer          | `%USERPROFILE%\.dsh\profiles\<profile>\cordis.patch.yml` | `~/.dsh/profiles/<profile>/cordis.patch.yml` | **Rewritten by `dsh plugin add`; back it up (§2)**                                                                                                                         |
-| Profile dependencies                 | `$DSH_HOME/profiles/<profile>/package.json`, `pnpm-lock.yaml` | the installer                          | same shape                                               | same shape                                   | What the profile actually resolved; the updater backs these up before a replace                                                                                            |
-| Windows agent log                    | `%USERPROFILE%\.dsh\w2m\agent.log`                            | the Windows supervisor                 | `%USERPROFILE%\.dsh\w2m\agent.log`                       | n/a                                          | stdout/stderr of a session-0 process goes nowhere, so the supervisor owns this file                                                                                        |
-| Windows supervisor heartbeat         | `%USERPROFILE%\.dsh\w2m\supervisor-heartbeat.json`            | the Windows supervisor                 | same                                                     | n/a                                          | "Is this machine working?" without parsing a log that may itself be the casualty                                                                                           |
-| Agent log (Unix, started by hand)    | wherever you redirected it                                    | you                                    | n/a                                                      | n/a                                          | The agent logs to stderr, and there is no shipped systemd unit for it: redirect it to a file, or run it under a supervisor of your own                                     |
-| Relay log                            | its stdout/stderr                                             | you                                    | the container log                                        | journalctl -u w2m-rabbit                     | The one place the operator token is printed, and only on first start                                                                                                       |
+| What                                 | Path                                                          | Created by                             | Windows                                                  | macOS / Linux                                | Notes                                                                                                                                                                                                                                                              |
+| ------------------------------------ | ------------------------------------------------------------- | -------------------------------------- | -------------------------------------------------------- | -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Device identity (`machine_id`, name) | `$DSH_HOME/xclient/device.json`                               | the agent, on first use                | `%USERPROFILE%\.dsh\xclient\device.json`                 | `~/.dsh/xclient/device.json`                 | Override the _file_ with `DSH_DEVICE_FILE`; mode 0600 where the platform honours it                                                                                                                                                                                |
+| Device private key                   | beside `device.json` — `$DSH_HOME/xclient/device.key`         | the agent, on first use                | `%USERPROFILE%\.dsh\xclient\device.key`                  | `~/.dsh/xclient/device.key`                  | JSON key material, mode 0600. **NTFS carries no POSIX modes: `chmod` there is best-effort and does not restrict other users**                                                                                                                                      |
+| Agent state / spool root             | `--state <dir>`, default `$DSH_HOME/xclient/<kind>`           | `w2m-localside` (`--state`)            | `%USERPROFILE%\.dsh\xclient\localside`                   | `~/.dsh/xclient/localside`                   | Explicit `--state` wins; then `$DSH_HOME/xclient/<kind>`; then `~/.dsh/xclient/<kind>`                                                                                                                                                                             |
+| Agent snapshot                       | `<state>/agent-state.json`                                    | the agent, continuously                | `…\xclient\localside\agent-state.json`                   | `…/xclient/localside/agent-state.json`       | The answer to "was the agent ever up", no network needed                                                                                                                                                                                                           |
+| Write-ahead spool                    | `<state>/spool/<task_id>__a<attempt>/`                        | the agent, per task                    | `…\localside\spool\`                                     | `…/localside/spool/`                         | `meta.json`, `task.json`, `envelope.json`. Offers are spooled **before** execution and envelopes before the POST; an entry is deleted only after the relay acknowledges it                                                                                         |
+| Auto-update bookkeeping              | `$DSH_HOME/xclient/auto-update-state.json`                    | the plugin's updater                   | `%USERPROFILE%\.dsh\xclient\auto-update-state.json`      | `~/.dsh/xclient/auto-update-state.json`      | Only exists if `autoUpdate` was turned on                                                                                                                                                                                                                          |
+| Relay ledger                         | `<relay state>/ledger.jsonl`                                  | `w2m-rabbit`                           | `%USERPROFILE%\.dsh\xclient\rabbit\ledger.jsonl`         | `~/.dsh/xclient/rabbit/ledger.jsonl`         | Append-only, one JSON object per line. A corrupt line is skipped and counted, not fatal                                                                                                                                                                            |
+| Relay device table                   | `<relay state>/devices.json`                                  | `w2m-rabbit`                           | `…\xclient\rabbit\devices.json`                          | `…/xclient/rabbit/devices.json`              | Atomic snapshot (temp file + rename). On a server, `deploy/` puts this at `/var/lib/w2m/`                                                                                                                                                                          |
+| Relay operator token                 | `<relay state>/operator-token.txt`                            | `w2m-rabbit`, **once**, on first start | `…\xclient\rabbit\operator-token.txt`                    | `…/xclient/rabbit/operator-token.txt`        | Printed once, on the start that **generated** it, and deliberately absent from `--json` output. Later starts name the file instead; `--print-operator-token` / `W2M_PRINT_OPERATOR_TOKEN=1` prints it anyway. Treat as a credential; do not paste it into a report |
+| Profile plugin list and patch        | `$DSH_HOME/profiles/<profile>/cordis.patch.yml`               | DSH, then you                          | `%USERPROFILE%\.dsh\profiles\<profile>\cordis.patch.yml` | `~/.dsh/profiles/<profile>/cordis.patch.yml` | **Not written by `dsh plugin add`** — a plugin toggle writes it, and Desktop's crash recovery renames it to `.bak-<ts>`. Back it up (§2)                                                                                                                           |
+| Profile dependencies                 | `$DSH_HOME/profiles/<profile>/package.json`, `pnpm-lock.yaml` | the installer                          | same shape                                               | same shape                                   | What the profile actually resolved; the updater backs these up before a replace                                                                                                                                                                                    |
+| Windows agent log                    | `%USERPROFILE%\.dsh\w2m\agent.log`                            | the Windows supervisor                 | `%USERPROFILE%\.dsh\w2m\agent.log`                       | n/a                                          | stdout/stderr of a session-0 process goes nowhere, so the supervisor owns this file                                                                                                                                                                                |
+| Windows supervisor heartbeat         | `%USERPROFILE%\.dsh\w2m\supervisor-heartbeat.json`            | the Windows supervisor                 | same                                                     | n/a                                          | "Is this machine working?" without parsing a log that may itself be the casualty                                                                                                                                                                                   |
+| Agent log (Unix, started by hand)    | wherever you redirected it                                    | you                                    | n/a                                                      | n/a                                          | The agent logs to stderr, and there is no shipped systemd unit for it: redirect it to a file, or run it under a supervisor of your own                                                                                                                             |
+| Relay log                            | its stdout/stderr                                             | you                                    | the container log                                        | journalctl -u w2m-rabbit                     | The one place the operator token is printed, and only on the start that generated it (or with the opt-in)                                                                                                                                                          |
 
-**Two rules about this table.**
+**Three rules about this table.**
 
 1. **Nothing here is inside your project.** The spool, the state and the key live under the state
    directory on purpose: a read-only project directory must never be written to, and the spool is not
@@ -764,24 +803,32 @@ elsewhere. `<kind>` is the sub-directory a program is started with: `localside` 
 2. **Two "machines" sharing one `device.json` are one machine.** Duplicating a state directory to run
    a second agent on one host makes both claim the same `machine_id`. Point `--state` (or `DSH_HOME`)
    somewhere else instead.
+3. **A `device.json` token is a fleet-wide _metadata_ read credential, not a machine-local one.** A task's
+   aggregate is keyed by `task_id`, and `GET /v1/tasks/{task_id}` and the report accept a device token,
+   so **any** paired machine's token can read the aggregate of **any** task on **every** machine:
+   statuses, per-machine outcomes, anchors, comparable fields, the `transport`/`p2p` blocks and counts.
+   What it cannot read that way is the captured output — the aggregate carries `stdout_sha256` and
+   `stdout_bytes`, not the text. Only `POST /v1/task` (dispatch) requires the operator token. So "a
+   machine that can receive work cannot command the others" is true, and "it cannot see what the others
+   were asked to do, or how it went" is **not**. Keep the token file as private as the operator token.
 
 ---
 
 ## 17. Reference: the reason codes you will actually see
 
-| Code                                                                      | Where it appears                          | First thing to check                                                                                   |
-| ------------------------------------------------------------------------- | ----------------------------------------- | ------------------------------------------------------------------------------------------------------ |
-| `W2M_UNREACHABLE`                                                         | dispatching side, relay not answering     | §9                                                                                                     |
-| `W2M_RABBIT_REFUSED`                                                      | dispatching side, HTTP 401 from the relay | §9 fix 4 — the network is fine                                                                         |
-| `COMMAND_NOT_ALLOWED`                                                     | `refused` result, agent log               | §7                                                                                                     |
-| `CAPABILITY_REFUSED`                                                      | `refused` result                          | the agent does not advertise the capability the task needs                                             |
-| `NO_ONLINE_DEVICE`                                                        | dispatch                                  | §4 — no machine the relay considers online                                                             |
-| `PAIRING_CODE_ROTATED`                                                    | pairing                                   | pair again with the current code                                                                       |
-| `LEASE_EXPIRED`                                                           | task status                               | §4/§5 — the executor stopped renewing its lease                                                        |
-| `P2P_UNAVAILABLE`                                                         | `refused` result in `p2pMode: direct`     | §6 — the punch did not land and direct-only refuses the fallback                                       |
-| `P2P_PUNCH_TIMEOUT`                                                       | reported transport reason                 | §6, §13                                                                                                |
-| `RUNNER_THREW`                                                            | envelope status                           | the command ran and the runner itself failed; read the envelope's excerpt                              |
-| `SIGNATURE_*` (`MISMATCH`, `EXPIRED`, `REPLAY`, `REQUIRED`, `INCOMPLETE`) | relay, when signing is configured         | the signing secret is rotated or the two sides disagree; `SIGNING_NOT_CONFIGURED` means signing is off |
+| Code                                                                      | Where it appears                                                           | First thing to check                                                                                                                                                                                                                                             |
+| ------------------------------------------------------------------------- | -------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `W2M_UNREACHABLE`                                                         | dispatching side, relay not answering                                      | §9                                                                                                                                                                                                                                                               |
+| `W2M_RABBIT_REFUSED`                                                      | dispatching side, HTTP 401 from the relay                                  | §9 fix 4 — the network is fine                                                                                                                                                                                                                                   |
+| `COMMAND_NOT_ALLOWED`                                                     | `refused` result, agent log                                                | §7                                                                                                                                                                                                                                                               |
+| `CAPABILITY_REFUSED`                                                      | `refused` result                                                           | the agent does not advertise the capability the task needs                                                                                                                                                                                                       |
+| `NO_ONLINE_DEVICE`                                                        | dispatch                                                                   | §4 — no machine the relay considers online                                                                                                                                                                                                                       |
+| `PAIRING_CODE_ROTATED`                                                    | pairing                                                                    | pair again with the current code                                                                                                                                                                                                                                 |
+| `LEASE_EXPIRED`                                                           | task status                                                                | §4/§5 — the executor stopped renewing its lease                                                                                                                                                                                                                  |
+| `P2P_UNAVAILABLE`                                                         | `refused` result in `p2pMode: direct`                                      | §6 — the punch did not land and direct-only refuses the fallback                                                                                                                                                                                                 |
+| `P2P_PUNCH_TIMEOUT`                                                       | reported transport reason                                                  | §6, §13                                                                                                                                                                                                                                                          |
+| `RUNNER_THREW`                                                            | the **auto-updater**'s spawn result (`w2m_update`), not an envelope status | the updater's own runner threw before or instead of running: read the message beside it, and check the install path. An envelope never carries this — `src/agent/exec.mjs` defines only `ok`, `nonzero_exit`, `timeout`, `crashed`, `refused` and `unverifiable` |
+| `SIGNATURE_*` (`MISMATCH`, `EXPIRED`, `REPLAY`, `REQUIRED`, `INCOMPLETE`) | relay, when signing is configured                                          | the signing secret is rotated or the two sides disagree; `SIGNING_NOT_CONFIGURED` means signing is off                                                                                                                                                           |
 
 Nine aggregate verdicts exist, of which `unverifiable` (§8) is the one that needs explaining rather
 than fixing.

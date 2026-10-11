@@ -23,6 +23,8 @@ import path from 'node:path';
 import { after, describe, it } from 'node:test';
 
 import * as plugin from '../src/plugin/tools.mjs';
+import { MATCH_REFUSAL } from '../src/agent/allowed-commands.mjs';
+import { hasPathSeparator, resolveCommand } from '../src/agent/resolve.mjs';
 import { SHARED_SERVER } from '../src/agent/p2p-node.mjs';
 // The composer's selection store, driven directly by the refusal-code tests: the browser route is the
 // production writer, and asserting what a *stored* selection reports does not need a route registry.
@@ -883,19 +885,140 @@ describe('argument gating', () => {
     }
   });
 
-  it('accepts a configured command regardless of .exe suffix and path', async () => {
+  it('accepts a configured command regardless of .exe suffix, but not regardless of path', async () => {
+    // The suffix half is the documented tolerance: `Node.exe` and `node` are the same name, so the
+    // entry admits it. The path half used to be tolerated too -- `C:\Program Files\nodejs\node.exe`
+    // was admitted for that entry because its *basename* matched -- and that is the v0.5.10 defect:
+    // a copy of some other program at `E:\Temp\evil\node.exe` was admitted the same way, and `spawn`
+    // ran the copy. A path is now admitted only when it is the file the entry's executable resolves
+    // to, which is the file the agent would run.
     const fetchStub = installFetch([{ method: 'POST', path: '/v1/task', body: { task_id: '01J', leases: [], seq: 1 } }]);
     try {
       const { tools } = await register({
         rabbitUrl: RABBIT,
         stateDir: await makeStateDir(PAIRED_DEVICE),
-        allowedCommands: ['Node.exe'],
+        allowedCommands: ['node.exe --test'],
         projectDir: await makeNonRepoDir(),
         operatorToken: OPERATOR_TOKEN,
       });
-      const value = JSON.parse(await tools.get('w2m_run').execute(runArgs({ command_argv: ['C:\\Program Files\\nodejs\\node.exe', '--test'] }), {}));
-      assert.equal(value.ok, true);
+      const value = JSON.parse(await tools.get('w2m_run').execute(runArgs({ command_argv: ['node', '--test'] }), {}));
+      assert.equal(value.ok, true, `a bare name must match an entry that spells the suffix: ${JSON.stringify(value)}`);
       assert.equal(fetchStub.calls.length, 1);
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('refuses an executable path that is not the file the entry names, under the matcher\'s code', async () => {
+    const fetchStub = installFetch([]);
+    try {
+      const dir = await makeNonRepoDir();
+      const other = path.join(dir, process.platform === 'win32' ? 'node.exe' : 'node');
+      await fs.writeFile(other, '', 'utf8');
+      if (process.platform !== 'win32') await fs.chmod(other, 0o755);
+
+      const { tools } = await register({
+        rabbitUrl: RABBIT,
+        stateDir: await makeStateDir(PAIRED_DEVICE),
+        allowedCommands: ['node --test'],
+        projectDir: dir,
+        operatorToken: OPERATOR_TOKEN,
+      });
+
+      // The entry names `node`; this path names a different file that happens to share the basename.
+      // Identity is the file, so the pre-flight refuses before any request is made.
+      const refused = JSON.parse(
+        await tools.get('w2m_run').execute(runArgs({ command_argv: [other, '--test'] }), {}),
+      );
+      assert.equal(refused.ok, false);
+      assert.equal(refused.state, 'refused');
+      assert.equal(refused.refusal_reason, MATCH_REFUSAL.EXECUTABLE_PATH_MISMATCH);
+      assert.equal(refused.reason_code, MATCH_REFUSAL.EXECUTABLE_PATH_MISMATCH);
+      assert.ok(refused.detail.includes(other), 'the detail names the refused path');
+      assert.equal(fetchStub.calls.length, 0, 'a refused command must not reach the Rabbit');
+
+      // A relative executable is refused outright: the working directory is the offer's to choose.
+      const relative = process.platform === 'win32' ? '.\\node.exe' : './node';
+      const relativeRefusal = JSON.parse(
+        await tools.get('w2m_run').execute(runArgs({ command_argv: [relative, '--test'] }), {}),
+      );
+      assert.equal(relativeRefusal.reason_code, MATCH_REFUSAL.EXECUTABLE_RELATIVE_PATH);
+      assert.equal(fetchStub.calls.length, 0);
+
+      // The direction that must keep working: the absolute path of the executable the entry resolves
+      // to is that same file, so it is the entry's command. Guarded, because a dispatcher with no
+      // `node` on PATH has nothing for the name to resolve to -- and then no path can be admitted.
+      const resolved = resolveCommand('node');
+      if (hasPathSeparator(resolved)) {
+        const fetchStubAllowed = installFetch([
+          { method: 'POST', path: '/v1/task', body: { task_id: '01J', leases: [], seq: 1 } },
+        ]);
+        try {
+          const allowed = JSON.parse(
+            await tools.get('w2m_run').execute(runArgs({ command_argv: [resolved, '--test'] }), {}),
+          );
+          assert.equal(allowed.ok, true, `${resolved} is the file the entry resolves to`);
+          assert.equal(fetchStubAllowed.calls.length, 1);
+        } finally {
+          fetchStubAllowed.restore();
+        }
+      }
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('refuses a trailing argument that would make the allowed tool load code', async () => {
+    // HIGH-2 at the dispatch end: the plugin's pre-flight and the agent's gate are one matcher, so a
+    // refusal the machine would give is given here, under the same code, before any request is made.
+    const fetchStub = installFetch([{ method: 'POST', path: '/v1/task', body: { task_id: '01J', leases: [], seq: 1 } }]);
+    try {
+      const { tools } = await register({
+        rabbitUrl: RABBIT,
+        stateDir: await makeStateDir(PAIRED_DEVICE),
+        allowedCommands: ['node --test'],
+        projectDir: await makeNonRepoDir(),
+        operatorToken: OPERATOR_TOKEN,
+      });
+      const run = tools.get('w2m_run');
+
+      const refused = JSON.parse(
+        await run.execute(
+          runArgs({ command_argv: ['node', '--test', '--test-reporter=file:///E:/evil-reporter.mjs'] }),
+          {},
+        ),
+      );
+      assert.equal(refused.ok, false);
+      assert.equal(refused.refusal_reason, MATCH_REFUSAL.REPARSING_ARGUMENT);
+      assert.equal(refused.reason_code, MATCH_REFUSAL.REPARSING_ARGUMENT);
+      assert.match(refused.detail, /--test-reporter/);
+      assert.equal(fetchStub.calls.length, 0, 'a refused command must not reach the Rabbit');
+
+      // The direction that must keep working: a legitimate trailing argument of the same entry.
+      const allowed = JSON.parse(
+        await run.execute(
+          runArgs({ command_argv: ['node', '--test', '--test-name-pattern=adds'] }),
+          {},
+        ),
+      );
+      assert.equal(allowed.ok, true, `a legitimate trailing argument must dispatch: ${JSON.stringify(allowed)}`);
+      assert.equal(fetchStub.calls.length, 1, 'it must reach the Rabbit');
+
+      // And a pipeline stage that carries the argument is refused by name, naming the stage.
+      const stageRefusal = JSON.parse(
+        await run.execute(
+          runArgs({
+            mode: 'pipeline',
+            command_argv: undefined,
+            stages: ['node --test', 'node --test --test-reporter=file:///E:/evil-reporter.mjs'],
+          }),
+          {},
+        ),
+      );
+      assert.equal(stageRefusal.refusal_reason, MATCH_REFUSAL.REPARSING_ARGUMENT);
+      assert.equal(stageRefusal.stage_index, 1, 'the refusal must name which stage was rejected');
+      assert.match(stageRefusal.message, /stage 1/);
+      assert.equal(fetchStub.calls.length, 1, 'nothing may reach the relay once a stage is refused');
     } finally {
       fetchStub.restore();
     }

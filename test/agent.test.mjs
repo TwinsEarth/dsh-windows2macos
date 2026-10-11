@@ -13,7 +13,7 @@ import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   mkdirSync,
   mkdtempSync,
@@ -25,6 +25,11 @@ import {
   existsSync,
   chmodSync,
 } from 'node:fs';
+// v0.5.10: `publishState()`'s retry and cleanup can only be observed by injecting a rename
+// failure, and the agent binds `renameSync` as a named import of the builtin. `fs` (default) is the
+// mutable view, `syncBuiltinESMExports()` is the documented way to make that named import follow it.
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -46,7 +51,6 @@ import {
   probeCapsDetailed,
   probeFilesystemCaps,
   findExecutable,
-  resolveCommand,
 } from '../src/agent/caps.mjs';
 import {
   FINGERPRINT_ALGO,
@@ -105,6 +109,10 @@ import {
   verifyEnvelope,
 } from '../src/agent/agent.mjs';
 import { MATCH_REFUSAL } from '../src/agent/allowed-commands.mjs';
+// `resolve.mjs` is the canonical owner of the executable search order; `caps.mjs` re-exports
+// `resolveCommand` for callers that have always imported it from there (see its own note). Imported
+// once, from the owner, so the module never has two bindings for one function.
+import { hasPathSeparator, resolveCommand } from '../src/agent/resolve.mjs';
 import { endpointUrl, joinUrl, resolveBaseUrl } from '../src/agent/url.mjs';
 import { createRelayServer } from '../src/relay/server.mjs';
 import * as plugin from '../src/plugin/tools.mjs';
@@ -183,6 +191,54 @@ async function waitFor(fn, { timeoutMs = 15_000, intervalMs = 25, label = 'condi
     if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
+}
+
+/**
+ * Wait for a spawned child to close -- including one that has *already* closed.
+ *
+ * `child.on('close', resolve)` never settles for a child that has already exited: `close` is a
+ * one-shot event, the work it was waiting for has already succeeded, and the promise it was going
+ * to resolve simply never resolves. The test body then hangs forever with no output, which is the
+ * worst possible shape for a failure. Caught once in three loaded runs of the task-16 test, where
+ * the child had finished long before the listener was attached (`exitCode=0 signalCode=null`).
+ *
+ * So the exit state is read *first* -- `exitCode` and `signalCode` are set as soon as the process
+ * ends -- and the listener is only for the still-running case. `timeoutMs` is deliberately part of
+ * the helper: a wait that can outlive its child is exactly the bug being fixed, and a bounded wait
+ * turns it into a named failure instead of a hung suite.
+ *
+ * @param {import('node:child_process').ChildProcess} child
+ * @param {{timeoutMs?: number, label?: string}} [options]
+ * @returns {Promise<{code: number|null, signal: string|null, alreadyExited: boolean, waitedMs: number}>}
+ */
+function waitForChildClose(child, { timeoutMs = 60_000, label = 'child process' } = {}) {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve({
+      code: child.exitCode,
+      signal: child.signalCode,
+      alreadyExited: true,
+      waitedMs: 0,
+    });
+  }
+  return new Promise((resolve, reject) => {
+    const startedAt = Date.now();
+    const timer = setTimeout(() => {
+      child.removeListener('close', onClose);
+      // Kill it, so a bounded failure here cannot leave a process behind for the next test.
+      child.kill('SIGKILL');
+      reject(
+        new Error(
+          `${label} did not close within ${timeoutMs}ms (pid ${child.pid}); ` +
+            'a wait that outlives its child is the defect this helper exists to prevent',
+        ),
+      );
+    }, timeoutMs);
+    const onClose = (code, signal) => {
+      clearTimeout(timer);
+      resolve({ code, signal, alreadyExited: false, waitedMs: Date.now() - startedAt });
+    };
+    child.once('close', onClose);
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -383,7 +439,19 @@ describe('allow-list: default-deny prefix matching', () => {
 
   it('accepts an absolute executable path that names an allowed command', () => {
     const prefixes = parseAllowedCommands('["node --test"]');
-    assert.equal(matchAllowedCommand([NODE, '--test'], prefixes).allowed, true);
+    // The absolute path of the file the entry *resolves to* is the executable the entry names, and it
+    // is admitted on that identity. Resolving `node` here rather than assuming this process's own
+    // executable is what PATH holds keeps the test about the rule: a harness running a bundled
+    // runtime with no `node` on PATH is exactly the case where the two are different files.
+    const resolved = resolveCommand('node');
+    const outcome = matchAllowedCommand([resolved, '--test'], prefixes);
+    if (hasPathSeparator(resolved)) {
+      assert.equal(outcome.allowed, true, `${resolved} is the file \`node\` resolves to`);
+    } else {
+      // Nothing named `node` on PATH: no path can be admitted for this entry, and the refusal says so
+      // instead of admitting a path because its basename happens to match.
+      assert.equal(outcome.reason_code, MATCH_REFUSAL.EXECUTABLE_PATH_MISMATCH);
+    }
   });
 
   it('refuses everything when the list is empty', () => {
@@ -432,6 +500,219 @@ describe('allow-list: default-deny prefix matching', () => {
       matchAllowedCommand(['rm', '-rf', '/'], parseAllowedCommands('["node --test"]')).reason_code,
       REFUSAL.COMMAND_NOT_ALLOWED,
     );
+    // The three v0.5.10 codes are the matcher's alone, deliberately: the plugin forwards whatever the
+    // matcher returned instead of defining a second spelling (`checkAllowedCommand` reads
+    // `match.reason_code`), and the agent writes the matcher's code into its envelope. That agreement
+    // is asserted from both ends -- here and in tools.test.mjs -- so it is a test, not a hope.
+    for (const code of [
+      MATCH_REFUSAL.REPARSING_ARGUMENT,
+      MATCH_REFUSAL.EXECUTABLE_PATH_MISMATCH,
+      MATCH_REFUSAL.EXECUTABLE_RELATIVE_PATH,
+    ]) {
+      assert.equal(typeof code, 'string');
+      assert.notEqual(code, MATCH_REFUSAL.NOT_ALLOWED, 'a distinct fault keeps a distinct code');
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// allow-list: trailing arguments that load code (v0.5.10)
+// ---------------------------------------------------------------------------
+
+/** `["node --test"]` -- the entry this repository's README and PROTOCOL use as the example. */
+function NODE_TEST_ENTRY() {
+  return parseAllowedCommands('["node --test"]');
+}
+
+describe('allow-list: a matched prefix does not cover code-loading trailing arguments', () => {
+  it('refuses --test-reporter and every other argument that makes node load code', () => {
+    // The defect: only the first `prefix.length` tokens were compared, so `node --test
+    // --test-reporter=file:///E:/evil-reporter.mjs` returned `allowed: true` and node imported and
+    // ran that module. The matcher now refuses the *trailing* arguments that re-enter a parser.
+    const prefixes = NODE_TEST_ENTRY();
+    for (const argv of [
+      ['node', '--test', '--test-reporter=file:///E:/evil-reporter.mjs'],
+      ['node', '--test', '--test-reporter', 'file:///E:/evil-reporter.mjs'],
+      ['node', '--test', '--import=file:///E:/evil.mjs'],
+      ['node', '--test', '--require=E:/evil.cjs'],
+      ['node', '--test', '-r', 'E:/evil.cjs'],
+      ['node', '--test', '--experimental-loader=file:///E:/evil.mjs'],
+      ['node', '--test', '--loader=file:///E:/evil.mjs'],
+      ['node', '--test', '-e', 'process.exit(0)'],
+      ['node', '--test', '--eval', 'process.exit(0)'],
+      ['node', '--test', '-p', '1+1'],
+      // A bundle of short options is the same two flags: `-pe` is `--print --eval`.
+      ['node', '--test', '-pe', '1+1'],
+    ]) {
+      const refused = matchAllowedCommand(argv, prefixes);
+      assert.equal(refused.allowed, false, `${argv.join(' ')} must be refused`);
+      assert.equal(refused.reason_code, MATCH_REFUSAL.REPARSING_ARGUMENT, argv.join(' '));
+    }
+
+    const refused = matchAllowedCommand(
+      ['node', '--test', '--test-reporter=file:///E:/evil-reporter.mjs'],
+      prefixes,
+    );
+    // The refusal has to say *which* argument and what would change it, or the operator's only move
+    // is to loosen the allow-list blindly.
+    assert.match(refused.detail, /--test-reporter/, 'the detail names the argument');
+    assert.match(refused.detail, /trailing argument of the entry `node --test`/, 'and the entry it matched');
+    assert.match(refused.detail, /entry of its own/, 'and the remedy');
+  });
+
+  it('covers the interpreters in common use, and only per family', () => {
+    const cases = [
+      [['python'], ['python', '-c', 'import os; os.system("id")']],
+      [['python3.12'], ['python3.12', '-m', 'evil']],
+      [['perl'], ['perl', '-e', 'print 1']],
+      [['ruby'], ['ruby', '-r', '/tmp/evil']],
+      [['php'], ['php', '-r', 'system("id");']],
+      [['bash'], ['bash', '-lc', 'id']],
+      [['pwsh'], ['pwsh', '-Command', 'id']],
+      [['cmd'], ['cmd', '/c', 'whoami']],
+      [['java'], ['java', '-javaagent:C:\\evil.jar', '-jar', 'app.jar']],
+      [['git', 'status'], ['git', 'status', '--exec-path=E:/evil']],
+      [['git'], ['git', '-c', 'core.pager=!sh -c id', 'log']],
+      [['rsync'], ['rsync', '-e', 'sh -c id', 'a', 'b']],
+      [['tar'], ['tar', '-xf', 'a.tar', '--to-command=id']],
+      [['find'], ['find', '.', '-name', 'x', '-exec', 'id', ';']],
+      [['env'], ['env', '-S', 'id']],
+      [['make'], ['make', '--eval=$(shell id)']],
+    ];
+    for (const [entry, argv] of cases) {
+      const refused = matchAllowedCommand(argv, parseAllowedCommands([entry]));
+      assert.equal(refused.allowed, false, `${argv.join(' ')} under ${entry.join(' ')}`);
+      assert.equal(refused.reason_code, MATCH_REFUSAL.REPARSING_ARGUMENT, `${argv.join(' ')} under ${entry.join(' ')}`);
+    }
+    // The limit, stated rather than discovered: the deny-list is per executable family, so a tool
+    // nobody listed keeps prefix-only semantics. `npx`, `xargs` and `sh -c` are grants of *another*
+    // program by construction, and no token list enumerates them.
+    assert.equal(matchAllowedCommand(['mytool', '--run', 'id'], parseAllowedCommands(['mytool'])).allowed, true);
+  });
+
+  it('keeps a legitimate trailing argument, and lets an entry name a refused one', () => {
+    // The direction that must keep working. A control that refused the whole entry because one
+    // argument is on the deny-list would make `node --test` unusable rather than safer.
+    const prefixes = NODE_TEST_ENTRY();
+    for (const argv of [
+      ['node', '--test', '--test-name-pattern=adds'],
+      ['node', '--test', '--reporter=tap'],
+      ['node', '--test', 'tests/one.test.mjs'],
+      ['node', '--test', '--test-concurrency=1', 'tests/one.test.mjs'],
+    ]) {
+      const allowed = matchAllowedCommand(argv, prefixes);
+      assert.equal(allowed.allowed, true, `${argv.join(' ')} must still be allowed`);
+      assert.equal(allowed.reason_code, null);
+    }
+
+    // A plain path must not be read as a bundle of short options: `not-a-test-name.mjs` contains an
+    // `e`, and a first cut of the deny-list refused it as `-e`.
+    assert.equal(matchAllowedCommand(['node', '--test', 'E:/x/not-a-test-name.mjs'], prefixes).allowed, true);
+
+    // The escape hatch the refusal names: an entry that spells the argument out is the explicit
+    // grant, and entries are tried in order, so the specific entry must win over the general one.
+    const explicit = parseAllowedCommands('["node --test","node --test --test-reporter=tap"]');
+    assert.equal(matchAllowedCommand(['node', '--test', '--test-reporter=tap'], explicit).allowed, true);
+    assert.equal(
+      matchAllowedCommand(['node', '--test', '--test-reporter=file:///E:/evil.mjs'], explicit).reason_code,
+      MATCH_REFUSAL.REPARSING_ARGUMENT,
+      'naming one value must not admit every value',
+    );
+  });
+
+  it('says out loud that an allowed prefix still grants what the tool does with its arguments', () => {
+    // The honest limit of a *prefix* allow-list, pinned here so nobody reads the deny-list as a
+    // sandbox: `node --test <path>` loads and executes that file, so the entry `node --test` is a
+    // grant of arbitrary code execution from any file this machine can read. The deny-list narrows
+    // the argument shapes that reach it and cannot close it; see the module header.
+    const allowed = matchAllowedCommand(['node', '--test', '/anywhere/at/all.mjs'], NODE_TEST_ENTRY());
+    assert.equal(allowed.allowed, true);
+    assert.equal(allowed.reason_code, null);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// allow-list: executable identity (v0.5.10)
+// ---------------------------------------------------------------------------
+
+describe('allow-list: the executable is a file, not a spelling', () => {
+  /**
+   * A directory holding one file named like an executable, so identity tests are hermetic.
+   *
+   * The contents do not matter: nothing here executes it, and the matcher only resolves it.
+   *
+   * @param {string} name Scratch directory name.
+   */
+  function plantExecutable(name) {
+    const dir = scratch(name);
+    const file = join(dir, process.platform === 'win32' ? 'node.exe' : 'node');
+    writeFileSync(file, '', 'utf8');
+    if (process.platform !== 'win32') chmodSync(file, 0o755);
+    return { dir, file };
+  }
+
+  it('admits an absolute path only when it is the file the entry resolves to', () => {
+    // The defect: `argv[0]` was accepted when its *basename* matched, so `E:\Temp\evil\node.exe` --
+    // a copy of another program under an allowed name -- was admitted, and `spawn` ran it.
+    const allowedDir = plantExecutable('identity-allowed');
+    const evilDir = plantExecutable('identity-evil');
+    const prefixes = NODE_TEST_ENTRY();
+    const env = { PATH: allowedDir.dir };
+
+    const same = matchAllowedCommand([allowedDir.file, '--test'], prefixes, { env });
+    assert.equal(same.allowed, true, "the file the entry resolves to is the entry's executable");
+
+    const other = matchAllowedCommand([evilDir.file, '--test'], prefixes, { env });
+    assert.equal(other.allowed, false, 'a different file with the same name is a different program');
+    assert.equal(other.reason_code, MATCH_REFUSAL.EXECUTABLE_PATH_MISMATCH);
+    assert.ok(other.detail.includes(evilDir.file), 'the detail names the refused path');
+    assert.ok(other.detail.includes(allowedDir.file), 'and the file the entry resolves to');
+  });
+
+  it('admits the same file when the entry names the path itself', () => {
+    const allowedDir = plantExecutable('identity-path-entry');
+    const evilDir = plantExecutable('identity-path-entry-evil');
+    const prefixes = parseAllowedCommands([[allowedDir.file, '--test']]);
+    assert.equal(matchAllowedCommand([allowedDir.file, '--test'], prefixes).allowed, true);
+    assert.equal(
+      matchAllowedCommand([evilDir.file, '--test'], prefixes).reason_code,
+      MATCH_REFUSAL.EXECUTABLE_PATH_MISMATCH,
+    );
+    // A bare name against a path entry resolves through PATH, and is admitted only when it is that
+    // file -- which is how a dispatcher's `node` reaches an entry that spells the path out.
+    assert.equal(
+      matchAllowedCommand(['node', '--test'], prefixes, { env: { PATH: allowedDir.dir } }).allowed,
+      true,
+    );
+    assert.equal(
+      matchAllowedCommand(['node', '--test'], prefixes, { env: { PATH: evilDir.dir } }).reason_code,
+      MATCH_REFUSAL.EXECUTABLE_PATH_MISMATCH,
+    );
+  });
+
+  it('refuses a relative executable outright, even when an entry names it', () => {
+    // `./node.exe` is a different file in every working directory, and the working directory is the
+    // offer's to choose -- so no entry can pin it, including one that spells the path out.
+    const rel = process.platform === 'win32' ? '.\\node.exe' : './node';
+    const refused = matchAllowedCommand([rel, '--test'], NODE_TEST_ENTRY());
+    assert.equal(refused.allowed, false);
+    assert.equal(refused.reason_code, MATCH_REFUSAL.EXECUTABLE_RELATIVE_PATH);
+    assert.match(refused.detail, /working directory/);
+    assert.equal(
+      matchAllowedCommand([rel, '--test'], parseAllowedCommands([[rel, '--test']])).reason_code,
+      MATCH_REFUSAL.EXECUTABLE_RELATIVE_PATH,
+    );
+  });
+
+  it('still matches a bare name, extension aside, and names an incomparable argv', () => {
+    // The direction that must keep working: a bare name is what every existing configuration uses,
+    // and `.exe` is not part of the name.
+    assert.equal(matchAllowedCommand(['node', '--test'], parseAllowedCommands('["node.exe --test"]')).allowed, true);
+    assert.equal(matchAllowedCommand(['node', '--test'], NODE_TEST_ENTRY()).allowed, true);
+
+    // An argv the matcher cannot compare at all is a caller bug, and it is named as one instead of
+    // throwing out of `path.basename` (which reached the agent as a `crashed` envelope).
+    assert.equal(matchAllowedCommand(['node', 7], NODE_TEST_ENTRY()).reason_code, MATCH_REFUSAL.ARGV_EMPTY);
   });
 });
 
@@ -1331,7 +1612,7 @@ async function startFakeRabbit({
       if (pathname === '/v1/result') {
         if (resultError) {
           // Play a relay that refuses the result for a protocol reason (a bad
-          // signature, a missing operator token, …) so the agent's reporting of
+          // signature, a missing operator token, — so the agent's reporting of
           // *why* can be asserted.
           response.writeHead(resultError.status, { 'content-type': 'application/json' });
           response.end(
@@ -1568,6 +1849,181 @@ describe('Localside agent end to end', () => {
       assert.equal(envelope.stdout_bytes, 0);
       assert.equal(verifyEnvelope(envelope), true);
       assert.equal(agent.spool.list().length, 0);
+    } finally {
+      await rabbit.close();
+    }
+  });
+
+  it('refuses a whole pipeline when a later stage is outside the allow-list, and runs no stage', async () => {
+    // HIGH-1: `mode:'pipeline'` was gated on the offer's `command_argv`, which the relay sets to
+    // `stages[0].command_argv`, so every stage after the first was unchecked on the machine that ran
+    // it -- and a dispatcher that posts straight to `/v1/task` never touches the plugin's pre-flight.
+    // The whole chain is refused before anything runs, and the refusal names the stage.
+    const rabbit = await startFakeRabbit();
+    const project = await makeRepo('e2e-pipeline-list');
+    try {
+      const witness = join(project, 'stage0-ran.txt');
+      const proof = join(project, 'stage1-proof.txt');
+      // Stage 0 is an ordinary allowed invocation with a side effect, so "nothing ran" is a fact about
+      // the filesystem rather than about a status field. The entry names `-e` because that is what
+      // stage 0 uses -- a trailing `-e` is refused by the matcher as code the entry never named, so an
+      // entry of just `node` would refuse stage 0 too and prove nothing about stage 1.
+      const agent = makeAgent({ rabbit: rabbit.url, project, allowed: [['node', '-e']], name: 'pipeline-list' });
+      const running = agent.start();
+      const stream = await rabbit.stream();
+      stream.send('ready', { protocol_version: 1, machine_id: 'rabbit' });
+      stream.send('task.offer', {
+        task_id: '01J-E2E-PIPELINE-ALLOWLIST',
+        attempt: 1,
+        mode: 'pipeline',
+        index: 0,
+        index_total: 1,
+        command_argv: [NODE, '-e', `require('fs').writeFileSync(${JSON.stringify(witness)}, 'ran')`],
+        stages: [
+          { command_argv: [NODE, '-e', `require('fs').writeFileSync(${JSON.stringify(witness)}, 'ran')`] },
+          // The stage the entry does not cover. It is the *second* stage, which is the whole defect.
+          { command_argv: [NODE, '--test', 'two.test.mjs'] },
+        ],
+        cwd_rel: '.',
+        write: false,
+        timeout_ms: 30_000,
+        dedupe_key: 'dk-e2e-pipeline-allowlist',
+      });
+      await running;
+
+      assert.equal(rabbit.state.results.length, 1);
+      const envelope = rabbit.state.results[0];
+      assert.equal(envelope.status, 'refused');
+      assert.equal(envelope.refusal_reason, MATCH_REFUSAL.NOT_ALLOWED, "the matcher's code, not a second spelling");
+      assert.equal(envelope.exit_code, null);
+      assert.equal(verifyEnvelope(envelope), true);
+      assert.equal(envelope.protocol_violations.length, 1, 'the stage that failed travels with the envelope');
+      assert.match(envelope.protocol_violations[0], /^stage 1: COMMAND_NOT_ALLOWED/);
+      // `--test` is not on the entry, so the second stage is refused -- which is the point. The
+      // first stage's own side effect must not have happened either: the chain is refused as a whole.
+      assert.equal(existsSync(proof), false, 'the disallowed stage must not have run');
+      assert.equal(existsSync(witness), false, 'nor may an allowed earlier stage run before the refusal');
+    } finally {
+      await rabbit.close();
+    }
+  });
+
+  it('refuses a stage carrying a code-loading argument under the code the plugin pre-flight reports', async () => {
+    // The two ends of one rule, on one chain. The plugin's dispatch pre-flight refuses
+    // `stages: ['node --test', 'node --test --test-reporter=file:///E:/evil.mjs']` with
+    // `reason_code: COMMAND_REPARSING_ARGUMENT` and `stage_index: 1` (test/tools.test.mjs); this is
+    // the same chain reaching a real agent, which must refuse it with the same code and must name the
+    // same stage. A shared matcher is only worth sharing if the two answers cannot differ.
+    const rabbit = await startFakeRabbit();
+    const project = await makeRepo('e2e-pipeline-reparsing');
+    try {
+      const agent = makeAgent({ rabbit: rabbit.url, project, allowed: [['node', '--test']], name: 'pipeline-reparse' });
+      const running = agent.start();
+      const stream = await rabbit.stream();
+      stream.send('ready', { protocol_version: 1, machine_id: 'rabbit' });
+      stream.send('task.offer', {
+        task_id: '01J-E2E-PIPELINE-REPARSING',
+        attempt: 1,
+        mode: 'pipeline',
+        index: 0,
+        index_total: 1,
+        command_argv: [NODE, '--test'],
+        stages: [
+          // Allowed on its own: `node --test` with no arguments runs zero tests and exits 0.
+          { command_argv: [NODE, '--test'] },
+          { command_argv: [NODE, '--test', '--test-reporter=file:///E:/evil-reporter.mjs'] },
+        ],
+        cwd_rel: '.',
+        write: false,
+        timeout_ms: 30_000,
+        dedupe_key: 'dk-e2e-pipeline-reparsing',
+      });
+      await running;
+
+      const envelope = rabbit.state.results[0];
+      assert.equal(envelope.status, 'refused');
+      assert.equal(
+        envelope.refusal_reason,
+        MATCH_REFUSAL.REPARSING_ARGUMENT,
+        'the code the plugin pre-flight reports for this same chain',
+      );
+      assert.equal(envelope.protocol_violations.length, 1);
+      assert.match(envelope.protocol_violations[0], /^stage 1: COMMAND_REPARSING_ARGUMENT/);
+      assert.match(envelope.protocol_violations[0], /--test-reporter/, 'and the argument that caused it');
+      assert.equal(verifyEnvelope(envelope), true);
+    } finally {
+      await rabbit.close();
+    }
+  });
+
+  it('runs every stage of a pipeline whose stages are all allowed', async () => {
+    // The direction that must keep working. A chain the allow-list covers runs, in order, and the
+    // per-stage record still says so.
+    const rabbit = await startFakeRabbit();
+    const project = await makeRepo('e2e-pipeline-ok');
+    try {
+      const witness = join(project, 'order.txt');
+      const stageArgv = (name) => [
+        NODE,
+        '-e',
+        `require('fs').appendFileSync(${JSON.stringify(witness)}, ${JSON.stringify(`${name}\n`)})`,
+      ];
+      // `-e` is named by the entry: it is the argument these stages use, and a *trailing* `-e` is
+      // refused precisely because it would let an entry that names only the tool run arbitrary source.
+      const agent = makeAgent({ rabbit: rabbit.url, project, allowed: [['node', '-e']], name: 'pipeline-ok' });
+      const running = agent.start();
+      const stream = await rabbit.stream();
+      stream.send('ready', { protocol_version: 1, machine_id: 'rabbit' });
+      stream.send('task.offer', {
+        task_id: '01J-E2E-PIPELINE-OK',
+        attempt: 1,
+        mode: 'pipeline',
+        index: 0,
+        index_total: 1,
+        command_argv: stageArgv('one'),
+        stages: [
+          { command_argv: stageArgv('one') },
+          { command_argv: stageArgv('two') },
+        ],
+        cwd_rel: '.',
+        write: false,
+        timeout_ms: 60_000,
+        dedupe_key: 'dk-e2e-pipeline-ok',
+      });
+      await running;
+
+      const envelope = rabbit.state.results[0];
+      assert.equal(
+        envelope.status,
+        'ok',
+        `every stage is covered by the entry, so the chain must run: ${JSON.stringify({
+          status: envelope.status,
+          refusal_reason: envelope.refusal_reason,
+          protocol_violations: envelope.protocol_violations,
+          warnings: envelope.warnings,
+          exit_code: envelope.exit_code,
+          stages: envelope.pipeline?.stages,
+          stdout_head: envelope.stdout_head,
+          stderr_head: envelope.stderr_head,
+        })}`,
+      );
+      assert.equal(envelope.refusal_reason, null);
+      assert.equal(
+        existsSync(witness),
+        true,
+        `the stages must write the witness: ${JSON.stringify({
+          argv: envelope.command_argv,
+          stages: envelope.pipeline?.stages,
+          stdout_head: envelope.stdout_head,
+          stderr_head: envelope.stderr_head,
+          cwd_rel: envelope.cwd_rel,
+          project,
+        })}`,
+      );
+      assert.equal(readFileSync(witness, 'utf8'), 'one\ntwo\n', 'the stages ran in order');
+      assert.deepEqual(envelope.pipeline.stages.map((s) => s.status), ['ok', 'ok']);
+      assert.equal(envelope.pipeline.stopped_at, null);
+      assert.equal(verifyEnvelope(envelope), true);
     } finally {
       await rabbit.close();
     }
@@ -2749,7 +3205,12 @@ describe('agent state file for cross-process diagnostics (task-16)', () => {
 
       // The run really happened: the agent exits by itself in --once mode, and a
       // non-empty spool would mean the result was never acknowledged.
-      const exitCode = await new Promise((resolve) => child.on('close', resolve));
+      //
+      // v0.5.10: the exit state is read before any listener is attached. The child usually exits
+      // while this process is still assembling the assertions above, and `on('close')` attached to a
+      // child that has already closed never fires -- the suite then hangs in this line with the work
+      // it was waiting for already done.
+      const { code: exitCode } = await waitForChildClose(child, { label: 'the --once agent' });
       assert.equal(exitCode, 0, `agent must stop cleanly; stderr: ${childErr}`);
       assert.ok(
         childOut.includes(`result delivered for ${task.task_id}`),
@@ -3030,7 +3491,8 @@ describe('agent state file for cross-process diagnostics (task-16)', () => {
     child.stderr.on('data', (chunk) => {
       stderr += chunk;
     });
-    const exitCode = await new Promise((resolve) => child.on('close', resolve));
+    // Same reason as the task-16 wait: read the exit state instead of racing the `close` event.
+    const { code: exitCode } = await waitForChildClose(child, { label: 'the disconnected agent' });
 
     assert.equal(exitCode, 0, `an unreachable relay must not be fatal; stderr: ${stderr}`);
     assert.equal(stderr.trim(), '', 'no stack trace may reach stderr');
@@ -3871,5 +4333,321 @@ describe('request signing (v0.3.0)', () => {
       signRequest({ secret, ...vector1, path: '/w2m/v1/heartbeat' }),
       signRequest({ secret, ...vector1 }),
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.5.10: process lifetime, bounded waits, and a publish path that cleans up
+// after itself. All three were found by an independent verifier against v0.5.9:
+// a documented `unref()` that did not exist (so a host without `ctx.effect`
+// could never exit), an unbounded wait on a one-shot event, and a failed rename
+// that leaked its temp file -- 266 of them in one live state directory.
+// ---------------------------------------------------------------------------
+
+describe('process lifetime: a started node must not hold its host open (v0.5.10)', () => {
+  /** The plugin under test, by URL, for the child process below. */
+  const PLUGIN_URL = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'plugin', 'tools.mjs')).href;
+
+  /**
+   * The bare-context host, as a script: register the *shipping* plugin against a ctx that has no
+   * `effect`, start the P2P node through `w2m_status`, say what it observed, and then simply stop.
+   *
+   * Nothing here calls `process.exit()`. The process ends if -- and only if -- every handle the node
+   * owns is unreferenced, which is exactly the sentence the plugin's ownership comment promises.
+   * Written to a scratch file (not embedded with `-e`) so a failure can be reproduced by hand.
+   */
+  const BARE_CTX_SCRIPT = `import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+const [pluginUrl, stateDir, projectDir] = process.argv.slice(2);
+mkdirSync(stateDir, { recursive: true });
+mkdirSync(projectDir, { recursive: true });
+writeFileSync(
+  join(stateDir, 'device.json'),
+  JSON.stringify(
+    {
+      machine_id: '11111111-2222-4333-8444-555566667777',
+      machine_name: 'bare-ctx',
+      device_token: 'tok',
+      rabbit_url: null,
+    },
+    null,
+    2,
+  ),
+);
+
+const plugin = await import(pluginUrl);
+const tools = new Map();
+const ctx = {
+  // Deliberately no \`effect\`: this is the host the ownership comment describes.
+  tools: {
+    register(definition) {
+      tools.set(definition.name, definition);
+      return definition;
+    },
+  },
+  logger: { warn: () => {}, info: () => {} },
+};
+// Port 1 is not listening: the announcement fails, which is a reported fact and never fatal. What
+// matters here is that the socket binds and the accept loop starts.
+await plugin.apply(ctx, { rabbitUrl: 'http://127.0.0.1:1', stateDir, projectDir });
+const status = JSON.parse(await tools.get('w2m_status').execute({}, {}));
+console.log(
+  'BARE_CTX_OK p2p_running=' + status.p2p?.running + ' socket_bound=' + status.p2p?.transport?.socket_bound,
+);
+`;
+
+  it('exits by itself after a bare context started the node', async () => {
+    const dir = scratch('bare-ctx-exit');
+    const scriptPath = join(dir, 'bare-ctx-exit.mjs');
+    writeFileSync(scriptPath, BARE_CTX_SCRIPT);
+
+    const child = spawn(NODE, [scriptPath, PLUGIN_URL, join(dir, 'state'), join(dir, 'project')], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk;
+    });
+
+    try {
+      const { code } = await waitForChildClose(child, {
+        timeoutMs: 30_000,
+        label: 'the bare-context host',
+      });
+      assert.equal(code, 0, `the bare-context host must exit cleanly; stderr: ${stderr}`);
+    } catch (error) {
+      assert.fail(`${error.message}; stdout: ${stdout} stderr: ${stderr}`);
+    }
+    // Without this the test passes for a host that never started a node and therefore had nothing
+    // to hold it open -- a green result that proves the opposite of what it claims.
+    assert.match(
+      stdout,
+      /BARE_CTX_OK p2p_running=true socket_bound=true/,
+      `the node must really have started, or exiting proves nothing; stdout: ${stdout}`,
+    );
+  });
+});
+
+describe('child-process waits are bounded (v0.5.10)', () => {
+  it('resolves for a child that has already closed, instead of waiting for an event that cannot fire', async () => {
+    const child = spawn(NODE, ['-e', 'process.exit(3)'], { stdio: 'ignore' });
+    // Attached at spawn time, so this is the child's own exit and not a race with it.
+    await new Promise((resolve) => child.once('exit', resolve));
+
+    // The mechanism the defect is made of: `close` is one-shot, so a listener attached afterwards
+    // never fires. Measured here rather than asserted from memory -- 150ms is many event-loop turns.
+    let lateListenerFired = false;
+    child.on('close', () => {
+      lateListenerFired = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(
+      lateListenerFired,
+      false,
+      'a close listener attached after the child exited must not fire; that is the hang the helper prevents',
+    );
+
+    const startedAt = Date.now();
+    const result = await waitForChildClose(child, { timeoutMs: 5000 });
+    const elapsed = Date.now() - startedAt;
+    assert.equal(result.code, 3, 'the helper must report the code the child exited with');
+    assert.equal(result.alreadyExited, true, 'an exited child is recognised without waiting');
+    assert.ok(elapsed < 1000, `the helper must short-circuit, not wait out its timeout; took ${elapsed}ms`);
+  });
+
+  it('turns a child that never closes into a named failure instead of an unbounded wait', async () => {
+    const child = spawn(NODE, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' });
+    try {
+      await assert.rejects(
+        () => waitForChildClose(child, { timeoutMs: 300, label: 'the stuck child' }),
+        /the stuck child did not close within 300ms/,
+      );
+    } finally {
+      child.kill('SIGKILL');
+    }
+  });
+});
+
+describe('state publishing: a failed rename is retried and cleaned up (v0.5.10)', () => {
+  /**
+   * Count -- and optionally fail -- the renames that target the state file.
+   *
+   * The agent binds `renameSync` as a named import of `node:fs`, so patching the module's own
+   * property only takes effect after `syncBuiltinESMExports()`. Scoped to the state file on purpose:
+   * `spool.mjs` uses the same temp+rename pattern, and a failure injected there would measure a
+   * different file's behaviour. Always undone in the caller's `finally`.
+   *
+   * @param {string} stateFilePath
+   * @param {{failures?: number}} [options]
+   */
+  function injectRenameFailures(stateFilePath, { failures = 0 } = {}) {
+    const real = fs.renameSync;
+    /** @type {Map<string, number>} temp path -> rename attempts */
+    const attempts = new Map();
+    let calls = 0;
+    let left = failures;
+    fs.renameSync = (from, to) => {
+      if (to !== stateFilePath) return real(from, to);
+      calls += 1;
+      attempts.set(from, (attempts.get(from) ?? 0) + 1);
+      if (left > 0) {
+        left -= 1;
+        const error = new Error(`EPERM: injected transient rename failure (${left} left)`);
+        error.code = 'EPERM';
+        throw error;
+      }
+      return real(from, to);
+    };
+    syncBuiltinESMExports();
+    return {
+      renameCalls: () => calls,
+      attemptsBySource: () => attempts,
+      restore: () => {
+        fs.renameSync = real;
+        syncBuiltinESMExports();
+      },
+    };
+  }
+
+  /** A port nothing listens on, so publishes happen (one per failed attach) with no relay needed. */
+  async function deadPort() {
+    const probe = createServer(() => {});
+    await new Promise((resolve) => probe.listen(0, '127.0.0.1', resolve));
+    const port = probe.address().port;
+    await new Promise((resolve) => probe.close(resolve));
+    return port;
+  }
+
+  /**
+   * @param {{stateDir: string, project: string, rabbitUrl: string, logs?: object[]}} options
+   */
+  function makeStateAgent({ stateDir, project, rabbitUrl, logs }) {
+    return createAgent({
+      rabbitUrl,
+      project,
+      stateDir,
+      identity: {
+        machine_id: '3f2a1111-2222-4333-8444-555566667777',
+        machine_name: 'publish-retry',
+        device_token: 'tok',
+        rabbit_url: null,
+      },
+      caps: { case_sensitive_fs: false, symlinks: false, exec_bit: false, python: null, npm: null, node: process.version },
+      platform: { os: 'windows', os_version: '10.0', arch: 'x64', shell: 'cmd', shell_version: null },
+      allowedCommands: [],
+      once: false,
+      heartbeatIntervalMs: 60_000,
+      statePublishIntervalMs: 0,
+      log: logs ? (level, message, extra) => logs.push({ level, message, extra: extra ?? {} }) : () => {},
+    });
+  }
+
+  /** Temp files this test's publish path left in the state directory. */
+  const leftoverTempFiles = (stateDir) =>
+    readdirSync(stateDir).filter((name) => name.includes(`${AGENT_STATE_FILE}.tmp-`) || name.includes('.tmp-'));
+
+  it('leaves no temp file behind when every rename fails, and keeps running', async () => {
+    const project = scratch('publish-forced-project');
+    const stateDir = scratch('publish-forced-state');
+    const stateFilePath = join(stateDir, AGENT_STATE_FILE);
+    // A directory where the file must go: the rename can never succeed on any platform.
+    mkdirSync(stateFilePath);
+    const logs = [];
+    const patch = injectRenameFailures(stateFilePath);
+    let agent = null;
+    let running = null;
+    try {
+      agent = makeStateAgent({ stateDir, project, rabbitUrl: `http://127.0.0.1:${await deadPort()}`, logs });
+      running = agent.start();
+      await waitFor(() => patch.renameCalls() >= 3, { label: 'three failed publish attempts' });
+
+      // The failure is reported by name, once, and never fatal.
+      const warned = logs.filter((entry) => /could not publish agent-state\.json/.test(entry.message));
+      assert.equal(warned.length, 1, 'a repeated failure is warned about once, not once per attempt');
+      assert.match(
+        String(warned[0].extra.error),
+        /EPERM|EACCES|EISDIR|ENOTEMPTY|ENOTDIR/,
+        `the warning must carry the filesystem reason; got ${JSON.stringify(warned[0].extra.error)}`,
+      );
+
+      // The property: a publish that failed leaves nothing of its own behind. Before v0.5.10 this
+      // equalled the attempt count, which is how one live state directory reached 266 files / 187 KB.
+      assert.deepEqual(
+        leftoverTempFiles(stateDir),
+        [],
+        'a failed publish must unlink the temp file it created',
+      );
+      assert.equal(agent.state.statePublishedAt, null, 'nothing was published, so nothing claims to be');
+      assert.equal(agent.state.stopped, false, 'a diagnostics write must never take the agent down');
+      agent.stop();
+      await running;
+      running = null;
+    } finally {
+      patch.restore();
+      agent?.stop();
+      if (running) await running.catch(() => {});
+    }
+  });
+
+  it('publishes through a transient EPERM instead of losing the publish', async () => {
+    const project = scratch('publish-transient-project');
+    const stateDir = scratch('publish-transient-state');
+    const stateFilePath = join(stateDir, AGENT_STATE_FILE);
+    // Two injected failures: enough that the first publish cannot succeed without a retry, and few
+    // enough that the retry budget (STATE_RENAME_ATTEMPTS) is not exhausted.
+    const patch = injectRenameFailures(stateFilePath, { failures: 2 });
+    const logs = [];
+    let agent = null;
+    let running = null;
+    try {
+      agent = makeStateAgent({ stateDir, project, rabbitUrl: `http://127.0.0.1:${await deadPort()}`, logs });
+      running = agent.start();
+      await waitFor(() => agent.state.statePublishedAt !== null, { label: 'a published snapshot' });
+
+      // The publish went through *within one call*, not on a later attempt: the temp file it created
+      // was renamed three times -- two injected EPERMs and then the success.
+      const firstTmp = [...patch.attemptsBySource().keys()][0];
+      assert.ok(firstTmp, 'the publish path must have tried to rename a temp file');
+      assert.equal(
+        patch.attemptsBySource().get(firstTmp),
+        3,
+        `the same temp file must be retried after a transient EPERM; attempts: ${JSON.stringify([...patch.attemptsBySource()])}`,
+      );
+      // The retry is visible in the log, not only in the file: before v0.5.10 the only trace of this
+      // contention was the pile of temp files it left behind.
+      assert.ok(
+        logs.some((entry) => /published agent-state\.json after 3 rename attempts/.test(entry.message)),
+        `a retried publish must say so; log: ${JSON.stringify(logs.map((entry) => entry.message))}`,
+      );
+      assert.equal(
+        logs.filter((entry) => /could not publish agent-state\.json/.test(entry.message)).length,
+        0,
+        'a publish that succeeded on a retry is not a failure and must not be warned about',
+      );
+
+      const published = JSON.parse(readFileSync(stateFilePath, 'utf8'));
+      assert.equal(published.schema_version, AGENT_STATE_SCHEMA_VERSION);
+      assert.equal(published.machine_id, '3f2a1111-2222-4333-8444-555566667777');
+      assert.deepEqual(leftoverTempFiles(stateDir), [], 'the retry must not leak the temp file it retried');
+
+      // The negative direction: with the failures consumed, a healthy publish needs exactly one
+      // rename. The retry is a failure path, not a second rename on every publish.
+      await waitFor(() => patch.attemptsBySource().size >= 2, { label: 'a second publish' });
+      const secondTmp = [...patch.attemptsBySource().keys()][1];
+      assert.equal(patch.attemptsBySource().get(secondTmp), 1, 'a rename that succeeds is not retried');
+      assert.deepEqual(leftoverTempFiles(stateDir), [], 'and it leaves no temp file either');
+      agent.stop();
+      await running;
+      running = null;
+    } finally {
+      patch.restore();
+      agent?.stop();
+      if (running) await running.catch(() => {});
+    }
   });
 });

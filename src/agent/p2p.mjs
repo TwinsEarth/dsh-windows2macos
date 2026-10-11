@@ -76,6 +76,7 @@ import {
   REFUSE_REASON,
   respondHandshake,
   startHandshake,
+  verifyRefuseMac,
 } from './crypto.mjs';
 
 /** Frame kinds. Exported so tests and callers can name them instead of using magic numbers. */
@@ -270,9 +271,17 @@ export function reverseDialSession({ originMachineId, taskId, machineId } = {}) 
  *   * `plaintext` — no handshake was possible (no key for the peer, or the peer sent none), and the
  *     reason says which. This is the v0.5.x compatibility path, and it is recorded, never hidden.
  *   * `refused`  — a handshake was attempted and did not complete. `reason` is a
- *     `crypto.mjs` reason code. **There is no plaintext channel in this case**: §4's "never silently
- *     downgrading to plaintext" is enforced where the channel is created rather than left to a caller
- *     to remember.
+ *     `crypto.mjs` reason code. **No plaintext channel is handed back on this path**: §4's "never
+ *     silently downgrading to plaintext" is enforced where the channel is created rather than left to
+ *     a caller to remember.
+ *
+ * That last sentence used to be written as "there is no plaintext channel in this case", which is a
+ * stronger claim than the code makes and was falsified by the v0.5.9 review: a `REFUSE(NO_PEER_KEY)`
+ * that arrives from nowhere still *chose* the `plaintext` outcome (the branch below the refusal check),
+ * so a punch ended as `ok: true` with a plaintext channel instead of `refused`. Which is why the
+ * refusal is now guarded where it is read — see {@link REFUSE_GUARD} — and why `plaintext` carries
+ * `refusal_authenticated` when a refusal is what chose it: the honest wording is "a *failed* handshake
+ * never falls back into the clear", not "no datagram can make this a plaintext punch".
  *
  * @param {'encrypted'|'plaintext'|'refused'} status
  * @param {string|null} reason
@@ -302,16 +311,133 @@ function channelCrypto(outcome, tuning = {}) {
 }
 
 /**
+ * What a `REFUSE` datagram must satisfy before it may change a punch's outcome — as a value, so the
+ * contract cannot drift away from the code the way a comment can.
+ *
+ * `crypto.mjs` sends `REFUSE` with no proof in the one case where it has none to give: it is answering
+ * a handshake it cannot verify, because it holds no key for that machine. That is honest, and it is
+ * also a lever: any datagram of 13 bytes that reaches the dialling socket can claim to be that peer
+ * refusing, and the naive reading of it turns "the handshake did not complete" (a named failure, the
+ * relay fallback) into "the peer cannot take part" (a **plaintext channel**, and a ledger that says
+ * the peer was the one who could not). MEDIUM-4 of the v0.5.9 review reproduced exactly that with a
+ * third socket on loopback.
+ *
+ * So the refusal is honoured only when all of these hold, and the fourth narrows the one that
+ * matters most:
+ *
+ *   1. **It names the session this punch agreed** — the frame header *and* the refusal body. A
+ *      refusal for a punch we are not making cannot be about us.
+ *   2. **It comes from an address this punch punched**: one of the candidates we sent `HELLO` to, or
+ *      the address that has already answered. A refusal from a third address is not this peer's.
+ *   3. **A seal never buys a downgrade it cannot prove.** A refusal that would choose a plaintext
+ *      channel (`NO_KEY`, `NO_PEER_KEY`) is honoured when its `k_ref` seal verifies, or — for a peer too
+ *      old to seal one — when it carries no seal at all *and* comes from the endpoint that answered the
+ *      punch (condition 4). A **sealed** downgrade whose MAC does not verify is dropped: an honest peer
+ *      either seals correctly or sends no MAC at all, so that datagram was assembled by somebody else.
+ *   4. **An unsealed downgrade must be corroborated** by the same peer having acknowledged the punch.
+ *      That branch does not fail the punch, it *downgrades* it, so it is the one place where a claim
+ *      that cannot be checked has to come from the endpoint that actually answered. A *sealed*
+ *      downgrade needs no corroboration: it is the peer.
+ *
+ * Every other (**terminal**) refusal is honoured from a dialled address whether or not it is sealed, and
+ * `crypto.refusal_authenticated` says which it was: `true` (a seal that verified — proof), `null` (no
+ * seal: the form an older build sends), `false` (a seal that did not verify). Dropping a terminal
+ * refusal over a bad seal would buy nothing — an attacker forging one simply omits the seal — and would
+ * cost the honest case its name: a peer whose record of *our* key is stale computes a `k_ref` we cannot
+ * reproduce, and "your proof did not verify" is exactly what it is telling us.
+ *
+ * A datagram that fails 1, 2 or 3 is **dropped**, and the drop is recorded on the result in
+ * `crypto.ignored_refusals` with a `reason_code` from `CRYPTO_REASON`. Dropped rather than reported as
+ * a failure on purpose: if a forged refusal could fail the punch, injecting one would be a cheaper
+ * denial of service than suppressing the real answer, and the honest peer would be failed for it.
+ *
+ * RESIDUAL, stated because the documents above quote it: an attacker who can put a datagram on the
+ * wire *from the punched peer's address and port* (spoofing the source, so on-path or on the same
+ * host as the punch) can still satisfy 1, 2 and 4 with an **unsealed** `NO_PEER_KEY` — the one form a
+ * peer running an older build sends, and therefore the one form that cannot be required to carry a
+ * seal. That attacker can force the recorded plaintext outcome; if the real peer answers first, an
+ * injected terminal refusal can also force the relay fallback. What no longer works is a datagram
+ * from anywhere else, one that names another session, a sealed downgrade that does not verify, or a
+ * forced downgrade against a peer new enough to seal one — for those, `k_ref` cannot be forged by
+ * anyone who does not hold the peer's static private key.
+ */
+export const REFUSE_GUARD = Object.freeze({
+  requires: [
+    'names the session this punch agreed (frame header and body)',
+    'comes from an address this punch dialled, or from the peer that answered it',
+    'a plaintext-choosing refusal is sealed with a k_ref MAC that verifies, or carries no seal at all',
+    'an unsealed plaintext-choosing refusal (NO_KEY, NO_PEER_KEY) comes from the address that answered the punch',
+  ],
+  on_failure: 'the datagram is dropped and recorded in crypto.ignored_refusals; the punch outcome is unchanged',
+  terminal_refusals:
+    'honoured from a dialled address sealed or not; crypto.refusal_authenticated records true (seal verified), '
+    + 'null (no seal) or false (a seal that did not verify), so a claim is never mistaken for proof',
+  residual:
+    'an attacker who can inject an unsealed refusal from the punched peer\'s own address and port can still '
+    + 'force the recorded plaintext outcome, or the relay fallback with a terminal refusal; a sealed downgrade '
+    + 'cannot be forged without the peer\'s static private key',
+});
+
+/**
  * A refusal frame, if this datagram is one. Extracted because three branches ask the same question.
  *
+ * `key` is `k_ref` — the key this end derives from the handshake ephemeral (see `crypto.mjs`) — when a
+ * handshake is in flight. It decides one thing only: whether the refusal's optional seal can be
+ * checked. `authenticated` is deliberately three-valued — `true` (a seal was present and verified),
+ * `false` (a seal was present and did *not* verify), `null` (no seal at all, which is what a peer too
+ * old to seal one sends and which proves nothing).
+ *
  * @param {{kind:number, session:number, body:Buffer}} parsed
- * @returns {{code:number, reason:string}|null} The named reason, or null when this is not a refusal.
+ * @param {Buffer|null} [key] `k_ref` for this exchange, or null when no handshake is in flight.
+ * @returns {{code:number, reason:string, session:number, machineId:string|null,
+ *   authenticated:boolean|null}|null} The named reason, or null when this is not a refusal.
  */
-function cryptoRefusalOf(parsed) {
+function cryptoRefusalOf(parsed, key = null) {
   if (parsed.kind !== KIND.HELLO_ACK && parsed.kind !== KIND.HELLO) return null;
   const refuse = decodeRefuse(parsed.body);
   if (refuse === null) return null;
-  return { code: refuse.code, reason: REFUSE_REASON[refuse.code] ?? CRYPTO_REASON.REFUSED_BY_PEER };
+  let authenticated = null;
+  if (refuse.mac !== null) authenticated = key === null ? false : verifyRefuseMac(key, parsed.body) === true;
+  return {
+    code: refuse.code,
+    reason: REFUSE_REASON[refuse.code] ?? CRYPTO_REASON.REFUSED_BY_PEER,
+    session: refuse.session,
+    machineId: refuse.machineId,
+    authenticated,
+  };
+}
+
+/**
+ * Why a refusal datagram was **ignored**, in the house `{reason_code, detail}` shape.
+ *
+ * Every one of these four is a refusal we declined to act on rather than a refusal that decided the
+ * punch, which is why they are collected on the result (`crypto.ignored_refusals`) instead of being
+ * raised as a failure: a datagram an attacker can forge must not be able to fail a punch either.
+ * `detail` says what *would* have changed it, because "why did my punch still time out?" is the
+ * question each of these exists to answer.
+ *
+ * @param {string} reasonCode One of `CRYPTO_REASON`'s four `REFUSE_*` codes.
+ * @param {string} detail
+ * @param {object} context
+ * @param {{kind:number, session:number, body:Buffer}} context.parsed
+ * @param {{address:string, port:number}} context.rinfo
+ * @param {number} context.agreed The session this punch agreed.
+ * @returns {{reason_code:string, detail:string, session:number, from:string, datagram_bytes:number}}
+ */
+function ignoredRefusal(reasonCode, detail, { parsed, rinfo, agreed }) {
+  return {
+    reason_code: reasonCode,
+    detail,
+    session: (parsed.session >>> 0),
+    agreed_session: (agreed >>> 0),
+    from: `${rinfo.address}:${rinfo.port}`,
+    datagram_bytes: parsed.body.length + 5,
+  };
+}
+
+/** Same remote endpoint? `null` on either side is "not the same". */
+function sameEndpoint(a, b) {
+  return a !== null && b !== null && a.address === b.address && a.port === b.port;
 }
 
 /**
@@ -347,9 +473,11 @@ function finishFromInitiatorMessage(handshake, body) {
  *   * This end holds no key for the peer (a v0.5.x peer, or one that never announced): a plain
  *     `HELLO` is sent and the channel is plaintext with `P2P_CRYPTO_NO_KEY` as the reason.
  *   * This end holds a key and the handshake fails: the punch reports `ok: false` with the peer's
- *     named reason, and **no plaintext channel is returned for that peer**. The caller falls back to
- *     the relay — §4's fallback clause — and the ledger records `p2p.encrypted: false` plus the
- *     reason.
+ *     named reason, and no plaintext channel is handed back for that peer — but see
+ *     {@link REFUSE_GUARD}: "the peer's named reason" is only acted on when the datagram carrying it
+ *     can plausibly be the peer's, because `REFUSE` is unauthenticated by design. The caller falls
+ *     back to the relay — §4's fallback clause — and the ledger records `p2p.encrypted: false` plus
+ *     the reason.
  *
  * @param {object} options
  * @param {import('node:dgram').Socket} options.socket  Already bound, and the same socket STUN used.
@@ -366,7 +494,14 @@ function finishFromInitiatorMessage(handshake, body) {
  *   2^20 messages.
  * @returns {Promise<{ok:boolean, peer:{address:string,port:number}|null, session:number,
  *                    attempts:number, rttMs:number|null, error:string|null,
- *                    crypto:{status:string, reason:string|null, session:object|null, isInitiator:boolean}}>}
+ *                    crypto:{status:string, reason:string|null, session:object|null, isInitiator:boolean,
+ *                            refusal_authenticated?:boolean|null, ignored_refusals?:object[]}}>}
+ *   `crypto.ignored_refusals` is present only when at least one `REFUSE` datagram was dropped by
+ *   {@link REFUSE_GUARD}; each entry is `{reason_code, detail, session, agreed_session, from,
+ *   datagram_bytes}` (`datagram_bytes` is null for the one drop decided at outcome time, when the
+ *   datagram is no longer at hand). `crypto.refusal_authenticated` is present only when a refusal
+ *   decided the outcome: `true` for a seal that verified, `null` for the unsealed form an older build
+ *   sends, `false` for a seal that did not verify.
  */
 export async function punch(options) {
   const { socket } = options;
@@ -416,6 +551,13 @@ export async function punch(options) {
         session: ownSession,
       })
       : null;
+  /**
+   * `k_ref` for the peer being dialled, when a handshake is in flight: what a refusal MAC is checked
+   * with. It comes from the handshake's own ephemeral (`ECDH(e_i, s_r)`), so it exists for every peer
+   * whose `HELLO` reached us — including one that holds no key for us, which is the case that sends
+   * the refusal MEDIUM-4 was about.
+   */
+  const refusalKey = handshake === null ? null : handshake.refusalMacKey;
   // Why there is no handshake, when there is none. `null` means one is in flight.
   const noCryptoReason =
     handshake !== null
@@ -437,21 +579,42 @@ export async function punch(options) {
     let punchAttempts = 0;
     /** Set when the handshake has definitively failed, so the punch says why instead of timing out. */
     let refused = null;
+    /** Whether the refusal that set `refused` was `k0`-verified. See {@link REFUSE_GUARD}. */
+    let refusedAuthenticated = null;
     /**
      * Set when the peer has told us it can only do plaintext (`REFUSE.NO_KEY`).
      *
      * Separate from `refused` on purpose, and the distinction is the whole of §4's fallback clause: a
      * refusal means "do not talk to me in the clear", a plaintext-only answer means "I cannot talk to
      * you any other way, and here is why". The first is a failure, the second is a recorded outcome.
+     *
+     * Carries the source it arrived from and whether it was authenticated, because a plaintext channel
+     * is only handed back when the *same* endpoint that answered the punch is the one that asked for
+     * it — see {@link REFUSE_GUARD} condition 4.
      */
     let plainOnly = null;
+    /** Every `REFUSE` datagram dropped by {@link REFUSE_GUARD}, in `{reason_code, detail}` form. */
+    const ignoredRefusals = [];
+    /** One drop per un-corroborated plaintext refusal, however many times the outcome is asked for. */
+    let plainOnlyDropRecorded = false;
+
+    /** Is this datagram from an address this punch actually punched, or from the peer that answered it? */
+    const isPunchedSource = (rinfo) =>
+      sameEndpoint(punchedPeer, rinfo) ||
+      remote.some((candidate) => candidate.address === rinfo.address && candidate.port === rinfo.port);
 
     const finish = (result) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       socket.removeListener('message', onMessage);
-      resolve(result);
+      // The drops are attached here rather than threaded through every outcome, and only when there
+      // were any: a punch nobody interfered with returns exactly the object it always did.
+      resolve(
+        ignoredRefusals.length === 0
+          ? result
+          : { ...result, crypto: { ...result.crypto, ignored_refusals: ignoredRefusals } },
+      );
     };
 
     /** The path is open: report it with whatever the handshake managed to do. */
@@ -510,22 +673,76 @@ export async function punch(options) {
       }
 
       if (parsed.kind === KIND.HELLO_ACK) {
-        const refusal = cryptoRefusalOf(parsed);
+        const refusal = cryptoRefusalOf(parsed, refusalKey);
         if (refusal !== null) {
-          if (refusal.code === REFUSE.NO_KEY || refusal.code === REFUSE.NO_PEER_KEY) {
+          // ---- REFUSE_GUARD, conditions 1 and 2: this refusal has to be about *this* punch, from an
+          // address this punch actually dialled. Both checks come before anything else reads the
+          // datagram, and both are recorded rather than raised: see REFUSE_GUARD's `on_failure`.
+          if (parsed.session !== agreed || refusal.session !== agreed) {
+            ignoredRefusals.push(ignoredRefusal(
+              CRYPTO_REASON.REFUSE_SESSION_MISMATCH,
+              `the refusal named session ${refusal.session} in a frame for session ${parsed.session}; a refusal `
+                + `that names the agreed session ${agreed} is honoured`,
+              { parsed, rinfo, agreed },
+            ));
+            return;
+          }
+          if (!isPunchedSource(rinfo)) {
+            ignoredRefusals.push(ignoredRefusal(
+              CRYPTO_REASON.REFUSE_UNPUNCHED_SOURCE,
+              `it arrived from ${rinfo.address}:${rinfo.port}, which is neither one of the ${remote.length} `
+                + 'address(es) this punch dialled nor the peer that answered it; a refusal from one of those is '
+                + 'honoured',
+              { parsed, rinfo, agreed },
+            ));
+            return;
+          }
+          // ---- condition 3, first half: a MAC that was present and *wrong* buys nothing.
+          //
+          // It cannot be proof, and — for the one refusal that would choose a plaintext channel — it
+          // must not even be a claim: `NO_KEY`/`NO_PEER_KEY` are the refusals a *legitimate* peer seals
+          // with `k_ref` (it holds our `e_i` and its own `s_r`), so a sealed one that does not verify is
+          // not a peer whose records disagree with ours; it is a datagram somebody assembled. Dropping
+          // it costs an honest peer nothing, because an honest peer that cannot derive `k_ref` sends no
+          // MAC at all, which is the claim path below.
+          const wantsPlaintext = refusal.code === REFUSE.NO_KEY || refusal.code === REFUSE.NO_PEER_KEY;
+          if (wantsPlaintext && refusal.authenticated === false) {
+            ignoredRefusals.push(ignoredRefusal(
+              CRYPTO_REASON.REFUSE_BAD_MAC,
+              'it asked for a plaintext channel and carried a refusal MAC that did not verify; a refusal sealed '
+                + 'with the key derived from the handshake ephemeral is honoured, and an older peer that sends no '
+                + 'MAC at all is honoured from the address that answered the punch',
+              { parsed, rinfo, agreed },
+            ));
+            return;
+          }
+          if (wantsPlaintext) {
             // The peer has a keypair of its own and none *for us*, and it said so instead of answering
             // in a way we would have to guess about. That is the plaintext-only case, not a failure:
             // §4's fallback clause is explicitly about not losing a machine to a security upgrade, and
             // this is the peer naming the upgrade it could not take part in. The plain acknowledgement
             // follows from the same responder, so the punch settles on that.
-            plainOnly = CRYPTO_REASON.NO_KEY;
+            //
+            // This is also the one refusal that *chooses a plaintext channel* rather than failing the
+            // punch, so it is the one held to REFUSE_GUARD's fourth condition, and that condition can
+            // only be checked at outcome time: the refusal and the plain acknowledgement are two
+            // datagrams, either may arrive first, and only once both have is there something to
+            // corroborate. A refusal sealed with `k_ref` needs no corroboration — it is the peer.
+            plainOnly = {
+              reason: CRYPTO_REASON.NO_KEY,
+              source: { address: rinfo.address, port: rinfo.port },
+              authenticated: refusal.authenticated,
+            };
             return;
           }
           // Any other refusal is final — `BAD_MAC` means the peer is known and its proof did not
           // verify, which is a stale key or an impersonation attempt, and neither is a reason to fall
           // back into the clear. Named, and never downgraded: this is the path where a channel is
-          // deliberately not handed back at all.
+          // deliberately not handed back at all. A failed MAC does not disqualify it, because it can
+          // only ever fail a punch that was already failing, and an honest peer with a stale record of
+          // *our* key is exactly the peer that sends one; `refusal_authenticated` says which it was.
           refused = refusal.reason;
+          refusedAuthenticated = refusal.authenticated;
           finish({
             ok: false,
             peer: punchedPeer,
@@ -533,10 +750,14 @@ export async function punch(options) {
             attempts: punchAttempts,
             rttMs: punchedRtt,
             error: `${refusal.reason}: the peer refused the handshake`,
-            crypto: cryptoOutcome('refused', refusal.reason),
+            crypto: {
+              ...cryptoOutcome('refused', refusal.reason),
+              refusal_authenticated: refusal.authenticated,
+            },
           });
           return;
-        }        if (parsed.session !== agreed) return;
+        }
+        if (parsed.session !== agreed) return;
         notePeer(rinfo);
         const ack = decodeHello(parsed.body);
         if (ack === null) {
@@ -550,8 +771,9 @@ export async function punch(options) {
           // answers plainly, and settling on that answer would turn "your key did not verify" into a
           // silent plaintext channel — the exact outcome §4 forbids. Deferring costs one interval and
           // only happens on the punch where there was something to wait for.
-          if (!wantCrypto) finishPunched(cryptoOutcome('plaintext', plainOnly ?? noCryptoReason));
-          else deferPlain();
+          if (!wantCrypto) {
+            finishPunched(plaintextOutcome() ?? cryptoOutcome('plaintext', noCryptoReason));
+          } else deferPlain();
           return;
         }
         if (handshake === null) {
@@ -581,8 +803,43 @@ export async function punch(options) {
      * lose the machine. A peer we hold a key for and never hear a handshake from is a different fact —
      * `P2P_CRYPTO_HANDSHAKE_TIMEOUT` — and it falls back to the relay, which is what the contract says
      * a failed handshake does.
+     *
+     * It is also where REFUSE_GUARD's fourth condition is enforced, and it has to be *here* rather than
+     * at the datagram: the refusal and the plain acknowledgement are two datagrams from the same
+     * responder, either may arrive first, and only once both have is there something to corroborate.
+     * A refusal that no acknowledgement from the same endpoint ever backs is not honoured — and, like
+     * every other drop, it does not fail the punch; the punch keeps waiting and then reports the
+     * timeout it honestly has.
+     *
+     * A refusal that *is* sealed with `k_ref` skips that condition entirely: it proves the sender holds
+     * the static key we dialled, which is more than an acknowledgement from the same address could.
      */
-    const plaintextOutcome = () => (plainOnly === null ? null : cryptoOutcome('plaintext', plainOnly));
+    const plaintextOutcome = () => {
+      if (plainOnly === null) return null;
+      const corroborated = plainOnly.authenticated === true || sameEndpoint(punchedPeer, plainOnly.source);
+      if (!corroborated) {
+        if (!plainOnlyDropRecorded) {
+          plainOnlyDropRecorded = true;
+          ignoredRefusals.push({
+            reason_code: CRYPTO_REASON.REFUSE_UNCORROBORATED,
+            detail:
+              `it asked for a plaintext channel from ${plainOnly.source.address}:${plainOnly.source.port}, and the `
+              + 'peer that answered this punch is '
+              + (punchedPeer === null ? 'nobody yet' : `${punchedPeer.address}:${punchedPeer.port}`)
+              + '; the same refusal from the address that answered the punch is honoured',
+            session: agreed >>> 0,
+            agreed_session: agreed >>> 0,
+            from: `${plainOnly.source.address}:${plainOnly.source.port}`,
+            datagram_bytes: null,
+          });
+        }
+        return null;
+      }
+      return {
+        ...cryptoOutcome('plaintext', plainOnly.reason),
+        refusal_authenticated: plainOnly.authenticated,
+      };
+    };
     /** Keep the handshake alive after a plain answer, rather than settling into the clear. */
     const deferPlain = () => {
       tick();
@@ -616,6 +873,10 @@ export async function punch(options) {
           // The handshake failed and said why — from the peer's own refusal frame, or from a MAC that
           // did not verify. Reported at once and named, never downgraded to a plaintext channel: a
           // downgrade that a mismatched key can trigger is not encryption.
+          //
+          // `refusal_authenticated` travels with it because "the peer refused and proved it holds its
+          // static key" and "somebody told us the peer refused" are different facts, and the ledger is
+          // where that difference has to survive.
           finish({
             ok: false,
             peer: punchedPeer,
@@ -623,7 +884,7 @@ export async function punch(options) {
             attempts: punchAttempts,
             rttMs: punchedRtt,
             error: `${refused}: the handshake did not complete`,
-            crypto: cryptoOutcome('refused', refused),
+            crypto: { ...cryptoOutcome('refused', refused), refusal_authenticated: refusedAuthenticated },
           });
           return;
         }
@@ -1065,6 +1326,10 @@ export class P2PChannel extends EventEmitter {
  * @param {number} [options.timeoutMs] How long to wait before giving up.
  * @param {Set<number>|Map<number, unknown>} [options.claimed] Sessions that already have
  *        a live channel. Read, never written.
+ * @param {boolean} [options.unrefWait] Do not let the wait itself hold the process open. Off by
+ *        default: an awaited operation is normally exactly the thing that should keep a process
+ *        alive. On for a node that was asked to be unreferenced (`P2PNode.unref()`), where this
+ *        timer would otherwise be the last referenced handle and the process could never exit.
  * @param {number} [options.intervalMs] Floor between re-acknowledgements of the same
  *        claimed session within one call, so a peer that sprays HELLOs cannot make the
  *        responder answer every single one. The default matches `punch()`'s send
@@ -1074,9 +1339,12 @@ export class P2PChannel extends EventEmitter {
  * @param {object} [options.cryptoTuning] Rekey thresholds and retention; see `crypto.mjs`.
  * @returns {Promise<{ok:boolean, channel:P2PChannel|null, peer:{address:string,port:number}|null,
  *                    session:number, rttMs:number|null, error:string|null, machineId:string|null,
- *                    crypto:{status:string, reason:string|null, session:object|null, isInitiator:boolean}}>}
+ *                    crypto:{status:string, reason:string|null, session:object|null, isInitiator:boolean,
+ *                            refusal_authenticated?:boolean}}>}
  *   `machineId` is the handshake's *verified* claim about who dialled, or null for a plain punch
  *   (which carries no identity at all — see `P2PNode`'s note on why it refuses to guess one).
+ *   `crypto.refusal_authenticated` is present only on a refused outcome, and is the *sender's* view of
+ *   {@link REFUSE_GUARD}'s third condition: whether the refusal this end sent carried a `k_ref` seal.
  */
 export async function accept(options) {
   const { socket } = options;
@@ -1086,6 +1354,7 @@ export async function accept(options) {
   const intervalMs = options.intervalMs ?? 250;
   const claimed = options.claimed ?? null;
   const crypto = options.crypto ?? null;
+  const unrefWait = options.unrefWait === true;
 
   return new Promise((resolve) => {
     let settled = false;
@@ -1113,6 +1382,11 @@ export async function accept(options) {
         crypto: cryptoOutcome('plaintext', CRYPTO_REASON.PLAINTEXT_PEER),
       });
     }, timeoutMs);
+
+    // See `options.unrefWait`: a node that was asked not to hold the process open must not hold it
+    // open through the accept loop's own timeout, which is the handle that is pending almost all of
+    // the time in a node that is simply waiting for a punch.
+    if (unrefWait) timer.unref?.();
 
     // A wait on a socket that goes away must end now, not at the end of the timeout:
     // this is what makes a node's `close()` a barrier instead of a five-second stall.
@@ -1203,6 +1477,18 @@ export async function accept(options) {
       let machineId = null;
       /** Set when the handshake cannot be verified, so the peer is told why in a named refusal. */
       let refusal = null;
+      /**
+       * The exact refusal bytes the crypto layer produced, when it produced any.
+       *
+       * They are forwarded rather than rebuilt, because rebuilding them here silently threw away the
+       * responder's machine id and — since v0.6.0 — the `k0` MAC that makes `BAD_MAC` a statement only
+       * the holder of `s_r` can make. The initiator treats a MAC'd refusal as proof and a bare one as a
+       * claim (`REFUSE_GUARD`), so losing the MAC here would quietly downgrade every terminal refusal
+       * back to "somebody said so".
+       */
+      let refusalBytes = null;
+      /** Whether the refusal this end sent carried a `k_ref` seal. False when it has no key material. */
+      let refusalSealed = false;
 
       if (handshakeMessage !== null) {
         if (crypto === null) {
@@ -1210,6 +1496,9 @@ export async function accept(options) {
           // would turn "this build has no keys" into "this machine is unreachable", which is exactly
           // the fleet-losing outcome §4 forbids — but the peer is told why, in a named refusal frame
           // that travels alongside the plain acknowledgement.
+          //
+          // A machine with no key material cannot MAC anything, so this refusal is unauthenticated by
+          // construction, like `NO_PEER_KEY` below and for the same reason.
           //
           // This is what keeps the two ends from disagreeing about whether the session is encrypted: an
           // initiator that asked for a handshake and received only a plain acknowledgement would
@@ -1225,7 +1514,8 @@ export async function accept(options) {
             ackBody = answered.body;
             machineId = answered.machineId;
           } else if (answered.refuse !== null) {
-            const code = decodeRefuse(answered.refuse)?.code ?? REFUSE.UNKNOWN_PEER;
+            const decoded = decodeRefuse(answered.refuse);
+            const code = decoded?.code ?? REFUSE.UNKNOWN_PEER;
             // `NO_PEER_KEY` is the recoverable one, and the distinction is what makes §4's fallback
             // clause implementable without a silent downgrade. "I have a keypair and none for you"
             // means the handshake is impossible for a stated reason, and the peer may use the plaintext
@@ -1240,17 +1530,17 @@ export async function accept(options) {
             };
             if (refusal.terminal) outcome = cryptoOutcome('refused', answered.reason);
             else outcome = cryptoOutcome('plaintext', CRYPTO_REASON.NO_KEY);
+            // `decoded === null` means these bytes are not a refusal at all: the REPLAY path re-sends a
+            // cached *answer*, and for that case the named refusal below is built here as it always was.
+            if (decoded !== null) refusalBytes = answered.refuse;
           }
         }
       }
 
       if (refusal !== null) {
-        socket.send(
-          frame(KIND.HELLO_ACK, session, encodeRefuse(session, refusal.code, null)),
-          rinfo.port,
-          rinfo.address,
-          () => {},
-        );
+        const bytes = refusalBytes ?? encodeRefuse(session, refusal.code, null);
+        refusalSealed = decodeRefuse(bytes)?.mac !== null;
+        socket.send(frame(KIND.HELLO_ACK, session, bytes), rinfo.port, rinfo.address, () => {});
       }
       if (refusal !== null && refusal.terminal) {
         // The punch is *not* acknowledged: a handshake that failed is not a path this build will use in
@@ -1263,7 +1553,10 @@ export async function accept(options) {
           rttMs: null,
           error: `${refusal.reason}: the handshake was refused`,
           machineId: null,
-          crypto: cryptoOutcome('refused', refusal.reason),
+          // `refusal_authenticated` here is the responder's view of the same field: whether the refusal
+          // it just sent carried a seal, so "I told it why, with proof" and "I told it why, bare" are
+          // distinguishable without reading the wire.
+          crypto: { ...cryptoOutcome('refused', refusal.reason), refusal_authenticated: refusalSealed },
         });
         return;
       }

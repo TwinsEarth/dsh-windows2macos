@@ -16,9 +16,9 @@
  * unchanged, so the caller still gets the real ENOENT instead of a fake path.
  */
 
-import { accessSync, constants, statSync } from 'node:fs';
+import { accessSync, constants, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { delimiter, join } from 'node:path';
+import { delimiter, isAbsolute, join } from 'node:path';
 
 /** The DSH runtime directory layout we fall back to (task-8, measured). */
 export const DSH_RUNTIME_RELATIVE = join('dsh-runtimes', 'dsh-primary-runtime', 'dependencies');
@@ -141,8 +141,73 @@ export function bundledBinDirs(env = process.env) {
 export function resolveCommand(exe, options = {}) {
   if (typeof exe !== 'string' || exe === '') return exe;
   // Anything with a separator is a path the caller chose, not a name to look up.
-  if (exe.includes('/') || exe.includes('\\')) return exe;
+  if (hasPathSeparator(exe)) return exe;
   const env = options.env ?? process.env;
   const extraDirs = options.extraDirs ?? bundledBinDirs(env);
   return findExecutable(exe, { env, extraDirs }) ?? exe;
+}
+
+/**
+ * Does `value` name a path, rather than a bare command name to look up?
+ *
+ * Separators are platform-specific, and deliberately so. On Windows both `/` and `\` separate, so
+ * `C:\x\node.exe` is a path; on POSIX only `/` does, and the same string is an ordinary *name* that
+ * `spawn` would fail to find -- treating it as a path there would let a matcher compare two strings
+ * that name no file at all and report an identity it never established.
+ *
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+export function hasPathSeparator(value) {
+  if (typeof value !== 'string') return false;
+  return process.platform === 'win32'
+    ? value.includes('/') || value.includes('\\')
+    : value.includes('/');
+}
+
+/**
+ * Is `value` a *relative* path (`./node.exe`, `bin\node.exe`)?
+ *
+ * A relative executable is one whose meaning is chosen by whoever picks the working directory, which
+ * is exactly the party an allow-list does not control -- so the matcher refuses these outright rather
+ * than comparing them against anything. `C:node.exe` on Windows (drive-relative) is relative by this
+ * definition too, which is why the test is `!isAbsolute` and not "does not start with a separator".
+ *
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+export function isRelativePath(value) {
+  return hasPathSeparator(value) && !isAbsolute(value);
+}
+
+/** `realpath` that answers `null` instead of throwing for a path that names no file. */
+function realPathOf(value) {
+  const realpath = realpathSync.native ?? realpathSync;
+  try {
+    return realpath(value);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Do two paths name the **same file** on this machine?
+ *
+ * `realpath` rather than a string comparison, because the point is the file that would be executed:
+ * it resolves symlinks and junctions, Windows 8.3 short names, and the on-disk letter case. Two
+ * different copies of one program are two different files and answer `false`, which is what makes
+ * this usable as an identity check rather than a spelling check.
+ *
+ * @param {unknown} a
+ * @param {unknown} b
+ * @returns {boolean}
+ */
+export function sameFile(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string' || a === '' || b === '') return false;
+  const realA = realPathOf(a);
+  const realB = realPathOf(b);
+  if (realA === null || realB === null) return false;
+  return process.platform === 'win32'
+    ? realA.toLowerCase() === realB.toLowerCase()
+    : realA === realB;
 }

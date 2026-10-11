@@ -119,6 +119,15 @@ export const SESSION_KEY_LABEL = 'w2m-p2p-crypto v1 session';
 /** `k0 = HKDF(ECDH(s_i,s_r))` of §4: proves possession of the static key. */
 export const STATIC_KEY_LABEL = 'w2m-p2p-crypto v1 static';
 
+/**
+ * Domain separator of a `REFUSE`'s optional MAC — a *different* label from every handshake MAC, and a
+ * different *input*: `ECDH(e_i, s_r)` rather than `ECDH(s_i, s_r)` (see the note above `REFUSE`).
+ *
+ * Without the label, a refusal MAC and `mac'` of §4 would both be `sealMac(·, …)` over 32-byte hashes
+ * a hostile peer could try to make collide. One extra hash input makes the two families disjoint.
+ */
+export const REFUSE_MAC_LABEL = 'w2m-p2p-crypto v1 refuse';
+
 /** The literal string §4's `hash(prologue ——` starts with. */
 export const PROLOGUE = 'w2m-p2p-crypto v1 prologue';
 
@@ -200,6 +209,29 @@ export const CRYPTO_REASON = Object.freeze({
   MALFORMED: 'P2P_CRYPTO_MALFORMED',
   /** The peer never learned a key (an older build), so a direct channel with it is plaintext. */
   PLAINTEXT_PEER: 'P2P_CRYPTO_PLAINTEXT_PEER',
+  /**
+   * A `REFUSE` datagram was **dropped**, not honoured: it named a session this punch did not agree.
+   *
+   * The four `REFUSE_*` codes below name an *ignored datagram* rather than a failed punch, which is
+   * deliberate and is the whole of the v0.6.0 hardening: an unauthenticated refusal that cannot be
+   * tied to this punch must not be able to change its outcome, and it must not be able to fail it
+   * either — an attacker who could turn "the peer never answered" into "the peer refused" would have
+   * been handed a denial of service in exchange for closing a downgrade.
+   */
+  REFUSE_SESSION_MISMATCH: 'P2P_CRYPTO_REFUSE_SESSION_MISMATCH',
+  /** A `REFUSE` datagram was dropped: it came from an address this punch never dialled. */
+  REFUSE_UNPUNCHED_SOURCE: 'P2P_CRYPTO_REFUSE_UNPUNCHED_SOURCE',
+  /** A `REFUSE` datagram was dropped: it carried a `k0` MAC that did not verify. */
+  REFUSE_BAD_MAC: 'P2P_CRYPTO_REFUSE_BAD_MAC',
+  /**
+   * A downgrade-inducing `REFUSE` was dropped: it did not come from the peer that answered the punch.
+   *
+   * `NO_KEY`/`NO_PEER_KEY` say "I cannot take part, use the plaintext channel" — the one refusal that
+   * changes the outcome into something weaker than a failure. Requiring it to come from the address
+   * that actually answered the punch is what stops a datagram from a third address from choosing a
+   * plaintext channel on the peer's behalf.
+   */
+  REFUSE_UNCORROBORATED: 'P2P_CRYPTO_REFUSE_UNCORROBORATED',
 });
 
 /* -------------------------------------------------------------------------- */
@@ -788,12 +820,35 @@ export function bytesEqual(a, b) {
  *
  *     HELLO      magic|version|session u32|e[32]|idLen u8|machineId|mac[48]
  *     HELLO_ACK  magic|version|session u32|e[32]|idLen u8|machineId|mac[48]
- *     REFUSE     magic|version|session u32|code u8|idLen u8|machineId
+ *     REFUSE     magic|version|session u32|code u8|idLen u8|machineId[|mac 48]
  *
- * `mac` is 32 bytes of ciphertext plus 16 of tag (§4's AEAD-produced MAC). `REFUSE` is deliberately
- * unauthenticated: it is sent precisely when we cannot authenticate the peer, so it can carry no
- * proof —and it is what turns "the handshake did not complete" into a named reason on *both* ends
- * instead of a timeout on one of them.
+ * `mac` is 32 bytes of ciphertext plus 16 of tag (§4's AEAD-produced MAC).
+ *
+ * `REFUSE` **may** be unauthenticated, and that is not an oversight: it is sent precisely when we
+ * cannot authenticate the peer (we hold no key for it), so it can carry no proof — and it is what
+ * turns "the handshake did not complete" into a named reason on *both* ends instead of a timeout on
+ * one of them. When the responder received a handshake `HELLO` it holds the initiator's ephemeral
+ * `e_i`, and it *always* holds its own static private key `s_r`, so it can always derive
+ * `k_ref = HKDF(ECDH(e_i, s_r), REFUSE_MAC_LABEL)` — a key the initiator derives just as easily from
+ * `e_i`'s private half and `s_r`'s public key, and that nobody else can derive at all. The trailing 48
+ * bytes of a refusal are then `sealMac(k_ref, hash(REFUSE_MAC_LABEL ‖ the refusal without its MAC))`.
+ *
+ * That is the asymmetry this file relies on, and it is worth stating plainly because the naive
+ * version of it is wrong: `k0 = ECDH(s_i, s_r)` — the handshake MAC's key — is *not* usable here. A
+ * responder that has no key for us (or a stale one) cannot compute it, and those are exactly the two
+ * cases that send a refusal. `k_ref` needs neither end to hold the other's static key: the initiator
+ * sends `e_i` in the clear, and the responder's `s_r` is public. What it proves is what a refusal
+ * needs to prove — *this datagram came from the machine that holds `s_r`* — and it is therefore
+ * available to `BAD_MAC` (our proof did not verify), `NO_PEER_KEY` (we hold no key for you) and
+ * `UNKNOWN_PEER` alike.
+ *
+ * `VERSION` is the one refusal that stays bare, and deliberately: the peer that needs it speaks a
+ * handshake version whose body layout this build cannot rely on, so a trailing field it does not know
+ * about would be worse than useless.
+ *
+ * The unauthenticated form still exists and is still honoured by `p2p.mjs` — a peer running an older
+ * build cannot produce `k_ref` and must not lose its plaintext channel for it. What `p2p.mjs` will not
+ * do is let a datagram it cannot tie to the punch (see `REFUSE_GUARD` there) rewrite a ledger.
  */
 
 /**
@@ -808,6 +863,14 @@ export function bytesEqual(a, b) {
  *     it is not a downgrade: the peer never offered a key to downgrade from.
  *   * `BAD_MAC` — the peer *is* known and its MAC over its static key did not verify. That is either a
  *     stale key or an impersonation attempt, and the initiator treats it as terminal.
+ *
+ * The two known-peer codes (`BAD_MAC`, `REPLAY`) can be sealed with the ephemeral-static key of
+ * {@link refusalMacKey}, and so can the two unknown-peer codes — `k_ref` needs no static key on file.
+ * `VERSION` is the exception and stays bare. What `p2p.mjs` does with that asymmetry (`REFUSE_GUARD`
+ * there) is the rule: a *plaintext-choosing* refusal (`NO_KEY`, `NO_PEER_KEY`) must either verify its
+ * seal or arrive, unsealed, from the endpoint that acknowledged the punch; a terminal refusal is
+ * honoured from a dialled address sealed or not, with `refusal_authenticated` recording whether the
+ * seal was proof. Nothing dropped ever fails a punch.
  */
 export const REFUSE = Object.freeze({
   UNKNOWN_PEER: 1,
@@ -894,32 +957,136 @@ export function decodeHello(body) {
   };
 }
 
-/** @param {number} session @param {number} code @param {string|null} [machineId] @returns {Buffer} */
-export function encodeRefuse(session, code, machineId = null) {
+/**
+ * Build a `REFUSE` body, optionally with the trailing `k0` MAC of {@link sealRefuse}.
+ *
+ * @param {number} session
+ * @param {number} code
+ * @param {string|null} [machineId]
+ * @param {Buffer|null} [mac] 48 bytes, or null for the unauthenticated form.
+ * @returns {Buffer}
+ */
+export function encodeRefuse(session, code, machineId = null, mac = null) {
   const id = (machineId === null ? Buffer.alloc(0) : Buffer.from(machineId, 'utf8')).subarray(
     0,
     MAX_HANDSHAKE_MACHINE_ID,
   );
-  const out = Buffer.alloc(8 + id.length);
+  const trailing = mac === null ? Buffer.alloc(0) : mac;
+  if (trailing.length !== 0 && trailing.length !== MAC_BYTES) {
+    throw new TypeError(`encodeRefuse: a refusal MAC must be ${MAC_BYTES} bytes`);
+  }
+  const out = Buffer.alloc(8 + id.length + trailing.length);
   out.writeUInt8(FRAME_MAGIC, 0);
   out.writeUInt8(CRYPTO_VERSION, 1);
   out.writeUInt32BE(session >>> 0, 2);
   out.writeUInt8(code, 6);
   out.writeUInt8(id.length, 7);
   id.copy(out, 8);
+  trailing.copy(out, 8 + id.length);
   return out;
 }
 
-/** @param {Buffer} body @returns {{session:number, code:number, machineId:string|null}|null} */
+/**
+ * Parse a `REFUSE` body — both the bare form and the `k0`-MAC'd one — or null.
+ *
+ * Strict about the length, in both forms, and that strictness is load-bearing rather than tidy: the
+ * body being parsed here arrives as the body of a **`HELLO_ACK`**, and a handshake body is also
+ * `magic|version|session|…` with a byte that can look like an id length. An earlier version accepted
+ * exactly one length and validated nothing else, so a genuine `HELLO_ACK` could be read as a refusal
+ * — `body[6]` (the first byte of the responder's ephemeral, which is random) became the refusal code
+ * and `body[7]` the id length — roughly one handshake in 256 refusing itself. The machine-id check
+ * below is what makes that collision impossible rather than unlikely: a handshake body's bytes from
+ * offset 8 on are key material, and key material is not a printable machine id.
+ *
+ * @param {Buffer} body
+ * @returns {{session:number, code:number, machineId:string|null, mac:Buffer|null, headerBytes:number,
+ *   bytes:Buffer}|null}
+ */
 export function decodeRefuse(body) {
   if (!Buffer.isBuffer(body) || body.length < 8) return null;
   if (body.readUInt8(0) !== FRAME_MAGIC) return null;
+  if (body.readUInt8(1) !== CRYPTO_VERSION) return null;
   const session = body.readUInt32BE(2);
   const code = body.readUInt8(6);
   const idLength = body.readUInt8(7);
-  if (body.length !== 8 + idLength) return null;
-  const machineId = idLength > 0 ? body.subarray(8, 8 + idLength).toString('utf8') : null;
-  return { session, code, machineId };
+  if (idLength > MAX_HANDSHAKE_MACHINE_ID) return null;
+  const headerBytes = 8 + idLength;
+  if (body.length !== headerBytes && body.length !== headerBytes + MAC_BYTES) return null;
+  let machineId = null;
+  if (idLength > 0) {
+    machineId = body.subarray(8, headerBytes).toString('utf8');
+    // Same rule, and the same reason, as `decodeHello`: no build produces a control byte in a machine
+    // id, and one that arrives would put a delimiter into a log line.
+    // eslint-disable-next-line no-control-regex -- rejecting control bytes is the point
+    if (/[\u0000-\u001f\u007f]/.test(machineId)) return null;
+  }
+  const mac = body.length === headerBytes + MAC_BYTES
+    ? Buffer.from(body.subarray(headerBytes, headerBytes + MAC_BYTES))
+    : null;
+  return { session, code, machineId, mac, headerBytes, bytes: Buffer.from(body) };
+}
+
+/**
+ * The transcript a refusal MAC is taken over: the label, then the refusal exactly as it goes on the
+ * wire *without* its MAC. Recomputed by the receiver from the bytes it holds, never sent separately.
+ *
+ * @param {Buffer} body The refusal body without the trailing MAC.
+ * @returns {Buffer} 32 bytes.
+ */
+export function refuseTranscript(body) {
+  return handshakeHash(REFUSE_MAC_LABEL, body);
+}
+
+/**
+ * A refusal with proof attached, for every responder that received a parseable `HELLO`.
+ *
+ * @param {number} session
+ * @param {number} code
+ * @param {string|null} machineId
+ * @param {Buffer} macKey `k_ref`, from {@link refusalMacKey}.
+ * @returns {Buffer}
+ */
+export function sealRefuse(session, code, machineId, macKey) {
+  const body = encodeRefuse(session, code, machineId);
+  return encodeRefuse(session, code, machineId, sealMac(macKey, refuseTranscript(body)));
+}
+
+/**
+ * The MAC key a refusal is sealed with: `k_ref = HKDF(ECDH(e_i, s_r), REFUSE_MAC_LABEL)`.
+ *
+ * Both ends derive it from material the *other* end published, and neither needs the other's static
+ * public key to be on file: the initiator passes its own ephemeral private key and the responder's
+ * static public key, the responder passes its own static private key and the initiator's ephemeral
+ * public key from the `HELLO`. An attacker who has neither private key cannot derive it, which is
+ * what makes a sealed refusal evidence rather than a claim.
+ *
+ * @param {object} input
+ * @param {import('node:crypto').KeyObject} input.privateKey `e_i`'s private half (initiator) or `s_r`
+ *   (responder).
+ * @param {Buffer} input.peerPublicRaw 32 raw bytes of `s_r` (initiator) or `e_i` (responder).
+ * @returns {Buffer} 32 bytes.
+ */
+export function refusalMacKey({ privateKey, peerPublicRaw }) {
+  if (!Buffer.isBuffer(peerPublicRaw) || peerPublicRaw.length !== KEY_BYTES) {
+    throw new TypeError(`refusalMacKey: the peer public key must be ${KEY_BYTES} raw bytes`);
+  }
+  return derive(diffieHellman({ privateKey, publicKey: publicKeyFromRaw(peerPublicRaw) }), REFUSE_MAC_LABEL);
+}
+
+/**
+ * Verify the optional MAC on a received refusal.
+ *
+ * @param {Buffer|null} macKey `k_ref`, or null when this end has nothing to check with.
+ * @param {Buffer} body The whole refusal body as received.
+ * @returns {boolean|null} `null` when the body carries no MAC (or is not a refusal at all), otherwise
+ *   whether it verifies. `false` is never "unknown" — it is a MAC that was present and wrong.
+ */
+export function verifyRefuseMac(macKey, body) {
+  const decoded = decodeRefuse(body);
+  if (decoded === null || decoded.mac === null) return null;
+  if (macKey === null) return false;
+  const expected = sealMac(macKey, refuseTranscript(body.subarray(0, decoded.headerBytes)));
+  return bytesEqual(expected, decoded.mac);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1341,7 +1508,9 @@ export function ackTranscript(helloBytes, responderEphemeralRaw) {
  * @param {string} options.peerMachineId The machine being dialled.
  * @param {string} options.peerPublicKey Its static public key, from the offer or from the relay.
  * @param {number} options.session The punch session.
- * @returns {{body: Buffer, ephemeral: string, session: number, peerMachineId: string, finish: Function}}
+ * @returns {{body: Buffer, ephemeral: string, session: number, peerMachineId: string,
+ *   refusalMacKey: Buffer, finish: Function}} `refusalMacKey` is `k_ref` of {@link refusalMacKey}: what
+ *   this end checks a `REFUSE` against, and the reason a refusal can be evidence rather than a claim.
  */
 export function startHandshake({ deviceKey, peerMachineId, peerPublicKey, session }) {
   const peerRaw = decodeKey(peerPublicKey);
@@ -1364,6 +1533,10 @@ export function startHandshake({ deviceKey, peerMachineId, peerPublicKey, sessio
     ephemeral: encodeKey(ephemeralPublic),
     session,
     peerMachineId,
+    // Derived once, here, from the ephemeral this handshake is about to send: `ECDH(e_i, s_r)`. The
+    // responder derives the same value from that very `e_i` and its own static key, which is what lets
+    // it answer a refusal with proof even when it holds no key for us at all.
+    refusalMacKey: refusalMacKey({ privateKey: ephemeral.privateKey, peerPublicRaw: peerRaw }),
     /**
      * Verify `HELLO_ACK` and hand back the transport session.
      *
@@ -1433,7 +1606,42 @@ export function startHandshake({ deviceKey, peerMachineId, peerPublicKey, sessio
 export function respondHandshake({ deviceKey, body, peerKeys, seen = null }) {
   const hello = decodeHello(body);
   if (hello === null) return { ok: false, reason: CRYPTO_REASON.MALFORMED, refuse: null };
+
+  /** This peer's static public key as filed under its claimed machine id, or null. */
+  const keyFor = (machineId) => {
+    if (machineId === null) return null;
+    return peerKeys instanceof PeerKeyStore
+      ? peerKeys.get(machineId)
+      : (peerKeys.get(machineId) ?? null);
+  };
+
+  /**
+   * `k_ref` for this exchange, from the initiator's `e_i` and our own static key.
+   *
+   * Present whenever the `HELLO` parsed at all, which is every refusal below except `MALFORMED` (which
+   * sends nothing). It is deliberately *not* `k0`: a responder with no key for the initiator — the
+   * sender of `NO_PEER_KEY` — cannot compute `k0`, and a responder with a stale key for it (the sender
+   * of `BAD_MAC`) would produce a `k0` the initiator cannot reproduce either. `k_ref` needs neither.
+   */
+  const initiatorEphemeralRaw = decodeKey(hello.ephemeral);
+  const refusalKey = initiatorEphemeralRaw === null
+    ? null
+    : refusalMacKey({ privateKey: deviceKey.privateKey, peerPublicRaw: initiatorEphemeralRaw });
+  /**
+   * A refusal body: sealed when we can prove it, bare when we cannot.
+   *
+   * @param {number} code
+   * @returns {Buffer}
+   */
+  const refuse = (code) => (refusalKey === null
+    ? encodeRefuse(hello.session, code, deviceKey.machineId)
+    : sealRefuse(hello.session, code, deviceKey.machineId, refusalKey));
+
   if (hello.version !== CRYPTO_VERSION) {
+    // The version is decided before any key is looked at — a peer speaking a different handshake
+    // version must be told *that*, not "unknown peer" — and this refusal stays bare on purpose: the
+    // peer receiving it speaks a body layout this build cannot vouch for, so a trailing field it does
+    // not know about would be worse than useless.
     return {
       ok: false,
       reason: CRYPTO_REASON.VERSION_MISMATCH,
@@ -1441,19 +1649,19 @@ export function respondHandshake({ deviceKey, body, peerKeys, seen = null }) {
     };
   }
 
-  const initiatorKey =
-    hello.machineId === null
-      ? null
-      : peerKeys instanceof PeerKeyStore
-        ? peerKeys.get(hello.machineId)
-        : (peerKeys.get(hello.machineId) ?? null);
+  const initiatorKey = keyFor(hello.machineId);
 
   if (initiatorKey === null) {
-    // Nothing this peer says can be verified, and we will not guess. The refusal is named and
-    // unauthenticated — it proves nothing, and it is the only honest answer available. It says
-    // `NO_PEER_KEY` rather than `UNKNOWN_PEER` because that is what the initiator needs to know: a
-    // handshake is impossible here, so it may use the plaintext channel it would have had before this
-    // work rather than waiting out a timeout.
+    // Nothing this peer says can be verified, and we will not guess. The refusal is named — and it is
+    // *sealed*, because `k_ref` is exactly the proof this case can carry: it says "this datagram came
+    // from the machine that holds the static key you dialled", which is precisely what a peer with no
+    // key on file for us can still prove. `p2p.mjs` turns that into the rule that a refusal which
+    // would choose a plaintext channel needs either this proof or the corroboration of the same
+    // endpoint having acknowledged the punch.
+    //
+    // It says `NO_PEER_KEY` rather than `UNKNOWN_PEER` because that is what the initiator needs to
+    // know: a handshake is impossible here, so it may use the plaintext channel it would have had
+    // before this work rather than waiting out a timeout.
     //
     // This branch has a second, ordinary caller: a handshake from *our own* machine id, which is what
     // a task the relay leased back to the dispatching machine produces. We hold no peer key for
@@ -1461,19 +1669,11 @@ export function respondHandshake({ deviceKey, body, peerKeys, seen = null }) {
     // self-dial has always used. That is the right answer rather than an oversight: a self-connection
     // has no path to protect and must not fail, or a machine would lose the task it dispatched to
     // itself.
-    return {
-      ok: false,
-      reason: CRYPTO_REASON.UNKNOWN_PEER,
-      refuse: encodeRefuse(hello.session, REFUSE.NO_PEER_KEY, deviceKey.machineId),
-    };
+    return { ok: false, reason: CRYPTO_REASON.UNKNOWN_PEER, refuse: refuse(REFUSE.NO_PEER_KEY) };
   }
   const initiatorRaw = decodeKey(initiatorKey);
   if (initiatorRaw === null) {
-    return {
-      ok: false,
-      reason: CRYPTO_REASON.UNKNOWN_PEER,
-      refuse: encodeRefuse(hello.session, REFUSE.UNKNOWN_PEER, deviceKey.machineId),
-    };
+    return { ok: false, reason: CRYPTO_REASON.UNKNOWN_PEER, refuse: refuse(REFUSE.UNKNOWN_PEER) };
   }
 
   const k0 = derive(deviceKey.sharedSecret(initiatorRaw), STATIC_KEY_LABEL);
@@ -1484,12 +1684,10 @@ export function respondHandshake({ deviceKey, body, peerKeys, seen = null }) {
   if (!bytesEqual(hello.mac, expectedMac)) {
     // The peer is known, and its mac is wrong: it does not hold the private key we have on file for
     // it. A distinct code from UNKNOWN_PEER because the responses differ —one means "refresh that
-    // machine's key", the other means "somebody is guessing at names".
-    return {
-      ok: false,
-      reason: CRYPTO_REASON.BAD_MAC,
-      refuse: encodeRefuse(hello.session, REFUSE.BAD_MAC, deviceKey.machineId),
-    };
+    // machine's key", the other means "somebody is guessing at names". Sealed with `k_ref` and not
+    // `k0`, because when our record of *its* key is the stale one, `k0` is a value neither end can
+    // agree on — and this is the refusal whose whole content is "our records disagree".
+    return { ok: false, reason: CRYPTO_REASON.BAD_MAC, refuse: refuse(REFUSE.BAD_MAC) };
   }
 
   const nonceKey = `${hello.machineId}#${hello.session}#${hello.ephemeral}`;

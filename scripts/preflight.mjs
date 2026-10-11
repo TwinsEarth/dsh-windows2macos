@@ -13,13 +13,29 @@
  *
  * So this script is the release process, in the order a release needs it:
  *
- *   1. assert that the gate itself ran            (9 checks, each with a named result)
- *   2. lint: 0 errors
- *   3. mojibake scan: clean over the whole tree
- *   4. the suite declared in package.json#scripts.test
- *   5. pack, then assert against the *packed tarball* -- not the tree
- *   6. the claims that need the tree and the documents (test/claims.test.mjs)
- *   7. a summary line naming counts and the verdict
+ *   1. assert that the gate itself ran            (11 checks, each with a named result)
+ *   2. the wiring: every suite on disk is named by a script, every path a script names exists, and
+ *      each workflow's suite list is *derived* from package.json rather than hand-maintained
+ *   3. lint: 0 errors
+ *   4. mojibake scan: clean over the whole tree
+ *   5. the suite declared in package.json#scripts.test
+ *   6. pack, then assert the tarball against an expectation derived from the **tree**
+ *   7. the claims that need the tree and the documents (test/claims.test.mjs)
+ *   8. a summary line naming counts and the verdict
+ *
+ * WHY STEP 6 SAYS "TREE" AND NOT "files[]"
+ *
+ * The first version of the "files[] complete" check expanded `package.json#files` itself and then
+ * compared that expansion to the packed tarball. Both sides of the comparison came from the same
+ * list, so the check could not fail: delete `CHANGELOG.md`, `docs`, `TROUBLESHOOTING.md`,
+ * `SECURITY.md`, `CONTRIBUTING.md` and the `PROTOCOL*.md` documents from `files[]`, leave the files
+ * where they are, and the check still printed PASS -- with the words "files[] complete" in the
+ * sentence -- over a tarball that had lost its documents. That is v0.5.6's defect (a package missing
+ * its own documents) wearing the name of the gate built to prevent it.
+ *
+ * The expectation is therefore derived from the tree (see "The release contract" below) and can only
+ * be satisfied by declaring a document as shipped or by naming it as excluded **with a reason**. The
+ * one list a defect could previously hide in is now the list the check is measured against.
  *
  * THE RULE THAT MATTERS MOST: A CHECK THAT PRODUCES NO RESULT IS A FAILURE.
  *
@@ -43,17 +59,24 @@
  * UNVERIFIABLE
  *
  * A check may report UNVERIFIABLE instead of PASS or FAIL only when it cannot be measured *here*
- * (a missing host prerequisite, an absent optional tool). An UNVERIFIABLE result does **not** fail
- * the run -- a pre-flight that is permanently red on its author's own machine for an environmental
- * reason is a gate people learn to ignore -- but it is printed in the same block as the verdict, it
- * is counted, and it names the exact thing that could not be measured. It never counts as a pass:
- * "I could not check" and "I checked and it is fine" are different sentences, and this script keeps
- * them different.
+ * (a missing host prerequisite, an absent optional tool) -- and only for a reason on
+ * `ACCEPTED_UNVERIFIABLE` below, which lives in this repository, in the diff, with its justification.
+ * A reason that is not on that list is converted to a FAIL naming the check and the reason.
+ *
+ * That last sentence is the rule this file learned from its own review, and it replaces an earlier
+ * one that read "an UNVERIFIABLE result does **not** fail the run". That rule was an unguarded escape
+ * hatch: switching a check's PASS to `unverifiable('INSTRUMENT: ...')` produced "0 pass, 0 fail,
+ * 2 unverifiable -- GREEN, cleared to bump", which is a gate that has decided in advance to accept
+ * its own inability to measure anything. `compat.yml` states and enforces the opposite rule for a
+ * skipped page assertion; the pre-flight now applies the same discipline to itself. UNVERIFIABLE
+ * still never counts as a pass: "I could not check" and "I checked and it is fine" stay different
+ * sentences, and the first one now has to be one of the sentences this repository has agreed to.
  *
  * Usage:
  *   node scripts/preflight.mjs
  *
- * Exit code: 0 when every check PASSed (UNVERIFIABLE allowed, and reported), 1 otherwise.
+ * Exit code: 0 when every check PASSed (an accepted UNVERIFIABLE is allowed and reported), 1
+ * otherwise -- including when a check reported UNVERIFIABLE for a reason nobody accepted.
  */
 
 import { spawnSync } from 'node:child_process';
@@ -69,7 +92,7 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs';
-import { dirname, join, resolve, sep } from 'node:path';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
@@ -166,7 +189,11 @@ async function run(checks, options = {}) {
       verdict: fail(`${missing.length} check(s) produced no result: ${missing.join('; ')}`),
     });
   }
-  return { results, missing };
+  // The number of *registered* checks that produced a verdict. The self-assertion row above is a
+  // result of the ledger, not a registered check, and counting it in the numerator is how this
+  // script came to print "(4/3 registered check(s) reported)" in a failing run.
+  const reported = checks.filter((check) => counted.get(check.name) === 1).length;
+  return { results, missing, reported };
 }
 
 /** One check's line, plus its note indented underneath. */
@@ -215,14 +242,43 @@ async function checkLedgerCatchesSilence() {
   if (probe.missing.length !== 2) {
     problems.push(`the missing list held ${probe.missing.length} entr(ies), expected 2: ${probe.missing.join('; ')}`);
   }
+  if (probe.reported !== 1) {
+    problems.push(
+      `the run reported ${probe.reported} of 3 registered check(s) as having produced a verdict, expected ` +
+        'exactly 1: the count in the summary must be a count of registered checks, not of result rows',
+    );
+  }
+
+  // The second escape hatch, exercised the same way: UNVERIFIABLE is only allowed for a reason this
+  // repository has accepted, and the classification has to say so for both directions.
+  const classification = classifyUnverifiable([
+    { name: 'selftest: an unaccepted unverifiable', verdict: unverifiable('INSTRUMENT: a plausible-sounding excuse') },
+    { name: 'host bundled-runtime layout (this machine, not the suite env)', verdict: unverifiable("this host's DSH_HOME (C:\\nope) contains no dsh-runtimes/; the rest of the reason does not matter") },
+    { name: 'selftest: a passing check', verdict: pass('this one passed') },
+  ]);
+  const refusedNames = classification.refused.map((row) => row.name);
+  const acceptedNames = classification.accepted.map((row) => row.name);
+  if (refusedNames.length !== 1 || refusedNames[0] !== 'selftest: an unaccepted unverifiable') {
+    problems.push(
+      `an UNVERIFIABLE with an unaccepted reason was not refused (refused: ${refusedNames.join(', ') || 'nothing'})`,
+    );
+  }
+  if (acceptedNames.length !== 1 || acceptedNames[0] !== 'host bundled-runtime layout (this machine, not the suite env)') {
+    problems.push(`the accepted host-layout reason was not accepted (accepted: ${acceptedNames.join(', ') || 'nothing'})`);
+  }
 
   const detail =
     `silent->${silentStatus}, throwing->${throwStatus}, honest->${honestStatus}, ` +
-    `run self-assertion->${ledgerStatus}, missing=${probe.missing.length}`;
+    `run self-assertion->${ledgerStatus}, missing=${probe.missing.length}, reported=${probe.reported}/3, ` +
+    `unaccepted-UNVERIFIABLE->refused, accepted-UNVERIFIABLE->allowed`;
   if (problems.length > 0) {
     return fail(`the ledger did not catch a check that reports nothing: ${problems.join('; ')}`, detail);
   }
-  return pass('a silent check, a throwing check and an honest one were classified FAIL/FAIL/PASS', detail);
+  return pass(
+    'a silent check, a throwing check and an honest one were classified FAIL/FAIL/PASS; an ' +
+      'UNVERIFIABLE for an unaccepted reason was refused and the accepted one was allowed',
+    detail,
+  );
 }
 
 /* --------------------------------------------------------------------------------------------- */
@@ -267,6 +323,787 @@ function tail(result, lines = 8) {
 }
 
 /* --------------------------------------------------------------------------------------------- */
+/* The release contract: what a shipped artifact must carry, derived from the TREE                 */
+/* --------------------------------------------------------------------------------------------- */
+
+/**
+ * The one rule this whole section exists for: **the shipped set may not describe itself**.
+ *
+ * A check that builds its expectation by expanding `package.json#files` and then compares that
+ * expansion to the tarball is satisfied by editing either side of its own comparison. It cannot
+ * report the defect it is named after. (Measured: dropping `CHANGELOG.md`, `docs`,
+ * `TROUBLESHOOTING.md`, `SECURITY.md`, `CONTRIBUTING.md` and the `PROTOCOL*.md` documents from
+ * `files[]` left every gate green over a tarball that no longer carried them.)
+ *
+ * So the expectation is derived from the tree -- every root `*.md`, every file under `docs/`, and
+ * every path the manifest itself points at -- and each item must be either shipped or named as
+ * excluded, in this file, with a reason. `test/claims.test.mjs` imports the same functions, so the
+ * rule has exactly one implementation and both callers are measured against it.
+ */
+
+/** Directories whose every file is a document this package documents itself with. */
+export const DOCUMENT_DIRECTORIES = ['docs'];
+
+/**
+ * Documents in the tree that are deliberately NOT shipped, each with the reason a reviewer reads.
+ *
+ * This list is the **only** way a document may be absent from the tarball. It is deliberately not a
+ * field of `package.json`: the point of the exercise is that the shipped set must not be able to
+ * describe itself into completeness, so each exception lives next to the rule it bends, in the diff,
+ * in words. Removing a row turns the check red; adding a document to the tree without a row turns it
+ * red too.
+ */
+export const DOCUMENT_EXCLUSIONS = [
+  {
+    path: 'RELEASE-STATUS.md',
+    reason:
+      'an internal release-status log (Chinese), last updated for v0.4.2 -- five releases stale. It ' +
+      'records past release actions for the maintainer and makes no claim about the shipped ' +
+      'artifact, so it is not part of the documentation set the package ships.',
+  },
+];
+
+/** Below this many characters a "reason" is a shrug, not a reason. */
+const MIN_REASON_LENGTH = 40;
+
+/**
+ * Every file this package documents itself with, read from the tree. Never from `files[]`.
+ *
+ * Root `*.md` and everything under `DOCUMENT_DIRECTORIES`; not recursive over the whole repository,
+ * because `src/**` and `deploy/**` carry module-level notes that ship (or do not) with their own
+ * directory entry and are not part of the package's document set.
+ *
+ * @param {string} root
+ * @returns {string[]} package-relative POSIX paths, sorted.
+ */
+export function treeDocuments(root) {
+  const documents = [];
+  for (const name of readdirSync(root).sort()) {
+    const abs = join(root, name);
+    if (name.toLowerCase().endsWith('.md') && statSync(abs).isFile()) documents.push(name);
+  }
+  for (const directory of DOCUMENT_DIRECTORIES) {
+    const abs = join(root, directory);
+    if (!existsSync(abs)) continue;
+    const walk = (dirAbs, rel) => {
+      for (const child of readdirSync(dirAbs).sort()) {
+        const childAbs = join(dirAbs, child);
+        const info = statSync(childAbs);
+        if (info.isDirectory()) walk(childAbs, `${rel}/${child}`);
+        else if (info.isFile()) documents.push(`${rel}/${child}`);
+      }
+    };
+    walk(abs, directory);
+  }
+  return documents.sort();
+}
+
+/**
+ * Mirror of `ALWAYS` in `scripts/pack.mjs`, which the packer adds whether or not `files` names them.
+ *
+ * Kept here rather than imported because that file is a script, not a module; the packing check
+ * asserts every one of these is in the tarball, so a change to the packer's list is a red line in
+ * this file rather than a silent difference in what ships.
+ */
+export const PACKER_ALWAYS = ['package.json', 'README.md', 'LICENSE'];
+
+/**
+ * Every file the `files` globs expand to in the tree, as package-relative POSIX paths.
+ *
+ * This is the *declared* side. Nothing here may be used as the expectation for what a release must
+ * carry -- that is `documentContract()` and `requiredShippedEntries()`, both derived from the tree.
+ *
+ * @param {string} root
+ * @param {string[]} files
+ * @returns {string[]}
+ */
+export function packageFilesExpansion(root, files) {
+  const collected = [];
+  const walk = (abs, rel) => {
+    const info = statSync(abs);
+    if (info.isDirectory()) {
+      for (const childName of readdirSync(abs).sort()) {
+        walk(join(abs, childName), `${rel}/${childName}`);
+      }
+      return;
+    }
+    if (info.isFile()) collected.push(rel);
+  };
+  for (const entry of files ?? []) {
+    const abs = join(root, entry);
+    if (existsSync(abs)) walk(abs, entry.replace(/^\.\//, ''));
+  }
+  for (const name of PACKER_ALWAYS) {
+    if (existsSync(join(root, name)) && !collected.includes(name)) collected.push(name);
+  }
+  return collected.sort();
+}
+
+/**
+ * The tree-to-tarball ledger for documents: which documents exist, which are shipped, which are
+ * excluded with a reason, and every problem that makes one of those answers unusable.
+ *
+ * @param {{root: string, files: string[], exclusions?: Array<{path: string, reason: string}>}} input
+ * @returns {{documents: string[], shipped: string[], excluded: string[], undeclared: string[],
+ *   problems: string[], counts: string}}
+ */
+export function documentContract({ root, files, exclusions = DOCUMENT_EXCLUSIONS }) {
+  const documents = treeDocuments(root);
+  const declared = new Set(packageFilesExpansion(root, files));
+  const problems = [];
+  const rows = new Map();
+
+  for (const row of exclusions) {
+    const path = typeof row?.path === 'string' ? row.path : '';
+    if (path === '') {
+      problems.push('an exclusion row names no path, so it excuses everything and nothing');
+      continue;
+    }
+    if (rows.has(path)) problems.push(`two exclusion rows name ${path}`);
+    rows.set(path, row);
+    const reason = typeof row.reason === 'string' ? row.reason.trim() : '';
+    if (reason.length < MIN_REASON_LENGTH) {
+      problems.push(
+        `the exclusion of ${path} gives no usable reason (${reason.length} character(s), ${MIN_REASON_LENGTH} ` +
+          'required): an exclusion without a stated reason is an omission with paperwork',
+      );
+    }
+    if (!existsSync(join(root, path))) {
+      problems.push(
+        `the exclusion of ${path} is stale: there is no such file in the tree, so the row excuses ` +
+          'nothing and hides the next document that takes its name',
+      );
+    }
+    if (declared.has(path)) {
+      problems.push(
+        `${path} is both declared in package.json#files and listed as excluded; one of the two is a ` +
+          'mistake and this check will not guess which',
+      );
+    }
+  }
+
+  const shipped = [];
+  const undeclared = [];
+  for (const document of documents) {
+    if (declared.has(document)) shipped.push(document);
+    else if (!rows.has(document)) undeclared.push(document);
+  }
+  if (undeclared.length > 0) {
+    problems.push(
+      `${undeclared.length} document(s) in the tree are neither declared in package.json#files nor ` +
+        `named in DOCUMENT_EXCLUSIONS with a reason: ${undeclared.join(', ')}. Add each to "files" or ` +
+        'to the exclusion list in scripts/preflight.mjs -- a document nobody decided about is the ' +
+        'v0.5.6 defect (a package missing its own documents).',
+    );
+  }
+
+  const excluded = [...rows.keys()].filter((path) => !declared.has(path)).sort();
+  const counts =
+    `tree documents: ${documents.length}; shipped: ${shipped.length}; excluded with a reason: ` +
+    `${excluded.length} (${excluded.join(', ') || 'none'}); neither: ${undeclared.length}`;
+  return { documents, shipped, excluded, undeclared, problems, counts };
+}
+
+/**
+ * Paths the manifest itself points at, which therefore must be inside the tarball: an entry point
+ * that does not ship resolves to nothing on the user's machine, and `dsh.bundle.patch` that does not
+ * ship means the plugin never mounts.
+ *
+ * Read from `main`, `exports`, `bin` and `dsh.bundle.patch` -- i.e. from the fields that must agree
+ * with reality for the package to be loadable at all, not from `files`.
+ *
+ * @param {object} manifest
+ * @returns {Array<{field: string, path: string}>}
+ */
+export function requiredShippedEntries(manifest) {
+  const required = [];
+  const add = (field, value, { relative = false } = {}) => {
+    if (typeof value !== 'string' || value.trim() === '') return;
+    if (relative && !value.startsWith('./')) return;
+    const path = value.replace(/^\.\//, '');
+    if (path.startsWith('node:') || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(path)) return;
+    required.push({ field, path });
+  };
+  add('main', manifest.main);
+  for (const [subpath, target] of Object.entries(manifest.exports ?? {})) {
+    add(`exports["${subpath}"]`, target, { relative: true });
+  }
+  for (const [name, target] of Object.entries(manifest.bin ?? {})) add(`bin["${name}"]`, target);
+  add('dsh.bundle.patch', manifest.dsh?.bundle?.patch);
+  return required;
+}
+
+/**
+ * Manifest fields allowed to differ between the tree and the packed copy. **None**, and that is a
+ * measurement rather than a hope: `scripts/pack.mjs` packs `package.json`'s bytes verbatim, so a
+ * single differing field means the published manifest is not the manifest that was reviewed -- which
+ * is how a release loses `engines`, `disclosure` or `peerDependencies` while "the packed manifest is
+ * the tree's manifest" stays green on a `version`-only comparison.
+ *
+ * The list stays as a parameter so that a future packer which must rewrite a field has exactly one
+ * place to say so, in the diff, with a reason -- instead of the comparison being loosened globally.
+ */
+export const ALLOWED_MANIFEST_DIFFERENCES = [];
+
+/**
+ * Every difference between two manifest-shaped values, as `path: tree=X packed=Y` lines.
+ *
+ * @param {unknown} tree
+ * @param {unknown} packed
+ * @param {string[]} allowed top-level fields that may differ (see ALLOWED_MANIFEST_DIFFERENCES).
+ * @returns {string[]}
+ */
+export function manifestDifferences(tree, packed, allowed = ALLOWED_MANIFEST_DIFFERENCES) {
+  const show = (value) => (value === undefined ? '(absent)' : JSON.stringify(value));
+  const differences = [];
+  const walk = (a, b, path) => {
+    if (Array.isArray(a) || Array.isArray(b)) {
+      if (!Array.isArray(a) || !Array.isArray(b)) {
+        differences.push(`${path}: tree=${show(a)} packed=${show(b)}`);
+        return;
+      }
+      if (a.length !== b.length) {
+        differences.push(`${path}: tree has ${a.length} entr(ies), packed has ${b.length}`);
+      }
+      for (let i = 0; i < Math.max(a.length, b.length); i += 1) walk(a[i], b[i], `${path}[${i}]`);
+      return;
+    }
+    const objectLike = (value) => value !== null && typeof value === 'object';
+    if (objectLike(a) && objectLike(b)) {
+      const keys = [...new Set([...Object.keys(a), ...Object.keys(b)])].sort();
+      for (const key of keys) walk(a[key], b[key], path === '' ? key : `${path}.${key}`);
+      return;
+    }
+    if (!Object.is(a, b)) differences.push(`${path}: tree=${show(a)} packed=${show(b)}`);
+  };
+  walk(tree, packed, '');
+  // A difference line reads `path: tree=... packed=...`, so an allowed top-level field covers every
+  // line whose path is that field or something under it. (Measured: an earlier version compared the
+  // whole line to the field name and therefore filtered nothing at all -- the suite's own
+  // falsifying assertion caught it.)
+  return differences.filter(
+    (line) =>
+      !allowed.some(
+        (field) => line.startsWith(`${field}:`) || line.startsWith(`${field}.`) || line.startsWith(`${field}[`),
+      ),
+  );
+}
+
+/**
+ * The two workflows that gate a push to `main` and a tag, and therefore must run the suite the
+ * release declares. Named explicitly, and the check reports it as a problem when one of them is
+ * missing, so a rename cannot quietly take a gate with it.
+ *
+ * `compat.yml` is deliberately not on this list: its `mount-and-boot` job is a targeted single-suite
+ * gate whose own TAP verdict program decides it (and its other two jobs run no suite at all), and
+ * `ci.yml`'s `live-api` job is documented in that file as non-blocking.
+ */
+export const GATING_WORKFLOWS = ['ci.yml', 'release.yml'];
+
+/**
+ * Every `run:` scalar in a workflow file, as text.
+ *
+ * A deliberately crude YAML read: this file must not grow a YAML dependency, and the shape it
+ * depends on -- `run:` followed by an inline command or a block scalar -- is asserted by the check
+ * that uses it (a workflow whose suite list cannot be read is a failure, not an empty list).
+ *
+ * @param {string} text
+ * @returns {string[]}
+ */
+export function workflowRunBlocks(text) {
+  const lines = String(text).split(/\r?\n/);
+  const blocks = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    const match = /^([ \t]*)(?:-[ \t]+)?run:[ \t]*(.*)$/.exec(lines[i]);
+    if (match === null) continue;
+    const [, indent, inline] = match;
+    const value = inline.trim();
+    if (value !== '' && !/^[|>][-+]?$/.test(value)) {
+      blocks.push(value);
+      continue;
+    }
+    const body = [];
+    for (let j = i + 1; j < lines.length; j += 1) {
+      if (lines[j].trim() === '') {
+        body.push('');
+        continue;
+      }
+      const deeper = /^([ \t]*)\S/.exec(lines[j]);
+      if (deeper === null || deeper[1].length <= indent.length) break;
+      body.push(lines[j]);
+    }
+    blocks.push(body.join('\n'));
+  }
+  return blocks;
+}
+
+/**
+ * The loader gate must keep running on the two occasions that matter: every pull request, and every
+ * release tag.
+ *
+ * `compat.yml`'s `mount-and-boot` job is the only place in this repository where the packed artifact is
+ * mounted by the *real* Loader, activated through the real client-module system, and -- with a browser
+ * -- booted as a page that the real shell accepts. That last assertion is the only oracle the client
+ * *seat* has: `lib/client.js`, `test/client-bundle.test.mjs` and `test/loader-entry.test.mjs` each
+ * carry the seat literal `conversation.input.left`, and the activation helper mounts a stand-in slot
+ * registry that records whatever key the entry injects, so a consistent three-way rename in this
+ * repository would satisfy all three of our own copies while the shell disagreed. The seat table lives
+ * in the shell (the helper says so: "the seat service the shell provides from its seed table") and is
+ * not reachable from a checkout -- measured: no file in the installed tree at
+ * `resources/app.asar/dsh` contains the literal. The page boot therefore cannot be replaced by a
+ * cheaper check, and it must not quietly stop running.
+ *
+ * Pure, on the workflow text, so both directions can be exercised.
+ *
+ * @param {string} text
+ * @returns {string[]}
+ */
+export function loaderGateTriggerProblems(text) {
+  const problems = [];
+  const head = String(text).split(/\r?\njobs:/)[0] ?? '';
+  if (!/pull_request:/.test(head)) {
+    problems.push(
+      'compat.yml does not run on pull requests, so the packed artifact is never mounted by the real ' +
+        'Loader before it is merged',
+    );
+  }
+  if (!/tags:\s*\[[^\]]*v\*/.test(head)) {
+    problems.push(
+      'compat.yml does not run on `v*` tags, so a release can be published without the one gate that ' +
+        'mounts the packed artifact in a real Loader and boots its page. That page boot is the only ' +
+        'assertion in this repository made against the real shell rather than against our own copy of it',
+    );
+  }
+  return problems;
+}
+
+/**
+ * Which suites each workflow runs, and how that follows from `package.json#scripts`.
+ *
+ * This is what stops the suite list from being maintained twice. A workflow that runs `npm test`
+ * runs whatever `scripts.test` names *today*; a workflow that hand-lists twenty-three paths runs
+ * those twenty-three forever, which is how six suites that exist, are in `scripts.test`, and were
+ * named by a script came to run in no workflow at all -- while release.yml carried a comment saying
+ * "a new suite is invisible to the release gate until it is added here ... that has bitten this
+ * project once already".
+ *
+ * @param {{root: string, workflows: Array<string|{name: string, text: string}>, scripts: object}} input
+ *   `workflows` entries are either a file name under `.github/workflows/`, or `{name, text}` so a
+ *   synthetic workflow can be measured against the same rule (this is what the claims suite does).
+ * @returns {{perWorkflow: Array<{workflow: string, covered: Map<string,string>, literal: string[],
+ *   invocations: string[]}>, releaseSuite: string[], namedByAnyScript: string[], problems: string[]}}
+ */
+export function workflowSuiteCoverage({ root, workflows, scripts }) {
+  const namedByAnyScript = new Set();
+  for (const text of Object.values(scripts ?? {})) {
+    for (const file of scriptTestFiles(String(text))) namedByAnyScript.add(file);
+  }
+
+  const perWorkflow = [];
+  const problems = [];
+
+  for (const entry of workflows) {
+    const name = typeof entry === 'string' ? entry : entry.name;
+    let text = null;
+    if (typeof entry === 'string') {
+      const file = join(root, '.github', 'workflows', name);
+      if (!existsSync(file)) {
+        problems.push(`.github/workflows/${name} does not exist, so the suites it runs cannot be read`);
+        continue;
+      }
+      text = readFileSync(file, 'utf8');
+    } else {
+      text = entry.text;
+    }
+
+    const covered = new Map();
+    const literal = new Set();
+    const invocations = [];
+    /** `covered` is filled first-wins, so the report names the plainest reason a suite runs. */
+    const cover = (file, how) => {
+      if (!covered.has(file)) covered.set(file, how);
+    };
+
+    for (const block of workflowRunBlocks(text)) {
+      for (const line of block.split('\n')) {
+        if (!/\bnode\s+--test\b/.test(line)) continue;
+        const paths = scriptTestFiles(line);
+        for (const file of paths) {
+          literal.add(file);
+          cover(file, `${name} names it directly`);
+        }
+        if (paths.length >= 2) {
+          problems.push(
+            `${name} hand-lists ${paths.length} suite paths on one \`node --test\` line (${paths
+              .slice(0, 3)
+              .join(', ')}${paths.length > 3 ? ', ...' : ''}). A list maintained beside ` +
+              'package.json#scripts.test goes stale the first time a suite is added: run the script ' +
+              '(`npm test`, `npm run test:e2e`) instead, or name a single suite.',
+          );
+        }
+      }
+
+      for (const match of block.matchAll(/\bnpm\s+(?:run\s+)?([A-Za-z0-9:_.-]+)/g)) {
+        const scriptName = match[1];
+        if (typeof scripts?.[scriptName] !== 'string') continue;
+        const how = `npm ${scriptName === 'test' ? 'test' : `run ${scriptName}`}`;
+        invocations.push(how);
+        for (const file of scriptTestFiles(scripts[scriptName])) cover(file, how);
+      }
+
+      if (/\bnode\s+scripts\/preflight\.mjs\b/.test(block) && typeof scripts?.test === 'string') {
+        // The pre-flight runs `scripts.test` as its "declared suite" check, which is exactly what
+        // `scripts/preflight.mjs`'s checkTestSuite() asserts in every run -- so a workflow that
+        // invokes it does run the release suite. If that ever stops being true, the pre-flight's own
+        // declared-suite check goes red on the same run, so this is not a claim without a checker.
+        invocations.push('scripts/preflight.mjs (runs package.json#scripts.test)');
+        for (const file of scriptTestFiles(scripts.test)) {
+          cover(file, 'scripts/preflight.mjs (runs package.json#scripts.test)');
+        }
+      }
+    }
+
+    perWorkflow.push({
+      workflow: name,
+      covered,
+      literal: [...literal].sort(),
+      invocations: [...new Set(invocations)],
+    });
+  }
+
+  const releaseSuite = scriptTestFiles(String(scripts?.test ?? ''));
+  if (releaseSuite.length === 0) {
+    problems.push(
+      'package.json#scripts.test names no suite, so "the release suite runs in CI" cannot be measured',
+    );
+  }
+
+  for (const gating of GATING_WORKFLOWS) {
+    const entry = perWorkflow.find((p) => p.workflow === gating);
+    if (entry === undefined) continue; // already reported as missing above
+    const missing = releaseSuite.filter((file) => !entry.covered.has(file));
+    if (missing.length > 0) {
+      problems.push(
+        `.github/workflows/${gating} runs ${releaseSuite.length - missing.length} of the ` +
+          `${releaseSuite.length} suite(s) declared by package.json#scripts.test; missing: ` +
+          `${missing.join(', ')}. A version bump with no CHANGELOG entry, which the claims suite ` +
+          'catches, must be caught by something automatic.',
+      );
+    }
+  }
+
+  const union = new Set();
+  for (const entry of perWorkflow) for (const file of entry.covered.keys()) union.add(file);
+  const orphaned = [...namedByAnyScript].sort().filter((file) => !union.has(file));
+  if (orphaned.length > 0) {
+    problems.push(
+      `${orphaned.length} suite(s) are named by an npm script and run in no workflow: ` +
+        `${orphaned.join(', ')}. A test that does not run protects nothing.`,
+    );
+  }
+
+  const absent = [];
+  for (const entry of perWorkflow) {
+    for (const file of entry.literal) {
+      if (!existsSync(join(root, file))) absent.push(`${entry.workflow} names ${file}, which does not exist`);
+    }
+  }
+  if (absent.length > 0) problems.push(...absent);
+
+  return { perWorkflow, releaseSuite, namedByAnyScript: [...namedByAnyScript].sort(), problems };
+}
+
+/* --------------------------------------------------------------------------------------------- */
+/* The two accepted lists: what this repository agrees not to measure, and why                     */
+/* --------------------------------------------------------------------------------------------- */
+
+/**
+ * THE ACCEPTED-UNVERIFIABLE LIST.
+ *
+ * An UNVERIFIABLE check is a hole in the evidence, and a hole nobody has to justify is an escape
+ * hatch. Each entry names the check it applies to, the pattern its *reason* must match, and why this
+ * repository accepts that hole. A reason that matches nothing here is turned into a FAIL by
+ * `classifyUnverifiable()`.
+ *
+ * One entry today, and it is the one thing this machine genuinely cannot measure: the layout of the
+ * *host's own* bundled runtime. That is a fact about the machine, not about the artifact, and
+ * pretending otherwise would be the more expensive mistake.
+ */
+export const ACCEPTED_UNVERIFIABLE = [
+  {
+    key: 'host-runtime-layout',
+    appliesTo: 'host bundled-runtime layout (this machine, not the suite env)',
+    match: /^this host's DSH_HOME \((?:.|\n)*\) contains no dsh-runtimes\//,
+    why:
+      'the host\'s own bundled-runtime layout is a property of the machine, not of the artifact; the ' +
+      'suite is run against a throwaway home that has the documented layout, and this row is the ' +
+      'honest record of what the machine itself has',
+  },
+];
+
+/**
+ * Split a run's UNVERIFIABLE rows into the accepted ones and the refused ones.
+ *
+ * @param {Array<{name: string, verdict: {status: string, reason: string, note?: string}}>} rows
+ * @param {Array<object>} accepted
+ * @returns {{accepted: Array<{name: string, entry: object}>, refused: Array<{name: string, reason: string, note?: string}>}}
+ */
+export function classifyUnverifiable(rows, accepted = ACCEPTED_UNVERIFIABLE) {
+  const acceptedRows = [];
+  const refused = [];
+  for (const row of rows) {
+    if (row.verdict?.status !== 'UNVERIFIABLE') continue;
+    const entry = accepted.find(
+      (candidate) =>
+        (candidate.appliesTo === undefined || candidate.appliesTo === row.name) &&
+        candidate.match.test(row.verdict.reason),
+    );
+    if (entry === undefined) refused.push({ name: row.name, reason: row.verdict.reason, note: row.verdict.note });
+    else acceptedRows.push({ name: row.name, entry });
+  }
+  return { accepted: acceptedRows, refused };
+}
+
+/**
+ * THE ACCEPTED-SKIP LIST.
+ *
+ * A skipped assertion is a claim that did not run. The declared suite contributes fourteen of them
+ * on a developer's machine, ten of those being the whole loader gate -- so "clean, N skips" was a
+ * sentence in which the strongest assertion set in the repository never ran, and the count itself
+ * drifted between runs with no way to see which assertion had moved.
+ *
+ * Each entry is keyed on the *enclosing suite* and on the skip's own reason, and caps how many times
+ * it may happen: a cap that is exceeded means an assertion was added, removed or started skipping,
+ * and that is a question for a human rather than a number to recompute. A skip matching nothing here
+ * is a FAIL naming the suite, the assertion and the reason.
+ */
+export const ACCEPTED_SKIPS = [
+  {
+    key: 'no-loader-installation',
+    suite: /^loader entry: the packed artifact/,
+    match: /^no DeepSeek Harness installation found to drive the real Loader\b/,
+    maxCount: 10,
+    why:
+      'test/loader-entry.test.mjs drives a real DSH installation; on a machine without one every ' +
+      'assertion in that single suite skips, and .github/workflows/compat.yml is where it runs ' +
+      'against a pinned host instead',
+  },
+  {
+    key: 'network-half-not-enabled',
+    suite: /^release tarball claims \(GitHub Release assets\)$/,
+    match: /^network check not enabled: could not reach https:\/\/github\.com\//,
+    maxCount: 1,
+    why: 'the one network-dependent claim in test/claims.test.mjs; run it with W2M_NETWORK_TESTS=1',
+  },
+  {
+    key: 'network-half-forced-off',
+    suite: /^release tarball claims \(GitHub Release assets\)$/,
+    match: /^W2M_SKIP_NETWORK_TESTS=1:/,
+    maxCount: 1,
+    why: 'the same claim, with the network explicitly disabled by the operator',
+  },
+  {
+    key: 'live-github-api-not-enabled',
+    suite: /^real GitHub API \(network\)$/,
+    match: /^explicitly skipped: set W2M_NETWORK_TESTS=1/,
+    maxCount: 1,
+    why:
+      'test/update-source.test.mjs\'s live API case; ci.yml runs it with the workflow token in a ' +
+      'non-blocking job, and the mocked coverage of the same paths always runs',
+  },
+  {
+    key: 'ntfs-has-no-posix-bits',
+    suite: /^identity: device\.json$/,
+    match: /^NTFS has no POSIX bits/,
+    maxCount: 1,
+    why: 'a 0600 permission assertion that only a POSIX filesystem can evaluate; it runs on the macOS and Linux legs of ci.yml',
+  },
+  {
+    key: 'windows-is-not-a-posix-shell',
+    suite: /^executable resolution/,
+    match: /^a POSIX shell script is not a Windows executable/,
+    maxCount: 1,
+    why: 'a bundled-tool resolution probe that needs a POSIX shell script; it runs on the macOS and Linux legs of ci.yml',
+  },
+];
+
+/**
+ * Every skip in a TAP capture, with the suite that encloses it and the reason it gave.
+ *
+ * The nesting is read rather than guessed: `node --test`'s TAP reporter emits `# Subtest: <name>`
+ * lines with increasing indentation, and a result row belongs to the nearest subtest that encloses
+ * it. (Measured against a real capture: a skipped assertion is printed as
+ * `    # Subtest: <test name>` followed by `    ok N - <test name> # SKIP <reason>`, and the suite
+ * that encloses it is the `# Subtest:` line above it at a lower indentation.)
+ *
+ * @param {string} text
+ * @returns {Array<{suite: string, name: string, reason: string}>}
+ */
+export function tapSkips(text) {
+  const stack = [];
+  const skips = [];
+  for (const line of String(text).replace(/\r\n/g, '\n').split('\n')) {
+    const subtest = /^([ \t]*)# Subtest: (.*)$/.exec(line);
+    if (subtest !== null) {
+      const indent = subtest[1].length;
+      while (stack.length > 0 && stack[stack.length - 1].indent >= indent) stack.pop();
+      stack.push({ indent, name: subtest[2].trim() });
+      continue;
+    }
+    const row = /^([ \t]*)(?:not ok|ok) \d+ - (.*)$/.exec(line);
+    if (row === null) continue;
+    const skip = / # skip ?(.*)$/i.exec(row[2]);
+    if (skip === null) continue;
+    const indent = row[1].length;
+    const enclosing = [...stack].reverse().find((frame) => frame.indent < indent);
+    skips.push({
+      suite: enclosing?.name ?? '(no enclosing suite name in the capture)',
+      name: row[2].slice(0, skip.index).trim(),
+      reason: skip[1].trim(),
+    });
+  }
+  return skips;
+}
+
+/**
+ * Classify every skip in a run against `ACCEPTED_SKIPS`.
+ *
+ * @param {Array<{suite: string, name: string, reason: string}>} skips
+ * @param {Array<object>} accepted
+ * @returns {{problems: string[], counts: Map<string, number>, lines: string[]}}
+ */
+export function classifySkips(skips, accepted = ACCEPTED_SKIPS) {
+  const problems = [];
+  const counts = new Map();
+  const lines = [];
+  for (const skip of skips) {
+    const entry = accepted.find((row) => row.suite.test(skip.suite) && row.match.test(skip.reason));
+    if (entry === undefined) {
+      problems.push(
+        `"${skip.suite} > ${skip.name}" was SKIPPED and its reason is not on the accepted list: ` +
+          `${skip.reason === '' ? '(no reason given)' : skip.reason}. An assertion that did not run is a ` +
+          'hole in this run: make it run, or add a justified entry to ACCEPTED_SKIPS in ' +
+          'scripts/preflight.mjs.',
+      );
+      continue;
+    }
+    const seen = (counts.get(entry.key) ?? 0) + 1;
+    counts.set(entry.key, seen);
+    if (seen > entry.maxCount) {
+      problems.push(
+        `the accepted skip "${entry.key}" happened ${seen} time(s) and this repository accepts at ` +
+          `most ${entry.maxCount} (${entry.why}). Either an assertion was added that also skips, or one ` +
+          'that used to run now skips; both are questions for a human, not a number to raise.',
+      );
+    }
+    lines.push(`  ${entry.key}: ${skip.suite} > ${skip.name} -- ${skip.reason}`);
+  }
+  return { problems, counts, lines };
+}
+
+/**
+ * The plan: every check this pre-flight runs, by name, in the order it runs them.
+ *
+ * Exported because it is a *claim about the gate*, and a claim nothing checks is what this file is
+ * about. Three independent lists now describe the same run -- this plan, the implementations bound to
+ * each name in `main()`, and `GATE_INVENTORY` (which binds each repository artifact to the check that
+ * measures it) -- and `test/claims.test.mjs` asserts that they agree. Deleting a check therefore
+ * requires three coordinated edits rather than one: removing it from the run throws (no implementation
+ * bound), removing it from this plan leaves an artifact with no measuring check, and removing both
+ * from here and from the inventory is a deliberate edit that only review can catch -- the honest limit
+ * of what a file can assert about itself.
+ */
+export const DECLARED_CHECKS = [
+  'gate inventory (every gate exists and is bound to the registered check that measures it)',
+  'ledger self-test (silence and an unaccepted UNVERIFIABLE are both failures)',
+  'test wiring (every suite on disk is named by a script; the release suite and the rest are reported)',
+  'workflow wiring (ci.yml and release.yml run the suite scripts.test declares)',
+  'entry points (scripts/check-entrypoints.mjs)',
+  'lint (0 errors required)',
+  'mojibake scan (whole tree, plus a positive control)',
+  'declared suite (package.json#scripts.test, skips itemized)',
+  'packed tarball (tree-derived documents + entry points, whole manifest, forbidden paths, 8 tools from the pack)',
+  'claims (test/claims.test.mjs, reused not reimplemented)',
+  'CHANGELOG shape (title above the newest entry, newest-first)',
+];
+
+/**
+ * The gate inventory: which repository artifact each check is the measurement of.
+ *
+ * `checkGateInventory()` used to assert that five files exist, and nothing else -- so a check could be
+ * deleted together with its function and the run stayed green (`checks registered: 8 ... 8 pass,
+ * 0 fail`) while the inventory line still printed `claims=present`. A file existing is not a
+ * measurement of it.
+ *
+ * So every row below binds an artifact to the *name* of the check that measures it, and the check
+ * enforces the relation in both directions: every named check must be registered, and every
+ * registered check must be named by some row. Deleting a check makes its artifact unmeasured (red);
+ * deleting a row leaves a check that measures nothing declared (red). Deleting both is a deliberate
+ * edit that only review can catch -- and it is a visible diff, which is the honest limit of what a
+ * file can assert about itself.
+ */
+export const GATE_INVENTORY = [
+  { artifact: 'eslint entry point', path: 'node_modules/eslint/bin/eslint.js', checkedBy: 'lint (0 errors required)' },
+  { artifact: 'mojibake scanner', path: 'scripts/scan-mojibake.mjs', checkedBy: 'mojibake scan (whole tree, plus a positive control)' },
+  { artifact: 'entry-point check', path: 'scripts/check-entrypoints.mjs', checkedBy: 'entry points (scripts/check-entrypoints.mjs)' },
+  { artifact: 'packer', path: 'scripts/pack.mjs', checkedBy: 'packed tarball (tree-derived documents + entry points, whole manifest, forbidden paths, 8 tools from the pack)' },
+  { artifact: 'installed-copy probe', path: 'scripts/verify-installed.mjs', checkedBy: 'packed tarball (tree-derived documents + entry points, whole manifest, forbidden paths, 8 tools from the pack)' },
+  { artifact: 'claims suite', path: 'test/claims.test.mjs', checkedBy: 'claims (test/claims.test.mjs, reused not reimplemented)' },
+  { artifact: 'declared suite list', path: 'package.json', checkedBy: 'declared suite (package.json#scripts.test, skips itemized)' },
+  { artifact: 'test wiring', path: 'test', checkedBy: 'test wiring (every suite on disk is named by a script; the release suite and the rest are reported)' },
+  { artifact: 'gating workflows', path: '.github/workflows/release.yml', checkedBy: 'workflow wiring (ci.yml and release.yml run the suite scripts.test declares)' },
+  { artifact: 'compiled CHANGELOG', path: 'CHANGELOG.md', checkedBy: 'CHANGELOG shape (title above the newest entry, newest-first)' },
+  { artifact: 'pre-flight ledger', path: 'scripts/preflight.mjs', checkedBy: 'ledger self-test (silence and an unaccepted UNVERIFIABLE are both failures)' },
+  { artifact: 'gate inventory (this table)', path: 'scripts/preflight.mjs', checkedBy: 'gate inventory (every gate exists and is bound to the registered check that measures it)' },
+];
+
+/**
+ * The verdict on a claims-suite run's counts. Zero executed claims is a FAIL naming the count.
+ *
+ * `checkTestSuite()` has guarded `counts.tests === 0` since it was written; `checkClaims()` did not,
+ * so a run in which every claim was skipped (a `describe` made conditional on the wrong thing, a
+ * selector that matched nothing) printed "0 claim(s) checked, 0 pass, 0 skip" and counted as a PASS.
+ * That is verbatim the failure mode this file's own header exists to prevent.
+ *
+ * Pure, and exported, so the refusal can be exercised in both directions by a test rather than
+ * asserted in a comment.
+ *
+ * @param {{tests: number|null, pass: number|null, skipped?: number|null}} counts
+ * @returns {{ok: boolean, reason: string}}
+ */
+export function claimsCountsVerdict(counts) {
+  const tests = counts?.tests ?? null;
+  const pass = counts?.pass ?? null;
+  const skipped = counts?.skipped ?? 0;
+  if (tests === null) {
+    return {
+      ok: false,
+      reason:
+        'the runner printed no test count at all, so whether the claims executed cannot be read ' +
+        'from its output',
+    };
+  }
+  if (tests === 0) {
+    return {
+      ok: false,
+      reason:
+        `0 claim(s) executed (tests=0, pass=${pass ?? 0}, skip=${skipped}). Zero executed claims is a ` +
+        'failure, not a pass: it is what a skipped describe, a renamed group or a selector that ' +
+        'matched nothing looks like from here.',
+    };
+  }
+  if ((pass ?? 0) === 0) {
+    return {
+      ok: false,
+      reason:
+        `${tests} claim(s) were collected and not one of them passed (pass=0, skip=${skipped}); a ` +
+        'suite whose every assertion skipped has measured nothing',
+    };
+  }
+  return { ok: true, reason: `${tests} claim(s) executed, ${pass} pass, ${skipped} skip` };
+}
+
+/* --------------------------------------------------------------------------------------------- */
 /* Test-suite plumbing: the script is the source of truth, and its wiring is checked              */
 /* --------------------------------------------------------------------------------------------- */
 
@@ -305,11 +1142,22 @@ function checkTestWiring() {
 
   const missingOnDisk = [...declared.keys()].filter((f) => !existsSync(join(ROOT, f))).sort();
   const neverRun = onDisk.filter((f) => !declared.has(f));
+  // Named by a script, but not by the one script that gates a release. Reported rather than failed:
+  // `test:e2e` is a legitimate second list of slow suites, and the workflow check that follows
+  // requires every suite here to actually run in a workflow, so "named somewhere" cannot become an
+  // excuse for "run nowhere".
+  const releaseSuite = new Set(scriptTestFiles(String(scripts.test ?? '')));
+  const notReleaseGating = onDisk.filter((f) => declared.has(f) && !releaseSuite.has(f));
 
   const counts =
-    `test/*.test.mjs on disk: ${onDisk.length}; named by at least one npm script: ` +
-    `${onDisk.length - neverRun.length}; distinct paths named: ${declared.size}; ` +
-    `paths named but absent: ${missingOnDisk.length}`;
+    `test/*.test.mjs on disk: ${onDisk.length}; declared by package.json#scripts.test (the release ` +
+    `suite): ${releaseSuite.size}; named by another script: ${notReleaseGating.length}; ` +
+    `distinct paths named: ${declared.size}; paths named but absent: ${missingOnDisk.length}`;
+  const elsewhere =
+    notReleaseGating.length === 0
+      ? 'no suite is named by a script other than scripts.test'
+      : `not in the release suite, and reported so that this is a decision rather than an oversight:\n` +
+        notReleaseGating.map((f) => `  ${f}  <- ${declared.get(f).join(', ')}`).join('\n');
 
   if (missingOnDisk.length > 0) {
     return fail(
@@ -325,7 +1173,73 @@ function checkTestWiring() {
       counts,
     );
   }
-  return pass('every suite on disk is named by a script, and every path named exists', counts);
+  return pass(
+    `every suite on disk is named by a script (${releaseSuite.size} by scripts.test, ` +
+      `${notReleaseGating.length} by another script) and every path named exists`,
+    `${counts}\n${elsewhere}`,
+  );
+}
+
+/**
+ * Check 4a': the workflows run the suite the repository declares, rather than a copy of the list.
+ *
+ * `scripts.test` is one source of truth only if the things that gate a release read it. Both
+ * `ci.yml` and `release.yml` used to carry their own hand-written list of twenty-three paths, and
+ * both were stale in the same way: six suites that exist, are named by `scripts.test`, and pass on a
+ * developer's machine ran in no workflow at all. `release.yml` even carried a comment naming this
+ * exact defect class ("a new suite is invisible to the release gate until it is added here ... that
+ * has bitten this project once already") and was still stale, which is the honest measure of how
+ * much a comment is worth next to a list.
+ *
+ * So the requirement is structural: the gating workflows must cover every suite `scripts.test`
+ * declares -- which `npm test` and `node scripts/preflight.mjs` do *by construction*, and a
+ * hand-maintained list does not -- and every suite named by any npm script must run in some
+ * workflow.
+ */
+function checkTestGatingWorkflows() {
+  const workflowsDir = join(ROOT, '.github', 'workflows');
+  if (!existsSync(workflowsDir)) return fail(`no ${workflowsDir}; there are no workflows to measure`);
+  const workflows = readdirSync(workflowsDir)
+    .filter((f) => f.endsWith('.yml') || f.endsWith('.yaml'))
+    .sort();
+  if (workflows.length === 0) return fail(`${workflowsDir} holds no workflow file`);
+
+  const coverage = workflowSuiteCoverage({
+    root: ROOT,
+    workflows,
+    scripts: MANIFEST.scripts ?? {},
+  });
+  // The loader gate's own triggers, which is what keeps the seat oracle (see
+  // loaderGateTriggerProblems) in the release path.
+  const compatFile = join(ROOT, '.github', 'workflows', 'compat.yml');
+  if (existsSync(compatFile)) {
+    coverage.problems.push(...loaderGateTriggerProblems(readFileSync(compatFile, 'utf8')));
+  }
+
+  const report = coverage.perWorkflow
+    .map(
+      (entry) =>
+        `${entry.workflow}: ${entry.covered.size} suite(s), via ` +
+        `${entry.invocations.length > 0 ? entry.invocations.join(' + ') : 'nothing this check can read'}` +
+        (entry.literal.length > 0 ? `; names ${entry.literal.length} path(s) directly` : ''),
+    )
+    .join('\n');
+  const detail =
+    `${report}\nrelease suite (package.json#scripts.test): ${coverage.releaseSuite.length} suite(s); ` +
+    `gating workflows required to cover it: ${GATING_WORKFLOWS.join(', ')}`;
+
+  if (coverage.releaseSuite.length === 0) {
+    return fail('package.json#scripts.test names no suite, so there is nothing to require of a workflow', detail);
+  }
+  if (coverage.problems.length > 0) {
+    return fail(coverage.problems.join(' '), detail);
+  }
+  return pass(
+    `${GATING_WORKFLOWS.join(' and ')} each run all ${coverage.releaseSuite.length} suite(s) declared by ` +
+      `package.json#scripts.test, every script-named suite runs in a workflow, and no workflow ` +
+      'hand-lists a suite set',
+    detail,
+  );
 }
 
 /** Parse the `node --test` spec-reporter summary. */
@@ -390,38 +1304,124 @@ function checkTestSuite(suiteEnv) {
   // this run rebuilds it at the current version, and before the bump the rebuild is a no-op.
   const removed = clearStaleDistArtifacts();
 
+  // The spec reporter keeps printing the human-readable run; a second reporter writes the same run to
+  // a TAP file, because a *skipped* assertion is invisible in the counts alone ("14 skip" says nothing
+  // about which claim did not run) and the names and reasons are what this check has to report.
+  // `--test-reporter-destination` is Node 20+, and `engines` in package.json declares >= 20.19.0; if a
+  // node without it ever runs this file, the check fails loudly with the child's own "bad option"
+  // output rather than passing over an unreadable capture.
+  const capture = mkdtempSync(join(tmpdir(), 'w2m-preflight-tap-'));
+  const tapFile = join(capture, 'suite.tap');
   const started = Date.now();
-  const result = child('test', process.execPath, ['--test', '--test-force-exit', ...files], {
-    timeoutMs: TEST_TIMEOUT_MS,
-    env: suiteEnv.env,
-  });
+  const result = child(
+    'test',
+    process.execPath,
+    [
+      '--test',
+      '--test-force-exit',
+      '--test-reporter=spec',
+      '--test-reporter-destination=stdout',
+      '--test-reporter=tap',
+      `--test-reporter-destination=${tapFile}`,
+      ...files,
+    ],
+    { timeoutMs: TEST_TIMEOUT_MS, env: suiteEnv.env },
+  );
   const seconds = ((Date.now() - started) / 1000).toFixed(1);
   const counts = parseTestCounts(result.stdout);
 
-  // Both directions are required. The exit status is the runner's verdict; the counts prove the
-  // runner was pointed at something, which is the difference between "0 tests, 0 failures" and green.
-  if (counts.tests === null || counts.tests === 0) {
+  let skipReport = '';
+  try {
+    // Both directions are required. The exit status is the runner's verdict; the counts prove the
+    // runner was pointed at something, which is the difference between "0 tests, 0 failures" and green.
+    if (counts.tests === null || counts.tests === 0) {
+      return fail(
+        `the runner reported no test count, so nothing can be said about whether the suite ran. ` +
+          `${result.command} exited ${result.status}`,
+        tail(result),
+      );
+    }
+    if (!result.ok || (counts.fail ?? 0) > 0) {
+      return fail(
+        `${counts.fail ?? '?'} of ${counts.tests} test(s) failed via scripts.test (exit ${result.status})`,
+        tail(result, 25),
+      );
+    }
+
+    const skipped = (counts.skipped ?? 0) > 0;
+    const tapExists = existsSync(tapFile);
+    if (!tapExists && skipped) {
+      return fail(
+        `the run reported ${counts.skipped} skipped test(s) and wrote no TAP capture to ${tapFile}, so ` +
+          'which claim did not run cannot be named. The TAP reporter flags ' +
+          '(--test-reporter=tap --test-reporter-destination=...) are what makes a skip auditable.',
+        tail(result, 15),
+      );
+    }
+    if (tapExists) {
+      const skips = tapSkips(readFileSync(tapFile, 'utf8'));
+      const classified = classifySkips(skips);
+      if (classified.problems.length > 0) {
+        return fail(classified.problems.join(' '), `skips in this run:\n${classified.lines.join('\n') || '  (none)'}`);
+      }
+      if ((counts.skipped ?? 0) !== skips.length) {
+        return fail(
+          `the runner's summary says ${counts.skipped ?? 0} skip(s) and the TAP capture holds ` +
+            `${skips.length} skipped result line(s); the tally and the lines must agree before either ` +
+            'can be believed, or a skip can hide between them',
+          `capture: ${tapFile}`,
+        );
+      }
+      skipReport =
+        skips.length === 0
+          ? 'no assertion skipped in this run'
+          : `${skips.length} skip(s), each on the accepted list, named here:\n${classified.lines.join('\n')}`;
+    } else {
+      skipReport = 'no TAP capture was written by this node, and the run reported no skips';
+    }
+
+    return pass(
+      `${counts.tests} test(s) in ${files.length} file(s): ${counts.pass} pass, ${counts.fail} fail, ` +
+        `${counts.skipped} skip, ${seconds}s`,
+      `declared by package.json#scripts.test\n${suiteEnv.note}\n${skipReport}\nfiles: ${files.join(' ')}` +
+        (removed.length > 0
+          ? `\nremoved ${removed.length} stale tarball(s) from dist/ before the run, so the tarball ` +
+            `assertions measured ${MANIFEST.version}: ${removed.join(', ')}`
+          : ''),
+    );
+  } finally {
+    rmSync(capture, { recursive: true, force: true });
+  }
+}
+
+/**
+ * The entry points, measured by the gate ci.yml already runs for them.
+ *
+ * `scripts/check-entrypoints.mjs` was in the CI workflow and in nothing else: not in this pre-flight's
+ * inventory and not in the suite, which is the same "a gate nobody runs before publishing" shape this
+ * file exists to end. It is called rather than reimplemented, and both its exit status and its own
+ * success line are required -- a probe edited to exit 0 early would satisfy only the first.
+ */
+function checkEntryPoints() {
+  const file = join(ROOT, 'scripts', 'check-entrypoints.mjs');
+  if (!existsSync(file)) return fail(`no ${file}; the two published entry points would go unimported`);
+  const result = child('check-entrypoints', process.execPath, [file], { timeoutMs: SHORT_TIMEOUT_MS });
+  if (!result.ok || !/ALL ENTRY POINTS OK/.test(result.stdout)) {
     return fail(
-      `the runner reported no test count, so nothing can be said about whether the suite ran. ` +
-        `${result.command} exited ${result.status}`,
-      tail(result),
+      `scripts/check-entrypoints.mjs reported a failure (exit ${result.status}, success line ` +
+        `${/ALL ENTRY POINTS OK/.test(result.stdout) ? 'present' : 'absent'})`,
+      tail(result, 20),
     );
   }
-  if (!result.ok || (counts.fail ?? 0) > 0) {
+  const passed = (result.stdout.match(/^\s+PASS\s/gm) ?? []).length;
+  if (passed === 0) {
     return fail(
-      `${counts.fail ?? '?'} of ${counts.tests} test(s) failed via scripts.test (exit ${result.status})`,
-      tail(result, 25),
+      'scripts/check-entrypoints.mjs exited 0 without printing a single PASS line, so "the entry ' +
+        'points import" is not what its exit status measured',
+      tail(result, 10),
     );
   }
-  return pass(
-    `${counts.tests} test(s) in ${files.length} file(s): ${counts.pass} pass, ${counts.fail} fail, ` +
-      `${counts.skipped} skip, ${seconds}s`,
-    `declared by package.json#scripts.test\n${suiteEnv.note}\nfiles: ${files.join(' ')}` +
-      (removed.length > 0
-        ? `\nremoved ${removed.length} stale tarball(s) from dist/ before the run, so the tarball ` +
-          `assertions measured ${MANIFEST.version}: ${removed.join(', ')}`
-        : ''),
-  );
+  return pass(`${passed} entry point assertion(s) passed (exit 0 and its own success line)`, result.stdout.trim());
 }
 
 /* --------------------------------------------------------------------------------------------- */
@@ -469,31 +1469,6 @@ function tarEntries(gz) {
     offset += BLOCK + Math.ceil(dataLength / BLOCK) * BLOCK;
   }
   return entries;
-}
-
-/** Every file the `files` globs expand to in the tree, as package-relative POSIX paths. */
-function expectedPackedFiles() {
-  const collected = [];
-  const walk = (abs, rel) => {
-    const info = statSync(abs);
-    if (info.isDirectory()) {
-      for (const childName of readdirSync(abs).sort()) {
-        walk(join(abs, childName), `${rel}/${childName}`);
-      }
-      return;
-    }
-    if (info.isFile()) collected.push(rel);
-  };
-  for (const entry of MANIFEST.files ?? []) {
-    const abs = join(ROOT, entry);
-    if (existsSync(abs)) walk(abs, entry.replace(/^\.\//, ''));
-  }
-  // The packer always adds these when present, whether or not `files` names them.
-  for (const name of ['package.json', 'README.md', 'LICENSE']) {
-    const rel = name;
-    if (existsSync(join(ROOT, name)) && !collected.includes(rel)) collected.push(rel);
-  }
-  return collected.sort();
 }
 
 /** The condition a packed path must never satisfy. */
@@ -617,30 +1592,119 @@ function prepareSuiteEnv() {
   };
 }
 
-/** Step 1's own precondition, stated as a check: the lint entry point is really there. */
-function checkGateInventory() {
-  const lintPresent = existsSync(ESLINT);
-  const scannerPresent = existsSync(join(ROOT, 'scripts', 'scan-mojibake.mjs'));
-  const packerPresent = existsSync(join(ROOT, 'scripts', 'pack.mjs'));
-  const installerProbe = existsSync(join(ROOT, 'scripts', 'verify-installed.mjs'));
-  const claimsPresent = existsSync(join(ROOT, 'test', 'claims.test.mjs'));
-
+/**
+ * The inventory relation, as a pure function so both the check and a test can ask the question.
+ *
+ * @param {string[]} registered the names of the checks about to run.
+ * @returns {{missingArtifacts: string[], unbound: string[], problems: string[]}}
+ */
+export function gateInventoryAnalysis(registered) {
+  const missingArtifacts = [];
   const problems = [];
-  if (!lintPresent) problems.push(`eslint entry point missing: ${ESLINT}`);
-  if (!scannerPresent) problems.push('scripts/scan-mojibake.mjs missing');
-  if (!packerPresent) problems.push('scripts/pack.mjs missing');
-  if (!installerProbe) problems.push('scripts/verify-installed.mjs missing');
-  if (!claimsPresent) problems.push('test/claims.test.mjs missing');
+  for (const row of GATE_INVENTORY) {
+    if (!existsSync(join(ROOT, row.path))) {
+      missingArtifacts.push(`${row.artifact} (${row.path})`);
+      continue;
+    }
+    if (!registered.includes(row.checkedBy)) {
+      problems.push(
+        `the ${row.artifact} (${row.path}) is declared to be measured by "${row.checkedBy}", which is ` +
+          'not a registered check in this run: the artifact exists and nothing measures it',
+      );
+    }
+  }
+  const unbound = registered.filter((name) => !GATE_INVENTORY.some((row) => row.checkedBy === name));
+  if (unbound.length > 0) {
+    problems.push(
+      `${unbound.length} registered check(s) measure no artifact this repository declares: ` +
+        `${unbound.join(', ')}. Either the check is redundant or GATE_INVENTORY in scripts/preflight.mjs ` +
+        'is out of date; a check that measures nothing declared is a check nobody can review.',
+    );
+  }
+  return { missingArtifacts, unbound, problems };
+}
+
+/**
+ * Step 1's own precondition, stated as a check: every gate this pre-flight delegates to exists, and
+ * every one of them is the measurement of a registered check.
+ *
+ * The second half is the one that earns its keep. Asserting that a file exists says nothing about
+ * whether anything reads it: the previous version of this check printed `claims=present` in a run
+ * whose claims check had been deleted, because "present" was the whole claim. The relation is now
+ * enforced in both directions against `GATE_INVENTORY`.
+ *
+ * @param {string[]} registered the names of the checks the ledger is about to run.
+ */
+function checkGateInventory(registered) {
+  const { missingArtifacts, unbound, problems } = gateInventoryAnalysis(registered);
 
   const inventory =
-    `eslint=${lintPresent ? 'present' : 'MISSING'}; scan-mojibake=${scannerPresent ? 'present' : 'MISSING'}; ` +
-    `pack=${packerPresent ? 'present' : 'MISSING'}; verify-installed=${installerProbe ? 'present' : 'MISSING'}; ` +
-    `claims=${claimsPresent ? 'present' : 'MISSING'}`;
+    `${GATE_INVENTORY.length} artifact(s) inventoried; ${registered.length} registered check(s); ` +
+    `${unbound.length} unbound\n` +
+    GATE_INVENTORY.map((row) => `  ${row.artifact}: ${row.path} -> ${row.checkedBy}`).join('\n');
 
-  if (problems.length > 0) {
-    return fail(`a gate this pre-flight depends on is not on disk: ${problems.join('; ')}`, inventory);
+  if (missingArtifacts.length > 0) {
+    return fail(
+      `a gate this pre-flight delegates to is not on disk: ${missingArtifacts.join('; ')}`,
+      inventory,
+    );
   }
-  return pass('every gate this pre-flight delegates to exists on disk', inventory);
+  if (problems.length > 0) {
+    return fail(problems.join(' '), inventory);
+  }
+  return pass(
+    `every artifact this pre-flight delegates to exists and is bound to the registered check that ` +
+      'measures it, in both directions',
+    inventory,
+  );
+}
+
+/**
+ * The mojibake scan, with a positive control.
+ *
+ * The scanner (`scripts/scan-mojibake.mjs`) walks the current directory and prints
+ * `clean: no mojibake detected`, which is also what it prints when it walked *nothing*. A gate whose
+ * success text is identical in the two cases is not a measurement, so the scanner is first pointed at
+ * a throwaway directory holding exactly one deliberately corrupted file: it must find it, name it and
+ * exit non-zero. Only then is its "clean" over the tree worth reading.
+ */
+function checkMojibake() {
+  const scanner = join(ROOT, 'scripts', 'scan-mojibake.mjs');
+  if (!existsSync(scanner)) return fail(`no scanner at ${scanner}`);
+
+  const control = mkdtempSync(join(tmpdir(), 'w2m-mojibake-control-'));
+  try {
+    const victim = join(control, 'corrupted.mjs');
+    // U+FFFD, written as bytes rather than as a string literal, so this file's own bytes cannot be
+    // mistaken for an accident and read the same way by the scanner as the control.
+    writeFileSync(victim, Buffer.concat([Buffer.from('export const x = "'), Buffer.from([0xef, 0xbf, 0xbd]), Buffer.from('";\n')]));
+    const positive = child('mojibake-control', process.execPath, [scanner], { cwd: control });
+    if (positive.ok || !/corrupted\.mjs/.test(positive.stdout)) {
+      return fail(
+        'the scanner did not report a file containing the replacement character, so its "clean" ' +
+          `verdict over the tree cannot be read as a measurement (exit ${positive.status})`,
+        tail(positive, 10),
+      );
+    }
+
+    const result = child('mojibake', process.execPath, [scanner]);
+    const clean = /clean: no mojibake detected/.test(result.stdout);
+    if (!result.ok || !clean) {
+      return fail(
+        `the scanner reported mojibake (exit ${result.status}); every offending file is named below`,
+        tail(result, 20),
+      );
+    }
+    // The scanner's own success text is required as well as its exit code: a run that produced no
+    // output at all would otherwise be read as "found nothing".
+    return pass(
+      'clean over the whole tree (exit 0 and the scanner said so), and the same scanner named a ' +
+        'deliberately corrupted control file',
+      `positive control: 1 file, 1 hit, named and exit ${positive.status}\n${result.stdout.trim()}`,
+    );
+  } finally {
+    rmSync(control, { recursive: true, force: true });
+  }
 }
 
 function checkLint() {
@@ -663,25 +1727,50 @@ function checkLint() {
   return pass(`0 errors, ${warnings} warnings`, `eslint: ${ESLINT}`);
 }
 
-function checkMojibake() {
-  const scanner = join(ROOT, 'scripts', 'scan-mojibake.mjs');
-  if (!existsSync(scanner)) return fail(`no scanner at ${scanner}`);
-  const result = child('mojibake', process.execPath, [scanner]);
-  const clean = /clean: no mojibake detected/.test(result.stdout);
-  if (!result.ok || !clean) {
-    return fail(
-      `the scanner reported mojibake (exit ${result.status}); every offending file is named below`,
-      tail(result, 20),
-    );
-  }
-  // The scanner's own success text is required as well as its exit code: a run that produced no
-  // output at all would otherwise be read as "found nothing".
-  return pass('clean over the whole tree (exit 0 and the scanner said so)', result.stdout.trim());
-}
-
 function checkPackAndTarball() {
   const packer = join(ROOT, 'scripts', 'pack.mjs');
   if (!existsSync(packer)) return fail(`no packer at ${packer}`);
+
+  // (a0) the tree's own documents, asserted against the tree -- before the tarball is even read.
+  // This is the part that cannot be satisfied by editing `files[]`, because the expectation does not
+  // come from `files[]`.
+  const contract = documentContract({ root: ROOT, files: MANIFEST.files });
+  if (contract.documents.length === 0) {
+    return fail(
+      'the document scan found no document in the tree at all, so "every document ships" would pass ' +
+        'over an empty set; the scan itself has drifted',
+      contract.counts,
+    );
+  }
+  if (contract.problems.length > 0) {
+    return fail(
+      `the tree and package.json#files disagree about what this package carries: ${contract.problems.join(' ')}`,
+      contract.counts,
+    );
+  }
+
+  const patchField = MANIFEST.dsh?.bundle?.patch;
+  if (typeof patchField !== 'string' || patchField.trim() === '') {
+    return fail(
+      'package.json#dsh.bundle.patch is absent or empty, so nothing says which patch file mounts the ' +
+        'plugin; a bundle whose patch field points nowhere mounts nothing',
+    );
+  }
+  const required = requiredShippedEntries(MANIFEST);
+  if (required.length === 0) {
+    return fail('the manifest names no entry point at all (main, exports, bin, dsh.bundle.patch)');
+  }
+  // The path a field names must exist before anything is packed: `dsh.bundle.patch` pointing at a
+  // file that is not there used to pass every gate, because nothing read the field.
+  const dangling = required.filter(({ path }) => !existsSync(join(ROOT, path)));
+  if (dangling.length > 0) {
+    return fail(
+      `${dangling.length} path(s) the manifest names are not in the tree: ` +
+        `${dangling.map(({ field, path }) => `${field} -> ${path}`).join('; ')}. A field that names a ` +
+        'missing file is read by nothing until a user mounts the package.',
+      `${required.length} manifest-declared path(s) checked, including dsh.bundle.patch -> ${patchField}`,
+    );
+  }
 
   const staging = mkdtempSync(join(tmpdir(), 'w2m-preflight-pack-'));
   try {
@@ -718,8 +1807,31 @@ function checkPackAndTarball() {
     // file that was present. Measured, and the reason this reads the way it does.
     const packedRel = new Set(packedNames.map((n) => n.slice('package/'.length)));
 
-    // (a) every path package.json#files names is inside the tarball
-    const expected = expectedPackedFiles();
+    // (a) the tarball, asserted against the TREE-derived expectation. Four directions, and the first
+    // two are the ones the previous version of this check structurally could not see:
+    //    a1 every document the tree carries is inside the tarball
+    //    a2 no document excluded with a reason is inside it anyway
+    //    a3 every path `files` names is inside it (the declared side, still worth asserting)
+    //    a4 every path the manifest's own entry-point fields name ships
+    const missingDocuments = contract.shipped.filter((rel) => !packedRel.has(rel));
+    if (missingDocuments.length > 0) {
+      return fail(
+        `${missingDocuments.length} document(s) the tree carries and package.json#files declares are ` +
+          `absent from the packed tarball: ${missingDocuments.join(', ')}`,
+        `packed ${packedNames.length} file(s)\n${contract.counts}`,
+      );
+    }
+
+    const smuggled = contract.excluded.filter((rel) => packedRel.has(rel));
+    if (smuggled.length > 0) {
+      return fail(
+        `${smuggled.length} document(s) are excluded with a reason in scripts/preflight.mjs and are in ` +
+          `the packed tarball anyway: ${smuggled.join(', ')}. Either the exclusion is wrong or the ` +
+          'packer is adding files nothing declares.',
+      );
+    }
+
+    const expected = packageFilesExpansion(ROOT, MANIFEST.files);
     const missing = expected.filter((rel) => !packedRel.has(rel));
     if (missing.length > 0) {
       return fail(
@@ -729,7 +1841,29 @@ function checkPackAndTarball() {
       );
     }
 
-    // (b) the packed manifest is the tree's manifest
+    const entryProblems = [];
+    for (const { field, path } of required) {
+      const abs = join(ROOT, path);
+      if (statSync(abs).isDirectory()) {
+        const prefix = `${path.replace(/\/$/, '')}/`;
+        if (![...packedRel].some((rel) => rel.startsWith(prefix))) {
+          entryProblems.push(`${field} -> ${path} (a directory) contributes no packed file`);
+        }
+      } else if (!packedRel.has(path)) {
+        entryProblems.push(`${field} -> ${path} is not in the packed tarball`);
+      }
+    }
+    if (entryProblems.length > 0) {
+      return fail(
+        `${entryProblems.length} path(s) the manifest names do not ship: ${entryProblems.join('; ')}. An ` +
+          'entry point that is not in the tarball resolves to nothing on the machine that installs it.',
+        `packed ${packedNames.length} file(s)\n${required
+          .map(({ field, path }) => `  ${field} -> ${path}`)
+          .join('\n')}`,
+      );
+    }
+
+    // (b) the packed manifest IS the tree's manifest -- the whole of it, not just its version.
     const manifestEntry = entries.find((e) => e.name === 'package/package.json');
     if (!manifestEntry || manifestEntry.data === null) {
       return fail('the tarball contains no package/package.json, so it declares nothing');
@@ -739,6 +1873,18 @@ function checkPackAndTarball() {
       return fail(
         `the packed package.json says ${packedManifest.version} while the tree says ${MANIFEST.version}; ` +
           '"which artifact did you install?" would have two answers',
+      );
+    }
+    const drift = manifestDifferences(MANIFEST, packedManifest);
+    if (drift.length > 0) {
+      return fail(
+        `the packed package.json differs from the tree's in ${drift.length} field(s): ${drift
+          .slice(0, 8)
+          .join('; ')}${drift.length > 8 ? `; and ${drift.length - 8} more` : ''}. A packed manifest ` +
+          'that is not the tree\'s manifest can lose `engines`, `disclosure` or `peerDependencies` ' +
+          'while still naming the right version.',
+        `compared every field; allowed to differ: ` +
+          `${ALLOWED_MANIFEST_DIFFERENCES.length === 0 ? 'nothing' : ALLOWED_MANIFEST_DIFFERENCES.join(', ')}`,
       );
     }
 
@@ -791,10 +1937,17 @@ function checkPackAndTarball() {
 
     const sha256 = createHash('sha256').update(gz).digest('hex');
     return pass(
-      `${packedNames.length} file(s) packed, byte-identical on a second pack; files[] complete; ` +
-        `version ${packedManifest.version}; no forbidden path; ${toolCount} tools ` +
-        'registered from the packed copy',
-      `sha256 ${sha256}\nartifact: ${distTarball}` +
+      `${packedNames.length} file(s) packed, byte-identical on a second pack; ` +
+        `${contract.shipped.length}/${contract.documents.length} tree document(s) shipped, ` +
+        `${contract.excluded.length} excluded with a reason; the manifest is the tree's, field for ` +
+        `field; all ${required.length} manifest-declared path(s) shipped; version ` +
+        `${packedManifest.version}; no forbidden path; ${toolCount} tools registered from the packed copy`,
+      `sha256 ${sha256}\nartifact: ${distTarball}\n${contract.counts}` +
+        (contract.excluded.length > 0
+          ? `\nexcluded documents and why: ${contract.excluded
+              .map((path) => `${path} (see DOCUMENT_EXCLUSIONS in scripts/preflight.mjs)`)
+              .join(', ')}`
+          : '') +
         (stale.length > 0 ? `\nremoved ${stale.length} stale tarball(s) from dist/: ${stale.join(', ')}` : ''),
     );
   } finally {
@@ -808,10 +1961,22 @@ function checkClaims() {
   if (!existsSync(file)) return fail(`no ${file}; the version and bundle-patch claims would go unchecked`);
   // Called rather than reimplemented: test/claims.test.mjs already measures the registered tool set
   // against the documents, the version against the newest CHANGELOG entry, the CHANGELOG's order,
-  // the withdrawn-version rule, the bundle patch row, and the tarball URLs. A second copy of those
-  // rules here could disagree with it, and then there would be two answers and no way to choose.
+  // the withdrawn-version rule, the bundle patch row, the release tree against the tree-derived
+  // document contract, and the tarball URLs. A second copy of those rules here could disagree with
+  // it, and then there would be two answers and no way to choose.
   const result = child('claims', process.execPath, ['--test', '--test-force-exit', 'test/claims.test.mjs']);
   const counts = parseTestCounts(result.stdout);
+  // "0 claim(s) checked, 0 pass, 0 skip" is not a pass. A suite in which every claim was skipped --
+  // a `describe` made conditional on the wrong thing, a group renamed, a selector that matched
+  // nothing -- produces exactly that line and a zero exit status, and this check used to accept it.
+  // checkTestSuite() has guarded the same shape since it was written; this is the same guard.
+  const executed = claimsCountsVerdict(counts);
+  if (!executed.ok) {
+    return fail(
+      `test/claims.test.mjs produced no usable verdict (exit ${result.status}): ${executed.reason}`,
+      tail(result, 30),
+    );
+  }
   if (!result.ok || (counts.fail ?? 0) > 0) {
     return fail(
       `test/claims.test.mjs failed (exit ${result.status}): ${counts.fail ?? '?'} of ${counts.tests ?? '?'} ` +
@@ -825,8 +1990,8 @@ function checkClaims() {
         'not reach, and are the only part of this pre-flight that is network-dependent'
       : '';
   return pass(
-    `${counts.tests ?? '?'} claim(s) checked, ${counts.pass ?? '?'} pass, ${counts.skipped ?? 0} skip ` +
-      '(version agreement + bundle patch row included)',
+    `${counts.tests} claim(s) checked, ${counts.pass} pass, ${counts.skipped ?? 0} skip ` +
+      '(version agreement + bundle patch row + release tree included)',
     `reused test/claims.test.mjs, not reimplemented${skippedNote}`,
   );
 }
@@ -910,54 +2075,139 @@ function compareVersions(a, b) {
 /* The run                                                                                        */
 /* --------------------------------------------------------------------------------------------- */
 
-const SUITE_ENV = prepareSuiteEnv();
+/**
+ * The pre-flight, as one function.
+ *
+ * Everything lives inside `main()`, and `main()` runs only when this file *is* the entry point.
+ * `test/claims.test.mjs` imports the release contract from this module -- one implementation of the
+ * rule, two callers -- and an import that started a whole pre-flight (a throwaway DSH_HOME, a
+ * tarball, a thousand tests) would make that reuse impossible. The guard is therefore load-bearing,
+ * and it refuses to be silent: a file named `preflight.mjs` that was executed but did not match this
+ * module's own path exits non-zero rather than printing nothing and looking like a pass.
+ */
+async function main() {
+  const suiteEnv = prepareSuiteEnv();
 
-const CHECKS = [
-  { name: 'gate inventory (the gates this pre-flight delegates to exist)', run: checkGateInventory },
-  { name: 'ledger self-test (a check that reports nothing is a failure)', run: checkLedgerCatchesSilence },
-  { name: 'test wiring (every suite on disk is named by a script, every named path exists)', run: checkTestWiring },
-  { name: 'lint (0 errors required)', run: checkLint },
-  { name: 'mojibake scan (whole tree)', run: checkMojibake },
-  { name: 'declared suite (package.json#scripts.test)', run: () => checkTestSuite(SUITE_ENV) },
-  { name: 'packed tarball (files[] complete, version, forbidden paths, 8 tools from the pack)', run: checkPackAndTarball },
-  { name: 'claims (test/claims.test.mjs, reused not reimplemented)', run: checkClaims },
-  { name: 'CHANGELOG shape (title above the newest entry, newest-first)', run: checkChangelogShape },
-];
+  // Name -> implementation, keyed by the names in DECLARED_CHECKS. A declared name with no
+  // implementation is a hard error (see the map lookup below), never a silently missing check.
+  const implementations = new Map([
+    [
+      'gate inventory (every gate exists and is bound to the registered check that measures it)',
+      () => checkGateInventory(DECLARED_CHECKS),
+    ],
+    [
+      'ledger self-test (silence and an unaccepted UNVERIFIABLE are both failures)',
+      checkLedgerCatchesSilence,
+    ],
+    [
+      'test wiring (every suite on disk is named by a script; the release suite and the rest are reported)',
+      checkTestWiring,
+    ],
+    [
+      'workflow wiring (ci.yml and release.yml run the suite scripts.test declares)',
+      checkTestGatingWorkflows,
+    ],
+    ['entry points (scripts/check-entrypoints.mjs)', checkEntryPoints],
+    ['lint (0 errors required)', checkLint],
+    ['mojibake scan (whole tree, plus a positive control)', checkMojibake],
+    ['declared suite (package.json#scripts.test, skips itemized)', () => checkTestSuite(suiteEnv)],
+    [
+      'packed tarball (tree-derived documents + entry points, whole manifest, forbidden paths, 8 tools from the pack)',
+      checkPackAndTarball,
+    ],
+    ['claims (test/claims.test.mjs, reused not reimplemented)', checkClaims],
+    ['CHANGELOG shape (title above the newest entry, newest-first)', checkChangelogShape],
+  ]);
 
-process.stdout.write(`w2m pre-flight for ${MANIFEST.name} ${MANIFEST.version} (${ROOT})\n`);
-process.stdout.write(`  checks registered: ${CHECKS.length}\n`);
-process.stdout.write(`  ${SUITE_ENV.note}\n`);
-process.stdout.write('\n');
+  const checks = DECLARED_CHECKS.map((name) => {
+    const run = implementations.get(name);
+    if (run === undefined) {
+      throw new Error(
+        `scripts/preflight.mjs declares the check "${name}" and binds no implementation to it; a ` +
+          'declared check that cannot run is a hole in the gate, not a check to skip',
+      );
+    }
+    return { name, run };
+  });
+  const unboundImplementations = [...implementations.keys()].filter((name) => !DECLARED_CHECKS.includes(name));
+  if (unboundImplementations.length > 0) {
+    throw new Error(
+      `scripts/preflight.mjs binds implementation(s) for check(s) that DECLARED_CHECKS does not ` +
+        `declare: ${unboundImplementations.join(', ')}`,
+    );
+  }
 
-const { results } = await run(CHECKS);
-// The host observation is recorded as a named, non-blocking UNVERIFIABLE whenever the suite had to be
-// run against a shaped home: the suite's PASS is then a statement about the resolver's documented
-// layout, and this line keeps the reader from mistaking it for a statement about this machine.
-const hostEnv = [
-  { name: 'host bundled-runtime layout (this machine, not the suite env)', verdict: unverifiable(SUITE_ENV.hostReason) },
-];
-const all = [...results, ...hostEnv];
+  process.stdout.write(`w2m pre-flight for ${MANIFEST.name} ${MANIFEST.version} (${ROOT})\n`);
+  process.stdout.write(`  checks registered: ${checks.length}\n`);
+  process.stdout.write(`  ${suiteEnv.note}\n`);
+  process.stdout.write('\n');
 
-const failed = all.filter((r) => r.verdict.status === 'FAIL');
-const unverified = all.filter((r) => r.verdict.status === 'UNVERIFIABLE');
-const passed = all.filter((r) => r.verdict.status === 'PASS');
+  const { results, reported } = await run(checks);
+  // The host observation is recorded as a named, non-blocking UNVERIFIABLE whenever the suite had to
+  // be run against a shaped home: the suite's PASS is then a statement about the resolver's documented
+  // layout, and this line keeps the reader from mistaking it for a statement about this machine.
+  const hostEnv = [
+    { name: 'host bundled-runtime layout (this machine, not the suite env)', verdict: unverifiable(suiteEnv.hostReason) },
+  ];
+  const all = [...results, ...hostEnv];
 
-process.stdout.write('\n');
-for (const { name, verdict } of unverified) {
-  process.stdout.write(`  UNVERIF  ${name}: ${verdict.reason}\n`);
-  if (verdict.note) process.stdout.write(`          ${verdict.note}\n`);
-}
-process.stdout.write('\n');
+  // An UNVERIFIABLE for a reason this repository has not accepted is a FAIL. Without this, switching
+  // any check's PASS to `unverifiable('...')` turns the whole gate green while measuring nothing.
+  const unverifiableVerdict = classifyUnverifiable(all);
+  const refused = unverifiableVerdict.refused.map((row) => ({
+    name: `${row.name} (UNVERIFIABLE refused)`,
+    verdict: fail(
+      `reported UNVERIFIABLE for a reason that is not on ACCEPTED_UNVERIFIABLE: ${row.reason}. A check ` +
+        'that cannot measure something must say what it could not measure in terms this repository ' +
+        'has agreed to accept, or fail.',
+      row.note,
+    ),
+  }));
 
-process.stdout.write(
-  `pre-flight: ${passed.length} pass, ${failed.length} fail, ${unverified.length} unverifiable ` +
-    `(${results.length}/${CHECKS.length} registered check(s) reported, plus ${hostEnv.length} host ` +
-    `observation(s)) -- ${failed.length > 0 ? 'RED, do not bump' : 'GREEN, cleared to bump'}\n`,
-);
-if (unverified.length > 0) {
+  const failed = [...all.filter((r) => r.verdict.status === 'FAIL'), ...refused];
+  const unverified = all.filter((r) => r.verdict.status === 'UNVERIFIABLE' && !refused.some((r2) => r2.name.startsWith(r.name)));
+  const passed = all.filter((r) => r.verdict.status === 'PASS');
+
+  process.stdout.write('\n');
+  for (const { name, verdict } of failed.filter((r) => r.name.endsWith('(UNVERIFIABLE refused)'))) {
+    process.stdout.write(`  FAIL    ${name}: ${verdict.reason}\n`);
+    if (verdict.note) process.stdout.write(`          ${verdict.note}\n`);
+  }
+  for (const { name, verdict } of unverified) {
+    process.stdout.write(`  UNVERIF  ${name}: ${verdict.reason}\n`);
+    if (verdict.note) process.stdout.write(`          ${verdict.note}\n`);
+  }
+  process.stdout.write('\n');
+
   process.stdout.write(
-    '  note: UNVERIFIABLE is not a pass. Those checks could not be measured here; the reason above ' +
-      'names what was missing.\n',
+    `pre-flight: ${passed.length} pass, ${failed.length} fail, ${unverified.length} unverifiable ` +
+      `(${reported}/${checks.length} registered check(s) reported, plus ${hostEnv.length} host ` +
+      `observation(s)) -- ${failed.length > 0 ? 'RED, do not bump' : 'GREEN, cleared to bump'}\n`,
   );
+  if (unverified.length > 0) {
+    process.stdout.write(
+      '  note: UNVERIFIABLE is not a pass. Those checks could not be measured here; the reason above ' +
+        'names what was missing, and it is on the accepted list in scripts/preflight.mjs.\n',
+    );
+  }
+  process.exit(failed.length > 0 ? 1 : 0);
 }
-process.exit(failed.length > 0 ? 1 : 0);
+
+/** Is `a` the same path as `b`, on a filesystem that may not care about case? */
+function samePath(a, b) {
+  return process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+const SELF = fileURLToPath(import.meta.url);
+const INVOKED = process.argv[1] === undefined ? '' : resolve(process.argv[1]);
+
+if (INVOKED !== '' && samePath(INVOKED, SELF)) {
+  await main();
+} else if (basename(INVOKED) === basename(SELF)) {
+  process.stderr.write(
+    `preflight: refusing to exit silently. ${INVOKED} was executed but resolves to a different file ` +
+      `than this module (${SELF}), so no check ran. A gate that prints nothing and exits 0 is the ` +
+      'failure this file exists to prevent.\n',
+  );
+  process.exit(1);
+}

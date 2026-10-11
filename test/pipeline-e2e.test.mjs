@@ -127,8 +127,22 @@ async function startRelay({ stateDir, port = 0 }) {
  * without it every offer is refused with `COMMAND_NOT_ALLOWED` -- correctly, and with a warning on
  * startup saying so. The first version of this test omitted it and spent a minute waiting for a
  * verdict from work that was never permitted to start.
+ *
+ * The default entry is the **array form** and it names `-e`, and neither is cosmetic:
+ *
+ *   * `NODE` is `process.execPath`, which on this platform lives under `C:\Program Files\`, and a
+ *     *string* entry is split on whitespace by design (`'["node --test"]'` is two tokens).
+ *     `JSON.stringify([NODE])` therefore describes the entry `C:\Program` plus the argument
+ *     `Files\nodejs\node.exe`, which matches nothing -- the chain was refused before its first stage
+ *     and the witness file this suite reads was never written. The array form is what the parser
+ *     documents for an executable path containing spaces.
+ *   * Every stage in this file is `node -e <source>`, and `-e` is deliberately **not** covered by an
+ *     entry that merely names the tool: it is a trailing argument that makes node run source the
+ *     entry never named, so the matcher refuses it with `COMMAND_REPARSING_ARGUMENT`. Naming `-e` in
+ *     the entry is the explicit grant that admits it -- which is exactly how the two tests below
+ *     should read: this machine may run *node with eval*, not "node, doing anything".
  */
-async function startAgent({ rabbitUrl, pairingCode, project, stateDir, dshHome, allowedCommands = [NODE] }) {
+async function startAgent({ rabbitUrl, pairingCode, project, stateDir, dshHome, allowedCommands = [[NODE, '-e']] }) {
   const proc = spawn(
     NODE,
     [
@@ -332,6 +346,62 @@ describe('pipeline end to end: a real agent runs the chain', () => {
     // interpretable; which stage it came from is in the envelope (asserted in broadcast.test.mjs).
     assert.equal(done.aggregate?.machines?.[0]?.exit_code, 3, "the chain's exit code is the failing stage's");
     assert.equal(done.aggregate?.machines?.[0]?.status, 'nonzero_exit');
+  });
+
+  it('refuses a whole chain whose later stage is outside the allow-list, and runs no stage', async () => {
+    // HIGH-1, over the wire: `mode:'pipeline'` was gated on the offer's `command_argv`, which the
+    // relay sets to `stages[0].command_argv` (src/relay/state.mjs), so a stage the allow-list does
+    // not cover still ran -- and it ran *on the machine*, where no dispatch-time pre-flight can help
+    // a dispatcher that posts straight to `/v1/task`. Stage 1 here is exactly the review's payload.
+    const relayState = mkdtempSync(join(tmpdir(), 'w2m-pa-relay-'));
+    const agentState = mkdtempSync(join(tmpdir(), 'w2m-pa-agent-'));
+    const dshHome = mkdtempSync(join(tmpdir(), 'w2m-pa-home-'));
+    const project = makeRepo('allowlist');
+    scratch.push(relayState, agentState, dshHome);
+
+    const relay = await startRelay({ stateDir: relayState });
+    await startAgent({
+      rabbitUrl: relay.url,
+      pairingCode: relay.info.pairingCode,
+      project,
+      stateDir: agentState,
+      dshHome,
+      // `node --test` and nothing else: stage 0 is an ordinary allowed invocation.
+      allowedCommands: [[NODE, '--test']],
+    });
+
+    const stage0 = join(project, 'stage0-ran.txt');
+    const proof = join(project, 'stage2-proof.txt');
+    writeFileSync(
+      join(project, 'stage0.test.mjs'),
+      `import { writeFileSync } from 'node:fs';\nwriteFileSync(${JSON.stringify(stage0)}, 'ran\\n');\n`,
+      'utf8',
+    );
+    const created = await postTask(relay.url, {
+      mode: 'pipeline',
+      ...(await anchorsOf(project)),
+      stages: [
+        // Stage 0 is covered by the entry and exits 0 on its own (an empty test run), so a chain that
+        // ran would reach stage 1. It has no witness of its own on purpose: inside `node --test`, a
+        // nested `node --test` is skipped by the runner's own recursion guard, so "the file was not
+        // written" would be true whether or not the gate worked. The proof file below is the payload
+        // that does execute when it is reached -- `node -e` is unaffected by that guard.
+        { command_argv: [NODE, '--test', 'stage0.test.mjs'] },
+        { command_argv: [NODE, '-e', `require('fs').writeFileSync(${JSON.stringify(proof)}, 'PWNED')`] },
+      ],
+      cwd_rel: '.',
+      timeout_ms: 60_000,
+    });
+    assert.equal(created.status, 200, JSON.stringify(created.json));
+
+    const done = await waitForVerdict(relay.url, created.json.task_id, readDeviceToken(dshHome));
+
+    // The verdict is the refusal, named. `consistent` here would mean the chain ran -- the defect.
+    assert.equal(done.verdict, 'refused', JSON.stringify(done.aggregate));
+    assert.equal(done.aggregate?.machines?.[0]?.refusal_reason, 'COMMAND_NOT_ALLOWED');
+    assert.equal(done.aggregate?.machines?.[0]?.exit_code, null);
+    // And the payload never ran.
+    assert.equal(existsSync(proof), false, 'the stage outside the allow-list must not have run');
   });
 });
 

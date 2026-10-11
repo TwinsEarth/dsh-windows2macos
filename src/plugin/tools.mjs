@@ -1810,9 +1810,15 @@ async function initP2P(ctx, cfg, runtime, block) {
    * Registered *here*, after the node exists, rather than in `createP2PRuntime` — an effect that owns
    * nothing is a disposer that releases nothing, and `relay` mode and a machine with no identity must
    * leave the host's effect list exactly as they found it. A host that provides no `ctx.effect` (an
-   * older Cordis, or a bare test context) still gets a working node: the socket is `unref()`ed, so it
-   * cannot keep the process alive, and refusing to start the direct path because the host cannot track
-   * a disposer would break the release's own default.
+   * older Cordis, or a bare test context) still gets a working node: the node itself is asked not to
+   * hold the process open (`node.unref()`, below), so it cannot keep the process alive, and refusing
+   * to start the direct path because the host cannot track a disposer would break the release's own
+   * default.
+   *
+   * v0.5.10: `node.unref()` is a real call, not a description. Until it was added this comment
+   * claimed an `unref()` that existed nowhere in the plugin or the node — the socket went on holding
+   * the event loop, so a host without `ctx.effect` that started a node never exited (found by an
+   * independent verifier against the `w2m_status` test's bare context).
    */
   if (typeof ctx?.effect === 'function') {
     ctx.effect(() => () => {
@@ -1824,6 +1830,11 @@ async function initP2P(ctx, cfg, runtime, block) {
         runtime.events.last_error = error instanceof Error ? error.message : String(error);
       });
     });
+  } else {
+    // No disposer will ever be called by the host, so the node must not be the reason the process
+    // stays up. Called before `start()`: the node remembers it and unrefs the socket it binds, which
+    // is the only ordering that leaves no window where the loop is held open.
+    runtime.node?.unref?.();
   }
 
   // eslint-disable-next-line require-atomic-updates -- single-entry: `ensureStarted` assigns `starting` before this runs
@@ -2701,27 +2712,6 @@ async function resolveTreeFingerprint(projectDir, timeoutMs) {
 // ---------------------------------------------------------------------------------------------
 
 /**
- * The comparable form of an **executable token**: basename, lower case, no `.exe`/`.cmd`/`.bat`/`.com`.
- *
- * Applied to `argv[0]` and to the first token of an entry, never to the arguments after it --
- * `--reporter=TAP` and `--reporter=tap` are different arguments, and collapsing them would authorise
- * something nobody wrote.
- *
- * This is the plugin's long-documented tolerance (`allowedCommands: ['Node.exe']` accepts
- * `C:\Program Files\nodejs\node.exe`), and it is deliberately platform-independent: the old check
- * normalised the separator itself rather than asking `path`, which is what makes the documented
- * entry work the same on a POSIX dispatcher. Everything *after* the executable token is compared
- * verbatim by the shared matcher, which is where the prefix rule lives.
- *
- * @param {string} value
- * @returns {string}
- */
-function normalizeExecToken(value) {
-  const base = path.basename(String(value).trim().replace(/\\/g, '/')).toLowerCase();
-  return base.replace(/\.(exe|cmd|bat|com)$/, '');
-}
-
-/**
  * Check one argv against the configured allow-list, with the **same rule the agent applies**.
  *
  * Returns `null` when the call may proceed. When `allowedCommands` is unset or empty this plugin
@@ -2735,6 +2725,15 @@ function normalizeExecToken(value) {
  * comparison (`argv[0]` against each entry) could never match a multi-token entry at all, so the
  * documented config `['node --test','git status --porcelain']` refused `['git','rev-parse','HEAD']`
  * -- stricter than the gate, which is the direction that silently loses work.
+ *
+ * The argv is handed over **verbatim**, including `argv[0]`. It used to be reduced to a basename
+ * first, and that was the plugin half of a defect: the matcher decides executable identity by
+ * resolving a path, and a pre-flight that strips the path can only ever compare names, so it would
+ * wave `E:\Temp\evil\node.exe` through while the agent refused it. Passing the argv through
+ * unchanged is what keeps the two ends one rule. What the shared matcher then resolves, it resolves
+ * against **this** process's environment — the dispatcher's PATH — which is a real limit of a
+ * pre-flight (the executing machine's PATH is the one that will decide), and the reason the refusal
+ * that matters is the agent's own.
  *
  * A refusal names itself: `reason_code` is the matcher's own code (so the two ends cannot report one
  * refusal under two spellings) and `detail` says what would change it. The two ways this control
@@ -2766,15 +2765,14 @@ function checkAllowedCommand(allowedCommands, argv) {
   }
   // Prefixes "as written": the configured entries, whitespace-normalised, in a stable order.
   const allowed = prefixes.map((prefix) => prefix.join(' ')).sort();
-  const entries = prefixes.map((prefix) => [normalizeExecToken(prefix[0]), ...prefix.slice(1)]);
-  const command = [normalizeExecToken(argv[0]), ...argv.slice(1)];
-  const match = matchAllowedCommand(command, entries);
+  const match = matchAllowedCommand(argv, prefixes);
   if (match.allowed) return null;
   return {
     allowed,
     // The shared matcher's code, not a second copy of it: `COMMAND_NOT_ALLOWED` is the literal the
     // agent writes into its own envelope, so a machine's refusal and this pre-flight's refusal read
-    // the same to whoever has to act on them.
+    // the same to whoever has to act on them. The matcher's three newer codes travel the same way
+    // for the same reason.
     reason_code: match.reason_code ?? REFUSAL_CODE.COMMAND_NOT_ALLOWED,
     message: `\`${argv.join(' ')}\` is not in this plugin's allowedCommands (${allowed.join(', ')})`,
     detail:

@@ -1,7 +1,8 @@
 # W2M 线协议 v1（冻结）
 
-> 项目：**DSH: Windows2MacOS** · 版本 **0.0.1** · 本文件是 Rabbit / Localside / DSH 插件三方共同遵循的**唯一契约**。
+> 项目：**DSH: Windows2MacOS** · **线协议版本 `1`**（`protocol_version = 1`，未变）· 本文件最后校对的软件版本 **`@twinsearth/w2m-dsh-plugin@0.5.9`** · 本文件是 Rabbit / Localside / DSH 插件三方共同遵循的**唯一契约**。
 > 任何一方改动本文件即为**破坏性变更**，必须同时升 `protocol_version`。
+> 两个版本号不是一回事：**线协议版本**只在破坏性变更时上升，**软件版本**是写这份文件时校对过的发行版；软件版本比协议版本变得频繁得多，不要把它们混为一谈。
 
 ---
 
@@ -33,7 +34,7 @@
 | `POST` | `/v1/result` | Bearer | 回传结果信封 | 是（`dedupe_key` 去重） |
 | `POST` | `/v1/task` | Bearer | 提交任务（插件调用） | 否（每次新 `task_id`） |
 | `GET` | `/v1/devices` | Bearer | 设备表 | 是 |
-| `GET` | `/v1/tasks/{task_id}` | Bearer | 任务状态 + 六态聚合 | 是 |
+| `GET` | `/v1/tasks/{task_id}` | Bearer | 任务状态 + 九态聚合 | 是 |
 | `GET` | `/v1/tasks/{task_id}/report?format=md\|json` | Bearer | 汇总报告 | 是 |
 | `GET` | `/v1/tasks?limit=N` | Bearer | 任务列表 | 是 |
 
@@ -139,7 +140,12 @@
 - 给了 → 只发给列出的机器；
 - 没给 → 发给**全部已配对设备**。
 
-**index 如何分配**：`replicate` → 所有机器 `index = 0`、`index_total = 1`；`split` → 按设备顺序 `index = i % index_total`。
+**index 如何分配**（`src/relay/state.mjs` 的 `createTask`）：`replicate` → 所有机器 `index = 0`、`index_total = 1`；`split` → 按设备顺序 `index = i % index_total`。
+
+**四种 mode**：`replicate`（每台机器跑同一条命令）、`split`（按 index 切片）、`broadcast`（**只有一台**机器执行，由 `executor_machine_id` 指定；其余机器拿到 `state: "observing"` 的 lease，只被告知结果而**不执行**）、`pipeline`（每台机器按顺序跑完 `stages` 整条链，遇首个失败阶段即停；`stages` 仅在此 mode 下合法，最多 16 个阶段，且 `index_total` 必须为 1）。
+
+> `observing` 是 **lease 状态**，不是 `outcome`：它持有该任务的一个位置并会被告知结果，但从未拿到命令，因此**不经过能力门**（拒绝一件没让你做的事不算拒绝），并且**被排除在每一个聚合步骤之外** —— 没跑过的机器永远不会被记成"结果一致"。
+
 能力门失败的机器仍会拿到一条 `state: "refused"` 的 lease，但**不会收到 offer**。
 
 ### 4.1.1 `GET /v1/tasks/{task_id}` 响应形状（初稿未定义，v0.0.1 补充）
@@ -167,7 +173,8 @@
 - **终态判定读 `aggregate.status`**（不是顶层 `status`，也没有顶层 `aggregate` 字符串）。
 - `machines[].outcome` 是**每台机器**的判定，`machines[].reasons[]` 是它被扣分的具体理由（例如 `"pre_tree_fingerprint != base_tree"`）。
 - `aggregate` 在结果到达前是 `pending`。**`pending` 与"某台机器仍 pending"都不算终态**：初稿的六态里 `partial` 会在第一台结果落地时立刻出现，此时其余机器仍在跑 —— 消费者必须同时检查 `machines[].outcome === "pending"`。
-- 六态之外还有两个仅作展示的值：`pending`（首条结果到达前）、`refused`（所有 lease 都被能力门拒绝）。
+- **九态**（`AGGREGATE_STATUSES`，`src/relay/report.mjs`）：`consistent`、`divergent`、`divergent-platform`、`degraded`、`failed`、`partial`、`timeout`、`cancelled`、`unverifiable`。其中 `timeout` / `cancelled` / `degraded` 是 v0.3.0 追加的三个**判定**，各自取代了一个说得不准确的说法：`timeout` 取代"永远 `pending`"，`cancelled` 取代与 `failed` 混同，`degraded` 取代借用的 `partial`（后者同时意味着"还有机器没回"）。
+- 九态之外还有两个**仅作展示、不是判定**的值：`pending`（首条结果到达前，**唯一非终态**）、`refused`（所有 lease 都被能力门拒绝 —— 每台机器都已作答，等待不会改变结论，故按终态处理）。
 
 ### 4.2 `task.offer` 事件
 ```json
@@ -236,7 +243,7 @@ dedupe_key = sha256(task_id + "|" + index + "|" + command_hash + "|" + base_tree
 | `platform` | object | `{os, os_version, arch, shell, shell_version}` |
 | `caps` | object | 能力声明 |
 | `index` / `index_total` | int | replicate 固定 0/1 |
-| `mode` | `replicate`\|`split` | |
+| `mode` | `replicate`\|`split`\|`broadcast`\|`pipeline` | |
 | `cwd_rel` | string | 相对项目根，正斜杠 |
 | `base_commit` | string | 中继广播 |
 | `base_tree` | string\|null | 期望工作区指纹 |
@@ -284,20 +291,31 @@ dedupe_key = sha256(task_id + "|" + index + "|" + command_hash + "|" + base_tree
 `base_commit` + `pre_tree_fingerprint` + `command_hash`。
 > `toolchain` / `platform` **不是锚**，它们走能力门。
 
-### 6.3 六态聚合（Rabbit 侧）
+### 6.3 九态聚合（Rabbit 侧）
+
+步序是契约的一部分：Step 0 → 1 → 2 → 3，**永不合并**，因为顺序会改变结论。
+
 ```
 Step 0  任一机器 refused                                    → 该机记 refused（不阻断其他机器）
+                                                             全部被拒 → 聚合 status = refused，Step 2/3 跳过
 Step 1  任一机器缺必需字段 或 base_commit≠期望 或
         pre_tree_fingerprint≠base_tree 或 command_hash 不一致 → unverifiable（拒绝汇总）
 Step 2  其余机器中：
         全部 ok                                              → 进 Step 3
-        部分 ok、部分 {nonzero_exit,timeout,crashed}          → partial
+        部分 ok、部分 {nonzero_exit,timeout,crashed}          → degraded   （所有机器都已作答）
+        部分 ok、部分失败，且仍有机器 pending                  → partial    （"还有机器没回"）
         全部 {nonzero_exit,timeout,crashed}                  → failed
+        无人作答且已过 deadline                              → timeout    （等够了，不会再来）
+        操作者主动停止                                        → cancelled  （不是故障，不得报成 failed）
 Step 3  比对全部"可比字段"：
         全等                                                 → consistent
         仅 toolchain/platform 不同且差异集中在 stdout 文本    → divergent-platform（期望内，不告警）
         其他差异                                             → divergent（列出字段与逐机取值）
 ```
+
+**两个非判定值**：`pending`（首条结果到达前，唯一非终态）、`refused`（所有 lease 都被能力门拒绝）。
+
+`degraded` 与 `partial` 的分工是 v0.3.0 修正的一处失真：`partial` 同时意味着"还有机器没回"，于是一个**已结束但部分失败**的任务和**仍在进行**的任务在 `status` 这一个字段上无法区分。现在两者各有其名。
 
 ---
 
@@ -311,6 +329,9 @@ Step 3  比对全部"可比字段"：
 | 码 | 含义 |
 |---|---|
 | `COMMAND_NOT_ALLOWED` | argv 不在该机的 default-deny 白名单内 |
+| `COMMAND_REPARSING_ARGUMENT` | 白名单条目匹配，但**尾随实参**会让该工具加载条目从未指明的代码（`--test-reporter`、`--import`、`--require`、`-e`/`--eval`、`-p`/`--print`、`python -c`、`bash -c`、`git --exec-path` …）。要跑就必须把该实参写进条目本身 |
+| `COMMAND_EXECUTABLE_PATH_MISMATCH` | `argv[0]` 是路径，但不是该条目可执行文件解析到的同一个文件（同名副本不是同一个程序） |
+| `COMMAND_EXECUTABLE_RELATIVE_PATH` | `argv[0]` 是相对路径：工作目录由 offer 决定，因此它指向的文件随目录而变，白名单无法判定 |
 | `MISSING_<TOOL>` | 例如 `MISSING_PYTHON`、`MISSING_NPM`：能力门要求该工具，但该机探不到 |
 | `PLATFORM_MISMATCH` | 任务 `requirements.platform` 不含该机 OS |
 | `READ_ONLY_MACHINE` | 任务 `write: true`，但该机项目目录不可写（`fs.access(W_OK)` 失败） |
@@ -340,7 +361,12 @@ Step 3  比对全部"可比字段"：
 
 ---
 
-## 9. P2P 数据面加密（v0.6.0 新增，**附加式扩展，不升版本**）
+## 9. P2P 数据面加密（v0.5.3 新增，**附加式扩展，不升版本**）
+
+> **版本号更正。** 本节此前标为 "v0.6.0 新增"。**没有 v0.6.0 这个发行版**：P2P 数据面加密的
+> stage 1 随 **v0.5.3**（2026-10-11）发布，`CHANGELOG.md` 的 `[0.5.3]` 条目就是它，本节所称的
+> "v0.6.0" 在代码里指的是*这一批加固*，而不是这个包的一个版本。下文凡写 "v0.6.0" 处均按
+> "v0.5.3 起的加固"理解。
 
 > **不破坏冻结。** `protocol_version` 仍为 `1`，`envelope_version` 仍为 `1.0`。本节全部内容是
 > **可选对象 `p2p` 内部的新键**，以及对**已存在的可选字段** `p2p.encrypted` 的赋值规则；不知道
@@ -387,9 +413,14 @@ Step 3  比对全部"可比字段"：
 
 | 帧 | body 布局（大端） | 长度 |
 |---|---|---|
-| `HELLO` | `A5 \| ver u8 \| session u32 \| e_i[32] \| idLen u8 \| machineId \| mac[48]` | 88 + idLen |
-| `HELLO_ACK` | 同上，`e_r` 替代 `e_i` | 88 + idLen |
-| `REFUSE` | `A5 \| ver u8 \| session u32 \| code u8 \| idLen u8 \| machineId` | 8 + idLen |
+| `HELLO` | `A5 \| ver u8 \| session u32 \| e_i[32] \| idLen u8 \| machineId \| mac[48]` | 87 + idLen |
+| `HELLO_ACK` | 同上，`e_r` 替代 `e_i` | 87 + idLen |
+| `REFUSE` | `A5 \| ver u8 \| session u32 \| code u8 \| idLen u8 \| machineId[ \| mac 48]` | 8 + idLen，或 56 + idLen |
+
+> 长度是 **87 + idLen**，不是 88：前缀 39 字节（magic 1 + ver 1 + session 4 + `e[32]` 32 + idLen 1），
+> 加 `mac[48]` 共 87，再加 `idLen` 字节的 `machineId`。代码里就是
+> `HANDSHAKE_PREFIX_BYTES = 1 + 1 + 4 + KEY_BYTES + 1`（39）加 `MAC_BYTES`（48），
+> `test/p2p-crypto.test.mjs` 也按 `1+1+4+32+1+byteLength(machineId)+48` 断言。
 
 `mac` = `AEAD(k0, nonce=0, BLAKE2s-256(prologue ‖ ver u8 ‖ session u32 ‖ s_i.pub ‖ s_r.pub))`，48 字节
 （32 密文 + 16 tag）。`mac'` = 同 `k0`，消息为 `BLAKE2s-256(HELLO ‖ e_r)`。
@@ -402,7 +433,19 @@ Step 3  比对全部"可比字段"：
 > 真实性无关。该省略以常量 `HANDSHAKE_MAC_FIELDS_OMITTED` 落在代码里，不是沉默。
 
 `REFUSE.code`：`1`=UNKNOWN_PEER、`2`=BAD_MAC、`3`=REPLAY、`4`=NO_KEY、`5`=VERSION、`6`=NO_PEER_KEY。
-`REFUSE` 本身**不认证**（它正是在无法认证对端时发出的），因此不携带任何证明。
+
+`REFUSE` 的**可选尾部 48 字节 MAC**（v0.5.3 起的加固，MEDIUM-4 修复）用
+`k_ref = HKDF-SHA256(ECDH(e_i, s_r))` 封装，消息为 `BLAKE2s-256(label ‖ 不含 MAC 的 REFUSE)`，其中
+`label = "w2m-p2p-crypto v1 refuse"`。两端都能推导 `k_ref`：发起方持有 `e_i` 私钥与 `s_r` 公钥，
+响应方持有自己的 `s_r` 与 `HELLO` 里公开的 `e_i`——因此**即使响应方完全没有本机公钥**（`NO_PEER_KEY`
+的情形）也仍能给出证明；而 `k0` 在那种情形下根本不存在，这正是这个 MAC 必须用 `k_ref` 的原因。
+`NO_PEER_KEY`/`UNKNOWN_PEER`/`BAD_MAC` 在可封装时一律封装；`VERSION` 保持裸体（需要对端的 body 布局
+本端无法担保）。因此「`REFUSE` 不认证」这句话只在**旧版本对端**意义上成立：可以没有 MAC，但规则是——
+**要求明文的降级类拒绝**（`NO_KEY`/`NO_PEER_KEY`）必须**要么带通过验证的 `k_ref` 证明，要么不带 MAC
+且来自「已确认本次打洞的那个地址」**；**终结类拒绝**（`BAD_MAC`/`REPLAY`/版本不符）只要来自打过的地址
+就被采纳（无论是否封装），结果里用 `refusal_authenticated` 记下 `true`（证明通过）/`null`（无 MAC）/
+`false`（有 MAC 但没通过），账本因此不会把「有人说」当成「对端证明」。丢弃的拒绝数据报只被记录、
+绝不使打洞失败——否则伪造一个数据报就成了比压制真实应答更便宜的拒绝服务。
 
 ### 9.4 数据面帧加密
 
@@ -432,10 +475,19 @@ frame = kind u8 | session u32 | A5 | epoch u8 | counter u64le | ciphertext | tag
 | `P2P_CRYPTO_HANDSHAKE_TIMEOUT` | 路径已通但握手未完成 → 不建通道 |
 | `P2P_CRYPTO_VERSION_MISMATCH` / `MALFORMED` | 版本或报文形状不可用 |
 | `P2P_CRYPTO_PLAINTEXT_PEER` | 对端未学得密钥（v0.5.x 情形）→ 明文通道 |
+| `P2P_CRYPTO_REFUSE_SESSION_MISMATCH` | 收到的 `REFUSE` 未指名本次打洞的 session → **丢弃并记录**，不改变结果 |
+| `P2P_CRYPTO_REFUSE_UNPUNCHED_SOURCE` | `REFUSE` 来自本次打洞从未打过的地址 → 丢弃并记录 |
+| `P2P_CRYPTO_REFUSE_BAD_MAC` | 降级类 `REFUSE` 带 MAC 但验证失败 → 丢弃并记录（终结类拒绝不因 MAC 失败被丢） |
+| `P2P_CRYPTO_REFUSE_UNCORROBORATED` | 未封装的降级类 `REFUSE` 并非来自「已确认本次打洞的地址」→ 丢弃并记录 |
 
 **回退规则**：握手失败 → 任务**照旧走中继**，信封记录 `p2p.encrypted: false` 与原因；机器**绝不**
 因为安全升级而丢失。唯一不允许的降级是"已持有对端密钥、握手失败后仍建明文通道"——那是一次攻击者
-可触发的降级。
+可触发的降级。**这句在 v0.5.3 被收紧为更准确的表述**：握手*失败*本身绝不回落明文；唯一会给出明文
+通道的是对端明确声明"无法参与"（`NO_KEY`/`NO_PEER_KEY`），而这样的拒绝必须**要么带 `k_ref` 证明、
+要么来自已确认本次打洞的那个地址**。结果里同时记录 `refusal_authenticated`，让账本能区分
+「对端证明了自己」与「有人这么说」。仍然存在的残余风险（攻击者能从被打洞对端自己的地址与端口发出
+**未封装**的拒绝）写在 `docs/P2P-CRYPTO.md` §2 与 §9 的最后，不再用绝对句掩盖。
+四个 `P2P_CRYPTO_REFUSE_*` 码都只记录、**绝不使打洞失败**：否则伪造一个数据报就比压制真实应答更便宜。
 
 ### 9.6 信封字段
 
@@ -455,7 +507,8 @@ frame = kind u8 | session u32 | A5 | epoch u8 | counter u64le | ciphertext | tag
 | 对端 | 结果 |
 |---|---|
 | v0.4.x / v0.5.x（无 `static_keys`） | 本端发**普通** `HELLO`，明文通道，任务照常完成，`p2p.encrypted: false` + 具名原因 |
-| v0.6.0（`static_keys` 齐备） | 握手完成，通道密封，`p2p.encrypted: true` |
-| v0.6.0，但本端无对端公钥 | 对端回 `REFUSE(6)`＋普通 `HELLO_ACK` → 明文通道，原因为 `P2P_CRYPTO_NO_KEY` |
+| v0.5.3 及以后，`static_keys` 齐备 | 握手完成，通道密封，`p2p.encrypted: true` |
+| v0.5.3 及以后，但本端无对端公钥 | 对端回 `REFUSE(6)`＋普通 `HELLO_ACK` → 明文通道，原因为 `P2P_CRYPTO_NO_KEY` |
 | 公钥错误 / 有人在冒充 | `REFUSE(2)` → **不建通道**，任务走中继，账本记 `encrypted: false` + `P2P_CRYPTO_BAD_MAC` |
+| 第三方伪造 `REFUSE`（v0.5.9 MEDIUM-4） | 会话不符、地址未打过、MAC 不通过，或降级类拒绝未被同一地址确认 → 丢弃并记 `P2P_CRYPTO_REFUSE_*`，打洞结果不变 |
 | 自打洞（relay 把任务租给下发机自己） | 明文通道（自连接无路径可保护，且不得失败）

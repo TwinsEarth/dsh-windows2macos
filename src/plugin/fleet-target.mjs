@@ -34,6 +34,12 @@
  *   GET  /api/w2m/target?session_id=…   the fleet and this session's selection, as one snapshot
  *   POST /api/w2m/target                { session_id, machine_id|null } → the same snapshot
  *
+ * A refusal is `{ok: false, error, reason_code, detail}` with a `{@link TARGET_REFUSAL}` code and a
+ * `detail` that says what would change it; a `PUT`/`DELETE`/`PATCH` is a `405` rather than a write
+ * (only exactly `GET` and `POST` are answered), a machine the relay does not list is a `409` exactly
+ * like one it lists as offline, and `session_id` is capped at {@link MAX_SESSION_ID_LENGTH} characters
+ * on both verbs because the store keys on the whole string.
+ *
  * Plain `Response.json`, no Typert descriptor: this package is dependency-free, and a generated
  * strict Remote contribution is neither reachable from plain JavaScript nor worth a codec for one
  * object. Nothing else in the protocol changes — no new relay endpoint, no new tool parameter, no
@@ -75,6 +81,49 @@ export const NO_SESSION = '(no-session)';
 
 /** Session buckets retained before the oldest is evicted; a browse session cannot grow this. */
 export const MAX_SELECTIONS = 512;
+
+/**
+ * Longest `session_id` this route accepts, in characters (UTF-16 code units).
+ *
+ * `MAX_SELECTIONS` bounds how many buckets exist; it says nothing about how large one key is, and the
+ * store keeps the whole string. A caller that sends a 200,000-character id therefore allocates as much
+ * as it likes per request and gets it echoed back in the snapshot — the count cap bounds the *number*
+ * of sessions, never the *bytes*. 200 is a bound with room to spare: a DSH session id is a UUID (36
+ * characters), and 200 leaves room for a ULID, a path-shaped id or a test's own naming without
+ * inviting an unbounded key.
+ */
+export const MAX_SESSION_ID_LENGTH = 200;
+
+/**
+ * The `/api/w2m/target` route's refusals, in the house `{reason_code, detail}` shape.
+ *
+ * Deliberately a map of its own rather than a widening of `tools.mjs`'s `REFUSAL_CODE`: those codes name
+ * refusals on the *dispatch* path (which the eight tools report), while these name refusals at the
+ * route the browser calls, and `fleet-target.mjs` is imported *by* `tools.mjs` — importing back would
+ * be a cycle. `reason_code` is the greppable, stable identifier and `detail` says what would change it.
+ */
+export const TARGET_REFUSAL = Object.freeze({
+  /** A verb this route does not answer. Only exactly `GET` and `POST` are read or written. */
+  METHOD_NOT_ALLOWED: 'TARGET_METHOD_NOT_ALLOWED',
+  /** `GET` carried no `session_id`, so there is no session to answer for. */
+  SESSION_ID_REQUIRED: 'TARGET_SESSION_ID_REQUIRED',
+  /** `session_id` is longer than {@link MAX_SESSION_ID_LENGTH}. */
+  SESSION_ID_TOO_LONG: 'TARGET_SESSION_ID_TOO_LONG',
+  /** A `POST` body that could not be parsed as JSON at all. */
+  BODY_NOT_JSON: 'TARGET_BODY_NOT_JSON',
+  /** A `POST` body that is not a JSON object. */
+  BODY_NOT_AN_OBJECT: 'TARGET_BODY_NOT_AN_OBJECT',
+  /** `machine_id` was neither a string nor null. */
+  MACHINE_ID_NOT_A_STRING: 'TARGET_MACHINE_ID_NOT_A_STRING',
+  /** `machine_name` was neither a string nor null. */
+  MACHINE_NAME_NOT_A_STRING: 'TARGET_MACHINE_NAME_NOT_A_STRING',
+  /** The named machine is not one the relay lists at all. */
+  MACHINE_UNKNOWN: 'TARGET_MACHINE_UNKNOWN',
+  /** The named machine exists, and the relay does not call it online. */
+  MACHINE_OFFLINE: 'TARGET_MACHINE_OFFLINE',
+  /** The fleet could not be read, so no selection could be checked against it. */
+  FLEET_UNAVAILABLE: 'TARGET_FLEET_UNAVAILABLE',
+});
 
 /** How long the fleet roster may be reused by the control before it is asked for again. */
 export const FLEET_CACHE_MS = 10_000;
@@ -415,25 +464,55 @@ export function buildUiState(deps) {
 /**
  * Parse the JSON body of a selection write, refusing anything outside the declared shape.
  *
+ * Every refusal is a *value with a name*: `reason_code` is stable and greppable, and `detail` says what
+ * would have to change for the same request to be accepted. The route turns both into the response body
+ * verbatim, so the browser can show the reason without re-deriving it.
+ *
  * @param {unknown} body
- * @returns {{ok: true, value: {session_id: string, machine_id: string|null, machine_name: string|null}}|{ok: false, error: string}}
+ * @returns {{ok: true, value: {session_id: string, machine_id: string|null, machine_name: string|null}}
+ *   |{ok: false, error: string, reason_code: string, detail: string}}
  */
 export function parseSelectionWrite(body) {
+  const refuse = (error, reason_code, detail) => ({ ok: false, error, reason_code, detail });
   if (body === null || typeof body !== 'object' || Array.isArray(body)) {
-    return { ok: false, error: 'body must be a JSON object' };
+    return refuse(
+      'body must be a JSON object',
+      TARGET_REFUSAL.BODY_NOT_AN_OBJECT,
+      'send `{"session_id": "<id>", "machine_id": "<id>|null"}`',
+    );
   }
   const record = /** @type {Record<string, unknown>} */ (body);
   const sessionId = record.session_id;
   if (typeof sessionId !== 'string' || sessionId === '') {
-    return { ok: false, error: '`session_id` must be a non-empty string' };
+    return refuse(
+      '`session_id` must be a non-empty string',
+      TARGET_REFUSAL.SESSION_ID_REQUIRED,
+      'send the id of the session this selection belongs to',
+    );
+  }
+  if (sessionId.length > MAX_SESSION_ID_LENGTH) {
+    return refuse(
+      `\`session_id\` must be at most ${MAX_SESSION_ID_LENGTH} characters, got ${sessionId.length}`,
+      TARGET_REFUSAL.SESSION_ID_TOO_LONG,
+      `send the id the host gave this session (a UUID is 36 characters); anything longer than `
+        + `${MAX_SESSION_ID_LENGTH} characters is not a session id`,
+    );
   }
   const machineId = record.machine_id;
   if (machineId !== null && machineId !== undefined && typeof machineId !== 'string') {
-    return { ok: false, error: '`machine_id` must be a string or null' };
+    return refuse(
+      '`machine_id` must be a string or null',
+      TARGET_REFUSAL.MACHINE_ID_NOT_A_STRING,
+      'send a `machine_id` from the roster this route reports, or null to clear the selection',
+    );
   }
   const machineName = record.machine_name;
   if (machineName !== null && machineName !== undefined && typeof machineName !== 'string') {
-    return { ok: false, error: '`machine_name` must be a string or null' };
+    return refuse(
+      '`machine_name` must be a string or null',
+      TARGET_REFUSAL.MACHINE_NAME_NOT_A_STRING,
+      'send the machine\'s display name as a string, or leave it out and the relay\'s name is used',
+    );
   }
   return {
     ok: true,
@@ -603,11 +682,51 @@ function mountTargetRoutes(connection, deps, status, logger) {
     fetch: async (request) => {
       const url = new URL(request.url);
       const noStore = { 'cache-control': 'no-store' };
+      /**
+       * One refusal shape for the whole route: `{ok:false, error, reason_code, detail}`.
+       *
+       * @param {number} status
+       * @param {string} reasonCode A {@link TARGET_REFUSAL} value.
+       * @param {string} error What happened, in the host's own words (the control prints this).
+       * @param {string} detail What would change it.
+       * @returns {Response}
+       */
+      const refuse = (status, reasonCode, error, detail) =>
+        Response.json({ ok: false, error, reason_code: reasonCode, detail }, { status, headers: noStore });
+
+      // Defence in depth, and the one place it is cheap. The registration above declares
+      // `methods: ['GET', 'POST']`, so the host should never route a `PUT`/`DELETE`/`PATCH` here at all
+      // — but the handler used to treat *anything* that was not a GET as a write, which means a
+      // registration mistake, a host that forwards other verbs, or a future `methods` change would
+      // silently turn `DELETE /api/w2m/target` into "clear this selection". A route that writes must
+      // say which verbs write; everything else is refused by name rather than guessed at.
+      if (request.method !== 'GET' && request.method !== 'POST') {
+        return refuse(
+          405,
+          TARGET_REFUSAL.METHOD_NOT_ALLOWED,
+          `${request.method} is not a method this route answers`,
+          'GET reads the fleet and this session\'s selection and POST writes one; any other verb is refused '
+            + 'rather than treated as a write',
+        );
+      }
 
       if (request.method === 'GET') {
         const sessionId = url.searchParams.get('session_id');
         if (typeof sessionId !== 'string' || sessionId === '') {
-          return Response.json({ ok: false, error: '`session_id` query parameter is required' }, { status: 400 });
+          return refuse(
+            400,
+            TARGET_REFUSAL.SESSION_ID_REQUIRED,
+            '`session_id` query parameter is required',
+            'add `?session_id=<the session the control belongs to>`',
+          );
+        }
+        if (sessionId.length > MAX_SESSION_ID_LENGTH) {
+          return refuse(
+            400,
+            TARGET_REFUSAL.SESSION_ID_TOO_LONG,
+            `\`session_id\` must be at most ${MAX_SESSION_ID_LENGTH} characters, got ${sessionId.length}`,
+            `send the id the host gave this session (a UUID is 36 characters)`,
+          );
         }
         try {
           return Response.json(await snapshot(sessionId, request.signal), { headers: noStore });
@@ -623,10 +742,17 @@ function mountTargetRoutes(connection, deps, status, logger) {
       try {
         body = await request.json();
       } catch {
-        return Response.json({ ok: false, error: 'body is not JSON' }, { status: 400 });
+        return refuse(
+          400,
+          TARGET_REFUSAL.BODY_NOT_JSON,
+          'body is not JSON',
+          'send `{"session_id": "<id>", "machine_id": "<id>|null"}` as a JSON object',
+        );
       }
       const parsed = parseSelectionWrite(body);
-      if (!parsed.ok) return Response.json({ ok: false, error: parsed.error }, { status: 400 });
+      if (!parsed.ok) {
+        return refuse(400, parsed.reason_code, parsed.error, parsed.detail);
+      }
       const { session_id: sessionId, machine_id: machineId, machine_name: machineName } = parsed.value;
 
       if (machineId === null) {
@@ -642,16 +768,35 @@ function mountTargetRoutes(connection, deps, status, logger) {
       const cfg = deps.cfg();
       const fleet = await fleetFor(request.signal);
       if (fleet.ok !== true) {
-        return Response.json(
-          { ok: false, error: `the fleet could not be read, so no target was changed: ${fleet.error ?? 'unknown cause'}` },
-          { status: 503 },
+        return refuse(
+          503,
+          TARGET_REFUSAL.FLEET_UNAVAILABLE,
+          `the fleet could not be read, so no target was changed: ${fleet.error ?? 'unknown cause'}`,
+          'bring the relay back (or fix `rabbitUrl`) and choose again; nothing was selected in the meantime',
         );
       }
       const machine = fleet.machines.find((entry) => entry.machine_id === machineId) ?? null;
-      if (machine !== null && machine.online !== true) {
-        return Response.json(
-          { ok: false, error: `${machine.name ?? machineId} is listed as ${machine.state}, so it cannot be selected` },
-          { status: 409 },
+      // A machine the relay does not list *at all* is refused in exactly the same breath as one it lists
+      // as offline. The comment above always claimed this and the code did not do it: `machine === null`
+      // fell through to `store.set`, so `{"machine_id":"NOT-A-MACHINE"}` was accepted with a 200 and a
+      // selection the fleet could never honour. Dispatch re-validates, which is what bounded the impact
+      // — but a control whose whole promise is "you cannot select what the fleet cannot run" has to
+      // refuse the id it has never heard of too.
+      if (machine === null) {
+        return refuse(
+          409,
+          TARGET_REFUSAL.MACHINE_UNKNOWN,
+          `${machineId} is not a machine this relay lists`,
+          'pick a machine from the roster this route reports; if it has just paired, reload the list and '
+            + 'choose it again',
+        );
+      }
+      if (machine.online !== true) {
+        return refuse(
+          409,
+          TARGET_REFUSAL.MACHINE_OFFLINE,
+          `${machine.name ?? machineId} is listed as ${machine.state}, so it cannot be selected`,
+          'the machine must be online: wait for its next heartbeat, or select another machine',
         );
       }
       deps.store.set(sessionId, {

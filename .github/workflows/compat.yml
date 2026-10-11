@@ -284,6 +284,22 @@ jobs:
            *                   that is UNVERIFIABLE — never PASS, reported in the summary — and accepted
            *                   only for a reason on the list below.
            *
+           * TWO RULES THIS PROGRAM IS BUILT AROUND, both added after its first version was reviewed:
+           *
+           *   1. THE ACCEPTED REASON IS THE SKIP'S OWN REASON, NOT THE ENVIRONMENT'S. The first
+           *      version decided the reason from the runner (`BROWSER === '' ? 'no-browser' :
+           *      'unknown'`), so a page assertion skipped for a reason that is a property of the
+           *      *composition* -- "this composition serves no Web app, so there is no page to open",
+           *      or a Web app that did not boot -- printed `Accepted reason \`no-browser\`` and exited
+           *      0 on a browserless runner. The accepted list is now matched against the skip
+           *      directive's own text, and only the page half may use it.
+           *
+           *   2. THE PROTECTION IS STRUCTURAL. The first version checked nine hand-listed titles plus
+           *      the page half, so any *other* assertion in the capture could skip unnoticed: an
+           *      eleventh test that skipped left `# skipped 1` and exited 0. Every result line in the
+           *      capture is now classified, and the assertions the test file declares are read out of
+           *      the file itself, so an assertion that produced no line at all is a FAIL too.
+           *
            * Exit status: 0 for PASS, and for UNVERIFIABLE whose reason is on the accepted list. Every
            * other outcome is non-zero.
            */
@@ -292,6 +308,15 @@ jobs:
           const TAP_FILE = process.env.TAP_FILE;
           const EXIT_FILE = process.env.TEST_EXIT_FILE;
           const BROWSER = process.env.W2M_DSH_BROWSER ?? '';
+          /**
+           * The suite this program classifies, read rather than assumed.
+           *
+           * The assertions the file declares are what "an assertion produced no result line" is
+           * measured against, so a test added tomorrow is covered by this gate without anyone editing
+           * a list here -- which is the difference between a structural protection and a hand-checked
+           * one.
+           */
+          const TEST_FILE = process.env.W2M_COMPAT_TEST_FILE ?? 'test/loader-entry.test.mjs';
 
           /**
            * Substrings that identify the deterministic assertions in `test/loader-entry.test.mjs`.
@@ -318,14 +343,39 @@ jobs:
 
           /**
            * THE ACCEPTED-UNVERIFIABLE LIST. One entry, and it is the only reason an un-evaluated claim
-           * may leave this job green. The reason must be a fact about the runner, not about the
-           * artifact: `no-browser` is only ever produced when this workflow's own probe found no
-           * browser, which is why the probe runs before the gate and why a browser-resolved-but-skipped
-           * outcome below is a failure rather than an excuse.
+           * may leave this job green.
+           *
+           * `match` is tested against **the skip directive's own text**, never against the runner's
+           * probe. The first version of this program keyed the verdict on the environment
+           * (`BROWSER === '' ? 'no-browser' : 'unknown'`), so a capture whose page line was skipped
+           * for a reason that is a property of *our composition* -- "this composition serves no Web
+           * app, so there is no page to open", or a Web app that did not boot -- was reported as
+           * `Accepted reason \`no-browser\`` and exited 0 on a runner without a browser. The reason a
+           * claim was not evaluated is a fact about the claim, and it is the claim's own words that
+           * have to be accepted.
+           *
+           * `appliesTo` is what keeps the list narrow: only the page assertion may be skipped, so a
+           * deterministic assertion that skipped cannot borrow this excuse even if its reason text
+           * were copied verbatim.
            */
-          const ACCEPTED_UNVERIFIABLE = new Map([
-            ['no-browser', 'this runner has no Chromium-based browser at any path test/helpers/dsh-page-boot.mjs probes'],
-          ]);
+          const ACCEPTED_UNVERIFIABLE = [
+            {
+              key: 'no-browser',
+              appliesTo: PAGE,
+              // test/helpers/dsh-page-boot.mjs's own sentence when its probe found no browser at any
+              // candidate path. `W2M_DSH_BROWSER=none` and `W2M_DSH_BROWSER names a missing file: ...`
+              // are deliberately NOT accepted: both mean a human (or a step) switched the page half
+              // off, and a claim nobody switched on must not leave a job green.
+              match: /^no Chromium-based browser found \(set W2M_DSH_BROWSER to one\)/,
+              why: 'this runner has no Chromium-based browser at any path test/helpers/dsh-page-boot.mjs probes',
+            },
+          ];
+
+          /** The accepted entry for a skipped row, or null. Only the page half has one. */
+          const acceptedFor = (row) => {
+            if (!row.skipped || !row.name.includes(PAGE)) return null;
+            return ACCEPTED_UNVERIFIABLE.find((entry) => entry.match.test(row.skipReason ?? '')) ?? null;
+          };
 
           const rows = [];
           const counts = Object.create(null);
@@ -372,31 +422,79 @@ jobs:
           else if (exit !== 0) problems.push(`\`node --test\` exited ${exit}`);
           if ((counts.fail ?? 0) !== 0) problems.push(`${counts.fail} TAP subtest(s) failed`);
 
-          for (const needle of DETERMINISTIC) {
-            const row = only(needle);
-            if (row === null) continue;
-            if (row.skipped) problems.push(`the deterministic assertion "${row.name}" was SKIPPED (${row.skipReason}); it is a property of the artifact, so a runner that cannot evaluate it fails this claim`);
-            else if (!row.ok) problems.push(`the deterministic assertion "${row.name}" failed`);
+          // ---- 1. the assertions the SUITE declares, read out of the test file -------------------
+          //
+          // The nine titles below identify the assertions this workflow was written for; this scan is
+          // what notices an assertion that was *added* and produced no result line. Without it, "any
+          // assertion that is skipped, failed or missing is a failure" would only be true of the
+          // assertions somebody remembered to list here.
+          let declaredTitles = [];
+          try {
+            const source = fs.readFileSync(TEST_FILE, 'utf8');
+            declaredTitles = [...source.matchAll(/^[ \t]*(?:it|test)\(\s*'((?:[^'\\]|\\.)*)'/gm)].map((m) => m[1]);
+          } catch (error) {
+            problems.push(`could not read ${TEST_FILE} (${error?.message ?? String(error)}), so an assertion that produced no result line could not be noticed`);
+          }
+          if (declaredTitles.length === 0) {
+            problems.push(`${TEST_FILE} declares no assertion this program can read (\`it('...')\` / \`test('...')\` at the start of a line), so the scan itself has drifted and would accept a capture that ran nothing`);
+          }
+          for (const title of declaredTitles) {
+            const found = rows.filter((row) => row.name.includes(title));
+            if (found.length === 0) {
+              problems.push(`the test file declares "${title}" and the capture holds no result line for it: the assertion did not run`);
+            } else if (found.length > 1) {
+              problems.push(`"${title}" matches ${found.length} TAP result lines; expected exactly one`);
+            }
+          }
+
+          // ---- 2. every named deterministic assertion is present ----------------------------------
+          for (const needle of DETERMINISTIC) only(needle);
+
+          // ---- 3. EVERY result line in the capture, classified ------------------------------------
+          //
+          // This is the structural half. A skip is a hole in the evidence, and the only hole this
+          // gate accepts is the page half for an accepted reason; a line that failed is a failure
+          // whatever it is called. An assertion nobody listed above cannot slip through here.
+          const allowedSkips = [];
+          for (const row of rows) {
+            const accepted = acceptedFor(row);
+            if (row.skipped) {
+              if (accepted === null) {
+                problems.push(`"${row.name}" was SKIPPED (${row.skipReason}) and that reason is not on the accepted list; an un-evaluated assertion fails this gate, and the accepted list covers only "${PAGE}"`);
+                continue;
+              }
+              allowedSkips.push({ row, accepted });
+              report.push(`  SKIP ${row.name} (${row.skipReason})`);
+              continue;
+            }
+            if (!row.ok) problems.push(`"${row.name}" failed in the capture`);
             else report.push(`  ok   ${row.name}`);
           }
 
+          // ---- 4. the page half, whose outcome the summary must state either way -------------------
           const page = only(PAGE);
+          const pageAccepted = page === null ? null : acceptedFor(page);
           if (page === null) {
             // `only()` has already recorded the failure.
           } else if (page.skipped && BROWSER !== '') {
             problems.push(`the page assertion was SKIPPED although this workflow resolved ${BROWSER}: the probes disagree, or the browser cannot start`);
-          } else if (page.skipped) {
+          } else if (page.skipped && pageAccepted !== null) {
             unverifiable.push(`the page half did not run: ${page.skipReason}`);
-            report.push(`  SKIP ${page.name} (${page.skipReason})`);
+          } else if (page.skipped) {
+            // already recorded by the row scan above, which is where every skip is judged
           } else if (!page.ok) {
             problems.push(`the page assertion failed: ${page.name}`);
           } else {
-            report.push(`  ok   ${page.name} (browser: ${BROWSER})`);
+            report.push(`  ok   ${page.name} (browser: ${BROWSER || 'resolved by the helper itself'})`);
+          }
+
+          // ---- 5. the summary and the lines must agree --------------------------------------------
+          if ((counts.skipped ?? 0) !== allowedSkips.length) {
+            problems.push(`the capture's summary says ${counts.skipped ?? 0} skipped while ${allowedSkips.length} accepted skip(s) are on its result lines; the tally and the lines must agree before either can be believed`);
           }
 
           const verdict = problems.length > 0 ? 'FAIL' : unverifiable.length > 0 ? 'UNVERIFIABLE' : 'PASS';
-          const reason = verdict === 'UNVERIFIABLE' ? (BROWSER === '' ? 'no-browser' : 'unknown') : null;
-          const accepted = reason !== null && ACCEPTED_UNVERIFIABLE.has(reason);
+          const acceptedReason = unverifiable.length > 0 ? allowedSkips[0].accepted : null;
           const lines = [
             `### compat / mount-and-boot: ${verdict}`,
             '',
@@ -404,9 +502,9 @@ jobs:
           ];
           if (verdict === 'UNVERIFIABLE') {
             lines.push('', `**The page-boot claim was NOT evaluated.** ${unverifiable.join('; ')}`);
-            lines.push(accepted
-              ? `Accepted reason \`${reason}\` (${ACCEPTED_UNVERIFIABLE.get(reason)}). The nine deterministic assertions above did run and did pass; this run verifies them and not the browser half.`
-              : `Reason \`${String(reason)}\` is not on the accepted list, so this run fails.`);
+            lines.push(acceptedReason !== null
+              ? `Accepted reason \`${acceptedReason.key}\` (${acceptedReason.why}). The nine deterministic assertions above did run and did pass; this run verifies them and not the browser half.`
+              : 'No accepted reason was recorded, so this run fails: an un-evaluated claim with no accepted reason is a failure.');
           }
           if (verdict === 'FAIL') {
             lines.push('', '**The claim failed.** An un-evaluated assertion is reported here as a failure on purpose.');
@@ -417,7 +515,7 @@ jobs:
           if (typeof process.env.GITHUB_STEP_SUMMARY === 'string' && process.env.GITHUB_STEP_SUMMARY !== '') {
             fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${lines.join('\n')}\n`);
           }
-          if (verdict === 'FAIL' || (verdict === 'UNVERIFIABLE' && !accepted)) {
+          if (verdict === 'FAIL' || (verdict === 'UNVERIFIABLE' && acceptedReason === null)) {
             // Annotations are for the pull-request UI; the summary above carries the whole list, so a
             // failure that skips nine assertions does not paint nine identical annotations over the diff.
             const shown = problems.length > 0 ? problems : unverifiable;
@@ -426,7 +524,7 @@ jobs:
             process.exit(1);
           }
           if (verdict === 'UNVERIFIABLE') {
-            process.stdout.write(`::warning title=compat::UNVERIFIABLE (accepted reason: ${reason}): the page-boot claim was not evaluated on this runner\n`);
+            process.stdout.write(`::warning title=compat::UNVERIFIABLE (accepted reason: ${acceptedReason.key}): the page-boot claim was not evaluated on this runner\n`);
           }
           process.exit(0);
           JS

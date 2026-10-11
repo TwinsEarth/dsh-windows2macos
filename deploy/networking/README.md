@@ -16,16 +16,39 @@ and a rung that cannot be opened is recorded with its reason rather than guessed
 | 1 | a channel is already open | `transport: p2p`, `offer_path: p2p` | nothing |
 | 2 | **simultaneous punch (A)** — the dispatcher punches, and the executor dials the same session it was told about | `transport: p2p`, `offer_path: p2p` | two NATs must agree, or one side must be dialable |
 | 3 | **reverse dial (B)** — no channel existed, so the receiving side dialled out to deliver the result | `transport: p2p`, `offer_path: relay` | the result found its own way home while the offer needed the relay |
-| 4 | **tunnel (C)** — WireGuard on the shared server, and every machine gets a routable `10.66.0.x` | `transport: p2p` — **indistinguishable from rung 1–2** | see the warning below |
+| 4 | **tunnel (C)** — WireGuard on the shared server, and every machine gets a routable `10.66.0.x` | `transport: p2p`, **plus the tunnel named explicitly** in the same result (see below) — never a bare `p2p` with nothing else said | see the warning below |
 | 5 | relay | `transport: relay` + a `p2p.reason` naming why | the relay carries the data |
+
+**What `transport` means, and what it must never be read as.** The ledger's `transport` describes the
+**socket path the envelope took** — `p2p` means it was carried on a socket between the two machines
+rather than on the relay's SSE stream. It does **not** mean the bytes avoided a server, and it must
+never be read as "peer-to-peer" in that sense. So wherever a tunnel carried the traffic, **the tunnel
+has to be named explicitly in the same result** — the `p2p` block's `opened_by` / `offer_path`, or an
+equivalent field — so that a reader who only has the ledger can tell a hub-forwarded socket from one
+between two machines alone.
+
+**And "direct" in this directory means exactly one thing:** *a socket between the two machines,
+forwarded by the hub.* Not "the bytes avoided a server" — never that.
+
+**Where the code stands on this, stated rather than implied.** The two fields that exist today —
+`p2p.offer_path` (`p2p` or `relay`) and `p2p.opened_by` (`dispatcher-punch`, `simultaneous-punch`,
+`result-reverse-dial`; `P2P_OPENED_BY` in `src/agent/agent.mjs`) — say **which socket carried it and
+which mechanism opened that socket**. Neither one currently distinguishes "a socket between two
+machines" from "a socket the hub forwards", because the agent cannot see the routing table. So on
+rung 4 the tunnel is named by **you**, in the deployment's own record (the `wg0` peer list and the
+route that produced the `10.66.0.x` address), and that record has to travel with the result. Treating
+a bare `transport: p2p` as proof of a server-free path is the reading this section exists to forbid;
+if the naming is ever automated, the field belongs beside `opened_by`, not inside `transport`.
 
 **Rung 4 is the one to read carefully.** WireGuard has no NAT traversal of its own — that is exactly
 what Tailscale adds on top of it (disco/DERP) and what rungs 2 and 3 are for. So with two machines
-behind NAT, traffic between their `10.66.0.x` addresses is **forwarded through the VPS**. The ledger
-will say `p2p`, and it will not be lying: from W2M's point of view that socket is direct. But the
-bytes cross a server. If you asked for "the data goes peer to peer", rung 4 does not satisfy that —
-it satisfies "the fleet works regardless of NAT, encrypted, with no third party", which is a
-different and still useful promise. Rung 2/3 are the ones that make the data path direct.
+behind NAT, traffic between their `10.66.0.x` addresses is **forwarded through the VPS**. Reading
+`transport: p2p` alone, you cannot tell rung 4 from rungs 1–2 — which is precisely why rung 4 is
+**not allowed to report a bare `p2p`**. Report the socket path *and* name the tunnel; a reader must be
+able to tell "these two machines have a socket" from "these two machines have a socket and no third
+party is on it". If you asked for "the data goes peer to peer", rung 4 does not satisfy that — it
+satisfies "the fleet works regardless of NAT, encrypted, with no third party", which is a different
+and still useful promise. Rungs 2/3 are the ones that make the data path direct *in the strong sense*.
 
 ## What is measured, and by what
 
@@ -122,7 +145,9 @@ Two port notes, both learned the hard way:
 
 * **Rung 5 is not a failure.** A task that completes over the relay completed. The ledger naming the
   path is the feature; pretending every path is direct would be the bug.
-* **A `p2p` reading on a tunnel (rung 4) does not mean the bytes avoided a server.** See above.
+* **A `p2p` reading on a tunnel (rung 4) does not mean the bytes avoided a server.** See above. The
+  socket is between the two machines; the bytes are forwarded by the hub. `transport` answers "which
+  socket", never "was a third party on the path", and a tunnel result has to name the tunnel itself.
 * **A symmetric NAT cannot be dialled into, ever.** Not by this project, not by Tailscale. What can
   be done is to have the symmetric side dial *out* (rungs 2 and 3) or to stop being behind it
   (rung 4, or another network).

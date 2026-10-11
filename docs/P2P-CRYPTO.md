@@ -30,7 +30,9 @@ that is actually valuable here and needs no privileges: **its cryptography and i
 * A passive observer anywhere on the path between two machines: task offers, results and file
   fingerprints on the direct UDP channel become unreadable.
 * An off-path attacker who knows a peer's address: without the peer's static private key a forged
-  `HELLO` cannot complete the handshake.
+  `HELLO` cannot complete the handshake, and a forged `REFUSE` cannot be sealed with `k_ref` either.
+  What such an attacker *can* still do is send an unsealed refusal if they can also spoof the punched
+  peer's source address and port — see the does-not-protect list below, which is where that belongs.
 * Replay and reordering of data frames: counters plus a replay window, not hope.
 * A *curious relay operator* reading task data **that travels over the direct channel**. Note the
   relay still sees the control plane — see below.
@@ -42,6 +44,17 @@ that is actually valuable here and needs no privileges: **its cryptography and i
   when, and the aggregate verdict. Metadata is not hidden by this work, and pretending otherwise would
   be worse than saying so.
 * Traffic analysis, or an attacker who can drop packets (availability is the relay's job).
+* **An active attacker who can inject a datagram at a punch address.** `REFUSE` is what tells a
+  dialler "the handshake is impossible, here is why", and the unknown-peer form of it (`NO_PEER_KEY`,
+  `NO_KEY`) is sent precisely when the sender holds no key for the dialler — so it can carry no `k0`
+  proof, and an attacker who can put one such datagram on the wire *from the punched peer's own
+  address and port* can force the recorded outcome: a plaintext channel with `P2P_CRYPTO_NO_KEY`, or —
+  with a terminal refusal — the relay fallback. The v0.6.0 guard (`REFUSE_GUARD` in `src/agent/p2p.mjs`)
+  narrows this to exactly that attacker: a refusal that names another session, arrives from any other
+  address, or carries a `k_ref` seal that does not verify changes nothing, and a sealed refusal cannot
+  be forged without the peer's static private key. A peer that *can* seal its refusal is therefore not
+  downgradable at all; a peer running an older build cannot seal one, and its plaintext fallback has to
+  stay reachable.
 * Any traffic that falls back to the relay, **unless** the relay leg is separately protected. Stage 1
   leaves the relay leg as it is and says so in the ledger (`encrypted: false` for that machine).
 
@@ -96,7 +109,28 @@ session key             k  = HKDF( ECDH(e_i, e_r) ‖ ECDH(s_i, e_r) ‖ ECDH(e_
 * A replayed `HELLO` cannot produce a session key, because the responder's fresh `e_r` never existed
   at the time the original was captured.
 * A machine that does not know the initiator's static key cannot verify `mac` and refuses, naming the
-  reason — never silently downgrading to plaintext.
+  reason. It does **not** silently downgrade to plaintext, and that sentence is narrower than it reads
+  — see the guard below and the residual in §2. What it means precisely is that a *failed handshake*
+  never falls back into the clear by itself: a plaintext channel is only handed back when the peer
+  named `NO_KEY`/`NO_PEER_KEY` **and** that refusal either came with proof or came from the address
+  that answered the punch. The v0.5.9 review broke the earlier, absolute wording with one 13-byte
+  datagram from a third socket, so the absolute wording is gone.
+
+**Refusals, and what makes one evidence rather than a claim.** A `REFUSE` may carry a trailing 48-byte
+MAC, sealed with `k_ref = HKDF(ECDH(e_i, s_r))` — the initiator's ephemeral (public on the wire) and
+the responder's static key (which the responder always holds). Both ends derive it, neither needs the
+other's *static* public key on file, and nobody else can. `NO_PEER_KEY`, `UNKNOWN_PEER`, `BAD_MAC` and
+`REPLAY` are sealed when the sender can; a `VERSION` mismatch is not, because the peer that needs it
+speaks a body layout this build cannot vouch for. A dialler drops a refusal that does not name the
+agreed session, or that arrives from an address the punch never dialled, and it drops a **sealed**
+refusal that would choose a plaintext channel while its seal does not verify. A plaintext-choosing
+refusal with *no* seal is honoured only when it comes from the endpoint that acknowledged the punch —
+that is the form an older build sends, and the reason it is still reachable. A terminal refusal
+(`BAD_MAC`, `REPLAY`, a version mismatch) is honoured from a dialled address whether or not it is
+sealed, and the outcome records which it was (`refusal_authenticated`: `true` proof, `null` no seal,
+`false` a seal that did not verify) so a claim is never mistaken for proof. A dropped refusal is
+recorded (`crypto.ignored_refusals`) and never fails the punch, because a datagram an attacker can
+forge must not be able to deny service either.
 
 **Transport.** ChaCha20-Poly1305 per frame; nonce = four zero bytes followed by a 64-bit
 little-endian counter, per direction (WireGuard's layout). A 64-message sliding replay window. Rekey
@@ -110,7 +144,12 @@ untouched.
 **Fallback, and it is not optional.** If the handshake fails — an older peer, an unknown key, a
 tampered packet — the task proceeds **exactly as today**, over the relay, and the ledger records
 `p2p.encrypted: false` together with the reason. A fleet must never lose a machine because a security
-upgrade could not complete; it must only *say* that it did not.
+upgrade could not complete; it must only *say* that it did not. The one outcome that is not a failure
+is the peer saying it cannot take part at all (`NO_KEY`/`NO_PEER_KEY`): that is a plaintext channel,
+recorded with its reason and with whether the refusal was sealed, and it is the documented outcome
+rather than a downgrade. What §4 does **not** promise is that no datagram can produce it: an
+unsealed refusal from the punched peer's own address can, which is the §2 residual and the reason the
+guard exists.
 
 **Compatibility.** Additive: an older peer ignores the unknown offer fields (that property is already
 pinned by tests) and its frames are plaintext, which the newer peer accepts while recording
@@ -128,7 +167,11 @@ window carry over unchanged.
 
 Unchanged from `deploy/networking/`: the hub makes machines reachable regardless of NAT, and it does
 **not** make them peers — traffic between two clients is forwarded by the hub. It stays a fallback for
-reachability, and the ledger must never label tunnelled traffic as direct.
+reachability. When it carries a task, the ledger's `transport` may describe the socket path — rung 4
+really is a socket between the two machines — but the tunnel **must be named explicitly** wherever it
+carried the traffic (the `p2p` block's `opened_by` / `offer_path`, or an equivalent field), and
+**"direct" must never be read as "the bytes avoided a server"**: here it means "a socket between the two
+machines, forwarded by the hub". Naming the tunnel is the requirement, not falsifying the socket.
 
 ## 7. How any of this is believed
 
@@ -223,3 +266,61 @@ decision nobody has needed yet.
   rediscovered.
 * A v0.4.x/v0.5.x peer is unaffected: it gets the plain channel it always had, and our side records
   `encrypted: false` with a reason. Never silently downgraded, never dropped from the fleet.
+
+### Added by the v0.5.9 review (MEDIUM-4)
+
+The review reproduced a downgrade with one datagram: a third socket on loopback sending a 13-byte
+`HELLO_ACK` whose body is `REFUSE(NO_PEER_KEY)`. Without it the punch refused with
+`P2P_CRYPTO_HANDSHAKE_TIMEOUT` and returned no channel; with it the same punch returned `ok: true` with
+a plaintext channel and recorded `P2P_CRYPTO_NO_KEY` — a live channel where the text of §4 and the
+`cryptoOutcome` comment said none could exist, and a ledger entry blaming the peer. The fix is
+`REFUSE_GUARD` (`src/agent/p2p.mjs`) plus the `k_ref` seal (`src/agent/crypto.mjs`), and it is stated
+here rather than folded into §4 because §4 is the contract as it was agreed:
+
+* a refusal must name the session the punch agreed, and arrive from an address that punch dialled;
+* a **sealed** refusal that would choose a plaintext channel and whose `k_ref` seal does not verify is
+  dropped — an honest peer either seals correctly or sends no seal at all;
+* an *unsealed* refusal that would choose plaintext must come from the endpoint that acknowledged the
+  punch — which is how an older peer, one that cannot seal, keeps its fallback;
+* a *terminal* refusal is honoured from a dialled address sealed or not, and `refusal_authenticated`
+  records whether its seal was proof;
+* a dropped refusal is recorded with a `reason_code` (`P2P_CRYPTO_REFUSE_SESSION_MISMATCH`,
+  `P2P_CRYPTO_REFUSE_UNPUNCHED_SOURCE`, `P2P_CRYPTO_REFUSE_BAD_MAC`,
+  `P2P_CRYPTO_REFUSE_UNCORROBORATED`) and never fails the punch, so forging one is not a cheap denial
+  of service;
+* the outcome now says whether a refusal was proof or a claim (`refusal_authenticated`), because a
+  ledger that cannot tell those apart is the part of the defect that outlives the packet.
+
+**Residual, and it is the honest version of §2's new bullet**: an attacker who can send an unsealed
+refusal *from the punched peer's own address and port* can still force the recorded plaintext outcome,
+or the relay fallback with a terminal refusal, against a peer old enough not to seal. Against a peer
+that seals, it cannot. What no longer works at all is a datagram from anywhere else, one naming
+another session, or a sealed downgrade that does not verify.
+
+**Why a sealed downgrade that does not verify is dropped, and what that costs.** Sealing is not optional
+for a peer that can do it — `k_ref` needs only the ephemeral it already received and the static key it
+already holds — so a *plaintext-choosing* refusal that arrives sealed and fails verification is not a
+peer whose records disagree with ours; it is a datagram somebody assembled. Honouring it as a claim
+would let anyone who can spoof the punched address force plaintext, which is the defect this section
+exists to close. The cost is stated rather than hidden: when **our** stored key for the peer is stale,
+the peer seals its honest refusal with a `k_ref` we cannot reproduce, and what happens next depends on
+which refusal it is. If it is a *downgrade* — the peer also holds no key for us, so it answers
+`NO_PEER_KEY` — the seal fails and the refusal is dropped, so that misconfigured pair falls back to the
+**relay** instead of a plaintext direct channel. If it is *terminal* — the peer does hold a good key for
+us, so the mismatch shows up as `BAD_MAC` — the refusal is still honoured and still named, with
+`refusal_authenticated: false` recording that its seal proved nothing. Either way the task completes,
+the ledger records a fact that is true (`P2P_CRYPTO_HANDSHAKE_TIMEOUT`, or the peer's own named
+refusal) rather than a plaintext channel an attacker could have chosen, and the staleness is the
+operator's to fix. `refusal_authenticated` is what keeps the rest honest, and it is deliberately
+three-valued on the outcome: `true` (a `k_ref` seal verified — proof), `null` (no seal at all: the form
+an older build sends, which proves nothing), `false` (a seal was present and did not verify — the
+stale-key `BAD_MAC` just described, which fails the punch honestly and is simply never counted as
+proof). A reader of the ledger can therefore never mistake "somebody said the peer refused" for "the
+peer proved it refused".
+
+One collision was found and closed while adding the seal: `decodeRefuse` accepted one length and
+validated nothing else, so a genuine `HELLO_ACK` could be read as a refusal — `body[6]` (the first byte
+of a random ephemeral) as the code and `body[7]` as an id length — roughly once in 256 handshakes,
+which would have refused an honest punch. The parse now checks the version byte, both legal lengths and
+that the machine id holds no control bytes; a test bends a real acknowledgement's length byte into the
+collision and asserts it is still not a refusal.

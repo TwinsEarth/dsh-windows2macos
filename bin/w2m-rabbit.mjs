@@ -45,6 +45,10 @@ Credentials and state:
                          written to <state>/operator-token.txt if omitted.
                          Pass an empty string to remove the requirement.
                          [env W2M_OPERATOR_TOKEN]
+  --print-operator-token Print the token in this banner even when this start did
+                         not generate it. Default off: the token is printed on
+                         the start that generated it (and is always written to
+                         <state>/operator-token.txt, 0600). [env W2M_PRINT_OPERATOR_TOKEN=1]
   --state <dir>          State directory. Default <DSH_HOME>/xclient/rabbit.
   --no-persist           Keep everything in memory; forget devices and tasks on
                          restart.
@@ -102,6 +106,7 @@ try {
       'tls-key': { type: 'string' },
       'pair-rate-limit': { type: 'string' },
       'operator-token': { type: 'string' },
+      'print-operator-token': { type: 'boolean', default: false },
       // v0.3.0 request signing. `--signing-secret ''` switches signing off explicitly.
       'signing-secret': { type: 'string' },
       'signing-secret-previous': { type: 'string' },
@@ -253,6 +258,10 @@ try {
     tlsKey: tlsKey ?? null,
     operatorToken,
     operatorTokenRequired,
+    // MEDIUM-6: the token is printed by the start that generated it, or when the operator asks for it
+    // here (--print-operator-token / W2M_PRINT_OPERATOR_TOKEN=1). The relay resolves both, so the
+    // banner below and the relay's own startup lines can never disagree about it.
+    printOperatorToken: values['print-operator-token'] === true,
     pairRateLimitPerMinute: pairRateLimit,
     persist: !values['no-persist'],
     // v0.3.0 request signing. Undefined means "not configured", which the relay treats as
@@ -346,11 +355,29 @@ if (values.json) {
 
   log('');
   if (operatorTokenRequired && resolvedOperatorToken) {
-    log('  ┌────────────────────────────────────────────────────────────┐');
-    log('  │  OPERATOR TOKEN (needed to SEND instructions, keep secret)  │');
-    log(`  │  ${String(resolvedOperatorToken).padEnd(56)}│`);
-    log('  └────────────────────────────────────────────────────────────┘');
-    log(`  Also written to ${stateDir}/operator-token.txt`);
+    // MEDIUM-6: this banner is the *machine's* stdout, and stdout is what journald, a container log or
+    // a CI transcript keeps. The token authorises dispatching to every machine in the group, so it is
+    // printed only on the start that generated it — the one moment it exists nowhere else — or when
+    // --print-operator-token / W2M_PRINT_OPERATOR_TOKEN=1 asked for it explicitly. Every other start
+    // says where to read it and how to change that answer.
+    //
+    // DELIBERATE, do not "fix": on that generating start the relay's own startup line prints the value
+    // too (on stderr). The pair is the intended shape — this box is the operator-facing handoff, that
+    // line is the log copy — and every other start prints it in neither place.
+    if (listenInfo.operatorTokenPrintable === true) {
+      log('  ┌────────────────────────────────────────────────────────────┐');
+      log('  │  OPERATOR TOKEN (needed to SEND instructions, keep secret)  │');
+      log(`  │  ${String(resolvedOperatorToken).padEnd(56)}│`);
+      log('  └────────────────────────────────────────────────────────────┘');
+      log(`  Printed once because ${listenInfo.operatorTokenPrintReason === 'generated'
+        ? 'this start generated it'
+        : `${listenInfo.operatorTokenPrintReason ?? 'an option'} asked for it`}.`);
+      log(`  Also written to ${stateDir}/operator-token.txt (0600).`);
+    } else {
+      log('  OPERATOR TOKEN — not printed (this start did not generate it).');
+      log(`  Read it from ${stateDir}/operator-token.txt (0600).`);
+      log('  To print it here as well: --print-operator-token, or W2M_PRINT_OPERATOR_TOKEN=1.');
+    }
     log('  Device tokens cannot send work; this is what authorises it.');
   } else if (!operatorTokenRequired) {
     log('  ⚠  OPERATOR TOKEN REQUIREMENT IS OFF (--operator-token "").');

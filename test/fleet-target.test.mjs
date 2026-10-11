@@ -29,7 +29,9 @@ import { after, beforeEach, describe, it } from 'node:test';
 import * as plugin from '../src/plugin/tools.mjs';
 import {
   MAX_SELECTIONS,
+  MAX_SESSION_ID_LENGTH,
   NO_SESSION,
+  TARGET_REFUSAL,
   TARGET_ROUTE_PATH,
   buildUiState,
   createLocalIdentity,
@@ -510,8 +512,144 @@ describe('fleet-target: the browser route', () => {
       body: JSON.stringify({ session_id: 'sess-1', machine_id: '1c14d7d2-d9e2-43dd-a7e5-eda98f4864bc' }),
     }));
     assert.equal(response.status, 409);
-    assert.match((await response.json()).error, /listed as expired/);
+    const refused = await response.json();
+    assert.match(refused.error, /listed as expired/);
+    assert.equal(refused.reason_code, TARGET_REFUSAL.MACHINE_OFFLINE);
+    assert.match(refused.detail, /wait for its next heartbeat|select another machine/);
     assert.equal(store.get('sess-1'), null, 'a refused selection must not half-apply');
+  });
+
+  /* ------------------------------------------------------------------ */
+  /* v0.5.9 LOW-7/LOW-8/LOW-9 — what the route refuses, by name          */
+  /* ------------------------------------------------------------------ */
+
+  it('refuses a machine id the relay does not list at all (LOW-7)', async () => {
+    // The comment above the check always said "only accepted for a machine the relay currently lists
+    // as online"; the code refused only a machine that existed *and* was offline, so `machine === null`
+    // fell through to `store.set` and `{"machine_id":"NOT-A-MACHINE"}` was answered with a 200. The
+    // impact was bounded -- dispatch re-validates -- but a control whose promise is "you cannot select
+    // what the fleet cannot run" cannot accept an id the fleet has never heard of.
+    const { store, route } = mount();
+    const response = await route.fetch(new Request(url(), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ session_id: 'sess-1', machine_id: 'NOT-A-MACHINE' }),
+    }));
+    assert.equal(response.status, 409, 'the same status as the offline refusal: both are "not selectable"');
+    const refused = await response.json();
+    assert.equal(refused.reason_code, TARGET_REFUSAL.MACHINE_UNKNOWN);
+    assert.match(refused.error, /NOT-A-MACHINE is not a machine this relay lists/);
+    assert.match(refused.detail, /pick a machine from the roster/);
+    assert.equal(store.get('sess-1'), null, 'an unknown id must not be stored');
+
+    // The other direction, in the same breath: a machine the relay *does* list as online is still
+    // accepted, so the refusal above is about this id and not about the route having stopped working.
+    const accepted = await route.fetch(new Request(url(), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ session_id: 'sess-1', machine_id: REMOTE_MACHINE_ID, machine_name: 'macmini' }),
+    }));
+    assert.equal(accepted.status, 200);
+    assert.equal((await accepted.json()).selected.machine_id, REMOTE_MACHINE_ID);
+    assert.equal(store.get('sess-1').machine_id, REMOTE_MACHINE_ID);
+  });
+
+  it('refuses every verb that is not exactly GET or POST (LOW-8)', async () => {
+    // Defence in depth: the registration declares `methods: ['GET','POST']`, so the host should never
+    // route these at all. The handler used to write for *any* non-GET verb, which would turn a
+    // registration mistake into "DELETE clears the selection".
+    for (const method of ['PUT', 'DELETE', 'PATCH', 'HEAD']) {
+      const { store, route } = mount();
+      const response = await route.fetch(new Request(url(), {
+        method,
+        headers: { 'content-type': 'application/json' },
+        // HEAD and DELETE are not given a body: `Request` itself refuses that combination for HEAD.
+        body: method === 'DELETE' || method === 'HEAD'
+          ? undefined
+          : JSON.stringify({ session_id: 'sess-1', machine_id: REMOTE_MACHINE_ID }),
+      }));
+      assert.equal(response.status, 405, `${method} must be refused`);
+      const refused = await response.json().catch(() => null);
+      if (refused !== null) {
+        assert.equal(refused.reason_code, TARGET_REFUSAL.METHOD_NOT_ALLOWED);
+        assert.match(refused.detail, /POST writes one/);
+      }
+      assert.equal(store.get('sess-1'), null, `${method} must not have written a selection`);
+    }
+    // And the two verbs the route *does* answer are untouched by the guard.
+    const { store, route } = mount();
+    const read = await route.fetch(new Request(url('?session_id=sess-1')));
+    assert.equal(read.status, 200);
+    const write = await route.fetch(new Request(url(), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ session_id: 'sess-1', machine_id: REMOTE_MACHINE_ID }),
+    }));
+    assert.equal(write.status, 200);
+    assert.equal(store.get('sess-1').machine_id, REMOTE_MACHINE_ID);
+  });
+
+  it('bounds the session id instead of storing and echoing whatever arrives (LOW-9)', async () => {
+    // `MAX_SELECTIONS` bounds the *number* of buckets; the key is the whole string, so an unbounded id
+    // is unbounded memory per request, echoed back in the snapshot.
+    const { store, route } = mount();
+    const huge = 'x'.repeat(200_000);
+    const response = await route.fetch(new Request(url(), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ session_id: huge, machine_id: REMOTE_MACHINE_ID }),
+    }));
+    assert.equal(response.status, 400);
+    const refused = await response.json();
+    assert.equal(refused.reason_code, TARGET_REFUSAL.SESSION_ID_TOO_LONG);
+    assert.match(refused.error, new RegExp(`at most ${MAX_SESSION_ID_LENGTH} characters, got 200000`));
+    assert.match(refused.detail, /UUID is 36 characters/);
+    assert.equal(store.get(huge), null, 'nothing was stored under the over-long id');
+
+    // The same bound on the read path, which echoes the id back too.
+    const read = await route.fetch(new Request(url(`?session_id=${huge}`)));
+    assert.equal(read.status, 400);
+    assert.equal((await read.json()).reason_code, TARGET_REFUSAL.SESSION_ID_TOO_LONG);
+
+    // And the legitimate path still works at the bound: a long-but-legal session id is accepted.
+    const legal = 'y'.repeat(MAX_SESSION_ID_LENGTH);
+    const ok = await route.fetch(new Request(url(), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ session_id: legal, machine_id: REMOTE_MACHINE_ID }),
+    }));
+    assert.equal(ok.status, 200, `a ${MAX_SESSION_ID_LENGTH}-character session id is inside the bound`);
+    assert.equal((await ok.json()).session_id, legal);
+    assert.equal(store.get(legal).machine_id, REMOTE_MACHINE_ID);
+  });
+
+  it('names every refusal the route and its body parser produce (reason_code + detail)', async () => {
+    const { route } = mount();
+    const post = (body) => route.fetch(new Request(url(), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body,
+    }));
+    const cases = [
+      ['not json at all', await post('this is not json'), 400, TARGET_REFUSAL.BODY_NOT_JSON],
+      ['an array', await post('[1,2,3]'), 400, TARGET_REFUSAL.BODY_NOT_AN_OBJECT],
+      ['no session id', await post(JSON.stringify({})), 400, TARGET_REFUSAL.SESSION_ID_REQUIRED],
+      ['a numeric machine id', await post(JSON.stringify({ session_id: 's', machine_id: 7 })), 400, TARGET_REFUSAL.MACHINE_ID_NOT_A_STRING],
+      ['a numeric machine name', await post(JSON.stringify({ session_id: 's', machine_name: 7 })), 400, TARGET_REFUSAL.MACHINE_NAME_NOT_A_STRING],
+    ];
+    for (const [label, response, status, code] of cases) {
+      assert.equal(response.status, status, label);
+      const body = await response.json();
+      assert.equal(body.reason_code, code, label);
+      assert.equal(typeof body.detail, 'string', `${label} must say what would change it`);
+      assert.ok(body.detail.length > 10, `${label} needs a real detail, not a placeholder`);
+    }
+
+    // The body parser alone, so the codes are pinned at the function rather than only through HTTP.
+    assert.equal(parseSelectionWrite({ session_id: 's'.repeat(MAX_SESSION_ID_LENGTH + 1) }).reason_code,
+      TARGET_REFUSAL.SESSION_ID_TOO_LONG);
+    assert.equal(parseSelectionWrite(null).ok, false);
+    assert.equal(parseSelectionWrite(null).reason_code, TARGET_REFUSAL.BODY_NOT_AN_OBJECT);
   });
 
   it('clears the selection on a null machine_id, which restores the whole fleet', async () => {

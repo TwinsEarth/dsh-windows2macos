@@ -550,9 +550,28 @@ Two consequences that are easy to walk into:
   [["C:\\Program Files\\nodejs\\node.exe", "-e"]]
   ```
 
-  (This is why the pipeline end-to-end suite passes on CI runners — Node lives at
-  a path without spaces there — and can fail locally on a Windows box where Node
-  is installed under `C:\Program Files`.)
+  (This is why the pipeline end-to-end suite used to fail locally and pass on CI
+  runners — Node lives at a path without spaces there — until the entry in that
+  suite was written as an array entry, the form above.)
+
+Three more refusals look like this section's symptom, and each has its own code
+because each has its own remedy:
+
+* `COMMAND_REPARSING_ARGUMENT` — the entry matched, but a **trailing** argument
+  would make the tool load code the entry never named: `node --test
+  --test-reporter=file:///tmp/evil.mjs`, `--import`, `--require`, `-e`, `python -c`,
+  `bash -c`, `git --exec-path`, `make -f`, `tar --to-command`, … Name the argument
+  in the entry if this machine is meant to run it (`["node --test
+  --test-reporter=tap"]`); an entry that merely names the tool is not read as
+  permission to eval.
+* `COMMAND_EXECUTABLE_PATH_MISMATCH` — `argv[0]` is a path, and it is not the
+  file the entry's executable resolves to. `C:\Program Files\nodejs\node.exe` is
+  admitted for the entry `node` only when that is what `node` resolves to; a copy
+  of another program at `E:\Temp\evil\node.exe` is refused, because a copy under an
+  allowed name is a different program.
+* `COMMAND_EXECUTABLE_RELATIVE_PATH` — `argv[0]` is a relative path
+  (`./node.exe`). The working directory comes from the offer, so the path names a
+  different file in every directory; use the bare name or an absolute path.
 
 To see what the machine actually received, ask the relay for the last task and
 read the machine's `refusal_reason`, or run the agent in the foreground: the
