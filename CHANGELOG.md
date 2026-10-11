@@ -1,59 +1,29 @@
+## [0.5.8] — 2026-10-11
+
+### Fixed
+
+* **The CHANGELOG was out of order, and the claims gate caught it.** My bump scripts anchored the new
+  entry on the wrong heading, so v0.5.5 ended up *above* v0.5.6 and v0.5.7 and "the newest entry" stopped
+  meaning anything — which is exactly the assertion `test/claims.test.mjs` makes. Entries are ordered
+  newest-first again, and the anchor is the top of the file rather than a version I have to remember.
+* **Mojibake in shipped code.** `src/agent/mdns-wire.mjs` is packed, and its comments carried an em dash
+  and a section sign that had been decoded as the wrong encoding and re-saved, so a reader would have
+  seen `鈥` and `搂` where the RFC references belong. The same damage was in `test/mdns-discover.test.mjs`.
+  All five mDNS files are ASCII now, and the repository's own mojibake scan is clean.
+
+### Notes
+
+* Fix-forward again, and for the same reason: v0.5.6 and v0.5.7 are published and stay published.
+* Three releases in an hour, each fixing a defect the previous one introduced and a gate caught. That is
+  the gates working, but it is also a release process with no pre-flight of its own — which is the next
+  thing this project should fix rather than the next thing it should be proud of.
+* No runtime change: the code in v0.5.8 is the code in v0.5.6.
 # Changelog
 
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.5.5] — 2026-10-11
-
-### Fixed
-
-* **The v0.5.4 loader failure, with the cause the loader actually reported** rather than the hypothesis
-  that stood in for it:
-
-  ```
-  w2m (@twinsearth/w2m-dsh-plugin/tools): Error: cannot get property "connection" without inject
-    at registerTargetRoutes (src/plugin/fleet-target.mjs:483:25)
-  ```
-
-  cordis throws on reading a service property the fiber never declared, so the entry died and took all
-  eight tools with it. **Every existing test was blind to this**, because they drive the plugin with a
-  plain-object context where an undeclared read merely yields `undefined` — the fake was more forgiving
-  than the runtime. Fixed with `ctx.inject(['connection'], …)`, which is also the only shape that can
-  work: in the real composition the service is genuinely absent while `apply()` runs, and siblings are
-  mounted concurrently.
-* **The client half was never composed either, for a second and independent reason:** the bundle row
-  named the subpath `@twinsearth/w2m-dsh-plugin/tools` instead of the package, and a client package is
-  identified by its Loader row specifier — a subpath resolves to no `package.json`, so `dsh.client` was
-  never read and no boot-graph row was built. The row now names the package.
-* **A silent route rejection:** the control fetched `/w2m/target`, but fetch routes are validated
-  against `/api/`, and the refusal failed only a child fiber, so nothing surfaced. Now
-  `/api/w2m/target`, mirrored in the shipped bundle.
-
-### Added
-
-* **`test/loader-entry.test.mjs`** — the test that would have caught v0.5.4: it packs the tree, installs
-  the tarball with the installation's own `dsh plugin add` into a throwaway profile under a throwaway
-  `DSH_HOME`, and boots it with the real `runProfile` under the Harness runtime, asserting that the
-  entry activates, all eight tools are registered, the boot-graph row is composed from the shipped
-  bundle, and no failed entry names the package. **Proved in both directions**: 6/6 pass on the fixed
-  tree and 6/6 fail against the preserved v0.5.4 tarball, failing on precisely the loader error quoted
-  above. It skips loudly, naming the probes it tried, when no installation is found.
-* Cheap always-on guards in `test/client-bundle.test.mjs` that need no Harness: the platform field, the
-  client export, the row must be the bare package name, and the bundle's route must equal the host's.
-
-### Notes
-
-* **An upgrade from v0.5.4 requires one edit outside this package:** `cordis.patch.yml` in the profile
-  must name the package (`@twinsearth/w2m-dsh-plugin`), not the `/tools` subpath. With the corrected
-  bundle row, a mismatch makes the loader skip the whole patch — silently reverting `rabbitUrl`,
-  `operatorToken`, `stateDir`, `projectDir`, `machineName`, `p2pMode` and `allowedCommands` to their
-  shipped defaults. Measured both ways with `--dump-config`.
-* **0.5.4 remains DO NOT INSTALL.** This release exists so that a rebuilt artifact is distinguishable
-  from the broken one by version alone.
-* Still unverified, and not claimed: how the control *renders*. No browser was opened. What is proven is
-  the entire host side — the entry activates, the eight tools register, the boot-graph row is composed
-  from the shipped bundle, the route is registered and attached — plus the seat shape in a VM test.
 ## [0.5.7] — 2026-10-11
 
 ### Fixed
@@ -75,6 +45,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   rewriting history someone may already have. Both defects are mine, and both are the class this project
   keeps naming — a claim that nothing checks.
 * No runtime change: the code in v0.5.7 is the code in v0.5.6.
+
 ## [0.5.6] — 2026-10-11
 
 ### Fixed
@@ -146,6 +117,58 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Bonjour/Avahi peer answers. There is **no third-party interoperability test**, no probing or conflict
   resolution, IPv4 only, and the responder is **built and tested but not started** by the plugin —
   loading a plugin should not silently multicast on the host's network.
+
+## [0.5.5] — 2026-10-11
+
+### Fixed
+
+* **The v0.5.4 loader failure, with the cause the loader actually reported** rather than the hypothesis
+  that stood in for it:
+
+  ```
+  w2m (@twinsearth/w2m-dsh-plugin/tools): Error: cannot get property "connection" without inject
+    at registerTargetRoutes (src/plugin/fleet-target.mjs:483:25)
+  ```
+
+  cordis throws on reading a service property the fiber never declared, so the entry died and took all
+  eight tools with it. **Every existing test was blind to this**, because they drive the plugin with a
+  plain-object context where an undeclared read merely yields `undefined` — the fake was more forgiving
+  than the runtime. Fixed with `ctx.inject(['connection'], …)`, which is also the only shape that can
+  work: in the real composition the service is genuinely absent while `apply()` runs, and siblings are
+  mounted concurrently.
+* **The client half was never composed either, for a second and independent reason:** the bundle row
+  named the subpath `@twinsearth/w2m-dsh-plugin/tools` instead of the package, and a client package is
+  identified by its Loader row specifier — a subpath resolves to no `package.json`, so `dsh.client` was
+  never read and no boot-graph row was built. The row now names the package.
+* **A silent route rejection:** the control fetched `/w2m/target`, but fetch routes are validated
+  against `/api/`, and the refusal failed only a child fiber, so nothing surfaced. Now
+  `/api/w2m/target`, mirrored in the shipped bundle.
+
+### Added
+
+* **`test/loader-entry.test.mjs`** — the test that would have caught v0.5.4: it packs the tree, installs
+  the tarball with the installation's own `dsh plugin add` into a throwaway profile under a throwaway
+  `DSH_HOME`, and boots it with the real `runProfile` under the Harness runtime, asserting that the
+  entry activates, all eight tools are registered, the boot-graph row is composed from the shipped
+  bundle, and no failed entry names the package. **Proved in both directions**: 6/6 pass on the fixed
+  tree and 6/6 fail against the preserved v0.5.4 tarball, failing on precisely the loader error quoted
+  above. It skips loudly, naming the probes it tried, when no installation is found.
+* Cheap always-on guards in `test/client-bundle.test.mjs` that need no Harness: the platform field, the
+  client export, the row must be the bare package name, and the bundle's route must equal the host's.
+
+### Notes
+
+* **An upgrade from v0.5.4 requires one edit outside this package:** `cordis.patch.yml` in the profile
+  must name the package (`@twinsearth/w2m-dsh-plugin`), not the `/tools` subpath. With the corrected
+  bundle row, a mismatch makes the loader skip the whole patch — silently reverting `rabbitUrl`,
+  `operatorToken`, `stateDir`, `projectDir`, `machineName`, `p2pMode` and `allowedCommands` to their
+  shipped defaults. Measured both ways with `--dump-config`.
+* **0.5.4 remains DO NOT INSTALL.** This release exists so that a rebuilt artifact is distinguishable
+  from the broken one by version alone.
+* Still unverified, and not claimed: how the control *renders*. No browser was opened. What is proven is
+  the entire host side — the entry activates, the eight tools register, the boot-graph row is composed
+  from the shipped bundle, the route is registered and attached — plus the seat shape in a VM test.
+
 ## [0.5.4] — 2026-10-11
 
 > **DO NOT INSTALL 0.5.4.** It fails to load in the Harness: the loader entry
@@ -186,6 +209,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   serves the plugin from the profile's `node_modules`; the new revision must be installed *and the
   Harness restarted* before the control appears. The control is therefore in the artifact and not in the
   running UI, and this entry says so rather than implying otherwise.
+
 ## [0.5.3] — 2026-10-11
 
 ### Added
@@ -215,6 +239,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 * Every socket in the new suite is loopback and crosses no NAT; that is stated in the suite header and
   is not evidence that a real translation can be crossed.
 * No protocol version bump: `envelope_version` stays `1.0` and a v0.4.x/v0.5.x peer is unaffected.
+
 ## [0.5.2] — 2026-10-10
 
 ### Fixed
@@ -248,6 +273,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 * This release exists because `deploy/` and `docs/` are inside the published package: after v0.5.1 the
   tag and the tarball had drifted, and a release is the only honest way to close that.
 * No runtime change to the eight tools.
+
 ## [0.5.1] — 2026-10-10
 
 ### Fixed
@@ -282,6 +308,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   supervisor leaves the agent alive with its punch socket still bound (`0.0.0.0:41235`).
 * Also included: the test fix for `test/outbound-only.test.mjs`, whose port was being read from the
   timestamp rather than from the field that states it (commit `57dbc5f`).
+
 ## [0.5.0] — 2026-10-10
 
 The release that stops treating "the relay carried it" as the only answer for a machine behind a
@@ -760,7 +787,6 @@ written down as not measured.
 * A loopback punch is not evidence of NAT traversal, and neither the tests nor
   this entry claim it is. The WAN measurement is one hop with one NAT, and it is
   labelled as one hop with one NAT.
-
 
 ## [0.3.9] — 2026-10-09
 

@@ -159,7 +159,7 @@ describe('round trip for every record type this layer reads', () => {
 
     // Byte-level pinning, so a change to the header layout, the TTL width or the compression pointer
     // cannot pass by being "round-trip consistent":
-    //   id 0000                     (RFC 6762 §18.1: zero on transmission)
+    //   id 0000                     (RFC 6762 sec.18.1: zero on transmission)
     //   flags 8400                  QR=1, AA=1, opcode 0
     //   counts 0000 0001 0000 0000  no questions, one answer
     //   04 5f77326d 04 5f746370 05 6c6f63616c 00   "_w2m" "_tcp" "local" root
@@ -286,7 +286,7 @@ describe('name compression', () => {
       `compression must shorten the message: ${compressed.length} < ${uncompressed.length}`,
     );
     // The SRV owner name is the pointer 0xc027 (offset 39, inside the PTR's RDATA), which is exactly
-    // the "prior occurrence anywhere earlier in the message" RFC 1035 §4.1.4 describes.
+    // the "prior occurrence anywhere earlier in the message" RFC 1035 sec.4.1.4 describes.
     const message = messageOf(compressed);
     assert.equal(message.answers[0].target, INSTANCE);
     assert.equal(message.answers[1].name, INSTANCE);
@@ -300,7 +300,7 @@ describe('name compression', () => {
   it('never compresses the SRV target, and never points into one', () => {
     const bytes = encodeMessage({ answers: [serviceRecords().srv, serviceRecords().a] });
     const message = messageOf(bytes);
-    // The SRV target is written in full: RFC 1035 §4.1.4 lists the types whose RDATA may be compressed
+    // The SRV target is written in full: RFC 1035 sec.4.1.4 lists the types whose RDATA may be compressed
     // and SRV is not among them. The A record's owner name must not point into the SRV RDATA either.
     const srv = message.answers[0];
     assert.equal(srv.target, HOST);
@@ -312,7 +312,7 @@ describe('name compression', () => {
 
   it('follows a hand-built pointer to a legal earlier name', () => {
     // The question name is written in full at offset 12; the answer's owner name is the label
-    // "mac-studio" followed by a pointer back to offset 12. That is the shape RFC 1035 §4.1.4
+    // "mac-studio" followed by a pointer back to offset 12. That is the shape RFC 1035 sec.4.1.4
     // describes, built from octets rather than from the encoder.
     const question = Buffer.concat([encodeName(SERVICE), Buffer.from([0x00, 0x0c, 0x00, 0x01])]);
     const owner = Buffer.concat([Buffer.from([0x0a]), Buffer.from('mac-studio', 'utf8'), pointer(12)]);
@@ -550,7 +550,7 @@ describe('label and name limits', () => {
   });
 
   it('refuses a wire label whose kind bits are reserved (01 and 10)', () => {
-    // RFC 1035 §4.1.4 defines only `00` (label) and `11` (pointer). 0x41 is `01` with length 1.
+    // RFC 1035 sec.4.1.4 defines only `00` (label) and `11` (pointer). 0x41 is `01` with length 1.
     assert.equal(
       refusalOf(Buffer.concat([header({ questions: 1 }), Buffer.from([0x41, 0x61, 0x00])])).reason,
       REFUSAL.LABEL_TYPE,
@@ -562,14 +562,14 @@ describe('label and name limits', () => {
   });
 
   it('refuses to encode a name that encodes to more than 255 octets', () => {
-    // Five 60-octet labels: 5 * 61 + 1 = 306 octets, over the 255 limit of RFC 1035 §2.3.4.
+    // Five 60-octet labels: 5 * 61 + 1 = 306 octets, over the 255 limit of RFC 1035 sec.2.3.4.
     const long = `${Array.from({ length: 5 }, () => 'a'.repeat(60)).join('.')}.local`;
     assert.throws(
       () => encodeName(long),
       (error) => error instanceof MdnsWireError && error.code === REFUSAL.NAME_TOO_LONG,
     );
     // A legal name at the limit still encodes: 64 + 64 + 64 + 62 + 1 = 255 octets, length octets and
-    // the terminating zero included, which is the largest name RFC 1035 §2.3.4 allows.
+    // the terminating zero included, which is the largest name RFC 1035 sec.2.3.4 allows.
     const longest = `${'a'.repeat(63)}.${'b'.repeat(63)}.${'c'.repeat(63)}.${'d'.repeat(61)}`;
     assert.equal(encodeName(longest).length, MAX_NAME_BYTES);
     // One more octet of label and it is refused.
@@ -653,7 +653,7 @@ describe('message caps', () => {
 });
 
 /* -------------------------------------------------------------------------- */
-/* 6. Queries, responses and the RFC 6762 §6.7 legacy rules                    */
+/* 6. Queries, responses and the RFC 6762 sec.6.7 legacy rules                    */
 /* -------------------------------------------------------------------------- */
 
 describe('queries and responses', () => {
@@ -695,7 +695,7 @@ describe('queries and responses', () => {
         legacy: true,
       }),
     );
-    assert.equal(response.id, 0x1234, 'RFC 6762 §6.7: the query id is repeated');
+    assert.equal(response.id, 0x1234, 'RFC 6762 sec.6.7: the query id is repeated');
     assert.equal(response.questions.length, 1);
     assert.equal(response.questions[0].name, SERVICE);
     assert.equal(response.questions[0].unicast_response, false);

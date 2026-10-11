@@ -19,34 +19,34 @@
  * # Clean room
  *
  * Written from RFC 6762 (Multicast DNS), RFC 6763 (DNS-Based Service Discovery), RFC 2782 (SRV) and
- * RFC 1035 §4.1 (message format). See `src/agent/mdns-wire.mjs` for the two studied-implementation
+ * RFC 1035 sec.4.1 (message format). See `src/agent/mdns-wire.mjs` for the two studied-implementation
  * behaviours this layer deliberately does *not* reproduce (first-writer-wins record updates, and a name
  * treated as identity).
  *
  * # What this implements, exactly
  *
  *   * `buildServiceRecords` — the four records a W2M service instance publishes: a shared PTR under
- *     `_w2m._tcp.local`, and unique SRV + TXT + A records. TTLs follow RFC 6762 §10: 120 s for records
+ *     `_w2m._tcp.local`, and unique SRV + TXT + A records. TTLs follow RFC 6762 sec.10: 120 s for records
  *     naming or containing a host name (SRV, A), 75 minutes for the others (PTR, TXT).
  *   * `createResponder` — announces on start, answers matching questions, re-announces on a timer, and
- *     sends a TTL=0 goodbye on close (RFC 6762 §10.1) so peers drop us immediately instead of waiting
+ *     sends a TTL=0 goodbye on close (RFC 6762 sec.10.1) so peers drop us immediately instead of waiting
  *     out a 75-minute TTL.
- *   * `discoverServices` — one bounded scan with a fresh socket per call, which is what RFC 6762 §5.1
- *     describes ("one-shot" queries from an ephemeral source port; §5.1 is also why the socket is
+ *   * `discoverServices` — one bounded scan with a fresh socket per call, which is what RFC 6762 sec.5.1
+ *     describes ("one-shot" queries from an ephemeral source port; sec.5.1 is also why the socket is
  *     never bound to 5353).
  *
  * # Scope, stated rather than glossed
  *
  *   * **IPv4 only.** `224.0.0.251` and the `udp4` socket family. IPv6 (`ff02::fb`) is not half-built
  *     here; it would need its own socket, its own interface enumeration and its own tests.
- *   * **No probing or conflict resolution** (RFC 6762 §8.1, §9). A responder here announces its
+ *   * **No probing or conflict resolution** (RFC 6762 sec.8.1, sec.9). A responder here announces its
  *     records immediately and does not defend them. Two machines configured with the same instance
  *     name would both answer. That is a real limitation, and it is acceptable *only* because of the
  *     rule above: a discovered name is a hint, and the pairing that actually authorises anything is
  *     keyed by machine id, not by the name two machines might collide on.
- *   * **No known-answer suppression** (RFC 6762 §7.1) and no negative responses (NSEC). A scan is one
+ *   * **No known-answer suppression** (RFC 6762 sec.7.1) and no negative responses (NSEC). A scan is one
  *     query; nothing here is a long-lived browsing client.
- *   * **The 10-second re-announce is a deliberate deviation.** RFC 6762 §8.3 says a responder "MUST NOT
+ *   * **The 10-second re-announce is a deliberate deviation.** RFC 6762 sec.8.3 says a responder "MUST NOT
  *     send regular periodic announcements as a matter of course" and asks for at least two
  *     announcements one second apart with the interval doubling. The periodic re-announce exists here
  *     because this is a small, fixed set of records on a tool that expects peers to appear and vanish,
@@ -71,31 +71,31 @@ import {
   normalizeName,
 } from './mdns-wire.mjs';
 
-/** The IPv4 link-local multicast address every mDNS name resolves through (RFC 6762 §3). */
+/** The IPv4 link-local multicast address every mDNS name resolves through (RFC 6762 sec.3). */
 export const MDNS_GROUP = '224.0.0.251';
 
-/** The mDNS UDP port (RFC 6762 §5). A source port of 5353 means "fully compliant querier". */
+/** The mDNS UDP port (RFC 6762 sec.5). A source port of 5353 means "fully compliant querier". */
 export const MDNS_PORT = 5353;
 
 /** The service type W2M instances advertise under. */
 export const DEFAULT_SERVICE_TYPE = '_w2m._tcp.local';
 
-/** Default window for one scan. RFC 6762 §5.2 expects responses within about a second. */
+/** Default window for one scan. RFC 6762 sec.5.2 expects responses within about a second. */
 export const DEFAULT_DISCOVERY_TIMEOUT_MS = 1500;
 
-/** Default re-announce period. See the header: this is a deliberate deviation from RFC 6762 §8.3. */
+/** Default re-announce period. See the header: this is a deliberate deviation from RFC 6762 sec.8.3. */
 export const DEFAULT_ANNOUNCE_INTERVAL_MS = 10_000;
 
-/** RFC 6762 §10: 120 s where a host name is involved, 75 minutes (4500 s) for everything else. */
+/** RFC 6762 sec.10: 120 s where a host name is involved, 75 minutes (4500 s) for everything else. */
 export const DEFAULT_TTL_SECONDS = Object.freeze({ ptr: 4500, srv: 120, txt: 4500, address: 120 });
 
-/** RFC 6762 §10.1: a goodbye is the same record with an RR TTL of zero. */
+/** RFC 6762 sec.10.1: a goodbye is the same record with an RR TTL of zero. */
 export const GOODBYE_TTL = 0;
 
 /** Upper bound on instances one scan will report, so a flooding peer cannot grow this without limit. */
 export const MAX_SCAN_INSTANCES = 64;
 
-/** The first TXT string DNS-SD asks for (RFC 6763 §6.1). */
+/** The first TXT string DNS-SD asks for (RFC 6763 sec.6.1). */
 export const TXT_VERSION = 'txtvers=1';
 
 /** TXT keys this layer reads. `mid` is the *only* one that can carry identity, and it is the relay's. */
@@ -195,7 +195,7 @@ export function localHostLabel(hostname = os.hostname()) {
 /**
  * The records one W2M service instance publishes.
  *
- * Layout follows DNS-SD (RFC 6763 §4–§6) with W2M's own keys in the TXT record:
+ * Layout follows DNS-SD (RFC 6763 sec.4–sec.6) with W2M's own keys in the TXT record:
  *
  *   `_w2m._tcp.local` PTR → `<instance>._w2m._tcp.local`            shared,   TTL 4500
  *   `<instance>._w2m._tcp.local` SRV → `<host>.local` port          unique,   TTL 120
@@ -217,7 +217,7 @@ export function localHostLabel(hostname = os.hostname()) {
  * @param {string|null} [options.machineId] The relay's machine id, published as `mid=`.
  * @param {string|null} [options.machineName] Display name, published as `name=`.
  * @param {object} [options.ttl] Overrides for {@link DEFAULT_TTL_SECONDS}.
- * @param {boolean} [options.goodbye] Emit the same records with TTL 0 (RFC 6762 §10.1).
+ * @param {boolean} [options.goodbye] Emit the same records with TTL 0 (RFC 6762 sec.10.1).
  * @returns {object[]}
  */
 export function buildServiceRecords(options) {
@@ -250,7 +250,7 @@ export function buildServiceRecords(options) {
     // Shared: many responders may publish a PTR for the same service type, so no cache-flush bit.
     { name: serviceType, type: RECORD_TYPE.PTR, ttl: at(ttl.ptr), target: instanceFqdn },
     // Unique: exactly one owner, so the cache-flush bit tells peers to drop older SRV/TXT/A records
-    // for these names (RFC 6762 §10.2). This is what stops a peer that moved from keeping the old
+    // for these names (RFC 6762 sec.10.2). This is what stops a peer that moved from keeping the old
     // address: the new record *replaces* rather than joins.
     {
       name: instanceFqdn,
@@ -273,7 +273,7 @@ export function buildServiceRecords(options) {
       cache_flush: !goodbye,
     });
   }
-  // A goodbye is a *deletion*. RFC 6762 §10.1 has the TTL alone carry that meaning, and §10.2's
+  // A goodbye is a *deletion*. RFC 6762 sec.10.1 has the TTL alone carry that meaning, and sec.10.2's
   // cache-flush bit must not be set on it: a cooperating responder's own records for the same name
   // must not be flushed along with ours.
   return goodbye ? records.map((record) => ({ ...record, cache_flush: false })) : records;
@@ -290,13 +290,13 @@ export function buildServiceRecords(options) {
  * studied implementation has: **there is no first-writer-wins and no "keep the first non-zero port".**
  *
  *   * A record is identified by `(name, type, rdata)`. A later copy of the same record *replaces* the
- *     earlier one and restarts its TTL — the definition of a cache update (RFC 1035 §3.2.1, RFC 6762
- *     §10).
+ *     earlier one and restarts its TTL — the definition of a cache update (RFC 1035 sec.3.2.1, RFC 6762
+ *     sec.10).
  *   * A record carrying the cache-flush bit replaces the whole RRset of that `(name, type)`: other
- *     RDATA for the same name and type is dropped. RFC 6762 §10.2 gives other members one second of
+ *     RDATA for the same name and type is dropped. RFC 6762 sec.10.2 gives other members one second of
  *     grace for the multi-packet case; this cache has no second consumer and no peer reading it, so it
  *     drops them immediately, which is the *safe* direction — a stale address never survives.
- *   * A record with TTL 0 is a goodbye (RFC 6762 §10.1) and deletes every record with that
+ *   * A record with TTL 0 is a goodbye (RFC 6762 sec.10.1) and deletes every record with that
  *     `(name, type)` at once. RFC 6762 suggests a long-lived querier record TTL 1 and delete a second
  *     later, to give cooperating responders a chance to rescue the records; for a bounded scan the
  *     honest reading is "the peer said this is gone", and keeping it for a second would mean reporting
@@ -539,7 +539,7 @@ export function parseServiceInstances(input, options = {}) {
 /**
  * TXT character-strings → a key/value map.
  *
- * RFC 6763 §6.1: a string with no `=` is a key with an empty value; a duplicate key keeps the first
+ * RFC 6763 sec.6.1: a string with no `=` is a key with an empty value; a duplicate key keeps the first
  * occurrence (the RFC's rule for its own keys).
  *
  * @param {string[]} strings
@@ -764,7 +764,7 @@ export function createResponder(options = {}) {
   }
 
   /**
-   * Multicast our records (RFC 6762 §8.3), or the TTL=0 goodbye when `goodbye` is set (§10.1).
+   * Multicast our records (RFC 6762 sec.8.3), or the TTL=0 goodbye when `goodbye` is set (sec.10.1).
    *
    * @param {{goodbye?: boolean}} [announceOptions]
    * @returns {Promise<object>}
@@ -903,7 +903,7 @@ export function createResponder(options = {}) {
     const message = decoded.message;
     outcome.handled = true;
 
-    // RFC 6762 §18.3: an opcode other than zero is not a standard query and must be ignored.
+    // RFC 6762 sec.18.3: an opcode other than zero is not a standard query and must be ignored.
     if (message.flags.opcode !== 0) {
       ignoredOpcode += 1;
       outcome.reason = 'opcode';
@@ -924,8 +924,8 @@ export function createResponder(options = {}) {
       return outcome;
     }
 
-    // RFC 6762 §6.7: a query whose source port is not 5353 comes from a one-shot resolver, and MUST be
-    // answered directly, with the query id and question repeated and short TTLs. §5.4: a question with
+    // RFC 6762 sec.6.7: a query whose source port is not 5353 comes from a one-shot resolver, and MUST be
+    // answered directly, with the query id and question repeated and short TTLs. sec.5.4: a question with
     // the unicast-response bit asks for the same treatment.
     const legacy = rinfo.port !== mdnsPort;
     const unicast = legacy || match.unicast_requested;
@@ -1159,7 +1159,7 @@ function waitFor(ms, signal) {
 /**
  * One bounded mDNS scan for W2M service instances.
  *
- * A fresh socket per call, bound to an ephemeral port: RFC 6762 §5.1 requires a one-shot query *not*
+ * A fresh socket per call, bound to an ephemeral port: RFC 6762 sec.5.1 requires a one-shot query *not*
  * to come from port 5353, and a fresh socket also means a scan cannot be poisoned by the previous
  * scan's socket state. The socket is closed on every path, including a throw from a caller's abort
  * signal, and the whole function resolves — it never rejects.
@@ -1177,7 +1177,7 @@ function waitFor(ms, signal) {
  *   the multicast group:5353. A test, or a network where multicast is filtered, can name a unicast
  *   target instead — the query is identically shaped either way.
  * @param {string} [options.bindAddress]
- * @param {boolean} [options.unicastResponse] Set the QU bit (RFC 6762 §5.4).
+ * @param {boolean} [options.unicastResponse] Set the QU bit (RFC 6762 sec.5.4).
  * @param {AbortSignal} [options.signal]
  * @param {() => number} [options.now]
  * @returns {Promise<object>}
@@ -1223,7 +1223,7 @@ export async function discoverServices(options = {}) {
       bound.on('error', (error) => {
         socketError = `${error?.code ?? 'ERROR'}: ${error?.message ?? error}`;
       });
-      // Responses to a one-shot query are unicast back to this socket (§5.1/§6.7), but a responder on
+      // Responses to a one-shot query are unicast back to this socket (sec.5.1/sec.6.7), but a responder on
       // the same link may also multicast its answer, which arrives here too because the socket joined
       // nothing and is simply addressed. Both are handled the same way, and both are hints.
       bound.on('message', (bytes, rinfo) => {

@@ -13,7 +13,7 @@
  *      proves the query/response path, the reply addressing rules and the TTL=0 goodbye are real, and it
  *      is why these tests bind and send rather than mocking `dgram`.
  *   3. **Tool wiring.** `w2m_devices` is driven through `plugin.apply()` to prove the discovery block is
- *      actually exposed 鈥?and, on whatever network the machine happens to be on, that no candidate is
+ *      actually exposed --and, on whatever network the machine happens to be on, that no candidate is
  *      ever presented as verified or as a dispatch target the relay has not listed.
  *
  * **A loopback socket is not evidence about a real LAN.** It says nothing about whether multicast works
@@ -328,7 +328,7 @@ describe('record cache', () => {
 });
 
 /* -------------------------------------------------------------------------- */
-/* 2. Reassembly: records 鈫?instances, across packets                          */
+/* 2. Reassembly: records --?instances, across packets                          */
 /* -------------------------------------------------------------------------- */
 
 describe('service instance reassembly', () => {
@@ -451,7 +451,7 @@ describe('service instance reassembly', () => {
     assert.equal(truncated, 70, 'a flood is reported as truncated, not silently accepted');
   });
 
-  it('reads TXT strings the way RFC 6763 搂6.1 defines them', () => {
+  it('reads TXT strings the way RFC 6763 --6.1 defines them', () => {
     assert.deepEqual(txtMap(['txtvers=1', 'mid=aaa', 'flag', 'k=v=w', 'mid=bbb']), {
       txtvers: '1',
       mid: 'aaa',
@@ -511,7 +511,7 @@ describe('a discovered device is a candidate to ask, never an authorisation', ()
     assert.equal(candidate.dispatchable, false);
     assert.equal(mayDispatchTo(candidate), false);
     assert.equal(refusalCode(candidate.refusal), DISPATCH_REFUSAL.IDENTITY_UNKNOWN);
-    // The name match is still reported 鈥?a human can use it 鈥?but as a hint on its own field.
+    // The name match is still reported --a human can use it --but as a hint on its own field.
     assert.deepEqual(candidate.name_match, { machine_id: 'aaa', name: 'mac-studio', online: true });
   });
 
@@ -562,7 +562,7 @@ describe('a discovered device is a candidate to ask, never an authorisation', ()
     assert.equal(refusalCode(noAddress.refusal), DISPATCH_REFUSAL.NO_ENDPOINT);
   });
 
-  it('does dispatch to a paired, relay-listed, live candidate 鈥?the other direction', () => {
+  it('does dispatch to a paired, relay-listed, live candidate --the other direction', () => {
     // Without this half, a rule that returned `false` unconditionally would pass every test above while
     // making the feature useless. The pair of tests is the executable form of "the guard discriminates".
     const candidate = describeDiscoveredCandidate(instanceView(), {
@@ -881,7 +881,7 @@ describe('the TTL=0 goodbye on close', () => {
     assert.equal(closed.ok, true);
     assert.equal(closed.goodbye, true);
     const goodbye = decodeMessage(sent.at(-1).bytes).message;
-    // Same names, same rdata, TTL 0: RFC 6762 搂10.1's definition of a deletion.
+    // Same names, same rdata, TTL 0: RFC 6762 --10.1's definition of a deletion.
     assert.deepEqual(
       goodbye.records.map((record) => record.ttl),
       [GOODBYE_TTL, GOODBYE_TTL, GOODBYE_TTL, GOODBYE_TTL],
@@ -1015,7 +1015,7 @@ describe('over real UDP sockets, bound to loopback', () => {
     assert.equal(found.txt.map.mid, 'aaa');
     assert.equal(scanned.packets.received >= 1, true);
     assert.equal(scanned.packets.refused, 0);
-    // RFC 6762 搂6.7: the query came from an ephemeral port, so the answer is a legacy unicast response
+    // RFC 6762 --6.7: the query came from an ephemeral port, so the answer is a legacy unicast response
     // with the query id repeated and TTLs capped at ten seconds. Discovery reports what it saw, and the
     // TTL it reports is the capped one.
     assert.equal(found.ttl.ptr <= 10, true);

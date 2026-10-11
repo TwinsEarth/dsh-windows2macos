@@ -1,10 +1,10 @@
 /**
- * Multicast DNS wire codec 鈥?a bounded, hand-written DNS message encoder and decoder.
+ * Multicast DNS wire codec --a bounded, hand-written DNS message encoder and decoder.
  *
  * # THE RULE
  *
  * **Discovery is a hint, never an authorisation.** A discovered device is a *candidate to ask*. It
- * never skips, weakens or short-circuits any existing gate 鈥?the device token, the per-machine
+ * never skips, weakens or short-circuits any existing gate --the device token, the per-machine
  * allow-list, the git anchors, the verdict model. Nothing in this file, in `src/agent/mdns.mjs`, or in
  * `src/plugin/mdns-discover.mjs` may treat "we saw it announce itself" as "we may run there". If a
  * future edit finds itself writing code where a discovered device is trusted *because it was
@@ -14,10 +14,10 @@
  *
  * # Clean room
  *
- * Written from the published rules 鈥?RFC 1035 搂4.1 (message format, name compression), RFC 1035
- * 搂2.3.4 (the 255-octet name limit), RFC 1035 搂3.1/搂3.2.2 (record and type definitions), RFC 2782
- * (SRV), RFC 6763 (DNS-SD record layout, the TXT record's key=value convention), RFC 6762 搂18
- * (mDNS message format) and RFC 6762 搂10 (TTL values, goodbye packets). No third-party
+ * Written from the published rules --RFC 1035 --4.1 (message format, name compression), RFC 1035
+ * --2.3.4 (the 255-octet name limit), RFC 1035 --3.1/--3.2.2 (record and type definitions), RFC 2782
+ * (SRV), RFC 6763 (DNS-SD record layout, the TXT record's key=value convention), RFC 6762 --18
+ * (mDNS message format) and RFC 6762 --10 (TTL values, goodbye packets). No third-party
  * implementation was consulted line by line and none was copied: this project is MIT and stays free of
  * third-party notice entanglement, and deriving from the specification is also what lets us *not*
  * reproduce the defects a studied implementation had.
@@ -31,7 +31,7 @@
  *     scan must be seen at its new address, not at the address it had when the scan began.
  *   * **a name as identity.** Nothing here decides identity at all; the codec only reports what the
  *     wire said, including the exact `name` bytes as written. Identity is decided in
- *     `src/plugin/mdns-discover.mjs`, by a `machine_id` the relay assigned 鈥?never by a matching
+ *     `src/plugin/mdns-discover.mjs`, by a `machine_id` the relay assigned --never by a matching
  *     service or host name.
  *
  * # What is implemented, and what is not
@@ -52,17 +52,17 @@
  *   | guard                        | limit | refusal              |
  *   | ---------------------------- | ----- | -------------------- |
  *   | label length octet           | 63    | `MDNS_LABEL_TOO_LONG`|
- *   | unsupported label kind (01/10)| 鈥?   | `MDNS_LABEL_TYPE`    |
+ *   | unsupported label kind (01/10)| --   | `MDNS_LABEL_TYPE`    |
  *   | expanded name length         | 255   | `MDNS_NAME_TOO_LONG` |
  *   | compression pointer target   | must be strictly earlier in the message | `MDNS_POINTER_LOOP` |
  *   | compression pointer hops     | 128   | `MDNS_POINTER_HOPS`  |
  *   | records per message          | 256   | `MDNS_RECORD_COUNT`  |
  *   | message size                 | 9000  | `MDNS_MESSAGE_TOO_LARGE` |
- *   | any read past the end        | 鈥?    | `MDNS_TRUNCATED`     |
+ *   | any read past the end        | --    | `MDNS_TRUNCATED`     |
  *
  * The two pointer guards are both load-bearing, and neither is decoration:
  *
- *   * RFC 1035 搂4.1.4 says a pointer refers to "a prior occurrence" of the name, i.e. to an offset
+ *   * RFC 1035 --4.1.4 says a pointer refers to "a prior occurrence" of the name, i.e. to an offset
  *     *earlier* in the message. A pointer that does not point strictly backwards is the only way to
  *     build a cycle, so it is refused as a loop. This alone guarantees termination.
  *   * The hop counter (128, the conventional guard) is the bound on *work*, not just on loops: a
@@ -79,13 +79,13 @@ import { Buffer } from 'node:buffer';
 // Constants
 // ---------------------------------------------------------------------------------------------
 
-/** DNS CLASS IN (RFC 1035 搂3.2.4). */
+/** DNS CLASS IN (RFC 1035 --3.2.4). */
 export const DNS_CLASS_IN = 1;
 
-/** DNS CLASS ANY (`*`), which mDNS queries use to ask for every type of a name (RFC 6762 搂5). */
+/** DNS CLASS ANY (`*`), which mDNS queries use to ask for every type of a name (RFC 6762 --5). */
 export const DNS_CLASS_ANY = 255;
 
-/** Record types this layer reads. RFC 1035 搂3.2.2, RFC 1035 搂3.2.3 (AAAA is RFC 3596), RFC 2782. */
+/** Record types this layer reads. RFC 1035 --3.2.2, RFC 1035 --3.2.3 (AAAA is RFC 3596), RFC 2782. */
 export const RECORD_TYPE = Object.freeze({
   A: 1,
   PTR: 12,
@@ -108,26 +108,26 @@ const TYPE_NAME = Object.freeze({
 /**
  * The most significant bit of the *rrclass* field in a response record.
  *
- * RFC 6762 搂10.2: "this is not a record class 0x8001" 鈥?the bit means "the rest of this RRset is
+ * RFC 6762 --10.2: "this is not a record class 0x8001" --the bit means "the rest of this RRset is
  * replaced", and it must be masked off before the class is compared. It is the *same bit value* as
  * {@link UNICAST_RESPONSE} in a question, but a different field with a different meaning; the two
  * constants are separate so a future edit cannot conflate them.
  */
 export const CACHE_FLUSH = 0x8000;
 
-/** The most significant bit of the *qclass* field in a question (RFC 6762 搂5.4, "QU" questions). */
+/** The most significant bit of the *qclass* field in a question (RFC 6762 --5.4, "QU" questions). */
 export const UNICAST_RESPONSE = 0x8000;
 
-/** RFC 1035 搂2.3.4: a label is at most 63 octets, which is why the top two bits can be flags. */
+/** RFC 1035 --2.3.4: a label is at most 63 octets, which is why the top two bits can be flags. */
 export const MAX_LABEL_BYTES = 63;
 
-/** RFC 1035 搂2.3.4: a name (length octets, label octets and the terminating zero) is at most 255. */
+/** RFC 1035 --2.3.4: a name (length octets, label octets and the terminating zero) is at most 255. */
 export const MAX_NAME_BYTES = 255;
 
 /**
  * Largest message this codec will parse or produce.
  *
- * RFC 6762 搂17 asks that multicast messages fit in 1500 bytes "whenever possible" and caps them at
+ * RFC 6762 --17 asks that multicast messages fit in 1500 bytes "whenever possible" and caps them at
  * 9000 (`MAX_MESSAGE_BYTES` here). The cap is also a bound on parser work, which is the reason it is
  * enforced on *decode* as well: a datagram larger than this is refused before a single name is read.
  */
@@ -143,8 +143,8 @@ export const MAX_RECORDS = 256;
 export const MAX_COMPRESSION_ENTRIES = 512;
 
 /**
- * The two top bits of a length octet (RFC 1035 搂4.1.4): `00` is a label length, `11` is a compression
- * pointer, `01` and `10` are reserved. The mask is one octet wide 鈥?the 16-bit form, `0xc000`, is what
+ * The two top bits of a length octet (RFC 1035 --4.1.4): `00` is a label length, `11` is a compression
+ * pointer, `01` and `10` are reserved. The mask is one octet wide --the 16-bit form, `0xc000`, is what
  * the *writer* ORs into a pointer, and mixing the two up makes every pointer unreadable.
  */
 const LABEL_KIND_MASK = 0xc0;
@@ -153,8 +153,8 @@ const LABEL_KIND_MASK = 0xc0;
 const POINTER_WORD_MASK = 0xc000;
 
 /**
- * RFC 6762 搂6.7: a response to a query from a source port other than 5353 is a *legacy* unicast
- * response, and its TTLs "SHOULD NOT be greater than ten seconds" 鈥?the resolver that asked has no
+ * RFC 6762 --6.7: a response to a query from a source port other than 5353 is a *legacy* unicast
+ * response, and its TTLs "SHOULD NOT be greater than ten seconds" --the resolver that asked has no
  * cache-coherency protocol and would keep the record long after it stopped being true.
  */
 export const LEGACY_UNICAST_TTL = 10;
@@ -162,10 +162,10 @@ export const LEGACY_UNICAST_TTL = 10;
 /** 14 bits of pointer target, i.e. the largest offset a pointer can name. */
 const MAX_POINTER_TARGET = 0x3fff;
 
-/** Header size: ID, flags, and four section counts (RFC 1035 搂4.1.1). */
+/** Header size: ID, flags, and four section counts (RFC 1035 --4.1.1). */
 const HEADER_BYTES = 12;
 
-/** Flag bits of the second header word (RFC 1035 搂4.1.1). */
+/** Flag bits of the second header word (RFC 1035 --4.1.1). */
 export const FLAG = Object.freeze({
   QR: 0x8000,
   AA: 0x0400,
@@ -198,7 +198,7 @@ export const REFUSAL = Object.freeze({
 /**
  * An invalid *argument* to an encoder.
  *
- * The decoder never throws 鈥?it refuses. The encoder does, because its input is our own data: writing
+ * The decoder never throws --it refuses. The encoder does, because its input is our own data: writing
  * a packet we know to be malformed would put a lie on the wire where nobody is left to catch it.
  */
 export class MdnsWireError extends Error {
@@ -225,7 +225,7 @@ function refuse(reason, detail = undefined) {
 /**
  * Lower-case a name and drop one trailing dot, for case-insensitive comparison.
  *
- * DNS names are case-insensitive (RFC 1035 搂2.3.3) but the wire case is preserved everywhere else in
+ * DNS names are case-insensitive (RFC 1035 --2.3.3) but the wire case is preserved everywhere else in
  * this module, because a DNS-SD *instance* name is a human-readable label and "Mac Studio" is not
  * "mac studio" to the person who reads it.
  *
@@ -282,7 +282,7 @@ export function splitName(name, what = 'name') {
     if (bytes > MAX_LABEL_BYTES) {
       throw new MdnsWireError(
         REFUSAL.LABEL_TOO_LONG,
-        `${what} ${JSON.stringify(name)} has a ${bytes}-octet label; RFC 1035 搂2.3.4 allows ${MAX_LABEL_BYTES}`,
+        `${what} ${JSON.stringify(name)} has a ${bytes}-octet label; RFC 1035 --2.3.4 allows ${MAX_LABEL_BYTES}`,
       );
     }
     encoded += bytes + 1;
@@ -290,14 +290,14 @@ export function splitName(name, what = 'name') {
   if (encoded > MAX_NAME_BYTES) {
     throw new MdnsWireError(
       REFUSAL.NAME_TOO_LONG,
-      `${what} ${JSON.stringify(name)} encodes to ${encoded} octets; RFC 1035 搂2.3.4 allows ${MAX_NAME_BYTES}`,
+      `${what} ${JSON.stringify(name)} encodes to ${encoded} octets; RFC 1035 --2.3.4 allows ${MAX_NAME_BYTES}`,
     );
   }
   return labels;
 }
 
 /**
- * `a.b.c.` 鈫?encoded name, with no compression (a standalone helper for tests and for RDATA that must
+ * `a.b.c.` --?encoded name, with no compression (a standalone helper for tests and for RDATA that must
  * not be compressed).
  *
  * @param {string} name
@@ -315,7 +315,7 @@ export function encodeName(name, options = {}) {
   return Buffer.concat(parts);
 }
 
-/** `192.168.0.1` 鈫?4 octets. Strict: four decimal octets, each 0-255, no shorthand. */
+/** `192.168.0.1` --?4 octets. Strict: four decimal octets, each 0-255, no shorthand. */
 export function parseIpv4(text) {
   if (typeof text !== 'string')
     throw new MdnsWireError('MDNS_A_INVALID', `IPv4 address must be a string, got ${typeof text}`);
@@ -334,13 +334,13 @@ export function parseIpv4(text) {
   return bytes;
 }
 
-/** 4 octets 鈫?dotted quad. */
+/** 4 octets --?dotted quad. */
 export function formatIpv4(bytes) {
   return `${bytes[0]}.${bytes[1]}.${bytes[2]}.${bytes[3]}`;
 }
 
 /**
- * `2001:db8::1` 鈫?16 octets, with `::` expansion and an embedded IPv4 tail.
+ * `2001:db8::1` --?16 octets, with `::` expansion and an embedded IPv4 tail.
  *
  * Hand-written rather than borrowed: `node:net` validates an IPv6 literal but does not hand back its
  * bytes, and the only other source of bytes would be a dependency this project does not take.
@@ -359,7 +359,7 @@ export function parseIpv6(text) {
   if (value.includes('%'))
     throw new MdnsWireError('MDNS_AAAA_INVALID', `${text} carries a zone index, which is link-local only`);
   if (value.includes('.')) {
-    // An embedded IPv4 tail (RFC 4291 搂2.2): convert it to two groups and re-parse.
+    // An embedded IPv4 tail (RFC 4291 --2.2): convert it to two groups and re-parse.
     const cut = value.lastIndexOf(':');
     if (cut === -1)
       throw new MdnsWireError('MDNS_AAAA_INVALID', `${text} has an IPv4 tail but no IPv6 prefix`);
@@ -395,7 +395,7 @@ export function parseIpv6(text) {
 }
 
 /**
- * 16 octets 鈫?text, with the longest run of zero groups collapsed to `::` (RFC 5952 搂4.2).
+ * 16 octets --?text, with the longest run of zero groups collapsed to `::` (RFC 5952 --4.2).
  *
  * @param {Buffer} bytes
  * @returns {string}
@@ -458,7 +458,7 @@ function readName(buffer, start) {
   /** Offset just past the name in the *original* stream, which a pointer fixes once and for all. */
   let next = null;
   let hops = 0;
-  let expanded = 1; // the terminating zero octet counts towards the 255 (RFC 1035 搂2.3.4)
+  let expanded = 1; // the terminating zero octet counts towards the 255 (RFC 1035 --2.3.4)
 
   for (;;) {
     if (position >= buffer.length) return refuse(REFUSAL.TRUNCATED, { at: position, reading: 'name' });
@@ -473,7 +473,7 @@ function readName(buffer, start) {
       // is refused as a budget overrun rather than being mistaken for a loop.
       if (hops >= MAX_POINTER_HOPS)
         return refuse(REFUSAL.POINTER_HOPS, { hops, target, limit: MAX_POINTER_HOPS });
-      // RFC 1035 搂4.1.4: a pointer names a *prior* occurrence. A pointer that does not go strictly
+      // RFC 1035 --4.1.4: a pointer names a *prior* occurrence. A pointer that does not go strictly
       // backwards is the only way to build a cycle, so it is refused as one. This is what makes
       // termination a property of the format rather than of the hop counter.
       if (target >= position) return refuse(REFUSAL.POINTER_LOOP, { target, position });
@@ -482,7 +482,7 @@ function readName(buffer, start) {
       continue;
     }
 
-    // `01` and `10` are reserved label kinds (RFC 1035 搂4.1.4 defines only `00` and `11`). A packet
+    // `01` and `10` are reserved label kinds (RFC 1035 --4.1.4 defines only `00` and `11`). A packet
     // using them is not something to guess at.
     if ((lengthByte & LABEL_KIND_MASK) !== 0)
       return refuse(REFUSAL.LABEL_TYPE, { octet: lengthByte, at: position });
@@ -535,7 +535,7 @@ function readRdata(buffer, rdataStart, rdataEnd, type) {
     if (length === 0) return refuse(REFUSAL.RDATA_LENGTH, { type: 'PTR', length, expected: 'a name' });
     const name = readName(buffer, rdataStart);
     if (!name.ok) return name;
-    // RFC 1035 搂4.1.4 permits PTR RDATA to be compressed, and mDNS implementations do it, so a
+    // RFC 1035 --4.1.4 permits PTR RDATA to be compressed, and mDNS implementations do it, so a
     // pointer is followed here (leniently) even though the encoder writes this name uncompressed.
     return { ok: true, value: { target: name.name } };
   }
@@ -611,11 +611,11 @@ function readRecord(buffer, offset, section, context) {
       name: name.name,
       type,
       type_name: typeName(type),
-      // RFC 6762 搂10.2: the cache-flush bit is not part of the class and must be masked off.
+      // RFC 6762 --10.2: the cache-flush bit is not part of the class and must be masked off.
       class: rrclass & 0x7fff,
       cache_flush: (rrclass & CACHE_FLUSH) !== 0,
       ttl,
-      // TTL 0 is a goodbye (RFC 6762 搂10.1), and it is a *value*, not an error: the consumers drop
+      // TTL 0 is a goodbye (RFC 6762 --10.1), and it is a *value*, not an error: the consumers drop
       // the record when they see it.
       goodbye: ttl === 0,
       rdata: Buffer.from(buffer.subarray(rdataStart, rdataEnd)),
@@ -666,7 +666,7 @@ export function decodeMessage(buffer) {
         name: name.name,
         type: buffer.readUInt16BE(offset),
         class: qclass & 0x7fff,
-        // RFC 6762 搂5.4: the top bit of the class asks for a unicast reply ("QU").
+        // RFC 6762 --5.4: the top bit of the class asks for a unicast reply ("QU").
         unicast_response: (qclass & UNICAST_RESPONSE) !== 0,
       });
       offset += 4;
@@ -821,9 +821,9 @@ function createWriter() {
  *
  * Compression policy, and the reasoning behind it:
  *
- *   * **PTR RDATA is compressed.** It is a name, RFC 1035 搂4.1.4 permits it, and every mDNS responder
- *     on a real LAN does it 鈥?a response that did not would be larger than the peers' own.
- *   * **SRV RDATA is not compressed.** RFC 1035 搂4.1.4 lists the types whose RDATA may be compressed
+ *   * **PTR RDATA is compressed.** It is a name, RFC 1035 --4.1.4 permits it, and every mDNS responder
+ *     on a real LAN does it --a response that did not would be larger than the peers' own.
+ *   * **SRV RDATA is not compressed.** RFC 1035 --4.1.4 lists the types whose RDATA may be compressed
  *     and SRV (RFC 2782) is not among them, which is the conservative reading every interoperating
  *     implementation follows. The *decoder* still follows a pointer there, because refusing a packet a
  *     peer legitimately built is worse than accepting one written in a style we would not choose.
@@ -863,7 +863,7 @@ function encodeRdata(writer, record) {
  * Encode a TXT RDATA: a sequence of length-prefixed character-strings, each at most 255 octets.
  *
  * An empty list is written as one zero-length string, which is the DNS-SD convention for "this service
- * has no attributes but does have a TXT record" (RFC 6763 搂6.1).
+ * has no attributes but does have a TXT record" (RFC 6763 --6.1).
  *
  * @param {object} record
  * @returns {Buffer}
@@ -876,7 +876,7 @@ function encodeTxt(record) {
     if (bytes.length > 255)
       throw new MdnsWireError(
         'MDNS_TXT_TOO_LONG',
-        `TXT string of ${bytes.length} octets; RFC 1035 搂3.3.14 allows 255`,
+        `TXT string of ${bytes.length} octets; RFC 1035 --3.3.14 allows 255`,
       );
     parts.push(Buffer.from([bytes.length]), bytes);
   }
@@ -924,7 +924,7 @@ function writeRecord(writer, record, section) {
   writer.writeUint16(rrclass | (record.cache_flush === true || record.cacheFlush === true ? CACHE_FLUSH : 0));
   writer.writeUint32(ttl);
   // The length has to precede the RDATA, but a compressed name inside the RDATA needs the offsets of
-  // everything before it 鈥?so the RDATA is written into the message and the placeholder patched after.
+  // everything before it --so the RDATA is written into the message and the placeholder patched after.
   const placeholder = writer.reserveUint16();
   const before = writer.length;
   const rdata = encodeRdata(writer, { ...record, type });
@@ -984,9 +984,9 @@ export function encodeMessage(message = {}) {
 /**
  * Build a service-discovery query.
  *
- * RFC 6762 搂5.1: a one-shot query MUST NOT be sent from source port 5353, because that port signals a
+ * RFC 6762 --5.1: a one-shot query MUST NOT be sent from source port 5353, because that port signals a
  * fully compliant querier. The caller owns the socket and therefore the source port; this function
- * only writes the message. RFC 6762 搂18.1: the ID of a multicast query is zero.
+ * only writes the message. RFC 6762 --18.1: the ID of a multicast query is zero.
  *
  * @param {{serviceType: string, type?: number, unicastResponse?: boolean, id?: number}} options
  * @returns {Buffer}
@@ -995,7 +995,7 @@ export function encodeQuery(options) {
   const type = options.type ?? RECORD_TYPE.PTR;
   return encodeMessage({
     id: Number.isInteger(options.id) ? options.id : 0,
-    // 搂18.3/搂18.4/搂18.5/搂18.6: opcode 0, and the RD/RA/Z bits clear on transmission.
+    // --18.3/--18.4/--18.5/--18.6: opcode 0, and the RD/RA/Z bits clear on transmission.
     flags: { qr: false, opcode: 0, aa: false, tc: false, rd: false, ra: false, rcode: 0 },
     questions: [
       {
@@ -1011,7 +1011,7 @@ export function encodeQuery(options) {
 /**
  * Build a response to a question, copying the question section.
  *
- * RFC 6762 搂6.7: a response to a query from a source port other than 5353 ("legacy") MUST repeat the
+ * RFC 6762 --6.7: a response to a query from a source port other than 5353 ("legacy") MUST repeat the
  * query ID and the question. `legacy` therefore carries those two behaviours and the 10-second TTL cap
  * (see {@link capLegacyTtl}).
  *
@@ -1027,7 +1027,7 @@ export function encodeResponse(options) {
   const legacy = options.legacy === true;
   return encodeMessage({
     id: legacy && Number.isInteger(query?.id) ? query.id : 0,
-    // 搂18.7: the AA bit is set on responses; there is no recursion and no error code in mDNS.
+    // --18.7: the AA bit is set on responses; there is no recursion and no error code in mDNS.
     flags: { qr: true, opcode: 0, aa: true, tc: false, rd: false, ra: false, rcode: 0 },
     questions:
       legacy && Array.isArray(query?.questions)
@@ -1035,13 +1035,13 @@ export function encodeResponse(options) {
         : [],
     answers: answers.map((record) => withTtl(record, legacy)),
     // The additional section carries the records a peer needs next (SRV and TXT for a PTR answer, the
-    // A record for an SRV answer). 搂10.2's cache-flush bit is *not* set for a legacy unicast response.
+    // A record for an SRV answer). --10.2's cache-flush bit is *not* set for a legacy unicast response.
     additionals: additionals.map((record) => withTtl(record, legacy)),
   });
 }
 
 /**
- * Apply RFC 6762 搂6.7's TTL cap and cache-flush rule to one record of a response.
+ * Apply RFC 6762 --6.7's TTL cap and cache-flush rule to one record of a response.
  *
  * A legacy resolver is a plain DNS client with no cache-coherency protocol, so it must not be handed a
  * 75-minute TTL: "the resource record TTL given in a legacy unicast response SHOULD NOT be greater
