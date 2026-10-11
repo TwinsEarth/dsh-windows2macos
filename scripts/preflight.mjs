@@ -953,6 +953,26 @@ export const ACCEPTED_SKIPS = [
       'becoming a blanket one: on win32 the same reason is refused, because there the assertion should ' +
       'have run and a skip is the defect rather than the environment.',
   },
+  {
+    key: 'no-runtime-pnpm',
+    suite: /^update-install: real pnpm against a throwaway profile$/,
+    match: /^runtime pnpm not found$/,
+    maxCount: 2,
+    why:
+      'those two assertions install this package with the pnpm that ships *inside a DSH runtime*: ' +
+      'src/plugin/update-install.mjs resolves it as $DSH_HOME/dsh-runtimes/*/dependencies/pnpm/bin/pnpm.mjs, ' +
+      'or as $W2M_PNPM. A CI runner has no DSH installation, so the suite\'s own precondition is absent -- ' +
+      'the same fact as the accepted "no-loader-installation" skip, which is why this entry carries no ' +
+      '`platforms`: Windows runners lack it exactly as Linux ones do, and qualifying it by platform would ' +
+      'say something false. It runs on every host that has the runtime, and prepareSuiteEnv()\'s shaped ' +
+      'throwaway home is what supplies one on an authoring machine, so on this machine the assertions run ' +
+      'and this entry is inert. The cap of 2 is the bound: a third skip in that describe fails the check, ' +
+      'and this reason on a host that *does* have a runtime would be a defect in resolution, not an ' +
+      'environment fact. The alternative -- building a synthetic runtime in CI, as compat.yml does for the ' +
+      'loader gate -- would exercise the installer against a pnpm fetched from npm instead of the one the ' +
+      'Desktop ships, which is a weaker claim about the artifact plus a network dependency in the release ' +
+      'gate, so it is a deliberate non-choice rather than an oversight.',
+  },
 ];
 
 /**
@@ -2017,7 +2037,20 @@ function checkClaims() {
   // the withdrawn-version rule, the bundle patch row, the release tree against the tree-derived
   // document contract, and the tarball URLs. A second copy of those rules here could disagree with
   // it, and then there would be two answers and no way to choose.
-  const result = child('claims', process.execPath, ['--test', '--test-force-exit', 'test/claims.test.mjs']);
+  // The reporter is pinned, exactly as checkTestSuite() pins it, and for the same reason: the counts
+  // below are read out of stdout, and node's *default* reporter is not a promise this file can keep.
+  // Measured: the same command prints the spec reporter's summary under node 24 and TAP's `# tests 48`
+  // under node 22 when stdout is a pipe -- which is what a CI runner is. This check therefore read no
+  // count at all on the version the workflows run, and reported "the runner printed no test count at
+  // all" for a suite that had passed, while every local run on node 24 was green. A gate whose reading
+  // depends on the runtime's default output format is a difference that only shows up where it matters.
+  const result = child('claims', process.execPath, [
+    '--test',
+    '--test-force-exit',
+    '--test-reporter=spec',
+    '--test-reporter-destination=stdout',
+    'test/claims.test.mjs',
+  ]);
   const counts = parseTestCounts(result.stdout);
   // "0 claim(s) checked, 0 pass, 0 skip" is not a pass. A suite in which every claim was skipped --
   // a `describe` made conditional on the wrong thing, a group renamed, a selector that matched
