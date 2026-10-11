@@ -1,0 +1,721 @@
+name: Compat
+
+# WHAT THIS WORKFLOW PROVES, AND WHY IT IS THE GATE THIS PROJECT WAS MISSING
+#
+# v0.5.4 and v0.5.5 both shipped a tarball that passed every test in this repository and then stopped
+# the whole DSH application from starting. v0.5.4: the entry died inside the real Loader
+# (`cannot get property "connection" without inject`), all eight `w2m_*` tools answered "unknown tool",
+# and `scripts/verify-installed.mjs` still printed `PASS: 8 tools registered` because it drives the
+# plugin against a plain-object context, where reading an undeclared service merely yields `undefined`.
+# v0.5.5: the client half composed, mounted, and then failed to activate during the host's web boot
+# (`cannot get property "locale" without inject`), so the shell refused the page with
+# `web boot: 1 entry did not activate`. It cost the user three restarts, and the real error surfaced only
+# in a crash log.
+#
+# `test/loader-entry.test.mjs` is the test that would have caught both: it packs the tree with the
+# repository's own `scripts/pack.mjs`, installs the tarball with the installation's own `dsh plugin add`
+# into a throwaway profile under a throwaway `DSH_HOME`, boots it with the real `runProfile`, reads the
+# composed tree through the real Loader, activates the client entries through the real client module
+# system and the real Cordis loader, and — when a Chromium-based browser is installed — boots the
+# profile's own page headless. What it lacked was a place to run: it ran only when a human remembered
+# to run it, on one machine, against an installation that happened to be there. This file is that place,
+# so "a published artifact mounts and boots in a real profile" fails automatically instead of relying on
+# a habit.
+#
+# THE THREE JOBS, in order of importance (each on its own runner; the host-installation snippet is
+# repeated in `mount-and-boot` and `uninstall` on purpose — a shared composite action would be a second
+# file, and this change is one workflow):
+#
+#   mount-and-boot  the packed artifact mounts in a real profile and boots: its row is composed by the
+#                   real Loader, its entry ends active, all eight `w2m_*` tools are registered, the
+#                   client half is composed *and activated*, and a registry-wide sweep finds no failed
+#                   fiber anywhere in the composed tree. Then the page half, when a browser exists.
+#   bare-import     the cheap one, and the one that fails fast when packaging breaks: the packed tarball
+#                   installs into an empty project, its root entry imports, and it exports `apply` with
+#                   no host present at all.
+#   uninstall       install the tarball into a scratch profile, remove it again, and assert the
+#                   profile's composition is byte-for-byte what it was before. Reversibility is a claim
+#                   nobody tests until it matters.
+#
+# LESSON 1, taken from a comparable plugin's compat workflow (`PerryLink/dsh-session-sync`,
+# Apache-2.0 — mechanism description only, no code copied; this plugin is MIT): **assert the
+# deterministic artifact, treat a fuzzy smoke as best-effort, never assert a log string that varies by
+# environment.** That workflow demotes its own headless smoke next to a `--dump-config` row assertion,
+# and records why: the same missing credential aborts with `TRANSPORT` on a runner and
+# `MISSING_CREDENTIAL` on a workstation. So nothing here matches a message the host prints. Every
+# assertion below is either a TAP result line for a *named* test in our own `test/loader-entry.test.mjs`,
+# or a comparison of two artifacts produced in this same run (baseline vs. after-remove). The
+# deterministic half is the gate; the real-browser page boot is the fuzzy half, and it is the only thing
+# allowed to report UNVERIFIABLE.
+#
+# LESSON 2: **an unverifiable claim is a first-class outcome with a reason, never a silent pass.**
+# A study this week found a project whose gate printed "unverifiable" and exited 0 on every machine but
+# the author's, so it was counted as a gate while verifying nothing. The rule here is therefore: an
+# un-evaluated claim never prints PASS, never leaves the run looking verified, and FAILS the job — with
+# exactly one documented exception, below, and a `::warning::` even then. The accepted list lives right
+# here in the repository, where a reviewer reads it in the diff:
+#
+#   THE ACCEPTED-UNVERIFIABLE LIST (one entry, deliberately)
+#
+#     no-browser   the runner has no Chromium-based browser at any path
+#                  `test/helpers/dsh-page-boot.mjs` probes. This is the single case that exits 0 without
+#                  its claim evaluated, because the browser half is the only assertion that depends on
+#                  the runner rather than on the artifact — and it is reached only *after* all nine
+#                  deterministic assertions passed. A runner that cannot host the installation, an
+#                  artifact that fails, a browser this workflow resolved but the harness still skipped:
+#                  all FAIL. The accepted case still prints a `::warning::` annotation, writes
+#                  UNVERIFIABLE — never PASS — into the job summary, and says which claim was not
+#                  evaluated. It is expected to be rare: the ubuntu runner image ships Chrome. If it
+#                  ever fires, the honest fix is to run this job where a browser exists (or add one)
+#                  rather than to widen this list.
+#
+# Everything else is red, including a host that cannot be installed: if the pinned release cannot be
+# fetched, that run did not verify the claim, and a red run says exactly that. Flip the accepted case to
+# a hard failure — red on every runner without a browser — by deleting the `ACCEPTED_UNVERIFIABLE` entry
+# in the verdict program below.
+#
+# THE PIN IS DELIBERATE. `DSH_HOST_VERSION` names one exact release, never a dist-tag or a range: with a
+# floating host, every red run of this workflow is ambiguous between "our artifact broke" and "the host
+# changed under us", which is the one question this gate exists to answer without argument. The value is
+# the release the authoring installation reports at `resources/app.asar/dsh/package.json`, and the two
+# cordis pins are the versions that same file carries. When it needs bumping: bump it in its own commit,
+# put the old and new version in the commit subject, and say in the body what changed in the host — then
+# treat the first run on the new pin as a real measurement, because that is what it is. A host bump that
+# arrives inside a feature PR turns two unrelated questions into one red run.
+#
+# WHAT IS *NOT* PROVEN HERE, stated so nobody has to infer it:
+#   * no control is clicked: nothing opens the composer menu or picks a target. The page half proves the
+#     page boots and this package's stylesheet — which only a completed `apply` installs — is in the
+#     document;
+#   * the host is the pinned *npm* release in a synthetic installation tree, not the Desktop
+#     application's own bundled one; see the bridge note in `mount-and-boot` for exactly what that
+#     substitutes and why;
+#   * one operating system. The claim is platform-neutral (a Cordis `inject` guard, a package
+#     specifier, a route prefix) and `ci.yml` already runs the suite on Windows, macOS and Linux; paying
+#     for three runners here would buy a second copy of the same answer.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    # Releases are tagged `v*` on `main`, and a tag push is exactly when "the artifact we are about to
+    # hand users mounts and boots" must be measured — not after.
+    branches: [main]
+    tags: ['v*']
+  schedule:
+    # Weekly, because the host publishes between our releases: a Monday run is what turns "the host
+    # changed" into a notification instead of a surprise inside a feature PR.
+    - cron: '0 4 * * 1'
+  workflow_dispatch:
+
+# A public repository, no secrets: this workflow needs to read the checkout and reach the npm registry.
+permissions:
+  contents: read
+
+concurrency:
+  group: compat-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The host release this gate is about. See "THE PIN IS DELIBERATE" above.
+  DSH_HOST_VERSION: '0.2.0-rc.2'
+  DSH_CORDIS_VERSION: '4.0.4'
+  DSH_CORDIS_LOADER_VERSION: '1.0.5'
+  # The version the Desktop installation bundles at `resources/runtime/pnpm`; `dsh plugin add` forwards
+  # to pnpm in the profile directory and fails with exit 127 without one on PATH.
+  PNPM_VERSION: '11.7.0'
+
+jobs:
+  mount-and-boot:
+    name: packed artifact mounts and boots in a real profile
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: pnpm (the version the Desktop installation bundles)
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      # The installation the harness under test drives, built in the runner's scratch space.
+      #
+      # `test/loader-entry.test.mjs` recognizes an installation by `<root>/resources/app.asar` and
+      # imports the Loader from `<root>/resources/app.asar/dsh/node_modules`, which on a real Desktop
+      # install is an ASAR archive only the Harness runtime can read. Here that path is an ordinary
+      # directory holding the pinned npm packages, and the runtime is the runner's own `node`: the host
+      # itself runs as Node under `ELECTRON_RUN_AS_NODE=1` in production, which is the same runtime, and
+      # nothing in this workflow reads an archive.
+      #
+      # The installation is not a profile: the profile the gate boots lives in a throwaway `DSH_HOME`
+      # under the test's own temporary directory, and the tarball is installed there with the host's own
+      # `dsh plugin add`. Nothing in this workflow can reach a profile outside the runner.
+      - name: Build the pinned host installation
+        id: host
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/w2m-dsh-host"
+          DIST="$ROOT/resources/app.asar/dsh"
+          mkdir -p "$DIST"
+
+          # The direct dependencies are pinned exactly, because they are the ones this repository's own
+          # helpers import (`dsh`, `dsh-app-boot`, `dsh-client-modules`, `cordis`,
+          # `cordis-plugin-loader`). Transitive ranges resolve per the host's own release metadata,
+          # which is the host's choice, not ours.
+          cat > "$DIST/package.json" <<JSON
+          {
+            "name": "w2m-compat-host",
+            "private": true,
+            "version": "0.0.0",
+            "dependencies": {
+              "@deepseek-ai/dsh": "${DSH_HOST_VERSION}",
+              "@deepseek-ai/dsh-app-boot": "${DSH_HOST_VERSION}",
+              "@deepseek-ai/dsh-client-modules": "${DSH_HOST_VERSION}",
+              "@deepseek-ai/cordis": "${DSH_CORDIS_VERSION}",
+              "@deepseek-ai/cordis-plugin-loader": "${DSH_CORDIS_LOADER_VERSION}"
+            }
+          }
+          JSON
+
+          # --ignore-scripts: the host's dependency tree carries lifecycle scripts for things this gate
+          # never uses (node-pty, koffi, protobufjs, `@deepseek-ai/dsh-subprocess-local`). Running them
+          # would add a build toolchain and a supply-chain surface to a composition measurement, and
+          # `mount-and-boot` is what proves the tree boots without them. If a future host needs one of
+          # those scripts to boot, this gate goes red and the answer is to allow that script explicitly
+          # — not to remove the flag silently.
+          npm install --prefix "$DIST" --no-audit --no-fund --ignore-scripts
+
+          # The harness spawns the installation's own CLI at exactly this path, which is how
+          # `dsh plugin add` runs. The real `@deepseek-ai/dsh-desktop-host` is private and unpublished,
+          # and its `lib/cli.js` is a thin wrapper over the *published* CLI: it imports `runCli` from
+          # `@deepseek-ai/dsh/lib/bin.js` and adds three Desktop-only concerns this runner does not have
+          # (Electron's Windows console handler, ASAR-relative Office-engine resolution, and the
+          # Desktop's bundled pnpm/node under `resources/runtime`). The file below is that same `runCli`,
+          # bridged to the path the harness reads; it contains no installer logic of its own. Both files
+          # and their digests are printed so a reviewer sees exactly what the bridge is.
+          BRIDGE="$DIST/node_modules/@deepseek-ai/dsh-desktop-host"
+          mkdir -p "$BRIDGE/lib"
+          cat > "$BRIDGE/lib/cli.js" <<'JS'
+          // Bridge written by .github/workflows/compat.yml — see the note in that step.
+          import { runCli } from '@deepseek-ai/dsh/lib/bin.js';
+          await runCli({ manageDesktopProfile: true });
+          JS
+          cat > "$BRIDGE/package.json" <<'JSON'
+          {
+            "name": "@deepseek-ai/dsh-desktop-host",
+            "private": true,
+            "version": "0.0.0-compat-bridge",
+            "type": "module",
+            "main": "lib/cli.js"
+          }
+          JSON
+          echo "--- bridge: $BRIDGE/lib/cli.js ($(sha256sum "$BRIDGE/lib/cli.js" | cut -d' ' -f1))"
+          cat "$BRIDGE/lib/cli.js"
+
+          # The runtime the tests spawn, which must live in the installation root. A real installation's
+          # runtime is its Electron binary in Node mode (`--expose-internals` and all); this is the same
+          # Node the host packages run on.
+          ln -s "$(command -v node)" "$ROOT/deepseek-harness"
+          "$ROOT/deepseek-harness" --version
+
+          # Fast-fail assertions about the installation itself: a pin that resolves to something else
+          # must say so here, not arrive later as a confusing boot error.
+          for pkg in dsh dsh-app-boot dsh-client-modules; do
+            actual=$(node -p "require('$DIST/node_modules/@deepseek-ai/$pkg/package.json').version")
+            if [ "$actual" != "$DSH_HOST_VERSION" ]; then
+              echo "::error::@deepseek-ai/$pkg resolved to $actual, expected $DSH_HOST_VERSION"
+              exit 1
+            fi
+          done
+          test -f "$BRIDGE/lib/cli.js"
+          echo "installation ready: $ROOT"
+          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
+
+      # The one environment fact this workflow cannot control. It is measured *before* the gate so the
+      # verdict can tell a skip it predicted from a skip it did not: if a browser is resolved here, the
+      # page assertion is required to have run, and a skip then fails. The candidate list mirrors
+      # `test/helpers/dsh-page-boot.mjs`; if the two ever disagree, the disagreement fails loudly rather
+      # than excusing itself.
+      - name: Resolve a Chromium-based browser (the page half's only dependency)
+        id: browser
+        run: |
+          set -euo pipefail
+          found=""
+          for candidate in /usr/bin/google-chrome /usr/bin/chromium /usr/bin/chromium-browser /usr/bin/microsoft-edge; do
+            if [ -x "$candidate" ]; then
+              found="$candidate"
+              break
+            fi
+          done
+          if [ -n "$found" ]; then
+            echo "resolved $found ($("$found" --version 2>/dev/null || echo 'version not reported'))"
+          else
+            echo "::warning title=compat::no Chromium-based browser on this runner: the page-boot half of the loader gate cannot run and will be reported as UNVERIFIABLE (accepted reason: no-browser)"
+          fi
+          echo "path=$found" >> "$GITHUB_OUTPUT"
+
+      # The verdict program. It is a file rather than inline shell so that it can be extracted verbatim
+      # from this workflow and run locally against real TAP captures — the classification below was
+      # exercised in both directions (a browser present, and absent) before this workflow was pushed.
+      - name: Write the verdict program
+        run: |
+          cat > "$RUNNER_TEMP/verify-tap.mjs" <<'JS'
+          /**
+           * Classify the loader gate from its TAP capture.
+           *
+           * The claim has two halves and they are not equally strong.
+           *
+           *   deterministic   the plugin's row is composed by the real Loader, its entry ends active, all
+           *                   eight `w2m_*` tools are registered, the client half is composed and
+           *                   activates through the real module system and Cordis loader, and a
+           *                   registry-wide sweep finds no failed fiber. Every one of these is a property
+           *                   of our artifact and of the host's Loader, none depends on a browser, and
+           *                   none may be skipped. A skip here is a FAIL: an assertion that quietly did
+           *                   not run is the exact failure mode this workflow exists to end.
+           *
+           *   page            the profile's own page boots headless and the control arrives. It needs a
+           *                   Chromium-based browser, which is not ours to promise; when it did not run
+           *                   that is UNVERIFIABLE — never PASS, reported in the summary — and accepted
+           *                   only for a reason on the list below.
+           *
+           * Exit status: 0 for PASS, and for UNVERIFIABLE whose reason is on the accepted list. Every
+           * other outcome is non-zero.
+           */
+          import fs from 'node:fs';
+
+          const TAP_FILE = process.env.TAP_FILE;
+          const EXIT_FILE = process.env.TEST_EXIT_FILE;
+          const BROWSER = process.env.W2M_DSH_BROWSER ?? '';
+
+          /**
+           * Substrings that identify the deterministic assertions in `test/loader-entry.test.mjs`.
+           *
+           * ASCII only, and a substring rather than a whole title, so a typographic apostrophe or a
+           * reworded tail cannot turn an assertion into a silent no-op. Each must match exactly one TAP
+           * result line: zero matches means the assertion did not run, more than one means this list has
+           * stopped identifying a single test.
+           */
+          const DETERMINISTIC = [
+            'mounts the entry the bundle patch names',
+            'leaves the entry active, with no error on its fiber',
+            'registers all eight w2m_* tools',
+            'has the client half composed by the web app',
+            'attaches the composer control',
+            'reports no failed entry that names this package',
+            'reports the stage it reached',
+            'sweeps every fiber in the process and finds no failure',
+            'activates the client entry through the real module system and Cordis loader',
+          ];
+
+          /** The page half: the one assertion allowed to be unverifiable. */
+          const PAGE = 'boots the profile';
+
+          /**
+           * THE ACCEPTED-UNVERIFIABLE LIST. One entry, and it is the only reason an un-evaluated claim
+           * may leave this job green. The reason must be a fact about the runner, not about the
+           * artifact: `no-browser` is only ever produced when this workflow's own probe found no
+           * browser, which is why the probe runs before the gate and why a browser-resolved-but-skipped
+           * outcome below is a failure rather than an excuse.
+           */
+          const ACCEPTED_UNVERIFIABLE = new Map([
+            ['no-browser', 'this runner has no Chromium-based browser at any path test/helpers/dsh-page-boot.mjs probes'],
+          ]);
+
+          const rows = [];
+          const counts = Object.create(null);
+          // The TAP `# SKIP` directive, matched case-insensitively: the directive is ours to read, and a
+          // reporter that spelled it `# skip` must not turn a skipped assertion into a passing one.
+          const SKIP = / # skip(?: |$)/i;
+          for (const line of fs.readFileSync(TAP_FILE, 'utf8').split(/\r?\n/)) {
+            const hit = /^[ \t]*(not ok|ok) (\d+) - (.*)$/.exec(line);
+            if (hit !== null) {
+              const skipped = SKIP.test(hit[3]);
+              rows.push({
+                ok: hit[1] === 'ok',
+                skipped,
+                name: hit[3].replace(/ # skip.*$/i, '').trim(),
+                skipReason: skipped ? hit[3].replace(/^.*? # skip ?/i, '').trim() : null,
+              });
+              continue;
+            }
+            const tally = /^# ([a-z]+) (\d+)$/.exec(line);
+            if (tally !== null) counts[tally[1]] = Number(tally[2]);
+          }
+
+          const problems = [];
+          const unverifiable = [];
+          const report = [];
+
+          /** One TAP result line, or a failure explaining why there is not exactly one. */
+          const only = (needle) => {
+            const found = rows.filter((row) => row.name.includes(needle));
+            if (found.length !== 1) {
+              problems.push(`"${needle}" matches ${found.length} TAP result lines; expected exactly one, so this assertion did not run as written`);
+              return null;
+            }
+            return found[0];
+          };
+
+          report.push(`TAP: tests=${counts.tests ?? '?'} pass=${counts.pass ?? '?'} fail=${counts.fail ?? '?'} skipped=${counts.skipped ?? '?'}`);
+
+          if (counts.tests === undefined) {
+            problems.push('the TAP capture holds no summary at all: `node --test` did not run test/loader-entry.test.mjs');
+          }
+          const exit = Number.parseInt(fs.readFileSync(EXIT_FILE, 'utf8').trim(), 10);
+          if (!Number.isInteger(exit)) problems.push('the gate left no exit status behind, so "it ran" cannot be asserted');
+          else if (exit !== 0) problems.push(`\`node --test\` exited ${exit}`);
+          if ((counts.fail ?? 0) !== 0) problems.push(`${counts.fail} TAP subtest(s) failed`);
+
+          for (const needle of DETERMINISTIC) {
+            const row = only(needle);
+            if (row === null) continue;
+            if (row.skipped) problems.push(`the deterministic assertion "${row.name}" was SKIPPED (${row.skipReason}); it is a property of the artifact, so a runner that cannot evaluate it fails this claim`);
+            else if (!row.ok) problems.push(`the deterministic assertion "${row.name}" failed`);
+            else report.push(`  ok   ${row.name}`);
+          }
+
+          const page = only(PAGE);
+          if (page === null) {
+            // `only()` has already recorded the failure.
+          } else if (page.skipped && BROWSER !== '') {
+            problems.push(`the page assertion was SKIPPED although this workflow resolved ${BROWSER}: the probes disagree, or the browser cannot start`);
+          } else if (page.skipped) {
+            unverifiable.push(`the page half did not run: ${page.skipReason}`);
+            report.push(`  SKIP ${page.name} (${page.skipReason})`);
+          } else if (!page.ok) {
+            problems.push(`the page assertion failed: ${page.name}`);
+          } else {
+            report.push(`  ok   ${page.name} (browser: ${BROWSER})`);
+          }
+
+          const verdict = problems.length > 0 ? 'FAIL' : unverifiable.length > 0 ? 'UNVERIFIABLE' : 'PASS';
+          const reason = verdict === 'UNVERIFIABLE' ? (BROWSER === '' ? 'no-browser' : 'unknown') : null;
+          const accepted = reason !== null && ACCEPTED_UNVERIFIABLE.has(reason);
+          const lines = [
+            `### compat / mount-and-boot: ${verdict}`,
+            '',
+            ...report.map((line) => `- ${line}`),
+          ];
+          if (verdict === 'UNVERIFIABLE') {
+            lines.push('', `**The page-boot claim was NOT evaluated.** ${unverifiable.join('; ')}`);
+            lines.push(accepted
+              ? `Accepted reason \`${reason}\` (${ACCEPTED_UNVERIFIABLE.get(reason)}). The nine deterministic assertions above did run and did pass; this run verifies them and not the browser half.`
+              : `Reason \`${String(reason)}\` is not on the accepted list, so this run fails.`);
+          }
+          if (verdict === 'FAIL') {
+            lines.push('', '**The claim failed.** An un-evaluated assertion is reported here as a failure on purpose.');
+            lines.push(...problems.map((problem) => `- ${problem}`));
+          }
+
+          process.stdout.write(`${lines.join('\n')}\n`);
+          if (typeof process.env.GITHUB_STEP_SUMMARY === 'string' && process.env.GITHUB_STEP_SUMMARY !== '') {
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${lines.join('\n')}\n`);
+          }
+          if (verdict === 'FAIL' || (verdict === 'UNVERIFIABLE' && !accepted)) {
+            // Annotations are for the pull-request UI; the summary above carries the whole list, so a
+            // failure that skips nine assertions does not paint nine identical annotations over the diff.
+            const shown = problems.length > 0 ? problems : unverifiable;
+            for (const problem of shown.slice(0, 3)) process.stdout.write(`::error title=compat::${problem}\n`);
+            if (shown.length > 3) process.stdout.write(`::error title=compat::${shown.length - 3} further problem(s); the job summary lists them all\n`);
+            process.exit(1);
+          }
+          if (verdict === 'UNVERIFIABLE') {
+            process.stdout.write(`::warning title=compat::UNVERIFIABLE (accepted reason: ${reason}): the page-boot claim was not evaluated on this runner\n`);
+          }
+          process.exit(0);
+          JS
+
+      # The gate. Everything above built the installation; this step is the claim.
+      - name: The loader gate against that installation
+        env:
+          W2M_DSH_ROOT: ${{ steps.host.outputs.root }}
+          W2M_DSH_RUNTIME: ${{ steps.host.outputs.root }}/deepseek-harness
+          W2M_DSH_BROWSER: ${{ steps.browser.outputs.path }}
+          TAP_FILE: ${{ runner.temp }}/loader-entry.tap
+          TEST_EXIT_FILE: ${{ runner.temp }}/loader-entry.exit
+        run: |
+          # GitHub invokes a `run:` script with errexit (`bash -e`), and the gate's own non-zero exit is
+          # an outcome to classify rather than an error to die on: turn errexit off before running it, or
+          # a failing gate would abort this step before its exit code could be recorded.
+          set +e
+          set -uo pipefail
+          node --test --test-reporter=tap --test-force-exit test/loader-entry.test.mjs > "$TAP_FILE" 2>&1
+          gate_exit=$?
+          echo "$gate_exit" > "$TEST_EXIT_FILE"
+          # The capture is the evidence: print it, then classify it. The last command's status is this
+          # step's status, which is the whole point.
+          cat "$TAP_FILE"
+          node "$RUNNER_TEMP/verify-tap.mjs"
+
+  bare-import:
+    name: the packed tarball imports with no host present
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Pack (the repository's own packer)
+        run: |
+          set -euo pipefail
+          node scripts/pack.mjs --out "$RUNNER_TEMP/packed"
+
+      # The cheapest failure this project can ship is a tarball whose entry points do not resolve:
+      # `node --check` parses a file without resolving its imports, so a re-export naming a symbol that
+      # does not exist passes every syntax check and every unit test (which import `src/` directly) and
+      # fails only when DSH mounts the plugin. This job installs the *packed* artifact into an empty
+      # project — no Harness, no installation, no optional peer — and imports it the way npm resolves it.
+      - name: Install into an empty project and import the root entry
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./package.json').version")
+          TARBALL="$RUNNER_TEMP/packed/twinsearth-w2m-dsh-plugin-$VERSION.tgz"
+          test -f "$TARBALL"
+          BARE="$RUNNER_TEMP/bare"
+          mkdir -p "$BARE"
+          cd "$BARE"
+          npm init -y > /dev/null
+          npm install --no-audit --no-fund --no-save "$TARBALL"
+
+          # The check lives in a file so it can be read as code, and run from inside the project so that
+          # `import '@twinsearth/w2m-dsh-plugin'` resolves through the installed `exports` map.
+          cat > "$BARE/import-check.mjs" <<'JS'
+          import fs from 'node:fs';
+          import path from 'node:path';
+
+          const bare = process.argv[2];
+          const installed = path.join(bare, 'node_modules', '@twinsearth', 'w2m-dsh-plugin');
+          const problems = [];
+
+          /** Nothing in an empty project provides the host: the import below must be hostless, for real. */
+          for (const host of ['@deepseek-ai/dsh', '@deepseek-ai/dsh-tools', '@deepseek-ai/cordis']) {
+            try {
+              await import(host);
+              problems.push(`${host} resolved in the empty project, so "with no host present" is not what this run measured`);
+            } catch {
+              // expected: the optional peer is absent
+            }
+          }
+
+          const manifest = JSON.parse(fs.readFileSync(path.join(installed, 'package.json'), 'utf8'));
+          const dependencies = Object.keys(manifest.dependencies ?? {});
+          if (dependencies.length !== 0) {
+            problems.push(`the installed package declares runtime dependencies: ${dependencies.join(', ')}; this project ships none`);
+          }
+
+          let mod;
+          try {
+            mod = await import('@twinsearth/w2m-dsh-plugin');
+          } catch (error) {
+            problems.push(`importing the package root threw: ${error?.message ?? String(error)}`);
+          }
+          if (mod !== undefined && typeof mod.apply !== 'function') {
+            problems.push(`the package root exports apply as ${typeof mod.apply}; cordis.patch.yml mounts this entry and calls it`);
+          }
+
+          if (problems.length > 0) {
+            for (const problem of problems) process.stdout.write(`::error title=compat::${problem}\n`);
+            process.exit(1);
+          }
+          process.stdout.write(`tarball ${manifest.name}@${manifest.version} imports with no host; apply is a function, inject = ${JSON.stringify(mod.inject ?? null)}\n`);
+          JS
+          node "$BARE/import-check.mjs" "$BARE"
+
+  uninstall:
+    name: install then uninstall returns the profile to its previous composition
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: pnpm (the version the Desktop installation bundles)
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      # Same synthetic installation as `mount-and-boot`, built by the same commands. Kept as a copy
+      # rather than an artifact shared between jobs: a job that depends on another job's uploaded state
+      # can be green because the state is stale, and this job's whole point is what the host's own
+      # commands do to a profile.
+      - name: Build the pinned host installation
+        id: host
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/w2m-dsh-host"
+          DIST="$ROOT/resources/app.asar/dsh"
+          mkdir -p "$DIST"
+          cat > "$DIST/package.json" <<JSON
+          {
+            "name": "w2m-compat-host",
+            "private": true,
+            "version": "0.0.0",
+            "dependencies": {
+              "@deepseek-ai/dsh": "${DSH_HOST_VERSION}",
+              "@deepseek-ai/dsh-app-boot": "${DSH_HOST_VERSION}",
+              "@deepseek-ai/dsh-client-modules": "${DSH_HOST_VERSION}",
+              "@deepseek-ai/cordis": "${DSH_CORDIS_VERSION}",
+              "@deepseek-ai/cordis-plugin-loader": "${DSH_CORDIS_LOADER_VERSION}"
+            }
+          }
+          JSON
+          npm install --prefix "$DIST" --no-audit --no-fund --ignore-scripts
+          BRIDGE="$DIST/node_modules/@deepseek-ai/dsh-desktop-host"
+          mkdir -p "$BRIDGE/lib"
+          cat > "$BRIDGE/lib/cli.js" <<'JS'
+          import { runCli } from '@deepseek-ai/dsh/lib/bin.js';
+          await runCli({ manageDesktopProfile: true });
+          JS
+          cat > "$BRIDGE/package.json" <<'JSON'
+          {
+            "name": "@deepseek-ai/dsh-desktop-host",
+            "private": true,
+            "version": "0.0.0-compat-bridge",
+            "type": "module",
+            "main": "lib/cli.js"
+          }
+          JSON
+          ln -s "$(command -v node)" "$ROOT/deepseek-harness"
+          test -f "$BRIDGE/lib/cli.js"
+          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
+
+      - name: Pack (the repository's own packer)
+        run: |
+          set -euo pipefail
+          node scripts/pack.mjs --out "$RUNNER_TEMP/packed"
+
+      # The reversibility verdict, for the same reason as the verdict program in `mount-and-boot`: a file,
+      # so the copy embedded here can be extracted verbatim and run against real artifacts locally. The
+      # distinction it makes between the composed config and the profile manifest was measured on the
+      # pinned host, not assumed — see its own comment.
+      - name: Write the reversibility verdict program
+        run: |
+          cat > "$RUNNER_TEMP/verify-uninstall.mjs" <<'JS'
+          /**
+           * Decide the uninstall claim from the artifacts the host's own commands produced.
+           *
+           * The composition must return to what it was: `--dump-config` byte for byte, the profile's
+           * bundle list, and nothing left behind in the profile's node_modules.
+           *
+           * The profile *manifest* is compared as a composition rather than as a file, and that
+           * distinction was measured on the pinned host rather than assumed: `plugin remove` runs pnpm,
+           * and pnpm drops the now-empty `"dependencies": {}` field that the host's own profile
+           * initializer wrote. A byte-diff of the manifest would therefore fail on every run for a reason
+           * that is not a reversibility defect — while catching nothing extra, since the composed config
+           * is already compared byte for byte. So: no key may appear, no bundle may change, and no
+           * dependency may survive.
+           *
+           * `with.txt` is checked as well, so that a remove which did nothing cannot pass by leaving
+           * behind a profile that was never changed in the first place.
+           */
+          import fs from 'node:fs';
+          import path from 'node:path';
+
+          const work = process.argv[2];
+          const profileDir = process.argv[3];
+          const PACKAGE = '@twinsearth/w2m-dsh-plugin';
+
+          const read = (name) => fs.readFileSync(path.join(work, name), 'utf8');
+          const manifest = (name) => JSON.parse(read(name));
+          const bundles = (m) => JSON.stringify(m.dsh?.profile?.bundles ?? null);
+          const dependencies = (m) => Object.keys(m.dependencies ?? {}).sort();
+
+          const before = manifest('before-package.json');
+          const after = manifest('after-package.json');
+          const problems = [];
+
+          if (!read('with.txt').includes(PACKAGE)) {
+            problems.push(`the composed config after \`plugin add\` does not name ${PACKAGE}: the install never landed, so a remove that did nothing would have looked reversible`);
+          }
+          if (read('before.txt') !== read('after.txt')) {
+            problems.push('the composed config is not byte-identical before the install and after the remove');
+          }
+          if (bundles(before) !== bundles(after)) {
+            problems.push(`the profile bundle list changed: ${bundles(before)} -> ${bundles(after)}`);
+          }
+          const appeared = dependencies(after).filter((name) => !dependencies(before).includes(name));
+          if (appeared.length > 0) {
+            problems.push(`the profile manifest gained dependencies it did not have before: ${appeared.join(', ')}`);
+          }
+          if (dependencies(after).includes(PACKAGE)) {
+            problems.push(`the profile manifest still depends on ${PACKAGE}`);
+          }
+          if (fs.existsSync(path.join(profileDir, 'node_modules', ...PACKAGE.split('/')))) {
+            problems.push(`${PACKAGE} is still in the profile node_modules`);
+          }
+
+          const lines = [
+            `### compat / uninstall: ${problems.length === 0 ? 'PASS' : 'FAIL'}`,
+            '',
+            '- installed the packed tarball into a scratch profile with the host own `dsh plugin add`, asserted its row in the composed config, then removed it',
+            '- the composed config is byte-identical before the install and after the remove',
+            `- the profile bundle list is unchanged (${bundles(after)})`,
+            `- dependencies after the remove: ${JSON.stringify(dependencies(after))}`,
+            '- the package is gone from the profile node_modules',
+          ];
+          if (problems.length > 0) lines.push('', '**The reversibility claim failed.**', ...problems.map((problem) => `- ${problem}`));
+
+          process.stdout.write(`${lines.join('\n')}\n`);
+          if (typeof process.env.GITHUB_STEP_SUMMARY === 'string' && process.env.GITHUB_STEP_SUMMARY !== '') {
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `${lines.join('\n')}\n`);
+          }
+          if (problems.length > 0) {
+            for (const problem of problems.slice(0, 3)) process.stdout.write(`::error title=compat::${problem}\n`);
+            process.exit(1);
+          }
+          process.exit(0);
+          JS
+
+      - name: Install, then remove, then diff the composition
+        env:
+          DSH_HOME: ${{ runner.temp }}/w2m-dsh-home
+        run: |
+          set -euo pipefail
+          ROOT="${{ steps.host.outputs.root }}"
+          CLI="$ROOT/resources/app.asar/dsh/node_modules/@deepseek-ai/dsh-desktop-host/lib/cli.js"
+          RUN="$ROOT/deepseek-harness"
+          PROFILE=w2m-compat-uninstall
+          WORK="$RUNNER_TEMP/uninstall"
+          VERSION=$(node -p "require('./package.json').version")
+          TARBALL="$RUNNER_TEMP/packed/twinsearth-w2m-dsh-plugin-$VERSION.tgz"
+          mkdir -p "$WORK"
+          test -f "$TARBALL"
+
+          # The host's own CLI, spawned the way the harness spawns it.
+          dsh() { "$RUN" --expose-internals "$CLI" "$@"; }
+
+          # The baseline. `version-exemptions` is a DSH-owned command that never reaches pnpm or the
+          # network, and it initializes the profile exactly as `plugin add` does on first use — so
+          # "before" is a composition the host itself produced, not one this workflow hand-wrote.
+          dsh plugin --profile "$PROFILE" version-exemptions > "$WORK/exemptions.json"
+          test "$(cat "$WORK/exemptions.json")" = '{}'
+          dsh --profile "$PROFILE" --dump-config > "$WORK/before.txt"
+          cp "$DSH_HOME/profiles/$PROFILE/package.json" "$WORK/before-package.json"
+
+          # Install the packed artifact the way a user does.
+          dsh plugin --profile "$PROFILE" add "$TARBALL"
+          dsh --profile "$PROFILE" --dump-config > "$WORK/with.txt"
+          test -d "$DSH_HOME/profiles/$PROFILE/node_modules/@twinsearth/w2m-dsh-plugin"
+
+          # Remove it again. Whether the profile is really back where it started is decided by the
+          # program written above, from the two compositions the host itself printed.
+          dsh plugin --profile "$PROFILE" remove '@twinsearth/w2m-dsh-plugin'
+          dsh --profile "$PROFILE" --dump-config > "$WORK/after.txt"
+          cp "$DSH_HOME/profiles/$PROFILE/package.json" "$WORK/after-package.json"
+          node "$RUNNER_TEMP/verify-uninstall.mjs" "$WORK" "$DSH_HOME/profiles/$PROFILE"

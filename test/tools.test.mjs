@@ -24,6 +24,9 @@ import { after, describe, it } from 'node:test';
 
 import * as plugin from '../src/plugin/tools.mjs';
 import { SHARED_SERVER } from '../src/agent/p2p-node.mjs';
+// The composer's selection store, driven directly by the refusal-code tests: the browser route is the
+// production writer, and asserting what a *stored* selection reports does not need a route registry.
+import { defaultSelectionStore } from '../src/plugin/fleet-target.mjs';
 
 const RABBIT = 'http://127.0.0.1:8787';
 
@@ -595,6 +598,11 @@ describe('missing configuration', () => {
         (error) => {
           assert.match(error.message, /W2M_NO_TOKEN/);
           assert.match(error.message, /device\.json/);
+          // The *code* stays W2M_NO_TOKEN for the whole class ("this machine cannot authenticate"),
+          // while the refusal names which of the three it is -- because "pair the agent", "repair the
+          // file" and "finish the pairing" are three different things to do about it.
+          assert.equal(error.code, 'W2M_NO_TOKEN');
+          assert.equal(error.reason_code, 'DEVICE_NOT_PAIRED');
           return true;
         },
       );
@@ -613,9 +621,35 @@ describe('missing configuration', () => {
         (error) => {
           assert.match(error.message, /device_token/);
           assert.match(error.message, /device\.json/);
+          assert.equal(error.code, 'W2M_NO_TOKEN');
+          assert.equal(error.reason_code, 'DEVICE_TOKEN_ABSENT', 'a file that exists is a different fix');
           return true;
         },
       );
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('names an unreadable device.json as its own refusal, not as "not paired"', async () => {
+    // Three ways to have no usable token, three remedies: the file is absent (pair the agent), the file
+    // is corrupt (repair it), the file parsed but never finished pairing (run the agent once). Sharing
+    // one code across all three would send two of the three readers to the wrong fix.
+    const dir = await makeStateDir(null);
+    await fs.writeFile(path.join(dir, 'device.json'), '{ this is not json', 'utf8');
+    const fetchStub = installFetch([]);
+    try {
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: dir });
+      await assert.rejects(
+        () => tools.get('w2m_devices').execute({}, {}),
+        (error) => {
+          assert.match(error.message, /not valid JSON/);
+          assert.equal(error.code, 'W2M_NO_TOKEN');
+          assert.equal(error.reason_code, 'DEVICE_UNREADABLE');
+          return true;
+        },
+      );
+      assert.equal(fetchStub.calls.length, 0, 'an unreadable identity must not reach the relay');
     } finally {
       fetchStub.restore();
     }
@@ -768,6 +802,10 @@ describe('argument gating', () => {
       assert.equal(value.ok, false);
       assert.equal(value.state, 'refused');
       assert.equal(value.refusal_reason, 'COMMAND_NOT_ALLOWED');
+      // The same code under the name the gates share, and a detail that names what would change it --
+      // a refusal a caller cannot act on has told them nothing.
+      assert.equal(value.reason_code, 'COMMAND_NOT_ALLOWED');
+      assert.match(value.detail, /allowedCommands|allow-list/, 'the detail must name what to change');
       assert.deepEqual(value.allowed, ['git', 'node']);
       assert.equal(fetchStub.calls.length, 0, 'a refused command must not reach the Rabbit');
     } finally {
@@ -805,6 +843,7 @@ describe('argument gating', () => {
       assert.equal(refused.ok, false);
       assert.equal(refused.state, 'refused');
       assert.equal(refused.refusal_reason, 'COMMAND_NOT_ALLOWED');
+      assert.equal(refused.reason_code, 'COMMAND_NOT_ALLOWED');
       assert.deepEqual(refused.allowed, ['git rev-parse'], 'the entries are listed as written');
       assert.match(refused.message, /git push/, 'the message names the refused command');
       assert.match(refused.message, /git rev-parse/, 'and the configured entries');
@@ -836,6 +875,7 @@ describe('argument gating', () => {
       );
       assert.equal(refused.ok, false);
       assert.equal(refused.refusal_reason, 'COMMAND_NOT_ALLOWED');
+      assert.equal(refused.reason_code, 'COMMAND_NOT_ALLOWED');
       assert.deepEqual(refused.allowed, ['node --test']);
       assert.equal(fetchStub.calls.length, 1, 'a different flag must not be waved through');
     } finally {
@@ -885,6 +925,254 @@ describe('argument gating', () => {
       );
       assert.equal(empty.ok, true, 'an empty list must not be read as "refuse everything" here');
       assert.equal(fetchStub.calls.length, 2);
+    } finally {
+      fetchStub.restore();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// 3b. Refusal codes: a gate that says no says why
+// ---------------------------------------------------------------------------------------------
+//
+// The nine aggregate verdicts never reduce an outcome to a boolean; these are the gates that run
+// *before* any comparison, and each refusal now names itself. Every test below asserts the **code**,
+// not merely that something was refused: "it failed" passes for the wrong reason, and a refusal a
+// caller cannot act on is the failure these codes exist to remove.
+
+describe('refusal codes: the machine selection says which of four things happened', () => {
+  /** A dispatch narrowed by the composer, keyed by the session the tool context names. */
+  const SESSION = 'w2m-refusal-code-session';
+
+  it('reports SELECTION_NONE when nothing is selected, rather than a bare applied:false', async () => {
+    const fetchStub = installFetch([{ method: 'POST', path: '/v1/task', body: { task_id: '01J', leases: [], seq: 1 } }]);
+    try {
+      const { tools } = await register({
+        rabbitUrl: RABBIT,
+        stateDir: await makeStateDir(PAIRED_DEVICE),
+        projectDir: await makeNonRepoDir(),
+        operatorToken: OPERATOR_TOKEN,
+      });
+      const value = JSON.parse(await tools.get('w2m_run').execute(runArgs(), {}));
+      assert.equal(value.selection.applied, false, 'the boolean keeps meaning what it always meant');
+      assert.equal(value.selection.reason_code, 'SELECTION_NONE');
+      assert.match(value.selection.detail, /not narrowed/, 'and the detail says what that means');
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('reports SELECTION_APPLIED and names the field the selection travelled in', async () => {
+    const fetchStub = installFetch([{ method: 'POST', path: '/v1/task', body: { task_id: '01J', leases: [], seq: 1 } }]);
+    defaultSelectionStore.set(SESSION, { machine_id: 'm-target', machine_name: 'mac-studio' });
+    try {
+      const { tools } = await register({
+        rabbitUrl: RABBIT,
+        stateDir: await makeStateDir(PAIRED_DEVICE),
+        projectDir: await makeNonRepoDir(),
+        operatorToken: OPERATOR_TOKEN,
+      });
+      const value = JSON.parse(
+        await tools.get('w2m_run').execute(runArgs(), { agent: { session: { id: SESSION } } }),
+      );
+      assert.equal(value.selection.applied, true);
+      assert.equal(value.selection.reason_code, 'SELECTION_APPLIED');
+      assert.equal(value.selection.field, 'target_machines');
+      assert.deepEqual(fetchStub.calls.at(-1).body.target_machines, ['m-target']);
+    } finally {
+      defaultSelectionStore.clear(SESSION);
+      fetchStub.restore();
+    }
+  });
+
+  it('reports SELECTION_OVERRIDDEN_BY_CALLER when the call named its own machine', async () => {
+    // The precedence rule — a caller's own fields always win — is documented, and this is the code
+    // that makes it visible in the answer instead of the operator finding out from a ledger entry.
+    const fetchStub = installFetch([{ method: 'POST', path: '/v1/task', body: { task_id: '01J', leases: [], seq: 1 } }]);
+    defaultSelectionStore.set(SESSION, { machine_id: 'm-target', machine_name: 'mac-studio' });
+    try {
+      const { tools } = await register({
+        rabbitUrl: RABBIT,
+        stateDir: await makeStateDir(PAIRED_DEVICE),
+        projectDir: await makeNonRepoDir(),
+        operatorToken: OPERATOR_TOKEN,
+      });
+      const value = JSON.parse(
+        await tools
+          .get('w2m_run')
+          .execute(runArgs({ mode: 'broadcast', executor_machine_id: 'm-caller' }), { agent: { session: { id: SESSION } } }),
+      );
+      assert.equal(value.selection.applied, false);
+      assert.equal(value.selection.reason_code, 'SELECTION_OVERRIDDEN_BY_CALLER');
+      assert.match(value.selection.detail, /m-caller/, 'the detail names the value that won');
+      const sent = fetchStub.calls.at(-1).body;
+      assert.equal(sent.executor_machine_id, 'm-caller');
+      assert.equal('target_machines' in sent, false, 'the selection must not also be sent');
+    } finally {
+      defaultSelectionStore.clear(SESSION);
+      fetchStub.restore();
+    }
+  });
+
+  it('reports SELECTION_UNUSABLE when a stored selection names no machine at all', async () => {
+    // Unreachable through the browser route, which clears on a null `machine_id` and refuses an empty
+    // one — but the store is a plain map that host code and tests write, and a selection that routes
+    // nothing used to be indistinguishable from "the whole fleet ran it".
+    const fetchStub = installFetch([{ method: 'POST', path: '/v1/task', body: { task_id: '01J', leases: [], seq: 1 } }]);
+    defaultSelectionStore.set(SESSION, { machine_id: '' });
+    try {
+      const { tools } = await register({
+        rabbitUrl: RABBIT,
+        stateDir: await makeStateDir(PAIRED_DEVICE),
+        projectDir: await makeNonRepoDir(),
+        operatorToken: OPERATOR_TOKEN,
+      });
+      const value = JSON.parse(
+        await tools.get('w2m_run').execute(runArgs(), { agent: { session: { id: SESSION } } }),
+      );
+      assert.equal(value.selection.applied, false);
+      assert.equal(value.selection.reason_code, 'SELECTION_UNUSABLE');
+      assert.match(value.selection.detail, /composer/, 'the detail says what would fix it');
+    } finally {
+      defaultSelectionStore.clear(SESSION);
+      fetchStub.restore();
+    }
+  });
+});
+
+describe('refusal codes: the direct path names every machine it did not push to', () => {
+  /**
+   * A `P2PNode` stand-in, injected through the documented `p2pBlock` seam.
+   *
+   * `p2pBlock.P2PNode` is a *class*, and the plugin constructs its own instance — so the state the
+   * test inspects lives on the class, not on an object the test made. It records the machines it was
+   * asked to dial, so "the gate refused" can be told apart from "it tried and failed" — the
+   * distinction the codes exist to make.
+   */
+  class FakeP2PNode {
+    /** Every instance the plugin built, so the test can read the one that served the dispatch. */
+    static instances = [];
+    /** Answers keyed by machine id; anything else is "no candidates", the ordinary case. */
+    static answers = new Map();
+
+    constructor() {
+      FakeP2PNode.instances.push(this);
+      this.dials = [];
+      this.status = { mode: 'auto', running: true, candidates: [] };
+      this.handlers = new Map();
+    }
+
+    on(name, handler) {
+      this.handlers.set(name, handler);
+      return this;
+    }
+
+    async start() {
+      return { ok: true, enabled: true };
+    }
+
+    async dial(machineId, options) {
+      this.dials.push({ machineId, options });
+      const answer = FakeP2PNode.answers.get(machineId);
+      if (answer) return answer();
+      return { ok: false, error: `P2P_NO_CANDIDATES: the relay holds no live announcement for ${machineId}` };
+    }
+
+    close() {}
+  }
+
+  it('codes an unaddressable lease and an unrunnable lease differently, and does not dial the second', async () => {
+    FakeP2PNode.instances.length = 0;
+    FakeP2PNode.answers = new Map([
+      [
+        'm-offered',
+        () => ({
+          ok: true,
+          channel: { send: async () => {}, close: () => {}, encryption: { encrypted: false } },
+          session: 7,
+          reused: false,
+        }),
+      ],
+    ]);
+
+    const fetchStub = installFetch([
+      {
+        method: 'POST',
+        path: '/v1/task',
+        body: {
+          task_id: '01JCODES',
+          seq: 1,
+          leases: [
+            { machine_id: 'm-offered', index: 0, state: 'offered' },
+            { index: 0, state: 'queued' },
+            { machine_id: 'm-observing', index: 1, state: 'observing' },
+            { machine_id: 'm-nobody-home', index: 2, state: 'queued' },
+          ],
+        },
+      },
+    ]);
+
+    try {
+      const { tools } = await register({
+        p2pMode: 'auto',
+        p2pBlock: { P2PNode: FakeP2PNode },
+        rabbitUrl: RABBIT,
+        stateDir: await makeStateDir(PAIRED_DEVICE),
+        projectDir: await makeNonRepoDir(),
+        operatorToken: OPERATOR_TOKEN,
+      });
+
+      const value = JSON.parse(await tools.get('w2m_run').execute(runArgs(), {}));
+      assert.equal(value.ok, true);
+
+      // The plugin builds the node, so the test reads the instance that served this dispatch rather
+      // than one of its own that nothing talked to.
+      const node = FakeP2PNode.instances.at(-1);
+      assert.ok(node, 'the dispatch must have built the injected node');
+      assert.equal(FakeP2PNode.instances.length, 1, 'one node per plugin, however many dispatches');
+
+      const byMachine = new Map(value.direct_pushes.pushes.map((entry) => [entry.machine_id, entry]));
+      assert.equal(value.direct_pushes.pushes.length, 4, 'every lease is accounted for');
+
+      // The lease the relay did not address to anyone. It has no machine_id, so it is keyed by null.
+      const unaddressed = value.direct_pushes.pushes.find((entry) => entry.machine_id === null);
+      assert.equal(unaddressed.ok, false);
+      assert.equal(unaddressed.reason_code, 'P2P_LEASE_NO_MACHINE_ID');
+      assert.match(unaddressed.error, /machine_id/);
+
+      // The lease the relay decided must not run the command: a refusal with its own code and a detail
+      // that says whose decision it was.
+      const observing = byMachine.get('m-observing');
+      assert.equal(observing.ok, false);
+      assert.equal(observing.reason_code, 'P2P_LEASE_NOT_RUNNABLE');
+      assert.match(observing.detail, /relay/, 'the detail must say the relay decided, not this plugin');
+      assert.equal(
+        node.dials.some((entry) => entry.machineId === 'm-observing'),
+        false,
+        'a machine that was never handed the command must not be asked to run it',
+      );
+
+      // A dial that failed keeps the node's own code, lifted out of its message rather than replaced.
+      const unreachable = byMachine.get('m-nobody-home');
+      assert.equal(unreachable.ok, false);
+      assert.equal(unreachable.reason_code, 'P2P_NO_CANDIDATES', 'the node names its own refusal');
+      assert.equal(unreachable.ok, false);
+
+      // The one that landed, so the codes above are not simply "everything fails".
+      const delivered = byMachine.get('m-offered');
+      assert.equal(delivered.ok, true);
+      assert.equal(delivered.reason_code, null, 'a delivered push has no refusal to name');
+
+      // One entry per lease *considered* — the meaning `attempted` has always had — against two dials
+      // actually made. The difference is the point: the unrunnable lease was refused, not attempted.
+      assert.equal(value.direct_pushes.attempted, 4);
+      assert.equal(value.direct_pushes.delivered, 1);
+      assert.equal(value.direct_pushes.failed, 3);
+      assert.deepEqual(
+        node.dials.map((entry) => entry.machineId),
+        ['m-offered', 'm-nobody-home'],
+        'only addressable, runnable leases are dialled',
+      );
     } finally {
       fetchStub.restore();
     }
@@ -1547,6 +1835,10 @@ describe('v0.1.2 operator token', () => {
         () => tools.get('w2m_run').execute(runArgs(), {}),
         (error) => {
           assert.equal(error.code, 'W2M_CONFIG');
+          // The refusal has its own code: `W2M_CONFIG` says a setting is wrong, this says *which gate*
+          // refused and that the remedy is the operator credential. It is the one credential this
+          // plugin holds, so a caller must not have to parse a message to find that out.
+          assert.equal(error.reason_code, 'OPERATOR_TOKEN_MISSING');
           assert.match(error.message, /operatorToken/, 'must name the missing setting');
           assert.match(error.message, /device token cannot dispatch tasks/i, 'must say why the device token will not do');
           assert.match(error.message, /W2M_OPERATOR_TOKEN/, 'must name the environment fallback');

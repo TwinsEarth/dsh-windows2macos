@@ -87,19 +87,76 @@ function sameName(a, b) {
 }
 
 /**
+ * The stable codes this matcher refuses with.
+ *
+ * `COMMAND_NOT_ALLOWED` is deliberately the **same literal** the agent writes into a result
+ * envelope's `refusal_reason` (`REFUSAL.COMMAND_NOT_ALLOWED` in `src/agent/agent.mjs`) and the same
+ * one the plugin's dispatch pre-flight reports: the whole reason this matcher is shared is that the
+ * two ends must not be able to disagree about *why* a command was refused, and two spellings of one
+ * refusal would be a disagreement of exactly that kind.
+ *
+ * `COMMAND_ARGV_EMPTY` is the matcher's own precondition. It is a separate code because it is a
+ * separate fault — a caller that passed nothing has a bug, not a policy problem — and collapsing it
+ * into `COMMAND_NOT_ALLOWED` would send the reader to the allow-list to fix a caller.
+ */
+export const MATCH_REFUSAL = Object.freeze({
+  ARGV_EMPTY: 'COMMAND_ARGV_EMPTY',
+  NOT_ALLOWED: 'COMMAND_NOT_ALLOWED',
+});
+
+/**
+ * Why this argv is not covered by this list, and what would change it.
+ *
+ * The entries are echoed because they are the *only* thing that would make the same call succeed,
+ * and a caller reading this deserves them without a second call. They are configuration, never
+ * credentials: the parse path refuses a secret-looking key before a list ever reaches here.
+ *
+ * @param {string[]} argv
+ * @param {string[][]} prefixes
+ * @returns {string}
+ */
+function allowListMissDetail(argv, prefixes) {
+  if (prefixes.length === 0) {
+    return (
+      'the configured allow-list is empty, so every command is refused; add an entry naming what ' +
+      `this machine may run - an entry of \`${argv[0]}\` would allow \`${argv.join(' ')}\``
+    );
+  }
+  const entries = prefixes.map((prefix) => prefix.join(' ')).join(', ');
+  return (
+    `no configured entry is a prefix of this argv; the allow-list entries are ${entries}. Add one ` +
+    `that covers \`${argv.join(' ')}\`, or run a command the list already covers`
+  );
+}
+
+/**
  * Default-deny prefix match.
  *
  * `['node','--test']` is allowed by the prefix `node --test`, and so is
  * `['node','--test','--reporter=tap']`; `['node','-e','...']` and a bare
  * `['node']` are refused.
  *
+ * A refusal is a **named** one: `reason_code` is a stable, greppable code and `detail` says what
+ * would change it. `allowed` and `prefix` keep the shape this function has always returned, because
+ * both callers read exactly those two fields and the codes are additive.
+ *
  * @param {string[]} argv
  * @param {string[][]} prefixes
- * @returns {{allowed: boolean, prefix: string[]|null}}
+ * @returns {{allowed: boolean, prefix: string[]|null, reason_code: string|null, detail: string|null}}
  */
 export function matchAllowedCommand(argv, prefixes) {
-  if (!Array.isArray(argv) || argv.length === 0) return { allowed: false, prefix: null };
-  for (const prefix of prefixes ?? []) {
+  const entries = Array.isArray(prefixes) ? prefixes : [];
+  if (!Array.isArray(argv) || argv.length === 0) {
+    return {
+      allowed: false,
+      prefix: null,
+      reason_code: MATCH_REFUSAL.ARGV_EMPTY,
+      detail:
+        'there is no argv to compare, and this matcher is default-deny; pass a non-empty array of ' +
+        'strings whose first element is the executable',
+    };
+  }
+  for (const prefix of entries) {
     if (!Array.isArray(prefix) || prefix.length === 0) continue;
     if (argv.length < prefix.length) continue;
     if (!sameName(argv[0], prefix[0]) && !sameName(execName(argv[0]), prefix[0])) continue;
@@ -110,7 +167,12 @@ export function matchAllowedCommand(argv, prefixes) {
         break;
       }
     }
-    if (ok) return { allowed: true, prefix };
+    if (ok) return { allowed: true, prefix, reason_code: null, detail: null };
   }
-  return { allowed: false, prefix: null };
+  return {
+    allowed: false,
+    prefix: null,
+    reason_code: MATCH_REFUSAL.NOT_ALLOWED,
+    detail: allowListMissDetail(argv, entries.filter((prefix) => Array.isArray(prefix) && prefix.length > 0)),
+  };
 }

@@ -131,3 +131,7 @@ Therefore:
 
 Do not open a public issue for a vulnerability. See [SECURITY.md](SECURITY.md) for the private
 channel and what to include.
+
+## The compatibility gate
+
+`.github/workflows/compat.yml` is the CI half of rule 7, on every pull request, every push to `main`, every `v*` tag and a weekly schedule: it packs the tree, installs the tarball into a scratch profile with the host's own `dsh plugin add`, and asserts the deterministic artifact — the plugin's row composed by the real Loader, all eight `w2m_*` tools registered, no failed fiber anywhere in the composed tree, the client half activated through the real module system — plus a bare import with no host present and an install/uninstall that returns a profile to its previous composition; **a red compat run blocks a release** exactly as a red preflight does, and its `UNVERIFIABLE` outcomes are never a pass — read the reason it prints.

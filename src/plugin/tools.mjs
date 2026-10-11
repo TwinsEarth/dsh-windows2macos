@@ -30,6 +30,49 @@
  * * This file never reads `.credentials.yaml`, and never hard-codes an endpoint: every URL comes
  *   from `config.rabbitUrl` or from `device.json`'s `rabbit_url`.
  *
+ * # The exposure boundary: what an agent-facing tool may not do
+ *
+ * Everything in this file is callable by a model, against a fleet whose machines run commands under
+ * their own allow-lists, and it holds an operator token that authorises dispatch fleet-wide. That
+ * makes the *tool surface* a boundary, and this section is the boundary written down as it actually
+ * is — not as it would sound best. `test/tool-cards.test.mjs` asserts the parts of it that can be
+ * asserted mechanically, and a change that crosses it is meant to turn that suite red.
+ *
+ * **No tool parameter names a credential, an allow-list, a key path, or a state directory.** There is
+ * no parameter through which a caller can set a token, a secret, `allowedCommands`, `p2pMode`, a
+ * `device.key` path, or another machine's identity file. `w2m_run`'s only machine-naming parameter is
+ * `executor_machine_id`, and it *narrows* one `broadcast` to a machine the relay already lists; it
+ * cannot name a machine the relay does not hold, and it cannot hand that machine anything new.
+ *
+ * **No tool can widen what a machine will run.** `allowedCommands` is read in `readConfig` from the
+ * host config and the shared `.w2m.json` / `machine.json` layers, is never written by anything here,
+ * and is applied in one direction only: {@link checkAllowedCommand} returns a refusal or `null`, and
+ * there is no path in this file that adds an entry to the list. Each target machine's own agent
+ * re-decides the same gate against its own list, so a dispatcher that lost this check would still not
+ * widen anything — the direction the shared matcher exists to keep honest (`src/agent/allowed-commands.mjs`).
+ *
+ * **No tool can change a machine's `p2pMode`.** The mode is resolved once, in `readConfig` at
+ * `apply()` time, from the config object or `W2M_P2P_MODE`, and every dispatch publishes it as a fact
+ * (`p2p: {mode}`) rather than accepting one. The *executor's* mode is its own local setting: an agent
+ * configured `direct` refuses a relay-delivered offer with `P2P_UNAVAILABLE` rather than accepting the
+ * weaker path, which is the one place a dispatcher could otherwise have quietly downgraded a peer.
+ *
+ * **No tool writes another machine's identity or keys.** `device.json` is read (`readDevice`) and
+ * `device.key` is loaded (`DeviceKey.load`) — neither is ever written here. What a dispatch publishes
+ * is this machine's own **public** key inside `p2p.static_keys`, so the executor can authenticate a
+ * dial; the private half never leaves `src/agent/crypto.mjs`.
+ *
+ * **No tool result carries a token or a key.** `w2m_status` reports `paired`,
+ * `operatorToken_configured` and `pairingCode_configured` as booleans and never the values. The
+ * operator token travels only in the `Authorization` header of `POST /v1/task` — never in the request
+ * body and never in an answer — and `direct_pushes[].static_key` is the literal marker `'published'`,
+ * not the key it describes.
+ *
+ * What an agent-facing tool *may* do across machines is bounded and stated: ask the machines the relay
+ * leased a task to run one argv inside their own allow-lists, in their own copy of the project,
+ * read-only unless `write: true` names a `write_scope`, and report what they said — refusals
+ * included, as values.
+ *
  * # `@deepseek-ai/dsh-tools` and the offline fallback
  *
  * `defineTool` is imported lazily, at `apply()` time, through {@link loadDefineTool}. When the
@@ -168,6 +211,88 @@ const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
 // ---------------------------------------------------------------------------------------------
 
 /**
+ * Every stable code a **gate in this file** refuses with, in one greppable place.
+ *
+ * The nine aggregate verdicts never reduce an outcome to a boolean; the gates that run *before* any
+ * comparison owe a caller the same courtesy, and this table is that debt paid. Each code names what
+ * was refused, and every refusal site also carries a `detail` saying what would change it, because a
+ * caller that cannot act on a refusal has been told nothing.
+ *
+ * Two of these are the agent's own vocabulary, deliberately shared rather than re-spelled:
+ * `COMMAND_NOT_ALLOWED` (`REFUSAL.COMMAND_NOT_ALLOWED` in `src/agent/agent.mjs`, which is also what
+ * `src/agent/allowed-commands.mjs` returns) and the `P2P_FRAME_*` family that already travelled into
+ * `w2m_status` as message prefixes.
+ *
+ * A code is added only when it names a *distinct remedy*. `W2M_CONFIG` still covers a malformed
+ * setting at large; the credential gate below has its own code because its remedy — set
+ * `operatorToken` — is unlike any other configuration fault's.
+ */
+export const REFUSAL_CODE = Object.freeze({
+  /** The dispatch pre-flight found the command outside this plugin's `allowedCommands`. */
+  COMMAND_NOT_ALLOWED: 'COMMAND_NOT_ALLOWED',
+  /**
+   * The configured `allowedCommands` could not be parsed, so the control could not be evaluated.
+   * Distinct from the code above: the remedy is to fix the list, not the command.
+   */
+  ALLOWED_COMMANDS_UNPARSEABLE: 'ALLOWED_COMMANDS_UNPARSEABLE',
+  /** No operator credential is configured, so `POST /v1/task` cannot be authorised at all. */
+  OPERATOR_TOKEN_MISSING: 'OPERATOR_TOKEN_MISSING',
+  /** No `device.json` exists where this machine's identity was looked for. */
+  DEVICE_NOT_PAIRED: 'DEVICE_NOT_PAIRED',
+  /** `device.json` exists but could not be read as JSON. */
+  DEVICE_UNREADABLE: 'DEVICE_UNREADABLE',
+  /** `device.json` parsed but carries no `device_token`, so the device never completed pairing. */
+  DEVICE_TOKEN_ABSENT: 'DEVICE_TOKEN_ABSENT',
+  /** The relay returned a lease with no `machine_id`, so there is nobody to address an offer to. */
+  P2P_LEASE_NO_MACHINE_ID: 'P2P_LEASE_NO_MACHINE_ID',
+  /** The lease is not in a runnable state, so the relay never handed this machine the command. */
+  P2P_LEASE_NOT_RUNNABLE: 'P2P_LEASE_NOT_RUNNABLE',
+  /** A direct dial to a leased machine failed; `direct_pushes[].error` carries the node's own code. */
+  P2P_DIAL_FAILED: 'P2P_DIAL_FAILED',
+  /** The best-effort offer push threw rather than returning a refusal. */
+  P2P_PUSH_THREW: 'P2P_PUSH_THREW',
+  /** A frame arrived over a direct channel that is not a JSON document. */
+  P2P_FRAME_NOT_JSON: 'P2P_FRAME_NOT_JSON',
+  /** A frame arrived that parsed to something other than a JSON object. */
+  P2P_FRAME_NOT_AN_OBJECT: 'P2P_FRAME_NOT_AN_OBJECT',
+  /** A result frame carried no `task_id`, so it could not be stored or acknowledged. */
+  P2P_FRAME_NO_TASK_ID: 'P2P_FRAME_NO_TASK_ID',
+  /** A result frame carried no `machine_id`, so two machines' answers could collide on one file. */
+  P2P_FRAME_NO_MACHINE_ID: 'P2P_FRAME_NO_MACHINE_ID',
+  /** A result arrived with no `stateDir` to write it to. */
+  P2P_NO_STATE_DIR: 'P2P_NO_STATE_DIR',
+  /** Storing a result frame failed, so the result exists only on the sender. */
+  P2P_INBOX_WRITE_FAILED: 'P2P_INBOX_WRITE_FAILED',
+  /**
+   * The composer's selected target routed this dispatch. Not a refusal — a named *reason*, so the
+   * routing decision is greppable in the answer instead of being a bare `applied: true`.
+   */
+  SELECTION_APPLIED: 'SELECTION_APPLIED',
+  /** Nothing is selected for this session, so the dispatch went to the whole fleet. */
+  SELECTION_NONE: 'SELECTION_NONE',
+  /** A selection exists but names no `machine_id`, so none of it could be applied. */
+  SELECTION_UNUSABLE: 'SELECTION_UNUSABLE',
+  /** The call named its own `executor_machine_id`, which wins over the session selection. */
+  SELECTION_OVERRIDDEN_BY_CALLER: 'SELECTION_OVERRIDDEN_BY_CALLER',
+});
+
+/**
+ * The leading `CODE:` token of a message one of this project's own modules produced, or `null`.
+ *
+ * Every coded failure in this tree is written as `'CODE: what happened'`, so the code is already in
+ * the string; this lifts it back out for the places that must publish it as a field too. It refuses
+ * to invent one: a message with no such prefix returns `null` and the caller supplies its own code.
+ *
+ * @param {unknown} message
+ * @returns {string|null}
+ */
+function reasonCodeOf(message) {
+  if (typeof message !== 'string') return null;
+  const match = /^([A-Z][A-Z0-9_]{2,}):/.exec(message);
+  return match ? match[1] : null;
+}
+
+/**
  * An error a caller can act on, carrying a stable machine-readable code.
  *
  * `code` and `hint` are duplicated into enumerable own properties so that `JSON.stringify(error)`
@@ -177,12 +302,16 @@ class W2MError extends Error {
   /**
    * @param {string} code Stable code, e.g. `W2M_CONFIG`.
    * @param {string} message What went wrong and, when known, how to fix it.
-   * @param {{hint?: string, detail?: object, cause?: unknown}} [options]
+   * @param {{hint?: string, detail?: object, cause?: unknown, reason_code?: string}} [options]
+   *   `reason_code` names the *refusal* when `code` only names its class. `W2M_CONFIG` says "a
+   *   setting is wrong"; `OPERATOR_TOKEN_MISSING` says which gate refused and, with `hint`, what
+   *   would change it. It defaults to `code`, so every existing error keeps one obvious code.
    */
   constructor(code, message, options = {}) {
     super(message, options.cause === undefined ? undefined : { cause: options.cause });
     this.name = 'W2MError';
     this.code = code;
+    this.reason_code = options.reason_code ?? code;
     this.hint = options.hint;
     this.detail = options.detail;
   }
@@ -198,10 +327,14 @@ class W2MError extends Error {
  * @param {string} setting Dotted setting name, e.g. `rabbitUrl`.
  * @param {string} why Why the value was refused.
  * @param {string} hint What to set.
+ * @param {string} [reasonCode] The refusal's own code, when this is a gate rather than a typo.
  * @returns {W2MError}
  */
-function configError(setting, why, hint) {
-  return new W2MError('W2M_CONFIG', `W2M_CONFIG: configuration \`${setting}\` ${why}; ${hint}`, { hint });
+function configError(setting, why, hint, reasonCode) {
+  return new W2MError('W2M_CONFIG', `W2M_CONFIG: configuration \`${setting}\` ${why}; ${hint}`, {
+    hint,
+    ...(reasonCode === undefined ? {} : { reason_code: reasonCode }),
+  });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -954,15 +1087,27 @@ function canonicalJson(value) {
  * acknowledgement is keyed by `task_id`, and two machines answering the same task must not overwrite
  * each other — so it is refused by name instead of being written somewhere surprising.
  *
+ * Both halves of the refusal are returned: `reason` is the `CODE: sentence` string this has always
+ * produced (it is what `w2m_status` shows), `reason_code` is the same code as a field, so a reader
+ * that wants to branch on the refusal does not have to split a message.
+ *
  * @param {object} frame
- * @returns {string|null} The reason it is unusable, or null.
+ * @returns {{reason_code: string, reason: string}|null} The reason it is unusable, or null.
  */
 function inboxKeyProblem(frame) {
   const taskId = frame?.task_id;
   const machineId = frame?.machine_id;
-  if (typeof taskId !== 'string' || taskId.trim() === '') return 'P2P_FRAME_NO_TASK_ID: `task_id` is missing or empty';
+  if (typeof taskId !== 'string' || taskId.trim() === '') {
+    return {
+      reason_code: REFUSAL_CODE.P2P_FRAME_NO_TASK_ID,
+      reason: 'P2P_FRAME_NO_TASK_ID: `task_id` is missing or empty',
+    };
+  }
   if (typeof machineId !== 'string' || machineId.trim() === '') {
-    return 'P2P_FRAME_NO_MACHINE_ID: `machine_id` is missing or empty';
+    return {
+      reason_code: REFUSAL_CODE.P2P_FRAME_NO_MACHINE_ID,
+      reason: 'P2P_FRAME_NO_MACHINE_ID: `machine_id` is missing or empty',
+    };
   }
   return null;
 }
@@ -1198,11 +1343,21 @@ function offerP2PFor(published, { taskId, machineId, peerKey = null }) {
  * @param {string|null} options.originMachineId
  * @param {string|null} [options.peerKey] The target's static public key (v0.6.0), added to the
  *   frame's `p2p.static_keys` under that machine's id.
- * @returns {{frame: object|null, skipped: string|null}}
+ * @returns {{frame: object|null, skipped: {reason_code: string, message: string}|null}} `skipped` is
+ *   a named refusal, not a sentence: a lease the relay did not address to a machine is a different
+ *   fault from one it decided must not run the command.
  */
 function buildOfferFrame({ taskId, lease, payload, originMachineId, peerKey = null }) {
   const machineId = typeof lease?.machine_id === 'string' && lease.machine_id !== '' ? lease.machine_id : null;
-  if (machineId === null) return { frame: null, skipped: 'the relay returned a lease with no machine_id' };
+  if (machineId === null) {
+    return {
+      frame: null,
+      skipped: {
+        reason_code: REFUSAL_CODE.P2P_LEASE_NO_MACHINE_ID,
+        message: 'the relay returned a lease with no machine_id',
+      },
+    };
+  }
 
   const index = Number.isInteger(lease?.index) ? lease.index : 0;
   // The relay's first attempt is 1, and a lease that never says otherwise is a first attempt.
@@ -1263,8 +1418,9 @@ function buildOfferFrame({ taskId, lease, payload, originMachineId, peerKey = nu
  *   well because the *dispatcher* is the initiator here and needs the executor's key to handshake.
  *   `peerKeys` is the node's own store, taught the same key so the accept side can verify the
  *   executor's handshake later without a second relay lookup.
- * @returns {Promise<{ok: boolean, error: string|null, session: number|null, reused: boolean,
- *   encrypted: boolean, encryption_reason: string|null}>}
+ * @returns {Promise<{ok: boolean, reason_code: string|null, error: string|null, session: number|null,
+ *   reused: boolean, encrypted: boolean, encryption_reason: string|null}>} `reason_code` is null on a
+ *   delivered push and names the refusal otherwise, so the caller never has to read `error` to branch.
  */
 async function pushOffer(node, frame, crypto = {}) {
   const session = Number.isInteger(frame?.p2p?.session) && frame.p2p.session > 0 ? frame.p2p.session : undefined;
@@ -1288,6 +1444,9 @@ async function pushOffer(node, frame, crypto = {}) {
     if (!dialled.ok) {
       return {
         ok: false,
+        // The node writes its own refusal as `CODE: sentence`; the code is lifted out so the push
+        // reports the *same* code as a field instead of making the reader parse a message.
+        reason_code: reasonCodeOf(dialled.error) ?? REFUSAL_CODE.P2P_DIAL_FAILED,
         error: dialled.error ?? 'P2P_DIAL_FAILED',
         session: dialled.session ?? null,
         reused: false,
@@ -1300,6 +1459,7 @@ async function pushOffer(node, frame, crypto = {}) {
       await channel.send(JSON.stringify(frame));
       return {
         ok: true,
+        reason_code: null,
         error: null,
         session: dialled.session ?? null,
         reused: dialled.reused === true,
@@ -1314,6 +1474,7 @@ async function pushOffer(node, frame, crypto = {}) {
   } catch (error) {
     return {
       ok: false,
+      reason_code: REFUSAL_CODE.P2P_PUSH_THREW,
       error: `P2P_PUSH_THREW: ${error instanceof Error ? error.message : String(error)}`,
       session: session ?? null,
       reused: false,
@@ -1342,7 +1503,9 @@ async function pushOffer(node, frame, crypto = {}) {
  *
  * @param {P2PNode} node
  * @param {object} options
- * @returns {Promise<Array<object>>} One entry per lease considered, in lease order.
+ * @returns {Promise<Array<object>>} One entry per lease considered, in lease order. A machine that was
+ *   not pushed to carries `ok: false` **and** a `reason_code` naming which gate refused it — this
+ *   block is a tool result, so a bare boolean here would be exactly the reduction the verdicts refuse.
  */
 async function pushOffers(node, { taskId, leases, payload, originMachineId, getJson = null }) {
   const out = [];
@@ -1350,27 +1513,44 @@ async function pushOffers(node, { taskId, leases, payload, originMachineId, getJ
     const machineId = typeof lease?.machine_id === 'string' && lease.machine_id !== '' ? lease.machine_id : null;
     const state = lease?.state;
     if (machineId === null) {
-      out.push({ machine_id: null, ok: false, error: 'the relay returned a lease with no machine_id' });
+      out.push({
+        machine_id: null,
+        ok: false,
+        reason_code: REFUSAL_CODE.P2P_LEASE_NO_MACHINE_ID,
+        error: 'the relay returned a lease with no machine_id',
+      });
       continue;
     }
     if (state !== 'queued' && state !== 'offered') {
       out.push({
         machine_id: machineId,
         ok: false,
+        reason_code: REFUSAL_CODE.P2P_LEASE_NOT_RUNNABLE,
         error: `lease state is ${JSON.stringify(state ?? null)}, so this machine was not handed the command`,
+        // What would change it: nothing the dispatcher can do. The relay decided, and the honest
+        // report is that the decision was the relay's rather than a delivery failure.
+        detail:
+          'only leases in a runnable state (queued, offered) are pushed; this lease is refused or ' +
+          'observing, so it was never handed the command and the relay\'s own SSE offer is the only delivery',
       });
       continue;
     }
     const peerKey = await readPeerStaticKey(getJson, machineId);
     const built = buildOfferFrame({ taskId, lease, payload, originMachineId, peerKey });
     if (built.frame === null) {
-      out.push({ machine_id: machineId, ok: false, error: built.skipped });
+      out.push({
+        machine_id: machineId,
+        ok: false,
+        reason_code: built.skipped.reason_code,
+        error: built.skipped.message,
+      });
       continue;
     }
     const result = await pushOffer(node, built.frame, { peerKey, peerKeys: node?.peerKeys ?? null });
     out.push({
       machine_id: machineId,
       ok: result.ok,
+      reason_code: result.ok ? null : (result.reason_code ?? REFUSAL_CODE.P2P_DIAL_FAILED),
       error: result.error,
       dedupe_key: built.frame.dedupe_key === null ? null : 'relay-formula',
       // The session this push and the executor's reverse dial meet on, so a machine's own
@@ -1678,11 +1858,19 @@ async function handleP2PMessage(runtime, event) {
   try {
     frame = JSON.parse(raw);
   } catch {
-    runtime.events.refused.push({ reason: 'P2P_FRAME_NOT_JSON: the payload is not a JSON document', bytes: raw.length });
+    runtime.events.refused.push({
+      reason_code: REFUSAL_CODE.P2P_FRAME_NOT_JSON,
+      reason: 'P2P_FRAME_NOT_JSON: the payload is not a JSON document',
+      bytes: raw.length,
+    });
     return;
   }
   if (frame === null || typeof frame !== 'object' || Array.isArray(frame)) {
-    runtime.events.refused.push({ reason: 'P2P_FRAME_NOT_AN_OBJECT: expected a JSON object', type: typeof frame });
+    runtime.events.refused.push({
+      reason_code: REFUSAL_CODE.P2P_FRAME_NOT_AN_OBJECT,
+      reason: 'P2P_FRAME_NOT_AN_OBJECT: expected a JSON object',
+      type: typeof frame,
+    });
     return;
   }
   if (frame.type !== 'task.result') {
@@ -1693,11 +1881,14 @@ async function handleP2PMessage(runtime, event) {
 
   const problem = inboxKeyProblem(frame);
   if (problem !== null) {
-    runtime.events.refused.push({ reason: problem, type: 'task.result' });
+    // `reason_code` travels beside `reason` so `w2m_status`'s inbox block is greppable by code rather
+    // than by string prefix; this is a refusal at a boundary a user reads.
+    runtime.events.refused.push({ reason_code: problem.reason_code, reason: problem.reason, type: 'task.result' });
     return;
   }
   if (runtime.inboxDir === null) {
     runtime.events.refused.push({
+      reason_code: REFUSAL_CODE.P2P_NO_STATE_DIR,
       reason: 'P2P_NO_STATE_DIR: stateDir is not set, so a received result has nowhere to be written',
       type: 'task.result',
       task_id: frame.task_id,
@@ -1725,7 +1916,12 @@ async function handleP2PMessage(runtime, event) {
   } catch (error) {
     // eslint-disable-next-line require-atomic-updates -- one message at a time; the write is the only await
     runtime.events.last_error = `P2P_INBOX_WRITE_FAILED: ${error instanceof Error ? error.message : String(error)}`;
-    runtime.events.refused.push({ reason: runtime.events.last_error, type: 'task.result', task_id: frame.task_id });
+    runtime.events.refused.push({
+      reason_code: REFUSAL_CODE.P2P_INBOX_WRITE_FAILED,
+      reason: runtime.events.last_error,
+      type: 'task.result',
+      task_id: frame.task_id,
+    });
     return;
   }
   runtime.events.results += 1;
@@ -1886,6 +2082,10 @@ function requireOperatorToken(cfg) {
       '`POST /v1/task` requires the operator token',
     'set `operatorToken` in this plugin\'s profile patch (or `W2M_OPERATOR_TOKEN` in the environment) ' +
       'to the value the relay printed at startup, or read it from `<state>/operator-token.txt`',
+    // The gate's own code. `W2M_CONFIG` names the class of the fault; this names the refusal, and it
+    // is the one credential this plugin holds, so "why was my dispatch refused" must not have to be
+    // answered by reading a message.
+    REFUSAL_CODE.OPERATOR_TOKEN_MISSING,
   );
 }
 
@@ -2358,6 +2558,10 @@ async function readDevice(cfg) {
 /**
  * Require a `device_token`, naming where it was looked for when it is absent.
  *
+ * The `code` stays `W2M_NO_TOKEN` for every case — one class, "this machine cannot authenticate" —
+ * while `reason_code` names which of the three it is, because the three have different remedies: pair
+ * the agent, repair the file, or finish a pairing that never completed.
+ *
  * @param {{machine_id: string|null, device_token: string|null, path: string|null, present: boolean, error: string|null}} device
  * @returns {string}
  */
@@ -2368,20 +2572,23 @@ function requireToken(device) {
       'W2M_NO_TOKEN',
       `W2M_NO_TOKEN: no paired device at \`${device.path ?? 'device.json'}\` - the file does not exist; ` +
         'start the agent once so it can pair, or set `stateDir` to the directory holding an already-paired device.json',
-      { hint: 'start the agent once so it can pair, or set `stateDir` to the directory holding an already-paired device.json' },
+      {
+        hint: 'start the agent once so it can pair, or set `stateDir` to the directory holding an already-paired device.json',
+        reason_code: REFUSAL_CODE.DEVICE_NOT_PAIRED,
+      },
     );
   }
   if (device.error) {
     throw new W2MError(
       'W2M_NO_TOKEN',
       `W2M_NO_TOKEN: could not read a device token from \`${device.path}\` - ${device.error}; repair or delete the file and pair again`,
-      { hint: 'repair or delete the file and pair again' },
+      { hint: 'repair or delete the file and pair again', reason_code: REFUSAL_CODE.DEVICE_UNREADABLE },
     );
   }
   throw new W2MError(
     'W2M_NO_TOKEN',
     `W2M_NO_TOKEN: \`${device.path}\` has no \`device_token\` - the device has not completed POST /v1/pair yet; run the agent once to pair it`,
-    { hint: 'the device has not completed POST /v1/pair yet; run the agent once to pair it' },
+    { hint: 'the device has not completed POST /v1/pair yet; run the agent once to pair it', reason_code: REFUSAL_CODE.DEVICE_TOKEN_ABSENT },
   );
 }
 
@@ -2529,9 +2736,14 @@ function normalizeExecToken(value) {
  * documented config `['node --test','git status --porcelain']` refused `['git','rev-parse','HEAD']`
  * -- stricter than the gate, which is the direction that silently loses work.
  *
+ * A refusal names itself: `reason_code` is the matcher's own code (so the two ends cannot report one
+ * refusal under two spellings) and `detail` says what would change it. The two ways this control
+ * refuses are kept apart — a command outside the list and a list that cannot be parsed have
+ * different remedies, and sharing one code would send the reader to the wrong one.
+ *
  * @param {string[]} allowedCommands Entries as configured, e.g. `['node --test']`.
  * @param {string[]} argv
- * @returns {{code: string, message: string, allowed: string[]}|null}
+ * @returns {{allowed: string[], reason_code: string, message: string, detail: string}|null}
  */
 function checkAllowedCommand(allowedCommands, argv) {
   if (allowedCommands.length === 0) return null;
@@ -2542,20 +2754,32 @@ function checkAllowedCommand(allowedCommands, argv) {
     // Fail closed: an unparseable list is not an empty one, and a control that cannot be evaluated
     // must refuse rather than wave the command through.
     return {
-      code: 'COMMAND_NOT_ALLOWED',
-      message: `the plugin's allowedCommands could not be parsed (${error?.message ?? String(error)})`,
       allowed: [],
+      reason_code: REFUSAL_CODE.ALLOWED_COMMANDS_UNPARSEABLE,
+      message: `the plugin's allowedCommands could not be parsed (${error?.message ?? String(error)})`,
+      detail:
+        'the configured list is not a JSON array of command prefixes (entries are split on ' +
+        'whitespace, and commas are not separators); fix `allowedCommands` in the profile patch, ' +
+        '.w2m.json or machine.json - until it parses, this control cannot be evaluated and every ' +
+        'dispatch is refused',
     };
   }
   // Prefixes "as written": the configured entries, whitespace-normalised, in a stable order.
   const allowed = prefixes.map((prefix) => prefix.join(' ')).sort();
   const entries = prefixes.map((prefix) => [normalizeExecToken(prefix[0]), ...prefix.slice(1)]);
   const command = [normalizeExecToken(argv[0]), ...argv.slice(1)];
-  if (matchAllowedCommand(command, entries).allowed) return null;
+  const match = matchAllowedCommand(command, entries);
+  if (match.allowed) return null;
   return {
-    code: 'COMMAND_NOT_ALLOWED',
-    message: `\`${argv.join(' ')}\` is not in this plugin's allowedCommands (${allowed.join(', ')})`,
     allowed,
+    // The shared matcher's code, not a second copy of it: `COMMAND_NOT_ALLOWED` is the literal the
+    // agent writes into its own envelope, so a machine's refusal and this pre-flight's refusal read
+    // the same to whoever has to act on them.
+    reason_code: match.reason_code ?? REFUSAL_CODE.COMMAND_NOT_ALLOWED,
+    message: `\`${argv.join(' ')}\` is not in this plugin's allowedCommands (${allowed.join(', ')})`,
+    detail:
+      match.detail ??
+      `add \`${argv.join(' ')}\` (or a prefix of it) to allowedCommands, or run a command the list already covers`,
   };
 }
 
@@ -3280,6 +3504,38 @@ export async function apply(ctx, config = {}) {
         ? null
         : routedBy.applied_as;
 
+      /**
+       * *Why* the selection did or did not route this task, as a code rather than a bare boolean.
+       *
+       * `applied` alone conflates three different situations an operator has to tell apart: nothing
+       * was selected, the selection was overridden by the call's own `executor_machine_id`, or a
+       * selection exists that names no machine at all and therefore routed nothing. The last one is
+       * the one that used to be invisible — a stored selection with no `machine_id` produces
+       * `applied: false` and nothing else, which looks exactly like "the whole fleet ran it".
+       */
+      const selectionReason = selection === null
+        ? {
+            reason_code: REFUSAL_CODE.SELECTION_NONE,
+            detail: 'no machine is selected for this session, so this dispatch was not narrowed to one',
+          }
+        : selectionAppliedAs !== null
+          ? {
+              reason_code: REFUSAL_CODE.SELECTION_APPLIED,
+              detail: `the composer's selected machine routed this dispatch, sent as ${selectionAppliedAs}=${selection.machine_id}`,
+            }
+          : mode === 'broadcast' && executorMachineId !== null
+            ? {
+                reason_code: REFUSAL_CODE.SELECTION_OVERRIDDEN_BY_CALLER,
+                detail: `this call named executor_machine_id=${executorMachineId}, which wins over the session selection and was sent instead`,
+              }
+            : {
+                reason_code: REFUSAL_CODE.SELECTION_UNUSABLE,
+                detail:
+                  'a machine is selected for this session but the selection names no machine_id, so ' +
+                  'nothing could be applied and the dispatch was not narrowed; pick a machine in the ' +
+                  'composer again, or clear the selection',
+              };
+
       // Plugin-side allow-list check: only when one is configured. See checkAllowedCommand.
       //
       // **Every** stage is checked, not just the first. Checking only `command_argv` would let a
@@ -3291,14 +3547,21 @@ export async function apply(ctx, config = {}) {
       for (const [stageIndex, stageArgv] of commandsToCheck.entries()) {
         const refused = checkAllowedCommand(cfg.allowedCommands, stageArgv);
         if (refused) {
+          // The refusal is a *value*, like every other verdict this project reports, and it carries
+          // the code twice on purpose: `refusal_reason` is the field a caller and a report already
+          // read, `reason_code` is the same code under the name the rest of the gates now use, and
+          // `detail` is what would change it. No request is made, so this result is the only trace
+          // of the decision the caller gets.
           return JSON.stringify(
             {
               ok: false,
               state: 'refused',
-              refusal_reason: refused.code,
+              refusal_reason: refused.reason_code,
+              reason_code: refused.reason_code,
               message: commandsToCheck.length > 1
                 ? `stage ${stageIndex}: ${refused.message}`
                 : refused.message,
+              detail: refused.detail,
               stage_index: commandsToCheck.length > 1 ? stageIndex : null,
               allowed: refused.allowed,
             },
@@ -3504,15 +3767,17 @@ export async function apply(ctx, config = {}) {
           // v0.6.1: whether this dispatch was narrowed to the composer's selected machine, and to
           // which one. Published because a dispatch that ran somewhere other than where the operator
           // pointed is the one failure this feature could hide, and a caller that cannot see the
-          // routing cannot report it.
+          // routing cannot report it. `applied` is kept as the boolean it has always been; the code
+          // and detail beside it say which of the four situations produced it.
           selection: selection === null
-            ? { applied: false, field: null, machine_id: null, machine_name: null, session: sessionKey }
+            ? { applied: false, field: null, machine_id: null, machine_name: null, session: sessionKey, ...selectionReason }
             : {
                 applied: selectionAppliedAs !== null,
                 field: selectionAppliedAs,
                 machine_id: selection.machine_id,
                 machine_name: selection.machine_name,
                 session: sessionKey,
+                ...selectionReason,
               },
           note: anchors.base_tree === null
             ? 'this machine\'s working tree could not be fingerprinted, so peers have no anchor to match and the aggregate will be unverifiable'

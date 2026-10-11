@@ -18,12 +18,38 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   extracted copy; that the version, bundle-patch and document claims in `test/claims.test.mjs` still
   hold; and that the CHANGELOG's title sits above its newest entry and its entries run newest-first.
   Every check reports `PASS`, `FAIL` or `UNVERIFIABLE` **with a name and a reason**, and the run fails
-  if any registered check produces no result at all: "the gate ran" is itself a check, because a
-  self-authored gate that reports success while executing zero checks is a defect this project studied
-  in another one.
+  if any registered check produces no result at all: "the gate ran" is itself a check, and the ledger
+  that enforces it is itself exercised on every run against a silent check, a throwing check and an
+  honest one — because a self-authored gate that reports success while executing zero checks is a
+  defect this project studied in another one. The first draft of that ledger counted a coerced `FAIL`
+  as a produced result, and the self-test caught it on its first run.
 * **A wiring check that would have caught two of the defects below.** Every `test/*.test.mjs` on disk
   must be named by some npm script, and every path an npm script names must exist. Measured now: 36
-  suites on disk, 36 named, 0 orphans.
+  suites on disk, 36 named by a script, 0 orphans, 0 named-but-absent.
+* **A CI compatibility gate** (`.github/workflows/compat.yml`, with its own section in
+  `CONTRIBUTING.md`). Three jobs. *mount-and-boot* builds a pinned host in `RUNNER_TEMP`
+  (`@deepseek-ai/dsh@0.2.0-rc.2`, `dsh-app-boot`, `dsh-client-modules`, `cordis@4.0.4`,
+  `cordis-plugin-loader@1.0.5`), runs the existing `test/loader-entry.test.mjs` against it **unmodified**
+  and classifies the TAP capture with nine named assertions, of which a `SKIP` counts as a failure.
+  *bare-import* packs, installs into an empty project, and asserts `dependencies === {}`, that no host
+  package resolves, and that the root export is a callable `apply`. *uninstall* asserts the composition
+  is byte-identical before and after, and documents why the manifest key set is not compared. Triggers:
+  PRs to main, pushes to main, `v*` tags, weekly, and dispatch; `contents: read`, no secrets. No-browser
+  is the single entry on `ACCEPTED_UNVERIFIABLE` and reports `UNVERIFIABLE` with its reason rather than
+  `PASS`. Validated end to end against a synthetic installation built with the workflow's own commands
+  (10/10 pass) and in the failing direction with `W2M_ROUTE_DEFECT=1`, which reports `FAIL` naming the
+  route assertion and the fiber sweep — the same both-directions rule the rest of this release follows.
+* **Refusal codes, and the exposure boundary written down as executable text.** 26 codes in three
+  greppable tables (`REFUSAL_CODE` in `src/plugin/tools.mjs`, `MATCH_REFUSAL` in
+  `src/agent/allowed-commands.mjs`, `EXEC_REFUSAL` in `src/agent/exec.mjs`), with
+  `MATCH_REFUSAL.NOT_ALLOWED === REFUSAL.COMMAND_NOT_ALLOWED` asserted so the two ends of a dispatch
+  cannot drift apart. The defect this closes is that `applied: false` conflated three different facts:
+  a stored selection naming no machine was indistinguishable from "the whole fleet ran it", and that
+  state now has its own code (`SELECTION_UNUSABLE`). Every refusal carries `reason_code` and a `detail`
+  saying what would change it. The boundary itself — no tool parameter may name a credential, an
+  allow-list, a key path or a state directory — is stated in `src/plugin/tools.mjs`'s header and pinned
+  by four canaries run across all eight tools, proving that no result and no request body carries a
+  token. Proven by 17 mutations, 17 red, in a scratch copy outside the repository.
 
 ### Fixed
 
@@ -40,25 +66,33 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 * **The entire declared unit suite had not been running.** Wiring the new suites into
   `package.json#scripts.test` and `#scripts.test:all` dropped one space, producing the path
   `test/claims.test.mjstest/fleet-target.test.mjs`. `node --test` exits 1 on a missing path, so
-  `npm test` was failing immediately and *no* unit suite — not just `fleet-target` — was running.
-  One space; and it is my edit that did it.
+  `npm test` was failing immediately and *no* unit suite — not just `fleet-target` — was running. This
+  one is mine: it came from the edit that wired the new suites in, and it means the declared unit suite
+  was not being run at all between that edit and this release.
 * **`test/p2p-crypto.test.mjs` was named by no script at all.** 33 tests, green, and wired into
-  nothing — the exact defect v0.5.7's release note identified in someone else's repository. It is in
-  `test` and `test:all` now.
+  nothing — the exact defect v0.5.7's release note identified in someone else's repository. A suite
+  that never runs protects nothing, and that is now asserted rather than assumed. It is in `test` and
+  `test:all`.
 
 ### Notes
 
 * This release exists because three releases in one hour — v0.5.6, v0.5.7, v0.5.8 — each fixed a
   defect the previous one introduced. **Every one of those defects was found after the tag was pushed**,
   by a gate that already existed and simply was not run before the release. The gates were never
-  broken; the process around them was missing. That process is this release's only subject.
-* No runtime change: the code in v0.5.9 is the code in v0.5.6.
+  broken; the process around them was missing. That process is this release's subject.
 * One check is `UNVERIFIABLE` on this machine and is reported as such rather than passed quietly: the
   host has no `%DSH_HOME%\dsh-runtimes\`, while `src/agent/resolve.mjs` looks for the bundled runtime at
   `dsh-runtimes/dsh-primary-runtime/dependencies` and the application bundle carries it at
   `E:\DS\resources\runtime\primary-runtime\dependencies` instead. The suite's bundled-python claim is
   measured against a throwaway home with the documented layout, and the host mismatch is printed next
   to the verdict, as an open question rather than a silent pass.
+* Two checks are known to be sensitive to a loaded machine rather than to the artifact, and both are
+  named here rather than discovered later: `test/relay.test.mjs`'s `runs a complete signed task end to
+  end`, whose `lease_until` is computed by the relay during the request and recomputed by the test
+  after the await, so the two can land in different seconds; and the capability probe in
+  `test/agent.test.mjs`, which measures the host's own runtime layout as well as the resolver. A red
+  run naming only these is a re-run, not a release defect — and a report that hides them behind a green
+  verdict is the kind of green this release exists to avoid.
 
 ## [0.5.8] — 2026-10-11
 

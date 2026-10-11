@@ -32,6 +32,46 @@ export const WARN_OUTPUT_TRUNCATED = 'OUTPUT_TRUNCATED';
 export const WARN_PATH_INVALID = 'PATH_INVALID';
 
 /**
+ * The stable codes this gate refuses with.
+ *
+ * These are the last check before `spawn`, and they are what makes one invariant legible: **no shell,
+ * ever**. A string command, an empty argv and a non-string element are all refused here, and until
+ * now each was a bare `TypeError` with no code — a caller could see *that* the execution gate said no
+ * and not *which* rule said it. `code` and `detail` are attached rather than replacing the type, so
+ * `assert.throws(..., TypeError)` keeps meaning what it meant and `parseAllowedCommands`' own
+ * `err.code = 'ALLOWED_COMMANDS_INVALID'` stays the house convention rather than an exception.
+ */
+export const EXEC_REFUSAL = Object.freeze({
+  /**
+   * `argv` was not a non-empty array. This is the "no shell string" rule: `runArgv('node --test')`
+   * is refused because that string would have to be split by *something* to become a process, and the
+   * something would be a shell.
+   */
+  ARGV_NOT_ARRAY: 'EXEC_ARGV_NOT_ARRAY',
+  /** An element of `argv` was not a string; nothing here coerces, because coercion is a re-parse. */
+  ARGV_ENTRY_NOT_STRING: 'EXEC_ARGV_ENTRY_NOT_STRING',
+  /** `argv[0]` was the empty string, which names no executable. */
+  ARGV_EXECUTABLE_EMPTY: 'EXEC_ARGV_EXECUTABLE_EMPTY',
+  /** The process could not be started at all (ENOENT, EACCES, …); the OS code stays in `code`. */
+  SPAWN_FAILED: 'EXEC_SPAWN_FAILED',
+});
+
+/**
+ * Build the refusal `runArgv` throws: a real `TypeError`, carrying a stable code and a remedy.
+ *
+ * @param {string} code One of {@link EXEC_REFUSAL}.
+ * @param {string} message What was refused and why it cannot be run.
+ * @param {string} detail What would make the same call acceptable.
+ * @returns {TypeError}
+ */
+function execRefusal(code, message, detail) {
+  const error = new TypeError(message);
+  error.code = code;
+  error.detail = detail;
+  return error;
+}
+
+/**
  * Lowercase hex SHA-256 of a Buffer/string.
  *
  * @param {Buffer|Uint8Array|string} data
@@ -67,7 +107,9 @@ export const EMPTY_SHA256 = sha256Hex(Buffer.alloc(0));
  * @property {number} duration_ms Wall-clock duration.
  * @property {boolean} timed_out We killed it because `timeoutMs` elapsed.
  * @property {boolean} cancelled We killed it because the signal aborted.
- * @property {{code: string, message: string}|null} spawn_error
+ * @property {{code: string, reason_code: string, message: string}|null} spawn_error
+ *   `code` is the OS error code (ENOENT, EACCES) or `SPAWN_FAILED`; `reason_code` is this gate's own
+ *   stable code, so a reader can tell "the execution gate refused" from "the operating system did".
  * @property {string[]} warnings
  */
 
@@ -143,16 +185,28 @@ function createCollector(maxOutputBytes) {
  */
 export function runArgv(argv, options = {}) {
   if (!Array.isArray(argv) || argv.length === 0) {
-    throw new TypeError('runArgv: argv must be a non-empty array of strings');
+    throw execRefusal(
+      EXEC_REFUSAL.ARGV_NOT_ARRAY,
+      'runArgv: argv must be a non-empty array of strings',
+      'pass the command and its arguments as separate array elements, for example ["node","--test"] - a command line in one string is refused because splitting it would need a shell',
+    );
   }
   for (const part of argv) {
     if (typeof part !== 'string') {
-      throw new TypeError(
+      throw execRefusal(
+        EXEC_REFUSAL.ARGV_ENTRY_NOT_STRING,
         `runArgv: argv entries must be strings, got ${part === null ? 'null' : typeof part}`,
+        'stringify the argument at the caller, so this gate never has to re-parse a value it did not receive',
       );
     }
   }
-  if (argv[0] === '') throw new TypeError('runArgv: argv[0] must not be empty');
+  if (argv[0] === '') {
+    throw execRefusal(
+      EXEC_REFUSAL.ARGV_EXECUTABLE_EMPTY,
+      'runArgv: argv[0] must not be empty',
+      'name the executable in argv[0], for example "node" or an absolute path to it',
+    );
+  }
 
   const {
     cwd = process.cwd(),
@@ -265,6 +319,7 @@ export function runArgv(argv, options = {}) {
     } catch (error) {
       finish(null, null, {
         code: error?.code ?? 'SPAWN_FAILED',
+        reason_code: EXEC_REFUSAL.SPAWN_FAILED,
         message: String(error?.message ?? error),
       });
       return;
@@ -276,6 +331,7 @@ export function runArgv(argv, options = {}) {
     child.on('error', (error) => {
       finish(null, null, {
         code: error?.code ?? 'SPAWN_FAILED',
+        reason_code: EXEC_REFUSAL.SPAWN_FAILED,
         message: String(error?.message ?? error),
       });
     });

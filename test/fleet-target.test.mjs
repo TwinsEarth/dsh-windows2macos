@@ -612,13 +612,19 @@ describe('fleet-target: the selection routes w2m_run', () => {
     const { body, value } = await dispatch({}, execFor('sess-1'));
     assert.equal('target_machines' in body, false);
     assert.equal('executor_machine_id' in body, false);
-    assert.deepEqual(value.selection, {
+    // The shape is pinned whole, so a new key is a deliberate edit here rather than a silent
+    // addition: `applied: false` used to be *all* this said, and "nothing was selected" is a
+    // different fact from "your selection was ignored".
+    const { detail, ...selection } = value.selection;
+    assert.deepEqual(selection, {
       applied: false,
       field: null,
       machine_id: null,
       machine_name: null,
       session: 'sess-1',
+      reason_code: 'SELECTION_NONE',
     });
+    assert.match(detail, /not narrowed/, 'and the detail says what that reason means for this dispatch');
   });
 
   it('narrows a replicate dispatch to the selected machine and says which field did it', async () => {
@@ -627,6 +633,8 @@ describe('fleet-target: the selection routes w2m_run', () => {
     assert.deepEqual(body.target_machines, [REMOTE_MACHINE_ID]);
     assert.equal('executor_machine_id' in body, false);
     assert.equal(value.selection.applied, true);
+    assert.equal(value.selection.reason_code, 'SELECTION_APPLIED');
+    assert.match(value.selection.detail, /target_machines=/, 'the detail names the field that carried it');
     assert.equal(value.selection.field, 'target_machines');
     assert.equal(value.selection.machine_id, REMOTE_MACHINE_ID);
     assert.equal(value.selection.session, 'sess-1');
@@ -646,6 +654,7 @@ describe('fleet-target: the selection routes w2m_run', () => {
     assert.equal(body.executor_machine_id, REMOTE_MACHINE_ID);
     assert.equal('target_machines' in body, false, 'the other machines stay as observers');
     assert.equal(value.selection.field, 'executor_machine_id');
+    assert.equal(value.selection.reason_code, 'SELECTION_APPLIED');
   });
 
   it('lets an explicit executor_machine_id win, because a caller that names a machine is not overridden', async () => {
@@ -656,6 +665,10 @@ describe('fleet-target: the selection routes w2m_run', () => {
     );
     assert.equal(body.executor_machine_id, LOCAL_MACHINE_ID);
     assert.equal(value.selection.applied, false, 'the answer must say the selection did not route this task');
+    // The precedence rule is documented in `tools.mjs`; this is the code that makes it visible in the
+    // answer, instead of an operator discovering it from a ledger entry that names the wrong machine.
+    assert.equal(value.selection.reason_code, 'SELECTION_OVERRIDDEN_BY_CALLER');
+    assert.match(value.selection.detail, new RegExp(LOCAL_MACHINE_ID), 'the detail names the value that won');
     assert.equal(value.selection.field, null);
     assert.equal(value.selection.machine_id, REMOTE_MACHINE_ID, 'the selection is still reported as held');
   });

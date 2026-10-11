@@ -104,6 +104,7 @@ import {
   summarizeRtt,
   verifyEnvelope,
 } from '../src/agent/agent.mjs';
+import { MATCH_REFUSAL } from '../src/agent/allowed-commands.mjs';
 import { endpointUrl, joinUrl, resolveBaseUrl } from '../src/agent/url.mjs';
 import { createRelayServer } from '../src/relay/server.mjs';
 import * as plugin from '../src/plugin/tools.mjs';
@@ -208,6 +209,39 @@ describe('exec: direct argv, never a shell', () => {
     assert.throws(() => runArgv([NODE, 42]), /must be strings/);
   });
 
+  it('names the execution gate it refused at, and says what would make the call runnable', () => {
+    // The gate that runs immediately before `spawn`. Each of these used to be a bare `TypeError` with
+    // no code: a caller could see *that* it was refused and not *which* rule refused it, which for the
+    // "no shell, ever" invariant is the difference between "my argv is wrong" and "this module will
+    // not take a command line".
+    const cases = [
+      ['node --test', 'EXEC_ARGV_NOT_ARRAY'],
+      [[], 'EXEC_ARGV_NOT_ARRAY'],
+      [[NODE, 42], 'EXEC_ARGV_ENTRY_NOT_STRING'],
+      [['', '--test'], 'EXEC_ARGV_EXECUTABLE_EMPTY'],
+    ];
+    for (const [argv, code] of cases) {
+      assert.throws(
+        () => runArgv(argv),
+        (error) => {
+          assert.equal(error instanceof TypeError, true, 'the refusal is still a TypeError');
+          assert.equal(error.code, code, `${JSON.stringify(argv)} must be refused by name`);
+          assert.equal(typeof error.detail, 'string', 'and must carry what would change it');
+          assert.ok(error.detail.length > 20, `the detail must be a sentence: ${error.detail}`);
+          return true;
+        },
+      );
+    }
+  });
+
+  it('codes a spawn that never started, beside the operating system code', async () => {
+    // `code` stays the OS code (ENOENT here) because that is what a reader needs to fix it; the
+    // execution gate's own code says which layer decided, which is the thing a bare ENOENT hides.
+    const result = await runArgv(['w2m-definitely-not-a-real-binary']);
+    assert.equal(result.spawn_error.code, 'ENOENT');
+    assert.equal(result.spawn_error.reason_code, 'EXEC_SPAWN_FAILED');
+    assert.equal(classifyExit(result), 'crashed');
+  });
   it('records a non-zero exit code', async () => {
     const result = await runArgv([NODE, '-e', 'process.exit(3)']);
     assert.equal(result.exit_code, 3);
@@ -259,6 +293,9 @@ describe('exec: direct argv, never a shell', () => {
     const result = await runArgv(['w2m-definitely-not-a-real-binary']);
     assert.equal(result.exit_code, null);
     assert.equal(result.spawn_error?.code, 'ENOENT');
+    // `code` stays the operating system's, because that is what a reader needs to fix it; the
+    // execution gate's own code says which layer refused, which is what a bare ENOENT hides.
+    assert.equal(result.spawn_error?.reason_code, 'EXEC_SPAWN_FAILED');
     assert.ok(result.warnings.includes(WARN_PATH_INVALID));
     assert.equal(classifyExit(result), 'crashed');
   });
@@ -352,6 +389,49 @@ describe('allow-list: default-deny prefix matching', () => {
   it('refuses everything when the list is empty', () => {
     assert.equal(matchAllowedCommand([NODE, '--test'], []).allowed, false);
     assert.equal(matchAllowedCommand([NODE, '--test'], undefined).allowed, false);
+  });
+
+  it('names every refusal, and says what would change it', () => {
+    // A default-deny gate that answers `{allowed: false}` and nothing else tells a caller that the
+    // machine will not run their command, and leaves them to guess whether the list is wrong, the
+    // command is wrong, or their own call is wrong. The three are separate codes here.
+    const prefixes = parseAllowedCommands('["node --test","git status"]');
+
+    const notListed = matchAllowedCommand(['rm', '-rf', '/'], prefixes);
+    assert.equal(notListed.allowed, false);
+    assert.equal(notListed.reason_code, 'COMMAND_NOT_ALLOWED');
+    assert.match(notListed.detail, /node --test/, 'the detail repeats the entries that would cover it');
+    assert.match(notListed.detail, /rm -rf \//, 'and names the command that was refused');
+
+    const nothingAllowed = matchAllowedCommand(['node', '--test'], []);
+    assert.equal(nothingAllowed.allowed, false);
+    assert.equal(nothingAllowed.reason_code, 'COMMAND_NOT_ALLOWED', 'one refusal, one code, one list');
+    assert.match(nothingAllowed.detail, /empty/, 'but the remedy is the empty list, and it says so');
+
+    // An argv the matcher cannot even compare against: a caller bug, not a policy decision, so it is
+    // deliberately not folded into the code above.
+    for (const argv of ['node --test', [], null]) {
+      const unusable = matchAllowedCommand(argv, prefixes);
+      assert.equal(unusable.allowed, false, `${JSON.stringify(argv)} must still be refused`);
+      assert.equal(unusable.reason_code, 'COMMAND_ARGV_EMPTY');
+      assert.match(unusable.detail, /argv/);
+    }
+
+    const allowed = matchAllowedCommand(['node', '--test'], prefixes);
+    assert.equal(allowed.allowed, true);
+    assert.equal(allowed.reason_code, null, 'an allowed command has no refusal to name');
+    assert.equal(allowed.detail, null);
+  });
+
+  it('refuses under the same code the agent writes into an envelope', () => {
+    // The whole reason this matcher is shared: a dispatcher's pre-flight refusal and a machine's own
+    // refusal must read identically to whoever has to act on them. Two spellings of one refusal would
+    // be exactly the drift the shared module exists to prevent, so the literals are asserted equal.
+    assert.equal(MATCH_REFUSAL.NOT_ALLOWED, REFUSAL.COMMAND_NOT_ALLOWED);
+    assert.equal(
+      matchAllowedCommand(['rm', '-rf', '/'], parseAllowedCommands('["node --test"]')).reason_code,
+      REFUSAL.COMMAND_NOT_ALLOWED,
+    );
   });
 });
 
