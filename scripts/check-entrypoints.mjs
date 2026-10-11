@@ -7,8 +7,14 @@
  * and fails only when DSH mounts the plugin. That is precisely the failure this
  * project has already been bitten by once, in a different plugin.
  *
- * So: actually import `lib/tools.js` -- the exact specifier
- * `cordis.patch.yml` mounts -- and assert the plugin surface is present.
+ * So: actually import both published entry points -- `lib/index.js`, the module
+ * `cordis.patch.yml` mounts, and `lib/tools.js`, the subpath a profile may mount
+ * instead -- and assert the plugin surface is present on each.
+ *
+ * This gate still cannot see the *loader's* own view of the package (fiber state,
+ * the client-modules scan, the eight registered tools). That view is what
+ * `test/loader-entry.test.mjs` drives, through a real Harness and a packed
+ * tarball; this file stays the dependency-free half of the same question.
  *
  * Usage: node scripts/check-entrypoints.mjs
  */
@@ -25,10 +31,10 @@ const bad = (m) => { failures += 1; process.stdout.write(`  FAIL  ${m}\n`); };
 
 process.stdout.write('entry point imports\n');
 
-// The module `cordis.patch.yml` names. Importing it is the whole point.
+// The module `cordis.patch.yml` names, and npm's own subpath: one of them is what a profile loads.
 const mountEntry = join(ROOT, 'lib', 'tools.js');
 if (!existsSync(mountEntry)) {
-  bad(`lib/tools.js is missing; cordis.patch.yml mounts a path that does not exist`);
+  bad(`lib/tools.js is missing; the documented subpath entry point is gone`);
 } else {
   try {
     const mod = await import(pathToFileURL(mountEntry).href);
@@ -45,14 +51,16 @@ if (!existsSync(mountEntry)) {
   }
 }
 
-// The package root, which npm resolves for `import '@twinsearth/w2m-dsh-plugin'`.
+// The package root, which is what `cordis.patch.yml` mounts and what npm resolves for
+// `import '@twinsearth/w2m-dsh-plugin'`.
 const rootEntry = join(ROOT, 'lib', 'index.js');
 if (!existsSync(rootEntry)) {
-  bad('lib/index.js is missing');
+  bad('lib/index.js is missing; cordis.patch.yml mounts a path that does not exist');
 } else {
   try {
-    await import(pathToFileURL(rootEntry).href);
-    ok('lib/index.js imports (deliberately empty plugin root)');
+    const mod = await import(pathToFileURL(rootEntry).href);
+    if (typeof mod.apply !== 'function') bad(`lib/index.js exports apply as ${typeof mod.apply}`);
+    else ok('lib/index.js exports a callable apply (the mounted root)');
   } catch (error) {
     bad(`importing lib/index.js threw: ${error.message}`);
   }

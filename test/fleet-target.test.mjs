@@ -158,6 +158,14 @@ async function makeNonRepoDir() {
 /**
  * A fake `ctx` carrying the services this plugin injects, plus an optional fetch-route registry.
  *
+ * `inject` is part of the fake on purpose: it is the *only* way this plugin may reach the optional
+ * `connection` service. A plain `ctx.connection` read inside a real Cordis fiber throws
+ * (`cannot get property "connection" without inject`) whether or not the service exists, which is
+ * exactly how v0.5.4 took the whole entry down — so a fake that handed `connection` over as a plain
+ * property would be modelling a host that cannot exist. The real `Context` runs the callback once the
+ * named service is available; the fake runs it synchronously against itself, which is the same thing
+ * for the "already provided" case these tests cover.
+ *
  * @param {{withRoutes?: boolean}} [options]
  * @returns {{ctx: object, tools: Map<string, object>, routes: object[], warnings: string[]}}
  */
@@ -175,6 +183,9 @@ function makeCtx(options = {}) {
       },
     },
     logger: { warn: (message) => warnings.push(String(message)), info: () => {} },
+    inject(_names, callback) {
+      callback(ctx);
+    },
   };
   if (options.withRoutes === true) {
     ctx.connection = { fetch: { register: (route) => routes.push(route) } };
@@ -430,9 +441,13 @@ describe('fleet-target: the browser route', () => {
       request: options.request ?? (async () => ({ ok: true, status: 200, json: DEVICES_BODY })),
       resolveToken: async () => 'dev-test-abc',
     };
-    const ctx = options.noRegistry === true
-      ? {}
-      : { connection: { fetch: { register: (route) => registered.push(route) } } };
+    const ctx = {
+      ...(options.noRegistry === true ? {} : { connection: { fetch: { register: (route) => registered.push(route) } } }),
+      // Same cordis-shaped injection as `makeCtx`: the route is mounted from the callback.
+      inject(_names, callback) {
+        callback(ctx);
+      },
+    };
     const status = registerTargetRoutes(ctx, deps);
     return { store, registered, status, route: registered[0] ?? null };
   }

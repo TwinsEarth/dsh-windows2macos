@@ -1,7 +1,30 @@
 # This file is the bundle patch declared by package.json's `dsh.bundle.patch`.
-# It mounts the plugin explicitly at `./tools` rather than relying on a
-# "root export is the plugin" convention, so reading this file tells you which
-# module of the package becomes the plugin.
+# It mounts the plugin by its package name, whose root export is the plugin
+# (`lib/index.js` re-exports `./tools.js`), so reading this file tells you which
+# package becomes the plugin.
+#
+# ---------------------------------------------------------------------------
+# Why the row names the package and not the `/tools` subpath (v0.5.4)
+# ---------------------------------------------------------------------------
+# Until v0.5.4 this row said `name: '@twinsearth/w2m-dsh-plugin/tools'`, and for a
+# host-only plugin that was fine. It stops being fine the moment the package also
+# ships a browser half, because the client module system identifies a package by
+# the *package specifier* its Loader row carries:
+#
+#   client-modules: resolveMeta(loaderName, baseUrl)   (dsh-client-modules)
+#     exactPackageSpecifier('@twinsearth/w2m-dsh-plugin/tools') -> undefined
+#     ... -> locatePkgJson returns undefined -> the entry is not a client package
+#
+# A subpath specifier resolves to no package manifest at all, so a `/tools` row is
+# invisible to the scan: `lib/client.js` is never composed into `__DSH_BOOT__`, and
+# the composer control can never register -- whatever else is fixed. Measured on the
+# 0.5.4 tarball through the real Loader: the composed boot graph held rows for
+# `@deepseek-ai/dsh-typert-registry` and `@deepseek-ai/dsh-api-gateway` and none for
+# this package. Naming the bare package fixes it, because the root export already
+# re-exports exactly what `/tools` exports (`test/tools.test.mjs` asserts the two
+# carry the same `inject`), so the host half is unchanged. `./tools` remains a
+# supported mount point for anyone who wants it -- it is simply not the one this
+# bundle uses.
 #
 # ---------------------------------------------------------------------------
 # Why this is an `insert:` list and not a bare `- id: w2m`
@@ -83,7 +106,7 @@
 # is visible rather than assumed.
 - insert:
     - id: w2m
-      name: '@twinsearth/w2m-dsh-plugin/tools'
+      name: '@twinsearth/w2m-dsh-plugin'
       config:
         rabbitUrl: ''
         operatorToken: ''

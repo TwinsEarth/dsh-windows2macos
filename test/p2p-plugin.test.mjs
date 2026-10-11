@@ -287,6 +287,11 @@ function makeCtx() {
       if (typeof disposer === 'function') disposers.push(disposer);
       return disposer;
     },
+    // Cordis-shaped injection of the optional `connection` service (see test/tools.test.mjs): this
+    // host has none, so nothing is mounted and no warning is owed.
+    inject(_names, callback) {
+      callback(ctx);
+    },
   };
   return { ctx, tools, warnings, disposers };
 }

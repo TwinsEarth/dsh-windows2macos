@@ -35,6 +35,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
 import { describe, it } from 'node:test';
+import { TARGET_ROUTE_PATH } from '../src/plugin/fleet-target.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const BUNDLE_PATH = path.join(HERE, '..', 'lib', 'client.js');
@@ -243,6 +244,60 @@ describe('client bundle: the seat it registers into', () => {
     const { exports } = loadBundle();
     assert.doesNotThrow(() => exports.apply(ctx));
     assert.equal(registered.length, 1);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// The declaration the host scans
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * What a host needs before it will ever fetch this bundle.
+ *
+ * Cheap, always-on counterpart to `test/loader-entry.test.mjs`: that file boots a real Harness and is
+ * therefore skipped where none is installed, while these three declarations are what it depends on —
+ * and the third one is the one v0.5.4 got wrong. The client module system identifies a package by the
+ * specifier its Loader row carries (`exactPackageSpecifier` in `@deepseek-ai/dsh-client-modules`), so a
+ * `/tools` row resolves to no manifest, no `dsh.client` declaration is read, and the browser half is
+ * never composed — silently, with the host plugin still working. Measured on the v0.5.4 tarball: the
+ * composed boot graph held rows for two other packages and none for this one.
+ */
+describe('client bundle: the declaration a host scans', () => {
+  const manifest = JSON.parse(fs.readFileSync(path.join(HERE, '..', 'package.json'), 'utf8'));
+  const patch = fs
+    .readFileSync(path.join(HERE, '..', 'cordis.patch.yml'), 'utf8')
+    .split('\n')
+    .filter((line) => !/^\s*#/.test(line));
+
+  it('declares dsh.client for the web platform', () => {
+    assert.equal(manifest.dsh?.client?.platform, 'web', 'without this the host never looks for a bundle');
+  });
+
+  it('exports the bundle at ./client, which is the path the host reads', () => {
+    assert.equal(manifest.exports?.['./client'], './lib/client.js');
+    assert.ok(fs.existsSync(BUNDLE_PATH), `the declared bundle is missing: ${BUNDLE_PATH}`);
+  });
+
+  it('is mounted by its package name, not a subpath, or the host cannot find the manifest', () => {
+    const mounted = patch.map((line) => /^\s*name:\s*'([^']+)'\s*$/.exec(line)).find(Boolean);
+    assert.ok(mounted !== undefined, 'cordis.patch.yml must still name the module it mounts');
+    assert.equal(
+      mounted[1],
+      manifest.name,
+      'the Loader row must carry the bare package specifier: a subpath (`…/tools`) resolves to no ' +
+        'package.json, so `@deepseek-ai/dsh-client-modules` never composes this package’s client half',
+    );
+  });
+
+  it('fetches the exact path the host registers, `/api` channel included', () => {
+    // The host's Connection service mounts its fetch-route registry under `/api` and refuses any
+    // other prefix, so a browser half that fetches `/w2m/target` while the host registers
+    // `/api/w2m/target` is a control that 404s forever. Two constants, one path: they are compared
+    // rather than trusted.
+    const route = /const ROUTE = '([^']+)'/.exec(fs.readFileSync(BUNDLE_PATH, 'utf8'));
+    assert.ok(route !== null, 'the bundle must name the route it fetches');
+    assert.equal(route[1], TARGET_ROUTE_PATH);
+    assert.ok(TARGET_ROUTE_PATH.startsWith('/api/'), 'the registry accepts only /api/… exact routes');
   });
 });
 

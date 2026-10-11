@@ -2872,6 +2872,12 @@ export async function apply(ctx, config = {}) {
   // host without `connection.fetch` still gets every tool, and `w2m_status` reports the absence —
   // which is the honest place for it, since a host that has no Connection at all is simply not a web
   // composition and does not need a warning on every headless run.
+  //
+  // Nothing here reads the service: `registerTargetRoutes` declares the optional dependency with
+  // `ctx.inject` and attaches from that callback (the comment there records why a plain
+  // `ctx.connection` read fails the whole entry, and why the read cannot be synchronous anyway). The
+  // one mismatch worth a log line — a Connection that carries no fetch registry — is logged where it
+  // is observed, inside that callback, so this call returns a status object that stays live.
   const targetRoutes = registerTargetRoutes(ctx, {
     cfg: () => cfg,
     store: defaultSelectionStore,
@@ -2879,9 +2885,6 @@ export async function apply(ctx, config = {}) {
     request,
     resolveToken,
   });
-  if (targetRoutes.unexpected) {
-    ctx.logger?.warn?.(`w2m: the composer target control is inactive — ${targetRoutes.reason}`);
-  }
 
   /** Text output: rendered as JSON, because every one of these tools answers with a structure. */
   const jsonOutput = {

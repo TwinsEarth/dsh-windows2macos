@@ -27,10 +27,12 @@
  *
  * # The wire, and why it is this small
  *
- * Two exact Fetch routes on the host's `/api` carrier, mounted inside its authentication fence:
+ * Two exact Fetch routes on the host's `/api` carrier, mounted inside its authentication fence.
+ * The `/api` prefix is the registry's own channel — see {@link TARGET_ROUTE_PATH} — so these are the
+ * paths as the host registers them, and the page fetches the same path document-relative:
  *
- *   GET  /w2m/target?session_id=…   the fleet and this session's selection, as one snapshot
- *   POST /w2m/target                { session_id, machine_id|null } → the same snapshot
+ *   GET  /api/w2m/target?session_id=…   the fleet and this session's selection, as one snapshot
+ *   POST /api/w2m/target                { session_id, machine_id|null } → the same snapshot
  *
  * Plain `Response.json`, no Typert descriptor: this package is dependency-free, and a generated
  * strict Remote contribution is neither reachable from plain JavaScript nor worth a codec for one
@@ -48,8 +50,19 @@
  * get.
  */
 
-/** Both routes hang off this exact path; the browser half reads the same constant. */
-export const TARGET_ROUTE_PATH = '/w2m/target';
+/**
+ * Both routes hang off this exact path; the browser half reads the same constant.
+ *
+ * The `/api` prefix is not decoration and not ours: `@deepseek-ai/dsh-client-connection` mounts the
+ * whole fetch-route registry under its `/api` channel and validates every registration with
+ * `endpointFromPath('/api', path)`, which returns undefined for anything that does not start with
+ * `/api/`. A `/w2m/target` registration is therefore refused — `connection: invalid exact Fetch route
+ * "/w2m/target"` — inside the injected callback, where it failed the *child* fiber and left the host
+ * entry looking perfectly healthy. The shipped browser halves all follow the same rule
+ * (`dsh-client-file-upload` uses `/api/session/uploadFileBinary`), and the page fetches the same
+ * document-relative path.
+ */
+export const TARGET_ROUTE_PATH = '/api/w2m/target';
 
 /**
  * The store bucket used when a dispatch carries no session.
@@ -460,16 +473,40 @@ export function createLocalIdentity(read) {
   };
 }
 
+/** The one diagnostic for "this host cannot carry the composer control", shared by both causes. */
+const NO_ROUTE_REGISTRY =
+  'this host provides no `connection.fetch` route registry, so the composer control cannot reach the plugin';
+
 /**
  * Mount the two browser routes, if this host has a fetch-route registry to mount them on.
  *
  * Returning a status object instead of throwing keeps the one interesting case loud *and*
  * survivable: a host built without `@deepseek-ai/dsh-client-connection` still gets a working plugin
- * with seven tools and no composer control, which is strictly better than a plugin that refuses to
- * load because a UI nicety has nowhere to attach.
+ * with all eight tools and no composer control, which is strictly better than a plugin that refuses
+ * to load because a UI nicety has nowhere to attach.
  *
- * @param {object|null|undefined} ctx Cordis context; only `ctx.connection.fetch` is read, and it is
- *   read defensively because a host may not provide one.
+ * # Why the service is declared with `ctx.inject`, and never read as `ctx.connection`
+ *
+ * Cordis resolves services per fiber: a property read of a name this plugin did not declare in its
+ * `inject` list **throws** — `cannot get property "connection" without inject` — and it throws
+ * whether or not some other plugin provides that service. `ctx.inject(names, callback)` is the
+ * declaration that makes the read legal, and it is the *optional* form: the plugin's own list stays
+ * `['tools']`, so a host with no Connection service still activates and still registers all eight
+ * tools — the callback below simply never runs. v0.5.4 shipped the plain property read, and the whole
+ * entry then failed on a web host and on a base-only host alike, because the throw does not depend on
+ * the service existing.
+ *
+ * `ctx.inject` also drops the ordering assumption a one-shot read would carry: the Loader creates
+ * sibling entries concurrently (`EntryGroup.update` → `Promise.all`), so a host that *does* provide
+ * Connection may still be activating it while this plugin's `apply` runs. A synchronous read would
+ * report "no registry" for a control that was about to become attachable.
+ *
+ * The status object is mutated in place when the callback runs, so `w2m_status` — called long after
+ * activation — reads what happened rather than what was knowable at `apply` time.
+ *
+ * @param {object|null|undefined} ctx Cordis context; `ctx.inject(['connection'], …)` is how the
+ *   optional service is declared and read. A context without `inject` gets no route and no warning,
+ *   which is the same status as a host that has no Connection at all.
  * @param {object} deps
  * @param {() => object} deps.cfg Current merged plugin config.
  * @param {object} deps.store The selection store.
@@ -480,17 +517,43 @@ export function createLocalIdentity(read) {
  *   when the host has a Connection service that lacks the registry — the one case worth a warning.
  */
 export function registerTargetRoutes(ctx, deps) {
-  const connection = ctx?.connection ?? null;
+  const status = {
+    mounted: false,
+    unexpected: false,
+    reason: NO_ROUTE_REGISTRY,
+  };
+  if (typeof ctx?.inject === 'function') {
+    ctx.inject(['connection'], (webCtx) => {
+      mountTargetRoutes(webCtx.connection, deps, status, ctx.logger);
+    });
+  }
+  return status;
+}
+
+/**
+ * Attach the route pair to one host's fetch registry, recording the outcome on `status`.
+ *
+ * The registration is owned by the context it is made through — `register` is a Connection method
+ * bound to the calling fiber, so it is released with the injected child fiber — which is why there
+ * is no `ctx.effect` wrapper here.
+ *
+ * @param {object|null|undefined} connection The `connection` service, when the host has one.
+ * @param {object} deps
+ * @param {{mounted: boolean, unexpected: boolean, reason: string|null}} status Mutated in place.
+ * @param {object} [logger] The plugin's logger, for the one mismatch worth a line.
+ * @returns {void}
+ */
+function mountTargetRoutes(connection, deps, status, logger) {
   const registry = connection?.fetch;
   if (registry === undefined || typeof registry.register !== 'function') {
-    return {
-      mounted: false,
-      // The distinction matters to the caller's log: a host with **no** Connection at all is simply
-      // not a web composition, and warning about it would be noise on every headless run. A host
-      // that has Connection but no fetch registry is a real mismatch worth one line.
-      unexpected: connection !== null && connection !== undefined,
-      reason: 'this host provides no `connection.fetch` route registry, so the composer control cannot reach the plugin',
-    };
+    // The distinction matters to the log: a host with **no** Connection at all is simply not a web
+    // composition, and warning about it would be noise on every headless run. A host that has
+    // Connection but no fetch registry is a real mismatch worth one line.
+    status.unexpected = connection !== null && connection !== undefined;
+    if (status.unexpected) {
+      logger?.warn?.(`w2m: the composer target control is inactive — ${NO_ROUTE_REGISTRY}`);
+    }
+    return;
   }
 
   let cache = { at: 0, value: null };
@@ -599,5 +662,6 @@ export function registerTargetRoutes(ctx, deps) {
     },
   });
 
-  return { mounted: true, unexpected: false, reason: null };
+  status.mounted = true;
+  status.reason = null;
 }

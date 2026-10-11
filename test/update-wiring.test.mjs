@@ -25,6 +25,10 @@ after(() => {
 /**
  * A fake `ctx` carrying `tools`, and optionally a working `effect` that records its disposer.
  *
+ * `inject` is the Cordis-shaped part: the plugin declares the optional `connection` service through
+ * `ctx.inject(names, callback)` rather than reading it as a property (which throws inside a real
+ * fiber). This host provides no Connection, so nothing is mounted.
+ *
  * @param {{withEffect?: boolean, effectThrows?: boolean}} [opts]
  */
 function makeCtx({ withEffect = true, effectThrows = false } = {}) {
@@ -43,6 +47,9 @@ function makeCtx({ withEffect = true, effectThrows = false } = {}) {
     logger: {
       warn: (m) => warnings.push(String(m)),
       info: (m) => infos.push(String(m)),
+    },
+    inject(_names, callback) {
+      callback(ctx);
     },
   };
   if (withEffect) {

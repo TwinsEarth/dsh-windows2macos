@@ -63,6 +63,11 @@ async function makeNonRepoDir() {
 /**
  * A fake `ctx` carrying the `tools` service this plugin injects.
  *
+ * `inject` is the Cordis-shaped half of the fake: the plugin reaches the optional `connection`
+ * service only through `ctx.inject(names, callback)` (a plain property read throws inside a real
+ * fiber), so a fake without it would be modelling a host that cannot exist. This host provides no
+ * Connection, so the callback's read stays `undefined` and no route is mounted — the headless case.
+ *
  * @returns {{ctx: object, tools: Map<string, object>, warnings: string[]}}
  */
 function makeCtx() {
@@ -78,6 +83,9 @@ function makeCtx() {
       },
     },
     logger: { warn: (message) => warnings.push(String(message)), info: () => {} },
+    inject(_names, callback) {
+      callback(ctx);
+    },
   };
   return { ctx, tools, warnings };
 }
