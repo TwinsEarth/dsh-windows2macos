@@ -4,6 +4,86 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1] — 2026-10-11
+
+### Fixed
+
+* **v0.6.0 was tagged and never published, because its release pipeline ran a pre-flight that could not
+  complete on the platform that builds the artifact.** Nothing was wrong with the v0.6.0 *code*: the
+  tarball this release publishes is the v0.6.0 tree plus the repairs below, and the section underneath
+  describes what is in it. What was wrong was the pipeline's order and two of its checks, all three
+  invisible on the developer machine that wrote them. This is a fix-forward release rather than a re-tag:
+  v0.6.0 stays tagged and unpublished, and its content ships here.
+* **The pre-flight ran before the pack, so on a fresh checkout it could never be green.** `dist/` is
+  gitignored, so a clean checkout has no tarball, and three assertions in `test/claims.test.mjs` about the
+  *packed* tree skip when there is none -- while `scripts/preflight.mjs` fails any skip whose reason is not
+  on `ACCEPTED_SKIPS`. Measured by moving `dist/` aside: "10 pass, 1 fail, 1 unverifiable -- RED", naming
+  `no dist/ in this checkout: the packed tree was not verified here`. It looked green on a developer
+  machine only because `dist/` still held a tarball from an earlier pack. `ci.yml`'s `preflight` job and
+  `release.yml` now pack first, and `release.yml`'s checksums moved below the pre-flight so `SHA256SUMS`
+  describes the bytes the pre-flight left in `dist/` -- the ones unpacked, verified and published. The skip
+  was deliberately **not** added to `ACCEPTED_SKIPS`: that would have traded three real assertions about
+  the published artifact for a green light.
+* **The matrix job ran `npm test` without `npm install`, and the gate inventory names a `node_modules`
+  path.** `test/claims.test.mjs` asserts that every artifact `GATE_INVENTORY` names exists in the tree --
+  the check that catches a gate deleted from the pre-flight -- and the first row of that inventory is the
+  eslint entry point at `node_modules/eslint/bin/eslint.js`. The matrix job never installed dev tooling, so
+  all four legs failed that assertion with `the inventory names files that are not in the tree: eslint entry
+  point (node_modules/eslint/bin/eslint.js)`. It could not reproduce locally, where `node_modules/` exists,
+  and it was newly exposed by v0.6.0's own wiring change: the hand-listed 22-path subset it replaced had
+  never run `claims`. The matrix job now installs dev tooling before `npm test`, and was measured green on
+  all four legs afterwards.
+* **The pre-flight read the claims suite's counts without pinning the reporter, so on node 22 it read
+  none.** `checkClaims()` parsed the child's stdout with the spec reporter's summary in mind, while
+  `checkTestSuite()` has always pinned `--test-reporter=spec --test-reporter-destination=stdout`. Node's
+  default reporter depends on the runtime: measured, the same command prints the spec summary under node 24
+  and TAP's `# tests 48` under node 22 when stdout is a pipe -- which is what a CI runner is. The check
+  therefore reported `the runner printed no test count at all` for a suite that had passed, on the version
+  every workflow runs, and **every local run on node 24 was green: only the runner's own output named it.**
+  The reporter is now pinned exactly as the declared-suite check pins it.
+* **The pre-flight now names its own failing checks in the CI interface.** Its verdict is its exit status
+  and its output went only to the step log, so a red pre-flight read as one line -- "Process completed with
+  exit code 1" -- to anyone without log access, including the API-only tools this project audits a run
+  with. The `FAIL` and `UNVERIF` lines it printed are now `::error::` annotations, the convention
+  `compat.yml`'s verdict program already used. The exit status is unchanged: the wrapper reads the
+  pre-flight's own status out of `PIPESTATUS` and exits with it, because a pipeline ending in `tee` would
+  otherwise report success for a red gate.
+
+### Notes
+
+* **Two skips are accepted because a CI runner has no DSH installation, and nothing else was
+  pre-accepted.** `update-install: real pnpm against a throwaway profile` needs the pnpm that ships
+  *inside* a DSH runtime (`$W2M_PNPM`, or `$DSH_HOME/dsh-runtimes/*/dependencies/pnpm/bin/pnpm.mjs`), so on
+  a runner both of its assertions skip with `runtime pnpm not found`; they are accepted as
+  `no-runtime-pnpm`, capped at two. The entry carries no platform qualifier, because this is not a platform
+  fact -- Windows runners lack the runtime exactly as Linux ones do -- and the cap is the bound: a third
+  skip in that describe fails the check, and this reason on a host that *does* have a runtime would be a
+  defect in resolution rather than an environment fact. The alternative, building a synthetic runtime in CI
+  the way `compat.yml` builds a host for the loader gate, was rejected on purpose: it would exercise the
+  installer against a pnpm fetched from npm instead of the one the Desktop ships, a weaker claim about the
+  artifact plus a network dependency inside the release gate. The platform-conditional pair in
+  `test/agent.test.mjs` is qualified the other way round and **by platform**, so accepting the POSIX side
+  cannot excuse the same reason on Windows, where that assertion is expected to run.
+* **A hypothesis that was tested and did not survive, recorded because the next reader deserves it.** The
+  standing explanation for the four red matrix legs was "the runner has no DSH installation, so suites that
+  need one behave differently there". It was tested by rebuilding the runner's conditions -- a clone with no
+  `node_modules/`, no `dist/`, no DSH installation reachable, no `~/.dsh`, node 22, one `npm test` -- and it
+  did not produce a failure: the loader gate skips (accepted), and the bundled-python assertion is guarded
+  by `PATH` and had already passed in v0.5.9's CI on these same runners. The real mechanism was a path in
+  the gate inventory on a job that never ran `npm install`. A wrong hypothesis that was tested and
+  discarded is worth as much to the next reader as the right one.
+* **A node-22 difference this release does not fix, stated with its bounds.** With the pre-flight's shaped
+  `DSH_HOME`, `test/agent.test.mjs` is 147 tests / **0 fail under node 24** and **13 fail under node 22**
+  (`'refused' !== 'ok'`, around `test/agent.test.mjs:3870` and `:3915`). `engines` declares `>=20.19.0`, so
+  node 22 is a supported runtime and this is a real difference rather than a curiosity. Two facts bound it:
+  it does not fire in CI today, because a runner cannot shape a home -- `prepareSuiteEnv()` finds no runtime
+  source there and the suite runs bare, which is why no agent failure appears on ubuntu -- and it will
+  surface the moment the pre-flight job is given a runtime layout. It is a behaviour question rather than
+  wiring, so it is recorded here and left to a separate change.
+* `PROTOCOL.md` §9's correction note said there is no such release as v0.6.0; that was true when it was
+  written and the tag made it false. It now still says what it was written to say -- the P2P data-plane
+  crypto shipped in **v0.5.3**, not v0.6.0 -- without contradicting the tag.
+
 ## [0.6.0] — 2026-10-11
 
 ### Added
