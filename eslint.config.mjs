@@ -149,13 +149,21 @@ export default [
   // the DSH web shell loads as a plugin, written by hand in the module-loader
   // format (`window.__ModuleLoader__.load({ id, factory })`) because this
   // package has no build step and no dependencies. It is browser code with a
-  // deliberate `var` prelude, so it gets browser globals and two exemptions:
+  // deliberate `var` prelude, so it gets browser globals and three exemptions:
   //
   //   no-var        the loader's entry shape is `var module = {exports:{}}` +
   //                 `var exports = module.exports` around the factory body, and
   //                 that prologue is part of the contract, not a style choice.
   //   no-implicit-globals  the file's whole purpose is to touch the page's
   //                 `window`.
+  //   no-console    the renderer console at error level is the *only* channel a
+  //                 browser half has into the desktop crash log (the log's
+  //                 `--- renderer console (error level, oldest first) ---`
+  //                 block). Measured: when this entry failed to activate, the
+  //                 log said `@twinsearth/w2m-dsh-plugin: failed` and nothing
+  //                 about the cause, which cost two outages to find. The
+  //                 bundle's two `console.error` calls are that diagnosis, and
+  //                 there is no value to return them to.
   //
   // Every correctness rule still applies: `no-undef` now checks against the
   // browser's globals rather than the node ones, which is the stronger check
@@ -173,6 +181,7 @@ export default [
     rules: {
       'no-var': 'off',
       'no-implicit-globals': 'off',
+      'no-console': 'off',
     },
   },
 

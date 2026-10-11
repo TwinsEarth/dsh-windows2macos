@@ -54,6 +54,77 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 * Still unverified, and not claimed: how the control *renders*. No browser was opened. What is proven is
   the entire host side — the entry activates, the eight tools register, the boot-graph row is composed
   from the shipped bundle, the route is registered and attached — plus the seat shape in a VM test.
+## [0.5.6] — 2026-10-11
+
+### Fixed
+
+* **The client entry could not activate, and that made the whole application refuse to start.**
+  v0.5.4 and v0.5.5 were withdrawn for it. The real cause, taken from the page itself rather than
+  guessed:
+
+  ```
+  w2m-client-probe: apply threw for @twinsearth/w2m-dsh-plugin: cannot get property "locale" without inject
+  Error: web boot: 1 entry did not activate
+  ```
+
+  Cordis throws for any `ctx.<name>` a fiber reads without declaring it, and the client half declared
+  `inject = []`. **The first throw was `locale`, not `slots`** — so declaring the seat alone, or guarding
+  the locale alone, would each still have died. Now `inject = ['slots']` (a declared name is a *required*
+  dependency, which is why `locale` is deliberately not among them), the optional carrier is read
+  inject-free with `ctx.get('locale')` while its dictionary registration rides a child fiber, a context
+  with no usable seat becomes a **no-op with a diagnostic** instead of taking the page down, and `apply`
+  prints the inner message to the error-level renderer console — the channel the crash log reads — and
+  then rethrows, because a swallow would boot a healthy-looking page with no control.
+* **A failed entry was invisible unless you read fiber state.** `cordis-plugin-loader` no longer
+  propagates a failed mount to `await ctx.loader.await()`, and the loader driver inspected only the one
+  entry it knew about — so a failure landing on a **child** fiber (our silently-refused route) went
+  unseen. The driver now sweeps the whole registry and reports `failedFibers`.
+
+### Added
+
+* **A gate that would have caught all of it**: `test/loader-entry.test.mjs` packs the tree, installs the
+  tarball with the installation's own `dsh plugin add` into a throwaway profile under a throwaway
+  `DSH_HOME`, boots it with the real `runProfile`, activates the client entries through the real module
+  system, and — when a browser is present — boots the profile's own page and asserts our control renders.
+  Proven in both directions: **10/10 on this tree, 2 failures against the preserved pre-fix tarball, 9
+  against the v0.5.4 one**, and with a deliberately injected route defect it names the **child** fiber
+  while "entry active" and "eight tools" still pass. It reports one stage per line, so a failure names
+  its cause.
+* **`test/claims.test.mjs`** — 22 checks that our own published claims match the artifact, with the
+  registered tool set *measured* by importing the entry. It caught a stale claim in our README on its
+  **first run** (`README.md` said the installer asserts 5 tools; it asserts 8), and its author's own
+  mutation proof caught two false greens in its first draft — a scan that extracted zero tool names and
+  a lookahead that invented one out of a metric.
+* **`TROUBLESHOOTING.md`** — 17 symptom-indexed sections that name the culprit when it is not us (pnpm's
+  `minimumReleaseAge`, carrier-grade NAT, the OS firewall, an installer that rewrites the profile patch),
+  ending with a data-location table and a reason-code table.
+* **`SECURITY.md`** — a private reporting channel and **no public-issue route**, an honest support table,
+  and the consent model written out: what a paired machine may and may not do, and that we never write to
+  another machine's `authorized_keys`.
+* **`CONTRIBUTING.md`** — one page of falsifiable conventions, including **"a test that would pass
+  against a broken artifact is not evidence"** and **"run mutation proofs in a copy, never in the shared
+  tree"** (both learned the hard way).
+* **Opt-in LAN discovery** (`src/agent/mdns-wire.mjs`, `src/agent/mdns.mjs`, `src/plugin/mdns-discover.mjs`):
+  a bounded, hand-written DNS/mDNS codec with parse hardening (a pointer may only name a *prior* offset, so
+  termination is a property of the format; a 128-hop budget reported separately from a loop; label, name,
+  record and packet caps; every read bounds-checked) and a discovery source exposed through
+  `w2m_devices`' new `include_discovered` (default `false`). **Discovery is a hint, never an
+  authorisation**: a discovered device is refused as a dispatch target unless the relay already lists it
+  and it is online, and the positive control is tested so the rule cannot pass by refusing everything.
+
+### Notes
+
+* **v0.5.4 and v0.5.5 remain DO NOT INSTALL.** This release also exists so that `latest` on the registry,
+  which still pointed at v0.5.5, stops handing out a version that prevents the application from starting.
+* **Upgrading from v0.5.4 needs one edit outside this package**: the profile's `cordis.patch.yml` must
+  name the package (`@twinsearth/w2m-dsh-plugin`), not the `/tools` subpath. With the corrected bundle row
+  a mismatch makes the loader skip the whole patch and silently revert every configured value to its
+  default. The claims gate now checks this.
+* **LAN discovery is unverified on a real network.** Every socket in its suite is loopback and no packet
+  left the host, so it says nothing about whether a switch forwards `224.0.0.251` or how a real
+  Bonjour/Avahi peer answers. There is **no third-party interoperability test**, no probing or conflict
+  resolution, IPv4 only, and the responder is **built and tested but not started** by the plugin —
+  loading a plugin should not silently multicast on the host's network.
 ## [0.5.4] — 2026-10-11
 
 > **DO NOT INSTALL 0.5.4.** It fails to load in the Harness: the loader entry

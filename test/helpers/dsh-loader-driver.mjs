@@ -19,12 +19,28 @@
  *
  * One line of JSON on stdout, prefixed `W2M-LOADER-REPORT:`, holding
  *
+ *   stages   one line per step, so a failure names the stage it happened in instead of arriving as
+ *            one opaque error string;
  *   entries  every Loader entry with the fiber state it settled to (2 = active, 3 = failed) and the
  *            error the fiber recorded, so "the entry is active" is a measurement, not an inference
  *            from the absence of a message;
+ *   failedFibers  a **registry-wide sweep** of every fiber in the process, not just the entries this
+ *            test already knows about. A failure that lands on a *child* fiber — a route refused
+ *            inside an injected callback, say — leaves the parent entry `active`, so per-entry state
+ *            cannot see it; `loader.await()` cannot either, because cordis settles its import tasks
+ *            with `Promise.allSettled`. The sweep is the only thing in this file that would notice;
  *   tools    the names the `tools` service hands the model, read through its own projection;
- *   client   whether the real `clientModules` host half accepted this package's `dsh.client`
- *            declaration and composed a boot-graph row for it, plus the bundle path it read.
+ *   client   the host-side composition: whether the real `clientModules` host half accepted this
+ *            package's `dsh.client` declaration and composed a boot-graph row for it, plus the
+ *            bundle path and URL it read;
+ *   clientActivation  the *activation* half of the client story, driven through the real client
+ *            module system and the real Cordis loader with no browser
+ *            (`test/helpers/dsh-client-activation.mjs`): each entry's fiber state in the page's own
+ *            runtime, and the slot seats a completed `apply` took;
+ *   clientPage  the same question asked of a real browser: the profile's own Web app booted headless
+ *            (`test/helpers/dsh-page-boot.mjs`), with `arrived` true only when this package's
+ *            stylesheet is in the document. Skipped — loudly, never silently passed — when no
+ *            Chromium-based browser is installed.
  *
  * The process disposes the tree and exits on its own: the profile's tree owns sockets and timers, so
  * a report that hung would be a report that never arrived.
@@ -34,11 +50,13 @@
  * `appArgsJson` is the app flag array the profile's own app parses (the web app accepts
  * `["--port","0","--no-open"]`, which makes a web-shaped composition bindable from a test);
  * `overlayPath` is an extra patch layer applied over the profile's, which is how the test keeps the
- * plugin's own status call off the network.
+ * plugin's own status call off the network and how it can mount a deliberately failing probe.
  */
 
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { activateClientEntries } from './dsh-client-activation.mjs';
+import { bootPage, findBrowser } from './dsh-page-boot.mjs';
 
 const REPORT_PREFIX = 'W2M-LOADER-REPORT:';
 
@@ -85,7 +103,24 @@ const record = ({ name, type, args }) => {
 };
 
 /** Fiber states, by the numbers cordis uses. */
-const STATE = { 0: 'pending', 1: 'loading', 2: 'active', 3: 'failed' };
+const STATE = { 0: 'pending', 1: 'loading', 2: 'active', 3: 'failed', 4: 'disposed', 5: 'unloading' };
+
+/** Every stage the driver reached, mirrored to stderr as it happens. */
+const stages = [];
+
+/**
+ * Mark one stage.
+ *
+ * A stage line goes to stderr immediately, so a run that dies or hangs still says how far it got;
+ * the same list travels in the report, so a failing assertion can say which step it belongs to
+ * instead of quoting one long error string.
+ *
+ * @param {string} name - the stage.
+ */
+function stage(name) {
+  stages.push(name);
+  process.stderr.write(`w2m-loader-driver: [stage] ${name}\n`);
+}
 
 /**
  * Snapshot every entry the Loader keeps, deepest last.
@@ -109,6 +144,39 @@ function entryReport(ctx) {
       error: reason === null ? null : String(reason?.message ?? reason),
     };
   });
+}
+
+/**
+ * Sweep every fiber in the process for a failure, and name the entry each one belongs to.
+ *
+ * The per-entry report above answers "did *this* entry die". This one answers "did anything die",
+ * which is a different and larger question: cordis keeps child fibers under their parent's runtime,
+ * a child failure leaves the parent entry `active`, and the Loader's own `await()` swallows both
+ * import failures and child failures (`Promise.allSettled`). A regression that only kills a child —
+ * the refused fetch route this package shipped in v0.5.4 is exactly that shape — is invisible to
+ * every other field in this report.
+ *
+ * @param {object} ctx - The booted root context.
+ * @returns {object[]} one row per failed fiber.
+ */
+function failedFiberReport(ctx) {
+  const failed = [];
+  for (const runtime of ctx.registry.values()) {
+    for (const fiber of runtime.fibers ?? []) {
+      if (fiber.state !== 3) continue;
+      const reason = fiber.error ?? fiber._error ?? null;
+      const entry = fiber.entry ?? null;
+      failed.push({
+        entry: entry?.options?.id ?? null,
+        id: entry?.options?.name ?? runtime.name ?? null,
+        module: entry?.options?.name ?? null,
+        name: fiber.name ?? runtime.name ?? null,
+        error: reason === null ? '(no error recorded on the fiber)' : String(reason?.message ?? reason),
+        stack: reason instanceof Error && typeof reason.stack === 'string' ? reason.stack.split('\n').slice(0, 4).join('\n') : null,
+      });
+    }
+  }
+  return failed;
 }
 
 /**
@@ -190,6 +258,7 @@ async function targetSelectionReport(ctx) {
 
 let report;
 try {
+  stage('boot the profile through runProfile');
   const { ctx } = await runProfile({
     environment: loadLayeredEnv('dsh'),
     profile,
@@ -197,25 +266,71 @@ try {
     args: appArgs,
   });
   ctx.logger.exporter({ levels: { default: 2 }, export: record });
+  stage('profile booted');
+
+  stage('read the loader entries and sweep every fiber');
+  const entries = entryReport(ctx);
+  const failedFibers = failedFiberReport(ctx);
+
+  stage('read the tools service');
+  const tools = toolReport(ctx);
+
+  stage('read the client composition (host half)');
+  const client = await clientReport(ctx);
+
+  stage('activate the client entries (real module system + Cordis, no browser)');
+  const registry = ctx.get('clientModules');
+  const clientActivation = registry === undefined
+    ? { mounted: [], entries: [], seats: [], skipped: 'the client-modules host half is not in this composition' }
+    : await activateClientEntries({
+        packages,
+        registry,
+        profileDir: path.join(dshHome, 'profiles', profile),
+      });
+
+  stage('boot the page in a headless browser (when one is installed)');
+  const browser = findBrowser();
+  const webServer = ctx.get('webServer');
+  const connection = ctx.get('connection');
+  let clientPage;
+  if (browser.executable === null) {
+    clientPage = { skipped: browser.reason };
+  } else if (webServer === undefined || connection === undefined) {
+    clientPage = { skipped: 'this composition serves no Web app, so there is no page to open' };
+  } else {
+    const rawUrl = `http://127.0.0.1:${String(webServer.port ?? 0)}`;
+    const url = typeof connection.authenticatedUrl === 'function' ? connection.authenticatedUrl(rawUrl) : rawUrl;
+    clientPage = await bootPage({ url, executable: browser.executable });
+  }
+
+  stage('read the composer control’s route from w2m_status');
+  const targetSelection = await targetSelectionReport(ctx);
 
   report = {
     ok: true,
     profile,
     dshHome,
-    entries: entryReport(ctx),
-    tools: toolReport(ctx),
-    client: await clientReport(ctx),
-    targetSelection: await targetSelectionReport(ctx),
+    stages,
+    entries,
+    failedFibers,
+    tools,
+    client,
+    clientActivation,
+    clientPage,
+    targetSelection,
     diagnostics,
   };
 
+  stage('dispose the profile tree');
   await ctx.fiber.dispose();
 } catch (error) {
   report = {
     ok: false,
     profile,
     dshHome,
+    stages,
     error: `${error?.name ?? 'Error'}: ${error?.message ?? String(error)}`,
+    stack: String(error?.stack ?? '').split('\n').slice(0, 8).join('\n'),
     diagnostics,
   };
 }

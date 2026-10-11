@@ -535,7 +535,7 @@ the plugin:
 
 ```bash
 node scripts/check-entrypoints.mjs   # imports lib/tools.js, the exact specifier cordis.patch.yml mounts
-node scripts/verify-installed.mjs <path-to-installed-package>   # asserts the installed copy registers 5 tools
+node scripts/verify-installed.mjs <path-to-installed-package>   # asserts the installed copy registers 8 tools
 ```
 
 **Not verified:**
@@ -587,6 +587,8 @@ node --test --test-force-exit test/e2e.test.mjs   # see note
 Issues and pull requests are welcome. If you change observable behaviour, update
 `PROTOCOL.md` in the same commit — that file is the contract three components
 agree on.
+
+When something does not work, start from the symptom: [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
 ## License
 

@@ -97,6 +97,9 @@ import {
   sessionKeyFor,
   TARGET_ROUTE_PATH,
 } from './fleet-target.mjs';
+// v0.7.0: the LAN hint layer. Imported here and used in exactly one place (`w2m_devices`); see the
+// module header for why a discovered device is a candidate to *ask* and never an authorisation.
+import { createDiscoverySource } from './mdns-discover.mjs';
 import { loadSharedConfig, describeSharedConfig } from './shared-config.mjs';
 import { DEFAULT_DAILY_TIMES, DEFAULT_TIME_ZONE } from './schedule.mjs';
 
@@ -2886,6 +2889,11 @@ export async function apply(ctx, config = {}) {
     resolveToken,
   });
 
+  // The LAN discovery source (v0.7.0). Constructing it binds nothing: a socket is opened only when a
+  // scan is asked for, and only `w2m_devices` asks. A network where multicast is unavailable produces
+  // one log line and an `available: false` block in the answer - never a failure of the tool.
+  const discovery = createDiscoverySource({ logger: ctx.logger });
+
   /** Text output: rendered as JSON, because every one of these tools answers with a structure. */
   const jsonOutput = {
     schema: { type: 'string' },
@@ -2901,11 +2909,21 @@ export async function apply(ctx, config = {}) {
       'List the machines the Rabbit currently holds leases for: machine_id, name, platform, ' +
       'capabilities, and when each was last seen. Read-only. Answers "who is online" without ' +
       'running anything; a machine that is listed may still refuse the next command for a reason ' +
-      'the capability gate will report.',
+      'the capability gate will report. With include_discovered it also reports what mDNS sees on ' +
+      'the LAN in `discovery.candidates` - unverified hints, each marked with whether the relay ' +
+      'lists it, and never a dispatch target on their own.',
     parameters: {
       include_stale: {
         type: 'boolean',
         description: 'Include machines whose lease looks expired rather than only the live ones. Defaults to false.',
+      },
+      include_discovered: {
+        type: 'boolean',
+        default: false,
+        description:
+          'Also scan the LAN over mDNS for about 1.5 s and report discovered candidates under ' +
+          '`discovery`. Each candidate is marked unverified and carries `known_to_relay`; only a ' +
+          'candidate the relay also lists (by machine_id) may be dispatched to. Defaults to false.',
       },
     },
     output: jsonOutput,
@@ -2950,6 +2968,22 @@ export async function apply(ctx, config = {}) {
       const includeStale = args?.include_stale === true;
       const listed = fleet.records.filter((machine) => includeStale || String(machine?.state ?? 'online') !== 'expired');
 
+      // The LAN hint layer. `include_discovered` runs one bounded scan; without it the block reports
+      // the *last* scan's candidates against this call's roster, so a model that already paid for a
+      // scan does not have to pay for it twice. Either way the candidates are described by
+      // `mdns-discover.mjs`, which is where "discovered but not relay-listed is not a target" lives.
+      const discoveryRequested = args?.include_discovered === true;
+      const discoveryBlock = discoveryRequested
+        ? await discovery.scan({
+            signal: exec?.signal,
+            relayRecords: fleet.records,
+            localMachineId: identity.machine_id,
+          })
+        : discovery.describe({ relayRecords: fleet.records, localMachineId: identity.machine_id });
+      // A cancel during the scan window is a cancel, not a partial answer: the signal is our caller's
+      // withdrawal, and the same typed abort every other wait in this file produces is owed to them.
+      if (discoveryRequested) throwIfAborted(exec?.signal);
+
       return JSON.stringify(
         {
           ok: true,
@@ -2968,6 +3002,7 @@ export async function apply(ctx, config = {}) {
             state: machine?.state ?? 'online',
           })),
           excluded_stale: includeStale ? 0 : fleet.records.length - listed.length,
+          discovery: discoveryBlock,
           note:
             'a listed device has paired and is being tracked; it can still refuse the next command ' +
             'at the capability gate, which w2m_wait reports per machine as `refused`',

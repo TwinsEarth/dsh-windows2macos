@@ -47,12 +47,26 @@
  *      package from the shipped `lib/client.js`;
  *   4. the plugin's own `w2m_status` reports `target_selection.attached: true` — the route pair really
  *      is registered on the live `connection.fetch` registry, which is the host-side half of "the
- *      control works".
+ *      control works";
+ *   5. **every fiber in the process is swept for a failure** — not just the entry this file already
+ *      knows about. A failure that lands on a *child* fiber leaves its entry `active`, and cordis
+ *      settles `loader.await()` with `Promise.allSettled`, so nothing else in this file can see it.
+ *      This is defect 3's own shape, and the sweep is the assertion that generalises the other four;
+ *   6. **the client entry activates** — the half this file was missing. Points 3 and 4 can both pass
+ *      while the page cannot boot at all, and that is exactly what v0.5.5 shipped: the row was
+ *      composed from the right bundle, the host answered every question about it, and the bundle's
+ *      `apply` threw the moment the shell tried to activate it, which fails the entry and makes the
+ *      shell refuse the page (`web boot: 1 entry did not activate`). The activation is measured
+ *      twice: through the real client module system and Cordis loader with no browser
+ *      (`test/helpers/dsh-client-activation.mjs`), and — when a Chromium-based browser is installed —
+ *      in a real headless page running the profile's own Web app
+ *      (`test/helpers/dsh-page-boot.mjs`), where `arrived` means this package's stylesheet is in the
+ *      document, which only a completed `apply` can put there.
  *
- * Point 3 is composition, not rendering, and point 4 is registration, not a click: nothing here opens
- * a browser, so "the control appears in the composer and changes the target" remains a GUI
- * observation. What this file rules out is the whole host-side half of that failure — a dead entry, a
- * missing declaration, a route that cannot attach.
+ * Points 3 and 4 are composition and registration; point 6 is activation, and the browser half of it
+ * is still not a *click*: nothing here opens the composer menu or changes a target. What this file
+ * rules out is the whole host-side half of that failure — a dead entry, a missing declaration, a
+ * route that cannot attach — plus the client half that can stop the app from starting at all.
  *
  * # Running it somewhere else
  *
@@ -61,11 +75,15 @@
  * executable when the suite is itself started by the Harness, and finally by walking up from this
  * repository looking for `resources/app.asar`. When no installation is found the tests **skip** and
  * say so: this file is about one host's loader, and pretending to test it without that host would be
- * the same mistake in a new place.
+ * the same mistake in a new place. The browser half skips separately, and says which browsers it
+ * looked for; `W2M_DSH_BROWSER=<path>` names one, `W2M_DSH_BROWSER=none` turns that half off.
  *
  * `W2M_TEST_TARBALL=<path.tgz>` installs an existing tarball instead of packing the tree, which is how
  * the regression was proved in both directions: the same file fails on the v0.5.4 tarball and passes
- * on the fixed tree.
+ * on the fixed tree. `W2M_ROUTE_DEFECT=1` restores v0.5.4's route inside the *installed* copy, which
+ * is the failing direction of the failed-fiber sweep — a child fiber dies while its entry stays
+ * active. `W2M_DSH_BROWSER=<path>` names the browser the page half uses; `W2M_DSH_BROWSER=none` turns
+ * that half off and makes it report a skip.
  */
 
 import assert from 'node:assert/strict';
@@ -122,8 +140,13 @@ const BOOT_TIMEOUT_MS = 180_000;
  * `w2m_status` probes the relay it is configured with, and the shipped config points at the shared
  * server; a loopback port that refuses instantly keeps that call off the network, and
  * `p2pMode: relay` keeps it from binding a UDP socket. Nothing about the loader, the entry, the
- * client half or the route registration depends on either value — which is why this overlay cannot
- * make a broken build look healthy. `config` is replaced wholesale, so every key is carried.
+ * client half, the client activation or the route registration depends on either value — which is why
+ * this overlay cannot make a broken build look healthy. `config` is replaced wholesale, so every key
+ * is carried.
+ *
+ * A profile patch layer *targets* entries; it cannot insert a new row (measured: an unknown id is
+ * reported as `patch: entry "…" not found` and ignored). That is why the failing direction for the
+ * failed-fiber sweep below is injected into the installed copy instead — see {@link ROUTE_DEFECT_ENV}.
  */
 const OVERLAY = `# Written by test/loader-entry.test.mjs: keep the plugin's status call off the network.
 - id: w2m
@@ -136,6 +159,24 @@ const OVERLAY = `# Written by test/loader-entry.test.mjs: keep the plugin's stat
     p2pMode: relay
     stunServers: []
 `;
+
+/**
+ * The switch that restores v0.5.4's route defect in the **installed** copy, for the failing direction
+ * of the failed-fiber sweep.
+ *
+ * v0.5.4 registered `/w2m/target`, and the Connection service mounts its exact-fetch-route registry
+ * under `/api` and refuses any other prefix. The refusal happens inside the injected callback, so it
+ * fails a *child* fiber: the `include:w2m` entry stays `active`, all eight tools still register, and
+ * every per-entry assertion in this file passes. Only the registry-wide sweep can see it, which is
+ * why the sweep exists — and this switch is how that claim is checked rather than asserted:
+ *
+ *   W2M_ROUTE_DEFECT=1 node --test test/loader-entry.test.mjs
+ *
+ * With it set, `sweeps every fiber` must fail naming the child's error, while `leaves the entry
+ * active` and `registers all eight w2m_* tools` still pass. Nothing here depends on the switch: it
+ * edits the throwaway profile's installed copy, never the tree under test.
+ */
+const ROUTE_DEFECT_ENV = 'W2M_ROUTE_DEFECT';
 
 /** The web app's own flags: an OS-chosen port, and no browser launch from a test. */
 const APP_ARGS = ['--port', '0', '--no-open'];
@@ -352,6 +393,24 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
     const overlayPath = path.join(workDir, 'overlay.yml');
     await fsp.writeFile(overlayPath, OVERLAY, 'utf8');
 
+    if (process.env[ROUTE_DEFECT_ENV] === '1') {
+      // Restore v0.5.4's route in the installed copy only: the child fiber that registers it then
+      // fails on `/api`'s fence, while the entry itself stays active.
+      const installedRoute = path.join(
+        profileDir,
+        'node_modules',
+        '@twinsearth',
+        'w2m-dsh-plugin',
+        'src',
+        'plugin',
+        'fleet-target.mjs',
+      );
+      const source = await fsp.readFile(installedRoute, 'utf8');
+      const patched = source.replace("'/api/w2m/target'", "'/w2m/target'");
+      assert.notEqual(patched, source, `${ROUTE_DEFECT_ENV}=1 could not find the route to restore in ${installedRoute}`);
+      await fsp.writeFile(installedRoute, patched, 'utf8');
+    }
+
     const booted = await run(
       installation.runtime,
       [
@@ -447,5 +506,93 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
     if (skipReason !== null) return t.skip(skipReason);
     const failed = report.entries.filter((row) => row.phase === 'failed' && String(row.module).includes(CLIENT_PACKAGE));
     assert.deepEqual(failed, [], `failed entries: ${JSON.stringify(failed)}`);
+  });
+
+  it('reports the stage it reached, so a failure names its cause', (t) => {
+    if (skipReason !== null) return t.skip(skipReason);
+    // The driver prints one line per stage as it goes and carries the list in its report; a run that
+    // dies half-way leaves a truncated list, which is what turns "one opaque error" into a location.
+    assert.ok(Array.isArray(report.stages) && report.stages.length > 0, 'the driver reported no stages');
+    for (const expected of [
+      'profile booted',
+      'read the client composition (host half)',
+      'activate the client entries (real module system + Cordis, no browser)',
+    ]) {
+      assert.ok(report.stages.includes(expected), `the driver never reached "${expected}"; stages: ${report.stages.join(' -> ')}`);
+    }
+  });
+
+  it('sweeps every fiber in the process and finds no failure', (t) => {
+    if (skipReason !== null) return t.skip(skipReason);
+    // The four assertions above read the entry this file already knows about. A failure on a *child*
+    // fiber — defect 3's shape, a route refused inside an injected callback — leaves that entry
+    // `active`, and `loader.await()` cannot see it either: cordis settles its tasks with
+    // `Promise.allSettled`. This sweep is the assertion that generalises them, and it is the only one
+    // here that fails when something *else* in the tree dies.
+    const died = report.failedFibers ?? [];
+    assert.deepEqual(
+      died,
+      [],
+      `failed fibers (state 3): ${died
+        .map((row) => `${row.entry ?? '(no entry)'} / ${row.module ?? row.name ?? '(unnamed)'}: ${row.error}`)
+        .join(' | ')}`,
+    );
+  });
+
+  it('activates the client entry through the real module system and Cordis loader', (t) => {
+    if (skipReason !== null) return t.skip(skipReason);
+    const activation = report.clientActivation;
+    assert.ok(activation !== undefined, 'the driver reported no client activation');
+    assert.equal(activation.skipped, null, `the client activation was not driven: ${String(activation.skipped)}`);
+    assert.deepEqual(
+      activation.mounted,
+      [CLIENT_PACKAGE],
+      'the profile’s own client rows are what this assertion is about',
+    );
+    for (const row of activation.entries) {
+      // v0.5.5 failed here: `failed`, "cannot get property \"locale\" without inject" — composed,
+      // mounted, and dead, which is a page that cannot boot.
+      assert.equal(
+        row.phase,
+        'active',
+        `${String(row.module)} ended ${row.phase} (state ${String(row.state)}): ${row.error ?? '(no error recorded on the fiber)'}`,
+      );
+      assert.equal(row.error, null);
+    }
+    // Activation is not enough on its own: the entry has to have taken its seat in the composer.
+    assert.ok(
+      activation.seats.includes('conversation.input.left'),
+      `the entry activated without registering into the composer: seats ${JSON.stringify(activation.seats)}`,
+    );
+  });
+
+  it('boots the profile’s own page in a browser, and the control arrives', async (t) => {
+    if (skipReason !== null) return t.skip(skipReason);
+    const page = report.clientPage;
+    assert.ok(page !== undefined, 'the driver reported no page boot');
+    if (typeof page.skipped === 'string') {
+      // Loudly, never silently: this half is the only one that runs the shell's real boot, so a
+      // missing browser is a hole in the evidence and the reason travels with it.
+      t.diagnostic(`the real-page half of this file did not run: ${page.skipped}`);
+      return t.skip(page.skipped);
+    }
+    assert.equal(page.bootFailure, null, `the shell refused the page: ${String(page.bootFailure)}`);
+    assert.equal(
+      page.arrived,
+      true,
+      `the control never reached the page (${page.arrivedSelector} absent after ${String(page.settledAfterMs)}ms; ` +
+        `boot overlay: ${String(page.bootOverlay)}; body: ${String(page.bodyText ?? '').slice(0, 300)}; ` +
+        `console errors: ${JSON.stringify(page.consoleErrors ?? [])})`,
+    );
+    // The stylesheet alone says "our apply ran", which the shell checks *before* it accepts the
+    // page. The boot surface going away says every entry activated and the UI mounted, which is the
+    // whole claim: on the v0.5.5 bundle the same measurement left the failure card up
+    // (`Failed to load plugins / @twinsearth/w2m-dsh-plugin / web boot: 1 entry did not activate`).
+    assert.equal(
+      page.bootOverlayGone,
+      true,
+      `the page never finished booting (boot surface still up after ${String(page.settledAfterMs)}ms; ` +
+        `body: ${String(page.bodyText ?? '').slice(0, 300)})`,
+    );
   });
 });

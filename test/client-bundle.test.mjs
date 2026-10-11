@@ -10,23 +10,32 @@
  * materialization would compile, lint, pass `node --test`, and only ever show up as a composer with
  * no control in it.
  *
- * So the bundle is loaded here for real, against a stand-in module loader, and three things are
+ * So the bundle is loaded here for real, against a stand-in module loader, and four things are
  * asserted:
  *
  *   1. **The entry shape is what the module system expects** — one `load()` call, the id equal to
  *      the package name (the boot graph addresses the row by package), and a factory that returns an
  *      object carrying `apply`.
- *   2. **The registration is the seat the task requires** — announced through `slots.inject` on
+ *   2. **The service contract holds** — every Cordis service the mounted body reads is declared in
+ *      the exported `inject`, measured by mounting it behind a context that enforces Cordis's own
+ *      rule (an undeclared service read throws). See "the activation contract" below: that rule is
+ *      what took the whole app down in v0.5.5, and the fake `ctx` that used to live here was
+ *      *more forgiving than the runtime* precisely where the runtime was fatal.
+ *   3. **The registration is the seat the task requires** — announced through `slots.inject` on
  *      `conversation.input.left` and registered there with a unique id and a positive order, so it
  *      lands to the *right* of the shipped permission control rather than competing with it.
- *   3. **The stylesheet is installed once and owned** — a second `apply` in the same document must
+ *   4. **The stylesheet is installed once and owned** — a second `apply` in the same document must
  *      not add a second `<style>`, and the disposer handed to `ctx.effect` must remove the one tag
- *      it added. A control that leaks a stylesheet per reload is a page that slowly rots.
+ *      it added. A control that leaks a stylesheet per page load is a page that slowly rots.
  *
  * React is stubbed and nothing is rendered: the pixels are the GUI observation's business. What this
  * file covers is everything that would stop the control from ever rendering — the entry shape, the
- * seat, the injection contract, and the stylesheet's lifecycle. It is a **bundle-loading test, not a
- * renderer**: no attempt is made to emulate a React tree or a browser.
+ * service contract, the seat, the injection contract, and the stylesheet's lifecycle. It is a
+ * **bundle-loading test, not a renderer**: no attempt is made to emulate a React tree or a browser.
+ *
+ * `W2M_CLIENT_BUNDLE=<path>` points every load at another copy of the bundle — the same file with a
+ * candidate fix, or a preserved release artifact. That is how the assertions below were proved in
+ * both directions (they fail on the v0.5.5 tarball's bundle and pass here).
  */
 
 import assert from 'node:assert/strict';
@@ -38,22 +47,43 @@ import { describe, it } from 'node:test';
 import { TARGET_ROUTE_PATH } from '../src/plugin/fleet-target.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const BUNDLE_PATH = path.join(HERE, '..', 'lib', 'client.js');
+/**
+ * The bundle under test: the tree's own, or the copy `W2M_CLIENT_BUNDLE` names.
+ *
+ * The override exists so the two-direction proof is reproducible without editing the tree: point it
+ * at the bundle extracted from a preserved tarball and the activation assertions below must fail.
+ */
+const BUNDLE_PATH = process.env.W2M_CLIENT_BUNDLE === undefined || process.env.W2M_CLIENT_BUNDLE === ''
+  ? path.join(HERE, '..', 'lib', 'client.js')
+  : path.resolve(process.env.W2M_CLIENT_BUNDLE);
 
 /** The slot the control occupies, and the seat the task forbids it from touching. */
 const SEAT = 'conversation.input.left';
 const FORBIDDEN_SEAT = 'conversation.input.permission';
 
+/** The Cordis members every context has without declaring them (accessors and methods). */
+const CORE_MEMBERS = {
+  effect: (callback) => {
+    const disposer = callback();
+    return typeof disposer === 'function' ? disposer : () => {};
+  },
+  inject: () => ({ then: () => {} }),
+  plugin: () => ({ then: () => {} }),
+  on: () => () => {},
+  get: () => undefined,
+  logger: { error: () => {}, info: () => {}, warn: () => {} },
+};
+
 /**
  * Load `lib/client.js` the way the module system does.
  *
  * The bundle is a **script**, not a module: it registers itself on `window.__ModuleLoader__` and
- * expects `window`, `document`, `require` and `module` to exist. `node:vm` is how a test can run it
- * with exactly those four bindings and no network, instead of the `Function` constructor ESLint
- * (rightly) refuses.
+ * expects `window`, `document`, `require`, `console` and `module` to exist. `node:vm` is how a test
+ * can run it with exactly those bindings and no network, instead of the `Function` constructor
+ * ESLint (rightly) refuses.
  *
  * @param {{document?: object|null, requireImpl?: (specifier: string) => unknown}} [options]
- * @returns {{loads: object[], exports: object, module: object, window: object, document: object|null}}
+ * @returns {{loads: object[], exports: object, module: object, window: object, document: object|null, consoleErrors: string[]}}
  */
 function loadBundle(options = {}) {
   const source = fs.readFileSync(BUNDLE_PATH, 'utf8');
@@ -69,12 +99,100 @@ function loadBundle(options = {}) {
     throw new Error(`the bundle required "${specifier}", which the platform seed table does not hold`);
   });
   const module = { exports: {} };
-  const context = vm.createContext({ window, document: hostDocument, require: requireImpl, module, exports: module.exports });
+  const consoleErrors = [];
+  // The bundle's own diagnostics go to the console at error level; recording them here is how the
+  // "a failure says what happened" assertion below can read them.
+  const hostConsole = {
+    error: (...args) => consoleErrors.push(args.map((value) => (value instanceof Error ? value.message : String(value))).join(' ')),
+    warn: () => {},
+    log: () => {},
+  };
+  const context = vm.createContext({
+    window,
+    document: hostDocument,
+    require: requireImpl,
+    module,
+    exports: module.exports,
+    console: hostConsole,
+  });
   // The filename is only for stack traces; `timeout` bounds a bundle that loops forever.
   vm.runInContext(source, context, { filename: BUNDLE_PATH, timeout: 5_000 });
   assert.equal(loads.length, 1, 'a client bundle must register exactly one factory');
   const exports = loads[0].factory(requireImpl);
-  return { loads, exports, module, window, document: hostDocument };
+  return { loads, exports, module, window, document: hostDocument, consoleErrors };
+}
+
+/**
+ * A context that enforces Cordis's service rule, instead of ignoring it.
+ *
+ * This is the whole lesson of the v0.5.5 outage in one function. A plain object returns `undefined`
+ * for a service the plugin never declared, so **every** fake-`ctx` test in this repository was blind
+ * to the defect by construction: the bundle shipped with `inject = []` while reading `ctx.locale`,
+ * the real context threw `cannot get property "locale" without inject` inside `apply`, the entry
+ * ended `failed`, and the web shell refuses to boot when any entry is not active. The app did not
+ * start, twice.
+ *
+ * So this stand-in is deliberately *stricter* than the runtime in that one place: a read of an
+ * undeclared service throws the runtime's own message. It hands over every declared service, and it
+ * models `ctx.get(name)` as Cordis does — the inject-free lookup that returns `undefined` rather
+ * than throwing, which is what makes an optional carrier (the locale service) safe to read.
+ *
+ * @param {{inject?: string[], services?: object, extra?: object}} [options]
+ * @returns {object} the proxy context.
+ */
+function makeStrictContext(options = {}) {
+  const declared = new Set(options.inject ?? []);
+  const services = options.services ?? {};
+  const target = {
+    ...CORE_MEMBERS,
+    // Cordis's inject-free lookup: no declaration, no throw, `undefined` when absent.
+    get: (name) => services[name],
+    ...options.extra,
+  };
+  return new Proxy(target, {
+    get: (receiver, property) => {
+      if (typeof property === 'symbol' || Reflect.has(receiver, property)) return Reflect.get(receiver, property);
+      if (declared.has(property)) {
+        if (!(property in services)) {
+          throw new Error(`cannot get required service "${property}" in inactive context`);
+        }
+        return services[property];
+      }
+      throw new Error(`cannot get property "${property}" without inject`);
+    },
+  });
+}
+
+/** A slot registry stand-in with the two methods the bundle uses. */
+function makeRegistry() {
+  const announced = [];
+  const registered = [];
+  return {
+    announced,
+    registered,
+    inject(key, callback) {
+      announced.push(key);
+      registered.push(callback());
+      return () => {};
+    },
+    register(options, component) {
+      return { options, component };
+    },
+  };
+}
+
+/** A locale-service stand-in: `register` hands back the unregister disposer, `bind` a translator. */
+function makeLocale(dicts = new Map()) {
+  return {
+    registered: dicts,
+    register(namespace, dictionary) {
+      dicts.set(namespace, dictionary);
+      return () => dicts.delete(namespace);
+    },
+    bind(namespace) {
+      return (key) => Object.values(dicts.get(namespace) ?? {})[0]?.[key] ?? key;
+    },
+  };
 }
 
 /** A React stand-in carrying only what the bundle actually calls. */
@@ -148,7 +266,6 @@ describe('client bundle: the module-system entry', () => {
     // Array.isArray rather than deepEqual: the bundle ran in its own vm realm, where `[]` has that
     // realm's Array prototype and a cross-realm deepEqual would be asserting the wrong thing.
     assert.ok(Array.isArray(exports.inject), 'the plugin declares an inject list');
-    assert.equal(exports.inject.length, 0, 'the control needs no Cordis service');
   });
 
   it('does nothing at all at module scope except register the factory', () => {
@@ -158,6 +275,115 @@ describe('client bundle: the module-system entry', () => {
     const { loads } = loadBundle({ document: fakeDocument });
     assert.equal(loads.length, 1);
     assert.deepEqual(fakeDocument.appended, [], 'style injection belongs to apply(), not the factory');
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// The activation contract
+// ---------------------------------------------------------------------------------------------
+//
+// This block is the one that would have caught v0.5.5 before it shipped, and the one that has to
+// keep failing on the artifact it did ship. Cordis resolves `ctx.<name>` against the fiber's inject
+// list: an undeclared service read *throws*, the entry ends `failed`, and the web shell treats a
+// single failed entry as fatal (`web boot: 1 entry did not activate`) — the app does not start.
+// Measured in a real browser against the shipped 0.5.5 bundle:
+//
+//   w2m-client-probe: apply threw for @twinsearth/w2m-dsh-plugin: cannot get property "locale" without inject
+//   Error: web boot: 1 entry did not activate
+//   @twinsearth/w2m-dsh-plugin: failed
+
+describe('client bundle: the activation contract', () => {
+  it('declares the seat service it reads, and only the services it may require', () => {
+    const { exports } = loadBundle();
+    const declared = [...exports.inject];
+    assert.ok(declared.includes('slots'), 'the control registers into the slot registry, so it must declare it');
+    // `locale` is an *optional* carrier: every declared name is a required dependency, and an entry
+    // waiting on a service the composition does not provide never activates either — the audit
+    // reports it as `pending`, which is just as fatal as `failed`. It is read with `ctx.get`.
+    assert.equal(declared.includes('locale'), false, 'an optional carrier must not become a required dependency');
+  });
+
+  it('mounts behind a context that enforces the inject rule, with the services it declares', () => {
+    const { exports } = loadBundle();
+    const registry = makeRegistry();
+    const locale = makeLocale();
+    const ctx = makeStrictContext({
+      inject: [...exports.inject],
+      services: { slots: registry, locale },
+    });
+    assert.doesNotThrow(
+      () => exports.apply(ctx),
+      'an undeclared service read throws in Cordis and takes the whole app down; the bundle must read only what it declares',
+    );
+    assert.deepEqual(registry.announced, [SEAT], 'the entry still has to take its seat');
+    assert.equal(registry.registered.length, 1);
+    assert.equal(locale.registered.has('w2m.target'), true, 'the dictionaries go to the locale service when there is one');
+  });
+
+  it('mounts without a locale service at all, and says which strings it falls back to', () => {
+    const { exports } = loadBundle();
+    const registry = makeRegistry();
+    const ctx = makeStrictContext({ inject: [...exports.inject], services: { slots: registry } });
+    assert.doesNotThrow(() => exports.apply(ctx), 'a composition without a locale service must still get the control');
+    const injected = registry.registered[0].options.inject('sess-1');
+    assert.equal(injected.t('all'), '全部机器', 'the built-in dictionary is the fallback');
+    // With no locale service, the registration waits on a child fiber rather than blocking the entry.
+    assert.equal(typeof ctx.inject, 'function');
+  });
+
+  it('reads the optional locale service without the inject requirement', () => {
+    const { exports } = loadBundle();
+    const registry = makeRegistry();
+    const lookups = [];
+    const locale = makeLocale();
+    const ctx = makeStrictContext({
+      inject: [...exports.inject],
+      services: { slots: registry, locale },
+      extra: {
+        get: (name) => {
+          lookups.push(name);
+          return name === 'locale' ? locale : undefined;
+        },
+      },
+    });
+    exports.apply(ctx);
+    assert.ok(lookups.includes('locale'), 'the optional carrier is read with ctx.get(name), never as ctx.locale');
+  });
+
+  it('is a no-op, not a throw, when the context has no slot registry', () => {
+    // The seat is the one thing this control cannot work without. A context that offers no registry
+    // must cost the operator the control, never the page: an uncaught throw here fails the entry,
+    // and one failed entry is fatal to the whole web boot.
+    const { exports, consoleErrors } = loadBundle();
+    const effects = [];
+    const ctx = { effect: (callback) => effects.push(callback), get: () => undefined };
+    assert.doesNotThrow(() => exports.apply(ctx));
+    assert.equal(effects.length, 0, 'nothing to own when nothing was mounted');
+    assert.equal(consoleErrors.length, 1, 'the skipped control is stated, not swallowed');
+    assert.match(consoleErrors[0], /@twinsearth\/w2m-dsh-plugin/);
+    assert.match(consoleErrors[0], /no slot registry/);
+  });
+
+  it('reports a failed activation with its cause, and still fails', () => {
+    // The shell's audit prints the entry's name and the word "failed" and nothing else, so the cause
+    // has to travel on the renderer console — the error-level channel the desktop crash log already
+    // captures. Swallowing the error instead would boot a healthy-looking page with no control.
+    const { exports, consoleErrors } = loadBundle();
+    const broken = makeStrictContext({
+      inject: [...exports.inject],
+      services: {
+        slots: {
+          inject: () => {
+            throw new Error('the seat refused the entry');
+          },
+          register: () => ({}),
+        },
+      },
+    });
+    assert.throws(() => exports.apply(broken), /the seat refused the entry/);
+    assert.equal(consoleErrors.length, 1);
+    assert.match(consoleErrors[0], /@twinsearth\/w2m-dsh-plugin/);
+    assert.match(consoleErrors[0], /the seat refused the entry/);
   });
 });
 
