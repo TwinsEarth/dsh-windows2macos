@@ -6,6 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.5.4] — 2026-10-11
 
+> **DO NOT INSTALL 0.5.4.** It fails to load in the Harness: the loader entry
+> include:@twinsearth/w2m-dsh-plugin/tools reports iberPhase: failed, so **all eight tools
+> disappear** and the client half never registers. The package verifies in isolation
+> (scripts/verify-installed.mjs reports 8 tools registered) and its exports map is complete, so the
+> failure is in the real loader path -- the newly declared dsh.client half being composed there, with
+> lib/client.js being browser code that has no window under a host-side load. That cause is a
+> hypothesis, not a measurement; the loader's own error is still to be read. 0.5.5 fixes it and adds the
+> test that should have caught it: **load the packed artifact through the real loader path**, which is
+> the step this release skipped. The tag and the npm version stay as published history; they are simply
+> not installable.
+
+
 ### Added
 
 * **A dispatch-target control inside the chat composer.** A client half registers into
