@@ -70,6 +70,24 @@ jobs:
         # run if this workflow stops covering every suite `package.json#scripts.test` declares.
         run: npm run test:e2e
 
+      # PACK BEFORE THE PRE-FLIGHT, NOT AFTER IT.
+      #
+      # This step used to sit below the pre-flight, and the pre-flight is RED without it on a fresh
+      # checkout: the declared-suite check classifies every skip, `test/claims.test.mjs`'s three assertions
+      # about the packed tree skip when `dist/` holds no tarball, and `dist/` is gitignored -- so a fresh
+      # checkout has none. Measured by moving `dist/` aside: "10 pass, 1 fail, 1 unverifiable -- RED",
+      # naming `no dist/ in this checkout: the packed tree was not verified here`. The same run is green on
+      # a developer machine only because `dist/` still holds a tarball from an earlier pack.
+      #
+      # The answer is to pack, not to accept the skip: an ACCEPTED_SKIPS entry for "no dist/ in this
+      # checkout" would trade three real assertions about the artifact users install for a green light.
+      # `scripts/pack.mjs` is the same deterministic packer the pre-flight's own packed-tarball check runs
+      # on the same sources, and it imports nothing outside `node:` builtins, so this needs no install.
+      - name: Pack before the pre-flight (its packed-tree assertions measure this tarball)
+        run: |
+          set -euo pipefail
+          node scripts/pack.mjs --out dist
+
       - name: Release pre-flight (the same gate a human runs, exit 1 is RED)
         # THE RELEASE GATE IS ONE COMMAND, AND IT IS THE SAME COMMAND A HUMAN RUNS.
         #
@@ -89,12 +107,19 @@ jobs:
         # the *tree* (documents, entry points, the whole manifest, forbidden paths, the eight tools
         # from the packed copy); the claims suite -- where zero executed claims is a FAIL; and the
         # CHANGELOG's shape.
+        #
+        # The pack step above is part of this gate rather than a preparation for publishing: without it
+        # the three packed-tree assertions in `test/claims.test.mjs` skip, and a skip whose reason is not
+        # on ACCEPTED_SKIPS is a FAIL. It also repacks `dist/` itself (and asserts that two independent
+        # packs of the tree are byte-identical), so the tarball the steps below publish is the one this
+        # gate measured.
         run: node scripts/preflight.mjs
 
-      - name: Pack
+      - name: Checksums for the published assets
+        # Computed here rather than beside the pack above, so SHA256SUMS describes the bytes the
+        # pre-flight left in `dist/` -- the ones the steps below unpack, verify and publish.
         run: |
           set -euo pipefail
-          node scripts/pack.mjs --out dist
           cd dist
           sha256sum *.tgz > SHA256SUMS
           cat SHA256SUMS

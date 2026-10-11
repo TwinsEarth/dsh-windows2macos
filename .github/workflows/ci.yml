@@ -130,6 +130,27 @@ jobs:
         shell: bash
         run: node scripts/verify-installed.mjs "$(pwd)"
 
+      # THE DEV TOOLING IS HERE BECAUSE ONE DECLARED SUITE READS IT, not because anything above needs it.
+      #
+      # `test/claims.test.mjs` asserts that every artifact `GATE_INVENTORY` in `scripts/preflight.mjs`
+      # names is present in the tree -- that is the check which catches a gate deleted from the pre-flight
+      # -- and the first row of that inventory is the eslint entry point at
+      # `node_modules/eslint/bin/eslint.js`. With no `node_modules/`, that assertion fails with
+      # "the inventory names files that are not in the tree: eslint entry point
+      # (node_modules/eslint/bin/eslint.js)", which says nothing about the code under test. Measured by
+      # running `npm test` in a clone of this commit with no `node_modules/`: it is a property of the
+      # checkout rather than of the runner, so it fails every leg the same way.
+      #
+      # Why not the alternatives: a hand-listed suite subset is what v0.6.0 deleted (and the pre-flight
+      # refuses one), and narrowing or dropping the claims assertion would remove the check that notices a
+      # gate which stopped being measured. So the job gives the declared suite what it needs.
+      #
+      # Same flags as the `lint` job above and the `preflight` job below: this project commits no lockfile
+      # on purpose, so `npm install` and not `npm ci`. Nothing here is a runtime dependency; the published
+      # package still declares `"dependencies": {}`.
+      - name: Install dev tooling (a declared suite reads the gate inventory)
+        run: npm install --no-audit --no-fund
+
       - name: Unit and release suites (package.json#scripts.test, via npm test)
         # THE LIST IS NOT HERE ON PURPOSE. It used to be: twenty-three paths, hand-maintained,
         # and stale -- six suites that exist, are named by `scripts.test`, and pass on a developer's
@@ -275,6 +296,30 @@ jobs:
           git config --global user.email "ci@example.invalid"
           git config --global init.defaultBranch main
           git config --global core.autocrlf false
+
+      # PACK BEFORE THE PRE-FLIGHT, NOT AFTER IT.
+      #
+      # Without this step the pre-flight is RED on a fresh checkout, and on a developer machine it looked
+      # green only because `dist/` still held a tarball from an earlier pack -- the "it works here" this
+      # gate exists to refuse.
+      #
+      # WHY: the pre-flight's declared-suite check reads the TAP capture of every suite and classifies each
+      # skip -- an assertion that did not run is a hole, and a skip whose reason is not on ACCEPTED_SKIPS is
+      # a FAIL. `test/claims.test.mjs` holds three assertions about the *packed* tree (the tarball in
+      # `dist/` carries nothing forbidden, the packed manifest is the tree's manifest field for field, and
+      # every declared document ships), and each of them skips when `dist/` holds no tarball. `dist/` is
+      # gitignored, so a fresh checkout has none; measured by moving `dist/` aside, the run comes back
+      # "10 pass, 1 fail, 1 unverifiable -- RED" naming `no dist/ in this checkout: the packed tree was not
+      # verified here`.
+      #
+      # That skip is honest, but its reason is not one this repository has agreed to accept, and the answer
+      # is not to accept it: adding it to ACCEPTED_SKIPS would trade three real assertions about the
+      # artifact users install for a green light. Packing first is what lets the real check run. It is the
+      # same deterministic packer, on the same sources, that the pre-flight's own packed-tarball check
+      # runs, so this is a precondition rather than a second, weaker path to the same verdict -- and it
+      # needs no `npm install`, because scripts/pack.mjs imports nothing outside `node:` builtins.
+      - name: Pack (the tarball the pre-flight's packed-tree assertions measure)
+        run: node scripts/pack.mjs --out dist
 
       - name: Pre-flight (exit 1 is RED, do not bump)
         run: node scripts/preflight.mjs
