@@ -1,0 +1,753 @@
+/**
+ * Unit tests for the composer's target-machine control, host half (`src/plugin/fleet-target.mjs`)
+ * and its dispatch wiring in `src/plugin/tools.mjs`.
+ *
+ * # What these tests cover
+ *
+ * Three claims, and they are the three that would make the feature a lie if they broke:
+ *
+ *   1. **The roster is the relay's**, with the relay's liveness per machine — not a list this
+ *      package keeps. `GET /v1/devices` is the only source, and a machine the relay does not call
+ *      reachable is reported as unselectable rather than hidden or assumed good.
+ *   2. **The selection is per session and survives** what a re-render does to the browser: it lives
+ *      in the host process, keyed by session id, and a read after a write returns it.
+ *   3. **The selection reaches the dispatch path, and only when the caller named nothing.**
+ *      `w2m_run` sends `target_machines: [id]` for replicate/split/pipeline and
+ *      `executor_machine_id: id` for broadcast, an explicit `executor_machine_id` wins, and a
+ *      dispatch belonging to another session is untouched.
+ *
+ * The relay calls are stubbed at `globalThis.fetch` (the same harness shape `test/tools.test.mjs`
+ * uses), so these tests assert the exact bytes this plugin would put on the wire.
+ */
+
+import assert from 'node:assert/strict';
+import { promises as fs } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { after, beforeEach, describe, it } from 'node:test';
+
+import * as plugin from '../src/plugin/tools.mjs';
+import {
+  MAX_SELECTIONS,
+  NO_SESSION,
+  TARGET_ROUTE_PATH,
+  buildUiState,
+  createLocalIdentity,
+  createSelectionStore,
+  defaultSelectionStore,
+  describeTargetMachine,
+  dispatchSelectionFields,
+  isSelectableDevice,
+  parseSelectionWrite,
+  readFleet,
+  registerTargetRoutes,
+  sessionKeyFor,
+} from '../src/plugin/fleet-target.mjs';
+
+const RABBIT = 'http://127.0.0.1:8787';
+const OPERATOR_TOKEN = 'opr-test-xyz';
+const LOCAL_MACHINE_ID = 'e94f1ce8-124d-43ee-872a-7dcc7d8b1ef6';
+const REMOTE_MACHINE_ID = '71f0dd07-e957-4889-bf82-319a0d6b434a';
+
+const PAIRED_DEVICE = {
+  machine_id: LOCAL_MACHINE_ID,
+  machine_name: 'win-desktop',
+  device_token: 'dev-test-abc',
+  rabbit_url: RABBIT,
+};
+
+/** The fleet `GET /v1/devices` answers with: two live machines and one expired lease. */
+const DEVICES_BODY = {
+  protocol_version: 1,
+  rabbit_time: '2026-10-11T04:16:52Z',
+  devices: [
+    {
+      machine_id: LOCAL_MACHINE_ID,
+      machine_name: 'win-desktop',
+      os: 'windows',
+      state: 'online',
+      last_seen: '2026-10-11T04:16:52Z',
+    },
+    {
+      machine_id: REMOTE_MACHINE_ID,
+      machine_name: 'macmini',
+      os: 'macos',
+      state: 'online',
+      last_seen: '2026-10-10T18:01:40Z',
+    },
+    {
+      machine_id: '1c14d7d2-d9e2-43dd-a7e5-eda98f4864bc',
+      machine_name: 'jp-shared',
+      os: 'linux',
+      state: 'expired',
+      last_seen: '2026-10-09T00:00:00Z',
+    },
+  ],
+};
+
+// ---------------------------------------------------------------------------------------------
+// Harness
+// ---------------------------------------------------------------------------------------------
+
+const cleanup = [];
+after(async () => {
+  for (const entry of cleanup) await fs.rm(entry, { recursive: true, force: true }).catch(() => {});
+});
+
+/** Every test starts from "nothing is selected": the store is process-global by design. */
+beforeEach(() => {
+  defaultSelectionStore.clearAll();
+});
+
+/**
+ * Install a routing `fetch` for one test, recording every call.
+ *
+ * @param {Array<{method?: string, path: string, status?: number, body?: unknown, text?: string,
+ *                contentType?: string}>} routes
+ * @returns {{calls: Array<{method: string, url: string, path: string, headers: object, body: unknown}>, restore: () => void}}
+ */
+function installFetch(routes) {
+  const calls = [];
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async (input, init = {}) => {
+    const url = typeof input === 'string' ? input : (input?.url ?? String(input));
+    const method = String(init.method ?? 'GET').toUpperCase();
+    const parsed = new URL(url);
+    calls.push({
+      method,
+      url,
+      path: parsed.pathname,
+      search: parsed.search,
+      headers: init.headers ?? {},
+      body: init.body === undefined || init.body === null ? null : JSON.parse(String(init.body)),
+    });
+    const route = routes.find(
+      (candidate) => candidate.path === parsed.pathname && String(candidate.method ?? 'GET').toUpperCase() === method,
+    );
+    if (!route) throw new Error(`test route missing: ${method} ${parsed.pathname}`);
+    const status = route.status ?? 200;
+    const text = route.text ?? JSON.stringify(route.body ?? {});
+    return new Response(text, {
+      status,
+      headers: { 'content-type': route.contentType ?? 'application/json' },
+    });
+  };
+  return {
+    calls,
+    restore: () => {
+      globalThis.fetch = previousFetch;
+    },
+  };
+}
+
+/** A throwaway state directory holding `device.json`. */
+async function makeStateDir(device) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'w2m-target-test-'));
+  cleanup.push(dir);
+  if (device) await fs.writeFile(path.join(dir, 'device.json'), JSON.stringify(device, null, 2), 'utf8');
+  return dir;
+}
+
+/** A non-repo directory: `w2m_run` still dispatches, it just has no anchors to send. */
+async function makeNonRepoDir() {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'w2m-target-nonrepo-'));
+  cleanup.push(dir);
+  return dir;
+}
+
+/**
+ * A fake `ctx` carrying the services this plugin injects, plus an optional fetch-route registry.
+ *
+ * @param {{withRoutes?: boolean}} [options]
+ * @returns {{ctx: object, tools: Map<string, object>, routes: object[], warnings: string[]}}
+ */
+function makeCtx(options = {}) {
+  const tools = new Map();
+  const warnings = [];
+  const routes = [];
+  const ctx = {
+    tools: {
+      register(definition) {
+        assert.ok(definition && typeof definition.name === 'string', 'register() needs a named definition');
+        assert.ok(!tools.has(definition.name), `tool \`${definition.name}\` registered twice`);
+        tools.set(definition.name, definition);
+        return definition;
+      },
+    },
+    logger: { warn: (message) => warnings.push(String(message)), info: () => {} },
+  };
+  if (options.withRoutes === true) {
+    ctx.connection = { fetch: { register: (route) => routes.push(route) } };
+  }
+  return { ctx, tools, routes, warnings };
+}
+
+/**
+ * Register the plugin and hand back its tools.
+ *
+ * `p2pMode: 'relay'` keeps the direct path out of the call list, exactly as `test/tools.test.mjs`
+ * does and for the same reason: a node that starts fires its own announcement through the same
+ * helper every other call uses.
+ *
+ * @param {object} [config]
+ * @param {{withRoutes?: boolean}} [options]
+ * @returns {Promise<{tools: Map<string, object>, routes: object[], warnings: string[]}>}
+ */
+async function register(config = {}, options = {}) {
+  const { ctx, tools, routes, warnings } = makeCtx(options);
+  await plugin.apply(ctx, { p2pMode: 'relay', ...config });
+  return { tools, routes, warnings };
+}
+
+/** The plugin config a dispatch test needs, pointed at a throwaway state and project directory. */
+async function runConfig(overrides = {}) {
+  return {
+    rabbitUrl: RABBIT,
+    stateDir: await makeStateDir(PAIRED_DEVICE),
+    projectDir: await makeNonRepoDir(),
+    machineName: 'win-desktop',
+    operatorToken: OPERATOR_TOKEN,
+    ...overrides,
+  };
+}
+
+/** Valid `w2m_run` arguments, minus the fields a test varies. */
+function runArgs(overrides = {}) {
+  return { command_argv: ['node', '--test'], ...overrides };
+}
+
+/** A tool execution context carrying a session, as DSH provides one. */
+function execFor(sessionId) {
+  return sessionId === undefined ? {} : { agent: { session: { id: sessionId } } };
+}
+
+// ---------------------------------------------------------------------------------------------
+// The roster is the relay's
+// ---------------------------------------------------------------------------------------------
+
+describe('fleet-target: the roster comes from the relay', () => {
+  it('reads GET /v1/devices with the device token and describes every machine the relay lists', async () => {
+    const fetchStub = installFetch([{ path: '/v1/devices', body: DEVICES_BODY }]);
+    try {
+      const fleet = await readFleet({
+        rabbitUrl: RABBIT,
+        token: 'dev-test-abc',
+        localMachineId: LOCAL_MACHINE_ID,
+        request: async (options) => {
+          const url = new URL(`${options.rabbitUrl}${options.pathname}`);
+          for (const [key, value] of Object.entries(options.query ?? {})) url.searchParams.set(key, String(value));
+          const response = await globalThis.fetch(url, {
+            method: options.method ?? 'GET',
+            headers: options.token ? { authorization: `Bearer ${options.token}` } : {},
+          });
+          return { ok: response.ok, status: response.status, json: await response.json() };
+        },
+      });
+      assert.equal(fetchStub.calls.length, 1, 'one read, not one per machine');
+      assert.equal(fetchStub.calls[0].method, 'GET');
+      assert.equal(fetchStub.calls[0].path, '/v1/devices');
+      assert.equal(fleet.total, 3);
+      assert.deepEqual(fleet.machines.map((machine) => machine.name), ['win-desktop', 'macmini', 'jp-shared']);
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('marks liveness per machine and marks this machine as local', async () => {
+    const fleet = await readFleet({
+      rabbitUrl: RABBIT,
+      token: 'dev-test-abc',
+      localMachineId: LOCAL_MACHINE_ID,
+      request: async (options) => {
+        assert.equal(options.pathname, '/v1/devices');
+        assert.equal(options.token, 'dev-test-abc');
+        return { ok: true, status: 200, json: DEVICES_BODY };
+      },
+    });
+    assert.equal(fleet.ok, true);
+    assert.equal(fleet.total, 3);
+    assert.equal(fleet.online, 2);
+    assert.equal(fleet.excluded, 1, 'the expired lease is counted, not hidden');
+    assert.equal(fleet.rabbit_time, '2026-10-11T04:16:52Z');
+    const local = fleet.machines.find((machine) => machine.machine_id === LOCAL_MACHINE_ID);
+    assert.equal(local.local, true, 'this machine is the one whose composer this is');
+    assert.equal(local.online, true);
+    const expired = fleet.machines.find((machine) => machine.machine_id === '1c14d7d2-d9e2-43dd-a7e5-eda98f4864bc');
+    assert.equal(expired.online, false, 'an expired lease is not selectable');
+    assert.equal(expired.state, 'expired');
+  });
+
+  it('reports a relay refusal as a value instead of throwing', async () => {
+    const fleet = await readFleet({
+      rabbitUrl: RABBIT,
+      request: async () => ({ ok: false, status: 401, error: { code: 'UNAUTHORIZED', message: 'no device token' } }),
+    });
+    assert.equal(fleet.ok, false);
+    assert.equal(fleet.status, 401);
+    assert.match(fleet.error, /HTTP 401 \(UNAUTHORIZED: no device token\)/);
+    assert.deepEqual(fleet.machines, []);
+  });
+
+  it('treats an unknown liveness field as NOT online', () => {
+    assert.equal(isSelectableDevice({ state: 'online' }), true);
+    assert.equal(isSelectableDevice({ state: 'expired' }), false);
+    assert.equal(isSelectableDevice({ online: false, state: 'online' }), false, 'the boolean measurement wins');
+    assert.equal(isSelectableDevice({}), false, '"unknown" is not "reachable"');
+    assert.equal(isSelectableDevice(null), false);
+  });
+
+  it('names an unnamed machine by its id rather than inventing a label', () => {
+    const described = describeTargetMachine({ machine_id: 'abc', state: 'online' }, null);
+    assert.equal(described.name, null);
+    assert.equal(described.machine_id, 'abc');
+    assert.equal(described.local, false);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// The selection store
+// ---------------------------------------------------------------------------------------------
+
+describe('fleet-target: the selection is per session and survives', () => {
+  it('keeps one target per session and reports a session that has none', () => {
+    const store = createSelectionStore({ now: () => 1000 });
+    assert.equal(store.get('s1'), null);
+    store.set('s1', { machine_id: 'm1', machine_name: 'macmini' }, { selectedBy: 'win-desktop' });
+    store.set('s2', { machine_id: 'm2', machine_name: 'jp-shared' }, {});
+    assert.deepEqual(store.get('s1'), {
+      machine_id: 'm1',
+      machine_name: 'macmini',
+      selected_at: 1000,
+      selected_by: 'win-desktop',
+    });
+    assert.equal(store.get('s2').machine_id, 'm2');
+    assert.equal(store.get('s1').machine_id, 'm1', 'one session cannot overwrite another');
+  });
+
+  it('replaces rather than accumulates when a session picks again', () => {
+    const store = createSelectionStore({ now: () => 1 });
+    store.set('s1', { machine_id: 'm1' }, {});
+    store.set('s1', { machine_id: 'm2' }, {});
+    assert.equal(store.size, 1);
+    assert.equal(store.get('s1').machine_id, 'm2');
+  });
+
+  it('clears a selection, which is what puts the whole fleet back in play', () => {
+    const store = createSelectionStore();
+    store.set('s1', { machine_id: 'm1' }, {});
+    assert.equal(store.clear('s1'), true);
+    assert.equal(store.get('s1'), null);
+    assert.equal(store.clear('s1'), false, 'clearing twice is not an error, it is just nothing left to do');
+  });
+
+  it('evicts the least recently chosen session, not an arbitrary one', () => {
+    const store = createSelectionStore({ now: () => 5, max: 2 });
+    store.set('a', { machine_id: 'm1' }, {});
+    store.set('b', { machine_id: 'm2' }, {});
+    store.set('a', { machine_id: 'm3' }, {});
+    store.set('c', { machine_id: 'm4' }, {});
+    assert.deepEqual(store.list().map((entry) => entry.session_id), ['a', 'c']);
+    assert.equal(store.get('b'), null, 'b was the least recently chosen');
+  });
+
+  it('has a default cap so a long-lived process cannot grow one entry per session forever', () => {
+    assert.ok(MAX_SELECTIONS >= 64, 'a session count imagined as "tens" must fit');
+    const store = createSelectionStore();
+    for (let i = 0; i < MAX_SELECTIONS + 5; i += 1) store.set(`s${i}`, { machine_id: `m${i}` }, {});
+    assert.equal(store.size, MAX_SELECTIONS);
+    assert.equal(store.get('s0'), null);
+    assert.equal(store.get(`s${MAX_SELECTIONS + 4}`).machine_id, `m${MAX_SELECTIONS + 4}`);
+  });
+
+  it('resolves a session id from the tool execution context, with one named bucket for "none"', () => {
+    assert.equal(sessionKeyFor({ agent: { session: { id: 'sess-1' } } }), 'sess-1');
+    assert.equal(sessionKeyFor({ agent: { session: { header: { id: 'sess-2' } } } }), 'sess-2');
+    assert.equal(sessionKeyFor({}), NO_SESSION);
+    assert.equal(sessionKeyFor(undefined), NO_SESSION);
+    assert.equal(sessionKeyFor({ agent: { session: { id: '' } } }), NO_SESSION);
+  });
+
+  it('memoizes a resolved identity but retries an unresolved one', async () => {
+    let reads = 0;
+    const identity = createLocalIdentity(async () => {
+      reads += 1;
+      return reads === 1
+        ? { machine_id: null, machine_name: null, machineName: 'win-desktop' }
+        : { machine_id: LOCAL_MACHINE_ID, machine_name: 'win-desktop' };
+    });
+    const first = await identity();
+    assert.equal(first.machine_id, null);
+    assert.equal(first.machine_name, 'win-desktop', 'the configured name stands in until pairing');
+    const second = await identity();
+    assert.equal(second.machine_id, LOCAL_MACHINE_ID, 'pairing during the process lifetime must take effect');
+    await identity();
+    assert.equal(reads, 2, 'a resolved identity is read once');
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Mapping a selection onto the dispatch
+// ---------------------------------------------------------------------------------------------
+
+describe('fleet-target: a selection becomes the dispatch fields the relay already accepts', () => {
+  const selection = { machine_id: 'm1', machine_name: 'macmini' };
+
+  it('narrows the targets for the modes that fan out', () => {
+    for (const mode of ['replicate', 'split', 'pipeline']) {
+      const routed = dispatchSelectionFields(selection, mode);
+      assert.deepEqual(routed.fields, { target_machines: ['m1'] }, mode);
+      assert.equal(routed.applied_as, 'target_machines');
+    }
+  });
+
+  it('names the executor for broadcast, and does not remove the observers', () => {
+    const routed = dispatchSelectionFields(selection, 'broadcast');
+    assert.deepEqual(routed.fields, { executor_machine_id: 'm1' });
+    assert.equal(routed.applied_as, 'executor_machine_id');
+    assert.equal('target_machines' in routed.fields, false, 'observers stay in the task');
+  });
+
+  it('sends nothing at all when there is no selection', () => {
+    assert.deepEqual(dispatchSelectionFields(null, 'replicate'), { fields: {}, applied_as: null });
+    assert.deepEqual(dispatchSelectionFields(undefined, 'broadcast'), { fields: {}, applied_as: null });
+    assert.deepEqual(dispatchSelectionFields({ machine_id: '' }, 'split'), { fields: {}, applied_as: null });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// The browser-facing route
+// ---------------------------------------------------------------------------------------------
+
+describe('fleet-target: the browser route', () => {
+  /** Build a route pair mounted on a stand-in registry, with a stubbed relay. */
+  function mount(options = {}) {
+    const store = createSelectionStore({ now: () => 4242 });
+    const registered = [];
+    const deps = {
+      cfg: () => ({ rabbitUrl: RABBIT, machineName: 'win-desktop' }),
+      store,
+      localIdentity: async () => ({ machine_id: LOCAL_MACHINE_ID, machine_name: 'win-desktop' }),
+      request: options.request ?? (async () => ({ ok: true, status: 200, json: DEVICES_BODY })),
+      resolveToken: async () => 'dev-test-abc',
+    };
+    const ctx = options.noRegistry === true
+      ? {}
+      : { connection: { fetch: { register: (route) => registered.push(route) } } };
+    const status = registerTargetRoutes(ctx, deps);
+    return { store, registered, status, route: registered[0] ?? null };
+  }
+
+  const url = (search = '') => `http://127.0.0.1:19387${TARGET_ROUTE_PATH}${search}`;
+
+  it('mounts ONE route object for both verbs, because the registry is keyed by path', () => {
+    const { registered, status, route } = mount();
+    assert.equal(status.mounted, true);
+    assert.equal(registered.length, 1, 'a second registration for the same path would be refused by the host');
+    assert.deepEqual(route.methods, ['GET', 'POST']);
+    assert.equal(route.path, TARGET_ROUTE_PATH);
+    assert.equal(route.requestBody, 'buffered');
+  });
+
+  it('answers a GET with the fleet, the selection and the local machine name', async () => {
+    const { store, route } = mount();
+    store.set('sess-1', { machine_id: REMOTE_MACHINE_ID, machine_name: 'macmini' }, {});
+    const response = await route.fetch(new Request(url('?session_id=sess-1')));
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('cache-control'), 'no-store');
+    const state = await response.json();
+    assert.equal(state.session_id, 'sess-1');
+    assert.equal(state.selected.machine_id, REMOTE_MACHINE_ID);
+    assert.equal(state.selected.online, true);
+    assert.equal(state.selected.stale, false);
+    assert.equal(state.fleet.ok, true);
+    assert.equal(state.fleet.online, 2);
+    assert.equal(state.machines.length, 3);
+    assert.equal(state.host.local_machine_name, 'win-desktop');
+    assert.equal(state.host.detail_unavailable, false);
+  });
+
+  it('refuses a GET with no session id rather than answering for nobody', async () => {
+    const { route } = mount();
+    const response = await route.fetch(new Request(url()));
+    assert.equal(response.status, 400);
+    assert.match((await response.json()).error, /session_id/);
+  });
+
+  it('accepts a selection for a machine the relay calls online, and echoes the new state', async () => {
+    const { store, route } = mount();
+    const response = await route.fetch(new Request(url(), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ session_id: 'sess-1', machine_id: REMOTE_MACHINE_ID, machine_name: 'macmini' }),
+    }));
+    assert.equal(response.status, 200);
+    const state = await response.json();
+    assert.equal(state.selected.machine_id, REMOTE_MACHINE_ID);
+    assert.equal(store.get('sess-1').machine_name, 'macmini');
+    assert.equal(store.get('sess-1').selected_by, 'win-desktop');
+  });
+
+  it('refuses a selection for a machine whose lease is not live', async () => {
+    const { store, route } = mount();
+    const response = await route.fetch(new Request(url(), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ session_id: 'sess-1', machine_id: '1c14d7d2-d9e2-43dd-a7e5-eda98f4864bc' }),
+    }));
+    assert.equal(response.status, 409);
+    assert.match((await response.json()).error, /listed as expired/);
+    assert.equal(store.get('sess-1'), null, 'a refused selection must not half-apply');
+  });
+
+  it('clears the selection on a null machine_id, which restores the whole fleet', async () => {
+    const { store, route } = mount();
+    store.set('sess-1', { machine_id: REMOTE_MACHINE_ID }, {});
+    const response = await route.fetch(new Request(url(), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ session_id: 'sess-1', machine_id: null }),
+    }));
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).selected.machine_id, null);
+    assert.equal(store.get('sess-1'), null);
+  });
+
+  it('reports a fleet it cannot read instead of accepting a target against nothing', async () => {
+    const { store, route } = mount({ request: async () => { throw new Error('connect ECONNREFUSED'); } });
+    const write = await route.fetch(new Request(url(), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ session_id: 'sess-1', machine_id: REMOTE_MACHINE_ID }),
+    }));
+    assert.equal(write.status, 503);
+    assert.match((await write.json()).error, /ECONNREFUSED/);
+    assert.equal(store.get('sess-1'), null);
+
+    const read = await route.fetch(new Request(url('?session_id=sess-1')));
+    assert.equal(read.status, 200, 'a read still answers: "the relay is down" is the answer');
+    const state = await read.json();
+    assert.equal(state.fleet.ok, false);
+    assert.equal(state.machines.length, 0);
+    assert.equal(state.selected.online, null, 'not confirmed is not the same as offline');
+  });
+
+  it('keeps the selection visible when the machine it names has left the fleet', async () => {
+    const { store, route } = mount();
+    store.set('sess-1', { machine_id: 'gone-machine', machine_name: 'retired' }, {});
+    const state = await (await route.fetch(new Request(url('?session_id=sess-1')))).json();
+    assert.equal(state.selected.machine_id, 'gone-machine');
+    assert.equal(state.selected.name, 'retired', 'the stored name is the only name left to show');
+    assert.equal(state.selected.stale, true);
+    assert.equal(state.selected.online, false);
+  });
+
+  it('says so, rather than failing to load, when the host has no route registry', async () => {
+    const { status, registered } = mount({ noRegistry: true });
+    assert.equal(status.mounted, false);
+    assert.match(status.reason, /connection\.fetch/);
+    assert.deepEqual(registered, []);
+  });
+
+  it('validates a write body field by field', () => {
+    assert.deepEqual(parseSelectionWrite({ session_id: 's' }), {
+      ok: true,
+      value: { session_id: 's', machine_id: null, machine_name: null },
+    });
+    assert.equal(parseSelectionWrite(null).ok, false);
+    assert.equal(parseSelectionWrite({}).ok, false);
+    assert.equal(parseSelectionWrite({ session_id: '' }).ok, false);
+    assert.equal(parseSelectionWrite({ session_id: 's', machine_id: 7 }).ok, false);
+    assert.equal(parseSelectionWrite({ session_id: 's', machine_name: 7 }).ok, false);
+  });
+
+  it('builds the same snapshot for a session with no selection', () => {
+    const store = createSelectionStore();
+    const state = buildUiState({
+      store,
+      sessionId: 'sess-x',
+      fleet: { ok: true, error: null, machines: [], online: 0, total: 0, rabbit_time: null, excluded: 0 },
+      localMachineName: 'win-desktop',
+      detailUnavailable: true,
+    });
+    assert.equal(state.selected.machine_id, null);
+    assert.equal(state.selected.online, null);
+    assert.equal(state.host.detail_unavailable, true);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// The dispatch path
+// ---------------------------------------------------------------------------------------------
+
+describe('fleet-target: the selection routes w2m_run', () => {
+  /** Register the plugin and run one dispatch, returning the body that reached POST /v1/task. */
+  async function dispatch(overrides = {}, exec = {}) {
+    const fetchStub = installFetch([{ method: 'POST', path: '/v1/task', body: { task_id: 'T1', seq: 1, leases: [] } }]);
+    try {
+      const { tools } = await register(await runConfig());
+      const value = JSON.parse(await tools.get('w2m_run').execute(runArgs(overrides), exec));
+      const call = fetchStub.calls.find((entry) => entry.path === '/v1/task');
+      return { body: call.body, value };
+    } finally {
+      fetchStub.restore();
+    }
+  }
+
+  it('sends no target field at all when nothing is selected', async () => {
+    const { body, value } = await dispatch({}, execFor('sess-1'));
+    assert.equal('target_machines' in body, false);
+    assert.equal('executor_machine_id' in body, false);
+    assert.deepEqual(value.selection, {
+      applied: false,
+      field: null,
+      machine_id: null,
+      machine_name: null,
+      session: 'sess-1',
+    });
+  });
+
+  it('narrows a replicate dispatch to the selected machine and says which field did it', async () => {
+    defaultSelectionStore.set('sess-1', { machine_id: REMOTE_MACHINE_ID, machine_name: 'macmini' }, {});
+    const { body, value } = await dispatch({}, execFor('sess-1'));
+    assert.deepEqual(body.target_machines, [REMOTE_MACHINE_ID]);
+    assert.equal('executor_machine_id' in body, false);
+    assert.equal(value.selection.applied, true);
+    assert.equal(value.selection.field, 'target_machines');
+    assert.equal(value.selection.machine_id, REMOTE_MACHINE_ID);
+    assert.equal(value.selection.session, 'sess-1');
+  });
+
+  it('leaves another session alone', async () => {
+    defaultSelectionStore.set('sess-1', { machine_id: REMOTE_MACHINE_ID }, {});
+    const { body } = await dispatch({}, execFor('sess-2'));
+    assert.equal('target_machines' in body, false, 'a target belongs to the session that chose it');
+    const noSession = await dispatch({}, {});
+    assert.equal('target_machines' in noSession.body, false);
+  });
+
+  it('elects the selected machine under broadcast, where the relay reads the executor field', async () => {
+    defaultSelectionStore.set('sess-1', { machine_id: REMOTE_MACHINE_ID, machine_name: 'macmini' }, {});
+    const { body, value } = await dispatch({ mode: 'broadcast' }, execFor('sess-1'));
+    assert.equal(body.executor_machine_id, REMOTE_MACHINE_ID);
+    assert.equal('target_machines' in body, false, 'the other machines stay as observers');
+    assert.equal(value.selection.field, 'executor_machine_id');
+  });
+
+  it('lets an explicit executor_machine_id win, because a caller that names a machine is not overridden', async () => {
+    defaultSelectionStore.set('sess-1', { machine_id: REMOTE_MACHINE_ID }, {});
+    const { body, value } = await dispatch(
+      { mode: 'broadcast', executor_machine_id: LOCAL_MACHINE_ID },
+      execFor('sess-1'),
+    );
+    assert.equal(body.executor_machine_id, LOCAL_MACHINE_ID);
+    assert.equal(value.selection.applied, false, 'the answer must say the selection did not route this task');
+    assert.equal(value.selection.field, null);
+    assert.equal(value.selection.machine_id, REMOTE_MACHINE_ID, 'the selection is still reported as held');
+  });
+
+  it('carries the selection for split and pipeline too', async () => {
+    defaultSelectionStore.set('sess-1', { machine_id: REMOTE_MACHINE_ID }, {});
+    const split = await dispatch({ mode: 'split', index_total: 2 }, execFor('sess-1'));
+    assert.deepEqual(split.body.target_machines, [REMOTE_MACHINE_ID]);
+    const pipeline = await dispatch({ mode: 'pipeline', command_argv: undefined, stages: ['node --test'] }, execFor('sess-1'));
+    assert.deepEqual(pipeline.body.target_machines, [REMOTE_MACHINE_ID]);
+  });
+
+  it('names the selected machine when the relay says nothing is online', async () => {
+    defaultSelectionStore.set('sess-1', { machine_id: REMOTE_MACHINE_ID, machine_name: 'macmini' }, {});
+    const fetchStub = installFetch([{
+      method: 'POST',
+      path: '/v1/task',
+      status: 409,
+      body: { error: { code: 'NO_ONLINE_DEVICE', message: 'no paired device available for this task' } },
+    }]);
+    try {
+      const { tools } = await register(await runConfig());
+      await assert.rejects(
+        () => tools.get('w2m_run').execute(runArgs(), execFor('sess-1')),
+        (error) => {
+          assert.match(error.message, /selected machine \(macmini\)/);
+          assert.match(error.hint, /clear the composer selection/);
+          return true;
+        },
+      );
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('reports the control as attached on a host that provides the route registry', async () => {
+    const fetchStub = installFetch([
+      { path: '/healthz', body: { rabbit_time: 'now', relay_id: 'r1' } },
+      { path: '/v1/devices', body: DEVICES_BODY },
+    ]);
+    try {
+      const { tools, routes } = await register(await runConfig(), { withRoutes: true });
+      assert.equal(routes.length, 1, 'the control is mounted as one route');
+      const value = JSON.parse(await tools.get('w2m_status').execute({}, {}));
+      assert.equal(value.target_selection.attached, true);
+      assert.equal(value.target_selection.route, TARGET_ROUTE_PATH);
+      assert.equal(value.target_selection.sessions_with_a_target, 0);
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('reports the absence of the registry instead of pretending the control works', async () => {
+    const fetchStub = installFetch([
+      { path: '/healthz', body: { rabbit_time: 'now' } },
+      { path: '/v1/devices', body: DEVICES_BODY },
+    ]);
+    try {
+      const { tools, warnings } = await register(await runConfig());
+      const value = JSON.parse(await tools.get('w2m_status').execute({}, {}));
+      assert.equal(value.target_selection.attached, false);
+      assert.match(value.target_selection.detail, /connection\.fetch/);
+      // `register()` also carries the offline-`defineTool` warning in this repository, so the
+      // assertion is about the *control*, not about the total warning count.
+      assert.deepEqual(
+        warnings.filter((line) => /composer target control/.test(line)),
+        [],
+        'a host with no Connection at all is not a web composition, so it is not a warning',
+      );
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('warns once when a host HAS a Connection service but no fetch registry', async () => {
+    const fetchStub = installFetch([
+      { path: '/healthz', body: { rabbit_time: 'now' } },
+      { path: '/v1/devices', body: DEVICES_BODY },
+    ]);
+    try {
+      // The one case worth a log line: something is there and the control still cannot attach.
+      const { ctx, tools, warnings } = makeCtx();
+      ctx.connection = {};
+      await plugin.apply(ctx, { p2pMode: 'relay', ...(await runConfig()) });
+      const value = JSON.parse(await tools.get('w2m_status').execute({}, {}));
+      assert.equal(value.target_selection.attached, false);
+      const controlWarnings = warnings.filter((line) => /composer target control/.test(line));
+      assert.equal(controlWarnings.length, 1);
+      assert.match(controlWarnings[0], /composer target control is inactive/);
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('keeps w2m_devices listing the relay roster, expired leases included on request', async () => {
+    const fetchStub = installFetch([{ path: '/v1/devices', body: DEVICES_BODY }]);
+    try {
+      const { tools } = await register(await runConfig());
+      const live = JSON.parse(await tools.get('w2m_devices').execute({}, {}));
+      assert.equal(live.count, 2, 'the expired lease is excluded by default');
+      assert.equal(live.excluded_stale, 1);
+      assert.deepEqual(live.devices.map((device) => device.name), ['win-desktop', 'macmini']);
+      const all = JSON.parse(await tools.get('w2m_devices').execute({ include_stale: true }, {}));
+      assert.equal(all.count, 3);
+      assert.equal(all.excluded_stale, 0);
+    } finally {
+      fetchStub.restore();
+    }
+  });
+});

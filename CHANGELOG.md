@@ -4,6 +4,34 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.4] — 2026-10-11
+
+### Added
+
+* **A dispatch-target control inside the chat composer.** A client half registers into
+  `conversation.input.left` — a `list` seat with `replaceRisk: none` — so the control is added *beside*
+  the permission control rather than shadowing it; `conversation.input.permission` is never touched. The
+  roster is the relay's own device list, read through the same helper `w2m_devices` uses, so the tool and
+  the control cannot disagree; a machine the relay does not list as online is shown but not selectable.
+* **The selection means something, and only via fields that already existed.** Picking a machine stores a
+  per-session target that survives a page reload; `w2m_run` maps it onto `target_machines` for
+  replicate/split/pipeline and onto `executor_machine_id` for broadcast, and a caller that names an
+  executor explicitly always wins. No new tool parameter, no protocol change, `envelope_version`
+  untouched. `w2m_status` reports the current target.
+* `lib/client.js` is the shipped browser bundle, written by hand in the runtime's lazy-CJS loader format
+  because this package has no bundler; `dsh.client` and `exports["./client"]` declare it additively.
+
+### Notes
+
+* Verified by test and by a live probe against the real relay: selecting `jp-shared` and dispatching with
+  no executor named produced leases `jp-shared: offered`, the other two `observing`, and a `consistent`
+  verdict from the machine that was selected. **Not verified: how the control renders.** Every client
+  Inspect query timed out for the whole session, so the page is not answering the client inspect channel
+  and the rendered text and position beside the permission control are unconfirmed.
+* **A page refresh cannot show it.** The running Harness composes the client boot graph at startup and
+  serves the plugin from the profile's `node_modules`; the new revision must be installed *and the
+  Harness restarted* before the control appears. The control is therefore in the artifact and not in the
+  running UI, and this entry says so rather than implying otherwise.
 ## [0.5.3] — 2026-10-11
 
 ### Added

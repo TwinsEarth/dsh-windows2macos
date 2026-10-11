@@ -85,6 +85,18 @@ import { parseServer } from '../agent/stun.mjs';
 // the dedupe key exists to prevent.
 import { SHELL_ID_DIRECT, computeCommandHash, computeDedupeKey } from '../relay/state.mjs';
 import { createAutoUpdater, findProfileDir, resolveCurrentVersion } from './auto-update.mjs';
+// v0.6.1: the session's chosen target machine, and the two browser routes the composer control
+// reads it through. Imported rather than inlined because the control and `w2m_run` must agree on
+// what "selected" means, and a second copy of that rule is a second chance to disagree.
+import {
+  createLocalIdentity,
+  defaultSelectionStore,
+  dispatchSelectionFields,
+  readFleet,
+  registerTargetRoutes,
+  sessionKeyFor,
+  TARGET_ROUTE_PATH,
+} from './fleet-target.mjs';
 import { loadSharedConfig, describeSharedConfig } from './shared-config.mjs';
 import { DEFAULT_DAILY_TIMES, DEFAULT_TIME_ZONE } from './schedule.mjs';
 
@@ -2845,6 +2857,32 @@ export async function apply(ctx, config = {}) {
   // still has to dispatch, and `w2m_status` is where the failure is reported.
   const p2p = createP2PRuntime(ctx, cfg, config.p2pBlock);
 
+  /**
+   * This machine's fleet identity, read once per successful resolution.
+   *
+   * The memoization rule lives in {@link createLocalIdentity} so the route half and the tool half
+   * cannot disagree about when a missing identity becomes a stale one.
+   */
+  const localIdentity = createLocalIdentity(async () => {
+    const device = await readDevice({ stateDir: cfg.stateDir });
+    return { machine_id: device.machine_id, machine_name: device.machine_name, machineName: cfg.machineName };
+  });
+
+  // v0.6.1: the two browser routes behind the composer's target control. Additive and optional: a
+  // host without `connection.fetch` still gets every tool, and `w2m_status` reports the absence —
+  // which is the honest place for it, since a host that has no Connection at all is simply not a web
+  // composition and does not need a warning on every headless run.
+  const targetRoutes = registerTargetRoutes(ctx, {
+    cfg: () => cfg,
+    store: defaultSelectionStore,
+    localIdentity,
+    request,
+    resolveToken,
+  });
+  if (targetRoutes.unexpected) {
+    ctx.logger?.warn?.(`w2m: the composer target control is inactive — ${targetRoutes.reason}`);
+  }
+
   /** Text output: rendered as JSON, because every one of these tools answers with a structure. */
   const jsonOutput = {
     schema: { type: 'string' },
@@ -2872,48 +2910,61 @@ export async function apply(ctx, config = {}) {
       throwIfAborted(exec?.signal);
       const base = requireRabbit(cfg);
       const token = await resolveToken(cfg);
-      const result = await request({
+
+      // The read itself, the liveness rule, and "this machine has no identity yet" all come from
+      // the same helper the composer control uses, so the list a model reads and the list an
+      // operator clicks can never disagree about who is online.
+      const identity = await localIdentity();
+      const fleet = await readFleet({
         rabbitUrl: base,
         token,
+        localMachineId: identity.machine_id,
         signal: exec?.signal,
-        pathname: '/v1/devices',
+        request,
       });
-      if (!result.ok) {
-        throw new W2MError('W2M_RABBIT_REFUSED', `W2M_RABBIT_REFUSED: the Rabbit refused GET /v1/devices with HTTP ${result.status}${result.error ? ` (${result.error.code}: ${result.error.message})` : ''}; ${result.status === 401 ? 'this machine is not paired, or its device_token is stal - pair the agent again' : 'check the Rabbit log for the reason it gave'}`, {
-          hint: result.status === 401
-            ? 'this machine is not paired, or its device_token is stale; pair the agent again'
-            : 'check the Rabbit log for the reason it gave',
-        });
+      if (!fleet.ok) {
+        // The typed error is rebuilt here, from the helper's report, so the code, message and hint a
+        // caller sees are the same three it saw before this read moved into `fleet-target.mjs`: the
+        // remediation travels in `hint`, never in the message.
+        const unauthorized = fleet.status === 401;
+        throw new W2MError(
+          unauthorized ? 'W2M_RABBIT_REFUSED' : 'W2M_UNREACHABLE',
+          fleet.status === 0
+            ? `${fleet.error}`
+            : `${fleet.error}; ${unauthorized ? 'this machine is not paired, or its device_token is stale - pair the agent again' : 'check the Rabbit log for the reason it gave'}`,
+          {
+            hint: fleet.hint ?? (unauthorized
+              ? 'this machine is not paired, or its device_token is stale; pair the agent again'
+              : 'check the Rabbit log for the reason it gave'),
+          },
+        );
       }
 
       // `GET /v1/devices` answers `{protocol_version, rabbit_time, devices:[...]}`. Each entry is a
       // device recor - the Rabbit's own lease bookkeeping is on the task, not her - so a device
-      // is described by identity and capabilities, and "online" is the honest default for a device
-      // the Rabbit still lists.
-      const machines = Array.isArray(result.json?.devices)
-        ? result.json.devices
-        : (Array.isArray(result.json?.machines) ? result.json.machines : []);
+      // is described by identity and capabilities, and the relay's own `state` is the honest
+      // default for a device it still lists.
       const includeStale = args?.include_stale === true;
-      const listed = machines.filter((machine) => includeStale || String(machine?.state ?? 'online') !== 'expired');
+      const listed = fleet.records.filter((machine) => includeStale || String(machine?.state ?? 'online') !== 'expired');
 
       return JSON.stringify(
         {
           ok: true,
           protocol_version: PROTOCOL_VERSION,
-          rabbit_time: result.json?.rabbit_time ?? null,
+          rabbit_time: fleet.rabbit_time,
           count: listed.length,
           devices: listed.map((machine) => ({
             machine_id: machine?.machine_id ?? null,
             name: machine?.machine_name ?? machine?.name ?? null,
-            os: machine?.platform?.os ?? null,
-            os_version: machine?.platform?.os_version ?? null,
-            arch: machine?.platform?.arch ?? null,
-            shell: machine?.platform?.shell ?? null,
+            os: machine?.platform?.os ?? machine?.os ?? null,
+            os_version: machine?.platform?.os_version ?? machine?.os_version ?? null,
+            arch: machine?.platform?.arch ?? machine?.arch ?? null,
+            shell: machine?.platform?.shell ?? machine?.shell ?? null,
             caps: machine?.caps ?? null,
             last_seen: machine?.last_seen ?? machine?.last_seen_at ?? null,
             state: machine?.state ?? 'online',
           })),
-          excluded_stale: includeStale ? 0 : machines.length - listed.length,
+          excluded_stale: includeStale ? 0 : fleet.records.length - listed.length,
           note:
             'a listed device has paired and is being tracked; it can still refuse the next command ' +
             'at the capability gate, which w2m_wait reports per machine as `refused`',
@@ -2937,7 +2988,10 @@ export async function apply(ctx, config = {}) {
       'Anchors (base_commit, base_tree) are computed here from this machine\'s working tree so ' +
       'the peers can be checked against them. Under the default p2pMode the offer is also pushed ' +
       'over the direct path, best effort: `direct_pushes` names every attempt, and the relay\'s ' +
-      'own offer remains the delivery when a push fails.',
+      'own offer remains the delivery when a push fails. ' +
+      'A machine selected in the composer for this session narrows the dispatch to that machine; ' +
+      'an explicit `executor_machine_id` always wins over it, and the answer\'s `selection` says ' +
+      'which of the two routed the task.',
     parameters: {
       command_argv: {
         type: 'array',
@@ -3160,6 +3214,34 @@ export async function apply(ctx, config = {}) {
         );
       }
 
+      // -------------------------------------------------------------------------------------------
+      // v0.6.1: the session's chosen target, when the caller named no machine of its own.
+      // -------------------------------------------------------------------------------------------
+      //
+      // The composer control writes a selection into this process, keyed by session; here is where
+      // it becomes real. Read before the payload literal so the routing facts and the answer agree.
+      //
+      // The precedence rule is the whole contract, and it is one line: **the caller's own fields
+      // always win**. `executor_machine_id` is checked below, and `target_machines` is never a tool
+      // argument — so a caller that named a machine (which, for this tool, means
+      // `executor_machine_id` under broadcast) is untouched, and a caller that named none inherits
+      // the selection. Nothing already published changes meaning: the selection only fills fields
+      // that were absent, and the relay has accepted both of them since v0.3.3/v0.4.1.
+      const sessionKey = sessionKeyFor(exec);
+      const selection = defaultSelectionStore.get(sessionKey);
+      const routedBy = dispatchSelectionFields(selection, mode);
+      // broadcast reads the executor field; everything else reads `target_machines`. The relay
+      // ignores the field a mode does not read, and the two are never both set by a selection.
+      const selectionFields = mode === 'broadcast' && executorMachineId !== null
+        ? { fields: {}, applied_as: null }
+        : routedBy.fields;
+      // Whether the selection actually routed THIS task. Reported in the answer, because it is the
+      // one thing an operator cannot recover afterwards: the payload is not in the transcript, and
+      // the same command run twice can legitimately take two different routes.
+      const selectionAppliedAs = mode === 'broadcast' && executorMachineId !== null
+        ? null
+        : routedBy.applied_as;
+
       // Plugin-side allow-list check: only when one is configured. See checkAllowedCommand.
       //
       // **Every** stage is checked, not just the first. Checking only `command_argv` would let a
@@ -3256,6 +3338,10 @@ export async function apply(ctx, config = {}) {
         // Only sent for broadcast; the relay ignores it otherwise, and the validation above already
         // refused the combination, so this cannot silently mean nothing.
         ...(executorMachineId !== null ? { executor_machine_id: executorMachineId } : {}),
+        // v0.6.1: the elected machine, when the caller did not name one and a mode that reads it is
+        // in play. Spread after the caller's own field above so the caller always wins even if a
+        // future edit makes both possible.
+        ...selectionFields,
         // Only for pipeline. The relay ignores `stages` under the other modes and the validation
         // above refuses the combination, so this can never silently mean nothing.
         ...(mode === 'pipeline' && stagesPayload !== null ? { stages: stagesPayload } : {}),
@@ -3279,15 +3365,22 @@ export async function apply(ctx, config = {}) {
         // OPERATOR_REQUIRED gets its own guidance: it is the one refusal whose fix is a client-side
         // setting rather than something on the relay.
         const operatorRequired = result.error?.code === 'OPERATOR_REQUIRED' || result.status === 401;
+        // v0.6.1: when a task was elected to one machine, NO_ONLINE_DEVICE is the *machine* being
+        // unreachable, not the fleet being empty -- and the two have different fixes. Saying so is
+        // the difference between "start an agent" and "the machine you picked went away".
+        const selectedName = selection?.machine_name ?? selection?.machine_id ?? null;
+        const selectedMissing = result.error?.code === 'NO_ONLINE_DEVICE' && selectionAppliedAs !== null;
         throw new W2MError(
           'W2M_RABBIT_REFUSED',
-          `W2M_RABBIT_REFUSED: the Rabbit refused POST /v1/task with HTTP ${result.status}${result.error ? ` (${result.error.code}: ${result.error.message})` : ''}; ${operatorRequired ? 'this relay requires the operator token to dispatch tasks and the one sent was not accepted - set `operatorToken` (or `W2M_OPERATOR_TOKEN`) to the value the relay printed at startup; a device token cannot dispatch tasks' : result.error?.code === 'NO_ONLINE_DEVICE' ? 'no machine is currently streaming - start the agent on each machine, then w2m_devices shows who is online' : 'check the Rabbit log for the reason it gave'}`,
+          `W2M_RABBIT_REFUSED: the Rabbit refused POST /v1/task with HTTP ${result.status}${result.error ? ` (${result.error.code}: ${result.error.message})` : ''}; ${operatorRequired ? 'this relay requires the operator token to dispatch tasks and the one sent was not accepted - set `operatorToken` (or `W2M_OPERATOR_TOKEN`) to the value the relay printed at startup; a device token cannot dispatch tasks' : selectedMissing ? `this session's selected machine (${selectedName}) is not among the machines the relay currently holds, so a task narrowed to it has no target - pick another machine in the composer, or clear the selection` : result.error?.code === 'NO_ONLINE_DEVICE' ? 'no machine is currently streaming - start the agent on each machine, then w2m_devices shows who is online' : 'check the Rabbit log for the reason it gave'}`,
           {
             hint: operatorRequired
               ? 'set `operatorToken` (or `W2M_OPERATOR_TOKEN`) to the value the relay printed at startup, or read it from `<state>/operator-token.txt`'
-              : result.error?.code === 'NO_ONLINE_DEVICE'
-                ? 'no machine is currently streaming; start the agent on each machine (w2m_devices shows who is online)'
-                : 'check the Rabbit log for the reason it gave',
+              : selectedMissing
+                ? `the selected target was sent as ${selectionAppliedAs}=${selection?.machine_id ?? ''}; clear the composer selection to dispatch to the whole fleet again`
+                : result.error?.code === 'NO_ONLINE_DEVICE'
+                  ? 'no machine is currently streaming; start the agent on each machine (w2m_devices shows who is online)'
+                  : 'check the Rabbit log for the reason it gave',
           },
         );
       }
@@ -3370,6 +3463,19 @@ export async function apply(ctx, config = {}) {
           // v0.4.0: what the direct path tried, per machine. `mode` is repeated here rather than left
           // to `w2m_status` so one dispatch's answer is self-contained.
           direct_pushes: directPushes,
+          // v0.6.1: whether this dispatch was narrowed to the composer's selected machine, and to
+          // which one. Published because a dispatch that ran somewhere other than where the operator
+          // pointed is the one failure this feature could hide, and a caller that cannot see the
+          // routing cannot report it.
+          selection: selection === null
+            ? { applied: false, field: null, machine_id: null, machine_name: null, session: sessionKey }
+            : {
+                applied: selectionAppliedAs !== null,
+                field: selectionAppliedAs,
+                machine_id: selection.machine_id,
+                machine_name: selection.machine_name,
+                session: sessionKey,
+              },
           note: anchors.base_tree === null
             ? 'this machine\'s working tree could not be fingerprinted, so peers have no anchor to match and the aggregate will be unverifiable'
             : 'peers are checked against base_commit + base_tree + command_hash',
@@ -3777,6 +3883,23 @@ export async function apply(ctx, config = {}) {
             dirty: anchors.dirty,
             fingerprint_algo: 'git-temp-index-tree/v1',
             error: anchors.error,
+          },
+          /**
+           * v0.6.1: the composer's target control and the selections it holds.
+           *
+           * Reported here because "the control is not in my composer" has exactly two causes — the
+           * host has no fetch-route registry, or the browser half is not loaded — and this is the
+           * one call that can tell them apart from the host side. The selections themselves are
+           * counts, not contents: which session picked which machine is the operator's business and
+           * nothing the model needs.
+           */
+          target_selection: {
+            route: TARGET_ROUTE_PATH,
+            attached: targetRoutes.mounted,
+            detail: targetRoutes.mounted
+              ? 'the composer control reads and writes its selection through this route'
+              : targetRoutes.reason,
+            sessions_with_a_target: defaultSelectionStore.list().length,
           },
           notes: statusNotes(relay, rtt, cfg, p2pStatus),
         },

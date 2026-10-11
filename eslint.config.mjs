@@ -145,6 +145,38 @@ export default [
   },
 
   // ---------------------------------------------------------------------
+  // The browser half. `lib/client.js` is the *shipped* client bundle: the file
+  // the DSH web shell loads as a plugin, written by hand in the module-loader
+  // format (`window.__ModuleLoader__.load({ id, factory })`) because this
+  // package has no build step and no dependencies. It is browser code with a
+  // deliberate `var` prelude, so it gets browser globals and two exemptions:
+  //
+  //   no-var        the loader's entry shape is `var module = {exports:{}}` +
+  //                 `var exports = module.exports` around the factory body, and
+  //                 that prologue is part of the contract, not a style choice.
+  //   no-implicit-globals  the file's whole purpose is to touch the page's
+  //                 `window`.
+  //
+  // Every correctness rule still applies: `no-undef` now checks against the
+  // browser's globals rather than the node ones, which is the stronger check
+  // for a file that runs in a page.
+  // ---------------------------------------------------------------------
+  {
+    files: ['lib/client.js'],
+    languageOptions: {
+      ecmaVersion: 2024,
+      sourceType: 'script',
+      globals: {
+        ...globals.browser,
+      },
+    },
+    rules: {
+      'no-var': 'off',
+      'no-implicit-globals': 'off',
+    },
+  },
+
+  // ---------------------------------------------------------------------
   // CLI entry points: console is the interface here, so allow it.
   //
   // deploy/windows/*.mjs belongs in this list for the same reason as bin/: the supervisor is a

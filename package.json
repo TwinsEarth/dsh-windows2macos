@@ -1,6 +1,6 @@
 {
   "name": "@twinsearth/w2m-dsh-plugin",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "description": "DSH: Windows2MacOS — drive the same project on online Windows and macOS machines from one DeepSeek account, across networks and regions. P2P hole punching is the default path (relay + shared server as rendezvous, ledger and fallback), with a bundled STUN responder, Tailscale/public-VPS/tunnel shapes, Rabbit relay + per-machine Localside + eight DSH tools (replicate / split), nine aggregate verdicts and signed requests.",
   "type": "module",
   "main": "lib/index.js",
@@ -12,6 +12,7 @@
   "exports": {
     ".": "./lib/index.js",
     "./tools": "./lib/tools.js",
+    "./client": "./lib/client.js",
     "./rabbit": "./bin/w2m-rabbit.mjs",
     "./localside": "./bin/w2m-localside.mjs",
     "./stun": "./bin/w2m-stun.mjs",
@@ -38,6 +39,9 @@
     "kind": "server",
     "bundle": {
       "patch": "cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
     }
   },
   "disclosure": {
@@ -92,13 +96,13 @@
     }
   },
   "scripts": {
-    "test": "node --test --test-force-exit test/relay.test.mjs test/broadcast.test.mjs test/agent.test.mjs test/tools.test.mjs test/schedule.test.mjs test/auto-update.test.mjs test/update-source.test.mjs test/update-install.test.mjs test/update-wiring.test.mjs test/signing.test.mjs test/stress.test.mjs test/shared-config.test.mjs test/metrics.test.mjs test/metrics-route.test.mjs test/tool-cards.test.mjs test/p2p-stun.test.mjs test/p2p-transport.test.mjs test/p2p-signaling.test.mjs test/p2p-node.test.mjs test/p2p-transport-fields.test.mjs test/p2p-plugin.test.mjs test/stun-server.test.mjs",
+    "test": "node --test --test-force-exit test/relay.test.mjs test/broadcast.test.mjs test/agent.test.mjs test/tools.test.mjs test/fleet-target.test.mjs test/client-bundle.test.mjs test/schedule.test.mjs test/auto-update.test.mjs test/update-source.test.mjs test/update-install.test.mjs test/update-wiring.test.mjs test/signing.test.mjs test/stress.test.mjs test/shared-config.test.mjs test/metrics.test.mjs test/metrics-route.test.mjs test/tool-cards.test.mjs test/p2p-stun.test.mjs test/p2p-transport.test.mjs test/p2p-signaling.test.mjs test/p2p-node.test.mjs test/p2p-transport-fields.test.mjs test/p2p-plugin.test.mjs test/stun-server.test.mjs",
     "test:e2e": "node --test --test-force-exit test/e2e.test.mjs test/crossnetwork.test.mjs test/signing-e2e.test.mjs test/outbound-only.test.mjs test/recovery.test.mjs test/pipeline-e2e.test.mjs test/p2p-agent.test.mjs",
     "test:relay": "node --test test/relay.test.mjs",
     "test:agent": "node --test test/agent.test.mjs",
     "test:tools": "node --test test/tools.test.mjs",
     "test:crossnetwork": "node --test --test-force-exit test/crossnetwork.test.mjs",
-    "test:all": "node --test --test-force-exit test/relay.test.mjs test/broadcast.test.mjs test/agent.test.mjs test/tools.test.mjs test/schedule.test.mjs test/auto-update.test.mjs test/update-source.test.mjs test/update-install.test.mjs test/update-wiring.test.mjs test/signing.test.mjs test/stress.test.mjs test/e2e.test.mjs test/crossnetwork.test.mjs test/signing-e2e.test.mjs test/outbound-only.test.mjs test/recovery.test.mjs test/pipeline-e2e.test.mjs test/shared-config.test.mjs test/metrics.test.mjs test/metrics-route.test.mjs test/tool-cards.test.mjs test/p2p-stun.test.mjs test/p2p-transport.test.mjs test/p2p-signaling.test.mjs test/p2p-node.test.mjs test/p2p-transport-fields.test.mjs test/p2p-plugin.test.mjs test/p2p-agent.test.mjs test/stun-server.test.mjs",
+    "test:all": "node --test --test-force-exit test/relay.test.mjs test/broadcast.test.mjs test/agent.test.mjs test/tools.test.mjs test/fleet-target.test.mjs test/client-bundle.test.mjs test/schedule.test.mjs test/auto-update.test.mjs test/update-source.test.mjs test/update-install.test.mjs test/update-wiring.test.mjs test/signing.test.mjs test/stress.test.mjs test/e2e.test.mjs test/crossnetwork.test.mjs test/signing-e2e.test.mjs test/outbound-only.test.mjs test/recovery.test.mjs test/pipeline-e2e.test.mjs test/shared-config.test.mjs test/metrics.test.mjs test/metrics-route.test.mjs test/tool-cards.test.mjs test/p2p-stun.test.mjs test/p2p-transport.test.mjs test/p2p-signaling.test.mjs test/p2p-node.test.mjs test/p2p-transport-fields.test.mjs test/p2p-plugin.test.mjs test/p2p-agent.test.mjs test/stun-server.test.mjs",
     "pack": "node scripts/pack.mjs",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
