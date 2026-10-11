@@ -149,3 +149,25 @@ Tests that must exist before stage 1 is called done:
   (a key-change notice is cheap and catches a silent substitution).
 * Windows has no 0600: what the key file's protection actually is there, stated honestly in the
   deployment notes rather than assumed.
+
+### Raised by the v0.4.0 agent workstream, and still open
+
+* **`envelope_sha256` currently covers the transport facts, and that is why the direct result frame is
+  not the envelope.** The direct frame carries only `{type:'task.result', task_id}`: `result_path`
+  cannot be known until the bounded `result.ack` wait finishes, the envelope is hashed when it is
+  built, and stamping `result_path` afterwards would produce a hash that does not cover its own bytes —
+  `verifyEnvelope` would then reject an envelope nobody tampered with. The forced choice was an
+  accurate `result_path` on the ledger copy at the price of posting that copy up to the bound late
+  (`p2pAckTimeoutMs`, default 2000 ms). Consequence: **the fast path saves the dispatcher a wait, not
+  the bytes**, because the dispatcher still reads the envelope from the relay. Fixing it means
+  splitting the transport facts out of the hashed region (or hashing them in a second, separate
+  digest) — a deliberate protocol decision, not a patch, and stage 1 must settle it before claiming
+  that the direct channel carries the result.
+* **Stage 1's `encrypted` flag lands in the same `p2p` block**, so whatever is decided above decides
+  where that flag is trustworthy: inside the authenticated envelope (readable only by the dispatcher)
+  or beside it (readable by the relay too). The second is simpler; the first is the one that cannot be
+  forged by the relay.
+* **`result.ack` has only ever been sent by a test dispatcher**, never by the production plugin when
+  that work was done — so the ack contract is proven against a faithful stand-in, not against the real
+  caller. Stage 1's rekey path makes the same assumption.
+* `direct` mode refusing *every* relay-arrived offer is a contract interpretation, not a measurement.
