@@ -332,4 +332,26 @@ jobs:
         run: node scripts/pack.mjs --out dist
 
       - name: Pre-flight (exit 1 is RED, do not bump)
-        run: node scripts/preflight.mjs
+        # THE VERDICT IS THE EXIT STATUS. The annotations are for the reader.
+        #
+        # A red run whose only visible text is "Process completed with exit code 1" cannot be acted on by
+        # anyone without log access -- and the failing check's own words are the whole value of this gate:
+        # which assertion was skipped, which artifact went missing, which claim disagreed. GitHub keeps
+        # `::error::` lines as *annotations*, which are readable through the API and on the commit page
+        # without a token, which is why `compat.yml`'s verdict program already reports its problems that
+        # way. This step does the same for the pre-flight: the FAIL and UNVERIFIABLE lines it printed become
+        # annotations carrying its own reasons.
+        #
+        # The wrapper changes no verdict: `set +e` is what lets the pipeline run to completion, the
+        # pre-flight's own status is read back from `PIPESTATUS`, and that status is what this step exits
+        # with. A pipe whose last command is `tee` would otherwise report success for a red gate.
+        run: |
+          set +e
+          node scripts/preflight.mjs 2>&1 | tee "$RUNNER_TEMP/preflight.log"
+          code=${PIPESTATUS[0]}
+          if [ "$code" -ne 0 ]; then
+            grep -E '^  (FAIL|UNVERIF)' "$RUNNER_TEMP/preflight.log" | head -n 6 | while IFS= read -r line; do
+              echo "::error title=pre-flight::${line}"
+            done
+          fi
+          exit "$code"
