@@ -274,6 +274,16 @@ jobs:
   # One operating system, deliberately: the matrix above is the cross-platform signal, and the
   # pre-flight is a statement about the release process rather than about a platform. Its declared
   # suite is the same list on all three.
+  #
+  # What is NOT the same on all three is which of that suite's assertions *skip*, because two of them
+  # are platform-conditional: `test/agent.test.mjs` asserts two facts about NTFS, and the 0600
+  # permission assertion next to it is a fact about a POSIX filesystem. This runner is Linux, so the
+  # entry this job needs is the POSIX side of that pair (`posix-has-no-windows-filesystem` in
+  # ACCEPTED_SKIPS, qualified to darwin and linux). The Windows-side entries in the same list
+  # (`ntfs-has-no-posix-bits`, `windows-is-not-a-posix-shell`) are inert here and are exercised where
+  # the other platform's skips are produced: a human running `node scripts/preflight.mjs` on Windows,
+  # and the windows-latest legs of the matrix above, which run the same assertions and report the
+  # skips -- `npm test` tolerates them; only the pre-flight classifies them.
   preflight:
     name: release pre-flight (the gate a human runs)
     runs-on: ubuntu-latest

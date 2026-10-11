@@ -876,6 +876,17 @@ export function classifyUnverifiable(rows, accepted = ACCEPTED_UNVERIFIABLE) {
  * it may happen: a cap that is exceeded means an assertion was added, removed or started skipping,
  * and that is a question for a human rather than a number to recompute. A skip matching nothing here
  * is a FAIL naming the suite, the assertion and the reason.
+ *
+ * `platforms`, when present, names the hosts on which that skip is accepted, and every
+ * platform-conditional assertion carries it. `test/agent.test.mjs` holds the pair that makes the
+ * reason plain: `caps.case_sensitive_fs === false` and `caps.exec_bit === false` are facts about
+ * NTFS, and the 0600 permission assertion in the same file is a fact about a POSIX filesystem, so
+ * each of them skips where it cannot be measured. The pre-flight runs on both kinds of host -- a
+ * human runs it on Windows, `ci.yml`'s `preflight` job and `release.yml` run it on ubuntu-latest --
+ * so both directions need an entry, and without the qualifier each entry would also excuse the same
+ * reason on the host where the assertion *should* have run. On a host outside the list the skip is
+ * refused by name rather than silently accepted, which is the difference between a symmetry and a
+ * blanket exemption.
  */
 export const ACCEPTED_SKIPS = [
   {
@@ -916,6 +927,7 @@ export const ACCEPTED_SKIPS = [
     suite: /^identity: device\.json$/,
     match: /^NTFS has no POSIX bits/,
     maxCount: 1,
+    platforms: ['win32'],
     why: 'a 0600 permission assertion that only a POSIX filesystem can evaluate; it runs on the macOS and Linux legs of ci.yml',
   },
   {
@@ -923,7 +935,23 @@ export const ACCEPTED_SKIPS = [
     suite: /^executable resolution/,
     match: /^a POSIX shell script is not a Windows executable/,
     maxCount: 1,
+    platforms: ['win32'],
     why: 'a bundled-tool resolution probe that needs a POSIX shell script; it runs on the macOS and Linux legs of ci.yml',
+  },
+  {
+    key: 'posix-has-no-windows-filesystem',
+    suite: /^capability probing$/,
+    match: /^windows-only expectation$/,
+    maxCount: 1,
+    platforms: ['darwin', 'linux'],
+    why:
+      'the mirror image of ntfs-has-no-posix-bits, in the other direction: test/agent.test.mjs asserts ' +
+      'that caps.case_sensitive_fs is false and caps.exec_bit is false, which are facts about NTFS, so on ' +
+      'a POSIX host there is nothing to measure and the assertion skips there. It runs on the windows-latest ' +
+      'legs of ci.yml. This entry exists because the pre-flight runs on ubuntu-latest (ci.yml\'s preflight ' +
+      'job, and release.yml before it publishes), and `platforms` is what keeps the acceptance from ' +
+      'becoming a blanket one: on win32 the same reason is refused, because there the assertion should ' +
+      'have run and a skip is the defect rather than the environment.',
   },
 ];
 
@@ -968,17 +996,42 @@ export function tapSkips(text) {
 /**
  * Classify every skip in a run against `ACCEPTED_SKIPS`.
  *
+ * `host` is a parameter rather than a read of `process.platform` inside the loop so that the
+ * platform qualification of an entry can be exercised on any machine: `classifySkips(skips, accepted,
+ * 'linux')` and `... , 'win32'` are the two directions of the pair in `test/agent.test.mjs`, and both
+ * are measurable from Windows. A rule that can only be exercised on one of the hosts it is about is a
+ * rule nobody reviews.
+ *
  * @param {Array<{suite: string, name: string, reason: string}>} skips
  * @param {Array<object>} accepted
+ * @param {string} [host] The platform the skip is being judged on.
  * @returns {{problems: string[], counts: Map<string, number>, lines: string[]}}
  */
-export function classifySkips(skips, accepted = ACCEPTED_SKIPS) {
+export function classifySkips(skips, accepted = ACCEPTED_SKIPS, host = process.platform) {
   const problems = [];
   const counts = new Map();
   const lines = [];
+  /** An entry applies here when it names no platform, or names this one. */
+  const appliesHere = (row) => row.platforms === undefined || row.platforms.includes(host);
   for (const skip of skips) {
-    const entry = accepted.find((row) => row.suite.test(skip.suite) && row.match.test(skip.reason));
+    const entry = accepted.find(
+      (row) => appliesHere(row) && row.suite.test(skip.suite) && row.match.test(skip.reason),
+    );
     if (entry === undefined) {
+      // Name the near miss. An entry that matches this skip's suite and reason but is qualified to
+      // other platforms means the assertion skipped on the host where it was supposed to run -- which
+      // is a defect here, and not "a reason this repository has not thought about".
+      const elsewhere = accepted.find(
+        (row) => !appliesHere(row) && row.suite.test(skip.suite) && row.match.test(skip.reason),
+      );
+      if (elsewhere !== undefined) {
+        problems.push(
+          `"${skip.suite} > ${skip.name}" was SKIPPED on ${host} with a reason this repository accepts ` +
+            `only on ${elsewhere.platforms.join(', ')}: ${skip.reason === '' ? '(no reason given)' : skip.reason}. ` +
+            `On ${host} that assertion is expected to run (${elsewhere.why}), so its skip is the finding.`,
+        );
+        continue;
+      }
       problems.push(
         `"${skip.suite} > ${skip.name}" was SKIPPED and its reason is not on the accepted list: ` +
           `${skip.reason === '' ? '(no reason given)' : skip.reason}. An assertion that did not run is a ` +
