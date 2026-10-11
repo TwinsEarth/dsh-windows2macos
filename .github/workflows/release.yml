@@ -113,7 +113,22 @@ jobs:
         # on ACCEPTED_SKIPS is a FAIL. It also repacks `dist/` itself (and asserts that two independent
         # packs of the tree are byte-identical), so the tarball the steps below publish is the one this
         # gate measured.
-        run: node scripts/preflight.mjs
+        #
+        # The annotations are additive, exactly as in ci.yml's pre-flight step: a red release gate that
+        # says only "exit code 1" cannot be acted on by anyone reading the run without log access, and this
+        # is the one run where that matters most. `set +e` lets the pipeline finish, the pre-flight's own
+        # status is read back from `PIPESTATUS`, and that status is what this step exits with -- a pipeline
+        # ending in `tee` would otherwise report success for a red gate.
+        run: |
+          set +e
+          node scripts/preflight.mjs 2>&1 | tee "$RUNNER_TEMP/preflight.log"
+          code=${PIPESTATUS[0]}
+          if [ "$code" -ne 0 ]; then
+            grep -E '^  (FAIL|UNVERIF)' "$RUNNER_TEMP/preflight.log" | head -n 6 | while IFS= read -r line; do
+              echo "::error title=pre-flight::${line}"
+            done
+          fi
+          exit "$code"
 
       - name: Checksums for the published assets
         # Computed here rather than beside the pack above, so SHA256SUMS describes the bytes the
