@@ -287,6 +287,34 @@ function sendUdp(port, payload) {
 }
 
 /**
+ * Is this UDP port free for anyone else to take?
+ *
+ * `exclusive: true` is the whole point and the reason this is not `freeUdpPort()` with a number. A
+ * plain bind succeeds even when another socket already holds the port (that is what makes multicast
+ * and SO_REUSEADDR work), so it would answer "yes" to the wrong question and the assertion built on it
+ * would pass no matter what the agent did. `exclusive` asks the OS for the port and nothing else, which
+ * on Windows and Linux alike fails with `EADDRINUSE` while somebody holds it.
+ *
+ * @param {number} port
+ * @returns {Promise<boolean>} True when nothing is bound there.
+ */
+function udpPortIsFree(port) {
+  return new Promise((resolve) => {
+    const socket = createSocket('udp4');
+    const done = (value) => {
+      try {
+        socket.close();
+      } catch {
+        /* never bound */
+      }
+      resolve(value);
+    };
+    socket.once('error', () => done(false));
+    socket.bind({ port, address: '0.0.0.0', exclusive: true }, () => done(true));
+  });
+}
+
+/**
  * Wait until a spawned process has really left, so the sockets it held are really closed.
  *
  * Used by the TCP probe below, which has to know that a listener it finds *after* the agent is killed
@@ -568,6 +596,85 @@ describe('the link is outbound-only', () => {
     const fromEnvZero = await runCli(['--rabbit', 'http://127.0.0.1:1'], { W2M_P2P_PORT: '0' });
     assert.equal(fromEnvZero.code, 2, '0 is refused by name rather than read as "ephemeral"');
     assert.match(fromEnvZero.stderr, /P2P_PORT_ZERO/);
+  });
+
+  it('binds a pinned punch port in the default mode and not at all in relay mode', async () => {
+    // WHAT THIS ADDS, and why the assertions above are not enough on their own.
+    //
+    // The case above states the same property from the agent's *output*: one `p2p: auto node on …`
+    // line, and no such line in relay mode. Output is a claim; this case asks the operating system.
+    // The mechanism is `--p2p-port`, and it is decisive precisely because it is the one way the node
+    // can be told to use a *named* port:
+    //
+    //   * with a pinned port and the direct path on, that port must be held by somebody, or the flag
+    //     is decorative and a firewall rule pointing at it protects nothing;
+    //   * with the same pinned port and `--p2p-mode relay`, that port must be **free**, because relay
+    //     mode binds no socket at all -- and that is a fact an outside process can establish for
+    //     itself with `exclusive: true`, rather than a sentence in a log the agent wrote about itself.
+    //
+    // The pinned port is used deliberately instead of the ephemeral one: an ephemeral port is only
+    // knowable from the agent's own line, so "nothing is bound there" could always be explained by
+    // having read the wrong number. The same number is used for both agents, so the pair of
+    // assertions is about one port and one difference: the mode.
+    const stateDir = mkdtempSync(join(tmpdir(), 'w2m-oo-relay6-'));
+    const pinnedState = mkdtempSync(join(tmpdir(), 'w2m-oo-pinned-'));
+    const relayModeState = mkdtempSync(join(tmpdir(), 'w2m-oo-pinnedrelay-'));
+    const project = mkdtempSync(join(tmpdir(), 'w2m-oo-proj6-'));
+    const pinnedHome = mkdtempSync(join(tmpdir(), 'w2m-oo-home6a-'));
+    const relayModeHome = mkdtempSync(join(tmpdir(), 'w2m-oo-home6b-'));
+    scratch.push(stateDir, pinnedState, relayModeState, project, pinnedHome, relayModeHome);
+    const pinnedPort = await freeUdpPort();
+
+    const relay = await startRelay({ stateDir });
+    const directAgent = await startAgent({
+      rabbitUrl: relay.url,
+      pairingCode: relay.info.pairingCode,
+      project,
+      stateDir: pinnedState,
+      dshHome: pinnedHome,
+      extraArgs: ['--p2p-port', String(pinnedPort)],
+    });
+    const nodeLine = await waitForLog(directAgent, /p2p: auto node on 0\.0\.0\.0:\d+/);
+    assert.match(
+      nodeLine,
+      new RegExp(`node on 0\\.0\\.0\\.0:${pinnedPort}\\b`),
+      `the direct path must really hold the pinned port: ${nodeLine}`,
+    );
+    assert.equal(
+      await udpPortIsFree(pinnedPort),
+      false,
+      'the port the node announced must be held by a real socket, not only named in a log line',
+    );
+    directAgent.proc.kill('SIGKILL');
+    await waitForExit(directAgent.proc);
+
+    // A second relay: a pairing code is single-use, and reaching for the rotated one would make this
+    // depend on the CLI's banner format.
+    const relayModeRelay = await startRelay({ stateDir: relayModeState });
+    const relayModeAgent = await startAgent({
+      rabbitUrl: relayModeRelay.url,
+      pairingCode: relayModeRelay.info.pairingCode,
+      project,
+      stateDir: relayModeState,
+      dshHome: relayModeHome,
+      extraArgs: ['--p2p-mode', 'relay', '--p2p-port', String(pinnedPort)],
+    });
+    // Give it long enough that a socket *would* have been bound, had the mode allowed one: the same
+    // window in which the direct agent above had already announced itself.
+    await new Promise((resolve) => {
+      setTimeout(resolve, 1_500);
+    });
+    assert.equal(
+      relayModeAgent.proc.exitCode,
+      null,
+      'relay mode must stay up: it is a working agent, not a refused start',
+    );
+    assert.equal(
+      await udpPortIsFree(pinnedPort),
+      true,
+      'relay mode must bind no UDP socket at all, so the port it was pointed at stays free',
+    );
+    relayModeAgent.proc.kill('SIGKILL');
   });
 
   it('the relay binds only the loopback address it was given', async () => {    const stateDir = mkdtempSync(join(tmpdir(), 'w2m-oo-relay2-'));
