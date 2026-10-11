@@ -49,6 +49,16 @@ throwaway profile under a throwaway `DSH_HOME` and boots it with the real `runPr
 
 Each line is checkable against a diff.
 
+0. **A release starts with `node scripts/preflight.mjs`, and a green run is the precondition for a
+   version bump.** `scripts/preflight.mjs` is the only sanctioned way to start a release: it runs the
+   lint, the mojibake scan, the suite declared in `package.json#scripts.test`, the pack plus the
+   assertions against the **packed tarball**, and the claim checks in `test/claims.test.mjs`, in that
+   order, and prints `PASS`/`FAIL`/`UNVERIFIABLE` with a reason for each. It exits non-zero on any
+   failure, and also when a check produces no result at all — "the gate ran" is itself checked. Do not
+   bump a version, tag, or publish on a red or unread run; `UNVERIFIABLE` is not a pass either, so read
+   the reason it prints. The three releases of 2026-10-11 (v0.5.6, v0.5.7, v0.5.8) each fixed a defect
+   the previous one introduced, every one of them found *after* the tag was pushed by a gate nobody had
+   run. This line exists so that does not happen again.
 1. **Zero runtime dependencies.** `dependencies === {}` in `package.json`. Node built-ins only.
 2. **Argv execution, never a shell string.** A command is an array of arguments passed to
    `spawn`/`execFile` with no shell. No `exec`, no `shell: true`, no string interpolation into a

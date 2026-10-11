@@ -1,3 +1,65 @@
+# Changelog
+
+All notable changes to this project are documented here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
+adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.5.9] — 2026-10-11
+
+### Added
+
+* **A release pre-flight, as one entry point: `node scripts/preflight.mjs`.** A release is now
+  something you start by running it, and a green run is the precondition for the version bump. It
+  checks, in order: that every gate it delegates to exists on disk; that lint is at 0 errors; that the
+  mojibake scan is clean over the whole tree; that the suite declared in `package.json#scripts.test`
+  runs and passes; that the **packed tarball** — not the tree — contains every path `package.json#files`
+  names, names the tree's version, carries no forbidden path (`node_modules`, `test/`, `scripts/`,
+  `.git`, `*.proof-backup`/`*.orig`/`*.bak`) and registers its eight tools when executed from the
+  extracted copy; that the version, bundle-patch and document claims in `test/claims.test.mjs` still
+  hold; and that the CHANGELOG's title sits above its newest entry and its entries run newest-first.
+  Every check reports `PASS`, `FAIL` or `UNVERIFIABLE` **with a name and a reason**, and the run fails
+  if any registered check produces no result at all: "the gate ran" is itself a check, because a
+  self-authored gate that reports success while executing zero checks is a defect this project studied
+  in another one.
+* **A wiring check that would have caught two of the defects below.** Every `test/*.test.mjs` on disk
+  must be named by some npm script, and every path an npm script names must exist. Measured now: 36
+  suites on disk, 36 named, 0 orphans.
+
+### Fixed
+
+* **`CHANGELOG.md` had carried a mangled character into the published package.** v0.5.8's own entry —
+  the one describing the mojibake repair — contained the two garbled CJK sequences it was complaining
+  about, reproduced literally inside backticks. `CHANGELOG.md` is in `package.json#files`, so v0.5.8
+  shipped the damage it was apologising for, and `scripts/scan-mojibake.mjs` was red on the tree. The
+  line is ASCII now and the scan is clean over the whole tree.
+* **The CHANGELOG's title and introduction were in the middle of the file.** The v0.5.8 entry was
+  prepended above `# Changelog` itself, which is the same mistake as the out-of-order entries v0.5.8
+  fixed, one level up: "newest first" was true of the version headings while the document's own header
+  had been pushed to line 21. The entry is below the title again, and the pre-flight now asserts the
+  shape rather than only the order.
+* **The entire declared unit suite had not been running.** Wiring the new suites into
+  `package.json#scripts.test` and `#scripts.test:all` dropped one space, producing the path
+  `test/claims.test.mjstest/fleet-target.test.mjs`. `node --test` exits 1 on a missing path, so
+  `npm test` was failing immediately and *no* unit suite — not just `fleet-target` — was running.
+  One space; and it is my edit that did it.
+* **`test/p2p-crypto.test.mjs` was named by no script at all.** 33 tests, green, and wired into
+  nothing — the exact defect v0.5.7's release note identified in someone else's repository. It is in
+  `test` and `test:all` now.
+
+### Notes
+
+* This release exists because three releases in one hour — v0.5.6, v0.5.7, v0.5.8 — each fixed a
+  defect the previous one introduced. **Every one of those defects was found after the tag was pushed**,
+  by a gate that already existed and simply was not run before the release. The gates were never
+  broken; the process around them was missing. That process is this release's only subject.
+* No runtime change: the code in v0.5.9 is the code in v0.5.6.
+* One check is `UNVERIFIABLE` on this machine and is reported as such rather than passed quietly: the
+  host has no `%DSH_HOME%\dsh-runtimes\`, while `src/agent/resolve.mjs` looks for the bundled runtime at
+  `dsh-runtimes/dsh-primary-runtime/dependencies` and the application bundle carries it at
+  `E:\DS\resources\runtime\primary-runtime\dependencies` instead. The suite's bundled-python claim is
+  measured against a throwaway home with the documented layout, and the host mismatch is printed next
+  to the verdict, as an open question rather than a silent pass.
+
 ## [0.5.8] — 2026-10-11
 
 ### Fixed
@@ -8,7 +70,8 @@
   newest-first again, and the anchor is the top of the file rather than a version I have to remember.
 * **Mojibake in shipped code.** `src/agent/mdns-wire.mjs` is packed, and its comments carried an em dash
   and a section sign that had been decoded as the wrong encoding and re-saved, so a reader would have
-  seen `鈥` and `搂` where the RFC references belong. The same damage was in `test/mdns-discover.test.mjs`.
+  seen the two garbled CJK sequences where the RFC references belong. The same damage was in
+  `test/mdns-discover.test.mjs`.
   All five mDNS files are ASCII now, and the repository's own mojibake scan is clean.
 
 ### Notes
@@ -18,11 +81,6 @@
   the gates working, but it is also a release process with no pre-flight of its own — which is the next
   thing this project should fix rather than the next thing it should be proud of.
 * No runtime change: the code in v0.5.8 is the code in v0.5.6.
-# Changelog
-
-All notable changes to this project are documented here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
-adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.5.7] — 2026-10-11
 
