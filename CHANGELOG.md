@@ -4,6 +4,53 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.3] — 2026-10-14
+
+**The fleet reader used the wrong credential and the wrong field names.** v0.7.2 shipped an
+executor that had never been pointed at a live relay. Found by running it against one.
+
+The agent's own log proved the task really ran:
+
+```
+[agent] offer 01M4VC7KWKF5WA5Q6BBDNH4AXM attempt 1 {"argv":["node","src/facts.mjs"]}
+[agent] result delivered for 01M4VC7KWKF5WA5Q6BBDNH4AXM {"status":"nonzero_exit"}
+[agent] result accepted for 01M4VC7KWKF5WA5Q6BBDNH4AXM {"status":"nonzero_exit"}
+```
+
+— while the poll loop printed erdict=undefined thirty times.
+
+### Fixed
+
+* **GET /v1/tasks/<id> needs the device token, not the operator token.** With the operator
+  token it answers 401 {"code":"UNAUTHORIZED","message":"missing or invalid device_token"}.
+  Dispatching and reading take different credentials; the executor now holds both, and a refusal
+  names which one it wanted, because *"your operator token is wrong"* and *"this install is not
+  paired"* have different fixes.
+* **The verdict is at ody.aggregate.status, not the top level.** The per-machine rows are
+  ody.leases[] on a status and ody.machines[] on a report, and the machine field is
+  machine_name. The first version read ody.verdict and ody.results, so every machine
+  printed as ?: ? while the task completed perfectly.
+* /v1/devices wants the device token too on this relay build.
+* A lease row carries state rather than outcome until the result lands, so describeMachines
+  shows the outcome when there is one and the lease state when there is not.
+
+### Verified end to end
+
+Against a live relay and a live Localside agent on Windows:
+
+```
+任务 01M4VCET — unverifiable
+命令：node src/facts.mjs
+win-desktop: unverifiable  status nonzero_exit  exit 1
+```
+
+272 chatops cases pass.
+
+### Still not claimed
+
+No message has been sent from a phone through WeChat to the fleet. The adapter is verified
+against live WeChat and the executor is now verified against a live relay, but **the two have
+not yet been joined by a human typing**.
 ## [0.7.2] — 2026-10-14
 
 **Run the fleet from a chat message, and get the machines' own verdict back.**

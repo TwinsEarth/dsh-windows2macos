@@ -51,6 +51,7 @@ function executorFor(script, over = {}) {
   const executor = createFleetExecutor({
     rabbitUrl: 'http://relay.test:8787',
     token: 'operator-token',
+    deviceToken: 'device-token',
     fetch: r.fetch,
     sleep: async () => {},
     ...over,
@@ -82,7 +83,7 @@ describe('a message runs a command and the verdict comes back', () => {
   it('dispatches the argv as an array and never as a joined string', async () => {
     const { executor, r } = executorFor({
       task: { task_id: 'task-1' },
-      status: { verdict: 'consistent', results: [{ machine: 'win-desktop', verdict: 'consistent' }] },
+      status: { aggregate: { status: 'consistent' }, machines: [{ machine_name: 'win-desktop', outcome: 'consistent' }] },
       report: { verdict: 'consistent', stdout: 'ok' },
     });
     await executor.run(['node', '--test', 'a b']);
@@ -245,10 +246,22 @@ describe('the phone-sized formatting rules', () => {
     assert.match(lines[0], /macmini/);
   });
 
-  it('reads the per-machine shape wherever the relay puts it', () => {
-    assert.equal(describeMachines({ machines: [{ name: 'a', status: 'ok' }] }).length, 1);
-    assert.equal(describeMachines({ per_machine: { a: { verdict: 'ok' } } }).length, 1);
+  it('reads the per-machine rows from the shapes a live relay returns', () => {
+    // `machines` on a report, `leases` on a status. Both measured; neither was guessed.
+    assert.equal(describeMachines({ machines: [{ machine_name: 'a', outcome: 'ok' }] }).length, 1);
+    assert.equal(describeMachines({ leases: [{ machine_name: 'a', state: 'done' }] }).length, 1);
+    // And the per-machine verdict is `outcome`, with `status` alongside rather than instead of it.
+    const row = describeMachines({
+      machines: [{ machine_name: 'e2e-agent', outcome: 'unverifiable', status: 'nonzero_exit', exit_code: 1 }],
+    })[0];
+    assert.match(row, /e2e-agent: unverifiable/);
+    assert.match(row, /status nonzero_exit/);
+    assert.match(row, /exit 1/);
+  });
+
+  it('returns nothing for a body with no per-machine rows, including an empty object', () => {
     assert.deepEqual(describeMachines({}), []);
+    assert.deepEqual(describeMachines({ status: 'consistent' }), []);
   });
 
   it('formats a failed dispatch without pretending there is a task', () => {
@@ -302,7 +315,7 @@ describe('the executor talks to the paths the plugin already uses', () => {
   it('posts to /v1/task, reads /v1/tasks/<id>, /report and /devices', async () => {
     const { executor, r } = executorFor({
       task: { task_id: 'task-1' },
-      status: { verdict: 'consistent' },
+      status: { aggregate: { status: 'consistent' } },
       report: { verdict: 'consistent' },
       devices: { devices: [{ machine_id: 'm1', name: 'macmini', platform: 'macos' }] },
     });
@@ -314,10 +327,14 @@ describe('the executor talks to the paths the plugin already uses', () => {
     assert.deepEqual(paths, [RELAY.TASK, RELAY.TASK_STATUS('task-1'), RELAY.TASK_REPORT('task-1'), RELAY.DEVICES]);
   });
 
-  it('sends the operator token, which a device token cannot replace', async () => {
-    const { executor, r } = executorFor({ task: { task_id: 't' } });
+  it('uses the operator token to dispatch and the device token to read', async () => {
+    // Measured: GET /v1/tasks/<id> with the operator token answers 401 naming device_token. The
+    // two credentials are not interchangeable, so the executor holds both.
+    const { executor, r } = executorFor({ task: { task_id: 't' }, status: { aggregate: { status: 'consistent' } } });
     await executor.run(['node', '--test']);
-    assert.equal(r.calls[0].headers.authorization, 'Bearer operator-token');
+    await executor.status('t');
+    assert.equal(r.calls[0].headers.authorization, 'Bearer operator-token', 'dispatch uses the operator token');
+    assert.equal(r.calls[1].headers.authorization, 'Bearer device-token', 'a task read uses the device token');
   });
 
   it('maps relay devices onto the shape /machines prints', async () => {

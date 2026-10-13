@@ -36,22 +36,39 @@ export function tailLines(text, limit = DEFAULT_TAIL_LINES) {
   return [`…（省略前 ${lines.length - limit} 行）`, ...kept].join('\n');
 }
 
-/** A one-line-per-machine summary of an aggregate body. */
+/**
+ * A one-line-per-machine summary, using the field names a live relay actually returns.
+ *
+ * Measured on a report: each row carries `machine_name`, `outcome` (the per-machine verdict),
+ * `status` (what the process did — `nonzero_exit`, `ok`), `lease_state`, and `exit_code`. The
+ * first version of this read `machine`/`verdict`, which are both `undefined` in a real response,
+ * so every machine would have printed as `?: ?` while the task completed perfectly.
+ */
 export function describeMachines(body) {
-  const per = body?.results ?? body?.machines ?? body?.per_machine ?? null;
-  if (per === null) return [];
-  const entries = Array.isArray(per) ? per : Object.entries(per).map(([name, value]) => ({ machine: name, ...value }));
-  return entries.map((entry) => {
+  const rows = [];
+  for (const key of ['machines', 'leases', 'results']) {
+    if (Array.isArray(body?.[key])) {
+      rows.push(...body[key]);
+      break;
+    }
+  }
+  if (rows.length === 0 && body && typeof body === 'object' && !Array.isArray(body)) {
+    // A map keyed by machine name, which some shapes use. An empty object is not a map of zero
+    // machines and must not be reported as one — `[]` and "no per-machine shape at all" are the
+    // same answer, and the empty case is the one an unstarted task produces.
+    const entries = Object.entries(body).filter(([, v]) => v && typeof v === 'object');
+    if (entries.length > 0 && entries.every(([, v]) => 'verdict' in v || 'status' in v || 'outcome' in v)) {
+      rows.push(...entries.map(([name, value]) => ({ machine_name: name, ...value })));
+    }
+  }
+  return rows.map((entry) => {
     const name = entry.machine_name ?? entry.machine ?? entry.name ?? entry.machine_id ?? '?';
-    const verdict = entry.verdict ?? entry.status ?? '?';
-    const exit = entry.exit_code ?? entry.exit ?? null;
-    const detail = entry.detail ?? entry.reason ?? entry.error ?? null;
-    const tail = [
-      `${name}: ${verdict}`,
-      exit === null ? null : `exit ${exit}`,
-      detail === null ? null : tailLines(String(detail), 2),
-    ].filter(Boolean);
-    return tail.join('  ');
+    // The per-machine verdict is `outcome`; `status` is what the process did, which is a
+    // different fact and is shown alongside rather than instead of it.
+    const parts = [`${name}: ${entry.outcome ?? entry.verdict ?? entry.lease_state ?? '?'}`];
+    if (entry.status !== undefined && entry.status !== entry.outcome) parts.push(`status ${entry.status}`);
+    if (entry.exit_code !== undefined && entry.exit_code !== null) parts.push(`exit ${entry.exit_code}`);
+    return parts.join('  ');
   });
 }
 
