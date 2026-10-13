@@ -4,6 +4,68 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.6] — 2026-10-14
+
+**The authorisation chain and the fleet scoping rule.** `ACCOUNT-FLEET-DESIGN.md` §3, built.
+
+> **Read this before trusting the isolation.** The two modules below are complete and tested, but
+> **the relay does not call them yet.** `src/relay/state.mjs` still selects targets with
+> `[...this.devices.values()]`, so at runtime accounts remain mixed. Wiring it is the next step
+> and is not in this release. Saying "isolation is implemented" now would be false.
+
+### Added
+
+* **`src/chatops/auth.mjs`** — the device keypair and the authorisation statement.
+  * A device generates an **Ed25519** keypair on first run; the private key is exported for
+    persistence and the caller is told to write it 0600 and never log it.
+  * The relay seals a statement over `(fleet_id, machine_id, sn, public_key, issued_at, expires_at)`.
+  * Every request carries a signature over `(method, path, timestamp, nonce, body_hash)`.
+  * **The canonical encoding is built by hand, with length-prefixed fields and a fixed field
+    order.** Two JSON encodings of one object can differ, so a verifier that re-serialised what it
+    received would be verifying its own encoding; and without length prefixes `{a:'x',b:'yz'}` and
+    `{a:'xy',b:'z'}` concatenate identically. The wire form carries **the exact bytes that were
+    signed**, so nothing is ever reassembled.
+  * **Expiry is mandatory** — a statement without one is a permanent credential. Checked *before*
+    the canonical form is recomputed, so a missing expiry reports `no_expiry` rather than the
+    technically-true-but-useless `malformed`. A test found that ordering.
+  * Replay defence is a **bounded** nonce window, injected: an unbounded set is a memory leak a
+    peer can drive, and the timestamp window already rejects anything old enough to fall out.
+  * Fleet keys are **derived** per fleet from one master secret, so a relay serves many accounts
+    without holding a key per account and one fleet's key does not sign for another.
+
+* **`src/chatops/fleet-scope.mjs`** — which devices a request may reach.
+  * **The fleet comes from the pairing code, never from the device.** A device that could name its
+    own fleet would join any account, and every signature would faithfully attest to a lie.
+  * **An absent fleet is not a wildcard.** `undefined === undefined` is explicitly **not** a match.
+    This is the most dangerous available mistake: two ungrouped devices matching each other would
+    silently restore the exact "everything in one pool" behaviour being removed, and every test
+    that only ever sets a fleet would keep passing. There is a test named for it.
+  * **A foreign target is refused with the same answer as a nonexistent one**, so a caller cannot
+    enumerate another account's machine ids by trying them and reading the error.
+  * **A partial dispatch is refused whole** — silently dropping a named target leaves the caller
+    believing it dispatched somewhere.
+  * Offline devices are **counted, not silently dropped**: "we tried and they were offline" and
+    "there are none" produce the same empty result and different fixes.
+
+* `test/chatops-auth.test.mjs` (33 cases) and `test/chatops-fleet-scope.test.mjs` (25 cases).
+
+### The tests are written against the attack, not the happy path
+
+Each names the failure it prevents, and three of them assert a **weakening** rather than a
+strength: that a device editing its own `fleet_id` fails verification, that swapping in its own
+public key fails, and that an ungrouped device matches nothing. Those are the changes that would
+look correct in a diff and quietly undo the isolation.
+
+### Not in this release
+
+* **The relay does not call either module.** No device keypair is generated in a real run, no
+  statement is issued, no request is signed, and dispatch is still unfiltered. This release is the
+  mechanism; connecting it is next.
+* **The relay does not yet issue pairing codes bound to a fleet**, so `fleetFromPairingCode` has no
+  producer in a live relay.
+* **Hand-off is not implemented** — that is v0.7.7.
+* **No message has yet gone from a phone through WeChat to the fleet.**
+
 ## [0.7.5] — 2026-10-14
 
 **Stage 1 of the account-fleet design: this machine now knows which account it belongs to, and
