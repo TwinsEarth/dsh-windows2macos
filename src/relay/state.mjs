@@ -17,6 +17,8 @@ import { createHash, randomBytes } from 'node:crypto';
 // exhaustive tests — three lines inside this object would be untestable without a live relay.
 import { targetsFor } from '../chatops/fleet-wiring.mjs';
 import { fleetForPairingCode, deviceFleetFields } from '../chatops/fleet-wiring.mjs';
+// v0.8.1: the account-derived fleet key, so a machine can join with no pairing code.
+import { planJoin } from '../chatops/fleet-join.mjs';
 
 export const PROTOCOL_VERSION = 1;
 
@@ -754,7 +756,41 @@ export class RabbitState {
 
   /** §2.2: exchange a one-time code for a device_token. §1: idempotent. */
   pair(request = {}) {
-    const rec = this.validatePairingCode(request.pairing_code);
+    /**
+     * v0.8.1: a pairing code **or** an account-derived fleet key.
+     *
+     * The code path is unchanged. The key path is what lets a second machine on one account join
+     * with no human step and no relay configuration — the gap that left a new PC invisible beside
+     * its own fleet.
+     *
+     * ## Why a key may stand in for a code
+     *
+     * They authorise different things. A **code** is the operator saying *"let this machine in"*,
+     * and it is the only way to place a device in a fleet the device could not compute for itself.
+     * A **key** is the account saying *"this machine is mine"*, and it can only ever place the
+     * device in the fleet derived from that key — so it cannot be used to reach a fleet its holder
+     * is not already entitled to.
+     *
+     * ## Why a malformed key refuses rather than falling back
+     *
+     * A request with a `fleet_key` is a request that *meant* to join by account. Quietly demanding a
+     * code instead would surface at the client as an unexplained `PAIRING_INVALID`, which is the
+     * silent-wrong-answer shape this codebase keeps producing; the reason is named instead.
+     */
+    const hasKey = typeof request.fleet_key === 'string' && request.fleet_key !== '';
+    let rec = null;
+    if (hasKey) {
+      const join = planJoin({ fleetKeyEncoded: request.fleet_key });
+      if (!join.ok) {
+        throw new ProtocolError('PAIRING_INVALID', join.text, { reason: join.reason });
+      }
+      // A synthetic code record so the fleet binding below reads from one place. `fleet_id` is the
+      // DERIVED value, never anything the request claimed.
+      rec = { code: null, fleet_id: join.fleetId, from_fleet_key: true };
+    } else {
+      rec = this.validatePairingCode(request.pairing_code);
+    }
+
     const machineId = request.machine_id;
     if (typeof machineId !== 'string' || machineId.length === 0) {
       throw new ProtocolError('BAD_REQUEST', 'machine_id is required');

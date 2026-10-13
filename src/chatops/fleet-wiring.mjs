@@ -206,7 +206,19 @@ export function fleetForPairingCode(codeRecord) {
  */
 export function deviceFleetFields({ codeRecord, fleetKeyEncoded = null, requestedFleet = null }) {
   const fromCode = fleetForPairingCode(codeRecord);
-  if (fromCode !== null) return { fleet_id: fromCode, fleet_source: 'pairing_code' };
+  if (fromCode !== null) {
+    /**
+     * The provenance has to say *how* the fleet was established, and a first version did not: it
+     * reported `pairing_code` for a device that never presented one, because the relay builds a
+     * synthetic code record for the key path so the binding reads from a single place.
+     *
+     * That mattered. `fleet_source` is what an operator reads in `devices.json` to answer *"how did
+     * this machine get into my fleet?"* — and answering "a pairing code" when there was none sends
+     * them looking for a code that was never issued. Found by a live pairing test, not by reading.
+     */
+    if (codeRecord?.from_fleet_key === true) return { fleet_id: fromCode, fleet_source: 'fleet_key' };
+    return { fleet_id: fromCode, fleet_source: 'pairing_code' };
+  }
 
   /**
    * The auto-join path. Tried before the operator's `--fleet` so that a device which knows its own
