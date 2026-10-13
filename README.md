@@ -250,7 +250,7 @@ dsh plugin --profile <profile-name> add @twinsearth/w2m-dsh-plugin
 
 ```bash
 dsh plugin --profile <profile-name> add \
-  https://github.com/TwinsEarth/dsh-windows2macos/releases/download/v0.5.9/twinsearth-w2m-dsh-plugin-0.5.9.tgz
+  https://github.com/TwinsEarth/dsh-windows2macos/releases/download/v0.6.3/twinsearth-w2m-dsh-plugin-0.6.3.tgz
 ```
 
 **From the repository** — the form a marketplace's one-click installer uses (it clones
@@ -624,6 +624,13 @@ move with it: `claims` is 19 tests here and **22 when `dist/` holds a packed tar
 its two tarball-vs-`package.json` checks run instead of skipping — so a checkout with `dist/` measures
 **1,142 tests / 1,134 pass / 4 skip**, and that is the number to expect from a release tree.
 
+> **These counts are the v0.5.9 measurement and have not been re-taken since.** They are kept, dated
+> and attributed rather than refreshed, because a figure presented as current without having been
+> measured is the failure this project's own rules exist to prevent. Suites added after v0.5.9 —
+> `p2p-crypto`, and from v0.7.0 `chatops-approval` and `chatops-policy` — are therefore **not** in
+> any total on this page. Treat every count below as a v0.5.9 measurement until a release re-runs
+> the suite on its own host and says so.
+
 **Which script runs which suite matters, because they are not the same set:**
 
 | Command | Suites | Result on this host (v0.5.9) |
@@ -810,7 +817,7 @@ node bin/w2m-localside.mjs --rabbit http://<中继地址>:8787 --pair PAIR-XXXXX
 
 # 3) 装 DSH 插件
 dsh plugin --profile <profile-name> add \
-  https://github.com/TwinsEarth/dsh-windows2macos/releases/download/v0.5.9/twinsearth-w2m-dsh-plugin-0.5.9.tgz
+  https://github.com/TwinsEarth/dsh-windows2macos/releases/download/v0.6.3/twinsearth-w2m-dsh-plugin-0.6.3.tgz
 ```
 
 然后在 profile 的 `cordis.patch.yml` 里给插件 `rabbitUrl`（留空即用共享服务器）与 `operatorToken`，重启 DSH，即可直接用自然语言指挥：
