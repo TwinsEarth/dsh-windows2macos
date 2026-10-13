@@ -4,6 +4,56 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.5] — 2026-10-14
+
+**Stage 1 of the account-fleet design: this machine now knows which account it belongs to, and
+has a serial number.** The relay and the dispatch path are deliberately untouched — scoping
+dispatch by fleet is v0.8.0, because it changes the protocol.
+
+### Added
+
+* **`src/chatops/account.mjs`** — the identity root.
+  * **The account code comes from the host, not from a fetch and not from config.**
+    `ctx.deepseekAccount.getDeviceIdentity()` returns `userId`, which is hashed to an 8-hex
+    account code. There is deliberately **no way to set it from configuration**: a value an
+    operator can type is a value an attacker can type, so a hand-entered "account code" would be
+    a forgeable account code.
+  * **The SN is `W2M-<ACCT>-<HWID>-<TS>`, 40 characters**, defined to the character, with the
+    timestamp fixed at first generation so a restart cannot change a machine's identity.
+  * **Hardware sources per platform, all injectable**, so a Windows-shaped machine is exercised
+    on any host: `MachineGuid` / SMBIOS UUID, `IOPlatformUUID`, `/etc/machine-id`.
+  * **Placeholder values are refused before hashing.** Firmware that reports an all-zeroes UUID
+    would otherwise give *every such machine the same hardware code* — far worse than having none,
+    because it silently merges distinct machines.
+
+* `test/chatops-account.test.mjs` — 42 cases.
+
+### Two things the tests assert on purpose
+
+* **That a forged SN passes the shape check.** `isWellFormedSn` is named for what it does — it
+  answers "is this well formed", and an SN is computed by the party being checked, so nothing
+  about it is verifiable by inspection. The test *documents* this rather than papering over it,
+  so a future change that turns the shape check into an authorisation check fails a test instead
+  of building on sand.
+* **That two accounts get different fleets and two machines in one account get the same fleet.**
+  The property the whole scheme exists for, asserted directly rather than inferred.
+
+### Fixed
+
+* **The published v0.7.4 release notes claimed the SN is 41 characters. It is 40**
+  (4 + 8 + 1 + 12 + 1 + 14). The design document said the same thing in one place. Both are
+  corrected, and the release notes were edited in place. The wrong number came from arithmetic
+  done by hand; the unit test that asserts the length is what caught it.
+
+### Not in this release
+
+* **The relay still does not scope by fleet.** `docs/ACCOUNT-FLEET-DESIGN.md` §3 is designed and
+  unimplemented: dispatch targets are still `[...this.devices.values()]` with no filter, so
+  accounts remain mixed. That is v0.8.0 and it is a breaking protocol change.
+* **No device keypair yet.** The SN exists; the signature chain that makes account membership
+  *verifiable* rather than merely *asserted* does not.
+* **No message has yet gone from a phone through WeChat to the fleet.**
+
 ## [0.7.4] — 2026-10-14
 
 **No code changed.** This release is an audit and a design document, and it exists because the

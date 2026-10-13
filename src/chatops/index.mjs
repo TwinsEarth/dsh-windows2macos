@@ -37,7 +37,46 @@ import { createILinkChannel } from './ilink.mjs';
 import { isAllowedApiUrl } from './ilink-protocol.mjs';
 import { createFleetExecutor } from './fleet.mjs';
 import { createChatopsActions } from './actions.mjs';
+import { createAccountIdentity, parseSn, fleetOf, SN_STATE_KEY } from './account.mjs';
 import { helpText, commandTable } from './commands.mjs';
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+
+/**
+ * Load a stored serial number, or null.
+ *
+ * **Storage is deliberately not the config row.** A row is editable by whoever can edit the
+ * profile, and a serial number that a person can retype is a serial number that can be made to
+ * claim someone else's fleet. The state directory is where the machine's own identity already
+ * lives, so that is where this goes.
+ *
+ * A malformed stored SN is returned as-is rather than being ignored: `account.mjs` refuses it by
+ * name, and silently minting a replacement would hide a corrupted state file behind a machine
+ * that merely looks new.
+ */
+function loadStoredSn(path) {
+  if (path === null) return null;
+  try {
+    const raw = JSON.parse(readFileSync(path, 'utf8'));
+    const value = raw?.[SN_STATE_KEY];
+    return typeof value === 'string' && value !== '' ? value : null;
+  } catch {
+    // Absent or unreadable is the normal first-run path, not an error worth reporting twice.
+    return null;
+  }
+}
+
+/** Persist an SN at 0600, so the machine's identity is not world-readable. */
+function storeSn(path, sn) {
+  if (path === null) return false;
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, `${JSON.stringify({ [SN_STATE_KEY]: sn, schema_version: 1 }, null, 2)}\n`, { mode: 0o600 });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * A fleet that refuses everything, for an install with no relay configured.
@@ -68,6 +107,7 @@ const DEFAULTS = Object.freeze({
   reply: Object.freeze({ maxChunkBytes: 6000, rateLimitMs: 1200, maxFileMB: 100 }),
   storagePath: '',
   projectRoot: '',
+  stateDir: '',
   operatorToken: '',
   enableMemoryChannel: false,
   /** The fleet. `rabbitUrl` is read from the same row the tools use, so there is one setting. */
@@ -96,6 +136,9 @@ export function readChatopsConfig(config = {}) {
     reply,
     storagePath: typeof config.storagePath === 'string' ? config.storagePath : DEFAULTS.storagePath,
     projectRoot: typeof config.projectRoot === 'string' ? config.projectRoot : DEFAULTS.projectRoot,
+    // Where the machine's own identity lives. Read from the same row the agent uses, so there is
+    // one setting rather than two — a second state directory would be a second identity.
+    stateDir: typeof config.stateDir === 'string' && config.stateDir.trim() !== '' ? config.stateDir.trim() : DEFAULTS.stateDir,
     // Resolution order matches the tools': the row, then the environment, then nothing. A
     // different order here would mean the chat layer and the tools disagree about which token
     // they hold, and only one of them would be refused.
@@ -247,6 +290,46 @@ export async function apply(ctx, config = {}) {
     audit: (event, detail) => ctx?.logger?.debug?.(`chatops ${event} ${JSON.stringify(detail ?? {})}`),
   });
 
+  /**
+   * This machine's identity: which account it belongs to, and its serial number.
+   *
+   * Resolved before the channel work so a failure is reported once and early. A failure here is
+   * **not fatal to the plugin**: a machine with no signed-in account still runs the bridge, it
+   * just has no fleet — and the design says it must not be handed a placeholder one, because that
+   * would put two unrelated machines in the same pool.
+   */
+  const snPath = cfg.stateDir === '' ? null : join(cfg.stateDir, 'chatops-identity.json');
+  let identity = { ok: false, reason: 'not_resolved' };
+  try {
+    identity = await createAccountIdentity({
+      ctx,
+      stored: loadStoredSn(snPath),
+      platform: process.platform,
+      audit: (event, detail) => ctx?.logger?.debug?.(`chatops ${event} ${JSON.stringify(detail ?? {})}`),
+    }).resolve();
+  } catch (error) {
+    identity = { ok: false, reason: 'identity_threw', detail: error instanceof Error ? error.message : String(error) };
+  }
+
+  if (identity.ok) {
+    // Written once, on creation. A stored SN is never rewritten, so a restart cannot change the
+    // machine's identity — every restart looking like a new device is how a fleet fills with
+    // ghosts of one machine.
+    if (identity.reused === false && storeSn(snPath, identity.sn)) {
+      log.info(`identity ${identity.sn} (fleet ${identity.accountCode}, from ${identity.hardwareSources?.join('+') ?? 'unknown'})`);
+    } else if (identity.reused) {
+      log.info(`identity ${identity.sn} (reused; fleet ${identity.accountCode})`);
+    }
+  } else {
+    // Named, and at warn level, because "why is this machine in no fleet" is otherwise unanswerable
+    // from the outside. `signed-out` is the common case and is not an error.
+    log.warn(
+      identity.reason === 'signed-out'
+        ? 'no DeepSeek account is signed in, so this machine has no fleet; it will not be grouped with any other'
+        : `no serial number was produced (${identity.reason}${identity.detail ? `: ${identity.detail}` : ''})`,
+    );
+  }
+
   // The fleet half of the action set. This is what makes `/run` mean something: without it the
   // command could only ever answer "this install has no fleet", which is exactly what v0.7.1 and
   // earlier did.
@@ -332,6 +415,12 @@ export async function apply(ctx, config = {}) {
     started: true,
     help: helpText(),
     configRoute: route !== null,
+    // Reported here so `apply`'s result answers "which fleet is this machine in" without the
+    // caller needing to know about account.mjs. `sn: null` plus a `reason` means no fleet, and
+    // the reason is the actionable half.
+    sn: identity.ok ? identity.sn : null,
+    fleet: identity.ok ? identity.accountCode : null,
+    identity: identity.ok ? identity : { reason: identity.reason, detail: identity.detail ?? null },
     ...described,
   };
 }
