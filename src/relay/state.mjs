@@ -13,6 +13,11 @@
 
 import { createHash, randomBytes } from 'node:crypto';
 
+// v0.7.7: fleet scoping. Imported rather than inlined so the rule has one home with its own
+// exhaustive tests — three lines inside this object would be untestable without a live relay.
+import { targetsFor } from '../chatops/fleet-wiring.mjs';
+import { fleetForPairingCode, deviceFleetFields } from '../chatops/fleet-wiring.mjs';
+
 export const PROTOCOL_VERSION = 1;
 
 /**
@@ -391,6 +396,18 @@ export class RabbitState {
 
     this.protocolVersion = PROTOCOL_VERSION;
     this.eventBufferSize = options.eventBufferSize ?? DEFAULT_EVENT_BUFFER_SIZE;
+    /**
+     * v0.7.7: the fleet this relay serves, or null for a relay that serves every device.
+     *
+     * **Null is the migration-safe default and is what the shared relay runs today.** With it,
+     * task targeting behaves exactly as it did before this release, so deploying cannot be an
+     * outage. Set it (via `--fleet <id>` or `fleetId`) and the relay becomes scoped: a device
+     * with a `fleet_id` reaches only its own fleet, and a device with none reaches nothing.
+     *
+     * This is the relay's *own* fleet, not a device's. A device carries its own `fleet_id`, which
+     * the relay wrote at pairing time from the pairing code.
+     */
+    this.fleetId = typeof options.fleetId === 'string' && options.fleetId !== '' ? options.fleetId : null;
     this.pairingTtlMs = options.pairingTtlMs ?? DEFAULT_PAIRING_TTL_MS;
     /** When true one code stays valid for its whole TTL instead of rotating. */
     this.pairingCodeReusable = options.pairingCodeReusable === true;
@@ -669,13 +686,33 @@ export class RabbitState {
 
   /* ---------------- pairing (§2) ---------------- */
 
-  createPairingCode({ ttlMs = this.pairingTtlMs } = {}) {
-    let code;
-    do { code = `PAIR-${this._randomChars(8)}`; } while (this.pairingCodes.has(code));
-    const now = this.nowMs();
-    this.pairingCodes.set(code, { code, created_at_ms: now, expires_at_ms: now + ttlMs, used: false });
-    return code;
-  }
+    /**
+     * Mint a pairing code.
+     *
+     * **v0.7.7: the code carries the relay's fleet.** This is the link that makes the scheme work,
+     * and it is easy to leave out: `pair()` reads the fleet *from the code*, so a code with no
+     * fleet pairs a device into no fleet -- and a device in no fleet reaches nothing on a scoped
+     * relay. `--fleet X` would then have had no effect on anything, silently.
+     *
+     * Defaulting to `this.fleetId` rather than requiring the caller to pass it means there is no
+     * path that mints a fleetless code on a scoped relay. An explicit `fleetId` overrides, which
+     * is what a relay serving several fleets would need.
+     */
+    createPairingCode({ ttlMs = this.pairingTtlMs, fleetId = this.fleetId } = {}) {
+      let code;
+      do { code = `PAIR-${this._randomChars(8)}`; } while (this.pairingCodes.has(code));
+      const now = this.nowMs();
+      this.pairingCodes.set(code, {
+        code,
+        created_at_ms: now,
+        expires_at_ms: now + ttlMs,
+        used: false,
+        // Present as an explicit key even when null, so a code dump shows whether a fleet was
+        // attached rather than leaving it to be inferred from an absent field.
+        fleet_id: typeof fleetId === 'string' && fleetId !== '' ? fleetId : null,
+      });
+      return code;
+    }
 
   /** Revoke every outstanding code and mint a new one. */
   rotatePairingCode(opts) {
@@ -734,6 +771,14 @@ export class RabbitState {
       platform: request.platform ?? {},
       caps: request.caps ?? {},
       user_id: request.user_id ?? null,
+        // v0.7.7: which fleet this device belongs to, and where that fact came from.
+        //
+        // **The fleet comes from the pairing code, not from the request.** A device that could
+        // name its own fleet would join any fleet, and every signature would faithfully attest
+        // to it. `deviceFleetFields` is the single place that binding is made, and it records
+        // its provenance so a fleet that arrived from a request is visible as such in
+        // `devices.json` rather than looking identical to one that came from a code.
+        ...deviceFleetFields({ codeRecord: rec, requestedFleet: null }),
       device_token: token,
       paired_at_ms: now,
       re_paired: Boolean(existing),
@@ -991,6 +1036,21 @@ export class RabbitState {
       platform: device.platform,
       caps: device.caps,
       user_id: device.user_id,
+        /**
+         * v0.7.7: the fleet this device belongs to, and where the fact came from.
+         *
+         * **Carried in the public shape on purpose, and it has to be**, because `devices.json`
+         * is written from this shape -- a fleet that lived only on the in-memory record would
+         * vanish on the next restart, which is precisely when an operator is looking at it. A
+         * first version omitted these and the live test caught the fleet disappearing from
+         * `listDevices()`.
+         *
+         * Safe to expose: `fleet_id` is a truncated hash of the account id, not the account id,
+         * and devices on one relay can already enumerate each other. Narrowing `/v1/devices` to
+         * a device's own fleet is a further step, recorded as such rather than implied.
+         */
+        fleet_id: device.fleet_id ?? null,
+        fleet_source: device.fleet_source ?? null,
       online: device.online,
       streams: device.streams,
       paired_at: rfc3339(device.paired_at_ms),
@@ -1257,10 +1317,102 @@ export class RabbitState {
       p2p: routing.p2p,
     };
 
-    const all = [...this.devices.values()];
-    const targets = Array.isArray(input.target_machines) && input.target_machines.length > 0
-      ? all.filter((d) => input.target_machines.includes(d.machine_id))
-      : all;
+    /**
+     * Fleet scoping (v0.7.7).
+     *
+     * This replaces `targets = [...this.devices.values()]`, which reached **every device on the
+     * relay** with no filter — the finding that accounts were not isolated. The rule now lives in
+     * `fleet-wiring.mjs` so it is one function with its own exhaustive tests rather than three
+     * lines inside a two-thousand-line object.
+     *
+     * ## The migration is deliberate, and so is its limit
+     *
+     * The shared relay holds four devices that paired before fleets existed, and none of them has
+     * a `fleet_id`. `targetsFor` therefore has two modes: a relay with no fleet configured keeps
+     * exactly the old behaviour, and a relay that *is* scoped refuses a fleetless requester rather
+     * than handing it the run of the fleet. So deploying this cannot be an outage, and scoping it
+     * cannot be a silent grant.
+     *
+     * ## What this does NOT do, stated here rather than discovered later
+     *
+     * `POST /v1/task` authenticates with the **operator token**, and `authorizeTaskDispatch`
+     * returns `{ role: 'operator', machine_id: null }` for it — there is no device, so there is no
+     * fleet to scope by. Every device that authenticates with a **device token** gets full
+     * isolation from this change; an operator-token dispatch remains relay-wide, because the
+     * operator token *is* the relay-wide credential by design.
+     *
+     * `input.created_by` is the one device identity a task carries, and it is used when present:
+     * a task submitted on behalf of a machine is scoped to that machine's fleet.
+     */
+    const requester =
+      (typeof input.created_by === 'string' && this.devices.get(input.created_by)) ||
+      (typeof input.requester_machine_id === 'string' && this.devices.get(input.requester_machine_id)) ||
+      null;
+
+    /**
+     * An operator-token dispatch, on a relay that has been scoped, acts **within that scope**.
+     *
+     * A first version passed `requester: null` and let it be refused -- which broke every
+     * operator dispatch on a scoped relay, and broke it in the least useful way: the operator had
+     * just configured the fleet, and configuring it made them unable to dispatch at all.
+     *
+     * The reasoning for the fix: the relay's own `fleetId` *is* an admin's statement about which
+     * fleet this relay serves. An operator dispatch therefore has an unambiguous scope, and
+     * refusing it would be refusing the case that was explicitly asked for.
+     *
+     * What stays genuinely ambiguous is an operator dispatch on a relay holding **several** fleets
+     * with no fleet of its own -- there is no way to tell which was meant, so `targetsFor` refuses
+     * that rather than guessing.
+     */
+    const scopedRequester =
+      requester ??
+      (this.fleetId === null ? null : { machine_id: null, fleet_id: this.fleetId, fleet_source: 'relay_scope' });
+
+    const scoped = targetsFor({
+      devices: [...this.devices.values()],
+      requester: scopedRequester,
+      targetMachines: input.target_machines,
+      relayFleetId: this.fleetId ?? null,
+      // The existing code did not filter offline devices at selection time -- it offered to them and
+      // let the lease expire. Keeping that here avoids changing two behaviours at once, and the
+      // lease expiry is what `handoff.mjs` is for.
+      requireOnline: false,
+    });
+    if (!scoped.ok) {
+      /**
+       * `NO_ONLINE_DEVICE`, not a new code.
+       *
+       * A first version invented `NO_ELIGIBLE_DEVICE`, which broke the one relay test that pins
+       * this contract — and worse, it would have broken **callers**: `chatops/fleet.mjs` reads
+       * `NO_ONLINE_DEVICE` to produce *"start an agent on each machine"*, and a code it has never
+       * seen falls through to a generic refusal. The protocol's code table is part of the
+       * protocol, and adding a member to it is a decision for a protocol revision, not for a
+       * wiring change.
+       *
+       * What *is* new is why nothing was eligible, and that belongs in `detail`, where a caller
+       * can read it without a new code entering the table.
+       */
+      throw new ProtocolError('NO_ONLINE_DEVICE', scoped.text, {
+        reason: scoped.reason,
+        legacy: scoped.legacy,
+        fleet_scoped: scoped.legacy === false,
+        hint:
+          scoped.reason === 'requester_has_no_fleet'
+            ? 'this relay is bound to a fleet and the requesting device is in none; pair it with a code issued for that fleet'
+            : scoped.reason === 'target_outside_fleet'
+              ? 'the named target is not in this fleet'
+              : 'check that at least one device in this fleet is paired and streaming',
+      });
+    }
+    const targets = scoped.targets;
+    if (scoped.legacy) {
+      // Logged at debug so an operator reading logs during a migration can see which rule applied.
+      // "N targets" alone does not say whether isolation is on, and that is the question being asked.
+      this.log?.('debug', 'task targets selected without a fleet (legacy path)', {
+        task_candidates: targets.length,
+        relay_fleet_id: this.fleetId ?? null,
+      });
+    }
 
     // v0.3.3 `broadcast`: validated here, where `targets` is known. The executor id itself was
     // resolved before the task literal because the literal records it.

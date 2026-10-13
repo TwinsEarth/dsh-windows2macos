@@ -53,6 +53,9 @@ Credentials and state:
   --no-persist           Keep everything in memory; forget devices and tasks on
                          restart.
   --pairing-code <c>     Use a fixed pairing code instead of a generated one.
+--fleet <id>           Bind this relay to one account's fleet. Omitted, the relay serves
+                       every device (the pre-v0.7.7 behaviour). Set, a device with no
+                       fleet reaches nothing and a device in another fleet is invisible.
 
 Request signing (v0.3.0):
   --signing-secret <s>   Shared secret for HMAC-signed requests. Unset means the relay does
@@ -98,6 +101,9 @@ try {
       port: { type: 'string' },
       state: { type: 'string' },
       'pairing-code': { type: 'string' },
+      // v0.7.7: bind this relay to a fleet. Omitted means every device, which is the
+      // pre-v0.7.7 behaviour and therefore the migration-safe default.
+      fleet: { type: 'string' },
       'heartbeat-ms': { type: 'string' },
       'grace-ms': { type: 'string' },
       'base-path': { type: 'string' },

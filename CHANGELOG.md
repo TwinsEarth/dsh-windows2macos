@@ -4,6 +4,88 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.8] — 2026-10-14
+
+**The wiring.** v0.7.5–v0.7.7 shipped modules that nothing called. This release connects them, so
+account isolation and fleet scoping are **in effect** rather than merely tested.
+
+### What changed in the relay
+
+* **`src/relay/state.mjs`** — `createTask` no longer selects `[...this.devices.values()]` with no
+  filter. It calls `targetsFor()` from `fleet-wiring.mjs`, which applies the fleet rule.
+* **`createPairingCode` now carries the relay's fleet**, and `pair()` writes it onto the device.
+  This is the link the whole scheme hangs on, and it is easy to omit: `pair()` reads the fleet
+  *from the code*, so a code with no fleet pairs a device into no fleet — and a device in no fleet
+  reaches nothing on a scoped relay. `--fleet X` would then have had **no effect on anything,
+  silently**.
+* **`publicDevice` carries `fleet_id` and `fleet_source`.** `devices.json` is written from this
+  shape, so a fleet that lived only on the in-memory record would have vanished on the next
+  restart — which is precisely when an operator looks at it. A live test caught that.
+* **`bin/w2m-rabbit.mjs`** gains `--fleet <id>`.
+
+### The migration, which is the part that could have gone wrong
+
+The shared relay holds four devices that paired before fleets existed, none with a `fleet_id`.
+The rule is therefore two-mode, and both modes are tested against the relay's *actual* state:
+
+| relay | requester | reaches |
+|---|---|---|
+| unscoped (`--fleet` absent) | operator, or a fleetless device | **every device — byte-for-byte the old behaviour** |
+| scoped (`--fleet X`) | operator | **fleet X** |
+| scoped | a device in fleet X | **fleet X only** |
+| scoped | a fleetless device | **nothing**, with the reason named |
+
+**Deploying this cannot be an outage**, and **scoping it cannot be a silent grant** — the second
+row of that table is what makes the first row safe to ship.
+
+### Three defects found while wiring, all by tests
+
+1. **`NO_ELIGIBLE_DEVICE` was invented.** It broke the one relay test that pins the contract, and
+   worse, it would have broken **callers**: `chatops/fleet.mjs` reads `NO_ONLINE_DEVICE` to
+   produce *"start an agent on each machine"*, and an unrecognised code falls through to a generic
+   refusal. The protocol's code table is part of the protocol; the new information went into
+   `detail` instead.
+2. **An absent requester was refused as an unknown one.** An operator is not a device —
+   `authorizeTaskDispatch` returns `{ role: 'operator', machine_id: null }` — so treating "no
+   device" as "unknown device" turned every operator dispatch into an error and broke **74 relay
+   tests at once**.
+3. **An operator dispatch on a scoped relay was refused.** Configuring the fleet made the operator
+   unable to dispatch, which is the least useful possible outcome. The relay's own `fleetId` *is*
+   a statement about which fleet it serves, so an operator dispatch has an unambiguous scope and
+   lands inside it.
+
+### Verification
+
+* **432 chatops cases across sixteen suites**, including **ten that boot a real relay** and assert
+  the three links end to end: `--fleet` → the code carries it → the device carries it → dispatch
+  reaches only that fleet.
+* **The relay's own 168 tests pass unchanged**, which is the migration guarantee: the legacy path
+  reproduces the rule it replaced.
+* The repository's wider suite keeps its baseline of one environmental failure (a missing
+  `node_modules/eslint`).
+
+### Deployed
+
+The Linux server (`vultr`, `202.182.123.154`) was updated **v0.6.3 → v0.7.7** with a scripted
+deploy: checksum verified before unpacking, the previous tree backed up, the new tree staged and
+checked for entry points, then swapped, restarted and health-checked, with automatic rollback on
+failure. Relay state (`/var/lib/w2m/rabbit`) was untouched — the 839 KB ledger and the operator
+token both survived.
+
+**It runs unscoped**, so its four devices keep working exactly as before. Setting `--fleet` is
+what turns isolation on, and it is now a one-line change plus a re-pair.
+
+### Still not done
+
+* **Hand-off is not wired into the relay's lease sweep.** `handoff.mjs` is complete and tested;
+  `shouldHandOff()` is not yet called on lease expiry. A silent machine is still simply silent.
+* **Device-side signals are not sent.** No device generates a keypair in a real run, and no request
+  carries a signature. The relay's existing HMAC signing (`signing.mjs`) is a different mechanism
+  and is untouched.
+* **`/v1/devices` is not narrowed to the caller's own fleet.** A device on a relay can still list
+  every fleet's machines; it cannot *reach* them, which is the part that matters for isolation.
+* **No message has yet gone from a phone through WeChat to the fleet.**
+
 ## [0.7.7] — 2026-10-14
 
 **Hand-off: what happens when the machine holding a task does not answer.** `ACCOUNT-FLEET-DESIGN.md`
