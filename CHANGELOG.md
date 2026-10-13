@@ -4,6 +4,124 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] — 2026-10-14
+
+**The first release on npm since 0.6.3.** Eight versions of work — account identity, fleet
+isolation, device signing, lease-takeover guards, `/run`, the durability policy, and the server's
+own configuration — now reachable by `npm install` rather than only by git tag.
+
+### What is in it, and what each part actually guarantees
+
+**Account identity and the SN** (0.7.5). A machine derives a serial number from
+`account code + hardware code + time code`. The account code is `sha256(userId)` truncated, so it
+can be handed to a relay without disclosing the account id — which is what makes the next part
+possible on a server that has no account login of its own.
+
+**Fleet isolation** (0.7.6, wired in 0.7.8). `createTask` no longer selects every device on the
+relay. It selects the requester's fleet, where the fleet is read **from the pairing code** — a
+device cannot name its own fleet, because a device that could would join any fleet and every
+signature would faithfully attest to it.
+
+The migration is two-mode and both modes are tested against the relay's real state:
+
+| relay | requester | reaches |
+|---|---|---|
+| unscoped | operator, or a fleetless device | **every device — the pre-0.7.8 rule, unchanged** |
+| scoped | operator | the relay's fleet |
+| scoped | a device in that fleet | that fleet only |
+| scoped | a fleetless device | **nothing**, with the reason named |
+
+**Deploying cannot be an outage; scoping cannot be a silent grant.**
+
+**Per-device Ed25519 signing** (0.7.10, verified by the relay in 0.7.11). The relay already signed
+requests, but with **HMAC over a shared secret** — everyone who can sign can verify, so that proves
+only that the sender knows the secret, which is every device. A device key proves *which* device.
+
+The relay now tries the device key first and converges one machine at a time:
+
+| device | outcome |
+|---|---|
+| sends no signature | shared secret, byte-for-byte unchanged |
+| stored key, good signature | verified by the key |
+| stored key, **bad** signature | **refused, and not retried against the shared secret** |
+
+That third row is the whole point: falling back would make the strong mechanism *optional* for
+anyone able to produce a malformed signature, which is everyone.
+
+**Lease-takeover guards** (0.7.9). `_takeover` would re-offer a dead machine's index to **every idle
+device the relay holds**, with no fleet filter and no consideration of whether the task writes. So a
+device in another account could be handed the work, and a writing task could be run twice. Both are
+now refused with a named reason.
+
+**`/run` with two privilege levels** (0.7.11).
+
+| form | who | what it does | capability |
+|---|---|---|---|
+| `/run <argv>` | expert | dispatches those arguments, uninterpreted | `fleet.dispatch` |
+| `/run --ask <words>` | beginner | asks; the agent answers and **proposes** | `operate` |
+
+A beginner describing what they want is **not** executing anything: the request goes to a session,
+and if the session wants something run it emits `/run <argv>`, which still needs `fleet.dispatch`.
+**A low-privilege window can ask freely and cannot cause a fleet execution by asking.**
+
+**Durability policy** (0.7.11). The requirement — *"10× redundancy, tolerate losing 90% of nodes"* —
+is two different claims, and the arithmetic decides the architecture:
+
+```
+n=   3  copies=3/10   loss=100%  basis=server_complete
+n= 100  copies=10/10  loss=100%  basis=server_complete
+--- with no server copy ---
+n=   3  loss=67%   meets=false      <- three devices cannot reach 90% alone
+n=  10  loss=90%   meets=true
+```
+
+At three devices the guarantee is **the server's complete copy**; device redundancy alone gives
+**67%**. So the server is the **authority at every tier**, not one more replica to drop once devices
+are plentiful.
+
+**`deploy/server/`**. The three systemd units as the live host runs them, and the deployment script
+whose step order is the safety argument: checksum before unpacking, back up in place, entry-point
+check before swapping, then restart, health-check, and automatic rollback on failure.
+
+### The secrets guard
+
+`scripts/scan-for-secrets.mjs` fails a release on a credential shape in any **tracked file**. It
+exists because `.gitignore` refuses a *path*, while the ways a credential escapes are pasting one
+into a source file, a fixture, or an example. The relay's `operator-token.txt` — full control of the
+fleet — is the thing it protects.
+
+Writing it exposed **six defects in the guard itself**, every one a silent-off failure that looks
+like success: an unconditional `statSync` that made an injected reader unreachable; a relative path
+that made the scan report zero findings across zero files; a token regex that missed camelCase; a
+slug rule that rejected `p2p-crypto-operator` over a digit; a duplicate rule; and a test that
+hard-coded rule names and so measured the name rather than the behaviour.
+
+### WeChat, measured
+
+Reading and sending both work against the live service. The body is `item_list[0].text_item.text`,
+the cursor is `get_updates_buf`, login confirms as `confirmed` (not `scaned`), the token is valid
+**>280 s**, and a send nests under `msg` with `message_type: 2` and `message_state: 2`, returning a
+`message_id` and no `ret`. Four wrong guesses on the wire format made a working feature look broken,
+including a false conclusion that the token lived only 30 seconds.
+
+### The honest gaps
+
+* **`shouldHandOff()` and `reconcileResults()` are written and tested but not wired.** The fleet and
+  write guards are in the relay's takeover path; single-successor selection is not.
+* **The relay defaults to unscoped**, so accounts are mixed unless an operator sets `--fleet`. Doing
+  so requires an account code, which a headless server cannot produce, and a re-pair of every
+  device — during which a fleetless device reaches nothing.
+* **`/run` is not yet wired to the WeChat channel.** The parser, the renderer, and the capability
+  split are complete and tested; the last link is the adapter.
+* **The Mac cannot be updated remotely.** Its allow-list refuses anything but `node -e`, and a DSH
+  restart would kill the only channel to it.
+* **`/v1/devices` is not narrowed to the caller's fleet** — a device can still *list* another
+  fleet's machines, though it cannot *reach* them.
+
+### Verified
+
+**542 chatops cases across twenty-two suites**, and the relay's own **168 unchanged**.
+
 ## [0.7.11] — 2026-10-14
 
 **The relay verifies device signatures, `/run` reaches the fleet from a chat window, the durability
