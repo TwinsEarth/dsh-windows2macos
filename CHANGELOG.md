@@ -4,6 +4,114 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] — 2026-10-14
+
+The release that answered "can we drive the fleet from a phone?" with **not yet, and
+here is exactly why** — and then built the two pieces that had to exist first, under
+test.
+
+### Why this is not the feature, and why that is the honest release
+
+The goal was to fold [`dsh-chatops`](https://github.com/ZhuoSir/dsh-chatops) 0.1.0 —
+an IM bridge for WeChat/Feishu/DingTalk/WeCom — into this plugin as a feature. It was
+read in full instead of trusted: ~168 KB of TypeScript across 40 files, plus the
+published 3,544-line bundle, which is byte-identical to the committed source modulo
+CRLF (`minify:false`, so identifiers and comments survive — the audit is on the real
+artifact).
+
+**It is not safe to adopt as written, and the reasons are not stylistic:**
+
+* The approval answerer registers `(req) => …` on the `approval/request` **waterfall**
+  and never calls `next()`. This host documents that event as *"Return an outcome to
+  claim the request or call `next()` to delegate"*, and cordis's `waterfall` consults
+  the next listener **only when the current one calls `next()`**. The plugin's listener
+  is also `async`, so it hands back a Promise, and the harness takes any non-`undefined`
+  value as the final answer. The host's own GUI answerer is therefore never consulted
+  for a session that has an IM window bound, and the request is held until the plugin's
+  own 300 s deadline. Whether it happens at all depends on listener **registration
+  order**, which the plugin does nothing to control. This is the one defect that reaches
+  beyond the plugin.
+* The first private message on any of three channels makes its sender a **permanent
+  owner**, before any authorisation runs, with no pairing code and no allow-list, and
+  persists the claim to `bindings.json`. All four channels ship enabled by default. Once
+  adopted, that identity can enumerate every workspace and session, inject prompts,
+  read transcripts via `/log`, exfiltrate workspace files via `/send`, approve, and
+  switch the sandbox to `danger-full-access`.
+* `GET /chatops/api/config` returns four platforms' credentials in cleartext behind a
+  loopback-only check with no token and no Origin validation; the settings page re-polls
+  it every 3 s. `POST` to the same path merges an unvalidated body into the config and
+  writes the profile's `cordis.patch.yml` — and `puppet` is passed to `await import()`,
+  so that path is arbitrary module load.
+* Pending approvals were keyed by window alone, so a second concurrent request
+  overwrote the first and the older became unanswerable from IM.
+* The workspace file fence is lexical only (`resolve` + `startsWith`); `statSync`
+  follows symlinks, so a link inside the project ships any readable file to IM.
+
+Shipping that as a headline feature would have been a regression in every user's
+safety, so it is not shipped. The audit is published instead, and the two modules that
+had to exist first are built and tested.
+
+### Added
+
+* **`src/chatops/approval-broker.mjs`** — the approval seam, designed so the defect
+  above cannot recur:
+  * **declining is synchronous and never touches `next`**, so a bridge with nothing to
+    ask leaves the host's answerers to answer;
+  * **a deadline delegates instead of deciding** — a phone that did not answer is not
+    an operator who said no, so the timeout calls `next()` and lets the answerers behind
+    it decide;
+  * **pending requests are keyed by approval id and queued per window**, so two
+    concurrent requests cannot overwrite each other;
+  * ids carry full entropy, where 0.1.0 minted `randomUUID().slice(0, 8)` — 32 bits held
+    for five minutes;
+  * `dispose()` settles everything outstanding, so a reload leaves no timer that can
+    resolve a promise belonging to a fiber that no longer exists;
+  * the clock **and** the timer are injectable. That pairing is the whole reason the
+    suite is deterministic: an injected clock with a real `setTimeout` is two clocks, and
+    the first version of this test hung rather than failed.
+* **`src/chatops/policy.mjs`** — who may command this machine, fail-closed:
+  * **nothing is trusted because it arrived.** An identity is trusted only by being
+    seeded in config or by redeeming a single-use, expiring, per-identity rate-limited
+    pairing code. There is no path that trusts a sender because nobody else had spoken;
+  * identity is `(channel, id)`. 0.1.0 held one flat `Set` matched after stripping the
+    channel prefix, so the same raw id was the same person on every platform;
+  * **a room is not a person**: an allowed room is never sufficient — the speaker must
+    also be individually trusted, where 0.1.0 returned `true` for every member of an
+    allowed room whenever `allowContacts` was empty;
+  * revocation exists, which 0.1.0 had no way to do short of deleting its state file;
+  * `CHANNELS` is **one** registry. The same information lived in four places that had to
+    agree, and a channel missing from the authorisation regexes had every message from it
+    silently dropped;
+  * a well-formed key naming an unenabled channel is a **named** refusal
+    (`channel_unknown`), because a silent drop is indistinguishable from a bot that is
+    simply broken.
+* `test/chatops-approval.test.mjs` (24 cases) and `test/chatops-policy.test.mjs`
+  (24 cases), both wired into `test` and `test:all`.
+
+### Not in this release
+
+* **No IM channel is wired up.** These are the two halves that carry the safety
+  properties; the WeChat/Feishu/DingTalk/WeCom transports, the command router and the
+  file delivery are not here.
+* **Nothing in `src/chatops/` has been exercised against a real IM platform.** It is
+  verified by unit tests with fake channels, which cover the properties that matter —
+  who is admitted, who decides, what happens on a deadline — and prove nothing about
+  WeChat's protocol, a tenant's identity model, or a five-minute wait in production.
+  An end-to-end claim would need credentials and a phone, and is not made.
+* The audit's own limits: the chatops dependency trees were not resolved (no
+  `node_modules` was installed, and none of its code was executed), and its Feishu
+  card-action signature path lives inside a vendor SDK that was not available to read.
+
+### Note on the other half of the work
+
+The three-machine comparison this fleet exists for still needs one commit that all
+three machines can reach. The Mac runs the project at `a1e7dc04` on a clean tree with
+`--project /Users/fang/w2m-project` — already correct, and already the same path its own
+DSH uses; the mismatch is that this is not the commit the Windows host and the Tokyo
+relay are on. Its `git ls-remote` to GitHub times out while `curl api.github.com`
+answers 200, so the reachable common anchor is `origin/main` (`6e7ba0c9`, the v0.6.3
+tag) rather than the fixture commit used for the local runs.
+
 ## [0.6.3] — 2026-10-13
 
 One fix, and it is the half of v0.6.2 that made the other half usable.
