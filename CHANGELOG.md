@@ -4,6 +4,86 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.10] — 2026-10-14
+
+**Per-device Ed25519 request signing — the part of the signature chain that can be built without
+locking anyone out.** The relay does not enforce it yet, deliberately.
+
+### Why a second signing mechanism
+
+The relay already has request signing, and it is **HMAC over a shared secret**: everyone who can
+sign can also verify, so the relay holds a credential that every device holds. That is fine when
+one operator owns every machine, and it is the wrong shape for what this workstream is about —
+proving that *this specific device* is in *this account's* fleet. **A shared secret proves only
+that the sender knows the secret, which is every device.**
+
+`src/chatops/device-signing.mjs` signs with a **device-held Ed25519 private key**, so the relay
+verifies with a public key it stores and never holds anything that could impersonate the device.
+
+### The defect that would have made all of it useless
+
+The signed bytes are the **relay's own canonical string**, reproduced byte for byte:
+
+```
+v1\n<METHOD>\n<path>\n<timestamp>\n<nonce>\n<sha256-of-body>
+```
+
+The first version hashed the body with `createHash('sha256', …)`. **The relay uses
+`createHmac('sha256', Buffer.alloc(0))`**, and those are not the same function: HMAC wraps the key
+with its own padding, so an empty body hashes to `b613679a…` rather than `e3b0c442…`.
+
+**Every signature would have failed, forever, with no clue why.** A probe that signed four requests
+with both implementations and compared the strings is what caught it — and that comparison is now
+a test, because it is the only reason this is correct.
+
+### Added
+
+* **`src/chatops/device-signing.mjs`** — a device signer, a verifier, and the shared canonical
+  string. Compatibility with the existing mechanism is deliberate: one verified string rather than
+  two that must be kept in step, and the relay can tell the two apart by **whether the device has a
+  public key** — no protocol flag, no version negotiation, no second header a client could forget.
+* **`pair()` accepts and stores `public_key`.** Not validated there on purpose: a malformed key
+  fails at verification with a named reason, while rejecting a pairing over it would lock out every
+  existing device the moment the field appeared. A device that sends no key keeps working, with
+  `public_key: null` meaning *"signs with the shared secret or not at all"*.
+* **`publicDevice` reports `public_key_present`** as a boolean, not the key. The key is not a
+  secret, but a device list is read by every device, and verification happens relay-side.
+* `test/chatops-device-signing.test.mjs` — 22 cases.
+
+### The test that matters most
+
+`canonicalString` is compared against **the relay's own implementation, imported** — not against a
+reimplementation of the expectation. A test that asserts what the author believed the format to be
+would have passed for the broken version.
+
+### ⚠️ Not enforced, and that is the point
+
+**The relay does not verify device signatures yet.** A device that signs today is signing into a
+relay that does not check it. Two reasons this is the right order:
+
+1. **Enforcement is what would lock people out.** A relay that *requires* a signature refuses every
+   device that has not been updated — including all four current machines. Landing verification and
+   enforcement together is how a safety feature becomes an outage.
+2. **The fleet rollout is blocked anyway** (see v0.7.9): the shared relay cannot produce an account
+   code, and the Mac cannot be updated without physical access.
+
+So the sequence is: ship the signing, ship the verification, update every device, then turn
+enforcement on — with `requireSignature` already meaning *"insist"* in the relay's existing
+vocabulary, so the switch is one flag rather than a new mechanism.
+
+### Verified
+
+**459 chatops cases across eighteen suites**; the relay's own **146 unchanged**.
+
+### Still not done
+
+* **No signature is verified by the relay.** `verifyDeviceSignature` has no caller in `src/relay/`.
+* **Hand-off is guarded but not refined** — `shouldHandOff()` and `reconcileResults()` remain
+  unwired; the fleet and write guards from v0.7.9 are in the relay's takeover path.
+* **The Linux server, the Mac and the Windows plugin are still on older versions**, and the relay
+  is unscoped, so accounts remain mixed at runtime.
+* **No message has yet gone from a phone through WeChat to the fleet.**
+
 ## [0.7.9] — 2026-10-14
 
 **Two safety guards on lease takeover, and an honest account of what is still not connected.**

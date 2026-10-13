@@ -779,6 +779,19 @@ export class RabbitState {
         // its provenance so a fleet that arrived from a request is visible as such in
         // `devices.json` rather than looking identical to one that came from a code.
         ...deviceFleetFields({ codeRecord: rec, requestedFleet: null }),
+        /**
+         * v0.7.10: the device's Ed25519 public key, if it offered one.
+         *
+         * A public key is not a secret, so storing it costs nothing and it is the whole basis of
+         * per-device verification: the relay can then check a signature only *this* machine could
+         * have made, rather than a shared secret every machine holds.
+         *
+         * Not validated here, deliberately. A malformed key fails at verification with a named
+         * reason, while rejecting a pairing over it would lock out every existing device the
+         * moment this field was added -- and devices that send no key keep working, with
+         * `public_key: null` meaning "signs with the shared secret or not at all".
+         */
+        public_key: typeof request.public_key === 'string' && request.public_key !== '' ? request.public_key : null,
       device_token: token,
       paired_at_ms: now,
       re_paired: Boolean(existing),
@@ -1051,6 +1064,10 @@ export class RabbitState {
          */
         fleet_id: device.fleet_id ?? null,
         fleet_source: device.fleet_source ?? null,
+        // v0.7.10: a boolean rather than the key itself. The key is not a secret, but a device
+        // list is read by every device, and there is no reason to hand every machine every other
+        // machine's key when the verification happens relay-side.
+        public_key_present: typeof device.public_key === 'string' && device.public_key !== '',
       online: device.online,
       streams: device.streams,
       paired_at: rfc3339(device.paired_at_ms),
