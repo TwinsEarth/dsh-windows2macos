@@ -35,7 +35,26 @@ import { createConfigRoute } from './config-route.mjs';
 import { createMemoryChannel, validateChannel, CHANNEL_STATE } from './channel.mjs';
 import { createILinkChannel } from './ilink.mjs';
 import { isAllowedApiUrl } from './ilink-protocol.mjs';
+import { createFleetExecutor } from './fleet.mjs';
+import { createChatopsActions } from './actions.mjs';
 import { helpText, commandTable } from './commands.mjs';
+
+/**
+ * A fleet that refuses everything, for an install with no relay configured.
+ *
+ * Named refusals rather than an absent action, because `/machines` on a phone must say *why* it
+ * has nothing — "no rabbitUrl is set" is actionable and "this install has no fleet" is not.
+ */
+function unreachableFleet() {
+  const refuse = () => ({ ok: false, reason: 'no_relay', text: '这个安装没有配置 rabbitUrl，无法访问编队。' });
+  return {
+    run: async () => refuse(),
+    wait: async () => refuse(),
+    status: async () => refuse(),
+    report: async () => refuse(),
+    devices: async () => refuse(),
+  };
+}
 
 /** Cordis service this plugin needs: none. The bridge is self-contained by construction. */
 export const inject = [];
@@ -51,6 +70,12 @@ const DEFAULTS = Object.freeze({
   projectRoot: '',
   operatorToken: '',
   enableMemoryChannel: false,
+  /** The fleet. `rabbitUrl` is read from the same row the tools use, so there is one setting. */
+  rabbitUrl: '',
+  /** How long `/run` holds a chat reply before answering "still running". */
+  fleetWaitMs: 90_000,
+  /** Whether `/run` waits at all. A dispatch-only install answers with the task id instead. */
+  fleetAutoWait: true,
 });
 
 /** Read the row into a shape the modules take, with every default stated once. */
@@ -63,6 +88,7 @@ export function readChatopsConfig(config = {}) {
     : config.channel
       ? [config.channel]
       : [...DEFAULTS.channels];
+  const envToken = typeof process.env.W2M_OPERATOR_TOKEN === 'string' ? process.env.W2M_OPERATOR_TOKEN.trim() : '';
   return {
     channels,
     security,
@@ -70,7 +96,23 @@ export function readChatopsConfig(config = {}) {
     reply,
     storagePath: typeof config.storagePath === 'string' ? config.storagePath : DEFAULTS.storagePath,
     projectRoot: typeof config.projectRoot === 'string' ? config.projectRoot : DEFAULTS.projectRoot,
-    operatorToken: typeof config.operatorToken === 'string' ? config.operatorToken : DEFAULTS.operatorToken,
+    // Resolution order matches the tools': the row, then the environment, then nothing. A
+    // different order here would mean the chat layer and the tools disagree about which token
+    // they hold, and only one of them would be refused.
+    operatorToken:
+      typeof config.operatorToken === 'string' && config.operatorToken.trim() !== ''
+        ? config.operatorToken.trim()
+        : envToken !== ''
+          ? envToken
+          : DEFAULTS.operatorToken,
+    rabbitUrl:
+      typeof config.rabbitUrl === 'string' && config.rabbitUrl.trim() !== ''
+        ? config.rabbitUrl.trim()
+        : typeof process.env.W2M_RABBIT_URL === 'string' && process.env.W2M_RABBIT_URL.trim() !== ''
+          ? process.env.W2M_RABBIT_URL.trim()
+          : DEFAULTS.rabbitUrl,
+    fleetWaitMs: Number.isInteger(config.fleetWaitMs) ? config.fleetWaitMs : DEFAULTS.fleetWaitMs,
+    fleetAutoWait: config.fleetAutoWait !== false,
     enableMemoryChannel: config.enableMemoryChannel === true,
   };
 }
@@ -196,13 +238,42 @@ export async function apply(ctx, config = {}) {
     log.warn('mounted with an inert channel so the profile loads; enable a channel to receive anything');
   }
 
+  // The policy is built here rather than inside `createBridge`, so the action set can share the
+  // same one. Two policies would mean two answers to "who is trusted", and `/trust` would write
+  // to the copy that admission does not read.
+  const policy = createPolicy({
+    trustedContacts: cfg.security.allowContacts,
+    allowedRooms: cfg.security.allowRooms,
+    audit: (event, detail) => ctx?.logger?.debug?.(`chatops ${event} ${JSON.stringify(detail ?? {})}`),
+  });
+
+  // The fleet half of the action set. This is what makes `/run` mean something: without it the
+  // command could only ever answer "this install has no fleet", which is exactly what v0.7.1 and
+  // earlier did.
+  const fleet =
+    cfg.rabbitUrl === ''
+      ? null
+      : createFleetExecutor({
+          rabbitUrl: cfg.rabbitUrl,
+          token: cfg.operatorToken === '' ? null : cfg.operatorToken,
+          audit: (event, detail) => ctx?.logger?.debug?.(`chatops ${event} ${JSON.stringify(detail ?? {})}`),
+        });
+  if (fleet === null) log.warn('no rabbitUrl, so /run, /where, /report and /machines will refuse');
+
+  const actions = createChatopsActions({
+    executor: fleet ?? unreachableFleet(),
+    policy,
+    host: ctx?.chatopsHost ?? {},
+    waitMs: cfg.fleetWaitMs,
+    autoWait: cfg.fleetAutoWait,
+    audit: (event, detail) => ctx?.logger?.debug?.(`chatops ${event} ${JSON.stringify(detail ?? {})}`),
+  });
+
   const bridge = createBridge({
     channels,
-    actions: ctx?.chatopsActions ?? {},
-    policy: {
-      trustedContacts: cfg.security.allowContacts,
-      allowedRooms: cfg.security.allowRooms,
-    },
+    actions,
+    // Passed in, not rebuilt: `/trust` must widen the list that admission actually consults.
+    policy,
     chunkBytes: cfg.reply.maxChunkBytes,
     throttleMs: cfg.reply.rateLimitMs,
     projectRoot: cfg.projectRoot === '' ? undefined : cfg.projectRoot,

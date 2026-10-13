@@ -97,7 +97,18 @@ export function createBridge(options) {
     }
   }
 
-  const policy = createPolicy({ audit, ...options.policy });
+  /**
+   * Accept either a ready policy or the overrides to build one.
+   *
+   * The chat action set needs the *same* policy instance the bridge admits with, or `/trust`
+   * writes to a copy that admission never reads and the command silently does nothing. Duck-typed
+   * on `admit` rather than `instanceof`, because the two modules must not have to import each
+   * other's constructors to agree on this.
+   */
+  const policy =
+    options.policy && typeof options.policy.admit === 'function'
+      ? options.policy
+      : createPolicy({ audit, ...options.policy });
   const commands = commandTable();
   const broker = createApprovalBroker({
     now: options.now,

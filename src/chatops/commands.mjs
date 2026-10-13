@@ -199,6 +199,30 @@ export function commandTable() {
       },
     },
     {
+      name: 'where',
+      usage: '/where <任务 id>',
+      summary: 'Show how a task is doing, machine by machine.',
+      capability: CAPABILITY.VIEW,
+      async run(args, ctx) {
+        if (args.length !== 1) return { refusal: ROUTE_REFUSAL.BAD_ARGUMENTS, text: '用法：/where <任务 id>' };
+        if (!ctx.actions.where) return { refusal: ROUTE_REFUSAL.UNAVAILABLE, text: '这台机器没有连接编队。' };
+        const outcome = await ctx.actions.where(args[0]);
+        return { text: outcome.text };
+      },
+    },
+    {
+      name: 'report',
+      usage: '/report <任务 id>',
+      summary: 'Show a task\'s full per-machine report.',
+      capability: CAPABILITY.VIEW,
+      async run(args, ctx) {
+        if (args.length !== 1) return { refusal: ROUTE_REFUSAL.BAD_ARGUMENTS, text: '用法：/report <任务 id>' };
+        if (!ctx.actions.fullReport) return { refusal: ROUTE_REFUSAL.UNAVAILABLE, text: '这台机器没有连接编队。' };
+        const outcome = await ctx.actions.fullReport(args[0]);
+        return { text: outcome.text };
+      },
+    },
+    {
       name: 'approve',
       usage: '/approve [审批 id]',
       summary: 'Approve the oldest pending request for this window.',
