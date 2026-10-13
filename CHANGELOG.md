@@ -4,6 +4,68 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2] — 2026-10-14
+
+**Run the fleet from a chat message, and get the machines' own verdict back.**
+
+v0.7.1 shipped a working WeChat adapter and could still do nothing with it: `/run` answered
+*"this install has no fleet"*, because the executor did not exist. This adds it.
+
+### The gap was architectural
+
+`w2m_run` and `w2m_wait` are DSH **tools**: their bodies live inside the plugin's `ctx.tools`
+registration and are shaped for a model to call — a schema, a card, an error type the host
+renders. The chat bridge needs the same work with none of that: an argv in, a verdict and a
+sentence out.
+
+The bridge cannot call the tools. A tool call needs `@deepseek-ai/dsh-tools`, which exists
+**only inside `app.asar`** — a separate process cannot complete one, and an in-process call would
+have to fabricate the host's own calling convention. So the fleet work is now expressed once
+against the relay's HTTP API, and the tool and the chat bridge are both callers of it.
+
+### Added
+
+* **`src/chatops/fleet.mjs`** — `POST /v1/task`, `GET /v1/tasks/<id>`, `/report`, `/devices`, the
+  same paths the plugin's own tools use. A refusal is returned as a value: the relay's refusals are
+  answers, and the two that matter get their own sentences, because *"start an agent on each
+  machine"* and *"your operator token is wrong"* are different instructions. A wait that expires
+  reports `timeout` as a **verdict** rather than throwing — a fleet with one dead machine never
+  reaches a terminal state, and silence is the worst possible reply to a phone.
+* **`src/chatops/actions.mjs`** — the action set `commands.mjs` calls, plus the phone-sized
+  formatting rules.
+* **`/where <task id>`** and **`/report <task id>`**, so a task id from a reply is actionable.
+* `test/chatops-fleet.test.mjs` — 28 cases.
+
+### Two properties worth naming
+
+* **The argv is never joined into a string.** A chat message is attacker-influenced text, and the
+  array is what keeps a shell from ever seeing it. A formatter that joined and re-split would work
+  for every command until the first one with a space in an argument.
+* **`divergent` and `divergent-platform` are not collapsed.** They mean different things — one is
+  a bug, the other a platform difference — and paraphrasing either into "failed" is how a
+  portability difference becomes an incident.
+
+### Changed
+
+* `createBridge` now accepts a policy **instance** as well as the overrides to build one. The
+  action set has to share the bridge's policy, or `/trust` widens a copy that admission never
+  consults and the command silently does nothing. Duck-typed on `admit()` so the two modules need
+  not import each other's constructors.
+* `apply()` builds the executor from the same `rabbitUrl` / `operatorToken` row the tools read, so
+  there is one setting rather than two, and resolves the token in the same order (row, then
+  `W2M_OPERATOR_TOKEN`). An install with no `rabbitUrl` gets named refusals — *"no rabbitUrl is
+  configured"* — instead of an absent action.
+
+### Verified
+
+**271 chatops cases pass**, 28 of them new.
+
+### Not yet done — the honest caveat
+
+The round trip has been verified against **live WeChat as far as the adapter**, and against
+**the relay as far as the executor**. But **no command has been sent from a phone to the fleet end
+to end.** That is the next thing to test, and this release does not claim it.
+
 ## [0.7.1] — 2026-10-14
 
 **v0.7.0's WeChat channel could not send a single message.** This release fixes it, and the
