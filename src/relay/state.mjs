@@ -1922,9 +1922,62 @@ export class RabbitState {
    * execution of the same index.
    */
   _takeover(task, expiredLease, nowMs = this.nowMs()) {
+    /**
+     * v0.7.8: the two safety guards this path was missing.
+     *
+     * `_takeover` already existed and is invoked on `halt=now`, so hand-off was not absent — but it
+     * would re-offer a dead machine's index to **every idle device the relay holds**, with no fleet
+     * filter and no consideration of whether the task writes. Both are reachable defects:
+     *
+     *   1. **A device in another account could be handed the work.** On a relay serving several
+     *      fleets, `this.devices` includes all of them, so a takeover crossed accounts — which is
+     *      the isolation this release series is about, broken in the one path that is easy to miss
+     *      because it only runs when something has already gone wrong.
+     *   2. **A writing task could be run a second time.** Hand-off makes execution at-least-once,
+     *      which is harmless for `node --test` and is a duplicated write for anything else. The
+     *      design forbids automatic hand-off for writing tasks until a fencing token exists.
+     *
+     * The re-offer shape itself is unchanged: PROTOCOL v0.0.1 defines no per-index lease
+     * reassignment, so takeover is expressed as a re-offer to idle machines. Narrowing that to a
+     * single successor is a protocol revision, not a wiring change, and is not made here.
+     */
+    if (task.write === true) {
+      this.emit('notice', {
+        level: 'warn',
+        code: 'LEASE_TAKEOVER_REFUSED',
+        message:
+          `task ${task.task_id} index ${expiredLease.index} is a writing task, so no machine takes it over: `
+          + 'a second run could apply the same change twice, and the caller cannot tell from the verdict',
+        task_id: task.task_id,
+        reason: 'write_not_idempotent',
+      });
+      return [];
+    }
+
+    const requesterFleet = this.fleetId ?? null;
+
     const candidates = [];
     for (const device of this.devices.values()) {
       if (device.machine_id === expiredLease.machine_id) continue;
+      /**
+       * Fleet membership, when the relay is scoped.
+       *
+       * A device with its own `fleet_id` must match. A device with none cannot take over on a
+       * scoped relay, because there is no fleet to match it against — the same rule `targetsFor`
+       * applies to dispatch, kept identical here so the two paths cannot disagree.
+       */
+      if (requesterFleet !== null) {
+        const deviceFleet = typeof device.fleet_id === 'string' && device.fleet_id !== '' ? device.fleet_id : null;
+        if (deviceFleet !== requesterFleet) {
+          this.log?.('debug', 'takeover candidate skipped: not in this fleet', {
+            task_id: task.task_id,
+            machine_id: device.machine_id,
+            device_fleet: deviceFleet,
+            relay_fleet: requesterFleet,
+          });
+          continue;
+        }
+      }
       const lease = task.leases.get(device.machine_id);
       if (lease && !['queued', 'offered'].includes(lease.state)) continue;
       if (!lease && gateMachine(task, device)) continue;

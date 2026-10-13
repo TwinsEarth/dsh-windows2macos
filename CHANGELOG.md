@@ -4,6 +4,74 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.9] — 2026-10-14
+
+**Two safety guards on lease takeover, and an honest account of what is still not connected.**
+
+### What was already there, and what was missing
+
+`_takeover` existed and already ran on `halt: 'now'`, so hand-off was **not absent** — v0.7.7's
+note that it "is not implemented" was about `handoff.mjs` not being called, and this release
+corrects the record: the relay's own takeover path was live and had been since v0.1.x.
+
+**What it lacked was the two guards**, and both are reachable defects rather than theory:
+
+1. **A device in another account could be handed the work.** `_takeover` iterated
+   `this.devices.values()` with no fleet filter, so on a relay serving several fleets a takeover
+   **crossed accounts** — the isolation this whole series is about, broken in the one path that is
+   easy to miss because it only runs when something has already gone wrong.
+2. **A writing task could be run a second time.** Hand-off makes execution at-least-once. Harmless
+   for `node --test`; a duplicated write for anything else, applied on a machine with no idea the
+   first one already ran.
+
+Both are now refused with a named reason (`LEASE_TAKEOVER_REFUSED`, `write_not_idempotent`).
+
+### Deliberately not changed
+
+The re-offer **shape** is untouched. PROTOCOL v0.0.1 defines no per-index lease reassignment, so
+takeover is expressed as a re-offer to every idle machine — a fan-out, not a single successor.
+Narrowing it to one successor is what `handoff.mjs`'s `shouldHandOff()` would do, and it is a
+**protocol revision**, not a wiring change, so it is not made here. `reconcileResults()` is
+likewise ready and unused: nothing calls it yet.
+
+### The prerequisite this release discovered, which blocks the fleet rollout
+
+**The shared Linux server cannot produce an account code.** Its `.dsh` holds no account
+credentials — it is a headless VPS running the relay, STUN and a localside agent, not a signed-in
+DSH client. So `--fleet <account code>` has **no source on the server**, and the value must be
+computed on a machine that *is* signed in and then handed over.
+
+That is workable — the account code is an opaque `sha256(userId)` prefix, so passing it does not
+disclose the account id — but it means the rollout is:
+
+1. read the account code on a signed-in machine,
+2. restart the relay with `--fleet <code>`,
+3. **re-pair every device**, because a device only receives a fleet from the pairing code, and
+   every existing device paired without one.
+
+**Step 3 is the risk**: on a scoped relay a fleetless device reaches **nothing**, so all four
+current devices go silent until each is re-paired. That is the intended fail-safe direction, and it
+is still an outage until the re-pairing completes.
+
+### Added
+
+* `test/chatops-takeover.test.mjs` — 5 cases, booting a real relay: a write task is refused and
+  names why; a read task is still re-offered; a takeover skips a device in another fleet; it skips
+  a fleetless device on a scoped relay; and an unscoped relay behaves exactly as before.
+
+### Verified
+
+**437 chatops cases across seventeen suites**, and the relay's own 165 unchanged.
+
+### Still not done
+
+* **`shouldHandOff()` and `reconcileResults()` are not wired.** The guards above are in the
+  relay's takeover path; the richer single-successor selection and the late-result rule are not.
+* **No device generates a keypair and no request carries a signature.** The relay's existing HMAC
+  signing is a different mechanism and remains untouched, so the signature chain is **not enforced**.
+* **`/v1/devices` is not narrowed to the caller's fleet.**
+* **No message has yet gone from a phone through WeChat to the fleet.**
+
 ## [0.7.8] — 2026-10-14
 
 **The wiring.** v0.7.5–v0.7.7 shipped modules that nothing called. This release connects them, so
