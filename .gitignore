@@ -33,3 +33,8 @@ desktop.ini
 .idea/
 *.swp
 *~
+
+# Scratch scripts from live probing. Kept out of the tree: they are throwaway diagnostics,
+# not part of the product, and git add -A would otherwise commit them (which it did once).
+_*.mjs
+
