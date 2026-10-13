@@ -4,6 +4,33 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.3] — 2026-10-13
+
+One fix, and it is the half of v0.6.2 that made the other half usable.
+
+### Fixed
+
+* **`w2m_status` now reports `encryption.relay_serves_keys`.** v0.6.2 taught the node to tell a relay
+  that drops peer keys apart from a peer that has none — and then did not carry the answer to the one
+  surface an operator actually reads. The plugin builds its encryption block from an explicit field
+  list, and the new field was not on it, so a fleet in exactly the state v0.6.2 exists to explain still
+  showed `peers_known: 0` with no way to see why.
+
+  Measured on the machine that built the release: `w2m_status` returned
+
+  ```json
+  "encryption": { "enabled": true, "public_key": "cQshuntt…", "peers_known": 0,
+                  "handshakes": 0, "encrypted_channels": 0, "plaintext_channels": 0 }
+  ```
+
+  while the node underneath it was reporting `relay_serves_keys: false` against the same relay. The
+  feature worked and was invisible — which is the failure mode the field was added to remove, one
+  layer up.
+
+  `?? null`, not `?? 0`, because the value is three-valued and collapsing it would accuse the relay
+  before it had been tested: `null` means no announcement has proved it either way (or this node has
+  no key of its own, so it never asked), `false` means the relay dropped the key we sent.
+
 ## [0.6.2] — 2026-10-13
 
 The release that stops a broken *relay* from being reported as an out-of-date *peer*, and stops a
