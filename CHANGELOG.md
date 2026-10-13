@@ -90,17 +90,19 @@ had to exist first are built and tested.
 
 ### Not in this release
 
-* **No IM channel is wired up.** These are the two halves that carry the safety
-  properties; the WeChat/Feishu/DingTalk/WeCom transports, the command router and the
-  file delivery are not here.
-* **Nothing in `src/chatops/` has been exercised against a real IM platform.** It is
-  verified by unit tests with fake channels, which cover the properties that matter —
-  who is admitted, who decides, what happens on a deadline — and prove nothing about
-  WeChat's protocol, a tenant's identity model, or a five-minute wait in production.
-  An end-to-end claim would need credentials and a phone, and is not made.
-* The audit's own limits: the chatops dependency trees were not resolved (no
-  `node_modules` was installed, and none of its code was executed), and its Feishu
-  card-action signature path lives inside a vendor SDK that was not available to read.
+* **Only one channel adapter ships, and it is the WeChat one.** `ilink.mjs` is here because
+  its protocol is JSON over HTTPS with no vendor SDK — the other three channels need SDKs
+  this project cannot vendor or review. Feishu, DingTalk and WeCom are not implemented; the
+  channel contract they must satisfy is `channel.mjs`, checked by the same validator `ilink`
+  passes.
+* **Nothing has been exercised against a live WeChat account.** The adapter's whole network
+  surface is one injected `request()`, so its request shaping, response mapping,
+  de-duplication, state machine and host allow-list are all asserted — 30 cases. What that
+  suite cannot tell you is whether WeChat accepts the requests. That needs a QR scan and a
+  real bot, and is not claimed.
+* The audit's own limits: the chatops dependency trees were not resolved (no `node_modules`
+  was installed, and none of its code was executed), and its Feishu card-action signature path
+  lives inside a vendor SDK that was not available to read.
 
 ### Note on the other half of the work
 
