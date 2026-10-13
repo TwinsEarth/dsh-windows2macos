@@ -33,7 +33,8 @@ import { createBridge } from './bridge.mjs';
 import { createPolicy } from './policy.mjs';
 import { createConfigRoute } from './config-route.mjs';
 import { createMemoryChannel, validateChannel, CHANNEL_STATE } from './channel.mjs';
-import { createILinkChannel, isAllowedApiUrl } from './ilink.mjs';
+import { createILinkChannel } from './ilink.mjs';
+import { isAllowedApiUrl } from './ilink-protocol.mjs';
 import { helpText, commandTable } from './commands.mjs';
 
 /** Cordis service this plugin needs: none. The bridge is self-contained by construction. */
@@ -153,29 +154,30 @@ export async function apply(ctx, config = {}) {
     );
   }
 
-  // The WeChat adapter, mounted when its row asks for it and the host supplied a transport.
-  // The transport is the host's, not ours: this plugin does not own an HTTP client, and an
-  // adapter built with a real `fetch` inside would be untestable and unreviewable.
+  // The WeChat adapter, mounted when its row asks for it.
   if (cfg.channels.includes('ilink')) {
-    if (typeof ctx?.chatopsIlinkRequest !== 'function') {
-      log.warn(
-        'the ilink channel is enabled but the host supplied no `chatopsIlinkRequest` transport, ' +
-          'so it was not mounted; the bridge receives nothing on it',
-      );
+    const base = ctx?.chatopsIlinkBase ?? undefined;
+    if (base !== undefined && !isAllowedApiUrl(base).ok) {
+      // Refused before a token can go anywhere. Named rather than attempted.
+      log.warn(`the ilink base url was refused: ${isAllowedApiUrl(base).reason}`);
     } else {
-      const base = ctx?.chatopsIlinkBase ?? undefined;
-      if (base !== undefined && !isAllowedApiUrl(base).ok) {
-        // Refused before a token can go anywhere. Named rather than attempted.
-        log.warn(`the ilink base url was refused: ${isAllowedApiUrl(base).reason}`);
-      } else {
-        channels.push(
-          createILinkChannel({
-            request: ctx.chatopsIlinkRequest,
-            token: ctx?.chatopsIlinkToken ?? undefined,
-            apiBase: base,
-            audit: (event, detail) => ctx?.logger?.debug?.(`chatops ${event} ${JSON.stringify(detail ?? {})}`),
-          }),
-        );
+      const token = ctx?.chatopsIlinkToken ?? null;
+      channels.push(
+        createILinkChannel({
+          // The host *may* supply a transport. In v0.7.0 that was the only option, which meant
+          // the channel could never send a request at all, because nothing shipped one. The
+          // adapter now builds a real HTTP transport itself and this only overrides it.
+          transport: typeof ctx?.chatopsIlinkRequest === 'function' ? ctx.chatopsIlinkRequest : undefined,
+          token,
+          apiBase: base,
+          audit: (event, detail) => ctx?.logger?.debug?.(`chatops ${event} ${JSON.stringify(detail ?? {})}`),
+        }),
+      );
+      if (token === null || token === '') {
+        // Neither an error nor silent: an install that has not scanned a QR yet is a normal
+        // state, and saying so is what stops "the bot is broken" being the only conclusion
+        // available to an operator.
+        log.warn('the ilink channel is mounted with no bot token, so it will not poll until one is adopted');
       }
     }
   }

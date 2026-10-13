@@ -4,6 +4,104 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] — 2026-10-14
+
+**v0.7.0's WeChat channel could not send a single message.** This release fixes it, and the
+way it was found is the point.
+
+### What was wrong
+
+v0.7.0's `ilink.mjs` was written by *reading* the audited plugin's TypeScript. Every field name
+in it was wrong — nine separate mismatches — and all 237 of its tests passed, because those tests
+drove an injected transport and asserted on the requests we *constructed* rather than the
+requests WeChat *accepts*. **A self-consistent suite cannot falsify its own assumptions.**
+
+The first real request, made with a real QR scan and a real bot, returned:
+
+```json
+{"errcode":-14,"errmsg":"session timeout"}
+```
+
+That message is a lie about its own cause, which is why it took as long as it did:
+
+| # | v0.7.0 | Measured |
+|---|---|---|
+| 1 | *(absent)* | **`AuthorizationType: ilink_bot_token`** |
+| 2 | *(absent)* | **`X-WECHAT-UIN`**, a per-request random |
+| 3 | `to_user` | `to_user_id` |
+| 4 | bare `{msg}` | `{msg, base_info}` |
+| 5 | `item_list[].text_item` | also `type: 1`, `from_user_id`, `client_id`, `message_type: 2`, `message_state: 2` |
+| 6 | `getupdates` body `{}` | `{get_updates_buf, base_info}` |
+| 7 | `bot_id` / `owner_user_id` | `ilink_bot_id` / `ilink_user_id` |
+| 8 | success = HTTP 2xx | **`ret === 0`** |
+| 9 | — | failures use **`errcode`/`errmsg`** and **still return HTTP 200** |
+
+**#1 is the one that cost the most time.** Without `AuthorizationType`, every authenticated
+endpoint answers `-14 session timeout` — *including a request carrying no `Authorization` header
+at all*, because the server rejects on the missing type before it reads the credential. That made
+it look like an expiry bug, and an expiry bug is investigated by checking clocks, re-scanning
+codes and re-minting tokens. It is not one.
+
+**#8 and #9 are the dangerous ones.** A refusal arrives with HTTP 200, so a status-code check
+reports a failed send as a delivered one — the exact silent-failure shape this release series
+exists to remove, and it had been reintroduced in the adapter. `send()` now rejects on
+`errcode`, so the outbound queue can never count a refusal as a delivery.
+
+### Also fixed
+
+* **The transport did not exist.** v0.7.0 required the host to inject `chatopsIlinkRequest` and
+  shipped no default, so no request could ever be sent and `apply()` could never mount a working
+  channel. `ilink-transport.mjs` is now the default, and injecting one only overrides it.
+* **64-bit ids were rounded.** A live `message_id` is 7515840255213248776 — past
+  `Number.MAX_SAFE_INTEGER` — so `JSON.parse` returned `7515840255213249000`. The transport now
+  recovers the exact digits. Rounding is harmless for de-duplication and not harmless if an id is
+  ever persisted as a key or sent back.
+* **The host allow-list was wider than the measurement.** v0.7.0 allowed `weixin.qq.com` and
+  `api.weixin.qq.com` on a guess; the login response returns exactly `ilinkai.weixin.qq.com`. An
+  allow-list wider than what was observed is not caution, it is the absence of the check.
+* **A precision bug in the fix itself**, caught by the suite it was written for: the first
+  `repairMessageIds` mutated in place, so a shared test fixture was rewritten by whichever case
+  ran first.
+
+### Added
+
+* `src/chatops/ilink-protocol.mjs` — the measured wire format in one place, each constant
+  annotated with the live response it came from.
+* `src/chatops/ilink-transport.mjs` — the real HTTP transport, with per-request deadlines, the
+  `ret`/`errcode` distinction returned as data, and `undici`'s `cause` unwrapped so a network
+  fault does not read as a protocol fault.
+* `test/chatops-ilink-contract.test.mjs` — **36 cases pinned to fixtures taken verbatim from live
+  responses**. The rule it enforces: if a field name changes, a test here must fail. That is the
+  mechanism that would have caught all nine.
+* `scripts/ilink-login-and-probe.mjs`, `scripts/ilink-qr-poll.mjs`, `scripts/ilink-talk.mjs` —
+  the probes that found this. Kept because they are the only way to check the adapter against
+  reality rather than against itself.
+
+### Changed
+
+* `test/chatops-ilink.test.mjs` **removed**. It asserted the wrong protocol — `body.msg.to_user`,
+  `msg_list` — so keeping it would have pinned the v0.7.0 defects back in. The contract suite
+  replaces it.
+
+### Verified against live WeChat
+
+A real QR scan, a real bot, a real exchange in both directions:
+
+* `get_bot_qrcode` → `{"qrcode":…,"qrcode_img_content":…,"ret":0}`
+* `get_qrcode_status` → `{"status":"confirmed","bot_token":…,"baseurl":…,"ilink_bot_id":…,"ilink_user_id":…}`
+* `notifystart` → `{"ret":0}`
+* `getupdates` → the peer's reply, read verbatim
+* `sendmessage` → `{"message_id":7515840555615131656}`, received on the phone
+
+### Not fixed, and not claimed
+
+* **Feishu, DingTalk and WeCom are still not implemented.** They need vendor SDKs this project
+  cannot vendor or review. The contract they must satisfy is `channel.mjs`.
+* **Only the WeChat path has been exercised against a live platform.** That is one of four, and it
+  is the one that happens to need no SDK.
+* **No command has been run through the bridge from a phone yet.** The adapter is verified; the
+  end-to-end path from a chat message to `/run` on the fleet is not.
+
 ## [0.7.0] — 2026-10-14
 
 The release that answered "can we drive the fleet from a phone?" with **not yet, and

@@ -1,0 +1,71 @@
+fix(chatops): the WeChat adapter could not send a single message, and now it can
+
+v0.7.0's ilink.mjs was written by reading the audited plugin's TypeScript. Every field
+name in it was wrong -- nine mismatches -- and all 237 of its tests passed, because they
+drove an injected transport and asserted on the requests we *constructed* rather than
+the requests WeChat *accepts*. A self-consistent suite cannot falsify its own
+assumptions. The first real request, with a real QR scan and a real bot, answered:
+
+    {"errcode":-14,"errmsg":"session timeout"}
+
+That message lies about its own cause, which is why it took as long as it did.
+
+The nine, measured:
+  1. AuthorizationType: ilink_bot_token        (absent in v0.7.0)
+  2. X-WECHAT-UIN, per-request random          (absent)
+  3. to_user_id                                (v0.7.0: to_user)
+  4. {msg, base_info}                          (v0.7.0: bare {msg})
+  5. item_list needs type:1, from_user_id, client_id, message_type:2, message_state:2
+  6. getupdates needs {get_updates_buf, base_info}   (v0.7.0: {})
+  7. ilink_bot_id / ilink_user_id              (v0.7.0: bot_id / owner_user_id)
+  8. success is ret === 0, not HTTP 2xx
+  9. failures use errcode/errmsg AND STILL RETURN HTTP 200
+
+#1 cost the most time. Without AuthorizationType every authenticated endpoint answers
+-14 session timeout -- *including a request with no Authorization header at all* --
+because the server rejects on the missing type before it reads the credential. It reads
+exactly like an expiry bug, so it sends you checking clocks and re-minting tokens.
+
+#8 and #9 are the dangerous ones. A refusal arrives with HTTP 200, so a status-code
+check reports a failed send as a delivered one: the silent-failure shape this release
+series exists to remove, reintroduced in the adapter. send() now rejects on errcode, so
+the outbound queue cannot count a refusal as a delivery.
+
+Also fixed:
+  * the transport did not exist. v0.7.0 required the host to inject one and shipped no
+    default, so no request could ever be sent and apply() could never mount a working
+    channel. ilink-transport.mjs is now the default; injecting one only overrides it.
+  * 64-bit ids were rounded. A live message_id is 7515840255213248776, past
+    Number.MAX_SAFE_INTEGER, so JSON.parse returned 7515840255213249000. The exact
+    digits are now recovered. Harmless for de-duplication, not harmless as a key.
+  * the host allow-list was wider than the measurement: v0.7.0 allowed weixin.qq.com
+    and api.weixin.qq.com on a guess, where the login response returns exactly
+    ilinkai.weixin.qq.com. An allow-list wider than what was observed is not caution.
+  * a bug in the fix itself, caught by the suite written for it: the first
+    repairMessageIds mutated in place, so a shared test fixture was rewritten by
+    whichever case ran first.
+  * createILinkChannel passed {fetch: undefined}, which a presence check read as
+    "provided" -- so apply() threw on mount while every unit test passed, because the
+    tests all inject a transport and never exercise the default. Found by a live smoke
+    test.
+
+Added: ilink-protocol.mjs (the measured wire format, each constant annotated with the
+live response it came from), ilink-transport.mjs (real HTTP, per-request deadlines,
+ret/errcode as data, undici `cause` unwrapped), test/chatops-ilink-contract.test.mjs
+(36 cases pinned to verbatim live fixtures -- if a field name changes, these must
+fail), and the three probe scripts that found all of this.
+
+Removed: test/chatops-ilink.test.mjs. It asserted the wrong protocol -- body.msg.to_user,
+msg_list -- so keeping it would have pinned the v0.7.0 defects back in.
+
+Verified against live WeChat: a real QR scan, a real bot, a real exchange in both
+directions. get_bot_qrcode and get_qrcode_status returned their documented fields;
+notifystart answered {"ret":0}; getupdates delivered the peer's reply verbatim;
+sendmessage returned a message_id and the message arrived on the phone.
+
+243 chatops cases pass. The repo unit suite is back to its baseline of one
+environmental failure (a missing node_modules/eslint), which predates this work.
+
+Not fixed, not claimed: Feishu, DingTalk and WeCom are still unimplemented, and no
+command has been run through the bridge from a phone yet -- the adapter is verified,
+the chat-to-fleet path is not.
