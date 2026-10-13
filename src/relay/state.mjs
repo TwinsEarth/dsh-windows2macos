@@ -778,7 +778,17 @@ export class RabbitState {
         // to it. `deviceFleetFields` is the single place that binding is made, and it records
         // its provenance so a fleet that arrived from a request is visible as such in
         // `devices.json` rather than looking identical to one that came from a code.
-        ...deviceFleetFields({ codeRecord: rec, requestedFleet: null }),
+        //
+        // v0.8.1 adds the third source: an account-derived `fleet_key`. That is what lets a second
+        // machine on one account join with **no human step and no relay configuration** -- the gap
+        // that left a new PC invisible beside its own fleet. The relay does not trust a claimed
+        // fleet id; it *derives* one from the key, so a device can only land in the fleet whose key
+        // it holds and anything else forms a separate, empty fleet.
+        ...deviceFleetFields({
+          codeRecord: rec,
+          fleetKeyEncoded: typeof request.fleet_key === 'string' ? request.fleet_key : null,
+          requestedFleet: null,
+        }),
         /**
          * v0.7.10: the device's Ed25519 public key, if it offered one.
          *

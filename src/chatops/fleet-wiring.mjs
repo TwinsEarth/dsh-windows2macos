@@ -34,6 +34,8 @@
  */
 
 import { selectTargets, SCOPE_REFUSAL } from './fleet-scope.mjs';
+// v0.8.1: the account-derived fleet key, so a machine can join its own fleet with no human step.
+import { planJoin } from './fleet-join.mjs';
 
 /** Why a request reached nothing, before target selection even runs. */
 export const WIRING_REFUSAL = Object.freeze({
@@ -174,13 +176,58 @@ export function fleetForPairingCode(codeRecord) {
  * Kept as a function so the "the fleet came from the code" rule lives in one place: a caller that
  * builds a device literal by hand is the way a device ends up choosing its own fleet.
  */
-export function deviceFleetFields({ codeRecord, requestedFleet }) {
+/**
+ * The `fleet_id` a device joins, and **where that fact came from**.
+ *
+ * Three sources, in order of authority, and the order is the whole security argument:
+ *
+ * | source | who decided | why |
+ * |---|---|---|
+ * | `pairing_code` | the operator, by issuing the code | explicit intent, and the only source that can place a device in a fleet it could not compute |
+ * | `fleet_key` | the account, by derivation | the auto-join path: the device proves membership by holding the key |
+ * | `request` | the relay operator, via `--fleet` | a relay that serves one fleet and is told which |
+ *
+ * ## Why the key is *derived from* rather than *compared against*
+ *
+ * A device presenting a `fleet_key` is **assigned** the fleet id computed from that key —
+ * `SHA-256(key)`. The relay does not decide whether to believe a claimed fleet id; it computes one.
+ * So a device can only ever land in the fleet whose key it holds, there is no trust-on-first-use to
+ * get wrong, and nothing to forge: a device without the key forms a different, empty fleet rather
+ * than joining somebody else's.
+ *
+ * This is what lets a second machine on one account join with **no human step and no relay
+ * configuration** — the gap that let a new PC sit invisible next to its own fleet.
+ *
+ * @param {object} input
+ * @param {object|null} input.codeRecord The pairing code's record, if one was used.
+ * @param {string|null} [input.fleetKeyEncoded] The account-derived key, if the device offered one.
+ * @param {string|null} [input.requestedFleet] An explicit fleet from the relay's own configuration.
+ * @returns {{fleet_id: string|null, fleet_source: string|null, fleet_reason?: string}}
+ */
+export function deviceFleetFields({ codeRecord, fleetKeyEncoded = null, requestedFleet = null }) {
   const fromCode = fleetForPairingCode(codeRecord);
   if (fromCode !== null) return { fleet_id: fromCode, fleet_source: 'pairing_code' };
+
+  /**
+   * The auto-join path. Tried before the operator's `--fleet` so that a device which knows its own
+   * account lands in its own fleet rather than being absorbed into whatever fleet the relay serves —
+   * a relay configured for one account must not silently become the wrong fleet for a device whose
+   * account says otherwise.
+   */
+  if (typeof fleetKeyEncoded === 'string' && fleetKeyEncoded !== '') {
+    const join = planJoin({ fleetKeyEncoded });
+    if (join.ok) return { fleet_id: join.fleetId, fleet_source: 'fleet_key' };
+    /**
+     * A malformed key does **not** pair the device into the relay's own fleet. Falling through would
+     * be the silent wrong answer: a device that meant to join its account would instead be placed in
+     * an unrelated fleet and told nothing.
+     */
+    return { fleet_id: null, fleet_source: null, fleet_reason: join.reason };
+  }
+
   if (typeof requestedFleet === 'string' && requestedFleet !== '') {
-    // Reachable only when the relay has no fleet of its own and an operator passed one explicitly.
     // Recorded with its provenance so a fleet that arrived from a request is visible as such in
-    // `devices.json` rather than looking identical to one that came from a code.
+    // `devices.json` rather than looking identical to one that came from a code or a key.
     return { fleet_id: requestedFleet, fleet_source: 'request' };
   }
   return { fleet_id: null, fleet_source: null };

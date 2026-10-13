@@ -4,6 +4,92 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.1] — 2026-10-14
+
+**A machine on the same account joins the same fleet with no human step** — the requirement that
+had no implementation behind it, and the bug that made it visible.
+
+### The reported bug, and what it actually was
+
+A new PC signed into the same DeepSeek account did **not** join the same fleet. Traced rather than
+guessed, the cause was four gaps stacked:
+
+* the plugin computed its SN, derived `fleet` from the account code, **logged it, and never used it
+  for anything**;
+* nothing called `/v1/pair`;
+* `autoStartAgent` defaults to **false**, so no agent started;
+* and even with an agent, membership needed a **human-typed one-time pairing code**.
+
+So "same account joins the same fleet automatically" was a stated requirement with no code path.
+
+### Why the obvious fix is the wrong one
+
+The obvious fix is to use `accountCode` as the credential. `account.mjs` documents the trade
+honestly — *"the cost of 32 bits, stated rather than hidden"* — and for **grouping** 32 bits is
+fine. As a **secret** it is not: 2^32 is brute-forceable, so authorising a join with it would let
+anyone enumerate their way into any fleet.
+
+**The bug was a conflation: a grouping identifier was doing duty as a secret.**
+
+### The fix
+
+The machines of one account share something an outsider cannot obtain — the ability to read
+`userId` — so the fleet secret is derived from it:
+
+```
+fleetKey = HMAC-SHA256(userId, "w2m-fleet-v1")     256 bits, same-account machines only
+fleetId  = SHA-256(fleetKey)                       what the relay groups by
+```
+
+**Presenting the key is the proof.** The relay *computes* a fleet id from the key it is given
+rather than believing a claimed one, so a device can only land in the fleet whose key it holds.
+No trust-on-first-use, no operator configuration, no account lookup, nothing to forge — and a
+device without the key forms a different, empty fleet instead of joining someone else's.
+
+`deriveAccountFleetKey` **refuses anything shorter than 16 characters**, and the refusal is asserted
+in a test rather than left to a comment: passing the 8-hex account code by mistake would otherwise
+produce a key that *looks* strong and is not — the worst kind of credential failure, because it is
+silent.
+
+### The relay side
+
+`deviceFleetFields` gains a third source, ordered by authority:
+
+| source | who decided |
+|---|---|
+| `pairing_code` | the operator, by issuing the code |
+| **`fleet_key`** | **the account, by derivation** — the auto-join path |
+| `request` | the relay operator, via `--fleet` |
+
+A **malformed key does not fall through** to the relay's own fleet. Falling through would be the
+silent wrong answer: a device that meant to join its account would be placed in an unrelated fleet
+and told nothing. It is refused, with the reason recorded on the device record.
+
+This also removes the deployment problem recorded in v0.7.9: `--fleet` no longer needs an operator
+to compute and hand-carry a 32-bit code, because the relay needs to know **nothing** about any
+account.
+
+### Verified
+
+* **21 cases** for the derivation: same account agrees, different accounts differ, the 32-bit code
+  is refused, the wire form round-trips, a client and a relay independently derive the same id, and
+  comparison is constant-time.
+* The derived bytes are **pinned**, not self-compared — a regression would silently split every
+  existing fleet into two halves that cannot see each other, with no error anywhere.
+* **223 cases** across the relay, wiring, scoping and join suites, unchanged.
+
+### ⚠️ What is still not wired
+
+The **derivation and the relay's acceptance** are done. The pieces that make a real machine use
+them are not:
+
+* `index.mjs` does not yet derive or expose the fleet key;
+* the agent does not yet present it at pairing;
+* `autoStartAgent` still defaults to false.
+
+**Until those land, a new PC still will not auto-join.** The credential exists and is accepted; the
+client does not yet offer it.
+
 ## [0.8.0] — 2026-10-14
 
 **The first release on npm since 0.6.3.** Eight versions of work — account identity, fleet
