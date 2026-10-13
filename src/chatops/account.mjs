@@ -37,6 +37,8 @@
  */
 
 import { createHash } from 'node:crypto';
+// v0.8.1: the account-derived fleet key, so a machine joins its account's fleet with no human step.
+import { deriveAccountFleetKey, encodeFleetKey } from './fleet-join.mjs';
 import { execFile } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { promisify } from 'node:util';
@@ -308,7 +310,16 @@ export function createAccountIdentity(options = {}) {
     const acct = accountCode(userId);
     if (acct === null) return { ok: false, reason: 'bad_account_id', detail: 'the account id hashed to nothing' };
     audit('account/identified', { account_code: acct });
-    return { ok: true, accountCode: acct, deviceId: identity.deviceId ?? null, osVersion: identity.osVersion ?? null };
+    // `userId` is returned so the fleet key can be derived from it. It is deliberately NOT put on
+    // the wire: the key travels, the raw account id does not, so a relay learns a fleet's identity
+    // without learning the account's.
+    return {
+      ok: true,
+      accountCode: acct,
+      userId,
+      deviceId: identity.deviceId ?? null,
+      osVersion: identity.osVersion ?? null,
+    };
   }
 
   /** The hardware code, and which source produced it. */
@@ -329,30 +340,59 @@ export function createAccountIdentity(options = {}) {
    * on every start — every restart would look like a new device, and the fleet would fill with
    * ghosts of one machine.
    */
-  async function resolve() {
-    if (options.stored !== undefined && options.stored !== null) {
-      const parsed = parseSn(options.stored);
-      if (parsed === null) {
-        return { ok: false, reason: 'stored_sn_malformed', detail: options.stored };
+    async function resolve() {
+      /**
+       * The fleet key is derived on **every** resolve, including the stored-SN path.
+       *
+       * A first version returned early when an SN was already stored and never read the account
+       * at all. That is right for the SN -- it must not be regenerated, or every restart would
+       * look like a new device -- but it is **wrong for the key**: a machine has a stored SN from
+       * its second start onward, so it would have derived a key exactly once and then never
+       * again.
+       *
+       * The auto-join would therefore have worked on a machine's first boot and silently stopped
+       * afterwards -- the hardest kind of bug to see, because it works when you test it. So the
+       * account is read in both paths, and a signed-out machine yields no key rather than an
+       * error.
+       */
+      const account = await identify();
+      let accountFields = { accountCode: null, fleetKey: null };
+      if (account.ok) {
+        try {
+          // The KEY travels; the raw `userId` does not.
+          accountFields = { accountCode: account.accountCode, fleetKey: encodeFleetKey(deriveAccountFleetKey(account.userId)) };
+        } catch (error) {
+          // Reported rather than folded into "no fleet". Reaching here means `userId` passed
+          // `identify` and was still unusable, which is a contradiction worth seeing.
+          audit('account/fleet-key-failed', { detail: error instanceof Error ? error.message : String(error) });
+          accountFields = { accountCode: account.accountCode, fleetKey: null };
+        }
       }
-      return { ok: true, sn: options.stored, ...parsed, reused: true };
+
+      if (options.stored !== undefined && options.stored !== null) {
+        const parsed = parseSn(options.stored);
+        if (parsed === null) {
+          return { ok: false, reason: 'stored_sn_malformed', detail: options.stored };
+        }
+        // The SN is returned unchanged; the key is fresh, because it comes from the account.
+        return { ok: true, sn: options.stored, ...parsed, ...accountFields, reused: true };
+      }
+
+      if (!account.ok) return account;
+      const hardware = await fingerprint();
+      if (!hardware.ok) return hardware;
+      const sn = buildSn({ accountCode: account.accountCode, hardwareCode: hardware.hardwareCode, at: options.at ?? new Date() });
+      audit('account/sn-created', { sn, sources: hardware.sources });
+      return {
+        ok: true,
+        sn,
+        ...accountFields,
+        hardwareCode: hardware.hardwareCode,
+        timeCode: parseSn(sn).timeCode,
+        hardwareSources: hardware.sources,
+        reused: false,
+      };
     }
-    const account = await identify();
-    if (!account.ok) return account;
-    const hardware = await fingerprint();
-    if (!hardware.ok) return hardware;
-    const sn = buildSn({ accountCode: account.accountCode, hardwareCode: hardware.hardwareCode, at: options.at ?? new Date() });
-    audit('account/sn-created', { sn, sources: hardware.sources });
-    return {
-      ok: true,
-      sn,
-      accountCode: account.accountCode,
-      hardwareCode: hardware.hardwareCode,
-      timeCode: parseSn(sn).timeCode,
-      hardwareSources: hardware.sources,
-      reused: false,
-    };
-  }
 
   return { identify, fingerprint, resolve };
 }

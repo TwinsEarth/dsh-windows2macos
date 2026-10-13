@@ -316,7 +316,7 @@ export async function apply(ctx, config = {}) {
     // machine's identity — every restart looking like a new device is how a fleet fills with
     // ghosts of one machine.
     if (identity.reused === false && storeSn(snPath, identity.sn)) {
-      log.info(`identity ${identity.sn} (fleet ${identity.accountCode}, from ${identity.hardwareSources?.join('+') ?? 'unknown'})`);
+      log.info(`identity ${identity.sn} (fleet ${identity.accountCode}${identity.fleetKey ? ', joinable' : ', no join key'}, from ${identity.hardwareSources?.join('+') ?? 'unknown'})`);
     } else if (identity.reused) {
       log.info(`identity ${identity.sn} (reused; fleet ${identity.accountCode})`);
     }
@@ -420,6 +420,17 @@ export async function apply(ctx, config = {}) {
     // the reason is the actionable half.
     sn: identity.ok ? identity.sn : null,
     fleet: identity.ok ? identity.accountCode : null,
+      /**
+       * v0.8.1: the key a machine presents to join its account's fleet with no human step.
+       *
+       * Exposed so the agent can offer it at pairing. It is a **derived** value, not the account
+       * id, so anything reading this result -- a log, a status surface -- learns which fleet this
+       * machine belongs to without learning whose account it is.
+       *
+       * `null` alongside a `reason` means no fleet: a signed-out machine has none, and the design
+       * says it must not be given a random one instead.
+       */
+      fleetKey: identity.ok ? (identity.fleetKey ?? null) : null,
     identity: identity.ok ? identity : { reason: identity.reason, detail: identity.detail ?? null },
     ...described,
   };

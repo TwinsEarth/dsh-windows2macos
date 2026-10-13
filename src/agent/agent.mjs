@@ -2273,14 +2273,36 @@ export function createAgent(options) {
    * @param {string} pairingCode
    * @param {string} [userId]
    */
-  async function pair(pairingCode, userId) {
+  /**
+   * Pair this machine, by **either** an operator's code **or** the account's fleet key (v0.8.1).
+   *
+   * The two authorise different things, which is why both are accepted rather than one replacing the
+   * other:
+   *
+   *   * a **pairing code** is the operator saying *"let this machine in"*, and it is the only way to
+   *     place a device in a fleet the device could not compute for itself;
+   *   * a **fleet key** is the account saying *"this machine is mine"*, and the relay derives the
+   *     fleet from it — so it can only ever reach a fleet its holder is already entitled to.
+   *
+   * Passing neither remains allowed: the relay answers `PAIRING_INVALID` and the caller reports it,
+   * which is the pre-v0.8.1 behaviour for an unpaired machine.
+   */
+  async function pair(pairingCode, userId, fleetKey = null) {
     const body = {
-      pairing_code: pairingCode,
       machine_id: identity.machine_id,
       machine_name: identity.machine_name,
       platform,
       caps,
     };
+    /**
+     * Send only the discriminator that was actually given.
+     *
+     * `pairing_code: null` would be *present*, and a presence check reads a null as "provided" —
+     * the same trap that made `createILinkChannel` pass `{ fetch: undefined }` and throw on mount in
+     * v0.7.0. An absent code must be an absent key, not a null one.
+     */
+    if (typeof pairingCode === 'string' && pairingCode !== '') body.pairing_code = pairingCode;
+    if (typeof fleetKey === 'string' && fleetKey !== '') body.fleet_key = fleetKey;
     if (userId) body.user_id = userId;
     const response = await postJson('/v1/pair', body, { auth: false });
     if (!response.ok) {

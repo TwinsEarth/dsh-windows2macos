@@ -88,6 +88,10 @@ function parseCli(argv) {
     options: {
       rabbit: { type: 'string' },
       pair: { type: 'string' },
+      // v0.8.1: the account-derived key, so a machine joins its account's fleet with no
+      // operator step. Supplied by the plugin, which is the only process that can read the
+      // signed-in account; the agent is standalone and cannot derive it itself.
+      'fleet-key': { type: 'string' },
       project: { type: 'string' },
       name: { type: 'string' },
       'allowed-commands': { type: 'string' },
@@ -269,12 +273,25 @@ async function main() {
       });
     }
 
-    if (flags.pair) {
-      const paired = await agent.pair(flags.pair);
+    /**
+     * Pair by a code, by an account fleet key, or not at all (v0.8.1).
+     *
+     * ## The bug a first version of this had
+     *
+     * The fleet-key handling was inserted **inside `if (flags.pair)`**, so the key path could only
+     * run when a pairing code was also supplied — which is precisely the case it exists to avoid.
+     * It worked whenever anyone tested it with a code, and did nothing in the case that mattered.
+     *
+     * The two are therefore peers rather than nested: either credential alone is enough.
+     */
+    const fleetKey = typeof flags['fleet-key'] === 'string' && flags['fleet-key'] !== '' ? flags['fleet-key'] : null;
+
+    if (flags.pair || fleetKey !== null) {
+      const paired = await agent.pair(flags.pair ?? null, undefined, fleetKey);
       saveDeviceToken(paired.device_token, {});
-      log('info', 'device_token stored');
+      log('info', `device_token stored (paired by ${flags.pair ? 'pairing code' : 'fleet key'})`);
     } else if (!identity.device_token) {
-      log('warn', 'no device_token and no --pair: offers cannot be fetched until paired');
+      log('warn', 'no device_token and no --pair/--fleet-key: offers cannot be fetched until paired');
     }
 
     let stopping = false;
