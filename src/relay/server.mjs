@@ -29,6 +29,11 @@ import { renderMetrics, METRICS_CONTENT_TYPE } from './metrics.mjs';
 // v0.3.0 §9: request signing. This import is the entire point of the module --
 // until the HTTP layer calls it, HMAC support does not exist for any real request.
 import { DEFAULT_SKEW_SECONDS, NonceCache, verifyRequest } from '../signing.mjs';
+// v0.7.11: per-device Ed25519 verification, tried before the shared secret.
+import {
+  SIGNATURE_HEADER as DEVICE_SIGNATURE_HEADER,
+  verifyDeviceSignature,
+} from '../chatops/device-signing.mjs';
 
 export const DEFAULT_SSE_KEEPALIVE_MS = 15_000; // §3.2: every 15s a `: keepalive` line
 export const DEFAULT_SWEEP_INTERVAL_MS = 1_000;
@@ -125,6 +130,19 @@ function firstHeaderValue(value) {
   if (typeof raw !== 'string') return null;
   const first = raw.split(',')[0].trim();
   return first === '' ? null : first;
+}
+
+/**
+ * Read one header case-insensitively from a plain Node headers object.
+ *
+ * `signing.mjs` does this internally, but the device-key path needs it before deciding whether that
+ * module applies at all, so it is needed here too. Node lower-cases incoming header names, and a
+ * test that builds a request by hand may not, so both spellings are tried.
+ */
+function readHeader(headers, name) {
+  if (headers === null || headers === undefined) return null;
+  const found = Object.keys(headers).find((k) => k.toLowerCase() === name);
+  return found === undefined ? null : firstHeaderValue(headers[found]);
 }
 
 /**
@@ -973,7 +991,37 @@ export class RelayServer {
    * path is the only value both sides agree on in all three deployment forms, so
    * clients sign `/v1/result` and never `https://host/w2m/v1/result`.
    */
+  /**
+   * Verify a request's signature (v0.7.11).
+   *
+   * Two mechanisms, and the order between them is the whole design:
+   *
+   * **1. Per-device Ed25519, when the sender is a device with a stored public key.** This is the
+   * one that proves *which* device signed. It is tried **first** because a device key is strictly
+   * stronger evidence than a shared secret, and because a device that registered a key must not
+   * fall back to the weaker mechanism by accident.
+   *
+   * **2. HMAC over a shared secret, otherwise.** Every device that paired before v0.7.10 arrives
+   * here — which is every device today — and nothing about its behaviour changes.
+   *
+   * ## Why this converges with no second deployment
+   *
+   * A device that has not been updated sends no signature header, so mechanism 1 finds no key and
+   * mechanism 2 answers exactly as before. A device that *has* been updated sends a signature, its
+   * public key is on file from pairing, and it is verified with it. So a fleet updates one machine
+   * at a time and each machine gets the strongest mechanism available **to it** the moment it
+   * starts sending one — no flag, no rollout step, no coordination.
+   *
+   * ## What this deliberately does not do
+   *
+   * It does not **require** a device key. `requireSignature` still means "a signature must be
+   * present", and either mechanism satisfies it. Making a *device key* mandatory is a separate,
+   * later switch, because turning it on today would refuse all four machines at once.
+   */
   verifySignature(req, { method, signedPath, body }) {
+    const viaDevice = this.verifyWithDeviceKey(req, { method, signedPath, body });
+    if (viaDevice !== null) return viaDevice;
+
     return verifyRequest({
       headers: req.headers, // plain Node object; signing.mjs reads it case-insensitively
       method,
@@ -985,6 +1033,54 @@ export class RelayServer {
       skewSeconds: this.signatureSkewSeconds,
       required: this.requireSignature,
     });
+  }
+
+  /**
+   * Try the per-device Ed25519 path.
+   *
+   * Returns `null` when the mechanism does not apply — no signature presented, or the signing
+   * machine is not a device whose public key we hold — so the caller falls through. Returns a
+   * decision when it *does* apply, **including when it fails**: a device that registered a key and
+   * then presented a bad signature must not get a second chance through the shared secret, since
+   * that would make the stronger mechanism optional for anyone able to produce a malformed one.
+   */
+  verifyWithDeviceKey(req, { method, signedPath, body }) {
+    const header = readHeader(req.headers, DEVICE_SIGNATURE_HEADER);
+    if (typeof header !== 'string' || header === '') return null;
+
+    const machineId = this.machineIdForRequest(req);
+    if (machineId === null) return null;
+    const publicKey = this.state.devices.get(machineId)?.public_key;
+    if (typeof publicKey !== 'string' || publicKey === '') return null;
+
+    const decision = verifyDeviceSignature({
+      headers: req.headers,
+      publicKeyPem: publicKey,
+      method,
+      path: signedPath,
+      body: body ?? '',
+      nowMs: this.state.nowMs(),
+      skewSeconds: this.signatureSkewSeconds,
+      // `accept`, not `remember` -- the name this class actually exposes. It reports whether the
+      // nonce was new, which is exactly the contract `verifyDeviceSignature` expects.
+      nonces: (nonce, at) => this.nonceCache.accept(nonce, at),
+    });
+    if (decision.ok) return { ...decision, machine_id: machineId, keyIndex: null };
+    return decision;
+  }
+
+  /**
+   * Which machine a request claims to be, from either credential.
+   *
+   * An **operator token is not a machine**, so it resolves to `null` and the device path does not
+   * apply — consistent with `authorizeTaskDispatch`, which reports `machine_id: null` for an
+   * operator. That is why an operator-token request keeps using the shared secret.
+   */
+  machineIdForRequest(req) {
+    const token = bearerToken(req);
+    if (!token) return null;
+    if (this.operatorToken !== null && token === this.operatorToken) return null;
+    return this.state.authenticate(token)?.machine_id ?? null;
   }
 
   /** Periodic maintenance, called by the sweep timer. */
