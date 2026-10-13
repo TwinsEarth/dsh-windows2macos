@@ -54,7 +54,10 @@
       "202.182.123.154:3478",
       "stun.cloudflare.com:3478",
       "stun.l.google.com:19302",
-      "stun.nextcloud.com:443"
+      "stun.nextcloud.com:443",
+      "ilinkai.weixin.qq.com:443",
+      "weixin.qq.com:443",
+      "api.weixin.qq.com:443"
     ],
     "offlineMode": false,
     "apiKeys": [
@@ -65,11 +68,19 @@
       {
         "env": null,
         "storage": "file-0600"
+      },
+      {
+        "env": null,
+        "storage": "profile-config"
+      },
+      {
+        "env": null,
+        "storage": "im-bot-token"
       }
     ],
     "permissions": {
-      "network": "the configured relay (default: the shared server above), STUN servers, and UDP to the peer machines",
-      "filesystem": "read/write inside the project directory and DSH_HOME; the agent writes its spool and state under --state",
+      "network": "the configured relay (default: the shared server above), STUN servers, and UDP to the peer machines. The optional chatops channels reach one instant-messaging platform each, and only when that channel is named in `channels` and the host has supplied the transport: the WeChat channel reaches ilinkai.weixin.qq.com and sends the bot token as a bearer credential, and both that host and the base url in a login response are checked against an allow-list before a token is sent anywhere",
+      "filesystem": "read/write inside the project directory and DSH_HOME; the agent writes its spool and state under --state; the chatops file fence reads inside `projectRoot` only, after resolving symlinks",
       "env": [
         "W2M_*"
       ]
