@@ -4,6 +4,130 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.11] — 2026-10-14
+
+**The relay verifies device signatures, `/run` reaches the fleet from a chat window, the durability
+policy is written down, and the server's own configuration is in the repository.**
+
+### Relay verifies device Ed25519 signatures
+
+`verifySignature` now tries the per-device path before the shared secret. The design goal is
+**convergence**: a fleet updates one machine at a time, with no flag and no coordination.
+
+| device | outcome |
+|---|---|
+| sends no signature | shared secret — byte-for-byte unchanged |
+| has a stored key, good signature | verified by the key, `device: true` |
+| has a stored key, **bad** signature | **refused, and not retried against the shared secret** |
+
+That third row is the one that matters. Falling back would make the strong mechanism *optional* for
+anyone able to produce a malformed signature, which is everyone.
+
+*Defect found while writing it:* `NonceCache` exposes `accept`, not `remember`. The test caught it.
+
+### `/run` — two forms, two privilege levels
+
+| form | who | what it does | capability |
+|---|---|---|---|
+| `/run <argv>` | expert | dispatches those arguments, uninterpreted | `fleet.dispatch` |
+| `/run --ask <words>` | beginner | asks; the agent answers and **proposes** | `operate` |
+
+The asymmetry is the point. A beginner describing what they want is **not** executing anything: the
+request goes to a session, the session answers in prose, and if it wants something run it emits
+`/run <argv>` — which still needs `fleet.dispatch`. So a low-privilege window can ask freely and
+**cannot cause a fleet execution by asking**.
+
+The form is **declared** (`--ask`), never inferred from how the text reads. An inferred distinction
+gets it wrong in both directions, and the direction that matters is dispatching a sentence as if it
+were a program.
+
+Shell metacharacters are refused rather than passed through, because the fleet takes an argv array
+and never a shell string — `|` would arrive as a literal argument and quietly do something other
+than what was typed. **A command that runs and does the wrong thing is worse than a refusal.**
+
+### Durability policy
+
+The requirement was given as *"10× redundancy, tolerate losing 90% of nodes"*. Those are two
+different claims, and conflating them yields a system that looks compliant and is not:
+
+* **10 replicas** is a storage-layout property, and is **impossible** below 10 nodes;
+* **surviving 90% loss** counts every copy, including the authoritative one.
+
+Measured, with the arithmetic in tests:
+
+```
+n=   3  copies=3/10   loss=100%  basis=server_complete
+n= 100  copies=10/10  loss=100%  basis=server_complete
+n=1000  copies=10/10  loss=100%  basis=server_complete
+--- with no server copy ---
+n=   3  loss=67%   meets=false
+n=  10  loss=90%   meets=true
+```
+
+So at three devices the 90% guarantee is met **by the server's complete copy**, and device
+redundancy alone would give only 67%. That is why the policy treats the server as the **authority at
+every tier** rather than as one more replica that can be dropped once devices are plentiful.
+`durabilityReport()` names the basis in a note, so a health number cannot be read without its
+provenance, and `server_copy_required` is true at every fleet size.
+
+Tiers, inclusive at the bottom as measured by tests: `<100` server, `100–999` hybrid, `>=1000`
+distributed with the server as a fallback that is still written to.
+
+### The server's configuration is now in the repository
+
+`deploy/server/` holds the three systemd units **as the live host actually runs them** —
+`w2m-rabbit`, `w2m-stun`, `w2m-localside` — plus `deploy-w2m.sh`, the deployment script that
+performed the last two upgrades.
+
+The script's step order *is* the safety argument: verify the checksum **before** unpacking (a
+truncated upload must never become a service), back up in place (rollback must not depend on the
+network), check for entry points **before** swapping (a `git archive` of the wrong directory
+unpacks cleanly and contains no `bin/`), then restart, health-check, and **roll back automatically**
+on failure.
+
+**`/var/lib/w2m/rabbit/` is not in the repository and must never be.** It holds `operator-token.txt`
+— full control of the fleet — and the task ledger. Two mechanisms keep that true, because one is
+not enough: `.gitignore` refuses the **paths**, and `scripts/scan-for-secrets.mjs` reads the
+**content** of every tracked file. A `.gitignore` refuses a path; the ways a credential actually
+escapes are pasting one into a source file, a fixture, or an example.
+
+### The secrets guard, and the six defects it caught in itself
+
+The guard is only worth having if it works, so it was tested against the real repository — and it
+failed in ways worth recording, every one of them a **silent-off** failure that would look like
+success:
+
+1. **`statSync` was called unconditionally**, so an injected reader could never be reached — the
+   stat hit the real filesystem, threw, and the `catch` swallowed it;
+2. **a relative path was passed to `readFile`**, so every file threw and the scan reported
+   **zero findings across zero files**;
+3. **the regex `operator[_-]?token` missed camelCase** — `operatorToken`, which is how this project
+   actually spells it;
+4. **a slug rule requiring only `[a-z]`** rejected `p2p-crypto-operator` because of the digit in
+   `p2p`;
+5. a **duplicate rule** reported one match twice;
+6. a test **hard-coded rule names**, so renaming a rule broke a test that was measuring the name
+   rather than the behaviour.
+
+Findings on the real tree went from 3 false positives → 5 exposed fixtures → **0 blocking, 14 for
+review** (all ordinary 64-hex hashes). `REVIEW` is deliberately **not fatal**: a scanner whose false
+positives block releases is a scanner someone deletes.
+
+### Verified
+
+**542 chatops cases across twenty-two suites**, the relay's own **168 unchanged**.
+
+### Still not done
+
+* **`handoff.mjs`'s `shouldHandOff()` and `reconcileResults()` remain unwired** — the fleet and write
+  guards are in the relay's takeover path, the single-successor selection is not.
+* **The Linux server and Windows plugin are on v0.7.10**; the Mac is on **v0.6.3** and cannot be
+  updated remotely (its allow-list refuses anything but `node -e`, and a DSH restart would kill the
+  only channel to it).
+* **The relay is unscoped**, so accounts remain mixed at runtime.
+* **npm has not been published since 0.6.3** and no credential is available on this host.
+* **WeChat: reading works, sending works, `/run` is not yet wired to the channel.**
+
 ## [0.7.10] — 2026-10-14
 
 **Per-device Ed25519 request signing — the part of the signature chain that can be built without

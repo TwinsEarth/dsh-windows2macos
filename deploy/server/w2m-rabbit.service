@@ -1,0 +1,26 @@
+[Unit]
+Description=W2M Rabbit relay (P2P rendezvous, signalling and task ledger)
+Documentation=https://github.com/TwinsEarth/dsh-windows2macos
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=w2m
+Group=w2m
+WorkingDirectory=/opt/w2m/app
+ExecStart=/usr/local/bin/node /opt/w2m/app/bin/w2m-rabbit.mjs --host 0.0.0.0 --port 8787 --state /var/lib/w2m/rabbit
+Restart=always
+RestartSec=2
+# The relay holds no model credentials and no working copy; it needs its state dir and
+# nothing else. NoNewPrivileges + ProtectSystem close the obvious escalation paths.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/w2m
+StandardOutput=append:/var/log/w2m/rabbit.log
+StandardError=append:/var/log/w2m/rabbit.log
+
+[Install]
+WantedBy=multi-user.target

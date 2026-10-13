@@ -1,0 +1,26 @@
+[Unit]
+Description=W2M STUN responder - reflexive address discovery for P2P hole punching
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=w2m
+Group=w2m
+ExecStart=/usr/local/bin/node /opt/w2m/app/bin/w2m-stun.mjs --host 0.0.0.0 --port 3478 --log-level info
+Restart=always
+RestartSec=2
+StartLimitIntervalSec=60
+StartLimitBurst=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+StandardOutput=append:/var/log/w2m/stun.log
+StandardError=append:/var/log/w2m/stun.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,31 @@
+[Unit]
+Description=W2M Localside agent (shared server as a fleet machine)
+After=network-online.target w2m-rabbit.service
+Wants=network-online.target
+Wants=w2m-rabbit.service
+
+[Service]
+Type=simple
+User=w2m
+Group=w2m
+WorkingDirectory=/opt/w2m/demo
+ExecStart=/usr/local/bin/node /opt/w2m/app/bin/w2m-localside.mjs \
+  --rabbit http://127.0.0.1:8787 \
+  --project /opt/w2m/shared \
+  --name jp-shared \
+  --state /var/lib/w2m/localside-jp \
+  --p2p-mode auto \
+  --p2p-port 41234 \
+  --allowed-commands '["node --version","node --test","node -e","git status --porcelain","git rev-parse","git log","git diff","npm test","npm run"]'
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/w2m
+StandardOutput=append:/var/log/w2m/localside.log
+StandardError=append:/var/log/w2m/localside.log
+
+[Install]
+WantedBy=multi-user.target
