@@ -509,6 +509,14 @@ export class P2PNode extends EventEmitter {
     this.deviceKey = deviceKey ?? null;
     /** @type {PeerKeyStore} Peer static keys, learned from offers and from the relay. */
     this.peerKeys = peerKeys instanceof PeerKeyStore ? peerKeys : new PeerKeyStore();
+    /**
+     * Does the relay keep the static key this machine announces? `null` until an announcement proves
+     * it either way. See the note in `performAnnounce` — a relay older than v0.6.0 drops the field
+     * silently, and that is otherwise indistinguishable from every peer having no key.
+     *
+     * @type {boolean|null}
+     */
+    this.relayServesKeys = null;
     /** @type {object|null} `CryptoSession` overrides; null means the documented thresholds. */
     this.cryptoTuning = cryptoTuning ?? null;
     /** @type {NonceCache} Replay tracking for inbound handshakes. Outlives one `accept()`. */
@@ -654,6 +662,12 @@ export class P2PNode extends EventEmitter {
         enabled: this.deviceKey !== null,
         public_key: this.deviceKey === null ? null : (this.deviceKey.publicKeyBase64 ?? null),
         peers_known: this.peerKeys.size,
+        /**
+         * `null` until this node's own announcement proves it either way; `false` means the relay
+         * dropped the key we sent, which is the fact that explains an otherwise mysterious
+         * `peers_known: 0` on a fleet whose machines all hold keys (v0.6.2).
+         */
+        relay_serves_keys: this.relayServesKeys,
         handshakes: this.cryptoCounts.handshakes,
         encrypted_channels: this.cryptoCounts.encrypted_channels,
         plaintext_channels: this.cryptoCounts.plaintext_channels,
@@ -951,6 +965,28 @@ export class P2PNode extends EventEmitter {
     const posted = response?.ok === true;
     if (!posted && postError === null) postError = describeAnnounceFailure(response);
 
+    /**
+     * Does the relay keep the static key we send it? (v0.6.2)
+     *
+     * This is knowable from our own announcement, and only from our own announcement: we POST
+     * `static_key`, and the relay echoes the entry it stored. A relay that predates v0.6.0 has never
+     * heard of the field, drops it silently, and echoes an entry without it — indistinguishable, from
+     * any peer's point of view, from a machine that has no key at all.
+     *
+     * That ambiguity is what turned a stale relay into hours of "the peer is an older build". The
+     * deployed relay in this fleet started 2026-10-10T18:01:40Z; v0.6.0 and v0.6.1 shipped on
+     * 2026-10-11. Every announcement carried a valid key, every stored entry lost it, no dispatcher
+     * could ever arm a handshake, and `PLAINTEXT_PEER` blamed the one component that was up to date.
+     *
+     * Recorded rather than reported here: one announce proves the relay's behaviour, and `dial()`
+     * turns it into a named reason only where it explains something. `null` means "not yet known" —
+     * a machine with no key of its own cannot ask the question at all, and must not conclude "no".
+     */
+    if (posted && this.deviceKey !== null) {
+      const echoed = response?.json?.static_key;
+      this.relayServesKeys = typeof echoed === 'string' && echoed !== '' ? true : false;
+    }
+
     // A POST failure is the headline when there is one: the announcement is not live at
     // all. Otherwise a discovery failure is what makes this announcement incomplete.
     const error = !posted ? postError : discoveryOk ? null : discoveryError;
@@ -1142,6 +1178,9 @@ export class P2PNode extends EventEmitter {
     const fromOffer = Array.isArray(options.candidates) && options.candidates.length > 0;
 
     let announced = [];
+    // v0.6.2: the peer's static key as published in the same record the candidates came from. Lifted
+    // out of the lookup block because `lookup` is scoped to it, and the key is needed further down.
+    let announcedStaticKey = null;
     if (fromOffer) {
       announced = options.candidates;
     } else {
@@ -1166,6 +1205,8 @@ export class P2PNode extends EventEmitter {
         return fail(`P2P_LOOKUP_FAILED: ${describeLookupFailure(lookup)}`);
       }
       announced = Array.isArray(lookup.json?.peer?.candidates) ? lookup.json.peer.candidates : [];
+      const key = lookup.json?.peer?.static_key;
+      if (typeof key === 'string' && key !== '') announcedStaticKey = key;
     }
 
     const remote = [];
@@ -1176,6 +1217,52 @@ export class P2PNode extends EventEmitter {
       remote.push(usable);
       if (remote.length >= this.tuning.maxCandidates) break;
     }
+
+    /**
+     * The peer's static key, learned from its own announcement when this machine does not hold one.
+     *
+     * v0.6.2. This is the other half of the plaintext-downgrade fix, and without it the reason code
+     * alone would have been a better-worded lie: the dispatcher that reported
+     * `P2P_CRYPTO_PLAINTEXT_PEER` against a same-version peer *could* have encrypted, it simply had an
+     * empty key store and never asked. The relay has carried the peer's `static_key` in this very
+     * record since v0.6.0 (`relay/peers.mjs`), the plugin already read it, and the agent's own `dial()`
+     * was fetching the same record for the candidate list and then throwing the key away.
+     *
+     * Adopting it here is what makes the local/remote distinction possible as well as useful: a peer
+     * that publishes no key is genuinely an older build and `PLAINTEXT_PEER` is honest; a peer that
+     * publishes one we had not learned is *our* gap, and after this it is not a gap at all.
+     */
+    let peerKey = this.peerKeys.get(machineId);
+    if (peerKey === null && announcedStaticKey !== null) {
+      this.peerKeys.set(machineId, announcedStaticKey, 'relay');
+      peerKey = announcedStaticKey;
+    }
+
+    /**
+     * Why this dial cannot be encrypted, when it cannot. Named here because this is where the reason
+     * is actually known: `punch()` sees only "no crypto request" and used to guess, blaming the peer
+     * for what is usually a local condition.
+     *
+     * `null` means a handshake will be armed. `PLAINTEXT_PEER` is reserved for the one case that is
+     * about the peer -- it publishes no key, so there is nothing to encrypt with. Everything else is
+     * `NO_KEY`: this machine has no device key of its own, holds no key for that peer, or is dialling
+     * itself (a machine keeps no key for itself, so its own `respondHandshake` would refuse it with
+     * `P2P_CRYPTO_UNKNOWN_PEER`).
+     */
+    const cryptoBlockedReason =
+      this.deviceKey === null
+        ? CRYPTO_REASON.NO_KEY
+        : machineId === this.machineId
+          ? CRYPTO_REASON.NO_KEY
+          : peerKey === null
+            ? this.relayServesKeys === false
+              // The peer announced, we hold a key of our own, and no key came back for it. If this
+              // node has already proved the relay drops keys, the relay is the cause and saying
+              // otherwise sends the operator to the wrong machine.
+              ? CRYPTO_REASON.RELAY_NO_KEYS
+              : CRYPTO_REASON.PLAINTEXT_PEER
+            : null;
+
     if (remote.length === 0) {
       // `peersAnnounced` still counts what was offered, not what survived validation: a caller
       // reading "the punch failed" needs to see that there *was* a list, and that every entry in it
@@ -1210,17 +1297,19 @@ export class P2PNode extends EventEmitter {
         // sends would be refused by its own `respondHandshake` (`P2P_CRYPTO_UNKNOWN_PEER`) and the
         // task it dispatched to itself would be lost. `machineId !== this.machineId` is what makes a
         // self-lease survive a security upgrade, which is the same rule as every other fallback here.
-        ...(this.deviceKey === null ||
-        machineId === this.machineId ||
-        this.peerKeys.get(machineId) === null
-          ? {}
-          : {
+        ...(cryptoBlockedReason === null && peerKey !== null
+          ? {
             crypto: {
               deviceKey: this.deviceKey,
-              peerKey: this.peerKeys.get(machineId),
+              peerKey,
               peerMachineId: machineId,
             },
-          }),
+          }
+          : {}),
+        // v0.6.2: the reason travels with the call instead of being guessed downstream. `punch()`
+        // cannot tell a local "we hold no key" from the peer being an older build, and it used to
+        // report the peer-blaming one for both.
+        cryptoBlockedReason,
         ...(this.cryptoTuning === null ? {} : { cryptoTuning: this.cryptoTuning }),
       });
     } catch (error) {

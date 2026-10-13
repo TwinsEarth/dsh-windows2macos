@@ -23,8 +23,8 @@
 
 import { Readable } from 'node:stream';
 import { access, constants as fsConstants } from 'node:fs/promises';
-import { mkdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import {
@@ -49,7 +49,7 @@ import {
 } from './git.mjs';
 import { createSpool } from './spool.mjs';
 import { matchAllowedCommand, parseAllowedCommands } from './allowed-commands.mjs';
-import { CRYPTO_REASON, DeviceKey, PeerKeyStore } from './crypto.mjs';
+import { CRYPTO_REASON, DEVICE_KEY_FILE, DeviceKey, PeerKeyStore } from './crypto.mjs';
 import { DEFAULT_P2P_MODE, P2P_DEFAULTS, P2PNode, normalizeP2PMode, normalizeP2PPort } from './p2p-node.mjs';
 import { punchSession, reverseDialSession } from './p2p.mjs';
 import { createSigner } from '../signing.mjs';
@@ -988,6 +988,7 @@ export function createAgent(options) {
     project,
     stateDir,
     identity,
+    identityPath = null,
     caps,
     platform,
     once = false,
@@ -1093,11 +1094,17 @@ export function createAgent(options) {
   // *dispatcher* publishes in an offer, and "which key will this machine present" must not depend on
   // whether a particular code path happened to have run yet. `loadOrCreate` is the documented rule
   // ("generated the first time a machine pairs"), and a failure is never fatal — see `deviceKeyError`.
-  const deviceKeyOutcome = loadDeviceKey(options.deviceKey ?? null, stateDir, identity.machine_id);
+  const deviceKeyOutcome = loadDeviceKey(options.deviceKey ?? null, stateDir, identity.machine_id, identityPath);
   /** @type {object|null} This machine's static keypair, or null when there is none. */
   const deviceKey = deviceKeyOutcome.key;
   /** @type {string|null} Why there is no key, when there is none. Reported, never thrown. */
   const deviceKeyError = deviceKeyOutcome.error;
+  /**
+   * A key adopted from the pre-v0.6.2 location (`--state/device.key`). Reported once at startup,
+   * because a machine whose key moved is a machine whose public key a peer may have learned under the
+   * old file — silence here would make "my peers stopped talking to me" have no visible cause.
+   */
+  const deviceKeyMigratedFrom = deviceKeyOutcome.migratedFrom ?? null;
   /**
    * Peer static keys, learned from offers.
    *
@@ -1359,6 +1366,15 @@ export function createAgent(options) {
       log(result.ok ? 'info' : 'warn', `p2p ${p2pMode}: ${result.ok ? 'node started' : 'node did not start'}`, {
         error: result.error ?? null,
       });
+      // v0.6.2: a key adopted from the pre-fix location. Said out loud because the public key is what
+      // a peer authenticates this machine by, and a silent move would look like a peer going deaf.
+      if (deviceKeyMigratedFrom !== null) {
+        log('warn', 'p2p: adopting a device key from the old --state location', {
+          from: deviceKeyMigratedFrom,
+          public_key: deviceKey === null ? null : deviceKey.publicKeyBase64,
+          note: 'v0.6.2 moved device.key beside device.json; delete the old file once every peer has seen the new announcement',
+        });
+      }
       refreshP2PStatus();
       return result;
     })();
@@ -4067,32 +4083,88 @@ export function createAgent(options) {
  * be read so an operator can fix it. Refusing to start an agent because a *security upgrade* could not
  * complete is exactly the fleet-losing failure `docs/P2P-CRYPTO.md` §4 forbids.
  *
- * The key lives beside the spool and `agent-state.json` (the `--state` directory), which is where
- * `identity.mjs` puts `device.json` when the agent is run with `--state`. A caller that injected a
- * `DeviceKey` gets that one, which is the test seam and the way a caller supplies a key from
- * somewhere else entirely.
+ * WHERE THE KEY LIVES, AND THE BUG THAT CAME FROM GETTING IT WRONG (v0.6.2)
  *
- * @param {object|null} injected A `DeviceKey`, or null to load or generate one from the state dir.
- * @param {string} stateDir
+ * `DeviceKey.load` documents the rule as "`device.key` **beside `device.json`**", and this function
+ * used to break it: it loaded from the `--state` directory, justified by a comment claiming that
+ * `identity.mjs` puts `device.json` there "when the agent is run with `--state`". That claim is false.
+ * `device.json` is fixed at `<DSH_HOME>/xclient/device.json` by the identity contract and `--state`
+ * does not move it — which is why an agent run as `--state ~/.dsh/xclient/localside-mac` had its
+ * identity one directory *above* its key.
+ *
+ * The measured consequence, on one machine running both halves of W2M: the plugin (which loads the key
+ * correctly, from `dirname(device.json)`) and the agent each generated a *different* pair, and both
+ * announced to the one `/v1/peer/{machine_id}` slot — the relay's record alternated between the two
+ * nodes' ports every few seconds, and the `static_key` a dispatcher read was one node's or the other's.
+ * A dispatcher that learns the wrong key cannot arm a handshake, so every direct channel came back
+ * `P2P_CRYPTO_PLAINTEXT_PEER` — reported as "the peer is an older build" when both ends were the same
+ * build on the same host.
+ *
+ * MIGRATION. `DeviceKey.load` warns that "silently generating a replacement key would make every peer
+ * that knows the old one refuse this machine". So a key already generated in the old location is
+ * adopted rather than abandoned: canonical first, then a copy forward from `--state`, then generate.
+ *
+ * @param {object|null} injected A `DeviceKey`, or null to load or generate one.
+ * @param {string} stateDir The `--state` directory; the key's home only when `deviceFile` is absent.
  * @param {string} machineId
- * @returns {{key: object|null, error: string|null}}
+ * @param {string|null} [deviceFile] Absolute path of the `device.json` this agent loaded. The key
+ *   belongs beside it; pass the path the caller resolved rather than re-resolving `DSH_HOME` here.
+ * @returns {{key: object|null, error: string|null, migratedFrom: string|null}}
  */
-function loadDeviceKey(injected, stateDir, machineId) {
+function loadDeviceKey(injected, stateDir, machineId, deviceFile = undefined) {
   if (injected !== null && injected !== undefined) {
     if (typeof injected.sharedSecret !== 'function' || typeof injected.publicKeyBase64 !== 'string') {
-      return { key: null, error: 'P2P_CRYPTO_NO_KEY: the injected deviceKey is not a DeviceKey' };
+      return { key: null, error: 'P2P_CRYPTO_NO_KEY: the injected deviceKey is not a DeviceKey', migratedFrom: null };
     }
-    return { key: injected, error: null };
+    return { key: injected, error: null, migratedFrom: null };
   }
-  try {
-    const loaded = DeviceKey.load({ dir: stateDir, machineId });
-    return { key: loaded.key, error: null };
-  } catch (error) {
+
+  // Beside `device.json` — the documented rule. `identityPath` is the path the caller actually
+  // loaded, never a fresh global resolution: resolving `DSH_HOME` here would make a test (or any
+  // caller with an injected identity) read and *create* a key in the real user's home.
+  let canonicalDir = null;
+  if (typeof deviceFile === 'string' && deviceFile !== '') canonicalDir = dirname(deviceFile);
+
+  const legacyPath = join(stateDir, DEVICE_KEY_FILE);
+
+  /**
+   * Candidates in order. `mayCreate` is the whole subtlety: only a location that is *the* documented
+   * home may mint a key. A legacy directory is consulted to adopt a key that is already there, never
+   * to create one — `DeviceKey.load` warns that generating a replacement "would make every peer that
+   * knows the old one refuse this machine", so an upgrade must not silently change this machine's
+   * public key.
+   *
+   * With no `identityPath` the caller injected its own identity and there is no canonical home, so
+   * `--state` keeps the pre-v0.6.2 behaviour of being able to create. That is what stops a test or an
+   * embedder from reading and writing the real user's `~/.dsh/xclient`.
+   */
+  const candidates =
+    canonicalDir === null
+      ? [{ dir: stateDir, mayCreate: true, from: null }]
+      : [
+        { dir: canonicalDir, mayCreate: true, from: null },
+        ...(existsSync(legacyPath) ? [{ dir: stateDir, mayCreate: false, from: legacyPath }] : []),
+      ];
+
+  let lastError = null;
+  for (const candidate of candidates) {
+    try {
+      const loaded = DeviceKey.load({ dir: candidate.dir, machineId });
+      if (candidate.mayCreate === false && loaded.created) continue;
+      return { key: loaded.key, error: null, migratedFrom: candidate.from };
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  if (lastError !== null) {
     return {
       key: null,
-      error: `P2P_CRYPTO_KEY_UNREADABLE: ${error instanceof Error ? error.message : String(error)}`,
+      error: `P2P_CRYPTO_KEY_UNREADABLE: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
+      migratedFrom: null,
     };
   }
+  return { key: null, error: null, migratedFrom: null };
 }
 
 /**

@@ -31,7 +31,7 @@ import {
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { delimiter, dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
 
 import {
@@ -2923,7 +2923,27 @@ describe('w2m-localside CLI', () => {
   function runCli(args, { timeoutMs = 15_000 } = {}) {
     return new Promise((resolve) => {
       const child = spawn(process.execPath, [CLI, ...args], {
-        env: { ...process.env, DSH_HOME: join(root, 'cli-dsh-home') },
+        env: {
+          ...process.env,
+          DSH_HOME: join(root, 'cli-dsh-home'),
+          // The command under test is built from `process.execPath` — an absolute path — while the
+          // allow-list entry is the bare name `node -e`. `matchAllowedCommand` admits an absolute
+          // path only when it resolves to the same file the entry's bare name resolves to, and that
+          // name is looked up through PATH and then the bundled runtime **under this child's
+          // DSH_HOME**. Two things therefore have to be true, and on a clean CI runner both are:
+          //
+          //   * the scratch DSH_HOME above carries no `dsh-runtimes/`, so `bundledBinDirs()` returns
+          //     nothing there;
+          //   * `actions/setup-node` puts `node` on PATH.
+          //
+          // So this passed in CI and failed on a machine where node exists *only* as DSH's bundled
+          // runtime — measured here as `COMMAND_EXECUTABLE_PATH_MISMATCH`, which is the allow-list
+          // behaving exactly as documented. Putting the executing node's own directory on the
+          // child's PATH restores the identity the check is meant to confirm, rather than weakening
+          // the check: the absolute path still has to match a real, resolvable `node`, and a
+          // mismatched one is still refused.
+          PATH: `${dirname(process.execPath)}${delimiter}${process.env.PATH ?? ''}`,
+        },
         stdio: ['ignore', 'pipe', 'pipe'],
       });
       let stdout = '';

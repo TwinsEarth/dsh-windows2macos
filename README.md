@@ -283,6 +283,23 @@ Then give it the relay URL in that profile's `cordis.patch.yml` — or leave
     p2pMode: auto
 ```
 
+> **Do not add a `name:` line to that row.** In a patch, `name` is not a rename — it is an
+> *assertion* about the entry being patched, and the Loader skips the whole patch when it does not
+> match. The row is already inserted by the bundle with the package name, so an override that
+> asserts something else is discarded, and the plugin mounts with the bundle's **empty** defaults:
+>
+> ```
+> patch: name mismatch for "w2m" (expected "@twinsearth/w2m-dsh-plugin",
+>        got "@twinsearth/w2m-dsh-plugin/tools"), skipping
+> ```
+>
+> That is a silent failure by construction — the install looks right, eight tools appear, and
+> `w2m_status` reports `paired: false` and a null `rabbitUrl` because none of your values were ever
+> applied. It is not hypothetical: this row's expected name moved from the `/tools` subpath to the
+> package root in v0.5.4 (see `cordis.patch.yml`'s header for why), and every override that still
+> asserted the old subpath stopped being applied on upgrade. `id` already identifies the row, so the
+> safest `name:` is no `name:` at all.
+
 Restart DSH. You should see eight tools: `w2m_devices`, `w2m_run`, `w2m_wait`,
 `w2m_report`, `w2m_status`, `w2m_update`, `w2m_history`, `w2m_stats`.
 

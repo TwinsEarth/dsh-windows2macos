@@ -902,6 +902,16 @@ export class RelayServer {
       // so this drops to 0 by itself when nobody is refreshing.
       ...this.peers.stats(),
       ok: true,
+      /**
+       * v0.6.2: hoisted out of `persistence` so it cannot be missed by a reader that only looks at
+       * the top level. `degraded: true` means this relay is answering requests while failing to record
+       * them -- the one relay failure that presents as health. `ok` deliberately stays true: the relay
+       * still serves the fleet, and flipping it would turn a recording problem into an outage.
+       */
+      degraded: this.persistence.enabled && this.persistence.degraded,
+      degraded_reason: this.persistence.degraded
+        ? `ledger appends are failing (${this.persistence.lastAppendError ?? 'unknown error'}); results are served but not durably recorded`
+        : null,
       protocol_version: PROTOCOL_VERSION,
       rabbit_time: this.state.nowIso(),
       uptime_ms: this.state.nowMs() - this._startedAtMs,

@@ -104,6 +104,29 @@ YAML, and the loader fails on the file as a whole — one bad row takes the enti
 just this plugin. Both cases are why this file is treated as hand-edited state, not as a generated
 artifact.
 
+A third mechanism, and the only one where the file looks *perfect* and is still being ignored: **a
+`name:` line in your override is an assertion, not a rename.** The bundle inserts this row itself with
+the package name, so your row targets it by `id` and a `name:` only has to agree. When it does not, the
+Loader drops the whole patch:
+
+```
+patch: name mismatch for "w2m" (expected "@twinsearth/w2m-dsh-plugin",
+       got "@twinsearth/w2m-dsh-plugin/tools"), skipping
+```
+
+Every value in that block is then absent — not overridden with something else, simply never applied —
+and the plugin mounts on the bundle's empty defaults. This is the failure mode where `cat` shows your
+settings sitting right there and `w2m_status` reports `paired: false` anyway.
+
+It is also the one that arrives **on upgrade** rather than on a crash: the entry's expected name moved
+from the `/tools` subpath to the package root in v0.5.4 (`cordis.patch.yml`'s header records why), and
+every override still asserting the old subpath stopped being applied the moment the profile was
+upgraded — with no edit to the profile and no error. If you keep a `name:`, an upgrade can silently
+disconnect you from your own configuration.
+
+**The fix is to delete the line.** `id: w2m` already identifies the row; asserting the name buys
+nothing and turns any future rename by the bundle into a silent misconfiguration.
+
 **Decision procedure.**
 
 ```bash
@@ -113,6 +136,9 @@ cat "$DSH_HOME/profiles/<profile>/cordis.patch.yml"
 
 - First characters are `[]` → the placeholder case; see the safe-edit rule below.
 - The `w2m` row is absent → it was dropped; re-add it (§2 fix 3).
+- The row carries a `name:` line → **delete that line first**, then re-check the values. Everything
+  else in this section assumes the patch is being applied at all, and a mismatched `name:` means it
+  is not.
 - The row is present but values are empty → it was reset; re-apply them.
 
 ```bash
@@ -827,6 +853,9 @@ elsewhere. `<kind>` is the sub-directory a program is started with: `localside` 
 | `LEASE_EXPIRED`                                                           | task status                                                                | §4/§5 — the executor stopped renewing its lease                                                                                                                                                                                                                  |
 | `P2P_UNAVAILABLE`                                                         | `refused` result in `p2pMode: direct`                                      | §6 — the punch did not land and direct-only refuses the fallback                                                                                                                                                                                                 |
 | `P2P_PUNCH_TIMEOUT`                                                       | reported transport reason                                                  | §6, §13                                                                                                                                                                                                                                                          |
+| `P2P_CRYPTO_RELAY_NO_KEYS`                                                | `p2p.encryption.reason` on a direct channel that came back plaintext       | **the relay, not the peer.** This machine holds a key and the peer announced one, yet the relay served no key for it — this node has proved, from its own announcement, that the relay drops the `static_key` field. Almost always a relay older than v0.6.0: upgrade and restart it. `w2m_status` shows the same fact as `encryption.relay_serves_keys: false`. Replaced a misleading `PLAINTEXT_PEER` in v0.6.2 |
+| `P2P_CRYPTO_PLAINTEXT_PEER`                                               | `p2p.encryption.reason`                                                    | the peer genuinely publishes no key, so there is nothing to encrypt with. Check the peer's version before assuming it is merely misconfigured — and note that this code used to be reported for local causes too, which is why `P2P_CRYPTO_NO_KEY` and `..._RELAY_NO_KEYS` now exist |
+| `P2P_CRYPTO_NO_KEY`                                                       | `p2p.encryption.reason`                                                    | **this** machine's gap, not the peer's: no device key of its own, no key for that peer, or a self-dial (a machine keeps no key for itself). `device.key` lives beside `device.json`, not in `--state` |
 | `RUNNER_THREW`                                                            | the **auto-updater**'s spawn result (`w2m_update`), not an envelope status | the updater's own runner threw before or instead of running: read the message beside it, and check the install path. An envelope never carries this — `src/agent/exec.mjs` defines only `ok`, `nonzero_exit`, `timeout`, `crashed`, `refused` and `unverifiable` |
 | `SIGNATURE_*` (`MISMATCH`, `EXPIRED`, `REPLAY`, `REQUIRED`, `INCOMPLETE`) | relay, when signing is configured                                          | the signing secret is rotated or the two sides disagree; `SIGNING_NOT_CONFIGURED` means signing is off                                                                                                                                                           |
 

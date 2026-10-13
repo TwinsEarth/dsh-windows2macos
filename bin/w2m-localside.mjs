@@ -230,6 +230,11 @@ async function main() {
       project,
       stateDir,
       identity,
+      // v0.6.2: the device key belongs beside the `device.json` this process actually loaded, and this
+      // is the only place that knows where that is. Without it the agent fell back to `--state`, a
+      // different directory — so on one machine the plugin and the agent each minted their own keypair
+      // and then overwrote each other's announcement under the one shared machine_id.
+      identityPath,
       caps,
       platform,
       allowedCommands,

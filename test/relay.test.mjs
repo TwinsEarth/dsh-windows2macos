@@ -41,6 +41,7 @@ import {
 } from '../src/relay/state.mjs';
 import { AGGREGATE_STATUSES, aggregate, aggregateTask, renderReportMarkdown } from '../src/relay/report.mjs';
 import { createRelayServer, normalizeBasePath, SlidingWindowRateLimiter } from '../src/relay/server.mjs';
+import { Persistence } from '../src/relay/persistence.mjs';
 
 /**
  * Issue a request signed over the EXACT bytes that go on the wire.
@@ -2152,6 +2153,52 @@ describe('v0.1.2 persistence (§7)', () => {
 /* v0.1.2 §4/§8 — healthz fields, SSE hardening, relay_id              */
 /* ================================================================== */
 
+describe('v0.6.2 durability is a state, not a log line', () => {
+  it('reports a full disk as degraded, and counts the repeats instead of repeating them', async () => {
+    // THE INCIDENT. On a full disk the relay answered every request normally and appended nothing,
+    // and the only trace was one identical warning per failed append -- 22 of them in this fleet.
+    // A relay that serves without recording is the one relay failure that presents as health, so the
+    // two things pinned here are that it says so and that the repeats do not bury it.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'w2m-degraded-'));
+    const ledger = path.join(dir, 'ledger.jsonl');
+    try {
+      // Make the ledger path unappendable by putting a read-only *file* where the ledger must go:
+      // `append` then fails with EACCES/ENOTDIR, the same shape as ENOSPC from the caller's side.
+      fs.writeFileSync(ledger, '', { mode: 0o400 });
+      fs.chmodSync(ledger, 0o400);
+
+      const persistence = new Persistence({ dir, now: () => 1_700_000_000_000 });
+      const state = new RabbitState({ now: () => 1_700_000_000_000 });
+      state.setPersistence(persistence);
+
+      assert.equal(persistence.degraded, false, 'nothing has failed yet');
+
+      for (let i = 0; i < 5; i += 1) state._ledger({ kind: 'test', i });
+
+      assert.equal(persistence.degraded, true, 'serving while failing to record is a degraded state');
+      assert.equal(persistence.appendFailures, 5);
+      assert.equal(typeof persistence.lastAppendError, 'string');
+
+      const described = persistence.describe();
+      assert.equal(described.degraded, true);
+      assert.match(described.degraded_since, /^\d{4}-\d{2}-\d{2}T/, 'a start time is what makes it actionable');
+      assert.equal(described.append_failures, 5);
+
+      // Five failures, ONE warning entry that counts. The old shape produced five identical lines.
+      const failing = described.warnings.filter((w) => String(w.message).startsWith('append failed'));
+      assert.equal(failing.length, 1, 'identical warnings are counted, not repeated');
+      assert.equal(failing[0].count, 5);
+    } finally {
+      try {
+        fs.chmodSync(ledger, 0o600);
+      } catch {
+        /* the file may not exist if the test failed before writing it */
+      }
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('v0.1.2 observability (§4/§8)', () => {
   it('/healthz exposes the cross-region operations fields', async () => {
     await withRelay({ basePath: '/w2m', trustProxy: true, pairRateLimitPerMinute: 7 }, async (relay) => {
@@ -2169,10 +2216,18 @@ describe('v0.1.2 observability (§4/§8)', () => {
       assert.equal(hz.json.pair_rate_limit, 7);
       assert.deepEqual(
         Object.keys(hz.json.persistence).sort(),
-        ['devices_corrupt', 'devices_missing', 'dir', 'enabled', 'ledger_lines_read',
-          'ledger_lines_skipped', 'revived_devices', 'revived_tasks', 'warnings'],
+        ['append_failures', 'degraded', 'degraded_since', 'devices_corrupt', 'devices_missing', 'dir',
+          'enabled', 'last_append_error', 'ledger_lines_read', 'ledger_lines_skipped',
+          'revived_devices', 'revived_tasks', 'warnings'],
       );
       assert.equal(hz.json.persistence.enabled, false);
+      // v0.6.2: durability state, hoisted so a reader that only looks at the top level still sees it.
+      // A relay that serves while failing to record is the one relay failure that presents as health.
+      assert.equal(hz.json.persistence.degraded, false);
+      assert.equal(hz.json.persistence.append_failures, 0);
+      assert.equal(hz.json.persistence.last_append_error, null);
+      assert.equal(hz.json.degraded, false, 'persistence disabled is not degraded: there is nothing to fail');
+      assert.equal(hz.json.degraded_reason, null);
       const serialized = JSON.stringify(hz.json);
       assert.equal(serialized.includes(OP), false, '/healthz must never leak the operator token');
     });

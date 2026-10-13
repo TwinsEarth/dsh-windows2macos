@@ -36,6 +36,15 @@ export class Persistence {
     this._now = now;
     /** @type {{file:string, message:string, line?:number}[]} */
     this.warnings = [];
+    /**
+     * Durability state (v0.6.2): whether the ledger is actually being written.
+     *
+     * `appendFailures` is cumulative and never reset, so "how much was lost" stays answerable after a
+     * disk fills and is freed again. `degradedSinceMs` is the live condition.
+     */
+    this.appendFailures = 0;
+    this.lastAppendError = null;
+    this.degradedSinceMs = null;
     this.devicesCorrupt = false;
     this.devicesMissing = true;
     this.revivedDevices = 0;
@@ -50,8 +59,61 @@ export class Persistence {
   get operatorTokenFile() { return this.enabled ? path.join(this.dir, OPERATOR_TOKEN_FILE) : null; }
 
   warn(file, message, extra = {}) {
-    this.warnings.push({ file, message, ...extra });
-    return this.warnings[this.warnings.length - 1];
+    // Deduplicated (v0.6.2). A full disk fails *every* append, and appending an identical entry each
+    // time buried the signal in its own repetition: this fleet's relay reached 22 byte-identical
+    // "ENOSPC" warnings and no way to ask "is this relay still recording?" without counting them. One
+    // entry that counts is what an operator can act on.
+    const existing = this.warnings.find((entry) => entry.file === file && entry.message === message);
+    if (existing !== undefined) {
+      existing.count = (existing.count ?? 1) + 1;
+      existing.last_at = rfc3339(this._now());
+      return existing;
+    }
+    const entry = { file, message, count: 1, ...extra };
+    this.warnings.push(entry);
+    return entry;
+  }
+
+  /**
+   * One ledger append failed: the relay is still serving, but it is no longer recording (v0.6.2).
+   *
+   * This is a first-class state rather than a log line because the ledger *is* the relay's durability
+   * story. Every machine's result, every lease, everything a later question would be answered from —
+   * none of it survives a restart once appends stop landing. A relay in this state accepts work
+   * exactly as before, which is precisely why it has to say so out loud.
+   *
+   * @param {string} message
+   * @returns {false}
+   */
+  noteAppendFailure(message) {
+    this.appendFailures += 1;
+    this.lastAppendError = message;
+    if (this.degradedSinceMs === null) this.degradedSinceMs = this._now();
+    this.warn(LEDGER_FILE, `append failed: ${message}`);
+    return false;
+  }
+
+  /**
+   * The ledger is being written again.
+   *
+   * The history is kept — `append_failures` is not reset — because "how much was lost" is the first
+   * question after a disk fills, and a counter that silently returns to zero cannot answer it.
+   *
+   * @returns {true}
+   */
+  noteAppendSuccess() {
+    if (this.degradedSinceMs !== null) {
+      const forMs = Math.max(0, this._now() - this.degradedSinceMs);
+      this.degradedSinceMs = null;
+      this.lastAppendError = null;
+      this.warn(LEDGER_FILE, `append recovered after ${this.appendFailures} failure(s) over ${forMs}ms`);
+    }
+    return true;
+  }
+
+  /** Is the relay serving without recording? @returns {boolean} */
+  get degraded() {
+    return this.degradedSinceMs !== null;
   }
 
   ensureDir() {
@@ -199,6 +261,14 @@ export class Persistence {
       devices_missing: this.devicesMissing,
       ledger_lines_read: this.ledgerLinesRead,
       ledger_lines_skipped: this.ledgerLinesSkipped,
+      /**
+       * v0.6.2. `degraded: true` means the relay is answering requests while failing to record them,
+       * which is the one relay failure that looks exactly like health from the outside.
+       */
+      degraded: this.degraded,
+      degraded_since: this.degradedSinceMs === null ? null : rfc3339(this.degradedSinceMs),
+      last_append_error: this.lastAppendError,
+      append_failures: this.appendFailures,
       warnings: this.warnings.map((w) => ({ ...w })),
     };
   }

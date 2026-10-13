@@ -470,9 +470,16 @@ export class RabbitState {
   _ledger(entry) {
     if (this._restoring || !this._persist) return false;
     try {
-      return this._persist.append(entry);
+      const appended = this._persist.append(entry);
+      // v0.6.2: a successful append is what clears a degraded relay, so the outcome has to be
+      // reported back rather than assumed -- otherwise the state could only ever be entered.
+      if (appended) this._persist.noteAppendSuccess?.();
+      return appended;
     } catch (err) {
-      this._persist.warn?.('ledger.jsonl', `append failed: ${err.message}`);
+      // Recorded as a state, not merely as a line: this is the one relay failure that keeps serving,
+      // and so the one that is invisible from every other angle (v0.6.2).
+      if (typeof this._persist.noteAppendFailure === 'function') this._persist.noteAppendFailure(err.message);
+      else this._persist.warn?.('ledger.jsonl', `append failed: ${err.message}`);
       return false;
     }
   }

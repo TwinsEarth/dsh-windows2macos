@@ -1274,6 +1274,97 @@ describe('crypto: §7.6 an older peer that never learned a key still completes i
     }
   });
 
+  it('blames the relay, not the peer, when the relay drops the key it was sent', async () => {
+    // THE v0.6.2 REGRESSION. This test exists because the opposite behaviour cost an afternoon: a
+    // *relay* older than v0.6.0 accepted every announcement, silently dropped `static_key`, and served
+    // entries without it — so every peer looked exactly like a machine that had no key, and the
+    // resulting plaintext channel was reported as `PLAINTEXT_PEER` ("the peer never learned a key (an
+    // older build)") against peers that were the same build, on the same host, holding valid keys.
+    //
+    // The relay here is that relay: it echoes an announcement without the key it was given. The peer
+    // is not old and not keyless — it announces normally. Only the relay is behind.
+    const { P2PNode } = await import('../src/agent/p2p-node.mjs');
+    const sockets = [];
+    const binder = async () => {
+      const bound = await bindUdpSocket();
+      sockets.push(bound);
+      return bound;
+    };
+
+    /** An announcement the relay accepted, with the key stripped the way a pre-v0.6.0 relay strips it. */
+    const oldRelayAnnounce = () => ({ ok: true, status: 200, json: { machine_id: 'x', candidates: [], ttl_ms: 60000 } });
+
+    const behindRelay = 'machine-behind-relay';
+    const peer = 'machine-healthy';
+
+    const healthy = new P2PNode({
+      mode: 'auto',
+      machineId: peer,
+      rabbitUrl: 'http://127.0.0.1:1',
+      postJson: async () => oldRelayAnnounce(),
+      getJson: async () => ({ ok: false, status: 404, json: null }),
+      discover: async () => ({ ok: false, reflexive: null, mapping: 'unknown', error: 'no stun' }),
+      bindUdpSocket: binder,
+      deviceKey: DeviceKey.generate(peer),
+      peerKeys: new PeerKeyStore(),
+      tuning: { punchTimeoutMs: 2000, acceptTimeoutMs: 2000 },
+    });
+
+    const dialer = new P2PNode({
+      mode: 'auto',
+      machineId: behindRelay,
+      rabbitUrl: 'http://127.0.0.1:1',
+      postJson: async () => oldRelayAnnounce(),
+      // The peer announces — with candidates, so the punch has somewhere to go — but the relay's copy
+      // carries no key, because this relay never stored one.
+      getJson: async () => ({
+        ok: true,
+        status: 200,
+        json: { peer: { machine_id: peer, candidates: [{ address: '127.0.0.1', port: 9 }], nat: { mapping: 'unknown' } } },
+      }),
+      discover: async () => ({ ok: false, reflexive: null, mapping: 'unknown', error: 'no stun' }),
+      bindUdpSocket: binder,
+      deviceKey: DeviceKey.generate(behindRelay),
+      peerKeys: new PeerKeyStore(),
+      tuning: { punchTimeoutMs: 800, acceptTimeoutMs: 800 },
+    });
+
+    try {
+      await healthy.start();
+      await dialer.start();
+      await dialer.announceNow();
+
+      assert.equal(
+        dialer.status.encryption.relay_serves_keys,
+        false,
+        'a relay that echoes an announcement without the key it was sent is not serving keys',
+      );
+
+      const dialled = await dialer.dial(peer, {
+        session: 0x5eed0011,
+        candidates: [{ address: '127.0.0.1', port: healthy.status.local.port }],
+        timeoutMs: 800,
+      });
+      // The punch's outcome is not the point — whether anyone answers at 127.0.0.1:9 is not what this
+      // test is about. The *reason* is.
+      assert.equal(
+        dialled.channel?.encryption?.reason ?? dialled.encryption?.reason,
+        CRYPTO_REASON.RELAY_NO_KEYS,
+        'the relay dropped the key, so the relay is the cause — not the peer',
+      );
+    } finally {
+      await dialer.close();
+      await healthy.close();
+      for (const bound of sockets) {
+        try {
+          bound.socket.close();
+        } catch {
+          /* gone */
+        }
+      }
+    }
+  });
+
   it('completes the task and records encrypted:false in the ledger when the peer has no key', async () => {
     // THE REAL THING: a real relay, a real Localside agent, a real signed envelope. The offer arrives
     // over the relay because no key exists for this peer, which is the v0.5.x case, and what the

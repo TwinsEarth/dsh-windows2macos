@@ -210,6 +210,20 @@ export const CRYPTO_REASON = Object.freeze({
   /** The peer never learned a key (an older build), so a direct channel with it is plaintext. */
   PLAINTEXT_PEER: 'P2P_CRYPTO_PLAINTEXT_PEER',
   /**
+   * The relay is not serving peer keys, so no handshake can be armed by anyone (v0.6.2).
+   *
+   * Distinct from {@link PLAINTEXT_PEER} on purpose, and the distinction is the whole reason this code
+   * exists. A relay older than v0.6.0 has never heard of `static_key`: it accepts an announcement,
+   * silently drops the field, and serves an entry without it. Every peer then looks exactly like a
+   * machine that has no key — which is how a stale *relay* came to be reported for hours as "the peer
+   * is an older build", pointing the investigation at the one component that was up to date.
+   *
+   * Detected from this node's own announcement: we POST a key, so the entry the relay echoes back says
+   * whether it kept it. No relay cooperation and no version negotiation required, which is what makes
+   * it work against the relay that is actually deployed.
+   */
+  RELAY_NO_KEYS: 'P2P_CRYPTO_RELAY_NO_KEYS',
+  /**
    * A `REFUSE` datagram was **dropped**, not honoured: it named a session this punch did not agree.
    *
    * The four `REFUSE_*` codes below name an *ignored datagram* rather than a failed punch, which is

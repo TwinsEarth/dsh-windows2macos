@@ -4,6 +4,97 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.2] — 2026-10-13
+
+The release that stops a broken *relay* from being reported as an out-of-date *peer*, and stops a
+relay that has quietly stopped recording from looking healthy.
+
+The incident, measured on this fleet: every machine at v0.6.1 held a valid device key and announced
+it, `peers_known` stayed `0` on all of them, no handshake was ever armed, and every direct channel
+came back `P2P_CRYPTO_PLAINTEXT_PEER` — documented as *"the peer never learned a key (an older
+build)"*. Both ends were the same build, on the same host. The component that was actually behind was
+the relay: it started `2026-10-10T18:01:40Z`, and v0.6.0 and v0.6.1 shipped on `2026-10-11`. It had
+never heard of `static_key`, so it accepted every announcement, dropped the field, and served entries
+without it. The reason code blamed the one component that was up to date.
+
+### Added
+
+* **`encryption.relay_serves_keys`** — whether the relay keeps the key this machine announces. `null`
+  until an announcement proves it either way; `false` when the relay dropped what was sent; `null` for
+  a node with no key of its own, because such a node never asked and must not conclude "no". Detected
+  from this node's **own** announcement — it POSTs a key and the relay echoes the entry it stored — so
+  it needs no relay cooperation, no version negotiation and no capability call. That is what makes it
+  work against the relay that is actually deployed, which is the whole point.
+* **`P2P_CRYPTO_RELAY_NO_KEYS`** — a new reason, used when a peer announced, this machine holds a key
+  of its own, no key came back for that peer, and this node has already proved the relay drops keys.
+* **`/healthz` reports durability**: top-level `degraded` and `degraded_reason`, plus `degraded`,
+  `degraded_since`, `last_append_error` and `append_failures` inside `persistence`. `ok` deliberately
+  stays `true`: the relay still serves the fleet, and flipping it would turn a recording problem into
+  an outage. Persistence disabled is not degraded — there is nothing that can fail.
+
+### Fixed
+
+* **The reason a direct channel is plaintext now names the real cause.** `punch()` computed it as
+  `request === null ? PLAINTEXT_PEER : NO_KEY`, and `dial()` sends no crypto request in three
+  situations that are all *local* — this machine has no device key, it holds no key for that peer, or
+  it is dialling itself. Every one of them was reported as the peer being old. The code already
+  disagreed with itself about this: `dial()`'s own comment claims the reason "then says
+  `P2P_CRYPTO_NO_KEY`". The reason is now decided where it is known and travels with the call;
+  `PLAINTEXT_PEER` keeps its real meaning and keeps firing for the one case that is genuinely about
+  the peer — it publishes no key, so there is nothing to encrypt with.
+* **`dial()` learns the peer key it was throwing away.** The peer's `static_key` has ridden in the
+  relay's `/v1/peer/{id}` record since v0.6.0, and `dial()` was fetching that very record for the
+  candidate list and discarding the key. A dispatcher that reported `PLAINTEXT_PEER` against a
+  same-version peer could have encrypted; it had an empty store and never asked. Reporting alone would
+  have been a better-worded lie.
+* **`device.key` is loaded from beside `device.json`, not from `--state`.** The plugin followed the
+  documented rule; the agent did not, on the stated grounds that "`identity.mjs` puts `device.json`
+  when the agent is run with `--state`" — which is false. `device.json` is fixed at
+  `<DSH_HOME>/xclient/device.json` by the identity contract and `--state` does not move it. Measured
+  consequence on one machine running both halves: two different keypairs under one `machine_id`, both
+  announcing to the one `/v1/peer/{machine_id}` slot, the relay's record alternating between the two
+  nodes' ports every ~8s, each announcement overwriting the other. A dispatcher reading that record
+  learned one node's key or the other's, never reliably the key of the node it was about to dial. The
+  fix takes the path the caller actually resolved — `bin/w2m-localside.mjs` already had it in
+  `identityPath` and simply did not pass it down — and deliberately does **not** re-resolve `DSH_HOME`
+  inside the agent, which would make a test or an embedder read and *create* a key in the real user's
+  home.
+* **A key already generated in `--state` is adopted, not abandoned.** `DeviceKey.load` warns that
+  "silently generating a replacement key would make every peer that knows the old one refuse this
+  machine", so the canonical location may create and a legacy file may only be adopted. An adopted key
+  is logged, because the public key is what a peer authenticates this machine by.
+* **A relay that serves without recording now says so.** On a full disk the relay answered every
+  request normally and appended nothing; the only trace was one warning per failed append, and this
+  fleet's relay had reached **22 byte-identical `ENOSPC` entries**, so the signal was buried in its own
+  repetition. Identical warnings are now counted rather than repeated, and durability is a first-class
+  state: entered by the first failed append, cleared by the next success. `append_failures` is
+  cumulative and deliberately never reset — "how much was lost" is the first question after a disk
+  fills, and a counter that returns to zero cannot answer it.
+* **A patch override that asserts the wrong `name:` now has a documented failure mode.** In a patch,
+  `name` is an *assertion* about the entry being targeted, not a rename, and the Loader drops the whole
+  patch on mismatch — leaving the plugin mounted on the bundle's empty defaults: eight tools present,
+  `w2m_status` reading `paired: false` and a null `rabbitUrl`, with the profile's settings sitting in
+  the file the whole time, unread. README now carries the hazard where the config block is copied,
+  `TROUBLESHOOTING.md` §2 names it as the third mechanism for "the patch lost my configuration" (and
+  the only one where the file looks intact), and §17 documents the reason codes this release adds and
+  corrects.
+* **`test/agent.test.mjs`'s sub-path CLI test no longer depends on the host's `PATH`.** This is what
+  made v0.6.1's own pre-flight **RED** — "do not bump" — on a machine where node exists only as DSH's
+  bundled runtime. `runCli` points the child's `DSH_HOME` at a scratch directory, so
+  `bundledBinDirs()` correctly finds no bundled runtime there; the command under test is built from
+  `process.execPath` while the allow-list entry is the bare name `node -e`; and with no bundled runtime
+  and no `node` on `PATH`, that name does not resolve, so the absolute path is refused with
+  `COMMAND_EXECUTABLE_PATH_MISMATCH` — the allow-list behaving exactly as documented. CI runs
+  `actions/setup-node`, which is why it was green there. The child now gets the executing node's own
+  directory on its `PATH`, which restores the identity the check exists to confirm rather than
+  weakening it: a mismatched absolute path is still refused with the same code.
+
+### Changed
+
+* `scripts/preflight.mjs` reports **11 pass, 0 fail, 1 unverifiable — GREEN, cleared to bump** on a
+  clean macOS checkout. Before this release the same gate reported "10 pass, 1 fail — RED".
+* The local suite reads **557 tests, 555 pass, 0 fail**.
+
 ## [0.6.1] — 2026-10-11
 
 ### Fixed

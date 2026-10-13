@@ -1485,10 +1485,18 @@ describe('p2p-node: lifecycle', () => {
       'public_key',
       'refusals',
       'refused',
+      // v0.6.2: whether the relay keeps the key this machine announces. `null` for this node because
+      // it has no key of its own, so it never asked the question — see `performAnnounce`.
+      'relay_serves_keys',
     ]);
     assert.equal(status.encryption.enabled, false);
     assert.equal(status.encryption.public_key, null);
     assert.equal(status.encryption.peers_known, 0);
+    assert.equal(
+      status.encryption.relay_serves_keys,
+      null,
+      'a node with no key of its own must not conclude anything about the relay',
+    );
     // Plain objects, no class instances: the whole thing has to survive JSON.
     assert.equal(Object.getPrototypeOf(status), Object.prototype);
     assert.equal(Object.getPrototypeOf(status.local), Object.prototype);

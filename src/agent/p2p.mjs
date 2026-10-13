@@ -558,13 +558,25 @@ export async function punch(options) {
    * the refusal MEDIUM-4 was about.
    */
   const refusalKey = handshake === null ? null : handshake.refusalMacKey;
-  // Why there is no handshake, when there is none. `null` means one is in flight.
-  const noCryptoReason =
-    handshake !== null
-      ? null
-      : request === null
-        ? CRYPTO_REASON.PLAINTEXT_PEER
-        : CRYPTO_REASON.NO_KEY;
+  /**
+   * Why there is no handshake, when there is none. `null` means one is in flight.
+   *
+   * v0.6.2: `request === null` is *this end's* decision, not a fact about the peer. `P2PNode.dial`
+   * sends no crypto request in three situations and every one of them is local — this machine has no
+   * device key, it holds no key for that peer, or it is dialling itself (a machine keeps no key for
+   * itself, so its own `respondHandshake` would refuse it with `P2P_CRYPTO_UNKNOWN_PEER`).
+   *
+   * It used to report `PLAINTEXT_PEER` here, documented as "the peer never learned a key (an older
+   * build)". Measured consequence: a dispatcher with an empty peer-key store reported every direct
+   * channel as the peer being out of date, when both ends were the same build on the same host — an
+   * encryption downgrade recorded as normal compatibility. `dial()`'s own comment has always claimed
+   * the reason would be `NO_KEY`; this is that behaviour, and it is what the objective asks for: a
+   * punch that did not encrypt says whether the cause was ours or theirs.
+   *
+   * `PLAINTEXT_PEER` keeps its real meaning and its real sites: a handshake *was* armed and the peer
+   * answered in the clear, which is the only case where the peer is genuinely the reason.
+   */
+  const noCryptoReason = handshake !== null ? null : (options.cryptoBlockedReason ?? CRYPTO_REASON.NO_KEY);
   /** Whether this punch is trying to encrypt at all. */
   const wantCrypto = handshake !== null;
 
