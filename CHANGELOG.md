@@ -4,6 +4,66 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.2] — 2026-10-14
+
+**The client half of the auto-join.** v0.8.1 landed the credential and the relay's acceptance of
+it; this is the wiring that makes a real machine use them.
+
+### What is now connected
+
+| piece | what it does |
+|---|---|
+| `account.mjs` | derives the fleet key on **every** resolve, including the stored-SN path |
+| `index.mjs` | exposes it as `fleetKey` — the key, never the account id |
+| `agent.mjs` | `pair(code, userId, fleetKey)`, sending only the discriminator that was given |
+| `w2m-localside` | `--fleet-key`, a peer of `--pair` |
+| relay | derives the fleet from the key; never believes a claimed one |
+
+**Verified end to end:** an agent given **only** `--fleet-key`, against a relay with **no fleet of
+its own**, pairs and lands in the account-derived fleet (`d5bb1b9ddf3faad4`, `source=fleet_key`).
+
+### The bug that would have made it work exactly once
+
+`resolve()` returned early when an SN was already stored and never read the account at all. That is
+right for the SN — it must not be regenerated, or every restart looks like a new device — and
+**wrong for the key**: a machine has a stored SN from its *second* start onward, so it would have
+derived a fleet key once and never again.
+
+**The auto-join would have worked on a machine's first boot and silently stopped afterwards** — the
+hardest kind of bug to see, because it works when you test it. Found by asking what the stored-SN
+path actually does, rather than by reading the happy path.
+
+### The bug in this release's own patch
+
+The fleet-key handling was first inserted **inside `if (flags.pair)`**, so the key path could only
+run when a pairing code was also supplied — precisely the case it exists to avoid. **It worked
+whenever anyone tested it with a code, and did nothing in the case that mattered.** The end-to-end
+test is what caught it, not review.
+
+### A provenance bug, also caught by testing
+
+A device that paired by key was recorded as `fleet_source: 'pairing_code'`, because the relay builds
+a synthetic code record so the binding reads from one place. That matters: `fleet_source` is what an
+operator reads in `devices.json` to answer *"how did this machine get into my fleet?"*, and
+answering "a pairing code" when there was none sends them looking for a code never issued.
+
+### Also
+
+`HANDOFF.md` records the state, the single reachable path to the Mac, and the traps this codebase
+has already fallen into.
+
+### Verified
+
+**585 chatops cases pass.** The 12 agent-suite failures are **pre-existing and environmental** —
+measured against an untouched clone of the same commit, both give **147 tests / 133 pass / 12 fail /
+2 skipped**, identical, so this change is not the cause.
+
+### ⚠️ Still not user-facing
+
+**The plugin does not yet spawn the agent or hand it the key**, so with the default configuration a
+new PC still will not auto-join. The mechanism is complete and verified; that last wire is what
+makes it something a user experiences rather than something a test proves.
+
 ## [0.8.1] — 2026-10-14
 
 **A machine on the same account joins the same fleet with no human step** — the requirement that
