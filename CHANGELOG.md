@@ -4,6 +4,70 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.4] — 2026-10-14
+
+**No code changed.** This release is an audit and a design document, and it exists because the
+audit found that the answer to *"is each account's fleet isolated?"* is **no** — in a way worth
+writing down before anything is built on top of it.
+
+### What the audit found, every line with its source
+
+| question | answer | where |
+|---|---|---|
+| Is a device identity bound to an account? | **No.** `machine_id` is `randomUUID()` — no account, no hardware | `src/agent/agent.mjs` |
+| Does an SN exist? | **No.** The concept is not in the codebase | entire repo |
+| Is there a hardware identifier? | **No.** `caps` probes os/arch/node/python but never enters identity or authorisation | `src/agent/caps.mjs` |
+| Does the relay use `user_id` for isolation? | **No — it stores it and never reads it.** Five references, every one a store or load | `src/relay/state.mjs` L507/736/981/993, `persistence.mjs` L170 |
+| Does the plugin reference `user_id`? | **Zero times** | `src/plugin/tools.mjs` |
+| Are dispatch targets filtered by account? | **No.** With no `target_machines`, `targets = all` — every device on the relay | `src/relay/state.mjs` L1259-1262 |
+| Device table shape | **One flat Map**, no grouping dimension | `src/relay/state.mjs` L435 |
+
+Measured on the shared relay (`a1b59a3b04dcd180`): **`devices=4`, all in one pool, with a single
+pairing code.** Any machine holding that code joins the same pool, and any caller holding a valid
+operator token has its task broadcast to every one of those four machines.
+
+### Added
+
+* **`docs/ACCOUNT-FLEET-DESIGN.md`** — the design for account-scoped fleets, in three parts as
+  asked: the exact SN format, the relay authorisation model, and the hand-off timing.
+
+  The identity source is **verified, not assumed**: DSH already exposes `ctx.deepseekAccount`,
+  whose `getDeviceIdentity()` returns `{ deviceId?, userId?, osVersion }` and is documented as
+  *"read existing login identity without creating a device or returning credentials."* The
+  account's unique identifier therefore needs **no account API call** — and a hand-typed account
+  code in a config row is explicitly ruled out, because a value an operator can type is a value
+  an attacker can type.
+
+  The SN is defined to the character: `W2M-<ACCT>-<HWID>-<TS>`, 41 characters, with `ACCT` a
+  truncated `sha256(userId)` rather than the raw id (it ends up in logs, chat messages and device
+  lists), `HWID` from platform-stable sources only — MAC addresses, mount points and package
+  lists are excluded because they change and would make one machine look like two — and `TS`
+  fixed at first generation.
+
+### Three things the design says out loud that a proposal usually does not
+
+1. **An SN cannot be a credential.** It is computed and asserted by the client, so anyone who
+   knows or guesses an account id can forge one. The document states that the relay must never
+   trust an SN, and that the timestamp provides **no** cryptographic uniqueness — uniqueness is
+   `(ACCT, HWID)`, and the timestamp only distinguishes re-registrations and makes the string
+   auditable. A string scheme presented as hardware-grade protection is worse than none, because
+   it is believed.
+2. **Hand-off makes execution at-least-once.** A command may run on two machines. Harmless for
+   `node --test`, harmful for anything with `write: true` — so the design **forbids automatic
+   hand-off for writing tasks** until a fencing token exists.
+3. **The relay is the trust root.** Compromising it forges any fleet's authorisation. The design
+   accepts that rather than adding an online account check, which would stop offline machines
+   from working at all.
+
+### Not in this release
+
+* **Nothing from the design is implemented.** It lands in **v0.8.0**, because it changes the relay
+  protocol — a breaking change that needs an explicit refusal path for older devices rather than
+  a silent failure.
+* **No message has yet gone from a phone through WeChat to the fleet.** The adapter is verified
+  against live WeChat and the executor against a live relay; **the two have not been joined by a
+  human typing.**
+
 ## [0.7.3] — 2026-10-14
 
 **The fleet reader used the wrong credential and the wrong field names.** v0.7.2 shipped an
