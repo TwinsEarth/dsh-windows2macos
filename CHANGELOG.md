@@ -4,6 +4,71 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.7] — 2026-10-14
+
+**Hand-off: what happens when the machine holding a task does not answer.** `ACCOUNT-FLEET-DESIGN.md`
+§4, built.
+
+> **Two things this release does not do, said first.**
+>
+> 1. **The relay still does not call any of the v0.7.6/v0.7.7 modules.** Dispatch is still
+>    `[...this.devices.values()]`, no keypair is generated, no statement is issued, no request is
+>    signed, and no lease is ever handed off. **At runtime, accounts remain mixed and a silent PC
+>    is still simply silent.** These releases are the mechanism.
+> 2. **The Linux server was not updated.** Its SSH credentials were not available to me
+>    (`ssh_run.py` deliberately reads them from the environment with no fallback in the file), so
+>    the relay there still runs v0.6.3-era code. Updating it needs `W2M_PASS`.
+
+### Added
+
+* **`src/chatops/handoff.mjs`** — the hand-off decision, and the sharp edge it names.
+  * **`write: true` plus `halt: 'now'` is refused outright.** Hand-off turns execution from
+    at-most-once into **at-least-once**: a command may now run on two machines. Harmless for
+    `node --test`, and a second application of the same change for anything that writes — on a
+    machine with no idea the first one already ran. Refused, not warned about.
+  * **A late result never overwrites its successor.** The winner is the **highest attempt**, not
+    the last to arrive: arrival order is a property of the network, and a verdict that depends on
+    it is a verdict nobody can reason about. Superseded results are **kept, not dropped** — a late
+    result from the machine that went silent says it was slow, not dead, and discarding it turns a
+    diagnosable situation into an unexplained one.
+  * **The machine that just went silent is never offered its own slice again** — the one
+    reassignment guaranteed to be useless.
+  * **A slow machine is not pre-empted.** Two separate questions, in order: is the lease still
+    valid, and has the grace elapsed since it expired.
+  * **Every refusal is named**, because *"why did nothing take over"* has several answers with
+    different fixes: cancelled, `halt: 'never'`, a writing task, no other machine, every machine
+    already tried, not yet expired.
+
+* `test/chatops-handoff.test.mjs` — 29 cases.
+
+### Three defects found in this module by its own tests
+
+Worth recording, because each was invisible in the code and obvious in a failure:
+
+1. **The grace-period arithmetic was on the wrong side.** The first version asked
+   `now + grace <= until`, which declines when the grace is *short* and takes over when it is
+   *long* — the exact inverse. Two questions were being collapsed into one expression; they are
+   now separate branches.
+2. **`ALL_TRIED` was unreachable.** It was decided by asking "is there an untried machine", which
+   is always false in the all-tried case, so the reason could never fire and the two refusals were
+   indistinguishable. The real question is how many machines *exist*, not how many are untried.
+3. **A missing attempt number was treated as the newest.** `?? Infinity` made a frame with no
+   attempt win the aggregate — letting a stale result from a superseded lease override its
+   successor, which is the precise inversion `reconcileResults` exists to prevent. A missing
+   attempt is an **old** frame: it now sorts as `0`.
+
+### Still not connected
+
+`auth.mjs`, `fleet-scope.mjs` and `handoff.mjs` are complete and tested, and **nothing in `src/`
+outside `src/chatops/` imports them.** The relay must still:
+
+* bind pairing codes to a fleet and sign a statement per device,
+* verify the statement and the request signature on every call,
+* replace the target selection with `selectTargets()`,
+* call `shouldHandOff()` on lease expiry, and `reconcileResults()` when results arrive.
+
+Until that is done, the isolation and the hand-off are **designed and tested, not in effect**.
+
 ## [0.7.6] — 2026-10-14
 
 **The authorisation chain and the fleet scoping rule.** `ACCOUNT-FLEET-DESIGN.md` §3, built.
