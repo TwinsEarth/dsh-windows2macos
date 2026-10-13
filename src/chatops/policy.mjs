@@ -81,6 +81,11 @@ export const CHANNELS = Object.freeze({
   dingtalk: Object.freeze({ prefixes: Object.freeze(['dsu']), supportsRooms: true, roomPrefixes: Object.freeze(['dsc']) }),
   wecom: Object.freeze({ prefixes: Object.freeze(['wsu']), supportsRooms: true, roomPrefixes: Object.freeze(['wsc']) }),
   wechaty: Object.freeze({ prefixes: Object.freeze(['wx', 'room', 'self']), supportsRooms: true, roomPrefixes: Object.freeze(['room']) }),
+  // The in-memory channel is a first-class member, not a test-only special case. Registering
+  // it here is what lets a dry run and the integration suite exercise the *real* admission
+  // and routing path rather than a bypass, and it is the worked example for what adding a
+  // sixth channel now costs: one entry, in one table.
+  memory: Object.freeze({ prefixes: Object.freeze(['mem']), supportsRooms: false, selfKey: 'mem' }),
 });
 
 /**
