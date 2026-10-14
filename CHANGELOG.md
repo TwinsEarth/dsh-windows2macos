@@ -4,6 +4,37 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.5] — 2026-10-14
+
+**Same code as v0.9.4; published because v0.9.4's npm and GitHub bytes cannot be made to agree.**
+
+### Why this version exists
+
+v0.9.4 was published, then amended minutes later to replace a comment that quoted a retired message
+verbatim. GitHub's tag and assets were moved to the corrected commit. **npm could not follow**: a
+published version cannot be overwritten, and this account's token cannot unpublish either, so npm keeps
+the pre-amendment bytes permanently.
+
+The difference is one comment. It is recorded here rather than papered over because a divergence that is
+discovered later and unexplained costs more than a version number:
+
+| Where | v0.9.4 | Carries |
+|---|---|---|
+| npm | `sha256:570f5175…` (870353 b) | the comment that quotes the retired sentence |
+| GitHub | `sha256:ab7b60dc…` (870448 b) | the corrected comment |
+
+Both run **identically** — the changed bytes are inside a `/** */` block. `latest` on npm now points at
+0.9.5, which is byte-consistent with its GitHub release, so the divergence is confined to a superseded
+patch of one patch version.
+
+### Verified
+
+- `test/relay.test.mjs` 152 pass, `test/claims.test.mjs` 47 pass, `test/chatops-account.test.mjs` pass —
+  242 tests, 0 failures, 0 cancelled.
+- `eslint .` — 0 errors.
+- The precise check on the shipped tree: the retired sentence appears **0 times in code and 0 times in
+  comments**; the corrected sentence appears once, at the assignment.
+
 ## [0.9.4] — 2026-10-14
 
 **A note that promised a verdict the relay no longer delivers, and the test that had locked the promise in.**
