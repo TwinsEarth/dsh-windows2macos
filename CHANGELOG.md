@@ -4,6 +4,53 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.7] — 2026-10-14
+
+**`w2m_memory` gains the collective layer and the one write a machine may not make for itself.**
+
+### `scope: "fleet"` — the collective memory
+
+Reads the curated `fleet-memory.md` that §3.2 of the design puts on the archive host, beside the profile
+that mounted this plugin. It returns the document **as text, with its section list**, and does not parse
+it into facts — deliberately. Hand-written prose has no schema, so a parser would silently drop whatever
+shape it did not recognise, and what it dropped would be exactly what a human judged worth writing down.
+The section list is there so a reader can see what the collective memory covers before paying for all of
+it.
+
+An absent file is answered honestly rather than as an empty document: `MEMORY_NO_COLLECTIVE`, with the
+path that was looked at. *"Nothing has been curated yet"* and *"the memory is empty"* are different
+facts, and only one of them means someone should start writing.
+
+### `record` — a conclusion, which only a reader may assert
+
+`memoryRecord` always emits `conclusion: null`, because a machine that invented one would be asserting an
+interpretation it cannot have. This is the path by which a reader supplies it: the conclusion is appended
+as a **new record naming the task it is about**, never written into the existing line.
+
+Append-only is the point. In-place editing would break the property that makes the log trustworthy — what
+was written is what happened, and an amendment is a later statement *about* it — and it would destroy the
+original text, which is the thing a reader most needs when a conclusion turns out to be wrong.
+
+### A defect this found in its own first draft
+
+`collectivePath()` was `path.join(resolveProfileDir(cfg), COLLECTIVE_FILE)`. `resolveProfileDir`
+legitimately returns `null` — a bare test context, or a host whose layout it cannot read — and the first
+version passed that straight into `path.join`, which threw `ERR_INVALID_ARG_TYPE`. **A read tool that
+crashes on a missing directory is worse than one that says the directory is missing:** the caller was
+asking a question, and an exception is not an answer. It now resolves to `null`, reports
+`MEMORY_NO_COLLECTIVE`, and says which of the two reasons applies.
+
+### Verified
+
+- `eslint .` — 0 errors.
+- The contract suites — `memory`, `tools`, `tool-cards`, `claims`, `loader-entry`, `update-wiring`,
+  `p2p-plugin` — **230 pass, 0 fail, 11 platform skips**.
+- Every scope exercised against a real temporary profile: `fleet` found the seeded document and listed
+  its five sections; `record` wrote a conclusion against a task and reported that no task existed when
+  none did; an absent collective file produced `MEMORY_NO_COLLECTIVE` rather than a throw.
+- The tool count is unchanged at nine, so this release moves no contract: the same nine tools, two of them
+  wider.
+
 ## [0.9.6] — 2026-10-14
 
 **Individual memory: the fleet can now answer "what did we already try on this machine, and what happened?" — a question nothing in it could answer before.**

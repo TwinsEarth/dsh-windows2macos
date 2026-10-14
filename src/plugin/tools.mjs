@@ -97,7 +97,7 @@ import path from 'node:path';
 // file here: the reader carries the rules that matter -- newest-first by file position, a malformed line
 // skipped rather than fatal, and the rotated generation reachable -- and a second implementation would
 // drift from the writer's shape without anything failing.
-import { readMemorySync } from '../agent/memory.mjs';
+import { appendMemory, readMemorySync } from '../agent/memory.mjs';
 
 // The base-address rules live in one place (§2), shared with the agent side. Importing the - rather
 // than re-deriving them her - is what stops the plugin and the agent from disagreeing about what
@@ -4687,15 +4687,48 @@ export async function apply(ctx, config = {}) {
    * fleet's roster still comes from the relay, so the answer distinguishes "no such machine" from "that
    * machine keeps its own memory and this build cannot fetch it".
    */
+  /**
+   * The collective layer's filename, beside the profile that mounted this plugin.
+   *
+   * §3.2 of the design puts curated fleet knowledge on the archive host. This is the read half of it, and
+   * it deliberately reads a *markdown document* rather than a store: the design's own argument is that a
+   * memory which is merely a log is one nobody reads, so the collective layer is written for a person and
+   * this tool returns it as text rather than pretending to have parsed it into facts. A parser over
+   * hand-written prose would silently drop whatever it did not recognise, and the dropped part would be
+   * exactly the part a human thought was worth writing down.
+   */
+  const COLLECTIVE_FILE = 'fleet-memory.md';
+  /**
+   * The collective document's path, or `null` when there is no profile to resolve it against.
+   *
+   * `resolveProfileDir` legitimately returns `null` -- a bare test context, or a host whose layout it
+   * cannot read -- and the first version of this passed that straight into `path.join`, which threw
+   * `ERR_INVALID_ARG_TYPE`. A read tool that crashes on a missing directory is worse than one that says
+   * the directory is missing: the caller was asking a question, and an exception is not an answer.
+   */
+  const collectivePath = () => {
+    const dir = resolveProfileDir(cfg);
+    return typeof dir === 'string' && dir !== '' ? path.join(dir, COLLECTIVE_FILE) : null;
+  };
+
   ctx.tools.register(defineTool({
     name: 'w2m_memory',
     description:
-      'Ask what this machine has already done: its individual memory, one line per finished task, ' +
-      'recording the command, exit code, duration, transport and the tail of stdout/stderr. Use it ' +
-      'before re-running work to find out whether it has been tried and what happened. The relay keeps ' +
-      'only hashes, so this local file is the only place a command\'s output survives. Reads only this ' +
-      'machine\'s memory; for another machine it reports where that memory lives rather than guessing.',
+      'Ask what the fleet already knows and what this machine has already done. scope="local" reads ' +
+      'this machine\'s individual memory: one line per finished task with the command, exit code, ' +
+      'duration, transport and the tails of stdout/stderr. scope="fleet" reads the curated collective ' +
+      'memory: measured facts with their dates, decisions with their reasoning, and open problems. The ' +
+      'relay keeps only hashes, so these files are the only place a command\'s output survives. Use it ' +
+      'before re-running work -- it is what turns a dozen rediscovery dispatches into one lookup.',
     parameters: {
+      scope: {
+        type: 'string',
+        enum: ['local', 'fleet'],
+        description:
+          'local (default) = what this machine did; fleet = what the fleet knows, from the curated ' +
+          'collective memory.',
+        default: 'local',
+      },
       machine: {
         type: 'string',
         description:
@@ -4714,6 +4747,13 @@ export async function apply(ctx, config = {}) {
           'memory question about anything older than the current file needs this.',
         default: false,
       },
+      record: {
+        type: 'string',
+        description:
+          'Record a conclusion against the most recent task: what its result meant. This is the only ' +
+          'field a machine is not allowed to write itself -- the machine stores the fact, a reader ' +
+          'asserts the meaning. Written as a new record so nothing already written is rewritten.',
+      },
     },
     output: jsonOutput,
     async execute(args, exec) {
@@ -4725,6 +4765,120 @@ export async function apply(ctx, config = {}) {
       const identity = await readLocalIdentity(cfg);
       const self = identity?.machine_name ?? null;
       const selfId = identity?.machine_id ?? null;
+
+      /**
+       * The collective layer, returned as the document it is.
+       *
+       * No parsing, on purpose. The file is written for a person -- facts with their evidence and the date
+       * they were measured, decisions with the reasoning that produced them -- and a parser over prose
+       * would silently drop whatever shape it did not expect. What it dropped would be exactly what a
+       * human judged worth writing down, so the honest answer is the text plus where it came from.
+       */
+      if (args?.scope === 'fleet') {
+        const file = collectivePath();
+        let text = null;
+        let error = null;
+        if (file === null) {
+          error = 'MEMORY_NO_COLLECTIVE';
+        } else {
+          try {
+            text = await fs.readFile(file, 'utf8');
+          } catch (readError) {
+            error = readError?.code === 'ENOENT' ? 'MEMORY_NO_COLLECTIVE' : `MEMORY_READ_FAILED: ${readError?.code}`;
+          }
+        }
+        const headings = text === null
+          ? []
+          : text.split('\n').filter((line) => /^#{1,3} /.test(line)).map((line) => line.replace(/^#+\s*/, '').trim());
+        return JSON.stringify(
+          {
+            ok: true,
+            scope: 'fleet',
+            path: file,
+            found: text !== null,
+            bytes: text === null ? null : Buffer.byteLength(text, 'utf8'),
+            // The section list is what makes a long document usable: a reader can see what the collective
+            // memory covers without paying for the whole of it first.
+            sections: headings,
+            body: text,
+            ...(error === null ? {} : { reason_code: error }),
+            notes: [
+              error === 'MEMORY_NO_COLLECTIVE'
+                ? (file === null
+                  ? 'no profile directory could be resolved, so the collective memory has no known location'
+                  : `no collective memory at ${file}; it is written by hand on the archive host, and its absence means nothing has been curated there yet`)
+                : null,
+              'this document is curated, not generated: every fact in it should carry the date it was measured and how',
+            ].filter((n) => n !== null),
+          },
+          null,
+          2,
+        );
+      }
+
+      /**
+       * Recording a conclusion.
+       *
+       * The one field a machine may not write for itself. `memoryRecord` always emits `conclusion: null`
+       * because a machine that invented one would be asserting an interpretation it cannot have; this is
+       * the path by which a reader -- a person, or the agent acting on their instruction -- supplies it.
+       *
+       * Appended as a new record rather than by rewriting the existing line. The log is append-only, and
+       * in-place editing would break the property that makes it trustworthy: what was written is what
+       * happened, and an amendment is a later statement about it. Rewriting would also lose the original
+       * text, which is the thing a reader most needs when a conclusion turns out to be wrong.
+       */
+      const conclusionText = typeof args?.record === 'string' && args.record.trim() !== '' ? args.record.trim() : null;
+      if (conclusionText !== null) {
+        const stateDirForRecord = cfg.stateDir ?? null;
+        if (stateDirForRecord === null) {
+          return JSON.stringify(
+            {
+              ok: false,
+              scope: 'local',
+              reason_code: 'MEMORY_NO_STATE_DIR',
+              detail: 'this plugin has no stateDir configured, so a conclusion has nowhere to be written',
+            },
+            null,
+            2,
+          );
+        }
+        const recent = readMemorySync(stateDirForRecord, { limit: 1 });
+        const subject = recent.records[0] ?? null;
+        const written = appendMemory(stateDirForRecord, {
+          at: new Date().toISOString(),
+          kind: 'conclusion',
+          task_id: subject?.task_id ?? null,
+          machine_id: selfId,
+          machine_name: self,
+          // The conclusion is about the record named by `task_id`; the fields below repeat enough of it
+          // that a reader does not have to join two lines to know what is being talked about.
+          about: subject === null
+            ? null
+            : { argv: subject.argv ?? null, exit_code: subject.exit_code ?? null, at: subject.at ?? null },
+          conclusion: conclusionText,
+          tags: [],
+        });
+        return JSON.stringify(
+          {
+            ok: written.ok === true,
+            scope: 'local',
+            recorded: written.ok === true,
+            task_id: subject?.task_id ?? null,
+            conclusion: conclusionText,
+            path: written.ok === true ? written.path : null,
+            ...(written.ok === true ? {} : { reason_code: written.error }),
+            notes: [
+              subject === null
+                ? 'no task has been recorded here yet, so this conclusion names no task; it is still kept, with about: null'
+                : `recorded against task ${subject.task_id}`,
+              'appended, never rewritten: the original record is left as it was written',
+            ],
+          },
+          null,
+          2,
+        );
+      }
 
       // A query about another machine is answered honestly rather than with an empty list, which would
       // read as "that machine has done nothing" -- the opposite conclusion from "this build cannot see".
