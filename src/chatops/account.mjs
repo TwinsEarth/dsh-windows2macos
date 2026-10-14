@@ -356,16 +356,27 @@ export function createAccountIdentity(options = {}) {
        * error.
        */
       const account = await identify();
-      let accountFields = { accountCode: null, fleetKey: null };
+      let accountFields = { accountCode: null, fleetKey: null, fleetKeyReason: null };
       if (account.ok) {
         try {
           // The KEY travels; the raw `userId` does not.
           accountFields = { accountCode: account.accountCode, fleetKey: encodeFleetKey(deriveAccountFleetKey(account.userId)) };
         } catch (error) {
-          // Reported rather than folded into "no fleet". Reaching here means `userId` passed
-          // `identify` and was still unusable, which is a contradiction worth seeing.
-          audit('account/fleet-key-failed', { detail: error instanceof Error ? error.message : String(error) });
-          accountFields = { accountCode: account.accountCode, fleetKey: null };
+          /**
+           * v0.8.10: **carry the reason out, do not just log it.**
+           *
+           * This catch used to set `fleetKey: null` and nothing else, which made a derivation
+           * failure *indistinguishable from being signed out* at the call site: both arrive as
+           * "ok: true (or false) with no key". The caller could not say which had happened, so the
+           * one branch that was actually failing had no voice -- the same silent-no-op class fixed
+           * in v0.8.5 and v0.8.9, in a third place.
+           *
+           * `audit` was already called here, but audit output is not somewhere an operator looks.
+           * The reason now travels with the result so whoever receives it can name it.
+           */
+          const detail = error instanceof Error ? error.message : String(error);
+          audit('account/fleet-key-failed', { detail });
+          accountFields = { accountCode: account.accountCode, fleetKey: null, fleetKeyReason: `fleet_key_derivation_failed: ${detail}` };
         }
       }
 
