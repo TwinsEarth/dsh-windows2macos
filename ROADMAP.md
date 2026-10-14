@@ -46,7 +46,7 @@ it into P1. So this is not a foundation poured in advance of a use — the use i
 Each row states its **deliverable** and its **falsifying test** — the observation that would show it is
 not working. A row without the second is a feature list, not a plan.
 
-### v4.7.0 — authority model  ← **next**
+### v4.7.0 — authority model  **shipped in 0.9.8**
 
 **Deliverable.** `src/agent/authority.mjs`: an integer `authority_level` on every actor, the four bands
 (0–49 ordinary, 50–69 captain, 70–89 org admin, 90+ system admin), a rule evaluator carrying
@@ -60,7 +60,7 @@ that produced it.
   the document does not grant it and inventing it would be the worst possible default;
 - a rule with no `matching_exempt_level` exempts nobody, rather than exempting everybody.
 
-### v4.8.0 — memory: field-level acceptance (MMP P1/P2)
+### v4.8.0 — memory: field-level acceptance (MMP P1/P2)  **shipped in 0.9.9, suite verified on MacMini**
 
 **Deliverable.** Extend the shipped memory layer: a CAT7 seven-field cognitive block, per-field
 acceptance driven by §2's authority model, and lineage — each accepted claim records the content hash of

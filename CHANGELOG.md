@@ -4,6 +4,71 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.9] — 2026-10-15
+
+**Cognitive memory blocks (roadmap v4.8.0): field-level acceptance and lineage — and the first release whose suite was run on the fleet machine rather than on the development host.**
+
+### `src/agent/blocks.mjs`
+
+The memory layer shipped in 0.9.6/0.9.7 accepts a peer's claim **whole or not at all**, which is a blunt
+instrument with two costs the roadmap records as P1 and P2. A block is now seven fixed fields so the
+decision can be made per field:
+
+| Field | May a receiver choose it? |
+|---|---|
+| `subject`, `body`, `evidence` | yes |
+| `confidence` | **no — refused whatever the chooser says** |
+| `origin`, `observed_at`, `lineage` | **no — inherited, and setting them would be forging provenance** |
+
+Lineage is by **content hash**, not by id, because an id is assigned by whoever creates the block and can
+be copied. A block whose parent cannot be produced is **refused rather than re-rooted**: re-rooting turns
+an unverifiable history into no history, which reads as a fresh, independent assertion, and that is how a
+fabricated claim acquires a respectable past.
+
+### Three defects the suite found in its own module
+
+- **`confidence` was only a default, not an invariant.** Supplying a custom `choose` *replaced* the
+  default rather than refining it, so the file's central conservative property — a receiver does not adopt
+  the sender's certainty about the sender's own assertion — was silently optional. "Silently optional" is
+  how a safety default stops being one, so the refusal is now a hard invariant that no chooser can open.
+- **A cycle fixture that asserted nothing.** The first cycle test mutated `lineage` after hashing and keyed
+  the map by the recomputed digest, leaving the references pointing at hashes the map did not hold — the
+  walker reported `missing` and never met the cycle it was supposed to test. `linkFixtures` now makes the
+  reference and the key the same string by construction.
+- **A test that measured the clock.** `makeBlock` stamps the current time when no `observed_at` is given
+  (correctly — that is what the field means), so two blocks built a millisecond apart differ. The failure
+  looked like a hashing defect and was a 1 ms difference in a field the test never mentioned.
+
+### Verified on MacMini, not only here
+
+This is the first release whose suite was executed on the fleet machine:
+
+```
+MacMini (MacMinideMac-mini.local)
+  HEAD     : 642242446d3eb0ed1928f128d088b727284a6d43
+  expected : 642242446d3eb0ed1928f128d088b727284a6d43   MATCH
+  suiteOk  : true
+```
+
+`test/blocks.test.mjs` — **28 tests, 0 failures**, adversarial by design: most cases assert a refusal
+rather than a happy path, because what makes a fleet memory worse than no memory is losing the ability to
+tell a fact from an echo. `eslint` 0 errors.
+
+### Notes on how this got here, because the tooling cost more than the module
+
+`run-relay.mjs` targets `root@<relay>` and runs **bash on the relay host**; `relay-run.mjs` runs a
+**JavaScript file on a fleet machine**. Both are called "relay" and only one of them is the fleet — a
+clone believed to be on MacMini was on the relay for a round. Also: `Set-Content -Encoding utf8` writes a
+**BOM**, and a shebang behind a BOM is not a shebang. And a 43 KB script cannot travel as an argv element
+under Windows' 32 KB command-line limit, which is why this work reaches MacMini as a **branch** it fetches
+rather than as an inline command.
+
+### Environment, measured
+
+MacMini has `git` 2.54.0, `curl`, `python3`, 70 GiB free, and **working** HTTPS to npm, the GitHub API,
+release assets and codeload — including `git ls-remote`, which an earlier session recorded as failing.
+It has no `npm`, `pnpm` or `brew`, so `node --test` directly is the suite runner.
+
 ## [0.9.8] — 2026-10-14
 
 **The numeric authority model — the layer four of the five roadmap layers depend on — plus a roadmap and a memory write that reports its own outcome.**
