@@ -1,4 +1,4 @@
-/**
+﻿/**
  * The Localside agent: everything between "Rabbit hands us an offer" and
  * "Rabbit has our envelope".
  *
@@ -48,7 +48,7 @@ import {
   resolveProjectCwd,
 } from './git.mjs';
 import { createSpool } from './spool.mjs';
-import { appendMemory, memoryRecord } from './memory.mjs';
+import { MEMORY_FILE, appendMemory, memoryRecord } from './memory.mjs';
 import { matchAllowedCommand, parseAllowedCommands } from './allowed-commands.mjs';
 import { CRYPTO_REASON, DEVICE_KEY_FILE, DeviceKey, PeerKeyStore } from './crypto.mjs';
 import { DEFAULT_P2P_MODE, P2P_DEFAULTS, P2PNode, normalizeP2PMode, normalizeP2PPort } from './p2p-node.mjs';
@@ -1094,7 +1094,7 @@ export function createAgent(options) {
   // Loaded here, at construction, rather than lazily at `start()`: the key file is also what a
   // *dispatcher* publishes in an offer, and "which key will this machine present" must not depend on
   // whether a particular code path happened to have run yet. `loadOrCreate` is the documented rule
-  // ("generated the first time a machine pairs"), and a failure is never fatal — see `deviceKeyError`.
+  // ("generated the first time a machine pairs"), and a failure is never fatal  - see `deviceKeyError`.
   const deviceKeyOutcome = loadDeviceKey(options.deviceKey ?? null, stateDir, identity.machine_id, identityPath);
   /** @type {object|null} This machine's static keypair, or null when there is none. */
   const deviceKey = deviceKeyOutcome.key;
@@ -1103,7 +1103,7 @@ export function createAgent(options) {
   /**
    * A key adopted from the pre-v0.6.2 location (`--state/device.key`). Reported once at startup,
    * because a machine whose key moved is a machine whose public key a peer may have learned under the
-   * old file — silence here would make "my peers stopped talking to me" have no visible cause.
+   * old file  - silence here would make "my peers stopped talking to me" have no visible cause.
    */
   const deviceKeyMigratedFrom = deviceKeyOutcome.migratedFrom ?? null;
   /**
@@ -1120,7 +1120,7 @@ export function createAgent(options) {
    * What each task's direct channel actually was, for the result envelope.
    *
    * Keyed by `task_id`, alongside the channel map rather than on the channel itself, because the
-   * envelope is built *after* `planDirectDelivery` may have released the channel — and
+   * envelope is built *after* `planDirectDelivery` may have released the channel  - and
    * `p2p.encrypted` has to describe the channel that carried this attempt, not whichever channel
    * happens to be live when the envelope is written.
    *
@@ -1166,7 +1166,7 @@ export function createAgent(options) {
   const p2pPeers = new Map();
 
   /**
-   * One reverse-dial attempt per `task_id` — the executor's own half of a two-way punch.
+   * One reverse-dial attempt per `task_id`  - the executor's own half of a two-way punch.
    *
    * A record exists for every offer this agent takes on, including the ones it decides *not* to
    * dial for, and that is deliberate: "we did not try, because a channel was already live" and "we
@@ -1444,8 +1444,8 @@ export function createAgent(options) {
    * happened rather than what was possible. `reason` is the named code from that same channel, so
    * `p2p.encrypted: false` always arrives with a *why*.
    *
-   * It is called from both places a channel becomes a task's channel — the offer that arrived on one
-   * and the dial that opened one — and the most recent call wins, which is right: a task's result
+   * It is called from both places a channel becomes a task's channel  - the offer that arrived on one
+   * and the dial that opened one  - and the most recent call wins, which is right: a task's result
    * travels over the channel that is live *now*.
    *
    * @param {string} taskId
@@ -1479,7 +1479,7 @@ export function createAgent(options) {
    *
    * Without this, a task executed entirely over the relay reports `encrypted: false` with no
    * explanation, and a reader cannot tell "this machine has no crypto" from "no direct channel was the
-   * answer for this task" — entirely different operational facts. The reason is the *same* string
+   * answer for this task"  - entirely different operational facts. The reason is the *same* string
    * `offerTransportOf` puts in `p2p.reason`, deliberately: one sentence, decided in one place.
    *
    * It never overwrites a channel's own record: once a channel carried something for this task, which
@@ -2118,7 +2118,7 @@ export function createAgent(options) {
    * Signing headers for one request, or nothing at all.
    *
    * The signed `path` is the **API-relative** path plus its query
-   * (`/v1/stream?machine_id=…&seq=5`), never the URL as sent.
+   * (`/v1/stream?machine_id= - seq=5`), never the URL as sent.
    *
    * That looks backwards -- surely the signature should cover the bytes on the
    * wire? -- so here is the case that settles it. With `rabbitUrl =
@@ -2283,7 +2283,7 @@ export function createAgent(options) {
    *   * a **pairing code** is the operator saying *"let this machine in"*, and it is the only way to
    *     place a device in a fleet the device could not compute for itself;
    *   * a **fleet key** is the account saying *"this machine is mine"*, and the relay derives the
-   *     fleet from it — so it can only ever reach a fleet its holder is already entitled to.
+   *     fleet from it  - so it can only ever reach a fleet its holder is already entitled to.
    *
    * Passing neither remains allowed: the relay answers `PAIRING_INVALID` and the caller reports it,
    * which is the pre-v0.8.1 behaviour for an unpaired machine.
@@ -2298,8 +2298,7 @@ export function createAgent(options) {
     /**
      * Send only the discriminator that was actually given.
      *
-     * `pairing_code: null` would be *present*, and a presence check reads a null as "provided" —
-     * the same trap that made `createILinkChannel` pass `{ fetch: undefined }` and throw on mount in
+     * `pairing_code: null` would be *present*, and a presence check reads a null as "provided"  -      * the same trap that made `createILinkChannel` pass `{ fetch: undefined }` and throw on mount in
      * v0.7.0. An absent code must be an absent key, not a null one.
      */
     if (typeof pairingCode === 'string' && pairingCode !== '') body.pairing_code = pairingCode;
@@ -2419,7 +2418,7 @@ export function createAgent(options) {
    *                   states, and a bound nobody measures is a claim: this is the number that says
    *                   whether the result path really stayed inside it.
    *   * `result_error` -- why the direct copy of *this result* did not land, when one was attempted
-   *                   and not acknowledged (`P2P_ACK_TIMEOUT: …`). Null otherwise; this is the
+   *                   and not acknowledged (`P2P_ACK_TIMEOUT:  - ). Null otherwise; this is the
    *                   `delivery.error` that `p2pDeliveryMark` has always carried and the envelope
    *                   never reported.
    *
@@ -2438,8 +2437,7 @@ export function createAgent(options) {
      *
      * Read from what the agent *recorded* when it held the channel, not from a live object: by the
      * time the envelope is built the channel may have been released, and `p2p.encrypted` has to
-     * describe the channel that carried this attempt. `null` means no channel was ever involved —
-     * a task executed entirely over the relay — which reports `encrypted: false` because that is the
+     * describe the channel that carried this attempt. `null` means no channel was ever involved  -      * a task executed entirely over the relay  - which reports `encrypted: false` because that is the
      * truth about this task's data plane, whatever this machine's keypair could have done.
      */
     const encryption = encryptionFor(offer?.task_id);
@@ -2653,17 +2651,25 @@ export function createAgent(options) {
      * The write happens **after** the envelope is complete, so the record it stores is the same one the
      * relay will judge -- not a second, independently assembled opinion about what happened.
      *
-     * `appendMemory` never throws and its result is deliberately not returned or checked: the task is
-     * the work and this is a note about it, so a full disk or an unwritable directory must not turn a
-     * successful command into a failed task. A memory that can fail work is worse than no memory, and
-     * the failure mode is silent here on purpose -- the envelope's own fields already say what happened.
+     * `appendMemory` never throws and its result never changes the verdict: the task is the work and
+     * this is a note about it, so a full disk or an unwritable directory must not turn a successful
+     * command into a failed task. A memory that can fail work is worse than no memory.
+     *
+     * v0.9.8: its *outcome* is nonetheless reported, as `memory` on the envelope. Leaving it entirely
+     * silent was the right call for the control flow and the wrong one for the reader -- a machine whose
+     * memory is not being written is indistinguishable from one that has nothing to remember, which is
+     * exactly the class of invisible failure this layer exists to end. One optional field, no verdict
+     * moved: it is not a comparable field, so two machines cannot disagree over it.
      */
-    appendMemory(stateDir, memoryRecord({
+    const memoryWrite = appendMemory(stateDir, memoryRecord({
       envelope,
       commandArgv,
       cwdRel,
       ms: (Date.parse(endedAt) - Date.parse(startedAt)) || 0,
     }));
+    envelope.memory = memoryWrite.ok === true
+      ? { written: true, file: MEMORY_FILE, rotated: memoryWrite.rotated === true }
+      : { written: false, reason_code: memoryWrite.error };
 
     return buildEnvelope(envelope);
   }
@@ -3220,7 +3226,7 @@ export function createAgent(options) {
     }
 
     if (channelFor(offer?.task_id) === null) {
-      // No channel at all, so nothing about this task's data plane was ever sealed — and the reason
+      // No channel at all, so nothing about this task's data plane was ever sealed  - and the reason
       // recorded here is the one `offerTransportOf` already decided for `p2p.reason`.
       rememberNoChannel(offer?.task_id, offerTransportOf(offer, p2pStatusSnapshot()).reason);
       return p2pDeliveryMark();
@@ -3282,7 +3288,7 @@ export function createAgent(options) {
 
     const startedAt = process.hrtime.bigint();
     // `machine_id` travels with the notice because the dispatcher has to be able to say *which*
-    // machine finished without waiting for the relay's copy — the plugin names its direct-result
+    // machine finished without waiting for the relay's copy  - the plugin names its direct-result
     // inbox file after it. The frame still carries no envelope: `result_path` is decided by the
     // acknowledgement this frame is waiting for, and `envelope_sha256` covers `result_path`, so
     // sending the envelope first and stamping it afterwards would break the hash it is signed with.
@@ -3415,7 +3421,7 @@ export function createAgent(options) {
         code = null;
       }
       const error = new Error(`stream HTTP ${response.status} ${body.slice(0, 200)}`.trim());
-      // Preserve the relay's own code (SIGNATURE_REQUIRED, SIGNATURE_EXPIRED, …)
+      // Preserve the relay's own code (SIGNATURE_REQUIRED, SIGNATURE_EXPIRED,  - 
       // so a signed link can be diagnosed without guessing.
       error.code = code ?? `HTTP_${response.status}`;
       state.lastRelayError = {
@@ -3568,7 +3574,7 @@ export function createAgent(options) {
         // peer tried to put on the wire is overwritten, so a relay frame can never claim the
         // direct path -- the only thing that sets `'p2p'` here is the channel having delivered it.
         const offer = { ...payload, p2p_transport: source.transport };
-        // v0.6.0: the block's `static_keys` is the *entire* key-distribution mechanism — a machine
+        // v0.6.0: the block's `static_keys` is the *entire* key-distribution mechanism  - a machine
         // learns the keys of exactly the peers it was asked to talk to, from the offer that asked it,
         // and never from a config file. Learned here, before the offer is queued, because the reverse
         // dial starts inside `handleOffer` and a key merged any later would miss the handshake this
@@ -4127,8 +4133,8 @@ export function createAgent(options) {
 /**
  * Load this machine's static keypair, or explain why there is none (v0.6.0).
  *
- * Never throws. A machine whose key file is unreadable is still a working W2M machine — every task
- * still travels over the relay — and `agent.state.p2p.encryption.error` names the file that could not
+ * Never throws. A machine whose key file is unreadable is still a working W2M machine  - every task
+ * still travels over the relay  - and `agent.state.p2p.encryption.error` names the file that could not
  * be read so an operator can fix it. Refusing to start an agent because a *security upgrade* could not
  * complete is exactly the fleet-losing failure `docs/P2P-CRYPTO.md` §4 forbids.
  *
@@ -4138,15 +4144,15 @@ export function createAgent(options) {
  * used to break it: it loaded from the `--state` directory, justified by a comment claiming that
  * `identity.mjs` puts `device.json` there "when the agent is run with `--state`". That claim is false.
  * `device.json` is fixed at `<DSH_HOME>/xclient/device.json` by the identity contract and `--state`
- * does not move it — which is why an agent run as `--state ~/.dsh/xclient/localside-mac` had its
+ * does not move it  - which is why an agent run as `--state ~/.dsh/xclient/localside-mac` had its
  * identity one directory *above* its key.
  *
  * The measured consequence, on one machine running both halves of W2M: the plugin (which loads the key
  * correctly, from `dirname(device.json)`) and the agent each generated a *different* pair, and both
- * announced to the one `/v1/peer/{machine_id}` slot — the relay's record alternated between the two
+ * announced to the one `/v1/peer/{machine_id}` slot  - the relay's record alternated between the two
  * nodes' ports every few seconds, and the `static_key` a dispatcher read was one node's or the other's.
  * A dispatcher that learns the wrong key cannot arm a handshake, so every direct channel came back
- * `P2P_CRYPTO_PLAINTEXT_PEER` — reported as "the peer is an older build" when both ends were the same
+ * `P2P_CRYPTO_PLAINTEXT_PEER`  - reported as "the peer is an older build" when both ends were the same
  * build on the same host.
  *
  * MIGRATION. `DeviceKey.load` warns that "silently generating a replacement key would make every peer
@@ -4168,7 +4174,7 @@ function loadDeviceKey(injected, stateDir, machineId, deviceFile = undefined) {
     return { key: injected, error: null, migratedFrom: null };
   }
 
-  // Beside `device.json` — the documented rule. `identityPath` is the path the caller actually
+  // Beside `device.json`  - the documented rule. `identityPath` is the path the caller actually
   // loaded, never a fresh global resolution: resolving `DSH_HOME` here would make a test (or any
   // caller with an injected identity) read and *create* a key in the real user's home.
   let canonicalDir = null;
@@ -4179,7 +4185,7 @@ function loadDeviceKey(injected, stateDir, machineId, deviceFile = undefined) {
   /**
    * Candidates in order. `mayCreate` is the whole subtlety: only a location that is *the* documented
    * home may mint a key. A legacy directory is consulted to adopt a key that is already there, never
-   * to create one — `DeviceKey.load` warns that generating a replacement "would make every peer that
+   * to create one  - `DeviceKey.load` warns that generating a replacement "would make every peer that
    * knows the old one refuse this machine", so an upgrade must not silently change this machine's
    * public key.
    *

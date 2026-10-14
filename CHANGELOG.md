@@ -4,6 +4,76 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.8] — 2026-10-14
+
+**The numeric authority model — the layer four of the five roadmap layers depend on — plus a roadmap and a memory write that reports its own outcome.**
+
+### `ROADMAP.md`
+
+The operator's architecture document specifies five layers across v4.7.0–v4.13.0. It lives in the
+repository now, and it states the delta honestly before it states the plan: this repository has **one
+relay and five machines**, against a target of 1,000+ agents. Every release row carries both a
+deliverable and **the observation that would falsify it**, because a row without the second is a feature
+list rather than a plan.
+
+It also refuses three things on the record: it does not adopt a named protocol (InterMesh, A2A, NLIP,
+AIX, MMP) before a line of its wire format exists; it does not build BFT consensus among five machines on
+one relay, where it would add latency and failure modes without adding trust; and it does not specify
+1,000-agent behaviour, because the source document's own §6.4 reports 30–50 agents as the practical limit
+and superlinear "coordination collapse" beyond 100 — **a design not measured at 50 cannot honestly
+specify 1,000.**
+
+### `src/agent/authority.mjs` — v4.7.0
+
+An integer `authority_level` on every actor, the four bands (0–49 ordinary, 50–69 captain, 70–89 org
+admin, 90+ system admin), `matching_exempt_level` as the Unix-root-style exemption, and a decision
+function returning `allow | needs_approval | deny` **with the rule that produced it**.
+
+Why an integer rather than role names: authority appears in four of the five layers — permissions, the
+approval flow, committee voting weights, and the defence hierarchy where a Coordinator outranks an
+Analyst. An enumerated set of names would be re-partitioned by each layer, and every re-partition is a
+place for two of them to disagree.
+
+Three decisions are load-bearing and each is pinned by a test:
+
+- **A rule with no `matching_exempt_level` exempts nobody.** The tempting default is "absent means
+  unconstrained", and it is wrong in the one direction that matters: a rule author who forgets the field
+  would silently create an unrestricted action.
+- **An exemption bypasses membership, not the level floor.** The Unix analogy is exact — root bypasses a
+  file's permission bits, not the requirement that the file exists. A rule that says both is
+  self-contradictory, and the strict half wins.
+- **A derived actor never exceeds its parent.** No rule in the source design grants delegation, and the
+  default an implementation reaches for — "a captain's delegate is a captain" — turns one compromised
+  actor into an escalation path. Where the source is silent, the narrow reading is the safe one.
+
+### `evaluateAll` — a design corrected by its own test
+
+The first draft evaluated every rule and returned the strictest verdict. A test asserting that the rules
+after a gate are not evaluated failed, and the failure was right. `decisive` must be **unique**, or a
+list can hold several non-allow decisions and whichever the caller picks, the *stated* reason for a
+refusal stops being the reason. And a gate is a gate whether it says `deny` or `needs_approval`: in both
+cases the caller's next action is determined and the remaining rules are decoration. It now stops at the
+first non-allow.
+
+### `envelope.memory` — a silent write that now reports
+
+`appendMemory`'s result was deliberately unchecked, so a memory write could not fail a task. That remains
+true — but leaving it entirely *silent* was the right call for the control flow and the wrong one for the
+reader: **a machine whose memory is not being written is indistinguishable from one that has nothing to
+remember**, which is precisely the class of invisible failure this layer exists to end. The envelope now
+carries `memory: {written, file, rotated}` or `{written: false, reason_code}`. It is not a comparable
+field, so no verdict moves and two machines cannot disagree over it.
+
+### Verified
+
+- `test/authority.test.mjs` — **27 tests, 0 failures.** Every one is about a boundary, because the only
+  interesting thing an authority model can get wrong is being off by one: a level too permissive is an
+  escalation and one too strict is an outage, so the band edges and the exemption boundary are asserted
+  **from both sides** rather than by a middle value that would pass either way.
+- Band partition is proven total and non-overlapping across 0..100 by walking every level, so a seam that
+  belongs to two bands — a bug that only appears once someone is assigned that level — cannot exist.
+- `eslint .` — 0 errors on the new module and test.
+
 ## [0.9.7] — 2026-10-14
 
 **`w2m_memory` gains the collective layer and the one write a machine may not make for itself.**
