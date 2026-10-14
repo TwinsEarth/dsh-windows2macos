@@ -59,11 +59,36 @@ export const DEFAULT_HISTORY_LIMIT = 50;
 export const DEFAULT_INTERVAL_DAYS = 1;
 
 /**
+ * A value shaped like a build-time placeholder rather than a version.
+ *
+ * `__W2M_PLUGIN_VERSION__` is substituted by `scripts/pack.mjs`, but `pnpm publish` packs the source
+ * tree directly and never runs that script -- so every npm release has shipped the literal
+ * placeholder, in 0.8.8, 0.8.9 and 0.8.10.
+ *
+ * Recognised by **shape**, not by the one string: matching a single literal would leave the next
+ * placeholder name free to reintroduce the same defect. Anything that is not made of version-ish
+ * characters is not a version.
+ */
+const VERSION_SHAPE = /^[0-9A-Za-z.\-+]+$/;
+
+/**
  * Read the running plugin's version.
  *
  * Uses the compiled-in constant, overridable by `W2M_PLUGIN_VERSION` so tests
  * and packagers can pin it. Returns `null` when unknown -- callers must treat
  * that as "cannot decide", never as "old".
+ *
+ * ## Why a placeholder is "unknown" and not a version
+ *
+ * The contract above was documented and not implemented: the guard rejected only the empty string,
+ * so `__W2M_PLUGIN_VERSION__` passed through as a valid version. The consequence is not cosmetic --
+ * the auto-updater's whole job is comparing the installed version against releases, so an
+ * npm-installed machine ran an updater whose input was not a version, and `w2m_update` reported
+ * `current_version: "__W2M_PLUGIN_VERSION__"`.
+ *
+ * Treating it as unknown is the **documented** behaviour and it fails safe: the updater declines to
+ * decide instead of comparing nonsense. Fixing it here rather than only in the pack step covers
+ * every channel, including ones not yet thought of.
  *
  * @param {string} bundledVersion - Version from the caller's own package.json.
  * @param {NodeJS.ProcessEnv} [env]
@@ -71,8 +96,12 @@ export const DEFAULT_INTERVAL_DAYS = 1;
  */
 export function resolveCurrentVersion(bundledVersion, env = process.env) {
   const fromEnv = typeof env?.[PKG_VERSION_ENV] === 'string' ? env[PKG_VERSION_ENV].trim() : '';
-  if (fromEnv !== '') return fromEnv;
-  return typeof bundledVersion === 'string' && bundledVersion.trim() !== '' ? bundledVersion.trim() : null;
+  if (fromEnv !== '') return VERSION_SHAPE.test(fromEnv) ? fromEnv : null;
+  if (typeof bundledVersion !== 'string') return null;
+  const trimmed = bundledVersion.trim();
+  if (trimmed === '') return null;
+  // A placeholder is not a version. Underscores are the tell, and they never appear in a semver.
+  return VERSION_SHAPE.test(trimmed) ? trimmed : null;
 }
 
 /**
