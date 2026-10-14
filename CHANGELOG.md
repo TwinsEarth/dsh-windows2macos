@@ -4,6 +4,128 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.11] — 2026-10-14
+
+**The in-process join threw before it could pair — and a missing fingerprint took the fleet key with it.**
+
+### The defect that mattered
+
+`startLocalStack` built `identityOptions`, loaded the identity, and then passed
+`identityOptions.identity` to `createAgent` — but nothing ever assigned that property.
+`loadOrCreateIdentity()` returns `{ identity, path, created }` and does not mutate the options it was
+given, so `createAgent` received `undefined` and rejected it by contract:
+
+```
+createAgent: identity.machine_id is required
+```
+
+**The in-process join therefore threw on every start**, after `loadOrCreateIdentity` had already
+created `device.json` and before anything could pair.
+
+That single line accounts for the whole reported symptom, and every earlier explanation was reading
+the wreckage:
+
+| observed | why |
+|---|---|
+| `device.json` exists, `device_token: null` | the file is created one line above the throw |
+| its mtime never moves across restarts | execution never reaches the pairing path |
+| `w2m_devices` answers `401` | no token was ever obtained |
+| `P2P_ANNOUNCE_FAILED: HTTP 401` | same token, same absence |
+
+The evidence that finally settled it was the mtime, exactly as v0.8.9's own note said it would be —
+but read the other way round: not "the write is missing" but "**nothing after the throw runs at all**".
+
+### The second gate: a missing fingerprint discarded a derived key
+
+`resolve()` mints a serial number from a hardware fingerprint and the fleet key from the account's
+`userId`. The key does not depend on the fingerprint — but it was only returned *after* the
+fingerprint succeeded:
+
+```js
+const hardware = await fingerprint();
+if (!hardware.ok) return hardware;          // accountFields -- and the fleet key -- thrown away
+const sn = buildSn({ accountCode: account.accountCode, ... });
+return { ok: true, sn, ...accountFields, ... };
+```
+
+On the machine this was reported from, `readHardwareValues({ platform: 'win32' })` returns **zero**
+usable values — both `MachineGuid` (via `reg query`) and the SMBIOS UUID (via PowerShell) come back
+empty — so `fingerprint()` always failed and the fleet key was always discarded after being computed.
+
+No amount of retrying could fix that, which is why v0.8.9's backoff did not help: the account *was*
+readable, and the key *was* derived. The failure is now reported as what it is (`no_hardware_source`,
+no SN), while `accountFields` still travels, so a caller that only needs to join a fleet is not held
+hostage by a display identifier.
+
+### The join is no longer a one-shot prologue
+
+Two changes to the shape, both consequences of the above:
+
+- **The mount path is fast.** It spends two derivation attempts (~2 s), not six (~62 s):
+  `agent.start()` waits behind it, and any tool that asked to join waited behind that. The patient
+  retrying moved into a background loop beside the running agent, where nothing is blocked by it.
+- **A tool call can finish the join.** A tool call is proof the account profile exists — the session
+  cannot answer a model request without it — so `w2m_status`, `w2m_devices` and `w2m_run` ask the
+  in-process agent to join if it has not already.
+
+The rate limit is respected by a **cooldown, not by permanence**: a successful join is memoised for
+the life of the process, while a *failed* one is retried after ten seconds. Memoising the failure
+would have reproduced the defect being fixed — a machine holding a rejected promise for ever, which
+is the "intermittent miss becomes permanent" trap v0.8.7 fell into.
+
+### Reporting
+
+A machine that cannot join says so once, at warn, naming the reason — and says it again only if the
+state changes. The previous wording guessed *"the profile may not be loaded yet"* for every
+`ok: true` case, which after sixty seconds of backoff was usually the wrong explanation.
+
+### Verified
+
+`node scripts/verify-join.mjs` — **16 checks, all passing.** It drives the join against a stub agent
+(the real `start()` talks to the public relay for the life of the process, which is why nothing
+exercised this path before) and asserts:
+
+- the agent is constructed with a real `identity.machine_id` — the assertion that catches the defect
+  above, since `undefined` is what was being passed;
+- nothing is paired while the account cannot be read, and no pairing is attempted without a key;
+- the machine joins once the account answers, **and the token reaches `device.json`**;
+- the pairing presents a 43-character derived fleet key and names the identity on disk;
+- a machine holding a token never re-pairs, however many tools ask (`pair_rate_limit: 5`);
+- a fingerprint failure still yields the fleet key, with `no_hardware_source` reported and no SN
+  invented.
+
+Two of those checks found real problems while being written, which is the point of having them. The
+first draft of the cooldown rate-limited the *keyless* case as well, so the mount attempt failed on a
+cold account and the very next tool call silently did nothing — the reported symptom, reproduced by
+its own fix. And the mount budget, which had been ~62 s since v0.8.9 with `agent.start()` and every
+tool call waiting behind it, is now ~2 s.
+
+The script reads and writes a throwaway identity (`DSH_DEVICE_FILE`), so it never touches the real
+`~/.dsh/xclient/device.json`.
+
+Measured on the Windows host this was reported from:
+
+```
+late-account join
+  ok    the agent is constructed
+  ok    the agent receives a real identity (createAgent requires identity.machine_id)
+  ok    nothing is paired while the account cannot be read
+  ok    no pairing is attempted without a fleet key
+  ok    the machine says it is in no fleet rather than staying silent
+  ok    w2m_status is registered
+  ok    the machine joins once the account answers
+  ok    the token is persisted, not just held in memory
+  ok    the pairing presents a derived fleet key
+  ok    the pairing names the identity on disk
+  ok    a machine holding a token never re-pairs
+fleet key without a hardware fingerprint
+  ok    no fingerprint means no serial number, and that is reported
+  ok    no serial number is invented
+  ok    the fleet key survives the fingerprint failure
+  ok    the account code travels with it
+all checks passed
+```
+
 ## [0.8.9] — 2026-10-14
 
 **The account answers lazily, and we asked once.**

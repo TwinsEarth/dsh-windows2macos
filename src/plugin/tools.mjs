@@ -2187,6 +2187,76 @@ function toRequestUrl(url) {
 let inProcessAgentStatus = null;
 
 /**
+ * A way back into the fleet-join sequence, when the plugin started the agent itself.
+ *
+ * Set by {@link startLocalStack} and cleared by its disposer. Null in the normal case, where the
+ * agent runs as its own process and this process has nothing to pair.
+ *
+ * ## Why the tools need this (v0.8.12)
+ *
+ * The join used to be a one-shot prologue of `startLocalStack`: derive, pair, persist, and never
+ * look again. On this host the account profile is a *lazy cache* -- `getPlatformSession().userId` is
+ * null until a successful `getProfile` has happened -- and the mount path runs before anything has
+ * asked for the profile. So the one window closed empty and the machine stayed in no fleet for the
+ * life of the process, even though the account answered correctly minutes later.
+ *
+ * A tool call is the natural place to notice, because a tool call is **after** the profile exists:
+ * the session cannot answer a model request without it. So the unpaired tools call this, and a
+ * machine that is used at all becomes a machine that joins.
+ *
+ * @type {(() => Promise<{paired: boolean, by: string|null}>)|null}
+ */
+let ensureFleetJoin = null;
+
+/**
+ * The agent factory `startLocalStack` uses -- the real `createAgent`, unless a test replaces it.
+ *
+ * ## Why this seam exists
+ *
+ * The join sequence is two steps: **pair** (derive the fleet key, `POST /v1/pair`, persist the
+ * token) and **run** (`await agent.start()`, which opens an SSE stream and binds a UDP socket and
+ * talks to a real relay for as long as the process lives). Only the first step is what a unit test
+ * of "does a late account still join" can meaningfully assert.
+ *
+ * Without a seam the test has to start the real agent, which means reaching the public relay: slow,
+ * non-hermetic, and it never returns. A test that can only be written by talking to production is a
+ * test that will not be written -- and this series has already lost two rounds to a join path that
+ * nothing exercised.
+ *
+ * @type {(options: object) => Promise<object>}
+ */
+let createAgentImpl = null;
+
+/**
+ * Replace the agent factory. Test-only: `resetDefineToolCacheForTests`' sibling.
+ *
+ * @param {((options: object) => Promise<object>)|null} impl
+ */
+export function setCreateAgentForTests(impl) {
+  createAgentImpl = impl;
+}
+
+/**
+ * Ask the in-process agent to finish joining, if it has not already.
+ *
+ * Deliberately total: every failure is reported as a value. A tool that refused to run because the
+ * fleet join had not completed would turn "not paired yet" into "this tool is broken", and the whole
+ * point of `w2m_status` is to describe a half-configured machine rather than fail on one.
+ *
+ * @returns {Promise<{paired: boolean, by: string|null}|null>} Null when this process owns no agent.
+ */
+async function requestFleetJoin() {
+  if (ensureFleetJoin === null) return null;
+  try {
+    return await ensureFleetJoin();
+  } catch (error) {
+    // Named to the caller's log context is not available here, so it travels as a value; the
+    // retry loop inside `startLocalStack` owns the durable reporting.
+    return { paired: false, by: null, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/**
  * File names an agent may publish its state under, most specific first.
  *
  * The `localside/` entry is not decoration: `stateDir` here is documented as the
@@ -3167,6 +3237,15 @@ export async function apply(ctx, config = {}) {
     output: jsonOutput,
     async execute(args, exec) {
       throwIfAborted(exec?.signal);
+      /**
+       * v0.8.12: a tool call is proof the account profile exists.
+       *
+       * The session cannot answer a model request without it, so by the time any tool runs, the lazy
+       * cache the fleet key is derived from is warm. Asking here is what turns "joined at mount, when
+       * the profile was still cold" into "joined as soon as joining was possible". Memoised, so it
+       * cannot become a second pairing on a relay that allows five a minute.
+       */
+      await requestFleetJoin();
       const base = requireRabbit(cfg);
       const token = await resolveToken(cfg);
 
@@ -3352,6 +3431,8 @@ export async function apply(ctx, config = {}) {
     output: jsonOutput,
     async execute(args, exec) {
       throwIfAborted(exec?.signal);
+      // v0.8.12: dispatching is the clearest moment to finish joining -- see `requestFleetJoin`.
+      await requestFleetJoin();
       const base = requireRabbit(cfg);
 
       // `required` is enforced by DSH's schema layer in production, and by the shim offline; this
@@ -4050,6 +4131,9 @@ export async function apply(ctx, config = {}) {
     output: jsonOutput,
     async execute(_args, exec) {
       throwIfAborted(exec?.signal);
+      // v0.8.12: the tool an operator reaches for when the machine is in no fleet is the right place
+      // to try joining again -- see `requestFleetJoin`. Memoised, and a no-op once paired.
+      await requestFleetJoin();
       // Read, not required: this tool exists to describe a half-configured machine, so an absent or
       // unpaired device.json is part of the answer rather than a reason to refuse. `/healthz` needs
       // no bearer token, so nothing here depends on the token being present.
@@ -4658,6 +4742,7 @@ async function startLocalStack(ctx, cfg) {
         : resolveStateDir(null, 'localside');
     if (cfg.stateDir !== resolvedStateDir) {
       ctx.logger?.info?.(`w2m: stateDir was unset; using ${resolvedStateDir}`);
+    }
 
     const target = cfg.rabbitUrl ? new URL(cfg.rabbitUrl) : null;
     const isLocalRelay =
@@ -4678,8 +4763,6 @@ async function startLocalStack(ctx, cfg) {
       ctx.logger?.info?.(`w2m: joining the relay at ${cfg.rabbitUrl}`);
     }
 
-    }
-
     /**
      * v0.8.6: the identity, and the options needed to WRITE IT BACK.
      *
@@ -4695,6 +4778,26 @@ async function startLocalStack(ctx, cfg) {
      */
     const identityOptions = { name: cfg.machineName, rabbitUrl: cfg.rabbitUrl ?? undefined };
     const loaded = loadOrCreateIdentity(identityOptions);
+    /**
+     * v0.8.12: **carry the loaded identity back onto the options.**
+     *
+     * `loadOrCreateIdentity()` returns `{ identity, path, created }` and does not mutate the options
+     * it was given, but the `createAgent` call below reads `identityOptions.identity` -- so it was
+     * passing `undefined`. `createAgent` rejects that by contract
+     * (`agent.mjs`: `if (!identity?.machine_id) throw new TypeError(...)`), which means **the
+     * in-process join path threw on every single start**: after `loadOrCreateIdentity` had already
+     * created `device.json`, and before anything could possibly pair.
+     *
+     * That single line accounts for the whole observed symptom, and every earlier explanation was
+     * reading the wreckage: `device.json` exists with `device_token: null` because the file is
+     * created one line above the throw; nothing ever pairs because there is no agent to pair with;
+     * and every authenticated call answers 401 because no token was ever obtained. The mtime that
+     * never moved was not a missing write on the pairing path -- execution never reached it.
+     *
+     * The identity is carried on this object rather than passed alongside because the v0.8.6 rule is
+     * that the *same* options must be used to write the token back.
+     */
+    identityOptions.identity = loaded.identity;
 
     /**
      * v0.8.8: report what this machine IS, not just that it exists.
@@ -4715,7 +4818,9 @@ async function startLocalStack(ctx, cfg) {
       ctx.logger?.info?.(`w2m: capability probe notes: ${capDetail.notes.join('; ')}`);
     }
 
-    const agent = await createAgent({
+    // The seam exists so a test can assert the *join* half without starting a real agent; in
+    // production `createAgentImpl` is null and this is exactly `createAgent` (see its declaration).
+    const agent = await (createAgentImpl ?? createAgent)({
       rabbitUrl: relay?.url ?? cfg.rabbitUrl,
       // `project`, not `projectDir`: the option `createAgent` documents, and the one it requires.
       project: cfg.projectDir,
@@ -4755,39 +4860,84 @@ async function startLocalStack(ctx, cfg) {
      * nor falsy, so that shape produced no log line anywhere. A silent branch in the exact place
      * that was failing is how this took several rounds to find.
      */
-    let fleetKey = cfg.fleetKey ?? null;
-    let fleetKeySource = fleetKey === null ? null : 'config';
-    if (fleetKey === null) {
-      const ATTEMPTS = 6;
+    /**
+     * The configured key, if any. Kept separate from the derived one because the two have different
+     * lifetimes: a configured key is an operator decision that never changes, while a derived key is
+     * something we keep trying to obtain.
+     */
+    const fleetKeyFromConfig = cfg.fleetKey ?? null;
+
+    /**
+     * How many derivation tries the **mount path** may spend.
+     *
+     * Two, not the six of v0.8.9: `agent.start()` waits behind this, and a tool that asks to join
+     * waits behind it too. The patient retrying belongs in the background loop, where nothing is
+     * blocked by it -- see {@link deriveFleetKeyOnce}.
+     */
+    const FAST_DERIVE_ATTEMPTS = 2;
+
+    /**
+     * One derivation attempt, with a bounded in-line retry.
+     *
+     * ## v0.8.12: fast at mount, patient in the background
+     *
+     * v0.8.9 gave the derivation six attempts and a 2 s -> 30 s backoff, which is right for a profile
+     * that is a few seconds behind. It is **not** right for this host, and not only because the budget
+     * expired: measured on DSH, the profile was still cold when those ~62 s ran out, so every attempt
+     * answered `signed-out` on a machine that was demonstrably signed in (its model calls run through
+     * the account). The window was spent before the thing it waited for had happened.
+     *
+     * It was also spent **in the mount path**, which `agent.start()` waits behind -- so the machine
+     * had no agent for the first minute of its life, and any tool that tried to join would have waited
+     * that long too.
+     *
+     * So the patience moves out of the critical path and into the retry loop beside the running
+     * agent: `attempts` is small here (2 fast tries, ~2 s) and generous there (where nobody is
+     * waiting). A tool call is never blocked by more than a couple of seconds, and a machine that
+     * outlives the mount window still joins.
+     *
+     * @param {number} attempts How many tries to make before giving up and letting the caller retry.
+     * @returns {Promise<{fleetKey: string|null, fleetKeySource: string|null, last: object|null}>}
+     */
+    async function deriveFleetKeyOnce(attempts = FAST_DERIVE_ATTEMPTS) {
+      const configured = fleetKeyFromConfig;
+      if (configured !== null) return { fleetKey: configured, fleetKeySource: 'config', last: null };
+
       let last = null;
-      for (let attempt = 1; attempt <= ATTEMPTS; attempt += 1) {
+      for (let attempt = 1; attempt <= attempts; attempt += 1) {
         try {
           const { createAccountIdentity } = await import('../chatops/account.mjs');
           last = await createAccountIdentity({ ctx, platform: process.platform }).resolve();
         } catch (error) {
           last = { ok: false, reason: 'threw', detail: error instanceof Error ? error.message : String(error) };
         }
-        const key = last && last.ok === true ? last.fleetKey : null;
-        if (typeof key === 'string' && key !== '') {
-          fleetKey = key;
-          fleetKeySource = 'account';
-          ctx.logger?.info?.(`w2m: fleet key derived from the signed-in account on attempt ${attempt} (fleet ${last.accountCode})`);
-          break;
+        /**
+         * The key is the question, not `ok`.
+         *
+         * `ok: false` with a key present is a real shape: a machine whose hardware fingerprint is
+         * unreadable has no SN (so `resolve()` reports `no_hardware_source`), yet it still belongs to
+         * its account's fleet and can still join it. Gating on `ok` here is what would have thrown
+         * that key away a second time.
+         */
+        const derived = last && typeof last.fleetKey === 'string' && last.fleetKey !== '' ? last.fleetKey : null;
+        if (derived !== null) {
+          ctx.logger?.info?.(
+            `w2m: fleet key derived from the signed-in account on attempt ${attempt} (fleet ${last.accountCode})`
+            + (last.ok === true ? '' : `; no serial number: ${last.reason ?? 'unknown reason'}`),
+          );
+          return { fleetKey: derived, fleetKeySource: 'account', last };
         }
-        if (attempt < ATTEMPTS) {
+        if (attempt < attempts) {
           const waitMs = Math.min(2000 * 2 ** (attempt - 1), 30000);
           ctx.logger?.info?.(`w2m: no fleet key yet (${describeIdentityFailure(last)}); retrying in ${waitMs}ms`);
           await new Promise((resolve) => setTimeout(resolve, waitMs));
         }
       }
-      if (fleetKey === null) {
-        // Loud, and it names which failure it was: a machine in no fleet must never be quiet.
-        ctx.logger?.warn?.(
-          `w2m: could not derive a fleet key after ${ATTEMPTS} attempts (${describeIdentityFailure(last)}) -- `
-          + 'this machine is in NO fleet and will receive no work', 
-        );
-      }
+      // Not fatal: the caller may pair by code, and a later attempt may still succeed.
+      return { fleetKey: null, fleetKeySource: null, last };
     }
+
+    let { fleetKey, fleetKeySource } = await deriveFleetKeyOnce();
 
     /**
      * Name what actually went wrong, including the shapes that used to say nothing.
@@ -4836,49 +4986,209 @@ async function startLocalStack(ctx, cfg) {
     const existingToken = loaded.identity.device_token;
     const alreadyPaired = typeof existingToken === 'string' && existingToken !== '';
 
-    const pairBy = fleetKey !== null ? `fleet key (${fleetKeySource})` : cfg.pairingCode ? 'pairing code' : null;
-    if (alreadyPaired) {
-      ctx.logger?.info?.(`w2m: already paired (token in ${loaded.path}); not pairing again`);
-    } else if (pairBy !== null) {
+    /**
+     * Pair with the key that is in hand, and **persist the token**.
+     *
+     * Split out of the mount path so a later attempt can run the same code. The v0.8.6 note still
+     * applies verbatim: `agent.pair` sets `device_token` on its in-memory object only, and without
+     * the write below the observable behaviour is a machine the relay has registered, that then
+     * answers `401` to every authenticated call because `device.json` still says `null`.
+     *
+     * @param {string|null} key - Derived or configured fleet key, when one is available.
+     * @returns {Promise<{paired: boolean, by: string|null}>}
+     */
+    async function pairNow(key) {
+      const by = key !== null ? `fleet key (${key === fleetKeyFromConfig ? 'config' : 'account'})`
+        : cfg.pairingCode ? 'pairing code' : null;
+      if (by === null) return { paired: false, by: null };
       try {
-        const paired = await agent.pair(cfg.pairingCode ?? null, undefined, fleetKey);
-        /**
-         * v0.8.6: **persist the token.** Without this the pairing is thrown away.
-         *
-         * `agent.pair` sets `identity.device_token` on its in-memory object only. Nothing in this
-         * path wrote it back, so the observable behaviour was: the relay registers the device, the
-         * machine appears in `w2m_devices`, and then every authenticated call answers
-         * `401 UNAUTHORIZED` -- `w2m_devices`, the P2P announce, all of it -- because `device.json`
-         * still said `device_token: null`. It reads as a permission failure and is a missing write.
-         *
-         * The CLI has always done this; the in-process path was written without it.
-         * `saveDeviceToken` throws on an empty token rather than storing one, which is the right
-         * shape: a silent null here is exactly the state this line removes.
-         */
+        const paired = await agent.pair(cfg.pairingCode ?? null, undefined, key);
         try {
           saveDeviceToken(paired?.device_token, identityOptions);
           ctx.logger?.info?.(`w2m: device token persisted to ${loaded.path}`);
         } catch (error) {
           // Named rather than silent: a machine that paired but cannot authenticate is the exact
-          // failure this release exists to remove, and it must not be quiet a second time.
+          // failure v0.8.6 exists to remove, and it must not be quiet a second time.
           ctx.logger?.warn?.(
             'w2m: paired but the device token could NOT be persisted ('
             + `${error instanceof Error ? error.message : String(error)}) -- this machine will answer `
             + '401 to every authenticated call until that is fixed',
           );
+          return { paired: false, by };
         }
-        ctx.logger?.info?.(`w2m: paired by ${pairBy}`);
+        ctx.logger?.info?.(`w2m: paired by ${by}`);
+        return { paired: true, by };
       } catch (error) {
         // Named rather than swallowed: an agent that failed to pair runs and does nothing, which
         // looks identical to a fleet with no work.
-        ctx.logger?.warn?.(`w2m: pairing by ${pairBy} failed: ${error instanceof Error ? error.message : String(error)}`);
+        ctx.logger?.warn?.(`w2m: pairing by ${by} failed: ${error instanceof Error ? error.message : String(error)}`);
+        return { paired: false, by };
       }
+    }
+
+    /**
+     * v0.8.12: **join the fleet, once, however late it becomes possible -- but do not remember a
+     * failure as if it were an answer.**
+     *
+     * ## The two halves, and why both are needed
+     *
+     * A **successful** join is memoised for the life of the process: a machine that holds a token has
+     * nothing to gain from pairing again, and the relay allows five pairings a minute. That is the
+     * v0.8.7 rule, kept.
+     *
+     * A **failed** join must NOT be memoised, because that is precisely the defect this replaces.
+     * v0.8.9's attempt ran once and nothing remembered to retry; memoising a failure would reproduce
+     * the same trap with better bookkeeping -- the machine would hold a rejected promise for ever and
+     * never ask again, which is the "intermittent miss becomes permanent" failure v0.8.7 introduced
+     * by accident.
+     *
+     * The rate limit is honoured by a **cooldown** rather than by permanence, and the cooldown applies
+     * only when a pairing was actually **attempted**. "There is no fleet key yet" means the account
+     * profile was not readable; nothing was sent, so there is nothing for `pair_rate_limit` to have an
+     * opinion about, and making the next caller wait ten seconds for it costs the honest case -- the
+     * tool call immediately after the account becomes readable is exactly the caller this release
+     * exists to serve. Measured while writing this: with the keyless case cooled down too, the mount
+     * attempt failed on a cold account and the very next tool call silently did nothing, which is the
+     * reported symptom reproduced by its own fix.
+     */
+    const JOIN_COOLDOWN_MS = 10000;
+    let joinPromise = null;
+    let joinPromiseAt = 0;
+    /** True when the last attempt failed without sending anything to the relay. */
+    let joinLastWasKeyless = false;
+    let joinSucceeded = false;
+    let joinAttempts = 0;
+    let joinLastError = null;
+    async function joinFleet() {
+      if (joinSucceeded) return { paired: true, by: 'existing token' };
+      const coolingDown = joinPromise !== null
+        && !joinLastWasKeyless
+        && Date.now() - joinPromiseAt < JOIN_COOLDOWN_MS;
+      if (coolingDown) return joinPromise;
+      joinPromiseAt = Date.now();
+      joinPromise = (async () => {
+        joinAttempts += 1;
+        if (alreadyPaired) {
+          joinSucceeded = true;
+          ctx.logger?.info?.(`w2m: already paired (token in ${loaded.path}); not pairing again`);
+          return { paired: true, by: 'existing token' };
+        }
+        // A missing key is re-derived here rather than only at mount: the account is a lazy cache,
+        // so "not yet" is the normal first answer and time is the input that changes it.
+        let key = fleetKey;
+        let source = fleetKeySource;
+        if (key === null) {
+          const retry = await deriveFleetKeyOnce();
+          key = retry.fleetKey;
+          source = retry.fleetKeySource;
+          if (key !== null) {
+            fleetKey = key;
+            fleetKeySource = source;
+          } else {
+            joinLastError = describeIdentityFailure(retry.last);
+          }
+        }
+        if (key === null) {
+          // Nothing was sent, so nothing is rate-limited: the next caller may try again at once.
+          joinLastWasKeyless = true;
+          joinSucceeded = false;
+          joinLastError = joinLastError ?? 'no fleet key';
+          return { paired: false, by: null };
+        }
+        joinLastWasKeyless = false;
+        const outcome = await pairNow(key);
+        if (outcome.paired) {
+          joinSucceeded = true;
+        } else {
+          joinSucceeded = false;
+          if (joinLastError === null) {
+            joinLastError = key === null ? (joinLastError ?? 'no fleet key') : 'pairing refused';
+          }
+        }
+        return outcome;
+      })();
+      return joinPromise;
+    }
+
+    /**
+     * The tool layer's way back in: called when a tool finds the machine unpaired.
+     *
+     * A no-op when the account cannot be read is correct -- a machine that genuinely has no account
+     * must not be handed a fleet, and `joinLastError` records why.
+     */
+    ensureFleetJoin = () => joinFleet();
+
+    if (alreadyPaired) {
+      joinSucceeded = true;
+      joinPromise = Promise.resolve({ paired: true, by: 'existing token' });
+      ctx.logger?.info?.(`w2m: already paired (token in ${loaded.path}); not pairing again`);
     } else {
-      ctx.logger?.warn?.('w2m: no fleetKey and no pairingCode, so this machine cannot join a fleet');
+      await joinFleet();
+      if (fleetKey === null && fleetKeyFromConfig === null && cfg.pairingCode == null) {
+        // The state the whole series has been about: signed in, reachable, and in no fleet. One line
+        // that says so -- and says it once. The retry loop below, and any tool call, will try again;
+        // this line exists so the moment of failure is not silent.
+        ctx.logger?.warn?.(
+          `w2m: not in a fleet yet (${joinLastError ?? 'no fleet key'}) -- the account profile is `
+          + 'read on demand and may still be loading; this machine will join as soon as it answers',
+        );
+      }
     }
 
     await agent.start();
     ctx.logger?.info?.(`w2m: agent started as ${JSON.stringify(agent.identity?.() ?? null)}`);
+
+    /**
+     * v0.8.12: **keep trying to join after mount.**
+     *
+     * The mount path runs before this host has read the account profile, and the profile read is on
+     * demand, so a single window -- however generously retried inside it -- is a bet on a timing
+     * nobody controls. Measured here: 0.8.9's ~62 s budget expired while the profile was still cold,
+     * and because nothing re-attempted afterwards the machine stayed in no fleet for the rest of the
+     * process's life. The account answered minutes later; there was simply nobody left asking.
+     *
+     * So the retry moves out of the mount window and beside the running agent, at a cadence that
+     * cannot annoy the relay: `joinFleet` is memoised, so a successful join ends this loop, and one
+     * attempt per escalation is all it can ever produce. It stops after `joinRetryLimit` tries rather
+     * than polling forever -- a machine with no account is a state to report, not to hammer.
+     */
+    const joinRetryLimit = 30;
+    let joinRetryTimer = null;
+    let joinRetryCount = 0;
+    let joinRetryDelayMs = 15000;
+    function clearJoinRetry() {
+      if (joinRetryTimer !== null) {
+        clearTimeout(joinRetryTimer);
+        joinRetryTimer = null;
+      }
+    }
+    function scheduleJoinRetry() {
+      clearJoinRetry();
+      if (joinRetryCount >= joinRetryLimit) {
+        ctx.logger?.warn?.(
+          `w2m: gave up trying to join after ${joinRetryCount} attempts (${joinLastError ?? 'no reason recorded'}); `
+          + 'this machine is in NO fleet and will receive no work',
+        );
+        return;
+      }
+      joinRetryCount += 1;
+      const delay = joinRetryDelayMs;
+      joinRetryDelayMs = Math.min(Math.round(joinRetryDelayMs * 1.5), 120000);
+      joinRetryTimer = setTimeout(() => {
+        joinRetryTimer = null;
+        // `joinFleet` resolves rather than throws for every outcome it can name, but a retry loop is
+        // exactly the place an unforeseen throw would become an unhandled rejection and take the
+        // process down -- so it is caught here as well.
+        joinFleet().then((outcome) => {
+          if (!outcome.paired) scheduleJoinRetry();
+        }).catch((error) => {
+          joinLastError = error instanceof Error ? error.message : String(error);
+          scheduleJoinRetry();
+        });
+      }, delay);
+      joinRetryTimer.unref?.();
+    }
+    if (!alreadyPaired) scheduleJoinRetry();
 
     // Â§8.2: when the agent runs inside this process its `rttMs` is reachable directly, so `w2m_status`
     // can report it without a file. When the agent is its own process this stays null and the tool
@@ -4886,6 +5196,8 @@ async function startLocalStack(ctx, cfg) {
     const statusGetter = agent.status ?? agent.state ?? null;
 
   return async () => {
+    clearJoinRetry();
+    ensureFleetJoin = null;
     inProcessAgentStatus = null;
     await agent.stop();
     await relay.close();
