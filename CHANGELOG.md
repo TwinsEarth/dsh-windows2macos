@@ -4,6 +4,58 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.9] — 2026-10-14
+
+**The account answers lazily, and we asked once.**
+
+### The defect
+
+`getPlatformSession().userId` repeats the stable account id **from the most recent successful
+`getProfile`**, and is `null` until one has happened. The account profile is a **lazy cache**, and
+`startLocalStack` reads it **at mount** — before any model call has touched the profile.
+
+So on a signed-in machine the first read returns *signed out*, the fleet key is never derived, no
+pairing happens, and **nothing is written**. The evidence that pins it is `device.json`'s **mtime**:
+unchanged since the first boot, so `saveDeviceToken` was not merely ineffective, it was **never
+reached**.
+
+**That also explains an earlier result that made no sense at the time:** v0.8.4 *did* pair once,
+because by then the profile happened to be cached. **A timing-dependent success is the worst kind to
+debug — the code is right and the outcome still varies.**
+
+### v0.8.7 made it worse, without meaning to
+
+*"Already paired → do not pair again"* turned an **intermittent miss into a permanent one**. A
+machine that missed at startup never retried, and re-pairing had been the only thing rescuing it.
+The rate-limit fix was correct and exposed a defect it did not create.
+
+### Fixed
+
+Derivation now **backs off and retries** (6 attempts, 2s doubling to a 30s cap) until a real key
+appears or the budget runs out.
+
+### And the silent branch that hid it
+
+`resolve()` on the **stored-SN path** returns `ok: true` with `fleetKey: null`. The old code logged
+only when `ok === false` — so the shape that was actually firing **produced no output anywhere**.
+
+That is the same *silent no-op* class fixed in 0.8.5, reappearing **in the exact branch that was
+failing**. Every outcome is now named:
+
+| shape | reported as |
+|---|---|
+| `ok: true`, key present | `fleet key derived … on attempt N (fleet …)` |
+| **`ok: true`, key null** | **`signed in, but the account returned no fleet key (the profile may not be loaded yet)`** |
+| `ok: false` | the reason and detail, verbatim |
+| budget exhausted | **`this machine is in NO fleet and will receive no work`** |
+
+A machine in no fleet must never be quiet about it.
+
+### Verified
+
+**174 cases**. `tools.mjs` loads; the describer was exercised against all five shapes including the
+one that previously said nothing.
+
 ## [0.8.8] — 2026-10-14
 
 **A machine that joined without saying what it is — and a fix that was computed and never used.**

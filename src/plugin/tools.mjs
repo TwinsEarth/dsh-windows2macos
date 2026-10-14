@@ -4734,36 +4734,71 @@ async function startLocalStack(ctx, cfg) {
       allowedCommands: cfg.allowedCommands,
     });
     /**
-     * v0.8.4: derive the fleet key from the signed-in account when nobody supplied one.
+     * v0.8.9: derive the fleet key, RETRYING until the account actually answers.
      *
-     * This is the connection that makes the feature user-facing. The `chatops` half already
-     * derived the key from `userId` and exposed it; this half already accepted one. Neither knew
-     * about the other, so the plugin read `fleetKey` from config or `W2M_FLEET_KEY` and a machine
-     * with a signed-in account still joined nothing.
+     * The account profile is LAZILY loaded: `getPlatformSession().userId` is null until a
+     * successful `getProfile` has happened, and this runs at mount -- before any model call has
+     * touched the profile. So a single read at startup returns "signed out" on a machine that is
+     * signed in, and the fleet key is never derived.
      *
-     * The host is the only layer that can read the account -- a standalone agent cannot -- so the
-     * derivation belongs here, where `ctx` is available, and not where the key is used.
+     * That also explains an earlier confusing result: v0.8.4 DID pair once, because the profile
+     * happened to be cached by then. A timing-dependent success is the worst kind to debug,
+     * because the code is right and the outcome still varies.
+     *
+     * v0.8.7 made it worse without meaning to: "already paired -> do not pair again" turned an
+     * intermittent miss into a PERMANENT one, since a machine that missed at startup never
+     * retried. Re-pairing was the only thing that had been rescuing it.
+     *
+     * So: back off and retry until a real key appears or the budget runs out, and REPORT EVERY
+     * OUTCOME -- including the one that used to say nothing at all. `resolve()` on the stored-SN
+     * path returns ok:true with a null fleetKey, which the old code checked for neither truthy
+     * nor falsy, so that shape produced no log line anywhere. A silent branch in the exact place
+     * that was failing is how this took several rounds to find.
      */
     let fleetKey = cfg.fleetKey ?? null;
     let fleetKeySource = fleetKey === null ? null : 'config';
     if (fleetKey === null) {
-      try {
-        const { createAccountIdentity } = await import('../chatops/account.mjs');
-        const identity = await createAccountIdentity({ ctx, platform: process.platform }).resolve();
-        if (identity.ok && typeof identity.fleetKey === 'string' && identity.fleetKey !== '') {
-          fleetKey = identity.fleetKey;
-          fleetKeySource = 'account';
-          ctx.logger?.info?.(`w2m: fleet key derived from the signed-in account (fleet ${identity.accountCode})`);
-        } else if (identity.ok === false) {
-          // Named, and at info rather than warn: being signed out is a normal state, and a machine
-          // with no account has no fleet -- the design says it must not be given a random one.
-          ctx.logger?.info?.(`w2m: no fleet key from the account (${identity.reason}${identity.detail ? `: ${identity.detail}` : ''})`);
+      const ATTEMPTS = 6;
+      let last = null;
+      for (let attempt = 1; attempt <= ATTEMPTS; attempt += 1) {
+        try {
+          const { createAccountIdentity } = await import('../chatops/account.mjs');
+          last = await createAccountIdentity({ ctx, platform: process.platform }).resolve();
+        } catch (error) {
+          last = { ok: false, reason: 'threw', detail: error instanceof Error ? error.message : String(error) };
         }
-      } catch (error) {
-        // A derivation failure must not stop the agent: an unpaired agent still runs and can be
-        // paired later, whereas a thrown start is a machine that never appears at all.
-        ctx.logger?.warn?.(`w2m: could not derive a fleet key: ${error instanceof Error ? error.message : String(error)}`);
+        const key = last && last.ok === true ? last.fleetKey : null;
+        if (typeof key === 'string' && key !== '') {
+          fleetKey = key;
+          fleetKeySource = 'account';
+          ctx.logger?.info?.(`w2m: fleet key derived from the signed-in account on attempt ${attempt} (fleet ${last.accountCode})`);
+          break;
+        }
+        if (attempt < ATTEMPTS) {
+          const waitMs = Math.min(2000 * 2 ** (attempt - 1), 30000);
+          ctx.logger?.info?.(`w2m: no fleet key yet (${describeIdentityFailure(last)}); retrying in ${waitMs}ms`);
+          await new Promise((resolve) => setTimeout(resolve, waitMs));
+        }
       }
+      if (fleetKey === null) {
+        // Loud, and it names which failure it was: a machine in no fleet must never be quiet.
+        ctx.logger?.warn?.(
+          `w2m: could not derive a fleet key after ${ATTEMPTS} attempts (${describeIdentityFailure(last)}) -- `
+          + 'this machine is in NO fleet and will receive no work', 
+        );
+      }
+    }
+
+    /**
+     * Name what actually went wrong, including the shape that used to say nothing.
+     *
+     * `ok: true` with a null key is the stored-SN path, and it was invisible before: the old code
+     * only logged when `ok === false`, so the one branch that was firing had no output.
+     */
+    function describeIdentityFailure(identity) {
+      if (!identity) return 'no result';
+      if (identity.ok === true) return 'signed in, but the account returned no fleet key (the profile may not be loaded yet)';
+      return `${identity.reason}${identity.detail ? `: ${identity.detail}` : ''}`;
     }
 
     /**
