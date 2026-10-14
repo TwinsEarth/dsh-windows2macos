@@ -16,7 +16,7 @@ import { createHash, randomBytes } from 'node:crypto';
 // v0.7.7: fleet scoping. Imported rather than inlined so the rule has one home with its own
 // exhaustive tests — three lines inside this object would be untestable without a live relay.
 import { targetsFor } from '../chatops/fleet-wiring.mjs';
-import { fleetForPairingCode, deviceFleetFields } from '../chatops/fleet-wiring.mjs';
+import { deviceFleetFields } from '../chatops/fleet-wiring.mjs';
 // v0.8.1: the account-derived fleet key, so a machine can join with no pairing code.
 import { planJoin } from '../chatops/fleet-join.mjs';
 
@@ -1488,7 +1488,25 @@ export class RabbitState {
 
     if (targets.length === 0) {
       throw new ProtocolError('NO_ONLINE_DEVICE', 'no paired device available for this task', {
-        known_devices: all.length,
+        /**
+         * v0.9.0: `all` was never defined here — this threw `ReferenceError: all is not defined`
+         * instead of the refusal it was written to be, and it did so on **the one path an operator
+         * actually reaches**: `targets` is empty exactly when the fleet has nothing to dispatch to,
+         * which is what a freshly configured machine sees before its first peer joins.
+         *
+         * The count an operator needs there is "how many devices does this relay know at all",
+         * because the answer distinguishes *"nothing is paired"* from *"something is paired but
+         * scoped out"* — and `targets` being fleet-filtered cannot answer that. `this.devices` is
+         * the unfiltered set the same call hands to `targetsFor` a few lines above (see the
+         * `devices: [...this.devices.values()]` there), so its size is that number.
+         *
+         * ESLint's `no-undef` found this, which is the rule the project's own lint audit credits as
+         * "what caught the one real defect" of that round. This is the same class of defect one
+         * release later, and the audit's note about it is worth repeating: an unbound identifier in
+         * an ESM module is a `ReferenceError` at evaluation time, not an `undefined` that quietly
+         * takes a branch.
+         */
+        known_devices: this.devices.size,
       });
     }
 

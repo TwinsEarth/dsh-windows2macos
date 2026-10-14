@@ -169,7 +169,7 @@ describe('a misspelled command is not sent to the model', () => {
 describe('an approval id is resolved against this window only', () => {
   it('answers the oldest request when no id is given', async () => {
     const decided = [];
-    const { ctx: c } = ctx({ actions: { pending: () => PENDING, decideApproval: (id, o) => (decided.push([id, o]), { ok: true }) } });
+    const { ctx: c } = ctx({ actions: { pending: () => PENDING, decideApproval: (id, o) => { decided.push([id, o]); return { ok: true }; } } });
     const result = await route('/approve', c);
     assert.equal(result.kind, 'ok');
     assert.deepEqual(decided, [['appr-1111-2222', 'allowed-once']]);
@@ -178,7 +178,7 @@ describe('an approval id is resolved against this window only', () => {
   it('refuses an id that this window was never shown', async () => {
     const decided = [];
     const { ctx: c } = ctx({
-      actions: { pending: () => PENDING, decideApproval: (id, o) => (decided.push([id, o]), { ok: true }) },
+      actions: { pending: () => PENDING, decideApproval: (id, o) => { decided.push([id, o]); return { ok: true }; } },
     });
     // `appr-9999` exists elsewhere; honouring it here would let a trusted identity answer a
     // request it had no business seeing.
@@ -189,7 +189,7 @@ describe('an approval id is resolved against this window only', () => {
 
   it('accepts an unambiguous id prefix', async () => {
     const decided = [];
-    const { ctx: c } = ctx({ actions: { pending: () => PENDING, decideApproval: (id) => (decided.push(id), { ok: true }) } });
+    const { ctx: c } = ctx({ actions: { pending: () => PENDING, decideApproval: (id) => { decided.push(id); return { ok: true }; } } });
     await route('/reject appr-3333', c);
     assert.deepEqual(decided, ['appr-3333-4444']);
   });
@@ -296,7 +296,7 @@ describe('the fleet is reachable, and says so when it is not', () => {
 
   it('dispatches /run with the argv the operator typed', async () => {
     const sent = [];
-    const { ctx: c } = ctx({ actions: { dispatch: async (argv) => (sent.push(argv), { taskId: 't', summary: 'sent' }) } });
+    const { ctx: c } = ctx({ actions: { dispatch: async (argv) => { sent.push(argv); return { taskId: 't', summary: 'sent' }; } } });
     const result = await route('/run node --test', c);
     assert.equal(result.kind, 'ok');
     assert.deepEqual(sent, [['node', '--test']]);

@@ -36,17 +36,7 @@ import { CHANNEL_STATE, CHANNEL_FEATURE } from './channel.mjs';
 // from here; the definitions live in ilink-protocol.mjs, which is what the contract suite pins.
 export * from './ilink-protocol.mjs';
 import { createTransport } from './ilink-transport.mjs';
-import {
-  QR_BASE_URL,
-  ENDPOINTS,
-  BOT_TYPE,
-  LOGIN_STATUS,
-  MESSAGE,
-  baseInfo,
-  isAllowedApiUrl,
-  extractText,
-  messageId,
-} from './ilink-protocol.mjs';
+import { QR_BASE_URL, ENDPOINTS, BOT_TYPE, MESSAGE, baseInfo, isAllowedApiUrl, extractText, messageId } from './ilink-protocol.mjs';
 
 /** Long poll: the platform holds the request open this long, so the deadline must exceed it. */
 const LONG_POLL_MS = 35_000;
@@ -117,7 +107,7 @@ export function createILinkChannel(options = {}) {
     return apiBase;
   }
 
-  const url = (endpoint) => new URL(endpoint, QR_BASE_URL).toString();
+  const _url = (endpoint) => new URL(endpoint, QR_BASE_URL).toString();
 
   /** One request, with the outcome returned as data. Never throws on a business refusal. */
   async function call(endpoint, body, { base = null, authenticated = true, timeoutMs = 20_000, signal } = {}) {

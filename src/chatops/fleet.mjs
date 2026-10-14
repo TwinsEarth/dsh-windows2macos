@@ -111,7 +111,7 @@ export function createFleetExecutor(options) {
   const timeoutMs = options.timeoutMs ?? 30_000;
   const doFetch = options.fetch ?? globalThis.fetch;
   const now = options.now ?? (() => Date.now());
-  const sleep = options.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
+  const sleep = options.sleep ?? ((ms) => new Promise((r) => { setTimeout(r, ms); }));
   const audit = options.audit ?? (() => {});
 
   /** One relay call. Resolves for every HTTP status: a refusal is an answer, not an exception. */

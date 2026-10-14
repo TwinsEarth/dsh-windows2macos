@@ -21,7 +21,10 @@ const CLIENT_VERSION = String((2 << 16) | (4 << 8) | 6);
 
 const argv = process.argv.slice(2);
 const say = argv.includes('--say') ? argv[argv.indexOf('--say') + 1] : null;
-let cursor = argv.includes('--buf') ? argv[argv.indexOf('--buf') + 1] : existsSync(CURSOR) ? readFileSync(CURSOR, 'utf8') : '';
+// `const`, not `let`: the cursor is resolved once from `--buf`, the saved file, or empty, and is only
+// ever read afterwards (it is sent as `get_updates_buf`). The earlier `let` suggested a resumption
+// that this script does not implement.
+const cursor = argv.includes('--buf') ? argv[argv.indexOf('--buf') + 1] : existsSync(CURSOR) ? readFileSync(CURSOR, 'utf8') : '';
 
 /** The random per-request UIN the reference client sends, and the type header it cannot omit. */
 const uin = () => Buffer.from(String(randomBytes(4).readUInt32BE(0)), 'utf8').toString('base64');

@@ -49,7 +49,7 @@ function harness({ timeoutMs = 300_000, delegateOutcome = 'allowed-once', ids } 
   let n = 0;
   const events = [];
   const delegateCalls = [];
-  let nextId = ids ? [...ids] : null;
+  const nextId = ids ? [...ids] : null;
   const timers = new Map();
   let timerSeq = 0;
 

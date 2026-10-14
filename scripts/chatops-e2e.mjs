@@ -11,12 +11,12 @@
  * default does one synthetic dispatch and reports, so a run cannot hang on a human.
  */
 
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { createBridge } from '../src/chatops/bridge.mjs';
 import { createILinkChannel } from '../src/chatops/ilink.mjs';
 import { createFleetExecutor } from '../src/chatops/fleet.mjs';
 import { createChatopsActions } from '../src/chatops/actions.mjs';
-import { OWNER_CAPABILITIES } from '../src/chatops/commands.mjs';
+
 
 const LOGIN = 'dist/ilink/ilink-login.json';
 const argv = process.argv.slice(2);

@@ -76,11 +76,24 @@ const UPDATES_RESPONSE = {
   msgs: [
     {
       seq: 1,
+      /*
+       * `message_id` and `create_time_ms` below are **measured** live values, and the number
+       * literals are the point of the fixture rather than an accident of it.
+       *
+       * `message_id` is nineteen digits, past `Number.MAX_SAFE_INTEGER`, so JavaScript rounds it on
+       * parse. That rounding is exactly what the assertions below use the fixture to demonstrate:
+       * `String(parsed.message_id)` is deliberately NOT `'7515840255213248776'`, and the production
+       * `messageId()` path recovers the exact digits from the raw response text for precisely this
+       * reason. Quoting either literal would delete the case being tested, which is why `no-loss-of-
+       * precision` is disabled for this fixture instead of the fixture being rewritten to suit it.
+       */
+      /* eslint-disable no-loss-of-precision */
       message_id: 7515840255213248776,
       from_user_id: 'o9cq80y8gA2CW4Y9RPgJxjpYAolE@im.wechat',
       to_user_id: '9787225e3e71@im.bot',
       client_id: 'mmassistant_bypmsg_inbox_9dc6917db1ba1eba03315fda471adb54mmo9cq80y907qoBau41lnzsSsoCIlU@weclaw563625_1791915952',
       create_time_ms: 1791915954331,
+      /* eslint-enable no-loss-of-precision -- the fixture's two measured ids are done */
       message_type: 1,
       message_state: 2,
       item_list: [
@@ -97,7 +110,14 @@ const UPDATES_RESPONSE = {
   ret: 0,
 };
 
-/** `POST ilink/bot/sendmessage` for a delivered reply → 200. Measured. */
+/**
+ * `POST ilink/bot/sendmessage` for a delivered reply → 200. Measured.
+ *
+ * The id is the same nineteen-digit shape as above, so it rounds identically on both sides of the
+ * comparison that uses it — `message_id` here is what the transport is expected to echo. A string
+ * would no longer exercise the number path that the rounding bug lives on.
+ */
+/* eslint-disable-next-line no-loss-of-precision -- measured live id, see the note above */
 const SEND_RESPONSE = { message_id: 7515840555615131656 };
 
 // ---------------------------------------------------------------------------------------------

@@ -191,9 +191,23 @@ export default [
   // deploy/windows/*.mjs belongs in this list for the same reason as bin/: the supervisor is a
   // long-running process whose *only* output channel is the console and the log file it tees it
   // into. There is nothing to return a value to.
+  //
+  // v0.9.0: `scripts/**` joins them, for the same reason and after the same measurement.
+  //
+  // The rule this exception serves is that `console` outside a CLI is nearly always a leftover debug
+  // statement. Every `scripts/` file here *is* a CLI: `ilink-*.mjs` are operator probes that log a
+  // QR flow and its state transitions as their entire output, and `chatops-*-e2e.mjs` are end-to-end
+  // drivers whose value is their transcribed trace. None of them returns a value to a caller -- the
+  // trace *is* the deliverable.
+  //
+  // Measured before the change: they accounted for 117 of the tree's 155 blocking errors, all
+  // `no-console`, so the lint gate was red on a rule whose stated rationale (a leftover debug
+  // statement in a library) does not apply to any of them. The alternative -- 117 inline disables --
+  // would have been the same decision written 117 times, and would have buried the errors that do
+  // matter. `src/` and `test/` keep `no-console` at error.
   // ---------------------------------------------------------------------
   {
-    files: ['bin/**/*.mjs', 'deploy/**/*.mjs'],
+    files: ['bin/**/*.mjs', 'deploy/**/*.mjs', 'scripts/**/*.mjs'],
     rules: {
       'no-console': 'off',
     },

@@ -4930,7 +4930,7 @@ async function startLocalStack(ctx, cfg) {
         if (attempt < attempts) {
           const waitMs = Math.min(2000 * 2 ** (attempt - 1), 30000);
           ctx.logger?.info?.(`w2m: no fleet key yet (${describeIdentityFailure(last)}); retrying in ${waitMs}ms`);
-          await new Promise((resolve) => setTimeout(resolve, waitMs));
+          await new Promise((resolve) => { setTimeout(resolve, waitMs); });
         }
       }
       // Not fatal: the caller may pair by code, and a later attempt may still succeed.
@@ -5188,10 +5188,29 @@ async function startLocalStack(ctx, cfg) {
     }
     if (!alreadyPaired) scheduleJoinRetry();
 
-    // Â§8.2: when the agent runs inside this process its `rttMs` is reachable directly, so `w2m_status`
+    // §8.2: when the agent runs inside this process its `rttMs` is reachable directly, so `w2m_status`
     // can report it without a file. When the agent is its own process this stays null and the tool
     // says so instead of guessing.
+    //
+    // v0.9.0: **this assignment is the whole feature, and it was missing.**
+    //
+    // The getter was built and then dropped on the floor, so `inProcessAgentStatus` stayed `null` for
+    // the life of the process. `readRtt` opens with `if (inProcessAgentStatus)` and skips the entire
+    // in-process branch when it is null -- so it fell through to reading a state file, and reported
+    //
+    //   no agent round-trip time is available: the agent is not running in this process and no agent
+    //   state file was found under <stateDir>
+    //
+    // on a machine whose agent *was* in that process and *was* publishing that file. The wording is
+    // wrong twice over, and it is wrong in the direction that costs the most: it tells the reader to
+    // doubt the agent, on the one call they make to find out what is actually happening.
+    //
+    // This is the defect shape the release notes keep recording -- *the record was created and the
+    // part that makes it useful was not filled in* -- and it is the same shape as the identity line
+    // fixed above. ESLint's `no-unused-vars` is what surfaced it: the variable was read nowhere
+    // because nothing was ever assigned to the thing it was meant to feed.
     const statusGetter = agent.status ?? agent.state ?? null;
+    if (typeof statusGetter === 'function') inProcessAgentStatus = statusGetter;
 
   return async () => {
     clearJoinRetry();

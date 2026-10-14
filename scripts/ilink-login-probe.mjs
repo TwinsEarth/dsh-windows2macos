@@ -23,7 +23,7 @@ const BOT_TYPE = '3';
 
 const args = process.argv.slice(2);
 const outDir = args.includes('--out') ? args[args.indexOf('--out') + 1] : null;
-let verifyCode = args.includes('--verify') ? args[args.indexOf('--verify') + 1] : null;
+const verifyCode = args.includes('--verify') ? args[args.indexOf('--verify') + 1] : null;
 
 const headers = {
   'content-type': 'application/json',

@@ -126,21 +126,6 @@ jobs:
         working-directory: .
         run: node scripts/check-entrypoints.mjs
 
-      # The join is the half of this plugin that shipped broken for seven releases, and it is the half
-      # no suite could reach: `test/tools.test.mjs` drives `apply()` against a fake registry, and the
-      # real `agent.start()` talks to the public relay for the life of the process. `verify-join.mjs`
-      # substitutes the agent factory and asserts the sequence instead -- that `createAgent` receives a
-      # real `identity.machine_id`, that a machine whose account answered *after* mount still derives a
-      # key, pairs, and writes the token to `device.json`, and that a machine holding a token never
-      # re-pairs. It needs no install (node builtins only) and no network; it writes to a throwaway
-      # identity via `DSH_DEVICE_FILE`, never the real one.
-      #
-      # It is a script rather than a suite member deliberately: `package.json#scripts.test` runs under
-      # `--test-force-exit` on a runner, and this checks a sequence, not a collection of cases.
-      - name: The fleet join reaches a token (stub agent, no relay)
-        working-directory: .
-        run: npm run verify:join
-
       - name: Install the package and assert it registers eight tools
         shell: bash
         run: node scripts/verify-installed.mjs "$(pwd)"

@@ -35,7 +35,10 @@ const deadline = Date.now() + 30 * 60 * 1000;
 while (Date.now() < deadline && token === null) {
   await new Promise(r => setTimeout(r, 2000));
   try { st = await post(`ilink/bot/get_qrcode_status?qrcode=${encodeURIComponent(qr.qrcode)}`, { base_info: BOT_INFO }); }
-  catch (e) { continue; }
+  // The catch deliberately discards its error: a failed poll is retried until the deadline, and the
+  // loop's own state line is the report. There is no error binding because there is nothing to do
+  // with it that would not be noise while waiting for a human to scan a QR code.
+  catch { continue; }
   const state = String(st?.status ?? st?.state ?? '');
   if (state !== lastState) { log('state=' + state); lastState = state; }
   token = st?.bot_token ?? st?.token ?? null;

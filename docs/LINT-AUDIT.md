@@ -12,6 +12,51 @@
 
 ---
 
+## Addendum — v0.9.0: the gate was cleared, and this document is why it had to be
+
+*The measurements above are left exactly as written. They were correct for 2026-10-08 and they are
+the record of a real decision. But they no longer describe the tree, and a reader arriving at this
+file today would draw the wrong conclusion from it — so the change is recorded here rather than by
+editing the numbers.*
+
+**What happened between then and v0.9.0.** The audit's disposition for most findings was "report, do
+not fix", on the reasoning that ~30 findings were rule noise on idiomatic code and that rewriting
+working code to satisfy a heuristic is the wrong trade. That reasoning still holds. What changed is
+volume: the tree grew `scripts/ilink-*.mjs` and `scripts/chatops-*-e2e.mjs`, which between them added
+**117 `no-console` errors** — every one of them a CLI script for which the console *is* the output
+channel. `eslint .` went from 31 blocking errors to **155**.
+
+The consequence is the one this document could not have anticipated: a lint gate that is red for 117
+pieces of noise is a gate nobody reads, and **three real defects then sat in the tree undetected** —
+including `ReferenceError: all is not defined` in `src/relay/state.mjs`, thrown while building a
+refusal on the exact path an operator reaches when their fleet has nothing to dispatch to. §3.1's
+claim that `no-undef` is "what caught the one real defect" was true, and it stayed true: `no-undef`
+caught this one too, once anyone was reading.
+
+**What v0.9.0 did about it**, per rule (full reasoning in `CHANGELOG.md`):
+
+| Rule | Then | Now |
+|---|---|---|
+| `no-console` | 31 blocking, all in `test/`+`src/` as errors | 117 moved to **configuration**: `scripts/**` joins `bin/**`+`deploy/**` in the existing `no-console: off` block. `src/` and `test/` unchanged. |
+| `no-unused-vars` | 21 | 13 dead imports removed, 7 unused bindings annotated `_`-prefixed. |
+| `no-promise-executor-return` | 31 (demoted to warn in `test/`+`scripts/`) | The 4 **errors** in `src/`/`deploy/` given braces. The warnings are untouched. |
+| `prefer-const` | — | 2 fixed. The rule's report on `scripts/ilink-talk.mjs`'s `cursor` was correct: the `let` implied a resumption the script does not implement. |
+| `no-sequences` | — | 4 fixed in `test/chatops-commands.test.mjs`. |
+| `no-loss-of-precision` | — | 2 **dispositioned**, not fixed: the nineteen-digit measured ids that the iLink fixture exists to demonstrate. Scoped `eslint-disable` with the reason inline. |
+| `no-useless-assignment`, `no-control-regex` | off / left as error (§1.2) | Unchanged. `no-control-regex` still has no occurrence to fire on. |
+
+**Current state: 0 errors, 127 warnings.** Measured with this repository's config plus
+`--report-unused-disable-directives`, so a suppression that has stopped suppressing anything fails the
+run rather than remaining as decoration.
+
+**What §1.1 still costs, and it is not fixed by any of this.** Type-aware rules remain unavailable,
+so `@typescript-eslint/no-floating-promises` — the canonical "you forgot `await`" check — is still
+absent. Two of the three defects v0.9.0 fixed were *unused* things (an unassigned variable read
+nowhere, a parameter mentioned nowhere), which `no-unused-vars` catches; the third was `no-undef`. A
+missing `await` would still be invisible. That conclusion is unchanged.
+
+---
+
 ## 0. TL;DR
 
 | Question | Answer |

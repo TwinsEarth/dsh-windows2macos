@@ -23,17 +23,7 @@
 import { readFileSync, writeFileSync, existsSync, appendFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 
-import {
-  buildHeaders,
-  buildReply,
-  sendSucceeded,
-  planMessage,
-  renderTaskOutcome,
-  renderFailure,
-  ITEM_TYPE,
-  MESSAGE_TYPE,
-  MESSAGE_STATE_FINISH,
-} from '../src/chatops/ilink-fleet-bridge.mjs';
+import { buildHeaders, buildReply, sendSucceeded, planMessage, renderTaskOutcome, renderFailure, MESSAGE_TYPE } from '../src/chatops/ilink-fleet-bridge.mjs';
 import { createFleetExecutor } from '../src/chatops/fleet.mjs';
 
 const LOGIN = 'dist/ilink/ilink-login.json';

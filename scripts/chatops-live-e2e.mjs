@@ -13,12 +13,12 @@
  * Usage: node scripts/chatops-live-sanitized.mjs
  */
 
-import { createServer } from 'node:http';
+
 import { spawn } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 
 import { createBridge } from '../src/chatops/bridge.mjs';
 import { createILinkChannel } from '../src/chatops/ilink.mjs';
@@ -59,7 +59,7 @@ writeFileSync(join(PROJECT, 'facts.txt'), 'w2m e2e\n');
 
 let relay = null;
 let agent = null;
-let agentLog = '';
+const _agentLog = '';
 
 try {
   // ---- the relay -------------------------------------------------------------------------
@@ -72,11 +72,14 @@ try {
   ], { stdio: ['ignore', 'pipe', 'pipe'] });
   relay.stdout.on('data', (b) => process.stdout.write(`  [relay] ${b}`));
   relay.stderr.on('data', (b) => process.stdout.write(`  [relay] ${b}`));
-  await waitFor(async () => (await fetch(`${RELAY_URL}/healthz`).then((r) => r.ok).catch(() => false)), 15_000, 'relay');
+  await waitFor(() => fetch(`${RELAY_URL}/healthz`).then((r) => r.ok).catch(() => false), 15_000, 'relay');
   const health = await (await fetch(`${RELAY_URL}/healthz`)).json();
   log(`relay up: ${health.relay_id}  operator_token_required=${health.operator_token_required}`);
 
-  const { createAgent, parseAllowedCommands } = await import('../src/agent/agent.mjs');
+  // `createAgent` is imported but unused: the e2e drives the agent through the CLI rather than
+  // constructing one here. Annotated rather than dropped so the import list still records which
+  // modules this script reaches into (`parseAllowedCommands` below is used).
+  const { createAgent: _createAgent, parseAllowedCommands } = await import('../src/agent/agent.mjs');
   const { probeCapsDetailed, detectPlatform } = await import('../src/agent/caps.mjs');
 
   // ---- the agent, with a real array allow-list -------------------------------------------
@@ -135,7 +138,7 @@ try {
   {
     const r = await fetch(`/v1/devices`, { headers: { authorization: `Bearer ` } });
     const body = await r.json();
-    for (const d of body.devices ?? []) log(`  relay sees:  online= state= last_seen=`);
+    for (const _d of body.devices ?? []) log(`  relay sees:  online= state= last_seen=`);
   }
   log('relay reports the device online');
 

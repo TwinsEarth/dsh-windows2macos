@@ -37,7 +37,7 @@ import { createILinkChannel } from './ilink.mjs';
 import { isAllowedApiUrl } from './ilink-protocol.mjs';
 import { createFleetExecutor } from './fleet.mjs';
 import { createChatopsActions } from './actions.mjs';
-import { createAccountIdentity, parseSn, fleetOf, SN_STATE_KEY } from './account.mjs';
+import { createAccountIdentity, SN_STATE_KEY } from './account.mjs';
 import { helpText, commandTable } from './commands.mjs';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';

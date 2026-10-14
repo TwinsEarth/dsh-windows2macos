@@ -120,7 +120,7 @@ export function createOutboundQueue(options) {
   const random = options.random ?? Math.random;
   const audit = options.audit ?? (() => {});
 
-  const realSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const realSleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
   const sleep = options.sleep ?? realSleep;
 
   /** window -> lane -> { tail, pending, lastSentAt } */

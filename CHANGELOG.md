@@ -4,6 +4,104 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] — 2026-10-14
+
+**Three defects that were mounted, wired, and doing nothing — and the lint gate that had stopped being able to say so.**
+
+### The shape all three share
+
+Each was, in the words an earlier release note already used for this class: *the record was created,
+and the part that makes it useful was not filled in*. All three were invisible to the suite, and all
+three were found by reading lint output rather than by running anything.
+
+### 1. `ReferenceError: all is not defined` — on the path an operator actually reaches
+
+`src/relay/state.mjs` threw an undefined identifier while *building a refusal*:
+
+```js
+if (targets.length === 0) {
+  throw new ProtocolError('NO_ONLINE_DEVICE', 'no paired device available for this task', {
+    known_devices: all.length,          // ← `all` exists nowhere in the file
+  });
+}
+```
+
+`targets` is empty exactly when the fleet has nothing to dispatch to — a freshly configured machine
+before its first peer joins, or a fleet whose machines are all scoped out. So the one case where the
+operator needs the detail most answered with a `ReferenceError` instead of the refusal. The count they
+need is the **unfiltered** device set, because the answer distinguishes *"nothing is paired"* from
+*"something is paired but scoped out"*; that is `this.devices`, the same collection handed to
+`targetsFor` a few lines above.
+
+The project's own lint audit records `no-undef` as the rule that "caught the one real defect" of its
+round, and notes why it matters: *an unbound identifier in an ESM module is a `ReferenceError` at
+evaluation time, not an `undefined` that quietly takes a branch.* This is the same defect one release
+later.
+
+### 2. The in-process agent's status was built and then dropped
+
+`src/plugin/tools.mjs` documented a feature and never performed it:
+
+```js
+// §8.2: when the agent runs inside this process its `rttMs` is reachable directly, so `w2m_status`
+// can report it without a file.
+const statusGetter = agent.status ?? agent.state ?? null;      // ← and nothing else
+```
+
+`readRtt` opens with `if (inProcessAgentStatus)` and skips the whole in-process branch when it is
+null. Nothing ever assigned it, so on a machine whose agent *is* in that process the tool fell through
+to reading a state file and reported:
+
+```
+no agent round-trip time is available: the agent is not running in this process and no agent
+state file was found under <stateDir>
+```
+
+— wrong twice, and wrong in the direction that costs most: it tells the reader to doubt the agent, on
+the one call they make to find out what is actually happening. The getter is now assigned.
+
+### 3. A parameter that promised a binding it never made
+
+`src/chatops/bridge.mjs` had `function actionsFor(windowKey)` under a doc line claiming the window was
+"bound in", and a body that never mentioned `windowKey`. The real binding is per call
+(`pending: (window) => broker.listFor(window)`), so the parameter is gone rather than renamed: a
+caller passing a window there was reading a promise the signature did not keep.
+
+### The lint gate, which is why nobody saw any of this
+
+`eslint .` reported **155 errors**, and the release pre-flight requires zero — so the gate was red, and
+a gate that is red for 117 pieces of noise is a gate nobody reads. Which is how three defects sat in
+the tree.
+
+| Rule | Count | Disposition |
+|---|---|---|
+| `no-console` | 117 | **Configuration.** Every one is in `scripts/` — `ilink-*.mjs` operator probes whose entire output *is* a transcribed QR flow, and `chatops-*-e2e.mjs` end-to-end drivers whose value is their trace. The rule's rationale ("a leftover debug statement") does not describe a file that returns nothing to a caller. `scripts/**` joins `bin/**` and `deploy/**` in the existing exception; `src/` and `test/` keep it at error. |
+| `no-unused-vars` | 20 | 13 dead imports removed; 7 unused **bindings** annotated with a leading underscore, per the config's own convention. Two of those are load-bearing calls whose *result* is unused — `stats = await lstat(lexical)` is how a missing file is detected — so the call stays and the binding is annotated. |
+| `no-promise-executor-return` | 4 | The idiomatic `new Promise((r) => setTimeout(r, ms))`. The rule is right that the executor returns a value; braces remove it without changing what the promise does. |
+| `prefer-const` | 2 | Both real; one (`cursor`) carried a `let` that suggested a resumption the script does not implement. |
+| `no-sequences` | 4 | Comma-operator arrows in a test, rewritten as block bodies — same order, same value, readable without knowing the operator. |
+| `no-loss-of-precision` | 2 | **Dispositioned, not fixed.** These are the nineteen-digit measured `message_id` values the iLink contract fixture exists to demonstrate: JavaScript rounds them on parse, and a production path recovers the exact digits from the raw text *because* of that. Quoting the literals would delete the case under test, so they carry a scoped `eslint-disable` with the reason inline. |
+
+Result: **0 errors**, measured with the repository's own config and `--report-unused-disable-directives`,
+so a suppression that no longer suppresses anything fails the run instead of sitting there looking
+like it does.
+
+`docs/LINT-AUDIT.md` keeps its measurements as written and gains an addendum for this round, because
+an audit document that silently disagrees with the tree is worse than no audit document.
+
+### Verified
+
+- `node scripts/verify-join.mjs` — 16/16, unchanged by the edits above.
+- `node scripts/check-entrypoints.mjs` — all entry points import.
+- The four touched suites — **119 tests / 25 suites / 0 failures** (`chatops-commands`,
+  `chatops-ilink-contract`, `chatops-approval`, `chatops-durability`).
+- `eslint .` — 0 errors.
+
+The three defects do **not** carry new tests, and that is a stated gap rather than an oversight: each
+sits on a path the existing suite does not construct (an empty target set at dispatch, an in-process
+agent status getter, a bridge action set built with an argument). They were found by lint and fixed by
+reading the surrounding contract; a test for each is the honest next step.
+
 ## [0.8.11] — 2026-10-14
 
 **The in-process join threw before it could pair — and a missing fingerprint took the fleet key with it.**

@@ -31,8 +31,8 @@
  * Usage: node mac-self-update.mjs --tarball <path> --sha256 <hex> [--verify-fleet <url>]
  */
 
-import { execFileSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync, cpSync, rmSync, readdirSync, statSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, cpSync, rmSync, readdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -120,7 +120,7 @@ function findDshProcess() {
  * `machineName` is read from the environment the agent was started with, falling back to the
  * hostname — the relay lists machines by the name they paired under.
  */
-async function fleetHasMachine(url, name) {
+async function fleetHasMachine(url, _name) {
   try {
     const res = await fetch(new URL('/healthz', url).toString(), { signal: AbortSignal.timeout(10_000) });
     const body = await res.json();
@@ -133,7 +133,7 @@ async function fleetHasMachine(url, name) {
   }
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms) => new Promise((r) => { setTimeout(r, ms); });
 
 async function main() {
   const install = findInstall();

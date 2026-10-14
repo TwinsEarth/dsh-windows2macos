@@ -21,17 +21,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import {
-  TIER,
-  DEFAULT_THRESHOLDS,
-  REQUIRED_LOSS_TOLERANCE,
-  NOMINAL_REPLICATION,
-  tierFor,
-  achievableReplication,
-  lossTolerance,
-  durabilityReport,
-  refreshPlan,
-} from '../src/chatops/durability.mjs';
+import { TIER, REQUIRED_LOSS_TOLERANCE, NOMINAL_REPLICATION, tierFor, achievableReplication, lossTolerance, durabilityReport, refreshPlan } from '../src/chatops/durability.mjs';
 
 describe('replication is bounded by the number of nodes', () => {
   it('reports 3 copies for 10 requested across 3 devices, not 10', () => {

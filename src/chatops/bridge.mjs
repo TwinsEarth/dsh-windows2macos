@@ -241,8 +241,16 @@ export function createBridge(options) {
     return { action: routed.kind, name: routed.name, refusal: routed.refusal, taskId: routed.taskId };
   }
 
-  /** The action set the command table sees, with the window bound in. */
-  function actionsFor(windowKey) {
+  /**
+   * The action set the command table sees.
+   *
+   * v0.9.0: this took a `windowKey` and never used it. The doc line above used to claim the window
+   * was "bound in", which was not true of the body -- the real binding is that `pending` takes the
+   * window per call (`broker.listFor(window)`), so the injected set is window-independent by design.
+   * The parameter is gone rather than renamed: a caller passing a window here was reading a promise
+   * the signature did not keep.
+   */
+  function actionsFor() {
     const injected = options.actions ?? {};
     return {
       ...injected,

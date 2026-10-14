@@ -164,9 +164,13 @@ export function createFileReader(options) {
     // Cheap refusal first, so a traversal never even reaches the filesystem.
     if (!contains(root, lexical)) return refuse(FILE_REFUSAL.ESCAPED, `lexical: ${lexical}`);
 
-    let stats;
+    // The binding is unused by design: the *call* is the check. A missing path must be refused with
+    // `MISSING` here rather than surfacing as a `realpath` failure below, because the two are
+    // different answers for the caller -- "there is no such file" versus "there is one and it escapes
+    // the root". Underscored, per the config's own convention for an unused binding.
+    let _stats;
     try {
-      stats = await lstat(lexical);
+      _stats = await lstat(lexical);
     } catch {
       return refuse(FILE_REFUSAL.MISSING, relPath);
     }
