@@ -48,6 +48,7 @@ import {
   resolveProjectCwd,
 } from './git.mjs';
 import { createSpool } from './spool.mjs';
+import { appendMemory, memoryRecord } from './memory.mjs';
 import { matchAllowedCommand, parseAllowedCommands } from './allowed-commands.mjs';
 import { CRYPTO_REASON, DEVICE_KEY_FILE, DeviceKey, PeerKeyStore } from './crypto.mjs';
 import { DEFAULT_P2P_MODE, P2P_DEFAULTS, P2PNode, normalizeP2PMode, normalizeP2PPort } from './p2p-node.mjs';
@@ -2638,6 +2639,32 @@ export function createAgent(options) {
     const directResult = (context.p2pDelivery ?? p2pDeliveryMark()).path === 'p2p';
     envelope.transport = transport.offer_path === 'p2p' || directResult ? 'p2p' : transport.offer_path;
     envelope.p2p = envelopeP2P({ ...context, p2pTransport: transport });
+
+    /**
+     * v0.9.6 individual memory: write what this machine just did, where the text still exists.
+     *
+     * This is the last point at which the output is available to anything that will keep it. The relay
+     * is sent `stdout_sha256` and `stdout_bytes` and never the text -- deliberately, so that a relay
+     * compromise discloses no command text and the ledger stays a consistency record rather than a
+     * transcript. The consequence is that a question like "what did we already try on this machine, and
+     * what happened?" had no answer anywhere in the fleet, and the same facts were rediscovered from
+     * scratch repeatedly at the cost of a dozen dispatches in one session.
+     *
+     * The write happens **after** the envelope is complete, so the record it stores is the same one the
+     * relay will judge -- not a second, independently assembled opinion about what happened.
+     *
+     * `appendMemory` never throws and its result is deliberately not returned or checked: the task is
+     * the work and this is a note about it, so a full disk or an unwritable directory must not turn a
+     * successful command into a failed task. A memory that can fail work is worse than no memory, and
+     * the failure mode is silent here on purpose -- the envelope's own fields already say what happened.
+     */
+    appendMemory(stateDir, memoryRecord({
+      envelope,
+      commandArgv,
+      cwdRel,
+      ms: (Date.parse(endedAt) - Date.parse(startedAt)) || 0,
+    }));
+
     return buildEnvelope(envelope);
   }
 

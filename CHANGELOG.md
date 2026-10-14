@@ -4,6 +4,76 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.6] — 2026-10-14
+
+**Individual memory: the fleet can now answer "what did we already try on this machine, and what happened?" — a question nothing in it could answer before.**
+
+### The gap this closes, measured rather than asserted
+
+The relay is sent `command_hash`, `stdout_sha256` and `stdout_bytes`, and never the text. That choice is
+defensible and stays: the ledger is a tamper-evident consistency record, and a relay compromise discloses
+no command text. The price was that no part of the fleet retained what a command actually did, and the
+price was paid over and over. In one working session the same facts were rediscovered from scratch across
+a dozen dispatches — that a machine had no package manager (3 times), which node binary actually ran (2),
+that its git could not reach github.com while node's HTTPS could (2), that a task is expired at about
+fifty seconds (3), and which commit its checkout was on (2).
+
+### What was added
+
+**`src/agent/memory.mjs` — one append-only `memory.jsonl` per machine, in its own state directory.**
+
+Written by the agent as each task finishes, at the one point where the output still exists at all and on
+the one machine that owns it. Each line carries the command, `cwd_rel`, exit code, status, duration,
+transport, and the tails of stdout and stderr — plus the envelope's hashes, so a human-readable record can
+be cross-checked against the relay's tamper-evident one without trusting either.
+
+Three properties are deliberate and each has a test:
+
+- **Bounded by construction**, with a byte cap and one rotating generation. This is not hypothetical
+  caution: the Linux host's root filesystem reached 100% today from 14.7 GB/day of uncapped logging, and
+  the recovery cost real time. A memory that can fill a disk is a worse outcome than no memory. Rotation
+  keeps the previous generation rather than discarding it, because the question this file answers is
+  usually about the recent past and the rotation boundary sits exactly there.
+- **A malformed line is skipped, not fatal.** A partially written final line is what a machine losing
+  power mid-append leaves behind, and one damaged line must not make the rest unreadable — the relay's own
+  ledger behaves this way for the same reason.
+- **`conclusion` is written as `null` by the machine and only ever filled in by a reader.** The design
+  separates fact from interpretation, and a machine that invented a conclusion would be asserting
+  something it cannot know. A test pins this, because the failure would be silent.
+
+**`w2m_memory` — the read side.** Returns this machine's memory, newest first, with a status tally, and
+reaches the rotated generation on request.
+
+It does **not** read another machine's memory, and says so instead of returning an empty list. The reason
+is structural rather than an omission: the relay carries no such file, and an agent executes a dispatched
+command inside a sandbox whose writes are scoped. A query for another machine is answered with
+`MEMORY_REMOTE_NOT_READABLE` and the two ways to actually read it. Returning `records: []` would have read
+as *"that machine has done nothing"* — the opposite conclusion from *"this build cannot see"*.
+
+The write is wrapped so it can never fail a task. The task is the work; this is a note about it.
+
+### Verified
+
+- `test/memory.test.mjs` — **18 tests, 0 failures**: record shape, tail and argv clamping, append-and-read,
+  newest-first ordering, the limit, a malformed line skipped, an absent file read as empty, rotation with
+  both generations readable, and that neither `appendMemory` nor `readMemorySync` throws on a bad directory.
+- A rotation test that trips the cap with *real* records rather than filler, because the first version
+  wrote eight megabytes of `'x'` — it rotated, but it could not answer the question being asked, since the
+  previous generation then held one unparseable line.
+- `eslint .` — 0 errors.
+- **The full pre-flight is green: 11 pass, 0 fail, 1 unverifiable** (1721 tests in 54 files; 1707 pass,
+  0 fail, 14 platform skips). The single `UNVERIFIABLE` is an accepted host observation, not a gate.
+  Reaching that required installing `git` on the development host, which had none; the 39 failures before
+  it were all `spawn git ENOENT`, and the two rounds of diagnosis after it were a sandbox rule (writing
+  files in `%TEMP%` is allowed, **creating a directory** there is refused — and `git init` creates one) and
+  two mojibake sequences this release then repaired. Recorded because "39 failures" read as a defect count
+  and was, at every stage, an environment count.
+- The nine-tool contract is updated everywhere it is pinned: `scripts/verify-installed.mjs`,
+  `test/loader-entry.test.mjs`, `test/tools.test.mjs`, `test/tool-cards.test.mjs`, `test/claims.test.mjs`,
+  `test/p2p-plugin.test.mjs`, `test/update-wiring.test.mjs` and the pre-flight gate inventory. Those
+  assertions are what make "the tool set" a contract rather than a habit, so leaving one at eight would
+  have failed a release that is otherwise correct.
+
 ## [0.9.5] — 2026-10-14
 
 **Same code as v0.9.4; published because v0.9.4's npm and GitHub bytes cannot be made to agree.**

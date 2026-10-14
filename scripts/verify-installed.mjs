@@ -64,6 +64,7 @@ const expected = [
   'w2m_status',
   'w2m_update',
   'w2m_wait',
+  'w2m_memory',
 ];
 const ok = registered.length === expected.length && expected.every((e) => names.includes(e));
 process.stdout.write(

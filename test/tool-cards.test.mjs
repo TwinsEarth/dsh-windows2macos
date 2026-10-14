@@ -104,7 +104,7 @@ async function register(config = {}) {
 describe('tool cards: the contract the shipped runtime actually implements', () => {
   it('gives every tool a presentCall that yields a generic card with a title', async () => {
     const tools = await register({ stateDir: makeProfile() });
-    assert.equal(tools.size, 8, 'the eight tools are the surface this contract covers');
+    assert.equal(tools.size, 9, 'the nine tools are the surface this contract covers');
     for (const [name, tool] of tools) {
       assert.equal(typeof tool.presentCall, 'function', `${name} needs a presentCall`);
       const card = tool.presentCall({});
@@ -418,7 +418,7 @@ describe('exposure boundary: a tool may not hold a credential, an allow-list or 
 });
 
 describe('exposure boundary: no tool result may carry a credential', () => {
-  it('returns none of the four credentials from any of the eight tools, and never puts one in a body', async () => {
+  it('returns none of the four credentials from any of the nine tools, and never puts one in a body', async () => {
     const fetchStub = installFetch([
       { method: 'GET', path: '/healthz', body: CANARY_HEALTHZ },
       { method: 'GET', path: '/v1/devices', body: CANARY_FLEET },
@@ -464,6 +464,10 @@ describe('exposure boundary: no tool result may carry a credential', () => {
         ['w2m_update', { action: 'status' }],
         ['w2m_history', { limit: 1 }],
         ['w2m_stats', {}],
+        // v0.9.6. Swept like the rest because it answers from a state directory that holds
+        // `device.json` -- exactly the kind of tool that could echo a credential back in a "here is
+        // what I found" field. It reports paths and its own records, never the device file's contents.
+        ['w2m_memory', {}],
       ];
 
       const results = [];
@@ -476,7 +480,7 @@ describe('exposure boundary: no tool result may carry a credential', () => {
         assert.equal(parsed.ok, true, `${name} must have run: ${text.slice(0, 200)}`);
         results.push([name, text]);
       }
-      assert.equal(results.length, 8, 'every registered tool must be swept, not a sample of them');
+      assert.equal(results.length, 9, 'every registered tool must be swept, not a sample of them');
 
       for (const [name, text] of results) {
         for (const canary of CANARIES) {

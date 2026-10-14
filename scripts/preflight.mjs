@@ -1974,7 +1974,7 @@ function checkPackAndTarball() {
       );
     }
 
-    // (d) the packed copy registers the eight tools -- executed from the extracted tarball, not the tree
+    // (d) the packed copy registers the nine tools -- executed from the extracted tarball, not the tree
     const extracted = join(staging, 'extracted');
     mkdirSync(extracted, { recursive: true });
     const skipped = extract(entries, extracted);
@@ -1988,19 +1988,19 @@ function checkPackAndTarball() {
     const verified = child('verify-installed', process.execPath, [probe, extracted]);
     if (!verified.ok) {
       return fail(
-        'scripts/verify-installed.mjs reported the packed copy does not register its eight tools',
+        'scripts/verify-installed.mjs reported the packed copy does not register its nine tools',
         tail(verified, 20),
       );
     }
     // `verify-installed.mjs` already compares the registered names to its own expected list and exits
     // non-zero on a mismatch. The count is parsed as well, and asserted here, because "the probe exited
-    // 0" and "the probe registered eight tools" are different measurements and only the second one is
+    // 0" and "the probe registered nine tools" are different measurements and only the second one is
     // the claim this check makes; a probe edited to exit 0 early would satisfy the first.
     const toolCount = Number(verified.stdout.match(/registered\s*:\s*(\d+)/)?.[1] ?? NaN);
-    if (toolCount !== 8) {
+    if (toolCount !== 9) {
       return fail(
         `the packed copy registered ${Number.isNaN(toolCount) ? 'an unreadable number of' : toolCount} tool(s), ` +
-          `not the eight this package documents`,
+          `not the nine this package documents`,
         tail(verified, 20),
       );
     }

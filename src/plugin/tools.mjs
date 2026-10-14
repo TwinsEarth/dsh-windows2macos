@@ -35,7 +35,7 @@
  * Everything in this file is callable by a model, against a fleet whose machines run commands under
  * their own allow-lists, and it holds an operator token that authorises dispatch fleet-wide. That
  * makes the *tool surface* a boundary, and this section is the boundary written down as it actually
- * is — not as it would sound best. `test/tool-cards.test.mjs` asserts the parts of it that can be
+ * is  - not as it would sound best. `test/tool-cards.test.mjs` asserts the parts of it that can be
  * asserted mechanically, and a change that crosses it is meant to turn that suite red.
  *
  * **No tool parameter names a credential, an allow-list, a key path, or a state directory.** There is
@@ -49,7 +49,7 @@
  * and is applied in one direction only: {@link checkAllowedCommand} returns a refusal or `null`, and
  * there is no path in this file that adds an entry to the list. Each target machine's own agent
  * re-decides the same gate against its own list, so a dispatcher that lost this check would still not
- * widen anything — the direction the shared matcher exists to keep honest (`src/agent/allowed-commands.mjs`).
+ * widen anything  - the direction the shared matcher exists to keep honest (`src/agent/allowed-commands.mjs`).
  *
  * **No tool can change a machine's `p2pMode`.** The mode is resolved once, in `readConfig` at
  * `apply()` time, from the config object or `W2M_P2P_MODE`, and every dispatch publishes it as a fact
@@ -58,19 +58,19 @@
  * weaker path, which is the one place a dispatcher could otherwise have quietly downgraded a peer.
  *
  * **No tool writes another machine's identity or keys.** `device.json` is read (`readDevice`) and
- * `device.key` is loaded (`DeviceKey.load`) — neither is ever written here. What a dispatch publishes
+ * `device.key` is loaded (`DeviceKey.load`)  - neither is ever written here. What a dispatch publishes
  * is this machine's own **public** key inside `p2p.static_keys`, so the executor can authenticate a
  * dial; the private half never leaves `src/agent/crypto.mjs`.
  *
  * **No tool result carries a token or a key.** `w2m_status` reports `paired`,
  * `operatorToken_configured` and `pairingCode_configured` as booleans and never the values. The
- * operator token travels only in the `Authorization` header of `POST /v1/task` — never in the request
- * body and never in an answer — and `direct_pushes[].static_key` is the literal marker `'published'`,
+ * operator token travels only in the `Authorization` header of `POST /v1/task`  - never in the request
+ * body and never in an answer  - and `direct_pushes[].static_key` is the literal marker `'published'`,
  * not the key it describes.
  *
  * What an agent-facing tool *may* do across machines is bounded and stated: ask the machines the relay
  * leased a task to run one argv inside their own allow-lists, in their own copy of the project,
- * read-only unless `write: true` names a `write_scope`, and report what they said — refusals
+ * read-only unless `write: true` names a `write_scope`, and report what they said  - refusals
  * included, as values.
  *
  * # `@deepseek-ai/dsh-tools` and the offline fallback
@@ -93,6 +93,11 @@ import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+// The individual memory layer (v0.9.6). Read through the agent's own module rather than re-parsing the
+// file here: the reader carries the rules that matter -- newest-first by file position, a malformed line
+// skipped rather than fatal, and the rotated generation reachable -- and a second implementation would
+// drift from the writer's shape without anything failing.
+import { readMemorySync } from '../agent/memory.mjs';
 
 // The base-address rules live in one place (§2), shared with the agent side. Importing the - rather
 // than re-deriving them her - is what stops the plugin and the agent from disagreeing about what
@@ -227,8 +232,8 @@ const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
  * `w2m_status` as message prefixes.
  *
  * A code is added only when it names a *distinct remedy*. `W2M_CONFIG` still covers a malformed
- * setting at large; the credential gate below has its own code because its remedy — set
- * `operatorToken` — is unlike any other configuration fault's.
+ * setting at large; the credential gate below has its own code because its remedy  - set
+ * `operatorToken`  - is unlike any other configuration fault's.
  */
 export const REFUSAL_CODE = Object.freeze({
   /** The dispatch pre-flight found the command outside this plugin's `allowedCommands`. */
@@ -267,7 +272,7 @@ export const REFUSAL_CODE = Object.freeze({
   /** Storing a result frame failed, so the result exists only on the sender. */
   P2P_INBOX_WRITE_FAILED: 'P2P_INBOX_WRITE_FAILED',
   /**
-   * The composer's selected target routed this dispatch. Not a refusal — a named *reason*, so the
+   * The composer's selected target routed this dispatch. Not a refusal  - a named *reason*, so the
    * routing decision is greppable in the answer instead of being a bare `applied: true`.
    */
   SELECTION_APPLIED: 'SELECTION_APPLIED',
@@ -577,7 +582,7 @@ function readConfig(config = {}) {
   /**
    * §7: where the relay address came from.
    *
-   * The order is `rabbitUrl` → `W2M_RABBIT_URL` → the shared server, and the *source* is carried out
+   * The order is `rabbitUrl` 鈫?`W2M_RABBIT_URL` 鈫?the shared server, and the *source* is carried out
    * of here rather than re-derived at report time, because "which of the three won" is exactly the
    * question a cross-network deployment gets wrong: a machine that silently talked to the shared
    * server instead of the operator's own relay looks identical to a working one until it dispatches
@@ -709,7 +714,7 @@ function readConfig(config = {}) {
 }
 
 /**
- * Resolve `p2pMode` from the config object, then `W2M_P2P_MODE`, then the default — loudly.
+ * Resolve `p2pMode` from the config object, then `W2M_P2P_MODE`, then the default  - loudly.
  *
  * A value that is present and wrong is a `W2M_CONFIG` error naming the setting: falling back to
  * `auto` would dispatch work over a path the operator explicitly asked not to use, and falling back
@@ -717,7 +722,7 @@ function readConfig(config = {}) {
  * decisions the operator has to make.
  *
  * "Present" is decided by the *key*, not by truthiness. A profile patch that writes `p2pMode:` with
- * nothing after it hands this function `null`, and that is a value somebody typed — collapsing it
+ * nothing after it hands this function `null`, and that is a value somebody typed  - collapsing it
  * into "the key is absent" is exactly the silent default this function exists to refuse. An unset key
  * and a blank `W2M_P2P_MODE` are the only two shapes that mean "nobody chose", and only the second is
  * treated as absent because an unset environment variable is indistinguishable from an empty one.
@@ -753,12 +758,12 @@ function resolveP2PMode(config) {
  * Every entry is validated here, before the node is built, because the alternative is a tick several
  * seconds later inside the node's announce loop: an unusable STUN entry is a configuration mistake,
  * and this project reports those at the call site rather than as a degraded status field. The rule
- * itself is `parseServer` from `src/agent/stun.mjs` — the same function the query path will use, so
+ * itself is `parseServer` from `src/agent/stun.mjs`  - the same function the query path will use, so
  * "valid here" and "usable there" cannot drift.
  *
  * An **empty list is the default**, not an error. `stunServers: []` is what the bundled
  * `cordis.patch.yml` carries (a key that documents itself and names no server), and a profile that
- * starts from that file must not fail to load. `null` entries are dropped for the same reason — a
+ * starts from that file must not fail to load. `null` entries are dropped for the same reason  - a
  * YAML list with a blank item is the same statement as a blank item in a profile patch. A list whose
  * entries are *wrong* is still refused: there is a difference between "nothing named" and "the wrong
  * thing named", and only the second is a mistake.
@@ -985,7 +990,7 @@ function resolveProfileDir(config) {
 /**
  * Require the Rabbit URL, naming the setting when it is absent.
  *
- * With §7's shared-server default this can no longer be reached by "the operator set nothing" — an
+ * With §7's shared-server default this can no longer be reached by "the operator set nothing"  - an
  * unset `rabbitUrl` resolves to {@link SHARED_SERVER}. It stays as the last-resort guard so that a
  * future edit which clears the field fails with a sentence naming it instead of an `Invalid URL`
  * from somewhere deep in `fetch`.
@@ -1042,7 +1047,7 @@ function devicePathFor(cfg) {
  *
  * {@link readDevice} answers from a `stateDir` and is the tool-facing reader; this one adds the
  * `DSH_HOME` fallback (an unset `stateDir` is the documented default layout, not an error) and turns
- * every failure into a `machine_id` of null plus an `error` — a machine whose identity cannot be read
+ * every failure into a `machine_id` of null plus an `error`  - a machine whose identity cannot be read
  * must still be able to dispatch, because the relay path does not need an identity at all.
  *
  * @param {ReturnType<typeof readConfig>} cfg
@@ -1082,8 +1087,8 @@ function safeFilePart(value) {
  *
  * Deliberately *not* the relay's own `jcs` (that would make this file depend on relay internals for
  * a two-line need). The digest here is only an integrity check of what this process stored, so the
- * rule is local by definition; the value that has to match another process byte for byte — the
- * dedupe key — is the one imported from the relay instead.
+ * rule is local by definition; the value that has to match another process byte for byte  - the
+ * dedupe key  - is the one imported from the relay instead.
  *
  * @param {unknown} value
  * @returns {string}
@@ -1099,9 +1104,9 @@ function canonicalJson(value) {
 /**
  * Does `frame` name both halves of the inbox key?
  *
- * A frame without a `task_id` or without a `machine_id` cannot be stored or acknowledged — the
+ * A frame without a `task_id` or without a `machine_id` cannot be stored or acknowledged  - the
  * acknowledgement is keyed by `task_id`, and two machines answering the same task must not overwrite
- * each other — so it is refused by name instead of being written somewhere surprising.
+ * each other  - so it is refused by name instead of being written somewhere surprising.
  *
  * Both halves of the refusal are returned: `reason` is the `CODE: sentence` string this has always
  * produced (it is what `w2m_status` shows), `reason_code` is the same code as a field, so a reader
@@ -1159,7 +1164,7 @@ async function writeFileAtomic(dir, file, text) {
  * Count the stored result frames.
  *
  * Depth is read from the directory rather than tracked in memory, so it answers the question that
- * actually matters — "is there anything here I have not consumed" — across a plugin reload. A
+ * actually matters  - "is there anything here I have not consumed"  - across a plugin reload. A
  * missing directory is depth 0, not an error: the inbox exists only once something has arrived.
  *
  * @param {string|null} dir
@@ -1233,7 +1238,7 @@ function createP2PTransport(cfg) {
  *
  * A dispatcher behind a symmetric NAT (CGNAT, in practice) can send all it likes and still be heard
  * by nobody: its outbound HELLO opens its own mapping, but the peer's filter stays shut until
- * *something of the peer's* has gone the other way. So the executor has to dial first — and to dial
+ * *something of the peer's* has gone the other way. So the executor has to dial first  - and to dial
  * it needs two things the offer itself can carry: where the dispatcher says it is, and which punch
  * to join. Without them the executor has only the relay lookup, which is a second opinion about the
  * same machine that answers 404 for a dispatcher whose announcement has just expired.
@@ -1241,14 +1246,14 @@ function createP2PTransport(cfg) {
  * WHY A PUNCH ID RATHER THAN A SESSION ID
  *
  * The session id cannot be known when this request is written: one dispatch leases one task to
- * several machines, and the relay decides which — in the same request that mints the task id. A
+ * several machines, and the relay decides which  - in the same request that mints the task id. A
  * single session shared by those machines would be a defect, not a simplification: on the
  * dispatcher's own node the second machine's HELLO would look like a re-acknowledgement of the
  * first machine's live channel, so one of them would have its result delivered to the other's
  * address. The block therefore publishes a per-dispatch *punch id*, and both ends derive the same
  * per-machine session from it (`punchSession` in `src/agent/p2p.mjs`): the dispatcher from the
- * lease, the executor from the offer plus its own machine id. The pushed frame — which is addressed
- * to one machine, so the value *is* known — carries the derived `session` as well.
+ * lease, the executor from the offer plus its own machine id. The pushed frame  - which is addressed
+ * to one machine, so the value *is* known  - carries the derived `session` as well.
  *
  * COMPATIBILITY
  *
@@ -1264,11 +1269,11 @@ function createP2PTransport(cfg) {
  * WHY A MAP RATHER THAN ONE KEY
  *
  * The executor needs the *dispatcher's* key before it can dial back, and the dispatcher needs the
- * *executor's* key before it can push — and at dispatch time the relay has not yet said which
+ * *executor's* key before it can push  - and at dispatch time the relay has not yet said which
  * machines the task went to (`leases` come back in the same response that creates it). So the block
  * carries this machine's own key, which is known before the request is written, and
  * {@link offerP2PFor} adds the target's once the lease names it. Reading the field is therefore
- * "look up the machine you are about to talk to", never "assume the only entry is the peer" — a
+ * "look up the machine you are about to talk to", never "assume the only entry is the peer"  - a
  * machine that receives an offer for a fleet of three has three entries and uses one.
  *
  * What that buys, in the document's own terms: no `[Peer]` block for anyone to fill in. A machine
@@ -1295,7 +1300,7 @@ function buildP2POfferBlock(cfg, runtime) {
     block.candidates = candidates.map((candidate) => ({ address: candidate.address, port: candidate.port }));
   }
   // This machine's own static public key. Absent (not null) when there is none, so the wire stays
-  // byte-identical to v0.5.x for a machine that has no key — an additive change has to be absent to
+  // byte-identical to v0.5.x for a machine that has no key  - an additive change has to be absent to
   // be additive.
   const own = runtime?.encryption?.public_key;
   const machineId = runtime?.machineId;
@@ -1311,7 +1316,7 @@ function buildP2POfferBlock(cfg, runtime) {
  * The added `session` is what makes the push and a reverse dial one punch rather than two: an
  * executor that received the offer over a channel may still have to dial back (the dispatcher closes
  * the channel it pushed over, immediately after the push), and a dial carrying a session the
- * dispatcher is not filtering for would be answered by its `accept()` at best — a second session,
+ * dispatcher is not filtering for would be answered by its `accept()` at best  - a second session,
  * a second channel, and two live sessions for one task where one would do.
  *
  * v0.6.0 adds the *target's* key to `static_keys` when the caller supplies one, which is the half of
@@ -1343,8 +1348,7 @@ function offerP2PFor(published, { taskId, machineId, peerKey = null }) {
  *
  * The executor decides whether an offer is a first delivery or a duplicate on `dedupe_key` +
  * `attempt` (§6), and the relay emits its own SSE offer with those exact values. A push that
- * disagreed by one character would make the machine execute the task twice — once from each path —
- * so the dedupe key is computed with the relay's own {@link computeDedupeKey}/{@link computeCommandHash},
+ * disagreed by one character would make the machine execute the task twice  - once from each path  -  * so the dedupe key is computed with the relay's own {@link computeDedupeKey}/{@link computeCommandHash},
  * from the same `task_id`, `index`, `command_hash` inputs and `base_tree` the task was created with,
  * and `machine_id`/`index`/`attempt` come from the lease rather than from the caller's arguments.
  *
@@ -1419,7 +1423,7 @@ function buildOfferFrame({ taskId, lease, payload, originMachineId, peerKey = nu
 /**
  * Push one offer over the direct path. Best effort by construction: nothing here throws.
  *
- * The session comes from the frame's own `p2p.session` — minted per machine by
+ * The session comes from the frame's own `p2p.session`  - minted per machine by
  * {@link offerP2PFor} from the punch id the relay is publishing for this same task. Dialling with a
  * session of the node's own invention would leave the two ends on two sessions, and an executor
  * whose reverse dial happened to arrive first would open a *second* channel beside this one instead of
@@ -1449,7 +1453,7 @@ async function pushOffer(node, frame, crypto = {}) {
   }
   // The dial's own options, built here rather than inline because the *presence* of `crypto` is the
   // decision: `P2PNode.dial` arms a handshake only when this dispatcher holds a key for that peer, and
-  // a peer with no published key is dialled exactly as v0.5.x dialled it — plaintext, recorded, and
+  // a peer with no published key is dialled exactly as v0.5.x dialled it  - plaintext, recorded, and
   // never a failure. That is §4's fallback clause applied to the push: a fleet must never lose a
   // machine to a security upgrade. It is not a silent downgrade, because the peer never offered a key
   // to downgrade *from*; a peer whose key we hold and whose handshake fails produces `ok: false` and
@@ -1505,14 +1509,14 @@ async function pushOffer(node, frame, crypto = {}) {
  *
  * Called after the relay has created the task, so the relay's own SSE offer has already gone out:
  * this is an *additional* delivery over the faster path, and the relay's copy is what makes a failed
- * push harmless. Only leases in a runnable state are pushed — `refused` and `observing` machines
+ * push harmless. Only leases in a runnable state are pushed  - `refused` and `observing` machines
  * were never handed the command, and sending them an offer would be asking them to run work the
  * relay decided they must not run.
  *
  * v0.6.0: each target's static key is fetched from the relay's peer record before the push, which is
  * the one moment the dispatcher learns the key of a machine it did not already know. It is fetched
  * **here** rather than sourced from the stored `p2p` block because the block is written *before* the
- * relay decides which machines the task goes to — the offer that carries the key is the one addressed
+ * relay decides which machines the task goes to  - the offer that carries the key is the one addressed
  * to the machine that key belongs to. A missing key is not an error: the push proceeds and the
  * executor records `P2P_CRYPTO_NO_KEY` for its plaintext channel, which is the documented outcome for
  * a peer that never announced.
@@ -1520,7 +1524,7 @@ async function pushOffer(node, frame, crypto = {}) {
  * @param {P2PNode} node
  * @param {object} options
  * @returns {Promise<Array<object>>} One entry per lease considered, in lease order. A machine that was
- *   not pushed to carries `ok: false` **and** a `reason_code` naming which gate refused it — this
+ *   not pushed to carries `ok: false` **and** a `reason_code` naming which gate refused it  - this
  *   block is a tool result, so a bare boolean here would be exactly the reduction the verdicts refuse.
  */
 async function pushOffers(node, { taskId, leases, payload, originMachineId, getJson = null }) {
@@ -1574,7 +1578,7 @@ async function pushOffers(node, { taskId, leases, payload, originMachineId, getJ
       // logs side by side. `null` when there was nothing to punch over (a v0.4.x-shaped frame).
       session: result.session,
       // True when the executor's dial got there first and this push travelled over the channel that
-      // dial opened — a two-way punch that worked, reported as such rather than as a plain push.
+      // dial opened  - a two-way punch that worked, reported as such rather than as a plain push.
       reused: result.reused === true,
       // v0.6.0: whether the offer actually travelled sealed, and why not when it did not. Reported
       // per machine because it is a per-machine fact: one peer can be encrypted and the next one a
@@ -1618,19 +1622,19 @@ async function readPeerStaticKey(getJson, machineId) {
  * WHEN THE NODE STARTS, AND WHY IT IS NOT `apply()`
  *
  * The v0.4.0 contract says the node is "started in `apply()`". It is not, and this is the one place
- * this file departs from the contract's letter rather than its intent — reported as a deviation, not
+ * this file departs from the contract's letter rather than its intent  - reported as a deviation, not
  * settled quietly here. What *is* kept is everything the sentence is about: the direct path is owned
  * for the plugin's whole lifetime, it is disposed by a `ctx.effect` disposer, and a failure to start
  * is a field in `w2m_status` rather than an exception at load.
  *
  * The reason for the change is what "start" costs. Starting this node binds a UDP socket and kicks
- * off a STUN sweep against four servers — network traffic with a multi-second tail — for a machine
+ * off a STUN sweep against four servers  - network traffic with a multi-second tail  - for a machine
  * that may never dispatch a task in that session. `apply()` runs on every session in a host that
  * mounts this plugin, so an unconditional start is a rendezvous per session, and it puts traffic
  * into every test and every host whose runtime is deterministic about what it sends. `ensureStarted()`
  * therefore does the work the first time a tool actually needs the direct path: a dispatch
  * (`w2m_run`) or a question about it (`w2m_status`). A machine that never dispatches never punches,
- * which is also the more honest reading of §1 — "never dials" is the property that matters, and this
+ * which is also the more honest reading of §1  - "never dials" is the property that matters, and this
  * is closer to it than an announce nobody asked for.
  *
  * @param {object|null} ctx Cordis context; `ctx.effect` is used when present.
@@ -1674,7 +1678,7 @@ function createP2PRuntime(ctx, cfg, block = {}) {
      *
      * Assigned before the relay-mode early return so the tools can call it unconditionally: a caller
      * asks "is the direct path ready" and gets an answer either way, instead of having to know which
-     * mode it is in — the defect this shape fixes was a `relay`-mode dispatch calling a method that did
+     * mode it is in  - the defect this shape fixes was a `relay`-mode dispatch calling a method that did
      * not exist, which is a crash in the mode that is supposed to be the safe one.
      *
      * @type {() => Promise<object>}
@@ -1722,7 +1726,7 @@ function createP2PRuntime(ctx, cfg, block = {}) {
  *
  * Never throws. A caller cannot fix an unreadable key file from a tool call, and a dispatch that
  * refused because a *security upgrade* could not complete would be exactly the fleet-losing failure
- * §4 forbids — so the failure becomes a reason string, the node runs without a key, and every offer
+ * §4 forbids  - so the failure becomes a reason string, the node runs without a key, and every offer
  * this machine publishes is plainly labelled as having none.
  *
  * @param {object|null} injected Test seam: a `DeviceKey`, or null to use the file.
@@ -1823,7 +1827,7 @@ async function initP2P(ctx, cfg, runtime, block) {
   /**
    * Ownership: one node, one effect, one disposer.
    *
-   * Registered *here*, after the node exists, rather than in `createP2PRuntime` — an effect that owns
+   * Registered *here*, after the node exists, rather than in `createP2PRuntime`  - an effect that owns
    * nothing is a disposer that releases nothing, and `relay` mode and a machine with no identity must
    * leave the host's effect list exactly as they found it. A host that provides no `ctx.effect` (an
    * older Cordis, or a bare test context) still gets a working node: the node itself is asked not to
@@ -1832,7 +1836,7 @@ async function initP2P(ctx, cfg, runtime, block) {
    * default.
    *
    * v0.5.10: `node.unref()` is a real call, not a description. Until it was added this comment
-   * claimed an `unref()` that existed nowhere in the plugin or the node — the socket went on holding
+   * claimed an `unref()` that existed nowhere in the plugin or the node  - the socket went on holding
    * the event loop, so a host without `ctx.effect` that started a node never exited (found by an
    * independent verifier against the `w2m_status` test's bare context).
    */
@@ -1863,13 +1867,13 @@ async function initP2P(ctx, cfg, runtime, block) {
  * Store one JSON frame that arrived over a direct channel, and acknowledge it.
  *
  * The writer is deliberately strict. A frame that is not a JSON object, or that names no
- * `task_id`/`machine_id`, is refused and **nothing** is written — an inbox file is the only durable
+ * `task_id`/`machine_id`, is refused and **nothing** is written  - an inbox file is the only durable
  * trace of a peer's result, and a file whose name does not identify its contents is worse than no
  * file, because the next reader cannot tell a partial result from a complete one.
  *
  * `task.result` is the frame this exists for; `result.ack` and anything else a peer might send are
  * counted and ignored rather than treated as faults. The acknowledgement goes back on the same
- * channel the frame arrived on, and a failed acknowledgement is recorded — the sender retries (the
+ * channel the frame arrived on, and a failed acknowledgement is recorded  - the sender retries (the
  * channel is reliable) and the file is already on disk, so a lost ack must not lose the result.
  *
  * @param {object} runtime
@@ -1930,7 +1934,7 @@ async function handleP2PMessage(runtime, event) {
     task_id: frame.task_id,
     frame,
     // A digest of the stored copy, so a reader can tell "the file changed under me" from "the peer
-    // sent something else". Not a signature — the channel is not authenticated at this layer.
+    // sent something else". Not a signature  - the channel is not authenticated at this layer.
     frame_sha256: createHash('sha256').update(canonicalJson(frame)).digest('hex'),
   };
   const file = path.join(
@@ -1970,7 +1974,7 @@ async function handleP2PMessage(runtime, event) {
  *
  * Every field is present on every call, including when the direct path is off: a reader must be able
  * to tell "relay mode" from "p2p was requested and could not start" without comparing two calls.
- * `null` is used for "never measured", never 0 — the same rule the rest of this file follows for RTT.
+ * `null` is used for "never measured", never 0  - the same rule the rest of this file follows for RTT.
  *
  * @param {ReturnType<typeof readConfig>} cfg
  * @param {object} runtime
@@ -2012,7 +2016,7 @@ async function readP2PStatus(cfg, runtime, peersAnnounced = null) {
     // v0.6.0: the crypto facts, named one by one rather than mirrored wholesale. `enabled` is about
     // *this* machine's key; `encrypted_channels` and `plaintext_channels` are about the channels it
     // has actually made, and they can both be non-zero on a mixed fleet. `error` is the reason there
-    // is no key when there is none — a reader has to be able to tell "this build has no crypto" from
+    // is no key when there is none  - a reader has to be able to tell "this build has no crypto" from
     // "the key file is unreadable" without reading a log.
     encryption: {
       enabled: runtime.encryption?.enabled === true,
@@ -2504,7 +2508,7 @@ async function request(options) {
   }
 
   // §2: base + path, joined by hand. `new URL(pathname, base)` would resolve against the origin
-  // and drop a deployment sub-path (`https://h/w2m` + `/v1/task` 鈫?`https://h/v1/task` 鈫?404).
+  // and drop a deployment sub-path (`https://h/w2m` + `/v1/task` —?`https://h/v1/task` —?404).
   const target = toRequestUrl(joinUrl(rabbitUrl, pathname));
   for (const [key, value] of Object.entries(query ?? {})) {
     if (value !== undefined && value !== null) target.searchParams.set(key, String(value));
@@ -2584,8 +2588,8 @@ function endpointOf(target) {
  * Two sources, and the distinction is the point. An explicit `stateDir` is the operator pointing at
  * a pairing, so a missing or unreadable `device.json` there is **named as the fault** rather than
  * being turned into a mystery `401`. With no `stateDir`, this machine's own identity lives where the
- * agent writes it by default — `$DSH_HOME/xclient/device.json`, the same file {@link readLocalIdentity}
- * reads — and the calls go out with it. v0.4.0 made that fallback load-bearing rather than optional:
+ * agent writes it by default  - `$DSH_HOME/xclient/device.json`, the same file {@link readLocalIdentity}
+ * reads  - and the calls go out with it. v0.4.0 made that fallback load-bearing rather than optional:
  * every P2P announcement is authenticated as the announcing device, so a machine whose identity was
  * only reachable through `DSH_HOME` would have had a permanently unauthenticated rendezvous and a
  * direct path that never worked, while the relay path kept working and hid the reason.
@@ -2655,8 +2659,7 @@ async function readDevice(cfg) {
 /**
  * Require a `device_token`, naming where it was looked for when it is absent.
  *
- * The `code` stays `W2M_NO_TOKEN` for every case — one class, "this machine cannot authenticate" —
- * while `reason_code` names which of the three it is, because the three have different remedies: pair
+ * The `code` stays `W2M_NO_TOKEN` for every case  - one class, "this machine cannot authenticate"  -  * while `reason_code` names which of the three it is, because the three have different remedies: pair
  * the agent, repair the file, or finish a pairing that never completed.
  *
  * @param {{machine_id: string|null, device_token: string|null, path: string|null, present: boolean, error: string|null}} device
@@ -2817,13 +2820,13 @@ async function resolveTreeFingerprint(projectDir, timeoutMs) {
  * resolving a path, and a pre-flight that strips the path can only ever compare names, so it would
  * wave `E:\Temp\evil\node.exe` through while the agent refused it. Passing the argv through
  * unchanged is what keeps the two ends one rule. What the shared matcher then resolves, it resolves
- * against **this** process's environment — the dispatcher's PATH — which is a real limit of a
+ * against **this** process's environment  - the dispatcher's PATH  - which is a real limit of a
  * pre-flight (the executing machine's PATH is the one that will decide), and the reason the refusal
  * that matters is the agent's own.
  *
  * A refusal names itself: `reason_code` is the matcher's own code (so the two ends cannot report one
  * refusal under two spellings) and `detail` says what would change it. The two ways this control
- * refuses are kept apart — a command outside the list and a list that cannot be parsed have
+ * refuses are kept apart  - a command outside the list and a list that cannot be parsed have
  * different remedies, and sharing one code would send the reader to the wrong one.
  *
  * @param {string[]} allowedCommands Entries as configured, e.g. `['node --test']`.
@@ -2903,7 +2906,7 @@ function compactEnvelope(raw, comparable) {
 function excerpt(value) {
   const buffer = Buffer.from(value, 'utf8');
   if (buffer.byteLength <= MAX_EXCERPT_BYTES) return value;
-  return `${buffer.subarray(0, MAX_EXCERPT_BYTES).toString('utf8')}\n - truncated at ${MAX_EXCERPT_BYTES} bytes]`;
+  return `${buffer.subarray(0, MAX_EXCERPT_BYTES).toString('utf8')}\n - …[truncated at ${MAX_EXCERPT_BYTES} bytes]`;
 }
 
 /**
@@ -2952,7 +2955,7 @@ const OPTIONAL_FIELDS = new Set([
   'lockfiles', 'unpinned_deps', 'submodules', 'lfs', 'signal',
   // v0.4.0 §5: how the envelope travelled, and the path facts that came with it. Optional because a
   // v0.3.9 agent sends neither and must keep working unchanged; here rather than in
-  // `COMPARABLE_FIELDS` because **a path is not a result** — two byte-identical runs on two machines
+  // `COMPARABLE_FIELDS` because **a path is not a result**  - two byte-identical runs on two machines
   // must stay `consistent` when one of them punched a hole and the other used the relay.
   'transport', 'p2p',
 ]);
@@ -3164,7 +3167,7 @@ export async function apply(ctx, config = {}) {
   //
   // Composed here, next to the updater's own `ctx.effect`, and for the same reason: a socket and a
   // refresh timer have to be released when the plugin is unloaded, and an effect disposer is the
-  // only mechanism Cordis gives for that. Creating it never throws — a machine that cannot punch
+  // only mechanism Cordis gives for that. Creating it never throws  - a machine that cannot punch
   // still has to dispatch, and `w2m_status` is where the failure is reported.
   const p2p = createP2PRuntime(ctx, cfg, config.p2pBlock);
 
@@ -3180,14 +3183,13 @@ export async function apply(ctx, config = {}) {
   });
 
   // v0.6.1: the two browser routes behind the composer's target control. Additive and optional: a
-  // host without `connection.fetch` still gets every tool, and `w2m_status` reports the absence —
-  // which is the honest place for it, since a host that has no Connection at all is simply not a web
+  // host without `connection.fetch` still gets every tool, and `w2m_status` reports the absence  -   // which is the honest place for it, since a host that has no Connection at all is simply not a web
   // composition and does not need a warning on every headless run.
   //
   // Nothing here reads the service: `registerTargetRoutes` declares the optional dependency with
   // `ctx.inject` and attaches from that callback (the comment there records why a plain
   // `ctx.connection` read fails the whole entry, and why the read cannot be synchronous anyway). The
-  // one mismatch worth a log line — a Connection that carries no fetch registry — is logged where it
+  // one mismatch worth a log line  - a Connection that carries no fetch registry  - is logged where it
   // is observed, inside that callback, so this call returns a status object that stays live.
   const targetRoutes = registerTargetRoutes(ctx, {
     cfg: () => cfg,
@@ -3580,7 +3582,7 @@ export async function apply(ctx, config = {}) {
       //
       // The precedence rule is the whole contract, and it is one line: **the caller's own fields
       // always win**. `executor_machine_id` is checked below, and `target_machines` is never a tool
-      // argument — so a caller that named a machine (which, for this tool, means
+      // argument  - so a caller that named a machine (which, for this tool, means
       // `executor_machine_id` under broadcast) is untouched, and a caller that named none inherits
       // the selection. Nothing already published changes meaning: the selection only fills fields
       // that were absent, and the relay has accepted both of them since v0.3.3/v0.4.1.
@@ -3605,7 +3607,7 @@ export async function apply(ctx, config = {}) {
        * `applied` alone conflates three different situations an operator has to tell apart: nothing
        * was selected, the selection was overridden by the call's own `executor_machine_id`, or a
        * selection exists that names no machine at all and therefore routed nothing. The last one is
-       * the one that used to be invisible — a stored selection with no `machine_id` produces
+       * the one that used to be invisible  - a stored selection with no `machine_id` produces
        * `applied: false` and nothing else, which looks exactly like "the whole fleet ran it".
        */
       const selectionReason = selection === null
@@ -3692,14 +3694,14 @@ export async function apply(ctx, config = {}) {
 
       // §7: the two routing facts the offer carries to the machine that has to run the command.
       //
-      // `origin_machine_id` is *this* machine's id from `device.json` — where the work was typed, not
-      // where it runs — and it is omitted entirely (not sent as null) when this machine has no
+      // `origin_machine_id` is *this* machine's id from `device.json`  - where the work was typed, not
+      // where it runs  - and it is omitted entirely (not sent as null) when this machine has no
       // identity, because the relay's own validation refuses an empty string and "unknown origin" is
       // what a missing field already means on the wire.
       //
       // The identity comes from the runtime, which resolves it off the dispatch path; a dispatch that
       // arrives before that one small read has finished waits for it rather than racing it. The wait
-      // is bounded by the identity read itself and can never reject — see `createP2PRuntime`. This is
+      // is bounded by the identity read itself and can never reject  - see `createP2PRuntime`. This is
       // also the first use of the direct path, so it is where the node is started.
       await p2p.ensureStarted();
       const originMachineId =
@@ -3742,7 +3744,7 @@ export async function apply(ctx, config = {}) {
         // above refuses the combination, so this can never silently mean nothing.
         ...(mode === 'pipeline' && stagesPayload !== null ? { stages: stagesPayload } : {}),
         // v0.4.0: stated on every task, so `w2m_wait`'s `transport` and a machine's report can say
-        // which path the dispatcher expected to use — and so the executor in `direct` mode knows it
+        // which path the dispatcher expected to use  - and so the executor in `direct` mode knows it
         // must refuse an offer that did not arrive over the direct path.
         ...(originMachineId !== null ? { origin_machine_id: originMachineId } : {}),
         p2p: p2pOffer,
@@ -3788,7 +3790,7 @@ export async function apply(ctx, config = {}) {
        * so a push that fails, a peer that never announced and a socket that was never bound all leave
        * exactly the same outcome: the relay's own SSE offer is the delivery, and the machine's
        * `transport` says which path won. A failed push is therefore **not** an error and never fails
-       * this tool — but it is not hidden either, because `direct_pushes` names every attempt and the
+       * this tool  - but it is not hidden either, because `direct_pushes` names every attempt and the
        * reason it did not land.
        *
        * `relay` mode and a machine with no direct path both report `attempted: 0`, which is the
@@ -3823,7 +3825,7 @@ export async function apply(ctx, config = {}) {
             failed: pushes.filter((entry) => !entry.ok).length,
             pushes,
             // How many of the machines that were reached were reached over a channel *this* machine
-            // did not open — the executor dialled first, and the push landed on that path. Zero on a
+            // did not open  - the executor dialled first, and the push landed on that path. Zero on a
             // fleet where only the dispatcher initiates, which is what makes the two-way punch
             // visible in one dispatch's own answer instead of only in the ledger.
             reused_channels: pushes.filter((entry) => entry.reused === true).length,
@@ -4023,7 +4025,7 @@ export async function apply(ctx, config = {}) {
                * v0.4.0 §5: which path this machine's result travelled, and the path facts that came
                * with it. Read from the envelope because that is where the agent writes them, with the
                * per-machine record as the fallback (`GET /v1/tasks/{id}` copies both onto the machine
-               * entry as well). `null` means the machine did not say — which is exactly what a
+               * entry as well). `null` means the machine did not say  - which is exactly what a
                * v0.3.9 agent sends, so a missing value must not be dressed up as `'relay'`.
                */
               transport: envelope?.transport ?? machine?.transport ?? null,
@@ -4223,7 +4225,7 @@ export async function apply(ctx, config = {}) {
       const rtt = await readRtt(cfg);
       // §7: this tool is one of the two places the direct path is asked about, so it is one of the
       // two places the node is started. Never throws, and reports `enabled: false`/`running: false`
-      // rather than omitting itself — a reader has to be able to tell "relay mode" from "p2p was
+      // rather than omitting itself  - a reader has to be able to tell "relay mode" from "p2p was
       // requested and did not start".
       await p2p.ensureStarted();
       const p2pStatus = await readP2PStatus(cfg, p2p, Number.isInteger(relay.peers_announced) ? relay.peers_announced : null);
@@ -4303,8 +4305,8 @@ export async function apply(ctx, config = {}) {
           /**
            * v0.6.1: the composer's target control and the selections it holds.
            *
-           * Reported here because "the control is not in my composer" has exactly two causes — the
-           * host has no fetch-route registry, or the browser half is not loaded — and this is the
+           * Reported here because "the control is not in my composer" has exactly two causes  - the
+           * host has no fetch-route registry, or the browser half is not loaded  - and this is the
            * one call that can tell them apart from the host side. The selections themselves are
            * counts, not contents: which session picked which machine is the operator's business and
            * nothing the model needs.
@@ -4336,8 +4338,7 @@ export async function apply(ctx, config = {}) {
      * v0.8.5: **say it out loud.**
      *
      * This branch is the whole reason a machine can run v0.8.4 with the account-derived fleet key,
-     * hold a valid signed-in account, reach the relay over HTTP 200, and still be in no fleet —
-     * with nothing anywhere reporting a problem. The eight tools register, the plugin looks
+     * hold a valid signed-in account, reach the relay over HTTP 200, and still be in no fleet  -      * with nothing anywhere reporting a problem. The eight tools register, the plugin looks
      * healthy, and the join sequence simply never runs.
      *
      * A silent no-op that looks like success is the worst failure mode this plugin has had. One
@@ -4661,6 +4662,181 @@ export async function apply(ctx, config = {}) {
     },
     presentCall: () => ({ card: 'generic', title: 'w2m stats', kind: 'read', rawInput: {} }),
   }));
+
+  /**
+   * v0.9.6 — the individual memory layer.
+   *
+   * The relay keeps `command_hash`, `stdout_sha256` and `stdout_bytes` and never the text, deliberately:
+   * the ledger is a tamper-evident consistency record, and a relay compromise discloses no command text.
+   * The price is that nothing in the fleet could answer *"what did we already try on this machine, and
+   * what happened?"* -- and that price was paid repeatedly, with the same facts rediscovered from scratch
+   * across a dozen dispatches in one session.
+   *
+   * This tool is the read side of the fix. The write side is `appendMemory`, called by the agent as each
+   * task finishes, in that machine's own state directory.
+   *
+   * ## What this first version does and does not reach
+   *
+   * It reaches **this machine's** memory directly: the file is local, so the read is a file read. It does
+   * **not** yet read another machine's memory, and the reason is structural rather than an omission --
+   * the relay carries no such file, an agent executes a dispatched command inside a sandbox whose writes
+   * are scoped, and pretending otherwise would mean shipping a tool that silently returns nothing for
+   * every machine but one.
+   *
+   * So a query for another machine says exactly that, names where to look instead, and stays useful: the
+   * fleet's roster still comes from the relay, so the answer distinguishes "no such machine" from "that
+   * machine keeps its own memory and this build cannot fetch it".
+   */
+  ctx.tools.register(defineTool({
+    name: 'w2m_memory',
+    description:
+      'Ask what this machine has already done: its individual memory, one line per finished task, ' +
+      'recording the command, exit code, duration, transport and the tail of stdout/stderr. Use it ' +
+      'before re-running work to find out whether it has been tried and what happened. The relay keeps ' +
+      'only hashes, so this local file is the only place a command\'s output survives. Reads only this ' +
+      'machine\'s memory; for another machine it reports where that memory lives rather than guessing.',
+    parameters: {
+      machine: {
+        type: 'string',
+        description:
+          'Which machine\'s memory to read. Defaults to this machine. Naming another machine is ' +
+          'answered with where its memory is kept, because this build can only read the local file.',
+      },
+      limit: {
+        type: 'number',
+        description: 'How many records to return, newest first. Defaults to 20.',
+        default: 20,
+      },
+      include_previous: {
+        type: 'boolean',
+        description:
+          'Also read the rotated generation (`memory.jsonl.1`). The log is capped and rotates, so a ' +
+          'memory question about anything older than the current file needs this.',
+        default: false,
+      },
+    },
+    output: jsonOutput,
+    async execute(args, exec) {
+      throwIfAborted(exec?.signal);
+      const limitRaw = Number(args?.limit);
+      const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(Math.floor(limitRaw), 500) : 20;
+
+      const requested = typeof args?.machine === 'string' && args.machine.trim() !== '' ? args.machine.trim() : null;
+      const identity = await readLocalIdentity(cfg);
+      const self = identity?.machine_name ?? null;
+      const selfId = identity?.machine_id ?? null;
+
+      // A query about another machine is answered honestly rather than with an empty list, which would
+      // read as "that machine has done nothing" -- the opposite conclusion from "this build cannot see".
+      if (requested !== null && requested !== self && requested !== selfId) {
+        return JSON.stringify(
+          {
+            ok: true,
+            scope: 'remote',
+            requested_machine: requested,
+            self: { machine_id: selfId, machine_name: self },
+            records: null,
+            reason_code: 'MEMORY_REMOTE_NOT_READABLE',
+            detail:
+              `the individual memory of "${requested}" is kept on that machine, in its own state ` +
+              'directory as memory.jsonl; this build reads only the local file, and the relay never ' +
+              'receives it',
+            how_to_read_it: [
+              `run \`w2m_run\` on ${requested} with a command that prints the tail of its memory.jsonl`,
+              'or read it directly over an administration channel to that machine',
+            ],
+            found: false,
+          },
+          null,
+          2,
+        );
+      }
+
+      const stateDir = cfg.stateDir ?? null;
+      if (stateDir === null) {
+        return JSON.stringify(
+          {
+            ok: true,
+            scope: 'local',
+            machine_id: selfId,
+            machine_name: self,
+            records: null,
+            reason_code: 'MEMORY_NO_STATE_DIR',
+            detail: 'this plugin has no stateDir configured, so there is nowhere the memory log would be',
+            found: false,
+          },
+          null,
+          2,
+        );
+      }
+
+      const current = readMemorySync(stateDir, { limit });
+      const previous = args?.include_previous === true ? readMemorySync(stateDir, { limit, previous: true }) : null;
+
+      /**
+       * A small summary before the records themselves.
+       *
+       * The question that sent someone here is usually "have we run this before, and did it work", and a
+       * count answers it faster than reading twenty lines. The counts are of the records *returned*, not
+       * of the whole file, and that is stated -- a summary that silently described a different set than
+       * the one shown is how a reader learns to distrust the summary.
+       */
+      const tally = (records) => {
+        const by = {};
+        for (const r of records ?? []) {
+          const key = r?.status ?? 'unknown';
+          by[key] = (by[key] ?? 0) + 1;
+        }
+        return by;
+      };
+
+      return JSON.stringify(
+        {
+          ok: true,
+          scope: 'local',
+          machine_id: selfId,
+          machine_name: self,
+          state_dir: stateDir,
+          memory_path: current.path,
+          found: current.path !== null && (current.records.length > 0 || previous !== null),
+          count: current.records.length,
+          skipped_lines: current.skipped,
+          truncated: current.truncated,
+          status_tally: tally(current.records),
+          records: current.records,
+          ...(previous === null
+            ? {}
+            : {
+                previous: {
+                  path: previous.path,
+                  count: previous.records.length,
+                  skipped_lines: previous.skipped,
+                  status_tally: tally(previous.records),
+                  records: previous.records,
+                },
+              }),
+          notes: [
+            current.path === null
+              ? 'no memory has been written here yet: the log is created when a task finishes'
+              : null,
+            current.skipped > 0
+              ? `${current.skipped} line(s) could not be parsed and were skipped; a partially written final line is the expected cause`
+              : null,
+            'conclusion is null until something records what a result meant; the machine only stores the fact',
+            'the relay keeps hashes and never this text, so this file is the only durable copy of the output',
+          ].filter((n) => n !== null),
+        },
+        null,
+        2,
+      );
+    },
+    presentCall: (args) => ({
+      card: 'generic',
+      title: `w2m memory${typeof args?.machine === 'string' ? ` ${args.machine}` : ''}`,
+      kind: 'read',
+      rawInput: {},
+    }),
+  }));
 }
 
 /**
@@ -4735,14 +4911,14 @@ async function startLocalStack(ctx, cfg) {
      *
      * It called `createAgent` with `projectDir` and without `identity`, and passed a
      * `pairingCode` that `createAgent` does not accept. `createAgent` requires `project` and an
-     * `identity.machine_id`, so **`autoStartAgent: true` threw on its first call** — the code path
+     * `identity.machine_id`, so **`autoStartAgent: true` threw on its first call**  - the code path
      * that was supposed to bring an agent up had never run. That is why the fleet-join wire appeared
      * to be missing: the place it was meant to live could not be reached at all.
      *
      * Two more things were wrong with the shape:
      *
      *   * it created a **local relay** unconditionally. For a machine joining a shared fleet that
-     *     is the opposite of what is wanted — the machine must connect to the relay that already
+     *     is the opposite of what is wanted  - the machine must connect to the relay that already
      *     exists, not mint another one, and with `rabbitUrl` pointing at a remote host it would
      *     have tried to bind a relay on that hostname;
      *   * nothing paired the agent, so even a started agent could fetch no offers.
