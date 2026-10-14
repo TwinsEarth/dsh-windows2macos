@@ -33,12 +33,16 @@ By reading the CI failure logs rather than the CI summary. The summary said *"Th
 
 The same class of mistake as the four files an earlier push left behind (see v0.9.1), and it is worth naming the shared root cause: **the v0.8.x tarballs were packed from a working tree, while the repository was written to by listing files individually.** A pack packs everything; an explicit list omits what the author forgets. The durable fix is to stop enumerating — but until this release the enumeration is what the tree had.
 
-So this release does the one thing v0.9.1 should have: it diffs the working tree against the repository in **both** directions, and the only file present locally and absent remotely was this one.
+So this release does the one thing v0.9.1 should have: it diffs the working tree against the repository in **both** directions. Exactly one file was present locally and absent remotely, and it was this one.
 
 ### Verified
 
 - `node scripts/verify-join.mjs` — 16/16 locally, which it always was; the defect was never in the script.
-- The full local tree now differs from the repository in exactly the ways this release intends, in both directions.
+- The script is now in the repository, which is the only place `verify:join` can run from: `claims.test.mjs` pins
+  `FORBIDDEN_IN_RELEASE = ['test', 'scripts', ...]`, so `scripts/` is deliberately **not** in `package.json#files` and
+  a published tarball carries no `scripts/` directory by design. `verify:join`, `pack` and `verify` are source-tree
+  and CI commands, not consumer commands. An earlier draft of this entry called the absent `scripts/` a packaging
+  defect; that was wrong, and the constraint above is why.
 
 ## [0.9.1] — 2026-10-14
 
