@@ -121,6 +121,7 @@ import { mintPunchId, punchSession } from '../agent/p2p.mjs';
 // rather than reimplemented: the dispatcher and the executor have to derive the *same* keys, and two
 // implementations of a handshake are two chances to disagree about it.
 import { DeviceKey } from '../agent/crypto.mjs';
+import { loadOrCreateIdentity } from '../agent/identity.mjs';
 import { parseServer } from '../agent/stun.mjs';
 // The result-deduplication identity the relay mints. Imported rather than re-implemented: the value
 // is compared byte for byte by the executor, so a second copy of the formula that drifted by one
@@ -654,6 +655,19 @@ function readConfig(config = {}) {
       ? config.machineName.trim()
       : os.hostname(),
     autoStartAgent: config.autoStartAgent === true,
+      /**
+       * v0.8.3: the account-derived key this machine joins its fleet with.
+       *
+       * Supplied by the host, which is the only layer that can read the signed-in account -- a
+       * standalone agent cannot derive it, which is why it must be handed down rather than
+       * computed where it is used. `W2M_FLEET_KEY` is accepted too, so a machine can be pointed at
+       * a fleet without editing a profile.
+       */
+      fleetKey: typeof config.fleetKey === 'string' && config.fleetKey.trim() !== ''
+        ? config.fleetKey.trim()
+        : (typeof process.env.W2M_FLEET_KEY === 'string' && process.env.W2M_FLEET_KEY.trim() !== ''
+          ? process.env.W2M_FLEET_KEY.trim()
+          : null),
     // From the merged layers, not from `config` alone: this is the value the fleet shares.
     allowedCommands: shared.values.allowedCommands
       .filter((entry) => typeof entry === 'string')
@@ -4586,31 +4600,86 @@ async function startLocalStack(ctx, cfg) {
     });
   }
 
-  const target = cfg.rabbitUrl ? new URL(cfg.rabbitUrl) : null;
-  const relay = await createRelay({
-    host: target?.hostname ?? '127.0.0.1',
-    port: target?.port ? Number(target.port) : 8787,
-    stateDir: cfg.stateDir,
-    pairingCode: cfg.pairingCode ?? undefined,
-  });
-  ctx.logger?.info?.(`w2m: relay listening at ${relay.url ?? '(unknown url)'}`);
+    /**
+     * v0.8.3: this block was dead code, and the reason is worth recording.
+     *
+     * It called `createAgent` with `projectDir` and without `identity`, and passed a
+     * `pairingCode` that `createAgent` does not accept. `createAgent` requires `project` and an
+     * `identity.machine_id`, so **`autoStartAgent: true` threw on its first call** — the code path
+     * that was supposed to bring an agent up had never run. That is why the fleet-join wire appeared
+     * to be missing: the place it was meant to live could not be reached at all.
+     *
+     * Two more things were wrong with the shape:
+     *
+     *   * it created a **local relay** unconditionally. For a machine joining a shared fleet that
+     *     is the opposite of what is wanted — the machine must connect to the relay that already
+     *     exists, not mint another one, and with `rabbitUrl` pointing at a remote host it would
+     *     have tried to bind a relay on that hostname;
+     *   * nothing paired the agent, so even a started agent could fetch no offers.
+     *
+     * So: pair by the **account fleet key** when one is available, fall back to a pairing code, and
+     * only stand up a local relay when the configured URL actually is local.
+     */
+    const target = cfg.rabbitUrl ? new URL(cfg.rabbitUrl) : null;
+    const isLocalRelay =
+      target === null || ['127.0.0.1', 'localhost', '::1', '[::1]'].includes(target.hostname);
 
-  const agent = await createAgent({
-    rabbitUrl: relay.url ?? cfg.rabbitUrl,
-    pairingCode: cfg.pairingCode ?? relay.pairingCode ?? undefined,
-    projectDir: cfg.projectDir,
-    machineName: cfg.machineName,
-    stateDir: cfg.stateDir,
-    allowedCommands: cfg.allowedCommands,
-  });
-  await agent.start();
-  ctx.logger?.info?.(`w2m: agent started as ${JSON.stringify(agent.identity?.() ?? null)}`);
+    let relay = null;
+    if (isLocalRelay) {
+      relay = await createRelay({
+        host: target?.hostname ?? '127.0.0.1',
+        port: target?.port ? Number(target.port) : 8787,
+        stateDir: cfg.stateDir,
+        pairingCode: cfg.pairingCode ?? undefined,
+      });
+      ctx.logger?.info?.(`w2m: relay listening at ${relay.url ?? '(unknown url)'}`);
+    } else {
+      // Joining an existing relay: nothing to start, and minting a second one would put this
+      // machine in a fleet of its own.
+      ctx.logger?.info?.(`w2m: joining the relay at ${cfg.rabbitUrl}`);
+    }
 
-  // §8.2: when the agent runs inside this process its `rttMs` is reachable directly, so `w2m_status`
-  // can report it without a file. When the agent is its own process this stays null and the tool
-  // says so instead of guessing.
-  const statusGetter = agent.status ?? agent.state ?? null;
-  inProcessAgentStatus = typeof statusGetter === 'function' ? statusGetter.bind(agent) : null;
+    const agent = await createAgent({
+      rabbitUrl: relay?.url ?? cfg.rabbitUrl,
+      // `project`, not `projectDir`: the option `createAgent` documents, and the one it requires.
+      project: cfg.projectDir,
+      stateDir: cfg.stateDir,
+      // The identity the agent announces itself under. Loaded from the same file the CLI uses, so
+      // a machine has ONE identity whether the agent runs in-process or as its own process --
+      // otherwise each would mint its own keypair and overwrite the other's announcement under a
+      // shared machine_id (the v0.6.2 defect, in a new place).
+      identity: loadOrCreateIdentity({ name: cfg.machineName, rabbitUrl: cfg.rabbitUrl ?? undefined }).identity,
+      allowedCommands: cfg.allowedCommands,
+    });
+
+    /**
+     * Pair before starting, because an unpaired agent can fetch no offers.
+     *
+     * The fleet key is tried first: it needs no operator step and no code to hand over, which is
+     * the whole point of v0.8.1. A pairing code is the fallback for a relay that has no fleet of
+     * its own.
+     */
+    const pairBy = cfg.fleetKey ? 'fleet key' : cfg.pairingCode ? 'pairing code' : null;
+    if (pairBy !== null) {
+      try {
+        await agent.pair(cfg.pairingCode ?? null, undefined, cfg.fleetKey ?? null);
+        ctx.logger?.info?.(`w2m: paired by ${pairBy}`);
+      } catch (error) {
+        // Named rather than swallowed: an agent that failed to pair runs and does nothing, which
+        // looks identical to a fleet with no work.
+        ctx.logger?.warn?.(`w2m: pairing by ${pairBy} failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    } else {
+      ctx.logger?.warn?.('w2m: no fleetKey and no pairingCode, so this machine cannot join a fleet');
+    }
+
+    await agent.start();
+    ctx.logger?.info?.(`w2m: agent started as ${JSON.stringify(agent.identity?.() ?? null)}`);
+
+    // Â§8.2: when the agent runs inside this process its `rttMs` is reachable directly, so `w2m_status`
+    // can report it without a file. When the agent is its own process this stays null and the tool
+    // says so instead of guessing.
+    const statusGetter = agent.status ?? agent.state ?? null;
 
   return async () => {
     inProcessAgentStatus = null;

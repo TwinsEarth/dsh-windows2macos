@@ -4,6 +4,67 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.3] — 2026-10-14
+
+**The last wire, and the reason it was never there.**
+
+### `autoStartAgent` was dead code
+
+The option existed, was documented, and **threw on its first call**. `startLocalStack` built its
+`createAgent` arguments as `projectDir` (the option is `project`), omitted `identity` (which is
+required), and passed a `pairingCode` that `createAgent` does not accept.
+
+Verified rather than inferred — calling `createAgent` with that exact shape:
+
+```
+createAgent THREW: createAgent: project is required
+```
+
+**So the code path that was supposed to bring an agent up had never run.** That is why the
+fleet-join wire appeared to be missing: the place it was meant to live could not be reached at all.
+An option that exists, is documented, and cannot execute is worse than one that is absent — it
+reads as a feature.
+
+### Two more things wrong with the shape
+
+* **It created a local relay unconditionally.** For a machine joining a shared fleet that is the
+  opposite of what is wanted: the machine must connect to the relay that already exists, not mint
+  another one — and with `rabbitUrl` pointing at a remote host it would have tried to bind a relay
+  on that hostname. It now stands up a local relay **only when the configured URL actually is
+  local**, and otherwise logs that it is joining the relay at the given address.
+* **Nothing paired the agent.** Even a started agent could fetch no offers, which looks identical to
+  a fleet with no work.
+
+### Now
+
+`startLocalStack` passes the option names `createAgent` actually documents, loads the identity from
+the **same file the CLI uses** — so one machine has one identity whether the agent runs in-process
+or as its own process, rather than each minting a keypair and overwriting the other's announcement
+under a shared `machine_id` (the v0.6.2 defect, in a new place) — and **pairs by the account fleet
+key**, falling back to a pairing code.
+
+Pairing is attempted **before** `agent.start()`, and a failure is **named at warn level** rather than
+swallowed: an agent that failed to pair runs and does nothing, which is indistinguishable from a
+quiet fleet.
+
+### Config
+
+`fleetKey` is read from the config layer or `W2M_FLEET_KEY`. The key must be **handed down** rather
+than computed where it is used, because a standalone agent cannot read the signed-in account — which
+is why it comes from the host.
+
+### Verified
+
+**132 cases** across the tools, apply and fleet-join suites. `tools.mjs` loads. The 12 agent-suite
+failures remain pre-existing and environmental, measured against an untouched clone of the same
+commit.
+
+### ⚠️ Not yet proven on real hardware
+
+The wiring is fixed and the mechanism was verified end to end in v0.8.2, but **no machine has yet
+joined a fleet through this path in a live run**. That is the next check, and it needs a machine
+that is not already paired.
+
 ## [0.8.2] — 2026-10-14
 
 **The client half of the auto-join.** v0.8.1 landed the credential and the relay's acceptance of
