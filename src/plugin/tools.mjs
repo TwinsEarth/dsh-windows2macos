@@ -4651,18 +4651,43 @@ async function startLocalStack(ctx, cfg) {
       identity: loadOrCreateIdentity({ name: cfg.machineName, rabbitUrl: cfg.rabbitUrl ?? undefined }).identity,
       allowedCommands: cfg.allowedCommands,
     });
-
     /**
-     * Pair before starting, because an unpaired agent can fetch no offers.
+     * v0.8.4: derive the fleet key from the signed-in account when nobody supplied one.
      *
-     * The fleet key is tried first: it needs no operator step and no code to hand over, which is
-     * the whole point of v0.8.1. A pairing code is the fallback for a relay that has no fleet of
-     * its own.
+     * This is the connection that makes the feature user-facing. The `chatops` half already
+     * derived the key from `userId` and exposed it; this half already accepted one. Neither knew
+     * about the other, so the plugin read `fleetKey` from config or `W2M_FLEET_KEY` and a machine
+     * with a signed-in account still joined nothing.
+     *
+     * The host is the only layer that can read the account -- a standalone agent cannot -- so the
+     * derivation belongs here, where `ctx` is available, and not where the key is used.
      */
-    const pairBy = cfg.fleetKey ? 'fleet key' : cfg.pairingCode ? 'pairing code' : null;
+    let fleetKey = cfg.fleetKey ?? null;
+    let fleetKeySource = fleetKey === null ? null : 'config';
+    if (fleetKey === null) {
+      try {
+        const { createAccountIdentity } = await import('../chatops/account.mjs');
+        const identity = await createAccountIdentity({ ctx, platform: process.platform }).resolve();
+        if (identity.ok && typeof identity.fleetKey === 'string' && identity.fleetKey !== '') {
+          fleetKey = identity.fleetKey;
+          fleetKeySource = 'account';
+          ctx.logger?.info?.(`w2m: fleet key derived from the signed-in account (fleet ${identity.accountCode})`);
+        } else if (identity.ok === false) {
+          // Named, and at info rather than warn: being signed out is a normal state, and a machine
+          // with no account has no fleet -- the design says it must not be given a random one.
+          ctx.logger?.info?.(`w2m: no fleet key from the account (${identity.reason}${identity.detail ? `: ${identity.detail}` : ''})`);
+        }
+      } catch (error) {
+        // A derivation failure must not stop the agent: an unpaired agent still runs and can be
+        // paired later, whereas a thrown start is a machine that never appears at all.
+        ctx.logger?.warn?.(`w2m: could not derive a fleet key: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+
+    const pairBy = fleetKey !== null ? `fleet key (${fleetKeySource})` : cfg.pairingCode ? 'pairing code' : null;
     if (pairBy !== null) {
       try {
-        await agent.pair(cfg.pairingCode ?? null, undefined, cfg.fleetKey ?? null);
+        await agent.pair(cfg.pairingCode ?? null, undefined, fleetKey);
         ctx.logger?.info?.(`w2m: paired by ${pairBy}`);
       } catch (error) {
         // Named rather than swallowed: an agent that failed to pair runs and does nothing, which
