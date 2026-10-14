@@ -4,6 +4,64 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.8] — 2026-10-14
+
+**A machine that joined without saying what it is — and a fix that was computed and never used.**
+
+### `platform` and `caps` were never sent
+
+`createAgent` accepts `platform` and `caps`, and `bin/w2m-localside.mjs` has always supplied them.
+`startLocalStack` did not, so a machine that joined **through the plugin** appeared in the relay
+complete and correct except for:
+
+```
+"os": null, "arch": null, "caps": {}
+```
+
+**The capability gate then had nothing to filter on — and that gate decides what work a machine is
+offered.** So the device was registered, reachable, and unusable for anything the gate would have
+matched it to.
+
+Same shape as the rest of this series: the record was created and **the part that makes it useful was
+not filled in**.
+
+### The v0.8.5 fix was computed and never used
+
+Worse, and found while making the change above:
+
+```js
+const resolvedStateDir = cfg.stateDir.trim() !== '' ? cfg.stateDir.trim() : resolveStateDir(...);
+if (cfg.stateDir !== resolvedStateDir) { ctx.logger?.info?.(`w2m: stateDir was unset; using ...`); }
+...
+const agent = await createAgent({ stateDir: cfg.stateDir, ... });   // ← the EMPTY string
+```
+
+**v0.8.5 computed the resolved directory, logged it, and then passed the original empty string to
+`createAgent`** — the exact call that throws `createAgent: stateDir is required`. So the second gate
+v0.8.5 claimed to open was **still shut**, and the only evidence was a log line saying the resolved
+path was being used.
+
+*The log said the right thing while the code did the wrong thing* — which is worse than silence,
+because silence sends you looking and a confident wrong log sends you away.
+
+Both `createRelay` and `createAgent` now receive `resolvedStateDir`, and its definition was moved
+**above** its first use: as a `const` used earlier in the same block it would have thrown
+`ReferenceError: Cannot access 'resolvedStateDir' before initialization` at runtime, which
+`node --check` cannot see because it is not a syntax error. Caught by checking the **order**, not the
+syntax.
+
+### Also sent now
+
+`identityPath: loaded.path` — the device key belongs **beside the `device.json` this process actually
+loaded**, not in a directory the agent guesses. Without it the in-process and standalone paths can
+mint separate keypairs under one `machine_id` and overwrite each other's announcement (the v0.6.2
+defect, which this path would have reintroduced).
+
+### Verified
+
+**174 cases**. `tools.mjs` loads; the ordering was confirmed by comparing line numbers rather than by
+reading.
+
 ## [0.8.7] — 2026-10-14
 
 **Pair only when there is no token — because the relay rate-limits pairing.**

@@ -122,6 +122,7 @@ import { mintPunchId, punchSession } from '../agent/p2p.mjs';
 // implementations of a handshake are two chances to disagree about it.
 import { DeviceKey } from '../agent/crypto.mjs';
 import { loadOrCreateIdentity, saveDeviceToken } from '../agent/identity.mjs';
+import { probeCapsDetailed, detectPlatform } from '../agent/caps.mjs';
 import { resolveStateDir } from '../util/cli.mjs';
 import { parseServer } from '../agent/stun.mjs';
 // The result-deduplication identity the relay mints. Imported rather than re-implemented: the value
@@ -4639,25 +4640,6 @@ async function startLocalStack(ctx, cfg) {
      * So: pair by the **account fleet key** when one is available, fall back to a pairing code, and
      * only stand up a local relay when the configured URL actually is local.
      */
-    const target = cfg.rabbitUrl ? new URL(cfg.rabbitUrl) : null;
-    const isLocalRelay =
-      target === null || ['127.0.0.1', 'localhost', '::1', '[::1]'].includes(target.hostname);
-
-    let relay = null;
-    if (isLocalRelay) {
-      relay = await createRelay({
-        host: target?.hostname ?? '127.0.0.1',
-        port: target?.port ? Number(target.port) : 8787,
-        stateDir: cfg.stateDir,
-        pairingCode: cfg.pairingCode ?? undefined,
-      });
-      ctx.logger?.info?.(`w2m: relay listening at ${relay.url ?? '(unknown url)'}`);
-    } else {
-      // Joining an existing relay: nothing to start, and minting a second one would put this
-      // machine in a fleet of its own.
-      ctx.logger?.info?.(`w2m: joining the relay at ${cfg.rabbitUrl}`);
-    }
-
     /**
      * v0.8.5: a usable state directory, because an empty one THROWS.
      *
@@ -4676,6 +4658,26 @@ async function startLocalStack(ctx, cfg) {
         : resolveStateDir(null, 'localside');
     if (cfg.stateDir !== resolvedStateDir) {
       ctx.logger?.info?.(`w2m: stateDir was unset; using ${resolvedStateDir}`);
+
+    const target = cfg.rabbitUrl ? new URL(cfg.rabbitUrl) : null;
+    const isLocalRelay =
+      target === null || ['127.0.0.1', 'localhost', '::1', '[::1]'].includes(target.hostname);
+
+    let relay = null;
+    if (isLocalRelay) {
+      relay = await createRelay({
+        host: target?.hostname ?? '127.0.0.1',
+        port: target?.port ? Number(target.port) : 8787,
+        stateDir: resolvedStateDir,
+        pairingCode: cfg.pairingCode ?? undefined,
+      });
+      ctx.logger?.info?.(`w2m: relay listening at ${relay.url ?? '(unknown url)'}`);
+    } else {
+      // Joining an existing relay: nothing to start, and minting a second one would put this
+      // machine in a fleet of its own.
+      ctx.logger?.info?.(`w2m: joining the relay at ${cfg.rabbitUrl}`);
+    }
+
     }
 
     /**
@@ -4694,11 +4696,30 @@ async function startLocalStack(ctx, cfg) {
     const identityOptions = { name: cfg.machineName, rabbitUrl: cfg.rabbitUrl ?? undefined };
     const loaded = loadOrCreateIdentity(identityOptions);
 
+    /**
+     * v0.8.8: report what this machine IS, not just that it exists.
+     *
+     * `createAgent` accepts `platform` and `caps`, and the CLI has always supplied them. This path
+     * did not, so a machine that joined through the plugin appeared in the relay complete and
+     * correct except for `os: null` and `caps: {}` -- and the capability gate then had nothing to
+     * filter on, which decides what work the machine is offered.
+     *
+     * The same shape as the other defects in this series: the record was created, and the part
+     * that makes it USEFUL was not filled in.
+     */
+    const [{ caps, detail: capDetail }, platform] = await Promise.all([
+      probeCapsDetailed({}),
+      detectPlatform({}),
+    ]);
+    if (capDetail?.notes?.length) {
+      ctx.logger?.info?.(`w2m: capability probe notes: ${capDetail.notes.join('; ')}`);
+    }
+
     const agent = await createAgent({
       rabbitUrl: relay?.url ?? cfg.rabbitUrl,
       // `project`, not `projectDir`: the option `createAgent` documents, and the one it requires.
       project: cfg.projectDir,
-      stateDir: cfg.stateDir,
+      stateDir: resolvedStateDir,
       // The identity the agent announces itself under. Loaded from the same file the CLI uses, so
       // a machine has ONE identity whether the agent runs in-process or as its own process --
       // otherwise each would mint its own keypair and overwrite the other's announcement under a
@@ -4707,6 +4728,9 @@ async function startLocalStack(ctx, cfg) {
       // the device token back. Reading with one set and writing with another is how the plugin and
       // the CLI ended up each minting a keypair under one machine_id (the v0.6.2 defect).
       identity: identityOptions.identity,
+      identityPath: loaded.path,
+      caps,
+      platform,
       allowedCommands: cfg.allowedCommands,
     });
     /**
