@@ -1086,6 +1086,18 @@ export class RelayServer {
   /** Periodic maintenance, called by the sweep timer. */
   maintenance() {
     const expired = this.sweep();
+    /**
+     * v0.9.1: presence expiry, alongside lease expiry.
+     *
+     * `this.sweep()` writes off lease *holds*; this writes off *presence*. They were conflated, so a
+     * machine that stopped existing was only ever noticed when its SSE stream detached — and a
+     * half-open stream never detaches.
+     */
+    const silent = this.state.sweepSilentDevices();
+    if (silent.length > 0) {
+      this._log(`[w2m-rabbit] marked ${silent.length} silent device(s) offline: `
+        + silent.map((s) => `${s.machine_name} (${Math.round(s.silent_ms / 1000)}s)`).join(', '));
+    }
     this.pairLimiter.prune();
     this.peers.sweep();
     // Keep the nonce cache from growing without bound in a long-running process.

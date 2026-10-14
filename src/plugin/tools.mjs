@@ -4621,6 +4621,17 @@ export async function apply(ctx, config = {}) {
                 machine_id: d?.machine_id ?? null,
                 machine_name: d?.machine_name ?? null,
                 online: d?.online === true,
+                /**
+                 * v0.9.1: why a machine is not usable, when it is not.
+                 *
+                 * Passed through rather than summarised, because "offline" alone was the shape that
+                 * hid the reported defect: a machine powered off for hours was listed `online` and
+                 * selectable, and there was no field anywhere that would have said otherwise. A
+                 * relay older than v0.9.1 sends no such field, so this reads `null` there rather than
+                 * inventing a reason.
+                 */
+                offline_reason: d?.offline_reason ?? null,
+                silent_ms: d?.silent_ms ?? null,
                 rtt_ms: d?.rtt_ms ?? null,
                 rtt_stale: d?.rtt_stale ?? null,
                 last_heartbeat_at: d?.last_heartbeat_at ?? null,

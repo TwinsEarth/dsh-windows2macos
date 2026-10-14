@@ -58,6 +58,19 @@ jobs:
       - name: Entry points import
         run: node scripts/check-entrypoints.mjs
 
+      # The join is the half of this plugin that shipped broken for seven releases, and the half no
+      # suite could reach: the real `agent.start()` talks to the public relay for the life of the
+      # process, so nothing exercised the sequence that pairs and writes the token. `verify-join.mjs`
+      # substitutes the agent factory and asserts it instead -- a real `identity.machine_id` reaching
+      # `createAgent`, a machine whose account answered *after* mount still joining and persisting its
+      # token, and a machine holding a token never re-pairing. Node builtins only, no install, no
+      # network, and a throwaway identity (`DSH_DEVICE_FILE`) rather than the real one.
+      #
+      # It sits above the pre-flight deliberately: it is the cheapest check here and the one that
+      # guards the defect this release exists to fix, so it should fail first and say why.
+      - name: The fleet join reaches a token (stub agent, no relay)
+        run: npm run verify:join
+
       # Same reasoning as ci.yml's lint job: this project commits no lockfile on purpose, so
       # `npm install` rather than `npm ci`. The pre-flight below lints as one of its checks.
       - name: Install dev tooling

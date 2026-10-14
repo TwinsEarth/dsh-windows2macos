@@ -391,7 +391,27 @@ export function createAccountIdentity(options = {}) {
 
       if (!account.ok) return account;
       const hardware = await fingerprint();
-      if (!hardware.ok) return hardware;
+      /**
+       * v0.8.12: **a missing serial number must not discard a fleet key that was already derived.**
+       *
+       * The SN needs the hardware fingerprint; the fleet key does not. The key comes from the
+       * account's `userId`, and it is computed above, before this point. Returning the bare hardware
+       * failure threw that work away -- and because the whole `resolve()` result was then
+       * `ok: false` with a hardware reason, the caller could not tell that the *key* had been fine.
+       *
+       * Measured on the machine this was reported from: `readHardwareValues({ platform: 'win32' })`
+       * returns **zero** usable values (both `MachineGuid` and the SMBIOS UUID source come back
+       * empty), so `fingerprint()` always failed there and the fleet key was always discarded --
+       * which is exactly the reported symptom, a signed-in machine that joins nothing. Retrying the
+       * derivation could never have helped: the account was readable and the key *was* computed, then
+       * dropped one line later.
+       *
+       * So the failure is reported as what it is -- `no_hardware_source`, with `ok: false` and the SN
+       * fields absent, because there genuinely is no SN -- while `accountFields` still travels, so a
+       * caller that only needs to join the account's fleet is not held hostage by a display
+       * identifier.
+       */
+      if (!hardware.ok) return { ...hardware, ...accountFields };
       const sn = buildSn({ accountCode: account.accountCode, hardwareCode: hardware.hardwareCode, at: options.at ?? new Date() });
       audit('account/sn-created', { sn, sources: hardware.sources });
       return {

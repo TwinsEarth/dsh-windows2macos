@@ -121,6 +121,37 @@ export const MAX_RTT_MS = 24 * 60 * 60 * 1000;
 export const DEFAULT_RTT_STALE_MS = 180_000;
 /** v0.3.0: recommended cadence for an agent with no lease (reference for the agent side). */
 export const DEFAULT_IDLE_HEARTBEAT_MS = 60_000;
+
+/**
+ * v0.9.1: how long a device may stay `online` without any contact before the relay calls it silent.
+ *
+ * ## The defect this closes
+ *
+ * `online` was written in exactly two places, both driven by the SSE stream: set true when a
+ * subscriber attached, false when it detached. **Nothing derived it from contact.** So a machine
+ * whose process died without the TCP connection closing — a half-open stream, which is what a killed
+ * process or a yanked network path leaves behind — stayed `online: true` in `/v1/devices`
+ * indefinitely, and stayed selectable as a dispatch target. Reported from a real fleet: a Windows
+ * machine powered off hours earlier was still listed online, with `last_heartbeat_at: null` to say it
+ * had never heartbeated at all.
+ *
+ * `peer.bye` did not help either, because it is emitted *by* the stream closing (`setOnline(…, false)`
+ * on detach). With no close there is no bye, so the machine was never removed from any other
+ * machine's fleet view either — which is the "not broadcast" half of the same report.
+ *
+ * ## The threshold
+ *
+ * An idle agent heartbeats every {@link DEFAULT_IDLE_HEARTBEAT_MS} (60 s), and a busy one renews its
+ * lease every {@link DEFAULT_HEARTBEAT_INTERVAL_MS} (10 s), so the *slowest* healthy cadence is 60 s.
+ * Two skipped idle beats is therefore 120 s: a live machine cannot reach it, and a dead one is
+ * noticed within two cycles plus the sweep tick.
+ *
+ * Deliberately longer than `heartbeatIntervalMs * missedHeartbeats` (the 20 s lease rule): that rule
+ * is about holding a *task index*, where being wrong costs a duplicated execution. This one is about
+ * a display and a target list, where being wrong costs a wasted dispatch. Same reasoning, different
+ * price, so not the same number.
+ */
+export const DEFAULT_SILENCE_MS = DEFAULT_IDLE_HEARTBEAT_MS * 2;
 export const ENVELOPE_VERSION = '1.0';
 export const FINGERPRINT_ALGO = 'git-temp-index-tree/v1';
 
@@ -416,6 +447,11 @@ export class RabbitState {
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS;
     this.missedHeartbeats = options.missedHeartbeats ?? DEFAULT_MISSED_HEARTBEATS;
     this.leaseGraceMs = options.leaseGraceMs ?? DEFAULT_LEASE_GRACE_MS;
+    /**
+     * v0.9.1: how long an `online` device may go without contact before it is declared silent.
+     * See {@link DEFAULT_SILENCE_MS} for why this is not the lease number.
+     */
+    this.silenceMs = options.silenceMs ?? DEFAULT_SILENCE_MS;
     /**
      * v0.4.0: how long the relay holds its own offer back when the dispatcher says it will push the
      * offer over the direct path (`origin_machine_id` + `p2p.mode`).
@@ -1050,25 +1086,104 @@ export class RabbitState {
   }
 
   /**
+   * v0.9.1: how long since this device last made any contact, or null when it never has.
+   *
+   * `last_seen_at_ms` is the right field rather than `last_heartbeat_at_ms`: `touchDevice` advances it
+   * on every contact the relay accepts — a heartbeat, a task poll, a lease renewal — so it measures
+   * "is anything there", while `last_heartbeat_at_ms` measures "has it ever heartbeated", which is
+   * null for an agent old enough not to send them.
+   *
+   * Falls back to `paired_at_ms` so that a device which paired but has not spoken since is judged
+   * from the moment it arrived rather than from `null`, which would have read as "silent forever" and
+   * marked it offline the instant it appeared.
+   *
+   * @param {object} device
+   * @param {number} nowMs
+   * @returns {number|null}
+   */
+  silenceAgeMs(device, nowMs = this.nowMs()) {
+    const seen = device.last_seen_at_ms ?? device.last_heartbeat_at_ms ?? device.paired_at_ms ?? null;
+    if (seen === null || seen === undefined) return null;
+    return Math.max(0, nowMs - seen);
+  }
+
+  /**
+   * v0.9.1 §4.3 companion: declare a device silent once nothing has contacted the relay for
+   * {@link DEFAULT_SILENCE_MS}.
+   *
+   * ## Why this exists next to `sweepExpired`
+   *
+   * `sweepExpired` writes off lease *holds*; this writes off *presence*. Both are expiry, and they
+   * were conflated: a machine that stopped existing was only noticed when its SSE stream actually
+   * detached, so a half-open stream — a killed process, a pulled cable, a laptop lid — left it
+   * `online: true` and selectable for as long as the socket stayed open, which can be hours or
+   * indefinitely.
+   *
+   * Going through {@link setOnline} is the point rather than an implementation detail: it flips the
+   * flag **and emits `peer.bye`**, which is what tells every other machine in the fleet. Fixing only
+   * the flag would correct `/v1/devices` on the relay while leaving every agent's own view — and
+   * therefore every machine picker — still showing a departed machine.
+   *
+   * @param {number} [nowMs]
+   * @returns {Array<{machine_id: string, machine_name: string, silent_ms: number}>} what was swept
+   */
+  sweepSilentDevices(nowMs = this.nowMs()) {
+    const went = [];
+    for (const device of this.devices.values()) {
+      if (device.online !== true) continue;
+      const age = this.silenceAgeMs(device, nowMs);
+      if (age === null || age < this.silenceMs) continue;
+      this.emit('notice', {
+        level: 'info',
+        code: 'DEVICE_SILENT',
+        message: `machine ${device.machine_name} (${device.machine_id}) stopped making contact; marking it offline`,
+        machine_id: device.machine_id,
+        silent_ms: age,
+      });
+      this.setOnline(device.machine_id, false, 'silent');
+      went.push({ machine_id: device.machine_id, machine_name: device.machine_name, silent_ms: age });
+    }
+    return went;
+  }
+
+  /**
    * v0.3.0 single-machine status view.
    *
    * `last_heartbeat_at` and `rtt_at` answer different questions, and the gap
    * between them is the whole point: a machine can be heartbeating (alive) while
    * its RTT number is old (a v0.2.3 agent that never sends `rtt_ms`), and a
    * machine can be gone while a plausible-looking RTT is still on file.
+   *
+   * v0.9.1: `online` is additionally cross-checked against silence, so a direct call to this method
+   * (a test, or a caller that never runs the sweep) cannot report a departed machine as present.
+   * The sweep is still what fixes the flag and broadcasts; this only refuses to repeat a stale `true`.
    */
   deviceStatus(machineId, nowMs = this.nowMs()) {
     const device = this.devices.get(machineId);
     if (!device) return null;
     const rttAt = device.rtt_at_ms ?? null;
     const lastHeartbeat = device.last_heartbeat_at_ms ?? null;
+    const silentMs = this.silenceAgeMs(device, nowMs);
+    const silent = device.online === true && silentMs !== null && silentMs >= this.silenceMs;
     return {
       machine_id: device.machine_id,
       machine_name: device.machine_name,
       relay_id: this.relayId,
       connected: (device.streams ?? 0) > 0,
       streams: device.streams ?? 0,
-      online: device.online === true,
+      online: device.online === true && !silent,
+      /**
+       * Why this machine is not usable, when it is not. `null` for a healthy one.
+       *
+       * Added because "offline" without a reason is exactly the shape that made this defect hard to
+       * see: a machine that had been powered off for hours was listed `online`, and a machine that is
+       * correctly offline still gives no clue whether it is gone or merely quiet.
+       *
+       * `silent` first, for the same reason as in `publicDevice`: the stored flag is `true` in the
+       * half-open case, so the silence is the finding.
+       */
+      offline_reason: silent ? 'silent' : (device.online !== true ? 'stream_closed' : null),
+      silent_ms: silentMs,
       rtt_ms: device.rtt_ms ?? null,
       rtt_at: rttAt === null ? null : rfc3339(rttAt),
       rtt_age_ms: this.rttAgeMs(device, nowMs),
@@ -1089,6 +1204,9 @@ export class RabbitState {
 
   /** Public device view — never leaks device_token. */
   publicDevice(device) {
+    // Computed once, so the three fields below cannot disagree with each other.
+    const silentMs = this.silenceAgeMs(device);
+    const silent = silentMs !== null && silentMs >= this.silenceMs;
     return {
       machine_id: device.machine_id,
       machine_name: device.machine_name,
@@ -1114,8 +1232,28 @@ export class RabbitState {
         // list is read by every device, and there is no reason to hand every machine every other
         // machine's key when the verification happens relay-side.
         public_key_present: typeof device.public_key === 'string' && device.public_key !== '',
-      online: device.online,
+      /**
+       * v0.9.1: `online` is derived, not just read.
+       *
+       * It used to be the raw stored flag, which is only ever written by the SSE stream attaching or
+       * detaching. A half-open stream therefore reported `online: true` for a machine that was gone,
+       * and `/v1/devices` handed that to every machine picker in the fleet. The sweep is what flips
+       * the stored flag and broadcasts `peer.bye`; this expression makes the read agree with it even
+       * between sweeps, so no caller can observe the stale value at all.
+       */
+      online: device.online === true && !silent,
       streams: device.streams,
+      /**
+       * v0.9.1: why this machine is not usable, when it is not.
+       *
+       * `silent` is tested FIRST, and that order is the whole subtlety: a half-open stream leaves the
+       * stored `online` flag `true`, so testing `device.online !== true` first reported
+       * `stream_closed` for a machine whose stream was precisely the thing still attached. The
+       * reported defect in one line -- the flag says connected, the truth says gone, and the reason
+       * has to name the truth.
+       */
+      offline_reason: silent ? 'silent' : (device.online !== true ? 'stream_closed' : null),
+      silent_ms: silentMs,
       paired_at: rfc3339(device.paired_at_ms),
       last_seen_at: rfc3339(device.last_seen_at_ms),
       // v0.3.0: `null` means "never measured", which is NOT the same as 0ms.

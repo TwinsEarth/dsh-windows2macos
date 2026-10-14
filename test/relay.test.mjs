@@ -29,6 +29,8 @@ import {
 } from '../src/signing.mjs';
 
 import {
+  DEFAULT_IDLE_HEARTBEAT_MS,
+  DEFAULT_SILENCE_MS,
   MAX_FRAME_BYTES,
   ProtocolError,
   RabbitState,
@@ -339,6 +341,25 @@ async function pairDevice(relay, machineId, extra = {}) {
   });
   assert.equal(res.status, 200, `pair failed: ${res.text}`);
   return { token: res.json.device_token, body: res.json };
+}
+
+/**
+ * One idle diagnostic heartbeat, exactly as a live agent with no lease sends it.
+ *
+ * `diagnostic: true` is required, not decorative: the relay refuses a heartbeat carrying neither a
+ * `task_id` nor that flag, on purpose ("a heartbeat that silently renewed nothing would let an agent
+ * whose task_id went missing stop renewing while believing it was fine"). This helper exists so the
+ * silence tests exercise the real contract rather than a shape the relay happens to accept.
+ *
+ * @returns {Promise<number>} the HTTP status.
+ */
+async function idleHeartbeat(relay, token, machineId) {
+  const res = await request(`${relay.url}/v1/heartbeat`, {
+    method: 'POST',
+    token,
+    body: { diagnostic: true, machine_id: machineId },
+  });
+  return res.status;
 }
 
 const ARGV = ['node', '--test'];
@@ -803,6 +824,150 @@ describe('SSE (§3)', () => {
       assert.equal(relay.state.devices.get('m1').streams, 0);
       assert.equal(relay.state.devices.get('m1').online, false, 'peer.bye → offline');
     });
+  });
+
+  /**
+   * v0.9.1 — presence expiry.
+   *
+   * Reported from a live fleet: a Windows machine that had been powered off for hours was still
+   * listed `online` and still selectable as a dispatch target, with `last_heartbeat_at: null` to say
+   * it had never heartbeated at all.
+   *
+   * The cause was that `online` was written only by the SSE stream attaching or detaching, so a
+   * **half-open stream** — a killed process, a pulled cable, a closed lid — left it `true` for as
+   * long as the socket survived, which is indefinitely. `peer.bye` did not help either, because it is
+   * emitted *by* the detach that never came, so no other machine in the fleet was told either: that
+   * is the "not broadcast" half of the same report.
+   *
+   * These cases pin three separate claims: the flag flips, the departure is broadcast, and a healthy
+   * machine is left alone.
+   */
+  it('marks an online device silent once nothing contacts the relay, and broadcasts peer.bye', async () => {
+    const clock = makeClock();
+    await withRelay({ now: clock.now, silenceMs: 420_000 }, async (relay) => {
+      const { token } = await pairDevice(relay, 'm1');
+      const { token: witnessToken } = await pairDevice(relay, 'm2');
+
+      // m2 stays connected AND keeps heartbeating, as a live idle agent does -- it is the witness, and
+      // a witness that went silent itself would be swept alongside the machine under test.
+      const sse2 = await openSse(`${relay.url}/v1/stream?machine_id=m2`, { token: witnessToken });
+      await sse2.waitFor((f) => f.event === 'ready');
+
+      const sse1 = await openSse(`${relay.url}/v1/stream?machine_id=m1`, { token });
+      await sse1.waitFor((f) => f.event === 'ready');
+      assert.equal(relay.state.devices.get('m1').online, true, 'an attached stream means online');
+
+      // The window passes with m2 heartbeating and m1 completely silent. This is the half-open case:
+      // m1's stream is still open and the machine is gone, so no detach will ever arrive.
+      clock.advance(120_000);
+      assert.equal(await idleHeartbeat(relay, witnessToken, 'm2'), 200, 'the witness must stay alive');
+      clock.advance(180_000);
+      assert.equal(await idleHeartbeat(relay, witnessToken, 'm2'), 200);
+      clock.advance(120_000);
+
+      const swept = relay.state.sweepSilentDevices();
+      assert.equal(swept.length, 1, 'exactly one silent device');
+      assert.equal(swept[0].machine_id, 'm1');
+      assert.equal(relay.state.devices.get('m1').online, false, 'the stored flag must flip');
+      assert.equal(relay.state.deviceStatus('m2').online, true, 'the witness must survive');
+
+      const bye = await sse2.waitFor((f) => f.event === 'peer.bye' && f.json.machine_id === 'm1');
+      assert.equal(bye.json.reason, 'silent', 'the reason must name silence, not a stream close');
+
+      sse1.close();
+      sse2.close();
+    });
+  });
+
+  it('reads a silent device as offline even before the sweep timer runs', async () => {
+    const clock = makeClock();
+    const silenceMs = 420_000;
+    await withRelay({ now: clock.now, silenceMs }, async (relay) => {
+      const { token } = await pairDevice(relay, 'm1');
+      // The observer must be a DIFFERENT device. `RelayServer.handle` calls `touchDevice` on every
+      // authenticated request, so polling `/v1/devices` with m1's own token would refresh m1's
+      // `last_seen_at` and it would look alive *because it was asking*. That is not a hypothetical:
+      // it is what this test did first, and it read a silent machine as online.
+      const { token: observerToken } = await pairDevice(relay, 'observer');
+
+      const sse = await openSse(`${relay.url}/v1/stream?machine_id=m1`, { token });
+      await sse.waitFor((f) => f.event === 'ready');
+
+      clock.advance(silenceMs);
+
+      // No sweep call at all. Nothing may have to wait for a background timer to be told that a
+      // machine which stopped talking is gone -- that lag is how the reported machine stayed in a
+      // picker.
+      const status = relay.state.deviceStatus('m1');
+      assert.equal(status.online, false, 'a read must agree with the rule, not with the stale flag');
+      assert.equal(status.offline_reason, 'silent');
+      assert.equal(status.silent_ms, silenceMs);
+
+      const listed = relay.state.listDevices().find((d) => d.machine_id === 'm1');
+      assert.equal(listed.online, false, '/v1/devices must agree with /v1/status');
+      assert.equal(listed.offline_reason, 'silent');
+
+      // The wire, asked by the observer so that asking does not answer the question.
+      const beforeSweep = await request(`${relay.url}/v1/devices`, { token: observerToken });
+      const wireBefore = beforeSweep.json.devices.find((d) => d.machine_id === 'm1');
+      assert.equal(wireBefore.online, false, 'the wire must agree before the sweep too');
+      assert.equal(wireBefore.offline_reason, 'silent');
+      assert.equal(relay.state.devices.get('m1').online, true, 'the stored flag is still the sweep\'s to clear');
+
+      // And once the sweep runs, the stored flag agrees as well.
+      assert.equal(relay.state.sweepSilentDevices().length, 1);
+      assert.equal(relay.state.devices.get('m1').online, false);
+      const afterSweep = await request(`${relay.url}/v1/devices`, { token: observerToken });
+      assert.equal(afterSweep.json.devices.find((d) => d.machine_id === 'm1').online, false);
+      assert.equal(afterSweep.json.devices.find((d) => d.machine_id === 'm1').offline_reason, 'silent');
+
+      sse.close();
+    });
+  });
+
+  it('leaves a heartbeating device alone, and does not sweep a merely quiet one', async () => {
+    const clock = makeClock();
+    const silenceMs = 420_000;
+    await withRelay({ now: clock.now, silenceMs }, async (relay) => {
+      const { token } = await pairDevice(relay, 'busy');
+      const { token: idleToken } = await pairDevice(relay, 'idle');
+
+      const sseBusy = await openSse(`${relay.url}/v1/stream?machine_id=busy`, { token });
+      await sseBusy.waitFor((f) => f.event === 'ready');
+      const sseIdle = await openSse(`${relay.url}/v1/stream?machine_id=idle`, { token: idleToken });
+      await sseIdle.waitFor((f) => f.event === 'ready');
+
+      // One heartbeat inside the window, which is all a live idle agent has to do.
+      clock.advance(120_000);
+      assert.equal(await idleHeartbeat(relay, token, 'busy'), 200, 'the heartbeat must be accepted');
+
+      // Both are inside the window now: `busy` because it heartbeated, `idle` because one idle beat is
+      // not enough to be declared gone. Sweeping `idle` here would flap every healthy idle machine --
+      // that is the whole reason the threshold is two beats rather than one.
+      assert.equal(relay.state.deviceStatus('busy').online, true);
+      assert.equal(relay.state.deviceStatus('idle').online, true, 'a quiet device is not a dead one');
+      assert.equal(relay.state.sweepSilentDevices().length, 0, 'nothing here is silent yet');
+
+      // And the distinction is real, not just a wider window: push `idle` past the threshold with no
+      // further contact and it is swept, while `busy` is not.
+      clock.advance(silenceMs);
+      assert.equal(await idleHeartbeat(relay, token, 'busy'), 200);
+      const swept = relay.state.sweepSilentDevices();
+      assert.deepEqual(swept.map((s) => s.machine_id), ['idle'], 'only the silent one goes');
+
+      sseBusy.close();
+      sseIdle.close();
+    });
+  });
+
+  it('keeps the silence threshold above the idle cadence, so a healthy idle agent never flaps', () => {
+    // The invariant that makes the rule safe rather than merely plausible. An idle agent heartbeats
+    // every DEFAULT_IDLE_HEARTBEAT_MS; if the threshold ever fell to or below one beat, every healthy
+    // idle machine would flap between online and silent.
+    assert.ok(
+      DEFAULT_SILENCE_MS >= DEFAULT_IDLE_HEARTBEAT_MS * 2,
+      `silence ${DEFAULT_SILENCE_MS}ms must leave at least two idle heartbeats of margin`,
+    );
   });
 });
 

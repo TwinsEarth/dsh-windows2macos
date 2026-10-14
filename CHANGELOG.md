@@ -4,6 +4,75 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] — 2026-10-14
+
+**A powered-off machine stayed `online` and selectable in every fleet view, because `online` was never derived from contact.**
+
+### The report
+
+> *"Another Windows machine, clearly shut down and offline for a long time, is still online and active — not greyed out, still selectable."* And, in the same breath: *"is the fleet heartbeat not synchronised, not updated, not broadcast?"*
+
+All three of those turned out to be one defect with three faces, and the report was exactly right. The relay's own data at the time:
+
+| machine | `online` | `last_heartbeat_at` |
+|---|---|---|
+| `jp-shared` | true | `11:15:55Z` |
+| `macmini` | true | `11:15:41Z` |
+| **`win-desktop` (`549b9fde`)** | **true** | **`null`** |
+| `ToFuture` (here) | true | `11:16:32Z` |
+
+A machine reported `online: true` while `last_heartbeat_at` was `null` — meaning it had **never sent a heartbeat at all**. Two fields in one row contradicted each other and nothing reconciled them.
+
+### The cause
+
+`device.online` was written in exactly two places, and both were the SSE stream:
+
+```js
+device.streams === 0 && this.state.setOnline(sub.machineId, false, 'stream_closed');  // detach
+this.state.setOnline(machineId, true, 'stream_open');                                 // attach
+```
+
+`/v1/devices` then read the flag back:
+
+```js
+online: device.online === true,
+```
+
+**Nothing derived liveness from contact.** So the machine's state was really "is there a TCP connection", and a **half-open stream** — a killed process, a pulled cable, a closed lid; anything that ends the agent without a clean socket close — left `online: true` for as long as the socket survived, which is indefinitely. That is the reported machine: powered off, still listed, still a dispatch target.
+
+The "not broadcast" half is the same cause. `peer.bye` *is* broadcast to every other machine — but it is emitted **by the detach that never came**, so no other machine was ever told either, and every machine picker in the fleet kept offering a departed host.
+
+And the "heartbeat not synchronised" half is the third face: a heartbeat alone could not fix the flag, because the flag did not read heartbeats.
+
+### The fix
+
+**Presence is now expired, next to lease expiry.** A new `sweepSilentDevices()`, driven by the relay's existing 1 s maintenance timer, declares a device silent once nothing has contacted it for `DEFAULT_SILENCE_MS`, and goes through the **existing** `setOnline(id, false, 'silent')` — which both flips the flag and emits `peer.bye`. Going through that path rather than setting the flag directly is the point: correcting only the flag would fix `/v1/devices` on the relay while every agent's own view, and therefore every picker, still showed the departed machine.
+
+**Reads agree between sweeps.** `online` in both `deviceStatus` and `publicDevice` is now derived as well as stored, so nothing has to wait up to a second for a background timer to be told that a machine which stopped talking is gone.
+
+**The threshold is two idle heartbeats (120 s).** An idle agent heartbeats every 60 s and a busy one every 10 s, so the slowest healthy cadence is 60 s and 120 s cannot be reached by a live machine. Deliberately *not* the 20 s lease rule (`heartbeatIntervalMs × missedHeartbeats`): that one guards a task index, where being wrong costs a duplicated execution, while this one guards a display and a target list, where being wrong costs a wasted dispatch. Same reasoning, different price. A test pins the invariant `DEFAULT_SILENCE_MS >= DEFAULT_IDLE_HEARTBEAT_MS * 2`, because a threshold at or below one beat would flap every healthy idle machine.
+
+**`offline_reason` and `silent_ms` are now reported** (`stream_closed` | `silent` | `null`), on `/v1/devices`, in `/v1/status`, and through `w2m_stats`. "Offline" without a reason is precisely the shape that hid this: a departed machine looked identical to a quiet one, and a reader had no field to check.
+
+### What the tests had to be told, twice
+
+Both mistakes are recorded in the test file because both are traps a future reader will fall into:
+
+1. **`RelayServer.handle` calls `touchDevice` on every authenticated request.** The first version of the wire test polled `/v1/devices` *with the token of the machine under test* — so the silent machine refreshed its own `last_seen_at` by asking, and the test read it as online. The observer must be a different device.
+2. **The threshold has to exceed the heartbeat cadence used by the test.** The first version used `silenceMs: 5_000` against a witness that heartbeated every 60 s, so the witness was legitimately swept alongside the machine under test.
+
+A third correction was to the fix itself, and it is the subtle one: `offline_reason` originally tested `device.online !== true` **first**, which reports `stream_closed` for exactly the half-open case — the stream *is* still attached. Silence has to be tested first, or the reason names the wrong thing on the one case that matters.
+
+### Verified
+
+- `test/relay.test.mjs` — **150 tests, 0 failures** (4 new: the sweep plus its broadcast, the pre-sweep read, the healthy-quiet distinction, and the threshold invariant).
+- The 13 suites that touch device or fleet state — **398 tests, 0 failures**.
+- `eslint .` — **0 errors**, 127 warnings.
+
+### Deployment note — this fix is on the wrong side of the wire
+
+The defect lives in the **relay**, so upgrading the plugin does **not** fix a running relay: a machine running v0.9.1 still shows every other machine's stale `online` flag until the relay itself is restarted on v0.9.1. The relay at the shared default address was still serving the stale view when this was written. Restarting it is an operator action, and the relay's own operator token is not something this repository holds.
+
 ## [0.9.0] — 2026-10-14
 
 **Three defects that were mounted, wired, and doing nothing — and the lint gate that had stopped being able to say so.**
