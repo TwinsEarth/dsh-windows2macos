@@ -5057,7 +5057,6 @@ async function startLocalStack(ctx, cfg) {
     /** True when the last attempt failed without sending anything to the relay. */
     let joinLastWasKeyless = false;
     let joinSucceeded = false;
-    let joinAttempts = 0;
     let joinLastError = null;
     async function joinFleet() {
       if (joinSucceeded) return { paired: true, by: 'existing token' };
@@ -5067,7 +5066,6 @@ async function startLocalStack(ctx, cfg) {
       if (coolingDown) return joinPromise;
       joinPromiseAt = Date.now();
       joinPromise = (async () => {
-        joinAttempts += 1;
         if (alreadyPaired) {
           joinSucceeded = true;
           ctx.logger?.info?.(`w2m: already paired (token in ${loaded.path}); not pairing again`);
