@@ -121,7 +121,7 @@ import { mintPunchId, punchSession } from '../agent/p2p.mjs';
 // rather than reimplemented: the dispatcher and the executor have to derive the *same* keys, and two
 // implementations of a handshake are two chances to disagree about it.
 import { DeviceKey } from '../agent/crypto.mjs';
-import { loadOrCreateIdentity } from '../agent/identity.mjs';
+import { loadOrCreateIdentity, saveDeviceToken } from '../agent/identity.mjs';
 import { resolveStateDir } from '../util/cli.mjs';
 import { parseServer } from '../agent/stun.mjs';
 // The result-deduplication identity the relay mints. Imported rather than re-implemented: the value
@@ -4678,6 +4678,22 @@ async function startLocalStack(ctx, cfg) {
       ctx.logger?.info?.(`w2m: stateDir was unset; using ${resolvedStateDir}`);
     }
 
+    /**
+     * v0.8.6: the identity, and the options needed to WRITE IT BACK.
+     *
+     * loadOrCreateIdentity is read-only. The token it gains at pairing lives only in memory
+     * unless something calls saveDeviceToken -- and nothing in this path did, so a machine could
+     * pair successfully, appear in the relay's device table, and then answer 401 to every
+     * authenticated request after the next restart, because device.json still said device_token:
+     * null.
+     *
+     * The CLI has always done this (in/w2m-localside.mjs: saveDeviceToken(paired.device_token)).
+     * The in-process path was written without it, which is why the symptom looked like a permission
+     * fault rather than a missing line.
+     */
+    const identityOptions = { name: cfg.machineName, rabbitUrl: cfg.rabbitUrl ?? undefined };
+    const loaded = loadOrCreateIdentity(identityOptions);
+
     const agent = await createAgent({
       rabbitUrl: relay?.url ?? cfg.rabbitUrl,
       // `project`, not `projectDir`: the option `createAgent` documents, and the one it requires.
@@ -4687,7 +4703,10 @@ async function startLocalStack(ctx, cfg) {
       // a machine has ONE identity whether the agent runs in-process or as its own process --
       // otherwise each would mint its own keypair and overwrite the other's announcement under a
       // shared machine_id (the v0.6.2 defect, in a new place).
-      identity: loadOrCreateIdentity({ name: cfg.machineName, rabbitUrl: cfg.rabbitUrl ?? undefined }).identity,
+      // The identity options are kept in a variable because the SAME options must be used to write
+      // the device token back. Reading with one set and writing with another is how the plugin and
+      // the CLI ended up each minting a keypair under one machine_id (the v0.6.2 defect).
+      identity: identityOptions.identity,
       allowedCommands: cfg.allowedCommands,
     });
     /**
@@ -4726,7 +4745,32 @@ async function startLocalStack(ctx, cfg) {
     const pairBy = fleetKey !== null ? `fleet key (${fleetKeySource})` : cfg.pairingCode ? 'pairing code' : null;
     if (pairBy !== null) {
       try {
-        await agent.pair(cfg.pairingCode ?? null, undefined, fleetKey);
+        const paired = await agent.pair(cfg.pairingCode ?? null, undefined, fleetKey);
+        /**
+         * v0.8.6: **persist the token.** Without this the pairing is thrown away.
+         *
+         * `agent.pair` sets `identity.device_token` on its in-memory object only. Nothing in this
+         * path wrote it back, so the observable behaviour was: the relay registers the device, the
+         * machine appears in `w2m_devices`, and then every authenticated call answers
+         * `401 UNAUTHORIZED` -- `w2m_devices`, the P2P announce, all of it -- because `device.json`
+         * still said `device_token: null`. It reads as a permission failure and is a missing write.
+         *
+         * The CLI has always done this; the in-process path was written without it.
+         * `saveDeviceToken` throws on an empty token rather than storing one, which is the right
+         * shape: a silent null here is exactly the state this line removes.
+         */
+        try {
+          saveDeviceToken(paired?.device_token, identityOptions);
+          ctx.logger?.info?.(`w2m: device token persisted to ${loaded.path}`);
+        } catch (error) {
+          // Named rather than silent: a machine that paired but cannot authenticate is the exact
+          // failure this release exists to remove, and it must not be quiet a second time.
+          ctx.logger?.warn?.(
+            'w2m: paired but the device token could NOT be persisted ('
+            + `${error instanceof Error ? error.message : String(error)}) -- this machine will answer `
+            + '401 to every authenticated call until that is fixed',
+          );
+        }
         ctx.logger?.info?.(`w2m: paired by ${pairBy}`);
       } catch (error) {
         // Named rather than swallowed: an agent that failed to pair runs and does nothing, which

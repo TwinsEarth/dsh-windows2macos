@@ -4,6 +4,64 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.6] — 2026-10-14
+
+**The pairing worked and the token was thrown away.**
+
+### The defect
+
+`startLocalStack` called `agent.pair(...)` and **never persisted the result**. `agent.pair` sets
+`identity.device_token` on its **in-memory object only**, so the observable behaviour was:
+
+1. the account-derived key is computed ✅
+2. the relay **accepts** the pair and registers the device ✅
+3. the machine appears in `w2m_devices` ✅
+4. **every authenticated call then answers `401 UNAUTHORIZED`** — `w2m_devices`, the P2P announce,
+   all of it — because `device.json` still said `device_token: null` ❌
+
+It reads as a permission failure and is **a missing write**.
+
+The evidence that settles it is the shape of the value: not an empty string, not a truncated token —
+**`null`**. A write that failed would leave the previous value; a write that never happened leaves
+what the identity was created with.
+
+### Why the CLI never had this bug
+
+`bin/w2m-localside.mjs` has always done it:
+
+```js
+const paired = await agent.pair(flags.pair ?? null, undefined, fleetKey);
+saveDeviceToken(paired.device_token, {});     // ← the CLI persists it
+```
+
+**The in-process path was written without that line.** So the two paths diverged in exactly the way
+that produces a symptom in one and not the other — which is why it looked like a relay or permission
+problem rather than a missing statement.
+
+### Fixed
+
+`saveDeviceToken(paired.device_token, identityOptions)` now runs after a successful pair, using the
+**same options object** that loaded the identity. Reading with one set of options and writing with
+another is how the plugin and the CLI once ended up each minting a keypair under one `machine_id`
+(the v0.6.2 defect), so the options are captured once and used for both.
+
+A failure to persist is **named at warn level**, including what it means: *"this machine will answer
+401 to every authenticated call until that is fixed."* That exact condition was silent once already.
+
+### The pattern this is the third instance of
+
+* v0.8.4 wired the **derivation** but the gate in front of it was closed.
+* v0.8.5 fixed the **second gate** (`stateDir`) but not the write behind it.
+* v0.8.6 fixes the **write**.
+
+Each time, the action was connected and its **persistence or precondition** was not. Worth stating
+plainly because it is the shape of every bug in this series: **the thing that makes the result
+survive is the thing that gets forgotten.**
+
+### Verified
+
+**174 cases** across the tools, apply, account and fleet-join suites.
+
 ## [0.8.5] — 2026-10-14
 
 **Two gates, not one — and the silence that hid both.**
