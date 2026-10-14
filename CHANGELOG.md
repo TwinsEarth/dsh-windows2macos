@@ -4,6 +4,64 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.4] — 2026-10-14
+
+**The last connection — the one that makes the feature user-facing.**
+
+### The gap
+
+The `chatops` half derived the fleet key from `userId` and exposed it. The `plugin/tools.mjs` half
+accepted a key and handed it to the agent. **Neither knew about the other**, so the plugin read
+`fleetKey` from config or `W2M_FLEET_KEY` — and a machine with a signed-in account still joined
+nothing without a human setting a variable.
+
+Two halves that each work, with no wire between them, is the same failure as v0.8.1's: the capability
+existed and nothing exercised it.
+
+### Now
+
+`startLocalStack` derives the key itself, from the account, via the same
+`createAccountIdentity({ ctx }).resolve()` the rest of the plugin uses. The derivation belongs there
+because **the host is the only layer that can read the account** — a standalone agent cannot — so the
+key must be produced where `ctx` is available rather than where it is used.
+
+Verified with DSH's own context shape:
+
+```
+ctx.get('deepseekAccount') -> createAccountIdentity({ ctx }).resolve()
+  -> fleetKey (43 chars) -> fleetId d5bb1b9ddf3faad4     (matches the existing derivation)
+  signed-out                 -> named reason, no key invented
+  no account service         -> named reason
+```
+
+### Two failure modes, handled differently on purpose
+
+* A **derivation failure is caught and logged, not thrown** — an unpaired agent still runs and can be
+  paired later, whereas a thrown start is a machine that never appears at all.
+* **`signed-out` is logged at info, not warn** — being signed out is a normal state, and the design
+  says a machine with no account must not be given a random fleet. Warning about it would train an
+  operator to ignore the line that matters.
+
+An explicitly configured `fleetKey` still wins, and the log names which source was used — `paired by
+fleet key (account)` or `(config)` — so nobody has to guess where the key came from.
+
+### A defect in this patch, caught by the compiler
+
+The first edit consumed the `} catch (error) {` line and left the catch body inside the `try`, which
+`node --check` reported immediately. Worth recording because the same edit pattern — replacing a
+block by line range — corrupted a function in v0.8.1 as well.
+
+### Verified
+
+**174 cases** across the tools, apply, account and fleet-join suites.
+
+### This is what closes the reported bug
+
+A new machine, installed and signed into the same account, derives its fleet key, presents it at
+pairing, and lands in the same fleet — **with no key to copy and no operator step**. That is the
+behaviour the original report asked for, and it is now reachable by configuration rather than by
+convention.
+
 ## [0.8.3] — 2026-10-14
 
 **The last wire, and the reason it was never there.**
