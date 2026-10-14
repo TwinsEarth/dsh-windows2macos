@@ -4790,14 +4790,31 @@ async function startLocalStack(ctx, cfg) {
     }
 
     /**
-     * Name what actually went wrong, including the shape that used to say nothing.
+     * Name what actually went wrong, including the shapes that used to say nothing.
      *
-     * `ok: true` with a null key is the stored-SN path, and it was invisible before: the old code
-     * only logged when `ok === false`, so the one branch that was firing had no output.
+     * `ok: true` with a null key was invisible before: the old code only logged when `ok === false`,
+     * so the one branch that was firing had no output.
+     *
+     * ## v0.8.11: read `fleetKeyReason`, and stop guessing
+     *
+     * v0.8.10 taught `resolve()` to return *why* the derivation failed -- and **nothing consumed
+     * it**, so the reason was written into a value and never printed. A fix that adds a field no
+     * caller reads is not a fix; it is a field.
+     *
+     * The `ok: true` wording also guessed *"the profile may not be loaded yet"*, which was true
+     * when this ran once at mount. After v0.8.9's retries that reading is usually **wrong** --
+     * sixty seconds of backoff have passed -- and a confident wrong explanation is worse than
+     * none, because it sends the reader to check timing when the cause is elsewhere. The real
+     * reason travels in `fleetKeyReason`, so report that instead of a guess.
      */
     function describeIdentityFailure(identity) {
       if (!identity) return 'no result';
-      if (identity.ok === true) return 'signed in, but the account returned no fleet key (the profile may not be loaded yet)';
+      if (identity.ok === true) {
+        if (typeof identity.fleetKeyReason === 'string' && identity.fleetKeyReason !== '') {
+          return identity.fleetKeyReason;
+        }
+        return 'signed in, but the account produced no fleet key and gave no reason';
+      }
       return `${identity.reason}${identity.detail ? `: ${identity.detail}` : ''}`;
     }
 
