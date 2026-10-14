@@ -4,6 +4,80 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.3] — 2026-10-14
+
+**An undeclared anchor was compared against the literal `null`, so every dispatch from a non-git machine was `unverifiable` — including the ones that succeeded.**
+
+### The report, and why it read as a lie
+
+A relay was asked what happened to a task, and every answer came back the same way:
+
+```
+status : unverifiable
+reasons: ["base_commit \"a1e7dc042913b96da3ad68… != expected null"]
+notes  : ["aggregation refused: Step 1 anchor violation"]
+```
+
+while the machine's own record said `lease_state: done`, `status: ok`, `exit_code: 0`. A reader has no way
+to prefer either half, so a task that ran perfectly was reported as one that could not be trusted — and
+the same verdict came back for **every** dispatch.
+
+### The cause
+
+`report.mjs` Step 1 compared the anchor unconditionally:
+
+```js
+if (canon(valueOf(env, 'base_commit')) !== canon(expected.base_commit)) {
+```
+
+`expected.base_commit` comes from `task.base_commit ?? null`, and a dispatcher whose own tree is not a
+git work tree — the ordinary case for the plugin running out of its profile directory — sends `null`. So
+the comparison was *"the machine's real commit **equals null**"*, which no machine with an anchor can
+satisfy. **A machine was marked untrustworthy for reporting its commit truthfully.**
+
+That the two anchors disagree is the whole story. `base_tree` six lines below has always read:
+
+```js
+if (expected.base_tree !== null && canon(valueOf(env, 'pre_tree_fingerprint')) !== canon(expected.base_tree)) {
+```
+
+— it tolerates absence. `base_commit` did not. Same kind of statement, opposite handling, and the
+asymmetry is the bug. The protocol cannot even distinguish the two cases: `state.mjs` normalises both an
+absent field and an explicit `null` with `input.base_commit ?? null`, so "no anchor" and "anchor is null"
+arrive identically and must be treated identically.
+
+### The fix
+
+`base_commit` is enforced only when the dispatcher declared one, matching `base_tree`. The relaxation is
+**reported, not silent**: an `unanchored: true` field on the aggregate plus a note saying
+
+> no base_commit was declared, so the anchor check did not run: machine agreement here is agreement with
+> each other, not with a tree the dispatcher named
+
+because *"these machines agreed"* and *"nobody said what they should have agreed on"* must not read the
+same to an operator. `consistent: true` from an unanchored run says the machines matched; it does not say
+they ran the tree you meant.
+
+### Verified
+
+- `test/relay.test.mjs` — **152 tests, 0 failures**, including two new ones: the undeclared anchor is
+  skipped and reported, and a **declared** anchor mismatch still refuses aggregation. The second exists
+  because the first is a relaxation, and a relaxation without a falsifying test is how a check quietly
+  disappears.
+- `eslint .` — 0 errors.
+- The rest of the pre-flight — gate inventory, test wiring, workflow wiring, entry points, packed tarball,
+  claims, CHANGELOG shape — all green. The one red gate is `declared suite`, whose 38 failures on this host
+  are 38 tests that shell out to `git`, which is not installed here.
+
+### Note on where task output lives
+
+Investigating this also settled a question that had cost real time: the relay stores **no** task output. A
+task record carries `machine_id`, `lease_state`, `outcome`, `status`, `exit_code`, `transport`, `p2p` and
+`reasons` — and no `stdout`, no `stderr`, not even `stdout_sha256`, despite `COMPARABLE_FIELDS` naming
+those fields. So "sync the output home" cannot be solved at the relay, by any port or proxy: the text was
+never kept. Any durable record of what a command printed has to be written **on the machine that ran it** —
+which is exactly where the fleet-memory work begins.
+
 ## [0.9.2] — 2026-10-14
 
 **The gate added in v0.8.11 pointed at a file that had never been committed, so it failed on all four CI platforms.**

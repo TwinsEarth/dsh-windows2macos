@@ -1490,6 +1490,55 @@ describe('six-state aggregation (§6.3)', () => {
     assert.equal(agg3.status, 'unverifiable');
   });
 
+  it('an undeclared anchor is skipped, not compared against null', () => {
+    /**
+     * v0.9.3. A dispatcher whose own tree is not a git work tree sends `base_commit: null`, and the
+     * check used to compare every machine's real commit against the literal `null`. Every dispatch from
+     * such a machine was therefore `unverifiable` -- including a wholly successful one -- with the
+     * reason `base_commit "a1e7dc04…" != expected null`, and the verdict became unreadable.
+     *
+     * `fakeTask` without `base_commit`/`base_tree` overrides is exactly that dispatcher.
+     */
+    // `fakeTask` substitutes BASE_COMMIT for an *undefined* override, so the absence has to be stated
+    // explicitly -- `null` is the dispatcher saying "I have no anchor", which is the case under test.
+    const task = fakeTask({ machines: ['m1'], base_commit: null, base_tree: null });
+    assert.equal(task.base_commit, null, 'this fixture must have no anchor, or it tests nothing');
+
+    const agg = aggregate(task, [rec('m1', makeEnvelope({ machine_id: 'm1' }))]);
+
+    assert.equal(agg.unanchored, true, 'an absent anchor must be reported as such');
+    assert.equal(agg.expected.base_commit, null);
+    assert.equal(
+      agg.steps[1].violations.length,
+      0,
+      'a machine reporting its real commit must not violate an anchor nobody declared',
+    );
+    assert.notEqual(agg.status, 'unverifiable', `expected a usable verdict, got ${agg.status}`);
+    assert.equal(
+      agg.machines[0].reasons.some((r) => r.includes('base_commit')),
+      false,
+      'no base_commit reason may be recorded for an undeclared anchor',
+    );
+    assert.ok(
+      agg.notes.some((n) => n.includes('agreement with each other, not with a tree')),
+      'the unanchored case must say so in the notes, so agreement is not read as tree-identity',
+    );
+  });
+
+  it('a declared anchor is still enforced, and unanchored is not set', () => {
+    // The falsifying direction: the relaxation above must not have disabled the check itself.
+    const task = fakeTask({ machines: ['m1', 'm2'] });
+    assert.notEqual(task.base_commit, null, 'this fixture must carry an anchor');
+
+    const agg = aggregate(task, [
+      rec('m1', makeEnvelope({ machine_id: 'm1' })),
+      rec('m2', makeEnvelope({ machine_id: 'm2', base_commit: 'a different commit' })),
+    ]);
+
+    assert.equal(agg.unanchored, false);
+    assert.equal(agg.status, 'unverifiable', 'a real anchor mismatch must still refuse aggregation');
+  });
+
   it('step order matters: Step 1 wins over a would-be consistent Step 3', () => {
     const task = fakeTask({ machines: ['m1', 'm2'] });
     const e1 = makeEnvelope({ machine_id: 'm1' });

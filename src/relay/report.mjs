@@ -216,7 +216,34 @@ export function aggregate(task, resultRecords = [], opts = {}) {
       m.reasons.push('envelope status = unverifiable');
     }
     if (missing.length > 0) m.reasons.push(`missing required fields: ${missing.join(',')}`);
-    if (canon(valueOf(env, 'base_commit')) !== canon(expected.base_commit)) {
+    /**
+     * v0.9.3: `base_commit` is enforced only when the dispatcher declared one.
+     *
+     * The check used to be unconditional, so a dispatcher with **no** anchor -- one whose own tree is
+     * not a git work tree, which is the ordinary case for a machine that runs the plugin from its
+     * profile directory -- sent `base_commit: null`, and every result was then compared against the
+     * literal `null`. Any machine that *did* have an anchor reported its real commit and was marked
+     * `unverifiable` for telling the truth:
+     *
+     *     expected.base_commit : null
+     *     machine reported     : a1e7dc042913b96da3ad68…
+     *     reasons              : ["base_commit \"a1e7dc04…\" != expected null"]
+     *     notes                : ["aggregation refused: Step 1 anchor violation"]
+     *
+     * which downgraded **every** dispatch from such a machine, including a wholly successful one, and
+     * made the verdict unreadable. The anchor exists to answer "did these machines run the same tree";
+     * with nothing declared there is no such question, and the honest verdict is that the run is
+     * unanchored -- not that it disagreed with `null`.
+     *
+     * `base_tree` three lines below has always read this way (`expected.base_tree !== null && …`), and
+     * the asymmetry was the bug: the two anchors are the same kind of statement and one of them
+     * tolerated absence while the other did not.
+     *
+     * An absent anchor is still *reported* rather than silently ignored -- `unanchored: true` on the
+     * aggregate and in the machine's own record -- because "these two machines agreed" and "nobody
+     * said what they should have agreed on" must not read the same to an operator.
+     */
+    if (expected.base_commit !== null && canon(valueOf(env, 'base_commit')) !== canon(expected.base_commit)) {
       m.reasons.push(`base_commit ${truncate(canon(env.base_commit), 24)} != expected ${truncate(canon(expected.base_commit), 24)}`);
     }
     if (expected.base_tree !== null && canon(valueOf(env, 'pre_tree_fingerprint')) !== canon(expected.base_tree)) {
@@ -429,6 +456,18 @@ export function aggregate(task, resultRecords = [], opts = {}) {
     created_by: task.created_by ?? null,
     cancelled: task.cancelled === true,
     expected,
+    /**
+     * v0.9.3: whether this task ran against a declared tree at all.
+     *
+     * `expected.base_commit === null` means the dispatcher declared no anchor -- its own tree is not a
+     * git work tree, which is the ordinary case for the plugin running out of a profile directory. The
+     * anchor check is therefore skipped rather than compared against the literal `null` (see Step 1).
+     *
+     * Reported explicitly because the two situations must not look alike: `consistent: true` from an
+     * unanchored run says "these machines agreed with each other", **not** "these machines ran the
+     * tree you meant". An operator comparing results needs to know which of those they are holding.
+     */
+    unanchored: expected.base_commit === null,
     machines: machines.map((m) => ({
       machine_id: m.machine_id,
       machine_name: m.machine_name,
@@ -451,7 +490,10 @@ export function aggregate(task, resultRecords = [], opts = {}) {
     })),
     steps,
     differences: step3.differences ?? [],
-    notes,
+    notes: expected.base_commit === null
+      ? [...notes, 'no base_commit was declared, so the anchor check did not run: machine agreement here is '
+        + 'agreement with each other, not with a tree the dispatcher named']
+      : notes,
     counts: {
       refused: step0.refused.length,
       unverifiable: step1.violations.length,
