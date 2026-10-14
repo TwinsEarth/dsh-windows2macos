@@ -4742,8 +4742,28 @@ async function startLocalStack(ctx, cfg) {
       }
     }
 
+    /**
+     * v0.8.7: **pair only when there is no token**, because the relay rate-limits pairing.
+     *
+     * The previous version paired on EVERY start: the fleet key is derived unconditionally, so
+     * `pairBy` was never null and the branch always ran. The relay allows
+     * `pair_rate_limit: 5` per minute, so five restarts inside a minute would hit the limit --
+     * and a rate-limit refusal reads as a pairing failure, which reads as a fleet problem.
+     * A machine that already holds a token has nothing to gain from pairing again: the relay
+     * would re-issue one and invalidate the old, for no reason.
+     *
+     * So the condition is the token: absent -> pair once and persist; present -> leave it alone.
+     * That is also what makes the persisted token load-bearing rather than an optimisation --
+     * without it every start is a fresh pairing, which is why the missing write in v0.8.5 and
+     * the unconditional pairing here were the same defect seen from two sides.
+     */
+    const existingToken = loaded.identity.device_token;
+    const alreadyPaired = typeof existingToken === 'string' && existingToken !== '';
+
     const pairBy = fleetKey !== null ? `fleet key (${fleetKeySource})` : cfg.pairingCode ? 'pairing code' : null;
-    if (pairBy !== null) {
+    if (alreadyPaired) {
+      ctx.logger?.info?.(`w2m: already paired (token in ${loaded.path}); not pairing again`);
+    } else if (pairBy !== null) {
       try {
         const paired = await agent.pair(cfg.pairingCode ?? null, undefined, fleetKey);
         /**

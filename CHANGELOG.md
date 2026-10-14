@@ -4,6 +4,50 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.7] — 2026-10-14
+
+**Pair only when there is no token — because the relay rate-limits pairing.**
+
+### The defect
+
+v0.8.6 made the token persist; it still **paired on every start**. The fleet key is derived
+unconditionally, so `pairBy` was never null and the pairing branch always ran.
+
+The relay allows `pair_rate_limit: 5` per minute. **Five restarts inside a minute hit the limit — and
+a rate-limit refusal reads as a pairing failure, which reads as a fleet problem.** The symptom would
+have pointed at the network, the relay, or the account, none of which would be at fault.
+
+A machine that already holds a token has nothing to gain from pairing again: the relay would re-issue
+one and invalidate the old, for no reason.
+
+### Fixed
+
+```js
+const existingToken = loaded.identity.device_token;
+const alreadyPaired = typeof existingToken === 'string' && existingToken !== '';
+
+if (alreadyPaired) {
+  ctx.logger?.info?.(`w2m: already paired (token in ${loaded.path}); not pairing again`);
+} else if (pairBy !== null) {
+  // pair once, then persist
+}
+```
+
+**This also makes the persisted token load-bearing rather than an optimisation.** Without it every
+start is a fresh pairing — which is why *the missing write in v0.8.5* and *the unconditional pairing
+here* are **the same defect seen from two sides**: one threw the token away, the other had to
+re-create it every time.
+
+### A note on how this was found
+
+Reported, with reasoning and a rate-limit number from the relay's own configuration — not from a
+failing test. The distinction matters for what it implies: **nothing in the suite would have caught
+it**, because every case starts from a fresh state and none of them restart the plugin in a loop.
+
+### Verified
+
+**174 cases** across the tools, apply, account and fleet-join suites.
+
 ## [0.8.6] — 2026-10-14
 
 **The pairing worked and the token was thrown away.**
