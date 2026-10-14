@@ -1438,7 +1438,28 @@ describe('happy paths', () => {
       assert.equal(value.task_id, '01JZZZ');
       assert.equal(value.seq, 42);
       assert.equal(value.leases.length, 2);
-      assert.match(value.note, /unverifiable/, 'a machine with no fingerprint must say so up front');
+
+      /**
+       * A machine with no fingerprint must say so up front — but it must not claim a verdict.
+       *
+       * This asserted `/unverifiable/` until v0.9.4, which encoded a promise the relay no longer keeps:
+       * the relay used to compare an absent anchor against the literal `null`, so an unanchored dispatch
+       * really could never aggregate. v0.9.3 made it skip a check nobody declared, so the same dispatch
+       * now reaches a real verdict and the old wording told operators to doubt a correct `ok`.
+       *
+       * So the assertion is on the *claim*, not the phrasing: the note must warn that no anchor was
+       * declared (the operator cannot tell "these machines agreed" from "they ran the tree I named"
+       * otherwise), and must not assert what the verdict will be. The negative case is the one that
+       * matters — it is what stops the stale promise from being written back in.
+       */
+      assert.match(value.note, /no anchor was declared/, 'the absence of an anchor must be stated up front');
+      assert.match(value.note, /compared with each other|not against a named tree/i, 'and what that costs must be stated too');
+      assert.doesNotMatch(
+        value.note,
+        /unverifiable/,
+        'the note must not promise a verdict: the relay decides that, and an unanchored dispatch is now '
+          + 'aggregated normally',
+      );
     } finally {
       fetchStub.restore();
     }

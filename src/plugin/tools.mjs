@@ -3874,8 +3874,21 @@ export async function apply(ctx, config = {}) {
                 session: sessionKey,
                 ...selectionReason,
               },
+          /**
+           * The note has to match what the relay will actually do.
+           *
+           * It used to read "...and the aggregate will be unverifiable", which was true when the relay
+           * compared an absent anchor against the literal `null`: every machine with a real commit
+           * violated it, so an unanchored dispatch could never aggregate. v0.9.3 made the relay skip a
+           * check nobody declared (`base_commit` now behaves like `base_tree` always did), so the same
+           * dispatch reaches a real verdict -- and the old wording would have told an operator to doubt
+           * an `ok` result that is correct.
+           *
+           * What is still true, and is the thing worth saying: without an anchor there is no answer to
+           * "did these machines run the same tree", so consistency here is agreement between machines.
+           */
           note: anchors.base_tree === null
-            ? 'this machine\'s working tree could not be fingerprinted, so peers have no anchor to match and the aggregate will be unverifiable'
+            ? 'this machine\'s working tree could not be fingerprinted, so no anchor was declared: peers are compared with each other, not against a named tree'
             : 'peers are checked against base_commit + base_tree + command_hash',
         },
         null,

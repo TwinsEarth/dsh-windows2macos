@@ -4,6 +4,49 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.4] — 2026-10-14
+
+**A note that promised a verdict the relay no longer delivers, and the test that had locked the promise in.**
+
+### What v0.9.3 left behind
+
+v0.9.3 made the relay skip an anchor nobody declared, so an unanchored dispatch now aggregates normally —
+the live relay returns `state: consistent`, `counts.ok: 1` for a command that used to come back
+`unverifiable`. The plugin, however, still opened every such dispatch with:
+
+> this machine's working tree could not be fingerprinted, so peers have no anchor to match and
+> **the aggregate will be unverifiable**
+
+which was true when it was written and is now false. The fixed mechanism had been left with a sentence
+telling operators to doubt a verdict that is correct, so the note now says what is actually the case:
+
+> this machine's working tree could not be fingerprinted, so no anchor was declared: peers are compared
+> with each other, not against a named tree
+
+### The test had encoded the promise
+
+`test/tools.test.mjs` asserted `assert.match(value.note, /unverifiable/)`, so fixing the wording broke
+the suite — and the tempting repair is to put the sentence back and keep the suite green. That would have
+been the wrong way round: **the test was guarding a claim, not a behaviour.** It now asserts the claim:
+
+- the note must state that no anchor was declared;
+- it must state what that costs — agreement between peers, not with a named tree;
+- and `assert.doesNotMatch(value.note, /unverifiable/)`, so the stale promise cannot be written back in.
+
+The third is the one that earns its place. A positive match on a *new* sentence would have passed too and
+guarded nothing; the negative case is what stops the old sentence returning.
+
+### Verified
+
+- `test/relay.test.mjs` — 152 tests, 0 failures.
+- `test/claims.test.mjs` — 47 pass. It caught this release's own omission on the first run: the version
+  was bumped to 0.9.4 while the newest CHANGELOG entry still said 0.9.3, and it refused with *"One of them
+  is the release; the other is a mistake."* Correct, and the reason this entry exists.
+- `test/tools.test.mjs` — 90 pass, 1 failure: `w2m_run computes base_commit and base_tree from a real git
+  work tree`, which fails with `spawn git ENOENT` because **git is not installed on this host**. That is
+  the same environmental cause as the 38 `declared suite` failures, not a regression.
+- `eslint .` — 0 errors, 127 warnings.
+
 ## [0.9.3] — 2026-10-14
 
 **An undeclared anchor was compared against the literal `null`, so every dispatch from a non-git machine was `unverifiable` — including the ones that succeeded.**
