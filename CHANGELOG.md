@@ -4,6 +4,42 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.2] — 2026-10-14
+
+**The gate added in v0.8.11 pointed at a file that had never been committed, so it failed on all four CI platforms.**
+
+### What was broken
+
+`verify:join` was wired in three places across two releases:
+
+| where | when |
+|---|---|
+| `package.json` → `"verify:join": "node scripts/verify-join.mjs"` | v0.8.11 |
+| `.github/workflows/ci.yml` → `- run: npm run verify:join` | (pushed in v0.9.1) |
+| `.github/workflows/release.yml` → `- run: npm run verify:join` | (pushed in v0.9.1) |
+
+**`scripts/verify-join.mjs` itself was never in the repository.** It existed only in the working tree that built the tarballs, so every CI platform failed with the least interesting error available:
+
+```
+Error: Cannot find module '/home/runner/work/dsh-windows2macos/dsh-windows2macos/scripts/verify-join.mjs'
+code: 'MODULE_NOT_FOUND'
+```
+
+On `ubuntu-latest/22`, `windows-latest/22`, `windows-latest/20` and `macos-latest/22` alike. A file-existence check would have caught it; a review of the diff would not, because the diff was of files that existed.
+
+### How it was found
+
+By reading the CI failure logs rather than the CI summary. The summary said *"The fleet join reaches a token (stub agent, no relay)"* failed — which reads like the check *ran and disagreed*. It had not run at all. The summary named the step; only the log said `MODULE_NOT_FOUND`.
+
+The same class of mistake as the four files an earlier push left behind (see v0.9.1), and it is worth naming the shared root cause: **the v0.8.x tarballs were packed from a working tree, while the repository was written to by listing files individually.** A pack packs everything; an explicit list omits what the author forgets. The durable fix is to stop enumerating — but until this release the enumeration is what the tree had.
+
+So this release does the one thing v0.9.1 should have: it diffs the working tree against the repository in **both** directions, and the only file present locally and absent remotely was this one.
+
+### Verified
+
+- `node scripts/verify-join.mjs` — 16/16 locally, which it always was; the defect was never in the script.
+- The full local tree now differs from the repository in exactly the ways this release intends, in both directions.
+
 ## [0.9.1] — 2026-10-14
 
 **A powered-off machine stayed `online` and selectable in every fleet view, because `online` was never derived from contact.**
