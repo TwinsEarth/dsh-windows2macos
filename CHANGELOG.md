@@ -4,6 +4,62 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.5] — 2026-10-14
+
+**Two gates, not one — and the silence that hid both.**
+
+### The second gate
+
+v0.8.4's analysis said the join sequence was blocked by `autoStartAgent` defaulting to false. That
+was right and incomplete: **an unset `stateDir` threw as well**, so flipping the switch would have
+failed too.
+
+```
+stateDir=empty string -> THREW: createAgent: stateDir is required
+```
+
+`createAgent` rejects a falsy `stateDir`; the plugin's resolved default is the empty string; and
+`startLocalStack` passed it straight through. **Two gates in series, and the analysis found the one
+in front.**
+
+`stateDir` now resolves to a real path (`$DSH_HOME/xclient/localside`) when unset, resolved in
+`startLocalStack` so `w2m_status` reports the path actually used — which is what makes *"where did it
+write `device.json`"* answerable rather than a guess.
+
+### The silence, which is the real defect
+
+A machine could run v0.8.4, hold a valid signed-in account, reach the relay over **HTTP 200**, and
+be in **no fleet** — with nothing anywhere reporting a problem. The eight tools registered, the
+plugin looked healthy, and the join sequence simply never ran.
+
+**A silent no-op that looks like success is the worst failure mode this plugin has had**, because
+every diagnostic signal a person would reach for says the system is fine. The evidence that finally
+settled it was an *absence* — no `device.json`, no `xclient`, no listening ports — and an absence
+is only readable once you know what should have been there.
+
+So the disabled branch now says so, at warn level, naming what it means and how to change it:
+
+> `w2m: no agent is running on this machine, so it is in no fleet and will receive no work. Set autoStartAgent: true to join …`
+
+One line turns *"why is this machine not in my fleet"* from an investigation into a log search.
+
+### A test that measured a count instead of a message
+
+`tools.test.mjs` asserted `warnings.length === 1` for the `dsh-tools` shim warning — a claim about
+**every** warning the plugin will ever emit, so the new one broke a test about something else
+entirely. It now matches the message it is about. **The count was never the property.**
+
+### What is still required, stated plainly
+
+The switch does not default to on, deliberately: a control machine that only *dispatches* to others
+has no reason to be in the fleet itself. So joining requires `autoStartAgent: true` **and** a
+`w2m` row in the profile — and the profile having no such row is the state every fresh install
+starts in.
+
+### Verified
+
+**174 cases** across the tools, apply, account and fleet-join suites.
+
 ## [0.8.4] — 2026-10-14
 
 **The last connection — the one that makes the feature user-facing.**

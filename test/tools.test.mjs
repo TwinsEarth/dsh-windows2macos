@@ -1932,15 +1932,23 @@ describe('bounds and cancellation', () => {
     const { tools, warnings } = await register({ rabbitUrl: RABBIT });
     assert.equal(tools.size, 8, 'the plugin must register all eight tools on either path');
 
-    if (warnings.length === 0) {
+    /**
+     * Match the warning this test is about, rather than counting warnings.
+     *
+     * A first version asserted `warnings.length === 1`, which is a claim about *every* warning the
+     * plugin will ever emit — so an unrelated new one (v0.8.5's "no agent is running") broke a test
+     * about `dsh-tools` resolution. The count was never the property; the message was.
+     */
+    const shim = warnings.filter((w) => /did not resolve/.test(w));
+    if (shim.length === 0) {
       // The package resolved: the real defineTool accepted all eight definitions, which is the
       // stronger outcome. Nothing degraded, so there is nothing more to assert here.
       return;
     }
-    assert.equal(warnings.length, 1);
-    assert.match(warnings[0], /@deepseek-ai\/dsh-tools did not resolve/);
-    assert.match(warnings[0], /offline shim/);
-    assert.match(warnings[0], /production/i);
+    assert.equal(shim.length, 1, `exactly one shim warning, saw: ${JSON.stringify(warnings)}`);
+    assert.match(shim[0], /@deepseek-ai\/dsh-tools did not resolve/);
+    assert.match(shim[0], /offline shim/);
+    assert.match(shim[0], /production/i);
   });
 });
 

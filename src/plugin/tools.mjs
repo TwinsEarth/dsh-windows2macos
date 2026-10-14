@@ -122,6 +122,7 @@ import { mintPunchId, punchSession } from '../agent/p2p.mjs';
 // implementations of a handshake are two chances to disagree about it.
 import { DeviceKey } from '../agent/crypto.mjs';
 import { loadOrCreateIdentity } from '../agent/identity.mjs';
+import { resolveStateDir } from '../util/cli.mjs';
 import { parseServer } from '../agent/stun.mjs';
 // The result-deduplication identity the relay mints. Imported rather than re-implemented: the value
 // is compared byte for byte by the executor, so a second copy of the formula that drifted by one
@@ -4230,6 +4231,24 @@ export async function apply(ctx, config = {}) {
   // -------------------------------------------------------------------------------------------
   if (cfg.autoStartAgent) {
     ctx.effect?.(() => startLocalStack(ctx, cfg));
+  } else {
+    /**
+     * v0.8.5: **say it out loud.**
+     *
+     * This branch is the whole reason a machine can run v0.8.4 with the account-derived fleet key,
+     * hold a valid signed-in account, reach the relay over HTTP 200, and still be in no fleet —
+     * with nothing anywhere reporting a problem. The eight tools register, the plugin looks
+     * healthy, and the join sequence simply never runs.
+     *
+     * A silent no-op that looks like success is the worst failure mode this plugin has had. One
+     * line at warn level turns *"why is this machine not in my fleet"* from an investigation into a
+     * log search.
+     */
+    ctx.logger?.warn?.(
+      'w2m: no agent is running on this machine, so it is in no fleet and will receive no work. '
+      + 'Set autoStartAgent: true to join (the fleet key is derived from the signed-in account), '
+      + 'or run w2m-localside yourself and point it at the relay.',
+    );
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -4637,6 +4656,26 @@ async function startLocalStack(ctx, cfg) {
       // Joining an existing relay: nothing to start, and minting a second one would put this
       // machine in a fleet of its own.
       ctx.logger?.info?.(`w2m: joining the relay at ${cfg.rabbitUrl}`);
+    }
+
+    /**
+     * v0.8.5: a usable state directory, because an empty one THROWS.
+     *
+     * `createAgent` rejects a falsy `stateDir` (`createAgent: stateDir is required`), and the
+     * plugin's resolved default is the empty string. So `autoStartAgent: true` with `stateDir`
+     * unset threw as well -- a SECOND gate behind the first, and the two together meant the
+     * join sequence could not run even when someone flipped the switch.
+     *
+     * Resolved here rather than left to the caller because `w2m_status` reports `cfg.stateDir`
+     * verbatim: showing the resolved path is what makes "where did it write device.json"
+     * answerable instead of a guess.
+     */
+    const resolvedStateDir =
+      typeof cfg.stateDir === 'string' && cfg.stateDir.trim() !== ''
+        ? cfg.stateDir.trim()
+        : resolveStateDir(null, 'localside');
+    if (cfg.stateDir !== resolvedStateDir) {
+      ctx.logger?.info?.(`w2m: stateDir was unset; using ${resolvedStateDir}`);
     }
 
     const agent = await createAgent({
