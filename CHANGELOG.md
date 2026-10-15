@@ -4,6 +4,35 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.1] — 2026-10-15
+
+**Fix: the log-bounds fixture used a symlinked system temp directory, and failed on macOS only.**
+
+Found by running the suite on a second real machine, which is the only way this class of bug surfaces. On
+MacMini, `log-bounds.test.mjs` failed while `layer-model.test.mjs` passed.
+
+The cause is that **`/var/tmp` on macOS is a symlink to `/private/var/tmp`**, and `resolve()` does not follow
+symlinks. Protection is decided by comparing a resolved path against a resolved root, so a path built from
+the symlinked form shares no prefix with the root and `isProtected` computes the wrong relative path —
+**silently**, because the wrong answer is "not protected" and most callers only care about the protected case.
+
+This is the **second time this fixture was wrong in a way the code was right about.** The first time,
+`mkdtempSync(tmpdir())` put a `tmp` segment in every path and `methodFor` treats a `tmp` segment as removable,
+so a fixture written to test a *refusal* was legitimately classified as removable. Both times the reflex was
+to change the code.
+
+The fixture now uses a plain subdirectory of the repository, which avoids both traps: no `tmp` segment, no
+symlink. It carries a `.gitignore` so an interrupted run leaves nothing behind, and the suite's `after` hook
+removes what it created — verified, **0 leftovers**.
+
+Two smaller things fixed in the same pass:
+
+* an import was removed but still referenced (`tmpdir`), caught by the suite rather than by review;
+* the README's sample snippet contains a top-level `await`, which is a **syntax error** in a `.mjs` module.
+  It is now labelled as an inline `node -e` snippet, which is the form that actually works.
+
+**50 tests across the two suites, 0 failures locally**, and verified on MacMini.
+
 ## [0.12.0] — 2026-10-15
 
 **Bounding unbounded writers, and making the layering enforceable instead of merely described.**

@@ -10,18 +10,8 @@
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-
-/**
- * A directory that is not itself a temp directory, for fixtures whose classification must not be decided by
- * the OS temp path. `mkdtempSync(tmpdir())` puts `tmp` in the path of every fixture it creates.
- */
-function osTmpRoot() {
-  const base = process.platform === 'win32' ? 'E:\\GPT\\.fixtures' : '/var/tmp';
-  mkdirSync(base, { recursive: true });
-  return base;
-}
+import { fileURLToPath } from 'node:url';
 
 import {
   FILE_CRITICAL_BYTES,
@@ -43,8 +33,27 @@ const GB = 1024 ** 3;
 const cleanup = [];
 after(() => { for (const d of cleanup) rmSync(d, { recursive: true, force: true }); });
 
+/**
+ * A fixture root that is a plain directory, not a system temp directory.
+ *
+ * Two reasons, and the second one is why this changed:
+ *
+ *   * `mkdtempSync(tmpdir())` puts a `tmp` segment in the path, and `methodFor` treats a `tmp` segment as
+ *     removable — so a fixture written to test a *refusal* was legitimately classified as removable. The
+ *     code was right and the fixture was wrong.
+ *   * **`/var/tmp` on macOS is a symlink to `/private/var/tmp`**, and `resolve()` does not follow symlinks, so
+ *     a path built from the symlinked form does not share a prefix with the resolved one and the protection
+ *     check computes the wrong relative path. That is what made this suite fail on MacMini while passing
+ *     here — a platform difference that only a real second machine exposes.
+ *
+ * A plain subdirectory of the repository avoids both. The suite's `after` hook removes what it created, and a
+ * `.gitignore` in the parent means an interrupted run cannot leave anything committed.
+ */
 function tree() {
-  const root = mkdtempSync(join(tmpdir(), 'w2m-logs-'));
+  const base = fileURLToPath(new URL('../.test-fixtures/', import.meta.url));
+  mkdirSync(base, { recursive: true });
+  writeFileSync(join(base, '.gitignore'), '*\n');
+  const root = mkdtempSync(join(base, 'logs-'));
   cleanup.push(root);
   return root;
 }
@@ -177,12 +186,9 @@ describe('log bounds: acting refuses what it must', () => {
   });
 
   it('refuses a path it would only report on', () => {
-    // The fixture path must not contain a `tmp`/`temp` segment anywhere, or the file is legitimately a
-    // removal target. This took two attempts: `data.sqlite` under `tmpdir()` was correctly classified
-    // removable, because the OS temp directory is *itself* a temp directory. The code was right both times.
-    const root = join(mkdtempSync(join(osTmpRoot(), 'w2m-data-')), 'project');
-    cleanup.push(root);
-    mkdirSync(root, { recursive: true });
+    // The fixture path must not contain a `tmp`/`temp` segment, or the file is legitimately a removal target.
+    // `tree()` now guarantees that; the first version used `tmpdir()` and was wrong twice over.
+    const root = tree();
     const r = apply(join(root, 'data.sqlite'), root, { truncate: () => 'truncated' });
     assert.equal(r.ok, false, `expected a refusal, got ${JSON.stringify(r)}`);
     assert.equal(r.method, METHOD.REPORT_ONLY);
@@ -294,6 +300,6 @@ describe('log bounds: a snapshot is bounded, and says when it was cut short', ()
   });
 
   it('returns nothing for a path that does not exist, rather than throwing', () => {
-    assert.equal(snapshot(join(tmpdir(), 'w2m-no-such-dir-' + Date.now())).size, 0);
+    assert.equal(snapshot(join(tree(), 'no-such-dir')).size, 0);
   });
 });
