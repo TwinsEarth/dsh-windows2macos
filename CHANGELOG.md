@@ -4,6 +4,66 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.5] — 2026-10-15
+
+**FLEET-RULES.md enters the tree, with this host's reachability measured and written down.**
+
+### What was actually wrong
+
+The 1.0.0 objective starts with *"local Windows and MacMini jointly"*, and on inspection the Windows host
+had never been a git participant at all: its working copy was not a repository, and every release so far had
+been published through the GitHub REST API rather than through git. That is a real gap and it was recorded
+as one rather than glossed over.
+
+### Why it was that way, measured rather than assumed
+
+`github.com:443` is unreachable from this host while every other GitHub endpoint answers. Three consecutive
+`git fetch` attempts failed after ~21 s each, and from the same process minutes apart:
+
+| Endpoint | Result |
+|---|---|
+| `github.com:443` | **TIMEOUT** |
+| `api.github.com:443` | OPEN 73 ms |
+| `codeload.github.com:443` | OPEN 77 ms |
+| `ssh.github.com:443` | OPEN 95 ms |
+| `objects.githubusercontent.com:443` | OPEN 228 ms |
+
+The blocking is **per hostname, not per port** — `ssh.github.com` answers on the same 443 that `github.com`
+does not. It is also **intermittent at the TCP layer**: a raw `net.connect` to `20.205.243.166:443` timed out
+while a `tls.connect` to the same IP with `servername: 'github.com'` completed `authorized: true` on TLS 1.3.
+An intermittent block is worse than a solid one, because a single success is not evidence the path works.
+
+The first two attempts at this treated the failure as a configuration problem and tried proxy settings and
+retries. Both were wrong, and both cost a round. The measurements are cheaper to read than to repeat, which
+is why they are now rule 8 of `FLEET-RULES.md` rather than a note in a session log.
+
+### What now works, and what the evidence is
+
+The repository is materialised from a `codeload` tarball (the one path that is reachable), giving a real git
+work tree containing exactly `main` — verified by hashing both trees: **227 files, 0 differences,
+`IDENTICAL`**. `scripts/fleet-sync.mjs` then ran against a real repository for the first time, having only
+ever been tested against a temporary one:
+
+| Step | Result |
+|---|---|
+| initial | `state=up-to-date action=none` |
+| local commit | `state=ahead action=push ahead=1` |
+| `--write` | `performed: true - pushed 1 commit(s)`; mirror and HEAD agree |
+| peer commit arrives | `state=behind action=fast-forward behind=1` |
+| `--write` | `performed: true - now at d42d5c0`; 228 files, peer file present |
+| final | `state=up-to-date action=none` |
+
+The same run also demonstrated the refusal path for free: when a fast-forward was rejected by git, the
+result was `performed: false`, the tree was **left untouched**, and the state stayed `behind` — an automatic
+sync that fails must not half-apply.
+
+### Stated plainly rather than implied
+
+This host can *pull* the truth and can *run* the sync machinery, but it **cannot push over git**. A round
+that needs a commit published must use the API, and a round that exercises `fleet-sync` must do it against a
+local bare remote. That is a real test of the state machine and **not** a test of the network, and the
+difference is written into the rule so it is not mistaken for one.
+
 ## [0.10.4] — 2026-10-15
 
 **A result channel over exit codes, for machines whose text cannot be read back.**
