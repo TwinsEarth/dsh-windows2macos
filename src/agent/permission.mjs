@@ -147,6 +147,104 @@ export function decide(capability, level) {
 }
 
 /**
+ * Which capability a dispatch costs, decided from the dispatch's own facts.
+ *
+ * A dispatch that may write costs more than one that may not, and the fact is already in the payload
+ * (`write` plus a non-empty `write_scope`), so this reads it rather than asking the caller to declare a
+ * capability. That matters because a caller who must name their own capability is a caller who can name the
+ * cheap one.
+ *
+ * @param {{write?: boolean, write_scope?: string[]}} args
+ * @returns {{capability: string, detail: string}}
+ */
+export function capabilityForDispatch(args) {
+  const writes = args?.write === true;
+  const scope = Array.isArray(args?.write_scope) ? args.write_scope.filter((s) => typeof s === 'string' && s.trim() !== '') : [];
+  if (!writes) return { capability: 'dispatch_readonly', detail: 'write is not true, so the machines cannot write' };
+  if (scope.length === 0) {
+    // A write with no scope is refused upstream by the dispatch path itself. Reporting it as the writing
+    // capability rather than the read-only one is the conservative direction: if that upstream check ever
+    // moved, this would not silently hand out the cheaper permission.
+    return { capability: 'dispatch_writing', detail: 'write is true with an empty scope, which the dispatch path refuses separately' };
+  }
+  return { capability: 'dispatch_writing', detail: `write is true inside ${scope.length} declared scope prefix(es)` };
+}
+
+/**
+ * The gate a dispatch passes through.
+ *
+ * ## Why an unset level is not the same as a low one
+ *
+ * `tools.mjs` states plainly that **no parameter of any tool can widen what a machine will run**, and that
+ * there is no way for a caller to set anything authority-shaped. So a plugin that has not been configured
+ * with an actor level has no actor to judge. Two answers were available and only one is honest:
+ *
+ *   * treat an unset level as `0` — which would refuse every writing dispatch on every machine that has not
+ *     opted in, breaking a working fleet to enforce a policy nobody asked for;
+ *   * treat it as **unenforced**, and say so in the verdict, so the caller can tell "allowed" from "not
+ *     checked".
+ *
+ * The second is what this does, and the `enforced` flag is the whole point: a gate that reports `ALLOW` and a
+ * gate that reports `not checked` must never look alike, because the first is a decision and the second is an
+ * absence of one.
+ *
+ * @param {{write?: boolean, write_scope?: string[]}} args
+ * @param {number|null|undefined} actorLevel
+ * @returns {{decision: object, enforced: boolean, capability: string, detail: string}}
+ */
+export function gateDispatch(args, actorLevel) {
+  const { capability, detail } = capabilityForDispatch(args);
+  if (actorLevel === null || actorLevel === undefined) {
+    return {
+      decision: {
+        verdict: AUTHORITY_VERDICT.ALLOW,
+        capability,
+        level: null,
+        required: permissionFor(capability),
+        shortfall: null,
+        destructive: isDestructive(capability),
+        reason_code: 'GATE_NOT_ENFORCED',
+        detail: 'no authority level is configured, so this dispatch was not checked',
+      },
+      enforced: false,
+      capability,
+      detail: `not enforced: ${detail}; no actor level is configured`,
+    };
+  }
+  return { decision: decide(capability, actorLevel), enforced: true, capability, detail };
+}
+
+/**
+ * Build the approval request for a dispatch that needs one, or `null` when it does not.
+ *
+ * Shaped to hand straight to the cross-session approval index, which is the point: a permission gate and an
+ * approval queue that do not meet are two features that each look finished and jointly do nothing.
+ *
+ * @param {object} decision from {@link decide}
+ * @param {{taskId?: string, machineId?: string, requestedBy?: string}} context
+ */
+export function approvalRequestFor(decision, context = {}) {
+  if (decision === null || typeof decision !== 'object' || decision.verdict !== AUTHORITY_VERDICT.NEEDS_APPROVAL) {
+    return null;
+  }
+  return {
+    // The subject level travels WITH the request, recorded now, because it is a fact about who asked and must
+    // not be re-derived later from a caller who might be the approver.
+    subject_level: decision.level,
+    required_level: decision.required,
+    capability: decision.capability,
+    task_id: context.taskId ?? null,
+    machine_id: context.machineId ?? null,
+    requested_by: context.requestedBy ?? null,
+    destructive: decision.destructive === true,
+    // A destructive request is never auto-settleable, so it is marked here rather than left for the queue to
+    // infer from the capability name.
+    auto_settleable: mayAutoSettle(decision).auto,
+    detail: decision.detail,
+  };
+}
+
+/**
  * Whether a decision may be settled automatically.
  *
  * Only `ALLOW` and only for a non-destructive capability. A destructive action that reaches an approver's

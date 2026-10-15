@@ -4,6 +4,56 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.22.0] — 2026-10-15
+
+**The gate now grades a real dispatch, and connects to the approval queue.**
+
+0.21.0 built the gate and admitted it had no caller. This release gives it one: `gateDispatch()` reads a
+dispatch's **own** facts — `write` and a non-empty `write_scope`, both already in the payload — and grades it,
+rather than asking the caller to name a capability. That distinction is the whole design: **a caller who must
+name their own capability is a caller who can name the cheap one.**
+
+### The unset level, which is the honest part
+
+`tools.mjs` states plainly that **no parameter of any tool can widen what a machine will run**, and that there
+is no way for a caller to set anything authority-shaped. So a plugin with no configured actor level has no
+actor to judge. Two answers were available:
+
+* treat an unset level as `0` — which would **refuse every writing dispatch on every machine that has not opted
+  in**, breaking a working fleet to enforce a policy nobody asked for;
+* treat it as **unenforced, and say so**.
+
+This does the second, and `enforced` is the whole point: **a gate that reports `ALLOW` and a gate that reports
+"not checked" must never look alike, because the first is a decision and the second is the absence of one.**
+A test asserts exactly that — same verdict, different `enforced`, different `reason_code`.
+
+### The escalation reaches the queue it was built for
+
+`approvalRequestFor()` returns `null` for anything that is not `NEEDS_APPROVAL`, and otherwise produces a
+request shaped for the cross-session approval index built in 0.10.0 — **the two features finally meet**, which
+is the point: a permission gate and an approval queue that do not connect are two things that each look
+finished and jointly do nothing.
+
+The request carries the **subject level recorded now**, not left to be re-derived later, for the reason
+0.10.0's index already states: an approver who could supply the subject level could lower it. A destructive
+request is marked `auto_settleable: false` explicitly, rather than leaving the queue to infer it from a
+capability name.
+
+### A `write` with no scope is graded as the dearer capability
+
+The dispatch path refuses that combination separately. Grading it cheap here would mean that if that check
+ever moved, a request intending to write would be handed the read-only permission.
+
+### A test of mine was wrong, again in the same direction
+
+`gateDispatch({write: true}, 0)` was asserted to be `deny`; it is `needs_approval`, **because an ordinary
+actor is exactly one band below captain and that is the documented behaviour.** The implementation was right.
+This is the fourth time in this project that a failing test was the test's fault — and it is the argument for
+testing refusals rather than only the happy path, because a wrong refusal fails loudly enough to be told apart
+from a wrong acceptance.
+
+**11 new tests, 0 failures.**
+
 ## [0.21.0] — 2026-10-15
 
 **The capability table has a gate now, so it is a policy rather than a description of one.**

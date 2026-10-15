@@ -20,8 +20,11 @@ import { AUTHORITY_BANDS, AUTHORITY_MAX } from '../src/agent/authority.mjs';
 import {
   AUTHORITY_VERDICT,
   GATE_REFUSAL,
+  approvalRequestFor,
   auditCapabilities,
+  capabilityForDispatch,
   decide,
+  gateDispatch,
   mayAutoSettle,
 } from '../src/agent/permission.mjs';
 
@@ -31,6 +34,105 @@ const levelIn = (name) => {
   assert.ok(band, `no band named ${name}`);
   return band.min;
 };
+describe('permission: a dispatch is graded from its own facts, not from a caller-named capability', () => {
+  it('grades a non-writing dispatch as the cheap capability', () => {
+    assert.equal(capabilityForDispatch({ write: false }).capability, 'dispatch_readonly');
+    assert.equal(capabilityForDispatch({}).capability, 'dispatch_readonly');
+    assert.equal(capabilityForDispatch(undefined).capability, 'dispatch_readonly');
+  });
+
+  it('grades a writing dispatch with a scope as the dearer capability', () => {
+    assert.equal(capabilityForDispatch({ write: true, write_scope: ['src/'] }).capability, 'dispatch_writing');
+  });
+
+  it('grades a write with no scope as the DEARER one, not the cheaper', () => {
+    // The dispatch path refuses that combination separately. If that check ever moved, grading it cheap here
+    // would hand out the read-only permission for a request that intends to write.
+    assert.equal(capabilityForDispatch({ write: true, write_scope: [] }).capability, 'dispatch_writing');
+    assert.equal(capabilityForDispatch({ write: true }).capability, 'dispatch_writing');
+  });
+
+  it('ignores scope entries that are not usable strings', () => {
+    assert.equal(capabilityForDispatch({ write: true, write_scope: [null, '', '  ', 42] }).capability, 'dispatch_writing');
+    assert.match(capabilityForDispatch({ write: true, write_scope: [null, ''] }).detail, /empty scope/);
+  });
+});
+
+describe('permission: an unset actor level is not a low one', () => {
+  it('does not enforce, and says so, rather than refusing everything', () => {
+    // Treating an unset level as 0 would refuse every writing dispatch on every machine that has not opted
+    // in -- breaking a working fleet to enforce a policy nobody asked for.
+    const g = gateDispatch({ write: true, write_scope: ['src/'] }, null);
+    assert.equal(g.enforced, false);
+    assert.equal(g.decision.verdict, AUTHORITY_VERDICT.ALLOW);
+    assert.equal(g.decision.reason_code, 'GATE_NOT_ENFORCED');
+    assert.match(g.detail, /not enforced/);
+    assert.equal(g.decision.level, null);
+  });
+
+  it('never lets an unchecked dispatch look like a checked one', () => {
+    // The whole reason `enforced` exists: a decision and the absence of one must not be indistinguishable.
+    const unchecked = gateDispatch({ write: true, write_scope: ['src/'] }, undefined);
+    const checked = gateDispatch({ write: true, write_scope: ['src/'] }, 100);
+    assert.equal(unchecked.decision.verdict, checked.decision.verdict, 'both are ALLOW on this input');
+    assert.notEqual(unchecked.enforced, checked.enforced, 'but only one of them was checked');
+    assert.notEqual(unchecked.decision.reason_code, checked.decision.reason_code);
+  });
+
+  it('enforces as soon as a level is configured', () => {
+    // An ordinary actor asking to write is ONE BAND below captain, so it escalates rather than being refused --
+    // which is the documented behaviour, and the first version of this test asserted `deny` and was wrong.
+    const escalated = gateDispatch({ write: true, write_scope: ['src/'] }, 0);
+    assert.equal(escalated.enforced, true);
+    assert.equal(escalated.decision.verdict, AUTHORITY_VERDICT.NEEDS_APPROVAL);
+    // A read is inside the ordinary band, so the same actor is simply allowed.
+    const allowed = gateDispatch({ write: false }, 0);
+    assert.equal(allowed.enforced, true);
+    assert.equal(allowed.decision.verdict, AUTHORITY_VERDICT.ALLOW);
+    // And a capability two bands up is refused outright rather than escalated.
+    assert.equal(decide('write_config', 0).verdict, AUTHORITY_VERDICT.DENY);
+  });
+});
+
+describe('permission: the request an escalation produces fits the approval queue', () => {
+  it('produces a request only for NEEDS_APPROVAL', () => {
+    assert.equal(approvalRequestFor(decide('read_fleet_state', 0)), null, 'an allow is not a request');
+    assert.equal(approvalRequestFor(decide('teleport', 100)), null, 'a denial is not a request');
+    assert.equal(approvalRequestFor(null), null);
+    const needs = decide('dispatch_writing', 49);
+    assert.equal(needs.verdict, AUTHORITY_VERDICT.NEEDS_APPROVAL);
+    assert.ok(approvalRequestFor(needs) !== null);
+  });
+
+  it('carries the subject level with the request rather than leaving it to be re-derived', () => {
+    // An approver who could supply the subject level could lower it. It is recorded now, as a fact about who
+    // asked.
+    const r = approvalRequestFor(decide('dispatch_writing', 49), { taskId: 'T1', machineId: 'M1', requestedBy: 'someone' });
+    assert.equal(r.subject_level, 49);
+    assert.equal(r.required_level, permissionFor('dispatch_writing'));
+    assert.equal(r.capability, 'dispatch_writing');
+    assert.equal(r.task_id, 'T1');
+    assert.equal(r.machine_id, 'M1');
+    assert.equal(r.requested_by, 'someone');
+  });
+
+  it('marks a destructive request as not auto-settleable, rather than leaving the queue to infer it', () => {
+    const needs = decide('delete_permanent', levelIn('org_admin'));
+    const r = approvalRequestFor(needs);
+    if (needs.verdict === AUTHORITY_VERDICT.NEEDS_APPROVAL) {
+      assert.equal(r.destructive, true);
+      assert.equal(r.auto_settleable, false);
+    }
+  });
+
+  it('defaults the context fields to null rather than to undefined', () => {
+    // A queue that receives `undefined` writes a field that disappears through JSON; null survives.
+    const r = approvalRequestFor(decide('dispatch_writing', 49));
+    assert.equal(r.task_id, null);
+    assert.equal(r.machine_id, null);
+    assert.equal(r.requested_by, null);
+  });
+});
 
 describe('permission: a level at or above the requirement is allowed', () => {
   it('allows exactly the required level, asserted from both sides', () => {
