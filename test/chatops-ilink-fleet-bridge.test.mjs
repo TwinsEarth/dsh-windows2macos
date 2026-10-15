@@ -16,6 +16,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 
 import {
   buildHeaders,
@@ -24,6 +25,7 @@ import {
   sendSucceeded,
   planMessage,
   renderTaskOutcome,
+  dryRunPolicy,
   AUTH_TYPE,
   MESSAGE_TYPE,
   MESSAGE_STATE_FINISH,
@@ -207,5 +209,66 @@ describe('a verdict is rendered for a phone', () => {
   it('says unknown rather than inventing a verdict from a missing field', () => {
     const text = renderTaskOutcome({ taskId: 'T', body: {} });
     assert.match(text, /判定：unknown/);
+  });
+});
+
+describe('--dry-run: nothing reaches the fleet, and this is the fix for a real dispatch', () => {
+  /**
+   * The defect, measured rather than described: two `--dry-run` runs sent `node--version` to all five
+   * machines, and one produced a task record with five real leases. The flag guarded the REPLY only.
+   */
+  it('refuses the dispatch when dryRun is set, and says so', () => {
+    const policy = dryRunPolicy({ dryRun: true });
+    assert.equal(policy.dispatch, false, 'a dry run must not reach fleet.run');
+    assert.equal(policy.reply, false, 'and must not reach WeChat either');
+    assert.match(policy.reason, /not dispatched to/);
+  });
+
+  it('permits both when dryRun is absent or false', () => {
+    for (const options of [{}, { dryRun: false }, { dryRun: undefined }]) {
+      const policy = dryRunPolicy(options);
+      assert.equal(policy.dispatch, true, JSON.stringify(options));
+      assert.equal(policy.reply, true, JSON.stringify(options));
+      assert.equal(policy.reason, null);
+    }
+  });
+
+  it('opens only on the boolean true, and this function takes a PARAMETER not a CLI flag', () => {
+    // My first version asserted that `'true'` (a string) must not dispatch, and it does dispatch. **The
+    // code was right and the test was wrong**, and the cause is a collision of two different things
+    // sharing one word:
+    //
+    //   * the CLI **flag** `--dry-run` is PRESENT-MEANS-TRUE (`argv.includes('--dry-run')`), and
+    //   * the **parameter** `dryRun` defaults to FALSE, which is what `update-install` means by it.
+    //
+    // This function takes the parameter, and the script always hands it a boolean from `includes()`. The
+    // assertion that matters is therefore the strict one: only `true` turns the dispatch off, so a future
+    // caller cannot open the path with a truthy value.
+    assert.equal(dryRunPolicy({ dryRun: true }).dispatch, false);
+    for (const v of [false, undefined, null, 0, '', 'true']) {
+      assert.equal(dryRunPolicy({ dryRun: v }).dispatch, true, `dryRun=${JSON.stringify(v)} permits dispatch`);
+    }
+  });
+
+  it('agrees with the meaning this project already gives dryRun elsewhere', () => {
+    // `update-install` asserts "dryRun must not call the package manager" and "must not write", and
+    // `auto-update` asserts it writes nothing to the profile. The bridge held the opposite meaning for the
+    // same word -- two flags, one name. Aligning is why the fix is a behaviour change and not a rename.
+    const install = readFileSync(new URL('./update-install.test.mjs', import.meta.url), 'utf8');
+    assert.match(install, /dryRun must not call the package manager/);
+    assert.equal(dryRunPolicy({ dryRun: true }).dispatch, false);
+  });
+
+  it('is consumed by the script, above the only call that reaches the fleet', () => {
+    // The policy is only a fix if the script reads it. A test of the pure function alone would pass while
+    // the script still dispatched -- which is exactly the shape of the original defect: the guard existed
+    // for the reply and not for the dispatch, and nothing noticed.
+    const script = readFileSync(new URL('../scripts/ilink-fleet-bridge.mjs', import.meta.url), 'utf8');
+    const guardAt = script.indexOf('if (!dry.dispatch)');
+    const runAt = script.indexOf('await fleet.run(');
+    assert.ok(guardAt > -1, 'the script consults the dispatch permission');
+    assert.ok(runAt > -1, 'the script dispatches somewhere');
+    assert.ok(guardAt < runAt, 'and consults it BEFORE the only call that can reach the fleet');
+    assert.match(script, /const dry = dryRunPolicy\(\{ dryRun \}\)/, 'derived once, from the flag');
   });
 });

@@ -18,12 +18,17 @@
  * session and the bot goes silent with no indication why.
  *
  * Usage: node scripts/ilink-fleet-bridge.mjs [--once] [--dry-run]
+ *
+ * `--dry-run` means **nothing reaches the fleet and nothing is sent to WeChat** -- the poll still runs,
+ * so it is how you check the login and see which forms the parser accepts, and it is not a way to
+ * dispatch "safely". Until v0.48.0 it guarded the reply only, so a dry run really did dispatch
+ * (measured: `node--version` sent to five machines, twice).
  */
 
 import { readFileSync, writeFileSync, existsSync, appendFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 
-import { buildHeaders, buildReply, sendSucceeded, planMessage, renderTaskOutcome, renderFailure, MESSAGE_TYPE } from '../src/chatops/ilink-fleet-bridge.mjs';
+import { buildHeaders, buildReply, sendSucceeded, planMessage, renderTaskOutcome, renderFailure, MESSAGE_TYPE, dryRunPolicy } from '../src/chatops/ilink-fleet-bridge.mjs';
 import { createFleetExecutor } from '../src/chatops/fleet.mjs';
 
 const LOGIN = 'dist/ilink/ilink-login.json';
@@ -33,6 +38,13 @@ const LOG = 'dist/ilink/bridge.log';
 const argv = process.argv.slice(2);
 const once = argv.includes('--once');
 const dryRun = argv.includes('--dry-run');
+/**
+ * What `--dry-run` permits, read from the library rather than decided here.
+ *
+ * The three usages below were all `dryRun` checks before, and there were two of them: one on the reply
+ * and **none on the dispatch**. Deriving both from one value is what stops that happening again.
+ */
+const dry = dryRunPolicy({ dryRun });
 
 const stamp = () => new Date().toISOString().slice(11, 19);
 const log = (m) => {
@@ -171,7 +183,7 @@ async function post(endpoint, payload) {
 const BASE_INFO = () => ({ channel_version: '2.4.6', bot_agent: 'DeepSeekHarness/w2m-bridge' });
 
 async function reply(to, contextToken, text) {
-  if (dryRun) { log(`  [dry-run] would reply to ${to}: ${text.split('\n')[0]}`); return true; }
+  if (!dry.reply) { log(`  [dry-run] would reply to ${to}: ${text.split('\n')[0]}`); return true; }
   try {
     const body = await post('ilink/bot/sendmessage', {
       base_info: BASE_INFO(),
@@ -191,6 +203,15 @@ async function reply(to, contextToken, text) {
  * the channel.
  */
 async function dispatchAndReport(plan) {
+  /**
+   * The guard that was missing, at the TOP of the only function that can reach `fleet.run`.
+   *
+   * Placed here rather than at the call site because a guard at the call site is one edit away from
+   * being bypassed by a second caller; a guard above the dangerous call is a property of the function.
+   * **This is the whole fix**: two dry runs previously dispatched `node--version` to five machines
+   * because the reply was guarded and this was not.
+   */
+  if (!dry.dispatch) { log(`  [dry-run] would dispatch ${plan.argv.join(' ')} -- not sent`); return; }
   try {
     const started = await fleet.run(plan.argv, {
       mode: plan.flags.mode,

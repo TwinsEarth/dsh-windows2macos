@@ -4,6 +4,61 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.48.0] — 2026-10-15
+
+**`--dry-run` dispatched. Two dry runs sent a command to five machines, and one made a real task.**
+
+### The defect, measured before it was described
+
+The bridge guarded exactly one thing under `--dry-run`: the **reply**. The dispatch ran unconditionally.
+
+```
+[15:13:57] dry run     : true
+[15:15:00]   dispatched task 01M50231AYJYDD41WSPMS9PRM3
+[15:15:50]   verdict for …: partial
+```
+
+**That is a real task record with five real leases, produced by a run whose flag promised nothing would
+happen.** A rehearsal executed commands on production machines — and it was found by accident, while draining
+a message queue, not by a test.
+
+### Why the fix is "skip the dispatch" and not "rename the flag"
+
+**This repository already fixes the meaning of the word.** `update-install`'s `dryRun` is asserted to **call no
+package manager and write nothing**, and `auto-update`'s is asserted to **write nothing to the profile**. So a
+second `dry-run` meaning "do the dangerous part anyway" is not a naming preference — **it is two flags with one
+name and opposite meanings, and the bridge held the unsafe one.**
+
+**Renaming would have left the flag. Aligning keeps the word and removes the hazard**, and a reader who knows
+`dryRun` from anywhere else in this project is now already right about this one.
+
+### Why the guard is a function in `lib`, not an `if` in the script
+
+`scripts/` is **not in `package.json#files`**, so nothing there is covered by a test that ships. A safety
+property expressed as one line inside an untested script is a property nobody re-checks. `dryRunPolicy` is
+exported and asserted beside the wire shapes — **a script is not where a guard should live if the guard is the
+point.**
+
+The guard sits at the **top of the only function that reaches `fleet.run`**, not at its call site, because a
+guard at the call site is one edit away from being bypassed by a second caller.
+
+### A name collision that made my own test wrong
+
+I asserted that `dryRun: 'true'` must not dispatch. **It does dispatch — the code was right and the test was
+wrong**, and the cause is two different things sharing one word:
+
+| | meaning |
+|---|---|
+| the CLI **flag** `--dry-run` | **present-means-true** (`argv.includes('--dry-run')`) |
+| the **parameter** `dryRun` | **defaults to false**, which is what `update-install` means by it |
+
+`dryRunPolicy` takes the parameter, and the script always hands it a boolean. The assertion is now the strict
+one — **only `true` turns the dispatch off, so a future caller cannot open the path with a truthy value.**
+
+**5 new tests, 0 failures.** One of them reads the script and asserts the guard appears **before** the only
+call that can reach the fleet — because a test of the pure function alone would pass while the script still
+dispatched, **which is precisely the shape of the original defect.**
+
 ## [0.47.0] — 2026-10-15
 
 **Correcting my own counts: 0.46.0 said 54/32/22, the table says 61/53/8.**

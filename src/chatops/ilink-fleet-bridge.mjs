@@ -25,6 +25,47 @@
 
 import { parseInvocation, renderVerdict, renderDispatchFailure } from './run-command.mjs';
 
+/**
+ * What a run with `--dry-run` set is allowed to do.
+ *
+ * ## The defect this exists to make unreachable
+ *
+ * `scripts/ilink-fleet-bridge.mjs` guarded exactly one thing under `--dry-run`: the **reply**. The
+ * dispatch itself ran unconditionally, so **two dry runs sent `node--version` to all five machines**
+ * — and one of them produced a real task record with five real leases. The flag's name promises that
+ * nothing happens, and the promise was false in the direction that matters: **a rehearsal executed
+ * commands on production machines.**
+ *
+ * ## Why "skip the dispatch" rather than "rename the flag"
+ *
+ * This repository already fixes the meaning of the word. `update-install`'s `dryRun` is asserted to
+ * **write nothing and call no package manager**, and `auto-update`'s is asserted to **write nothing to
+ * the profile**. So a second `dry-run` that means "do the dangerous part anyway" is not a naming
+ * preference — it is two flags with one name and opposite meanings, and the bridge held the unsafe one.
+ *
+ * **Renaming would have left the flag. Aligning keeps the word and removes the hazard**, and it means
+ * a reader who knows `dryRun` from anywhere else in this project is already right about this one.
+ *
+ * ## Why this is a function rather than an `if` in the script
+ *
+ * `scripts/` is not in `package.json#files`, so nothing there is covered by a test that ships. A safety
+ * property expressed as one line inside an untested script is a property nobody re-checks. As an
+ * exported function with a name, it is asserted in `chatops-ilink-fleet-bridge.test.mjs` beside the
+ * wire shapes — **a script is not where a guard should live if the guard is the point.**
+ *
+ * @param {{ dryRun?: boolean }} [options]
+ * @returns {{ dispatch: boolean, reply: boolean, reason: string|null }}
+ */
+export function dryRunPolicy(options = {}) {
+  if (options.dryRun !== true) return { dispatch: true, reply: true, reason: null };
+  return {
+    dispatch: false,
+    reply: false,
+    // Carried so the caller logs *why* nothing happened rather than printing a bare "[dry-run]".
+    reason: 'dry run: the fleet was not dispatched to, and no reply was sent',
+  };
+}
+
 /** The header every authenticated call needs; undocumented and mandatory. */
 export const AUTH_TYPE = 'ilink_bot_token';
 export const APP_ID = 'bot';
