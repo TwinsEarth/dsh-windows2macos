@@ -26,6 +26,7 @@ import {
   planMessage,
   renderTaskOutcome,
   dryRunPolicy,
+  helpText,
   AUTH_TYPE,
   MESSAGE_TYPE,
   MESSAGE_STATE_FINISH,
@@ -97,21 +98,41 @@ describe('the wire shapes are the ones measured from the live service', () => {
   });
 });
 
-describe('only an explicit /run line is an action', () => {
-  it('ignores ordinary conversation', () => {
+describe('only an explicit /run line is an action -- and everything else is ANSWERED', () => {
+  /**
+   * These three assertions used to demand `ignore`. They were right about the rule and wrong about the
+   * response: the rule is that a typo must never become a fleet execution, and that is unchanged. What
+   * changed is that **silence is no longer the way the rule is expressed** -- a bot that reads messages
+   * and answers nothing is indistinguishable from a bot that is broken, and the operator's only move was
+   * to send the command again.
+   */
+  it('answers ordinary conversation with help instead of ignoring it', () => {
     for (const text of ['你好', 'hello', 'node --version', '/help', '/runner x']) {
-      assert.equal(planMessage({ message: inbound(text), authorize: allowAll }).act, 'ignore', text);
+      const plan = planMessage({ message: inbound(text), authorize: allowAll });
+      assert.notEqual(plan.act, 'dispatch', `${text} must not dispatch`);
+      assert.equal(plan.act, 'reply', text);
+      assert.match(plan.text, /没有执行这条消息/, text);
+      assert.match(plan.text, /【3】参考与边界/, text);
     }
   });
 
-  it('ignores a message with no sender or no context_token', () => {
+  it('still ignores where a reply is structurally impossible', () => {
+    // The one surviving silence, and it is structural rather than a decision: with no sender or no
+    // context_token there is nowhere to send an answer. **Calling this `reply` would make the plan lie
+    // about what the caller can do**, which is why the vocabulary keeps `ignore`.
     assert.equal(planMessage({ message: inbound('x', { from_user_id: '' }), authorize: allowAll }).act, 'ignore');
     assert.equal(planMessage({ message: inbound('x', { context_token: '' }), authorize: allowAll }).act, 'ignore');
   });
 
-  it('ignores a non-text message instead of guessing at it', () => {
+  it('answers a non-text message instead of guessing at it', () => {
+    // Not guessed at -- answered. The help says which types are unsupported, so the limitation arrives
+    // with the reply rather than leaving the operator to work it out.
     const msg = { from_user_id: 'u', context_token: 'c', item_list: [{ type: 2 }] };
-    assert.equal(planMessage({ message: msg, authorize: allowAll }).act, 'ignore');
+    const plan = planMessage({ message: msg, authorize: allowAll });
+    assert.equal(plan.act, 'reply');
+    assert.equal(plan.act === 'dispatch', false, 'and above all it is not executed');
+    assert.match(plan.text, /不是文字/);
+    assert.match(plan.text, /语音、图片、文件、表情/);
   });
 
   it('accepts the prefix case-insensitively and with any spacing', () => {
@@ -270,5 +291,67 @@ describe('--dry-run: nothing reaches the fleet, and this is the fix for a real d
     assert.ok(runAt > -1, 'the script dispatches somewhere');
     assert.ok(guardAt < runAt, 'and consults it BEFORE the only call that can reach the fleet');
     assert.match(script, /const dry = dryRunPolicy\(\{ dryRun \}\)/, 'derived once, from the flag');
+  });
+});
+
+describe('helpText: the three sections the operator asked for, one of them honest', () => {
+  const help = helpText({ reason: '这条消息没有以 /run 开头' });
+
+  it('carries the three sections, by the names that were requested', () => {
+    // The request named them: 开关指令 / 指令规则与格式 / 参考与边界. Asserted by heading rather than by
+    // "the text mentions commands", because a help text that loses a section still reads fine.
+    assert.match(help, /【1】开关指令/);
+    assert.match(help, /【2】指令规则与格式/);
+    assert.match(help, /【3】参考与边界/);
+  });
+
+  it('states why it did not execute, first, before any syntax', () => {
+    // A reader who sent a command wants to know what happened before they want a manual.
+    const first = help.split('\n')[0];
+    assert.match(first, /没有执行这条消息/);
+    assert.match(first, /没有以 \/run 开头/);
+    assert.equal(helpText().startsWith('没有执行'), false, 'with no reason there is no line to state');
+  });
+
+  it('lists the switches, including --ask -- the flag nobody could discover', () => {
+    // The whole reason this task existed: `--ask` was reachable only by reading the source. If it ever
+    // stops being in the help, the discoverability defect is back.
+    assert.match(help, /\/run --ask/);
+    assert.match(help, /\/run --on/);
+    assert.match(help, /\/run --timeout/);
+    assert.match(help, /\/run --mode/);
+  });
+
+  it('says what the window CANNOT do, and who can change that', () => {
+    // "If refused, provide the activation instruction" -- and the honest answer is that a chat window
+    // cannot activate itself. Saying so is the instruction; implying otherwise would send the operator
+    // looking for a command that does not exist.
+    assert.match(help, /W2M_CAPABILITIES/);
+    assert.match(help, /聊天窗口本身不能自行激活/);
+  });
+
+  it('names text as supported and voice, images and files as NOT -- the boundary, not a footnote', () => {
+    // The request asked the help to advertise "text, voice and images". Two of the three are untrue:
+    // \`textOf\` reads only \`type: 1\`, measured. **A help text that promised a capability the bridge does
+    // not have would be read as a bug the first time somebody sent a photo.**
+    assert.match(help, /支持：文字/);
+    assert.match(help, /不支持：语音、图片、文件、表情/);
+  });
+
+  it('warns that argv is not a shell, before the operator tries a pipe', () => {
+    // Measured elsewhere: \`|\`, \`>\` and \`&&\` are refused by the parser. Saying so in the help turns a
+    // refusal into an expectation.
+    assert.match(help, /不是 shell 字符串/);
+    assert.match(help, /管道/);
+  });
+
+  it('gives examples that the parser actually accepts', () => {
+    // Every example in the help is put through the real parser, so the help cannot drift into advertising
+    // syntax that is refused. This is the assertion that keeps the two in step.
+    for (const line of help.split('\n').filter((l) => l.includes('/run '))) {
+      const text = line.slice(line.indexOf('/run ')).trim();
+      const plan = planMessage({ message: inbound(text), authorize: allowAll });
+      assert.notEqual(plan.act, 'ignore', `help advertises "${text}" and it is ignored`);
+    }
   });
 });

@@ -141,6 +141,64 @@ export function sendSucceeded(response) {
 }
 
 /**
+ * What to say when a message is not a command.
+ *
+ * ## The requirement this satisfies, and the part of it that had to be refused
+ *
+ * *"Every sentence from WeChat must get a reply; a mistake must get help."* Before this, **five measured
+ * inputs were silently dropped**: a plain sentence, an image, a voice note, an empty `item_list`, and an
+ * empty string. The operator sees a bot that reads messages and answers nothing, which is
+ * indistinguishable from a bot that is broken.
+ *
+ * The request also asked the help to advertise *"text, voice and images"*. **Two of those three are not
+ * supported**, and `textOf` reading only `type: 1` is the proof: an image and a voice note both answer
+ * `not a text message`. So the boundary section says what is true — **a help text that promises a
+ * capability the bridge does not have would be read as a bug the first time somebody sent a photo.**
+ *
+ * ## Why the boundary is a section rather than a footnote
+ *
+ * A user cannot discover a limitation they are never told about. **"Voice is not supported" arriving in
+ * the same breath as the command syntax is the difference between a limitation and a mystery.**
+ *
+ * @param {{reason?: string|null}} [context]
+ * @returns {string}
+ */
+export function helpText(context = {}) {
+  const why = typeof context.reason === 'string' && context.reason !== '' ? context.reason : null;
+  const lines = [];
+  if (why !== null) lines.push(`没有执行这条消息：${why}`, '');
+
+  lines.push(
+    '【1】开关指令',
+    '  /run <命令>            把一个命令派发到编队（默认所有在线机器）',
+    '  /run --ask <一句话>    问一句话，不执行任何东西',
+    '  /run --on <机器> <命令>  只派发到指定机器（逗号分隔）',
+    '  /run --timeout <毫秒> <命令>  覆盖等待上限',
+    '  /run --mode <模式> <命令>  replicate | split | broadcast | pipeline',
+    '',
+    '  —— 关于权限：这个窗口当前的能力是 operate、fleet.dispatch。',
+    '     若被拒绝，回复里会写明缺哪一个能力；能力由启动桥接的人通过',
+    '     W2M_CAPABILITIES 授予，聊天窗口本身不能自行激活。',
+    '',
+    '【2】指令规则与格式',
+    '  · 只能以 /run 开头，其余文字一律当作普通消息并回这条帮助。',
+    '  · /run 之后是 argv（逐个词），不是 shell 字符串：',
+    '    管道 | 、重定向 > 、&& 都不会生效，会被拒绝。',
+    '  · 每个词里的空格要用引号包起来。',
+    '  · 举例： /run node --version',
+    '          /run git rev-parse --short HEAD',
+    '          /run --ask 现在编队里有几台机器在线？',
+    '',
+    '【3】参考与边界',
+    '  · 支持：文字。中文可以。',
+    '  · 不支持：语音、图片、文件、表情——它们只会得到这条帮助。',
+    '  · 命令是否被允许由目标机器自己的允许清单决定；',
+    '    被拒绝时回复会带上原因码（如 COMMAND_NOT_ALLOWED）。',
+  );
+  return lines.join('\n');
+}
+
+/**
  * Decide what to do with one inbound message.
  *
  * Returns a **plan** rather than performing it, so the decision is testable without a relay, a
@@ -158,14 +216,34 @@ export function planMessage({ message, authorize }) {
   const contextToken = message?.context_token;
   const text = textOf(message);
 
+  /**
+   * The only two real silences, and both are structural rather than a decision.
+   *
+   * With no `from_user_id` or no `context_token` there is nowhere to send an answer to — so a `reply`
+   * here would be a promise the caller cannot keep. **These stay `ignore`, and they are the reason the
+   * vocabulary still has one**: collapsing them into `reply` would make the plan lie about what the
+   * script can do. Everything below this line gets an answer, because it can.
+   */
   if (typeof from !== 'string' || from === '') return { act: 'ignore', why: 'no sender' };
   if (typeof contextToken !== 'string' || contextToken === '') return { act: 'ignore', why: 'no context_token' };
-  if (text === null) return { act: 'ignore', why: 'not a text message' };
+
+  // A non-text message is answered rather than dropped: "every sentence must get a reply" includes the
+  // sentences the bridge cannot read.
+  if (text === null) {
+    return { act: 'reply', to: from, contextToken, text: helpText({ reason: '这条消息不是文字（语音/图片/文件暂不支持）' }) };
+  }
 
   const trimmed = text.trim();
-  // Only the exact `/run` prefix is an action. Everything else is conversation, which is what keeps
-  // a typo from becoming a fleet execution.
-  if (!/^\/run(\s|$)/i.test(trimmed)) return { act: 'ignore', why: 'not a /run line' };
+  // Only the exact `/run` prefix is an action, and that rule is unchanged: a typo must never become a
+  // fleet execution. What changed is that it now gets an answer instead of silence.
+  if (!/^\/run(\s|$)/i.test(trimmed)) {
+    return {
+      act: 'reply',
+      to: from,
+      contextToken,
+      text: helpText({ reason: trimmed === '' ? '空消息' : '这条消息没有以 /run 开头' }),
+    };
+  }
 
   const body = trimmed.replace(/^\/run\s*/i, '');
   const invocation = parseInvocation(body);

@@ -4,6 +4,68 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.49.0] — 2026-10-15
+
+**Every message now gets an answer. Five inputs were being silently dropped, and two of the three input
+types the request asked me to advertise are not supported.**
+
+### What was silent, measured before it was changed
+
+```
+文字 /run node --version  → dispatch
+文字 /run --ask 你好       → reply
+文字 你好                  → ignore   why=not a /run line
+图片 (type 2)             → ignore   why=not a text message
+语音 (type 3)             → ignore   why=not a text message
+空 item_list              → ignore   why=not a text message
+```
+
+**Five inputs, no answer.** A bot that reads messages and replies to none of them is
+**indistinguishable from a bot that is broken**, and the operator's only move was to send the command again.
+
+### The one silence that survived, and why it had to
+
+`no sender` and `no context_token` still return `ignore`. **With no sender or no context token there is
+nowhere to send an answer**, so returning `reply` would be a plan that lies about what the caller can do.
+**That is the reason the vocabulary still contains `ignore` at all** — collapsing it into `reply` would have
+made every plan look successful while nothing was sent.
+
+### The request asked the help to advertise "text, voice and images". I refused two of the three.
+
+`textOf` reads only `item type: 1` — **measured, not inferred: an image and a voice note both answer
+`not a text message`.** So the help says:
+
+> 支持：文字。中文可以。
+> 不支持：语音、图片、文件、表情——它们只会得到这条帮助。
+
+**A help text that promised a capability the bridge does not have would be read as a bug the first time
+somebody sent a photo**, and the bug report would be about the bridge rather than about the promise.
+
+### The three sections are asserted by heading
+
+`【1】开关指令` · `【2】指令规则与格式` · `【3】参考与边界` — asserted by name rather than by "the text mentions
+commands", because **a help text that loses a section still reads fine.**
+
+Two of the seven new assertions are worth naming:
+
+* **`--ask` is in the help.** It was reachable only by reading the source, which is the entire
+  discoverability defect this section exists to close. If it ever leaves the help, the defect is back.
+* **every `/run` example in the help is put through the real parser.** The help cannot drift into
+  advertising syntax that is refused.
+
+### The activation instruction, answered honestly
+
+*"If refused, provide the activation instruction"* — and the honest answer is that **a chat window cannot
+activate itself**. The help says the capabilities are granted by whoever starts the bridge, through
+`W2M_CAPABILITIES`, and that a refusal names the missing capability. **Implying otherwise would have sent
+the operator looking for a command that does not exist.**
+
+**Three existing tests demanded `ignore` and now demand `reply`.** They were right about the rule — a typo
+must never become a fleet execution — and wrong about how the rule is expressed. They were updated rather
+than deleted, because **the old expectation is the record of what changed.**
+
+**7 new tests, 0 failures.**
+
 ## [0.48.0] — 2026-10-15
 
 **`--dry-run` dispatched. Two dry runs sent a command to five machines, and one made a real task.**
