@@ -131,6 +131,10 @@ import { gateDispatch, approvalRequestFor, raiseApproval } from '../agent/permis
 import { createApprovalIndex } from '../agent/approval-index.mjs';
 // v0.31.0: the approval queue's front door. Written in 0.30.0 and given a caller here.
 import { createApprovalGate } from '../agent/approval-gate.mjs';
+// v0.37.0: v4.10.0's council, reached at last. `reachability-classify.mjs` found it imported by nothing but
+// its own suite, and that is the defect this import fixes.
+import { PHASES, ROLES } from '../agent/council.mjs';
+import { createCouncilSessions } from '../agent/council-session.mjs';
 import { AUTHORITY_MAX, isAuthorityLevel } from '../agent/authority.mjs';
 // v0.33.0: the level is chosen by NAME rather than typed. `resolveConfiguredLevel` also accepts a plain
 // integer, because a profile patch written by an earlier version must keep loading.
@@ -3331,6 +3335,19 @@ export async function apply(ctx, config = {}) {
     Number.isInteger(config.approvalRaiseLimitPerMinute) ? { limit: config.approvalRaiseLimitPerMinute } : {},
   );
 
+  /**
+   * v0.37.0: the council, reached at last.
+   *
+   * `src/agent/council.mjs` shipped in 0.11.0 as v4.10.0's committee governance — 275 lines with three
+   * falsifying tests asserted by name — and **nothing imported it.** `scripts/reachability-classify.mjs`
+   * reported it as a closed loop in 0.36.0, and that is what this fixes.
+   *
+   * `createCouncilSessions` holds the state, because a council runs through **seven phases across many
+   * calls**: one that lived inside a single invocation could never finish. That is the same lesson the
+   * approval queue and the P2P runtime taught, applied a third time.
+   */
+  const councilSessions = createCouncilSessions();
+
   // v0.6.1: the two browser routes behind the composer's target control. Additive and optional: a
   // host without `connection.fetch` still gets every tool, and `w2m_status` reports the absence  -   // which is the honest place for it, since a host that has no Connection at all is simply not a web
   // composition and does not need a warning on every headless run.
@@ -5386,6 +5403,150 @@ export async function apply(ctx, config = {}) {
         note: actor.level === null
           ? 'no actor_level was supplied, so may_act is reported as if the level were 0: the queue is visible, but whether you may answer any of it is not known'
           : 'may_act reflects the actor_level supplied',
+      });
+    },
+  }));
+
+  /**
+   * v0.37.0: the eleventh tool -- a question put to a council, and the outcome read back with its dissent.
+   *
+   * ## Why one tool with an action rather than seven
+   *
+   * The seven phases are a **state machine over one object**, and the machine already refuses an operation in
+   * the wrong phase with a named refusal. Seven tools would let a model call the wrong one and have to learn
+   * the order from errors; one tool with an action can report `phase` and `phases` on every call, so the
+   * legal next move is visible rather than inferred.
+   *
+   * ## What it will not do
+   *
+   * It does not break a tie. `decide()` refuses one by name, because a split council is exactly the case a
+   * person must see -- and a tool that returned *some* outcome for a tie would hide the only situation where
+   * the council exists to escalate.
+   */
+  ctx.tools.register(defineTool({
+    name: 'w2m_council',
+    description:
+      'Put a question to a council of agents and read the outcome back WITH its dissent. A council walks seven ' +
+      'phases (' + PHASES.join(' -> ') + ') and every action reports the phase it is in and the whole phase list, so the ' +
+      'legal next move is visible rather than guessed. Roles are assigned during "convene", arguments are ' +
+      'recorded during "deliberate", votes during "vote", the outcome is fixed during "decide", and "record" ' +
+      'seals it. A TIE IS REFUSED, not broken: a split council is the case a person must see. Votes carry a ' +
+      'weight computed from the voter\'s authority and reputation, and that weight is reproducible from the ' +
+      'stored ballots, which every read reports.',
+    parameters: {
+      action: {
+        type: 'string',
+        enum: ['open', 'advance', 'assign', 'argue', 'vote', 'decide', 'record', 'state', 'decision', 'list'],
+        description: 'What to do. "open" starts a council, "state" reports one mid-flight, "decision" reads a sealed one back with its dissent.',
+        default: 'state',
+      },
+      council_id: {
+        type: 'string',
+        description: 'Which council. Required for everything except "list"; chosen by the caller so it can be addressed later.',
+      },
+      question: { type: 'string', description: 'What the council is deciding. Used by "open" only.' },
+      participant: { type: 'string', description: 'Who is acting. Used by assign, argue and vote.' },
+      role: { type: 'string', enum: [...ROLES], description: 'The hat being worn. Used by "assign" only.' },
+      stance: { type: 'string', enum: ['for', 'against'], description: 'Which side an argument takes. Used by "argue" only.' },
+      text: { type: 'string', description: 'The argument itself. Used by "argue" only.' },
+      authority: { type: 'number', description: 'The voter authority level, 0..100. Used by "vote"; the weight comes from this and reputation.' },
+      reputation: { type: 'number', description: 'The voter reputation. Used by "vote"; it can never overturn authority.' },
+      choice: { type: 'string', description: 'What the voter votes for. Used by "vote" only.' },
+      reason: { type: 'string', description: 'Why the voter chose it. Carried with the ballot and read back with the dissent.' },
+    },
+    output: jsonOutput,
+    presentCall: (args) => ({
+      card: 'generic',
+      title: `w2m council ${typeof args?.action === 'string' ? args.action : 'state'}`,
+      // Only actions that change the council are writes; reading one is not.
+      kind: ['open', 'advance', 'assign', 'argue', 'vote', 'decide', 'record'].includes(args?.action) ? 'write' : 'read',
+      rawInput: {},
+    }),
+    async execute(args, exec) {
+      throwIfAborted(exec?.signal);
+      const action = typeof args?.action === 'string' ? args.action : 'state';
+      const id = typeof args?.council_id === 'string' ? args.council_id : null;
+
+      if (action === 'list') {
+        return JSON.stringify({ ok: true, action, ...councilSessions.ids(), phases: PHASES, roles: [...ROLES] });
+      }
+      if (action === 'open') {
+        const opened = councilSessions.open(id, { question: typeof args?.question === 'string' ? args.question : '' });
+        return JSON.stringify({ ok: opened.ok, action, council_id: id, phase: opened.phase ?? null, phases: PHASES, roles: [...ROLES], reason_code: opened.reason_code ?? null, detail: opened.detail });
+      }
+      if (action === 'decision') {
+        const read = councilSessions.decision(id);
+        return JSON.stringify({
+          ok: read.ok,
+          action,
+          council_id: id,
+          reason_code: read.reason_code ?? null,
+          detail: read.detail ?? null,
+          decision: read.decision ?? null,
+          // A dissent without its reason is a number rather than a position, and a decision whose outcome does
+          // not reproduce from its own ballots is one nobody should act on. Both travel with every read.
+          dissent: read.decision?.dissent ?? null,
+          unanimous: read.decision?.unanimous ?? null,
+          recount: read.recount ?? null,
+        });
+      }
+
+      const found = councilSessions.get(id);
+      if (!found.ok) {
+        return JSON.stringify({ ok: false, action, council_id: id, reason_code: found.reason_code, detail: found.detail });
+      }
+      const council = found.council;
+
+      // Every mutation goes through the council's own refusals rather than a check here, so the phase rules
+      // live in exactly one place and a tool cannot disagree with the module about them.
+      try {
+        if (action === 'advance') {
+          const moved = council.advance();
+          return JSON.stringify({ ok: true, action, council_id: id, phase: moved.phase, phases: PHASES, moved: moved.moved, detail: moved.detail ?? null });
+        }
+        if (action === 'assign') {
+          const assigned = council.assign(args?.participant, args?.role);
+          return JSON.stringify({ ok: true, action, council_id: id, phase: council.phase, assigned });
+        }
+        if (action === 'argue') {
+          const recorded = council.argue({ participant: args?.participant, stance: args?.stance, text: args?.text });
+          return JSON.stringify({ ok: true, action, council_id: id, phase: council.phase, argument: recorded });
+        }
+        if (action === 'vote') {
+          const ballot = council.vote({ participant: args?.participant, authority: args?.authority, reputation: args?.reputation, choice: args?.choice, reason: args?.reason ?? null });
+          // The weight is returned because it is the thing a reader would otherwise have to recompute to
+          // believe the tally.
+          return JSON.stringify({ ok: true, action, council_id: id, phase: council.phase, ballot });
+        }
+        if (action === 'decide') {
+          const decision = council.decide();
+          return JSON.stringify({ ok: true, action, council_id: id, phase: council.phase, decision, dissent: decision.dissent, unanimous: decision.unanimous });
+        }
+        if (action === 'record') {
+          const sealed = council.record();
+          const moved = councilSessions.seal(id);
+          return JSON.stringify({ ok: moved.ok, action, council_id: id, phase: council.phase, seal: sealed, reason_code: moved.reason_code ?? null, detail: moved.detail ?? null });
+        }
+      } catch (error) {
+        // A phase refusal is a value, not a crash: the caller is told which phase it is in and what the phase
+        // list is, so it can correct itself without a second call to find out.
+        if (error?.name === 'CouncilRefusal') {
+          return JSON.stringify({ ok: false, action, council_id: id, phase: council.phase, phases: PHASES, reason_code: error.code, detail: error.message, extra: error.extra ?? null });
+        }
+        throw error;
+      }
+
+      // "state" and anything unrecognised: report rather than mutate.
+      return JSON.stringify({
+        ok: true,
+        action: 'state',
+        council_id: id,
+        phase: council.phase,
+        phases: PHASES,
+        members: council.members,
+        votes: council.votes,
+        arguments: council.arguments,
+        decision: council.decision,
       });
     },
   }));

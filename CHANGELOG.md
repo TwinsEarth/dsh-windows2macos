@@ -4,6 +4,55 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.37.0] — 2026-10-15
+
+**`council.mjs` is wired. v4.10.0's committee governance is reachable, and its dissent arrives with its decision.**
+
+0.36.0's reachability classification found `src/agent/council.mjs` as a **closed loop** — 275 lines with three
+falsifying tests asserted by name, imported by **nothing but its own suite.** This is the eleventh tool and the
+fix for the third module of that shape.
+
+### Why the state lives outside the call
+
+A council walks **seven phases across many calls**: `convene → frame → deliberate → vote → decide → record →
+adjourn`. One that lived inside a single invocation **could never finish**, and the failure would look like
+"the phases are wrong" rather than "the state was thrown away". `createCouncilSessions` holds it — the same
+lesson the approval queue and the P2P runtime taught, applied a third time.
+
+Two kinds of state, deliberately capped differently:
+
+* a **live** council is scratch space. Losing one costs the work of returning to that phase, so the cap is
+  generous (64) and eviction is **oldest-first**, so a reader can say which survives without reading code.
+* a **decided** council is the artifact. `ROADMAP.md`'s third falsifying test is that *"a decision with
+  recorded dissent is retrievable with the dissent"* — and **retrievable means after the council that produced
+  it is gone.** So the decided cap is larger (256) and decisions outlive live eviction. Tested.
+
+### One tool with an action, not seven tools
+
+The seven phases are **a state machine over one object** and the machine already refuses an operation in the
+wrong phase by name. Seven tools would let a model call the wrong one and learn the order from errors; one
+tool reports `phase` and the whole `phases` list on **every** call, so the legal next move is visible rather
+than inferred. A `CouncilRefusal` comes back as a **value** — `ok: false` with the phase and the list — not as
+a throw, for the same reason.
+
+**A tie is refused, not broken**, and the tool does not paper over it: a split council is the one case where
+the council exists to escalate to a person.
+
+Every read of a decision returns the **dissent with its reasons** and a **`recount`**, so the seal never has
+to be taken on trust.
+
+### My own error, and the fix is a pattern rather than a correction
+
+My test helper reached the `deliberate` phase by **counting advances**, got the count wrong by one, and failed
+with a `WRONG_PHASE` refusal that **read like a defect in the module**. Measured order:
+`convene → frame → deliberate → …`, so `argue` needs **two** advances and not one. The helper now **names its
+destination** — `advanceTo(council, 'deliberate')` — because **one that counts steps drifts silently when the
+phase list grows, and one that names a destination cannot.**
+
+28 tool-count assertions updated across nine files, the whole set that has caught this every time.
+
+**13 new tests, 0 failures.**
+
 ## [0.36.0] — 2026-10-15
 
 **The classification found a third closed loop — and it is `council.mjs`, which `ROADMAP.md` marks shipped.**

@@ -39,7 +39,7 @@ So the cross-machine capability has to be built. This is that build.
                        ▼
    ┌──────────────────────────────────┐        ┌──────────────────────────┐
    │  Windows · DSH session           │        │  macOS · DSH session     │
-   │   w2m plugin (10 tools)          │        │   w2m plugin (10 tools)  │
+   │   w2m plugin (11 tools)          │        │   w2m plugin (11 tools)  │
    │        │                         │        │        │                 │
    │   Localside agent                │        │   Localside agent        │
    │    · three anchors               │        │    · three anchors       │
@@ -293,16 +293,16 @@ Then give it the relay URL in that profile's `cordis.patch.yml` — or leave
 >        got "@twinsearth/w2m-dsh-plugin/tools"), skipping
 > ```
 >
-> That is a silent failure by construction — the install looks right, ten tools appear, and
+> That is a silent failure by construction — the install looks right, eleven tools appear, and
 > `w2m_status` reports `paired: false` and a null `rabbitUrl` because none of your values were ever
 > applied. It is not hypothetical: this row's expected name moved from the `/tools` subpath to the
 > package root in v0.5.4 (see `cordis.patch.yml`'s header for why), and every override that still
 > asserted the old subpath stopped being applied on upgrade. `id` already identifies the row, so the
 > safest `name:` is no `name:` at all.
 
-Restart DSH. You should see ten tools: `w2m_devices`, `w2m_run`, `w2m_wait`,
+Restart DSH. You should see eleven tools: `w2m_devices`, `w2m_run`, `w2m_wait`,
 `w2m_report`, `w2m_status`, `w2m_update`, `w2m_history`, `w2m_stats`, `w2m_memory`,
-`w2m_approvals`.
+`w2m_approvals`, `w2m_council`.
 
 > `dsh` may not be on your `PATH`. On a packaged install it lives under
 > `resources/runtime/cli/bin/`. If `dsh` is not found, call it by path.
@@ -585,7 +585,7 @@ a product.
 |---|---|---|
 | relay | 142 | pairing, auth, SSE with `ready`-first and `seq` replay, leases with heartbeat renewal and expiry, dedupe, all **nine** aggregation states plus `pending`/`refused`, report generation, operator token, rate limiting, persistence and restart recovery, TLS, and the lost-offer recovery path |
 | agent | 129 | allow-list allow/deny, timeout, output truncation, exit codes, anchors on clean and dirty trees, four concurrent fingerprint computations, spool, a 40-case URL join matrix, cursor lifecycle across relay restarts, and the bundled-runtime resolver |
-| tools | 89 | ten tools registered, schemas, typed errors, polling, operator-token enforcement (no request is sent without it), sub-path endpoints, and the credential canaries |
+| tools | 89 | eleven tools registered, schemas, typed errors, polling, operator-token enforcement (no request is sent without it), sub-path endpoints, and the credential canaries |
 | broadcast | 19 | exactly one executor, the rest `observing`; observers excluded from every aggregation step so a machine that did not run is never counted as agreeing |
 | claims | 19 | the document claims themselves: the version, the bundle patch, the tool list, every documented tarball URL, and the CHANGELOG's shape |
 | fleet-target | 37 | the composer's target selection, and the `executor_machine_id` narrowing that overrides it |
@@ -713,7 +713,7 @@ the plugin:
 
 ```bash
 node scripts/check-entrypoints.mjs   # imports lib/tools.js, the exact specifier cordis.patch.yml mounts
-node scripts/verify-installed.mjs <path-to-installed-package>   # asserts the installed copy registers 10 tools
+node scripts/verify-installed.mjs <path-to-installed-package>   # asserts the installed copy registers 11 tools
 ```
 
 **Not verified:**

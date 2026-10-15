@@ -1095,7 +1095,7 @@ export const DECLARED_CHECKS = [
   'lint (0 errors required)',
   'mojibake scan (whole tree, plus a positive control)',
   'declared suite (package.json#scripts.test, skips itemized)',
-  'packed tarball (tree-derived documents + entry points, whole manifest, forbidden paths, 10 tools from the pack)',
+  'packed tarball (tree-derived documents + entry points, whole manifest, forbidden paths, 11 tools from the pack)',
   'claims (test/claims.test.mjs, reused not reimplemented)',
   'CHANGELOG shape (title above the newest entry, newest-first)',
 ];
@@ -1119,8 +1119,8 @@ export const GATE_INVENTORY = [
   { artifact: 'eslint entry point', path: 'node_modules/eslint/bin/eslint.js', checkedBy: 'lint (0 errors required)' },
   { artifact: 'mojibake scanner', path: 'scripts/scan-mojibake.mjs', checkedBy: 'mojibake scan (whole tree, plus a positive control)' },
   { artifact: 'entry-point check', path: 'scripts/check-entrypoints.mjs', checkedBy: 'entry points (scripts/check-entrypoints.mjs)' },
-  { artifact: 'packer', path: 'scripts/pack.mjs', checkedBy: 'packed tarball (tree-derived documents + entry points, whole manifest, forbidden paths, 10 tools from the pack)' },
-  { artifact: 'installed-copy probe', path: 'scripts/verify-installed.mjs', checkedBy: 'packed tarball (tree-derived documents + entry points, whole manifest, forbidden paths, 10 tools from the pack)' },
+  { artifact: 'packer', path: 'scripts/pack.mjs', checkedBy: 'packed tarball (tree-derived documents + entry points, whole manifest, forbidden paths, 11 tools from the pack)' },
+  { artifact: 'installed-copy probe', path: 'scripts/verify-installed.mjs', checkedBy: 'packed tarball (tree-derived documents + entry points, whole manifest, forbidden paths, 11 tools from the pack)' },
   { artifact: 'claims suite', path: 'test/claims.test.mjs', checkedBy: 'claims (test/claims.test.mjs, reused not reimplemented)' },
   { artifact: 'declared suite list', path: 'package.json', checkedBy: 'declared suite (package.json#scripts.test, skips itemized)' },
   { artifact: 'test wiring', path: 'test', checkedBy: 'test wiring (every suite on disk is named by a script; the release suite and the rest are reported)' },
@@ -1974,7 +1974,7 @@ function checkPackAndTarball() {
       );
     }
 
-    // (d) the packed copy registers the ten tools -- executed from the extracted tarball, not the tree
+    // (d) the packed copy registers the eleven tools -- executed from the extracted tarball, not the tree
     const extracted = join(staging, 'extracted');
     mkdirSync(extracted, { recursive: true });
     const skipped = extract(entries, extracted);
@@ -1988,7 +1988,7 @@ function checkPackAndTarball() {
     const verified = child('verify-installed', process.execPath, [probe, extracted]);
     if (!verified.ok) {
       return fail(
-        'scripts/verify-installed.mjs reported the packed copy does not register its ten tools',
+        'scripts/verify-installed.mjs reported the packed copy does not register its eleven tools',
         tail(verified, 20),
       );
     }
@@ -1997,10 +1997,10 @@ function checkPackAndTarball() {
     // 0" and "the probe registered ten tools" are different measurements and only the second one is
     // the claim this check makes; a probe edited to exit 0 early would satisfy the first.
     const toolCount = Number(verified.stdout.match(/registered\s*:\s*(\d+)/)?.[1] ?? NaN);
-    if (toolCount !== 10) {
+    if (toolCount !== 11) {
       return fail(
         `the packed copy registered ${Number.isNaN(toolCount) ? 'an unreadable number of' : toolCount} tool(s), ` +
-          'not the ten this package documents',
+          'not the eleven this package documents',
         tail(verified, 20),
       );
     }
@@ -2198,7 +2198,7 @@ async function main() {
     ['mojibake scan (whole tree, plus a positive control)', checkMojibake],
     ['declared suite (package.json#scripts.test, skips itemized)', () => checkTestSuite(suiteEnv)],
     [
-      'packed tarball (tree-derived documents + entry points, whole manifest, forbidden paths, 10 tools from the pack)',
+      'packed tarball (tree-derived documents + entry points, whole manifest, forbidden paths, 11 tools from the pack)',
       checkPackAndTarball,
     ],
     ['claims (test/claims.test.mjs, reused not reimplemented)', checkClaims],

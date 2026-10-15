@@ -112,7 +112,7 @@ const CLIENT_PACKAGE = '@twinsearth/w2m-dsh-plugin';
 /** The route the host registers and the page fetches (defect 3, `/api` channel included). */
 const TARGET_ROUTE_PATH = '/api/w2m/target';
 
-/** The ten tools the plugin registers; the exact set, because "some tools" is not the contract. */
+/** The eleven tools the plugin registers; the exact set, because "some tools" is not the contract. */
 const EXPECTED_TOOLS = [
   'w2m_devices',
   'w2m_history',

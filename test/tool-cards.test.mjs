@@ -104,7 +104,7 @@ async function register(config = {}) {
 describe('tool cards: the contract the shipped runtime actually implements', () => {
   it('gives every tool a presentCall that yields a generic card with a title', async () => {
     const tools = await register({ stateDir: makeProfile() });
-    assert.equal(tools.size, 10, 'the ten tools are the surface this contract covers');
+    assert.equal(tools.size, 11, 'the eleven tools are the surface this contract covers');
     for (const [name, tool] of tools) {
       assert.equal(typeof tool.presentCall, 'function', `${name} needs a presentCall`);
       const card = tool.presentCall({});
@@ -418,7 +418,7 @@ describe('exposure boundary: a tool may not hold a credential, an allow-list or 
 });
 
 describe('exposure boundary: no tool result may carry a credential', () => {
-  it('returns none of the four credentials from any of the ten tools, and never puts one in a body', async () => {
+  it('returns none of the four credentials from any of the eleven tools, and never puts one in a body', async () => {
     const fetchStub = installFetch([
       { method: 'GET', path: '/healthz', body: CANARY_HEALTHZ },
       { method: 'GET', path: '/v1/devices', body: CANARY_FLEET },
@@ -473,6 +473,9 @@ describe('exposure boundary: no tool result may carry a credential', () => {
         // An empty queue is enough to prove the tool answers without a credential, and the sweep is
         // about the shape of the result, not about filling the queue.
         ['w2m_approvals', { action: 'list' }],
+        // v0.37.0. Swept because it holds live state across calls: a council id, phases, ballots. Exactly the
+        // kind of tool whose result could echo back something it was handed.
+        ['w2m_council', { action: 'list' }],
       ];
 
       const results = [];
@@ -485,7 +488,7 @@ describe('exposure boundary: no tool result may carry a credential', () => {
         assert.equal(parsed.ok, true, `${name} must have run: ${text.slice(0, 200)}`);
         results.push([name, text]);
       }
-      assert.equal(results.length, 10, 'every registered tool must be swept, not a sample of them');
+      assert.equal(results.length, 11, 'every registered tool must be swept, not a sample of them');
 
       for (const [name, text] of results) {
         for (const canary of CANARIES) {

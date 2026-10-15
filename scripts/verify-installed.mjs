@@ -57,6 +57,7 @@ if (warnings.length > 0) {
 
 const expected = [
   'w2m_approvals',
+  'w2m_council',
   'w2m_devices',
   'w2m_history',
   'w2m_report',
