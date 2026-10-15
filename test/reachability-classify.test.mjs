@@ -81,7 +81,7 @@ describe('classifier: a closed loop is the shape this project shipped three time
 });
 
 describe('classifier: the report puts the findings where a reader looks first', () => {
-  it('counts every class and lists the loops under a heading, not in a flat list', () => {
+  it('counts every class and puts the orphans under their own heading', () => {
     const root = tree({
       'src/orphan.mjs': 'export function onlyExport() { return 1; }\n',
       'test/orphan.test.mjs': "import { onlyExport } from '../src/orphan.mjs';\n",
@@ -89,8 +89,12 @@ describe('classifier: the report puts the findings where a reader looks first', 
     const { classified } = classifyAll({ root });
     const text = classifyReport(classified);
     assert.match(text, /tests-only exports : 1/);
-    assert.match(text, /1 CLOSED LOOP\(S\)/);
+    assert.match(text, /1 ORPHAN MODULE\(S\)/);
     assert.match(text, /src\/orphan\.mjs/);
+    // TWO buckets, and the library count is gone rather than printed as a permanent zero -- it was
+    // arithmetically unreachable and a count that always reads zero is a claim nobody can act on.
+    assert.match(text, /of the closed loops: 1 ORPHAN, 0 cli/);
+    assert.doesNotMatch(text, /library/);
   });
 
   it('says so plainly when there are no loops, rather than printing an empty section', () => {

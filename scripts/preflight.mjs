@@ -1086,6 +1086,8 @@ export function classifySkips(skips, accepted = ACCEPTED_SKIPS, host = process.p
  * from here and from the inventory is a deliberate edit that only review can catch -- the honest limit
  * of what a file can assert about itself.
  */
+import { acceptedPaths } from './accepted-orphans.mjs';
+
 export const DECLARED_CHECKS = [
   'gate inventory (every gate exists and is bound to the registered check that measures it)',
   'ledger self-test (silence and an unaccepted UNVERIFIABLE are both failures)',
@@ -1094,6 +1096,7 @@ export const DECLARED_CHECKS = [
   'entry points (scripts/check-entrypoints.mjs)',
   'lint (0 errors required)',
   'mojibake scan (whole tree, plus a positive control)',
+  'reachable or accepted (no orphan module without a written reason)',
   'declared suite (package.json#scripts.test, skips itemized)',
   'packed tarball (tree-derived documents + entry points, whole manifest, forbidden paths, 11 tools from the pack)',
   'claims (test/claims.test.mjs, reused not reimplemented)',
@@ -1118,6 +1121,7 @@ export const DECLARED_CHECKS = [
 export const GATE_INVENTORY = [
   { artifact: 'eslint entry point', path: 'node_modules/eslint/bin/eslint.js', checkedBy: 'lint (0 errors required)' },
   { artifact: 'mojibake scanner', path: 'scripts/scan-mojibake.mjs', checkedBy: 'mojibake scan (whole tree, plus a positive control)' },
+  { artifact: 'accepted-orphan list', path: 'scripts/accepted-orphans.mjs', checkedBy: 'reachable or accepted (no orphan module without a written reason)' },
   { artifact: 'entry-point check', path: 'scripts/check-entrypoints.mjs', checkedBy: 'entry points (scripts/check-entrypoints.mjs)' },
   { artifact: 'packer', path: 'scripts/pack.mjs', checkedBy: 'packed tarball (tree-derived documents + entry points, whole manifest, forbidden paths, 11 tools from the pack)' },
   { artifact: 'installed-copy probe', path: 'scripts/verify-installed.mjs', checkedBy: 'packed tarball (tree-derived documents + entry points, whole manifest, forbidden paths, 11 tools from the pack)' },
@@ -1780,6 +1784,47 @@ function checkMojibake() {
   }
 }
 
+/**
+ * v0.39.0: no module may be an orphan without a written reason.
+ *
+ * Three modules shipped in this span fully tested and reachable by nothing, and two of them were **described
+ * as delivered** while nothing ran them. The classification that found them reported 86 closed loops against
+ * this repository and **could not say which were defects**, so it printed and exited 0.
+ *
+ * This gate is the missing half. A closed loop is RED unless its file appears in `scripts/accepted-orphans.mjs`
+ * **with a reason and a stated exit** — so the eight known ones are decisions somebody made, and a NINTH
+ * fails the pre-flight and forces the same conversation.
+ */
+function checkOrphans() {
+  const result = child('reachability', process.execPath, [join(ROOT, 'scripts', 'reachability-classify.mjs')], { timeoutMs: TEST_TIMEOUT_MS });
+  const text = result.stdout ?? '';
+  const line = text.match(/of the closed loops: (\d+) ORPHAN/);
+  if (!line) {
+    return fail('the classifier printed no orphan count, so the run cannot be read', tail(result, 12));
+  }
+  // The orphan module list is the section headed by a count; read the file paths under it.
+  const section = text.split(/\d+ ORPHAN MODULE\(S\)[^\n]*\n/)[1] ?? '';
+  const found = [...new Set(section.split('\n').map((l) => l.trim()).filter((l) => l.startsWith('src/') || l.startsWith('bin/') || l.startsWith('scripts/')))];
+  if (found.length === 0) {
+    return pass('no orphan modules: every closed loop is either a script run as a program or one of the accepted eight', 'reachability-classify.mjs');
+  }
+  const accepted = acceptedPaths();
+  const unexpected = found.filter((f) => !accepted.has(f));
+  if (unexpected.length > 0) {
+    return fail(
+      `${unexpected.length} module(s) are reachable by NOTHING and have no accepted reason: ${unexpected.join(', ')}. ` +
+        'Add each to scripts/accepted-orphans.mjs with a reason and what would remove it, or wire it.',
+      tail(result, 16),
+    );
+  }
+  // Accepted ones must still be orphans, or the list is stale and claiming a problem that is gone.
+  const stale = [...accepted].filter((f) => !found.includes(f));
+  if (stale.length > 0) {
+    return fail(`scripts/accepted-orphans.mjs names ${stale.length} file(s) that are no longer orphans, so the list is stale: ${stale.join(', ')}`, 'remove the entries that were fixed');
+  }
+  return pass(`${found.length} orphan module(s), every one accepted with a reason`, 'scripts/accepted-orphans.mjs');
+}
+
 function checkLint() {
   if (!existsSync(ESLINT)) return fail(`no eslint at ${ESLINT}; run npm install (dev tools only)`);
   const result = child('lint', process.execPath, [ESLINT, '.'], { timeoutMs: TEST_TIMEOUT_MS });
@@ -2196,6 +2241,7 @@ async function main() {
     ['entry points (scripts/check-entrypoints.mjs)', checkEntryPoints],
     ['lint (0 errors required)', checkLint],
     ['mojibake scan (whole tree, plus a positive control)', checkMojibake],
+    ['reachable or accepted (no orphan module without a written reason)', checkOrphans],
     ['declared suite (package.json#scripts.test, skips itemized)', () => checkTestSuite(suiteEnv)],
     [
       'packed tarball (tree-derived documents + entry points, whole manifest, forbidden paths, 11 tools from the pack)',

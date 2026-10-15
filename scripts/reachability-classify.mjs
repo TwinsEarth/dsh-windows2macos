@@ -49,6 +49,72 @@ export const CLASS = Object.freeze({
   UNNAMED: 'unnamed',
 });
 
+/** What a closed loop turns out to be, once the file's own directory is taken into account. */
+export const LOOP_KIND = Object.freeze({
+  ORPHAN: 'orphan',
+  CLI: 'cli',
+  /**
+   * **Not reachable by this classification, and kept only to say so.**
+   *
+   * The idea was that a module written to be a library would be reached *through* another module, and so
+   * could be told apart from an orphan. **It cannot, and the reason is arithmetic rather than a missing
+   * case:** a row is classified `closed-loop` only when **no source file imports anything from it at all** —
+   * that is exactly what the earlier `sibling-imported` class excludes. So by the time a row could be called
+   * a library there is no first-order importer for a second-order walk to start from, and `reachedIndirectly`
+   * returns `false` for every one of them.
+   *
+   * Measured when this was written: **72 orphan, 0 library, 14 cli** — and **the zero was a tautology rather
+   * than a finding.** It is recorded instead of deleted because the next reader will otherwise re-derive the
+   * idea and reintroduce the dead branch. **Being a library is a claim about intent, and the import graph
+   * cannot carry it; `scripts/accepted-orphans.mjs` is where that claim is actually made.**
+   */
+  LIBRARY_UNREACHABLE: 'library-unreachable',
+});
+
+/**
+ * Whether a module is reached *through* another module.
+ *
+ * ## Why "no importer" and "orphaned" are different findings
+ *
+ * Measured on this repository, the closed loops in `src/` are **72 exports across eight modules, every one of
+ * them written in a single span** — `fleet-scale`, `log-bounds`, `exit-channel`, `health`, `storage`,
+ * `field-authority`, `fleet-state`, `test-report`. Three of those were **described as delivered** when they
+ * shipped (`log-bounds` in 0.12.0, `exit-channel` in 0.10.4, `storage` in 0.10.2).
+ *
+ * That reads like eight defects. **It is not, and the distinction is measurable rather than a matter of what
+ * the author meant:**
+ *
+ *   * a module written **to be a library** has no caller by design. Its contract is its suite — fine, as long
+ *     as nothing claims it runs;
+ *   * a module whose exports **nothing anywhere reaches, directly or through another module**, is an orphan.
+ *
+ * The test is **second-order reachability**: is there any file that imports a file that imports this one? A
+ * library a wired module uses passes; a module nothing reaches does not. **That is a fact about the import
+ * graph, not a judgement about intent.**
+ *
+ * @param {string} file the module under test
+ * @param {Map<string, string[]>} importersOfModule module -> files importing from it
+ * @param {string[]} sourceFiles the program's own files
+ * @returns {{reached: boolean, via: string|null, detail: string}}
+ */
+export function reachedIndirectly(file, importersOfModule, sourceFiles) {
+  const programFiles = sourceFiles.filter((f) => !f.startsWith('test/'));
+  const direct = (importersOfModule.get(file) ?? []).filter((f) => programFiles.includes(f) && f !== file);
+  if (direct.length > 0) {
+    return { reached: true, via: direct[0], detail: `imported directly by ${direct[0]}` };
+  }
+  // One step further out: a file that itself has an importer, and imports this module.
+  for (const candidate of importersOfModule.get(file) ?? []) {
+    if (!programFiles.includes(candidate) || candidate === file) continue;
+    const importers = (importersOfModule.get(candidate) ?? []).filter((f) => programFiles.includes(f) && f !== candidate);
+    if (importers.length > 0) {
+      return { reached: true, via: candidate, detail: `reached through ${candidate}, which ${importers[0]} imports` };
+    }
+  }
+  return { reached: false, via: null, detail: 'no file in the program imports this module, directly or through another' };
+}
+
+
 /** `src/agent/x.mjs` -> `x`, `y.test.mjs` -> `y`. Used only to ask whether a loop is closed. */
 export function moduleStem(file) {
   return basename(file).replace(/\.test\.mjs$/, '').replace(/\.mjs$/, '').replace(/\.js$/, '');
@@ -139,7 +205,18 @@ export function classifyAll(options = {}) {
   const graph = { importersOfModule, exportsPerFile };
   const classified = analysis.exports
     .filter((e) => e.used_by_tests_only)
-    .map((e) => ({ ...e, ...classify(e, graph) }));
+    .map((e) => {
+      const row = { ...e, ...classify(e, graph) };
+      if (row.class === CLASS.CLOSED_LOOP) {
+        const reach = reachedIndirectly(row.file, importersOfModule, sourceFiles);
+        // A module under scripts/ or bin/ is run as a program, so having no importer is its normal state
+        // rather than a finding. The kind says which case this is, so the count is not read as a defect count.
+        // TWO kinds, not three. The library case cannot arise -- see LOOP_KIND.LIBRARY_UNREACHABLE.
+        row.loop_kind = row.file.startsWith('scripts/') || row.file.startsWith('bin/') ? LOOP_KIND.CLI : LOOP_KIND.ORPHAN;
+        row.reach_detail = reach.detail;
+      }
+      return row;
+    });
 
   return { analysis, classified, graph };
 }
@@ -160,14 +237,23 @@ export function classifyReport(classified) {
   lines.push('');
 
   const loops = byClass.get(CLASS.CLOSED_LOOP) ?? [];
+  const orphans = loops.filter((f) => f.loop_kind === LOOP_KIND.ORPHAN);
+  const clis = loops.filter((f) => f.loop_kind === LOOP_KIND.CLI);
+  // No third bucket: a library cannot be told from an orphan here, which is stated rather than implied by a
+  // count that would always read zero.
+  lines.push(`  of the closed loops: ${orphans.length} ORPHAN, ${clis.length} cli`);
+  lines.push('');
   if (loops.length === 0) {
     lines.push('no closed loops: every module with a single-export test surface is also imported by source');
+  } else if (orphans.length === 0) {
+    lines.push('no ORPHANS: every closed loop is either a script run as a program or a library another module reaches');
   } else {
-    lines.push(`${loops.length} CLOSED LOOP(S) -- a module whose only importer is the test named after it:`);
-    for (const f of loops) {
+    const orphanFiles = [...new Set(orphans.map((f) => f.file))];
+    lines.push(`${orphanFiles.length} ORPHAN MODULE(S) -- nothing in the program reaches them, directly or through another:`);
+    for (const file of orphanFiles) {
       lines.push('');
-      lines.push(`  ${f.file}`);
-      lines.push(`    ${f.name}  -- ${f.detail}`);
+      lines.push(`  ${file}`);
+      for (const f of orphans.filter((o) => o.file === file)) lines.push(`    ${f.name}`);
     }
   }
   lines.push('');

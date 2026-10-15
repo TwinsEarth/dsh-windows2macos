@@ -4,6 +4,64 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.39.0] — 2026-10-15
+
+**The orphan gate: a module nothing reaches now fails the pre-flight unless a reason is written down.**
+
+### What checking the remaining loops found — and it corrects a claim I made
+
+0.36.0's classifier reported 86 closed loops and **could not say which were defects**, so it printed and
+exited 0. This sorts them, and the result is uncomfortable and precise:
+
+**Eight orphan modules, 72 exports, every one of them written in this span** — and **two were described as
+delivered** while nothing ran them.
+
+`approval-gate.mjs` **is** wired: `tools.mjs` imports it, constructs it, and calls `mayRaise` on the raise path.
+**`field-authority.mjs` is not.** Reading the tree rather than my own changelog:
+
+```
+grep 'field-authority' src/  →  comments and documentation only. Nothing imports it.
+```
+
+**0.29.0 said "the connection now exists". It exists inside that module and nowhere else.** That is now
+recorded as a correction in `scripts/accepted-orphans.mjs`, in the entry that keeps it on the list.
+
+### A dead branch, found by the test that could not be written
+
+I added **second-order reachability** so that a module reached *through* another could be called a library
+rather than an orphan. The test for it failed, and the reason is arithmetic:
+
+> a row is `closed-loop` **only when no source file imports anything from it at all** — which is exactly what
+> the `sibling-imported` class already excludes. **So there is never a first-order importer for a second-order
+> walk to start from**, and the library case **cannot arise**.
+
+Measured: **72 orphan, 0 library, 14 cli** — and **the zero was a tautology, not a finding.** The library
+bucket is removed rather than printed as a permanent zero, and `LOOP_KIND.LIBRARY_UNREACHABLE` records *why*
+so the next reader does not re-derive the idea. **Being a library is a claim about intent, and the import
+graph cannot carry it — so the claim is made where it can be checked.**
+
+### `scripts/accepted-orphans.mjs`, and why a list rather than a rule
+
+Each accepted orphan names a **reason**, and **what would remove it**. `library` is a design choice;
+`interface-unrouted` **is the defect**, kept only because removing it needs a decision about *where* it should
+be reached from.
+
+The gate is `checkOrphans` in the pre-flight: **a closed loop is red unless its file is on that list.** The
+eight known ones are decisions somebody made; **a ninth fails the run and forces the same conversation.**
+A stale entry — one that names a file no longer an orphan — also fails, so the list cannot quietly claim a
+problem that is gone.
+
+Four of the eight are marked `interface-unrouted` and said so plainly: `health` (the sensor the user asked for
+by name), `log-bounds` (the answer to the 40× log growth, shipped in 0.12.0 and called by nothing), `storage`,
+and `field-authority`.
+
+### My own error, the same one as two rounds ago
+
+`await` in a **non-async callback**, caught by `node --check` — **the second time in this span.** The fix is
+the same both times: import it up front rather than reaching for it where it is not allowed.
+
+**13 new tests, 0 failures.**
+
 ## [0.38.0] — 2026-10-15
 
 **A seven-phase council run on MacMini — real-machine evidence for the tool that had never touched one.**
