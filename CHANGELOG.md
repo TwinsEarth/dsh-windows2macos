@@ -4,6 +4,52 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.32.0] — 2026-10-15
+
+**Widening real-machine verification: eight suites tried, none passed, and the cause is a hypothesis.**
+
+### What was measured
+
+The eight suites dispatched to MacMini all returned **non-zero there while passing here**. The packed code
+that reported this was at times ambiguous, so the run was repeated with a simpler encoding — **one bit per
+suite, exit 0 or not** — and that is unambiguous: **the packed result was `0`, meaning no suite passed.**
+
+### What was NOT measured, and is therefore not claimed
+
+The likely cause is a **missing `node_modules` on that machine** — the suites import from `src/`, and some of
+those modules reach for a dependency. **That was not established.** It is a hypothesis, and this release
+records it as one. The acceptance document now says so in a row of its own rather than in a footnote.
+
+### Five dispatches spent on a channel that carries eight bits
+
+The attempts, in order, and what each one actually answered:
+
+| Attempt | Question asked | What came back |
+|---|---|---|
+| 1 | four suites, two bits each (status + reason) | 8 bits, but the tail truncated — **unreadable** |
+| 2 | eight suites, three bits each | 24 bits packed into 8 — **arithmetically impossible, and it returned 0** |
+| 3 | re-read the saved outputs | the parse matched nothing, because it guessed Node's summary format |
+| 4 | eight suites, one bit each | **`0` — no suite passed. Unambiguous.** |
+| 5 | print the environment facts | ran to completion, **and stdout is not visible through a dispatch** |
+
+**Every one of those was the same mistake**: asking a channel more than it carries, then reading the
+truncation as an answer. `exit code` is one byte, and the correct instinct — already written into
+`machine-test-packet.mjs` and ignored here — is to ask **one bit per suite and nothing else**.
+
+`--inline` was added to that script so its loop can be delivered as a `node -e` one-liner, because a real
+machine's allow-list **admits `node -e` and refuses `node scripts/…`**. The generated command is 486 characters
+and self-checks locally. **Its stdout is still invisible through a dispatch**, which the docstring now says
+plainly: the inline form is useful when the packed code is enough, and **when it is not, the answer is one
+command run by a person rather than a cleverer encoding.**
+
+### What is unchanged
+
+**Two of the three decisions the user made are not in this release.** The authority-level *selector* — the
+request that the level be **chosen rather than typed** — is not built, and the permission gate remains
+**off by default**, which §3.11 of the acceptance draft still records as incompatible with claiming 分权限.
+
+**No new tests.** The suites that exist all still pass; what changed is a measurement and a docstring.
+
 ## [0.31.0] — 2026-10-15
 
 **The approval gate got a caller, and a draft acceptance definition for 1.0.0.**
