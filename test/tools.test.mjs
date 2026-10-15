@@ -2816,6 +2816,75 @@ describe('w2m_run: the approval gate is on the raise path, not merely available'
     assert.equal(settled.ok, true, settled.detail);
   });
 });
+describe('w2m_memory: a received block is accepted field by field, by authority', () => {
+  /** A CAT7 block as another machine would send it. */
+  const received = async () => {
+    const { makeBlock } = await import('../src/agent/blocks.mjs');
+    return makeBlock({ origin: 'machine-b', subject: 's', body: 'a claim from elsewhere', evidence: 'because', observed_at: '2026-10-15T00:00:00Z', lineage: [] });
+  };
+
+  it('refuses to accept anything without a level, rather than taking the block whole', async () => {
+    // Accepting whole is the behaviour field-level acceptance exists to replace, and it would look like success.
+    const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
+    const value = JSON.parse(await tools.get('w2m_memory').execute({ scope: 'local', accept_block: await received() }, {}));
+    assert.equal(value.ok, false);
+    assert.equal(value.reason_code, 'MEMORY_BLOCK_NO_AUTHORITY');
+    assert.match(value.detail, /no actor to judge/);
+  });
+
+  it('accepts the fields an ordinary actor can afford and OMITS the rest rather than nulling them', async () => {
+    // v4.8.0's first falsifying test, now reachable through the tool: a refused field is ABSENT.
+    const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
+    const value = JSON.parse(await tools.get('w2m_memory').execute({ scope: 'local', accept_block: await received(), actor_authority: 0 }, {}));
+    assert.equal(value.recorded, true, value.detail);
+    assert.ok(value.accepted_fields.includes('body'));
+    assert.equal(value.accepted_fields.includes('evidence'), false, 'evidence costs more than an ordinary actor has');
+    assert.equal(Object.prototype.hasOwnProperty.call(value.accepted, 'evidence'), false, 'omitted, not null');
+    assert.ok(value.refused_fields.some((r) => r.field === 'evidence'), 'and the refusal is reported');
+  });
+
+  it('accepts more when the actor can afford more, from the same block', async () => {
+    const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
+    const value = JSON.parse(await tools.get('w2m_memory').execute({ scope: 'local', accept_block: await received(), actor_authority: 70 }, {}));
+    assert.equal(value.recorded, true, value.detail);
+    assert.ok(value.accepted_fields.includes('evidence'), 'a higher level reaches the dearer field');
+  });
+
+  it('refuses a block whose own hash does not match, before judging any field', async () => {
+    const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
+    const tampered = { ...(await received()), body: 'changed after the hash was taken' };
+    const value = JSON.parse(await tools.get('w2m_memory').execute({ scope: 'local', accept_block: tampered, actor_authority: 100 }, {}));
+    assert.equal(value.ok, false);
+    assert.equal(value.verified, false);
+  });
+
+  it('refuses a block naming an ancestor the caller cannot produce, rather than re-rooting it', async () => {
+    // Re-rooting turns an unverifiable history into no history, which reads as a fresh independent assertion.
+    const { makeBlock } = await import('../src/agent/blocks.mjs');
+    const parent = makeBlock({ origin: 'machine-b', subject: 's', body: 'parent', observed_at: '2026-10-15T00:00:00Z', lineage: [] });
+    const child = makeBlock({ origin: 'machine-b', subject: 's', body: 'child', observed_at: '2026-10-15T00:00:00Z', lineage: [parent] });
+    const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
+    const refused = JSON.parse(await tools.get('w2m_memory').execute({ scope: 'local', accept_block: child, actor_authority: 100, lineage: [] }, {}));
+    assert.equal(refused.ok, false);
+    assert.match(refused.detail, /re-rooting/);
+    const accepted = JSON.parse(await tools.get('w2m_memory').execute({ scope: 'local', accept_block: child, actor_authority: 100, lineage: [parent.hash] }, {}));
+    assert.equal(accepted.recorded, true, accepted.detail);
+  });
+
+  it('writes the block as a row in the same memory file, with its refusals kept', async () => {
+    // One store, one rotation, one answer to 'what does this machine remember'.
+    const stateDir = await makeStateDir(PAIRED_DEVICE);
+    const { tools } = await register({ rabbitUrl: RABBIT, stateDir, operatorToken: OPERATOR_TOKEN });
+    const value = JSON.parse(await tools.get('w2m_memory').execute({ scope: 'local', accept_block: await received(), actor_authority: 0 }, {}));
+    assert.equal(value.recorded, true, value.detail);
+    const read = JSON.parse(await tools.get('w2m_memory').execute({ scope: 'local' }, {}));
+    const row = read.records.find((r) => r.kind === 'block');
+    assert.ok(row, 'the block is a row in the local memory');
+    assert.equal(row.block_hash, value.block_hash);
+    assert.deepEqual(row.accepted_fields, value.accepted_fields);
+    assert.ok(row.refused_fields.length > 0, 'what it declined to believe is stored too');
+  });
+});
 describe('w2m_approvals: the tool an approver reaches for', () => {
   it('takes a real dispatch from a refusal, through the queue, to a status that announces it', async () => {
     // The whole point of putting the count in `w2m_status`: a fleet blocked on approval looks exactly like an

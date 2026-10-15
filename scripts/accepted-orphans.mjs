@@ -25,6 +25,17 @@
  * original problem — three modules described as delivered while nothing ran them — happened in the first
  * place. Each entry therefore says what would take it off this list.
  */
+/**
+ * ## REMOVED in 0.41.0: `src/agent/field-authority.mjs`
+ *
+ * It was the one entry marked \`interface-unrouted\` whose removal had a known answer, and it was removed by
+ * giving it the caller its own entry named: \`w2m_memory\` now accepts a received block field by field, at the
+ * actor's authority level. **The gate's stale-entry check is what forced this edit** -- once something imported
+ * the file it stopped being an orphan, the run went red, and the acceptance had to go.
+ *
+ * Kept as a comment rather than deleted silently, because **0.29.0 claimed this connection existed and it did
+ * not**; the record of that correction is worth more than a clean list.
+ */
 export const REASON = Object.freeze({
   LIBRARY: 'library',
   INTERFACE_UNROUTED: 'interface-unrouted',
@@ -43,12 +54,6 @@ export const ACCEPTED_ORPHANS = Object.freeze([
     reason: REASON.LIBRARY,
     why: 'encodes a report into a sequence of exit codes; called by whoever needs to send one, and nothing in this repository does yet',
     removedBy: 'a caller that has a report and only an exit code to send it through -- the MacMini packet work came close but used a one-line equivalent instead',
-  },
-  {
-    file: 'src/agent/field-authority.mjs',
-    reason: REASON.INTERFACE_UNROUTED,
-    why: 'drives per-field block acceptance from the authority model; `blocks.mjs` reaches it, but nothing reaches `blocks.mjs`. **Corrects a claim**: 0.29.0 said "the connection now exists" and it exists only inside this module',
-    removedBy: 'a memory layer that stores a cognitive block and asks this module what may be accepted into it',
   },
   {
     file: 'src/agent/fleet-scale.mjs',

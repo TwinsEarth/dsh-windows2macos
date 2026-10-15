@@ -98,6 +98,12 @@ import path from 'node:path';
 // skipped rather than fatal, and the rotated generation reachable -- and a second implementation would
 // drift from the writer's shape without anything failing.
 import { appendMemory, readMemorySync } from '../agent/memory.mjs';
+// v0.41.0: v4.8.0's other half. Written in 0.9.9 and 0.29.0, and **nothing called them** until here --
+// `field-authority.mjs` was reported as an orphan in 0.36.0 and stayed on the accepted list until 0.41.0.
+// `makeBlock` is NOT imported: this path receives blocks and only reads them. Building one here would be the
+// plugin asserting a claim on its own behalf, which is the sender's job.
+import { acceptBlock, verifyBlock } from '../agent/blocks.mjs';
+import { acceptWithAuthority } from '../agent/field-authority.mjs';
 
 // The base-address rules live in one place (§2), shared with the agent side. Importing the - rather
 // than re-deriving them her - is what stops the plugin and the agent from disagreeing about what
@@ -5044,6 +5050,29 @@ export async function apply(ctx, config = {}) {
           'field a machine is not allowed to write itself -- the machine stores the fact, a reader ' +
           'asserts the meaning. Written as a new record so nothing already written is rewritten.',
       },
+      accept_block: {
+        type: 'object',
+        description:
+          'v0.41.0. Accept a CAT7 cognitive block received from another machine, per field, DRIVEN BY AN ' +
+          'AUTHORITY LEVEL (actor_authority below) rather than accepted whole. A field the level cannot ' +
+          'afford is OMITTED from the stored block rather than set to null, and lineage is checked against ' +
+          'the ancestors you supply: a block whose parent cannot be produced is REFUSED, never silently ' +
+          're-rooted, because re-rooting turns an unverifiable history into no history. Every field decision ' +
+          'is reported, so a refusal is readable rather than mysterious.',
+      },
+      actor_authority: {
+        type: 'number',
+        description:
+          'The authority level, 0..100, for accept_block. Required with it: an unset level means there is ' +
+          'no actor to judge, and accepting a block whole would defeat the point of field-level acceptance.',
+      },
+      lineage: {
+        type: 'array',
+        items: { type: 'string' },
+        description:
+          'The hashes of the ancestors you can actually produce, for accept_block. A block naming an ' +
+          'ancestor outside this list is refused rather than re-rooted.',
+      },
     },
     output: jsonOutput,
     async execute(args, exec) {
@@ -5119,8 +5148,91 @@ export async function apply(ctx, config = {}) {
        * text, which is the thing a reader most needs when a conclusion turns out to be wrong.
        */
       const conclusionText = typeof args?.record === 'string' && args.record.trim() !== '' ? args.record.trim() : null;
+      /**
+       * v0.41.0: accept a received cognitive block, field by field, driven by the authority model.
+       *
+       * ## Why the block is written as a ROW rather than into a structure of its own
+       *
+       * The memory file is JSONL rows with a \`kind\`. A conclusion is one kind; an accepted block is
+       * another. Giving blocks their own file would mean two stores to read, two to rotate, and two
+       * answers to "what does this machine remember" -- and the rotation in \`appendMemory\` already
+       * handles the size problem a second store would be created to solve.
+       *
+       * ## Why an unset authority level REFUSES rather than accepting everything
+       *
+       * Field-level acceptance exists because a receiver should not adopt everything a sender asserts.
+       * With no level there is no actor to judge, so accepting the block whole would be the exact
+       * behaviour this mode was built to replace -- and it would look like success.
+       */
+      // Hoisted above both branches that write: block acceptance and the conclusion. One read of the
+      // configured directory, so the two cannot disagree about where memory lives.
+      const stateDirForRecord = cfg.stateDir ?? null;
+
+      if (args?.accept_block !== undefined && args?.accept_block !== null) {
+        if (stateDirForRecord === null) {
+          return JSON.stringify({ ok: false, scope: 'local', reason_code: 'MEMORY_NO_STATE_DIR', detail: 'this plugin has no stateDir configured, so a block has nowhere to be accepted into' });
+        }
+        if (!Number.isInteger(args?.actor_authority)) {
+          return JSON.stringify({
+            ok: false,
+            scope: 'local',
+            reason_code: 'MEMORY_BLOCK_NO_AUTHORITY',
+            detail: 'accept_block needs actor_authority as an integer 0..100; without a level there is no actor to judge the fields, and accepting the block whole is what field-level acceptance exists to prevent',
+          });
+        }
+        const received = args.accept_block;
+        const verified = verifyBlock(received);
+        if (!verified.ok) {
+          // A block that fails its own hash is refused entirely: field-level acceptance is about trust, and
+          // there is nothing to trust about content that does not match what it claims to be.
+          return JSON.stringify({ ok: false, scope: 'local', reason_code: verified.code, detail: verified.detail, verified: false });
+        }
+        const { accepted, refused, decisions } = acceptWithAuthority(
+          received,
+          { level: args.actor_authority, id: self },
+          { accept: acceptBlock, ...(Array.isArray(args.lineage) ? { lineage: args.lineage } : {}) },
+        );
+        if (accepted === null) {
+          // Refused as a whole -- a missing ancestor, most likely. Reported with the whole field list, because
+          // "refused" without "why" is the failure this project keeps having to correct.
+          return JSON.stringify({ ok: false, scope: 'local', reason_code: refused[0]?.why?.split(':')[0] ?? 'MEMORY_BLOCK_REFUSED', detail: refused[0]?.why ?? 'the block was refused', refused, decisions });
+        }
+        const row = {
+          at: new Date().toISOString(),
+          kind: 'block',
+          machine_id: selfId,
+          machine_name: self,
+          // The block's own hash identifies what was accepted; the lineage it declared travels with the row, so
+          // a reader can tell an accepted block from a fabricated one without re-deriving anything.
+          block_hash: received.hash ?? null,
+          lineage: Array.isArray(received.lineage) ? [...received.lineage] : [],
+          accepted_by_level: args.actor_authority,
+          accepted,
+          accepted_fields: decisions.filter((d) => d.accepted).map((d) => d.field),
+          // Refusals are stored, not discarded: "what did this machine decline to believe" is as much a part
+          // of its memory as what it took, and the design's whole third test is about dissent surviving.
+          refused_fields: decisions.filter((d) => !d.accepted).map((d) => ({ field: d.field, why: d.reason })),
+        };
+        const written = appendMemory(stateDirForRecord, row);
+        return JSON.stringify({
+          ok: written.ok === true,
+          scope: 'local',
+          recorded: written.ok === true,
+          kind: 'block',
+          block_hash: row.block_hash,
+          accepted_fields: row.accepted_fields,
+          refused_fields: row.refused_fields,
+          accepted,
+          decisions,
+          path: written.path ?? null,
+          reason_code: written.ok === true ? null : 'MEMORY_BLOCK_WRITE_FAILED',
+          detail: written.ok === true
+            ? `accepted ${row.accepted_fields.length} field(s) at level ${args.actor_authority}; ${row.refused_fields.length} omitted`
+            : (written.error ?? 'the block could not be written'),
+        });
+      }
+
       if (conclusionText !== null) {
-        const stateDirForRecord = cfg.stateDir ?? null;
         if (stateDirForRecord === null) {
           return JSON.stringify(
             {

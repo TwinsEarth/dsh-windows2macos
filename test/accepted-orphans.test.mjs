@@ -10,7 +10,7 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { after } from 'node:test';
 
@@ -141,12 +141,13 @@ describe('orphan gate: the acceptance list is itself checkable', () => {
     assert.ok(reasons.has(REASON.INTERFACE_UNROUTED), 'and some are the defect, kept only for lack of a decision');
   });
 
-  it('records the correction, not just the current state', () => {
-    // The entry for field-authority says 0.29.0 claimed the connection existed. If that sentence is ever
-    // tidied away, the record of a wrong claim goes with it.
-    const entry = ACCEPTED_ORPHANS.find((e) => e.file === 'src/agent/field-authority.mjs');
-    assert.ok(entry, 'field-authority must stay listed until it is wired');
-    assert.match(entry.why, /Corrects a claim/);
-    assert.equal(entry.reason, REASON.INTERFACE_UNROUTED);
+  it('no longer accepts field-authority, because 0.41.0 gave it a caller', () => {
+    // The entry existed to record that 0.29.0 claimed a connection that did not exist. It was removed only
+    // when `w2m_memory` started calling the module -- and the gate's own stale-entry check is what demanded
+    // the edit. Asserting its ABSENCE here is what stops it being re-added out of habit.
+    assert.equal(ACCEPTED_ORPHANS.some((e) => e.file === 'src/agent/field-authority.mjs'), false);
+    const text = readFileSync(new URL('../scripts/accepted-orphans.mjs', import.meta.url), 'utf8');
+    assert.match(text, /REMOVED in 0\.41\.0/, 'the removal is recorded, not merely applied');
+    assert.match(text, /0\.29\.0 claimed this connection existed and it did\s*\n?\s*\* not/, 'and the wrong claim it corrects is still named');
   });
 });

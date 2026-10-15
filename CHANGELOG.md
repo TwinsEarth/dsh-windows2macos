@@ -4,6 +4,57 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.41.0] — 2026-10-15
+
+**`field-authority.mjs` has a caller. The correction from 0.29.0 lands, six versions after the claim.**
+
+### What was wired, and the claim it settles
+
+0.29.0's entry said *"the connection now exists."* **It existed inside that module and nowhere else** — the
+0.36.0 classification reported the file as an **orphan**, and reading the tree rather than the changelog
+confirmed it: `grep 'field-authority' src/` matched **comments and documentation only.**
+
+`w2m_memory` now accepts a received CAT7 block **field by field, at the actor's authority level**, and writes it
+as a row in the same JSONL the conclusions use — one store, one rotation, one answer to *"what does this machine
+remember."* Measured, all six cases:
+
+```
+no level   ok=false  MEMORY_BLOCK_NO_AUTHORITY
+level 0    ok=true   accepted=[subject,body] refused=[evidence]
+level 70   ok=true   accepted=[subject,body,evidence]
+tampered   ok=false  BLOCK_HASH_MISMATCH
+no ancestor ok=false BLOCK_MISSING_PARENT
+with ancestor ok=true accepted 3/3
+```
+
+**A refused field is OMITTED, not set to null** — v4.8.0's first falsifying test, now reachable through a tool.
+**An unset level REFUSES rather than accepting the block whole**, because accepting whole is the exact behaviour
+field-level acceptance was built to replace, and it would look like success. **A block naming an ancestor the
+caller cannot produce is refused, never re-rooted**, because re-rooting turns an unverifiable history into no
+history — which reads as a fresh, independent assertion. And **refusals are stored**, not discarded: what a
+machine declined to believe is as much a part of its memory as what it took.
+
+### The list policed itself, which is the part worth keeping
+
+`field-authority` was removed from `scripts/accepted-orphans.mjs` **not by a decision to tidy up, but because
+the gate went red.** Its stale-entry check fails when an accepted orphan stops being an orphan — so the moment
+`tools.mjs` imported the file, the run demanded the acceptance be withdrawn. **Orphans: 8 → 7. Exports: 72 →
+65.**
+
+### My own error, and it is the eighth of this exact shape
+
+I inserted the new branch by matching an **anchor string** and never checked **what block that string was
+inside.** It landed inside `if (conclusionText !== null)`, so the feature only ran when the caller *also* passed
+`record`. Six tests failed, and I diagnosed it by **guessing at return shapes twice before printing them** —
+`verifyBlock` and `acceptWithAuthority` were both exactly what I had assumed, and the actual fault was a
+scoping mistake three steps earlier.
+
+**Two wrong hypotheses, then one printed value, then ten seconds to the answer.** That is the eighth time in
+this span that printing would have been faster than predicting, and the note is here because the pattern has
+now survived being written down seven times.
+
+**6 new tests, 0 failures.**
+
 ## [0.40.0] — 2026-10-15
 
 **The acceptance document, converged — and bound to the pre-flight so it cannot drift.**
