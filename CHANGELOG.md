@@ -4,6 +4,60 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.4] — 2026-10-15
+
+**A result channel over exit codes, for machines whose text cannot be read back.**
+
+### Why this exists, stated without euphemism
+
+The relay carries a per-machine `exit_code` faithfully and carries **no stdout at all**. That is a
+deliberate property of the ledger and the right design for a system whose job is to say whether machines
+agree — but the consequence is that an orchestrator can learn *that* a task failed and never *why*, and on
+this fleet that cost several rounds: a health check returning a real verdict was indistinguishable from one
+that crashed, because both produce a number and nothing else.
+
+Every channel that would carry text is unavailable here. The relay host's SSH and its sink are refused, an
+inbound receiver on the orchestrator never received a single connection, and a machine's `allowedCommands`
+may permit only a narrow set of commands. What has worked on every machine every time is the exit status. So
+this encodes bytes into exit codes. It is slow and it is ugly, and both are the point: **a diagnostic that
+arrives slowly is worth more than one that never arrives.**
+
+### The two design choices that are not arbitrary
+
+- **`126` and `127` never carry data.** Shells write them for "not executable" and "not found", so a real
+  127 and a data 127 would be indistinguishable and the reader would investigate the wrong failure. The
+  alphabet is therefore a mapping over `1..125` and `128..253`, not a constant offset — the first version
+  used `value + 1` across the whole range and its own test caught the collision.
+- **Truncation is not completion.** `254` ends the message and `255` says the sender failed. A channel that
+  stopped mid-message must not be read as a whole message, because that turns "the machine stopped talking"
+  into "the machine said this" with no way for the reader to tell.
+
+### Three failed fixes, and what actually located the bug
+
+`encodeBytes` emits remainders as it divides, so its output is **least significant first**; the decoder's
+Horner accumulator consumes digits **most significant first**. Feeding one into the other inverts the
+message, and it presents as byte-order corruption rather than reversal — `"first"` came back as
+`"Y~\u0010\u0018\u00fc"`.
+
+Two attempts to fix it failed because they were fixing the wrong half: a stray `.reverse()` was added to the
+*output* buffer, then removed, then removed again, while the real fault was that the *input* needed
+reversing. The first attempt also had a genuine second bug — the encoder mutated the array it was iterating
+— which masked the first. What settled it was computing the digits with `BigInt` and comparing: `encodeBytes`
+matched the reference exactly, which located the fault on the decode side and in the input order rather than
+the output.
+
+### What is documented rather than papered over
+
+Leading NUL bytes are not recoverable: they do not change the number, so `[0, 0, 1]` and `[1]` are the same
+value and the same digit list. Recovering them needs a length declared on the wire, and this channel carries
+text. That is asserted in the suite, because a future reader will otherwise treat it as a bug and add a
+length prefix that changes the wire format for every existing message.
+
+A 29-byte verdict costs 30 dispatches. `costOf()` reports this so a caller can see that a log file is not
+worth sending this way — and fix the real channel instead.
+
+**17 tests, 0 failures.**
+
 ## [0.10.3] — 2026-10-15
 
 **Fix: the macOS health check walked a user's home directory, and timed out instead of reporting.**
