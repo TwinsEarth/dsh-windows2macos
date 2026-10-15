@@ -4,6 +4,51 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] — 2026-10-15
+
+**The fleet is three machines, not five — and two relay endpoints disagree about it.**
+
+### The measurement, which is the whole point of this release
+
+`w2m_stats` and `w2m_devices` both answer "is this machine usable?" and **they do not agree**:
+
+| Machine | `w2m_devices` | `w2m_stats` | silent for |
+|---|---|---|---|
+| jp-shared | online | online, RTT **6 ms** | 2.4 s |
+| macmini | online | online, RTT **538 ms** | 4.4 s |
+| ToFuture | online | online, RTT **122 ms** | 0 s |
+| win-desktop ×2 | **online** | **offline, `silent`** | **61 384 s ≈ 17 h** |
+
+**A fleet whose size is reported two ways is a fleet whose plans are wrong by a factor of 1.7** — and the
+failure is silent, because both answers look authoritative. `src/agent/fleet-state.mjs` prefers `w2m_stats`
+(it is the one carrying a *reason*), treats a listing without a heartbeat age as unverified, and
+`reconcile()` reports **every machine the two endpoints disagree about** rather than picking one and staying
+quiet.
+
+### The second divergence, which would have flattered the fleet
+
+`w2m_history` lists a `lease_states` map per task. **It is not the execution outcome.** Of forty tasks in the
+sample, every one recorded macmini as `done` — while the session's own result envelopes included several
+`expired` with no exit code at all. The map records the *current* lease state.
+
+`historyIsOutcomeRecord()` returns `false` unconditionally with the reason, and its suite asserts on the
+measured payload. The finding matters because of its direction: **a reliability measurement built on the
+history listing would have shown a perfectly reliable fleet** — the most dangerous possible error in a module
+whose whole purpose is to notice trouble.
+
+The number to plan against is therefore **three usable machines**, and `readStats()` takes it from the
+per-machine entries rather than from `counts.online`, while still reporting the relay's own claim rather than
+hiding it.
+
+### A fixture typo that invented a disagreement
+
+Two tests failed because a machine id in a fixture was written `tob` where the payload says `tof` — so the
+reconciler correctly reported a *third* machine claimed online but not usable. **The code was right and the
+fixture was wrong**, which is the third time in this project that a failing test was the test's fault; the
+argument for testing refusals is that they fail loudly enough to be told apart.
+
+**16 tests, 0 failures.**
+
 ## [0.14.0] — 2026-10-15
 
 **Fleet scale: the arithmetic the observations support, and the refusals where they support nothing.**
