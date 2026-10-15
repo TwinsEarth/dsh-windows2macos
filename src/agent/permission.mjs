@@ -256,6 +256,82 @@ export function approvalRequestFor(decision, context = {}) {
 }
 
 /**
+ * Turn an approval request into the entry the approval index accepts, and register it.
+ *
+ * ## Why this adapter exists rather than a direct call
+ *
+ * The two shapes are close and **not identical**, which is precisely where a defect would live:
+ *
+ * | `approvalRequestFor` produces | `index.register` wants |
+ * |---|---|
+ * | `subject_level` (flat) | `subject: { id, level }` (nested) |
+ * | `capability` | `action` |
+ * | `task_id` / `requested_by` | `sessionKey` / `subject.id` |
+ *
+ * A caller hand-mapping these at the call site would get it right once and wrong later, and the failure would
+ * be a request registered against the wrong subject — the one field the whole decision rests on. So the
+ * mapping lives here, beside the thing it maps from.
+ *
+ * ## What it refuses, and why it does not smooth anything over
+ *
+ * `register` refuses a subject level that is not an integer 0..100, and this adapter **passes the index's own
+ * `reason_code` and `detail` through unchanged**. A bridge that substituted a default level to make
+ * registration succeed would be inventing the single fact the approver's decision rests on, and would look
+ * like success while doing it.
+ *
+ * @param {{register: (entry: object) => {ok: boolean, reason_code?: string, detail?: string}}} index
+ * @param {object} request from {@link approvalRequestFor}
+ * @param {{approvalId: string, sessionKey?: string|null, toolName?: string|null,
+ *   deadlineAt?: number|null, now?: number}} context
+ * @returns {{ok: boolean, approval_id: string|null, reason_code: string|null, detail: string}}
+ */
+export function raiseApproval(index, request, context = {}) {
+  if (index === null || typeof index !== 'object' || typeof index.register !== 'function') {
+    return { ok: false, approval_id: null, reason_code: 'APPROVAL_NO_INDEX', detail: 'no approval index was supplied, so nothing was registered' };
+  }
+  if (request === null || typeof request !== 'object') {
+    return { ok: false, approval_id: null, reason_code: 'APPROVAL_NO_REQUEST', detail: 'no approval request was supplied, so nothing was registered' };
+  }
+  const approvalId = context.approvalId;
+  if (typeof approvalId !== 'string' || approvalId === '') {
+    // Required from the caller rather than generated here: an id invented at this layer could not be
+    // correlated with whoever is waiting for the decision.
+    return {
+      ok: false,
+      approval_id: null,
+      reason_code: 'APPROVAL_NO_ID',
+      detail: 'raiseApproval needs a caller-supplied approvalId, so the request can be correlated with whoever waits on it',
+    };
+  }
+
+  const result = index.register({
+    approvalId,
+    sessionKey: context.sessionKey ?? null,
+    subject: { id: request.requested_by ?? null, level: request.subject_level },
+    action: request.capability,
+    toolName: context.toolName ?? null,
+    reason: request.detail ?? null,
+    ...(Number.isFinite(context.now) ? { openedAt: context.now } : {}),
+    deadlineAt: Number.isFinite(context.deadlineAt) ? context.deadlineAt : null,
+  });
+
+  if (result?.ok !== true) {
+    return {
+      ok: false,
+      approval_id: null,
+      reason_code: result?.reason_code ?? 'APPROVAL_REFUSED',
+      detail: result?.detail ?? 'the approval index refused the request without saying why',
+    };
+  }
+  return {
+    ok: true,
+    approval_id: approvalId,
+    reason_code: null,
+    detail: `registered ${approvalId} for ${request.capability} at subject level ${request.subject_level}`,
+  };
+}
+
+/**
  * Whether a decision may be settled automatically.
  *
  * Only `ALLOW` and only for a non-destructive capability. A destructive action that reaches an approver's

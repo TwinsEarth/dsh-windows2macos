@@ -4,6 +4,56 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.0] — 2026-10-15
+
+**The escalation reaches the approval index — and the bridge between them is where the defect would have been.**
+
+Two shapes that look alike and are not:
+
+| `approvalRequestFor()` produces | `index.register()` wants |
+|---|---|
+| `subject_level` (flat) | `subject: { id, level }` (nested) |
+| `capability` | `action` |
+| `task_id`, `requested_by` | `sessionKey`, `subject.id` |
+
+A caller hand-mapping these at the call site would get it right once and wrong later, and **the failure would
+be a request registered against the wrong subject — the one field the whole decision rests on.** So
+`raiseApproval()` owns the mapping and lives beside the thing it maps from.
+
+### It does not smooth anything over
+
+`register()` refuses a subject level that is not an integer 0..100, and the adapter **passes the index's own
+`reason_code` and `detail` through unchanged**. A bridge that substituted a default level to make registration
+succeed would be **inventing the single fact the approver's decision rests on, and would look like success
+while doing it.** Tested directly: a request whose level is `'captain'` is refused, and the queue stays empty.
+
+The `approvalId` is **required from the caller, not generated here**, because an id invented at this layer
+could not be correlated with whoever is waiting on the decision.
+
+### The end-to-end property is asserted, not described
+
+A real `createApprovalIndex()` is constructed in the suite and an escalation is raised into it: the request
+appears in `index.all()`, `subjectLevel` survives the mapping as `49`, and after an approver at level 50
+settles it, **the subject level is still 49** — settling must not rewrite it.
+
+### Two of my own errors, both caught by the suite rather than by reading
+
+* I asserted `INDEX_NO_SUBJECT_LEVEL`. The value is `APPROVAL_NO_SUBJECT_LEVEL` — **every code in
+  `INDEX_REFUSAL` carries the `APPROVAL_` prefix.** The implementation was right and had passed the index's
+  own code through faithfully, which is exactly what the test was there to check. The assertion now reads the
+  value **out of the table** so it cannot drift again.
+* The generator script's escape handling produced a stray `$` inside a template literal in a *failure message*,
+  which threw at runtime rather than at parse time. Caught by running the suite, not by `node --check`.
+
+### Still not wired to a live queue
+
+`createApprovalIndex` has **no caller in the plugin** — it was built in 0.10.0 and is exported from
+`approval-index.mjs` alone. This release makes the gate and the index meet **on a real object**, with an
+end-to-end test, but no dispatch path yet constructs a queue. So `W2M_PERMISSION_NEEDS_APPROVAL` still
+refuses rather than queuing, and it still says so.
+
+**6 new tests, 0 failures.**
+
 ## [0.23.0] — 2026-10-15
 
 **The gate is on the dispatch path. "分权限" now executes, and a machine that has not opted in behaves exactly as before.**

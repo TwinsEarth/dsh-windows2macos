@@ -16,6 +16,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { CAPABILITIES, permissionFor } from '../scripts/layer-model.mjs';
+import { INDEX_REFUSAL, createApprovalIndex } from '../src/agent/approval-index.mjs';
 import { AUTHORITY_BANDS, AUTHORITY_MAX } from '../src/agent/authority.mjs';
 import {
   AUTHORITY_VERDICT,
@@ -26,6 +27,7 @@ import {
   decide,
   gateDispatch,
   mayAutoSettle,
+  raiseApproval,
 } from '../src/agent/permission.mjs';
 
 /** A level that sits inside a named band, so tests depend on the bands rather than on magic numbers. */
@@ -33,7 +35,81 @@ const levelIn = (name) => {
   const band = AUTHORITY_BANDS.find((b) => b.name === name);
   assert.ok(band, `no band named ${name}`);
   return band.min;
-};
+};describe('permission: the escalation really reaches the approval index', () => {
+  const freshIndex = () => createApprovalIndex({ now: () => 1000 });
+  const escalate = (level) => approvalRequestFor(decide('dispatch_writing', level), { taskId: 'T1', machineId: 'M1', requestedBy: 'actor-1' });
+
+  it('registers a real escalation, and the index accepts it', () => {
+    // The two features meeting for the first time on a real object rather than on a shape description.
+    const index = freshIndex();
+    const r = raiseApproval(index, escalate(49), { approvalId: 'AP-1' });
+    assert.equal(r.ok, true, r.detail);
+    assert.equal(r.approval_id, 'AP-1');
+    assert.match(r.detail, /registered AP-1 for dispatch_writing/);
+    assert.equal(index.all().length, 1, 'the request should be in the queue');
+  });
+
+  it('maps the flat request onto the nested entry, field by field', () => {
+    // The mapping is where a defect would live: `subject_level` -> `subject.level`, `capability` -> `action`.
+    const index = freshIndex();
+    raiseApproval(index, escalate(49), { approvalId: 'AP-2', sessionKey: 'S1', toolName: 'w2m_run' });
+    const [record] = index.all();
+    assert.equal(record.subjectLevel, 49, 'the subject level must survive the mapping');
+    assert.equal(record.subjectId, 'actor-1');
+    assert.equal(record.action, 'dispatch_writing');
+    assert.equal(record.sessionKey, 'S1');
+    assert.equal(record.toolName, 'w2m_run');
+  });
+
+  it('passes the index refusal through rather than defaulting the level', () => {
+    // A bridge that substituted a level to make registration succeed would be inventing the one fact the
+    // approver's decision rests on, and would look like success while doing it.
+    const index = freshIndex();
+    const bad = escalate(49);
+    bad.subject_level = 'captain';
+    const r = raiseApproval(index, bad, { approvalId: 'AP-3' });
+    assert.equal(r.ok, false);
+    // `INDEX_REFUSAL.NO_SUBJECT_LEVEL` is `'APPROVAL_NO_SUBJECT_LEVEL'` -- every code in that table carries the
+    // `APPROVAL_` prefix. The first version of this assertion guessed `INDEX_` and was wrong; it now reads the
+    // value out of the table itself so it cannot drift again.
+    assert.equal(r.reason_code, INDEX_REFUSAL.NO_SUBJECT_LEVEL);
+    assert.equal(index.all().length, 0, 'nothing should have been registered');
+  });
+
+  it('refuses a call with no id, no request or no index, each by name', () => {
+    const index = freshIndex();
+    for (const [args, code] of [
+      [[null, escalate(49), { approvalId: 'x' }], 'APPROVAL_NO_INDEX'],
+      [[{ register: 1 }, escalate(49), { approvalId: 'x' }], 'APPROVAL_NO_INDEX'],
+      [[index, null, { approvalId: 'x' }], 'APPROVAL_NO_REQUEST'],
+      [[index, escalate(49), {}], 'APPROVAL_NO_ID'],
+      [[index, escalate(49), { approvalId: '' }], 'APPROVAL_NO_ID'],
+    ]) {
+      const r = raiseApproval(...args);
+      assert.equal(r.ok, false, JSON.stringify(args[2]));
+      assert.equal(r.reason_code, code);
+    }
+  });
+
+  it('does not register an allow or a denial, because neither is a request', () => {
+    const index = freshIndex();
+    assert.equal(approvalRequestFor(decide('read_fleet_state', 0)), null);
+    assert.equal(raiseApproval(index, approvalRequestFor(decide('read_fleet_state', 0)), { approvalId: 'AP-4' }).ok, false);
+    assert.equal(index.all().length, 0);
+  });
+
+  it('keeps the subject level the index recorded, not the one a later caller supplies', () => {
+    // The reason the level is recorded at raise time at all: an approver who could supply it could lower it.
+    const index = freshIndex();
+    raiseApproval(index, escalate(49), { approvalId: 'AP-5' });
+    const [record] = index.all();
+    assert.equal(record.subjectLevel, 49);
+    const decision = index.decide('AP-5', { id: 'approver', level: 50 }, 'approved');
+    assert.equal(decision.ok, true, decision.detail);
+    assert.equal(index.all({ includeSettled: true })[0].subjectLevel, 49, 'settling must not rewrite the subject level');
+  });
+});
+
 describe('permission: a dispatch is graded from its own facts, not from a caller-named capability', () => {
   it('grades a non-writing dispatch as the cheap capability', () => {
     assert.equal(capabilityForDispatch({ write: false }).capability, 'dispatch_readonly');
