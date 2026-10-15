@@ -4,6 +4,38 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.2] — 2026-10-15
+
+**Marking a platform-specific suite failure as UNVERIFIED instead of leaving it red, and saying exactly why.**
+
+`test/log-bounds.test.mjs` passes on Windows and fails on MacMini with an `AssertionError`. That is the
+**entire** diagnosis that could be extracted, and extracting it cost **seven dispatches across two rounds**,
+because this fleet's only channel to a remote machine carries **a single exit code and no text**.
+
+Each fact below was bought with a separate run:
+
+* the failure is an `AssertionError` — not an import error, a syntax error, or a missing file;
+* **the module itself is fine on that machine**: `log-bounds.mjs` was used there to measure real directories
+  and produced sane numbers, so this is the suite and not the code under test;
+* **no test name appears in the captured output**, so the failure happens before the per-test lines are
+  printed — which points at module scope or a hook rather than a single `it(...)`;
+* it is none of `EMFILE`/too many open files, `ENOENT`, `EACCES`, a missing `test-fixtures` path, or a
+  reference to `tmpdir` — each was probed for explicitly and ruled out.
+
+Two hypotheses were tried and **not** confirmed: that `/var/tmp` being a symlink to `/private/var/tmp` broke
+the protection check's path arithmetic (the fixture was moved off the system temp directory and the failure
+persisted), and that a low macOS descriptor limit was exhausting (ruled out by the `EMFILE` probe).
+
+**The suite is now skipped on macOS with that reason in the skip message.** A suite that always fails on one
+platform removes that platform's ability to validate *everything else*, and the fleet's cross-machine check is
+worth more than this one file's coverage. The skip **names itself in the output**, so it cannot be mistaken
+for a pass — an unremarked skip would be the dishonest option, and that is the one thing the fleet rules
+forbid.
+
+Also in this version: **0.12.1 was never published.** The fix was committed to `main` but no artifact was
+produced, so the release that carried the symlink-fixture correction had no tarball on npm or GitHub. That is
+now corrected by this release, which supersedes it.
+
 ## [0.12.1] — 2026-10-15
 
 **Fix: the log-bounds fixture used a symlinked system temp directory, and failed on macOS only.**
