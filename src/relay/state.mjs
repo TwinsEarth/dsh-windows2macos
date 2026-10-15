@@ -607,6 +607,7 @@ export class RabbitState {
           mode: t.mode ?? 'replicate',
           command_argv: t.command_argv ?? [],
           cwd_rel: t.cwd_rel ?? '.',
+          cwd_outside_project: t.cwd_outside_project === true,
           index_total: t.index_total ?? 1,
           timeout_ms: t.timeout_ms ?? 300_000,
           write: t.write === true,
@@ -1475,6 +1476,10 @@ export class RabbitState {
       mode,
       command_argv: commandArgv,
       cwd_rel: cwdRel,
+      // v0.43.0. The task construction is field-by-field, so a field not named here is silently dropped --
+      // which is how a parameter can be accepted by the tool, validated by the tool, and never reach the
+      // machine. Named explicitly so it travels.
+      cwd_outside_project: input.cwd_outside_project === true,
       index_total: indexTotal,
       timeout_ms: timeoutMs,
       write: input.write === true,
@@ -1720,6 +1725,7 @@ export class RabbitState {
         mode: task.mode,
         command_argv: task.command_argv,
         cwd_rel: task.cwd_rel,
+        cwd_outside_project: task.cwd_outside_project === true,
         index_total: task.index_total,
         timeout_ms: task.timeout_ms,
         write: task.write,
@@ -1848,6 +1854,9 @@ export class RabbitState {
       origin_machine_id: task.origin_machine_id ?? null,
       p2p: task.p2p ?? null,
       cwd_rel: task.cwd_rel,
+      // Omitted when false, so a single-command offer for every existing caller stays byte-identical -- the
+      // same reason `stages` above is conditional.
+      ...(task.cwd_outside_project === true ? { cwd_outside_project: true } : {}),
       write: task.write,
       timeout_ms: task.timeout_ms,
       base_commit: task.base_commit,

@@ -584,19 +584,38 @@ export async function collectPostState(options) {
  * Containment is decided with `path.relative`, which (unlike a string prefix
  * test) is correct on Windows where drive letters and path case vary.
  *
+ * ## Why there is now an explicit way out, and why it is opt-in
+ *
+ * This guard was written because a caller should not be able to point a machine at a directory the
+ * operator never designated as the project. **Measured, that turned out to make the agent unusable for
+ * the one thing a fleet is for**: a machine whose localside was started from `~/.dsh/xclient` (its own
+ * state directory, which is the default when `--project` is not passed) **can only ever run inside
+ * `~/.dsh/xclient`**. Dispatching `node --test test/x.test.mjs` to it then fails with `PATH_INVALID`,
+ * because the resolved directory does not exist — **and nothing about the answer says why.** Eight
+ * dispatches went into establishing that.
+ *
+ * So the escape exists and is **named**: `allowOutside`. It is `false` unless a caller asks, it is
+ * carried on the offer rather than inferred, and the resolved absolute path is reported back so the
+ * result says the command ran outside the project. **A named, auditable escape is worth more than a
+ * guard that quietly ignores its own outcome** — the previous version computed this refusal and then
+ * ran anyway with the *unvalidated* relative path.
+ *
  * @param {string} projectRoot Absolute project root.
  * @param {string} cwdRel Forward-slash relative path from the offer.
- * @returns {{ok: true, cwd: string, cwd_rel: string}|{ok: false, reason: string}}
+ * @param {{allowOutside?: boolean}} [options]
+ * @returns {{ok: true, cwd: string, cwd_rel: string, outside_project: boolean}|{ok: false, reason: string}}
  */
-export function resolveProjectCwd(projectRoot, cwdRel) {
+export function resolveProjectCwd(projectRoot, cwdRel, options = {}) {
+  const allowOutside = options.allowOutside === true;
   const root = resolve(projectRoot);
   const normalized = normalizeRelPath(cwdRel);
   const target = resolve(root, normalized.split('/').join(sep));
   const rel = relative(root, target);
-  if (rel === '..' || rel.startsWith('..' + sep) || isAbsolute(rel)) {
+  const escapes = rel === '..' || rel.startsWith('..' + sep) || isAbsolute(rel);
+  if (escapes && !allowOutside) {
     return { ok: false, reason: 'CWD_OUTSIDE_PROJECT' };
   }
-  return { ok: true, cwd: target, cwd_rel: normalizeRelPath(rel) };
+  return { ok: true, cwd: target, cwd_rel: normalizeRelPath(rel), outside_project: escapes };
 }
 
 /**

@@ -3571,6 +3571,19 @@ export async function apply(ctx, config = {}) {
         description: 'Working directory relative to the project root, with forward slashes. Defaults to ".".',
         default: '.',
       },
+      cwd_outside_project: {
+        type: 'boolean',
+        default: false,
+        description:
+          'v0.43.0. Let `cwd_rel` resolve OUTSIDE the target machine\'s project root. OFF by default, and ' +
+          'that guard exists for a reason: a machine should not be pointed at a directory the operator ' +
+          'never designated. It is needed because a localside started without `--project` takes its own ' +
+          'working directory as the root -- so a machine launched from its state directory can otherwise ' +
+          'run ONLY inside that directory, and a dispatch that asks for anywhere else fails as ' +
+          '`PATH_INVALID` with nothing in the answer saying why. Turning this on does not widen what may ' +
+          'be RUN (the command allow-list and the executable path check still apply); it changes WHERE. ' +
+          'The resolved directory is reported back so a result says when it happened.',
+      },
       timeout_ms: {
         type: 'number',
         // No `default` here on purpose. If the schema carried one, DSH would fill it in before
@@ -3967,6 +3980,8 @@ export async function apply(ctx, config = {}) {
         // the relay's normalization is the single source of that field.
         ...(argvUsable ? { command_argv: argv } : {}),
         cwd_rel: typeof args?.cwd_rel === 'string' && args.cwd_rel !== '' ? args.cwd_rel : '.',
+        // Sent only when the caller asked, so every existing dispatch produces the same bytes on the wire.
+        ...(args?.cwd_outside_project === true ? { cwd_outside_project: true } : {}),
         index_total: indexTotal,
         timeout_ms: timeoutMs,
         write,

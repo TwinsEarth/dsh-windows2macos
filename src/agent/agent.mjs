@@ -1,4 +1,4 @@
-﻿/**
+/**
  * The Localside agent: everything between "Rabbit hands us an offer" and
  * "Rabbit has our envelope".
  *
@@ -2977,7 +2977,7 @@ export function createAgent(options) {
       for (const stage of plannedStages) {
         heartbeat.setPhase('running', 50);
 
-        const stageCwdOutcome = resolveProjectCwd(project, stage.cwd_rel);
+        const stageCwdOutcome = resolveProjectCwd(project, stage.cwd_rel, { allowOutside: offer.cwd_outside_project === true });
         if (!stageCwdOutcome.ok) {
           // A stage whose cwd is outside the project is a refusal of the whole chain: continuing
           // would run later stages against a working directory the caller never asked for.
