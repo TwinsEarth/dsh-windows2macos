@@ -4,6 +4,59 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.35.0] — 2026-10-15
+
+**§1.5 measured at last: the reachability report, and the honest reason it is not a gate.**
+
+`docs/1.0.0-ACCEPTANCE.md` §1.5 recorded that **nothing** measured whether an export is reachable. Three
+mechanisms shipped in this span fully tested and completely uncalled — `field-authority.mjs`,
+`approval-gate.mjs`, `createApprovalIndex` — and **a tested mechanism with no caller is indistinguishable from
+a finished feature** by reading either the tests or the source.
+
+`scripts/reachability-check.mjs` measures it.
+
+### The first version was unusable, and the false positive that proved it
+
+It asked *"which files mention this name"* and reported **378 findings**, almost all false. The clearest:
+`deepEqual` from `src/relay/state.mjs`, which appeared to be named by **69 test files** — every one of them
+calling `assert.deepEqual`. Whole-word matching cannot tell an imported binding from a coincidental name.
+
+**An import is a statement about two things at once — a module and a name — so matching on the name alone
+throws away half of what the source says.** The check now reads both and matches on the pair:
+
+```
+importedNames(text)  ->  module specifier -> imported names
+resolveSpecifier()   ->  the file that specifier names, the way Node resolves it
+```
+
+### Why it exits 0, which is the part worth defending
+
+Measured against this repository it names **465 exports**, and it **cannot tell three kinds apart**:
+
+1. **the defect** — built, tested, never wired;
+2. **a deliberate surface** — the plugin's entry points and re-exports;
+3. **composition** — a capability reached only through another module's use.
+
+Only the first is a finding, and no static name-and-import check separates them. **A check that fails on 465
+things nobody will fix is a check that gets disabled within a week — and a disabled check is worse than none,
+because it is cited as coverage.** So it prints, exits 0, and closes with *"READ THIS AS A LIST TO TRIAGE, NOT
+A LIST OF BUGS."*
+
+**§1.5 is therefore measured, not closed.** A defect of this class is now *visible*; nothing fails when one
+appears. The tests build synthetic trees where ground truth is known, because asserting on the real 465 would
+pin noise.
+
+### Three of my own errors, and one of them is the lesson of this whole span
+
+* My re-export exclusion looked for ` from ` **inside** the captured braces, so it never saw it —
+  `export { X } from './y.mjs'` was counted as a definition. **The test failed because the code was wrong.**
+* I expected `b` in an export list where the source says `b as bee`. The implementation was right.
+* **I "fixed" that by sorting my own guessed array.** Sorting a wrong list does not make it measured — and
+  that is the same mistake, in miniature, that this project has now paid for six times: **predicting what the
+  output is instead of printing it.** The fix was to print it.
+
+**16 new tests, 0 failures.**
+
 ## [0.34.0] — 2026-10-15
 
 **`requireAuthorityLevel`: the policy that makes 分权限 real, and why it is a flag rather than a default.**
