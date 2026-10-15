@@ -4,6 +4,58 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.44.0] — 2026-10-15
+
+**A real dispatch proved the parameter does not yet travel — and the tests that make that checkable.**
+
+### What the end-to-end attempt showed
+
+`cwd_outside_project: true` was dispatched to MacMini with a `cwd_rel` pointing outside its project root.
+**The answer was `refusal_reason: CWD_OUTSIDE_PROJECT`** — the guard firing exactly as if the escape had never
+been asked for.
+
+**That is the honest result, and it is not a bug in the change.** The relay serving the fleet started
+`2026-10-14T13:53:14Z`, and MacMini was restarted *before* 0.43.0 was installed there:
+
+| Component | On disk | In memory |
+|---|---|---|
+| the shared relay | 0.43.0 | **the code from before this change** |
+| MacMini's agent | 0.43.0 | **the code from before this change** |
+
+**So the new field had nowhere to travel through.** Neither process knew the name, so the relay dropped it on
+the way in and the agent never saw it. **The refusal is what the old code correctly produces** — and it is also
+the second time in two releases that a real dispatch was more informative than reading the code.
+
+### Which is why this release is the tests rather than the feature
+
+The parameter is copied by hand in **four** places, and each is a place it can be dropped:
+
+1. the plugin's payload
+2. `createTask`'s explicit task object
+3. the `task.created` ledger row — **so a relay restart cannot forget a granted permission**
+4. the offer handed to a machine
+
+**This is the shape of the defect that produced the parameter in the first place:** `cwd_rel` was accepted,
+normalized, hashed and stored, and then the guard's own refusal was **discarded** — it travelled most of the
+way and stopped short, with nothing saying so. **The risk in adding a new field is that it travels the same
+distance and stops at the same place.**
+
+So the copies are now asserted against the real relay, and both directions are pinned, **including the
+omission**: `false` writes `false` rather than vanishing, so **absence is never ambiguous**, and the check is
+`=== true` rather than truthy, because the value arrives over the wire.
+
+The ledger assertion is the one worth naming. A dispatch that runs, a relay that restarts, and a permission
+that is **silently gone** would be the worst available failure — the same dispatch refused afterwards with
+nothing visibly changed.
+
+### Containment, re-asserted rather than assumed
+
+`resolveProjectCwd`'s guarantee is unchanged: an escape is refused unless asked for, an absolute path is
+refused however it is spelled, a sibling sharing a path prefix is refused, and **the escape is reported** as
+`outside_project` so a result says where a command ran instead of leaving a reader to assume.
+
+**12 new tests, 0 failures.**
+
 ## [0.43.0] — 2026-10-15
 
 **A machine stuck in its own state directory — and the parameter that was accepted, hashed, and ignored.**
