@@ -38,8 +38,68 @@ export const AUTHORITY_BANDS = Object.freeze([
   { name: 'system_admin', min: 90, max: null, may: 'create global goals, configure across organisations, override any lower constraint' },
 ]);
 
+/**
+ * The band floors, as named constants, for callers that want a level rather than a range.
+ *
+ * `AUTHORITY_BANDS` above is the model — ranges with prose about what each band may do. This is the lookup a
+ * caller reaches for when it wants "the captain floor" as a number, and it exists here rather than in
+ * `scripts/layer-model.mjs` because it is a view of the same table and the two must not be able to drift.
+ *
+ * Derived from `AUTHORITY_BANDS` rather than written out, so adding a band cannot leave this behind.
+ */
+export const AUTHORITY_BAND_FLOORS = Object.freeze(
+  Object.fromEntries(AUTHORITY_BANDS.map((b) => [b.name.toUpperCase(), b.min])),
+);
+
 /** The highest level this model will accept. Above it, a level is a mistake rather than a promotion. */
 export const AUTHORITY_MAX = 100;
+
+/**
+ * What each operational capability costs in authority.
+ *
+ * ## Why this lives here and not in `scripts/`
+ *
+ * It was declared in `scripts/layer-model.mjs` from v0.12.0, and `src/agent/permission.mjs` imported it from
+ * there — which read cleanly and **broke the published package**: `scripts/` is not in `package.json#files`,
+ * so an installed copy could not resolve the import at all. The packed-tarball check caught it, and the check
+ * was right.
+ *
+ * The layering says the same thing: `scripts/` sits *above* `src/`, so a `src/` module reaching up into it
+ * inverts the dependency. The authority model already owns the bands, so the capability table belongs beside
+ * them; `scripts/layer-model.mjs` now imports and re-exports it, keeping that module's public surface intact
+ * for the suites that assert on it.
+ *
+ * ## Why a table and not a set of branches
+ *
+ * `AUTHORITY_BANDS` above says what a band *may* do in prose. This says what each concrete operation *costs*,
+ * as data, so a reader can enumerate it and a test can audit it. The two must not drift, which is why they sit
+ * in one file.
+ */
+export const CAPABILITIES = Object.freeze([
+  { name: 'read_fleet_state', min_authority: 0, destructive: false, note: 'listing machines and tasks changes nothing' },
+  { name: 'dispatch_readonly', min_authority: 0, destructive: false, note: 'a task that may not write' },
+  { name: 'dispatch_writing', min_authority: 50, destructive: false, note: 'a task that may write inside a declared scope' },
+  { name: 'publish_release', min_authority: 70, destructive: true, note: 'a published version cannot be unpublished from here' },
+  { name: 'delete_permanent', min_authority: 90, destructive: true, note: 'overrides the storage tier refusal; forced removal only' },
+  { name: 'amend_law', min_authority: 70, destructive: false, note: 'amendment keeps the chain, so it is not a destruction' },
+  { name: 'write_config', min_authority: 90, destructive: true, note: 'allowedCommands and the relay URL live here' },
+]);
+
+/**
+ * The minimum authority for a capability, or `null` when it is not declared.
+ *
+ * `null` rather than a permissive default: a capability the table has not heard of must not be granted, and
+ * the gate in `permission.mjs` refuses on `null` rather than treating it as free.
+ */
+export function permissionFor(name) {
+  return CAPABILITIES.find((c) => c.name === name)?.min_authority ?? null;
+}
+
+/** Whether a capability is declared destructive. An unknown capability is not assumed safe. */
+export function isDestructive(name) {
+  const found = CAPABILITIES.find((c) => c.name === name);
+  return found === undefined ? null : found.destructive;
+}
 
 /** Verdicts an authority check can reach. */
 export const AUTHORITY_VERDICT = Object.freeze({

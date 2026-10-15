@@ -120,30 +120,17 @@ export function checkEdges(edges) {
  * claiming otherwise would be false. What it provides is a single place where the answer is written down, and
  * a test that fails if a capability is added to the tool surface without a decision here.
  */
-export const AUTHORITY_BANDS = Object.freeze({
-  ORDINARY: 0,
-  CAPTAIN: 50,
-  ORG_ADMIN: 70,
-  SYSTEM_ADMIN: 90,
-});
-
-export const CAPABILITIES = Object.freeze([
-  { name: 'read_fleet_state', min_authority: AUTHORITY_BANDS.ORDINARY, destructive: false, note: 'listing machines and tasks changes nothing' },
-  { name: 'dispatch_readonly', min_authority: AUTHORITY_BANDS.ORDINARY, destructive: false, note: 'a task that may not write' },
-  { name: 'dispatch_writing', min_authority: AUTHORITY_BANDS.CAPTAIN, destructive: false, note: 'a task that may write inside a declared scope' },
-  { name: 'publish_release', min_authority: AUTHORITY_BANDS.ORG_ADMIN, destructive: true, note: 'a published version cannot be unpublished from here' },
-  { name: 'delete_permanent', min_authority: AUTHORITY_BANDS.SYSTEM_ADMIN, destructive: true, note: 'overrides the storage tier refusal; forced removal only' },
-  { name: 'amend_law', min_authority: AUTHORITY_BANDS.ORG_ADMIN, destructive: false, note: 'amendment keeps the chain, so it is not a destruction' },
-  { name: 'write_config', min_authority: AUTHORITY_BANDS.SYSTEM_ADMIN, destructive: true, note: 'allowedCommands and the relay URL live here' },
-]);
-
-/** The minimum authority for a capability, or `null` when it is not declared. */
-export function permissionFor(name) {
-  return CAPABILITIES.find((c) => c.name === name)?.min_authority ?? null;
-}
-
-/** Whether a capability is declared destructive. An unknown capability is not assumed safe. */
-export function isDestructive(name) {
-  const found = CAPABILITIES.find((c) => c.name === name);
-  return found === undefined ? null : found.destructive;
-}
+// v0.23.0: the capability table and its accessors MOVED to `src/agent/authority.mjs`, which owns the
+// bands the costs are expressed in. They are re-exported here so this module's public surface is unchanged
+// for the suites that assert on it.
+//
+// The move was not cosmetic: `src/agent/permission.mjs` imported the table from THIS file, and `scripts/` is
+// not in `package.json#files`, so the published package could not resolve it. The packed-tarball check caught
+// that, and the layering rule says the same thing -- a `src/` module must not depend on `scripts/`.
+// NOTE ON THE NAME: `AUTHORITY_BANDS` here is the NAMED-FLOOR map (`{ORDINARY: 0, CAPTAIN: 50, ...}`),
+// which is what this module exported before the move, and it is NOT the `AUTHORITY_BANDS` array that
+// `authority.mjs` owns. The alias keeps this module's public surface exactly as it was -- the first attempt
+// at the move re-exported the array under this name and broke two assertions in this module's own suite.
+export const AUTHORITY_BANDS = AUTHORITY_BAND_FLOORS;
+export { AUTHORITY_BAND_FLOORS, CAPABILITIES, permissionFor, isDestructive };
+import { AUTHORITY_BAND_FLOORS, CAPABILITIES, permissionFor, isDestructive } from '../src/agent/authority.mjs';

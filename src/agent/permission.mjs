@@ -30,8 +30,19 @@
  * table grant whatever is added next, and answering `NEEDS_APPROVAL` makes it requestable. Both are worse than
  * a refusal, because both hide the omission.
  */
-import { CAPABILITIES, permissionFor, isDestructive } from '../../scripts/layer-model.mjs';
-import { AUTHORITY_BANDS, AUTHORITY_MAX, AUTHORITY_VERDICT, bandOf, isAuthorityLevel } from './authority.mjs';
+// v0.23.0: imported from `authority.mjs`, which owns the bands and therefore the costs. It used to come
+// from `scripts/layer-model.mjs`, and that broke the published package -- `scripts/` is not in the `files`
+// list, so an installed copy could not resolve it. A `src/` module must not reach above itself either.
+import {
+  AUTHORITY_BANDS,
+  AUTHORITY_MAX,
+  AUTHORITY_VERDICT,
+  bandOf,
+  isAuthorityLevel,
+  CAPABILITIES,
+  permissionFor,
+  isDestructive,
+} from './authority.mjs';
 
 export { AUTHORITY_VERDICT };
 

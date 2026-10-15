@@ -122,6 +122,11 @@ import {
 // another's, so a second implementation of the formula that drifted by one input would make every
 // reverse dial time out while both ends insisted they were sending.
 import { mintPunchId, punchSession } from '../agent/p2p.mjs';
+// v0.22.0: the permission gate. Imported rather than reimplemented for the same reason as everything else
+// here -- a second copy of the escalation rule is a second chance to disagree with the first about how far
+// below a requirement an actor may still ask.
+import { gateDispatch, approvalRequestFor } from '../agent/permission.mjs';
+import { isAuthorityLevel } from '../agent/authority.mjs';
 // v0.6.0: the device keypair and the offer's key distribution (`docs/P2P-CRYPTO.md` §4). Imported
 // rather than reimplemented: the dispatcher and the executor have to derive the *same* keys, and two
 // implementations of a handshake are two chances to disagree about it.
@@ -680,6 +685,21 @@ function readConfig(config = {}) {
       .filter((entry) => typeof entry === 'string')
       .map((entry) => entry.trim())
       .filter(Boolean),
+    /**
+     * v0.22.0: the authority level this machine dispatches AS, or null when nobody configured one.
+     *
+     * Not part of the shared config, deliberately: this is a local statement about who is typing, and a
+     * fleet-wide value would let one machine's level speak for another's operator. `W2M_ACTOR_AUTHORITY`
+     * is accepted so a machine can be pointed at a level without editing a profile.
+     *
+     * null is not 0. An unset level means there is no actor to judge, and the gate reports that as
+     * unenforced rather than refusing every writing dispatch on a machine that never opted in.
+     */
+    actorAuthorityLevel: isAuthorityLevel(config.actorAuthorityLevel)
+      ? config.actorAuthorityLevel
+      : (Number.isInteger(Number(process.env.W2M_ACTOR_AUTHORITY)) && isAuthorityLevel(Number(process.env.W2M_ACTOR_AUTHORITY))
+        ? Number(process.env.W2M_ACTOR_AUTHORITY)
+        : null),
     defaultTimeoutMs: shared.values.defaultTimeoutMs,
     sharedConfig: shared,
     pairingCode: typeof config.pairingCode === 'string' && config.pairingCode.trim() !== ''
@@ -3685,6 +3705,40 @@ export async function apply(ctx, config = {}) {
           'W2M_WRITE_SCOPE: `write` is true but `write_scope` is empty; name the project-relative prefixes the machines may write, for example ["src/"], or set write to false',
           { hint: 'name the project-relative prefixes the machines may write, for example ["src/"], or leave write false' },
         );
+      }
+
+      /**
+       * v0.22.0: the permission gate, placed AFTER the write-scope check so the thing being graded is
+       * already known to be well-formed.
+       *
+       * It grades the dispatch from its own facts rather than from a capability the caller names, and with
+       * no configured level it reports `enforced: false` and changes nothing -- which is why adding it
+       * cannot alter the behaviour of any machine that has not opted in.
+       */
+      const gate = gateDispatch({ write, write_scope: writeScope }, cfg.actorAuthorityLevel);
+      if (gate.enforced) {
+        if (gate.decision.verdict === 'deny') {
+          throw new W2MError(
+            'W2M_PERMISSION_DENIED',
+            'W2M_PERMISSION_DENIED: ' + gate.decision.detail,
+            { hint: "raise this machine's actorAuthorityLevel, or use a capability its level reaches" },
+          );
+        }
+        if (gate.decision.verdict === 'needs_approval') {
+          const request = approvalRequestFor(gate.decision, {
+            taskId: null,
+            machineId: null,
+            requestedBy: cfg.machineName,
+          });
+          throw new W2MError(
+            'W2M_PERMISSION_NEEDS_APPROVAL',
+            'W2M_PERMISSION_NEEDS_APPROVAL: ' + gate.decision.detail,
+            {
+              hint: 'this dispatch needs an approver; it is refused rather than queued because no approval queue is wired to this call yet',
+              request,
+            },
+          );
+        }
       }
 
       // §5: dispatching a task is the operator's privilege, not the device's. The operator token is

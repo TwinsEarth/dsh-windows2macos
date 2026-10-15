@@ -4,6 +4,51 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.23.0] — 2026-10-15
+
+**The gate is on the dispatch path. "分权限" now executes, and a machine that has not opted in behaves exactly as before.**
+
+`src/plugin/tools.mjs` calls `gateDispatch()` immediately after the write-scope check — placed there so the
+thing being graded is already known to be well-formed — and refuses the dispatch when the verdict is not
+`allow`.
+
+### `actorAuthorityLevel`, and why it is not shared config
+
+Read from the plugin config, or `W2M_ACTOR_AUTHORITY` so a machine can be pointed at a level without editing a
+profile. **Deliberately not part of `shared.values`**: this is a local statement about who is typing, and a
+fleet-wide value would let one machine's level speak for another's operator.
+
+**`null` is not `0`.** An unset level means there is no actor to judge, and the gate reports `enforced: false`
+and changes nothing — which is why adding this cannot alter the behaviour of any machine that has not opted
+in. A refusal for everyone who never configured a level would have been the easy implementation and the wrong
+one.
+
+### What a refusal looks like
+
+Two distinct codes, because they need different responses:
+
+| Code | When | What it means |
+|---|---|---|
+| `W2M_PERMISSION_DENIED` | verdict `deny` | the level is more than one band short, or the capability is undeclared |
+| `W2M_PERMISSION_NEEDS_APPROVAL` | verdict `needs_approval` | the level is exactly one band short |
+
+The `needs_approval` refusal **carries the approval request** that `approvalRequestFor()` built — subject
+level, required level, capability, `auto_settleable` — and says plainly that it is refused rather than queued
+**because no approval queue is wired to this call yet.** Refusing and saying why is honest; queueing a request
+nothing reads would not be.
+
+### A defect I introduced while wiring it, and how it surfaced
+
+The first edit **corrupted the file**: the anchor for the config field matched only the first line of a
+multi-line expression, so it cut `allowedCommands` off from its own `.filter().map().filter()` chain and left
+the orphan chained onto my insertion. A second attempt then wrote literal backslashes into the source by
+escaping backticks that did not need escaping.
+
+Both were caught by `node --check` immediately, which is the argument for running it after every write rather
+than after the batch. Neither reached a commit.
+
+**120 tests across the tools, permission and entrypoint suites, 0 failures.**
+
 ## [0.22.0] — 2026-10-15
 
 **The gate now grades a real dispatch, and connects to the approval queue.**
