@@ -4,6 +4,33 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.3] — 2026-10-15
+
+**Fix: the macOS health check walked a user's home directory, and timed out instead of reporting.**
+
+Found on a real machine, not by reading the code.
+
+`sample()` on macOS was scanning `/Users` for files that grow. On a developer machine that is hundreds of
+thousands of files, and the symptom was not "slow" but **total failure**: the health suite exceeded the
+fleet's own ~50-second lease ceiling and the task expired with `exit_code: null` and no result at all.
+
+A monitoring tool that times out because it is too expensive to monitor is worse than no monitoring,
+because **the timeout looks like a machine problem**. The contrast that identified it, measured on the same
+host minutes apart:
+
+| Command | Time | Result |
+|---|---|---|
+| `node -e "process.exit(1)"` | 8 s | `exit_code: 1` — the machinery was fine |
+| `health.test.mjs` (before) | > 50 s | expired, no result |
+| the same suite (authoring host) | 280 ms | pass |
+
+`/Users` is replaced by `/Library/Logs`, which is where an unbounded system writer actually writes. The rule
+this file already stated — that a health check must not be a load source — was written in the module header
+while the path list violated it, which is the useful part of the lesson: the principle was written down and
+still not applied to the one line that needed it.
+
+Sampling now costs 53 ms. 20 tests, 0 failures.
+
 ## [0.10.2] — 2026-10-15
 
 **Tiered storage — temporary, compressed, permanent, and the two kinds of knowledge that persist forever.**
