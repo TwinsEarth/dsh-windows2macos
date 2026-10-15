@@ -4,6 +4,50 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.31.0] — 2026-10-15
+
+**The approval gate got a caller, and a draft acceptance definition for 1.0.0.**
+
+### The defect this round started by finding, in the release that had just criticised it
+
+`approval-gate.mjs` shipped in 0.30.0 with a full suite and **no caller** — which is exactly the shape of the
+two defects 0.30.0 had just finished writing into `ROADMAP.md`. **Building a mechanism and wiring it are
+separate acts**, and a mechanism with no caller cannot be told from a finished feature by reading either the
+tests or the source.
+
+It is now on the raise path, and the wiring is asserted rather than described: a real dispatch raises once,
+the queue holds one request, a second raise is **refused by the front door before a request exists**, and the
+queue still holds exactly one. Two more tests pin the asymmetry — reading the queue five times past any raise
+budget, and settling the request — because a gate that also metered *those* would pass a flooding test and
+quietly break the queue.
+
+`approvalRaiseLimitPerMinute` is configurable so a host can set it and so a test can reach the refusal without
+raising thirty requests first. Unset, the gate's own default governs.
+
+### `docs/1.0.0-ACCEPTANCE.md` — a draft for objection
+
+The goal names **分模块 / 分层级 / 分权限**, and a version number means nothing without a definition that can
+fail. The draft lists 21 criteria across the three, each with **where it is checked and whether that check is
+actually running**, under one rule: **a criterion nothing measures is not a criterion.**
+
+Its two honest admissions are the point of writing it:
+
+* **§1.5 — reachability is NOT checked.** Three mechanisms shipped fully tested and completely uncalled in
+  this span. The `claims` suite catches *documentation* drift and **cannot** catch this, because the document
+  and the code can agree while neither is reachable.
+* **§3.11 — the permission gate is OFF by default.** An unset `actorAuthorityLevel` means `enforced: false`
+  and no change, so **a default install dispatches exactly as it did before the permission model existed.**
+  Treating unset as `0` would break every machine that never opted in, so the current behaviour is defensible
+  — but **"off unless configured" cannot be part of a 1.0.0 that claims 分权限.** The draft puts the choice to
+  a reader rather than resolving it: **require a level and refuse to start without one, or ship with the gate
+  off and say so in the README.** Silence is the one option that is not defensible.
+
+It also records what is **not** claimed: no scale statement (3 usable machines of 5), no restart durability for
+the queue, no MacMini verification beyond the four suites measured in 0.28.0, and `P2P_PUNCH_FAILED` still
+UNVERIFIED.
+
+**2 new tests, 0 failures.**
+
 ## [0.30.0] — 2026-10-15
 
 **The same ruler on the other two entries: v4.9.0 had the same defect, v4.10.0 did not.**

@@ -2626,6 +2626,64 @@ describe('v0.1.2 cross-region diagnostics', () => {
   });
 });
 
+describe('w2m_run: the approval gate is on the raise path, not merely available', () => {
+  it('refuses a second raise in the window, and does not create the request it refused', async () => {
+    // The whole reason for wiring the gate: a mechanism with no caller cannot be told from a finished
+    // feature. This drives the real dispatch twice and reads the real queue.
+    const { tools } = await register({
+      rabbitUrl: RABBIT,
+      stateDir: await makeStateDir(PAIRED_DEVICE),
+      operatorToken: OPERATOR_TOKEN,
+      actorAuthorityLevel: 49,
+      approvalRaiseLimitPerMinute: 1,
+    });
+    const args = runArgs({ write: true, write_scope: ['src/'] });
+
+    // The first raise succeeds and is queued.
+    await assert.rejects(() => tools.get('w2m_run').execute(args, {}), /W2M_PERMISSION_NEEDS_APPROVAL/);
+    const afterFirst = JSON.parse(await tools.get('w2m_approvals').execute({ action: 'list' }, {}));
+    assert.equal(afterFirst.count, 1, 'the first raise reached the queue');
+
+    // The second is refused by the FRONT DOOR, before a request exists.
+    let refused = null;
+    await assert.rejects(() => tools.get('w2m_run').execute(args, {}), (error) => {
+      refused = error;
+      assert.match(error.message, /W2M_PERMISSION_APPROVAL_RATE_LIMITED/);
+      return true;
+    });
+    assert.equal(refused.detail.reason_code, 'APPROVAL_RAISE_RATE_LIMITED');
+    assert.ok(refused.detail.retry_after_seconds >= 1);
+    assert.match(refused.hint, /the queue was not cleared/, 'a refusal must say what was NOT lost');
+
+    const afterSecond = JSON.parse(await tools.get('w2m_approvals').execute({ action: 'list' }, {}));
+    assert.equal(afterSecond.count, 1, 'a refused raise must not have created the request it was refused for');
+  });
+
+  it('does not meter reading the queue or settling a request', async () => {
+    // The asymmetry is the design. A gate that also limited these would pass a flooding test and quietly
+    // break the queue -- so it is asserted rather than left to the reader.
+    const { tools } = await register({
+      rabbitUrl: RABBIT,
+      stateDir: await makeStateDir(PAIRED_DEVICE),
+      operatorToken: OPERATOR_TOKEN,
+      actorAuthorityLevel: 49,
+      approvalRaiseLimitPerMinute: 1,
+    });
+    await assert.rejects(() => tools.get('w2m_run').execute(runArgs({ write: true, write_scope: ['src/'] }), {}), /NEEDS_APPROVAL/);
+
+    // Read it many times, past what any raise budget would allow.
+    for (let i = 0; i < 5; i += 1) {
+      const listed = JSON.parse(await tools.get('w2m_approvals').execute({ action: 'list', actor_level: 50 }, {}));
+      assert.equal(listed.ok, true, `read ${i} was refused, which would limit knowing what is waiting`);
+    }
+    // And settle it, which must also be unmetered.
+    const id = JSON.parse(await tools.get('w2m_approvals').execute({ action: 'list' }, {})).rows[0].approval_id;
+    const settled = JSON.parse(
+      await tools.get('w2m_approvals').execute({ action: 'approve', approval_id: id, actor_level: 50, actor_id: 'supervisor' }, {}),
+    );
+    assert.equal(settled.ok, true, settled.detail);
+  });
+});
 describe('w2m_approvals: the tool an approver reaches for', () => {
   it('takes a real dispatch from a refusal, through the queue, to a status that announces it', async () => {
     // The whole point of putting the count in `w2m_status`: a fleet blocked on approval looks exactly like an

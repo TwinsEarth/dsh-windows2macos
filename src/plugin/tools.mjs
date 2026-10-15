@@ -129,6 +129,8 @@ import { gateDispatch, approvalRequestFor, raiseApproval } from '../agent/permis
 // v0.24.0: the queue an escalation is raised into. Imported from `src/`, never from `scripts/` -- a
 // `src/` module reaching above itself breaks the published package (see CHANGELOG 0.23.0).
 import { createApprovalIndex } from '../agent/approval-index.mjs';
+// v0.31.0: the approval queue's front door. Written in 0.30.0 and given a caller here.
+import { createApprovalGate } from '../agent/approval-gate.mjs';
 import { AUTHORITY_MAX, isAuthorityLevel } from '../agent/authority.mjs';
 // v0.6.0: the device keypair and the offer's key distribution (`docs/P2P-CRYPTO.md` §4). Imported
 // rather than reimplemented: the dispatcher and the executor have to derive the *same* keys, and two
@@ -3246,6 +3248,28 @@ export async function apply(ctx, config = {}) {
     return approvals;
   };
 
+  /**
+   * v0.31.0: the rate limiter that is the approval queue's front door.
+   *
+   * ## Why this took a round to arrive
+   *
+   * `approval-gate.mjs` was written in 0.30.0 with a full suite and **no caller** — which is precisely the
+   * defect that same release had just finished documenting in `ROADMAP.md` twice. Building the mechanism and
+   * wiring it are separate acts, and a mechanism with no caller is the thing a reader cannot tell from a
+   * finished feature.
+   *
+   * It guards **raising only**. Reading the queue and settling a request are deliberately unmetered: limiting
+   * the view would limit knowing what is waiting, and limiting the answer would punish the supervisor
+   * clearing the backlog. The threat is queue flooding by a runaway retry loop, and that is a threat against
+   * the raise path.
+   */
+  const approvalGate = createApprovalGate(
+    // Configurable so a host can tighten or loosen it, and so a test can reach the refusal without raising
+    // thirty requests first. Omitted entirely when unset, which leaves the gate's own default in charge --
+    // passing `undefined` through would be the same thing with more ways to be wrong.
+    Number.isInteger(config.approvalRaiseLimitPerMinute) ? { limit: config.approvalRaiseLimitPerMinute } : {},
+  );
+
   // v0.6.1: the two browser routes behind the composer's target control. Additive and optional: a
   // host without `connection.fetch` still gets every tool, and `w2m_status` reports the absence  -   // which is the honest place for it, since a host that has no Connection at all is simply not a web
   // composition and does not need a warning on every headless run.
@@ -3778,6 +3802,24 @@ export async function apply(ctx, config = {}) {
             machineId: null,
             requestedBy: cfg.machineName,
           });
+          // v0.31.0: the raise path passes the front door BEFORE a request exists. A flood of raises is
+          // what the limiter is for, so a refused raise must not have already created the request it was
+          // refused for.
+          const permission = approvalGate.mayRaise({ id: cfg.machineName, level: cfg.actorAuthorityLevel });
+          if (!permission.allowed) {
+            throw new W2MError(
+              'W2M_PERMISSION_APPROVAL_RATE_LIMITED',
+              'W2M_PERMISSION_APPROVAL_RATE_LIMITED: ' + permission.detail,
+              {
+                hint: 'wait for the window to pass and dispatch again; the queue was not cleared and existing requests are still answerable',
+                detail: {
+                  reason_code: permission.reason_code,
+                  retry_after_seconds: permission.retry_after_seconds,
+                  budget: approvalGate.budgetFor({ id: cfg.machineName, level: cfg.actorAuthorityLevel }),
+                },
+              },
+            );
+          }
           const approvalId = randomUUID();
           const raised = raiseApproval(approvalQueue(), request, { approvalId, toolName: 'w2m_run' });
           if (!raised.ok) {
