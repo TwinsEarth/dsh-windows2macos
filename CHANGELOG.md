@@ -4,6 +4,62 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.40.0] — 2026-10-15
+
+**The acceptance document, converged — and bound to the pre-flight so it cannot drift.**
+
+### Three statuses, decided by a checkable rule
+
+Every criterion now carries one of three values, and **the rule decides it rather than opinion**:
+
+| Status | Test |
+|---|---|
+| **ENFORCED** | delete the thing and run `scripts/preflight.mjs`; it goes red |
+| **MEASURED** | something checks and prints, and the run stays green |
+| **UNVERIFIED** | nothing checks it, or the check's own documentation says it cannot see this |
+
+**MEASURED is not ENFORCED, and §4 says so with the receipt:** the reachability classifier named **465
+exports** and could not tell a defect from a library, so a gate built on it would have been disabled within a
+week. **A check that cannot fail is a report.**
+
+**17 criteria are ENFORCED**, including §1.5 — the orphan gate added in 0.39.0. **Six are MEASURED**, of which
+two are the ones worth naming: **§1.6, because the classifier cannot classify**, and **§3.10, because
+`field-authority` still has no production caller.** **Seven are UNVERIFIED**, and `4.7` is the widest of them —
+**the plugin this machine runs is thirty versions behind the source under test**, so every source-level
+conclusion about its runtime is void.
+
+### The corrections, kept rather than tidied away
+
+Seven claims were written down in this span, acted on, and later found wrong. **Four of the seven were a claim
+about wiring or delivery that a single check disproved:**
+
+* *"v4.8.0 shipped"* — the block and lineage are real; **the authority-driven half was never built.**
+* *"the already-shipped rate limiter as its front door"* — **never built.**
+* *"**the connection now exists**"* (CHANGELOG 0.29.0, of `field-authority`) — **it exists inside that module
+  and nowhere else.**
+* *"v4.10.0 shipped in 0.11.0"* — the falsifying tests **are** asserted, and **nothing routed a question to
+  it** until 0.37.0.
+
+**Two of the seven were corrected by the same instrument** — the reachability classifier, which was built
+*because* the first two had happened, and which then found two more. **That is the only argument for a check
+this project accepts: it found something the previous rounds had missed.**
+
+### The document is now checked, because a parallel list is a second source of truth
+
+`test/acceptance-doc.test.mjs` reads the pre-flight's own `DECLARED_CHECKS` and fails if the document names a
+gate that does not exist, if any of the three statuses stops being defined, or if the corrections section is
+emptied. **A criterion cannot quietly become unenforced while the file keeps claiming otherwise.**
+
+### Three errors of mine, all in the test rather than the subject
+
+* I demanded eight **exact** check names; the document sensibly uses short forms.
+* I matched `gate` inside `approval-gate.mjs` and flagged **a filename as a gate**.
+* I then demanded the document name `lint` and `mojibake` — **gates on the code's tidiness, not criteria for
+  what 1.0.0 must prove.** The document was right not to list them. **A test asserting its own assumption is
+  indistinguishable from a test asserting a property, until it fails.**
+
+**6 new tests, 0 failures.**
+
 ## [0.39.0] — 2026-10-15
 
 **The orphan gate: a module nothing reaches now fails the pre-flight unless a reason is written down.**
