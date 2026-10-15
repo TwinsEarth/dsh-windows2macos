@@ -4,6 +4,46 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.20.0] — 2026-10-15
+
+**Version skew is refuted too, and the direct-path failure is now counted instead of read one at a time.**
+
+### Third hypothesis, third refutation
+
+The previous release established that this machine runs plugin **0.9.5** while the source tree is **0.19.0**,
+and that the failing `P2P_PUNCH_FAILED` is raised by the plugin process. The natural next step was to suspect a
+digest name that 0.9.5 used and later versions removed.
+
+**Measured, and refuted:** reading `crypto.mjs`, `p2p.mjs` and `p2p-node.mjs` **at tag `v0.9.5`** through the
+API shows the same two digest names the current tree uses — `blake2s256` and `sha256`. Then a search for
+**dynamic** algorithm arguments (`createHash(variable)`) across `src/` found **none**: every `createHash` and
+`createHmac` in this codebase is called with a string literal.
+
+**So there is no call in this codebase that can produce `Digest method not supported`.** Three hypotheses have
+now been measured and excluded — BLAKE2s, the wider primitive set, and version skew — and the cause remains
+**UNVERIFIED**. What is *not* in doubt is where it is raised: the plugin process on this machine, running
+0.9.5 while the source under study is 0.20.0.
+
+### What this release delivers instead of a fourth guess
+
+`p2pReasons()` and `classifyP2PReason()` turn the P2P reason strings into a **count**, because the finding that
+matters was invisible in every individual report: **twelve of twelve tasks travelled by relay, and no aggregate
+anywhere said so.**
+
+* `relay_only_share` is the fleet's avoidable latency as one number, and it is **`null`** for an empty
+  denominator — "no lease carried a p2p block" and "every lease failed" must not look alike.
+* an unrecognised code is counted as `OTHER` **with the raw code travelling with it**, so a new refusal name
+  is reported rather than swallowed.
+* a missing reason is distinguished from a present one, because *"no reason recorded" is not "no failure"*.
+
+### The version skew is still unresolved and still blocks diagnosis
+
+The installed plugin is **0.9.5**; the source is **0.20.0**. Until they match, every source-level conclusion
+about this machine's P2P behaviour is read from code that is not running. This needs a person: updating the
+plugin installs files into the DSH profile, which is outside what this session changes on its own.
+
+**7 new tests, 0 failures.**
+
 ## [0.19.0] — 2026-10-15
 
 **The plugin this machine runs is 0.9.5. The source tree is 0.18.0. Every source-level conclusion about the P2P failure was read from code that may not have run.**

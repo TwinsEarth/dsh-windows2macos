@@ -111,6 +111,78 @@ export function isFleetFailure(entry) {
   return classifyLease(entry).outcome === LEASE_OUTCOME.NO_RESULT;
 }
 
+/** Refusal codes the relay writes into `p2p.reason`, grouped by what they mean for a fleet. */
+export const P2P_FAILURE_KIND = Object.freeze({
+  NO_CANDIDATES: 'no candidate address was known, so no punch was attempted',
+  PUNCH_FAILED: 'a punch was attempted and did not complete',
+  PUNCH_TIMEOUT: 'a punch was attempted and nothing answered in time',
+  LEASE_NOT_RUNNABLE: 'the lease was not in a state to be handed the command',
+  REVERSE_DIAL: 'the reverse dial did not complete',
+  BLOCKED: 'a local condition stopped the direct path',
+  OTHER: 'a reason the table does not classify',
+});
+
+/**
+ * Classify one `p2p.reason` string.
+ *
+ * Reasons are prose with a machine-readable prefix (`P2P_NO_CANDIDATES: ...`), and reading them one at a time
+ * is how a fleet's direct-path problem stays invisible: the sample that prompted this had **twelve of twelve
+ * tasks on the relay** and no aggregate anywhere that said so.
+ *
+ * Returns `OTHER` for anything unrecognised rather than throwing or guessing, and the raw reason travels with
+ * the classification so a new code is reported rather than swallowed.
+ */
+export function classifyP2PReason(reason) {
+  if (typeof reason !== 'string' || reason === '') {
+    return { kind: null, code: null, detail: 'no reason recorded, which is not the same as no failure' };
+  }
+  const code = (reason.split(':')[0] ?? '').trim();
+  if (code === 'P2P_NO_CANDIDATES') return { kind: P2P_FAILURE_KIND.NO_CANDIDATES, code, detail: reason };
+  if (code === 'P2P_PUNCH_FAILED') return { kind: P2P_FAILURE_KIND.PUNCH_FAILED, code, detail: reason };
+  if (code === 'P2P_PUNCH_TIMEOUT') return { kind: P2P_FAILURE_KIND.PUNCH_TIMEOUT, code, detail: reason };
+  if (code === 'P2P_LEASE_NOT_RUNNABLE') return { kind: P2P_FAILURE_KIND.LEASE_NOT_RUNNABLE, code, detail: reason };
+  if (code.startsWith('P2P_REVERSE_DIAL')) return { kind: P2P_FAILURE_KIND.REVERSE_DIAL, code, detail: reason };
+  if (code.startsWith('P2P_UNAVAILABLE') || code.startsWith('P2P_CRYPTO')) return { kind: P2P_FAILURE_KIND.BLOCKED, code, detail: reason };
+  return { kind: P2P_FAILURE_KIND.OTHER, code, detail: reason };
+}
+
+/**
+ * Count why the direct path was not used, across a set of reports.
+ *
+ * The number worth acting on is `relay_only_share`: the fraction of leases that travelled by relay while a
+ * direct path was nominally configured. That is the fleet's avoidable latency, and it is invisible in any
+ * single report.
+ */
+export function p2pReasons(reports) {
+  const byCode = new Map();
+  let leasesWithP2P = 0;
+  let onRelay = 0;
+  let onDirect = 0;
+  for (const report of Array.isArray(reports) ? reports : []) {
+    for (const m of Array.isArray(report?.machines) ? report.machines : []) {
+      const p = m?.p2p;
+      if (p === null || p === undefined || typeof p !== 'object') continue;
+      leasesWithP2P += 1;
+      if (p.encrypted === true || (p.peer !== null && p.peer !== undefined)) onDirect += 1;
+      else onRelay += 1;
+      const c = classifyP2PReason(p.reason ?? p.encryption_reason ?? null);
+      if (c.code !== null) byCode.set(c.code, (byCode.get(c.code) ?? 0) + 1);
+    }
+  }
+  return {
+    leases_with_p2p: leasesWithP2P,
+    on_relay: onRelay,
+    on_direct: onDirect,
+    // Null rather than 0 for an empty denominator, for the same reason every other rate here is: "no leases"
+    // and "every lease failed" must not look alike.
+    relay_only_share: leasesWithP2P === 0 ? null : Math.round((onRelay / leasesWithP2P) * 1000) / 1000,
+    by_code: Object.fromEntries([...byCode].sort((a, b) => b[1] - a[1])),
+    detail: leasesWithP2P === 0
+      ? 'no lease carried a p2p block, so nothing can be said about the direct path'
+      : `${onRelay} of ${leasesWithP2P} lease(s) used the relay; ${byCode.size} distinct reason code(s)`,
+  };
+}
+
 /**
  * Summarise a set of task reports.
  *

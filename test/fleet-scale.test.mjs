@@ -14,6 +14,9 @@ import assert from 'node:assert/strict';
 
 import {
   FAILURE_STATES,
+  P2P_FAILURE_KIND,
+  classifyP2PReason,
+  p2pReasons,
   LEASE_OUTCOME,
   classifyLease,
   isFleetFailure,
@@ -76,6 +79,68 @@ describe('fleet scale: a non-zero exit code is not a fleet failure', () => {
     const ok = classifyLease({ lease_state: 'done', exit_code: 0 });
     assert.equal(ok.ran, true);
     assert.equal(ok.outcome, LEASE_OUTCOME.RAN);
+  });
+});
+describe('fleet scale: why the direct path was not used, counted rather than read one at a time', () => {
+  it('classifies the codes the relay actually writes', () => {
+    // The sample that prompted this had twelve of twelve tasks on the relay, and no aggregate anywhere said
+    // so. A reason is prose with a machine-readable prefix, and reading them individually is how that stays
+    // invisible.
+    assert.equal(classifyP2PReason('P2P_NO_CANDIDATES: no direct channel was open').kind, P2P_FAILURE_KIND.NO_CANDIDATES);
+    assert.equal(classifyP2PReason('P2P_PUNCH_FAILED: Digest method not supported').kind, P2P_FAILURE_KIND.PUNCH_FAILED);
+    assert.equal(classifyP2PReason('P2P_LEASE_NOT_RUNNABLE: lease state is "observing"').kind, P2P_FAILURE_KIND.LEASE_NOT_RUNNABLE);
+    assert.equal(classifyP2PReason('P2P_REVERSE_DIAL_TIMEOUT: P2P_PUNCH_TIMEOUT: no answer').kind, P2P_FAILURE_KIND.REVERSE_DIAL);
+    assert.equal(classifyP2PReason('P2P_CRYPTO_NO_KEY: no key for that peer').kind, P2P_FAILURE_KIND.BLOCKED);
+  });
+
+  it('returns OTHER with the raw code rather than swallowing a new one', () => {
+    const c = classifyP2PReason('P2P_SOMETHING_NEW: invented');
+    assert.equal(c.kind, P2P_FAILURE_KIND.OTHER);
+    assert.equal(c.code, 'P2P_SOMETHING_NEW');
+    assert.match(c.detail, /invented/);
+  });
+
+  it('distinguishes a missing reason from a present one', () => {
+    // 'no reason recorded' is not 'no failure', and a counter that merged them would under-report.
+    for (const bad of [null, undefined, '', 42]) {
+      const c = classifyP2PReason(bad);
+      assert.equal(c.kind, null);
+      assert.match(c.detail, /not the same as no failure/);
+    }
+  });
+
+  it('counts a relay-only fleet and names the reasons', () => {
+    const reports = Array.from({ length: 12 }, () => ({
+      machines: [{ lease_state: 'done', p2p: { encrypted: false, peer: null, reason: 'P2P_NO_CANDIDATES: none open' } }],
+    }));
+    const r = p2pReasons(reports);
+    assert.equal(r.leases_with_p2p, 12);
+    assert.equal(r.on_relay, 12);
+    assert.equal(r.on_direct, 0);
+    assert.equal(r.relay_only_share, 1, 'twelve of twelve is 100%, and it should be unmissable');
+    assert.equal(r.by_code.P2P_NO_CANDIDATES, 12);
+  });
+
+  it('reports an empty denominator as null, not as a perfect score', () => {
+    const r = p2pReasons([{ machines: [{ lease_state: 'done' }] }]);
+    assert.equal(r.leases_with_p2p, 0);
+    assert.equal(r.relay_only_share, null);
+    assert.match(r.detail, /nothing can be said about the direct path/);
+  });
+
+  it('counts a direct lease as direct even when the relay also appears', () => {
+    const r = p2pReasons([{ machines: [{ p2p: { encrypted: true, peer: 'x' } }] }]);
+    assert.equal(r.on_direct, 1);
+    assert.equal(r.on_relay, 0);
+    assert.equal(r.relay_only_share, 0);
+  });
+
+  it('survives junk rather than throwing on it', () => {
+    for (const bad of [null, undefined, 42, 'reports', {}]) {
+      const r = p2pReasons(bad);
+      assert.equal(r.leases_with_p2p, 0);
+      assert.equal(r.relay_only_share, null);
+    }
   });
 });
 
