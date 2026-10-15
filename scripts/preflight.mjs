@@ -1101,6 +1101,8 @@ export const DECLARED_CHECKS = [
   'packed tarball (tree-derived documents + entry points, whole manifest, forbidden paths, 11 tools from the pack)',
   'claims (test/claims.test.mjs, reused not reimplemented)',
   'CHANGELOG shape (title above the newest entry, newest-first)',
+  'agent skills (frontmatter satisfies the loader, so no skill is silently dropped)',
+  'agent plugins manifest (plugin.json and mcp.json satisfy Agent Plugins 1.0.0)',
 ];
 
 /**
@@ -1123,6 +1125,14 @@ export const GATE_INVENTORY = [
   { artifact: 'mojibake scanner', path: 'scripts/scan-mojibake.mjs', checkedBy: 'mojibake scan (whole tree, plus a positive control)' },
   { artifact: 'accepted-orphan list', path: 'scripts/accepted-orphans.mjs', checkedBy: 'reachable or accepted (no orphan module without a written reason)' },
   { artifact: 'entry-point check', path: 'scripts/check-entrypoints.mjs', checkedBy: 'entry points (scripts/check-entrypoints.mjs)' },
+  { artifact: 'manifest validator', path: 'scripts/plugin-manifest-check.mjs', checkedBy: 'agent plugins manifest (plugin.json and mcp.json satisfy Agent Plugins 1.0.0)' },
+  { artifact: 'Agent Plugins manifest', path: 'plugin.json', checkedBy: 'agent plugins manifest (plugin.json and mcp.json satisfy Agent Plugins 1.0.0)' },
+  { artifact: 'MCP configuration', path: 'mcp.json', checkedBy: 'agent plugins manifest (plugin.json and mcp.json satisfy Agent Plugins 1.0.0)' },
+  { artifact: 'skill validator', path: 'scripts/skill-check.mjs', checkedBy: 'agent skills (frontmatter satisfies the loader, so no skill is silently dropped)' },
+  { artifact: 'fleet-control skill', path: 'skills/fleet-control/SKILL.md', checkedBy: 'agent skills (frontmatter satisfies the loader, so no skill is silently dropped)' },
+  { artifact: 'memory-sync skill', path: 'skills/memory-sync/SKILL.md', checkedBy: 'agent skills (frontmatter satisfies the loader, so no skill is silently dropped)' },
+  { artifact: 'session-ref skill', path: 'skills/session-ref/SKILL.md', checkedBy: 'agent skills (frontmatter satisfies the loader, so no skill is silently dropped)' },
+  { artifact: 'resource-schedule skill', path: 'skills/resource-schedule/SKILL.md', checkedBy: 'agent skills (frontmatter satisfies the loader, so no skill is silently dropped)' },
   { artifact: 'packer', path: 'scripts/pack.mjs', checkedBy: 'packed tarball (tree-derived documents + entry points, whole manifest, forbidden paths, 11 tools from the pack)' },
   { artifact: 'installed-copy probe', path: 'scripts/verify-installed.mjs', checkedBy: 'packed tarball (tree-derived documents + entry points, whole manifest, forbidden paths, 11 tools from the pack)' },
   { artifact: 'claims suite', path: 'test/claims.test.mjs', checkedBy: 'claims (test/claims.test.mjs, reused not reimplemented)' },
@@ -1745,6 +1755,66 @@ function checkGateInventory(registered) {
  * a throwaway directory holding exactly one deliberately corrupted file: it must find it, name it and
  * exit non-zero. Only then is its "clean" over the tree worth reading.
  */
+/**
+ * Every skill must satisfy the loader's contract, because failing it is SILENT.
+ *
+ * `parseSkillFile` reads `name` and `description`, checks the name against
+ * `/^[a-z0-9]+(?:-[a-z0-9]+)*$/`, rejects three renamed invocation spellings outright, and on any
+ * failure logs a warning and **returns** -- so the skill does not appear, nothing is red, and the
+ * directory looks shipped. That is the failure mode this check exists for: a skill is a file whose only
+ * symptom of being wrong is not being there.
+ *
+ * The validator is a separate script rather than inline code so it can also be run directly while
+ * authoring a skill, and so the same rules are read by the test that covers it.
+ */
+function checkAgentSkills() {
+  const validator = join(ROOT, 'scripts', 'skill-check.mjs');
+  const dir = join(ROOT, 'skills');
+  if (!existsSync(validator)) return fail(`no skill validator at ${validator}`);
+  if (!existsSync(dir)) return fail(`no skills directory at ${dir}`);
+
+  const result = child('agent-skills', process.execPath, [validator, dir]);
+  const found = /skills found: (\d+)/.exec(result.stdout);
+  const problems = /problems: (\d+)/.exec(result.stdout);
+  if (found === null || problems === null) {
+    // A validator that produced no parseable verdict cannot be read as "nothing wrong" -- the same rule
+    // the mojibake check applies to its scanner.
+    // `result.error` is why the spawn failed; reporting only the status turned "EPERM" or "ENOENT" into
+    // a bare `exit null`, which is a diagnosis that names nothing.
+    const why = result.error === null ? 'no parseable verdict' : `${result.error.code ?? result.error.name}: ${result.error.message}`;
+    return fail(`the skill validator did not run (${why})`, tail(result, 20));
+  }
+  if (!result.ok || Number(problems[1]) > 0) {
+    return fail(
+      `${problems[1]} skill problem(s) across ${found[1]} skill(s); every one is named below`,
+      tail(result, 20),
+    );
+  }
+  return pass(`${found[1]} skill(s) satisfy the loader contract`);
+}
+
+/**
+ * The Agent Plugins 1.0.0 manifests must satisfy the published schemas.
+ *
+ * `plugin.json` has no consumer in this host -- DSH reads `package.json#dsh` and a Cordis bundle patch, not
+ * a root manifest -- so nothing would ever notice it going stale. **A manifest nobody reads is a document
+ * that cannot be wrong**, and the version-drift check inside the validator is the one thing keeping it honest.
+ */
+function checkAgentPluginsManifest() {
+  const validator = join(ROOT, 'scripts', 'plugin-manifest-check.mjs');
+  if (!existsSync(validator)) return fail(`no manifest validator at ${validator}`);
+  const result = child('agent-plugins', process.execPath, [validator, ROOT]);
+  const problems = /problems: (\d+)/.exec(result.stdout);
+  if (problems === null) {
+    const why = result.error === null ? 'no parseable verdict' : `${result.error.code ?? result.error.name}: ${result.error.message}`;
+    return fail(`the manifest validator did not run (${why})`, tail(result, 20));
+  }
+  if (!result.ok || Number(problems[1]) > 0) {
+    return fail(`${problems[1]} manifest problem(s); every one is named below`, tail(result, 20));
+  }
+  return pass('plugin.json and mcp.json satisfy Agent Plugins 1.0.0');
+}
+
 function checkMojibake() {
   const scanner = join(ROOT, 'scripts', 'scan-mojibake.mjs');
   if (!existsSync(scanner)) return fail(`no scanner at ${scanner}`);
@@ -2225,6 +2295,14 @@ async function main() {
     [
       'gate inventory (every gate exists and is bound to the registered check that measures it)',
       () => checkGateInventory(DECLARED_CHECKS),
+    ],
+    [
+      'agent skills (frontmatter satisfies the loader, so no skill is silently dropped)',
+      checkAgentSkills,
+    ],
+    [
+      'agent plugins manifest (plugin.json and mcp.json satisfy Agent Plugins 1.0.0)',
+      checkAgentPluginsManifest,
     ],
     [
       'ledger self-test (silence and an unaccepted UNVERIFIABLE are both failures)',

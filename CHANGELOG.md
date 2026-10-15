@@ -4,6 +4,134 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.52.0] — 2026-10-15
+
+**Agent Plugins 1.0.0 manifests, validated against the published schemas — and the honest note about who
+reads them.**
+
+### What shipped
+
+```
+plugin.json    root manifest, Agent Plugins 1.0.0, $schema pinned to the canonical identifier
+mcp.json       schema-valid with an EMPTY server map -- see below
+skills/        unchanged; the four SKILL.md files were already the portable form
+```
+
+`scripts/plugin-manifest-check.mjs` validates both, `pre-flight` gained a fourteenth check, and
+`test/agent-plugins.test.mjs` adds fourteen assertions across both manifests and the skills.
+
+### The schemas were read, and the constraints are written out rather than fetched
+
+`https://agent-plugins.org/schemas/1.0.0/plugin.schema.json` and `.../mcp.schema.json` are both live, and the
+rules come from them — including the `name` pattern `^(?!.*(?:--|\.\.))[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$`,
+**which refuses `--` and `..` and which I would not have guessed.** They are **not fetched at check time**:
+a validator that needs the network cannot run offline, and one that skips itself when the fetch fails reports
+success for the case it could not measure.
+
+**What this cannot check, stated rather than implied:** the schema's own description says *"the Agent Plugins
+specification defines additional semantic and operational requirements."* Path containment, symlink
+resolution, MCP transport support and the `PLUGIN_ROOT`/`PLUGIN_DATA` expansion rules are **not** expressible
+here and **are not claimed**.
+
+### `mcp.json` ships with zero servers, and that is the honest version
+
+The request specified MCP as the unified calling protocol. **DSH has no MCP client.** Measured across all
+8543 small code and config files in the application bundle: `plugin.json` 0, `mcp.json` 0, `agent-plugins` 0,
+**and `mcpServers` 0 occurrences in host-owned code** — the 202 hits are third-party SDKs inside
+`node_modules`, which support MCP without this host reading a config for it.
+
+**And there is no MCP server in this package.** So the file is schema-valid with an empty map: a portable
+client reads it and starts nothing, which is true. **The alternative — declaring a server that does not
+exist — is a manifest that launches a failure**, and shipping that to satisfy a specification would be the
+same mistake as advertising a capability the code lacks.
+
+### The one rule that is not from a schema caught me immediately
+
+`plugin.json`'s `version` must equal `package.json`'s. **On the validator's first run it failed: the manifest
+said 0.52.0 and `package.json` still said 0.51.0.** That is the whole justification for the rule — DSH loads
+plugins through `package.json#dsh` and a Cordis bundle patch, **so nothing in this host ever reads
+`plugin.json`.** A manifest with no consumer has no way to notice it is stale.
+
+**A file nobody reads is a file that cannot be wrong.** The schema check and the drift check are the only
+things standing between this manifest and quiet decay.
+
+### Four assertions that were wrong, mine
+
+* **`frontmatter('---\nname: a\n')` returns `null`, not `{ data: undefined }`** — an unclosed block is not
+  frontmatter, and my assertion demanded the shape the code does not return. **The code was right.**
+* **I typed `disableModelInvoction`** in the rejected-spelling set. **A misspelled name in a rejection list
+  is a name that is not rejected** — the exact failure the list exists to prevent.
+* **I exported a contract object above the constants it read**, so importing the module threw
+  `Cannot access 'PLUGIN_FIELDS' before initialization`.
+* **I wrote the `implementations` Map entry as `['name']: () => …`** inside an array of pairs, matching an
+  anchor line without reading the structure around it. **This is the third time in this project that an
+  edit matched an anchor string instead of the block containing it.**
+
+Both validators now export their rules and keep the CLI in `main()`, so **the suite asserts them without
+spawning a child** — a test that needs a subprocess is skipped wherever piped stdio is refused, which is
+exactly where a check must still run.
+
+## [0.51.0] — 2026-10-15
+
+**Four Agent Skills, written against the loader's real contract — and a gate that makes the contract matter.**
+
+### The four skills
+
+```
+skills/
+├── fleet-control/SKILL.md        the four modes, the nine verdicts, every refusal code
+├── memory-sync/SKILL.md          field-level acceptance, omission versus null, ancestry
+├── session-ref/SKILL.md          the dsh-session: codec, its three checks, its silent trap
+└── resource-schedule/SKILL.md    lease states, the ~50s ceiling, what "expired" means
+```
+
+**Every rule in them was measured before it was written.** The refusal codes are the ones this session
+actually produced, the ~50-second ceiling is one that was hit more than eight times, and the `dsh-session:`
+section describes a codec whose three checks were read out of `@deepseek-ai/dsh-session-reference` — **including
+the one that surprises people, where a payload that decodes correctly is still refused for not being
+*canonical*.**
+
+### The contract came from the loader, not from a specification
+
+`parseSkillFile` reads **`name`** and **`description`**, tests the name against
+`/^[a-z0-9]+(?:-[a-z0-9]+)*$/`, and **rejects three renamed spellings outright** —
+`disableModelInvocation`, `modelInvocable`, `userInvocable` — in favour of the hyphenated forms. On any
+failure it logs a warning and **returns**.
+
+**That is the whole reason this ships with a gate.** A skill that violates the contract is not an error: it
+simply never appears, the directory still looks shipped, and nothing is red. **It is a file whose only symptom
+of being wrong is not being there.**
+
+### New check: `agent skills`, and the twelfth became the thirteenth
+
+`scripts/skill-check.mjs` mirrors the loader's rules, and `pre-flight` now runs it.
+
+```
+PASS  agent skills (frontmatter satisfies the loader, so no skill is silently dropped): 4 skill(s) satisfy the loader contract
+pre-flight: 13 pass, 0 fail, 1 unverifiable (13/13 registered check(s) reported) -- GREEN
+```
+
+It is bound in **three** places — `DECLARED_CHECKS`, `GATE_INVENTORY` (five artifact rows: the validator and
+the four `SKILL.md` files), and the implementation map — because this repository's own rule is that a
+declared check with no artifact, or an artifact with no check, is red in both directions.
+
+### Two mistakes of mine, both worth keeping visible
+
+**The check reported `exit null` and nothing else.** The cause was `result.error` — an `EPERM` from
+`spawnSync` under a `workspace-write` sandbox that had replaced the `danger-full-access` of earlier runs. **The
+code was right and the environment was refusing.** But the diagnosis was bad on its own terms: **a check that
+prints an exit status and drops the reason names nothing**, so the failure now says
+`EPERM: spawnSync …` and the next reader does not have to rediscover the sandbox boundary.
+
+**I edited the `implementations` Map into invalid syntax** — `['name']: () => …` inside an array of pairs —
+because I matched an anchor line without reading the structure it sat in. **This is the same error shape as
+the `accept_block` branch in 0.41.0, and it is twice now.**
+
+**The skills ship** — `skills` is in `package.json#files` beside `docs`, so the four `SKILL.md` files are in
+the tarball. **They load only when a host points `DSH_BUNDLED_SKILL_DIR` at the directory**, which is a host
+setting rather than something the package can assert; the alternative roots are `<project>/.dsh/skills`,
+`<project>/.agents/skills`, `<dshHome>/skills` and `~/.agents/skills`.
+
 ## [0.50.0] — 2026-10-15
 
 **The matrix gains the two defects and the WeChat path — and the counts are read from the table, not typed.**
