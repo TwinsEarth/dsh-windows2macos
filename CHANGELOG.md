@@ -4,6 +4,54 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.26.0] — 2026-10-15
+
+**`w2m_approvals`: the approval chain is reachable by an operator, not only by the suite.**
+
+The tenth tool. `action: "list"` reads the queue, `approve` and `reject` settle one request by `approval_id`.
+Until now the chain from 0.25.0 was **closed in code and testable end to end while no operator could reach
+it**; this is the tool that opens it.
+
+### Every row says whether *you* may act, and why not when you may not
+
+A list filtered to what the caller may answer would be shorter and would **make the fleet look idle at the
+moment it is most blocked.** `listFor` already returns each row with `may_act` and `why_not`; the tool passes
+them through instead of hiding work above the caller's authority.
+
+### `actor_level` is a parameter, and that is deliberate
+
+The machine's own `actorAuthorityLevel` says what it may **dispatch as**. An approver's level is a fact about
+the person answering, and a decision made on the dispatcher's level would let a machine approve its own
+escalations. Passing it explicitly is what keeps `APPROVAL_SELF_APPROVAL` meaningful rather than incidental.
+
+**Settling without a level is refused** (`W2M_APPROVAL_LEVEL`) rather than defaulted, so a decision is never
+attributed to a level nobody supplied. Listing **without** a level still works and says so: `level_known:
+false`, with a note explaining that the queue is visible but whether any of it is answerable is not known —
+**knowing what is waiting does not require the authority to answer it, and a queue only its supervisors can
+see is a queue that stays full.**
+
+### The note on every settle, because a reader will assume otherwise
+
+> *"the request is settled; the dispatch did not run and must be attempted again"*
+
+Approval means the next attempt is allowed, not that anything already happened. A tool that settled quietly
+would leave its caller waiting for a result that is never coming.
+
+### Three defects of mine, all caught by the suite or by checking
+
+* I called a `json(...)` helper **that does not exist in this file** — every tool returns `JSON.stringify(...)`.
+  `node --check` passed, so only reading the surrounding code found it.
+* I referenced `AUTHORITY_MAX` without importing it.
+* I omitted `presentCall`, which `ALLOWED_DEF_KEYS` requires and which the registration-shape test pins. It now
+  labels a list as a `read` and a settle as a `write`, because **calling a queue inspection a write would
+  misrepresent the common case.**
+
+Four tool-count assertions said "exactly nine" and named the nine; they now say ten and name the ten. The
+comment beside one of them already recorded the lesson from a previous version — that a **count** was once the
+wrong property and the **message** was the right one. This time the count *was* the property.
+
+**7 new tests, 0 failures.**
+
 ## [0.25.0] — 2026-10-15
 
 **The chain is closed: dispatch → gate → queue → decision. The plugin builds a queue, and an escalation is a real entry an approver can find.**

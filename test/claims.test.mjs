@@ -360,8 +360,8 @@ describe('registered tool set (measured from lib/tools.js)', () => {
     // without this file, that is a real disagreement worth failing on.
     assert.equal(
       REGISTERED.length,
-      9,
-      `verify-installed.mjs asserts 9 tools; the artifact registers ${REGISTERED.length}`,
+      10,
+      `verify-installed.mjs asserts 10 tools; the artifact registers ${REGISTERED.length}`,
     );
   });
 

@@ -273,13 +273,13 @@ function finalTask(overrides = {}) {
 // ---------------------------------------------------------------------------------------------
 
 describe('registration shape', () => {
-  it('declares the tools service and registers exactly nine tools', async () => {
+  it('declares the tools service and registers exactly ten tools', async () => {
     assert.deepEqual(plugin.inject, ['tools']);
     const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
-    assert.equal(tools.size, 9);
+    assert.equal(tools.size, 10);
     assert.deepEqual(
       [...tools.keys()].sort(),
-      ['w2m_devices', 'w2m_history', 'w2m_memory', 'w2m_report', 'w2m_run', 'w2m_stats', 'w2m_status', 'w2m_update', 'w2m_wait'],
+      ['w2m_approvals', 'w2m_devices', 'w2m_history', 'w2m_memory', 'w2m_report', 'w2m_run', 'w2m_stats', 'w2m_status', 'w2m_update', 'w2m_wait'],
     );
   });
 
@@ -1951,7 +1951,7 @@ describe('bounds and cancellation', () => {
     // earlier test happened to populate the cache with.
     plugin.resetDefineToolCacheForTests();
     const { tools, warnings } = await register({ rabbitUrl: RABBIT });
-    assert.equal(tools.size, 9, 'the plugin must register all nine tools on either path');
+    assert.equal(tools.size, 10, 'the plugin must register all ten tools on either path');
 
     /**
      * Match the warning this test is about, rather than counting warnings.
@@ -2623,6 +2623,78 @@ describe('v0.1.2 cross-region diagnostics', () => {
     } finally {
       fetchStub.restore();
     }
+  });
+});
+
+describe('w2m_approvals: the tool an approver reaches for', () => {
+  it('lists an empty queue rather than failing on it', async () => {
+    // A queue with nothing waiting is the normal state, not an error. The tool has to say so without making
+    // it indistinguishable from "the queue is broken".
+    const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
+    const value = JSON.parse(await tools.get('w2m_approvals').execute({ action: 'list' }, {}));
+    assert.equal(value.ok, true);
+    assert.equal(value.count, 0);
+    assert.deepEqual(value.rows, []);
+  });
+
+  it('says the level is unknown rather than assuming one when actor_level is absent', async () => {
+    // The distinction the whole queue rests on. Defaulting to a high level would let anyone approve;
+    // defaulting to a low one would report work as unanswerable.
+    const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
+    const value = JSON.parse(await tools.get('w2m_approvals').execute({}, {}));
+    assert.equal(value.level_known, false);
+    assert.equal(value.as.level, null);
+    assert.match(value.note, /no actor_level was supplied/);
+    assert.match(value.note, /not known/);
+  });
+
+  it('records the level and the id when they are supplied', async () => {
+    const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
+    const value = JSON.parse(await tools.get('w2m_approvals').execute({ actor_level: 50, actor_id: 'supervisor' }, {}));
+    assert.equal(value.level_known, true);
+    assert.equal(value.as.level, 50);
+    assert.equal(value.as.id, 'supervisor');
+  });
+
+  it('refuses to settle without an id, and says where to find one', async () => {
+    const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
+    await assert.rejects(
+      () => tools.get('w2m_approvals').execute({ action: 'approve', actor_level: 70 }, {}),
+      /W2M_APPROVAL_ID/,
+    );
+  });
+
+  it('refuses to settle without a level, rather than attributing a decision to nobody', async () => {
+    // A decision whose actor level was never supplied cannot be audited, so it is refused here rather than
+    // handed to the index to guess at.
+    const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
+    for (const bad of [undefined, 'captain', 50.5, -1, 101]) {
+      await assert.rejects(
+        () => tools.get('w2m_approvals').execute({ action: 'approve', approval_id: 'AP-1', actor_level: bad }, {}),
+        /W2M_APPROVAL_LEVEL/,
+        `actor_level ${JSON.stringify(bad)} should be refused`,
+      );
+    }
+  });
+
+  it('answers for an id nobody raised, naming the reason rather than throwing', async () => {
+    // Settling an unknown request is a normal mistake, not a crash: the caller gets a value back.
+    const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
+    const value = JSON.parse(await tools.get('w2m_approvals').execute({ action: 'approve', approval_id: 'AP-NOPE', actor_level: 70 }, {}));
+    assert.equal(value.ok, false);
+    assert.equal(value.settled, null);
+    assert.ok(typeof value.reason_code === 'string' && value.reason_code.length > 0, 'the refusal must be named');
+    assert.match(value.note, /still waiting|unchanged/);
+  });
+
+  it('labels a list as a read and a settle as a write', async () => {
+    // The card is what a host renders; calling a queue inspection a write would misrepresent it.
+    const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
+    const tool = tools.get('w2m_approvals');
+    assert.equal(tool.presentCall({ action: 'list' }).kind, 'read');
+    assert.equal(tool.presentCall({}).kind, 'read', 'the default action is a list');
+    assert.equal(tool.presentCall({ action: 'approve' }).kind, 'write');
+    assert.equal(tool.presentCall({ action: 'reject' }).kind, 'write');
   });
 });
 

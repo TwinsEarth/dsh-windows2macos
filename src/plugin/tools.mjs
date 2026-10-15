@@ -129,7 +129,7 @@ import { gateDispatch, approvalRequestFor, raiseApproval } from '../agent/permis
 // v0.24.0: the queue an escalation is raised into. Imported from `src/`, never from `scripts/` -- a
 // `src/` module reaching above itself breaks the published package (see CHANGELOG 0.23.0).
 import { createApprovalIndex } from '../agent/approval-index.mjs';
-import { isAuthorityLevel } from '../agent/authority.mjs';
+import { AUTHORITY_MAX, isAuthorityLevel } from '../agent/authority.mjs';
 // v0.6.0: the device keypair and the offer's key distribution (`docs/P2P-CRYPTO.md` §4). Imported
 // rather than reimplemented: the dispatcher and the executor have to derive the *same* keys, and two
 // implementations of a handshake are two chances to disagree about it.
@@ -5087,6 +5087,131 @@ export async function apply(ctx, config = {}) {
       kind: 'read',
       rawInput: {},
     }),
+  }));
+
+  /**
+   * v0.25.0: the tool that makes the approval chain reachable by an operator.
+   *
+   * ## Why it reports refusals instead of hiding them
+   *
+   * Every row carries `may_act` and, when false, `why_not`. A list filtered down to what the caller may
+   * answer would be shorter and **would make the fleet look idle at the moment it is most blocked** — the
+   * work above their authority is exactly the work they most need to know exists.
+   *
+   * ## Why `actor_level` is a parameter and not read from config
+   *
+   * This machine's own `actorAuthorityLevel` says what it may *dispatch as*. An approver's level is a fact
+   * about the person answering, and a decision made on the dispatcher's level would let a machine approve its
+   * own escalations — which the index already refuses by name (`APPROVAL_SELF_APPROVAL`) when the ids match.
+   * Making it explicit keeps that refusal meaningful rather than incidental.
+   */
+  ctx.tools.register(defineTool({
+    name: 'w2m_approvals',
+    description:
+      'List and settle the dispatches that are waiting for an approver. A dispatch whose actor level is ' +
+      'exactly one band below what it needs is QUEUED rather than refused, and this is where that queue is ' +
+      'read and answered. Every row reports whether YOU may act on it and why not if you may not, so work ' +
+      'above your authority is visible rather than filtered away. Settling a request does not run the ' +
+      'dispatch: approval means the next attempt is allowed, not that anything already happened.',
+    parameters: {
+      action: {
+        type: 'string',
+        enum: ['list', 'approve', 'reject'],
+        description: 'list (default) shows the queue; approve and reject settle one request by approval_id.',
+        default: 'list',
+      },
+      approval_id: {
+        type: 'string',
+        description: 'Which request to settle. Required for approve and reject.',
+      },
+      actor_id: {
+        type: 'string',
+        description: 'Who is answering. Defaults to this machine\'s name; it is recorded on the decision, and it is what makes a self-approval refusable.',
+      },
+      actor_level: {
+        type: 'number',
+        description: 'The authority level of the person answering, 0..100. Required to approve or reject: an approver with no level cannot be placed relative to the request, and the index refuses rather than guessing one.',
+      },
+      include_settled: {
+        type: 'boolean',
+        description: 'Also show recently settled requests. They are kept briefly as receipts, so a supervisor returning to a busy queue can tell "already dealt with" from "never seen".',
+        default: false,
+      },
+    },
+    output: jsonOutput,
+    presentCall: (args) => ({
+      card: 'generic',
+      title: `w2m approvals ${typeof args?.action === 'string' ? args.action : 'list'}`,
+      // Only `approve` and `reject` change anything; a list is a read. Labelling the whole tool 'write' would
+      // make the common case -- looking at the queue -- read as an action.
+      kind: args?.action === 'approve' || args?.action === 'reject' ? 'write' : 'read',
+      rawInput: {},
+    }),
+    async execute(args, exec) {
+      throwIfAborted(exec?.signal);
+      const action = typeof args?.action === 'string' ? args.action : 'list';
+      const queue = approvalQueue();
+
+      if (action === 'approve' || action === 'reject') {
+        const approvalId = typeof args?.approval_id === 'string' ? args.approval_id.trim() : '';
+        if (approvalId === '') {
+          throw new W2MError('W2M_APPROVAL_ID', 'W2M_APPROVAL_ID: settling a request needs `approval_id`', {
+            hint: 'call w2m_approvals with action="list" to see the pending ids',
+          });
+        }
+        if (!isAuthorityLevel(args?.actor_level)) {
+          // Refused rather than defaulted, and refused HERE rather than left to the index, so the message can
+          // say what to do about it. A decision attributed to a level nobody supplied is a decision nobody
+          // can audit.
+          throw new W2MError(
+            'W2M_APPROVAL_LEVEL',
+            'W2M_APPROVAL_LEVEL: `actor_level` must be an integer 0..' + AUTHORITY_MAX + ' to settle a request',
+            { hint: 'an approver with no level cannot be placed relative to the request it is answering' },
+          );
+        }
+        const actor = { id: typeof args?.actor_id === 'string' && args.actor_id.trim() !== '' ? args.actor_id.trim() : cfg.machineName, level: args.actor_level };
+        const outcome = action === 'approve' ? 'approved' : 'rejected';
+        const result = queue.decide(approvalId, actor, outcome);
+        return JSON.stringify({
+          ok: result.ok === true,
+          action,
+          approval_id: approvalId,
+          settled: result.ok === true ? outcome : null,
+          reason_code: result.reason_code ?? null,
+          detail: result.detail ?? null,
+          acted_by: actor,
+          // Said every time, because a reader who assumes approval ran the dispatch will wait for a result
+          // that is never coming.
+          note: result.ok === true
+            ? 'the request is settled; the dispatch did not run and must be attempted again'
+            : 'the decision was refused; the request is unchanged and still waiting',
+        });
+      }
+
+      const actor = {
+        id: typeof args?.actor_id === 'string' && args.actor_id.trim() !== '' ? args.actor_id.trim() : cfg.machineName,
+        level: isAuthorityLevel(args?.actor_level) ? args.actor_level : null,
+      };
+      // An actor with no level still gets the list: knowing what is waiting does not require the authority to
+      // answer it, and a queue only its supervisors can see is a queue that stays full.
+      const rows = queue.listFor(
+        actor.level === null ? { id: actor.id, level: 0 } : actor,
+        { includeSettled: args?.include_settled === true },
+      );
+      const summary = queue.summary(actor.level === null ? { id: actor.id, level: 0 } : actor);
+      return JSON.stringify({
+        ok: true,
+        action: 'list',
+        as: actor,
+        level_known: actor.level !== null,
+        summary,
+        count: rows.length,
+        rows,
+        note: actor.level === null
+          ? 'no actor_level was supplied, so may_act is reported as if the level were 0: the queue is visible, but whether you may answer any of it is not known'
+          : 'may_act reflects the actor_level supplied',
+      });
+    },
   }));
 }
 

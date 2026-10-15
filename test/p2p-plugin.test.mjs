@@ -711,7 +711,7 @@ describe('v0.4.0 config: stunServers', () => {
     await withoutP2pEnvironment(async () => {
       const { ctx, tools } = makeCtx();
       await plugin.apply(ctx, bundled);
-      assert.equal(tools.size, 9);
+      assert.equal(tools.size, 10);
     });
   });
 
