@@ -4,6 +4,51 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.0] — 2026-10-15
+
+**The plugin this machine runs is 0.9.5. The source tree is 0.18.0. Every source-level conclusion about the P2P failure was read from code that may not have run.**
+
+Measured, not inferred:
+
+```
+source    : 0.18.0
+installed : 0.9.5   at ...\profiles\desktop\node_modules\@twinsearth\w2m-dsh-plugin
+verdict   : installed 0.9.5 is 8995 rank(s) BEHIND the source 0.18.0
+            -- source-level conclusions about this machine are void
+```
+
+Reading `p2p-node.mjs` established which call raises `P2P_PUNCH_FAILED`, and it is raised **by the plugin
+process** — `tools.mjs:1463`, `node.dial(...)`, on the dispatching machine. That machine's plugin is **nine
+versions behind the file that was being read.** Two rounds of crypto-capability work were therefore correct
+about the code in this repository and only *possibly* correct about the code that failed.
+
+### Two runtime facts were assumed, and only one held
+
+| Assumption | Status |
+|---|---|
+| which node the plugin runs under | **holds** — the DSH process runs `dsh-primary-runtime/.../node.exe` v24.21.0, the same binary that was probed; the runtime was never the variable |
+| which plugin version is loaded | **did not hold** — 0.9.5 installed against 0.18.0 of source |
+
+The first was checked last and held; the second was never checked and did not. **A version skew is not a
+detail to note — it is a reason every source-level conclusion is void**, and it should have been the first
+thing measured rather than the last.
+
+### The invariant is now a test
+
+`test/installed-version.test.mjs` finds every plausible install location, compares numerically (because
+`'0.9.0' > '0.10.0'` as strings, and `0.9.5` against `0.18.0` is exactly the case that would be got wrong),
+and **reports the skew with both numbers** rather than failing an assertion nobody could act on. It also
+refuses to compare what it cannot parse, and **says so when it finds no installed copy** — because passing by
+absence is the same failure mode as an earlier skip guard in this repository, which passed for three rounds
+while hiding a defect in the tooling rather than in the code.
+
+### What is needed from a person
+
+**The local DSH must load the current plugin** for P2P diagnosis to mean anything. Until it does, this
+machine's `P2P_PUNCH_FAILED` comes from 0.9.5 and no reading of 0.19.0's source can explain it.
+
+**8 tests, 0 failures.**
+
 ## [0.18.0] — 2026-10-15
 
 **The whole handshake primitive set is present on both machines — so the P2P failure is not a missing algorithm.**
