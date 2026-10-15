@@ -60,7 +60,7 @@ that produced it.
   the document does not grant it and inventing it would be the worst possible default;
 - a rule with no `matching_exempt_level` exempts nobody, rather than exempting everybody.
 
-### v4.8.0 — memory: field-level acceptance (MMP P1/P2)  **shipped in 0.9.9, suite verified on MacMini**
+### v4.8.0 — memory: field-level acceptance (MMP P1/P2)  **shipped in 0.9.9 (block + lineage); the authority half completed in 0.29.0**
 
 **Deliverable.** Extend the shipped memory layer: a CAT7 seven-field cognitive block, per-field
 acceptance driven by §2's authority model, and lineage — each accepted claim records the content hash of
@@ -69,6 +69,17 @@ its parent, so a returned claim is identifiable as the receiver's own earlier th
 **Falsifying tests.** a field refused by policy is *absent* from the stored block rather than null; a
 claim's ancestor chain survives a round trip; a claim whose parent is missing is refused rather than
 silently re-rooted.
+
+**Correction, 0.29.0.** This entry previously read *"shipped in 0.9.9, suite verified on MacMini"*, and that
+was **half true**. The block, the lineage, the absent-not-null refusal and the missing-parent refusal all
+shipped and are all asserted. But **"per-field acceptance driven by §2's authority model" was never built**:
+measured, `src/agent/blocks.mjs` did not import `authority.mjs` at all, and the only chooser that shipped
+refused `confidence` by name and accepted everything else. The connection now exists in
+`src/agent/field-authority.mjs`, with the three inherited fields deliberately left undeclared because no
+chooser is ever asked about them.
+
+The lesson is recorded rather than tidied away: **a roadmap sentence is a claim, and this one was checkable
+in one grep.** It stood for several releases because nothing tested the sentence itself.
 
 ### v4.9.0 — approval queue and scheduling
 

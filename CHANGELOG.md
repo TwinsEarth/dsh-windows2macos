@@ -4,6 +4,68 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.29.0] — 2026-10-15
+
+**v4.8.0 was half shipped, and the ROADMAP said otherwise. The missing half is now built.**
+
+### What the check found
+
+`ROADMAP.md` described v4.8.0 as *"a CAT7 seven-field cognitive block, **per-field acceptance driven by §2's
+authority model**, and lineage"* and marked it **shipped in 0.9.9**. Reading the tree instead of the sentence:
+
+| Claim | Verdict |
+|---|---|
+| CAT7 seven-field block | **real**, asserted |
+| lineage, with a missing parent refused rather than re-rooted | **real**, asserted |
+| a refused field *absent* from the stored block rather than null | **real**, asserted |
+| **"driven by §2's authority model"** | **never built** |
+
+Measured: **`src/agent/blocks.mjs` did not import `authority.mjs` at all**, and `defaultChoose` — the only
+chooser that shipped — refused `confidence` by name and accepted everything else. **A roadmap sentence is a
+claim, and this one was checkable in a single grep.** It stood for several releases because nothing tested the
+sentence itself.
+
+### `src/agent/field-authority.mjs`
+
+Per-field acceptance now goes through `authority.evaluate`, so the two models cannot drift into different
+notions of what a rule is. Three refusals apply in a fixed order:
+
+1. **not a CAT7 field** — before any rule, because a rule cannot make a field exist;
+2. **no declared rule** — refused, never granted and never escalated;
+3. **the authority verdict** — `allow` accepts, anything else refuses with the model's own reason.
+
+**A field with no declared rule is refused**, which is the same decision `authority.mjs` already states for
+exemptions and `permission.mjs` states for capabilities. Three modules, one rule, because the failure mode is
+identical: **a table that grants what it has not heard of grants whatever is added next.**
+
+### The three inherited fields are deliberately undeclared, and that is not dead policy
+
+Measured: the chooser is asked about `subject`, `body` and `evidence` — **never** `origin`, `observed_at` or
+`lineage`, because `acceptBlock` copies the inherited three directly. A rule for them would read as policy
+while doing nothing, so they are left out and `acceptField` reports them `UNDECLARED`. A test asserts a rule
+can never be added for them by accident.
+
+`confidence` is refused **at every level including `AUTHORITY_MAX`**, because if it were merely expensive a
+system administrator would be *permitted by this model* to adopt the sender's own certainty about the
+sender's own assertion.
+
+### Four of my own errors, and how each surfaced
+
+* I invented `scope_claim` and `meaning` as field names. **Neither exists** — the real seven are `origin`,
+  `subject`, `body`, `evidence`, `confidence`, `observed_at`, `lineage`. My "undeclared field" test was
+  therefore testing `NOT_A_FIELD` and passing for the wrong reason; the fields that are genuinely
+  governed-but-undeclared are the three inherited ones.
+* I asserted `accepted_fields` held only the receiver's two, when it also carries the three inherited ones.
+* I asserted one chooser ruling per choosable field; there are **three, not four**, because `acceptBlock`
+  hard-codes the `confidence` refusal and `continue`s **before** calling the chooser.
+* `observed_at: 'T'` is not an ISO timestamp and `makeBlock` refused it — **the block layer was right and my
+  probe was wrong**, which is the sixth time in this project that a failing test was the test's fault.
+
+Every one of the four was found by **measuring the real behaviour** rather than by reading the source and
+predicting it.
+
+**17 tests, 0 failures.**
+
 ## [0.28.0] — 2026-10-15
 
 **First real-machine verification of the recent work, and a tool that packs four answers into one exit code.**
