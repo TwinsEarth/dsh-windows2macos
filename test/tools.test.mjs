@@ -2626,6 +2626,58 @@ describe('v0.1.2 cross-region diagnostics', () => {
   });
 });
 
+describe('w2m_run: the authority level is chosen by name', () => {
+  it('accepts a band name where a number used to be required, and the gate follows it', async () => {
+    // The user-facing point of the selector: nobody has to remember what 50 means.
+    const { tools } = await register({
+      rabbitUrl: RABBIT,
+      stateDir: await makeStateDir(PAIRED_DEVICE),
+      operatorToken: OPERATOR_TOKEN,
+      actorAuthorityLevel: 'captain',
+    });
+    const status = JSON.parse(await tools.get('w2m_status').execute({}, {}));
+    assert.equal(status.actor_authority.ok, true);
+    assert.equal(status.actor_authority.level, 50);
+    assert.equal(status.actor_authority.source, 'name');
+    assert.equal(Object.prototype.hasOwnProperty.call(status.actor_authority, 'choices'), false, 'a resolved level needs no menu');
+
+    // captain is the floor `dispatch_writing` needs, so a writing dispatch is ALLOWED rather than escalated.
+    // Asserted by the KIND of failure rather than by success: this test installs no fetch stub, so the
+    // dispatch reaches the network layer and fails as unreachable. That is exactly the proof wanted -- a
+    // refused dispatch would have thrown W2M_PERMISSION_*, and it did not.
+    let thrown = null;
+    await assert.rejects(
+      () => tools.get('w2m_run').execute(runArgs({ write: true, write_scope: ['src/'] }), {}),
+      (error) => {
+        thrown = error;
+        return true;
+      },
+    );
+    assert.doesNotMatch(thrown.message, /W2M_PERMISSION_/, 'the gate refused a dispatch a captain may make');
+    assert.match(thrown.message, /W2M_UNREACHABLE/, 'it should have got as far as trying to reach the relay');
+  });
+
+  it('reports a level it could not resolve instead of quietly dispatching unenforced', async () => {
+    // The failure this prevents: an unreadable level degrading to null, which reads exactly like a machine
+    // that never chose one -- and those need opposite responses.
+    const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN, actorAuthorityLevel: 'king' });
+    const status = JSON.parse(await tools.get('w2m_status').execute({}, {}));
+    assert.equal(status.actor_authority.ok, false);
+    assert.equal(status.actor_authority.level, null);
+    assert.match(status.actor_authority.detail, /neither a choice nor a level/);
+    assert.ok(Array.isArray(status.actor_authority.choices), 'a refusal carries the menu, so it is fixable in place');
+    assert.deepEqual(status.actor_authority.choices.map((c) => c.value), ['ordinary', 'captain', 'org_admin', 'system_admin']);
+  });
+
+  it('still accepts a plain integer, so a profile patch from an older version keeps loading', async () => {
+    const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN, actorAuthorityLevel: 70 });
+    const status = JSON.parse(await tools.get('w2m_status').execute({}, {}));
+    assert.equal(status.actor_authority.ok, true);
+    assert.equal(status.actor_authority.level, 70);
+    assert.equal(status.actor_authority.source, 'number');
+    assert.equal(Object.prototype.hasOwnProperty.call(status.actor_authority, 'choices'), false);
+  });
+});
 describe('w2m_run: the approval gate is on the raise path, not merely available', () => {
   it('refuses a second raise in the window, and does not create the request it refused', async () => {
     // The whole reason for wiring the gate: a mechanism with no caller cannot be told from a finished

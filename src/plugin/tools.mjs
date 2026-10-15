@@ -132,6 +132,9 @@ import { createApprovalIndex } from '../agent/approval-index.mjs';
 // v0.31.0: the approval queue's front door. Written in 0.30.0 and given a caller here.
 import { createApprovalGate } from '../agent/approval-gate.mjs';
 import { AUTHORITY_MAX, isAuthorityLevel } from '../agent/authority.mjs';
+// v0.33.0: the level is chosen by NAME rather than typed. `resolveConfiguredLevel` also accepts a plain
+// integer, because a profile patch written by an earlier version must keep loading.
+import { AUTHORITY_CHOICES, resolveConfiguredLevel } from '../agent/authority-choice.mjs';
 // v0.6.0: the device keypair and the offer's key distribution (`docs/P2P-CRYPTO.md` §4). Imported
 // rather than reimplemented: the dispatcher and the executor have to derive the *same* keys, and two
 // implementations of a handshake are two chances to disagree about it.
@@ -700,11 +703,34 @@ function readConfig(config = {}) {
      * null is not 0. An unset level means there is no actor to judge, and the gate reports that as
      * unenforced rather than refusing every writing dispatch on a machine that never opted in.
      */
-    actorAuthorityLevel: isAuthorityLevel(config.actorAuthorityLevel)
-      ? config.actorAuthorityLevel
-      : (Number.isInteger(Number(process.env.W2M_ACTOR_AUTHORITY)) && isAuthorityLevel(Number(process.env.W2M_ACTOR_AUTHORITY))
-        ? Number(process.env.W2M_ACTOR_AUTHORITY)
-        : null),
+    /**
+     * v0.33.0: the level, chosen by NAME or configured as a number.
+     *
+     * The plugin config takes either, through {@link resolveConfiguredLevel} — a name because nobody should
+     * have to remember what 70 means, and a number because a profile patch written by an earlier version
+     * must keep loading. `W2M_ACTOR_AUTHORITY` takes a name too, so a machine can be pointed at a band
+     * without editing a profile.
+     *
+     * `actorAuthorityChoice` carries the resolution — including WHY it failed, when it did — so `w2m_status`
+     * can report a level it refused instead of silently dispatching unenforced. A misconfigured level that
+     * degrades to `null` in silence is the failure this pair exists to prevent.
+     */
+    ...(() => {
+      const fromEnv = typeof process.env.W2M_ACTOR_AUTHORITY === 'string' && process.env.W2M_ACTOR_AUTHORITY.trim() !== ''
+        ? process.env.W2M_ACTOR_AUTHORITY.trim()
+        : undefined;
+      const resolved = resolveConfiguredLevel(fromEnv !== undefined ? fromEnv : config.actorAuthorityLevel);
+      return {
+        actorAuthorityLevel: resolved.ok ? resolved.level : null,
+        actorAuthorityChoice: {
+          ok: resolved.ok,
+          level: resolved.level,
+          source: resolved.source,
+          reason_code: resolved.code,
+          detail: resolved.detail,
+        },
+      };
+    })(),
     defaultTimeoutMs: shared.values.defaultTimeoutMs,
     sharedConfig: shared,
     pairingCode: typeof config.pairingCode === 'string' && config.pairingCode.trim() !== ''
@@ -4518,6 +4544,17 @@ export async function apply(ctx, config = {}) {
               ? 'the composer control reads and writes its selection through this route'
               : targetRoutes.reason,
             sessions_with_a_target: defaultSelectionStore.list().length,
+          },
+          /**
+           * v0.33.0: how the authority level was resolved, and why it failed when it did.
+           *
+           * A misconfigured level used to degrade to `null` in silence, which reads exactly like a machine
+           * that never chose one -- and those need opposite responses. This reports the difference, and
+           * carries the four choices so a reader can fix it without being told what they are elsewhere.
+           */
+          actor_authority: {
+            ...cfg.actorAuthorityChoice,
+            ...(cfg.actorAuthorityChoice.ok ? {} : { choices: AUTHORITY_CHOICES.map((c) => ({ value: c.value, may: c.may, range: c.range })) }),
           },
           approvals: approvalsBlock,
           notes: statusNotes(relay, rtt, cfg, p2pStatus, approvalsBlock),

@@ -4,6 +4,69 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.33.0] — 2026-10-15
+
+**The authority level is chosen by name. Nobody types a number.**
+
+`actorAuthorityLevel` is an integer in `0..100` whose four bands have names and gaps. Asking a person to type
+it asks them to hold all of that in their head, and **getting it wrong fails silently**: `69` and `70` look
+equally arbitrary and land in different bands, so a machine configured one point low **refuses a dispatch it
+should have run and never says a threshold was the reason.**
+
+`src/agent/authority-choice.mjs` turns the number into a choice:
+
+| Choice | Level | What picking it permits |
+|---|---|---|
+| `ordinary` | **0** | create goals and session data within its own scope |
+| `captain` | **50** | create team goals, manage team membership |
+| `org_admin` | **70** | create organisation goals, register actors, set overrides |
+| `system_admin` | **90** | create global goals, configure across organisations, override any lower constraint |
+
+The options are **built from `AUTHORITY_BANDS`**, so a band added to the model appears here without anybody
+remembering — and a band cannot be described in two places differently.
+
+### A name resolves to its band FLOOR, and the consequence is stated
+
+The floor is where the band's own description becomes true, and it is what `bandOf` answers with. Resolving to
+a midpoint would mean **a choice labelled "captain" silently granting more than captain.**
+
+The practical consequence is worth writing down because it decides what a machine may do: **`ordinary`
+resolves to `0` and `dispatch_writing` costs `50`, so a machine whose operator picks "ordinary" cannot
+dispatch a write at all** — it escalates and an approver must answer. Measured, all four:
+
+```
+ordinary     level   0  ->  write dispatch: needs_approval
+captain      level  50  ->  write dispatch: allow
+org_admin    level  70  ->  write dispatch: allow
+system_admin level  90  ->  write dispatch: allow
+```
+
+### Two vocabularies, and two different callers
+
+**A number is refused by the selector**, because a selector that also accepts integers is a text field with a
+helpful hint and every reason above applies again. **A number is accepted by the config**, because a profile
+patch written by an earlier version must keep loading — and breaking every existing machine on upgrade is a
+worse failure than accepting a number from a file nobody is looking at. The two rules are stated in one place
+and tested against each other, including that the selector refuses `'captain '` while the config trims it.
+
+### A misconfigured level no longer degrades in silence
+
+`w2m_status` now reports `actor_authority` — whether it resolved, from which vocabulary, and **why not when it
+did not, with the four choices attached**. A level that failed to parse used to become `null`, which reads
+exactly like a machine that never chose one, and **those two need opposite responses.**
+
+### Three of my own errors
+
+* I asserted `UNKNOWN` for the integer `70`; it is `NOT_A_STRING`, because the codes distinguish "a number was
+  given" from "a string that did not match" — **on purpose, so a caller can message them differently.**
+* I reused the selector's message in the config resolver, so a config author was told about names only while
+  **that function's own contract promised numbers too.** The implementation was changed, not the test.
+* My captain test asserted success and instead reached the network, because it installed no fetch stub. **That
+  failure was the proof**: it did *not* throw `W2M_PERMISSION_*`. The assertion now checks the kind of failure
+  rather than the absence of one, which is what the test was always about.
+
+**18 new tests, 0 failures.**
+
 ## [0.32.0] — 2026-10-15
 
 **Widening real-machine verification: eight suites tried, none passed, and the cause is a hypothesis.**
