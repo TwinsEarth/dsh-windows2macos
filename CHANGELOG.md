@@ -4,6 +4,144 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.2] — 2026-10-15
+
+**Tiered storage — temporary, compressed, permanent, and the two kinds of knowledge that persist forever.**
+
+### Why tiers rather than one directory
+
+The Linux host reached 100% filesystem on 2026-10-14 from a single uncapped writer at 14.7 GB/day, and the
+recovery cost real time. The lesson was not "delete more": it was that **data with different lifetimes was
+stored in one place under one policy**, so the only available policy was "never delete" until it became
+"delete under pressure" — which is the worst possible moment to be deciding what matters.
+
+So a file's tier is written down when it is stored, and the tier alone decides what may happen to it:
+
+| Tier | Lifetime | May it be deleted? |
+|---|---|---|
+| `temp` | a stated TTL | yes, automatically, once expired |
+| `compressed` | until the archive is unwanted | only whole, never partially |
+| `permanent` | forever | **no — refused, not warned about** |
+| `skill` | forever | **no** |
+| `law` | forever | **no — amended instead** |
+
+### Why `permanent` refuses rather than warns
+
+A warning is a thing a caller ignores, and the caller under pressure is exactly who this exists for.
+`memory.jsonl` is the **only** durable copy of what a command printed — the relay keeps `stdout_sha256` and
+never the text — so deleting it deletes the fleet's ability to answer what it already tried, and nothing
+else in the system notices. `device.key` is the identity peers know a machine by; losing it makes every
+peer holding the old one refuse that machine with no visible cause. A forced removal remains possible,
+because a rule with no escape hatch gets bypassed rather than followed.
+
+`law` entries carry an **amendment chain** naming the hash each amendment supersedes, because "what does
+the rule say now" and "what did it used to say" are both questions a reader has, and only the second
+explains why something was done the old way.
+
+### A test that asserted nothing, found while writing it
+
+The compressed-removal case ended with `existsSync(join(..., 'nope'))` — a path that never exists, so the
+assertion could never be false. It now checks the real property: removal leaves no orphan on disk, because
+an index that forgets a file still on disk is how a store grows without anything being able to name what
+is in it.
+
+**24 tests, 0 failures.**
+
+## [0.10.1] — 2026-10-15
+
+**A service-health agent: measure, classify, recommend — never act.**
+
+### Why it only advises
+
+A component that both decides a server is unhealthy *and* changes that server is one bug away from
+deleting the thing it was protecting. The 2026-10-14 disk incident is the concrete example: the recovery
+was `truncate`, **not** `rm`, because rsyslog still held the file descriptor open, so removing the file
+would have freed nothing while appearing to succeed. A cleaner that had decided on its own to delete "the
+big log file" would have looked successful and changed nothing.
+
+### Where the thresholds come from — measurement, not taste
+
+- **Disk** — critical at 90% used *or* under 1 GB free; warn at 80%. The host reached 100% with 268 MB
+  free, which is the state this is for. The absolute floor matters independently: a huge filesystem can be
+  "only 85% used" and still have less headroom than a task needs.
+- **Log growth** — 14.7 GB/day is the measured rate that caused the incident. Any single file over 1 GB is
+  reported **by name**, because "the disk is filling" is not actionable and "this file is filling it" is.
+- **Load** — compared against CPU count, never an absolute number, because the consequence worth naming is
+  that a loaded machine starts expiring tasks at the ~50 s lease ceiling.
+- **Memory** — set where a host starts swapping, not where it looks comfortable.
+
+### Two defects the suite found in its own work
+
+- The critical load multiple was `loadPerCpuWarn * 2`, which **reads as a rule and is a coincidence** —
+  equal to 3.0 only while the warning threshold is 1.5, so changing one would silently move the other. Its
+  own test asserted the documented 1.5 / 3.0 pair and failed. It is now a named constant.
+- A test asserted `critical` for 4.0 load over 2 CPUs. 4 / 2 is 2.0 per CPU, between warn and critical.
+  **The implementation was right and the assertion was not.**
+
+### Permanent storage is a classification, not a copy
+
+`DATA_CLASSES` marks `memory.jsonl`, `device.json`, `device.key` and `fleet-memory.md` as
+`IRREPLACEABLE`. It copies nothing: deciding where data may live is a policy this module has no standing
+to make, and the honest half is saying which data cannot be regenerated.
+
+### A limitation measured rather than assumed
+
+`df` exists on Linux and macOS and not on Windows, so a Windows sample carries `disks: []`. The important
+part is that it is **empty** rather than filled with a healthy-looking default — an unmeasured disk must
+never read as free space. A test asserts the empty case on whichever host runs the suite.
+
+**20 tests, 0 failures.**
+
+## [0.10.0] — 2026-10-15
+
+**The cross-session approval index, and a syncer that refuses to wedge a repository.**
+
+### The approval index (roadmap v4.9.0)
+
+`approval-broker.mjs` answers approvals **per session**: a request belongs to one IM window and the
+operator answers it there. That is right for the person in that conversation and wrong for a supervisor,
+who by definition is not in it — the design's own words are that a supervisor reviews all agents' pending
+approvals *from one queue*. Without this, a request raised in a session nobody is watching sits until its
+deadline delegates it.
+
+The index presents pending work across sessions, filtered by what the viewer may act on, and verifies
+authority at the moment of decision. It decides nothing itself: `decide()` returns a verdict and the caller
+settles the broker, because the broker already owns settlement and a second settler would be a second owner
+of the same promise.
+
+Two choices worth stating. The subject's authority level is recorded **at raise time**, because it is a
+fact about who asked and must not be re-derived from a caller who might be the approver — an index that let
+the approver supply it would let the approver lower it. And `listFor` returns work the viewer **cannot**
+answer, with the reason, rather than filtering it out: a filtered list makes the fleet look idle at the
+moment it is most blocked.
+
+### `scripts/fleet-sync.mjs` — broadcast, sync, merge, with a decision
+
+Three defects were found by running it, two of them dangerous in production:
+
+- **A failed rebase wedged the repository.** No committer identity meant `git rebase` stopped part-way,
+  leaving a detached HEAD and `.git/rebase-merge` for a person to resolve. An automatic tool that can
+  wedge a repository is worse than one that does nothing. The identity is now checked before starting, and
+  a failure **aborts** the rebase to restore the exact previous state.
+- **A failed `rev-parse` was read as a ref name.** `git rev-parse <unknown>` **echoes the argument** to
+  stdout and then exits non-zero, so a failed lookup produced `{ok:false, out:'origin/main'}` — a plausible
+  ref name attached to a status saying it does not exist. `inspect` read `out` alone and reported a
+  repository with **no remote at all** as `ahead` with `ahead/behind: NaN/0`. Every ref lookup now uses
+  `--verify`, and an unparseable `rev-list` is `unreadable`/stop rather than falling through to a default.
+- **The published/unpublished safety test was dead code.** `published = local_only < ahead` can never be
+  true: `ahead` counts the commits absent from the remote-tracking branch and `--not --remotes` selects
+  exactly those commits. The real question is narrower — would this rebase rewrite a commit some remote ref
+  already reaches — and it is now answered by testing each local commit for reachability from the remotes.
+
+A finding that changed a test rather than the code: **on a single upstream, a "both sides published"
+divergence cannot exist.** If a local commit is reachable from `origin/main` then HEAD is its ancestor, so
+`behind` is 0 and there is no divergence. Three fixtures failed before that became clear. The reachable
+version of the hazard is a local commit some *other* remote ref already has — a branch pushed as a feature
+and then rewritten — and that is what the test now builds.
+
+**30 tests across the two, 0 failures**, against real repositories and a real bare remote: a mocked git
+would have been a test of the mock.
+
 ## [0.9.9] — 2026-10-15
 
 **Cognitive memory blocks (roadmap v4.8.0): field-level acceptance and lineage — and the first release whose suite was run on the fleet machine rather than on the development host.**
