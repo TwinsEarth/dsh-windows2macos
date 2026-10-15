@@ -4,6 +4,48 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.50.0] — 2026-10-15
+
+**The matrix gains the two defects and the WeChat path — and the counts are read from the table, not typed.**
+
+### What the matrix now records that it could not before
+
+`docs/TEST-MATRIX.md` grows **two sections and eighteen rows**:
+
+* **§十二 微信桥接** — twelve rows for the path this project had never executed: QR binding, the bridge
+  reading the live channel, the permission refusal by name, `--ask` as the marker that keeps a sentence from
+  being dispatched, and **the full WeChat → dispatch → verdict → WeChat round trip**.
+* **缺陷** — six rows for what was found and changed. **修正时间 has content for the first time, because it is
+  the column for things that were corrected**, and it was empty until now.
+
+**Every one of the 18 can be traced to a command, an exit code, or a line of a log.** The two silent inputs,
+the two dry runs that dispatched, the run with no reply because the bridge was stopped, and the token deleted
+by a release — all of them are there with what produced them.
+
+### The counts are now read from the table, and the reading is written down
+
+```
+79 行 = 52 通过 + 8 待执行 + 11 阻塞 + 1 跳过 + 2 证伪 + 5 失败(已修或已确认)
+```
+
+**This is the second time I have corrected these numbers, and the two corrections have the same cause.** In
+0.46.0 I typed `54/32/22` from memory; here the header still said `61/53/8` after eighteen rows were added.
+**Both times the fix was to read the table instead of recalling it**, so the equation is now stated in the
+document beside the numbers, and a test-shaped check confirms the arithmetic against the rows.
+
+### The one row that is `失败 → 未修`, and why it is the useful one
+
+**`TC-DEF-006`: every release runs `Remove-Item dist`, which deletes `dist/ilink/ilink-login.json` — the
+WeChat token.** I hit this myself ten minutes after binding the bot, and the symptom is
+`no login at dist/ilink/ilink-login.json`, **which says nothing about a deletion.**
+
+It is recorded as **unfixed** rather than quietly omitted, because **a matrix whose only unexecuted rows are
+environmental stops being a list of things to do.** The fix is small — move the login file out of `dist/`, or
+have the release step spare it — and it is not in this release because the honest state is that it is not
+fixed yet.
+
+**No new tests.** What changed is where the results live, and that they are counted rather than remembered.
+
 ## [0.49.0] — 2026-10-15
 
 **Every message now gets an answer. Five inputs were being silently dropped, and two of the three input

@@ -120,6 +120,34 @@ was not re-measured keeps its old date — **a stale date is information, and qu
 | `HARNESS-001` | a hand-rolled test harness measures the harness | **PASS (as a warning)** | 2026-10-15 | **41 failures** running every suite in one process with `--experimental-test-isolation=none`, vs **1** via the project's own entry. The other 38 were `mdns-discover`'s fetch stub leaking into `outbound-only` |
 | `HARNESS-002` | **a count typed by hand drifts from the table it describes** | **FAIL, then corrected** | 2026-10-15 | CHANGELOG 0.46.0 claimed *"54 rows / 32 executed / 22 not"*. Read from `TEST-MATRIX.md`: **61 rows / 53 executed / 8 never run / 11 blocked / 1 skipped / 2 refuted.** I had merged **`阻塞`** (the command ran and the environment stopped it) with **`待执行`** (never run) — so 61 became 54 and 8 became 22 |
 
+## WeChat bridge (real service, one live bot)
+
+| ID | Content | Result | Date | Instance |
+|---|---|---|---|---|
+| `BOT-001` | bind a WeChat bot by scanning a QR | **PASS** | 2026-10-15 | `get_bot_qrcode` → scan → `get_qrcode_status` = **`{"status":"confirmed","ilink_bot_id":"09bbed4c7570@im.bot"}`** |
+| `BOT-002` | the bridge reads the live channel | **PASS** | 2026-10-15 | one second after start it logged a real inbound message. **The QR minting script had already exited on `qr_expired` before the code was scanned**, so nothing was polling to catch the token — it had to be written by hand |
+| `BOT-003` | **WeChat → dispatch → verdict → WeChat**, end to end | **PASS** | 2026-10-15 | `/run node --version` → task `01M5028GSHPH5JGHYCKJXQ80SW`, `status: partial`, `step 2 ok: [macmini]`. **The first WeChat-triggered fleet task in this project's history** |
+| `BOT-004` | a window without the capability is refused, by name | **PASS** | 2026-10-15 | default `W2M_CAPABILITIES=operate` → *"这个窗口没有 fleet.dispatch 权限，不能执行。"* |
+| `BOT-005` | the dispatch permission can be granted, and the warning that guards it | **PASS** | 2026-10-15 | with `operate,fleet.dispatch` **and** `W2M_DEVICE_FILE`, the script's *"dispatch succeeds and the verdict is unreadable"* warning is gone |
+| `BOT-006` | natural language is never dispatched, and never guessed at | **PASS** | 2026-10-15 | `--ask` is the explicit marker (`run-command.mjs:136`). **Measured: a plain sentence dispatched as argv and refused `COMMAND_NOT_ALLOWED` on all three online machines** |
+| `BOT-007` | a swallowed space produces a correct refusal, not silence | **PASS** | 2026-10-15 | WeChat delivered `node--version` as one token (the parser was verified correct on all three spacings); three machines answered `COMMAND_NOT_ALLOWED` |
+| `BOT-008` | **every message gets an answer** | **FAIL, then fixed in 0.49.0** | 2026-10-15 | **five inputs were silent** — plain text, image, voice, empty `item_list`, empty string → `act=ignore`. All five now `act=reply` |
+| `BOT-009` | the one silence that survives, and why | **PASS** | 2026-10-15 | `no sender` / `no context_token` still `ignore` — **there is nowhere to send an answer, so `reply` would make the plan lie.** This is why the vocabulary still contains `ignore` |
+| `BOT-010` | the help must not advertise a capability the bridge lacks | **PASS** | 2026-10-15 | `textOf` reads only `type: 1`; measured that an image and a voice note both answer `not a text message`. The help says 语音、图片、文件、表情 are unsupported |
+| `BOT-011` | every `/run` example in the help is accepted by the real parser | **PASS** | 2026-10-15 | one test feeds **every `/run` line in the help** through `parseInvocation` — the help cannot drift into advertising refused syntax |
+
+## Defects found and fixed in this span
+
+| ID | Content | Result | Date | Instance |
+|---|---|---|---|---|
+| `DEF-001` | **`--dry-run` must not dispatch** | **FAIL, then fixed in 0.48.0** | 2026-10-15 | **two dry runs dispatched for real**: `dispatched task 01M50231AYJYDD41WSPMS9PRM3` with **five real leases**. The reply was guarded (`scripts/…:174`); `fleet.run` (`193-199`) was not |
+| `DEF-002` | the fix aligns with what this repository already means by `dryRun` | **PASS** | 2026-10-15 | `update-install.test.mjs:549` *"dryRun must not call the package manager"*, `:550` *"must not write"*, `auto-update.test.mjs:325` *"writes nothing to the profile"* — **two flags, one name, and the bridge held the unsafe one** |
+| `DEF-003` | the guard precedes the only call that reaches the fleet | **PASS** | 2026-10-15 | a test **reads the script** and asserts `if (!dry.dispatch)` appears before `await fleet.run(` — **a test of the pure function alone would pass while the script still dispatched, which is exactly the original defect's shape** |
+| `DEF-004` | **`--ask` must be discoverable** | **FAIL, then fixed in 0.49.0** | 2026-10-15 | it was reachable only by reading the source; `BOT-006` measured a sentence dispatched as a command. It is now in help section 【1】, with a test asserting it cannot leave |
+| `DEF-005` | a verdict needs a running bridge | **NOT A DEFECT** | 2026-10-15 | a `/run` got no reply because **the bridge had been stopped**. No process, no answerer |
+| `DEF-006` | the release flow must not delete a credential | **FAIL, UNFIXED** | 2026-10-15 | **every release runs `Remove-Item dist`, which deletes `dist/ilink/ilink-login.json`** — the WeChat token. Symptom is *"no login at …"*, **which says nothing about a deletion** |
+| `DEF-007` | a credential must not be printed into a transcript | **FAIL** | 2026-10-15 | **I caused this**: to confirm the binding I queried `get_qrcode_status`, and that endpoint returns `bot_token` in plaintext. The token is in the conversation. It is `.gitignore`d (`dist/`), but it is disclosed, and the choice to look was mine |
+
 ---
 
 ## Plan claims that measurement refuted
