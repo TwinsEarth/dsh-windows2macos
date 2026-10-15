@@ -13,7 +13,8 @@
 
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -233,5 +234,35 @@ describe('layer model: the real tree obeys the declared model', () => {
     const present = new Set(buildGraph().edges.map((e) => `${e.from} -> ${e.to}`));
     const unused = ALLOWED_EDGES.map(([a, b]) => `${a} -> ${b}`).filter((k) => !present.has(k));
     assert.deepEqual(unused, [], `declared but absent: ${unused.join(', ')}`);
+  });
+});
+
+describe('layer-check as a program: its EXIT STATUS has to mean something', () => {
+  it('exits zero when the tree is clean, and says so in the same breath', () => {
+    // This is the regression test for a defect that survived a hundred versions: the script printed
+    // \`clean: every cross-layer edge is declared\` and then called \`process.exit(1)\`.
+    //
+    // **Every reader that trusts the exit code -- a shell, CI, a script, \`&&\` -- read a passing check as a
+    // failing one**, and the pre-flight never noticed because its own step reads the PRINTED TEXT. So the
+    // assertion is deliberately on the STATUS and not on the output: a test that reads the message would
+    // have passed against the broken version, which is exactly what happened.
+    let status = 0;
+    let text = '';
+    try {
+      text = execFileSync(process.execPath, ['scripts/layer-check.mjs'], { cwd: process.cwd(), encoding: 'utf8' });
+    } catch (e) {
+      status = e.status ?? -1;
+      text = String(e.stdout ?? '');
+    }
+    assert.match(text, /clean: every cross-layer edge is declared/, 'the tree is clean, so this test is about the status');
+    assert.equal(status, 0, 'a clean check must exit 0, or nothing can gate on it');
+  });
+
+  it('still exits non-zero when there IS a violation, so it was not made green', () => {
+    // The other half, and the one that matters more: fixing a status must not turn the check into one that
+    // cannot fail. Read from the source rather than simulated, because a violation needs a broken tree.
+    const source = readFileSync(new URL('../scripts/layer-check.mjs', import.meta.url), 'utf8');
+    assert.match(source, /process\.exit\(result\.violations\.length > 0 \? 2 : 3\)/, 'the failure paths keep distinct non-zero codes');
+    assert.doesNotMatch(source, /clean: every cross-layer edge is declared\n'\);\s*\n\s*process\.exit\(1\)/, 'the clean path no longer exits 1');
   });
 });

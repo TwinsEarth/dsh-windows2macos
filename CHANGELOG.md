@@ -4,6 +4,55 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.42.0] — 2026-10-15
+
+**The README catches up with 62 versions — and gathering the numbers found a defect that had survived all of them.**
+
+### The progress section, in both languages
+
+The README's newest version reference was **v0.4.0**, thirteen times, and its install command pinned a
+**v0.6.3** tarball. **Thirty-four versions of work had no record in the file a newcomer reads first.**
+
+There is now a **Progress** section (with a matching 进度 section) built from the CHANGELOG rather than from
+memory: **62 versions since 0.8.0, 11 tools, 79 suites, 2199 tests, 12 pre-flight checks, 0 failures.** It
+carries the three properties the project set out to have, the roadmap's **delivered / partial** state per
+version, what the reachability work found, the measured-on-real-machines table, and an explicit **"this is not
+1.0.0"**.
+
+**The seven accepted orphans are listed with what would remove each one**, and the **three that are defects are
+named as defects** rather than folded in with the four libraries — because the import graph cannot tell them
+apart, and only a written reason can.
+
+### `layer-check` printed "clean" and exited 1
+
+Gathering the numbers meant running the checks and reading their output and their status side by side, and two
+of them contradicted each other:
+
+```
+clean: every cross-layer edge is declared
+exit=1
+```
+
+**The clean path called `process.exit(1)`.** Every reader that trusts the exit code — a shell, CI, a script,
+`&&` — **read a passing check as a failing one.**
+
+**The pre-flight never noticed, and the reason is the interesting part: its own step reads the PRINTED TEXT
+rather than the status.** A check can therefore be wrong for a hundred versions while the gate over it stays
+green. It now exits `0`, with the failure paths still distinct (`2` for a violation, `3` for unexplained), and
+a regression test asserts **the status rather than the message** — because a test that read the message would
+have passed against the broken version, which is exactly what happened.
+
+### Also corrected
+
+* the install instructions now say **how to verify you got the version you asked for**, because this
+  repository's own profile installed from a pinned tarball and **fell 30+ versions behind**. A successful
+  install and a current install are two different things.
+* both language halves now name **`pnpm`** as the fallback where `npm` is absent — which is the case in the
+  packaged DSH runtime this was tested against.
+* one dead in-page anchor, from assuming GitHub's slugger keeps an em dash. It does not.
+
+**2 new tests, 0 failures.**
+
 ## [0.41.0] — 2026-10-15
 
 **`field-authority.mjs` has a caller. The correction from 0.29.0 lands, six versions after the claim.**

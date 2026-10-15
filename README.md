@@ -14,6 +14,71 @@ English | [中文](#中文说明)
 
 ---
 
+## Progress — where this actually is
+
+**Current: `0.41.0`.** 62 versions since `0.8.0`. The number that matters more than the version:
+**11 tools, 79 suites, 2199 tests, 12 pre-flight checks, 0 failures.**
+
+### The three properties this project set out to have
+
+| Property | State | What it means concretely |
+|---|---|---|
+| **分模块** (modular) | **enforced** | every file belongs to exactly one declared layer; `layer-check` fails on an undeclared edge |
+| **分层级** (layered) | **enforced** | six ranked layers and an **allow-list** of edges — not a rule that can be interpreted, a list that can be read |
+| **分权限** (tiered authority) | **built, opt-in** | four bands, escalation moves **exactly one band**, nothing destructive auto-settles. **Off by default** — see the gap below |
+
+### Roadmap
+
+| Version | Deliverable | State |
+|---|---|---|
+| **v4.8.0** | field-level acceptance, MMP P1/P2, lineage | **delivered** — `w2m_memory` accepts a received CAT7 block **field by field at the actor's level**; a field that costs more than the actor has is **omitted, not nulled**; a block naming an ancestor the caller cannot produce is **refused, never re-rooted** |
+| **v4.9.0** | approval queue | **partial** — the queue, the escalation bridge and the raise-limiter are wired and reachable by an operator through `w2m_approvals`. **The "front door" named in the roadmap was never built**: `approval-index.mjs` imports `authority.mjs` and nothing else |
+| **v4.10.0** | committee governance | **delivered** — seven phases, weighted votes, **a tie is refused rather than broken**, and a sealed decision is **retrievable with its dissent and its reasons** after the council that produced it is gone |
+
+### What the reachability work found, because it is the honest part
+
+Three mechanisms were shipped in this span **fully tested and reachable by nothing** — `field-authority`,
+`approval-gate`, and `council`. Two were **described as delivered** while nothing ran them. A single `grep`
+disproved one of them.
+
+There is now a **gate**: a module nothing reaches makes the pre-flight **red** unless it appears in
+`scripts/accepted-orphans.mjs` **with a reason and a statement of what would remove it**. An acceptance that
+outlives its cause also fails. **Seven remain**:
+
+| Module | Kind | What would remove it |
+|---|---|---|
+| `health.mjs` | **defect** | the agent calling it on a schedule |
+| `log-bounds.mjs` | **defect** | the same — it is the answer to a **measured 40× log growth** |
+| `storage.mjs` | **defect** | a tool writing through its undelatable tiers |
+| `fleet-scale.mjs`, `fleet-state.mjs`, `exit-channel.mjs`, `test-report.mjs` | library | a caller, when one is wanted |
+
+**The defect class is named as a defect rather than folded in with the libraries**, because the two are
+indistinguishable from the import graph alone and only a written reason can separate them.
+
+### The gap that matters most right now
+
+**The plugin this machine runs is 30+ versions behind this source tree.** Every source-level conclusion about
+the running runtime is void until it is upgraded — which is one command, and it is in
+[Install](#3-the-dsh-plugin).
+
+### Measured on real machines
+
+| Fact | Evidence |
+|---|---|
+| a **seven-phase council** runs on macOS | `exit 0` on MacMini: phases 7, dissent retained, recount reproduced |
+| **field-level acceptance** holds on macOS | `exit 0` on MacMini: level 0 cannot reach `evidence`, level 70 can, tampering caught, a missing ancestor refused rather than re-rooted |
+| the fleet is **3 usable machines of 5 paired** | and `fleet-scale.mjs` **refuses to extrapolate** from five |
+| **`P2P_PUNCH_FAILED`** | **UNVERIFIED.** Three hypotheses measured and excluded (BLAKE2s-256, the wider primitive set, version skew). **The plugin that raises it runs 0.9.5** — upgrading is the next experiment |
+
+### Not claimed
+
+**This is not 1.0.0.** `docs/1.0.0-ACCEPTANCE.md` sorts all 30 criteria into **ENFORCED / MEASURED /
+UNVERIFIED** by a rule rather than an opinion, names **seven claims this work had to retract**, and states
+plainly that four of its own closing items are undone. It is bound to the pre-flight by a test, so a criterion
+cannot quietly become unenforced while the file keeps claiming otherwise.
+
+---
+
 ## The problem
 
 You have a Windows desktop and a Mac laptop. You are working on one project. You
@@ -250,8 +315,17 @@ dsh plugin --profile <profile-name> add @twinsearth/w2m-dsh-plugin
 
 ```bash
 dsh plugin --profile <profile-name> add \
-  https://github.com/TwinsEarth/dsh-windows2macos/releases/download/v0.6.3/twinsearth-w2m-dsh-plugin-0.6.3.tgz
+  https://github.com/TwinsEarth/dsh-windows2macos/releases/download/v0.41.0/twinsearth-w2m-dsh-plugin-0.41.0.tgz
 ```
+
+This form **pins a version by construction**, which is both its virtue and the trap: a
+profile that installs this way stays on that version forever unless somebody edits the
+line. **This repository's own profile did exactly that and fell 30+ versions behind** —
+so if you use it, re-check the number against the badge at the top of this file.
+
+**No `npm`?** Some hosted runtimes (including the packaged DSH) ship `node` and `pnpm`
+but not `npm`. `pnpm add @twinsearth/w2m-dsh-plugin@0.41.0 --save-exact` installs the
+identical tarball from the identical registry.
 
 **From the repository** — the form a marketplace's one-click installer uses (it clones
 the repo, builds nothing, and registers `cordis.patch.yml`):
@@ -269,6 +343,14 @@ answer, not three.
 > `node_modules` **and** a row in the profile's `cordis.patch.yml`. A bundle that is
 > listed in `package.json` but never composed is the failure this project hit once
 > already — see `cordis.patch.yml`'s header for what that looked like.
+
+**Then check the version you actually got**, because a successful install and a current
+install are two different things:
+
+```
+w2m_status   →  actor_authority and approvals should be present (0.9.5 has neither)
+tool list    →  w2m_council should be present (it arrived in 0.37.0; anything older lacks it)
+```
 
 Then give it the relay URL in that profile's `cordis.patch.yml` — or leave
 `rabbitUrl` empty to use the shared server:
@@ -532,6 +614,10 @@ Read this before exposing the relay to anything.
 
 This project's rule is that claims carry their evidence.
 
+> **Current state lives in [Progress](#progress-where-this-actually-is) above.** What follows is the
+> **v0.4.0 record**, kept because it is the measurement the direct path still rests on — not because it
+> describes what ships today. The version is now `0.41.0`.
+
 ### v0.4.0 — the direct path is the default, and here is what that is worth
 
 v0.3.9 shipped the P2P transport and admitted in its own §8 that nothing read
@@ -778,6 +864,60 @@ When something does not work, start from the symptom: [TROUBLESHOOTING.md](TROUB
 
 **同一个 DeepSeek 账号，一条指令，让在线的 Windows 与 Mac 跑同一个项目。**
 
+### 进度 —— 它现在到底到哪一步了
+
+**当前版本：`0.41.0`**。自 `0.8.0` 以来共 **62 个版本**。比版本号更重要的数字是：
+**11 个工具、79 个测试套件、2199 个用例、12 项预检、0 失败。**
+
+#### 三项目标本来的属性
+
+| 属性 | 状态 | 具体含义 |
+|---|---|---|
+| **分模块** | **已强制** | 每个文件属于且只属于一个已声明的层；出现未声明的依赖边，`layer-check` 直接失败 |
+| **分层级** | **已强制** | 六个带序号的层，以及一张**允许清单**——不是一条可以被解读的规则，而是一张可以被读的清单 |
+| **分权限** | **已建成，需手动开启** | 四个权限带、升级**恰好一级**、破坏性操作**永不自动放行**。**默认关闭**，见下方缺口 |
+
+#### 路线图
+
+| 版本 | 交付物 | 状态 |
+|---|---|---|
+| **v4.8.0** | 字段级接受、MMP P1/P2、lineage | **已交付** —— `w2m_memory` 接收来自其他机器的 CAT7 认知块，**按字段、按接收方的权限级别**逐项接受；接收方买不起的字段**是「缺席」，不是 null**；祖先无法产出时**拒绝，绝不重新生根** |
+| **v4.9.0** | 审批队列 | **部分完成** —— 队列、升级桥、发起限流器都已接线，操作者可通过 `w2m_approvals` 处理。**但路线图里写的那道「前门」从未构建**：`approval-index.mjs` 只导入 `authority.mjs`，别无其他 |
+| **v4.10.0** | 委员会治理 | **已交付** —— 七个阶段、加权投票、**平票是拒绝而不是打破**；封印的决定在产生它的委员会消失之后，**仍可连异议和异议的理由一起取回** |
+
+#### 可达性检查发现了什么（这部分才是诚实的部分）
+
+这一跨度里有**三个机制被完整实现、完整测试、却没有任何东西能到达**——`field-authority`、`approval-gate`、`council`。其中**两个在被描述为「已交付」时，没有任何东西在跑它们**。一条 `grep` 就推翻了其中一个。
+
+现在有**门禁**了：一个没人能到达的模块会让预检**变红**，除非它出现在 `scripts/accepted-orphans.mjs` 里，**并写明理由和「什么能让它下榜」**。已经修好的条目若还留在清单上，同样失败。**目前还剩 7 个**：
+
+| 模块 | 性质 | 什么能让它下榜 |
+|---|---|---|
+| `health.mjs` | **缺陷** | agent 按计划调用它 |
+| `log-bounds.mjs` | **缺陷** | 同上——它是对**实测到的 40 倍日志增长**的答案 |
+| `storage.mjs` | **缺陷** | 有工具真正通过它的「不可删除」层写入 |
+| `fleet-scale.mjs`、`fleet-state.mjs`、`exit-channel.mjs`、`test-report.mjs` | 库 | 需要时给它们调用方 |
+
+**「缺陷」这一类被单独命名，而不是和「库」混在一起**——因为仅凭导入图这两者无法区分，**只有写下来的理由能分开它们**。
+
+#### 眼下最要紧的那个缺口
+
+**本机实际运行的插件比这份源码落后 30 多个版本。** 在升级之前，**任何关于运行时行为的源码级结论都作废**。升级只需一条命令，见[快速开始](#快速开始)第 3 步。
+
+#### 在真机上实测到的
+
+| 事实 | 证据 |
+|---|---|
+| **七阶段委员会**能在 macOS 上跑通 | MacMini `exit 0`：7 个阶段、异议被保留、`recount` 复现成功 |
+| **字段级接受**在 macOS 上成立 | MacMini `exit 0`：级别 0 拿不到 `evidence`、级别 70 拿得到、篡改被抓、**缺祖先时拒绝而不重新生根** |
+| 编队是**5 台配对中 3 台可用** | 而 `fleet-scale.mjs` 因此**拒绝外推** |
+| **`P2P_PUNCH_FAILED`** | **未验证。** 三个假设已测量并排除（BLAKE2s-256、更广的原语集、版本偏差）。**抛出它的是跑着 0.9.5 的插件**——升级就是下一个实验 |
+
+#### 不作声明
+
+**这不是 1.0.0。** `docs/1.0.0-ACCEPTANCE.md` 把全部 30 条准则按**一条规则**（而非观点）分成
+**已强制 / 已测量 / 未验证**三类，列出**这一跨度不得不撤回的 7 条声明**，并明说它自己收尾清单里的四项尚未完成。它被一个测试**绑定到预检**，所以**一条准则不可能在文件仍声称它被强制的同时悄悄变成未被强制**。
+
 ### 为什么需要它
 
 DSH 目前**不能**跨机器协作，而且不是疏忽：
@@ -817,8 +957,21 @@ node bin/w2m-localside.mjs --rabbit http://<中继地址>:8787 --pair PAIR-XXXXX
   --allowed-commands '["node --test","git status --porcelain"]'
 
 # 3) 装 DSH 插件
-dsh plugin --profile <profile-name> add \
-  https://github.com/TwinsEarth/dsh-windows2macos/releases/download/v0.6.3/twinsearth-w2m-dsh-plugin-0.6.3.tgz
+#    v0.4.0 起可从 npm 装（比逐个指定 release 的 tgz 更好：不会锁死在某个旧版本上）。
+#    本仓库自己的 profile 就一直锁在一个本地 0.9.5 的 tgz 上，结果落后了 30 多个版本。
+npm install @twinsearth/w2m-dsh-plugin@latest
+#    或者，如果你想钉死一个具体版本：
+#    npm install @twinsearth/w2m-dsh-plugin@0.41.0
+#
+#    没有 npm 的托管运行时（DSH 打包版就是这种）用 pnpm 即可，同一个 registry、同一份 tarball：
+#    pnpm add @twinsearth/w2m-dsh-plugin@0.41.0 --save-exact
+```
+
+装完后**重启 DSH**，然后确认版本对上了——这一步别跳过，因为**本仓库自己就在这里栽过**：
+
+```
+w2m_status  →  应能看到 actor_authority 与 approvals 两个字段（0.9.5 没有）
+工具列表    →  应能看到 w2m_council（旧版只有 8 个工具）
 ```
 
 然后在 profile 的 `cordis.patch.yml` 里给插件 `rabbitUrl`（留空即用共享服务器）与 `operatorToken`，重启 DSH，即可直接用自然语言指挥：

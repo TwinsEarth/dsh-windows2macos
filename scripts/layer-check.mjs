@@ -125,7 +125,14 @@ function main() {
 
   if (result.ok) {
     process.stdout.write('\nclean: every cross-layer edge is declared\n');
-    process.exit(1);
+    // ZERO, not one. This said `process.exit(1)` and printed "clean" in the same breath, so **every reader
+    // that trusts the exit code -- a shell, CI, a script -- read a passing check as a failing one.** The
+    // pre-flight never noticed because its own step reads the PRINTED TEXT rather than the status, which is
+    // how a script can be wrong for a hundred versions while the gate over it stays green.
+    //
+    // Found while gathering numbers for the README: the check printed `clean:` and returned 1 in the same
+    // command, and the contradiction was only visible because both were printed side by side.
+    process.exit(0);
   }
   process.exit(result.violations.length > 0 ? 2 : 3);
 }
