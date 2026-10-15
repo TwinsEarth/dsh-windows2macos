@@ -1118,6 +1118,7 @@ function safeFilePart(value) {
  */
 function canonicalJson(value) {
   if (value === undefined) return 'null';
+
   if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
   if (Array.isArray(value)) return `[${value.map((entry) => canonicalJson(entry)).join(',')}]`;
   const keys = Object.keys(value).sort();
@@ -3087,8 +3088,25 @@ function readAggregate(body) {
  * @param {object} p2p The block from {@link readP2PStatus}.
  * @returns {string[]}
  */
-function statusNotes(relay, rtt, cfg, p2p) {
+function statusNotes(relay, rtt, cfg, p2p, approvalsNote = null) {
   const notes = [];
+
+  /**
+   * v0.26.0: blocked work announces itself.
+   *
+   * The whole reason the count is in `w2m_status` at all. A note is what a caller reads without asking a
+   * further question, and "three dispatches are waiting for an approver" is the single most actionable
+   * sentence this tool can emit: the fleet is not idle, it is stopped, and it is stopped on a person.
+   *
+   * It is placed first because ordering is the only emphasis a list of notes has.
+   */
+  if (approvalsNote !== null && Number.isFinite(approvalsNote.pending) && approvalsNote.pending > 0) {
+    notes.push(
+      `${approvalsNote.pending} dispatch(es) are WAITING FOR AN APPROVER and will not run until one answers; ` +
+        `read them with \`w2m_approvals\`${approvalsNote.overdue > 0 ? ` (${approvalsNote.overdue} past their deadline)` : ''}` +
+        `${Number.isFinite(approvalsNote.oldest_waiting_ms) ? `; the oldest has been waiting ${Math.round(approvalsNote.oldest_waiting_ms / 1000)}s` : ''}`,
+    );
+  }
 
   /**
    * §7's one-line note, and the reason it exists at all: the shared server is a *default*, and a
@@ -3777,8 +3795,12 @@ export async function apply(ctx, config = {}) {
             'W2M_PERMISSION_NEEDS_APPROVAL: ' + gate.decision.detail,
             {
               hint: 'this dispatch is queued awaiting an approver; approve or reject it with w2m_approvals, then dispatch again',
-              approval_id: raised.approval_id,
-              request,
+              // Carried in `detail`, not as top-level options: `W2MError` accepts only code, message, hint,
+              // detail, cause and reason_code, so anything else passed here is DROPPED SILENTLY. The first
+              // version of this passed `approval_id` at the top level and the test caught it by finding
+              // nothing -- which is exactly the kind of omission that would otherwise have reached a user as
+              // "await approval" with no way to name what they are waiting for.
+              detail: { approval_id: raised.approval_id, request },
             },
           );
         }
@@ -4327,6 +4349,45 @@ export async function apply(ctx, config = {}) {
       await p2p.ensureStarted();
       const p2pStatus = await readP2PStatus(cfg, p2p, Number.isInteger(relay.peers_announced) ? relay.peers_announced : null);
 
+      /**
+      * v0.26.0: how much work is waiting for an approver.
+      *
+      * ## Why it belongs in `w2m_status` rather than only in `w2m_approvals`
+      *
+      * A queue that is only visible to someone who remembers to look at it is a queue that stays full,
+      * and a fleet that is blocked on approval looks exactly like a fleet that is idle. This makes the
+      * blocked state **report itself**, which is the difference between a tool an operator has and a
+      * signal an operator receives.
+      *
+      * `constructed` distinguishes "nothing is waiting" from "nothing has ever asked". They are the same
+      * number and very different facts, and a machine that never tripped the permission gate should not
+      * be described as having an empty queue as though that were a measurement.
+      */
+      const approvalsBlock = (() => {
+      if (approvals === null) {
+      return {
+      constructed: false,
+      pending: null,
+      detail: 'no approval has ever been requested on this machine, so no queue exists yet; this is not the same as an empty queue',
+      };
+      }
+      const pendingRows = approvals.all();
+      const overdue = pendingRows.filter((r) => r.overdue === true).length;
+      return {
+      constructed: true,
+      pending: pendingRows.length,
+      overdue,
+      // The oldest request is the one whose loss costs most, so it is reported rather than left for a
+      // reader to sort out of the rows.
+      oldest_waiting_ms: pendingRows.length === 0
+      ? null
+      : Math.max(...pendingRows.map((r) => r.waiting_ms ?? 0)),
+      detail: pendingRows.length === 0
+      ? 'the queue exists and nothing is waiting'
+      : `${pendingRows.length} dispatch(es) waiting for an approver${overdue > 0 ? `, ${overdue} overdue` : ''}`,
+      };
+      })();
+
       return JSON.stringify(
         {
           ok: true,
@@ -4416,7 +4477,8 @@ export async function apply(ctx, config = {}) {
               : targetRoutes.reason,
             sessions_with_a_target: defaultSelectionStore.list().length,
           },
-          notes: statusNotes(relay, rtt, cfg, p2pStatus),
+          approvals: approvalsBlock,
+          notes: statusNotes(relay, rtt, cfg, p2pStatus, approvalsBlock),
         },
         null,
         2,

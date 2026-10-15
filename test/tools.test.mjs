@@ -2627,6 +2627,85 @@ describe('v0.1.2 cross-region diagnostics', () => {
 });
 
 describe('w2m_approvals: the tool an approver reaches for', () => {
+  it('takes a real dispatch from a refusal, through the queue, to a status that announces it', async () => {
+    // The whole point of putting the count in `w2m_status`: a fleet blocked on approval looks exactly like an
+    // idle fleet unless the blocked state reports itself. This drives the real sequence across three tools
+    // rather than asserting on `statusNotes` in isolation.
+    const { tools } = await register({
+      rabbitUrl: RABBIT,
+      stateDir: await makeStateDir(PAIRED_DEVICE),
+      operatorToken: OPERATOR_TOKEN,
+      // An ordinary actor: one band below the captain that `dispatch_writing` requires.
+      actorAuthorityLevel: 49,
+    });
+
+    // Before anything is asked, the status must not describe an empty queue as though it were a measurement.
+    const before = JSON.parse(await tools.get('w2m_status').execute({}, {}));
+    assert.equal(before.approvals.constructed, false);
+    assert.equal(before.approvals.pending, null);
+    assert.match(before.approvals.detail, /not the same as an empty queue/);
+    assert.equal(
+      before.notes.some((n) => /WAITING FOR AN APPROVER/.test(n)),
+      false,
+      'a machine nobody has asked anything of must not claim to be blocked',
+    );
+
+    // The writing dispatch is refused -- and refused WITH the id of a queued request.
+    let raised = null;
+    await assert.rejects(
+      () => tools.get('w2m_run').execute(runArgs({ write: true, write_scope: ['src/'] }), {}),
+      (error) => {
+        raised = error;
+        assert.match(error.message, /W2M_PERMISSION_NEEDS_APPROVAL/);
+        return true;
+      },
+    );
+    // The payload lives in `detail`: `W2MError` accepts only code, message, hint, detail, cause and
+    // reason_code, so a top-level `approval_id` would be dropped silently.
+    assert.equal(raised.detail.request.capability, 'dispatch_writing');
+    assert.equal(raised.detail.request.subject_level, 49, 'the subject level is recorded at raise time');
+    assert.ok(
+      typeof raised.detail.approval_id === 'string' && raised.detail.approval_id.length > 0,
+      'the refusal must name the queued request, or a caller cannot tell what it is waiting for',
+    );
+
+    // …and the status now says the fleet is stopped, without anyone asking about approvals specifically.
+    const after = JSON.parse(await tools.get('w2m_status').execute({}, {}));
+    assert.equal(after.approvals.constructed, true);
+    assert.equal(after.approvals.pending, 1);
+    assert.equal(after.approvals.overdue, 0);
+    const blocking = after.notes.filter((n) => /WAITING FOR AN APPROVER/.test(n));
+    assert.equal(blocking.length, 1, 'exactly one note, and it is the actionable one');
+    assert.match(blocking[0], /will not run until one answers/);
+    assert.match(blocking[0], /w2m_approvals/);
+
+    // The queue the note points at holds the request, and it is the same id.
+    //
+    // NOTE THE `actor_id`. The request recorded its subject as this machine's name, because nothing else was
+    // supplied at dispatch time; an approver who defaults to that same name IS the subject, and the index
+    // refuses a self-approval by name. That is correct behaviour and a real consequence of the defaults, so
+    // this names a different approver rather than working around the refusal.
+    const asSelf = JSON.parse(await tools.get('w2m_approvals').execute({ action: 'list', actor_level: 50 }, {}));
+    assert.equal(asSelf.rows[0].may_act, false, 'the default approver is the requester, and the index knows it');
+    assert.equal(asSelf.rows[0].why_not.reason_code, 'APPROVAL_SELF_APPROVAL');
+
+    const listed = JSON.parse(await tools.get('w2m_approvals').execute({ action: 'list', actor_level: 50, actor_id: 'supervisor' }, {}));
+    assert.equal(listed.count, 1);
+    assert.equal(listed.rows[0].approval_id, raised.detail.approval_id);
+    assert.equal(listed.rows[0].may_act, true, 'a captain is the level this escalation was addressed to');
+
+    // Settling it clears the signal, so a reader is not left with a warning about work already answered.
+    const settled = JSON.parse(
+      await tools
+        .get('w2m_approvals')
+        .execute({ action: 'approve', approval_id: raised.detail.approval_id, actor_level: 50, actor_id: 'supervisor' }, {}),
+    );
+    assert.equal(settled.ok, true, settled.detail);
+    const cleared = JSON.parse(await tools.get('w2m_status').execute({}, {}));
+    assert.equal(cleared.approvals.pending, 0);
+    assert.equal(cleared.notes.some((n) => /WAITING FOR AN APPROVER/.test(n)), false);
+  });
+
   it('lists an empty queue rather than failing on it', async () => {
     // A queue with nothing waiting is the normal state, not an error. The tool has to say so without making
     // it indistinguishable from "the queue is broken".

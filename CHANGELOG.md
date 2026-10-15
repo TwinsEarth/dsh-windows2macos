@@ -4,6 +4,51 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.27.0] — 2026-10-15
+
+**A blocked fleet reports itself. The approval count is in `w2m_status`, and it arrives as a note.**
+
+A queue visible only to someone who remembers to look at it is a queue that stays full, and **a fleet blocked
+on approval looks exactly like an idle fleet.** `w2m_status` now carries an `approvals` block and, when
+anything is waiting, a note placed **first** — ordering being the only emphasis a list of notes has:
+
+> *"3 dispatch(es) are WAITING FOR AN APPROVER and will not run until one answers; read them with
+> `w2m_approvals` (1 past their deadline); the oldest has been waiting 240s"*
+
+### `constructed: false` is not `pending: 0`
+
+A machine that has never tripped the permission gate should not be described as having an empty queue **as
+though that were a measurement.** The block says which it is, and the note is emitted only for real pending
+work.
+
+### The whole chain, across three tools, asserted end to end
+
+An ordinary actor (49) attempts a write → refused with `W2M_PERMISSION_NEEDS_APPROVAL` **carrying the queued
+id** → `w2m_status` reports `pending: 1` and the blocking note **without being asked about approvals** → a
+captain settles it → the signal clears.
+
+### The default approver is the requester, and the index says so
+
+The test discovered this rather than assuming it: a request records its subject as the machine's name, and an
+approver who **defaults to that same name is the subject** — so `may_act` is false with
+`APPROVAL_SELF_APPROVAL`. That is correct, and it is a real consequence of the defaults rather than a bug. The
+test now names a distinct approver and **asserts the refusal first**, so the self-approval rule is pinned
+rather than sidestepped.
+
+### A payload silently dropped, caught by a test that found nothing
+
+`W2MError` accepts only `code`, `message`, `hint`, `detail`, `cause` and `reason_code`. The first version
+passed `approval_id` and `request` as **top-level options**, so they were **discarded without complaint** and
+the refusal told a caller to await approval **with no way to name what they were waiting for.** They now
+travel in `detail`, and the constructor's accepted keys are named in a comment beside the call.
+
+Two of my own errors in this round were the same shape as the ones before it: a block hoisted into the **wrong
+scope** (module level instead of inside `execute`, which `node --check` accepted because the name existed
+*somewhere*), and a syntactic fix that put a statement **inside an object literal**. Both were caught by
+running the suite, not by reading.
+
+**1 new cross-tool test, 0 failures.**
+
 ## [0.26.0] — 2026-10-15
 
 **`w2m_approvals`: the approval chain is reachable by an operator, not only by the suite.**
