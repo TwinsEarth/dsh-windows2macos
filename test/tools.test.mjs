@@ -2678,6 +2678,86 @@ describe('w2m_run: the authority level is chosen by name', () => {
     assert.equal(Object.prototype.hasOwnProperty.call(status.actor_authority, 'choices'), false);
   });
 });
+describe('w2m_run: requiring a level is a policy, not a default', () => {
+  it('starts without a level when the policy is off, and says the gate is unenforced', async () => {
+    // The behaviour every existing machine has. It has to keep working, or an upgrade becomes an outage.
+    const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
+    const status = JSON.parse(await tools.get('w2m_status').execute({}, {}));
+    assert.equal(status.actor_authority.ok, false);
+    assert.equal(status.actor_authority.required, false);
+    assert.match(status.actor_authority.detail, /gate is not enforced/);
+  });
+
+  it('refuses to start when the policy is on and no level was chosen', async () => {
+    // The gap 1.0.0-ACCEPTANCE.md §3.11 records, closed for a machine that asks for it to be closed.
+    const stateDir = await makeStateDir(PAIRED_DEVICE);
+    await assert.rejects(
+      () => register({ rabbitUrl: RABBIT, stateDir, operatorToken: OPERATOR_TOKEN, requireAuthorityLevel: true }),
+      (error) => {
+        assert.equal(error.reason_code, 'AUTHORITY_CHOICE_NOT_CHOSEN');
+        assert.match(error.message, /is required on this machine/);
+        assert.match(error.hint, /ordinary, captain, org_admin, system_admin/, 'the refusal names what would work');
+        return true;
+      },
+    );
+  });
+
+  it('refuses to start when the policy is on and the level is unusable', async () => {
+    const stateDir = await makeStateDir(PAIRED_DEVICE);
+    // The refusal code is on `reason_code`, not in the message: that field is what a consumer branches on,
+    // so it is what the test pins. The first version matched the code against the message and failed.
+    for (const bad of ['king', 101, 'Captain']) {
+      await assert.rejects(
+        () => register({ rabbitUrl: RABBIT, stateDir, operatorToken: OPERATOR_TOKEN, requireAuthorityLevel: true, actorAuthorityLevel: bad }),
+        (error) => {
+          assert.equal(error.reason_code, 'AUTHORITY_CHOICE_UNKNOWN', JSON.stringify(bad));
+          assert.match(error.message, /is required on this machine/);
+          return true;
+        },
+      );
+    }
+  });
+
+  it('starts with the policy on once a level is chosen, and reports that it is required', async () => {
+    const { tools } = await register({
+      rabbitUrl: RABBIT,
+      stateDir: await makeStateDir(PAIRED_DEVICE),
+      operatorToken: OPERATOR_TOKEN,
+      requireAuthorityLevel: true,
+      actorAuthorityLevel: 'captain',
+    });
+    const status = JSON.parse(await tools.get('w2m_status').execute({}, {}));
+    assert.equal(status.actor_authority.ok, true);
+    assert.equal(status.actor_authority.level, 50);
+    assert.equal(status.actor_authority.required, true, 'a reader can tell this machine opted in');
+  });
+
+  it('does not let the environment turn the policy ON by being set to a falsy-looking string', async () => {
+    // `W2M_REQUIRE_AUTHORITY_LEVEL=0` means off. A truthiness test would read "0" as set-and-therefore-on,
+    // which would refuse to start a machine whose operator explicitly wrote zero.
+    const previous = process.env.W2M_REQUIRE_AUTHORITY_LEVEL;
+    try {
+      process.env.W2M_REQUIRE_AUTHORITY_LEVEL = '0';
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
+      const status = JSON.parse(await tools.get('w2m_status').execute({}, {}));
+      assert.equal(status.actor_authority.required, false, '"0" must mean off');
+
+      process.env.W2M_REQUIRE_AUTHORITY_LEVEL = 'yes';
+      const rejecting = await makeStateDir(PAIRED_DEVICE);
+      await assert.rejects(
+        () => register({ rabbitUrl: RABBIT, stateDir: rejecting, operatorToken: OPERATOR_TOKEN }),
+        (error) => {
+          assert.equal(error.reason_code, 'AUTHORITY_CHOICE_NOT_CHOSEN');
+          return true;
+        },
+      );
+    } finally {
+      if (previous === undefined) delete process.env.W2M_REQUIRE_AUTHORITY_LEVEL;
+      else process.env.W2M_REQUIRE_AUTHORITY_LEVEL = previous;
+    }
+  });
+});
+
 describe('w2m_run: the approval gate is on the raise path, not merely available', () => {
   it('refuses a second raise in the window, and does not create the request it refused', async () => {
     // The whole reason for wiring the gate: a mechanism with no caller cannot be told from a finished

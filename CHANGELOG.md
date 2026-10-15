@@ -4,6 +4,54 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.34.0] — 2026-10-15
+
+**`requireAuthorityLevel`: the policy that makes 分权限 real, and why it is a flag rather than a default.**
+
+`docs/1.0.0-ACCEPTANCE.md` §3.11 recorded the gap plainly — the gate is **off unless configured**, so a
+default install dispatches exactly as it did before the permission model existed, and **"off unless
+configured" cannot be part of a 1.0.0 that claims 分权限.**
+
+`requireAuthorityLevel: true` (or `W2M_REQUIRE_AUTHORITY_LEVEL`) closes it for a machine that asks. Measured,
+the whole truth table:
+
+| `requireAuthorityLevel` | level | result |
+|---|---|---|
+| off | unset | **starts**, gate unenforced |
+| off | chosen | starts, gate enforced |
+| **on** | **unset** | **refuses to start** — `AUTHORITY_CHOICE_NOT_CHOSEN` |
+| **on** | **unusable** | **refuses to start** — `AUTHORITY_CHOICE_UNKNOWN` |
+| on | chosen | starts, gate enforced |
+
+A refusal names the four choices, so it is fixable from the message alone, and a machine that opted in says
+so in `w2m_status` — a reader can tell "asked and answered" from "never asked".
+
+### Why opt-in, which is a deliberate limit rather than a hedge
+
+Refusing unconditionally would be the honest reading of *"a permission system that is off is untested in
+production"* — and it would also **stop every machine running an earlier version the moment it upgraded**,
+because none of them has a level. That trade is one silent failure for a loud outage, and **an outage is not
+a security property.**
+
+**So the gap is narrowed, not closed, and the document says so** rather than letting the flag's existence
+imply otherwise. A fleet that never sets it is exactly as unenforced as before.
+
+### `W2M_REQUIRE_AUTHORITY_LEVEL=0` means off
+
+Asserted, because a truthiness test would read the string `"0"` as set-and-therefore-on and **refuse to start
+a machine whose operator explicitly wrote zero.**
+
+### My own errors, both of them syntax rather than logic
+
+* I wrote `await` inside a **non-async arrow** passed to `assert.rejects`, which does not parse. `node --check`
+  caught it immediately; the fix is to compute the state directory first, because making the arrow async would
+  change what it does.
+* I asserted refusal codes against the **message text**; the codes live on `error.reason_code`, which is the
+  field a consumer branches on. **The code was correct and the assertion was looking in the wrong place** —
+  now it pins the field.
+
+**6 new tests, 0 failures.**
+
 ## [0.33.0] — 2026-10-15
 
 **The authority level is chosen by name. Nobody types a number.**

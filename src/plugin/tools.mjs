@@ -720,6 +720,40 @@ function readConfig(config = {}) {
         ? process.env.W2M_ACTOR_AUTHORITY.trim()
         : undefined;
       const resolved = resolveConfiguredLevel(fromEnv !== undefined ? fromEnv : config.actorAuthorityLevel);
+
+      /**
+       * v0.34.0: the policy that makes 分权限 real, and why it is a policy rather than a default.
+       *
+       * `docs/1.0.0-ACCEPTANCE.md` §3.11 records the gap plainly: the gate is **off unless configured**, so a
+       * default install dispatches exactly as it did before the permission model existed, and **"off unless
+       * configured" cannot be part of a 1.0.0 that claims 分权限.**
+       *
+       * `requireAuthorityLevel: true` closes it: with the policy on, a machine that has not chosen a level
+       * **refuses to start** rather than dispatching unenforced. `W2M_REQUIRE_AUTHORITY_LEVEL` supplies the
+       * same policy from the environment, so a fleet can require it without editing every profile.
+       *
+       * ## Why it is opt-in, which is a deliberate limit
+       *
+       * Refusing unconditionally would be the honest reading of "a permission system that is off is
+       * untested" — and it would also **stop every machine running an earlier version the moment it
+       * upgraded**, since none of them has a level. That trades one silent failure for a loud outage, and an
+       * outage is not a security property.
+       *
+       * So the policy is per-machine and explicit. **The gap is narrowed, not closed**: a fleet that does not
+       * turn this on is exactly as unenforced as before, and this comment says so rather than letting the
+       * existence of the flag imply otherwise.
+       */
+      const required = config.requireAuthorityLevel === true
+        || (typeof process.env.W2M_REQUIRE_AUTHORITY_LEVEL === 'string' && process.env.W2M_REQUIRE_AUTHORITY_LEVEL.trim() !== '' && process.env.W2M_REQUIRE_AUTHORITY_LEVEL.trim() !== '0');
+      if (required && !resolved.ok) {
+        throw configError(
+          'actorAuthorityLevel',
+          `is required on this machine (requireAuthorityLevel is set) and ${resolved.ok ? '' : resolved.detail}`,
+          `choose one of ${AUTHORITY_CHOICES.map((c) => c.value).join(', ')} as \`actorAuthorityLevel\`, or as \`W2M_ACTOR_AUTHORITY\`; to dispatch without a level, unset requireAuthorityLevel`,
+          resolved.code ?? 'W2M_AUTHORITY_LEVEL_REQUIRED',
+        );
+      }
+
       return {
         actorAuthorityLevel: resolved.ok ? resolved.level : null,
         actorAuthorityChoice: {
@@ -728,6 +762,7 @@ function readConfig(config = {}) {
           source: resolved.source,
           reason_code: resolved.code,
           detail: resolved.detail,
+          required,
         },
       };
     })(),
