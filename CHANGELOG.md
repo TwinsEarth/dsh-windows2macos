@@ -4,6 +4,68 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.53.0] — 2026-10-15
+
+**The shared-memory layer gets a suite, and it corrected three things this session had already "verified".**
+
+### The layer was measured by hand; now it is measured by the suite
+
+Field-level omission at level 0, the refusal of an unproducible ancestor, the level 0/70 difference — **all of
+that was real evidence, produced through actual dispatches to an actual machine.** It was also **not
+repeatable**: it lived in a session, not in the suite. **A measurement that cannot be re-run is a memory of a
+measurement.**
+
+`test/memory-layer.test.mjs` adds **22 assertions**, and the suite grew to 84 files.
+
+### Three corrections, each of which the hand-run had got wrong
+
+**1. `evidence` costs 50, not 70.**
+
+```
+FIELD_LEVELS = { subject: 0, body: 0, evidence: 50 }
+```
+
+A level-70 dispatch succeeded, and **70 was written down as the threshold.** It is not: 49 is refused and 50 is
+allowed, and **50 is not arbitrary — it is the bottom of the `captain` band**, which is why the number is what
+it is.
+
+**2. `confidence` is an invariant, not a high-cost field.**
+
+`NEVER_ACCEPTED.confidence` = *"a receiver does not adopt the sender's certainty (**invariant, not a
+default**)"*. Level 90 is refused exactly as level 0 is, and there is no level that satisfies it. **The reason
+string says "invariant" on purpose: a reader who thinks it is a threshold will try to raise it.**
+
+**3. `FIELD_UNDECLARED` does not mean "forbidden", and the two APIs answer different questions.**
+
+| call | question | `origin` / `observed_at` / `lineage` |
+|---|---|---|
+| `acceptField` | *may a receiver choose this?* | `FIELD_UNDECLARED` — no rule lets a receiver pick it |
+| `acceptWithAuthority` | *what does this receiver keep?* | **present in `accepted`** — they are inherited |
+
+**So `UNDECLARED` means "not a receiver's to choose", not "refused".** Reading it as a refusal would have the
+receiver drop the ancestry that makes the block meaningful — and `INHERITED_FIELDS` plus
+`RECEIVER_CHOOSABLE_FIELDS` partition the seven exactly, so neither list can change without the other.
+
+### Four assertions of mine that were wrong, and the last one is the interesting one
+
+* **`ancestry` takes a `Map`, not an array**, and returns `{chain, missing, cycle, depth}` — **there is no `ok`
+  and no `code`.**
+* **`MISSING_PARENT` is not an `ancestry` outcome.** `ancestry` **collects** gaps in `missing` — *"knowing how
+  much of a history is absent is more useful than knowing that some of it is"* — while `acceptBlock` is what
+  **refuses**, returning `accepted: null`.
+* **`isDescendantOf` returns `{descendant, chain, missing, checked}`, not a boolean.** It returns more than a
+  boolean because that is its point: *"a claim that descends from something this machine already thought is an
+  **echo**, not corroboration, and **a fleet that cannot tell those apart will confidently agree with
+  itself**."* A parent that is not held gives `descendant: false` — and my assertion had demanded `true`.
+* **I could not construct a cycle, and that turned out to be the finding.** `blockHash` covers `lineage`, so
+  rebuilding a block changes its hash and the edge no longer closes — **a real cycle would need a hash
+  preimage.** The walk produces a *diamond* instead, and `CYCLE` is reachable **only** from a `have` map whose
+  keys disagree with the blocks under them: a corrupted or hostile store, where **terminating is the point,
+  because an unbounded walk on hostile input is a denial of service.**
+
+**Three attempts at that test asserted a cycle the code was right not to report.** The fourth printed the
+traversal instead of predicting it, which is the only one of the four that produced a fact.
+
 ## [0.52.0] — 2026-10-15
 
 **Agent Plugins 1.0.0 manifests, validated against the published schemas — and the honest note about who
