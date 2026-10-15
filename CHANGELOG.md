@@ -4,6 +4,51 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0] — 2026-10-15
+
+**BLAKE2s-256 is not the cause of `P2P_PUNCH_FAILED`, and a failure that names nothing costs a probe per guess.**
+
+### The hypothesis, and its refutation
+
+`P2P_PUNCH_FAILED: Digest method not supported` has been reproduced twice in production and never under
+instrumentation. The obvious candidate was `createHash('blake2s256')` in `handshakeHash` — an algorithm that
+some Node builds lack, whose absence produces exactly that string.
+
+**Measured, and refuted:** both MacMini and this Windows host compute a 32-byte BLAKE2s-256 digest, on the
+same run that reported the failure. `blake2s256` is available on both. **So the algorithm is not the cause**,
+and the real cause remains **UNVERIFIED**.
+
+### What changed anyway, because the failure's *shape* is the real defect
+
+OpenSSL's message names **no algorithm, no caller and no host**. Establishing that BLAKE2s was innocent
+therefore required probing each machine by hand, over a channel that carries one exit code — a round trip per
+hypothesis. `handshakeHash` now:
+
+* catches the unavailable case and throws `CRYPTO_BLAKE2S256_UNAVAILABLE` naming the algorithm, the runtime,
+  and the fact that **it is a wire-protocol primitive which cannot be replaced with SHA-256** without breaking
+  interoperability with every peer — so nobody "fixes" it by substituting an algorithm and silently splits the
+  fleet;
+* refuses a digest that is not 32 bytes (`CRYPTO_BLAKE2S256_WRONG_LENGTH`), because a truncated digest throws
+  nowhere and would surface as an authentication failure far from its cause;
+* exposes `blake2s256Support()` so a machine can answer the question about itself in one dispatch.
+
+The wrapper is transparent on the happy path, and a test asserts it byte-for-byte against a direct
+`createHash` call — if it changed the bytes, every peer would compute a different handshake.
+
+### A defect in the fix itself, found before shipping
+
+The first version called `getHashes()` without importing it, so `typeof getHashes === 'function'` was silently
+`false` and the `advertised` flag would have been wrong forever. Caught by inspecting the import block rather
+than by a test, which is the honest description of how it was caught.
+
+### The 0 % direct share stands
+
+Last round measured **12 of 12 tasks carried by the relay**, at RTT 354 ms (macmini) and 336 ms (ToFuture)
+where jp-shared answers in 20 ms. This release does not improve that number; it makes the next attempt at
+diagnosing it cheaper.
+
+**10 new tests, 0 failures.**
+
 ## [0.16.0] — 2026-10-15
 
 **A non-zero exit code is not a fleet failure, and this session conflated them repeatedly.**

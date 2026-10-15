@@ -48,6 +48,7 @@ import {
   createPublicKey,
   diffieHellman,
   generateKeyPairSync,
+  getHashes,
   hkdfSync,
   randomBytes,
   timingSafeEqual,
@@ -704,15 +705,84 @@ export function derive(ikm, label, length = KEY_BYTES) {
 }
 
 /**
+ * How BLAKE2s-256 is reached on this runtime, discovered once and remembered.
+ *
+ * ## Why a probe exists for a call that simply works
+ *
+ * `P2P_PUNCH_FAILED: Digest method not supported` was reproduced twice in production and, measured directly,
+ * **neither MacMini nor this Windows host lacks `blake2s256`** — so the algorithm is *not* the cause. What
+ * made that take so long to establish is the shape of the failure: OpenSSL's message names no algorithm, no
+ * caller and no host, so the only way to rule a candidate out was to probe each machine by hand.
+ *
+ * This wrapper does not change behaviour. It changes what a failure *says*: the algorithm that was requested,
+ * whether the runtime advertises it, and the fact that it cannot be substituted. That is the difference
+ * between a message a reader can act on and one that costs a round trip per hypothesis.
+ */
+let blake2sSupport = null;
+
+/**
+ * Whether this runtime can compute BLAKE2s-256, and how it was reached.
+ *
+ * @returns {{ok: boolean, advertised: boolean, detail: string}}
+ */
+export function blake2s256Support() {
+  if (blake2sSupport !== null) return blake2sSupport;
+  let advertised = false;
+  try {
+    advertised = typeof getHashes === 'function' && getHashes().includes('blake2s256');
+  } catch {
+    advertised = false;
+  }
+  try {
+    const probe = createHash('blake2s256');
+    probe.update('');
+    const bytes = probe.digest().length;
+    blake2sSupport = {
+      ok: bytes === 32,
+      advertised,
+      detail: bytes === 32
+        ? `BLAKE2s-256 available (${advertised ? 'advertised by getHashes' : 'works though not advertised'})`
+        : `BLAKE2s-256 produced ${bytes} bytes rather than 32`,
+    };
+  } catch (e) {
+    blake2sSupport = {
+      ok: false,
+      advertised,
+      detail: `BLAKE2s-256 unavailable on this runtime: ${e?.message ?? String(e)}. It is a WIRE PROTOCOL primitive -- the handshake hash, the prologue hash and the session binding -- so it cannot be replaced with SHA-256 without breaking interoperability with every peer. This machine cannot take part in a handshake until the runtime supports it.`,
+    };
+  }
+  return blake2sSupport;
+}
+
+/**
  * BLAKE2s-256, §3's handshake hash.
+ *
+ * Throws a message naming the algorithm and the consequence when the runtime cannot provide it, instead of
+ * letting OpenSSL's `Digest method not supported` escape — which names neither, and which is why a real
+ * production failure took several rounds to attribute.
  *
  * @param {...(Buffer|string)} parts
  * @returns {Buffer} 32 bytes.
  */
 export function handshakeHash(...parts) {
-  const hash = createHash('blake2s256');
+  let hash;
+  try {
+    hash = createHash('blake2s256');
+  } catch (e) {
+    const support = blake2s256Support();
+    const error = new Error(`handshakeHash requires BLAKE2s-256: ${support.detail}`);
+    error.code = 'CRYPTO_BLAKE2S256_UNAVAILABLE';
+    error.cause = e;
+    throw error;
+  }
   for (const part of parts) hash.update(part);
-  return hash.digest();
+  const out = hash.digest();
+  if (out.length !== 32) {
+    const error = new Error(`handshakeHash expected a 32-byte digest and produced ${out.length}; peers would compute a different handshake hash`);
+    error.code = 'CRYPTO_BLAKE2S256_WRONG_LENGTH';
+    throw error;
+  }
+  return out;
 }
 
 /**
