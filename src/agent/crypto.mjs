@@ -705,6 +705,67 @@ export function derive(ikm, label, length = KEY_BYTES) {
 }
 
 /**
+ * The cryptographic primitives the handshake requires, and whether this runtime has each.
+ *
+ * ## Why a capability report rather than a one-off diagnostic
+ *
+ * `P2P_PUNCH_FAILED: Digest method not supported` has been reproduced several times in production and never
+ * under instrumentation. Two candidates have now been **measured and excluded**:
+ *
+ *   * **BLAKE2s-256** — present on both MacMini and this Windows host, on the same run that reported the
+ *     failure. Ruled out by a direct 32-byte digest on each machine.
+ *   * **every other primitive the handshake touches** — `sha256`, `chacha20-poly1305` with a real AEAD
+ *     round trip, `hkdfSync('sha256')`, `x25519` with `diffieHellman`, and `ed25519` — all present on both.
+ *
+ * So the fault is **not a missing algorithm**, and knowing that is worth more than another hypothesis: it
+ * moves the search from the runtime to the protocol, the state, or the transport.
+ *
+ * The exclusion cost several dispatches because each candidate had to be probed over a channel carrying one
+ * exit code. This function means the next question of that kind is answered in **one** dispatch, by the
+ * machine itself, with no interpretation in between.
+ *
+ * @returns {{ ok: boolean, missing: string[], present: string[], node: string, detail: string }}
+ */
+export function cryptoCapabilities() {
+  const present = [];
+  const missing = [];
+  const check = (name, fn) => {
+    try {
+      if (fn()) present.push(name);
+      else missing.push(`${name} (reported as unsupported)`);
+    } catch (e) {
+      missing.push(`${name} (${e?.message ?? String(e)})`);
+    }
+  };
+
+  check('blake2s256', () => createHash('blake2s256').update('').digest().length === 32);
+  check('sha256', () => createHash('sha256').update('').digest().length === 32);
+  check('chacha20-poly1305', () => {
+    const key = randomBytes(32);
+    const cipher = createCipheriv('chacha20-poly1305', key, Buffer.alloc(12), { authTagLength: 16 });
+    cipher.update(Buffer.from('probe'));
+    cipher.final();
+    return cipher.getAuthTag().length === 16;
+  });
+  check('hkdf-sha256', () => hkdfSync('sha256', randomBytes(32), Buffer.alloc(0), Buffer.from('probe'), 32).byteLength === 32);
+  check('x25519+diffieHellman', () => {
+    const { privateKey, publicKey } = generateKeyPairSync('x25519');
+    return diffieHellman({ privateKey, publicKey }).length === 32;
+  });
+  check('ed25519', () => generateKeyPairSync('ed25519') !== null);
+
+  return {
+    ok: missing.length === 0,
+    present,
+    missing,
+    node: process.version,
+    detail: missing.length === 0
+      ? `all ${present.length} handshake primitive(s) available on ${process.version}`
+      : `${missing.length} of ${present.length + missing.length} handshake primitive(s) unavailable on ${process.version}: ${missing.join('; ')}`,
+  };
+}
+
+/**
  * How BLAKE2s-256 is reached on this runtime, discovered once and remembered.
  *
  * ## Why a probe exists for a call that simply works

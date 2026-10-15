@@ -24,7 +24,37 @@ import { describe, it } from 'node:test';
 import { createHash } from 'node:crypto';
 import assert from 'node:assert/strict';
 
-import { blake2s256Support, handshakeHash, prologueHash, derive } from '../src/agent/crypto.mjs';
+import { blake2s256Support, cryptoCapabilities, handshakeHash, prologueHash, derive } from '../src/agent/crypto.mjs';
+
+describe('crypto: the whole handshake primitive set, reported rather than assumed', () => {
+  it('reports every primitive the handshake needs as present on this runtime', () => {
+    // The exclusion this encodes was bought with several dispatches: BLAKE2s was the first suspect and was
+    // measured innocent, so the next question had to cover everything else at once. If one of these is ever
+    // missing on a runner, the name is in the failure instead of a bare OpenSSL string.
+    const c = cryptoCapabilities();
+    assert.equal(c.missing.length, 0, 'missing: ' + c.missing.join('; '));
+    assert.equal(c.ok, true);
+    for (const name of ['blake2s256', 'sha256', 'chacha20-poly1305', 'hkdf-sha256', 'x25519+diffieHellman', 'ed25519']) {
+      assert.ok(c.present.includes(name), name + ' should be present');
+    }
+    assert.match(c.detail, /all 6 handshake primitive\(s\) available/);
+    assert.match(c.node, /^v\d+/);
+  });
+
+  it('names the missing primitive and its reason when one is unavailable', () => {
+    // Exercised through the shape of the report rather than by removing an algorithm, which a running runtime
+    // will not let a test do. The contract is that the missing list carries the name AND the reason.
+    const c = cryptoCapabilities();
+    for (const m of c.missing) assert.match(m, /\(.+\)$/, m + ' should carry a reason in parentheses');
+  });
+
+  it('asks the same question of every primitive, so none is silently skipped', () => {
+    // A capability report that silently checks four of six things is worse than none, because it reads as
+    // complete. The total is asserted so adding a primitive without adding a check fails here.
+    const c = cryptoCapabilities();
+    assert.equal(c.present.length + c.missing.length, 6);
+  });
+});
 
 describe('crypto: BLAKE2s-256 support is discovered, not assumed', () => {
   it('reports whether this runtime can compute it, with a reason either way', () => {

@@ -4,6 +4,34 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.0] — 2026-10-15
+
+**The whole handshake primitive set is present on both machines — so the P2P failure is not a missing algorithm.**
+
+Two candidates for `P2P_PUNCH_FAILED: Digest method not supported` have now been **measured and excluded**:
+
+| Candidate | Measurement | Verdict |
+|---|---|---|
+| BLAKE2s-256 | 32-byte digest on MacMini **and** here, on the same run that failed | **innocent** |
+| every other primitive the handshake touches | `sha256`, `chacha20-poly1305` with a real AEAD round trip, `hkdfSync('sha256')`, `x25519`+`diffieHellman`, `ed25519` — all present on both | **innocent** |
+
+The second row was answered by **one bit-encoded dispatch** that put eight questions to MacMini at once
+(`exit_code: 255`, every bit set) rather than one question per round. That technique was already in this
+repository and should have been the first move.
+
+**What this changes:** the search moves off the runtime and onto the protocol, the session state, or the
+transport. And it points somewhere specific — **`P2P_PUNCH_FAILED` is raised by the relay's own push, on the
+machine that already has every primitive it needs.** The failing handshake is not on a peer missing an
+algorithm; it is on a peer that has all of them.
+
+`cryptoCapabilities()` now answers this question in one dispatch for any machine, and its suite asserts the
+**count** — six primitives, six checks — because a capability report that silently checks four things reads as
+complete.
+
+**Honest status: the cause of `P2P_PUNCH_FAILED` remains UNVERIFIED**, and the 0 % direct share measured last
+round is unchanged. What this release buys is that two hypotheses are dead and the next one costs one
+dispatch to test.
+
 ## [0.17.0] — 2026-10-15
 
 **BLAKE2s-256 is not the cause of `P2P_PUNCH_FAILED`, and a failure that names nothing costs a probe per guess.**
