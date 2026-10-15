@@ -18,7 +18,8 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { after } from 'node:test';
 import { join } from 'node:path';
 
 import {
@@ -32,6 +33,9 @@ import {
   testsOnly,
 } from '../scripts/reachability-check.mjs';
 
+/** Every fixture root this file made, removed when the file finishes -- see the after() below. */
+const FIXTURE_ROOTS = [];
+
 /**
  * Build a throwaway tree.
  *
@@ -40,6 +44,7 @@ import {
  */
 function tree(files) {
   const root = mkdtempSync(join(process.cwd(), '.test-fixtures', 'reach-'));
+  FIXTURE_ROOTS.push(root);
   for (const [rel, body] of Object.entries(files)) {
     const full = join(root, rel);
     mkdirSync(join(full, '..'), { recursive: true });
@@ -207,4 +212,22 @@ describe('reachability: the report says what it is', () => {
     const files = collectFiles(root, ['src', 'test']);
     assert.deepEqual(files, ['src/a.mjs', 'test/a.test.mjs']);
   });
+});
+
+/**
+ * Remove the fixture trees this file made.
+ *
+ * Not tidiness. Leaving them behind made the NEXT pre-flight's lint step walk orphaned empty `.mjs` files and
+ * report **11 errors** on files that were no longer under test -- so a test's own litter failed a gate one run
+ * later, in a check with no visible connection to the suite that caused it.
+ */
+after(() => {
+  for (const root of FIXTURE_ROOTS) {
+    try {
+      rmSync(root, { recursive: true, force: true });
+    } catch {
+      // A fixture that cannot be removed must not turn into a test failure; the next run will report the
+      // leftover through lint, which is the check that caught this in the first place.
+    }
+  }
 });

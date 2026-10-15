@@ -75,8 +75,25 @@ export class CouncilRefusal extends Error {
   }
 }
 
-/** Authority bands, taken from v4.7.0: 0-49 ordinary, 50-69 captain, 70-89 org admin, 90+ system admin. */
-export const AUTHORITY_MAX = 100;
+/**
+ * Authority bands, taken from v4.7.0: 0-49 ordinary, 50-69 captain, 70-89 org admin, 90+ system admin.
+ *
+ * ## This was a SECOND copy of a number that already existed, and the reachability check is what found it
+ *
+ * It read `export const AUTHORITY_MAX = 100;` — a literal, redeclared here. `src/agent/authority.mjs` owns
+ * that bound and the bands it belongs to, and `AUTHORITY_BAND_FLOORS` is derived from them precisely so a new
+ * band cannot leave a stale copy behind. A second literal cannot be kept in step by anything, and **the
+ * failure it produces is silent**: raise the real maximum to 120 and this module keeps refusing 101, with a
+ * message that names the wrong number as authoritative.
+ *
+ * Found by `scripts/reachability-classify.mjs`, which reported this file as a **closed loop** — a module whose
+ * only importer is the test named after it. That finding was about wiring, and the duplicated constant was
+ * sitting in the same file. **Reading the file to check the first finding is how the second one surfaced**,
+ * which is the argument for investigating a report rather than counting it.
+ */
+import { AUTHORITY_MAX } from './authority.mjs';
+
+export { AUTHORITY_MAX };
 
 /**
  * The weight of one participant, as a pure function of the two numbers on its ballot.

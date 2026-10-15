@@ -4,6 +4,48 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.36.0] — 2026-10-15
+
+**The classification found a third closed loop — and it is `council.mjs`, which `ROADMAP.md` marks shipped.**
+
+### What the classifier does that a regex cannot
+
+468 findings against this repository, and the one real defect in them was invisible. Refining the pattern
+cannot fix that: **the information is not in the name, it is in the shape of the import graph.**
+
+The shape that identified the two known defects was — **one export, one importer, and that importer is the
+test named after the module.** That is not a heuristic about naming; it is a statement about the graph: **a
+module whose only importer is its own suite exists in a closed loop, and nothing in the program reaches it.**
+The name is used only to decide whether the loop is *closed*.
+
+Against this repository: **316 `sibling-imported`, 91 `closed-loop`, 61 `same-module`.**
+
+**91 is not a defect count and the classifier says so**, in three tests that pin its own limits rather than
+commenting on them: it cannot see a **dynamic import** (`await import('./x.mjs')` names no binding), and it
+cannot see a module reached only because a **CLI entry point spawns it** — which is every file in `scripts/`,
+and is why that number is large.
+
+### `v4.10.0`'s council is BUILT, NOT ROUTED
+
+`src/agent/council.mjs` is a closed loop: **275 lines implementing committee governance, imported by nothing
+but its own suite.** `ROADMAP.md` marks v4.10.0 *shipped in 0.11.0*, and 0.30.0 verified its three falsifying
+tests are asserted by name — **which they are.** What was never checked is whether anything routes a question
+to it. **Same defect as `field-authority` and `approval-gate`, in a third module**, and the one the
+reachability work existed to find. Recorded as **built, not routed**, and routing it needs a tool surface and
+a session rather than a line of code.
+
+### A duplicated limit, found by reading the file to check the first finding
+
+`council.mjs` declared its own `export const AUTHORITY_MAX = 100` instead of importing the bound from
+`authority.mjs`. **Two copies of a limit that nothing can keep in step, and the failure is silent**: raise the
+real maximum and this module keeps refusing `101` while naming the wrong number as authoritative. It now
+imports it, and `AUTHORITY_MAX` has exactly one literal definition in `src/`.
+
+**Reading the file to check the wiring finding is how the constant surfaced** — the argument for investigating
+a report rather than counting it.
+
+**10 new tests, 0 failures.**
+
 ## [0.35.0] — 2026-10-15
 
 **§1.5 measured at last: the reachability report, and the honest reason it is not a gate.**
