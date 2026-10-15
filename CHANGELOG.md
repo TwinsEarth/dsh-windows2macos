@@ -4,6 +4,55 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] — 2026-10-15
+
+**Fleet scale: the arithmetic the observations support, and the refusals where they support nothing.**
+
+ROADMAP v4.11.0 names scale, defence and integration and deliberately does not plan them, on the grounds that
+**a design that has not been measured at 50 cannot honestly specify 1,000**. This release does not specify
+1,000. It provides the module that computes what a fleet's own task history can support, and refuses the rest.
+
+### The limit that bounds everything, stated first
+
+**This fleet has five machines.** No amount of cleverness turns five into fifty, and the number the ROADMAP
+actually asks about — the agent count at which coordination collapses — is exactly the number this fleet
+cannot observe. So `scaleOf()` returns `can_answer_collapse_point: false` as a **field**, not as a footnote,
+and `extrapolate(5, 50)` refuses with a reason rather than producing a scaled number.
+
+The refusal is the feature. A module that emitted a "scaling curve" from five points would be producing
+**fiction with a decimal point on it**, which is worse than silence because it is quotable.
+
+### What the fleet can answer, from `w2m_history` and `w2m_report`
+
+| Measure | Why it is the one that matters |
+|---|---|
+| **lease expiry rate** | An expired lease is work that was assigned and **silently did not happen**. This is the coordination failure. |
+| **refusal rate** | Counted separately, because a refusal is *the request* being wrong, not the fleet. Merging them points the reader at the wrong machine. |
+| **transport mix** | Every task carried by the relay while a direct path existed is avoidable latency. |
+| **fan-out vs machines online** | Participation against opportunity. |
+
+### The refusals, which are most of the suite
+
+`0/0` is the most misleading number this module could produce — it reads as a perfectly coordinated empty
+fleet. So `expiry_rate`, `refusal_rate`, `direct_share` and `overhead_per_agent` all return **`null`** for an
+empty denominator, and `overhead()` says *"the overhead of zero agents is not zero, it is undefined"*.
+
+`ceilingFrom()` states one thing and denies another: *"at a fan-out of N, the lease expiry rate was X"*, with
+`is_a_ceiling: false` and a note that a ceiling would need the rate measured **at several fan-outs and
+trending**. That is the only honest form of the answer available.
+
+Three defects found by the suite, all mine:
+
+* the boundary rule contradicted its own comment — the test said *"at least a tenth"* while the code required
+  *more than* a tenth. The boundary is now exclusive, deliberately: at exactly 10% a refusal costs nothing and
+  an estimate costs credibility.
+* a test expected a `null` entry in a machine list to be dropped. It should not be: a machine listed with no
+  result **is an unknown outcome**, which is a real thing a relay response says.
+* the same two mistakes, in the same file, in the same run — which is the argument for testing the refusals
+  rather than only the arithmetic.
+
+**19 tests, 0 failures.**
+
 ## [0.13.1] — 2026-10-15
 
 **The macOS skip is removed, because the failure it was hiding did not exist.**
