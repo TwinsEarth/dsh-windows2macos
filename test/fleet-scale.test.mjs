@@ -14,6 +14,9 @@ import assert from 'node:assert/strict';
 
 import {
   FAILURE_STATES,
+  LEASE_OUTCOME,
+  classifyLease,
+  isFleetFailure,
   LEASE_MEANING,
   REQUEST_FAULT_STATES,
   ceilingFrom,
@@ -28,6 +31,53 @@ function task(machines, over = {}) {
   return { task_id: 'T', mode: 'replicate', machines, ...over };
 }
 const lease = (state, over = {}) => ({ lease_state: state, outcome: state === 'done' ? 'ok' : state, ...over });
+
+describe('fleet scale: a non-zero exit code is not a fleet failure', () => {
+  it('tells a command that ran and reported 70 from a lease that produced nothing', () => {
+    // The conflation this session made repeatedly. \`exit_code: 70\` with \`lease_state: done\` means the
+    // command RAN and reported 70 -- the fleet worked. \`exit_code: null\` with \`expired\` means no result
+    // existed at all. Both are true facts and they send a reader to different places.
+    const ran = classifyLease({ lease_state: 'done', exit_code: 70 });
+    assert.equal(ran.outcome, LEASE_OUTCOME.RAN);
+    assert.equal(ran.ran, true);
+    assert.equal(ran.exit_code, 70);
+    assert.match(ran.detail, /the command's answer, not a fleet failure/);
+
+    const nothing = classifyLease({ lease_state: 'expired', exit_code: null });
+    assert.equal(nothing.outcome, LEASE_OUTCOME.NO_RESULT);
+    assert.equal(nothing.ran, false);
+    assert.equal(nothing.exit_code, null);
+    assert.match(nothing.detail, /what the command did is unknown/);
+  });
+
+  it('calls only the no-result case a fleet failure', () => {
+    assert.equal(isFleetFailure({ lease_state: 'done', exit_code: 70 }), false);
+    assert.equal(isFleetFailure({ lease_state: 'done', exit_code: 0 }), false);
+    assert.equal(isFleetFailure({ lease_state: 'expired', exit_code: null }), true);
+    assert.equal(isFleetFailure({ lease_state: 'timeout' }), true);
+    assert.equal(isFleetFailure({ lease_state: 'refused' }), false, 'a refusal is the request being wrong');
+    assert.equal(isFleetFailure({ lease_state: 'observing' }), false, 'an observer was never asked to act');
+  });
+
+  it('separates a refusal and an observer from both kinds of failure', () => {
+    assert.equal(classifyLease({ lease_state: 'refused', refusal_reason: 'COMMAND_NOT_ALLOWED' }).outcome, LEASE_OUTCOME.REFUSED);
+    assert.equal(classifyLease({ lease_state: 'observing' }).outcome, LEASE_OUTCOME.OBSERVED_ONLY);
+  });
+
+  it('reports an unrecognised lease state rather than guessing at it', () => {
+    // A new state added to the relay must not be silently folded into one of the existing buckets.
+    const c = classifyLease({ lease_state: 'something-new', exit_code: 0 });
+    assert.equal(c.outcome, LEASE_OUTCOME.UNKNOWN);
+    assert.match(c.detail, /unrecognised lease state/);
+    assert.equal(classifyLease(null).outcome, LEASE_OUTCOME.UNKNOWN);
+  });
+
+  it('records success as having run, because success is not the opposite of a fleet failure', () => {
+    const ok = classifyLease({ lease_state: 'done', exit_code: 0 });
+    assert.equal(ok.ran, true);
+    assert.equal(ok.outcome, LEASE_OUTCOME.RAN);
+  });
+});
 
 describe('fleet scale: the summary counts what was observed', () => {
   it('counts each lease state and computes the expiry rate against acting leases', () => {

@@ -49,6 +49,69 @@ export const FAILURE_STATES = Object.freeze(['expired', 'timeout']);
 export const REQUEST_FAULT_STATES = Object.freeze(['refused']);
 
 /**
+ * How a lease ended, told apart properly.
+ *
+ * ## The conflation this exists to prevent
+ *
+ * This session repeatedly read `exit_code: 70` as a failure and `lease_state: expired` as the same kind of
+ * failure. **They are not the same kind of thing at all**, and the difference decides where a reader looks:
+ *
+ *   * `exit_code: 70` with `lease_state: done` means **the command ran and reported 70**. The fleet worked.
+ *     The number is the command's answer, and the machine is fine.
+ *   * `exit_code: null` with `lease_state: expired` means **no result was ever produced**. The command may not
+ *     have started. Nothing is known about what it did, and the machine — or the lease, or the network — is
+ *     where the fault is.
+ *
+ * Measured: twelve consecutive real reports showed **12 acting leases, 12 `done`, 0 expired** — while several
+ * runs in the same session had produced no result at all. Both facts are true; they are different failures.
+ * A rate that merged them would report a healthy fleet as broken, or a broken one as healthy, depending on
+ * which it happened to count.
+ */
+export const LEASE_OUTCOME = Object.freeze({
+  RAN: 'ran',                 // a result was produced, whatever it said
+  NO_RESULT: 'no_result',     // nothing came back; the command's behaviour is unknown
+  REFUSED: 'refused',         // the allow-list rejected it before it could run
+  OBSERVED_ONLY: 'observed',  // the machine was told the outcome without being asked to act
+  UNKNOWN: 'unknown',
+});
+
+/**
+ * Classify one machine entry from a task report.
+ *
+ * `exit_code` is the decisive field, **not** the lease state: a lease can be `done` while its command
+ * returned non-zero, and that is a successful execution of a failing command.
+ */
+export function classifyLease(entry) {
+  if (entry === null || typeof entry !== 'object') return { outcome: LEASE_OUTCOME.UNKNOWN, ran: false, exit_code: null, detail: 'no machine entry' };
+  const state = String(entry.lease_state ?? entry.outcome ?? '');
+  const code = entry.exit_code;
+  if (state === 'observing') return { outcome: LEASE_OUTCOME.OBSERVED_ONLY, ran: false, exit_code: null, detail: 'told the outcome, not asked to act' };
+  if (state === 'refused') return { outcome: LEASE_OUTCOME.REFUSED, ran: false, exit_code: null, detail: entry.refusal_reason ?? 'refused' };
+  if (state === 'done') {
+    return {
+      outcome: LEASE_OUTCOME.RAN,
+      ran: true,
+      exit_code: Number.isFinite(code) ? code : null,
+      detail: Number.isFinite(code) && code !== 0
+        ? `ran and reported ${code} -- the command's answer, not a fleet failure`
+        : 'ran and reported success',
+    };
+  }
+  if (state === 'expired' || state === 'timeout') {
+    return { outcome: LEASE_OUTCOME.NO_RESULT, ran: false, exit_code: null, detail: 'no result was produced; what the command did is unknown' };
+  }
+  return { outcome: LEASE_OUTCOME.UNKNOWN, ran: false, exit_code: null, detail: `unrecognised lease state ${JSON.stringify(state)}` };
+}
+
+/**
+ * Whether a non-zero exit code is a fleet failure. It is not, and this function exists so a caller does not
+ * have to decide that for itself each time.
+ */
+export function isFleetFailure(entry) {
+  return classifyLease(entry).outcome === LEASE_OUTCOME.NO_RESULT;
+}
+
+/**
  * Summarise a set of task reports.
  *
  * @param {Array<{task_id?: string, mode?: string, counts?: object, machines?: Array<object>}>} reports

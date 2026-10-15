@@ -4,6 +4,52 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.0] — 2026-10-15
+
+**A non-zero exit code is not a fleet failure, and this session conflated them repeatedly.**
+
+Twelve real task reports were fetched one request at a time — the only correct input, since `w2m_history`
+records current lease state rather than outcomes — and the measured result was **12 acting leases, 12 `done`,
+0 expired, 0 refused**. Yet several runs in the same session produced no result at all. Both facts are true.
+
+They are different failures, and the difference decides where a reader looks:
+
+| Observation | What it means | Where the fault is |
+|---|---|---|
+| `exit_code: 70`, `lease_state: done` | **The command ran and reported 70.** The fleet worked. | the command |
+| `exit_code: null`, `lease_state: expired` | **No result was ever produced.** | the machine, the lease, or the network |
+
+`classifyLease()` and `isFleetFailure()` now encode that distinction, and **`exit_code` is the decisive field,
+not the lease state** — a lease can be `done` while its command returned non-zero, which is a *successful
+execution of a failing command*. `isFleetFailure` returns true only for the no-result case; a refusal is the
+request being wrong, and an observer was never asked to act.
+
+A rate that merged the two would report a healthy fleet as broken, or a broken one as healthy, depending on
+which it happened to count.
+
+### The measured fleet, this round
+
+| Measure | Value | Note |
+|---|---|---|
+| acting leases | 12 of 12 | a bounded sample, fetched per task |
+| expiry rate | **0.0 %** | 0 expired in the sample |
+| refusal rate | **0.0 %** | 0 refused |
+| direct share | **0.0 %** | **every task went by relay** |
+| P2P delivery rate | **0.0 %** | no direct channel was ever established |
+| fleet size | **3 usable of 5 paired** | two `win-desktop` silent ≈ 17.2 h |
+
+**The 0 % direct share is the finding worth acting on**: not one task in the sample used a direct path, so the
+entire fleet has been running on the relay at RTT **354 ms** (macmini) and **336 ms** (ToFuture) where
+jp-shared answers in **20 ms**.
+
+### Still not fixed
+
+The two relay endpoints still disagree about whether the silent machines are online — `reconcile()` detects it
+and says which to trust, but the disagreement itself needs a change on the relay, and this session has no shell
+on that host.
+
+**24 tests, 0 failures.**
+
 ## [0.15.0] — 2026-10-15
 
 **The fleet is three machines, not five — and two relay endpoints disagree about it.**
