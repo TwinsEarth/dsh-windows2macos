@@ -4,6 +4,79 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] — 2026-10-15
+
+**Bounding unbounded writers, and making the layering enforceable instead of merely described.**
+
+### The log bounding, from three recorded incidents
+
+| When | What | Measurement |
+|---|---|---|
+| 2026-10-14 | Linux relay host filled to 100% | one uncapped writer at **14.7 GB/day** |
+| 2026-10-11 → 10-12 | MacMini `relay-test` and node logs | grew **40×** in a day |
+| recurring | build output in project copies and `/tmp` | accumulates without bound |
+
+Recovery on the 14th was `truncate`, **not** `rm`, because rsyslog still held the descriptor open — removing
+the file frees nothing while appearing to succeed. That single fact shapes the module: `methodFor` returns
+`truncate` for anything a process writes and `remove` for build output, and the two are never conflated.
+
+The 40× case is why there are **two independent findings** rather than one size threshold. `absolute` means
+this file is already too big; `rate` means it grew this much between two samples, so it can be acted on
+*before* it becomes the first kind. The rate is computed from the caller's elapsed time and **not** from
+`mtime`, because `mtime` is rewritten by a rotation, a copy or a `touch` — a rate read from it would be a rate
+of the last touch rather than of the writing.
+
+### What is refused, and why the refusal carries its reason
+
+`memory.jsonl` is the only durable copy of what a command printed, since the relay keeps `stdout_sha256` and
+never the text. `device.key` is the identity peers know a machine by, and losing it makes every peer holding
+the old one refuse that machine with no visible cause. Protection is by **resolved path prefix and by name**,
+not by name alone, because a name-based check is defeated by putting the same file in another directory. A
+protected file that *was* found is listed with its reason rather than dropped: a report that omits the
+database is indistinguishable from one where the database was not there.
+
+`node_modules`, `dist`, `target` and `build` are deliberately **not** protected — being rebuildable is exactly
+what makes them legitimate targets, and `classFor` marks them `rebuildable` so a caller prefers them over
+anything unique.
+
+### The layering, as data rather than as a paragraph
+
+The goal's wording is "分模块&分层级&分权限". A prose layering is true on the day it is written and quietly
+false afterwards, because nothing fails when an import is added. So `scripts/layer-model.mjs` holds the model
+as **data**, `scripts/layer-check.mjs` derives the graph from the real tree, and `test/layer-model.test.mjs`
+fails when they disagree.
+
+It is an **allow-list**, not a denylist. A denylist lets a new edge through and reports nothing; an allow-list
+refuses it and forces the question. The measured shape it now describes is a chain with one shared leaf:
+`plugin → agent(12), util(1), relay(1)`, `relay → chatops(4)`, and `agent`/`relay → shared(1 each)`.
+
+Three defects found while building it, all by running rather than reading:
+
+* **`src/signing.mjs` was treated as a layer.** It is a file sitting directly in `src/`, so its basename
+  became a layer name and two genuine edges came back as "unexplained" — and worse, any future root-level
+  file would have silently passed as a layer nobody declared. It now folds into a declared `shared` layer.
+* **`buildGraph(srcDir)` ignored its own argument.** `layerOf` and `insideSrc` hard-coded the real `src`, so
+  every synthetic-tree test returned zero edges. Two tests caught it; without them the real-tree test would
+  have passed for the wrong reason.
+* **`/x/dist` was classified `report_only`.** The match was on `/dist/` and `\dist\`, which a directory path
+  with no trailing separator never matches — so the single most obvious cleanup target of all was not a
+  target. Matching is now on whole path segments.
+
+A fourth finding is about the tests rather than the code: two fixtures used `mkdtempSync(tmpdir())`, so the
+OS temp path put a `tmp` segment in every path and made files legitimately removable. **The code was right
+both times and the fixture was wrong**, which is worth recording because the reflex is to change the code.
+
+### The configuration is offered; the module is what runs
+
+`deploy/logrotate/w2m.logrotate` is a host-level file that needs root to install, so this repository can
+*offer* it and cannot *enforce* it — saying otherwise is the kind of claim the fleet rules exist to prevent.
+What runs without root, from a task on any machine, is `src/agent/log-bounds.mjs`. `copytruncate` and
+`maxsize` are both set in the configuration: without the first, rotation renames the file while the daemon
+keeps writing to the old descriptor and the disk stays full; without the second, a file growing 40× a day
+reaches its cap long before a daily timer looks.
+
+**28 tests for log bounds and 22 for the layer model, 0 failures.**
+
 ## [0.11.0] — 2026-10-15
 
 **Committee governance (roadmap v4.10.0): one decision engine, ordered phases, weighted votes, retained dissent.**

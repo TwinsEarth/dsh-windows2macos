@@ -1,0 +1,86 @@
+# Log rotation for the w2m fleet.
+#
+# Install:  install -m 0644 deploy/logrotate/w2m.logrotate /etc/logrotate.d/w2m
+# Test:     logrotate --debug /etc/logrotate.d/w2m
+#
+# Two incidents put this file here, and both are in the CHANGELOG with their measurements:
+#   * 2026-10-14  the relay host's root filesystem reached 100% at 14.7 GB/day from one uncapped writer.
+#                 Recovery was `truncate`, not `rm`, because rsyslog still held the descriptor open.
+#   * 2026-10-11  MacMini's relay-test and node logs grew 40x in a single day.
+#
+# Two directives carry the weight, and neither is a default:
+#
+#   copytruncate   Without it, rotation renames the file while the daemon keeps writing to the old
+#                  descriptor: the new file stays empty and THE DISK STAYS FULL. That is the first
+#                  incident in a different costume. The cost is a brief window where writes to the file
+#                  can be lost, which is acceptable for logs and would not be for a ledger.
+#
+#   maxsize        Set as well as the schedule, because a file growing 40x a day reaches any sane cap long
+#                  before a daily timer looks at it. `daily` + `maxsize 256M` means "at least once a day,
+#                  and immediately if it gets big", which is what both incidents needed.
+
+# The w2m daemons. `w2m-rabbit` owns the relay; `w2m-localside` and `w2m-stun` write far less but share
+# the directory, and rotating a file that is not there is why `missingok` is set.
+/var/log/w2m/*.log /var/log/w2m/*.out /var/log/w2m/*.err {
+  daily
+  maxsize 256M
+  rotate 7
+  compress
+  delaycompress
+  missingok
+  notifempty
+  copytruncate
+  create 0640 root adm
+}
+
+# The relay's own test output. This is the path named in the 2026-10-11 incident: it is written by a test
+# harness rather than a service, so nothing signals it and `copytruncate` is the only safe method.
+/var/log/w2m/relay-test* {
+  daily
+  maxsize 128M
+  rotate 3
+  compress
+  delaycompress
+  missingok
+  notifempty
+  copytruncate
+}
+
+# Anything a node process leaves behind under the state directory. Bounded tightly, because a crash loop
+# writes these faster than anything else on the machine.
+/var/lib/w2m/*.log /var/lib/w2m/logs/*.log {
+  daily
+  maxsize 128M
+  rotate 5
+  compress
+  delaycompress
+  missingok
+  notifempty
+  copytruncate
+}
+
+# Deploy-time and test-time logs that accumulate in the checkout. These are not written by a long-lived
+# process, so `nocopytruncate` would also work -- `copytruncate` is kept for uniformity, since a file that
+# nobody expects to be open is exactly the file that will be.
+/home/*/w2m-dev/*.log /home/*/w2m-dev/logs/*.log /Users/*/w2m-dev/*.log /Users/*/w2m-dev/logs/*.log {
+  daily
+  maxsize 128M
+  rotate 3
+  compress
+  delaycompress
+  missingok
+  notifempty
+  copytruncate
+}
+
+# A backstop for /tmp. This is deliberately last and deliberately blunt: /tmp on a machine that runs tests
+# accumulates build output, and the alternative is the filesystem filling while every specific rule above
+# reports nothing to do. `maxage` is the part that helps; the size cap is a secondary guard.
+/tmp/w2m* /tmp/relay-test* {
+  daily
+  maxsize 512M
+  rotate 1
+  missingok
+  notifempty
+  copytruncate
+}
