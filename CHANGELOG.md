@@ -4,6 +4,63 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.46.0] — 2026-10-15
+
+**The test matrix the plans asked for — with every row it could not earn left as `待执行`, and the reason named.**
+
+### Two documents, and the split is the point
+
+`docs/TEST-MATRIX.md` is the **master list**: 54 rows across twelve sections, each with a stable id, what it
+checks, its result, a correction date, and the instance that produced the result.
+
+`docs/TEST-LEDGER.md` is the **evidence**: the exact command, exit code and artifact behind each verdict, plus
+the vocabulary the matrix refers to.
+
+**The reference goes one way.** The matrix cites the ledger; the ledger never cites the matrix. A summary that
+its own evidence cites is a summary that can no longer be checked against it.
+
+### What the matrix refuses to do
+
+**32 of 54 rows are executed; 22 are not, and none of the 22 says "通过".**
+
+**A row may only be filled in from a run whose output was read.** Where a result would have to be inferred —
+from a suite that covers the same code, from the implementation, from plausibility — the row stays `待执行`
+**and names what would settle it.** Twelve rows cite suite coverage explicitly, labelled as *suite coverage*
+rather than as a run of that item, because **"a suite covers this code" and "this item was executed" are
+different claims and only one of them is a measurement of the item.**
+
+The 22 unexecuted rows are **not 22 problems.** They collapse into **four blockers**, and two of them are one
+command or one machine away:
+
+| Blocker | Rows held | Release condition |
+|---|---|---|
+| only one executable machine online | 7 | the two `win-desktop` machines, silent since 2026-10-14 |
+| the relay cannot be upgraded or restarted remotely | 4 | **one command on `jp-shared`** |
+| no usable pairing code | 3 | a pairing experiment, which would disturb the fleet and needs consent |
+| a real interruption or an external resource is required | 8 | a real update check; one row needs macOS or Linux |
+
+### Three numbers the matrix now owns, because the plans kept repeating them
+
+| the plans say | measured at v0.45.0 |
+|---|---|
+| 79 test suites | **82** |
+| 2199 tests | **2228** |
+| nine aggregate verdicts | **6** |
+
+**A count that is copied from an older plan becomes more true-looking each time it is copied.** The matrix is
+now the single place these are read from.
+
+### Two rows are `证伪` rather than `失败`, and the distinction matters
+
+`TC-AGG-003` and `TC-AGG-005` assert **`environmental`** and **nine states**. **Both names are absent from the
+code** — the real verdict is `divergent-platform`, and there are six verdicts plus three non-verdict values.
+
+A row marked `失败` would say *"the code is wrong."* These say *"the expectation is wrong"*, which is a
+different repair. **A test asserting `environmental` would fail against correct code — the exact path by which
+a real check gets disabled, because the runner looks broken rather than the expectation.**
+
+**No new tests.** What changed is that the results now have a home, and the ones that have none say so.
+
 ## [0.45.0] — 2026-10-15
 
 **The test plan's security cases, made executable — and the one case that had never been watched run.**
