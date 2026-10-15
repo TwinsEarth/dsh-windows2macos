@@ -48,13 +48,20 @@ export const LOG_GROWTH_WARN_BYTES_PER_DAY = 1 * GB;
 /**
  * Which paths are worth checking for growth, by platform.
  *
- * Deliberately short. A health check that walks a whole filesystem is itself a load source, and the
- * incident was caused by *two* files rather than by a general untidiness — so the check names the places
- * where an unbounded writer has actually been observed.
+ * Deliberately short, and deliberately **not including a user's home directory**.
+ *
+ * A health check that walks a whole filesystem is itself a load source, and this list got that wrong on the
+ * first attempt: macOS was given `/Users`, and on a developer machine that is hundreds of thousands of files.
+ * The symptom appeared on a real machine as a health check that **exceeded the fleet's own ~50-second lease
+ * ceiling** and expired with no result at all — a monitoring tool timing out because it was too expensive to
+ * monitor. On the machine that wrote it, the same suite runs in 280 ms.
+ *
+ * So each entry is a place where an unbounded writer has actually been observed, which is what the 14.7
+ * GB/day incident was: two files in `/var/log`, not a general untidiness.
  */
 export const LOG_PATHS = Object.freeze({
   linux: ['/var/log', '/var/lib/w2m', '/tmp'],
-  darwin: ['/var/log', '/tmp', '/Users'],
+  darwin: ['/var/log', '/Library/Logs', '/tmp'],
   win32: ['C:\\Windows\\Logs', 'C:\\Windows\\Temp'],
 });
 
