@@ -59,48 +59,25 @@ function tree() {
 }
 
 /**
- * ## UNVERIFIED on macOS -- the whole suite is skipped there, with the reason
+ * ## There is no macOS skip here any more, and the reason it existed was a bug in my parser
  *
- * This suite passes on Windows and fails on MacMini with an `AssertionError`. That is the **entire** diagnosis
- * that could be extracted, and extracting it cost seven dispatches across two rounds, because this fleet's
- * only channel to a remote machine carries a single exit code and no text. What is known, each fact bought
- * with a separate run:
+ * This suite was skipped on macOS for three rounds because it appeared to fail there with an
+ * \`AssertionError\`. **It never failed.** The tooling that read its result was looking for a summary line
+ * beginning \`# fail 0\`, and node v24 writes \`fail 0\` behind an information symbol instead. With the guard
+ * temporarily removed on MacMini and the corrected parser in place, the measured result was **28 tests, 0
+ * failures** -- and the same run reported \`28 test(s), 0 failed\`, read from stdout in the \`info\` format.
  *
- *   * the failure is an `AssertionError`, not an import error, a syntax error or a missing file;
- *   * the module itself loads and runs correctly on that machine -- it was used there to measure real
- *     directories and produced sane numbers, so this is the suite and not `log-bounds.mjs`;
- *   * it is a **single assertion inside some `it(...)`**, NOT a crash at module scope. An earlier version of
- *     this note claimed the opposite, reasoning that no test name appeared in the captured output. **That
- *     reasoning was wrong and the correction is worth keeping:** on this machine the test names do not appear
- *     in the output AT ALL -- a probe looking for twenty-seven of them found none even on a run that
- *     succeeded -- so their absence said nothing about where the failure was. The same mistaken inference was
- *     made from the same channel capability twice, which is why the note now says what was MEASURED;
- *   * it is none of: `EMFILE`/too many open files, `ENOENT`, `EACCES`, a missing `test-fixtures` path, or a
- *     reference to `tmpdir` -- each of those was tested for explicitly and ruled out.
+ * What that cost, recorded so the shape of the mistake is recognisable next time: two rounds of probes that
+ * ruled out every filesystem hypothesis (all correctly -- repository present, module loads, \`mkdirSync\`,
+ * \`mkdtempSync\` and \`writeFileSync\` all fine), because the hypothesis being tested had been derived from a
+ * bad premise. **The premise was never measured.** One command that printed the raw output would have shown
+ * the prefix immediately, and should have been the first thing run rather than the last.
  *
- * The two hypotheses tried and not confirmed: that `/var/tmp` being a symlink to `/private/var/tmp` broke
- * the protection check's path arithmetic (the fixture was moved off the system temp directory, and the
- * failure persisted), and that a low macOS descriptor limit was exhausting (ruled out by the `EMFILE` probe).
- *
- *
- *   * the file operations and module load are all FINE on that machine. A bit-encoded probe (one dispatch, six
- *     questions) confirmed: the repository is present, the module loads without throwing, `snapshot` and
- *     `methodFor` are functions, and `mkdirSync`, `mkdtempSync` and `writeFileSync` all succeed. What is left
- *     is a plain assertion, somewhere in the twenty-eight.
- *
- * **So this is skipped rather than left failing**, for a reason worth stating: a suite that always fails on
- * one platform removes that platform's ability to validate *everything else*, and the fleet's cross-machine
- * check is worth more than this one file's coverage. The skip names itself in the output, so it cannot be
- * mistaken for a pass -- an unremarked skip would be the dishonest option, and that is the one thing the
- * fleet rules forbid.
- *
- * Removing this guard is the fix. The suite needs no change to run on macOS; something in it does.
+ * The parser now lives in \`src/agent/test-report.mjs\` with its own suite, accepts both prefixes, reads both
+ * streams and reports which one answered -- so the next person does not have to discover this again.
  */
-const SKIP_ON_DARWIN = process.platform === 'darwin'
-  ? 'UNVERIFIED on macOS: AssertionError before any test line, cause not yet isolated (see the note above)'
-  : false;
 
-describe('log bounds: a rate is measured between two samples, not read from mtime', { skip: SKIP_ON_DARWIN }, () => {
+describe('log bounds: a rate is measured between two samples, not read from mtime', () => {
   it('reports a file that grew past the threshold, with the rate it grew at', () => {
     // The MacMini case: 40x in a day. Modelled as 4 GB over 6 hours, which is 16 GB/day.
     const before = new Map([['/x/relay-test.log', 100 * 1024 * 1024]]);
@@ -150,7 +127,7 @@ describe('log bounds: a rate is measured between two samples, not read from mtim
   });
 });
 
-describe('log bounds: the method is chosen, and truncate exists for a reason', { skip: SKIP_ON_DARWIN }, () => {
+describe('log bounds: the method is chosen, and truncate exists for a reason', () => {
   it('truncates a log rather than removing it', () => {
     // The 2026-10-14 recovery: `rm` on a file rsyslog still held open freed nothing while appearing to
     // succeed. For anything a process is writing, truncation is the correct method.
@@ -180,7 +157,7 @@ describe('log bounds: the method is chosen, and truncate exists for a reason', {
   });
 });
 
-describe('log bounds: what is protected, and the reason is carried', { skip: SKIP_ON_DARWIN }, () => {
+describe('log bounds: what is protected, and the reason is carried', () => {
   it('protects the named irreplaceable files wherever they are', () => {
     // memory.jsonl is the only durable copy of what a command printed; the relay keeps hashes and never the
     // text. Losing device.key makes every peer holding the old one refuse this machine with no visible cause.
@@ -217,7 +194,7 @@ describe('log bounds: what is protected, and the reason is carried', { skip: SKI
   });
 });
 
-describe('log bounds: acting refuses what it must', { skip: SKIP_ON_DARWIN }, () => {
+describe('log bounds: acting refuses what it must', () => {
   it('refuses a protected path even when asked directly', () => {
     // `apply` re-checks the guard rather than trusting the plan: a plan is data that may have been
     // serialised, filtered or hand-edited between being made and being applied.
@@ -263,7 +240,7 @@ describe('log bounds: acting refuses what it must', { skip: SKIP_ON_DARWIN }, ()
   });
 });
 
-describe('log bounds: the plan orders by severity then size', { skip: SKIP_ON_DARWIN }, () => {
+describe('log bounds: the plan orders by severity then size', () => {
   it('puts the incident above the tidying', () => {
     const root = tree();
     const sizes = new Map([
@@ -294,7 +271,7 @@ describe('log bounds: the plan orders by severity then size', { skip: SKIP_ON_DA
   });
 });
 
-describe('log bounds: the logrotate configuration says the things that matter', { skip: SKIP_ON_DARWIN }, () => {
+describe('log bounds: the logrotate configuration says the things that matter', () => {
   it('sets copytruncate, without which rotation leaves the disk full', () => {
     // Rename-only rotation keeps the daemon writing to the old descriptor: the new file stays empty and the
     // space is not freed. That is the 2026-10-14 failure in a different costume.
@@ -321,7 +298,7 @@ describe('log bounds: the logrotate configuration says the things that matter', 
   });
 });
 
-describe('log bounds: a snapshot is bounded, and says when it was cut short', { skip: SKIP_ON_DARWIN }, () => {
+describe('log bounds: a snapshot is bounded, and says when it was cut short', () => {
   it('reads real sizes from a real tree', () => {
     const root = tree();
     mkdirSync(join(root, 'sub'), { recursive: true });

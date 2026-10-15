@@ -4,6 +4,37 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.1] — 2026-10-15
+
+**The macOS skip is removed, because the failure it was hiding did not exist.**
+
+`test/log-bounds.test.mjs` was skipped on macOS for three rounds because it appeared to fail there with an
+`AssertionError`. **It never failed.** The tooling that read its result was looking for a summary line
+beginning `# fail 0`, and node v24 writes `fail 0` behind an information symbol instead — the same defect
+fixed in 0.13.0. The "failure" was my parse error, re-reported as a suite result.
+
+With the guard temporarily removed on MacMini and the corrected parser in place, the measured result was:
+
+```
+28 test(s), 0 failed          (read from stdout, info format)
+```
+
+**Seven `describe` blocks had been guarded. All seven are unguarded now, and the note explaining the skip is
+replaced by a note explaining that there is nothing to skip.**
+
+### What that cost, recorded so the shape is recognisable next time
+
+Two rounds of probes, all of which correctly ruled out every filesystem hypothesis — the repository was
+present, the module loaded, and `mkdirSync`, `mkdtempSync` and `writeFileSync` all succeeded. **The probing was
+sound and the premise was not**: it had been derived from a parse failure, and the premise itself was never
+measured. One command that printed the raw output would have shown the prefix immediately. It should have been
+the first thing run rather than the last.
+
+A guard added on a false premise is worse than no guard, because it converts "I cannot see the result" into a
+permanent, plausible-looking exception — and it does so in the one place nobody looks again.
+
+Windows: 28 tests, 28 pass, **0 skipped**.
+
 ## [0.13.0] — 2026-10-15
 
 **The root cause of three rounds of confusion was a regex, and it was mine.**
