@@ -4,6 +4,58 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.45.0] — 2026-10-15
+
+**The test plan's security cases, made executable — and the one case that had never been watched run.**
+
+### A coverage gap with an error code and no test
+
+`COMMAND_EXECUTABLE_RELATIVE_PATH` is declared in `allowed-commands.mjs` with a written rationale — *"it names
+a different file in every working directory"*. **A grep across all 81 suites returned zero hits.** The refusal
+path existed and **no test had ever watched it fire.**
+
+That is the same class of defect as the three uncalled modules this project shipped: **present, documented, and
+unobserved.** The difference is that a module has a suite and an error code does not. It now has one, and it
+distinguishes the two refusals that are easy to confuse — **an entry that itself names a relative path is
+refused as `EXECUTABLE_RELATIVE_PATH`, while a relative `argv[0]` against an absolute entry is merely
+`NOT_ALLOWED`.**
+
+### The plan asserted something the code does, and reading alone would not have settled it
+
+The test plan claims `node --test --test-reporter=tap` is **allowed when an entry names it explicitly**, while
+`node --test-reporter=tap` (no `--test`) is refused. The suite says the opposite of half of that —
+`agent.test.mjs` is titled *"refuses --test-reporter and every other argument that makes node load code"*.
+
+**Both are right, and the mechanism is the one the refusal's own message names:** the reparse refusal fires on
+**trailing** arguments of a matched entry, and its remedy is *"an entry of its own"*. So:
+
+* `['node','--test']` **refuses** `--test-reporter=tap` — verified;
+* `['node','--test'], ['node','--test','--test-reporter=tap']` **allows** exactly that flag — verified;
+* **and still refuses** `--test-reporter=file:///tmp/evil.mjs`, because the second entry pins one value rather
+  than opening the flag — verified.
+
+**The line between "a named flag" and "a flag" is the whole security property**, so all three are now asserted
+rather than inferred from the refusal's wording.
+
+### The plan's `environmental` state does not exist
+
+`AGG-003` and the plan's nine-state table name **`environmental`**. The project implements
+**`divergent-platform`** (`tools.mjs`, `report.mjs`, `fleet.mjs`). **A test asserting `environmental` would fail
+against correct code** — the kind of error that gets a real check disabled, because the runner looks broken
+rather than the expectation.
+
+### My own error, and it was two errors in one run
+
+Running every suite in **one process** with `--experimental-test-isolation=none` produced **41 failures**;
+the project's own entry (`node --test --test-force-exit`, each suite isolated) produced **1**. The other 38 were
+**global state from `mdns-discover`'s fetch stub leaking into `outbound-only`** — my harness, not the code.
+
+The 1 real failure was also mine: I bumped the version to `0.45.0` and did not write the CHANGELOG entry, so
+`claims` and `CHANGELOG shape` correctly went red. **Both are recorded because the first is the trap worth
+naming: a test harness that is not the project's harness measures the harness.**
+
+**10 new tests, 0 failures** by the project's own entry point.
+
 ## [0.44.0] — 2026-10-15
 
 **A real dispatch proved the parameter does not yet travel — and the tests that make that checkable.**

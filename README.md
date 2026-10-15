@@ -16,8 +16,8 @@ English | [中文](#中文说明)
 
 ## Progress — where this actually is
 
-**Current: `0.41.0`.** 62 versions since `0.8.0`. The number that matters more than the version:
-**11 tools, 79 suites, 2199 tests, 12 pre-flight checks, 0 failures.**
+**Current: `0.45.0`.** 66 versions since `0.8.0`. The number that matters more than the version:
+**11 tools, 82 suites, 2228 tests, 12 pre-flight checks, 0 failures.**
 
 ### The three properties this project set out to have
 
@@ -866,8 +866,8 @@ When something does not work, start from the symptom: [TROUBLESHOOTING.md](TROUB
 
 ### 进度 —— 它现在到底到哪一步了
 
-**当前版本：`0.41.0`**。自 `0.8.0` 以来共 **62 个版本**。比版本号更重要的数字是：
-**11 个工具、79 个测试套件、2199 个用例、12 项预检、0 失败。**
+**当前版本：`0.45.0`**。自 `0.8.0` 以来共 **66 个版本**。比版本号更重要的数字是：
+**11 个工具、82 个测试套件、2228 个用例、12 项预检、0 失败。**
 
 #### 三项目标本来的属性
 
