@@ -4,6 +4,57 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.0] — 2026-10-15
+
+**The capability table has a gate now, so it is a policy rather than a description of one.**
+
+`scripts/layer-model.mjs` has declared since 0.12.0 what each operational capability costs in authority —
+`read_fleet_state` at ordinary, `dispatch_writing` at captain, `publish_release` at org admin,
+`write_config` at system admin — and **nothing consulted it**. A table nothing reads is true on the day it is
+written and unenforced afterwards; that is the same failure this project already paid for with the layering,
+where a prose description was quietly violated while nothing failed.
+
+`src/agent/permission.mjs` compares the table against `authority.mjs`'s bands and returns one of three
+verdicts. The interesting part is not `ALLOW`:
+
+### The escalation window is exactly one band
+
+`NEEDS_APPROVAL` is granted to an actor **one band below** the requirement and to nobody further down.
+`DENY` covers everything else.
+
+**Two bands below is refused rather than escalated**, and that is a security decision rather than a
+convenience one: if any shortfall could be forwarded, an ordinary actor could request a system-admin action
+and **the request itself would be the attack** — one inattentive approver away from a write to
+`allowedCommands`. One band means an actor can ask for the next thing up and no more, which is what
+"escalate to your supervisor" actually means.
+
+### An undeclared capability is DENIED
+
+Not `ALLOW`, which would make the table grant whatever is added next; not `NEEDS_APPROVAL`, which would make
+it requestable. Either would turn an **omission** into a permission. `decide('teleport', 100)` refuses, because
+authority answers *how much may this actor do*, not *is this a thing that exists*.
+
+### A level nobody defined is refused rather than rounded
+
+`50.5`, `-1`, `101`, `NaN` and `'50'` are all denied with the requirement still reported. Treating them as `0`
+would silently downgrade an actor; treating them as high would silently promote one. Neither is a decision
+this module is entitled to make.
+
+### Nothing destructive settles itself
+
+`mayAutoSettle()` returns false for any destructive capability **even on an `ALLOW` at maximum authority** —
+the level answers "may this actor", not "should this happen now". A release published on a machine's own
+judgement is a release nobody reviewed.
+
+### The table is audited, not trusted
+
+`auditCapabilities()` reports any entry **no band can reach**, because an unreachable capability reads as
+policy while doing nothing — worse than an absent one, since it looks like a control.
+
+**18 tests, 0 failures.** One property is asserted across the whole table rather than by example: for every
+declared capability and every level from 0 to 100, a `NEEDS_APPROVAL` verdict implies the actor is exactly one
+band below.
+
 ## [0.20.0] — 2026-10-15
 
 **Version skew is refuted too, and the direct-path failure is now counted instead of read one at a time.**
