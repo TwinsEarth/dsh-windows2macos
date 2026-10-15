@@ -4,6 +4,53 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.25.0] — 2026-10-15
+
+**The chain is closed: dispatch → gate → queue → decision. The plugin builds a queue, and an escalation is a real entry an approver can find.**
+
+### The queue belongs to the plugin, not to the call
+
+`apply()` now constructs **one** `createApprovalIndex()` for the plugin's lifetime, lazily. A queue built at
+the call site would be **empty every time**, so a request raised by one dispatch could never be found by the
+decision that answers it — **it would look wired and behave as if it were not.** Same reasoning as the P2P
+runtime beside it: something that must outlive a single call belongs to the plugin.
+
+### Measured, end to end, before it was written down
+
+| Step | Result |
+|---|---|
+| an ordinary actor (49) asks to write | `needs_approval`, `enforced: true` |
+| the request is raised | `ok`, id issued, `subjectLevel` **49** |
+| a captain (50) lists the queue | `may_act: true`, `required_level: 50` |
+| a peer (10) lists the same queue | **sees it**, `may_act: false`, `APPROVAL_INSUFFICIENT_AUTHORITY` |
+| the captain settles it | `ok` |
+| after settling | `approved`, **`subjectLevel` still 49** |
+| the requester approves their own request | **`APPROVAL_SELF_APPROVAL`** |
+
+The fourth row is the one worth naming: **a peer can see work that is above their authority and is not theirs
+to answer.** A filtered list would make the fleet look idle at the moment it is most blocked.
+
+### A queue that refuses is not a queue that needs approval
+
+If `raiseApproval` fails, the dispatch is refused with **`W2M_PERMISSION_APPROVAL_NOT_RAISED`**, a different
+code from `W2M_PERMISSION_NEEDS_APPROVAL`. A caller told "await approval" for a request that was never stored
+would **wait forever for a decision nobody can make.**
+
+### Still true, and stated rather than glossed
+
+The dispatch still **does not run** when approval is required — an escalation is a request to be allowed, not
+a permission. There is **no tool yet for an approver to settle a pending request**; `decide()` exists and is
+exercised by the suite, and wiring it to a tool is the next step. So the chain is closed in code and testable
+end to end, while remaining **unreachable by an operator in the running plugin.**
+
+### My probe was wrong before the code was
+
+The first end-to-end run threw on `listFor(...).requests.length`. `listFor` returns a **row array**, not an
+object with a `requests` field. **The code was right; my assumption about a shape I had not read was wrong**
+— the fifth time in this project, and the same failure as the parse-prefix mistake early on.
+
+**3 new chain tests, 0 failures.**
+
 ## [0.24.0] — 2026-10-15
 
 **The escalation reaches the approval index — and the bridge between them is where the defect would have been.**

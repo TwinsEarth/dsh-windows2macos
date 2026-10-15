@@ -89,7 +89,7 @@
  */
 
 import { execFile } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -125,7 +125,10 @@ import { mintPunchId, punchSession } from '../agent/p2p.mjs';
 // v0.22.0: the permission gate. Imported rather than reimplemented for the same reason as everything else
 // here -- a second copy of the escalation rule is a second chance to disagree with the first about how far
 // below a requirement an actor may still ask.
-import { gateDispatch, approvalRequestFor } from '../agent/permission.mjs';
+import { gateDispatch, approvalRequestFor, raiseApproval } from '../agent/permission.mjs';
+// v0.24.0: the queue an escalation is raised into. Imported from `src/`, never from `scripts/` -- a
+// `src/` module reaching above itself breaks the published package (see CHANGELOG 0.23.0).
+import { createApprovalIndex } from '../agent/approval-index.mjs';
 import { isAuthorityLevel } from '../agent/authority.mjs';
 // v0.6.0: the device keypair and the offer's key distribution (`docs/P2P-CRYPTO.md` §4). Imported
 // rather than reimplemented: the dispatcher and the executor have to derive the *same* keys, and two
@@ -3202,6 +3205,29 @@ export async function apply(ctx, config = {}) {
     return { machine_id: device.machine_id, machine_name: device.machine_name, machineName: cfg.machineName };
   });
 
+  /**
+   * v0.24.0: the approval queue, one per plugin lifetime.
+   *
+   * ## Why it lives here and not inside the dispatch
+   *
+   * A queue constructed at the call site would be **empty every time**, so a request raised by one dispatch
+   * could never be found by the decision that answers it — the queue would look wired and behave as if it were
+   * not. This is the same reasoning as `p2p` above: something that has to outlive a single call belongs to the
+   * plugin, not to the call.
+   *
+   * Lazy, because a machine that never trips the permission gate should not pay for a queue, and built through
+   * the effect system so a decision still pending at unload does not keep the plugin alive.
+   */
+  let approvals = null;
+  const approvalQueue = () => {
+    if (approvals === null) {
+      approvals = createApprovalIndex({
+        audit: (event, detail) => ctx.logger?.debug?.(`w2m: ${event} ${JSON.stringify(detail ?? {})}`),
+      });
+    }
+    return approvals;
+  };
+
   // v0.6.1: the two browser routes behind the composer's target control. Additive and optional: a
   // host without `connection.fetch` still gets every tool, and `w2m_status` reports the absence  -   // which is the honest place for it, since a host that has no Connection at all is simply not a web
   // composition and does not need a warning on every headless run.
@@ -3725,16 +3751,33 @@ export async function apply(ctx, config = {}) {
           );
         }
         if (gate.decision.verdict === 'needs_approval') {
+          // v0.24.0: the request is QUEUED now, not merely refused with a description of a queue. The
+          // dispatch still does not run -- an escalation is a request to be allowed, not a permission --
+          // but the request is a real entry an approver can find and settle, and its id comes back so the
+          // caller can name what it is waiting on.
           const request = approvalRequestFor(gate.decision, {
             taskId: null,
             machineId: null,
             requestedBy: cfg.machineName,
           });
+          const approvalId = randomUUID();
+          const raised = raiseApproval(approvalQueue(), request, { approvalId, toolName: 'w2m_run' });
+          if (!raised.ok) {
+            // The queue refused it, which is a different failure from needing approval and must not be
+            // reported as one: a caller told "await approval" for a request that was never stored would wait
+            // forever for a decision nobody can make.
+            throw new W2MError(
+              'W2M_PERMISSION_APPROVAL_NOT_RAISED',
+              'W2M_PERMISSION_APPROVAL_NOT_RAISED: ' + raised.reason_code + ': ' + raised.detail,
+              { hint: 'the approval request could not be queued, so this dispatch is refused rather than left waiting', request },
+            );
+          }
           throw new W2MError(
             'W2M_PERMISSION_NEEDS_APPROVAL',
             'W2M_PERMISSION_NEEDS_APPROVAL: ' + gate.decision.detail,
             {
-              hint: 'this dispatch needs an approver; it is refused rather than queued because no approval queue is wired to this call yet',
+              hint: 'this dispatch is queued awaiting an approver; approve or reject it with w2m_approvals, then dispatch again',
+              approval_id: raised.approval_id,
               request,
             },
           );

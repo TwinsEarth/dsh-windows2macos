@@ -35,7 +35,68 @@ const levelIn = (name) => {
   const band = AUTHORITY_BANDS.find((b) => b.name === name);
   assert.ok(band, `no band named ${name}`);
   return band.min;
-};describe('permission: the escalation really reaches the approval index', () => {
+};describe('permission: the whole chain, dispatch to decision, on real objects', () => {
+  it('carries a writing dispatch from refusal through approval to a queued, settleable request', () => {
+    // This is the sequence the dispatch path performs, replayed on real objects rather than described.
+    // Every step was measured before it was written down; the numbers are the ones the run produced.
+    const queue = createApprovalIndex({ now: () => 1000 });
+
+    // 1. an ordinary actor asking to write is one band below captain
+    const gate = gateDispatch({ write: true, write_scope: ['src/'] }, 49);
+    assert.equal(gate.enforced, true);
+    assert.equal(gate.decision.verdict, AUTHORITY_VERDICT.NEEDS_APPROVAL);
+
+    // 2. the request is queued, not merely described
+    const request = approvalRequestFor(gate.decision, { taskId: null, machineId: null, requestedBy: 'operator' });
+    const raised = raiseApproval(queue, request, { approvalId: 'AP-E2E', toolName: 'w2m_run' });
+    assert.equal(raised.ok, true, raised.detail);
+
+    // 3. and it is findable, with the subject level intact
+    const rows = queue.all();
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].action, 'dispatch_writing');
+    assert.equal(rows[0].subjectLevel, 49);
+
+    // 4. a captain may act on it; a peer may see it and may not answer it
+    const supervisor = queue.listFor({ id: 'supervisor', level: 50 });
+    assert.equal(supervisor[0].may_act, true);
+    assert.equal(supervisor[0].required_level, 50);
+    const peer = queue.listFor({ id: 'peer', level: 10 });
+    assert.equal(peer.length, 1, 'a peer still SEES the work, so the queue does not look idle');
+    assert.equal(peer[0].may_act, false);
+    assert.equal(peer[0].why_not.reason_code, INDEX_REFUSAL.INSUFFICIENT_AUTHORITY);
+
+    // 5. the decision settles it, and settling does not rewrite who asked
+    const verdict = queue.decide('AP-E2E', { id: 'supervisor', level: 50 }, 'approved');
+    assert.equal(verdict.ok, true, verdict.detail);
+    assert.equal(queue.all({ includeSettled: true })[0].settled, 'approved');
+    assert.equal(queue.all({ includeSettled: true })[0].subjectLevel, 49);
+  });
+
+  it('refuses the requester approving their own request, one level above the subject', () => {
+    // The property that makes the queue a control rather than a formality. Measured: raising at 49 and
+    // approving at 50 as the SAME id is refused, even though 50 is above the requirement.
+    const queue = createApprovalIndex({ now: () => 1000 });
+    const gate = gateDispatch({ write: true, write_scope: ['src/'] }, 49);
+    const request = approvalRequestFor(gate.decision, { taskId: null, machineId: null, requestedBy: 'operator' });
+    raiseApproval(queue, request, { approvalId: 'AP-SELF' });
+    const self = queue.decide('AP-SELF', { id: 'operator', level: 50 }, 'approved');
+    assert.equal(self.ok, false);
+    assert.equal(self.reason_code, INDEX_REFUSAL.SELF_APPROVAL);
+    assert.equal(queue.all()[0].settled, null, 'a refused decision must not settle the request');
+  });
+
+  it('refuses a decision from an approver at the subject level, naming the shortfall', () => {
+    const queue = createApprovalIndex({ now: () => 1000 });
+    const gate = gateDispatch({ write: true, write_scope: ['src/'] }, 49);
+    const request = approvalRequestFor(gate.decision, { taskId: null, machineId: null, requestedBy: 'operator' });
+    raiseApproval(queue, request, { approvalId: 'AP-LOW' });
+    const low = queue.decide('AP-LOW', { id: 'another', level: 49 }, 'approved');
+    assert.equal(low.ok, false);
+    assert.equal(low.reason_code, INDEX_REFUSAL.INSUFFICIENT_AUTHORITY);
+  });
+});
+describe('permission: the escalation really reaches the approval index', () => {
   const freshIndex = () => createApprovalIndex({ now: () => 1000 });
   const escalate = (level) => approvalRequestFor(decide('dispatch_writing', level), { taskId: 'T1', machineId: 'M1', requestedBy: 'actor-1' });
 
