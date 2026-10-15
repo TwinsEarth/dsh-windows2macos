@@ -4,6 +4,46 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.56.0] — 2026-10-15
+
+**The declared endpoint is now tested against the real binary, so a drifted port turns the pre-flight red.**
+
+### The gap the sixteen transport tests left open
+
+`mcp-http.test.mjs` drives `createRequestHandler` **in process**, with fake request and response objects. That
+proves the framing, and it proves **nothing about the CLI path**: a wrong default port, a crash during startup,
+an import cycle, or a `--http` flag that is never reached would all pass while `mcp.json` pointed at a dead URL.
+
+**A wrong end of a declared address is not a unit-test-shaped bug.** It has to be dialled.
+
+### What the new suite does differently
+
+`test/mcp-http-live.test.mjs` **spawns `bin/w2m-mcp.mjs --http`** and speaks to **the URL read out of
+`mcp.json`** — not a URL the test picks, because a healthy server on port 0 would prove nothing about `8766`.
+
+It asserts the far end is reachable and speaking the protocol, and **deliberately does not assert a successful
+tool result**: the relay needs an operator token the test does not carry, so **a `401` is the expected
+outcome**. That refusal is *stronger* evidence than a mocked `200` — **it proves the request left this process,
+crossed the binding, and was answered by the fleet's real relay**, which a mock could not distinguish from a
+server that never dialled out.
+
+**stdout is asserted empty.** The stdio binding owns stdout; if this path ever wrote a frame there, a client
+launching both would see a corrupted stream and the symptom would be a hang rather than an error.
+
+### Three levels of nesting, which is why this was worth checking
+
+`pre-flight` → runs the declared suite as a child → which runs this suite → which spawns the server. **That
+works**, and the run proved it rather than assuming it.
+
+### The one failure it produced, and it was mine
+
+The first run went red on `claims.test.mjs`: **`package.json` said 0.56.0 and the newest CHANGELOG entry said
+0.55.0.** I bumped the version before writing the entry. **This project's own check caught my ordering mistake**
+— which is the whole point of `claims` existing, and the second time this session that a version bump without an
+entry has been the only red line in an otherwise green run.
+
+**6 new tests, 0 failures.** Full suite 2324 in 87 files. **Pre-flight GREEN with FIFTEEN checks.**
+
 ## [0.55.0] — 2026-10-15
 
 **A second transport binding — and `mcp.json` now declares both.**
