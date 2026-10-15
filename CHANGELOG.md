@@ -4,6 +4,47 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.38.0] — 2026-10-15
+
+**A seven-phase council run on MacMini — real-machine evidence for the tool that had never touched one.**
+
+0.37.0's `w2m_council` was the only substantial addition in this span that had **never run anywhere but this
+laptop.** It now has a measurement, and the exit code came from the machine:
+
+```
+OK phases=7 outcome=ship dissent=1 reproduced=true      exit 0
+```
+
+Driven through `node -e` on MacMini against its own checkout at 0.37.0: the council was convened, roles
+assigned, two arguments recorded, two weighted votes cast, the outcome fixed, the decision sealed, and the
+sealed decision **read back after the council stopped being advanceable** — with its dissent, its reason, and a
+`recount` that reproduced the outcome from the stored ballots. **Every one of those was asserted before the
+process was allowed to exit `0`**, so this is not a "did it load" smoke test.
+
+### The same run answered a question that had only been a hypothesis for four rounds
+
+**v4.10.0's council works on MacMini because it reaches for nothing that machine lacks.** `council.mjs` imports
+`node:crypto` and `./authority.mjs`, and neither needs `node_modules`. The eight suites that failed there in
+0.32.0 therefore failed on **what their fixtures reach for**, not on the modules under test — **a measurement
+now, where four earlier releases recorded a guess as a guess.**
+
+It also sharpens the shape of that failure: a suite whose *subject* has no dependencies still fails if the
+*suite* imports one, and **from an exit code alone the two are indistinguishable.**
+
+### The sixth time I exceeded the ceiling
+
+The update dispatch — download a release tarball and extract it — **expired**. Measured again, and the number
+has not moved: the agent's lease survives roughly **50 seconds** (`heartbeatIntervalMs 10s × missedHeartbeats 2
++ leaseGraceMs 30s`), and an expired lease carries **no exit code at all**, so the work was lost rather than
+reported as failed.
+
+**What matters is what happened next:** rather than retrying the download, a **three-line probe** established
+that the extraction had in fact completed — **the partial run had succeeded and only the report was lost.** A
+retry would have spent another dispatch redoing finished work, and could have raced the `tar` it had left
+half-written.
+
+**No new tests.** What changed is a measurement, and a hypothesis that stopped being one.
+
 ## [0.37.0] — 2026-10-15
 
 **`council.mjs` is wired. v4.10.0's committee governance is reachable, and its dissent arrives with its decision.**
