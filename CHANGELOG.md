@@ -4,6 +4,47 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] — 2026-10-15
+
+**The root cause of three rounds of confusion was a regex, and it was mine.**
+
+Several rounds were spent believing a suite *failed on macOS*. It had not. The parser was looking for lines
+beginning `# tests 17`. Node v24 writes them beginning `ℹ tests 17`:
+
+```
+ℹ tests 17        not        # tests 17
+ℹ pass 17                    # pass 17
+ℹ fail 0                     # fail 0
+```
+
+**The `#` form was an assumption that was never checked**, carried from the first script written in this
+session to every one after it. The damage was worse than a misread count:
+
+* suites that had **passed** were recorded as `UNREADABLE`;
+* and then the absence of a `# fail` line, together with the absence of test *names* in the captured output,
+  was read as **"the process crashed before printing anything"** — which pointed at module scope and sent an
+  investigation somewhere the fault was not. Two rounds went into that, including a probe that correctly ruled
+  out every file-system hypothesis, because the hypothesis being tested was derived from a bad premise.
+
+`src/agent/test-report.mjs` now writes the contract down, parses both prefixes plus a bare form, reads
+**both streams and says which one answered**, and reports its own format so a future change is *reported*
+rather than silently tolerated. 13 tests, and the two that matter most are:
+
+* the **real** v24 output parses (taken verbatim from a run, not invented);
+* an unreadable report yields `verdict(...) === null`, **not `false`** — collapsing "could not read" into
+  "failed" is the safer of the two wrong directions and was still wrong enough to waste rounds.
+
+### The lesson, stated so it generalises
+
+**I assumed the shape of a channel's output instead of measuring it** — the same error, from the same
+channel, for the third time in this session (first the exit-code summary line, then the test names, now the
+prefix). The technique that finally settled it was printing the raw output and looking at it, which took one
+command and should have been the first.
+
+`test/log-bounds.test.mjs` remains skipped on macOS. With a working parser the skip is no longer plausible as
+a parse artefact, so the underlying assertion failure is still **UNVERIFIED** — but the reason it took so long
+to see is now fixed and tested.
+
 ## [0.12.3] — 2026-10-15
 
 **Correcting a wrong inference that 0.12.2 recorded as fact.**
