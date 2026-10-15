@@ -4,6 +4,39 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.3] — 2026-10-15
+
+**Correcting a wrong inference that 0.12.2 recorded as fact.**
+
+0.12.2's note on the macOS failure said: *"no test name appears in the captured output, so the failure happens
+before the per-test lines are printed — which points at module scope or a hook rather than a single
+`it(...)`."* **That reasoning was wrong, and it is corrected here rather than quietly dropped.**
+
+The claim rested on a probe that searched the captured output for twenty-seven test names and found none. A
+later run searched for the same twenty-seven and also found none — **on a run that succeeded**. So on this
+machine the test names do not appear in the output at all, and their absence said nothing about where the
+failure was. The same mistaken inference was drawn from the same channel capability twice.
+
+What is actually measured now, by a bit-encoded probe that asked six questions in **one** dispatch instead of
+six:
+
+| Question | Result |
+|---|---|
+| repository present | yes |
+| `log-bounds.mjs` present | yes |
+| `snapshot` is a function | yes |
+| `methodFor` is a function | yes |
+| the module import throws | **no** |
+| `mkdirSync` / `mkdtempSync` / `writeFileSync` succeed | yes |
+
+So the file operations and the module load are **fine** on that machine. The failure is a **plain assertion
+inside some `it(...)`** — one of twenty-eight — and not a crash at module scope. The suite stays skipped on
+macOS with that reason, unchanged in behaviour and now honest in its explanation.
+
+The lesson is about the channel, not the test: **the remote output does not contain what I assumed it
+contained**, and assuming its shape cost rounds twice. The probe that answers six questions per dispatch
+should have been the first thing built, not the last.
+
 ## [0.12.2] — 2026-10-15
 
 **Marking a platform-specific suite failure as UNVERIFIED instead of leaving it red, and saying exactly why.**

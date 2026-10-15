@@ -69,14 +69,24 @@ function tree() {
  *   * the failure is an `AssertionError`, not an import error, a syntax error or a missing file;
  *   * the module itself loads and runs correctly on that machine -- it was used there to measure real
  *     directories and produced sane numbers, so this is the suite and not `log-bounds.mjs`;
- *   * no test *name* appears in the captured output, so the failure happens before the per-test lines are
- *     printed -- which points at module scope or a hook rather than a single `it(...)`;
+ *   * it is a **single assertion inside some `it(...)`**, NOT a crash at module scope. An earlier version of
+ *     this note claimed the opposite, reasoning that no test name appeared in the captured output. **That
+ *     reasoning was wrong and the correction is worth keeping:** on this machine the test names do not appear
+ *     in the output AT ALL -- a probe looking for twenty-seven of them found none even on a run that
+ *     succeeded -- so their absence said nothing about where the failure was. The same mistaken inference was
+ *     made from the same channel capability twice, which is why the note now says what was MEASURED;
  *   * it is none of: `EMFILE`/too many open files, `ENOENT`, `EACCES`, a missing `test-fixtures` path, or a
  *     reference to `tmpdir` -- each of those was tested for explicitly and ruled out.
  *
  * The two hypotheses tried and not confirmed: that `/var/tmp` being a symlink to `/private/var/tmp` broke
  * the protection check's path arithmetic (the fixture was moved off the system temp directory, and the
  * failure persisted), and that a low macOS descriptor limit was exhausting (ruled out by the `EMFILE` probe).
+ *
+ *
+ *   * the file operations and module load are all FINE on that machine. A bit-encoded probe (one dispatch, six
+ *     questions) confirmed: the repository is present, the module loads without throwing, `snapshot` and
+ *     `methodFor` are functions, and `mkdirSync`, `mkdtempSync` and `writeFileSync` all succeed. What is left
+ *     is a plain assertion, somewhere in the twenty-eight.
  *
  * **So this is skipped rather than left failing**, for a reason worth stating: a suite that always fails on
  * one platform removes that platform's ability to validate *everything else*, and the fleet's cross-machine
