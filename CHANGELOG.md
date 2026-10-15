@@ -4,6 +4,77 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.28.0] — 2026-10-15
+
+**First real-machine verification of the recent work, and a tool that packs four answers into one exit code.**
+
+### The measurement
+
+The MacMini's checkout was updated to 0.27.0 and its own suites run there, with **the exit code produced by
+that machine** as the evidence:
+
+| Suite on MacMini | Result |
+|---|---|
+| `permission.test.mjs` | pass |
+| `fleet-scale.test.mjs` | pass |
+| `fleet-state.test.mjs` | pass |
+| `crypto-blake2s.test.mjs` | pass |
+
+Those four cover the code written in this span — the permission gate, the fleet arithmetic, the endpoint
+reconciliation, and the crypto capability report. This is the goal's "verify on the real machine with exit
+codes and artifacts" satisfied for that body of work, rather than inferred.
+
+### `scripts/machine-test-packet.mjs`
+
+A dispatch carries **one** exit code, so running four suites in one `node --test` answers only "did anything
+fail". This packs **two bits per file** into a single byte: `10` passed, `01` failed, `00` absent, `11`
+not measured. **`00` is distinguished from `01` on purpose** — "the file is not on this machine" is a
+deployment finding, "the file ran and failed" is a code finding.
+
+**Four dispatches were spent on this channel before the tool existed, two of them on my own misreadings:**
+
+* a TAP parser matching `^ok ` that counted **nothing**, because Node indents its subtests. It returned
+  `pass 0 fail 0` and I nearly read that as "no tests ran".
+* a summary regex that matched nothing, so the exit code described **my parser** rather than the code under
+  test.
+
+Both were the same mistake in different clothes, and it is the mistake this project keeps making: **assuming
+the shape of output instead of reading it.**
+
+### Three defects in the tool itself, all caught by its own suite
+
+* **The docstring claimed "zero is the all-clear", and that is false.** One passing file is `2`, four are
+  `170`. **Zero means every file was ABSENT** — a total deployment failure the old claim would have had a
+  reader take as a clean run. `allPassedCode()` now computes the value and the test asserts the arithmetic.
+* **The guard against emitting `126`/`127` was never reached** by the inputs I guessed. Enumerating the whole
+  two-bit space found the only two combinations that land on a shell-owned value
+  (`[PASSED, WAITED, WAITED, FAILED]` and `[WAITED, WAITED, WAITED, FAILED]`).
+* **The reassuring message was unreachable**, because it tested `code === 0` rather than the outcomes.
+  `packOutcomes([])` returns `0`, so the one code that reads as success was attached to the one input that
+  measured nothing.
+
+### The budget, and the fifth time I hit the same ceiling
+
+The first version took a 40-second timeout **per file** and ran four files: a 160-second worst case against
+this fleet's **~50-second lease ceiling** (`heartbeatIntervalMs 10s × missedHeartbeats 2 + leaseGraceMs 30s`).
+It **expired** on the real machine, and an expired lease carries **no exit code at all** — so the measurement
+was lost rather than reported negative. That is the fifth time in this project that a dispatch was built
+without respect for the ceiling.
+
+The fix is a **total budget** (`DEFAULT_BUDGET_MS`, 30s) with a per-file cap, and files that miss their turn
+are named `WAITED` rather than dropped — a packet that quietly omitted the last file would look like a clean
+run of the ones it managed. A per-file timeout answers "is this file hung"; only a total budget answers "will
+the answer survive the trip".
+
+### What the real machine refused, which is a finding and not a bug
+
+`node scripts/machine-test-packet.mjs ...` came back **`COMMAND_NOT_ALLOWED`**. The MacMini's allow-list
+admits `node -e` and `node --test`; it does not admit an arbitrary script path, and the packet **spawns
+`node --test` internally**, so it would be refused a second time. The tool is correct and tested; it needs an
+allow-list entry to run there, and **that is a change nobody has made.**
+
+**11 tests, 0 failures.**
+
 ## [0.27.0] — 2026-10-15
 
 **A blocked fleet reports itself. The approval count is in `w2m_status`, and it arrives as a note.**
