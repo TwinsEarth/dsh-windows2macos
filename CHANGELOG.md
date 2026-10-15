@@ -4,6 +4,47 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] — 2026-10-15
+
+**Committee governance (roadmap v4.10.0): one decision engine, ordered phases, weighted votes, retained dissent.**
+
+### Built now, wired to nothing — and that is the roadmap's own instruction
+
+ROADMAP §3 says a governance layer above a fleet *that has no disagreements yet* is indistinguishable from
+a delay, and that the council earns its place when two fleets want the same machine. So `council.mjs` ships
+as the decision engine, tested in isolation, with no caller. Building it now is justified because its
+semantics are testable; deploying it now would not be.
+
+### The three falsifying tests the roadmap names, as the suite's actual cases
+
+1. **A phase cannot be skipped.** `advance()` takes no argument, so there is no way to name a destination;
+   `goTo`/`setPhase`/`jumpTo` do not exist and a test asserts their absence. A vote before the vote phase
+   refuses with `COUNCIL_UNCLEARED_TO_VOTE`, and the message says why: *a vote on nothing*.
+2. **A vote's weights are reproducible from stored inputs.** `weightOf()` is a pure function of two stored
+   integers, so `recount()` reproduces an outcome on any machine. The falsification is in the suite: a
+   tampered weight is **detected** rather than reproduced, and the tally is asserted order-independent.
+3. **A decision is retrievable *with* its dissent.** Dissent is part of the `Decision` value, not a log
+   line, and `unanimous` is an explicit flag because an empty dissent list alone cannot distinguish
+   unanimous from unrecorded. A test seals a decision and checks that dropping a ballot changes the seal.
+
+### The design choice worth naming
+
+`weight = authority × (1 + reputation/100)`, so reputation is a bounded multiplier in `[1, 2)` and **can
+never overturn authority**: authority 49 at perfect reputation (98) still loses to a bare authority 99. A
+governance layer that let reputation outvote the authority model would be a second, undeclared authority
+model, and v4.7.0 already owns that question. A tie is a **refusal**, not a coin toss, because a split
+council is exactly the case a person must see — and the refusal carries the tally that shows the split.
+
+### Two design bugs the suite caught, both the same mistake
+
+`record()` sets the seal, and `adjourn` comes **after** `record`. Deriving "sealed" from `decision !== null`
+made `record()` block `advance()`, so the final phase was unreachable; and then having `advance()` consult
+the seal at all was self-contradictory for the same reason. The fix is the distinction the module now states
+explicitly: **the seal protects the decision, not the phase machine**. Conflating "decided" with "sealed"
+produced a state nobody could reach — twice.
+
+**28 tests, 0 failures.**
+
 ## [0.10.5] — 2026-10-15
 
 **FLEET-RULES.md enters the tree, with this host's reachability measured and written down.**
