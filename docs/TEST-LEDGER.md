@@ -118,6 +118,7 @@ was not re-measured keeps its old date — **a stale date is information, and qu
 | `GATE-002` | an accepted orphan that is no longer an orphan fails — the list cannot go stale | **PASS** | 2026-10-15 | `field-authority` was removed when 0.41.0 gave it a caller, **because this check went red** |
 | `GATE-003` | `layer-check` prints `clean` **and exits 0** | **PASS** | 2026-10-15 | after the fix. **Before it printed `clean:` and exited `1`** — every reader trusting the status read a passing check as a failure; the pre-flight never noticed because its step reads the *printed text* |
 | `HARNESS-001` | a hand-rolled test harness measures the harness | **PASS (as a warning)** | 2026-10-15 | **41 failures** running every suite in one process with `--experimental-test-isolation=none`, vs **1** via the project's own entry. The other 38 were `mdns-discover`'s fetch stub leaking into `outbound-only` |
+| `HARNESS-002` | **a count typed by hand drifts from the table it describes** | **FAIL, then corrected** | 2026-10-15 | CHANGELOG 0.46.0 claimed *"54 rows / 32 executed / 22 not"*. Read from `TEST-MATRIX.md`: **61 rows / 53 executed / 8 never run / 11 blocked / 1 skipped / 2 refuted.** I had merged **`阻塞`** (the command ran and the environment stopped it) with **`待执行`** (never run) — so 61 became 54 and 8 became 22 |
 
 ---
 

@@ -4,6 +4,41 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.47.0] — 2026-10-15
+
+**Correcting my own counts: 0.46.0 said 54/32/22, the table says 61/53/8.**
+
+0.46.0's entry claimed *"**54 rows** across twelve sections"*, *"**32 of 54** rows are executed; **22** are not"*.
+**All three numbers were typed by hand, and all three were wrong.** Read from `docs/TEST-MATRIX.md`:
+
+| | 0.46.0 said | the table says |
+|---|---|---|
+| rows | 54 | **61** |
+| executed | 32 | **53** |
+| not executed | 22 | **8 never run**, plus **11 blocked**, **1 skipped**, **2 refuted** |
+
+### The cause is that I merged two words that are not the same
+
+**`阻塞` means the command RAN and the environment stopped it. `待执行` means it never ran at all.** I collapsed
+both into "not executed" — **and a count that merges two categories is wrong in both directions at once**: it
+overstates what was never attempted and understates what was attempted and blocked.
+
+**The matrix now marks `阻塞` as "the command executed" explicitly, and carries a note recording this mistake**,
+because the distinction is the one a reader needs in order to tell "we have not tried" from "we tried and were
+stopped".
+
+### It is the same error the matrix itself documents, one level up
+
+The matrix's own rule is that **a row's result may only be changed by re-running its `Instance` and reading the
+output**, and that a count copied from an older plan becomes more true-looking each time it is copied. **I then
+wrote the headline counts of the document from memory instead of reading the document.** The rule was in the
+file I was writing.
+
+**So the counts are no longer asserted anywhere by hand.** They are read from the table, and the reading is
+recorded: `61 = 39 通过 + 8 待执行 + 11 阻塞 + 1 跳过 + 2 证伪`.
+
+**No new tests.** What changed is three numbers and the reason they drifted.
+
 ## [0.46.0] — 2026-10-15
 
 **The test matrix the plans asked for — with every row it could not earn left as `待执行`, and the reason named.**
