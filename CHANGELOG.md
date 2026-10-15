@@ -4,6 +4,90 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.30.0] — 2026-10-15
+
+**The same ruler on the other two entries: v4.9.0 had the same defect, v4.10.0 did not.**
+
+After 0.29.0 found that v4.8.0's *"driven by the authority model"* was a phrase rather than a mechanism, the
+next two ROADMAP sentences were checked the same way rather than assumed sound.
+
+| Entry | Claim | Verdict |
+|---|---|---|
+| v4.9.0 | cross-session pending-approval index | **real**, substantial |
+| v4.9.0 | **"with the already-shipped rate limiter as its front door"** | **never built** |
+| v4.10.0 | ordered phases, a phase cannot be skipped | **real**, asserted by name |
+| v4.10.0 | weights reproducible from stored inputs | **real**, plus tamper detection |
+| v4.10.0 | dissent retrievable *with* the decision | **real**, and the dissent is inside the seal |
+
+Measured for the missing half: **`approval-index.mjs` imports `authority.mjs` and nothing else** — no
+limiter, no window, no cooldown anywhere in the file — while the shipped `SlidingWindowRateLimiter` sat in
+`relay/server.mjs` with **no approval caller**. Two entries, one defect, and the third entry was genuine:
+**the pattern was not assumed, it was tested.**
+
+### `src/agent/approval-gate.mjs`
+
+**It limits raising and nothing else.** That asymmetry is the design:
+
+* limiting the **view** would limit *knowing what is waiting*, which is the one thing the queue exists for;
+* limiting **settling** would punish the supervisor clearing the backlog — a limit there is a limit on fixing
+  the problem;
+* **raising** is the surface, because the threat is not brute force but **queue flooding**: an agent in a
+  retry loop can raise hundreds of requests and drown out the work that needs attention.
+
+Two more decisions worth naming:
+
+* **The key is an identity, not an address.** A fleet's agents frequently share a host, so an address-keyed
+  budget would apply one allowance to everybody on it — refusing the well-behaved because a neighbour
+  misbehaved. An anonymous caller gets a **shared named budget rather than none**, because *"no id, no key, no
+  limit"* would make forgetting to identify yourself the way to escape the limit.
+* **The default is not the pairing limit.** `DEFAULT_PAIR_RATE_LIMIT_PER_MINUTE` is 5 because pairing is rare
+  and a wrong guess is an attack; raising approvals is ordinary work done in bursts. Inheriting a number built
+  for a different threat would have been the easy mistake.
+
+It composes the shipped `SlidingWindowRateLimiter` rather than writing a second sliding window — the roadmap's
+word was *"already-shipped"*, and two windows in one codebase are two chances to disagree about what a minute
+is. A test asserts the composition.
+
+The absence of `mayList` / `maySettle` / `mayDecide` is asserted **as an absence**, because their presence is
+the defect and a test about flooding would never notice them.
+
+### One error of mine
+
+I looked for the "shared anonymous budget" wording on the **refusal**; it is on the **allow** branch, which is
+where a caller learns which budget they are spending from. The implementation was right and the assertion was
+in the wrong half — seventh time in this project, and the same remedy worked: measuring instead of predicting.
+
+### The layer checker refused my first version, and it was right
+
+Importing the limiter from `relay/server.mjs` made an **`agent` module depend on the `relay` layer**:
+
+```
+relay -> util is not in ALLOWED_EDGES (undeclared)   ← after the first fix attempt
+agent -> relay                                        ← the original refusal
+```
+
+`agent` is rank 2 and `relay` is rank 3, so that edge **points up**. The tempting fix was to add
+`['agent', 'relay']` to the allow-list, which would have **legalised an inversion**. The right fix was to
+notice that `SlidingWindowRateLimiter` **never used anything from the relay** — it holds a `Map` and reads a
+clock — so it belonged in `util` (rank 0, a leaf) all along.
+
+The move cost nothing at runtime, and that is measured rather than assumed: **the relay's own construction
+site already passed `limit` explicitly**, so the class's defaults had never been used. Its `limit` is now
+**required** instead of defaulting to `DEFAULT_PAIR_RATE_LIMIT_PER_MINUTE` — keeping that default would mean
+this leaf importing a relay constant, **the same inversion one level down**.
+
+Two edges are declared, both downward: `['agent', 'util']` and `['relay', 'util']`. The layer model is now
+`clean: every cross-layer edge is declared`.
+
+### Two more of my own errors
+
+* `export { DEFAULT_WINDOW_MS as RATE_LIMIT_WINDOW_MS } from '...'` **re-exports without creating a local
+  binding**, so the relay's constructor threw `RATE_LIMIT_WINDOW_MS is not defined` while the module's public
+  surface looked perfectly correct. **106 tests failed at once**, which is how it was found.
+* I looked for the "shared anonymous budget" wording on the refusal; it is on the allow branch.
+
+**12 tests, 0 failures**, and 197 across the five affected suites.
+
 ## [0.29.0] — 2026-10-15
 
 **v4.8.0 was half shipped, and the ROADMAP said otherwise. The missing half is now built.**

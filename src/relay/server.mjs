@@ -38,7 +38,12 @@ import {
 export const DEFAULT_SSE_KEEPALIVE_MS = 15_000; // §3.2: every 15s a `: keepalive` line
 export const DEFAULT_SWEEP_INTERVAL_MS = 1_000;
 export const DEFAULT_PAIR_RATE_LIMIT_PER_MINUTE = 5; // v0.1.2 §6
-export const RATE_LIMIT_WINDOW_MS = 60_000;
+// The window length is a unit and lives with the limiter. Both names are kept: `DEFAULT_WINDOW_MS` is the
+// local binding this module uses, and `RATE_LIMIT_WINDOW_MS` is the name this module has always exported.
+// `export ... from` would NOT have worked here -- it re-exports without creating a local binding, so the
+// constructor below saw `RATE_LIMIT_WINDOW_MS is not defined` while the export itself looked fine.
+import { DEFAULT_WINDOW_MS, SlidingWindowRateLimiter } from '../util/rate-limit.mjs';
+export { DEFAULT_WINDOW_MS as RATE_LIMIT_WINDOW_MS };
 export const DEFAULT_STATE_DIR = path.join(os.homedir(), '.w2m');
 
 /**
@@ -278,62 +283,18 @@ function readSecretValue(value, label) {
  * Per-IP sliding window. Successful pairs count too, otherwise a working pairing
  * code could be used to flush the failure budget.
  */
-export class SlidingWindowRateLimiter {
-  constructor({ limit = DEFAULT_PAIR_RATE_LIMIT_PER_MINUTE, windowMs = RATE_LIMIT_WINDOW_MS, now = Date.now } = {}) {
-    this.limit = limit;
-    this.windowMs = windowMs;
-    this._now = now;
-    /** @type {Map<string, number[]>} */
-    this.buckets = new Map();
-  }
-
-  get windowSeconds() { return Math.round(this.windowMs / 1000); }
-
-  /** Records one attempt and reports whether it is allowed. */
-  hit(key) {
-    if (this.limit <= 0) {
-      return { allowed: true, retry_after_seconds: 0, limit: 0, window_seconds: this.windowSeconds, remaining: Infinity };
-    }
-    const now = this._now();
-    const cutoff = now - this.windowMs;
-    let hits = this.buckets.get(key);
-    if (!hits) {
-      hits = [];
-      this.buckets.set(key, hits);
-    }
-    while (hits.length > 0 && hits[0] <= cutoff) hits.shift();
-
-    if (hits.length >= this.limit) {
-      const retryMs = hits[0] + this.windowMs - now;
-      return {
-        allowed: false,
-        retry_after_seconds: Math.max(1, Math.ceil(retryMs / 1000)),
-        limit: this.limit,
-        window_seconds: this.windowSeconds,
-        remaining: 0,
-      };
-    }
-    hits.push(now);
-    return {
-      allowed: true,
-      retry_after_seconds: 0,
-      limit: this.limit,
-      window_seconds: this.windowSeconds,
-      remaining: this.limit - hits.length,
-    };
-  }
-
-  /** Drop idle buckets so a long-running relay cannot leak memory. */
-  prune() {
-    const cutoff = this._now() - this.windowMs;
-    for (const [key, hits] of this.buckets) {
-      while (hits.length > 0 && hits[0] <= cutoff) hits.shift();
-      if (hits.length === 0) this.buckets.delete(key);
-    }
-  }
-
-  reset() { this.buckets.clear(); }
-}
+/*
+ * The limiter MOVED to `src/util/rate-limit.mjs` in v0.30.0.
+ *
+ * It never used anything from this file, and when the approval gate needed the same window, importing it
+ * from here made an `agent` module depend on the `relay` layer -- which `scripts/layer-model.mjs` refused,
+ * correctly. `agent` is rank 2 and `relay` is rank 3, so the edge points up; moving the class to `util`
+ * (rank 0, a leaf) lets both depend on it in the only direction the model allows.
+ *
+ * Re-exported rather than merely imported, because `SlidingWindowRateLimiter` and `RATE_LIMIT_WINDOW_MS` are
+ * part of this module's published surface and `test/relay.test.mjs` imports the class from here.
+ */
+export { SlidingWindowRateLimiter };
 
 /* ------------------------------------------------------------------ */
 /* server                                                              */
@@ -420,7 +381,7 @@ export class RelayServer {
     /* ---- /v1/pair rate limit (§6) ---- */
     this.pairLimiter = new SlidingWindowRateLimiter({
       limit: this.pairRateLimitPerMinute,
-      windowMs: RATE_LIMIT_WINDOW_MS,
+      windowMs: DEFAULT_WINDOW_MS,
       now: () => this.state.nowMs(),
     });
 

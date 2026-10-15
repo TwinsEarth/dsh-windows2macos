@@ -81,14 +81,25 @@ chooser is ever asked about them.
 The lesson is recorded rather than tidied away: **a roadmap sentence is a claim, and this one was checkable
 in one grep.** It stood for several releases because nothing tested the sentence itself.
 
-### v4.9.0 — approval queue and scheduling
+### v4.9.0 — approval queue and scheduling  **shipped in 0.10.0 (index); the rate-limiter front door added in 0.30.0**
 
 **Deliverable.** A cross-session pending-approval index (§4.2's "supervisor reviews every agent's pending
 approvals from one queue"), with the already-shipped rate limiter as its front door. Scheduling stays
 out of scope here — MARL is not buildable at five machines, and pretending otherwise would be the most
 expensive kind of dishonesty in this roadmap.
 
-### v4.10.0 — committee governance
+**Correction, 0.30.0.** The index shipped and is substantial. **"With the already-shipped rate limiter as its
+front door" did not**: measured, `approval-index.mjs` imports `authority.mjs` and nothing else, and the file
+contains no limiter, window or cooldown — while the shipped `SlidingWindowRateLimiter` sat in
+`relay/server.mjs` with no approval caller. The front door was a phrase, exactly as v4.8.0's authority half
+was.
+
+It now exists in `src/agent/approval-gate.mjs`, and **it limits raising and nothing else**. That asymmetry is
+the design, not an omission: limiting the *view* would limit knowing what is waiting, and limiting *settling*
+would punish the supervisor clearing the backlog. The key is the requester's identity rather than an address,
+because a fleet's agents often share a host and an address-keyed budget would blame the wrong machine.
+
+### v4.10.0 — committee governance  **shipped in 0.11.0, and verified against this entry in 0.30.0**
 
 **Deliverable.** The AURA six-role council as a *single* decision engine with the seven phases, weighted
 voting whose weights come from v4.7.0's authority plus reputation, and **dissent retention** — the losing
@@ -97,6 +108,16 @@ a decision auditable later.
 
 **Falsifying tests.** a phase cannot be skipped; a vote's weights are reproducible from stored inputs; a
 decision with recorded dissent is retrievable *with* the dissent.
+
+**Verification, 0.30.0.** All three are asserted in `test/council.test.mjs`, by name: *"starts in convene and
+moves exactly one phase per advance"* and *"exposes no way to name a destination phase"*; *"reproduces a
+recorded outcome from the stored ballots alone"*, *"is a pure function: same inputs, same weight, no hidden
+state"* and *"detects a tampered weight instead of reproducing it"*; *"retains the losing arguments alongside
+the outcome"* and *"keeps the dissent in the value the seal covers, so it cannot be dropped later"*.
+
+**This entry is the reason the two above it were checked.** v4.8.0 and v4.9.0 each described something that
+was not built; this one described something that was. Rather than assume the pattern, each sentence was
+treated as a claim and tested — which is the practice the two corrections exist to record.
 
 ### v4.11.0–v4.13.0 — scale, defence, integration
 

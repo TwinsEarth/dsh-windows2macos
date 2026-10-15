@@ -57,6 +57,12 @@ export const ALLOWED_EDGES = Object.freeze([
   ['plugin', 'relay'],
   ['relay', 'chatops'],
   ['agent', 'shared'],
+  // v0.30.0: the shared sliding-window limiter. Not ['agent', 'relay'] -- that edge points UP (agent is
+  // rank 2, relay is rank 3), and the class moved to util rather than the model being widened.
+  ['agent', 'util'],
+  // The same limiter, reached from the layer it was originally written in. Also downward (relay 3 -> util 0),
+  // and the second half of the same decision: one shared window rather than two that could disagree.
+  ['relay', 'util'],
   ['relay', 'shared'],
 ]);
 
