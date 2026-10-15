@@ -337,10 +337,40 @@ export function serve({ input, output, deps }) {
   return pending;
 }
 
-function main() {
+/**
+ * Start the server on the transport the caller asked for.
+ *
+ * **stdio is the default because it is what `mcp.json` declares and what a client launches.** `--http` is for
+ * the clients that require an HTTP endpoint -- one of them is known to insist on a local HTTP server with a
+ * discovery file rather than a subprocess -- and it is an explicit flag rather than a guess, because the two
+ * transports have different threat models: a subprocess talks to its parent, a socket talks to whatever can
+ * reach the port.
+ */
+async function main() {
+  const argv = process.argv.slice(2);
+  const flag = (name, dflt) => (argv.includes(name) ? argv[argv.indexOf(name) + 1] : dflt);
   const config = readConfig();
   log(`starting; relay ${config.relayUrl}; device ${config.device?.machine_name ?? '(none)'}`);
   log(`read-only tools: ${TOOL_NAMES.join(', ')}`);
+
+  if (argv.includes('--http')) {
+    const { createMcpHttpServer } = await import('../src/mcp/http-transport.mjs');
+    const host = flag('--host', '127.0.0.1');
+    const port = Number(flag('--port', 8766));
+    if (!Number.isInteger(port) || port < 0 || port > 65535) {
+      log(`--port ${flag('--port')} is not a port number`);
+      process.exit(2);
+    }
+    const running = await createMcpHttpServer({ host, port, deps: { config, fetchImpl: fetch } });
+    // Printed so a launcher can read the port when it asked for 0, and on stderr so it never touches a protocol
+    // stream -- this binding has no stdout protocol, but the rule is the same one the stdio binding follows.
+    log(`streamable-http listening on ${running.url}`);
+    const stop = async () => { await running.close(); process.exit(0); };
+    process.on('SIGINT', stop);
+    process.on('SIGTERM', stop);
+    return;
+  }
+
   serve({ input: process.stdin, output: process.stdout, deps: { config, fetchImpl: fetch } });
 }
 

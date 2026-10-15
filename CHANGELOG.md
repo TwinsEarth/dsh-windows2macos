@@ -4,6 +4,60 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.55.0] — 2026-10-15
+
+**A second transport binding — and `mcp.json` now declares both.**
+
+### The same protocol, two bindings, and no logic shared between them
+
+The MCP overview states it plainly: **"protocol semantics are identical on every transport. A transport is a
+binding."** So `src/mcp/http-transport.mjs` contains **no protocol decisions** — it decodes a request, hands the
+body to the same `handleMessage` the stdio binding uses, and encodes the reply. **Neither binding imports the
+other.** The single command reaches the fleet over both.
+
+### What revision `2026-07-28` removed, which made this smaller than expected
+
+* **The GET stream endpoint is gone.** A bare `GET /mcp` gets **405 naming the revision**, not a 404 — a client
+  written against the older revision should learn *why* rather than guess at the URL.
+* **Protocol-level sessions are gone.** No `Mcp-Session-Id`, no session table, no state between requests. Two
+  identical requests return identical bytes, and the test asserts it.
+
+`GET /mcp?discover` still answers, **gated on an explicit parameter**: a bare GET is what the removed stream
+client sends, and handing it a description document to parse as a stream would be worse than refusing it.
+
+### The `Origin` rule is a MUST, and it is easy to skip
+
+> **"Servers MUST validate the `Origin` header on all incoming connections to prevent DNS rebinding attacks."**
+
+A loopback MCP server is reachable by **any page the user's browser loads**, and a rebinding attack makes that
+page same-origin. So a refused `Origin` gets **403 before the body is read** — asserted with an unparseable body,
+because ordering is the property.
+
+**A missing `Origin` is allowed, and that is a decision rather than an oversight**: the header constrains
+*browsers*, an attacker's browser always sends one, and refusing an absent header would break every
+command-line client while stopping no attack. The default bind is **127.0.0.1**, per the specification's SHOULD.
+
+### `mcp.json` declares both, and one of them is not a subprocess
+
+```json
+"w2m-fleet":      { "type": "stdio",           "command": "node", "args": ["./bin/w2m-mcp.mjs"], "cwd": "${PLUGIN_ROOT}" },
+"w2m-fleet-http": { "type": "streamable-http", "url": "http://127.0.0.1:8766/mcp" }
+```
+
+**The HTTP entry names a server that must be started separately** — `node bin/w2m-mcp.mjs --http` — because a
+remote-transport entry has no `command` to launch. That is what the transport type means, and the alternative —
+declaring only stdio — would leave an HTTP-only client with nothing to connect to. **The `cwd` is
+`${PLUGIN_ROOT}` rather than a path, so the entry works wherever the package is installed**, and
+`plugin-manifest-check.mjs` validates both entries against the schema's closed per-transport field sets.
+
+### One assertion I wrote wrong, and the fix was the implementation
+
+My discovery handler matched `GET /mcp` **exactly**, while the test sent `GET /mcp?discover=1`. **The test was
+right and the code was wrong** — the two GETs are different callers with different needs, and telling them apart
+by a parameter is honest where guessing at intent is not. Fixed the handler, not the test.
+
+**16 new tests, 0 failures.** Full suite 2318 in 86 files. **Pre-flight GREEN with FIFTEEN checks.**
+
 ## [0.54.0] — 2026-10-15
 
 **The fleet is published as an MCP server — read-only, and every declared route is checked against the relay's

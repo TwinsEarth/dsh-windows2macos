@@ -6,6 +6,10 @@
       "command": "node",
       "args": ["./bin/w2m-mcp.mjs"],
       "cwd": "${PLUGIN_ROOT}"
+    },
+    "w2m-fleet-http": {
+      "type": "streamable-http",
+      "url": "http://127.0.0.1:8766/mcp"
     }
   }
 }
