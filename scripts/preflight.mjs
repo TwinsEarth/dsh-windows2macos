@@ -1103,6 +1103,7 @@ export const DECLARED_CHECKS = [
   'CHANGELOG shape (title above the newest entry, newest-first)',
   'agent skills (frontmatter satisfies the loader, so no skill is silently dropped)',
   'agent plugins manifest (plugin.json and mcp.json satisfy Agent Plugins 1.0.0)',
+  'mcp server (every declared route exists in the relay, and no tool can mutate)',
 ];
 
 /**
@@ -1125,6 +1126,8 @@ export const GATE_INVENTORY = [
   { artifact: 'mojibake scanner', path: 'scripts/scan-mojibake.mjs', checkedBy: 'mojibake scan (whole tree, plus a positive control)' },
   { artifact: 'accepted-orphan list', path: 'scripts/accepted-orphans.mjs', checkedBy: 'reachable or accepted (no orphan module without a written reason)' },
   { artifact: 'entry-point check', path: 'scripts/check-entrypoints.mjs', checkedBy: 'entry points (scripts/check-entrypoints.mjs)' },
+  { artifact: 'mcp route validator', path: 'scripts/mcp-check.mjs', checkedBy: 'mcp server (every declared route exists in the relay, and no tool can mutate)' },
+  { artifact: 'MCP server', path: 'bin/w2m-mcp.mjs', checkedBy: 'mcp server (every declared route exists in the relay, and no tool can mutate)' },
   { artifact: 'manifest validator', path: 'scripts/plugin-manifest-check.mjs', checkedBy: 'agent plugins manifest (plugin.json and mcp.json satisfy Agent Plugins 1.0.0)' },
   { artifact: 'Agent Plugins manifest', path: 'plugin.json', checkedBy: 'agent plugins manifest (plugin.json and mcp.json satisfy Agent Plugins 1.0.0)' },
   { artifact: 'MCP configuration', path: 'mcp.json', checkedBy: 'agent plugins manifest (plugin.json and mcp.json satisfy Agent Plugins 1.0.0)' },
@@ -1815,6 +1818,28 @@ function checkAgentPluginsManifest() {
   return pass('plugin.json and mcp.json satisfy Agent Plugins 1.0.0');
 }
 
+/**
+ * The MCP server's declared routes must exist, and no tool may mutate.
+ *
+ * `bin/w2m-mcp.mjs` reaches the relay over HTTP, so a route typo is invisible to every other check: the relay
+ * answers 404, the MCP client reports a broken server, and the bug is here. **My first draft of that file
+ * declared two routes that do not exist**, which is why the routes are read back out of the relay's own router.
+ */
+function checkMcpServer() {
+  const validator = join(ROOT, 'scripts', 'mcp-check.mjs');
+  if (!existsSync(validator)) return fail(`no MCP validator at ${validator}`);
+  const result = child('mcp-server', process.execPath, [validator, ROOT]);
+  const problems = /problems: (\d+)/.exec(result.stdout);
+  if (problems === null) {
+    const why = result.error === null ? 'no parseable verdict' : `${result.error.code ?? result.error.name}: ${result.error.message}`;
+    return fail(`the MCP validator did not run (${why})`, tail(result, 20));
+  }
+  if (!result.ok || Number(problems[1]) > 0) {
+    return fail(`${problems[1]} MCP server problem(s); every one is named below`, tail(result, 20));
+  }
+  return pass('five read-only tools, every declared route routed by the relay');
+}
+
 function checkMojibake() {
   const scanner = join(ROOT, 'scripts', 'scan-mojibake.mjs');
   if (!existsSync(scanner)) return fail(`no scanner at ${scanner}`);
@@ -2303,6 +2328,10 @@ async function main() {
     [
       'agent plugins manifest (plugin.json and mcp.json satisfy Agent Plugins 1.0.0)',
       checkAgentPluginsManifest,
+    ],
+    [
+      'mcp server (every declared route exists in the relay, and no tool can mutate)',
+      checkMcpServer,
     ],
     [
       'ledger self-test (silence and an unaccepted UNVERIFIABLE are both failures)',

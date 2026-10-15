@@ -4,6 +4,81 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.54.0] — 2026-10-15
+
+**The fleet is published as an MCP server — read-only, and every declared route is checked against the relay's
+own router.**
+
+### Five tools, and nothing that can change anything
+
+```
+w2m_devices  -> /v1/devices
+w2m_stats    -> /healthz
+w2m_history  -> /v1/tasks
+w2m_report   -> /v1/tasks/{id}/report
+w2m_status   -> /v1/agents/{id}/status
+```
+
+**`w2m_run` is deliberately absent.** A server that hands fleet execution to any process able to start it gives
+away the ability to run commands on every machine in the fleet — and this project has already learned that a
+guard which is merely *named* well is not a guard: the `--dry-run` flag in `scripts/ilink-fleet-bridge.mjs`
+**dispatched for real while its name promised otherwise**. So the first version exposes five reads, and a test
+asserts by name that no mutating tool appears — **a later edit adding `w2m_run` has to delete an assertion rather
+than quietly widen what the fleet exposes.**
+
+### I invented two routes, and the check that catches that now exists
+
+My first draft declared `/v1/stats` and `/v1/status`. **Neither exists.** The relay's complete GET surface is
+`/healthz`, `/metrics`, `/v1/stream`, `/v1/devices`, `/v1/tasks`, `/v1/tasks/{id}`, `/v1/tasks/{id}/report` and
+`/v1/agents/{id}/status`.
+
+**A fabricated route does not fail loudly.** The relay answers 404, the MCP client reports a broken server, and
+the bug is in this package — a failure that surfaces in somebody else's tool, at a time nobody connects to this
+commit. So `scripts/mcp-check.mjs` **reads the routes back out of `src/relay/server.mjs` and compares them**, and
+the pre-flight runs it as a fifteenth check. Verified by injection: adding `/v1/invented` turns it red and names
+the route.
+
+**Two routes needed canonicalising to compare at all** — the router carries `/v1/tasks/([^/]+)/report` where the
+tool declares `/v1/tasks/{id}/report`. The first version of the check failed on two routes that *are* routed,
+which is its own lesson: **a check that fails on correct input gets disabled.**
+
+### Both protocol eras, because the deployed clients are on the older one
+
+The current revision (`2026-07-28`) is **stateless** — version, identity and capabilities travel as per-request
+`_meta`, and there is **no handshake**. Every earlier revision opens with `initialize`.
+
+**A server implementing only the modern contract is unreachable from most deployed clients**, which is exactly
+the population this exists to serve. So `initialize` is answered for legacy clients, `_meta` is honoured for
+modern ones, and an unsupported version gets the `-32022` error **with the `supported` list**, as the
+specification requires. `server/discover`, which the current revision demands of every server, is implemented.
+
+**A notification is never answered** — JSON-RPC forbids it, and `notifications/initialized` is sent by every
+legacy client, so getting that wrong breaks every connection.
+
+### stdout carries protocol messages and nothing else
+
+Over stdio a stray `console.log` corrupts the stream, and the symptom is a **hung client**, not a chatty server.
+Every diagnostic in this file goes to stderr through one `log()`, and the test drives the real `serve()` loop
+over in-memory streams rather than spawning a process — **because a test that needs a subprocess is skipped
+wherever piped stdio is refused, which is exactly where a protocol regression must still be caught.**
+
+### Four mistakes of mine, three of them the same mistake
+
+* **`/v1/stats` and `/v1/status` were fabricated.** Read the router; do not write the route you expect.
+* **`mcp-check.mjs` ran its whole check and called `process.exit` on import**, so the consuming suite reported
+  **1 test instead of 25** with no failure named. **This is the third file in this project to need the same
+  guarded-`main()` fix** — `skill-check.mjs` and `plugin-manifest-check.mjs` were the first two — and each one
+  now carries the guard with a comment saying why.
+* **I deleted a doc comment's closing `*/`**, which commented out `export const TOOLS` and produced
+  `TOOLS is not defined`. **That is the fourth time in this project that an edit matched anchor text without
+  reading the block containing it.**
+* **One assertion failed three times for three different incidental reasons** — a sample value substituted
+  where the builder applied a default, a `{id}` that `canonicalRoute` refuses to collapse, and an optional
+  property left unset. **The fix was to narrow what it tests**: the property is *"this tool can reach the route
+  it declares"*, and the query string is not part of that.
+
+**25 new tests, 0 failures.** Full suite 2302 in 85 files. **Pre-flight GREEN with FIFTEEN checks.**
+
 ## [0.53.0] — 2026-10-15
 
 **The shared-memory layer gets a suite, and it corrected three things this session had already "verified".**

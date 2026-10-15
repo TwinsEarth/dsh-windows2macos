@@ -1,4 +1,11 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
-  "mcpServers": {}
+  "mcpServers": {
+    "w2m-fleet": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["./bin/w2m-mcp.mjs"],
+      "cwd": "${PLUGIN_ROOT}"
+    }
+  }
 }
