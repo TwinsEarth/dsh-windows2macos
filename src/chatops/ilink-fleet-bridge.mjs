@@ -114,6 +114,57 @@ export function textOf(message) {
 }
 
 /**
+ * Describe the SHAPE of a message's items without recording any of their content.
+ *
+ * ## Why this exists rather than an image branch
+ *
+ * `ITEM_TYPE` declares exactly one member, `TEXT: 1`. **The shape of every other item type is unrecorded in this
+ * repository** -- no `image_item`, no sample payload, no fixture. So a download path written now would be a guess
+ * about field names, and **it would fail at the moment a real person's photograph arrived**, which is the worst
+ * possible time to discover it.
+ *
+ * This is the discovery step instead. It reports **key paths and value types, never values**, so an operator can
+ * send one photograph and the log then says what the far end actually sends. **Every wrong guess this session
+ * was corrected by printing the thing instead of predicting it** -- a fabricated relay route, a malformed PNG, a
+ * count on a CHANGELOG entry -- and this is that method applied before the guess rather than after.
+ *
+ * Values are never included because a message body is the user's content, and **a discovery aid that quietly
+ * logs photographs to a file would be a worse defect than the one it is diagnosing.**
+ *
+ * @param {object} message one `msgs[]` entry
+ * @param {{maxKeys?: number, maxDepth?: number}} [options]
+ * @returns {string} a compact, content-free description
+ */
+export function describeItems(message, { maxKeys = 24, maxDepth = 3 } = {}) {
+  const items = Array.isArray(message?.item_list) ? message.item_list : [];
+  if (items.length === 0) return 'item_list is empty or absent';
+
+  /**
+   * A bounded walk: enough to answer "which fields exist and what kind are they", and short enough that a
+   * surprising payload cannot bury the log. Arrays are described by their first element, because a caption list
+   * and a sticker list need the same answer.
+   */
+  const seen = new Set();
+  const walk = (value, depth) => {
+    if (value === null) return 'null';
+    if (Array.isArray(value)) return value.length === 0 ? 'array[0]' : `array[${value.length}] of ${walk(value[0], depth)}`;
+    const kind = typeof value;
+    if (kind !== 'object') return kind;
+    if (depth >= maxDepth) return 'object{…}';
+    if (seen.has(value)) return 'object{cyclic}';
+    seen.add(value);
+    const keys = Object.keys(value).slice(0, maxKeys);
+    const parts = keys.map((k) => `${k}:${walk(value[k], depth + 1)}`);
+    const more = Object.keys(value).length > maxKeys ? `,+${Object.keys(value).length - maxKeys}` : '';
+    return `{${parts.join(',')}${more}}`;
+  };
+
+  return items
+    .map((item, i) => `item[${i}].type=${JSON.stringify(item?.type)} ${walk(item, 1)}`)
+    .join(' | ');
+}
+
+/**
  * The reply envelope.
  *
  * `context_token` is **mandatory and comes from the inbound message**: without it the reply is not
@@ -230,7 +281,22 @@ export function planMessage({ message, authorize }) {
   // A non-text message is answered rather than dropped: "every sentence must get a reply" includes the
   // sentences the bridge cannot read.
   if (text === null) {
-    return { act: 'reply', to: from, contextToken, text: helpText({ reason: '这条消息不是文字（语音/图片/文件暂不支持）' }) };
+    const shape = describeItems(message);
+    return {
+      act: 'reply',
+      to: from,
+      contextToken,
+      text: helpText({ reason: '这条消息不是文字（语音/图片/文件暂不支持）' }),
+      /**
+       * Carried out of the plan so the caller can log it.
+       *
+       * **The shape, never the content.** This field exists so that one photograph sent by a person answers the
+       * question this file cannot answer from its own source -- which fields iLink actually puts on an image --
+       * and it is reported rather than acted on, because acting on a guessed shape is how a download path ends up
+       * failing on the first real photograph.
+       */
+      shape,
+    };
   }
 
   const trimmed = text.trim();

@@ -4,6 +4,51 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.58.0] — 2026-10-15
+
+**The bridge now reports what it received instead of guessing what an image looks like.**
+
+### Why this is a probe and not an image branch
+
+`ITEM_TYPE` declares exactly one member:
+
+```js
+export const ITEM_TYPE = Object.freeze({ TEXT: 1 });
+```
+
+**The shape of every other item type is unrecorded in this repository** — no `image_item`, no sample payload, no
+fixture. `ilink-protocol.mjs` documents only the text form. **So a download path written today would be a guess
+about field names, and it would fail at the moment a real photograph arrived** — which is the worst possible time
+to discover a wrong guess, because the person is waiting for their picture to be read.
+
+**This is the discovery step.** `describeItems()` reports **key paths and value types, never values**, so one
+photograph sent by a person answers the question the source cannot.
+
+### Values are never recorded, and that is the point of the whole function
+
+A message body is the user's content, and **a discovery aid that quietly wrote photographs into a log file would
+be a worse defect than the one it exists to diagnose.** One assertion is dedicated to that: a distinctive
+passphrase planted in a URL and a caption, and the check that neither appears in the output.
+
+The walk is bounded — `maxKeys` and `maxDepth`, arrays described by length and first element, cycles reported
+rather than followed — **so a surprising payload cannot bury the log it is being written to.**
+
+### Every wrong guess this session was corrected by printing the thing
+
+A fabricated relay route (`/v1/stats`, `/v1/status`), a malformed PNG reported as a credential failure, a count
+typed from memory onto a CHANGELOG entry — **each was fixed by reading rather than predicting.** This applies that
+method *before* the guess instead of after it, which is the only difference between this and the four previous
+occasions.
+
+### What is still not done, stated rather than implied
+
+**The bridge still cannot read an image.** The `/v1`-style branch that downloads it does not exist, because the
+field names are unknown. What exists now is the instrument that finds them: **send one photograph, and the log
+says what the far end actually sends.**
+
+**13 new tests, 0 failures**, and the existing bridge and tool-card suites still pass — the added `shape` field is
+carried only on a non-text reply, so it means one thing. Full suite 2354 in 89 files. **Pre-flight GREEN.**
+
 ## [0.57.1] — 2026-10-15
 
 **The vision status line now appears only on a bridge that actually starts — which it already did, for a reason

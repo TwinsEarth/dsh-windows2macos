@@ -287,6 +287,9 @@ async function main() {
 
       handled += 1;
       if (plan.act === 'reply') {
+        // A shape report, when the message carried no text. **Key paths and value types only** -- enough to learn
+        // what iLink sends for an image, and never the user's content.
+        if (typeof plan.shape === 'string') log(`  shape: ${plan.shape}`);
         log(`  reply: ${plan.text.split('\n')[0].slice(0, 80)}`);
         await reply(plan.to, plan.contextToken, plan.text);
       } else if (plan.act === 'dispatch') {
