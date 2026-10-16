@@ -5067,6 +5067,33 @@ export async function apply(ctx, config = {}) {
       },
       accept_block: {
         type: 'object',
+        /**
+         * `true`, and it has to be stated.
+         *
+         * ## The defect this closes, and why it took so long to see
+         *
+         * DSH's `parameterSchemaSpecToJsonSchema` **requires an explicit `additionalProperties` on every
+         * `type: 'object'` parameter** and throws otherwise:
+         *
+         *     JsonSchemaError: unsupported JSON schema:
+         *       parameters.accept_block.additionalProperties must be explicitly true or false at authorError
+         *         at parameterSchemaSpecToJsonSchema (dsh-tools/lib/index.js:803)
+         *         at defineTool (dsh-tools/lib/index.js:848)
+         *         at Object.apply (src/plugin/tools.mjs:5025)
+         *
+         * **The throw happens while the tool is being defined, so the whole fiber fails to mount** -- the client
+         * reports the package as `异常`, none of the eleven tools appear, and **the message is only visible if
+         * something gets far enough to print it.** This parameter has had that shape since v0.41.0, so the
+         * failure dates from then.
+         *
+         * **`true` rather than `false`:** `verifyBlock()` and `acceptWithAuthority()` already validate the block's
+         * structure and hash, so the schema is not the guard here, and a peer that adds a field outside the seven
+         * would be **refused for a reason that has nothing to do with trust**. Refusing a legitimate block is the
+         * worse error of the two.
+         *
+         * Only one parameter in this file had the shape -- checked across the whole tool surface, not just here.
+         */
+        additionalProperties: true,
         description:
           'v0.41.0. Accept a CAT7 cognitive block received from another machine, per field, DRIVEN BY AN ' +
           'AUTHORITY LEVEL (actor_authority below) rather than accepted whole. A field the level cannot ' +

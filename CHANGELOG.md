@@ -2,6 +2,63 @@
 
 All notable changes to this project are documented here.
 
+## [1.0.2] — 2026-10-16
+
+**One missing line made the whole plugin fail to mount, and it had been missing since v0.41.0.**
+
+### The defect
+
+    JsonSchemaError: unsupported JSON schema:
+      parameters.accept_block.additionalProperties must be explicitly true or false at authorError
+        at parameterSchemaSpecToJsonSchema (dsh-tools/lib/index.js:803)
+        at defineTool (dsh-tools/lib/index.js:848)
+        at Object.apply (src/plugin/tools.mjs:5025)
+
+`w2m_memory`'s `accept_block` was declared as `type: 'object'` **without `additionalProperties`**, and DSH's
+compiler requires it to be explicit. **The throw happens while the tool is being defined, so the entire fiber fails
+to mount** — the client shows the package as `异常`, **all eleven tools disappear**, and the message is visible
+only if something gets far enough to print it.
+
+**That single parameter is the whole failure.** Checked across the entire tool surface: **one `type: 'object'`
+parameter exists in this file, and it was the one.**
+
+### Verified against the real compiler, not the shim
+
+`verify-installed.mjs` runs against an offline shim that checks shape only, **which is why it reported
+`PASS: 11 tools registered` for every broken version**. The real `@deepseek-ai/dsh-tools` was extracted from
+`app.asar` — 10,913 entries, preserving the `node_modules` layout so bare specifiers resolve — and the same call
+was made against it both ways:
+
+    WITHOUT additionalProperties -> THREW JsonSchemaError: ... must be explicitly true or false
+    WITH    additionalProperties -> ACCEPTED
+
+**Same error, same code path as the client reported.** That is the first measurement in this session taken from the
+compiler that actually runs.
+
+### `true`, not `false`
+
+`verifyBlock()` and `acceptWithAuthority()` already validate the block's structure and its hash, **so the schema
+is not the guard here**. A peer that adds a field outside the seven would be refused **for a reason that has nothing
+to do with trust**, and refusing a legitimate block is the worse of the two errors.
+
+### Why this took so long to find, stated plainly
+
+**The error was invisible until the installer was used.** When the package was installed with `pnpm` and then
+removed, the client failed *earlier*, with `cannot resolve profile bundle`, which names a resolution problem and
+not a schema one. **Installing through the plugin manager took it far enough to reach `defineTool` and print the
+real cause.**
+
+**So the user's instinct was right in the way that mattered**: not that the official path behaves differently, but
+that it is the path which gets far enough to report the truth. Four earlier rounds of diagnosis — a fabricated
+incompatibility with the host, a mount-row duplicate, a release-notes defect, a runtime-discovery defect — were all
+real, and **none of them was this**.
+
+### The method that worked
+
+I extracted the host's own compiler from `app.asar` and called it directly. **Every previous attempt had tested
+against a shim, a clone, or an inference**, and each of those agreed with the broken declaration. **The only
+measurement that disagreed was the one taken from the code that throws.**
+
 ## [1.0.1] — 2026-10-16
 
 **The first stable release. Three defects fixed, two of them mine and one of them published 56 times.**
