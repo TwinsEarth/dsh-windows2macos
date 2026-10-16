@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.57.1] — 2026-10-15
+
+**The vision status line now appears only on a bridge that actually starts — which it already did, for a reason
+worth writing down.**
+
+`visionStatus()` sits at the top of `main()`, and the configuration refusal runs at **module scope, before `main()`
+is ever called**. So a bridge that refuses to start prints nothing about vision.
+
+**I first described that as a bug and set out to move the check "after the refusal block".** Reading the file
+showed the ordering was already right: **the refusal already names what is wrong, and a second complaint about
+vision underneath it would bury the first.** The comment was corrected to say what the code does rather than to
+describe a fix that was never needed.
+
+**A no-behaviour-change release**, and the only reason it exists is that the comment previously implied a
+sequence the file does not have.
+
 ## [0.57.0] — 2026-10-15
 
 **An image path becomes text evidence: the vision subprocess, and the credential path that does not touch argv.**

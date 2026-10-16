@@ -247,11 +247,15 @@ async function dispatchAndReport(plan) {
 async function main() {
   let cursor = existsSync(CURSOR) ? readFileSync(CURSOR, 'utf8').trim() : '';
   /**
-   * Say whether vision is usable, before the loop starts.
+   * Say whether vision is usable, before the poll loop starts.
+   *
+   * The refusal block above runs at module scope, before `main()` is ever called, **so a bridge that refuses to
+   * start prints nothing here** -- which is the right way round: the refusal already says what is wrong, and a
+   * second complaint about vision would bury it.
    *
    * An image arriving with vision unconfigured is answered by the help text either way, **and that message is
-   * the same sentence whether the skill is missing, the key is absent, or python3 is not installed.** One line
-   * here turns three indistinguishable failures into a named one at the moment it can still be fixed cheaply.
+   * the same sentence whether the skill is missing, the key is absent, or `python3` is not installed.** This line
+   * turns three indistinguishable failures into a named one, at startup, where it is still cheap to fix.
    */
   const vision = await visionStatus();
   log(`vision      : ${vision.ready ? `ready (${vision.provider})` : `NOT ready -- ${vision.reason}`}`);
