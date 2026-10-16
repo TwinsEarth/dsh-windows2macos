@@ -58,7 +58,7 @@
 
 import { basename, extname } from 'node:path';
 
-import { hasPathSeparator, isRelativePath, resolveCommand, sameFile } from './resolve.mjs';
+import { bundledExecutable, hasPathSeparator, isRelativePath, resolveCommand, sameFile } from './resolve.mjs';
 
 /**
  * Parse `--allowed-commands`.
@@ -474,6 +474,24 @@ function executableIdentity(argv0, prefix0, options) {
     return { kind: 'no-match', detail: null };
   }
   if (sameFile(resolvedArgv, resolvedPrefix)) return { kind: 'match', detail: null };
+
+  /**
+   * Second identity path, and the one that matters on a machine where the bundled tree is not on PATH.
+   *
+   * A bare entry names a tool; **the bundled copy of that tool is that tool**, whether or not PATH happens to
+   * point at it. This is what admits `process.execPath` for the entry `node` without weakening anything: it
+   * **only ever** returns a file under `<deps>`, so `E:\Temp\evil\node.exe` is still refused, and it does not
+   * touch the search order, so `keeps PATH ahead of the bundled runtime` still holds.
+   *
+   * It also fixes a real case rather than a test-only one: **DSH runs on the bundled interpreter and does not
+   * put its directory on PATH**, so an allow-list entry of `node` could not be satisfied by the very interpreter
+   * the host executes.
+   */
+  if (!prefixIsPath && argvIsPath) {
+    const bundled = bundledExecutable(prefix0, options.env ?? process.env);
+    if (bundled !== null && sameFile(argv0, bundled)) return { kind: 'match', detail: null };
+  }
+
   return {
     kind: 'path-mismatch',
     detail:

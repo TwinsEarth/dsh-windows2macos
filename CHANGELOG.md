@@ -1,6 +1,178 @@
 # Changelog
 
-All notable changes to this project are documented here. The format follows
+All notable changes to this project are documented here.
+
+## [1.0.1] — 2026-10-16
+
+**The first stable release. Three defects fixed, two of them mine and one of them published 56 times.**
+
+### The command allow-list could not admit the interpreter DSH itself runs on
+
+Twelve end-to-end tests failed with `COMMAND_EXECUTABLE_PATH_MISMATCH`, and **the refusal was correct** —
+the identity check was reading the wrong machine.
+
+    bundled node : E:\DS\resources\runtime\primary-runtime\dependencies\node\bin\node.exe
+    PATH         : E:\Unity3D\Tuanjie Cowork\cli\bin\win32-x64\node.exe      <- a different program
+    PATH contains the bundled directory : False
+
+The tests dispatch `[process.execPath, '-e', …]` against an allow-list entry of the bare name `node`. **DSH runs
+on the bundled interpreter and does not put its directory on PATH**, so the bare name resolved to an unrelated
+`node.exe` shipped by another application, and an absolute path to the bundled copy was refused as "a different
+file".
+
+**Fixed by answering the right question.** `resolveCommand` still keeps PATH ahead of the bundled tree — a test
+guards that precedence, and it is about *which file a name means*. The new `bundledExecutable()` answers a
+different question: *is this path the bundled copy of that tool?* **The bundled copy of a tool is that tool**, so
+identity holds, and **nothing is weakened**: it only ever returns files under `<deps>`, so
+`E:\Temp\evil\node.exe` is still refused.
+
+**The runtime is now discovered rather than assumed.** `dshDependenciesDir()` tried exactly one path,
+`$DSH_HOME/dsh-runtimes/<runtime>/dependencies`, which stopped existing when the application moved its runtime
+inside the bundle. It now tries the explicit override, then that documented layout, then **the directory implied
+by `process.execPath`** — a bundled interpreter lives at `<deps>/node/bin/node`, so its own path states where
+`<deps>` is. **That cannot go stale when the installation moves again.**
+
+### 56 of 66 release scripts published v0.1.3's commit message under an unrelated title
+
+Found because a test plan written against v0.60.0 reported its release notes as "highly duplicated" with several
+earlier releases. **The scripts state the right intention and then read the wrong file:**
+
+    /** The release notes reuse the commit message */
+    const NOTES = fs.readFileSync('…\\commit-0103b.txt', 'utf8');          // v0.1.3's message
+    name: 'v0.60.0 — approval index, fleet sync, service health, tiered storage',   // hardcoded
+
+`scripts/github-release.mjs` **derives both fields from the repository's own record** — the title from the commit
+subject, the body from the CHANGELOG entry — **so neither can be copied by accident.** It refuses to publish a
+version with no CHANGELOG entry, and reads the release back after writing. **The five most-read releases
+(v0.60.0, v0.59.0, v0.58.0, v0.57.1, v0.57.0) are corrected**, each verified by reading it back.
+
+### My mount-row advice broke the client twice, and §3.2 withdraws it
+
+**An installed plugin mounts itself**, from its own bundle patch — so adding a row to `cordis.patch.yml` inserts
+a **second** entry with the same `id`, and the client stops opening. Measured: **0 rows before install, exactly 1
+after, 2 with the manual row, 1 again once removed.**
+
+### Also in this release
+
+**Two client failures had one cause, and it was this repository's own advice: do not add a mount row.**
+
+### The plugin mounts itself
+
+`package.json` declares `dsh.bundle.patch`, so **the host composes an installed package from the patch shipped
+inside the package**. Nothing needs to be written into the profile — and writing it anyway inserts a **second**
+entry with the same `id`, which stops the client from opening.
+
+**Measured on a throwaway profile**, because the desktop profile cannot be previewed (`rejectElectronProfile`)
+and that is exactly where the failures happened:
+
+| State | `id: w2m` rows |
+|---|---|
+| profile created, plugin not installed | 0 |
+| **plugin installed, nothing else done** | **1** |
+| a correctly written `insert:` row added as well | **2** ← the failure |
+| that row removed | **1** |
+
+**The symptom is worth stating precisely, because it is not a crash:** the client does not open, there is no
+error message, and deleting `cordis.patch.yml` restores it immediately. **That is what pointed at configuration
+rather than code.**
+
+### §3.2, and why the old advice is withdrawn
+
+The section now leads with the rule — **install, and change nothing else** — then covers the three ways an edit
+goes wrong:
+
+* **`insert:` is an append.** Appending a row whose `id` already exists is the failure. To change configuration,
+  address the row the bundle patch created, as a non-insert patch.
+* **`Add-Content` onto this file is always wrong.** It is a YAML list; a fresh profile ships `[]`, and a second
+  document after it is a parse error. **The measured exception message is in the section**, because "failed to
+  parse overlay" alone sends people looking at the wrong thing.
+* **The desktop profile has no safe preview.** `--dump-config` composes and exits without starting anything, and
+  it is the right tool — but the CLI refuses the desktop profile, so for that one the only protection is writing
+  the row correctly. **Which in practice means not writing one.**
+
+### What I got wrong, since the section exists because of it
+
+I added the row to a live profile without a way to test it that did not involve the user's client, and the
+backup went with the profile when it was reset. **The cost was two client failures and a profile reset.**
+
+**I also formed a plausible hypothesis and disproved it before writing any of this**: I suspected
+`Add-Content -Encoding utf8` had written a mid-file BOM. Measured on PowerShell 5.1 — a 45-byte file with the
+BOM only at offset 0. **Not the cause, and recorded so it is not repeated.**
+
+**The experiment that settled it took one command and started nothing**: `dsh --profile <probe> --dump-config`,
+which prints the composed tree and exits. **It would have caught this before the first restart had I run it
+first.**
+
+**No code change and no test count change** — a documentation release. It is versioned rather than left
+unreleased because the incorrect procedure was published in `TROUBLESHOOTING.md`, and a user following it would
+break their client.
+
+**56 of 66 release scripts published the wrong text, and this is the fix that makes it impossible to repeat.**
+
+### The defect, found while checking someone else's test plan
+
+A test plan written against v0.60.0 reported that its GitHub release notes were *"highly duplicated"* with
+v0.59.0, v0.58.0 and several earlier releases, and concluded they were probably template-generated. **That
+conclusion was right and the cause was mine:**
+
+    // publish-0600-github.mjs
+    /** The release notes reuse the commit message: it already states the cause, the fix and the evidence. */
+    const NOTES = fs.readFileSync('E:\\GPT\\scripts\\commit-0103b.txt', 'utf8');   // <- v0.1.3's message
+    name: 'v0.60.0 — approval index, fleet sync, service health, tiered storage',      // <- hardcoded
+
+**The script states the right intention in its own comment and then reads the wrong file.** Measured: **56 of 66
+`publish-*-github.mjs` scripts read that same stale file, and 57 carry that same title** -- four roadmap
+keywords that describe none of those releases.
+
+### What I got wrong twice while investigating
+
+**First** I said the `health` module did not exist and that the test plan was testing a fiction. **It exists:**
+`src/agent/health.mjs`, whose own header records the macOS mistake and its fix
+(`darwin: ['/var/log', '/Library/Logs', '/tmp']`). **It was in the code and missing from my CHANGELOG, and I
+read the CHANGELOG as if it were the record.** The test plan was more accurate than my denial of it.
+
+**Second**, having been wrong, the honest correction is that the plan is right about `health` and wrong about
+three counts, which are now measured rather than quoted: **89 suites (not 82), 2352 tests (not 2228), 15
+pre-flight checks (not 12), and six aggregation verdicts (not nine)** -- `degraded`, `timeout` and
+`cancelled` do not exist, so the three rows testing them would report false failures.
+
+### The fix is a module, not another corrected copy
+
+`scripts/github-release.mjs` **derives both fields from the repository's own record**: the title from the commit
+subject, the body from the CHANGELOG entry for that version. **Neither is written by hand, so neither can be
+copied by accident** -- which was the actual failure mode, since each release was a copy of the previous script
+and the two constants that must change were the two easiest to forget.
+
+**It refuses to publish when the CHANGELOG has no entry for the version.** A release whose body cannot be derived
+is a release that would otherwise be published under the previous one's text, which is precisely what happened 56
+times. **It also reads back after writing and compares**, because `PATCH` returning 200 is not evidence that the
+field changed.
+
+Verified: a version with no CHANGELOG entry is refused (exit 1); a version with one yields the commit subject as
+its title and a 3024-character body (exit 0, dry run); the exported helpers split CHANGELOG sections correctly,
+return null for an unknown version, and import without side effects.
+
+**The token comes from `GITHUB_TOKEN` rather than being embedded**, which all 66 older scripts do.
+
+### The five most-read releases are corrected
+
+Titles and bodies rewritten from their own CHANGELOG entries, **each verified by reading the release back**
+rather than by trusting the response:
+
+| Release | Title now |
+|---|---|
+| v0.60.0 | `docs(troubleshooting) + feat(script): the lock rule, and an out-of-band session bound` |
+| v0.59.0 | `fix(bin): every published bin can be imported without killing the importing process` |
+| v0.58.0 | `feat(bridge): report what arrived instead of guessing what an image looks like` |
+| v0.57.1 | `docs(bridge): correct a comment that implied a sequence the file does not have` |
+| v0.57.0 | `feat(vision): an image path becomes text evidence, and the credential never touches argv` |
+
+Each was 2044 characters -- one identical body -- before the repair.
+
+**The remaining 51 are left as they are**, which is a decision rather than an oversight: they are old enough that
+nobody reads them, and the module means the next release is correct without anyone remembering to check.
+
+ format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 

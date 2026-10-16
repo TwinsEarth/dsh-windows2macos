@@ -311,6 +311,109 @@ instance. **Killing that process is the smaller, safer step, and it is the one t
 **What this cost, stated plainly:** the deleted directory carried session history and profile
 configuration that no longer exists. **`Stop-Process` would have cost nothing.**
 
+### 3.2 Never add a mount row: an installed plugin mounts itself
+
+**This section exists because two client failures were caused by following advice that used to be in this
+repository.** A mount row in `cordis.patch.yml` is **not necessary, and adding one breaks the client.**
+
+**The plugin mounts itself when the package is installed.** The host composes an installed package from **the
+plugin's own bundle patch** — `package.json`'s `dsh.bundle.patch`, which points at the `cordis.patch.yml` shipped
+*inside this package*. Nothing has to be written into the profile.
+
+**Confirmed by experiment.** On a throwaway profile created from the shipped `web` template, `--dump-config`
+reports **exactly one** `w2m` row with the plugin installed and **nothing** added to the profile:
+
+```
+# == @twinsearth/w2m-dsh-plugin
+- id: w2m
+  name: '@twinsearth/w2m-dsh-plugin'
+  config:
+    rabbitUrl: ''
+    autoStartAgent: false
+```
+
+**Adding a row inserts a second entry with the same `id`:**
+
+```
+1260: # == @twinsearth/w2m-dsh-plugin                      <- automatic
+1261: - id: w2m
+
+1271: # == ...\profiles\<name>\cordis.patch.yml              <- the manual one
+1272: - id: w2m                                               <- SAME id, twice
+```
+
+**Two rows with one `id` is what made the client stop responding.** The symptom is not a crash and not an
+error message — **the client does not open at all.**
+
+#### The rule
+
+```bash
+# Install. That is the whole procedure.
+dsh plugin --profile <name> add @twinsearth/w2m-dsh-plugin@<version>
+```
+
+**Do not edit `cordis.patch.yml` for this plugin.** If you have already added a row, delete that row — **and
+delete the row, not the `~/.dsh` directory.**
+
+#### To change configuration, target the existing row
+
+**Do not insert.** Address the row that the bundle patch already created:
+
+```yaml
+- id: w2m                    # a non-insert patch: replaces fields on the existing entry
+  config:
+    autoStartAgent: true
+```
+
+**An `insert:` is an append.** Appending a row whose `id` already exists is the failure described above.
+
+#### `Add-Content` onto this file is always wrong
+
+It is a YAML **list**, so the file's root is a sequence:
+
+```
+Error: dsh: failed to parse overlay ...\cordis.patch.yml:
+YAMLException: end of the stream or a document separator is expected (6:1)
+
+  4 | []
+  6 | - insert:
+  -----^
+```
+
+`[]` is a complete document; a `- insert:` list after it is a second one. **Rewrite the file with a list root;
+never append to it.** A freshly created profile ships `[]`, so this bites on the first edit.
+
+#### Verify before you restart, when you can
+
+`--dump-config` **composes the configuration and exits without starting an application**, which makes it the
+safe way to check an edit:
+
+```bash
+dsh --profile <name> --dump-config      # then search the output for this package's name
+```
+
+**The desktop profile is the one case where this is unavailable.** The CLI refuses it
+(`rejectElectronProfile`): Desktop manages that profile exclusively. **So for the desktop profile there is no
+safe preview — the only protection is writing the row correctly, which in practice means not writing one at all,
+because the plugin mounts itself.**
+
+If you must test a row, **create a separate profile and try it there first**:
+
+```bash
+dsh probe --from-default-profile web --dump-config
+dsh plugin --profile probe add @twinsearth/w2m-dsh-plugin@<version>
+dsh --profile probe --dump-config        # count the rows naming this package: expect exactly one
+```
+
+**The measured sequence, so the expectation is on record:**
+
+| State | `id: w2m` rows |
+|---|---|
+| profile created, plugin not installed | 0 |
+| **plugin installed, nothing else done** | **1** |
+| a correct `insert:` row added as well | **2** ← the failure |
+| that row removed | **1** |
+
 ---
 
 ## 4. A machine is listed but never answers
