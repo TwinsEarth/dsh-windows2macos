@@ -18,6 +18,7 @@
  */
 
 import { parseArgs } from 'node:util';
+import { pathToFileURL } from 'node:url';
 import { createRelayServer } from '../src/relay/server.mjs';
 import { resolveStateDir, formatError } from '../src/util/cli.mjs';
 
@@ -248,182 +249,196 @@ const stateDir = resolveStateDir(values.state, 'rabbit');
 const log = (line) => process.stdout.write(`${line}\n`);
 const diag = (line) => process.stderr.write(`${line}\n`);
 
-let relay;
-let listenInfo;
-let pairingCode;
-try {
-  relay = createRelayServer({
-    stateDir,
-    pairingCode: values['pairing-code'],
-    heartbeatIntervalMs: heartbeatMs,
-    leaseGraceMs: graceMs,
-    // v0.1.2 deployment options
-    basePath,
-    trustProxy: Boolean(values['trust-proxy']),
-    tlsCert: tlsCert ?? null,
-    tlsKey: tlsKey ?? null,
-    operatorToken,
-    operatorTokenRequired,
-    // MEDIUM-6: the token is printed by the start that generated it, or when the operator asks for it
-    // here (--print-operator-token / W2M_PRINT_OPERATOR_TOKEN=1). The relay resolves both, so the
-    // banner below and the relay's own startup lines can never disagree about it.
-    printOperatorToken: values['print-operator-token'] === true,
-    pairRateLimitPerMinute: pairRateLimit,
-    persist: !values['no-persist'],
-    // v0.3.0 request signing. Undefined means "not configured", which the relay treats as
-    // "do not verify" -- byte-for-byte the v0.2.3 behaviour.
-    signingSecret,
-    signingSecretPrevious,
-    requireSignature,
-    metrics: values.metrics === true,
-    signatureSkewSeconds,
-  });
-  // The pairing code rotates on every successful pairing, so the CLI has to
-  // follow it rather than print it once: an operator pairing a second machine
-  // needs the *current* code, not the one that was already consumed.
-  //
-  // Listeners receive the buffered *entry* (`{seq, event, target}`), not the
-  // event itself -- `entry.event` is the frame that goes on the wire.
-  relay.state.onEvent((entry) => {
-    const event = entry?.event ?? entry;
-    if (event?.type === 'notice' && event.code === 'PAIRING_CODE_ROTATED' && event.pairing_code) {
-      pairingCode = event.pairing_code;
-      // In --json mode this must not touch stdout: a rotation would otherwise
-      // corrupt the very output the flag exists to produce.
-      const out = values.json ? diag : log;
-      out('');
-      out('  Pairing code rotated after a successful pairing.');
-      out(`  新的配对码 / NEW PAIRING CODE:  ${pairingCode}`);
-      out('');
-    }
-  });
-  listenInfo = await relay.listen({
-    host: values.host ?? '127.0.0.1',
-    port,
-  });
-  pairingCode = listenInfo.pairingCode;
-} catch (error) {
-  fail(formatError(error), 3);
-}
-
-const boundPort = listenInfo.port;
-const boundHost = listenInfo.host;
-const scheme = listenInfo.scheme ?? (tlsCert ? 'https' : 'http');
-// Prefer what the relay reports (it knows whether TLS is active); fall back to
-// the bound address so a 0.0.0.0 bind is not advertised as a usable URL.
-const publicUrl = listenInfo.publicUrl ?? `${scheme}://${boundHost === '0.0.0.0' ? '<this-host>' : boundHost}:${boundPort}${basePath === '/' ? '' : basePath}`;
-const resolvedOperatorToken = listenInfo.operatorToken ?? operatorToken ?? null;
-
-if (values.json) {
-  log(JSON.stringify({
-    event: 'listening',
-    url: listenInfo.url,
-    publicUrl,
-    host: boundHost,
-    port: boundPort,
-    scheme,
-    basePath,
-    stateDir,
-    persist: !values['no-persist'],
-    trustProxy: Boolean(values['trust-proxy']),
-    pairRateLimit: pairRateLimit ?? 5,
-    operatorTokenRequired,
-    // The token itself is deliberately absent. This line is the one people pipe
-    // into a log or a file, and a credential written there is a credential
-    // leaked; it is printed to stderr and stored at
-    // <stateDir>/operator-token.txt (0600), which is where a secret belongs.
-    operatorTokenPresent: Boolean(operatorTokenRequired && resolvedOperatorToken),
-    pairingCode,
-    relayId: listenInfo.relayId ?? null,
-    protocolVersion: 1,
-  }));
-} else {
-  log('');
-  log('  W2M relay (Rabbit) is listening.');
-  log('');
-  log(`  URL          ${publicUrl}`);
-  log(`  Bind         ${boundHost}:${boundPort}${scheme === 'https' ? ' (TLS)' : ''}`);
-  if (basePath !== '/') log(`  Base path    ${basePath}`);
-  log(`  State        ${stateDir}${values['no-persist'] ? '  (persistence DISABLED)' : ''}`);
-  log(`  Protocol     v1   relay id ${listenInfo.relayId ?? '(none)'}`);
-
-  if (values['trust-proxy']) {
-    log('');
-    log('  NOTE: --trust-proxy is ON. The relay believes X-Forwarded-For and');
-    log('        X-Forwarded-Proto. Only safe behind a proxy you control.');
-  }
-  if (boundHost === '0.0.0.0' && scheme === 'http') {
-    log('');
-    log('  NOTE: bound to 0.0.0.0 over plain HTTP. Fine on a Tailscale/WireGuard');
-    log('        address (already encrypted); NOT fine on a public interface --');
-    log('        use --tls-cert/--tls-key or a TLS-terminating proxy there.');
-  }
-
-  log('');
-  if (operatorTokenRequired && resolvedOperatorToken) {
-    // MEDIUM-6: this banner is the *machine's* stdout, and stdout is what journald, a container log or
-    // a CI transcript keeps. The token authorises dispatching to every machine in the group, so it is
-    // printed only on the start that generated it — the one moment it exists nowhere else — or when
-    // --print-operator-token / W2M_PRINT_OPERATOR_TOKEN=1 asked for it explicitly. Every other start
-    // says where to read it and how to change that answer.
-    //
-    // DELIBERATE, do not "fix": on that generating start the relay's own startup line prints the value
-    // too (on stderr). The pair is the intended shape — this box is the operator-facing handoff, that
-    // line is the log copy — and every other start prints it in neither place.
-    if (listenInfo.operatorTokenPrintable === true) {
-      log('  ┌────────────────────────────────────────────────────────────┐');
-      log('  │  OPERATOR TOKEN (needed to SEND instructions, keep secret)  │');
-      log(`  │  ${String(resolvedOperatorToken).padEnd(56)}│`);
-      log('  └────────────────────────────────────────────────────────────┘');
-      log(`  Printed once because ${listenInfo.operatorTokenPrintReason === 'generated'
-        ? 'this start generated it'
-        : `${listenInfo.operatorTokenPrintReason ?? 'an option'} asked for it`}.`);
-      log(`  Also written to ${stateDir}/operator-token.txt (0600).`);
-    } else {
-      log('  OPERATOR TOKEN — not printed (this start did not generate it).');
-      log(`  Read it from ${stateDir}/operator-token.txt (0600).`);
-      log('  To print it here as well: --print-operator-token, or W2M_PRINT_OPERATOR_TOKEN=1.');
-    }
-    log('  Device tokens cannot send work; this is what authorises it.');
-  } else if (!operatorTokenRequired) {
-    log('  ⚠  OPERATOR TOKEN REQUIREMENT IS OFF (--operator-token "").');
-    log('     Any paired device can send work to any other. Trusted LAN only.');
-  }
-
-  log('');
-  if (pairingCode) {
-    log('  ┌──────────────────────────────────────────────┐');
-    log(`  │  配对码 / PAIRING CODE:  ${String(pairingCode).padEnd(19)}│`);
-    log('  └──────────────────────────────────────────────┘');
-    log('');
-    log('  Run this on every machine you want in the group:');
-    log('');
-    log(`    w2m-localside --rabbit ${listenInfo.url} --pair ${pairingCode} \\`);
-    log('                  --project <path-to-project> --name <machine-name>');
-    log('');
-    log('  The code rotates after each successful pairing; the new one is');
-    log('  printed here, so you can pair the next machine without restarting.');
-  }
-  if (boundHost === '0.0.0.0') {
-    log('  NOTE: bound to 0.0.0.0 -- other machines on your network can reach this');
-    log('        relay. It carries no TLS and no authentication beyond device tokens.');
-    log('');
-  }
-}
-
-let stopping = false;
-async function shutdown(signal) {
-  if (stopping) return;
-  stopping = true;
-  if (!values.json) log(`\n  ${signal} received, shutting down...`);
+/**
+ * Run only when executed, never when imported.
+ *
+ * `package.json` publishes this file as an `exports` subpath, and an unguarded top-level body means
+ * **importing that subpath executes the program**. Measured, not inferred: on the sibling `w2m-localside.mjs`, a
+ * statement placed after the import never ran and node exited with code 2.
+ *
+ * **A published entry point that terminates whichever process imports it is a plugin that stops the client from
+ * starting** -- the defect this closes. `w2m-mcp.mjs` already carried the guard and was the only bin that
+ * behaved, so the fix gives the others the same one rather than withdrawing the exports: **a subpath that is
+ * importable and inert is strictly better than one that is neither.**
+ */
+if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  let relay;
+  let listenInfo;
+  let pairingCode;
   try {
-    await relay.close();
+    relay = createRelayServer({
+      stateDir,
+      pairingCode: values['pairing-code'],
+      heartbeatIntervalMs: heartbeatMs,
+      leaseGraceMs: graceMs,
+      // v0.1.2 deployment options
+      basePath,
+      trustProxy: Boolean(values['trust-proxy']),
+      tlsCert: tlsCert ?? null,
+      tlsKey: tlsKey ?? null,
+      operatorToken,
+      operatorTokenRequired,
+      // MEDIUM-6: the token is printed by the start that generated it, or when the operator asks for it
+      // here (--print-operator-token / W2M_PRINT_OPERATOR_TOKEN=1). The relay resolves both, so the
+      // banner below and the relay's own startup lines can never disagree about it.
+      printOperatorToken: values['print-operator-token'] === true,
+      pairRateLimitPerMinute: pairRateLimit,
+      persist: !values['no-persist'],
+      // v0.3.0 request signing. Undefined means "not configured", which the relay treats as
+      // "do not verify" -- byte-for-byte the v0.2.3 behaviour.
+      signingSecret,
+      signingSecretPrevious,
+      requireSignature,
+      metrics: values.metrics === true,
+      signatureSkewSeconds,
+    });
+    // The pairing code rotates on every successful pairing, so the CLI has to
+    // follow it rather than print it once: an operator pairing a second machine
+    // needs the *current* code, not the one that was already consumed.
+    //
+    // Listeners receive the buffered *entry* (`{seq, event, target}`), not the
+    // event itself -- `entry.event` is the frame that goes on the wire.
+    relay.state.onEvent((entry) => {
+      const event = entry?.event ?? entry;
+      if (event?.type === 'notice' && event.code === 'PAIRING_CODE_ROTATED' && event.pairing_code) {
+        pairingCode = event.pairing_code;
+        // In --json mode this must not touch stdout: a rotation would otherwise
+        // corrupt the very output the flag exists to produce.
+        const out = values.json ? diag : log;
+        out('');
+        out('  Pairing code rotated after a successful pairing.');
+        out(`  新的配对码 / NEW PAIRING CODE:  ${pairingCode}`);
+        out('');
+      }
+    });
+    listenInfo = await relay.listen({
+      host: values.host ?? '127.0.0.1',
+      port,
+    });
+    pairingCode = listenInfo.pairingCode;
   } catch (error) {
-    process.stderr.write(`w2m-rabbit: error while closing: ${formatError(error)}\n`);
-    process.exit(1);
+    fail(formatError(error), 3);
   }
-  process.exit(0);
-}
 
-process.on('SIGINT', () => { void shutdown('SIGINT'); });
-process.on('SIGTERM', () => { void shutdown('SIGTERM'); });
+  const boundPort = listenInfo.port;
+  const boundHost = listenInfo.host;
+  const scheme = listenInfo.scheme ?? (tlsCert ? 'https' : 'http');
+  // Prefer what the relay reports (it knows whether TLS is active); fall back to
+  // the bound address so a 0.0.0.0 bind is not advertised as a usable URL.
+  const publicUrl = listenInfo.publicUrl ?? `${scheme}://${boundHost === '0.0.0.0' ? '<this-host>' : boundHost}:${boundPort}${basePath === '/' ? '' : basePath}`;
+  const resolvedOperatorToken = listenInfo.operatorToken ?? operatorToken ?? null;
+
+  if (values.json) {
+    log(JSON.stringify({
+      event: 'listening',
+      url: listenInfo.url,
+      publicUrl,
+      host: boundHost,
+      port: boundPort,
+      scheme,
+      basePath,
+      stateDir,
+      persist: !values['no-persist'],
+      trustProxy: Boolean(values['trust-proxy']),
+      pairRateLimit: pairRateLimit ?? 5,
+      operatorTokenRequired,
+      // The token itself is deliberately absent. This line is the one people pipe
+      // into a log or a file, and a credential written there is a credential
+      // leaked; it is printed to stderr and stored at
+      // <stateDir>/operator-token.txt (0600), which is where a secret belongs.
+      operatorTokenPresent: Boolean(operatorTokenRequired && resolvedOperatorToken),
+      pairingCode,
+      relayId: listenInfo.relayId ?? null,
+      protocolVersion: 1,
+    }));
+  } else {
+    log('');
+    log('  W2M relay (Rabbit) is listening.');
+    log('');
+    log(`  URL          ${publicUrl}`);
+    log(`  Bind         ${boundHost}:${boundPort}${scheme === 'https' ? ' (TLS)' : ''}`);
+    if (basePath !== '/') log(`  Base path    ${basePath}`);
+    log(`  State        ${stateDir}${values['no-persist'] ? '  (persistence DISABLED)' : ''}`);
+    log(`  Protocol     v1   relay id ${listenInfo.relayId ?? '(none)'}`);
+
+    if (values['trust-proxy']) {
+      log('');
+      log('  NOTE: --trust-proxy is ON. The relay believes X-Forwarded-For and');
+      log('        X-Forwarded-Proto. Only safe behind a proxy you control.');
+    }
+    if (boundHost === '0.0.0.0' && scheme === 'http') {
+      log('');
+      log('  NOTE: bound to 0.0.0.0 over plain HTTP. Fine on a Tailscale/WireGuard');
+      log('        address (already encrypted); NOT fine on a public interface --');
+      log('        use --tls-cert/--tls-key or a TLS-terminating proxy there.');
+    }
+
+    log('');
+    if (operatorTokenRequired && resolvedOperatorToken) {
+      // MEDIUM-6: this banner is the *machine's* stdout, and stdout is what journald, a container log or
+      // a CI transcript keeps. The token authorises dispatching to every machine in the group, so it is
+      // printed only on the start that generated it — the one moment it exists nowhere else — or when
+      // --print-operator-token / W2M_PRINT_OPERATOR_TOKEN=1 asked for it explicitly. Every other start
+      // says where to read it and how to change that answer.
+      //
+      // DELIBERATE, do not "fix": on that generating start the relay's own startup line prints the value
+      // too (on stderr). The pair is the intended shape — this box is the operator-facing handoff, that
+      // line is the log copy — and every other start prints it in neither place.
+      if (listenInfo.operatorTokenPrintable === true) {
+        log('  ┌────────────────────────────────────────────────────────────┐');
+        log('  │  OPERATOR TOKEN (needed to SEND instructions, keep secret)  │');
+        log(`  │  ${String(resolvedOperatorToken).padEnd(56)}│`);
+        log('  └────────────────────────────────────────────────────────────┘');
+        log(`  Printed once because ${listenInfo.operatorTokenPrintReason === 'generated'
+          ? 'this start generated it'
+          : `${listenInfo.operatorTokenPrintReason ?? 'an option'} asked for it`}.`);
+        log(`  Also written to ${stateDir}/operator-token.txt (0600).`);
+      } else {
+        log('  OPERATOR TOKEN — not printed (this start did not generate it).');
+        log(`  Read it from ${stateDir}/operator-token.txt (0600).`);
+        log('  To print it here as well: --print-operator-token, or W2M_PRINT_OPERATOR_TOKEN=1.');
+      }
+      log('  Device tokens cannot send work; this is what authorises it.');
+    } else if (!operatorTokenRequired) {
+      log('  ⚠  OPERATOR TOKEN REQUIREMENT IS OFF (--operator-token "").');
+      log('     Any paired device can send work to any other. Trusted LAN only.');
+    }
+
+    log('');
+    if (pairingCode) {
+      log('  ┌──────────────────────────────────────────────┐');
+      log(`  │  配对码 / PAIRING CODE:  ${String(pairingCode).padEnd(19)}│`);
+      log('  └──────────────────────────────────────────────┘');
+      log('');
+      log('  Run this on every machine you want in the group:');
+      log('');
+      log(`    w2m-localside --rabbit ${listenInfo.url} --pair ${pairingCode} \\`);
+      log('                  --project <path-to-project> --name <machine-name>');
+      log('');
+      log('  The code rotates after each successful pairing; the new one is');
+      log('  printed here, so you can pair the next machine without restarting.');
+    }
+    if (boundHost === '0.0.0.0') {
+      log('  NOTE: bound to 0.0.0.0 -- other machines on your network can reach this');
+      log('        relay. It carries no TLS and no authentication beyond device tokens.');
+      log('');
+    }
+  }
+
+  let stopping = false;
+  async function shutdown(signal) {
+    if (stopping) return;
+    stopping = true;
+    if (!values.json) log(`\n  ${signal} received, shutting down...`);
+    try {
+      await relay.close();
+    } catch (error) {
+      process.stderr.write(`w2m-rabbit: error while closing: ${formatError(error)}\n`);
+      process.exit(1);
+    }
+    process.exit(0);
+  }
+
+  process.on('SIGINT', () => { void shutdown('SIGINT'); });
+  process.on('SIGTERM', () => { void shutdown('SIGTERM'); });
+}

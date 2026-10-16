@@ -21,6 +21,7 @@
 
 import { parseArgs as parseNodeArgs } from 'node:util';
 import process from 'node:process';
+import { pathToFileURL } from 'node:url';
 
 import { formatError, resolveStateDir } from '../src/util/cli.mjs';
 import { createAgent, parseAllowedCommands } from '../src/agent/agent.mjs';
@@ -314,12 +315,34 @@ async function main() {
   }
 }
 
-main().then(
-  (code) => {
-    process.exitCode = code;
-  },
-  (error) => {
-    process.stderr.write(`fatal: ${formatError(error)}\n`);
-    process.exitCode = 1;
-  },
-);
+/**
+ * Run only when executed, never when imported.
+ *
+ * ## The defect this closes, which was measured rather than reasoned about
+ *
+ * `package.json` publishes `"./localside": "./bin/w2m-localside.mjs"` in its `exports` map, and this file used to
+ * call `main()` unconditionally. **So `import '@twinsearth/w2m-dsh-plugin/localside'` executed a CLI, printed
+ * usage, and terminated the process** -- measured, not inferred:
+ *
+ *     import ... /bin/w2m-localside.mjs   ->  node exited with code 2
+ *     a line after the import never ran
+ *
+ * **That is fatal for any process unlucky enough to import the subpath**, and the host is the only plausible
+ * candidate: a plugin whose published entry points kill the client is a plugin that makes the client "unable to
+ * start", which is exactly what was reported.
+ *
+ * `w2m-mcp.mjs` already carried this guard, and it was the one file that behaved. **The other three bins had no
+ * guard and were published as importable paths** -- so the fix is to give them the same one, not to remove the
+ * exports: a subpath that is importable *and* inert is strictly more useful than one that is neither.
+ */
+if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().then(
+    (code) => {
+      process.exitCode = code;
+    },
+    (error) => {
+      process.stderr.write(`fatal: ${formatError(error)}\n`);
+      process.exitCode = 1;
+    },
+  );
+}

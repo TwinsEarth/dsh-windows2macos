@@ -4,6 +4,69 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.59.0] — 2026-10-16
+
+**Every published bin can now be imported without killing the importing process — measured, not reasoned about.**
+
+### The defect
+
+`package.json` publishes three CLIs as importable `exports` subpaths:
+
+```json
+"./rabbit":    "./bin/w2m-rabbit.mjs"
+"./localside": "./bin/w2m-localside.mjs"
+"./stun":      "./bin/w2m-stun.mjs"
+```
+
+**And those three had no import guard, so their top-level body ran on import.** Measured:
+
+```
+import .../bin/w2m-localside.mjs   ->  node exited with code 2
+a statement placed after the import never ran
+```
+
+**A published entry point that terminates whichever process imports it.** The plugin's own client-bundle
+documentation records that `exports['./client']` *"is what the host scans for"*, so the host reads that map —
+**and `w2m-mcp.mjs` already carried this guard, which is why it was the one bin that behaved.**
+
+The fix gives the other three the same guard rather than withdrawing the exports: **a subpath that is importable
+and inert is strictly better than one that is neither.** All four are now inert on import (`58ms / 74ms / 5ms /
+2ms`) and all four still run as programs (`--help` → exit 0 with the right banner).
+
+### What this does **not** claim, and why that matters here
+
+**This is not offered as the explanation for the client that would not start.** That was reported as *no process
+at all on a double-click*, and that symptom has a different mechanism, read out of `lib/main.js`:
+
+```js
+function claimDesktopSingleInstance(application, focusOwner) {
+  if (!application.requestSingleInstanceLock()) {
+    application.quit();
+    return false;
+  }
+```
+
+**`application.quit()` — no dialog, no error, no window.** A second launch is silently discarded while the first
+instance holds the lock, which explains all three observations: disabling third-party plugins did nothing (the
+new process never reached plugin loading), **reinstalling the client did nothing (a new directory does not release
+a lock registered against the application)**, and deleting `~/.dsh` worked — **because it took down the lock
+holder.**
+
+**A real defect, fixed; a different defect, responsible.** The two were adjacent in time, and conflating them
+would have produced a changelog entry claiming a fix it cannot demonstrate.
+
+### Three of my edits failed on the same mistake before the fourth worked
+
+The guard had to be inserted where each file's executable body begins. **My first two markers were text I
+predicted rather than read** — `await main()` does not exist in `w2m-rabbit.mjs`, and `const bound = await bind`
+does not exist in `w2m-stun.mjs`. Then a `Select-Object -Skip` offset was **1-based** while the array index is
+**0-based**, so the script refused both files by one line. **The fourth attempt anchored on the statements' own
+text and succeeded on the first run.** That is the same lesson as the fabricated relay route and the malformed
+PNG, and it is now the fifth time this session.
+
+**No test count change** — the guards alter when the bodies run, not what they do, and all four entry points are
+exercised by `scripts/check-entrypoints.mjs`.
+
 ## [0.58.0] — 2026-10-15
 
 **The bridge now reports what it received instead of guessing what an image looks like.**

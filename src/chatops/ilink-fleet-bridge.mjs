@@ -135,7 +135,7 @@ export function textOf(message) {
  * @param {{maxKeys?: number, maxDepth?: number}} [options]
  * @returns {string} a compact, content-free description
  */
-export function describeItems(message, { maxKeys = 24, maxDepth = 3 } = {}) {
+export function describeItems(message, { maxKeys = 24, maxDepth = 5 } = {}) {
   const items = Array.isArray(message?.item_list) ? message.item_list : [];
   if (items.length === 0) return 'item_list is empty or absent';
 

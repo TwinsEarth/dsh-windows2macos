@@ -27,6 +27,7 @@
  */
 
 import { parseArgs } from 'node:util';
+import { pathToFileURL } from 'node:url';
 import { createStunServer, DEFAULT_SOFTWARE } from '../src/relay/stun-server.mjs';
 import { formatError } from '../src/util/cli.mjs';
 
@@ -154,78 +155,92 @@ function logRequest(entry) {
   );
 }
 
-let server;
-let listen;
-const startedAt = Date.now();
-try {
-  server = createStunServer({ host, port, software, log: logRequest });
-  listen = await server.start();
-} catch (error) {
-  fail(formatError(error), 3);
-}
-
-if (!listen.ok) {
-  // EADDRINUSE deserves its own sentence: it is the one failure an operator will
-  // actually hit, and the fix (find the other listener, or pick another port) is
-  // not obvious from "EADDRINUSE".
-  if (listen.error === 'EADDRINUSE') {
-    fail(
-      `UDP port ${port} is already in use on ${host} — another STUN server or another ` +
-        `w2m-stun is holding it. Stop it, or choose a different --port.`,
-      3,
-    );
-  }
-  fail(`failed to bind ${host}:${port} — ${listen.error}`, 3);
-}
-
-const bound = server.address() ?? { address: listen.host, port: listen.port };
-log('');
-log('  W2M STUN responder is listening.');
-log('');
-log(`  Bind          udp4 ${bound.address}:${bound.port}`);
-log(`  Software      ${software}`);
-log('  Answers       Binding requests (0x0001) -> 0x0101 with XOR-MAPPED-ADDRESS,');
-log('                MAPPED-ADDRESS and SOFTWARE. Anything else is dropped.');
-log('');
-log('  NAT translation:');
-log('    A machine behind NAT cannot see the public address and port its packets');
-log(
-  `    leave from. Point clients at ${bound.address === '0.0.0.0' ? '<this-host>' : bound.address}:${bound.port} (UDP) and`,
-);
-log('    this server reports the translated address back, which is what lets two');
-log('    machines punch a direct path instead of relaying every task.');
-if (bound.address === '0.0.0.0') {
-  log('');
-  log('  NOTE: bound to 0.0.0.0 — reachable from anywhere that can route UDP to this');
-  log('        host. There is no authentication and no state: every request is');
-  log('        answered on the address it came from, and nothing else is possible.');
-}
-log('');
-log(`  Log level     ${logLevel}${debug ? '' : '   (--log-level debug prints one line per request)'}`);
-log('');
-
-let stopping = false;
-async function shutdown(signal) {
-  if (stopping) return;
-  stopping = true;
-  const stats = server.stats();
-  log(
-    `\n  ${signal} received, shutting down. ` +
-      `requests=${stats.requests} responses=${stats.responses} errors=${stats.errors} ` +
-      `uptime=${Math.round((Date.now() - startedAt) / 100) / 10}s`,
-  );
+/**
+ * Run only when executed, never when imported.
+ *
+ * `package.json` publishes this file as an `exports` subpath, and an unguarded top-level body means
+ * **importing that subpath executes the program**. Measured, not inferred: on the sibling `w2m-localside.mjs`, a
+ * statement placed after the import never ran and node exited with code 2.
+ *
+ * **A published entry point that terminates whichever process imports it is a plugin that stops the client from
+ * starting** -- the defect this closes. `w2m-mcp.mjs` already carried the guard and was the only bin that
+ * behaved, so the fix gives the others the same one rather than withdrawing the exports: **a subpath that is
+ * importable and inert is strictly better than one that is neither.**
+ */
+if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  let server;
+  let listen;
+  const startedAt = Date.now();
   try {
-    await server.stop();
+    server = createStunServer({ host, port, software, log: logRequest });
+    listen = await server.start();
   } catch (error) {
-    process.stderr.write(`w2m-stun: error while closing: ${formatError(error)}\n`);
-    process.exit(1);
+    fail(formatError(error), 3);
   }
-  process.exit(0);
-}
 
-process.on('SIGINT', () => {
-  void shutdown('SIGINT');
-});
-process.on('SIGTERM', () => {
-  void shutdown('SIGTERM');
-});
+  if (!listen.ok) {
+    // EADDRINUSE deserves its own sentence: it is the one failure an operator will
+    // actually hit, and the fix (find the other listener, or pick another port) is
+    // not obvious from "EADDRINUSE".
+    if (listen.error === 'EADDRINUSE') {
+      fail(
+        `UDP port ${port} is already in use on ${host} — another STUN server or another ` +
+          `w2m-stun is holding it. Stop it, or choose a different --port.`,
+        3,
+      );
+    }
+    fail(`failed to bind ${host}:${port} — ${listen.error}`, 3);
+  }
+
+  const bound = server.address() ?? { address: listen.host, port: listen.port };
+  log('');
+  log('  W2M STUN responder is listening.');
+  log('');
+  log(`  Bind          udp4 ${bound.address}:${bound.port}`);
+  log(`  Software      ${software}`);
+  log('  Answers       Binding requests (0x0001) -> 0x0101 with XOR-MAPPED-ADDRESS,');
+  log('                MAPPED-ADDRESS and SOFTWARE. Anything else is dropped.');
+  log('');
+  log('  NAT translation:');
+  log('    A machine behind NAT cannot see the public address and port its packets');
+  log(
+    `    leave from. Point clients at ${bound.address === '0.0.0.0' ? '<this-host>' : bound.address}:${bound.port} (UDP) and`,
+  );
+  log('    this server reports the translated address back, which is what lets two');
+  log('    machines punch a direct path instead of relaying every task.');
+  if (bound.address === '0.0.0.0') {
+    log('');
+    log('  NOTE: bound to 0.0.0.0 — reachable from anywhere that can route UDP to this');
+    log('        host. There is no authentication and no state: every request is');
+    log('        answered on the address it came from, and nothing else is possible.');
+  }
+  log('');
+  log(`  Log level     ${logLevel}${debug ? '' : '   (--log-level debug prints one line per request)'}`);
+  log('');
+
+  let stopping = false;
+  async function shutdown(signal) {
+    if (stopping) return;
+    stopping = true;
+    const stats = server.stats();
+    log(
+      `\n  ${signal} received, shutting down. ` +
+        `requests=${stats.requests} responses=${stats.responses} errors=${stats.errors} ` +
+        `uptime=${Math.round((Date.now() - startedAt) / 100) / 10}s`,
+    );
+    try {
+      await server.stop();
+    } catch (error) {
+      process.stderr.write(`w2m-stun: error while closing: ${formatError(error)}\n`);
+      process.exit(1);
+    }
+    process.exit(0);
+  }
+
+  process.on('SIGINT', () => {
+    void shutdown('SIGINT');
+  });
+  process.on('SIGTERM', () => {
+    void shutdown('SIGTERM');
+  });
+}
