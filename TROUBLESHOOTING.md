@@ -258,6 +258,59 @@ after removal, remove the `w2m` row from `cordis.patch.yml` by hand (§2) before
 **Not us.** If the failure is in a _different_ plugin's entry and this one is merely in the same
 profile, the loader reports the package name in the same line — read it before assuming it is ours.
 
+### 3.1 First rule: if a double-click produces NO process, it is not a plugin
+
+**This section's decision procedure below will mislead you if you skip this step.** It assumes the
+application *ran and reported something*. A launch that leaves **no process at all** — nothing in Task
+Manager, no window, no dialog — is a different failure, and the plugin is not the cause.
+
+**The mechanism**, read out of `@deepseek-ai/dsh-desktop`'s `lib/main.js`:
+
+```js
+function claimDesktopSingleInstance(application, focusOwner) {
+  if (!application.requestSingleInstanceLock()) {
+    application.quit();          // no dialog, no error, no window
+    return false;
+  }
+  application.on("second-instance", focusOwner);
+  return true;
+}
+```
+
+**A second launch is silently discarded while the first instance holds the lock.** Electron registers that
+lock against the *application*, not against a directory, which is why the two most natural remedies both
+fail:
+
+| What you try | Why it does nothing |
+|---|---|
+| **Disable third-party plugins before restarting** | The new process never reaches plugin loading — it quits at the lock |
+| **Reinstall the client (new folder, new exe)** | A new directory does not release a lock registered against the application |
+
+**Check the lock before touching anything else:**
+
+```powershell
+# Windows
+Get-Process -Name 'DeepSeek Harness' | Select-Object Id, StartTime
+```
+
+```bash
+# macOS / Linux
+pgrep -fl "DeepSeek Harness"
+```
+
+* **Processes listed** → it is the lock, and the app is not broken. **End them and start again.** On
+  Windows: `Stop-Process -Name 'DeepSeek Harness' -Force`. Do **not** delete `~/.dsh`.
+* **Nothing listed** → the failure really is before the lock, and *then* §3's procedure below applies.
+
+**A measured case, so the cost is on record.** A restart after upgrading to **v0.58.0** produced no
+process. Disabling third-party plugins and reinstalling the client both changed nothing; **deleting the
+entire `~/.dsh` directory fixed it** — not because anything in that directory was corrupt, but because
+**the deletion took down the process still holding the lock**, and the next launch then became the first
+instance. **Killing that process is the smaller, safer step, and it is the one to try first.**
+
+**What this cost, stated plainly:** the deleted directory carried session history and profile
+configuration that no longer exists. **`Stop-Process` would have cost nothing.**
+
 ---
 
 ## 4. A machine is listed but never answers

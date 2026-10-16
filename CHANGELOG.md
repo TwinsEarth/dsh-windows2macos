@@ -4,6 +4,71 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.60.0] — 2026-10-16
+
+**Two things learned from a client that would not start, neither of which was a crash in this plugin.**
+
+### §3.1 in `TROUBLESHOOTING.md`: check the lock before you check the plugin
+
+A launch that leaves **no process at all** is a different failure from one that starts and reports something, and
+the existing §3 procedure will mislead anyone who skips that distinction — it assumes the application *ran*.
+
+**The mechanism is one function in `@deepseek-ai/dsh-desktop`'s `lib/main.js`:**
+
+```js
+function claimDesktopSingleInstance(application, focusOwner) {
+  if (!application.requestSingleInstanceLock()) {
+    application.quit();          // no dialog, no error, no window
+    return false;
+  }
+```
+
+**A second launch is silently discarded while the first instance holds the lock.** Electron registers it against
+the *application*, not a directory — which is why the two natural remedies both fail, and why the section now says
+so before offering any plugin diagnosis:
+
+| What was tried | Why it did nothing |
+|---|---|
+| disable third-party plugins before restarting | the new process quits at the lock, before plugin loading |
+| reinstall the client (new folder, new exe) | a new directory does not release an application-scoped lock |
+
+**Deleting `~/.dsh` fixed it — not because anything in it was corrupt, but because the deletion took down the
+process still holding the lock.** The section now leads with the measurement that costs nothing:
+
+```powershell
+Get-Process -Name 'DeepSeek Harness' | Select-Object Id, StartTime
+```
+
+**Processes listed → it is the lock, end them and retry. Nothing listed → the failure really is pre-lock, and §3's
+procedure applies.** The deleted directory carried session history and profile configuration; **`Stop-Process`
+would have cost nothing.**
+
+### `scripts/session-retention.mjs`: the store is bounded, out-of-band, as DSH says it must be
+
+`@deepseek-ai/dsh-session-persistence`'s README, under *Known Limitations*:
+
+> **No deletion or retention API** — pruning stored sessions is **out-of-band backend maintenance**.
+
+**So this is not a workaround for a missing feature: the host states retention is the operator's job.** The
+measurement that motivated it is that **one session reached 18.03 MiB of an 18.07 MiB store**, nothing bounds it,
+and every start reads the store.
+
+Three refusals are built in, and each is a deliberate limit rather than an omission:
+
+* **The newest session of every workspace is never removed.** DSH writes to it, and *which* process is writing
+  cannot be checked reliably from outside — so the rule is the one that needs no knowledge of the running
+  process.
+* **`--apply` is required.** The default prints the plan and exits 0. **A tool that removes conversation history
+  shows what it will remove before it removes it.**
+* **A directory that is not a session is reported, not touched**, because the layout is read from the filesystem
+  rather than assumed.
+
+**Verified against the real store:** at a 256 MiB cap it reports *"under the cap — nothing to remove"*; at a
+1 MiB cap it plans two removals and leaves the 18 MiB live session alone.
+
+**No test count change** — both additions are a document and a script, and the script is exercised by hand against
+the store it bounds rather than by a fixture that would not resemble it.
+
 ## [0.59.0] — 2026-10-16
 
 **Every published bin can now be imported without killing the importing process — measured, not reasoned about.**
