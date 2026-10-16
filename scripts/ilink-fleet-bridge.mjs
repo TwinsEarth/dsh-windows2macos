@@ -30,6 +30,18 @@ import { randomBytes } from 'node:crypto';
 
 import { buildHeaders, buildReply, sendSucceeded, planMessage, renderTaskOutcome, renderFailure, MESSAGE_TYPE, dryRunPolicy } from '../src/chatops/ilink-fleet-bridge.mjs';
 import { createFleetExecutor } from '../src/chatops/fleet.mjs';
+/**
+ * The capability probe, used to say at startup whether vision is usable.
+ *
+ * **This is `src/chatops/vision.mjs`'s first production caller**, and the pre-flight's orphan gate is what
+ * required one: a mechanism with no caller is indistinguishable from a finished feature, and this repository has
+ * shipped four of those. The probe is deliberately the smallest useful consumer -- **not** the analysis path,
+ * which is the separate WeChat work.
+ *
+ * It earns its place beyond satisfying the gate: "is vision configured on this machine" is a real question at
+ * startup, and without a line here the only way to learn the answer is to send an image and read the refusal.
+ */
+import { visionStatus } from '../src/chatops/vision.mjs';
 
 const LOGIN = 'dist/ilink/ilink-login.json';
 const CURSOR = 'dist/ilink/ilink-cursor.txt';
@@ -234,6 +246,15 @@ async function dispatchAndReport(plan) {
 
 async function main() {
   let cursor = existsSync(CURSOR) ? readFileSync(CURSOR, 'utf8').trim() : '';
+  /**
+   * Say whether vision is usable, before the loop starts.
+   *
+   * An image arriving with vision unconfigured is answered by the help text either way, **and that message is
+   * the same sentence whether the skill is missing, the key is absent, or python3 is not installed.** One line
+   * here turns three indistinguishable failures into a named one at the moment it can still be fixed cheaply.
+   */
+  const vision = await visionStatus();
+  log(`vision      : ${vision.ready ? `ready (${vision.provider})` : `NOT ready -- ${vision.reason}`}`);
   log(`listening (cursor ${cursor === '' ? 'empty' : `${cursor.length} chars`}) -- send /run ... in WeChat`);
   let handled = 0;
 

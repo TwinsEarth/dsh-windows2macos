@@ -4,6 +4,61 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.57.0] — 2026-10-15
+
+**An image path becomes text evidence: the vision subprocess, and the credential path that does not touch argv.**
+
+### What this is, and what it deliberately is not
+
+`src/chatops/vision.mjs` runs the vendored `vision.py` as a subprocess. **It is not the WeChat integration** —
+the bridge still answers an image with a help message. The two halves are kept apart because each has a different
+failure mode and can be verified alone, **and this half is verifiable today**: give it a real image and it either
+returns text or a named reason.
+
+**Verified against the real endpoint, on this machine:** a generated 32×32 red PNG, `glm-4v-plus`, **1.77 s**,
+reply `"红色。"` — and `prompt_tokens` 64 → 2374, so the image genuinely reached the model rather than being
+ignored.
+
+### The credential never enters `argv`
+
+`vision.py` resolves its key as `--api-key` > `VISION_API_KEY` > the provider's own variable — read out of its
+own source, not assumed. **Passing it on the command line would put a live key into `ps` output and into any
+argument logging**, so this module only ever sets it **in the child's environment**, and the caller supplies it
+from a file.
+
+**The settings file is a parser, not a shell.** No expansion, no quoting rules, no `export` prefix: a value of
+`$HOME` stays the four characters `$HOME`. **A settings file that is half a shell is a shell**, and the point of
+this one is that it is read rather than executed.
+
+### An error message I wrote that collapsed three causes into one
+
+My first probe of the credential printed
+`==> refused; the key or the model name is not accepted` for **any** non-2xx response. The actual response was:
+
+```
+HTTP 400  code 1210  "图片输入格式/解析错误"
+```
+
+**That is an image-decoding failure — which is proof the credential was accepted**, because bigmodel answers
+**401** for a bad key. **My hand-built base64 PNG was malformed, and I reported it as a credential problem.** One
+conclusion for three different causes is the failure this repository keeps naming, and I committed it while
+writing a file whose own header complains about that pattern.
+
+The re-probe generates the PNG from `zlib.deflateSync` plus a hand-written CRC — **correct by construction** —
+and splits the two questions: a text-only request isolates the key, and the image isolates the vision path. Both
+returned 200.
+
+### One ordering the code decided and the test got wrong
+
+The module checks the image argument, then the script, then whether the image exists. My new assertion claimed a
+non-existent image outranks a missing script — **it does not, and the code was right.** The assertion was
+narrowed to the ordering that is actually guaranteed: **an empty argument is rejected before the installation is
+consulted.**
+
+**17 new tests, 0 failures**, and none of them needs a network or a key — every refusal path is asserted, and the
+one thing not asserted is a real model answer, because a suite that needs a credential is a suite that skips
+wherever the credential is absent.
+
 ## [0.56.0] — 2026-10-15
 
 **The declared endpoint is now tested against the real binary, so a drifted port turns the pre-flight red.**
