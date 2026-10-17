@@ -55,6 +55,7 @@ import {
 } from 'node:crypto';
 import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { blake2s256 as blake2s256Js } from './blake2s.mjs';
 
 /* -------------------------------------------------------------------------- */
 /* Names that travel on the wire, or into a report                             */
@@ -738,7 +739,8 @@ export function cryptoCapabilities() {
     }
   };
 
-  check('blake2s256', () => createHash('blake2s256').update('').digest().length === 32);
+  // The JavaScript fallback counts here: what the handshake needs is the digest, not OpenSSL's implementation of it.
+  check('blake2s256', () => blake2s256Support().ok);
   check('sha256', () => createHash('sha256').update('').digest().length === 32);
   check('chacha20-poly1305', () => {
     const key = randomBytes(32);
@@ -801,16 +803,47 @@ export function blake2s256Support() {
     blake2sSupport = {
       ok: bytes === 32,
       advertised,
+      source: 'native',
       detail: bytes === 32
         ? `BLAKE2s-256 available (${advertised ? 'advertised by getHashes' : 'works though not advertised'})`
         : `BLAKE2s-256 produced ${bytes} bytes rather than 32`,
     };
   } catch (e) {
-    blake2sSupport = {
-      ok: false,
-      advertised,
-      detail: `BLAKE2s-256 unavailable on this runtime: ${e?.message ?? String(e)}. It is a WIRE PROTOCOL primitive -- the handshake hash, the prologue hash and the session binding -- so it cannot be replaced with SHA-256 without breaking interoperability with every peer. This machine cannot take part in a handshake until the runtime supports it.`,
-    };
+    /**
+     * **The native digest is unavailable, but that is not the end of the handshake.**
+     *
+     * `P2P_PUNCH_FAILED: Digest method not supported` -- OpenSSL's message, naming no algorithm -- was observed on the
+     * DSH desktop runtime. BLAKE2s is public and deterministic, so the digest can be computed in JavaScript and the
+     * bytes are identical to a peer with a native implementation: **interoperability is preserved exactly**, which is
+     * the constraint the old message correctly named and then wrongly concluded from.
+     *
+     * The fallback is verified before it is trusted: its digest of the empty input is compared against the published
+     * vector, so a broken fallback reports unavailable rather than producing hashes no peer will agree with.
+     */
+    const KNOWN_EMPTY = '69217a3079908094e11121d042354a7c1f55b6482ca1a51e1b250dfd1ed0eef9';
+    let jsOk = false;
+    try {
+      jsOk = blake2s256Js(Buffer.alloc(0)).toString('hex') === KNOWN_EMPTY;
+    } catch {
+      jsOk = false;
+    }
+    blake2sSupport = jsOk
+      ? {
+        ok: true,
+        advertised,
+        source: 'js-fallback',
+        detail: `BLAKE2s-256 computed in JavaScript: the runtime's digest is unavailable (${e?.message ?? String(e)}), `
+          + 'and the fallback matches the published empty-input vector, so handshakes stay interoperable',
+      }
+      : {
+        ok: false,
+        advertised,
+        source: 'none',
+        detail: `BLAKE2s-256 unavailable on this runtime: ${e?.message ?? String(e)}, and the JavaScript fallback failed `
+          + 'its known-answer check. It is a WIRE PROTOCOL primitive -- the handshake hash, the prologue hash and the '
+          + 'session binding -- so it cannot be replaced with SHA-256 without breaking interoperability with every peer. '
+          + 'This machine cannot take part in a handshake until one of the two works.',
+      };
   }
   return blake2sSupport;
 }
@@ -826,18 +859,28 @@ export function blake2s256Support() {
  * @returns {Buffer} 32 bytes.
  */
 export function handshakeHash(...parts) {
-  let hash;
+  let out;
   try {
-    hash = createHash('blake2s256');
+    const hash = createHash('blake2s256');
+    for (const part of parts) hash.update(part);
+    out = hash.digest();
   } catch (e) {
+    /**
+     * The runtime has no native BLAKE2s. Compute the same 32 bytes in JavaScript instead of refusing the handshake:
+     * the algorithm is public and deterministic, so the bytes a peer computes are unchanged and interoperability is
+     * preserved. A runtime where neither path works still fails loudly, with the algorithm and the consequence named.
+     */
     const support = blake2s256Support();
-    const error = new Error(`handshakeHash requires BLAKE2s-256: ${support.detail}`);
-    error.code = 'CRYPTO_BLAKE2S256_UNAVAILABLE';
-    error.cause = e;
-    throw error;
+    if (!support.ok) {
+      const error = new Error(`handshakeHash requires BLAKE2s-256: ${support.detail}`);
+      error.code = 'CRYPTO_BLAKE2S256_UNAVAILABLE';
+      error.cause = e;
+      throw error;
+    }
+    out = blake2s256Js(Buffer.concat(
+      parts.map((part) => (typeof part === 'string' ? Buffer.from(part, 'utf8') : Buffer.from(part))),
+    ));
   }
-  for (const part of parts) hash.update(part);
-  const out = hash.digest();
   if (out.length !== 32) {
     const error = new Error(`handshakeHash expected a 32-byte digest and produced ${out.length}; peers would compute a different handshake hash`);
     error.code = 'CRYPTO_BLAKE2S256_WRONG_LENGTH';

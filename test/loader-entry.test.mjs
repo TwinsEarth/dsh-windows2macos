@@ -42,7 +42,7 @@
  * Each assertion then measures one of the defects, rather than inferring it:
  *
  *   1. the `include:w2m` entry ends **active**, with no error recorded on its fiber;
- *   2. all **eight** `w2m_*` tools are registered in the live `tools` service;
+ *   2. all **eleven** `w2m_*` tools are registered in the live `tools` service;
  *   3. the **real** `clientModules` service the web app loads composes a boot-graph row for this
  *      package from the shipped `lib/client.js`;
  *   4. the plugin's own `w2m_status` reports `target_selection.attached: true` — the route pair really
@@ -112,17 +112,29 @@ const CLIENT_PACKAGE = '@twinsearth/w2m-dsh-plugin';
 /** The route the host registers and the page fetches (defect 3, `/api` channel included). */
 const TARGET_ROUTE_PATH = '/api/w2m/target';
 
-/** The eleven tools the plugin registers; the exact set, because "some tools" is not the contract. */
+/**
+ * The eleven tools the plugin registers; the exact set, because "some tools" is not the contract.
+ *
+ * Sorted, so a **missing** name and a **renamed** name fail differently in the diff. The list had drifted: it held
+ * nine while the plugin registered eleven, and the compatibility gate (which mounts the packed artifact in a real
+ * profile and runs the real Loader) failed on
+ *
+ *     registers all eight w2m_* tools
+ *
+ * -- a name that was already wrong about its own count.
+ */
 const EXPECTED_TOOLS = [
+  'w2m_approvals',
+  'w2m_council',
   'w2m_devices',
   'w2m_history',
+  'w2m_memory',
   'w2m_report',
   'w2m_run',
   'w2m_stats',
   'w2m_status',
   'w2m_update',
   'w2m_wait',
-  'w2m_memory',
 ];
 
 /** Fiber state 2 is cordis for "active"; 3 is "failed". */
@@ -174,7 +186,7 @@ const OVERLAY = `# Written by test/loader-entry.test.mjs: keep the plugin's stat
  *   W2M_ROUTE_DEFECT=1 node --test test/loader-entry.test.mjs
  *
  * With it set, `sweeps every fiber` must fail naming the child's error, while `leaves the entry
- * active` and `registers all eight w2m_* tools` still pass. Nothing here depends on the switch: it
+ * active` and `registers every w2m_* tool the package declares` still pass. Nothing here depends on the switch: it
  * edits the throwaway profile's installed copy, never the tree under test.
  */
 const ROUTE_DEFECT_ENV = 'W2M_ROUTE_DEFECT';
@@ -462,7 +474,7 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
     assert.equal(entry.error, null);
   });
 
-  it('registers all eight w2m_* tools', (t) => {
+  it('registers every w2m_* tool the package declares', (t) => {
     if (skipReason !== null) return t.skip(skipReason);
     const registered = report.tools.filter((name) => name.startsWith('w2m_'));
     assert.deepEqual(registered, EXPECTED_TOOLS, `the live tools service holds: ${report.tools.join(', ')}`);

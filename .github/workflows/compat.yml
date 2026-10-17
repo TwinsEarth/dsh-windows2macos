@@ -344,7 +344,9 @@ jobs:
           const DETERMINISTIC = [
             'mounts the entry the bundle patch names',
             'leaves the entry active, with no error on its fiber',
-            'registers all eight w2m_* tools',
+            // A prefix, not the whole title: the assertion was renamed when the tool list grew from eight to eleven,
+            // and a needle that pins the whole sentence turns a rename into a red gate for the wrong reason.
+            'registers every w2m_* tool',
             'has the client half composed by the web app',
             'attaches the composer control',
             'reports no failed entry that names this package',

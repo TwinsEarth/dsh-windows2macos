@@ -2,6 +2,66 @@
 
 All notable changes to this project are documented here.
 
+## [1.1.0] — 2026-10-17
+
+**The direct path now works on runtimes whose OpenSSL has no BLAKE2s, and the compatibility gate that measures the real
+Loader was asserting a tool list that had gone stale.**
+
+### The handshake hash no longer depends on the runtime's OpenSSL
+
+One dispatch reported, per machine:
+
+> `P2P_PUNCH_FAILED: handshakeHash requires BLAKE2s-256: BLAKE2s-256 unavailable on this runtime: Digest method not
+> supported. It is a WIRE PROTOCOL primitive -- the handshake hash, the prologue hash and the session binding -- so it
+> cannot be replaced with SHA-256 without breaking interoperability with every peer.`
+
+That message names the constraint correctly and draws the wrong conclusion. **BLAKE2s is public and deterministic**, so
+the digest can be computed here instead of by OpenSSL: the bytes are identical to what a peer with a native
+implementation produces, and interoperability is preserved exactly. The alternative -- refusing to handshake -- makes
+**every** direct path fall back to the relay on that runtime, which is what the fleet was doing without saying so.
+
+* `src/agent/blake2s.mjs` — BLAKE2s-256 in plain JavaScript (unkeyed, which is all the wire protocol uses).
+* `src/agent/crypto.mjs` — `handshakeHash` tries the native digest and falls back to it; `blake2s256Support()`
+  now reports **how** the digest is reached (`native` or `js-fallback`); `cryptoCapabilities()` counts the fallback
+  as present, because what the handshake needs is the digest, not OpenSSL's implementation of it.
+* The fallback is verified before it is trusted: its empty-input digest is compared against the published vector, so a
+  broken fallback reports unavailable rather than producing hashes no peer will agree with.
+
+**The bug that made this take longer than it should have.** The first version inverted both `v[14]` and `v[15]` for
+the final block. BLAKE2 sets `f0 = 0xFFFFFFFF` on the last block and leaves `f1 = 0` for sequential hashing, so
+only `v[14]` is inverted. Inverting both produces a **stable, plausible-looking digest that matches no reference**:
+the three RFC vectors failed while the compression function -- checked against an independent implementation -- was
+correct the whole time. `test/blake2s.test.mjs` pins the vectors and compares against `node:crypto` across every
+block boundary, so that class of mistake cannot survive again.
+
+### The compatibility gate was asserting a stale tool count
+
+`test/loader-entry.test.mjs` asserted the plugin registers a fixed set of tools, under a name that still said "eight".
+The set had grown to **eleven** (`w2m_approvals` and `w2m_council` were missing), so the gate that mounts the packed
+artifact in a real profile and runs the real Loader failed at:
+
+> `registers all eight w2m_* tools`
+
+The list is now
+the actual eleven, sorted so a missing name and a renamed name fail differently, and the test says what it means.
+
+### Two configuration facts this exposed, recorded because they are not obvious
+
+A machine can be **installed, running, and still outside the fleet** -- both were true here:
+
+* `dsh.profile.bundles` must list the package. Installing it as a dependency is not enough: the host composes the
+  entry list from that array, so a package present in `node_modules` and absent from `bundles` simply never loads.
+* `autoStartAgent: true` is **off by default**, and joining happens inside the agent it starts. Without it a machine
+  never joins, no matter how correctly it is installed.
+
+With both set, this machine joined, listed its peers, accepted a dispatch and executed it (`node --version`, exit 0).
+
+### Verified
+
+Full suite green; pre-flight **GREEN**, 15 of 15 checks. `test/blake2s.test.mjs`: **10 pass, 0 fail**, including
+byte-identical agreement with `node:crypto` at lengths 0, 1, 2, 3, 31, 32, 33, 63, 64, 65, 127, 128, 129, 191, 192,
+193, 255, 256, 257 and 1000.
+
 ## [1.0.16] — 2026-10-17
 
 **The last two failures on Linux CI, and one of them was a defect in the release process: a release was advertised as
