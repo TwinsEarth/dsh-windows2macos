@@ -2,6 +2,69 @@
 
 All notable changes to this project are documented here.
 
+## [1.0.7] — 2026-10-17
+
+**The fleet sync channel, both directions: a machine can publish its collective memory to the relay and another
+machine in the same fleet can fetch it back by hash.**
+
+### #1 is now a channel, not a backup
+
+v1.0.6 shipped the storage layer and said plainly that it had no route and no caller. This release supplies both:
+
+| Piece | Where |
+|---|---|
+| content-addressed store | `src/relay/persistence.mjs` — `putBlob`/`getBlob`, 8 MiB per blob, 256 per fleet, oldest-first eviction that never takes the last one |
+| hash → fleet ownership | `<state>/blobs/index.json`, so a content-addressed store is *not* a shared one |
+| two routes | `PUT`/`GET /v1/fleet/blobs/<sha256>` in `src/relay/server.mjs`, behind the same device-token gate as every other route |
+| scoping | `state.scopeBlobFleet` reuses `scopeFleetId` — **the same rule task dispatch obeys**, not a second copy of it |
+| caller | `w2m_memory` `action: "publish"` and `"pull"` |
+
+**Why a content-addressed store does not contradict "the relay keeps only hashes".** It persists `stdout_sha256`
+and never the text, and `src/agent/storage.mjs` records why: each machine's `memory.jsonl` is the only durable copy
+of what a command printed. **That invariant is about the relay not interpreting content.** A blob keyed by its own
+hash preserves it exactly — the relay still interprets nothing, and **the hash is what says the bytes are the
+bytes**, as `stdout_sha256` does for a result. What is new is only that a hash the relay already holds can now have
+its bytes fetched from the same place.
+
+### The decisions worth recording
+
+**The write verifies the key, and refuses rather than correcting.** A content-addressed store that accepts bytes
+under a key they do not hash to is not content-addressed: the key stops being a claim, and every later reader's
+verification becomes decorative. A mismatch is `422 BLOB_HASH_MISMATCH` and nothing is stored.
+
+**Ownership is first-writer-wins.** A second fleet PUT-ing an identical blob does **not** take ownership of it.
+Otherwise any fleet could claim another's blob by replaying the same bytes, which is the same failure as having no
+index at all.
+
+**A cross-fleet read is `404`, not `403`.** A distinguishable "not yours" tells a prober that this hash exists on
+this relay. The reader cannot tell "never stored" from "another fleet's", deliberately.
+
+**The pull side re-hashes what it receives.** A verification performed only by the party that could be wrong is not
+a verification, so a reader that gets bytes hashing to something else raises `W2M_BAD_BLOB` rather than passing
+them on.
+
+### What is verified, and what is not
+
+**Verified — executed:** four new tests in `test/relay.test.mjs` drive the real routes against a real relay:
+store-and-return-unchanged; a mismatched key is refused (422) and leaves the key absent (404); one fleet cannot read
+another's blob (404); an unauthenticated request is refused (401). Full suite **2356 tests, 2342 pass, 0 fail, 14
+skip**; pre-flight **GREEN, 15 of 15 checks**.
+
+**NOT verified: the `publish`/`pull` tool actions end to end.** They are type-correct and lint-clean, and their
+failure paths are written, but **no test executes them** — they need a profile with a `fleet-memory.md` and a live
+relay. They are marked unverified here rather than counted as working, which is the distinction this project keeps
+having to restate.
+
+**A known limit of the reader:** `pull` returns the blob as text and re-hashes it as UTF-8. That is exact for a
+`fleet-memory.md`; it would not be for arbitrary binary content, and the channel does not claim to carry that.
+
+### Not in this release
+
+The trigger (#3) and merge semantics (#2) are deliberately absent. Publishing is a decision a machine makes, not
+something that happens on join, and merge needs a conflict rule that has not been decided: two machines writing
+different facts produce **two hashes**, and nothing yet says who wins. **Nothing is overwritten in the meantime —
+that is the property #1 was built to provide.**
+
 ## [1.0.6] — 2026-10-17
 
 **DSH-GPW now ships *findable*: installed with the package, present in the plugin list, and off until an operator

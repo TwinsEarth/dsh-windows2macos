@@ -17,6 +17,9 @@ import { createHash, randomBytes } from 'node:crypto';
 // exhaustive tests — three lines inside this object would be untestable without a live relay.
 import { targetsFor } from '../chatops/fleet-wiring.mjs';
 import { deviceFleetFields } from '../chatops/fleet-wiring.mjs';
+// v1.0.7: the one home for "which fleet does this requester act as", reused by the blob channel so it cannot
+// drift from the rule the task routes already obey.
+import { scopeFleetId } from '../chatops/fleet-wiring.mjs';
 // v0.8.1: the account-derived fleet key, so a machine can join with no pairing code.
 import { planJoin } from '../chatops/fleet-join.mjs';
 
@@ -56,6 +59,21 @@ export const ERROR_STATUS = Object.freeze({
   SIGNATURE_EXPIRED: 401,
   SIGNATURE_REPLAY: 401,
   SIGNING_NOT_CONFIGURED: 500,
+
+  /* v1.0.7: the content-addressed blob channel.
+   *
+   * `BLOB_HASH_MISMATCH` is **422**, not 400: the request is well-formed and the bytes are fine, but they do not
+   * hash to the key they were sent under, so storing them would break content addressing for every later reader.
+   * That is a semantically invalid request, not a malformed one -- 422 is the status that says so.
+   *
+   * `PERSISTENCE_DISABLED` is **503**: the relay was started without a state directory, so the channel cannot
+   * exist. Retrying will not fix a missing directory, but a caller is still right to treat it as "this relay cannot
+   * serve this right now" rather than as its own mistake. */
+  BLOB_HASH_MISMATCH: 422,
+  BLOB_TOO_LARGE: 413,
+  BLOB_EMPTY: 400,
+  BLOB_WRITE_FAILED: 500,
+  PERSISTENCE_DISABLED: 503,
 });
 
 /** §5.1 required envelope fields — missing any one means `unverifiable`. */
@@ -509,6 +527,57 @@ export class RabbitState {
 
   /** Inject/replace the persistence backend (also used by tests). */
   setPersistence(persistence) { this._persist = persistence ?? null; return this._persist; }
+
+  /* ---------------- v1.0.7: the content-addressed blob channel (#1) ---------------- */
+
+  /**
+   * Which fleet a device acts as when it writes or reads a blob.
+   *
+   * **Reuses `scopeFleetId` rather than re-deriving it.** The rule "the requester's fleet comes from the device
+   * record the relay wrote at pairing time, never from the request" is already stated, tested and enforced for task
+   * dispatch; a second copy here would be a second place for it to drift, and the blob channel is exactly where a
+   * drift would leak one fleet's memory into another's.
+   *
+   * @param {{machine_id?: string, fleet_id?: string|null}|null} device
+   * @returns {{ok:true, fleetId:string|null, legacy:boolean}|{ok:false, reason:string, text:string}}
+   */
+  scopeBlobFleet(device) {
+    return scopeFleetId({ device, relayFleetId: this.fleetId ?? null });
+  }
+
+  /**
+   * Store bytes under their SHA-256, owned by the writer's fleet.
+   *
+   * Delegates to `Persistence` -- this class never touches the filesystem (v0.1.2 §7), and that constraint is what
+   * keeps the durable path in one place.
+   *
+   * @param {object} device the authenticated device
+   * @param {Buffer} bytes
+   */
+  putFleetBlob(device, bytes) {
+    if (!this._persist) {
+      return { ok: false, reason: 'PERSISTENCE_DISABLED', detail: 'the relay has no persistence backend' };
+    }
+    const scope = this.scopeBlobFleet(device);
+    if (scope.ok !== true) return { ok: false, reason: scope.reason, detail: scope.text };
+    return this._persist.putBlob(bytes, { fleetId: scope.fleetId });
+  }
+
+  /**
+   * The bytes for a hash, or `null`.
+   *
+   * `null` covers three cases on purpose -- no such blob, a blob owned by another fleet, and no persistence -- so a
+   * caller cannot use the relay to enumerate which hashes exist elsewhere on it.
+   *
+   * @param {object} device the authenticated device
+   * @param {string} hash
+   */
+  getFleetBlob(device, hash) {
+    if (!this._persist) return null;
+    const scope = this.scopeBlobFleet(device);
+    if (scope.ok !== true) return null;
+    return this._persist.getBlob(hash, { fleetId: scope.fleetId });
+  }
 
   /** Snapshot the device table; failures must never break the request path. */
   _saveDevices() {

@@ -13,7 +13,7 @@ import https from 'node:https';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 
 import {
   MAX_FRAME_BYTES,
@@ -761,6 +761,77 @@ export class RelayServer {
       const { _instanceKey, ...clean } = result;
       return sendJson(res, 200, clean);
     }
+    /**
+     * v1.0.7: the content-addressed blob channel (#1).
+     *
+     * ## Why the relay may carry bytes at all
+     *
+     * It persists `stdout_sha256` and never the text, and `src/agent/storage.mjs` records why: each machine's
+     * `memory.jsonl` is the only durable copy of what a command printed. **That invariant is about the relay not
+     * interpreting content** -- it never decides what bytes mean and never asserts they are authentic.
+     *
+     * A blob keyed by its own hash preserves exactly that. The relay still interprets nothing; **the hash is what
+     * says the bytes are the bytes**, exactly as `stdout_sha256` does for a result. What is new is only that a hash
+     * the relay already holds can have its bytes fetched from the same place.
+     *
+     * ## Why the hash is verified before storing
+     *
+     * A content-addressed store that accepts bytes under a key they do not hash to is not content-addressed -- the
+     * key stops being a claim about the content, and every later reader's verification becomes decorative. So a
+     * mismatch is **refused (422)**, never stored and never corrected: correcting it would silently re-key a blob
+     * the caller believes it stored under a different name.
+     *
+     * ## Fleet scoping
+     *
+     * `putFleetBlob`/`getFleetBlob` reuse `scopeFleetId`, the same rule task dispatch obeys. A blob written by one
+     * fleet is **not readable by another**, and the read refusal is a 404 rather than a 403: a distinguishable
+     * "not yours" tells a prober that the hash exists here.
+     */
+    const blobMatch = /^\/v1\/fleet\/blobs\/([0-9a-f]{64})$/.exec(path);
+    if (blobMatch !== null) {
+      const hash = blobMatch[1];
+      if (method === 'PUT') {
+        const received = rawBody ?? Buffer.alloc(0);
+        const actual = createHash('sha256').update(received).digest('hex');
+        if (actual !== hash) {
+          throw new ProtocolError('BLOB_HASH_MISMATCH', 'the body does not hash to the key it was sent under', {
+            expected: hash,
+            actual,
+            bytes: received.length,
+          });
+        }
+        const stored = this.state.putFleetBlob(device, received);
+        if (stored.ok !== true) {
+          throw new ProtocolError(stored.reason ?? 'BLOB_WRITE_FAILED', stored.detail ?? 'the blob was refused', {
+            hash,
+          });
+        }
+        return sendJson(res, 201, {
+          protocol_version: PROTOCOL_VERSION,
+          ok: true,
+          hash: stored.hash,
+          bytes: stored.bytes,
+          evicted: stored.evicted,
+        });
+      }
+      if (method === 'GET') {
+        const bytes = this.state.getFleetBlob(device, hash);
+        if (bytes === null) {
+          // Same code and shape for "no such blob" and "not your fleet's" -- deliberately indistinguishable.
+          throw new ProtocolError('NOT_FOUND', 'no such blob is readable by this device', { hash });
+        }
+        res.writeHead(200, {
+          'content-type': 'application/octet-stream',
+          'content-length': bytes.length,
+          // Same reason as `/metrics`: a memory document must not be cached by an intermediary.
+          'cache-control': 'no-store',
+        });
+        res.end(bytes);
+        return true;
+      }
+      throw new ProtocolError('BAD_REQUEST', 'a blob is addressed with PUT or GET', { method });
+    }
+
     if (method === 'GET' && path === '/v1/devices') {
       return sendJson(res, 200, {
         protocol_version: PROTOCOL_VERSION,

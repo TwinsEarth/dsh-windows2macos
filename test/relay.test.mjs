@@ -13,6 +13,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import https from 'node:https';
 import fs from 'node:fs';
+import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -613,7 +614,7 @@ describe('auth (§1/§7)', () => {
   });
 
   it('every protected route answers 401 without a token, with the §7 shape', async () => {
-    // v0.1.2 §5: POST /v1/task no longer answers UNAUTHORIZED — it demands the
+    // v0.1.2 §5: POST /v1/task no longer answers UNAUTHORIZED → it demands the
     // operator token. Every other protected route is unchanged.
     const routes = [
       ['GET', '/v1/stream?machine_id=m1', 'UNAUTHORIZED'],
@@ -827,14 +828,14 @@ describe('SSE (§3)', () => {
   });
 
   /**
-   * v0.9.1 — presence expiry.
+   * v0.9.1 → presence expiry.
    *
    * Reported from a live fleet: a Windows machine that had been powered off for hours was still
    * listed `online` and still selectable as a dispatch target, with `last_heartbeat_at: null` to say
    * it had never heartbeated at all.
    *
    * The cause was that `online` was written only by the SSE stream attaching or detaching, so a
-   * **half-open stream** — a killed process, a pulled cable, a closed lid — left it `true` for as
+   * **half-open stream** → a killed process, a pulled cable, a closed lid → left it `true` for as
    * long as the socket survived, which is indefinitely. `peer.bye` did not help either, because it is
    * emitted *by* the detach that never came, so no other machine in the fleet was told either: that
    * is the "not broadcast" half of the same report.
@@ -1361,7 +1362,7 @@ describe('frame limit', () => {
 });
 
 /* ================================================================== */
-/* six-state aggregation (§6.3) — pure                                 */
+/* six-state aggregation (§6.3) → pure                                 */
 /* ================================================================== */
 
 describe('six-state aggregation (§6.3)', () => {
@@ -1495,7 +1496,7 @@ describe('six-state aggregation (§6.3)', () => {
      * v0.9.3. A dispatcher whose own tree is not a git work tree sends `base_commit: null`, and the
      * check used to compare every machine's real commit against the literal `null`. Every dispatch from
      * such a machine was therefore `unverifiable` -- including a wholly successful one -- with the
-     * reason `base_commit "a1e7dc04…" != expected null`, and the verdict became unreadable.
+     * reason `base_commit "a1e7dc04" != expected null`, and the verdict became unreadable.
      *
      * `fakeTask` without `base_commit`/`base_tree` overrides is exactly that dispatcher.
      */
@@ -1745,7 +1746,7 @@ describe('reports', () => {
 });
 
 /* ================================================================== */
-/* v0.1.2 §3 — deployment base path                                    */
+/* v0.1.2 §3 → deployment base path                                    */
 /* ================================================================== */
 
 describe('v0.1.2 base path (§3)', () => {
@@ -1773,13 +1774,13 @@ describe('v0.1.2 base path (§3)', () => {
       assert.equal(rootHealth.json.base_path, '/w2m');
       assert.equal(rootHealth.json.relay_id, relay.relayId);
 
-      // /v1/* works under the prefix…
+      // /v1/* works under the prefix
       const { token } = await pairDevice(relay, 'm1');
       const devices = await request(`${relay.url}/v1/devices`, { token });
       assert.equal(devices.status, 200);
       assert.equal(devices.json.devices.length, 1);
 
-      // …and 404s outside it — including with a perfectly valid token.
+      // …and 404s outside it → including with a perfectly valid token.
       const outside = await request(`${origin}/v1/devices`, { token });
       assert.equal(outside.status, 404, 'outside the prefix must be 404, not 401 and not 502');
       assert.equal(outside.json.error.code, 'NOT_FOUND');
@@ -1802,7 +1803,7 @@ describe('v0.1.2 base path (§3)', () => {
 });
 
 /* ================================================================== */
-/* v0.1.2 §3/§4 — proxy headers                                        */
+/* v0.1.2 §3/§4 → proxy headers                                        */
 /* ================================================================== */
 
 describe('v0.1.2 trust-proxy (§3/§4)', () => {
@@ -1849,7 +1850,7 @@ describe('v0.1.2 trust-proxy (§3/§4)', () => {
 });
 
 /* ================================================================== */
-/* v0.1.2 §5 — operator token                                          */
+/* v0.1.2 §5 → operator token                                          */
 /* ================================================================== */
 
 describe('v0.1.2 operator token (§5)', () => {
@@ -1904,7 +1905,7 @@ describe('v0.1.2 operator token (§5)', () => {
           `startup banner must warn: ${JSON.stringify(relay.startupMessages)}`,
         );
 
-        // escape hatch = v1 semantics: a paired device may dispatch…
+        // escape hatch = v1 semantics: a paired device may dispatch
         const a = await pairDevice(relay, 'm1');
         assert.equal((await postTask(relay, taskBody(), a.token)).status, 200);
         // …but the endpoint is not simply unauthenticated
@@ -2001,7 +2002,7 @@ describe('v0.1.2 operator token (§5)', () => {
   });
 
   /* ---------------------------------------------------------------- */
-  /* v0.5.9 MEDIUM-6 — the token is material, the posture is not       */
+  /* v0.5.9 MEDIUM-6 → the token is material, the posture is not       */
   /* ---------------------------------------------------------------- */
 
   describe('v0.5.9 MEDIUM-6 the operator token is printed once, by the start that generated it', () => {
@@ -2147,7 +2148,7 @@ describe('v0.1.2 operator token (§5)', () => {
 });
 
 /* ================================================================== */
-/* v0.1.2 §6 — /v1/pair rate limiting                                  */
+/* v0.1.2 §6 → /v1/pair rate limiting                                  */
 /* ================================================================== */
 
 describe('v0.1.2 pair rate limit (§6)', () => {
@@ -2176,8 +2177,7 @@ describe('v0.1.2 pair rate limit (§6)', () => {
   it('answers 429 RATE_LIMITED with retry_after_seconds and Recovers after the window', async () => {
     const clock = makeClock();
     await withRelay({ now: clock.now, pairRateLimitPerMinute: 2 }, async (relay) => {
-      // A SUCCESSFUL pair rotates the code, so each attempt mints a fresh one —
-      // this is exactly the "successes count too" case §6 calls out.
+      // A SUCCESSFUL pair rotates the code, so each attempt mints a fresh one →       // this is exactly the "successes count too" case §6 calls out.
       const pair = () => request(`${relay.url}/v1/pair`, {
         method: 'POST',
         body: {
@@ -2222,7 +2222,7 @@ describe('v0.1.2 pair rate limit (§6)', () => {
 });
 
 /* ================================================================== */
-/* v0.1.2 §7 — persistence                                             */
+/* v0.1.2 §7 → persistence                                             */
 /* ================================================================== */
 
 describe('v0.1.2 persistence (§7)', () => {
@@ -2364,7 +2364,7 @@ describe('v0.1.2 persistence (§7)', () => {
 });
 
 /* ================================================================== */
-/* v0.1.2 §4/§8 — healthz fields, SSE hardening, relay_id              */
+/* v0.1.2 §4/§8 → healthz fields, SSE hardening, relay_id              */
 /* ================================================================== */
 
 describe('v0.6.2 durability is a state, not a log line', () => {
@@ -2521,7 +2521,7 @@ describe('v0.1.2 observability (§4/§8)', () => {
           method: 'POST', token: deviceToken, body: envelopeForTask(taskId, 'm1'),
         }));
         await grab('task-created', postTask(relay, taskBody()));
-        // error paths carry `detail` too — the easiest place to leak by accident
+        // error paths carry `detail` too → the easiest place to leak by accident
         await grab('err-operator-missing', request(`${relay.url}/v1/task`, { method: 'POST', body: taskBody() }));
         await grab('err-operator-device-token', postTask(relay, taskBody(), deviceToken));
         await grab('err-unauthorized', request(`${relay.url}/v1/devices`));
@@ -2578,7 +2578,7 @@ describe('v0.1.2 observability (§4/§8)', () => {
 });
 
 /* ================================================================== */
-/* v0.1.2 §3 — TLS termination (deployment form B)                     */
+/* v0.1.2 §3 → TLS termination (deployment form B)                     */
 /* ================================================================== */
 
 // Self-signed fixture for 127.0.0.1/localhost, valid until 2036-10-04.
@@ -2679,7 +2679,7 @@ describe('v0.1.2 TLS (§3 form B)', () => {
 });
 
 /* ================================================================== */
-/* v0.1.2 §8.6 — offers lost while a stream is down                    */
+/* v0.1.2 §8.6 → offers lost while a stream is down                    */
 /* ================================================================== */
 
 /**
@@ -2937,7 +2937,7 @@ describe('v0.1.2 lost-offer recovery (§8.6)', () => {
 });
 
 /* ================================================================== */
-/* v0.3.0 — cross-machine RTT through the relay                        */
+/* v0.3.0 → cross-machine RTT through the relay                        */
 /* ================================================================== */
 
 /**
@@ -3304,7 +3304,7 @@ describe('v0.3.0 relay RTT (heartbeat rtt_ms)', () => {
 });
 
 /* ================================================================== */
-/* v0.3.0 — idle (diagnostic) heartbeats                               */
+/* v0.3.0 → idle (diagnostic) heartbeats                               */
 /* ================================================================== */
 
 /**
@@ -3499,7 +3499,7 @@ describe('v0.3.0 idle (diagnostic) heartbeats', () => {
 });
 
 /* ================================================================== */
-/* v0.3.0 §9 — request signing wired into the HTTP layer               */
+/* v0.3.0 §9 → request signing wired into the HTTP layer               */
 /* ================================================================== */
 
 /**
@@ -4009,7 +4009,7 @@ describe('v0.3.0 request signing (§9)', () => {
 });
 
 /* ================================================================== */
-/* v0.3.0 §9.4.1 — cross-team signing test vectors                     */
+/* v0.3.0 §9.4.1 → cross-team signing test vectors                     */
 /* ================================================================== */
 
 /**
@@ -4113,6 +4113,89 @@ describe('signing test vectors (§9.4.1)', () => {
       assert.equal(res.status, 200, `the published vector must be accepted by a real relay: ${res.text}`);
       assert.equal(res.json.cancel, false);
       assert.equal(res.json.lease_until, rfc3339(frozenMs + 50_000));
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// v1.0.7 — the content-addressed blob channel (#1d)
+// ---------------------------------------------------------------------------------------------
+//
+// **These are the first tests that execute the channel at all.** Before them the route and the store existed and
+// had never been reached, which is the defect this repository keeps an accepted-orphans list for.
+//
+// Two harness facts these tests depend on, both measured rather than assumed:
+//
+//   * `request()` **JSON-stringifies `body`** and sends `Buffer.from(JSON.stringify(body))`. A blob PUT must use
+//     `rawBody`, which is sent as `Buffer.from(rawBody, 'utf8')` — the bytes the hash is computed over. Using
+//     `body` here produced a real `BLOB_HASH_MISMATCH` before this was corrected, which is the relay behaving
+//     exactly as designed.
+//   * **A pairing code is one-time.** `pairDevice` mints a fresh one when `code` is omitted; a test that needs a
+//     specific fleet must mint one code per machine, or the second pair fails with `pairing code already used`.
+describe('v1.0.7 blob channel', () => {
+  const hashOf = (text) => createHash('sha256').update(Buffer.from(text, 'utf8')).digest('hex');
+
+  it('stores bytes under their own hash and returns them unchanged', async () => {
+    await withRelay({ stateDir: makeStateDir() }, async (relay) => {
+      const { token } = await pairDevice(relay, 'blob-sender');
+      const payload = 'fleet memory v1\nline two\n';
+      const hash = hashOf(payload);
+      const put = await request(`${relay.url}/v1/fleet/blobs/${hash}`, { method: 'PUT', rawBody: payload, token });
+      assert.equal(put.status, 201, put.text);
+      assert.equal(put.json.hash, hash);
+      assert.equal(put.json.bytes, Buffer.from(payload, 'utf8').length);
+
+      const got = await request(`${relay.url}/v1/fleet/blobs/${hash}`, { token });
+      assert.equal(got.status, 200, got.text);
+      assert.equal(got.text, payload, 'the bytes must come back identical, or the hash means nothing');
+    });
+  });
+
+  it('refuses bytes that do not hash to the key, and stores nothing', async () => {
+    await withRelay({ stateDir: makeStateDir() }, async (relay) => {
+      const { token } = await pairDevice(relay, 'blob-liar');
+      const key = 'a'.repeat(64); // right shape, not the hash of anything this test sends
+      const body = 'not that hash';
+      const put = await request(`${relay.url}/v1/fleet/blobs/${key}`, { method: 'PUT', rawBody: body, token });
+      assert.equal(put.status, 422, put.text);
+      assert.equal(put.json.error.code, 'BLOB_HASH_MISMATCH');
+      assert.equal(put.json.error.detail.expected, key);
+      assert.equal(
+        put.json.error.detail.actual,
+        createHash('sha256').update(Buffer.from(body, 'utf8')).digest('hex'),
+        'the refusal must report the hash it actually computed, or it is unauditable',
+      );
+      // A refused write must not become readable under the key it claimed.
+      assert.equal((await request(`${relay.url}/v1/fleet/blobs/${key}`, { token })).status, 404);
+    });
+  });
+
+  it('does not let one fleet read another fleet blob', async () => {
+    await withRelay({ stateDir: makeStateDir() }, async (relay) => {
+      // One code per machine: a code is one-time, and using one twice fails the second pair.
+      const { token: tokenA } = await pairDevice(relay, 'blob-mA', {
+        code: relay.state.createPairingCode({ fleetId: 'fleet-A' }),
+      });
+      const { token: tokenB } = await pairDevice(relay, 'blob-mB', {
+        code: relay.state.createPairingCode({ fleetId: 'fleet-B' }),
+      });
+      const payload = 'secret to fleet A\n';
+      const hash = hashOf(payload);
+      const put = await request(`${relay.url}/v1/fleet/blobs/${hash}`, { method: 'PUT', rawBody: payload, token: tokenA });
+      assert.equal(put.status, 201, put.text);
+      assert.equal((await request(`${relay.url}/v1/fleet/blobs/${hash}`, { token: tokenA })).status, 200, 'the owner reads it');
+      // 404 rather than 403: a distinguishable "not yours" would tell fleet B that this hash exists here.
+      assert.equal((await request(`${relay.url}/v1/fleet/blobs/${hash}`, { token: tokenB })).status, 404);
+    });
+  });
+
+  it('requires a device token before the channel will store anything', async () => {
+    await withRelay({}, async (relay) => {
+      const payload = 'nobody should reach this\n';
+      const hash = hashOf(payload);
+      const anonymous = await request(`${relay.url}/v1/fleet/blobs/${hash}`, { method: 'PUT', rawBody: payload });
+      assert.equal(anonymous.status, 401, 'the channel sits behind the same device-token gate as every other route');
+      assert.equal((await request(`${relay.url}/v1/fleet/blobs/${hash}`, {})).status, 401);
     });
   });
 });

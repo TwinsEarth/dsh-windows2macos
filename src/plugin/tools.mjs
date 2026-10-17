@@ -2590,9 +2590,26 @@ async function request(options) {
     pathname,
     query,
     body,
+    /**
+     * v1.0.7: raw bytes to send instead of a JSON body.
+     *
+     * Added for the blob channel (#1), which PUTs a memory document's exact octets. **Added here rather than as a
+     * second `fetch` in the caller**, because `tools.mjs:1283` already states the rule: the direct path must not grow
+     * a second way to talk to the relay -- bearer-token resolution, base-path joining, timeouts and abort handling
+     * all live in this one function, and a duplicate would be a duplicate of all four.
+     *
+     * `body` and `rawBody` are mutually exclusive: passing both is a caller bug, not a merge to guess at.
+     */
+    rawBody,
     maxBytes = MAX_RESPONSE_BYTES,
     accept = 'application/json',
   } = options;
+
+  if (rawBody !== undefined && body !== undefined) {
+    throw new W2MError('W2M_CONFIG', 'W2M_CONFIG: `body` and `rawBody` are mutually exclusive', {
+      hint: 'pass `rawBody` for octets, `body` for JSON -- not both',
+    });
+  }
 
   throwIfAborted(signal);
 
@@ -2613,7 +2630,10 @@ async function request(options) {
 
   const headers = { accept };
   if (token) headers.authorization = `Bearer ${token}`;
-  if (body !== undefined) headers['content-type'] = 'application/json';
+  // v1.0.7: octets keep their own content type. JSON-stringifying them would corrupt the bytes and, because the
+  // relay verifies `sha256(body) === key`, corrupting them here would surface as a 422 blamed on the caller.
+  if (rawBody !== undefined) headers['content-type'] = 'application/octet-stream';
+  else if (body !== undefined) headers['content-type'] = 'application/json';
 
   const timeoutController = new AbortController();
   const timer = setTimeout(() => timeoutController.abort(new Error('timeout')), timeoutMs);
@@ -2624,7 +2644,7 @@ async function request(options) {
     response = await fetch(target, {
       method,
       headers,
-      body: body === undefined ? undefined : JSON.stringify(body),
+      body: rawBody !== undefined ? rawBody : (body === undefined ? undefined : JSON.stringify(body)),
       signal: combined.signal,
     });
   } catch (error) {
@@ -5112,6 +5132,30 @@ export async function apply(ctx, config = {}) {
       'relay keeps only hashes, so these files are the only place a command\'s output survives. Use it ' +
       'before re-running work -- it is what turns a dozen rediscovery dispatches into one lookup.',
     parameters: {
+      /**
+       * v1.0.7: `read` (the default, and the only behaviour before this release), `publish`, or `pull`.
+       *
+       * Defaulting to `read` is deliberate: every existing caller says nothing about `action`, and a tool that
+       * changed what "call `w2m_memory`" means would be a silent behaviour change on the one path that is supposed
+       * to be safe to call blindly.
+       */
+      action: {
+        type: 'string',
+        enum: ['read', 'publish', 'pull'],
+        description:
+          'read (default) = answer from memory. publish = upload the curated collective memory '
+          + '(`fleet-memory.md`) to the relay as a content-addressed blob and return its SHA-256. pull = fetch one '
+          + 'blob by its SHA-256 and return its text, re-hashing what came back against the name it was asked for. '
+          + 'Neither publish nor pull modifies the local file.',
+        default: 'read',
+      },
+      hash: {
+        type: 'string',
+        description:
+          'The SHA-256 naming the blob, for action="pull": 64 lowercase hex characters. A hash that exists on the '
+          + 'relay but belongs to another fleet is reported as not found, exactly like a hash that was never '
+          + 'stored -- a distinguishable refusal would confirm to a prober which hashes this relay holds.',
+      },
       scope: {
         type: 'string',
         enum: ['local', 'fleet'],
@@ -5199,6 +5243,154 @@ export async function apply(ctx, config = {}) {
     output: jsonOutput,
     async execute(args, exec) {
       throwIfAborted(exec?.signal);
+
+      /**
+       * v1.0.7 (#1c): publish the collective memory as a content-addressed blob.
+       *
+       * ## Why this exists at all
+       *
+       * The blob channel (1a/1b) is a route and a store; **without a caller it is the same defect as the seven
+       * written-but-unreachable modules this repository keeps an accepted-orphans list for.** This is the caller:
+       * a machine that wants its curated memory to be fetchable by its own fleet says so, and gets back the hash
+       * that names it.
+       *
+       * ## Why it reads the file and does not rewrite it
+       *
+       * Publishing is a **copy, not a move**. If it deleted or normalised the file, the only durable copy of what
+       * this machine knows would depend on the relay having accepted it -- and the relay is explicitly not the
+       * durable store (`storage.mjs`: each machine's `memory.jsonl` is the only copy of what a command printed).
+       *
+       * ## Why a missing file is a named refusal
+       *
+       * `putBlob` rejects an empty body with `BLOB_EMPTY`, which is correct but arrives too late to say anything
+       * useful. A machine with no `fleet-memory.md` has not published anything yet -- that is a state, not a
+       * protocol violation, and the message should say which file is missing and where it was looked for.
+       */
+      if (typeof args?.action === 'string' && args.action === 'publish') {
+        const file = collectivePath();
+        if (file === null) {
+          throw new W2MError('W2M_CONFIG', 'W2M_CONFIG: there is no profile to publish collective memory from', {
+            hint: 'the collective layer lives beside the profile that mounted this plugin; set `stateDir` or run '
+              + 'with a profile',
+          });
+        }
+        let bytes;
+        try {
+          // `fs` is `promises as fs` in this file (line 93), so this is the promise API -- a bare `readFile` is not
+          // in scope and would throw ReferenceError at the exact moment the caller wanted to publish.
+          bytes = await fs.readFile(file);
+        } catch {
+          // The error object is deliberately not bound: every refusal of a read here is the same refusal (there is
+          // no document at that path), and naming the errno would tell the caller to debug a filesystem this plugin
+          // does not own.
+          throw new W2MError(
+            'W2M_NOT_FOUND',
+            `W2M_NOT_FOUND: no collective memory to publish at ${file}`,
+            { hint: 'write measured facts to it first; publishing copies the file, it does not create one' },
+          );
+        }
+        const hash = createHash('sha256').update(bytes).digest('hex');
+        const base = requireRabbit(cfg);
+        const token = await resolveToken(cfg);
+        const result = await request({
+          rabbitUrl: base,
+          token,
+          method: 'PUT',
+          pathname: `/v1/fleet/blobs/${hash}`,
+          rawBody: bytes,
+          signal: exec?.signal,
+        });
+        return JSON.stringify({
+          ok: true,
+          published: true,
+          hash,
+          bytes: bytes.length,
+          file,
+          relay: {
+            http_status: result.status,
+            // `request()` returns `{status, ok, json, text, error}` -- the parsed body is `json`, not `body`.
+            evicted: result.json?.evicted ?? [],
+          },
+          next: 'another machine in the same fleet can GET ' + `/v1/fleet/blobs/${hash}` + ' to fetch it',
+        });
+      }
+
+      /**
+       * v1.0.7 (#1d, the other direction): fetch one blob by the hash that names it.
+       *
+       * ## Why this had to exist before the channel was called finished
+       *
+       * A `publish` with no `pull` is a backup, not a channel: the bytes leave the machine and nothing can bring
+       * them back through the tool surface. The relay route existed and was tested, and the plugin could still only
+       * write -- which is the same "half a mechanism" shape the whole 1a-1d sequence was organised to avoid.
+       *
+       * ## Why the reader re-hashes instead of trusting the relay
+       *
+       * The relay verifies `sha256(body) === key` on write, so in principle what comes back is what was stored. **A
+       * reader must not depend on that.** The hash is the only thing that makes the bytes a claim rather than an
+       * assertion, and a verification performed only by the party that could be wrong is not a verification. So the
+       * content is re-hashed here, and a mismatch is a failure rather than a warning -- accepting unverified bytes
+       * under a name they do not match would make every later reader's check decorative too.
+       */
+      if (typeof args?.action === 'string' && args.action === 'pull') {
+        const wanted = typeof args?.hash === 'string' ? args.hash.trim().toLowerCase() : '';
+        if (!/^[0-9a-f]{64}$/.test(wanted)) {
+          throw new W2MError(
+            'W2M_CONFIG',
+            'W2M_CONFIG: `action: "pull"` needs `hash`, a SHA-256 of 64 lowercase hex characters',
+            { hint: 'the hash is what `action: "publish"` returned for the document you want' },
+          );
+        }
+        const base = requireRabbit(cfg);
+        const token = await resolveToken(cfg);
+        const result = await request({
+          rabbitUrl: base,
+          token,
+          pathname: `/v1/fleet/blobs/${wanted}`,
+          accept: 'application/octet-stream',
+          signal: exec?.signal,
+        });
+        if (result.status === 404) {
+          // Deliberately the same answer for "never stored" and "another fleet's": see the `hash` parameter note.
+          throw new W2MError(
+            'W2M_NOT_FOUND',
+            `W2M_NOT_FOUND: no blob named ${wanted} is readable by this machine`,
+            {
+              hint: 'the hash may belong to another fleet, or the relay may have evicted it -- blobs are evicted '
+                + 'oldest-first once a fleet holds 256',
+            },
+          );
+        }
+        if (result.status !== 200) {
+          throw new W2MError(
+            'W2M_RABBIT_REFUSED',
+            `W2M_RABBIT_REFUSED: GET /v1/fleet/blobs/${wanted} answered HTTP ${result.status}`,
+            { http_status: result.status, detail: result.error ?? null },
+          );
+        }
+        const body = result.text ?? '';
+        const actual = createHash('sha256').update(body, 'utf8').digest('hex');
+        if (actual !== wanted) {
+          throw new W2MError(
+            'W2M_BAD_BLOB',
+            `W2M_BAD_BLOB: the bytes returned for ${wanted} hash to ${actual} instead`,
+            {
+              hint: 'the reader refuses unverified content rather than passing it on; nothing was written locally',
+              expected: wanted,
+              actual,
+            },
+          );
+        }
+        return JSON.stringify({
+          ok: true,
+          pulled: true,
+          hash: wanted,
+          bytes: Buffer.byteLength(body, 'utf8'),
+          verified: true,
+          content: body,
+        });
+      }
+
       const limitRaw = Number(args?.limit);
       const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(Math.floor(limitRaw), 500) : 20;
 
