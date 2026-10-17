@@ -2,6 +2,64 @@
 
 All notable changes to this project are documented here.
 
+## [1.0.3] — 2026-10-17
+
+**The warning that predicted this failure now says what to do about it.**
+
+### What was wrong with the old line
+
+    w2m: no agent is running on this machine, so it is in no fleet and will receive no work.
+         Set autoStartAgent: true to join (the fleet key is derived from the signed-in account),
+         or run w2m-localside yourself and point it at the relay.
+
+**Accurate, and insufficient.** It names **one** of the two things required and does not say *where* to set it.
+
+**Measured on a real machine:** plugin installed, activated, **no error anywhere**, and
+`device_token: null` with `autoStartAgent: false`. The operator's own summary was *"it installed but the machine
+is not in the fleet"* -- **exactly what this warning predicts, and nothing in it resolved that.** The line was
+written for the v0.8.5 failure mode and the operator still had to discover both steps.
+
+### The guidance is now a procedure, and it is ordered
+
+```
+      This machine is NOT paired yet, so both steps below are required.
+      To join, two things are needed:
+        1. a one-time pairing code. `w2m-rabbit` prints it once, in its startup banner:
+             [w2m-rabbit] listening on <url>  pairing code: PAIR-XXXXXXXX
+           It lives in memory only and is never written to the state directory...
+        2. `autoStartAgent: true` plus that code, on the `w2m` row that ALREADY EXISTS...
+               - id: w2m
+                 config:
+                   autoStartAgent: true
+                   pairingCode: PAIR-XXXXXXXX
+           Do NOT add an `insert:` for it. An insert appends a SECOND entry with the same id, and the
+           client then refuses to open -- measured on this project, not theorised.
+```
+
+**It states the current pairing state, because the two cases need different first steps.** An unpaired machine
+must fetch a code; a paired one only has to turn the switch on, and **sending that machine after a code would send
+it somewhere it has no business.** Verifying that branch required reading `device.json` and finding
+`device_token: null`, which is exactly what the rendered warning then said.
+
+**Why pairing cannot be automatic, stated where the operator will read it:** the relay's own header says *"the
+pairing code is the only credential that grants admission"*, and **a plugin able to join unattended would be one
+that lets any machine holding the package into the fleet.** So the fix is guidance, not auto-joining.
+
+### A parameter I wrote into the text before checking that it exists
+
+The first draft told the operator to use **`--print-pairing-code`**. **There is no such flag.** Measured from
+`w2m-rabbit --help`, the real options are:
+
+    --pairing-code <c>     Use a fixed pairing code instead of a generated one.
+    --pair-rate-limit <n>  Pairing attempts per IP per minute. Default 5. 0 = off.
+
+**And `--pairing-code` does the opposite of what I described**: it *chooses* a known code rather than printing an
+existing one. The text now says that, **because a command in an error message is read as an instruction and is
+followed.**
+
+The warning was also **rendered and read** rather than assumed -- a warning nobody has printed is a warning whose
+formatting is guesswork.
+
 ## [1.0.2] — 2026-10-16
 
 **One missing line made the whole plugin fail to mount, and it had been missing since v0.41.0.**

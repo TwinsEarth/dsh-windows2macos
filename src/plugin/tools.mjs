@@ -149,7 +149,7 @@ import { AUTHORITY_CHOICES, resolveConfiguredLevel } from '../agent/authority-ch
 // rather than reimplemented: the dispatcher and the executor have to derive the *same* keys, and two
 // implementations of a handshake are two chances to disagree about it.
 import { DeviceKey } from '../agent/crypto.mjs';
-import { loadOrCreateIdentity, saveDeviceToken } from '../agent/identity.mjs';
+import { loadIdentity, loadOrCreateIdentity, saveDeviceToken } from '../agent/identity.mjs';
 import { probeCapsDetailed, detectPlatform } from '../agent/caps.mjs';
 import { resolveStateDir } from '../util/cli.mjs';
 import { parseServer } from '../agent/stun.mjs';
@@ -4655,11 +4655,91 @@ export async function apply(ctx, config = {}) {
      * A silent no-op that looks like success is the worst failure mode this plugin has had. One
      * line at warn level turns *"why is this machine not in my fleet"* from an investigation into a
      * log search.
+     *
+     * ## v1.0.3: the line was accurate and still left the operator stuck
+     *
+     * "Set `autoStartAgent: true` to join" names **one** of the two things required and does not say where to set
+     * it. **Both omissions were measured on a real machine**: installed, activated, no error anywhere, and
+     * `device_token: null` with `autoStartAgent: false`. The operator's own summary was *"it installed but the
+     * machine is not in the fleet"* -- exactly what this warning predicts, and nothing in it resolves that.
+     *
+     * So the guidance is now **a procedure, and the procedure is ordered**:
+     *
+     *   1. Pairing needs a **one-time code the operator obtains**. It cannot be self-issued, and that is design
+     *      rather than oversight -- the relay's own header says *"the pairing code is the only credential that
+     *      grants admission"*, and a plugin able to join unattended would be one that lets any machine holding
+     *      the package into the fleet.
+     *   2. `autoStartAgent: true` goes on **the `w2m` row that already exists**, matched by `id` -- **not** as an
+     *      `insert:`, which appends a second row with the same `id` and stops the client from opening.
+     *
+     * **The warning also states the current pairing state, because the two cases need different first steps.**
+     * An unpaired machine must fetch a code; a paired one only has to turn the switch on, and sending *that*
+     * machine after a code would send it somewhere it has no business.
      */
+    let paired = false;
+    /**
+     * Read the pairing state, **read-only**, and only when a state directory is configured.
+     *
+     * ## Two defects this line caused before it was right, both measured
+     *
+     * **First it called `loadOrCreateIdentity({ dir: cfg.stateDir ?? undefined })`.**
+     *
+     *   * With `stateDir` unset -- the default -- that `undefined` falls back to `~/.dsh/xclient/device.json`,
+     *     **the operator's real file**, and `loadOrCreateIdentity` **creates it when absent**. A message about
+     *     the machine's state must not be able to change it. Four tests in `test/update-wiring.test.mjs` failed
+     *     because the plugin read the real home instead of the profile they supplied.
+     *   * Guarding on `stateDir` fixed those, **and broke a different one**: `test/tools.test.mjs:593` sets an
+     *     empty `stateDir` and asserts `reason_code: DEVICE_NOT_PAIRED` for an **absent** `device.json`.
+     *     `loadOrCreateIdentity` **created that file**, so the very next read found it present-but-unpaired and
+     *     reported `DEVICE_TOKEN_ABSENT` instead. Isolated both ways: `tools.mjs` at 1.0.2 gives `115 pass,
+     *     0 fail`; the version with this call gave `114 pass, 1 fail`.
+     *
+     * **`loadIdentity` is the read-only one** -- `ENOENT` returns `exists: false` and creates nothing -- which is
+     * the only behaviour a diagnostic is entitled to.
+     *
+     * With nothing configured there is no location to consult, so the state is reported as unknown rather than
+     * guessed at, which is what `w2m_status` already says for the same reason (`"stateDir is not set, so no agent
+     * state could be located"`).
+     */
+    let stateDirConfigured = false;
+    try {
+      stateDirConfigured = typeof cfg.stateDir === 'string' && cfg.stateDir.trim() !== '';
+      if (stateDirConfigured) {
+        const { identity } = loadIdentity({ dir: cfg.stateDir });
+        paired = typeof identity?.device_token === 'string' && identity.device_token !== '';
+      }
+    } catch {
+      // An unreadable identity is `w2m_status`' business; this line is about joining, so it stays quiet.
+      stateDirConfigured = false;
+    }
     ctx.logger?.warn?.(
-      'w2m: no agent is running on this machine, so it is in no fleet and will receive no work. '
-      + 'Set autoStartAgent: true to join (the fleet key is derived from the signed-in account), '
-      + 'or run w2m-localside yourself and point it at the relay.',
+      'w2m: no agent is running on this machine, so it is in no fleet, will receive no work, and no dispatch '
+      + 'will ever reach it.\n'
+      + `      ${stateDirConfigured
+        ? (paired
+          ? 'This machine IS paired, so step 1 is already done -- only the switch is missing.'
+          : 'This machine is NOT paired yet, so both steps below are required.')
+        : 'No stateDir is configured, so this machine\'s pairing state could not be read; assume it is not '
+          + 'paired and treat both steps below as required.'}\n`
+      + '      To join, two things are needed:\n'
+      + '        1. a one-time pairing code. `w2m-rabbit` prints it once, in its startup banner:\n'
+      + '             [w2m-rabbit] listening on <url>  pairing code: PAIR-XXXXXXXX\n'
+      + '           It lives in memory only and is never written to the state directory, so it is read from\n'
+      + '           the relay\'s console. There is no flag that prints an existing code; starting the relay\n'
+      + '           with `--pairing-code <c>` chooses a KNOWN code instead of a generated one, which is the\n'
+      + '           supported way to make pairing repeatable.\n'
+      + '        2. `autoStartAgent: true` plus that code, on the `w2m` row that ALREADY EXISTS in the\n'
+      + '           profile\'s cordis.patch.yml, matched by id:\n'
+      + '               - id: w2m\n'
+      + '                 config:\n'
+      + '                   autoStartAgent: true\n'
+      + '                   pairingCode: PAIR-XXXXXXXX\n'
+      + '           Do NOT add an `insert:` for it. An insert appends a SECOND entry with the same id, and the\n'
+      + '           client then refuses to open -- measured on this project, not theorised.\n'
+      + '      Or pair without touching this profile at all: run\n'
+      + '          w2m-localside --rabbit <url> --pair <CODE>\n'
+      + '      `w2m_status` reports both facts this line is about -- `identity.paired` and\n'
+      + '      `config.autoStartAgent` -- and is the first thing to read when it appears.',
     );
   }
 

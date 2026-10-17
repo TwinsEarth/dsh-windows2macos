@@ -14,12 +14,43 @@ import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
+/**
+ * Point the device identity at a throwaway file **before the plugin is imported**.
+ *
+ * ## The defect this closes, which was measured by moving one file
+ *
+ * `deviceFilePath()` resolves `DSH_DEVICE_FILE`, then `DSH_HOME`, then the real `~/.dsh`. **Nothing here set
+ * either**, so the plugin read the *developer's own* `~/.dsh/xclient/device.json` -- and once that file existed,
+ * **four tests in this file failed with `W2M_NO_TOKEN`**, because `w2m_history` then took the device-token path
+ * instead of the `operatorToken` this suite configures.
+ *
+ * **Measured both directions:** with the real file present, `30 pass, 4 fail`; with it moved aside,
+ * `34 pass, 0 fail`. Nothing else changed.
+ *
+ * **Why this is a test defect and not a product one:** the suite was **implicitly depending on the machine's home
+ * directory being empty of agent state.** That is the shape this project keeps correcting elsewhere -- *a test
+ * that passes on the author's machine and fails wherever an agent has run.* Setting the variable makes the
+ * dependency explicit and the suite hermetic, instead of asking every operator to move a file before running it.
+ *
+ * It is set at module scope rather than in a `before` hook **because `deviceFilePath` is called during tool
+ * execution, and the value must not be able to differ between the two** -- a `before` hook would leave the
+ * window in which a stray import resolves the real path.
+ */
+const deviceDir = mkdtempSync(path.join(os.tmpdir(), 'w2m-device-'));
+process.env.DSH_DEVICE_FILE = path.join(deviceDir, 'device.json');
+
 import * as plugin from '../src/plugin/tools.mjs';
 import { findProfileDir } from '../src/plugin/auto-update.mjs';
 
 const cleanup = [];
+const previousDeviceFile = process.env.DSH_DEVICE_FILE;
 after(() => {
   for (const dir of cleanup) rmSync(dir, { recursive: true, force: true });
+  // Put the environment back: a leaked variable would silently redirect the identity of anything that runs after
+  // this file in the same process.
+  if (previousDeviceFile === undefined) delete process.env.DSH_DEVICE_FILE;
+  else process.env.DSH_DEVICE_FILE = previousDeviceFile;
+  rmSync(deviceDir, { recursive: true, force: true });
 });
 
 /**

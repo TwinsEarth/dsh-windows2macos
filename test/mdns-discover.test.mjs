@@ -31,6 +31,9 @@
 
 import assert from 'node:assert/strict';
 import { after, describe, it } from 'node:test';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 import {
   DEFAULT_SERVICE_TYPE,
@@ -65,6 +68,40 @@ import {
   mayDispatchTo,
   mergeRosterView,
 } from '../src/plugin/mdns-discover.mjs';
+/**
+ * Give this suite its own device identity, **before the plugin is imported**.
+ *
+ * ## The defect this closes, and how it was measured
+ *
+ * `registerPlugin` below calls `plugin.apply(ctx, { p2pMode: 'relay', rabbitUrl: ... })` -- **no `stateDir`** --
+ * and `w2m_devices` resolves its token through `deviceFilePath()`, which falls back to the operator's real
+ * `~/.dsh/xclient/device.json` when nothing is configured. On a machine where that file exists but holds
+ * `device_token: null` -- **which is the normal state of a machine that has installed the plugin and not yet
+ * paired** -- two tests here failed with `W2M_NO_TOKEN`.
+ *
+ * **Isolated both ways:** with `tools.mjs` at the shipped 1.0.2 these two fail identically, so this is not a
+ * regression from any change to the plugin; **it is a suite that implicitly required the developer's home
+ * directory to hold no agent state.** That is the failure shape this project keeps correcting elsewhere -- *green
+ * on the author's machine, red wherever an agent has actually run.*
+ *
+ * The token is a **fixture**, not a real credential, and no network call is made with it: the fetch stub in
+ * `registerPlugin` answers every route from its own table.
+ */
+const deviceDir = mkdtempSync(path.join(os.tmpdir(), 'w2m-mdns-device-'));
+const deviceFile = path.join(deviceDir, 'device.json');
+writeFileSync(
+  deviceFile,
+  JSON.stringify({
+    machine_id: 'd89d5817-953d-4571-883d-23800e67d20c',
+    machine_name: 'mdns-suite',
+    device_token: 'tok-mdns-suite',
+    rabbit_url: 'http://127.0.0.1:8787',
+  }, null, 2),
+  'utf8',
+);
+process.env.DSH_DEVICE_FILE = deviceFile;
+const previousDeviceFile = deviceFile;
+
 import * as plugin from '../src/plugin/tools.mjs';
 
 /* -------------------------------------------------------------------------- */
@@ -179,6 +216,11 @@ after(async () => {
       /* the assertion that failed is the one worth reporting */
     }
   }
+  // Put the environment back: a leaked `DSH_DEVICE_FILE` would silently redirect the identity of anything else
+  // sharing this process, which is exactly the class of coupling this file just stopped relying on.
+  if (previousDeviceFile === undefined) delete process.env.DSH_DEVICE_FILE;
+  else process.env.DSH_DEVICE_FILE = previousDeviceFile;
+  rmSync(deviceDir, { recursive: true, force: true });
 });
 
 /* -------------------------------------------------------------------------- */
