@@ -1,4 +1,4 @@
-﻿/**
+/**
  * DSH: Windows2MacO - the DSH Cordis plugin.
  *
  * # What this exposes
@@ -6138,6 +6138,39 @@ export async function apply(ctx, config = {}) {
         }
         const actor = { id: typeof args?.actor_id === 'string' && args.actor_id.trim() !== '' ? args.actor_id.trim() : cfg.machineName, level: args.actor_level };
         const outcome = action === 'approve' ? 'approved' : 'rejected';
+        /**
+         * v1.1.16: a fleet-admission request is settled at the RELAY, because that is where the request lives and where
+         * the quorum rules are enforced. The local index would accept the write and change nothing that matters.
+         *
+         * The actor id is the person answering; the relay records it on the decision. A refusal is reported as such
+         * (`ALREADY_DECIDED` included) rather than thrown: the caller is looking at a list that may be a second old.
+         */
+        if (/^adm-/.test(approvalId)) {
+          const decideDevice = await readDevice(cfg);
+          const decideRelay = cfg.rabbitUrl ?? null;
+          const settled = decideRelay === null || decideDevice.device_token === null
+            ? { ok: false, json: { code: 'W2M_NO_RELAY' } }
+            : await request({
+              rabbitUrl: decideRelay,
+              token: requireToken(decideDevice),
+              method: 'POST',
+              pathname: '/v1/fleet/admission/' + encodeURIComponent(approvalId) + '/decide',
+              body: { decision: action === 'approve' ? 'approve' : 'reject', decided_by: actor.id, auto: false },
+            });
+          return JSON.stringify({
+            ok: settled?.ok === true,
+            action,
+            approval_id: approvalId,
+            kind: 'fleet_admission',
+            settled: settled?.ok === true ? outcome : null,
+            reason_code: settled?.ok === true ? null : (settled?.json?.error?.code ?? settled?.json?.code ?? settled?.error?.code ?? null),
+            detail: settled?.ok === true ? null : (settled?.json?.error?.message ?? null),
+            acted_by: actor,
+            note: settled?.ok === true
+              ? 'the machine is admitted; it will appear in w2m_devices once its agent reconnects'
+              : 'the decision was refused; the request is unchanged (already decided requests are normal when the ten-second window has passed)',
+          });
+        }
         const result = queue.decide(approvalId, actor, outcome);
         return JSON.stringify({
           ok: result.ok === true,
@@ -6161,6 +6194,43 @@ export async function apply(ctx, config = {}) {
       };
       // An actor with no level still gets the list: knowing what is waiting does not require the authority to
       // answer it, and a queue only its supervisors can see is a queue that stays full.
+      /**
+       * v1.1.16: a machine waiting to join the fleet is a request waiting for a human, which is what this tool is.
+       *
+       * It is NOT a permission escalation, so it must not be shoved through `approvalRequestFor` -- that shape requires
+       * a needs-approval verdict and a capability, and faking one would record a lie in the audit trail. The list is
+       * shared; the store underneath is not.
+       *
+       * The countdown uses the RELAY's clock: `requested_at_ms` was stamped there, and three machines in this fleet
+       * disagree on the time by tens of seconds. A local-clock countdown would fire the automatic approval early on a
+       * fast machine and late on a slow one. The relay still owns the decision (it refuses to auto-approve with no
+       * member online); this is display only.
+       */
+      let admissionRows = [];
+      try {
+        const admissionDevice = await readDevice(cfg);
+        const admissionRelay = cfg.rabbitUrl ?? null;
+        // A relay URL and a device token are what the rest of this file passes on every authenticated call; omitting
+        // them made this request throw into the catch below, which is why the merged rows were silently missing.
+        const admissionPending = admissionRelay === null || admissionDevice.device_token === null
+          ? { ok: false }
+          : await request({ rabbitUrl: admissionRelay, token: requireToken(admissionDevice), method: 'GET', pathname: '/v1/fleet/admission/pending' });
+        if (admissionPending?.ok === true && Array.isArray(admissionPending.json?.pending)) {
+          const relayNow = Date.parse(String(admissionPending.json.rabbit_time ?? '')) || Date.now();
+          admissionRows = admissionPending.json.pending.map((row) => ({
+            approval_id: row.request_id,
+            kind: 'fleet_admission',
+            machine_id: row.machine_id ?? null,
+            machine_name: row.machine_name ?? null,
+            requested_at_ms: row.requested_at_ms ?? null,
+            countdown_ms: Number.isFinite(row.requested_at_ms) ? Math.max(0, 10_000 - (relayNow - row.requested_at_ms)) : null,
+            may_act: true,
+            note: 'approving admits this machine to the fleet; the ten-second window is enforced by the relay and needs a member online',
+          }));
+        }
+      } catch {
+        // The approval list must still work when the relay is unreachable: the permission queue is local.
+      }
       const rows = queue.listFor(
         actor.level === null ? { id: actor.id, level: 0 } : actor,
         { includeSettled: args?.include_settled === true },
@@ -6172,8 +6242,8 @@ export async function apply(ctx, config = {}) {
         as: actor,
         level_known: actor.level !== null,
         summary,
-        count: rows.length,
-        rows,
+        count: rows.length + admissionRows.length,
+        rows: rows.concat(admissionRows),
         note: actor.level === null
           ? 'no actor_level was supplied, so may_act is reported as if the level were 0: the queue is visible, but whether you may answer any of it is not known'
           : 'may_act reflects the actor_level supplied',

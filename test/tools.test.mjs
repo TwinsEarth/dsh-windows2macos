@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Unit tests for the W2M DSH plugin (`src/plugin/tools.mjs`).
  *
  * # What these tests do and do not cover
@@ -3046,3 +3046,80 @@ describe('w2m_approvals: the tool an approver reaches for', () => {
   });
 });
 
+/**
+ * v1.1.16: a machine waiting to be admitted is a request waiting for a human, so it appears in `w2m_approvals` -- but
+ * it is NOT a permission escalation and the two live in different stores. These five assertions are that seam.
+ */
+describe('w2m_approvals and fleet admission', () => {
+  const RELAY_NOW = '2026-10-17T12:00:00.000Z';
+  const REQUESTED_AT = Date.parse(RELAY_NOW) - 4_000;
+  const pendingRow = {
+    request_id: 'adm-0001', machine_id: 'new-pc-1', machine_name: 'new-pc',
+    requested_at_ms: REQUESTED_AT, state: 'pending',
+  };
+  const pendingBody = { protocol_version: 1, rabbit_time: RELAY_NOW, pending: [pendingRow] };
+
+  async function withAdmission(routes) {
+    const { tools } = await register({ rabbitUrl: 'http://relay.test', stateDir: await makeStateDir(PAIRED_DEVICE) });
+    const stub = installFetch(routes);
+    return { tools, stub };
+  }
+
+  it('fleet_admission rows appear in the approval list with the fields a person needs', async () => {
+    const { tools, stub } = await withAdmission([
+      { method: 'GET', path: '/v1/fleet/admission/pending', status: 200, body: pendingBody },
+    ]);
+    const out = JSON.parse(await tools.get('w2m_approvals').execute({ action: 'list' }));
+    const urls = stub.calls.map((c) => c.method + ' ' + c.url);
+    stub.restore();
+    assert.ok(urls.some((u) => u.includes('/v1/fleet/admission/pending')), 'the list never asked the relay: ' + JSON.stringify(urls));
+    const row = out.rows.find((r) => r.kind === 'fleet_admission');
+    assert.ok(row, 'the pending admission is missing from the list');
+    assert.equal(row.approval_id, 'adm-0001');
+    assert.equal(row.machine_name, 'new-pc');
+    assert.equal(row.requested_at_ms, REQUESTED_AT);
+    assert.equal(out.count, out.rows.length);
+  });
+
+  it('the countdown comes from the relay clock, not this machine clock', async () => {
+    const { tools, stub } = await withAdmission([
+      { method: 'GET', path: '/v1/fleet/admission/pending', status: 200, body: pendingBody },
+    ]);
+    const out = JSON.parse(await tools.get('w2m_approvals').execute({ action: 'list' }));
+    stub.restore();
+    assert.equal(out.rows.find((r) => r.kind === 'fleet_admission').countdown_ms, 6_000);
+  });
+
+  it('an unreachable relay leaves the local queue readable', async () => {
+    const { tools, stub } = await withAdmission([
+      { method: 'GET', path: '/v1/fleet/admission/pending', status: 500, body: { error: { code: 'INTERNAL', message: 'boom' } } },
+    ]);
+    const out = JSON.parse(await tools.get('w2m_approvals').execute({ action: 'list' }));
+    stub.restore();
+    assert.equal(out.ok, true);
+    assert.equal(out.rows.filter((r) => r.kind === 'fleet_admission').length, 0);
+  });
+
+  it('settling an admission id calls the relay, not the local index', async () => {
+    const { tools, stub } = await withAdmission([
+      { method: 'POST', path: '/v1/fleet/admission/adm-0001/decide', status: 200, body: { protocol_version: 1, request_id: 'adm-0001', state: 'approved' } },
+    ]);
+    const out = JSON.parse(await tools.get('w2m_approvals').execute({ action: 'approve', approval_id: 'adm-0001', actor_id: 'operator', actor_level: 50 }));
+    const decided = stub.calls.find((c) => c.url.includes('/v1/fleet/admission/adm-0001/decide'));
+    stub.restore();
+    assert.ok(decided, 'the decision never reached the relay');
+    assert.equal(decided.body.decision, 'approve');
+    assert.equal(out.ok, true);
+    assert.equal(out.kind, 'fleet_admission');
+  });
+
+  it('a decision that arrived after the ten-second window is reported, not thrown', async () => {
+    const { tools, stub } = await withAdmission([
+      { method: 'POST', path: '/v1/fleet/admission/adm-0001/decide', status: 400, body: { error: { code: 'ALREADY_DECIDED', message: 'already decided' } } },
+    ]);
+    const out = JSON.parse(await tools.get('w2m_approvals').execute({ action: 'reject', approval_id: 'adm-0001', actor_id: 'operator', actor_level: 50 }));
+    stub.restore();
+    assert.equal(out.ok, false);
+    assert.equal(out.reason_code, 'ALREADY_DECIDED');
+  });
+});
