@@ -5141,12 +5141,13 @@ export async function apply(ctx, config = {}) {
        */
       action: {
         type: 'string',
-        enum: ['read', 'publish', 'pull'],
+        enum: ['read', 'publish', 'pull', 'latest'],
         description:
           'read (default) = answer from memory. publish = upload the curated collective memory '
-          + '(`fleet-memory.md`) to the relay as a content-addressed blob and return its SHA-256. pull = fetch one '
-          + 'blob by its SHA-256 and return its text, re-hashing what came back against the name it was asked for. '
-          + 'Neither publish nor pull modifies the local file.',
+          + '(`fleet-memory.md`) to the relay as a content-addressed blob and return its SHA-256. latest = ask the '
+          + 'relay which blob this fleet published last (the discovery half of the channel). pull = fetch one blob '
+          + 'by SHA-256 -- or by "latest" -- and return its text, re-hashing what came back against the name it was '
+          + 'asked for. None of these modifies the local file.',
         default: 'read',
       },
       hash: {
@@ -5332,17 +5333,88 @@ export async function apply(ctx, config = {}) {
        * content is re-hashed here, and a mismatch is a failure rather than a warning -- accepting unverified bytes
        * under a name they do not match would make every later reader's check decorative too.
        */
+      /**
+       * v1.0.9: which blob this fleet published last -- **the discovery half of the channel**.
+       *
+       * Without it the channel only works if a human reads a 64-character hash off one machine and types it into
+       * another, which is a demo rather than a sync.
+       */
+      if (typeof args?.action === 'string' && args.action === 'latest') {
+        const base = requireRabbit(cfg);
+        const token = await resolveToken(cfg);
+        const pointer = await request({
+          rabbitUrl: base,
+          token,
+          pathname: '/v1/fleet/blobs/latest',
+          signal: exec?.signal,
+        });
+        if (pointer.status === 404) {
+          throw new W2MError(
+            'W2M_NOT_FOUND',
+            'W2M_NOT_FOUND: this fleet has published no blob yet',
+            { hint: 'run `action: "publish"` on a machine in this fleet first' },
+          );
+        }
+        if (pointer.status !== 200) {
+          throw new W2MError(
+            'W2M_RABBIT_REFUSED',
+            `W2M_RABBIT_REFUSED: GET /v1/fleet/blobs/latest answered HTTP ${pointer.status}`,
+            { http_status: pointer.status, detail: pointer.error ?? null },
+          );
+        }
+        return JSON.stringify({
+          ok: true,
+          hash: pointer.json?.hash ?? null,
+          bytes: pointer.json?.bytes ?? null,
+          published_at: pointer.json?.published_at ?? null,
+          published_by: pointer.json?.published_by ?? null,
+          next: 'w2m_memory {"action":"pull","hash":"latest"} fetches it and verifies it against this hash',
+        });
+      }
+
       if (typeof args?.action === 'string' && args.action === 'pull') {
-        const wanted = typeof args?.hash === 'string' ? args.hash.trim().toLowerCase() : '';
+        let wanted = typeof args?.hash === 'string' ? args.hash.trim().toLowerCase() : '';
+        const base = requireRabbit(cfg);
+        const token = await resolveToken(cfg);
+        /**
+         * `"latest"` resolves the fleet pointer first.
+         *
+         * **The pointer is trusted only to name a hash; the bytes are still verified against that hash.** Resolving
+         * must not weaken the re-hash below, or the pointer becomes the thing trusted instead of the content -- and
+         * a pointer is metadata, which is exactly what a relay is allowed to be wrong about.
+         */
+        let viaLatest = false;
+        if (wanted === 'latest') {
+          viaLatest = true;
+          const pointer = await request({
+            rabbitUrl: base,
+            token,
+            pathname: '/v1/fleet/blobs/latest',
+            signal: exec?.signal,
+          });
+          if (pointer.status === 404) {
+            throw new W2MError(
+              'W2M_NOT_FOUND',
+              'W2M_NOT_FOUND: this fleet has published no blob to follow',
+              { hint: 'publish from a machine in this fleet first, or pass an explicit hash' },
+            );
+          }
+          if (pointer.status !== 200) {
+            throw new W2MError(
+              'W2M_RABBIT_REFUSED',
+              `W2M_RABBIT_REFUSED: GET /v1/fleet/blobs/latest answered HTTP ${pointer.status}`,
+              { http_status: pointer.status, detail: pointer.error ?? null },
+            );
+          }
+          wanted = String(pointer.json?.hash ?? '');
+        }
         if (!/^[0-9a-f]{64}$/.test(wanted)) {
           throw new W2MError(
             'W2M_CONFIG',
-            'W2M_CONFIG: `action: "pull"` needs `hash`, a SHA-256 of 64 lowercase hex characters',
-            { hint: 'the hash is what `action: "publish"` returned for the document you want' },
+            'W2M_CONFIG: `action: "pull"` needs `hash` -- 64 lowercase hex characters, or the word "latest"',
+            { hint: 'the hash is what `action: "publish"` returned, and "latest" follows this fleet\'s own pointer' },
           );
         }
-        const base = requireRabbit(cfg);
-        const token = await resolveToken(cfg);
         const result = await request({
           rabbitUrl: base,
           token,
@@ -5385,6 +5457,7 @@ export async function apply(ctx, config = {}) {
           ok: true,
           pulled: true,
           hash: wanted,
+          via_latest: viaLatest,
           bytes: Buffer.byteLength(body, 'utf8'),
           verified: true,
           content: body,

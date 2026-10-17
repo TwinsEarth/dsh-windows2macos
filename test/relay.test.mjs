@@ -4199,3 +4199,90 @@ describe('v1.0.7 blob channel', () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+// v1.0.9 — the discovery pointer (#3): which blob did this fleet publish last?
+// ---------------------------------------------------------------------------------------------
+//
+// The channel worked before this and was close to useless: a hash is only useful to someone who already has it, and
+// the only way to get one was to read `publish`'s output on another machine. These tests cover the half that makes
+// it a sync rather than a demo.
+describe('v1.0.9 fleet latest pointer', () => {
+  const hashOf = (text) => createHash('sha256').update(Buffer.from(text, 'utf8')).digest('hex');
+
+  it('advances on publish, and reports the blob this fleet wrote', async () => {
+    await withRelay({ stateDir: makeStateDir() }, async (relay) => {
+      const { token } = await pairDevice(relay, 'ptr-a');
+      // Nothing published yet: 404, not an empty object. "No current document" is not "the document is nothing".
+      assert.equal((await request(`${relay.url}/v1/fleet/blobs/latest`, { token })).status, 404);
+
+      const one = 'memory v1\n';
+      await request(`${relay.url}/v1/fleet/blobs/${hashOf(one)}`, { method: 'PUT', rawBody: one, token });
+      const first = await request(`${relay.url}/v1/fleet/blobs/latest`, { token });
+      assert.equal(first.status, 200, first.text);
+      assert.equal(first.json.hash, hashOf(one));
+      assert.equal(first.json.bytes, Buffer.byteLength(one));
+      assert.match(first.json.published_at, /^\d{4}-\d{2}-\d{2}T/);
+
+      const two = 'memory v2\n';
+      await request(`${relay.url}/v1/fleet/blobs/${hashOf(two)}`, { method: 'PUT', rawBody: two, token });
+      assert.equal((await request(`${relay.url}/v1/fleet/blobs/latest`, { token })).json.hash, hashOf(two), 'the pointer follows the newest publish');
+    });
+  });
+
+  it('is scoped per fleet, like the blobs it points at', async () => {
+    await withRelay({ stateDir: makeStateDir() }, async (relay) => {
+      const { token: tokenA } = await pairDevice(relay, 'ptr-mA', {
+        code: relay.state.createPairingCode({ fleetId: 'ptr-fleet-A' }),
+      });
+      const { token: tokenB } = await pairDevice(relay, 'ptr-mB', {
+        code: relay.state.createPairingCode({ fleetId: 'ptr-fleet-B' }),
+      });
+      const payload = 'only A knows this\n';
+      await request(`${relay.url}/v1/fleet/blobs/${hashOf(payload)}`, { method: 'PUT', rawBody: payload, token: tokenA });
+      assert.equal((await request(`${relay.url}/v1/fleet/blobs/latest`, { token: tokenA })).json.hash, hashOf(payload));
+      // B never published, so it has no pointer -- A's is not visible across the fleet boundary.
+      assert.equal((await request(`${relay.url}/v1/fleet/blobs/latest`, { token: tokenB })).status, 404);
+    });
+  });
+
+  it('is a hint, not a guarantee: the pointer survives eviction but the pull does not', async () => {
+    await withRelay({ stateDir: makeStateDir() }, async (relay) => {
+      const { token } = await pairDevice(relay, 'ptr-evict');
+      const evictedText = 'will be evicted\n';
+      const evictedHash = hashOf(evictedText);
+      await request(`${relay.url}/v1/fleet/blobs/${evictedHash}`, { method: 'PUT', rawBody: evictedText, token });
+
+      // Remove the blob from disk behind the relay's back, which is what oldest-first eviction amounts to here.
+      const dir = relay.state._persist.dir;
+      const file = path.join(dir, 'blobs', evictedHash.slice(0, 2), evictedHash);
+      fs.rmSync(file, { force: true });
+
+      // The pointer still names it -- and the channel says so in the payload rather than pretending.
+      const pointer = await request(`${relay.url}/v1/fleet/blobs/latest`, { token });
+      assert.equal(pointer.status, 200);
+      assert.equal(pointer.json.hash, evictedHash);
+      assert.match(pointer.json.hint, /hint, not a guarantee/);
+      // And the read is honest: the blob is gone, so it is not found. The pointer does not resurrect it.
+      assert.equal((await request(`${relay.url}/v1/fleet/blobs/${evictedHash}`, { token })).status, 404);
+    });
+  });
+
+  it('does not let a second fleet claim the pointer by re-publishing identical bytes', async () => {
+    await withRelay({ stateDir: makeStateDir() }, async (relay) => {
+      const { token: tokenA } = await pairDevice(relay, 'ptr-ownA', {
+        code: relay.state.createPairingCode({ fleetId: 'ptr-own-A' }),
+      });
+      const { token: tokenB } = await pairDevice(relay, 'ptr-ownB', {
+        code: relay.state.createPairingCode({ fleetId: 'ptr-own-B' }),
+      });
+      const shared = 'identical bytes\n';
+      const hash = hashOf(shared);
+      assert.equal((await request(`${relay.url}/v1/fleet/blobs/${hash}`, { method: 'PUT', rawBody: shared, token: tokenA })).status, 201);
+      assert.equal((await request(`${relay.url}/v1/fleet/blobs/${hash}`, { method: 'PUT', rawBody: shared, token: tokenB })).status, 201);
+      assert.equal((await request(`${relay.url}/v1/fleet/blobs/latest`, { token: tokenA })).json.hash, hash, 'the first writer keeps it');
+      // B owns nothing, and must not be pointed at a blob it cannot read.
+      assert.equal((await request(`${relay.url}/v1/fleet/blobs/latest`, { token: tokenB })).status, 404);
+    });
+  });
+});

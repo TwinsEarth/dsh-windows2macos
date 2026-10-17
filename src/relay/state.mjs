@@ -579,6 +579,22 @@ export class RabbitState {
     return this._persist.getBlob(hash, { fleetId: scope.fleetId });
   }
 
+  /**
+   * Which blob this device's fleet published most recently, or `null`.
+   *
+   * **This is the discovery half of the channel** (v1.0.9): without it a hash is only useful to whoever read
+   * `publish`'s output, so a "sync" would need a human relaying a 64-character string between machines.
+   *
+   * Scoped by the same rule as the blobs themselves -- a fleetless device on a claimed relay gets `null`, not a
+   * shared pointer it could never read.
+   */
+  latestFleetBlob(device) {
+    if (!this._persist) return null;
+    const scope = this.scopeBlobFleet(device);
+    if (scope.ok !== true) return null;
+    return this._persist.fleetLatest(scope.fleetId);
+  }
+
   /** Snapshot the device table; failures must never break the request path. */
   _saveDevices() {
     if (this._restoring || !this._persist) return false;

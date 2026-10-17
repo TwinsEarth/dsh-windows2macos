@@ -39,6 +39,28 @@ export const MAX_BLOBS = 256;
  */
 export const BLOB_INDEX_FILE = 'index.json';
 
+/**
+ * v1.0.9: **which blob is each fleet's current document** -- the discovery half of the channel.
+ *
+ * ## Why a hash alone is not enough
+ *
+ * v1.0.7/1.0.8 gave the fleet a content-addressed channel: anyone in the fleet can `pull <hash>`. **A hash is only
+ * useful to someone who already has it**, and the only way to get one was to read `publish`'s output on another
+ * machine. That makes the channel work exactly as well as a human relaying a 64-character string.
+ *
+ * So the relay keeps one pointer per fleet: four fields of metadata it was already entitled to hold, because it
+ * already holds `fleet_id` for every blob.
+ *
+ * ## A pointer is a hint, not a guarantee
+ *
+ * Eviction is oldest-first and can take the current document on a busy fleet. `latest` may therefore name a blob
+ * that no longer exists, and a pull of it answers `404`. **That is the honest outcome**: keeping a document alive
+ * because it is pointed at would make eviction depend on a second, unstated rule.
+ *
+ * Shape: `{ "<fleet_id>": { hash, bytes, published_at_ms, published_by } }`.
+ */
+export const BLOB_LATEST_FILE = 'latest.json';
+
 /** Ledger entry types understood by `RabbitState#restore`. */
 export const LEDGER_TYPES = Object.freeze([
   'task.created',
@@ -335,6 +357,12 @@ export class Persistence {
       if (entry === undefined) {
         index[hash] = { fleet_id: fleetId, added_at_ms: this._now() };
         this.writeBlobIndex(index);
+        this.advanceFleetLatest(fleetId, hash, bytes.length, options.publishedBy);
+      } else if (entry.fleet_id === fleetId) {
+        // Re-publishing the same bytes is a statement that this is the current document, so the pointer advances
+        // even though the path did not change. Only for the **owner**: pointing another fleet's pointer at a blob it
+        // cannot read would advertise a document that answers 404 to the very fleet being told about it.
+        this.advanceFleetLatest(fleetId, hash, bytes.length, options.publishedBy);
       }
       return { ok: true, hash, bytes: bytes.length, evicted: [] };
     }
@@ -352,6 +380,7 @@ export class Persistence {
     }
     index[hash] = { fleet_id: fleetId, added_at_ms: this._now() };
     this.writeBlobIndex(index);
+    this.advanceFleetLatest(fleetId, hash, bytes.length, options.publishedBy);
     return { ok: true, hash, bytes: bytes.length, evicted };
   }
 
@@ -484,6 +513,81 @@ export class Persistence {
       this.warn(BLOB_DIR, `blob index write failed: ${error?.message ?? String(error)}`);
       return false;
     }
+  }
+
+  /** Read the fleet -> latest-blob pointer map. Missing or corrupt reads as empty, never throws. */
+  readBlobLatest() {
+    if (!this.enabled) return {};
+    try {
+      const raw = fs.readFileSync(path.join(this.dir, BLOB_DIR, BLOB_LATEST_FILE), 'utf8');
+      const parsed = JSON.parse(raw);
+      return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+
+  /** Atomically replace the pointer map. Best-effort, like the ownership index. */
+  writeBlobLatest(latest) {
+    if (!this.enabled) return false;
+    const file = path.join(this.dir, BLOB_DIR, BLOB_LATEST_FILE);
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      const tmp = `${file}.tmp-${process.pid}-${this._now()}`;
+      fs.writeFileSync(tmp, `${JSON.stringify(latest)}\n`, 'utf8');
+      fs.renameSync(tmp, file);
+      return true;
+    } catch (error) {
+      this.warn(BLOB_DIR, `blob latest-pointer write failed: ${error?.message ?? String(error)}`);
+      return false;
+    }
+  }
+
+  /**
+   * Point a fleet at the blob it just published.
+   *
+   * ## `null` is a real scope, not a missing value
+   *
+   * The first version of this method skipped `fleetId === null`, reasoning that a fleetless device has no fleet to
+   * advertise to. **That was wrong for the most common deployment.** On a relay with no fleet configured,
+   * `scopeFleetId` returns `{fleetId: null, legacy: true}` -- and `null` there means **one shared scope**, which
+   * is exactly the pre-v0.7.7 behaviour that fleet scoping's own comment insists a migration must not change:
+   * *"a migration must not change behaviour for devices that were never asked to change."*
+   *
+   * Skipping it meant the pointer was never written on an unclaimed relay, so `latest` answered 404 for every
+   * machine on the default single-relay setup -- the feature worked nowhere it was most likely to be used. A test
+   * caught it, which is the only reason this is a comment instead of a bug report.
+   *
+   * The genuinely fleetless case on a **claimed** relay never reaches here: `scopeFleetId` refuses it outright
+   * (`REQUESTER_HAS_NO_FLEET`), so the blob is rejected before any pointer could be written.
+   *
+   * @param {string|null} fleetId `null` means the relay-wide legacy scope
+   * @param {string} hash
+   * @param {number} bytes
+   * @param {string|null} [publishedBy]
+   */
+  advanceFleetLatest(fleetId, hash, bytes, publishedBy = null) {
+    if (!this.enabled || fleetId === undefined) return false;
+    const latest = this.readBlobLatest();
+    latest[fleetId] = {
+      hash,
+      bytes,
+      published_at_ms: this._now(),
+      published_by: typeof publishedBy === 'string' && publishedBy !== '' ? publishedBy : null,
+    };
+    return this.writeBlobLatest(latest);
+  }
+
+  /**
+   * The blob `fleetId` last published, or `null`.
+   *
+   * **A returned pointer is a hint.** It may name a blob that eviction has since removed, and the caller is expected
+   * to read it and answer not-found rather than being told a comfortable lie here.
+   */
+  fleetLatest(fleetId) {
+    if (!this.enabled || fleetId === undefined) return null;
+    const entry = this.readBlobLatest()[fleetId];
+    return entry !== undefined && typeof entry.hash === 'string' ? entry : null;
   }
 
   /** `<state>/blobs/<aa>/<sha256>`, or `null` when persistence is off or the hash is not a sha256. */

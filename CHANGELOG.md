@@ -2,6 +2,72 @@
 
 All notable changes to this project are documented here.
 
+## [1.0.9] — 2026-10-17
+
+**Discovery: a machine can now ask the relay which blob its fleet published last, instead of a human relaying a
+64-character hash between machines.**
+
+### Why the channel needed this before it was usable
+
+v1.0.7/1.0.8 gave the fleet a content-addressed channel -- anyone in the fleet can `pull <hash>`. **But a hash is
+only useful to someone who already has it**, and the only place one appeared was `publish`'s output on the machine
+that ran it. That makes the channel work exactly as well as a person copying a string, which is a demo, not a sync.
+
+So the relay keeps **one pointer per fleet**: the blob that fleet published most recently.
+
+| Piece | Where |
+|---|---|
+| pointer store | `<state>/blobs/latest.json`, shape `{ "<fleet_id>": { hash, bytes, published_at_ms, published_by } }` |
+| advanced by | `putBlob`, together with the ownership record -- a publish that succeeded but did not advance the pointer would leave the fleet advertising a stale document |
+| route | `GET /v1/fleet/blobs/latest`, scoped through the same `scopeBlobFleet` as the blobs themselves |
+| tool | `w2m_memory {"action":"latest"}`, and `{"action":"pull","hash":"latest"}` |
+
+**`hash: "latest"` is the ergonomic point**: a joining machine runs one call, and it is the form that survives a
+teammate republishing. A stored hash goes stale; `latest` follows.
+
+**Resolving a pointer does not weaken verification.** The re-hash in `pull` is unchanged, because a pointer is
+metadata -- exactly the thing a relay is allowed to be wrong about -- while the hash is what the bytes must match.
+
+### A pointer is a hint, not a guarantee
+
+Eviction is oldest-first and can take the current document on a busy fleet. So `latest` may name a blob that no
+longer exists, and a pull of it answers `404`. **That is the honest outcome**: keeping a document alive because it
+is pointed at would make eviction depend on a second, unstated rule. The route says so in its own payload.
+
+### The defect a test caught, recorded because it is easy to reintroduce
+
+The first version of `advanceFleetLatest` skipped `fleetId === null`, reasoning that a fleetless device has no
+fleet to advertise to. **That skipped the most common deployment.** On a relay with no fleet configured,
+`scopeFleetId` returns `{fleetId: null, legacy: true}` -- and `null` there means **one shared scope**, the
+pre-v0.7.7 behaviour that fleet scoping's own comment insists a migration must not change. The pointer was therefore
+never written on an unclaimed relay, and `latest` answered `404` for every machine on the default single-relay
+setup. **The feature worked nowhere it was most likely to be used**, and the test that asserted 200 is the only
+reason this is a comment in the source rather than a bug report.
+
+The genuinely fleetless case on a **claimed** relay never reaches that code: `scopeFleetId` refuses it outright, so
+the blob is rejected before a pointer could exist.
+
+### Verified
+
+Four new tests in `test/relay.test.mjs` run against a real relay: the pointer advances on publish and follows the
+newest one; it is scoped per fleet (B sees `404` while A sees its own); **the pointer survives eviction while the
+pull does not** -- the pointer still names the removed blob, the payload says "hint, not a guarantee", and the read
+answers `404` without resurrecting it; and a second fleet re-publishing identical bytes **cannot claim the pointer**.
+
+Full suite **2360 tests, 2346 pass, 0 fail, 14 skip**. Pre-flight **GREEN, 15 of 15 checks**.
+
+### NOT verified
+
+The `latest` and `pull latest` tool actions **end to end** -- same gap as v1.0.7's publish/pull: they are
+type-correct and lint-clean, but no test executes them, because that needs a profile with a `fleet-memory.md` and a
+live relay.
+
+### And still absent
+
+Merge (#2). Two machines publishing produce two blobs, and the pointer names whichever published last -- **the
+earlier document is not lost, it is merely no longer `latest`**. That visibility is the input merge needs, and
+nothing yet says who wins when two machines assert different facts.
+
 ## [1.0.8] — 2026-10-17
 
 **The fleet sync channel, both directions: a machine can publish its collective memory to the relay and another

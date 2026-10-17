@@ -787,6 +787,32 @@ export class RelayServer {
      * fleet is **not readable by another**, and the read refusal is a 404 rather than a 403: a distinguishable
      * "not yours" tells a prober that the hash exists here.
      */
+    /**
+     * v1.0.9: **which blob this fleet published last** -- the discovery half of the channel.
+     *
+     * Checked **before** the `<sha256>` matcher deliberately. The matcher only accepts 64 hex characters, so
+     * `latest` cannot collide with it today; **the ordering is asserted anyway**, because "these two patterns cannot
+     * conflict" is exactly the reasoning that produces a shadowed route the day one of them is relaxed.
+     *
+     * A fleet that has never published gets a 404 rather than an empty object: "there is no current document" and
+     * "the current document is nothing" are different statements, and only one of them is true here.
+     */
+    if (method === 'GET' && path === '/v1/fleet/blobs/latest') {
+      const latest = this.state.latestFleetBlob(device);
+      if (latest === null) {
+        throw new ProtocolError('NOT_FOUND', 'this fleet has published no blob', {});
+      }
+      return sendJson(res, 200, {
+        protocol_version: PROTOCOL_VERSION,
+        hash: latest.hash,
+        bytes: latest.bytes,
+        published_at: new Date(latest.published_at_ms).toISOString(),
+        published_by: latest.published_by ?? null,
+        // Stated in the payload, not only in the docs: a pointer can outlive its blob under oldest-first eviction.
+        hint: 'a hint, not a guarantee -- a pull may answer 404 if the blob has since been evicted',
+      });
+    }
+
     const blobMatch = /^\/v1\/fleet\/blobs\/([0-9a-f]{64})$/.exec(path);
     if (blobMatch !== null) {
       const hash = blobMatch[1];
