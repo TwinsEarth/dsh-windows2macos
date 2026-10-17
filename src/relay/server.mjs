@@ -740,6 +740,13 @@ export class RelayServer {
       now: () => this.state.nowMs(),
       publicKeyFor: (fingerprint) => this.state.accountKeyFor(fingerprint),
     });
+    const admissionPollMatch = /^\/v1\/fleet\/admission\/([^/]+)$/.exec(path);
+    if (method === 'GET' && admissionPollMatch && url.searchParams.get('poll_token') !== null) {
+      this.admission ??= createAdmission({ now: () => this.state.nowMs() });
+      const polled = this.admission.poll(decodeURIComponent(admissionPollMatch[1]), url.searchParams.get('poll_token'));
+      if (polled.ok !== true) throw new ProtocolError('NOT_FOUND', 'unknown admission request');
+      return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ...polled });
+    }
     if (method === 'GET' && path === '/v1/fleet/admission/challenge') {
       const issued = this.joinChallenges.issue(url.searchParams.get('fingerprint') ?? '', url.searchParams.get('machine_id') ?? '');
       if (issued.ok !== true) throw new ProtocolError('BAD_REQUEST', 'challenge refused: ' + issued.code, { code: issued.code });
@@ -912,7 +919,6 @@ export class RelayServer {
     const peerReadMatch = /^\/v1\/peer\/([^/]+)$/.exec(path);
     /* ---- v1.1.6 admission ---- */
     const admissionDecideMatch = /^\/v1\/fleet\/admission\/([^/]+)\/decide$/.exec(path);
-    const admissionOneMatch = /^\/v1\/fleet\/admission\/([^/]+)$/.exec(path);
     const memberRemoveMatch = /^\/v1\/fleet\/members\/([^/]+)\/remove$/.exec(path);
     const removalVoteMatch = /^\/v1\/fleet\/removals\/([^/]+)\/vote$/.exec(path);
 
@@ -1011,12 +1017,6 @@ export class RelayServer {
       });
       if (result.ok !== true) throw new ProtocolError('BAD_REQUEST', 'admission decision refused: ' + result.code, result);
       return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ...result });
-    }
-
-    if (method === 'GET' && admissionOneMatch) {
-      const request = this.admission.getRequest(decodeURIComponent(admissionOneMatch[1]));
-      if (request === null) throw new ProtocolError('NOT_FOUND', 'unknown admission request');
-      return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), request });
     }
 
     if (method === 'POST' && memberRemoveMatch) {

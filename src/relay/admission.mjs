@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 /**
  * Fleet admission: who may join a fleet, who may be removed, and by how many votes.
  *
@@ -111,8 +112,9 @@ export function createAdmission(options = {}) {
       request_id, machine_id, machine_name, account_fingerprint, fleet_id,
       state: ADMISSION.PENDING, requested_at_ms: now(), decided_at_ms: null,
       decided_by: null, auto: false,
+      poll_token: randomBytes(16).toString('hex'),
     });
-    return { ok: true, request_id, state: ADMISSION.PENDING };
+    return { ok: true, request_id, state: ADMISSION.PENDING, poll_token: requests.get(request_id).poll_token };
   }
 
   function getRequest(request_id) {
@@ -231,9 +233,18 @@ export function createAdmission(options = {}) {
     return r === undefined ? null : { removal_id: r.removal_id, target_machine_id: r.target_machine_id, state: r.state, need: r.need, snapshot: [...r.snapshot], yes: [...r.votes.values()].filter((v) => v === 'yes').length, no: [...r.votes.values()].filter((v) => v === 'no').length, votes: r.votes.size };
   }
 
+  /** Poll without a device token: the asking machine has none. The token is the credential, and it is not guessable from the id. */
+  function poll(request_id, poll_token) {
+    const r = requests.get(request_id);
+    if (r === undefined || typeof poll_token !== 'string' || poll_token === '' || r.poll_token !== poll_token) {
+      return { ok: false, code: 'NOT_FOUND' };
+    }
+    return { ok: true, request_id, state: r.state };
+  }
+
   function pendingFor() {
     return [...requests.values()].filter((r) => r.state === ADMISSION.PENDING).map((r) => ({ ...r }));
   }
 
-  return { requestAdmission, decide, tick, getRequest, pendingFor, remove, vote, getRemoval, isMember, memberOf, setOnline, seedFounder, _members: members };
+  return { requestAdmission, decide, tick, getRequest, pendingFor, poll, remove, vote, getRemoval, isMember, memberOf, setOnline, seedFounder, _members: members };
 }

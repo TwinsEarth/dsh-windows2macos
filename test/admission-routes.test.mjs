@@ -72,6 +72,14 @@ describe('an unpaired machine can prove its account and ask to join', () => {
       assert.equal(requested.status, 200, JSON.stringify(requested.body));
       assert.equal(requested.body.state, 'pending');
       const requestId = requested.body.request_id;
+      assert.ok(requested.body.poll_token, 'the asking machine gets a poll token -- it has no device token');
+
+      const polled = await call('GET', '/v1/fleet/admission/' + requestId + '?poll_token=' + requested.body.poll_token, null);
+      assert.equal(polled.status, 200, 'poll: ' + JSON.stringify(polled.body));
+      assert.equal(polled.body.state, 'pending');
+
+      const refused = await call('GET', '/v1/fleet/admission/' + requestId + '?poll_token=wrong', null);
+      assert.equal(refused.status, 404, 'wrong poll token must not reveal the request, got ' + refused.status + ' ' + JSON.stringify(refused.body));
 
       const pending = await call('GET', '/v1/fleet/admission/pending', admin);
       assert.ok(pending.body.pending.some((r) => r.request_id === requestId));

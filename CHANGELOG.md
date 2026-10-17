@@ -2,6 +2,57 @@
 
 All notable changes to this project are documented here.
 
+## [1.1.15] — 2026-10-17
+
+**A machine that cannot join the old way now proves its account, asks to join, and waits for an answer -- and the
+executed command finally learns which machine and which slice it is.**
+
+### The fallback path is connected end to end
+
+v1.1.14 shipped the server half. This release connects the client:
+
+* \`pairNow\` classifies its failure and, for **only** the three degradable reasons (invalid pairing code, unreachable
+  relay, timeout), calls the new chain: challenge -> sign with the account key -> submit proof -> poll until a terminal
+  state. Anything else still needs a human and still does not change mechanisms;
+* **a rejection is final.** The chain stops on \`rejected\`; re-asking would turn a decision into a notification queue;
+* **an unfinished wait is reported, never hung on**: \`STILL_PENDING\` after the poll budget, \`expired\` when the relay
+  says so;
+* the seed for the account key is the **fleet key, never the account code** -- the account code is written to the log,
+  and deriving a signing key from a value anyone can read would hand out the account's identity;
+* the machine id comes from the agent object in scope, **not** from device.json: this machine never paired, which is the
+  entire situation.
+
+### Polling without a device token
+
+The asking machine has no device token -- that is why it is asking. The request response therefore carries a
+\`poll_token\`, and \`GET /v1/fleet/admission/{id}?poll_token=\` is reachable **ahead of** the device-token gate. A wrong
+token returns 404 rather than revealing whether the request exists.
+
+### The command learns where it is (P1)
+
+\`runArgv\` accepts an environment, and every executed command receives \`W2M_INDEX\`, \`W2M_INDEX_TOTAL\`,
+\`W2M_STAGE_INDEX\`, \`W2M_TASK_ID\`, \`W2M_MODE\`, \`W2M_MACHINE_ID\`, \`W2M_MACHINE_NAME\`. Values come from the OFFER,
+never from argv, so one machine cannot reshape a fleet-wide split. The variables are merged over \`process.env\` rather
+than replacing it -- PATH must survive, or no interpreter is found. \`W2M_STAGE_INDEX\` is deliberately separate from
+\`W2M_INDEX\`: for a split over four machines each runs one stage (0) but they are machines 0..3.
+
+This makes the operator's acceptance shape possible: \`process.exit(Number(process.env.W2M_INDEX)+1)\` yields 1/2/3/4
+across four machines. The single-machine half is tested here; the four-machine run needs the fleet and is **not yet
+verified**.
+
+### NOT shipped, stated plainly
+
+* **The approval UI** (10s popup with countdown plus a standing dialog) is not written. The server enforces the rules it
+  must: no automatic approval with zero members online, and a rejection beats the ten seconds;
+* **no end-to-end run**: new install -> popup -> admitted has not been executed, so \`agent.runtime.machineId\` being
+  non-empty on a real machine is **UNVERIFIED** -- if it is empty the fallback logs and does not fire;
+* the fleet chat / broadcast channel is designed (FLEET-CHAT-DESIGN.md) and not implemented.
+
+### Verified
+
+Full gate GREEN (final pass, 15 of 15). Suites touched: tools 115, account-join 6, account-identity 6, join-challenge 8,
+join-degradation 3, admission 16, admission-routes 3, relay 163, broadcast 19.
+
 ## [1.1.14] — 2026-10-17
 
 **A new machine joins by itself, and a machine that cannot join the old way can now prove its account and ask.**

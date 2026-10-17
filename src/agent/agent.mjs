@@ -3011,11 +3011,28 @@ export function createAgent(options) {
           break;
         }
 
+        /**
+         * v1.1.15 (P1): the executed command learns which machine and which slice it is.
+         *
+         * Values come from the OFFER, never from argv, so a fleet-wide split cannot be reshaped by one machine.
+         * W2M_STAGE_INDEX is separate from W2M_INDEX: for a split over four machines, each runs one stage (0) but they
+         * are machines 0..3, and conflating the two would make "print my index" print 0 everywhere.
+         */
+        const taskEnv = {
+          W2M_INDEX: String(Number.isInteger(offer.index) ? offer.index : 0),
+          W2M_INDEX_TOTAL: String(Number.isInteger(offer.index_total) ? offer.index_total : 1),
+          W2M_STAGE_INDEX: String(Number.isInteger(stage.index) ? stage.index : 0),
+          W2M_TASK_ID: String(offer.task_id ?? ''),
+          W2M_MODE: String(offer.mode ?? ''),
+          W2M_MACHINE_ID: String(offer.machine_id ?? ''),
+          W2M_MACHINE_NAME: String(offer.machine_name ?? ''),
+        };
         const ran = await runArgv(stage.command_argv, {
           cwd: stageCwdOutcome.cwd,
           timeoutMs: remainingMs,
           maxOutputBytes,
           signal: controller.signal,
+          env: taskEnv,
         });
         execution = ran;
         for (const warning of ran.warnings) if (!warnings.includes(warning)) warnings.push(warning);

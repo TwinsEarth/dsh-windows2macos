@@ -108,6 +108,8 @@ import { acceptWithAuthority } from '../agent/field-authority.mjs';
 // exhaustively, without a profile or a relay.
 import { mergeMemory } from './fleet-merge.mjs';
 import { shouldDegrade } from './join-degradation.mjs';
+import { deriveAccountKeypair } from '../util/account-identity.mjs';
+import { joinByAccount } from './account-join.mjs';
 
 // The base-address rules live in one place (§2), shared with the agent side. Importing the - rather
 // than re-deriving them her - is what stops the plugin and the agent from disagreeing about what
@@ -6716,6 +6718,44 @@ async function startLocalStack(ctx, cfg) {
          */
         const reason = error?.reason_code ?? error?.code ?? null;
         const degrade = shouldDegrade(reason);
+        if (degrade === true && key !== null) {
+          /**
+           * v1.1.15: the fallback path, finally called.
+           *
+           * Two invariants are load-bearing here:
+           *
+           * 1. the seed is the FLEET KEY, never the account code -- the account code is written to the log two
+           *    hundred lines above, and deriving a signing key from a value anyone can read would hand out the
+           *    account's identity;
+           * 2. the machine id comes from the agent object that is already in this scope, not from device.json --
+           *    this machine never paired, so it has no device.json, which is the entire situation.
+           *
+           * A failure here does not change the outcome of the old attempt: the caller still sees
+           * `{paired: false, degrade: true}` and can retry later. It must not throw out of this catch block.
+           */
+          try {
+            const localMachineId = typeof agent?.runtime?.machineId === 'string' ? agent.runtime.machineId
+              : (typeof agent?.machineId === 'string' ? agent.machineId : '');
+            if (localMachineId !== '') {
+              const joined = await joinByAccount({
+                request,
+                identity: deriveAccountKeypair(key),
+                machine: { machine_id: localMachineId, machine_name: cfg.machineName ?? null },
+                maxPolls: 10,
+              });
+              if (joined.ok === true && typeof joined.device_token === 'string') {
+                saveDeviceToken(joined.device_token, identityOptions);
+                ctx.logger?.info?.('w2m: joined by account admission (' + joined.state + ')');
+                return { paired: true, by: 'account-admission' };
+              }
+              ctx.logger?.warn?.('w2m: account admission did not admit this machine (' + joined.state + (joined.code ? '/' + joined.code : '') + ')');
+            } else {
+              ctx.logger?.warn?.('w2m: no local machine id, so the account-admission fallback cannot ask to join');
+            }
+          } catch (fallbackError) {
+            ctx.logger?.warn?.('w2m: account-admission fallback failed: ' + (fallbackError instanceof Error ? fallbackError.message : String(fallbackError)));
+          }
+        }
         ctx.logger?.warn?.(`w2m: pairing by ${by} failed${reason === null ? '' : ' (' + String(reason) + ')'}: ${error instanceof Error ? error.message : String(error)}`);
         return { paired: false, by, reason_code: reason, degrade };
       }
