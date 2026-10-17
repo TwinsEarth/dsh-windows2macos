@@ -2,6 +2,52 @@
 
 All notable changes to this project are documented here.
 
+## [1.0.14] — 2026-10-17
+
+**Merging while a third machine publishes is verified: it never tears, never writes, and names its failures.**
+
+### The gap this closes, stated precisely
+
+v1.0.12 verified the memory actions end to end **one machine at a time**. v1.0.13 verified concurrent *publishing*.
+**Neither covered a merge racing a publish**, and the merge has a two-step read that a publish can break:
+
+1. `GET /v1/fleet/blobs/latest` — learn the hash;
+2. `GET /v1/fleet/blobs/<hash>` — fetch the bytes, re-hash, merge.
+
+Between those steps the pointer can advance (harmless: the merge still reads the blob it was told about) or the blob
+can be **evicted** (fatal if unhandled: a 404 where the code expected bytes).
+
+### What "correct" means for a racing read
+
+There is no single right answer for *which* document a racing merge sees -- that is the nature of a read that is not in
+a transaction. What is required:
+
+* it **never throws an error it cannot name**;
+* it **never produces a torn merge** -- a result whose recorded decision disagrees with the text it produced;
+* it **never writes the local file**, under any outcome;
+* when the blob is gone mid-flight, it **says so by name**.
+
+### Verified
+
+Two tests in `test/fleet-merge-race.test.mjs`:
+
+* **twenty rounds of a merge fired together with a publish.** Every round resolved: a completed merge with a
+  consistent decision, or a **named** `W2M_*` refusal. No crash. No torn merge -- when the recorded winner is
+  `local` the text carries the local value, when it is `fleet` it carries a fleet value. **The local document was
+  re-read after every round and was untouched every time.** The test also asserts at least one merge *completed*, so it
+  cannot pass vacuously by refusing everything.
+* **a pointer naming a blob that no longer exists** raises `W2M_NOT_FOUND`, not a crash.
+
+**One honest limitation of the second test:** it *sets up* the state the race would produce (pointer names a removed
+blob) rather than catching the removal in flight. **The code path is identical; the timing is not.** Recorded because
+"mid-flight" without that caveat would overstate the evidence.
+
+### Still not verified, and now the list is short
+
+**Two relay processes sharing one state directory.** The design is one relay per fleet; supporting the other would need
+real file locking, and nothing here provides it. **"Concurrency is tested" must not be read as "any topology is safe"**
+-- that sentence was written into v1.0.13's notes and it still applies.
+
 ## [1.0.13] — 2026-10-17
 
 **Concurrent publishing is verified safe on one relay, and the reason it is safe is stated so a future change can
