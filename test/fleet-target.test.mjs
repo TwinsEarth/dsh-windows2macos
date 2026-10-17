@@ -68,21 +68,21 @@ const DEVICES_BODY = {
       machine_name: 'win-desktop',
       os: 'windows',
       state: 'online',
-      last_seen: '2026-10-11T04:16:52Z',
+      last_seen: new Date(Date.now() - 60_000).toISOString(),
     },
     {
       machine_id: REMOTE_MACHINE_ID,
       machine_name: 'macmini',
       os: 'macos',
       state: 'online',
-      last_seen: '2026-10-10T18:01:40Z',
+      last_seen: new Date(Date.now() - 120_000).toISOString(),
     },
     {
       machine_id: '1c14d7d2-d9e2-43dd-a7e5-eda98f4864bc',
       machine_name: 'jp-shared',
       os: 'linux',
       state: 'expired',
-      last_seen: '2026-10-09T00:00:00Z',
+      last_seen: new Date(Date.now() - 180_000).toISOString(),
     },
   ],
 };
@@ -915,5 +915,60 @@ describe('fleet-target: the selection routes w2m_run', () => {
     } finally {
       fetchStub.restore();
     }
+  });
+});
+
+/**
+ * v1.1.3: a machine offline for more than 72 hours leaves the LIST and nothing else.
+ *
+ * The operator's rule, and the reason each assertion is here: "hide, do not delete, come back on its own". A filter that
+ * merely removed the row would pass a naive test while quietly depending on the record still existing; so the tests
+ * assert \`records\` (everything the relay sent) as well as \`machines\` (what is shown), and the third test proves the
+ * return requires no bookkeeping at all.
+ */
+describe('72h archive: hidden from the list, never deleted', () => {
+  const DAY = 24 * 60 * 60 * 1000;
+  const body = (archivedLastSeen) => ({
+    protocol_version: 1,
+    rabbit_time: new Date().toISOString(),
+    devices: [
+      { machine_id: 'fresh-1', machine_name: 'fresh', state: 'online', last_seen: new Date(Date.now() - 60_000).toISOString() },
+      { machine_id: 'gone-1', machine_name: 'gone', state: 'expired', last_seen: archivedLastSeen },
+    ],
+  });
+  const fleetWith = (json, extra = {}) => readFleet({
+    rabbitUrl: RABBIT,
+    token: 'dev-test-abc',
+    request: async () => ({ ok: true, status: 200, json }),
+    ...extra,
+  });
+
+  it('leaves the list when it has been offline for more than 72 hours', async () => {
+    const fleet = await fleetWith(body(new Date(Date.now() - 4 * DAY).toISOString()));
+    assert.deepEqual(fleet.machines.map((m) => m.machine_id), ['fresh-1']);
+    assert.equal(fleet.archived, 1, 'the count must say one machine is hidden, or "1 machine" reads as "1 exists"');
+  });
+
+  it('keeps the record: records contains every device the relay sent', async () => {
+    const fleet = await fleetWith(body(new Date(Date.now() - 4 * DAY).toISOString()));
+    assert.equal(fleet.records.length, 2, 'hiding is a read-path decision, so the record must still be here');
+    assert.ok(fleet.records.some((r) => r.machine_id === 'gone-1'));
+  });
+
+  it('comes back on its own once it reports again, and include_stale can show it meanwhile', async () => {
+    const stale = await fleetWith(body(new Date(Date.now() - 4 * DAY).toISOString()), { include_stale: true });
+    assert.equal(stale.machines.length, 2, 'include_stale is the operator\'s way to see archived machines');
+    assert.equal(stale.archived, 0);
+
+    // No bookkeeping: the same record, a fresh timestamp, and it is listed again.
+    const back = await fleetWith(body(new Date(Date.now() - 1_000).toISOString()));
+    assert.deepEqual(back.machines.map((m) => m.machine_id).sort(), ['fresh-1', 'gone-1']);
+    assert.equal(back.archived, 0);
+  });
+
+  it('does not archive a device whose timestamp is missing or unparseable', async () => {
+    const fleet = await fleetWith({ protocol_version: 1, devices: [{ machine_id: 'unknown-1', state: 'expired' }] });
+    assert.equal(fleet.machines.length, 1, 'an unknown age must not be read as "gone for three days"');
+    assert.equal(fleet.archived, 0);
   });
 });

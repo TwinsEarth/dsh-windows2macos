@@ -156,6 +156,15 @@ export function isSelectableDevice(device) {
  * @param {string|null} localMachineId This machine's id, for the "this machine" mark.
  * @returns {object}
  */
+/**
+ * v1.1.3: how long a machine may be unheard from before it leaves the list.
+ *
+ * The operator's rule: offline for 72 hours is no longer shown, **nothing is deleted**, and it comes back on its own
+ * once it reports again. Hiding and deleting are deliberately different -- deleting would throw away the history of a
+ * machine that is merely switched off, and re-pairing would be the only way back.
+ */
+const ARCHIVE_AFTER_MS = 72 * 60 * 60 * 1000;
+
 export function describeTargetMachine(device, localMachineId = null) {
   const machineId = typeof device?.machine_id === 'string' && device.machine_id !== '' ? device.machine_id : null;
   return {
@@ -343,7 +352,7 @@ export function dispatchSelectionFields(selection, mode) {
  *   fields rather than this module's projection of them.
  */
 export async function readFleet(deps) {
-  const { rabbitUrl, token = null, localMachineId = null, signal, request } = deps;
+  const { rabbitUrl, token = null, localMachineId = null, signal, request, include_stale = false } = deps;
   if (typeof rabbitUrl !== 'string' || rabbitUrl === '') {
     return {
       ok: false,
@@ -397,7 +406,18 @@ export async function readFleet(deps) {
   const records = Array.isArray(result.json?.devices)
     ? result.json.devices
     : (Array.isArray(result.json?.machines) ? result.json.machines : []);
-  const machines = records.map((record) => describeTargetMachine(record, localMachineId));
+  const allMachines = records.map((record) => describeTargetMachine(record, localMachineId));
+  /**
+   * Archived means "not shown", never "removed": `records` still carries every device, so a caller that asks for the
+   * archived ones receives them. A missing or unparseable timestamp is NOT archived -- "unknown" must not be read as
+   * "gone for three days", or a relay that omits the field would empty the list.
+   */
+  const isArchived = (machine) => {
+    const raw = machine.last_seen;
+    const at = typeof raw === 'number' ? raw : Date.parse(String(raw ?? ''));
+    return Number.isFinite(at) && (Date.now() - at) >= ARCHIVE_AFTER_MS;
+  };
+  const machines = include_stale === true ? allMachines : allMachines.filter((machine) => !isArchived(machine));
   return {
     ok: true,
     error: null,
@@ -410,6 +430,7 @@ export async function readFleet(deps) {
     // Machines the relay still lists but whose lease is not live. Reported so "3 machines" is never
     // mistaken for "3 machines you can use".
     excluded: machines.filter((machine) => !machine.online).length,
+    archived: allMachines.length - machines.length,
   };
 }
 

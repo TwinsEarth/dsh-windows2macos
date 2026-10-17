@@ -2,6 +2,37 @@
 
 All notable changes to this project are documented here.
 
+## [1.1.3] — 2026-10-17
+
+**A machine offline for more than 72 hours leaves the list. It is not deleted, and it comes back on its own.**
+
+### The rule, and why hiding is not deleting
+
+`readFleet` filters the roster at **the read path only**:
+
+* a machine whose `last_seen` is at least **72 hours** old is **not shown** by `w2m_devices` or the composer;
+* `records` still carries **every device the relay sent**, so nothing is lost and no bookkeeping is required;
+* a **missing or unparseable** `last_seen` is **not** archived -- an unknown age must not be read as "gone for three
+  days", or a relay that omits the field would empty the list;
+* `include_stale: true` shows the archived machines, which is the operator's audit route;
+* the machine returns by reporting again: the same record with a fresh timestamp is listed, with no re-pairing.
+
+Because the relay already stops leasing machines that are offline (v1.1.2), a hidden machine is also not a dispatch
+target -- the list and the dispatch agree, from one notion of liveness plus this display rule.
+
+### The fixtures were the reason this took two attempts
+
+The first attempt changed nothing in the filter and failed 8 tests: `fleet-target`'s roster fixtures carried **fixed
+dates** (`2026-10-09` … `2026-10-11`), which are more than 72 hours old *now*, so a correct filter archived all three
+machines. Making the timestamps **relative** (`Date.now() - 60s` …) fixed all 8 without touching a single assertion,
+which is the evidence that the filter was right and the fixture was the stale part.
+
+### Verified
+
+`test/fleet-target.test.mjs` gains four assertions -- hidden from the list, **records kept**, returns on its own and
+`include_stale` shows it meanwhile, unknown age not archived -- for **45 pass, 0 fail**. `test/tools.test.mjs` 115 and
+`test/relay.test.mjs` 160 remain green.
+
 ## [1.1.2] — 2026-10-17
 
 **A dispatch that names no machines now goes to the machines that are online. The rule that decides "online" had been
