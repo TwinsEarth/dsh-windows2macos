@@ -2,6 +2,61 @@
 
 All notable changes to this project are documented here.
 
+## [1.0.12] — 2026-10-17
+
+**The five fleet-memory actions are verified end to end, against a real relay, a real profile and a real
+`fleet-memory.md` -- and the first attempt found a real defect.**
+
+### What was unverified until now
+
+`publish`, `pull`, `latest`, `diff` and `merge` had each been shipped marked **UNVERIFIED**. The merge *rule* was
+proven exhaustively as a pure function, and the relay *routes* were proven against a real relay -- **but nothing had
+ever executed the tool surface itself.** A caller with no execution is indistinguishable from a working one, which is
+the same gap this project keeps restating in a different shape.
+
+### The defect the end-to-end test found on its first run
+
+`latest` reported `published_by: null` for a publication whose author the relay knew perfectly well.
+
+`RabbitState.putFleetBlob` accepted a `publishedBy` argument that **nothing ever supplied**: the pointer store took
+it, defaulted it to `null`, and the field looked implemented. Fixed by filling it from **the authenticated device's
+`machine_id`, never from the request body** -- for the same reason the P2P announce route reads `machine_id` off the
+token: a caller that could name itself in the body could attribute a publication to a machine that never made it.
+
+**No unit test could have caught this**, because the unit under test was the pointer store, and it was behaving
+exactly as written. The bug lived in the seam between two correct components, which is what an end-to-end test is for.
+
+### What the test exercises, in the order a machine would
+
+A real relay on an ephemeral port and a real profile, then:
+
+1. **`publish`** — returns a 64-hex hash and the byte count.
+2. **`latest`** — discovers that hash **without being told it**, and reports the publishing machine.
+3. **`pull latest`** — fetches the bytes, re-hashes them, and they round-trip **exactly**.
+4. **`diff`** — on an unchanged document: `same: true`, no difference, **and the local file untouched**.
+5. the fleet's document is replaced out of band through the relay's own route;
+6. **`diff`** — now reports the divergence, and the local file is **still untouched**;
+7. **`merge`** — applies the declared rule (neither side declares a repair, so the **default layer** applies and the
+   newer publication wins), records the decision with a reason, carries the winning value into the merged text, and
+   **writes nothing to the local document.**
+
+**`wrote_anything: false` is asserted three times**, because "these actions never edit the file they read" is the
+property that makes it safe to let a network round trip participate at all.
+
+### Verified
+
+- the end-to-end suite: 1 test, passing, covering all five actions;
+- `test/fleet-merge.test.mjs`: 13 tests over the rule itself;
+- full suite: **2374 tests in 91 files, 2360 pass, 0 fail, 14 skip**;
+- pre-flight **GREEN, 15 of 15 checks**.
+
+### NOT verified, even now
+
+**Concurrency.** Everything here is one machine at a time. Two machines publishing and merging simultaneously is
+untested, and the pointer has no compare-and-swap, so the last writer to the pointer wins -- which is **the same rule
+as the default layer**, but that is a coincidence rather than a guarantee. Recorded so the next person does not read
+"end to end" as "under contention".
+
 ## [1.0.11] — 2026-10-17
 
 **`w2m_memory {"action":"merge"}`: merge this machine's collective memory with the fleet's current blob, under the

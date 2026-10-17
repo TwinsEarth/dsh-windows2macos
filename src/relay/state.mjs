@@ -560,7 +560,20 @@ export class RabbitState {
     }
     const scope = this.scopeBlobFleet(device);
     if (scope.ok !== true) return { ok: false, reason: scope.reason, detail: scope.text };
-    return this._persist.putBlob(bytes, { fleetId: scope.fleetId });
+    /**
+     * v1.0.12: `publishedBy` comes from **the authenticated device, never from the request body.**
+     *
+     * The relay knows which device is writing; the request does not get a say, for the same reason `machine_id` is
+     * read off the token in the P2P announce route -- a caller that could name itself in the body could attribute a
+     * publication to a machine that never made it.
+     *
+     * An end-to-end test caught this field being `null`: the pointer store accepted a `publishedBy` argument that
+     * nothing supplied, so `latest` reported `published_by: null` for a publication whose author was right there.
+     */
+    return this._persist.putBlob(bytes, {
+      fleetId: scope.fleetId,
+      publishedBy: typeof device?.machine_id === 'string' ? device.machine_id : null,
+    });
   }
 
   /**
