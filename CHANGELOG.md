@@ -2,6 +2,67 @@
 
 All notable changes to this project are documented here.
 
+## [1.0.5] — 2026-10-17
+
+**DSH-GPW ships as an optional sub-plugin, and the reason it never activated is fixed.**
+
+### What DSH-GPW is
+
+**Global Permission Watchdog.** It answers permission requests on the `approval/request` waterfall with a hard global
+budget: **at most 10 auto-approvals per rolling 60 s, at least 3000 ms apart.** Past either limit it returns
+`next()` -- *"no opinion"* -- so the request falls through to the human prompt **and waits**. It never refuses, and
+it never changes what is being asked.
+
+### Optional means optional, which decides where it lives
+
+The package declares **one** `dsh.bundle.patch`, and that is what makes the w2m plugin mount itself on install. **A
+second plugin in the same patch would mount for everyone**, and this one changes how permissions are answered -- that
+is an operator's decision, not a default.
+
+So it is exposed as `@twinsearth/w2m-dsh-plugin/gpw` and mounted by one explicit row:
+
+    - insert:
+        - id: dsh-gpw
+          name: '@twinsearth/w2m-dsh-plugin/gpw'
+
+**`insert:` is required and the reason is recorded in this package's own patch file**: no earlier layer creates a
+`dsh-gpw` row, and a bare `- id:` patch aimed at a nonexistent row is **skipped silently**. Removing the row
+disables it again.
+
+**It is deliberately not re-exported from `lib/index.js`.** A permission-answering plugin must not arrive because
+someone installed a fleet tool.
+
+### The defect that kept it from ever activating
+
+The standalone copy declared:
+
+    export const inject = { required: ['approval'] };
+
+**The host reads `inject` as an array of service names.** Measured across the shipped tree: **283 array-shaped
+declarations, 0 object-shaped.** So the host took the object's *key* and waited for a service literally named
+`required`:
+
+    pending (waiting for service: required)
+
+-- indefinitely, and the client reported the component as `等待依赖`. It is now `['approval']`, and `approval`
+does exist: `@deepseek-ai/dsh-base`'s patch mounts `@deepseek-ai/dsh-user-approval` as id `approval`.
+
+**The error message named its own cause**, which is why this took one measurement instead of an investigation: it
+said `required`, and `required` is the key.
+
+### What is verified, and what is not
+
+**Verified:** `lib/gpw.js` loads; `name` is `dsh-gpw`; `inject` is an array; `apply` is a function;
+`approval/request` and `allowed-once` both exist in the host (9 and 22 files respectively).
+
+**Not verified: that it mounts and intercepts.** That needs a live host with the row added. The observable evidence
+after a restart is its own startup line --
+
+    approval-ratelimit: active -- at most 10 auto-approvals per 60 s, at least 3000 ms apart, process-wide
+
+-- **and then the periodic counted line, without which "mounted and working" and "mounted and doing nothing" look
+identical.** That distinction is the reason those counters exist.
+
 ## [1.0.4] — 2026-10-17
 
 **The description described a different package, and it is the only thing many readers see.**
