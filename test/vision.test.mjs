@@ -30,7 +30,21 @@ let dir;
 before(() => { dir = mkdtempSync(join(tmpdir(), 'vision-suite-')); });
 after(() => { rmSync(dir, { recursive: true, force: true }); });
 
-const write = (name, text) => { const p = join(dir, name); writeFileSync(p, text, 'utf8'); return p; };
+/**
+ * Write a fixture, **with owner-only permissions**.
+ *
+ * The settings loader refuses a file that holds a key and is group- or world-readable, and that refusal is correct --
+ * it is what stops a credential being left in a `0644` file. But it means a fixture created under the default umask
+ * answers *"mode 644"* instead of the thing the test asked about.
+ *
+ * That difference is invisible on Windows, where `chmod` is a no-op and files are not group-readable, and it is what
+ * failed on Linux CI. **The fixture is what should be 0600; the guard is right.**
+ */
+const write = (name, text) => {
+  const p = join(dir, name);
+  writeFileSync(p, text, { encoding: 'utf8', mode: 0o600 });
+  return p;
+};
 
 describe('the settings file is parsed, not executed', () => {
   it('reads KEY=value lines and ignores comments and blanks', () => {

@@ -212,6 +212,24 @@ describe('declining an approval never touches next, answering never calls it', (
   it('delegates on its own deadline instead of denying', async () => {
     // The property that decides whether a silent phone blocks work the host would allow.
     let now = 0;
+    /**
+     * A **deterministic** timer, because a real one makes this test depend on the event loop.
+     *
+     * `approval-broker.mjs:226` calls `record.timer.unref()`, so during the await the only pending handle is an
+     * **unref'd** timeout -- and an unref'd handle does not keep the loop alive. On Linux CI the loop drained before
+     * the timer fired, the offering promise never settled, and node's runner reported `cancelledByParent:
+     * "Promise resolution is still pending but the event loop has already resolved"`. It passed on Windows only by
+     * accident of scheduling.
+     *
+     * Firing the callback explicitly keeps the broker's contract (a callback that runs at or after its deadline,
+     * cancelled by `clearTimer`) while removing the wall clock from the test.
+     */
+    const timers = [];
+    const fireDue = () => {
+      for (const t of timers) {
+        if (!t.cancelled && t.due <= now) { t.cancelled = true; t.fn(); }
+      }
+    };
     const ch = createMemoryChannel({ name: 'memory', prefixes: ['mem'] });
     const bridge = createBridge({
       channels: [ch],
@@ -220,12 +238,11 @@ describe('declining an approval never touches next, answering never calls it', (
       broker: {
         now: () => now,
         setTimer: (fn, ms) => {
-          // Fire on the next turn, so `advance` stands in the window a real loop has.
-          const handle = setTimeout(fn, 0);
-          handle._due = now + ms;
+          const handle = { fn, due: now + ms, cancelled: false };
+          timers.push(handle);
           return handle;
         },
-        clearTimer: (h) => clearTimeout(h),
+        clearTimer: (h) => { if (h) h.cancelled = true; },
       },
     });
     bridge.policy.trust('memory', 'owner');
@@ -242,6 +259,8 @@ describe('declining an approval never touches next, answering never calls it', (
       },
     });
     now = 11;
+    // The deadline has passed; fire the broker's timer explicitly rather than waiting on the event loop.
+    fireDue();
     const result = await offering;
     assert.equal(result.claimed, true);
     assert.equal(result.outcome, 'allowed-once', 'the host allowed it; the bridge did not deny it');

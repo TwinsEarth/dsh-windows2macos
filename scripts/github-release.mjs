@@ -114,12 +114,28 @@ export async function publishRelease(options) {
     digest = sha256(assetBuf);
   }
 
-  const body = digest === null
-    ? `${entry}\n`
-    : `${entry}\n\n> This asset is **byte-identical to the npm release** (sha256 \`${digest}\`).\n`;
+  /**
+   * **The release title is the version, not the commit subject.**
+   *
+   * The earlier rule -- title = commit subject -- was written to stop 56 releases sharing one hardcoded title, and it
+   * solved that. It introduced a different problem that only shows on the repository home page: the sidebar renders
+   * the latest release's *name*, so it read
+   *
+   *     test(merge): verify merging while a third machine publishes -- never tears, ...
+   *
+   * **where a version number belongs.** A reader looking for "which version is current?" got a commit subject.
+   *
+   * So the title is the tag (`v1.0.14`) and the commit subject moves to the **first line of the body**, where it still
+   * explains what the release is without occupying the only slot that names it.
+   */
+  const title = tag;
+  const body = (subject === null ? '' : `${subject}\n\n`)
+    + (digest === null
+      ? `${entry}\n`
+      : `${entry}\n\n> This asset is **byte-identical to the npm release** (sha256 \`${digest}\`).\n`);
 
   if (dryRun) {
-    return { ok: true, title: subject, bodyChars: body.length, problems: ['dry run: nothing was sent'] };
+    return { ok: true, title, bodyChars: body.length, problems: ['dry run: nothing was sent'] };
   }
 
   const existing = await api(token, `/repos/${repo}/releases/tags/${tag}`);
@@ -129,14 +145,14 @@ export async function publishRelease(options) {
 
   let release;
   if (existing.ok) {
-    const patch = await api(token, `/repos/${repo}/releases/${existing.json.id}`, 'PATCH', { name: subject, body });
+    const patch = await api(token, `/repos/${repo}/releases/${existing.json.id}`, 'PATCH', { name: title, body });
     if (!patch.ok) return { ok: false, problems: [`PATCH ${tag}: HTTP ${patch.status} ${patch.detail ?? ''}`] };
     release = patch.json;
   } else {
     const create = await api(token, `/repos/${repo}/releases`, 'POST', {
       tag_name: tag,
       target_commitish: commit,
-      name: subject,
+      name: title,
       body,
       draft: false,
       prerelease: false,
@@ -146,6 +162,19 @@ export async function publishRelease(options) {
     release = create.json;
   }
 
+  /**
+   * **The `SHA256SUMS` asset is not optional, and it took a product defect to establish that.**
+   *
+   * `src/plugin/update-source.mjs` refuses to offer an update without it:
+   *
+   *     no SHA256SUMS asset for ${tag}; cannot verify a download without it
+   *
+   * The 0.x releases carried two assets (tarball + sums). When the 1.0 line was cut this script uploaded **only the
+   * tarball**, so every 1.0.x release became un-updatable from GitHub -- verifiable downloads stopped working while
+   * the releases looked complete. A CI job that makes a real API call caught it; nothing local could have.
+   *
+   * So the sums are derived from the same bytes that are uploaded, and attached in the same run.
+   */
   if (assetBuf !== null && assetName !== undefined) {
     const upload = await fetch(
       `https://uploads.github.com/repos/${repo}/releases/${release.id}/assets?name=${encodeURIComponent(assetName)}`,
@@ -158,16 +187,44 @@ export async function publishRelease(options) {
     );
     // 422 means the asset is already attached, which is the normal case on a re-run and not a failure.
     if (!upload.ok && upload.status !== 422) problems.push(`asset upload: HTTP ${upload.status}`);
+
+    // `<64-hex>  <filename>` -- one space-two-space line, exactly what `parseSums` accepts.
+    const sumsBuf = Buffer.from(`${digest}  ${assetName}\n`, 'utf8');
+    const sumsUpload = await fetch(
+      `https://uploads.github.com/repos/${repo}/releases/${release.id}/assets?name=SHA256SUMS`,
+      {
+        method: 'POST',
+        headers: { ...headers(token), 'Content-Type': 'application/octet-stream' },
+        body: sumsBuf,
+        signal: AbortSignal.timeout(300000),
+      },
+    );
+    if (!sumsUpload.ok && sumsUpload.status !== 422) {
+      problems.push(`SHA256SUMS upload: HTTP ${sumsUpload.status} -- without it the update cannot be verified`);
+    }
   }
 
   // Read back: a successful PATCH is not evidence that the field now holds what was sent.
   const after = await api(token, `/repos/${repo}/releases/tags/${tag}`);
   const nowTitle = after.json?.name ?? null;
   const nowBody = after.json?.body ?? '';
-  if (nowTitle !== subject) problems.push(`title did not stick: read back ${JSON.stringify(nowTitle)}`);
+  if (nowTitle !== title) problems.push(`title did not stick: read back ${JSON.stringify(nowTitle)} instead of ${JSON.stringify(title)}`);
   if (nowBody.length === 0) problems.push('body is empty after the write');
 
-  return { ok: problems.length === 0, title: nowTitle, bodyChars: nowBody.length, problems };
+  /**
+   * Assert the sums asset exists **at release time**.
+   *
+   * This is the check whose absence made every 1.0.x release silently un-updatable: the release looked complete
+   * because the tarball was there, and the missing `SHA256SUMS` only surfaced in a CI job that calls the real API.
+   * A failed upload only warned; the read-back is what makes it a failure.
+   */
+  const nowAssets = (after.json?.assets ?? []).map((a) => a.name);
+  if (assetBuf !== null && !nowAssets.some((n) => /^SHA256SUMS(\.txt)?$/i.test(n))) {
+    problems.push(`SHA256SUMS asset is missing after the write (assets: [${nowAssets.join(', ')}]) -- the update ` +
+      'cannot be verified without it');
+  }
+
+  return { ok: problems.length === 0, title: nowTitle, bodyChars: nowBody.length, assets: nowAssets, problems };
 }
 
 /**

@@ -2,6 +2,58 @@
 
 All notable changes to this project are documented here.
 
+## [1.0.15] — 2026-10-17
+
+**Every 1.0.x GitHub release was missing its `SHA256SUMS` asset, so updating from GitHub could not be verified and
+would be refused. That is fixed, along with the two tests that were failing on Linux CI.**
+
+### The product defect: un-updatable releases
+
+`src/plugin/update-source.mjs` refuses to offer an update without a checksum asset:
+
+> `no SHA256SUMS asset for ${tag}; cannot verify a download without it`
+
+The 0.x releases carry **two** assets (tarball + sums). **When the 1.0 line was cut, the release script uploaded only the
+tarball** -- so every 1.0.x release looked complete and was, in fact, **un-updatable from GitHub**. Nothing local could
+have caught it: the tarball was present and correct, and only a job that calls the real API noticed.
+
+Fixed in three places:
+
+* `scripts/github-release.mjs` now derives the sums from the same bytes it uploads and attaches `SHA256SUMS` in the
+  same run, **and reads back the asset list** so a missing sums file is a release failure rather than a warning;
+* the asset has been backfilled on **all fourteen** 1.0.x releases (v1.0.1 … v1.0.14), each checksum computed from the
+  bytes GitHub actually serves;
+* the live-API test in `test/update-source.test.mjs` now passes -- it was the only thing that ever reported this.
+
+### Two tests that failed only on Linux CI
+
+Both were invisible on Windows, and both were **the test's** fault, not the code's:
+
+**`test/vision.test.mjs`** created its settings fixture with the default umask, which is `0644` on Linux. The loader
+correctly refuses a file that holds a key and is group-readable, so the test got *"mode 644"* instead of the message it
+asserted. **The fixture should be 0600; the guard was right.**
+
+**`test/chatops-bridge.test.mjs`** faked its timer with a real `setTimeout`. The broker calls `record.timer.unref()`,
+so during the await the only pending handle is an **unref'd** timeout -- which does not keep the event loop alive. On
+Linux the loop drained before it fired and node reported
+`cancelledByParent: Promise resolution is still pending but the event loop has already resolved`. **It passed on Windows
+by accident of scheduling.** The timer is now deterministic: the callback is captured and fired explicitly.
+
+### Release titles are version numbers
+
+The repository home page sidebar renders the latest release's **name**, and the name was the commit subject:
+
+> `test(merge): verify merging while a third machine publishes -- never tears, …`
+
+-- where a reader looking for "which version is current?" expects `v1.0.14`. The title is now the tag; **the commit
+subject moved to the first line of the body**, so nothing is lost and the one slot that names the release names the
+version. All fourteen 1.0.x releases were renamed to match.
+
+### Verified
+
+Full suite **2380 tests in 93 files, 2366 pass, 0 fail, 14 skip**; pre-flight **GREEN, 15 of 15 checks**.
+`test/update-source.test.mjs` (which makes a real GitHub API call) passes: **50 tests, 49 pass, 0 fail**.
+
 ## [1.0.14] — 2026-10-17
 
 **Merging while a third machine publishes is verified: it never tears, never writes, and names its failures.**
