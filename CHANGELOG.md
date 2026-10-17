@@ -2,6 +2,45 @@
 
 All notable changes to this project are documented here.
 
+## [1.0.4] — 2026-10-17
+
+**The description described a different package, and it is the only thing many readers see.**
+
+### Two numbers were wrong, and both were checkable
+
+The text had been carried forward since an earlier release and said:
+
+    ... eight DSH tools (replicate / split), nine aggregate verdicts and signed requests.
+
+**Measured: eleven tools, six verdicts.** The tools are the `name: 'w2m_…'` registration sites in
+`src/plugin/tools.mjs`; the verdicts are named in `src/relay/report.mjs:19-25` -- `consistent`, `divergent`,
+`divergent-platform`, `failed`, `partial`, `unverifiable`. **Four coordination modes, not the two a
+parenthetical named.**
+
+### What mattered more than the numbers: it never mentioned joining
+
+A reader finished that sentence knowing the plugin exists and **nothing about the step every new machine gets
+wrong** -- which is the one this release's predecessor spent hours on. **A description that omits the join
+requirement produces exactly the "I installed it and nothing happened" report.**
+
+So the description now ends with it, as a flat fact: **"Joining needs a pairing code plus `autoStartAgent:
+true`; installing alone does not join."**
+
+### The replacement
+
+    Run one project across your own Windows and macOS machines from a single DeepSeek account, through 11
+    w2m_* tools. Four coordination modes (replicate, split, broadcast, pipeline) and six aggregate verdicts
+    (consistent, divergent, divergent-platform, failed, partial, unverifiable). P2P hole punching by default,
+    with a bundled relay, STUN responder and ledger fallback, so the fleet needs no third-party service.
+    Joining needs a pairing code plus autoStartAgent: true; installing alone does not join.
+
+**Exactly 500 characters, because registries truncate and a description cut mid-sentence is worse than a shorter
+one.** The first candidate was 502; the trim removed two words and **was reported rather than applied silently**.
+Both `package.json` and `plugin.json` carry it -- they previously disagreed, which is its own small defect: two
+descriptions of one package.
+
+**No code change.** Full suite 2352 in 89 files, 0 fail. Pre-flight GREEN with FIFTEEN checks.
+
 ## [1.0.3] — 2026-10-17
 
 **The warning that predicted this failure now says what to do about it.**
