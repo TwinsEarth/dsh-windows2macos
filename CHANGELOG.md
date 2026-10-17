@@ -2,6 +2,36 @@
 
 All notable changes to this project are documented here.
 
+## [1.0.16] — 2026-10-17
+
+**The last two failures on Linux CI, and one of them was a defect in the release process: a release was advertised as
+"latest" before its assets had finished uploading.**
+
+### A release must not be "latest" until it can be downloaded
+
+The release script created the release with `make_latest: 'true'` and *then* uploaded the tarball. That leaves a
+window in which `releases/latest` points at a release **with no tarball** -- and CI's live-API job read exactly that,
+failing with:
+
+> `ASSET_MISSING no release asset matches /\.(?:tgz|tar\.gz)$/i`
+
+on a release that was complete seconds later. **The ordering was the defect, not the test.** The release is now created
+without `make_latest`, the assets are attached, **and only then is it promoted** -- so a reader following the
+"latest" link always lands on something downloadable.
+
+### A test that was only true on a developer machine
+
+`test/fleet-sync.test.mjs` removes the repository's git identity to prove the tool refuses to rebase without one. It
+checked `git config user.email`, which **falls back to the global and system config** -- absent on a developer machine,
+**present on GitHub's runners**. So the tool correctly found an identity and the test's premise was false, on CI only.
+
+The test now points `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` at paths that do not exist, so git's config is exactly
+as empty as the test claims. It also restores every environment variable it touches.
+
+### Verified
+
+Full suite **2380 tests in 93 files, 2366 pass, 0 fail, 14 skip**; pre-flight **GREEN, 15 of 15 checks**.
+
 ## [1.0.15] — 2026-10-17
 
 **Every 1.0.x GitHub release was missing its `SHA256SUMS` asset, so updating from GitHub could not be verified and

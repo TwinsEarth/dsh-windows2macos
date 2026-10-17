@@ -209,22 +209,37 @@ describe('fleet sync: the four states, each built for real', { skip: GIT === nul
     // Found by running it: `git rebase` failed on a missing identity and left the tree in a detached HEAD
     // with `.git/rebase-merge` present -- needing a person. An automatic tool that can wedge a repository
     // is worse than one that does nothing, so the identity is checked before starting and a failure aborts.
-    const { work, other } = makeFleet();
+    const { work, other, root } = makeFleet();
     commit(other, 'their work');
     git(other, ['push']);
     commit(work, 'my unpublished work');
 
-    // Strip the identity that `makeFleet` pins, leaving neither config nor environment to fall back on.
+    // Strip the identity that `makeFleet` pins.
     git(work, ['config', '--unset', 'user.email']);
     git(work, ['config', '--unset', 'user.name']);
 
-    const state = inspect(work);
-    assert.equal(state.state, 'diverged-unpublished');
-
-    const saved = { name: process.env.GIT_COMMITTER_NAME, email: process.env.GIT_COMMITTER_EMAIL };
-    delete process.env.GIT_COMMITTER_NAME;
-    delete process.env.GIT_COMMITTER_EMAIL;
+    /**
+     * **Neutralise the global and system git config too.**
+     *
+     * `git config user.email` falls back to `~/.gitconfig` and `/etc/gitconfig`. A developer machine usually has
+     * neither (which is why this passed locally), but **GitHub's runners do have a global identity**, so the module's
+     * pre-check found one and the test's "no identity" premise was false -- on CI only.
+     *
+     * Pointing `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` at paths that do not exist makes the config exactly as empty as
+     * the test claims, on every host.
+     */
+    const envKeys = ['GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL', 'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL',
+      'EMAIL', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM'];
+    const savedEnv = {};
+    for (const k of envKeys) savedEnv[k] = process.env[k];
+    const emptyConfig = join(root, 'no-git-config');
+    for (const k of envKeys.slice(0, 5)) delete process.env[k];
+    process.env.GIT_CONFIG_GLOBAL = emptyConfig;
+    process.env.GIT_CONFIG_SYSTEM = emptyConfig;
     try {
+      const state = inspect(work);
+      assert.equal(state.state, 'diverged-unpublished');
+
       const outcome = act(state, { cwd: work, write: true });
       assert.equal(outcome.performed, false);
       assert.equal(outcome.action, 'stop');
@@ -232,8 +247,10 @@ describe('fleet sync: the four states, each built for real', { skip: GIT === nul
       assert.equal(existsSync(join(work, '.git', 'rebase-merge')), false, 'the repository must not be left mid-rebase');
       assert.equal(inspect(work).state, 'diverged-unpublished', 'and must be exactly where it was');
     } finally {
-      if (saved.name !== undefined) process.env.GIT_COMMITTER_NAME = saved.name;
-      if (saved.email !== undefined) process.env.GIT_COMMITTER_EMAIL = saved.email;
+      for (const k of envKeys) {
+        if (savedEnv[k] === undefined) delete process.env[k];
+        else process.env[k] = savedEnv[k];
+      }
     }
   });
 });

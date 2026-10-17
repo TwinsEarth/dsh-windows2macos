@@ -144,11 +144,21 @@ export async function publishRelease(options) {
   }
 
   let release;
+  let createdNew = false;
   if (existing.ok) {
     const patch = await api(token, `/repos/${repo}/releases/${existing.json.id}`, 'PATCH', { name: title, body });
     if (!patch.ok) return { ok: false, problems: [`PATCH ${tag}: HTTP ${patch.status} ${patch.detail ?? ''}`] };
     release = patch.json;
   } else {
+    /**
+     * **Created without `make_latest`, and promoted only after its assets are attached.**
+     *
+     * CI runs a job that calls the real API and reads `/releases/latest`. When this script set `make_latest: 'true'`
+     * at creation, there was a window -- the release existed, the tarball was still uploading -- in which "latest"
+     * pointed at a release with **no tarball**. That job failed with `ASSET_MISSING no release asset matches`, on a
+     * release that was complete seconds later. The ordering is the defect: a release must not be advertised as latest
+     * until a downloader can actually download it.
+     */
     const create = await api(token, `/repos/${repo}/releases`, 'POST', {
       tag_name: tag,
       target_commitish: commit,
@@ -156,10 +166,11 @@ export async function publishRelease(options) {
       body,
       draft: false,
       prerelease: false,
-      make_latest: 'true',
+      make_latest: 'false',
     });
     if (!create.ok) return { ok: false, problems: [`POST release ${tag}: HTTP ${create.status} ${create.detail ?? ''}`] };
     release = create.json;
+    createdNew = true;
   }
 
   /**
@@ -202,6 +213,17 @@ export async function publishRelease(options) {
     if (!sumsUpload.ok && sumsUpload.status !== 422) {
       problems.push(`SHA256SUMS upload: HTTP ${sumsUpload.status} -- without it the update cannot be verified`);
     }
+  }
+
+  /**
+   * **Promote to "latest" only now that the assets are attached.**
+   *
+   * A reader following `releases/latest` must land on something downloadable. Promoting at creation left a window
+   * where the latest release had no tarball yet, and CI caught exactly that.
+   */
+  if (createdNew) {
+    const promote = await api(token, `/repos/${repo}/releases/${release.id}`, 'PATCH', { make_latest: 'true' });
+    if (!promote.ok) problems.push(`could not promote ${tag} to latest: HTTP ${promote.status}`);
   }
 
   // Read back: a successful PATCH is not evidence that the field now holds what was sent.
