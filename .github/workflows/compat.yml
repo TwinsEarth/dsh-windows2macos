@@ -119,8 +119,23 @@ concurrency:
 env:
   # The host release this gate is about. See "THE PIN IS DELIBERATE" above.
   DSH_HOST_VERSION: '0.2.0-rc.2'
-  DSH_CORDIS_VERSION: '4.0.4'
-  DSH_CORDIS_LOADER_VERSION: '1.0.5'
+  # ## Why these two moved from 4.0.4 / 1.0.5 to 4.0.5 / 1.0.6
+  #
+  # The gate went red **without a change on our side**. `@deepseek-ai/cordis-plugin-group@1.0.5` -- a transitive peer of
+  # `@deepseek-ai/dsh-app-boot@0.2.0-rc.2`, which asks for `cordis-plugin-group@~1.0.4` -- moved its own peer range from
+  # `@deepseek-ai/cordis@~4.0.4` to `~4.0.5`. With `cordis` pinned at `4.0.4`, npm answered:
+  #
+  #     ERESOLVE  peer @deepseek-ai/cordis@"~4.0.5" from @deepseek-ai/cordis-plugin-group@1.0.5
+  #               Found: @deepseek-ai/cordis@4.0.4
+  #
+  # **4.0.5 satisfies both ranges** (`~4.0.4` is >=4.0.4 <4.1.0) and `cordis-plugin-loader@1.0.6` satisfies both of the
+  # loader ranges for the same reason. Verified before pushing, not assumed: the synthetic manifest is installed locally
+  # with `npm@11` and **4.0.4/1.0.5 reproduces the ERESOLVE while 4.0.5/1.0.6 resolves (exit 0, group 1.0.5 installed)**.
+  #
+  # This is the floating-transitive case "THE PIN IS DELIBERATE" warned about, and the answer is to move the pin to a
+  # version that satisfies the moved peer -- not `--legacy-peer-deps`, which would hide the next one as well.
+  DSH_CORDIS_VERSION: '4.0.5'
+  DSH_CORDIS_LOADER_VERSION: '1.0.6'
   # The version the Desktop installation bundles at `resources/runtime/pnpm`; `dsh plugin add` forwards
   # to pnpm in the profile directory and fails with exit 127 without one on PATH.
   PNPM_VERSION: '11.7.0'
