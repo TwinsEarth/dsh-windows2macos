@@ -2428,9 +2428,22 @@ describe('v0.1.2 observability (§4/§8)', () => {
       assert.equal(hz.json.base_path, '/w2m');
       assert.equal(hz.json.operator_token_required, true);
       assert.equal(hz.json.pair_rate_limit, 7);
+      /**
+       * The exact key set is a **surface lock**, and it is deliberately exact.
+       *
+       * `/healthz` is unauthenticated, so a field appearing here is a field published to anyone who can reach the
+       * relay. The token-leak assertion two lines below is the security check; this one is what makes *adding* a
+       * field a decision someone had to review rather than a side effect of a patch.
+       *
+       * v1.0.7 added four: `blobs`, `blob_bytes`, `blobs_limit`, `blob_bytes_limit`. They are **counts and totals
+       * only** -- the fleet sync channel's occupancy, never any stored content -- which is why they belong on an
+       * unauthenticated endpoint at all. Listed in the order `Object.keys()` sorts them, not the order they were
+       * added, because the assertion sorts.
+       */
       assert.deepEqual(
         Object.keys(hz.json.persistence).sort(),
-        ['append_failures', 'degraded', 'degraded_since', 'devices_corrupt', 'devices_missing', 'dir',
+        ['append_failures', 'blob_bytes', 'blob_bytes_limit', 'blobs', 'blobs_limit', 'degraded',
+          'degraded_since', 'devices_corrupt', 'devices_missing', 'dir',
           'enabled', 'last_append_error', 'ledger_lines_read', 'ledger_lines_skipped',
           'revived_devices', 'revived_tasks', 'warnings'],
       );

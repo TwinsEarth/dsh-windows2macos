@@ -115,3 +115,23 @@
         allowedCommands: []
         p2pMode: auto
         stunServers: []
+    # DSH-GPW (Global Permission Watchdog) ships with this package and is **off until an operator turns it on**.
+    #
+    # It is in this insert list rather than left out of the tree entirely, because a plugin the composed tree does
+    # not mention is a plugin the plugin manager cannot list -- and then "enable it manually" has no control to
+    # click. **A row with `disabled: true` is the shape that makes it installable with the package and switchable
+    # from the UI**: the component shows up, its toggle is off, and flipping it needs no file edit.
+    #
+    # Found this way, not assumed: v1.0.5 shipped the subpath export but no row, so the watchdog was reachable only
+    # by hand-editing a profile patch. **An optional component nobody can find is not optional, it is absent.**
+    #
+    # What it does once enabled: answers `approval/request` with at most 10 auto-approvals per rolling 60 s, at
+    # least 3000 ms apart, and defers everything past that to the human prompt, where it waits.
+    - id: dsh-gpw
+      name: '@twinsearth/w2m-dsh-plugin/gpw'
+      disabled: true
+      config:
+        maxPerWindow: 10
+        windowMs: 60000
+        minGapMs: 3000
+

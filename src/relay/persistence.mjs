@@ -4,6 +4,7 @@
  * `<state>/devices.json`  atomic snapshot (tmp file + rename)
  * `<state>/ledger.jsonl`  append-only, one JSON object per line
  * `<state>/operator-token.txt`  single line, 0600
+ * `<state>/blobs/<aa>/<sha256>`  content-addressed bytes, v1.0.7 (see `putBlob`)
  *
  * This is the only relay module allowed to touch the filesystem.
  * Corruption is never silent: every skipped line / unreadable snapshot is
@@ -12,12 +13,31 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 
 import { rfc3339 } from './state.mjs';
 
 export const DEVICES_FILE = 'devices.json';
 export const LEDGER_FILE = 'ledger.jsonl';
 export const OPERATOR_TOKEN_FILE = 'operator-token.txt';
+/** v1.0.7: the content-addressed blob directory, and the two caps that keep it bounded. */
+export const BLOB_DIR = 'blobs';
+export const MAX_BLOB_BYTES = 8 * 1024 * 1024;
+export const MAX_BLOBS = 256;
+/**
+ * v1.0.7: **which fleet wrote each blob.**
+ *
+ * Content addressing keys a blob by its own hash, and a hash knows nothing about fleets. So two fleets that store
+ * the same bytes land at the same path -- and without this index, the second one could read the first one's content.
+ * **A content-addressed store with no ownership record is not isolated, it is shared.**
+ *
+ * The index is a separate document rather than part of the path (`blobs/<fleet>/<aa>/<hash>`) for one concrete
+ * reason: **deduplication is only sound when the content is identical**, and identical bytes stored twice would
+ * otherwise occupy two entries. The path stays a pure function of the content; the fleet is metadata.
+ *
+ * Shape: `{ "<sha256>": { fleet_id: string|null, added_at_ms: number } }`.
+ */
+export const BLOB_INDEX_FILE = 'index.json';
 
 /** Ledger entry types understood by `RabbitState#restore`. */
 export const LEDGER_TYPES = Object.freeze([
@@ -250,8 +270,232 @@ export class Persistence {
     return true;
   }
 
+  /* ------------------------------------------------------------------------------------------- */
+  /* v1.0.7: content-addressed blobs — the fleet sync channel (#1)                               */
+  /* ------------------------------------------------------------------------------------------- */
+
+  /**
+   * Store bytes under their own SHA-256, and read them back by that hash.
+   *
+   * ## Why the relay may carry bytes at all, when it deliberately carries none today
+   *
+   * The relay persists `stdout_sha256` and never the text, and `src/agent/storage.mjs` records why that matters:
+   * `memory.jsonl` on each machine is the only durable copy of what a command printed. **That invariant is about
+   * the relay not becoming a document store** — it never interprets content and never asserts that content is
+   * authentic.
+   *
+   * A blob keyed by **its own hash** preserves both halves. The relay still interprets nothing; **the hash is what
+   * says the bytes are the bytes**, exactly as `stdout_sha256` does for a result. The only thing that is new is
+   * that a hash the relay already holds can now have its bytes fetched from the same place.
+   *
+   * ## The two limits, because an uncapped writer is what caused the original incident
+   *
+   * `storage.mjs`'s header records the incident that produced its whole design: a single uncapped writer reached
+   * 100% filesystem at 14.7 GB/day. A blob channel with no ceiling reproduces that on the relay, so:
+   *
+   *   * **8 MiB per blob** — a `fleet-memory.md` is tens of KB; this is three orders of magnitude of headroom.
+   *     Larger content is an archive, not a memory.
+   *   * **256 blobs** — bounded *count* matters as much as bounded size: 256 × 8 MiB caps a fleet's share at
+   *     2 GiB regardless of what it writes.
+   *
+   * Eviction is oldest-first and **never takes the last blob**: deleting the only copy of a fact is the failure
+   * `UNDELETABLE_TIERS` exists to prevent locally.
+   *
+   * @param {Buffer} bytes
+   * @param {{fleetId?: string|null}} [options] the owning fleet, recorded so another fleet cannot read it back
+   * @returns {{ok:true, hash:string, bytes:number, evicted:string[]}|{ok:false, reason:string, detail:string}}
+   */
+  putBlob(bytes, options = {}) {
+    if (!this.enabled) return { ok: false, reason: 'PERSISTENCE_DISABLED', detail: 'the relay has no state directory' };
+    if (!Buffer.isBuffer(bytes) || bytes.length === 0) {
+      return { ok: false, reason: 'BLOB_EMPTY', detail: 'an empty blob is a caller bug, not content' };
+    }
+    if (bytes.length > MAX_BLOB_BYTES) {
+      return {
+        ok: false,
+        reason: 'BLOB_TOO_LARGE',
+        detail: `${bytes.length} bytes exceeds the ${MAX_BLOB_BYTES}-byte limit`,
+      };
+    }
+    const hash = createHash('sha256').update(bytes).digest('hex');
+    const file = this.blobFile(hash);
+    if (file === null) return { ok: false, reason: 'PERSISTENCE_DISABLED', detail: 'no blob directory' };
+
+    const index = this.readBlobIndex();
+    const fleetId = typeof options.fleetId === 'string' && options.fleetId !== '' ? options.fleetId : null;
+
+    // Content addressing makes the write idempotent: the same bytes always land at the same path.
+    if (fs.existsSync(file)) {
+      /**
+       * Already stored. **The first writer's fleet keeps ownership** -- re-assigning it on a second write would let
+       * one fleet claim a blob another fleet already owns by simply PUT-ting the same bytes, which is the same
+       * failure as having no index at all.
+       */
+      const entry = index[hash];
+      if (entry === undefined) {
+        index[hash] = { fleet_id: fleetId, added_at_ms: this._now() };
+        this.writeBlobIndex(index);
+      }
+      return { ok: true, hash, bytes: bytes.length, evicted: [] };
+    }
+
+    const evicted = this.evictBlobsFor(1);
+    for (const gone of evicted) delete index[gone];
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      const tmp = `${file}.tmp-${process.pid}-${this._now()}`;
+      fs.writeFileSync(tmp, bytes);
+      fs.renameSync(tmp, file);
+    } catch (error) {
+      this.warn(BLOB_DIR, `blob write failed: ${error?.message ?? String(error)}`);
+      return { ok: false, reason: 'BLOB_WRITE_FAILED', detail: error?.message ?? String(error) };
+    }
+    index[hash] = { fleet_id: fleetId, added_at_ms: this._now() };
+    this.writeBlobIndex(index);
+    return { ok: true, hash, bytes: bytes.length, evicted };
+  }
+
+  /**
+   * The bytes for a hash, or `null`.
+   *
+   * Never throws -- an unreadable blob is a miss, not a crash -- and **when `fleetId` is supplied, a blob owned by a
+   * different fleet is a miss too.** The caller cannot distinguish "no such blob" from "not yours", which is
+   * deliberate: a distinguishable refusal tells a prober that a hash exists on this relay.
+   *
+   * @param {string} hash
+   * @param {{fleetId?: string|null|undefined}} [options] omit `fleetId` entirely for an unscoped read
+   */
+  getBlob(hash, options = {}) {
+    const file = this.blobFile(hash);
+    if (file === null) return null;
+    if (options.fleetId !== undefined) {
+      const entry = this.readBlobIndex()[hash];
+      // A blob with no recorded owner predates the index or was written unscoped; it is not this fleet's.
+      if (entry === undefined || entry.fleet_id !== options.fleetId) return null;
+    }
+    try {
+      return fs.readFileSync(file);
+    } catch {
+      return null;
+    }
+  }
+
+  hasBlob(hash) {
+    const file = this.blobFile(hash);
+    if (file === null) return false;
+    try {
+      return fs.statSync(file).isFile();
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Every stored blob, newest last, with the size and mtime needed to enforce the count cap.
+   *
+   * @returns {{hash:string, bytes:number, mtimeMs:number}[]}
+   */
+  listBlobs() {
+    if (!this.enabled) return [];
+    const root = path.join(this.dir, BLOB_DIR);
+    let shards;
+    try {
+      shards = fs.readdirSync(root, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+    const out = [];
+    for (const shard of shards) {
+      if (!shard.isDirectory()) continue;
+      const shardPath = path.join(root, shard.name);
+      let names;
+      try {
+        names = fs.readdirSync(shardPath, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const entry of names) {
+        if (!entry.isFile() || entry.name.includes('.tmp-')) continue;
+        try {
+          const stat = fs.statSync(path.join(shardPath, entry.name));
+          out.push({ hash: entry.name, bytes: stat.size, mtimeMs: stat.mtimeMs });
+        } catch {
+          /* a blob that vanished mid-scan is not a failure */
+        }
+      }
+    }
+    out.sort((a, b) => a.mtimeMs - b.mtimeMs);
+    return out;
+  }
+
+  /**
+   * Make room for `incoming` more blobs, oldest first, and never take the last one.
+   *
+   * **The caller must prune the index for the returned hashes** -- this method deletes files, and the index is a
+   * separate document. `putBlob` does that pruning; a future caller that evicts for another reason owes the same.
+   *
+   * @param {number} incoming
+   * @returns {string[]} the hashes evicted
+   */
+  evictBlobsFor(incoming) {
+    const existing = this.listBlobs();
+    const over = existing.length + incoming - MAX_BLOBS;
+    if (over <= 0) return [];
+    const evicted = [];
+    let count = existing.length;
+    for (const blob of existing) {
+      if (count <= 1) break; // never delete the only copy of anything
+      try {
+        fs.rmSync(path.join(this.dir, BLOB_DIR, blob.hash.slice(0, 2), blob.hash), { force: true });
+        evicted.push(blob.hash);
+        count -= 1;
+      } catch {
+        /* leave it; the caller will see the count did not drop */
+      }
+      if (evicted.length >= over) break;
+    }
+    if (evicted.length > 0) this.warn(BLOB_DIR, `evicted ${evicted.length} blob(s) to stay within ${MAX_BLOBS}`);
+    return evicted;
+  }
+
+  /** Read the hash -> owner map. A missing or corrupt index reads as empty rather than taking the relay down. */
+  readBlobIndex() {
+    if (!this.enabled) return {};
+    try {
+      const raw = fs.readFileSync(path.join(this.dir, BLOB_DIR, BLOB_INDEX_FILE), 'utf8');
+      const parsed = JSON.parse(raw);
+      return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+
+  /** Atomically replace the index. Best-effort: a failure is warned about, never thrown at the caller. */
+  writeBlobIndex(index) {
+    if (!this.enabled) return false;
+    const file = path.join(this.dir, BLOB_DIR, BLOB_INDEX_FILE);
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      const tmp = `${file}.tmp-${process.pid}-${this._now()}`;
+      fs.writeFileSync(tmp, `${JSON.stringify(index)}\n`, 'utf8');
+      fs.renameSync(tmp, file);
+      return true;
+    } catch (error) {
+      this.warn(BLOB_DIR, `blob index write failed: ${error?.message ?? String(error)}`);
+      return false;
+    }
+  }
+
+  /** `<state>/blobs/<aa>/<sha256>`, or `null` when persistence is off or the hash is not a sha256. */
+  blobFile(hash) {
+    if (!this.enabled) return null;
+    if (typeof hash !== 'string' || !/^[0-9a-f]{64}$/.test(hash)) return null;
+    return path.join(this.dir, BLOB_DIR, hash.slice(0, 2), hash);
+  }
+
   /** Redacted view for `/healthz` — never contains tokens. */
   describe() {
+    const blobs = this.listBlobs();
     return {
       enabled: this.enabled,
       dir: this.dir,
@@ -261,6 +505,11 @@ export class Persistence {
       devices_missing: this.devicesMissing,
       ledger_lines_read: this.ledgerLinesRead,
       ledger_lines_skipped: this.ledgerLinesSkipped,
+      /** v1.0.7: the fleet sync channel's occupancy, reported as counts and bytes — never contents. */
+      blobs: blobs.length,
+      blob_bytes: blobs.reduce((sum, b) => sum + b.bytes, 0),
+      blobs_limit: MAX_BLOBS,
+      blob_bytes_limit: MAX_BLOB_BYTES,
       /**
        * v0.6.2. `degraded: true` means the relay is answering requests while failing to record them,
        * which is the one relay failure that looks exactly like health from the outside.

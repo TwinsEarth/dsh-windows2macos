@@ -2,6 +2,58 @@
 
 All notable changes to this project are documented here.
 
+## [1.0.6] — 2026-10-17
+
+**DSH-GPW now ships *findable*: installed with the package, present in the plugin list, and off until an operator
+turns it on.**
+
+### What v1.0.5 got wrong
+
+It shipped the subpath export `@twinsearth/w2m-dsh-plugin/gpw` and no config row. **A plugin the composed tree does
+not mention is a plugin the plugin manager cannot list** -- so "enable it manually" had **nothing to click**, and
+the only way in was hand-editing a profile patch.
+
+**An optional component nobody can find is not optional, it is absent.** That is the same distinction as the seven
+written-but-unreachable modules in this repository, seen from the user's side instead of the code's.
+
+### The shape that fixes it
+
+The package's own bundle patch now carries a second entry:
+
+    - id: dsh-gpw
+      name: '@twinsearth/w2m-dsh-plugin/gpw'
+      disabled: true
+      config:
+        maxPerWindow: 10
+        windowMs: 60000
+        minGapMs: 3000
+
+**`disabled: true` is the load-bearing field.** The row exists, so the component appears; the toggle is off, so
+nothing answers `approval/request`; and **flipping it in the UI is the whole enablement step** -- no file edit, no
+restart of anything but the client.
+
+**It stays in the same `insert:` list as the w2m row**, and that is still the correct form: this is an insert
+because no earlier layer creates a `dsh-gpw` row. (A *bare* `- id:` patch aimed at a nonexistent row is skipped
+silently -- the failure recorded in this file and in TROUBLESHOOTING 3.2.)
+
+### The distinction the two releases now make
+
+| | v1.0.5 | v1.0.6 |
+|---|---|---|
+| Installs with the package | yes | yes |
+| Appears in the plugin manager | **no** | **yes** |
+| Enabled by default | no | no |
+| How you turn it on | hand-edit a profile patch | **click its toggle** |
+
+**Not verified: that the toggle actually flips it on and that it then intercepts.** That needs a live host. The
+observable evidence is its own startup line followed by its counted line --
+
+    approval-ratelimit: active -- at most 10 auto-approvals per 60 s, at least 3000 ms apart, process-wide
+    approval-ratelimit: N auto-approved, M deferred to the human
+
+-- **because without the second line, "mounted and working" and "mounted and doing nothing" are the same picture**,
+which is the failure this watchdog's own counters exist to prevent.
+
 ## [1.0.5] — 2026-10-17
 
 **DSH-GPW ships as an optional sub-plugin, and the reason it never activated is fixed.**
