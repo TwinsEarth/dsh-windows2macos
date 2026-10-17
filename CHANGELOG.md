@@ -2,6 +2,49 @@
 
 All notable changes to this project are documented here.
 
+## [1.0.13] — 2026-10-17
+
+**Concurrent publishing is verified safe on one relay, and the reason it is safe is stated so a future change can
+falsify it.**
+
+### What v1.0.12 recorded as unverified, and is now verified
+
+v1.0.12 closed the end-to-end gap **one machine at a time** and wrote concurrency down as open, with a specific
+worry: the blob store keeps its ownership index as a read-modify-write, and a lost update there would leave **a stored
+blob with no owner** -- readable by nobody, including the fleet that wrote it.
+
+### Why it turned out to be safe, stated as a property rather than a hope
+
+`RabbitState.putFleetBlob` and `Persistence.putBlob` **do no awaiting**: every filesystem call in that path is the
+synchronous `fs` API. The request handler awaits the body first, and after that the whole read-mutate-write runs to
+completion inside one Node job. **On a single-threaded event loop that makes each publish atomic with respect to
+every other request on the same relay process.**
+
+**That reasoning is the thing the tests falsify rather than assume.** If any part of that path becomes asynchronous,
+they fail with a lost index entry -- which is much better than finding it in a fleet.
+
+### What is verified
+
+Four tests in `test/fleet-concurrency.test.mjs`:
+
+* **ten publishes fired together** leave **ten** ownership entries, and every blob still readable and still owned -- a
+  lost update would show up as a 404;
+* the **latest pointer names a document that was actually written** (not a torn value) and that document resolves;
+* **two fleets publishing at the same moment stay separate** -- each fleet's pointer names its own document and the
+  index attributes each blob to the right fleet;
+* the pointer is **stable once the writers stop** -- reading it twice gives the same hash and timestamp.
+
+Full suite **2378 tests in 92 files, 2364 pass, 0 fail, 14 skip**. Pre-flight **GREEN, 15 of 15 checks**.
+
+### The limit of this claim, which matters more than the claim
+
+**One relay process.** The design is one relay per fleet. **Two processes sharing one state directory would need real
+file locking**, and nothing here provides it. "Concurrency is tested" must not be read as "any topology is safe".
+
+Also still unverified: **two machines merging while a third publishes.** The merge itself is a pure read of local bytes
+plus one fetched blob, so it has no shared state to corrupt -- but that is reasoning, not a test, and it is recorded
+as such.
+
 ## [1.0.12] — 2026-10-17
 
 **The five fleet-memory actions are verified end to end, against a real relay, a real profile and a real
