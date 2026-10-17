@@ -113,7 +113,7 @@ const CLIENT_PACKAGE = '@twinsearth/w2m-dsh-plugin';
 const TARGET_ROUTE_PATH = '/api/w2m/target';
 
 /**
- * The eleven tools the plugin registers; the exact set, because "some tools" is not the contract.
+ * The twelve tools the plugin registers; the exact set, because "some tools" is not the contract.
  *
  * Sorted, so a **missing** name and a **renamed** name fail differently in the diff. The list had drifted: it held
  * nine while the plugin registered eleven, and the compatibility gate (which mounts the packed artifact in a real

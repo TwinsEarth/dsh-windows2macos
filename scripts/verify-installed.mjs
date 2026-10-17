@@ -56,17 +56,18 @@ if (warnings.length > 0) {
 }
 
 const expected = [
-  'w2m_approvals',
-  'w2m_council',
   'w2m_devices',
-  'w2m_history',
-  'w2m_report',
   'w2m_run',
-  'w2m_stats',
+  'w2m_wait',
+  'w2m_report',
   'w2m_status',
   'w2m_update',
-  'w2m_wait',
+  'w2m_history',
+  'w2m_stats',
   'w2m_memory',
+  'w2m_approvals',
+  'w2m_chat',
+  'w2m_council',
 ];
 const ok = registered.length === expected.length && expected.every((e) => names.includes(e));
 process.stdout.write(

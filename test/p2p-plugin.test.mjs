@@ -720,7 +720,7 @@ describe('v0.4.0 config: stunServers', () => {
     await withoutP2pEnvironment(async () => {
       const { ctx, tools } = makeCtx();
       await applyPinned(ctx, bundled);
-      assert.equal(tools.size, 11);
+      assert.equal(tools.size, 12);
     });
   });
 

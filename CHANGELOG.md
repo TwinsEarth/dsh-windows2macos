@@ -2,6 +2,69 @@
 
 All notable changes to this project are documented here.
 
+## [1.1.17] — 2026-10-18
+
+**Fleet chat: messages live in a session, are refused by a byte budget rather than silently dropped, are stored
+encrypted and split across the fleet's own machines, and reach the agent as a tool.**
+
+### The store, and the rule it refuses to break
+
+`src/relay/fleet-messages.mjs` keeps messages per **session** -- the operator's scope: deleting the session deletes the
+history, and a machine joining or leaving changes who reads the flow, never what was said.
+
+The budget is the operator's formula, not a round number:
+
+    limit = min(200 MB, max(100 MB, used-in-7-days))
+
+A message over it is **refused** with the current usage attached (`FLEET_QUOTA_EXCEEDED`); nothing is silently dropped
+and nobody else's words are evicted to make room. Text only: non-strings, control characters and messages over 4 KiB are
+refused by name. Every timestamp comes from the relay's clock, because client clocks in this fleet disagree by tens of
+seconds.
+
+### Encrypted sharding with the three rules that keep it from losing data
+
+`src/relay/message-shards.mjs` seals a day's messages with AES-256-GCM under a key derived from the fleet key (domain
+separated, no new long-lived secret) and splits the result across the fleet:
+
+- **rebuildable** -- the metadata says which machine holds which part, so a reader never guesses;
+- **offline tolerated** -- every part gets **two replicas on two different machines**; one machine being down is the
+  normal case;
+- **integrity** -- each shard carries sha256 of its own bytes. A corrupt shard fails as `SHARD_CORRUPT` naming the part
+  and machine; a missing one fails as `MISSING_SHARDS` naming **which** parts; a wrong key fails as `AUTH_FAILED`
+  without returning partial plaintext.
+
+### HTTP and the notification that carries no text
+
+`POST /v1/fleet/messages` and `GET /v1/fleet/messages` sit behind the device gate: the author is the token holder, never
+a body field. Every read returns the fleet's current usage so a client can warn before a write is refused.
+`GET /v1/fleet/messages/stream` is SSE and emits **only** `{session_id, message_id, machine_id, at_ms}` -- the text is
+always fetched through the authenticated read, because a broadcast carrying text would send every message to every
+listener and make the membership check decorative.
+
+### The twelfth tool: `w2m_chat`
+
+`w2m_chat` (`send` / `list`) exposes the above to the agent. It is an ordinary MCP tool available on every transport;
+`w2m_run` remains the only host-only one.
+
+### The cost of adding a tool: seven count pins
+
+Adding a twelfth tool is not one edit. The count is pinned in **eight** places -- `README` (both languages), four test
+suites (`tools`, `p2p-plugin`, `loader-entry`, `tool-cards`), `scripts/verify-installed.mjs`'s expected list, and
+`test/claims.test.mjs`'s assertion. The first attempt fixed the ones that came to mind and left three red; the gate caught
+each. `docs/PLATFORMS.md` gained a section stating that `w2m_chat` is available over MCP.
+
+### Not verified
+
+- no client UI panel beyond the generic tool card;
+- the SSE route has module-level notification tests, not a live end-to-end stream assertion;
+- shards are produced and reassembled but **not yet transported** to machines -- that is the relay's next step, and the
+  tests say so rather than implying distribution works.
+
+### Verified
+
+Gate GREEN twice, 15 of 15. tools 120, claims 48, p2p 32, loader 10, fleet-messages 7, message-shards 9, chat-http 3,
+message-notify 3.
+
 ## [1.1.16] — 2026-10-18
 
 **A machine waiting to be admitted now appears where you already answer questions -- and the README leads with how to

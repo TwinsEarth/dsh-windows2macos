@@ -81,3 +81,25 @@ So the split is:
 
 Marking the last two rows "prepared" rather than "done" is deliberate: a manifest that exists is not a listing, and
 this project has already shipped a "mechanism with no caller" seven times.
+
+## Fleet chat over MCP (\w2m_chat\)
+
+\w2m_chat\ is available on **every** transport described above, because it is an ordinary MCP tool like the rest --
+nothing about it depends on the DSH host, and it is not on the deliberately-host-only list (that list contains
+\w2m_run\ only, for the reason given at the top of this document).
+
+What it does, and what it deliberately does not:
+
+- \ction: "send"\ posts plain text (≤ 4 KiB, UTF-8, no control characters) to the relay at
+  \POST /v1/fleet/messages\. The author is the **device token holder**; a body field cannot name a different machine.
+- \ction: "list"\ reads one session's flow at \GET /v1/fleet/messages?session_id=…\ and returns the messages together
+  with the fleet's current byte usage, so a client can warn before the quota refuses a write.
+- A refused write is returned with its named code (\FLEET_QUOTA_EXCEEDED\, \MESSAGE_TOO_LARGE\, \NOT_TEXT\,
+  \EMPTY_TEXT\) -- the tool does not flatten them into "failed".
+- **No push inside MCP.** The \
+ew_message\ notification is an SSE stream
+  (\GET /v1/fleet/messages/stream\, event id only, never the text); an MCP client that cannot hold a stream polls
+  \ction: "list"\ with \since_ms\. The stream is a hint; the text always comes back through the authenticated read.
+
+Encryption and sharding are server-side: history is sealed with AES-256-GCM under a key derived from the fleet key and
+split across the fleet's machines with two replicas per part. No client sees another machine's shard bodies.

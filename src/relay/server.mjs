@@ -22,6 +22,7 @@ import {
   RabbitState,
   rfc3339,
 } from './state.mjs';
+import { createFleetMessages } from './fleet-messages.mjs';
 import { createJoinChallenges } from './join-challenge.mjs';
 import { createAdmission } from './admission.mjs';
 import { Persistence } from './persistence.mjs';
@@ -1035,6 +1036,75 @@ export class RelayServer {
       });
       if (result.ok !== true) throw new ProtocolError('BAD_REQUEST', 'vote refused: ' + result.code, result);
       return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ...result });
+    }
+
+    /* ---- v1.1.17: fleet chat ---- */
+    //
+    // Both endpoints sit AFTER the device gate on purpose: a message must be attributable to a paired machine, and
+    // "who said this" is exactly the machine_id the token resolves to -- never a body field, which would let one machine
+    // speak as another. The refusal codes from the store are passed through unchanged (FLEET_QUOTA_EXCEEDED included)
+    // because a caller that cannot tell "too big" from "over quota" from "not text" cannot tell the operator what to do.
+    this.fleetMessages ??= createFleetMessages({ now: () => this.state.nowMs() });
+
+    if (method === 'POST' && path === '/v1/fleet/messages') {
+      const body = takeJson();
+      const posted = this.fleetMessages.post({
+        session_id: body.session_id,
+        fleet_id: typeof body.fleet_id === 'string' ? body.fleet_id : null,
+        machine_id: device.machine_id,
+        text: body.text,
+      });
+      if (posted.ok !== true) {
+        throw new ProtocolError('BAD_REQUEST', 'message refused: ' + posted.code, { code: posted.code, ...(posted.detail ?? {}) });
+      }
+      return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), message: posted.message });
+    }
+
+    if (method === 'GET' && path === '/v1/fleet/messages/stream') {
+      /**
+       * v1.1.17: a notification channel, not a message channel.
+       *
+       * The event carries the id and the session -- never the text -- so a client that connects learns "something was
+       * said" and then fetches it through GET /v1/fleet/messages, which is where membership is actually checked. A
+       * broadcast carrying text would hand every message to every connected listener and make the check decorative.
+       *
+       * The stream sits behind the device gate: an unpaired client cannot listen.
+       */
+      const sessionId = url.searchParams.get('session_id');
+      res.writeHead(200, {
+        'content-type': 'text/event-stream; charset=utf-8',
+        'cache-control': 'no-store',
+        connection: 'keep-alive',
+        'x-accel-buffering': 'no',
+      });
+      res.write(': connected\n\n');
+      if (typeof res.flushHeaders === 'function') res.flushHeaders();
+      const keepalive = setInterval(() => { try { res.write(': keepalive\n\n'); } catch { /* closed */ } }, 15_000);
+      if (typeof keepalive.unref === 'function') keepalive.unref();
+      const unsubscribe = this.fleetMessages.subscribe(sessionId, (event) => {
+        try {
+          res.write('event: new_message\ndata: ' + JSON.stringify(event) + '\n\n');
+        } catch { /* the reader went away; close() below cleans up */ }
+      });
+      const done = () => { clearInterval(keepalive); unsubscribe(); try { res.end(); } catch { /* already closed */ } };
+      req.on('close', done);
+      return undefined;
+    }
+
+    if (method === 'GET' && path === '/v1/fleet/messages') {
+      const sinceRaw = url.searchParams.get('since_ms');
+      const limitRaw = url.searchParams.get('limit');
+      const listed = this.fleetMessages.list({
+        session_id: url.searchParams.get('session_id') ?? '',
+        since_ms: sinceRaw === null ? null : Number(sinceRaw),
+        limit: limitRaw === null ? 50 : Number(limitRaw),
+      });
+      return sendJson(res, 200, {
+        protocol_version: PROTOCOL_VERSION,
+        rabbit_time: this.state.nowIso(),
+        ...listed,
+        usage: this.fleetMessages.usage(),   // shown with every read so a client can warn before the quota refuses a post
+      });
     }
 
     throw new ProtocolError('NOT_FOUND', `no route for ${method} ${path}`, { method, path });

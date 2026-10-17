@@ -112,7 +112,7 @@ async function register(config = {}) {
 describe('tool cards: the contract the shipped runtime actually implements', () => {
   it('gives every tool a presentCall that yields a generic card with a title', async () => {
     const tools = await register({ stateDir: makeProfile() });
-    assert.equal(tools.size, 11, 'the eleven tools are the surface this contract covers');
+    assert.equal(tools.size, 12, 'the twelve tools are the surface this contract covers');
     for (const [name, tool] of tools) {
       assert.equal(typeof tool.presentCall, 'function', `${name} needs a presentCall`);
       const card = tool.presentCall({});
@@ -426,7 +426,7 @@ describe('exposure boundary: a tool may not hold a credential, an allow-list or 
 });
 
 describe('exposure boundary: no tool result may carry a credential', () => {
-  it('returns none of the four credentials from any of the eleven tools, and never puts one in a body', async () => {
+  it('returns none of the four credentials from any of the twelve tools, and never puts one in a body', async () => {
     const fetchStub = installFetch([
       { method: 'GET', path: '/healthz', body: CANARY_HEALTHZ },
       { method: 'GET', path: '/v1/devices', body: CANARY_FLEET },

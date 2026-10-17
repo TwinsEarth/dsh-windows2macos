@@ -84,3 +84,13 @@ describe('the byte budget is the operator formula', () => {
     assert.equal(chat.post(msg('b'.repeat(80))).ok, true);
   });
 });
+
+describe('notifications say nothing about content', () => {
+  it('a message that is refused produces no notification at all', () => {
+    const chat = createFleetMessages({ quota24hBytes: 10, hardCapBytes: 10 });
+    const events = [];
+    chat.subscribe('s-1', (e) => events.push(e));
+    chat.post({ session_id: 's-1', machine_id: 'm-1', text: 'x'.repeat(20) });
+    assert.equal(events.length, 0, 'a refused write is not a new message');
+  });
+});

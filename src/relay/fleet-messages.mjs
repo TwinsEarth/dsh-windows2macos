@@ -46,6 +46,12 @@ export function createFleetMessages(options = {}) {
   const retentionDays = Number.isInteger(options.retentionDays) ? options.retentionDays : RETENTION_DAYS;
   const maxMessageBytes = Number.isInteger(options.maxMessageBytes) ? options.maxMessageBytes : MAX_MESSAGE_BYTES;
 
+  /**
+   * Notification subscribers. An event carries NO text: the notification says "there is something new to read", and the
+   * reader fetches the text through the endpoint that already authenticates them. Putting the text in a broadcast would
+   * send every message to every connected listener regardless of session membership.
+   */
+  const listeners = new Set();
   /** session_id -> [{ message_id, session_id, machine_id, text, at_ms, bytes }] */
   const sessions = new Map();
   let seq = 0;
@@ -82,6 +88,9 @@ export function createFleetMessages(options = {}) {
     const text = input.text;
     if (text.trim() === '') return { ok: false, code: 'EMPTY_TEXT' };
     // Reject control characters (except tab/newline): "plain text" is a contract, not a preference.
+    // Control characters are the thing being rejected here, so the rule that forbids them in a pattern
+    // does not apply -- the escape IS the contract.
+    // eslint-disable-next-line no-control-regex
     if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/.test(text)) return { ok: false, code: 'NOT_TEXT' };
     const bytes = Buffer.byteLength(text, 'utf8');
     if (bytes > maxMessageBytes) return { ok: false, code: 'MESSAGE_TOO_LARGE', detail: { bytes, maxBytes: maxMessageBytes } };
@@ -104,6 +113,11 @@ export function createFleetMessages(options = {}) {
     };
     if (!sessions.has(sessionId)) sessions.set(sessionId, []);
     sessions.get(sessionId).push(message);
+    for (const listener of listeners) {
+      if (listener.sessionId !== null && listener.sessionId !== sessionId) continue;
+      try { listener.fn({ session_id: sessionId, message_id: message.message_id, machine_id: message.machine_id, at_ms: message.at_ms }); }
+      catch { /* a dead listener must not fail the write */ }
+    }
     return { ok: true, message };
   }
 
@@ -120,5 +134,12 @@ export function createFleetMessages(options = {}) {
     return sessions.delete(sessionId);
   }
 
-  return { post, list, usage, limitBytes, deleteSession, _sessions: sessions };
+  /** @param {string|null} sessionId null subscribes to every session; returns the unsubscribe function. */
+  function subscribe(sessionId, fn) {
+    const listener = { sessionId: typeof sessionId === 'string' && sessionId !== '' ? sessionId : null, fn };
+    listeners.add(listener);
+    return () => listeners.delete(listener);
+  }
+
+  return { post, list, usage, limitBytes, deleteSession, subscribe, _sessions: sessions };
 }

@@ -283,13 +283,13 @@ function finalTask(overrides = {}) {
 // ---------------------------------------------------------------------------------------------
 
 describe('registration shape', () => {
-  it('declares the tools service and registers exactly eleven tools', async () => {
+  it('declares the tools service and registers exactly twelve tools', async () => {
     assert.deepEqual(plugin.inject, ['tools']);
     const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
-    assert.equal(tools.size, 11);
+    assert.equal(tools.size, 12);
     assert.deepEqual(
       [...tools.keys()].sort(),
-      ['w2m_approvals', 'w2m_council', 'w2m_devices', 'w2m_history', 'w2m_memory', 'w2m_report', 'w2m_run', 'w2m_stats', 'w2m_status', 'w2m_update', 'w2m_wait'],
+      ['w2m_approvals', 'w2m_chat', 'w2m_council', 'w2m_devices', 'w2m_history', 'w2m_memory', 'w2m_report', 'w2m_run', 'w2m_stats', 'w2m_status', 'w2m_update', 'w2m_wait'],
     );
   });
 
@@ -1961,7 +1961,7 @@ describe('bounds and cancellation', () => {
     // earlier test happened to populate the cache with.
     plugin.resetDefineToolCacheForTests();
     const { tools, warnings } = await register({ rabbitUrl: RABBIT });
-    assert.equal(tools.size, 11, 'the plugin must register all eleven tools on either path');
+    assert.equal(tools.size, 12, 'the plugin must register all twelve tools on either path');
 
     /**
      * Match the warning this test is about, rather than counting warnings.

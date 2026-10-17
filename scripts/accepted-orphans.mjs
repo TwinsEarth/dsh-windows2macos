@@ -50,6 +50,11 @@ export const REASON = Object.freeze({
  */
 export const ACCEPTED_ORPHANS = Object.freeze([
   {
+    file: 'src/relay/message-shards.mjs',
+    reason: REASON.LIBRARY,
+    why: 'seals a day of chat with AES-256-GCM and splits it into replicated shards; the relay serves messages today but does not yet transport these shards to machines',
+    removedBy: 'wiring the relay to write shards to member machines and read them back on demand -- the transport step this file was designed for',
+  },  {
     file: 'src/agent/exit-channel.mjs',
     reason: REASON.LIBRARY,
     why: 'encodes a report into a sequence of exit codes; called by whoever needs to send one, and nothing in this repository does yet',

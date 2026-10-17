@@ -14,7 +14,7 @@ English | [中文](#中文说明)
 
 ## Install
 
-Five routes in. They all end with **11 tools registered** in your agent. Pick one.
+Five routes in. They all end with **12 tools registered** in your agent. Pick one.
 
 ### 1. DSH plugin (recommended — zero configuration)
 
@@ -66,18 +66,18 @@ The manifests live in [`.claude-plugin/`](.claude-plugin/) and are version-locke
 # copy this block into your own codex/mcp-servers.toml
 [mcp_servers.w2m]
 command = "npx"
-args = ["-y", "@twinsearth/w2m-dsh-plugin@1.1.16", "w2m-mcp"]
+args = ["-y", "@twinsearth/w2m-dsh-plugin@1.1.17", "w2m-mcp"]
 ```
 
 ### 5. Verified release tarball (offline)
 
-From the `v1.1.16` release page download **both** files — `twinsearth-w2m-dsh-plugin-1.1.16.tgz` and `SHA256SUMS` —
+From the `v1.1.17` release page download **both** files — `twinsearth-w2m-dsh-plugin-1.1.17.tgz` and `SHA256SUMS` —
 then:
 
 ```bash
-curl -LO https://github.com/TwinsEarth/dsh-windows2macos/releases/download/v1.1.16/twinsearth-w2m-dsh-plugin-1.1.16.tgz
+curl -LO https://github.com/TwinsEarth/dsh-windows2macos/releases/download/v1.1.17/twinsearth-w2m-dsh-plugin-1.1.17.tgz
 sha256sum -c SHA256SUMS          # verify before installing, always
-npm install -g ./twinsearth-w2m-dsh-plugin-1.1.16.tgz
+npm install -g ./twinsearth-w2m-dsh-plugin-1.1.17.tgz
 ```
 
 Every release carries `SHA256SUMS` for exactly this reason. If a release is missing it, do not install that release.
@@ -114,7 +114,7 @@ hand-maintained host list.
 ### Tools
 
 `w2m_status` · `w2m_devices` · `w2m_run` · `w2m_wait` · `w2m_history` · `w2m_stats` · `w2m_report` ·
-`w2m_memory` · `w2m_approvals` · `w2m_council` · `w2m_update`
+`w2m_memory` · `w2m_approvals` · `w2m_council` · `w2m_chat` · `w2m_update`
 
 ### Environment a dispatched command receives (1.1.15+)
 
@@ -217,7 +217,7 @@ MIT.
 
 ### 安装
 
-五种方式，最终都会在你的 agent 里注册 **11 tools registered**。任选其一。
+五种方式，最终都会在你的 agent 里注册 **12 tools registered**。任选其一。
 
 #### 1. DSH 插件（推荐，零配置）
 
@@ -267,17 +267,17 @@ w2m-mcp --help
 # 把这段复制进你自己的 codex/mcp-servers.toml
 [mcp_servers.w2m]
 command = "npx"
-args = ["-y", "@twinsearth/w2m-dsh-plugin@1.1.16", "w2m-mcp"]
+args = ["-y", "@twinsearth/w2m-dsh-plugin@1.1.17", "w2m-mcp"]
 ```
 
 #### 5. 校验过的发布包（离线）
 
-从 `v1.1.16` 的 release 页面下载**两个**文件 —— `twinsearth-w2m-dsh-plugin-1.1.16.tgz` 与 `SHA256SUMS` —— 然后：
+从 `v1.1.17` 的 release 页面下载**两个**文件 —— `twinsearth-w2m-dsh-plugin-1.1.17.tgz` 与 `SHA256SUMS` —— 然后：
 
 ```bash
-curl -LO https://github.com/TwinsEarth/dsh-windows2macos/releases/download/v1.1.16/twinsearth-w2m-dsh-plugin-1.1.16.tgz
+curl -LO https://github.com/TwinsEarth/dsh-windows2macos/releases/download/v1.1.17/twinsearth-w2m-dsh-plugin-1.1.17.tgz
 sha256sum -c SHA256SUMS          # 安装前务必校验
-npm install -g ./twinsearth-w2m-dsh-plugin-1.1.16.tgz
+npm install -g ./twinsearth-w2m-dsh-plugin-1.1.17.tgz
 ```
 
 每个 release 都带 `SHA256SUMS` 正是为了这一步。若某个 release 缺少它，**不要安装该版本**。
@@ -309,7 +309,7 @@ w2m_wait task_id="..."
 ### 工具
 
 `w2m_status` · `w2m_devices` · `w2m_run` · `w2m_wait` · `w2m_history` · `w2m_stats` · `w2m_report` ·
-`w2m_memory` · `w2m_approvals` · `w2m_council` · `w2m_update`
+`w2m_memory` · `w2m_approvals` · `w2m_council` · `w2m_chat` · `w2m_update`
 
 ### 被派发命令会收到的环境变量（1.1.15+）
 

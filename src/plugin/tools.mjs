@@ -5228,7 +5228,7 @@ export async function apply(ctx, config = {}) {
          *         at Object.apply (src/plugin/tools.mjs:5025)
          *
          * **The throw happens while the tool is being defined, so the whole fiber fails to mount** -- the client
-         * reports the package as `异常`, none of the eleven tools appear, and **the message is only visible if
+         * reports the package as `异常`, none of the twelve tools appear, and **the message is only visible if
          * something gets far enough to print it.** This parameter has had that shape since v0.41.0, so the
          * failure dates from then.
          *
@@ -6248,6 +6248,50 @@ export async function apply(ctx, config = {}) {
           ? 'no actor_level was supplied, so may_act is reported as if the level were 0: the queue is visible, but whether you may answer any of it is not known'
           : 'may_act reflects the actor_level supplied',
       });
+    },
+  }));
+
+  /**
+   * v1.1.17: fleet chat, one session at a time. The text never travels over the notification stream -- this tool reads
+   * it through the endpoint that checks who is asking, and the author of a sent message is the token holder.
+   */
+  ctx.tools.register(defineTool({
+    name: 'w2m_chat',
+    description:
+      'Fleet chat for one session: send plain text to the machines in this conversation, or read what was said. ' +
+      'A refused write comes back with its named reason (quota, size, or non-text) rather than as a bare failure.',
+    parameters: {
+      action: { type: 'string', enum: ['send', 'list'], description: 'send posts text; list reads the flow (default).', default: 'list' },
+      session_id: { type: 'string', description: 'Which conversation. Chat is scoped to a session, not a machine.' },
+      text: { type: 'string', description: 'The message for send. Plain text, UTF-8, at most 4 KiB.' },
+      since_ms: { type: 'number', description: 'For list: only messages newer than this relay timestamp.' },
+      limit: { type: 'number', description: 'For list: how many of the newest messages (default 50).' },
+    },
+    output: jsonOutput,
+    presentCall: (args) => ({ card: 'generic', title: 'w2m chat ' + (typeof args?.action === 'string' ? args.action : 'list'), kind: args?.action === 'send' ? 'write' : 'read', rawInput: {} }),
+    async execute(args, exec) {
+      throwIfAborted(exec?.signal);
+      const action = typeof args?.action === 'string' ? args.action : 'list';
+      const sessionId = typeof args?.session_id === 'string' ? args.session_id.trim() : '';
+      if (sessionId === '') throw new W2MError('W2M_CHAT_SESSION', 'W2M_CHAT_SESSION: session_id is required', { hint: 'chat is scoped to a conversation' });
+      const device = await readDevice(cfg);
+      const rabbitUrl = cfg.rabbitUrl ?? null;
+      if (rabbitUrl === null) throw new W2MError('W2M_NO_RELAY', 'W2M_NO_RELAY: no relay is configured, so chat cannot be reached', { hint: 'set rabbitUrl in the profile patch' });
+      const token = requireToken(device);
+      if (action === 'send') {
+        const posted = await request({ rabbitUrl, token, signal: exec?.signal, method: 'POST', pathname: '/v1/fleet/messages', body: { session_id: sessionId, text: typeof args?.text === 'string' ? args.text : '' } });
+        if (posted?.ok !== true) {
+          const code = posted?.json?.error?.code ?? posted?.error?.code ?? 'W2M_CHAT_SEND';
+          throw new W2MError('W2M_CHAT_SEND', code + ': the message was refused', { reason_code: code, hint: 'quota, size and non-text each need a different answer' });
+        }
+        return JSON.stringify({ ok: true, action, message: posted.json?.message ?? null });
+      }
+      const query = { session_id: sessionId };
+      if (Number.isFinite(args?.since_ms)) query.since_ms = String(args.since_ms);
+      if (Number.isInteger(args?.limit)) query.limit = String(args.limit);
+      const listed = await request({ rabbitUrl, token, signal: exec?.signal, method: 'GET', pathname: '/v1/fleet/messages', query });
+      if (listed?.ok !== true) throw new W2MError('W2M_CHAT_LIST', 'W2M_CHAT_LIST: the relay refused the read', { hint: 'check the relay and this machine token' });
+      return JSON.stringify({ ok: true, action, session_id: sessionId, messages: listed.json?.messages ?? [], count: listed.json?.count ?? 0, usage: listed.json?.usage ?? null });
     },
   }));
 
