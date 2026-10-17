@@ -1,0 +1,29 @@
+{
+  "name": "twinsearth-w2m",
+  "owner": {
+    "name": "TwinsEarth"
+  },
+  "metadata": {
+    "description": "The w2m fleet plugins: one account, many machines, any of Windows, macOS or Linux.",
+    "version": "1.1.1"
+  },
+  "plugins": [
+    {
+      "name": "w2m-fleet",
+      "source": "./",
+      "description": "Read fleet state and dispatch commands across the machines registered to one account. Read-only MCP surface: the five exposed tools cannot change anything.",
+      "version": "1.1.1",
+      "author": {
+        "name": "TwinsEarth"
+      },
+      "homepage": "https://github.com/TwinsEarth/dsh-windows2macos",
+      "repository": "https://github.com/TwinsEarth/dsh-windows2macos",
+      "license": "MIT",
+      "keywords": [
+        "fleet",
+        "remote-execution",
+        "mcp"
+      ]
+    }
+  ]
+}

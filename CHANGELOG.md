@@ -2,6 +2,54 @@
 
 All notable changes to this project are documented here.
 
+## [1.1.1] — 2026-10-17
+
+**The fleet is now installable from Claude Code, Codex and OpenAI's plugin surface -- and the parts that still need a
+person are marked as needing one.**
+
+### One server, three manifests
+
+`bin/w2m-mcp.mjs` already answers both MCP eras (modern per-request `_meta`, and the legacy `initialize` handshake
+most deployed clients still speak) and exposes **five read-only tools**. Adapting to a platform is therefore a
+**manifest**, not a second implementation:
+
+* `.claude-plugin/plugin.json` — the Claude Code plugin manifest, with its own `mcpServers` entry.
+* `.claude-plugin/marketplace.json` — so this repository can be added **as** a marketplace.
+* `codex/mcp-servers.toml` — the block to append to `~/.codex/config.toml`, kept as a reviewable file rather than
+  prose in a document.
+* `docs/PLATFORMS.md` — the per-platform routes, and the exact state of each submission.
+* `w2m-mcp` is now a published **bin**, so a client can start the server without guessing a path.
+
+### The trap: two schemas, two different root variables
+
+The top-level `mcp.json` uses the agent-plugins schema's `${PLUGIN_ROOT}`. **Claude Code does not substitute that
+variable** -- it substitutes `${CLAUDE_PLUGIN_ROOT}`. Reusing the top-level file verbatim would ship a literal
+`${PLUGIN_ROOT}` string as the server's first argument, and the failure would present as *a missing server* rather
+than *a wrong variable name*.
+
+So the Claude Code manifest declares its own server entry, and `test/portable-plugins.test.mjs` refuses a manifest
+that uses the wrong variable, points at a file that is not in the package, or drifts from `package.json`'s version.
+
+### What is published, and what is not
+
+| Destination | State |
+|---|---|
+| npm package, GitHub release, `SHA256SUMS` | **published** |
+| Claude Code plugin + marketplace manifests | **shipped and tested** |
+| Codex configuration snippet | **shipped and tested** |
+| Pull request to `anthropics/claude-plugins-official` / `-community` / `claude-code` | **not done** |
+| Submission to OpenAI's plugin portal | **not done** |
+
+The last two require write access to repositories this project does not own; the release token is scoped to
+`TwinsEarth/dsh-windows2macos` and acting on a third-party repository is refused by design. A manifest that exists is
+not a listing, so it is not reported as one.
+
+### Verified
+
+New suite `test/portable-plugins.test.mjs`: the manifests parse, the version agrees across all four manifests and the
+package, the MCP bin exists, the Codex snippet pins the version being released, both manifests are in
+`package.json#files`, and `docs/PLATFORMS.md` names every platform it claims to.
+
 ## [1.1.0] — 2026-10-17
 
 **The direct path now works on runtimes whose OpenSSL has no BLAKE2s, and the compatibility gate that measures the real

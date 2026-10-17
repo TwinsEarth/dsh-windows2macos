@@ -1,0 +1,17 @@
+# Codex MCP configuration for the w2m fleet.
+#
+# This file is a **snippet, not a config**: it is the block to append to `~/.codex/config.toml`, kept here so the
+# arguments are reviewable and testable instead of living only in prose (docs/PLATFORMS.md).
+#
+# Why `npx -p ... w2m-mcp` and not a path: Codex runs on whichever machine the operator is sitting at, and the package
+# is published, so the same block works on Windows, macOS and Linux without an install step. The version is pinned
+# exactly -- a floating server is a moving target for a protocol the client negotiates at startup.
+#
+# The server is stdio and read-only by design: `w2m_run` is not among the tools it exposes, because handing fleet
+# execution rights to any process able to start an MCP server is a guard that only looks like one.
+
+[mcp_servers.w2m-fleet]
+command = "npx"
+args = ["-y", "-p", "@twinsearth/w2m-dsh-plugin@1.1.1", "w2m-mcp"]
+startup_timeout_sec = 20
+tool_timeout_sec = 60
