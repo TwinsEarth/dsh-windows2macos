@@ -2,6 +2,38 @@
 
 All notable changes to this project are documented here.
 
+## [1.1.19-beta.1] — 2026-10-18
+
+**A beta whose purpose is to prove the beta pipeline works.** It carries one product fix and nothing else, stated plainly
+so nobody installs it expecting the composer controls.
+
+### The one product change
+
+`plugin.json`'s description said "through **11** w2m_* tools" while the package registers **12** (w2m_chat arrived in
+1.1.17). That description is what the host's plugin page shows, so the page was advertising a surface it no longer had.
+Claims never caught it because they check the README's "N tools registered" line, not the manifest prose.
+
+### Why this release exists at all
+
+`.github/workflows/beta.yml` had never run. A workflow that has only been read is not a workflow that works, and the
+first time it matters should not be the day a real beta is needed. Publishing this beta exercises every part of it:
+
+- the version must be a prerelease (`X.Y.Z-beta.N`), or the run is refused;
+- the tag and `package.json` must agree, and the workflow bumps nothing itself;
+- it produces a GitHub **prerelease** (`prerelease: true`), so neither GitHub nor npm resolves it as `latest`;
+- it does **not** publish to npm — there is no `npm publish` line in that workflow;
+- it waits on the `beta-access` environment, which requires a reviewer.
+
+### Not in this beta
+
+The two composer controls (`w2m-chat`, `w2m-update`) that v1.1.19 proper is for. They are designed and their contracts
+are recorded; they are not written. A stable 1.1.19 will ship them, and it will be the release that goes to npm and
+GitHub Packages.
+
+### Verified
+
+portable-plugins 10/10, tools 122/122, claims: see the 1.1.19 stable entry when it lands.
+
 ## [1.1.18] — 2026-10-18
 
 **The developer declares this a STABLE release.** It ships the three-channel updater and the release plumbing that makes
