@@ -1,0 +1,139 @@
+# Beta channel: versions developers may try, and that npm users never receive.
+#
+# ## The policy this encodes (operator decision, 2026-10-18)
+#
+# 1. A bump is a **beta** by default, and a beta is **never published to npm**.
+# 2. npm receives a version only when the developer says, in so many words, that this one is a **stable** release.
+# 3. Trying a beta needs permission and a signed risk acknowledgment; the default install stays on `latest`.
+#
+# ## Why beta artifacts live here instead of on npm
+#
+# The reason rule 1 exists: an npm `latest` is an installer for thousands of machines, and a beta is not. A betas'
+# audience is a developer who has been given access and has accepted what "unstable" means. So a beta is a **GitHub
+# prerelease**: it is downloadable, it is checksummed, it is explicitly marked `prerelease: true` (so GitHub never calls
+# it `latest`), and it is **absent from npm entirely**.
+#
+# This workflow therefore does three things and deliberately not a fourth:
+#
+#   - refuses to run unless the version is a prerelease (`X.Y.Z-beta.N`);
+#   - refuses to run unless the manifest and the tag agree;
+#   - attaches the packed tarball and `SHA256SUMS` to a **prerelease**;
+#   - **does not publish to npm.** There is no `npm publish` line in this file, on purpose; removing the risk once is
+#     better than remembering not to take it.
+#
+# ## The permission half
+#
+# Access is controlled by a protected GitHub Environment (`beta-access`), which requires reviewers before this job can
+# start. That is the "申请权限" step: a human with authority grants the run. The risk acknowledgment is the readme section
+# linked from the release body, and installing a beta is documented as requiring it.
+
+name: Beta
+
+on:
+  push:
+    tags:
+      - 'v*-beta.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'The beta version already in package.json, for example 1.1.18-beta.1'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: beta-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish-beta:
+    name: attach the beta artifacts (never npm)
+    runs-on: ubuntu-latest
+    # The permission gate: this environment must be configured with required reviewers. An unprotected environment
+    # here would quietly turn rule 3 into a comment.
+    environment: beta-access
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'push' && github.ref || format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: The tag and the manifest must name the same beta version
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          manifest="$(node -p "require('./package.json').version")"
+          expected="${INPUT_VERSION:-}"
+          if [ -z "${expected}" ]; then expected="${GITHUB_REF_NAME#v}"; fi
+          echo "manifest: ${manifest}"
+          echo "expected: ${expected}"
+          if [ "${manifest}" != "${expected}" ]; then
+            echo "::error::package.json says ${manifest} but this run is for ${expected}. Bump the manifest, commit, tag that commit."
+            exit 1
+          fi
+          case "${manifest}" in
+            *-beta.*) ;;
+            *)
+              echo "::error::${manifest} is not a beta. A beta tag with a stable-looking version would reach testers under a name that reads as stable."
+              exit 1
+              ;;
+          esac
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: The suite must be green before anyone is offered the artifact
+        run: npm test --silent
+
+      - name: Pack the artifact and its checksum
+        run: |
+          set -euo pipefail
+          mkdir -p beta-out
+          npm pack --pack-destination beta-out
+          cd beta-out
+          sha256sum ./*.tgz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create the prerelease (marked prerelease, so it is never "latest")
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          cat > notes.md <<EOF
+          **Beta ${version} — not on npm, and not for production.**
+
+          This build exists for developers who have been granted \`beta-access\` and who accept that betas can fail in
+          ways stable releases do not. Installing it requires reading [SECURITY.md](../SECURITY.md) and is at your own
+          risk.
+
+          - \`latest\` (npm) is **unchanged** by this release.
+          - Stable releases only: npm receives a version when the developer declares it stable.
+          EOF
+          gh release create "v${version}" \
+            --prerelease \
+            --title "v${version} (beta)" \
+            --notes-file notes.md \
+            beta-out/*.tgz beta-out/SHA256SUMS
+
+      - name: Say what happened, and what did not
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          {
+            echo "### Beta \`${version}\` attached as a GitHub prerelease"
+            echo ""
+            echo "- npm was **not** touched"
+            echo "- \`latest\` did not move"
+            echo "- downloading requires \`beta-access\`; installing requires the risk acknowledgment"
+          } >> "${GITHUB_STEP_SUMMARY}"

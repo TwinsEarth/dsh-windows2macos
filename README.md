@@ -198,6 +198,27 @@ Linux, npm + GitHub release + checksums consistent, end-to-end fleet runs on a r
 
 ---
 
+## Release channels
+
+Three channels, and only one of them is what \
+pm install\ gives you.
+
+| Channel | Where it comes from | Who should use it |
+|---|---|---|
+| **stable** | npm \latest\ — a version the developer declared stable | everyone; this is the default install |
+| **beta** | a GitHub **prerelease** (tarball + \SHA256SUMS\), **never on npm** | developers granted \eta-access\ who accept that it can fail |
+| **latest build** | the newest of the two, whatever its channel | a developer who wants the newest code and knows the above |
+
+A bump is a **beta by default**. npm receives a version only when the developer says, in so many words, that this one is a
+stable release: a beta is published as a prerelease (so neither GitHub nor npm ever resolves it as \latest\), it is
+downloadable only after the \eta-access\ environment approves the run, and installing it requires reading
+[SECURITY.md](SECURITY.md) and accepting the risk.
+
+There is no \
+pm publish\ line in the beta workflow. That is deliberate — a channel cannot leak to the default install if
+the publication cannot happen at all.
+---
+
 ## Links
 
 - [CHANGELOG](CHANGELOG.md) — every version, including what it deliberately did **not** ship
@@ -372,6 +393,23 @@ CI 全绿、npm 与 GitHub 发布及校验和一致、在真实的 Linux/Mac/Win
 | 裁决总是 `partial` | 来自已下线机器的陈旧租约 | 1.1.2 已修：派发只对在线且未沉默的机器建租约 |
 | `P2P_PUNCH_FAILED` | NAT，或宿主密码学能力缺口 | 会自动降级到 relay 路径，结果不受影响 |
 
+### 发布通道（中文）
+
+三个通道，其中只有一个是你 \
+pm install\ 默认拿到的。
+
+| 通道 | 来源 | 适合谁 |
+|---|---|---|
+| **stable** | npm \latest\，开发者明确声明为稳定版 | 所有人；默认安装就是它 |
+| **beta** | GitHub **prerelease**（tarball + \SHA256SUMS\），**绝不进 npm** | 被授予 \eta-access\、且接受它可能失败的开发者 |
+| **最新构建** | 两者中版本较新的那个，不论通道 | 想要最新代码、并理解上述含义的开发者 |
+
+**默认的 bump 是 beta**。只有开发者明确说明"这次是稳定版"，npm 才会收到该版本：beta 以 prerelease 形式发布（因此
+GitHub 与 npm 都不会把它解析成 \latest\），只有在 \eta-access\ 环境审批通过后才能下载，安装前需阅读
+[SECURITY.md](SECURITY.md) 并自担风险。
+
+beta 工作流里**没有 \
+pm publish\ 这一行**，这是刻意的 —— 只要发布动作不可能发生，这个通道就不可能泄漏到默认安装。
 ### 链接
 
 - [CHANGELOG](CHANGELOG.md) —— 每个版本，包括它**故意没有**交付的内容

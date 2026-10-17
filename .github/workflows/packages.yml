@@ -1,0 +1,122 @@
+# GitHub Packages: the same artifact, on a second registry.
+#
+# ## Why a second registry exists here
+#
+# npm is the channel operators install from. GitHub Packages is the channel that lives next to the repository, inherits
+# GitHub's access control, and is reachable from inside CI and from GitHub-scoped tooling without a separate org-level
+# npm account. It is a mirror, not a second opinion: the version published here must be one already released.
+#
+# ## The constraint that shapes this file
+#
+# GitHub Packages requires the package scope to match the repository owner. This package is `@twinsearth/...` in a
+# `TwinsEarth/...` repository; the match is case-insensitive, so it resolves -- but it is an assumption that must be
+# **measured on the first run**, not trusted. That is why the job fails loudly if the publish returns anything other
+# than success, and why the summary states the exact ref it published.
+#
+# ## Why the registry is overridden on the command line
+#
+# `publishConfig.registry` in package.json would apply to **every** publish, including `release.yml`'s publish to npm,
+# and silently redirect the operator channel to GitHub Packages. The override therefore lives here, on this one command,
+# so the two publications cannot be confused for each other.
+#
+# ## What it publishes
+#
+# The version already in `package.json` -- and it refuses to publish a prerelease. A beta belongs to a GitHub
+# *prerelease* and must never reach either registry: an installer that resolves a beta as the newest stable is the
+# failure the channel policy exists to prevent.
+
+name: Packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'The stable version already in package.json (for example 1.1.17)'
+        required: true
+        type: string
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: packages-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish-to-github-packages:
+    name: mirror the release on GitHub Packages
+    runs-on: ubuntu-latest
+    # Only a stable release is mirrored: a prerelease is not a release an installer should ever resolve.
+    if: github.event_name == 'workflow_dispatch' || github.event.release.prerelease == false
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node for GitHub Packages
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@twinsearth'
+
+      - name: The version being mirrored must be the manifest's, and stable
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          manifest="$(node -p "require('./package.json').version")"
+          expected="${INPUT_VERSION:-}"
+          if [ -z "${expected}" ]; then expected="${GITHUB_REF_NAME#v}"; fi
+          echo "manifest: ${manifest}"
+          echo "expected: ${expected}"
+          if [ "${manifest}" != "${expected}" ]; then
+            echo "::error::package.json says ${manifest} but this run mirrors ${expected}. Mirror the released version, do not invent one."
+            exit 1
+          fi
+          case "${manifest}" in
+            *-*) echo "::error::${manifest} is a prerelease. Betas belong to a GitHub prerelease and must not reach a registry."; exit 1 ;;
+          esac
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Publish to GitHub Packages (registry overridden here, never in package.json)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "::error::GITHUB_TOKEN is empty; refusing to publish"
+            exit 1
+          fi
+          set +e
+          output="$(npm publish --registry=https://npm.pkg.github.com --no-git-checks 2>&1)"
+          status=$?
+          set -e
+          echo "${output}"
+          if [ "${status}" -ne 0 ]; then
+            # The likely causes are worth naming, because "it failed" sends the reader to the wrong place.
+            if grep -qi 'scope' <<<"${output}"; then
+              echo "::error::npm rejected the scope. GitHub Packages requires the package scope to match the repository owner (TwinsEarth); this package is @twinsearth/w2m-dsh-plugin."
+            elif grep -qi 'already exists' <<<"${output}"; then
+              echo "::error::this version is already on GitHub Packages. A mirror publishes each version once; bump or mirror a different release."
+            fi
+            exit "${status}"
+          fi
+
+      - name: Say exactly what was mirrored
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          {
+            echo "### \`@twinsearth/w2m-dsh-plugin@${version}\` mirrored to GitHub Packages"
+            echo ""
+            echo "- install: \`npm install @twinsearth/w2m-dsh-plugin@${version} --registry=https://npm.pkg.github.com\`"
+            echo "- npm (operator channel) was **not** touched by this workflow"
+            echo "- betas are never mirrored: they live as GitHub prereleases"
+          } >> "${GITHUB_STEP_SUMMARY}"
