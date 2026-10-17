@@ -2,6 +2,50 @@
 
 All notable changes to this project are documented here.
 
+## [1.1.2] — 2026-10-17
+
+**A dispatch that names no machines now goes to the machines that are online. The rule that decides "online" had been
+written three times and the three copies are now one.**
+
+### The defect
+
+The relay built a lease for **every paired device**, including a machine whose agent had stopped heartbeating days
+earlier. That lease expired, `partial` became the only verdict the task could reach, and a fleet whose live machines
+agreed reported *"incomplete"* forever. Observed on 2026-10-17:
+
+    aggregate: partial    counts: { ok: 3, expired: 4 }
+
+So "all machines agree" was **unreachable** while a stale entry existed, and no amount of re-running could fix it.
+
+### The fix: one definition, three call sites
+
+`device.online === true` alone is **not** the answer -- the flag stays true until the sweep runs. The real rule was
+already computed, in two places, as `device.online === true && !silent`, and the target list was about to become a
+third copy. It is now a method:
+
+    isOnlineDevice(device, nowMs = this.nowMs())
+
+used by `deviceStatus`, `publicDevice` and the default target list. `simtMs === null` (no contact ever observed) is
+**not** silent, so an unknown age cannot be read as "gone".
+
+### `include_offline` is the escape hatch, and it is reachable
+
+`w2m_run` gains `include_offline` (boolean, **default false**) and puts it on the wire only when asked, so a default
+dispatch sends the same bytes as before. The relay records it on the task, and a probe against a live `RabbitState`
+confirmed the field is accepted and stored (`recorded: true`) rather than rejected as unknown.
+
+### Deliberately NOT in this release
+
+**The 72-hour archive rule is deferred to 1.1.3.** The read-path filter is written and correct, but eight
+`fleet-target` fixtures carry fixed old timestamps and would need their intent reviewed one by one; shipping it with
+those fixtures patched blindly is how a green suite stops meaning anything. A machine that has been offline for days is
+therefore **hidden from dispatch** by this release (it is not online) but still **listed** by `w2m_devices`.
+
+### Verified
+
+`test/relay.test.mjs` 160 pass, `test/tools.test.mjs` 115 pass, `test/fleet-target.test.mjs` 41 pass -- 316 tests, 0
+fail, after the change. The 72h filter was measured, found to break 8 fixtures, and rolled back rather than shipped.
+
 ## [1.1.1] — 2026-10-17
 
 **The fleet is now installable from Claude Code, Codex and OpenAI's plugin surface -- and the parts that still need a

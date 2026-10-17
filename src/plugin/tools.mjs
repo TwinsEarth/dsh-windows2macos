@@ -3589,6 +3589,16 @@ export async function apply(ctx, config = {}) {
         description: 'Number of slices for mode=split. Defaults to 1, which is the only value replicate accepts.',
         default: 1,
       },
+      include_offline: {
+        type: 'boolean',
+        // v1.1.2. The relay now leases only devices that are online and not silent by default; this asks it to include
+        // the machines that are down as well, which is what an operator wants when queueing work for a machine that
+        // is currently switched off. Default false, because a stale lease is what kept every aggregate at `partial`.
+        description:
+          'Default false: the relay leases only the machines that are online and have not gone silent. Set true to ' +
+          'include machines that are currently down (their lease will simply expire if they do not come back).',
+        default: false,
+      },
       cwd_rel: {
         type: 'string',
         description: 'Working directory relative to the project root, with forward slashes. Defaults to ".".',
@@ -4023,6 +4033,8 @@ export async function apply(ctx, config = {}) {
         // in play. Spread after the caller's own field above so the caller always wins even if a
         // future edit makes both possible.
         ...selectionFields,
+        // Named on the wire only when asked, so a default dispatch sends the same bytes as it always did.
+        ...(args?.include_offline === true ? { include_offline: true } : {}),
         // Only for pipeline. The relay ignores `stages` under the other modes and the validation
         // above refuses the combination, so this can never silently mean nothing.
         ...(mode === 'pipeline' && stagesPayload !== null ? { stages: stagesPayload } : {}),

@@ -1257,6 +1257,22 @@ export class RabbitState {
    * (a test, or a caller that never runs the sweep) cannot report a departed machine as present.
    * The sweep is still what fixes the flag and broadcasts; this only refuses to repeat a stale `true`.
    */
+  /**
+   * Whether this device is usable right now: its flag is set AND it is not silent.
+   *
+   * \`device.online === true\` alone is not the answer -- the flag stays true until the sweep runs, so a machine whose
+   * agent stopped heartbeating was still a dispatch target. The same expression appeared in \`deviceStatus\`,
+   * \`publicDevice\` and (v1.1.2) the default target list; one definition keeps the list and the dispatch from
+   * disagreeing about which machines exist.
+   *
+   * \`silentMs === null\` means no contact has ever been observed, and that is NOT silent.
+   */
+  isOnlineDevice(device, nowMs = this.nowMs()) {
+    if (!device || device.online !== true) return false;
+    const silentMs = this.silenceAgeMs(device, nowMs);
+    return !(silentMs !== null && silentMs >= this.silenceMs);
+  }
+
   deviceStatus(machineId, nowMs = this.nowMs()) {
     const device = this.devices.get(machineId);
     if (!device) return null;
@@ -1270,7 +1286,7 @@ export class RabbitState {
       relay_id: this.relayId,
       connected: (device.streams ?? 0) > 0,
       streams: device.streams ?? 0,
-      online: device.online === true && !silent,
+      online: this.isOnlineDevice(device),
       /**
        * Why this machine is not usable, when it is not. `null` for a healthy one.
        *
@@ -1340,7 +1356,7 @@ export class RabbitState {
        * the stored flag and broadcasts `peer.bye`; this expression makes the read agree with it even
        * between sweeps, so no caller can observe the stale value at all.
        */
-      online: device.online === true && !silent,
+      online: this.isOnlineDevice(device),
       streams: device.streams,
       /**
        * v0.9.1: why this machine is not usable, when it is not.
@@ -1560,9 +1576,27 @@ export class RabbitState {
     //
     // Resolved before the task literal because the literal records it. (`targets` is computed below,
     // so the executor is re-validated against it after that.)
+    /**
+     * v1.1.2: a dispatch that names no machines goes to the machines that are **online**.
+     *
+     * WHY THIS IS THE DEFAULT: this line used to return every paired device, including one whose agent stopped
+     * heartbeating days ago. The relay still built it a lease, that lease expired, and \`partial\` became the only
+     * verdict the task could reach -- so a fleet whose live machines agreed reported "incomplete" forever
+     * (observed 2026-10-17: \`ok: 3, expired: 4\`). Liveness is the relay's own knowledge, which is why the fix
+     * belongs here and not in a client-side pre-read that would add a round trip to every dispatch.
+     *
+     * \`include_offline: true\` restores the old behaviour for the operator who really does want to queue work for a
+     * machine that is down. A device that comes back is online again and rejoins the default set with no bookkeeping:
+     * nothing is deleted, and the only state consulted is \`online\`.
+     */
     const targetIds = Array.isArray(input.target_machines) && input.target_machines.length > 0
       ? input.target_machines
-      : [...this.devices.keys()];
+      : input.include_offline === true || mode === 'broadcast'
+        // broadcast is NOT a fan-out: it names one executor and tells the rest the outcome. Narrowing the default set
+        // here would change WHICH machine is elected (or make the election impossible when the fixture's devices are
+        // not marked online), so the default set stays every paired device for this mode only.
+        ? [...this.devices.keys()]
+        : [...this.devices.entries()].filter(([, d]) => this.isOnlineDevice(d)).map(([id]) => id);
     const executorMachineId = mode === 'broadcast'
       ? (typeof input.executor_machine_id === 'string' && input.executor_machine_id !== ''
         ? input.executor_machine_id
@@ -1587,6 +1621,7 @@ export class RabbitState {
       base_tree: baseTree,
       requirements: input.requirements ?? {},
       compare_policy: input.compare_policy ?? {},
+      include_offline: input.include_offline === true,
       halt,
       created_by: input.created_by ?? null,
       created_at_ms: now,
