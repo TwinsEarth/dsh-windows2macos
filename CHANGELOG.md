@@ -2,6 +2,66 @@
 
 All notable changes to this project are documented here.
 
+## [1.0.11] — 2026-10-17
+
+**`w2m_memory {"action":"merge"}`: merge this machine's collective memory with the fleet's current blob, under the
+operator's conflict rule, and still write nothing.**
+
+### The rule, which is the operator's decision
+
+> **默认最新的赢；如果是修复默认流程，最全 & 验证最全面的有最后修改权。**
+>
+> Default: the newest wins. But if it is a repair of the default flow, the most complete and most thoroughly verified
+> one has final edit authority.
+
+Two layers, and the second is the one that is easy to lose: **a declared repair outranks recency**, so a repaired
+fact is not overwritten by a later-written older understanding. Between two repairs, the better-supported one wins.
+
+### What is the operator's, and what is my operationalisation -- stated so it can be challenged
+
+**Theirs:** the two layers above. **Mine, and it is in the source:**
+
+* **The entry syntax.** There is no way to read "is this a repair of the default flow" out of prose; any attempt to
+  guess would overwrite correct versions with wrong ones. So a keyed entry declares it:
+  `- 〔id:<stable-id> fix evidence=<n> verified=<n>〕<the fact>`.
+  Entries without an `id` are prose: they are unioned and never adjudicated, because without an id there is no way to
+  tell "same fact, two versions" from "two different facts".
+* **`completeness = evidence + 2 × verified`. The weight 2 is a judgement, not the operator's words.** One reproduced
+  fact outranks three unreproduced ones. It only applies when **both** sides declare `fix`.
+
+**Every decision is recorded** as a comment in the merged text (`<!-- <id> -> local (repair): ... -->`), because a
+merge that cannot explain its choices produces a document nobody can audit -- and the first sign of a wrong rule
+would be a fact nobody can find.
+
+### What it refuses
+
+| Case | Behaviour |
+|---|---|
+| the same id twice **inside one document** | **refused**, not resolved: a broken document is not a conflict |
+| a blob that fails its own hash | `W2M_BAD_BLOB`, and **nothing is merged** -- comparing unverified content would launder it |
+| a pointer naming an evicted blob | reported as that, with the remedy (publish again) |
+| no fleet document at all | reported as a state: publishing comes first |
+
+### And it still writes nothing
+
+The merged text comes back in the result; **the local file is not modified.** Half of a merge's input arrived over the
+network, and letting one round trip rewrite the only local copy would hand a remote party a write into local memory.
+
+### Verified
+
+**13 tests in `test/fleet-merge.test.mjs`** exercise the rule as a rule, with no profile and no relay: the default
+layer picks the newer publication; **a declared repair beats a NEWER non-repair** (the operator's override -- if this
+test flips, the rule has silently become "newest wins"); two repairs are separated by completeness, then by
+verification count, then by recency; a genuine tie resolves deterministically **and is recorded as a tie**; a
+duplicated id is refused; prose unions; inputs are not mutated; an identical id produces no decision.
+
+Full suite: see the pre-flight line. Pre-flight **GREEN, 15 of 15 checks**.
+
+### NOT verified
+
+The `merge` action **end to end** -- the same gap as `publish`/`pull`/`latest`/`diff`: the rule is proven, the
+plumbing around it is not, because that needs a profile with a `fleet-memory.md` and a live relay.
+
 ## [1.0.10] — 2026-10-17
 
 **`w2m_memory {"action":"diff"}`: compare this machine's collective memory against the fleet's current blob,

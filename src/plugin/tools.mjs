@@ -104,6 +104,9 @@ import { appendMemory, readMemorySync } from '../agent/memory.mjs';
 // plugin asserting a claim on its own behalf, which is the sender's job.
 import { acceptBlock, verifyBlock } from '../agent/blocks.mjs';
 import { acceptWithAuthority } from '../agent/field-authority.mjs';
+// v1.0.11: the merge rule (#2b) lives in its own module so the operator's two layers can be tested as a rule,
+// exhaustively, without a profile or a relay.
+import { mergeMemory } from './fleet-merge.mjs';
 
 // The base-address rules live in one place (§2), shared with the agent side. Importing the - rather
 // than re-deriving them her - is what stops the plugin and the agent from disagreeing about what
@@ -5141,14 +5144,15 @@ export async function apply(ctx, config = {}) {
        */
       action: {
         type: 'string',
-        enum: ['read', 'publish', 'pull', 'latest', 'diff'],
+        enum: ['read', 'publish', 'pull', 'latest', 'diff', 'merge'],
         description:
           'read (default) = answer from memory. publish = upload the curated collective memory '
           + '(`fleet-memory.md`) to the relay as a content-addressed blob and return its SHA-256. latest = ask the '
           + 'relay which blob this fleet published last. pull = fetch one blob by SHA-256 -- or by "latest" -- and '
           + 'return its text, re-hashing it. diff = compare the local document against the fleet current blob and '
-          + 'report what differs, **writing nothing**: merge has no conflict rule yet, so this action deliberately '
-          + 'resolves nothing. None of these modifies the local file.',
+          + 'report what differs. merge = apply the declared conflict rule (newest wins by default; a declared '
+          + 'repair of the default flow outranks recency) and return the merged text with every decision recorded. '
+          + '**No action modifies the local file.**',
         default: 'read',
       },
       hash: {
@@ -5606,6 +5610,116 @@ export async function apply(ctx, config = {}) {
           merged: false,
           wrote_anything: false,
           note: 'a comparison only. Merge has no conflict rule yet, so nothing is resolved and nothing is written.',
+        });
+      }
+
+      /**
+       * v1.0.11 (#2b): merge this machine's collective memory with the fleet's current blob, **under the operator's
+       * rule**, and still write nothing.
+       *
+       * ## The rule (the operator's, quoted)
+       *
+       * > 默认最新的赢；如果是修复默认流程，最全 & 验证最全面的有最后修改权。
+       *
+       * The two layers are implemented in `src/plugin/fleet-merge.mjs`: newest publication wins by default, and a
+       * declared repair of the default flow outranks recency. **The operationalisation is that module's; this branch
+       * only supplies the inputs.**
+       *
+       * ## Why the result is returned rather than written
+       *
+       * The local file is this machine's only copy, and half of a merge's input arrived over the network. **Letting
+       * one round trip rewrite it would hand a remote party a write into local memory.** So the merged text comes
+       * back in the result, decisions and all, and the caller decides.
+       *
+       * ## Recency inputs, named
+       *
+       * `localAddedAtMs` is the file's mtime; `fleetAddedAtMs` is the relay's `published_at` for the pointer's blob.
+       * Both are compared as milliseconds. **Neither is a claim about content** -- which is exactly why they are only
+       * the tie-break of last resort under the default layer.
+       */
+      if (typeof args?.action === 'string' && args.action === 'merge') {
+        const file = collectivePath();
+        if (file === null) {
+          throw new W2MError('W2M_CONFIG', 'W2M_CONFIG: there is no profile to merge collective memory from', {
+            hint: 'the collective layer lives beside the profile that mounted this plugin',
+          });
+        }
+        let localBytes;
+        let localStat;
+        try {
+          localBytes = await fs.readFile(file);
+          localStat = await fs.stat(file);
+        } catch {
+          throw new W2MError('W2M_NOT_FOUND', `W2M_NOT_FOUND: no collective memory to merge at ${file}`, {
+            hint: 'merge needs a local document; it compares against the fleet copy, it does not create one',
+          });
+        }
+        const localHash = createHash('sha256').update(localBytes).digest('hex');
+        const base = requireRabbit(cfg);
+        const token = await resolveToken(cfg);
+
+        const pointer = await request({ rabbitUrl: base, token, pathname: '/v1/fleet/blobs/latest', signal: exec?.signal });
+        if (pointer.status === 404) {
+          return JSON.stringify({
+            ok: true, merged: false, wrote_anything: false,
+            local: { hash: localHash, bytes: localBytes.length, file },
+            reason: 'this fleet has published no blob yet, so there is nothing to merge with. Publishing comes first.',
+          });
+        }
+        if (pointer.status !== 200) {
+          throw new W2MError('W2M_RABBIT_REFUSED', `W2M_RABBIT_REFUSED: GET /v1/fleet/blobs/latest answered HTTP ${pointer.status}`, {
+            http_status: pointer.status, detail: pointer.error ?? null,
+          });
+        }
+        const fleetHash = String(pointer.json?.hash ?? '');
+        const fleetRes = await request({
+          rabbitUrl: base, token, pathname: `/v1/fleet/blobs/${fleetHash}`,
+          accept: 'application/octet-stream', signal: exec?.signal,
+        });
+        if (fleetRes.status !== 200) {
+          throw new W2MError('W2M_NOT_FOUND', `W2M_NOT_FOUND: the fleet pointer names ${fleetHash}, which answered HTTP ${fleetRes.status}`, {
+            hint: 'the pointer is a hint (see #3); oldest-first eviction can remove the blob it names',
+            prescribed: 'publish from a machine in this fleet to establish a current document again',
+          });
+        }
+        const fleetText = fleetRes.text ?? '';
+        const fleetActual = createHash('sha256').update(fleetText, 'utf8').digest('hex');
+        if (fleetActual !== fleetHash) {
+          throw new W2MError('W2M_BAD_BLOB', `W2M_BAD_BLOB: the fleet blob ${fleetHash} hashes to ${fleetActual} instead`, {
+            hint: 'refusing to merge unverified content', expected: fleetHash, actual: fleetActual,
+          });
+        }
+
+        const fleetPublishedAt = Date.parse(String(pointer.json?.published_at ?? ''));
+        const outcome = mergeMemory({
+          localText: localBytes.toString('utf8'),
+          localAddedAtMs: Number.isFinite(localStat.mtimeMs) ? localStat.mtimeMs : 0,
+          localHash,
+          fleetText,
+          fleetAddedAtMs: Number.isFinite(fleetPublishedAt) ? fleetPublishedAt : 0,
+          fleetHash,
+        });
+
+        return JSON.stringify({
+          ok: true,
+          merged: true,
+          wrote_anything: false,
+          rule: 'default: newest publication wins; a declared repair of the default flow outranks recency, and between '
+            + 'two repairs the one with the higher (evidence + 2 x verified) wins',
+          local: { hash: localHash, bytes: localBytes.length, file, added_at_ms: Math.round(localStat.mtimeMs) },
+          fleet: {
+            hash: fleetHash, bytes: Buffer.byteLength(fleetText, 'utf8'),
+            published_at: pointer.json?.published_at ?? null, published_by: pointer.json?.published_by ?? null,
+          },
+          decisions: outcome.decisions,
+          unresolved: outcome.unresolved,
+          refused: outcome.refused,
+          unchanged: outcome.unchanged,
+          added: outcome.added,
+          removed: outcome.removed,
+          merged_text: outcome.text,
+          next: 'this result is text only. Writing it back is the caller\'s decision -- a merge does not edit the '
+            + 'document it read.',
         });
       }
 
