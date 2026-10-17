@@ -2,6 +2,55 @@
 
 All notable changes to this project are documented here.
 
+## [1.1.16] — 2026-10-18
+
+**A machine waiting to be admitted now appears where you already answer questions -- and the README leads with how to
+install it.**
+
+### Admission in `w2m_approvals`
+
+`w2m_approvals` merges `GET /v1/fleet/admission/pending` into its list as `kind:'fleet_admission'` rows, so a machine
+asking to join shows up beside the permission requests already there. Settling an `adm-` id goes to the **relay's**
+decide endpoint, not the local permission index: admission is not an authority escalation, and pushing it through
+`approvalRequestFor` -- whose shape requires a needs-approval verdict and a capability -- would record a lie in the
+audit trail. The list is shared; the stores are not.
+
+The countdown is derived from the **relay's clock** (`rabbit_time`), never this machine's: three machines in this fleet
+disagree by tens of seconds, and a local countdown would fire the automatic approval early on a fast machine. The relay
+still owns the decision and still refuses to auto-approve with no member online.
+
+### Two defects the tests caught
+
+- the merged request omitted `rabbitUrl` and the device token, so it threw into the surrounding catch and the rows were
+  **silently missing** -- a probe showed the fetch was never called at all (`calls: []`);
+- the refusal code was read from `json.code`, but protocol errors arrive at `json.error.code`, so `reason_code` was always
+  null and a late `ALREADY_DECIDED` decision looked like a success path.
+
+Five assertions now cover that seam: rows and their fields, relay-clock countdown, an unreachable relay still showing the
+local queue, `adm-` routing reaching the relay, and a late decision reported rather than thrown.
+
+### README rewritten around installation
+
+Five routes, easiest first: DSH plugin (zero configuration), npm/MCP for any client, Claude Code marketplace, Codex, and
+the verified release tarball. Then quick start, the 11 tools registered, the `W2M_*` environment a dispatched command
+receives, the fleet model, the security posture, and an explicit **verified / not verified** table that names the approval
+popup, the four-machine `W2M_INDEX` run, the unimplemented chat channel and the macOS P2P downgrade instead of implying
+they work.
+
+Two claim checks rejected the first draft and were right: a `SHA256SUMS` release-download URL does not name a
+`<name>-<version>.tgz` asset, and "eleven tools" had to be the measured number.
+
+### Not in this release
+
+The approval **popup** (a dedicated 10-second countdown control) is not implemented -- the rules are enforced by the
+relay and this tool lists and settles the requests. The fleet chat channel remains designed (FLEET-CHAT-DESIGN.md) and
+not built. No four-machine `W2M_INDEX` run yet.
+
+### Verified
+
+Gate GREEN (final pass, 15 of 15). 2458 tests in 102 files, 2444 pass, 0 fail, 14 skip. tools 120, tool-cards 8,
+claims 47.
+
 ## [1.1.15] — 2026-10-17
 
 **A machine that cannot join the old way now proves its account, asks to join, and waits for an answer -- and the

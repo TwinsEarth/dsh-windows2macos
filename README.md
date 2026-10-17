@@ -30,7 +30,7 @@ plugins:
 # 3. restart DSH — joining happens at mount time, so a hot reload is not enough
 ```
 
-Since **1.1.15** the agent starts by itself (`autoStartAgent` defaults to `true`): a freshly installed
+Since **1.1.16** the agent starts by itself (`autoStartAgent` defaults to `true`): a freshly installed
 machine derives its account identity, joins the account's fleet, and appears in `w2m_devices` with no
 pairing step. To turn that off, put it back explicitly:
 
@@ -66,22 +66,22 @@ The manifests live in [`.claude-plugin/`](.claude-plugin/) and are version-locke
 # codex/mcp-servers.toml — copy this block into your own config
 [mcp_servers.w2m]
 command = "npx"
-args = ["-y", "@twinsearth/w2m-dsh-plugin@1.1.15", "w2m-mcp"]
+args = ["-y", "@twinsearth/w2m-dsh-plugin@1.1.16", "w2m-mcp"]
 ```
 
 ### 5. From the release tarball (verified, offline)
 
-From the 1.1.15 release page, download **both** files:
+From the 1.1.16 release page, download **both** files:
 
-- 	winsearth-w2m-dsh-plugin-1.1.15.tgz
+- 	winsearth-w2m-dsh-plugin-1.1.16.tgz
 - SHA256SUMS
 
 Or fetch the tarball directly and take the checksum file from the same release:
 
 ```bash
-curl -LO https://github.com/TwinsEarth/dsh-windows2macos/releases/download/v1.1.15/twinsearth-w2m-dsh-plugin-1.1.15.tgz
+curl -LO https://github.com/TwinsEarth/dsh-windows2macos/releases/download/v1.1.16/twinsearth-w2m-dsh-plugin-1.1.16.tgz
 sha256sum -c SHA256SUMS          # verify before installing, always
-npm install -g ./twinsearth-w2m-dsh-plugin-1.1.15.tgz
+npm install -g ./twinsearth-w2m-dsh-plugin-1.1.16.tgz
 ```
 
 Every release carries **`SHA256SUMS`** for exactly this reason. If it is missing, do not install that
@@ -130,7 +130,7 @@ by a hand-maintained host list.
 
 ### Environment variables a dispatched command receives
 
-Since 1.1.15 the command knows where it is — values come from the offer, never from argv:
+Since 1.1.16 the command knows where it is — values come from the offer, never from argv:
 
 | Variable | Meaning |
 |---|---|
@@ -217,7 +217,7 @@ MIT.
 ### 安装（由易到难，任选一种）
 
 1. **DSH 插件（推荐，零配置）**：`dsh plugin add @twinsearth/w2m-dsh-plugin`，把包名加入
-   `dsh.profile.bundles`，**重启 DSH**。1.1.15 起 agent 默认自动启动，装完即自动入队。
+   `dsh.profile.bundles`，**重启 DSH**。1.1.16 起 agent 默认自动启动，装完即自动入队。
 2. **npm（任意 MCP 客户端）**：`npm i -g @twinsearth/w2m-dsh-plugin` → `w2m-mcp`。
 3. **Claude Code**：`/plugin marketplace add TwinsEarth/dsh-windows2macos` → `/plugin install w2m@twinsearth`。
 4. **Codex**：复制 [`codex/mcp-servers.toml`](codex/mcp-servers.toml) 的配置块。
@@ -240,7 +240,7 @@ w2m_wait task_id="..."
 - **时间窗与法定人数由 relay 权威判定**：10 秒自动同意（需至少 1 名成员在线）、24 小时内可即时踢出、
   超过 24 小时需冻结快照表决（3 人以上 ≥50%，2 人编队 1 票）。
 - **离线 72 小时只是不显示，绝不删除**：记录保留，机器重新上线后自动回到列表。
-- **派发命令会拿到 `W2M_INDEX` 等环境变量**（1.1.15 起），因此 split 可以按机器分支。
+- **派发命令会拿到 `W2M_INDEX` 等环境变量**（1.1.16 起），因此 split 可以按机器分支。
 
 ### 验证状态（不含糊）
 
