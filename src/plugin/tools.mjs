@@ -180,6 +180,9 @@ import {
   sessionKeyFor,
   TARGET_ROUTE_PATH,
 } from './fleet-target.mjs';
+// v1.1.17 chat: the host route behind the composer's fleet-chat panel. The relay side and the
+// `w2m_chat` tool shipped first; this is the browser-facing half that was still missing.
+import { registerChatRoutes } from './fleet-chat-route.mjs';
 // v0.7.0: the LAN hint layer. Imported here and used in exactly one place (`w2m_devices`); see the
 // module header for why a discovered device is a candidate to *ask* and never an authorisation.
 import { createDiscoverySource } from './mdns-discover.mjs';
@@ -3401,6 +3404,20 @@ export async function apply(ctx, config = {}) {
     resolveToken,
   });
 
+  // The composer's fleet-chat panel: `GET/POST /api/w2m/chat`, proxied to the relay's device-gated
+  // `/v1/fleet/messages`. Optional like the target routes — a host without Connection keeps every
+  // tool and the panel is simply not mounted.
+  const chatRoutes = registerChatRoutes(ctx, {
+    cfg: () => cfg,
+    request,
+    resolveToken: () => resolveToken(cfg),
+  });
+  if (chatRoutes.mounted !== true) {
+    // Named rather than silent: a composition without the fetch registry loses the chat panel while every tool still
+    // works, and "the panel is missing" with no line anywhere is the shape this project keeps paying for.
+    ctx.logger?.warn?.('w2m: the fleet-chat composer route is not mounted (' + (chatRoutes.reason ?? 'unknown reason') + ')');
+  }
+
   // The LAN discovery source (v0.7.0). Constructing it binds nothing: a socket is opened only when a
   // scan is asked for, and only `w2m_devices` asks. A network where multicast is unavailable produces
   // one log line and an `available: false` block in the answer - never a failure of the tool.
@@ -6320,10 +6337,14 @@ export async function apply(ctx, config = {}) {
       const action = typeof args?.action === 'string' ? args.action : 'list';
       const sessionId = typeof args?.session_id === 'string' ? args.session_id.trim() : '';
       if (sessionId === '') throw new W2MError('W2M_CHAT_SESSION', 'W2M_CHAT_SESSION: session_id is required', { hint: 'chat is scoped to a conversation' });
-      const device = await readDevice(cfg);
       const rabbitUrl = cfg.rabbitUrl ?? null;
       if (rabbitUrl === null) throw new W2MError('W2M_NO_RELAY', 'W2M_NO_RELAY: no relay is configured, so chat cannot be reached', { hint: 'set rabbitUrl in the profile patch' });
-      const token = requireToken(device);
+      // resolveToken, not readDevice: readDevice returns an empty identity whenever `stateDir` is
+      // unset, even though this machine's device.json exists at the default DSH_HOME path — every
+      // other device-authenticated tool goes through resolveToken for exactly that reason, and this
+      // one reported W2M_NO_TOKEN on a machine that was paired and answering every other call.
+      const token = await resolveToken(cfg);
+      if (token === null) throw new W2MError('W2M_NO_TOKEN', 'W2M_NO_TOKEN: this machine has no device token, so chat cannot be authenticated', { hint: 'pair this machine first (autoStartAgent or a pairing code), then retry' });
       if (action === 'send') {
         const posted = await request({ rabbitUrl, token, signal: exec?.signal, method: 'POST', pathname: '/v1/fleet/messages', body: { session_id: sessionId, text: typeof args?.text === 'string' ? args.text : '' } });
         if (posted?.ok !== true) {

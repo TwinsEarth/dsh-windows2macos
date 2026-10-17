@@ -2,37 +2,35 @@
 
 All notable changes to this project are documented here.
 
-## [1.1.19-beta.1] — 2026-10-18
+## [1.1.19] — 2026-10-18
 
-**A beta whose purpose is to prove the beta pipeline works.** It carries one product fix and nothing else, stated plainly
-so nobody installs it expecting the composer controls.
+**The chat panel exists in the browser.**
 
-### The one product change
+Fleet chat shipped as a tool in 1.1.17 and as a relay API in the same release. What was missing was the half a user actually
+touches: a control in the composer. This release adds it.
 
-`plugin.json`'s description said "through **11** w2m_* tools" while the package registers **12** (w2m_chat arrived in
-1.1.17). That description is what the host's plugin page shows, so the page was advertising a surface it no longer had.
-Claims never caught it because they check the README's "N tools registered" line, not the manifest prose.
+- **The panel**: a "fleet chat" control beside the target-machine control opens a floating panel listing this session's
+  messages, with the relay usage shown next to them, a multi-line input, and a send button. It refreshes while open.
+- **The host route**: the browser never holds a device token. It calls `/api/w2m/chat` on the host, which proxies to the
+  relay's device-gated `/v1/fleet/messages` — so the token stays in the host process.
+- **Tool bug fixed**: `w2m_chat` resolved its token through `readDevice(cfg)`, which fails when `stateDir` is unset even
+  though a `device.json` exists elsewhere; it now resolves exactly like every other tool (`resolveToken(cfg)`).
+- **Theme discipline**: the panel carries no literal colours, only `--dsw-*` tokens, because a literal is wrong in one of
+  the two themes. The stylesheet test caught the one literal (`#fff` on the send button).
 
-### Why this release exists at all
+The relay on the fleet host was upgraded to this line of code in the same step: it had been running 1.0.14, which has no
+`/v1/fleet/messages` route at all, so the panel would have shown "no route" forever. Verified after the restart: an
+authenticated GET returns 200 (it returned 404 before), unauthenticated returns 401, and the fleet came back with the same
+eight devices and no re-pairing.
 
-`.github/workflows/beta.yml` had never run. A workflow that has only been read is not a workflow that works, and the
-first time it matters should not be the day a real beta is needed. Publishing this beta exercises every part of it:
+### Not in this release
 
-- the version must be a prerelease (`X.Y.Z-beta.N`), or the run is refused;
-- the tag and `package.json` must agree, and the workflow bumps nothing itself;
-- it produces a GitHub **prerelease** (`prerelease: true`), so neither GitHub nor npm resolves it as `latest`;
-- it does **not** publish to npm — there is no `npm publish` line in that workflow;
-- it waits on the `beta-access` environment, which requires a reviewer.
-
-### Not in this beta
-
-The two composer controls (`w2m-chat`, `w2m-update`) that v1.1.19 proper is for. They are designed and their contracts
-are recorded; they are not written. A stable 1.1.19 will ship them, and it will be the release that goes to npm and
-GitHub Packages.
+The coloured per-machine avatars for chat messages are designed and not built. The panel shows one style for every
+machine today.
 
 ### Verified
 
-portable-plugins 10/10, tools 122/122, claims: see the 1.1.19 stable entry when it lands.
+Gate GREEN, 15 of 15. 2489 tests / 2471+ pass. client-bundle 25, tools 122, claims, portable-plugins 10.
 
 ## [1.1.18] — 2026-10-18
 

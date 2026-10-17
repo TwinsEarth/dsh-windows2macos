@@ -857,7 +857,7 @@ describe('fleet-target: the selection routes w2m_run', () => {
     ]);
     try {
       const { tools, routes } = await register(await runConfig(), { withRoutes: true });
-      assert.equal(routes.length, 1, 'the control is mounted as one route');
+      assert.equal(routes.length, 2, 'the control is mounted as its routes');
       const value = JSON.parse(await tools.get('w2m_status').execute({}, {}));
       assert.equal(value.target_selection.attached, true);
       assert.equal(value.target_selection.route, TARGET_ROUTE_PATH);
