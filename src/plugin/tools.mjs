@@ -5141,13 +5141,14 @@ export async function apply(ctx, config = {}) {
        */
       action: {
         type: 'string',
-        enum: ['read', 'publish', 'pull', 'latest'],
+        enum: ['read', 'publish', 'pull', 'latest', 'diff'],
         description:
           'read (default) = answer from memory. publish = upload the curated collective memory '
           + '(`fleet-memory.md`) to the relay as a content-addressed blob and return its SHA-256. latest = ask the '
-          + 'relay which blob this fleet published last (the discovery half of the channel). pull = fetch one blob '
-          + 'by SHA-256 -- or by "latest" -- and return its text, re-hashing what came back against the name it was '
-          + 'asked for. None of these modifies the local file.',
+          + 'relay which blob this fleet published last. pull = fetch one blob by SHA-256 -- or by "latest" -- and '
+          + 'return its text, re-hashing it. diff = compare the local document against the fleet current blob and '
+          + 'report what differs, **writing nothing**: merge has no conflict rule yet, so this action deliberately '
+          + 'resolves nothing. None of these modifies the local file.',
         default: 'read',
       },
       hash: {
@@ -5461,6 +5462,150 @@ export async function apply(ctx, config = {}) {
           bytes: Buffer.byteLength(body, 'utf8'),
           verified: true,
           content: body,
+        });
+      }
+
+      /**
+       * v1.0.10 (#2a): **compare** this machine's collective memory against the fleet's current blob. Writes nothing.
+       *
+       * ## Why this exists before merge does
+       *
+       * "Merge" needs a conflict rule -- *when two machines assert different facts, who wins?* -- and that is a
+       * product decision, not an implementation detail. Shipping a merge before its rule is how a fleet silently
+       * loses one machine's memory.
+       *
+       * What needs no decision is the half that **prevents harm**: telling a caller whether their local document is
+       * the newest one, and what would be lost if they published over the fleet's copy. That is this action.
+       *
+       * ## Why a set comparison instead of a diff
+       *
+       * `same` is decided by **whole-document hash equality**, not by the absence of line differences: two documents
+       * with identical line sets in a different order are not the same, and reporting them as the same would hide an
+       * order change. The line sets are then reported as `local_only` / `fleet_only` -- deliberately *not* a diff,
+       * because a diff would report "moved" versus "changed" and then want a merge policy. **A set comparison cannot
+       * resolve anything, which is the property this step needs.**
+       *
+       * ## Why it re-hashes the fleet copy
+       *
+       * Comparing unverified content would launder it: the report would give a hash-verified-looking answer about
+       * bytes nobody checked. A blob that fails its own name is reported as unverified, never compared.
+       */
+      if (typeof args?.action === 'string' && args.action === 'diff') {
+        const file = collectivePath();
+        if (file === null) {
+          throw new W2MError('W2M_CONFIG', 'W2M_CONFIG: there is no profile to compare collective memory from', {
+            hint: 'the collective layer lives beside the profile that mounted this plugin',
+          });
+        }
+        let localBytes;
+        try {
+          localBytes = await fs.readFile(file);
+        } catch {
+          throw new W2MError('W2M_NOT_FOUND', `W2M_NOT_FOUND: no collective memory to compare at ${file}`, {
+            hint: 'write measured facts to it first; this action compares, it does not create',
+          });
+        }
+        const localHash = createHash('sha256').update(localBytes).digest('hex');
+        const base = requireRabbit(cfg);
+        const token = await resolveToken(cfg);
+
+        const pointer = await request({
+          rabbitUrl: base,
+          token,
+          pathname: '/v1/fleet/blobs/latest',
+          signal: exec?.signal,
+        });
+        if (pointer.status === 404) {
+          // No fleet document yet: nothing to differ from. Reported as a state, not as an error.
+          return JSON.stringify({
+            ok: true,
+            same: false,
+            local: { hash: localHash, bytes: localBytes.length, file },
+            fleet: { present: false, reason: 'this fleet has published no blob yet' },
+            merged: false,
+            wrote_anything: false,
+          });
+        }
+        if (pointer.status !== 200) {
+          throw new W2MError(
+            'W2M_RABBIT_REFUSED',
+            `W2M_RABBIT_REFUSED: GET /v1/fleet/blobs/latest answered HTTP ${pointer.status}`,
+            { http_status: pointer.status, detail: pointer.error ?? null },
+          );
+        }
+        const fleetHash = String(pointer.json?.hash ?? '');
+        const fleetRes = await request({
+          rabbitUrl: base,
+          token,
+          pathname: `/v1/fleet/blobs/${fleetHash}`,
+          accept: 'application/octet-stream',
+          signal: exec?.signal,
+        });
+        if (fleetRes.status === 404) {
+          // The pointer is a hint (see #3): eviction can take the document it names.
+          return JSON.stringify({
+            ok: true,
+            same: false,
+            local: { hash: localHash, bytes: localBytes.length, file },
+            fleet: {
+              present: false,
+              pointed_at: fleetHash,
+              reason: 'the pointer names a blob that no longer exists (oldest-first eviction)',
+            },
+            merged: false,
+            wrote_anything: false,
+          });
+        }
+        if (fleetRes.status !== 200) {
+          throw new W2MError(
+            'W2M_RABBIT_REFUSED',
+            `W2M_RABBIT_REFUSED: GET /v1/fleet/blobs/${fleetHash} answered HTTP ${fleetRes.status}`,
+            { http_status: fleetRes.status, detail: fleetRes.error ?? null },
+          );
+        }
+        const fleetText = fleetRes.text ?? '';
+        const fleetActual = createHash('sha256').update(fleetText, 'utf8').digest('hex');
+        if (fleetActual !== fleetHash) {
+          throw new W2MError(
+            'W2M_BAD_BLOB',
+            `W2M_BAD_BLOB: the fleet blob ${fleetHash} hashes to ${fleetActual} instead`,
+            {
+              hint: 'refusing to compare unverified content -- a comparison over bytes nobody checked would '
+                + 'launder them',
+              expected: fleetHash,
+              actual: fleetActual,
+            },
+          );
+        }
+
+        const localText = localBytes.toString('utf8');
+        // Trailing whitespace only: leading whitespace is markdown structure, not noise.
+        const norm = (text) => new Set(text.split('\n').map((line) => line.replace(/\s+$/, '')));
+        const localLines = norm(localText);
+        const fleetLines = norm(fleetText);
+        const localOnly = [...localLines].filter((line) => !fleetLines.has(line));
+        const fleetOnly = [...fleetLines].filter((line) => !localLines.has(line));
+        return JSON.stringify({
+          ok: true,
+          same: localHash === fleetHash,
+          local: { hash: localHash, bytes: localBytes.length, lines: localLines.size, file },
+          fleet: {
+            present: true,
+            hash: fleetHash,
+            bytes: Buffer.byteLength(fleetText, 'utf8'),
+            lines: fleetLines.size,
+            published_at: pointer.json?.published_at ?? null,
+            published_by: pointer.json?.published_by ?? null,
+          },
+          differing_lines: localOnly.length + fleetOnly.length,
+          preview: {
+            local_only: localOnly.slice(0, 20),
+            fleet_only: fleetOnly.slice(0, 20),
+            truncated: localOnly.length > 20 || fleetOnly.length > 20,
+          },
+          merged: false,
+          wrote_anything: false,
+          note: 'a comparison only. Merge has no conflict rule yet, so nothing is resolved and nothing is written.',
         });
       }
 

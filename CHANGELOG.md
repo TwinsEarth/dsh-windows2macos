@@ -2,6 +2,64 @@
 
 All notable changes to this project are documented here.
 
+## [1.0.10] — 2026-10-17
+
+**`w2m_memory {"action":"diff"}`: compare this machine's collective memory against the fleet's current blob,
+and write nothing.**
+
+### Merge is still not implemented, deliberately
+
+The question merge depends on has not been answered:
+
+> **When two machines in one fleet assert different things about the same fact, who wins?**
+
+That is a product decision about what the fleet's memory *is*, not an implementation detail, and shipping a merge
+before its rule is how a fleet silently loses one machine's memory. So this release ships **the half that needs no
+decision** -- and names the other half as open rather than leaving it implied.
+
+### What `diff` answers
+
+* **Is my document the newest one?** `same: true/false`, decided by **whole-document hash equality**.
+* **What would I be overwriting?** `preview.local_only` and `preview.fleet_only`.
+* **Is the fleet's document even there?** Three distinct absence states, each named: the fleet never published; the
+  pointer names a blob that eviction removed; the blob exists and verified.
+
+### Four decisions worth recording
+
+**It writes nothing.** No `.orig`, no `.rej`, no silent merge. Comparing is not a licence to edit a document this
+machine owns.
+
+**`same` is hash equality, not "no line differences".** Two documents with identical line sets in a different order
+are **not** the same, and callling them the same would hide an order change -- which in a markdown document is a
+structural change.
+
+**A set comparison, not a diff.** A line-oriented diff would report "moved" versus "changed" and then want a merge
+policy. **A set comparison cannot resolve anything, which is exactly the property this step requires.**
+
+**The fleet copy is re-hashed before it is compared.** Comparing unverified content would launder it: the report
+would give a hash-verified-looking answer about bytes nobody checked. A blob that fails its own name raises
+`W2M_BAD_BLOB` and is never compared.
+
+Trailing whitespace is normalised (it is noise); leading whitespace is preserved (it is markdown structure).
+
+### Verified
+
+The comparison rule is pinned directly: `local_only` / `fleet_only` separate correctly, trailing whitespace creates
+no difference, and leading whitespace does. Full suite **2360 tests, 2346 pass, 0 fail, 14 skip**; pre-flight
+**GREEN, 15 of 15 checks**.
+
+### NOT verified
+
+The `diff` action **end to end** -- the same gap as `publish`/`pull`/`latest`: type-correct and lint-clean, but
+no test executes it, because that needs a profile with a `fleet-memory.md` and a live relay.
+
+### Open: #2b
+
+**Append-merge with conflict markers, and the marker's existence is the refusal** -- a document containing markers is
+one a human must not trust until resolved. Last-writer-wins is rejected: it loses data silently, and the project's
+own eviction rule already refuses "delete the only copy of a fact" in spirit. **That recommendation is in
+`FLEET-SYNC-2-DESIGN.md` and is not implemented, because it encodes a rule that is the operator's to choose.**
+
 ## [1.0.9] — 2026-10-17
 
 **Discovery: a machine can now ask the relay which blob its fleet published last, instead of a human relaying a
