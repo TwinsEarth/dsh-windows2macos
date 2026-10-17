@@ -2,6 +2,60 @@
 
 All notable changes to this project are documented here.
 
+## [1.1.14] — 2026-10-17
+
+**A new machine joins by itself, and a machine that cannot join the old way can now prove its account and ask.**
+
+### Joining is on by default
+
+`autoStartAgent` now defaults to **true**. The old expression was `config.autoStartAgent === true`, which made joining
+opt-IN, and the observed defect was a machine that was installed, running, and simply not in the fleet -- "installed,
+paired: false" with no hint of why. `false` is still the way to turn it off.
+
+Making this the default required changing the meaning of the tests that intentionally ran without an agent: eight suites
+now pin `autoStartAgent: false` through one `applyPinned` wrapper each, and the single case that asserts a STARTED node
+exits cleanly passes `autoStartAgent: true` inside its own template script. Two bugs were found while doing it, and both
+are recorded because they are the shape of this kind of change: inserting a key into object literals with a regex broke a
+file, and replacing call sites after defining the wrapper made the wrapper call itself.
+
+### Admission: who may join, who may be removed
+
+The relay gains a fleet-admission state machine and five routes: `admission/request`, `admission/pending`,
+`admission/{id}/decide`, `members/{id}/remove`, `removals/{id}/vote`, plus `admission/challenge`.
+
+* a request is `pending` and grants nothing until approved;
+* **10 seconds without a decision auto-approves**, but only while at least one member is online -- an empty fleet cannot
+  consent, and that refusal is a named `NO_ONLINE_MEMBER`;
+* inside **24 hours** any online member may remove a new member immediately; after 24 hours a single machine may only
+  OPEN a vote, and the quorum set is **frozen at open time** so a voter going offline mid-vote cannot move the bar;
+* the quorum is the operator's: 3+ old members need >= 50% rounded up, a two-member fleet needs one vote;
+* old members are ordered by **insertion sequence**, not timestamps -- two machines approved inside the same millisecond
+  are equal on the clock but still have an order, and a quorum that depends on a sub-millisecond race is not a quorum.
+
+### An unpaired machine can prove its account
+
+A machine whose pairing failed has no device_token, which is the situation the fallback exists for -- so the two routes
+it needs are reachable **without** one, authorised instead by an account signature:
+
+* the account gains a **derived Ed25519 identity** (`account-identity.mjs`): the same account material yields the same
+  keypair on every machine, which is what makes zero-configuration joining possible at all;
+* the public key is registered with the relay **when that account's first machine pairs** -- the only moment the relay has
+  proof of the account -- and the first key wins (a different key is refused, not silently accepted);
+* a one-time, five-minute challenge is signed and verified against it; the challenge is consumed on any attempt, the
+  signature binds `machine_id`, and issuing is rate limited **per fingerprint**;
+* the fingerprint the relay acts on comes from the **verified signature**, never from the request body.
+
+### Deliberately not in this release
+
+The client-side consumption of `degrade: true` (challenge -> request -> poll) and the approval UI (10s popup plus a
+standing dialog) are **not** shipped. The server half is tested; the client half is not written, and shipping a
+mechanism whose client does not call it is the failure this project has recorded seven times.
+
+### Verified
+
+Full gate: **GREEN**, 15 of 15 checks, twice. The suites this release touches directly: relay 163, tools 115, admission
+16, admission-routes 3, broadcast 19, join-challenge 8, account-identity 6, join-degradation 3, fleet-target 45.
+
 ## [1.1.3] — 2026-10-17
 
 **A machine offline for more than 72 hours leaves the list. It is not deleted, and it comes back on its own.**

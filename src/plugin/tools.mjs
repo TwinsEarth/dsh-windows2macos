@@ -1,4 +1,4 @@
-/**
+﻿/**
  * DSH: Windows2MacO - the DSH Cordis plugin.
  *
  * # What this exposes
@@ -107,6 +107,7 @@ import { acceptWithAuthority } from '../agent/field-authority.mjs';
 // v1.0.11: the merge rule (#2b) lives in its own module so the operator's two layers can be tested as a rule,
 // exhaustively, without a profile or a relay.
 import { mergeMemory } from './fleet-merge.mjs';
+import { shouldDegrade } from './join-degradation.mjs';
 
 // The base-address rules live in one place (§2), shared with the agent side. Importing the - rather
 // than re-deriving them her - is what stops the plugin and the agent from disagreeing about what
@@ -687,7 +688,8 @@ function readConfig(config = {}) {
     machineName: typeof config.machineName === 'string' && config.machineName.trim() !== ''
       ? config.machineName.trim()
       : os.hostname(),
-    autoStartAgent: config.autoStartAgent === true,
+    // v1.1.6: joining is on by default; `false` is the only way off.
+    autoStartAgent: config.autoStartAgent !== false,
       /**
        * v0.8.3: the account-derived key this machine joins its fleet with.
        *
@@ -6704,10 +6706,18 @@ async function startLocalStack(ctx, cfg) {
         ctx.logger?.info?.(`w2m: paired by ${by}`);
         return { paired: true, by };
       } catch (error) {
-        // Named rather than swallowed: an agent that failed to pair runs and does nothing, which
-        // looks identical to a fleet with no work.
-        ctx.logger?.warn?.(`w2m: pairing by ${by} failed: ${error instanceof Error ? error.message : String(error)}`);
-        return { paired: false, by };
+        /**
+         * The failure is classified here, where the reason still exists.
+         *
+         * v1.1.6 adds a second joining path (account fingerprint + member approval) that may only take over when the
+         * FIRST path cannot work -- an invalid pairing code, an unreachable relay, a timeout. Anything else (a config
+         * error, a permission refusal) needs a human, and moving the machine between mechanisms would hide that. The
+         * classifier owns that rule; this only has to stop discarding the error before it can be read.
+         */
+        const reason = error?.reason_code ?? error?.code ?? null;
+        const degrade = shouldDegrade(reason);
+        ctx.logger?.warn?.(`w2m: pairing by ${by} failed${reason === null ? '' : ' (' + String(reason) + ')'}: ${error instanceof Error ? error.message : String(error)}`);
+        return { paired: false, by, reason_code: reason, degrade };
       }
     }
 

@@ -8,6 +8,14 @@
  */
 
 import { after, describe, it } from 'node:test';
+
+/**
+ * v1.1.6: `autoStartAgent` defaults to true. Cases in this file are about something else, so the harness pins it off
+ * once; call sites were renamed first, so this wrapper's own `plugin.apply` is still a real call.
+ */
+function applyPinned(ctx, config = {}) {
+  return plugin.apply(ctx, { autoStartAgent: false, ...config });
+}
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
@@ -103,7 +111,7 @@ function makeCtx({ withEffect = true, effectThrows = false } = {}) {
  */
 async function register(config = {}, ctxOpts = {}) {
   const made = makeCtx(ctxOpts);
-  await plugin.apply(made.ctx, config);
+  await applyPinned(made.ctx, config);
   return made;
 }
 

@@ -21,6 +21,14 @@
  */
 
 import assert from 'node:assert/strict';
+
+/**
+ * v1.1.6: `autoStartAgent` defaults to true. Cases in this file are about something else, so the harness pins it off
+ * once; call sites were renamed first, so this wrapper's own `plugin.apply` is still a real call.
+ */
+function applyPinned(ctx, config = {}) {
+  return plugin.apply(ctx, { autoStartAgent: false, ...config });
+}
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -208,7 +216,7 @@ function makeCtx(options = {}) {
  */
 async function register(config = {}, options = {}) {
   const { ctx, tools, routes, warnings } = makeCtx(options);
-  await plugin.apply(ctx, { p2pMode: 'relay', ...config });
+  await applyPinned(ctx, { p2pMode: 'relay', ...config });
   return { tools, routes, warnings };
 }
 
@@ -890,7 +898,7 @@ describe('fleet-target: the selection routes w2m_run', () => {
       // The one case worth a log line: something is there and the control still cannot attach.
       const { ctx, tools, warnings } = makeCtx();
       ctx.connection = {};
-      await plugin.apply(ctx, { p2pMode: 'relay', ...(await runConfig()) });
+      await applyPinned(ctx, { p2pMode: 'relay', ...(await runConfig()) });
       const value = JSON.parse(await tools.get('w2m_status').execute({}, {}));
       assert.equal(value.target_selection.attached, false);
       const controlWarnings = warnings.filter((line) => /composer target control/.test(line));

@@ -24,6 +24,14 @@
  *   * when the blob vanishes mid-flight, it says so by name rather than crashing.
  */
 import assert from 'node:assert/strict';
+
+/**
+ * v1.1.6: `autoStartAgent` defaults to true. Cases in this file are about something else, so the harness pins it off
+ * once; call sites were renamed first, so this wrapper's own `plugin.apply` is still a real call.
+ */
+function applyPinned(ctx, config = {}) {
+  return plugin.apply(ctx, { autoStartAgent: false, ...config });
+}
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -101,7 +109,7 @@ async function standUp(localDoc) {
   await fs.writeFile(memoryFile, localDoc, 'utf8');
 
   const { ctx, tools } = makeCtx();
-  await plugin.apply(ctx, { rabbitUrl: relay.url, stateDir, profileDir, operatorToken: 'op' });
+  await applyPinned(ctx, { rabbitUrl: relay.url, stateDir, profileDir, operatorToken: 'op' });
 
   const publishVia = (doc) => fetch(`${relay.url}/v1/fleet/blobs/${sha256(doc)}`, {
     method: 'PUT',

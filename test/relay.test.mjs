@@ -4286,3 +4286,36 @@ describe('v1.0.9 fleet latest pointer', () => {
     });
   });
 });
+
+/**
+ * v1.1.6 account-key registration. The rule is "first pairing wins", and it is asserted in both directions because the
+ * dangerous half is the silent one: a second machine presenting a different key must be reported, not accepted.
+ */
+describe('the account key registry', () => {
+  it('registers the account key once and refuses to overwrite it with a different key', () => {
+    const state = new RabbitState({ now: () => 1_000 });
+    state.pair({ pairing_code: state.createPairingCode(), machine_id: 'm1', account_fingerprint: 'fp-1', account_public_key: 'PEM-A' });
+    assert.equal(state.accountKeyFor('fp-1'), 'PEM-A', 'the first pairing fixes the key');
+
+    state.pair({ pairing_code: state.createPairingCode(), machine_id: 'm2', account_fingerprint: 'fp-1', account_public_key: 'PEM-B' });
+    assert.equal(state.accountKeyFor('fp-1'), 'PEM-A', 'a second machine may not replace the account key');
+
+    const same = state.registerAccountKey('fp-1', 'PEM-A');
+    assert.equal(same.registered, false);
+    assert.equal(same.reason, 'ALREADY_REGISTERED', 'the same key again is a no-op, not a conflict');
+  });
+
+  it('registers nothing when the pairing request carries no account key, and pairing still works', () => {
+    const state = new RabbitState({ now: () => 1_000 });
+    const paired = state.pair({ pairing_code: state.createPairingCode(), machine_id: 'm1' });
+    assert.ok(paired.device_token, 'old clients must keep working');
+    assert.equal(state.accountKeyFor('fp-1'), null);
+  });
+
+  it('rejects malformed registration input instead of storing it', () => {
+    const state = new RabbitState({ now: () => 1_000 });
+    assert.equal(state.registerAccountKey('', 'PEM-A').reason, 'BAD_FINGERPRINT');
+    assert.equal(state.registerAccountKey('fp-1', '').reason, 'BAD_PUBLIC_KEY');
+    assert.equal(state.accountKeyFor('fp-1'), null);
+  });
+});

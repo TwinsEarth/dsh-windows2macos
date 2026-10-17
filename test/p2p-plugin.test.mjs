@@ -43,6 +43,15 @@
  */
 
 import assert from 'node:assert/strict';
+
+/**
+ * v1.1.6: \`autoStartAgent\` now defaults to true in the product, and every case in this file is about the P2P path,
+ * not about joining a fleet. Pinning it off once keeps each case's environment explicit, instead of editing twelve
+ * object literals by hand.
+ */
+function applyPinned(ctx, config = {}) {
+  return plugin.apply(ctx, { autoStartAgent: false, ...config });
+}
 import { createHash } from 'node:crypto';
 import { promises as fs, readFileSync } from 'node:fs';
 import http from 'node:http';
@@ -377,7 +386,7 @@ async function registerPlugin({ config }) {
   const binder = countingBinder();
   let live = null;
   try {
-    await plugin.apply(ctx, {
+    await applyPinned(ctx, {
       ...config,
       p2pBlock: {
         bindUdpSocket: binder.bindUdpSocket,
@@ -526,7 +535,7 @@ describe('v0.4.0 config: p2pMode', () => {
     // it wrong.
     for (const value of ['', null, 'AUTO', 'p2p', 'Auto', ' auto ', 'directt', 42, true]) {
       await assert.rejects(
-        () => plugin.apply(makeCtx().ctx, { rabbitUrl: 'http://127.0.0.1:1', p2pMode: value }),
+        () => applyPinned(makeCtx().ctx, { rabbitUrl: 'http://127.0.0.1:1', p2pMode: value }),
         (error) => {
           assert.equal(error.code, 'W2M_CONFIG', `${JSON.stringify(value)} must be a W2M_CONFIG error`);
           assert.match(error.message, /p2pMode/, `${JSON.stringify(value)} must name the setting`);
@@ -543,7 +552,7 @@ describe('v0.4.0 config: p2pMode', () => {
     const dir = await makeScratchDir();
     for (const mode of P2P_MODES) {
       const { ctx } = makeCtx();
-      await plugin.apply(ctx, { rabbitUrl: 'http://127.0.0.1:1', stateDir: dir, p2pMode: mode });
+      await applyPinned(ctx, { rabbitUrl: 'http://127.0.0.1:1', stateDir: dir, p2pMode: mode });
     }
   });
 
@@ -552,7 +561,7 @@ describe('v0.4.0 config: p2pMode', () => {
     process.env.W2M_P2P_MODE = 'AUTO';
     try {
       await assert.rejects(
-        () => plugin.apply(makeCtx().ctx, { rabbitUrl: 'http://127.0.0.1:1' }),
+        () => applyPinned(makeCtx().ctx, { rabbitUrl: 'http://127.0.0.1:1' }),
         (error) => {
           assert.equal(error.code, 'W2M_CONFIG');
           assert.match(error.message, /W2M_P2P_MODE/, 'the operator must be sent to the environment');
@@ -572,7 +581,7 @@ describe('v0.4.0 config: p2pMode', () => {
     const { ctx, disposers } = makeCtx();
     const binder = countingBinder();
     try {
-      await plugin.apply(ctx, {
+      await applyPinned(ctx, {
         rabbitUrl: 'http://127.0.0.1:1',
         stateDir: dir,
         p2pBlock: { bindUdpSocket: binder.bindUdpSocket, discover: loopbackDiscovery(), tuning: testTuning() },
@@ -600,7 +609,7 @@ describe('v0.4.0 config: stunServers', () => {
       ['a:1', 'bad'],
     ]) {
       await assert.rejects(
-        () => plugin.apply(makeCtx().ctx, { rabbitUrl: 'http://127.0.0.1:1', stunServers: value }),
+        () => applyPinned(makeCtx().ctx, { rabbitUrl: 'http://127.0.0.1:1', stunServers: value }),
         (error) => {
           assert.equal(error.code, 'W2M_CONFIG', `${JSON.stringify(value)} must be a W2M_CONFIG error`);
           assert.match(error.message, /stunServers/, `${JSON.stringify(value)} must name the setting`);
@@ -614,7 +623,7 @@ describe('v0.4.0 config: stunServers', () => {
   it('refuses a wrong type rather than falling back silently', async () => {
     for (const value of [42, {}, 'ok:3478,oops', ['stun.example.com:3478', 5]]) {
       await assert.rejects(
-        () => plugin.apply(makeCtx().ctx, { rabbitUrl: 'http://127.0.0.1:1', stunServers: value }),
+        () => applyPinned(makeCtx().ctx, { rabbitUrl: 'http://127.0.0.1:1', stunServers: value }),
         (error) => error.code === 'W2M_CONFIG' && /stunServers/.test(error.message),
         `${JSON.stringify(value)} must be refused`,
       );
@@ -646,7 +655,7 @@ describe('v0.4.0 config: stunServers', () => {
     process.env.W2M_STUN_SERVERS = 'not-a-server';
     try {
       await assert.rejects(
-        () => plugin.apply(makeCtx().ctx, { rabbitUrl: 'http://127.0.0.1:1' }),
+        () => applyPinned(makeCtx().ctx, { rabbitUrl: 'http://127.0.0.1:1' }),
         (error) => {
           assert.equal(error.code, 'W2M_CONFIG');
           assert.match(error.message, /W2M_STUN_SERVERS/);
@@ -710,7 +719,7 @@ describe('v0.4.0 config: stunServers', () => {
 
     await withoutP2pEnvironment(async () => {
       const { ctx, tools } = makeCtx();
-      await plugin.apply(ctx, bundled);
+      await applyPinned(ctx, bundled);
       assert.equal(tools.size, 11);
     });
   });
@@ -912,7 +921,7 @@ describe('v0.4.0 shared server default', () => {
     await withoutP2pEnvironment(async () => {
       process.env.W2M_RABBIT_URL = 'not-a-url';
       await assert.rejects(
-        () => plugin.apply(makeCtx().ctx, {}),
+        () => applyPinned(makeCtx().ctx, {}),
         (error) => {
           assert.equal(error.code, 'W2M_CONFIG');
           assert.match(error.message, /W2M_RABBIT_URL/);
@@ -1491,7 +1500,7 @@ describe('v0.4.0 p2pMode=relay', () => {
     await withRelay(async (relay) => {
       const { dir } = await makeDeviceDir(relay, 'machine-origin');
       const { ctx, disposers } = makeCtx();
-      await plugin.apply(ctx, {
+      await applyPinned(ctx, {
         rabbitUrl: relay.url,
         stateDir: dir,
         projectDir: dir,
@@ -1574,7 +1583,7 @@ describe('v0.4.0 auto mode owns exactly one socket', () => {
 async function registerPluginWithBinder(bindUdpSocket, config) {
   const { ctx, tools, disposers } = makeCtx();
   const recorder = recordFetch();
-  await plugin.apply(ctx, {
+  await applyPinned(ctx, {
     ...config,
     p2pBlock: { bindUdpSocket, discover: loopbackDiscovery(), tuning: testTuning() },
   });

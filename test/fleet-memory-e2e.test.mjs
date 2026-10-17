@@ -14,6 +14,14 @@
  * because that sequence is what a machine actually does.
  */
 import assert from 'node:assert/strict';
+
+/**
+ * v1.1.6: `autoStartAgent` defaults to true. Cases in this file are about something else, so the harness pins it off
+ * once; call sites were renamed first, so this wrapper's own `plugin.apply` is still a real call.
+ */
+function applyPinned(ctx, config = {}) {
+  return plugin.apply(ctx, { autoStartAgent: false, ...config });
+}
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -109,7 +117,7 @@ describe('fleet memory actions, end to end', () => {
       await fs.writeFile(memoryFile, localDoc, 'utf8');
 
       const { ctx, tools } = makeCtx();
-      await plugin.apply(ctx, { rabbitUrl: relay.url, stateDir, profileDir, operatorToken: OP });
+      await applyPinned(ctx, { rabbitUrl: relay.url, stateDir, profileDir, operatorToken: OP });
       const memory = tools.get('w2m_memory');
       assert.ok(memory, 'w2m_memory must be registered');
 

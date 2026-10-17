@@ -47,6 +47,14 @@
  */
 
 import { after, describe, it } from 'node:test';
+
+/**
+ * v1.1.6: `autoStartAgent` defaults to true. Cases in this file are about something else, so the harness pins it off
+ * once; call sites were renamed first, so this wrapper's own `plugin.apply` is still a real call.
+ */
+function applyPinned(ctx, config = {}) {
+  return plugin.apply(ctx, { autoStartAgent: false, ...config });
+}
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
@@ -97,7 +105,7 @@ async function register(config = {}) {
     effect: () => {},
     on: () => {},
   };
-  await plugin.apply(ctx, { rabbitUrl: 'http://127.0.0.1:1', ...config });
+  await applyPinned(ctx, { rabbitUrl: 'http://127.0.0.1:1', ...config });
   return tools;
 }
 

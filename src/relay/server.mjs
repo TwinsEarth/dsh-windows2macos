@@ -22,6 +22,8 @@ import {
   RabbitState,
   rfc3339,
 } from './state.mjs';
+import { createJoinChallenges } from './join-challenge.mjs';
+import { createAdmission } from './admission.mjs';
 import { Persistence } from './persistence.mjs';
 import { PeerRegistry } from './peers.mjs';
 import { aggregateTask, buildReport } from './report.mjs';
@@ -733,6 +735,25 @@ export class RelayServer {
       return sendJson(res, 200, result);
     }
 
+    /* ---- v1.1.6: reachable WITHOUT a device token ---- */
+    this.joinChallenges ??= createJoinChallenges({
+      now: () => this.state.nowMs(),
+      publicKeyFor: (fingerprint) => this.state.accountKeyFor(fingerprint),
+    });
+    if (method === 'GET' && path === '/v1/fleet/admission/challenge') {
+      const issued = this.joinChallenges.issue(url.searchParams.get('fingerprint') ?? '', url.searchParams.get('machine_id') ?? '');
+      if (issued.ok !== true) throw new ProtocolError('BAD_REQUEST', 'challenge refused: ' + issued.code, { code: issued.code });
+      return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ...issued });
+    }
+    if (method === 'POST' && path === '/v1/fleet/admission/request') {
+      const body = takeJson();
+      this.admission ??= createAdmission({ now: () => this.state.nowMs() });
+      const proof = this.joinChallenges.consume({ challenge_id: body.challenge_id, machine_id: body.machine_id, signature: body.signature });
+      if (proof.ok !== true) throw new ProtocolError('UNAUTHORIZED', 'join proof refused: ' + proof.code, { code: proof.code });
+      const result = this.admission.requestAdmission({ machine_id: body.machine_id, machine_name: body.machine_name ?? null, account_fingerprint: proof.fingerprint });
+      return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ...result });
+    }
+
     /* ---- everything below requires `Authorization: Bearer <device_token>` ---- */
     const token = bearerToken(req);
     const device = token ? this.state.authenticate(token) : null;
@@ -889,6 +910,11 @@ export class RelayServer {
     // v0.3.9: P2P candidate rendezvous. `/announce` is checked before the read route
     // so that a machine literally named "announce" cannot shadow it.
     const peerReadMatch = /^\/v1\/peer\/([^/]+)$/.exec(path);
+    /* ---- v1.1.6 admission ---- */
+    const admissionDecideMatch = /^\/v1\/fleet\/admission\/([^/]+)\/decide$/.exec(path);
+    const admissionOneMatch = /^\/v1\/fleet\/admission\/([^/]+)$/.exec(path);
+    const memberRemoveMatch = /^\/v1\/fleet\/members\/([^/]+)\/remove$/.exec(path);
+    const removalVoteMatch = /^\/v1\/fleet\/removals\/([^/]+)\/vote$/.exec(path);
 
     /* ---- v0.3.9 P2P signalling ---- */
     if (method === 'POST' && path === '/v1/peer/announce') {
@@ -965,6 +991,50 @@ export class RelayServer {
         leases: [...task.leases.values()],
         aggregate,
       });
+    }
+
+
+    /* ---- v1.1.6 admission: the caller is always `device.machine_id`, never a body field ---- */
+    this.admission ??= createAdmission({ now: () => this.state.nowMs() });
+
+    if (method === 'GET' && path === '/v1/fleet/admission/pending') {
+      return sendJson(res, 200, {
+        protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(),
+        pending: this.admission.pendingFor(),
+      });
+    }
+
+    if (method === 'POST' && admissionDecideMatch) {
+      const body = takeJson();
+      const result = this.admission.decide(decodeURIComponent(admissionDecideMatch[1]), {
+        decision: body.decision, decided_by: device.machine_id, auto: body.auto === true,
+      });
+      if (result.ok !== true) throw new ProtocolError('BAD_REQUEST', 'admission decision refused: ' + result.code, result);
+      return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ...result });
+    }
+
+    if (method === 'GET' && admissionOneMatch) {
+      const request = this.admission.getRequest(decodeURIComponent(admissionOneMatch[1]));
+      if (request === null) throw new ProtocolError('NOT_FOUND', 'unknown admission request');
+      return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), request });
+    }
+
+    if (method === 'POST' && memberRemoveMatch) {
+      const body = takeJson();
+      const result = this.admission.remove(decodeURIComponent(memberRemoveMatch[1]), {
+        requested_by: device.machine_id, reason: typeof body.reason === 'string' ? body.reason : null,
+      });
+      if (result.ok !== true) throw new ProtocolError('BAD_REQUEST', 'removal refused: ' + result.code, result);
+      return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ...result });
+    }
+
+    if (method === 'POST' && removalVoteMatch) {
+      const body = takeJson();
+      const result = this.admission.vote(decodeURIComponent(removalVoteMatch[1]), {
+        machine_id: device.machine_id, vote: body.vote,
+      });
+      if (result.ok !== true) throw new ProtocolError('BAD_REQUEST', 'vote refused: ' + result.code, result);
+      return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ...result });
     }
 
     throw new ProtocolError('NOT_FOUND', `no route for ${method} ${path}`, { method, path });

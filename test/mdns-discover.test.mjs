@@ -12,7 +12,7 @@
  *      the multicast group replaced by a loopback address so that **no packet leaves this host**. This
  *      proves the query/response path, the reply addressing rules and the TTL=0 goodbye are real, and it
  *      is why these tests bind and send rather than mocking `dgram`.
- *   3. **Tool wiring.** `w2m_devices` is driven through `plugin.apply()` to prove the discovery block is
+ *   3. **Tool wiring.** `w2m_devices` is driven through `applyPinned()` to prove the discovery block is
  *      actually exposed --and, on whatever network the machine happens to be on, that no candidate is
  *      ever presented as verified or as a dispatch target the relay has not listed.
  *
@@ -30,6 +30,14 @@
  */
 
 import assert from 'node:assert/strict';
+
+/**
+ * v1.1.6: `autoStartAgent` defaults to true. Cases in this file are about something else, so the harness pins it off
+ * once; call sites were renamed first, so this wrapper's own `plugin.apply` is still a real call.
+ */
+function applyPinned(ctx, config = {}) {
+  return plugin.apply(ctx, { autoStartAgent: false, ...config });
+}
 import { after, describe, it } from 'node:test';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
@@ -73,7 +81,7 @@ import {
  *
  * ## The defect this closes, and how it was measured
  *
- * `registerPlugin` below calls `plugin.apply(ctx, { p2pMode: 'relay', rabbitUrl: ... })` -- **no `stateDir`** --
+ * `registerPlugin` below calls `applyPinned(ctx, { p2pMode: 'relay', rabbitUrl: ... })` -- **no `stateDir`** --
  * and `w2m_devices` resolves its token through `deviceFilePath()`, which falls back to the operator's real
  * `~/.dsh/xclient/device.json` when nothing is configured. On a machine where that file exists but holds
  * `device_token: null` -- **which is the normal state of a machine that has installed the plugin and not yet
@@ -1274,7 +1282,7 @@ async function registerPlugin(routes) {
       callback(ctx);
     },
   };
-  await plugin.apply(ctx, { p2pMode: 'relay', rabbitUrl: 'http://127.0.0.1:8787' });
+  await applyPinned(ctx, { p2pMode: 'relay', rabbitUrl: 'http://127.0.0.1:8787' });
   assert.equal(calls.length, 0, 'applying the plugin must not call the relay');
   return { tools, warnings };
 }

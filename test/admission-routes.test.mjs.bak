@@ -1,0 +1,83 @@
+/**
+ * The five admission routes, over a REAL relay instance.
+ *
+ * ## Why this file exists when admission.mjs already has unit tests
+ *
+ * "The state machine is correct" and "the route is reachable" are different claims, and this project has already paid
+ * for confusing them: node --check and the unit suites were green once while the plugin failed to mount, because a
+ * symbol was named that did not exist. A typo in a path matcher, or a route placed after the 404, passes every unit test
+ * and fails every client. So these tests boot the server, pair two machines and speak HTTP.
+ *
+ * The vote route is exercised through its refusal path on purpose: reaching the vote path itself requires a member that
+ * joined more than 24 hours ago, and the relay's clock is the only clock -- a test that waited 24 hours would not be run.
+ * Reachability and refusal are what a route test can honestly assert here; the counting is covered by admission.test.mjs.
+ */
+import { describe, it } from 'node:test';
+import assert from 'node:assert/strict';
+import { createRelayServer } from '../src/relay/server.mjs';
+
+const OP = 'operator-token-for-tests';
+
+async function liveRelay() {
+  const relay = createRelayServer({ host: '127.0.0.1', port: 0, persist: false, operatorToken: OP });
+  const info = await relay.listen();
+  const port = info.port ?? info.port_actual;
+  const base = 'http://127.0.0.1:' + port;
+  const pair = async (machine_id) => {
+    const code = relay.state.createPairingCode();
+    const res = await fetch(base + '/v1/pair', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ pairing_code: code, machine_id, machine_name: machine_id, platform: { os: 'linux', arch: 'x64' }, caps: {} }),
+    });
+    const body = await res.json();
+    assert.equal(res.status, 200, 'pair failed: ' + JSON.stringify(body));
+    return body.device_token;
+  };
+  const call = async (method, path, token, body) => {
+    const res = await fetch(base + path, {
+      method,
+      headers: { 'content-type': 'application/json', ...(token ? { authorization: 'Bearer ' + token } : {}) },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    return { status: res.status, body: await res.json() };
+  };
+  return { relay, base, pair, call, close: () => relay.close?.() };
+}
+
+describe('the admission routes answer over HTTP', () => {
+  it('request -> pending, pending -> contains it, decide -> approved, remove -> immediate', async () => {
+    const { pair, call, close } = await liveRelay();
+    try {
+      const admin = await pair('m1');
+      const applicant = await pair('m2');
+
+      const requested = await call('POST', '/v1/fleet/admission/request', applicant, { machine_name: 'm2', account_fingerprint: 'fp-1' });
+      assert.equal(requested.status, 200, JSON.stringify(requested.body));
+      assert.equal(requested.body.state, 'pending');
+      const requestId = requested.body.request_id;
+      assert.ok(requestId, 'no request_id was issued');
+
+      const pending = await call('GET', '/v1/fleet/admission/pending', admin);
+      assert.equal(pending.status, 200);
+      assert.ok(pending.body.pending.some((r) => r.request_id === requestId), 'the admin cannot see the request it must decide');
+
+      const decided = await call('POST', '/v1/fleet/admission/' + requestId + '/decide', admin, { decision: 'approve' });
+      assert.equal(decided.status, 200, JSON.stringify(decided.body));
+      assert.equal(decided.body.state, 'approved');
+
+      const removed = await call('POST', '/v1/fleet/members/m2/remove', admin, { reason: 'test' });
+      assert.equal(removed.status, 200, JSON.stringify(removed.body));
+      assert.equal(removed.body.immediate, true, 'inside 24h the kick is immediate');
+    } finally { close(); }
+  });
+
+  it('the vote route is reachable and refuses a vote on an unknown removal', async () => {
+    const { pair, call, close } = await liveRelay();
+    try {
+      const admin = await pair('m1');
+      const res = await call('POST', '/v1/fleet/removals/rmv-9999/vote', admin, { vote: 'yes' });
+      assert.equal(res.status, 400, 'unknown removal must be refused, not 404 from the router');
+      assert.match(JSON.stringify(res.body), /NOT_FOUND/, 'the refusal must name the reason');
+    } finally { close(); }
+  });
+});

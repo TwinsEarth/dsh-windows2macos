@@ -876,6 +876,31 @@ export class RabbitState {
   }
 
   /** §2.2 step 3: validate a one-time code. */
+  /**
+   * The account fingerprint -> public key registry (v1.1.6).
+   *
+   * Keyed by the FINGERPRINT, not by machine: every machine on one account shares the derived keypair, and the point of
+   * the registry is to answer "which key speaks for this account", once, for all of them.
+   *
+   * @returns {{registered: boolean, reason?: string}}
+   */
+  registerAccountKey(fingerprint, publicKeyPem) {
+    if (typeof fingerprint !== 'string' || fingerprint === '') return { registered: false, reason: 'BAD_FINGERPRINT' };
+    if (typeof publicKeyPem !== 'string' || publicKeyPem === '') return { registered: false, reason: 'BAD_PUBLIC_KEY' };
+    this.accountKeys ??= new Map();
+    const existing = this.accountKeys.get(fingerprint);
+    if (existing !== undefined) {
+      return { registered: false, reason: existing === publicKeyPem ? 'ALREADY_REGISTERED' : 'KEY_MISMATCH' };
+    }
+    this.accountKeys.set(fingerprint, publicKeyPem);
+    return { registered: true };
+  }
+
+  /** @returns {string|null} the key that speaks for this account, or null if no machine ever paired for it. */
+  accountKeyFor(fingerprint) {
+    return this.accountKeys?.get(fingerprint) ?? null;
+  }
+
   validatePairingCode(code) {
     if (typeof code !== 'string' || code.length === 0) {
       throw new ProtocolError('PAIRING_INVALID', 'pairing_code is required');
@@ -987,6 +1012,27 @@ export class RabbitState {
     };
     this.devices.set(machineId, device);
     this.tokens.set(token, machineId);
+
+    /**
+     * v1.1.6: register the account's signing key while we have proof of the account.
+     *
+     * A machine that failed the old joining path must later prove the account to the relay. It can only do that against
+     * a key the relay already trusts, and the only moment the relay has real proof ("this machine holds the account
+     * material") is a successful pairing. So this is the trust anchor, and it is written HERE rather than at
+     * registration time to keep the two paths honest: no pairing, no key.
+     *
+     * Idempotent on purpose: the first machine to pair for a fingerprint fixes the key. A second machine claiming the
+     * same fingerprint with a DIFFERENT key is not silently accepted -- the registration is refused and reported, and
+     * changing a key needs the fleet vote the removal flow already provides.
+     */
+    const accountFingerprint = typeof request.account_fingerprint === 'string' ? request.account_fingerprint : '';
+    const accountPublicKey = typeof request.account_public_key === 'string' ? request.account_public_key : '';
+    const accountKey = accountFingerprint !== '' && accountPublicKey !== ''
+      ? this.registerAccountKey(accountFingerprint, accountPublicKey)
+      : null;
+    // Recorded on the device, not just discarded: a second machine claiming the same account with a different key is
+    // refused, and the refusal must be visible in devices.json rather than looking like a successful registration.
+    device.account_key = accountKey;
     rec.used = true;
 
     // A group has more than one machine, and a single-use code would leave the

@@ -17,6 +17,14 @@
  */
 
 import assert from 'node:assert/strict';
+
+/**
+ * v1.1.6: `autoStartAgent` defaults to true. Cases in this file are about something else, so the harness pins it off
+ * once; call sites were renamed first, so this wrapper's own `plugin.apply` is still a real call.
+ */
+function applyPinned(ctx, config = {}) {
+  return plugin.apply(ctx, { autoStartAgent: false, ...config });
+}
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -109,7 +117,9 @@ async function register(config = {}) {
   // stub is live and shifts `calls[0]`. This suite therefore pins `p2pMode: 'relay'` — the mode that
   // binds no socket and makes no announcement — unless a test asks for something else. The direct
   // path itself is covered against real sockets in `test/p2p-plugin.test.mjs`.
-  await plugin.apply(ctx, { p2pMode: 'relay', ...config });
+  // autoStartAgent is pinned off here for the same reason p2pMode is: this suite asserts the exact HTTP call
+  // list, and a started agent adds its own traffic. A test that wants the product default passes `undefined`.
+  await applyPinned(ctx, { p2pMode: 'relay', autoStartAgent: false, ...config });
   return { tools, warnings };
 }
 

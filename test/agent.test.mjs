@@ -10,6 +10,14 @@
  */
 
 import { describe, it, before, after } from 'node:test';
+
+/**
+ * v1.1.6: `autoStartAgent` defaults to true. Cases in this file are about something else, so the harness pins it off
+ * once; call sites were renamed first, so this wrapper's own `plugin.apply` is still a real call.
+ */
+function applyPinned(ctx, config = {}) {
+  return plugin.apply(ctx, { autoStartAgent: false, ...config });
+}
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
@@ -3055,7 +3063,7 @@ async function registerPluginTools(config) {
     },
     logger: { warn: () => {}, info: () => {} },
   };
-  await plugin.apply(ctx, config);
+  await applyPinned(ctx, config);
   return tools;
 }
 
@@ -4410,7 +4418,7 @@ const ctx = {
 };
 // Port 1 is not listening: the announcement fails, which is a reported fact and never fatal. What
 // matters here is that the socket binds and the accept loop starts.
-await plugin.apply(ctx, { rabbitUrl: 'http://127.0.0.1:1', stateDir, projectDir });
+await plugin.apply(ctx, { autoStartAgent: true, rabbitUrl: 'http://127.0.0.1:1', stateDir, projectDir });
 const status = JSON.parse(await tools.get('w2m_status').execute({}, {}));
 console.log(
   'BARE_CTX_OK p2p_running=' + status.p2p?.running + ' socket_bound=' + status.p2p?.transport?.socket_bound,
