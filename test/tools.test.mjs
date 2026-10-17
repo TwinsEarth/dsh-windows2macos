@@ -3123,3 +3123,41 @@ describe('w2m_approvals and fleet admission', () => {
     assert.equal(out.reason_code, 'ALREADY_DECIDED');
   });
 });
+
+/**
+ * v1.1.18: the channel report is opt-in, and a failed lookup is reported as "nothing on that channel" rather than as a
+ * crash or as a substituted stable version.
+ *
+ * The first assertion is the one that protects every other call: a plain w2m_update status is LOCAL, and a version that
+ * quietly reached GitHub on every status call would slow the tool down and break it behind a proxy.
+ */
+describe('w2m_update channels (v1.1.18)', () => {
+  it('the three channels are opt-in: a plain status reaches no network at all', async () => {
+    const { tools } = await register({});
+    const calls = [];
+    const previous = globalThis.fetch;
+    globalThis.fetch = async (url) => { calls.push(String(url)); throw new Error('status must not reach the network'); };
+    try {
+      const out = JSON.parse(await tools.get('w2m_update').execute({ action: 'status' }));
+      assert.equal(out.ok, true);
+      assert.ok(out.update, 'the local description must still be there');
+      assert.equal(out.channels, undefined, 'channels require the explicit flag');
+      assert.deepEqual(calls, [], 'a default status call must not touch the network');
+    } finally { globalThis.fetch = previous; }
+  });
+
+  it('with the flag, an unreachable GitHub yields an explicit empty channel instead of a substituted version', async () => {
+    const { tools } = await register({});
+    const previous = globalThis.fetch;
+    globalThis.fetch = async () => ({ ok: false, status: 403, json: async () => ({}), text: async () => '' });
+    try {
+      const out = JSON.parse(await tools.get('w2m_update').execute({ action: 'status', channels: true }));
+      assert.ok(out.channels, 'the structure must be there even when both lookups fail');
+      assert.equal(out.channels.stable.available, null);
+      assert.equal(out.channels.beta.available, null);
+      assert.equal(out.latest.channel, null, 'no channel may be invented when neither source answered');
+      assert.equal(out.sources.stable.ok, false, 'the failure is carried, not hidden');
+      assert.ok(/RATE_LIMITED|HTTP_/.test(out.sources.stable.code ?? ''), 'a 403 is named, not flattened');
+    } finally { globalThis.fetch = previous; }
+  });
+});

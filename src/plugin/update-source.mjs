@@ -684,3 +684,74 @@ export async function downloadVerified({
 }
 
 export default { fetchLatestRelease, downloadVerified, parseVersion, compareVersions, isNewer, parseSha256Sums, findChecksum };
+
+/**
+ * The beta channel's source: the newest PRERELEASE.
+ *
+ * ## Why this cannot reuse `fetchLatestRelease`
+ *
+ * That function asks GitHub for `/releases/latest`, and GitHub's own definition of "latest" **excludes prereleases**
+ * -- which is exactly right for the stable channel and exactly wrong for the beta one. The beta channel needs the
+ * opposite query: list releases, keep the prereleases, take the highest by SemVer.
+ *
+ * ## What it deliberately does not do
+ *
+ * It does not fall back to a stable release when no prerelease exists. "There is no beta right now" is a fact the update
+ * UI has to be able to show (a disabled button); substituting the stable version would make the beta button a stable
+ * button with a misleading label.
+ *
+ * @param {{repo?: string, fetchImpl?: Function, timeoutMs?: number, token?: string|null,
+ *          apiBase?: string, userAgent?: string, perPage?: number, signal?: AbortSignal|null}} [options]
+ * @returns {Promise<{ok:true, tag:string, version:object|null, prerelease:true, htmlUrl:string|null}
+ *   | {ok:false, code:string, error:string, status?:number, rateLimited?:boolean}>}
+ */
+export async function fetchPrereleaseRelease({
+  repo = DEFAULT_REPO,
+  fetchImpl = globalThis.fetch,
+  timeoutMs = DEFAULT_TIMEOUT_MS,
+  token = null,
+  apiBase = DEFAULT_API_BASE,
+  userAgent = DEFAULT_USER_AGENT,
+  perPage = 30,
+  signal = null,
+} = {}) {
+  try {
+    if (typeof fetchImpl !== 'function') {
+      throw new UpdateSourceError('NO_FETCH', 'no fetch implementation available (Node.js 18+ required)');
+    }
+    if (typeof repo !== 'string' || !/^[\w.-]+\/[\w.-]+$/.test(repo)) {
+      throw new UpdateSourceError('BAD_REPO', 'repo must look like "owner/name"');
+    }
+    const base = String(apiBase).replace(/\/+$/, '');
+    const url = base + '/repos/' + repo + '/releases?per_page=' + perPage;
+    const headers = { accept: 'application/vnd.github+json', 'user-agent': userAgent };
+    if (typeof token === 'string' && token !== '') headers.authorization = 'Bearer ' + token;
+    const response = await fetchImpl(url, { headers, signal: signal ?? AbortSignal.timeout(timeoutMs) });
+    const status = response?.status ?? 0;
+    if (response?.ok !== true) {
+      const rateLimited = status === 403 || status === 429;
+      return { ok: false, status, rateLimited, code: rateLimited ? 'RATE_LIMITED' : 'HTTP_' + status, error: 'GitHub answered HTTP ' + status };
+    }
+    const list = await response.json();
+    if (!Array.isArray(list)) return { ok: false, code: 'BAD_SHAPE', error: 'the releases response was not an array' };
+    const candidates = list.filter((r) => r && r.draft !== true && r.prerelease === true && typeof r.tag_name === 'string');
+    if (candidates.length === 0) {
+      // Not an error: the beta channel is empty, and the caller must be able to say so.
+      return { ok: false, code: 'NO_PRERELEASE', error: 'there is no prerelease at the moment' };
+    }
+    let best = candidates[0];
+    for (const candidate of candidates.slice(1)) {
+      // Highest SemVer wins; `compareVersions` is the same comparison the install decision uses.
+      if (compareVersions(candidate.tag_name, best.tag_name) > 0) best = candidate;
+    }
+    return {
+      ok: true,
+      tag: best.tag_name,
+      version: parseVersion(best.tag_name),
+      prerelease: true,
+      htmlUrl: typeof best.html_url === 'string' ? best.html_url : null,
+    };
+  } catch (error) {
+    return { ok: false, code: 'FETCH_FAILED', error: String(error && error.message ? error.message : error) };
+  }
+}

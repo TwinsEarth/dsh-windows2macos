@@ -89,7 +89,10 @@
  */
 
 import { execFile } from 'node:child_process';
-import { createHash, randomUUID } from 'node:crypto';
+
+import { resolveChannels } from './update-channels.mjs';
+import { fetchLatestRelease, fetchPrereleaseRelease, requireChecksum, downloadVerified, DEFAULT_REPO } from './update-source.mjs';
+import { installUpdate } from './update-install.mjs';import { createHash, randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -4858,7 +4861,50 @@ export async function apply(ctx, config = {}) {
       // `jsonOutput` is a renderer, not a serialiser; the tool still owns turning its value into
       // text.
       if (action === 'status') {
-        return JSON.stringify({ ok: true, action, update: updater.describe() }, null, 2);
+        const described = { ok: true, action, update: updater.describe() };
+        // Opt-in on purpose: the plain status call is local and offline, and making it reach GitHub would slow every
+        // w2m_status and fail behind a proxy. The three channels need two API calls, so they are asked for explicitly.
+        if (args?.channels !== true) return JSON.stringify(described, null, 2);
+        const repo = (typeof process.env.W2M_UPDATE_REPO === 'string' && process.env.W2M_UPDATE_REPO.trim() !== '')
+          ? process.env.W2M_UPDATE_REPO.trim() : DEFAULT_REPO;
+        const [stableRelease, betaRelease] = await Promise.all([fetchLatestRelease({ repo }), fetchPrereleaseRelease({ repo })]);
+        const currentVersion = resolveCurrentVersion(null, process.env);
+        return JSON.stringify({ ...described, ...resolveChannels({ stable: stableRelease?.ok === true ? stableRelease : null, beta: betaRelease?.ok === true ? betaRelease : null, currentVersion }), sources: { stable: stableRelease, beta: betaRelease } }, null, 2);
+      }
+
+      /**
+       * v1.1.18: install a specific channel. The beta channel exists only as a GitHub prerelease, so it is verified here
+       * rather than trusted: the tarball sha256 must match the SHA256SUMS shipped with the same release, and
+       * downloadVerified removes its temp file on a mismatch, leaving the installed profile untouched.
+       */
+      if (action === 'apply') {
+        const channel = typeof args?.channel === 'string' ? args.channel : 'stable';
+        if (channel !== 'stable' && channel !== 'beta' && channel !== 'latest') {
+          throw new W2MError('W2M_CHANNEL', 'W2M_CHANNEL: channel must be stable, beta or latest', { hint: 'call status with channels=true to see what each channel offers' });
+        }
+        const repo = (typeof process.env.W2M_UPDATE_REPO === 'string' && process.env.W2M_UPDATE_REPO.trim() !== '')
+          ? process.env.W2M_UPDATE_REPO.trim() : DEFAULT_REPO;
+        const [stableRelease, betaRelease] = await Promise.all([fetchLatestRelease({ repo }), fetchPrereleaseRelease({ repo })]);
+        const currentVersion = resolveCurrentVersion(null, process.env);
+        const resolved = resolveChannels({ stable: stableRelease?.ok === true ? stableRelease : null, beta: betaRelease?.ok === true ? betaRelease : null, currentVersion });
+        const wanted = channel === 'latest' ? resolved.latest.channel : channel;
+        const release = wanted === 'beta' ? betaRelease : stableRelease;
+        if (release?.ok !== true) {
+          throw new W2MError('W2M_NO_CHANNEL', 'W2M_NO_CHANNEL: nothing is available on the ' + channel + ' channel', { hint: release?.code ? release.code + ': ' + release.error : undefined });
+        }
+        const sumsAsset = release.assets?.sums;
+        const tarballAsset = release.assets?.tarball;
+        if (!sumsAsset || !tarballAsset) throw new W2MError('W2M_NO_ASSETS', 'W2M_NO_ASSETS: the release carries no tarball and SHA256SUMS');
+        const sumsResponse = await fetch(sumsAsset.url, { headers: sumsAsset.headers ?? {} });
+        if (sumsResponse?.ok !== true) throw new W2MError('W2M_SUMS', 'W2M_SUMS: could not download SHA256SUMS (HTTP ' + sumsResponse?.status + ')');
+        const sha256 = requireChecksum(await sumsResponse.text(), tarballAsset.name);
+        const profileDir = args?.profile_dir ?? findProfileDir({});
+        const staged = await downloadVerified({ url: tarballAsset.url, sha256, destPath: (args?.staging_dir ?? profileDir) + '/.w2m-update/' + tarballAsset.name });
+        if (staged?.ok !== true) {
+          throw new W2MError('W2M_CHECKSUM', 'W2M_CHECKSUM: refusing to install; ' + (staged?.code ?? 'download-failed') + ' ' + (staged?.error ?? ''), { hint: 'a checksum mismatch is not retried: the asset and its SHA256SUMS disagree' });
+        }
+        const installed = await installUpdate({ tarballPath: staged.path, profileDir, expectedSha256: sha256, dryRun: args?.dry_run === true });
+        return JSON.stringify({ ok: installed?.ok === true, action, channel, version: resolved.channels[wanted]?.available ?? null, sha256, install: installed }, null, 2);
       }
       const result = await updater.check('manual');
       // `ok:false` inside `result` means "the check could not complete", never "the tool failed".

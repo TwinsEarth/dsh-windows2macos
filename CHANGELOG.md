@@ -2,6 +2,51 @@
 
 All notable changes to this project are documented here.
 
+## [1.1.18] — 2026-10-18
+
+**The developer declares this a STABLE release.** It ships the three-channel updater and the release plumbing that makes
+the beta channel real.
+
+### Three channels, resolved from the two releases that exist
+
+`w2m_update action:"status" channels:true` reports:
+
+| Channel | Source | Rule |
+|---|---|---|
+| `stable` | GitHub's `/releases/latest` | never a prerelease |
+| `beta` | the newest **prerelease**, fetched from `/releases` and filtered | exists only when one is published |
+| `latest` | whichever of the two is newer by SemVer | equal versions resolve to stable |
+
+Every decision comes from the existing `decideUpdate`, so the channel logic cannot drift from the install rule; this
+module only chooses which two releases to ask about. A missing beta is reported as `available: null` rather than
+substituted with stable — "there is no beta right now" is a fact the UI has to be able to show as a disabled button.
+
+**The channel report is opt-in.** A plain `status` remains local and offline; making every status call reach GitHub would
+slow the tool and break it behind a proxy. Asserted by a test that fails if any fetch happens.
+
+### Installing a channel, with the checksum enforced twice
+
+`w2m_update action:"apply" channel:"stable"|"beta"|"latest"`: the release's `SHA256SUMS` is downloaded, the hash for the
+tarball is required (no hash, no install), `downloadVerified` removes its temp file on any mismatch, and `installUpdate`
+receives `expectedSha256` as well and keeps its rollback path. A mismatch is not retried: it means the asset and its
+checksums disagree, which is never a transient condition.
+
+### The beta channel is a GitHub prerelease, and never npm
+
+`.github/workflows/beta.yml`: a bump is a beta by default; a beta becomes a **prerelease** (so neither GitHub nor npm
+resolves it as latest) gated by the `beta-access` environment, which requires a reviewer. There is **no `npm publish`
+line in that file** — a channel cannot leak into the default install if the publication cannot happen at all. npm
+receives a version only when the developer declares it stable, as this release does.
+
+`.github/workflows/packages.yml` mirrors a released stable version to GitHub Packages with the registry overridden **on
+the command line**, because `publishConfig.registry` would silently redirect the operator-channel publish too.
+
+### Verified
+
+Gate GREEN twice, 15/15. 2504 tests / 2490 pass / 0 fail / 14 skip. tools 122, update-channels 4, update-prerelease 2.
+The first GitHub Packages publication succeeded; the package page itself is confirmed by the operator, since the PAT has
+no `read:packages` scope to read it back.
+
 ## [1.1.17] — 2026-10-18
 
 **Fleet chat: messages live in a session, are refused by a byte budget rather than silently dropped, are stored
