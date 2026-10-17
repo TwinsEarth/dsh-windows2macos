@@ -2,7 +2,23 @@
 
 All notable changes to this project are documented here.
 
-## [1.0.7] — 2026-10-17
+## [1.0.8] — 2026-10-17
+
+**The fleet sync channel, both directions: a machine can publish its collective memory to the relay and another
+machine in the same fleet can fetch it back by hash.**
+
+> **Why 1.0.7 and 1.0.8 are both published, and what that records.** `pnpm publish 1.0.7` succeeded; a verification
+> read a minute later answered `version not found: 1.0.7`, a retry answered
+> `409 Cannot publish over previously staged version "1.0.7"`, and `npm stage list` reported nothing -- so 1.0.7 was
+> concluded to have failed and 1.0.8 was cut. **The registry was simply lagging: both versions are published, and
+> their contents are identical apart from the version string.** The 409 was the retry racing a publish that was
+> still in flight, not evidence that nothing had been accepted.
+>
+> **The mistake worth keeping is the conclusion, not the retry.** A freshness read that disagrees with a successful
+> write is evidence of lag, not of failure -- and the way to tell them apart is to wait and re-read, which is
+> cheaper than re-cutting a release. 1.0.8 stands as the current version because it is already published and is the
+> one `latest` names; 1.0.7 is deprecated pointing here rather than left to look like a distinct release.
+
 
 **The fleet sync channel, both directions: a machine can publish its collective memory to the relay and another
 machine in the same fleet can fetch it back by hash.**
