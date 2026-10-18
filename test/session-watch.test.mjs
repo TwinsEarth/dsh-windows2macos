@@ -6,14 +6,21 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { zstdCompressSync } from 'node:zlib';
+import { createRequire } from 'node:module';
+import { zstdAvailable } from '../src/plugin/session-watch.mjs';
+
+// Node 20 has no zstd API. The feature is then unavailable, not broken: the reader returns nothing and these tests say so
+// instead of failing, because the support matrix deliberately includes a runtime that cannot decode the format.
+const zstd = createRequire(import.meta.url)('node:zlib');
+const supported = zstdAvailable() && typeof zstd.zstdCompressSync === 'function';
+const skip = supported ? false : 'this Node has no zstd API (needs >= 22.15)';
 import {
   conversationKey, decodeTranscript, extractUserMessages, sessionDirName, splitZstdFrames,
 } from '../src/plugin/session-watch.mjs';
 
-const frame = (events) => zstdCompressSync(Buffer.from(events.map((e) => JSON.stringify(e)).join('\n') + '\n', 'utf8'));
+const frame = (events) => zstd.zstdCompressSync(Buffer.from(events.map((e) => JSON.stringify(e)).join('\n') + '\n', 'utf8'));
 
-describe('a session transcript is many zstd frames', () => {
+describe('a session transcript is many zstd frames', { skip }, () => {
   it('splits and decodes every frame, in file order', () => {
     const buf = Buffer.concat([
       frame([{ type: 'meta', cwd: 'E:\\GPT' }]),

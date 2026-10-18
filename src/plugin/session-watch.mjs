@@ -19,7 +19,31 @@
  * ask for them.
  */
 import { createHash } from 'node:crypto';
-import { zstdDecompressSync } from 'node:zlib';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
+
+/**
+ * The zstd API, or null on a runtime that does not have it.
+ *
+ * It is looked up lazily and through \`require\` on purpose: a static \`import { zstdDecompressSync } from 'node:zlib'\`
+ * makes the WHOLE module fail to link on Node 20, which is where part of the support matrix runs, and the failure is not
+ * "this feature is unavailable" -- it is "the plugin does not load". A missing decoder must degrade to an empty read.
+ */
+let zstdModule = null;
+function zstdApi() {
+  if (zstdModule !== null) return zstdModule;
+  try {
+    const loaded = require('node:zlib');
+    zstdModule = typeof loaded.zstdDecompressSync === 'function' ? loaded : { zstdDecompressSync: null };
+  } catch { zstdModule = { zstdDecompressSync: null }; }
+  return zstdModule;
+}
+
+/** Whether this runtime can decode a session transcript at all (Node >= 22.15 exposes the zstd API). */
+export function zstdAvailable() {
+  return typeof zstdApi().zstdDecompressSync === 'function';
+}
 
 /** The zstd frame magic number, little-endian bytes 28 B5 2F FD. */
 const ZSTD_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd]);
@@ -47,9 +71,11 @@ export function splitZstdFrames(buffer) {
  */
 export function decodeTranscript(buffer) {
   const events = [];
+  const decode = zstdApi().zstdDecompressSync;
+  if (typeof decode !== 'function') return events;   // no decoder on this runtime: nothing to read, nothing to crash
   for (const frame of splitZstdFrames(buffer)) {
     let text;
-    try { text = zstdDecompressSync(frame).toString('utf8'); } catch { continue; }
+    try { text = decode(frame).toString('utf8'); } catch { continue; }
     for (const line of text.split('\n')) {
       if (line === '') continue;
       try { events.push(JSON.parse(line)); } catch { /* a partial trailing line is expected in a live file */ }
