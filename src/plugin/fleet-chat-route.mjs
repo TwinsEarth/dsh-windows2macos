@@ -165,6 +165,7 @@ export function registerChatRoutes(ctx, deps) {
           // Its key is the relay alone -- deliberately NOT the project name -- so every machine in the fleet
           // lands in one stream. It is not a history fetch: the caller sends a floor timestamp (see the panel).
           let sessionId = '';
+          const addressing = {};
           let text = null;
           if (request.method === 'GET') {
             sessionId = sessionIdOf(url.searchParams.get('session_id'));
@@ -177,6 +178,17 @@ export function registerChatRoutes(ctx, deps) {
             }
             sessionId = sessionIdOf(body?.session_id);
             text = typeof body?.text === 'string' ? body.text : null;
+            // Addressing + correlation travel as optional fields; each is validated here so a bad one is refused with a
+            // name instead of being stored and never understood.
+            if (typeof body?.to === 'string' && body.to.trim() !== '') {
+              const to = body.to.trim();
+              if (to !== 'all' && (to.length > 64 || /\s/.test(to))) {
+                return refuse(400, 'CHAT_BAD_ADDRESS', 'to must be "all" or a machine id', 'a recipient is either the whole fleet or one machine');
+              }
+              addressing.to = to;
+            }
+            if (typeof body?.thread_id === 'string' && body.thread_id.trim() !== '') addressing.thread_id = body.thread_id.trim().slice(0, 64);
+            if (typeof body?.reply_to === 'string' && body.reply_to.trim() !== '') addressing.reply_to = body.reply_to.trim();
           }
           const identity = await identityOf();
           if (identity.error !== null) {
@@ -203,7 +215,11 @@ export function registerChatRoutes(ctx, deps) {
 
           try {
             if (request.method === 'GET') {
-              const query = { session_id: sessionId };
+              const query = { session_id: sessionId, for_me: '1' };
+              const threadOf = url.searchParams.get('thread_id');
+              const toOf = url.searchParams.get('to');
+              if (threadOf !== null && threadOf !== '') query.thread_id = threadOf;
+              if (toOf !== null && toOf !== '') query.to = toOf;
               const sinceMs = url.searchParams.get('since_ms');
               const limit = url.searchParams.get('limit');
               if (sinceMs !== null && /^\d+$/.test(sinceMs)) query.since_ms = sinceMs;
@@ -216,7 +232,7 @@ export function registerChatRoutes(ctx, deps) {
               }
               return Response.json({ ...listed.json, ok: true, local_machine_id: identity.machineId, local_machine_name: identity.machineName, conversation_key: sessionId, conversation_source: identity.source }, { headers: NO_STORE });
             }
-            const posted = await deps.request({ rabbitUrl, token, method: 'POST', pathname: '/v1/fleet/messages', body: { session_id: sessionId, text: text ?? '', machine_id: identity.machineId, machine_name: identity.machineName, origin: 'chat' }, signal: request.signal });
+            const posted = await deps.request({ rabbitUrl, token, method: 'POST', pathname: '/v1/fleet/messages', body: { session_id: sessionId, text: text ?? '', machine_id: identity.machineId, machine_name: identity.machineName, origin: 'chat', ...addressing }, signal: request.signal });
             if (posted?.ok !== true) {
               const code = posted?.json?.error?.code ?? posted?.error?.code ?? 'CHAT_SEND_REFUSED';
               const message = posted?.json?.error?.message ?? posted?.error?.message ?? `the relay answered HTTP ${posted?.status ?? 0}`;

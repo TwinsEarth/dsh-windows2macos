@@ -6335,11 +6335,20 @@ export async function apply(ctx, config = {}) {
       'Fleet chat for one session: send plain text to the machines in this conversation, or read what was said. ' +
       'A refused write comes back with its named reason (quota, size, or non-text) rather than as a bare failure.',
     parameters: {
-      action: { type: 'string', enum: ['send', 'list'], description: 'send posts text; list reads the flow (default).', default: 'list' },
+      action: {
+        type: 'string',
+        enum: ['send', 'list', 'ask', 'await'],
+        description: 'send posts text; ask posts a question and returns its message id; await waits for a reply to it; list reads the flow (default).',
+        default: 'list',
+      },
       session_id: { type: 'string', description: 'Which conversation. Chat is scoped to a session, not a machine.' },
       text: { type: 'string', description: 'The message for send. Plain text, UTF-8, at most 4 KiB.' },
       since_ms: { type: 'number', description: 'For list: only messages newer than this relay timestamp.' },
       limit: { type: 'number', description: 'For list: how many of the newest messages (default 50).' },
+      to: { type: 'string', description: 'For send/ask: "all" (the fleet group, the default) or one machine_id.' },
+      thread_id: { type: 'string', description: 'For send/ask: group this message into a named thread (at most 64 characters).' },
+      reply_to: { type: 'string', description: 'For send/ask: the message_id this message answers. For await: the message_id to wait for a reply to.' },
+      timeout_ms: { type: 'number', description: 'For await: how long to wait before reporting a timeout (default 60000, capped at 300000). A timeout is a value, not an error.' },
     },
     output: jsonOutput,
     presentCall: (args) => ({ card: 'generic', title: 'w2m chat ' + (typeof args?.action === 'string' ? args.action : 'list'), kind: args?.action === 'send' ? 'write' : 'read', rawInput: {} }),
@@ -6356,14 +6365,46 @@ export async function apply(ctx, config = {}) {
       // one reported W2M_NO_TOKEN on a machine that was paired and answering every other call.
       const token = await resolveToken(cfg);
       if (token === null) throw new W2MError('W2M_NO_TOKEN', 'W2M_NO_TOKEN: this machine has no device token, so chat cannot be authenticated', { hint: 'pair this machine first (autoStartAgent or a pairing code), then retry' });
-      if (action === 'send') {
-        const posted = await request({ rabbitUrl, token, signal: exec?.signal, method: 'POST', pathname: '/v1/fleet/messages', body: { session_id: sessionId, text: typeof args?.text === 'string' ? args.text : '' } });
+      // Addressing + correlation travel only when the caller supplied them, so a plain broadcast stays byte-identical.
+      const addressing = {};
+      if (typeof args?.to === 'string' && args.to.trim() !== '') {
+        const to = args.to.trim();
+        if (to !== 'all' && (to.length > 64 || /\s/.test(to))) {
+          throw new W2MError('W2M_CHAT_ADDRESS', 'W2M_CHAT_ADDRESS: to must be "all" or a machine id', { hint: 'a recipient is either the whole fleet or one machine listed by w2m_devices' });
+        }
+        addressing.to = to;
+      }
+      if (typeof args?.thread_id === 'string' && args.thread_id.trim() !== '') addressing.thread_id = args.thread_id.trim().slice(0, 64);
+      if (typeof args?.reply_to === 'string' && args.reply_to.trim() !== '') addressing.reply_to = args.reply_to.trim();
+
+      if (action === 'await') {
+        // Waiting for an ANSWER is a state machine, and a timeout is a value the caller reads rather than an exception
+        // that loses the question. The question stays in the flow, so it can still be answered later.
+        const target = typeof args?.reply_to === 'string' ? args.reply_to.trim() : '';
+        if (target === '') throw new W2MError('W2M_CHAT_AWAIT', 'W2M_CHAT_AWAIT: reply_to is required for await', { hint: 'pass the message_id returned by ask' });
+        const timeoutMs = Number.isFinite(args?.timeout_ms) ? Math.max(1000, Math.min(args.timeout_ms, 300000)) : 60000;
+        const startedAt = Date.now();
+        for (;;) {
+          throwIfAborted(exec?.signal);
+          const reply = await request({ rabbitUrl, token, signal: exec?.signal, method: 'GET', pathname: '/v1/fleet/messages', query: { session_id: sessionId, reply_to: target, limit: '10' } });
+          const found = Array.isArray(reply?.json?.messages) ? reply.json.messages : [];
+          if (found.length > 0) return JSON.stringify({ ok: true, action, state: 'answered', reply_to: target, replies: found });
+          if (Date.now() - startedAt >= timeoutMs) {
+            return JSON.stringify({ ok: true, action, state: 'timeout', reply_to: target, waited_ms: Date.now() - startedAt, hint: 'the question is still in the flow and can be answered later' });
+          }
+          await new Promise((resolve) => { setTimeout(resolve, 1500); });
+        }
+      }
+      if (action === 'send' || action === 'ask') {
+        const posted = await request({ rabbitUrl, token, signal: exec?.signal, method: 'POST', pathname: '/v1/fleet/messages', body: { session_id: sessionId, text: typeof args?.text === 'string' ? args.text : '', ...addressing } });
         if (posted?.ok !== true) {
           const code = posted?.json?.error?.code ?? posted?.error?.code ?? 'W2M_CHAT_SEND';
           throw new W2MError('W2M_CHAT_SEND', code + ': the message was refused', { reason_code: code, hint: 'quota, size and non-text each need a different answer' });
         }
-        return JSON.stringify({ ok: true, action, message: posted.json?.message ?? null });
+        return JSON.stringify({ ok: true, action, message: posted.json?.message ?? null, message_id: posted.json?.message?.message_id ?? null });
       }
+      if (typeof args?.thread_id === 'string' && args.thread_id.trim() !== '') query.thread_id = args.thread_id.trim();
+      if (typeof args?.to === 'string' && args.to.trim() !== '') query.to = args.to.trim();
       const query = { session_id: sessionId };
       if (Number.isFinite(args?.since_ms)) query.since_ms = String(args.since_ms);
       if (Number.isInteger(args?.limit)) query.limit = String(args.limit);

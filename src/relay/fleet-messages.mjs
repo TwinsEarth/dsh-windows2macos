@@ -88,12 +88,21 @@ export function createFleetMessages(options = {}) {
     const text = input.text;
     if (text.trim() === '') return { ok: false, code: 'EMPTY_TEXT' };
     // Reject control characters (except tab/newline): "plain text" is a contract, not a preference.
-    // Control characters are the thing being rejected here, so the rule that forbids them in a pattern
-    // does not apply -- the escape IS the contract.
     // eslint-disable-next-line no-control-regex
     if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/.test(text)) return { ok: false, code: 'NOT_TEXT' };
     const bytes = Buffer.byteLength(text, 'utf8');
     if (bytes > maxMessageBytes) return { ok: false, code: 'MESSAGE_TOO_LARGE', detail: { bytes, maxBytes: maxMessageBytes } };
+
+    // Addressing: 'all' is the group, a machine id is one recipient. ONE row either way -- N copies for N recipients
+    // would multiply the byte budget by the fleet size for no extra meaning; visibility is a filter at read time.
+    const to = typeof input?.to === 'string' && input.to.trim() !== '' ? input.to.trim() : 'all';
+    if (to !== 'all' && (to.length > 64 || /\s/.test(to))) return { ok: false, code: 'BAD_ADDRESS' };
+    // Correlation: a thread groups a conversation, reply_to points at the message being answered, turn orders the
+    // exchange inside one thread. Plain fields, validated rather than trusted.
+    const threadId = typeof input?.thread_id === 'string' && input.thread_id.trim() !== ''
+      ? input.thread_id.trim().slice(0, 64)
+      : null;
+    const replyTo = typeof input?.reply_to === 'string' && input.reply_to.trim() !== '' ? input.reply_to.trim() : null;
 
     const before = usage();
     const limit = limitBytes();
@@ -101,12 +110,24 @@ export function createFleetMessages(options = {}) {
       return { ok: false, code: 'FLEET_QUOTA_EXCEEDED', detail: { used_24h_bytes: before.used_24h_bytes, limit_bytes: limit, bytes } };
     }
 
+    // A reply must point at something that exists in the SAME session: a dangling reply_to makes a thread unreadable.
+    const existing = sessions.get(sessionId) ?? [];
+    if (replyTo !== null && !existing.some((m) => m.message_id === replyTo)) {
+      return { ok: false, code: 'REPLY_TARGET_MISSING', detail: { reply_to: replyTo } };
+    }
+    const threadOf = threadId ?? (replyTo !== null ? (existing.find((m) => m.message_id === replyTo)?.thread_id ?? null) : null);
+    const turn = existing.filter((m) => (threadOf === null ? m.thread_id === null : m.thread_id === threadOf)).length + 1;
+
     seq += 1;
     const message = {
       message_id: 'msg-' + String(seq).padStart(6, '0'),
       session_id: sessionId,
       fleet_id: typeof input?.fleet_id === 'string' ? input.fleet_id : null,
       machine_id: machineId,
+      to,
+      thread_id: threadOf,
+      reply_to: replyTo,
+      turn,
       text,
       at_ms: now(),
       bytes,
@@ -122,9 +143,16 @@ export function createFleetMessages(options = {}) {
   }
 
   /** Read one session's flow. \`since_ms\` is exclusive; the order is the order it was said. */
-  function list({ session_id: sessionId, since_ms: sinceMs = null, limit = 50 } = {}) {
+  function list({ session_id: sessionId, since_ms: sinceMs = null, limit = 50, for_machine_id: forMachine = null,
+    thread_id: threadId = null, to: toFilter = null } = {}) {
     const rows = sessions.get(sessionId) ?? [];
-    const filtered = Number.isFinite(sinceMs) ? rows.filter((m) => m.at_ms > sinceMs) : rows;
+    let filtered = Number.isFinite(sinceMs) ? rows.filter((m) => m.at_ms > sinceMs) : rows;
+    // A reader sees the group and what was addressed to it, never another machine's private message.
+    if (typeof forMachine === 'string' && forMachine !== '') {
+      filtered = filtered.filter((m) => (m.to ?? 'all') === 'all' || m.to === forMachine || m.machine_id === forMachine);
+    }
+    if (typeof threadId === 'string' && threadId !== '') filtered = filtered.filter((m) => m.thread_id === threadId);
+    if (typeof toFilter === 'string' && toFilter !== '') filtered = filtered.filter((m) => (m.to ?? 'all') === toFilter);
     const capped = filtered.slice(-Math.max(1, Math.min(limit, 200)));
     return { ok: true, messages: capped.map((m) => ({ ...m })), count: capped.length };
   }

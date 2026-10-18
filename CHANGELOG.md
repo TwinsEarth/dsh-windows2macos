@@ -2,6 +2,44 @@
 
 All notable changes to this project are documented here.
 
+## [1.2.1] — 2026-10-18
+
+**P1 of fleet collaboration: addressing, correlation, and a turn that can time out.**
+
+### 1. Addressing — a message can name its recipient
+
+`POST /v1/fleet/messages` accepts `to`: `"all"` (the fleet group, the default) or one `machine_id`. The relay stores ONE row
+either way and filters at read time (`for_me=1` is answered from the authenticated device identity, never from a caller
+supplied id), because N copies for N recipients would multiply the byte budget by the size of the fleet for no extra
+meaning. A malformed address is refused `BAD_ADDRESS` by the store and `CHAT_BAD_ADDRESS` by the host route.
+
+### 2. Correlation — threads and replies
+
+Messages carry `thread_id`, `reply_to` and `turn`. `reply_to` must name a message that exists in the SAME session
+(`REPLY_TARGET_MISSING` otherwise): a dangling reply makes a thread unreadable. `turn` is assigned by the relay and counts
+the exchange inside a thread, so a reader can order answers without trusting client clocks.
+
+### 6. Turn semantics — waiting is a state, timeouts are values
+
+`w2m_chat` gained `action: "ask"` (send, return the message id) and `action: "await"` (wait for a reply to that id).
+`await` returns `{state: "answered" | "timeout"}` — a timeout is a result the caller reads, not an exception that loses the
+question, and the question stays in the flow so it can be answered later.
+
+### What this needs from the relay
+
+The fields are new, so the relay on the fleet host must be redeployed with this build. An older relay ignores the fields
+(the message still stores and reads, without addressing/threading) because they are plain body fields rather than a
+protocol version bump.
+
+### Verified
+
+Relay store: `BAD_ADDRESS`, `REPLY_TARGET_MISSING`, turn counting, and the read filters. HTTP: the three existing
+fleet-message tests still pass. Tools: 122 pass. relay suite: 163 pass. Gate GREEN twice, 15 of 15.
+
+### Not verified
+
+Two-machine end-to-end (A asks, B answers, A's await reports answered) — that needs both machines on this build, and the
+relay redeployed.
 ## [1.2.0] — 2026-10-18
 
 **Fleet chat is one group per relay.**

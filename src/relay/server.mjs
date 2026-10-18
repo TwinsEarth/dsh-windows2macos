@@ -1052,6 +1052,9 @@ export class RelayServer {
         session_id: body.session_id,
         fleet_id: typeof body.fleet_id === 'string' ? body.fleet_id : null,
         machine_id: device.machine_id,
+        to: body.to,
+        thread_id: body.thread_id,
+        reply_to: body.reply_to,
         text: body.text,
       });
       if (posted.ok !== true) {
@@ -1098,6 +1101,11 @@ export class RelayServer {
         session_id: url.searchParams.get('session_id') ?? '',
         since_ms: sinceRaw === null ? null : Number(sinceRaw),
         limit: limitRaw === null ? 50 : Number(limitRaw),
+        // Addressing/correlation filters. `for_me=1` is answered from the authenticated device identity, never from a
+        // caller-supplied machine id: a reader must not be able to ask for another machine's private messages.
+        for_machine_id: url.searchParams.get('for_me') === '1' ? device.machine_id : null,
+        thread_id: url.searchParams.get('thread_id'),
+        to: url.searchParams.get('to'),
       });
       return sendJson(res, 200, {
         protocol_version: PROTOCOL_VERSION,
