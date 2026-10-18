@@ -23,6 +23,9 @@ jobs:
   release:
     name: verify, pack and publish
     runs-on: ubuntu-latest
+    # The operator's rule: a STABLE release must be approved online. The beta workflow has no environment at
+    # all -- for a beta the control point is who may push its tag.
+    environment: Stable
     steps:
       - uses: actions/checkout@v4
         with:
@@ -198,9 +201,6 @@ jobs:
   # as failed when it tried and could not.
   # ---------------------------------------------------------------------------------------------
   npm:
-    # The operator's rule: a STABLE release must be approved online. A beta does not, which is why that workflow
-    # has no environment at all -- the control point for a beta is who may push its tag.
-    environment: Stable
     name: publish to npm
     needs: release
     runs-on: ubuntu-latest
