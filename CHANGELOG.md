@@ -2,6 +2,36 @@
 
 All notable changes to this project are documented here.
 
+## [1.2.0] — 2026-10-18
+
+**Fleet chat is one group per relay.**
+
+The conversation used to be keyed from `process.cwd()`, which is the DSH process's own directory and differs per machine
+(`E:\DS` here, `/root` there). Two machines therefore computed two different keys and each panel saw only its own messages:
+"互相收不到队员聊天信息". The rule is now the simplest one that makes a fleet talk: **the relay is the group**.
+
+- one relay → one conversation, whatever project a machine is working on;
+- a trailing slash on the relay URL is the same relay;
+- the project name and the account key are deliberately NOT part of the basis: including either split the fleet into
+  separate streams, which is exactly the bug;
+- the machine id remains only as a last resort when no relay is configured, so a panel can still answer locally.
+
+### What was removed, and why it is not a loss
+
+Two intermediate designs were built and dropped in this release: keying per project (relay + project name) and a
+"同步编队全部项目" scope button that switched between the project stream and the fleet stream. With the relay as the group
+there is nothing to switch to, so the button and its scope parameter are gone rather than left as a no-op. The panel is
+simpler and the operator gets the fleet-wide conversation by default.
+
+### Verified
+
+`conversationBasis` is pure and tested: same relay unites two machines, a trailing slash does not split them, different
+relays stay apart, and a host without a relay falls back to the machine scope. 4 identity tests, 25 client-bundle tests,
+tools 122. Gate GREEN twice, 15 of 15.
+
+### Not verified
+
+Two-machine end-to-end against a live fleet; that check needs both machines on this build, which is the next step.
 ## [1.1.22] — 2026-10-18
 
 **The fleet-chat panel said "this machine has no fleet-chat identity yet" on a machine that was paired and online.**

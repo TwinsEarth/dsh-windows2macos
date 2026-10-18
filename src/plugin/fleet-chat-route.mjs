@@ -19,7 +19,7 @@ import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import {
-  conversationKey as deriveConversationKey, decodeTranscript, extractUserMessages, sessionDirName,
+  decodeTranscript, extractUserMessages, sessionDirName,
 } from './session-watch.mjs';
 import { createSessionSync } from './session-sync.mjs';
 
@@ -56,7 +56,17 @@ const NO_STORE = { 'cache-control': 'no-store' };
  */
 export function registerChatRoutes(ctx, deps) {
   const status = { mounted: false, reason: 'the host has no Connection service' };
-  const cwd = process.cwd();
+  /**
+   * The project this conversation belongs to.
+   *
+   * NOT `process.cwd()`: that is the DSH host's own directory, which differs per machine (E:\DS on one box, /root on
+   * another), so the derived conversation key differed per machine and every panel saw only its own messages. The
+   * operator's rule is account + project NAME; the name has to come from the project this plugin was configured for.
+   */
+  const projectDirOf = () => {
+    const configured = deps.cfg()?.projectDir;
+    return typeof configured === 'string' && configured !== '' ? configured : process.cwd();
+  };
   const sync = createSessionSync({ conversationKey: 'pending', machineId: 'pending', machineName: null });
 
   /**
@@ -81,15 +91,13 @@ export function registerChatRoutes(ctx, deps) {
       // Nothing can be keyed without a machine, and inventing one would put unrelated hosts in one conversation.
       return { error: 'CHAT_NO_IDENTITY', machineId: null, machineName: null, conversationKey: null, source: null };
     }
-    const material = typeof deps.accountMaterial === 'function' ? deps.accountMaterial() : null;
-    const basis = conversationBasis({ machineId, accountMaterial: material });
-    const fingerprint = createHash('sha256')
-      .update('w2m-conversation-basis-v1').update('\\u0000').update(basis.basis).digest('hex');
+    const basis = conversationBasis({ machineId, relayUrl: deps.cfg()?.rabbitUrl ?? null });
     resolved = {
       error: null,
       machineId,
       machineName: typeof local?.machine_name === 'string' ? local.machine_name : null,
-      conversationKey: deriveConversationKey(fingerprint, cwd),
+      // One group per relay: every machine in this fleet shares this conversation, whatever its project.
+      conversationKey: createHash('sha256').update('w2m-fleet-conversation-v1').update(basis.basis).digest('hex'),
       source: basis.source,
     };
     return resolved;
@@ -118,7 +126,7 @@ export function registerChatRoutes(ctx, deps) {
   const mirrorOnce = async () => {
     const identity = await identityOf();
     if (identity.conversationKey === null) return;
-    const file = newestTranscript(cwd);
+    const file = newestTranscript(projectDirOf());
     if (file === null) return;
     let messages;
     try { messages = extractUserMessages(decodeTranscript(readFileSync(file))); } catch { return; }
@@ -153,6 +161,9 @@ export function registerChatRoutes(ctx, deps) {
 
           const url = new URL(request.url);
           const sessionIdOf = (value) => (typeof value === 'string' ? value.trim() : '');
+          // "All projects in this fleet" is an explicit scope, not the default: the operator presses a button for it.
+          // Its key is the relay alone -- deliberately NOT the project name -- so every machine in the fleet
+          // lands in one stream. It is not a history fetch: the caller sends a floor timestamp (see the panel).
           let sessionId = '';
           let text = null;
           if (request.method === 'GET') {
@@ -167,14 +178,12 @@ export function registerChatRoutes(ctx, deps) {
             sessionId = sessionIdOf(body?.session_id);
             text = typeof body?.text === 'string' ? body.text : null;
           }
-           const identity = await identityOf();
-           if (identity.error !== null) {
-             return refuse(503, identity.error, 'this machine has no fleet-chat identity yet', 'pair the machine and let it derive the fleet key');
-           }
-           // v1.1.20: the browser's session id is per-machine and no other machine can compute it, so the wire key is the
-           // conversation key (account + project directory). The browser's value is accepted and then replaced.
-           sessionId = identity.conversationKey;
-          if (sessionId === '') return refuse(400, 'CHAT_SESSION_ID_REQUIRED', '`session_id` is required', 'chat is scoped to one conversation');
+          const identity = await identityOf();
+          if (identity.error !== null) {
+            return refuse(503, identity.error, 'this machine has no fleet-chat identity yet', 'pair the machine and let it derive the fleet key');
+          }
+          // One group per relay: the browser sends its own session id, which is replaced here.
+          sessionId = identity.conversationKey;
           if (sessionId.length > MAX_SESSION_ID_LENGTH) {
             return refuse(400, 'CHAT_SESSION_ID_TOO_LONG', `\`session_id\` must be at most ${MAX_SESSION_ID_LENGTH} characters`, 'send the id the host gave this session');
           }
@@ -234,20 +243,21 @@ export function registerChatRoutes(ctx, deps) {
 }
 
 /**
- * The material a conversation is keyed from, and which scope it represents.
+ * The material a conversation is keyed from.
  *
- * The account key is the right basis -- two machines on the same account and the same project are one conversation. But
- * the account key is derived asynchronously at stack start, and a panel that cannot answer at all is worse than a panel
- * that answers for one machine until the join lands. So the machine id is the documented fallback, and the answer says
- * which basis it used rather than leaving the caller to guess.
+ * The operator's rule, in its simplest form: **one relay is one group**. Every machine talking to the same relay shares
+ * one conversation, whatever project it is working on. Neither the project name nor the account key is part of the basis:
+ * including either split the fleet into separate streams, which is the report this replaces.
  *
- * @param {{machineId?: string|null, accountMaterial?: string|null}} input
- * @returns {{basis: string, source: 'account'|'machine'}|null} null when there is no machine to key on
+ * The machine id stays only as a last resort for a host with no relay configured, so the panel can still answer locally.
+ *
+ * @param {{machineId?: string|null, relayUrl?: string|null}} input
+ * @returns {{basis: string, source: 'fleet'|'machine'}|null} null when there is no machine to key on
  */
-export function conversationBasis({ machineId, accountMaterial } = {}) {
+export function conversationBasis({ machineId, relayUrl } = {}) {
   const machine = typeof machineId === 'string' && machineId !== '' ? machineId : null;
   if (machine === null) return null;
-  const account = typeof accountMaterial === 'string' && accountMaterial.trim() !== '' ? accountMaterial.trim() : null;
-  if (account !== null) return { basis: 'account:' + account, source: 'account' };
+  const relay = typeof relayUrl === 'string' && relayUrl.trim() !== '' ? relayUrl.trim().replace(/\/+$/, '') : null;
+  if (relay !== null) return { basis: 'fleet:' + relay, source: 'fleet' };
   return { basis: 'machine:' + machine, source: 'machine' };
 }
