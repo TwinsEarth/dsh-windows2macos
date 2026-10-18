@@ -2,6 +2,44 @@
 
 All notable changes to this project are documented here.
 
+## [1.1.20-beta.1] — 2026-10-18
+
+**The fleet panel now shows what each machine's owner actually typed into DSH.** A beta, because it reads a file format
+that DSH owns and the first real fleet run is the point of it.
+
+### What it does
+
+- the host route learns the conversation key from **account material + project directory name**, so the same project on
+  two machines is one conversation and nothing has to be configured;
+- a 2-second read-only watcher looks at the newest \`session.v4.jsonl.zstd\` for that project, extracts **only the user's
+  messages** (`role: 'user'`/`'prompt'`), and publishes the new ones to the relay;
+- the panel colours them: **red** for this machine's own prompts (marked "来自会话"), **green** for messages typed into the
+  fleet box here, **white** for other machines — each machine also gets a colour on its whale avatar derived from its id.
+
+### The rules that are enforced, not promised
+
+- **the session is never written** — \`test/session-readonly.test.mjs\` scans the two modules for any file-mutating API and
+  fails the gate if one appears;
+- **no injection into DSH** — nothing is appended to a conversation; the panel is a mirror;
+- **no assistant replies, tool calls or results** — only the user's own words;
+- **own broadcasts are not shown as remote** — the echo rule is a tested function, not a convention.
+
+### What the gate caught on the way
+
+Adding the panel's newest pieces put four real defects in front of the tests: a state declared in the wrong component
+(both components have a `busy`), an `accountMaterial` getter that named a variable outside its scope, a repair that ate
+the closing braces of the route registration, and lint errors from an unused import plus over-escaped regexes. The gate
+held at RED until each was fixed; this entry exists because it finally went green twice.
+
+### Not verified
+
+The end-to-end path (type in DSH on machine A, see it in machine B's panel) has **not been run across two machines yet**.
+The reader, the extractor, the sync rules, the route and the panel are each tested; their composition is not.
+
+### Verified
+
+Gate GREEN twice, 15 of 15. 2502 tests / 2488 pass / 0 fail / 14 skip.
+
 ## [1.1.19] — 2026-10-18
 
 **The chat panel exists in the browser.**

@@ -14,6 +14,34 @@
  * panel can print the host's own words. A relay that predates the fleet-messages routes answers
  * 404, which is reported as such rather than as an empty conversation.
  */
+import { createHash } from 'node:crypto';
+import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import {
+  conversationKey as deriveConversationKey, decodeTranscript, extractUserMessages, sessionDirName,
+} from './session-watch.mjs';
+import { createSessionSync } from './session-sync.mjs';
+
+/**
+ * The newest transcript for a cwd, or null. Reads directory listings and stat only -- this module never opens a
+ * session file for writing, and \	est/session-readonly.test.mjs\ enforces that.
+ */
+function newestTranscript(cwd) {
+  const dir = join(homedir(), '.dsh', 'sessions', sessionDirName(cwd));
+  let entries;
+  try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return null; }
+  let best = null;
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !entry.name.startsWith('session-')) continue;
+    const file = join(dir, entry.name, 'session.v4.jsonl.zstd');
+    let stat;
+    try { stat = statSync(file); } catch { continue; }
+    if (best === null || stat.mtimeMs > best.mtimeMs) best = { file, mtimeMs: stat.mtimeMs };
+  }
+  return best === null ? null : best.file;
+}
+
 export const CHAT_ROUTE_PATH = '/api/w2m/chat';
 export const MAX_SESSION_ID_LENGTH = 200;
 
@@ -28,6 +56,68 @@ const NO_STORE = { 'cache-control': 'no-store' };
  */
 export function registerChatRoutes(ctx, deps) {
   const status = { mounted: false, reason: 'the host has no Connection service' };
+  const cwd = process.cwd();
+  const sync = createSessionSync({ conversationKey: 'pending', machineId: 'pending', machineName: null });
+
+  /**
+   * Which machine this is and which conversation the project belongs to.
+   *
+   * Resolved once. The account material is hashed with a domain label first: it is the fleet key, which is secret, but
+   * hashing keeps the conversation key from ever being usable as a joining secret.
+   */
+  let identityPromise = null;
+  const identityOf = () => (identityPromise ??= (async () => {
+    const local = typeof deps.localIdentity === 'function' ? await deps.localIdentity() : null;
+    const material = typeof deps.accountMaterial === 'function' ? deps.accountMaterial() : null;
+    const machineId = typeof local?.machine_id === 'string' && local.machine_id !== '' ? local.machine_id : null;
+    if (machineId === null || typeof material !== 'string' || material === '') {
+      return { error: 'CHAT_NO_IDENTITY', machineId: null, machineName: null, conversationKey: null };
+    }
+    const fingerprint = createHash('sha256').update('w2m-account-material-v1').update('\\u0000').update(material).digest('hex');
+    return {
+      error: null,
+      machineId,
+      machineName: typeof local?.machine_name === 'string' ? local.machine_name : null,
+      conversationKey: deriveConversationKey(fingerprint, cwd),
+    };
+  })());
+
+  /** Post one batch into the relay using the machine's device token, exactly as the browser route does. */
+  const postToRelay = async (identity, payload) => {
+    const cfg = deps.cfg();
+    const rabbitUrl = cfg?.rabbitUrl ?? null;
+    if (rabbitUrl === null) return { ok: false };
+    let token;
+    try { token = await deps.resolveToken(); } catch { return { ok: false }; }
+    if (typeof token !== 'string' || token === '') return { ok: false };
+    return deps.request({
+      rabbitUrl, token, method: 'POST', pathname: '/v1/fleet/messages',
+      body: { session_id: identity.conversationKey, ...payload },
+    });
+  };
+
+  /**
+   * v1.1.20: mirror this machine's own prompts into the fleet conversation -- READ ONLY.
+   *
+   * The session files are never written and nothing is injected into DSH: the transcript is read, the user's messages
+   * are extracted, and only the new ones are published. A failure here must not disturb the panel or the route.
+   */
+  const mirrorOnce = async () => {
+    const identity = await identityOf();
+    if (identity.conversationKey === null) return;
+    const file = newestTranscript(cwd);
+    if (file === null) return;
+    let messages;
+    try { messages = extractUserMessages(decodeTranscript(readFileSync(file))); } catch { return; }
+    for (const payload of sync.pending(messages)) {
+      await postToRelay(identity, {
+        text: payload.text,
+        machine_id: identity.machineId,
+        machine_name: identity.machineName,
+        origin: 'session',
+      });
+    }
+  };
   if (typeof ctx?.inject !== 'function') return status;
   ctx.inject(['connection'], (webCtx) => {
     const registry = webCtx?.connection?.fetch;
@@ -64,6 +154,13 @@ export function registerChatRoutes(ctx, deps) {
             sessionId = sessionIdOf(body?.session_id);
             text = typeof body?.text === 'string' ? body.text : null;
           }
+           const identity = await identityOf();
+           if (identity.error !== null) {
+             return refuse(503, identity.error, 'this machine has no fleet-chat identity yet', 'pair the machine and let it derive the fleet key');
+           }
+           // v1.1.20: the browser's session id is per-machine and no other machine can compute it, so the wire key is the
+           // conversation key (account + project directory). The browser's value is accepted and then replaced.
+           sessionId = identity.conversationKey;
           if (sessionId === '') return refuse(400, 'CHAT_SESSION_ID_REQUIRED', '`session_id` is required', 'chat is scoped to one conversation');
           if (sessionId.length > MAX_SESSION_ID_LENGTH) {
             return refuse(400, 'CHAT_SESSION_ID_TOO_LONG', `\`session_id\` must be at most ${MAX_SESSION_ID_LENGTH} characters`, 'send the id the host gave this session');
@@ -95,9 +192,9 @@ export function registerChatRoutes(ctx, deps) {
                 const message = listed?.json?.error?.message ?? listed?.error?.message ?? `the relay answered HTTP ${listed?.status ?? 0}`;
                 return refuse(listed?.status === 404 ? 502 : 502, code, message, 'the relay must run a version with /v1/fleet/messages (>= 1.1.17) and be restarted');
               }
-              return Response.json({ ...listed.json, ok: true }, { headers: NO_STORE });
+              return Response.json({ ...listed.json, ok: true, local_machine_id: identity.machineId, local_machine_name: identity.machineName, conversation_key: sessionId }, { headers: NO_STORE });
             }
-            const posted = await deps.request({ rabbitUrl, token, method: 'POST', pathname: '/v1/fleet/messages', body: { session_id: sessionId, text: text ?? '' }, signal: request.signal });
+            const posted = await deps.request({ rabbitUrl, token, method: 'POST', pathname: '/v1/fleet/messages', body: { session_id: sessionId, text: text ?? '', machine_id: identity.machineId, machine_name: identity.machineName, origin: 'chat' }, signal: request.signal });
             if (posted?.ok !== true) {
               const code = posted?.json?.error?.code ?? posted?.error?.code ?? 'CHAT_SEND_REFUSED';
               const message = posted?.json?.error?.message ?? posted?.error?.message ?? `the relay answered HTTP ${posted?.status ?? 0}`;
@@ -111,6 +208,10 @@ export function registerChatRoutes(ctx, deps) {
       });
       status.mounted = true;
       status.reason = null;
+      const timer = setInterval(() => { mirrorOnce().catch(() => { /* one bad tick must not stop the next */ }); }, 2000);
+      if (typeof timer.unref === 'function') timer.unref();
+      if (typeof ctx?.effect === 'function') ctx.effect(() => () => clearInterval(timer), 'w2m: fleet chat session mirror');
+      else globalThis.__w2mChatMirrorTimer = timer;
     } catch (error) {
       status.reason = error instanceof Error ? error.message : String(error);
       ctx?.logger?.warn?.(`w2m: the fleet chat route is inactive — ${status.reason}`);

@@ -3411,6 +3411,14 @@ export async function apply(ctx, config = {}) {
     cfg: () => cfg,
     request,
     resolveToken: () => resolveToken(cfg),
+    // v1.1.20: the panel needs to know WHICH machine is speaking, and which conversation the session belongs to.
+    // Both are already resolved in this scope for the target control; passing them here is what lets the route key
+    // messages by account+project instead of by a per-machine session id no other machine can compute.
+    localIdentity,
+    // The account material is the fleet key from config. Deliberately NOT the account code: that is written to logs,
+    // and deriving a conversation key from a readable value would let anyone join the conversation. When no fleet key
+    // is configured the route reports "no identity yet" rather than inventing one.
+    accountMaterial: () => (typeof cfg.fleetKey === 'string' ? cfg.fleetKey : null),
   });
   if (chatRoutes.mounted !== true) {
     // Named rather than silent: a composition without the fetch registry loses the chat panel while every tool still
