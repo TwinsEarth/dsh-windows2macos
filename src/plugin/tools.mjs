@@ -3325,8 +3325,11 @@ export async function apply(ctx, config = {}) {
    * cannot disagree about when a missing identity becomes a stale one.
    */
   const localIdentity = createLocalIdentity(async () => {
-    const device = await readDevice({ stateDir: cfg.stateDir });
-    return { machine_id: device.machine_id, machine_name: device.machine_name, machineName: cfg.machineName };
+    // readLocalIdentity knows the <DSH_HOME>/xclient/device.json fallback; readDevice() returns empty when
+    // `stateDir` is unset, which is the documented default layout -- and that made every consumer of this helper
+    // answer "no identity" on a paired machine (the fleet-chat panel said so verbatim).
+    const identity = await readLocalIdentity(cfg);
+    return { machine_id: identity.machine_id, machine_name: identity.machine_name, machineName: cfg.machineName };
   });
 
   /**

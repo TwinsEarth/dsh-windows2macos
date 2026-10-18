@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented here.
 
-## [1.1.22-beta.1] — 2026-10-18
+## [1.1.22] — 2026-10-18
 
 **The fleet-chat panel said "this machine has no fleet-chat identity yet" on a machine that was paired and online.**
 
@@ -95,7 +95,14 @@ here rather than implied by a green gate.
 
 ### Verified
 
-Gate GREEN twice, 15 of 15. 2502 tests / 2488 pass / 0 fail / 14 skip.
+### The panel shows a machine, not a UUID
+
+The first working beta displayed `d89d5817…` as the sender of every message. The message carries a `machine_id`; a name is
+not something a sender proves to the relay, so it was never stored. The panel now reads the same roster the target control
+reads (`readState`, once per open) and shows **name · platform**, or **name · 本机** for this machine. A machine that has no
+name yet is shown by a short id and is the only case where an id appears at all.
+
+Gate GREEN twice, 15 of 15. 2507 tests / 2493 pass / 0 fail / 14 skip.
 
 ## [1.1.19] — 2026-10-18
 
