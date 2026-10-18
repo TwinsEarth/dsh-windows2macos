@@ -65,22 +65,35 @@ export function registerChatRoutes(ctx, deps) {
    * Resolved once. The account material is hashed with a domain label first: it is the fleet key, which is secret, but
    * hashing keeps the conversation key from ever being usable as a joining secret.
    */
-  let identityPromise = null;
-  const identityOf = () => (identityPromise ??= (async () => {
+  /**
+   * Which machine this is and which conversation the project belongs to.
+   *
+   * Resolved lazily and NOT cached while it is incomplete: the fleet key may land after the first request (the account
+   * join runs at stack start), and a panel opened before it did would otherwise keep a "no identity" answer for the
+   * lifetime of the process -- which is exactly the bug this replaces.
+   */
+  let resolved = null;
+  const identityOf = async () => {
+    if (resolved !== null && resolved.error === null) return resolved;
     const local = typeof deps.localIdentity === 'function' ? await deps.localIdentity() : null;
-    const material = typeof deps.accountMaterial === 'function' ? deps.accountMaterial() : null;
     const machineId = typeof local?.machine_id === 'string' && local.machine_id !== '' ? local.machine_id : null;
-    if (machineId === null || typeof material !== 'string' || material === '') {
-      return { error: 'CHAT_NO_IDENTITY', machineId: null, machineName: null, conversationKey: null };
+    if (machineId === null) {
+      // Nothing can be keyed without a machine, and inventing one would put unrelated hosts in one conversation.
+      return { error: 'CHAT_NO_IDENTITY', machineId: null, machineName: null, conversationKey: null, source: null };
     }
-    const fingerprint = createHash('sha256').update('w2m-account-material-v1').update('\\u0000').update(material).digest('hex');
-    return {
+    const material = typeof deps.accountMaterial === 'function' ? deps.accountMaterial() : null;
+    const basis = conversationBasis({ machineId, accountMaterial: material });
+    const fingerprint = createHash('sha256')
+      .update('w2m-conversation-basis-v1').update('\\u0000').update(basis.basis).digest('hex');
+    resolved = {
       error: null,
       machineId,
       machineName: typeof local?.machine_name === 'string' ? local.machine_name : null,
       conversationKey: deriveConversationKey(fingerprint, cwd),
+      source: basis.source,
     };
-  })());
+    return resolved;
+  };
 
   /** Post one batch into the relay using the machine's device token, exactly as the browser route does. */
   const postToRelay = async (identity, payload) => {
@@ -192,7 +205,7 @@ export function registerChatRoutes(ctx, deps) {
                 const message = listed?.json?.error?.message ?? listed?.error?.message ?? `the relay answered HTTP ${listed?.status ?? 0}`;
                 return refuse(listed?.status === 404 ? 502 : 502, code, message, 'the relay must run a version with /v1/fleet/messages (>= 1.1.17) and be restarted');
               }
-              return Response.json({ ...listed.json, ok: true, local_machine_id: identity.machineId, local_machine_name: identity.machineName, conversation_key: sessionId }, { headers: NO_STORE });
+              return Response.json({ ...listed.json, ok: true, local_machine_id: identity.machineId, local_machine_name: identity.machineName, conversation_key: sessionId, conversation_source: identity.source }, { headers: NO_STORE });
             }
             const posted = await deps.request({ rabbitUrl, token, method: 'POST', pathname: '/v1/fleet/messages', body: { session_id: sessionId, text: text ?? '', machine_id: identity.machineId, machine_name: identity.machineName, origin: 'chat' }, signal: request.signal });
             if (posted?.ok !== true) {
@@ -218,4 +231,23 @@ export function registerChatRoutes(ctx, deps) {
     }
   });
   return status;
+}
+
+/**
+ * The material a conversation is keyed from, and which scope it represents.
+ *
+ * The account key is the right basis -- two machines on the same account and the same project are one conversation. But
+ * the account key is derived asynchronously at stack start, and a panel that cannot answer at all is worse than a panel
+ * that answers for one machine until the join lands. So the machine id is the documented fallback, and the answer says
+ * which basis it used rather than leaving the caller to guess.
+ *
+ * @param {{machineId?: string|null, accountMaterial?: string|null}} input
+ * @returns {{basis: string, source: 'account'|'machine'}|null} null when there is no machine to key on
+ */
+export function conversationBasis({ machineId, accountMaterial } = {}) {
+  const machine = typeof machineId === 'string' && machineId !== '' ? machineId : null;
+  if (machine === null) return null;
+  const account = typeof accountMaterial === 'string' && accountMaterial.trim() !== '' ? accountMaterial.trim() : null;
+  if (account !== null) return { basis: 'account:' + account, source: 'account' };
+  return { basis: 'machine:' + machine, source: 'machine' };
 }

@@ -3415,10 +3415,10 @@ export async function apply(ctx, config = {}) {
     // Both are already resolved in this scope for the target control; passing them here is what lets the route key
     // messages by account+project instead of by a per-machine session id no other machine can compute.
     localIdentity,
-    // The account material is the fleet key from config. Deliberately NOT the account code: that is written to logs,
-    // and deriving a conversation key from a readable value would let anyone join the conversation. When no fleet key
-    // is configured the route reports "no identity yet" rather than inventing one.
-    accountMaterial: () => (typeof cfg.fleetKey === 'string' ? cfg.fleetKey : null),
+    // The account material is the fleet key the local stack resolved (config first, then the account join). NOT the
+    // account code: that is written to logs, and a conversation key derivable from a printed value would let anyone in.
+    // Null until the join lands; the route then keeps the conversation scoped to this machine instead of refusing.
+    accountMaterial: () => resolvedFleetKey.value,
   });
   if (chatRoutes.mounted !== true) {
     // Named rather than silent: a composition without the fetch registry loses the chat panel while every tool still
@@ -6561,6 +6561,16 @@ function sleepWithSignal(ms, signal) {
  * @param {ReturnType<typeof readConfig>} cfg
  * @returns {Promise<() => Promise<void>>} A disposer that stops the agent and closes the relay.
  */
+/**
+ * The account material the local stack resolved, readable from the rest of the plugin.
+ *
+ * The fleet key is derived inside startLocalStack (it needs the account join), but the composer's chat route is
+ * registered in apply(), one scope above: without this hand-off the route can only see `cfg.fleetKey`, which is null on
+ * a machine that joined by account -- and the panel then refused every request with "no fleet-chat identity yet".
+ * A holder rather than a parameter because the route is mounted before the stack starts, and reads lazily.
+ */
+const resolvedFleetKey = { value: null, source: null, at: 0 };
+
 async function startLocalStack(ctx, cfg) {
   const relayUrl = new URL('../relay/server.mjs', import.meta.url);
   const agentUrl = new URL('../agent/agent.mjs', import.meta.url);
@@ -6816,6 +6826,9 @@ async function startLocalStack(ctx, cfg) {
     }
 
     let { fleetKey, fleetKeySource } = await deriveFleetKeyOnce();
+    resolvedFleetKey.value = fleetKey;
+    resolvedFleetKey.source = fleetKeySource;
+    resolvedFleetKey.at = Date.now();
 
     /**
      * Name what actually went wrong, including the shapes that used to say nothing.

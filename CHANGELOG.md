@@ -2,6 +2,39 @@
 
 All notable changes to this project are documented here.
 
+## [1.1.22-beta.1] — 2026-10-18
+
+**The fleet-chat panel said "this machine has no fleet-chat identity yet" on a machine that was paired and online.**
+
+Two structural causes, both introduced by 1.1.20's move to a conversation key:
+
+- **identity was read with the wrong reader.** The panel's identity came from `readDevice({ stateDir })`, which returns
+  empty the moment `stateDir` is unset -- and unset is the documented default layout, because the agent writes its identity
+  to `<DSH_HOME>/xclient/device.json`. The plugin already had `readLocalIdentity(cfg)`, which knows that fallback and
+  says so in its own documentation; it was simply not used here. The same bug made `w2m_status` report `machine_id: null`
+  next to a working P2P identity.
+- **the account material was read from a scope that cannot see it.** The conversation key is derived from the **fleet
+  key**, which `startLocalStack` resolves at stack start. The composer route is registered in `apply()`, one scope above
+  it, so all it could read was `cfg.fleetKey` -- null on a machine that joined by account. It now reads the resolved key
+  through a holder the stack updates, so the route and the join agree by construction.
+
+### The fallback, and why it is written down
+
+A missing account key no longer refuses. The conversation is then keyed by the machine id, and the response says
+`conversation_source: "machine"` instead of leaving the caller to guess. A panel that cannot answer at all is worse than
+one that answers for this machine until the account join lands; the moment the fleet key resolves the key changes to the
+account scope, which is what makes two machines in one project one conversation.
+
+### Verified
+
+The new `conversationBasis` contract: account basis when the key exists, machine basis with an explicit source when it does
+not, and `null` only when there is no machine at all. Tools 122/122, client-bundle 25/25, fleet-chat-identity 4/4.
+
+### Not verified
+
+The panel against a live host, which is what this beta is for: the machine that reported the error is the machine that will
+report whether it is fixed.
+
 ## [1.1.21] — 2026-10-18
 
 **A fix-forward release: 1.1.20 could not load on Node 20.**
