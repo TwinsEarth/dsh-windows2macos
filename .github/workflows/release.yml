@@ -198,6 +198,9 @@ jobs:
   # as failed when it tried and could not.
   # ---------------------------------------------------------------------------------------------
   npm:
+    # The operator's rule: a STABLE release must be approved online. A beta does not, which is why that workflow
+    # has no environment at all -- the control point for a beta is who may push its tag.
+    environment: Stable
     name: publish to npm
     needs: release
     runs-on: ubuntu-latest
