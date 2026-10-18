@@ -2,10 +2,9 @@
 
 All notable changes to this project are documented here.
 
-## [1.1.20-beta.1] — 2026-10-18
+## [1.1.20] — 2026-10-18
 
-**The fleet panel now shows what each machine's owner actually typed into DSH.** A beta, because it reads a file format
-that DSH owns and the first real fleet run is the point of it.
+**The developer declares this release STABLE.** The fleet panel now shows what each machine's owner actually typed into DSH.
 
 ### What it does
 
@@ -34,7 +33,8 @@ held at RED until each was fixed; this entry exists because it finally went gree
 ### Not verified
 
 The end-to-end path (type in DSH on machine A, see it in machine B's panel) has **not been run across two machines yet**.
-The reader, the extractor, the sync rules, the route and the panel are each tested; their composition is not.
+The reader, the extractor, the sync rules, the route and the panel are each tested; their composition is not. That is stated
+here rather than implied by a green gate.
 
 ### Verified
 
