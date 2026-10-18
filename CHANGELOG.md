@@ -2,7 +2,31 @@
 
 All notable changes to this project are documented here.
 
-## [1.1.20] — 2026-10-18
+## [1.1.21] — 2026-10-18
+
+**A fix-forward release: 1.1.20 could not load on Node 20.**
+
+1.1.20 shipped with `import { zstdDecompressSync } from 'node:zlib'`. That named export does not exist on Node 20, so the
+module did not merely lose a feature -- the whole entry-point chain failed to import ("lib/tools.js" and "lib/index.js"
+both refused to load). CI caught it on `windows-latest / node 20` after 1.1.20 had already been published, and npm does
+not allow a version to be replaced, so this release fixes forward.
+
+- the zstd API is now resolved lazily through `require` behind `zstdAvailable()`; on a runtime without it,
+  `decodeTranscript` returns nothing instead of crashing, and the session mirror simply publishes no prompts;
+- the reader tests skip themselves on such a runtime rather than failing to import;
+- the release pipeline was re-examined afterwards: a beta needs no approval, a stable release is approved in the
+  `Stable` environment, and this time CI was green **before** the approval was requested, not after.
+
+### 1.1.20 is deprecated on npm
+
+Its published build is marked deprecated with a message pointing at this release. `latest` was rolled back to 1.1.19 the
+moment the breakage was confirmed, so a fresh `npm install -g` never received the broken build.
+
+### Verified
+
+CI green on this commit, including `windows-latest / node 20`. Gate GREEN twice, 15 of 15. 2502 tests / 2488 pass / 0 fail.
+
+## [1.1.20] — 2026-10-18 (withdrawn)
 
 **The developer declares this release STABLE.** The fleet panel now shows what each machine's owner actually typed into DSH.
 
