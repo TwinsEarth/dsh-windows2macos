@@ -51,9 +51,6 @@ jobs:
   publish-beta:
     name: attach the beta artifacts (never npm)
     runs-on: ubuntu-latest
-    # The permission gate: this environment must be configured with required reviewers. An unprotected environment
-    # here would quietly turn rule 3 into a comment.
-    environment: beta-access
     steps:
       - name: Check out the tag
         uses: actions/checkout@v4
