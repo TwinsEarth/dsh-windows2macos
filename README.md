@@ -82,6 +82,28 @@ npm install -g ./twinsearth-w2m-dsh-plugin-1.1.19.tgz
 
 Every release carries `SHA256SUMS` for exactly this reason. If a release is missing it, do not install that release.
 
+### 6. Beta (prerelease — never on npm)
+
+A beta is a **GitHub prerelease**, not an npm version. Nothing about it is resolved by `npm install`, and `latest` never
+points at one. It exists for a developer who has been granted `beta-access` and accepts that it can break.
+
+```bash
+# 1. find the newest prerelease (a beta is marked "Pre-release" on the releases page)
+#    https://github.com/TwinsEarth/dsh-windows2macos/releases  -> latest entry labelled Pre-release
+# 2. download BOTH files attached to it: twinsearth-w2m-dsh-plugin-<version>.tgz and SHA256SUMS
+sha256sum -c SHA256SUMS          # verify before installing, always
+npm install -g ./twinsearth-w2m-dsh-plugin-<version>.tgz
+```
+
+- **Access**: the beta workflow waits on the protected `beta-access` environment, so a reviewer must approve each run
+  before the artifact exists at all.
+- **Risk acknowledgment**: install it only if you have read [SECURITY.md](SECURITY.md) and accept that a beta may fail
+  where a stable release does not.
+- **Going back**: `npm install -g @twinsearth/w2m-dsh-plugin@latest` returns you to the stable channel.
+- **Why not npm**: there is no `npm publish` line in the beta workflow. A channel cannot leak into the default install if
+  the publication cannot happen at all.
+
+
 ---
 
 ## Quick start
@@ -302,6 +324,25 @@ npm install -g ./twinsearth-w2m-dsh-plugin-1.1.19.tgz
 ```
 
 每个 release 都带 `SHA256SUMS` 正是为了这一步。若某个 release 缺少它，**不要安装该版本**。
+
+#### 6. Beta（预发布版 —— 不进 npm）
+
+Beta 是 **GitHub prerelease**，不是 npm 版本：`npm install` 永远拿不到它，`latest` 也不会指向它。它是给**已获
+`beta-access` 授权、且接受它可能出问题**的开发者用的。
+
+```bash
+# 1. 在 releases 页面找标着 Pre-release 的最新条目
+#    https://github.com/TwinsEarth/dsh-windows2macos/releases
+# 2. 下载该条目的两个文件：twinsearth-w2m-dsh-plugin-<版本>.tgz 与 SHA256SUMS
+sha256sum -c SHA256SUMS          # 安装前务必校验
+npm install -g ./twinsearth-w2m-dsh-plugin-<版本>.tgz
+```
+
+- **权限**：beta 流水线挂在受保护的 `beta-access` 环境上，**每次运行都需要审批者批准**，产物才会存在；
+- **风险确认**：安装前请阅读 [SECURITY.md](SECURITY.md)，并接受 beta 可能比稳定版更容易失败；
+- **回退**：`npm install -g @twinsearth/w2m-dsh-plugin@latest` 即回到稳定版通道；
+- **为什么不走 npm**：beta 工作流里**没有 `npm publish`** —— 只要发布动作不可能发生，这个通道就漏不进默认安装。
+
 
 ### 快速开始
 
