@@ -98,8 +98,8 @@ export function compareVersions(installed, source) {
 }
 
 describe('installed version: the plugin a machine loads is checkable, not assumed', () => {
-  it('reads this package version', () => {
-    assert.match(sourceVersion(), /^\d+\.\d+\.\d+$/);
+  it('reads this package version (a prerelease is still a version)', () => {
+    assert.match(sourceVersion(), /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/);
   });
 
   it('reports every installed copy it found, or none, without inventing one', () => {
