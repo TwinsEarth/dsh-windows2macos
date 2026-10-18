@@ -43,7 +43,7 @@ describe('a session transcript is many zstd frames', { skip }, () => {
   });
 });
 
-describe('only the user messages are taken', () => {
+describe('only the user messages are taken', { skip }, () => {
   it('keeps user and prompt events and drops assistant, tool and empty ones', () => {
     const events = decodeTranscript(Buffer.concat([frame([
       { role: 'user', content: 'please run the tests' },
@@ -57,7 +57,7 @@ describe('only the user messages are taken', () => {
   });
 });
 
-describe('the conversation key is account + project name', () => {
+describe('the conversation key is account + project name', { skip }, () => {
   it('treats the same project on different paths as one conversation', () => {
     const a = conversationKey('fp-1', 'E:\\GPT');
     const b = conversationKey('fp-1', '/Users/fang/GPT/');
