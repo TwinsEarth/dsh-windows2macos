@@ -52,6 +52,16 @@ jobs:
     name: attach the beta artifacts (never npm)
     runs-on: ubuntu-latest
     steps:
+      - name: Only a maintainer may publish a beta
+        shell: bash
+        run: |
+          set -euo pipefail
+          # No environment approval is required for a beta any more. The control point moves here: a tag
+          # pushed by anyone else fails before anything is built or published.
+          case "${GITHUB_ACTOR}" in
+            TwinsEarth) ;;
+            *) echo "::error::${GITHUB_ACTOR} may not publish a beta"; exit 1 ;;
+          esac
       - name: Check out the tag
         uses: actions/checkout@v4
         with:
