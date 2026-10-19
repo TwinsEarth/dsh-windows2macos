@@ -184,6 +184,7 @@ import {
 // `w2m_chat` tool shipped first; this is the browser-facing half that was still missing.
 import { registerChatRoutes } from './fleet-chat-route.mjs';
 import { createFleetCouncil, fleetCouncilThread } from './council-fleet.mjs';
+import { renderMemoryView } from './memory-view.mjs';
 import { listIntents, resolveIntent } from './intents.mjs';
 // v0.7.0: the LAN hint layer. Imported here and used in exactly one place (`w2m_devices`); see the
 // module header for why a discovered device is a candidate to *ask* and never an authorisation.
@@ -6173,6 +6174,7 @@ export async function apply(ctx, config = {}) {
           truncated: current.truncated,
           status_tally: tally(current.records),
           records: current.records,
+          view: renderMemoryView(current.records),
           ...(previous === null
             ? {}
             : {

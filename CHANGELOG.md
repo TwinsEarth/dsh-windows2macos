@@ -7,9 +7,9 @@
 
 All notable changes to this project are documented here.
 
-## [1.2.2-beta.2] — 2026-10-20
+## [1.2.2] — 2026-10-20
 
-**The beta release step can now be re-run.**
+**Fleet collaboration, part one: shared-memory writes, a council of machines, and the panel that reaches them.**
 
 `v1.2.2-beta.1` published correctly — prerelease, assets and a matching SHA256SUMS — but the run that produced it reported
 its last step as failed:
@@ -22,13 +22,33 @@ Creating the tag through the API had already triggered one run, which created th
 collided with it. A release step that cannot be retried fails for the wrong reason, so `beta.yml` now refreshes an existing
 release (notes + assets with `--clobber`) instead of refusing, and says so in the log.
 
-No package content changed between beta.1 and beta.2 except this workflow fix; the two v1.2.2 features (shared-memory
-`append`, fleet council) are the same. The composer UI is still **not** implemented — this remains a beta for that reason.
+### What is in it
+
+- **Shared-memory writes**: `w2m_memory` gained `action: "append"` with `if_revision`. A stale revision comes back as a 409
+  the caller reads (revision, how far behind, which records it has not seen) and is deliberately **not** retried in the
+  transport -- retrying there turns a visible conflict into a silent overwrite.
+- **A council of machines**: `src/plugin/council-fleet.mjs` keeps the single-machine decision rule and changes the
+  transport to chat messages on `council-<id>`, so every machine reads the same ballots and recounts the same outcome.
+  Weights are a pure function of the ballot; a tie is refused; one ballot per machine; a late ballot is refused by name.
+  `w2m_council` exposes `fleet-open` / `fleet-vote` / `fleet-decide` / `fleet-state` / `fleet-list`.
+- **The panel**: a recipient picker (default "all"), a thread chip on messages that belong to a thread, click-to-reply with
+  a quoted line above the input, and the reply thread travelling with it. The host route refuses a single recipient that
+  is not in this fleet (`CHAT_UNKNOWN_RECIPIENT`) and says `CHAT_ROSTER_UNAVAILABLE` when the roster could not be read at
+  all -- a relay outage is not a typo in the recipient.
+- **A readable view over memory**: `w2m_memory` read now returns `view` (counts by machine and by status, one line per
+  record). A row shape it does not recognise is shown as itself rather than dropped.
+- **The beta pipeline is repeatable**: creating the tag had triggered a run that created the release, so the explicit
+  dispatch collided with it. The step now refreshes an existing release instead of refusing.
 
 ### Verified
 
-Gate GREEN twice, 15 of 15. Same suite as beta.1: 2544 tests / 2530 pass / 0 fail / 14 skip.
-Supersedes 1.2.2-beta.1 (same two features, plus this workflow fix). The superseded entry was removed rather than kept above this one, because a changelog that lists a replaced build above its replacement makes "newest" unreadable.
+Gate GREEN twice, 15 of 15: 2550 tests / 2536 pass / 0 fail / 14 skip. tools 125 (three append cases), council-fleet 12,
+memory-view 6, client-bundle 25.
+
+### Not verified
+
+The fleet council and a directed message across two live machines, and the panel against a second machine. Those need two
+machines on this build.
 
 ## [1.2.1] — 2026-10-18
 

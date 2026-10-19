@@ -103,6 +103,36 @@ export function registerChatRoutes(ctx, deps) {
     return resolved;
   };
 
+  /**
+   * The machine ids this fleet knows, cached for five seconds.
+   *
+   * Only the HOST can check a single recipient: the relay validates the shape of a recipient, not whether a machine
+   * with that id exists. Null means the roster could not be read at all, which is deliberately a different answer from
+   * "no such machine" -- a relay outage must not be reported as a typo in the recipient.
+   */
+  let rosterAtMs = 0;
+  let rosterIds = null;
+  const knownMachineIds = async (signal) => {
+    if (rosterIds !== null && Date.now() - rosterAtMs < 5000) return rosterIds;
+    try {
+      const cfg = deps.cfg();
+      const rabbitUrl = cfg?.rabbitUrl ?? null;
+      if (rabbitUrl === null) return null;
+      const token = await deps.resolveToken();
+      if (typeof token !== 'string' || token === '') return null;
+      const listed = await deps.request({ rabbitUrl, token, method: 'GET', pathname: '/v1/devices', signal });
+      if (listed?.ok !== true) return null;
+      const devices = Array.isArray(listed.json?.devices) ? listed.json.devices : null;
+      if (devices === null) return null;
+      const ids = devices.map((device) => device?.machine_id).filter((id) => typeof id === 'string');
+      rosterIds = ids;
+      rosterAtMs = Date.now();
+      return ids;
+    } catch {
+      return null;
+    }
+  };
+
   /** Post one batch into the relay using the machine's device token, exactly as the browser route does. */
   const postToRelay = async (identity, payload) => {
     const cfg = deps.cfg();
@@ -231,6 +261,16 @@ export function registerChatRoutes(ctx, deps) {
                 return refuse(listed?.status === 404 ? 502 : 502, code, message, 'the relay must run a version with /v1/fleet/messages (>= 1.1.17) and be restarted');
               }
               return Response.json({ ...listed.json, ok: true, local_machine_id: identity.machineId, local_machine_name: identity.machineName, conversation_key: sessionId, conversation_source: identity.source }, { headers: NO_STORE });
+            }
+            // Addressing (v1.2.2): a single recipient must exist in THIS fleet.
+            if (typeof addressing.to === 'string' && addressing.to !== 'all') {
+              const roster = await knownMachineIds(request.signal);
+              if (roster === null) {
+                return refuse(503, 'CHAT_ROSTER_UNAVAILABLE', 'the machine roster could not be read', 'a recipient cannot be checked without the relay roster');
+              }
+              if (!roster.includes(addressing.to)) {
+                return refuse(400, 'CHAT_UNKNOWN_RECIPIENT', 'no machine with that id is in this fleet', 'send all, or a machine_id listed by w2m_devices');
+              }
             }
             const posted = await deps.request({ rabbitUrl, token, method: 'POST', pathname: '/v1/fleet/messages', body: { session_id: sessionId, text: text ?? '', machine_id: identity.machineId, machine_name: identity.machineName, origin: 'chat', ...addressing }, signal: request.signal });
             if (posted?.ok !== true) {
