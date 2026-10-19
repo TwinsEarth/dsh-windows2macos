@@ -39,8 +39,11 @@ stayed green while the real profile refused the entry.
 - **Unread count**: the trigger shows how many messages arrived since this conversation was last opened. The watermark is
   local storage per conversation -- the relay stays stateless and no "who read what" is invented.
 
-Still missing from the panel: a timeout mark on an unanswered question (needs the ask store from the turn state machine)
-and the task board (needs a tasks tool that does not exist yet).
+- **Task board**: the panel shows the relay's own task list (up to six rows: id prefix, mode, status) through a host
+  proxy (`/api/w2m/tasks`), so the browser never holds a device token.
+
+Still missing from the panel: a timeout mark on an unanswered question, which needs the ask store from the turn state
+machine.
 ### Verified
 
 Gate GREEN twice, 15 of 15: 2555 tests / 2541 pass / 0 fail / 14 skip.

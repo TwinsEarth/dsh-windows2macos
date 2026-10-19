@@ -43,6 +43,9 @@ function newestTranscript(cwd) {
 }
 
 export const CHAT_ROUTE_PATH = '/api/w2m/chat';
+
+/** The light task board the panel shows beside the chat. The relay already answers GET /v1/tasks. */
+export const TASKS_ROUTE_PATH = '/api/w2m/tasks';
 export const MAX_SESSION_ID_LENGTH = 200;
 
 const NO_STORE = { 'cache-control': 'no-store' };
@@ -284,6 +287,48 @@ export function registerChatRoutes(ctx, deps) {
           }
         },
       });
+      // A light task board. The relay answers GET /v1/tasks; this proxy exists so the panel can read it with the device
+      // token that never leaves the host.
+      registry.register({
+        path: TASKS_ROUTE_PATH,
+        methods: ['GET'],
+        requestBody: 'buffered',
+        fetch: async (request) => {
+          const refuse = (httpStatus, reasonCode, error, detail) =>
+            Response.json({ ok: false, error, reason_code: reasonCode, detail }, { status: httpStatus, headers: NO_STORE });
+          if (request.method !== 'GET') {
+            return refuse(405, 'TASKS_METHOD_NOT_ALLOWED', `${request.method} is not answered here`, 'GET only');
+          }
+          const url = new URL(request.url);
+          const limitRaw = url.searchParams.get('limit');
+          const limit = limitRaw !== null && /^[0-9]+$/.test(limitRaw) ? Math.min(Number(limitRaw), 50) : 20;
+          const cfg = deps.cfg();
+          const rabbitUrl = cfg?.rabbitUrl ?? null;
+          if (rabbitUrl === null) return refuse(503, 'TASKS_NO_RELAY', 'no relay is configured', 'set rabbitUrl in the profile patch');
+          let token;
+          try {
+            token = await deps.resolveToken();
+          } catch (error) {
+            return refuse(503, 'TASKS_UNPAIRED', `this machine has no device token: ${error instanceof Error ? error.message : String(error)}`, 'pair the machine first');
+          }
+          if (typeof token !== 'string' || token === '') {
+            return refuse(503, 'TASKS_UNPAIRED', 'this machine has no device token', 'pair the machine first');
+          }
+          try {
+            const listed = await deps.request({
+              rabbitUrl, token, method: 'GET', pathname: '/v1/tasks', query: { limit: String(limit) }, signal: request.signal,
+            });
+            if (listed?.ok !== true) {
+              const code = listed?.json?.error?.code ?? 'TASKS_LIST_REFUSED';
+              return refuse(502, code, `the relay answered HTTP ${listed?.status ?? 0}`, 'the relay must run a version with /v1/tasks');
+            }
+            return Response.json({ ...listed.json, ok: true }, { headers: NO_STORE });
+          } catch (error) {
+            return refuse(502, 'TASKS_RELAY_ERROR', `the relay call failed: ${error instanceof Error ? error.message : String(error)}`, null);
+          }
+        },
+      });
+
       status.mounted = true;
       status.reason = null;
       const timer = setInterval(() => { mirrorOnce().catch(() => { /* one bad tick must not stop the next */ }); }, 2000);
