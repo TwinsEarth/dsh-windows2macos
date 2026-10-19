@@ -2137,7 +2137,7 @@ function checkPackAndTarball() {
     // 0" and "the probe registered ten tools" are different measurements and only the second one is
     // the claim this check makes; a probe edited to exit 0 early would satisfy the first.
     const toolCount = Number(verified.stdout.match(/registered\s*:\s*(\d+)/)?.[1] ?? NaN);
-    if (toolCount !== 12) {
+    if (toolCount !== 13) {
       return fail(
         `the packed copy registered ${Number.isNaN(toolCount) ? 'an unreadable number of' : toolCount} tool(s), ` +
           'not the twelve this package documents',

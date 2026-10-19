@@ -67,7 +67,7 @@ const expected = [
   'w2m_memory',
   'w2m_approvals',
   'w2m_chat',
-  'w2m_council',
+  'w2m_intent', 'w2m_council',
 ];
 const ok = registered.length === expected.length && expected.every((e) => names.includes(e));
 process.stdout.write(

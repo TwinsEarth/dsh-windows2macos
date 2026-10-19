@@ -23,6 +23,7 @@ import {
   rfc3339,
 } from './state.mjs';
 import { createFleetMessages } from './fleet-messages.mjs';
+import { createFleetMemory } from './fleet-memory.mjs';
 import { createJoinChallenges } from './join-challenge.mjs';
 import { createAdmission } from './admission.mjs';
 import { Persistence } from './persistence.mjs';
@@ -1045,6 +1046,7 @@ export class RelayServer {
     // speak as another. The refusal codes from the store are passed through unchanged (FLEET_QUOTA_EXCEEDED included)
     // because a caller that cannot tell "too big" from "over quota" from "not text" cannot tell the operator what to do.
     this.fleetMessages ??= createFleetMessages({ now: () => this.state.nowMs() });
+    this.fleetMemory ??= createFleetMemory({ now: () => this.state.nowMs() });
 
     if (method === 'POST' && path === '/v1/fleet/messages') {
       const body = takeJson();
@@ -1113,6 +1115,37 @@ export class RelayServer {
         ...listed,
         usage: this.fleetMessages.usage(),   // shown with every read so a client can warn before the quota refuses a post
       });
+    }
+
+    // v1.2.2: shared memory writes. Compare-and-swap on a revision, because two machines appending to one document is
+    // otherwise last-writer-wins over the whole thing -- a record one machine added would vanish because the other had an
+    // older copy. A stale writer gets 409 and the records it has not read; it is NOT retried here, because retrying in
+    // the transport turns a visible conflict into a silent overwrite.
+    if (path.startsWith('/v1/fleet/memory/')) {
+      const doc = decodeURIComponent(path.slice('/v1/fleet/memory/'.length));
+      if (doc === '') throw new ProtocolError('BAD_REQUEST', 'memory doc is required', { method, path });
+      this.fleetMemory ??= createFleetMemory({ now: () => this.state.nowMs() });
+      if (method === 'GET') {
+        return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ...this.fleetMemory.get(doc) });
+      }
+      if (method === 'PUT') {
+        const body = takeJson();
+        const appended = this.fleetMemory.append({
+          doc,
+          if_revision: Number.isInteger(body.if_revision) ? body.if_revision : null,
+          author_machine_id: device.machine_id,
+          records: Array.isArray(body.records) ? body.records : (typeof body.text === 'string' ? [body.text] : []),
+        });
+        if (appended.ok !== true) {
+          const status = appended.code === 'REVISION_CONFLICT' ? 409 : 400;
+          return sendJson(res, status, {
+            protocol_version: PROTOCOL_VERSION, ok: false,
+            error: { code: appended.code }, detail: appended.detail ?? null,
+          });
+        }
+        return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ...appended });
+      }
+      throw new ProtocolError('BAD_REQUEST', 'memory accepts GET or PUT', { method, path });
     }
 
     throw new ProtocolError('NOT_FOUND', `no route for ${method} ${path}`, { method, path });

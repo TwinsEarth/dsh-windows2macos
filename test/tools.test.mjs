@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Unit tests for the W2M DSH plugin (`src/plugin/tools.mjs`).
  *
  * # What these tests do and do not cover
@@ -283,13 +283,13 @@ function finalTask(overrides = {}) {
 // ---------------------------------------------------------------------------------------------
 
 describe('registration shape', () => {
-  it('declares the tools service and registers exactly twelve tools', async () => {
+  it('declares the tools service and registers exactly thirteen tools', async () => {
     assert.deepEqual(plugin.inject, ['tools']);
     const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
-    assert.equal(tools.size, 12);
+    assert.equal(tools.size, 13);
     assert.deepEqual(
       [...tools.keys()].sort(),
-      ['w2m_approvals', 'w2m_chat', 'w2m_council', 'w2m_devices', 'w2m_history', 'w2m_memory', 'w2m_report', 'w2m_run', 'w2m_stats', 'w2m_status', 'w2m_update', 'w2m_wait'],
+      ['w2m_approvals', 'w2m_chat', 'w2m_council', 'w2m_devices', 'w2m_history', 'w2m_intent', 'w2m_memory', 'w2m_report', 'w2m_run', 'w2m_stats', 'w2m_status', 'w2m_update', 'w2m_wait'],
     );
   });
 
@@ -1961,7 +1961,7 @@ describe('bounds and cancellation', () => {
     // earlier test happened to populate the cache with.
     plugin.resetDefineToolCacheForTests();
     const { tools, warnings } = await register({ rabbitUrl: RABBIT });
-    assert.equal(tools.size, 12, 'the plugin must register all twelve tools on either path');
+    assert.equal(tools.size, 13, 'the plugin must register all twelve tools on either path');
 
     /**
      * Match the warning this test is about, rather than counting warnings.
@@ -3161,3 +3161,50 @@ describe('w2m_update channels (v1.1.18)', () => {
     } finally { globalThis.fetch = previous; }
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+// w2m_memory append: the shared-document write (v1.2.2)
+// ---------------------------------------------------------------------------------------------
+
+describe('w2m_memory append: compare-and-swap on the shared document', () => {
+  it('PUTs the records to the memory doc and returns the new revision', async () => {
+    const fetchStub = installFetch([
+      { method: 'PUT', path: '/v1/fleet/memory/fleet', body: { protocol_version: 1, ok: true, revision: 3, appended: 1 } },
+    ]);
+    try {
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
+      const out = JSON.parse(await tools.get('w2m_memory').execute({ action: 'append', records: ['a fact'], if_revision: 2 }));
+      assert.equal(out.ok, true);
+      assert.equal(out.revision, 3);
+      assert.equal(out.appended, 1);
+      const call = fetchStub.calls.at(-1);
+      assert.equal(call.method, 'PUT');
+      assert.equal(call.path, '/v1/fleet/memory/fleet');
+      assert.deepEqual(call.body, { records: ['a fact'], if_revision: 2 });
+    } finally { fetchStub.restore(); }
+  });
+
+  it('returns a 409 as a value and does not retry it', async () => {
+    const fetchStub = installFetch([
+      { method: 'PUT', path: '/v1/fleet/memory/fleet', status: 409, body: { ok: false, error: { code: 'REVISION_CONFLICT' }, detail: { revision: 5, behind_by: 2 } } },
+    ]);
+    try {
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
+      const out = JSON.parse(await tools.get('w2m_memory').execute({ action: 'append', records: ['late'], if_revision: 3 }));
+      assert.equal(out.ok, false);
+      assert.equal(out.code, 'REVISION_CONFLICT');
+      assert.equal(out.detail.revision, 5);
+      assert.equal(fetchStub.calls.filter((call) => call.path === '/v1/fleet/memory/fleet').length, 1, 'a conflict must not be retried');
+    } finally { fetchStub.restore(); }
+  });
+
+  it('refuses an empty records list before touching the relay', async () => {
+    const fetchStub = installFetch([]);
+    try {
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
+      await assert.rejects(() => tools.get('w2m_memory').execute({ action: 'append', records: [] }), /W2M_MEMORY_APPEND/);
+      assert.equal(fetchStub.calls.length, 0, 'nothing may reach the relay');
+    } finally { fetchStub.restore(); }
+  });
+});
+

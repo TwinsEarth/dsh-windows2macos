@@ -183,6 +183,8 @@ import {
 // v1.1.17 chat: the host route behind the composer's fleet-chat panel. The relay side and the
 // `w2m_chat` tool shipped first; this is the browser-facing half that was still missing.
 import { registerChatRoutes } from './fleet-chat-route.mjs';
+import { createFleetCouncil, fleetCouncilThread } from './council-fleet.mjs';
+import { listIntents, resolveIntent } from './intents.mjs';
 // v0.7.0: the LAN hint layer. Imported here and used in exactly one place (`w2m_devices`); see the
 // module header for why a discovered device is a candidate to *ask* and never an authorisation.
 import { createDiscoverySource } from './mdns-discover.mjs';
@@ -3390,6 +3392,10 @@ export async function apply(ctx, config = {}) {
    */
   const councilSessions = createCouncilSessions();
 
+  /** v1.2.2: the machine-wide council. Ballots arrive as chat messages, so this is state + arithmetic; the transport is
+   * the fleet chat itself (thread `council-<id>`), which already carries `to` / `thread_id` / `reply_to` since 1.2.1. */
+  const fleetCouncil = createFleetCouncil({});
+
   // v0.6.1: the two browser routes behind the composer's target control. Additive and optional: a
   // host without `connection.fetch` still gets every tool, and `w2m_status` reports the absence  -   // which is the honest place for it, since a host that has no Connection at all is simply not a web
   // composition and does not need a warning on every headless run.
@@ -5234,7 +5240,7 @@ export async function apply(ctx, config = {}) {
        */
       action: {
         type: 'string',
-        enum: ['read', 'publish', 'pull', 'latest', 'diff', 'merge'],
+        enum: ['read', 'publish', 'pull', 'latest', 'diff', 'merge', 'append'],
         description:
           'read (default) = answer from memory. publish = upload the curated collective memory '
           + '(`fleet-memory.md`) to the relay as a content-addressed blob and return its SHA-256. latest = ask the '
@@ -5251,6 +5257,19 @@ export async function apply(ctx, config = {}) {
           'The SHA-256 naming the blob, for action="pull": 64 lowercase hex characters. A hash that exists on the '
           + 'relay but belongs to another fleet is reported as not found, exactly like a hash that was never '
           + 'stored -- a distinguishable refusal would confirm to a prober which hashes this relay holds.',
+      },
+      records: {
+        type: 'array',
+        items: { type: 'string' },
+        description:
+          'For action="append": one append-only record per string. Appending is the unit of change, so two machines ' +
+          'can add records without one overwriting the other document.',
+      },
+      if_revision: {
+        type: 'number',
+        description:
+          'For action="append": the revision you read. A stale value is refused with 409 and the records you have not ' +
+          'read, because applying it on top of something you never saw is a silent overwrite.',
       },
       scope: {
         type: 'string',
@@ -5339,6 +5358,64 @@ export async function apply(ctx, config = {}) {
     output: jsonOutput,
     async execute(args, exec) {
       throwIfAborted(exec?.signal);
+
+      /**
+       * v1.2.2: append records to the shared memory under compare-and-swap.
+       *
+       * A 409 is returned AS-IS, with the revision and what the caller has not read. Retrying here would turn a visible
+       * conflict into a silent overwrite, which is the whole reason the relay keeps a revision instead of merging.
+       */
+      if (typeof args?.action === 'string' && args.action === 'append') {
+        const doc = typeof args?.scope === 'string' && args.scope.trim() !== '' ? args.scope.trim() : 'fleet';
+        const incoming = Array.isArray(args?.records)
+          ? args.records
+          : (typeof args?.records === 'string' ? [args.records] : []);
+        const records = incoming.filter((entry) => typeof entry === 'string' && entry.trim() !== '');
+        if (records.length === 0) {
+          throw new W2MError('W2M_MEMORY_APPEND', 'W2M_MEMORY_APPEND: records is required for append', {
+            hint: 'pass records: ["a fact the fleet should keep", ...]',
+          });
+        }
+        const appendUrl = cfg.rabbitUrl ?? null;
+        if (appendUrl === null) {
+          throw new W2MError('W2M_NO_RELAY', 'W2M_NO_RELAY: no relay is configured, so shared memory cannot be written', {
+            hint: 'set rabbitUrl in the profile patch',
+          });
+        }
+        const appendToken = await resolveToken(cfg);
+        if (appendToken === null) {
+          throw new W2MError('W2M_NO_TOKEN', 'W2M_NO_TOKEN: this machine has no device token, so shared memory cannot be written', {
+            hint: 'pair this machine first, then retry',
+          });
+        }
+        const appendBody = { records };
+        if (Number.isInteger(args?.if_revision)) appendBody.if_revision = args.if_revision;
+        const appended = await request({
+          rabbitUrl: appendUrl,
+          token: appendToken,
+          method: 'PUT',
+          pathname: '/v1/fleet/memory/' + encodeURIComponent(doc),
+          body: appendBody,
+          signal: exec?.signal,
+        });
+        if (appended?.ok !== true) {
+          return JSON.stringify({
+            ok: false,
+            action: 'append',
+            doc,
+            status: appended?.status ?? 0,
+            code: appended?.json?.error?.code ?? appended?.error?.code ?? 'W2M_MEMORY_APPEND',
+            detail: appended?.json?.detail ?? null,
+          });
+        }
+        return JSON.stringify({
+          ok: true,
+          action: 'append',
+          doc,
+          revision: appended.json?.revision ?? null,
+          appended: appended.json?.appended ?? 0,
+        });
+      }
 
       /**
        * v1.0.7 (#1c): publish the collective memory as a content-addressed blob.
@@ -6415,6 +6492,40 @@ export async function apply(ctx, config = {}) {
   }));
 
   /**
+   * v1.2.2: structured intents -- the deterministic half of "say it in words, run it on the machine".
+   *
+   * The caller is the model, and it turns language into one of a CLOSED set of intents; this tool maps that intent to an
+   * allow-listed argv or refuses it by name. Free text is deliberately not interpreted here: a remote machine runs an
+   * allow-list, and a model inventing a command on its behalf is exactly what the list exists to stop.
+   */
+  ctx.tools.register(defineTool({
+    name: 'w2m_intent',
+    description:
+      'Map a structured intent to an allow-listed command. Actions: run-tests, node-version, git-status, git-head, ' +
+      'fleet-facts, shard-probe. Unknown actions and unknown parameters are refused by name rather than guessed, and a ' +
+      'command the machine allow-list does not carry is refused with the list it checked.',
+    parameters: {
+      action: { type: 'string', description: 'The catalog action; call with action:"list" to read the catalog.' },
+      params: { type: 'object', description: 'Action parameters, for example { n: 3 } for shard-probe.' },
+    },
+    output: jsonOutput,
+    presentCall: (args) => ({ card: 'generic', title: 'w2m intent ' + (typeof args?.action === 'string' ? args.action : '?'), kind: 'read', rawInput: {} }),
+    async execute(args, exec) {
+      throwIfAborted(exec?.signal);
+      const action = typeof args?.action === 'string' ? args.action.trim() : '';
+      if (action === '' || action === 'list') {
+        return JSON.stringify({ ok: true, action: 'list', intents: listIntents() });
+      }
+      const resolved = resolveIntent({ action, params: args?.params }, { allowedCommands: cfg.allowedCommands ?? null });
+      if (resolved.ok !== true) {
+        return JSON.stringify({ ok: false, action, code: resolved.code, detail: resolved.detail ?? null, hint: resolved.hint });
+      }
+      return JSON.stringify({ ok: true, action, argv: resolved.argv, command: resolved.command, risk: resolved.risk });
+    },
+  }));
+
+
+  /**
    * v0.37.0: the eleventh tool -- a question put to a council, and the outcome read back with its dissent.
    *
    * ## Why one tool with an action rather than seven
@@ -6443,7 +6554,7 @@ export async function apply(ctx, config = {}) {
     parameters: {
       action: {
         type: 'string',
-        enum: ['open', 'advance', 'assign', 'argue', 'vote', 'decide', 'record', 'state', 'decision', 'list'],
+        enum: ['open', 'advance', 'assign', 'argue', 'vote', 'decide', 'record', 'state', 'decision', 'list', 'fleet-open', 'fleet-vote', 'fleet-decide', 'fleet-state', 'fleet-list'],
         description: 'What to do. "open" starts a council, "state" reports one mid-flight, "decision" reads a sealed one back with its dissent.',
         default: 'state',
       },
@@ -6473,6 +6584,37 @@ export async function apply(ctx, config = {}) {
       throwIfAborted(exec?.signal);
       const action = typeof args?.action === 'string' ? args.action : 'state';
       const id = typeof args?.council_id === 'string' ? args.council_id : null;
+
+      // v1.2.2: the FLEET council. Same decision rule as the single-machine one (reproducible weights, a tie is a
+      // refusal); the difference is transport -- ballots are chat messages on `council-<id>`, so every machine can read
+      // the same ballots and recount to the same outcome.
+      if (typeof action === 'string' && action.startsWith('fleet-')) {
+        const threadId = fleetCouncilThread(id);
+        if (action === 'fleet-open') {
+          const opened = fleetCouncil.open({ councilId: id, question: typeof args?.question === 'string' ? args.question : '', openedByMachineId: 'local' });
+          return JSON.stringify({ ok: opened.ok, action, council_id: id, thread_id: threadId, reason_code: opened.code ?? null, council: opened.council ?? null });
+        }
+        if (action === 'fleet-vote') {
+          const voted = fleetCouncil.vote({
+            councilId: id,
+            machineId: typeof args?.participant === 'string' && args.participant !== '' ? args.participant : 'local',
+            choice: args?.choice,
+            reason: args?.reason ?? null,
+            authority: args?.authority ?? null,
+            reputation: args?.reputation ?? null,
+          });
+          return JSON.stringify({ ok: voted.ok, action, council_id: id, thread_id: threadId, reason_code: voted.code ?? null, council: voted.council ?? null });
+        }
+        if (action === 'fleet-decide') {
+          const decided = fleetCouncil.decide({ councilId: id });
+          return JSON.stringify({ ok: decided.ok, action, council_id: id, thread_id: threadId, reason_code: decided.code ?? null, detail: decided.detail ?? null, council: decided.council ?? null });
+        }
+        if (action === 'fleet-list') {
+          return JSON.stringify({ ok: true, action, ...fleetCouncil.list() });
+        }
+        const read = fleetCouncil.state({ councilId: id });
+        return JSON.stringify({ ok: read.ok, action, council_id: id, thread_id: threadId, reason_code: read.code ?? null, council: read.council ?? null });
+      }
 
       if (action === 'list') {
         return JSON.stringify({ ok: true, action, ...councilSessions.ids(), phases: PHASES, roles: [...ROLES] });

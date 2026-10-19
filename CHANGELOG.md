@@ -1,7 +1,46 @@
+## [Unreleased]
+
+- `w2m_intent`: structured intents mapped onto allow-listed commands; unknown actions, parameters and types
+  are refused by name (the fleet does not invent commands).
+
 # Changelog
 
 All notable changes to this project are documented here.
 
+## [1.2.2-beta.1] — 2026-10-20
+
+**Two of the three v1.2.2 items: shared-memory writes and a council whose members are machines.**
+
+### Shared memory writes (⑤)
+
+`w2m_memory` gained `action: "append"` with `if_revision`: records are appended to a document the relay keeps under
+compare-and-swap. A stale `if_revision` is returned **as a 409 the caller reads** (`REVISION_CONFLICT` with `revision`,
+`behind_by`, `unread_records` and a sample), and it is deliberately **not retried here** — retrying in the transport turns a
+visible conflict into a silent overwrite. An empty record list is refused before anything touches the network.
+
+### Fleet council (⑥)
+
+`src/plugin/council-fleet.mjs` keeps the decision rule of the single-machine council and changes the transport: ballots are
+chat messages on `council-<id>`, so every machine can read the same ballots and recount to the same outcome.
+
+- weights are a pure function of the numbers on the ballot → reproducible on any machine;
+- a **tie is a refusal** (`FLEET_COUNCIL_TIED`), never broken;
+- one ballot per machine; a **late ballot is refused by name**, not silently dropped;
+- `w2m_council` exposes `fleet-open` / `fleet-vote` / `fleet-decide` / `fleet-state` / `fleet-list`.
+
+### Not in this beta
+
+The third v1.2.2 item — the panel UI (recipient picker, thread grouping, reply quoting, unread/timeout marks) — is **not
+implemented yet**. This is a beta precisely because the capability exists but is not yet reachable from the composer.
+
+### Verified
+
+Gate GREEN twice, 15 of 15: 2544 tests / 2530 pass / 0 fail / 14 skip. `tools.test.mjs` 125 (three new append cases:
+PUT body, 409 not retried, empty list never reaches the relay); `council-fleet.test.mjs` 12.
+
+### Not verified
+
+The fleet council across two live machines (ballot exchange through the relay). That needs two machines on this build.
 ## [1.2.1] — 2026-10-18
 
 **P1 of fleet collaboration: addressing, correlation, and a turn that can time out.**
