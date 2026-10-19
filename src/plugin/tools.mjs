@@ -185,6 +185,7 @@ import {
 import { registerChatRoutes } from './fleet-chat-route.mjs';
 import { createFleetCouncil, fleetCouncilThread } from './council-fleet.mjs';
 import { renderMemoryView } from './memory-view.mjs';
+import { schemaProblems } from './schema-spec.mjs';
 import { listIntents, resolveIntent } from './intents.mjs';
 // v0.7.0: the LAN hint layer. Imported here and used in exactly one place (`w2m_devices`); see the
 // module header for why a discovered device is a candidate to *ask* and never an authorisation.
@@ -554,6 +555,15 @@ function createDefineTool(real) {
     const parameters = {};
     for (const [key, decl] of Object.entries(declared)) {
       parameters[key] = normaliseParameter(name, key, decl);
+    }
+
+    // v1.2.3: DSH refuses an object parameter that does not state additionalProperties explicitly, and it
+    // refuses it at MOUNT time -- in the profile of whoever installed the build. That is the failure the packed
+    // artifact hit in a real host while this repository tests were green, so the rule is enforced here, where
+    // every tool already passes through.
+    const schemaProblemsFound = schemaProblems({ type: 'object', properties: parameters, additionalProperties: false }, name);
+    if (schemaProblemsFound.length > 0) {
+      throw new TypeError(schemaProblemsFound.map((problem) => problem.path + ': ' + problem.why).join('; '));
     }
 
     return { ...definition, parameters };
@@ -6508,7 +6518,11 @@ export async function apply(ctx, config = {}) {
       'command the machine allow-list does not carry is refused with the list it checked.',
     parameters: {
       action: { type: 'string', description: 'The catalog action; call with action:"list" to read the catalog.' },
-      params: { type: 'object', description: 'Action parameters, for example { n: 3 } for shard-probe.' },
+      params: {
+        type: 'object',
+        additionalProperties: true,
+        description: 'Action parameters, for example { n: 3 } for shard-probe.',
+      },
     },
     output: jsonOutput,
     presentCall: (args) => ({ card: 'generic', title: 'w2m intent ' + (typeof args?.action === 'string' ? args.action : '?'), kind: 'read', rawInput: {} }),

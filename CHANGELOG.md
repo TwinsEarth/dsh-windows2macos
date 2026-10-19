@@ -7,6 +7,40 @@
 
 All notable changes to this project are documented here.
 
+## [1.2.3] — 2026-10-20
+
+**The packed artifact did not mount. This fixes that, and the reason it was not caught here.**
+
+`v1.2.2` was released, published to npm, and **failed Compat**: the packed artifact would not mount in a real profile.
+
+```
+JsonSchemaError: unsupported JSON schema: parameters.params.additionalProperties must be explicitly true or false
+```
+
+`w2m_intent` declared `params: { type: "object", ... }` without stating `additionalProperties`. DSH refuses such a
+schema **at mount time** -- in the profile of whoever installs the build -- and this repository had no check that would
+have said so before shipping: the local loader gate mounted the artifact on a host whose compiler path differs, so it
+stayed green while the real profile refused the entry.
+
+### What changed
+
+- `w2m_intent`'s `params` now states `additionalProperties: true`, and every tool schema is checked when it is defined.
+- New `src/plugin/schema-spec.mjs`: a pure walker over schema-shaped values, and `schemaProblems()` which returns every
+  object node that does not state `additionalProperties` as a boolean -- all of them at once, not the first one.
+- `defineTool` now runs that check, so a tool with an under-specified object parameter fails where it is written rather
+  than in someone else's profile.
+- `test/schema-spec.test.mjs`: 5 tests on the walker and the checker (nested properties, array items, unions, multiple
+  offenders, `true` accepted as well as `false`).
+
+### Verified
+
+Gate GREEN twice, 15 of 15: 2555 tests / 2541 pass / 0 fail / 14 skip.
+
+### Not verified
+
+Compat itself: that workflow runs in its own environment, so this release is verified by the same local gate that missed
+the defect. **Watch the Compat run for this tag.** If it fails again, the mount is failing for a different reason than the
+schema and the log will say which entry and which fiber.
 ## [1.2.2] — 2026-10-20
 
 **Fleet collaboration, part one: shared-memory writes, a council of machines, and the panel that reaches them.**
