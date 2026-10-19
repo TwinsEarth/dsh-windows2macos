@@ -127,11 +127,21 @@ jobs:
           - \`latest\` (npm) is **unchanged** by this release.
           - Stable releases only: npm receives a version when the developer declares it stable.
           EOF
+          # Re-dispatching the same version used to fail here with "a release with the same tag name already
+          # exists": the tag push had already triggered a run, so the second one collided. A release step that
+          # cannot be retried is a release step that fails for the wrong reason, so an existing release is
+          # refreshed instead of refused.
+          if gh release view "v${version}" >/dev/null 2>&1; then
+            echo "release v${version} already exists; refreshing its notes and assets"
+            gh release edit "v${version}" --prerelease --title "v${version} (beta)" --notes-file notes.md
+            gh release upload "v${version}" beta-out/*.tgz beta-out/SHA256SUMS --clobber
+          else
           gh release create "v${version}" \
             --prerelease \
             --title "v${version} (beta)" \
             --notes-file notes.md \
             beta-out/*.tgz beta-out/SHA256SUMS
+          fi
 
       - name: Say what happened, and what did not
         run: |
