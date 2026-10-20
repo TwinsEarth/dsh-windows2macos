@@ -25,7 +25,7 @@ import { Readable } from 'node:stream';
 import { access, constants as fsConstants } from 'node:fs/promises';
 import { existsSync, mkdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { randomUUID , sign as signBytes } from 'node:crypto';
 
 import {
   EMPTY_SHA256,
@@ -50,11 +50,13 @@ import {
 import { createSpool } from './spool.mjs';
 import { MEMORY_FILE, appendMemory, memoryRecord } from './memory.mjs';
 import { matchAllowedCommand, parseAllowedCommands } from './allowed-commands.mjs';
-import { CRYPTO_REASON, DEVICE_KEY_FILE, DeviceKey, PeerKeyStore } from './crypto.mjs';
+import { CRYPTO_REASON, DEVICE_KEY_FILE, DeviceKey, PeerKeyStore, deriveSigningKey } from './crypto.mjs';
 import { DEFAULT_P2P_MODE, P2P_DEFAULTS, P2PNode, normalizeP2PMode, normalizeP2PPort } from './p2p-node.mjs';
 import { punchSession, reverseDialSession } from './p2p.mjs';
 import { createSigner } from '../signing.mjs';
 import { planStageOutput } from '../util/dataflow.mjs';
+import { redactEnvelope } from '../util/redact.mjs';
+import { canonicalSignedPayload } from '../util/envelope-signature.mjs';
 import { joinUrl, resolveBaseUrl } from './url.mjs';
 
 /** Wire protocol version (§1). */
@@ -997,6 +999,8 @@ export function createAgent(options) {
     fetchImpl = globalThis.fetch,
     heartbeatIntervalMs = HEARTBEAT_INTERVAL_MS,
     maxOutputBytes,
+    // v1.2.6: filter secrets out of the readable envelope fields. Off is allowed and marked `unredacted: true`.
+    redactOutput = true,
     objectMode = 'temp',
     tmpDir,
     onceIdleMs = 0,
@@ -2647,6 +2651,18 @@ export function createAgent(options) {
       toolchain: toolchain ?? null,
     };
     if (execution?.signal) envelope.signal = execution.signal;
+
+    /**
+     * v1.2.6: secrets a command printed are replaced before the envelope leaves this machine. The hashes above stay the
+     * evidence of the raw bytes; only the readable heads/tails are filtered. `redactOutput: false` disables it and marks the
+     * envelope `unredacted: true`, because a silent no-op would be worse than no redaction.
+     */
+    if (redactOutput !== false) {
+      const filtered = redactEnvelope(envelope, { enabled: true });
+      Object.assign(envelope, filtered.envelope);
+    } else {
+      envelope.unredacted = true;
+    }
     if (offer.write === true) envelope.write = true;
 
     // v0.3.3 `pipeline` (§5.2 optional). Present only for a chain, so a single-command envelope is
@@ -2711,6 +2727,32 @@ export function createAgent(options) {
     envelope.memory = memoryWrite.ok === true
       ? { written: true, file: MEMORY_FILE, rotated: memoryWrite.rotated === true }
       : { written: false, reason_code: memoryWrite.error };
+
+    /**
+     * v1.2.6: sign the four facts that identify THE COMMAND. The signature covers the tuple only, because everything else in
+     * the envelope is a report about the run rather than a claim about which command ran. `unsigned` is a fact a reader can
+     * see (an older build, or no device key); it is not silently claimed as signed.
+     */
+    const signingKey = deviceKey === null ? null : deriveSigningKey(deviceKey);
+    if (signingKey !== null) {
+      const payload = canonicalSignedPayload({
+        task_id: envelope.task_id,
+        argv_hash: envelope.command_hash,
+        machine_id: envelope.machine_id,
+        ts: endedAt,
+      });
+      try {
+        envelope.signature = {
+          alg: 'ed25519',
+          value: signBytes(null, Buffer.from(payload, 'utf8'), signingKey.privateKey).toString('base64'),
+          public_key: signingKey.publicKeyBase64,
+          ts: endedAt,
+        };
+      } catch {
+        // The failure is reported by the envelope arriving unsigned; a key that cannot sign must not fail the run.
+        // A key that cannot sign must not fail the run: the envelope simply arrives unsigned, which readers report.
+      }
+    }
 
     return buildEnvelope(envelope);
   }
@@ -3454,6 +3496,9 @@ export function createAgent(options) {
     // envelope above and released with it, so a long-lived agent keeps one record per *live* task.
     releaseDialRecord(envelope.task_id);
     scheduleChannelRelease(envelope.task_id);
+
+
+
     return envelope;
   }
 

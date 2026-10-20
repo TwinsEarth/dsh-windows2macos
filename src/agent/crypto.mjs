@@ -336,6 +336,37 @@ export function rawPrivateOf(privateKey) {
  * stored: the public half is derived, which is what makes a hand-edited file unable to publish a
  * public key that does not match its private key.
  */
+/**
+ * v1.2.6: the Ed25519 key this machine signs envelopes with.
+ *
+ * ## Why derived rather than a second file
+ *
+ * `DeviceKey` is X25519: it does key agreement for the p2p handshake and cannot sign (the runtime refuses it outright). A second
+ * on-disk key would be a second thing to back up, rotate and lose. The device's 32-byte private scalar is a perfectly good
+ * Ed25519 seed, so the signing key is derived from it: one secret to protect, and a machine that re-pairs cannot end up with a
+ * signature key nobody can verify.
+ *
+ * The public half travels INSIDE the signature so a reader can verify the tuple without knowing this machine beforehand. Binding
+ * that key to the relay's device record is the remaining step for non-repudiation across machines -- recorded in the roadmap.
+ *
+ * @param {DeviceKey} deviceKey
+ * @returns {{privateKey: import('node:crypto').KeyObject, publicKeyBase64: string}|null}
+ */
+export function deriveSigningKey(deviceKey) {
+  if (!(deviceKey instanceof DeviceKey)) return null;
+  try {
+    const seed = rawPrivateOf(deviceKey.privateKey);
+    if (seed.length !== 32) return null;
+    const pkcs8 = Buffer.concat([Buffer.from('302e020100300506032b657004220420', 'hex'), seed]);
+    const privateKey = createPrivateKey({ key: pkcs8, format: 'der', type: 'pkcs8' });
+    const publicKey = createPublicKey(privateKey);
+    const raw = publicKey.export({ format: 'der', type: 'spki' }).subarray(-32);
+    return { privateKey, publicKeyBase64: raw.toString('base64') };
+  } catch {
+    return null;
+  }
+}
+
 export class DeviceKey {
   /**
    * @param {object} options

@@ -7,6 +7,66 @@
 
 All notable changes to this project are documented here.
 
+## [1.2.6] — 2026-10-20
+
+**Security surface: signatures, a permission matrix, and output that no longer carries secrets — plus the reliability the chat
+needed before it could be trusted with real messages.**
+
+### Command signatures
+
+The agent signs `{task_id, argv_hash, machine_id, ts}` with an Ed25519 key derived from its device key (`DeviceKey` is X25519 and
+cannot sign; deriving keeps one secret per machine). The envelope carries `signature {alg, value, public_key, ts}`, and
+`w2m_wait` reports every machine as `signed`, `unsigned` or `bad_signature`, with a task-level `signature_warning`. A tampered
+`argv_hash` verifies as `bad_signature` -- tested at the unit level and end to end through a real agent run.
+
+Honest limit: the public half travels inside the signature. That proves the result matches the key it carries, not that the key
+belongs to the machine. Binding it to the relay's device record is the remaining step for non-repudiation across machines, and it
+is named here rather than implied.
+
+### Permission matrix
+
+`src/util/policy-matrix.mjs` is the single table: `observer < worker < owner` against `read_private | vote | join | dispatch |
+approve | manage_members`. A refusal is `FORBIDDEN_ACTION` naming the action, the level required and the level held. The relay
+enforces it where a role actually acts: an observer may read the fleet flow and may not post into it. Unknown means worker, never
+owner.
+
+### Output redaction
+
+`stdout_head`/`tail` and `stderr_head`/`tail` are filtered for API keys, `npm_`/`github_pat_` tokens and private-key blocks,
+replaced in place with `[redacted:class]` so line numbers survive. Hashes and blobs are never touched: they are evidence of the raw
+bytes. `redactOutput: false` is allowed and marks the envelope `unredacted: true`.
+
+### End-to-end encrypted chat
+
+Sending encrypts with AES-256-GCM under a group key derived as `HKDF(fleetKey, 'fleet-chat-v1')`; the relay stores ciphertext and
+cannot open it. Reading decrypts what the key covers and marks the rest `encrypted: true` with a `decrypt_error`. Plaintext
+messages keep working, so older clients neither break nor are lied to. The relay validates the encryption envelope's shape and
+refuses a malformed one (`BAD_ENCRYPTION`), and cannot search content -- which is the point, and is written down as the cost.
+
+### Reliability
+
+- **Role persistence**: `member.role` ledger entries replay on restart, so a relay restart no longer silently demotes every owner.
+  Verified live: the role that was lost before the deploy came back after it.
+- **Chat cursor**: `list` continues where the last page ended (`since_ms` from a persisted per-session cursor) and advances only
+  over what was actually read.
+- **Offline spool**: a send that cannot reach the relay is written to disk with an idempotency key and replayed on the next call;
+  a replay that the relay already received returns the first message instead of posting twice.
+
+### Verified
+
+Gate GREEN twice, 15 of 15: 2666 tests / 2652 pass / 0 fail / 14 skip in 130 files. New suites: chat-crypto (8),
+envelope-signature (6), policy-matrix (9); agent 152, relay 173, tools 132, fleet-messages 14.
+
+Relay redeployed twice from hash-verified tarballs, with state backups, and the new surfaces exercised against the live relay:
+encrypted message stored as ciphertext and read back, malformed encryption refused with 400, roles restored after restart.
+
+### Known gaps
+
+- The GitHub Packages mirror still holds an orphan `1.2.4` published by a diagnostic dispatch; removal needs a token with package
+  administration (this one sees 404 on the package API).
+- The signing public key is not yet bound to the relay's device record (see above).
+- Two-machine end-to-end runs of the new chat surface are still not done; the HTTP and tool surfaces are tested against fakes and
+  exercised once against jp-shared.
 ## [1.2.5] — 2026-10-20
 
 **Who is in the fleet, what they have read, who was named, and a retry that cannot double-post.**

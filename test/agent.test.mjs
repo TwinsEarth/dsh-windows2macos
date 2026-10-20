@@ -116,6 +116,7 @@ import {
   summarizeRtt,
   verifyEnvelope,
 } from '../src/agent/agent.mjs';
+import { verifyEnvelopeSignature } from '../src/util/envelope-signature.mjs';
 import { MATCH_REFUSAL } from '../src/agent/allowed-commands.mjs';
 // `resolve.mjs` is the canonical owner of the executable search order; `caps.mjs` re-exports
 // `resolveCommand` for callers that have always imported it from there (see its own note). Imported
@@ -1695,6 +1696,7 @@ function makeAgent({
   logs,
   idleHeartbeatIntervalMs,
   signingSecret,
+  redactOutput,
 }) {
   const stateDir = join(root, `e2e-state-${name}`);
   const serialized = allowed.map((prefix) => prefix.join(' '));
@@ -1722,6 +1724,7 @@ function makeAgent({
     heartbeatIntervalMs: 150,
     ...(idleHeartbeatIntervalMs === undefined ? {} : { idleHeartbeatIntervalMs }),
     ...(signingSecret === undefined ? {} : { signingSecret }),
+    ...(redactOutput === undefined ? {} : { redactOutput }),
     log,
     tmpDir: root,
   });
@@ -1847,6 +1850,86 @@ describe('Localside agent end to end', () => {
     } finally {
       await rabbit.close();
     }
+  });
+
+  it('signs the command it ran, and a tampered argv hash fails verification (v1.2.6)', async () => {
+    const rabbit = await startFakeRabbit();
+    const project = await makeRepo('e2e-sign');
+    try {
+      const agent = makeAgent({ rabbit: rabbit.url, project, allowed: [['node', '-e']], name: 'sign' });
+      const running = agent.start();
+      const stream = await rabbit.stream();
+      stream.send('ready', { protocol_version: 1, rabbit_time: '2026-10-07T12:00:00Z', machine_id: 'rabbit' });
+      stream.send('task.offer', {
+        task_id: '01J-E2E-SIGN', attempt: 1, mode: 'replicate', index: 0, index_total: 1,
+        command_argv: [NODE, '-e', 'process.stdout.write("signed\\n")'],
+        cwd_rel: '.', write: false, timeout_ms: 30_000, dedupe_key: 'dk-e2e-sign',
+      });
+      await running;
+      const envelope = rabbit.state.results[0];
+      assert.ok(envelope.signature, 'the envelope carries a signature');
+      assert.equal(envelope.signature.alg, 'ed25519');
+      const verdict = verifyEnvelopeSignature({
+        signature: envelope.signature,
+        task_id: envelope.task_id,
+        argv_hash: envelope.command_hash,
+        machine_id: envelope.machine_id,
+      });
+      assert.equal(verdict, 'signed', 'the signature verifies against the command hash');
+      const tampered = verifyEnvelopeSignature({
+        signature: envelope.signature,
+        task_id: envelope.task_id,
+        argv_hash: 'b'.repeat(64),
+        machine_id: envelope.machine_id,
+      });
+      assert.equal(tampered, 'bad_signature', 'a different argv hash must not verify');
+      assert.equal(verifyEnvelope(envelope), true);
+    } finally { await rabbit.close(); }
+  });
+
+  it('replaces a secret a command printed, before the envelope leaves the machine (v1.2.6)', async () => {
+    const rabbit = await startFakeRabbit();
+    const project = await makeRepo('e2e-redact-on');
+    try {
+      const RAW = 'token sk-abcdefghijklmnop1234';
+      const agent = makeAgent({ rabbit: rabbit.url, project, allowed: [['node', '-e']], name: 'redact-on' });
+      const running = agent.start();
+      const stream = await rabbit.stream();
+      stream.send('ready', { protocol_version: 1, rabbit_time: '2026-10-07T12:00:00Z', machine_id: 'rabbit' });
+      stream.send('task.offer', {
+        task_id: '01J-E2E-REDACT-ON', attempt: 1, mode: 'replicate', index: 0, index_total: 1,
+        command_argv: [NODE, '-e', 'process.stdout.write(' + JSON.stringify(RAW) + ')'],
+        cwd_rel: '.', write: false, timeout_ms: 30_000, dedupe_key: 'dk-e2e-redact-on',
+      });
+      await running;
+      const envelope = rabbit.state.results[0];
+      assert.equal(envelope.stdout_head.includes('sk-abcdefghijklmnop1234'), false, 'the secret must not reach the relay');
+      assert.match(envelope.stdout_head, /\[redacted:api-key\]/);
+      assert.equal(envelope.redacted[0].field, 'stdout_head');
+      assert.equal(envelope.stdout_sha256, sha256Hex(RAW), 'raw bytes stay the evidence');
+      assert.equal(verifyEnvelope(envelope), true);
+    } finally { await rabbit.close(); }
+  });
+
+  it('says unredacted: true when the operator turns redaction off (v1.2.6)', async () => {
+    const rabbit = await startFakeRabbit();
+    const project = await makeRepo('e2e-redact-off');
+    try {
+      const agent = makeAgent({ rabbit: rabbit.url, project, allowed: [['node', '-e']], name: 'redact-off', redactOutput: false });
+      const running = agent.start();
+      const stream = await rabbit.stream();
+      stream.send('ready', { protocol_version: 1, rabbit_time: '2026-10-07T12:00:00Z', machine_id: 'rabbit' });
+      stream.send('task.offer', {
+        task_id: '01J-E2E-REDACT-OFF', attempt: 1, mode: 'replicate', index: 0, index_total: 1,
+        command_argv: [NODE, '-e', 'process.stdout.write("token sk-abcdefghijklmnop1234\\n")'],
+        cwd_rel: '.', write: false, timeout_ms: 30_000, dedupe_key: 'dk-e2e-redact-off',
+      });
+      await running;
+      const envelope = rabbit.state.results[0];
+      assert.equal(envelope.stdout_head.includes('sk-abcdefghijklmnop1234'), true, 'off means off');
+      assert.equal(envelope.unredacted, true, 'and it says so');
+      assert.equal(verifyEnvelope(envelope), true);
+    } finally { await rabbit.close(); }
   });
 
   it('pairs, runs an allowed offer and delivers a verifiable envelope', async () => {

@@ -126,3 +126,40 @@ describe('mentions and idempotency (v1.2.5)', () => {
     assert.equal(m.list({ session_id: 's1' }).count, 2);
   });
 });
+
+
+describe('end-to-end encrypted messages (v1.2.6)', () => {
+  const store = () => createFleetMessages({ now: (() => { let t = 2_000; return () => (t += 10); })() });
+
+  it('stores the ciphertext and its metadata, and returns both on read', () => {
+    const m = store();
+    const enc = { v: 1, alg: 'aes-256-gcm', iv: 'aXY=', tag: 'dGFn' };
+    const posted = m.post({ session_id: 's1', machine_id: 'a', text: 'Y2lwaGVy', enc });
+    assert.equal(posted.ok, true);
+    assert.deepEqual(posted.message.enc, enc);
+    assert.equal(posted.message.text, 'Y2lwaGVy');
+    assert.deepEqual(m.list({ session_id: 's1' }).messages[0].enc, enc);
+  });
+
+  it('refuses a malformed encryption envelope instead of storing it', () => {
+    const m = store();
+    for (const enc of [
+      { v: 2, alg: 'aes-256-gcm', iv: 'aXY=', tag: 'dGFn' },
+      { v: 1, alg: 'rot13', iv: 'aXY=', tag: 'dGFn' },
+      { v: 1, alg: 'aes-256-gcm', iv: '', tag: 'dGFn' },
+      { v: 1, alg: 'aes-256-gcm', iv: 'aXY=', tag: 'x'.repeat(65) },
+    ]) {
+      assert.equal(m.post({ session_id: 's1', machine_id: 'a', text: 'x', enc }).code, 'BAD_ENCRYPTION', JSON.stringify(enc));
+    }
+  });
+
+  it('keeps plaintext messages plaintext and in the same flow', () => {
+    const m = store();
+    m.post({ session_id: 's1', machine_id: 'a', text: 'plain' });
+    m.post({ session_id: 's1', machine_id: 'b', text: 'Y2lwaGVy', enc: { v: 1, alg: 'aes-256-gcm', iv: 'aXY=', tag: 'dGFn' } });
+    const listed = m.list({ session_id: 's1' }).messages;
+    assert.equal(listed.length, 2);
+    assert.equal(listed[0].enc, undefined, 'a plaintext message keeps the old shape');
+    assert.equal(listed[1].enc.alg, 'aes-256-gcm');
+  });
+});

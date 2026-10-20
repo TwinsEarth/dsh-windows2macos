@@ -4477,3 +4477,49 @@ describe('task cancellation over HTTP (v1.2.4)', () => {
     });
   });
 });
+
+
+describe('permission matrix (v1.2.6)', () => {
+  it('lets a worker post and refuses an observer with a named FORBIDDEN_ACTION', async () => {
+    await withRelay({}, async (relay) => {
+      const a = await pairDevice(relay, 'm1');
+      const b = await pairDevice(relay, 'm2');
+      const worker = await request(`${relay.url}/v1/fleet/messages`, { method: 'POST', token: a.token, body: { session_id: 's-perm', text: 'from worker' } });
+      assert.equal(worker.status, 200, worker.text);
+
+      const demoted = await request(`${relay.url}/v1/fleet/members/m2`, { method: 'PUT', token: OP, body: { role: 'observer' } });
+      assert.equal(demoted.status, 200, demoted.text);
+      const refused = await request(`${relay.url}/v1/fleet/messages`, { method: 'POST', token: b.token, body: { session_id: 's-perm', text: 'from observer' } });
+      assert.equal(refused.status, 403);
+      assert.equal(refused.json.error.code, 'FORBIDDEN_ACTION');
+      assert.equal(refused.json.detail.action, 'dispatch');
+      assert.equal(refused.json.detail.required_role, 'worker');
+      assert.equal(refused.json.detail.current_role, 'observer');
+
+      // reading is still allowed for the observer
+      const read = await request(`${relay.url}/v1/fleet/messages?session_id=s-perm`, { token: b.token });
+      assert.equal(read.status, 200, read.text);
+    });
+  });
+});
+
+describe('role persistence (v1.2.6)', () => {
+  it('keeps an operator-assigned role across a relay restart', async () => {
+    const dir = makeStateDir();
+    try {
+      const first = await startRelay({ stateDir: dir });
+      const a = await pairDevice(first, 'm1');
+      const listed = await request(`${first.url}/v1/fleet/members`, { token: a.token });
+      assert.equal(listed.status, 200, listed.text);
+      const promoted = await request(`${first.url}/v1/fleet/members/m1`, { method: 'PUT', token: OP, body: { role: 'owner' } });
+      assert.equal(promoted.status, 200, promoted.text);
+      await first.close();
+
+      const second = await startRelay({ stateDir: dir });
+      try {
+        const deviceToken = (await request(`${second.url}/v1/fleet/members`, { token: a.token })).json;
+        assert.equal(deviceToken.members.find((m) => m.machine_id === 'm1').role, 'owner', 'the role is not lost on restart');
+      } finally { await second.close(); }
+    } finally { removeStateDir(dir); }
+  });
+});

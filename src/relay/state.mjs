@@ -23,7 +23,7 @@ import { scopeFleetId } from '../chatops/fleet-wiring.mjs';
 // v0.8.1: the account-derived fleet key, so a machine can join with no pairing code.
 import { planJoin } from '../chatops/fleet-join.mjs';
 import { validateTaskDependencies } from './task-deps.mjs';
-import { buildMembers, setMemberRole as applyMemberRole } from './fleet-members.mjs';
+import { buildMembers, isMemberRole, setMemberRole as applyMemberRole } from './fleet-members.mjs';
 
 export const PROTOCOL_VERSION = 1;
 
@@ -749,6 +749,16 @@ export class RabbitState {
         }
         this.tasks.set(task.task_id, task);
         return true;
+      }
+      case 'member.role': {
+        /**
+         * v1.2.6: a role survives a restart. The ledger entry already existed (setMemberRole writes it); replaying it here is
+         * what stops "the relay restarted" from silently demoting every owner to the default worker.
+         */
+        if (typeof entry.machine_id !== 'string' || entry.machine_id === '') return false;
+        if (isMemberRole(entry.role) !== true) return false;
+        this.roles.set(entry.machine_id, entry.role);
+        return false;
       }
       case 'lease.changed': {
         const task = this.tasks.get(entry.task_id);
@@ -2212,6 +2222,11 @@ export class RabbitState {
       leases: [...task.leases.values()].map((l) => l.machine_id),
       lease_states: Object.fromEntries([...task.leases.values()].map((l) => [l.machine_id, l.state])),
     };
+  }
+
+  /** v1.2.6: the role this machine holds, for the permission matrix. Unknown means worker, never owner. */
+  roleOf(machineId) {
+    return typeof machineId === 'string' ? (this.roles.get(machineId) ?? null) : null;
   }
 
   /** v1.2.5: the fleet's members, with the role each holds and when it joined. */

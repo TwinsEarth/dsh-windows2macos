@@ -1,4 +1,4 @@
-﻿/**
+/**
  * DSH: Windows2MacO - the DSH Cordis plugin.
  *
  * # What this exposes
@@ -94,6 +94,7 @@ import { resolveChannels } from './update-channels.mjs';
 import { fetchLatestRelease, fetchPrereleaseRelease, requireChecksum, downloadVerified, DEFAULT_REPO } from './update-source.mjs';
 import { installUpdate } from './update-install.mjs';import { createHash, randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
+import { join } from 'node:path';
 import os from 'node:os';
 import path from 'node:path';
 // The individual memory layer (v0.9.6). Read through the agent's own module rather than re-parsing the
@@ -186,8 +187,51 @@ import { registerChatRoutes } from './fleet-chat-route.mjs';
 import { createFleetCouncil, fleetCouncilThread } from './council-fleet.mjs';
 import { renderMemoryView } from './memory-view.mjs';
 import { buildBoard } from './task-graph.mjs';
+import { verifyEnvelopeSignature } from '../util/envelope-signature.mjs';
 import { createAskStore } from './ask-store.mjs';
 import { deriveTurns } from './turn.mjs';
+import { decryptChatMessage, deriveChatKey, encryptChatText, isEncrypted } from '../util/chat-crypto.mjs';
+
+/**
+ * v1.2.6 reliability: two small files beside the plugin's state.
+ *
+ * `chat-cursor.json` remembers how far each conversation has been read, so "list" continues where the last page ended instead of
+ * starting over. `chat-spool.jsonl` holds messages that could not be sent because the Rabbit was unreachable; each carries the
+ * idempotency key it will be posted with, so a replay that the relay already received does not post the sentence twice.
+ */
+const CHAT_CURSOR_FILE = 'chat-cursor.json';
+const CHAT_SPOOL_FILE = 'chat-spool.jsonl';
+
+async function readChatCursors(stateDir) {
+  if (typeof stateDir !== 'string' || stateDir === '') return {};
+  try {
+    const parsed = JSON.parse(await fs.readFile(join(stateDir, CHAT_CURSOR_FILE), 'utf8'));
+    return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch { return {}; }
+}
+
+async function writeChatCursors(stateDir, cursors) {
+  if (typeof stateDir !== 'string' || stateDir === '') return false;
+  try { await fs.writeFile(join(stateDir, CHAT_CURSOR_FILE), JSON.stringify(cursors, null, 2), 'utf8'); return true; }
+  catch { return false; }
+}
+
+async function readChatSpool(stateDir) {
+  if (typeof stateDir !== 'string' || stateDir === '') return [];
+  try {
+    const text = await fs.readFile(join(stateDir, CHAT_SPOOL_FILE), 'utf8');
+    return text.split('\n').map((line) => { try { return JSON.parse(line); } catch { return null; } }).filter((entry) => entry !== null && typeof entry === 'object');
+  } catch { return []; }
+}
+
+async function writeChatSpool(stateDir, entries) {
+  if (typeof stateDir !== 'string' || stateDir === '') return false;
+  try {
+    await fs.writeFile(join(stateDir, CHAT_SPOOL_FILE), entries.map((entry) => JSON.stringify(entry)).join('\n') + (entries.length === 0 ? '' : '\n'), 'utf8');
+    return true;
+  } catch { return false; }
+}
+
 import { buildReducePlan } from '../util/dataflow.mjs';
 import { schemaProblems, strayParameterProblems } from './schema-spec.mjs';
 import { listIntents, resolveIntent } from './intents.mjs';
@@ -4423,6 +4467,13 @@ export async function apply(ctx, config = {}) {
       const machines = Array.isArray(aggregate.detail?.machines)
         ? aggregate.detail.machines.map((machine) => {
             const envelope = machine?.envelope ?? machine?.result ?? null;
+            // v1.2.6: the signature covers the command tuple; a reader is told which of the three states it is in.
+            const signatureStatus = verifyEnvelopeSignature({
+              signature: envelope?.signature ?? null,
+              task_id: envelope?.task_id ?? taskId,
+              argv_hash: envelope?.command_hash,
+              machine_id: envelope?.machine_id ?? machine?.machine_id,
+            });
             return {
               machine_id: machine?.machine_id ?? null,
               machine_name: machine?.machine_name ?? null,
@@ -4440,12 +4491,22 @@ export async function apply(ctx, config = {}) {
                * v0.3.9 agent sends, so a missing value must not be dressed up as `'relay'`.
                */
               transport: envelope?.transport ?? machine?.transport ?? null,
+              signature_status: signatureStatus,
               p2p: envelope?.p2p ?? machine?.p2p ?? null,
               reasons: machine?.reasons ?? [],
               envelope: compactEnvelope(envelope, COMPARABLE_FIELDS),
             };
           })
         : [];
+
+      // v1.2.6: a signature state is never silently flattened into success.
+      const signatureCounts = machines.reduce((counts, machine) => {
+        const key = machine.signature_status ?? 'unsigned';
+        counts[key] = (counts[key] ?? 0) + 1;
+        return counts;
+      }, {});
+      const unsigned = signatureCounts.unsigned ?? 0;
+      const badSignature = signatureCounts.bad_signature ?? 0;
 
       // v1.2.4: a task whose machines produced blobs is only complete when EVERY map result names one and a reducer was
       // declared. The plan is built from the RAW envelopes: the comparable copy intentionally drops the fields this needs,
@@ -4480,6 +4541,9 @@ export async function apply(ctx, config = {}) {
           state_known: aggregate.known,
           states: aggregate.states,
           machines,
+          signatures: signatureCounts,
+          ...(badSignature > 0 ? { signature_warning: 'bad_signature' } : {}),
+          ...(badSignature === 0 && unsigned > 0 ? { signature_warning: 'unsigned' } : {}),
           ...(reduce === null ? {} : { reduce }),
           ...(dataflowDegraded ? { dataflow_degraded: true } : {}),
           counts: aggregate.detail?.counts ?? null,
@@ -6549,6 +6613,10 @@ export async function apply(ctx, config = {}) {
         // The persisted questions for this conversation, in the states they are in. A read, so it needs no relay.
         return JSON.stringify({ ok: true, action, session_id: sessionId, ...askStore.list({ sessionId }) });
       }
+      if (action === 'cursor') {
+        const cursors = await readChatCursors(cfg.stateDir);
+        return JSON.stringify({ ok: true, action, session_id: sessionId, cursor: Object.prototype.hasOwnProperty.call(cursors, sessionId) ? cursors[sessionId] : null, spool_count: (await readChatSpool(cfg.stateDir)).length });
+      }
       const rabbitUrl = cfg.rabbitUrl ?? null;
       if (rabbitUrl === null) throw new W2MError('W2M_NO_RELAY', 'W2M_NO_RELAY: no relay is configured, so chat cannot be reached', { hint: 'set rabbitUrl in the profile patch' });
       // resolveToken, not readDevice: readDevice returns an empty identity whenever `stateDir` is
@@ -6557,6 +6625,22 @@ export async function apply(ctx, config = {}) {
       // one reported W2M_NO_TOKEN on a machine that was paired and answering every other call.
       const token = await resolveToken(cfg);
       if (token === null) throw new W2MError('W2M_NO_TOKEN', 'W2M_NO_TOKEN: this machine has no device token, so chat cannot be authenticated', { hint: 'pair this machine first (autoStartAgent or a pairing code), then retry' });
+      const stateDir = typeof cfg.stateDir === 'string' ? cfg.stateDir : '';
+      // v1.2.6 reliability: try to deliver what the last unreachable attempt had to leave behind, before doing anything else.
+      let spool = await readChatSpool(stateDir);
+      let spoolDelivered = 0;
+      if (spool.length > 0) {
+        const remaining = [];
+        for (const entry of spool) {
+          try {
+            const replayed = await request({ rabbitUrl, token, signal: exec?.signal, method: 'POST', pathname: '/v1/fleet/messages', body: entry.body });
+            if (replayed?.ok === true) { spoolDelivered += 1; continue; }
+          } catch { /* still unreachable: keep it for next time */ }
+          remaining.push(entry);
+        }
+        spool = remaining;
+        await writeChatSpool(stateDir, spool);
+      }
       // Addressing + correlation travel only when the caller supplied them, so a plain broadcast stays byte-identical.
       const addressing = {};
       if (typeof args?.to === 'string' && args.to.trim() !== '') {
@@ -6594,40 +6678,83 @@ export async function apply(ctx, config = {}) {
       }
       if (action === 'send' || action === 'ask') {
         const mentions = Array.isArray(args?.mentions) ? args.mentions.filter((id) => typeof id === 'string' && id !== '') : [];
-        const posted = await request({
-          rabbitUrl,
-          token,
-          signal: exec?.signal,
-          method: 'POST',
-          pathname: '/v1/fleet/messages',
-          body: {
-            session_id: sessionId,
-            text: typeof args?.text === 'string' ? args.text : '',
-            ...addressing,
-            // v1.2.5: a mention is a notification hint; the idempotency key lets a retry after a lost response replay the
-            // first message instead of posting the same sentence twice.
-            ...(mentions.length === 0 ? {} : { mentions }),
-            ...(typeof args?.idempotency_key === 'string' && args.idempotency_key.trim() !== '' ? { idempotency_key: args.idempotency_key.trim() } : {}),
-          },
-        });
+        /**
+         * v1.2.6: the chat is end-to-end encrypted when a fleet key is available (configured, or derived from the account join).
+         * Without one the tool keeps sending plaintext rather than refusing: a fleet that has not joined yet is a normal state,
+         * and a silent refusal would read as a broken chat.
+         */
+        const chatKey = deriveChatKey(cfg.fleetKey ?? resolvedFleetKey.value ?? null);
+        const plainText = typeof args?.text === 'string' ? args.text : '';
+        const sealed = chatKey === null ? null : encryptChatText(chatKey, plainText);
+        /**
+         * v1.2.6 reliability: an unreachable Rabbit does not lose the message. The exact body that could not be sent is
+         * spooled to disk and replayed with the SAME idempotency key next time, so a message the relay actually received
+         * before the connection died is not posted twice.
+         */
+        const messageBody = {
+          session_id: sessionId,
+          text: sealed !== null && sealed.ok === true ? sealed.text : plainText,
+          ...(sealed !== null && sealed.ok === true ? { enc: sealed.enc } : {}),
+          ...addressing,
+          ...(mentions.length === 0 ? {} : { mentions }),
+          ...(typeof args?.idempotency_key === 'string' && args.idempotency_key.trim() !== '' ? { idempotency_key: args.idempotency_key.trim() } : { idempotency_key: 'spool-' + Date.now() + '-' + Math.random().toString(36).slice(2) }),
+        };
+        let posted = null;
+        try {
+          posted = await request({ rabbitUrl, token, signal: exec?.signal, method: 'POST', pathname: '/v1/fleet/messages', body: messageBody });
+        } catch (error) {
+          if (error?.code === 'W2M_UNREACHABLE') {
+            spool.push({ body: messageBody, created_at: new Date().toISOString() });
+            await writeChatSpool(stateDir, spool);
+            return JSON.stringify({ ok: true, action, spooled: true, spool_count: spool.length, encrypted: sealed !== null && sealed.ok === true });
+          }
+          throw error;
+        }
         if (posted?.ok !== true) {
           const code = posted?.json?.error?.code ?? posted?.error?.code ?? 'W2M_CHAT_SEND';
           throw new W2MError('W2M_CHAT_SEND', code + ': the message was refused', { reason_code: code, hint: 'quota, size and non-text each need a different answer' });
         }
-        return JSON.stringify({ ok: true, action, message: posted.json?.message ?? null, message_id: posted.json?.message?.message_id ?? null, ...(posted.json?.deduped === true ? { deduped: true } : {}) });
+        return JSON.stringify({
+          ok: true, action, message: posted.json?.message ?? null, message_id: posted.json?.message?.message_id ?? null,
+          encrypted: sealed !== null && sealed.ok === true,
+          ...(posted.json?.deduped === true ? { deduped: true } : {}),
+        });
       }
+      const query = { session_id: sessionId };
+      // v1.2.6 reliability: continue where the last page ended, unless the caller asked for an explicit start.
+      const cursors = await readChatCursors(stateDir);
+      const storedCursor = Object.prototype.hasOwnProperty.call(cursors, sessionId) ? cursors[sessionId] : null;
+      if (!Number.isFinite(args?.since_ms) && storedCursor !== null && Number.isFinite(storedCursor.at_ms)) query.since_ms = String(storedCursor.at_ms);
       if (typeof args?.thread_id === 'string' && args.thread_id.trim() !== '') query.thread_id = args.thread_id.trim();
       if (typeof args?.to === 'string' && args.to.trim() !== '') query.to = args.to.trim();
-      const query = { session_id: sessionId };
       if (Number.isFinite(args?.since_ms)) query.since_ms = String(args.since_ms);
       if (Number.isInteger(args?.limit)) query.limit = String(args.limit);
       const listed = await request({ rabbitUrl, token, signal: exec?.signal, method: 'GET', pathname: '/v1/fleet/messages', query });
       if (listed?.ok !== true) throw new W2MError('W2M_CHAT_LIST', 'W2M_CHAT_LIST: the relay refused the read', { hint: 'check the relay and this machine token' });
-      const messages = listed.json?.messages ?? [];
+      const rawMessages = listed.json?.messages ?? [];
+      /**
+       * v1.2.6: a reader decrypts what its key covers and marks the rest. An undecryptable message keeps its ciphertext and its
+       * reason instead of failing the page -- the relay is allowed to hold a message this machine cannot open.
+       */
+      const listKey = deriveChatKey(cfg.fleetKey ?? resolvedFleetKey.value ?? null);
+      const messages = rawMessages.map((message) => {
+        if (!isEncrypted(message)) return message;
+        const opened = decryptChatMessage(listKey, message);
+        if (opened.ok === true) return { ...message, text: opened.text, decrypted: true };
+        return { ...message, text: '', decrypted: false, encrypted: true, decrypt_error: opened.code };
+      });
+      const encryptedCount = messages.filter((message) => message.encrypted === true || message.decrypted === true).length;
+      // The cursor advances only over what was actually read, so a page that failed mid-way does not skip messages.
+      const newestAt = messages.reduce((max, message) => (Number.isFinite(message?.at_ms) && message.at_ms > max ? message.at_ms : max), 0);
+      let cursor = storedCursor;
+      if (newestAt > 0 && (storedCursor === null || newestAt > storedCursor.at_ms)) {
+        cursor = { at_ms: newestAt, message_id: messages.filter((message) => message.at_ms === newestAt)[0]?.message_id ?? null };
+        await writeChatCursors(stateDir, { ...cursors, [sessionId]: cursor });
+      }
       // v1.2.4: the page is annotated with turns derived from the relay's own numbering, so a reader does not have to order
       // replies by arrival time.
       const turns = deriveTurns(messages);
-      return JSON.stringify({ ok: true, action, session_id: sessionId, messages, count: messages.length, turns: turns.threads, inferred_turns: turns.inferred_turns, count_was: listed.json?.count ?? 0, usage: listed.json?.usage ?? null });
+      return JSON.stringify({ ok: true, action, session_id: sessionId, messages, count: messages.length, encrypted_count: encryptedCount, cursor, spooled: spoolDelivered, turns: turns.threads ?? [], inferred_turns: turns.inferred_turns ?? [] });
     },
   }));
 
@@ -7182,6 +7309,8 @@ async function startLocalStack(ctx, cfg) {
       caps,
       platform,
       allowedCommands: cfg.allowedCommands,
+      // v1.2.6: on by default; a profile may turn it off for debugging, and the envelope then says `unredacted: true`.
+      redactOutput: cfg.redactOutput !== false,
     });
     /**
      * v0.8.9: derive the fleet key, RETRYING until the account actually answers.

@@ -23,6 +23,7 @@ import {
   rfc3339,
 } from './state.mjs';
 import { createFleetMessages } from './fleet-messages.mjs';
+import { can as mayAct } from '../util/policy-matrix.mjs';
 import { createFleetMemory } from './fleet-memory.mjs';
 import { createJoinChallenges } from './join-challenge.mjs';
 import { createAdmission } from './admission.mjs';
@@ -1114,6 +1115,25 @@ export class RelayServer {
     this.fleetMemory ??= createFleetMemory({ now: () => this.state.nowMs() });
 
     if (method === 'POST' && path === '/v1/fleet/messages') {
+      /**
+       * v1.2.6: posting to the group is a dispatch-class action. An observer may read the flow and may not speak into it, and
+       * the refusal names the action and both roles so it is actionable.
+       */
+      const permitted = mayAct({ role: this.state.roleOf(device.machine_id), action: 'dispatch' });
+      if (permitted.ok !== true) {
+        return sendJson(res, 403, {
+          protocol_version: PROTOCOL_VERSION,
+          ok: false,
+          error: { code: permitted.code, message: 'role may not post to the fleet group' },
+          detail: {
+            action: permitted.action,
+            required_level: permitted.required_level,
+            current_level: permitted.current_level,
+            required_role: permitted.required_role,
+            current_role: permitted.current_role,
+          },
+        });
+      }
       const body = takeJson();
       const posted = this.fleetMessages.post({
         session_id: body.session_id,
@@ -1124,6 +1144,7 @@ export class RelayServer {
         reply_to: body.reply_to,
         text: body.text,
         mentions: body.mentions,
+        enc: body.enc,
         idempotency_key: body.idempotency_key,
       });
       if (posted.ok !== true) {

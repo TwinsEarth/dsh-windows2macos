@@ -105,6 +105,20 @@ export function createFleetMessages(options = {}) {
     if (to !== 'all' && (to.length > 64 || /\s/.test(to))) return { ok: false, code: 'BAD_ADDRESS' };
     // Correlation: a thread groups a conversation, reply_to points at the message being answered, turn orders the
     // exchange inside one thread. Plain fields, validated rather than trusted.
+    /**
+     * v1.2.6 end-to-end encryption: the relay carries the ciphertext and its metadata, and never a key. It validates the SHAPE
+     * because a malformed envelope would be stored and later fail on every reader; it cannot check the content, and that is the
+     * point -- which also means it cannot search messages or know their real length.
+     */
+    const rawEnc = input?.enc;
+    let enc = null;
+    if (rawEnc !== undefined && rawEnc !== null) {
+      const ivOk = typeof rawEnc.iv === 'string' && rawEnc.iv.length > 0 && rawEnc.iv.length <= 64;
+      const tagOk = typeof rawEnc.tag === 'string' && rawEnc.tag.length > 0 && rawEnc.tag.length <= 64;
+      if (rawEnc.v !== 1 || rawEnc.alg !== 'aes-256-gcm' || !ivOk || !tagOk) return { ok: false, code: 'BAD_ENCRYPTION' };
+      enc = { v: 1, alg: 'aes-256-gcm', iv: rawEnc.iv, tag: rawEnc.tag };
+    }
+
     // v1.2.5 idempotency: replay the first message instead of storing the text twice.
     const idempotencyKey = typeof input?.idempotency_key === 'string' && input.idempotency_key.trim() !== ''
       ? input.idempotency_key.trim().slice(0, 64)
@@ -161,6 +175,9 @@ export function createFleetMessages(options = {}) {
       text,
       // Omitted when empty so a message without mentions keeps the pre-1.2.5 shape.
       ...(mentions.length === 0 ? {} : { mentions }),
+      // v1.2.6: ciphertext metadata travels beside the text so an old client can read it as opaque text and a new one can name
+      // the cipher it does not have a key for.
+      ...(enc === null ? {} : { enc }),
       ...(idempotencyKey === null ? {} : { idempotency_key: idempotencyKey }),
       at_ms: now(),
       bytes,

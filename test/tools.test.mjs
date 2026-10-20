@@ -1624,6 +1624,158 @@ describe('happy paths', () => {
     }
   });
 
+  it('remembers a chat cursor so list continues where the last page ended (v1.2.6)', async () => {
+    const seen = [];
+    const previousFetch = globalThis.fetch;
+    const page = (messages) => new globalThis.Response(JSON.stringify({ protocol_version: 1, ok: true, messages }), { status: 200, headers: { 'content-type': 'application/json' } });
+    globalThis.fetch = async (input) => {
+      const url = new URL(String(input));
+      seen.push(url.search);
+      const since = url.searchParams.get('since_ms');
+      const all = [
+        { message_id: 'm1', session_id: 's-cur', machine_id: 'a', at_ms: 1000, thread_id: null, reply_to: null, turn: 0, text: 'one' },
+        { message_id: 'm2', session_id: 's-cur', machine_id: 'a', at_ms: 2000, thread_id: null, reply_to: null, turn: 1, text: 'two' },
+      ];
+      return page(since === null ? all : all.filter((m) => m.at_ms > Number(since)));
+    };
+    try {
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN, device_token: 'tok-test-abc', fleetKey: Buffer.from('a-shared-fleet-key-of-at-least-32-bytes!').toString('base64') });
+      const first = JSON.parse(await tools.get('w2m_chat').execute({ action: 'list', session_id: 's-cur' }, {}));
+      assert.equal(first.messages.length, 2);
+      assert.equal(first.cursor.at_ms, 2000);
+      const second = JSON.parse(await tools.get('w2m_chat').execute({ action: 'list', session_id: 's-cur' }, {}));
+      assert.equal(second.messages.length, 0, 'the second page starts after the first');
+      assert.match(seen[1], /since_ms=2000/, 'the cursor became since_ms');
+      const cursor = JSON.parse(await tools.get('w2m_chat').execute({ action: 'cursor', session_id: 's-cur' }, {}));
+      assert.equal(cursor.cursor.at_ms, 2000, 'the cursor is persisted, not just echoed');
+    } finally { globalThis.fetch = previousFetch; }
+  });
+
+  it('spools a message when the relay is unreachable and replays it once (v1.2.6)', async () => {
+    const posts = [];
+    const previousFetch = globalThis.fetch;
+    let reachable = false;
+    globalThis.fetch = async (input, init = {}) => {
+      const url = new URL(String(input));
+      const method = String(init.method ?? 'GET').toUpperCase();
+      if (!reachable) throw new TypeError('fetch failed');
+      if (method === 'POST' && url.pathname === '/v1/fleet/messages') {
+        posts.push(JSON.parse(String(init.body)));
+        return new globalThis.Response(JSON.stringify({ protocol_version: 1, ok: true, message: { message_id: 'm-nine', session_id: 's-spool' } }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      return new globalThis.Response(JSON.stringify({ protocol_version: 1, ok: true, messages: [] }), { status: 200, headers: { 'content-type': 'application/json' } });
+    };
+    const stateDir = await makeStateDir(PAIRED_DEVICE);
+    try {
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir, operatorToken: OPERATOR_TOKEN, device_token: 'tok-test-abc' });
+      const offline = JSON.parse(await tools.get('w2m_chat').execute({ action: 'send', session_id: 's-spool', text: 'while away' }, {}));
+      assert.equal(offline.ok, true);
+      assert.equal(offline.spooled, true);
+      assert.equal(offline.spool_count, 1, 'the message was kept, not lost');
+      const before = JSON.parse(await tools.get('w2m_chat').execute({ action: 'cursor', session_id: 's-spool' }, {}));
+      assert.equal(before.spool_count, 1);
+
+      reachable = true;
+      await tools.get('w2m_chat').execute({ action: 'list', session_id: 's-spool' }, {});
+      assert.equal(posts.length, 1, 'the spooled message was delivered');
+      assert.match(posts[0].idempotency_key, /^spool-/, 'replay carries the key that makes it safe to repeat');
+      const after = JSON.parse(await tools.get('w2m_chat').execute({ action: 'cursor', session_id: 's-spool' }, {}));
+      assert.equal(after.spool_count, 0, 'the spool is empty after delivery');
+    } finally { globalThis.fetch = previousFetch; }
+  });
+
+  it('sends chat messages encrypted with the derived group key (v1.2.6)', async () => {
+    const { deriveChatKey, decryptChatMessage } = await import('../src/util/chat-crypto.mjs');
+    const FLEET_KEY = Buffer.from('a-shared-fleet-key-of-at-least-32-bytes!').toString('base64');
+    const captured = [];
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = async (input, init = {}) => {
+      captured.push({ url: String(input), method: String(init.method ?? 'GET').toUpperCase(), body: init.body === undefined ? null : JSON.parse(String(init.body)) });
+      return new globalThis.Response(JSON.stringify({ protocol_version: 1, ok: true, message: { message_id: 'msg-1', session_id: 's-enc' } }), { status: 200, headers: { 'content-type': 'application/json' } });
+    };
+    try {
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN, device_token: 'tok-test-abc', fleetKey: FLEET_KEY });
+      const value = JSON.parse(await tools.get('w2m_chat').execute({ action: 'send', session_id: 's-enc', text: 'hello secret' }, {}));
+      assert.equal(value.encrypted, true);
+      const posted = captured.find((entry) => entry.method === 'POST');
+      assert.ok(posted, 'the tool posted once');
+      assert.equal(posted.body.text.includes('hello secret'), false, 'the plaintext must not be sent');
+      assert.equal(posted.body.enc.alg, 'aes-256-gcm');
+      assert.deepEqual(decryptChatMessage(deriveChatKey(FLEET_KEY), { text: posted.body.text, enc: posted.body.enc }), { ok: true, text: 'hello secret' });
+    } finally { globalThis.fetch = previousFetch; }
+  });
+
+  it('decrypts readable messages and marks the ones it cannot open (v1.2.6)', async () => {
+    const { deriveChatKey, encryptChatText } = await import('../src/util/chat-crypto.mjs');
+    const FLEET_KEY = Buffer.from('a-shared-fleet-key-of-at-least-32-bytes!').toString('base64');
+    const sealed = encryptChatText(deriveChatKey(FLEET_KEY), 'hello secret');
+    const envelope = { messages: [{ message_id: 'msg-1', session_id: 's-enc', machine_id: 'aaa', at_ms: 1, thread_id: null, reply_to: null, turn: 0, text: sealed.text, enc: sealed.enc }] };
+    const serve = async () => new globalThis.Response(JSON.stringify({ protocol_version: 1, ok: true, ...envelope }), { status: 200, headers: { 'content-type': 'application/json' } });
+
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = async () => serve();
+    try {
+      const withKey = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN, device_token: 'tok-test-abc', fleetKey: FLEET_KEY });
+      const read = JSON.parse(await withKey.tools.get('w2m_chat').execute({ action: 'list', session_id: 's-enc' }, {}));
+      assert.equal(read.messages[0].text, 'hello secret');
+      assert.equal(read.messages[0].decrypted, true);
+      assert.equal(read.encrypted_count, 1);
+
+      const withoutKey = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN, device_token: 'tok-test-abc' });
+      const blocked = JSON.parse(await withoutKey.tools.get('w2m_chat').execute({ action: 'list', session_id: 's-enc' }, {}));
+      assert.equal(blocked.messages[0].text, '', 'the ciphertext is not shown as if it were the text');
+      assert.equal(blocked.messages[0].decrypted, false);
+      assert.equal(blocked.messages[0].encrypted, true);
+      assert.equal(blocked.messages[0].decrypt_error, 'CHAT_NO_KEY');
+    } finally { globalThis.fetch = previousFetch; }
+  });
+
+  it('reports each machine signature as signed, unsigned or bad_signature (v1.2.6)', async () => {
+    const { generateKeyPairSync, sign } = await import('node:crypto');
+    const { canonicalSignedPayload } = await import('../src/util/envelope-signature.mjs');
+    const { privateKey, publicKey } = generateKeyPairSync('ed25519');
+    const raw = publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('base64');
+    const commandHash = 'a'.repeat(64);
+    const taskId = '01JABCDEF';
+    const signFor = (fields) => ({
+      alg: 'ed25519',
+      value: sign(null, Buffer.from(canonicalSignedPayload(fields), 'utf8'), privateKey).toString('base64'),
+      public_key: raw,
+      ts: '2026-10-20T00:00:00.000Z',
+    });
+    const envelopeWith = (signature) => ({
+      task_id: taskId, machine_id: 'aaa', machine_name: 'win-desktop',
+      status: 'ok', exit_code: 0, stdout_sha256: 'a'.repeat(64), command_hash: commandHash,
+      ...(signature === null ? {} : { signature }),
+    });
+    const signed = signFor({ task_id: taskId, argv_hash: commandHash, machine_id: 'aaa', ts: '2026-10-20T00:00:00.000Z' });
+
+    const run = async (envelope) => {
+      const fetchStub = installFetch([
+        { path: '/v1/tasks/01JABCDEF', body: taskResponse(finalTask({ machines: [machine('aaa', 'win-desktop', 'ok', envelope)] })) },
+      ]);
+      try {
+        const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
+        return JSON.parse(await tools.get('w2m_wait').execute({ task_id: '01JABCDEF', wait_ms: 1000, poll_ms: 25 }, {}));
+      } finally { fetchStub.restore(); }
+    };
+
+    const good = await run(envelopeWith(signed));
+    assert.equal(good.machines[0].signature_status, 'signed');
+    assert.deepEqual(good.signatures, { signed: 1 });
+    assert.equal('signature_warning' in good, false);
+
+    const tamperedEnvelope = envelopeWith(signed);
+    tamperedEnvelope.command_hash = 'b'.repeat(64);
+    const bad = await run(tamperedEnvelope);
+    assert.equal(bad.machines[0].signature_status, 'bad_signature', 'a different command hash must not verify');
+    assert.equal(bad.signature_warning, 'bad_signature');
+
+    const unsigned = await run(envelopeWith(null));
+    assert.equal(unsigned.machines[0].signature_status, 'unsigned');
+    assert.equal(unsigned.signature_warning, 'unsigned', 'unsigned is reported, not hidden');
+  });
+
   it('w2m_wait reports an unknown aggregate state instead of pretending it agreed', async () => {
     const fetchStub = installFetch([
       { path: '/v1/tasks/01JX', body: taskResponse(finalTask({ status: 'probably-fine' })) },
