@@ -7,6 +7,18 @@
 
 All notable changes to this project are documented here.
 
+## [1.2.10-beta.1] — 2026-10-21
+
+A beta by policy: GitHub prerelease only, never npm. This one makes the reduce phase executable.
+
+### Reduce execution (caller-dispatched)
+
+`w2m_reduce` dispatches a reduce only from complete data: it refuses unless every declared shard reported as a blob and the named reducer reported (`W2M_REDUCE_NOT_READY`, with the missing indexes). It never picks a reducer and never invents inputs; inline results are refused (`W2M_REDUCE_INLINE_INPUT`) because they cannot be carried to another machine.
+
+The relay validates and carries `reduce_of` + `reduce_inputs` (at most 16 artifacts, sha256 only) on the task, the ledger and the offer; the agent fetches those content-addressed blobs BEFORE running the reduce and exposes `W2M_REDUCE_INPUTS_DIR` / `W2M_REDUCE_MANIFEST` / `W2M_REDUCE_OF` to the command. A failed fetch refuses the task (`REDUCE_INPUT_FETCH_FAILED`) rather than reducing half the fleet.
+
+Verified: gate GREEN twice, 2701 tests / 2687 pass / 0 fail / 14 skip in 131 files; new agent e2e proves the reduce reads the exact artifact bytes; the tool has a dispatch test and a refusal test.
+
 ## [1.2.9-beta.1] — 2026-10-21
 
 A beta by policy: **GitHub prerelease only, never npm.** The theme is the data plane and the collaboration plane: the design is

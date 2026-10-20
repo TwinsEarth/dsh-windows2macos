@@ -711,6 +711,7 @@ export class RabbitState {
         const t = entry.task;
         if (!t || typeof t.task_id !== 'string') return false;
         const createdAt = Number.isFinite(t.created_at_ms) ? t.created_at_ms : Date.parse(entry.ts ?? '');
+
         const task = {
           task_id: t.task_id,
           mode: t.mode ?? 'replicate',
@@ -737,6 +738,8 @@ export class RabbitState {
           // v1.2.7: a revived task keeps its graph edges and assignment, or the scheduler silently becomes a different scheduler.
           depends_on: Array.isArray(t.depends_on) ? t.depends_on : [],
           assignee: typeof t.assignee === 'string' && t.assignee !== '' ? t.assignee : null,
+          reduce_of: typeof t.reduce_of === 'string' ? t.reduce_of : null,
+          reduce_inputs: Array.isArray(t.reduce_inputs) ? t.reduce_inputs : [],
           leases: new Map(),
           cancelled: false,
           cancel_reason: null,
@@ -1723,6 +1726,24 @@ export class RabbitState {
         : targetIds[0] ?? null)
       : null;
 
+    /**
+     * v1.2.10: validate the reduce artifact list up front. A malformed list would otherwise become an offer the machine
+     * cannot execute, and the failure would surface as a generic refusal on the executor instead of at dispatch.
+     */
+    const rawReduceInputs = input.reduce_inputs === undefined || input.reduce_inputs === null ? [] : input.reduce_inputs;
+    if (!Array.isArray(rawReduceInputs) || rawReduceInputs.length > 16) {
+      throw new ProtocolError('BAD_REQUEST', 'reduce_inputs must be an array of at most 16 artifacts', { count: Array.isArray(rawReduceInputs) ? rawReduceInputs.length : null });
+    }
+    const normalizedReduceInputs = [];
+    for (const artifact of rawReduceInputs) {
+      const machineId = typeof artifact?.machine_id === 'string' && artifact.machine_id !== '' ? artifact.machine_id : null;
+      const sha256 = typeof artifact?.sha256 === 'string' ? artifact.sha256.toLowerCase() : '';
+      if (machineId === null || !/^[0-9a-f]{64}$/.test(sha256)) {
+        throw new ProtocolError('BAD_REQUEST', 'each reduce input must be {machine_id, sha256}', { machine_id: machineId, sha256 });
+      }
+      normalizedReduceInputs.push({ machine_id: machineId, sha256 });
+    }
+
     const task = {
       task_id: taskId,
       mode,
@@ -1757,6 +1778,12 @@ export class RabbitState {
       // the silent-drop failure this field-by-field literal exists to prevent.
       depends_on: deps.ok === true ? deps.depends_on : [],
       assignee: typeof input.assignee === 'string' && input.assignee !== '' ? input.assignee : null,
+      /**
+       * v1.2.10: a reduce task names the map task it reduces and the artifacts it consumes. The artifact LIST travels with
+       * the task (never inferred by the reducer), because "which shards this reduce covers" is the completeness contract.
+       */
+      reduce_of: typeof input.reduce_of === 'string' && input.reduce_of !== '' ? input.reduce_of : null,
+      reduce_inputs: normalizedReduceInputs,
       leases: new Map(),
       cancelled: false,
       cancel_reason: null,
@@ -2039,6 +2066,8 @@ export class RabbitState {
             // v1.2.7: the dependency graph and assignment belong to the task record, not to a reader's memory of it.
             depends_on: Array.isArray(task.depends_on) ? task.depends_on : [],
             assignee: task.assignee ?? null,
+            reduce_of: task.reduce_of ?? null,
+            reduce_inputs: Array.isArray(task.reduce_inputs) ? task.reduce_inputs : [],
         origin_machine_id: task.origin_machine_id ?? null,
         p2p: task.p2p ?? null,
       },
@@ -2150,6 +2179,8 @@ export class RabbitState {
        */
       origin_machine_id: task.origin_machine_id ?? null,
       p2p: task.p2p ?? null,
+      // v1.2.10: present only on a reduce task, so a normal offer stays byte-identical.
+      ...(task.reduce_of !== null ? { reduce_of: task.reduce_of, reduce_inputs: task.reduce_inputs } : {}),
       cwd_rel: task.cwd_rel,
       // Omitted when false, so a single-command offer for every existing caller stays byte-identical -- the
       // same reason `stages` above is conditional.
@@ -2306,6 +2337,8 @@ export class RabbitState {
        * Before this, GET /v1/tasks carried no status at all, so a board classified a waiting task as "ready" (its dependencies
        * map empty) and a released task as "waiting" forever. The board must read the scheduler's own words or it is decoration.
        */
+      reduce_of: task.reduce_of ?? null,
+      reduce_inputs: Array.isArray(task.reduce_inputs) ? task.reduce_inputs : [],
       status: (() => {
         if (task.cancelled === true) return 'cancelled';
         const leases = [...task.leases.values()];

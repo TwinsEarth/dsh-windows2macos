@@ -283,7 +283,7 @@ describe('findProfileDir (the branch ESLint found, not the tests)', () => {
     const made = await register({ rabbitUrl: 'http://127.0.0.1:1', profileDir });
     const out = await updateStatus(made.tools);
     assert.equal(out.update.profile_dir, profileDir);
-    assert.equal(made.tools.size, 15);
+    assert.equal(made.tools.size, 16);
   });
 });
 
@@ -620,7 +620,7 @@ describe('the scheduled job is owned by ctx.effect', () => {
   it('does not require ctx.effect when the feature is off', async () => {
     // A host without `ctx.effect` must still be able to run the W2M tools.
     const { tools } = await register({ rabbitUrl: 'http://127.0.0.1:1' }, { withEffect: false });
-    assert.equal(tools.size, 15);
+    assert.equal(tools.size, 16);
     assert.equal((await updateStatus(tools)).update.enabled, false);
   });
 

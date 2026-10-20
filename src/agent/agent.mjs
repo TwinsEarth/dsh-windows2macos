@@ -23,8 +23,9 @@
 
 import { Readable } from 'node:stream';
 import { access, constants as fsConstants } from 'node:fs/promises';
-import { existsSync, mkdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { randomUUID , sign as signBytes } from 'node:crypto';
 
 import {
@@ -3027,6 +3028,58 @@ export function createAgent(options) {
       // never allowed to ask for, and the plugin's pre-flight refuses the dispatch as a whole for the
       // same reason. The refusal names the stage index, because "this chain is not allowed" is not
       // actionable without knowing which stage.
+      /**
+       * v1.2.10: a reduce task carries the artifacts it consumes, and the machine fetches them BEFORE the reduce command runs.
+       *
+       * The list is the caller's completeness decision (the relay validated its shape, never its truth), and the bytes are
+       * content-addressed, so the fetch verifies nothing less than the hash already did. A failed fetch refuses the whole task:
+       * a reduce that ran on half the inputs would produce a confident wrong answer, which is the failure this feature exists to
+       * make impossible.
+       */
+      let reduceEnv = null;
+      if (Array.isArray(offer.reduce_inputs) && offer.reduce_inputs.length > 0) {
+        try {
+          const inputDir = mkdtempSync(join(tmpdir(), 'w2m-reduce-'));
+          const manifest = [];
+          for (const artifact of offer.reduce_inputs) {
+            const response = await fetch(rabbitUrl + '/v1/fleet/blobs/' + encodeURIComponent(artifact.sha256), {
+              headers: token() ? { authorization: 'Bearer ' + token() } : {},
+            });
+            if (response.status !== 200) {
+              throw new Error('blob ' + artifact.sha256 + ' -> HTTP ' + response.status);
+            }
+            const body = Buffer.from(await response.arrayBuffer());
+            const file = join(inputDir, String(artifact.machine_id).replace(/[^A-Za-z0-9._-]/g, '_') + '.bin');
+            writeFileSync(file, body);
+            manifest.push({ machine_id: artifact.machine_id, sha256: artifact.sha256, bytes: body.length, file });
+          }
+          const manifestPath = join(inputDir, 'manifest.json');
+          writeFileSync(manifestPath, JSON.stringify({ reduce_of: offer.reduce_of ?? null, inputs: manifest }, null, 2));
+          reduceEnv = {
+            W2M_REDUCE_INPUTS_DIR: inputDir,
+            W2M_REDUCE_MANIFEST: manifestPath,
+            W2M_REDUCE_OF: String(offer.reduce_of ?? ''),
+          };
+        } catch (error) {
+          log('warn', offer.task_id + ': reduce input fetch failed', { error: error?.message ?? String(error) });
+          await finish({
+            offer,
+            cwdRel,
+            commandArgv,
+            anchorsBefore,
+            anchorsAfter: null,
+            execution: null,
+            status: 'refused',
+            refusalReason: 'REDUCE_INPUT_FETCH_FAILED',
+            warnings,
+            startedAt,
+            endedAt: new Date().toISOString(),
+            protocolViolations: ['reduce inputs could not be fetched: ' + (error?.message ?? String(error))],
+          });
+          return;
+        }
+      }
+
       for (const stage of plannedStages) {
         const stageAllowed = matchAllowedCommand(stage.command_argv, allowedCommands);
         if (stageAllowed.allowed) continue;
@@ -3120,6 +3173,7 @@ export function createAgent(options) {
           W2M_MODE: String(offer.mode ?? ''),
           W2M_MACHINE_ID: String(offer.machine_id ?? ''),
           W2M_MACHINE_NAME: String(offer.machine_name ?? ''),
+          ...(reduceEnv ?? {}),
         };
         const ran = await runArgv(stage.command_argv, {
           cwd: stageCwdOutcome.cwd,

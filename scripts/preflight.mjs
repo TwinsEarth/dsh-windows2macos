@@ -1098,7 +1098,7 @@ export const DECLARED_CHECKS = [
   'mojibake scan (whole tree, plus a positive control)',
   'reachable or accepted (no orphan module without a written reason)',
   'declared suite (package.json#scripts.test, skips itemized)',
-  'packed tarball (tree-derived documents + entry points, whole manifest, forbidden paths, 12 tools from the pack)',
+  'packed tarball (tree-derived documents + entry points, whole manifest, forbidden paths, 16 tools from the pack)',
   'claims (test/claims.test.mjs, reused not reimplemented)',
   'CHANGELOG shape (title above the newest entry, newest-first)',
   'agent skills (frontmatter satisfies the loader, so no skill is silently dropped)',
@@ -1136,8 +1136,8 @@ export const GATE_INVENTORY = [
   { artifact: 'memory-sync skill', path: 'skills/memory-sync/SKILL.md', checkedBy: 'agent skills (frontmatter satisfies the loader, so no skill is silently dropped)' },
   { artifact: 'session-ref skill', path: 'skills/session-ref/SKILL.md', checkedBy: 'agent skills (frontmatter satisfies the loader, so no skill is silently dropped)' },
   { artifact: 'resource-schedule skill', path: 'skills/resource-schedule/SKILL.md', checkedBy: 'agent skills (frontmatter satisfies the loader, so no skill is silently dropped)' },
-  { artifact: 'packer', path: 'scripts/pack.mjs', checkedBy: 'packed tarball (tree-derived documents + entry points, whole manifest, forbidden paths, 12 tools from the pack)' },
-  { artifact: 'installed-copy probe', path: 'scripts/verify-installed.mjs', checkedBy: 'packed tarball (tree-derived documents + entry points, whole manifest, forbidden paths, 12 tools from the pack)' },
+  { artifact: 'packer', path: 'scripts/pack.mjs', checkedBy: 'packed tarball (tree-derived documents + entry points, whole manifest, forbidden paths, 16 tools from the pack)' },
+  { artifact: 'installed-copy probe', path: 'scripts/verify-installed.mjs', checkedBy: 'packed tarball (tree-derived documents + entry points, whole manifest, forbidden paths, 16 tools from the pack)' },
   { artifact: 'claims suite', path: 'test/claims.test.mjs', checkedBy: 'claims (test/claims.test.mjs, reused not reimplemented)' },
   { artifact: 'declared suite list', path: 'package.json', checkedBy: 'declared suite (package.json#scripts.test, skips itemized)' },
   { artifact: 'test wiring', path: 'test', checkedBy: 'test wiring (every suite on disk is named by a script; the release suite and the rest are reported)' },
@@ -2114,7 +2114,7 @@ function checkPackAndTarball() {
       );
     }
 
-    // (d) the packed copy registers the twelve tools -- executed from the extracted tarball, not the tree
+    // (d) the packed copy registers the sixteen tools -- executed from the extracted tarball, not the tree
     const extracted = join(staging, 'extracted');
     mkdirSync(extracted, { recursive: true });
     const skipped = extract(entries, extracted);
@@ -2128,7 +2128,7 @@ function checkPackAndTarball() {
     const verified = child('verify-installed', process.execPath, [probe, extracted]);
     if (!verified.ok) {
       return fail(
-        'scripts/verify-installed.mjs reported the packed copy does not register its twelve tools',
+        'scripts/verify-installed.mjs reported the packed copy does not register its sixteen tools',
         tail(verified, 20),
       );
     }
@@ -2137,10 +2137,10 @@ function checkPackAndTarball() {
     // 0" and "the probe registered ten tools" are different measurements and only the second one is
     // the claim this check makes; a probe edited to exit 0 early would satisfy the first.
     const toolCount = Number(verified.stdout.match(/registered\s*:\s*(\d+)/)?.[1] ?? NaN);
-    if (toolCount !== 15) {
+    if (toolCount !== 16) {
       return fail(
         `the packed copy registered ${Number.isNaN(toolCount) ? 'an unreadable number of' : toolCount} tool(s), ` +
-          'not the twelve this package documents',
+          'not the sixteen this package documents',
         tail(verified, 20),
       );
     }
@@ -2351,7 +2351,7 @@ async function main() {
     ['reachable or accepted (no orphan module without a written reason)', checkOrphans],
     ['declared suite (package.json#scripts.test, skips itemized)', () => checkTestSuite(suiteEnv)],
     [
-      'packed tarball (tree-derived documents + entry points, whole manifest, forbidden paths, 12 tools from the pack)',
+      'packed tarball (tree-derived documents + entry points, whole manifest, forbidden paths, 16 tools from the pack)',
       checkPackAndTarball,
     ],
     ['claims (test/claims.test.mjs, reused not reimplemented)', checkClaims],

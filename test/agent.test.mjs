@@ -1623,6 +1623,19 @@ async function startFakeRabbit({
       // v1.2.4: the content-addressed blob route a large pipeline stage uploads to. Records the sha and the exact body so a
       // test can verify the name IS the hash of what was sent.
       if (pathname.startsWith('/v1/fleet/blobs/')) {
+        // v1.2.10: a reduce task's agent FETCHES the artifacts it reduces, so the fake relay serves what it stored.
+        if (request.method === 'GET') {
+          const wanted = decodeURIComponent(pathname.slice('/v1/fleet/blobs/'.length));
+          const stored = state.blobs.find((blob) => blob.sha === wanted) ?? null;
+          if (stored === null) {
+            response.writeHead(404, { 'content-type': 'application/json' });
+            response.end(JSON.stringify({ error: { code: 'NOT_FOUND' } }));
+            return;
+          }
+          response.writeHead(200, { 'content-type': 'application/octet-stream' });
+          response.end(stored.raw);
+          return;
+        }
         if (blobError) {
           response.writeHead(blobError.status ?? 500, { 'content-type': 'application/json' });
           response.end(JSON.stringify({ error: { code: blobError.code ?? 'BLOB_REFUSED' } }));
@@ -1851,6 +1864,47 @@ describe('Localside agent end to end', () => {
       assert.equal(envelope.output_mode, 'blob');
       assert.equal(envelope.stdout_head, '', 'a blob envelope does not also inline the head');
       assert.equal(envelope.pipeline ?? null, null, 'a plain command is not a pipeline');
+      assert.equal(verifyEnvelope(envelope), true);
+    } finally {
+      await rabbit.close();
+    }
+  });
+  it('fetches reduce artifacts before running the reduce command (v1.2.10)', async () => {
+    const rabbit = await startFakeRabbit();
+    const project = await makeRepo('e2e-reduce-fetch');
+    try {
+      const artifact = 'artifact-bytes-from-map';
+      const sha = sha256Hex(artifact);
+      rabbit.state.blobs.push({ sha, raw: Buffer.from(artifact, 'utf8') });
+      const agent = makeAgent({ rabbit: rabbit.url, project, allowed: [['node', '-e']], name: 'reduce-fetch' });
+      const running = agent.start();
+      const stream = await rabbit.stream();
+      stream.send('ready', { protocol_version: 1, rabbit_time: '2026-10-07T12:00:00Z', machine_id: 'rabbit' });
+      const script = 'const m=JSON.parse(require("fs").readFileSync(process.env.W2M_REDUCE_MANIFEST,"utf8"));const f=require("fs").readFileSync(m.inputs[0].file,"utf8");process.stdout.write(JSON.stringify({of:process.env.W2M_REDUCE_OF,n:m.inputs.length,machine:m.inputs[0].machine_id,bytes:m.inputs[0].bytes,data:f}));';
+      stream.send('task.offer', {
+        task_id: '01J-E2E-REDUCE-FETCH',
+        attempt: 1,
+        mode: 'replicate',
+        index: 0,
+        index_total: 1,
+        command_argv: [NODE, '-e', script],
+        cwd_rel: '.',
+        write: false,
+        timeout_ms: 30_000,
+        dedupe_key: 'dk-e2e-reduce-fetch',
+        reduce_of: '01J-MAP-TASK',
+        reduce_inputs: [{ machine_id: 'm1', sha256: sha }],
+      });
+      await running;
+
+      const envelope = rabbit.state.results[0];
+      assert.equal(envelope.status, 'ok');
+      const parsed = JSON.parse(envelope.stdout_head);
+      assert.equal(parsed.of, '01J-MAP-TASK', 'the reduce knows which map task it belongs to');
+      assert.equal(parsed.n, 1);
+      assert.equal(parsed.machine, 'm1');
+      assert.equal(parsed.bytes, Buffer.byteLength(artifact));
+      assert.equal(parsed.data, artifact, 'the exact artifact bytes were written to the input file');
       assert.equal(verifyEnvelope(envelope), true);
     } finally {
       await rabbit.close();

@@ -7147,6 +7147,66 @@ export async function apply(ctx, config = {}) {
     },
   }));
 
+
+  ctx.tools.register(defineTool({
+    name: 'w2m_reduce',
+    description:
+      'Dispatch a reduce task for a finished map task. Refuses unless every declared shard reported as a blob and the named reducer is a machine that reported: the relay never picks a reducer, and this tool never invents one.',
+    parameters: {
+      task_id: { type: 'string', required: true, description: 'The map task whose results are being reduced.' },
+      reducer_machine_id: { type: 'string', required: true, description: 'The machine that must run the reduce; it must have reported a shard.' },
+      reduce_argv: { type: 'array', items: { type: 'string' }, required: true, description: 'The reduce command as argv, run with W2M_REDUCE_MANIFEST set.' },
+      timeout_ms: { type: 'number', description: 'Wall-clock budget for the reduce task (default 300000, cap 3600000).' },
+      cwd_rel: { type: 'string', description: 'Working directory relative to the project (default ".").' },
+    },
+    output: jsonOutput,
+    presentCall: (args) => ({ card: 'generic', title: 'w2m reduce ' + (typeof args?.task_id === 'string' ? args.task_id : ''), kind: 'write', rawInput: {} }),
+    async execute(args, exec) {
+      throwIfAborted(exec?.signal);
+      const base = requireRabbit(cfg);
+      const taskId = typeof args?.task_id === 'string' ? args.task_id.trim() : '';
+      const reducerMachineId = typeof args?.reducer_machine_id === 'string' ? args.reducer_machine_id.trim() : '';
+      const reduceArgv = Array.isArray(args?.reduce_argv) ? args.reduce_argv.filter((part) => typeof part === 'string' && part !== '') : [];
+      if (taskId === '') throw new W2MError('W2M_REDUCE_TASK', 'W2M_REDUCE_TASK: task_id is required');
+      if (reducerMachineId === '') throw new W2MError('W2M_REDUCE_REDUCER', 'W2M_REDUCE_REDUCER: reducer_machine_id is required');
+      if (reduceArgv.length === 0) throw new W2MError('W2M_REDUCE_ARGV', 'W2M_REDUCE_ARGV: reduce_argv must be a non-empty string array');
+      const deviceToken = await resolveToken(cfg);
+      const operatorToken = requireOperatorToken(cfg);
+      const viewed = await request({ rabbitUrl: base, token: deviceToken, signal: exec?.signal, method: 'GET', pathname: '/v1/tasks/' + encodeURIComponent(taskId) });
+      if (viewed?.ok !== true) throw new W2MError('W2M_REDUCE_READ', 'W2M_REDUCE_READ: the relay refused the task read');
+      const body = viewed.json ?? {};
+      const aggregate = body.aggregate ?? {};
+      const machines = Array.isArray(aggregate.machines) ? aggregate.machines : (Array.isArray(aggregate.detail?.machines) ? aggregate.detail.machines : []);
+      const expectedIndexTotal = Number.isInteger(body?.task?.index_total) ? body.task.index_total : null;
+      const suggestion = suggestReduce({ machines, reducerMachineId, expectedIndexTotal });
+      if (suggestion.ready !== true) {
+        const code = suggestion?.plan?.code ?? 'NOT_READY';
+        throw new W2MError('W2M_REDUCE_NOT_READY', 'W2M_REDUCE_NOT_READY: ' + code + ' -- refusing to reduce over incomplete data', {
+          reason_code: code, detail: suggestion?.plan?.detail ?? null, missing: suggestion?.missing ?? [],
+        });
+      }
+      const inputs = suggestion.plan.inputs.filter((entry) => entry.mode === 'blob').map((entry) => ({ machine_id: entry.machine_id, sha256: entry.sha256 }));
+      if (inputs.length !== suggestion.plan.inputs.length) throw new W2MError('W2M_REDUCE_INLINE_INPUT', 'W2M_REDUCE_INLINE_INPUT: an inline result cannot be carried to another machine');
+      const timeoutMs = Math.min(Math.max(Number.isFinite(args?.timeout_ms) ? Math.floor(args.timeout_ms) : 300_000, 1_000), 3_600_000);
+      const dispatched = await request({
+        rabbitUrl: base, token: operatorToken, signal: exec?.signal, method: 'POST', pathname: '/v1/task',
+        body: {
+          mode: 'broadcast', executor_machine_id: reducerMachineId, command_argv: reduceArgv,
+          cwd_rel: typeof args?.cwd_rel === 'string' && args.cwd_rel !== '' ? args.cwd_rel : '.',
+          index_total: 1, timeout_ms: timeoutMs, write: false,
+          requirements: { toolchain: {}, platform: [] },
+          compare_policy: { strip_ansi: true, normalize_crlf: true, strip_trailing_blank_lines: true, redact: [] },
+          reduce_of: taskId, reduce_inputs: inputs,
+        },
+      });
+      if (dispatched?.ok !== true) {
+        const code = dispatched?.json?.error?.code ?? dispatched?.error?.code ?? 'W2M_REDUCE_DISPATCH';
+        throw new W2MError('W2M_REDUCE_DISPATCH', 'W2M_REDUCE_DISPATCH: ' + code + ': the reduce was refused', { reason_code: code });
+      }
+      return JSON.stringify({ ok: true, action: 'reduce', reduce_task_id: dispatched.json?.task_id ?? null, reduce_of: taskId, reducer_machine_id: reducerMachineId, inputs: inputs.length });
+    },
+  }));
+
   ctx.tools.register(defineTool({
     name: 'w2m_tasks',
     description:
