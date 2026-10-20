@@ -4468,7 +4468,8 @@ export async function apply(ctx, config = {}) {
         ? aggregate.detail.machines.map((machine) => {
             const envelope = machine?.envelope ?? machine?.result ?? null;
             // v1.2.6: the signature covers the command tuple; a reader is told which of the three states it is in.
-            const signatureStatus = verifyEnvelopeSignature({
+            const relayVerdict = typeof machine?.signature_status === 'string' && machine.signature_status !== '' ? machine.signature_status : null;
+          const signatureStatus = relayVerdict ?? verifyEnvelopeSignature({
               signature: envelope?.signature ?? null,
               task_id: envelope?.task_id ?? taskId,
               argv_hash: envelope?.command_hash,

@@ -4523,3 +4523,52 @@ describe('role persistence (v1.2.6)', () => {
     } finally { removeStateDir(dir); }
   });
 });
+
+describe('signature binding (v1.2.6)', () => {
+  it('trusts a signature only when the key was registered at pairing', async () => {
+    const { generateKeyPairSync, sign } = await import('node:crypto');
+    const { canonicalSignedPayload } = await import('../src/util/envelope-signature.mjs');
+    const keypair = () => {
+      const { privateKey, publicKey } = generateKeyPairSync('ed25519');
+      return { privateKey, raw: publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('base64') };
+    };
+    const keyA = keypair();
+    const keyB = keypair();
+    const ts = '2026-10-20T00:00:00.000Z';
+    const signEnvelope = (env, key) => ({
+      alg: 'ed25519',
+      value: sign(null, Buffer.from(canonicalSignedPayload({
+        task_id: env.task_id, argv_hash: env.command_hash, machine_id: env.machine_id, ts,
+      }), 'utf8'), key.privateKey).toString('base64'),
+      public_key: key.raw,
+      ts,
+    });
+
+    await withRelay({}, async (relay) => {
+      const a = await pairDevice(relay, 'm1', { public_key: keyA.raw });
+      const b = await pairDevice(relay, 'm2', { public_key: keyB.raw });
+      const created = await postTask(relay, taskBody());
+      assert.equal(created.status, 200, created.text);
+      const taskId = created.json.task_id;
+
+      const envA = envelopeForTask(taskId, 'm1', { index: 0 });
+      envA.signature = signEnvelope(envA, keyA);
+      const postedA = await request(`${relay.url}/v1/result`, { method: 'POST', token: a.token, body: envA });
+      assert.equal(postedA.status, 200, postedA.text);
+
+      const viewA = await request(`${relay.url}/v1/tasks/${taskId}`, { token: a.token });
+      assert.equal(viewA.status, 200, viewA.text);
+      const machineA = viewA.json.aggregate.machines.find((m) => m.machine_id === 'm1');
+      assert.equal(machineA.signature_status, 'signed', 'the key registered at pairing verifies the envelope');
+
+      const envB = envelopeForTask(taskId, 'm2', { index: 1 });
+      envB.signature = signEnvelope({ ...envB, machine_id: 'm2' }, keyA); // right signature, WRONG key for m2
+      const postedB = await request(`${relay.url}/v1/result`, { method: 'POST', token: b.token, body: envB });
+      assert.equal(postedB.status, 200, postedB.text);
+
+      const viewB = await request(`${relay.url}/v1/tasks/${taskId}`, { token: a.token });
+      const machineB = viewB.json.aggregate.machines.find((m) => m.machine_id === 'm2');
+      assert.equal(machineB.signature_status, 'bad_signature', 'a key that is not the registered one is refused even when it verifies against itself');
+    });
+  });
+});

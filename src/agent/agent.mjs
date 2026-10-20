@@ -2337,6 +2337,15 @@ export function createAgent(options) {
       caps,
     };
     /**
+     * v1.2.6: the public half of this machine's envelope-signing key. It is not a secret, and pairing is the one moment the
+     * relay has a reason to believe it belongs to this machine -- so a later result can be checked against the key that was
+     * registered here rather than against whichever key the result happens to carry.
+     */
+    {
+      const signing = deriveSigningKey(deviceKey);
+      if (signing !== null) body.public_key = signing.publicKeyBase64;
+    }
+    /**
      * Send only the discriminator that was actually given.
      *
      * `pairing_code: null` would be *present*, and a presence check reads a null as "provided"  -      * the same trap that made `createILinkChannel` pass `{ fetch: undefined }` and throw on mount in

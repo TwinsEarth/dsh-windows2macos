@@ -1944,6 +1944,9 @@ describe('Localside agent end to end', () => {
       assert.equal(rabbit.state.pairs[0].machine_id, '3f2a1111-2222-4333-8444-555566667777');
       assert.equal(rabbit.state.pairs[0].pairing_code, 'PAIR-7K2M9QX4');
       assert.deepEqual(Object.keys(rabbit.state.pairs[0].caps).sort(), [...CAPS_KEYS].sort());
+      // v1.2.6: pairing is where the relay learns which key this machine signs envelopes with.
+      assert.equal(typeof rabbit.state.pairs[0].public_key, 'string');
+      assert.ok(rabbit.state.pairs[0].public_key.length > 0, 'the signing public key travels with the pairing request');
 
       const running = agent.start();
       const stream = await rabbit.stream();

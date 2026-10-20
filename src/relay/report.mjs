@@ -148,6 +148,8 @@ export function aggregate(task, resultRecords = [], opts = {}) {
       observing: lease.state === 'observing',
       result: rec,
       envelope: rec?.envelope ?? null,
+      // v1.2.6: the relay's own signature verdict (bound to the key registered at pairing), not a client claim.
+      signature_status: rec?.validation?.signature_status ?? null,
       outcome: null,
       reasons: [],
     });
@@ -166,6 +168,7 @@ export function aggregate(task, resultRecords = [], opts = {}) {
       gate_refused: false,
       result: rec,
       envelope: rec.envelope,
+      signature_status: rec?.validation?.signature_status ?? null,
       outcome: null,
       reasons: [],
     });
@@ -487,6 +490,8 @@ export function aggregate(task, resultRecords = [], opts = {}) {
       transport: m.envelope?.transport ?? null,
       p2p: m.envelope?.p2p ?? null,
       reasons: m.reasons,
+      // v1.2.6: the relay's verdict, bound to the key registered at pairing.
+      signature_status: m.signature_status ?? null,
     })),
     steps,
     differences: step3.differences ?? [],

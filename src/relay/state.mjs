@@ -11,7 +11,7 @@
  * there is intentionally no snapshot/serialization hook yet.
  */
 
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes , verify as verifyBytes } from 'node:crypto';
 
 // v0.7.7: fleet scoping. Imported rather than inlined so the rule has one home with its own
 // exhaustive tests — three lines inside this object would be untestable without a live relay.
@@ -24,6 +24,7 @@ import { scopeFleetId } from '../chatops/fleet-wiring.mjs';
 import { planJoin } from '../chatops/fleet-join.mjs';
 import { validateTaskDependencies } from './task-deps.mjs';
 import { buildMembers, isMemberRole, setMemberRole as applyMemberRole } from './fleet-members.mjs';
+import { canonicalSignedPayload, publicKeyFromBase64 } from '../util/envelope-signature.mjs';
 
 export const PROTOCOL_VERSION = 1;
 
@@ -2646,6 +2647,42 @@ export class RabbitState {
       return { deduped: true, task_id: taskId, dedupe_key: dedupeKey, seq: prior.seq };
     }
 
+    /**
+     * v1.2.6: verify the envelope signature against the key this machine registered WHEN IT PAIRED.
+     *
+     * This is the difference between "the result matches the key it carries" and "the key belongs to this machine". The relay is
+     * the place that can answer the second question, because pairing is the moment the operator (or the account) let the machine
+     * in, and that is the only moment its signing key has a reason to be believed. A signature whose key differs from the
+     * registered one is bad_signature even when it verifies against itself.
+     */
+    let signatureStatus = 'unsigned';
+    const signature = envelope.signature ?? null;
+    if (signature !== null) {
+      signatureStatus = 'bad_signature';
+      if (signature.alg !== 'ed25519') {
+        signatureStatus = 'unsupported_algorithm';
+      } else {
+        const registeredKey = machineId === null ? null : (typeof this.devices.get(machineId)?.public_key === 'string' ? this.devices.get(machineId).public_key : null);
+        if (registeredKey === null) {
+          signatureStatus = 'unbound';
+        } else if (signature.public_key !== registeredKey) {
+          signatureStatus = 'bad_signature';
+        } else {
+          const key = publicKeyFromBase64(registeredKey);
+          const payload = canonicalSignedPayload({
+            task_id: envelope.task_id,
+            argv_hash: envelope.command_hash,
+            machine_id: envelope.machine_id,
+            ts: signature.ts,
+          });
+          try {
+            signatureStatus = key !== null && verifyBytes(null, Buffer.from(payload, 'utf8'), key, Buffer.from(String(signature.value ?? ''), 'base64'))
+              ? 'signed' : 'bad_signature';
+          } catch { signatureStatus = 'bad_signature'; }
+        }
+      }
+    }
+
     const now = this.nowMs();
     let envelopeShaOk = null;
     if (typeof envelope.envelope_sha256 === 'string') {
@@ -2664,6 +2701,7 @@ export class RabbitState {
         missing: [...new Set(missing)],
         problems,
         envelope_sha256_ok: envelopeShaOk,
+        signature_status: signatureStatus,
       },
     };
 
