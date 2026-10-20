@@ -94,3 +94,35 @@ describe('notifications say nothing about content', () => {
     assert.equal(events.length, 0, 'a refused write is not a new message');
   });
 });
+
+
+describe('mentions and idempotency (v1.2.5)', () => {
+  const store = () => createFleetMessages({ now: (() => { let t = 1_000; return () => (t += 10); })() });
+
+  it('stores a validated mention list on the message', () => {
+    const m = store();
+    const posted = m.post({ session_id: 's1', machine_id: 'a', text: 'hi', mentions: ['b', 'c', 'b'] });
+    assert.equal(posted.ok, true);
+    assert.deepEqual(posted.message.mentions, ['b', 'c'], 'duplicates collapse');
+  });
+
+  it('refuses a malformed mention list instead of ignoring it', () => {
+    const m = store();
+    for (const mentions of ['b', ['b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l'], ['has space'], [1]]) {
+      assert.equal(m.post({ session_id: 's1', machine_id: 'a', text: 'hi', mentions }).code, 'BAD_MENTIONS', JSON.stringify(mentions));
+    }
+  });
+
+  it('replays the first message for a repeated idempotency key', () => {
+    const m = store();
+    const first = m.post({ session_id: 's1', machine_id: 'a', text: 'once', idempotency_key: 'k1' });
+    const again = m.post({ session_id: 's1', machine_id: 'a', text: 'once', idempotency_key: 'k1' });
+    assert.equal(again.ok, true);
+    assert.equal(again.deduped, true);
+    assert.equal(again.message.message_id, first.message.message_id);
+    assert.equal(m.list({ session_id: 's1' }).count, 1, 'the sentence is stored once');
+    const other = m.post({ session_id: 's1', machine_id: 'a', text: 'once', idempotency_key: 'k2' });
+    assert.equal(other.deduped, undefined);
+    assert.equal(m.list({ session_id: 's1' }).count, 2);
+  });
+});

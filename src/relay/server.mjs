@@ -720,6 +720,21 @@ export class RelayServer {
       });
     }
     /**
+     * v1.2.5: a role is an operator decision, so this route sits with dispatch — before the device gate, where an operator
+     * token is accepted.
+     */
+    const memberMatch = path.match(/^\/v1\/fleet\/members\/([^/]+)$/);
+    if (method === 'PUT' && memberMatch !== null) {
+      this.authorizeTaskDispatch(req);
+      this.enforceSignature(req, { method, signedPath, body: rawBody });
+      const body = takeJson();
+      const changed = this.state.setMemberRole(decodeURIComponent(memberMatch[1]), body.role);
+      if (changed.ok !== true) {
+        return sendJson(res, 400, { protocol_version: PROTOCOL_VERSION, ok: false, error: { code: changed.code }, detail: changed.detail ?? null });
+      }
+      return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ok: true, member: changed.member });
+    }
+    /**
      * v0.3.3 `/metrics`: machine-readable fleet state for a monitoring system.
      *
      * Token-free, like `/healthz` and for the same reason: a scraper that needs the operator token
@@ -794,6 +809,38 @@ export class RelayServer {
     // signatures. See `enforceSignature` for the reasoning.
     this.enforceSignature(req, { method, signedPath, body: rawBody });
 
+    /* ---- v1.2.5: members and read watermarks ---- */
+    if (method === 'GET' && path === '/v1/fleet/members') {
+      return sendJson(res, 200, {
+        protocol_version: PROTOCOL_VERSION,
+        rabbit_time: this.state.nowIso(),
+        ok: true,
+        members: this.state.listMembers(),
+      });
+    }
+    const readMatch = path.match(/^\/v1\/fleet\/read\/([^/]+)$/);
+    if (readMatch !== null) {
+      const sessionId = decodeURIComponent(readMatch[1]);
+      if (method === 'PUT') {
+        const body = takeJson();
+        const marked = this.state.markRead(sessionId, device.machine_id, {
+          at_ms: Number.isFinite(body.at_ms) ? body.at_ms : this.state.nowMs(),
+          message_id: typeof body.message_id === 'string' ? body.message_id : null,
+        });
+        if (marked.ok !== true) return sendJson(res, 400, { protocol_version: PROTOCOL_VERSION, ok: false, error: { code: marked.code } });
+        return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ok: true, ...marked });
+      }
+      if (method === 'GET') {
+        this.fleetMessages ??= createFleetMessages({ now: () => this.state.nowMs() });
+        const mark = this.state.readMark(sessionId, device.machine_id);
+        const listed = this.fleetMessages.list({ session_id: sessionId, limit: 200, for_machine_id: device.machine_id });
+        const messages = listed.ok === true ? listed.messages : [];
+        const floor = mark === null ? 0 : mark.at_ms;
+        const unread = messages.filter((message) => Number.isFinite(message?.at_ms) && message.at_ms > floor && message.machine_id !== device.machine_id).length;
+        return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ok: true, session_id: sessionId, mark, unread });
+      }
+      return sendJson(res, 405, { protocol_version: PROTOCOL_VERSION, ok: false, error: { code: 'METHOD_NOT_ALLOWED' } });
+    }
     if (method === 'GET' && path === '/v1/stream') {
       return this.handleStream(req, res, url, device);
     }
@@ -1076,11 +1123,13 @@ export class RelayServer {
         thread_id: body.thread_id,
         reply_to: body.reply_to,
         text: body.text,
+        mentions: body.mentions,
+        idempotency_key: body.idempotency_key,
       });
       if (posted.ok !== true) {
         throw new ProtocolError('BAD_REQUEST', 'message refused: ' + posted.code, { code: posted.code, ...(posted.detail ?? {}) });
       }
-      return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), message: posted.message });
+      return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), message: posted.message, ...(posted.deduped === true ? { deduped: true } : {}) });
     }
 
     if (method === 'GET' && path === '/v1/fleet/messages/stream') {
@@ -1106,7 +1155,17 @@ export class RelayServer {
       if (typeof keepalive.unref === 'function') keepalive.unref();
       const unsubscribe = this.fleetMessages.subscribe(sessionId, (event) => {
         try {
-          res.write('event: new_message\ndata: ' + JSON.stringify(event) + '\n\n');
+          // v1.2.5: a listener learns whether IT was named, and nothing else about the text.
+          const mentioned = Array.isArray(event.mentions) && event.mentions.includes(device.machine_id);
+          const payload = {
+            session_id: event.session_id,
+            message_id: event.message_id,
+            machine_id: event.machine_id,
+            at_ms: event.at_ms,
+            to: event.to ?? 'all',
+            ...(mentioned ? { mention: true } : {}),
+          };
+          res.write('event: new_message\ndata: ' + JSON.stringify(payload) + '\n\n');
         } catch { /* the reader went away; close() below cleans up */ }
       });
       const done = () => { clearInterval(keepalive); unsubscribe(); try { res.end(); } catch { /* already closed */ } };

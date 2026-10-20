@@ -52,6 +52,12 @@ export function createFleetMessages(options = {}) {
    * send every message to every connected listener regardless of session membership.
    */
   const listeners = new Set();
+  /**
+   * v1.2.5 idempotency: (session, key) -> message_id. A sender that retries after a lost response must not post the text twice,
+   * and the answer to a replay is the FIRST message -- a second row would make the same sentence appear twice in the thread.
+   */
+  const idempotency = new Map();
+  const MAX_IDEMPOTENCY_KEYS = 2000;
   /** session_id -> [{ message_id, session_id, machine_id, text, at_ms, bytes }] */
   const sessions = new Map();
   let seq = 0;
@@ -99,6 +105,30 @@ export function createFleetMessages(options = {}) {
     if (to !== 'all' && (to.length > 64 || /\s/.test(to))) return { ok: false, code: 'BAD_ADDRESS' };
     // Correlation: a thread groups a conversation, reply_to points at the message being answered, turn orders the
     // exchange inside one thread. Plain fields, validated rather than trusted.
+    // v1.2.5 idempotency: replay the first message instead of storing the text twice.
+    const idempotencyKey = typeof input?.idempotency_key === 'string' && input.idempotency_key.trim() !== ''
+      ? input.idempotency_key.trim().slice(0, 64)
+      : null;
+    if (idempotencyKey !== null) {
+      const seenId = idempotency.get(sessionId + '\u0000' + idempotencyKey) ?? null;
+      if (seenId !== null) {
+        const known = (sessions.get(sessionId) ?? []).find((entry) => entry.message_id === seenId) ?? null;
+        if (known !== null) return { ok: true, message: { ...known }, deduped: true };
+      }
+    }
+
+    // v1.2.5 mentions: names to alert, validated as a small set. The message still has ONE row; a mention is a notification
+    // hint, not a delivery mechanism.
+    const rawMentions = input?.mentions;
+    let mentions = [];
+    if (rawMentions !== undefined && rawMentions !== null) {
+      if (!Array.isArray(rawMentions) || rawMentions.length > 10) return { ok: false, code: 'BAD_MENTIONS' };
+      for (const entry of rawMentions) {
+        if (typeof entry !== 'string' || entry === '' || entry.length > 64 || /\s/.test(entry)) return { ok: false, code: 'BAD_MENTIONS' };
+      }
+      mentions = [...new Set(rawMentions)];
+    }
+
     const threadId = typeof input?.thread_id === 'string' && input.thread_id.trim() !== ''
       ? input.thread_id.trim().slice(0, 64)
       : null;
@@ -129,6 +159,9 @@ export function createFleetMessages(options = {}) {
       reply_to: replyTo,
       turn,
       text,
+      // Omitted when empty so a message without mentions keeps the pre-1.2.5 shape.
+      ...(mentions.length === 0 ? {} : { mentions }),
+      ...(idempotencyKey === null ? {} : { idempotency_key: idempotencyKey }),
       at_ms: now(),
       bytes,
     };
@@ -136,9 +169,27 @@ export function createFleetMessages(options = {}) {
     sessions.get(sessionId).push(message);
     for (const listener of listeners) {
       if (listener.sessionId !== null && listener.sessionId !== sessionId) continue;
-      try { listener.fn({ session_id: sessionId, message_id: message.message_id, machine_id: message.machine_id, at_ms: message.at_ms }); }
+      try {
+        // The event carries addressing and mentions so a listener can say "you were named"; it never carries the text.
+        listener.fn({
+          session_id: sessionId,
+          message_id: message.message_id,
+          machine_id: message.machine_id,
+          at_ms: message.at_ms,
+          to: message.to,
+          ...(mentions.length === 0 ? {} : { mentions }),
+        });
+      }
       catch { /* a dead listener must not fail the write */ }
     }
+    if (idempotencyKey !== null) {
+      idempotency.set(sessionId + '\u0000' + idempotencyKey, message.message_id);
+      if (idempotency.size > MAX_IDEMPOTENCY_KEYS) {
+        const oldest = idempotency.keys().next().value;
+        if (oldest !== undefined) idempotency.delete(oldest);
+      }
+    }
+
     return { ok: true, message };
   }
 

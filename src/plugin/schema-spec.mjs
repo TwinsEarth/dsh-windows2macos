@@ -47,3 +47,36 @@ export function schemaProblems(schema, name = 'tool') {
     .map(({ path }) => ({ path: path + '.additionalProperties', why: 'an object parameter must state additionalProperties: true or false' }))
     .map((problem) => ({ ...problem, path: name + '.' + problem.path }));
 }
+
+
+/** Keys a parameter declaration may carry. Anything else is a typo or a parameter nested by accident. */
+const PARAM_KEYS = new Set(['type', 'items', 'description', 'default', 'required', 'enum', 'properties', 'additionalProperties', 'oneOf', 'anyOf']);
+
+/**
+ * Parameters nested inside another parameter's declaration.
+ *
+ * This is the shape that shipped in the 1.2.4 build: a parameter block pasted inside its predecessor. Every local schema check
+ * was green, and the real host refused the whole entry ("parameters.poll_ms.reducer_machine_id is not supported by the value
+ * schema DSL") -- because to JavaScript it is a perfectly good object.
+ *
+ * @param {Record<string, object>} parameters
+ * @param {string} [name]
+ * @returns {Array<{path: string, why: string}>}
+ */
+export function strayParameterProblems(parameters, name = 'tool') {
+  const problems = [];
+  for (const [key, decl] of Object.entries(parameters ?? {})) {
+    if (decl === null || typeof decl !== 'object') continue;
+    for (const nested of Object.keys(decl)) {
+      if (PARAM_KEYS.has(nested)) continue;
+      const looksLikeParameter = decl[nested] !== null && typeof decl[nested] === 'object' && typeof decl[nested].type === 'string';
+      if (looksLikeParameter) {
+        problems.push({
+          path: name + '.parameters.' + key + '.' + nested,
+          why: 'a parameter declaration is nested inside another parameter; move it to the parameters object',
+        });
+      }
+    }
+  }
+  return problems;
+}

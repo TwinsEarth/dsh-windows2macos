@@ -4,7 +4,7 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { objectNodes, schemaProblems } from '../src/plugin/schema-spec.mjs';
+import { objectNodes, schemaProblems, strayParameterProblems } from '../src/plugin/schema-spec.mjs';
 
 describe('objectNodes', () => {
   it('finds nested objects through properties, items and unions', () => {
@@ -53,5 +53,23 @@ describe('schemaProblems', () => {
 
   it('accepts additionalProperties: true as well as false', () => {
     assert.deepEqual(schemaProblems({ type: 'object', additionalProperties: false, properties: { a: { type: 'object', additionalProperties: true } } }, 'x'), []);
+  });
+});
+
+describe('strayParameterProblems', () => {
+  it('finds a parameter declaration nested inside another parameter', () => {
+    const problems = strayParameterProblems({
+      poll_ms: { type: 'number', description: 'interval', reducer_machine_id: { type: 'string', description: 'nested by accident' } },
+    }, 'w2m_wait');
+    assert.equal(problems.length, 1);
+    assert.match(problems[0].path, /w2m_wait\.parameters\.poll_ms\.reducer_machine_id/);
+  });
+
+  it('accepts ordinary declarations and object sub-schemas', () => {
+    assert.deepEqual(strayParameterProblems({
+      task_id: { type: 'string', required: true },
+      limit: { type: 'number', default: 20 },
+      params: { type: 'object', additionalProperties: true, properties: { n: { type: 'number' } } },
+    }, 'w2m_x'), []);
   });
 });

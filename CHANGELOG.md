@@ -7,6 +7,60 @@
 
 All notable changes to this project are documented here.
 
+## [1.2.5] — 2026-10-20
+
+**Who is in the fleet, what they have read, who was named, and a retry that cannot double-post.**
+
+### Members and roles
+
+`GET /v1/fleet/members` lists every machine with its name, role, join time, presence and last-seen time. `PUT
+/v1/fleet/members/{id}` changes a role and requires the **operator** token, so the route sits with dispatch rather than behind the
+device gate. Roles are `owner | worker | observer` and live in their own table: a device record is written by pairing and by
+reconnect, and a role is an operator decision that must survive both. An unknown machine is a `worker`, never an `owner` -- a
+re-pair cannot gain authority. The last owner cannot be demoted, because then nobody could readmit a machine.
+
+### Read watermarks
+
+`PUT /v1/fleet/read/{session}` records how far this machine has read a conversation (its own token decides which machine);
+`GET /v1/fleet/read/{session}` answers the watermark and an unread count of messages from others newer than it. Only forward: a
+stale marker arriving late must not move the watermark backwards, or the count would grow for messages already seen.
+
+### Mentions
+
+A message may carry `mentions: [machine_id]` (at most 10, validated). The row is still **one** row -- a mention is a
+notification hint, not a delivery mechanism -- and the SSE notification says only whether **this** listener was named. It never
+carries the text, and it does not carry the mention list.
+
+### Idempotent posts
+
+`POST /v1/fleet/messages` accepts `idempotency_key` (per session). A retry after a lost response returns the **first** message
+with `deduped: true` instead of storing the sentence twice. The key is bounded, like the message log.
+
+### Two defects the 1.2.4 tag carried, fixed here
+
+The 1.2.4 commit (tag `v1.2.4`) had a red CI and a red Compat, both found before approval:
+
+- **Compat**: `w2m_wait`'s `reducer_machine_id` declaration had been pasted **inside** `poll_ms`. Every local check was green;
+  the real host refused the whole entry ("parameters.poll_ms.reducer_machine_id is not supported by the value schema DSL"). The
+  parameter now sits where it belongs, and `schema-spec.mjs` gained `strayParameterProblems()` — a parameter declaration
+  nested inside another parameter is now refused where the tool is written, with two tests.
+- **CI**: the cancellation HTTP test had been inserted inside an enclosing `it`. Node 24 ran it; Node 20/22 reported
+  `cancelledByParent`. The test now lives in its own top-level `describe`.
+
+### Verified
+
+Gate GREEN twice, 15 of 15: 2628 tests / 2614 pass / 0 fail / 14 skip. New suites: fleet-members (6); fleet-messages grew to 11;
+relay grew to 171 including two HTTP cases for members and watermarks.
+
+The relay was deployed a fourth time from a hash-verified tarball with a state backup, and the new routes were exercised against
+the live relay (members returned 8 machines; a role change returned 200; a watermark round-tripped; unread answered 0).
+
+### Not in this release
+
+- **Offline replay of outbound chat** is not implemented. The agent's spool already holds undeliverable *results*; chat text is
+  not yet spooled and replayed.
+- A two-machine end-to-end run of mentions/watermarks. The HTTP surface is tested against the fake relay and exercised once
+  against jp-shared, but not by two physical machines.
 ## [1.2.4] — 2026-10-20
 
 **Fleet collaboration, part two: cancellation, dependencies, a task board, questions on disk, and output that travels.**

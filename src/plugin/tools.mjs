@@ -189,7 +189,7 @@ import { buildBoard } from './task-graph.mjs';
 import { createAskStore } from './ask-store.mjs';
 import { deriveTurns } from './turn.mjs';
 import { buildReducePlan } from '../util/dataflow.mjs';
-import { schemaProblems } from './schema-spec.mjs';
+import { schemaProblems, strayParameterProblems } from './schema-spec.mjs';
 import { listIntents, resolveIntent } from './intents.mjs';
 // v0.7.0: the LAN hint layer. Imported here and used in exactly one place (`w2m_devices`); see the
 // module header for why a discovered device is a candidate to *ask* and never an authorisation.
@@ -565,7 +565,10 @@ function createDefineTool(real) {
     // refuses it at MOUNT time -- in the profile of whoever installed the build. That is the failure the packed
     // artifact hit in a real host while this repository tests were green, so the rule is enforced here, where
     // every tool already passes through.
-    const schemaProblemsFound = schemaProblems({ type: 'object', properties: parameters, additionalProperties: false }, name);
+    const schemaProblemsFound = [
+      ...schemaProblems({ type: 'object', properties: parameters, additionalProperties: false }, name),
+      ...strayParameterProblems(parameters, name),
+    ];
     if (schemaProblemsFound.length > 0) {
       throw new TypeError(schemaProblemsFound.map((problem) => problem.path + ': ' + problem.why).join('; '));
     }
@@ -4333,10 +4336,10 @@ export async function apply(ctx, config = {}) {
         type: 'number',
         description: `Interval between status polls, in milliseconds. Defaults to 750. Raise it to be gentler on the Rabbit; it is capped below by ${MIN_POLL_MS}.`,
         default: 750,
+      },
       reducer_machine_id: {
         type: 'string',
         description: 'For a task whose machines produced blobs: which machine runs the reduce step. Without it a blob result is reported as degraded (REDUCER_MISSING) rather than silently treated as complete.',
-      },
       },
     },
     output: jsonOutput,
@@ -6524,6 +6527,15 @@ export async function apply(ctx, config = {}) {
       to: { type: 'string', description: 'For send/ask: "all" (the fleet group, the default) or one machine_id.' },
       thread_id: { type: 'string', description: 'For send/ask: group this message into a named thread (at most 64 characters).' },
       reply_to: { type: 'string', description: 'For send/ask: the message_id this message answers. For await: the message_id to wait for a reply to.' },
+      mentions: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'For send/ask: machine ids to alert (at most 10). A mention is a notification hint, not a delivery mechanism -- the message still has one row.',
+      },
+      idempotency_key: {
+        type: 'string',
+        description: 'For send/ask: replay protection. A retry with the same key returns the first message instead of posting the same sentence twice.',
+      },
       timeout_ms: { type: 'number', description: 'For await: how long to wait before reporting a timeout (default 60000, capped at 300000). A timeout is a value, not an error.' },
     },
     output: jsonOutput,
@@ -6581,12 +6593,28 @@ export async function apply(ctx, config = {}) {
         }
       }
       if (action === 'send' || action === 'ask') {
-        const posted = await request({ rabbitUrl, token, signal: exec?.signal, method: 'POST', pathname: '/v1/fleet/messages', body: { session_id: sessionId, text: typeof args?.text === 'string' ? args.text : '', ...addressing } });
+        const mentions = Array.isArray(args?.mentions) ? args.mentions.filter((id) => typeof id === 'string' && id !== '') : [];
+        const posted = await request({
+          rabbitUrl,
+          token,
+          signal: exec?.signal,
+          method: 'POST',
+          pathname: '/v1/fleet/messages',
+          body: {
+            session_id: sessionId,
+            text: typeof args?.text === 'string' ? args.text : '',
+            ...addressing,
+            // v1.2.5: a mention is a notification hint; the idempotency key lets a retry after a lost response replay the
+            // first message instead of posting the same sentence twice.
+            ...(mentions.length === 0 ? {} : { mentions }),
+            ...(typeof args?.idempotency_key === 'string' && args.idempotency_key.trim() !== '' ? { idempotency_key: args.idempotency_key.trim() } : {}),
+          },
+        });
         if (posted?.ok !== true) {
           const code = posted?.json?.error?.code ?? posted?.error?.code ?? 'W2M_CHAT_SEND';
           throw new W2MError('W2M_CHAT_SEND', code + ': the message was refused', { reason_code: code, hint: 'quota, size and non-text each need a different answer' });
         }
-        return JSON.stringify({ ok: true, action, message: posted.json?.message ?? null, message_id: posted.json?.message?.message_id ?? null });
+        return JSON.stringify({ ok: true, action, message: posted.json?.message ?? null, message_id: posted.json?.message?.message_id ?? null, ...(posted.json?.deduped === true ? { deduped: true } : {}) });
       }
       if (typeof args?.thread_id === 'string' && args.thread_id.trim() !== '') query.thread_id = args.thread_id.trim();
       if (typeof args?.to === 'string' && args.to.trim() !== '') query.to = args.to.trim();

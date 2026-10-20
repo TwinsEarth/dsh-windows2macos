@@ -23,6 +23,7 @@ import { scopeFleetId } from '../chatops/fleet-wiring.mjs';
 // v0.8.1: the account-derived fleet key, so a machine can join with no pairing code.
 import { planJoin } from '../chatops/fleet-join.mjs';
 import { validateTaskDependencies } from './task-deps.mjs';
+import { buildMembers, setMemberRole as applyMemberRole } from './fleet-members.mjs';
 
 export const PROTOCOL_VERSION = 1;
 
@@ -507,6 +508,14 @@ export class RabbitState {
     /** @type {{seq:number,event:object,target:string|null}[]} ring buffer, last N events */
     this.buffer = [];
     this.devices = new Map();      // machine_id -> device
+    /** v1.2.5: operator-assigned roles, kept apart from device records so a re-pair cannot change authority. */
+    this.roles = new Map();        // machine_id -> 'owner'|'worker'|'observer'
+    /** v1.2.5: read watermarks per session, per machine. */
+    this.readMarks = new Map();    // session_id -> Map<machine_id, {at_ms, message_id}>
+    /** v1.2.5: operator-assigned roles, kept apart from device records so a re-pair cannot change authority. */
+    this.roles = new Map();        // machine_id -> 'owner'|'worker'|'observer'
+    /** v1.2.5: read watermarks per session, per machine. */
+    this.readMarks = new Map();    // session_id -> Map<machine_id, {at_ms, message_id}>
     this.tokens = new Map();       // device_token -> machine_id
     this.tasks = new Map();        // task_id -> task
     this.results = new Map();      // instanceKey -> {envelope, machine_id, received_at_ms, ...}
@@ -2203,6 +2212,49 @@ export class RabbitState {
       leases: [...task.leases.values()].map((l) => l.machine_id),
       lease_states: Object.fromEntries([...task.leases.values()].map((l) => [l.machine_id, l.state])),
     };
+  }
+
+  /** v1.2.5: the fleet's members, with the role each holds and when it joined. */
+  listMembers() {
+    return buildMembers({ devices: this.devices, roles: this.roles });
+  }
+
+  /** v1.2.5: an operator decision about one machine. Refused by name, never silently ignored. */
+  setMemberRole(machineId, role) {
+    const result = applyMemberRole({ machineId, role, devices: this.devices, roles: this.roles });
+    if (result.ok === true) {
+      this.emit('notice', { level: 'info', code: 'MEMBER_ROLE_SET', message: `${machineId} is now ${role}`, machine_id: machineId });
+      this._ledger({ type: 'member.role', machine_id: machineId, role });
+    }
+    return result;
+  }
+
+  /**
+   * v1.2.5: record that a machine has read a session up to a marker.
+   *
+   * Only forward: a stale marker arriving after a newer one must not move the watermark backwards, or the unread count would
+   * grow for messages the machine has already seen.
+   */
+  markRead(sessionId, machineId, marker = {}) {
+    if (typeof sessionId !== 'string' || sessionId === '') return { ok: false, code: 'BAD_SESSION' };
+    if (typeof machineId !== 'string' || machineId === '') return { ok: false, code: 'BAD_MACHINE' };
+    const atMs = Number.isFinite(marker.at_ms) ? Math.floor(marker.at_ms) : this.nowMs();
+    const messageId = typeof marker.message_id === 'string' && marker.message_id !== '' ? marker.message_id : null;
+    if (!this.readMarks.has(sessionId)) this.readMarks.set(sessionId, new Map());
+    const perSession = this.readMarks.get(sessionId);
+    const previous = perSession.get(machineId) ?? null;
+    if (previous !== null && previous.at_ms > atMs) return { ok: true, mark: { ...previous }, advanced: false };
+    const mark = { at_ms: atMs, message_id: messageId };
+    perSession.set(machineId, mark);
+    return { ok: true, mark: { ...mark }, advanced: true };
+  }
+
+  /** v1.2.5: this machine's watermark for one session (null when it never read it). */
+  readMark(sessionId, machineId) {
+    const perSession = this.readMarks.get(sessionId) ?? null;
+    if (perSession === null) return null;
+    const mark = perSession.get(machineId) ?? null;
+    return mark === null ? null : { ...mark };
   }
 
   cancelTask(taskId, reason = 'cancelled_by_operator') {

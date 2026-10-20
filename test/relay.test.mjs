@@ -1105,28 +1105,6 @@ describe('tasks (§4)', () => {
       assert.equal(second.json.error.code, 'TASK_EXISTS');
     });
 
-  it('cancels a task over HTTP, records the reason, and refuses an unknown id (v1.2.4)', async () => {
-    await withRelay({}, async (relay) => {
-      await pairDevice(relay, 'm1');
-      const taskId = '01JCANCEL00000000000000000';
-      const created = await request(`${relay.url}/v1/task`, { method: 'POST', token: OP, body: taskBody({ task_id: taskId }) });
-      assert.equal(created.status, 200, created.text);
-      const cancelled = await request(`${relay.url}/v1/tasks/${taskId}/cancel`, {
-        method: 'POST',
-        token: OP,
-        body: { reason: 'operator stopped it' },
-      });
-      assert.equal(cancelled.status, 200, cancelled.text);
-      assert.equal(cancelled.json.task.cancelled, true);
-      assert.equal(cancelled.json.task.cancel_reason, 'operator stopped it');
-      // The ledger is the answer a second caller gets too: cancelling twice is not an error.
-      const again = await request(`${relay.url}/v1/tasks/${taskId}/cancel`, { method: 'POST', token: OP, body: {} });
-      assert.equal(again.status, 200);
-      assert.equal(again.json.task.cancelled, true);
-      const missing = await request(`${relay.url}/v1/tasks/nope/cancel`, { method: 'POST', token: OP, body: {} });
-      assert.equal(missing.status, 404);
-    });
-  });
   });
 
   it('rejects malformed task bodies with BAD_REQUEST', async () => {
@@ -4417,5 +4395,85 @@ describe('the account key registry', () => {
     assert.equal(state.registerAccountKey('', 'PEM-A').reason, 'BAD_FINGERPRINT');
     assert.equal(state.registerAccountKey('fp-1', '').reason, 'BAD_PUBLIC_KEY');
     assert.equal(state.accountKeyFor('fp-1'), null);
+  });
+});
+
+
+describe('members and read watermarks (v1.2.5)', () => {
+  it('lists every member with its role, and lets the operator change one', async () => {
+    await withRelay({}, async (relay) => {
+      const a = await pairDevice(relay, 'm1');
+      const b = await pairDevice(relay, 'm2');
+      const listed = await request(`${relay.url}/v1/fleet/members`, { token: a.token });
+      assert.equal(listed.status, 200, listed.text);
+      const roles = Object.fromEntries(listed.json.members.map((m) => [m.machine_id, m.role]));
+      assert.equal(roles.m1, 'worker', 'a paired machine is a worker, never an owner by default');
+      assert.equal(roles.m2, 'worker');
+
+      const promoted = await request(`${relay.url}/v1/fleet/members/m1`, {
+        method: 'PUT', token: OP, body: { role: 'owner' },
+      });
+      assert.equal(promoted.status, 200, promoted.text);
+      assert.equal(promoted.json.member.role, 'owner');
+      const after = await request(`${relay.url}/v1/fleet/members`, { token: b.token });
+      assert.equal(after.json.members.find((m) => m.machine_id === 'm1').role, 'owner');
+
+      const bad = await request(`${relay.url}/v1/fleet/members/m1`, { method: 'PUT', token: OP, body: { role: 'admin' } });
+      assert.equal(bad.status, 400);
+      assert.equal(bad.json.error.code, 'MEMBERS_BAD_ROLE');
+    });
+  });
+
+  it('records a read watermark forward only, and counts unread messages after it', async () => {
+    await withRelay({}, async (relay) => {
+      const a = await pairDevice(relay, 'm1');
+      const b = await pairDevice(relay, 'm2');
+      const session = 's-read';
+      const first = await request(`${relay.url}/v1/fleet/messages`, { method: 'POST', token: a.token, body: { session_id: session, text: 'hello' } });
+      assert.equal(first.status, 200, first.text);
+      const second = await request(`${relay.url}/v1/fleet/messages`, { method: 'POST', token: a.token, body: { session_id: session, text: 'again' } });
+      assert.equal(second.status, 200, second.text);
+
+      const before = await request(`${relay.url}/v1/fleet/read/${session}`, { token: b.token });
+      assert.equal(before.status, 200, before.text);
+      assert.equal(before.json.mark, null);
+      assert.equal(before.json.unread, 2, 'both messages are newer than "never read"');
+
+      const marked = await request(`${relay.url}/v1/fleet/read/${session}`, { method: 'PUT', token: b.token, body: { at_ms: second.json.message.at_ms } });
+      assert.equal(marked.status, 200, marked.text);
+      const after = await request(`${relay.url}/v1/fleet/read/${session}`, { token: b.token });
+      assert.equal(after.json.unread, 0);
+      assert.equal(after.json.mark.at_ms, second.json.message.at_ms);
+
+      const backwards = await request(`${relay.url}/v1/fleet/read/${session}`, { method: 'PUT', token: b.token, body: { at_ms: 1 } });
+      assert.equal(backwards.json.advanced, false, 'a stale marker must not move the watermark backwards');
+      assert.equal(backwards.json.mark.at_ms, second.json.message.at_ms);
+    });
+  });
+});
+
+
+describe('task cancellation over HTTP (v1.2.4)', () => {
+  it('cancels a task over HTTP, records the reason, and refuses an unknown id (v1.2.4)', async () => {
+    await withRelay({}, async (relay) => {
+      await pairDevice(relay, 'm1');
+      const taskId = '01JCANCEL00000000000000000';
+      const created = await request(`${relay.url}/v1/task`, { method: 'POST', token: OP, body: taskBody({ task_id: taskId }) });
+      assert.equal(created.status, 200, created.text);
+      const cancelled = await request(`${relay.url}/v1/tasks/${taskId}/cancel`, {
+        method: 'POST',
+        token: OP,
+        body: { reason: 'operator stopped it' },
+      });
+      assert.equal(cancelled.status, 200, cancelled.text);
+      assert.equal(cancelled.json.task.cancelled, true);
+      assert.equal(cancelled.json.task.cancel_reason, 'operator stopped it');
+      // The ledger is the answer a second caller gets too: cancelling twice is not an error.
+      const again = await request(`${relay.url}/v1/tasks/${taskId}/cancel`, { method: 'POST', token: OP, body: {} });
+      assert.equal(again.status, 200);
+      assert.equal(again.json.task.cancelled, true);
+      const missing = await request(`${relay.url}/v1/tasks/nope/cancel`, { method: 'POST', token: OP, body: {} });
+      assert.equal(missing.status, 404);
+    });
   });
 });
