@@ -7,6 +7,33 @@
 
 All notable changes to this project are documented here.
 
+## [1.2.8-beta.1] — 2026-10-21
+
+A beta, by policy: **not published to npm**. It is a GitHub prerelease, installable by a developer who asks for it.
+
+### Message ids are unique across a relay restart
+
+The relay's chat sequence resets on restart, so a bare `msg-000001` named a different message after every deploy. Clients persist
+those ids -- an open turn, a read watermark, `reply_to` -- and live testing caught exactly that: a Windows `ask` recorded a turn, the
+relay restarted, a new message reused the id, and the wait settled the OLD turn as `answered_after_timeout` while the reply was
+fresh. Message ids now carry a random per-process epoch (`msg-<epoch>-<seq>`), so a restart cannot recycle an id and old clients that
+render ids verbatim keep working.
+
+### One size for "how large may one artifact be"
+
+The blob transport frame was 1 MiB while the agent's dataflow hard cap is 16 MiB, so an artifact between the two was accepted by the
+agent and then failed its upload (`BLOB_UPLOAD_FAILED`) on a relay that looked fine. `BLOB_FRAME_BYTES` is now 16 MiB, matching the
+agent, while every JSON route keeps the 64 KiB frame limit.
+
+### Verified
+
+Gate GREEN twice: 2691 tests / 2677 pass / 0 fail / 14 skip in 130 files. New tests: an id is unique across two store instances
+(same sequence, different process), an explicit epoch is honoured, and a 2 MiB blob survives the transport intact.
+
+### Still open (unchanged from 1.2.7)
+
+- `pipeline` keeps `index_total` at 1; blob map results come from plain commands above the inline cap.
+- macmini runs 1.2.6 from its own checkout and needs a `git pull` + restart for the plain-command blob behaviour.
 ## [1.2.7] — 2026-10-21
 
 **The scheduler enforces the graph, a wait survives a restart and a dropped stream, and a partial fleet can no longer call itself

@@ -187,3 +187,20 @@ describe('reply state (v1.2.7)', () => {
     assert.equal('reply_state' in plain.message, false);
   });
 });
+describe('message id epoch (v1.2.8)', () => {
+  const at = () => createFleetMessages({ now: (() => { let t = 4_000; return () => (t += 10); })() });
+
+  it('makes ids unique across a relay restart (same sequence, different process)', () => {
+    const first = at();
+    const second = at();
+    const one = first.post({ session_id: 's1', machine_id: 'a', text: 'before restart' });
+    const two = second.post({ session_id: 's1', machine_id: 'a', text: 'after restart' });
+    assert.match(one.message.message_id, /^msg-[0-9a-f]{6}-000001$/);
+    assert.notEqual(one.message.message_id, two.message.message_id, 'a restarted relay must not reuse an id');
+  });
+
+  it('honours an explicit epoch, so a test can name the process', () => {
+    const store = createFleetMessages({ now: () => 5_000, epoch: 'abc123' });
+    assert.equal(store.post({ session_id: 's1', machine_id: 'a', text: 'x' }).message.message_id, 'msg-abc123-000001');
+  });
+});

@@ -23,6 +23,8 @@
  * This keeps the authoritative list in memory for the relay to serve and to shard out; distributing encrypted shards
  * across the fleet's machines is the next step and depends on this shape staying the same.
  */
+import { randomBytes } from 'node:crypto';
+
 
 /** 100 MB per 24h per fleet (operator decision). */
 export const QUOTA_24H_BYTES = 100 * 1024 * 1024;
@@ -41,6 +43,15 @@ const DAY_MS = 24 * 60 * 60 * 1000;
  */
 export function createFleetMessages(options = {}) {
   const now = typeof options.now === 'function' ? options.now : () => Date.now();
+  /**
+   * v1.2.8: the relay's message sequence resets on restart, so a bare `msg-000001` names a DIFFERENT message after every
+   * restart. Clients persist message ids -- an open turn, a read watermark, a reply_to -- and a reused id makes a new message
+   * settle an old turn with the wrong state. The epoch is random per process, so ids are unique across restarts without a
+   * persisted counter, and old clients that render ids verbatim keep working.
+   */
+  const epoch = typeof options.epoch === 'string' && options.epoch !== ''
+    ? options.epoch
+    : randomBytes(3).toString('hex');
   const quota24hBytes = Number.isInteger(options.quota24hBytes) ? options.quota24hBytes : QUOTA_24H_BYTES;
   const hardCapBytes = Number.isInteger(options.hardCapBytes) ? options.hardCapBytes : HARD_CAP_BYTES;
   const retentionDays = Number.isInteger(options.retentionDays) ? options.retentionDays : RETENTION_DAYS;
@@ -169,7 +180,7 @@ export function createFleetMessages(options = {}) {
 
     seq += 1;
     const message = {
-      message_id: 'msg-' + String(seq).padStart(6, '0'),
+      message_id: 'msg-' + epoch + '-' + String(seq).padStart(6, '0'),
       session_id: sessionId,
       fleet_id: typeof input?.fleet_id === 'string' ? input.fleet_id : null,
       machine_id: machineId,

@@ -29,7 +29,11 @@ import {
 // one shared limit the blob channel could never accept a single byte -- a pipeline blob upload from a real relay failed with
 // FRAME_TOO_LARGE while the fake relay in the tests accepted it. The dataflow hard cap stays the agent-side bound; this is the
 // transport bound, and it is still bounded.
-export const BLOB_FRAME_BYTES = 1024 * 1024; // 1 MiB per blob frame
+export const BLOB_FRAME_BYTES = 16 * 1024 * 1024; // 16 MiB per blob frame -- the same cap the agent's dataflow plan uses.
+//
+// v1.2.8-beta.1: it was 1 MiB while the agent's hard cap is 16 MiB, so an artifact between the two failed its upload with
+// BLOB_UPLOAD_FAILED even though the agent had accepted it. One number for "how large may one artifact be" is the honest shape;
+// the JSON frame limit stays 64 KiB for every other route.
 import { createFleetMessages } from './fleet-messages.mjs';
 import { can as mayAct } from '../util/policy-matrix.mjs';
 import { createFleetMemory } from './fleet-memory.mjs';

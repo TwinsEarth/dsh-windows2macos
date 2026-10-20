@@ -19,7 +19,7 @@ describe('new-message notifications', () => {
     post(chat, 'secret words');
     unsubscribe();
     assert.equal(events.length, 1);
-    assert.equal(events[0].message_id, 'msg-000001');
+    assert.match(events[0].message_id, /^msg-[0-9a-f]{6}-000001$/, 'v1.2.8: ids carry the relay epoch');
     assert.equal(events[0].session_id, 's-1');
     assert.equal(events[0].machine_id, 'm-1');
     assert.equal(events[0].text, undefined, 'the event must not carry the text');

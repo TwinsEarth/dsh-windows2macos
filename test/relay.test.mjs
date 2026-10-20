@@ -4720,3 +4720,21 @@ describe('blob frame limit (v1.2.7)', () => {
     } finally { removeStateDir(dir); }
   });
 });
+describe('blob frame size (v1.2.8)', () => {
+  it('accepts a blob larger than the old 1 MiB transport cap, up to the agent hard cap', async () => {
+    const dir = makeStateDir();
+    try {
+      await withRelay({ stateDir: dir }, async (relay) => {
+        const a = await pairDevice(relay, 'm1');
+        const { createHash } = await import('node:crypto');
+        const text = 'y'.repeat(2 * 1024 * 1024);
+        const sha = createHash('sha256').update(Buffer.from(text, 'utf8')).digest('hex');
+        const put = await request(`${relay.url}/v1/fleet/blobs/${sha}`, { method: 'PUT', token: a.token, rawBody: text });
+        assert.equal(put.status, 201, put.text);
+        const got = await request(`${relay.url}/v1/fleet/blobs/${sha}`, { token: a.token });
+        assert.equal(got.status, 200);
+        assert.equal(got.text.length, text.length, 'a 2 MiB artifact survives the transport intact');
+      });
+    } finally { removeStateDir(dir); }
+  });
+});
