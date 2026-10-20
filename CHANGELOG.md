@@ -7,6 +7,67 @@
 
 All notable changes to this project are documented here.
 
+## [1.2.7] — 2026-10-21
+
+**The scheduler enforces the graph, a wait survives a restart and a dropped stream, and a partial fleet can no longer call itself
+a complete reduce.**
+
+### Turns are a state machine on disk
+
+A question written with `action:'ask'` becomes a persisted turn (`ask_id`, deadline). `await` attaches to that record, so a process
+restart does not lose the question or turn a late answer into silence; a late answer is recorded as `answered_after_timeout`. The
+wait prefers the relay's event stream, re-subscribes when the stream drops, and polls only when streaming is unavailable. A reply
+now carries `reply_state: 'answered'|'refused'`, so a refusal is a state the waiter reads rather than wording it guesses.
+
+### Dependencies block dispatch, and release when their prerequisite settles
+
+A task with `depends_on` is not offered: its leases are `waiting`, which redelivery skips and the sweeper ignores. When every
+prerequisite is settled -- **by a result, an expiry or a refusal** -- `_releaseDependents` moves those leases to offers. The graph
+edges and `assignee` are written into the task ledger, because live testing showed a restarted relay losing them and keeping a
+waiting task waiting forever. `assignee` is enforced, not recorded: only that machine gets a lease, and an unknown assignee is
+refused by name. `GET /v1/tasks` now publishes a derived `status` (`waiting`/`active`/`done`/`failed`/`cancelled`) and
+`waiting_on`, so the board and the scheduler cannot disagree.
+
+### Dataflow: an expected shard count, and a reduce that refuses partial input
+
+`buildReducePlan` takes `expectedIndexTotal` from the task (`index_total`) and refuses `MISSING_SHARD` (with the missing indexes),
+`MAP_INDEX_MISSING` and `MAP_INDEX_OUT_OF_RANGE`; only machines that actually reported can claim a shard, so an expired lease no
+longer makes a partial run look complete. Two production gaps were found by live testing and closed with it:
+
+- **A large plain-command stdout was never a blob.** The blob path lived only in the pipeline loop, so a split/mapreduce map result
+  was always inline and a reduce plan could never see what it reduces. Any command output above the inline cap now uploads a blob
+  exactly as a pipeline stage does (best effort: a failed upload keeps the command successful and says why).
+- **The relay's own frame limit made the blob channel unusable.** `MAX_FRAME_BYTES` (64 KiB) equals the inline threshold, so every
+  blob was by construction larger than the frame cap and a real upload failed with `FRAME_TOO_LARGE` while the fake relay in tests
+  accepted it. Blob PUTs now get a bounded 1 MiB frame (`BLOB_FRAME_BYTES`); every JSON route keeps the 64 KiB cap.
+- The aggregate now publishes `blob_sha256`, `output_mode`, `stdout_head` and `stdout_bytes` per machine: `w2m_wait` used to read
+  `aggregate.detail.machines`, a shape the production `/v1/tasks` response never carries, so the reduce plan was unreachable
+  outside tests.
+
+### Verified
+
+Gate GREEN twice, 15 of 15: 2687 tests / 2673 pass / 0 fail / 14 skip in 130 files.
+
+Two-machine live runs on Windows (ToFuture) and jp-shared over the real relay:
+
+- **await over SSE**: Windows asks, jp-shared replies `reply_state:'refused'`; the wait returns `state=refused, via=stream`, and the
+  turn is settled on disk.
+- **dependency chain**: B with `depends_on: [A]` is `waiting`, A settles, B is released (observed `status=active` with offers).
+- **missing shard**: a split task with `index_total: 5` whose map results are blobs is refused as
+  `MISSING_SHARD {missing:[1,3,4], expectedIndexTotal:5}` with `dataflow_degraded: true` -- the first live exercise of the blob
+  channel end to end.
+
+Both live-testing defects above (release only on a result; graph edges missing from the ledger) were found by these runs and are
+covered by tests now.
+
+### Limits, stated
+
+- A pipeline task runs the whole chain per machine, so `index_total` stays 1 for it; blob map results come from plain commands above
+  the inline cap.
+- The blob transport frame is 1 MiB while the agent's dataflow hard cap is 16 MiB: a single artifact above 1 MiB fails its upload
+  explicitly (`BLOB_UPLOAD_FAILED`) rather than being split across frames.
+- The jp-shared agent was upgraded to this build; macmini runs 1.2.6 from its own checkout and needs a `git pull` + restart to get
+  the plain-command blob behaviour.
 ## [1.2.6] — 2026-10-20
 
 **Security surface: signatures, a permission matrix, and output that no longer carries secrets — plus the reliability the chat

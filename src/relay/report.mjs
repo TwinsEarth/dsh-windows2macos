@@ -492,6 +492,17 @@ export function aggregate(task, resultRecords = [], opts = {}) {
       reasons: m.reasons,
       // v1.2.6: the relay's verdict, bound to the key registered at pairing.
       signature_status: m.signature_status ?? null,
+      /**
+       * v1.2.7: the dataflow facts a reader needs to build a reduce plan.
+       *
+       * The aggregate used to publish only a summary per machine, so a client could not see that a result was a blob -- the
+       * reduce plan existed in tests and read raw envelopes that the production response never carried. These four fields are
+       * that omission, closed: the blob hash, the file/blob mode, the inline head, and the byte count.
+       */
+      blob_sha256: m.envelope?.blob_sha256 ?? null,
+      output_mode: m.envelope?.output_mode ?? null,
+      stdout_head: m.envelope?.stdout_head ?? null,
+      stdout_bytes: m.envelope?.stdout_bytes ?? null,
     })),
     steps,
     differences: step3.differences ?? [],

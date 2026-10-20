@@ -45,7 +45,10 @@ describe('a stage decides inline versus blob', () => {
 
 describe('the wait aggregate refuses a partial reduce', () => {
   it('builds the plan from the raw envelopes, not the comparable copy', () => {
-    assert.ok(tools.includes('buildReducePlan({ results: mapResults, reducerMachineId })'), 'the wait aggregate must build the reduce plan');
+    assert.ok(tools.includes('buildReducePlan({'), 'the wait aggregate must build the reduce plan');
+    assert.ok(tools.includes('results: mapResults,'), 'the plan is built from the raw envelopes');
+    assert.ok(tools.includes('reducerMachineId,'), 'the caller names the reducer');
+    assert.ok(tools.includes('expectedIndexTotal: Number.isInteger(body?.task?.index_total)'), 'v1.2.7: the task shard count is the completeness contract');
     assert.ok(tools.includes('Array.isArray(aggregate.detail?.machines)'), 'the plan reads the raw machine list');
     assert.ok(tools.includes('reducerMachineId'), 'the caller names the reducer');
   });

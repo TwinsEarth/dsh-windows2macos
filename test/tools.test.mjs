@@ -1624,6 +1624,141 @@ describe('happy paths', () => {
     }
   });
 
+  it('ask opens a persisted turn and await settles it as answered or refused (v1.2.7)', async () => {
+    const stateDir = await makeStateDir(PAIRED_DEVICE);
+    let reply = null;
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = async (input, init = {}) => {
+      const url = new URL(String(input));
+      const method = String(init.method ?? 'GET').toUpperCase();
+      if (url.pathname === '/v1/fleet/messages/stream') {
+        return new globalThis.Response('', { status: 200, headers: { 'content-type': 'text/event-stream' } });
+      }
+      if (url.pathname === '/v1/fleet/messages' && method === 'POST') {
+        return new globalThis.Response(JSON.stringify({ protocol_version: 1, ok: true, message: { message_id: 'msg-q1', session_id: 's-turn' } }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      const messages = reply === null ? [] : [reply];
+      return new globalThis.Response(JSON.stringify({ protocol_version: 1, ok: true, messages }), { status: 200, headers: { 'content-type': 'application/json' } });
+    };
+    try {
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir, operatorToken: OPERATOR_TOKEN, device_token: 'tok-test-abc' });
+      const asked = JSON.parse(await tools.get('w2m_chat').execute({ action: 'ask', session_id: 's-turn', text: 'is the build green?' }, {}));
+      assert.equal(asked.ok, true);
+      assert.equal(asked.ask.state, 'open', 'the question is a persisted turn');
+
+      reply = { message_id: 'msg-a1', session_id: 's-turn', machine_id: 'other-machine', reply_to: 'msg-q1', reply_state: 'answered', at_ms: 5, text: 'yes' };
+      const answered = JSON.parse(await tools.get('w2m_chat').execute({ action: 'await', session_id: 's-turn', reply_to: 'msg-q1', timeout_ms: 5000 }, {}));
+      assert.equal(answered.state, 'answered');
+      assert.equal(answered.reply.message_id, 'msg-a1');
+      const afterAnswer = JSON.parse(await tools.get('w2m_chat').execute({ action: 'asks', session_id: 's-turn' }, {}));
+      assert.equal(afterAnswer.asks.find((ask) => ask.ask_id === asked.ask.ask_id).state, 'answered');
+
+      const second = JSON.parse(await tools.get('w2m_chat').execute({ action: 'ask', session_id: 's-turn', text: 'can you take this?' }, {}));
+      assert.equal(second.ask.state, 'open');
+      reply = { message_id: 'msg-r1', session_id: 's-turn', machine_id: 'other-machine', reply_to: second.message_id ?? 'msg-q1', reply_state: 'refused', at_ms: 6, text: 'no' };
+      const refused = JSON.parse(await tools.get('w2m_chat').execute({ action: 'await', session_id: 's-turn', reply_to: second.message_id, timeout_ms: 5000 }, {}));
+      assert.equal(refused.state, 'refused', 'a refusal is a state, not a wording to parse');
+    } finally { globalThis.fetch = previousFetch; }
+  });
+
+  it('times out a turn and records a later answer as answered_after_timeout (v1.2.7)', async () => {
+    const stateDir = await makeStateDir(PAIRED_DEVICE);
+    let reply = null;
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = async (input, init = {}) => {
+      const url = new URL(String(input));
+      const method = String(init.method ?? 'GET').toUpperCase();
+      if (url.pathname === '/v1/fleet/messages/stream') {
+        return new globalThis.Response('', { status: 200, headers: { 'content-type': 'text/event-stream' } });
+      }
+      if (url.pathname === '/v1/fleet/messages' && method === 'POST') {
+        return new globalThis.Response(JSON.stringify({ protocol_version: 1, ok: true, message: { message_id: 'msg-q2', session_id: 's-late' } }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      const messages = reply === null ? [] : [reply];
+      return new globalThis.Response(JSON.stringify({ protocol_version: 1, ok: true, messages }), { status: 200, headers: { 'content-type': 'application/json' } });
+    };
+    try {
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir, operatorToken: OPERATOR_TOKEN, device_token: 'tok-test-abc' });
+      await tools.get('w2m_chat').execute({ action: 'ask', session_id: 's-late', text: 'well?' }, {});
+      const timedOut = JSON.parse(await tools.get('w2m_chat').execute({ action: 'await', session_id: 's-late', reply_to: 'msg-q2', timeout_ms: 1000 }, {}));
+      assert.equal(timedOut.state, 'timeout');
+      assert.equal(timedOut.ask.state, 'timeout', 'the timeout is persisted, not just returned');
+
+      reply = { message_id: 'msg-late', session_id: 's-late', machine_id: 'other-machine', reply_to: 'msg-q2', reply_state: 'answered', at_ms: 9, text: 'late but real' };
+      const late = JSON.parse(await tools.get('w2m_chat').execute({ action: 'await', session_id: 's-late', reply_to: 'msg-q2', timeout_ms: 3000 }, {}));
+      assert.equal(late.state, 'answered');
+      assert.equal(late.ask.state, 'answered_after_timeout', 'a late answer is its own state');
+    } finally { globalThis.fetch = previousFetch; }
+  });
+
+  it('re-subscribes after a dropped stream instead of silently degrading (v1.2.7)', async () => {
+    const stateDir = await makeStateDir(PAIRED_DEVICE);
+    let reply = null;
+    let streamCalls = 0;
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = async (input, init = {}) => {
+      const url = new URL(String(input));
+      const method = String(init.method ?? 'GET').toUpperCase();
+      if (url.pathname === '/v1/fleet/messages/stream') {
+        streamCalls += 1;
+        if (streamCalls === 1) {
+          // the first subscription drops immediately, before any event
+          return new globalThis.Response('', { status: 200, headers: { 'content-type': 'text/event-stream' } });
+        }
+        return new globalThis.Response('data: {"message_id":"msg-any"}\n\n', { status: 200, headers: { 'content-type': 'text/event-stream' } });
+      }
+      if (url.pathname === '/v1/fleet/messages' && method === 'POST') {
+        return new globalThis.Response(JSON.stringify({ protocol_version: 1, ok: true, message: { message_id: 'msg-q7', session_id: 's-reconnect' } }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      const messages = reply === null ? [] : [reply];
+      return new globalThis.Response(JSON.stringify({ protocol_version: 1, ok: true, messages }), { status: 200, headers: { 'content-type': 'application/json' } });
+    };
+    try {
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir, operatorToken: OPERATOR_TOKEN, device_token: 'tok-test-abc' });
+      await tools.get('w2m_chat').execute({ action: 'ask', session_id: 's-reconnect', text: 'reachable?' }, {});
+      reply = { message_id: 'msg-r7', session_id: 's-reconnect', machine_id: 'other', reply_to: 'msg-q7', reply_state: 'answered', at_ms: 7, text: 'yes' };
+      const value = JSON.parse(await tools.get('w2m_chat').execute({ action: 'await', session_id: 's-reconnect', reply_to: 'msg-q7', timeout_ms: 5000 }, {}));
+      assert.equal(value.state, 'answered');
+      assert.equal(value.via, 'stream', 'the wait came through a re-subscribed stream');
+      assert.ok(streamCalls >= 2, 'the dropped subscription was retried');
+    } finally { globalThis.fetch = previousFetch; }
+  });
+
+  it('recovers a waiting turn after a restart (same state dir, new tool instance) (v1.2.7)', async () => {
+    const stateDir = await makeStateDir(PAIRED_DEVICE);
+    let reply = null;
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = async (input, init = {}) => {
+      const url = new URL(String(input));
+      const method = String(init.method ?? 'GET').toUpperCase();
+      if (url.pathname === '/v1/fleet/messages/stream') {
+        return new globalThis.Response('', { status: 200, headers: { 'content-type': 'text/event-stream' } });
+      }
+      if (url.pathname === '/v1/fleet/messages' && method === 'POST') {
+        return new globalThis.Response(JSON.stringify({ protocol_version: 1, ok: true, message: { message_id: 'msg-q8', session_id: 's-restart' } }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      const messages = reply === null ? [] : [reply];
+      return new globalThis.Response(JSON.stringify({ protocol_version: 1, ok: true, messages }), { status: 200, headers: { 'content-type': 'application/json' } });
+    };
+    try {
+      const first = await register({ rabbitUrl: RABBIT, stateDir, operatorToken: OPERATOR_TOKEN, device_token: 'tok-test-abc' });
+      const asked = JSON.parse(await first.tools.get('w2m_chat').execute({ action: 'ask', session_id: 's-restart', text: 'still there?' }, {}));
+      assert.equal(asked.ask.state, 'open');
+
+      // a new instance = a new process: it must find the question on disk, not open a second turn
+      const second = await register({ rabbitUrl: RABBIT, stateDir, operatorToken: OPERATOR_TOKEN, device_token: 'tok-test-abc' });
+      const before = JSON.parse(await second.tools.get('w2m_chat').execute({ action: 'asks', session_id: 's-restart' }, {}));
+      assert.equal(before.asks.filter((ask) => ask.state === 'open').length, 1, 'the waiting turn survived the restart');
+
+      reply = { message_id: 'msg-r8', session_id: 's-restart', machine_id: 'other', reply_to: 'msg-q8', reply_state: 'answered', at_ms: 8, text: 'yes' };
+      const value = JSON.parse(await second.tools.get('w2m_chat').execute({ action: 'await', session_id: 's-restart', reply_to: 'msg-q8', timeout_ms: 5000 }, {}));
+      assert.equal(value.state, 'answered');
+      assert.equal(value.ask.state, 'answered');
+      const after = JSON.parse(await second.tools.get('w2m_chat').execute({ action: 'asks', session_id: 's-restart' }, {}));
+      assert.equal(after.asks.filter((ask) => ask.ask_id === asked.ask.ask_id && ask.state === 'answered').length, 1, 'the reply settled the SAME turn');
+    } finally { globalThis.fetch = previousFetch; }
+  });
+
   it('remembers a chat cursor so list continues where the last page ended (v1.2.6)', async () => {
     const seen = [];
     const previousFetch = globalThis.fetch;
@@ -1730,7 +1865,53 @@ describe('happy paths', () => {
     } finally { globalThis.fetch = previousFetch; }
   });
 
-  it('reports each machine signature as signed, unsigned or bad_signature (v1.2.6)', async () => {
+  it('refuses a reduce plan when a declared split shard never reported (v1.2.7)', async () => {
+    const blobEnvelope = () => ({ status: 'ok', exit_code: 0, stdout_sha256: 'a'.repeat(64), stdout_bytes: 64 * 1024, blob_sha256: 'b'.repeat(64) });
+    const aggregate = finalTask({
+      machines: [
+        machine('m1', 'win', 'ok', blobEnvelope(), { index: 0 }),
+        machine('m2', 'linux', 'ok', blobEnvelope(), { index: 2 }),
+      ],
+    });
+    const response = taskResponse(aggregate);
+    response.task.mode = 'split';
+    response.task.index_total = 3;
+    const fetchStub = installFetch([{ path: '/v1/tasks/01JABCDEF', body: response }]);
+    try {
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
+      const value = JSON.parse(await tools.get('w2m_wait').execute({ task_id: '01JABCDEF', wait_ms: 1000, reducer_machine_id: 'm1' }, {}));
+      assert.equal(value.dataflow_degraded, true, 'a partial fleet is not a complete reduce');
+      assert.equal(value.reduce.ok, false);
+      assert.equal(value.reduce.code, 'MISSING_SHARD');
+      assert.deepEqual(value.reduce.detail, { missing: [1], expectedIndexTotal: 3 });
+      assert.equal(value.state, 'degraded');
+    } finally { fetchStub.restore(); }
+  });
+
+
+  it('builds the reduce plan from the aggregate shape the relay actually sends (v1.2.7)', async () => {
+    const response = taskResponse({
+      task_id: '01JSHARD',
+      status: 'consistent',
+      counts: { refused: 0, unverifiable: 0, ok: 2, failed: 0, expired: 0, pending: 0 },
+      machines: [
+        { machine_id: 'm1', machine_name: 'win', index: 0, outcome: 'ok', status: 'ok', blob_sha256: 'b'.repeat(64), output_mode: 'blob', stdout_bytes: 70_000 },
+        { machine_id: 'm2', machine_name: 'linux', index: 2, outcome: 'ok', status: 'ok', blob_sha256: 'c'.repeat(64), output_mode: 'blob', stdout_bytes: 70_000 },
+        // an expired machine still carries an index; it must not count as a produced shard
+        { machine_id: 'm3', machine_name: 'offline', index: 1, outcome: 'expired', lease_state: 'expired' },
+      ],
+    });
+    response.task.mode = 'split';
+    response.task.index_total = 3;
+    const fetchStub = installFetch([{ path: '/v1/tasks/01JSHARD', body: response }]);
+    try {
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
+      const value = JSON.parse(await tools.get('w2m_wait').execute({ task_id: '01JSHARD', wait_ms: 1000, reducer_machine_id: 'm1' }, {}));
+      assert.equal(value.dataflow_degraded, true, 'the plan is reachable from the real response shape');
+      assert.equal(value.reduce.code, 'MISSING_SHARD');
+      assert.deepEqual(value.reduce.detail.missing, [1]);
+    } finally { fetchStub.restore(); }
+  });  it('reports each machine signature as signed, unsigned or bad_signature (v1.2.6)', async () => {
     const { generateKeyPairSync, sign } = await import('node:crypto');
     const { canonicalSignedPayload } = await import('../src/util/envelope-signature.mjs');
     const { privateKey, publicKey } = generateKeyPairSync('ed25519');

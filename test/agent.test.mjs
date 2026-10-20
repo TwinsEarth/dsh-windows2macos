@@ -1817,6 +1817,45 @@ describe('Localside agent end to end', () => {
     }
   });
 
+  it('uploads a large plain-command stdout as a blob, so a reduce can see a map result (v1.2.7)', async () => {
+    const rabbit = await startFakeRabbit();
+    const project = await makeRepo('e2e-plain-blob');
+    try {
+      const agent = makeAgent({ rabbit: rabbit.url, project, allowed: [['node', '-e']], name: 'plain-blob' });
+      const running = agent.start();
+      const stream = await rabbit.stream();
+      stream.send('ready', { protocol_version: 1, rabbit_time: '2026-10-07T12:00:00Z', machine_id: 'rabbit' });
+      const big = 'x'.repeat(70_000);
+      const argv = [NODE, '-e', 'process.stdout.write("x".repeat(70000))'];
+      stream.send('task.offer', {
+        task_id: '01J-E2E-PLAIN-BLOB',
+        attempt: 1,
+        mode: 'replicate',
+        index: 0,
+        index_total: 1,
+        command_argv: argv,
+        cwd_rel: '.',
+        write: false,
+        timeout_ms: 30_000,
+        dedupe_key: 'dk-e2e-plain-blob',
+      });
+      await running;
+
+      assert.equal(rabbit.state.blobs.length, 1, 'a plain command above the inline cap uploads exactly one blob');
+      const uploaded = rabbit.state.blobs[0];
+      const sha = sha256Hex(big);
+      assert.equal(uploaded.sha, sha, 'the blob name is the hash of the command output');
+      assert.equal(uploaded.raw, big, 'the exact bytes were uploaded');
+      const envelope = rabbit.state.results[0];
+      assert.equal(envelope.blob_sha256, sha, 'the envelope names the blob');
+      assert.equal(envelope.output_mode, 'blob');
+      assert.equal(envelope.stdout_head, '', 'a blob envelope does not also inline the head');
+      assert.equal(envelope.pipeline ?? null, null, 'a plain command is not a pipeline');
+      assert.equal(verifyEnvelope(envelope), true);
+    } finally {
+      await rabbit.close();
+    }
+  });
   it('fails the stage by name when the blob upload is refused (v1.2.4)', async () => {
     const rabbit = await startFakeRabbit({ blobError: { status: 500, code: 'BLOB_REFUSED' } });
     const project = await makeRepo('e2e-dataflow-blob-fail');

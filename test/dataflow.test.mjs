@@ -51,3 +51,33 @@ describe('the reduce plan', () => {
     assert.equal(buildReducePlan({ results: [{ machine_id: 'm-2' }] }).code, 'REDUCER_MISSING');
   });
 });
+
+describe('buildReducePlan expected shards (v1.2.7)', () => {
+  const map = (machineId, index) => ({ machine_id: machineId, index, mode: 'blob', blob_sha256: 'a'.repeat(64) });
+
+  it('refuses a plan when a declared shard never reported', () => {
+    const plan = buildReducePlan({ reducerMachineId: 'reducer', expectedIndexTotal: 3, results: [map('m1', 0), map('m2', 2)] });
+    assert.equal(plan.ok, false);
+    assert.equal(plan.code, 'MISSING_SHARD');
+    assert.deepEqual(plan.detail, { missing: [1], expectedIndexTotal: 3 });
+  });
+
+  it('accepts a plan only when every declared shard is present', () => {
+    const plan = buildReducePlan({ reducerMachineId: 'reducer', expectedIndexTotal: 2, results: [map('m1', 0), map('m2', 1)] });
+    assert.equal(plan.ok, true);
+    assert.equal(plan.inputs.length, 2);
+  });
+
+  it('refuses a result that cannot name its shard, or names one outside the task', () => {
+    const noIndex = buildReducePlan({ reducerMachineId: 'reducer', expectedIndexTotal: 2, results: [{ machine_id: 'm1', mode: 'blob', blob_sha256: 'a'.repeat(64) }] });
+    assert.equal(noIndex.code, 'MAP_INDEX_MISSING');
+    const outOfRange = buildReducePlan({ reducerMachineId: 'reducer', expectedIndexTotal: 2, results: [map('m1', 7)] });
+    assert.equal(outOfRange.code, 'MAP_INDEX_OUT_OF_RANGE');
+    assert.equal(outOfRange.detail.index, 7);
+  });
+
+  it('keeps the old behaviour when the task declared no shard count', () => {
+    const plan = buildReducePlan({ reducerMachineId: 'reducer', results: [map('m1', 0)] });
+    assert.equal(plan.ok, true, 'a caller that never declared a count is not retroactively refused');
+  });
+});

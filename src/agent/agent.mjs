@@ -3215,6 +3215,28 @@ export function createAgent(options) {
         }
       }
 
+      /**
+       * v1.2.7: a plain command's large stdout is a stage artifact too.
+       *
+       * The blob path used to live only in the pipeline loop, so a split/mapreduce map result was always inlined and a
+       * reduce plan could never see the data it reduces -- the missing-shard check was unreachable from a real task. A
+       * command that prints more than the inline cap now uploads its stdout exactly as a stage does. Best effort here: a
+       * failed upload must not turn a successful command into a failure, so the envelope stays inline and says why.
+       */
+      if (isPipeline !== true && execution !== null && lastBlobSha256 === null) {
+        const plainPlan = planStageOutput({ machineId: identity.machine_id, stageIndex: 0, stdoutBytes: execution.stdout_bytes });
+        if (plainPlan.ok === true && plainPlan.mode === 'blob') {
+          if (execution.truncated_stdout === true && !warnings.includes('STDOUT_TRUNCATED')) warnings.push('STDOUT_TRUNCATED');
+          const uploaded = await putBlobBytes(execution.stdout_sha256, execution.stdout);
+          if (uploaded.ok === true) {
+            lastBlobSha256 = uploaded.sha256;
+          } else {
+            log('warn', offer.task_id + ': plain stdout blob upload failed', { code: uploaded.code });
+            warnings.push('BLOB_UPLOAD_FAILED');
+          }
+        }
+      }
+
       heartbeat.setPhase('finalizing', 90);
       if (execution === null) {
         // Nothing ran at all (a refused first stage, or a budget already spent). `execution` stays

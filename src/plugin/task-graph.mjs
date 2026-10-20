@@ -22,7 +22,12 @@ export const TASK_GRAPH_REFUSAL = Object.freeze({
 const DONE = new Set(['completed', 'done']);
 const FAILED = new Set(['failed', 'cancelled', 'refused']);
 // States that mean the task is already in flight. It is not 'ready': ready means work that can be STARTED.
-const ACTIVE = new Set(['running', 'queued', 'offered', 'preparing', 'finalizing']);
+const ACTIVE = new Set(['running', 'queued', 'offered', 'preparing', 'finalizing', 'active']);
+/**
+ * v1.2.7: the relay's scheduler reports 'waiting' for a task whose prerequisites are unsettled. Reading that as "ready" was the
+ * exact board/scheduler disagreement this set closes.
+ */
+const WAITING = new Set(['waiting']);
 
 /**
  * @param {{nodes?: Array<{task_id?: string, depends_on?: string[]}>}} input
@@ -103,6 +108,7 @@ export function classifyTask({ task_id, depends_on = [], status = null, statuses
   }
   if (waiting) return 'waiting';
   // In flight ONLY once its prerequisites are satisfied: a queued task behind a failed prerequisite is blocked, not active.
+  if (typeof status === 'string' && WAITING.has(status)) return 'waiting';
   if (typeof status === 'string' && ACTIVE.has(status)) return 'active';
   return 'ready';
 }

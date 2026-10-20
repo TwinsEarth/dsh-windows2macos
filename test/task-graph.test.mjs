@@ -5,6 +5,14 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { TASK_GRAPH_REFUSAL, buildBoard, buildGraph, classifyTask, topoOrder } from '../src/plugin/task-graph.mjs';
 
+describe('scheduler states (v1.2.7)', () => {
+  it('reads the relay waiting and active states literally', () => {
+    assert.equal(classifyTask({ task_id: 'b', status: 'waiting' }), 'waiting');
+    assert.equal(classifyTask({ task_id: 'c', status: 'active' }), 'active');
+    assert.equal(classifyTask({ task_id: 'd', status: 'done' }), 'done');
+  });
+});
+
 describe('buildGraph', () => {
   it('keeps each task and its dependencies', () => {
     const built = buildGraph({ nodes: [{ task_id: 'a', depends_on: ['b'] }, { task_id: 'b' }] });

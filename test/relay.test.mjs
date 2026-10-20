@@ -4572,3 +4572,151 @@ describe('signature binding (v1.2.6)', () => {
     });
   });
 });
+
+describe('dependency gating and assignment (v1.2.7)', () => {
+  it('does not dispatch a task whose prerequisites are unsettled, then releases it', async () => {
+    await withRelay({}, async (relay) => {
+      const a = await pairDevice(relay, 'm1');
+      const b = await pairDevice(relay, 'm2');
+      const first = await postTask(relay, taskBody());
+      assert.equal(first.status, 200, first.text);
+      const firstId = first.json.task_id;
+      const second = await postTask(relay, { ...taskBody(), depends_on: [firstId] });
+      assert.equal(second.status, 200, second.text);
+      const secondId = second.json.task_id;
+
+      const waiting = await request(`${relay.url}/v1/tasks/${secondId}`, { token: a.token });
+      assert.equal(waiting.status, 200, waiting.text);
+      const waitingStates = Object.values(waiting.json.task.lease_states);
+      assert.ok(waitingStates.length > 0, 'the dependent task records its machines');
+      assert.deepEqual([...new Set(waitingStates)], ['waiting'], 'nothing is offered before the graph allows it');
+      assert.deepEqual(waiting.json.task.waiting_on, [firstId]);
+
+      // settle the prerequisite on BOTH machines, because a task is settled only when no lease is active
+      for (const [device, machineId] of [[a, 'm1'], [b, 'm2']]) {
+        const env = envelopeForTask(firstId, machineId, { index: 0 });
+        const posted = await request(`${relay.url}/v1/result`, { method: 'POST', token: device.token, body: env });
+        assert.equal(posted.status, 200, posted.text);
+      }
+
+      const released = await request(`${relay.url}/v1/tasks/${secondId}`, { token: a.token });
+      const releasedStates = [...new Set(Object.values(released.json.task.lease_states))];
+      assert.equal(releasedStates.includes('waiting'), false, 'the dependent task was released');
+      assert.ok(releasedStates.some((state) => state === 'queued' || state === 'offered'), 'released leases are dispatchable');
+    });
+  });
+
+  it('narrows dispatch to the assignee and refuses an unknown one by name', async () => {
+    await withRelay({}, async (relay) => {
+      const a = await pairDevice(relay, 'm1');
+      await pairDevice(relay, 'm2');
+      const assigned = await postTask(relay, { ...taskBody(), assignee: 'm1' });
+      assert.equal(assigned.status, 200, assigned.text);
+      const view = await request(`${relay.url}/v1/tasks/${assigned.json.task_id}`, { token: a.token });
+      assert.deepEqual(Object.keys(view.json.task.lease_states), ['m1'], 'only the assignee holds a lease');
+
+      const unknown = await postTask(relay, { ...taskBody(), assignee: 'no-such-machine' });
+      assert.equal(unknown.status, 400);
+      assert.match(unknown.text, /assignee is not a known device/);
+    });
+  });
+});
+describe('dependency release on expiry (v1.2.7)', () => {
+  it('frees dependents when the prerequisite settles by expiry rather than by a result', async () => {
+    await withRelay({}, async (relay) => {
+      const a = await pairDevice(relay, 'm1');
+      await pairDevice(relay, 'm2');
+      const first = await postTask(relay, taskBody());
+      const second = await postTask(relay, { ...taskBody(), depends_on: [first.json.task_id] });
+      const waiting = await request(`${relay.url}/v1/tasks/${second.json.task_id}`, { token: a.token });
+      assert.deepEqual([...new Set(Object.values(waiting.json.task.lease_states))], ['waiting']);
+
+      // settle the prerequisite WITHOUT results: its leases expire, which is a settlement too
+      const prerequisite = relay.state.getTask(first.json.task_id);
+      for (const lease of prerequisite.leases.values()) lease.lease_until_ms = 0;
+      relay.state.sweepExpired();
+
+      const released = await request(`${relay.url}/v1/tasks/${second.json.task_id}`, { token: a.token });
+      const states = [...new Set(Object.values(released.json.task.lease_states))];
+      assert.equal(states.includes('waiting'), false, 'an expired prerequisite must still release its dependents');
+    });
+  });
+});
+describe('dependency graph survives a restart (v1.2.7)', () => {
+  it('restores depends_on and assignee, and still releases the dependent', async () => {
+    const dir = makeStateDir();
+    try {
+      const first = await startRelay({ stateDir: dir });
+      const a = await pairDevice(first, 'm1');
+      await pairDevice(first, 'm2');
+      const base = await postTask(first, taskBody());
+      const dependent = await postTask(first, { ...taskBody(), depends_on: [base.json.task_id], assignee: 'm1' });
+      const before = await request(`${first.url}/v1/tasks/${dependent.json.task_id}`, { token: a.token });
+      assert.deepEqual(before.json.task.depends_on, [base.json.task_id]);
+      await first.close();
+
+      const second = await startRelay({ stateDir: dir });
+      try {
+        const a2 = await pairDevice(second, 'm1');
+        const restored = await request(`${second.url}/v1/tasks/${dependent.json.task_id}`, { token: a2.token });
+        assert.deepEqual(restored.json.task.depends_on, [base.json.task_id], 'the graph edge survived the restart');
+        assert.equal(restored.json.task.assignee, 'm1', 'the assignment survived too');
+        const waiting = [...new Set(Object.values(restored.json.task.lease_states))];
+        assert.deepEqual(waiting, ['waiting']);
+
+        // settle the prerequisite on both machines; the restored dependent must be released
+        const secondDevice = await pairDevice(second, 'm2');
+        for (const [token, machineId] of [[a2.token, 'm1'], [secondDevice.token, 'm2']]) {
+          const env = envelopeForTask(base.json.task_id, machineId, { index: 0 });
+          const posted = await request(`${second.url}/v1/result`, { method: 'POST', token, body: env });
+          assert.equal(posted.status, 200, posted.text);
+        }
+        const released = await request(`${second.url}/v1/tasks/${dependent.json.task_id}`, { token: a2.token });
+        const states = [...new Set(Object.values(released.json.task.lease_states))];
+        assert.equal(states.includes('waiting'), false, 'a revived waiting task is released once its prerequisite settles');
+      } finally { await second.close(); }
+    } finally { removeStateDir(dir); }
+  });
+});
+describe('aggregate publishes dataflow facts (v1.2.7)', () => {
+  it('exposes blob hash, output mode, head and byte count per machine', async () => {
+    await withRelay({}, async (relay) => {
+      const a = await pairDevice(relay, 'm1');
+      const created = await postTask(relay, taskBody());
+      const env = envelopeForTask(created.json.task_id, 'm1', {
+        blob_sha256: 'b'.repeat(64), output_mode: 'blob', stdout_bytes: 70_000, stdout_head: '',
+      });
+      const posted = await request(`${relay.url}/v1/result`, { method: 'POST', token: a.token, body: env });
+      assert.equal(posted.status, 200, posted.text);
+      const view = await request(`${relay.url}/v1/tasks/${created.json.task_id}`, { token: a.token });
+      const machine = view.json.aggregate.machines.find((m) => m.machine_id === 'm1');
+      assert.equal(machine.blob_sha256, 'b'.repeat(64), 'the blob hash is on the aggregate, not hidden in detail');
+      assert.equal(machine.output_mode, 'blob');
+      assert.equal(machine.stdout_bytes, 70_000);
+    });
+  });
+});
+describe('blob frame limit (v1.2.7)', () => {
+  it('accepts a blob larger than the JSON frame cap while JSON routes stay capped', async () => {
+    const dir = makeStateDir();
+    try {
+    await withRelay({ stateDir: dir }, async (relay) => {
+      const a = await pairDevice(relay, 'm1');
+      const { createHash } = await import('node:crypto');
+      const text = 'x'.repeat(100_000);
+      const sha = createHash('sha256').update(Buffer.from(text, 'utf8')).digest('hex');
+
+      const put = await request(`${relay.url}/v1/fleet/blobs/${sha}`, { method: 'PUT', token: a.token, rawBody: text });
+      assert.equal(put.status, 201, put.text);
+      const got = await request(`${relay.url}/v1/fleet/blobs/${sha}`, { token: a.token });
+      assert.equal(got.status, 200);
+      assert.equal(got.text.length, 100_000, 'the blob came back byte-for-byte');
+
+      // the JSON frame cap still applies everywhere else: a 100 KB "result" is refused before routing
+      const huge = await request(`${relay.url}/v1/result`, { method: 'POST', token: a.token, rawBody: text });
+      assert.equal(huge.status, 413);
+      assert.match(huge.text, /FRAME_TOO_LARGE/);
+    });
+    } finally { removeStateDir(dir); }
+  });
+});

@@ -22,6 +22,14 @@ import {
   RabbitState,
   rfc3339,
 } from './state.mjs';
+
+// v1.2.7: the content-addressed blob channel carries ARTIFACTS, so its frame limit cannot be the JSON frame limit.
+//
+// MAX_FRAME_BYTES (64 KiB) is exactly the inline threshold: any blob is larger than an inline result by construction, so with
+// one shared limit the blob channel could never accept a single byte -- a pipeline blob upload from a real relay failed with
+// FRAME_TOO_LARGE while the fake relay in the tests accepted it. The dataflow hard cap stays the agent-side bound; this is the
+// transport bound, and it is still bounded.
+export const BLOB_FRAME_BYTES = 1024 * 1024; // 1 MiB per blob frame
 import { createFleetMessages } from './fleet-messages.mjs';
 import { can as mayAct } from '../util/policy-matrix.mjs';
 import { createFleetMemory } from './fleet-memory.mjs';
@@ -687,7 +695,9 @@ export class RelayServer {
 
     // v0.3.0 §9: read the body ONCE, before routing. An HMAC covers the exact
     // received bytes, so no route may consume the stream first and re-serialise.
-    const rawBody = methodHasBody(method) ? await readRawBody(req, this.frameLimitBytes) : null;
+    /** v1.2.7: only the blob channel gets the larger frame cap; every JSON route keeps the 64 KiB frame limit. */
+    const blobFrameLimit = method === 'PUT' && path.startsWith('/v1/fleet/blobs/') ? BLOB_FRAME_BYTES : this.frameLimitBytes;
+    const rawBody = methodHasBody(method) ? await readRawBody(req, blobFrameLimit) : null;
     const takeJson = () => parseJsonBody(rawBody);
 
     /* ---- public endpoints ---- */
@@ -1145,6 +1155,7 @@ export class RelayServer {
         text: body.text,
         mentions: body.mentions,
         enc: body.enc,
+        reply_state: body.reply_state,
         idempotency_key: body.idempotency_key,
       });
       if (posted.ok !== true) {

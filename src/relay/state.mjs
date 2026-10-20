@@ -734,6 +734,9 @@ export class RabbitState {
           created_at_ms: Number.isFinite(createdAt) ? createdAt : this.nowMs(),
           command_hash: t.command_hash ?? null,
           attempt: t.attempt ?? 1,
+          // v1.2.7: a revived task keeps its graph edges and assignment, or the scheduler silently becomes a different scheduler.
+          depends_on: Array.isArray(t.depends_on) ? t.depends_on : [],
+          assignee: typeof t.assignee === 'string' && t.assignee !== '' ? t.assignee : null,
           leases: new Map(),
           cancelled: false,
           cancel_reason: null,
@@ -1917,6 +1920,31 @@ export class RabbitState {
     if (typeof dedupeKeyBase !== 'string' || dedupeKeyBase.length !== 64) {
       throw new ProtocolError('INTERNAL', 'failed to compute dedupe_key');
     }
+    /**
+     * v1.2.7: a dependency that is not settled means this task is NOT dispatched yet. Its leases are recorded as `waiting`,
+     * which the sweeper ignores and redelivery skips, and `_releaseDependents` moves them to offers when the graph allows it.
+     */
+    const dependencyStates = (task.depends_on ?? []).map((depId) => {
+      const dep = this.tasks.get(depId);
+      if (dep === undefined) return 'unknown';
+      if (dep.cancelled === true) return 'cancelled';
+      return this._taskSettled(dep) === true ? 'completed' : 'waiting';
+    });
+    const graphBlocked = dependencyStates.some((state) => state === 'cancelled' || state === 'unknown');
+    const graphReady = graphBlocked !== true && dependencyStates.every((state) => state === 'completed');
+    const waitingOn = graphReady === true ? [] : (task.depends_on ?? []);
+    /**
+     * v1.2.7: an assignee is a restriction, not a label. Only that machine gets a lease; another machine cannot accidentally
+     * take work that was meant for one host. An unknown assignee is refused by name rather than producing a task nobody holds.
+     */
+    if (task.assignee !== null && !this.devices.has(task.assignee)) {
+      throw new ProtocolError('BAD_REQUEST', 'assignee is not a known device on this relay', { assignee: task.assignee });
+    }
+    if (task.assignee !== null) {
+      const narrowed = targets.filter((device) => device.machine_id === task.assignee);
+      targets.length = 0;
+      targets.push(...narrowed);
+    }
     let lastSeq = this.seq;
     targets.forEach((device, i) => {
       const index = mode === 'replicate' ? 0 : i % indexTotal;
@@ -1947,6 +1975,12 @@ export class RabbitState {
         // No capability gate and no offer: the machine is not being asked to run anything, so there
         // is nothing to refuse and nothing to hand out. It is recorded so the task can tell it the
         // outcome afterwards.
+        task.leases.set(device.machine_id, lease);
+        return;
+      }
+      if (graphReady !== true) {
+        lease.state = 'waiting';
+        lease.waiting_on = waitingOn;
         task.leases.set(device.machine_id, lease);
         return;
       }
@@ -2002,6 +2036,9 @@ export class RabbitState {
         attempt: task.attempt,
         deadline_ms: task.deadline_ms,
         // v0.4.0: routing metadata, so a restarted relay re-offers with the same facts.
+            // v1.2.7: the dependency graph and assignment belong to the task record, not to a reader's memory of it.
+            depends_on: Array.isArray(task.depends_on) ? task.depends_on : [],
+            assignee: task.assignee ?? null,
         origin_machine_id: task.origin_machine_id ?? null,
         p2p: task.p2p ?? null,
       },
@@ -2211,6 +2248,47 @@ export class RabbitState {
       .map((t) => this.taskSummary(t));
   }
 
+  /** v1.2.7: a task is settled when no lease can still produce a result. Dependencies wait for that, not for a wording. */
+  _taskSettled(task) {
+    for (const lease of task.leases.values()) if (ACTIVE_LEASE_STATES.includes(lease.state)) return false;
+    return true;
+  }
+
+  /**
+   * v1.2.7: release tasks whose prerequisites are all settled.
+   *
+   * Called after a result is stored: a dependency that finished must actually move its dependents from `waiting` to an offer.
+   * Without this the graph would be validated, stored, and then never scheduled -- the exact "validated but not enforced" gap.
+   */
+  _releaseDependents(completedTaskId = null) {
+    const released = [];
+    for (const candidate of this.tasks.values()) {
+      if (!Array.isArray(candidate.depends_on) || candidate.depends_on.length === 0) continue;
+      if (completedTaskId !== null && !candidate.depends_on.includes(completedTaskId)) continue;
+      const waiting = [...candidate.leases.values()].filter((lease) => lease.state === 'waiting');
+      if (waiting.length === 0) continue;
+      let ready = true;
+      for (const depId of candidate.depends_on) {
+        const dep = this.tasks.get(depId);
+        if (dep === undefined) { ready = false; break; }
+        if (dep.cancelled === true) { ready = false; break; }
+        if (this._taskSettled(dep) !== true) { ready = false; break; }
+      }
+      if (ready !== true) continue;
+      for (const lease of waiting) {
+        lease.state = 'queued';
+        lease.claimed_at_ms = this.nowMs();
+        lease.lease_until_ms = this.nowMs() + this.leaseWindowMs();
+        const device = this.devices.get(lease.machine_id);
+        if (device === undefined) continue;
+        this.emitOffer(candidate, lease);
+      }
+      this.emit('notice', { level: 'info', code: 'TASK_READY', message: candidate.task_id + ' is ready: dependencies settled', task_id: candidate.task_id });
+      released.push(candidate.task_id);
+    }
+    return released;
+  }
+
   taskSummary(task) {
     return {
       task_id: task.task_id,
@@ -2222,6 +2300,24 @@ export class RabbitState {
       degraded: task.degraded,
       leases: [...task.leases.values()].map((l) => l.machine_id),
       lease_states: Object.fromEntries([...task.leases.values()].map((l) => [l.machine_id, l.state])),
+      /**
+       * v1.2.7: the state the scheduler is actually in, derived here rather than by each reader.
+       *
+       * Before this, GET /v1/tasks carried no status at all, so a board classified a waiting task as "ready" (its dependencies
+       * map empty) and a released task as "waiting" forever. The board must read the scheduler's own words or it is decoration.
+       */
+      status: (() => {
+        if (task.cancelled === true) return 'cancelled';
+        const leases = [...task.leases.values()];
+        if (leases.some((lease) => lease.state === 'waiting')) return 'waiting';
+        if (leases.some((lease) => ACTIVE_LEASE_STATES.includes(lease.state))) return 'active';
+        const results = [...this.results.values()].filter((record) => record?.envelope?.task_id === task.task_id);
+        if (results.length > 0 && results.every((record) => ['failed', 'crashed', 'refused', 'timeout'].includes(record?.envelope?.status))) return 'failed';
+        return this._taskSettled(task) === true ? 'done' : 'unknown';
+      })(),
+      depends_on: Array.isArray(task.depends_on) ? task.depends_on : [],
+      assignee: task.assignee ?? null,
+      waiting_on: [...task.leases.values()].some((l) => l.state === 'waiting') ? (Array.isArray(task.depends_on) ? task.depends_on : []) : [],
     };
   }
 
@@ -2450,6 +2546,9 @@ export class RabbitState {
       }
       if (changed) task.degraded = 'partial';
     }
+    // v1.2.7: a lease that expires (or a machine that refuses) is a settlement too -- the dependent graph must move.
+    this._releaseDependents();
+
     return expired;
   }
 
@@ -2738,6 +2837,9 @@ export class RabbitState {
     });
 
     // §7: results go into the ledger so the dedupe index survives a restart.
+    // v1.2.7: a settled task may be the prerequisite that frees its dependents.
+    this._releaseDependents(taskId);
+
     this._ledger({ type: 'result.stored', task_id: taskId, machine_id: machineId, result: record });
     if (machineId) {
       const changed = task.leases.get(machineId);

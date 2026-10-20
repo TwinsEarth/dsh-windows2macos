@@ -41,7 +41,8 @@ const SHA256 = /^[0-9a-f]{64}$/;
  * A missing or malformed hash is refused by name -- the reduce step must never run on a partial fleet and call the answer
  * complete.
  *
- * @param {{results?: Array<{machine_id?: string, mode?: string, stdout?: string, blob_sha256?: string}>,
+ * @param {{results?: Array<{machine_id?: string, mode?: string, stdout?: string, blob_sha256?: string, index?: number}>,
+ *          expectedIndexTotal?: number|null,
  *          reducerMachineId?: string}} input
  * @returns {{ok: true, reducerMachineId: string, inputs: Array<{machine_id: string, mode: 'inline'|'blob', stdout?: string, sha256?: string}>} |
  *           {ok: false, code: string, detail: object}}
@@ -51,6 +52,15 @@ export function buildReducePlan(input = {}) {
   if (reducer === null) return { ok: false, code: 'REDUCER_MISSING', detail: {} };
   const results = Array.isArray(input.results) ? input.results : null;
   if (results === null || results.length === 0) return { ok: false, code: 'NO_MAP_RESULTS', detail: {} };
+  /**
+   * v1.2.7: what the task SAID would be produced, not just what arrived.
+   *
+   * Without an expected count the plan can only describe the reports it was handed, so a split run where one shard never
+   * reported produced a plan that looked complete. The count comes from the task (index_total); a missing index is refused
+   * by name before the reduce step can run on a partial fleet.
+   */
+  const expectedTotal = Number.isInteger(input.expectedIndexTotal) && input.expectedIndexTotal > 0 ? input.expectedIndexTotal : null;
+  const seenIndexes = new Set();
 
   const seen = new Set();
   const inputs = [];
@@ -59,6 +69,14 @@ export function buildReducePlan(input = {}) {
     if (machineId === null) return { ok: false, code: 'MAP_MACHINE_MISSING', detail: {} };
     if (seen.has(machineId)) return { ok: false, code: 'MAP_MACHINE_DUPLICATE', detail: { machineId } };
     seen.add(machineId);
+    if (expectedTotal !== null) {
+      const index = Number.isInteger(result?.index) ? result.index : null;
+      if (index === null) return { ok: false, code: 'MAP_INDEX_MISSING', detail: { machineId } };
+      if (index < 0 || index >= expectedTotal) {
+        return { ok: false, code: 'MAP_INDEX_OUT_OF_RANGE', detail: { machineId, index, expectedIndexTotal: expectedTotal } };
+      }
+      seenIndexes.add(index);
+    }
     const mode = result?.mode === 'blob' ? 'blob' : 'inline';
     if (mode === 'blob') {
       const sha = typeof result?.blob_sha256 === 'string' ? result.blob_sha256.toLowerCase() : '';
@@ -67,6 +85,11 @@ export function buildReducePlan(input = {}) {
     } else {
       inputs.push({ machine_id: machineId, mode, stdout: typeof result?.stdout === 'string' ? result.stdout : '' });
     }
+  }
+  if (expectedTotal !== null) {
+    const missing = [];
+    for (let index = 0; index < expectedTotal; index += 1) if (!seenIndexes.has(index)) missing.push(index);
+    if (missing.length > 0) return { ok: false, code: 'MISSING_SHARD', detail: { missing, expectedIndexTotal: expectedTotal } };
   }
   return { ok: true, reducerMachineId: reducer, inputs };
 }

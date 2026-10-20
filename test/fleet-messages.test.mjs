@@ -163,3 +163,27 @@ describe('end-to-end encrypted messages (v1.2.6)', () => {
     assert.equal(listed[1].enc.alg, 'aes-256-gcm');
   });
 });
+
+describe('reply state (v1.2.7)', () => {
+  const store = () => createFleetMessages({ now: (() => { let t = 3_000; return () => (t += 10); })() });
+
+  it('stores answered and refused as reply states', () => {
+    const m = store();
+    const answered = m.post({ session_id: 's1', machine_id: 'a', text: 'yes', reply_state: 'answered' });
+    const refused = m.post({ session_id: 's1', machine_id: 'a', text: 'no', reply_state: 'refused' });
+    assert.equal(answered.message.reply_state, 'answered');
+    assert.equal(refused.message.reply_state, 'refused');
+  });
+
+  it('refuses an unknown reply state instead of guessing', () => {
+    const m = store();
+    assert.equal(m.post({ session_id: 's1', machine_id: 'a', text: 'x', reply_state: 'maybe' }).code, 'BAD_REPLY_STATE');
+    assert.equal(m.post({ session_id: 's1', machine_id: 'a', text: 'x', reply_state: 1 }).code, 'BAD_REPLY_STATE');
+  });
+
+  it('leaves ordinary messages without the field', () => {
+    const m = store();
+    const plain = m.post({ session_id: 's1', machine_id: 'a', text: 'hello' });
+    assert.equal('reply_state' in plain.message, false);
+  });
+});

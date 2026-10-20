@@ -143,6 +143,11 @@ export function createFleetMessages(options = {}) {
       mentions = [...new Set(rawMentions)];
     }
 
+    // v1.2.7: a reply can be an ANSWER or a REFUSAL, and the difference is a state, not a wording. Validated here so the
+    // turn state machine reads the sender's own word instead of guessing from text.
+    const replyState = input?.reply_state === undefined || input?.reply_state === null ? null : input.reply_state;
+    if (replyState !== null && replyState !== 'answered' && replyState !== 'refused') return { ok: false, code: 'BAD_REPLY_STATE' };
+
     const threadId = typeof input?.thread_id === 'string' && input.thread_id.trim() !== ''
       ? input.thread_id.trim().slice(0, 64)
       : null;
@@ -179,6 +184,7 @@ export function createFleetMessages(options = {}) {
       // the cipher it does not have a key for.
       ...(enc === null ? {} : { enc }),
       ...(idempotencyKey === null ? {} : { idempotency_key: idempotencyKey }),
+      ...(replyState === null ? {} : { reply_state: replyState }),
       at_ms: now(),
       bytes,
     };

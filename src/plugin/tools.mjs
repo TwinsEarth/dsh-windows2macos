@@ -3771,6 +3771,15 @@ export async function apply(ctx, config = {}) {
         items: { type: 'string' },
         description: 'Which terminal conditions justify another attempt: expired, failed, partial, timeout. Omit to never retry.',
       },
+      depends_on: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Task ids this task waits for. The relay will not dispatch it until every dependency has settled; then it is offered automatically.',
+      },
+      assignee: {
+        type: 'string',
+        description: 'Machine id that must execute this task. An assignee is a restriction: no other machine is offered the work, and an unknown id is refused by name.',
+      },
     },
     output: jsonOutput,
     async execute(args, exec) {
@@ -4181,6 +4190,11 @@ export async function apply(ctx, config = {}) {
         // v1.2.4: the retry policy travels only when the caller asked for one, so a default dispatch stays byte-identical.
         ...(Number.isInteger(args?.max_attempts) && args.max_attempts > 1 ? { max_attempts: args.max_attempts } : {}),
         ...(Array.isArray(args?.retry_on) && args.retry_on.length > 0 ? { retry_on: args.retry_on } : {}),
+        // v1.2.7: graph edges and assignment travel only when declared, so a default dispatch stays byte-identical.
+        ...(Array.isArray(args?.depends_on) && args.depends_on.filter((id) => typeof id === 'string' && id !== '').length > 0
+          ? { depends_on: args.depends_on.filter((id) => typeof id === 'string' && id !== '') }
+          : {}),
+        ...(typeof args?.assignee === 'string' && args.assignee.trim() !== '' ? { assignee: args.assignee.trim() } : {}),
         created_by: cfg.machineName,
         // Only sent for broadcast; the relay ignores it otherwise, and the validation above already
         // refused the combination, so this cannot silently mean nothing.
@@ -4515,13 +4529,24 @@ export async function apply(ctx, config = {}) {
       const reducerMachineId = typeof args?.reducer_machine_id === 'string' && args.reducer_machine_id.trim() !== ''
         ? args.reducer_machine_id.trim()
         : null;
-      const rawMachines = Array.isArray(aggregate.detail?.machines) ? aggregate.detail.machines : [];
-      const mapResults = rawMachines.map((machine) => {
+      // v1.2.7: the relay publishes machine facts directly on the aggregate; `detail.machines` is a test/report shape that the
+      // real /v1/tasks response does not carry. Reading only the latter made the reduce plan silently unreachable in production.
+      const rawMachines = Array.isArray(aggregate.detail?.machines)
+        ? aggregate.detail.machines
+        : (Array.isArray(aggregate.machines) ? aggregate.machines : []);
+      // v1.2.7: only a machine that actually reported can claim a shard. An expired lease still carries an index, and counting
+      // it as "produced" would make a partial run look complete -- the exact failure the expected-index check exists to prevent.
+      const reportedMachines = rawMachines.filter((machine) => (machine?.envelope ?? machine?.result ?? null) !== null || typeof machine?.blob_sha256 === 'string' || typeof machine?.stdout_head === 'string' || Number.isFinite(machine?.stdout_bytes) || (typeof machine?.status === 'string' && machine.status !== '' && Number.isFinite(machine?.exit_code)));
+      const mapResults = reportedMachines.map((machine) => {
         const envelope = machine?.envelope ?? machine?.result ?? null;
-        const blobSha = typeof envelope?.blob_sha256 === 'string' ? envelope.blob_sha256 : null;
-        const inline = typeof envelope?.stdout_head === 'string' && envelope.stdout_head !== '' ? envelope.stdout_head : null;
+        const blobSha = typeof envelope?.blob_sha256 === 'string' ? envelope.blob_sha256
+          : (typeof machine?.blob_sha256 === 'string' ? machine.blob_sha256 : null);
+        const inline = typeof envelope?.stdout_head === 'string' && envelope.stdout_head !== '' ? envelope.stdout_head
+          : (typeof machine?.stdout_head === 'string' && machine.stdout_head !== '' ? machine.stdout_head : null);
         return {
           machine_id: machine?.machine_id ?? null,
+          // v1.2.7: the shard this result belongs to, so the reduce plan can tell "complete" from "the rest never reported".
+          index: Number.isInteger(machine?.index) ? machine.index : (Number.isInteger(envelope?.index) ? envelope.index : null),
           mode: blobSha === null ? 'inline' : 'blob',
           ...(inline === null ? {} : { stdout: inline }),
           ...(blobSha === null ? {} : { blob_sha256: blobSha }),
@@ -4529,7 +4554,12 @@ export async function apply(ctx, config = {}) {
       });
       const anyBlob = mapResults.some((entry) => entry.mode === 'blob');
       const reduce = anyBlob && reducerMachineId !== null
-        ? buildReducePlan({ results: mapResults, reducerMachineId })
+        ? buildReducePlan({
+            results: mapResults,
+            reducerMachineId,
+            // v1.2.7: the task's own shard count is the completeness contract; absent it, the old "just what arrived" plan stands.
+            expectedIndexTotal: Number.isInteger(body?.task?.index_total) ? body.task.index_total : null,
+          })
         : null;
       const dataflowDegraded = reduce !== null && reduce.ok !== true;
 
@@ -6601,6 +6631,10 @@ export async function apply(ctx, config = {}) {
         type: 'string',
         description: 'For send/ask: replay protection. A retry with the same key returns the first message instead of posting the same sentence twice.',
       },
+      reply_state: {
+        type: 'string',
+        description: 'For send/ask: answer the turn as "answered" or "refused". A refusal is a state the awaiter reads, not a wording it has to guess from.',
+      },
       timeout_ms: { type: 'number', description: 'For await: how long to wait before reporting a timeout (default 60000, capped at 300000). A timeout is a value, not an error.' },
     },
     output: jsonOutput,
@@ -6610,6 +6644,8 @@ export async function apply(ctx, config = {}) {
       const action = typeof args?.action === 'string' ? args.action : 'list';
       const sessionId = typeof args?.session_id === 'string' ? args.session_id.trim() : '';
       if (sessionId === '') throw new W2MError('W2M_CHAT_SESSION', 'W2M_CHAT_SESSION: session_id is required', { hint: 'chat is scoped to a conversation' });
+      // v1.2.7: expire stale turns on every entry, so `asks` reports the truth after downtime.
+      askStore.expireDue();
       if (action === 'asks') {
         // The persisted questions for this conversation, in the states they are in. A read, so it needs no relay.
         return JSON.stringify({ ok: true, action, session_id: sessionId, ...askStore.list({ sessionId }) });
@@ -6655,26 +6691,84 @@ export async function apply(ctx, config = {}) {
       if (typeof args?.reply_to === 'string' && args.reply_to.trim() !== '') addressing.reply_to = args.reply_to.trim();
 
       if (action === 'await') {
-        // Waiting for an ANSWER is a state machine, and a timeout is a value the caller reads rather than an exception
-        // that loses the question. The question stays in the flow, so it can still be answered later.
+        // v1.2.7: waiting is a persisted turn, not a poll loop.
+        //
+        // The question is written to the ask store when it is ASKED; await attaches to that record, so a restart in between
+        // does not lose the question or turn a late answer into silence. The event stream is tried first (the reply arrives
+        // when it is posted, not up to a poll interval later), and polling remains the fallback for a relay or proxy that
+        // cannot stream -- an old relay must not break awaiting.
         const target = typeof args?.reply_to === 'string' ? args.reply_to.trim() : '';
-        if (target === '') throw new W2MError('W2M_CHAT_AWAIT', 'W2M_CHAT_AWAIT: reply_to is required for await', { hint: 'pass the message_id returned by ask' });
+        if (target === '') throw new W2MError('W2M_CHAT_AWAIT', 'W2M_CHAT_AWAIT: reply_to is required for await', { hint: 'pass reply_to: <message_id of the question>' });
         const timeoutMs = Number.isFinite(args?.timeout_ms) ? Math.max(1000, Math.min(args.timeout_ms, 300000)) : 60000;
         const startedAt = Date.now();
+        askStore.expireDue();
+        let turn = askStore.list({ sessionId }).asks.find((ask) => (ask.state === 'open' || ask.state === 'timeout') && ask.message_id === target) ?? null;
+        if (turn === null) {
+          const opened = askStore.openAsk({ sessionId, messageId: target, timeoutMs });
+          turn = opened.ok === true ? opened.ask : null;
+        }
+        const ownMachineId = cfg.machineId ?? null;
+        const findReply = async () => {
+          const listed = await request({ rabbitUrl, token, signal: exec?.signal, method: 'GET', pathname: '/v1/fleet/messages', query: { session_id: sessionId, limit: 200 } });
+          const rows = Array.isArray(listed?.json?.messages) ? listed.json.messages : [];
+          return rows.find((message) => message.reply_to === target && message.machine_id !== ownMachineId) ?? null;
+        };
+        const finish = (replyMessage, via) => {
+          const verdict = replyMessage?.reply_state === 'refused' ? 'refused' : 'answered';
+          if (turn !== null) askStore.settle(turn.ask_id, verdict, { messageId: replyMessage?.message_id ?? null });
+          const recorded = turn === null ? null : (askStore.list({ sessionId }).asks.find((ask) => ask.ask_id === turn.ask_id) ?? null);
+          return JSON.stringify({ ok: true, action, state: verdict, via, reply_to: target, reply: replyMessage, replies: replyMessage === null ? [] : [replyMessage], ask: recorded });
+        };
+        // 1) stream first -- and RE-subscribe while the budget remains: a dropped stream is not the end of the wait.
+        let emptyStreams = 0;
+        while (Date.now() - startedAt < timeoutMs) {
+          const remaining = timeoutMs - (Date.now() - startedAt);
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), Math.min(remaining, 30000));
+          let reachable = false;
+          let gotEvent = false;
+          try {
+            const streamUrl = joinUrl(rabbitUrl, '/v1/fleet/messages/stream') + '?session_id=' + encodeURIComponent(sessionId);
+            const response = await fetch(streamUrl, { headers: { authorization: 'Bearer ' + token }, signal: controller.signal });
+            if (response.ok === true && response.body !== null) {
+              reachable = true;
+              const reader = response.body.getReader();
+              const decoder = new TextDecoder();
+              let buffer = '';
+              for (;;) {
+                const { value, done } = await reader.read();
+                if (done === true) break;
+                buffer += decoder.decode(value, { stream: true });
+                const parts = buffer.split('\n\n');
+                buffer = parts.pop() ?? '';
+                for (const part of parts) {
+                  const line = part.split('\n').find((entry) => entry.startsWith('data: '));
+                  if (line === undefined) continue;
+                  gotEvent = true;
+                  const reply = await findReply();
+                  if (reply !== null) return finish(reply, 'stream');
+                }
+              }
+            }
+          } catch (error) {
+            if (error?.name === 'AbortError' && Date.now() - startedAt >= timeoutMs) break;
+          } finally { clearTimeout(timer); }
+          if (reachable !== true) break; // a relay that will not stream at all: polling is the contract
+          emptyStreams = gotEvent === true ? 0 : emptyStreams + 1;
+          if (emptyStreams >= 2) break; // two streams that end immediately will not deliver this reply
+          await new Promise((resolve) => { setTimeout(resolve, 100); });
+        }
+        // 2) polling fallback
         for (;;) {
           throwIfAborted(exec?.signal);
-          const reply = await request({ rabbitUrl, token, signal: exec?.signal, method: 'GET', pathname: '/v1/fleet/messages', query: { session_id: sessionId, reply_to: target, limit: '10' } });
-          const found = Array.isArray(reply?.json?.messages) ? reply.json.messages : [];
-          if (found.length > 0) {
-            for (const open of askStore.list({ sessionId }).asks) {
-              if (open.state === 'open' && open.message_id === target) askStore.settle(open.ask_id, 'answered', { messageId: found[0]?.message_id ?? null });
-            }
-            return JSON.stringify({ ok: true, action, state: 'answered', reply_to: target, replies: found });
-          }
+          const reply = await findReply();
+          if (reply !== null) return finish(reply, 'poll');
           if (Date.now() - startedAt >= timeoutMs) {
-            return JSON.stringify({ ok: true, action, state: 'timeout', reply_to: target, waited_ms: Date.now() - startedAt, hint: 'the question is still in the flow and can be answered later' });
+            if (turn !== null) askStore.expire(turn.ask_id);
+            const recorded = turn === null ? null : (askStore.list({ sessionId }).asks.find((ask) => ask.ask_id === turn.ask_id) ?? null);
+            return JSON.stringify({ ok: true, action, state: 'timeout', reply_to: target, waited_ms: Date.now() - startedAt, ask: recorded, hint: 'the question stays in the flow and can still be answered later' });
           }
-          await new Promise((resolve) => { setTimeout(resolve, 1500); });
+          await new Promise((resolve) => { setTimeout(resolve, 1000); });
         }
       }
       if (action === 'send' || action === 'ask') {
@@ -6699,6 +6793,7 @@ export async function apply(ctx, config = {}) {
           ...addressing,
           ...(mentions.length === 0 ? {} : { mentions }),
           ...(typeof args?.idempotency_key === 'string' && args.idempotency_key.trim() !== '' ? { idempotency_key: args.idempotency_key.trim() } : { idempotency_key: 'spool-' + Date.now() + '-' + Math.random().toString(36).slice(2) }),
+            ...(typeof args?.reply_state === 'string' && (args.reply_state === 'answered' || args.reply_state === 'refused') ? { reply_state: args.reply_state } : {}),
         };
         let posted = null;
         try {
@@ -6715,9 +6810,23 @@ export async function apply(ctx, config = {}) {
           const code = posted?.json?.error?.code ?? posted?.error?.code ?? 'W2M_CHAT_SEND';
           throw new W2MError('W2M_CHAT_SEND', code + ': the message was refused', { reason_code: code, hint: 'quota, size and non-text each need a different answer' });
         }
+        let ask = null;
+        if (action === 'ask' && posted.json?.message?.message_id !== undefined) {
+          // v1.2.7: the question becomes a turn on disk the moment it is asked, so a later await (in this process or after a
+          // restart) settles the same record instead of opening a second one.
+          const opened = askStore.openAsk({
+            sessionId,
+            messageId: posted.json.message.message_id,
+            threadId: typeof args?.thread_id === 'string' ? args.thread_id : null,
+            to: typeof args?.to === 'string' ? args.to : null,
+            timeoutMs: Number.isFinite(args?.timeout_ms) ? args.timeout_ms : 60000,
+          });
+          if (opened.ok === true) ask = opened.ask;
+        }
         return JSON.stringify({
           ok: true, action, message: posted.json?.message ?? null, message_id: posted.json?.message?.message_id ?? null,
           encrypted: sealed !== null && sealed.ok === true,
+          ...(ask === null ? {} : { ask }),
           ...(posted.json?.deduped === true ? { deduped: true } : {}),
         });
       }
@@ -7069,6 +7178,11 @@ export async function apply(ctx, config = {}) {
           mode: row?.mode ?? null,
           status: row?.status ?? null,
           cancelled: row?.cancelled === true,
+          // v1.2.7: graph facts travel with each row so the board and the scheduler cannot disagree.
+          depends_on: Array.isArray(row?.depends_on) ? row.depends_on : [],
+          assignee: row?.assignee ?? null,
+          waiting_on: Array.isArray(row?.waiting_on) ? row.waiting_on : [],
+          lease_states: row?.lease_states ?? {},
           machines: Array.isArray(row?.leases)
             ? row.leases.map((lease) => lease?.machine_id ?? null).filter((id) => typeof id === "string")
             : [],
