@@ -233,6 +233,7 @@ async function writeChatSpool(stateDir, entries) {
 }
 
 import { buildReducePlan } from '../util/dataflow.mjs';
+import { suggestReduce } from '../util/reduce-suggestion.mjs';
 import { schemaProblems, strayParameterProblems } from './schema-spec.mjs';
 import { listIntents, resolveIntent } from './intents.mjs';
 // v0.7.0: the LAN hint layer. Imported here and used in exactly one place (`w2m_devices`); see the
@@ -4529,6 +4530,8 @@ export async function apply(ctx, config = {}) {
       const reducerMachineId = typeof args?.reducer_machine_id === 'string' && args.reducer_machine_id.trim() !== ''
         ? args.reducer_machine_id.trim()
         : null;
+      // v1.2.9: the task's own shard count is the completeness contract, used by both the plan and the suggestion.
+      const expectedIndexTotal = Number.isInteger(body?.task?.index_total) ? body.task.index_total : null;
       // v1.2.7: the relay publishes machine facts directly on the aggregate; `detail.machines` is a test/report shape that the
       // real /v1/tasks response does not carry. Reading only the latter made the reduce plan silently unreachable in production.
       const rawMachines = Array.isArray(aggregate.detail?.machines)
@@ -4558,7 +4561,7 @@ export async function apply(ctx, config = {}) {
             results: mapResults,
             reducerMachineId,
             // v1.2.7: the task's own shard count is the completeness contract; absent it, the old "just what arrived" plan stands.
-            expectedIndexTotal: Number.isInteger(body?.task?.index_total) ? body.task.index_total : null,
+            expectedIndexTotal,
           })
         : null;
       const dataflowDegraded = reduce !== null && reduce.ok !== true;
@@ -4576,6 +4579,11 @@ export async function apply(ctx, config = {}) {
           ...(badSignature > 0 ? { signature_warning: 'bad_signature' } : {}),
           ...(badSignature === 0 && unsigned > 0 ? { signature_warning: 'unsigned' } : {}),
           ...(reduce === null ? {} : { reduce }),
+          /**
+           * v1.2.9: complete-or-not, the candidate reducers, and the literal next step. This is a SUGGESTION: the tool does not
+           * dispatch the reduce, because choosing a machine to run a command is the caller's decision everywhere else in the fleet.
+           */
+          reduce_suggestion: suggestReduce({ machines: rawMachines, reducerMachineId, expectedIndexTotal }),
           ...(dataflowDegraded ? { dataflow_degraded: true } : {}),
           counts: aggregate.detail?.counts ?? null,
           differences: aggregate.detail?.differences ?? [],

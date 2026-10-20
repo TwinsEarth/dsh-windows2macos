@@ -7,6 +7,39 @@
 
 All notable changes to this project are documented here.
 
+## [1.2.9-beta.1] — 2026-10-21
+
+A beta by policy: **GitHub prerelease only, never npm.** The theme is the data plane and the collaboration plane: the design is
+written down (`docs/DATA-PLANE-COLLABORATION.md`) and this release ships its first slice.
+
+### `reduce_suggestion` on `w2m_wait`
+
+Every terminal wait now answers three questions without acting on them: is the data complete, who could reduce it, and what the
+caller is supposed to do next (`dispatch the reduce yourself; this tool does not run it`). It is a pure function over the machine
+facts the aggregate already publishes:
+
+- **ready** only when every declared shard reported and a reducer was named;
+- **missing indexes** when a shard never reported (an expired lease cannot claim one);
+- **candidates** listing the machines that reported, with the reason;
+- a named reducer that never reported is refused by name (`REDUCER_UNREPORTED`) rather than silently replaced -- changing the
+  machine changes what the reduce runs against;
+- a caller that named no reducer gets `REDUCER_MISSING` and candidates, never an invented choice.
+
+Nothing is stored and nothing is dispatched. Two readers of the same aggregate get the same suggestion, and reading does not
+change relay state.
+
+### The design document states the open question
+
+Caller-dispatched reduce (current direction) versus auto-reduce in the relay. The design leans caller-dispatched, because a relay
+that decides to run a command is the boundary every other decision avoids; a beta that flipped that default would be the wrong
+place to discover it. The document also names the next collaboration slices: conflict-merge UI, council decision trail to shared
+memory, and the board in the composer panel.
+
+### Verified
+
+Gate GREEN twice: 2699 tests / 2685 pass / 0 fail / 14 skip in 131 files. New: `suggestReduce` unit tests (7) covering complete,
+partial-with-missing, no-reducer, unreported-reducer and mixed inline+blob inputs; `w2m_wait` carries the suggestion for every
+aggregate.
 ## [1.2.8-beta.1] — 2026-10-21
 
 A beta, by policy: **not published to npm**. It is a GitHub prerelease, installable by a developer who asks for it.

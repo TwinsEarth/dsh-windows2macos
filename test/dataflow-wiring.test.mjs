@@ -48,7 +48,8 @@ describe('the wait aggregate refuses a partial reduce', () => {
     assert.ok(tools.includes('buildReducePlan({'), 'the wait aggregate must build the reduce plan');
     assert.ok(tools.includes('results: mapResults,'), 'the plan is built from the raw envelopes');
     assert.ok(tools.includes('reducerMachineId,'), 'the caller names the reducer');
-    assert.ok(tools.includes('expectedIndexTotal: Number.isInteger(body?.task?.index_total)'), 'v1.2.7: the task shard count is the completeness contract');
+    assert.ok(tools.includes('const expectedIndexTotal = Number.isInteger(body?.task?.index_total)'), 'v1.2.7: the task shard count is the completeness contract');
+    assert.ok(tools.includes('expectedIndexTotal,'), 'the plan and the suggestion share that count');
     assert.ok(tools.includes('Array.isArray(aggregate.detail?.machines)'), 'the plan reads the raw machine list');
     assert.ok(tools.includes('reducerMachineId'), 'the caller names the reducer');
   });
