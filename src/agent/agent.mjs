@@ -54,6 +54,7 @@ import { CRYPTO_REASON, DEVICE_KEY_FILE, DeviceKey, PeerKeyStore } from './crypt
 import { DEFAULT_P2P_MODE, P2P_DEFAULTS, P2PNode, normalizeP2PMode, normalizeP2PPort } from './p2p-node.mjs';
 import { punchSession, reverseDialSession } from './p2p.mjs';
 import { createSigner } from '../signing.mjs';
+import { planStageOutput } from '../util/dataflow.mjs';
 import { joinUrl, resolveBaseUrl } from './url.mjs';
 
 /** Wire protocol version (§1). */
@@ -2208,6 +2209,42 @@ export function createAgent(options) {
     return result;
   }
 
+  /**
+   * PUT one stage's stdout to the relay's content-addressed blob store (v1.2.4).
+   *
+   * The relay's blob route is device-gated and content-addressed: the name IS the hash, so a body that does not hash to it
+   * would be stored under the wrong name. The caller hashes first and passes that name, which also means the assistant's
+   * envelope can refer to the blob before the upload finishes without inventing an identifier.
+   *
+   * Returns the refusal instead of throwing: a pipeline stage fails as a stage, with BLOB_UPLOAD_FAILED, because that is
+   * the fact a reader needs. `{ status }` is the HTTP status when there was a response, 0 when the call itself failed.
+   *
+   * @param {string} sha256
+   * @param {string} body
+   * @returns {Promise<{ok: boolean, status: number, sha256?: string, code?: string}>}
+   */
+  async function putBlobBytes(sha256, body) {
+    const path = `/v1/fleet/blobs/${sha256}`;
+    // The stage's stdout arrives as a Buffer. Work on BYTES: the name must be the hash of exactly what is sent, and the
+    // signature must cover those same bytes -- decoding and re-encoding would replace invalid UTF-8 and change the hash.
+    const bytes = Buffer.isBuffer(body) ? body : Buffer.from(String(body ?? ''), 'utf8');
+    const headers = { 'content-type': 'application/octet-stream', accept: 'application/json' };
+    if (token()) headers.authorization = `Bearer ${token()}`;
+    Object.assign(headers, signingHeaders('PUT', path, bytes.toString('utf8')));
+    try {
+      const response = await fetchImpl(url(path), { method: 'PUT', headers, body: bytes });
+      if (response.ok) return { ok: true, status: response.status, sha256 };
+      let code = `HTTP_${response.status}`;
+      try {
+        const parsed = JSON.parse(await response.text());
+        if (typeof parsed?.error?.code === 'string') code = parsed.error.code;
+      } catch { /* the code is then the HTTP status, which is still a name */ }
+      return { ok: false, status: response.status, code };
+    } catch (error) {
+      return { ok: false, status: 0, code: error instanceof Error ? 'BLOB_UPLOAD_FAILED' : 'BLOB_UPLOAD_FAILED' };
+    }
+  }
+
   /** @param {string} path @param {object} body @param {number} [retries] */
   async function postJsonWithRetry(path, body, retries = resultRetries) {
     let lastError = null;
@@ -2520,6 +2557,7 @@ export function createAgent(options) {
       anchorsBefore,
       anchorsAfter,
       execution,
+      blobSha256 = null,
       status,
       refusalReason,
       warnings,
@@ -2591,14 +2629,17 @@ export function createAgent(options) {
       refusal_reason: refusalReason ?? null,
       stdout_sha256: execution ? execution.stdout_sha256 : EMPTY_SHA256,
       stdout_bytes: execution ? execution.stdout_bytes : 0,
+      ...(blobSha256 === null ? {} : { blob_sha256: blobSha256, output_mode: 'blob' }),
       stderr_sha256: execution ? execution.stderr_sha256 : EMPTY_SHA256,
       stderr_bytes: execution ? execution.stderr_bytes : 0,
       warnings,
       // Optional fields (§5.2): present on both machines for the same task, so
       // they stay comparable; head/tail are informational only.
       stdout_normalized_sha256: sha256Hex(normalized),
-      stdout_head: execution?.stdout_head ?? '',
-      stdout_tail: execution?.stdout_tail ?? '',
+      // v1.2.4: when the stage's output became a blob, the envelope names it and does NOT also inline the first/last 4 KiB --
+      // carrying both would make two readers disagree about which one is authoritative.
+      stdout_head: blobSha256 === null ? (execution?.stdout_head ?? '') : '',
+      stdout_tail: blobSha256 === null ? (execution?.stdout_tail ?? '') : '',
       stderr_head: execution?.stderr_head ?? '',
       stderr_tail: execution?.stderr_tail ?? '',
       untracked: anchorsAfter?.untracked ?? anchorsBefore?.untracked ?? [],
@@ -2969,6 +3010,8 @@ export function createAgent(options) {
       const chainStartedAt = Date.now();
 
       const stageReports = [];
+      /** The last stage's blob reference, so the envelope can name it without re-deriving anything. */
+      let lastBlobSha256 = null;
       /** The last stage's execution, used for the envelope's top-level exit code and output hashes. */
       let execution = null;
       let stoppedAt = null;
@@ -3038,6 +3081,60 @@ export function createAgent(options) {
         for (const warning of ran.warnings) if (!warnings.includes(warning)) warnings.push(warning);
 
         const stageStatus = classifyExit(ran);
+        /**
+         * v1.2.4: a stage whose stdout is large leaves it as a blob, and the stage record carries the reference instead of
+         * the text. The upload is authoritative: a blob that did not land FAILS the stage (BLOB_UPLOAD_FAILED) rather than
+         * leaving a reference to nothing, because a reduce over a partial fleet that calls itself complete is worse than a
+         * failed stage.
+         */
+        const stagePlan = planStageOutput({
+          machineId: identity.machine_id,
+          stageIndex: stage.index,
+          stdoutBytes: ran.stdout_bytes,
+        });
+        if (stagePlan.ok !== true) {
+          stageReports.push({
+            index: stage.index,
+            command_argv: stage.command_argv,
+            cwd_rel: stageCwdOutcome.cwd_rel ?? stage.cwd_rel,
+            continue_on_failure: stage.continue_on_failure,
+            status: 'failed',
+            refusal_reason: stagePlan.code,
+            exit_code: ran.exit_code,
+            duration_ms: ran.duration_ms,
+            stdout_sha256: ran.stdout_sha256,
+            stderr_sha256: ran.stderr_sha256,
+          });
+          stoppedAt = stage.index;
+          break;
+        }
+        let blobSha256 = null;
+        if (stagePlan.mode === 'blob') {
+          // The agent caps what it keeps in memory; if that cap was hit the blob holds the same bytes the hash covers, and
+          // the warning says so instead of letting a reader assume the stage printed exactly this much.
+          if (ran.truncated_stdout === true && !warnings.includes('PIPELINE_STDOUT_TRUNCATED')) warnings.push('PIPELINE_STDOUT_TRUNCATED');
+          const uploaded = await putBlobBytes(ran.stdout_sha256, ran.stdout);
+          if (uploaded.ok !== true) {
+            log("warn", offer.task_id + " stage " + stage.index + ": blob upload failed", { code: uploaded.code });
+            stageReports.push({
+              index: stage.index,
+              command_argv: stage.command_argv,
+              cwd_rel: stageCwdOutcome.cwd_rel ?? stage.cwd_rel,
+              continue_on_failure: stage.continue_on_failure,
+              status: 'failed',
+              refusal_reason: 'BLOB_UPLOAD_FAILED',
+              detail: { code: uploaded.code, http_status: uploaded.status },
+              exit_code: ran.exit_code,
+              duration_ms: ran.duration_ms,
+              stdout_sha256: ran.stdout_sha256,
+              stderr_sha256: ran.stderr_sha256,
+            });
+            stoppedAt = stage.index;
+            break;
+          }
+          blobSha256 = uploaded.sha256;
+          lastBlobSha256 = blobSha256;
+        }
         stageReports.push({
           index: stage.index,
           command_argv: stage.command_argv,
@@ -3050,6 +3147,12 @@ export function createAgent(options) {
           duration_ms: ran.duration_ms,
           stdout_sha256: ran.stdout_sha256,
           stderr_sha256: ran.stderr_sha256,
+          ...(blobSha256 === null
+            ? {}
+            : {
+                blob_sha256: blobSha256,
+                output_mode: 'blob',
+              }),
         });
 
         if (ran.timed_out) log('warn', `${offer.task_id} stage ${stage.index} timed out`);
@@ -3081,6 +3184,7 @@ export function createAgent(options) {
         anchorsBefore,
         anchorsAfter,
         execution,
+        blobSha256: lastBlobSha256,
         status,
         refusalReason: null,
         warnings,

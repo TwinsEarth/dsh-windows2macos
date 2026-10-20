@@ -7,6 +7,76 @@
 
 All notable changes to this project are documented here.
 
+## [1.2.4] — 2026-10-20
+
+**Fleet collaboration, part two: cancellation, dependencies, a task board, questions on disk, and output that travels.**
+
+### Cancelling a task over HTTP
+
+`state.cancelTask` has existed since the task ledger gained a cancel flag, but **no route reached it**. `POST /v1/tasks/{id}/cancel`
+now does, with the same operator authorization dispatch requires, and `w2m_cancel` is the tool over it. Cancelling twice is not
+an error: the ledger is the answer.
+
+### Prerequisites and a task board
+
+- `POST /v1/task` accepts `depends_on[]`. Validated at **enqueue** time: unknown prerequisite, self-edge, duplicate edge and
+  cycles are refused by name (`src/relay/task-deps.mjs`), because a graph checked only when a worker picks the task up puts the
+  refusal on a machine that did not create the problem.
+- `depends_on` / `assignee` travel on the task record.
+- `w2m_tasks` (the fifteenth tool) is the board: it classifies every visible task as ready / active / waiting / blocked / done
+  (`src/plugin/task-graph.mjs`). A prerequisite outside the page is treated as **waiting**, never as absent.
+
+### Questions that survive a restart
+
+`src/plugin/ask-store.mjs` keeps open questions in a JSONL file next to the profile (`ask-store.jsonl`, atomic rewrite, cap on
+records). A reply that arrives after the deadline is recorded as `answered_after_timeout` rather than overwriting the timeout or
+being dropped, and a settled question is never reopened. `w2m_chat` gained `action: "asks"`, and `await` settles the stored ask.
+
+### Output that travels
+
+`src/util/dataflow.mjs` (moved from `src/plugin/` — the layer check refused an `agent -> plugin` edge) is now wired:
+
+- a pipeline stage whose stdout exceeds 64 KiB **uploads it as a blob** (`PUT /v1/fleet/blobs/{sha256}`) and the envelope names
+  it (`blob_sha256`, `output_mode: "blob"`) instead of inlining head/tail;
+- a failed upload **fails the stage** by name (`BLOB_UPLOAD_FAILED`) rather than leaving a reference to nothing;
+- `w2m_wait` builds the reduce plan with `buildReducePlan` from the **raw** envelopes and marks the verdict `degraded` when a
+  shard is missing — but only when the caller declared `reducer_machine_id`, so a large pipeline result is not mistaken for a
+  partial reduce.
+
+The end-to-end fixture this release adds (`test/agent.test.mjs`) runs a real agent against a fake relay: it asserts the blob name
+is the hash of the bytes sent and that a refused upload fails the stage. Two real defects surfaced while writing it and are fixed
+here: the stage stdout arrives as a `Buffer` (it was handed to the signature helper as a string), and a 70 KiB test argv exceeds
+Windows' `CreateProcess` limit.
+
+### Retry and hand-off
+
+- `POST /v1/task` accepts `max_attempts` (1..5, default 1) and `retry_on` (`expired|failed|partial|timeout`). Defaults keep
+  at-most-once for every existing caller; a malformed policy is `BAD_REQUEST`, not silently ignored.
+- On lease expiry, `retry_on` containing `expired` performs the hand-off `halt=now` always had: attempt+1 and a re-offer to idle
+  machines (`_takeover`, which already refuses writing tasks to avoid double application).
+
+### mapreduce
+
+`mode: "mapreduce"` is accepted with `reduce_argv` and an optional `reducer_machine_id`. The map half is ordinary dispatch; the
+reduce half is **described, never launched** — the caller runs it as an explicit second task after `w2m_wait` says every shard is
+present, so one task id never describes two executions.
+
+### Relay
+
+The relay was deployed three times during this release (cancel route, retry policy, mapreduce) from hash-verified tarballs, each
+with a state backup, a health check, and a 401 check on the pre-existing routes. **The relay name is separate from the package
+version**: the tarball deployed was the 1.2.3-labelled build carrying this code, and is re-deployed from the released 1.2.4 tarball
+below.
+
+### Verified
+
+Gate GREEN twice, 15 of 15: 2610 tests / 2596 pass / 0 fail / 14 skip. Notable suites: agent 149 (147 pass, 2 skipped),
+relay 169, tools 127, task-deps 13, task-graph 11, ask-store 8, turn 5, dataflow 7, dataflow-wiring 7.
+
+### Not verified
+
+A two-machine run of cancel / retry / mapreduce end to end. The code paths are tested against a fake relay and against the real
+relay's HTTP surface, but no test here runs two physical machines exchanging an expired lease.
 ## [1.2.3] — 2026-10-20
 
 **The packed artifact did not mount. This fixes that, and the reason it was not caught here.**

@@ -702,6 +702,24 @@ export class RelayServer {
       return sendJson(res, 200, result);
     }
     /**
+     * v1.2.4: cancellation over HTTP. state.cancelTask has existed since the task ledger gained a cancel flag, but no route
+     * reached it -- the capability was real on paper and unreachable on the wire. Same authorization as dispatch: cancelling
+     * a fleet task is an operator act, not something a device token confers.
+     */
+    const cancelMatch = path.match(/^\/v1\/tasks\/([^/]+)\/cancel$/);
+    if (method === 'POST' && cancelMatch !== null) {
+      this.authorizeTaskDispatch(req);
+      this.enforceSignature(req, { method, signedPath, body: rawBody });
+      const body = takeJson();
+      const cancelled = this.state.cancelTask(decodeURIComponent(cancelMatch[1]), typeof body.reason === 'string' && body.reason !== '' ? body.reason : undefined);
+      return sendJson(res, 200, {
+        protocol_version: PROTOCOL_VERSION,
+        rabbit_time: this.state.nowIso(),
+        ok: true,
+        task: { task_id: cancelled.task_id, cancelled: cancelled.cancelled === true, cancel_reason: cancelled.cancel_reason ?? null },
+      });
+    }
+    /**
      * v0.3.3 `/metrics`: machine-readable fleet state for a monitoring system.
      *
      * Token-free, like `/healthz` and for the same reason: a scraper that needs the operator token

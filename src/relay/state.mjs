@@ -22,6 +22,7 @@ import { deviceFleetFields } from '../chatops/fleet-wiring.mjs';
 import { scopeFleetId } from '../chatops/fleet-wiring.mjs';
 // v0.8.1: the account-derived fleet key, so a machine can join with no pairing code.
 import { planJoin } from '../chatops/fleet-join.mjs';
+import { validateTaskDependencies } from './task-deps.mjs';
 
 export const PROTOCOL_VERSION = 1;
 
@@ -716,6 +717,9 @@ export class RabbitState {
           requirements: t.requirements ?? {},
           compare_policy: t.compare_policy ?? {},
           halt: t.halt ?? 'never',
+      ...(t.mode === 'mapreduce' ? { reduce_argv: Array.isArray(t.reduce_argv) ? t.reduce_argv : null, reducer_machine_id: t.reducer_machine_id ?? null } : {}),
+      max_attempts: Number.isInteger(t.max_attempts) ? t.max_attempts : 1,
+      retry_on: Array.isArray(t.retry_on) ? t.retry_on : [],
           created_by: t.created_by ?? null,
           created_at_ms: Number.isFinite(createdAt) ? createdAt : this.nowMs(),
           command_hash: t.command_hash ?? null,
@@ -1517,12 +1521,20 @@ export class RabbitState {
     // v0.4.0: refused BEFORE the task literal is built and before any offer is emitted, so a bad
     // value cannot leave a half-created task behind. `POST /v1/task` is all-or-nothing.
     const routing = RabbitState.validateTaskRouting(input);
+    // v1.2.4: prerequisites are validated where the task is CREATED. A graph that only fails later puts the
+    // refusal on a machine that did not create the problem.
+    const deps = validateTaskDependencies({
+      task_id: typeof input.task_id === 'string' ? input.task_id : null,
+      depends_on: input.depends_on,
+      tasksById: this.tasks,
+    });
+    if (deps.ok !== true) return { status: 'refused', refusal_reason: deps.code, detail: deps.detail ?? {} };
 
     const mode = input.mode ?? 'replicate';
-    if (mode !== 'replicate' && mode !== 'split' && mode !== 'broadcast' && mode !== 'pipeline' && mode !== 'compose') {
+    if (mode !== 'replicate' && mode !== 'split' && mode !== 'broadcast' && mode !== 'pipeline' && mode !== 'compose' && mode !== 'mapreduce') {
       throw new ProtocolError(
         'BAD_REQUEST',
-        'mode must be replicate|split|broadcast|pipeline|compose',
+        'mode must be replicate|split|broadcast|pipeline|compose|mapreduce',
         { mode },
       );
     }
@@ -1591,9 +1603,48 @@ export class RabbitState {
     }
     const indexTotal = Number.isInteger(input.index_total) ? input.index_total : 1;
     if (indexTotal < 1) throw new ProtocolError('BAD_REQUEST', 'index_total must be >= 1');
+    /**
+     * v1.2.4 mapreduce: the map half is ordinary dispatch; the reduce half is described here so the caller can run it as an
+     * explicit second task once w2m_wait has verified every shard is present. Deliberately NOT a cascade: a relay that
+     * launches the reduce itself would decide on a partial fleet, and the operator would see one task id for two executions.
+     */
+    let reduceArgv = null;
+    let reducerMachineId = null;
+    if (mode === 'mapreduce') {
+      if (indexTotal !== 1) {
+        throw new ProtocolError('BAD_REQUEST', 'mode=mapreduce maps the whole input on every machine, so index_total must be 1', { index_total: indexTotal });
+      }
+      const argv = input.reduce_argv;
+      if (!Array.isArray(argv) || argv.length === 0 || argv.some((part) => typeof part !== 'string' || part === '')) {
+        throw new ProtocolError('BAD_REQUEST', 'mode=mapreduce requires reduce_argv as a non-empty string[]', { reduce_argv: argv ?? null });
+      }
+      reduceArgv = [...argv];
+      if (input.reducer_machine_id !== undefined && input.reducer_machine_id !== null && typeof input.reducer_machine_id !== 'string') {
+        throw new ProtocolError('BAD_REQUEST', 'reducer_machine_id must be a machine id string', { reducer_machine_id: input.reducer_machine_id });
+      }
+      reducerMachineId = typeof input.reducer_machine_id === 'string' && input.reducer_machine_id !== '' ? input.reducer_machine_id : null;
+    } else if (input.reduce_argv !== undefined || input.reducer_machine_id !== undefined) {
+      throw new ProtocolError('BAD_REQUEST', 'reduce_argv and reducer_machine_id are only valid with mode=mapreduce', { mode });
+    }
 
     const halt = input.halt ?? 'never';
     if (halt !== 'never' && halt !== 'now') throw new ProtocolError('BAD_REQUEST', 'halt must be never|now', { halt });
+    /**
+     * v1.2.4 retry policy: how many attempts the task may take in total, and which terminal conditions justify
+     * another. Default one attempt and no retry, so every existing caller keeps at-most-once semantics.
+     */
+    const maxAttempts = Number.isInteger(input.max_attempts) ? input.max_attempts : 1;
+    if (maxAttempts < 1 || maxAttempts > 5) {
+      throw new ProtocolError('BAD_REQUEST', 'max_attempts must be an integer 1..5', { max_attempts: input.max_attempts });
+    }
+    const RETRYABLE = ['expired', 'failed', 'partial', 'timeout'];
+    if (input.retry_on !== undefined && !Array.isArray(input.retry_on)) {
+      throw new ProtocolError('BAD_REQUEST', 'retry_on must be an array of expired|failed|partial|timeout', { retry_on: input.retry_on });
+    }
+    const retryOn = Array.isArray(input.retry_on) ? [...new Set(input.retry_on)] : [];
+    if (retryOn.some((reason) => typeof reason !== 'string' || !RETRYABLE.includes(reason))) {
+      throw new ProtocolError('BAD_REQUEST', 'retry_on must list expired|failed|partial|timeout', { retry_on: input.retry_on, retryable: RETRYABLE });
+    }
 
     const taskId = input.task_id ?? this.nextId();
     if (this.tasks.has(taskId)) {
@@ -1659,6 +1710,8 @@ export class RabbitState {
       // machine. Named explicitly so it travels.
       cwd_outside_project: input.cwd_outside_project === true,
       index_total: indexTotal,
+      // v1.2.4: the reduce half travels with the task so a caller (and a revived relay) can read what was intended.
+      ...(mode === 'mapreduce' ? { reduce_argv: reduceArgv, reducer_machine_id: reducerMachineId } : {}),
       timeout_ms: timeoutMs,
       write: input.write === true,
       write_scope: input.write_scope ?? [],
@@ -1673,6 +1726,14 @@ export class RabbitState {
       created_at_ms: now,
       command_hash: commandHash,
       attempt: 1,
+      // v1.2.4: the policy travels with the task so a revived relay can still decide to retry after a restart.
+      max_attempts: maxAttempts,
+      retry_on: retryOn,
+      // v1.2.4: prerequisites and an assignee travel with the task, because a graph the relay validated but did not
+      // store would have to be re-derived later -- and a re-derivation that disagrees with the validation is exactly
+      // the silent-drop failure this field-by-field literal exists to prevent.
+      depends_on: deps.ok === true ? deps.depends_on : [],
+      assignee: typeof input.assignee === 'string' && input.assignee !== '' ? input.assignee : null,
       leases: new Map(),
       cancelled: false,
       cancel_reason: null,
@@ -2309,7 +2370,12 @@ export class RabbitState {
           task_id: task.task_id,
           machine_id: lease.machine_id,
         });
-        if (task.halt === 'now') {
+        // v1.2.4: a caller that named "expired" in retry_on gets the hand-off halt=now always had, as long as it
+        // has attempts left. Without the policy this stays book-keeping only -- the pre-1.2.4 behaviour.
+        const retryExpired = task.halt === 'now'
+          || (Number.isInteger(task.max_attempts) && task.attempt < task.max_attempts
+            && Array.isArray(task.retry_on) && task.retry_on.includes('expired'));
+        if (retryExpired) {
           task.attempt += 1;
           this._takeover(task, lease, nowMs);
         }

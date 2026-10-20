@@ -286,10 +286,10 @@ describe('registration shape', () => {
   it('declares the tools service and registers exactly thirteen tools', async () => {
     assert.deepEqual(plugin.inject, ['tools']);
     const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN });
-    assert.equal(tools.size, 13);
+    assert.equal(tools.size, 15);
     assert.deepEqual(
       [...tools.keys()].sort(),
-      ['w2m_approvals', 'w2m_chat', 'w2m_council', 'w2m_devices', 'w2m_history', 'w2m_intent', 'w2m_memory', 'w2m_report', 'w2m_run', 'w2m_stats', 'w2m_status', 'w2m_update', 'w2m_wait'],
+      ['w2m_approvals', 'w2m_cancel', 'w2m_chat', 'w2m_council', 'w2m_devices', 'w2m_history', 'w2m_intent', 'w2m_memory', 'w2m_report', 'w2m_run', 'w2m_stats', 'w2m_status', 'w2m_tasks', 'w2m_update', 'w2m_wait'],
     );
   });
 
@@ -470,7 +470,6 @@ describe('registration shape', () => {
         allowedCommands: ['node'],
       });
       const run = tools.get('w2m_run');
-
       await run.execute(
         runArgs({ mode: 'pipeline', command_argv: undefined, stages: ['node --test', 'node scripts/pack.mjs'] }),
         {},
@@ -494,6 +493,66 @@ describe('registration shape', () => {
       assert.equal(refused.stage_index, 1, 'the refusal must name which stage was rejected');
       assert.match(refused.message, /stage 1/);
       assert.equal(fetchStub.calls.length, 1, 'nothing may reach the relay once a stage is refused');
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('sends the retry policy only when the caller asked for one (v1.2.4)', async () => {
+    const fetchStub = installFetch([
+      { path: '/v1/task', method: 'POST', body: { task_id: 'T1', seq: 1, leases: [] } },
+    ]);
+    try {
+      const { tools } = await register({
+        rabbitUrl: RABBIT,
+        stateDir: await makeStateDir(PAIRED_DEVICE),
+        operatorToken: OPERATOR_TOKEN,
+        allowedCommands: ['node'],
+      });
+      const run = tools.get('w2m_run');
+      await run.execute(runArgs({ command_argv: ['node', '--test'] }), {});
+      const plain = fetchStub.calls.at(-1).body;
+      assert.equal('max_attempts' in plain, false, 'a default dispatch must not grow a field');
+      assert.equal('retry_on' in plain, false);
+
+      await run.execute(runArgs({ command_argv: ['node', '--test'], max_attempts: 3, retry_on: ['expired', 'partial'] }), {});
+      const asked = fetchStub.calls.at(-1).body;
+      assert.equal(asked.max_attempts, 3);
+      assert.deepEqual(asked.retry_on, ['expired', 'partial']);
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('sends the mapreduce halves only under mode=mapreduce (v1.2.4)', async () => {
+    const fetchStub = installFetch([
+      { path: '/v1/task', method: 'POST', body: { task_id: 'T1', seq: 1, leases: [] } },
+    ]);
+    try {
+      const { tools } = await register({
+        rabbitUrl: RABBIT,
+        stateDir: await makeStateDir(PAIRED_DEVICE),
+        operatorToken: OPERATOR_TOKEN,
+        allowedCommands: ['node'],
+      });
+      const run = tools.get('w2m_run');
+      await run.execute(runArgs({ mode: 'mapreduce', command_argv: ['node', '--test'], reduce_argv: ['node', 'scripts/reduce.mjs'], reducer_machine_id: 'm1' }), {});
+      const sent = fetchStub.calls.at(-1).body;
+      assert.equal(sent.mode, 'mapreduce');
+      assert.deepEqual(sent.reduce_argv, ['node', 'scripts/reduce.mjs']);
+      assert.equal(sent.reducer_machine_id, 'm1');
+
+      await run.execute(runArgs({ command_argv: ['node', '--test'] }), {});
+      assert.equal('reduce_argv' in fetchStub.calls.at(-1).body, false, 'a plain dispatch must not carry reduce fields');
+
+      await assert.rejects(
+        () => run.execute(runArgs({ mode: 'mapreduce', command_argv: ['node', '--test'] }), {}),
+        (error) => error?.code === 'W2M_BAD_REDUCE',
+      );
+      await assert.rejects(
+        () => run.execute(runArgs({ command_argv: ['node', '--test'], reduce_argv: ['node'] }), {}),
+        (error) => error?.code === 'W2M_BAD_REDUCE',
+      );
     } finally {
       fetchStub.restore();
     }
@@ -1961,7 +2020,7 @@ describe('bounds and cancellation', () => {
     // earlier test happened to populate the cache with.
     plugin.resetDefineToolCacheForTests();
     const { tools, warnings } = await register({ rabbitUrl: RABBIT });
-    assert.equal(tools.size, 13, 'the plugin must register all twelve tools on either path');
+    assert.equal(tools.size, 15, 'the plugin must register all fifteen tools on either path');
 
     /**
      * Match the warning this test is about, rather than counting warnings.

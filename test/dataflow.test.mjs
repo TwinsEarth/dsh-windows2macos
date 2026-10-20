@@ -4,7 +4,7 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { HARD_CAP_BYTES, MAX_INLINE_BYTES, buildReducePlan, planStageOutput } from '../src/plugin/dataflow.mjs';
+import { HARD_CAP_BYTES, MAX_INLINE_BYTES, buildReducePlan, planStageOutput } from '../src/util/dataflow.mjs';
 
 describe('how one stage output travels', () => {
   it('keeps a small output inline and sends a large one as a blob', () => {

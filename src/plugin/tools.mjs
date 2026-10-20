@@ -1,4 +1,4 @@
-/**
+﻿/**
  * DSH: Windows2MacO - the DSH Cordis plugin.
  *
  * # What this exposes
@@ -185,6 +185,10 @@ import {
 import { registerChatRoutes } from './fleet-chat-route.mjs';
 import { createFleetCouncil, fleetCouncilThread } from './council-fleet.mjs';
 import { renderMemoryView } from './memory-view.mjs';
+import { buildBoard } from './task-graph.mjs';
+import { createAskStore } from './ask-store.mjs';
+import { deriveTurns } from './turn.mjs';
+import { buildReducePlan } from '../util/dataflow.mjs';
 import { schemaProblems } from './schema-spec.mjs';
 import { listIntents, resolveIntent } from './intents.mjs';
 // v0.7.0: the LAN hint layer. Imported here and used in exactly one place (`w2m_devices`); see the
@@ -3406,6 +3410,8 @@ export async function apply(ctx, config = {}) {
   /** v1.2.2: the machine-wide council. Ballots arrive as chat messages, so this is state + arithmetic; the transport is
    * the fleet chat itself (thread `council-<id>`), which already carries `to` / `thread_id` / `reply_to` since 1.2.1. */
   const fleetCouncil = createFleetCouncil({});
+  /** v1.2.4: open questions survive a restart, because an answer that arrives after one is still an answer. */
+  const askStore = createAskStore({ stateDir: cfg.stateDir ?? null });
 
   // v0.6.1: the two browser routes behind the composer's target control. Additive and optional: a
   // host without `connection.fetch` still gets every tool, and `w2m_status` reports the absence  -   // which is the honest place for it, since a host that has no Connection at all is simply not a web
@@ -3607,7 +3613,7 @@ export async function apply(ctx, config = {}) {
       },
       mode: {
         type: 'string',
-        enum: ['replicate', 'split', 'broadcast', 'pipeline'],
+        enum: ['replicate', 'split', 'broadcast', 'pipeline', 'mapreduce'],
         description:
           'replicate: every machine runs the whole command. split: each machine takes its share by index. ' +
           'broadcast: one machine runs it and every other machine is told the outcome without running anything ' +
@@ -3638,8 +3644,17 @@ export async function apply(ctx, config = {}) {
       },
       index_total: {
         type: 'number',
-        description: 'Number of slices for mode=split. Defaults to 1, which is the only value replicate accepts.',
+        description: 'Number of slices for mode=split. Defaults to 1, which is the only value replicate and mapreduce accept.',
         default: 1,
+      },
+      reduce_argv: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'mode=mapreduce only: the reduce command as an argv array. Required there and refused under every other mode.',
+      },
+      reducer_machine_id: {
+        type: 'string',
+        description: 'mode=mapreduce only: which machine is expected to run the reduce task. Recorded on the task so w2m_wait can build the reduce plan.',
       },
       include_offline: {
         type: 'boolean',
@@ -3699,6 +3714,16 @@ export async function apply(ctx, config = {}) {
         description: 'never: a machine that stops reporting is only recorded. now: other machines may take over its work. Defaults to never.',
         default: 'never',
       },
+      max_attempts: {
+        type: 'number',
+        description: 'Total attempts this task may take, 1..5. Defaults to 1 (at-most-once). Only meaningful with retry_on.',
+        default: 1,
+      },
+      retry_on: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'Which terminal conditions justify another attempt: expired, failed, partial, timeout. Omit to never retry.',
+      },
     },
     output: jsonOutput,
     async execute(args, exec) {
@@ -3732,7 +3757,7 @@ export async function apply(ctx, config = {}) {
       }
 
       const mode = args?.mode ?? 'replicate';
-      if (mode !== 'replicate' && mode !== 'split' && mode !== 'broadcast' && mode !== 'pipeline') {
+      if (mode !== 'replicate' && mode !== 'split' && mode !== 'broadcast' && mode !== 'pipeline' && mode !== 'mapreduce') {
         throw new W2MError(
           'W2M_BAD_MODE',
           `W2M_BAD_MODE: \`mode\` must be \`replicate\`, \`split\`, \`broadcast\` or \`pipeline\`, not \`${mode}\`; ` +
@@ -3781,6 +3806,26 @@ export async function apply(ctx, config = {}) {
             );
           }
         });
+      } else if (mode === 'mapreduce') {
+        /**
+         * The map half is ordinary dispatch; the reduce half is described, never launched. A relay that launched it would be
+         * deciding on a partial fleet and reporting one task id for two executions -- so the caller runs it as a second
+         * task, after w2m_wait says the shards are all there.
+         */
+        if (stagesPayload !== null) {
+          throw new W2MError('W2M_BAD_STAGES', 'W2M_BAD_STAGES: stages is not part of mapreduce; the map command is command_argv and the reduce command is reduce_argv');
+        }
+        if (!Array.isArray(args?.reduce_argv) || args.reduce_argv.length === 0 || args.reduce_argv.some((part) => typeof part !== 'string' || part === '')) {
+          throw new W2MError('W2M_BAD_REDUCE', 'W2M_BAD_REDUCE: mode=mapreduce requires reduce_argv as a non-empty string[]', {
+            hint: 'pass reduce_argv: ["node","scripts/reduce.mjs"]',
+          });
+        }
+        if (Number.isInteger(args?.index_total) && args.index_total !== 1) {
+          throw new W2MError('W2M_BAD_INDEX', 'W2M_BAD_INDEX: mode=mapreduce maps the whole input on each machine, so index_total must be 1');
+        }
+      } else if (args?.reduce_argv !== undefined || args?.reducer_machine_id !== undefined) {
+        // Refused rather than ignored: a caller that names a reduce command under another mode believes it will run.
+        throw new W2MError('W2M_BAD_REDUCE', 'W2M_BAD_REDUCE: reduce_argv and reducer_machine_id are only valid with mode=mapreduce', { mode });
       } else if (stagesPayload !== null) {
         // Refused rather than ignored: the caller described a chain, and running only stage 0 would
         // silently drop every later stage while reporting success.
@@ -4077,6 +4122,18 @@ export async function apply(ctx, config = {}) {
         requirements: { toolchain: {}, platform: [] },
         compare_policy: { strip_ansi: true, normalize_crlf: true, strip_trailing_blank_lines: true, redact: [] },
         halt: args?.halt === 'now' ? 'now' : 'never',
+        // v1.2.4 mapreduce: sent only under that mode, so every other dispatch stays byte-identical.
+        ...(mode === 'mapreduce'
+          ? {
+              reduce_argv: [...args.reduce_argv],
+              ...(typeof args?.reducer_machine_id === 'string' && args.reducer_machine_id !== ''
+                ? { reducer_machine_id: args.reducer_machine_id }
+                : {}),
+            }
+          : {}),
+        // v1.2.4: the retry policy travels only when the caller asked for one, so a default dispatch stays byte-identical.
+        ...(Number.isInteger(args?.max_attempts) && args.max_attempts > 1 ? { max_attempts: args.max_attempts } : {}),
+        ...(Array.isArray(args?.retry_on) && args.retry_on.length > 0 ? { retry_on: args.retry_on } : {}),
         created_by: cfg.machineName,
         // Only sent for broadcast; the relay ignores it otherwise, and the validation above already
         // refused the combination, so this cannot silently mean nothing.
@@ -4276,6 +4333,10 @@ export async function apply(ctx, config = {}) {
         type: 'number',
         description: `Interval between status polls, in milliseconds. Defaults to 750. Raise it to be gentler on the Rabbit; it is capped below by ${MIN_POLL_MS}.`,
         default: 750,
+      reducer_machine_id: {
+        type: 'string',
+        description: 'For a task whose machines produced blobs: which machine runs the reduce step. Without it a blob result is reported as degraded (REDUCER_MISSING) rather than silently treated as complete.',
+      },
       },
     },
     output: jsonOutput,
@@ -4383,15 +4444,41 @@ export async function apply(ctx, config = {}) {
           })
         : [];
 
+      // v1.2.4: a task whose machines produced blobs is only complete when EVERY map result names one and a reducer was
+      // declared. The plan is built from the RAW envelopes: the comparable copy intentionally drops the fields this needs,
+      // and a reduce over a partial fleet that reports itself complete is the failure this guards.
+      const reducerMachineId = typeof args?.reducer_machine_id === 'string' && args.reducer_machine_id.trim() !== ''
+        ? args.reducer_machine_id.trim()
+        : null;
+      const rawMachines = Array.isArray(aggregate.detail?.machines) ? aggregate.detail.machines : [];
+      const mapResults = rawMachines.map((machine) => {
+        const envelope = machine?.envelope ?? machine?.result ?? null;
+        const blobSha = typeof envelope?.blob_sha256 === 'string' ? envelope.blob_sha256 : null;
+        const inline = typeof envelope?.stdout_head === 'string' && envelope.stdout_head !== '' ? envelope.stdout_head : null;
+        return {
+          machine_id: machine?.machine_id ?? null,
+          mode: blobSha === null ? 'inline' : 'blob',
+          ...(inline === null ? {} : { stdout: inline }),
+          ...(blobSha === null ? {} : { blob_sha256: blobSha }),
+        };
+      });
+      const anyBlob = mapResults.some((entry) => entry.mode === 'blob');
+      const reduce = anyBlob && reducerMachineId !== null
+        ? buildReducePlan({ results: mapResults, reducerMachineId })
+        : null;
+      const dataflowDegraded = reduce !== null && reduce.ok !== true;
+
       return JSON.stringify(
         {
           ok: true,
           complete: true,
           task_id: taskId,
-          state: aggregate.state,
+          state: dataflowDegraded ? 'degraded' : aggregate.state,
           state_known: aggregate.known,
           states: aggregate.states,
           machines,
+          ...(reduce === null ? {} : { reduce }),
+          ...(dataflowDegraded ? { dataflow_degraded: true } : {}),
           counts: aggregate.detail?.counts ?? null,
           differences: aggregate.detail?.differences ?? [],
           notes: aggregate.detail?.notes ?? [],
@@ -6426,7 +6513,7 @@ export async function apply(ctx, config = {}) {
     parameters: {
       action: {
         type: 'string',
-        enum: ['send', 'list', 'ask', 'await'],
+        enum: ['send', 'list', 'ask', 'await', 'asks'],
         description: 'send posts text; ask posts a question and returns its message id; await waits for a reply to it; list reads the flow (default).',
         default: 'list',
       },
@@ -6446,6 +6533,10 @@ export async function apply(ctx, config = {}) {
       const action = typeof args?.action === 'string' ? args.action : 'list';
       const sessionId = typeof args?.session_id === 'string' ? args.session_id.trim() : '';
       if (sessionId === '') throw new W2MError('W2M_CHAT_SESSION', 'W2M_CHAT_SESSION: session_id is required', { hint: 'chat is scoped to a conversation' });
+      if (action === 'asks') {
+        // The persisted questions for this conversation, in the states they are in. A read, so it needs no relay.
+        return JSON.stringify({ ok: true, action, session_id: sessionId, ...askStore.list({ sessionId }) });
+      }
       const rabbitUrl = cfg.rabbitUrl ?? null;
       if (rabbitUrl === null) throw new W2MError('W2M_NO_RELAY', 'W2M_NO_RELAY: no relay is configured, so chat cannot be reached', { hint: 'set rabbitUrl in the profile patch' });
       // resolveToken, not readDevice: readDevice returns an empty identity whenever `stateDir` is
@@ -6477,7 +6568,12 @@ export async function apply(ctx, config = {}) {
           throwIfAborted(exec?.signal);
           const reply = await request({ rabbitUrl, token, signal: exec?.signal, method: 'GET', pathname: '/v1/fleet/messages', query: { session_id: sessionId, reply_to: target, limit: '10' } });
           const found = Array.isArray(reply?.json?.messages) ? reply.json.messages : [];
-          if (found.length > 0) return JSON.stringify({ ok: true, action, state: 'answered', reply_to: target, replies: found });
+          if (found.length > 0) {
+            for (const open of askStore.list({ sessionId }).asks) {
+              if (open.state === 'open' && open.message_id === target) askStore.settle(open.ask_id, 'answered', { messageId: found[0]?.message_id ?? null });
+            }
+            return JSON.stringify({ ok: true, action, state: 'answered', reply_to: target, replies: found });
+          }
           if (Date.now() - startedAt >= timeoutMs) {
             return JSON.stringify({ ok: true, action, state: 'timeout', reply_to: target, waited_ms: Date.now() - startedAt, hint: 'the question is still in the flow and can be answered later' });
           }
@@ -6499,7 +6595,11 @@ export async function apply(ctx, config = {}) {
       if (Number.isInteger(args?.limit)) query.limit = String(args.limit);
       const listed = await request({ rabbitUrl, token, signal: exec?.signal, method: 'GET', pathname: '/v1/fleet/messages', query });
       if (listed?.ok !== true) throw new W2MError('W2M_CHAT_LIST', 'W2M_CHAT_LIST: the relay refused the read', { hint: 'check the relay and this machine token' });
-      return JSON.stringify({ ok: true, action, session_id: sessionId, messages: listed.json?.messages ?? [], count: listed.json?.count ?? 0, usage: listed.json?.usage ?? null });
+      const messages = listed.json?.messages ?? [];
+      // v1.2.4: the page is annotated with turns derived from the relay's own numbering, so a reader does not have to order
+      // replies by arrival time.
+      const turns = deriveTurns(messages);
+      return JSON.stringify({ ok: true, action, session_id: sessionId, messages, count: messages.length, turns: turns.threads, inferred_turns: turns.inferred_turns, count_was: listed.json?.count ?? 0, usage: listed.json?.usage ?? null });
     },
   }));
 
@@ -6734,6 +6834,111 @@ export async function apply(ctx, config = {}) {
         votes: council.votes,
         arguments: council.arguments,
         decision: council.decision,
+      });
+    },
+  }));
+
+  ctx.tools.register(defineTool({
+    name: 'w2m_cancel',
+    description:
+      'Cancel a fleet task: every active lease on it becomes cancelled, and the task ledger records why. The relay emits ' +
+      'task.cancel, so an agent holding a lease learns from its heartbeat rather than from a second request. Requires the ' +
+      'operator token -- the same credential dispatch requires, because cancelling fleet work is an operator act.',
+    parameters: {
+      task_id: { type: 'string', required: true, description: 'Task id returned by w2m_run.' },
+      reason: { type: 'string', description: 'Why it is being cancelled. Stored on the task and reported in task.cancel events.' },
+    },
+    output: jsonOutput,
+    presentCall: () => ({ card: 'generic', title: 'w2m cancel', kind: 'write', rawInput: {} }),
+    async execute(args, exec) {
+      throwIfAborted(exec?.signal);
+      const base = requireRabbit(cfg);
+      const taskId = typeof args?.task_id === 'string' ? args.task_id.trim() : '';
+      if (taskId === '') throw new W2MError('W2M_BAD_TASK_ID', '`task_id` must be a non-empty string');
+      const token = await resolveToken(cfg);
+      const cancelled = await request({
+        rabbitUrl: base,
+        token,
+        method: 'POST',
+        pathname: '/v1/tasks/' + encodeURIComponent(taskId) + '/cancel',
+        body: typeof args?.reason === 'string' && args.reason.trim() !== '' ? { reason: args.reason.trim() } : {},
+        signal: exec?.signal,
+      });
+      if (cancelled?.ok !== true) {
+        throw new W2MError('W2M_CANCEL_REFUSED', 'W2M_CANCEL_REFUSED: the Rabbit refused the cancel with HTTP ' + String(cancelled?.status ?? 0), {
+          hint: 'the task id must exist and the caller must hold the operator token',
+          http_status: cancelled?.status ?? 0,
+        });
+      }
+      return JSON.stringify({ ok: true, action: 'cancel', task_id: taskId, cancelled: cancelled.json?.task?.cancelled === true, cancel_reason: cancelled.json?.task?.cancel_reason ?? null });
+    },
+  }));
+
+  ctx.tools.register(defineTool({
+    name: 'w2m_tasks',
+    description:
+      'The task board: what the Rabbit is holding, newest first, with each task status and the machines that hold ' +
+      'leases. Read-only, and deliberately narrower than w2m_wait: it answers "what is queued or running right now" ' +
+      'without fetching any result envelope.',
+    parameters: {
+      limit: {
+        type: 'number',
+        description: 'How many rows to return, newest first. Defaults to 20; the relay caps it at 50.',
+        default: 20,
+      },
+      status: {
+        type: 'string',
+        description: 'Only tasks in this state, for example "running" or "queued". Omit for all states.',
+      },
+    },
+    presentCall: () => ({ card: 'generic', title: 'w2m tasks', kind: 'read', rawInput: {} }),
+    output: jsonOutput,
+    async execute(args, exec) {
+      throwIfAborted(exec?.signal);
+      const base = requireRabbit(cfg);
+      const token = await resolveToken(cfg);
+      const requested = typeof args?.limit === "number" && Number.isFinite(args.limit)
+        ? Math.floor(args.limit)
+        : 20;
+      const limit = Math.min(Math.max(requested, 1), 50);
+      const listed = await request({
+        rabbitUrl: base, token, signal: exec?.signal, pathname: `/v1/tasks?limit=${limit}`,
+      });
+      const rows = Array.isArray(listed?.json?.tasks) ? listed.json.tasks : [];
+      const wanted = typeof args?.status === "string" && args.status.trim() !== "" ? args.status.trim() : null;
+      const tasks = rows
+        .filter((row) => wanted === null || row?.status === wanted)
+        .map((row) => ({
+          task_id: row?.task_id ?? null,
+          mode: row?.mode ?? null,
+          status: row?.status ?? null,
+          cancelled: row?.cancelled === true,
+          machines: Array.isArray(row?.leases)
+            ? row.leases.map((lease) => lease?.machine_id ?? null).filter((id) => typeof id === "string")
+            : [],
+        }));
+      // v1.2.4: the board classifies each visible task against the others' states, so "what can start now" is a read rather
+      // than something the caller re-derives. A prerequisite outside this page is treated as waiting, never as absent.
+      const board = buildBoard({ tasks: rows });
+      return JSON.stringify({
+        ok: listed?.ok === true,
+        action: 'list',
+        count: tasks.length,
+        limit,
+        status: wanted,
+        tasks,
+        ...(board.ok === true
+          ? {
+              board: {
+                ready: board.ready,
+                active: board.active,
+                waiting: board.waiting,
+                blocked: board.blocked,
+                done: board.done,
+                order: board.order,
+              },
+            }
+          : { board_refusal: board.code }),
       });
     },
   }));

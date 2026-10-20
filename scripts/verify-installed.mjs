@@ -61,12 +61,12 @@ const expected = [
   'w2m_wait',
   'w2m_report',
   'w2m_status',
-  'w2m_update',
+  'w2m_tasks', 'w2m_update',
   'w2m_history',
   'w2m_stats',
   'w2m_memory',
   'w2m_approvals',
-  'w2m_chat',
+  'w2m_cancel', 'w2m_chat',
   'w2m_intent', 'w2m_council',
 ];
 const ok = registered.length === expected.length && expected.every((e) => names.includes(e));

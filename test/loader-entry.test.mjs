@@ -125,8 +125,9 @@ const TARGET_ROUTE_PATH = '/api/w2m/target';
  */
 const EXPECTED_TOOLS = [
   'w2m_approvals',
-  'w2m_chat',
+  'w2m_cancel', 'w2m_chat',
   'w2m_intent', 'w2m_council',
+  'w2m_tasks',
   'w2m_devices',
   'w2m_history',
   'w2m_memory',

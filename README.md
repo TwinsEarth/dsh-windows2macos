@@ -14,7 +14,7 @@ English | [中文](#中文说明)
 
 ## Install
 
-Five routes in. They all end with **13 tools registered** in your agent. Pick one.
+Five routes in. They all end with **15 tools registered** in your agent. Pick one.
 
 ### 1. DSH plugin (recommended — zero configuration)
 
@@ -136,7 +136,7 @@ hand-maintained host list.
 ### Tools
 
 `w2m_status` · `w2m_devices` · `w2m_run` · `w2m_wait` · `w2m_history` · `w2m_stats` · `w2m_report` ·
-`w2m_memory` · `w2m_approvals` · `w2m_council` · `w2m_chat` · `w2m_update`
+`w2m_memory` · `w2m_approvals` · `w2m_cancel` · `w2m_council` · `w2m_chat` · `w2m_update` `w2m_tasks`
 - `w2m_intent` — map a structured intent (run-tests, node-version, git-status, git-head, fleet-facts, shard-probe) onto an allow-listed command; unknown intents are refused by name, never guessed.
 
 ### Environment a dispatched command receives (1.1.15+)
@@ -202,7 +202,7 @@ Linux, npm + GitHub release + checksums consistent, end-to-end fleet runs on a r
 
 | Gap | State |
 |---|---|
-| Approval **popup** control | the relay enforces the rules and `w2m_approvals` lists and settles requests, but the 10 s countdown is relay data shown in a list, not a dedicated popup |
+| Approval **popup** control | the relay enforces the rules and `w2m_approvals` · `w2m_cancel` lists and settles requests, but the 10 s countdown is relay data shown in a list, not a dedicated popup |
 | Four-machine `W2M_INDEX` run | single-machine behaviour tested; the fleet-wide 1/2/3/4 run has not been executed |
 | Fleet chat / broadcast channel | message store + quota implemented and tested; encryption, sharding, endpoints and the panel are **not built** |
 | P2P on some macOS hosts | `P2P_PUNCH_FAILED: Unknown cipher` observed; the task falls back to the relay path |
@@ -261,7 +261,7 @@ MIT.
 
 ### 安装
 
-五种方式，最终都会在你的 agent 里注册 **13 tools registered**。任选其一。
+五种方式，最终都会在你的 agent 里注册 **15 tools registered**。任选其一。
 
 #### 1. DSH 插件（推荐，零配置）
 
@@ -372,7 +372,7 @@ w2m_wait task_id="..."
 ### 工具
 
 `w2m_status` · `w2m_devices` · `w2m_run` · `w2m_wait` · `w2m_history` · `w2m_stats` · `w2m_report` ·
-`w2m_memory` · `w2m_approvals` · `w2m_council` · `w2m_chat` · `w2m_update`
+`w2m_memory` · `w2m_approvals` · `w2m_cancel` · `w2m_council` · `w2m_chat` · `w2m_update` `w2m_tasks`
 
 ### 被派发命令会收到的环境变量（1.1.15+）
 
@@ -420,7 +420,7 @@ CI 全绿、npm 与 GitHub 发布及校验和一致、在真实的 Linux/Mac/Win
 
 | 缺口 | 状态 |
 |---|---|
-| 审批**弹窗**控件 | relay 强制规则、`w2m_approvals` 可列出并裁决，但 10 秒倒计时是列表里的 relay 数据，不是独立弹窗 |
+| 审批**弹窗**控件 | relay 强制规则、`w2m_approvals` · `w2m_cancel` 可列出并裁决，但 10 秒倒计时是列表里的 relay 数据，不是独立弹窗 |
 | 四台机器的 `W2M_INDEX` 联跑 | 单机行为已测；编队级 1/2/3/4 尚未执行 |
 | 编队聊天 / 广播通道 | 消息存储与配额已实现并测试；加密、分片、端点与面板**尚未构建** |
 | 部分 macOS 主机的 P2P | 观察到 `P2P_PUNCH_FAILED: Unknown cipher`；任务会降级走 relay 路径 |

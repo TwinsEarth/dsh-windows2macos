@@ -1498,6 +1498,7 @@ async function startFakeRabbit({
   heartbeatExtra = null,
   heartbeatIdleStatus = 200,
   resultError = null,
+  blobError = null,
 } = {}) {
   const state = {
     pairs: [],
@@ -1523,6 +1524,7 @@ async function startFakeRabbit({
      * @type {Array<{method: string, path: string, headers: Record<string,string>, rawBody: string, body: object|null}>}
      */
     requests: [],
+    blobs: [],
   };
 
   const server = createServer((request, response) => {
@@ -1615,6 +1617,19 @@ async function startFakeRabbit({
         response.end(
           JSON.stringify({ lease_until: '2026-10-07T12:10:00Z', cancel: false, ...(heartbeatExtra ?? {}) }),
         );
+        return;
+      }
+      // v1.2.4: the content-addressed blob route a large pipeline stage uploads to. Records the sha and the exact body so a
+      // test can verify the name IS the hash of what was sent.
+      if (pathname.startsWith('/v1/fleet/blobs/')) {
+        if (blobError) {
+          response.writeHead(blobError.status ?? 500, { 'content-type': 'application/json' });
+          response.end(JSON.stringify({ error: { code: blobError.code ?? 'BLOB_REFUSED' } }));
+          return;
+        }
+        state.blobs.push({ sha: decodeURIComponent(pathname.slice('/v1/fleet/blobs/'.length)), raw });
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ ok: true, sha256: decodeURIComponent(pathname.slice('/v1/fleet/blobs/'.length)) }));
         return;
       }
       if (pathname === '/v1/result') {
@@ -1749,6 +1764,85 @@ describe('Localside agent end to end', () => {
       const envelope = rabbit.state.results[0];
       assert.equal(envelope.status, 'ok');
       assert.equal(envelope.stdout_sha256, sha256Hex('string-form\n'));
+      assert.equal(verifyEnvelope(envelope), true);
+    } finally {
+      await rabbit.close();
+    }
+  });
+
+  it('uploads a large pipeline stage as a blob and names it in the envelope (v1.2.4)', async () => {
+    const rabbit = await startFakeRabbit();
+    const project = await makeRepo('e2e-dataflow-blob');
+    try {
+      const agent = makeAgent({ rabbit: rabbit.url, project, allowed: [['node', '-e']], name: 'dataflow-blob' });
+      const running = agent.start();
+      const stream = await rabbit.stream();
+      stream.send('ready', { protocol_version: 1, rabbit_time: '2026-10-07T12:00:00Z', machine_id: 'rabbit' });
+      const big = 'x'.repeat(70_000); // > MAX_INLINE_BYTES (64 KiB)
+      // Generated at run time: a 70 KiB argv is rejected by Windows' CreateProcess limit long before the stage
+      // could run, which is a property of the test rather than of the feature.
+      const argv = [NODE, '-e', 'process.stdout.write("x".repeat(70000))'];
+      stream.send('task.offer', {
+        task_id: '01J-E2E-DATAFLOW-BLOB',
+        attempt: 1,
+        mode: 'pipeline',
+        index: 0,
+        index_total: 1,
+        command_argv: argv,
+        stages: [{ command_argv: argv }],
+        cwd_rel: '.',
+        write: false,
+        timeout_ms: 30_000,
+        dedupe_key: 'dk-e2e-dataflow-blob',
+      });
+      await running;
+
+      assert.equal(rabbit.state.blobs.length, 1, 'exactly one blob was uploaded');
+      const uploaded = rabbit.state.blobs[0];
+      const sha = sha256Hex(big);
+      assert.equal(uploaded.sha, sha, 'the blob name is the hash of the stage output');
+      assert.equal(uploaded.raw, big, 'the relay received the exact bytes');
+
+      const envelope = rabbit.state.results[0];
+      assert.equal(envelope.blob_sha256, sha, 'the envelope names the blob');
+      assert.equal(envelope.output_mode, 'blob');
+      assert.equal(envelope.stdout_head, '', 'a blob envelope does not also inline the head');
+      assert.equal(envelope.pipeline.stages[0].blob_sha256, sha, 'the stage record names it too');
+      assert.equal(verifyEnvelope(envelope), true);
+    } finally {
+      await rabbit.close();
+    }
+  });
+
+  it('fails the stage by name when the blob upload is refused (v1.2.4)', async () => {
+    const rabbit = await startFakeRabbit({ blobError: { status: 500, code: 'BLOB_REFUSED' } });
+    const project = await makeRepo('e2e-dataflow-blob-fail');
+    try {
+      const agent = makeAgent({ rabbit: rabbit.url, project, allowed: [['node', '-e']], name: 'dataflow-blob-fail' });
+      const running = agent.start();
+      const stream = await rabbit.stream();
+      stream.send('ready', { protocol_version: 1, rabbit_time: '2026-10-07T12:00:00Z', machine_id: 'rabbit' });
+      const argv = [NODE, '-e', 'process.stdout.write("y".repeat(70000))'];
+      stream.send('task.offer', {
+        task_id: '01J-E2E-DATAFLOW-BLOB-FAIL',
+        attempt: 1,
+        mode: 'pipeline',
+        index: 0,
+        index_total: 1,
+        command_argv: argv,
+        stages: [{ command_argv: argv }],
+        cwd_rel: '.',
+        write: false,
+        timeout_ms: 30_000,
+        dedupe_key: 'dk-e2e-dataflow-blob-fail',
+      });
+      await running;
+
+      const envelope = rabbit.state.results[0];
+      assert.equal(envelope.pipeline.stages[0].status, 'failed');
+      assert.equal(envelope.pipeline.stages[0].refusal_reason, 'BLOB_UPLOAD_FAILED');
+      assert.equal(rabbit.state.blobs.length, 0, 'nothing was stored');
+      assert.equal(envelope.blob_sha256, undefined, 'no reference to a blob that does not exist');
       assert.equal(verifyEnvelope(envelope), true);
     } finally {
       await rabbit.close();

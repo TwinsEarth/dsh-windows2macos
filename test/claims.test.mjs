@@ -359,7 +359,7 @@ describe('registered tool set (measured from lib/tools.js)', () => {
     // `scripts/verify-installed.mjs` is the documented gate for this exact count. If it is edited
     // without this file, that is a real disagreement worth failing on.
     assert.equal(
-      REGISTERED.length, 13,
+      REGISTERED.length, 15,
       `verify-installed.mjs asserts 12 tools; the artifact registers ${REGISTERED.length}`,
     );
   });

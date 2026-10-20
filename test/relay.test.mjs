@@ -1104,6 +1104,29 @@ describe('tasks (§4)', () => {
       assert.equal(second.status, 409);
       assert.equal(second.json.error.code, 'TASK_EXISTS');
     });
+
+  it('cancels a task over HTTP, records the reason, and refuses an unknown id (v1.2.4)', async () => {
+    await withRelay({}, async (relay) => {
+      await pairDevice(relay, 'm1');
+      const taskId = '01JCANCEL00000000000000000';
+      const created = await request(`${relay.url}/v1/task`, { method: 'POST', token: OP, body: taskBody({ task_id: taskId }) });
+      assert.equal(created.status, 200, created.text);
+      const cancelled = await request(`${relay.url}/v1/tasks/${taskId}/cancel`, {
+        method: 'POST',
+        token: OP,
+        body: { reason: 'operator stopped it' },
+      });
+      assert.equal(cancelled.status, 200, cancelled.text);
+      assert.equal(cancelled.json.task.cancelled, true);
+      assert.equal(cancelled.json.task.cancel_reason, 'operator stopped it');
+      // The ledger is the answer a second caller gets too: cancelling twice is not an error.
+      const again = await request(`${relay.url}/v1/tasks/${taskId}/cancel`, { method: 'POST', token: OP, body: {} });
+      assert.equal(again.status, 200);
+      assert.equal(again.json.task.cancelled, true);
+      const missing = await request(`${relay.url}/v1/tasks/nope/cancel`, { method: 'POST', token: OP, body: {} });
+      assert.equal(missing.status, 404);
+    });
+  });
   });
 
   it('rejects malformed task bodies with BAD_REQUEST', async () => {
@@ -1231,6 +1254,83 @@ describe('leases (§4.3)', () => {
     const late = state.heartbeat({ task_id: created.task_id, machine_id: 'a' });
     assert.equal(late.cancel, true, 'the old owner must stop once the index was handed over');
     assert.equal(late.reason, 'LEASE_EXPIRED_TAKEN_OVER');
+  });
+
+  it('retry_on: [expired] hands an expired index over at attempt+1, and stops at max_attempts (v1.2.4)', async () => {
+    const clock = makeClock();
+    const state = new RabbitState({ now: clock.now });
+    state.pair({ pairing_code: state.createPairingCode(), machine_id: 'a' });
+    state.pair({ pairing_code: state.createPairingCode(), machine_id: 'b' });
+    const created = state.createTask(taskBody({ max_attempts: 2, retry_on: ['expired'] }));
+    const task = state.getTask(created.task_id);
+    assert.equal(task.attempt, 1);
+    assert.equal(task.max_attempts, 2);
+    clock.advance(49_999);
+    assert.equal(state.sweepExpired().length, 0);
+    clock.advance(1);
+    assert.equal(state.sweepExpired().length, 1);
+    assert.equal(task.attempt, 2, 'the expired attempt was followed by another');
+    const successor = task.leases.get('b') ?? null;
+    assert.ok(successor !== null, 'an idle machine was handed the index');
+    assert.equal(successor.state, 'offered');
+    assert.equal(successor.attempt, 2, 'the successor runs as the next attempt');
+    // The budget is now spent: a second expiry is book-keeping only.
+    clock.advance(60_000);
+    state.sweepExpired();
+    assert.equal(task.attempt, 2, 'no third attempt beyond max_attempts');
+  });
+
+  it('without retry_on an expired lease is book-keeping only (v1.2.4 default)', async () => {
+    const clock = makeClock();
+    const state = new RabbitState({ now: clock.now });
+    state.pair({ pairing_code: state.createPairingCode(), machine_id: 'a' });
+    state.pair({ pairing_code: state.createPairingCode(), machine_id: 'b' });
+    const created = state.createTask(taskBody());
+    const task = state.getTask(created.task_id);
+    clock.advance(60_000);
+    state.sweepExpired();
+    assert.equal(task.attempt, 1, 'the default policy does not retry');
+    assert.equal(task.degraded, 'partial');
+  });
+
+  it('refuses a retry policy it cannot honour (v1.2.4)', async () => {
+    const clock = makeClock();
+    const state = new RabbitState({ now: clock.now });
+    state.pair({ pairing_code: state.createPairingCode(), machine_id: 'a' });
+    for (const bad of [{ max_attempts: 0 }, { max_attempts: 6 }, { retry_on: ["someday"] }, { retry_on: "expired" }]) {
+      assert.throws(() => state.createTask(taskBody(bad)), (error) => error?.code === 'BAD_REQUEST', JSON.stringify(bad));
+    }
+  });
+
+  it('accepts mode=mapreduce with a reduce command, and keeps it on the task (v1.2.4)', async () => {
+    const clock = makeClock();
+    const state = new RabbitState({ now: clock.now });
+    state.pair({ pairing_code: state.createPairingCode(), machine_id: 'a' });
+    const created = state.createTask(taskBody({
+      mode: 'mapreduce',
+      reduce_argv: ['node', 'scripts/reduce.mjs'],
+      reducer_machine_id: 'a',
+    }));
+    const task = state.getTask(created.task_id);
+    assert.equal(task.mode, 'mapreduce');
+    assert.deepEqual(task.reduce_argv, ['node', 'scripts/reduce.mjs']);
+    assert.equal(task.reducer_machine_id, 'a');
+    // The map half still fans out: the paired machine holds a lease for it.
+    assert.equal(task.leases.has('a'), true);
+  });
+
+  it('refuses a malformed mapreduce task (v1.2.4)', async () => {
+    const clock = makeClock();
+    const state = new RabbitState({ now: clock.now });
+    state.pair({ pairing_code: state.createPairingCode(), machine_id: 'a' });
+    for (const bad of [
+      { mode: 'mapreduce' },
+      { mode: 'mapreduce', reduce_argv: [] },
+      { mode: 'mapreduce', reduce_argv: ['node'], index_total: 2 },
+      { mode: 'replicate', reduce_argv: ['node'] },
+    ]) {
+      assert.throws(() => state.createTask(taskBody(bad)), (error) => error?.code === 'BAD_REQUEST', JSON.stringify(bad));
+    }
   });
 
   it('cancelTask makes the next heartbeat return cancel:true', async () => {

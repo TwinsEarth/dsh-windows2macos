@@ -96,22 +96,7 @@ export const ACCEPTED_ORPHANS = Object.freeze([
     why: 'parses a `node --test` summary in both the `#` and `ℹ` forms; written to fix a real misreading and used by suites rather than by the program',
     removedBy: 'a tool that runs a suite and reports it, which is the job `machine-test-packet.mjs` does for exit codes',
   },
-  /**
-   * src/plugin/dataflow.mjs -- written for P2 (map -> blob -> reduce) and not yet wired into `w2m_run`.
-   *
-   * Contract: `planStageOutput` decides inline vs blob, `buildReducePlan` refuses a partial fleet. Its suite is
-   * `test/dataflow.test.mjs` (7 tests). Classified `interface-unrouted` rather than `library` on purpose: this module is
-   * meant to be reached from the pipeline path, so "nothing calls it" is a defect to finish, not a design.
-   *
-   * REMOVAL: wire `planStageOutput` into the `w2m_run` pipeline branch and `buildReducePlan` before the reduce step; the
-   * gate's stale-entry check then forces this entry out, exactly as it did for field-authority.mjs in 0.41.0.
-   */
-  {
-    file: 'src/plugin/dataflow.mjs',
-    reason: REASON.INTERFACE_UNROUTED,
-    why: 'the map -> blob -> reduce planner for P2; tested (7 cases) and not yet called from the pipeline path, which is the defect the classification names',
-    removedBy: 'wiring planStageOutput into the w2m_run pipeline branch and buildReducePlan before the reduce step',
-  },]);
+]);
 
 /** The accepted paths, as a Set, for the checker. */
 export function acceptedPaths() {
