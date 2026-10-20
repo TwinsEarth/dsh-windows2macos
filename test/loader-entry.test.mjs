@@ -478,7 +478,10 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
   it('registers every w2m_* tool the package declares', (t) => {
     if (skipReason !== null) return t.skip(skipReason);
     const registered = report.tools.filter((name) => name.startsWith('w2m_'));
-    assert.deepEqual(registered, EXPECTED_TOOLS, `the live tools service holds: ${report.tools.join(', ')}`);
+    // Order is not part of the claim: "every declared tool is registered" is about membership, and a deepEqual
+    // against a list pinned the registration order of tools.mjs instead, so inserting a tool anywhere but the end
+    // failed the capture for the wrong reason (v1.2.3: w2m_intent landed before w2m_council).
+    assert.deepEqual([...registered].sort(), [...EXPECTED_TOOLS].sort(), 'the live tools service holds: ' + report.tools.join(', '));
   });
 
   it('has the client half composed by the web app’s own clientModules row', (t) => {

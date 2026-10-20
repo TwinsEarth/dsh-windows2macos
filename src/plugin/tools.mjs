@@ -6623,7 +6623,29 @@ export async function apply(ctx, config = {}) {
         }
         if (action === 'fleet-decide') {
           const decided = fleetCouncil.decide({ councilId: id });
-          return JSON.stringify({ ok: decided.ok, action, council_id: id, thread_id: threadId, reason_code: decided.code ?? null, detail: decided.detail ?? null, council: decided.council ?? null });
+          // The decision travels as an append-only memory record: a decision that exists only in one process memory
+          // is a decision nobody can audit later. Writing it is best-effort -- the outcome is returned either way and
+          // `trail` says which happened, rather than implying the record exists when it does not.
+          let trail = 'not-written';
+          if (decided.ok === true && decided.council?.decision != null) {
+            try {
+              const trailUrl = cfg?.rabbitUrl ?? null;
+              const trailToken = trailUrl === null ? null : await resolveToken(cfg);
+              if (trailUrl !== null && typeof trailToken === 'string' && trailToken !== '') {
+                const decision = decided.council.decision;
+                const line = 'council ' + String(id) + ': ' + String(decision.choice) + ' (weight ' + String(decision.weight) + ', '
+                  + String(decided.council.ballots.length) + ' ballot(s))';
+                const appended = await request({
+                  rabbitUrl: trailUrl, token: trailToken, method: 'PUT',
+                  pathname: '/v1/fleet/memory/fleet', body: { records: [line] }, signal: exec?.signal,
+                });
+                trail = appended?.ok === true ? 'appended' : 'refused';
+              }
+            } catch {
+              trail = 'error';
+            }
+          }
+          return JSON.stringify({ ok: decided.ok, action, council_id: id, thread_id: threadId, reason_code: decided.code ?? null, detail: decided.detail ?? null, trail, council: decided.council ?? null });
         }
         if (action === 'fleet-list') {
           return JSON.stringify({ ok: true, action, ...fleetCouncil.list() });
