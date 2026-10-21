@@ -7,6 +7,25 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.10-beta.15] — 2026-10-22
+
+**M5 first primitive: branch and file locks.** A local module and eight tests; no routes or merge preflight call it yet.
+
+- `src/relay/project-locks.mjs` — one exclusive holder per `(project, branch)` or `(project, path)`, leases with renewal, lazy
+  expiry that frees the target and records `lock.expired`, owner-only force release with a mandatory reason recorded as
+  `lock.force_released`, per-project/per-holder limits (20/10), and a `conflicts()` preflight that answers which live locks cover a
+  branch or a set of paths.
+- Every mutation is returned as an event (`lock.acquired/renewed/released/expired/force_released`) so the project stream can carry
+  it; the module holds no relay state and takes the clock as an injection.
+- Eight tests: acquire/list/release, LOCK_HELD naming the holder, expired re-entry with both events, renew ownership and
+  non-revival, force-release permission and reason, limits, preflight conflicts for branch and paths, and malformed-input refusal.
+
+Registered as an accepted library with its exit named (the lock routes and the merge preflight check).
+
+Not in this slice: review tasks (§3) and notifications (§4), which are the next two M5 primitives.
+
+Verified: project-locks 8/8; gate GREEN twice.
+
 ## [1.3.10-beta.14] — 2026-10-22
 
 **M4 third slice: the `/v1/projects` routes.**

@@ -50,6 +50,12 @@ export const REASON = Object.freeze({
  */
 export const ACCEPTED_ORPHANS = Object.freeze([
   {
+    file: 'src/relay/project-locks.mjs',
+    reason: REASON.LIBRARY,
+    why: 'M5 branch/file locks: exclusive lease, renewal, owner force-release, merge preflight conflicts; the relay routes and merge queue do not call it yet',
+    removedBy: 'the /v1/projects/:id/locks routes and the merge preflight lock check (M5 wiring slice)',
+  },
+  {
     file: 'src/relay/merge-queue.mjs',
     reason: REASON.LIBRARY,
     why: 'M3 merge queue: one queue per project+branch, merge-slot serialisation, strict/replay policy, already_merged and MERGE_CONFLICT; the relay task path does not call it yet',
