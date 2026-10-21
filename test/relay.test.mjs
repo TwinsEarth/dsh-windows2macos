@@ -4738,3 +4738,56 @@ describe('blob frame size (v1.2.8)', () => {
     } finally { removeStateDir(dir); }
   });
 });
+describe('project room routes', () => {
+  it('lists the default project and creates one with a machine member via the operator token', async () => {
+    await withRelay({}, async (relay) => {
+      const device = await pairDevice(relay, 'm-room-1');
+      const listed = await request(relay.url + '/v1/projects', { token: device.token });
+      assert.equal(listed.status, 200, listed.text);
+      assert.ok(listed.json.projects.some((project) => project.project_id === 'default'), 'the implicit default project is listed');
+
+      const created = await request(relay.url + '/v1/projects', {
+        method: 'POST',
+        token: OP,
+        body: { name: 'demo', origin: { kind: 'git', url: 'https://example.invalid/repo.git' }, members: [{ kind: 'machine', id: 'm-room-1', role: 'worker' }] },
+      });
+      assert.equal(created.status, 200, created.text);
+      const projectId = created.json.project.project.project_id;
+      assert.match(projectId, /^prj-/);
+
+      const snapshot = await request(relay.url + '/v1/projects/' + projectId, { token: device.token });
+      assert.equal(snapshot.status, 200, snapshot.text);
+      assert.equal(snapshot.json.project.name, 'demo');
+      assert.equal(snapshot.json.members.length, 2);
+      assert.ok(snapshot.json.last_event_seq >= 2);
+
+      const events = await request(relay.url + '/v1/projects/' + projectId + '/events?since_seq=0', { token: device.token });
+      assert.equal(events.status, 200, events.text);
+      const types = events.json.events.map((event) => event.type);
+      assert.ok(types.includes('project.created'));
+      assert.ok(types.includes('member.added'));
+      assert.equal(events.json.next_seq, events.json.events.at(-1).seq);
+
+      const outsider = await pairDevice(relay, 'm-room-2');
+      const hidden = await request(relay.url + '/v1/projects/' + projectId, { token: outsider.token });
+      assert.equal(hidden.status, 404, 'a non-member sees NOT_FOUND, not the project');
+    });
+  });
+
+  it('requires the operator token to create a project or add a member', async () => {
+    await withRelay({}, async (relay) => {
+      const device = await pairDevice(relay, 'm-room-3');
+      const denied = await request(relay.url + '/v1/projects', { method: 'POST', token: device.token, body: { name: 'nope' } });
+      assert.equal(denied.status, 401);
+      assert.equal(denied.json.error.code, 'OPERATOR_REQUIRED');
+    });
+  });
+
+  it('answers 404 for an unknown project', async () => {
+    await withRelay({}, async (relay) => {
+      const device = await pairDevice(relay, 'm-room-4');
+      const missing = await request(relay.url + '/v1/projects/nope', { token: device.token });
+      assert.equal(missing.status, 404);
+    });
+  });
+});

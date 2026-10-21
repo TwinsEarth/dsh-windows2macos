@@ -811,6 +811,37 @@ export class RelayServer {
       return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ...result });
     }
 
+    /**
+     * v1.3.10-beta.14: project-room writes (M4).
+     *
+     * Above the shared device guard on purpose: an operator token is not a device token, and these change who may act on
+     * shared state, so they take the same credential that dispatches tasks.
+     */
+    if (method === 'POST' && (path === '/v1/projects' || /^\/v1\/projects\/[^/]+\/members$/.test(path))) {
+      const auth = this.authorizeTaskDispatch(req);
+      if (auth.role !== 'operator') throw new ProtocolError('FORBIDDEN_ACTION', 'only the operator may change project membership', { required_role: 'owner' });
+      const body = takeJson();
+      const membersMatch = /^\/v1\/projects\/([^/]+)\/members$/.exec(path);
+      if (membersMatch !== null) {
+        const target = decodeURIComponent(membersMatch[1]);
+        const added = this.state.projects.addMember({ projectId: target, member: { kind: body?.member?.kind, id: body?.member?.id, name: body?.member?.name ?? null }, role: body?.role ?? 'worker' });
+        return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ok: true, member: added.member, snapshot: this.state.projects.snapshot({ projectId: target }) });
+      }
+      const created = this.state.projects.createProject({
+        name: body?.name,
+        origin: body?.origin ?? null,
+        createdBy: { kind: 'operator', id: typeof body?.created_by?.id === 'string' ? body.created_by.id : 'operator', name: typeof body?.created_by?.name === 'string' ? body.created_by.name : null },
+      });
+      const createdId = created.project.project.project_id;
+      if (Array.isArray(body?.members)) {
+        for (const entry of body.members) {
+          this.state.projects.addMember({ projectId: createdId, member: { kind: entry?.kind, id: entry?.id, name: entry?.name ?? null }, role: entry?.role ?? 'worker' });
+        }
+      }
+      return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ok: true, project: this.state.projects.snapshot({ projectId: createdId }) });
+    }
+
+
     /* ---- everything below requires `Authorization: Bearer <device_token>` ---- */
     const token = bearerToken(req);
     const device = token ? this.state.authenticate(token) : null;
@@ -818,6 +849,46 @@ export class RelayServer {
       throw new ProtocolError('UNAUTHORIZED', 'missing or invalid device_token', {});
     }
     this.state.touchDevice(device.machine_id);
+    /**
+     * v1.3.10-beta.14: project-room reads (M4). Below the device guard, so the device is already authenticated.
+     *
+     * A machine sees the default project and the projects it is a member of; a project it is not a member of answers
+     * NOT_FOUND, so a project existence is not leaked. The snapshot carries last_event_seq, and the events route returns
+     * the slice after since_seq, which is what lets a client resume after a disconnect.
+     */
+    if (method === 'GET' && (path === '/v1/projects' || path.startsWith('/v1/projects/'))) {
+      const match = /^\/v1\/projects(?:\/([^/]+))?(?:\/(events|members))?$/.exec(path);
+      if (match === null) throw new ProtocolError('NOT_FOUND', 'unknown route', { path });
+      const projectId = match[1] === undefined ? null : decodeURIComponent(match[1]);
+      const sub = match[2] ?? null;
+      const readSnapshot = (id) => {
+        let snapshot;
+        try {
+          snapshot = this.state.projectSnapshot(id);
+        } catch (error) {
+          if (error?.code === 'BAD_REQUEST' || error?.code === 'PROJECT_NOT_FOUND') throw new ProtocolError('NOT_FOUND', 'unknown project', { project_id: id });
+          throw error;
+        }
+        if (snapshot.project.project_id === this.state.defaultProjectId) return snapshot;
+        const member = this.state.projects.memberOf({ projectId: id, member: { kind: 'machine', id: device.machine_id } });
+        if (member === null) throw new ProtocolError('NOT_FOUND', 'unknown project', { project_id: id });
+        return snapshot;
+      };
+      if (projectId === null) {
+        const mine = this.state.projects.listProjects({ member: { kind: 'machine', id: device.machine_id } }).projects;
+        if (!mine.some((project) => project.project_id === this.state.defaultProjectId)) mine.unshift({ project_id: this.state.defaultProjectId, name: 'default', origin: null });
+        return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ok: true, projects: mine });
+      }
+      if (sub === null) return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ok: true, ...readSnapshot(projectId) });
+      if (sub === 'events') {
+        readSnapshot(projectId);
+        const raw = url.searchParams.get('since_seq');
+        const sinceSeq = raw !== null && /^[0-9]+$/.test(raw) ? Number(raw) : 0;
+        return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ok: true, ...this.state.projectEvents(projectId, { sinceSeq }) });
+      }
+      throw new ProtocolError('BAD_REQUEST', 'unsupported project route', { method, path });
+    }
+
 
     // v0.3.0 §9: writes are always checked (tolerating unsigned unless required);
     // reads are only checked when the relay was explicitly told to require

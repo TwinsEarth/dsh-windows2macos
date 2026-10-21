@@ -7,6 +7,26 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.10-beta.14] — 2026-10-22
+
+**M4 third slice: the `/v1/projects` routes.**
+
+- `GET /v1/projects` — the default project plus the projects this machine is a member of (device token).
+- `GET /v1/projects/:id` — snapshot with `last_event_seq`; a machine that is not a member gets `NOT_FOUND`, so a project's
+  existence is not leaked. The default project stays readable for any paired machine because it is the implicit home of unnamed
+  tasks.
+- `GET /v1/projects/:id/events?since_seq=N` — the incremental slice and `next_seq`, so a client can resume after a disconnect.
+- `POST /v1/projects` and `POST /v1/projects/:id/members` — operator token only (the dispatch credential), because these change
+  who may act on shared state; the body's initial `members` array is seeded atomically with the project.
+- The routes authenticate per method and therefore sit above the shared device guard: an operator token is not a device token,
+  and the earlier placement made every write answer `UNAUTHORIZED`.
+- Three HTTP tests: list/create/snapshot/events with a member, a non-member seeing `NOT_FOUND`, the operator requirement, and an
+  unknown project answering `NOT_FOUND`.
+
+Still missing: artifact/memory/decision mounts, the panel view, and multi-client e2e.
+
+Verified: relay 184/184 (3 new route tests); gate GREEN twice.
+
 ## [1.3.10-beta.13] — 2026-10-22
 
 **M4 second slice: tasks belong to a project, and the room records it.** Relay state now owns a project room; no HTTP routes yet.
