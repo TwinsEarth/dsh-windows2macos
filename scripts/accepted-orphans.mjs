@@ -50,12 +50,6 @@ export const REASON = Object.freeze({
  */
 export const ACCEPTED_ORPHANS = Object.freeze([
   {
-    file: 'src/relay/blob-sessions.mjs',
-    reason: REASON.LIBRARY,
-    why: 'M6 chunked blob upload: declared sha256, out-of-order idempotent chunks, resume via missing list, verified commit; the blob-session routes and the agent upload path do not call it yet',
-    removedBy: 'the /v1/fleet/blob-sessions routes and the agent chunked upload (M6 wiring slice)',
-  },
-  {
     file: 'src/relay/merge-queue.mjs',
     reason: REASON.LIBRARY,
     why: 'M3 merge queue: one queue per project+branch, merge-slot serialisation, strict/replay policy, already_merged and MERGE_CONFLICT; the relay task path does not call it yet',

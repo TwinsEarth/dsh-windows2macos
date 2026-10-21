@@ -29,6 +29,7 @@ import { createProjectRoom } from './project-room.mjs';
 import { createProjectLocks } from './project-locks.mjs';
 import { createProjectReviews } from './project-reviews.mjs';
 import { createProjectNotifications } from './project-notifications.mjs';
+import { createBlobSessions } from './blob-sessions.mjs';
 
 export const PROTOCOL_VERSION = 1;
 
@@ -528,6 +529,16 @@ export class RabbitState {
     this.locks = createProjectLocks({ now: () => this.nowMs(), onEvent: roomEvent });
     this.reviews = createProjectReviews({ now: () => this.nowMs(), onEvent: roomEvent });
     this.notifications = createProjectNotifications({ now: () => this.nowMs(), onEvent: roomEvent });
+    // v1.3.10-beta.20: a committed chunk session becomes a fleet blob with the same verified bytes. A store failure does not
+    // undo the commit (the session is gone), but it is reported through the route so a caller never believes a blob exists.
+    this.blobSessions = createBlobSessions({
+      now: () => this.nowMs(),
+      onCommit: (blob) => {
+        const device = this.devices.get(blob.machineId);
+        if (device === undefined) return;
+        this.putFleetBlob(device, blob.bytes);
+      },
+    });
     /** v1.2.5: operator-assigned roles, kept apart from device records so a re-pair cannot change authority. */
     this.roles = new Map();        // machine_id -> 'owner'|'worker'|'observer'
     /** v1.2.5: read watermarks per session, per machine. */

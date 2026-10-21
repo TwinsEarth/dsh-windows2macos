@@ -980,6 +980,38 @@ export class RelayServer {
       return sendJson(res, 200, clean);
     }
     /**
+     * v1.3.10-beta.20: chunked blob sessions (M6). A >64 KiB artifact is uploaded in idempotent chunks and only becomes a
+     * blob when the assembled bytes hash to the declared sha256; the session answers "which chunks are missing" so an
+     * interrupted upload resumes instead of restarting.
+     */
+    const blobSessionCreate = method === 'POST' && path === '/v1/fleet/blob-sessions';
+    const blobSessionChunk = /^\/v1\/fleet\/blob-sessions\/([^/]+)\/chunks\/([0-9]+)$/.exec(path);
+    const blobSessionCommit = /^\/v1\/fleet\/blob-sessions\/([^/]+)\/commit$/.exec(path);
+    const blobSessionStatus = /^\/v1\/fleet\/blob-sessions\/([^/]+)$/.exec(path);
+    if (blobSessionCreate || blobSessionChunk !== null || blobSessionCommit !== null || blobSessionStatus !== null) {
+      const wrap = (fn) => { try { return fn(); } catch (error) { if (typeof error?.code === "string") throw new ProtocolError(error.code, error.message, error.detail ?? null); throw error; } };
+      if (blobSessionCreate) {
+        const body = takeJson();
+        const created = wrap(() => this.state.blobSessions.create({ machineId: device.machine_id, sha256: body?.sha256, size: body?.size, chunkBytes: body?.chunk_bytes }));
+        return sendJson(res, 201, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ...created });
+      }
+      if (method === 'PUT' && blobSessionChunk !== null) {
+        const data = rawBody ?? Buffer.alloc(0);
+        const stored = wrap(() => this.state.blobSessions.putChunk({ sessionId: decodeURIComponent(blobSessionChunk[1]), index: Number(blobSessionChunk[2]), data }));
+        return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ...stored });
+      }
+      if (method === 'POST' && blobSessionCommit !== null) {
+        const committed = wrap(() => this.state.blobSessions.commit({ sessionId: decodeURIComponent(blobSessionCommit[1]) }));
+        return sendJson(res, committed.ok === true ? 201 : 409, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ...committed });
+      }
+      if (method === 'GET' && blobSessionStatus !== null) {
+        const status = wrap(() => this.state.blobSessions.status({ sessionId: decodeURIComponent(blobSessionStatus[1]) }));
+        return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ...status });
+      }
+      throw new ProtocolError('BAD_REQUEST', 'a blob session is created with POST, chunks with PUT, committed with POST', {});
+    }
+
+    /**
      * v1.0.7: the content-addressed blob channel (#1).
      *
      * ## Why the relay may carry bytes at all
@@ -1063,6 +1095,23 @@ export class RelayServer {
         if (bytes === null) {
           // Same code and shape for "no such blob" and "not your fleet's" -- deliberately indistinguishable.
           throw new ProtocolError('NOT_FOUND', 'no such blob is readable by this device', { hash });
+        }
+        const rangeParam = url.searchParams.get('range');
+        if (rangeParam !== null) {
+          const match = /^([0-9]+)-([0-9]+)$/.exec(rangeParam);
+          if (match === null) throw new ProtocolError('BAD_REQUEST', 'range must be start-end', { range: rangeParam });
+          const start = Number(match[1]);
+          const end = Math.min(Number(match[2]), bytes.length - 1);
+          if (!(start >= 0 && start <= end && start < bytes.length)) throw new ProtocolError('BAD_REQUEST', 'range is outside the blob', { range: rangeParam, bytes: bytes.length });
+          const slice = bytes.subarray(start, end + 1);
+          res.writeHead(206, {
+            'content-type': 'application/octet-stream',
+            'content-length': slice.length,
+            'content-range': 'bytes ' + start + '-' + end + '/' + bytes.length,
+            'cache-control': 'no-store',
+          });
+          res.end(slice);
+          return true;
         }
         res.writeHead(200, {
           'content-type': 'application/octet-stream',

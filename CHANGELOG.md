@@ -7,6 +7,24 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.10-beta.20] — 2026-10-22
+
+**M6 wiring: chunk session and Range routes.** Large artifacts now travel over HTTP without restarting from zero.
+
+- `POST /v1/fleet/blob-sessions` declares `{sha256, size, chunk_bytes?}`; `PUT …/:sid/chunks/:index` uploads one idempotent chunk
+  (octet-stream); `GET …/:sid` returns received/missing so an interrupted upload resumes; `POST …/:sid/commit` verifies the
+  assembled sha256 and, on success, stores the bytes through the existing content-addressed blob store. A missing chunk answers
+  `409 BLOB_INCOMPLETE` with the indices; a mismatch deletes the session and creates nothing.
+- `GET /v1/fleet/blobs/:sha?range=start-end` answers `206` with `Content-Range`, so a client can fetch a large patch (or a conflict
+  artifact) in slices instead of one allocation.
+- The blob-session module's responses are now uniformly `{ok, session: {...}}`, which the routes and the original tests share.
+
+Two HTTP tests: a chunked upload that commits and is then read whole plus as a Range, and an incomplete commit naming `[0,1]`.
+
+Still to wire for M6: the agent result outbox, and P2P as acceleration-only with its observable success rate.
+
+Verified: blob-sessions 9/9, relay 188/188 (2 new route tests); gate GREEN twice.
+
 ## [1.3.10-beta.19] — 2026-10-22
 
 **M6 first slice: large artifacts can be uploaded in resumable chunks.** A local module and nine tests; the routes and the

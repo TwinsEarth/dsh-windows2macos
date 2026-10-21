@@ -40,8 +40,8 @@ describe('blob sessions', () => {
     sessions.putChunk({ sessionId: session.session_id, index: 0, data: first });
     sessions.putChunk({ sessionId: session.session_id, index: 0, data: first });
     const status = sessions.status({ sessionId: session.session_id });
-    assert.deepEqual(status.received, [0, last]);
-    assert.equal(status.missing.length, session.chunks - 2);
+    assert.deepEqual(status.session.received, [0, last]);
+    assert.equal(status.session.missing.length, session.chunks - 2);
   });
 
   it('commits a fully uploaded blob and calls the store hook with the verified bytes', () => {

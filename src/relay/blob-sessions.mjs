@@ -112,10 +112,10 @@ export function createBlobSessions({ now = () => Date.now(), limits = CHUNK_LIMI
       const expected = isLast ? session.size - session.chunk_bytes * (session.chunks_total - 1) : session.chunk_bytes;
       if (buffer.length !== expected) throw new BlobSessionError('INVALID_CHUNK', 'chunk length does not match the declared size', { index, bytes: buffer.length, expected });
       session.chunks.set(index, buffer);
-      return { ok: true, ...describe(session) };
+      return { ok: true, session: describe(session) };
     },
     status({ sessionId }) {
-      return { ok: true, ...describe(requireSession(sessionId)) };
+      return { ok: true, session: describe(requireSession(sessionId)) };
     },
     /** Commit only if every chunk arrived and the assembled sha256 equals the declared one. */
     commit({ sessionId }) {
@@ -137,7 +137,7 @@ export function createBlobSessions({ now = () => Date.now(), limits = CHUNK_LIMI
       session.state = 'committed';
       session.chunks.clear();
       sessions.delete(sessionId);
-      if (typeof onCommit === 'function') onCommit({ sha256: session.sha256, size: session.size, bytes: assembled });
+      if (typeof onCommit === 'function') onCommit({ machineId: session.machine_id, sha256: session.sha256, size: session.size, bytes: assembled });
       return { ok: true, sha256: session.sha256, bytes: assembled.length };
     },
     size() {

@@ -4847,3 +4847,61 @@ describe('project lock routes', () => {
     });
   });
 });
+
+describe('blob session routes', () => {
+  it('uploads in chunks, commits, and serves a Range read', async () => {
+    const dir = makeStateDir();
+    try {
+      await withRelay({ stateDir: dir }, async (relay) => {
+        const device = await pairDevice(relay, 'm-blob-1');
+        const payload = Buffer.from('hello world, this is a chunked blob payload', 'utf8');
+        const sha = sha256Hex(payload);
+        const created = await request(relay.url + '/v1/fleet/blob-sessions', {
+          method: 'POST', token: device.token, body: { sha256: sha, size: payload.length, chunk_bytes: 1024 },
+        });
+        assert.equal(created.status, 201, created.text);
+        const sessionId = created.json.session.session_id;
+        assert.equal(created.json.session.chunks, 1);
+
+        const put = await request(relay.url + '/v1/fleet/blob-sessions/' + sessionId + '/chunks/0', {
+          method: 'PUT', token: device.token, rawBody: payload.toString('utf8'), headers: { 'content-type': 'application/octet-stream' },
+        });
+        assert.equal(put.status, 200, put.text);
+
+        const status = await request(relay.url + '/v1/fleet/blob-sessions/' + sessionId, { token: device.token });
+        assert.equal(status.status, 200, status.text);
+        assert.deepEqual(status.json.session.missing, []);
+
+        const committed = await request(relay.url + '/v1/fleet/blob-sessions/' + sessionId + '/commit', { method: 'POST', token: device.token, body: {} });
+        assert.equal(committed.status, 201, committed.text);
+        assert.equal(committed.json.sha256, sha);
+
+        const full = await request(relay.url + '/v1/fleet/blobs/' + sha, { token: device.token });
+        assert.equal(full.status, 200, full.text);
+        assert.equal(full.text, payload.toString('utf8'));
+
+        const partial = await request(relay.url + '/v1/fleet/blobs/' + sha + '?range=0-4', { token: device.token });
+        assert.equal(partial.status, 206);
+        assert.equal(partial.text, 'hello');
+        assert.match(partial.headers['content-range'], /^bytes 0-4\//);
+      });
+    } finally { removeStateDir(dir); }
+  });
+
+  it('reports an incomplete commit with the missing chunk indices', async () => {
+    const dir = makeStateDir();
+    try {
+      await withRelay({ stateDir: dir }, async (relay) => {
+        const device = await pairDevice(relay, 'm-blob-2');
+        const payload = Buffer.alloc(2048, 0x61);
+        const sha = sha256Hex(payload);
+        const created = await request(relay.url + '/v1/fleet/blob-sessions', { method: 'POST', token: device.token, body: { sha256: sha, size: payload.length, chunk_bytes: 1024 } });
+        const sessionId = created.json.session.session_id;
+        const committed = await request(relay.url + '/v1/fleet/blob-sessions/' + sessionId + '/commit', { method: 'POST', token: device.token, body: {} });
+        assert.equal(committed.status, 409);
+        assert.equal(committed.json.code, 'BLOB_INCOMPLETE');
+        assert.deepEqual(committed.json.missing, [0, 1]);
+      });
+    } finally { removeStateDir(dir); }
+  });
+});
