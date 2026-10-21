@@ -7,6 +7,28 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.10-beta.19] — 2026-10-22
+
+**M6 first slice: large artifacts can be uploaded in resumable chunks.** A local module and nine tests; the routes and the
+agent upload path are the wiring slice after it.
+
+- `src/relay/blob-sessions.mjs` — a client declares the final `sha256` and `size` once, then uploads chunks in any order
+  (each index idempotent), asks what is missing, and commits. Only a commit whose assembled bytes hash to the declared sha256
+  becomes a blob; a mismatch deletes the session and returns `BLOB_SHA_MISMATCH`, so nothing can be referenced that does not
+  exist.
+- Limits follow the spec: default 1 MiB chunks, `≤8 MiB` per chunk, `≤256` chunks and `≤64 MiB` per blob, two open sessions and
+  512 MiB unfinished bytes per machine, 24h session TTL. A resume after a disconnect is `status()` plus the missing indices,
+  which is exactly the "don't restart a 40 MiB patch" property.
+- Nine tests: plan/status, out-of-order + idempotent chunks, verified commit through the store hook, incomplete commit naming
+  the missing chunks, sha mismatch deleting the session, chunk length/size refusals, quotas, TTL expiry, and blob/chunk ceilings.
+
+Registered as an accepted library with its exit named (the blob-session routes + agent upload).
+
+Still to wire for M6: the HTTP chunk routes and Range downloads, the agent outbox for offline results, and P2P as acceleration
+only.
+
+Verified: blob-sessions 9/9; gate GREEN twice.
+
 ## [1.3.10-beta.18] — 2026-10-22
 
 **M5 wiring, part 1: lock routes and one event stream for the primitives.**
