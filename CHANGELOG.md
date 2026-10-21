@@ -7,6 +7,23 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.10-beta.8] — 2026-10-22
+
+**M3 composed: worktree -> patch -> merge queue, proven together.**
+
+Two integration tests drive the three modules the way a real task pair would: both tasks start from the same base in isolated
+worktrees, each commits its change and produces a patch artifact, and the queue merges them one after the other. The disjoint
+case ends with both files changed and the branch advanced to the second merge; the same-file case ends with a structured
+MERGE_CONFLICT listing the file, the head still on the first approved commit, and the first task's change intact.
+
+No runtime wiring yet: the agent's task handler does not create worktrees, and the relay does not run the queue. This release
+records that the modules agree with each other before either becomes reachable, which is the point of composing them now.
+
+M1 real-machine acceptance remains pending: the relay host agent is offline and root SSH authentication is refused, so the
+privileged bootstrap has not run.
+
+Verified: m3-workflow 2/2, merge-queue 7/7, worktree 5/5, patch-artifact 5/5; gate GREEN twice.
+
 ## [1.3.10-beta.7] — 2026-10-22
 
 **M3 third block: the merge queue.** A local module and seven real-git tests; the relay task path does not import it yet.
