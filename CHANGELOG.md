@@ -7,6 +7,27 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.10-beta.21] — 2026-10-22
+
+**M6 second slice: the agent result outbox.** A local module and eight tests; the agent delivery path still uses the existing
+spool and has not switched to it yet.
+
+- `src/agent/outbox.mjs` — a result is written to disk (temp + rename, so a crash leaves either the old state or the complete
+  entry) before any network attempt, keyed by `(task_id, attempt)` so a retried handler is one entry. Delivery removes the entry
+  only after the relay acknowledged it; the relay's own dedupe makes a re-delivery safe when that acknowledgement was lost.
+- Retries use exponential backoff persisted with the entry (`1s, 2s, 4s …` capped at 60s), so closing the laptop for an hour is
+  a resume rather than a restart. Past `max_attempts` the entry moves to `dead/` and is reported as exhausted.
+- Limits: 200 entries / 16 MiB; beyond that the oldest entries are dropped and the caller sees `outbox_full: true`
+  (`OUTBOX_FULL` in the changelog's words) rather than a silent disk fill. A single oversize result is refused.
+- Eight tests: atomic persist + depth, duplicate enqueue, restart recovery with attempt counts, backoff growth and exhaustion,
+  ack-only removal, count-limit drop keeping the newest, corrupt-file quarantine, oversize refusal.
+
+Registered as an accepted library with its exit named (the agent delivery switch).
+
+Still to wire for M6: the agent's upload/download decision for large artifacts, and P2P as acceleration-only with metrics.
+
+Verified: outbox 8/8; gate GREEN twice.
+
 ## [1.3.10-beta.20] — 2026-10-22
 
 **M6 wiring: chunk session and Range routes.** Large artifacts now travel over HTTP without restarting from zero.

@@ -50,6 +50,12 @@ export const REASON = Object.freeze({
  */
 export const ACCEPTED_ORPHANS = Object.freeze([
   {
+    file: 'src/agent/outbox.mjs',
+    reason: REASON.LIBRARY,
+    why: 'M6 result outbox: atomic per-result files, exponential backoff, cross-restart recovery, count/byte ceiling; the agent delivery path still uses the existing spool and does not call it yet',
+    removedBy: 'the agent result delivery path switching to the outbox (M6 agent wiring slice)',
+  },
+  {
     file: 'src/relay/merge-queue.mjs',
     reason: REASON.LIBRARY,
     why: 'M3 merge queue: one queue per project+branch, merge-slot serialisation, strict/replay policy, already_merged and MERGE_CONFLICT; the relay task path does not call it yet',
