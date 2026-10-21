@@ -7,6 +7,27 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.10-beta.17] — 2026-10-22
+
+**M5 third primitive: notifications.** A local module and eight tests; no routes or SSE projection use it yet.
+
+- `src/relay/project-notifications.mjs` — notifications for a project addressed to a member or broadcast, each with kind,
+  subject, refs and `requires_action`. Every row is also a `notification.created` event for the live stream, and the list route
+  is the catch-up path.
+- Semantics pinned by tests: the same (kind, primary ref, target) inside 60s is one row; different refs/kinds are distinct;
+  overflow beyond 120 per minute collapses into one digest row that carries the count; unread is counted after a per-reader
+  watermark; a watermark never moves backwards; paging is `since_ms` + limit; retention drops rows older than 7 days (or beyond
+  2000 per project).
+- The reader is a member identity (machine or operator), not a transport: an offline client reconnects and reads the same
+  watermark it left.
+
+Registered as an accepted library with its exit named (the notification routes).
+
+M5 primitives are now all designed-and-implemented at module level: locks (beta.15), reviews (beta.16), notifications (beta.17).
+Still missing for M5: the routes, the merge/ref gates using them, and the panel views.
+
+Verified: project-notifications 8/8; gate GREEN twice.
+
 ## [1.3.10-beta.16] — 2026-10-22
 
 **M5 second primitive: review tasks.** A local module and ten tests; the review routes and the merge gate do not call it yet.

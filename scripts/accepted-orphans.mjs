@@ -50,6 +50,12 @@ export const REASON = Object.freeze({
  */
 export const ACCEPTED_ORPHANS = Object.freeze([
   {
+    file: 'src/relay/project-notifications.mjs',
+    reason: REASON.LIBRARY,
+    why: 'M5 notifications: per-reader watermark, 60s dedupe, per-minute digest, retention; the notification routes and the SSE projection do not call it yet',
+    removedBy: 'the /v1/projects/:id/notifications routes (M5 wiring slice)',
+  },
+  {
     file: 'src/relay/project-reviews.mjs',
     reason: REASON.LIBRARY,
     why: 'M5 reviews: request/decide lifecycle, self-review guard, duplicate-verdict refusal, approval gate by patch sha; the /v1/projects/:id/reviews routes and the merge gate do not call it yet',
