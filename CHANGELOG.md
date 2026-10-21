@@ -7,6 +7,43 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.10-beta.1] — 2026-10-21
+
+**M1 maintenance channel, first implementation slice.** Design: `docs/COLLAB/M1-MAINTENANCE.md` (the design series names this slice v1.3.2-beta; it ships as 1.3.10-beta.1 because 1.3.9 was already published as a stable release and versions must stay ordered).
+
+The maintenance channel lets an operator authorise exactly one of three fixed actions on one machine (update, restart, diag)
+with an Ed25519-signed request, executed by a root/SYSTEM runner that reads a queue the unprivileged agent may write to. An
+allow-list entry is not needed: the signature is the authorisation, and widening the allow-list is never the answer.
+
+### What this slice contains
+
+- `src/maintenance/protocol.mjs` — request envelope, canonical signing bytes, parameter whitelists for the three actions,
+  and the complete refusal vocabulary (wrong machine, expired, future, TTL too long, replay, revoked key, unknown key,
+  bad signature, bad action, bad params, too large, missing signature). TTL is capped at 10 minutes and only the pinned
+  operator key can sign.
+- `src/maintenance/operator-key.mjs` — Ed25519 key generation, relay registration payload, trust-on-first-use pinning with a
+  rotation chain (a new key must be signed by the pinned one), revocation, and a corrupt pin store that refuses instead of
+  trusting nothing.
+- `src/maintenance/runner.mjs` — queue scanning, claim-before-verify, signature verification, persisted replay sets
+  (request id + nonce), idempotent re-runs, and a result file for every request it looks at, refusals included.
+- `src/maintenance/actions.mjs` — the three fixed actions with no shell interpolation: diag (fixed read-only command set,
+  capped output), restart (fixed unit order and health waits), update (https download, sha256 verify, staged extraction,
+  version check inside the artifact, backup, atomic swap, health check, automatic rollback).
+- `bin/w2m-maintenance.mjs` — the root entry point (once/watch, pin bootstrap, root guard).
+- `deploy/server/w2m-maintenance.{service,path}` and `deploy/windows/w2m-maintenance.xml` — the runner as a systemd path
+  unit / SYSTEM scheduled task.
+
+### What this slice deliberately does not contain
+
+The relay routes that distribute the operator public key and the agent-side ferry that carries a request from a task offer
+to the queue (and the result back) are the next slice (1.3.10-beta.2). Until then the channel is exercised by placing a
+signed request in the queue directory directly — which is also the offline/bootstrap path the design keeps.
+
+Tests: 17 new cases cover the protocol, pinning/rotation/revocation and the runner's refusal and replay behaviour. The
+destructive actions are not executed in tests; they are covered by the real-machine acceptance runbook (M7 evidence).
+
+Verified: gate GREEN twice.
+
 ## [1.3.9] — 2026-10-21
 
 **Design-first release: the collaboration line is specified, not yet implemented.**

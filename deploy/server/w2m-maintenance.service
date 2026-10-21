@@ -1,0 +1,20 @@
+# w2m-maintenance.service — M1 root runner (v1.3.2-beta)
+# Started by w2m-maintenance.path when a signed request lands in the queue directory.
+[Unit]
+Description=W2M maintenance runner (signed update/restart/diag requests)
+Documentation=https://github.com/TwinsEarth/dsh-windows2macos/blob/main/docs/COLLAB/M1-MAINTENANCE.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/bin/env node /opt/w2m/app/bin/w2m-maintenance.mjs --once --queue-dir /var/lib/w2m/maintenance/queue --done-dir /var/lib/w2m/maintenance/done --machine-id ${W2M_MACHINE_ID} --pin-file /var/lib/w2m/maintenance/operator-pins.json
+EnvironmentFile=-/etc/w2m/maintenance.env
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadWritePaths=/opt/w2m /var/lib/w2m/maintenance
+NoNewPrivileges=yes

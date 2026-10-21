@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-16"?>
+<!-- w2m-maintenance.xml — M1 runner as a SYSTEM scheduled task (v1.3.2-beta).
+     Mirrors deploy/server/w2m-maintenance.service: fixed action set, queue directory, operator-signed requests. -->
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>W2M maintenance runner (signed update/restart/diag requests)</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <BootTrigger><Enabled>true</Enabled></BootTrigger>
+    <RegistrationTrigger><Enabled>true</Enabled></RegistrationTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>S-1-5-18</UserId>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT15M</ExecutionTimeLimit>
+    <Enabled>true</Enabled>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>node</Command>
+      <Arguments>C:\w2m\app\bin\w2m-maintenance.mjs --watch --queue-dir C:\ProgramData\w2m\maintenance\queue --done-dir C:\ProgramData\w2m\maintenance\done --machine-id %W2M_MACHINE_ID% --pin-file C:\ProgramData\w2m\maintenance\operator-pins.json</Arguments>
+    </Exec>
+  </Actions>
+</Task>

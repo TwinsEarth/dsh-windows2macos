@@ -1,0 +1,10 @@
+# w2m-maintenance.path — triggers the runner whenever the agent drops a signed request.
+[Unit]
+Description=W2M maintenance queue watcher
+
+[Path]
+PathModified=/var/lib/w2m/maintenance/queue
+Unit=w2m-maintenance.service
+
+[Install]
+WantedBy=multi-user.target
