@@ -7,6 +7,52 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.0] — 2026-10-21
+
+The first stable release of the collaboration line. It consolidates the four betas that followed 1.2.7 and changes no protocol in a
+way that a 1.2.7 peer cannot ignore; every addition is additive and named.
+
+### Data plane
+
+**A reduce phase you can actually run.** `w2m_reduce` dispatches a reduce task only from complete data: it refuses unless every
+declared shard reported as a blob and the named reducer reported (`W2M_REDUCE_NOT_READY` with the missing indexes), never picks a
+reducer, and refuses inline inputs that cannot be carried to another machine. The relay validates, stores, ledgers and offers
+`reduce_of` + `reduce_inputs`; the agent fetches those content-addressed blobs before the reduce runs and exposes
+`W2M_REDUCE_INPUTS_DIR` / `W2M_REDUCE_MANIFEST` / `W2M_REDUCE_OF`; a failed fetch refuses the whole task rather than reducing a
+partial fleet.
+
+**A suggestion that dispenses no action.** `w2m_wait` carries `reduce_suggestion`: ready only when every declared shard reported and
+a reducer was named, the missing indexes otherwise, the candidate machines, and the literal next step. It is derived, never stored,
+and it dispatches nothing.
+
+**Message ids survive a restart, artifacts are one size everywhere.** Chat ids carry a random per-process relay epoch
+(`msg-<epoch>-<seq>`) so a restart cannot recycle an id a client persisted; the blob transport frame is 16 MiB, matching the agent's
+dataflow hard cap, instead of 1 MiB against it.
+
+### Collaboration
+
+**The panel shows the scheduler's own buckets.** The fleet-chat panel renders 准备 / 进行 / 等待 / 阻塞 counts beside the relay's task
+list, derived from the relay's `status` and `waiting_on`; read-only, no dispatch.
+
+**Conflicts name their next step.** `w2m_memory append` returns `merge_hint` with a 409: `re-read-then-append`, `behind_by`, the
+unseen count, the sample size and the literal instruction to re-read, compare and append against the current revision -- never an
+automatic merge.
+
+**Decisions leave a trail.** `w2m_council fleet-decide` reports `trail` (`appended` / `refused` / `error` / `not-written`), and the
+test asserts that status instead of implying a record exists.
+
+### Verified
+
+Gate GREEN twice, 15 of 15: 2710 tests / 2696 pass / 0 fail / 14 skip in 133 files. Two-machine live runs over the real relay cover
+the turn state machine (ask/await over SSE with a refusal), dependency scheduling, and the missing-shard refusal, plus the panel and
+proxy behaviour above.
+
+### Known limits, stated
+
+- `pipeline` keeps `index_total` at 1; blob map results come from plain commands above the inline cap.
+- The reduce suggestion is advisory: the caller dispatches the reduce (this release does not let the relay decide to run a command).
+- The composer panel does not render the board buckets on a host without the Connection service; the tools still work.
+
 ## [1.2.11-beta.1] — 2026-10-21
 
 A beta by policy: GitHub prerelease only, never npm.
