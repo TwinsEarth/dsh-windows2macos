@@ -186,6 +186,7 @@ import {
 import { registerChatRoutes } from './fleet-chat-route.mjs';
 import { createFleetCouncil, fleetCouncilThread } from './council-fleet.mjs';
 import { renderMemoryView } from './memory-view.mjs';
+import { renderMergeHint } from './merge-hint.mjs';
 import { buildBoard } from './task-graph.mjs';
 import { verifyEnvelopeSignature } from '../util/envelope-signature.mjs';
 import { createAskStore } from './ask-store.mjs';
@@ -5609,6 +5610,8 @@ export async function apply(ctx, config = {}) {
             doc,
             status: appended?.status ?? 0,
             code: appended?.json?.error?.code ?? appended?.error?.code ?? 'W2M_MEMORY_APPEND',
+        // v1.2.11: turn the 409's numbers into the next step a reader can actually take.
+        merge_hint: renderMergeHint({ conflict: appended?.json?.detail ?? appended?.json?.error?.detail ?? null }),
             detail: appended?.json?.detail ?? null,
           });
         }

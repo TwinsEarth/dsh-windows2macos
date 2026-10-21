@@ -1911,7 +1911,28 @@ describe('happy paths', () => {
       assert.equal(value.reduce.code, 'MISSING_SHARD');
       assert.deepEqual(value.reduce.detail.missing, [1]);
     } finally { fetchStub.restore(); }
-  });  it('reports each machine signature as signed, unsigned or bad_signature (v1.2.6)', async () => {
+  });  it('turns a memory 409 into a merge hint naming the next step (v1.2.11)', async () => {
+    const fetchStub = installFetch([{ path: '/v1/fleet/memory/fleet', method: 'PUT', status: 409, body: { error: { code: 'REVISION_CONFLICT', detail: { behind_by: 2, unread_records: ['a', 'b'], sample: ['a'] } } } }]);
+    try {
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN, device_token: 'tok-test-abc' });
+      const value = JSON.parse(await tools.get('w2m_memory').execute({ action: 'append', doc: 'fleet', records: ['x'], if_revision: 1 }, {}));
+      assert.equal(value.status, 409);
+      assert.equal(value.merge_hint.state, 're-read-then-append');
+      assert.equal(value.merge_hint.behind_by, 2);
+      assert.equal(value.merge_hint.unread, 2);
+      assert.match(value.merge_hint.next, /do not merge unseen records/);
+    } finally { fetchStub.restore(); }
+  });
+
+  it('reports the council decision trail status instead of implying a record exists (v1.2.11)', async () => {
+    const { tools } = await register({ rabbitUrl: RABBIT, stateDir: await makeStateDir(PAIRED_DEVICE), operatorToken: OPERATOR_TOKEN, device_token: 'tok-test-abc' });
+    const value = JSON.parse(await tools.get('w2m_council').execute({ action: 'fleet-decide', council_id: 'unknown-council' }, {}));
+    assert.equal(value.ok, false);
+    assert.ok(Object.prototype.hasOwnProperty.call(value, 'trail'), 'a decision that was not written must say so');
+    assert.equal(value.trail, 'not-written', 'no council decision, no memory record');
+  });
+
+  it('reports each machine signature as signed, unsigned or bad_signature (v1.2.6)', async () => {
     const { generateKeyPairSync, sign } = await import('node:crypto');
     const { canonicalSignedPayload } = await import('../src/util/envelope-signature.mjs');
     const { privateKey, publicKey } = generateKeyPairSync('ed25519');

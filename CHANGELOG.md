@@ -7,6 +7,24 @@
 
 All notable changes to this project are documented here.
 
+## [1.2.11-beta.1] — 2026-10-21
+
+A beta by policy: GitHub prerelease only, never npm.
+
+### The task board in the composer panel
+
+The fleet-chat panel already listed the relay's tasks; it now also shows the four buckets the scheduler uses — 准备 / 进行 / 等待 / 阻塞 — derived from the relay's own `status` and `waiting_on`, never from a classification of its own. Read-only: the panel dispatches nothing.
+
+### Merge hint on memory conflicts
+
+`w2m_memory append` returns `merge_hint` with a 409: state `re-read-then-append`, `behind_by`, the number of unseen records, the sample size, and the literal next step (re-read, compare, append against the current revision — do not merge unseen records). Pure function, no automatic merge.
+
+### Council decisions leave a trail
+
+`w2m_council fleet-decide` reports `trail` (`appended` / `refused` / `error` / `not-written`) instead of implying a record exists; the test now asserts that status.
+
+Verified: gate GREEN twice, 2704 tests / 2690 pass / 0 fail / 14 skip in 132 files; client-bundle 25/25 after the board line; the merge-hint and trail tests are new.
+
 ## [1.2.10-beta.1] — 2026-10-21
 
 A beta by policy: GitHub prerelease only, never npm. This one makes the reduce phase executable.

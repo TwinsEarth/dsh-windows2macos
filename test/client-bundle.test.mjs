@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 /**
  * Tests for the **shipped browser half** (`lib/client.js`).
  *
@@ -588,5 +589,12 @@ describe('client bundle: the stylesheet', () => {
     const { exports } = loadBundle();
     assert.equal(exports.injectStyle(null), null);
     assert.equal(exports.injectStyle(undefined), null);
+  });
+
+  it('board shows the four bucket counts and reads the host proxy (v1.2.11)', () => {
+    const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
+    assert.ok(source.includes("className: 'w2mChat_boardCounts'"), 'the counts line exists');
+    assert.ok(source.includes("/api/w2m/tasks?limit=20"), 'the board reads the relay through the host proxy');
+    assert.ok(source.includes('准备'), 'the counts are labelled for the operator');
   });
 });
