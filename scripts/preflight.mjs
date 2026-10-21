@@ -2290,11 +2290,41 @@ function checkChangelogShape() {
 }
 
 /** Numeric dotted-version comparison, pre-release suffix compared as text. */
+/**
+ * Semver ordering, prerelease included.
+ *
+ * The naive comparator dropped everything after '-' and compared the first three numbers as strings in some call sites, so
+ * 1.3.10-beta.9 and 1.3.10-beta.10 could not be ordered. The gate refused to advance a beta exactly when the readership
+ * needed the newest entry first, which is the wrong failure to have on the release path.
+ */
 function compareVersions(a, b) {
-  const parse = (v) => v.split('-')[0].split('.').map(Number);
-  const [x, y] = [parse(a), parse(b)];
-  for (let i = 0; i < 3; i += 1) if (x[i] !== y[i]) return x[i] - y[i];
-  return String(a).localeCompare(String(b));
+  const parse = (v) => {
+    const [core, prerelease = null] = String(v).split('-', 2);
+    return { nums: core.split('.').map(Number), pre: prerelease === null ? null : prerelease.split('.') };
+  };
+  const x = parse(a);
+  const y = parse(b);
+  for (let i = 0; i < 3; i += 1) if (x.nums[i] !== y.nums[i]) return x.nums[i] - y.nums[i];
+  if (x.pre === null && y.pre === null) return 0;
+  if (x.pre === null) return 1;
+  if (y.pre === null) return -1;
+  for (let i = 0; i < Math.max(x.pre.length, y.pre.length); i += 1) {
+    const left = x.pre[i];
+    const right = y.pre[i];
+    if (left === undefined) return -1;
+    if (right === undefined) return 1;
+    const leftNumeric = /^[0-9]+$/.test(left);
+    const rightNumeric = /^[0-9]+$/.test(right);
+    if (leftNumeric && rightNumeric) {
+      const diff = Number(left) - Number(right);
+      if (diff !== 0) return diff;
+    } else if (leftNumeric !== rightNumeric) {
+      return leftNumeric ? -1 : 1;
+    } else if (left !== right) {
+      return left < right ? -1 : 1;
+    }
+  }
+  return 0;
 }
 
 /* --------------------------------------------------------------------------------------------- */
@@ -2450,3 +2480,4 @@ if (INVOKED !== '' && samePath(INVOKED, SELF)) {
   );
   process.exit(1);
 }
+

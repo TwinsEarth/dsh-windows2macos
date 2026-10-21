@@ -1,0 +1,24 @@
+{
+  "version": "1.3.10-beta.10",
+  "case": "M1-LIVE-RESTART",
+  "kind": "positive",
+  "requirement": "a signed restart request restarts the relay and the fleet result survives the restart",
+  "machines": [
+    "1c14d7d2-d9e2-43dd-a7e5-eda98f4864bc"
+  ],
+  "task_id": "01M5G3R8DJ2RNP0SNSC5J3WQWQ",
+  "result": {
+    "task": {
+      "outcome": "ok",
+      "status": "ok",
+      "refusal": null,
+      "stdout_bytes": 369
+    },
+    "relay_id_before": "68c2d7c3fb85bdc0",
+    "relay_id_after": "78446e30540b29b6",
+    "uptime_ms_after": 5710,
+    "operator_key_id": "79bcd7a23ad5b61f"
+  },
+  "executed_at": "2026-10-21T20:52:01.288Z",
+  "executor": "lead"
+}

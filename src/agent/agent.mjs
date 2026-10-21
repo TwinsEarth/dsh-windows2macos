@@ -3061,10 +3061,18 @@ export function createAgent(options) {
       if (offer && typeof offer.maintenance === 'object' && offer.maintenance !== null) {
         const ferryStarted = Date.now();
         const ferried = await ferryMaintenance({ offer, machineId: String(offer.machine_id ?? identity.machine_id ?? '') });
+        const stdoutText = JSON.stringify(ferried).slice(0, 64 * 1024);
+        const stderrText = ferried.ok ? '' : (ferried.message ?? ferried.code ?? 'maintenance failed');
+        // The envelope builder hashes and sizes the output; leaving any of these undefined makes canonicalisation fail
+        // with a JCS error and the task is reported as crashed after the maintenance action already ran.
         const execution = {
           exit_code: ferried.ok ? 0 : 1,
-          stdout: JSON.stringify(ferried).slice(0, 64 * 1024),
-          stderr: ferried.ok ? '' : (ferried.message ?? ferried.code),
+          stdout: stdoutText,
+          stderr: stderrText,
+          stdout_sha256: sha256Hex(stdoutText),
+          stderr_sha256: sha256Hex(stderrText),
+          stdout_bytes: Buffer.byteLength(stdoutText, 'utf8'),
+          stderr_bytes: Buffer.byteLength(stderrText, 'utf8'),
           duration_ms: Date.now() - ferryStarted,
           timed_out: ferried.code === 'MAINTENANCE_RUNNER_TIMEOUT',
         };

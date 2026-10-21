@@ -25,8 +25,10 @@ if [[ "$(id -u)" -ne 0 ]]; then echo "run as root" >&2; exit 2; fi
 
 BASE=/var/lib/w2m/maintenance
 mkdir -p "$BASE/queue" "$BASE/done" "$BASE/claimed"
-chown -R root:root "$BASE"
-chmod 0750 "$BASE/queue" "$BASE/done" "$BASE/claimed"
+# The agent runs as an unprivileged user; it must be able to create request files, and must NOT be able to execute them.
+chown -R root:w2m "$BASE"
+chmod 0770 "$BASE/queue"
+chmod 0750 "$BASE/done" "$BASE/claimed"
 
 if [[ ! -f "$APP_DIR/bin/w2m-maintenance.mjs" ]]; then
   echo "missing $APP_DIR/bin/w2m-maintenance.mjs — deploy the package first" >&2

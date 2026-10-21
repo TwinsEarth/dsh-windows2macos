@@ -1,0 +1,27 @@
+{
+  "version": "1.3.10-beta.10",
+  "case": "M1-LIVE-DIAG",
+  "kind": "positive",
+  "requirement": "a signed maintenance request is executed by the root runner on a remote machine and its result returns through the fleet",
+  "machines": [
+    "1c14d7d2-d9e2-43dd-a7e5-eda98f4864bc"
+  ],
+  "commands": [
+    [
+      "node",
+      "--version"
+    ]
+  ],
+  "task_id": "01M5G3HVZPNN8ES63NJPV7MRN5",
+  "result": {
+    "outcome": "ok",
+    "status": "ok",
+    "stdout_bytes": 62238,
+    "blob_sha256": null,
+    "blob_sha256_verified": false,
+    "sections": null
+  },
+  "executed_at": "2026-10-21T20:51:34.767Z",
+  "executor": "lead",
+  "note": "relay v1.3.10-beta.5; agent v1.3.10-beta.5 (locally patched envelope fields); operator key pinned at bootstrap; result delivered as a blob because the diag output exceeds the inline cap"
+}

@@ -7,6 +7,34 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.10-beta.10] — 2026-10-22
+
+**M1 live acceptance: the maintenance channel works end to end on a real machine.**
+
+The relay host (jp-shared) was bootstrapped and two signed requests were executed by the root runner:
+
+- **diag** — the runner produced 9 sections (version/services/journal/disk/ports), the agent returned the task as `ok` with
+  62,238 bytes of result, and the runner's own result file confirms `status: ok`. Evidence:
+  `docs/acceptance/1.3.10-beta.10/M1-LIVE-DIAG.json`.
+- **restart (rabbit)** — the relay was restarted by the runner, the agent survived it and delivered the task result, and the
+  relay came back with a new `relay_id` and a fresh uptime. Evidence:
+  `docs/acceptance/1.3.10-beta.10/M1-LIVE-RESTART.json`.
+
+The run found four real defects, all fixed here:
+
+1. The agent's envelope builder hashes and sizes the output; the maintenance ferry passed an execution object without
+   `stdout_sha256/stdout_bytes/stderr_sha256/stderr_bytes`, so every maintenance task ended as `crashed` **after** the action had
+   already run. The ferry now fills them.
+2. `--operator-key` without `--operator-key-id` claimed an empty key id, which the pin store correctly refused as a mismatch;
+   an absent id now means "trust the key that arrives".
+3. `bootstrap.sh` made the queue root-only, so the unprivileged agent could never enqueue a request; the queue is now
+   `root:w2m 0770` (write but not execute) and `done` is `root:w2m 0750`.
+4. Known limitation, documented rather than hidden: a request that restarts **the agent itself** kills the process still waiting
+   for its result file, so that result is lost (the action still runs). Restarting the relay is unaffected, which is why the
+   accepted case uses that target; the delayed-restart fix is next.
+
+Also verified: gate GREEN twice; the local agent suite still passes with the ferry envelope fix.
+
 ## [1.3.10-beta.9] — 2026-10-22
 
 **M3 conflict contract completed: MERGE_CONFLICT now carries the conflict itself.**

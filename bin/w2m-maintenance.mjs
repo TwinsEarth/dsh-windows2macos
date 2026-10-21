@@ -72,7 +72,9 @@ async function main() {
   const store = createPinStore(pinFile);
   if (args.operatorKey) {
     const pin = store.pinFromRegistration(registrationPayload({
-      keyId: args.operatorKeyId ?? '',
+      // An absent --operator-key-id means "trust the key that arrives"; an empty string must not be sent as a claimed id,
+      // because the pin store verifies a claimed id against the key it receives and an empty one can never match.
+      keyId: typeof args.operatorKeyId === 'string' && args.operatorKeyId !== '' ? args.operatorKeyId : undefined,
       publicKeyPem: readFileSync(args.operatorKey, 'utf8'),
     }));
     process.stdout.write('pinned operator key ' + pin.pinned.key_id + (pin.firstContact ? ' (first contact)' : '') + '\n');
