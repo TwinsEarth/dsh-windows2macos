@@ -7,6 +7,25 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.10-beta.16] — 2026-10-22
+
+**M5 second primitive: review tasks.** A local module and ten tests; the review routes and the merge gate do not call it yet.
+
+- `src/relay/project-reviews.mjs` — a review points at a content-addressed `{kind, sha256, source_task_id, diffstat}` target and
+  collects decisions from listed reviewers. Verdicts are records, not a mutable flag: `approve`/`changes_requested`/`comment`
+  accumulate, approvals are counted per distinct reviewer, and reaching `required_approvals` moves the review to `approved`.
+- Safety rules the tests pin: self-review is refused unless an owner overrides it (and the override is its own event); reviewers
+  must be maintainer/owner; only listed reviewers may decide; a reviewer cannot record the same verdict twice; a
+  `changes_requested` closes the round and refuses a later approve; a due date expires a pending review and late decisions are
+  refused; `approvedFor(project, sha256)` answers the merge gate for an exact patch.
+- Every state change is emitted as an event (`review.requested/decided/approved/changes_requested/expired/self_review_override`).
+
+Registered as an accepted library with its exit named (the review routes + merge-requires-review gate).
+
+Not in this slice: notifications (§4), the third M5 primitive.
+
+Verified: project-reviews 10/10; gate GREEN twice.
+
 ## [1.3.10-beta.15] — 2026-10-22
 
 **M5 first primitive: branch and file locks.** A local module and eight tests; no routes or merge preflight call it yet.
