@@ -7,6 +7,19 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.1-beta.1] — 2026-10-21
+
+**A red Compat and a green local gate: the loader-entry test was the gap.**
+
+v1.3.0 shipped with a failing Compat job: `test/loader-entry.test.mjs` still listed the fifteen tools it expected the packed
+artifact to register, and the artifact registers sixteen (`w2m_reduce`). The gate ran from the tree, where that test's expectation
+matched the *other* fixture it derives from, so the disagreement only appeared in the packed-copy mount. The expectation now names
+`w2m_reduce`, and this patch release is the artifact that matches it.
+
+No behaviour changes: the fix is the expectation, not the tool surface. v1.3.0 is superseded.
+
+A beta by policy: GitHub prerelease only, never npm. Verified: gate GREEN twice (2710 tests / 2696 pass / 0 fail / 14 skip in 133 files); the Compat re-run on this tag is the acceptance check, and this stays a prerelease either way.
+
 ## [1.3.0] — 2026-10-21
 
 The first stable release of the collaboration line. It consolidates the four betas that followed 1.2.7 and changes no protocol in a
