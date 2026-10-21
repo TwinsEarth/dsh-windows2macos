@@ -7,7 +7,7 @@
 
 All notable changes to this project are documented here.
 
-## [1.3.1-beta.2] — 2026-10-21
+## [1.3.1] — 2026-10-21
 
 **A red Compat and a green local gate: the loader-entry test was the gap.**
 
@@ -18,7 +18,7 @@ matched the *other* fixture it derives from, so the disagreement only appeared i
 
 No behaviour changes: the fix is the expectation, not the tool surface. beta.2 completes the fix: `EXPECTED_TOOLS` in that same test is the list the loader gate compares against, and beta.1 patched only the other fixture. v1.3.0 is superseded.
 
-A beta by policy: GitHub prerelease only, never npm. Verified: gate GREEN twice (2710 tests / 2696 pass / 0 fail / 14 skip in 133 files); the Compat re-run on this tag is the acceptance check, and this stays a prerelease either way.
+This is the stable fix for v1.3.0's red Compat: the loader gate and the packed artifact now agree at sixteen tools. v1.3.0 is superseded on every channel; the artifact behaviour is unchanged. Verified: gate GREEN twice (2710 tests / 2696 pass / 0 fail / 14 skip in 133 files), and Compat on this tag is green before it is called stable.
 
 ## [1.3.0] — 2026-10-21
 
