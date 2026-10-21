@@ -7,6 +7,26 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.10-beta.7] — 2026-10-22
+
+**M3 third block: the merge queue.** A local module and seven real-git tests; the relay task path does not import it yet.
+
+- `src/relay/merge-queue.mjs` — one queue per project+branch with a single merge slot (holder + TTL), items named by the
+  patch sha256, `strict` and `replay` base policies, and terminal verdicts: MERGED (branch head advances), `already_merged`
+  for a repeat submission, `BASE_MISMATCH` under strict, and a structured `MERGE_CONFLICT` with the changed files that never
+  advances the head.
+- Application happens in a detached throwaway worktree, then the repository's branch and working tree are moved to the new
+  commit — a merge that committed only in the worktree would leave the next reviewer looking at a head that never moved.
+- Seven tests cover merge-and-advance, idempotent re-submission, stale base, conflict (head unchanged), replay onto a moved
+  head, merge-slot serialisation, and patch naming.
+
+Registered as an accepted library with its exit named (the relay merge executor dispatch), because nothing reaches it yet.
+
+Still pending, unchanged: the M1 real-machine acceptance (relay runs beta.5 and carries the maintenance field live, but the
+relay host's agent is offline and root SSH authentication has not been restored), and the M2/M3 live runs.
+
+Verified: merge-queue 7/7; the rest of the suite is unchanged; gate GREEN twice.
+
 ## [1.3.10-beta.6] — 2026-10-21
 
 **M3 first two blocks: isolated worktrees and a patch artifact contract. Plus the grant replay e2e.**

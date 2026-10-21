@@ -50,6 +50,12 @@ export const REASON = Object.freeze({
  */
 export const ACCEPTED_ORPHANS = Object.freeze([
   {
+    file: 'src/relay/merge-queue.mjs',
+    reason: REASON.LIBRARY,
+    why: 'M3 merge queue: one queue per project+branch, merge-slot serialisation, strict/replay policy, already_merged and MERGE_CONFLICT; the relay task path does not call it yet',
+    removedBy: 'the relay merge executor dispatch (M3 wiring slice), which is the caller this module was written for',
+  },
+  {
     file: 'src/agent/worktree.mjs',
     reason: REASON.LIBRARY,
     why: 'M3 workspace: one git worktree per task, created at the caller base commit; nothing in the relay/agent task path calls it yet',
