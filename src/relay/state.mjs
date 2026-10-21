@@ -1751,6 +1751,21 @@ export class RabbitState {
       }
       normalizedMaintenance = rawMaintenance;
     }
+    /**
+     * v1.3.10-beta.3: a task-level grant travels with the dispatch. The relay checks its shape and time window so a bad
+     * grant is refused at dispatch, but the agent is the verifier — the relay never decides authorisation on its own.
+     */
+    const rawGrant = input.grant ?? null;
+    let normalizedGrant = null;
+    if (rawGrant !== null) {
+      if (typeof rawGrant !== 'object' || Array.isArray(rawGrant) || Buffer.byteLength(JSON.stringify(rawGrant), 'utf8') > 8 * 1024) {
+        throw new ProtocolError('BAD_REQUEST', 'grant must be an object of at most 8 KiB', {});
+      }
+      if (typeof rawGrant.grant_id !== 'string' || rawGrant.grant_id === '' || !/^[0-9a-f]{64}$/.test(String(rawGrant.argv_hash ?? ''))) {
+        throw new ProtocolError('BAD_REQUEST', 'grant needs grant_id and a 64-hex argv_hash', {});
+      }
+      normalizedGrant = rawGrant;
+    }
     const rawOperatorKey = input.operator_key ?? null;
     let normalizedOperatorKey = null;
     if (rawOperatorKey !== null) {
@@ -1817,6 +1832,8 @@ export class RabbitState {
        * the task (never inferred by the reducer), because "which shards this reduce covers" is the completeness contract.
        */
       reduce_of: typeof input.reduce_of === 'string' && input.reduce_of !== '' ? input.reduce_of : null,
+      grant: normalizedGrant,
+      grant_summary: normalizedGrant === null ? null : { grant_id: normalizedGrant.grant_id, argv_hash: normalizedGrant.argv_hash, key_id: normalizedGrant.signature?.key_id ?? null },
       /** v1.3.10-beta.2: a signed maintenance request travels with the task; the relay carries it, the root runner verifies it. */
       maintenance: normalizedMaintenance,
       operator_key: normalizedOperatorKey,
@@ -2106,6 +2123,7 @@ export class RabbitState {
             assignee: task.assignee ?? null,
             reduce_of: task.reduce_of ?? null,
             maintenance_summary: task.maintenance_summary ?? null,
+            grant_summary: task.grant_summary ?? null,
             reduce_inputs: Array.isArray(task.reduce_inputs) ? task.reduce_inputs : [],
         origin_machine_id: task.origin_machine_id ?? null,
         p2p: task.p2p ?? null,
@@ -2222,6 +2240,7 @@ export class RabbitState {
       ...(task.reduce_of !== null ? { reduce_of: task.reduce_of, reduce_inputs: task.reduce_inputs } : {}),
       // v1.3.10-beta.2: the signed request and its operator key travel together; the agent pins the key on first sight.
       ...(task.maintenance !== null && task.maintenance !== undefined ? { maintenance: task.maintenance, operator_key: task.operator_key } : {}),
+      ...(task.grant !== null && task.grant !== undefined ? { grant: task.grant } : {}),
       cwd_rel: task.cwd_rel,
       // Omitted when false, so a single-command offer for every existing caller stays byte-identical -- the
       // same reason `stages` above is conditional.
@@ -2381,6 +2400,7 @@ export class RabbitState {
       reduce_of: task.reduce_of ?? null,
       reduce_inputs: Array.isArray(task.reduce_inputs) ? task.reduce_inputs : [],
       maintenance_request_id: task.maintenance_summary?.request_id ?? null,
+      grant_id: task.grant_summary?.grant_id ?? null,
       status: (() => {
         if (task.cancelled === true) return 'cancelled';
         const leases = [...task.leases.values()];

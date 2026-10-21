@@ -25,7 +25,8 @@ import { Readable } from 'node:stream';
 import { access, constants as fsConstants } from 'node:fs/promises';
 import { existsSync, mkdirSync, mkdtempSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { ferryMaintenance } from './maintenance-ferry.mjs';
+import { ferryMaintenance, maintenancePaths } from './maintenance-ferry.mjs';
+import { authorizeWithGrant } from './grant-gate.mjs';
 import { tmpdir } from 'node:os';
 import { randomUUID , sign as signBytes } from 'node:crypto';
 
@@ -2958,7 +2959,22 @@ export function createAgent(options) {
       // `stages[0].command_argv` -- so this check covers the first stage and nothing else. Every
       // stage is checked below, before any of them runs; see the note there for why the second check
       // has to exist even though the plugin's pre-flight also checks every stage.
-      const allowed = matchAllowedCommand(commandArgv, allowedCommands);
+      /**
+       * v1.3.10-beta.3: the allow-list is a standing decision; a grant is a decision made now for exactly this argv.
+       * Ask the grant gate before falling through to the allow-list refusal, and never the other way round.
+       */
+      let allowed = matchAllowedCommand(commandArgv, allowedCommands);
+      if (allowed.ok !== true && offer && typeof offer.grant === 'object' && offer.grant !== null) {
+        const gatePaths = maintenancePaths();
+        const gate = await authorizeWithGrant({
+          offer,
+          machineId: String(offer.machine_id ?? identity.machine_id ?? ''),
+          pinFile: gatePaths.pinFile,
+          usedFile: join(dirname(gatePaths.pinFile), 'grant-uses.json'),
+        });
+        if (gate.ok === true) allowed = { ok: true, grant_id: gate.grantId };
+        else allowed = { ok: false, reason_code: gate.code ?? 'GRANT_REJECTED', detail: gate.message };
+      }
       if (!allowed.allowed) {
         log('warn', `refused ${offer.task_id}: ${allowed.reason_code ?? REFUSAL.COMMAND_NOT_ALLOWED}`, { argv: commandArgv });
         await finish({

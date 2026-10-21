@@ -7,6 +7,29 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.10-beta.3] — 2026-10-21
+
+**M2 first slice: task-level grants become the explicit authorisation channel.** Design: `docs/COLLAB/M2-TASK-GRANT.md`.
+
+- `src/maintenance/grant.mjs` — grant protocol: task binding, named machine ids, argv hash + expanded argv for the operator
+  to read, max uses, TTL capped at 10 minutes, nonce, and constraint fields that may only tighten the task (mode/cwd/write/
+  write_scope). Verification has a named refusal for every distinct failure: wrong machine, wrong task, argv mismatch,
+  expired, future, TTL too long, replay, uses exhausted, revoked key, unknown key, bad signature, constraint widening.
+- `src/agent/grant-gate.mjs` — the agent-side gate: pins the operator key on first sight, verifies the grant against the
+  concrete argv, and persists use counts so a spent grant stays spent across restarts. A corrupt use ledger is never read as
+  "nothing used yet".
+- The agent asks the grant gate **before** falling through to the allow-list refusal, and reports a grant refusal with its own
+  `GRANT_*` code instead of folding it into `COMMAND_NOT_ALLOWED`.
+- The relay accepts an optional `grant` on `POST /v1/task` (8 KiB cap, `grant_id` + 64-hex `argv_hash` checked), carries it on
+  the offer, writes `grant_summary` into the ledger and exposes `grant_id` on the task summary.
+
+Honest gap: the grant path has unit coverage (protocol 10, gate 6) and the existing agent/relay suites are unchanged-green,
+but there is no fake-relay e2e yet for "empty allow-list executes under a grant". That case and the real two-machine run land
+in the next slice together with the M2 acceptance evidence.
+
+Verified: agent 154/152, relay 181/181, grant 10/10, grant-gate 6/6, maintenance 17/17, ferry 4/4, layer-model 24/24; gate
+GREEN twice.
+
 ## [1.3.10-beta.2] — 2026-10-21
 
 **M1 maintenance channel: relay passthrough + agent ferry.** The remote loop now has both ends.
