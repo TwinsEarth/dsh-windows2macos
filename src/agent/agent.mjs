@@ -25,6 +25,7 @@ import { Readable } from 'node:stream';
 import { access, constants as fsConstants } from 'node:fs/promises';
 import { existsSync, mkdirSync, mkdtempSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { ferryMaintenance } from './maintenance-ferry.mjs';
 import { tmpdir } from 'node:os';
 import { randomUUID , sign as signBytes } from 'node:crypto';
 
@@ -3036,6 +3037,37 @@ export function createAgent(options) {
        * a reduce that ran on half the inputs would produce a confident wrong answer, which is the failure this feature exists to
        * make impossible.
        */
+      /**
+       * v1.3.10-beta.2: a maintenance request is verified and carried by maintenance-ferry.mjs, not executed here. The
+       * agent has no privilege to run update/restart/diag, which is the point of the separation.
+       */
+      if (offer && typeof offer.maintenance === 'object' && offer.maintenance !== null) {
+        const ferryStarted = Date.now();
+        const ferried = await ferryMaintenance({ offer, machineId: String(offer.machine_id ?? identity.machine_id ?? '') });
+        const execution = {
+          exit_code: ferried.ok ? 0 : 1,
+          stdout: JSON.stringify(ferried).slice(0, 64 * 1024),
+          stderr: ferried.ok ? '' : (ferried.message ?? ferried.code),
+          duration_ms: Date.now() - ferryStarted,
+          timed_out: ferried.code === 'MAINTENANCE_RUNNER_TIMEOUT',
+        };
+        await finish({
+          offer,
+          cwdRel,
+          commandArgv,
+          anchorsBefore,
+          anchorsAfter: null,
+          execution,
+          status: ferried.ok ? 'ok' : 'failed',
+          refusalReason: ferried.ok ? null : 'MAINTENANCE_FAILED',
+          warnings,
+          startedAt,
+          endedAt: new Date().toISOString(),
+          protocolViolations: [],
+        });
+        return;
+      }
+
       let reduceEnv = null;
       if (Array.isArray(offer.reduce_inputs) && offer.reduce_inputs.length > 0) {
         try {

@@ -515,10 +515,41 @@ describe('version claims', () => {
   });
 });
 
+/**
+ * Semver ordering, prerelease included (v1.3.10-beta.2).
+ *
+ * The old comparator dropped everything after '-', so 1.3.10-beta.1 and 1.3.10-beta.2 compared equal; reversing the sorted
+ * list then put beta.1 first, so "newest is first" and "descending order" could not both hold. Prerelease identifiers are
+ * compared the way semver defines them: a release outranks its prereleases, numeric identifiers compare numerically, and a
+ * shorter identifier list sorts first when every shared identifier matches.
+ */
 function compareVersions(a, b) {
-  const parse = (v) => v.split('-')[0].split('.').map(Number);
-  const [x, y] = [parse(a), parse(b)];
-  for (let i = 0; i < 3; i += 1) if (x[i] !== y[i]) return x[i] - y[i];
+  const parse = (v) => {
+    const [core, prerelease = null] = String(v).split('-', 2);
+    return { nums: core.split('.').map(Number), pre: prerelease === null ? null : prerelease.split('.') };
+  };
+  const x = parse(a);
+  const y = parse(b);
+  for (let i = 0; i < 3; i += 1) if (x.nums[i] !== y.nums[i]) return x.nums[i] - y.nums[i];
+  if (x.pre === null && y.pre === null) return 0;
+  if (x.pre === null) return 1;
+  if (y.pre === null) return -1;
+  for (let i = 0; i < Math.max(x.pre.length, y.pre.length); i += 1) {
+    const left = x.pre[i];
+    const right = y.pre[i];
+    if (left === undefined) return -1;
+    if (right === undefined) return 1;
+    const leftNumeric = /^[0-9]+$/.test(left);
+    const rightNumeric = /^[0-9]+$/.test(right);
+    if (leftNumeric && rightNumeric) {
+      const diff = Number(left) - Number(right);
+      if (diff !== 0) return diff;
+    } else if (leftNumeric !== rightNumeric) {
+      return leftNumeric ? -1 : 1;
+    } else if (left !== right) {
+      return left < right ? -1 : 1;
+    }
+  }
   return 0;
 }
 

@@ -38,6 +38,7 @@ export const LAYERS = Object.freeze([
   { name: 'util', rank: 0, kind: 'leaf', note: 'shared helpers with no intra-src imports' },
   { name: 'shared', rank: 0, kind: 'leaf', note: 'root-level src/*.mjs imported across layers (signing.mjs)' },
   { name: 'chatops', rank: 1, kind: 'capability', note: 'chat-command surfaces; depended on by relay' },
+  { name: 'maintenance', rank: 1, kind: 'capability', note: 'signed maintenance requests; the root runner never executes agent-requested shell' },
   { name: 'agent', rank: 2, kind: 'capability', note: 'the machine-side agent; depended on by plugin' },
   { name: 'relay', rank: 3, kind: 'service', note: 'the relay server; depends on chatops' },
   { name: 'plugin', rank: 4, kind: 'surface', note: 'the DSH-facing tool surface; the only entry point' },
@@ -60,6 +61,8 @@ export const ALLOWED_EDGES = Object.freeze([
   // v0.30.0: the shared sliding-window limiter. Not ['agent', 'relay'] -- that edge points UP (agent is
   // rank 2, relay is rank 3), and the class moved to util rather than the model being widened.
   ['agent', 'util'],
+  // v1.3.10-beta.2: the agent verifies a signed maintenance request and ferries it; the root runner executes it.
+  ['agent', 'maintenance'],
   // The same limiter, reached from the layer it was originally written in. Also downward (relay 3 -> util 0),
   // and the second half of the same decision: one shared window rather than two that could disagree.
   ['relay', 'util'],

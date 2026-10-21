@@ -7,6 +7,27 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.10-beta.2] — 2026-10-21
+
+**M1 maintenance channel: relay passthrough + agent ferry.** The remote loop now has both ends.
+
+- The relay accepts an optional `maintenance` request and `operator_key` on `POST /v1/task` (operator token already required),
+  registers the key once (`operator.key.registered` in the ledger, replayed on restart), carries the request on the offer, and
+  exposes `maintenance_request_id` on the task summary.
+- `src/agent/maintenance-ferry.mjs` — the agent pins the operator key on first sight (TOFU, rotation chain thereafter), verifies
+  the request against the pin, writes it atomically into the queue the root runner watches, waits for the runner's result file,
+  and reports it as the task result. A refusal is a named value (`MAINTENANCE_NO_PINNED_KEY`, `MAINTENANCE_BAD_SIGNATURE`,
+  `MAINTENANCE_RUNNER_TIMEOUT`, ...), never a thrown error, so the task result says why.
+- The agent never gains the privilege to run update/restart/diag: the root runner (beta.1) remains the only executor.
+- Layer model declares `maintenance` as a capability layer with an `agent -> maintenance` edge, so the new dependency is
+  explained rather than excused.
+
+Known gap, stated: no fake-runner agent-e2e test for the ferry yet (the ferry's own four cases cover pin/verify/queue/refusal);
+the end-to-end case lands with the real-machine acceptance run in beta.3.
+
+Verified: gate GREEN twice with the bundled node on PATH: 2731 tests / 2717 pass / 0 fail / 14 skip in 135 files
+(agent 154/152, relay 181/181, maintenance 17/17, ferry 4/4, layer-model 24/24, claims 44/44).
+
 ## [1.3.10-beta.1] — 2026-10-21
 
 **M1 maintenance channel, first implementation slice.** Design: `docs/COLLAB/M1-MAINTENANCE.md` (the design series names this slice v1.3.2-beta; it ships as 1.3.10-beta.1 because 1.3.9 was already published as a stable release and versions must stay ordered).

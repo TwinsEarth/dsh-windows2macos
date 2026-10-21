@@ -509,6 +509,8 @@ export class RabbitState {
     /** @type {{seq:number,event:object,target:string|null}[]} ring buffer, last N events */
     this.buffer = [];
     this.devices = new Map();      // machine_id -> device
+    // v1.3.10-beta.2: operator signing keys seen with a dispatch; agents pin the first one they receive.
+    this.operatorKeys = new Map();
     /** v1.2.5: operator-assigned roles, kept apart from device records so a re-pair cannot change authority. */
     this.roles = new Map();        // machine_id -> 'owner'|'worker'|'observer'
     /** v1.2.5: read watermarks per session, per machine. */
@@ -705,6 +707,10 @@ export class RabbitState {
 
   /** @returns {boolean} true when a new task was created. */
   _applyLedgerEntry(entry) {
+    if (entry?.type === 'operator.key.registered' && entry.key && typeof entry.key.key_id === 'string') {
+      this.operatorKeys.set(entry.key.key_id, { ...entry.key });
+      return false;
+    }
     if (!entry || typeof entry.type !== 'string') return false;
     switch (entry.type) {
       case 'task.created': {
@@ -1730,6 +1736,34 @@ export class RabbitState {
      * v1.2.10: validate the reduce artifact list up front. A malformed list would otherwise become an offer the machine
      * cannot execute, and the failure would surface as a generic refusal on the executor instead of at dispatch.
      */
+    /**
+     * v1.3.10-beta.2: a maintenance request is opaque to the relay (the root runner is the authority) but its shape and
+     * size are checked here so a malformed request is refused at dispatch instead of on a machine it was never meant for.
+     */
+    const rawMaintenance = input.maintenance ?? null;
+    let normalizedMaintenance = null;
+    if (rawMaintenance !== null) {
+      if (typeof rawMaintenance !== 'object' || Array.isArray(rawMaintenance) || Buffer.byteLength(JSON.stringify(rawMaintenance), 'utf8') > 64 * 1024) {
+        throw new ProtocolError('BAD_REQUEST', 'maintenance must be an object of at most 64 KiB', {});
+      }
+      if (typeof rawMaintenance.request_id !== 'string' || rawMaintenance.request_id === '') {
+        throw new ProtocolError('BAD_REQUEST', 'maintenance.request_id is required', {});
+      }
+      normalizedMaintenance = rawMaintenance;
+    }
+    const rawOperatorKey = input.operator_key ?? null;
+    let normalizedOperatorKey = null;
+    if (rawOperatorKey !== null) {
+      if (typeof rawOperatorKey !== 'object' || Array.isArray(rawOperatorKey)) throw new ProtocolError('BAD_REQUEST', 'operator_key must be an object', {});
+      if (typeof rawOperatorKey.key_id !== 'string' || typeof rawOperatorKey.public_key_pem !== 'string') {
+        throw new ProtocolError('BAD_REQUEST', 'operator_key needs key_id and public_key_pem', {});
+      }
+      normalizedOperatorKey = { key_id: rawOperatorKey.key_id, public_key_pem: rawOperatorKey.public_key_pem, created_at: rawOperatorKey.created_at ?? new Date(this.nowMs()).toISOString() };
+      if (this.operatorKeys.has(normalizedOperatorKey.key_id) === false) {
+        this.operatorKeys.set(normalizedOperatorKey.key_id, normalizedOperatorKey);
+        this._ledger({ type: 'operator.key.registered', key: normalizedOperatorKey });
+      }
+    }
     const rawReduceInputs = input.reduce_inputs === undefined || input.reduce_inputs === null ? [] : input.reduce_inputs;
     if (!Array.isArray(rawReduceInputs) || rawReduceInputs.length > 16) {
       throw new ProtocolError('BAD_REQUEST', 'reduce_inputs must be an array of at most 16 artifacts', { count: Array.isArray(rawReduceInputs) ? rawReduceInputs.length : null });
@@ -1783,6 +1817,10 @@ export class RabbitState {
        * the task (never inferred by the reducer), because "which shards this reduce covers" is the completeness contract.
        */
       reduce_of: typeof input.reduce_of === 'string' && input.reduce_of !== '' ? input.reduce_of : null,
+      /** v1.3.10-beta.2: a signed maintenance request travels with the task; the relay carries it, the root runner verifies it. */
+      maintenance: normalizedMaintenance,
+      operator_key: normalizedOperatorKey,
+      maintenance_summary: normalizedMaintenance === null ? null : { request_id: normalizedMaintenance.request_id ?? null, action: normalizedMaintenance.action ?? null },
       reduce_inputs: normalizedReduceInputs,
       leases: new Map(),
       cancelled: false,
@@ -2067,6 +2105,7 @@ export class RabbitState {
             depends_on: Array.isArray(task.depends_on) ? task.depends_on : [],
             assignee: task.assignee ?? null,
             reduce_of: task.reduce_of ?? null,
+            maintenance_summary: task.maintenance_summary ?? null,
             reduce_inputs: Array.isArray(task.reduce_inputs) ? task.reduce_inputs : [],
         origin_machine_id: task.origin_machine_id ?? null,
         p2p: task.p2p ?? null,
@@ -2181,6 +2220,8 @@ export class RabbitState {
       p2p: task.p2p ?? null,
       // v1.2.10: present only on a reduce task, so a normal offer stays byte-identical.
       ...(task.reduce_of !== null ? { reduce_of: task.reduce_of, reduce_inputs: task.reduce_inputs } : {}),
+      // v1.3.10-beta.2: the signed request and its operator key travel together; the agent pins the key on first sight.
+      ...(task.maintenance !== null && task.maintenance !== undefined ? { maintenance: task.maintenance, operator_key: task.operator_key } : {}),
       cwd_rel: task.cwd_rel,
       // Omitted when false, so a single-command offer for every existing caller stays byte-identical -- the
       // same reason `stages` above is conditional.
@@ -2339,6 +2380,7 @@ export class RabbitState {
        */
       reduce_of: task.reduce_of ?? null,
       reduce_inputs: Array.isArray(task.reduce_inputs) ? task.reduce_inputs : [],
+      maintenance_request_id: task.maintenance_summary?.request_id ?? null,
       status: (() => {
         if (task.cancelled === true) return 'cancelled';
         const leases = [...task.leases.values()];
