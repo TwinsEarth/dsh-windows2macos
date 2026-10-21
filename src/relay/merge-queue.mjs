@@ -107,7 +107,17 @@ export function createMergeQueue({ policy = 'strict', slotTtlMs = 10 * 60 * 1000
           await git(['apply', '--3way', '--whitespace=nowarn', patchFile], worktree);
         } catch (error) {
           this.finish(target.queueId, 'conflict');
-          return { ok: false, code: 'MERGE_CONFLICT', files: changedFiles(target.patch), detail: String(error?.message ?? error).split('\n').slice(0, 6), baseCommit: target.baseCommit, headCommit };
+          // The conflict itself is evidence, not just a failure: capture the file state git left behind (conflict markers
+          // included) so a reviewer can see exactly what clashed, and the head can stay where it was.
+          let conflictArtifact = null;
+          try {
+            const diff = await git(['diff'], worktree);
+            const text = diff.stdout;
+            if (typeof text === 'string' && text.trim() !== '') {
+              conflictArtifact = { sha256: patchSha(text), bytes: Buffer.byteLength(text, 'utf8'), text: text.slice(0, 64 * 1024) };
+            }
+          } catch { /* the diff is evidence, not a precondition for reporting the conflict */ }
+          return { ok: false, code: 'MERGE_CONFLICT', files: changedFiles(target.patch), detail: String(error?.message ?? error).split('\n').slice(0, 6), conflictArtifact, baseCommit: target.baseCommit, headCommit };
         }
         await git(['add', '--all'], worktree);
         await git(['-c', 'user.name=w2m-merge', '-c', 'user.email=merge@w2m.invalid', 'commit', '-m', 'merge: ' + target.queueId], worktree);

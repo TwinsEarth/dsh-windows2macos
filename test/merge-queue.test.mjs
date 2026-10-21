@@ -84,6 +84,9 @@ describe('merge queue', () => {
     assert.equal(conflict.ok, false);
     assert.equal(conflict.code, 'MERGE_CONFLICT');
     assert.deepEqual(conflict.files, ['a.txt']);
+    assert.ok(conflict.conflictArtifact, 'the conflict itself is captured as an artifact');
+    assert.match(conflict.conflictArtifact.text, /<<<<<<<|=======|>>>>>>>/);
+    assert.match(conflict.conflictArtifact.sha256, /^[0-9a-f]{64}$/);
     assert.equal(git(dir, 'rev-parse', 'HEAD'), mergedA.headCommit, 'a conflict never advances the head');
   });
 

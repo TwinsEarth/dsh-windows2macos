@@ -7,6 +7,20 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.10-beta.9] — 2026-10-22
+
+**M3 conflict contract completed: MERGE_CONFLICT now carries the conflict itself.**
+
+When `git apply --3way` cannot apply a patch, the queue previously reported the changed files and the git message. It now also
+captures the state git left in the merge worktree (conflict markers included) as a `conflictArtifact`:
+`{ sha256, bytes, text }`. That is the evidence a reviewer needs to decide whether to resubmit against the new base or resolve
+by hand, and it is the same content-addressed shape the patch artifacts use.
+
+The head still does not move on a conflict; the test asserts both the artifact (with conflict markers) and the unchanged head,
+and the composed M3 workflow test still passes.
+
+Verified: merge-queue 7/7 (conflict artifact assertion included), m3-workflow 2/2; gate GREEN twice.
+
 ## [1.3.10-beta.8] — 2026-10-22
 
 **M3 composed: worktree -> patch -> merge queue, proven together.**
