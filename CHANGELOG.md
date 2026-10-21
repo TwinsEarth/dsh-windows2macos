@@ -7,6 +7,41 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.9] — 2026-10-21
+
+**Design-first release: the collaboration line is specified, not yet implemented.**
+
+This release ships the design specification for the multi-machine / multi-client collaboration capability, and no behaviour change: the
+plugin, relay and agent are byte-identical in function to 1.3.1. It exists so the plan is reviewable, versioned, and citable before any
+of it is built.
+
+### What is in this release
+
+- `docs/MULTI-MACHINE-COLLABORATION-PLAN.md` — capability audit (what exists today is dispatch + aggregation, not collaboration),
+  root causes (missing execution-authorization model, missing workspace model, missing shared-object model), and the M1–M7 module plan.
+- `docs/COLLAB/M1-MAINTENANCE.md` — v1.3.2-beta design: signed maintenance requests executed by a root/SYSTEM unit through a queue
+  directory; remote update/restart/diag without SSH and without widening the allow-list.
+- `docs/COLLAB/M2-TASK-GRANT.md` — v1.3.3-beta design: operator-signed per-execution grants (argv hash, machine ids, TTL, task binding),
+  agent-side verification, ledger audit, revocation; the allow-list stops being the only execution authority.
+- `docs/COLLAB/M3-GIT-NATIVE-TASKS.md` — v1.3.4-beta design: per-task git worktrees, patch artifacts as the transportable result, a
+  serialized merge queue, and MERGE_CONFLICT as a first-class outcome.
+- `docs/COLLAB/M4-PROJECT-ROOM.md` — v1.3.5-beta design: relay-side project objects (members, board, artifacts, memory, decisions,
+  refs), snapshot + incremental event protocol, role-based permissions.
+- `docs/COLLAB/M5-MULTI-CLIENT-PRIMITIVES.md` — v1.3.6-beta design: branch/file locks, review tasks with findings and merge gating,
+  and notifications with delivery guarantees and read watermarks.
+- `docs/COLLAB/M6-CROSS-NETWORK-RELIABILITY.md` — v1.3.7-beta design: relay as the authoritative channel, chunked/resumable blobs,
+  agent result outbox, and P2P demoted to opportunistic acceleration.
+- `docs/COLLAB/M7-METRICS-ACCEPTANCE.md` — v1.3.8-beta design: every capability must be triggerable by a real task, negative tests are
+  mandatory, metrics are computed by the relay, and evidence is checked by pre-flight.
+
+### What is explicitly not in this release
+
+No code for M1–M7. The three model-level designs (v1.4.0 execution-authorization, v1.4.1 task, v1.4.2 collaboration) are not written yet.
+The next stable release that changes behaviour will be the one that implements M1 + M2 (the remote-operations loop), with real-machine
+acceptance evidence recorded as described in M7.
+
+Verified: gate GREEN twice on this tree; the package differs from 1.3.1 only in documentation and version metadata.
+
 ## [1.3.1] — 2026-10-21
 
 **A red Compat and a green local gate: the loader-entry test was the gap.**
