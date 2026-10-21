@@ -767,7 +767,11 @@ export class RelayServer {
         // scanner the surface exists.
         throw new ProtocolError('NOT_FOUND', 'metrics are not enabled on this relay', { hint: 'start the relay with --metrics' });
       }
-      const body = renderMetrics(this.state, { nowMs: this.state.nowMs() });
+      const publishedBody = renderMetrics(this.state, { nowMs: this.state.nowMs() });
+      // v1.3.10-beta.23: the M7 reliability registry is appended. It renders nothing until a call site records something, so
+      // the existing exposition is unchanged on relays that never instrument.
+      const registryBody = typeof this.state.metrics?.renderPrometheus === 'function' ? this.state.metrics.renderPrometheus() : '';
+      const body = registryBody === '' ? publishedBody : publishedBody + '# reliability registry\n' + registryBody;
       res.writeHead(200, {
         'content-type': METRICS_CONTENT_TYPE,
         'content-length': Buffer.byteLength(body, 'utf8'),
@@ -869,6 +873,8 @@ export class RelayServer {
         if (!canWrite) return sendJson(res, 403, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ok: false, error: { code: 'FORBIDDEN_ACTION', message: 'acquiring a lock needs worker or above', required_role: 'worker', current_role: membership.role } });
         const body = takeJson();
         const acquired = this.state.locks.acquire({ projectId, kind: body?.kind, target: body?.target, holder: { kind: "machine", id: device.machine_id }, reason: body?.reason ?? null, leaseMs: Number.isFinite(body?.lease_ms) ? body.lease_ms : undefined });
+        if (acquired.ok === true) this.state.metrics?.inc('wm_lock_acquired_total', { kind: String(body?.kind ?? '') });
+        else if (acquired.code === 'LOCK_HELD') this.state.metrics?.inc('wm_lock_conflict_total', { kind: String(body?.kind ?? '') });
         return sendJson(res, acquired.ok ? 200 : 409, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ...acquired });
       }
       if (method === 'POST' && lockId !== null && action === 'renew') {

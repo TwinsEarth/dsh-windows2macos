@@ -30,6 +30,7 @@ import { createProjectLocks } from './project-locks.mjs';
 import { createProjectReviews } from './project-reviews.mjs';
 import { createProjectNotifications } from './project-notifications.mjs';
 import { createBlobSessions } from './blob-sessions.mjs';
+import { createMetrics } from './reliability-metrics.mjs';
 
 export const PROTOCOL_VERSION = 1;
 
@@ -517,7 +518,13 @@ export class RabbitState {
     // v1.3.10-beta.2: operator signing keys seen with a dispatch; agents pin the first one they receive.
     this.operatorKeys = new Map();
     // v1.3.10-beta.13: shared project objects (M4). Tasks name a project; readers get snapshot + events.
-    this.projects = createProjectRoom({ now: () => this.nowMs() });
+    this.metrics = createMetrics();
+    // Every project-room event is counted once, here: the room's own events and the lock/review/notification events projected
+    // into it both pass through this callback, so the counter cannot double-count a projection.
+    const metricsEvent = (event) => {
+      try { this.metrics.inc('wm_project_events_total', { type: event.type }); } catch { /* metrics never break the room */ }
+    };
+    this.projects = createProjectRoom({ now: () => this.nowMs(), onEvent: metricsEvent });
     this.defaultProjectId = 'default';
     // M5 primitives share the project room's event stream: a lock, review or notification is a project event with the
     // module's own sequence attached, so one reader can reconstruct "what happened" from a single cursor.

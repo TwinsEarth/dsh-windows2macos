@@ -4905,3 +4905,22 @@ describe('blob session routes', () => {
     } finally { removeStateDir(dir); }
   });
 });
+
+describe('reliability registry on /metrics', () => {
+  it('appends the recorded M7 series to the exposition', async () => {
+    await withRelay({ metrics: true }, async (relay) => {
+      const device = await pairDevice(relay, 'm-met-1');
+      const created = await request(relay.url + '/v1/projects', { method: 'POST', token: OP, body: { name: 'metrics', members: [{ kind: 'machine', id: 'm-met-1', role: 'worker' }] } });
+      assert.equal(created.status, 200, created.text);
+      const metrics = await request(relay.url + '/metrics');
+      assert.equal(metrics.status, 200, metrics.text);
+      assert.match(metrics.text, /w2m_devices_online/);
+      assert.match(metrics.text, /# reliability registry/);
+      assert.match(metrics.text, /wm_project_events_total\{type="project.created"\} 1/);
+      const acquired = await request(relay.url + '/v1/projects/' + created.json.project.project.project_id + '/locks', { method: 'POST', token: device.token, body: { kind: 'branch', target: { branch: 'main' } } });
+      assert.equal(acquired.status, 200, acquired.text);
+      const again = await request(relay.url + '/metrics');
+      assert.match(again.text, /wm_lock_acquired_total\{kind="branch"\} 1/);
+    });
+  });
+});

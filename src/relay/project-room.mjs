@@ -34,7 +34,7 @@ export class ProjectRoomError extends Error {
   }
 }
 
-export function createProjectRoom({ now = () => Date.now() } = {}) {
+export function createProjectRoom({ now = () => Date.now(), onEvent = null } = {}) {
   const projects = new Map();
   const events = [];
   let seq = 0;
@@ -44,6 +44,7 @@ export function createProjectRoom({ now = () => Date.now() } = {}) {
     seq += 1;
     const event = { seq, project_id: projectId, type, actor, payload, at: new Date(now()).toISOString() };
     events.push(event);
+    if (typeof onEvent === 'function') onEvent(event);
     return event;
   };
 

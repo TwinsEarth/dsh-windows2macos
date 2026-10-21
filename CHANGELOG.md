@@ -7,6 +7,22 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.10-beta.23] — 2026-10-22
+
+**M7 wiring: the registry is live on /metrics.**
+
+- Relay state owns the M7 registry. The project room now notifies a listener per event, and that callback counts
+  `wm_project_events_total{type}` once for both the room's own events (project created, member changes, task linked) and the
+  lock/review/notification events projected into it — a projection is appended, then counted through the room hook, so it cannot
+  be double-counted.
+- `GET /metrics` appends the registry body under a `# reliability registry` marker. A relay that never records into the registry
+  renders exactly what it rendered before, which is why the existing exposition tests still pass unchanged.
+- Lock routes count `wm_lock_acquired_total{kind}` and `wm_lock_conflict_total{kind}`.
+- One route test: after creating a project and acquiring a branch lock, `/metrics` carries
+  `wm_project_events_total{type="project.created"}` and `wm_lock_acquired_total{kind="branch"}`.
+
+Verified: relay 189/189 (one new test); the registry and room suites are unchanged; gate GREEN twice.
+
 ## [1.3.10-beta.22] — 2026-10-22
 
 **M7 first slice: one metrics contract for the whole collaboration stack.** A local module and eight tests; the relay /metrics

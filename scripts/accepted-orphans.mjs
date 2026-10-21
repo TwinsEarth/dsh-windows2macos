@@ -50,12 +50,6 @@ export const REASON = Object.freeze({
  */
 export const ACCEPTED_ORPHANS = Object.freeze([
   {
-    file: 'src/relay/reliability-metrics.mjs',
-    reason: REASON.LIBRARY,
-    why: 'M7 metrics registry: declarative metric contract with cardinality guard and Prometheus rendering; the relay /metrics route still uses src/relay/metrics.mjs and no call site records yet',
-    removedBy: 'the /metrics route switching to the registry and the instrumentation call sites (M7 wiring slice)',
-  },
-  {
     file: 'src/agent/outbox.mjs',
     reason: REASON.LIBRARY,
     why: 'M6 result outbox: atomic per-result files, exponential backoff, cross-restart recovery, count/byte ceiling; the agent delivery path still uses the existing spool and does not call it yet',
