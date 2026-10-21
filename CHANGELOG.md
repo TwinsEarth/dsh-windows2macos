@@ -7,6 +7,27 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.10-beta.4] — 2026-10-21
+
+**M1 bootstrap tooling: one privileged step, then the channel is remote.** No runtime behaviour changes.
+
+- `deploy/maintenance/bootstrap.sh` (Linux, run once as root) — installs the fixed-action path unit/service, creates the
+  queue/done/claimed directories with root ownership, optionally pins the operator public key, and enables the watcher. It
+  refuses to run without `--machine-id` and refuses a tree where `bin/w2m-maintenance.mjs` is absent.
+- `deploy/maintenance/bootstrap.ps1` (Windows, run once as Administrator) — same shape via a SYSTEM scheduled task; it
+  substitutes the app directory and machine id into the task XML rather than editing the shipped file.
+- `docs/COLLAB/M1-ACCEPTANCE-RUNBOOK.md` — the real-machine acceptance cases (diag/restart/update/rollback plus four named
+  refusals), what "green" means, and the limitations that must appear in the release note (privileged bootstrap, TOFU pinning,
+  no automatic recovery if a restarted machine cannot be reached).
+
+Both scripts install **only** the fixed update/restart/diag runner; neither installs a shell, and neither touches the
+allow-list. The design's security boundary is unchanged: the agent ferries a signed request, the root runner decides.
+
+Honest gap, unchanged: the M1 real-machine acceptance run itself still needs a machine with a privileged bootstrap and a
+relay carrying the maintenance fields; and the M2 grant path still lacks a fake-relay e2e case. Both are next.
+
+Verified: gate GREEN twice; pack carries the new scripts and document.
+
 ## [1.3.10-beta.3] — 2026-10-21
 
 **M2 first slice: task-level grants become the explicit authorisation channel.** Design: `docs/COLLAB/M2-TASK-GRANT.md`.
