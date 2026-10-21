@@ -131,6 +131,7 @@ const EXPECTED_TOOLS = [
   'w2m_devices',
   'w2m_history',
   'w2m_memory',
+  'w2m_reduce',
   'w2m_report',
   'w2m_run',
   'w2m_stats',

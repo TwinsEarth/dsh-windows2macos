@@ -7,7 +7,7 @@
 
 All notable changes to this project are documented here.
 
-## [1.3.1-beta.1] — 2026-10-21
+## [1.3.1-beta.2] — 2026-10-21
 
 **A red Compat and a green local gate: the loader-entry test was the gap.**
 
@@ -16,7 +16,7 @@ artifact to register, and the artifact registers sixteen (`w2m_reduce`). The gat
 matched the *other* fixture it derives from, so the disagreement only appeared in the packed-copy mount. The expectation now names
 `w2m_reduce`, and this patch release is the artifact that matches it.
 
-No behaviour changes: the fix is the expectation, not the tool surface. v1.3.0 is superseded.
+No behaviour changes: the fix is the expectation, not the tool surface. beta.2 completes the fix: `EXPECTED_TOOLS` in that same test is the list the loader gate compares against, and beta.1 patched only the other fixture. v1.3.0 is superseded.
 
 A beta by policy: GitHub prerelease only, never npm. Verified: gate GREEN twice (2710 tests / 2696 pass / 0 fail / 14 skip in 133 files); the Compat re-run on this tag is the acceptance check, and this stays a prerelease either way.
 
