@@ -4952,3 +4952,108 @@ describe('state publishing: a failed rename is retried and cleaned up (v0.5.10)'
     }
   });
 });
+
+describe('grant e2e (v1.3.10-beta.6 slice)', () => {
+  const offerFor = (taskId, argv, overrides = {}) => ({
+    task_id: taskId,
+    attempt: 1,
+    mode: 'replicate',
+    index: 0,
+    index_total: 1,
+    command_argv: argv,
+    cwd_rel: '.',
+    write: false,
+    timeout_ms: 30_000,
+    dedupe_key: 'dk-' + taskId,
+    ...overrides,
+  });
+
+  const readyFrame = { protocol_version: 1, rabbit_time: '2026-10-21T12:00:00Z', machine_id: 'rabbit' };
+
+  it('executes a command under an empty allow-list when a valid grant authorises it', async () => {
+    const grant = await import('../src/maintenance/grant.mjs');
+    const operator = await import('../src/maintenance/operator-key.mjs');
+    const rabbit = await startFakeRabbit();
+    const project = await makeRepo('grant-e2e-ok');
+    const keys = operator.generateOperatorKeyPair();
+    const argv = [NODE, '-e', 'process.stdout.write("grant-ok")'];
+    const taskId = '01J-GRANT-E2E-OK';
+    process.env.W2M_MAINTENANCE_PINS = join(project, '.grant-pins.json');
+    try {
+      const signed = grant.signGrant(grant.buildGrant({ taskId, machineIds: ['m-grant-e2e'], argv, nowMs: Date.now(), ttlMs: 60_000 }), keys.privateKeyPem);
+      const agent = makeAgent({ rabbit: rabbit.url, project, allowed: [], name: 'grant-e2e-ok' });
+      const running = agent.start();
+      const stream = await rabbit.stream();
+      stream.send('ready', readyFrame);
+      stream.send('task.offer', offerFor(taskId, argv, { machine_id: 'm-grant-e2e', operator_key: operator.registrationPayload(keys), grant: signed }));
+      await running;
+      const envelope = rabbit.state.results[0];
+      assert.equal(envelope.status, 'ok');
+      assert.equal(envelope.stdout_sha256, sha256Hex('grant-ok'));
+    } finally { await rabbit.close(); delete process.env.W2M_MAINTENANCE_PINS; }
+  });
+
+  it('refuses argv that the grant does not cover, even with an empty allow-list', async () => {
+    const grant = await import('../src/maintenance/grant.mjs');
+    const operator = await import('../src/maintenance/operator-key.mjs');
+    const rabbit = await startFakeRabbit();
+    const project = await makeRepo('grant-e2e-argv');
+    const keys = operator.generateOperatorKeyPair();
+    const signedArgv = [NODE, '-e', 'process.stdout.write("allowed")'];
+    const otherArgv = [NODE, '-e', 'process.stdout.write("not-allowed")'];
+    const taskId = '01J-GRANT-E2E-ARGV';
+    process.env.W2M_MAINTENANCE_PINS = join(project, '.grant-pins.json');
+    try {
+      const signed = grant.signGrant(grant.buildGrant({ taskId, machineIds: ['m-grant-e2e'], argv: signedArgv, nowMs: Date.now(), ttlMs: 60_000 }), keys.privateKeyPem);
+      const agent = makeAgent({ rabbit: rabbit.url, project, allowed: [], name: 'grant-e2e-argv' });
+      const running = agent.start();
+      const stream = await rabbit.stream();
+      stream.send('ready', readyFrame);
+      stream.send('task.offer', offerFor(taskId, otherArgv, { machine_id: 'm-grant-e2e', operator_key: operator.registrationPayload(keys), grant: signed }));
+      await running;
+      const envelope = rabbit.state.results[0];
+      assert.equal(envelope.status, 'refused');
+      assert.equal(envelope.refusal_reason, 'GRANT_ARGV_MISMATCH');
+    } finally { await rabbit.close(); delete process.env.W2M_MAINTENANCE_PINS; }
+  });
+
+  it('refuses with COMMAND_NOT_ALLOWED when no grant is present', async () => {
+    const rabbit = await startFakeRabbit();
+    const project = await makeRepo('grant-e2e-none');
+    const argv = [NODE, '-e', 'process.stdout.write("no-grant")'];
+    try {
+      const agent = makeAgent({ rabbit: rabbit.url, project, allowed: [], name: 'grant-e2e-none' });
+      const running = agent.start();
+      const stream = await rabbit.stream();
+      stream.send('ready', readyFrame);
+      stream.send('task.offer', offerFor('01J-GRANT-E2E-NONE', argv));
+      await running;
+      const envelope = rabbit.state.results[0];
+      assert.equal(envelope.status, 'refused');
+      assert.equal(envelope.refusal_reason, 'COMMAND_NOT_ALLOWED');
+    } finally { await rabbit.close(); }
+  });
+
+  it('refuses a grant that names a different machine', async () => {
+    const grant = await import('../src/maintenance/grant.mjs');
+    const operator = await import('../src/maintenance/operator-key.mjs');
+    const rabbit = await startFakeRabbit();
+    const project = await makeRepo('grant-e2e-machine');
+    const keys = operator.generateOperatorKeyPair();
+    const argv = [NODE, '-e', 'process.stdout.write("wrong-machine")'];
+    const taskId = '01J-GRANT-E2E-MACHINE';
+    process.env.W2M_MAINTENANCE_PINS = join(project, '.grant-pins.json');
+    try {
+      const signed = grant.signGrant(grant.buildGrant({ taskId, machineIds: ['someone-else'], argv, nowMs: Date.now(), ttlMs: 60_000 }), keys.privateKeyPem);
+      const agent = makeAgent({ rabbit: rabbit.url, project, allowed: [], name: 'grant-e2e-machine' });
+      const running = agent.start();
+      const stream = await rabbit.stream();
+      stream.send('ready', readyFrame);
+      stream.send('task.offer', offerFor(taskId, argv, { machine_id: 'm-grant-e2e', operator_key: operator.registrationPayload(keys), grant: signed }));
+      await running;
+      const envelope = rabbit.state.results[0];
+      assert.equal(envelope.status, 'refused');
+      assert.equal(envelope.refusal_reason, 'GRANT_WRONG_MACHINE');
+    } finally { await rabbit.close(); delete process.env.W2M_MAINTENANCE_PINS; }
+  });
+});

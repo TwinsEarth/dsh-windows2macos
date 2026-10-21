@@ -2964,7 +2964,8 @@ export function createAgent(options) {
        * Ask the grant gate before falling through to the allow-list refusal, and never the other way round.
        */
       let allowed = matchAllowedCommand(commandArgv, allowedCommands);
-      if (allowed.ok !== true && offer && typeof offer.grant === 'object' && offer.grant !== null) {
+      let grantAuthorized = false;
+      if (allowed.allowed !== true && offer && typeof offer.grant === 'object' && offer.grant !== null) {
         const gatePaths = maintenancePaths();
         const gate = await authorizeWithGrant({
           offer,
@@ -2972,7 +2973,7 @@ export function createAgent(options) {
           pinFile: gatePaths.pinFile,
           usedFile: join(dirname(gatePaths.pinFile), 'grant-uses.json'),
         });
-        if (gate.ok === true) allowed = { ok: true, grant_id: gate.grantId };
+        if (gate.ok === true) { allowed = { allowed: true, ok: true, grant_id: gate.grantId }; grantAuthorized = true; }
         else allowed = { ok: false, reason_code: gate.code ?? 'GRANT_REJECTED', detail: gate.message };
       }
       if (!allowed.allowed) {
@@ -3129,7 +3130,8 @@ export function createAgent(options) {
       }
 
       for (const stage of plannedStages) {
-        const stageAllowed = matchAllowedCommand(stage.command_argv, allowedCommands);
+        // v1.3.10-beta.6: a grant that authorised step 5 covers the whole task, but only for the argv it signed.
+      const stageAllowed = grantAuthorized ? { allowed: true, ok: true } : matchAllowedCommand(stage.command_argv, allowedCommands);
         if (stageAllowed.allowed) continue;
         const code = stageAllowed.reason_code ?? REFUSAL.COMMAND_NOT_ALLOWED;
         log('warn', `refused ${offer.task_id}: ${code} at stage ${stage.index}`, {

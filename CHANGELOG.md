@@ -7,6 +7,25 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.10-beta.5] — 2026-10-21
+
+**M2 grant e2e: the explicit-authorisation path is proven end to end.**
+
+Four fake-relay tests now drive the real agent process:
+
+- an empty allow-list executes a command **only** because a valid grant authorises that exact argv (the envelope is `ok` and
+  the stdout hash matches);
+- the same command with no grant is still `COMMAND_NOT_ALLOWED`;
+- a grant that signed a different argv is refused with `GRANT_ARGV_MISMATCH`;
+- a grant that names another machine is refused with `GRANT_WRONG_MACHINE`.
+
+Two integration defects the e2e exposed, both fixed: the per-stage allow-list re-check ran again after step 5, so a grant that
+had authorised the task was refused at the stage boundary; and the matcher's result carries `allowed` (not `ok`), so both the
+gate result and the stage override had to use that shape or the refusal fell back to `COMMAND_NOT_ALLOWED`.
+
+Verified: agent 158/156 (4 new e2e cases), relay 181/181, grant 10/10, grant-gate 6/6, maintenance 17/17, ferry 4/4,
+layer-model 24/24, claims 47/47; gate GREEN twice.
+
 ## [1.3.10-beta.4] — 2026-10-21
 
 **M1 bootstrap tooling: one privileged step, then the channel is remote.** No runtime behaviour changes.
