@@ -849,6 +849,43 @@ export class RelayServer {
       throw new ProtocolError('UNAUTHORIZED', 'missing or invalid device_token', {});
     }
     this.state.touchDevice(device.machine_id);
+
+    const projectLockMatch = /^\/v1\/projects\/([^/]+)\/locks(?:\/([^/]+)(?:\/(renew))?)?$/.exec(path);
+    if (projectLockMatch !== null && method !== undefined) {
+      const projectId = decodeURIComponent(projectLockMatch[1]);
+      const lockId = projectLockMatch[2] === undefined ? null : decodeURIComponent(projectLockMatch[2]);
+      const action = projectLockMatch[3] ?? null;
+      const roomMember = { kind: 'machine', id: device.machine_id };
+      const snapshot = this.state.projectSnapshot(projectId);
+      const isDefault = snapshot.project.project_id === this.state.defaultProjectId;
+      const membership = isDefault ? { role: 'worker' } : this.state.projects.memberOf({ projectId, member: roomMember });
+      if (membership === null) return sendJson(res, 404, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ok: false, error: { code: 'NOT_FOUND', message: 'unknown project' } });
+      const roleRank = { observer: 0, worker: 1, maintainer: 2, owner: 3 };
+      const canWrite = roleRank[membership.role] >= roleRank.worker;
+      if (method === 'GET' && lockId === null) {
+        return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ok: true, locks: this.state.locks.list({ projectId }) });
+      }
+      if (method === 'POST' && lockId === null) {
+        if (!canWrite) return sendJson(res, 403, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ok: false, error: { code: 'FORBIDDEN_ACTION', message: 'acquiring a lock needs worker or above', required_role: 'worker', current_role: membership.role } });
+        const body = takeJson();
+        const acquired = this.state.locks.acquire({ projectId, kind: body?.kind, target: body?.target, holder: { kind: "machine", id: device.machine_id }, reason: body?.reason ?? null, leaseMs: Number.isFinite(body?.lease_ms) ? body.lease_ms : undefined });
+        return sendJson(res, acquired.ok ? 200 : 409, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ...acquired });
+      }
+      if (method === 'POST' && lockId !== null && action === 'renew') {
+        const renewed = this.state.locks.renew({ projectId, lockId, holder: { kind: "machine", id: device.machine_id } });
+        return sendJson(res, renewed.ok ? 200 : 409, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ...renewed });
+      }
+      if (method === 'DELETE' && lockId !== null) {
+        const force = url.searchParams.get('force') === '1';
+        const reason = url.searchParams.get('reason');
+        const released = force
+          ? this.state.locks.forceRelease({ projectId, lockId, actor: { kind: "machine", id: device.machine_id }, actorRole: membership.role, reason })
+          : this.state.locks.release({ projectId, lockId, holder: { kind: "machine", id: device.machine_id } });
+        return sendJson(res, released.ok ? 200 : 409, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ...released });
+      }
+      return sendJson(res, 405, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ok: false, error: { code: 'METHOD_NOT_ALLOWED', message: 'unsupported lock operation' } });
+    }
+
     /**
      * v1.3.10-beta.14: project-room reads (M4). Below the device guard, so the device is already authenticated.
      *

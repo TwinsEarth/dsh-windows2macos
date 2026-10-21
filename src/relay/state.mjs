@@ -26,6 +26,9 @@ import { validateTaskDependencies } from './task-deps.mjs';
 import { buildMembers, isMemberRole, setMemberRole as applyMemberRole } from './fleet-members.mjs';
 import { canonicalSignedPayload, publicKeyFromBase64 } from '../util/envelope-signature.mjs';
 import { createProjectRoom } from './project-room.mjs';
+import { createProjectLocks } from './project-locks.mjs';
+import { createProjectReviews } from './project-reviews.mjs';
+import { createProjectNotifications } from './project-notifications.mjs';
 
 export const PROTOCOL_VERSION = 1;
 
@@ -515,6 +518,16 @@ export class RabbitState {
     // v1.3.10-beta.13: shared project objects (M4). Tasks name a project; readers get snapshot + events.
     this.projects = createProjectRoom({ now: () => this.nowMs() });
     this.defaultProjectId = 'default';
+    // M5 primitives share the project room's event stream: a lock, review or notification is a project event with the
+    // module's own sequence attached, so one reader can reconstruct "what happened" from a single cursor.
+    const roomEvent = (event) => {
+      try {
+        this.projects.appendEvent({ projectId: event.payload.project_id, type: event.type, actor: { kind: 'operator', id: 'relay' }, payload: { ...event.payload, module_seq: event.seq } });
+      } catch { /* an event about a project that is gone is history, not an error */ }
+    };
+    this.locks = createProjectLocks({ now: () => this.nowMs(), onEvent: roomEvent });
+    this.reviews = createProjectReviews({ now: () => this.nowMs(), onEvent: roomEvent });
+    this.notifications = createProjectNotifications({ now: () => this.nowMs(), onEvent: roomEvent });
     /** v1.2.5: operator-assigned roles, kept apart from device records so a re-pair cannot change authority. */
     this.roles = new Map();        // machine_id -> 'owner'|'worker'|'observer'
     /** v1.2.5: read watermarks per session, per machine. */

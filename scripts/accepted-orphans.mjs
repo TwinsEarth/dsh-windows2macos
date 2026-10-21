@@ -50,24 +50,6 @@ export const REASON = Object.freeze({
  */
 export const ACCEPTED_ORPHANS = Object.freeze([
   {
-    file: 'src/relay/project-notifications.mjs',
-    reason: REASON.LIBRARY,
-    why: 'M5 notifications: per-reader watermark, 60s dedupe, per-minute digest, retention; the notification routes and the SSE projection do not call it yet',
-    removedBy: 'the /v1/projects/:id/notifications routes (M5 wiring slice)',
-  },
-  {
-    file: 'src/relay/project-reviews.mjs',
-    reason: REASON.LIBRARY,
-    why: 'M5 reviews: request/decide lifecycle, self-review guard, duplicate-verdict refusal, approval gate by patch sha; the /v1/projects/:id/reviews routes and the merge gate do not call it yet',
-    removedBy: 'the review routes and the merge-requires-review gate (M5 wiring slice)',
-  },
-  {
-    file: 'src/relay/project-locks.mjs',
-    reason: REASON.LIBRARY,
-    why: 'M5 branch/file locks: exclusive lease, renewal, owner force-release, merge preflight conflicts; the relay routes and merge queue do not call it yet',
-    removedBy: 'the /v1/projects/:id/locks routes and the merge preflight lock check (M5 wiring slice)',
-  },
-  {
     file: 'src/relay/merge-queue.mjs',
     reason: REASON.LIBRARY,
     why: 'M3 merge queue: one queue per project+branch, merge-slot serialisation, strict/replay policy, already_merged and MERGE_CONFLICT; the relay task path does not call it yet',

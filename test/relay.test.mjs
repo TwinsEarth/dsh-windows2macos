@@ -4791,3 +4791,59 @@ describe('project room routes', () => {
     });
   });
 });
+
+describe('project lock routes', () => {
+  it('acquires, lists and releases a branch lock, and returns a conflict as an answer', async () => {
+    await withRelay({}, async (relay) => {
+      const one = await pairDevice(relay, 'm-lock-1');
+      const two = await pairDevice(relay, 'm-lock-2');
+      const created = await request(relay.url + '/v1/projects', {
+        method: 'POST',
+        token: OP,
+        body: { name: 'locks', members: [{ kind: 'machine', id: 'm-lock-1', role: 'worker' }, { kind: 'machine', id: 'm-lock-2', role: 'worker' }] },
+      });
+      assert.equal(created.status, 200, created.text);
+      const projectId = created.json.project.project.project_id;
+
+      const acquired = await request(relay.url + '/v1/projects/' + projectId + '/locks', { method: 'POST', token: one.token, body: { kind: 'branch', target: { branch: 'main' }, reason: 'auth work' } });
+      assert.equal(acquired.status, 200, acquired.text);
+      assert.equal(acquired.json.ok, true);
+      const lockId = acquired.json.lock.lock_id;
+
+      const conflict = await request(relay.url + '/v1/projects/' + projectId + '/locks', { method: 'POST', token: two.token, body: { kind: 'branch', target: { branch: 'main' } } });
+      assert.equal(conflict.status, 409);
+      assert.equal(conflict.json.code, 'LOCK_HELD');
+      assert.deepEqual(conflict.json.holder, { kind: 'machine', id: 'm-lock-1' });
+
+      const listed = await request(relay.url + '/v1/projects/' + projectId + '/locks', { token: two.token });
+      assert.equal(listed.status, 200, listed.text);
+      assert.equal(listed.json.locks.length, 1);
+
+      const foreignRelease = await request(relay.url + '/v1/projects/' + projectId + '/locks/' + lockId, { method: 'DELETE', token: two.token });
+      assert.equal(foreignRelease.status, 409);
+      assert.equal(foreignRelease.json.code, 'LOCK_NOT_OWNER');
+
+      const ordered = await request(relay.url + '/v1/projects/' + projectId + '/locks/' + lockId, { method: 'DELETE', token: one.token });
+      assert.equal(ordered.status, 200, ordered.text);
+      assert.equal(ordered.json.ok, true);
+    });
+  });
+
+  it('refuses a non-member and force release without the owner role', async () => {
+    await withRelay({}, async (relay) => {
+      const member = await pairDevice(relay, 'm-lock-3');
+      const outsider = await pairDevice(relay, 'm-lock-4');
+      const created = await request(relay.url + '/v1/projects', { method: 'POST', token: OP, body: { name: 'locks2', members: [{ kind: 'machine', id: 'm-lock-3', role: 'worker' }] } });
+      const projectId = created.json.project.project.project_id;
+      const denied = await request(relay.url + '/v1/projects/' + projectId + '/locks', { token: outsider.token });
+      assert.equal(denied.status, 404);
+
+      const acquired = await request(relay.url + '/v1/projects/' + projectId + '/locks', { method: 'POST', token: member.token, body: { kind: 'file', target: { path: 'src/a.mjs' } } });
+      assert.equal(acquired.status, 200, acquired.text);
+      const lockId = acquired.json.lock.lock_id;
+      const forced = await request(relay.url + '/v1/projects/' + projectId + '/locks/' + lockId + '?force=1&reason=stale', { method: 'DELETE', token: member.token });
+      assert.equal(forced.status, 409);
+      assert.equal(forced.json.code, 'LOCK_FORCE_DENIED');
+    });
+  });
+});

@@ -7,6 +7,23 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.10-beta.18] — 2026-10-22
+
+**M5 wiring, part 1: lock routes and one event stream for the primitives.**
+
+- Relay state now owns the three M5 primitives (locks, reviews, notifications) and projects their events into the project room
+  stream with the module sequence attached, so a client can reconstruct "what happened" from one cursor instead of three.
+- `/v1/projects/:id/locks`: `GET` list, `POST` acquire, `POST …/:lock_id/renew`, `DELETE …/:lock_id` (holder release), and
+  `DELETE …?force=1&reason=…` (owner only). A conflict is an answer, not a transport error: `409` with the holder and expiry, so a
+  client can show who is editing instead of parsing a failure. Role checks sit on M4 membership (default project treats a paired
+  machine as worker); a non-member receives `404` and learns nothing about the project.
+- Two route tests: acquire/list/conflict/foreign-release/ordered-release, plus non-member `404` and `LOCK_FORCE_DENIED` for a
+  worker trying to force release.
+
+Still to wire: review and notification routes, the merge/review gate, and the panel views.
+
+Verified: relay 186/186 (2 new lock route tests); gate GREEN twice.
+
 ## [1.3.10-beta.17] — 2026-10-22
 
 **M5 third primitive: notifications.** A local module and eight tests; no routes or SSE projection use it yet.
