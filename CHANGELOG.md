@@ -7,6 +7,25 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.10-beta.12] — 2026-10-22
+
+**M4 first slice: the project room object.** A local module and eight tests; the relay routes and the panel do not call it yet.
+
+- `src/relay/project-room.mjs` — a project aggregate (project id, name, origin, settings, members), the four roles
+  (owner/maintainer/worker/observer), a deny-by-default action matrix (`read/dispatch/artifact/lock/memory/decide/merge/
+  settings/members`), member add/remove/role-change as recorded events, a snapshot carrying `last_event_seq`, incremental
+  events since a sequence, and per-member project listing.
+- Safety rules the tests pin: the last owner cannot be removed; a duplicate member is refused by name; an unknown project is
+  refused rather than creating an empty one; the permission check returns the required and current role rather than a bare
+  false; a role change records `{from,to}`.
+
+Registered as an accepted library with its exit named (the `/v1/projects` routes and the room panel), because nothing reaches it
+yet.
+
+Also in this tree since beta.11: the M1 live-acceptance evidence files under `docs/acceptance/1.3.10-beta.10/`.
+
+Verified: project-room 8/8; gate GREEN twice.
+
 ## [1.3.10-beta.11] — 2026-10-22
 
 **M1 update path fixed and the full acceptance set recorded.**
