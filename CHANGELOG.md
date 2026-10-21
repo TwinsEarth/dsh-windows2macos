@@ -7,6 +7,28 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.10-beta.6] — 2026-10-21
+
+**M3 first two blocks: isolated worktrees and a patch artifact contract. Plus the grant replay e2e.**
+
+- `src/agent/worktree.mjs` — one git worktree per task, created detached at the caller's `base_commit`; hooks disabled,
+  commit identity fixed, a porcelain snapshot before and after, commit-if-changed, `format-patch` relative to the base, and
+  a removal that reports failure instead of leaking a directory. Unknown base commit and missing repository are named refusals.
+- `src/agent/patch-artifact.mjs` — the transportable result: sha256 over the patch bytes, byte count, base/head commits,
+  sorted changed files, inline/blob mode, and `no_change` as a successful outcome for an empty patch. Non-ASCII patches are
+  measured in UTF-8 bytes, not characters.
+- Five real-git tests for the worktree lifecycle and five for the artifact contract.
+- `test/agent.test.mjs` gains the grant **replay** e2e: the same signed grant is used twice, the first run executes, the second
+  is refused with `GRANT_REPLAY` — the use ledger is what makes "single-use" true across processes.
+
+Not in this slice (stated, not implied): the merge queue itself (strict/replay bases, merge-slot serialization,
+`MERGE_CONFLICT`), review tasks and locks (M5), and the project room (M4). The M1 real-machine acceptance is also still pending:
+the relay was upgraded to beta.5 and the maintenance field is verified live, but the relay host's agent is offline and root SSH
+authentication is refused, so the privileged bootstrap has not run.
+
+Verified: agent 159/157 (replay e2e included), relay 181/181, grant 10/10, grant-gate 6/6, maintenance 17/17, ferry 4/4,
+worktree 5/5, patch-artifact 5/5, layer-model 24/24, claims 47/47; gate GREEN twice.
+
 ## [1.3.10-beta.5] — 2026-10-21
 
 **M2 grant e2e: the explicit-authorisation path is proven end to end.**

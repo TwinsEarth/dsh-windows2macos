@@ -5057,3 +5057,46 @@ describe('grant e2e (v1.3.10-beta.6 slice)', () => {
     } finally { await rabbit.close(); delete process.env.W2M_MAINTENANCE_PINS; }
   });
 });
+
+describe('grant replay e2e (v1.3.10-beta.6 slice)', () => {
+  it('refuses a replayed grant end to end, after the first use succeeded', async () => {
+    const grant = await import('../src/maintenance/grant.mjs');
+    const operator = await import('../src/maintenance/operator-key.mjs');
+    const rabbit = await startFakeRabbit();
+    const project = await makeRepo('grant-e2e-replay');
+    const keys = operator.generateOperatorKeyPair();
+    const argv = [NODE, '-e', 'process.stdout.write("once")'];
+    const taskId = '01J-GRANT-E2E-REPLAY';
+    process.env.W2M_MAINTENANCE_PINS = join(project, '.grant-pins.json');
+    try {
+      const signed = grant.signGrant(grant.buildGrant({ taskId, machineIds: ['m-grant-e2e'], argv, nowMs: Date.now(), ttlMs: 60_000 }), keys.privateKeyPem);
+      const agent = makeAgent({ rabbit: rabbit.url, project, allowed: [], name: 'grant-e2e-replay' });
+      const running = agent.start();
+      const stream = await rabbit.stream();
+      const offer = {
+        task_id: taskId, attempt: 1, mode: 'replicate', index: 0, index_total: 1,
+        command_argv: argv, cwd_rel: '.', write: false, timeout_ms: 30_000,
+        dedupe_key: 'dk-replay', machine_id: 'm-grant-e2e',
+        operator_key: operator.registrationPayload(keys), grant: signed,
+      };
+      stream.send('ready', { protocol_version: 1, rabbit_time: '2026-10-21T12:00:00Z', machine_id: 'rabbit' });
+      stream.send('task.offer', offer);
+      await running;
+      const first = rabbit.state.results[0];
+      assert.equal(first.status, 'ok');
+      assert.equal(first.stdout_sha256, sha256Hex('once'));
+      // Second delivery of the same signed grant: the use ledger must make it a replay, not a second execution.
+      const secondRabbit = await startFakeRabbit();
+      const agent2 = makeAgent({ rabbit: secondRabbit.url, project, allowed: [], name: 'grant-e2e-replay2' });
+      const running2 = agent2.start();
+      const stream2 = await secondRabbit.stream();
+      stream2.send('ready', { protocol_version: 1, rabbit_time: '2026-10-21T12:00:00Z', machine_id: 'rabbit' });
+      stream2.send('task.offer', { ...offer, attempt: 2, dedupe_key: 'dk-replay-2' });
+      await running2;
+      const second = secondRabbit.state.results[0];
+      assert.equal(second.status, 'refused');
+      assert.equal(second.refusal_reason, 'GRANT_REPLAY');
+      await secondRabbit.close();
+    } finally { await rabbit.close(); delete process.env.W2M_MAINTENANCE_PINS; }
+  });
+});

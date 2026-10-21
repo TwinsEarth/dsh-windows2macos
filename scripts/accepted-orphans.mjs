@@ -49,6 +49,18 @@ export const REASON = Object.freeze({
  * conversation the entry records.
  */
 export const ACCEPTED_ORPHANS = Object.freeze([
+  {
+    file: 'src/agent/worktree.mjs',
+    reason: REASON.LIBRARY,
+    why: 'M3 workspace: one git worktree per task, created at the caller base commit; nothing in the relay/agent task path calls it yet',
+    removedBy: 'the worktree task kind in the agent task handler (M3 merge-queue slice), which is the caller this module was written for',
+  },
+  {
+    file: 'src/agent/patch-artifact.mjs',
+    reason: REASON.LIBRARY,
+    why: 'M3 artifact contract: sha256/base/head/no_change for a worktree task result; the task result builder does not call it yet',
+    removedBy: 'the worktree task result path using workspaceEvidence() (M3 merge-queue slice)',
+  },
 
   {
     file: 'src/relay/message-shards.mjs',
