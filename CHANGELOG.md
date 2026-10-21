@@ -7,6 +7,24 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.10-beta.13] — 2026-10-22
+
+**M4 second slice: tasks belong to a project, and the room records it.** Relay state now owns a project room; no HTTP routes yet.
+
+- `POST /v1/task` (internal `createTask`) accepts an optional `project_id`. Unnamed tasks land in the implicit `default`
+  project, which is created lazily on first use; an explicit unknown project is refused with `BAD_REQUEST` rather than being
+  created silently.
+- The project room records a `task.linked` event for every task, so a snapshot's `last_event_seq` moves with the work and a
+  second client can apply it as an incremental event.
+- State exposes `projectSnapshot(projectId)` and `projectEvents(projectId, {sinceSeq})`; the task summary carries
+  `project_id`; the replay path restores it from the ledger.
+- Three attribution tests: implicit default + linked event consistency, explicit project visible on the summary, and an unknown
+  project refused without creating one.
+
+Still missing, stated: the `/v1/projects` HTTP routes, artefact/memory/decision mounts, the panel view, and multi-client e2e.
+
+Verified: project-attribution 3/3, project-room 8/8, relay 181/181; gate GREEN twice.
+
 ## [1.3.10-beta.12] — 2026-10-22
 
 **M4 first slice: the project room object.** A local module and eight tests; the relay routes and the panel do not call it yet.

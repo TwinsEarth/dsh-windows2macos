@@ -60,13 +60,14 @@ export function createProjectRoom({ now = () => Date.now() } = {}) {
 
   return {
     /** Create a project; the creator becomes its owner. */
-    createProject({ name, origin = null, createdBy }) {
+    createProject({ name, origin = null, createdBy, projectId = null }) {
       if (typeof name !== 'string' || name.trim() === '') throw new ProjectRoomError('BAD_REQUEST', 'project name is required');
       if (!createdBy || typeof createdBy.kind !== 'string' || typeof createdBy.id !== 'string') throw new ProjectRoomError('BAD_REQUEST', 'createdBy member is required');
       counter += 1;
-      const projectId = 'prj-' + String(counter).padStart(4, '0') + '-' + now().toString(36);
+      const assigned = typeof projectId === 'string' && projectId !== '' ? projectId : 'prj-' + String(counter).padStart(4, '0') + '-' + now().toString(36);
+      if (projects.has(assigned)) throw new ProjectRoomError('DUPLICATE_PROJECT', 'project id already exists', { project_id: assigned });
       const project = {
-        project_id: projectId,
+        project_id: assigned,
         name: name.trim(),
         origin: origin === null ? null : { ...origin },
         created_at: new Date(now()).toISOString(),
@@ -74,9 +75,9 @@ export function createProjectRoom({ now = () => Date.now() } = {}) {
         settings: { merge_requires_review: false, merge_requires_tests: false },
         members: [{ ...createdBy, role: 'owner', joined_at: new Date(now()).toISOString() }],
       };
-      projects.set(projectId, project);
-      emit(projectId, 'project.created', createdBy, { name: project.name });
-      return { ok: true, project: this.snapshot({ projectId }) };
+      projects.set(assigned, project);
+      emit(assigned, 'project.created', createdBy, { name: project.name });
+      return { ok: true, project: this.snapshot({ projectId: assigned }) };
     },
     addMember({ projectId, member, role }) {
       const project = requireProject(projectId);

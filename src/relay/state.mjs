@@ -25,6 +25,7 @@ import { planJoin } from '../chatops/fleet-join.mjs';
 import { validateTaskDependencies } from './task-deps.mjs';
 import { buildMembers, isMemberRole, setMemberRole as applyMemberRole } from './fleet-members.mjs';
 import { canonicalSignedPayload, publicKeyFromBase64 } from '../util/envelope-signature.mjs';
+import { createProjectRoom } from './project-room.mjs';
 
 export const PROTOCOL_VERSION = 1;
 
@@ -511,6 +512,9 @@ export class RabbitState {
     this.devices = new Map();      // machine_id -> device
     // v1.3.10-beta.2: operator signing keys seen with a dispatch; agents pin the first one they receive.
     this.operatorKeys = new Map();
+    // v1.3.10-beta.13: shared project objects (M4). Tasks name a project; readers get snapshot + events.
+    this.projects = createProjectRoom({ now: () => this.nowMs() });
+    this.defaultProjectId = 'default';
     /** v1.2.5: operator-assigned roles, kept apart from device records so a re-pair cannot change authority. */
     this.roles = new Map();        // machine_id -> 'owner'|'worker'|'observer'
     /** v1.2.5: read watermarks per session, per machine. */
@@ -744,7 +748,8 @@ export class RabbitState {
           // v1.2.7: a revived task keeps its graph edges and assignment, or the scheduler silently becomes a different scheduler.
           depends_on: Array.isArray(t.depends_on) ? t.depends_on : [],
           assignee: typeof t.assignee === 'string' && t.assignee !== '' ? t.assignee : null,
-          reduce_of: typeof t.reduce_of === 'string' ? t.reduce_of : null,
+          project_id: typeof t.project_id === 'string' ? t.project_id : null,
+        reduce_of: typeof t.reduce_of === 'string' ? t.reduce_of : null,
           reduce_inputs: Array.isArray(t.reduce_inputs) ? t.reduce_inputs : [],
           leases: new Map(),
           cancelled: false,
@@ -1831,6 +1836,7 @@ export class RabbitState {
        * v1.2.10: a reduce task names the map task it reduces and the artifacts it consumes. The artifact LIST travels with
        * the task (never inferred by the reducer), because "which shards this reduce covers" is the completeness contract.
        */
+      project_id: this.ensureProject(input.project_id ?? null),
       reduce_of: typeof input.reduce_of === 'string' && input.reduce_of !== '' ? input.reduce_of : null,
       grant: normalizedGrant,
       grant_summary: normalizedGrant === null ? null : { grant_id: normalizedGrant.grant_id, argv_hash: normalizedGrant.argv_hash, key_id: normalizedGrant.signature?.key_id ?? null },
@@ -2098,6 +2104,7 @@ export class RabbitState {
       type: 'task.created',
       task: {
         task_id: task.task_id,
+        project_id: task.project_id,
         mode: task.mode,
         command_argv: task.command_argv,
         cwd_rel: task.cwd_rel,
@@ -2130,6 +2137,11 @@ export class RabbitState {
       },
       leases: [...task.leases.values()].map((l) => ({ ...l })),
     });
+
+    // v1.3.10-beta.13: a task belongs to a project, and the project room records the link as an event both clients see.
+    try {
+      this.projects.appendEvent({ projectId: task.project_id, type: 'task.linked', actor: { kind: 'operator', id: 'relay' }, payload: { task_id: taskId, mode: task.mode } });
+    } catch { /* the ledger already carries the task; the room event is additive */ }
 
     const refusedOnly = [...task.leases.values()].every((l) => l.state === 'refused');
     if (refusedOnly) {
@@ -2260,6 +2272,27 @@ export class RabbitState {
     lease.lease_until_ms = lease.last_heartbeat_ms + this.leaseWindowMs();
     return event;
   }
+
+  /**
+   * Resolve the project a task belongs to. The implicit default project is created lazily, so existing callers keep working
+   * without naming one; an explicit unknown project is a refusal, not a new project.
+   */
+  ensureProject(projectId) {
+    const wanted = typeof projectId === 'string' && projectId !== '' ? projectId : this.defaultProjectId;
+    try {
+      this.projects.snapshot({ projectId: wanted });
+      return wanted;
+    } catch (error) {
+      if (error?.code !== 'PROJECT_NOT_FOUND') throw error;
+      if (wanted !== this.defaultProjectId) throw new ProtocolError('BAD_REQUEST', 'unknown project_id', { project_id: wanted });
+      this.projects.createProject({ projectId: this.defaultProjectId, name: 'default', createdBy: { kind: 'operator', id: 'relay', name: 'relay' } });
+      return wanted;
+    }
+  }
+
+  /** Snapshot helpers the project routes use; kept on state so the relay has one owner of the room. */
+  projectSnapshot(projectId) { return this.projects.snapshot({ projectId: this.ensureProject(projectId) }); }
+  projectEvents(projectId, options = {}) { return this.projects.events({ projectId: this.ensureProject(projectId), ...options }); }
 
   getTask(taskId) { return this.tasks.get(taskId) ?? null; }
 
@@ -2397,6 +2430,7 @@ export class RabbitState {
        * Before this, GET /v1/tasks carried no status at all, so a board classified a waiting task as "ready" (its dependencies
        * map empty) and a released task as "waiting" forever. The board must read the scheduler's own words or it is decoration.
        */
+      project_id: task.project_id ?? null,
       reduce_of: task.reduce_of ?? null,
       reduce_inputs: Array.isArray(task.reduce_inputs) ? task.reduce_inputs : [],
       maintenance_request_id: task.maintenance_summary?.request_id ?? null,

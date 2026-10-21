@@ -50,12 +50,6 @@ export const REASON = Object.freeze({
  */
 export const ACCEPTED_ORPHANS = Object.freeze([
   {
-    file: 'src/relay/project-room.mjs',
-    reason: REASON.LIBRARY,
-    why: 'M4 project room: project object, members, role matrix, snapshot+event protocol; the relay routes and the panel do not call it yet',
-    removedBy: 'the /v1/projects routes and the room panel (M4 wiring slice), which are the callers this module was written for',
-  },
-  {
     file: 'src/relay/merge-queue.mjs',
     reason: REASON.LIBRARY,
     why: 'M3 merge queue: one queue per project+branch, merge-slot serialisation, strict/replay policy, already_merged and MERGE_CONFLICT; the relay task path does not call it yet',
