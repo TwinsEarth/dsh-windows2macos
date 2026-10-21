@@ -7,6 +7,26 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.10-beta.22] — 2026-10-22
+
+**M7 first slice: one metrics contract for the whole collaboration stack.** A local module and eight tests; the relay /metrics
+route and the call sites do not record into it yet.
+
+- `src/relay/reliability-metrics.mjs` declares every M7 metric name, its type and the labels it may carry — 39 definitions across tasks,
+  authorization, data plane, collaboration and transport. An undeclared name, an undeclared label, or a high-cardinality label
+  (`task_id`, `dedupe_key`, ids) is refused at record time, so a metrics endpoint cannot silently become a memory leak.
+- Counters refuse decrements; gauges hold the last value; histograms keep cumulative buckets plus sum/count. `renderPrometheus()`
+  emits `_bucket/_sum/_count` with sorted, escaped label values, and `snapshot()` gives the same data as plain JSON for the panel.
+- Eight tests: label aggregation, undeclared metric/label refusal, wrong-type and decrement refusal, gauge semantics, cumulative
+  buckets, Prometheus text (including `+Inf`), label escaping, and the contract's own shape.
+
+Registered as an accepted library with its exit named (the /metrics route and instrumentation). Note on the name: the exposition module was already called metrics.mjs, so after a naming collision during this work its file and test were restored, and this registry ships as reliability-metrics.mjs; both test files pass.
+
+Still to wire for M7: the /metrics route, the instrumentation call sites, the acceptance-evidence validator and the preflight
+evidence check.
+
+Verified: metrics 8/8; gate GREEN twice.
+
 ## [1.3.10-beta.21] — 2026-10-22
 
 **M6 second slice: the agent result outbox.** A local module and eight tests; the agent delivery path still uses the existing
