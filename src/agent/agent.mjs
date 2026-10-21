@@ -3060,7 +3060,11 @@ export function createAgent(options) {
        */
       if (offer && typeof offer.maintenance === 'object' && offer.maintenance !== null) {
         const ferryStarted = Date.now();
-        const ferried = await ferryMaintenance({ offer, machineId: String(offer.machine_id ?? identity.machine_id ?? '') });
+        const ferriedRaw = await ferryMaintenance({ offer, machineId: String(offer.machine_id ?? identity.machine_id ?? '') });
+        // The ferry successful only means the runner wrote a result file; the runner itself may have failed. Reporting that
+        // as ok would tell the operator a restart/update happened when it did not.
+        const runnerOk = ferriedRaw.ok === true && ferriedRaw.result?.status === 'ok';
+        const ferried = runnerOk ? ferriedRaw : { ok: false, code: ferriedRaw.result?.code ?? ferriedRaw.code ?? 'MAINTENANCE_FAILED', message: ferriedRaw.result?.code ?? ferriedRaw.message ?? 'maintenance runner reported failure', requestId: ferriedRaw.requestId };
         const stdoutText = JSON.stringify(ferried).slice(0, 64 * 1024);
         const stderrText = ferried.ok ? '' : (ferried.message ?? ferried.code ?? 'maintenance failed');
         // The envelope builder hashes and sizes the output; leaving any of these undefined makes canonicalisation fail

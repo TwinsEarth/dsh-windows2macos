@@ -1,0 +1,18 @@
+{
+  "version": "1.3.10-beta.10",
+  "case": "M1-LIVE-POSTUPDATE-DIAG",
+  "kind": "positive",
+  "requirement": "after an update to beta.10 and a restart, a new diag request still executes end to end",
+  "machines": [
+    "1c14d7d2-d9e2-43dd-a7e5-eda98f4864bc"
+  ],
+  "task_id": "01M5G4M6EJ2G62P1FBHDS1FE9F",
+  "result": {
+    "outcome": "ok",
+    "status": "ok",
+    "stdout_bytes": 59581,
+    "refusal": null
+  },
+  "executed_at": "2026-10-21T21:07:14.358Z",
+  "executor": "lead"
+}

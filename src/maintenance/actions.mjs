@@ -10,6 +10,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, rmSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { dirname, join as joinPath } from 'node:path';
 
 export const UNITS = Object.freeze({
   rabbit: 'w2m-rabbit.service',
@@ -24,8 +25,10 @@ const MAX_TOTAL_DIAG_BYTES = 256 * 1024;
 export function defaultDeps(overrides = {}) {
   return {
     platform: process.platform,
+    // The staging tree must be on the SAME filesystem as the app directory: swap is a rename, and /tmp is often tmpfs,
+    // so renaming across the boundary fails with EXDEV after the download and extraction already succeeded.
     appDir: process.platform === 'win32' ? 'C:\\w2m\\app' : '/opt/w2m/app',
-    stagingRoot: process.platform === 'win32' ? 'C:\\w2m\\staging' : '/tmp',
+    stagingRoot: process.platform === 'win32' ? 'C:\\w2m\\staging' : joinPath(dirname('/opt/w2m/app'), '.maintenance-staging'),
     backupDir: process.platform === 'win32' ? 'C:\\w2m\\app.old' : '/opt/w2m/app.old',
     healthzUrl: 'http://127.0.0.1:8787/healthz',
     sleep: (ms) => new Promise((resolve) => { setTimeout(resolve, ms); }),

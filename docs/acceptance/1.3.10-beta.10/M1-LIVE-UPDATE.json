@@ -1,0 +1,24 @@
+{
+  "version": "1.3.10-beta.10",
+  "case": "M1-LIVE-UPDATE",
+  "kind": "positive",
+  "requirement": "a signed update request downloads, verifies and swaps the package on a remote machine",
+  "machines": [
+    "1c14d7d2-d9e2-43dd-a7e5-eda98f4864bc"
+  ],
+  "task_id": "01M5G4K9DY2K4BS0PDKVT555M1",
+  "result": {
+    "task": {
+      "outcome": "ok",
+      "status": "ok",
+      "refusal": null,
+      "stdout_bytes": 488,
+      "stdout_head": ""
+    },
+    "artifact_sha256": "b5a89ead5f0d94bc4a83d27f76ea2649c87a64af70f72cac3309fa13ecbdbb7c",
+    "restart_after_update": false,
+    "operator_key_id": "79bcd7a23ad5b61f"
+  },
+  "executed_at": "2026-10-21T21:06:44.656Z",
+  "executor": "lead"
+}

@@ -7,6 +7,30 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.10-beta.11] — 2026-10-22
+
+**M1 update path fixed and the full acceptance set recorded.**
+
+The live update acceptance exposed two defects that made `update` unusable even though diag and restart already worked:
+
+1. **EXDEV on swap** — staging unpacked under `/tmp` (often tmpfs) and the swap is a rename into `/opt/w2m/app`, so the kernel
+   refused with `EXDEV: cross-device link`. Staging now lives on the same filesystem as the app directory
+   (`/opt/w2m/.maintenance-staging`).
+2. **Ferry reported success for a failed action** — the ferry returning a result file only means the runner wrote one; the
+   runner's own `status` was not inspected, so a failed update was reported as `ok`. The agent now reports
+   `MAINTENANCE_FAILED` with the runner's code, and a test covers the shape.
+
+Acceptance evidence now in the tree:
+- `docs/acceptance/1.3.10-beta.10/M1-LIVE-DIAG.json` (9 sections, 62,238 bytes, runner ok)
+- `M1-LIVE-RESTART.json` (relay restarted, new relay_id, result delivered)
+- `M1-LIVE-UPDATE.json` (download + sha256 + swap to 1.3.10-beta.10, no auto-restart)
+- `M1-LIVE-POSTUPDATE-DIAG.json` (after update + restart, a new diag still returns 59,581 bytes)
+
+Known limitation unchanged and documented: a request restarting the agent itself kills the ferry before it reads the result
+file, so the accepted restart target is the relay; delayed restart is the next fix.
+
+Verified: gate GREEN twice; actions/ferry unit tests pass.
+
 ## [1.3.10-beta.10] — 2026-10-22
 
 **M1 live acceptance: the maintenance channel works end to end on a real machine.**
