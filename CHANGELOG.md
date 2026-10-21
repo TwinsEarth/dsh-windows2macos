@@ -7,6 +7,27 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.10-beta.24] — 2026-10-22
+
+**M7 second slice: acceptance evidence has a schema, and the committed evidence is validated against it.**
+
+- `src/acceptance/evidence.mjs` validates every required field of the M7 evidence record: version, uppercase case id, kind
+  (positive/negative/chaos), requirement, at least one machine, ISO `executed_at`, executor (lead/human/agent), a result with a
+  verdict, and — for a positive case — the real `task_id`. Optional fields are validated when present: argv arrays,
+  `[from, to]` ledger ranges, `{sha256, bytes}` artifacts and an assertions object. Every problem is returned at once, because a
+  release check should list what to fix rather than one field per run.
+- `summarizeEvidence()` counts valid records by kind and version and names the invalid ones, which is what a release note or a
+  gate summary reads.
+- The test suite validates the **actual committed files** under `docs/acceptance/` — a schema that rejected the project's own
+  evidence would be a schema written for a fictional project. It also pins that both the flat `result.outcome` and the nested
+  `result.task.outcome` (the live restart record) are accepted as the same fact.
+
+Registered as an accepted library with its exit named (the preflight evidence gate).
+
+Still to wire for M7: the preflight check that a release's evidence exists and validates, and the remaining instrumentation.
+
+Verified: evidence 6/6; gate GREEN twice.
+
 ## [1.3.10-beta.23] — 2026-10-22
 
 **M7 wiring: the registry is live on /metrics.**

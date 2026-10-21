@@ -50,6 +50,12 @@ export const REASON = Object.freeze({
  */
 export const ACCEPTED_ORPHANS = Object.freeze([
   {
+    file: 'src/acceptance/evidence.mjs',
+    reason: REASON.LIBRARY,
+    why: 'M7 evidence validator and summary: schema for docs/acceptance records; the preflight evidence gate and the release notes do not call it yet',
+    removedBy: 'the preflight acceptance-evidence check (M7 gate slice)',
+  },
+  {
     file: 'src/agent/outbox.mjs',
     reason: REASON.LIBRARY,
     why: 'M6 result outbox: atomic per-result files, exponential backoff, cross-restart recovery, count/byte ceiling; the agent delivery path still uses the existing spool and does not call it yet',
