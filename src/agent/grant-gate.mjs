@@ -58,7 +58,14 @@ export async function authorizeWithGrant(options) {
 
   used.grants[grant.grant_id] = (used.grants[grant.grant_id] ?? 0) + 1;
   used.nonces = [...used.nonces, grant.nonce].slice(-500);
-  writeUsed(usedFile, used);
+  // Fail closed: the use ledger is what makes a single-use grant single-use, so an unwritable ledger must refuse the task
+  // rather than run it unrecorded (and rather than crash the whole handler). Seen on a real host where the maintenance state
+  // directory was root-owned but the agent ran unprivileged.
+  try {
+    writeUsed(usedFile, used);
+  } catch (error) {
+    return { ok: false, code: 'GRANT_LEDGER_UNAVAILABLE', message: 'the grant use ledger cannot be written: ' + String(error?.message ?? error) };
+  }
   return { ok: true, grantId: grant.grant_id, used: used.grants[grant.grant_id] };
 }
 

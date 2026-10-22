@@ -347,3 +347,15 @@ task summary 与 ledger 现在携带 `grant_id`、`argv_hash`、`grant_key_id`�
 
 边界要写清楚：**provenance 是执行机器对自身判定的事实陈述，relay 只存储不验证**（signature 由 agent 验、派发由 relay 预检、撤销由
 relay 记账）。回答"这到底是谁允许的"仍以 relay ledger 为准；provenance 让每个结果可被机器与人快速定位到那条授权，而不是替代台账。
+
+## 使用台账不可写（v1.3.12-beta.4）
+
+真机发现：维护状态目录 `/var/lib/w2m/maintenance` 由 root 拥有且 0755，agent 以非特权用户运行；grant 第一次通过后写使用台账
+失败（EACCES），异常冒泡成任务 crashed —— 表现是"授权了但一执行就崩"。这不是授权判定错误，是记录失败。
+
+处理（fail closed）：
+
+- `grant-gate` 把台账写入包在 try/catch 里，失败返回 `GRANT_LEDGER_UNAVAILABLE`，不执行未记录的一次授权（否则单次授权会
+  变成可重放的漏洞），也不再把整个 handler 打崩。
+- `bootstrap.sh` 把 `$BASE` 设为 `root:w2m 0775`（agent 需要在这里写 grant-uses.json）；queue 仍为 0770、done/claimed 0750。
+- 回归用例：把 usedFile 指到不可写路径，断言返回该 code 而非抛异常。

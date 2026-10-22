@@ -27,6 +27,8 @@ BASE=/var/lib/w2m/maintenance
 mkdir -p "$BASE/queue" "$BASE/done" "$BASE/claimed"
 # The agent runs as an unprivileged user; it must be able to create request files, and must NOT be able to execute them.
 chown -R root:w2m "$BASE"
+# The agent writes grant uses and the maintenance queue here; the directory itself must be group-writable.
+chmod 0775 "$BASE"
 chmod 0770 "$BASE/queue"
 chmod 0750 "$BASE/done" "$BASE/claimed"
 

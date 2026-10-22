@@ -7,6 +7,25 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.12-beta.4] — 2026-10-22
+
+**执行授权模型真机修复：使用台账不可写时 fail closed，而不是 crashed。**
+
+在 relay 宿主上实测时发现"授权了但一执行就崩"：维护状态目录 `/var/lib/w2m/maintenance` 由 root 拥有且 0755，agent 以
+非特权用户运行，grant 第一次通过后写 `grant-uses.json` 报 EACCES，异常冒泡成任务 `crashed` —— 授权判定其实已经通过
+（同一 argv 无 grant 时是 `COMMAND_NOT_ALLOWED`），失败发生在记录环节。
+
+- `grant-gate`：台账写入包 try/catch，失败返回 `GRANT_LEDGER_UNAVAILABLE`，不执行"未记录的一次授权"（否则单次授权会变成
+  可重放漏洞），也不再把整个 handler 打崩。
+- `bootstrap.sh`：`$BASE` 改为 `root:w2m 0775`，让默认安装就能写台账；queue 仍 0770、done/claimed 0750。
+- 回归用例：usedFile 指向不可写路径，断言返回该 code 而非抛异常。
+
+真机对比（修复前、relay 宿主）：
+- 无 grant 的 `uname -s` → `refused/COMMAND_NOT_ALLOWED`；
+- 有合法 grant 的同一 argv → 通过 gate，随后因台账 EACCES 报 crashed（本次修复的目标）。
+
+Verified: grant-gate 7/7（含新用例）；gate GREEN twice。
+
 ## [1.3.12-beta.3] — 2026-10-22
 
 **执行授权模型收尾：每个结果都说明"是谁授权的"。**

@@ -94,3 +94,31 @@ describe('grant gate', () => {
     assert.equal(result.code, 'GRANT_REVOKED');
   });
 });
+
+describe('grant gate: unwritable use ledger', () => {
+  it('refuses with GRANT_LEDGER_UNAVAILABLE instead of running unrecorded or crashing', async () => {
+    const { signGrant, buildGrant } = await import('../src/maintenance/grant.mjs');
+    const { generateOperatorKeyPair } = await import('../src/maintenance/operator-key.mjs');
+    const { authorizeWithGrant } = await import('../src/agent/grant-gate.mjs');
+    const { mkdtempSync, writeFileSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const keys = generateOperatorKeyPair();
+    const dir = mkdtempSync(join(tmpdir(), 'w2m-gate-ledger-'));
+    const pinFile = join(dir, 'pins.json');
+    const store = (await import('../src/maintenance/operator-key.mjs')).createPinStore(pinFile);
+    store.pinFromRegistration((await import('../src/maintenance/operator-key.mjs')).registrationPayload(keys));
+    const blocker = join(dir, 'blocker');
+    writeFileSync(blocker, 'not a directory', 'utf8');
+    const taskId = '01M5GATELEDGER00000000000001';
+    const grant = signGrant(buildGrant({ taskId, machineIds: ['m-ledger'], argv: ['node', '--version'], mode: 'replicate', cwdRel: '.', nowMs: Date.now(), ttlMs: 60_000 }), keys.privateKeyPem);
+    const decision = await authorizeWithGrant({
+      offer: { task_id: taskId, command_argv: ['node', '--version'], mode: 'replicate', cwd_rel: '.', grant, operator_key: (await import('../src/maintenance/operator-key.mjs')).registrationPayload(keys) },
+      machineId: 'm-ledger',
+      pinFile,
+      usedFile: join(blocker, 'used.json'),
+    });
+    assert.equal(decision.ok, false);
+    assert.equal(decision.code, 'GRANT_LEDGER_UNAVAILABLE');
+  });
+});
