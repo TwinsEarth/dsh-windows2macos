@@ -7,6 +7,40 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.11] — 2026-10-22
+
+**Stable release: the collaboration stack's first seven modules, with the gate that measures them.**
+
+This is the first stable since 1.3.9 (docs) that ships runtime work, and the first beta line to end with its acceptance evidence
+enforced by the pre-flight rather than stored beside it. What is in it, by module:
+
+- **M1 maintenance channel** (live on the relay host): signed update/restart/diag requests, operator-key pinning, a root runner and
+  a bootstrap for Linux/Windows. Accepted on the real machine: diag (9 sections / 62 KB), relay restart with a new relay_id and
+  the result delivered after it, update to 1.3.10-beta.10 (download + sha256 + atomic swap), and a post-update diag. Evidence:
+  docs/acceptance/1.3.10-beta.10/.
+- **M2 grants**: single-use, task-bound Ed25519 grants with argv hash, TTL, use ledger and named refusals; e2e covers an empty
+  allow-list succeeding under a grant, replay, argv tampering and the no-grant refusal.
+- **M3 Git-native tasks**: isolated worktrees at the caller's base commit, a content-addressed patch artifact contract, a merge
+  queue with merge-slot serialisation, strict/replay policies, already_merged and a structured conflict artifact. Module-level,
+  24 tests across the three slices plus two composed workflow tests.
+- **M4 project room**: project objects, membership roles, a deny-by-default action matrix, snapshot + incremental events, task
+  attribution (implicit default project, explicit projects refused when unknown), and the /v1/projects routes.
+- **M5 multi-client primitives**: branch/file locks (leases, renewal, owner force-release, merge preflight conflicts), reviews
+  (self-review guard, duplicate-verdict refusal, approval gate by patch sha) and notifications (dedupe, digest, per-reader
+  watermarks, retention), with the lock routes live and their events projected into the project stream.
+- **M6 cross-network reliability**: chunked, resumable blob uploads with verified commits, Range downloads, and an agent result
+  outbox (atomic, persisted exponential backoff, cross-restart recovery, bounded).
+- **M7 metrics and acceptance**: a 39-metric contract with a cardinality guard, live on /metrics; a validator for acceptance
+  evidence; and the pre-flight's 16th check, which fails a release whose evidence does not validate or whose release line has no
+  record.
+
+Verified: pre-flight GREEN twice (16/16 checks, 2828 tests: 2814 pass, 0 fail, 14 skip); beta line beta.1 through beta.25 shipped on
+GitHub prereleases only.
+
+Known limitations, stated rather than implied: the merge queue and the review/notification routes are not wired into the task path
+yet; a request that restarts the agent itself loses the ferry result (relay restarts are fine); M4 role checks cover the lock routes
+and reads, not every future write; the relay runs beta.10 and is upgraded separately from this tag.
+
 ## [1.3.10-beta.25] — 2026-10-22
 
 **M7 final core slice: acceptance evidence is a gate, not a folder.**

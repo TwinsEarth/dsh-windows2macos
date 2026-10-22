@@ -1,0 +1,26 @@
+{
+  "version": "1.3.11",
+  "case": "M1-LIVE-DIAG",
+  "kind": "positive",
+  "requirement": "the stable 1.3.11 relay executes a signed maintenance diag request on a real machine and returns its result",
+  "machines": [
+    "1c14d7d2-d9e2-43dd-a7e5-eda98f4864bc"
+  ],
+  "commands": [
+    [
+      "node",
+      "--version"
+    ]
+  ],
+  "task_id": "01M5GF2Z2EYKDJ39YYY9WJNK8C",
+  "result": {
+    "outcome": "ok",
+    "status": "ok",
+    "stdout_bytes": 60781,
+    "relay_id": "bcd9d427bfd5bbd9",
+    "deployed_version": "1.3.11"
+  },
+  "executed_at": "2026-10-22T00:10:03.977Z",
+  "executor": "lead",
+  "note": "relay deployed from the packed 1.3.11 candidate over SSH; operator key pinned at bootstrap; result delivered through the relay"
+}
