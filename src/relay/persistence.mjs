@@ -213,6 +213,18 @@ export class Persistence {
         device_token: d.device_token ?? null,
         paired_at: rfc3339(d.paired_at_ms ?? this._now()),
         re_paired: d.re_paired === true,
+        /**
+         * v1.4.4: **the fleet binding is part of the device, so it must survive a restart.**
+         *
+         * Measured on the shared relay (2026-10-23): a relay restart came back with every device
+         * present and every fleet assignment gone, because this snapshot did not carry the two
+         * fields the pairing decision had produced. The devices were still authorised, so nothing
+         * looked broken -- they simply stopped being in a fleet, which is the one thing the fleet
+         * key had been bought to guarantee. `fleet_id` is a derived hash (not a secret) and
+         * `fleet_source` is the provenance that makes a wrong binding visible.
+         */
+        fleet_id: d.fleet_id ?? null,
+        fleet_source: d.fleet_source ?? null,
       };
     }
     const body = JSON.stringify(out, null, 2);

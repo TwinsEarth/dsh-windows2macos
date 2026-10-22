@@ -1,0 +1,20 @@
+{
+  "version": "1.4.4",
+  "case": "FLEET-PERSISTENCE",
+  "kind": "positive",
+  "machines": [
+    "d89d5817-953d-4571-883d-23800e67d20c"
+  ],
+  "executed_at": "2026-10-22T16:32:38.180Z",
+  "executor": "lead",
+  "requirement": "a relay restart keeps every device in the fleet it was paired into: devices.json persists fleet_id/fleet_source and restore rebuilds them",
+  "task_id": "01M5FLEETPERSIST0000000002",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "fleet_roundtrip_test": "pass",
+      "node_test_exit": 0
+    }
+  },
+  "note": "executed as a real fleet task (node --test, fleet round-trip case) on the local machine before packaging"
+}

@@ -750,6 +750,11 @@ export class RabbitState {
           device_token: typeof d.device_token === 'string' ? d.device_token : null,
           paired_at_ms: Number.isFinite(pairedAt) ? pairedAt : this.nowMs(),
           re_paired: d.re_paired === true,
+          // v1.4.4: restore the fleet binding with the device. Without this the snapshot brought the
+          // device back but dropped the fleet it was paired into, so a restart silently un-joined
+          // every machine while leaving it fully authorised (measured 2026-10-23 on the shared relay).
+          fleet_id: typeof d.fleet_id === 'string' && d.fleet_id !== '' ? d.fleet_id : null,
+          fleet_source: typeof d.fleet_source === 'string' && d.fleet_source !== '' ? d.fleet_source : null,
           last_seen_at_ms: this.nowMs(),
           // a snapshot proves the device exists, not that it is connected
           online: false,

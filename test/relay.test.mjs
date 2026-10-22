@@ -45,6 +45,7 @@ import {
 import { AGGREGATE_STATUSES, aggregate, aggregateTask, renderReportMarkdown } from '../src/relay/report.mjs';
 import { createRelayServer, normalizeBasePath, SlidingWindowRateLimiter } from '../src/relay/server.mjs';
 import { Persistence } from '../src/relay/persistence.mjs';
+import { encodeFleetKey, fleetIdFromKey } from '../src/chatops/fleet-join.mjs';
 
 /**
  * Issue a request signed over the EXACT bytes that go on the wire.
@@ -2351,6 +2352,54 @@ describe('v0.1.2 persistence (§7)', () => {
         const repeated = await request(`${second.url}/v1/result`, { method: 'POST', token: deviceToken, body: envelope });
         assert.equal(repeated.status, 200);
         assert.equal(repeated.json.deduped, true, 'the dedupe key was rebuilt from the ledger');
+      } finally {
+        await second.close();
+      }
+    } finally {
+      removeStateDir(dir);
+    }
+  });
+
+  it('keeps a fleet-bound device in its fleet across a restart (v1.4.4)', async () => {
+    /**
+     * Measured on the shared relay (2026-10-23): after a restart every device came back and every
+     * fleet assignment was gone. The snapshot carried the token and the name but not the two fields
+     * the pairing decision actually produced, so nothing looked broken -- machines simply stopped
+     * being in the fleet that the account key had bought them into. This test is that restart.
+     */
+    const dir = makeStateDir();
+    try {
+      const key = Buffer.alloc(32, 7);
+      const encoded = encodeFleetKey(key);
+      const fleetId = fleetIdFromKey(key);
+
+      const first = await startRelay({ stateDir: dir });
+      const paired = await request(`${first.url}/v1/pair`, {
+        method: 'POST',
+        body: {
+          machine_id: 'm-fleet',
+          machine_name: 'fleet-box',
+          platform: DEFAULT_PLATFORM,
+          caps: DEFAULT_CAPS,
+          fleet_key: encoded,
+        },
+      });
+      assert.equal(paired.status, 200);
+      const token = paired.json.device_token;
+
+      const before = await request(`${first.url}/v1/devices`, { token });
+      const beforeDevice = before.json.devices.find((d) => d.machine_id === 'm-fleet');
+      assert.equal(beforeDevice.fleet_id, fleetId, 'pairing by fleet key binds the derived fleet id');
+      assert.equal(beforeDevice.fleet_source, 'fleet_key');
+      await first.close();
+
+      const second = await startRelay({ stateDir: dir });
+      try {
+        const after = await request(`${second.url}/v1/devices`, { token });
+        assert.equal(after.status, 200, 'the same device token still authenticates');
+        const restored = after.json.devices.find((d) => d.machine_id === 'm-fleet');
+        assert.equal(restored.fleet_id, fleetId, 'the fleet binding must survive a relay restart');
+        assert.equal(restored.fleet_source, 'fleet_key', 'and so must its provenance');
       } finally {
         await second.close();
       }

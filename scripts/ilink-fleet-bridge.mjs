@@ -272,12 +272,46 @@ async function main() {
   log(`listening (cursor ${cursor === '' ? 'empty' : `${cursor.length} chars`}) -- send /run ... in WeChat`);
   let handled = 0;
 
+  /**
+   * v1.4.4: liveness for the poll loop, and a watchdog that reconnects instead of hanging.
+   *
+   * An idle bot and a wedged bot look identical from the chat window: both send nothing. The
+   * long-poll is silent by design, so "no log lines" is not evidence of a fault -- but it is also
+   * not evidence of health. These two lines make the difference visible:
+   *
+   *   * a completed poll of any kind (including empty) refreshes `lastPollOkAt`;
+   *   * every `POLL_HEARTBEAT_MS` an informational line says the loop is alive;
+   *   * if no poll completes for `POLL_STALL_MS`, the bridge logs the stall and exits non-zero so
+   *     its supervisor (launchd KeepAlive, systemd Restart=, or a shell loop) starts a fresh
+   *     connection. A watchdog that only logs leaves the silent bot in place.
+   */
+  const POLL_HEARTBEAT_MS = 10 * 60_000;
+  const POLL_STALL_MS = 5 * 60_000;
+  let lastPollOkAt = Date.now();
+  let lastHeartbeatAt = Date.now();
+  const watchdog = setInterval(() => {
+    const now = Date.now();
+    if (now - lastPollOkAt > POLL_STALL_MS) {
+      log(`poll stalled ${Math.round((now - lastPollOkAt) / 1000)}s -- no poll completed; exiting so the supervisor reconnects`);
+      process.exit(3);
+    }
+    if (now - lastHeartbeatAt >= POLL_HEARTBEAT_MS) {
+      lastHeartbeatAt = now;
+      log(`polling (cursor ${cursor === '' ? 'empty' : `${cursor.length} chars`}) -- idle, connection live`);
+    }
+  }, 30_000);
+  watchdog.unref?.();
+
   for (;;) {
     let update;
     try {
       update = await post('ilink/bot/getupdates', { base_info: BASE_INFO(), get_updates_buf: cursor, buf: cursor, limit: 20 });
+      lastPollOkAt = Date.now();
     } catch (err) {
-      log(`poll threw: ${err.message}`);
+      // The 40 s deadline in `post` is the only bound on a hung long-poll; name which bound fired,
+      // because "This operation was aborted" does not say whether the relay or the timeout did it.
+      const aborted = err?.name === 'AbortError' || /aborted/i.test(String(err?.message ?? ''));
+      log(aborted ? 'poll timeout after 40s -- reconnecting' : `poll threw: ${err.message}`);
       await new Promise((r) => setTimeout(r, 3000));
       continue;
     }

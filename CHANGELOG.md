@@ -7,6 +7,21 @@
 
 All notable changes to this project are documented here.
 
+## [1.4.4] — 2026-10-23
+
+**relay 重启不再丢失编队归属（devices.json 持久化 fleet_id）。**
+
+- 持久化修复：`devices.json` 快照新增 `fleet_id` / `fleet_source`，`restore()` 同步恢复。
+  在此之前，relay 重启后设备全在、token 仍有效，但每台设备的 fleet 归属全变成 null——
+  编队"静默消失"且没有任何错误可看（本次在共享 relay 上实测复现）。
+- 桥接 getupdates 看门狗：空闲时每 10 分钟输出 `polling ... connection live`；
+  40s 长轮询超时明确记录 `poll timeout after 40s -- reconnecting`；
+  连续 5 分钟没有一次成功轮询则退出（exit 3），由 launchd KeepAlive / systemd Restart= 拉起新连接，
+  避免"进程活着但没人知道它是否还在轮询"的静默状态。
+- 测试：relay 新增 fleet 重启往返用例（pair by fleet_key → 重启 → fleet_id/fleet_source 保留）；
+  bridge 套件 36/36；门禁 GREEN ×2。
+- 证据：docs/acceptance/1.4.4/FLEET-PERSISTENCE.json（真实 fleet task `01M5FLEETPERSIST0000000002`）。
+
 ## [1.4.3] — 2026-10-22
 
 **微信编队桥接：回复可靠性修复（不回复/静默问题）。**
