@@ -1,6 +1,6 @@
 # 执行授权模型（Execution Authorization Model）设计规格 — v1.4.0-beta
 
-> 状态：**模型级设计稿**。把 M1（运维通道）与 M2（任务级 grant）归纳成一个可复用的授权模型，并冻结线协议与失败语义。
+> 状态：**已实现（v1.3.12-beta.1）**。把 M1（运维通道）与 M2（任务级 grant）归纳成一个可复用的授权模型，并冻结线协议与失败语义。
 > 版本：`1.4.0-beta.*`；实现按 M1（1.3.2）/ M2（1.3.3）分步交付，模型一致性验收在 1.4.0-beta 完成。
 > 相关：`docs/COLLAB/M1-MAINTENANCE.md`、`docs/COLLAB/M2-TASK-GRANT.md`。
 
@@ -248,3 +248,66 @@ beta 过渡（1.3.2/1.3.3 实现期）：TOFU
 4. **谁可以签**：仅 owner 操作员，还是允许 maintainer 使用预设策略？
 5. **max TTL**：10 分钟是否合适（运维场景可能更长）？
 6. **审计可见性**：ledger 里的 argv 是否永久保存明文（敏感参数）还是只存 hash + 前缀？
+
+---
+
+## 签发（v1.3.12-beta.1）
+
+执行授权模型之前只有静态 allow-list：机器所有者写下一个长期决定，任何不在表里的命令都没有"就这一次"的途径。现在补上
+了操作员显式授权某一次执行的完整路径。
+
+### 1. 生成操作员密钥
+
+操作员持有 Ed25519 私钥；机器的 allow-list 保持不动（默认拒绝）。
+
+### 2. 先取 task_id，再签发 grant
+
+grant 绑定 **一个 task、一个 argv、若干 machine_id、一个短 TTL（≤10 分钟）和 max_uses（默认 1）**。所以签发之前 task_id
+必须已经确定（调度方生成后传给 `POST /v1/task` 的 `task_id` 字段）。
+
+```bash
+node bin/w2m-grant.mjs \
+  --key ~/.w2m/operator.pem \
+  --task-id 01M5GRANTCLI0000000000000001 \
+  --machines 6c92b251-3728-48bc-82a9-56cc40df48f2 \
+  --argv '["node","--version"]' \
+  --ttl-ms 120000 > /tmp/grant.json
+```
+
+stdout 是 grant JSON；stderr 打印 `task_id / argv_hash / machines / expires_at` 供核对，便于管道使用。
+
+### 3. 派发时携带 grant
+
+```json
+POST /v1/task
+{
+  "task_id": "01M5GRANTCLI0000000000000001",
+  "mode": "replicate",
+  "command_argv": ["node", "--version"],
+  "cwd_rel": ".",
+  "index_total": 1,
+  "timeout_ms": 60000,
+  "write": false,
+  "grant": { ... /tmp/grant.json 内容 ... }
+}
+```
+
+### 4. 两处检查，各管一件事
+
+- **relay（派发预检）**：grant 的 `task_id` 必须与本次派发的 task 一致（`GRANT_TASK_MISMATCH`），`argv_hash` 必须与
+  `command_argv` 一致（`GRANT_ARGV_MISMATCH`），`expires_at` 未过期（`GRANT_EXPIRED`）。这些是调用方错误（HTTP 400），
+  不是授权裁决。
+- **agent（真正的验证者）**：用机器上 pin 的操作员公钥验证签名、检查任务绑定/机器绑定/argv/有效期/max_uses，并把用过的
+  grant 记入本地 ledger（重放拒绝为 `GRANT_REPLAY`）。空 allow-list + 合法 grant 会执行；同 argv 无 grant 仍
+  `COMMAND_NOT_ALLOWED`。
+
+### 5. 审计字段
+
+task summary 与 ledger 现在携带 `grant_id`、`argv_hash`、`grant_key_id`；项目事件里投影 `task.linked`，回答"这条命令是谁
+授权、什么时候、在哪些机器上"。
+
+### 6. 边界（仍不做的）
+
+- 不做长期委托/子授权：一次 grant 只覆盖一次执行。
+- 不做自动签发：操作员必须显式运行签发命令或调用等价 API。
+- 不做跨项目授权：grant 绑定机器与 argv，与项目无关。

@@ -31,6 +31,7 @@ import { createProjectReviews } from './project-reviews.mjs';
 import { createProjectNotifications } from './project-notifications.mjs';
 import { createBlobSessions } from './blob-sessions.mjs';
 import { createMetrics } from './reliability-metrics.mjs';
+import { argvHash as grantArgvHash } from '../maintenance/grant.mjs';
 
 export const PROTOCOL_VERSION = 1;
 
@@ -43,6 +44,10 @@ export const PROTOCOL_VERSION = 1;
 export const ERROR_STATUS = Object.freeze({
   UNAUTHORIZED: 401,
   BAD_REQUEST: 400,
+  // v1.3.12-beta.1: dispatch refuses a grant written for another task or argv. Caller errors (400), not authorization verdicts.
+  GRANT_TASK_MISMATCH: 400,
+  GRANT_ARGV_MISMATCH: 400,
+  GRANT_EXPIRED: 400,
   NOT_FOUND: 404,
   PAIRING_INVALID: 400,
   PAIRING_EXPIRED: 400,
@@ -1800,6 +1805,20 @@ export class RabbitState {
       if (typeof rawGrant.grant_id !== 'string' || rawGrant.grant_id === '' || !/^[0-9a-f]{64}$/.test(String(rawGrant.argv_hash ?? ''))) {
         throw new ProtocolError('BAD_REQUEST', 'grant needs grant_id and a 64-hex argv_hash', {});
       }
+      // v1.3.12-beta.1: dispatch-side preflight of the execution-authorization model. The agent verifies the signature and
+      // the use ledger; the relay refuses a grant that is plainly for another task or another argv, by name, before any
+      // machine sees the task. This is a caller-bug check, not a second authorisation decision.
+      if (typeof rawGrant.task_id === 'string' && rawGrant.task_id !== '' && rawGrant.task_id !== taskId) {
+        throw new ProtocolError('GRANT_TASK_MISMATCH', 'the grant names another task_id', { grant_task_id: rawGrant.task_id, task_id: taskId });
+      }
+      if (grantArgvHash(commandArgv) !== String(rawGrant.argv_hash)) {
+        throw new ProtocolError('GRANT_ARGV_MISMATCH', 'the grant argv_hash does not match command_argv', { argv_hash: String(rawGrant.argv_hash), computed: grantArgvHash(commandArgv) });
+      }
+      if (rawGrant.expires_at !== undefined) {
+        const expiresAt = Date.parse(String(rawGrant.expires_at));
+        if (Number.isNaN(expiresAt)) throw new ProtocolError('BAD_REQUEST', 'grant.expires_at is not a timestamp', { expires_at: rawGrant.expires_at });
+        if (expiresAt <= this.nowMs()) throw new ProtocolError('GRANT_EXPIRED', 'the grant has already expired', { expires_at: rawGrant.expires_at });
+      }
       normalizedGrant = rawGrant;
     }
     const rawOperatorKey = input.operator_key ?? null;
@@ -2466,6 +2485,8 @@ export class RabbitState {
       reduce_inputs: Array.isArray(task.reduce_inputs) ? task.reduce_inputs : [],
       maintenance_request_id: task.maintenance_summary?.request_id ?? null,
       grant_id: task.grant_summary?.grant_id ?? null,
+    argv_hash: task.grant_summary?.argv_hash ?? null,
+    grant_key_id: task.grant_summary?.key_id ?? null,
       status: (() => {
         if (task.cancelled === true) return 'cancelled';
         const leases = [...task.leases.values()];

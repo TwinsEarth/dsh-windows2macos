@@ -7,6 +7,26 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.12-beta.1] — 2026-10-22
+
+**执行授权模型：静态 allow-list 之外，操作员可以显式授权某一次执行。**
+
+在此之前授权只有一层：机器本地配置的 allow-list，一个长期决定，没有"就这一次"的途径。这一版把 M2 grant 补成一条可用的
+路径——签发、派发、验证、审计——而不是一个只在测试里存在的协议。
+
+- **`bin/w2m-grant.mjs`**：操作员签发一条 grant。绑定一个 task_id（必须先确定）、一个 argv、若干 machine_id、≤10 分钟 TTL
+  和 max_uses（默认 1）；stdout 输出可直接放进 `POST /v1/task` 的 `grant` 字段，stderr 打印 task_id/argv_hash/expires_at。
+  该 CLI 同时登记为 package bin `w2m-grant`。
+- **relay 派发预检**：task_id 不符 → `GRANT_TASK_MISMATCH`，argv_hash 不符 → `GRANT_ARGV_MISMATCH`，已过期 →
+  `GRANT_EXPIRED`，都是 HTTP 400 的调用方错误；relay 不替 agent 做授权裁决。
+- **审计**：task summary 增加 `argv_hash` 与 `grant_key_id`（`grant_id` 已有），让"谁授权了哪条命令"可查。
+- **agent 仍是验证者**：签名、任务/机器绑定、argv、TTL、max_uses、重放（`GRANT_REPLAY`）由机器本地用 pin 的操作员公钥判定；
+  空 allow-list + 合法 grant 执行，无 grant 仍 `COMMAND_NOT_ALLOWED`（既有 e2e 覆盖）。
+- **文档**：`docs/COLLAB/EXECUTION-AUTH-MODEL.md` 状态改为已实现，补上"取 task_id → 签发 → 携带派发 → 两处检查 → 审计字段"
+  的完整路径和仍然不做的边界（无长期委托、无自动签发、无跨项目授权）。
+
+Verified: grant-issue 3/3（真实 CLI 子进程签发并用签名载荷验证）；grant 13/13；relay 190/190（新增派发预检用例）；gate GREEN twice。
+
 ## [1.3.11] — 2026-10-22
 
 **Stable release: the collaboration stack's first seven modules, with the gate that measures them.**

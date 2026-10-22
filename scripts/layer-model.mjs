@@ -63,6 +63,9 @@ export const ALLOWED_EDGES = Object.freeze([
   ['agent', 'util'],
   // v1.3.10-beta.2: the agent verifies a signed maintenance request and ferries it; the root runner executes it.
   ['agent', 'maintenance'],
+  // v1.3.12-beta.1: the relay preflights a task-level execution grant against the shared grant protocol (argv hash, expiry).
+  // Downward (relay 3 -> maintenance 1): the relay imports the protocol, never the runner.
+  ['relay', 'maintenance'],
   // The same limiter, reached from the layer it was originally written in. Also downward (relay 3 -> util 0),
   // and the second half of the same decision: one shared window rather than two that could disagree.
   ['relay', 'util'],

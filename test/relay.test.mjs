@@ -4924,3 +4924,35 @@ describe('reliability registry on /metrics', () => {
     });
   });
 });
+
+describe('execution-authorization dispatch preflight', () => {
+  it('carries a task-bound grant into the task and refuses a grant for another task/argv by name', async () => {
+    const { buildGrant, signGrant } = await import('../src/maintenance/grant.mjs');
+    const { generateOperatorKeyPair } = await import('../src/maintenance/operator-key.mjs');
+    await withRelay({}, async (relay) => {
+      await pairDevice(relay, 'm-grant-dispatch');
+      const keys = generateOperatorKeyPair();
+      const taskId = '01M5GRANTDISPATCH0000000001';
+      const argv = ['node', '--version'];
+      const grant = signGrant(buildGrant({ taskId, machineIds: ['m-grant-dispatch'], argv, mode: 'replicate', cwdRel: '.', nowMs: Date.now(), ttlMs: 60_000 }), keys.privateKeyPem);
+      const base = { mode: 'replicate', command_argv: argv, cwd_rel: '.', index_total: 1, timeout_ms: 30_000, write: false, task_id: taskId, grant };
+      const accepted = await postTask(relay, base);
+      assert.equal(accepted.status, 200, accepted.text);
+      assert.equal(accepted.json.task_id, taskId);
+      const detail = relay.state.taskSummary(relay.state.getTask(taskId));
+      assert.equal(detail.grant_id, grant.grant_id);
+      assert.equal(detail.argv_hash, grant.argv_hash);
+
+      const wrongTask = await postTask(relay, { ...base, task_id: '01M5GRANTDISPATCH0000000002' });
+      assert.equal(wrongTask.status, 400);
+      assert.equal(wrongTask.json.error.code, 'GRANT_TASK_MISMATCH');
+
+      // A separate task and a grant for THAT task, so the argv mismatch is the first thing the preflight sees.
+      const taskThree = '01M5GRANTDISPATCH0000000003';
+      const grantThree = signGrant(buildGrant({ taskId: taskThree, machineIds: ['m-grant-dispatch'], argv, mode: 'replicate', cwdRel: '.', nowMs: Date.now(), ttlMs: 60_000 }), keys.privateKeyPem);
+      const wrongArgv = await postTask(relay, { ...base, task_id: taskThree, grant: grantThree, command_argv: ['node', '--test'] });
+      assert.equal(wrongArgv.status, 400);
+      assert.equal(wrongArgv.json.error.code, 'GRANT_ARGV_MISMATCH');
+    });
+  });
+});
