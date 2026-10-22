@@ -7,6 +7,23 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.12-beta.2] — 2026-10-22
+
+**执行授权模型补完：撤销与操作员审计。**
+
+beta.1 让操作员能"授权某一次执行"；这一版让授权可以被收回、可以被查账，而不是只能等 TTL 过期。
+
+- **撤销**：`POST /v1/grants/revoke`（operator token）`{grant_id, reason?}`。幂等（第二次 `already_revoked: true`），写入
+  ledger `grant.revoked`，带 reason 与操作者。
+- **派发拒绝**：携带已撤销 grant 的任务在 `POST /v1/task` 被拒，`403 GRANT_REVOKED`，机器收不到 offer；revocation 先于
+  argv/task 绑定检查，理由更直接。
+- **审计视图**：`GET /v1/grants`（operator token）返回 `tasks`（task_id / grant_id / argv_hash / key_id / mode / created_at）
+  与 `revoked` 列表；device token 为 401，授权台账不属于机器工作面。
+- **边界**：撤销阻止的是**新派发**；agent 断网时仍会执行已到手 grant 里绑定的那一次（正确性仍取决于 relay 派发，与 M2 §4
+  一致）。撤销后要重新授权必须签发新 grant_id。
+
+Verified: grant 13/13；grant-issue 3/3；relay 191/191（新增撤销+审计用例）；gate GREEN twice。
+
 ## [1.3.12-beta.1] — 2026-10-22
 
 **执行授权模型：静态 allow-list 之外，操作员可以显式授权某一次执行。**

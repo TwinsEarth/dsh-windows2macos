@@ -311,3 +311,18 @@ task summary 与 ledger 现在携带 `grant_id`、`argv_hash`、`grant_key_id`�
 - 不做长期委托/子授权：一次 grant 只覆盖一次执行。
 - 不做自动签发：操作员必须显式运行签发命令或调用等价 API。
 - 不做跨项目授权：grant 绑定机器与 argv，与项目无关。
+
+## 撤销与审计（v1.3.12-beta.2）
+
+撤销解决"签发之后才发现不该授权"的问题，不需要动已经发出的 grant 内容（它可能已在操作员本机或任务体里）。
+
+- **撤销一条**：`POST /v1/grants/revoke`，operator token，body `{grant_id, reason?}`。幂等：第二次撤销返回
+  `already_revoked: true`，不报错。撤销写入 relay ledger（`grant.revoked`，含 reason 与操作者）。
+- **派发预检**：携带已撤销 grant 的任务在 `POST /v1/task` 阶段被拒：`403 GRANT_REVOKED`。机器不会收到 offer。
+- **审计视图**：`GET /v1/grants`，operator token。返回 `tasks`（所有携带过 grant 的任务：task_id / grant_id / argv_hash /
+  key_id / mode / created_at）与 `revoked`（撤销记录）。只有 operator token 能读；device token 得到 401，因为这是授权台账，
+  不是机器的工作面。
+- **agent 侧边界**：agent 无法联系 relay 时仍按本地 ledger 执行已到手的 grant（正确性依赖 relay 派发，见 §4）；撤销的作用
+  是阻止**新派发**，与"停止签发"同义。
+
+撤销之后的新授权需要重新签发（新的 grant_id，绑定同一 task 或新 task）。

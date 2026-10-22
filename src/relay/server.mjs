@@ -846,6 +846,28 @@ export class RelayServer {
     }
 
 
+    /**
+     * v1.3.12-beta.2: grant administration (execution-authorization model).
+     *
+     * Revoking is an operator act: it stops one authorisation from being dispatched. The task list is the audit view --
+     * every task that carried a grant, with the argv hash and key id it was authorised under -- and deliberately returns
+     * only operator-readable data, never result bodies.
+     */
+    if (path === '/v1/grants/revoke' || path === '/v1/grants') {
+      const auth = this.authorizeTaskDispatch(req);
+      if (auth.role !== 'operator') throw new ProtocolError('OPERATOR_REQUIRED', 'only the operator may administer grants');
+      if (method === 'POST' && path === '/v1/grants/revoke') {
+        const body = takeJson();
+        const revoked = this.state.revokeGrant({ grantId: body?.grant_id, reason: body?.reason ?? null });
+        return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ...revoked });
+      }
+      if (method === 'GET' && path === '/v1/grants') {
+        const audit = this.state.grantedTasks();
+        return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ok: true, ...audit });
+      }
+      throw new ProtocolError('BAD_REQUEST', 'grants accept GET (audit) or POST /revoke', { method, path });
+    }
+
     /* ---- everything below requires `Authorization: Bearer <device_token>` ---- */
     const token = bearerToken(req);
     const device = token ? this.state.authenticate(token) : null;
@@ -939,6 +961,7 @@ export class RelayServer {
     this.enforceSignature(req, { method, signedPath, body: rawBody });
 
     /* ---- v1.2.5: members and read watermarks ---- */
+
     if (method === 'GET' && path === '/v1/fleet/members') {
       return sendJson(res, 200, {
         protocol_version: PROTOCOL_VERSION,

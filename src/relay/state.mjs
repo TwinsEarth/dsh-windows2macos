@@ -48,6 +48,7 @@ export const ERROR_STATUS = Object.freeze({
   GRANT_TASK_MISMATCH: 400,
   GRANT_ARGV_MISMATCH: 400,
   GRANT_EXPIRED: 400,
+  GRANT_REVOKED: 403,
   NOT_FOUND: 404,
   PAIRING_INVALID: 400,
   PAIRING_EXPIRED: 400,
@@ -543,6 +544,9 @@ export class RabbitState {
     this.notifications = createProjectNotifications({ now: () => this.nowMs(), onEvent: roomEvent });
     // v1.3.10-beta.20: a committed chunk session becomes a fleet blob with the same verified bytes. A store failure does not
     // undo the commit (the session is gone), but it is reported through the route so a caller never believes a blob exists.
+    // v1.3.12-beta.2: revoked grants. The operator can stop one authorisation from being used; the dispatch preflight
+    // refuses a task carrying a revoked grant, and the ledger keeps the revocation with its reason.
+    this.revokedGrants = new Map();
     this.blobSessions = createBlobSessions({
       now: () => this.nowMs(),
       onCommit: (blob) => {
@@ -1819,6 +1823,9 @@ export class RabbitState {
         if (Number.isNaN(expiresAt)) throw new ProtocolError('BAD_REQUEST', 'grant.expires_at is not a timestamp', { expires_at: rawGrant.expires_at });
         if (expiresAt <= this.nowMs()) throw new ProtocolError('GRANT_EXPIRED', 'the grant has already expired', { expires_at: rawGrant.expires_at });
       }
+      if (this.revokedGrants.has(String(rawGrant.grant_id))) {
+        throw new ProtocolError('GRANT_REVOKED', 'the grant was revoked by the operator', { grant_id: String(rawGrant.grant_id) });
+      }
       normalizedGrant = rawGrant;
     }
     const rawOperatorKey = input.operator_key ?? null;
@@ -2461,6 +2468,27 @@ export class RabbitState {
       released.push(candidate.task_id);
     }
     return released;
+  }
+
+  /** Stop one issued grant from being used. Idempotent: revoking twice is the same authorisation state. */
+  revokeGrant({ grantId, reason = null, actor = { kind: "operator", id: "operator" } }) {
+    if (typeof grantId !== "string" || grantId === "") throw new ProtocolError("BAD_REQUEST", "grant_id is required");
+    const existing = this.revokedGrants.get(grantId);
+    if (existing !== undefined) return { ok: true, already_revoked: true, revocation: { ...existing } };
+    const revocation = { grant_id: grantId, reason: typeof reason === "string" && reason !== "" ? reason : null, revoked_at: this.nowIso(), revoked_by: actor };
+    this.revokedGrants.set(grantId, revocation);
+    this._ledger({ type: "grant.revoked", grant_id: grantId, reason: revocation.reason, revoked_by: actor });
+    return { ok: true, already_revoked: false, revocation: { ...revocation } };
+  }
+
+  /** Audit view: every task that carried a grant, plus every revocation. Operator credential only. */
+  grantedTasks() {
+    const tasks = [];
+    for (const task of this.tasks.values()) {
+      if (task.grant_summary === null || task.grant_summary === undefined) continue;
+      tasks.push({ task_id: task.task_id, grant_id: task.grant_summary.grant_id, argv_hash: task.grant_summary.argv_hash, key_id: task.grant_summary.key_id, mode: task.mode, created_at: rfc3339(task.created_at_ms) });
+    }
+    return { tasks, revoked: [...this.revokedGrants.values()].map((entry) => ({ ...entry })) };
   }
 
   taskSummary(task) {

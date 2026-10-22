@@ -4956,3 +4956,35 @@ describe('execution-authorization dispatch preflight', () => {
     });
   });
 });
+describe('grant revocation and audit', () => {
+  it('refuses a revoked grant at dispatch and lists the authorisation trail for the operator', async () => {
+    const { buildGrant, signGrant } = await import('../src/maintenance/grant.mjs');
+    const { generateOperatorKeyPair } = await import('../src/maintenance/operator-key.mjs');
+    await withRelay({}, async (relay) => {
+      await pairDevice(relay, 'm-grant-revoke');
+      const keys = generateOperatorKeyPair();
+      const taskId = '01M5GRANTREVOKE00000000000001';
+      const argv = ['node', '--version'];
+      const grant = signGrant(buildGrant({ taskId, machineIds: ['m-grant-revoke'], argv, mode: 'replicate', cwdRel: '.', nowMs: Date.now(), ttlMs: 60_000 }), keys.privateKeyPem);
+      const body = { mode: 'replicate', command_argv: argv, cwd_rel: '.', index_total: 1, timeout_ms: 30_000, write: false, task_id: taskId, grant };
+
+      const revoked = await request(relay.url + '/v1/grants/revoke', { method: 'POST', token: OP, body: { grant_id: grant.grant_id, reason: 'authorisation withdrawn' } });
+      assert.equal(revoked.status, 200, revoked.text);
+      assert.equal(revoked.json.already_revoked, false);
+      const again = await request(relay.url + '/v1/grants/revoke', { method: 'POST', token: OP, body: { grant_id: grant.grant_id } });
+      assert.equal(again.json.already_revoked, true);
+
+      const refused = await postTask(relay, body);
+      assert.equal(refused.status, 403, refused.text);
+      assert.equal(refused.json.error.code, 'GRANT_REVOKED');
+
+      const audit = await request(relay.url + '/v1/grants', { token: OP });
+      assert.equal(audit.status, 200, audit.text);
+      assert.ok((audit.json.revoked ?? []).some((entry) => entry.grant_id === grant.grant_id));
+      assert.equal((audit.json.revoked ?? [])[0].reason, 'authorisation withdrawn');
+
+      const deviceAudit = await request(relay.url + '/v1/grants', { token: (await pairDevice(relay, 'm-grant-revoke-2')).token });
+      assert.equal(deviceAudit.status, 401);
+    });
+  });
+});
