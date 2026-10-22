@@ -7,6 +7,36 @@
 
 All notable changes to this project are documented here.
 
+## [1.4.1] — 2026-10-22
+
+**修复：授权模型在从未 bootstrap 的机器上不可用（真机发现）。**
+
+- relay 的 offer 对 **grant 任务**也携带 `operator_key`（此前只有 maintenance 请求携带）。在空 allow-list 的机器上，
+  agent 首次收到 offer 时据此 TOFU pin；修复前该机器只会得到 `GRANT_NO_PINNED_KEY`，即"显式授权"形同虚设。
+- 任务台账记录 `operator_key`，relay 重启回放恢复 `workspace / grant / grant_summary / maintenance / operator_key`：
+  修复前重启后 re-offer 会丢失授权字段，机器会以错误的理由拒绝任务。
+
+真机验收（relay 1.4.1 候选，TwinsEarth 插件 1.4.0、allow-list 为空）：
+
+- 无 grant 的 `node --version` → `COMMAND_NOT_ALLOWED`
+- operator grant 授权的 `node -e` → **ok**，输出 `{plugin:"1.4.0", pinned:"^1.4.0", node:"v24.21.0"}`
+- relay M1 diag（root runner）→ ok，66,046 bytes
+- 证据：`docs/acceptance/1.4.1/TWIN-GRANT-LIVE.json`、`M1-LIVE-DIAG.json`
+
+Verified: relay TOFU offer 测试 1/1、grant/ledger 相关 3/3；候选部署后真机全部通过。
+
+## [1.4.1-beta.1] — 2026-10-22
+
+**候选：授权模型在"从未 bootstrap 的机器"上可用。**
+
+- relay 的 offer 现在对 **grant 任务**也携带 `operator_key`（此前只有 maintenance 请求携带），首次见到该键的
+  agent 因此可以 TOFU pin；在此之前，空 allow-list 的新机器收到 grant 只会得到 `GRANT_NO_PINNED_KEY`。
+- 任务台账记录 `operator_key`，重启回放恢复 `workspace / grant / grant_summary / maintenance / operator_key`：
+  此前 relay 重启后 re-offer 的任务会丢失授权/工作区字段，机器会以错误的理由拒绝。
+- 真机验证路径：TwinsEarth（allow-list 为空、插件 1.4.0）用 operator grant 执行 `node -e` 读取版本。
+
+Verified: relay TOFU offer 测试 1/1，grant/ledger 相关 3/3；候选部署到 relay 后做真机验收。
+
 ## [1.4.0] — 2026-10-22
 
 **稳定版：执行授权、任务、协作三个模型的第一版落地。**

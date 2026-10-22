@@ -1,0 +1,23 @@
+{
+  "version": "1.4.1-beta.1",
+  "executed_at": "2026-10-22T04:32:10.058Z",
+  "executor": "lead",
+  "case": "TWIN-GRANT-LIVE",
+  "kind": "positive",
+  "machines": [
+    "6c92b251-3728-48bc-82a9-56cc40df48f2"
+  ],
+  "requirement": "a machine with an empty allow-list executes a command only through an explicit operator grant, and is refused without one",
+  "task_id": "01M5TWINGRANTOK0000000000001",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "plain_refused": "COMMAND_NOT_ALLOWED",
+      "granted_outcome": "ok",
+      "granted_stdout": "{\"node\":\"v24.21.0\",\"platform\":\"win32\",\"plugin\":\"1.4.0\",\"pinned\":\"^1.4.0\"}\n",
+      "grant_id": "gr-mvj1ns5e-8b1745e3a9",
+      "relay_version": "1.4.1-beta.1"
+    }
+  },
+  "note": "TwinsEarth runs plugin 1.4.0 with an empty allow-list; the grant path required the relay operator_key offer fix (1.4.1)"
+}

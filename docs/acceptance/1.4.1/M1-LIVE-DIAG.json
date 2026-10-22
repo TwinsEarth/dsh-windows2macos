@@ -1,0 +1,17 @@
+{
+  "version": "1.4.1-beta.1",
+  "executed_at": "2026-10-22T04:32:10.058Z",
+  "executor": "lead",
+  "case": "M1-LIVE-DIAG",
+  "kind": "positive",
+  "machines": [
+    "1c14d7d2-d9e2-43dd-a7e5-eda98f4864bc"
+  ],
+  "requirement": "the 1.4.1 candidate executes a signed maintenance diag request on the relay host",
+  "task_id": "01M5GY2TVNKG3FB49WPCKGH9PA",
+  "result": {
+    "outcome": "ok",
+    "stdout_bytes": 66046,
+    "deployed_version": "1.4.1-beta.1"
+  }
+}

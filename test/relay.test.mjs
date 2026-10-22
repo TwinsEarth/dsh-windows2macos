@@ -5202,3 +5202,27 @@ describe('project-scoped SSE', () => {
     });
   });
 });
+
+describe('grant TOFU offer', () => {
+  it('carries the operator key on a grant-only offer so a fresh machine can pin it', async () => {
+    const { buildGrant, signGrant } = await import('../src/maintenance/grant.mjs');
+    const { generateOperatorKeyPair, registrationPayload } = await import('../src/maintenance/operator-key.mjs');
+    await withRelay({}, async (relay) => {
+      await pairDevice(relay, 'm-grant-tofu');
+      const keys = generateOperatorKeyPair();
+      const taskId = '01M5GRANTTOFU00000000000001';
+      const argv = ['node', '--version'];
+      const grant = signGrant(buildGrant({ taskId, machineIds: ['m-grant-tofu'], argv, mode: 'replicate', cwdRel: '.', nowMs: Date.now(), ttlMs: 60_000 }), keys.privateKeyPem);
+      const seen = [];
+      const unsubscribe = relay.state.onEvent((event) => seen.push(event));
+      try {
+        const posted = await postTask(relay, { mode: 'replicate', command_argv: argv, cwd_rel: '.', index_total: 1, timeout_ms: 30_000, write: false, task_id: taskId, grant, operator_key: registrationPayload(keys) });
+        assert.equal(posted.status, 200, posted.text);
+        const offer = seen.find((entry) => entry.event?.type === 'task.offer' && entry.event.task_id === taskId);
+        assert.ok(offer, 'an offer was emitted');
+        assert.equal(offer.event.operator_key?.key_id, keys.keyId, 'the offer carries the operator key for the TOFU pin');
+        assert.equal(offer.event.grant?.grant_id, grant.grant_id);
+      } finally { unsubscribe(); }
+    });
+  });
+});

@@ -821,6 +821,14 @@ export class RabbitState {
           depends_on: Array.isArray(t.depends_on) ? t.depends_on : [],
           assignee: typeof t.assignee === 'string' && t.assignee !== '' ? t.assignee : null,
           project_id: typeof t.project_id === 'string' ? t.project_id : null,
+          // v1.4.1: an authorization or workspace must survive a relay restart, or a re-offered task reaches the machine
+          // without the grant/key/workspace it was dispatched with and the machine's own gate refuses it for the wrong reason.
+          workspace: t.workspace ?? null,
+          grant: t.grant ?? null,
+          grant_summary: t.grant_summary ?? null,
+          maintenance: t.maintenance ?? null,
+          maintenance_summary: t.maintenance_summary ?? null,
+          operator_key: t.operator_key ?? null,
         reduce_of: typeof t.reduce_of === 'string' ? t.reduce_of : null,
           reduce_inputs: Array.isArray(t.reduce_inputs) ? t.reduce_inputs : [],
           leases: new Map(),
@@ -2241,6 +2249,7 @@ export class RabbitState {
             reduce_of: task.reduce_of ?? null,
             maintenance_summary: task.maintenance_summary ?? null,
             grant_summary: task.grant_summary ?? null,
+            operator_key: task.operator_key ?? null,
             reduce_inputs: Array.isArray(task.reduce_inputs) ? task.reduce_inputs : [],
         origin_machine_id: task.origin_machine_id ?? null,
         p2p: task.p2p ?? null,
@@ -2361,7 +2370,10 @@ export class RabbitState {
       // v1.2.10: present only on a reduce task, so a normal offer stays byte-identical.
       ...(task.reduce_of !== null ? { reduce_of: task.reduce_of, reduce_inputs: task.reduce_inputs } : {}),
       // v1.3.10-beta.2: the signed request and its operator key travel together; the agent pins the key on first sight.
-      ...(task.maintenance !== null && task.maintenance !== undefined ? { maintenance: task.maintenance, operator_key: task.operator_key } : {}),
+      ...(task.maintenance !== null && task.maintenance !== undefined ? { maintenance: task.maintenance } : {}),
+      // v1.4.1: a grant on a machine that has never pinned the operator key is useless unless the offer carries the key it should
+      // trust. Maintenance requests always shipped it; grants must too, or the TOFU pin path is unreachable.
+      ...(task.operator_key !== null && task.operator_key !== undefined ? { operator_key: task.operator_key } : {}),
       ...(task.workspace !== null && task.workspace !== undefined ? { workspace: task.workspace } : {}),
       ...(task.grant !== null && task.grant !== undefined ? { grant: task.grant } : {}),
       cwd_rel: task.cwd_rel,
