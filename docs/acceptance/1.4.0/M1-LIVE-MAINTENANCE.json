@@ -1,0 +1,20 @@
+{
+  "version": "1.4.0-beta.1",
+  "machines": [
+    "1c14d7d2-d9e2-43dd-a7e5-eda98f4864bc"
+  ],
+  "executed_at": "2026-10-22T01:56:11.375Z",
+  "executor": "lead",
+  "case": "M1-LIVE-MAINTENANCE",
+  "kind": "positive",
+  "requirement": "the 1.4.0 candidate executes signed maintenance requests on the relay host",
+  "task_id": "01M5GMT4W230CNSQXCH75M071H",
+  "result": {
+    "outcome": "blocked",
+    "assertions": {
+      "diag_when_agent_online": true,
+      "candidate_m1_code_same_as_accepted_1_3_11": true
+    }
+  },
+  "note": "the candidate swap is done and the relay-side regression passed; w2m-localside was not restarted by the unprivileged deploy path, so the ferried diag could not run after the swap. Known operational limitation; resolved by systemctl restart w2m-localside."
+}

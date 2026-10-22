@@ -7,6 +7,30 @@
 
 All notable changes to this project are documented here.
 
+## [1.4.0] — 2026-10-22
+
+**稳定版：执行授权、任务、协作三个模型的第一版落地。**
+
+- **执行授权模型**：`bin/w2m-grant.mjs` 签发单次执行授权（绑定 task_id/argv/机器/≤10min TTL/max_uses）；relay 派发预检
+  （`GRANT_TASK_MISMATCH` / `GRANT_ARGV_MISMATCH` / `GRANT_EXPIRED` → 400）；撤销 `POST /v1/grants/revoke`（幂等、
+  ledger 留痕、派发 `403 GRANT_REVOKED`）与审计 `GET /v1/grants`；结果信封携带 `authorization.provenance`
+  （grant/allow-list/maintenance）；使用台账不可写时 `GRANT_LEDGER_UNAVAILABLE` fail-closed。
+- **任务模型**：任务可声明 `workspace {kind:'worktree', base_commit, produce}`；agent 在独立 worktree 中执行、提交、
+  生成相对 base 的 patch 并上传内容寻址 blob，结果携带 `{base_commit, head_commit, changed_files, patch_sha256,
+  patch_bytes, cleaned}`；relay 侧分支 refs（单调、必须声明 from=head）、合并队列（patch sha256 幂等、already_merged）、
+  冲突结果带 conflict_sha256 且绝不推进分支。
+- **协作模型**：项目 room/board/artifact 索引/decisions/project memory/通知（共享对象事件广播 + 每 reader 未读水位）/
+  项目级 SSE（ready + since_seq 补齐 + 实时 project.event）。
+- **M7**：指标注册表与 `/metrics` 接线、证据 schema 与 preflight 第 16 项证据门禁；候选版本可用 candidate line
+  fallback，stable 必须提供本线真机证据。
+
+**发布时真机状态（如实）**：relay 宿主已运行 1.4.0 候选（1.4.0-beta.1，代码与 stable 相同），relay 侧真机回归 10/10
+通过（board/artifacts/decisions/memory/locks/blobs/refs/merge/notifications/项目 SSE）。M1 维护通道的 diag 在换版后
+未能执行：非特权换版路径（fleet node 通道）替换目录后由 kill 触发的重启没有拉起 `w2m-localside`（部署脚本的
+systemctl 被拒绝）；在控制台执行 `systemctl restart w2m-localside` 后即可继续完成 M1 复验与 stable 官方资产部署。
+
+证据：`docs/acceptance/1.4.0/`（REGRESSION-1.4.0.json、M1-LIVE-MAINTENANCE.json）。
+
 ## [1.4.0-beta.1] — 2026-10-22
 
 **v1.4.0 三模型候选：执行授权模型落地、任务模型落地、协作模型落地。**

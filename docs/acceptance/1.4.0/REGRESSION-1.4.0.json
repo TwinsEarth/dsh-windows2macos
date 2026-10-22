@@ -1,0 +1,81 @@
+{
+  "version": "1.4.0-beta.1",
+  "machines": [
+    "1c14d7d2-d9e2-43dd-a7e5-eda98f4864bc"
+  ],
+  "executed_at": "2026-10-22T01:56:11.375Z",
+  "executor": "lead",
+  "case": "LIVE-REGRESSION-140",
+  "kind": "positive",
+  "requirement": "the 1.4.0 candidate passes the relay-side live regression set on the real relay host",
+  "task_id": "01M5GMT4W230CNSQXCH75M071H",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "relay health": {
+        "ok": true,
+        "detail": {
+          "relay_id": "e09a7086b2d4fff7",
+          "uptime_ms": 258132,
+          "devices": 8
+        }
+      },
+      "M4 board": {
+        "ok": true,
+        "detail": {
+          "tasks": 18
+        }
+      },
+      "M4 artifacts": {
+        "ok": true,
+        "detail": {
+          "count": 1
+        }
+      },
+      "M4 decisions": {
+        "ok": true,
+        "detail": {
+          "count": 2
+        }
+      },
+      "M4 memory": {
+        "ok": true,
+        "detail": {
+          "version": 2
+        }
+      },
+      "M5 locks": {
+        "ok": true,
+        "detail": {
+          "conflict": "LOCK_HELD"
+        }
+      },
+      "M6 blobs": {
+        "ok": true,
+        "detail": {
+          "bytes": 35,
+          "range": 206
+        }
+      },
+      "TASK refs/merge": {
+        "ok": true,
+        "detail": {
+          "head": "cccccccccccccccccccccccccccccccccccccccc"
+        }
+      },
+      "COLLAB notifications": {
+        "ok": true,
+        "detail": {
+          "count": 9
+        }
+      },
+      "COLLAB project SSE": {
+        "ok": true,
+        "detail": {
+          "status": 200
+        }
+      }
+    }
+  },
+  "note": "candidate deployed through the fleet node channel; M1 maintenance acceptance tracked separately (agent service restart pending after the unprivileged deploy path)"
+}
