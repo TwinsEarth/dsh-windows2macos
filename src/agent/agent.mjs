@@ -55,6 +55,13 @@ import {
 import { createSpool } from './spool.mjs';
 import { MEMORY_FILE, appendMemory, memoryRecord } from './memory.mjs';
 import { matchAllowedCommand, parseAllowedCommands } from './allowed-commands.mjs';
+import {
+  EXEC_CAPABILITY_PREFIXES,
+  EXEC_CAPABILITY_WARNING,
+  defaultExecCapabilityFile,
+  effectiveExecCapabilityPrefixes,
+  readExecCapability,
+} from '../util/exec-capability.mjs';
 import { CRYPTO_REASON, DEVICE_KEY_FILE, DeviceKey, PeerKeyStore, deriveSigningKey } from './crypto.mjs';
 import { DEFAULT_P2P_MODE, P2P_DEFAULTS, P2PNode, normalizeP2PMode, normalizeP2PPort } from './p2p-node.mjs';
 import { punchSession, reverseDialSession } from './p2p.mjs';
@@ -1022,6 +1029,9 @@ export function createAgent(options) {
   // `string | string[][]` form is accepted, and a bare string list such as
   // `['node --test']` cannot reach `.map((prefix) => prefix.join(' '))`.
   const allowedCommands = parseAllowedCommands(options.allowedCommands ?? []);
+  // v1.4.2: the UI-activated Node-code-execution capability. Read before every task, so turning the switch in the
+  // plugin UI takes effect on the next task without restarting the agent; an expired temporary activation denies.
+  const execCapabilityFile = options.execCapabilityFile ?? defaultExecCapabilityFile();
 
   if (!rabbitUrl) throw new TypeError('createAgent: rabbitUrl is required');
   if (!project) throw new TypeError('createAgent: project is required');
@@ -2977,6 +2987,8 @@ export function createAgent(options) {
        */
       let allowed = matchAllowedCommand(commandArgv, allowedCommands);
       let grantAuthorized = false;
+      let capabilityAuthorized = false;
+      const capabilityStatus = readExecCapability(execCapabilityFile);
       if (allowed.allowed !== true && offer && typeof offer.grant === 'object' && offer.grant !== null) {
         const gatePaths = maintenancePaths();
         const gate = await authorizeWithGrant({
@@ -2988,10 +3000,16 @@ export function createAgent(options) {
         if (gate.ok === true) { allowed = { allowed: true, ok: true, grant_id: gate.grantId }; grantAuthorized = true; }
         else allowed = { ok: false, reason_code: gate.code ?? 'GRANT_REJECTED', detail: gate.message };
       }
+      if (allowed.allowed !== true && capabilityStatus.effective === true) {
+        allowed = matchAllowedCommand(commandArgv, effectiveExecCapabilityPrefixes(execCapabilityFile));
+        if (allowed.allowed === true) { capabilityAuthorized = true; warnings.push('EXEC_CAPABILITY: ' + EXEC_CAPABILITY_WARNING); }
+      }
       // One decision, two audiences: the gate decides whether to run, and the envelope records which decision it was.
       const authorization = grantAuthorized
         ? { provenance: 'grant', capability_id: allowed.grant_id ?? null, grant_id: allowed.grant_id ?? null }
-        : { provenance: 'allow-list' };
+        : capabilityAuthorized
+          ? { provenance: 'exec-capability', capability_id: 'node-code-exec', grant_id: null }
+          : { provenance: 'allow-list' };
       if (!allowed.allowed) {
         log('warn', `refused ${offer.task_id}: ${allowed.reason_code ?? REFUSAL.COMMAND_NOT_ALLOWED}`, { argv: commandArgv });
         await finish({
@@ -3182,7 +3200,12 @@ export function createAgent(options) {
 
       for (const stage of plannedStages) {
         // v1.3.10-beta.6: a grant that authorised step 5 covers the whole task, but only for the argv it signed.
-      const stageAllowed = grantAuthorized ? { allowed: true, ok: true } : matchAllowedCommand(stage.command_argv, allowedCommands);
+      const stageAllowList = matchAllowedCommand(stage.command_argv, allowedCommands);
+      const stageAllowed = grantAuthorized
+        ? { allowed: true, ok: true }
+        : stageAllowList.allowed === true
+          ? { allowed: true, ok: true }
+          : capabilityAuthorized ? matchAllowedCommand(stage.command_argv, EXEC_CAPABILITY_PREFIXES) : stageAllowList;
         if (stageAllowed.allowed) continue;
         const code = stageAllowed.reason_code ?? REFUSAL.COMMAND_NOT_ALLOWED;
         if (workspaceState !== null) { try { await removeWorktree({ repoDir: project, worktreeDir: workspaceState.worktreeDir }); } catch { /* best effort */ } }

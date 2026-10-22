@@ -1,0 +1,28 @@
+{
+  "version": "1.4.2-beta.1",
+  "case": "CAPABILITY-LIVE",
+  "kind": "positive",
+  "machines": [
+    "6c92b251-3728-48bc-82a9-56cc40df48f2"
+  ],
+  "executed_at": "2026-10-22T05:36:57.619Z",
+  "executor": "lead",
+  "requirement": "with an empty allow-list, node -e executes only while the UI-activated exec capability is effective; an expired temporary activation is refused",
+  "task_id": "01M5H1R5B8A0QAWNPDES19SZ1F",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "plugin_version": "1.4.2-beta.1",
+      "allow_list_empty": true,
+      "plain_node_refused": true,
+      "capability_executed": true,
+      "expired_capability_refused": true
+    }
+  },
+  "tasks": {
+    "plain_refused": "01M5H1QPA9QD3SKK4KFB7V18WX",
+    "capability_allowed": "01M5H1R5B8A0QAWNPDES19SZ1F",
+    "expired_refused": "01M5H1S0BKNBVF9RMC8P1X0665"
+  },
+  "note": "candidate installed from the release tree through the relay blob channel; the stale allow-list in cordis.patch.yml was cleared so the capability alone authorized the execution; the capability file is what the DSH capability control writes"
+}

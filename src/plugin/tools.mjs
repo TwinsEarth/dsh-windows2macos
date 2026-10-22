@@ -184,6 +184,8 @@ import {
 // v1.1.17 chat: the host route behind the composer's fleet-chat panel. The relay side and the
 // `w2m_chat` tool shipped first; this is the browser-facing half that was still missing.
 import { registerChatRoutes } from './fleet-chat-route.mjs';
+import { registerExecCapabilityRoutes } from './exec-capability-route.mjs';
+import { defaultExecCapabilityFile } from '../util/exec-capability.mjs';
 import { createFleetCouncil, fleetCouncilThread } from './council-fleet.mjs';
 import { renderMemoryView } from './memory-view.mjs';
 import { renderMergeHint } from './merge-hint.mjs';
@@ -3482,6 +3484,16 @@ export async function apply(ctx, config = {}) {
   // The composer's fleet-chat panel: `GET/POST /api/w2m/chat`, proxied to the relay's device-gated
   // `/v1/fleet/messages`. Optional like the target routes — a host without Connection keeps every
   // tool and the panel is simply not mounted.
+  // v1.4.2: the UI-activated Node-code-execution capability (`GET/POST /api/w2m/capability`). The composer
+  // control reads and writes it, the agent reads the same file before every task, so an activation takes effect
+  // on the next task without a restart. Optional like the other browser routes.
+  const capabilityRoutes = registerExecCapabilityRoutes(ctx, {
+    capabilityFile: () => defaultExecCapabilityFile(),
+  });
+  if (capabilityRoutes.mounted !== true) {
+    ctx.logger?.warn?.('w2m: the execution-capability control is inactive — ' + capabilityRoutes.reason);
+  }
+
   const chatRoutes = registerChatRoutes(ctx, {
     cfg: () => cfg,
     request,

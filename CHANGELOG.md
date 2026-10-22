@@ -7,6 +7,44 @@
 
 All notable changes to this project are documented here.
 
+## [1.4.2] — 2026-10-22
+
+**Node 代码执行权限成为 UI 可激活的子插件能力（命中真机验收）。**
+
+- 新增 `src/util/exec-capability.mjs`：机器本地能力状态（拒绝 / 临时 24h / 永久），fail-closed；临时档带绝对
+  `expires_at_ms`，过期即拒绝；唯一可放行的前缀固定为 `node -e`。
+- 新增 host 路由 `GET/POST /api/w2m/capability`（`src/plugin/exec-capability-route.mjs`），同源、在 host
+  认证栅栏内；浏览器不接触文件系统或设备 token。
+- client `lib/client.js` 在 `conversation.input.left` 新增第三个控制（order 42）：
+  `Node 执行：拒绝 | 临时 24 小时 | 永久`，带 RCE 风险提示与剩余时间。
+- agent 每个任务前读取能力文件；命中时结果信封 `authorization.provenance = "exec-capability"`，
+  warnings 记录 `EXEC_CAPABILITY`；pipeline 各 stage 同样覆盖。
+
+真机验收（TwinsEarth，插件 1.4.2-beta.1；先清空 `cordis.patch.yml` 的旧 allow-list 以隔离能力路径）：
+- 无能力、空 allow-list：`node --version` → `COMMAND_NOT_ALLOWED`
+- 能力=永久、空 allow-list：`node -e` → **ok**（`node -e` 是唯一被放行的前缀）
+- 能力=临时 5s 到期后：`node -e` → `COMMAND_NOT_ALLOWED`（fail-closed）
+- 证据：`docs/acceptance/1.4.2/CAPABILITY-LIVE.json`
+
+Verified: 单测/路由/客户端契约 43/43；候选 gate GREEN ×2；stable gate 见发布记录。
+
+## [1.4.2-beta.1] — 2026-10-22
+
+**Node 代码执行权限成为 UI 可激活的子插件能力。**
+
+- 新增 `src/util/exec-capability.mjs`：机器本地能力状态（拒绝 / 临时 24h / 永久），fail-closed，
+  临时档带绝对 `expires_at_ms`，过期即拒绝。
+- 新增 host 路由 `GET/POST /api/w2m/capability`（`src/plugin/exec-capability-route.mjs`），同源、在
+  host 认证栅栏内；浏览器不再接触文件系统或设备 token。
+- client `lib/client.js` 在 `conversation.input.left` 座位新增第三个控制（order 42）：
+  `Node 执行：拒绝 | 临时 24 小时 | 永久`，带 RCE 风险提示与剩余时间。
+- agent 每个任务前读取能力文件；命中时结果信封 `authorization.provenance = "exec-capability"`，
+  warnings 记录 `EXEC_CAPABILITY`；pipeline 各 stage 同样覆盖。
+- 文档 `docs/EXEC-CAPABILITY.md`；测试 `test/exec-capability.test.mjs`（7/7）、
+  client-bundle/loader-entry/exec-capability 合计 43/43。
+
+Verified: 单测与路由测试全绿；候选版本真机验收（UI 激活 → agent 下一任务可执行 node -e）。
+
 ## [1.4.1] — 2026-10-22
 
 **修复：授权模型在从未 bootstrap 的机器上不可用（真机发现）。**
