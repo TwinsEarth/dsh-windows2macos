@@ -14,6 +14,8 @@
 export const NOTIFICATION_KINDS = Object.freeze([
   'task.assigned', 'review.requested', 'review.decided', 'lock.conflict', 'merge.conflict',
   'merge.merged', 'ref.updated', 'mention', 'maintenance.result', 'digest',
+  // v1.3.14-beta.3: shared-object events that a client must learn about.
+  'decision.recorded', 'artifact.registered', 'memory.updated',
 ]);
 export const DEFAULT_NOTIFICATION_LIMITS = Object.freeze({
   dedupeWindowMs: 60 * 1000,

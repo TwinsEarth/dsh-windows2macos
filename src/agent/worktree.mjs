@@ -98,6 +98,15 @@ export async function producePatch({ worktreeDir, baseCommit, git = defaultGit()
 }
 
 /** Remove a worktree. Failure is reported, never hidden: a leaked worktree blocks the next task on that path. */
+export async function listChangedFiles({ worktreeDir, baseCommit, git = defaultGit() }) {
+  try {
+    const result = await git(['diff', '--name-only', baseCommit + '..HEAD'], worktreeDir);
+    return { ok: true, files: String(result.stdout).split(String.fromCharCode(10)).map((line) => line.trim()).filter((line) => line !== '').sort() };
+  } catch (error) {
+    return { ok: false, code: 'DIFF_FAILED', message: error?.message ?? 'git diff failed' };
+  }
+}
+
 export async function removeWorktree({ repoDir, worktreeDir, force = true, git = defaultGit() }) {
   try {
     const args = ['worktree', 'remove', ...(force ? ['--force'] : []), worktreeDir];

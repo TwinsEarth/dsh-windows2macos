@@ -4988,3 +4988,217 @@ describe('grant revocation and audit', () => {
     });
   });
 });
+
+describe('workspace task contract', () => {
+  it('carries a validated worktree descriptor into the task, the offer and the summary', async () => {
+    await withRelay({}, async (relay) => {
+      await pairDevice(relay, 'm-workspace');
+      const base = 'a'.repeat(40);
+      const accepted = await postTask(relay, { mode: 'replicate', command_argv: ['node', '--version'], cwd_rel: '.', index_total: 1, timeout_ms: 30_000, write: false, workspace: { kind: 'worktree', base_commit: base, produce: 'patch' } });
+      assert.equal(accepted.status, 200, accepted.text);
+      const summary = relay.state.taskSummary(relay.state.getTask(accepted.json.task_id));
+      assert.equal(summary.workspace.kind, 'worktree');
+      assert.equal(summary.workspace.base_commit, base);
+      assert.equal(summary.workspace.produce, 'patch');
+    });
+  });
+  it('refuses a malformed workspace descriptor at dispatch', async () => {
+    await withRelay({}, async (relay) => {
+      await pairDevice(relay, 'm-workspace-2');
+      const missing = await postTask(relay, { mode: 'replicate', command_argv: ['node', '--version'], cwd_rel: '.', index_total: 1, timeout_ms: 30_000, write: false, workspace: { kind: 'worktree' } });
+      assert.equal(missing.status, 400);
+      const wrongKind = await postTask(relay, { mode: 'replicate', command_argv: ['node', '--version'], cwd_rel: '.', index_total: 1, timeout_ms: 30_000, write: false, workspace: { kind: 'sandbox', base_commit: 'a'.repeat(40) } });
+      assert.equal(wrongKind.status, 400);
+    });
+  });
+});
+
+describe('project refs and merge queue routes', () => {
+  it('advances a branch only from its current head and settles merges and conflicts', async () => {
+    await withRelay({}, async (relay) => {
+      const device = await pairDevice(relay, 'm-refs');
+      const created = await request(relay.url + '/v1/projects', { method: 'POST', token: OP, body: { name: 'refs', members: [{ kind: 'machine', id: 'm-refs', role: 'worker' }] } });
+      assert.equal(created.status, 200, created.text);
+      const projectId = created.json.project.project.project_id;
+      const refsUrl = relay.url + '/v1/projects/' + projectId + '/refs';
+      const initial = await request(refsUrl, { token: device.token });
+      assert.equal(initial.status, 200, initial.text);
+      assert.deepEqual(initial.json.refs, []);
+
+      const A = 'a'.repeat(40);
+      const B = 'b'.repeat(40);
+      const C = 'c'.repeat(40);
+      const first = await request(refsUrl + '/advance', { method: 'POST', token: OP, body: { branch: 'main', from: null, to: A } });
+      assert.equal(first.status, 200, first.text);
+      const moved = await request(refsUrl + '/advance', { method: 'POST', token: OP, body: { branch: 'main', from: A, to: B } });
+      assert.equal(moved.status, 200, moved.text);
+      const stale = await request(refsUrl + '/advance', { method: 'POST', token: OP, body: { branch: 'main', from: A, to: C } });
+      assert.equal(stale.status, 409);
+      assert.equal(stale.json.code, 'REF_BASE_MISMATCH');
+
+      const deviceAdvance = await request(refsUrl + '/advance', { method: 'POST', token: device.token, body: { branch: 'main', from: B, to: C } });
+      assert.equal(deviceAdvance.status, 401);
+
+      const queueUrl = relay.url + '/v1/projects/' + projectId + '/merge-queue';
+      const patch = 'd'.repeat(64);
+      const queued = await request(queueUrl, { method: 'POST', token: OP, body: { branch: 'main', patch_sha256: patch, base_commit: B } });
+      assert.equal(queued.status, 200, queued.text);
+      const settled = await request(queueUrl + '/' + queued.json.item.queue_id + '/complete', { method: 'POST', token: OP, body: { outcome: 'merged', head_commit: C } });
+      assert.equal(settled.status, 200, settled.text);
+      const afterMerge = await request(refsUrl, { token: device.token });
+      assert.equal(afterMerge.json.refs[0].head_commit, C);
+
+      const again = await request(queueUrl, { method: 'POST', token: OP, body: { branch: 'main', patch_sha256: patch, base_commit: B } });
+      assert.equal(again.json.already_merged, true);
+
+      const patch2 = 'e'.repeat(64);
+      const second = await request(queueUrl, { method: 'POST', token: OP, body: { branch: 'main', patch_sha256: patch2, base_commit: C } });
+      const conflict = await request(queueUrl + '/' + second.json.item.queue_id + '/complete', { method: 'POST', token: OP, body: { outcome: 'conflict', conflict_sha256: 'f'.repeat(64) } });
+      assert.equal(conflict.status, 200, conflict.text);
+      const afterConflict = await request(refsUrl, { token: device.token });
+      assert.equal(afterConflict.json.refs[0].head_commit, C, 'a conflict never moves the branch');
+    });
+  });
+});
+
+describe('shared project board and artifacts', () => {
+  it('two clients in the same project read the same board and artifact index', async () => {
+    await withRelay({}, async (relay) => {
+      const one = await pairDevice(relay, 'm-board-1');
+      const two = await pairDevice(relay, 'm-board-2');
+      const outsider = await pairDevice(relay, 'm-board-outsider');
+      const created = await request(relay.url + '/v1/projects', { method: 'POST', token: OP, body: { name: 'board', members: [{ kind: 'machine', id: 'm-board-1', role: 'worker' }, { kind: 'machine', id: 'm-board-2', role: 'worker' }] } });
+      assert.equal(created.status, 200, created.text);
+      const projectId = created.json.project.project.project_id;
+
+      const task = await postTask(relay, { mode: 'replicate', command_argv: ['node', '--version'], cwd_rel: '.', index_total: 1, timeout_ms: 30_000, write: false, project_id: projectId });
+      assert.equal(task.status, 200, task.text);
+
+      const boardOne = await request(relay.url + '/v1/projects/' + projectId + '/board', { token: one.token });
+      const boardTwo = await request(relay.url + '/v1/projects/' + projectId + '/board', { token: two.token });
+      assert.equal(boardOne.status, 200, boardOne.text);
+      assert.equal(boardTwo.status, 200, boardTwo.text);
+      assert.deepEqual(boardOne.json.tasks.map((entry) => entry.task_id), boardTwo.json.tasks.map((entry) => entry.task_id));
+      assert.equal(boardOne.json.tasks.length, 1);
+      assert.equal(boardOne.json.counts.unknown ?? boardOne.json.counts.waiting ?? Object.values(boardOne.json.counts)[0], 1);
+
+      const sha = 'a'.repeat(64);
+      const registered = await request(relay.url + '/v1/projects/' + projectId + '/artifacts', { method: 'POST', token: OP, body: { sha256: sha, bytes: 1234, kind: 'patch', source_task_id: task.json.task_id } });
+      assert.equal(registered.status, 200, registered.text);
+      const artifactsOne = await request(relay.url + '/v1/projects/' + projectId + '/artifacts', { token: one.token });
+      const artifactsTwo = await request(relay.url + '/v1/projects/' + projectId + '/artifacts', { token: two.token });
+      assert.deepEqual(artifactsOne.json.artifacts.map((entry) => entry.sha256), artifactsTwo.json.artifacts.map((entry) => entry.sha256));
+      assert.deepEqual(artifactsOne.json.artifacts.map((entry) => entry.sha256), [sha]);
+
+      const outsiderBoard = await request(relay.url + '/v1/projects/' + projectId + '/board', { token: outsider.token });
+      assert.equal(outsiderBoard.status, 404);
+    });
+  });
+});
+
+describe('shared decisions and project memory', () => {
+  it('records decisions and a versioned memory document that every member reads identically', async () => {
+    await withRelay({}, async (relay) => {
+      const one = await pairDevice(relay, 'm-know-1');
+      const two = await pairDevice(relay, 'm-know-2');
+      const outsider = await pairDevice(relay, 'm-know-outsider');
+      const created = await request(relay.url + '/v1/projects', { method: 'POST', token: OP, body: { name: 'knowledge', members: [{ kind: 'machine', id: 'm-know-1', role: 'worker' }, { kind: 'machine', id: 'm-know-2', role: 'worker' }] } });
+      const projectId = created.json.project.project.project_id;
+
+      const added = await request(relay.url + '/v1/projects/' + projectId + '/decisions', { method: 'POST', token: OP, body: { title: 'use replay merge policy', text: 'because bases move', kind: 'policy', refs: { task_id: 't-1' } } });
+      assert.equal(added.status, 200, added.text);
+      const oneDecisions = await request(relay.url + '/v1/projects/' + projectId + '/decisions', { token: one.token });
+      const twoDecisions = await request(relay.url + '/v1/projects/' + projectId + '/decisions', { token: two.token });
+      assert.deepEqual(oneDecisions.json.decisions.map((entry) => entry.decision_id), twoDecisions.json.decisions.map((entry) => entry.decision_id));
+      assert.equal(oneDecisions.json.decisions[0].title, 'use replay merge policy');
+      assert.equal(oneDecisions.json.decisions[0].refs.task_id, 't-1');
+
+      const memoryOne = await request(relay.url + '/v1/projects/' + projectId + '/memory', { method: 'PUT', token: OP, body: { text: 'shared context v1' } });
+      assert.equal(memoryOne.json.document.version, 1);
+      const memoryTwo = await request(relay.url + '/v1/projects/' + projectId + '/memory', { method: 'PUT', token: OP, body: { text: 'shared context v2' } });
+      assert.equal(memoryTwo.json.document.version, 2);
+      const readOne = await request(relay.url + '/v1/projects/' + projectId + '/memory', { token: one.token });
+      const readTwo = await request(relay.url + '/v1/projects/' + projectId + '/memory', { token: two.token });
+      assert.equal(readOne.json.document.text, 'shared context v2');
+      assert.equal(readOne.json.document.version, readTwo.json.document.version);
+
+      const deviceWrite = await request(relay.url + '/v1/projects/' + projectId + '/decisions', { method: 'POST', token: one.token, body: { title: 'nope' } });
+      assert.equal(deviceWrite.status, 401);
+      const outsiderRead = await request(relay.url + '/v1/projects/' + projectId + '/decisions', { token: outsider.token });
+      assert.equal(outsiderRead.status, 404);
+    });
+  });
+});
+
+describe('project notifications', () => {
+  it('fans shared-object events out to every member with per-reader watermarks', async () => {
+    await withRelay({}, async (relay) => {
+      const one = await pairDevice(relay, 'm-notify-1');
+      const two = await pairDevice(relay, 'm-notify-2');
+      const created = await request(relay.url + '/v1/projects', { method: 'POST', token: OP, body: { name: 'notify', members: [{ kind: 'machine', id: 'm-notify-1', role: 'worker' }, { kind: 'machine', id: 'm-notify-2', role: 'worker' }] } });
+      const projectId = created.json.project.project.project_id;
+
+      const decision = await request(relay.url + '/v1/projects/' + projectId + '/decisions', { method: 'POST', token: OP, body: { title: 'notify about decisions' } });
+      assert.equal(decision.status, 200, decision.text);
+
+      const listedOne = await request(relay.url + '/v1/projects/' + projectId + '/notifications', { token: one.token });
+      const listedTwo = await request(relay.url + '/v1/projects/' + projectId + '/notifications', { token: two.token });
+      assert.equal(listedOne.status, 200, listedOne.text);
+      assert.ok(listedOne.json.notifications.some((row) => row.kind === 'decision.recorded'));
+      assert.deepEqual(listedOne.json.notifications.map((row) => row.notification_id), listedTwo.json.notifications.map((row) => row.notification_id));
+
+      const unreadOne = await request(relay.url + '/v1/projects/' + projectId + '/notifications/unread', { token: one.token });
+      const unreadTwo = await request(relay.url + '/v1/projects/' + projectId + '/notifications/unread', { token: two.token });
+      assert.equal(unreadOne.json.count, unreadTwo.json.count);
+      assert.ok(unreadOne.json.count >= 1);
+
+      const marked = await request(relay.url + '/v1/projects/' + projectId + '/notifications/read', { method: 'POST', token: one.token, body: { watermark_ms: Date.now() + 1000 } });
+      assert.equal(marked.status, 200, marked.text);
+      const afterOne = await request(relay.url + '/v1/projects/' + projectId + '/notifications/unread', { token: one.token });
+      const afterTwo = await request(relay.url + '/v1/projects/' + projectId + '/notifications/unread', { token: two.token });
+      assert.equal(afterOne.json.count, 0, 'the reader that acknowledged has nothing pending');
+      assert.ok(afterTwo.json.count >= 1, 'the other reader still has its own unread rows');
+
+      const queueUrl = relay.url + '/v1/projects/' + projectId + '/merge-queue';
+      const queued = await request(queueUrl, { method: 'POST', token: OP, body: { branch: 'main', patch_sha256: 'a'.repeat(64), base_commit: 'b'.repeat(40) } });
+      await request(queueUrl + '/' + queued.json.item.queue_id + '/complete', { method: 'POST', token: OP, body: { outcome: 'conflict', conflict_sha256: 'c'.repeat(64) } });
+      const conflictRows = await request(relay.url + '/v1/projects/' + projectId + '/notifications', { token: two.token });
+      assert.ok(conflictRows.json.notifications.some((row) => row.kind === 'merge.conflict' && row.requires_action === true));
+    });
+  });
+});
+
+describe('project-scoped SSE', () => {
+  it('pushes the same ordered project events to two clients, and replays from since_seq', async () => {
+    await withRelay({}, async (relay) => {
+      const one = await pairDevice(relay, 'm-sse-1');
+      const two = await pairDevice(relay, 'm-sse-2');
+      const created = await request(relay.url + '/v1/projects', { method: 'POST', token: OP, body: { name: 'sse', members: [{ kind: 'machine', id: 'm-sse-1', role: 'worker' }, { kind: 'machine', id: 'm-sse-2', role: 'worker' }] } });
+      const projectId = created.json.project.project.project_id;
+      const streamUrl = relay.url + '/v1/projects/' + projectId + '/stream';
+
+      const first = await openSse(streamUrl, { token: one.token });
+      const second = await openSse(streamUrl, { token: two.token });
+      assert.equal(first.status, 200);
+      assert.equal(second.status, 200);
+      await first.waitFor((frame) => frame.event === 'ready');
+      await second.waitFor((frame) => frame.event === 'ready');
+
+      const decision = await request(relay.url + '/v1/projects/' + projectId + '/decisions', { method: 'POST', token: OP, body: { title: 'streamed decision' } });
+      assert.equal(decision.status, 200, decision.text);
+
+      const isDecision = (frame) => frame.event === 'project.event' && JSON.parse(frame.data).type === 'decision.recorded';
+      const frameOne = await first.waitFor(isDecision);
+      const frameTwo = await second.waitFor(isDecision);
+      assert.equal(JSON.parse(frameOne.data).payload.title, 'streamed decision');
+      assert.equal(JSON.parse(frameOne.data).seq, JSON.parse(frameTwo.data).seq, 'both clients apply the same event sequence');
+
+      const replay = await openSse(streamUrl + '?since_seq=0', { token: one.token });
+      const replayedDecision = await replay.waitFor(isDecision);
+      assert.equal(JSON.parse(replayedDecision.data).payload.title, 'streamed decision');
+      first.close();
+      second.close();
+      replay.close();
+    });
+  });
+});

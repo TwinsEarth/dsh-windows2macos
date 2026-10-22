@@ -868,6 +868,201 @@ export class RelayServer {
       throw new ProtocolError('BAD_REQUEST', 'grants accept GET (audit) or POST /revoke', { method, path });
     }
 
+    /**
+     * v1.3.13-beta.4: project refs and the merge queue (task model: branch, merge, conflict).
+     *
+     * Reads take the device token of a paired machine; advancing a ref and settling a queue item are operator acts, because
+     * they state where the branch is and what a patch did. A merge that would move the head from a base that is no longer
+     * current is refused and the item stays queued -- the model never silently rewrites history.
+     */
+    const refsMatch = /^\/v1\/projects\/([^/]+)\/refs(?:\/advance)?$/.exec(path);
+    if (refsMatch !== null) {
+      const projectId = decodeURIComponent(refsMatch[1]);
+      const wantsAdvance = path.endsWith('/advance');
+      if (!wantsAdvance && method === 'GET') {
+        const token = bearerToken(req);
+        if (token === null || this.state.authenticate(token) === null) throw new ProtocolError('UNAUTHORIZED', 'reading refs needs a paired device token');
+        return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ok: true, refs: this.state.refs.listRefs({ projectId }) });
+      }
+      if (wantsAdvance && method === 'POST') {
+        const auth = this.authorizeTaskDispatch(req);
+        if (auth.role !== 'operator') throw new ProtocolError('OPERATOR_REQUIRED', 'advancing a ref is an operator act');
+        const body = takeJson();
+        const moved = this.state.refs.advance({ projectId, branch: body?.branch, from: body?.from ?? null, to: body?.to, reason: body?.reason ?? null });
+        return sendJson(res, moved.ok === true ? 200 : 409, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ...moved });
+      }
+      throw new ProtocolError('BAD_REQUEST', 'refs accept GET or POST /advance', { method, path });
+    }
+    const mergeMatch = /^\/v1\/projects\/([^/]+)\/merge-queue(?:\/([^/]+))?(?:\/(complete))?$/.exec(path);
+    if (mergeMatch !== null) {
+      const projectId = decodeURIComponent(mergeMatch[1]);
+      const queueId = mergeMatch[2] === undefined ? null : decodeURIComponent(mergeMatch[2]);
+      const action = mergeMatch[3] ?? null;
+      if (method === 'GET' && queueId === null) {
+        const token = bearerToken(req);
+        if (token === null || this.state.authenticate(token) === null) throw new ProtocolError('UNAUTHORIZED', 'reading the merge queue needs a paired device token');
+        return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ok: true, items: this.state.refs.listQueue({ projectId }) });
+      }
+      const auth = this.authorizeTaskDispatch(req);
+      if (auth.role !== 'operator') throw new ProtocolError('OPERATOR_REQUIRED', 'merge queue mutations are operator acts');
+      if (method === 'POST' && queueId === null) {
+        const body = takeJson();
+        const queued = this.state.refs.enqueue({ projectId, branch: body?.branch, patchSha256: body?.patch_sha256, baseCommit: body?.base_commit, sourceTaskId: body?.source_task_id ?? null });
+        return sendJson(res, queued.ok === true ? 200 : 400, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ...queued });
+      }
+      if (method === 'POST' && queueId !== null && action === 'complete') {
+        const body = takeJson();
+        const settled = this.state.refs.complete({ queueId, outcome: body?.outcome, headCommit: body?.head_commit ?? null, conflictSha256: body?.conflict_sha256 ?? null });
+        return sendJson(res, settled.ok === true ? 200 : 409, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ...settled });
+      }
+      throw new ProtocolError('BAD_REQUEST', 'merge queue accepts GET, POST enqueue or POST /:id/complete', { method, path });
+    }
+
+    /**
+     * v1.3.14-beta.1 (collaboration model): shared objects. Two clients in the same project read the SAME board and the SAME
+     * artifact index; before this they each filtered the global task list and disagreed as soon as one of them looked late.
+     */
+    const sharedMatch = /^\/v1\/projects\/([^/]+)\/(board|artifacts)$/.exec(path);
+    if (sharedMatch !== null) {
+      const projectId = decodeURIComponent(sharedMatch[1]);
+      const resource = sharedMatch[2];
+      const readDevice = () => {
+        const token = bearerToken(req);
+        const caller = token === null ? null : this.state.authenticate(token);
+        if (caller === null) throw new ProtocolError('UNAUTHORIZED', 'reading a project object needs a paired device token');
+        return caller;
+      };
+      if (method === 'GET') {
+        const caller = readDevice();
+        const snapshot = this.state.projectSnapshot(projectId);
+        const isDefault = snapshot.project.project_id === this.state.defaultProjectId;
+        if (!isDefault) {
+          const member = this.state.projects.memberOf({ projectId, member: { kind: 'machine', id: caller.machine_id } });
+          if (member === null) throw new ProtocolError('NOT_FOUND', 'unknown project', { project_id: projectId });
+        }
+        if (resource === 'board') return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ok: true, ...this.state.projectBoard({ projectId }) });
+        return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ok: true, artifacts: this.state.listArtifacts({ projectId }) });
+      }
+      if (method === 'POST' && resource === 'artifacts') {
+        const auth = this.authorizeTaskDispatch(req);
+        if (auth.role !== 'operator') throw new ProtocolError('OPERATOR_REQUIRED', 'registering a project artifact is an operator act');
+        const body = takeJson();
+        const registered = this.state.registerArtifact({ projectId, sha256: body?.sha256, bytes: body?.bytes, kind: body?.kind ?? 'artifact', sourceTaskId: body?.source_task_id ?? null });
+        return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ...registered });
+      }
+      throw new ProtocolError('BAD_REQUEST', 'project objects accept GET, or POST artifacts', { method, path });
+    }
+
+    /**
+     * v1.3.14-beta.2 (collaboration model): decisions and project memory as shared objects. The board answers "what is
+     * happening", these answer "what did we agree" -- and both are one object per project, not a per-client copy.
+     */
+    const knowledgeMatch = /^\/v1\/projects\/([^/]+)\/(decisions|memory)$/.exec(path);
+    if (knowledgeMatch !== null) {
+      const projectId = decodeURIComponent(knowledgeMatch[1]);
+      const resource = knowledgeMatch[2];
+      const readDevice = () => {
+        const token = bearerToken(req);
+        const caller = token === null ? null : this.state.authenticate(token);
+        if (caller === null) throw new ProtocolError('UNAUTHORIZED', 'reading a project object needs a paired device token');
+        return caller;
+      };
+      const requireReadable = (caller) => {
+        const snapshot = this.state.projectSnapshot(projectId);
+        if (snapshot.project.project_id === this.state.defaultProjectId) return;
+        const member = this.state.projects.memberOf({ projectId, member: { kind: 'machine', id: caller.machine_id } });
+        if (member === null) throw new ProtocolError('NOT_FOUND', 'unknown project', { project_id: projectId });
+      };
+      if (method === 'GET') {
+        const caller = readDevice();
+        requireReadable(caller);
+        if (resource === 'decisions') return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ok: true, decisions: this.state.listDecisions({ projectId }) });
+        return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ok: true, document: this.state.getProjectMemory({ projectId }) });
+      }
+      const auth = this.authorizeTaskDispatch(req);
+      if (auth.role !== 'operator') throw new ProtocolError('OPERATOR_REQUIRED', 'writing shared project objects is an operator act');
+      const body = takeJson();
+      if (method === 'POST' && resource === 'decisions') {
+        const added = this.state.addDecision({ projectId, title: body?.title, text: body?.text ?? null, actor: { kind: 'operator', id: 'operator' }, refs: body?.refs ?? {}, kind: body?.kind ?? 'decision' });
+        return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ...added });
+      }
+      if (method === 'PUT' && resource === 'memory') {
+        const updated = this.state.setProjectMemory({ projectId, text: body?.text, actor: { kind: 'operator', id: 'operator' } });
+        return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ...updated });
+      }
+      throw new ProtocolError('BAD_REQUEST', 'decisions accept GET/POST, memory accepts GET/PUT', { method, path });
+    }
+
+    /**
+     * v1.3.14-beta.3 (collaboration model): notifications for shared-object events. The rows are broadcast to project
+     * members, read with a per-reader watermark, and deduplicated inside the notifications module; a client that reconnects
+     * asks for everything after its watermark instead of re-reading the whole event stream.
+     */
+    const notifyMatch = /^\/v1\/projects\/([^/]+)\/notifications(?:\/(unread|read))?$/.exec(path);
+    if (notifyMatch !== null) {
+      const projectId = decodeURIComponent(notifyMatch[1]);
+      const action = notifyMatch[2] ?? null;
+      const token = bearerToken(req);
+      const caller = token === null ? null : this.state.authenticate(token);
+      if (caller === null) throw new ProtocolError('UNAUTHORIZED', 'notifications need a paired device token');
+      const snapshot = this.state.projectSnapshot(projectId);
+      if (snapshot.project.project_id !== this.state.defaultProjectId) {
+        const member = this.state.projects.memberOf({ projectId, member: { kind: 'machine', id: caller.machine_id } });
+        if (member === null) throw new ProtocolError('NOT_FOUND', 'unknown project', { project_id: projectId });
+      }
+      const reader = { kind: 'machine', id: caller.machine_id };
+      if (method === 'GET' && action === null) {
+        const url = new URL(req.url, 'http://relay.invalid');
+        const sinceMs = Number(url.searchParams.get('since_ms') ?? 0);
+        const limit = Number(url.searchParams.get('limit') ?? 200);
+        const listed = this.state.notifications.list({ projectId, sinceMs: Number.isFinite(sinceMs) ? sinceMs : 0, limit: Number.isFinite(limit) ? Math.max(1, Math.min(500, limit)) : 200 });
+        return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ok: true, ...listed });
+      }
+      if (method === 'GET' && action === 'unread') return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ok: true, ...this.state.notifications.unread({ projectId, reader }) });
+      if (method === 'POST' && action === 'read') {
+        const body = takeJson();
+        const marked = this.state.notifications.markRead({ projectId, reader, watermarkMs: body?.watermark_ms });
+        return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ...marked });
+      }
+      throw new ProtocolError('BAD_REQUEST', 'notifications accept GET, GET /unread or POST /read', { method, path });
+    }
+
+    /**
+     * v1.3.14-beta.4 (collaboration model): a project-scoped SSE stream.
+     *
+     * `ready` names the project and its last event seq, `since_seq` replays the room events a client missed, then every new
+     * room event is pushed as `project.event`. Clients in the same project therefore apply the same ordered events instead
+     * of each polling a different view.
+     */
+    const projectStreamMatch = /^\/v1\/projects\/([^/]+)\/stream$/.exec(path);
+    if (projectStreamMatch !== null && method === 'GET') {
+      const projectId = decodeURIComponent(projectStreamMatch[1]);
+      const token = bearerToken(req);
+      const caller = token === null ? null : this.state.authenticate(token);
+      if (caller === null) throw new ProtocolError('UNAUTHORIZED', 'project events need a paired device token');
+      const snapshot = this.state.projectSnapshot(projectId);
+      if (snapshot.project.project_id !== this.state.defaultProjectId) {
+        const member = this.state.projects.memberOf({ projectId, member: { kind: 'machine', id: caller.machine_id } });
+        if (member === null) throw new ProtocolError('NOT_FOUND', 'unknown project', { project_id: projectId });
+      }
+      const sinceRaw = url.searchParams.get('since_seq');
+      const sinceSeq = sinceRaw !== null && /^[0-9]+$/.test(sinceRaw) ? Number(sinceRaw) : 0;
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store', connection: 'keep-alive' });
+      const frame = (entry) => {
+        try { res.write('id: ' + entry.seq + '\nevent: project.event\ndata: ' + JSON.stringify({ project_id: entry.project_id, seq: entry.seq, type: entry.type, payload: entry.payload }) + '\n\n'); } catch { /* closed */ }
+      };
+      const replayed = this.state.projects.events({ projectId, sinceSeq });
+      res.write('event: ready\ndata: ' + JSON.stringify({ protocol_version: PROTOCOL_VERSION, project_id: projectId, last_event_seq: replayed.next_seq }) + '\n\n');
+      for (const entry of replayed.events) frame(entry);
+      const unsubscribe = this.state.onProjectEvent((entry) => { if (entry.project_id === projectId) frame(entry); });
+      const keepalive = setInterval(() => { try { res.write(': keepalive\n\n'); } catch { /* closed */ } }, this.keepaliveMs);
+      let closed = false;
+      const done = () => { if (closed) return; closed = true; clearInterval(keepalive); unsubscribe(); try { res.end(); } catch { /* already closed */ } };
+      req.on('close', done);
+      res.on('close', done);
+      return true;
+    }
+
     /* ---- everything below requires `Authorization: Bearer <device_token>` ---- */
     const token = bearerToken(req);
     const device = token ? this.state.authenticate(token) : null;

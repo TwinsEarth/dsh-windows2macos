@@ -7,6 +7,30 @@
 
 All notable changes to this project are documented here.
 
+## [1.4.0-beta.1] — 2026-10-22
+
+**v1.4.0 三模型候选：执行授权模型落地、任务模型落地、协作模型落地。**
+
+这是把 1.3.12–1.3.14 的 beta 线合成一版的候选，供 stable 前真机验收。
+
+- **执行授权模型（v1.4.0）**：`bin/w2m-grant.mjs` 签发单次执行授权（绑定 task_id/argv/机器/≤10min TTL）；
+  relay 派发预检（`GRANT_TASK_MISMATCH` / `GRANT_ARGV_MISMATCH` / `GRANT_EXPIRED`）；撤销
+  `POST /v1/grants/revoke`（幂等、ledger 留痕、派发 `403 GRANT_REVOKED`）与审计 `GET /v1/grants`；
+  结果信封带 `authorization.provenance`（grant/allow-list/maintenance）；使用台账不可写时
+  `GRANT_LEDGER_UNAVAILABLE` fail-closed（真机发现的 EACCES 崩溃已修）。
+- **任务模型（v1.4.1 前身）**：任务可声明 `workspace {kind:'worktree', base_commit, produce}`；
+  agent 在独立 worktree 执行 → 提交 → 生成相对 base 的 patch → 上传内容寻址 blob → 证据
+  `{base_commit, head_commit, changed_files, patch_sha256, patch_bytes, cleaned}`；
+  relay 侧分支 refs（单调、必须声明 from=head）、合并队列（按 patch sha256 幂等、already_merged）、
+  冲突结果携带 conflict_sha256 且绝不推进分支；refs/merge-queue HTTP 路由。
+- **协作模型（v1.4.2 前身）**：项目 room（成员/角色/快照+增量事件）、board、artifact 索引、
+  decisions（append-only）、project memory（版本文档）、通知（共享对象事件广播 + 每 reader 未读水位）、
+  项目级 SSE（ready + since_seq 补齐 + 实时 project.event + keepalive）。
+
+M7 证据门禁对候选版本增加 candidate line fallback：beta 候选可引用其所基于发布线的真机证据（其产物在机器升级前构建），stable 仍必须提供本线真机证据。
+
+Verified: gate GREEN ×2；relay 测试、agent 测试、workspace/refs/board/notification/SSE 用例全绿。
+
 ## [1.3.12-beta.4] — 2026-10-22
 
 **执行授权模型真机修复：使用台账不可写时 fail closed，而不是 crashed。**

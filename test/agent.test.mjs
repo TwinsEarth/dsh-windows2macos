@@ -5102,3 +5102,73 @@ describe('grant replay e2e (v1.3.10-beta.6 slice)', () => {
     } finally { await rabbit.close(); delete process.env.W2M_MAINTENANCE_PINS; }
   });
 });
+
+
+
+describe('workspace execution', () => {
+  it('runs in an isolated worktree, reports the patch, and cleans up', async () => {
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const { execFileSync } = await import('node:child_process');
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'w2m-ws-exec-'));
+    const git = (...args) => execFileSync('git', args, { cwd: repo, encoding: 'utf8' }).trim();
+    git('init', '-b', 'main');
+    git('config', 'user.name', 'test');
+    git('config', 'user.email', 'test@example.invalid');
+    git('config', 'core.autocrlf', 'false');
+    fs.writeFileSync(path.join(repo, 'base.txt'), 'base', 'utf8');
+    git('add', '--all');
+    git('commit', '-m', 'base');
+    const base = git('rev-parse', 'HEAD');
+
+    const rabbit = await startFakeRabbit();
+    const agent = makeAgent({ rabbit: rabbit.url, project: repo, allowed: [[NODE, '-e']], name: 'workspace-exec' });
+    const running = agent.start();
+    const stream = await rabbit.stream();
+    stream.send('ready', { protocol_version: 1, rabbit_time: '2026-10-22T12:00:00Z', machine_id: 'rabbit' });
+    stream.send('task.offer', {
+      task_id: '01J-WORKSPACE-EXEC', attempt: 1, mode: 'replicate', index: 0, index_total: 1,
+      command_argv: [NODE, '-e', 'require("fs").writeFileSync("out.txt", "hi")'],
+      cwd_rel: '.', write: false, timeout_ms: 30_000, dedupe_key: 'dk-workspace-exec', machine_id: 'm-workspace-exec',
+      workspace: { kind: 'worktree', base_commit: base, produce: 'patch' },
+    });
+    await running;
+    const result = rabbit.state.results[0];
+    assert.equal(result.status, 'ok', JSON.stringify(result).slice(0, 300));
+    assert.equal(result.workspace.base_commit, base);
+    assert.notEqual(result.workspace.head_commit, base);
+    assert.ok((result.workspace.changed_files ?? []).includes('out.txt'), 'changed_files names the new file: ' + JSON.stringify(result.workspace));
+    assert.match(String(result.workspace.patch_sha256), /^[0-9a-f]{64}$/);
+    assert.equal(result.workspace.patch_bytes > 0, true);
+    assert.equal(result.workspace.cleaned, true);
+    assert.equal(fs.existsSync(path.join(repo, 'out.txt')), false, 'the main copy was never written');
+    assert.equal(fs.existsSync(path.join(repo, '.w2m-worktrees', '01J-WORKSPACE-EXEC')), false, 'the worktree was removed');
+    await rabbit.close();
+  });
+
+  it('refuses WORKSPACE_CREATE_FAILED when the base commit does not exist', async () => {
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const { execFileSync } = await import('node:child_process');
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'w2m-ws-bad-'));
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repo, encoding: 'utf8' });
+    execFileSync('git', ['config', 'user.name', 'test'], { cwd: repo, encoding: 'utf8' });
+    execFileSync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: repo, encoding: 'utf8' });
+    fs.writeFileSync(path.join(repo, 'a.txt'), 'a', 'utf8');
+    execFileSync('git', ['add', '--all'], { cwd: repo, encoding: 'utf8' });
+    execFileSync('git', ['commit', '-m', 'base'], { cwd: repo, encoding: 'utf8' });
+    const rabbit = await startFakeRabbit();
+    const agent = makeAgent({ rabbit: rabbit.url, project: repo, allowed: [[NODE, '--version']], name: 'workspace-bad' });
+    const running = agent.start();
+    const stream = await rabbit.stream();
+    stream.send('ready', { protocol_version: 1, rabbit_time: '2026-10-22T12:00:00Z', machine_id: 'rabbit' });
+    stream.send('task.offer', { task_id: '01J-WORKSPACE-BAD', attempt: 1, mode: 'replicate', index: 0, index_total: 1, command_argv: [NODE, '--version'], cwd_rel: '.', write: false, timeout_ms: 30_000, dedupe_key: 'dk-workspace-bad', machine_id: 'm-workspace-bad', workspace: { kind: 'worktree', base_commit: 'f'.repeat(40), produce: 'patch' } });
+    await running;
+    const result = rabbit.state.results[0];
+    assert.equal(result.status, 'refused');
+    assert.equal(result.refusal_reason, 'WORKSPACE_CREATE_FAILED');
+    await rabbit.close();
+  });
+});

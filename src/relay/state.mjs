@@ -30,6 +30,7 @@ import { createProjectLocks } from './project-locks.mjs';
 import { createProjectReviews } from './project-reviews.mjs';
 import { createProjectNotifications } from './project-notifications.mjs';
 import { createBlobSessions } from './blob-sessions.mjs';
+import { createProjectRefs } from './project-refs.mjs';
 import { createMetrics } from './reliability-metrics.mjs';
 import { argvHash as grantArgvHash } from '../maintenance/grant.mjs';
 
@@ -525,10 +526,41 @@ export class RabbitState {
     this.operatorKeys = new Map();
     // v1.3.10-beta.13: shared project objects (M4). Tasks name a project; readers get snapshot + events.
     this.metrics = createMetrics();
+    // v1.3.14-beta.4: project-scoped live push. A client that follows one project subscribes here instead of filtering the
+    // global stream, so two clients see the same project events in the same order (the room owns the sequence).
+    this.projectSubscribers = new Set();
+    // v1.3.14-beta.1 (collaboration model): shared objects every client reads the same way -- a project board and an artifact
+    // index. Before this a client could only list ALL tasks, so two clients "in the same project" built different boards.
+    this.artifacts = new Map();
+    // v1.3.14-beta.2: the remaining shared objects -- decisions and a project memory document. Both are append/versioned and
+    // read by every member, so "what we agreed" is the same object for every client rather than a chat history.
+    this.decisions = new Map();
+    this.projectMemory = new Map();
+    // v1.3.13-beta.4: branch heads and merge outcomes live with the project room so one stream answers "where is the branch".
+    this.refs = createProjectRefs({
+      now: () => this.nowMs(),
+      onEvent: (event) => { try { this.projects.appendEvent({ projectId: event.payload.project_id, type: event.type, actor: { kind: 'operator', id: 'relay' }, payload: event.payload }); } catch { /* history */ } },
+    });
     // Every project-room event is counted once, here: the room's own events and the lock/review/notification events projected
     // into it both pass through this callback, so the counter cannot double-count a projection.
+    // v1.3.14-beta.3: which project events are worth a notification, and whether they need an action from a member.
+    const NOTIFIED = Object.freeze({
+      'decision.recorded': { kind: 'decision.recorded', subject: 'a decision was recorded', requiresAction: false },
+      'artifact.registered': { kind: 'artifact.registered', subject: 'an artifact was registered', requiresAction: false },
+      'memory.updated': { kind: 'memory.updated', subject: 'project memory was updated', requiresAction: false },
+      'merge.conflict': { kind: 'merge.conflict', subject: 'a merge conflicted', requiresAction: true },
+      'merge.merged': { kind: 'merge.merged', subject: 'a patch was merged', requiresAction: false },
+      'ref.advanced': { kind: 'ref.updated', subject: 'a branch was advanced', requiresAction: false },
+    });
     const metricsEvent = (event) => {
       try { this.metrics.inc('wm_project_events_total', { type: event.type }); } catch { /* metrics never break the room */ }
+      for (const listener of this.projectSubscribers) { try { listener(event); } catch { /* a subscriber never breaks the room */ } }
+      const notified = NOTIFIED[event.type];
+      if (notified !== undefined) {
+        try {
+          this.notifications.notify({ projectId: event.project_id, kind: notified.kind, target: { kind: 'broadcast' }, subject: notified.subject, refs: event.payload ?? {}, requiresAction: notified.requiresAction });
+        } catch { /* a notification is never worth failing the event for */ }
+      }
     };
     this.projects = createProjectRoom({ now: () => this.nowMs(), onEvent: metricsEvent });
     this.defaultProjectId = 'default';
@@ -1800,6 +1832,25 @@ export class RabbitState {
      * v1.3.10-beta.3: a task-level grant travels with the dispatch. The relay checks its shape and time window so a bad
      * grant is refused at dispatch, but the agent is the verifier — the relay never decides authorisation on its own.
      */
+    /**
+     * v1.3.13-beta.1 (task model): a task may explain WHICH copy of the project it runs on. The relay validates the
+     * descriptor and carries it, exactly as it carries argv: the machine that owns the copy decides whether it can honour
+     * it (and the agent currently refuses a workspace task with WORKSPACE_UNSUPPORTED until the execution slice lands).
+     */
+    const rawWorkspace = input.workspace ?? null;
+    let normalizedWorkspace = null;
+    if (rawWorkspace !== null) {
+      if (typeof rawWorkspace !== 'object' || Array.isArray(rawWorkspace) || Buffer.byteLength(JSON.stringify(rawWorkspace), 'utf8') > 4 * 1024) {
+        throw new ProtocolError('BAD_REQUEST', 'workspace must be an object of at most 4 KiB', {});
+      }
+      if (rawWorkspace.kind !== 'worktree') throw new ProtocolError('BAD_REQUEST', "workspace.kind must be 'worktree'", { kind: rawWorkspace.kind });
+      if (typeof rawWorkspace.base_commit !== 'string' || !/^[0-9a-f]{7,64}$/.test(rawWorkspace.base_commit)) {
+        throw new ProtocolError('BAD_REQUEST', 'workspace.base_commit must be a hex commit id', { base_commit: rawWorkspace.base_commit });
+      }
+      const produce = rawWorkspace.produce ?? 'patch';
+      if (!['patch', 'commit', 'none'].includes(produce)) throw new ProtocolError('BAD_REQUEST', "workspace.produce must be patch, commit or none", { produce });
+      normalizedWorkspace = { kind: 'worktree', base_commit: rawWorkspace.base_commit, produce };
+    }
     const rawGrant = input.grant ?? null;
     let normalizedGrant = null;
     if (rawGrant !== null) {
@@ -1895,6 +1946,7 @@ export class RabbitState {
        */
       project_id: this.ensureProject(input.project_id ?? null),
       reduce_of: typeof input.reduce_of === 'string' && input.reduce_of !== '' ? input.reduce_of : null,
+      workspace: normalizedWorkspace,
       grant: normalizedGrant,
       grant_summary: normalizedGrant === null ? null : { grant_id: normalizedGrant.grant_id, argv_hash: normalizedGrant.argv_hash, key_id: normalizedGrant.signature?.key_id ?? null },
       /** v1.3.10-beta.2: a signed maintenance request travels with the task; the relay carries it, the root runner verifies it. */
@@ -2161,6 +2213,7 @@ export class RabbitState {
       type: 'task.created',
       task: {
         task_id: task.task_id,
+        workspace: task.workspace ?? null,
         project_id: task.project_id,
         mode: task.mode,
         command_argv: task.command_argv,
@@ -2309,6 +2362,7 @@ export class RabbitState {
       ...(task.reduce_of !== null ? { reduce_of: task.reduce_of, reduce_inputs: task.reduce_inputs } : {}),
       // v1.3.10-beta.2: the signed request and its operator key travel together; the agent pins the key on first sight.
       ...(task.maintenance !== null && task.maintenance !== undefined ? { maintenance: task.maintenance, operator_key: task.operator_key } : {}),
+      ...(task.workspace !== null && task.workspace !== undefined ? { workspace: task.workspace } : {}),
       ...(task.grant !== null && task.grant !== undefined ? { grant: task.grant } : {}),
       cwd_rel: task.cwd_rel,
       // Omitted when false, so a single-command offer for every existing caller stays byte-identical -- the
@@ -2491,6 +2545,82 @@ export class RabbitState {
     return { tasks, revoked: [...this.revokedGrants.values()].map((entry) => ({ ...entry })) };
   }
 
+  /** Register a content-addressed artifact against a project (idempotent by sha256). */
+  registerArtifact({ projectId, sha256, bytes, kind = "artifact", sourceTaskId = null, actor = null }) {
+    if (!/^[0-9a-f]{64}$/.test(String(sha256))) throw new ProtocolError("BAD_REQUEST", "artifact sha256 must be 64 hex", {});
+    const wanted = this.ensureProject(projectId);
+    const existing = this.artifacts.get(sha256);
+    if (existing !== undefined && existing.project_id === wanted) return { ok: true, artifact: { ...existing }, already: true };
+    const artifact = { project_id: wanted, sha256: String(sha256), bytes: Number.isInteger(bytes) && bytes >= 0 ? bytes : null, kind: String(kind), source_task_id: sourceTaskId, created_at: this.nowIso(), actor };
+    this.artifacts.set(sha256, artifact);
+    try { this.projects.appendEvent({ projectId: wanted, type: "artifact.registered", actor: actor ?? { kind: "operator", id: "relay" }, payload: { sha256: artifact.sha256, bytes: artifact.bytes, kind: artifact.kind, source_task_id: sourceTaskId } }); } catch { /* history */ }
+    return { ok: true, artifact: { ...artifact }, already: false };
+  }
+
+  listArtifacts({ projectId }) {
+    const wanted = this.ensureProject(projectId);
+    return [...this.artifacts.values()].filter((artifact) => artifact.project_id === wanted).sort((a, b) => (a.created_at < b.created_at ? 1 : -1)).map((artifact) => ({ ...artifact }));
+  }
+
+  /** The project board: every task attributed to this project, with the scheduler's own status. */
+  projectBoard({ projectId }) {
+    const wanted = this.ensureProject(projectId);
+    const tasks = [...this.tasks.values()].filter((task) => task.project_id === wanted).map((task) => {
+      const summary = this.taskSummary(task);
+      return { task_id: summary.task_id, status: summary.status, mode: summary.mode, created_at: summary.created_at, leases: summary.leases, lease_states: summary.lease_states, result_count: [...this.results.values()].filter((record) => record?.envelope?.task_id === task.task_id).length };
+    });
+    const counts = {};
+    for (const task of tasks) counts[task.status] = (counts[task.status] ?? 0) + 1;
+    return { project_id: wanted, tasks, counts, generated_at: this.nowIso() };
+  }
+
+  /** Append a decision to a project. Decisions are records; there is no edit or delete. */
+  addDecision({ projectId, title, text = null, actor = null, refs = {}, kind = "decision" }) {
+    const wanted = this.ensureProject(projectId);
+    if (typeof title !== "string" || title.trim() === "") throw new ProtocolError("BAD_REQUEST", "decision title is required", {});
+    const list = this.decisions.get(wanted) ?? [];
+    const index = list.length + 1;
+    const decision = {
+      decision_id: wanted + "-d" + String(index).padStart(4, "0"),
+      project_id: wanted, title: title.trim().slice(0, 200), text: typeof text === "string" ? text.slice(0, 4000) : null,
+      kind: String(kind), refs: refs !== null && typeof refs === "object" ? { ...refs } : {},
+      actor, created_at: this.nowIso(),
+    };
+    list.push(decision);
+    this.decisions.set(wanted, list);
+    try { this.projects.appendEvent({ projectId: wanted, type: "decision.recorded", actor: actor ?? { kind: "operator", id: "relay" }, payload: { decision_id: decision.decision_id, title: decision.title, kind: decision.kind } }); } catch { /* history */ }
+    return { ok: true, decision: { ...decision } };
+  }
+
+  listDecisions({ projectId }) {
+    const wanted = this.ensureProject(projectId);
+    return (this.decisions.get(wanted) ?? []).map((decision) => ({ ...decision, refs: { ...decision.refs } }));
+  }
+
+  /** A small versioned document per project (64 KiB cap): shared context that is not a log. */
+  setProjectMemory({ projectId, text, actor = null }) {
+    const wanted = this.ensureProject(projectId);
+    if (typeof text !== "string") throw new ProtocolError("BAD_REQUEST", "memory text must be a string", {});
+    if (Buffer.byteLength(text, "utf8") > 64 * 1024) throw new ProtocolError("PROJECT_MEMORY_TOO_LARGE", "project memory is limited to 64 KiB", { bytes: Buffer.byteLength(text, "utf8") });
+    const previous = this.projectMemory.get(wanted);
+    const doc = { project_id: wanted, text, version: (previous?.version ?? 0) + 1, updated_at: this.nowIso(), actor };
+    this.projectMemory.set(wanted, doc);
+    try { this.projects.appendEvent({ projectId: wanted, type: "memory.updated", actor: actor ?? { kind: "operator", id: "relay" }, payload: { version: doc.version, bytes: Buffer.byteLength(text, "utf8") } }); } catch { /* history */ }
+    return { ok: true, document: { ...doc } };
+  }
+
+  getProjectMemory({ projectId }) {
+    const wanted = this.ensureProject(projectId);
+    const doc = this.projectMemory.get(wanted);
+    return doc === undefined ? { project_id: wanted, text: "", version: 0, updated_at: null, actor: null } : { ...doc };
+  }
+
+  /** Subscribe to every project event. Returns an unsubscribe function. */
+  onProjectEvent(listener) {
+    this.projectSubscribers.add(listener);
+    return () => { this.projectSubscribers.delete(listener); };
+  }
+
   taskSummary(task) {
     return {
       task_id: task.task_id,
@@ -2512,7 +2642,8 @@ export class RabbitState {
       reduce_of: task.reduce_of ?? null,
       reduce_inputs: Array.isArray(task.reduce_inputs) ? task.reduce_inputs : [],
       maintenance_request_id: task.maintenance_summary?.request_id ?? null,
-      grant_id: task.grant_summary?.grant_id ?? null,
+      workspace: task.workspace === null || task.workspace === undefined ? null : { ...task.workspace },
+    grant_id: task.grant_summary?.grant_id ?? null,
     argv_hash: task.grant_summary?.argv_hash ?? null,
     grant_key_id: task.grant_summary?.key_id ?? null,
       status: (() => {

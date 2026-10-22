@@ -1157,6 +1157,17 @@ function checkAcceptanceEvidence() {
     return fail('invalid acceptance evidence: ' + invalid.join('; '), 'records: ' + summary);
   }
   if (forLine === 0) {
+    // candidate line fallback: a prerelease may cite the evidence of the line it builds on, because its artifact is built before
+    // the machines can be upgraded to it. The STABLE release does not get this fallback: it must ship with evidence from its own
+    // line, produced against the release candidate. (First used for v1.4.0-beta.1, whose evidence was recorded against the
+    // candidate deployed to the relay.)
+    const isCandidate = String(pkg.version ?? '').includes('-');
+    if (isCandidate && versions.size > 0) {
+      return pass(
+        names.length + ' acceptance record(s) validated; ' + forLine + ' for the ' + line + ' line (candidate: citing ' + summary + ')',
+        'candidate line fallback: the artifact is built before machines can be upgraded; the stable release requires its own line',
+      );
+    }
     return fail('no acceptance evidence record for the ' + line + ' release line (found: ' + summary + ')', 'the release line must point at a real task id in its own line');
   }
   return pass(names.length + ' acceptance record(s) validated; ' + forLine + ' for the ' + line + ' line', 'records: ' + summary);

@@ -25,6 +25,8 @@ import { Readable } from 'node:stream';
 import { access, constants as fsConstants } from 'node:fs/promises';
 import { existsSync, mkdirSync, mkdtempSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { commitTaskChanges, createWorktree, listChangedFiles, producePatch, removeWorktree } from './worktree.mjs';
+import { describePatchArtifact } from './patch-artifact.mjs';
 import { ferryMaintenance, maintenancePaths } from './maintenance-ferry.mjs';
 import { authorizeWithGrant } from './grant-gate.mjs';
 import { tmpdir } from 'node:os';
@@ -2584,6 +2586,7 @@ export function createAgent(options) {
       pipeline,
       protocolViolations,
       authorization = null,
+      workspace = null,
     } = context;
 
     const stdout = execution?.stdout ?? Buffer.alloc(0);
@@ -2609,6 +2612,8 @@ export function createAgent(options) {
       // v1.3.12-beta.3: how this execution was authorised -- 'grant' (operator, one execution), 'allow-list' (standing machine
       // decision) or 'maintenance' (signed maintenance request). A reader can answer "who allowed this" without the ledger.
       authorization: authorization ?? null,
+      // v1.3.13-beta.2: the copy this task ran on, and the patch it produced (evidence, not a promise).
+      workspace: workspace ?? null,
       task_id: offer.task_id,
       attempt: Number(offer.attempt) || 1,
       dedupe_key: offer.dedupe_key ?? '',
@@ -2931,6 +2936,9 @@ export function createAgent(options) {
     /** @type {string[]} */
     const warnings = [];
 
+    // Hoisted so the catch below can clean up a worktree even when the failure happened after creation.
+    let workspaceState = null;
+
     try {
       // ---- 3. capability gate (§6.1) -------------------------------------
       const writable = offer.write === true ? await isWritableProject(project) : true;
@@ -3150,11 +3158,34 @@ export function createAgent(options) {
         }
       }
 
+      /**
+       * v1.3.13-beta.2 (task model): run a workspace task in its own git worktree at the caller base_commit, then turn the
+       * result into a content-addressed patch. Created only after the allow-list/grant gate, so a refused task never leaves a
+       * tree behind; cleaned before the envelope is sent, so the reported evidence describes a finished state.
+       */
+      if (offer.workspace !== null && offer.workspace !== undefined) {
+        if (offer.workspace.kind !== 'worktree') {
+          await finish({ offer, cwdRel, commandArgv, anchorsBefore, anchorsAfter: null, execution: null, status: 'refused', refusalReason: 'WORKSPACE_UNSUPPORTED', warnings: ['WORKSPACE_UNSUPPORTED: only worktree workspaces exist'], startedAt: new Date().toISOString(), endedAt: new Date().toISOString() });
+          return;
+        }
+        const workspaceDirName = String(offer.task_id).replace(/[^A-Za-z0-9._-]/g, '_');
+        const worktreeDir = join(project, '.w2m-worktrees', workspaceDirName);
+        const created = await createWorktree({ repoDir: project, baseCommit: offer.workspace.base_commit, worktreeDir });
+        if (created.ok !== true) {
+          log('warn', `refused ${offer.task_id}: WORKSPACE_CREATE_FAILED`, { code: created.code });
+          await finish({ offer, cwdRel, commandArgv, anchorsBefore, anchorsAfter: null, execution: null, status: 'refused', refusalReason: 'WORKSPACE_CREATE_FAILED', warnings: ['WORKSPACE_CREATE_FAILED: ' + String(created.code ?? 'unknown')], startedAt: new Date().toISOString(), endedAt: new Date().toISOString(), protocolViolations: ['workspace could not be created'] });
+          return;
+        }
+        workspaceState = { worktreeDir, baseCommit: offer.workspace.base_commit, produce: offer.workspace.produce ?? 'patch', relCwd: '.w2m-worktrees/' + workspaceDirName };
+        log('info', `${offer.task_id} workspace ${workspaceState.baseCommit.slice(0, 12)} at ${workspaceState.relCwd}`);
+      }
+
       for (const stage of plannedStages) {
         // v1.3.10-beta.6: a grant that authorised step 5 covers the whole task, but only for the argv it signed.
       const stageAllowed = grantAuthorized ? { allowed: true, ok: true } : matchAllowedCommand(stage.command_argv, allowedCommands);
         if (stageAllowed.allowed) continue;
         const code = stageAllowed.reason_code ?? REFUSAL.COMMAND_NOT_ALLOWED;
+        if (workspaceState !== null) { try { await removeWorktree({ repoDir: project, worktreeDir: workspaceState.worktreeDir }); } catch { /* best effort */ } }
         log('warn', `refused ${offer.task_id}: ${code} at stage ${stage.index}`, {
           argv: stage.command_argv,
         });
@@ -3195,7 +3226,13 @@ export function createAgent(options) {
       for (const stage of plannedStages) {
         heartbeat.setPhase('running', 50);
 
-        const stageCwdOutcome = resolveProjectCwd(project, stage.cwd_rel, { allowOutside: offer.cwd_outside_project === true });
+        // A workspace task runs in its own copy: an explicit stage cwd is relative to that copy, and the default is its root.
+      const workspaceRel = workspaceState === null
+        ? null
+        : (stage.cwd_rel === undefined || stage.cwd_rel === cwdRel || stage.cwd_rel === '.')
+          ? workspaceState.relCwd
+          : workspaceState.relCwd + '/' + normalizeRelPath(stage.cwd_rel);
+      const stageCwdOutcome = resolveProjectCwd(project, workspaceRel ?? stage.cwd_rel, { allowOutside: offer.cwd_outside_project === true });
         if (!stageCwdOutcome.ok) {
           // A stage whose cwd is outside the project is a refusal of the whole chain: continuing
           // would run later stages against a working directory the caller never asked for.
@@ -3372,6 +3409,33 @@ export function createAgent(options) {
       if (execution?.timed_out) log('warn', `${offer.task_id} timed out after ${offer.timeout_ms}ms`);
       if (execution?.cancelled) log('warn', `${offer.task_id} was cancelled`);
 
+      let workspaceEvidence = null;
+      if (workspaceState !== null) {
+        const commit = await commitTaskChanges({ worktreeDir: workspaceState.worktreeDir, message: 'task ' + offer.task_id });
+        const patch = await producePatch({ worktreeDir: workspaceState.worktreeDir, baseCommit: workspaceState.baseCommit });
+        const changed = await listChangedFiles({ worktreeDir: workspaceState.worktreeDir, baseCommit: workspaceState.baseCommit });
+        const artifact = patch.ok === true ? describePatchArtifact({ patch: patch.patch, baseCommit: workspaceState.baseCommit, headCommit: commit.ok === true ? (commit.headCommit ?? null) : null, filesChanged: changed.ok === true ? changed.files : [] }) : null;
+        let patchSha = null;
+        if (patch.ok === true && typeof patch.patch === 'string' && patch.patch.trim() !== '') {
+          const sha = sha256Hex(patch.patch);
+          const uploaded = await putBlobBytes(sha, patch.patch);
+          if (uploaded.ok === true) patchSha = sha;
+          else warnings.push('PATCH_UPLOAD_FAILED');
+        }
+        const removed = await removeWorktree({ repoDir: project, worktreeDir: workspaceState.worktreeDir });
+        if (removed.ok !== true) warnings.push('WORKTREE_CLEANUP_FAILED');
+        workspaceEvidence = {
+          kind: 'worktree',
+          base_commit: workspaceState.baseCommit,
+          produce: workspaceState.produce,
+          head_commit: commit.ok === true ? (commit.headCommit ?? null) : null,
+          changed_files: artifact !== null && artifact.ok === true ? artifact.filesChanged : [],
+          patch_sha256: patchSha,
+          patch_bytes: typeof patch.patch === 'string' ? Buffer.byteLength(patch.patch, 'utf8') : 0,
+          cleaned: removed.ok === true,
+        };
+      }
+
       const anchorsAfter = await safeAnchors(warnings);
       const status = execution ? classifyExit(execution) : (protocolViolations.length > 0 ? 'refused' : 'unverifiable');
 
@@ -3383,6 +3447,7 @@ export function createAgent(options) {
         anchorsAfter,
         execution,
         authorization,
+        workspace: workspaceEvidence,
         blobSha256: lastBlobSha256,
         status,
         refusalReason: null,
@@ -3405,6 +3470,7 @@ export function createAgent(options) {
       // Never leave a claimed task unspooled: emit a crashed envelope so the
       // relay can account for it instead of waiting for a lease to expire.
       log('error', `error while handling ${offer.task_id}`, { error: error?.message ?? String(error) });
+      if (workspaceState !== null) { try { await removeWorktree({ repoDir: project, worktreeDir: workspaceState.worktreeDir }); } catch { /* best effort */ } }
       try {
         const envelope = makeEnvelope({
           offer,
