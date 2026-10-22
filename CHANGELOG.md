@@ -7,6 +7,23 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.12-beta.3] — 2026-10-22
+
+**执行授权模型收尾：每个结果都说明"是谁授权的"。**
+
+beta.1 让操作员能授权一次执行，beta.2 让授权可撤销、可审计；这一版补上最后一块——结果自身携带授权来源，而不是只能在
+relay 台账里反查。
+
+- 结果信封新增 `authorization` 字段：`{provenance: "grant" | "allow-list" | "maintenance", capability_id?, grant_id?}`。
+  grant 路径带 `grant_id`（可与 ledger 对账），maintenance 路径带 request_id（可与 M1 台账对账），allow-list 路径标记
+  provenance 即可。
+- 一个决定、两个受众：gate 决定"跑不跑"，信封记录"这是哪一种决定"；refused 路径不伪造 provenance。
+- e2e 断言：空 allow-list + 合法 grant 的结果 `authorization.provenance === "grant"` 且带 grant_id。
+- 边界如实写进文档：provenance 是执行机器对自身判定的陈述，relay 存储但不验证它；签名仍由 agent 验证，派发仍由 relay
+  预检，撤销仍由 relay 记账——台账才是权威。
+
+Verified: agent 159/157（含 grant replay e2e 的 provenance 断言）；gate GREEN twice。
+
 ## [1.3.12-beta.2] — 2026-10-22
 
 **执行授权模型补完：撤销与操作员审计。**

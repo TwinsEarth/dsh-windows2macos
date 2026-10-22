@@ -326,3 +326,24 @@ task summary 与 ledger 现在携带 `grant_id`、`argv_hash`、`grant_key_id`�
   是阻止**新派发**，与"停止签发"同义。
 
 撤销之后的新授权需要重新签发（新的 grant_id，绑定同一 task 或新 task）。
+
+## 授权来源（v1.3.12-beta.3）
+
+前两版解决了"能不能授权"和"能不能收回"；这一版让结果自己回答"是谁授权的"。每个任务结果信封多一个字段：
+
+```json
+{
+  "authorization": {
+    "provenance": "grant | allow-list | maintenance",
+    "capability_id": "gr-…（grant 时）| maintenance request_id（maintenance 时）",
+    "grant_id": "gr-…（grant 时）"
+  }
+}
+```
+
+- **allow-list**：机器所有者的长期决定，机器执行时命中静态表。
+- **grant**：操作员针对这一次执行的显式授权；附带 grant_id，可与 relay ledger 的 `grant.revoked` / 任务记录对账。
+- **maintenance**：签名维护请求；capability_id 是 request_id，对应 M1 的请求台账。
+
+边界要写清楚：**provenance 是执行机器对自身判定的事实陈述，relay 只存储不验证**（signature 由 agent 验、派发由 relay 预检、撤销由
+relay 记账）。回答"这到底是谁允许的"仍以 relay ledger 为准；provenance 让每个结果可被机器与人快速定位到那条授权，而不是替代台账。

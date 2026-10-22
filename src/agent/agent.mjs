@@ -2583,6 +2583,7 @@ export function createAgent(options) {
       comparePolicy,
       pipeline,
       protocolViolations,
+      authorization = null,
     } = context;
 
     const stdout = execution?.stdout ?? Buffer.alloc(0);
@@ -2605,6 +2606,9 @@ export function createAgent(options) {
 
     const envelope = {
       envelope_version: ENVELOPE_VERSION,
+      // v1.3.12-beta.3: how this execution was authorised -- 'grant' (operator, one execution), 'allow-list' (standing machine
+      // decision) or 'maintenance' (signed maintenance request). A reader can answer "who allowed this" without the ledger.
+      authorization: authorization ?? null,
       task_id: offer.task_id,
       attempt: Number(offer.attempt) || 1,
       dedupe_key: offer.dedupe_key ?? '',
@@ -2976,6 +2980,10 @@ export function createAgent(options) {
         if (gate.ok === true) { allowed = { allowed: true, ok: true, grant_id: gate.grantId }; grantAuthorized = true; }
         else allowed = { ok: false, reason_code: gate.code ?? 'GRANT_REJECTED', detail: gate.message };
       }
+      // One decision, two audiences: the gate decides whether to run, and the envelope records which decision it was.
+      const authorization = grantAuthorized
+        ? { provenance: 'grant', capability_id: allowed.grant_id ?? null, grant_id: allowed.grant_id ?? null }
+        : { provenance: 'allow-list' };
       if (!allowed.allowed) {
         log('warn', `refused ${offer.task_id}: ${allowed.reason_code ?? REFUSAL.COMMAND_NOT_ALLOWED}`, { argv: commandArgv });
         await finish({
@@ -3087,6 +3095,7 @@ export function createAgent(options) {
           anchorsBefore,
           anchorsAfter: null,
           execution,
+          authorization: { provenance: 'maintenance', capability_id: typeof offer.maintenance?.request_id === 'string' ? offer.maintenance.request_id : null },
           status: ferried.ok ? 'ok' : 'failed',
           refusalReason: ferried.ok ? null : 'MAINTENANCE_FAILED',
           warnings,
@@ -3373,6 +3382,7 @@ export function createAgent(options) {
         anchorsBefore,
         anchorsAfter,
         execution,
+        authorization,
         blobSha256: lastBlobSha256,
         status,
         refusalReason: null,

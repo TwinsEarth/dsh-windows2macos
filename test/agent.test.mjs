@@ -5085,6 +5085,8 @@ describe('grant replay e2e (v1.3.10-beta.6 slice)', () => {
       const first = rabbit.state.results[0];
       assert.equal(first.status, 'ok');
       assert.equal(first.stdout_sha256, sha256Hex('once'));
+      assert.equal(first.authorization?.provenance, 'grant', 'the result records that a grant authorised this run');
+      assert.match(String(first.authorization?.grant_id ?? ''), /^gr-/);
       // Second delivery of the same signed grant: the use ledger must make it a replay, not a second execution.
       const secondRabbit = await startFakeRabbit();
       const agent2 = makeAgent({ rabbit: secondRabbit.url, project, allowed: [], name: 'grant-e2e-replay2' });
