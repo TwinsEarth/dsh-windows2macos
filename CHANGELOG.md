@@ -7,6 +7,28 @@
 
 All notable changes to this project are documented here.
 
+## [1.3.10-beta.25] — 2026-10-22
+
+**M7 final core slice: acceptance evidence is a gate, not a folder.**
+
+The pre-flight grew its 16th check. `acceptance evidence (every committed record validates, and the release line has one)`
+does three things a file list cannot:
+
+1. every JSON record under `docs/acceptance/` is validated with the M7 schema (`src/acceptance/evidence.mjs`) — a record that
+   does not say which machine ran it, when, by whom and under which task id fails the gate;
+2. the current release line must have at least one record: shipping a beta that claims an accepted capability while pointing at
+   no evidence from its own `1.3.x` line is RED;
+3. it reports what it read ("4 acceptance record(s) validated; 4 for the 1.3.10 line"), so a green row is a statement about a
+   specific set of records rather than about an empty directory.
+
+The check is bound to `docs/acceptance` in `GATE_INVENTORY`, so deleting the directory or the check breaks the inventory's
+both-directions rule; the evidence validator's accepted-orphan entry is removed now that the gate imports it.
+
+Not claimed: this gate proves the records are well-formed and current, not that the described runs happened — that is what the
+task id, the machine ids and the executor field are for, and they are now mandatory.
+
+Verified: gate GREEN twice with 16/16 registered checks; the evidence check passes on the four M1 records.
+
 ## [1.3.10-beta.24] — 2026-10-22
 
 **M7 second slice: acceptance evidence has a schema, and the committed evidence is validated against it.**

@@ -93,6 +93,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { basename, dirname, join, resolve, sep } from 'node:path';
+import { validateEvidence } from '../src/acceptance/evidence.mjs';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
@@ -1104,7 +1105,62 @@ export const DECLARED_CHECKS = [
   'agent skills (frontmatter satisfies the loader, so no skill is silently dropped)',
   'agent plugins manifest (plugin.json and mcp.json satisfy Agent Plugins 1.0.0)',
   'mcp server (every declared route exists in the relay, and no tool can mutate)',
+  'acceptance evidence (every committed record validates, and the release line has one)',
 ];
+
+
+/**
+ * Acceptance evidence gate (M7).
+ *
+ * The evidence schema lives in src/acceptance/evidence.mjs; this check is the release-side use of it. It fails when the
+ * directory is missing, when any committed record does not validate, or when the current release line has no record at all --
+ * a beta that claims an accepted capability must point at a task id in the same 1.3.x line, not at a schema that could accept
+ * anything. It does NOT claim the runs happened; it checks that the record says who/where/when, which is what makes the claim
+ * reproducible.
+ */
+function checkAcceptanceEvidence() {
+  const root = join(ROOT, 'docs', 'acceptance');
+  if (!existsSync(root)) {
+    return fail('docs/acceptance is missing: no capability evidence has been recorded for this release line');
+  }
+  let names = [];
+  try {
+    names = readdirSync(root, { recursive: true }).map(String).filter((name) => name.endsWith('.json')).sort();
+  } catch (error) {
+    return fail('docs/acceptance could not be read: ' + String(error?.message ?? error));
+  }
+  if (names.length === 0) return fail('docs/acceptance holds no evidence records');
+  const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
+  const line = String(pkg.version ?? '').split('-')[0];
+  const invalid = [];
+  const versions = new Map();
+  let forLine = 0;
+  for (const name of names) {
+    const path = join(root, name);
+    let record;
+    try {
+      record = JSON.parse(readFileSync(path, 'utf8'));
+    } catch (error) {
+      invalid.push(name + ': not JSON (' + String(error?.message ?? error).slice(0, 120) + ')');
+      continue;
+    }
+    const verdict = validateEvidence(record);
+    if (!verdict.ok) {
+      invalid.push(name + ': ' + verdict.errors.map((item) => item.code + ' ' + item.field).join(', '));
+      continue;
+    }
+    versions.set(record.version, (versions.get(record.version) ?? 0) + 1);
+    if (String(record.version).split('-')[0] === line) forLine += 1;
+  }
+  const summary = [...versions.entries()].map(([version, count]) => version + ' x' + count).join(', ') || 'none';
+  if (invalid.length > 0) {
+    return fail('invalid acceptance evidence: ' + invalid.join('; '), 'records: ' + summary);
+  }
+  if (forLine === 0) {
+    return fail('no acceptance evidence record for the ' + line + ' release line (found: ' + summary + ')', 'the release line must point at a real task id in its own line');
+  }
+  return pass(names.length + ' acceptance record(s) validated; ' + forLine + ' for the ' + line + ' line', 'records: ' + summary);
+}
 
 /**
  * The gate inventory: which repository artifact each check is the measurement of.
@@ -1122,6 +1178,7 @@ export const DECLARED_CHECKS = [
  * file can assert about itself.
  */
 export const GATE_INVENTORY = [
+  { artifact: 'acceptance evidence', path: 'docs/acceptance', checkedBy: 'acceptance evidence (every committed record validates, and the release line has one)' },
   { artifact: 'eslint entry point', path: 'node_modules/eslint/bin/eslint.js', checkedBy: 'lint (0 errors required)' },
   { artifact: 'mojibake scanner', path: 'scripts/scan-mojibake.mjs', checkedBy: 'mojibake scan (whole tree, plus a positive control)' },
   { artifact: 'accepted-orphan list', path: 'scripts/accepted-orphans.mjs', checkedBy: 'reachable or accepted (no orphan module without a written reason)' },
@@ -2386,6 +2443,7 @@ async function main() {
     ],
     ['claims (test/claims.test.mjs, reused not reimplemented)', checkClaims],
     ['CHANGELOG shape (title above the newest entry, newest-first)', checkChangelogShape],
+    ['acceptance evidence (every committed record validates, and the release line has one)', checkAcceptanceEvidence],
   ]);
 
   const checks = DECLARED_CHECKS.map((name) => {
