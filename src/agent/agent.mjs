@@ -2988,8 +2988,10 @@ export function createAgent(options) {
       let allowed = matchAllowedCommand(commandArgv, allowedCommands);
       let grantAuthorized = false;
       let capabilityAuthorized = false;
+      let grantAttempted = false;
       const capabilityStatus = readExecCapability(execCapabilityFile);
       if (allowed.allowed !== true && offer && typeof offer.grant === 'object' && offer.grant !== null) {
+        grantAttempted = true;
         const gatePaths = maintenancePaths();
         const gate = await authorizeWithGrant({
           offer,
@@ -3000,7 +3002,10 @@ export function createAgent(options) {
         if (gate.ok === true) { allowed = { allowed: true, ok: true, grant_id: gate.grantId }; grantAuthorized = true; }
         else allowed = { ok: false, reason_code: gate.code ?? 'GRANT_REJECTED', detail: gate.message };
       }
-      if (allowed.allowed !== true && capabilityStatus.effective === true) {
+      // A capability is a machine-local standing authorization, so it may rescue an allow-list miss -- but never an
+      // explicit grant refusal (replay, expiry, wrong machine). Masking GRANT_REPLAY with a capability would execute a
+      // token the operator already spent, and the envelope would report a reason that names neither decision.
+      if (allowed.allowed !== true && grantAttempted !== true && capabilityStatus.effective === true) {
         allowed = matchAllowedCommand(commandArgv, effectiveExecCapabilityPrefixes(execCapabilityFile));
         if (allowed.allowed === true) { capabilityAuthorized = true; warnings.push('EXEC_CAPABILITY: ' + EXEC_CAPABILITY_WARNING); }
       }

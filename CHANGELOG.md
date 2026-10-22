@@ -7,6 +7,23 @@
 
 All notable changes to this project are documented here.
 
+## [1.4.3] — 2026-10-22
+
+**微信编队桥接：回复可靠性修复（不回复/静默问题）。**
+
+- 每条消息独立 try/catch：任何处理异常不再让进程退出，改为回复
+  `处理失败（阶段，错误码）：原因 + /help 提示`（新增 `renderBridgeError`）。
+- 桥接启动调用 `ilink/bot/msg/notifystart`：修复"token 有效、进程在跑、但 iLink 不推送消息"的静默状态；
+  日志记录 `notifystart : ok`，失败也记录原因。
+- 非文本、空消息、未以 `/run` 开头、权限不足、派发失败/超时等路径均保证有回复与下一步提示。
+- 运行方式支持 launchd 常驻（KeepAlive 自动拉起；macOS plist 由运维部署，不进入安装包）。
+
+- **授权优先级修复**：exec-capability 只在任务未携带 grant 时兜底；grant 被拒（replay / 过期 / 机器不符）
+  原样上报，不再被能力分支覆盖成路径匹配错误，`GRANT_REPLAY` 语义恢复。
+
+真机验收（macmini）：`notifystart ok`、错误回复代码在位、launchd state=running、bridge 进程存活；
+证据 `docs/acceptance/1.4.3/BRIDGE-LIVE.json`。测试：chatops-ilink-fleet-bridge 36/36。
+
 ## [1.4.2] — 2026-10-22
 
 **Node 代码执行权限成为 UI 可激活的子插件能力（命中真机验收）。**

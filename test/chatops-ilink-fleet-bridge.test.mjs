@@ -24,7 +24,7 @@ import {
   textOf,
   sendSucceeded,
   planMessage,
-  renderTaskOutcome,
+  renderTaskOutcome,  renderBridgeError,
   dryRunPolicy,
   helpText,
   AUTH_TYPE,
@@ -354,4 +354,22 @@ describe('helpText: the three sections the operator asked for, one of them hones
       assert.notEqual(plan.act, 'ignore', `help advertises "${text}" and it is ignored`);
     }
   });
+});
+
+describe('every failure gets a reply', () => {
+  it('renders a failed message handling as a reply with phase, code and next step', () => {
+    const error = Object.assign(new Error('relay refused'), { code: 'DISPATCH_REFUSED' });
+    const text = renderBridgeError(error, 'dispatch');
+    assert.match(text, /处理失败/);
+    assert.match(text, /dispatch/);
+    assert.match(text, /DISPATCH_REFUSED/);
+    assert.match(text, /relay refused/);
+    assert.match(text, /\/help/);
+  });
+  it('names an unknown error instead of staying silent', () => {
+    const text = renderBridgeError('boom', 'parse');
+    assert.match(text, /ERR_UNKNOWN/);
+    assert.match(text, /boom/);
+  });
+
 });

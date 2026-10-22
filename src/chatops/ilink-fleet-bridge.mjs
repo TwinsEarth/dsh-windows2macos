@@ -372,6 +372,25 @@ export function renderTaskOutcome({ taskId, body }) {
   return `${renderVerdict({ taskId, verdict, machines: rows }).text}`;
 }
 
+/**
+ * Render a per-message handling failure as something the operator can act on.
+ *
+ * The rule this exists for: **every message gets an answer, including the ones that broke something.**
+ * Before this, an exception anywhere in the per-message path escaped the loop, killed the process, and the
+ * chat window went silent with no indication why. A failure is now a reply with the phase, a stable code and
+ * the next step, and the loop continues.
+ *
+ * @param {unknown} error
+ * @param {string} [phase] where it failed: message | parse | reply | dispatch
+ * @returns {string}
+ */
+export function renderBridgeError(error, phase = 'message') {
+  const code = error?.code ?? error?.name ?? 'ERR_UNKNOWN';
+  const message = error?.message ?? String(error ?? '未知错误');
+  return `处理失败（${phase}，${code}）：${String(message).slice(0, 300)}\n`
+    + '可以发送 /help 查看用法，或稍后重试这条指令。';
+}
+
 /** Render a dispatch that never became a task. */
 export function renderFailure(error) {
   return renderDispatchFailure({

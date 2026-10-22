@@ -28,7 +28,7 @@
 import { readFileSync, writeFileSync, existsSync, appendFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 
-import { buildHeaders, buildReply, sendSucceeded, planMessage, renderTaskOutcome, renderFailure, MESSAGE_TYPE, dryRunPolicy } from '../src/chatops/ilink-fleet-bridge.mjs';
+import { buildHeaders, buildReply, sendSucceeded, planMessage, renderTaskOutcome, renderFailure, renderBridgeError, MESSAGE_TYPE, dryRunPolicy } from '../src/chatops/ilink-fleet-bridge.mjs';
 import { createFleetExecutor } from '../src/chatops/fleet.mjs';
 /**
  * The capability probe, used to say at startup whether vision is usable.
@@ -257,6 +257,16 @@ async function main() {
    * the same sentence whether the skill is missing, the key is absent, or `python3` is not installed.** This line
    * turns three indistinguishable failures into a named one, at startup, where it is still cheap to fix.
    */
+  // Enable message push for this bot session. Measured: without notifystart, a re-logged-in bot keeps a
+  // valid token but the window can stay silent -- a state that reads as "the bot ignores me" and is not
+  // visible from the chat side. It is one call and it is answered with `{ret:0}`.
+  try {
+    const started = await post('ilink/bot/msg/notifystart', { base_info: BASE_INFO() });
+    log(`notifystart : ${started?.ret === 0 || started?.errcode === 0 ? 'ok' : JSON.stringify(started).slice(0, 160)}`);
+  } catch (error) {
+    log(`notifystart : failed -- ${error?.message ?? error}`);
+  }
+
   const vision = await visionStatus();
   log(`vision      : ${vision.ready ? `ready (${vision.provider})` : `NOT ready -- ${vision.reason}`}`);
   log(`listening (cursor ${cursor === '' ? 'empty' : `${cursor.length} chars`}) -- send /run ... in WeChat`);
@@ -281,21 +291,33 @@ async function main() {
     }
 
     for (const message of msgs) {
-      if (message?.message_type !== MESSAGE_TYPE.USER) continue;
-      const plan = planMessage({ message, authorize });
-      if (plan.act === 'ignore') { log(`  ignored (${plan.why})`); continue; }
+      // Every message is handled inside one try/catch, for the rule this bridge exists to keep: every
+      // sentence gets a reply. An exception here used to escape the loop and end the process, which is
+      // exactly the silent bot the operator cannot diagnose from the chat window.
+      try {
+        if (message?.message_type !== MESSAGE_TYPE.USER) { log(`  skipped message_type=${String(message?.message_type)}`); continue; }
+        const plan = planMessage({ message, authorize });
+        if (plan.act === 'ignore') { log(`  ignored (${plan.why})`); continue; }
 
-      handled += 1;
-      if (plan.act === 'reply') {
-        // A shape report, when the message carried no text. **Key paths and value types only** -- enough to learn
-        // what iLink sends for an image, and never the user's content.
-        if (typeof plan.shape === 'string') log(`  shape: ${plan.shape}`);
-        log(`  reply: ${plan.text.split('\n')[0].slice(0, 80)}`);
-        await reply(plan.to, plan.contextToken, plan.text);
-      } else if (plan.act === 'dispatch') {
-        log(`  DISPATCH ${plan.argv.join(' ')}`);
-        await reply(plan.to, plan.contextToken, plan.ack);
-        await dispatchAndReport(plan);
+        handled += 1;
+        if (plan.act === 'reply') {
+          // A shape report, when the message carried no text. **Key paths and value types only** -- enough to learn
+          // what iLink sends for an image, and never the user's content.
+          if (typeof plan.shape === 'string') log(`  shape: ${plan.shape}`);
+          log(`  reply: ${plan.text.split('\n')[0].slice(0, 80)}`);
+          await reply(plan.to, plan.contextToken, plan.text);
+        } else if (plan.act === 'dispatch') {
+          log(`  DISPATCH ${plan.argv.join(' ')}`);
+          await reply(plan.to, plan.contextToken, plan.ack);
+          await dispatchAndReport(plan);
+        }
+      } catch (error) {
+        log(`  message failed: ${error?.code ?? error?.message}`);
+        const to = message?.from_user_id;
+        const contextToken = message?.context_token;
+        if (typeof to === 'string' && to !== '' && typeof contextToken === 'string' && contextToken !== '') {
+          try { await reply(to, contextToken, renderBridgeError(error, 'message')); } catch (replyError) { log(`  error reply threw: ${replyError?.message}`); }
+        }
       }
       if (once) { log(`--once: handled ${handled} message(s), exiting`); process.exit(0); }
     }

@@ -1,0 +1,22 @@
+{
+  "version": "1.4.3",
+  "case": "BRIDGE-LIVE",
+  "kind": "positive",
+  "machines": [
+    "71f0dd07-e957-4889-bf82-319a0d6b434a"
+  ],
+  "executed_at": "2026-10-22T07:08:13.838Z",
+  "executor": "lead",
+  "requirement": "the deployed WeChat bridge enables iLink message push (notifystart ok), answers failures through the renderBridgeError path, and runs under launchd KeepAlive",
+  "task_id": "01M5BRIDGEACCMVJ78GU0",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "notifystart": true,
+      "error_reply_code": true,
+      "launchd_state": "state = running",
+      "bridge_processes": 3
+    }
+  },
+  "note": "hotfixed bridge files were verified live on macmini before packaging; the same files are what v1.4.3 ships"
+}

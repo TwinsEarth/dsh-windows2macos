@@ -1740,6 +1740,9 @@ function makeAgent({
     ...(redactOutput === undefined ? {} : { redactOutput }),
     log,
     tmpDir: root,
+    // Isolation: these tests must see the standing policy (no capability), not whatever a developer
+    // activated in the plugin UI on this machine. A missing file reads as `denied`.
+    execCapabilityFile: join(root, 'e2e-exec-capability.json'),
   });
 }
 
