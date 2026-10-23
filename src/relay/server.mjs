@@ -1350,13 +1350,30 @@ export class RelayServer {
     }
 
     if (method === 'GET' && path === '/v1/devices') {
-      return sendJson(res, 200, {
-        protocol_version: PROTOCOL_VERSION,
-        rabbit_time: this.state.nowIso(),
-        devices: this.state.listDevices(),
-      });
-    }
-    if (method === 'GET' && path === '/v1/tasks') {
+        /**
+         * v1.5.5: device enumeration is fleet-scoped.
+         *
+         * This endpoint used to return every device on the relay; state.mjs even recorded the narrowing
+         * as a pending step. The observation that forced it: another account's machine (its own fleet id,
+         * its own fleet key) appeared in this fleet's machine list -- correct fleet binding, wrong list.
+         *
+         * Migration rule, the same one task dispatch already obeys: a relay with no fleet configured
+         * keeps the historical behaviour for fleetless devices, a scoped relay serves its own fleet, and
+         * a fleet-bound device always sees exactly its own fleet and nothing else.
+         */
+        const callerFleet = typeof device?.fleet_id === 'string' && device.fleet_id !== '' ? device.fleet_id : null;
+        const relayFleet = this.state.fleetId ?? null;
+        const allDevices = this.state.listDevices();
+        const devices = callerFleet === null
+          ? (relayFleet === null ? allDevices : allDevices.filter((entry) => entry.fleet_id === relayFleet))
+          : allDevices.filter((entry) => entry.fleet_id === callerFleet);
+        return sendJson(res, 200, {
+          protocol_version: PROTOCOL_VERSION,
+          rabbit_time: this.state.nowIso(),
+          devices,
+          });
+      }
+      if (method === 'GET' && path === '/v1/tasks') {
       const rawLimit = url.searchParams.get('limit');
       let limit = 50;
       if (rawLimit !== null) {
@@ -1368,7 +1385,7 @@ export class RelayServer {
       return sendJson(res, 200, {
         protocol_version: PROTOCOL_VERSION,
         rabbit_time: this.state.nowIso(),
-        tasks: this.state.listTasks({ limit }),
+        tasks: this.state.listTasks({ limit, fleetId: device.fleet_id ?? null }),
       });
     }
 
@@ -1532,7 +1549,7 @@ export class RelayServer {
       const body = takeJson();
       const posted = this.fleetMessages.post({
         session_id: body.session_id,
-        fleet_id: typeof body.fleet_id === 'string' ? body.fleet_id : null,
+        fleet_id: device.fleet_id ?? null,
         machine_id: device.machine_id,
         to: body.to,
         thread_id: body.thread_id,
@@ -1599,7 +1616,10 @@ export class RelayServer {
         limit: limitRaw === null ? 50 : Number(limitRaw),
         // Addressing/correlation filters. `for_me=1` is answered from the authenticated device identity, never from a
         // caller-supplied machine id: a reader must not be able to ask for another machine's private messages.
-        for_machine_id: url.searchParams.get('for_me') === '1' ? device.machine_id : null,
+        // v1.5.5: a reader sees the chat of the fleet it belongs to; a device without a fleet keeps the
+          // historical unqualified view.
+          fleet_id: device.fleet_id ?? null,
+          for_machine_id: url.searchParams.get('for_me') === '1' ? device.machine_id : null,
         thread_id: url.searchParams.get('thread_id'),
         to: url.searchParams.get('to'),
       });
@@ -1607,6 +1627,8 @@ export class RelayServer {
         protocol_version: PROTOCOL_VERSION,
         rabbit_time: this.state.nowIso(),
         ...listed,
+          // v1.5.5: only the caller's fleet messages leave the process.
+          messages: (listed.messages ?? []).filter((m) => (m.fleet_id ?? null) === (device.fleet_id ?? null)),
         usage: this.fleetMessages.usage(),   // shown with every read so a client can warn before the quota refuses a post
       });
     }
@@ -1618,14 +1640,16 @@ export class RelayServer {
     if (path.startsWith('/v1/fleet/memory/')) {
       const doc = decodeURIComponent(path.slice('/v1/fleet/memory/'.length));
       if (doc === '') throw new ProtocolError('BAD_REQUEST', 'memory doc is required', { method, path });
+        // v1.5.5: a fleet's memory must not be addressable by another fleet on the same relay.
+        const docKey = typeof device.fleet_id === 'string' && device.fleet_id !== '' ? device.fleet_id + '::' + doc : doc;
       this.fleetMemory ??= createFleetMemory({ now: () => this.state.nowMs() });
       if (method === 'GET') {
-        return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ...this.fleetMemory.get(doc) });
+        return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ...this.fleetMemory.get(docKey) });
       }
       if (method === 'PUT') {
         const body = takeJson();
         const appended = this.fleetMemory.append({
-          doc,
+          doc: docKey,
           if_revision: Number.isInteger(body.if_revision) ? body.if_revision : null,
           author_machine_id: device.machine_id,
           records: Array.isArray(body.records) ? body.records : (typeof body.text === 'string' ? [body.text] : []),

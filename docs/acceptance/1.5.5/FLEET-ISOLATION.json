@@ -1,0 +1,23 @@
+{
+  "version": "1.5.5",
+  "case": "FLEET-ISOLATION",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-23T14:37:27.768Z",
+  "executor": "lead",
+  "requirement": "two fleets paired on one relay reach neither the other fleet device list, task list, fleet chat nor fleet memory",
+  "task_id": "01M5ANYMVL2Q8PD",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "verify_script": "11/11 checks passed",
+      "device_enumeration": "scoped",
+      "task_list": "scoped",
+      "fleet_chat": "scoped",
+      "fleet_memory": "scoped"
+    }
+  },
+  "note": "scripts/verify-fleet-isolation.mjs ran as a real fleet task against a real relay process"
+}

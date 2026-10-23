@@ -7,6 +7,23 @@
 
 All notable changes to this project are documented here.
 
+## [1.5.5] — 2026-10-23
+
+**跨编队隔离：同 relay 上的另一账号机器不再出现在本编队的枚举/任务/聊天/记忆里。**
+
+现场：另一账号的机器（自己的 fleet_id、自己的 fleet_key）出现在我们的机器列表里，被读成"非本账号
+机器进入编队"。排查结论：该机器的编队绑定本身是正确的，问题在于 relay 的**读取面没有按 fleet 过滤**
+（派发侧自 v0.7.7 起已按 fleet 隔离，operator token 为 relay 级权限属于设计）。
+
+- `GET /v1/devices`：按请求设备的 fleet 过滤（无 fleet 的旧设备在未配置 fleet 的 relay 上保持历史行为）。
+- `GET /v1/tasks`：任务记录携带 `fleet_id`，列表按调用者 fleet 过滤（operator 派发是 relay 级，不会进入
+  某个编队的列表）。
+- `POST /v1/fleet/messages`：`fleet_id` 取自已认证设备，忽略 body（防止把消息标成别的编队）。
+- `GET /v1/fleet/messages`：读取时按调用者 fleet 过滤。
+- fleet memory 文档按 fleet 前缀隔离（无 fleet 设备沿用历史键，单编队 relay 不受影响）。
+- 新增 `scripts/verify-fleet-isolation.mjs`：真实 relay + 两个 fleet 的黑盒验证（设备/任务/聊天/记忆
+  共 11 项检查），可作为部署前门禁脚本运行。
+- 验证：脚本 11/11 通过（fleet task `01M5ANYMVL2Q8PD`）；relay.test 200/200 通过。
 ## [1.5.4] — 2026-10-23
 
 **验签 bootstrap 的结果覆盖过期的显式 relay（现场故障：设备仍指向 127.0.0.1）。**

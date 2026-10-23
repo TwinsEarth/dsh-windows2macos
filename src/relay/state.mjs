@@ -1942,6 +1942,13 @@ export class RabbitState {
       include_offline: input.include_offline === true,
       halt,
       created_by: input.created_by ?? null,
+        // v1.5.5: the fleet a task belongs to, so list endpoints can scope by it.
+        // v1.5.5: the fleet this task belongs to, computed from the same requester rule fleet scoping
+        // uses. scopedRequester is declared further down (target selection), so it cannot be referenced
+        // from the task literal; this expression reads the same sources and stays a pure lookup.
+        fleet_id: ((typeof input.created_by === 'string' ? this.devices.get(input.created_by) : null) ||
+          (typeof input.requester_machine_id === 'string' ? this.devices.get(input.requester_machine_id) : null) ||
+          (this.fleetId !== null ? { fleet_id: this.fleetId } : null))?.fleet_id ?? null,
       created_at_ms: now,
       command_hash: commandHash,
       attempt: 1,
@@ -2492,9 +2499,11 @@ export class RabbitState {
     return { count: taskIds.length, task_ids: taskIds };
   }
 
-  listTasks({ limit = 50 } = {}) {
+  listTasks({ limit = 50, fleetId = null } = {}) {
     const n = Number.isInteger(limit) && limit > 0 ? limit : 50;
     return [...this.tasks.values()]
+      // v1.5.5: a fleet-bound caller lists only its own fleet's tasks; null fleet keeps the old view.
+      .filter((task) => fleetId === null || task.fleet_id === fleetId)
       .sort((a, b) => b.created_at_ms - a.created_at_ms)
       .slice(0, n)
       .map((t) => this.taskSummary(t));
