@@ -435,6 +435,85 @@ export async function readFleet(deps) {
 }
 
 /**
+ * v1.5.1: the relay pool the client folds, derived from configuration.
+ *
+ * `relayUrls` (array) is the multi-relay form; the single `rabbitUrl` stays valid and is returned
+ * as a one-element pool, so a host that never configured a pool behaves exactly as it did.
+ *
+ * @param {{relayUrls?: unknown, rabbitUrl?: string|null}|null|undefined} cfg
+ * @returns {string[]} Normalized base URLs, order preserved, duplicates removed.
+ */
+export function relayUrlsFromConfig(cfg) {
+  const raw = Array.isArray(cfg?.relayUrls) ? cfg.relayUrls : [];
+  const urls = raw
+    .filter((entry) => typeof entry === 'string' && entry.trim() !== '')
+    .map((entry) => entry.trim().replace(/\/+$/, ''));
+  if (urls.length > 0) return [...new Set(urls)];
+  if (typeof cfg?.rabbitUrl === 'string' && cfg.rabbitUrl.trim() !== '') {
+    return [cfg.rabbitUrl.trim().replace(/\/+$/, '')];
+  }
+  return [];
+}
+
+/**
+ * Fold a relay pool for display: at most `limit` nodes are shown, the rest are counted.
+ *
+ * The client is expected to render `shown` and `hidden` exactly as given: a view that silently
+ * shows every node when there are dozens is the failure this helper exists to prevent.
+ *
+ * @param {object[]} items Probe results, best first.
+ * @param {number} [limit]
+ * @returns {{shown: object[], hidden: object[], hidden_count: number, total: number, online: number}}
+ */
+export function foldRelayItems(items, limit = 3) {
+  const list = Array.isArray(items) ? items : [];
+  const shown = list.slice(0, Math.max(0, limit));
+  const hidden = list.slice(Math.max(0, limit));
+  return {
+    shown,
+    hidden,
+    hidden_count: hidden.length,
+    total: list.length,
+    online: list.filter((item) => item?.ok === true).length,
+  };
+}
+
+/**
+ * Probe each relay's `/healthz` and return the pool sorted by round-trip time (fastest first).
+ * A relay that fails is kept and sorted last with `ok:false` — disappearing from the list would
+ * hide exactly the outage the operator needs to see.
+ *
+ * @param {string[]} urls
+ * @param {{timeoutMs?: number, fetchImpl?: Function}} [options]
+ * @returns {Promise<object[]>}
+ */
+export async function probeRelays(urls, options = {}) {
+  const timeoutMs = Number.isInteger(options.timeoutMs) ? options.timeoutMs : 1200;
+  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+  const list = Array.isArray(urls) ? urls : [];
+  const results = await Promise.all(list.map(async (url) => {
+    const started = Date.now();
+    try {
+      const response = await fetchImpl(`${url}/healthz`, {
+        signal: typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
+          ? AbortSignal.timeout(timeoutMs)
+          : undefined,
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok || body?.ok !== true) {
+        return { url, ok: false, rtt_ms: null, error: `HTTP ${response.status}` };
+      }
+      return { url, ok: true, rtt_ms: Date.now() - started, relay_id: body.relay_id ?? null };
+    } catch (error) {
+      return { url, ok: false, rtt_ms: null, error: error instanceof Error ? error.message : String(error) };
+    }
+  }));
+  const reachable = results.filter((item) => item.ok === true).sort((a, b) => (a.rtt_ms ?? 0) - (b.rtt_ms ?? 0));
+  const unreachable = results.filter((item) => item.ok !== true);
+  return [...reachable, ...unreachable];
+}
+
+/**
  * Build the snapshot the browser renders.
  *
  * @param {object} deps
@@ -447,7 +526,7 @@ export async function readFleet(deps) {
  * @returns {object}
  */
 export function buildUiState(deps) {
-  const { store, sessionId, fleet, localMachineName = null, detailUnavailable = false } = deps;
+  const { store, sessionId, fleet, localMachineName = null, detailUnavailable = false, relays = null } = deps;
   const selection = store.get(sessionId);
   const machines = Array.isArray(fleet?.machines) ? fleet.machines : [];
   const selected = selection === null ? null : machines.find((machine) => machine.machine_id === selection.machine_id) ?? null;
@@ -479,6 +558,20 @@ export function buildUiState(deps) {
       // but cannot reach this half, and the honest answer is to say so rather than to look empty.
       detail_unavailable: detailUnavailable === true,
     },
+    // v1.5.1: the relay pool, folded. `null` means the host did not probe (single-relay host or
+    // probe disabled); the control then renders no relay section instead of inventing one.
+    relays: relays === null
+      ? null
+      : {
+          total: relays.total,
+          online: relays.online,
+          hidden_count: relays.hidden_count,
+          shown: relays.shown,
+          hidden: relays.hidden,
+          // Fastest reachable relay is the one a dispatch would prefer; naming it here keeps the
+          // fold honest when it hides nodes that the router would still consider.
+          primary_url: relays.shown.find((item) => item.ok === true)?.url ?? null,
+        },
   };
 }
 
@@ -680,12 +773,38 @@ function mountTargetRoutes(connection, deps, status, logger) {
     return value;
   };
 
+  /** v1.5.1: relay probing is cached like the fleet: opening the menu must not turn into a burst. */
+  let relayCache = { at: 0, value: null };
+  const relayPoolFor = async () => {
+    const now = Date.now();
+    if (relayCache.value !== null && now - relayCache.at < FLEET_CACHE_MS) return relayCache.value;
+    const urls = relayUrlsFromConfig(deps.cfg());
+    if (urls.length === 0) {
+      relayCache = { at: now, value: null };
+      return null;
+    }
+    const probed = await probeRelays(urls);
+    // The fold's primary is the fastest reachable node; every other reachable node is standby, and
+    // an unreachable one keeps its place at the end as `offline` rather than disappearing.
+    let reachableSeen = 0;
+    const items = probed.map((item) => {
+      if (item.ok !== true) return { ...item, role: 'offline' };
+      reachableSeen += 1;
+      return { ...item, role: reachableSeen === 1 ? 'primary' : 'standby' };
+    });
+    const folded = foldRelayItems(items, 3);
+    relayCache = { at: now, value: folded };
+    return folded;
+  };
+
   const snapshot = async (sessionId, signal) => {
     const cfg = deps.cfg();
     const identity = await deps.localIdentity();
     const fleet = await fleetFor(signal);
+    const relays = await relayPoolFor();
     return buildUiState({
       store: deps.store,
+      relays,
       sessionId,
       fleet,
       localMachineName: identity.machine_name ?? cfg.machineName ?? null,

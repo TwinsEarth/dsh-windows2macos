@@ -47,10 +47,13 @@ import {
   defaultSelectionStore,
   describeTargetMachine,
   dispatchSelectionFields,
+  foldRelayItems,
   isSelectableDevice,
   parseSelectionWrite,
+  probeRelays,
   readFleet,
   registerTargetRoutes,
+  relayUrlsFromConfig,
   sessionKeyFor,
 } from '../src/plugin/fleet-target.mjs';
 
@@ -978,5 +981,43 @@ describe('72h archive: hidden from the list, never deleted', () => {
     const fleet = await fleetWith({ protocol_version: 1, devices: [{ machine_id: 'unknown-1', state: 'expired' }] });
     assert.equal(fleet.machines.length, 1, 'an unknown age must not be read as "gone for three days"');
     assert.equal(fleet.archived, 0);
+  });
+});
+
+describe('relay pool folding (v1.5.1)', () => {
+  it('derives the pool from relayUrls first and falls back to the single rabbitUrl', () => {
+    assert.deepEqual(relayUrlsFromConfig({ relayUrls: ['http://a:1/', 'http://b:2', 'http://a:1'] }), ['http://a:1', 'http://b:2']);
+    assert.deepEqual(relayUrlsFromConfig({ rabbitUrl: 'http://only:8787/' }), ['http://only:8787']);
+    assert.deepEqual(relayUrlsFromConfig({}), []);
+    assert.deepEqual(relayUrlsFromConfig(null), []);
+  });
+
+  it('folds more than three relays into shown/hidden and counts them honestly', () => {
+    const items = [1, 2, 3, 4, 5].map((n) => ({ url: `http://r${n}:8787`, ok: n !== 5, rtt_ms: n * 10, role: n === 1 ? 'primary' : 'standby' }));
+    const folded = foldRelayItems(items, 3);
+    assert.equal(folded.shown.length, 3);
+    assert.equal(folded.hidden.length, 2);
+    assert.equal(folded.hidden_count, 2);
+    assert.equal(folded.total, 5);
+    assert.equal(folded.online, 4);
+  });
+
+  it('probes relays and puts the fastest reachable first, keeping failures visible', async () => {
+    const fetchImpl = async (url) => {
+      if (url.includes('a:1')) { await new Promise((r) => setTimeout(r, 15)); return Response.json({ ok: true, relay_id: 'A' }); }
+      if (url.includes('b:2')) return Response.json({ ok: true, relay_id: 'B' });
+      return new Response('bad', { status: 500 });
+    };
+    const probed = await probeRelays(['http://a:1', 'http://b:2', 'http://c:3'], { fetchImpl, timeoutMs: 500 });
+    assert.equal(probed[0].url, 'http://b:2', 'the faster relay leads');
+    assert.equal(probed[0].role, undefined, 'roles are assigned by the caller, not the probe');
+    assert.equal(probed.filter((item) => item.ok !== true).length, 1);
+    assert.equal(probed[probed.length - 1].url, 'http://c:3', 'a failing relay is kept, last');
+  });
+
+  it('keeps the probe exception out of the snapshot path: a throwing fetch becomes ok:false', async () => {
+    const probed = await probeRelays(['http://x:1'], { fetchImpl: async () => { throw new Error('ECONNREFUSED'); } });
+    assert.equal(probed[0].ok, false);
+    assert.match(String(probed[0].error), /ECONNREFUSED/);
   });
 });

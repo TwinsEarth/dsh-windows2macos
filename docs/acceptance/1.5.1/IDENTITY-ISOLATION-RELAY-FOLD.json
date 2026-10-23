@@ -1,0 +1,22 @@
+{
+  "version": "1.5.1",
+  "case": "IDENTITY-ISOLATION-RELAY-FOLD",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-23T09:40:01.304Z",
+  "executor": "lead",
+  "requirement": "the standby link isolates its identity home from the primary link (DSH_HOME/USERPROFILE/HOME) and the composer control folds a relay pool of more than three nodes",
+  "task_id": "01M5ANYMVKS3OQZ",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "secondary_link_suite": "7/7 pass",
+      "fleet_target_suite": "49/49 pass",
+      "identity_home_default": "isolated",
+      "relay_fold": "shown+hidden counted"
+    }
+  },
+  "note": "both suites were executed as one real fleet task on the Tencent relay before packaging"
+}

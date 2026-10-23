@@ -7,6 +7,21 @@
 
 All notable changes to this project are documented here.
 
+## [1.5.1] — 2026-10-23
+
+**备用链路的身份隔离 + 控制面板的 relay 折叠。**
+
+- `bin/w2m-secondary-link.mjs`：默认给子进程独立身份目录（`<stateDir>/dsh-home`），并同时设置
+  `DSH_HOME` / `USERPROFILE` / `HOME`，可用 `--identity-home` 指定。修复的是 v1.5.0 现场实测的坑：
+  备用链路首次启动覆盖了主链路 `~/.dsh/xclient/device.json`，机器在下一次重启前看不出问题，
+  重启后却会以**备用身份**连到**错误的 relay**。这种"重启后才爆"的坑按默认隔离处理。
+- 控制面板 relay 折叠：`GET /api/w2m/target` 快照新增 `relays`（`relayUrls` 数组优先，兼容单
+  `rabbitUrl`），探测 `/healthz` 后按 RTT 排序、标注 primary/standby/offline；超过 3 个节点时只显示
+  3 个并给出 "+N 折叠" 提示，展开后显示全部（含离线节点，不隐藏故障）。
+- 探针失败保留在列表末尾（`ok:false`），网络异常不会让节点从视图中消失，也不会抛进快照路径。
+- 测试：secondary-link 7/7、fleet-target 49/49（新增 relay pool 四个用例）；门禁 GREEN ×2；
+  证据 `docs/acceptance/1.5.1/IDENTITY-ISOLATION-RELAY-FOLD.json`（真实 fleet task `01M5ANYMVKS3OQZ`）。
+
 ## [1.5.0] — 2026-10-23
 
 **多 relay 双通道（active-passive）+ relay 健康看门狗。**

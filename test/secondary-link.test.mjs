@@ -48,6 +48,16 @@ describe('w2m-secondary-link (v1.5.0)', () => {
     assert.match(parsed.logFile, /link\.log$/);
   });
 
+  it('isolates the standby identity by default (v1.5.1) and honours an explicit --identity-home', () => {
+    const derived = parseSecondaryArgs(['--relay', 'http://relay.example:8787', '--fleet-key', 'K', '--state', '/tmp/s']);
+    assert.equal(derived.identityHome, path.join('/tmp/s', 'dsh-home'),
+      'the child must never share the primary link\'s DSH_HOME');
+    const explicit = parseSecondaryArgs([
+      '--relay', 'http://relay.example:8787', '--fleet-key', 'K', '--identity-home', '/var/lib/w2m/standby-home',
+    ]);
+    assert.equal(explicit.identityHome, '/var/lib/w2m/standby-home');
+  });
+
   it('refuses an unknown flag and a missing relay instead of starting a misdirected link', () => {
     assert.throws(() => parseSecondaryArgs(['--relay', 'http://x:1', '--fleet-key', 'K', '--nope']), /unknown flag/);
     assert.throws(() => parseSecondaryArgs(['--fleet-key', 'K']), /--relay/);
@@ -79,19 +89,22 @@ describe('w2m-secondary-link (v1.5.0)', () => {
   it('restarts an exited child with backoff until the supervisor is stopped', async () => {
     const logLines = [];
     const spawns = [];
-    const spawnFn = () => {
+    const seenEnv = [];
+    const spawnFn = (_exec, _args, opts) => {
       const child = new EventEmitter();
       child.pid = 1000 + spawns.length;
       child.kill = () => {};
       spawns.push(child);
+      seenEnv.push(opts?.env ?? {});
       // Exit on the next macrotask, after the supervisor has attached its listeners.
       setImmediate(() => child.emit('exit', 1, null));
       return child;
     };
     const stopSignal = { stopped: false };
     const states = [];
+    const options = parseSecondaryArgs(['--relay', 'http://relay.example:8787', '--fleet-key', 'KEY', '--state', '/tmp/state', '--log', '/tmp/state/log']);
     await runSupervisor(
-      parseSecondaryArgs(['--relay', 'http://relay.example:8787', '--fleet-key', 'KEY', '--state', '/tmp/state', '--log', '/tmp/state/log']),
+      options,
       {
         log: (line) => logLines.push(line),
         spawnFn,
@@ -100,6 +113,13 @@ describe('w2m-secondary-link (v1.5.0)', () => {
       },
     );
     assert.ok(spawns.length >= 3, `expected at least three spawn attempts, saw ${spawns.length}`);
+    // v1.5.1: every child runs with an isolated identity home, never the primary's.
+    assert.ok(seenEnv.length >= 3);
+    for (const env of seenEnv) {
+      assert.equal(env.DSH_HOME, options.identityHome);
+      assert.equal(env.USERPROFILE, options.identityHome);
+      assert.equal(env.HOME, options.identityHome);
+    }
     const exitLines = logLines.filter((l) => /child exited/.test(l));
     assert.ok(exitLines.length >= 2, 'every child exit is logged');
     assert.ok(logLines.some((l) => /restart_in=/.test(l)), 'the restart delay is visible in the log');

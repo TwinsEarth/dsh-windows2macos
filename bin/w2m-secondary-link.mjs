@@ -47,6 +47,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const DEFAULTS = Object.freeze({
   project: process.cwd(),
   stateDir: null,
+  identityHome: null,
   logFile: null,
   allowedCommands: '[]',
   restartDelayMs: 3000,
@@ -68,6 +69,7 @@ export function parseSecondaryArgs(argv) {
     fleetKey: null,
     name: null,
     stateDir: null,
+    identityHome: null,
     logFile: null,
     project: DEFAULTS.project,
     operatorToken: null,
@@ -86,6 +88,7 @@ export function parseSecondaryArgs(argv) {
       case '--fleet-key': out.fleetKey = value(); break;
       case '--name': out.name = value(); break;
       case '--state': out.stateDir = value(); break;
+      case '--identity-home': out.identityHome = value(); break;
       case '--log': out.logFile = value(); break;
       case '--project': out.project = value(); break;
       case '--operator-token': out.operatorToken = value(); break;
@@ -104,6 +107,18 @@ export function parseSecondaryArgs(argv) {
   }
   const suffix = out.name ?? 'standby';
   out.stateDir = out.stateDir ?? join(process.cwd(), '.w2m-secondary', suffix);
+  /**
+   * v1.5.1: **the standby gets its own identity home.**
+   *
+   * Measured in the field: the first v1.5.0 standby overwrote `~/.dsh/xclient/device.json` -- the
+   * primary link's identity -- because `w2m-localside` derives that path from `DSH_HOME`. The
+   * machine kept working (the running agent holds its token in memory) until its next restart, at
+   * which point it would have come up as the *standby* identity on the wrong relay. A link that is
+   * only correct until the next restart is a trap, so isolation is the default rather than an
+   * option: the child runs with `DSH_HOME` (and the platforms' home variables) pointed at this
+   * directory, and `--identity-home` exists for operators who need a specific path.
+   */
+  out.identityHome = out.identityHome ?? join(out.stateDir, 'dsh-home');
   out.logFile = out.logFile ?? join(out.stateDir, 'link.log');
   return out;
 }
@@ -158,10 +173,25 @@ export async function runSupervisor(options, deps) {
   const stopSignal = deps.stopSignal ?? { stopped: false };
   const args = buildLocalsideArgs(options);
   let delay = DEFAULTS.restartDelayMs;
-  log(`supervising secondary link relay=${options.relay} state=${options.stateDir}`);
+  // v1.5.1: the child must not see the primary link's identity. Both spellings are set because
+  // Windows resolves the home directory from USERPROFILE while POSIX uses HOME, and `DSH_HOME` is
+  // what `src/agent/identity.mjs` actually reads for `<DSH_HOME>/xclient/device.json`.
+  const childEnv = {
+    ...process.env,
+    DSH_HOME: options.identityHome,
+    USERPROFILE: options.identityHome,
+    HOME: options.identityHome,
+  };
+  try {
+    mkdirSync(options.identityHome, { recursive: true, mode: 0o700 });
+  } catch (error) {
+    log(`cannot create identity home ${options.identityHome}: ${error?.message ?? error}`);
+    throw error;
+  }
+  log(`supervising secondary link relay=${options.relay} state=${options.stateDir} identityHome=${options.identityHome}`);
   while (!stopSignal.stopped) {
     const startedAt = Date.now();
-    const child = spawnFn(process.execPath, args, { stdio: 'ignore', windowsHide: true });
+    const child = spawnFn(process.execPath, args, { stdio: 'ignore', windowsHide: true, env: childEnv });
     log(`child started pid=${child.pid ?? '?'}`);
     const exit = await new Promise((resolve) => {
       child.once('exit', (code, signal) => resolve({ code, signal }));
