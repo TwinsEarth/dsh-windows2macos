@@ -7,6 +7,19 @@
 
 All notable changes to this project are documented here.
 
+## [1.5.4] — 2026-10-23
+
+**验签 bootstrap 的结果覆盖过期的显式 relay（现场故障：设备仍指向 127.0.0.1）。**
+
+现场证据：DSH 升级到 v1.5.3 后仍报 `W2M_UNREACHABLE: could not reach the Rabbit at
+http://127.0.0.1:8787`——它的 profile 仍显式写着本机地址，v1.5.3 只在“无显式 relay”时才采用
+bootstrap 池，于是拿到池却继续拨 loopback。
+
+- bootstrap 验签成功后**总是采用** `relays[0]` 作为 `rabbitUrl`，并 warn 记录被替换的旧地址；
+  想固定 relay 的运维应显式设置 `relayUrls`（此时 bootstrap 分支不执行）。
+- 只影响“验签通过”的答案；失败仍保持原配置并写 `w2m_status.bootstrap.last_error`。
+- 测试：bootstrap 6/6、bootstrap-cli 6/6；证据 `docs/acceptance/1.5.4/BOOTSTRAP-WINS.json`
+  （fleet task `01M5ANYMVL0FV9C`）。
 ## [1.5.3] — 2026-10-23
 
 **零接触自动入队：只能升级插件的机器也能自己找到编队。**

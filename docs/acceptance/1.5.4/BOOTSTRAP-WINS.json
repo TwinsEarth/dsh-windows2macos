@@ -1,0 +1,20 @@
+{
+  "version": "1.5.4",
+  "case": "BOOTSTRAP-WINS",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-23T13:33:16.362Z",
+  "executor": "lead",
+  "requirement": "a verified bootstrap answer replaces a stale explicit rabbitUrl, so an upgrade-only machine that named a dead local relay still reaches the operator relay pool",
+  "task_id": "01M5ANYMVL0FV9C",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "bootstrap_suite": "6/6 pass",
+      "override_branch": "adopted relays[0] with a warning naming the replaced URL"
+    }
+  },
+  "note": "suites ran as a real fleet task; the override is the v1.5.4 delta"
+}

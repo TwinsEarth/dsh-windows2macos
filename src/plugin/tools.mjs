@@ -7400,7 +7400,15 @@ async function startLocalStack(ctx, cfg) {
       });
       if (outcome.ok === true) {
         cfg.relayUrls = outcome.relays;
-        if (cfg.rabbitSource === 'shared-default' || !cfg.rabbitUrl) { cfg.rabbitUrl = outcome.relays[0]; cfg.rabbitSource = 'bootstrap'; }
+          const previousRelay = cfg.rabbitUrl; // v1.5.4: capture what a stale profile pinned
+        // v1.5.4: a verified bootstrap answer WINS over a stale explicit rabbitUrl. A field machine
+          // still named 127.0.0.1:8787 (a local relay that is not running), so v1.5.3 adopted the pool but
+          // kept dialing loopback and reported W2M_UNREACHABLE. To pin a relay instead, set relayUrls.
+          cfg.rabbitUrl = outcome.relays[0];
+          cfg.rabbitSource = 'bootstrap';
+          if (typeof previousRelay === 'string' && previousRelay !== outcome.relays[0]) {
+            ctx.logger?.warn?.('w2m: bootstrap replaced the configured relay ' + previousRelay + ' with ' + outcome.relays[0]);
+          }
         cfg.bootstrap = { configured: true, url: cfg.bootstrapUrl, source: outcome.source, relays: outcome.relays, expires_at: outcome.expires_at, last_error: null };
         ctx.logger?.info?.('w2m: bootstrap assigned relays (' + outcome.relays.join(', ') + ')');
       } else {
