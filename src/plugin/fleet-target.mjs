@@ -571,6 +571,8 @@ export function buildUiState(deps) {
           // Fastest reachable relay is the one a dispatch would prefer; naming it here keeps the
           // fold honest when it hides nodes that the router would still consider.
           primary_url: relays.shown.find((item) => item.ok === true)?.url ?? null,
+          // v1.5.2: a fallback relay list is never presented as settled; the panel renders it red.
+          temporary: relays.temporary === true,
         },
   };
 }
@@ -793,8 +795,10 @@ function mountTargetRoutes(connection, deps, status, logger) {
       return { ...item, role: reachableSeen === 1 ? 'primary' : 'standby' };
     });
     const folded = foldRelayItems(items, 3);
-    relayCache = { at: now, value: folded };
-    return folded;
+    // v1.5.2: a fallback list is marked so the panel can render it in red, not as a settled config.
+    const withMark = { ...folded, temporary: deps.cfg()?.relayTemporary === true };
+    relayCache = { at: now, value: withMark };
+    return withMark;
   };
 
   const snapshot = async (sessionId, signal) => {

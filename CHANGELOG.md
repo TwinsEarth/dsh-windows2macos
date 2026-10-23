@@ -7,6 +7,25 @@
 
 All notable changes to this project are documented here.
 
+## [1.5.2] — 2026-10-23
+
+**新机器自动获得 relay 归属（验签 bootstrap）+ 一次性配置工具。**
+
+- 新增 `src/plugin/bootstrap.mjs`：机器用 fleetKey 派生 HMAC 证明请求 relay 列表；响应必须由
+  operator 公钥（pin）对 canonical payload（fleet_id + 排序后的 relays + issued_at + expires_at）
+  验签；过期/错 fleet/被篡改/坏 JSON 全部命名拒绝。缓存每次读取都重验签名与有效期，手改缓存无效。
+  **任何失败都不改现有 relay 配置**，原因写入 `w2m_status.bootstrap.last_error`。
+- `startLocalStack` 接线：无 `relayUrls` 且配置 `bootstrapUrl`+`fleetKey`+operator 公钥时启动即解析
+  （缓存优先，其次网络），成功则采用该 relay 池（首个为 primary）；`w2m_status` 新增
+  `bootstrap {configured, url, source, relays, expires_at, last_error}`。
+- 新增 `bin/w2m-bootstrap.mjs`：一条命令写 `relayUrls`/`fleetKey`/`autoStartAgent` 到 profile patch，
+  只改受管键、写前备份、所有输入先校验；`--temporary` 写 `relayTemporary: true`，面板以
+  **红色“临时 Relay 节点（回退配置）”**显示。
+- 新增 `bin/w2m-bootstrap-sign.mjs`：运维侧用 operator 私钥签名 relay 列表，输出可静态托管。
+- 控制面板 relay 折叠区支持 temporary 红色标记（仅主题 token，无硬编码颜色）。
+- 层模型修复：bootstrap 模块不依赖 chatops 层（layer-check 保持 clean）。
+- 测试：bootstrap 5/5、bootstrap-cli 6/6、fleet-target 49/49、client-bundle 26/26；
+  证据 `docs/acceptance/1.5.2/VERIFIED-BOOTSTRAP.json`（真实 fleet task `01M5ANYMVKXNU8E`）。
 ## [1.5.1] — 2026-10-23
 
 **备用链路的身份隔离 + 控制面板的 relay 折叠。**

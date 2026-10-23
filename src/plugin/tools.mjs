@@ -885,6 +885,19 @@ function readConfig(config = {}) {
     rabbitUrl,
     rabbitSource,
     rabbitUrlOverride,
+    // v1.5.2: the relay pool and the bootstrap inputs. `relayUrls` is what `w2m-bootstrap` writes;
+    // `relayTemporary` marks a fallback list so the fleet panel can say "临时 Relay 节点" out loud
+    // instead of presenting a stranded machine's fallback as a settled configuration.
+    relayUrls: Array.isArray(config.relayUrls)
+      ? config.relayUrls.filter((url) => typeof url === 'string' && url.trim() !== '').map((url) => url.trim().replace(/\/+$/, ''))
+      : [],
+    relayTemporary: config.relayTemporary === true,
+    bootstrapUrl: typeof config.bootstrapUrl === 'string' && config.bootstrapUrl.trim() !== ''
+      ? config.bootstrapUrl.trim()
+      : (typeof process.env.W2M_BOOTSTRAP_URL === 'string' && process.env.W2M_BOOTSTRAP_URL.trim() !== '' ? process.env.W2M_BOOTSTRAP_URL.trim() : null),
+    bootstrapOperatorKeyPem: typeof config.bootstrapOperatorKey === 'string' && config.bootstrapOperatorKey.trim() !== ''
+      ? config.bootstrapOperatorKey
+      : (typeof process.env.W2M_BOOTSTRAP_OPERATOR_KEY === 'string' && process.env.W2M_BOOTSTRAP_OPERATOR_KEY.trim() !== '' ? process.env.W2M_BOOTSTRAP_OPERATOR_KEY : null),
     p2pMode,
     stunServers: stunList,
   };
@@ -2176,6 +2189,7 @@ async function readP2PStatus(cfg, runtime, peersAnnounced = null) {
     device_error: runtime.identityError,
     local: status?.local ?? null,
     rabbit_url: status?.rabbit_url ?? cfg.rabbitUrl,
+      bootstrap: cfg.bootstrap ?? null,
     // How many machines the relay holds a live announcement for. `w2m_devices` says which machines
     // paired; this says which of them can be punched at, and the two differ constantly.
     peers_announced: peersAnnounced,
@@ -7354,6 +7368,46 @@ function sleepWithSignal(ms, signal) {
 const resolvedFleetKey = { value: null, source: null, at: 0 };
 
 async function startLocalStack(ctx, cfg) {
+
+  /**
+   * v1.5.2: bootstrap relay assignment. A fresh install has no relay list; without this it falls
+   * back to the compiled shared default, which is how a machine ends up looking connected on somebody
+   * else side. The answer is used only when it verified against the pinned operator key and is for
+   * this machine fleet; every failure leaves the configured relay untouched and is recorded in
+   * status, because a bootstrap that silently failed is indistinguishable from one never configured.
+   */
+  if ((Array.isArray(cfg.relayUrls) ? cfg.relayUrls.length : 0) === 0
+    && typeof cfg.bootstrapUrl === 'string' && typeof cfg.bootstrapOperatorKeyPem === 'string'
+    && typeof cfg.fleetKey === 'string') {
+    try {
+      const { resolveBootstrap } = await import(new URL('./bootstrap.mjs', import.meta.url).href);
+      const { homedir } = await import('node:os');
+      const { join } = await import('node:path');
+      const cacheFile = join(cfg.stateDir ?? join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'xclient'), 'bootstrap.json');
+      const outcome = await resolveBootstrap({
+        url: cfg.bootstrapUrl,
+        fleetKey: cfg.fleetKey,
+        operatorPublicKeyPem: cfg.bootstrapOperatorKeyPem,
+        cacheFile,
+        log: (line) => ctx.logger?.info?.(line),
+      });
+      if (outcome.ok === true) {
+        cfg.relayUrls = outcome.relays;
+        if (cfg.rabbitSource === 'shared-default' || !cfg.rabbitUrl) { cfg.rabbitUrl = outcome.relays[0]; cfg.rabbitSource = 'bootstrap'; }
+        cfg.bootstrap = { configured: true, url: cfg.bootstrapUrl, source: outcome.source, relays: outcome.relays, expires_at: outcome.expires_at, last_error: null };
+        ctx.logger?.info?.('w2m: bootstrap assigned relays (' + outcome.relays.join(', ') + ')');
+      } else {
+        cfg.bootstrap = { configured: true, url: cfg.bootstrapUrl, source: null, relays: [], expires_at: null, last_error: { reason_code: outcome.reason_code, detail: outcome.detail } };
+        ctx.logger?.warn?.('w2m: bootstrap kept the configured relay (' + outcome.reason_code + ': ' + outcome.detail + ')');
+      }
+    } catch (error) {
+      cfg.bootstrap = { configured: true, url: cfg.bootstrapUrl, source: null, relays: [], expires_at: null, last_error: { reason_code: 'BOOTSTRAP_ERROR', detail: error instanceof Error ? error.message : String(error) } };
+      ctx.logger?.warn?.('w2m: bootstrap failed (' + (error instanceof Error ? error.message : String(error)) + ')');
+    }
+  } else if (cfg.bootstrap === undefined) {
+    cfg.bootstrap = { configured: typeof cfg.bootstrapUrl === 'string', url: cfg.bootstrapUrl ?? null, source: null, relays: [], expires_at: null, last_error: null };
+  }
+
   const relayUrl = new URL('../relay/server.mjs', import.meta.url);
   const agentUrl = new URL('../agent/agent.mjs', import.meta.url);
 

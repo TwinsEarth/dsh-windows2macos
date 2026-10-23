@@ -1,0 +1,21 @@
+{
+  "version": "1.5.2",
+  "case": "VERIFIED-BOOTSTRAP",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-23T12:22:38.268Z",
+  "executor": "lead",
+  "requirement": "a fresh installation obtains its relay list from a signed bootstrap answer: HMAC proof, pinned Ed25519 verification over canonical bytes, expiry enforcement, verified cache; and w2m-bootstrap writes the profile patch with the fallback marker",
+  "task_id": "01M5ANYMVKXNU8E",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "bootstrap_suite": "5/5 pass",
+      "bootstrap_cli_suite": "6/6 pass",
+      "fleet_target_suite": "49/49 pass"
+    }
+  },
+  "note": "all three suites ran as one real fleet task on the Tencent relay before packaging"
+}
