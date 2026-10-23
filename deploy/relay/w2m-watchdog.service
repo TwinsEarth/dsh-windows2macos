@@ -1,0 +1,10 @@
+[Unit]
+Description=W2M relay health watchdog (checks /healthz and restarts a wedged relay)
+Documentation=https://github.com/TwinsEarth/dsh-windows2macos
+
+[Service]
+Type=oneshot
+User=root
+Environment=W2M_WATCHDOG_URL=http://127.0.0.1:8787
+ExecStart=/usr/local/bin/w2m-watchdog.sh
+NoNewPrivileges=false

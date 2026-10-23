@@ -1,0 +1,21 @@
+{
+  "version": "1.5.0",
+  "case": "SECONDARY-LINK",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-23T09:11:38.549Z",
+  "executor": "lead",
+  "requirement": "a standby relay link is supervised: flags are validated, the child argv is the same w2m-localside protocol client, and an exited child is restarted with backoff",
+  "task_id": "01M5ANYMVKR311N",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "secondary_link_suite": "6/6 pass",
+      "supervisor_restart": "covered by test",
+      "task_succeeded": true
+    }
+  },
+  "note": "the suite shipped in v1.5.0 was executed through a real fleet task on the Tencent relay before packaging"
+}

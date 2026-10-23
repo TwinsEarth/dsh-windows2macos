@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the W2M relay health watchdog every 30 s
+
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

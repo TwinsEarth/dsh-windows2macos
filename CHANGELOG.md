@@ -7,6 +7,23 @@
 
 All notable changes to this project are documented here.
 
+## [1.5.0] — 2026-10-23
+
+**多 relay 双通道（active-passive）+ relay 健康看门狗。**
+
+- 新增 `bin/w2m-secondary-link.mjs`：在一台机器上拉一条通往备用 relay 的常在线链接。
+  它监督子进程 `w2m-localside`（同一套协议客户端），子进程退出按指数退避重启并记录每次转换，
+  由 systemd/launchd/计划任务只守护这一层——避免"链接一次启动后静默死掉"的已知失败形态。
+- active-passive 是**路由规则**：两条链接都常连，任务只在主 relay 派发；主 relay 掉线或延迟严重时
+  把同一任务改派到备用 relay（机器已在线，无需重连），正常情况下一台机器只有一个执行者。
+- 新增 `deploy/relay/`：`w2m-watchdog.sh` + systemd `.service/.timer`。每 30s 检查
+  `/healthz` 的 `"ok":true`，连续 2 次失败才重启 relay/stun；每小时最多 5 次重启（避免掩盖根因），
+  日志写 `/var/lib/w2m/watchdog/watchdog.log`。relay 因此独立于"是否有编队成员"保持在线。
+- 新增 `docs/MULTI-RELAY.md`：拓扑、选路规则（健康且 RTT 最低且目标全在线）、relay 互为成员、
+  以及 relay 超过 3 个时客户端折叠显示（`relays: 3 shown · +N online`）的约定。
+- 测试：`test/secondary-link.test.mjs` 6/6（参数校验、child argv、退避重启、日志）；
+  门禁 GREEN ×2；证据 `docs/acceptance/1.5.0/SECONDARY-LINK.json`（真实 fleet task `01M5ANYMVKR311N`）。
+
 ## [1.4.4] — 2026-10-23
 
 **relay 重启不再丢失编队归属（devices.json 持久化 fleet_id）。**
