@@ -7,6 +7,22 @@
 
 All notable changes to this project are documented here.
 
+## [1.5.3] — 2026-10-23
+
+**零接触自动入队：只能升级插件的机器也能自己找到编队。**
+
+v1.5.2 的验签 bootstrap 需要一个 URL、一个 operator 公钥和 fleetKey 才能触发——新装机器三样都没有，
+于是仍然回落到编译期默认 relay 并报 W2M_UNREACHABLE。v1.5.3 把触发条件做进包里：
+
+- 包内置默认 bootstrap 端点与 **operator 公钥 pin**（只含公钥；端点无法签发，私钥不出运维机）。
+- bootstrap 证明改为可选：机器还没拿到 fleetKey 时，仍可凭"签名 + 有效期 + relay 形状"采用
+  operator 声明的 relay 池（relay 列表是公开路由信息；加入编队仍需账号派生密钥，是独立一步）。
+- `startLocalStack` 在无 relayUrls 时始终尝试 bootstrap（默认值生效），成功即用池（首个 primary），
+  失败保持回落并写入 `w2m_status.bootstrap.last_error`。
+- 包内默认 patch：`autoStartAgent: true`（本 fork），新装即启动 agent。
+- 因此只有"升级插件"这一条通道的机器：升级 → 重启 → 自动取 relay 池 → 账号密钥就绪后自动配对入队。
+- 测试：bootstrap 6/6（含 keyless）、bootstrap-cli 6/6、fleet-target 49/49；层模型 clean；
+  证据 `docs/acceptance/1.5.3/ZERO-TOUCH-BOOTSTRAP.json`（真实 fleet task `01M5ANYMVKZ7DHH`）。
 ## [1.5.2] — 2026-10-23
 
 **新机器自动获得 relay 归属（验签 bootstrap）+ 一次性配置工具。**

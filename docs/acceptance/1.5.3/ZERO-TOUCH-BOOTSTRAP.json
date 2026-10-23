@@ -1,0 +1,22 @@
+{
+  "version": "1.5.3",
+  "case": "ZERO-TOUCH-BOOTSTRAP",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-23T12:58:49.026Z",
+  "executor": "lead",
+  "requirement": "a machine whose only capability is upgrading the plugin obtains its relay pool without any local command: built-in bootstrap URL and operator public key, signature-verified keyless assignment, autoStartAgent on by default",
+  "task_id": "01M5ANYMVKZ7DHH",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "bootstrap_suite": "6/6 pass incl keyless",
+      "bootstrap_cli_suite": "6/6 pass",
+      "builtin_defaults": "endpoint+pin shipped",
+      "autoStartAgent_default": "true"
+    }
+  },
+  "note": "suites ran as a real fleet task on the Tencent relay; keyless assignment verified by unit test"
+}

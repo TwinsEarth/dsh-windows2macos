@@ -1,3 +1,4 @@
+import { DEFAULT_BOOTSTRAP_URL, DEFAULT_BOOTSTRAP_OPERATOR_KEY_PEM } from './bootstrap.mjs';
 /**
  * DSH: Windows2MacO - the DSH Cordis plugin.
  *
@@ -892,12 +893,14 @@ function readConfig(config = {}) {
       ? config.relayUrls.filter((url) => typeof url === 'string' && url.trim() !== '').map((url) => url.trim().replace(/\/+$/, ''))
       : [],
     relayTemporary: config.relayTemporary === true,
+    // v1.5.3: the operator endpoint and its public pin ship with the package, so a machine whose only
+    // capability is upgrading the plugin still finds its fleet. Explicit config/env still wins.
     bootstrapUrl: typeof config.bootstrapUrl === 'string' && config.bootstrapUrl.trim() !== ''
       ? config.bootstrapUrl.trim()
-      : (typeof process.env.W2M_BOOTSTRAP_URL === 'string' && process.env.W2M_BOOTSTRAP_URL.trim() !== '' ? process.env.W2M_BOOTSTRAP_URL.trim() : null),
+      : (typeof process.env.W2M_BOOTSTRAP_URL === 'string' && process.env.W2M_BOOTSTRAP_URL.trim() !== '' ? process.env.W2M_BOOTSTRAP_URL.trim() : DEFAULT_BOOTSTRAP_URL),
     bootstrapOperatorKeyPem: typeof config.bootstrapOperatorKey === 'string' && config.bootstrapOperatorKey.trim() !== ''
       ? config.bootstrapOperatorKey
-      : (typeof process.env.W2M_BOOTSTRAP_OPERATOR_KEY === 'string' && process.env.W2M_BOOTSTRAP_OPERATOR_KEY.trim() !== '' ? process.env.W2M_BOOTSTRAP_OPERATOR_KEY : null),
+      : (typeof process.env.W2M_BOOTSTRAP_OPERATOR_KEY === 'string' && process.env.W2M_BOOTSTRAP_OPERATOR_KEY.trim() !== '' ? process.env.W2M_BOOTSTRAP_OPERATOR_KEY : DEFAULT_BOOTSTRAP_OPERATOR_KEY_PEM),
     p2pMode,
     stunServers: stunList,
   };
@@ -4950,7 +4953,12 @@ export async function apply(ctx, config = {}) {
   // Optional: bring up relay + agent in this process
   // -------------------------------------------------------------------------------------------
   if (cfg.autoStartAgent) {
-    ctx.effect?.(() => startLocalStack(ctx, cfg));
+    // v1.5.3: a failed auto-start must not surface as an unhandled rejection. The bundled patch now
+  // starts the agent by default, and a host whose plugin wiring forbids that (a restricted test
+  // harness, a missing relay module) would otherwise reject where nothing can catch it.
+  ctx.effect?.(() => startLocalStack(ctx, cfg).catch((error) => {
+    ctx.logger?.warn?.('w2m: auto-start did not complete: ' + (error instanceof Error ? error.message : String(error)));
+  }));
   } else {
     /**
      * v0.8.5: **say it out loud.**
@@ -7377,8 +7385,7 @@ async function startLocalStack(ctx, cfg) {
    * status, because a bootstrap that silently failed is indistinguishable from one never configured.
    */
   if ((Array.isArray(cfg.relayUrls) ? cfg.relayUrls.length : 0) === 0
-    && typeof cfg.bootstrapUrl === 'string' && typeof cfg.bootstrapOperatorKeyPem === 'string'
-    && typeof cfg.fleetKey === 'string') {
+    && typeof cfg.bootstrapUrl === 'string' && typeof cfg.bootstrapOperatorKeyPem === 'string') {
     try {
       const { resolveBootstrap } = await import(new URL('./bootstrap.mjs', import.meta.url).href);
       const { homedir } = await import('node:os');
@@ -7386,7 +7393,7 @@ async function startLocalStack(ctx, cfg) {
       const cacheFile = join(cfg.stateDir ?? join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'xclient'), 'bootstrap.json');
       const outcome = await resolveBootstrap({
         url: cfg.bootstrapUrl,
-        fleetKey: cfg.fleetKey,
+        fleetKey: cfg.fleetKey ?? null,
         operatorPublicKeyPem: cfg.bootstrapOperatorKeyPem,
         cacheFile,
         log: (line) => ctx.logger?.info?.(line),

@@ -89,6 +89,17 @@ describe('verified relay bootstrap (v1.5.2)', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
+  it('adopts a signed answer without a fleet key (v1.5.3 keyless assignment)', () => {
+    const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+    const pem = publicKey.export({ type: 'spki', format: 'pem' });
+    const answer = signAnswer(privateKey);
+    // A machine that cannot derive a fleet key yet still needs its relays; the signature and expiry are
+    // the whole trust decision, and joining the fleet remains a separate, account-keyed step.
+    const keyless = verifyBootstrapAnswer(answer, { operatorPublicKeyPem: pem, fleetId: null });
+    assert.equal(keyless.ok, true);
+    assert.deepEqual(keyless.relays, RELAYS);
+  });
+
   it('canonical payload sorts the relay list, so order cannot change the signed bytes silently', () => {
     const a = canonicalBootstrapPayload({ fleet_id: 'f', relays: ['http://b:1', 'http://a:1'], issued_at: 'i', expires_at: 'e' });
     const b = canonicalBootstrapPayload({ fleet_id: 'f', relays: ['http://a:1', 'http://b:1'], issued_at: 'i', expires_at: 'e' });

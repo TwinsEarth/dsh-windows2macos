@@ -51,6 +51,21 @@ function fleetIdFromKey(key) {
 
 
 export const BOOTSTRAP_PROTOCOL = 'w2m-bootstrap/v1';
+/**
+ * v1.5.3 built-in bootstrap defaults.
+ *
+ * A machine whose only capability is "upgrade the plugin" cannot be told a URL or a pin by hand,
+ * so the operator's endpoint and public key ship inside the package. Only the PUBLIC key is here:
+ * the endpoint cannot mint answers, and the private key never leaves the operator's machine. A signed
+ * answer still has to verify and be unexpired, so the built-in values are a discovery hint, not trust.
+ */
+export const DEFAULT_BOOTSTRAP_URL = 'http://202.182.123.154:8911/bootstrap';
+export const DEFAULT_BOOTSTRAP_OPERATOR_KEY_PEM = [
+  '-----BEGIN PUBLIC KEY-----',
+  'MCowBQYDK2VwAyEAQdjWX9TggM/S1Bm/OKUI3/Q2IL20Le354AXwiMtua+0=',
+  '-----END PUBLIC KEY-----',
+  '',
+].join(String.fromCharCode(10));
 export const BOOTSTRAP_PROOF_PROTOCOL = 'w2m-bootstrap-proof/v1';
 /** Refusals are values with stable names, because the status surface reports them verbatim. */
 export const BOOTSTRAP_REFUSAL = Object.freeze({
@@ -137,7 +152,10 @@ export function verifyBootstrapAnswer(answer, input) {
   if (answer.protocol !== BOOTSTRAP_PROTOCOL) {
     return refuse(BOOTSTRAP_REFUSAL.BAD_PROTOCOL, `expected protocol ${BOOTSTRAP_PROTOCOL}, got ${JSON.stringify(answer.protocol ?? null)}`);
   }
-  if (typeof answer.fleet_id !== 'string' || answer.fleet_id !== input.fleetId) {
+  // v1.5.3: when the machine cannot derive a fleet key yet, it still must not be stranded: the
+  // signed relay list is public routing information, so a signature-only answer is adopted for relay
+  // assignment. Joining the fleet still needs the account-derived key, which is a separate step.
+  if (input.fleetId !== null && input.fleetId !== undefined && (typeof answer.fleet_id !== 'string' || answer.fleet_id !== input.fleetId)) {
     return refuse(BOOTSTRAP_REFUSAL.WRONG_FLEET, 'the answer names a different fleet; it is not for this machine');
   }
   const relays = Array.isArray(answer.relays)
@@ -205,9 +223,9 @@ function verifiedSignatureOk(value) {
  */
 export async function resolveBootstrap(deps) {
   const log = deps.log ?? (() => {});
-  const fleetId = fleetIdOf(deps.fleetKey);
-  if (fleetId === null) {
-    return { ok: false, reason_code: BOOTSTRAP_REFUSAL.NO_FLEET_KEY, detail: 'no usable fleet key is configured, so no bootstrap proof can be made' };
+  const fleetId = deps.fleetKey === null || deps.fleetKey === undefined ? null : fleetIdOf(deps.fleetKey);
+  if (deps.fleetKey !== null && deps.fleetKey !== undefined && fleetId === null) {
+    return { ok: false, reason_code: BOOTSTRAP_REFUSAL.NO_FLEET_KEY, detail: 'the configured fleet key is not a 32-byte base64url key' };
   }
   const pinned = readBootstrapCache(deps.cacheFile, { operatorPublicKeyPem: deps.operatorPublicKeyPem, fleetId, nowMs: deps.nowMs });
   if (pinned.ok === true) {
@@ -217,12 +235,10 @@ export async function resolveBootstrap(deps) {
   const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
   const timeoutMs = Number.isInteger(deps.timeoutMs) ? deps.timeoutMs : 4000;
   const nonce = createHash('sha256').update(`${fleetId}:${Date.now()}:${Math.random()}`).digest('hex').slice(0, 32);
-  let proof;
-  try {
-    proof = buildBootstrapProof({ fleetKey: deps.fleetKey, fleetId, nonce });
-  } catch (error) {
-    return { ok: false, reason_code: BOOTSTRAP_REFUSAL.NO_FLEET_KEY, detail: error instanceof Error ? error.message : String(error) };
-  }
+  // v1.5.3: the proof is optional. Without a fleet key the request cannot prove which fleet it is,
+  // but the ANSWER is still verified by signature, expiry and relay shape -- so relay assignment can
+  // be automatic even before an account-derived key is available.
+  const proof = deps.fleetKey === null || deps.fleetKey === undefined ? null : buildBootstrapProof({ fleetKey: deps.fleetKey, fleetId, nonce });
   let answer;
   try {
     const response = await fetchImpl(deps.url, {

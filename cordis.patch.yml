@@ -110,7 +110,7 @@
       config:
         rabbitUrl: ''
         operatorToken: ''
-        autoStartAgent: false
+        autoStartAgent: true
         machineName: ''
         allowedCommands: []
         p2pMode: auto
