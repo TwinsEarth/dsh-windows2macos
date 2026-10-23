@@ -491,6 +491,16 @@ function executableIdentity(argv0, prefix0, options) {
     const bundled = bundledExecutable(prefix0, options.env ?? process.env);
     if (bundled !== null && sameFile(argv0, bundled)) return { kind: 'match', detail: null };
   }
+    // v1.6.1: the interpreter executing this agent is the tool a bare entry names.
+    // Measured on a real machine (2026-10-24): DSH runs on its bundled node, a grant runner passes
+    // [process.execPath, '-e', ...], and the entry is the bare name `node` -- but PATH resolves `node`
+    // to an unrelated application binary. process.execPath needs no dependencies-directory lookup:
+    // it is the running interpreter, by definition the program the node entry names. A copy of the
+    // binary elsewhere is still refused (this compares identity, not the bare name).
+    if (!prefixIsPath && argvIsPath && sameFile(argv0, process.execPath)) {
+      const base = (value) => String(value).split(/[\\/]/).pop().replace(/\.exe$/i, '').toLowerCase();
+      if (base(argv0) === base(prefix0)) return { kind: 'match', detail: null };
+    }
 
   return {
     kind: 'path-mismatch',

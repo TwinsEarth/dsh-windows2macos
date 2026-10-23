@@ -1,129 +1,118 @@
 /**
- * The UI-activated Node-code-execution capability: the machine-local switch behind the composer control.
+ * v1.6.1: the Node-code-execution capability is a manual, in-process switch.
  *
- * The tests are grouped the way the feature fails: the store's fail-closed defaults, the expiry boundary, and the
- * host route's two verbs (plus the verbs it refuses by name). The agent's use of the same file is covered by the
- * agent suite; here the contract is "a decision is stored, expires and is read back exactly as written".
+ * These tests pin the policy, because it is the machine's highest-privilege switch:
+ *   * the standing default is denied;
+ *   * a capability file on disk — including a `permanent` one written by a task/script/attacker —
+ *     is IGNORED, because nothing a machine or automation runs may grant execution;
+ *   * only the host route (the human UI click) moves the state, and it moves process memory only;
+ *   * temporary really expires and permanent does not survive a restart by construction.
  */
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { describe, it, beforeEach } from 'node:test';
+import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, it } from 'node:test';
+
 import {
-  DEFAULT_TEMPORARY_TTL_MS,
+  EXEC_CAPABILITY_MANUAL_ONLY,
   MAX_TEMPORARY_TTL_MS,
+  defaultExecCapabilityFile,
   describeExecCapability,
   effectiveExecCapabilityPrefixes,
   readExecCapability,
+  resetExecCapability,
   writeExecCapability,
 } from '../src/util/exec-capability.mjs';
 import { registerExecCapabilityRoutes } from '../src/plugin/exec-capability-route.mjs';
 
 const tempFile = () => join(mkdtempSync(join(tmpdir(), 'w2m-cap-')), 'exec-capability.json');
 
-describe('exec capability store', () => {
-  it('is denied by default, including for a missing or malformed file', () => {
-    const file = tempFile();
-    assert.equal(readExecCapability(file).state, 'denied');
-    assert.equal(readExecCapability(file).reason, 'absent');
-    assert.deepEqual(effectiveExecCapabilityPrefixes(file), []);
-    writeFileSync(file, 'not json');
-    assert.equal(readExecCapability(file).state, 'denied');
-    assert.equal(readExecCapability(file).reason, 'invalid');
+describe('Node exec capability: manual-only, in-process (v1.6.1)', () => {
+  beforeEach(() => resetExecCapability());
+
+  it('starts denied and says the authority is process memory, not a file', () => {
+    const status = readExecCapability(tempFile());
+    assert.equal(status.state, 'denied');
+    assert.equal(status.effective, false);
+    assert.equal(status.reason, 'manual_default');
+    assert.equal(status.source, 'process-memory');
+    assert.equal(status.file_ignored, true);
+    assert.deepEqual(effectiveExecCapabilityPrefixes('ignored'), []);
   });
 
-  it('stores a permanent decision and exposes exactly the one fixed prefix', () => {
+  it('IGNORES a permanent capability file written by anything else (the security invariant)', () => {
     const file = tempFile();
-    const written = writeExecCapability(file, { state: 'permanent', actor: { kind: 'operator' } }, 1_000);
+    mkdirSync(join(file, '..'), { recursive: true });
+    // What a grant task, a scheduled script, or an attacker with file access can do today:
+    writeFileSync(file, JSON.stringify({
+      protocol: 'w2m-exec-capability/v1',
+      state: 'permanent',
+      activated_at_ms: Date.now(),
+      expires_at_ms: null,
+      actor: { kind: 'operator', id: 'totally-legit' },
+    }), 'utf8');
+    assert.equal(readExecCapability(file).state, 'denied', 'a disk file cannot grant execution');
+    assert.deepEqual(effectiveExecCapabilityPrefixes(file), []);
+  });
+
+  it('moves only through the write path (the host route), and adds exactly node -e', () => {
+    const file = tempFile();
+    const written = writeExecCapability(file, { state: 'permanent', actor: { kind: 'operator', id: 'plugin-ui' } }, 1_000);
     assert.equal(written.ok, true);
-    const state = readExecCapability(file, 5_000);
-    assert.equal(state.state, 'permanent');
-    assert.equal(state.effective, true);
+    assert.equal(readExecCapability(file, 5_000).effective, true);
     assert.deepEqual(effectiveExecCapabilityPrefixes(file, 5_000), [['node', '-e']]);
     const described = describeExecCapability(file, 5_000);
-    assert.deepEqual(described.allows, ['node -e']);
-    assert.match(described.warning, /RCE/);
-    assert.equal(JSON.parse(readFileSync(file, 'utf8')).state, 'permanent');
+    assert.equal(described.manual_only, true);
+    assert.equal(described.survives_restart, false);
+    assert.match(described.policy, /manual-only/i);
+    assert.equal(described.policy, EXEC_CAPABILITY_MANUAL_ONLY);
+    // Revocation works the same way.
+    writeExecCapability(file, { state: 'denied' }, 6_000);
+    assert.equal(readExecCapability(file, 7_000).state, 'denied');
+    assert.equal(effectiveExecCapabilityPrefixes(file, 7_000).length, 0);
   });
 
-  it('expires a temporary decision at its boundary and reports why', () => {
+  it('enforces the temporary window and refuses an over-long TTL', () => {
     const file = tempFile();
-    const written = writeExecCapability(file, { state: 'temporary', ttl_ms: 60_000 }, 1_000);
-    assert.equal(written.ok, true);
+    writeExecCapability(file, { state: 'temporary', ttl_ms: 60_000 }, 1_000);
     assert.equal(readExecCapability(file, 30_000).effective, true);
     assert.equal(readExecCapability(file, 61_000).effective, false);
-    assert.equal(readExecCapability(file, 61_000).state, 'denied');
     assert.equal(readExecCapability(file, 61_000).reason, 'expired');
-    assert.deepEqual(effectiveExecCapabilityPrefixes(file, 61_000), []);
-    // Default TTL is 24 h, the choice the UI offers.
-    const file2 = tempFile();
-    writeExecCapability(file2, { state: 'temporary' }, 0);
-    assert.equal(JSON.parse(readFileSync(file2, 'utf8')).expires_at_ms, DEFAULT_TEMPORARY_TTL_MS);
+    assert.equal(writeExecCapability(file, { state: 'temporary', ttl_ms: MAX_TEMPORARY_TTL_MS + 1 }, 1_000).code, 'CAPABILITY_TTL_TOO_LONG');
+    assert.equal(writeExecCapability(file, { state: 'always' }, 1_000).code, 'CAPABILITY_STATE_INVALID');
   });
 
-  it('records a refusal and refuses impossible requests by name', () => {
-    const file = tempFile();
-    writeExecCapability(file, { state: 'permanent' }, 1_000);
-    writeExecCapability(file, { state: 'denied' }, 2_000);
-    assert.equal(readExecCapability(file, 3_000).state, 'denied');
-    assert.equal(effectiveExecCapabilityPrefixes(file, 3_000).length, 0);
-    assert.equal(writeExecCapability(file, { state: 'always' }).code, 'CAPABILITY_STATE_INVALID');
-    assert.equal(writeExecCapability(file, { state: 'temporary', ttl_ms: MAX_TEMPORARY_TTL_MS + 1 }).code, 'CAPABILITY_TTL_TOO_LONG');
-  });
-});
-
-describe('exec capability host route', () => {
-  const mount = (capabilityFile) => {
-    let route = null;
-    const ctx = { inject: (_deps, callback) => callback({ connection: { fetch: { register: (registered) => { route = registered; } } } }) };
-    const status = registerExecCapabilityRoutes(ctx, { capabilityFile: () => capabilityFile });
-    return { status, route };
-  };
-
-  it('reads the current decision and writes one of the three states', async () => {
-    const file = tempFile();
-    const mounted = mount(file);
-    assert.equal(mounted.status.mounted, true);
-    assert.equal(mounted.route.path, '/api/w2m/capability');
-    const read = await mounted.route.fetch(new Request('http://host/api/w2m/capability'));
-    assert.equal(read.status, 200);
-    assert.equal((await read.json()).capability.state, 'denied');
-
-    const write = await mounted.route.fetch(new Request('http://host/api/w2m/capability', {
+  it('keeps the host route as the single setter and reports the manual-only policy', async () => {
+    const handlers = [];
+    const ctx = {
+      inject: (_services, callback) => callback({ connection: { fetch: { register: (route) => handlers.push(route) } } }),
+    };
+    const mounted = registerExecCapabilityRoutes(ctx, { capabilityFile: () => tempFile() });
+    assert.equal(mounted.mounted, true);
+    const route = handlers[0];
+    assert.equal(route.path, '/api/w2m/capability');
+    const get = await route.fetch({ method: 'GET' });
+    const getBody = await get.json();
+    assert.equal(getBody.capability.manual_only, true);
+    assert.equal(getBody.capability.state, 'denied');
+    const post = await route.fetch({
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ state: 'temporary', ttl_ms: 3_600_000 }),
-    }));
-    assert.equal(write.status, 200);
-    assert.equal((await write.json()).capability.effective, true);
-
-    const permanent = await mounted.route.fetch(new Request('http://host/api/w2m/capability', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ state: 'permanent' }),
-    }));
-    assert.equal((await permanent.json()).capability.state, 'permanent');
-    assert.equal(JSON.parse(readFileSync(file, 'utf8')).state, 'permanent');
+      json: async () => ({ state: 'temporary', ttl_ms: 3_600_000 }),
+    });
+    const postBody = await post.json();
+    assert.equal(postBody.ok, true);
+    assert.equal(postBody.capability.state, 'temporary');
+    assert.equal(postBody.capability.manual_only, true);
+    assert.equal(postBody.capability.survives_restart, false);
+    assert.equal(readExecCapability(undefined).effective, true);
   });
 
-  it('refuses a bad body and any verb it does not name', async () => {
-    const file = tempFile();
-    const mounted = mount(file);
-    const bad = await mounted.route.fetch(new Request('http://host/api/w2m/capability', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ state: 'sometimes' }),
-    }));
-    assert.equal(bad.status, 400);
-    assert.equal((await bad.json()).reason_code, 'CAPABILITY_STATE_INVALID');
-    const wrongVerb = await mounted.route.fetch(new Request('http://host/api/w2m/capability', { method: 'DELETE' }));
-    assert.equal(wrongVerb.status, 405);
-  });
-
-  it('reports a host without the Connection service rather than throwing', () => {
-    const status = registerExecCapabilityRoutes({ inject: undefined }, { capabilityFile: () => tempFile() });
-    assert.equal(status.mounted, false);
-    assert.match(status.reason, /Connection/);
+  it('resets to denied (a restart is a revocation)', () => {
+    writeExecCapability(undefined, { state: 'permanent' });
+    assert.equal(readExecCapability(undefined).effective, true);
+    resetExecCapability(); // what a new host process starts as
+    assert.equal(readExecCapability(undefined).state, 'denied');
+    assert.equal(defaultExecCapabilityFile('/home/x'), join('/home/x', '.w2m', 'exec-capability.json'));
   });
 });

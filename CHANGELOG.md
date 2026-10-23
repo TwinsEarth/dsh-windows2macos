@@ -7,6 +7,23 @@
 
 All notable changes to this project are documented here.
 
+## [1.6.1] — 2026-10-24
+
+**Node 执行开关改为「仅人工 UI 手动、进程内存态」：文件/远程/自动化一律无法授权。**
+
+本次实机验证暴露了一个必须修掉的现实：grant 任务可以远程写 `~/.w2m/exec-capability.json`，
+从而远程把机器变成可执行任意 Node 代码——与"最高权限只允许人工手动选中"直接冲突。
+
+- 能力状态改为**进程内存**唯一权威：`readExecCapability` 不再读磁盘；旧文件（含 permanent）被忽略；
+  只有 host 路由 `/api/w2m/capability`（composer 人工点击）能写。
+- **不随重启保留**：进程退出即回到 denied（"永久"= 本次进程生命周期）；
+  `describe` 明确返回 `survives_restart: false`、`manual_only: true`、`file_ignored: true`。
+- 三态语义不变：denied / temporary（默认 24h，上限 7 天，过期即失效）/ permanent（本进程内）。
+- 测试重写：`test/exec-capability.test.mjs` 6/6（含"磁盘写 permanent 仍 denied""路由是唯一 setter"
+  "重启即撤销"）；agent.test 161 项通过（PATH 环境问题已在本机修复，非代码缺陷）。
+- 修复 allow-list 解释器身份回归：当 argv[0] 是 **运行 agent 的同一个 node（process.execPath）** 时，
+  bare 条目 `node` 应放行（此前机器 PATH 里 node 指向别的程序时会误拒，实测 12 个 e2e 失败）。
+- 证据 `docs/acceptance/1.6.1/MANUAL-ONLY-CAPABILITY.json`（fleet task `01M5ANYMVLDYWBH`）。
 ## [1.6.0] — 2026-10-24
 
 **一台 relay 承载 N 个编队：每个 DeepSeek 账号一个编队，共享 relay 但互相隔离。**

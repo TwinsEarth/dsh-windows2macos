@@ -1,0 +1,22 @@
+{
+  "version": "1.6.1",
+  "case": "MANUAL-ONLY-CAPABILITY",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-23T19:51:58.929Z",
+  "executor": "lead",
+  "requirement": "the highest-privilege Node execution switch can only be changed by a human UI action: it lives in host process memory, disk files are ignored, remote tasks/automation cannot enable it, and a restart revokes it",
+  "task_id": "01M5ANYMVLDYWBH",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "capability_policy_suite": "6/6 pass",
+      "disk_permanent_file_ignored": "true",
+      "route_is_single_setter": "true",
+      "restart_revokes": "true"
+    }
+  },
+  "note": "suite ran as a real fleet task; policy invariant pinned by test"
+}
