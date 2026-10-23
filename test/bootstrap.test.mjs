@@ -53,8 +53,12 @@ describe('verified relay bootstrap (v1.5.2)', () => {
     const tampered = signAnswer(privateKey);
     tampered.relays = [...RELAYS, 'http://evil.example:8787'];
     assert.equal(verifyBootstrapAnswer(tampered, { operatorPublicKeyPem: pem, fleetId: FLEET_ID }).reason_code, BOOTSTRAP_REFUSAL.BAD_SIGNATURE);
-    const wrongFleet = signAnswer(privateKey, { fleet_id: 'a'.repeat(64) });
-    assert.equal(verifyBootstrapAnswer(wrongFleet, { operatorPublicKeyPem: pem, fleetId: FLEET_ID }).reason_code, BOOTSTRAP_REFUSAL.WRONG_FLEET);
+    // v1.6.0: an answer signed for another fleet is topology, not misdelivery -- N accounts share one relay.
+    const otherFleet = signAnswer(privateKey, { fleet_id: 'a'.repeat(64) });
+    const topology = verifyBootstrapAnswer(otherFleet, { operatorPublicKeyPem: pem, fleetId: FLEET_ID });
+    assert.equal(topology.ok, true);
+    assert.equal(topology.fleet_mismatch, true);
+    assert.equal(verifyBootstrapAnswer(otherFleet, { operatorPublicKeyPem: pem, fleetId: FLEET_ID, strictFleet: true }).reason_code, BOOTSTRAP_REFUSAL.WRONG_FLEET);
     const expired = signAnswer(privateKey, { expires_at: new Date(Date.now() - 1000).toISOString() });
     assert.equal(verifyBootstrapAnswer(expired, { operatorPublicKeyPem: pem, fleetId: FLEET_ID }).reason_code, BOOTSTRAP_REFUSAL.EXPIRED);
     const unsigned = signAnswer(privateKey);

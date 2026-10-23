@@ -7,6 +7,16 @@
 
 All notable changes to this project are documented here.
 
+## [1.6.0] — 2026-10-24
+
+**一台 relay 承载 N 个编队：每个 DeepSeek 账号一个编队，共享 relay 但互相隔离。**
+
+- bootstrap 答案从"单个编队的归属"改为"relay 拓扑声明"：签名与有效期仍严格，fleet_id 不匹配不再拒绝
+  （`strictFleet: true` 保留旧行为）。一份 operator 签名即可服务全部编队，新账号机器无需人工重签。
+- `scripts/verify-fleet-isolation.mjs` 扩展到 **3 个编队** 14 项检查（设备枚举/任务/聊天/记忆），全过。
+- 新增 `docs/MULTI-FLEET.md`：编排模型、运维视图、零人工接入新账号、配额与边界。
+- 测试：bootstrap 6/6（含拓扑答案用例）、fleet isolation 14/14；证据 `docs/acceptance/1.6.0/N-FLEET.json`
+  （fleet task `01M5ANYMVLBU716`）。
 ## [1.5.5] — 2026-10-23
 
 **跨编队隔离：同 relay 上的另一账号机器不再出现在本编队的枚举/任务/聊天/记忆里。**

@@ -155,8 +155,18 @@ export function verifyBootstrapAnswer(answer, input) {
   // v1.5.3: when the machine cannot derive a fleet key yet, it still must not be stranded: the
   // signed relay list is public routing information, so a signature-only answer is adopted for relay
   // assignment. Joining the fleet still needs the account-derived key, which is a separate step.
-  if (input.fleetId !== null && input.fleetId !== undefined && (typeof answer.fleet_id !== 'string' || answer.fleet_id !== input.fleetId)) {
-    return refuse(BOOTSTRAP_REFUSAL.WRONG_FLEET, 'the answer names a different fleet; it is not for this machine');
+  /**
+   * v1.6.0: a signed answer states relay topology, not one fleet's identity.
+   *
+   * Every DeepSeek account derives its own fleet key and therefore its own fleet id; on a shared
+   * relay those fleets coexist and are isolated per fleet (v1.5.5). The relay list is the same for
+   * all of them, so one operator-signed answer can serve N fleets -- refusing it for a fleet id
+   * mismatch would require the operator to re-sign per account, which is exactly the manual step
+   * this release removes. The signature and expiry remain strict; only the fleet binding relaxes.
+   */
+  const fleetMismatch = typeof input.fleetId === 'string' && answer.fleet_id !== input.fleetId;
+  if (fleetMismatch && input.strictFleet === true) {
+    return refuse(BOOTSTRAP_REFUSAL.WRONG_FLEET, 'the answer names a different fleet and strictFleet is set');
   }
   const relays = Array.isArray(answer.relays)
     ? [...new Set(answer.relays.filter((url) => typeof url === 'string' && url.trim() !== '').map((url) => url.trim().replace(/\/+$/, '')))]
@@ -194,7 +204,7 @@ export function verifyBootstrapAnswer(answer, input) {
   if (!verifiedSignatureOk(signatureOk)) {
     return refuse(BOOTSTRAP_REFUSAL.BAD_SIGNATURE, 'the answer signature does not match the pinned operator key and the canonical payload');
   }
-  return { ok: true, relays, issued_at: answer.issued_at, expires_at: answer.expires_at };
+  return { ok: true, relays, issued_at: answer.issued_at, expires_at: answer.expires_at, answer_fleet_id: typeof answer.fleet_id === 'string' ? answer.fleet_id : null, fleet_mismatch: fleetMismatch };
 }
 
 /** Kept separate so a test can assert the failure branch without a real crypto fault. */

@@ -27,6 +27,7 @@ const BASE = `http://127.0.0.1:${PORT}`;
 const stateDir = mkdtempSync(join(tmpdir(), 'w2m-iso-'));
 const fleetKeyA = randomBytes(32).toString('base64url');
 const fleetKeyB = randomBytes(32).toString('base64url');
+const fleetKeyC = randomBytes(32).toString('base64url');
 const fleetId = (key) => createHash('sha256').update(Buffer.from(key, 'base64url')).digest('hex');
 const FLEET_B = fleetId(fleetKeyB);
 
@@ -78,12 +79,17 @@ async function main() {
   }
   const tokenA = await pair('iso-device-a', fleetKeyA);
   const tokenB = await pair('iso-device-b', fleetKeyB);
+  const tokenC = await pair('iso-device-c', fleetKeyC);
 
   // 1) device enumeration
   const devicesA = await request('/v1/devices', { token: tokenA });
   const namesA = (devicesA.json?.devices ?? []).map((d) => d.machine_name);
   check('fleet A sees its own device', namesA.includes('iso-device-a'), JSON.stringify(namesA));
   check('fleet A does NOT see fleet B device', !namesA.includes('iso-device-b'), JSON.stringify(namesA));
+  const devicesC = await request('/v1/devices', { token: tokenC });
+  const namesC = (devicesC.json?.devices ?? []).map((d) => d.machine_name);
+  check('fleet C sees only its own device (N-fleet)', namesC.length === 1 && namesC[0] === 'iso-device-c', JSON.stringify(namesC));
+  check('fleet A does NOT see fleet C device', !namesA.includes('iso-device-c'), JSON.stringify(namesA));
   const devicesB = await request('/v1/devices', { token: tokenB });
   const namesB = (devicesB.json?.devices ?? []).map((d) => d.machine_name);
   check('fleet B does NOT see fleet A device', !namesB.includes('iso-device-a'), JSON.stringify(namesB));
@@ -111,6 +117,8 @@ async function main() {
   const chatB = await request('/v1/fleet/messages?session_id=iso-session', { token: tokenB });
   check('fleet A reads its own chat', (chatA.json?.messages ?? []).length >= 1);
   check('fleet B does NOT read fleet A chat', (chatB.json?.messages ?? []).length === 0, JSON.stringify(chatB.json?.messages ?? []));
+  const chatC = await request('/v1/fleet/messages?session_id=iso-session', { token: tokenC });
+  check('fleet C does NOT read fleet A chat (N-fleet)', (chatC.json?.messages ?? []).length === 0, JSON.stringify(chatC.json?.messages ?? []));
 
   // 4) fleet memory
   const memoryDoc = 'isolation-memory';
@@ -130,7 +138,7 @@ async function main() {
     process.stdout.write(`\nFAILED: ${failures.join(', ')}\n`);
     process.exitCode = 1;
   } else {
-    process.stdout.write('\nALL CHECKS PASSED — two fleets are isolated on one relay\n');
+    process.stdout.write('\nALL CHECKS PASSED — N fleets are isolated on one relay\n');
   }
 }
 
