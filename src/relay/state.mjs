@@ -3280,6 +3280,8 @@ export class RabbitState {
       devices: this.devices.size,
       // v1.6.2: whole-relay totals on the public health probe.
       fleets_total: this.fleetSummary().fleets_total,
+      // v1.6.4: 1.6.3 forgot to surface this on /healthz (the panel reads it there).
+      fleets_online: this.fleetSummary().fleets_online,
       devices_online: this.fleetSummary().devices_online,
       devices_total: this.devices.size,
       tasks: this.tasks.size,

@@ -7,6 +7,15 @@
 
 All notable changes to this project are documented here.
 
+## [1.6.4] — 2026-10-24
+
+**修复：`/healthz` 漏发 `fleets_online`（1.6.3 的 `fleetSummary` 已计算，但 `stats()` 没带到公开字段）。**
+
+- `stats()` 现在同时输出 `fleets_total` 与 `fleets_online`；
+- 面板可正确显示 `全服：X/Y 个编队 · M/T 台在线`（X = 至少一台机器在线的编队数）；
+- relay 主机升级到 1.6.4（含 1.6.3/1.6.2/1.6.1 全部内容）。
+- 测试：relay 200/200、fleet-target 49/49；证据 `docs/acceptance/1.6.4/HEALTHZ-FLEETS-ONLINE.json`
+  （fleet task `01M5ANYMVLX3MI7`）。
 ## [1.6.3] — 2026-10-24
 
 **编队与机器同构显示：在线编队数/编队总数 + 在线机器/机器总数。**
