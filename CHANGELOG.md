@@ -7,6 +7,18 @@
 
 All notable changes to this project are documented here.
 
+## [1.6.2] — 2026-10-24
+
+**relay 全服概览：多少个编队、多少台机器在线（healthz + operator /v1/fleets + 面板一行显示）。**
+
+- `state.fleetSummary()`：按 fleet 聚合设备数/在线数，返回 `fleets_total`、`devices_online`、
+  `devices_total`、`unfleeted_devices` 与 per-fleet 明细。
+- `GET /healthz`（公开）新增上述**聚合计数**（不暴露 per-fleet 明细）；
+- `GET /v1/fleets`（operator token）：返回 per-fleet 明细（其他账号的编队名不向普通设备暴露）。
+- 面板 relay 折叠区新增一行：`全服：N 个编队 · M/T 台在线`（fleet-target probe 读取 healthz 计数）。
+- relay 主机将升级到 1.6.2（包含 1.6.1 的 Node 执行仅人工/内存态与 allow-list 解释器身份修复）。
+- 测试：relay 200/200、fleet-target 49/49、client-bundle 26/26；证据
+  `docs/acceptance/1.6.2/RELAY-FLEET-OVERVIEW.json`（fleet task `01M5ANYMVLRYXSN`）。
 ## [1.6.1] — 2026-10-24
 
 **Node 执行开关改为「仅人工 UI 手动、进程内存态」：文件/远程/自动化一律无法授权。**

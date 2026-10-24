@@ -1,0 +1,22 @@
+{
+  "version": "1.6.2",
+  "case": "RELAY-FLEET-OVERVIEW",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-24T02:23:58.829Z",
+  "executor": "lead",
+  "requirement": "the relay reports how many fleets it serves and how many machines are online: aggregate counts on the public health probe, per-fleet rows only for the operator",
+  "task_id": "01M5ANYMVLRYXSN",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "relay_suite": "200/200 pass",
+      "fleet_summary": "fleets_total/devices_online/devices_total",
+      "operator_route": "GET /v1/fleets",
+      "panel_line": "globalSummary rendered"
+    }
+  },
+  "note": "relay and fleet-target suites ran as a real fleet task"
+}

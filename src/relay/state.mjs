@@ -3245,12 +3245,40 @@ export class RabbitState {
 
   /* ---------------- serialization ---------------- */
 
+  /**
+   * v1.6.2: the whole-relay view: how many fleets this relay serves and how many machines are
+   * online. Counts only — the per-fleet member lists stay behind the fleet-scoped endpoints, so
+   * this is safe to expose on the public health probe.
+   */
+  fleetSummary(nowMs = this.nowMs()) {
+    const byFleet = new Map();
+    let online = 0;
+    for (const device of this.devices.values()) {
+      const key = typeof device.fleet_id === 'string' && device.fleet_id !== '' ? device.fleet_id : null;
+      const entry = byFleet.get(key) ?? { fleet_id: key, devices: 0, online: 0 };
+      entry.devices += 1;
+      if (this.isOnlineDevice(device, nowMs)) { entry.online += 1; online += 1; }
+      byFleet.set(key, entry);
+    }
+    const fleets = [...byFleet.values()].sort((a, b) => b.devices - a.devices);
+    return {
+      fleets_total: fleets.filter((f) => f.fleet_id !== null).length,
+      unfleeted_devices: byFleet.get(null)?.devices ?? 0,
+      devices_total: this.devices.size,
+      devices_online: online,
+      fleets,
+    };
+  }
   stats() {
     return {
       protocol_version: PROTOCOL_VERSION,
       seq: this.seq,
       buffered_events: this.buffer.length,
       devices: this.devices.size,
+      // v1.6.2: whole-relay totals on the public health probe.
+      fleets_total: this.fleetSummary().fleets_total,
+      devices_online: this.fleetSummary().devices_online,
+      devices_total: this.devices.size,
       tasks: this.tasks.size,
       results: this.results.size,
       pairing_codes: [...this.pairingCodes.values()].filter((c) => !c.used && this.nowMs() < c.expires_at_ms).length,

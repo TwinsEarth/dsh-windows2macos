@@ -853,6 +853,17 @@ export class RelayServer {
      * every task that carried a grant, with the argv hash and key id it was authorised under -- and deliberately returns
      * only operator-readable data, never result bodies.
      */
+      /**
+       * v1.6.2: whole-relay fleet overview for an operator. Aggregate counts are public on /healthz;
+       * the per-fleet rows are not, because they name other accounts fleets.
+       */
+      if (method === 'GET' && path === '/v1/fleets') {
+        const auth = this.authorizeTaskDispatch(req);
+        if (auth.role !== 'operator') throw new ProtocolError('OPERATOR_REQUIRED', 'listing fleets is an operator view');
+        const summary = this.state.fleetSummary();
+        return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ok: true, ...summary });
+      }
+
     if (path === '/v1/grants/revoke' || path === '/v1/grants') {
       const auth = this.authorizeTaskDispatch(req);
       if (auth.role !== 'operator') throw new ProtocolError('OPERATOR_REQUIRED', 'only the operator may administer grants');

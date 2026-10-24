@@ -503,7 +503,16 @@ export async function probeRelays(urls, options = {}) {
       if (!response.ok || body?.ok !== true) {
         return { url, ok: false, rtt_ms: null, error: `HTTP ${response.status}` };
       }
-      return { url, ok: true, rtt_ms: Date.now() - started, relay_id: body.relay_id ?? null };
+      return {
+        url, ok: true, rtt_ms: Date.now() - started, relay_id: body.relay_id ?? null,
+        // v1.6.2: Whole-relay totals, shown in the panel as "N fleets · M machines online".
+        // Counts only: per-fleet membership stays behind the fleet-scoped endpoints.
+        stats: {
+          fleets_total: Number.isInteger(body.fleets_total) ? body.fleets_total : null,
+          devices_online: Number.isInteger(body.devices_online) ? body.devices_online : null,
+          devices_total: Number.isInteger(body.devices_total) ? body.devices_total : null,
+        },
+      };
     } catch (error) {
       return { url, ok: false, rtt_ms: null, error: error instanceof Error ? error.message : String(error) };
     }
@@ -573,6 +582,8 @@ export function buildUiState(deps) {
           primary_url: relays.shown.find((item) => item.ok === true)?.url ?? null,
           // v1.5.2: a fallback relay list is never presented as settled; the panel renders it red.
           temporary: relays.temporary === true,
+          // v1.6.2: whole-relay overview (fleets + online machines) for the panel header line.
+          server: relays.server ?? null,
         },
   };
 }
@@ -795,8 +806,10 @@ function mountTargetRoutes(connection, deps, status, logger) {
       return { ...item, role: reachableSeen === 1 ? 'primary' : 'standby' };
     });
     const folded = foldRelayItems(items, 3);
+    // v1.6.2: the primary relay's own view of the whole server, if it reported one.
+    const primaryStats = items.find((item) => item.ok === true)?.stats ?? null;
     // v1.5.2: a fallback list is marked so the panel can render it in red, not as a settled config.
-    const withMark = { ...folded, temporary: deps.cfg()?.relayTemporary === true };
+    const withMark = { ...folded, temporary: deps.cfg()?.relayTemporary === true, server: primaryStats };
     relayCache = { at: now, value: withMark };
     return withMark;
   };
