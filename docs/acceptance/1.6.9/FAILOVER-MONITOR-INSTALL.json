@@ -1,0 +1,35 @@
+{
+  "version": "1.6.9",
+  "case": "FAILOVER-MONITOR-INSTALL",
+  "kind": "positive",
+  "machines": [
+    "b1b19d49-20f1-4cdc-986e-f5630a5cd6f2",
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-24T15:45:00.621Z",
+  "executor": "lead",
+  "requirement": "startLocalStack returns so startFailoverStack can install the relay health monitor; the agent start is a background action with recorded failure",
+  "root_cause": {
+    "observed_on": "macOS / plugin 1.6.8",
+    "stage_log": [
+      "W wrap enter relayUrls=[primary,backup]",
+      "A startLocalStack enter",
+      "C createAgent done",
+      "S before agent.start",
+      "(nothing further — await agent.start() never settled, while the machine was online in the fleet)"
+    ],
+    "consequence": "startFailoverStack never reached relayPool(cfg)/setInterval, so the failover monitor was never created and automatic relay failover could not engage on any platform with the same agent.start behaviour"
+  },
+  "fix": {
+    "change": "startLocalStack no longer awaits agent.start(); it starts it in the background and logs a failure instead",
+    "guard": "test/agent-start-nonblocking.test.mjs reads the emitted source and fails if startLocalStack awaits the start again"
+  },
+  "task_id": "01M5ANYMVMKL55O",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "relay_failover": "5/5",
+      "nonblocking_guard": "2/2"
+    }
+  }
+}

@@ -8011,8 +8011,18 @@ async function startLocalStack(ctx, cfg) {
       }
     }
 
-    await agent.start();
-    ctx.logger?.info?.(`w2m: agent started as ${JSON.stringify(agent.identity?.() ?? null)}`);
+    // v1.6.9: the agent DOES come up, but on macOS its `start()` promise was observed to stay
+    // pending forever (stage log: "before agent.start" was the last line written). Awaiting it blocked
+    // everything after this point — including the failover monitor installed by startFailoverStack,
+    // which is why automatic relay failover never engaged: the monitor was never created.
+    //
+    // The mount does not need to OBSERVE the start to be complete: the agent announces itself through
+    // the relay, and the value startFailoverStack needs from this function is the cleanup handle. So
+    // start it in the background and record a failure instead of hanging the whole stack.
+    agent.start().then(
+      () => ctx.logger?.info?.('w2m: agent started as ' + JSON.stringify(agent.identity?.() ?? null)),
+      (error) => ctx.logger?.warn?.('w2m: agent start failed: ' + (error instanceof Error ? error.message : String(error))),
+    );
 
     /**
      * v0.8.12: **keep trying to join after mount.**

@@ -7,6 +7,29 @@
 
 All notable changes to this project are documented here.
 
+## [1.6.9] — 2026-10-24
+
+**修复 failover 监控从未安装的根因：`startLocalStack` 等待了永不 settle 的 `agent.start()`。**
+
+阶段日志（macOS，1.6.8，现场实测）：
+
+```
+W wrap enter relayUrls=[腾讯云, Vultr]   ← 配置正确
+A startLocalStack enter
+C createAgent done
+S before agent.start              ← 之后没有任何日志
+```
+
+agent 实际已上线（编队在线），但 `await agent.start()` 的 Promise 永不返回，导致 `startLocalStack` 不返回 →
+`startFailoverStack` 永远走不到 `relayPool(cfg)` / `setInterval`，**监控循环从未创建**，自动 failover 不可能触发。
+
+修复：
+
+- `startLocalStack` 不再 await `agent.start()`：后台启动，失败写日志（`w2m: agent start failed`）。
+- mount 只需要返回清理句柄，不需要"观察启动完成"；agent 会通过 relay 自报在线。
+- 新增回归测试 `test/agent-start-nonblocking.test.mjs`：读取源码，若 `startLocalStack` 再次 await
+  `agent.start()` 即失败（防止该阻塞回归）。
+- 证据：`docs/acceptance/1.6.9/FAILOVER-MONITOR-INSTALL.json`（fleet task `01M5ANYMVMKL55O`）。
 ## [1.6.8] — 2026-10-24
 
 **插件面板新增「检查插件更新」按钮：npm 对比 → 自动更新 → 提示重启 DSH。**
