@@ -1,3 +1,4 @@
+import { FAILOVER_DEFAULTS, createRelayFailover, relayPool } from './relay-failover.mjs';
 import { DEFAULT_BOOTSTRAP_URL, DEFAULT_BOOTSTRAP_OPERATOR_KEY_PEM } from './bootstrap.mjs';
 /**
  * DSH: Windows2MacO - the DSH Cordis plugin.
@@ -88,6 +89,9 @@ import { DEFAULT_BOOTSTRAP_URL, DEFAULT_BOOTSTRAP_OPERATOR_KEY_PEM } from './boo
  * own `dsh-tools`. Anything the shim accepts may still be rejected or reshaped by the real
  * implementation, and vice versa.
  */
+
+/** v1.6.6: last failover snapshot, reported by w2m_status and refreshed by the supervisor interval. */
+let relayFailoverStatus = null;
 
 import { execFile } from 'node:child_process';
 
@@ -2193,6 +2197,8 @@ async function readP2PStatus(cfg, runtime, peersAnnounced = null) {
     local: status?.local ?? null,
     rabbit_url: status?.rabbit_url ?? cfg.rabbitUrl,
       bootstrap: cfg.bootstrap ?? null,
+      // v1.6.6: which relay is in use and why it last moved.
+      failover: relayFailoverStatus,
     // How many machines the relay holds a live announcement for. `w2m_devices` says which machines
     // paired; this says which of them can be punched at, and the two differ constantly.
     peers_announced: peersAnnounced,
@@ -4956,7 +4962,7 @@ export async function apply(ctx, config = {}) {
     // v1.5.3: a failed auto-start must not surface as an unhandled rejection. The bundled patch now
   // starts the agent by default, and a host whose plugin wiring forbids that (a restricted test
   // harness, a missing relay module) would otherwise reject where nothing can catch it.
-  ctx.effect?.(() => startLocalStack(ctx, cfg).catch((error) => {
+  ctx.effect?.(() => startFailoverStack(ctx, cfg).catch((error) => {
     ctx.logger?.warn?.('w2m: auto-start did not complete: ' + (error instanceof Error ? error.message : String(error)));
   }));
   } else {
@@ -7375,6 +7381,70 @@ function sleepWithSignal(ms, signal) {
  */
 const resolvedFleetKey = { value: null, source: null, at: 0 };
 
+/** Probe one relay /healthz; any failure is `false` (a timeout must not throw into the interval). */
+async function probeRelayHealth(url, timeoutMs) {
+  try {
+    const response = await fetch(url + '/healthz', {
+      signal: typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function' ? AbortSignal.timeout(timeoutMs) : undefined,
+    });
+    if (response.ok !== true) return false;
+    const body = await response.json().catch(() => null);
+    return body?.ok === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * v1.6.6: keep the in-process stack on a reachable relay.
+ *
+ * The primary relay can disappear entirely (2026-10-24: its host was down, so 8787 and SSH were both
+ * unreachable). The stack is restartable: stop it, point cfg.rabbitUrl at the next healthy relay in
+ * the pool, start it again. A switch is a re-join, not just a reconnect -- device tokens are relay-
+ * specific, so startLocalStack pairs again through the account fleet key.
+ *
+ * The decision itself (3 failed probes to leave, 5 healthy ones to come home) lives in
+ * relay-failover.mjs and is unit-tested there; this function only supplies health and performs the
+ * restart.
+ */
+async function startFailoverStack(ctx, cfg) {
+  let stop = await startLocalStack(ctx, cfg);
+  const pool = relayPool(cfg);
+  if (pool.length < 2) {
+    relayFailoverStatus = null;
+    return stop;
+  }
+  const failover = createRelayFailover({ pool });
+  relayFailoverStatus = failover.snapshot();
+  let switching = false;
+  const timer = setInterval(async () => {
+    if (switching) return;
+    const health = {};
+    await Promise.all(pool.map(async (url) => { health[url] = await probeRelayHealth(url, FAILOVER_DEFAULTS.probeTimeoutMs); }));
+    const decision = failover.assess(health);
+    relayFailoverStatus = failover.snapshot();
+    if (decision.action !== 'switch') return;
+    switching = true;
+    try {
+      ctx.logger?.warn?.('w2m: relay failover ' + decision.active + ' (' + decision.reason + ')');
+      await stop();
+      cfg.rabbitUrl = decision.target;
+      cfg.relaySource = 'failover';
+      stop = await startLocalStack(ctx, cfg);
+      ctx.logger?.info?.('w2m: relay failover stack restarted on ' + decision.target);
+    } catch (error) {
+      ctx.logger?.warn?.('w2m: relay failover restart failed: ' + (error instanceof Error ? error.message : String(error)));
+    } finally {
+      switching = false;
+    }
+  }, FAILOVER_DEFAULTS.probeIntervalMs);
+  timer.unref?.();
+  return async () => {
+    clearInterval(timer);
+    relayFailoverStatus = null;
+    await stop();
+  };
+}
 async function startLocalStack(ctx, cfg) {
 
   /**

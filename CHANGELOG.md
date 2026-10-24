@@ -7,6 +7,21 @@
 
 All notable changes to this project are documented here.
 
+## [1.6.6] — 2026-10-24
+
+**relay 自动 failover：主 relay 故障时自动切到备用，恢复后自动切回。**
+
+现场事故（2026-10-24）：主 relay 主机整体不可达（8787 与 SSH 22 都超时），备用 relay 一直健康，
+但每台机器仍死连主 relay——备用链路只是常驻成员，不会接管，编队停摆。
+
+- 新增 `src/plugin/relay-failover.mjs`：非对称滞回状态机（**连续 3 次**探测失败才切走，**连续 5 次**
+  健康才切回；没有可达备选则不切）。纯函数，边界可单测。
+- `startLocalStack` 外包一层 `startFailoverStack`：每 10s 探测池内各 relay `/healthz`；
+  决策为切换时，停止当前 in-process stack，把 `cfg.rabbitUrl` 设为备 relay 并重启 stack——
+  **切换是重新入队（fleet key 重新配对），不是重连**（device token 是按 relay 签发的）。
+- `w2m_status` 新增 `failover` 快照：primary/active/pool、失败计数、切换次数、最近切换原因与历史。
+- 测试：relay-failover 5/5、relay 200/200；证据 `docs/acceptance/1.6.6/RELAY-FAILOVER.json`
+  （fleet task `01M5ANYMVM9GEKQ`）。
 ## [1.6.5] — 2026-10-24
 
 **Windows 后台自动化不再弹窗：VBScript 隐藏包装 + 计划任务工具 + 文档。**

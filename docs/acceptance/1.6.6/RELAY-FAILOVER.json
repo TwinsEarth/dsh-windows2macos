@@ -1,0 +1,22 @@
+{
+  "version": "1.6.6",
+  "case": "RELAY-FAILOVER",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-24T10:33:27.234Z",
+  "executor": "lead",
+  "requirement": "when the active relay is unreachable for 3 consecutive probes the plugin moves its in-process stack to the next healthy relay in the pool (re-joining through the fleet key), and returns to the primary after 5 consecutive healthy probes",
+  "task_id": "01M5ANYMVM9GEKQ",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "failover_suite": "5/5 pass",
+      "hysteresis": "3 failures to leave, 5 successes to return",
+      "no_alternative": "stays put",
+      "status": "failover snapshot exposed"
+    }
+  },
+  "note": "suites ran as a real fleet task; live drill follows the release"
+}
