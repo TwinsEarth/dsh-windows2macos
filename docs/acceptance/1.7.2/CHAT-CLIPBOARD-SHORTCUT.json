@@ -1,0 +1,32 @@
+{
+  "version": "1.7.2",
+  "case": "CHAT-CLIPBOARD-SHORTCUT",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-24T18:47:27.925Z",
+  "executor": "lead",
+  "requirement": "user feedback on v1.7.1: the screenshot must copy to the clipboard only (no thumbnail crowding the chat), the shortcut must be Ctrl+Shift+P (plain Ctrl+P printed the page), and the transcript must actually be selectable and copyable inside the DSH host",
+  "task_id": "01M5ANYMVMR3IOB",
+  "result": {
+    "outcome": "ok",
+    "host_capture_smoke": {
+      "platform": "win32",
+      "ok": true,
+      "bytes": 159561,
+      "copied": true,
+      "note": "host-side capture copied the real screen to the Windows clipboard"
+    },
+    "assertions": {
+      "fleet_chat_capture": "3/3 pass",
+      "client_bundle": "26/26 pass",
+      "ui_contract": [
+        "screenshot renders no preview row; feedback is a toast only",
+        "shortcut is Ctrl+Shift+P / Cmd+Shift+P and plain Ctrl+P keeps the print dialog",
+        "user-select:text!important is applied to the whole panel (not just one node)",
+        "the list stops the host from swallowing mousedown/copy so selection survives"
+      ]
+    }
+  }
+}

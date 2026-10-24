@@ -7,6 +7,18 @@
 
 All notable changes to this project are documented here.
 
+## [1.7.2] — 2026-10-25
+
+**按实测反馈调整编队聊天截图/复制：只复制不预览、快捷键 Ctrl+Shift+P、强制可选中。**
+
+- 截图按钮不再在面板里生成缩略图/下载行：抓到画面后**只写入剪贴板**并给一行提示，聊天区域保持干净。
+- 快捷键从 Ctrl+P 改为 **Ctrl+Shift+P（macOS 也支持 Cmd+Shift+P）**；普通 Ctrl+P 不再被劫持，
+  浏览器/应用的打印快捷键恢复原样。
+- 选中&复制：`user-select:text!important` 应用到整个面板的所有子节点（不再只覆盖几个类），
+  并在消息列表上阻止宿主吞掉 mousedown/copy 事件，保证拖选与 Ctrl+C 生效；单条消息的 ⧉ 复制按钮
+  仍走「浏览器剪贴板 → 宿主剪贴板」回退链。
+- 证据：`docs/acceptance/1.7.2/CHAT-CLIPBOARD-SHORTCUT.json`（fleet task `01M5ANYMVMR3IOB`；
+  宿主截图实测 159,561 字节并复制成功）。
 ## [1.7.1] — 2026-10-25
 
 **修复桌面壳下聊天截图/复制失败（permission denied）与插件更新"no supported installer available"。**
