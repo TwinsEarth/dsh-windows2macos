@@ -1,0 +1,21 @@
+{
+  "version": "1.6.3",
+  "case": "ONLINE-FLEETS",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-24T04:34:31.766Z",
+  "executor": "lead",
+  "requirement": "fleets are reported the same way as machines: online fleets / total fleets, beside online/total machines",
+  "task_id": "01M5ANYMVLWMTSG",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "relay_suite": "200/200",
+      "fleet_target": "49/49",
+      "panel_line": "fleetsOnline/fleets · machines online/total"
+    }
+  },
+  "note": "suites ran as a real fleet task"
+}

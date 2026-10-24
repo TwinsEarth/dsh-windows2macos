@@ -3263,6 +3263,9 @@ export class RabbitState {
     const fleets = [...byFleet.values()].sort((a, b) => b.devices - a.devices);
     return {
       fleets_total: fleets.filter((f) => f.fleet_id !== null).length,
+      // v1.6.3: an online fleet is a fleet with at least one online machine. Reported beside
+      // fleets_total so the panel can say "X/Y fleets" the same way it says "M/T machines".
+      fleets_online: fleets.filter((f) => f.fleet_id !== null && f.online > 0).length,
       unfleeted_devices: byFleet.get(null)?.devices ?? 0,
       devices_total: this.devices.size,
       devices_online: online,

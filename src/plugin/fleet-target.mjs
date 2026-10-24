@@ -509,6 +509,7 @@ export async function probeRelays(urls, options = {}) {
         // Counts only: per-fleet membership stays behind the fleet-scoped endpoints.
         stats: {
           fleets_total: Number.isInteger(body.fleets_total) ? body.fleets_total : null,
+          fleets_online: Number.isInteger(body.fleets_online) ? body.fleets_online : null,
           devices_online: Number.isInteger(body.devices_online) ? body.devices_online : null,
           devices_total: Number.isInteger(body.devices_total) ? body.devices_total : null,
         },

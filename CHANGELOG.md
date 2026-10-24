@@ -7,6 +7,15 @@
 
 All notable changes to this project are documented here.
 
+## [1.6.3] — 2026-10-24
+
+**编队与机器同构显示：在线编队数/编队总数 + 在线机器/机器总数。**
+
+- relay `fleetSummary()` 新增 `fleets_online`（至少一台机器在线的编队数），`/healthz` 公开计数同步增加；
+- 面板 relay 区显示：`全服：X/Y 个编队 · M/T 台在线`（fleet-target probe 读取 `fleets_online`）；
+- relay 主机升级到 1.6.3（含 1.6.2 全服概览与 1.6.1 安全修复）。
+- 测试：relay 200/200、fleet-target 49/49、client-bundle 26/26；证据
+  `docs/acceptance/1.6.3/ONLINE-FLEETS.json`（fleet task `01M5ANYMVLWMTSG`）。
 ## [1.6.2] — 2026-10-24
 
 **relay 全服概览：多少个编队、多少台机器在线（healthz + operator /v1/fleets + 面板一行显示）。**
