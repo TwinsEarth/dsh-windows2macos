@@ -26,7 +26,11 @@
         "shortcut is Ctrl+Shift+P / Cmd+Shift+P and plain Ctrl+P keeps the print dialog",
         "user-select:text!important is applied to the whole panel (not just one node)",
         "the list stops the host from swallowing mousedown/copy so selection survives"
-      ]
+      ],
+      "count_source": "whole-server totals come from the configured primary relay only; when it is unreachable the panel says unavailable instead of showing the backup relay numbers"
     }
-  }
+  },
+  "fixes": [
+    "fleet-target: server stats chosen by configured rabbitUrl, not by first reachable relay; buildUiState exposes server_url/server_reachable; client renders unavailable"
+  ]
 }

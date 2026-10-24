@@ -585,6 +585,9 @@ export function buildUiState(deps) {
           temporary: relays.temporary === true,
           // v1.6.2: whole-relay overview (fleets + online machines) for the panel header line.
           server: relays.server ?? null,
+          // v1.7.2: only the configured primary's totals; null means "unavailable", never the backup's.
+          server_url: relays.server_url ?? null,
+          server_reachable: relays.server_reachable !== false,
         },
   };
 }
@@ -807,10 +810,25 @@ function mountTargetRoutes(connection, deps, status, logger) {
       return { ...item, role: reachableSeen === 1 ? 'primary' : 'standby' };
     });
     const folded = foldRelayItems(items, 3);
-    // v1.6.2: the primary relay's own view of the whole server, if it reported one.
-    const primaryStats = items.find((item) => item.ok === true)?.stats ?? null;
-    // v1.5.2: a fallback list is marked so the panel can render it in red, not as a settled config.
-    const withMark = { ...folded, temporary: deps.cfg()?.relayTemporary === true, server: primaryStats };
+    // v1.7.2: whole-server totals come from the CONFIGURED primary relay only. v1.6.2 used "the first
+    // relay that answered", so when the primary was unreachable the panel showed the BACKUP relay's
+    // numbers (1/1 fleets, 2/5 machines) under the "whole server" label -- visibly wrong. An
+    // unreachable primary reports `server: null` + `server_reachable: false`, and the panel says the
+    // totals are unavailable instead of presenting another relay's fleet as the server's.
+    const normalize = (value) => (typeof value === 'string' ? value.trim().replace(/\/+$/, '') : null);
+    const configuredPrimary = normalize(deps.cfg()?.rabbitUrl) ?? normalize(urls[0]);
+    const primaryItem = configuredPrimary === null
+      ? items.find((item) => item.ok === true) ?? null
+      : items.find((item) => normalize(item.url) === configuredPrimary) ?? null;
+    const serverReachable = primaryItem?.ok === true;
+    const primaryStats = serverReachable ? primaryItem.stats : null;
+    const withMark = {
+      ...folded,
+      temporary: deps.cfg()?.relayTemporary === true,
+      server: primaryStats,
+      server_url: configuredPrimary ?? primaryItem?.url ?? null,
+      server_reachable: serverReachable,
+    };
     relayCache = { at: now, value: withMark };
     return withMark;
   };

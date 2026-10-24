@@ -1004,6 +1004,23 @@ describe('relay pool folding (v1.5.1)', () => {
     assert.equal(folded.online, 4);
   });
 
+  it('does not present another relay as the whole-server overview (v1.7.2)', () => {
+    const state = buildUiState({
+      store: { get: () => null },
+      sessionId: 's',
+      fleet: { ok: true, error: null, machines: [], online: 0, total: 0, rabbit_time: null, excluded: 0 },
+      relays: {
+        total: 2, online: 1, hidden_count: 0, shown: [], hidden: [], temporary: false,
+        // The primary was unreachable, so the host refuses to hand over backup totals.
+        server: null,
+        server_url: 'http://primary:8787',
+        server_reachable: false,
+      },
+    });
+    assert.equal(state.relays.server, null);
+    assert.equal(state.relays.server_reachable, false);
+    assert.equal(state.relays.server_url, 'http://primary:8787');
+  });
   it('probes relays and puts the fastest reachable first, keeping failures visible', async () => {
     const fetchImpl = async (url) => {
       if (url.includes('a:1')) { await new Promise((r) => setTimeout(r, 15)); return Response.json({ ok: true, relay_id: 'A' }); }

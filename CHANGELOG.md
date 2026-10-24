@@ -17,6 +17,8 @@ All notable changes to this project are documented here.
 - 选中&复制：`user-select:text!important` 应用到整个面板的所有子节点（不再只覆盖几个类），
   并在消息列表上阻止宿主吞掉 mousedown/copy 事件，保证拖选与 Ctrl+C 生效；单条消息的 ⧉ 复制按钮
   仍走「浏览器剪贴板 → 宿主剪贴板」回退链。
+- 全服统计只认**配置的主 relay**：主 relay 不可达时不再把备用 relay 的数字（1/1 编队、2/5 在线）当"全服"显示，
+  而是显示「主 relay 不可达 · 全服统计不可用」。修复了在线编队/在线机器数量"错误"的观感来源。
 - 证据：`docs/acceptance/1.7.2/CHAT-CLIPBOARD-SHORTCUT.json`（fleet task `01M5ANYMVMR3IOB`；
   宿主截图实测 159,561 字节并复制成功）。
 ## [1.7.1] — 2026-10-25
