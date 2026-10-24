@@ -7,6 +7,21 @@
 
 All notable changes to this project are documented here.
 
+## [1.6.7] — 2026-10-24
+
+**修复 v1.6.6 failover 的阻塞 bug：远端 relay 模式下清理函数抛错，切换后无法重启 stack。**
+
+现场演练（停主 relay 180s）暴露：机器掉线后没有切到备用，恢复主 relay 后才重新上线。根因：
+
+- `startLocalStack` 的清理函数无条件执行 `await relay.close()`；而 `relay` 只在"本进程自建本地 relay"
+  时才非空，远端 relay 模式下是 `null` → 抛 TypeError；
+- failover 的切换流程 `await stop()` 抛错后被 catch 吞掉，**后续的 restart 从未执行**（stack 停了没起来）。
+
+修复：
+- 清理函数 null-safe/idempotent：仅当 `relay` 是带 `close()` 的对象才调用；`agent.stop()` 失败也继续清理。
+- 切换流程：`stop()` 失败不再跳过 restart；并写诊断日志 `xclient/relay-failover.log`（每轮探测/切换/重启错误）。
+- 测试：relay-failover 5/5、relay 200/200；证据 `docs/acceptance/1.6.7/FAILOVER-CLEANUP-FIX.json`
+  （fleet task `01M5ANYMVMFSSP3`）。
 ## [1.6.6] — 2026-10-24
 
 **relay 自动 failover：主 relay 故障时自动切到备用，恢复后自动切回。**

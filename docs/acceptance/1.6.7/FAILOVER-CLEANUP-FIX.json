@@ -1,0 +1,22 @@
+{
+  "version": "1.6.7",
+  "case": "FAILOVER-CLEANUP-FIX",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-24T13:31:02.803Z",
+  "executor": "lead",
+  "requirement": "a remote-relay in-process stack can be stopped and restarted for failover: the cleanup must not assume a local relay object, a failed stop must not skip the restart, and the switch must leave a diagnostics log",
+  "task_id": "01M5ANYMVMFSSP3",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "failover_suite": "5/5",
+      "relay_suite": "200/200",
+      "cleanup": "null-safe and idempotent",
+      "diagnostics": "xclient/relay-failover.log"
+    }
+  },
+  "note": "v1.6.6 field drill stopped the stack and never restarted it: relay.close() threw on remote-relay stacks"
+}

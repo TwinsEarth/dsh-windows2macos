@@ -7407,6 +7407,19 @@ async function probeRelayHealth(url, timeoutMs) {
  * relay-failover.mjs and is unit-tested there; this function only supplies health and performs the
  * restart.
  */
+/** Append one line to the failover diagnostics log; failures are swallowed (diagnostics must not break the switch). */
+async function appendFailoverLog(cfg, line) {
+  try {
+    const { appendFileSync, mkdirSync, statSync, writeFileSync } = await import('node:fs');
+    const { join, dirname } = await import('node:path');
+    const { homedir } = await import('node:os');
+    const dir = cfg.stateDir ?? join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'xclient');
+    const file = join(dir, 'relay-failover.log');
+    mkdirSync(dirname(file), { recursive: true });
+    try { if (statSync(file).size > 256 * 1024) writeFileSync(file, ''); } catch { /* absent is fine */ }
+    appendFileSync(file, new Date().toISOString() + ' ' + line + '\n');
+  } catch { /* diagnostics only */ }
+}
 async function startFailoverStack(ctx, cfg) {
   let stop = await startLocalStack(ctx, cfg);
   const pool = relayPool(cfg);
@@ -7422,6 +7435,7 @@ async function startFailoverStack(ctx, cfg) {
     const health = {};
     await Promise.all(pool.map(async (url) => { health[url] = await probeRelayHealth(url, FAILOVER_DEFAULTS.probeTimeoutMs); }));
     const decision = failover.assess(health);
+    await appendFailoverLog(cfg, 'probe ' + JSON.stringify(health) + ' -> ' + decision.action + (decision.target ? ' ' + decision.target : ''));
     relayFailoverStatus = failover.snapshot();
     if (decision.action !== 'switch') return;
     switching = true;
@@ -8077,7 +8091,14 @@ async function startLocalStack(ctx, cfg) {
     ensureFleetJoin = null;
     inProcessAgentStatus = null;
     await agent.stop();
-    await relay.close();
+    // v1.6.7: `relay` is only a real relay object when THIS stack started a local relay; a remote-
+    // relay stack has null here. The unconditional close() threw, which is what made the first
+    // failover attempt stop the stack and never restart it.
+    if (relay !== null && typeof relay.close === 'function') {
+      try { await relay.close(); } catch (error) {
+        ctx.logger?.warn?.('w2m: local relay close failed: ' + (error instanceof Error ? error.message : String(error)));
+      }
+    }
   };
 }
 
