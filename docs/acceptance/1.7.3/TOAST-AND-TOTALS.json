@@ -1,0 +1,29 @@
+{
+  "version": "1.7.3",
+  "case": "TOAST-AND-TOTALS",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-24T19:25:35.677Z",
+  "executor": "lead",
+  "requirement": "screenshot feedback must not squeeze the compose box or stay forever: a top overlay that dismisses after 5s and can be closed; whole-server totals must name the relay they came from and not impersonate our fleet",
+  "task_id": "01M5ANYMVMSGGQV",
+  "result": {
+    "outcome": "ok",
+    "host_capture_smoke": {
+      "platform": "win32",
+      "ok": true,
+      "bytes": 141768,
+      "copied": true
+    },
+    "assertions": {
+      "fleet_chat_capture": "3/3 pass",
+      "client_bundle": "26/26 pass",
+      "fleet_target": "76/76 pass",
+      "toast": "absolute overlay inside the panel (no layout shift), 5s timer, close button",
+      "totals": "labelled \"primary relay (<url>)\"; separate \"this fleet: n/m online\" line",
+      "roles": "primary role follows the configured rabbitUrl, not the fastest response"
+    }
+  }
+}

@@ -801,22 +801,24 @@ function mountTargetRoutes(connection, deps, status, logger) {
       return null;
     }
     const probed = await probeRelays(urls);
-    // The fold's primary is the fastest reachable node; every other reachable node is standby, and
-    // an unreachable one keeps its place at the end as `offline` rather than disappearing.
-    let reachableSeen = 0;
-    const items = probed.map((item) => {
-      if (item.ok !== true) return { ...item, role: 'offline' };
-      reachableSeen += 1;
-      return { ...item, role: reachableSeen === 1 ? 'primary' : 'standby' };
-    });
+    // v1.7.3: the role follows the CONFIGURED primary relay, not whichever relay answered fastest.
+    // Ranking by latency let the backup masquerade as primary whenever it was quicker -- the panel then
+    // explained one relay while showing another relay's whole-server numbers.
+    const normalize = (value) => (typeof value === 'string' ? value.trim().replace(/\/+$/, '') : null);
+    const configuredPrimary = normalize(deps.cfg()?.rabbitUrl) ?? normalize(urls[0]);
+    const ordered = [...probed];
+    const primaryIndex = ordered.findIndex((item) => normalize(item.url) === configuredPrimary);
+    if (primaryIndex > 0) ordered.unshift(...ordered.splice(primaryIndex, 1));
+    const items = ordered.map((item) => ({
+      ...item,
+      role: item.ok !== true ? 'offline' : (normalize(item.url) === configuredPrimary ? 'primary' : 'standby'),
+    }));
     const folded = foldRelayItems(items, 3);
     // v1.7.2: whole-server totals come from the CONFIGURED primary relay only. v1.6.2 used "the first
     // relay that answered", so when the primary was unreachable the panel showed the BACKUP relay's
     // numbers (1/1 fleets, 2/5 machines) under the "whole server" label -- visibly wrong. An
     // unreachable primary reports `server: null` + `server_reachable: false`, and the panel says the
     // totals are unavailable instead of presenting another relay's fleet as the server's.
-    const normalize = (value) => (typeof value === 'string' ? value.trim().replace(/\/+$/, '') : null);
-    const configuredPrimary = normalize(deps.cfg()?.rabbitUrl) ?? normalize(urls[0]);
     const primaryItem = configuredPrimary === null
       ? items.find((item) => item.ok === true) ?? null
       : items.find((item) => normalize(item.url) === configuredPrimary) ?? null;
