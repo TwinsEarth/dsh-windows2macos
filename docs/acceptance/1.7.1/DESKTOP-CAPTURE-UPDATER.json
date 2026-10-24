@@ -1,0 +1,35 @@
+{
+  "version": "1.7.1",
+  "case": "DESKTOP-CAPTURE-UPDATER",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-24T17:01:53.420Z",
+  "executor": "lead",
+  "requirement": "on the DSH desktop shell, where the renderer denies getDisplayMedia (permission denied) and clipboard writes, the chat screenshot button and Ctrl+P still capture through the HOST, copy works through the host clipboard, and the plugin update button finds a supported installer",
+  "task_id": "01M5ANYMVMN9CNQ",
+  "result": {
+    "outcome": "ok",
+    "host_capture_smoke": {
+      "platform": "win32",
+      "ok": true,
+      "bytes": 150903,
+      "copied": true,
+      "note": "captured the real screen through PowerShell (System.Drawing) and put it on the Windows clipboard"
+    },
+    "assertions": {
+      "capture_route_tests": "4/4 pass",
+      "fleet_chat_capture": "3/3 pass",
+      "client_bundle": "26/26 pass",
+      "updater_resolver": "4/4 pass"
+    },
+    "fixes": [
+      "POST /api/w2m/capture: host-side PowerShell/macOS/Linux screenshot; returns JPEG base64 and copies on the host",
+      "POST /api/w2m/clipboard: host-side text clipboard, used when navigator.clipboard is denied",
+      "client falls back from getDisplayMedia -> host capture, and copies text through host when the renderer denies it",
+      "user-select:text!important so the transcript stays selectable under host CSS",
+      "update installer discovery: desktop resources runtime + per-user dsh-runtimes; runtime node instead of the app executable"
+    ]
+  }
+}

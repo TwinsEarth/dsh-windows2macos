@@ -7,6 +7,23 @@
 
 All notable changes to this project are documented here.
 
+## [1.7.1] — 2026-10-25
+
+**修复桌面壳下聊天截图/复制失败（permission denied）与插件更新"no supported installer available"。**
+
+- 截图：浏览器 `getDisplayMedia` 在 DSH 桌面（Electron）被拒绝（`permission denied`）。新增**宿主侧截图**
+  `POST /api/w2m/capture`（Windows PowerShell System.Drawing；macOS screencapture；返回 JPEG base64），
+  按钮与 Ctrl+P 在渲染层捕获失败时自动回退到宿主截图，并在宿主侧复制到剪贴板。
+- 复制：`navigator.clipboard` 被拒时新增**宿主剪贴板** `POST /api/w2m/clipboard`（Windows Set-Clipboard /
+  macOS osascript），单条消息复制按钮与复制文本都走这条回退链。
+- 选中：transcript 的 `user-select:text` 改为 `!important`，避免宿主全局样式覆盖导致无法选中。
+- 插件更新：`update-install` 的安装器解析新增桌面运行时布局
+  （`<app>/resources/runtime/<runtime>/dependencies/pnpm/bin/pnpm.mjs`、`~/.dsh/dsh-runtimes` 兜底），
+  并用运行时自带的 `node` 执行 pnpm（桌面壳的 `process.execPath` 不是 Node）。修复了更新按钮
+  "install update: no supported installer available"。
+
+- 测试：capture-route 4/4、fleet-chat-capture 3/3、client-bundle 26/26、update-resolver 4/4；
+  证据 `docs/acceptance/1.7.1/DESKTOP-CAPTURE-UPDATER.json`（fleet task `01M5ANYMVMN9CNQ`）。
 ## [1.7.0] — 2026-10-25
 
 **编队聊天框：截图按钮 + Ctrl+P 快捷键 + 对话内容可选中&复制。**

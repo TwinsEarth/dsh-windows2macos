@@ -488,7 +488,10 @@ async function relayFetch(relay, token, method, pathname, body) {
 }
 
 /** Poll `pred` until it holds, or fail with `why`. */
-async function waitFor(pred, why, timeoutMs = 8000) {
+// v1.7.1: raised from 8s. The full suite runs ~150 test files concurrently, and the direct-path
+// punch test was observed timing out at the 8s mark while passing in isolation; 15s keeps the same
+// assertion without turning scheduler load into a false failure.
+async function waitFor(pred, why, timeoutMs = 15000) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     if (await pred()) return true;

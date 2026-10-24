@@ -861,7 +861,8 @@ describe('fleet-target: the selection routes w2m_run', () => {
     try {
       const { tools, routes } = await register(await runConfig(), { withRoutes: true });
       // v1.6.8 adds the plugin-update route to the same registry.
-        assert.equal(routes.length, 5, 'the control is mounted as its routes (target, chat GET/POST, task board, execution capability, plugin update)');
+        // v1.7.1 adds the host capture + host clipboard fallbacks to the same registry.
+        assert.equal(routes.length, 7, 'the control is mounted as its routes (target, chat GET/POST, task board, execution capability, plugin update, host capture, host clipboard)');
       const value = JSON.parse(await tools.get('w2m_status').execute({}, {}));
       assert.equal(value.target_selection.attached, true);
       assert.equal(value.target_selection.route, TARGET_ROUTE_PATH);

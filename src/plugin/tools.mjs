@@ -191,6 +191,7 @@ import {
 import { registerChatRoutes } from './fleet-chat-route.mjs';
 import { registerExecCapabilityRoutes } from './exec-capability-route.mjs';
 import { registerPluginUpdateRoutes } from './update-route.mjs';
+import { registerCaptureRoutes } from './capture-route.mjs';
 import { defaultExecCapabilityFile } from '../util/exec-capability.mjs';
 import { createFleetCouncil, fleetCouncilThread } from './council-fleet.mjs';
 import { renderMemoryView } from './memory-view.mjs';
@@ -3517,6 +3518,11 @@ export async function apply(ctx, config = {}) {
   // v1.6.8: the plugin panel's "更新" button: GET checks npm latest, POST installs through the
   // verified updater (SHA-256 checked, old package backed up, restart required afterwards).
   const _updateRoutes = registerPluginUpdateRoutes(ctx, { profileDir: () => cfg.profileDir });
+
+  // v1.7.1: host-side screenshot + clipboard fallbacks. The DSH desktop shell does not grant the
+  // renderer getDisplayMedia/navigator.clipboard, so the chat panel needs a host route that does not
+  // depend on those permissions.
+  registerCaptureRoutes(ctx);
   if (capabilityRoutes.mounted !== true) {
     ctx.logger?.warn?.('w2m: the execution-capability control is inactive — ' + capabilityRoutes.reason);
   }

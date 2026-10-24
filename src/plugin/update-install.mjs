@@ -68,7 +68,7 @@ import {
   statSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { gunzipSync } from 'node:zlib';
 
 /** How much of the installer's stderr is preserved when it fails. */
@@ -225,19 +225,73 @@ export function resolveDshPath(env = process.env) {
  * @param {Record<string,string|undefined>} [env]
  * @returns {string|null}
  */
+
+/**
+ * Roots that may hold a DSH runtime with its own pnpm.
+ *
+ * v1.7.1: the desktop app does not ship the CLI layout (`<DSH_HOME>/dsh-runtimes`); it bundles the
+ * runtime at `<app>/resources/runtime/<runtime>/dependencies/pnpm/bin/pnpm.mjs`. The v1.6.8 update
+ * button reported "no supported installer available" on every desktop install because only the
+ * CLI layout was searched. Both layouts are roots here, and the caller iterates their children.
+ *
+ * @param {{env?: NodeJS.ProcessEnv, execPath?: string, resourcesPath?: string}} [input]
+ * @returns {string[]}
+ */
+export function runtimeCandidates(input = {}) {
+  const env = input.env ?? process.env;
+  const execPath = input.execPath ?? process.execPath;
+  const resourcesPath = input.resourcesPath ?? process.resourcesPath;
+  const roots = [];
+  if (typeof env.W2M_RUNTIME_ROOT === 'string' && env.W2M_RUNTIME_ROOT.trim() !== '') roots.push(env.W2M_RUNTIME_ROOT.trim());
+  if (typeof resourcesPath === 'string' && resourcesPath !== '') roots.push(join(resourcesPath, 'runtime'));
+  try {
+    // Only the desktop app layout has `resources/` next to the executable; plain Node does not.
+    if (existsSync(join(dirname(execPath), 'resources'))) roots.push(join(dirname(execPath), 'resources', 'runtime'));
+  } catch { /* execPath is not a normal path */ }
+  roots.push(join(dshHome(env), 'dsh-runtimes'));
+  // The desktop shell may rewrite DSH_HOME; the per-user runtime directory is still the real one.
+  roots.push(join(homedir(), '.dsh', 'dsh-runtimes'));
+  return [...new Set(roots)];
+}
+
+/**
+ * The runtime layout puts pnpm under `<root>/<runtime>/dependencies/pnpm/bin/pnpm.mjs`; the CLI layout
+ * is the same but its root already ends with `dsh-runtimes`. Both shapes are scanned.
+ *
+ * @param {string[]} roots
+ * @returns {string[]}
+ */
+function pnpmCandidates(roots) {
+  const candidates = [];
+  for (const root of roots) {
+    candidates.push(join(root, 'dependencies', 'pnpm', 'bin', 'pnpm.mjs'));
+    let entries = [];
+    try { entries = readdirSync(root); } catch { continue; }
+    for (const entry of entries) candidates.push(join(root, entry, 'dependencies', 'pnpm', 'bin', 'pnpm.mjs'));
+  }
+  return candidates;
+}
+
+/** Locate the runtime's own Node executable (the desktop app's executable is not Node). */
+export function resolveRuntimeNode(env = process.env) {
+  const explicit = env.W2M_NODE && env.W2M_NODE.trim() !== '' ? env.W2M_NODE.trim() : null;
+  if (explicit) return existsSync(explicit) ? explicit : null;
+  const names = process.platform === 'win32' ? ['node.exe'] : ['node'];
+  for (const root of runtimeCandidates({ env })) {
+    for (const entry of (() => { try { return readdirSync(root); } catch { return []; } })()) {
+      for (const name of names) {
+        const candidate = join(root, entry, 'dependencies', 'node', 'bin', name);
+        if (existsSync(candidate)) return candidate;
+      }
+    }
+  }
+  return null;
+}
 export function resolveRuntimePnpm(env = process.env) {
   const explicit = env.W2M_PNPM && env.W2M_PNPM.trim() !== '' ? env.W2M_PNPM.trim() : null;
   if (explicit) return existsSync(explicit) ? explicit : null;
 
-  const runtimesDir = join(dshHome(env), 'dsh-runtimes');
-  let runtimes;
-  try {
-    runtimes = readdirSync(runtimesDir);
-  } catch {
-    return null;
-  }
-  for (const runtime of runtimes) {
-    const candidate = join(runtimesDir, runtime, 'dependencies', 'pnpm', 'bin', 'pnpm.mjs');
+  for (const candidate of pnpmCandidates(runtimeCandidates({ env }))) {
     if (existsSync(candidate)) return candidate;
   }
   return null;
@@ -449,7 +503,8 @@ export async function installUpdate(options = {}) {
   const stagedTarball = join(stagingDir, basename(tarballPath));
   const dshPath = options.dshPath !== undefined ? options.dshPath : resolveDshPath();
   const pnpmPath = options.pnpmPath !== undefined ? options.pnpmPath : resolveRuntimePnpm();
-  const nodePath = options.nodePath ?? process.execPath;
+  // v1.7.1: in the desktop shell `process.execPath` is the app, not Node; pnpm.mjs cannot run on it.
+    const nodePath = options.nodePath ?? resolveRuntimeNode() ?? process.execPath;
   const runner = options.runner ?? createChildProcessRunner(options.runnerOptions);
 
   // ---- 1. verify --------------------------------------------------------
