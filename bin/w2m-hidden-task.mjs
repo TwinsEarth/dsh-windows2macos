@@ -50,7 +50,6 @@ export function parseHiddenTaskArgs(argv) {
   if (out.name === null || out.command === null || out.everyMinutes === null) {
     throw new Error('--name, --command and --every-minutes are required');
   }
-  if (process.platform !== 'win32') throw new Error('hidden scheduled tasks are a Windows feature');
   if (out.vbsPath === null) {
     const safe = String(out.name).replace(/[^A-Za-z0-9._-]/g, '_');
     out.vbsPath = join(os.homedir(), '.dsh', 'xclient', `${safe}-hidden.vbs`);
@@ -80,6 +79,7 @@ async function main() {
     }
     return;
   }
+  if (process.platform !== 'win32') throw new Error('hidden scheduled tasks are a Windows feature');
   mkdirSync(dirname(args.vbsPath), { recursive: true });
   writeFileSync(args.vbsPath, buildHiddenWrapper({ command: args.command, args: args.args, workingDirectory: args.workdir }), 'utf8');
   const taskArgs = hiddenTaskArgs({ taskName: args.name, everyMinutes: args.everyMinutes, vbsPath: args.vbsPath });

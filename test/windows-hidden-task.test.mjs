@@ -59,6 +59,9 @@ describe('windows hidden background tasks (v1.6.5)', () => {
     assert.equal(parsed.command, 'node.exe');
     assert.deepEqual(parsed.args, ['a.mjs', 'b']);
     assert.throws(() => parseHiddenTaskArgs(['--name', 'k']), /required/);
+    // Parsing is platform-independent (the Windows check lives in the scheduling action), so this
+    // suite can run on the Linux release runner too.
+    assert.equal(typeof parseHiddenTaskArgs(['--name', 'k2', '--every-minutes', '5', '--command', 'node.exe']).vbsPath, 'string');
     assert.throws(() => parseHiddenTaskArgs(['--delete', '--name', '']), /--name/);
     assert.throws(() => parseHiddenTaskArgs(['--nope', '1']), /unknown flag/);
   });
