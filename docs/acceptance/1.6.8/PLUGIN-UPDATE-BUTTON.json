@@ -1,0 +1,22 @@
+{
+  "version": "1.6.8",
+  "case": "PLUGIN-UPDATE-BUTTON",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-24T14:39:54.191Z",
+  "executor": "lead",
+  "requirement": "the plugin panel offers one update button: it checks npm for a newer version, installs it through the verified updater (SHA-256 checked, old package backed up), and tells the user to restart DSH",
+  "task_id": "01M5ANYMVMI9EHA",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "npm_update_suite": "4/4 pass",
+      "check": "only latest > installed",
+      "apply": "delegated to auto-update.mjs verified installer",
+      "restart_required": "true after install"
+    }
+  },
+  "note": "button lives in the w2m plugin panel; the DSH plugin-manager page is host UI packaged in app.asar and not editable by a plugin package"
+}

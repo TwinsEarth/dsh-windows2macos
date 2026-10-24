@@ -7,6 +7,20 @@
 
 All notable changes to this project are documented here.
 
+## [1.6.8] — 2026-10-24
+
+**插件面板新增「检查插件更新」按钮：npm 对比 → 自动更新 → 提示重启 DSH。**
+
+- 客户端：目标机器菜单 relay 区新增按钮。点击后：① GET `/api/w2m/plugin-update` 联网查 npm latest
+  并与已装版本比较；② 有新版时 POST `{action:"apply"}` 执行安装；③ 安装完成显示"请重启 DSH 以载入最新插件"。
+- 宿主：新增路由 `/api/w2m/plugin-update`。检查逻辑在 `src/plugin/npm-update.mjs`（纯函数，可单测：只认
+  `latest > installed`，网络失败是错误值而不是"已最新"）。
+- 安装复用**既有已验证更新器**（`auto-update.mjs` → `update-install.mjs`）：下载 tarball、用 release
+  SHA256SUMS 校验 SHA-256、备份旧包、替换新版——按钮点击不会引入第二套弱校验安装路径。
+- 测试：npm-update 4/4、client-bundle 26/26；证据 `docs/acceptance/1.6.8/PLUGIN-UPDATE-BUTTON.json`
+  （fleet task `01M5ANYMVMI9EHA`）。
+- 边界：DSH 插件管理页的「卸载」按钮属于宿主应用（打包在 app.asar 内），插件包无法直接注入其旁边；
+  本按钮位于 w2m 插件自己的面板中。若要放进宿主插件页，需要 DSH 侧提供插件动作扩展点（已列为待评估）。
 ## [1.6.7] — 2026-10-24
 
 **修复 v1.6.6 failover 的阻塞 bug：远端 relay 模式下清理函数抛错，切换后无法重启 stack。**

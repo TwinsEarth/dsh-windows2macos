@@ -190,6 +190,7 @@ import {
 // `w2m_chat` tool shipped first; this is the browser-facing half that was still missing.
 import { registerChatRoutes } from './fleet-chat-route.mjs';
 import { registerExecCapabilityRoutes } from './exec-capability-route.mjs';
+import { registerPluginUpdateRoutes } from './update-route.mjs';
 import { defaultExecCapabilityFile } from '../util/exec-capability.mjs';
 import { createFleetCouncil, fleetCouncilThread } from './council-fleet.mjs';
 import { renderMemoryView } from './memory-view.mjs';
@@ -3513,6 +3514,9 @@ export async function apply(ctx, config = {}) {
   const capabilityRoutes = registerExecCapabilityRoutes(ctx, {
     capabilityFile: () => defaultExecCapabilityFile(),
   });
+  // v1.6.8: the plugin panel's "更新" button: GET checks npm latest, POST installs through the
+  // verified updater (SHA-256 checked, old package backed up, restart required afterwards).
+  const _updateRoutes = registerPluginUpdateRoutes(ctx, { profileDir: () => cfg.profileDir });
   if (capabilityRoutes.mounted !== true) {
     ctx.logger?.warn?.('w2m: the execution-capability control is inactive — ' + capabilityRoutes.reason);
   }
