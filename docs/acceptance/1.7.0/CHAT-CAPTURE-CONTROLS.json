@@ -1,0 +1,23 @@
+{
+  "version": "1.7.0",
+  "case": "CHAT-CAPTURE-CONTROLS",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-24T16:20:22.367Z",
+  "executor": "lead",
+  "requirement": "the fleet-chat panel offers a screenshot button and Ctrl+P (Cmd+P) capture, and the transcript is selectable and copyable",
+  "task_id": "01M5ANYMVMLRC5H",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "fleet_chat_capture": "3/3 pass",
+      "client_bundle": "26/26 pass",
+      "shortcut": "Ctrl+P/Cmd+P registered in capture phase and prevents the print dialog",
+      "selection": "user-select:text on transcript, click-to-reply suppressed while text is selected",
+      "screenshot": "getDisplayMedia -> PNG -> clipboard + preview/download",
+      "limitation": "the relay chat payload is text-only, so an image is not broadcast as a message; it is copied and previewed locally"
+    }
+  }
+}

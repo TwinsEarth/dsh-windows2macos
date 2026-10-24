@@ -7,6 +7,22 @@
 
 All notable changes to this project are documented here.
 
+## [1.7.0] — 2026-10-25
+
+**编队聊天框：截图按钮 + Ctrl+P 快捷键 + 对话内容可选中&复制。**
+
+- 输入区新增 **📷 截图按钮**：`getDisplayMedia` 让用户选屏幕/窗口 → 抓帧为 PNG → 自动复制到剪贴板，
+  面板内显示缩略预览（可下载/再次复制）；宿主不支持或权限被拒时在面板内显示原因，不抛未处理异常。
+- **Ctrl+P（macOS 也支持 Cmd+P）**：聊天面板打开时触发同一截图流程，并在捕获阶段 `preventDefault`，
+  不会弹出浏览器打印对话框。
+- **对话内容可选中&复制**：transcript/消息文本 `user-select:text`；每条消息新增 **⧉ 复制** 按钮；
+  划选文字时点击消息不会误触发"回复"。
+
+已知边界：编队聊天协议仍是纯文本（relay 消息不含图片字段），所以截图是"复制到剪贴板 + 预览/下载"，
+不会作为图片消息广播给其他机器——图片传输需要扩展 relay 消息协议（后续版本）。
+
+- 测试：`test/fleet-chat-capture.test.mjs` 3/3；client-bundle 26/26；
+  证据 `docs/acceptance/1.7.0/CHAT-CAPTURE-CONTROLS.json`（fleet task `01M5ANYMVMLRC5H`）。
 ## [1.6.9] — 2026-10-24
 
 **修复 failover 监控从未安装的根因：`startLocalStack` 等待了永不 settle 的 `agent.start()`。**
