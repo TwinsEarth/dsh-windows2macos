@@ -1,0 +1,21 @@
+{
+  "version": "1.6.5",
+  "case": "HIDDEN-BACKGROUND-TASKS",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-24T07:33:03.150Z",
+  "executor": "lead",
+  "requirement": "Windows background automation never creates a console window: tasks run through a VBScript wrapper with window style 0, and the helper refuses incomplete input",
+  "task_id": "01M5ANYMVM30H98",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "hidden_task_suite": "5/5 pass",
+      "wrapper": "Run(...,0,False)",
+      "task_line": "wscript.exe //B"
+    }
+  },
+  "note": "field symptom: a 2-minute keeper and a 5-minute watcher produced recurring console windows"
+}

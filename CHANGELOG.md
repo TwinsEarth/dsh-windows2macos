@@ -7,6 +7,20 @@
 
 All notable changes to this project are documented here.
 
+## [1.6.5] — 2026-10-24
+
+**Windows 后台自动化不再弹窗：VBScript 隐藏包装 + 计划任务工具 + 文档。**
+
+现场故障：给 standby 守护（每 2 分钟）和 TwinsEarth 守望（每 5 分钟）用 `schtasks /TR "node.exe ..."`
+注册任务，导致桌面每隔几分钟弹出一个控制台窗口（守望脚本还会累积进程）。
+
+- 新增 `src/util/windows-hidden-task.mjs`：纯函数构造 VBScript 包装（`WScript.Shell.Run` 窗口样式 0、
+  不等待）与 `schtasks` 参数；命令行/参数先按 Windows 规则引用，再整体做一次 VBScript 转义（避免二次转义）。
+- 新增 `bin/w2m-hidden-task.mjs`：`--name/--every-minutes/--command/--arg/--workdir/--delete`，
+  一条命令注册“无窗口”计划任务。
+- 新增 `docs/WINDOWS-BACKGROUND-TASKS.md`：故障原因、正确做法、原则（分钟级任务只放短检查；一次性任务用完即删）。
+- 测试：windows-hidden-task 5/5（含转义与参数校验）；证据
+  `docs/acceptance/1.6.5/HIDDEN-BACKGROUND-TASKS.json`（fleet task `01M5ANYMVM30H98`）。
 ## [1.6.4] — 2026-10-24
 
 **修复：`/healthz` 漏发 `fleets_online`（1.6.3 的 `fleetSummary` 已计算，但 `stats()` 没带到公开字段）。**
