@@ -1,0 +1,25 @@
+{
+  "version": "1.7.6",
+  "case": "AUDIT-ZERO-RESIDUE",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-25T15:54:39.817Z",
+  "executor": "lead",
+  "task_id": "local-audit-20261025155439",
+  "requirement": "the test suite leaves no w2m/gpw fixture directories behind, the v1.6.1-v1.7.4 audit is reproducible, and the release gates stay green",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "suite": "2930 tests / 2916 pass / 0 fail / 14 skipped (measured twice, 137.8 s and 220.1 s)",
+      "lint": "eslint . -> 0 errors, 154 warnings",
+      "static_checks": "reachability / layer-check / entrypoints / classify all exit 0",
+      "preflight": "GREEN x2 (16/16 checks, 1 host observation)",
+      "residue_before": "user TEMP held 15,677 w2m-* and 15 gpw-* test directories (13,010 older than one day); one full suite added about 1,000",
+      "residue_fix": "cleaned 15,608; added scripts/temp-residue.mjs + test/helpers/temp-cleanup.mjs; fixed gpw-folder-policy/agent/worktree fixtures",
+      "residue_after": "one full suite adds 74 directories (prefixes itemized in docs/audit/AUDIT-1.6.1-1.7.4.md §4/§6)",
+      "deploy": "primary relay 43.142.74.71 upgraded 1.7.3 -> 1.7.4 (sha256 verified, state preserved, fleet 004945ed 2/2 online)"
+    }
+  }
+}

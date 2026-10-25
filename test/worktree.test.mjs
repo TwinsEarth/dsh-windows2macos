@@ -4,18 +4,22 @@
  * These drive real git: a fake git would pass while the actual workflow failed, and this module's whole job is the real
  * repository state. Each case builds a throwaway repository in the OS temp directory.
  */
-import { describe, it } from 'node:test';
+import { describe, it, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, existsSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createWorktree, snapshotStatus, commitTaskChanges, producePatch, removeWorktree } from '../src/agent/worktree.mjs';
 
 const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
 
+const WT_FIXTURES = [];
+after(() => { for (const dir of WT_FIXTURES) { try { rmSync(dir, { recursive: true, force: true }); } catch { /* locked on Windows */ } } });
+
 function makeRepo(name) {
   const dir = mkdtempSync(join(tmpdir(), 'w2m-wt-' + name + '-'));
+  WT_FIXTURES.push(dir);
   git(dir, 'init', '-b', 'main');
   git(dir, 'config', 'user.name', 'test');
   git(dir, 'config', 'user.email', 'test@example.invalid');

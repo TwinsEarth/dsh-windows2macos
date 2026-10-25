@@ -7,6 +7,18 @@
 
 All notable changes to this project are documented here.
 
+## [1.7.6] — 2026-10-25
+
+**审计修复版：测试零残留工具链 + 修复泄漏的测试夹具，并固化 v1.6.1→v1.7.4 审计报告。**
+
+- 新增 `scripts/temp-residue.mjs`（`snapshot` / `report` / `clean`）：对用户 TEMP 中 `w2m-*`、`gpw-*`
+  测试残留做基线快照、前缀统计与按年龄的安全清理；审计实测清理了 15,608 个历史残留目录。
+- 新增 `test/helpers/temp-cleanup.mjs`：基线式 per-test 清理，避免并发测试互删夹具。
+- 修复会泄漏临时目录的测试：`gpw-folder-policy`、`agent`（workspace 两处 fixture）、`worktree`（makeRepo）。
+- 零残留复测：单轮全量测试新增残留从约 1,000 个降至 74 个（剩余前缀已量化，作为下一轮清理清单）。
+- 新增审计报告 `docs/audit/AUDIT-1.6.1-1.7.4.md`：14 个正式版的 Release/CI/Compat 全绿记录、
+  2930 个测试 0 失败、lint 0 error、实机部署与落库断言、relay 延迟与测试耗时实测。
+- 证据：`docs/acceptance/1.7.6/AUDIT-ZERO-RESIDUE.json`。
 ## [1.7.5-beta.1] — 2026-10-25
 
 **GPW 升级为文件夹三分类网关（完全权限下生效）：黑名单拒绝 / 白名单放行 / 其余进入 GPW 自己的待审批队列。**

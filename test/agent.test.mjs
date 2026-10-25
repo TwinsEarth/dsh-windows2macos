@@ -11,6 +11,9 @@
 
 import { describe, it, before, after } from 'node:test';
 
+const WS_FIXTURES = [];
+after(() => { for (const dir of WS_FIXTURES) { try { rmSync(dir, { recursive: true, force: true }); } catch { /* locked on Windows */ } } });
+
 /**
  * v1.1.6: `autoStartAgent` defaults to true. Cases in this file are about something else, so the harness pins it off
  * once; call sites were renamed first, so this wrapper's own `plugin.apply` is still a real call.
@@ -5115,6 +5118,7 @@ describe('workspace execution', () => {
     const path = await import('node:path');
     const { execFileSync } = await import('node:child_process');
     const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'w2m-ws-exec-'));
+      WS_FIXTURES.push(repo);
     const git = (...args) => execFileSync('git', args, { cwd: repo, encoding: 'utf8' }).trim();
     git('init', '-b', 'main');
     git('config', 'user.name', 'test');
@@ -5156,6 +5160,7 @@ describe('workspace execution', () => {
     const path = await import('node:path');
     const { execFileSync } = await import('node:child_process');
     const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'w2m-ws-bad-'));
+      WS_FIXTURES.push(repo);
     execFileSync('git', ['init', '-b', 'main'], { cwd: repo, encoding: 'utf8' });
     execFileSync('git', ['config', 'user.name', 'test'], { cwd: repo, encoding: 'utf8' });
     execFileSync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: repo, encoding: 'utf8' });

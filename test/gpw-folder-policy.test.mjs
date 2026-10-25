@@ -7,13 +7,17 @@
  * `C:\workshop`, and a trailing separator must not change the answer.
  */
 import assert from 'node:assert/strict';
-import { describe, it } from 'node:test';
+import { describe, it, after } from 'node:test';
 
 import { classifyPath, classifyToolCall, isInside, normalizeFolder, pathsOfToolCall } from '../src/plugin/folder-policy.mjs';
 import { planGate, toolCallOf, validateFolderInput, folderForPath } from '../src/plugin/gpw.mjs';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+
+const fixtures = [];
+const fixture = () => { const dir = mkdtempSync(join(tmpdir(), 'gpw-')); fixtures.push(dir); return dir; };
+after(() => { for (const dir of fixtures) { try { rmSync(dir, { recursive: true, force: true }); } catch { /* locked on Windows */ } } });
 
 describe('GPW folder policy (v1.7.5-beta.1)', () => {
   it('normalises separators, resolves .. and never confuses a prefix with a folder', () => {
@@ -62,14 +66,14 @@ describe('GPW gate decision (v1.7.5-beta.1)', () => {
 });
 describe('GPW typed-folder validation (v1.7.5-beta.1)', () => {
   it('accepts an existing directory and normalises it', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'gpw-'));
+    const dir = fixture();
     const result = validateFolderInput(dir + (dir.endsWith('/') ? '' : '/'));
     assert.equal(result.ok, true);
     assert.equal(result.path, dir);
   });
 
   it('refuses a missing folder, a file and a drive root', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'gpw-'));
+    const dir = fixture();
     const file = join(dir, 'file.txt');
     writeFileSync(file, 'x');
     assert.equal(validateFolderInput(join(dir, 'nope')).ok, false);
@@ -79,7 +83,7 @@ describe('GPW typed-folder validation (v1.7.5-beta.1)', () => {
   });
 
   it('turns a file path into the nearest existing folder for one-click adding', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'gpw-'));
+    const dir = fixture();
     mkdirSync(join(dir, 'sub'));
     assert.equal(folderForPath(join(dir, 'sub', 'missing', 'x.txt')), join(dir, 'sub'));
     assert.equal(folderForPath(join(dir, 'file.txt')), dir);
