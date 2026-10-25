@@ -7,6 +7,17 @@
 
 All notable changes to this project are documented here.
 
+## [1.7.7] — 2026-10-26
+
+**GPW 子插件启用失败修复：`cannot get property "tools" without inject`。**
+
+- 根因：`gpw.mjs` 读取 `ctx.tools.guard` 做黑名单同步拦截，但 `inject` 只声明了 `permissionPresets`。
+  Cordis 对未声明服务读取直接抛错，插件激活因此失败（组件启用失败：1 entry did not activate dsh-gpw）。
+- 修复：`inject = ['permissionPresets', 'tools']`；guard 读取改为防御式（老宿主无 guard 扩展时不影响
+  `tools/pre-execute` 拦截）。
+- 新增回归测试 `test/gpw-activation.test.mjs`：用严格 Cordis 语义的 Proxy 上下文调用 `apply()`，
+  未声明服务读取即抛错；断言 `tools/pre-execute` 监听已安装。
+- 证据：`docs/acceptance/1.7.7/GPW-INJECT.json`。
 ## [1.7.6] — 2026-10-25
 
 **审计修复版：测试零残留工具链 + 修复泄漏的测试夹具，并固化 v1.6.1→v1.7.4 审计报告。**

@@ -1,0 +1,21 @@
+{
+  "version": "1.7.7",
+  "case": "GPW-INJECT",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-25T16:24:13.441Z",
+  "executor": "lead",
+  "task_id": "local-gpw-inject-20261025162413",
+  "requirement": "enabling the dsh-gpw sub-plugin must activate it; every service it reads must be declared in inject, and the folder gate must install its tools/pre-execute listener",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "symptom": "dsh: warning: 1 entry did not activate dsh-gpw (@twinsearth/w2m-dsh-plugin/gpw): Error: cannot get property \"tools\" without inject",
+      "cause": "ctx.tools.guard was read while inject named only permissionPresets",
+      "fix": "inject = ['permissionPresets', 'tools']; guard read is defensive for hosts without the guard extension",
+      "regression": "test/gpw-activation.test.mjs mounts apply() behind a strict Cordis-like Proxy that throws on undeclared reads; 12/12 (with gpw-folder-policy) pass"
+    }
+  }
+}

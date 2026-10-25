@@ -42,7 +42,7 @@ import { classifyToolCall } from './folder-policy.mjs';
 export const name = 'dsh-gpw';
 
 /** Services this plugin cannot work without. `connection` is used only for the operator routes. */
-export const inject = ['permissionPresets'];
+export const inject = ['permissionPresets', 'tools'];
 
 export const FULL_ACCESS_PRESET = 'danger-full-access';
 export const GPW_ROUTE = '/api/w2m/gpw/state';
@@ -322,7 +322,13 @@ export function apply(ctx, config = {}) {
   };
 
   // --- A: the blacklist denial must hold regardless of listener order -------------------------------------------------
-  ctx.tools?.guard?.((exec) => {
+  let guard = null;
+  try {
+    guard = ctx.tools?.guard;
+  } catch {
+    guard = null; // older host without the guard extension: pre-execute still denies
+  }
+  guard?.((exec) => {
     if (!isFullAccess(exec?.agent)) return undefined;
     const lists = folderLists();
     if (lists.blacklist.length === 0) return undefined;
