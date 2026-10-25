@@ -1,0 +1,32 @@
+{
+  "version": "1.7.4",
+  "case": "DESKTOP-HOST-COMPAT",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-25T13:13:25.302Z",
+  "executor": "lead",
+  "requirement": "the plugin must not crash the DSH desktop host, and a device token issued by one relay must trigger a re-pair when the configured relay no longer accepts it",
+  "evidence": {
+    "host_crash": {
+      "symptom": "dsh: fatal load failure: TypeError: agent.identity is not a function",
+      "cause": "agent.identity?.() — the desktop host exposes identity as a property, so the optional CALL threw inside agent.start().then(...) and became an unhandled rejection",
+      "fix": "agentIdentityOf() type-checks before calling; agent.start runs with its failure recorded, never awaited as a mount prerequisite"
+    },
+    "relay_switch": {
+      "symptom": "the Rabbit refused GET /v1/devices with HTTP 401 (UNAUTHORIZED: missing or invalid device_token), 无列表",
+      "cause": "startup saw a stored token and skipped pairing; the token belonged to the OLD relay after the fleet moved to a new primary",
+      "fix": "probe the configured relay with the stored token; an explicit 401/403 drops it and re-pairs via the fleet key, while network errors keep it"
+    }
+  },
+  "assertions": {
+    "identity_regression": "test/agent-identity-safe.test.mjs pass",
+    "re_pair_regression": "test/re-pair-stale-token.test.mjs pass",
+    "syntax": "node --check src/plugin/tools.mjs pass"
+  },
+  "task_id": "local-1.7.4-20261025131554",
+  "result": {
+    "outcome": "ok"
+  }
+}

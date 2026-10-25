@@ -7,6 +7,19 @@
 
 All notable changes to this project are documented here.
 
+## [1.7.4] — 2026-10-25
+
+**修复两处桌面宿主兼容性问题：`agent.identity` 崩溃、切换 relay 后旧 device token 导致 401 无法入队。**
+
+- 崩溃修复：`agent.identity?.()` 在桌面宿主上抛 `TypeError: agent.identity is not a function`，
+  且发生在 `agent.start().then(...)` 回调里变成未处理 rejection，把整个 DSH 宿主带崩。
+  新增 `agentIdentityOf()` 做类型判断，`agent.start()` 仍为非阻塞并记录失败。
+- 迁移修复：relay 切换到新主 relay 后，`device.json` 里的 token 属于旧 relay，新 relay 回
+  `401 UNAUTHORIZED: missing or invalid device_token`；启动逻辑看到已有 token 就跳过配对，
+  导致机器停在"无列表"。现在会先用 token 探测配置的 relay：**明确 401/403 才丢弃并重新配对**，
+  网络错误保留 token（不会因短暂故障误触发配对）。
+- 新增回归测试：`test/agent-identity-safe.test.mjs`、`test/re-pair-stale-token.test.mjs`。
+- 证据：`docs/acceptance/1.7.4/DESKTOP-HOST-COMPAT.json`（含真实崩溃信息与迁移症状）。
 ## [1.7.3] — 2026-10-25
 
 **截图提示改为顶部浮层（5 秒自动消失、可关闭、不挤压输入框）；全服计数标注来源 relay 并单列本编队。**

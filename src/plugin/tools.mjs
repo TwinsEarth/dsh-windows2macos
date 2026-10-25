@@ -7469,6 +7469,25 @@ async function startFailoverStack(ctx, cfg) {
     await stop();
   };
 }
+
+/**
+ * Read an agent's identity without assuming `identity` is a method.
+ *
+ * v1.7.4: calling the optional method form on agent.identity crashed the DESKTOP host with
+ *   dsh: fatal load failure: TypeError: agent.identity is not a function
+ * because the desktop host's agent exposes `identity` as a property while the in-process agent
+ * exposes it as a function. Optional CALL only guards null/undefined; a present non-function still
+ * throws, and inside a promise callback that became an unhandled rejection that took the host down.
+ * Reading the value with a type check covers both shapes.
+ */
+function agentIdentityOf(agent) {
+  try {
+    if (agent === null || agent === undefined) return null;
+    return typeof agent.identity === 'function' ? agent.identity() : (agent.identity ?? null);
+  } catch {
+    return null;
+  }
+}
 async function startLocalStack(ctx, cfg) {
 
   /**
@@ -7822,7 +7841,37 @@ async function startLocalStack(ctx, cfg) {
      * the unconditional pairing here were the same defect seen from two sides.
      */
     const existingToken = loaded.identity.device_token;
-    const alreadyPaired = typeof existingToken === 'string' && existingToken !== '';
+    let alreadyPaired = typeof existingToken === 'string' && existingToken !== '';
+
+    /**
+     * v1.7.4: a stored token is only "paired" for the relay that issued it.
+     *
+     * Moving the fleet to a new primary relay reuses device.json. The stored token belongs to the OLD
+     * relay, the new one answers `401 UNAUTHORIZED: missing or invalid device_token`, and because the
+     * startup path saw a token it skipped pairing entirely: every machine showed "the Rabbit refused
+     * GET /v1/devices with HTTP 401 ... 无列表" and joined no fleet.
+     *
+     * Probe the configured relay with the stored token. An explicit 401/403 means the token is stale
+     * FOR THIS RELAY, so drop it and pair again through the fleet key. Any other outcome (200, network
+     * error, unexpected status) keeps the token -- a transient outage must not trigger a re-pair.
+     */
+    if (alreadyPaired) {
+      const relayForToken = relay?.url ?? cfg.rabbitUrl;
+      if (typeof relayForToken === 'string' && relayForToken !== '') {
+        try {
+          const probe = await fetch(relayForToken.replace(/\/+$/, '') + '/v1/devices', {
+            headers: { authorization: 'Bearer ' + existingToken, accept: 'application/json' },
+            signal: typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function' ? AbortSignal.timeout(4000) : undefined,
+          });
+          if (probe.status === 401 || probe.status === 403) {
+            alreadyPaired = false;
+            loaded.identity.device_token = null;
+            if (identityOptions.identity !== undefined && identityOptions.identity !== null) identityOptions.identity.device_token = null;
+            ctx.logger?.warn?.('w2m: stored device token was rejected by ' + relayForToken + ' (HTTP ' + probe.status + '); pairing again with the fleet key');
+          }
+        } catch { /* network error: keep the token, do not force a re-pair */ }
+      }
+    }
 
     /**
      * Pair with the key that is in hand, and **persist the token**.
@@ -8026,7 +8075,7 @@ async function startLocalStack(ctx, cfg) {
     // the relay, and the value startFailoverStack needs from this function is the cleanup handle. So
     // start it in the background and record a failure instead of hanging the whole stack.
     agent.start().then(
-      () => ctx.logger?.info?.('w2m: agent started as ' + JSON.stringify(agent.identity?.() ?? null)),
+      () => ctx.logger?.info?.('w2m: agent started as ' + JSON.stringify(agentIdentityOf(agent))),
       (error) => ctx.logger?.warn?.('w2m: agent start failed: ' + (error instanceof Error ? error.message : String(error))),
     );
 
