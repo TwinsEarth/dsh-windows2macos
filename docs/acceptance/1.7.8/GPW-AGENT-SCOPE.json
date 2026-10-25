@@ -1,0 +1,21 @@
+{
+  "version": "1.7.8",
+  "case": "GPW-AGENT-SCOPE",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-25T16:57:54.149Z",
+  "executor": "lead",
+  "task_id": "local-gpw-scope-20261025165754",
+  "requirement": "enabling dsh-gpw must activate it under a full CORDIS context: no root tools read, the pre-execute gate installed, and the blacklist guard registered on each agent context",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "symptom": "TypeError: Cannot read properties of undefined (reading 'layers')",
+      "cause": "ctx.tools.guard was called at activation on the root context; the tools service is composed per agent and has no layer table there",
+      "fix": "agent/created -> agent.ctx.tools.guard per agent, disposers released through ctx.effect; inject = [permissionPresets]",
+      "regression": "test/gpw-activation.test.mjs: strict Proxy throws on undeclared/root-tools reads; activation, agent/created guard installation and source checks all pass"
+    }
+  }
+}

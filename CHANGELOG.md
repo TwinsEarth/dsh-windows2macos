@@ -7,6 +7,19 @@
 
 All notable changes to this project are documented here.
 
+## [1.7.8] — 2026-10-26
+
+**GPW 启用失败修复（第二个）：`TypeError: Cannot read properties of undefined (reading 'layers')`。**
+
+- 根因：v1.7.7 为做黑名单同步拒绝，在**激活期**调用根上下文的 `ctx.tools.guard()`。tools 服务是**按 agent 组合**的，
+  根作用域实例在激活阶段还没有 layer 表，于是抛 `reading 'layers'`，dsh-gpw 仍无法激活。
+- 修复：改为在 `agent/created` 监听里对**每个 agent 自己的上下文** `agent.ctx.tools.guard(...)` 注册黑名单守卫，
+  并用 `ctx.effect` 统一释放；根上下文不再读取 tools 服务（`inject` 回到只有 `permissionPresets`）。
+- 保留 `tools/pre-execute` 三分类拦截；guard 缺失的宿主不会因此激活失败（pre-execute 仍会拒绝黑名单）。
+- 回归测试升级：`test/gpw-activation.test.mjs` 现在用严格 Cordis 语义 Proxy（读取根 `tools` 即抛错）验证激活，
+  并通过伪造 `agent/created` 断言守卫注册在 agent 上下文。
+- 同时补全 bundle patch 中 GPW v2 的配置项（requireFullAccess / whitelist / blacklist / pendingTimeoutMs）。
+- 证据：`docs/acceptance/1.7.8/GPW-AGENT-SCOPE.json`。
 ## [1.7.7] — 2026-10-26
 
 **GPW 子插件启用失败修复：`cannot get property "tools" without inject`。**

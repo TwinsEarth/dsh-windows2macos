@@ -134,4 +134,10 @@
         maxPerWindow: 10
         windowMs: 60000
         minGapMs: 3000
+        # v1.7.5+: only act in the 完全权限 preset; the two folder lists are the gate's policy.
+        # Folders are added at runtime from the GPW panel into $DSH_HOME/xclient/gpw-folders.json.
+        requireFullAccess: true
+        whitelist: []
+        blacklist: []
+        pendingTimeoutMs: 120000
 

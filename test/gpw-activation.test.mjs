@@ -1,12 +1,15 @@
 /**
- * v1.7.7 regression guard: GPW activation must read only services it declares.
+ * v1.7.7/v1.7.8 regression guard: GPW activation must read only services it declares, and the blacklist guard must be
+ * registered on an agent's own context instead of the root one.
  *
- * Field failure (v1.7.5-beta.1):
- *   组件启用失败: dsh: warning: 1 entry did not activate dsh-gpw (@twinsearth/w2m-dsh-plugin/gpw):
- *   Error: cannot get property "tools" without inject
+ * Field failures:
+ *   v1.7.7: cannot get property "tools" without inject   (ctx.tools read at activation while inject named only permissionPresets)
+ *   v1.7.8: TypeError: Cannot read properties of undefined (reading 'layers')
+ *           (ctx.tools.guard at activation, where the tools service has no agent layer table yet)
  *
- * Cordis resolves ctx.<name> against the fiber's inject list and throws for an undeclared read, so this test mounts
- * apply() behind a context whose property getter throws exactly like Cordis does.
+ * The supported shape for per-agent behavior is `agent.ctx` obtained from an `agent/created` listener; this test mounts
+ * apply() behind a strict Cordis-like context that throws on undeclared reads AND on the root `tools` read, then emits
+ * agent/created with a fake agent and asserts the guard was installed there.
  */
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -18,52 +21,73 @@ import { apply, inject, name } from '../src/plugin/gpw.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
-describe('GPW activation (v1.7.7)', () => {
-  it('declares every service it reads', () => {
+function strictContext() {
+  const declared = new Set(inject);
+  const listeners = new Map();
+  const target = {
+    effect: () => {},
+    logger: { info: () => {}, warn: () => {} },
+    on: (event, listener) => {
+      listeners.set(event, listener);
+      return () => listeners.delete(event);
+    },
+    inject: (services, callback) => {
+      for (const service of services) declared.add(service);
+      callback({ connection: { fetch: { register: () => {} } } });
+    },
+    permissionPresets: { current: () => 'danger-full-access' },
+    workingDirectory: null,
+  };
+  const ctx = new Proxy(target, {
+    get(object, property) {
+      if (property === 'then') return undefined;
+      if (typeof property === 'string' && !(property in object) && !declared.has(property)) {
+        throw new Error('cannot get property "' + property + '" without inject');
+      }
+      return object[property];
+    },
+  });
+  return { ctx, listeners };
+}
+
+describe('GPW activation (v1.7.8)', () => {
+  it('declares permissionPresets and does not require the root tools service', () => {
     assert.equal(name, 'dsh-gpw');
-    for (const service of ['permissionPresets', 'tools']) {
-      assert.ok(inject.includes(service), 'inject must name ' + service);
-    }
+    assert.ok(inject.includes('permissionPresets'));
+    assert.equal(inject.includes('tools'), false, 'the root tools service is not read any more');
   });
 
-  it('mounts behind a strict Cordis-like context without throwing', () => {
-    const declared = new Set(inject);
-    const registry = [];
-    const ctx = new Proxy(
-      {
-        effect: () => {},
-        logger: { info: () => {}, warn: () => {} },
-        on: (event, listener) => {
-          registry.push({ event, listener });
-          return () => {};
-        },
-        inject: (services, callback) => {
-          for (const service of services) declared.add(service);
-          callback({ connection: { fetch: { register: () => {} } } });
-        },
-        permissionPresets: { current: () => 'danger-full-access' },
-        tools: { guard: () => () => {} },
-        workingDirectory: { ensure: async () => null },
-      },
-      {
-        get(target, property) {
-          if (property === 'then') return undefined;
-          if (typeof property === 'string' && !(property in target) && !declared.has(property)) {
-            throw new Error('cannot get property "' + property + '" without inject');
-          }
-          return target[property];
-        },
-        has: () => true,
-      },
-    );
-    assert.doesNotThrow(() => apply(ctx, {}));
-    assert.ok(registry.some((entry) => entry.event === 'tools/pre-execute'), 'the folder gate is installed');
+  it('mounts behind a strict context and installs the pre-execute gate without touching root tools', () => {
+    const { ctx, listeners } = strictContext();
+    assert.doesNotThrow(() => apply(ctx, {}), 'activation must not read undeclared/root services');
+    assert.equal(typeof listeners.get('tools/pre-execute'), 'function', 'the folder gate is installed');
+    assert.equal(typeof listeners.get('agent/created'), 'function', 'guards are registered per agent');
   });
 
-  it('keeps the folder gate in the source tree with the three branches', () => {
+  it('registers the blacklist guard on the agent context from agent/created', () => {
+    const { ctx, listeners } = strictContext();
+    apply(ctx, {});
+    const guarded = [];
+    const agent = {
+      session: {},
+      ctx: {
+        tools: {
+          guard: (guard) => {
+            guarded.push(guard);
+            return () => {};
+          },
+        },
+      },
+    };
+    listeners.get('agent/created')({ agent });
+    assert.equal(guarded.length, 1, 'one guard per agent');
+    assert.equal(guarded[0]({ name: 'read', parameters: { path: '/repo/a.txt' } }), undefined, 'paths outside the blacklist pass the guard');
+  });
+
+  it('keeps the per-agent registration in the source and drops the root one', () => {
     const source = readFileSync(join(here, '..', 'src', 'plugin', 'gpw.mjs'), 'utf8');
-    assert.match(source, /guard = ctx\.tools\?\.guard;/, 'the tools service is read through a defensive binding');
-    assert.match(source, /planGate\(/, 'the three-class decision is shared');
+    assert.match(source, /ctx\.on\('agent\/created'/);
+    assert.equal(/ctx\.tools\?\.guard\s*\(/.test(source), false, 'no root-scope guard registration');
     assert.match(source, /tools\/pre-execute/, 'the gate is a pre-execute listener');
   });
 });

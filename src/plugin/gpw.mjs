@@ -3,7 +3,7 @@
  *
  * ## The three classes and who answers
  *
- *   A. blacklist  -> denied. A synchronous `ctx.tools.guard()` is registered as well, so the denial holds no matter
+ *   A. blacklist  -> denied. A synchronous guard is registered on each agent (agent.ctx.tools.guard), so the denial holds no matter
  *                    which other pre-execute listener runs first.
  *   B. whitelist  -> allowed without a human. The whitelist is an explicit extension of the workspace (same decision,
  *                    plus the auto-approval budget below).
@@ -42,7 +42,7 @@ import { classifyToolCall } from './folder-policy.mjs';
 export const name = 'dsh-gpw';
 
 /** Services this plugin cannot work without. `connection` is used only for the operator routes. */
-export const inject = ['permissionPresets', 'tools'];
+export const inject = ['permissionPresets'];
 
 export const FULL_ACCESS_PRESET = 'danger-full-access';
 export const GPW_ROUTE = '/api/w2m/gpw/state';
@@ -322,13 +322,17 @@ export function apply(ctx, config = {}) {
   };
 
   // --- A: the blacklist denial must hold regardless of listener order -------------------------------------------------
-  let guard = null;
-  try {
-    guard = ctx.tools?.guard;
-  } catch {
-    guard = null; // older host without the guard extension: pre-execute still denies
-  }
-  guard?.((exec) => {
+  //
+  // v1.7.8: the guard is registered on each agent's own context, from an `agent/created` listener.
+  //
+  // Registering it on the root context (ctx.tools.guard at activation) crashed dsh-gpw with
+  //   TypeError: Cannot read properties of undefined (reading 'layers')
+  // because the tools service is composed per agent: the root-scope instance has no layer table yet at activation time.
+  // The documented shape for per-agent behavior is agent.ctx obtained in agent/created; the disposer is kept so an
+  // unloaded plugin cannot leave guards behind.
+  /** @type {Map<object, () => void>} */
+  const agentGuards = new Map();
+  const blacklistGuard = () => (exec) => {
     if (!isFullAccess(exec?.agent)) return undefined;
     const lists = folderLists();
     if (lists.blacklist.length === 0) return undefined;
@@ -339,7 +343,30 @@ export function apply(ctx, config = {}) {
     noteRecent({ tool: String(call.name ?? 'tool'), decision: 'deny', reason: result.reason, paths: result.paths });
     ctx.logger?.warn?.(`dsh-gpw: refused ${String(call.name ?? 'tool')} -- ${result.reason}`);
     return `GPW: ${result.reason}; the call was not executed`;
+  };
+  ctx.on('agent/created', ({ agent } = {}) => {
+    try {
+      const guard = agent?.ctx?.tools?.guard;
+      if (typeof guard !== 'function') return; // host without the guard extension: pre-execute still denies
+      const dispose = guard(blacklistGuard());
+      if (typeof dispose === 'function') agentGuards.set(agent, dispose);
+    } catch {
+      /* the pre-execute branch below still enforces the blacklist */
+    }
   });
+  if (typeof ctx.effect === 'function') {
+    ctx.effect(() => () => {
+      for (const dispose of agentGuards.values()) {
+        try {
+          dispose();
+        } catch {
+          /* already disposed with its agent */
+        }
+      }
+      agentGuards.clear();
+    }, 'dsh-gpw: per-agent blacklist guards');
+  }
+
 
   // --- B/C: the pre-execute gate ---------------------------------------------------------------------------------------
   ctx.on('tools/pre-execute', async (exec, next) => {
