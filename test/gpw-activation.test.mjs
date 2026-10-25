@@ -12,14 +12,23 @@
  * agent/created with a fake agent and asserts the guard was installed there.
  */
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { describe, it } from 'node:test';
+import { tmpdir } from 'node:os';
+import { after, describe, it } from 'node:test';
 
 import { apply, inject, name } from '../src/plugin/gpw.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
+const fixtures = [];
+/** Isolate the signed-lists file: activation must never write into the developer's real ~/.dsh. */
+function tempFolders() {
+  const dir = mkdtempSync(join(tmpdir(), 'gpw-activation-'));
+  fixtures.push(dir);
+  return join(dir, 'gpw-folders.json');
+}
+after(() => { for (const dir of fixtures) { try { rmSync(dir, { recursive: true, force: true }); } catch { /* locked on Windows */ } } });
 
 function strictContext() {
   const declared = new Set(inject);
@@ -59,14 +68,14 @@ describe('GPW activation (v1.7.8)', () => {
 
   it('mounts behind a strict context and installs the pre-execute gate without touching root tools', () => {
     const { ctx, listeners } = strictContext();
-    assert.doesNotThrow(() => apply(ctx, {}), 'activation must not read undeclared/root services');
+    assert.doesNotThrow(() => apply(ctx, { foldersFile: tempFolders() }), 'activation must not read undeclared/root services');
     assert.equal(typeof listeners.get('tools/pre-execute'), 'function', 'the folder gate is installed');
     assert.equal(typeof listeners.get('agent/created'), 'function', 'guards are registered per agent');
   });
 
   it('registers the blacklist guard on the agent context from agent/created', () => {
     const { ctx, listeners } = strictContext();
-    apply(ctx, {});
+    apply(ctx, { foldersFile: tempFolders() });
     const guarded = [];
     const agent = {
       session: {},

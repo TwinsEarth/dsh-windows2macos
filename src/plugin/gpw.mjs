@@ -25,17 +25,19 @@
  *
  * ## Operator surface
  *
- * The panel is rendered by the w2m client (`lib/client.js`): a floating "GPW 文件夹" button opens the three sections
- * (whitelist / blacklist / recently intercepted) plus the pending queue. Folders can be typed (validated against the
- * filesystem here) or taken from the recently-intercepted list in one click. Lists live in a JSON file under
- * `$DSH_HOME/xclient/`, never in the profile patch.
+ * The panel is rendered by the w2m client (`lib/client.js`): a pending prompt sits inline in the composer row,
+ * and a floating "GPW 文件夹" button opens the three sections (whitelist / blacklist / recently intercepted)
+ * plus the pending queue. Folders can be typed (validated against the filesystem here) or taken from the
+ * recently-intercepted list in one click. Lists live in a MAC-signed v2 JSON file under `$DSH_HOME/xclient/`
+ * (written read-only 0444), never in the profile patch; an external edit is detected and locks class-B/C paths
+ * until the operator resets the lists.
  */
 
 import { spawn } from 'node:child_process';
-import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHmac, randomBytes, randomUUID } from 'node:crypto';
 
 import { classifyToolCall } from './folder-policy.mjs';
 
@@ -49,11 +51,15 @@ export const GPW_ROUTE = '/api/w2m/gpw/state';
 export const GPW_FOLDERS_ROUTE = '/api/w2m/gpw/folders';
 export const GPW_DECIDE_ROUTE = '/api/w2m/gpw/decide';
 export const GPW_PICK_ROUTE = '/api/w2m/gpw/pick';
+export const GPW_RESET_ROUTE = '/api/w2m/gpw/reset';
 
 const DEFAULT_BUDGET = { maxPerWindow: 10, windowMs: 60_000, minGapMs: 3_000 };
 const DEFAULT_PENDING_TIMEOUT_MS = 120_000;
 const RECENT_LIMIT = 20;
 const NO_STORE = { 'cache-control': 'no-store' };
+/** v1.7.9: lists are MAC-signed (v2) so an external edit is detectable instead of silently trusted. */
+const FOLDERS_VERSION = 2;
+const FOLDERS_MAC_ALGO = 'sha256';
 
 /** Resolve the folders file: config first, then `$DSH_HOME/xclient/gpw-folders.json`. */
 export function foldersFileOf(config = {}) {
@@ -62,28 +68,116 @@ export function foldersFileOf(config = {}) {
   return join(home, 'xclient', 'gpw-folders.json');
 }
 
-/** Read the operator-managed lists. A missing or corrupt file is empty lists, never a crash on mount. */
-export function readFolders(file) {
-  try {
-    const parsed = JSON.parse(readFileSync(file, 'utf8'));
-    return {
-      whitelist: Array.isArray(parsed?.whitelist) ? parsed.whitelist.filter((v) => typeof v === 'string' && v !== '') : [],
-      blacklist: Array.isArray(parsed?.blacklist) ? parsed.blacklist.filter((v) => typeof v === 'string' && v !== '') : [],
-    };
-  } catch {
-    return { whitelist: [], blacklist: [] };
-  }
+/** The sidecar file that holds the MAC key. Kept next to (never inside) the lists file. */
+export function foldersKeyFileOf(file) {
+  return `${file}.key`;
 }
 
-/** Persist the operator-managed lists. */
-export function writeFolders(file, folders) {
-  mkdirSync(dirname(file), { recursive: true });
-  const next = {
-    whitelist: [...new Set((folders?.whitelist ?? []).filter((v) => typeof v === 'string' && v.trim() !== ''))],
-    blacklist: [...new Set((folders?.blacklist ?? []).filter((v) => typeof v === 'string' && v.trim() !== ''))],
-  };
-  writeFileSync(file, JSON.stringify(next, null, 2) + '\n', 'utf8');
-  return next;
+/**
+ * Resolve the MAC key: explicit config / env first, else a generated 32-byte key in a 0600 sidecar.
+ * `created` is true only when this call generated the key, which is what lets a legacy plain-JSON
+ * file be migrated exactly once and a later unsigned file be treated as tampering instead.
+ */
+export function ensureFoldersKey(file, config = {}) {
+  const fromConfig = typeof config.foldersKey === 'string' && config.foldersKey.trim() !== '' ? config.foldersKey.trim() : null;
+  const fromEnv = typeof process.env.W2M_GPW_FOLDERS_KEY === 'string' && process.env.W2M_GPW_FOLDERS_KEY.trim() !== ''
+    ? process.env.W2M_GPW_FOLDERS_KEY.trim()
+    : null;
+  const explicit = fromConfig ?? fromEnv;
+  if (explicit !== null) return { key: explicit, created: false, source: fromConfig !== null ? 'config' : 'env' };
+  const keyFile = foldersKeyFileOf(file);
+  try {
+    const existing = readFileSync(keyFile, 'utf8').trim();
+    if (existing !== '') return { key: existing, created: false, source: 'file' };
+  } catch {
+    /* generated below */
+  }
+  mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+  const key = randomBytes(32).toString('hex');
+  writeFileSync(keyFile, `${key}\n`, { encoding: 'utf8', mode: 0o600 });
+  try { chmodSync(keyFile, 0o600); } catch { /* best effort on Windows */ }
+  return { key, created: true, source: 'file' };
+}
+
+/** Canonical MAC over the two lists (order-independent, so adding/removing a row is what changes it). */
+export function macOfFolders(whitelist, blacklist, key) {
+  const canonical = JSON.stringify({
+    whitelist: [...new Set(whitelist)].sort(),
+    blacklist: [...new Set(blacklist)].sort(),
+  });
+  return createHmac(FOLDERS_MAC_ALGO, key).update(canonical).digest('hex');
+}
+
+/**
+ * Read the operator-managed lists.
+ *
+ *   - missing file + `allowMissing` -> clean empty lists (first run)
+ *   - missing file otherwise       -> `tampered` (the signed file was deleted)
+ *   - valid v2 + MAC               -> lists
+ *   - v2 with a bad MAC            -> `tampered` (edited outside GPW)
+ *   - no version/MAC (legacy)      -> `legacy: true`; the caller migrates once or treats it as tampered
+ */
+export function readFolders(file, key = null, options = {}) {
+  let raw;
+  try {
+    raw = readFileSync(file, 'utf8');
+  } catch (error) {
+    if (error?.code === 'ENOENT' && key !== null && options.allowMissing !== true) {
+      return { whitelist: [], blacklist: [], tampered: true, reason: 'folder lists file is missing' };
+    }
+    if (error?.code !== 'ENOENT') {
+      return { whitelist: [], blacklist: [], tampered: true, reason: `folder lists unreadable: ${error?.message ?? error}` };
+    }
+    return { whitelist: [], blacklist: [], tampered: false, reason: null, legacy: false };
+  }
+  let parsed = null;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { whitelist: [], blacklist: [], tampered: true, reason: 'folder lists file is not valid JSON' };
+  }
+  const whitelist = Array.isArray(parsed?.whitelist) ? parsed.whitelist.filter((v) => typeof v === 'string' && v !== '') : [];
+  const blacklist = Array.isArray(parsed?.blacklist) ? parsed.blacklist.filter((v) => typeof v === 'string' && v !== '') : [];
+  if (parsed?.version !== FOLDERS_VERSION || typeof parsed?.mac !== 'string') {
+    return { whitelist, blacklist, tampered: false, reason: null, legacy: true };
+  }
+  if (key === null) return { whitelist, blacklist, tampered: false, reason: null, legacy: false };
+  if (macOfFolders(whitelist, blacklist, key) !== parsed.mac) {
+    return { whitelist, blacklist, tampered: true, reason: 'folder lists were modified outside GPW (MAC mismatch)' };
+  }
+  return { whitelist, blacklist, tampered: false, reason: null, legacy: false };
+}
+
+/**
+ * Persist the operator-managed lists.
+ *
+ * Atomic (tmp + rename), MAC-signed when a key is supplied, and left **read-only** (0444) so an
+ * accidental or casual edit from the agent's file tools fails instead of silently changing policy.
+ * GPW itself rewrites by clearing the flag, writing a new tmp file and renaming over the target.
+ */
+export function writeFolders(file, folders, key = null) {
+  mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+  const whitelist = [...new Set((folders?.whitelist ?? []).filter((v) => typeof v === 'string' && v.trim() !== ''))];
+  const blacklist = [...new Set((folders?.blacklist ?? []).filter((v) => typeof v === 'string' && v.trim() !== ''))];
+  const next = { version: FOLDERS_VERSION, whitelist, blacklist };
+  if (key !== null) {
+    next.algo = FOLDERS_MAC_ALGO;
+    next.mac = macOfFolders(whitelist, blacklist, key);
+  }
+  const payload = `${JSON.stringify(next, null, 2)}\n`;
+  const tmp = `${file}.tmp-${process.pid}-${Date.now()}`;
+  // Windows refuses to rename over a read-only target: clear it first, then the atomic replace runs.
+  try { chmodSync(file, 0o644); } catch { /* first write */ }
+  writeFileSync(tmp, payload, { encoding: 'utf8', mode: 0o600 });
+  try { chmodSync(tmp, 0o600); } catch { /* best effort */ }
+  renameSync(tmp, file);
+  try { chmodSync(file, 0o444); } catch { /* read-only is best effort on Windows, MAC still verifies */ }
+  return { whitelist, blacklist };
+}
+
+/** Operator reset: drop every entry and re-sign. Used only after a tamper report. */
+export function resetFolders(file, key) {
+  return writeFolders(file, { whitelist: [], blacklist: [] }, key);
 }
 
 /**
@@ -229,6 +323,33 @@ export function apply(ctx, config = {}) {
   const pendingTimeoutMs = positiveInt(config.pendingTimeoutMs, DEFAULT_PENDING_TIMEOUT_MS);
   const requireFullAccess = config.requireFullAccess !== false;
   const foldersFile = foldersFileOf(config);
+  const keyInfo = ensureFoldersKey(foldersFile, config);
+  const foldersKey = keyInfo.key;
+  /** Set once the signed file has been read cleanly; a later disappearance then reads as tampering. */
+  let foldersSeen = false;
+  /** Non-null until the operator resets the lists; class-B/C paths are locked while it is set. */
+  let tamperedReason = null;
+
+  const noteTamper = (reason) => {
+    const next = reason ?? 'folder lists failed integrity check';
+    if (tamperedReason === null) ctx.logger?.warn?.(`dsh-gpw: ${next}; class-B/C paths are locked until the operator resets the lists`);
+    tamperedReason = next;
+  };
+
+  // First read: migrate a legacy plain-JSON file exactly once; after that an unsigned/missing file is tampering.
+  const initialFolders = readFolders(foldersFile, foldersKey, { allowMissing: keyInfo.created || !existsSync(foldersFile) });
+  if (initialFolders.legacy) ctx.logger?.info?.('dsh-gpw: migrating legacy folder lists to MAC-signed v2 (read-only)');
+  if (initialFolders.tampered) {
+    noteTamper(initialFolders.reason);
+  } else {
+    // Always leave a signed v2 file behind (first run creates the empty one; later runs re-sign it).
+    try {
+      writeFolders(foldersFile, initialFolders, foldersKey);
+      foldersSeen = true;
+    } catch (error) {
+      noteTamper(`folder lists could not be initialized: ${error?.message ?? error}`);
+    }
+  }
 
   /** Timestamps of auto-approvals in the current window. */
   const approvals = [];
@@ -247,11 +368,20 @@ export function apply(ctx, config = {}) {
   };
 
   const folderLists = () => {
-    const stored = readFolders(foldersFile);
+    const stored = readFolders(foldersFile, foldersKey, { allowMissing: keyInfo.created && !foldersSeen });
+    if (stored.legacy) {
+      noteTamper('folder lists lost their integrity signature (edited outside GPW?)');
+    } else if (stored.tampered) {
+      noteTamper(stored.reason);
+    } else {
+      foldersSeen = true;
+    }
     const merge = (a, b) => [...new Set([...(Array.isArray(a) ? a : []), ...b])];
     return {
       whitelist: merge(config.whitelist, stored.whitelist),
       blacklist: merge(config.blacklist, stored.blacklist),
+      tampered: tamperedReason !== null,
+      reason: tamperedReason,
     };
   };
 
@@ -335,8 +465,17 @@ export function apply(ctx, config = {}) {
   const blacklistGuard = () => (exec) => {
     if (!isFullAccess(exec?.agent)) return undefined;
     const lists = folderLists();
-    if (lists.blacklist.length === 0) return undefined;
     const call = toolCallOf(exec);
+    if (lists.tampered) {
+      // Fail closed: while the lists cannot be trusted, every path-naming call is refused outright.
+      const probe = classifyToolCall({ ...call, whitelist: [], blacklist: [] });
+      if (probe.paths.length === 0) return undefined;
+      deniedTotal += 1;
+      noteRecent({ tool: String(call.name ?? 'tool'), decision: 'deny', reason: lists.reason, paths: probe.paths });
+      ctx.logger?.warn?.(`dsh-gpw: refused ${String(call.name ?? 'tool')} -- lists locked (${lists.reason})`);
+      return `GPW: folder lists failed integrity check (${lists.reason}); reset them in the GPW panel`;
+    }
+    if (lists.blacklist.length === 0) return undefined;
     const result = classifyToolCall({ ...call, blacklist: lists.blacklist });
     if (result.decision !== 'deny') return undefined;
     deniedTotal += 1;
@@ -372,8 +511,17 @@ export function apply(ctx, config = {}) {
   ctx.on('tools/pre-execute', async (exec, next) => {
     if (requireFullAccess && !isFullAccess(exec?.agent)) return next();
     const lists = folderLists();
-    if (lists.blacklist.length === 0 && lists.whitelist.length === 0) return next();
     const call = toolCallOf(exec);
+    if (lists.tampered) {
+      // Fail closed: a tampered list file must not be able to silently turn policy off.
+      const probe = classifyToolCall({ ...call, whitelist: [], blacklist: [] });
+      if (probe.paths.length === 0) return next();
+      deniedTotal += 1;
+      noteRecent({ tool: String(call.name ?? 'tool'), decision: 'deny', reason: lists.reason, paths: probe.paths });
+      ctx.logger?.warn?.(`dsh-gpw: refused ${String(call.name ?? 'tool')} -- lists locked (${lists.reason})`);
+      return { kind: 'deny', reason: `GPW: folder lists failed integrity check (${lists.reason}); reset them in the GPW panel` };
+    }
+    if (lists.blacklist.length === 0 && lists.whitelist.length === 0) return next();
     let cwd = null;
     try {
       cwd = await ctx.workingDirectory?.ensure?.(exec.agent, exec.signal);
@@ -410,28 +558,34 @@ export function apply(ctx, config = {}) {
       path: GPW_ROUTE,
       methods: ['GET'],
       requestBody: 'buffered',
-      fetch: async () => json({
-        ok: true,
-        enabled: true,
-        require_full_access: requireFullAccess,
-        folders: folderLists(),
-        counters: { allowedTotal, pendingTotal, deniedTotal, budgetWindow: approvals.length, maxPerWindow },
-        recent: recent.map((entry) => ({
-          at: entry.at,
-          tool: entry.tool,
-          decision: entry.decision,
-          reason: entry.reason,
-          paths: entry.paths,
-          folder: entry.paths.length > 0 ? folderForPath(entry.paths[0]) : null,
-        })),
-        pending: [...pending.entries()].map(([id, entry]) => ({
-          id,
-          tool: entry.tool,
-          reason: entry.reason,
-          paths: entry.paths,
-          pending_ms: Date.now() - entry.createdAt,
-        })),
-      }),
+      fetch: async () => {
+        const lists = folderLists();
+        return json({
+          ok: true,
+          enabled: true,
+          require_full_access: requireFullAccess,
+          folders: { whitelist: lists.whitelist, blacklist: lists.blacklist },
+          tampered: lists.tampered,
+          tampered_reason: lists.reason,
+          counters: { allowedTotal, pendingTotal, deniedTotal, budgetWindow: approvals.length, maxPerWindow },
+          recent: recent.map((entry) => ({
+            at: entry.at,
+            tool: entry.tool,
+            decision: entry.decision,
+            reason: entry.reason,
+            paths: entry.paths,
+            folder: entry.paths.length > 0 ? folderForPath(entry.paths[0]) : null,
+          })),
+          pending: [...pending.entries()].map(([id, entry]) => ({
+            id,
+            tool: entry.tool,
+            reason: entry.reason,
+            paths: entry.paths,
+            folder: entry.paths.length > 0 ? folderForPath(entry.paths[0]) : null,
+            pending_ms: Date.now() - entry.createdAt,
+          })),
+        });
+      },
     });
 
     registry.register({
@@ -448,20 +602,55 @@ export function apply(ctx, config = {}) {
         const list = body?.list;
         if (list !== 'whitelist' && list !== 'blacklist') return json({ ok: false, error: 'list must be whitelist or blacklist' }, 400);
         if (body?.action !== 'add' && body?.action !== 'remove') return json({ ok: false, error: 'action must be add or remove' }, 400);
+        const current = folderLists();
+        if (current.tampered) {
+          return json({ ok: false, error: `folder lists are locked after an integrity failure (${current.reason}); reset them first` }, 409);
+        }
+        const stored = readFolders(foldersFile, foldersKey, { allowMissing: true });
         if (body.action === 'remove') {
           if (typeof body?.path !== 'string' || body.path.trim() === '') return json({ ok: false, error: 'path must be a non-empty string' }, 400);
-          const stored = readFolders(foldersFile);
           const next = { ...stored, [list]: stored[list].filter((entry) => entry !== body.path) };
-          writeFolders(foldersFile, next);
+          try {
+            writeFolders(foldersFile, next, foldersKey);
+          } catch (error) {
+            return json({ ok: false, error: `could not write folder lists: ${error?.message ?? error}` }, 500);
+          }
           return json({ ok: true, folders: folderLists() });
         }
         const validated = validateFolderInput(body?.path);
         if (!validated.ok) return json({ ok: false, error: validated.error }, 400);
-        const stored = readFolders(foldersFile);
         const next = { ...stored, [list]: [...new Set([...stored[list], validated.path])] };
-        writeFolders(foldersFile, next);
+        try {
+          writeFolders(foldersFile, next, foldersKey);
+        } catch (error) {
+          return json({ ok: false, error: `could not write folder lists: ${error?.message ?? error}` }, 500);
+        }
         ctx.logger?.info?.(`dsh-gpw: added ${validated.path} to ${list}`);
         return json({ ok: true, folders: folderLists() });
+      },
+    });
+
+    registry.register({
+      path: GPW_RESET_ROUTE,
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: async (request) => {
+        let body = null;
+        try {
+          body = await request.json();
+        } catch {
+          /* refused below */
+        }
+        if (body?.confirm !== 'reset') return json({ ok: false, error: "confirm must be the string 'reset'" }, 400);
+        try {
+          resetFolders(foldersFile, foldersKey);
+        } catch (error) {
+          return json({ ok: false, error: `could not reset folder lists: ${error?.message ?? error}` }, 500);
+        }
+        tamperedReason = null;
+        foldersSeen = true;
+        ctx.logger?.warn?.('dsh-gpw: folder lists were reset by the operator; all entries cleared and re-signed');
+        return json({ ok: true, tampered: false, folders: folderLists() });
       },
     });
 

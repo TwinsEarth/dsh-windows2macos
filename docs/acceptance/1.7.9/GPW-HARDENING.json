@@ -1,0 +1,25 @@
+{
+  "version": "1.7.9",
+  "case": "GPW-HARDENING",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-25T23:26:10.976Z",
+  "executor": "lead",
+  "task_id": "local-gpw-hardening-20261025232610",
+  "requirement": "a pending class-C call is visible and answerable inline, the three folder lists collapse after three rows, and the folder lists file is MAC-signed and read-only so an external edit is detected and fails closed until the operator resets",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "inline_prompt": "GpwPrompt is mounted on conversation.input.left (id w2m-gpw-prompt): pending count + tool name + allow/deny/open-panel; the launcher shows a badge too",
+      "collapsed_lists": "whitelist / blacklist / recently intercepted each show 3 rows, then \"另有 N 个，展开/收起\" with per-list state",
+      "signing": "v2 HMAC-SHA256 covers both lists; key from foldersKey config / W2M_GPW_FOLDERS_KEY / sidecar *.key (0600); atomic tmp->rename write then 0444 read-only",
+      "tamper_fail_closed": "missing / unreadable / bad-MAC / unsigned-after-seen -> tampered: every path-bearing call is denied (409 in clients) until POST /api/w2m/gpw/reset re-signs",
+      "legacy_migration": "an unsigned pre-1.7.9 file is migrated once, then treated as tampered if it reappears",
+      "tests": "test/gpw-hardening.test.mjs 8/8; test/gpw-tamper-gate.test.mjs 4/4; test/gpw-persistence.test.mjs 5/5; gpw-activation 4/4; gpw-folder-policy 9/9; client-bundle 26/26; claims/installed-version/acceptance-doc pass",
+      "pack": "scripts/pack.mjs builds the tarball deterministically; the canonical sha256 is published on the GitHub Release asset and verified equal to the npm tarball after release",
+      "list_inheritance": "lists and MAC key live under $DSH_HOME/xclient (outside the plugin package): upgrades, restarts and uninstall/reinstall reuse the same signed file; only explicit panel actions (remove row / reset) change the lists — covered by test/gpw-persistence.test.mjs"
+    }
+  }
+}

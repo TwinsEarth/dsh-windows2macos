@@ -7,6 +7,30 @@
 
 All notable changes to this project are documented here.
 
+## [1.7.9] — 2026-10-26
+
+**GPW 三项操作性问题修复：拦截即时弹选择、名单长列表折叠、名单文件防篡改。**
+
+- **拦截即审批（不再静默挂起）**：`tools/pre-execute` 挂起 C 类调用后，客户端在 **composer 行**
+  （`conversation.input.left`）新增内联提示 `GpwPrompt`：显示工具名与「允许本次 / 拒绝本次 / 打开面板」；
+  多个待审批显示数量。浮窗按钮增加待审批数量徽标，`w2m-gpw-open` 事件让内联提示直接打开面板。
+- **名单折叠**：白名单、黑名单、最近被拦截默认各显示 3 条，其余通过「另有 N 个，展开 / 收起」折叠；
+  待审批项新增「加入白名单并允许」「加入黑名单并拒绝」一键动作（服务端 pending 项补充 `folder`）。
+- **名单文件防篡改（fail-closed）**：`$DSH_HOME/xclient/gpw-folders.json` 改为 **MAC 签名 v2（HMAC-SHA256）
+  + 原子写（tmp→rename）+ 写后只读 0444**。密钥在旁路 `*.key`（0600；或配置 `foldersKey` /
+  `W2M_GPW_FOLDERS_KEY`）。
+  - 外部修改（MAC 不匹配）、删除签名文件、去掉签名 → 状态 `tampered`，门控 **fail-closed**：所有命名路径的
+    调用被直接拒绝；面板显示警告并提供「重置名单（清空并重新签名）」。
+  - 旧版无签名文件在首次启动时一次性迁移为 v2；升级后再次出现的无签名/缺失文件视为篡改。
+  - 诚实边界：DSH 与插件同用户运行时，OS 只读位可被有意的进程绕过；但签名校验使**静默改名单不可能**，
+    篡改会被检测并锁定（需操作员重置）。强隔离需独立用户/服务账号（后续项）。
+- **名单继承保证**：黑白名单与其 MAC 密钥位于 `$DSH_HOME/xclient/`（插件包之外），升级、重启、卸载重装都会原样继承；只有面板中的显式「移除 / 重置名单」会改变它。新增 `test/gpw-persistence.test.mjs`（5 项）覆盖。
+- 测试：新增 test/gpw-hardening.test.mjs（8 项：签名往返、只读拒绝直写、MAC 不匹配/删除检测、legacy 标记、reset、密钥 sidecar）
+  与 test/gpw-tamper-gate.test.mjs（4 项：篡改 fail-closed → 409 → 重置恢复 → 内联审批放行；legacy 迁移；客户端内联提示/折叠/重置静态断言）。
+  reset、密钥 sidecar）。`client-bundle` 更新为五个 composer 控件；`gpw-activation` 用临时名单文件隔离，
+  不再写真实 `~/.dsh`。
+- 证据：`gpw-hardening 8/8`、`gpw-folder-policy 9/9`、`gpw-activation 4/4`、`client-bundle 26/26`（node 进程内运行）。
+
 ## [1.7.8] — 2026-10-26
 
 **GPW 启用失败修复（第二个）：`TypeError: Cannot read properties of undefined (reading 'layers')`。**
