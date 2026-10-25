@@ -1,0 +1,24 @@
+{
+  "version": "1.7.5-beta.1",
+  "case": "GPW-FOLDER-GATE",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-25T13:47:23.010Z",
+  "executor": "lead",
+  "task_id": "local-gpw-20261025134723",
+  "requirement": "under the 完全权限 preset GPW classifies every path into blacklist (deny), whitelist (allow with budget) or other (GPW pending queue), and the operator can add/remove folders from the panel without editing any profile YAML",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "three_classes": "deny wins over allow; workspace and whitelist pass; everything else waits",
+      "deny_mechanism": "ctx.tools.guard returns a reason (order-independent); pre-execute also denies",
+      "whitelist_budget": "auto-allow bounded by rolling window and min gap; exhausted -> pending",
+      "pending_queue": "held calls resolve allow/deny from the GPW route; timeout denies",
+      "panel": "GpwPanel lists folders, adds via host native picker, shows pending approvals with allow/deny",
+      "storage": "$DSH_HOME/xclient/gpw-folders.json (no profile YAML edits)",
+      "unit_tests": "test/gpw-folder-policy.test.mjs 6/6 pass"
+    }
+  }
+}

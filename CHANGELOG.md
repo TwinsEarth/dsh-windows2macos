@@ -7,6 +7,21 @@
 
 All notable changes to this project are documented here.
 
+## [1.7.5-beta.1] — 2026-10-25
+
+**GPW 升级为文件夹三分类网关（完全权限下生效）：黑名单拒绝 / 白名单放行 / 其余进入 GPW 自己的待审批队列。**
+
+- 生效条件：仅当会话权限预设为 **完全权限**（`danger-full-access`）时拦截；其它预设交给 DSH 自己的沙箱/审批，
+  不重复介入。
+- **黑名单（拒绝）**：`ctx.tools.guard()` 同步拦截，返回拒绝原因即不执行；与 `tools/pre-execute` 的监听顺序无关。
+- **白名单（通过）**：等价于扩大的工作区，无需再审；仍受自动审批预算约束（每滚动窗口 10 次、间隔 3s），
+  预算耗尽后同样进入待审批队列而不是静默放行。
+- **其它文件夹（C 类，待审批）**：调用被挂起，进入 GPW 自己的待审批队列；用户在 GPW 面板点「允许本次/拒绝本次」
+  才继续（默认 120s 无答复则拒绝）。这不是 DSH 的 approval 策略，所以在 approval=never 的完全权限下依然有效。
+- 面板（Node 执行能力菜单内新增「GPW 文件夹策略」）：白/黑名单展示与移除；「添加文件夹」通过宿主原生选择器
+  （Windows FolderBrowserDialog / macOS choose folder / zenity）选路径，读写名单不需要编辑任何 profile YAML；
+  名单保存在 `$DSH_HOME/xclient/gpw-folders.json`，另有待审批列表与允许/拒绝按钮。
+- 测试：`test/gpw-folder-policy.test.mjs`（6/6，三分类、deny 优先、前缀误判防护、命令路径提取、预算映射）。
 ## [1.7.4] — 2026-10-25
 
 **修复两处桌面宿主兼容性问题：`agent.identity` 崩溃、切换 relay 后旧 device token 导致 401 无法入队。**

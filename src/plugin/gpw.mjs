@@ -1,205 +1,405 @@
 /**
- * DSH-GPW -- Global Permission Watchdog (v1.0.5), shipped as an OPTIONAL sub-plugin of @twinsearth/w2m-dsh-plugin.
+ * DSH-GPW v2 (v1.7.5-beta.1) — Global Permission Watchdog, now a folder gate rather than an approval answerer.
  *
- * ## What it does, in one paragraph
+ * ## The three classes and who answers
  *
- * It answers permission requests on the `approval/request` waterfall with a hard global budget: **at most 10
- * auto-approvals per rolling 60 s, at least 3000 ms apart.** Anything past either limit returns `next()`, which is
- * *"no opinion"* -- the request falls through to the human prompt and **waits**. It never refuses, and it never
- * changes what is being asked; it only decides who answers and how fast.
+ *   A. blacklist  -> denied. A synchronous `ctx.tools.guard()` is registered as well, so the denial holds no matter
+ *                    which other pre-execute listener runs first.
+ *   B. whitelist  -> allowed without a human. The whitelist is an explicit extension of the workspace (same decision,
+ *                    plus the auto-approval budget below).
+ *   C. other      -> GPW's own pending queue: the call is held until the operator allows/denies it in the GPW panel
+ *                    (or the pending timeout fires, which denies). This is the plugin's requirement, not DSH's
+ *                    approval policy, which is why it keeps working under "完全权限" (approval: never).
  *
- * ## Why the budget exists
+ * ## Full-access only
  *
- * Every auto-approval is a permission decision made without a human reading it. A watchdog with no ceiling is a
- * plugin that grants everything and is indistinguishable from one that is working correctly -- the failure mode this
- * repository has recorded seven times. The two counters it logs (`allowedTotal`, `deferredTotal`) exist so that
- * "mounted and doing nothing" and "mounted and working" look different.
+ * The gate runs only when `ctx.permissionPresets.current(session) === 'danger-full-access'` (the GUI preset labelled
+ * 完全权限). In the other presets DSH's own sandbox/approval answers the question and a second gate would only add
+ * surprises; the listener returns `next()` untouched.
  *
- * ## How it is enabled -- it is NOT on by default
+ * ## The budget still exists
  *
- * Installing this package does **not** mount the watchdog: its own `dsh.bundle.patch` mounts only the w2m plugin.
- * To enable it, add ONE `insert:` to the profile's `cordis.patch.yml`:
+ * Whitelisted auto-approvals are still permission decisions made without a human reading them, so the same rolling
+ * window applies. When the budget is exhausted a whitelisted call does not silently pass: it falls into the pending
+ * queue like a class-C call. That is the "升级自动审批" half: automatic, but bounded and visible.
  *
- *     - insert:
- *         - id: dsh-gpw
- *           name: '@twinsearth/w2m-dsh-plugin/gpw'
- *           config:
- *             maxPerWindow: 10      # optional; these are the defaults
- *             windowMs: 60000
- *             minGapMs: 3000
+ * ## Why the path extraction is a heuristic
  *
- * `insert:` is required: no earlier layer creates a `dsh-gpw` row, and a bare `- id:` patch aimed at a
- * non-existent row is skipped **silently**. Remove the row to disable it again -- no other change is needed.
- *
- * ## Its dependency, and the bug that shipped in the standalone copy
- *
- * `inject = ['approval']`. The first version of this module declared `{ required: ['approval'] }`; the host reads
- * `inject` as an array (**283 array-shaped declarations across the shipped tree, 0 object-shaped**), so it waited
- * for a service named `required` and stayed `pending (waiting for service: required)` forever. `approval` itself
- * exists: `@deepseek-ai/dsh-base`'s patch mounts `@deepseek-ai/dsh-user-approval` as id `approval`.
- *
- * ## Provenance
- *
- * Written as a standalone package `dsh-approval-ratelimit@1.0.0`, then folded in here so a fleet operator installs
- * one thing. The logic is unchanged apart from the name and the `inject` fix; every comment explaining a decision is
- * the original.
+ * The pre-execute event exposes the tool name and its JSON arguments, not a typed filesystem operation. Structured path
+ * fields are exact; command tools are scanned for absolute-looking tokens. A path assembled at runtime (a variable, a
+ * shell substitution) cannot be seen before execution -- that limitation is stated here instead of being implied.
  */
 
-/** @type {import('node:timers').Timeout | null} */
-let logTimer = null;
+import { spawn } from 'node:child_process';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { randomUUID } from 'node:crypto';
+
+import { classifyToolCall } from './folder-policy.mjs';
 
 export const name = 'dsh-gpw';
 
-export const inject = ['approval'];
+/** Services this plugin cannot work without. `connection` is used only for the operator routes. */
+export const inject = ['permissionPresets'];
+
+export const FULL_ACCESS_PRESET = 'danger-full-access';
+export const GPW_ROUTE = '/api/w2m/gpw/state';
+export const GPW_FOLDERS_ROUTE = '/api/w2m/gpw/folders';
+export const GPW_DECIDE_ROUTE = '/api/w2m/gpw/decide';
+export const GPW_PICK_ROUTE = '/api/w2m/gpw/pick';
+
+const DEFAULT_BUDGET = { maxPerWindow: 10, windowMs: 60_000, minGapMs: 3_000 };
+const DEFAULT_PENDING_TIMEOUT_MS = 120_000;
+const NO_STORE = { 'cache-control': 'no-store' };
+
+/** Resolve the folders file: config first, then `$DSH_HOME/xclient/gpw-folders.json`. */
+export function foldersFileOf(config = {}) {
+  if (typeof config.foldersFile === 'string' && config.foldersFile.trim() !== '') return config.foldersFile.trim();
+  const home = typeof process.env.DSH_HOME === 'string' && process.env.DSH_HOME !== '' ? process.env.DSH_HOME : join(homedir(), '.dsh');
+  return join(home, 'xclient', 'gpw-folders.json');
+}
+
+/** Read the operator-managed lists. A missing or corrupt file is empty lists, never a crash on mount. */
+export function readFolders(file) {
+  try {
+    const parsed = JSON.parse(readFileSync(file, 'utf8'));
+    return {
+      whitelist: Array.isArray(parsed?.whitelist) ? parsed.whitelist.filter((v) => typeof v === 'string' && v !== '') : [],
+      blacklist: Array.isArray(parsed?.blacklist) ? parsed.blacklist.filter((v) => typeof v === 'string' && v !== '') : [],
+    };
+  } catch {
+    return { whitelist: [], blacklist: [] };
+  }
+}
+
+/** Persist the operator-managed lists atomically enough for a single-writer settings file. */
+export function writeFolders(file, folders) {
+  mkdirSync(dirname(file), { recursive: true });
+  const next = {
+    whitelist: [...new Set((folders?.whitelist ?? []).filter((v) => typeof v === 'string' && v.trim() !== ''))],
+    blacklist: [...new Set((folders?.blacklist ?? []).filter((v) => typeof v === 'string' && v.trim() !== ''))],
+  };
+  writeFileSync(file, JSON.stringify(next, null, 2) + '\n', 'utf8');
+  return next;
+}
+
+/**
+ * Pure gate decision, exported so the three classes are testable without a session.
+ *
+ * The full-access check happens in the listeners (it needs the session's preset), so this function only maps a
+ * classification to an outcome: deny wins, whitelist passes while the budget lasts, and anything else waits.
+ *
+ * @param {{classification: {decision: 'deny'|'allow'|'pass', reason?: string},
+ *          autoAllowBudgetRemaining?: boolean}} input
+ * @returns {{kind: 'allow'|'deny'|'pending', reason: string}}
+ */
+export function planGate(input) {
+  const classification = input?.classification ?? { decision: 'pass', reason: '' };
+  if (classification.decision === 'deny') {
+    return { kind: 'deny', reason: classification.reason ?? 'the target is on the blacklist' };
+  }
+  if (classification.decision === 'allow') {
+    if (input.autoAllowBudgetRemaining === false) {
+      return { kind: 'pending', reason: 'whitelisted, but the auto-approval budget is exhausted' };
+    }
+    return { kind: 'allow', reason: classification.reason ?? 'the target is whitelisted' };
+  }
+  return { kind: 'pending', reason: classification.reason ?? 'the target is on neither list' };
+}
+
+/** Map a tool-exec object onto the shape folder-policy understands. */
+export function toolCallOf(exec) {
+  const parameters = exec?.parameters ?? exec?.arguments ?? exec?.input ?? exec?.args ?? exec?.toolCall?.parameters ?? null;
+  return {
+    name: typeof exec?.name === 'string' ? exec.name : (exec?.toolName ?? exec?.tool ?? null),
+    arguments: parameters,
+  };
+}
+
+/** Coerce a config value to a positive integer, falling back to the default. */
+function positiveInt(value, fallback) {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+
+/** Launch a native folder picker and resolve with its path, or null. Never rejects. */
+function pickFolder() {
+  return new Promise((resolve) => {
+    const done = (value) => resolve(typeof value === 'string' && value.trim() !== '' ? value.trim() : null);
+    try {
+      if (process.platform === 'win32') {
+        const script = [
+          'Add-Type -AssemblyName System.Windows.Forms',
+          '$d = New-Object System.Windows.Forms.FolderBrowserDialog',
+          '$d.Description = "GPW: choose a folder for the whitelist or blacklist"',
+          'if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($d.SelectedPath) }',
+        ].join('; ');
+        const child = spawn('powershell.exe', ['-NoProfile', '-STA', '-Command', script], { windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
+        let out = '';
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          done(out.trim());
+        };
+        child.stdout?.on('data', (chunk) => {
+          out = (out + chunk.toString('utf8')).slice(-4096);
+        });
+        child.on('error', () => finish());
+        child.on('close', finish);
+        setTimeout(() => {
+          try {
+            child.kill();
+          } catch {
+            /* already gone */
+          }
+          finish();
+        }, 120_000).unref?.();
+        return;
+      }
+      if (process.platform === 'darwin') {
+        const child = spawn('osascript', ['-e', 'POSIX path of (choose folder with prompt "GPW: choose a folder")'], { stdio: ['ignore', 'pipe', 'ignore'] });
+        let out = '';
+        child.stdout?.on('data', (chunk) => {
+          out += chunk.toString('utf8');
+        });
+        child.on('error', () => done(null));
+        child.on('close', () => done(out.trim()));
+        return;
+      }
+      const child = spawn('zenity', ['--file-selection', '--directory', '--title=GPW: choose a folder'], { stdio: ['ignore', 'pipe', 'ignore'] });
+      let out = '';
+      child.stdout?.on('data', (chunk) => {
+        out += chunk.toString('utf8');
+      });
+      child.on('error', () => done(null));
+      child.on('close', () => done(out.trim()));
+    } catch {
+      done(null);
+    }
+  });
+}
 
 /**
  * @param {object} ctx Cordis context.
  * @param {object} [config]
- * @param {number} [config.maxPerWindow] Auto-approvals allowed per rolling window. Default 10.
- * @param {number} [config.windowMs] Window length in ms. Default 60000.
- * @param {number} [config.minGapMs] Minimum gap between two auto-approvals, in ms. Default 3000.
  */
 export function apply(ctx, config = {}) {
-  const maxPerWindow = positiveInt(config.maxPerWindow, 10);
-  const windowMs = positiveInt(config.windowMs, 60_000);
-  const minGapMs = positiveInt(config.minGapMs, 3_000);
+  const maxPerWindow = positiveInt(config.maxPerWindow, DEFAULT_BUDGET.maxPerWindow);
+  const windowMs = positiveInt(config.windowMs, DEFAULT_BUDGET.windowMs);
+  const minGapMs = positiveInt(config.minGapMs, DEFAULT_BUDGET.minGapMs);
+  const pendingTimeoutMs = positiveInt(config.pendingTimeoutMs, DEFAULT_PENDING_TIMEOUT_MS);
+  const requireFullAccess = config.requireFullAccess !== false;
+  const foldersFile = foldersFileOf(config);
 
-  /** Timestamps of the auto-approvals inside the current window, oldest first. */
+  /** Timestamps of auto-approvals in the current window. */
   const approvals = [];
-  /** Timestamp of the most recent auto-approval, or null. */
   let lastApprovalAt = null;
-  /** Counters for the periodic line, so the operator can see this thing working. */
-  let deferredTotal = 0;
   let allowedTotal = 0;
+  let pendingTotal = 0;
+  let deniedTotal = 0;
+  /** id -> { resolve, createdAt, tool, reason, paths } */
+  const pending = new Map();
 
-  /**
-   * Drop approvals that have aged out of the window.
-   *
-   * A rolling window is the requirement; a fixed one would allow a burst of `2 * maxPerWindow`
-   * straddling a boundary (ten at the end of one minute, ten at the start of the next).
-   *
-   * @param {number} now
-   */
-  function prune(now) {
-    const cutoff = now - windowMs;
-    while (approvals.length > 0 && approvals[0] <= cutoff) approvals.shift();
-  }
-
-  /**
-   * Decide one request, without ever rejecting.
-   *
-   * @param {number} now
-   * @returns {{ allow: boolean, reason: string, inWindow: number }}
-   */
-  function decide(now) {
-    prune(now);
-    if (lastApprovalAt !== null && now - lastApprovalAt < minGapMs) {
-      return {
-        allow: false,
-        reason: `only ${now - lastApprovalAt} ms since the last auto-approval (needs ${minGapMs} ms)`,
-        inWindow: approvals.length,
-      };
-    }
-    if (approvals.length >= maxPerWindow) {
-      return {
-        allow: false,
-        reason: `${approvals.length} auto-approvals already in the last ${Math.round(windowMs / 1000)} s (limit ${maxPerWindow})`,
-        inWindow: approvals.length,
-      };
-    }
-    return { allow: true, reason: 'within both limits', inWindow: approvals.length };
-  }
-
-  /**
-   * One line per window of real activity, so a silent plugin and a broken plugin look different.
-   *
-   * The failure mode this guards against is the one this whole session keeps meeting: a component
-   * that is mounted, doing nothing, and indistinguishable from a healthy one. `allowedTotal` and
-   * `deferredTotal` are the two numbers that tell them apart.
-   */
-  function startReporter() {
-    if (logTimer !== null) return () => {};
-    logTimer = setInterval(() => {
-      if (allowedTotal === 0 && deferredTotal === 0) return;
-      ctx.logger?.info?.(
-        `approval-ratelimit: ${allowedTotal} auto-approved, ${deferredTotal} deferred to the human `
-        + `(limit ${maxPerWindow}/${Math.round(windowMs / 1000)}s, gap ${minGapMs}ms, ${approvals.length} in the current window)`,
-      );
-    }, windowMs);
-    logTimer.unref?.();
-    return () => {
-      if (logTimer !== null) {
-        clearInterval(logTimer);
-        logTimer = null;
-      }
+  const folderLists = () => {
+    const stored = readFolders(foldersFile);
+    const merge = (a, b) => [...new Set([...(Array.isArray(a) ? a : []), ...b])];
+    return {
+      whitelist: merge(config.whitelist, stored.whitelist),
+      blacklist: merge(config.blacklist, stored.blacklist),
     };
-  }
+  };
 
-  /**
-   * The answerer.
-   *
-   * Registered on the `approval/request` waterfall. Returning `'allowed-once'` grants this one
-   * request; returning `next()` is "no opinion" and hands the decision to whoever answers next --
-   * which is the human prompt, and it *waits* there rather than being refused.
-   */
-  const disposeListener = ctx.on('approval/request', (request, next) => {
-    const now = Date.now();
-    const verdict = decide(now);
-    if (!verdict.allow) {
-      deferredTotal += 1;
-      // Debug, not warn: deferring is the designed behaviour of this plugin, and warning about the
-      // normal path trains an operator to ignore the line that would matter.
-      ctx.logger?.debug?.(
-        `approval-ratelimit: deferring to the human -- ${verdict.reason}`
-        + (request?.toolName ? ` (tool ${request.toolName})` : ''),
-      );
-      return next();
-    }
-    approvals.push(now);
-    lastApprovalAt = now;
+  const prune = (nowMs) => {
+    while (approvals.length > 0 && nowMs - approvals[0] >= windowMs) approvals.shift();
+  };
+
+  /** Consume one budget slot if one is available. */
+  const takeBudgetSlot = () => {
+    const nowMs = Date.now();
+    prune(nowMs);
+    if (lastApprovalAt !== null && nowMs - lastApprovalAt < minGapMs) return false;
+    if (approvals.length >= maxPerWindow) return false;
+    approvals.push(nowMs);
+    lastApprovalAt = nowMs;
     allowedTotal += 1;
-    ctx.logger?.info?.(
-      `approval-ratelimit: auto-approved (${approvals.length}/${maxPerWindow} in the current window)`
-      + (request?.toolName ? ` tool ${request.toolName}` : '')
-      + (request?.reason ? ` -- ${request.reason}` : ''),
-    );
-    return 'allowed-once';
+    return true;
+  };
+
+  const isFullAccess = (agent) => {
+    try {
+      if (typeof ctx.permissionPresets?.current !== 'function') return false;
+      return ctx.permissionPresets.current(agent?.session) === FULL_ACCESS_PRESET;
+    } catch {
+      return false;
+    }
+  };
+
+  /** Hold a class-C (or over-budget B) call until the operator answers. */
+  const waitForOperator = (exec, reason, paths) => new Promise((resolve) => {
+    const id = randomUUID();
+    const entry = {
+      resolve,
+      createdAt: Date.now(),
+      tool: String(toolCallOf(exec).name ?? 'tool'),
+      reason,
+      paths,
+    };
+    pending.set(id, entry);
+    pendingTotal += 1;
+    const timer = setTimeout(() => {
+      if (!pending.has(id)) return;
+      pending.delete(id);
+      deniedTotal += 1;
+      resolve({ kind: 'deny', reason: `GPW: no operator answer within ${Math.round(pendingTimeoutMs / 1000)} s for ${entry.tool}` });
+    }, pendingTimeoutMs);
+    timer.unref?.();
+    entry.timer = timer;
   });
 
-  const stopReporter = startReporter();
+  const decidePending = (id, decision) => {
+    const entry = pending.get(id);
+    if (entry === undefined) return { ok: false, error: 'unknown pending request' };
+    pending.delete(id);
+    try {
+      clearTimeout(entry.timer);
+    } catch {
+      /* already fired */
+    }
+    if (decision === 'allow') {
+      allowedTotal += 1;
+      entry.resolve({ kind: 'allow', reason: 'GPW: allowed by the operator' });
+    } else {
+      deniedTotal += 1;
+      entry.resolve({ kind: 'deny', reason: 'GPW: denied by the operator' });
+    }
+    return { ok: true };
+  };
 
-  // Reversible: the host owns this effect, so an unload removes the answerer and the timer with it.
-  // A listener that outlived its plugin would keep approving requests with nobody watching.
-  if (typeof ctx.effect === 'function') {
-    ctx.effect(() => () => {
-      disposeListener?.();
-      stopReporter();
+  // --- A: the blacklist denial must hold regardless of listener order -------------------------------------------------
+  ctx.tools?.guard?.((exec) => {
+    if (!isFullAccess(exec?.agent)) return undefined;
+    const lists = folderLists();
+    if (lists.blacklist.length === 0) return undefined;
+    const call = toolCallOf(exec);
+    const result = classifyToolCall({ ...call, blacklist: lists.blacklist });
+    if (result.decision !== 'deny') return undefined;
+    deniedTotal += 1;
+    ctx.logger?.warn?.(`dsh-gpw: refused ${String(call.name ?? 'tool')} -- ${result.reason}`);
+    return `GPW: ${result.reason}; the call was not executed`;
+  });
+
+  // --- B/C: the pre-execute gate ---------------------------------------------------------------------------------------
+  ctx.on('tools/pre-execute', async (exec, next) => {
+    if (requireFullAccess && !isFullAccess(exec?.agent)) return next();
+    const lists = folderLists();
+    if (lists.blacklist.length === 0 && lists.whitelist.length === 0) return next();
+    const call = toolCallOf(exec);
+    let cwd = null;
+    try {
+      cwd = await ctx.workingDirectory?.ensure?.(exec.agent, exec.signal);
+    } catch {
+      cwd = null;
+    }
+    const classification = classifyToolCall({ ...call, whitelist: lists.whitelist, blacklist: lists.blacklist, workspace: cwd ?? null });
+    if (classification.decision === 'pass' && classification.paths.length === 0) return next();
+    const budget = classification.decision === 'allow' ? takeBudgetSlot() : false;
+    const plan = planGate({ classification, autoAllowBudgetRemaining: classification.decision === 'allow' ? budget !== false : undefined });
+    if (plan.kind === 'allow') {
+      ctx.logger?.info?.(`dsh-gpw: auto-allowed ${String(call.name ?? 'tool')} -- ${plan.reason}`);
+      return { kind: 'allow' };
+    }
+    if (plan.kind === 'deny') {
+      deniedTotal += 1;
+      ctx.logger?.warn?.(`dsh-gpw: refused ${String(call.name ?? 'tool')} -- ${plan.reason}`);
+      return { kind: 'deny', reason: `GPW: ${plan.reason}` };
+    }
+    ctx.logger?.info?.(`dsh-gpw: holding ${String(call.name ?? 'tool')} for operator -- ${plan.reason}`);
+    return waitForOperator(exec, plan.reason, classification.paths);
+  });
+
+  // --- operator routes (folders + pending queue + native picker) ---------------------------------------------------------
+  ctx.inject(['connection'], (webCtx) => {
+    const registry = webCtx?.connection?.fetch;
+    if (registry === undefined || typeof registry.register !== 'function') return;
+    const json = (body, status = 200) => Response.json(body, { status, headers: NO_STORE });
+
+    registry.register({
+      path: GPW_ROUTE,
+      methods: ['GET'],
+      requestBody: 'buffered',
+      fetch: async () => json({
+        ok: true,
+        enabled: true,
+        require_full_access: requireFullAccess,
+        folders: folderLists(),
+        counters: { allowedTotal, pendingTotal, deniedTotal, budgetWindow: approvals.length, maxPerWindow },
+        pending: [...pending.entries()].map(([id, entry]) => ({
+          id,
+          tool: entry.tool,
+          reason: entry.reason,
+          paths: entry.paths,
+          pending_ms: Date.now() - entry.createdAt,
+        })),
+      }),
     });
-  } else {
-    // No effect seam: say so rather than pretending the cleanup is guaranteed.
-    ctx.logger?.warn?.(
-      'approval-ratelimit: the context provides no ctx.effect, so the answerer and its reporter '
-      + 'cannot be released on unload',
-    );
-  }
+
+    registry.register({
+      path: GPW_FOLDERS_ROUTE,
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: async (request) => {
+        let body = null;
+        try {
+          body = await request.json();
+        } catch {
+          /* refused below */
+        }
+        const list = body?.list;
+        if (list !== 'whitelist' && list !== 'blacklist') return json({ ok: false, error: 'list must be whitelist or blacklist' }, 400);
+        if (body?.action !== 'add' && body?.action !== 'remove') return json({ ok: false, error: 'action must be add or remove' }, 400);
+        const folder = typeof body?.path === 'string' ? body.path.trim() : '';
+        if (body.action === 'add' && folder === '') return json({ ok: false, error: 'path must be a non-empty string' }, 400);
+        const stored = readFolders(foldersFile);
+        const set = new Set(stored[list]);
+        if (body.action === 'add') set.add(folder);
+        else set.delete(folder);
+        const next = { ...stored, [list]: [...set] };
+        writeFolders(foldersFile, next);
+        ctx.logger?.info?.(`dsh-gpw: ${body.action} ${folder} to ${list}`);
+        return json({ ok: true, folders: folderLists(), stored: next });
+      },
+    });
+
+    registry.register({
+      path: GPW_DECIDE_ROUTE,
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: async (request) => {
+        let body = null;
+        try {
+          body = await request.json();
+        } catch {
+          /* refused below */
+        }
+        if (typeof body?.id !== 'string' || (body?.decision !== 'allow' && body?.decision !== 'deny')) {
+          return json({ ok: false, error: 'id and decision (allow|deny) are required' }, 400);
+        }
+        const result = decidePending(body.id, body.decision);
+        return json(result.ok ? { ok: true } : { ok: false, error: result.error }, result.ok ? 200 : 404);
+      },
+    });
+
+    registry.register({
+      path: GPW_PICK_ROUTE,
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: async () => json({ ok: true, path: await pickFolder() }),
+    });
+  });
 
   ctx.logger?.info?.(
-    `approval-ratelimit: active -- at most ${maxPerWindow} auto-approvals per ${Math.round(windowMs / 1000)} s, `
-    + `at least ${minGapMs} ms apart, process-wide; everything else waits for the human`,
+    `dsh-gpw: active -- full-access only=${requireFullAccess}, at most ${maxPerWindow} auto-approvals per ${Math.round(windowMs / 1000)} s, `
+    + `pending timeout ${Math.round(pendingTimeoutMs / 1000)} s; blacklist denies, whitelist passes, everything else waits for the operator`,
   );
-}
-
-/**
- * Coerce a config value to a positive integer, falling back to the default.
- *
- * A misconfigured limit must not silently become "0", which would disable the plugin while looking
- * like it was on -- and must not become a non-finite number, which would break the comparison.
- *
- * @param {unknown} value
- * @param {number} fallback
- * @returns {number}
- */
-function positiveInt(value, fallback) {
-  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return fallback;
-  return Math.floor(value);
 }
