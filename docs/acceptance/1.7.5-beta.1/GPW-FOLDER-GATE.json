@@ -16,7 +16,7 @@
       "deny_mechanism": "ctx.tools.guard returns a reason (order-independent); pre-execute also denies",
       "whitelist_budget": "auto-allow bounded by rolling window and min gap; exhausted -> pending",
       "pending_queue": "held calls resolve allow/deny from the GPW route; timeout denies",
-      "panel": "GpwPanel lists folders, adds via host native picker, shows pending approvals with allow/deny",
+      "panel": "floating \"GPW 文件夹\" launcher in the lower-right corner; panel has whitelist / blacklist / recently-intercepted sections plus the pending queue; folders are added by typing a path (host validates the directory exists) or in one click from a recently intercepted call; client-bundle suite 26/26 green",
       "storage": "$DSH_HOME/xclient/gpw-folders.json (no profile YAML edits)",
       "unit_tests": "test/gpw-folder-policy.test.mjs 6/6 pass"
     }

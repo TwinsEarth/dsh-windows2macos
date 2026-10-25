@@ -23,17 +23,18 @@
  * window applies. When the budget is exhausted a whitelisted call does not silently pass: it falls into the pending
  * queue like a class-C call. That is the "升级自动审批" half: automatic, but bounded and visible.
  *
- * ## Why the path extraction is a heuristic
+ * ## Operator surface
  *
- * The pre-execute event exposes the tool name and its JSON arguments, not a typed filesystem operation. Structured path
- * fields are exact; command tools are scanned for absolute-looking tokens. A path assembled at runtime (a variable, a
- * shell substitution) cannot be seen before execution -- that limitation is stated here instead of being implied.
+ * The panel is rendered by the w2m client (`lib/client.js`): a floating "GPW 文件夹" button opens the three sections
+ * (whitelist / blacklist / recently intercepted) plus the pending queue. Folders can be typed (validated against the
+ * filesystem here) or taken from the recently-intercepted list in one click. Lists live in a JSON file under
+ * `$DSH_HOME/xclient/`, never in the profile patch.
  */
 
 import { spawn } from 'node:child_process';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import { classifyToolCall } from './folder-policy.mjs';
@@ -51,6 +52,7 @@ export const GPW_PICK_ROUTE = '/api/w2m/gpw/pick';
 
 const DEFAULT_BUDGET = { maxPerWindow: 10, windowMs: 60_000, minGapMs: 3_000 };
 const DEFAULT_PENDING_TIMEOUT_MS = 120_000;
+const RECENT_LIMIT = 20;
 const NO_STORE = { 'cache-control': 'no-store' };
 
 /** Resolve the folders file: config first, then `$DSH_HOME/xclient/gpw-folders.json`. */
@@ -73,7 +75,7 @@ export function readFolders(file) {
   }
 }
 
-/** Persist the operator-managed lists atomically enough for a single-writer settings file. */
+/** Persist the operator-managed lists. */
 export function writeFolders(file, folders) {
   mkdirSync(dirname(file), { recursive: true });
   const next = {
@@ -85,10 +87,55 @@ export function writeFolders(file, folders) {
 }
 
 /**
- * Pure gate decision, exported so the three classes are testable without a session.
+ * Validate a typed folder before it enters a list.
  *
- * The full-access check happens in the listeners (it needs the session's preset), so this function only maps a
- * classification to an outcome: deny wins, whitelist passes while the budget lasts, and anything else waits.
+ * The panel's input is the one place the operator can write a path by hand, so the check belongs here: an absolute path
+ * to an existing directory. `resolve` normalises `..` and trailing separators so the same folder is one entry.
+ *
+ * @param {unknown} input
+ * @returns {{ok: true, path: string} | {ok: false, error: string}}
+ */
+export function validateFolderInput(input) {
+  if (typeof input !== 'string' || input.trim() === '') return { ok: false, error: 'a folder path is required' };
+  const raw = input.trim();
+  if (/^[a-zA-Z]:$/.test(raw) || raw === '/') return { ok: false, error: 'a drive root cannot be a policy folder' };
+  const absolute = resolve(raw);
+  try {
+    if (!statSync(absolute).isDirectory()) return { ok: false, error: `not a directory: ${absolute}` };
+  } catch {
+    return { ok: false, error: `folder does not exist: ${absolute}` };
+  }
+  return { ok: true, path: absolute };
+}
+
+/** The nearest existing directory at or above `target`, for one-click "add this to a list". */
+export function folderForPath(target) {
+  if (typeof target !== 'string' || target.trim() === '') return null;
+  let current = resolve(target.trim());
+  for (let depth = 0; depth < 40; depth += 1) {
+    try {
+      if (statSync(current).isDirectory()) return current;
+    } catch {
+      /* keep walking up */
+    }
+    const parent = dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+  return null;
+}
+
+/** Map a tool-exec object onto the shape folder-policy understands. */
+export function toolCallOf(exec) {
+  const parameters = exec?.parameters ?? exec?.arguments ?? exec?.input ?? exec?.args ?? exec?.toolCall?.parameters ?? null;
+  return {
+    name: typeof exec?.name === 'string' ? exec.name : (exec?.toolName ?? exec?.tool ?? null),
+    arguments: parameters,
+  };
+}
+
+/**
+ * Pure gate decision, exported so the three classes are testable without a session.
  *
  * @param {{classification: {decision: 'deny'|'allow'|'pass', reason?: string},
  *          autoAllowBudgetRemaining?: boolean}} input
@@ -103,18 +150,9 @@ export function planGate(input) {
     if (input.autoAllowBudgetRemaining === false) {
       return { kind: 'pending', reason: 'whitelisted, but the auto-approval budget is exhausted' };
     }
-    return { kind: 'allow', reason: classification.reason ?? 'the target is whitelisted' };
+    return { kind: 'allow', reason: classification.reason ?? 'the target is on the whitelist' };
   }
   return { kind: 'pending', reason: classification.reason ?? 'the target is on neither list' };
-}
-
-/** Map a tool-exec object onto the shape folder-policy understands. */
-export function toolCallOf(exec) {
-  const parameters = exec?.parameters ?? exec?.arguments ?? exec?.input ?? exec?.args ?? exec?.toolCall?.parameters ?? null;
-  return {
-    name: typeof exec?.name === 'string' ? exec.name : (exec?.toolName ?? exec?.tool ?? null),
-    arguments: parameters,
-  };
 }
 
 /** Coerce a config value to a positive integer, falling back to the default. */
@@ -124,8 +162,8 @@ function positiveInt(value, fallback) {
 
 /** Launch a native folder picker and resolve with its path, or null. Never rejects. */
 function pickFolder() {
-  return new Promise((resolve) => {
-    const done = (value) => resolve(typeof value === 'string' && value.trim() !== '' ? value.trim() : null);
+  return new Promise((resolvePath) => {
+    const done = (value) => resolvePath(typeof value === 'string' && value.trim() !== '' ? value.trim() : null);
     try {
       if (process.platform === 'win32') {
         const script = [
@@ -200,6 +238,13 @@ export function apply(ctx, config = {}) {
   let deniedTotal = 0;
   /** id -> { resolve, createdAt, tool, reason, paths } */
   const pending = new Map();
+  /** Newest-first record of calls the gate saw, so the panel can offer "add this folder" in one click. */
+  const recent = [];
+
+  const noteRecent = (entry) => {
+    recent.unshift({ at: Date.now(), ...entry });
+    if (recent.length > RECENT_LIMIT) recent.length = RECENT_LIMIT;
+  };
 
   const folderLists = () => {
     const stored = readFolders(foldersFile);
@@ -236,10 +281,10 @@ export function apply(ctx, config = {}) {
   };
 
   /** Hold a class-C (or over-budget B) call until the operator answers. */
-  const waitForOperator = (exec, reason, paths) => new Promise((resolve) => {
+  const waitForOperator = (exec, reason, paths) => new Promise((resolveDecision) => {
     const id = randomUUID();
     const entry = {
-      resolve,
+      resolve: resolveDecision,
       createdAt: Date.now(),
       tool: String(toolCallOf(exec).name ?? 'tool'),
       reason,
@@ -251,7 +296,7 @@ export function apply(ctx, config = {}) {
       if (!pending.has(id)) return;
       pending.delete(id);
       deniedTotal += 1;
-      resolve({ kind: 'deny', reason: `GPW: no operator answer within ${Math.round(pendingTimeoutMs / 1000)} s for ${entry.tool}` });
+      resolveDecision({ kind: 'deny', reason: `GPW: no operator answer within ${Math.round(pendingTimeoutMs / 1000)} s for ${entry.tool}` });
     }, pendingTimeoutMs);
     timer.unref?.();
     entry.timer = timer;
@@ -285,6 +330,7 @@ export function apply(ctx, config = {}) {
     const result = classifyToolCall({ ...call, blacklist: lists.blacklist });
     if (result.decision !== 'deny') return undefined;
     deniedTotal += 1;
+    noteRecent({ tool: String(call.name ?? 'tool'), decision: 'deny', reason: result.reason, paths: result.paths });
     ctx.logger?.warn?.(`dsh-gpw: refused ${String(call.name ?? 'tool')} -- ${result.reason}`);
     return `GPW: ${result.reason}; the call was not executed`;
   });
@@ -305,20 +351,23 @@ export function apply(ctx, config = {}) {
     if (classification.decision === 'pass' && classification.paths.length === 0) return next();
     const budget = classification.decision === 'allow' ? takeBudgetSlot() : false;
     const plan = planGate({ classification, autoAllowBudgetRemaining: classification.decision === 'allow' ? budget !== false : undefined });
-    if (plan.kind === 'allow') {
-      ctx.logger?.info?.(`dsh-gpw: auto-allowed ${String(call.name ?? 'tool')} -- ${plan.reason}`);
-      return { kind: 'allow' };
-    }
     if (plan.kind === 'deny') {
       deniedTotal += 1;
+      noteRecent({ tool: String(call.name ?? 'tool'), decision: 'deny', reason: plan.reason, paths: classification.paths });
       ctx.logger?.warn?.(`dsh-gpw: refused ${String(call.name ?? 'tool')} -- ${plan.reason}`);
       return { kind: 'deny', reason: `GPW: ${plan.reason}` };
     }
+    if (plan.kind === 'allow') {
+      noteRecent({ tool: String(call.name ?? 'tool'), decision: 'allow', reason: plan.reason, paths: classification.paths });
+      ctx.logger?.info?.(`dsh-gpw: auto-allowed ${String(call.name ?? 'tool')} -- ${plan.reason}`);
+      return { kind: 'allow' };
+    }
+    noteRecent({ tool: String(call.name ?? 'tool'), decision: 'pending', reason: plan.reason, paths: classification.paths });
     ctx.logger?.info?.(`dsh-gpw: holding ${String(call.name ?? 'tool')} for operator -- ${plan.reason}`);
     return waitForOperator(exec, plan.reason, classification.paths);
   });
 
-  // --- operator routes (folders + pending queue + native picker) ---------------------------------------------------------
+  // --- operator routes (folders + pending queue + recent list + native picker) -----------------------------------------
   ctx.inject(['connection'], (webCtx) => {
     const registry = webCtx?.connection?.fetch;
     if (registry === undefined || typeof registry.register !== 'function') return;
@@ -334,6 +383,14 @@ export function apply(ctx, config = {}) {
         require_full_access: requireFullAccess,
         folders: folderLists(),
         counters: { allowedTotal, pendingTotal, deniedTotal, budgetWindow: approvals.length, maxPerWindow },
+        recent: recent.map((entry) => ({
+          at: entry.at,
+          tool: entry.tool,
+          decision: entry.decision,
+          reason: entry.reason,
+          paths: entry.paths,
+          folder: entry.paths.length > 0 ? folderForPath(entry.paths[0]) : null,
+        })),
         pending: [...pending.entries()].map(([id, entry]) => ({
           id,
           tool: entry.tool,
@@ -358,16 +415,20 @@ export function apply(ctx, config = {}) {
         const list = body?.list;
         if (list !== 'whitelist' && list !== 'blacklist') return json({ ok: false, error: 'list must be whitelist or blacklist' }, 400);
         if (body?.action !== 'add' && body?.action !== 'remove') return json({ ok: false, error: 'action must be add or remove' }, 400);
-        const folder = typeof body?.path === 'string' ? body.path.trim() : '';
-        if (body.action === 'add' && folder === '') return json({ ok: false, error: 'path must be a non-empty string' }, 400);
+        if (body.action === 'remove') {
+          if (typeof body?.path !== 'string' || body.path.trim() === '') return json({ ok: false, error: 'path must be a non-empty string' }, 400);
+          const stored = readFolders(foldersFile);
+          const next = { ...stored, [list]: stored[list].filter((entry) => entry !== body.path) };
+          writeFolders(foldersFile, next);
+          return json({ ok: true, folders: folderLists() });
+        }
+        const validated = validateFolderInput(body?.path);
+        if (!validated.ok) return json({ ok: false, error: validated.error }, 400);
         const stored = readFolders(foldersFile);
-        const set = new Set(stored[list]);
-        if (body.action === 'add') set.add(folder);
-        else set.delete(folder);
-        const next = { ...stored, [list]: [...set] };
+        const next = { ...stored, [list]: [...new Set([...stored[list], validated.path])] };
         writeFolders(foldersFile, next);
-        ctx.logger?.info?.(`dsh-gpw: ${body.action} ${folder} to ${list}`);
-        return json({ ok: true, folders: folderLists(), stored: next });
+        ctx.logger?.info?.(`dsh-gpw: added ${validated.path} to ${list}`);
+        return json({ ok: true, folders: folderLists() });
       },
     });
 
