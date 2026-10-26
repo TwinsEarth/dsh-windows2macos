@@ -17,9 +17,10 @@
       "signing": "v2 HMAC-SHA256 covers both lists; key from foldersKey config / W2M_GPW_FOLDERS_KEY / sidecar *.key (0600); atomic tmp->rename write then 0444 read-only",
       "tamper_fail_closed": "missing / unreadable / bad-MAC / unsigned-after-seen -> tampered: every path-bearing call is denied (409 in clients) until POST /api/w2m/gpw/reset re-signs",
       "legacy_migration": "an unsigned pre-1.7.9 file is migrated once, then treated as tampered if it reappears",
-      "tests": "test/gpw-hardening.test.mjs 8/8; test/gpw-tamper-gate.test.mjs 4/4; test/gpw-persistence.test.mjs 5/5; gpw-activation 4/4; gpw-folder-policy 9/9; client-bundle 26/26; claims/installed-version/acceptance-doc pass",
+      "tests": "gpw-hardening 8/8; gpw-tamper-gate 4/4; gpw-persistence 5/5; gpw-activation 4/4; gpw-folder-policy 12/12 (recursive + relative cases included); client-bundle 26/26; claims/installed-version/acceptance-doc pass",
       "pack": "scripts/pack.mjs builds the tarball deterministically; the canonical sha256 is published on the GitHub Release asset and verified equal to the npm tarball after release",
-      "list_inheritance": "lists and MAC key live under $DSH_HOME/xclient (outside the plugin package): upgrades, restarts and uninstall/reinstall reuse the same signed file; only explicit panel actions (remove row / reset) change the lists — covered by test/gpw-persistence.test.mjs"
+      "list_inheritance": "lists and MAC key live under $DSH_HOME/xclient (outside the plugin package): upgrades, restarts and uninstall/reinstall reuse the same signed file; only explicit panel actions (remove row / reset) change the lists — covered by test/gpw-persistence.test.mjs",
+      "recursive_folder_lists": "a listed folder is a root covering every subfolder (E:\\work matches E:\\work\\a\\b\\c.txt; E:\\workshop does not match); a nested blacklist root still wins; relative command paths are resolved against the session workspace before classification — covered by gpw-folder-policy tests"
     }
   }
 }

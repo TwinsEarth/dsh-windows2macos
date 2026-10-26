@@ -36,6 +36,27 @@ describe('GPW folder policy (v1.7.5-beta.1)', () => {
     assert.equal(classifyPath({ target: '/tmp/x', ...base }).decision, 'pass');
   });
 
+  it('treats a listed folder as a root that covers every descendant (not just the parent folder itself)', () => {
+    const base = { platform: 'linux', base: '/' };
+    assert.equal(classifyPath({ target: '/work/a/b/c/d.txt', whitelist: ['/work'], ...base }).decision, 'allow');
+    assert.equal(classifyPath({ target: '/work/a/b/c/d.txt', blacklist: ['/work/a'], ...base }).decision, 'deny', 'a nested blacklist root still wins');
+    assert.equal(classifyPath({ target: '/worked/a.txt', whitelist: ['/work'], ...base }).decision, 'pass', 'a sibling with the same prefix is not inside');
+  });
+
+  it('resolves relative command paths against the workspace, so subfolders are classified too', () => {
+    const call = { name: 'bash', arguments: { command: 'cat sub/dir/file.txt > out.txt' }, base: '/repo', workspace: '/repo', allowRelative: true, platform: 'linux' };
+    const classified = classifyToolCall(call);
+    assert.equal(classified.decision, 'allow');
+    assert.ok(classified.paths.includes('sub/dir/file.txt'), 'the relative subfolder token is a candidate');
+    assert.ok(classified.paths.includes('out.txt') === false, 'bare file names without a separator are not treated as paths');
+  });
+
+  it('classifies a relative command path that is outside the workspace as needing approval', () => {
+    const call = { name: 'bash', arguments: { command: 'cat ../outside/file.txt' }, base: '/repo', workspace: '/repo/sub', allowRelative: true, platform: 'linux' };
+    const classified = classifyToolCall(call);
+    assert.notEqual(classified.decision, 'allow', 'a parent-relative path outside the workspace must not be auto-allowed');
+  });
+
   it('classifies a whole call and keeps every candidate path', () => {
     const call = { name: 'write', arguments: { path: '/data/a.txt', newPath: '/data/b.txt' }, whitelist: ['/data'], platform: 'linux', base: '/' };
     const result = classifyToolCall(call);

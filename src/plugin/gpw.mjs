@@ -528,7 +528,9 @@ export function apply(ctx, config = {}) {
     } catch {
       cwd = null;
     }
-    const classification = classifyToolCall({ ...call, whitelist: lists.whitelist, blacklist: lists.blacklist, workspace: cwd ?? null });
+    // A listed folder covers its subfolders; relative command paths are resolved against the workspace so a
+    // subfolder reference is classified rather than treated as "names no path".
+    const classification = classifyToolCall({ ...call, whitelist: lists.whitelist, blacklist: lists.blacklist, workspace: cwd ?? null, base: cwd ?? undefined, allowRelative: cwd !== null });
     if (classification.decision === 'pass' && classification.paths.length === 0) return next();
     const budget = classification.decision === 'allow' ? takeBudgetSlot() : false;
     const plan = planGate({ classification, autoAllowBudgetRemaining: classification.decision === 'allow' ? budget !== false : undefined });

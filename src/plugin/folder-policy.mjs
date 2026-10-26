@@ -107,7 +107,7 @@ const COMMAND_TOOL = /^(bash|pwsh|powershell|shell|terminal|run_command|exec)$/i
  * @param {{name?: string, arguments?: string|object}} call
  * @returns {string[]} raw (not yet normalised) path candidates
  */
-export function pathsOfToolCall(call) {
+export function pathsOfToolCall(call, options = {}) {
   let args = call?.arguments;
   if (typeof args === 'string') {
     if (args.trim() === '') return [];
@@ -137,8 +137,20 @@ export function pathsOfToolCall(call) {
           : typeof call?.arguments === 'string'
             ? call.arguments
             : JSON.stringify(args ?? '');
-    const matches = text.match(/(?:[A-Za-z]:[\\/][^"'\s|;&<>]*|\\\\[^"'\s|;&<>]+|\/(?:[^"'\s|;&<>]+\/?)+)/g) ?? [];
+    const matches = text.match(/(?<![^\s"'=(])(?:[A-Za-z]:[\\/][^"'\s|;&<>]*|\\\\[^"'\s|;&<>]+|\/(?:[^"'\s|;&<>]+\/?)+)/g) ?? [];
     for (const m of matches) push(m);
+    // v1.7.9: relative tokens (sub/file.txt, ./x, ..\y) are resolved against the workspace base below, so a command
+    // that names a subfolder is classified instead of passing through as "names no path". Only tokens that actually
+    // contain a separator are taken; URLs, flags and bare words are left alone.
+    if (options.allowRelative === true) {
+      for (const token of text.split(/\s+/)) {
+        const cleaned = token.replace(/^["'(=]+|["'),;]+$/g, '');
+        if (cleaned === '' || cleaned.startsWith('-') || /^[A-Za-z][A-Za-z0-9+.-]*:/.test(cleaned)) continue;
+        if (!/[\\/]/.test(cleaned)) continue;
+        if (/[\\/]$/.test(cleaned) && cleaned.length === 1) continue;
+        push(cleaned);
+      }
+    }
   }
   return out;
 }
@@ -149,11 +161,11 @@ export function pathsOfToolCall(call) {
  * the ordinary one.
  *
  * @param {{name?: string, arguments?: string|object, whitelist?: string[], blacklist?: string[],
- *          workspace?: string|null, base?: string, platform?: string}} call
+ *          workspace?: string|null, base?: string, platform?: string, allowRelative?: boolean}} call
  * @returns {{decision: 'deny'|'allow'|'pass', path: string|null, folder: string|null, reason: string, paths: string[]}}
  */
 export function classifyToolCall(call) {
-  const candidates = pathsOfToolCall(call);
+  const candidates = pathsOfToolCall(call, { allowRelative: call.allowRelative === true });
   let weakest = { decision: 'pass', path: null, folder: null, reason: 'this call names no path', paths: [] };
   for (const candidate of candidates) {
     const result = classifyPath({

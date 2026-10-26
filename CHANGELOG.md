@@ -11,6 +11,8 @@ All notable changes to this project are documented here.
 
 **GPW 三项操作性问题修复：拦截即时弹选择、名单长列表折叠、名单文件防篡改。**
 
+- **名单策略调整：文件夹包含子文件夹**：名单条目按「根目录 + 全部子文件夹」递归匹配（`E:\work` 覆盖 `E:\work\a\b\c.txt`，`E:\workshop` 不会被误匹配；嵌套黑名单仍优先）；命令工具里的相对路径按会话工作区解析后再分类。新增测试覆盖递归覆盖、同前缀兄弟目录与相对路径。
+- **发布门禁稳定性**：`test/mcp-http-live.test.mjs` 的 relay 实连用例在出口网络不可达（或 MCP 工具层报 "could not reach the relay"）时明确 `skip`，网络抖动不再把 release 门禁判红；其余用例仍覆盖本地绑定行为。
 - **拦截即审批（不再静默挂起）**：`tools/pre-execute` 挂起 C 类调用后，客户端在 **composer 行**
   （`conversation.input.left`）新增内联提示 `GpwPrompt`：显示工具名与「允许本次 / 拒绝本次 / 打开面板」；
   多个待审批显示数量。浮窗按钮增加待审批数量徽标，`w2m-gpw-open` 事件让内联提示直接打开面板。
