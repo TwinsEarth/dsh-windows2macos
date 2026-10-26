@@ -1,0 +1,23 @@
+{
+  "version": "1.8.2",
+  "case": "GPW-AUTO-APPROVE",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-26T07:41:28.057Z",
+  "executor": "lead",
+  "task_id": "local-gpw-timeout-20261026074128",
+  "requirement": "a class-C (yellow) call with no operator answer is approved after 100 s, while blacklist/whitelist rules and red denials are unchanged; subfolders of a listed parent folder are folded in recently-intercepted",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "timeout": "DEFAULT_PENDING_TIMEOUT_MS = 100_000; on expiry the pending call resolves allow and records a session grant",
+      "lists_unchanged": "red denies immediately (never queued); whitelist hits allow immediately (never queued)",
+      "next_call_blue": "the auto-approved fingerprint is added to session grants, so the identical next call runs immediately",
+      "fold_parents": "folder_in uses bidirectional containment: a child folder under a listed parent maps to that list and is collapsed",
+      "tests": "test/gpw-auto-approve.test.mjs 4/4",
+      "readonly_green": "read-only tools are green (read/grep/glob/web_*/status/health/metrics/inspect, job_list/job_output/job_status/job_wait, w2m_status/devices/tasks/history/report/memory/stats); mutating tools (job_kill/job_start/w2m_run/w2m_cancel/w2m_intent) stay yellow"
+    }
+  }
+}

@@ -27,7 +27,18 @@ export const GPW_COLOR_LABELS = Object.freeze({
 });
 
 /** Tools that only read: green by their nature. */
-const READONLY_TOOLS = /^(read|search|grep|glob|list|dir|ls|web_search|web_fetch|fetch|cat|head|tail|status|health|metrics|inspect)$/i;
+const READONLY_TOOLS = new RegExp(
+  '^(' +
+    // local read-only tools
+    'read|read_file|search|grep|glob|glob_files|list|list_files|dir|ls|cat|head|tail|view|' +
+    'web_search|web_fetch|fetch|status|health|metrics|inspect|' +
+    // background-job observation is read-only; kill/spawn are not in this list on purpose
+    'job_list|job_output|job_status|job_wait|' +
+    // read-only fleet queries (w2m_run / w2m_cancel / w2m_intent mutate, so they stay yellow)
+    'w2m_status|w2m_devices|w2m_tasks|w2m_history|w2m_report|w2m_memory|w2m_wait|w2m_stats' +
+  ')$',
+  'i',
+);
 
 /** Command tools: their argv decides, not the tool name. */
 const COMMAND_TOOLS = /^(bash|pwsh|powershell|shell|terminal|run_command|exec)$/i;

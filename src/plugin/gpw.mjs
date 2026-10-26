@@ -95,7 +95,7 @@ export const GPW_PICK_ROUTE = '/api/w2m/gpw/pick';
 export const GPW_RESET_ROUTE = '/api/w2m/gpw/reset';
 
 const DEFAULT_BUDGET = { maxPerWindow: 10, windowMs: 60_000, minGapMs: 3_000 };
-const DEFAULT_PENDING_TIMEOUT_MS = 120_000;
+const DEFAULT_PENDING_TIMEOUT_MS = 100_000;
 const RECENT_LIMIT = 20;
 const NO_STORE = { 'cache-control': 'no-store' };
 /** v1.7.9: lists are MAC-signed (v2) so an external edit is detectable instead of silently trusted. */
@@ -473,8 +473,14 @@ export function apply(ctx, config = {}) {
     const timer = setTimeout(() => {
       if (!pending.has(id)) return;
       pending.delete(id);
-      deniedTotal += 1;
-      resolveDecision({ kind: 'deny', reason: `GPW: no operator answer within ${Math.round(pendingTimeoutMs / 1000)} s for ${entry.tool}` });
+      // v1.8.2 timeout policy: a yellow (class-C) call that nobody answered is approved after 100 s. Red never reaches
+      // this queue (it is denied outright) and black/white list hits never become pending, so this rule cannot widen
+      // either list's authority. The approval is recorded as a session grant, which is what turns its next occurrence
+      // blue.
+      allowedTotal += 1;
+      colorCounts.blue += 1;
+      if (typeof entry.fingerprint === 'string' && entry.fingerprint !== '') sessionGrants.add(entry.fingerprint);
+      resolveDecision({ kind: 'allow', reason: `GPW: auto-approved after ${Math.round(pendingTimeoutMs / 1000)} s with no operator answer (yellow path; black/white lists keep their own rules)` });
     }, pendingTimeoutMs);
     timer.unref?.();
     entry.timer = timer;

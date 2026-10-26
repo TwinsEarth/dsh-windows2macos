@@ -24,6 +24,15 @@ describe('GPW four-colour audit model (v1.7.10)', () => {
     assert.equal(classifyGpwCall({ name: 'write', paths: ['/repo/a.txt'], workspace: '/repo' }).color, 'green');
   });
 
+  it('green: read-only job and fleet queries run without a prompt, while mutating ones stay yellow', () => {
+    for (const name of ['job_list', 'job_output', 'job_status', 'job_wait', 'w2m_status', 'w2m_devices', 'w2m_tasks', 'w2m_history', 'w2m_report', 'w2m_memory', 'w2m_stats']) {
+      assert.equal(classifyGpwCall({ name }).color, 'green', name + ' is read-only');
+    }
+    for (const name of ['job_kill', 'job_start', 'w2m_run', 'w2m_cancel', 'w2m_intent']) {
+      assert.equal(classifyGpwCall({ name }).color, 'yellow', name + ' can mutate, so it needs a human');
+    }
+  });
+
   it('blue: an operation approved earlier in the session runs as an established grant', () => {
     const call = { name: 'bash', arguments: { command: 'npm run build' }, authorized: true };
     assert.equal(classifyGpwCall(call).color, 'blue');

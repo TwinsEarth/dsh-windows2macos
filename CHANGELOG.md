@@ -7,6 +7,19 @@
 
 All notable changes to this project are documented here.
 
+## [1.8.2] — 2026-10-26
+
+**GPW 超时策略：黄类（名单外）100 秒无人应答自动同意；黑白名单规则不变；已覆盖父目录的子文件夹拦截记录折叠。**
+
+- **只读工具绿名单扩展**：`read/read_file/search/grep/glob/list/…`、`job_list/job_output/job_status/job_wait`、`w2m_status/w2m_devices/w2m_tasks/w2m_history/w2m_report/w2m_memory/w2m_stats` 判为绿色（无打扰放行）；`job_kill/job_start/w2m_run/w2m_cancel/w2m_intent` 仍为黄色（可变更，需人工）。
+- 超时默认值 120s → **100s**；超时结果由「拒绝」改为「自动同意」（仅黄类 / 名单外路径调用）。
+- 红线（危险命令、敏感/系统路径、显式 deny）仍然立即拒绝，不进入待审批队列；白名单命中仍然立即放行。
+  因此超时规则不会扩大任何名单的授权范围。
+- 自动同意的调用会记录为会话授权（指纹），同一操作的后续出现以蓝色（已授权常态）直接放行。
+- 「最近被拦截」折叠逻辑确认覆盖父目录下的子文件夹：名单条目是根目录，其任意深度子文件夹的拦截记录都会进入
+  「已在名单中 N 条」折叠组（`folder_in` 双向包含匹配）。
+- 新增 `test/gpw-auto-approve.test.mjs`（4 项：超时自动同意→下次变蓝；红线仍拒；白名单立即放行；100s 默认值）。
+- 证据：`docs/acceptance/1.8.2/GPW-AUTO-APPROVE.json`。
 ## [1.8.1] — 2026-10-26
 
 **GPW「最近被拦截」去噪：已在名单中的条目折叠显示；加入名单后条目立即消失。**
