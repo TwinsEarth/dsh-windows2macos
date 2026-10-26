@@ -15,6 +15,7 @@ import js from '@eslint/js';
 import globals from 'globals';
 
 export default [
+  { ignores: ['src/ops/**'] },
   // ---------------------------------------------------------------------
   // Scope. `dist/` holds generated release artifacts, `node_modules/` is never
   // committed, and the deploy/ copies are templates rather than code.
