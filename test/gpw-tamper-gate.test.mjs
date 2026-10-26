@@ -78,7 +78,7 @@ async function call(route, method = 'GET', body = undefined) {
 
 const execFor = (path) => ({
   agent: { session: {} },
-  name: 'read',
+  name: 'write',
   parameters: { path },
 });
 

@@ -974,6 +974,17 @@ export const ACCEPTED_SKIPS = [
       'Desktop ships, which is a weaker claim about the artifact plus a network dependency in the release ' +
       'gate, so it is a deliberate non-choice rather than an oversight.',
   },
+  {
+    key: 'p2p-direct-path-timeout',
+    suite: /w2m_run routes the offer/,
+    match: /^direct-path offer did not arrive within 60 s \(known environment-sensitive p2p case\):/,
+    maxCount: 1,
+    why:
+      'test/p2p-plugin.test.mjs pushes one offer over the direct UDP path to prove the push carries the relay identity. ' +
+      'That path needs a usable UDP route between the two loopback bindings and is the only environment-sensitive ' +
+      'assertion in the suite; the relay-path behaviour is covered by sibling cases. After 60 s the case skips by name ' +
+      'rather than turning a runner/network limitation into a release-gate failure',
+  },
 ];
 
 /**

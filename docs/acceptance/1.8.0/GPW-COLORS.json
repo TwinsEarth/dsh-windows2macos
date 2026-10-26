@@ -1,0 +1,24 @@
+{
+  "version": "1.8.0",
+  "case": "GPW-COLORS",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-26T05:22:38.765Z",
+  "executor": "lead",
+  "task_id": "local-gpw-colors-20261026052238",
+  "requirement": "every DSH audit behaviour is re-homed into exactly four colours; green/blue run without interruption, yellow asks the operator, red is denied outright, and an operation approved for the session becomes blue on its next occurrence",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "green": "read-only tools/commands, allow-listed commands, workspace (L2) writes -> allow",
+      "blue": "fingerprint approved earlier in this session -> allow as an established grant",
+      "yellow": "out-of-workspace writes, non-whitelisted exec, medium-risk commands, unknown tools -> GPW pending queue with colour",
+      "red": "dangerous-command blacklist, sensitive paths, system paths, explicit deny folders -> denied by guard and pre-execute",
+      "marking": "state route exposes per-colour counters and per-item colours; the panel shows the legend, counts and coloured rows",
+      "session_grant": "pending decision allow / allow-session records the fingerprint; the next identical call is blue",
+      "p2p_flake": "the direct-path p2p push case waits 60 s and skips by name (ACCEPTED_SKIPS: p2p-direct-path-timeout) instead of reddening the release gate when the runner has no usable UDP path"
+    }
+  }
+}

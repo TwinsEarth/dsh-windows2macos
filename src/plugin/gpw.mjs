@@ -40,6 +40,7 @@ import { dirname, join, resolve } from 'node:path';
 import { createHmac, randomBytes, randomUUID } from 'node:crypto';
 
 import { classifyToolCall } from './folder-policy.mjs';
+import { classifyGpwCall, fingerprintOf } from './gpw-colors.mjs';
 
 export const name = 'dsh-gpw';
 
@@ -361,6 +362,10 @@ export function apply(ctx, config = {}) {
   const pending = new Map();
   /** Newest-first record of calls the gate saw, so the panel can offer "add this folder" in one click. */
   const recent = [];
+  /** Four-colour counters: every decision lands in exactly one bucket (v1.7.10). */
+  const colorCounts = { green: 0, blue: 0, yellow: 0, red: 0 };
+  /** Operation fingerprints approved earlier in this session -> the blue ("正常") state. */
+  const sessionGrants = new Set();
 
   const noteRecent = (entry) => {
     recent.unshift({ at: Date.now(), ...entry });
@@ -419,6 +424,8 @@ export function apply(ctx, config = {}) {
       tool: String(toolCallOf(exec).name ?? 'tool'),
       reason,
       paths,
+      color: 'yellow',
+      fingerprint: fingerprintOf(toolCallOf(exec)),
     };
     pending.set(id, entry);
     pendingTotal += 1;
@@ -441,9 +448,10 @@ export function apply(ctx, config = {}) {
     } catch {
       /* already fired */
     }
-    if (decision === 'allow') {
+    if (decision === 'allow' || decision === 'allow-session') {
       allowedTotal += 1;
-      entry.resolve({ kind: 'allow', reason: 'GPW: allowed by the operator' });
+      if (typeof entry.fingerprint === 'string' && entry.fingerprint !== '') sessionGrants.add(entry.fingerprint);
+      entry.resolve({ kind: 'allow', reason: decision === 'allow-session' ? 'GPW: allowed for this session (blue)' : 'GPW: allowed by the operator' });
     } else {
       deniedTotal += 1;
       entry.resolve({ kind: 'deny', reason: 'GPW: denied by the operator' });
@@ -521,7 +529,6 @@ export function apply(ctx, config = {}) {
       ctx.logger?.warn?.(`dsh-gpw: refused ${String(call.name ?? 'tool')} -- lists locked (${lists.reason})`);
       return { kind: 'deny', reason: `GPW: folder lists failed integrity check (${lists.reason}); reset them in the GPW panel` };
     }
-    if (lists.blacklist.length === 0 && lists.whitelist.length === 0) return next();
     let cwd = null;
     try {
       cwd = await ctx.workingDirectory?.ensure?.(exec.agent, exec.signal);
@@ -531,21 +538,52 @@ export function apply(ctx, config = {}) {
     // A listed folder covers its subfolders; relative command paths are resolved against the workspace so a
     // subfolder reference is classified rather than treated as "names no path".
     const classification = classifyToolCall({ ...call, whitelist: lists.whitelist, blacklist: lists.blacklist, workspace: cwd ?? null, base: cwd ?? undefined, allowRelative: cwd !== null });
-    if (classification.decision === 'pass' && classification.paths.length === 0) return next();
+    // v1.7.10: one four-colour decision in front of the folder plan, so every audit behaviour in DSH has one home.
+    const fingerprint = fingerprintOf(call);
+    const colour = classifyGpwCall({
+      name: call.name,
+      arguments: call.arguments,
+      paths: classification.paths,
+      whitelist: lists.whitelist,
+      blacklist: lists.blacklist,
+      workspace: cwd ?? null,
+      authorized: sessionGrants.has(fingerprint),
+    });
+    if (colour.color === 'red') {
+      deniedTotal += 1;
+      colorCounts.red += 1;
+      noteRecent({ tool: String(call.name ?? 'tool'), decision: 'deny', color: 'red', reason: colour.reason, paths: classification.paths });
+      ctx.logger?.warn?.(`dsh-gpw: red -- refused ${String(call.name ?? 'tool')} -- ${colour.reason}`);
+      return { kind: 'deny', reason: `GPW red: ${colour.reason}` };
+    }
+    if (colour.color === 'green' || colour.color === 'blue') {
+      colorCounts[colour.color] += 1;
+      noteRecent({ tool: String(call.name ?? 'tool'), decision: 'allow', color: colour.color, reason: colour.reason, paths: classification.paths });
+      ctx.logger?.info?.(`dsh-gpw: ${colour.color} -- ${String(call.name ?? 'tool')} -- ${colour.reason}`);
+      return { kind: 'allow' };
+    }
+    if (classification.decision === 'pass' && classification.paths.length === 0) {
+      colorCounts.yellow += 1;
+      noteRecent({ tool: String(call.name ?? 'tool'), decision: 'pending', color: 'yellow', reason: colour.reason, paths: [] });
+      return waitForOperator(exec, colour.reason, []);
+    }
     const budget = classification.decision === 'allow' ? takeBudgetSlot() : false;
     const plan = planGate({ classification, autoAllowBudgetRemaining: classification.decision === 'allow' ? budget !== false : undefined });
     if (plan.kind === 'deny') {
       deniedTotal += 1;
-      noteRecent({ tool: String(call.name ?? 'tool'), decision: 'deny', reason: plan.reason, paths: classification.paths });
+      colorCounts.red += 1;
+      noteRecent({ tool: String(call.name ?? 'tool'), decision: 'deny', color: 'red', reason: plan.reason, paths: classification.paths });
       ctx.logger?.warn?.(`dsh-gpw: refused ${String(call.name ?? 'tool')} -- ${plan.reason}`);
       return { kind: 'deny', reason: `GPW: ${plan.reason}` };
     }
     if (plan.kind === 'allow') {
-      noteRecent({ tool: String(call.name ?? 'tool'), decision: 'allow', reason: plan.reason, paths: classification.paths });
+      colorCounts.green += 1;
+      noteRecent({ tool: String(call.name ?? 'tool'), decision: 'allow', color: 'green', reason: plan.reason, paths: classification.paths });
       ctx.logger?.info?.(`dsh-gpw: auto-allowed ${String(call.name ?? 'tool')} -- ${plan.reason}`);
       return { kind: 'allow' };
     }
-    noteRecent({ tool: String(call.name ?? 'tool'), decision: 'pending', reason: plan.reason, paths: classification.paths });
+    colorCounts.yellow += 1;
+    noteRecent({ tool: String(call.name ?? 'tool'), decision: 'pending', color: 'yellow', reason: plan.reason, paths: classification.paths });
     ctx.logger?.info?.(`dsh-gpw: holding ${String(call.name ?? 'tool')} for operator -- ${plan.reason}`);
     return waitForOperator(exec, plan.reason, classification.paths);
   });
@@ -569,11 +607,12 @@ export function apply(ctx, config = {}) {
           folders: { whitelist: lists.whitelist, blacklist: lists.blacklist },
           tampered: lists.tampered,
           tampered_reason: lists.reason,
-          counters: { allowedTotal, pendingTotal, deniedTotal, budgetWindow: approvals.length, maxPerWindow },
+          counters: { allowedTotal, pendingTotal, deniedTotal, budgetWindow: approvals.length, maxPerWindow, colors: { ...colorCounts }, grants: sessionGrants.size },
           recent: recent.map((entry) => ({
             at: entry.at,
             tool: entry.tool,
             decision: entry.decision,
+            color: entry.color ?? null,
             reason: entry.reason,
             paths: entry.paths,
             folder: entry.paths.length > 0 ? folderForPath(entry.paths[0]) : null,
@@ -667,8 +706,8 @@ export function apply(ctx, config = {}) {
         } catch {
           /* refused below */
         }
-        if (typeof body?.id !== 'string' || (body?.decision !== 'allow' && body?.decision !== 'deny')) {
-          return json({ ok: false, error: 'id and decision (allow|deny) are required' }, 400);
+        if (typeof body?.id !== 'string' || (body?.decision !== 'allow' && body?.decision !== 'deny' && body?.decision !== 'allow-session')) {
+          return json({ ok: false, error: 'id and decision (allow|allow-session|deny) are required' }, 400);
         }
         const result = decidePending(body.id, body.decision);
         return json(result.ok ? { ok: true } : { ok: false, error: result.error }, result.ok ? 200 : 404);
