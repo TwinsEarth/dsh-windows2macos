@@ -39,10 +39,50 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { createHmac, randomBytes, randomUUID } from 'node:crypto';
 
-import { classifyToolCall } from './folder-policy.mjs';
+import { classifyToolCall, isInside, normalizeFolder } from './folder-policy.mjs';
 import { classifyGpwCall, fingerprintOf } from './gpw-colors.mjs';
 
 export const name = 'dsh-gpw';
+
+/**
+ * Which list (if any) already covers a folder, for the "recently intercepted" fold.
+ *
+ * A recent row whose folder is already covered by a list is noise: the operator already made that decision. Those rows
+ * are collapsed in the panel, and adding a folder from a recent row removes the row outright.
+ */
+export function folderInLists(folder, lists) {
+  if (typeof folder !== 'string' || folder.trim() === '') return null;
+  let target;
+  try {
+    target = normalizeFolder(folder);
+  } catch {
+    return null;
+  }
+  const inList = (entries) => (Array.isArray(entries) ? entries : []).some((entry) => {
+    try {
+      const root = normalizeFolder(entry);
+      return isInside(target, root) || isInside(root, target);
+    } catch {
+      return false;
+    }
+  });
+  if (inList(lists?.whitelist)) return 'whitelist';
+  if (inList(lists?.blacklist)) return 'blacklist';
+  return null;
+}
+
+/** True when a recent row's folder is the folder just added, or lives inside it. */
+export function foldIsCoveredBy(addedFolder, candidate) {
+  if (typeof addedFolder !== 'string' || typeof candidate !== 'string') return false;
+  try {
+    const added = normalizeFolder(addedFolder);
+    const target = normalizeFolder(candidate);
+    return target === added || isInside(target, added);
+  } catch {
+    return false;
+  }
+}
+
 
 /** Services this plugin cannot work without. `connection` is used only for the operator routes. */
 export const inject = ['permissionPresets'];
@@ -426,6 +466,7 @@ export function apply(ctx, config = {}) {
       paths,
       color: 'yellow',
       fingerprint: fingerprintOf(toolCallOf(exec)),
+      sessionId: String(exec?.agent?.session?.header?.id ?? ''),
     };
     pending.set(id, entry);
     pendingTotal += 1;
@@ -608,15 +649,19 @@ export function apply(ctx, config = {}) {
           tampered: lists.tampered,
           tampered_reason: lists.reason,
           counters: { allowedTotal, pendingTotal, deniedTotal, budgetWindow: approvals.length, maxPerWindow, colors: { ...colorCounts }, grants: sessionGrants.size },
-          recent: recent.map((entry) => ({
-            at: entry.at,
-            tool: entry.tool,
-            decision: entry.decision,
-            color: entry.color ?? null,
-            reason: entry.reason,
-            paths: entry.paths,
-            folder: entry.paths.length > 0 ? folderForPath(entry.paths[0]) : null,
-          })),
+          recent: recent.map((entry) => {
+            const folder = entry.paths.length > 0 ? folderForPath(entry.paths[0]) : null;
+            return {
+              at: entry.at,
+              tool: entry.tool,
+              decision: entry.decision,
+              color: entry.color ?? null,
+              reason: entry.reason,
+              paths: entry.paths,
+              folder,
+              folder_in: folderInLists(folder, lists),
+            };
+          }),
           pending: [...pending.entries()].map(([id, entry]) => ({
             id,
             tool: entry.tool,

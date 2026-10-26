@@ -1,0 +1,21 @@
+{
+  "version": "1.8.1",
+  "case": "GPW-RECENT-FOLD",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-26T06:55:26.042Z",
+  "executor": "lead",
+  "task_id": "local-gpw-fold-20261026065526",
+  "requirement": "recently-intercepted rows already covered by a list are collapsed, and a row the operator adds to a list disappears from the list immediately",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "folder_in": "the state route annotates each recent row with whitelist / blacklist / null",
+      "collapse": "the panel shows covered rows behind \"已在名单中 N 条 · 展开/收起\" and they carry no add buttons",
+      "disappear": "adding a folder from a recent row prunes that row and every row inside the folder server-side",
+      "tests": "test/gpw-recent-fold.test.mjs 4/4"
+    }
+  }
+}
