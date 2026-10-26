@@ -482,7 +482,6 @@ export function apply(ctx, config = {}) {
       if (typeof entry.fingerprint === 'string' && entry.fingerprint !== '') sessionGrants.add(entry.fingerprint);
       resolveDecision({ kind: 'allow', reason: `GPW: auto-approved after ${Math.round(pendingTimeoutMs / 1000)} s with no operator answer (yellow path; black/white lists keep their own rules)` });
     }, pendingTimeoutMs);
-    timer.unref?.();
     entry.timer = timer;
   });
 
