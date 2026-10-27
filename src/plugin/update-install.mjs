@@ -316,11 +316,10 @@ export function planInstall(input) {
   const dshPath = input.dshPath ?? null;
   const pnpmPath = input.pnpmPath ?? null;
   const nodePath = input.nodePath ?? process.execPath;
-  const platform = input.platform ?? process.platform;
-  // v1.9.9: on Windows the CLI is installed as `dsh.cmd`; spawn(shell:false) refuses it with
-  // EINVAL, which surfaced as "could not run dsh (EINVAL: spawn EINVAL)". Only a directly
-  // executable shim (.exe) may take the dsh path; everything else falls back to the runtime pnpm.
-  const dshSpawnable = dshPath !== null && !(platform === 'win32' && /\.(cmd|bat)$/i.test(dshPath));
+  // v1.9.9: a .cmd/.bat shim is a Windows shell script; spawn(shell:false) refuses it with EINVAL
+  // ("could not run dsh (EINVAL: spawn EINVAL)"), and no other platform can execute it either.
+  // Only a directly executable path may take the dsh plan; anything else uses the runtime pnpm.
+  const dshSpawnable = dshPath !== null && !/\.(cmd|bat)$/i.test(dshPath);
 
   if (dshSpawnable) {
     return {
