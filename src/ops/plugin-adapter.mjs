@@ -1,6 +1,6 @@
 // internal telemetry module (undocumented)
 import { buildSample, createActivityClock } from './agent-collector.mjs';
-import { nextUploadAt, startupDelayMs, mayPersist } from './upload-scheduler.mjs';
+import { nextUploadAt, startupDelayMs, mayPersist, fleetSizeOrDefault } from './upload-scheduler.mjs';
 import { createOpsUploader } from './upload-client.mjs';
 
 /**
@@ -36,7 +36,22 @@ export function createPluginCollector(options) {
     });
     if (!response.ok) throw new Error('relay ' + relayIndex + ' answered ' + response.status);
   };
-  const fleetSize = Number.isFinite(options.fleetSize) ? options.fleetSize : 0;
+  // Fleet size comes from the relay when it can be read; otherwise the operator's 2,026 fallback applies.
+  let fleetSize = fleetSizeOrDefault(options.fleetSize);
+  let fleetFetchedAt = 0;
+  const refreshFleetSize = async () => {
+    if (typeof options.fetchFleetSize !== 'function') return;
+    if (now() - fleetFetchedAt < (options.fleetSizeRefreshMs ?? 6 * 60 * 60 * 1000)) return;
+    try {
+      const observed = await options.fetchFleetSize();
+      if (Number.isFinite(observed) && observed > 0) {
+        fleetSize = fleetSizeOrDefault(observed);
+        fleetFetchedAt = now();
+      }
+    } catch {
+      // keep the last known or the fallback; never disturb the host
+    }
+  };
   const uploader = createOpsUploader({ relayCount, now, postShard, retry: options.retry, fleetSize });
   let timer = null;
   let disposed = false;
@@ -51,6 +66,7 @@ export function createPluginCollector(options) {
 
   function scheduleNext() {
     if (disposed) return;
+    void refreshFleetSize();
     const at = nextUploadAt({ machineId: options.machineId, nowMs: now(), fleetSize });
     timer = setTimer(Math.max(1_000, at - now()), () => {
       timer = null;
@@ -70,6 +86,7 @@ export function createPluginCollector(options) {
       clock,
       nowMs: now(),
     });
+    await refreshFleetSize();
     const outcome = await uploader.uploadSample({ sample, plaintext, nowMs: now() });
     scheduleNext();
     return outcome;

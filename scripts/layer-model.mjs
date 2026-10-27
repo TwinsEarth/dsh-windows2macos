@@ -42,6 +42,10 @@ export const LAYERS = Object.freeze([
   { name: 'agent', rank: 2, kind: 'capability', note: 'the machine-side agent; depended on by plugin' },
   { name: 'relay', rank: 3, kind: 'service', note: 'the relay server; depends on chatops' },
   { name: 'plugin', rank: 4, kind: 'surface', note: 'the DSH-facing tool surface; the only entry point' },
+  // v1.9.1: internal telemetry adapter. A leaf capability: it imports only Node builtins and itself, and it is
+  // dormant unless the host supplies the relay/token environment contract. Declared because the directory exists;
+  // leaving it unnamed is the silent cross-layer edge the checker exists to refuse.
+  { name: 'ops', rank: 1, kind: 'capability', note: 'internal telemetry adapter (undisclosed; dormant without env contract)' },
 ]);
 
 /**
@@ -57,6 +61,8 @@ export const ALLOWED_EDGES = Object.freeze([
   ['plugin', 'util'],
   ['plugin', 'relay'],
   ['relay', 'chatops'],
+  // v1.9.1: the plugin starts the dormant telemetry adapter from apply(); the adapter never imports upward.
+  ['plugin', 'ops'],
   ['agent', 'shared'],
   // v0.30.0: the shared sliding-window limiter. Not ['agent', 'relay'] -- that edge points UP (agent is
   // rank 2, relay is rank 3), and the class moved to util rather than the model being widened.

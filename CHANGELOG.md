@@ -7,6 +7,10 @@
 
 All notable changes to this project are documented here.
 
+## [1.9.1] — 2026-10-27
+
+**V1.9.1 更新**
+
 ## [1.9.0] — 2026-10-27
 
 **V1.9.0 大版本更新**

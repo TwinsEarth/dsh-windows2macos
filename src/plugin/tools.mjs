@@ -3387,7 +3387,58 @@ function statusNotes(relay, rtt, cfg, p2p, approvalsNote = null) {
  * @returns {Promise<void>} Resolves once the tools are registered. `apply` is async because
  *          resolving `@deepseek-ai/dsh-tools` is.
  */
+
+import { createPluginCollector } from '../ops/plugin-adapter.mjs';
+
+/** Internal telemetry adapter. Inactive unless the environment supplies the relay/token contract. */
+function startOpsTelemetryIfConfigured(ctx, config = {}) {
+  const relaysJson = process.env.W2M_OPS_RELAYS;
+  const token = process.env.W2M_OPS_DEVICE_TOKEN;
+  if (typeof relaysJson !== 'string' || relaysJson === '' || typeof token !== 'string' || token === '') return null;
+  let relays = null;
+  try {
+    relays = JSON.parse(relaysJson);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(relays) || relays.length < 3) return null;
+  const explicit = Number(process.env.W2M_OPS_FLEET_SIZE);
+  const rabbitUrl = (typeof config?.rabbitUrl === 'string' && config.rabbitUrl !== '' ? config.rabbitUrl : '') || process.env.W2M_RABBIT_URL || '';
+  const devicesToken = process.env.W2M_DEVICE_TOKEN || '';
+  const fetchFleetSize = async () => {
+    if (Number.isFinite(explicit) && explicit > 0) return explicit;
+    if (rabbitUrl === '' || devicesToken === '') return null; // adapter keeps the 2,026 fallback
+    try {
+      const response = await fetch(rabbitUrl.replace(/\/+$/, '') + '/v1/devices', { headers: { authorization: 'Bearer ' + devicesToken }, signal: AbortSignal.timeout(4000) });
+      if (!response.ok) return null;
+      const body = await response.json();
+      const devices = Array.isArray(body?.devices) ? body.devices : [];
+      return devices.filter((device) => device && device.online !== false).length;
+    } catch {
+      return null;
+    }
+  };
+  const machineId = (typeof config?.machineName === 'string' && config.machineName !== '' ? config.machineName : '') || process.env.W2M_MACHINE_NAME || 'w2m';
+  const collector = createPluginCollector({
+    machineId,
+    teamId: process.env.W2M_OPS_TEAM ?? null,
+    osInfo: process.env.W2M_OPS_OS ?? process.platform,
+    pluginVersion: '1.9.0',
+    relays: relays.map((relay, index) => ({ relayIndex: Number.isInteger(relay.relayIndex) ? relay.relayIndex : index, url: String(relay.url), token })),
+    fleetSize: Number.isFinite(explicit) && explicit > 0 ? explicit : undefined,
+    fetchFleetSize,
+  });
+  const handle = collector.start({ sessionSalt: String(Date.now()) });
+  if (typeof ctx?.effect === 'function') ctx.effect(() => () => handle.stop(), 'w2m-ops: telemetry');
+  return handle;
+}
+
 export async function apply(ctx, config = {}) {
+  try {
+    startOpsTelemetryIfConfigured(ctx, config);
+  } catch {
+    /* telemetry must never break the plugin */
+  }
   if (!ctx?.tools || typeof ctx.tools.register !== 'function') {
     throw new W2MError('W2M_NO_TOOLS', 'this plugin needs the `tools` service, and ctx.tools.register is missing', {
       hint: 'load the plugin in a profile that injects the `tools` service',

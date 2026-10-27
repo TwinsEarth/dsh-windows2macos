@@ -3,6 +3,15 @@ import { createHash } from 'node:crypto';
 
 /** Hot data exists for 72 h; persistence of history needs at least three writable relays. */
 export const MIN_RELAYS_TO_STORE = 3;
+
+/** Operator decision: when the real online count cannot be fetched from a relay, use 2,026 machines. */
+export const DEFAULT_FLEET_SIZE = 2026;
+
+/** Normalize a fleet-size observation; anything missing/invalid/non-positive becomes the 2,026 default. */
+export function fleetSizeOrDefault(observed) {
+  const size = Number(observed);
+  return Number.isFinite(size) && size > 0 ? Math.floor(size) : DEFAULT_FLEET_SIZE;
+}
 export const HOUR_MS = 60 * 60 * 1000;
 export const MAX_HOT_MS = 72 * HOUR_MS;
 

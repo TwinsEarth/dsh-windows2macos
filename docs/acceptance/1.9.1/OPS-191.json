@@ -1,0 +1,20 @@
+{
+  "version": "1.9.1",
+  "case": "OPS-191",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-26T19:55:01.081Z",
+  "executor": "lead",
+  "task_id": "pre-release-191-1793044501083",
+  "requirement": "V1.9.1 预发布验收（内部能力与细节不公开）",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "gates": "GREEN x2",
+      "private_tests": "101/101",
+      "public_tests": "3059 collected / 0 failed"
+    }
+  }
+}
