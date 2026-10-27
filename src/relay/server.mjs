@@ -1,3 +1,5 @@
+import { guardBlobRoute } from './redline-guard.mjs';
+import { guardResultEnvelope, guardTaskBody } from './redline-guard.mjs';
 /**
  * W2M Rabbit relay — node:http / node:https server.
  *
@@ -695,6 +697,13 @@ export class RelayServer {
       });
     }
     const path = normalizePath(stripped);
+    // B3/V12：basePath 剥离与 URL 规范化之后立即拒绝数据面 blob 路由，
+    // 覆盖 `..`、`%2e%2e`、basePath 前缀等变形；在读取 body 之前返回。
+    if (path === '/v1/fleet/blob-sessions' || path.startsWith('/v1/fleet/blob-sessions/')
+        || path === '/v1/fleet/blob-latest' || path.startsWith('/v1/fleet/blobs')) {
+      const refusal = guardBlobRoute(method);
+      return sendJson(res, refusal.status, refusal.body);
+    }
     const signedPath = `${stripped}${url.search}`;
 
     // v0.3.0 §9: read the body ONCE, before routing. An HMAC covers the exact
@@ -785,6 +794,10 @@ export class RelayServer {
       this.enforceSignature(req, { method, signedPath, body: rawBody });
       const body = takeJson();
       if (principal.machine_id && !body.created_by) body.created_by = principal.machine_id;
+      const taskGuard = guardTaskBody(body);
+      if (taskGuard.ok !== true) {
+        return sendJson(res, taskGuard.status, taskGuard.body);
+      }
       const result = this.state.createTask(body);
       return sendJson(res, 200, result);
     }
@@ -1210,7 +1223,14 @@ export class RelayServer {
     }
     if (method === 'POST' && path === '/v1/result') {
       const body = takeJson();
-      const result = this.state.submitResult(body);
+      // B1 方案 A：window 模式接收旧信封（含 argv/head）并投影后存储；enforce 才硬拒。
+    if (String(process.env.W2M_DATA_PLANE_GUARD ?? 'window') === 'enforce') {
+      const resultGuard = guardResultEnvelope(body);
+      if (resultGuard.ok !== true) {
+        return sendJson(res, resultGuard.status, resultGuard.body);
+      }
+    }
+    const result = this.state.submitResult(body);
       const { _instanceKey, ...clean } = result;
       return sendJson(res, 200, clean);
     }

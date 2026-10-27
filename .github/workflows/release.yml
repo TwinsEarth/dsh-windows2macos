@@ -9,7 +9,7 @@ name: Release
 
 on:
   push:
-    tags: ['v*']
+    tags: ['v*', '!v*-beta.*']
   workflow_dispatch:
     inputs:
       tag:
@@ -23,6 +23,7 @@ jobs:
   release:
     name: verify, pack and publish
     runs-on: ubuntu-latest
+    if: ${{ !contains(github.event.inputs.tag || '', '-beta.') }}
     # The operator's rule: a STABLE release must be approved online. The beta workflow has no environment at
     # all -- for a beta the control point is who may push its tag.
     environment: Stable
@@ -204,6 +205,7 @@ jobs:
     name: publish to npm
     needs: release
     runs-on: ubuntu-latest
+    if: ${{ !contains(github.event.inputs.tag || '', '-beta.') }}
     continue-on-error: true
     permissions:
       contents: read

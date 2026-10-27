@@ -7,9 +7,14 @@
 
 All notable changes to this project are documented here.
 
-## [1.9.1] — 2026-10-27
-
+## [1.9.2-beta.1] - 2026-10-27
+- P0 止血：relay 数据面端点退役（blob/blob-sessions/latest → 403），结果信封校验后投影后存储（不再落 argv/head/tail/路径原文）。
+- B1 兼容窗口：默认接收 v1 信封并投影，设置 W2M_DATA_PLANE_GUARD=enforce 才硬拒。
+- guard 递归扫描 + 16 KiB 语义上限 + 协议错误形状。
+- beta：仅 GitHub prerelease，不含 npm/packages 发布。
 **V1.9.1 更新**
+
+## [1.9.1] — 2026-10-27
 
 ## [1.9.0] — 2026-10-27
 

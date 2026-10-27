@@ -1,3 +1,4 @@
+import { decidePath } from './path-policy.mjs';
 /**
  * GPW v2 — folder policy for the approval gate (v1.7.5-beta.1).
  *
@@ -71,24 +72,15 @@ export function classifyPath(input) {
   const base = input.base ?? process.cwd();
   const target = normalizeFolder(input.target, { base, platform });
   const normalise = (list) => (Array.isArray(list) ? list : []).map((f) => normalizeFolder(f, { base, platform }));
-
-  for (const folder of normalise(input.blacklist)) {
-    if (isInside(target, folder, { platform })) {
-      return { decision: 'deny', target, folder, reason: `the folder "${folder}" is on the blacklist` };
-    }
-  }
-  for (const folder of normalise(input.whitelist)) {
-    if (isInside(target, folder, { platform })) {
-      return { decision: 'allow', target, folder, reason: `the folder "${folder}" is on the whitelist` };
-    }
-  }
-  if (typeof input.workspace === 'string' && input.workspace !== '') {
-    const workspace = normalizeFolder(input.workspace, { base, platform });
-    if (isInside(target, workspace, { platform })) {
-      return { decision: 'allow', target, folder: workspace, reason: 'the target is inside the workspace' };
-    }
-  }
-  return { decision: 'pass', target, folder: null, reason: 'no list mentions this target, so GPW asks the operator' };
+  const rules = [
+    ...normalise(input.blacklist).map((path) => ({ path, effect: 'deny', source: 'panel' })),
+    ...normalise(input.whitelist).map((path) => ({ path, effect: 'allow', source: 'panel' })),
+  ];
+  const verdict = decidePath({ target, rules, exceptions: [], workspace: input.workspace ?? null, platform });
+  // 兼容旧返回形状：approve 视为 pass（需要人工），判定仍由 decidePath 单一实现。
+  const decision = verdict.decision === 'approve' ? 'pass' : verdict.decision;
+  const folder = verdict.rule?.path ?? (verdict.source === 'workspace' ? normalizeFolder(input.workspace, { base, platform }) : null);
+  return { decision, target, folder, reason: verdict.reason };
 }
 
 /** Fields that carry a single filesystem path in the tool schemas this plugin sees. */

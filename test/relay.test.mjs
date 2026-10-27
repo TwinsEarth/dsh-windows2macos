@@ -13,7 +13,6 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import https from 'node:https';
 import fs from 'node:fs';
-import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -4259,165 +4258,26 @@ describe('signing test vectors (§9.4.1)', () => {
 //     exactly as designed.
 //   * **A pairing code is one-time.** `pairDevice` mints a fresh one when `code` is omitted; a test that needs a
 //     specific fleet must mint one code per machine, or the second pair fails with `pairing code already used`.
-describe('v1.0.7 blob channel', () => {
-  const hashOf = (text) => createHash('sha256').update(Buffer.from(text, 'utf8')).digest('hex');
-
-  it('stores bytes under their own hash and returns them unchanged', async () => {
-    await withRelay({ stateDir: makeStateDir() }, async (relay) => {
-      const { token } = await pairDevice(relay, 'blob-sender');
-      const payload = 'fleet memory v1\nline two\n';
-      const hash = hashOf(payload);
-      const put = await request(`${relay.url}/v1/fleet/blobs/${hash}`, { method: 'PUT', rawBody: payload, token });
-      assert.equal(put.status, 201, put.text);
-      assert.equal(put.json.hash, hash);
-      assert.equal(put.json.bytes, Buffer.from(payload, 'utf8').length);
-
-      const got = await request(`${relay.url}/v1/fleet/blobs/${hash}`, { token });
-      assert.equal(got.status, 200, got.text);
-      assert.equal(got.text, payload, 'the bytes must come back identical, or the hash means nothing');
-    });
-  });
-
-  it('refuses bytes that do not hash to the key, and stores nothing', async () => {
-    await withRelay({ stateDir: makeStateDir() }, async (relay) => {
-      const { token } = await pairDevice(relay, 'blob-liar');
-      const key = 'a'.repeat(64); // right shape, not the hash of anything this test sends
-      const body = 'not that hash';
-      const put = await request(`${relay.url}/v1/fleet/blobs/${key}`, { method: 'PUT', rawBody: body, token });
-      assert.equal(put.status, 422, put.text);
-      assert.equal(put.json.error.code, 'BLOB_HASH_MISMATCH');
-      assert.equal(put.json.error.detail.expected, key);
-      assert.equal(
-        put.json.error.detail.actual,
-        createHash('sha256').update(Buffer.from(body, 'utf8')).digest('hex'),
-        'the refusal must report the hash it actually computed, or it is unauditable',
-      );
-      // A refused write must not become readable under the key it claimed.
-      assert.equal((await request(`${relay.url}/v1/fleet/blobs/${key}`, { token })).status, 404);
-    });
-  });
-
-  it('does not let one fleet read another fleet blob', async () => {
-    await withRelay({ stateDir: makeStateDir() }, async (relay) => {
-      // One code per machine: a code is one-time, and using one twice fails the second pair.
-      const { token: tokenA } = await pairDevice(relay, 'blob-mA', {
-        code: relay.state.createPairingCode({ fleetId: 'fleet-A' }),
-      });
-      const { token: tokenB } = await pairDevice(relay, 'blob-mB', {
-        code: relay.state.createPairingCode({ fleetId: 'fleet-B' }),
-      });
-      const payload = 'secret to fleet A\n';
-      const hash = hashOf(payload);
-      const put = await request(`${relay.url}/v1/fleet/blobs/${hash}`, { method: 'PUT', rawBody: payload, token: tokenA });
-      assert.equal(put.status, 201, put.text);
-      assert.equal((await request(`${relay.url}/v1/fleet/blobs/${hash}`, { token: tokenA })).status, 200, 'the owner reads it');
-      // 404 rather than 403: a distinguishable "not yours" would tell fleet B that this hash exists here.
-      assert.equal((await request(`${relay.url}/v1/fleet/blobs/${hash}`, { token: tokenB })).status, 404);
-    });
-  });
-
-  it('requires a device token before the channel will store anything', async () => {
-    await withRelay({}, async (relay) => {
-      const payload = 'nobody should reach this\n';
-      const hash = hashOf(payload);
-      const anonymous = await request(`${relay.url}/v1/fleet/blobs/${hash}`, { method: 'PUT', rawBody: payload });
-      assert.equal(anonymous.status, 401, 'the channel sits behind the same device-token gate as every other route');
-      assert.equal((await request(`${relay.url}/v1/fleet/blobs/${hash}`, {})).status, 401);
-    });
+describe('relay data-plane endpoints are retired', () => {
+  it('refuses blob upload, read, latest and blob-sessions with DATA_PLANE_REFUSED', async () => {
+    const relay = await startRelay({});
+    const token = OP;
+    for (const [method, path] of [
+      ['PUT', '/v1/fleet/blobs/' + 'a'.repeat(64)],
+      ['GET', '/v1/fleet/blobs/' + 'a'.repeat(64)],
+      ['GET', '/v1/fleet/blobs/latest'],
+      ['POST', '/v1/fleet/blob-sessions'],
+      ['PUT', '/v1/fleet/x/../blobs/' + 'a'.repeat(64)],
+      ['PUT', '/v1/fleet/x/%2e%2e/blobs/' + 'a'.repeat(64)],
+    ]) {
+      const res = await request(relay.url + path, { method, token, rawBody: method === 'PUT' ? 'x' : undefined });
+      assert.equal(res.status, 403, method + ' ' + path);
+      assert.equal(res.json.error.code, 'DATA_PLANE_REFUSED');
+    }
+    await relay.close();
   });
 });
 
-// ---------------------------------------------------------------------------------------------
-// v1.0.9 — the discovery pointer (#3): which blob did this fleet publish last?
-// ---------------------------------------------------------------------------------------------
-//
-// The channel worked before this and was close to useless: a hash is only useful to someone who already has it, and
-// the only way to get one was to read `publish`'s output on another machine. These tests cover the half that makes
-// it a sync rather than a demo.
-describe('v1.0.9 fleet latest pointer', () => {
-  const hashOf = (text) => createHash('sha256').update(Buffer.from(text, 'utf8')).digest('hex');
-
-  it('advances on publish, and reports the blob this fleet wrote', async () => {
-    await withRelay({ stateDir: makeStateDir() }, async (relay) => {
-      const { token } = await pairDevice(relay, 'ptr-a');
-      // Nothing published yet: 404, not an empty object. "No current document" is not "the document is nothing".
-      assert.equal((await request(`${relay.url}/v1/fleet/blobs/latest`, { token })).status, 404);
-
-      const one = 'memory v1\n';
-      await request(`${relay.url}/v1/fleet/blobs/${hashOf(one)}`, { method: 'PUT', rawBody: one, token });
-      const first = await request(`${relay.url}/v1/fleet/blobs/latest`, { token });
-      assert.equal(first.status, 200, first.text);
-      assert.equal(first.json.hash, hashOf(one));
-      assert.equal(first.json.bytes, Buffer.byteLength(one));
-      assert.match(first.json.published_at, /^\d{4}-\d{2}-\d{2}T/);
-
-      const two = 'memory v2\n';
-      await request(`${relay.url}/v1/fleet/blobs/${hashOf(two)}`, { method: 'PUT', rawBody: two, token });
-      assert.equal((await request(`${relay.url}/v1/fleet/blobs/latest`, { token })).json.hash, hashOf(two), 'the pointer follows the newest publish');
-    });
-  });
-
-  it('is scoped per fleet, like the blobs it points at', async () => {
-    await withRelay({ stateDir: makeStateDir() }, async (relay) => {
-      const { token: tokenA } = await pairDevice(relay, 'ptr-mA', {
-        code: relay.state.createPairingCode({ fleetId: 'ptr-fleet-A' }),
-      });
-      const { token: tokenB } = await pairDevice(relay, 'ptr-mB', {
-        code: relay.state.createPairingCode({ fleetId: 'ptr-fleet-B' }),
-      });
-      const payload = 'only A knows this\n';
-      await request(`${relay.url}/v1/fleet/blobs/${hashOf(payload)}`, { method: 'PUT', rawBody: payload, token: tokenA });
-      assert.equal((await request(`${relay.url}/v1/fleet/blobs/latest`, { token: tokenA })).json.hash, hashOf(payload));
-      // B never published, so it has no pointer -- A's is not visible across the fleet boundary.
-      assert.equal((await request(`${relay.url}/v1/fleet/blobs/latest`, { token: tokenB })).status, 404);
-    });
-  });
-
-  it('is a hint, not a guarantee: the pointer survives eviction but the pull does not', async () => {
-    await withRelay({ stateDir: makeStateDir() }, async (relay) => {
-      const { token } = await pairDevice(relay, 'ptr-evict');
-      const evictedText = 'will be evicted\n';
-      const evictedHash = hashOf(evictedText);
-      await request(`${relay.url}/v1/fleet/blobs/${evictedHash}`, { method: 'PUT', rawBody: evictedText, token });
-
-      // Remove the blob from disk behind the relay's back, which is what oldest-first eviction amounts to here.
-      const dir = relay.state._persist.dir;
-      const file = path.join(dir, 'blobs', evictedHash.slice(0, 2), evictedHash);
-      fs.rmSync(file, { force: true });
-
-      // The pointer still names it -- and the channel says so in the payload rather than pretending.
-      const pointer = await request(`${relay.url}/v1/fleet/blobs/latest`, { token });
-      assert.equal(pointer.status, 200);
-      assert.equal(pointer.json.hash, evictedHash);
-      assert.match(pointer.json.hint, /hint, not a guarantee/);
-      // And the read is honest: the blob is gone, so it is not found. The pointer does not resurrect it.
-      assert.equal((await request(`${relay.url}/v1/fleet/blobs/${evictedHash}`, { token })).status, 404);
-    });
-  });
-
-  it('does not let a second fleet claim the pointer by re-publishing identical bytes', async () => {
-    await withRelay({ stateDir: makeStateDir() }, async (relay) => {
-      const { token: tokenA } = await pairDevice(relay, 'ptr-ownA', {
-        code: relay.state.createPairingCode({ fleetId: 'ptr-own-A' }),
-      });
-      const { token: tokenB } = await pairDevice(relay, 'ptr-ownB', {
-        code: relay.state.createPairingCode({ fleetId: 'ptr-own-B' }),
-      });
-      const shared = 'identical bytes\n';
-      const hash = hashOf(shared);
-      assert.equal((await request(`${relay.url}/v1/fleet/blobs/${hash}`, { method: 'PUT', rawBody: shared, token: tokenA })).status, 201);
-      assert.equal((await request(`${relay.url}/v1/fleet/blobs/${hash}`, { method: 'PUT', rawBody: shared, token: tokenB })).status, 201);
-      assert.equal((await request(`${relay.url}/v1/fleet/blobs/latest`, { token: tokenA })).json.hash, hash, 'the first writer keeps it');
-      // B owns nothing, and must not be pointed at a blob it cannot read.
-      assert.equal((await request(`${relay.url}/v1/fleet/blobs/latest`, { token: tokenB })).status, 404);
-    });
-  });
-});
-
-/**
- * v1.1.6 account-key registration. The rule is "first pairing wins", and it is asserted in both directions because the
- * dangerous half is the silent one: a second machine presenting a different key must be reported, not accepted.
- */
 describe('the account key registry', () => {
   it('registers the account key once and refuses to overwrite it with a different key', () => {
     const state = new RabbitState({ now: () => 1_000 });
@@ -4739,52 +4599,10 @@ describe('aggregate publishes dataflow facts (v1.2.7)', () => {
       assert.equal(posted.status, 200, posted.text);
       const view = await request(`${relay.url}/v1/tasks/${created.json.task_id}`, { token: a.token });
       const machine = view.json.aggregate.machines.find((m) => m.machine_id === 'm1');
-      assert.equal(machine.blob_sha256, 'b'.repeat(64), 'the blob hash is on the aggregate, not hidden in detail');
-      assert.equal(machine.output_mode, 'blob');
+      assert.equal(machine.blob_sha256, null, 'the blob hash is projected to null on the aggregate');
+      assert.equal(machine.output_mode, null, 'output_mode is retired from the metadata contract (projected to null)');
       assert.equal(machine.stdout_bytes, 70_000);
     });
-  });
-});
-describe('blob frame limit (v1.2.7)', () => {
-  it('accepts a blob larger than the JSON frame cap while JSON routes stay capped', async () => {
-    const dir = makeStateDir();
-    try {
-    await withRelay({ stateDir: dir }, async (relay) => {
-      const a = await pairDevice(relay, 'm1');
-      const { createHash } = await import('node:crypto');
-      const text = 'x'.repeat(100_000);
-      const sha = createHash('sha256').update(Buffer.from(text, 'utf8')).digest('hex');
-
-      const put = await request(`${relay.url}/v1/fleet/blobs/${sha}`, { method: 'PUT', token: a.token, rawBody: text });
-      assert.equal(put.status, 201, put.text);
-      const got = await request(`${relay.url}/v1/fleet/blobs/${sha}`, { token: a.token });
-      assert.equal(got.status, 200);
-      assert.equal(got.text.length, 100_000, 'the blob came back byte-for-byte');
-
-      // the JSON frame cap still applies everywhere else: a 100 KB "result" is refused before routing
-      const huge = await request(`${relay.url}/v1/result`, { method: 'POST', token: a.token, rawBody: text });
-      assert.equal(huge.status, 413);
-      assert.match(huge.text, /FRAME_TOO_LARGE/);
-    });
-    } finally { removeStateDir(dir); }
-  });
-});
-describe('blob frame size (v1.2.8)', () => {
-  it('accepts a blob larger than the old 1 MiB transport cap, up to the agent hard cap', async () => {
-    const dir = makeStateDir();
-    try {
-      await withRelay({ stateDir: dir }, async (relay) => {
-        const a = await pairDevice(relay, 'm1');
-        const { createHash } = await import('node:crypto');
-        const text = 'y'.repeat(2 * 1024 * 1024);
-        const sha = createHash('sha256').update(Buffer.from(text, 'utf8')).digest('hex');
-        const put = await request(`${relay.url}/v1/fleet/blobs/${sha}`, { method: 'PUT', token: a.token, rawBody: text });
-        assert.equal(put.status, 201, put.text);
-        const got = await request(`${relay.url}/v1/fleet/blobs/${sha}`, { token: a.token });
-        assert.equal(got.status, 200);
-        assert.equal(got.text.length, text.length, 'a 2 MiB artifact survives the transport intact');
-      });
-    } finally { removeStateDir(dir); }
   });
 });
 describe('project room routes', () => {
@@ -4894,64 +4712,6 @@ describe('project lock routes', () => {
       assert.equal(forced.status, 409);
       assert.equal(forced.json.code, 'LOCK_FORCE_DENIED');
     });
-  });
-});
-
-describe('blob session routes', () => {
-  it('uploads in chunks, commits, and serves a Range read', async () => {
-    const dir = makeStateDir();
-    try {
-      await withRelay({ stateDir: dir }, async (relay) => {
-        const device = await pairDevice(relay, 'm-blob-1');
-        const payload = Buffer.from('hello world, this is a chunked blob payload', 'utf8');
-        const sha = sha256Hex(payload);
-        const created = await request(relay.url + '/v1/fleet/blob-sessions', {
-          method: 'POST', token: device.token, body: { sha256: sha, size: payload.length, chunk_bytes: 1024 },
-        });
-        assert.equal(created.status, 201, created.text);
-        const sessionId = created.json.session.session_id;
-        assert.equal(created.json.session.chunks, 1);
-
-        const put = await request(relay.url + '/v1/fleet/blob-sessions/' + sessionId + '/chunks/0', {
-          method: 'PUT', token: device.token, rawBody: payload.toString('utf8'), headers: { 'content-type': 'application/octet-stream' },
-        });
-        assert.equal(put.status, 200, put.text);
-
-        const status = await request(relay.url + '/v1/fleet/blob-sessions/' + sessionId, { token: device.token });
-        assert.equal(status.status, 200, status.text);
-        assert.deepEqual(status.json.session.missing, []);
-
-        const committed = await request(relay.url + '/v1/fleet/blob-sessions/' + sessionId + '/commit', { method: 'POST', token: device.token, body: {} });
-        assert.equal(committed.status, 201, committed.text);
-        assert.equal(committed.json.sha256, sha);
-
-        const full = await request(relay.url + '/v1/fleet/blobs/' + sha, { token: device.token });
-        assert.equal(full.status, 200, full.text);
-        assert.equal(full.text, payload.toString('utf8'));
-
-        const partial = await request(relay.url + '/v1/fleet/blobs/' + sha + '?range=0-4', { token: device.token });
-        assert.equal(partial.status, 206);
-        assert.equal(partial.text, 'hello');
-        assert.match(partial.headers['content-range'], /^bytes 0-4\//);
-      });
-    } finally { removeStateDir(dir); }
-  });
-
-  it('reports an incomplete commit with the missing chunk indices', async () => {
-    const dir = makeStateDir();
-    try {
-      await withRelay({ stateDir: dir }, async (relay) => {
-        const device = await pairDevice(relay, 'm-blob-2');
-        const payload = Buffer.alloc(2048, 0x61);
-        const sha = sha256Hex(payload);
-        const created = await request(relay.url + '/v1/fleet/blob-sessions', { method: 'POST', token: device.token, body: { sha256: sha, size: payload.length, chunk_bytes: 1024 } });
-        const sessionId = created.json.session.session_id;
-        const committed = await request(relay.url + '/v1/fleet/blob-sessions/' + sessionId + '/commit', { method: 'POST', token: device.token, body: {} });
-        assert.equal(committed.status, 409);
-        assert.equal(committed.json.code, 'BLOB_INCOMPLETE');
-        assert.deepEqual(committed.json.missing, [0, 1]);
-      });
-    } finally { removeStateDir(dir); }
   });
 });
 

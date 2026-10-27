@@ -50,6 +50,36 @@ export const REASON = Object.freeze({
  */
 export const ACCEPTED_ORPHANS = Object.freeze([
   {
+    file: 'src/util/data-plane.mjs',
+    reason: REASON.LIBRARY,
+    why: 'the data-plane port (pushObject/fetchObject/ref validation/null sink) for the P1 data plane; 1.9.2 predates its wiring',
+    removedBy: 'the 1.9.3 wiring slice that gives this module its production caller',
+  },
+  {
+    file: 'src/util/sealed-object.mjs',
+    reason: REASON.LIBRARY,
+    why: 'the compressed-then-encrypted object format for approved sinks; measured by its own suite and not yet wired in 1.9.2',
+    removedBy: 'the 1.9.3 wiring slice that gives this module its production caller',
+  },
+  {
+    file: 'src/relay/guarded-dispatch.mjs',
+    reason: REASON.LIBRARY,
+    why: 'a composable guard wrapper kept as the relay-side seam; the live relay refuses blob routes inside handle()',
+    removedBy: 'the 1.9.3 wiring slice that gives this module its production caller',
+  },
+  {
+    file: 'src/plugin/target-policy.mjs',
+    reason: REASON.LIBRARY,
+    why: 'machine-selection precedence as a pure policy library; composer/dispatch wiring is scheduled for 1.9.3',
+    removedBy: 'the 1.9.3 wiring slice that gives this module its production caller',
+  },
+  {
+    file: 'src/plugin/gpw-policy-adapter.mjs',
+    reason: REASON.LIBRARY,
+    why: 'the GPW policy adapter (single matcher, color rendering, budget short-circuit); gpw-colors wiring is scheduled for 1.9.3',
+    removedBy: 'the 1.9.3 wiring slice that gives this module its production caller',
+  },
+  {
     file: 'src/agent/outbox.mjs',
     reason: REASON.LIBRARY,
     why: 'M6 result outbox: atomic per-result files, exponential backoff, cross-restart recovery, count/byte ceiling; the agent delivery path still uses the existing spool and does not call it yet',

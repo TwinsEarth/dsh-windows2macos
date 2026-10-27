@@ -5747,6 +5747,12 @@ export async function apply(ctx, config = {}) {
        * useful. A machine with no `fleet-memory.md` has not published anything yet -- that is a state, not a
        * protocol violation, and the message should say which file is missing and where it was looked for.
        */
+if (typeof args?.action === 'string' && ['publish', 'latest', 'pull', 'diff', 'merge'].includes(args.action)) {
+throw new W2MError('MEMORY_SYNC_UNAVAILABLE', 'MEMORY_SYNC_UNAVAILABLE: relay blob endpoints are retired in 1.9.2; a data-plane sink is required (1.9.3)', {
+hint: 'the local fleet-memory.md is unchanged; action read/show still reads local memory',
+});
+}
+
       if (typeof args?.action === 'string' && args.action === 'publish') {
         const file = collectivePath();
         if (file === null) {

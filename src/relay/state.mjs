@@ -1,3 +1,4 @@
+import { projectResultEnvelope } from './p0-projection.mjs';
 /**
  * W2M Rabbit relay — in-memory state machine.
  *
@@ -3155,8 +3156,12 @@ export class RabbitState {
       envelopeShaOk = sha256Hex(jcs(rest)) === envelope.envelope_sha256;
     }
 
+    // B2/V5/V6/V7：先校验（上面已完成），再投影后存储；原信封哈希单独保留用于审计。
+    const { projected, dropped } = projectResultEnvelope(envelope);
     const record = {
-      envelope,
+      envelope: projected,
+      envelope_sha256_received: typeof envelope.envelope_sha256 === 'string' ? envelope.envelope_sha256 : null,
+      ...(dropped.length > 0 ? { projection: { dropped } } : {}),
       machine_id: machineId,
       dedupe_key: dedupeKey,
       attempt,
