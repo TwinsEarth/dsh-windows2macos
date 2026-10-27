@@ -14,6 +14,7 @@ import { compareVersions } from './update-source.mjs';
 export const PLUGIN_PACKAGE_NAME = '@twinsearth/w2m-dsh-plugin';
 /** npm mirrors are fine here: the answer is only "which version is latest", and the tarball is verified separately. */
 export const DEFAULT_NPM_LATEST_URL = `https://registry.npmmirror.com/${encodeURIComponent(PLUGIN_PACKAGE_NAME)}/latest`;
+export const DEFAULT_NPM_LATEST_FALLBACK_URL = `https://registry.npmjs.org/${encodeURIComponent(PLUGIN_PACKAGE_NAME)}/latest`;
 export const NPM_CHECK_TIMEOUT_MS = 15_000;
 
 /**
@@ -61,19 +62,24 @@ export function decideNpmUpdate({ latest, currentVersion }) {
 export async function checkNpmUpdate(input) {
   const fetchImpl = input?.fetchImpl ?? globalThis.fetch;
   const url = input?.url ?? DEFAULT_NPM_LATEST_URL;
+  const urls = input?.url !== undefined ? [url] : [url, DEFAULT_NPM_LATEST_FALLBACK_URL];
   const timeoutMs = Number.isInteger(input?.timeoutMs) ? input.timeoutMs : NPM_CHECK_TIMEOUT_MS;
-  let doc;
-  try {
-    const response = await fetchImpl(url, {
-      headers: { accept: 'application/json' },
-      signal: typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function' ? AbortSignal.timeout(timeoutMs) : undefined,
-    });
-    if (response?.ok !== true) {
-      return decideNpmUpdate({ latest: { ok: false, error: `npm registry answered HTTP ${response?.status ?? '?'}` }, currentVersion: input?.currentVersion ?? null });
+  let last = { ok: false, error: 'npm latest could not be read' };
+  for (const candidate of urls) {
+    try {
+      const response = await fetchImpl(candidate, {
+        headers: { accept: 'application/json' },
+        signal: typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function' ? AbortSignal.timeout(timeoutMs) : undefined,
+      });
+      if (response?.ok !== true) { last = { ok: false, error: `npm registry answered HTTP ${response?.status ?? '?'}` }; continue; }
+      const doc = await response.json();
+      const parsed = parseNpmLatest(doc);
+      if (parsed.ok === true) return decideNpmUpdate({ latest: parsed, currentVersion: input?.currentVersion ?? null });
+      last = parsed;
+    } catch (error) {
+      last = { ok: false, error: error instanceof Error ? error.message : String(error) };
     }
-    doc = await response.json();
-  } catch (error) {
-    return decideNpmUpdate({ latest: { ok: false, error: error instanceof Error ? error.message : String(error) }, currentVersion: input?.currentVersion ?? null });
   }
-  return decideNpmUpdate({ latest: parseNpmLatest(doc), currentVersion: input?.currentVersion ?? null });
+  return decideNpmUpdate({ latest: last, currentVersion: input?.currentVersion ?? null });
 }
+

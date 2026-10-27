@@ -7,6 +7,12 @@
 
 All notable changes to this project are documented here.
 
+## [1.9.3] - 2026-10-27
+- 左侧边栏新增常驻 GPW 入口（默认显示、无关闭按钮），Composer 与右下角浮窗保留。
+- 插件设置页新增“W2M 插件更新”分区：检测更新、发现新版本后立即安装、自动更新开关（开启后每次启动自动安装）。
+- 更新检测修复：设置页打开即检查；本机为旧版时直接显示新版本号与安装按钮；npm 镜像不可用时回退 registry.npmjs.org。
+- 自动更新不再只是偏好：开关打开后会实际调用校验与安装流程，并提示重启。
+
 ## [1.9.2-beta.1] - 2026-10-27
 - P0 止血：relay 数据面端点退役（blob/blob-sessions/latest → 403），结果信封校验后投影后存储（不再落 argv/head/tail/路径原文）。
 - B1 兼容窗口：默认接收 v1 信封并投影，设置 W2M_DATA_PLANE_GUARD=enforce 才硬拒。

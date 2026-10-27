@@ -1,0 +1,21 @@
+{
+  "version": "1.9.3",
+  "case": "RELEASE-193",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-27T12:59:16.096Z",
+  "executor": "lead",
+  "task_id": "pre-release-193-1793105956097",
+  "requirement": "V1.9.3 发布验收：左侧边栏常驻 GPW 入口；插件设置页检测更新/自动更新；旧版安装可发现新版本",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "gates": "preflight GREEN, full suite 3167 passed",
+      "sidebar_gpw": "sidebar.footer.action registered, always visible, no close affordance",
+      "update_settings": "settings.section registered; check-on-mount; install button when outdated; auto-update toggle performs install",
+      "update_check_fix": "npm mirror failure falls back to registry.npmjs.org; settings shows latest/current without a click"
+    }
+  }
+}

@@ -316,8 +316,8 @@ describe('client bundle: the activation contract', () => {
       () => exports.apply(ctx),
       'an undeclared service read throws in Cordis and takes the whole app down; the bundle must read only what it declares',
     );
-    assert.deepEqual(registry.announced, [SEAT, SEAT, SEAT, SEAT, SEAT], 'the entry still has to take its seat');
-    assert.equal(registry.registered.length, 5);
+    assert.deepEqual(registry.announced, [SEAT, SEAT, 'sidebar.footer.action', 'settings.section', SEAT, SEAT, SEAT], 'the entry still has to take its seat');
+    assert.equal(registry.registered.length, 7);
     assert.equal(locale.registered.has('w2m.target'), true, 'the dictionaries go to the locale service when there is one');
   });
 
@@ -419,10 +419,10 @@ describe('client bundle: the seat it registers into', () => {
     return { announced, registered, effects };
   }
 
-  it('announces and registers all five controls into conversation.input.left', () => {
+  it('announces and registers all five composer controls plus the sidebar and update sections into conversation.input.left', () => {
     const { announced, registered } = applyTo();
-    assert.deepEqual(announced, [SEAT, SEAT, SEAT, SEAT, SEAT]);
-    assert.equal(registered.length, 5);
+    assert.deepEqual(announced, [SEAT, SEAT, 'sidebar.footer.action', 'settings.section', SEAT, SEAT, SEAT]);
+    assert.equal(registered.length, 7);
     assert.equal(registered[0].options.name, SEAT);
   });
 
@@ -470,7 +470,7 @@ describe('client bundle: the seat it registers into', () => {
     };
     const { exports } = loadBundle();
     assert.doesNotThrow(() => exports.apply(ctx));
-    assert.equal(registered.length, 5);
+    assert.equal(registered.length, 7);
   });
 });
 
