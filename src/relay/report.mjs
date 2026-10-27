@@ -14,6 +14,8 @@ import {
   rfc3339,
 } from './state.mjs';
 
+import { stripReportAggregate } from './p0-projection.mjs';
+
 /** Aggregate statuses this module can return. */
 export const AGGREGATE_STATUSES = Object.freeze([
   // ---- the six verdicts of §6.3 ----
@@ -446,7 +448,7 @@ export function aggregate(task, resultRecords = [], opts = {}) {
   steps.push(step2);
   steps.push(step3);
 
-  return {
+  return stripReportAggregate({
     protocol_version: PROTOCOL_VERSION,
     task_id: task.task_id,
     status,
@@ -518,7 +520,7 @@ export function aggregate(task, resultRecords = [], opts = {}) {
       expired: step2.expired?.length ?? 0,
       pending: step2.pending?.length ?? 0,
     },
-  };
+  });
 }
 
 /** Convenience wrapper: pull the task + its results out of a RabbitState. */

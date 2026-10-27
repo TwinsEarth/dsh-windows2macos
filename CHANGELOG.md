@@ -7,6 +7,11 @@
 
 All notable changes to this project are documented here.
 
+## [1.9.11] - 2026-10-28
+
+- 修复左侧栏只剩图标：GPW 名称恢复到入口内（🌐 GPW），侧栏 label 仍为空，避免再次重复。
+- 对话全文搜索：匹配项以黄色高亮（CSS Custom Highlight API ::highlight(w2m-conversation-search)），显示 当前/总数 计数；Enter/Shift+Enter 或 ↑/↓ 在命中项间滚动，Esc 清除。
+
 ## [1.9.10] - 2026-10-28
 
 - 新增 `bin/w2m-self-update.mjs`：可被编队任务直接下发的自更新入口，读取 GitHub Release、校验 SHA256SUMS、调用已验证安装器，输出一行 JSON，不重启 DSH。
