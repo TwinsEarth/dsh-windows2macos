@@ -4,10 +4,24 @@
  * relay 永不接触明文、内容密钥或私钥。
  */
 import {
-  createCipheriv, createDecipheriv, createHash, createPublicKey, diffieHellman,
+  createCipheriv, createDecipheriv, createHash, createPrivateKey, createPublicKey, diffieHellman,
   generateKeyPairSync, hkdfSync, randomBytes, sign as edSign, verify as edVerify,
 } from 'node:crypto';
-import { gzipSync, gunzipSync, zstdCompressSync, zstdDecompressSync } from 'node:zlib';
+import { createRequire } from 'node:module';
+import { gzipSync, gunzipSync } from 'node:zlib';
+
+// zstd landed in Node 22.15/23.8 while engines allow Node 20: feature-detect instead of importing
+// the name, because a named ESM import of a missing export fails at link time on the older runtime.
+const require = createRequire(import.meta.url);
+let zstdCompressSync = null;
+let zstdDecompressSync = null;
+try {
+  const zlib = require('node:zlib');
+  if (typeof zlib.zstdCompressSync === 'function') {
+    zstdCompressSync = zlib.zstdCompressSync;
+    zstdDecompressSync = zlib.zstdDecompressSync;
+  }
+} catch { /* older Node: gzip only */ }
 
 export const MAX_OBJECT_BYTES = 64 * 1024 * 1024;
 export const COMPRESS_THRESHOLD = 4 * 1024;
@@ -110,7 +124,7 @@ export function openObject(sealed, { recipientPrivateKeyPem, signerPublicKeyPem,
   if (sealed.plain.bytes > limit) throw new Error('OBJECT_TOO_LARGE');
 
   const aad = aadOf({ taskId: sealed.task_id, plainSha256: expected, sink: sealed.sink });
-  const shared = diffieHellman({ privateKey: createPublicKey(recipientPrivateKeyPem).export ? recipientPrivateKeyPem : recipientPrivateKeyPem, publicKey: createPublicKey(sealed.epk) });
+  const shared = diffieHellman({ privateKey: createPrivateKey(recipientPrivateKeyPem), publicKey: createPublicKey(sealed.epk) });
   const kek = Buffer.from(hkdfSync('sha256', shared, Buffer.from(expected.slice(0, 32), 'hex'), Buffer.from('w2m-sealed-v1', 'utf8'), 32));
   const unwrap = createDecipheriv('aes-256-gcm', kek, Buffer.from(sealed.wrap.iv, 'base64'));
   unwrap.setAuthTag(Buffer.from(sealed.wrap.tag, 'base64'));
