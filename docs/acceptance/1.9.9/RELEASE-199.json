@@ -1,0 +1,21 @@
+{
+  "version": "1.9.9",
+  "case": "RELEASE-199",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-27T22:54:14.249Z",
+  "executor": "lead",
+  "task_id": "pre-release-199-1793141654250",
+  "requirement": "V1.9.9：修复 Windows 立即更新 spawn EINVAL（dsh.cmd），回退运行时 pnpm",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "plan": "win32 .cmd/.bat shim never selected",
+      "fallback": "EINVAL on dsh plan retries once with runtime pnpm",
+      "tests": "update-install 28/28 green",
+      "gates": "full suite + preflight expected GREEN before tag"
+    }
+  }
+}

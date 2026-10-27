@@ -316,8 +316,13 @@ export function planInstall(input) {
   const dshPath = input.dshPath ?? null;
   const pnpmPath = input.pnpmPath ?? null;
   const nodePath = input.nodePath ?? process.execPath;
+  const platform = input.platform ?? process.platform;
+  // v1.9.9: on Windows the CLI is installed as `dsh.cmd`; spawn(shell:false) refuses it with
+  // EINVAL, which surfaced as "could not run dsh (EINVAL: spawn EINVAL)". Only a directly
+  // executable shim (.exe) may take the dsh path; everything else falls back to the runtime pnpm.
+  const dshSpawnable = dshPath !== null && !(platform === 'win32' && /\.(cmd|bat)$/i.test(dshPath));
 
-  if (dshPath) {
+  if (dshSpawnable) {
     return {
       via: 'dsh',
       // `dsh plugin --profile <name> add <tarball>` is the supported surface;
@@ -531,7 +536,7 @@ export async function installUpdate(options = {}) {
   const packageName = manifest?.name ?? options.packageName ?? DEFAULT_PACKAGE_NAME;
   const from = readInstalledVersion(absoluteProfile, packageName);
 
-  const plan = planInstall({
+  let plan = planInstall({
     profileDir: absoluteProfile,
     profileName,
     stagedTarball,
@@ -637,6 +642,21 @@ export async function installUpdate(options = {}) {
       spawnError: { code: 'RUNNER_THREW', message: String(error?.message ?? error) },
       timedOut: false,
     };
+  }
+
+  // v1.9.9: a spawn-level failure on the dsh plan (EINVAL/ENOENT) is retried once with the runtime
+  // pnpm, because that is the installer the same machine already uses successfully.
+  if (result?.spawnError?.code === 'EINVAL' && plan.via === 'dsh' && pnpmPath) {
+    const fallback = planInstall({ profileDir: absoluteProfile, profileName, stagedTarball, dshPath: null, pnpmPath, nodePath });
+    if (fallback !== null) {
+      step('dsh could not be spawned; retrying with the runtime pnpm');
+      plan = fallback;
+      try {
+        result = await runner({ argv: plan.argv, cwd: plan.cwd, via: plan.via });
+      } catch (error) {
+        result = { code: null, stdout: '', stderr: '', spawnError: { code: 'RUNNER_THREW', message: String(error?.message ?? error) }, timedOut: false };
+      }
+    }
   }
 
   const stderrTail = tailBytes(result?.stderr ?? '', stderrTailBytes);

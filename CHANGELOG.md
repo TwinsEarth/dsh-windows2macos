@@ -7,6 +7,11 @@
 
 All notable changes to this project are documented here.
 
+## [1.9.9] - 2026-10-28
+
+- 修复 Windows「立即更新」失败：dsh 以 dsh.cmd 安装时，child_process.spawn(shell:false) 会报 EINVAL。现在 Windows 下不再把 .cmd/.bat 当作可直接执行计划，自动改用运行时 pnpm；若 dsh 计划出现 EINVAL，也会回退 pnpm 重试一次。
+- 新增回归测试：.cmd 计划被拒绝并走 pnpm；spawn 失败仍回滚。
+
 ## [1.9.8] - 2026-10-28
 
 - 左栏 GPW 入口改为纯图标（🌐），去掉重复的文字条目。

@@ -578,8 +578,10 @@ describe('update-install: dryRun', () => {
 // ---------------------------------------------------------------------------
 
 describe('update-install: installer selection', () => {
-  it('prefers the dsh CLI and reports installedVia: dsh', async () => {
-    const profile = makeProfile('via-dsh');
+  it('refuses a Windows .cmd shim and installs through the runtime pnpm instead', async () => {
+    // v1.9.9: spawn(shell:false) cannot run dsh.cmd on Windows (EINVAL), which surfaced as
+    // "could not run dsh (EINVAL: spawn EINVAL)". The .cmd shim is not a supported plan.
+    const profile = makeProfile('via-dsh-cmd');
     const runner = fakeRunner();
 
     const result = await installUpdate({
@@ -592,11 +594,10 @@ describe('update-install: installer selection', () => {
     });
 
     assert.equal(result.ok, true, result.error ?? '');
-    assert.equal(result.installedVia, 'dsh');
+    assert.equal(result.installedVia, 'pnpm');
     const argv = runner.calls[0].argv;
-    assert.equal(argv[0], 'C:/dsh/dsh.cmd');
-    assert.deepEqual(argv.slice(1, 5), ['plugin', '--profile', basename(profile), 'add']);
-    assert.equal(argv[5], join(profile, STAGING_DIR_NAME, basename(tarballPath)));
+    assert.ok(argv.includes('C:/runtime/pnpm.mjs'), 'the runtime pnpm is executed');
+    assert.equal(argv[argv.length - 1], profile);
   });
 
   it('falls back to the runtime pnpm and reports installedVia: pnpm', async () => {
@@ -734,7 +735,9 @@ describe('update-install: failure reporting', () => {
       profileDir: profile,
       expectedSha256: tarballSha256,
       runner,
-      dshPath: 'C:/missing/dsh.cmd',
+      // v1.9.9: a .cmd shim is no longer a plan on Windows; use a directly executable path so
+      // this case keeps testing a spawn failure rather than installer selection.
+      dshPath: 'C:/tools/dsh.exe',
     });
 
     assert.equal(result.ok, false);
