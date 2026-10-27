@@ -7,6 +7,12 @@
 
 All notable changes to this project are documented here.
 
+## [1.9.10] - 2026-10-28
+
+- 新增 `bin/w2m-self-update.mjs`：可被编队任务直接下发的自更新入口，读取 GitHub Release、校验 SHA256SUMS、调用已验证安装器，输出一行 JSON，不重启 DSH。
+- 固化升级策略：优先下发自更新指令；失败才使用 Node 远程执行回退（macOS 用 mac-self-update，Windows 用 node 替换+备份）。
+- 参数：--profile、--dry-run、--allow-prerelease；环境变量 W2M_PROFILE_DIR / W2M_UPDATE_REPO。
+
 ## [1.9.9] - 2026-10-28
 
 - 对话主工作区新增全文搜索：会话头部（置顶按钮同排）🔍 图标，点击展开搜索框，Enter/Shift+Enter 或 ↑/↓ 在已渲染对话中查找并高亮（Electron/Chromium find）。
