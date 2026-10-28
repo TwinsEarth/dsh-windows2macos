@@ -7,6 +7,14 @@
 
 All notable changes to this project are documented here.
 
+## [2.0.1] - 2026-10-28
+
+- 修复右上角滚动按钮无效：滚动容器识别改为“命中测试 + 递归 shadow root + 允许 overflow:hidden 的程序化滚动容器”，
+  并直接写 scrollTop/scrollTo；找不到容器时回退到 window。旧实现只找 overflow:auto，虚拟列表/隐藏溢出容器下点击是空操作。
+- 只保留一个滚动图标（SVG 向上箭头，样式与右上角官方图标对齐：32px、8px 圆角、1px 边框、right:16px/top:64px），
+  删除原来的第二个“一键到顶”按钮与会话头部的重复“⇧3”按钮。
+- 交互：点一次向上滚动约 3 轮；长按 3 秒直接回到第一轮（长按后松手的 click 不会重复触发）。
+
 ## [2.0.0] - 2026-10-28
 
 主插件与既有 Relay 的对接按《W2M Relay × ToFuture 外部对接 API v1.2》收敛；ToFuture 子插件按该文档

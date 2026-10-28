@@ -1,0 +1,22 @@
+{
+  "version": "2.0.1",
+  "case": "RELEASE-2010",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-28T09:49:39.826Z",
+  "executor": "lead",
+  "task_id": "pre-release-2010-1793180979827",
+  "requirement": "v2.0.1：右上角单个滚动图标，点击滚动 3 轮、长按 3 秒到顶，图标与官方一键到顶对齐，修复点击无效",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "single_icon": "one SVG button; second top button and header duplicate removed",
+      "interaction": "click -> scrollTop -1.8*clientHeight; long press 3s -> top; click after long press suppressed",
+      "resolver": "elementFromPoint ancestors + shadow roots + overflow hidden + scrollTop direct write + window fallback",
+      "alignment": "right:16px, top:64px, 32x32, radius 8px, 1px border",
+      "tests": "client-bundle 26/26, lint 0 errors"
+    }
+  }
+}
