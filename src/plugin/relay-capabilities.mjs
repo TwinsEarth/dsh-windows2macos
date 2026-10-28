@@ -37,7 +37,8 @@ export async function readRelayCapabilities(input) {
       relay_version: typeof doc?.relay_version === 'string' ? doc.relay_version : (typeof doc?.version === 'string' ? doc.version : null),
       features,
       protocol_version: Number.isInteger(doc?.protocol_version) ? doc.protocol_version : null,
-      operator_token_required: doc?.operator_token_required === true,
+      operator_token_required: typeof doc?.operator_token_required === 'boolean' ? doc.operator_token_required : null,
+      signing_required: typeof doc?.signing?.required === 'boolean' ? doc.signing.required : null,
     };
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : String(error) };

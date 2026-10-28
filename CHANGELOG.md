@@ -7,6 +7,22 @@
 
 All notable changes to this project are documented here.
 
+## [2.0.0] - 2026-10-28
+
+主插件与既有 Relay 的对接按《W2M Relay × ToFuture 外部对接 API v1.2》收敛；ToFuture 子插件按该文档
+§6/§9 保持完全独立（主插件不内嵌、不调用、不代理、不实现其运维/白名单/令牌接口）。
+
+- 能力协商：/healthz 读取 features、operator_token_required、signing.required；缺失
+  target-machines/result-projection 时明确拒绝联合派发；signing.required=true 拒绝（v1 外部客户端不支持强签）；
+  operator_token_required=false 拒绝（生产必须为 true）。
+- 派发：控制消息显式携带 target_machines（API §4.6：发到哪台机器只由它决定），保留
+  executor_machine_id 兼容旧 relay；同 id 派发捕获 409 后读回任务而不是当成成功；
+  200 但无 task_id（依赖被拒）按失败处理；被点名机器租约 refused/expired/cancelled 立即失败。
+- 移除主插件内所有 ToFuture 运维面模块（MAC/IP 白名单 HMAC 上报、relay 侧识别路由），
+  遵守 API v1.2 §9：主插件不得实现、调用或探测运维/白名单/令牌接口。
+- 联合开发（plan/approve/dispatch/merge）仍为实验性：数据面投递与合并接线未随本版交付；
+  relay 部署/升级独立于插件发布，线上 relay 版本以 /healthz 为准。
+
 ## [1.9.21] - 2026-10-28
 
 - 发布边界：本版只发主插件；ToFuture 运维子插件由独立私有仓库另行发布，本包不包含安装/下载能力。

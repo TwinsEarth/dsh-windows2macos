@@ -93,6 +93,9 @@ export async function dispatchPlanToRelay(input) {
   }
 
   const capabilities = await readRelayCapabilities({ rabbitUrl, fetchImpl, timeoutMs });
+  if (capabilities.ok !== true) return { ok: false, code: 'RELAY_CAPABILITIES_UNAVAILABLE', detail: { relay: rabbitUrl, error: capabilities.error ?? null } };
+  if (capabilities.signing_required === true) return { ok: false, code: 'RELAY_SIGNING_REQUIRED', detail: { relay: rabbitUrl } };
+  if (capabilities.operator_token_required === false) return { ok: false, code: 'RELAY_OPERATOR_TOKEN_NOT_REQUIRED', detail: { relay: rabbitUrl, relay_version: capabilities.relay_version ?? null } };
   const negotiation = negotiateFeatures(capabilities);
   if (negotiation.ok !== true) {
     return { ok: false, code: negotiation.code ?? 'RELAY_CAPABILITIES_MISSING', detail: { missing: negotiation.missing ?? null, relay: rabbitUrl } };
@@ -106,6 +109,7 @@ export async function dispatchPlanToRelay(input) {
     const body = {
       task_id: taskId,
       mode: 'broadcast',
+      target_machines: [step.machine_id],
       executor_machine_id: step.machine_id,
       command_argv: step.command_argv,
       command_hash: step.command_hash,
@@ -132,18 +136,43 @@ export async function dispatchPlanToRelay(input) {
     }
     const doc = await response.json().catch(() => null);
     if (response.status === 409 && doc?.error?.code === 'TASK_EXISTS') {
+      // API v1.2 §5.2: a 409 is not success. Read the existing task back and require it to exist.
+      let existing = null;
+      try {
+        const read = await fetchImpl(`${rabbitUrl}/v1/tasks/${encodeURIComponent(taskId)}`, { headers, signal: signalOf() });
+        existing = read.ok === true ? await read.json() : null;
+      } catch { existing = null; }
+      if (existing === null) {
+        writeAudit(auditFile, { event: 'joint.dispatch.already', plan_sha256: plan.plan_sha256, step_id: step.step_id, task_id: taskId });
+        dispatched.set(step.step_id, taskId);
+        tasks.push({ step_id: step.step_id, task_id: taskId, already: true, leases: [] });
+        continue;
+      }
+      const existingLeases = Array.isArray(existing?.leases) ? existing.leases : [];
+      const mine = existingLeases.filter((lease) => lease?.machine_id === step.machine_id);
+      if (existingLeases.length > 0 && mine.length === 0) return { ok: false, code: 'TASK_EXISTS_FOREIGN', detail: { step_id: step.step_id, task_id: taskId }, partial: tasks.length > 0, tasks };
       writeAudit(auditFile, { event: 'joint.dispatch.already', plan_sha256: plan.plan_sha256, step_id: step.step_id, task_id: taskId });
       dispatched.set(step.step_id, taskId);
-      tasks.push({ step_id: step.step_id, task_id: taskId, already: true, leases: [] });
+      tasks.push({ step_id: step.step_id, task_id: taskId, already: true, leases: mine.map((lease) => ({ machine_id: lease.machine_id ?? null, state: lease.state ?? null })) });
       continue;
     }
     if (response.ok !== true) {
       writeAudit(auditFile, { event: 'joint.dispatch.refused', plan_sha256: plan.plan_sha256, step_id: step.step_id, task_id: taskId, reason_code: doc?.error?.code ?? 'RELAY_REFUSED' });
       return { ok: false, code: doc?.error?.code ?? 'RELAY_REFUSED', status: response.status, detail: doc?.error ?? doc, partial: tasks.length > 0, tasks };
     }
-    const returnedTaskId = doc?.task_id ?? doc?.task?.task_id ?? taskId;
+    if (typeof doc?.task_id !== 'string' || doc.task_id === '') {
+      writeAudit(auditFile, { event: 'joint.dispatch.refused', plan_sha256: plan.plan_sha256, step_id: step.step_id, task_id: taskId, reason_code: doc?.refusal_reason ?? 'RELAY_REFUSED' });
+      return { ok: false, code: 'RELAY_REFUSED', status: response.status, detail: { refusal_reason: doc?.refusal_reason ?? null, refused_task_id: null }, partial: tasks.length > 0, tasks };
+    }
+    const returnedTaskId = doc.task_id;
     const leases = Array.isArray(doc?.leases) ? doc.leases : [];
     const foreign = leases.filter((lease) => lease?.state !== 'observing' && lease?.machine_id !== step.machine_id);
+    const mine = leases.filter((lease) => lease?.machine_id === step.machine_id);
+    const dead = mine.filter((lease) => ['refused', 'expired', 'cancelled'].includes(lease?.state));
+    if (dead.length > 0) {
+      writeAudit(auditFile, { event: 'joint.dispatch.dead_lease', plan_sha256: plan.plan_sha256, step_id: step.step_id, task_id: returnedTaskId });
+      return { ok: false, code: 'DISPATCH_TARGET_REFUSED', detail: { step_id: step.step_id, machine_id: step.machine_id, leases: leases.map((lease) => ({ machine_id: lease?.machine_id ?? null, state: lease?.state ?? null })) }, partial: tasks.length > 0, tasks };
+    }
     if (foreign.length > 0) {
       try {
         await fetchImpl(`${rabbitUrl}/v1/tasks/${encodeURIComponent(returnedTaskId)}/cancel`, {
