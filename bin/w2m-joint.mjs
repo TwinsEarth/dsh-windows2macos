@@ -20,6 +20,7 @@
 import { readFileSync } from 'node:fs';
 
 import { buildControlEnvelopes, buildPlan } from '../src/plugin/joint-dev/dispatch.mjs';
+import { negotiateFeatures, readRelayCapabilities } from '../src/plugin/relay-capabilities.mjs';
 import {
   approvePlan,
   assertDispatchAllowed,
@@ -135,10 +136,22 @@ if (command === 'dispatch') {
   if (args['dry-run'] !== true) {
     fail('DISPATCH_NOT_WIRED', 'real dispatch is the next slice: it needs the operator token and a relay with target_machines/capability advertisement; use --dry-run to inspect the envelopes');
   }
+  let capabilities = null;
+  let negotiation = null;
+  if (typeof args.relay === 'string') {
+    capabilities = await readRelayCapabilities({ rabbitUrl: args.relay });
+    negotiation = negotiateFeatures(capabilities);
+    if (negotiation.ok !== true) {
+      fail(negotiation.code ?? 'RELAY_CAPABILITIES_MISSING', { missing: negotiation.missing ?? null, relay: args.relay });
+    }
+  }
   const envelopes = buildControlEnvelopes(gate.plan);
   print({
     ok: true,
     dry_run: true,
+    relay: typeof args.relay === 'string' ? args.relay : null,
+    relay_capabilities: capabilities === null ? null : { relay_version: capabilities.relay_version, features: capabilities.features },
+    relay_negotiation: negotiation,
     plan_sha256: gate.plan.plan_sha256,
     approval_sha256: gate.approval.approval_sha256,
     envelopes: envelopes.length,

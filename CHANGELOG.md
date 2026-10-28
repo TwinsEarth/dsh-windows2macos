@@ -7,6 +7,12 @@
 
 All notable changes to this project are documented here.
 
+## [1.9.16] - 2026-10-28
+
+- G0-2：relay /healthz 新增 relay_version 与 features（target-machines / result-projection / guard-v1 / relay-version-v1）；w2m_status 显示这两项，便于核对三台 relay 的实际版本与能力。
+- 新增 relay-capabilities 模块与 w2m-joint dispatch 能力协商：目标 relay 缺少必需 feature（或旧 relay 完全不广告）时，联合派发 fail-closed 返回 RELAY_CAPABILITIES_MISSING，不靠“先发再发现”。
+- 新增 test/relay-health-capabilities.test.mjs（5 项）。
+
 ## [1.9.15] - 2026-10-28
 
 - G0-1：operator token 安全存储。新增 `~/.w2m/operator-token`（0600，可用 W2M_OPERATOR_TOKEN_FILE 覆盖）与 `w2m-operator` CLI（set 从 stdin/文件读取、status 只显示指纹、clear）；w2m_status 新增 operatorToken_fingerprint/operatorToken_source，token 值不进日志/状态。

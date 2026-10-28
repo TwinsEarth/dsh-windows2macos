@@ -22,6 +22,17 @@ function readRelayVersion() {
   return process.env.W2M_RELAY_VERSION ?? 'unknown';
 }
 export const RELAY_VERSION = readRelayVersion();
+
+/**
+ * Capabilities a dispatcher may rely on. A relay that does not advertise a feature is an older
+ * relay: joint-dev must refuse rather than assume the field will be honoured.
+ */
+export const RELAY_FEATURES = Object.freeze([
+  'target-machines',
+  'result-projection',
+  'guard-v1',
+  'relay-version-v1',
+]);
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -1591,7 +1602,9 @@ export class RelayServer {
       rabbit_time: this.state.nowIso(),
       uptime_ms: this.state.nowMs() - this._startedAtMs,
       relay_id: this.relayId,
-    version: RELAY_VERSION,
+      version: RELAY_VERSION,
+      relay_version: RELAY_VERSION,
+      features: RELAY_FEATURES,
       started_at: rfc3339(this._startedAtMs),
       effective_scheme: this.effectiveScheme(req),
       base_path: this.basePath,

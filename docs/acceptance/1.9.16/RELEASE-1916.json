@@ -1,0 +1,21 @@
+{
+  "version": "1.9.16",
+  "case": "RELEASE-1916",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-28T01:20:53.202Z",
+  "executor": "lead",
+  "task_id": "pre-release-1916-1793150453204",
+  "requirement": "V1.9.16：relay 版本/能力广告与联合派发能力协商 fail-closed",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "healthz": "relay_version + features[]",
+      "status": "w2m_status exposes relay_version/features",
+      "negotiation": "joint dispatch refuses RELAY_CAPABILITIES_MISSING on old relay or missing feature",
+      "tests": "relay-health-capabilities 5/5"
+    }
+  }
+}

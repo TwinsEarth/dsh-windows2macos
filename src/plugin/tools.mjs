@@ -4896,6 +4896,8 @@ const result = await request({
             protocol_version: health.protocol_version ?? null,
             error: probe.ok ? null : (probe.error?.code ?? `HTTP ${probe.status}`),
             relay_id: health.relay_id ?? null,
+            relay_version: health.relay_version ?? health.version ?? null,
+            features: Array.isArray(health.features) ? health.features : null,
             uptime_ms: typeof health.uptime_ms === 'number' ? health.uptime_ms : null,
             started_at: health.started_at ?? null,
             base_path: health.base_path ?? null,
@@ -4906,7 +4908,7 @@ const result = await request({
             persistence: health.persistence ?? null,
             // Which of the §4 fields this relay actually sent. A v1 relay sends none of them, and a
             // reader should be able to tell "field absent" from "field false".
-            diagnostics_present: ['relay_id', 'uptime_ms', 'base_path', 'effective_scheme', 'operator_token_required']
+            diagnostics_present: ['relay_id', 'uptime_ms', 'base_path', 'effective_scheme', 'operator_token_required', 'relay_version', 'features']
               .filter((key) => health[key] !== undefined && health[key] !== null),
           };
         } catch (error) {
