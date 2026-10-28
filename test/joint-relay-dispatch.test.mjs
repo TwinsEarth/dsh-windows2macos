@@ -46,7 +46,7 @@ describe('joint dispatch over a real relay', () => {
     const fakeFetch = async (url, init) => {
       const target = String(url);
       if (target.endsWith('/healthz')) {
-        return { ok: true, status: 200, json: async () => ({ relay_version: 'test', features: ['target-machines', 'result-projection'] }) };
+        return { ok: true, status: 200, json: async () => ({ relay_version: 'test', features: ['target-machines', 'result-projection'], operator_token_required: true, signing: { required: false } }) };
       }
       if (target.endsWith('/v1/task')) {
         calls.push(JSON.parse(init.body));

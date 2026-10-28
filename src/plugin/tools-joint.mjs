@@ -11,7 +11,7 @@ import { loadOperatorKey } from './operator-key.mjs';
 
 const json = (value) => JSON.stringify(value, null, 2);
 
-export function registerJointTools(ctx, { defineTool, stateDir, machineName, output }) {
+export function registerJointTools(ctx, { defineTool, stateDir, machineName, output, progress }) {
   const requireStateDir = () => {
     if (typeof stateDir === 'string' && stateDir !== '') return stateDir;
     return null;
@@ -69,12 +69,17 @@ export function registerJointTools(ctx, { defineTool, stateDir, machineName, out
       'returns argv, output or file bytes, and it cannot approve or dispatch.',
     parameters: {
       plan_sha256: { type: 'string', description: 'the 64-hex plan id' },
+      action: { type: 'string', enum: ['status', 'progress'], description: 'status (default) or progress (relay projection; PROGRESS_UNSUPPORTED on an old relay)' },
     },
     output: output ?? { type: 'json' },
     async execute(args) {
       const dir = requireStateDir();
       if (dir === null) return json({ ok: false, code: 'JOINT_STATE_UNAVAILABLE' });
       const planSha = String(args?.plan_sha256 ?? '');
+      if ((args?.action ?? 'status') === 'progress') {
+        if (typeof progress !== 'function') return json({ ok: false, code: 'PROGRESS_UNAVAILABLE' });
+        return json(await progress({ planSha }));
+      }
       const plan = loadPlan({ stateDir: dir, planSha });
       if (plan.ok !== true) return json(plan);
       const key = loadOperatorKey();

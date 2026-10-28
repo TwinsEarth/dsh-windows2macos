@@ -7,6 +7,14 @@
 
 All notable changes to this project are documented here.
 
+## [2.0.5] - 2026-10-29
+
+- Relay 支持 AEAD v2 加密消息信封（A7 收尾）：`enc.v=2` 携带 `aad:{session_id,machine_id,message_id}`，
+  relay 校验明文 AAD 与消息的 session/machine 一致后原样存储与回放；v1 信封保持兼容。
+- 新增能力标记 `chat-enc-v2`（`/healthz.features`），主插件据此启用 encrypted mirror 发送。
+- 新增错误码：`CHAT_AAD_MISSING` / `CHAT_AAD_MISMATCH` / `CHAT_AAD_INVALID`。
+- 测试：fleet-messages AEAD v2 用例、能力协商断言（v1 兼容与未知版本拒绝保持）。
+
 ## [2.0.4] - 2026-10-28
 
 - GPW 双策略模式：小白模式（默认）只保留黑名单强制拒绝，其余工具调用放行；高级模式需手动切换，保持四色策略。

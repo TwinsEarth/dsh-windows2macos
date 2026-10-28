@@ -1200,7 +1200,7 @@ describe('envelope assembly', () => {
       machine_id: '3f2a0000-0000-4000-8000-000000000000',
       machine_name: 'win-desktop',
       platform: { os: 'windows', os_version: '10.0', arch: 'x64', shell: 'cmd', shell_version: null },
-      caps: { case_sensitive_fs: false, symlinks: false, exec_bit: false, python: null, npm: null, node: 'v24.16.0' },
+      caps: { case_sensitive_fs: false, symlinks: false, exec_bit: false, python: null, npm: null, node: 'v24.16.0', plugin_version: '2.0.4' },
       index: 0,
       index_total: 1,
       mode: 'replicate',
@@ -1729,7 +1729,7 @@ function makeAgent({
       device_token: 'tok-e2e',
       rabbit_url: rabbit,
     },
-    caps: { case_sensitive_fs: false, symlinks: false, exec_bit: false, python: null, npm: null, node: process.version },
+    caps: { case_sensitive_fs: false, symlinks: false, exec_bit: false, python: null, npm: null, node: process.version, plugin_version: '2.0.4' },
     platform: { os: 'windows', os_version: '10.0', arch: 'x64', shell: 'cmd', shell_version: null },
     // The documented API accepts both forms; `stringForm` exercises the raw
     // `['node -e']` shape that a caller would read straight off the CLI.
@@ -1792,6 +1792,48 @@ describe('Localside agent end to end', () => {
     }
   });
 
+  it('delivers a large stage to a configured dir sink and never to the relay (A3)', async () => {
+    const rabbit = await startFakeRabbit();
+    const project = await makeRepo('e2e-sink-delivery');
+    const sinkRoot = mkdtempSync(join(tmpdir(), 'w2m-agent-sink-'));
+    const stateDir = join(root, 'e2e-state-sink-delivery');
+    mkdirSync(join(stateDir, 'dataplane'), { recursive: true });
+    writeFileSync(join(stateDir, 'dataplane', 'sink.json'), JSON.stringify({ kind: 'dir', root: sinkRoot }), 'utf8');
+    try {
+      const agent = makeAgent({ rabbit: rabbit.url, project, allowed: [['node', '-e']], name: 'sink-delivery' });
+      const running = agent.start();
+      const stream = await rabbit.stream();
+      stream.send('ready', { protocol_version: 1, rabbit_time: '2026-10-07T12:00:00Z', machine_id: 'rabbit' });
+      const argv = [NODE, '-e', 'process.stdout.write("z".repeat(70000))'];
+      stream.send('task.offer', {
+        task_id: '01J-E2E-SINK-DELIVERY',
+        attempt: 1,
+        mode: 'pipeline',
+        index: 0,
+        index_total: 1,
+        command_argv: argv,
+        stages: [{ command_argv: argv }],
+        cwd_rel: '.',
+        write: false,
+        timeout_ms: 30_000,
+        dedupe_key: 'dk-e2e-sink-delivery',
+      });
+      await running;
+      const big = 'z'.repeat(70_000);
+      assert.equal(rabbit.state.blobs.length, 0, 'the relay received no artifact bytes');
+      const envelope = rabbit.state.results[0];
+      assert.equal(envelope.blob_sha256, sha256Hex(big), 'the envelope names the delivered artifact');
+      assert.equal(envelope.pipeline.stages[0].status, 'ok');
+      assert.equal(envelope.warnings?.includes('ARTIFACT_NOT_DELIVERED') ?? false, false);
+      const files = readdirSync(sinkRoot);
+      assert.equal(files.length, 1, 'exactly one object reached the authorized sink');
+      assert.equal(readFileSync(join(sinkRoot, files[0]), 'utf8'), big, 'the sink holds the exact bytes');
+      assert.equal(verifyEnvelope(envelope), true);
+    } finally {
+      await rabbit.close();
+    }
+  });
+
   it('uploads a large pipeline stage as a blob and names it in the envelope (v1.2.4)', async () => {
     const rabbit = await startFakeRabbit();
     const project = await makeRepo('e2e-dataflow-blob');
@@ -1800,7 +1842,6 @@ describe('Localside agent end to end', () => {
       const running = agent.start();
       const stream = await rabbit.stream();
       stream.send('ready', { protocol_version: 1, rabbit_time: '2026-10-07T12:00:00Z', machine_id: 'rabbit' });
-      const big = 'x'.repeat(70_000); // > MAX_INLINE_BYTES (64 KiB)
       // Generated at run time: a 70 KiB argv is rejected by Windows' CreateProcess limit long before the stage
       // could run, which is a property of the test rather than of the feature.
       const argv = [NODE, '-e', 'process.stdout.write("x".repeat(70000))'];
@@ -1819,17 +1860,11 @@ describe('Localside agent end to end', () => {
       });
       await running;
 
-      assert.equal(rabbit.state.blobs.length, 1, 'exactly one blob was uploaded');
-      const uploaded = rabbit.state.blobs[0];
-      const sha = sha256Hex(big);
-      assert.equal(uploaded.sha, sha, 'the blob name is the hash of the stage output');
-      assert.equal(uploaded.raw, big, 'the relay received the exact bytes');
-
+      assert.equal(rabbit.state.blobs.length, 0, 'artifacts no longer go to the relay');
       const envelope = rabbit.state.results[0];
-      assert.equal(envelope.blob_sha256, sha, 'the envelope names the blob');
-      assert.equal(envelope.output_mode, 'blob');
-      assert.equal(envelope.stdout_head, '', 'a blob envelope does not also inline the head');
-      assert.equal(envelope.pipeline.stages[0].blob_sha256, sha, 'the stage record names it too');
+      assert.ok(Array.isArray(envelope.warnings) && envelope.warnings.includes('ARTIFACT_NOT_DELIVERED'));
+      assert.equal(envelope.pipeline.stages[0].status, 'ok');
+      assert.equal(envelope.pipeline.stages[0].blob_sha256 ?? null, null);
       assert.equal(verifyEnvelope(envelope), true);
     } finally {
       await rabbit.close();
@@ -1844,7 +1879,6 @@ describe('Localside agent end to end', () => {
       const running = agent.start();
       const stream = await rabbit.stream();
       stream.send('ready', { protocol_version: 1, rabbit_time: '2026-10-07T12:00:00Z', machine_id: 'rabbit' });
-      const big = 'x'.repeat(70_000);
       const argv = [NODE, '-e', 'process.stdout.write("x".repeat(70000))'];
       stream.send('task.offer', {
         task_id: '01J-E2E-PLAIN-BLOB',
@@ -1860,15 +1894,10 @@ describe('Localside agent end to end', () => {
       });
       await running;
 
-      assert.equal(rabbit.state.blobs.length, 1, 'a plain command above the inline cap uploads exactly one blob');
-      const uploaded = rabbit.state.blobs[0];
-      const sha = sha256Hex(big);
-      assert.equal(uploaded.sha, sha, 'the blob name is the hash of the command output');
-      assert.equal(uploaded.raw, big, 'the exact bytes were uploaded');
+      assert.equal(rabbit.state.blobs.length, 0, 'artifacts no longer go to the relay');
       const envelope = rabbit.state.results[0];
-      assert.equal(envelope.blob_sha256, sha, 'the envelope names the blob');
-      assert.equal(envelope.output_mode, 'blob');
-      assert.equal(envelope.stdout_head, '', 'a blob envelope does not also inline the head');
+      assert.ok(Array.isArray(envelope.warnings) && envelope.warnings.includes('ARTIFACT_NOT_DELIVERED'));
+      assert.equal(envelope.blob_sha256 ?? null, null);
       assert.equal(envelope.pipeline ?? null, null, 'a plain command is not a pipeline');
       assert.equal(verifyEnvelope(envelope), true);
     } finally {
@@ -1941,10 +1970,10 @@ describe('Localside agent end to end', () => {
       await running;
 
       const envelope = rabbit.state.results[0];
-      assert.equal(envelope.pipeline.stages[0].status, 'failed');
-      assert.equal(envelope.pipeline.stages[0].refusal_reason, 'BLOB_UPLOAD_FAILED');
-      assert.equal(rabbit.state.blobs.length, 0, 'nothing was stored');
-      assert.equal(envelope.blob_sha256, undefined, 'no reference to a blob that does not exist');
+      assert.equal(envelope.pipeline.stages[0].status, 'ok', 'a missing sink is a delivery warning, not a stage failure');
+      assert.ok(Array.isArray(envelope.warnings) && envelope.warnings.includes('ARTIFACT_NOT_DELIVERED'));
+      assert.equal(rabbit.state.blobs.length, 0, 'nothing was uploaded to the relay');
+      assert.equal(envelope.blob_sha256 ?? null, null, 'no reference to an artifact that was not delivered');
       assert.equal(verifyEnvelope(envelope), true);
     } finally {
       await rabbit.close();
@@ -2454,7 +2483,7 @@ describe('Localside agent end to end', () => {
       project: root,
       stateDir: join(root, 'e2e-state-mismatch'),
       identity: { machine_id: newMachineId(), machine_name: 'x', device_token: null, rabbit_url: null },
-      caps: { case_sensitive_fs: false, symlinks: false, exec_bit: false, python: null, npm: null, node: process.version },
+      caps: { case_sensitive_fs: false, symlinks: false, exec_bit: false, python: null, npm: null, node: process.version, plugin_version: '2.0.4' },
       platform: { os: 'windows', os_version: '1', arch: 'x64', shell: 'cmd', shell_version: null },
       allowedCommands: [],
       fetchImpl,
@@ -2511,7 +2540,7 @@ describe('Localside agent end to end', () => {
         project,
         stateDir,
         identity: { machine_id: newMachineId(), machine_name: 'x', device_token: 'tok', rabbit_url: null },
-        caps: { case_sensitive_fs: false, symlinks: false, exec_bit: false, python: null, npm: null, node: process.version },
+        caps: { case_sensitive_fs: false, symlinks: false, exec_bit: false, python: null, npm: null, node: process.version, plugin_version: '2.0.4' },
         platform: { os: 'windows', os_version: '1', arch: 'x64', shell: 'cmd', shell_version: null },
         allowedCommands: parseAllowedCommands('["node -e"]'),
         once: true,
@@ -2865,7 +2894,7 @@ describe('cross-network reconnection (v0.1.2 §8)', () => {
       project: await makeRepo('reconnect-log'),
       stateDir: join(root, 'e2e-state-reconnect-log'),
       identity: { machine_id: newMachineId(), machine_name: 'x', device_token: 'tok', rabbit_url: null },
-      caps: { case_sensitive_fs: false, symlinks: false, exec_bit: false, python: null, npm: null, node: process.version },
+      caps: { case_sensitive_fs: false, symlinks: false, exec_bit: false, python: null, npm: null, node: process.version, plugin_version: '2.0.4' },
       platform: { os: 'windows', os_version: '1', arch: 'x64', shell: 'cmd', shell_version: null },
       allowedCommands: [],
       once: false,
@@ -2925,7 +2954,7 @@ describe('cross-network reconnection (v0.1.2 §8)', () => {
       project: await makeRepo('hot-loop'),
       stateDir: join(root, 'e2e-state-hot-loop'),
       identity: { machine_id: newMachineId(), machine_name: 'x', device_token: 'tok', rabbit_url: null },
-      caps: { case_sensitive_fs: false, symlinks: false, exec_bit: false, python: null, npm: null, node: process.version },
+      caps: { case_sensitive_fs: false, symlinks: false, exec_bit: false, python: null, npm: null, node: process.version, plugin_version: '2.0.4' },
       platform: { os: 'windows', os_version: '1', arch: 'x64', shell: 'cmd', shell_version: null },
       allowedCommands: [],
       once: false,
@@ -3547,7 +3576,7 @@ describe('agent state file for cross-process diagnostics (task-16)', () => {
         project,
         stateDir,
         identity: { machine_id: newMachineId(), machine_name: 'atomic', device_token: 'tok', rabbit_url: null },
-        caps: { case_sensitive_fs: false, symlinks: false, exec_bit: false, python: null, npm: null, node: process.version },
+        caps: { case_sensitive_fs: false, symlinks: false, exec_bit: false, python: null, npm: null, node: process.version, plugin_version: '2.0.4' },
         platform: { os: 'windows', os_version: '1', arch: 'x64', shell: 'cmd', shell_version: null },
         allowedCommands: parseAllowedCommands('["node -e"]'),
         once: true,
@@ -3621,7 +3650,7 @@ describe('agent state file for cross-process diagnostics (task-16)', () => {
         project,
         stateDir,
         identity: { machine_id: newMachineId(), machine_name: 'blocked', device_token: 'tok', rabbit_url: null },
-        caps: { case_sensitive_fs: false, symlinks: false, exec_bit: false, python: null, npm: null, node: process.version },
+        caps: { case_sensitive_fs: false, symlinks: false, exec_bit: false, python: null, npm: null, node: process.version, plugin_version: '2.0.4' },
         platform: { os: 'windows', os_version: '1', arch: 'x64', shell: 'cmd', shell_version: null },
         allowedCommands: parseAllowedCommands('["node -e"]'),
         once: true,
@@ -3678,7 +3707,7 @@ describe('agent state file for cross-process diagnostics (task-16)', () => {
         project,
         stateDir,
         identity: { machine_id: newMachineId(), machine_name: 'idle', device_token: 'tok', rabbit_url: null },
-        caps: { case_sensitive_fs: false, symlinks: false, exec_bit: false, python: null, npm: null, node: process.version },
+        caps: { case_sensitive_fs: false, symlinks: false, exec_bit: false, python: null, npm: null, node: process.version, plugin_version: '2.0.4' },
         platform: { os: 'windows', os_version: '1', arch: 'x64', shell: 'cmd', shell_version: null },
         allowedCommands: [],
         once: false,
@@ -3732,7 +3761,7 @@ describe('agent state file for cross-process diagnostics (task-16)', () => {
         project,
         stateDir,
         identity: { machine_id: newMachineId(), machine_name: 'nospool', device_token: 'tok', rabbit_url: null },
-        caps: { case_sensitive_fs: false, symlinks: false, exec_bit: false, python: null, npm: null, node: process.version },
+        caps: { case_sensitive_fs: false, symlinks: false, exec_bit: false, python: null, npm: null, node: process.version, plugin_version: '2.0.4' },
         platform: { os: 'windows', os_version: '1', arch: 'x64', shell: 'cmd', shell_version: null },
         allowedCommands: parseAllowedCommands('["node -e"]'),
         once: true,
@@ -4844,7 +4873,7 @@ describe('state publishing: a failed rename is retried and cleaned up (v0.5.10)'
         device_token: 'tok',
         rabbit_url: null,
       },
-      caps: { case_sensitive_fs: false, symlinks: false, exec_bit: false, python: null, npm: null, node: process.version },
+      caps: { case_sensitive_fs: false, symlinks: false, exec_bit: false, python: null, npm: null, node: process.version, plugin_version: '2.0.4' },
       platform: { os: 'windows', os_version: '10.0', arch: 'x64', shell: 'cmd', shell_version: null },
       allowedCommands: [],
       once: false,
@@ -5146,7 +5175,8 @@ describe('workspace execution', () => {
     assert.equal(result.workspace.base_commit, base);
     assert.notEqual(result.workspace.head_commit, base);
     assert.ok((result.workspace.changed_files ?? []).includes('out.txt'), 'changed_files names the new file: ' + JSON.stringify(result.workspace));
-    assert.match(String(result.workspace.patch_sha256), /^[0-9a-f]{64}$/);
+    assert.equal(result.workspace.patch_sha256, null, 'no sink: the patch was not delivered');
+    assert.ok(Array.isArray(result.warnings) && result.warnings.includes('ARTIFACT_NOT_DELIVERED'));
     assert.equal(result.workspace.patch_bytes > 0, true);
     assert.equal(result.workspace.cleaned, true);
     assert.equal(fs.existsSync(path.join(repo, 'out.txt')), false, 'the main copy was never written');

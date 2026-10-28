@@ -24,6 +24,8 @@ import { deviceFleetFields } from '../chatops/fleet-wiring.mjs';
 import { scopeFleetId } from '../chatops/fleet-wiring.mjs';
 // v0.8.1: the account-derived fleet key, so a machine can join with no pairing code.
 import { planJoin } from '../chatops/fleet-join.mjs';
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { validateTaskDependencies } from './task-deps.mjs';
 import { buildMembers, isMemberRole, setMemberRole as applyMemberRole } from './fleet-members.mjs';
 import { canonicalSignedPayload, publicKeyFromBase64 } from '../util/envelope-signature.mjs';
@@ -269,9 +271,22 @@ export const P2P_MODES = Object.freeze(['auto', 'direct', 'relay']);
  */
 export const TRANSPORT_VALUES = Object.freeze(['p2p', 'relay']);
 
+/**
+ * Canonical form of a relative working directory. Both the relay and the agent hash this string, so
+ * it is normalized in exactly one place per side and the two definitions are asserted to agree:
+ * backslashes become slashes, './' and repeated/trailing slashes disappear, empty means '.'.
+ */
+export function normalizeCwdRel(value) {
+  if (value === null || value === undefined) return '.';
+  let out = String(value).replace(/\\/g, '/');
+  while (out.startsWith('./')) out = out.slice(2);
+  out = out.replace(/\/{2,}/g, '/').replace(/\/+$/, '');
+  return out === '' ? '.' : out;
+}
+
 /** §4.4 helper: command_hash = sha256(JCS(argv)+"|"+shell_id+"|"+cwd_rel). */
 export function computeCommandHash(commandArgv, shellId = SHELL_ID_DIRECT, cwdRel = '.') {
-  return sha256Hex(`${jcs(commandArgv)}|${shellId}|${cwdRel}`);
+  return sha256Hex(`${jcs(commandArgv)}|${shellId}|${normalizeCwdRel(cwdRel)}`);
 }
 
 /**
@@ -288,7 +303,7 @@ export function computeCommandHash(commandArgv, shellId = SHELL_ID_DIRECT, cwdRe
 export function computePipelineCommandHash(stages, shellId = SHELL_ID_DIRECT) {
   const canonical = stages.map((s) => ({
     command_argv: s.command_argv,
-    cwd_rel: s.cwd_rel ?? '.',
+    cwd_rel: normalizeCwdRel(s.cwd_rel),
     continue_on_failure: s.continue_on_failure === true,
   }));
   return sha256Hex(`${jcs(canonical)}|${shellId}|pipeline`);
@@ -560,6 +575,7 @@ export class RabbitState {
     const metricsEvent = (event) => {
       try { this.metrics.inc('wm_project_events_total', { type: event.type }); } catch { /* metrics never break the room */ }
       for (const listener of this.projectSubscribers) { try { listener(event); } catch { /* a subscriber never breaks the room */ } }
+      if (typeof this._persistProjects === 'function') this._persistProjects();
       const notified = NOTIFIED[event.type];
       if (notified !== undefined) {
         try {
@@ -568,6 +584,18 @@ export class RabbitState {
       }
     };
     this.projects = createProjectRoom({ now: () => this.nowMs(), onEvent: metricsEvent });
+    // A6: the room snapshot is the durable form of projects/members/events. Written after every room
+    // event (0600, tmp+rename) and restored before the relay answers anything, so a restart keeps the
+    // project object and its cursor instead of silently starting from an empty room.
+    this._projectsFile = typeof this.persistence?.dir === 'string' && this.persistence.dir !== ''
+      ? join(this.persistence.dir, 'projects', 'room-snapshot.json')
+      : null;
+    if (this._projectsFile !== null) {
+      try {
+        const snapshot = JSON.parse(readFileSync(this._projectsFile, 'utf8').replace(/^\uFEFF/, ''));
+        this.projects.restore(snapshot);
+      } catch { /* absent or corrupt: start empty rather than failing to boot */ }
+    }
     this.defaultProjectId = 'default';
     // M5 primitives share the project room's event stream: a lock, review or notification is a project event with the
     // module's own sequence attached, so one reader can reconstruct "what happened" from a single cursor.
@@ -621,6 +649,17 @@ export class RabbitState {
 
   /** Inject/replace the persistence backend (also used by tests). */
   setPersistence(persistence) { this._persist = persistence ?? null; return this._persist; }
+
+  /** A6: atomic write of the project room snapshot (0600). */
+  _persistProjects() {
+    if (typeof this._projectsFile !== 'string' || this._projectsFile === '') return;
+    try {
+      mkdirSync(dirname(this._projectsFile), { recursive: true, mode: 0o700 });
+      const tmp = this._projectsFile + '.tmp-' + process.pid + '-' + Date.now().toString(36);
+      writeFileSync(tmp, JSON.stringify(this.projects.toSnapshot()), { encoding: 'utf8', mode: 0o600 });
+      renameSync(tmp, this._projectsFile);
+    } catch { /* a failed snapshot write must not break the live room */ }
+  }
 
   /* ---------------- v1.0.7: the content-addressed blob channel (#1) ---------------- */
 
@@ -1788,7 +1827,7 @@ export class RabbitState {
     }
 
     const now = this.nowMs();
-    const cwdRel = typeof input.cwd_rel === 'string' && input.cwd_rel ? input.cwd_rel : '.';
+    const cwdRel = normalizeCwdRel(input.cwd_rel);
     const baseTree = input.base_tree ?? null;
     // v2 R5: a joint dispatch must be auditable; a malformed binding is refused, never nulled.
     for (const key of ['plan_sha256', 'approval_sha256']) {
@@ -2825,6 +2864,26 @@ export class RabbitState {
    * of nothing -- a fake "the work is still being done" signal, which is the most
    * dangerous lie this relay can tell.
    */
+  /**
+   * Merge a small, typed bag of machine-advertised capabilities into the device row.
+   *
+   * Only scalars are copied (strings <= 64 chars, booleans, null) and only a bounded number of
+   * keys, so a heartbeat cannot turn the roster into an unbounded side channel.
+   */
+  _mergeAdvertisedCaps(device, caps) {
+    if (device === null || typeof device !== 'object') return;
+    if (caps === null || typeof caps !== 'object' || Array.isArray(caps)) return;
+    const next = { ...(device.caps ?? {}) };
+    let count = 0;
+    for (const [key, value] of Object.entries(caps)) {
+      if (count >= 32) break;
+      if (typeof key !== 'string' || key.length === 0 || key.length > 32) continue;
+      if (typeof value === 'string' && value.length <= 64) { next[key] = value; count += 1; continue; }
+      if (typeof value === 'boolean' || value === null) { next[key] = value; count += 1; }
+    }
+    device.caps = next;
+  }
+
   diagnosticHeartbeat(input = {}) {
     const machineId = typeof input.machine_id === 'string' && input.machine_id !== ''
       ? input.machine_id : null;
@@ -2837,6 +2896,7 @@ export class RabbitState {
     this._validatePhaseProgress(input);
 
     const device = this.touchDevice(machineId);
+    this._mergeAdvertisedCaps(device, input.caps);
     this.recordHeartbeatMetrics(machineId, input);
     return {
       // No lease is involved, and the response says so instead of inventing one.

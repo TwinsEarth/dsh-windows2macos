@@ -23,6 +23,13 @@ import {
 } from './session-watch.mjs';
 import { createSessionSync } from './session-sync.mjs';
 
+/** Session prompts are mirrored only when the operator opts in; the default is off. */
+export const DEFAULT_MIRROR_MODE = 'off';
+export function mirrorModeOf(cfg) {
+  const mode = cfg?.fleetChatMirror;
+  return mode === 'plaintext' || mode === 'encrypted' ? mode : DEFAULT_MIRROR_MODE;
+}
+
 
 /**
  * The newest transcript for a cwd, or null. Reads directory listings and stat only -- this module never opens a
@@ -158,12 +165,16 @@ export function registerChatRoutes(ctx, deps) {
    * are extracted, and only the new ones are published. A failure here must not disturb the panel or the route.
    */
   const MIRROR_MAX_BYTES = 3500;
+
   const truncateUtf8 = (value, max) => {
     const bytes = Buffer.from(value, 'utf8');
     if (bytes.length <= max) return value;
     return bytes.subarray(0, max).toString('utf8').replace(/\uFFFD+$/, '') + ' …(已截断)';
   };
   const mirrorOnce = async () => {
+    const mode = mirrorModeOf(deps.cfg());
+    if (mode === 'off') return;
+    if (mode === 'encrypted') return; // encrypted mirroring lands with the AEAD v2 slice
     const identity = await identityOf();
     if (identity.conversationKey === null) return;
     const file = newestTranscript(projectDirOf());

@@ -8,7 +8,7 @@ import { describe, it } from 'node:test';
 import { buildPlan } from '../src/plugin/joint-dev/dispatch.mjs';
 import { dispatchPlanToRelay } from '../src/plugin/joint-dev/relay-dispatch.mjs';
 
-const HEALTH = { relay_version: 'test', features: ['target-machines', 'result-projection'] };
+const HEALTH = { relay_version: 'test', features: ['target-machines', 'result-projection'], operator_token_required: true, signing: { required: false } };
 const APPROVAL = { approval_sha256: 'c'.repeat(64) };
 const planOf = (steps) => buildPlan({ base_commit: 'a'.repeat(40), steps }).plan;
 const jsonResponse = (status, doc) => ({ ok: status >= 200 && status < 300, status, json: async () => doc });
@@ -19,6 +19,7 @@ describe('R5 dispatch wiring', () => {
     const seen = [];
     const existsRelay = async (url, init) => {
       if (String(url).endsWith('/healthz')) return jsonResponse(200, HEALTH);
+      if (String(url).includes('/v1/tasks/')) return jsonResponse(200, { task: { task_id: 'jd-task' }, leases: [{ machine_id: 'm-1', state: 'offered' }] });
       seen.push(JSON.parse(init.body));
       return jsonResponse(409, { error: { code: 'TASK_EXISTS' } });
     };

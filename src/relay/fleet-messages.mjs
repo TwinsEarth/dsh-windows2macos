@@ -35,6 +35,11 @@ export const RETENTION_DAYS = 7;
 /** One message. Text is cheap; a 4 KiB cap keeps a single paste from eating the budget. */
 export const MAX_MESSAGE_BYTES = 4 * 1024;
 
+/** The only cipher the relay accepts in an `enc` envelope (it never holds a key). */
+const CHAT_ALG = 'aes-256-gcm';
+/** AEAD v2: adds an AAD object binding the ciphertext to session/machine/message id. */
+const CHAT_ENC_V2 = 2;
+
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 /**
@@ -128,10 +133,29 @@ export function createFleetMessages(options = {}) {
     const rawEnc = input?.enc;
     let enc = null;
     if (rawEnc !== undefined && rawEnc !== null) {
+      if (typeof rawEnc !== 'object' || Array.isArray(rawEnc)) return { ok: false, code: 'BAD_ENCRYPTION' };
       const ivOk = typeof rawEnc.iv === 'string' && rawEnc.iv.length > 0 && rawEnc.iv.length <= 64;
       const tagOk = typeof rawEnc.tag === 'string' && rawEnc.tag.length > 0 && rawEnc.tag.length <= 64;
-      if (rawEnc.v !== 1 || rawEnc.alg !== 'aes-256-gcm' || !ivOk || !tagOk) return { ok: false, code: 'BAD_ENCRYPTION' };
-      enc = { v: 1, alg: 'aes-256-gcm', iv: rawEnc.iv, tag: rawEnc.tag };
+      if (rawEnc.alg !== CHAT_ALG || !ivOk || !tagOk) return { ok: false, code: 'BAD_ENCRYPTION' };
+      if (rawEnc.v === 1) {
+        enc = { v: 1, alg: CHAT_ALG, iv: rawEnc.iv, tag: rawEnc.tag };
+      } else if (rawEnc.v === CHAT_ENC_V2) {
+        // AEAD v2 binds the ciphertext to its context. The AAD travels in the clear so every
+        // reader can rebuild it, and the GCM tag authenticates those exact bytes. The relay knows
+        // session_id/machine_id, so it refuses clear AAD naming another session or machine; it never
+        // sees a key and never inspects the ciphertext.
+        const aad = rawEnc.aad;
+        if (aad === null || typeof aad !== 'object' || Array.isArray(aad)) return { ok: false, code: 'CHAT_AAD_MISSING' };
+        const aadSession = typeof aad.session_id === 'string' ? aad.session_id : '';
+        const aadMachine = typeof aad.machine_id === 'string' ? aad.machine_id : '';
+        const aadMessage = typeof aad.message_id === 'string' ? aad.message_id : '';
+        if (aadSession !== sessionId || aadMachine !== machineId) return { ok: false, code: 'CHAT_AAD_MISMATCH' };
+        // eslint-disable-next-line no-control-regex
+        if (aadMessage === '' || aadMessage.length > 64 || /[\u0000-\u001F]/.test(aadMessage)) return { ok: false, code: 'CHAT_AAD_INVALID' };
+        enc = { v: CHAT_ENC_V2, alg: CHAT_ALG, iv: rawEnc.iv, tag: rawEnc.tag, aad: { session_id: aadSession, machine_id: aadMachine, message_id: aadMessage } };
+      } else {
+        return { ok: false, code: 'BAD_ENCRYPTION' };
+      }
     }
 
     // v1.9.18: a plain-text message may not smuggle an image payload. Encrypted text is exempt:

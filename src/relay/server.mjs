@@ -33,6 +33,7 @@ export const RELAY_FEATURES = Object.freeze([
   'guard-v1',
   'relay-version-v1',
   'chat-text-only-v1',
+  'chat-enc-v2',
 ]);
 import fs from 'node:fs';
 import os from 'node:os';
@@ -1101,8 +1102,13 @@ export class RelayServer {
       const frame = (entry) => {
         try { res.write('id: ' + entry.seq + '\nevent: project.event\ndata: ' + JSON.stringify({ project_id: entry.project_id, seq: entry.seq, type: entry.type, payload: entry.payload }) + '\n\n'); } catch { /* closed */ }
       };
-      const replayed = this.state.projects.events({ projectId, sinceSeq });
-      res.write('event: ready\ndata: ' + JSON.stringify({ protocol_version: PROTOCOL_VERSION, project_id: projectId, last_event_seq: replayed.next_seq }) + '\n\n');
+      const replayed = this.state.projects.events({ projectId, sinceSeq, limit: 500 });
+      if (replayed.truncated === true) {
+        // An aborted stream that missed more events than one page holds must be told so explicitly;
+        // otherwise it believes ready.last_event_seq is the whole story.
+        res.write('event: notice\ndata: ' + JSON.stringify({ code: 'PROJECT_REPLAY_TRUNCATED', project_id: projectId, next_seq: replayed.next_seq, latest_seq: replayed.latest_seq, remaining: replayed.remaining }) + '\n\n');
+      }
+      res.write('event: ready\ndata: ' + JSON.stringify({ protocol_version: PROTOCOL_VERSION, project_id: projectId, last_event_seq: replayed.latest_seq ?? replayed.next_seq, replayed_through: replayed.next_seq }) + '\n\n');
       for (const entry of replayed.events) frame(entry);
       const unsubscribe = this.state.onProjectEvent((entry) => { if (entry.project_id === projectId) frame(entry); });
       const keepalive = setInterval(() => { try { res.write(': keepalive\n\n'); } catch { /* closed */ } }, this.keepaliveMs);

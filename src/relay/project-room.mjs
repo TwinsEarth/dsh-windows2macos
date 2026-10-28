@@ -147,8 +147,20 @@ export function createProjectRoom({ now = () => Date.now(), onEvent = null } = {
     /** Incremental events for one project, seq strictly greater than sinceSeq. */
     events({ projectId, sinceSeq = 0, limit = 200 }) {
       requireProject(projectId);
-      const slice = events.filter((event) => event.project_id === projectId && event.seq > sinceSeq).slice(0, limit);
-      return { events: slice.map((event) => ({ ...event, payload: { ...event.payload } })), next_seq: slice.length > 0 ? slice[slice.length - 1].seq : sinceSeq };
+      const projectEvents = events.filter((event) => event.project_id === projectId);
+      const available = projectEvents.filter((event) => event.seq > sinceSeq);
+      const slice = available.slice(0, Math.max(0, limit));
+      const latestSeq = projectEvents.length > 0 ? projectEvents[projectEvents.length - 1].seq : sinceSeq;
+      return {
+        events: slice.map((event) => ({ ...event, payload: { ...event.payload } })),
+        next_seq: slice.length > 0 ? slice[slice.length - 1].seq : sinceSeq,
+        latest_seq: latestSeq,
+        oldest_available_seq: available.length > 0 ? available[0].seq : null,
+        // More events exist than this page returned: the client must page with next_seq instead of
+        // assuming the replay is complete (the old shape made an over-limit page look final).
+        truncated: available.length > slice.length,
+        remaining: Math.max(0, available.length - slice.length),
+      };
     },
     /** Projects a member belongs to. */
     listProjects({ member }) {
@@ -157,6 +169,39 @@ export function createProjectRoom({ now = () => Date.now(), onEvent = null } = {
     appendEvent({ projectId, type, actor, payload = {} }) {
       requireProject(projectId);
       return { ok: true, event: emit(projectId, type, actor, payload) };
+    },
+    /**
+     * A6: self-contained state for persistence. Projects and the event log are plain data, so the
+     * snapshot is the exact object that <stateDir>/projects can be rebuilt from.
+     */
+    toSnapshot() {
+      return {
+        v: 1,
+        counter,
+        seq,
+        last_event_seq: seq,
+        projects: [...projects.values()].map((project) => JSON.parse(JSON.stringify(project))),
+        events: events.map((event) => JSON.parse(JSON.stringify(event))),
+      };
+    },
+    /** Restore a snapshot produced by toSnapshot; refuses anything not shaped like one. */
+    restore(snapshot) {
+      if (snapshot === null || typeof snapshot !== 'object' || snapshot.v !== 1 || !Array.isArray(snapshot.projects) || !Array.isArray(snapshot.events)) {
+        throw new ProjectRoomError('BAD_SNAPSHOT', 'project room snapshot is not shaped like v1');
+      }
+      projects.clear();
+      for (const project of snapshot.projects) {
+        if (typeof project?.project_id !== 'string' || !Array.isArray(project.members)) throw new ProjectRoomError('BAD_SNAPSHOT', 'project entry is invalid');
+        projects.set(project.project_id, project);
+      }
+      events.length = 0;
+      for (const event of snapshot.events) {
+        if (event === null || typeof event !== 'object' || !Number.isInteger(event.seq) || typeof event.project_id !== 'string') throw new ProjectRoomError('BAD_SNAPSHOT', 'event entry is invalid');
+        events.push(event);
+      }
+      seq = Math.max(Number.isInteger(snapshot.seq) ? snapshot.seq : 0, Number.isInteger(snapshot.last_event_seq) ? snapshot.last_event_seq : 0);
+      counter = Number.isInteger(snapshot.counter) ? snapshot.counter : snapshot.projects.length;
+      return { ok: true, projects: projects.size, events: events.length, last_event_seq: seq };
     },
     size() { return { projects: projects.size, events: events.length, last_seq: seq }; },
   };

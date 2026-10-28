@@ -19,6 +19,7 @@ describe('relay health advertises version and features', () => {
       assert.ok(Array.isArray(doc.features), 'features must be an array');
       assert.ok(doc.features.includes('target-machines'));
       assert.ok(doc.features.includes('result-projection'));
+    assert.ok(doc.features.includes('chat-enc-v2'), 'AEAD v2 encrypted chat envelope is supported');
     } finally {
       await relay.close();
     }

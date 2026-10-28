@@ -598,3 +598,11 @@ describe('client bundle: the stylesheet', () => {
     assert.ok(source.includes('准备'), 'the counts are labelled for the operator');
   });
 });
+
+it('debounces conversation search and waits for the history loader (v2.0.5)', () => {
+  const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
+  assert.ok(source.includes('const timer = setTimeout(paintNow, 3000);'), 'search waits 3s after the last keystroke');
+  assert.ok(source.includes('function isLoadingEarlier()'), 'the scroll control can see the loading row');
+  assert.ok(source.includes('await waitForLoadSettled();'), 'the top button waits for in-flight history instead of re-pressing');
+  assert.ok(source.includes('if (stagnant >= 2) break;'), 'two pages that add nothing end the loop instead of spinning');
+});

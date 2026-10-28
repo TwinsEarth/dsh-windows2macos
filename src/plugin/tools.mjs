@@ -192,6 +192,9 @@ import { registerChatRoutes } from './fleet-chat-route.mjs';
 import { registerExecCapabilityRoutes } from './exec-capability-route.mjs';
 import { registerPluginUpdateRoutes } from './update-route.mjs';
 import { registerOperatorTokenRoute } from './operator-token-route.mjs';
+import { registerDataplaneSinkRoute } from './dataplane-sink-route.mjs';
+import { registerProjectStreamRoute } from './project-stream-route.mjs';
+import { planProgress } from './joint-dev/progress.mjs';
 import { registerJointTools } from './tools-joint.mjs';
 import { fingerprintOf, readOperatorToken } from './operator-token.mjs';
 import { registerCaptureRoutes } from './capture-route.mjs';
@@ -3586,6 +3589,10 @@ export async function apply(ctx, config = {}) {
   // verified updater (SHA-256 checked, old package backed up, restart required afterwards).
   const _updateRoutes = registerPluginUpdateRoutes(ctx, { profileDir: () => cfg.profileDir });
     const _operatorTokenRoute = registerOperatorTokenRoute(ctx, { configuredToken: () => cfg.operatorToken });
+  // A3/S4: local-user authorization of the artifact sink. Not reachable from any tool schema.
+  const _dataplaneSinkRoute = registerDataplaneSinkRoute(ctx, { stateDir: () => resolveStateDir(cfg.stateDir, 'joint-dev') });
+  // A6: read-only project SSE proxy (device token stays in the host process).
+  const _projectStreamRoute = registerProjectStreamRoute(ctx, { relayUrl: () => cfg.rabbitUrl, deviceToken: () => resolveToken(cfg) });
 
   // v1.7.1: host-side screenshot + clipboard fallbacks. The DSH desktop shell does not grant the
   // renderer getDisplayMedia/navigator.clipboard, so the chat panel needs a host route that does not
@@ -3628,7 +3635,20 @@ export async function apply(ctx, config = {}) {
   // -------------------------------------------------------------------------------------------
   // 1. w2m_device - read-only
   // -------------------------------------------------------------------------------------------
-  registerJointTools(ctx, { defineTool, stateDir: cfg.stateDir, machineName: cfg.machineName, output: jsonOutput });
+  registerJointTools(ctx, {
+    defineTool,
+    stateDir: resolveStateDir(cfg.stateDir, 'joint-dev'),
+    machineName: cfg.machineName,
+    output: jsonOutput,
+    progress: async ({ planSha }) => {
+      try {
+        const token = await resolveToken(cfg);
+        return await planProgress({ stateDir: resolveStateDir(cfg.stateDir, 'joint-dev'), planSha, relayUrl: cfg.rabbitUrl, deviceToken: token });
+      } catch {
+        return { ok: false, code: 'PROGRESS_UNAVAILABLE' };
+      }
+    },
+  });
 
   ctx.tools.register(defineTool({
     name: 'w2m_devices',
@@ -7309,7 +7329,7 @@ hint: 'the local fleet-memory.md is unchanged; action read/show still reads loca
       const base = requireRabbit(cfg);
       const taskId = typeof args?.task_id === 'string' ? args.task_id.trim() : '';
       if (taskId === '') throw new W2MError('W2M_BAD_TASK_ID', '`task_id` must be a non-empty string');
-      const token = await resolveToken(cfg);
+      const token = requireOperatorToken(cfg);
       const cancelled = await request({
         rabbitUrl: base,
         token,

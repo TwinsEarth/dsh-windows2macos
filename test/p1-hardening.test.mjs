@@ -9,7 +9,7 @@ import { appendAudit } from '../src/plugin/joint-dev/audit-file.mjs';
 import { buildPlan } from '../src/plugin/joint-dev/dispatch.mjs';
 import { dispatchPlanToRelay } from '../src/plugin/joint-dev/relay-dispatch.mjs';
 
-const HEALTH = { relay_version: 'test', features: ['target-machines', 'result-projection'] };
+const HEALTH = { relay_version: 'test', features: ['target-machines', 'result-projection'], operator_token_required: true, signing: { required: false } };
 const APPROVAL = { approval_sha256: 'c'.repeat(64) };
 const planOf = () => buildPlan({ base_commit: 'a'.repeat(40), steps: [{ step_id: 's1', machine_id: 'm-1', command_argv: ['node', '-v'] }] }).plan;
 const jsonResponse = (status, doc) => ({ ok: status >= 200 && status < 300, status, json: async () => doc });
@@ -48,7 +48,7 @@ describe('dispatcher plugin-version gate', () => {
       if (target.endsWith('/v1/devices')) return jsonResponse(200, { devices: [{ machine_id: 'm-1', caps: { plugin_version: '1.9.16' } }] });
       assert.fail('no task should be sent for a skewed machine');
     };
-    const result = await dispatchPlanToRelay({ rabbitUrl: 'http://relay.test', token: 't', deviceToken: 'd', expectedVersion: '2.0.0-beta.1', plan, approval: APPROVAL, fetchImpl: relay });
+    const result = await dispatchPlanToRelay({ rabbitUrl: 'http://relay.test', token: 't', deviceToken: 'd', expectedVersion: '2.0.0-beta.1', plan, approval: APPROVAL, versionGate: 'enforce', fetchImpl: relay });
     assert.equal(result.ok, false);
     assert.equal(result.code, 'VERSION_SKEW');
     assert.deepEqual(result.detail.machines, [{ machine_id: 'm-1', version: '1.9.16' }]);

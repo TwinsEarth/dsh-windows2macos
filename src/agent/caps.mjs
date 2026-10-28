@@ -20,7 +20,7 @@
  * leaks into an envelope.
  */
 
-import { chmodSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir, release as osRelease } from 'node:os';
 import { basename, extname, join } from 'node:path';
 import { randomBytes } from 'node:crypto';
@@ -40,7 +40,20 @@ export {
 } from './resolve.mjs';
 
 /** Keys of the contract's `caps` object — nothing else may be added. */
-export const CAPS_KEYS = ['case_sensitive_fs', 'symlinks', 'exec_bit', 'python', 'npm', 'node'];
+export const CAPS_KEYS = ['case_sensitive_fs', 'symlinks', 'exec_bit', 'python', 'npm', 'node', 'plugin_version'];
+
+/** The plugin's own version, read once from the package manifest (the version gate compares it). */
+let pluginVersionCache = null;
+export function pluginVersion() {
+  if (pluginVersionCache !== null) return pluginVersionCache;
+  try {
+    const manifest = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8').replace(/^\uFEFF/, ''));
+    pluginVersionCache = typeof manifest.version === 'string' && manifest.version !== '' ? manifest.version : null;
+  } catch {
+    pluginVersionCache = null;
+  }
+  return pluginVersionCache;
+}
 
 /**
  * Run `<exe> <args>` and return the first regex capture of stdout+stderr.
@@ -403,6 +416,7 @@ export async function probeCapsDetailed(options = {}) {
     python: python.version,
     npm: npm.version,
     node: node.version,
+    plugin_version: pluginVersion(),
   };
 
   return {

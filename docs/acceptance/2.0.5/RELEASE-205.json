@@ -1,0 +1,21 @@
+{
+  "version": "2.0.5",
+  "case": "RELEASE-205",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-28T16:37:29.497Z",
+  "executor": "lead",
+  "task_id": "pre-release-205-1793205449498",
+  "requirement": "v2.0.5：Relay 支持 AEAD v2 加密消息信封（enc.v=2 + aad{session_id,machine_id,message_id}），新增能力标记 chat-enc-v2，供主插件启用 encrypted mirror 发送；v1 兼容不变。",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "envelope": "v2 shape accepted and echoed verbatim (iv/tag + nested aad); v1 still accepted; unknown versions refused BAD_ENCRYPTION",
+      "aadBinding": "clear AAD must name the same session_id and machine_id as the message (CHAT_AAD_MISMATCH otherwise); missing aad CHAT_AAD_MISSING; bad message id CHAT_AAD_INVALID",
+      "feature": "healthz features includes chat-enc-v2; dispatcher can gate encrypted mirror on it",
+      "tests": "fleet-messages + relay-health-capabilities + relay.test 217 pass / 0 fail; targeted v2 suite 28 pass / 0 fail; eslint 0 errors"
+    }
+  }
+}

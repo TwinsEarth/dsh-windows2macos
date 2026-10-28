@@ -144,7 +144,7 @@ describe('end-to-end encrypted messages (v1.2.6)', () => {
   it('refuses a malformed encryption envelope instead of storing it', () => {
     const m = store();
     for (const enc of [
-      { v: 2, alg: 'aes-256-gcm', iv: 'aXY=', tag: 'dGFn' },
+      { v: 3, alg: 'aes-256-gcm', iv: 'aXY=', tag: 'dGFn' },
       { v: 1, alg: 'rot13', iv: 'aXY=', tag: 'dGFn' },
       { v: 1, alg: 'aes-256-gcm', iv: '', tag: 'dGFn' },
       { v: 1, alg: 'aes-256-gcm', iv: 'aXY=', tag: 'x'.repeat(65) },
@@ -161,6 +161,39 @@ describe('end-to-end encrypted messages (v1.2.6)', () => {
     assert.equal(listed.length, 2);
     assert.equal(listed[0].enc, undefined, 'a plaintext message keeps the old shape');
     assert.equal(listed[1].enc.alg, 'aes-256-gcm');
+  });
+});
+
+
+describe('AEAD v2 messages with AAD (A7)', () => {
+  const store = () => createFleetMessages({ now: (() => { let t = 2_500; return () => (t += 10); })() });
+  const envelope = (over = {}) => ({ v: 2, alg: 'aes-256-gcm', iv: 'aXY=', tag: 'dGFn', aad: { session_id: 's1', machine_id: 'a', message_id: 'local-1' }, ...over });
+
+  it('stores and returns a v2 envelope, AAD included', () => {
+    const m = store();
+    const posted = m.post({ session_id: 's1', machine_id: 'a', text: 'Y2lwaGVy', enc: envelope() });
+    assert.equal(posted.ok, true);
+    assert.deepEqual(posted.message.enc, envelope());
+    assert.deepEqual(m.list({ session_id: 's1' }).messages[0].enc, envelope());
+  });
+
+  it('refuses clear AAD naming another session or another machine', () => {
+    const m = store();
+    assert.equal(m.post({ session_id: 's1', machine_id: 'a', text: 'x', enc: envelope({ aad: { session_id: 's2', machine_id: 'a', message_id: 'local-1' } }) }).code, 'CHAT_AAD_MISMATCH');
+    assert.equal(m.post({ session_id: 's1', machine_id: 'a', text: 'x', enc: envelope({ aad: { session_id: 's1', machine_id: 'b', message_id: 'local-1' } }) }).code, 'CHAT_AAD_MISMATCH');
+  });
+
+  it('refuses a missing AAD, a bad message id, and unknown versions', () => {
+    const m = store();
+    assert.equal(m.post({ session_id: 's1', machine_id: 'a', text: 'x', enc: { v: 2, alg: 'aes-256-gcm', iv: 'aXY=', tag: 'dGFn' } }).code, 'CHAT_AAD_MISSING');
+    assert.equal(m.post({ session_id: 's1', machine_id: 'a', text: 'x', enc: envelope({ aad: { session_id: 's1', machine_id: 'a', message_id: '' } }) }).code, 'CHAT_AAD_INVALID');
+    assert.equal(m.post({ session_id: 's1', machine_id: 'a', text: 'x', enc: envelope({ v: 4 }) }).code, 'BAD_ENCRYPTION');
+  });
+
+  it('keeps v1 readable without AAD (backward compatibility)', () => {
+    const m = store();
+    const v1 = { v: 1, alg: 'aes-256-gcm', iv: 'aXY=', tag: 'dGFn' };
+    assert.equal(m.post({ session_id: 's1', machine_id: 'a', text: 'Y2lwaGVy', enc: v1 }).ok, true);
   });
 });
 

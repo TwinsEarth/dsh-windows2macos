@@ -33,6 +33,11 @@ import { tmpdir } from 'node:os';
 import { randomUUID , sign as signBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
+import { deliverArtifact } from './artifact-delivery.mjs';
+
+import { createSseWatchdog } from './sse-watchdog.mjs';
+import { shouldAdvanceCursor } from './sse-cursor.mjs';
+
 import {
   EMPTY_SHA256,
   classifyExit,
@@ -1921,6 +1926,8 @@ export function createAgent(options) {
   const COMPLETED_CACHE_LIMIT = 64;
   let pumping = false;
   let streamAbort = null;
+/** Set when the current attach attempt parsed the relay's `ready` frame. */
+let attemptAttached = false;
   let runAbort = null;
   /** @type {Heartbeat|null} */
   let heartbeat = null;
@@ -2247,26 +2254,19 @@ export function createAgent(options) {
    * @param {string} body
    * @returns {Promise<{ok: boolean, status: number, sha256?: string, code?: string}>}
    */
-  async function putBlobBytes(sha256, body) {
-    const path = `/v1/fleet/blobs/${sha256}`;
-    // The stage's stdout arrives as a Buffer. Work on BYTES: the name must be the hash of exactly what is sent, and the
-    // signature must cover those same bytes -- decoding and re-encoding would replace invalid UTF-8 and change the hash.
-    const bytes = Buffer.isBuffer(body) ? body : Buffer.from(String(body ?? ''), 'utf8');
-    const headers = { 'content-type': 'application/octet-stream', accept: 'application/json' };
-    if (token()) headers.authorization = `Bearer ${token()}`;
-    Object.assign(headers, signingHeaders('PUT', path, bytes.toString('utf8')));
-    try {
-      const response = await fetchImpl(url(path), { method: 'PUT', headers, body: bytes });
-      if (response.ok) return { ok: true, status: response.status, sha256 };
-      let code = `HTTP_${response.status}`;
-      try {
-        const parsed = JSON.parse(await response.text());
-        if (typeof parsed?.error?.code === 'string') code = parsed.error.code;
-      } catch { /* the code is then the HTTP status, which is still a name */ }
-      return { ok: false, status: response.status, code };
-    } catch (error) {
-      return { ok: false, status: 0, code: error instanceof Error ? 'BLOB_UPLOAD_FAILED' : 'BLOB_UPLOAD_FAILED' };
-    }
+  async function putBlobBytes(sha256, body, kind = 'stdout', taskId = null) {
+    // A3/S4: artifacts leave through the user's sink (dir/git/ssh), never through the relay.
+    // Without a sink the bytes are kept locally and the caller reports ARTIFACT_NOT_DELIVERED;
+    // the relay is not contacted at all.
+    const delivered = await deliverArtifact({
+      stateDir,
+      kind,
+      bytes: body,
+      taskId: typeof taskId === 'string' && taskId !== '' ? taskId : 'unknown-task',
+      machineId: identity.machine_id,
+    });
+    if (delivered.ok === true) return { ok: true, status: 200, sha256: delivered.sha256, ref: delivered.ref };
+    return { ok: false, status: 0, code: delivered.code ?? 'ARTIFACT_NOT_DELIVERED', reason: delivered.reason ?? null, local: delivered.local ?? null };
   }
 
   /** @param {string} path @param {object} body @param {number} [retries] */
@@ -3359,8 +3359,12 @@ export function createAgent(options) {
           // The agent caps what it keeps in memory; if that cap was hit the blob holds the same bytes the hash covers, and
           // the warning says so instead of letting a reader assume the stage printed exactly this much.
           if (ran.truncated_stdout === true && !warnings.includes('PIPELINE_STDOUT_TRUNCATED')) warnings.push('PIPELINE_STDOUT_TRUNCATED');
-          const uploaded = await putBlobBytes(ran.stdout_sha256, ran.stdout);
-          if (uploaded.ok !== true) {
+          const uploaded = await putBlobBytes(ran.stdout_sha256, ran.stdout, 'stdout', offer.task_id);
+          if (uploaded.ok !== true && uploaded.code === 'ARTIFACT_NOT_DELIVERED') {
+            // No sink configured: the stage itself succeeded and its bytes are kept locally.
+            warnings.push('ARTIFACT_NOT_DELIVERED');
+            blobSha256 = null;
+          } else if (uploaded.ok !== true) {
             log("warn", offer.task_id + " stage " + stage.index + ": blob upload failed", { code: uploaded.code });
             stageReports.push({
               index: stage.index,
@@ -3377,9 +3381,10 @@ export function createAgent(options) {
             });
             stoppedAt = stage.index;
             break;
+          } else {
+            blobSha256 = uploaded.sha256;
+            lastBlobSha256 = blobSha256;
           }
-          blobSha256 = uploaded.sha256;
-          lastBlobSha256 = blobSha256;
         }
         stageReports.push({
           index: stage.index,
@@ -3422,12 +3427,12 @@ export function createAgent(options) {
         const plainPlan = planStageOutput({ machineId: identity.machine_id, stageIndex: 0, stdoutBytes: execution.stdout_bytes });
         if (plainPlan.ok === true && plainPlan.mode === 'blob') {
           if (execution.truncated_stdout === true && !warnings.includes('STDOUT_TRUNCATED')) warnings.push('STDOUT_TRUNCATED');
-          const uploaded = await putBlobBytes(execution.stdout_sha256, execution.stdout);
+          const uploaded = await putBlobBytes(execution.stdout_sha256, execution.stdout, 'stdout', offer.task_id);
           if (uploaded.ok === true) {
             lastBlobSha256 = uploaded.sha256;
           } else {
             log('warn', offer.task_id + ': plain stdout blob upload failed', { code: uploaded.code });
-            warnings.push('BLOB_UPLOAD_FAILED');
+            warnings.push(uploaded.code === 'ARTIFACT_NOT_DELIVERED' ? 'ARTIFACT_NOT_DELIVERED' : 'BLOB_UPLOAD_FAILED');
           }
         }
       }
@@ -3451,9 +3456,9 @@ export function createAgent(options) {
         let patchSha = null;
         if (patch.ok === true && typeof patch.patch === 'string' && patch.patch.trim() !== '') {
           const sha = sha256Hex(patch.patch);
-          const uploaded = await putBlobBytes(sha, patch.patch);
+          const uploaded = await putBlobBytes(sha, patch.patch, 'patch', offer.task_id);
           if (uploaded.ok === true) patchSha = sha;
-          else warnings.push('PATCH_UPLOAD_FAILED');
+          else warnings.push(uploaded.code === 'ARTIFACT_NOT_DELIVERED' ? 'ARTIFACT_NOT_DELIVERED' : 'PATCH_UPLOAD_FAILED');
         }
         const removed = await removeWorktree({ repoDir: project, worktreeDir: workspaceState.worktreeDir });
         if (removed.ok !== true) warnings.push('WORKTREE_CLEANUP_FAILED');
@@ -3833,7 +3838,24 @@ export function createAgent(options) {
     // break the "proxy strips the prefix" deployment (see signingHeaders).
     Object.assign(headers, signingHeaders('GET', `/v1/stream?${query.toString()}`));
 
-    const response = await fetchImpl(streamUrl, { headers, signal: streamAbort.signal });
+    // Header deadline: a proxy that accepts the socket but never returns headers must not hang the
+    // agent forever. Node >= 20.19 has AbortSignal.any, and every other HTTP call in the tree already
+    // carries a timeout.
+    const headerTimeoutMs = Number(process.env.W2M_SSE_FIRST_FRAME_MS) > 0 ? Number(process.env.W2M_SSE_FIRST_FRAME_MS) : 5000;
+    const headerSignal = typeof AbortSignal.any === 'function'
+      ? AbortSignal.any([streamAbort.signal, AbortSignal.timeout(headerTimeoutMs)])
+      : streamAbort.signal;
+    let response;
+    try {
+      response = await fetchImpl(streamUrl, { headers, signal: headerSignal });
+    } catch (error) {
+      if (streamAbort.signal.aborted) throw error;
+      const timeout = new Error('SSE_FIRST_FRAME_TIMEOUT');
+      timeout.code = 'SSE_FIRST_FRAME_TIMEOUT';
+      state.lastRelayError = { at: new Date().toISOString(), http_status: null, code: timeout.code, path: '/v1/stream' };
+      publishState();
+      throw timeout;
+    }
     if (!response.ok) {
       const body = await response.text().catch(() => '');
       let code = null;
@@ -3855,19 +3877,51 @@ export function createAgent(options) {
       throw error;    }
     if (!response.body) throw new Error('stream response had no body');
 
+    // P0-f: two deadlines on the stream this attempt. A half-open connection must not look
+    // like a healthy one forever; the relay keepalive is 15 s, so 45 s is three missed beats.
+    const envMs = (name) => (Number(process.env[name]) > 0 ? Number(process.env[name]) : undefined);
+    let timeoutCode = null;
+    let source = null;
+    const watchdog = createSseWatchdog({
+      firstFrameMs: envMs('W2M_SSE_FIRST_FRAME_MS'),
+      idleMs: envMs('W2M_SSE_IDLE_MS'),
+      onTimeout: (code) => {
+        timeoutCode = code;
+        state.lastRelayError = { at: new Date().toISOString(), http_status: null, code, path: '/v1/stream' };
+        publishState();
+        const error = new Error(code);
+        error.code = code;
+        try { source?.destroy(error); } catch { /* already gone */ }
+      },
+    });
+
     // Both assignments mark the same stream attempt as no longer live: one before the read loop, one
     // after it ends. Only one stream runs at a time, so there is nothing to interleave with.
     // eslint-disable-next-line require-atomic-updates -- one stream attempt at a time
     state.connected = false;
     const decoder = new TextDecoder('utf-8');
     const parser = new SseParser();
-    const source = Readable.fromWeb(response.body);
+    source = Readable.fromWeb(response.body);
 
-    for await (const chunk of source) {
-      if (state.stopped) break;
-      for (const frame of parser.push(decoder.decode(chunk, { stream: true }))) {
-        handleFrame(frame);
+    try {
+      for await (const chunk of source) {
+        if (state.stopped) break;
+        watchdog.noteBytes();
+        for (const frame of parser.push(decoder.decode(chunk, { stream: true }))) {
+          watchdog.noteFrame();
+          handleFrame(frame);
+        }
       }
+    } catch (error) {
+      if (timeoutCode !== null) {
+        const timeout = new Error(timeoutCode);
+        timeout.code = timeoutCode;
+        log('warn', 'event stream watchdog fired; reconnecting', { code: timeoutCode });
+        throw timeout;
+      }
+      throw error;
+    } finally {
+      watchdog.dispose();
     }
     state.connected = false;
     publishState();
@@ -3934,7 +3988,9 @@ export function createAgent(options) {
    */
   function dispatchFrame(payload, source) {
     const type = payload?.type ?? source.event;
-    if (source.transport === 'relay') {
+    if (source.transport === 'relay' && shouldAdvanceCursor({ type, event: source.event })) {
+      // P0-f: ready/notice carry sequence numbers that never entered the replay ring; adopting one
+      // would claim events that were never received and a reconnect would skip the real gap.
       if (Number.isInteger(payload?.seq)) state.seq = Math.max(state.seq, payload.seq);
       else if (source.id && /^\d+$/.test(source.id)) state.seq = Math.max(state.seq, Number(source.id));
     }
@@ -3950,6 +4006,7 @@ export function createAgent(options) {
         }
         // §3.1: nothing counts as connected before `ready` arrives.
         state.connected = true;
+        attemptAttached = true;
         const relayId =
           typeof payload.relay_id === 'string' && payload.relay_id !== '' ? payload.relay_id : null;
         const previousRelayId = state.relayId;
@@ -4296,6 +4353,7 @@ export function createAgent(options) {
       const response = await postJson('/v1/heartbeat', {
         diagnostic: true,
         machine_id: identity.machine_id,
+        ...(caps === null || caps === undefined ? {} : { caps }),
         ...heartbeatDiagnostics({
           rttMs: state.rttMs,
           reconnectAttempts: state.reconnectAttempts,
@@ -4416,6 +4474,7 @@ export function createAgent(options) {
         streamAbort = new AbortController();
         state.streamRestartRequested = false;
         const openedAt = Date.now();
+        attemptAttached = false;
         /** @type {Error|null} */
         let failure = null;
         try {
@@ -4449,7 +4508,9 @@ export function createAgent(options) {
           });
         }
 
-        const stable = livedMs >= STABLE_STREAM_MS;
+        // A stream that never delivered `ready` is not stable however long the socket lived: the
+        // watchdog deadlines are seconds, so the old rule reset the backoff to 500 ms forever.
+        const stable = attemptAttached && livedMs >= STABLE_STREAM_MS;
         if (stable) {
           reconnectAttempt = 0;
           restartReconnects = 0;

@@ -7,6 +7,8 @@
  */
 import { createHash } from 'node:crypto';
 
+import { computeCommandHash, normalizeCwdRel, SHELL_ID_DIRECT } from '../../relay/state.mjs';
+
 import { appendAudit } from './audit-file.mjs';
 import { createAudit, inspectControlMessage } from './redline.mjs';
 
@@ -80,7 +82,8 @@ export function buildPlan(input) {
       step_id: step.step_id,
       machine_id: step.machine_id,
       command_argv: step.command_argv.slice(0, 32),
-      command_hash: sha256(JSON.stringify(step.command_argv)),
+      cwd_rel: normalizeCwdRel(step.cwd_rel),
+      command_hash: computeCommandHash(step.command_argv, SHELL_ID_DIRECT, normalizeCwdRel(step.cwd_rel)),
       write_scope: Array.isArray(step.write_scope) ? step.write_scope.slice(0, 8) : [],
       depends_on: Array.isArray(step.depends_on) ? step.depends_on.slice(0, 8) : [],
       timeout_ms: Number.isInteger(step.timeout_ms) ? step.timeout_ms : null,
@@ -101,6 +104,7 @@ export function buildControlEnvelopes(plan) {
       base_commit: plan.base_commit,
       command_argv: step.command_argv,
       command_hash: step.command_hash,
+      cwd_rel: step.cwd_rel ?? '.',
       write_scope: step.write_scope,
       depends_on: step.depends_on,
       ...(step.timeout_ms === null ? {} : { timeout_ms: step.timeout_ms }),

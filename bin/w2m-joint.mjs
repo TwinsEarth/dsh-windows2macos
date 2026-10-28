@@ -17,9 +17,15 @@
  *
  * Exit codes: 0 ok, 1 refusal (named code), 2 usage error.
  */
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+
+import { deviceFilePath } from '../src/agent/identity.mjs';
+import { resolveStateDir } from '../src/util/cli.mjs';
 
 import { buildControlEnvelopes, buildPlan } from '../src/plugin/joint-dev/dispatch.mjs';
+import { abortMerge, advanceTarget, mergePatches } from '../src/plugin/joint-dev/merge-engine.mjs';
+import { consumeMergeApproval, createMergeApproval, loadMergeApproval } from '../src/plugin/joint-dev/merge-approval.mjs';
+import { resolve as resolvePath } from 'node:path';
 import { negotiateFeatures, readRelayCapabilities } from '../src/plugin/relay-capabilities.mjs';
 import { dispatchPlanToRelay } from '../src/plugin/joint-dev/relay-dispatch.mjs';
 import { readOperatorToken } from '../src/plugin/operator-token.mjs';
@@ -53,8 +59,8 @@ const fail = (code, detail) => { print({ ok: false, code, detail: detail ?? null
 
 const args = parseArgs(process.argv.slice(2));
 const [command, action] = args._;
-const stateDir = typeof args.state === 'string' ? args.state : (process.env.W2M_JOINT_STATE ?? null);
-if (stateDir === null) fail('STATE_DIR_REQUIRED', 'pass --state <dir> (the joint-dev state directory)');
+if (args['allow-unsigned-approval'] === true) fail('UNKNOWN_FLAG', '--allow-unsigned-approval was removed: joint approvals must be signed');
+const stateDir = resolveStateDir(typeof args.state === 'string' ? args.state : (process.env.W2M_JOINT_STATE ?? null), 'joint-dev');
 
 if (command === 'plan' && action === 'create') {
   if (typeof args.steps !== 'string') fail('STEPS_REQUIRED', 'pass --steps <steps.json>');
@@ -130,7 +136,7 @@ if (command === 'status') {
   const plan = loadPlan({ stateDir, planSha: args.plan });
   if (plan.ok !== true) fail(plan.code ?? 'PLAN_NOT_FOUND');
   const approval = loadApproval({ stateDir, planSha: args.plan });
-  const gate = assertDispatchAllowed({ stateDir, planSha: args.plan, requireSignature: args['allow-unsigned-approval'] !== true });
+  const gate = assertDispatchAllowed({ stateDir, planSha: args.plan, requireSignature: true });
   print({
     ok: true,
     plan_sha256: plan.plan.plan_sha256,
@@ -147,7 +153,7 @@ if (command === 'dispatch') {
   if (typeof args.plan !== 'string') fail('PLAN_REQUIRED', 'pass --plan <sha256>');
   const key = ensureOperatorKey();
   const trusted = key.ok === true ? [key.key_id] : [];
-  const gate = assertDispatchAllowed({ stateDir, planSha: args.plan, requireSignature: args['allow-unsigned-approval'] !== true, trustedOperatorKeyIds: trusted });
+  const gate = assertDispatchAllowed({ stateDir, planSha: args.plan, requireSignature: true, trustedOperatorKeyIds: trusted });
   if (gate.ok !== true) fail(gate.code ?? 'APPROVAL_REQUIRED', 'dispatch refused before anything was sent');
   const relayUrl = typeof args.relay === 'string' ? args.relay : null;
   if (args['dry-run'] !== true) {
@@ -161,9 +167,23 @@ if (command === 'dispatch') {
     }
     if (token === null) fail('OPERATOR_TOKEN_MISSING', 'run w2m-operator set --file <token file>, or pass --token-file');
     // decision 2: one approval authorises exactly one dispatch.
-    const consumed = consumeApproval({ stateDir, planSha: args.plan, approvalSha: gate.approval.approval.approval_sha256 });
+    const consumed = consumeApproval({ stateDir, planSha: args.plan, approvalSha: gate.approval.approval_sha256 });
     if (consumed.ok !== true) fail(consumed.code ?? 'APPROVAL_CONSUME_FAILED', consumed.detail ?? null);
-    const sent = await dispatchPlanToRelay({ rabbitUrl: relayUrl, token, plan: gate.plan, approval: gate.approval.approval, auditFile: stateDir + '/joint-dev/audit.jsonl' });
+      // D2/B5: the gate is on by default in warn mode; enforce is explicit.
+      let deviceToken = '';
+      if (typeof args['device-token-file'] === 'string') {
+        deviceToken = readFileSync(args['device-token-file'], 'utf8').trim();
+      } else {
+        try {
+          const file = deviceFilePath({});
+          if (existsSync(file)) deviceToken = String(JSON.parse(readFileSync(file, 'utf8')).device_token ?? '');
+        } catch { deviceToken = ''; }
+      }
+      const expectedVersion = typeof args['expect-version'] === 'string' && args['expect-version'] !== ''
+        ? args['expect-version']
+        : JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
+      const versionGate = args['version-gate'] === 'off' || args['version-gate'] === 'enforce' ? args['version-gate'] : 'warn';
+      const sent = await dispatchPlanToRelay({ rabbitUrl: relayUrl, token, plan: gate.plan, approval: gate.approval, auditFile: stateDir + '/joint-dev/audit.jsonl', dispatchDir: stateDir + '/joint-dev/dispatches', deviceToken, expectedVersion, versionGate });
     print({ ...sent, plan_sha256: gate.plan.plan_sha256, relay: relayUrl });
     process.exit(sent.ok === true ? 0 : 1);
   }
@@ -183,11 +203,53 @@ if (command === 'dispatch') {
     relay: typeof args.relay === 'string' ? args.relay : null,
     relay_capabilities: capabilities === null ? null : { relay_version: capabilities.relay_version, features: capabilities.features },
     relay_negotiation: negotiation,
+    version_gate: args['version-gate'] === 'off' || args['version-gate'] === 'enforce' ? args['version-gate'] : 'warn',
     plan_sha256: gate.plan.plan_sha256,
     approval_sha256: gate.approval.approval_sha256,
     envelopes: envelopes.length,
     control: envelopes.map((envelope) => ({ type: envelope.type, body: envelope.body })),
   });
+  process.exit(0);
+}
+
+if (command === 'merge') {
+  const repo = typeof args.repo === 'string' ? resolvePath(args.repo) : null;
+  const baseCommit = typeof args.base === 'string' ? args.base : null;
+  const targetRef = typeof args['target-ref'] === 'string' ? args['target-ref'] : null;
+  const expectedOld = typeof args['expected-old'] === 'string' ? args['expected-old'] : null;
+  if (repo === null || baseCommit === null || targetRef === null || expectedOld === null) {
+    fail('MERGE_ARGS_REQUIRED', 'merge needs --repo --base --target-ref --expected-old');
+  }
+  if (action === 'approve') {
+    if (typeof args.head !== 'string' || typeof args.approver !== 'string') fail('MERGE_APPROVER_REQUIRED', 'merge approve needs --head <sha> --approver <name> --authority <70..100>');
+    const authority = Number.parseInt(String(args.authority ?? ''), 10);
+    if (!Number.isInteger(authority)) fail('AUTHORITY_REQUIRED', 'pass --authority <70..100>');
+    const ttlMin = Number.parseInt(String(args['ttl-min'] ?? '10'), 10);
+    const created = createMergeApproval({ stateDir, planSha: typeof args.plan === 'string' ? args.plan : null, repo, baseCommit, targetRef, expectedOld, integrationHead: args.head, approver: args.approver, authority, ttlMs: (Number.isFinite(ttlMin) ? ttlMin : 10) * 60_000 });
+    if (created.ok !== true) fail(created.code ?? 'MERGE_APPROVAL_FAILED', created.detail ?? null);
+    print({ ok: true, approval_sha256: created.approval_sha256, approval: created.approval });
+    process.exit(0);
+  }
+  if (typeof args.patches !== 'string') fail('MERGE_PATCHES_REQUIRED', 'pass --patches <manifest.json>');
+  let patches = null;
+  try { patches = JSON.parse(readFileSync(args.patches, 'utf8').replace(/^\uFEFF/, '')); } catch (error) { fail('MERGE_PATCHES_UNREADABLE', error instanceof Error ? error.message : String(error)); }
+  if (!Array.isArray(patches) || patches.length === 0) fail('MERGE_PATCHES_INVALID', 'manifest must be a non-empty JSON array of {step_id, patch}');
+  const merged = mergePatches({ repoDir: repo, baseCommit, patches });
+  if (merged.ok !== true) fail(merged.code ?? 'MERGE_FAILED', merged.detail ?? null);
+  const dryRun = args.apply !== true;
+  print({ ok: true, dry_run: dryRun, integration_head: merged.integration_head, applied: merged.applied, target_ref: targetRef, expected_old: expectedOld });
+  if (dryRun) { abortMerge({ repoDir: repo, worktree: merged.worktree }); process.exit(0); }
+  if (typeof args.approval !== 'string') { abortMerge({ repoDir: repo, worktree: merged.worktree }); fail('MERGE_APPROVAL_REQUIRED', '--apply needs --approval <merge_approval_sha256>'); }
+  const gate = loadMergeApproval({ stateDir, approvalSha: args.approval, repo, baseCommit, targetRef, expectedOld, integrationHead: merged.integration_head, planSha: typeof args.plan === 'string' ? args.plan : null });
+  if (gate.ok !== true) { abortMerge({ repoDir: repo, worktree: merged.worktree }); fail(gate.code ?? 'MERGE_APPROVAL_INVALID', gate.detail ?? null); }
+  const consumed = consumeMergeApproval({ stateDir, approvalSha: args.approval });
+  if (consumed.ok !== true) { abortMerge({ repoDir: repo, worktree: merged.worktree }); fail(consumed.code ?? 'MERGE_APPROVAL_CONSUME_FAILED', consumed.detail ?? null); }
+  const stamp = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14);
+  const rollbackRef = 'refs/w2m/rollback/' + (typeof args.plan === 'string' ? args.plan.slice(0, 12) : 'plan') + '-' + stamp;
+  const advanced = advanceTarget({ repoDir: repo, targetRef, expectedOld, newCommit: merged.integration_head, rollbackRef });
+  abortMerge({ repoDir: repo, worktree: merged.worktree });
+  if (advanced.ok !== true) fail(advanced.code ?? 'MERGE_CAS_FAILED', advanced.detail ?? null);
+  print({ ok: true, dry_run: false, integration_head: merged.integration_head, target_ref: targetRef, rollback_ref: rollbackRef });
   process.exit(0);
 }
 
