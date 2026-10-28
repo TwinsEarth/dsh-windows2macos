@@ -58,7 +58,7 @@ function mount(file, options = {}) {
     permissionPresets: { current: () => 'danger-full-access' },
     workingDirectory: null,
   };
-  const config = { foldersFile: file };
+  const config = { foldersFile: file, gpwMode: 'advanced' };
   if (options.key !== null) config.foldersKey = options.key ?? KEY;
   apply(ctx, config);
   return { routes, listeners, warnings };

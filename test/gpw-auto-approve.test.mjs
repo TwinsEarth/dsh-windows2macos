@@ -49,7 +49,7 @@ const execFor = (path, name = 'write') => ({ agent: { session: { header: { id: '
 describe('GPW timeout auto-approve (v1.8.2)', () => {
   it('approves a yellow call after the timeout and makes its next occurrence blue', async () => {
     const file = join(fixture(), 'gpw-folders.json');
-    const { preExecute } = mount({ foldersFile: file, foldersKey: 'test-key', pendingTimeoutMs: 60, requireFullAccess: true });
+    const { preExecute } = mount({ foldersFile: file, foldersKey: 'test-key', pendingTimeoutMs: 60, requireFullAccess: true, gpwMode: 'advanced' });
     const target = join(fixture(), 'outside', 'a.txt');
     const outcome = await preExecute(execFor(target), () => undefined);
     assert.equal(outcome.kind, 'allow', 'no operator answer -> auto-approve');
@@ -62,7 +62,7 @@ describe('GPW timeout auto-approve (v1.8.2)', () => {
 
   it('keeps red denied outright, with no timeout involved', async () => {
     const file = join(fixture(), 'gpw-folders.json');
-    const { preExecute } = mount({ foldersFile: file, foldersKey: 'test-key', pendingTimeoutMs: 60, requireFullAccess: true });
+    const { preExecute } = mount({ foldersFile: file, foldersKey: 'test-key', pendingTimeoutMs: 60, requireFullAccess: true, gpwMode: 'advanced' });
     const denied = await preExecute(execFor(join(fixture(), '.ssh', 'id_rsa')), () => undefined);
     assert.equal(denied.kind, 'deny');
   });
@@ -77,8 +77,8 @@ describe('GPW timeout auto-approve (v1.8.2)', () => {
     assert.doesNotMatch(String(outcome.reason ?? ''), /no operator answer/);
   });
 
-  it('exposes the 100 s default in the source', async () => {
+  it('exposes the 10 s default in the source', async () => {
     const source = (await import('node:fs')).readFileSync(join(process.cwd(), 'src', 'plugin', 'gpw.mjs'), 'utf8');
-    assert.match(source, /DEFAULT_PENDING_TIMEOUT_MS = 100_000/);
+    assert.match(source, /DEFAULT_PENDING_TIMEOUT_MS = 10_000/);
   });
 });

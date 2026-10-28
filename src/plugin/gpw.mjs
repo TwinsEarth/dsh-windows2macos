@@ -95,7 +95,21 @@ export const GPW_PICK_ROUTE = '/api/w2m/gpw/pick';
 export const GPW_RESET_ROUTE = '/api/w2m/gpw/reset';
 
 const DEFAULT_BUDGET = { maxPerWindow: 10, windowMs: 60_000, minGapMs: 3_000 };
-const DEFAULT_PENDING_TIMEOUT_MS = 100_000;
+const DEFAULT_PENDING_TIMEOUT_MS = 10_000;
+
+/** Two policy strategies; novice is the product default. */
+export const GPW_MODES = Object.freeze(['novice', 'advanced']);
+export const DEFAULT_GPW_MODE = 'novice';
+/** At most one path-naming auto-pass per 3 s in novice mode. */
+export const NOVICE_APPROVE_GAP_MS = 3000;
+/** Always refused in novice mode, even with an empty operator blacklist. */
+export const DEFAULT_PROTECTED_FOLDERS = Object.freeze([
+  'C:\\Windows',
+  'C:\\Program Files',
+  'D:\\Program Files',
+  'C:\\Program Files (x86)',
+  'D:\\Program Files (x86)',
+]);
 const RECENT_LIMIT = 20;
 const NO_STORE = { 'cache-control': 'no-store' };
 /** v1.7.9: lists are MAC-signed (v2) so an external edit is detectable instead of silently trusted. */
@@ -164,29 +178,30 @@ export function readFolders(file, key = null, options = {}) {
     raw = readFileSync(file, 'utf8');
   } catch (error) {
     if (error?.code === 'ENOENT' && key !== null && options.allowMissing !== true) {
-      return { whitelist: [], blacklist: [], tampered: true, reason: 'folder lists file is missing' };
+      return { whitelist: [], blacklist: [], mode: 'novice', tampered: true, reason: 'folder lists file is missing' };
     }
     if (error?.code !== 'ENOENT') {
       return { whitelist: [], blacklist: [], tampered: true, reason: `folder lists unreadable: ${error?.message ?? error}` };
     }
-    return { whitelist: [], blacklist: [], tampered: false, reason: null, legacy: false };
+    return { whitelist: [], blacklist: [], mode: 'novice', tampered: false, reason: null, legacy: false };
   }
   let parsed = null;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    return { whitelist: [], blacklist: [], tampered: true, reason: 'folder lists file is not valid JSON' };
+    return { whitelist: [], blacklist: [], mode: 'novice', tampered: true, reason: 'folder lists file is not valid JSON' };
   }
   const whitelist = Array.isArray(parsed?.whitelist) ? parsed.whitelist.filter((v) => typeof v === 'string' && v !== '') : [];
   const blacklist = Array.isArray(parsed?.blacklist) ? parsed.blacklist.filter((v) => typeof v === 'string' && v !== '') : [];
   if (parsed?.version !== FOLDERS_VERSION || typeof parsed?.mac !== 'string') {
-    return { whitelist, blacklist, tampered: false, reason: null, legacy: true };
+    return { whitelist, blacklist, mode: 'novice', tampered: false, reason: null, legacy: true };
   }
-  if (key === null) return { whitelist, blacklist, tampered: false, reason: null, legacy: false };
+  const storedMode = parsed?.mode === 'advanced' ? 'advanced' : 'novice';
+  if (key === null) return { whitelist, blacklist, mode: storedMode, tampered: false, reason: null, legacy: false };
   if (macOfFolders(whitelist, blacklist, key) !== parsed.mac) {
-    return { whitelist, blacklist, tampered: true, reason: 'folder lists were modified outside GPW (MAC mismatch)' };
+    return { whitelist, blacklist, mode: storedMode, tampered: true, reason: 'folder lists were modified outside GPW (MAC mismatch)' };
   }
-  return { whitelist, blacklist, tampered: false, reason: null, legacy: false };
+  return { whitelist, blacklist, mode: storedMode, tampered: false, reason: null, legacy: false };
 }
 
 /**
@@ -200,7 +215,8 @@ export function writeFolders(file, folders, key = null) {
   mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
   const whitelist = [...new Set((folders?.whitelist ?? []).filter((v) => typeof v === 'string' && v.trim() !== ''))];
   const blacklist = [...new Set((folders?.blacklist ?? []).filter((v) => typeof v === 'string' && v.trim() !== ''))];
-  const next = { version: FOLDERS_VERSION, whitelist, blacklist };
+  const mode = folders?.mode === 'advanced' ? 'advanced' : 'novice';
+  const next = { version: FOLDERS_VERSION, whitelist, blacklist, mode };
   if (key !== null) {
     next.algo = FOLDERS_MAC_ALGO;
     next.mac = macOfFolders(whitelist, blacklist, key);
@@ -213,12 +229,12 @@ export function writeFolders(file, folders, key = null) {
   try { chmodSync(tmp, 0o600); } catch { /* best effort */ }
   renameSync(tmp, file);
   try { chmodSync(file, 0o444); } catch { /* read-only is best effort on Windows, MAC still verifies */ }
-  return { whitelist, blacklist };
+  return { whitelist, blacklist, mode };
 }
 
 /** Operator reset: drop every entry and re-sign. Used only after a tamper report. */
 export function resetFolders(file, key) {
-  return writeFolders(file, { whitelist: [], blacklist: [] }, key);
+  return writeFolders(file, { whitelist: [], blacklist: [], mode: 'novice' }, key);
 }
 
 /**
@@ -363,6 +379,7 @@ export function apply(ctx, config = {}) {
   const minGapMs = positiveInt(config.minGapMs, DEFAULT_BUDGET.minGapMs);
   const pendingTimeoutMs = positiveInt(config.pendingTimeoutMs, DEFAULT_PENDING_TIMEOUT_MS);
   const requireFullAccess = config.requireFullAccess !== false;
+  const configuredMode = config.gpwMode === 'advanced' ? 'advanced' : DEFAULT_GPW_MODE;
   const foldersFile = foldersFileOf(config);
   const keyInfo = ensureFoldersKey(foldersFile, config);
   const foldersKey = keyInfo.key;
@@ -384,6 +401,8 @@ export function apply(ctx, config = {}) {
     noteTamper(initialFolders.reason);
   } else {
     // Always leave a signed v2 file behind (first run creates the empty one; later runs re-sign it).
+    // A configured mode is the bootstrap choice when the file carries none yet (tests and first run).
+    if (config.gpwMode !== undefined) initialFolders.mode = configuredMode;
     try {
       writeFolders(foldersFile, initialFolders, foldersKey);
       foldersSeen = true;
@@ -398,6 +417,7 @@ export function apply(ctx, config = {}) {
   let allowedTotal = 0;
   let pendingTotal = 0;
   let deniedTotal = 0;
+  let lastNovicePassAt = 0;
   /** id -> { resolve, createdAt, tool, reason, paths } */
   const pending = new Map();
   /** Newest-first record of calls the gate saw, so the panel can offer "add this folder" in one click. */
@@ -422,9 +442,13 @@ export function apply(ctx, config = {}) {
       foldersSeen = true;
     }
     const merge = (a, b) => [...new Set([...(Array.isArray(a) ? a : []), ...b])];
+    const mode = config.gpwMode !== undefined ? configuredMode : (stored.mode ?? configuredMode);
+    const storedBlacklist = merge(config.blacklist, stored.blacklist);
     return {
+      mode,
       whitelist: merge(config.whitelist, stored.whitelist),
-      blacklist: merge(config.blacklist, stored.blacklist),
+      blacklist: storedBlacklist,
+      effectiveBlacklist: mode === 'novice' ? [...new Set([...DEFAULT_PROTECTED_FOLDERS, ...storedBlacklist])] : storedBlacklist,
       tampered: tamperedReason !== null,
       reason: tamperedReason,
     };
@@ -529,8 +553,8 @@ export function apply(ctx, config = {}) {
       ctx.logger?.warn?.(`dsh-gpw: refused ${String(call.name ?? 'tool')} -- lists locked (${lists.reason})`);
       return `GPW: folder lists failed integrity check (${lists.reason}); reset them in the GPW panel`;
     }
-    if (lists.blacklist.length === 0) return undefined;
-    const result = classifyToolCall({ ...call, blacklist: lists.blacklist });
+    if (lists.effectiveBlacklist.length === 0) return undefined;
+    const result = classifyToolCall({ ...call, blacklist: lists.effectiveBlacklist });
     if (result.decision !== 'deny') return undefined;
     deniedTotal += 1;
     noteRecent({ tool: String(call.name ?? 'tool'), decision: 'deny', reason: result.reason, paths: result.paths });
@@ -574,6 +598,34 @@ export function apply(ctx, config = {}) {
       noteRecent({ tool: String(call.name ?? 'tool'), decision: 'deny', reason: lists.reason, paths: probe.paths });
       ctx.logger?.warn?.(`dsh-gpw: refused ${String(call.name ?? 'tool')} -- lists locked (${lists.reason})`);
       return { kind: 'deny', reason: `GPW: folder lists failed integrity check (${lists.reason}); reset them in the GPW panel` };
+    }
+    if (lists.mode === 'novice') {
+      // 小白模式: only the blacklist restricts anything; every other call passes.
+      // At most one path-naming call per 3 s is auto-passed, so a burst cannot do unbounded damage.
+      let noviceCwd = null;
+      try {
+        noviceCwd = await ctx.workingDirectory?.ensure?.(exec.agent, exec.signal);
+      } catch {
+        noviceCwd = null;
+      }
+      const noviceCall = toolCallOf(exec);
+      const noviceClassification = classifyToolCall({ ...noviceCall, blacklist: lists.effectiveBlacklist, workspace: noviceCwd ?? null, base: noviceCwd ?? undefined });
+      if (noviceClassification.decision === 'deny') {
+        deniedTotal += 1;
+        colorCounts.red += 1;
+        noteRecent({ tool: String(noviceCall.name ?? 'tool'), decision: 'deny', color: 'red', reason: noviceClassification.reason, paths: noviceClassification.paths });
+        ctx.logger?.warn?.('dsh-gpw: novice -- refused ' + String(noviceCall.name ?? 'tool') + ' -- ' + noviceClassification.reason);
+        return { kind: 'deny', reason: 'GPW: ' + noviceClassification.reason + '; the call was not executed' };
+      }
+      if (noviceClassification.paths.length > 0) {
+        const waitMs = NOVICE_APPROVE_GAP_MS - (Date.now() - lastNovicePassAt);
+        if (waitMs > 0) await new Promise((resolveSlot) => { setTimeout(resolveSlot, Math.min(waitMs, NOVICE_APPROVE_GAP_MS)); });
+        lastNovicePassAt = Date.now();
+      }
+      colorCounts.green += 1;
+      const noviceReason = '小白模式：黑名单外全部放行（每 3 秒最多一次路径操作）';
+      noteRecent({ tool: String(noviceCall.name ?? 'tool'), decision: 'allow', color: 'green', reason: noviceReason, paths: noviceClassification.paths });
+      return { kind: 'allow', reason: noviceReason };
     }
     let cwd = null;
     try {
@@ -651,6 +703,11 @@ export function apply(ctx, config = {}) {
           enabled: true,
           require_full_access: requireFullAccess,
           folders: { whitelist: lists.whitelist, blacklist: lists.blacklist },
+          mode: lists.mode,
+          modes: [...GPW_MODES],
+          protected_folders: lists.mode === 'novice' ? [...DEFAULT_PROTECTED_FOLDERS, ...lists.blacklist] : [...lists.blacklist],
+          pending_timeout_ms: pendingTimeoutMs,
+          novice_approve_gap_ms: NOVICE_APPROVE_GAP_MS,
           tampered: lists.tampered,
           tampered_reason: lists.reason,
           counters: { allowedTotal, pendingTotal, deniedTotal, budgetWindow: approvals.length, maxPerWindow, colors: { ...colorCounts }, grants: sessionGrants.size },
@@ -690,6 +747,22 @@ export function apply(ctx, config = {}) {
         } catch {
           /* refused below */
         }
+        if (body?.action === 'set-mode') {
+          const current = folderLists();
+          if (current.tampered) {
+            return json({ ok: false, error: 'folder lists are locked after an integrity failure (' + current.reason + '); reset them first' }, 409);
+          }
+          const mode = body?.mode;
+          if (mode !== 'novice' && mode !== 'advanced') return json({ ok: false, error: 'mode must be novice or advanced' }, 400);
+          const stored = readFolders(foldersFile, foldersKey, { allowMissing: true });
+          try {
+            writeFolders(foldersFile, { ...stored, mode }, foldersKey);
+          } catch (error) {
+            return json({ ok: false, error: 'could not write the policy mode: ' + (error?.message ?? error) }, 500);
+          }
+          ctx.logger?.info?.('dsh-gpw: policy mode -> ' + mode);
+          return json({ ok: true, mode, folders: folderLists() });
+        }
         const list = body?.list;
         if (list !== 'whitelist' && list !== 'blacklist') return json({ ok: false, error: 'list must be whitelist or blacklist' }, 400);
         if (body?.action !== 'add' && body?.action !== 'remove') return json({ ok: false, error: 'action must be add or remove' }, 400);
@@ -698,6 +771,17 @@ export function apply(ctx, config = {}) {
           return json({ ok: false, error: `folder lists are locked after an integrity failure (${current.reason}); reset them first` }, 409);
         }
         const stored = readFolders(foldersFile, foldersKey, { allowMissing: true });
+        if (body?.action === 'set-mode') {
+          const mode = body?.mode;
+          if (mode !== 'novice' && mode !== 'advanced') return json({ ok: false, error: 'mode must be novice or advanced' }, 400);
+          try {
+            writeFolders(foldersFile, { ...stored, mode }, foldersKey);
+          } catch (error) {
+            return json({ ok: false, error: 'could not write the policy mode: ' + (error?.message ?? error) }, 500);
+          }
+          ctx.logger?.info?.('dsh-gpw: policy mode -> ' + mode);
+          return json({ ok: true, mode, folders: folderLists() });
+        }
         if (body.action === 'remove') {
           if (typeof body?.path !== 'string' || body.path.trim() === '') return json({ ok: false, error: 'path must be a non-empty string' }, 400);
           const next = { ...stored, [list]: stored[list].filter((entry) => entry !== body.path) };
@@ -734,7 +818,7 @@ export function apply(ctx, config = {}) {
         }
         if (body?.confirm !== 'reset') return json({ ok: false, error: "confirm must be the string 'reset'" }, 400);
         try {
-          resetFolders(foldersFile, foldersKey);
+          resetFolders(foldersFile, foldersKey, folderLists().mode);
         } catch (error) {
           return json({ ok: false, error: `could not reset folder lists: ${error?.message ?? error}` }, 500);
         }

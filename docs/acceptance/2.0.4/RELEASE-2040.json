@@ -1,0 +1,22 @@
+{
+  "version": "2.0.4",
+  "case": "RELEASE-2040",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-28T12:54:03.976Z",
+  "executor": "lead",
+  "task_id": "pre-release-2040-1793192043977",
+  "requirement": "v2.0.4：GPW 双模式（小白默认/高级手动）、默认保护文件夹、3 秒放行节流、高级模式 10 秒自动放行；README 主页重写",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "mode": "novice default; advanced manual via /api/w2m/gpw/folders set-mode",
+      "protected": "C:\\\\Windows, Program Files (x86) on C: and D: always denied in novice",
+      "throttle": "one path auto-pass per 3000ms",
+      "timeout": "advanced pending auto-approve 10s (was 100s)",
+      "tests": "gpw suites 74 pass / 0 fail incl gpw-modes 5/5; client-bundle 26/26; lint 0 errors"
+    }
+  }
+}
