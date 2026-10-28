@@ -7,6 +7,16 @@
 
 All notable changes to this project are documented here.
 
+## [2.0.0-beta.1] - 2026-10-28
+
+首个联合开发 beta（S0–S1）。
+
+- S0 事实基座：operator token 安全存储（0600 文件 + 指纹状态）、relay /healthz 广告 relay_version/features、客户端能力协商 fail-closed；版本偏斜策略按“三机同版本才允许联合开发、enforce 不开启”执行。
+- S1 选择真实生效：派发前按当前设备名册重校验被选机器（离线 → TARGET_UNAVAILABLE，不换机）；派发后按 relay leases 校验，未被点名的机器也执行 → 取消任务并 SELECTION_NOT_HONOURED。
+- 联合开发操作员入口：w2m-joint（plan create/list/get、approve、status、dispatch --dry-run，能力协商接入）；联合开发默认关闭，属实验性 beta。
+- 运维工具：w2m-scrub（dry-run/apply，递归清点 blobs/<aa>/<sha>，备份必须外置，二次幂等），用于旧 relay 清淤。
+- beta 发布：仅 GitHub prerelease；npm 不发布本 beta。
+
 ## [1.9.16] - 2026-10-28
 
 - G0-2：relay /healthz 新增 relay_version 与 features（target-machines / result-projection / guard-v1 / relay-version-v1）；w2m_status 显示这两项，便于核对三台 relay 的实际版本与能力。

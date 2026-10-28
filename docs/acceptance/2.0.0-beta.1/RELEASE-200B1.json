@@ -1,0 +1,23 @@
+{
+  "version": "2.0.0-beta.1",
+  "case": "RELEASE-200B1",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-28T01:38:12.535Z",
+  "executor": "lead",
+  "task_id": "pre-release-200b1-1793151492536",
+  "requirement": "v2.0.0-beta.1（S0–S1）：版本/能力协商、operator token 安全存储、选中真实生效；联合开发默认关闭，beta 不含 npm",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "s0_token": "w2m-operator set/status/clear, 0600 file, fingerprint only (v1.9.15)",
+      "s0_capabilities": "relay /healthz relay_version/features; w2m_status exposes them; negotiation fail-closed (v1.9.16)",
+      "s1_selection": "pre-dispatch TARGET_UNAVAILABLE; post-dispatch SELECTION_NOT_HONOURED with cancel (v1.9.12)",
+      "joint_cli": "w2m-joint plan/approve/status/dispatch --dry-run with capability negotiation (v1.9.13 + current)",
+      "scrub_cli": "w2m-scrub recursive blobs, dry-run/apply, external backup, idempotent (current)",
+      "open": "G0-3 relay upgrade/cleanup needs SSH window; G0-4 machine version alignment needs operator token; enforce remains off"
+    }
+  }
+}

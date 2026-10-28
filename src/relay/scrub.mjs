@@ -3,7 +3,7 @@
  * 只处理已落盘的数据，不联网；dry-run 先报清单，apply 先备份再原子替换。
  */
 import {
-  copyFileSync, existsSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync,
+  copyFileSync, existsSync, readdirSync, readFileSync, renameSync, rmdirSync, statSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
@@ -34,23 +34,36 @@ export function scrubLedger(ledgerPath, { dryRun = true, now = Date.now() } = {}
   return { ok: true, exists: true, changed, lines: lines.length, backup, dryRun: false };
 }
 
-/** 清点/删除 relay blob 目录（内容寻址文件）。 */
+/** 清点/删除 relay blob 目录（内容寻址；真实布局是 blobs/<aa>/<sha>，递归处理）。 */
 export function scrubBlobs(blobDir, { dryRun = true, now = Date.now() } = {}) {
   if (!existsSync(blobDir)) return { ok: true, exists: false, files: [], bytes: 0, deleted: 0, manifest: null };
   const files = [];
   let bytes = 0;
-  for (const name of readdirSync(blobDir)) {
-    const path = join(blobDir, name);
-    if (!statSync(path).isFile()) continue;
-    files.push(name);
-    bytes += statSync(path).size;
-  }
+  const walk = (dir, rel) => {
+    for (const name of readdirSync(dir)) {
+      const path = join(dir, name);
+      const stat = statSync(path);
+      const relPath = rel === '' ? name : rel + '/' + name;
+      if (stat.isDirectory()) { walk(path, relPath); continue; }
+      files.push(relPath);
+      bytes += stat.size;
+    }
+  };
+  walk(blobDir, '');
   const manifest = {
     at: new Date(now).toISOString(),
-    files: files.map((name) => ({ name, sha256: sha256(readFileSync(join(blobDir, name))) })),
+    files: files.map((name) => ({ name, sha256: sha256(readFileSync(join(blobDir, name.split('/').join('/')))) })),
   };
   if (dryRun) return { ok: true, exists: true, files, bytes, deleted: 0, manifest, dryRun };
   for (const name of files) unlinkSync(join(blobDir, name));
+  // Remove the empty sharding directories the files lived in, but never the blob root itself.
+  const prune = (dir) => {
+    for (const name of readdirSync(dir)) {
+      const path = join(dir, name);
+      if (statSync(path).isDirectory()) { prune(path); try { rmdirSync(path); } catch { /* not empty */ } }
+    }
+  };
+  prune(blobDir);
   return { ok: true, exists: true, files, bytes, deleted: files.length, manifest, dryRun: false };
 }
 
