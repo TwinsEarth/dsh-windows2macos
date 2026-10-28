@@ -68,6 +68,7 @@ const expected = [
   'w2m_approvals',
   'w2m_cancel', 'w2m_chat',
   'w2m_intent', 'w2m_council',
+  'w2m_joint_plan', 'w2m_joint_status',
   'w2m_reduce',
 ];
 const ok = registered.length === expected.length && expected.every((e) => names.includes(e));

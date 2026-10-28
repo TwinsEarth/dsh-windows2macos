@@ -1790,6 +1790,17 @@ export class RabbitState {
     const now = this.nowMs();
     const cwdRel = typeof input.cwd_rel === 'string' && input.cwd_rel ? input.cwd_rel : '.';
     const baseTree = input.base_tree ?? null;
+    // v2 R5: a joint dispatch must be auditable; a malformed binding is refused, never nulled.
+    for (const key of ['plan_sha256', 'approval_sha256']) {
+      const value = input[key];
+      if (value !== undefined && !(typeof value === 'string' && /^[0-9a-f]{64}$/.test(value))) {
+        throw new ProtocolError('BAD_REQUEST', key + ' must be 64 lowercase hex characters');
+      }
+    }
+    if (input.step_id !== undefined && !(typeof input.step_id === 'string' && /^[a-z][a-z0-9_-]{0,31}$/.test(input.step_id))) {
+      throw new ProtocolError('BAD_REQUEST', 'step_id must be ^[a-z][a-z0-9_-]{0,31}$');
+    }
+
     const derivedCommandHash = isPipeline
       ? computePipelineCommandHash(stages, SHELL_ID_DIRECT)
       : computeCommandHash(commandArgv, SHELL_ID_DIRECT, cwdRel);

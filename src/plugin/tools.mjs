@@ -192,6 +192,7 @@ import { registerChatRoutes } from './fleet-chat-route.mjs';
 import { registerExecCapabilityRoutes } from './exec-capability-route.mjs';
 import { registerPluginUpdateRoutes } from './update-route.mjs';
 import { registerOperatorTokenRoute } from './operator-token-route.mjs';
+import { registerJointTools } from './tools-joint.mjs';
 import { fingerprintOf, readOperatorToken } from './operator-token.mjs';
 import { registerCaptureRoutes } from './capture-route.mjs';
 import { defaultExecCapabilityFile } from '../util/exec-capability.mjs';
@@ -3627,6 +3628,8 @@ export async function apply(ctx, config = {}) {
   // -------------------------------------------------------------------------------------------
   // 1. w2m_device - read-only
   // -------------------------------------------------------------------------------------------
+  registerJointTools(ctx, { defineTool, stateDir: cfg.stateDir, machineName: cfg.machineName, output: jsonOutput });
+
   ctx.tools.register(defineTool({
     name: 'w2m_devices',
     description:

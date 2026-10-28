@@ -1,0 +1,24 @@
+{
+  "kind": "ops-smoke",
+  "case": "AG-SMOKE",
+  "executed_at": "2026-10-28T05:02:36.913Z",
+  "executor": "lead",
+  "task_id": "01M60E2W38FFKXKRZS95JSVWFM",
+  "setup": "relay 43.142.74.71:8787 upgraded to 1.9.16; operator token used from ~/.w2m/operator-token; read via local device token",
+  "attempt": "broadcast executor_machine_id=ToFuture command_argv=[\"node\",\"-v\"] at 2.0.0-tree relay",
+  "observed": {
+    "dispatch": "POST /v1/task 200; executor lease on ToFuture=offered; DSH/macmini and 15 other devices=observing",
+    "final": "aggregate=refused; ToFuture lease=refused (agent allow-list), outcome=refused; observers did not execute"
+  },
+  "conclusions": {
+    "selection_routing": "PASS at relay level: only the named executor gets an executing lease; every other device is observing",
+    "execution": "NOT PROVEN: the target agent refused the command (allow-list)",
+    "ag_matrix": "PARTIAL: A/B/C/D routing smoke only; E/F/G and real execution blocked"
+  },
+  "blockers": [
+    "agent allow-list does not include node -v on ToFuture",
+    "running DSH process still predates the operator-token change (restart required)",
+    "macmini/DSH plugin versions unknown/unverified; same-version requirement not yet met",
+    "S4 data plane (agent putBlobBytes reroute + no-sink degradation) not implemented"
+  ]
+}

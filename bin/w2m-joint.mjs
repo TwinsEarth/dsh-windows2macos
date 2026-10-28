@@ -163,7 +163,7 @@ if (command === 'dispatch') {
     // decision 2: one approval authorises exactly one dispatch.
     const consumed = consumeApproval({ stateDir, planSha: args.plan, approvalSha: gate.approval.approval.approval_sha256 });
     if (consumed.ok !== true) fail(consumed.code ?? 'APPROVAL_CONSUME_FAILED', consumed.detail ?? null);
-    const sent = await dispatchPlanToRelay({ rabbitUrl: relayUrl, token, plan: gate.plan, approval: gate.approval.approval });
+    const sent = await dispatchPlanToRelay({ rabbitUrl: relayUrl, token, plan: gate.plan, approval: gate.approval.approval, auditFile: stateDir + '/joint-dev/audit.jsonl' });
     print({ ...sent, plan_sha256: gate.plan.plan_sha256, relay: relayUrl });
     process.exit(sent.ok === true ? 0 : 1);
   }

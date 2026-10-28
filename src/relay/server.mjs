@@ -32,6 +32,7 @@ export const RELAY_FEATURES = Object.freeze([
   'result-projection',
   'guard-v1',
   'relay-version-v1',
+  'chat-text-only-v1',
 ]);
 import fs from 'node:fs';
 import os from 'node:os';
@@ -64,7 +65,7 @@ import { createJoinChallenges } from './join-challenge.mjs';
 import { createAdmission } from './admission.mjs';
 import { Persistence } from './persistence.mjs';
 import { PeerRegistry } from './peers.mjs';
-import { aggregateTask, buildReport } from './report.mjs';
+import { aggregateTask, buildReport, taskProgress } from './report.mjs';
 import { renderMetrics, METRICS_CONTENT_TYPE } from './metrics.mjs';
 // v0.3.0 §9: request signing. This import is the entire point of the module --
 // until the HTTP layer calls it, HMAC support does not exist for any real request.
@@ -1249,7 +1250,9 @@ export class RelayServer {
     if (method === 'POST' && path === '/v1/result') {
       const body = takeJson();
       // B1 方案 A：window 模式接收旧信封（含 argv/head）并投影后存储；enforce 才硬拒。
-    if (String(process.env.W2M_DATA_PLANE_GUARD ?? 'window') === 'enforce') {
+    const dataPlaneGuardMode = String(process.env.W2M_DATA_PLANE_GUARD ?? 'window');
+    // decision 5: enforce is not allowed. The flag is read and reported, but never changes behaviour.
+    if (dataPlaneGuardMode === 'enforce' && this.allowDataPlaneGuardEnforce === true) {
       const resultGuard = guardResultEnvelope(body);
       if (resultGuard.ok !== true) {
         return sendJson(res, resultGuard.status, resultGuard.body);
@@ -1387,6 +1390,7 @@ export class RelayServer {
         task: this.state.taskSummary(task),
         leases: [...task.leases.values()],
         aggregate,
+        progress: taskProgress(this.state, taskId),
       });
     }
 
@@ -2037,3 +2041,4 @@ export {
   rfc3339,
 };
 export default createRelayServer;
+

@@ -112,7 +112,7 @@ async function register(config = {}) {
 describe('tool cards: the contract the shipped runtime actually implements', () => {
   it('gives every tool a presentCall that yields a generic card with a title', async () => {
     const tools = await register({ stateDir: makeProfile() });
-    assert.equal(tools.size, 16, 'every registered tool is the surface this contract covers');
+    assert.equal(tools.size, 18, 'every registered tool is the surface this contract covers');
     for (const [name, tool] of tools) {
       assert.equal(typeof tool.presentCall, 'function', `${name} needs a presentCall`);
       const card = tool.presentCall({});

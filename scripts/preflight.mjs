@@ -2215,7 +2215,7 @@ function checkPackAndTarball() {
       );
     }
 
-    // (d) the packed copy registers the sixteen tools -- executed from the extracted tarball, not the tree
+    // (d) the packed copy registers the eighteen tools -- executed from the extracted tarball, not the tree
     const extracted = join(staging, 'extracted');
     mkdirSync(extracted, { recursive: true });
     const skipped = extract(entries, extracted);
@@ -2229,7 +2229,7 @@ function checkPackAndTarball() {
     const verified = child('verify-installed', process.execPath, [probe, extracted]);
     if (!verified.ok) {
       return fail(
-        'scripts/verify-installed.mjs reported the packed copy does not register its sixteen tools',
+        'scripts/verify-installed.mjs reported the packed copy does not register its eighteen tools',
         tail(verified, 20),
       );
     }
@@ -2238,10 +2238,10 @@ function checkPackAndTarball() {
     // 0" and "the probe registered ten tools" are different measurements and only the second one is
     // the claim this check makes; a probe edited to exit 0 early would satisfy the first.
     const toolCount = Number(verified.stdout.match(/registered\s*:\s*(\d+)/)?.[1] ?? NaN);
-    if (toolCount !== 16) {
+    if (toolCount !== 18) {
       return fail(
         `the packed copy registered ${Number.isNaN(toolCount) ? 'an unreadable number of' : toolCount} tool(s), ` +
-          'not the sixteen this package documents',
+          'not the eighteen this package documents',
         tail(verified, 20),
       );
     }

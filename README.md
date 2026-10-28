@@ -14,7 +14,7 @@ English | [中文](#中文说明)
 
 ## Install
 
-Five routes in. They all end with **16 tools registered** in your agent. Pick one.
+Five routes in. They all end with **18 tools registered** in your agent. Pick one.
 
 ### 1. DSH plugin (recommended — zero configuration)
 
@@ -136,7 +136,7 @@ hand-maintained host list.
 ### Tools
 
 `w2m_status` · `w2m_devices` · `w2m_run` · `w2m_wait` · `w2m_history` · `w2m_stats` · `w2m_report` ·
-`w2m_memory` · `w2m_approvals` · `w2m_cancel` · `w2m_council` · `w2m_chat` · `w2m_update` `w2m_tasks` · `w2m_reduce`
+`w2m_memory` · `w2m_approvals` · `w2m_cancel` · `w2m_council` · `w2m_chat` · `w2m_update` `w2m_tasks` · `w2m_reduce` · `w2m_joint_plan` · `w2m_joint_status`
 - `w2m_intent` — map a structured intent (run-tests, node-version, git-status, git-head, fleet-facts, shard-probe) onto an allow-listed command; unknown intents are refused by name, never guessed.
 
 ### Environment a dispatched command receives (1.1.15+)
@@ -261,7 +261,7 @@ MIT.
 
 ### 安装
 
-五种方式，最终都会在你的 agent 里注册 **16 tools registered**。任选其一。
+五种方式，最终都会在你的 agent 里注册 **18 tools registered**。任选其一。
 
 #### 1. DSH 插件（推荐，零配置）
 

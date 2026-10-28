@@ -25,6 +25,7 @@ export const BODY_ALLOWED_KEYS = Object.freeze([
   'manifest_sha256', 'executor_machine_id', 'head_commit', 'verifier_machine_id',
   'command_argv', 'command_hash', 'cwd_rel', 'timeout_ms',
   'step_id', 'step_ids', 'machine_id', 'write_scope', 'depends_on',
+  'task_id', 'mode', 'approval_sha256', 'write',
 ]);
 
 /** 这些字段一律视为数据面内容，出现在控制消息里即拒绝（R1）。 */

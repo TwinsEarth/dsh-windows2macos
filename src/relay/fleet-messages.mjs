@@ -101,6 +101,10 @@ export function createFleetMessages(options = {}) {
     if (sessionId === '') return { ok: false, code: 'BAD_SESSION' };
     const machineId = typeof input?.machine_id === 'string' ? input.machine_id.trim() : '';
     if (machineId === '') return { ok: false, code: 'BAD_MACHINE' };
+    // v1.9.18: chat carries text and slash-command text only; images never travel over the relay.
+    const MEDIA_FIELDS = ['image', 'image_url', 'image_base64', 'image_bytes', 'picture', 'photo', 'thumb', 'thumbnail', 'attachment', 'attachments', 'file', 'files', 'data', 'base64', 'blob', 'binary', 'buffer', 'media', 'sticker_image', 'sticker_data', 'gif', 'png', 'jpeg', 'webp'];
+    const mediaField = Object.keys(input ?? {}).find((key) => MEDIA_FIELDS.includes(key.toLowerCase()));
+    if (mediaField !== undefined) return { ok: false, code: 'CHAT_FIELD_FORBIDDEN', detail: { field: mediaField } };
     if (typeof input?.text !== 'string') return { ok: false, code: 'NOT_TEXT' };
     const text = input.text;
     if (text.trim() === '') return { ok: false, code: 'EMPTY_TEXT' };
@@ -128,6 +132,24 @@ export function createFleetMessages(options = {}) {
       const tagOk = typeof rawEnc.tag === 'string' && rawEnc.tag.length > 0 && rawEnc.tag.length <= 64;
       if (rawEnc.v !== 1 || rawEnc.alg !== 'aes-256-gcm' || !ivOk || !tagOk) return { ok: false, code: 'BAD_ENCRYPTION' };
       enc = { v: 1, alg: 'aes-256-gcm', iv: rawEnc.iv, tag: rawEnc.tag };
+    }
+
+    // v1.9.18: a plain-text message may not smuggle an image payload. Encrypted text is exempt:
+    // it is base64 ciphertext by design and the relay cannot (and must not) inspect it.
+    if (enc === null) {
+      if (/data:(?:image|video|audio)\//i.test(text) || /!\[[^\]]*\]\(/i.test(text)) {
+        return { ok: false, code: 'TEXT_IMAGE_FORBIDDEN' };
+      }
+      const block = text.match(/[A-Za-z0-9+/]{256,}={0,2}/);
+      if (block !== null) {
+        try {
+          const head = Buffer.from(block[0].slice(0, 32), 'base64');
+          const magic = head.slice(0, 4).toString('latin1');
+          if ((head[0] === 0x89 && head.slice(1, 4).toString('latin1') === 'PNG') || (head[0] === 0xff && head[1] === 0xd8) || magic.startsWith('GIF8') || magic.startsWith('RIFF')) {
+            return { ok: false, code: 'TEXT_BINARY_FORBIDDEN' };
+          }
+        } catch { /* not base64 that matters */ }
+      }
     }
 
     // v1.2.5 idempotency: replay the first message instead of storing the text twice.

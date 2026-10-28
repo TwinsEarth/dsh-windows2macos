@@ -156,6 +156,12 @@ export function registerChatRoutes(ctx, deps) {
    * The session files are never written and nothing is injected into DSH: the transcript is read, the user's messages
    * are extracted, and only the new ones are published. A failure here must not disturb the panel or the route.
    */
+  const MIRROR_MAX_BYTES = 3500;
+  const truncateUtf8 = (value, max) => {
+    const bytes = Buffer.from(value, 'utf8');
+    if (bytes.length <= max) return value;
+    return bytes.subarray(0, max).toString('utf8').replace(/\uFFFD+$/, '') + ' …(已截断)';
+  };
   const mirrorOnce = async () => {
     const identity = await identityOf();
     if (identity.conversationKey === null) return;
@@ -165,7 +171,7 @@ export function registerChatRoutes(ctx, deps) {
     try { messages = extractUserMessages(decodeTranscript(readFileSync(file))); } catch { return; }
     for (const payload of sync.pending(messages)) {
       await postToRelay(identity, {
-        text: payload.text,
+        text: truncateUtf8(payload.text, MIRROR_MAX_BYTES),
         machine_id: identity.machineId,
         machine_name: identity.machineName,
         origin: 'session',

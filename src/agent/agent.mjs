@@ -23,7 +23,7 @@
 
 import { Readable } from 'node:stream';
 import { access, constants as fsConstants } from 'node:fs/promises';
-import { existsSync, mkdirSync, mkdtempSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { commitTaskChanges, createWorktree, listChangedFiles, producePatch, removeWorktree } from './worktree.mjs';
 import { describePatchArtifact } from './patch-artifact.mjs';
@@ -31,6 +31,7 @@ import { ferryMaintenance, maintenancePaths } from './maintenance-ferry.mjs';
 import { authorizeWithGrant } from './grant-gate.mjs';
 import { tmpdir } from 'node:os';
 import { randomUUID , sign as signBytes } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 
 import {
   EMPTY_SHA256,
@@ -2122,6 +2123,10 @@ export function createAgent(options) {
       python: caps.python ?? null,
       npm: caps.npm ?? null,
       git,
+      plugin_version: (() => {
+        try { return JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'package.json'), 'utf8')).version ?? null; } catch { return null; }
+      })(),
+      joint_dev: 'v2',
     };
     return toolchainCache;
   }

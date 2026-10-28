@@ -104,3 +104,14 @@ describe('offer journal: relay restart', () => {
     assert.equal(created.json.error.code, 'BAD_REQUEST');
   });
 });
+
+
+describe('relay joint metadata validation', () => {
+  it('refuses a malformed plan_sha256 instead of storing null', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'w2m-relay-meta-'));
+    const relay = await start(stateDir);
+    const bad = await post(relay.url, '/v1/task', TOKEN, { mode: 'replicate', command_argv: ['node', '-v'], include_offline: true, plan_sha256: 'zz' });
+    assert.equal(bad.status, 400, JSON.stringify(bad.json));
+    assert.equal(bad.json.error.code, 'BAD_REQUEST');
+  });
+});

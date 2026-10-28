@@ -524,6 +524,41 @@ export function aggregate(task, resultRecords = [], opts = {}) {
 }
 
 /** Convenience wrapper: pull the task + its results out of a RabbitState. */
+/** S3: a read-only progress view. phase/progress are live-only (null after a restart). */
+export function taskProgress(state, taskId, opts = {}) {
+  const task = state.getTask(taskId);
+  if (!task) return null;
+  const aggregate = aggregateTask(state, taskId, opts);
+  const summary = state.taskSummary(task);
+  const machines = aggregate.machines.map((machine) => {
+    const lease = task.leases.get(machine.machine_id) ?? null;
+    return {
+      machine_id: machine.machine_id,
+      lease_state: machine.lease_state,
+      outcome: machine.outcome,
+      exit_code: machine.exit_code ?? null,
+      phase: lease?.phase ?? null,
+      progress: typeof lease?.progress === 'number' ? lease.progress : null,
+      last_heartbeat_at: Number.isFinite(lease?.last_heartbeat_ms) ? rfc3339(lease.last_heartbeat_ms) : null,
+      lease_until: Number.isFinite(lease?.lease_until_ms) ? rfc3339(lease.lease_until_ms) : null,
+    };
+  });
+  return {
+    task_id: taskId,
+    mode: task.mode,
+    plan_sha256: task.plan_sha256 ?? null,
+    approval_sha256: task.approval_sha256 ?? null,
+    step_id: task.step_id ?? null,
+    command_hash: aggregate.expected?.command_hash ?? task.command_hash ?? null,
+    command_argv_len: Array.isArray(task.command_argv) ? task.command_argv.length : 0,
+    status: summary.status,
+    verdict: aggregate.status,
+    terminal: aggregate.status !== 'pending',
+    counts: aggregate.counts,
+    waiting_on: summary.waiting_on,
+    machines,
+  };
+}
 export function aggregateTask(state, taskId, opts = {}) {
   const task = state.getTask(taskId);
   if (!task) throw new ProtocolError('NOT_FOUND', 'unknown task_id', { task_id: taskId });
