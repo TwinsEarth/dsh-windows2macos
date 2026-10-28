@@ -16,6 +16,7 @@
  */
 import {
   chmodSync,
+  chownSync,
   closeSync,
   copyFileSync,
   existsSync,
@@ -63,6 +64,7 @@ export function repairLedger(file, options = {}) {
   const before = statSync(file);
   if (!before.isFile()) return { ok: false, code: LEDGER_REPAIR_CODES.NOT_A_FILE, path: file };
 
+  const mode = before.mode & 0o777;
   const raw = readFileSync(file);
   const afterRead = statSync(file);
   if (afterRead.mtimeMs !== before.mtimeMs || afterRead.size !== before.size) {
@@ -116,7 +118,8 @@ export function repairLedger(file, options = {}) {
   const backup = `${file}.bak-${now}`;
   try {
     copyFileSync(file, backup);
-    chmodSync(backup, 0o600);
+    chmodSync(backup, mode);
+    try { chownSync(backup, before.uid, before.gid); } catch { /* unprivileged run keeps the caller's owner */ }
   } catch (error) {
     return { ...base, dry_run: false, written: false, ok: false, code: LEDGER_REPAIR_CODES.WRITE_FAILED, error: String(error) };
   }
@@ -132,7 +135,10 @@ export function repairLedger(file, options = {}) {
   const next = valid.length === 0 ? '' : valid.join('\n') + (hasFinalNewline ? '\n' : '');
   const tmp = `${file}.repair-${now}.tmp`;
   try {
-    writeDurable(tmp, Buffer.from(next, 'utf8'), 0o600);
+    writeDurable(tmp, Buffer.from(next, 'utf8'), mode);
+    // Keep the service account as the owner: a relay that runs as `w2m` must still be able to
+    // read the file after root repaired it (this exact break happened on Vultr).
+    try { chownSync(tmp, before.uid, before.gid); } catch { /* unprivileged */ }
     renameSync(tmp, file);
   } catch (error) {
     try { if (existsSync(tmp)) unlinkSync(tmp); } catch { /* best effort */ }

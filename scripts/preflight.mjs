@@ -999,6 +999,14 @@ export const ACCEPTED_SKIPS = [
   maxCount: 1,
   why: 'C02 needs UNC normalisation inside canonicalKey; recorded as a known 1.9.3 defect and asserted by the skip row itself',
 },
+  {
+    key: 'ledger-repair-file-mode-posix-only',
+    suite: /^ledger repair: corrupt line$/,
+    match: /^POSIX file mode is not measurable on Windows$/,
+    maxCount: 1,
+    platforms: ['win32'],
+    why: 'the 0640 mode assertion is a POSIX fact; the repair itself runs on every host',
+  },
 ];
 
 /**

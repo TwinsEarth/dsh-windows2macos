@@ -10,7 +10,7 @@
  *   - the operation is idempotent
  */
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, writeFileSync, existsSync, readdirSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync, existsSync, readdirSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -99,6 +99,15 @@ describe('ledger repair: corrupt line', () => {
     const second = repairLedger(file, { apply: true });
     assert.equal(second.changed, false);
     assert.equal(second.written, false);
+  });
+
+  it('keeps the file mode (service account must still read it)', { skip: process.platform === 'win32' ? 'POSIX file mode is not measurable on Windows' : false }, () => {
+    const d = dir();
+    const file = join(d, 'ledger.jsonl');
+    writeFileSync(file, valid(1) + '\\n' + 'broken' + '\\n', { encoding: 'utf8', mode: 0o640 });
+    chmodSync(file, 0o640);
+    assert.equal(repairLedger(file, { apply: true }).written, true);
+    assert.equal(statSync(file).mode & 0o777, 0o640);
   });
 
   it('CRLF line endings are preserved for valid lines', () => {

@@ -7,6 +7,12 @@
 
 All notable changes to this project are documented here.
 
+## [1.9.13] - 2026-10-28
+
+- 新增操作员联合开发 CLI `w2m-joint`：plan create/list/get、approve（人签、authority≥70、TTL 默认 10 分钟）、status、dispatch --dry-run（打印控制信封，真实发送未接线并返回 DISPATCH_NOT_WIRED）。
+- 该 CLI 是 SOP 的操作员入口：计划先落盘、人工审批、再允许派发；dispatch 真发仍要求 operator token 与 relay 能力广告（下一片）。
+- 端到端本机冒烟：create → approve → status(dispatch_allowed=true) → dispatch --dry-run(2 envelopes)。
+
 ## [1.9.12] - 2026-10-28
 
 - 联合开发安全门（S1/S2 预置）：plan-store 保存与读取都重算 plan_sha256（篡改即 PLAN_TAMPERED）、planSha 强制 64 位十六进制（拒绝路径穿越）、审批绑定 plan_sha/approver/authority/TTL 并重算 approval_sha256（篡改/过期/低权限拒绝）、原子写。
