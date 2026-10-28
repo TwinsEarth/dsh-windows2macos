@@ -4,7 +4,7 @@
  */
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, it } from 'node:test';
@@ -104,6 +104,6 @@ describe('data-plane end to end', () => {
     const accepted = await call('POST', { kind: 'dir', root: resolve(outside, '.', '..', outside.split(/[\\/]/).pop()) });
     const body = await accepted.json();
     assert.equal(body.ok, true, JSON.stringify(body));
-    assert.equal(body.root, resolve(outside));
+    assert.equal(body.root, realpathSync.native ? realpathSync.native(resolve(outside)) : realpathSync(resolve(outside)));
   });
 });

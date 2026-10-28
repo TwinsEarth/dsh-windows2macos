@@ -5,7 +5,7 @@
  * the stored file contains references only (no credentials).
  */
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -46,7 +46,7 @@ describe('dataplane sink route', () => {
     const config = JSON.parse(readFileSync(file, 'utf8'));
     assert.equal(config.kind, 'dir');
     assert.equal(config.approved_by, 'local-user');
-    assert.equal(config.root, root);
+    assert.equal(config.root, realpathSync.native ? realpathSync.native(root) : realpathSync(root));
     // No credential field can be present.
     assert.equal(JSON.stringify(config).includes('password'), false);
     if (process.platform !== 'win32') assert.equal(statSync(file).mode & 0o777, 0o600);

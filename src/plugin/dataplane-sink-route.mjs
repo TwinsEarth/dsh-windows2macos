@@ -28,7 +28,12 @@ function readConfig(stateDir) {
 }
 
 function insideStateDir(stateDir, target) {
-  const rel = relative(stateDir, target);
+  // Compare canonical paths: Windows temp dirs come back as RUNNER~1 here and runneradmin in the
+  // realpath, and macOS /var is a symlink to /private/var, so a raw prefix test lets an inside path
+  // through on CI even though it is inside the state dir.
+  let base = stateDir;
+  try { base = realpathSync.native ? realpathSync.native(stateDir) : realpathSync(stateDir); } catch { /* keep raw */ }
+  const rel = relative(base, target);
   return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
 }
 

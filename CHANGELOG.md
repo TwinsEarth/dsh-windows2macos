@@ -7,6 +7,14 @@
 
 All notable changes to this project are documented here.
 
+## [2.0.6] - 2026-10-29
+
+- 修复 CI 跨平台失败：sink 授权 route 先把 stateDir 解析为 realpath（Windows RUNNER~1 / macOS
+  /var→/private/var），避免“stateDir 内部目录”被误放行；相关测试按 canonical 路径断言。
+- 会话搜索：纯数字 ≤100 不触发搜索（无高亮/无跳转）；只高亮当前视口，每屏最多 6 条，
+  滚动时按新视口刷新（150ms 防抖，不抢滚动位置）；输入仍保持 3 秒防抖。
+- 一键到顶：等待“加载中…”结束后再点“加载更早”，连续两页无增长即停止。
+
 ## [2.0.5] - 2026-10-29
 
 - Relay 支持 AEAD v2 加密消息信封（A7 收尾）：`enc.v=2` 携带 `aad:{session_id,machine_id,message_id}`，

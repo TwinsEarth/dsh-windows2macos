@@ -1,0 +1,22 @@
+{
+  "version": "2.0.6",
+  "case": "RELEASE-2060",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-28T17:02:50.164Z",
+  "executor": "lead",
+  "task_id": "pre-release-2060-1793206970165",
+  "requirement": "v2.0.6:CI 跨平台修复(realpath 归一) + 搜索规则(纯数字≤100拒绝/视口最多6条/滚动刷新) + 一键到顶等待加载",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "preflight": "16 pass / 0 fail / 1 unverifiable (GREEN)",
+      "tests": "declared suite all pass; client-bundle 27/27",
+      "lint": "0 errors",
+      "pack": "byte-identical; manifest equals tree",
+      "scope": "local code + tests only; release follows via tag v2.0.6"
+    }
+  }
+}
