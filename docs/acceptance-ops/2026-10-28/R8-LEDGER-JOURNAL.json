@@ -1,0 +1,21 @@
+{
+  "version": "2.0.0",
+  "case": "R8-LEDGER-JOURNAL",
+  "kind": "positive",
+  "executed_at": "2026-10-28T03:55:45.117Z",
+  "executor": "lead",
+  "task_id": "r8-ledger-journal-1793159745118",
+  "requirement": "relay ledger 只存 command_hash/command_argv_len；argv 移到独立 offer journal；重启从 journal 恢复；command_hash 由 relay 派生",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "ledger": "task.created 行不含 \"command_argv\"，含 command_argv_len（e2e 断言）",
+      "journal": "<stateDir>/offers/<task_id>.json 0600，字段 argv/stages/reduce_argv，写入先于任务通告",
+      "restart": "同一 stateDir 重启后 getTask(task_id).command_argv 从 journal 恢复，且 offer_unavailable 不为 true",
+      "hash": "调用方传入不匹配的 command_hash -> 400 BAD_REQUEST（relay 自行派生）",
+      "journal_lifecycle": "cancelled 删除；启动时 prune 掉无任务的 journal",
+      "tests": "test/relay-offer-journal.test.mjs 3/3；relay/joint/recovery/p2p 22 套件 384 项 383 pass / 1 skip / 0 fail；e2e 11/11",
+      "known_limit": "journal 不是数据面对象，但仍含指令 argv（控制面允许）；扫描器按字段名不命中，需文档声明其归属"
+    }
+  }
+}

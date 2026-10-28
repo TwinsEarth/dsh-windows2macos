@@ -1,4 +1,5 @@
 import { projectResultEnvelope } from './p0-projection.mjs';
+import { deleteOfferJournal, pruneOfferJournals, readOfferJournal, writeOfferJournal } from './offer-journal.mjs';
 /**
  * W2M Rabbit relay — in-memory state machine.
  *
@@ -462,6 +463,9 @@ export class RabbitState {
     this._randomChars = options.randomChars
       ?? ((n) => { const a = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'; const b = randomBytes(n); let s = ''; for (let i = 0; i < n; i += 1) s += a[b[i] % a.length]; return s; });
 
+    // R8: the offer journal lives next to the ledger, so the relay hands its Persistence down.
+    this.persistence = options.persistence ?? null;
+
     this.protocolVersion = PROTOCOL_VERSION;
     this.eventBufferSize = options.eventBufferSize ?? DEFAULT_EVENT_BUFFER_SIZE;
     /**
@@ -781,7 +785,8 @@ export class RabbitState {
           this.replayWarnings.push({ type: entry?.type ?? '<unknown>', message: err.message });
         }
       }
-      return { revived_devices: this.devices.size, revived_tasks: revivedTasks };
+      if (typeof this.persistence?.dir === 'string') pruneOfferJournals(this.persistence.dir, new Set(this.tasks.keys()));
+    return { revived_devices: this.devices.size, revived_tasks: revivedTasks };
     } finally {
       this._restoring = false;
     }
@@ -800,10 +805,14 @@ export class RabbitState {
         if (!t || typeof t.task_id !== 'string') return false;
         const createdAt = Number.isFinite(t.created_at_ms) ? t.created_at_ms : Date.parse(entry.ts ?? '');
 
+        const journal = typeof this.persistence?.dir === 'string' ? readOfferJournal(this.persistence.dir, t.task_id) : null;
+        const recoveredArgv = Array.isArray(journal?.argv) && journal.argv.length > 0 ? journal.argv : (Array.isArray(t.command_argv) ? t.command_argv : []);
+        const recoveredStages = Array.isArray(journal?.stages) && journal.stages.length > 0 ? journal.stages : (Array.isArray(t.stages) ? t.stages : null);
         const task = {
           task_id: t.task_id,
           mode: t.mode ?? 'replicate',
-          command_argv: t.command_argv ?? [],
+          command_argv: recoveredArgv,
+          stages: recoveredStages,
           cwd_rel: t.cwd_rel ?? '.',
           cwd_outside_project: t.cwd_outside_project === true,
           index_total: t.index_total ?? 1,
@@ -816,12 +825,16 @@ export class RabbitState {
           requirements: t.requirements ?? {},
           compare_policy: t.compare_policy ?? {},
           halt: t.halt ?? 'never',
-      ...(t.mode === 'mapreduce' ? { reduce_argv: Array.isArray(t.reduce_argv) ? t.reduce_argv : null, reducer_machine_id: t.reducer_machine_id ?? null } : {}),
+      ...(t.mode === 'mapreduce' ? { reduce_argv: Array.isArray(journal?.reduce_argv) ? journal.reduce_argv : (Array.isArray(t.reduce_argv) ? t.reduce_argv : null), reducer_machine_id: t.reducer_machine_id ?? null } : {}),
       max_attempts: Number.isInteger(t.max_attempts) ? t.max_attempts : 1,
       retry_on: Array.isArray(t.retry_on) ? t.retry_on : [],
           created_by: t.created_by ?? null,
           created_at_ms: Number.isFinite(createdAt) ? createdAt : this.nowMs(),
           command_hash: t.command_hash ?? null,
+          plan_sha256: t.plan_sha256 ?? null,
+          approval_sha256: t.approval_sha256 ?? null,
+          step_id: t.step_id ?? null,
+          ...(Array.isArray(journal?.argv) && journal.argv.length > 0 ? {} : { offer_unavailable: true }),
           attempt: t.attempt ?? 1,
           // v1.2.7: a revived task keeps its graph edges and assignment, or the scheduler silently becomes a different scheduler.
           depends_on: Array.isArray(t.depends_on) ? t.depends_on : [],
@@ -1777,9 +1790,13 @@ export class RabbitState {
     const now = this.nowMs();
     const cwdRel = typeof input.cwd_rel === 'string' && input.cwd_rel ? input.cwd_rel : '.';
     const baseTree = input.base_tree ?? null;
-    const commandHash = input.command_hash ?? (isPipeline
+    const derivedCommandHash = isPipeline
       ? computePipelineCommandHash(stages, SHELL_ID_DIRECT)
-      : computeCommandHash(commandArgv, SHELL_ID_DIRECT, cwdRel));
+      : computeCommandHash(commandArgv, SHELL_ID_DIRECT, cwdRel);
+    if (input.command_hash !== undefined && input.command_hash !== derivedCommandHash) {
+      throw new ProtocolError('BAD_REQUEST', 'command_hash does not match command_argv', { declared: input.command_hash, derived: derivedCommandHash });
+    }
+    const commandHash = derivedCommandHash;
     const timeoutMs = Number.isInteger(input.timeout_ms) ? input.timeout_ms : 300_000;
 
     // v0.3.3 `broadcast`: one machine runs the command, every other machine is told the outcome.
@@ -1952,6 +1969,10 @@ export class RabbitState {
           (this.fleetId !== null ? { fleet_id: this.fleetId } : null))?.fleet_id ?? null,
       created_at_ms: now,
       command_hash: commandHash,
+      // v2 R5: a joint dispatch records which plan/approval/step it belongs to. Hashes only.
+      plan_sha256: /^[0-9a-f]{64}$/.test(String(input.plan_sha256 ?? '')) ? input.plan_sha256 : null,
+      approval_sha256: /^[0-9a-f]{64}$/.test(String(input.approval_sha256 ?? '')) ? input.approval_sha256 : null,
+      step_id: typeof input.step_id === 'string' && /^[a-z][a-z0-9_-]{0,31}$/.test(input.step_id) ? input.step_id : null,
       attempt: 1,
       // v1.2.4: the policy travels with the task so a revived relay can still decide to retry after a restart.
       max_attempts: maxAttempts,
@@ -2228,16 +2249,26 @@ export class RabbitState {
       }
     });
 
+    if (typeof this.persistence?.dir === 'string' && this.persistence.dir !== '') {
+      writeOfferJournal(this.persistence.dir, taskId, {
+        argv: commandArgv,
+        stages: stages ?? null,
+        reduce_argv: mode === 'mapreduce' ? reduceArgv : null,
+      });
+    }
     this.tasks.set(taskId, task);
 
     this._ledger({
       type: 'task.created',
       task: {
         task_id: task.task_id,
+      plan_sha256: task.plan_sha256 ?? null,
+      approval_sha256: task.approval_sha256 ?? null,
+      step_id: task.step_id ?? null,
         workspace: task.workspace ?? null,
         project_id: task.project_id,
         mode: task.mode,
-        command_argv: task.command_argv,
+        command_argv_len: Array.isArray(task.command_argv) ? task.command_argv.length : 0,
         cwd_rel: task.cwd_rel,
         cwd_outside_project: task.cwd_outside_project === true,
         index_total: task.index_total,
@@ -2358,6 +2389,11 @@ export class RabbitState {
   }
 
   emitOffer(task, lease) {
+    if (task.offer_unavailable === true || (Array.isArray(task.command_argv) && task.command_argv.length === 0)) {
+      // R8: a replayed task without its journal cannot be offered with an unknown command.
+      if (ACTIVE_LEASE_STATES.includes(lease.state)) { lease.state = 'expired'; lease.finished_at_ms = this.nowMs(); }
+      return;
+    }
     const event = this.emit('task.offer', {
       task_id: task.task_id,
       attempt: lease.attempt,
@@ -2651,6 +2687,9 @@ export class RabbitState {
   taskSummary(task) {
     return {
       task_id: task.task_id,
+      plan_sha256: task.plan_sha256 ?? null,
+      approval_sha256: task.approval_sha256 ?? null,
+      step_id: task.step_id ?? null,
       mode: task.mode,
       created_at: rfc3339(task.created_at_ms),
       created_by: task.created_by,
@@ -2744,6 +2783,7 @@ export class RabbitState {
     for (const lease of task.leases.values()) {
       if (ACTIVE_LEASE_STATES.includes(lease.state)) lease.state = 'cancelled';
     }
+    if (typeof this.persistence?.dir === 'string') deleteOfferJournal(this.persistence.dir, taskId);
     this.emit('task.cancel', { task_id: taskId, reason });
     this._ledger({ type: 'task.cancelled', task_id: taskId, reason });
     return task;

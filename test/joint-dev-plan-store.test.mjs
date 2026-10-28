@@ -97,7 +97,7 @@ describe('plan store: approval gate', () => {
     savePlan({ stateDir: dir, plan });
     const approved = approvePlan({ stateDir: dir, planSha: plan.plan_sha256, approver: 'op', authority: 50 });
     assert.equal(approved.ok, false);
-    assert.equal(approved.code, 'APPROVAL_AUTHORITY_TOO_LOW');
+    assert.equal(approved.code, 'APPROVAL_AUTHORITY_INVALID');
   });
 
   it('allows dispatch after a valid approval and rejects expiry', () => {

@@ -30,6 +30,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { after, describe, it } from 'node:test';
 
+// Isolate the secure token file: these tests own their operator-token inputs (config or env).
+process.env.W2M_OPERATOR_TOKEN_FILE = path.join(os.tmpdir(), 'w2m-tools-test-no-token-' + process.pid);
+
 import * as plugin from '../src/plugin/tools.mjs';
 import { MATCH_REFUSAL } from '../src/agent/allowed-commands.mjs';
 import { hasPathSeparator, resolveCommand } from '../src/agent/resolve.mjs';

@@ -1796,7 +1796,10 @@ describe('reports', () => {
     assert.match(md, /divergent/);
     assert.match(md, /head_commit/);
     assert.match(md, /Step 3/);
-    assert.match(md, /\["node","--test"\]/);
+    // R8: the report names the command by hash, never by argv.
+    assert.match(md, /命令指纹/);
+    assert.match(md, /command_hash:/);
+    assert.equal(md.includes('["node","--test"]'), false);
   });
 
   it('GET /v1/tasks lists tasks with a limit', async () => {

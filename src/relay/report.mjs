@@ -614,10 +614,13 @@ export function renderReportMarkdown(agg, task = null) {
     L.push('');
   }
   if (task) {
-    L.push('## 原始命令');
+    // R8: the markdown report is readable by any paired device token, so it must never carry the
+    // command itself. The hash is the command identity; the length is the only shape we expose.
+    L.push('## 命令指纹');
     L.push('');
     L.push('```');
-    L.push(jcs(task.command_argv));
+    L.push('command_hash: ' + (typeof task.command_hash === 'string' ? task.command_hash : '-'));
+    L.push('command_argv_len: ' + (Array.isArray(task.command_argv) ? task.command_argv.length : '-'));
     L.push('```');
     L.push('');
   }

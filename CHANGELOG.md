@@ -7,7 +7,12 @@
 
 All notable changes to this project are documented here.
 
-## [2.0.0-beta.1] - 2026-10-28
+## [1.9.17] - 2026-10-28
+
+- 修复左侧栏 GPW 入口只剩小图标：恢复 🌐 GPW 文字（侧栏 label 仍为空，不会重复）。
+- 对话全文搜索高亮加强：命中项绿色文字 + 黄色背景（::highlight(w2m-conversation-search) 与 .w2mSearchMark 双样式），主工作区正文中直接可见；显示 当前/总数，Enter/Shift+Enter 或 ↑/↓ 跳转，Esc 清除。
+
+### [2.0.0-beta.1]（pre-release） - 2026-10-28
 
 首个联合开发 beta（S0–S1）。
 

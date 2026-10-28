@@ -21,9 +21,13 @@ import { readFileSync } from 'node:fs';
 
 import { buildControlEnvelopes, buildPlan } from '../src/plugin/joint-dev/dispatch.mjs';
 import { negotiateFeatures, readRelayCapabilities } from '../src/plugin/relay-capabilities.mjs';
+import { dispatchPlanToRelay } from '../src/plugin/joint-dev/relay-dispatch.mjs';
+import { readOperatorToken } from '../src/plugin/operator-token.mjs';
+import { ensureOperatorKey, signApprovalPayload } from '../src/plugin/operator-key.mjs';
 import {
   approvePlan,
   assertDispatchAllowed,
+  consumeApproval,
   listPlans,
   loadApproval,
   loadPlan,
@@ -55,7 +59,7 @@ if (stateDir === null) fail('STATE_DIR_REQUIRED', 'pass --state <dir> (the joint
 if (command === 'plan' && action === 'create') {
   if (typeof args.steps !== 'string') fail('STEPS_REQUIRED', 'pass --steps <steps.json>');
   let steps;
-  try { steps = JSON.parse(readFileSync(args.steps, 'utf8').replace(/^\\uFEFF/, '')); } catch (error) {
+  try { steps = JSON.parse(readFileSync(args.steps, 'utf8').replace(/^\uFEFF/, '')); } catch (error) {
     fail('STEPS_UNREADABLE', error instanceof Error ? error.message : String(error));
   }
   if (!Array.isArray(steps)) fail('STEPS_INVALID', 'steps.json must be a JSON array');
@@ -99,6 +103,10 @@ if (command === 'approve') {
   const authority = Number.parseInt(String(args.authority ?? ''), 10);
   if (!Number.isInteger(authority)) fail('AUTHORITY_REQUIRED', 'pass --authority <0..100>');
   const ttlMin = Number.parseInt(String(args['ttl-min'] ?? '10'), 10);
+  // decision 1/2: approvals are signed by the local operator Ed25519 key; the private key never
+  // leaves this machine, and only its fingerprint is printed.
+  const key = ensureOperatorKey();
+  if (key.ok !== true) fail(key.code ?? 'OPERATOR_KEY_MISSING', key.detail ?? null);
   const approved = approvePlan({
     stateDir,
     planSha: args.plan,
@@ -106,9 +114,14 @@ if (command === 'approve') {
     authority,
     note: typeof args.note === 'string' ? args.note : '',
     ttlMs: (Number.isFinite(ttlMin) ? ttlMin : 10) * 60_000,
+    signer: (body) => ({
+      sig: signApprovalPayload(body, key.privateKey),
+      key_id: key.key_id,
+      public_key_pem: key.publicKeyPem,
+    }),
   });
   if (approved.ok !== true) fail(approved.code ?? 'APPROVAL_FAILED', approved.detail ?? null);
-  print({ ok: true, approval: approved.approval, path: approved.path });
+  print({ ok: true, approval: approved.approval, path: approved.path, signed: approved.signed === true, operator_key_id: key.key_id });
   process.exit(0);
 }
 
@@ -117,12 +130,13 @@ if (command === 'status') {
   const plan = loadPlan({ stateDir, planSha: args.plan });
   if (plan.ok !== true) fail(plan.code ?? 'PLAN_NOT_FOUND');
   const approval = loadApproval({ stateDir, planSha: args.plan });
-  const gate = assertDispatchAllowed({ stateDir, planSha: args.plan });
+  const gate = assertDispatchAllowed({ stateDir, planSha: args.plan, requireSignature: args['allow-unsigned-approval'] !== true });
   print({
     ok: true,
     plan_sha256: plan.plan.plan_sha256,
     steps: plan.plan.steps.map((step) => ({ step_id: step.step_id, machine_id: step.machine_id, command_hash: step.command_hash })),
     approval: approval.ok ? { approver: approval.approval.approver, authority: approval.approval.authority, expires_at: approval.approval.expires_at } : { state: approval.code },
+    approval_strength: gate.strength ?? null,
     dispatch_allowed: gate.ok === true,
     blocked_by: gate.ok === true ? null : gate.code,
   });
@@ -131,10 +145,27 @@ if (command === 'status') {
 
 if (command === 'dispatch') {
   if (typeof args.plan !== 'string') fail('PLAN_REQUIRED', 'pass --plan <sha256>');
-  const gate = assertDispatchAllowed({ stateDir, planSha: args.plan });
+  const key = ensureOperatorKey();
+  const trusted = key.ok === true ? [key.key_id] : [];
+  const gate = assertDispatchAllowed({ stateDir, planSha: args.plan, requireSignature: args['allow-unsigned-approval'] !== true, trustedOperatorKeyIds: trusted });
   if (gate.ok !== true) fail(gate.code ?? 'APPROVAL_REQUIRED', 'dispatch refused before anything was sent');
+  const relayUrl = typeof args.relay === 'string' ? args.relay : null;
   if (args['dry-run'] !== true) {
-    fail('DISPATCH_NOT_WIRED', 'real dispatch is the next slice: it needs the operator token and a relay with target_machines/capability advertisement; use --dry-run to inspect the envelopes');
+    if (relayUrl === null) fail('RELAY_REQUIRED', 'real dispatch needs --relay <url>');
+    let token = null;
+    if (typeof args['token-file'] === 'string') {
+      token = readFileSync(args['token-file'], 'utf8').trim();
+    } else {
+      const secure = readOperatorToken();
+      token = secure.configured === true ? secure.token : null;
+    }
+    if (token === null) fail('OPERATOR_TOKEN_MISSING', 'run w2m-operator set --file <token file>, or pass --token-file');
+    // decision 2: one approval authorises exactly one dispatch.
+    const consumed = consumeApproval({ stateDir, planSha: args.plan, approvalSha: gate.approval.approval.approval_sha256 });
+    if (consumed.ok !== true) fail(consumed.code ?? 'APPROVAL_CONSUME_FAILED', consumed.detail ?? null);
+    const sent = await dispatchPlanToRelay({ rabbitUrl: relayUrl, token, plan: gate.plan, approval: gate.approval.approval });
+    print({ ...sent, plan_sha256: gate.plan.plan_sha256, relay: relayUrl });
+    process.exit(sent.ok === true ? 0 : 1);
   }
   let capabilities = null;
   let negotiation = null;

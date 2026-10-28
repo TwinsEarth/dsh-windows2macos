@@ -1,0 +1,35 @@
+{
+  "version": "2.0.0",
+  "case": "G0-3-202.182.123.154",
+  "kind": "positive",
+  "executed_at": "2026-10-28T03:50:51.939Z",
+  "executor": "lead",
+  "task_id": "g0-3-202.182.123.154-1793159451941",
+  "requirement": "relay 升级到 ≥1.9.16，广告 relay_version/features，持久面数据面对象为 0",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "method": "SSH (w2m-fleet-deploy) + tarball layout /opt/w2m/app, npm registry tgz sha256 verified",
+      "before": {
+        "relay_version": "1.9.12",
+        "features": null,
+        "blobs": 0
+      },
+      "after": {
+        "relay_version": "1.9.16",
+        "features": [
+          "target-machines",
+          "result-projection",
+          "guard-v1",
+          "relay-version-v1"
+        ],
+        "blobs": 0,
+        "blob_bytes": 0
+      },
+      "relay_id": "595a29b256890689",
+      "healthz": "http://202.182.123.154:8787/healthz",
+      "backup": "/opt/w2m/app.bak-* and /root/w2m-upgrade/<ts>/state on the host",
+      "rollback": "script trap restores previous app dir and service; not triggered"
+    }
+  }
+}

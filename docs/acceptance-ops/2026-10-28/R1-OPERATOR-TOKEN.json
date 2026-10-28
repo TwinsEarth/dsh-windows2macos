@@ -1,0 +1,19 @@
+{
+  "version": "2.0.0",
+  "case": "R1-OPERATOR-TOKEN",
+  "kind": "positive",
+  "executed_at": "2026-10-28T03:50:51.939Z",
+  "executor": "lead",
+  "task_id": "r1-token-1793159451943",
+  "requirement": "operator token 通过 0600 文件安全写入，状态只显示指纹",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "path": "C:/Users/fangw/.w2m/operator-token",
+      "source": "file",
+      "fingerprint": "209e400801c6",
+      "value_handling": "token read from relay unit/state by the operator, written via --file, temp file deleted; never printed",
+      "note": "running DSH process must be restarted to pick the file into w2m_run"
+    }
+  }
+}

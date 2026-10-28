@@ -1,0 +1,51 @@
+{
+  "version": "2.0.0",
+  "case": "R3-CAPABILITIES",
+  "kind": "positive",
+  "executed_at": "2026-10-28T03:50:51.939Z",
+  "executor": "lead",
+  "task_id": "r3-capabilities-1793159451943",
+  "requirement": "三台 relay 广告 relay_version/features；客户端能力协商通过；旧 relay 仍 fail-closed",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "relays": [
+        {
+          "host": "43.142.74.71",
+          "relay_version": "1.9.16",
+          "features": [
+            "target-machines",
+            "result-projection",
+            "guard-v1",
+            "relay-version-v1"
+          ],
+          "blobs": 0
+        },
+        {
+          "host": "106.53.197.47",
+          "relay_version": "1.9.16",
+          "features": [
+            "target-machines",
+            "result-projection",
+            "guard-v1",
+            "relay-version-v1"
+          ],
+          "blobs": 0
+        },
+        {
+          "host": "202.182.123.154",
+          "relay_version": "1.9.16",
+          "features": [
+            "target-machines",
+            "result-projection",
+            "guard-v1",
+            "relay-version-v1"
+          ],
+          "blobs": 0
+        }
+      ],
+      "client_negotiation": "w2m-joint dispatch --dry-run --relay http://43.142.74.71:8787 -> relay_negotiation.ok=true",
+      "fail_closed": "old relay without features still returns RELAY_CAPABILITIES_MISSING (unit test)"
+    }
+  }
+}

@@ -81,6 +81,16 @@ export function projectLedgerLine(line) {
   try { record = JSON.parse(line); } catch { return { changed: false, line }; }
   // Real ledger lines nest the envelope one level down: {type:'result.stored', result:{envelope:{...}}}.
   // Handle that shape first, then the flat result, then a bare envelope record.
+  // v2 R8: a legacy task record still carries the command itself. Project it to hash + length,
+  // so the scrub can bring old ledgers in line with "persist only metadata".
+  if (record?.type === 'task.created' && record.task && typeof record.task === 'object') {
+    const task = record.task;
+    if (!Array.isArray(task.command_argv)) return { changed: false, line };
+    task.command_argv_len = task.command_argv.length;
+    delete task.command_argv;
+    record.projection = { dropped: ['task.command_argv'], at: new Date().toISOString() };
+    return { changed: true, line: JSON.stringify(record) };
+  }
   let holder = null;
   if (record?.result && typeof record.result === 'object' && record.result.envelope && typeof record.result.envelope === 'object') holder = { parent: record.result, key: 'envelope' };
   else if (record?.result && typeof record.result === 'object') holder = { parent: record, key: 'result' };
