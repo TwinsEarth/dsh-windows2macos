@@ -11,10 +11,21 @@ import { guardBlobRoute, guardResultEnvelope, guardTaskBody } from './redline-gu
 
 import http from 'node:http';
 import https from 'node:https';
+import { createRequire } from 'node:module';
+
+/** The relay's own version, from the package it was installed from (W2M_RELAY_VERSION overrides). */
+function readRelayVersion() {
+  try {
+    const pkg = createRequire(import.meta.url)('../../package.json');
+    if (typeof pkg?.version === 'string' && pkg.version !== '') return pkg.version;
+  } catch { /* packaged without package.json */ }
+  return process.env.W2M_RELAY_VERSION ?? 'unknown';
+}
+export const RELAY_VERSION = readRelayVersion();
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createHash, randomBytes } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 
 import {
   MAX_FRAME_BYTES,
@@ -698,8 +709,12 @@ export class RelayServer {
     const path = normalizePath(stripped);
     // B3/V12：basePath 剥离与 URL 规范化之后立即拒绝数据面 blob 路由，
     // 覆盖 `..`、`%2e%2e`、basePath 前缀等变形；在读取 body 之前返回。
-    if (path === '/v1/fleet/blob-sessions' || path.startsWith('/v1/fleet/blob-sessions/')
-        || path === '/v1/fleet/blob-latest' || path.startsWith('/v1/fleet/blobs')) {
+    // Percent-encoded dot segments are not resolved by WHATWG URL, so the gate resolves them itself:
+    const gatePath = (() => {
+      try { return normalizePath(new URL(decodeURIComponent(path), 'http://gate.invalid').pathname); } catch { return path; }
+    })();
+    if (gatePath === '/v1/fleet/blob-sessions' || gatePath.startsWith('/v1/fleet/blob-sessions/')
+        || gatePath === '/v1/fleet/blob-latest' || gatePath.startsWith('/v1/fleet/blobs')) {
       const refusal = guardBlobRoute(method);
       return sendJson(res, refusal.status, refusal.body);
     }
@@ -1233,151 +1248,6 @@ export class RelayServer {
       const { _instanceKey, ...clean } = result;
       return sendJson(res, 200, clean);
     }
-    /**
-     * v1.3.10-beta.20: chunked blob sessions (M6). A >64 KiB artifact is uploaded in idempotent chunks and only becomes a
-     * blob when the assembled bytes hash to the declared sha256; the session answers "which chunks are missing" so an
-     * interrupted upload resumes instead of restarting.
-     */
-    const blobSessionCreate = method === 'POST' && path === '/v1/fleet/blob-sessions';
-    const blobSessionChunk = /^\/v1\/fleet\/blob-sessions\/([^/]+)\/chunks\/([0-9]+)$/.exec(path);
-    const blobSessionCommit = /^\/v1\/fleet\/blob-sessions\/([^/]+)\/commit$/.exec(path);
-    const blobSessionStatus = /^\/v1\/fleet\/blob-sessions\/([^/]+)$/.exec(path);
-    if (blobSessionCreate || blobSessionChunk !== null || blobSessionCommit !== null || blobSessionStatus !== null) {
-      const wrap = (fn) => { try { return fn(); } catch (error) { if (typeof error?.code === "string") throw new ProtocolError(error.code, error.message, error.detail ?? null); throw error; } };
-      if (blobSessionCreate) {
-        const body = takeJson();
-        const created = wrap(() => this.state.blobSessions.create({ machineId: device.machine_id, sha256: body?.sha256, size: body?.size, chunkBytes: body?.chunk_bytes }));
-        return sendJson(res, 201, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ...created });
-      }
-      if (method === 'PUT' && blobSessionChunk !== null) {
-        const data = rawBody ?? Buffer.alloc(0);
-        const stored = wrap(() => this.state.blobSessions.putChunk({ sessionId: decodeURIComponent(blobSessionChunk[1]), index: Number(blobSessionChunk[2]), data }));
-        return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ...stored });
-      }
-      if (method === 'POST' && blobSessionCommit !== null) {
-        const committed = wrap(() => this.state.blobSessions.commit({ sessionId: decodeURIComponent(blobSessionCommit[1]) }));
-        return sendJson(res, committed.ok === true ? 201 : 409, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ...committed });
-      }
-      if (method === 'GET' && blobSessionStatus !== null) {
-        const status = wrap(() => this.state.blobSessions.status({ sessionId: decodeURIComponent(blobSessionStatus[1]) }));
-        return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ...status });
-      }
-      throw new ProtocolError('BAD_REQUEST', 'a blob session is created with POST, chunks with PUT, committed with POST', {});
-    }
-
-    /**
-     * v1.0.7: the content-addressed blob channel (#1).
-     *
-     * ## Why the relay may carry bytes at all
-     *
-     * It persists `stdout_sha256` and never the text, and `src/agent/storage.mjs` records why: each machine's
-     * `memory.jsonl` is the only durable copy of what a command printed. **That invariant is about the relay not
-     * interpreting content** -- it never decides what bytes mean and never asserts they are authentic.
-     *
-     * A blob keyed by its own hash preserves exactly that. The relay still interprets nothing; **the hash is what
-     * says the bytes are the bytes**, exactly as `stdout_sha256` does for a result. What is new is only that a hash
-     * the relay already holds can have its bytes fetched from the same place.
-     *
-     * ## Why the hash is verified before storing
-     *
-     * A content-addressed store that accepts bytes under a key they do not hash to is not content-addressed -- the
-     * key stops being a claim about the content, and every later reader's verification becomes decorative. So a
-     * mismatch is **refused (422)**, never stored and never corrected: correcting it would silently re-key a blob
-     * the caller believes it stored under a different name.
-     *
-     * ## Fleet scoping
-     *
-     * `putFleetBlob`/`getFleetBlob` reuse `scopeFleetId`, the same rule task dispatch obeys. A blob written by one
-     * fleet is **not readable by another**, and the read refusal is a 404 rather than a 403: a distinguishable
-     * "not yours" tells a prober that the hash exists here.
-     */
-    /**
-     * v1.0.9: **which blob this fleet published last** -- the discovery half of the channel.
-     *
-     * Checked **before** the `<sha256>` matcher deliberately. The matcher only accepts 64 hex characters, so
-     * `latest` cannot collide with it today; **the ordering is asserted anyway**, because "these two patterns cannot
-     * conflict" is exactly the reasoning that produces a shadowed route the day one of them is relaxed.
-     *
-     * A fleet that has never published gets a 404 rather than an empty object: "there is no current document" and
-     * "the current document is nothing" are different statements, and only one of them is true here.
-     */
-    if (method === 'GET' && path === '/v1/fleet/blobs/latest') {
-      const latest = this.state.latestFleetBlob(device);
-      if (latest === null) {
-        throw new ProtocolError('NOT_FOUND', 'this fleet has published no blob', {});
-      }
-      return sendJson(res, 200, {
-        protocol_version: PROTOCOL_VERSION,
-        hash: latest.hash,
-        bytes: latest.bytes,
-        published_at: new Date(latest.published_at_ms).toISOString(),
-        published_by: latest.published_by ?? null,
-        // Stated in the payload, not only in the docs: a pointer can outlive its blob under oldest-first eviction.
-        hint: 'a hint, not a guarantee -- a pull may answer 404 if the blob has since been evicted',
-      });
-    }
-
-    const blobMatch = /^\/v1\/fleet\/blobs\/([0-9a-f]{64})$/.exec(path);
-    if (blobMatch !== null) {
-      const hash = blobMatch[1];
-      if (method === 'PUT') {
-        const received = rawBody ?? Buffer.alloc(0);
-        const actual = createHash('sha256').update(received).digest('hex');
-        if (actual !== hash) {
-          throw new ProtocolError('BLOB_HASH_MISMATCH', 'the body does not hash to the key it was sent under', {
-            expected: hash,
-            actual,
-            bytes: received.length,
-          });
-        }
-        const stored = this.state.putFleetBlob(device, received);
-        if (stored.ok !== true) {
-          throw new ProtocolError(stored.reason ?? 'BLOB_WRITE_FAILED', stored.detail ?? 'the blob was refused', {
-            hash,
-          });
-        }
-        return sendJson(res, 201, {
-          protocol_version: PROTOCOL_VERSION,
-          ok: true,
-          hash: stored.hash,
-          bytes: stored.bytes,
-          evicted: stored.evicted,
-        });
-      }
-      if (method === 'GET') {
-        const bytes = this.state.getFleetBlob(device, hash);
-        if (bytes === null) {
-          // Same code and shape for "no such blob" and "not your fleet's" -- deliberately indistinguishable.
-          throw new ProtocolError('NOT_FOUND', 'no such blob is readable by this device', { hash });
-        }
-        const rangeParam = url.searchParams.get('range');
-        if (rangeParam !== null) {
-          const match = /^([0-9]+)-([0-9]+)$/.exec(rangeParam);
-          if (match === null) throw new ProtocolError('BAD_REQUEST', 'range must be start-end', { range: rangeParam });
-          const start = Number(match[1]);
-          const end = Math.min(Number(match[2]), bytes.length - 1);
-          if (!(start >= 0 && start <= end && start < bytes.length)) throw new ProtocolError('BAD_REQUEST', 'range is outside the blob', { range: rangeParam, bytes: bytes.length });
-          const slice = bytes.subarray(start, end + 1);
-          res.writeHead(206, {
-            'content-type': 'application/octet-stream',
-            'content-length': slice.length,
-            'content-range': 'bytes ' + start + '-' + end + '/' + bytes.length,
-            'cache-control': 'no-store',
-          });
-          res.end(slice);
-          return true;
-        }
-        res.writeHead(200, {
-          'content-type': 'application/octet-stream',
-          'content-length': bytes.length,
-          // Same reason as `/metrics`: a memory document must not be cached by an intermediary.
-          'cache-control': 'no-store',
-        });
-        res.end(bytes);
-        return true;
-      }
-      throw new ProtocolError('BAD_REQUEST', 'a blob is addressed with PUT or GET', { method });
-    }
 
     if (method === 'GET' && path === '/v1/devices') {
         /**
@@ -1721,6 +1591,7 @@ export class RelayServer {
       rabbit_time: this.state.nowIso(),
       uptime_ms: this.state.nowMs() - this._startedAtMs,
       relay_id: this.relayId,
+    version: RELAY_VERSION,
       started_at: rfc3339(this._startedAtMs),
       effective_scheme: this.effectiveScheme(req),
       base_path: this.basePath,

@@ -55,6 +55,23 @@ export function projectResultEnvelope(envelope) {
       dropped.push(field);
     }
   }
+  // NESTED: pipeline.stages[].command_argv and friends are content too. The top-level sweep above
+  // cannot see them, and a real ledger line carries exactly that shape.
+  const NESTED_CONTENT = [...CONTENT_FIELDS, 'changed_files'];
+  const walk = (value, path) => {
+    if (value === null || typeof value !== 'object') return;
+    if (Array.isArray(value)) { value.forEach((entry, index) => walk(entry, path + '[' + index + ']')); return; }
+    for (const key of Object.keys(value)) {
+      const keyPath = path === '' ? key : path + '.' + key;
+      if (NESTED_CONTENT.includes(key)) {
+        delete value[key];
+        dropped.push(keyPath);
+        continue;
+      }
+      walk(value[key], keyPath);
+    }
+  };
+  walk(projected, '');
   return { projected, dropped, argv_hash: argvHash };
 }
 
@@ -62,11 +79,16 @@ export function projectResultEnvelope(envelope) {
 export function projectLedgerLine(line) {
   let record;
   try { record = JSON.parse(line); } catch { return { changed: false, line }; }
-  const target = record?.result ?? record?.envelope;
-  if (target === null || typeof target !== 'object') return { changed: false, line };
-  const { projected, dropped } = projectResultEnvelope(target);
+  // Real ledger lines nest the envelope one level down: {type:'result.stored', result:{envelope:{...}}}.
+  // Handle that shape first, then the flat result, then a bare envelope record.
+  let holder = null;
+  if (record?.result && typeof record.result === 'object' && record.result.envelope && typeof record.result.envelope === 'object') holder = { parent: record.result, key: 'envelope' };
+  else if (record?.result && typeof record.result === 'object') holder = { parent: record, key: 'result' };
+  else if (record?.envelope && typeof record.envelope === 'object') holder = { parent: record, key: 'envelope' };
+  if (holder === null) return { changed: false, line };
+  const { projected, dropped } = projectResultEnvelope(holder.parent[holder.key]);
   if (dropped.length === 0) return { changed: false, line };
-  if (record.result !== undefined) record.result = projected; else record.envelope = projected;
+  holder.parent[holder.key] = projected;
   record.projection = { dropped, at: new Date().toISOString() };
   return { changed: true, line: JSON.stringify(record) };
 }

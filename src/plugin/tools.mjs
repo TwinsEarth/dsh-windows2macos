@@ -4249,6 +4249,7 @@ export async function apply(ctx, config = {}) {
       const originMachineId =
         typeof p2p.machineId === 'string' && p2p.machineId !== '' ? p2p.machineId : null;
 
+
       /**
        * v0.4.x: the punch this dispatch will use, published with the task so the executor can join
        * the same session instead of waiting to be reached. See {@link buildP2POfferBlock} for why the
@@ -4313,7 +4314,33 @@ export async function apply(ctx, config = {}) {
         p2p: p2pOffer,
       };
 
-      const result = await request({
+            // v2/S1: a narrowed dispatch is revalidated against the relay roster immediately before the
+      // POST, so a machine that went away after the composer selection is a named refusal rather
+      // than a task that expires with no executor.
+      const narrowedTo = selectionAppliedAs === 'executor_machine_id' || selectionAppliedAs === 'target_machines'
+        ? (selection?.machine_id ?? null)
+        : (executorMachineId ?? null);
+      if (narrowedTo !== null) {
+        // A roster read is a best-effort guard: if it fails, the relay itself still decides and the
+        // post-dispatch lease check below remains the authority on whether the narrowing held.
+        let preflight = null;
+        try {
+          preflight = await readFleet({ rabbitUrl: base, token, localMachineId: null, signal: exec?.signal, request });
+        } catch { preflight = null; }
+        if (preflight.ok === true) {
+          const listed = (preflight.devices ?? []).find((device) => device?.machine_id === narrowedTo);
+          const online = listed !== undefined && (listed.state === 'online' || listed.state === undefined);
+          if (!online) {
+            throw new W2MError(
+              'TARGET_UNAVAILABLE',
+              `TARGET_UNAVAILABLE: the target machine ${narrowedTo} is not online on the relay right now; nothing was dispatched and no other machine was chosen`,
+              { hint: 'pick another machine in the composer, or clear the selection to dispatch to the whole fleet' },
+            );
+          }
+        }
+      }
+
+const result = await request({
         rabbitUrl: base,
         token,
         signal: exec?.signal,
@@ -4346,7 +4373,29 @@ export async function apply(ctx, config = {}) {
         );
       }
 
-      /**
+      // v2/S1: the relay's own lease list is the proof that the narrowing was honoured. A lease on a
+      // machine that was not named means the dispatch widened (old relay ignoring the field, or a
+      // routing bug): cancel and refuse rather than let the wrong machines run.
+      if (narrowedTo !== null) {
+        const leases = Array.isArray(result.json?.leases) ? result.json.leases : [];
+        const executing = leases.filter((lease) => lease?.state !== 'observing');
+        const foreign = executing.filter((lease) => lease?.machine_id !== narrowedTo);
+        if (foreign.length > 0) {
+          const taskId = result.json?.task_id ?? null;
+          if (taskId !== null) {
+            try {
+              await request({ rabbitUrl: base, token, signal: exec?.signal, method: 'POST', pathname: '/v1/tasks/' + encodeURIComponent(taskId) + '/cancel', body: { reason: 'SELECTION_NOT_HONOURED' } });
+            } catch { /* the refusal below is still the answer */ }
+          }
+          throw new W2MError(
+            'SELECTION_NOT_HONOURED',
+            'SELECTION_NOT_HONOURED: this dispatch named ' + narrowedTo + ', but the relay leased ' + (foreign.map((lease) => lease.machine_id).join(', ') || 'no machine') + '; the task was cancelled',
+            { hint: 'upgrade the relay to a version that honours target_machines/executor_machine_id, or clear the selection' },
+          );
+        }
+      }
+
+/**
        * v0.4.0 §7: best-effort direct pushes, after the relay has the task.
        *
        * Order matters and is deliberate. The task exists on the relay *before* anything is punched,

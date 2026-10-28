@@ -1,0 +1,20 @@
+{
+  "version": "1.9.12",
+  "case": "RELEASE-1912",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-28T00:07:11.551Z",
+  "executor": "lead",
+  "task_id": "pre-release-1912-1793146031552",
+  "requirement": "V1.9.12：联合开发安全门（plan/approval）与选中真实性（派发前重校验 + 派发后租约校验）",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "plan_store": "plan hash recompute, traversal refusal, approval signature/TTL, atomic write; 11 tests",
+      "selection": "pre-dispatch roster revalidation (TARGET_UNAVAILABLE) and post-dispatch foreign-lease refusal (SELECTION_NOT_HONOURED)",
+      "tests": "tools/broadcast/fleet-target 209/209 green"
+    }
+  }
+}

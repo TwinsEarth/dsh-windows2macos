@@ -8,25 +8,11 @@ import {
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 
+import { projectLedgerLine } from './p0-projection.mjs';
+
 export const LEDGER_CONTENT_FIELDS = ['stdout_head', 'stdout_tail', 'stderr_head', 'stderr_tail', 'command_argv', 'pipeline_hash_material', 'changed_files'];
 const sha256 = (buf) => createHash('sha256').update(buf).digest('hex');
 
-function projectLedgerLine(line) {
-  let record;
-  try { record = JSON.parse(line); } catch { return { changed: false, line }; }
-  const result = record?.result ?? record?.envelope ?? null;
-  if (result === null || typeof result !== 'object') return { changed: false, line };
-  let changed = false;
-  for (const field of LEDGER_CONTENT_FIELDS) {
-    if (field in result) { delete result[field]; changed = true; }
-  }
-  if ('patch_sha256' in result) { result.patch_sha256 = null; changed = true; }
-  if ('workspace' in result && typeof result.workspace === 'object' && result.workspace !== null) {
-    if ('changed_files' in result.workspace) { delete result.workspace.changed_files; changed = true; }
-    if ('patch_sha256' in result.workspace) { result.workspace.patch_sha256 = null; changed = true; }
-  }
-  return { changed, line: changed ? JSON.stringify(record) : line };
-}
 
 /** 清理 ledger：默认 dry-run；apply 时备份 .bak-<ts> 后原子替换。 */
 export function scrubLedger(ledgerPath, { dryRun = true, now = Date.now() } = {}) {
@@ -73,11 +59,15 @@ export function scanForContent(rootDir, markers = []) {
   const hits = [];
   const walk = (dir) => {
     for (const name of readdirSync(dir)) {
+      // Backups/temporaries are not live state: they hold the bytes the scrub just moved out.
+      if (/\.bak-|\.tmp-|\.corrupt-/.test(name)) continue;
       const path = join(dir, name);
       const stat = statSync(path);
       if (stat.isDirectory()) { walk(path); continue; }
       if (stat.size > 32 * 1024 * 1024) continue;
-      const text = readFileSync(path, 'utf8');
+      // The projection metadata names the dropped fields; scanning it for those names would report
+      // the scrub itself as a leak, so it is removed before the marker check.
+      const text = readFileSync(path, 'utf8').replace(/"projection"\s*:\s*\{[^{}]*\}/g, '');
       for (const field of LEDGER_CONTENT_FIELDS) {
         if (text.includes('"' + field + '"')) hits.push({ file: path, marker: field });
       }

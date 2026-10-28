@@ -31,7 +31,7 @@ describe('relay red-line audit: single guard entry', () => {
   it('the refusal runs after path normalisation and before routing', () => {
     const s = read('src/relay/server.mjs');
     const normalise = s.indexOf('const path = normalizePath(stripped);');
-    const gate = s.indexOf("path === '/v1/fleet/blob-sessions'");
+    const gate = s.indexOf("gatePath === '/v1/fleet/blob-sessions'");
     const firstRoute = s.indexOf("method === 'GET' && path === '/healthz'");
     assert.ok(normalise > 0, 'the request path is normalised');
     assert.ok(gate > normalise, 'the gate must see the normalised path');
@@ -85,12 +85,13 @@ describe('relay red-line audit: projection is wired', () => {
 });
 
 describe('relay red-line audit: blob endpoints retired', () => {
-  it('legacy blob handlers sit strictly after the refusal', () => {
+  it('legacy blob handlers are removed; only the refusal remains', () => {
     const s = read('src/relay/server.mjs');
-    const gate = s.indexOf("path.startsWith('/v1/fleet/blobs')");
-    const legacySession = s.indexOf("const blobSessionCreate = method === 'POST'");
-    assert.ok(gate > 0, 'the blob gate exists');
-    assert.ok(legacySession > gate, 'legacy handlers are unreachable before the gate');
+    assert.ok(s.indexOf("gatePath.startsWith('/v1/fleet/blobs')") > 0, 'the blob gate exists');
+    for (const symbol of ['blobSessionCreate', 'putFleetBlob', 'getFleetBlob', 'latestFleetBlob']) {
+      assert.equal(s.includes(symbol), false, 'legacy symbol removed: ' + symbol);
+    }
+    assert.equal(/const blobMatch = .*fleet\/blobs/.test(s), false, 'the blob route matcher is gone');
   });
 
   it('the guard answers 403 with a machine-readable code', () => {

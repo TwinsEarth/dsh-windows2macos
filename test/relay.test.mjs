@@ -42,7 +42,7 @@ import {
   sha256Hex,
 } from '../src/relay/state.mjs';
 import { AGGREGATE_STATUSES, aggregate, aggregateTask, renderReportMarkdown } from '../src/relay/report.mjs';
-import { createRelayServer, normalizeBasePath, SlidingWindowRateLimiter } from '../src/relay/server.mjs';
+import { createRelayServer, normalizeBasePath, RELAY_VERSION, SlidingWindowRateLimiter } from '../src/relay/server.mjs';
 import { Persistence } from '../src/relay/persistence.mjs';
 import { encodeFleetKey, fleetIdFromKey } from '../src/chatops/fleet-join.mjs';
 
@@ -611,6 +611,7 @@ describe('auth (§1/§7)', () => {
     assert.equal(res.status, 200);
     assert.equal(res.json.ok, true);
     assert.equal(res.json.protocol_version, 1);
+    assert.equal(res.json.version, RELAY_VERSION, 'healthz carries the relay software version');
   });
 
   it('every protected route answers 401 without a token, with the §7 shape', async () => {

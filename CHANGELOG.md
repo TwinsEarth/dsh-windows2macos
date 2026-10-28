@@ -7,6 +7,12 @@
 
 All notable changes to this project are documented here.
 
+## [1.9.12] - 2026-10-28
+
+- 联合开发安全门（S1/S2 预置）：plan-store 保存与读取都重算 plan_sha256（篡改即 PLAN_TAMPERED）、planSha 强制 64 位十六进制（拒绝路径穿越）、审批绑定 plan_sha/approver/authority/TTL 并重算 approval_sha256（篡改/过期/低权限拒绝）、原子写。
+- 全部机器选中真实性（S1）：w2m_run 在派发前用当前设备名册重校验被选机器（离线即 TARGET_UNAVAILABLE，不换机）；派发后按 relay 的 leases 校验，发现未被点名的机器也拿到租约即取消任务并返回 SELECTION_NOT_HONOURED。
+- 新增 test/joint-dev-plan-store.test.mjs（11 项）。
+
 ## [1.9.11] - 2026-10-28
 
 - 修复左侧栏只剩图标：GPW 名称恢复到入口内（🌐 GPW），侧栏 label 仍为空，避免再次重复。
