@@ -1,0 +1,22 @@
+{
+  "version": "2.0.3",
+  "case": "RELEASE-2030",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-28T10:35:33.753Z",
+  "executor": "lead",
+  "task_id": "pre-release-2030-1793183733754",
+  "requirement": "v2.0.3：滚动按钮移到会话区右上黑框位置并变黑；自动点击“加载更早”解除虚拟列表阻断；点击 3 轮、连续 3 次到顶",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "position": "conversation column top-right, 8px inset from surface top, right edge aligned",
+      "style": "34px circle, no border, elevation shadow, label-primary icon via theme tokens",
+      "load_earlier": "auto-click before scrolling at top and repeatedly during scroll-to-top",
+      "interaction": "click 3 turns; 3 clicks within 1.2s to top",
+      "tests": "client-bundle 26/26, lint 0 errors"
+    }
+  }
+}
