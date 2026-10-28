@@ -1,0 +1,21 @@
+{
+  "version": "1.9.21",
+  "case": "RELEASE-1921",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-28T08:19:50.383Z",
+  "executor": "lead",
+  "task_id": "pre-release-1921-1793175590384",
+  "requirement": "v1.9.21 主插件：仅保留与 Relay 配套的 HMAC 上报模块（隐藏、默认关闭），删除本机隐藏能力；不发子插件、不部署 relay",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "scope": "main plugin only; no sub-plugin, no relay deployment",
+      "retained": "src/util/tofuture-hmac.mjs, src/plugin/tofuture/report.mjs, src/relay/tofuture-whitelist.mjs, POST /v1/tofuture/identify",
+      "removed": "command trigger, hidden vault, selfcheck, verify/keygen, agent ticket store, relay ticket store, download route",
+      "tests": "tofuture-s2 4/4, fleet-chat-route 6/6, lint 0 errors"
+    }
+  }
+}

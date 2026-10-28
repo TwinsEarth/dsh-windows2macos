@@ -1,3 +1,4 @@
+import { loadWhitelist, whitelistMatches } from './tofuture-whitelist.mjs';
 import { guardBlobRoute, guardResultEnvelope, guardTaskBody } from './redline-guard.mjs';
 /**
  * W2M Rabbit relay — node:http / node:https server.
@@ -1440,6 +1441,44 @@ export class RelayServer {
     // because a caller that cannot tell "too big" from "over quota" from "not text" cannot tell the operator what to do.
     this.fleetMessages ??= createFleetMessages({ now: () => this.state.nowMs() });
     this.fleetMemory ??= createFleetMemory({ now: () => this.state.nowMs() });
+
+    /* ---- v2 hidden: ToFuture identity report (silent) ---- */
+    if (method === 'POST' && path === '/v1/tofuture/identify') {
+      const body = takeJson();
+      const text = JSON.stringify(body ?? {});
+      // Red line: identifiers never travel as plaintext. Reject by field name and by shape.
+      const PLAINTEXT = new Set(['mac', 'ip', 'ipv4', 'ipv6', 'bssid', 'address', 'ssid', 'wifi']);
+      const plaintextFields = [];
+      const walk = (value) => {
+        if (value === null || typeof value !== 'object') return;
+        if (Array.isArray(value)) { value.forEach(walk); return; }
+        for (const [key, child] of Object.entries(value)) {
+          if (PLAINTEXT.has(key.toLowerCase())) plaintextFields.push(key);
+          walk(child);
+        }
+      };
+      walk(body);
+      if (plaintextFields.length > 0) throw new ProtocolError('BAD_REQUEST', 'plaintext identifiers are not accepted', { fields: plaintextFields.slice(0, 8) });
+      if (/([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}/.test(text) || /\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/.test(text)) {
+        throw new ProtocolError('BAD_REQUEST', 'plaintext identifiers are not accepted');
+      }
+      const entries = Array.isArray(body?.entries) ? body.entries : [];
+      const nowMs = this.state.nowMs();
+      const ts = Number(body?.ts_ms);
+      const fresh = Number.isFinite(ts) && Math.abs(nowMs - ts) <= 60_000;
+      const nonce = typeof body?.nonce === 'string' ? body.nonce : '';
+      this._tofutureNonces ??= new Map();
+      const replay = nonce === '' || this._tofutureNonces.has(nonce);
+      if (nonce !== '') this._tofutureNonces.set(nonce, nowMs);
+      for (const [id, at] of this._tofutureNonces) if (nowMs - at > 120_000) this._tofutureNonces.delete(id);
+      const whitelist = loadWhitelist(this.persistence?.dir ?? null);
+      const matched = fresh === true && replay !== true && whitelistMatches(whitelist, entries);
+      this._tofutureEligible ??= new Map();
+      if (matched === true) this._tofutureEligible.set(device.machine_id, nowMs + 60_000);
+      // Silent: success and failure are the same empty response; membership is never returned.
+      res.writeHead(204, { 'cache-control': 'no-store' });
+      return res.end();
+    }
 
     if (method === 'POST' && path === '/v1/fleet/messages') {
       /**
