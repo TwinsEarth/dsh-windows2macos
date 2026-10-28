@@ -191,6 +191,7 @@ import {
 import { registerChatRoutes } from './fleet-chat-route.mjs';
 import { registerExecCapabilityRoutes } from './exec-capability-route.mjs';
 import { registerPluginUpdateRoutes } from './update-route.mjs';
+import { fingerprintOf, readOperatorToken } from './operator-token.mjs';
 import { registerCaptureRoutes } from './capture-route.mjs';
 import { defaultExecCapabilityFile } from '../util/exec-capability.mjs';
 import { createFleetCouncil, fleetCouncilThread } from './council-fleet.mjs';
@@ -687,6 +688,7 @@ async function loadDefineTool() {
  *            p2pMode: string, stunServers: string[]}}
  */
 function readConfig(config = {}) {
+  let operatorTokenSource = null;
   const cwd = process.cwd();
 
   /**
@@ -872,11 +874,23 @@ function readConfig(config = {}) {
         ? process.env.W2M_PAIRING_CODE.trim()
         : null),
     // §5: the operator credential. Only `w2m_run` uses it.
-    operatorToken: typeof config.operatorToken === 'string' && config.operatorToken.trim() !== ''
-      ? config.operatorToken.trim()
-      : (typeof process.env.W2M_OPERATOR_TOKEN === 'string' && process.env.W2M_OPERATOR_TOKEN.trim() !== ''
+    // v2 G0-1: the token file (0600) is the recommended source; profile config stays for legacy,
+    // env last. The value never reaches a status output - only the source and a fingerprint do.
+    operatorToken: (() => {
+      const fromConfig = typeof config.operatorToken === 'string' && config.operatorToken.trim() !== ''
+        ? config.operatorToken.trim()
+        : null;
+      if (fromConfig !== null) { operatorTokenSource = 'config'; return fromConfig; }
+      const secure = readOperatorToken();
+      if (secure.configured === true) { operatorTokenSource = 'file'; return secure.token; }
+      const fromEnv = typeof process.env.W2M_OPERATOR_TOKEN === 'string' && process.env.W2M_OPERATOR_TOKEN.trim() !== ''
         ? process.env.W2M_OPERATOR_TOKEN.trim()
-        : null),
+        : null;
+      if (fromEnv !== null) { operatorTokenSource = 'env'; return fromEnv; }
+      operatorTokenSource = null;
+      return null;
+    })(),
+    operatorTokenSource,
     // ---------------------------------------------------------------------------------------------
     // v0.2.3: daily self-update
     // ---------------------------------------------------------------------------------------------
@@ -4996,6 +5010,7 @@ const result = await request({
             // wrong one without spending a dispatch, and `required_by_relay` is what makes the two
             // halves of the mismatch (client has none / relay demands one) visible side by side.
             operatorToken_configured: cfg.operatorToken !== null,
+    operatorToken_fingerprint: cfg.operatorToken === null ? null : fingerprintOf(cfg.operatorToken),
             operatorToken_source: cfg.operatorToken !== null
               ? (typeof config?.operatorToken === 'string' && config.operatorToken.trim() !== ''
                 ? 'config'

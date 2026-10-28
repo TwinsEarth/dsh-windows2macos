@@ -7,6 +7,12 @@
 
 All notable changes to this project are documented here.
 
+## [1.9.15] - 2026-10-28
+
+- G0-1：operator token 安全存储。新增 `~/.w2m/operator-token`（0600，可用 W2M_OPERATOR_TOKEN_FILE 覆盖）与 `w2m-operator` CLI（set 从 stdin/文件读取、status 只显示指纹、clear）；w2m_status 新增 operatorToken_fingerprint/operatorToken_source，token 值不进日志/状态。
+- 解析顺序：profile config（兼容）→ 安全文件（推荐）→ 环境变量（兼容）。
+- 新增 test/operator-token.test.mjs（6 项）。
+
 ## [1.9.14] - 2026-10-28
 
 - 修复「立即更新」失败（fetch failed）：GitHub Release 下载被网络阻断时，自动回退到 npm registry 的同一版本 tarball；下载前校验 registry 的 sha512 integrity（缺失时 sha1 shasum），再由现有安装器做 sha256 校验、备份与回滚。
