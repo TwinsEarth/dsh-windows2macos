@@ -206,7 +206,8 @@ import { buildBoard } from './task-graph.mjs';
 import { verifyEnvelopeSignature } from '../util/envelope-signature.mjs';
 import { createAskStore } from './ask-store.mjs';
 import { deriveTurns } from './turn.mjs';
-import { decryptChatMessage, deriveChatKey, encryptChatText, isEncrypted } from '../util/chat-crypto.mjs';
+import { decryptChatMessage, deriveChatKey, encryptChatText, encryptChatTextV2, isEncrypted } from '../util/chat-crypto.mjs';
+import { chatEncV2Supported } from './chat-v2-gate.mjs';
 
 /**
  * v1.2.6 reliability: two small files beside the plugin's state.
@@ -6989,7 +6990,18 @@ hint: 'the local fleet-memory.md is unchanged; action read/show still reads loca
          */
         const chatKey = deriveChatKey(cfg.fleetKey ?? resolvedFleetKey.value ?? null);
         const plainText = typeof args?.text === 'string' ? args.text : '';
-        const sealed = chatKey === null ? null : encryptChatText(chatKey, plainText);
+        const idempotencyKey = typeof args?.idempotency_key === 'string' && args.idempotency_key.trim() !== ''
+          ? args.idempotency_key.trim()
+          : 'spool-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+        // A7: v2 only when the relay advertises chat-enc-v2 AND this machine has an id to bind. Otherwise
+        // send v1 (every relay accepts it) rather than an unverifiable v2 envelope.
+        const canV2 = chatKey !== null && typeof cfg.machineId === 'string' && cfg.machineId !== ''
+          && await chatEncV2Supported({ rabbitUrl: cfg.rabbitUrl ?? null });
+        const sealed = chatKey === null
+          ? null
+          : (canV2
+            ? encryptChatTextV2(chatKey, plainText, { sessionId, machineId: cfg.machineId, messageId: idempotencyKey })
+            : encryptChatText(chatKey, plainText));
         /**
          * v1.2.6 reliability: an unreachable Rabbit does not lose the message. The exact body that could not be sent is
          * spooled to disk and replayed with the SAME idempotency key next time, so a message the relay actually received
@@ -7001,7 +7013,7 @@ hint: 'the local fleet-memory.md is unchanged; action read/show still reads loca
           ...(sealed !== null && sealed.ok === true ? { enc: sealed.enc } : {}),
           ...addressing,
           ...(mentions.length === 0 ? {} : { mentions }),
-          ...(typeof args?.idempotency_key === 'string' && args.idempotency_key.trim() !== '' ? { idempotency_key: args.idempotency_key.trim() } : { idempotency_key: 'spool-' + Date.now() + '-' + Math.random().toString(36).slice(2) }),
+          ...{ idempotency_key: idempotencyKey },
             ...(typeof args?.reply_state === 'string' && (args.reply_state === 'answered' || args.reply_state === 'refused') ? { reply_state: args.reply_state } : {}),
         };
         let posted = null;
@@ -7058,7 +7070,7 @@ hint: 'the local fleet-memory.md is unchanged; action read/show still reads loca
       const listKey = deriveChatKey(cfg.fleetKey ?? resolvedFleetKey.value ?? null);
       const messages = rawMessages.map((message) => {
         if (!isEncrypted(message)) return message;
-        const opened = decryptChatMessage(listKey, message);
+        const opened = decryptChatMessage(listKey, message, { sessionId: String(query.session_id ?? message.session_id ?? ''), machineId: typeof message.machine_id === 'string' ? message.machine_id : undefined });
         if (opened.ok === true) return { ...message, text: opened.text, decrypted: true };
         return { ...message, text: '', decrypted: false, encrypted: true, decrypt_error: opened.code };
       });

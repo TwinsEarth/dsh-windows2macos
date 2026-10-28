@@ -7,6 +7,15 @@
 
 All notable changes to this project are documented here.
 
+## [2.0.7] - 2026-10-29
+
+- A7 encrypted mirror：/healthz.features 新增 `chat-enc-v2` 门控（默认 off）；支持时用
+  `encryptChatTextV2`（AAD=session/machine/message_id）投递会话镜像，否则保持 v1；
+  读取端用 `decryptChatMessageV2` 的上下文校验并保持 v1 兼容。
+- 聊天发送：relay 广告 v2 且本机有 machine id 时发 v2，否则回落 v1；同一 idempotency_key 作为
+  AAD message_id，重试不会产生第二行。
+- 插件设置中开启 Node 代码执行能力后，任务派发无需 relay 改动；本机已切换为 permanent。
+
 ## [2.0.6] - 2026-10-29
 
 - 修复 CI 跨平台失败：sink 授权 route 先把 stateDir 解析为 realpath（Windows RUNNER~1 / macOS

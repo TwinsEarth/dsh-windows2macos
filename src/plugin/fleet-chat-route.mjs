@@ -22,6 +22,8 @@ import {
   decodeTranscript, extractUserMessages, sessionDirName,
 } from './session-watch.mjs';
 import { createSessionSync } from './session-sync.mjs';
+import { deriveChatKey, encryptChatTextV2 } from '../util/chat-crypto.mjs';
+import { chatEncV2Supported } from './chat-v2-gate.mjs';
 
 /** Session prompts are mirrored only when the operator opts in; the default is off. */
 export const DEFAULT_MIRROR_MODE = 'off';
@@ -174,8 +176,37 @@ export function registerChatRoutes(ctx, deps) {
   const mirrorOnce = async () => {
     const mode = mirrorModeOf(deps.cfg());
     if (mode === 'off') return;
-    if (mode === 'encrypted') return; // encrypted mirroring lands with the AEAD v2 slice
     const identity = await identityOf();
+    if (identity.conversationKey === null) return;
+    if (mode === 'encrypted') {
+      // Relay gate: without chat-enc-v2 the mirror stays off (never send a shape the relay cannot
+      // validate). The fleet key derives the same group key every machine uses; the AAD binds the
+      // message to this conversation, this machine and a deterministic message id, so a ciphertext
+      // copied into another session is refused at decryption time.
+      const supported = await chatEncV2Supported({ rabbitUrl: deps.cfg()?.rabbitUrl ?? null });
+      if (!supported) return;
+      const accountMaterial = typeof deps.accountMaterial === 'function' ? await deps.accountMaterial() : null;
+      const chatKey = deriveChatKey(accountMaterial ?? deps.cfg()?.fleetKey ?? null);
+      if (chatKey === null) return;
+      const file = newestTranscript(projectDirOf());
+      if (file === null) return;
+      let messages;
+      try { messages = extractUserMessages(decodeTranscript(readFileSync(file))); } catch { return; }
+      for (const payload of sync.pending(messages)) {
+        const plain = truncateUtf8(payload.text, MIRROR_MAX_BYTES);
+        const messageId = createHash('sha256').update(identity.conversationKey + '|' + identity.machineId + '|' + plain).digest('hex').slice(0, 32);
+        const sealed = encryptChatTextV2(chatKey, plain, { sessionId: identity.conversationKey, machineId: identity.machineId, messageId });
+        if (sealed.ok !== true) continue;
+        await postToRelay(identity, {
+          text: sealed.text,
+          enc: sealed.enc,
+          machine_id: identity.machineId,
+          machine_name: identity.machineName,
+          origin: 'session',
+        });
+      }
+      return;
+    }
     if (identity.conversationKey === null) return;
     const file = newestTranscript(projectDirOf());
     if (file === null) return;
