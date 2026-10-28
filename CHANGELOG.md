@@ -7,6 +7,12 @@
 
 All notable changes to this project are documented here.
 
+## [1.9.14] - 2026-10-28
+
+- 修复「立即更新」失败（fetch failed）：GitHub Release 下载被网络阻断时，自动回退到 npm registry 的同一版本 tarball；下载前校验 registry 的 sha512 integrity（缺失时 sha1 shasum），再由现有安装器做 sha256 校验、备份与回滚。
+- 安装器仍走运行时 pnpm（Windows 不再尝试 dsh.cmd）。
+- 更新相关测试 66/66 通过。
+
 ## [1.9.13] - 2026-10-28
 
 - 新增操作员联合开发 CLI `w2m-joint`：plan create/list/get、approve（人签、authority≥70、TTL 默认 10 分钟）、status、dispatch --dry-run（打印控制信封，真实发送未接线并返回 DISPATCH_NOT_WIRED）。

@@ -86,6 +86,13 @@ export function registerPluginUpdateRoutes(ctx, deps) {
         const result = await updater.check('manual');
         const installedTo = typeof result?.to === 'string' && result.to !== '' ? result.to : null;
         const installed = result?.outcome === 'installed' || installedTo !== null && installedTo !== current;
+        // The GitHub release download is blocked on some networks ("fetch failed"), while the npm
+        // registry is reachable. Before reporting a failure, install the same version from the
+        // registry tarball, whose integrity field is verified before pnpm sees it.
+        if (installed !== true) {
+          const fallback = await installFromNpmFallback({ profileDir, current, version: checked.latest ?? current });
+          if (fallback !== null) return Response.json(fallback.body, { headers: NO_STORE });
+        }
         return Response.json({
           ok: result?.ok === true && installed === true,
           outcome: result?.outcome ?? 'unknown',
@@ -115,4 +122,28 @@ async function defaultUpdater({ profileDir, currentVersion }) {
     intervalDays: 0,
     log: () => {},
   });
+}
+
+/** Install the same version from the npm registry when the GitHub release download fails. */
+async function installFromNpmFallback({ profileDir, current, version }) {
+  try {
+    const { fetchNpmTarball } = await import('./npm-update.mjs');
+    const { installUpdate } = await import('./update-install.mjs');
+    const { tmpdir } = await import('node:os');
+    const fetched = await fetchNpmTarball({ version, destDir: join(tmpdir(), 'w2m-npm-update-' + Date.now()) });
+    if (fetched.ok !== true) return null;
+    const result = await installUpdate({ profileDir, tarballPath: fetched.path, expectedSha256: fetched.sha256 });
+    if (result?.ok !== true) return null;
+    return {
+      body: {
+        ok: true,
+        outcome: 'installed',
+        installedVia: 'npm-tarball',
+        from: result.from ?? current,
+        to: result.to ?? version,
+        installed: true,
+        restart_required: true,
+      },
+    };
+  } catch { return null; }
 }

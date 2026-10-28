@@ -8,6 +8,10 @@
  * package in the profile, and takes a backup. Keeping the check pure is what makes "NPM 对比" testable
  * without a network or a profile.
  */
+import { createHash } from 'node:crypto';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+
 import { compareVersions } from './update-source.mjs';
 
 /** The package this plugin is. */
@@ -83,3 +87,61 @@ export async function checkNpmUpdate(input) {
   return decideNpmUpdate({ latest: last, currentVersion: input?.currentVersion ?? null });
 }
 
+
+
+/** Registry package documents to try, in order (mirror first, then npmjs). */
+export const NPM_PACKAGE_DOC_URLS = [
+  `https://registry.npmmirror.com/${encodeURIComponent(PLUGIN_PACKAGE_NAME)}`,
+  `https://registry.npmjs.org/${encodeURIComponent(PLUGIN_PACKAGE_NAME)}`,
+];
+
+/**
+ * Download an exact npm version and verify it against the registry's own integrity field before it
+ * can be installed. This is the fallback for "immediately update failed: fetch failed": GitHub
+ * release downloads are blocked on some networks while the npm registry is reachable.
+ */
+export async function fetchNpmTarball(input) {
+  const fetchImpl = input?.fetchImpl ?? globalThis.fetch;
+  const version = typeof input?.version === 'string' ? input.version.trim() : '';
+  if (version === '') return { ok: false, error: 'version is required' };
+  const destDir = input?.destDir;
+  if (typeof destDir !== 'string' || destDir === '') return { ok: false, error: 'destDir is required' };
+  const timeoutMs = Number.isInteger(input?.timeoutMs) ? input.timeoutMs : NPM_CHECK_TIMEOUT_MS;
+  const urls = Array.isArray(input?.urls) ? input.urls : NPM_PACKAGE_DOC_URLS;
+  const signalOf = () => (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function' ? AbortSignal.timeout(timeoutMs) : undefined);
+  let meta = null;
+  let lastError = 'npm package document could not be read';
+  for (const url of urls) {
+    try {
+      const response = await fetchImpl(url, { headers: { accept: 'application/json' }, signal: signalOf() });
+      if (response?.ok !== true) { lastError = `npm registry answered HTTP ${response?.status ?? '?'}`; continue; }
+      const doc = await response.json();
+      const candidate = doc?.versions?.[version];
+      if (candidate?.dist?.tarball === undefined) { lastError = `npm has no version ${version} with a tarball`; continue; }
+      meta = candidate;
+      break;
+    } catch (error) { lastError = error instanceof Error ? error.message : String(error); }
+  }
+  if (meta === null) return { ok: false, error: lastError };
+  try {
+    const response = await fetchImpl(meta.dist.tarball, { signal: signalOf() });
+    if (response?.ok !== true) return { ok: false, error: `npm tarball answered HTTP ${response?.status ?? '?'}` };
+    const bytes = Buffer.from(await response.arrayBuffer());
+    const integrity = typeof meta.dist.integrity === 'string' ? meta.dist.integrity : null;
+    if (integrity !== null && /^sha512-/.test(integrity)) {
+      const actual = createHash('sha512').update(bytes).digest('base64');
+      if (actual !== integrity.slice('sha512-'.length)) return { ok: false, error: 'NPM_INTEGRITY_MISMATCH' };
+    } else if (typeof meta.dist.shasum === 'string') {
+      const actual = createHash('sha1').update(bytes).digest('hex');
+      if (actual !== meta.dist.shasum) return { ok: false, error: 'NPM_SHASUM_MISMATCH' };
+    } else {
+      return { ok: false, error: 'NPM_NO_INTEGRITY' };
+    }
+    mkdirSync(destDir, { recursive: true });
+    const path = join(destDir, `w2m-dsh-plugin-${version}.tgz`);
+    writeFileSync(path, bytes);
+    return { ok: true, path, bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex'), version, tarball: meta.dist.tarball, integrityVerified: true };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
