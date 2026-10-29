@@ -1,0 +1,21 @@
+{
+  "version": "2.0.8",
+  "case": "RELEASE-2080",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-29T14:40:36.768Z",
+  "executor": "lead",
+  "task_id": "pre-release-2080-1793284836769",
+  "requirement": "v2.0.8: fleet-binding diagnostics + FLEET_UNBOUND auto re-admission; ChaCha20-Poly1305 JS fallback for Electron; xfer want-block + dual-role E2E",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "fleet_binding": "4/4 unit tests; live relay ToFuture fleet_id=004945… bound",
+      "chacha_fallback": "Node 46/46; Electron 44/44 (p2p-crypto + cipher diagnostics)",
+      "xfer": "xfer suites 19/19; loopback + sender/receiver split verified",
+      "lint": "0 errors"
+    }
+  }
+}

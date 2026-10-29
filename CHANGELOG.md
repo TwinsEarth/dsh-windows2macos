@@ -3,6 +3,14 @@
 - `w2m_intent`: structured intents mapped onto allow-listed commands; unknown actions, parameters and types
   are refused by name (the fleet does not invent commands).
 
+## [2.0.8] - 2026-10-29
+
+- P2P 加密：新增 RFC 8439 ChaCha20-Poly1305 纯 JS 回退，Electron/BoringSSL 缺少 chacha 时自动启用，wire 字节与原生实现一致；保留 P2P_CIPHER_UNAVAILABLE 诊断。
+- 编队绑定：w2m_status 新增 fleet 诊断块与 FLEET_UNBOUND；token 有效但 fleet_id=null 且已配置 fleetKey 时，启动路径自动重新准入，避免“只在全部机器、不在本编队”。
+- 文件传输：want-block 协议（窗口、逐块校验、续传）与 sender/receiver 双角色 E2E 脚本。
+- 测试：chacha 回退（Node + Electron）、fleet-binding、xfer 套件。
+
+
 # Changelog
 
 All notable changes to this project are documented here.

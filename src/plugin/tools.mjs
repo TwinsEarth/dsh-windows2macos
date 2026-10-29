@@ -1,4 +1,5 @@
 import { FAILOVER_DEFAULTS, createRelayFailover, relayPool } from './relay-failover.mjs';
+import { diagnoseFleetBinding, shouldRejoin } from './fleet-binding.mjs';
 import { DEFAULT_BOOTSTRAP_URL, DEFAULT_BOOTSTRAP_OPERATOR_KEY_PEM } from './bootstrap.mjs';
 /**
  * DSH: Windows2MacO - the DSH Cordis plugin.
@@ -4997,6 +4998,13 @@ const result = await request({
       };
       })();
 
+      const fleetBinding = await diagnoseFleetBinding({
+        relayUrl: cfg.rabbitUrl,
+        token: device.device_token,
+        machineId: device.machine_id,
+        fleetKey: cfg.fleetKey,
+      });
+
       return JSON.stringify(
         {
           ok: true,
@@ -5021,6 +5029,7 @@ const result = await request({
           rabbit_source: cfg.rabbitSource,
           rabbit_url: cfg.rabbitUrl,
           p2p: p2pStatus,
+          fleet: fleetBinding,
           rtt,
           config: {
             rabbitUrl: cfg.rabbitUrl,
@@ -5031,6 +5040,7 @@ const result = await request({
             autoStartAgent: cfg.autoStartAgent,
             allowedCommands: cfg.allowedCommands,
             pairingCode_configured: cfg.pairingCode !== null,
+            fleetKey_configured: cfg.fleetKey !== null,
             p2pMode: cfg.p2pMode,
             // The resolved list, shared server first, exactly as the node will query it.
             stunServers: cfg.stunServers,
@@ -8028,6 +8038,18 @@ async function startLocalStack(ctx, cfg) {
             loaded.identity.device_token = null;
             if (identityOptions.identity !== undefined && identityOptions.identity !== null) identityOptions.identity.device_token = null;
             ctx.logger?.warn?.('w2m: stored device token was rejected by ' + relayForToken + ' (HTTP ' + probe.status + '); pairing again with the fleet key');
+          }
+          if (alreadyPaired && fleetKeyFromConfig !== null) {
+            const binding = await diagnoseFleetBinding({
+              relayUrl: relayForToken,
+              token: existingToken,
+              machineId: loaded.identity.machine_id,
+              fleetKey: fleetKeyFromConfig,
+            });
+            if (shouldRejoin({ token: existingToken, fleetId: binding.fleet_id, fleetKey: fleetKeyFromConfig })) {
+              alreadyPaired = false;
+              ctx.logger?.warn?.('w2m: FLEET_UNBOUND (token valid, fleet_id=null); re-admitting with the configured fleet key');
+            }
           }
         } catch { /* network error: keep the token, do not force a re-pair */ }
       }

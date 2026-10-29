@@ -53,6 +53,8 @@ import {
   randomBytes,
   timingSafeEqual,
 } from 'node:crypto';
+
+import { jsOpen, jsSeal } from './chacha.mjs';
 import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { blake2s256 as blake2s256Js } from './blake2s.mjs';
@@ -758,6 +760,57 @@ export function derive(ikm, label, length = KEY_BYTES) {
  *
  * @returns {{ ok: boolean, missing: string[], present: string[], node: string, detail: string }}
  */
+/** Wrap a cipher construction so an OpenSSL "Unknown cipher" carries WHO/WHAT, not just the text. */
+function cipherContextError(kind, cipherName, error, context = {}) {
+  const wrapped = new Error('P2P_CIPHER_UNAVAILABLE: ' + kind + ' ' + cipherName + ' failed: ' + (error?.message ?? String(error)));
+  wrapped.code = 'P2P_CIPHER_UNAVAILABLE';
+  wrapped.detail = {
+    cipher: cipherName,
+    suite: typeof context.suite === 'string' ? context.suite : 'w2m-p2p-v1',
+    peerKey: typeof context.peerKey === 'string' ? context.peerKey : null,
+    keyLength: context.keyLength ?? null,
+    ivLength: context.ivLength ?? null,
+    openssl: error?.message ?? String(error),
+    node: process.version,
+  };
+  wrapped.cause = error;
+  return wrapped;
+}
+function createCipherContext(name, key, iv, options, context = {}) {
+  try { return createCipheriv(name, key, iv, options); } catch (error) { throw cipherContextError('encrypt', name, error, { ...context, keyLength: key?.length, ivLength: iv?.length }); }
+}
+function createDecipherContext(name, key, iv, options, context = {}) {
+  try { return createDecipheriv(name, key, iv, options); } catch (error) { throw cipherContextError('decrypt', name, error, { ...context, keyLength: key?.length, ivLength: iv?.length }); }
+}
+
+
+/** Native ChaCha20-Poly1305 availability (DSH/Electron's BoringSSL may not expose it). */
+let NATIVE_CHACHA = true;
+try {
+  const probeKey = Buffer.alloc(32, 1);
+  const probeCipher = createCipheriv('chacha20-poly1305', probeKey, Buffer.alloc(12), { authTagLength: 16 });
+  probeCipher.final();
+} catch {
+  NATIVE_CHACHA = false;
+}
+export function nativeAeadAvailable() { return NATIVE_CHACHA; }
+function aeadSeal(key, nonce, plaintext, aad = Buffer.alloc(0), context = {}) {
+  if (!NATIVE_CHACHA) return jsSeal(key, nonce, plaintext, aad);
+  const cipher = createCipherContext('chacha20-poly1305', key, nonce, { authTagLength: TAG_BYTES }, { suite: 'w2m-p2p-v1', ...context });
+  if (aad.length > 0) cipher.setAAD(aad);
+  return Buffer.concat([cipher.update(plaintext), cipher.final(), cipher.getAuthTag()]);
+}
+function aeadOpen(key, nonce, sealed, aad = Buffer.alloc(0)) {
+  if (!NATIVE_CHACHA) return jsOpen(key, nonce, sealed, aad);
+  if (!Buffer.isBuffer(sealed) || sealed.length < TAG_BYTES) return null;
+  try {
+    const decipher = createDecipherContext('chacha20-poly1305', key, nonce, { authTagLength: TAG_BYTES }, { suite: 'w2m-p2p-v1' });
+    if (aad.length > 0) decipher.setAAD(aad);
+    decipher.setAuthTag(sealed.subarray(sealed.length - TAG_BYTES));
+    return Buffer.concat([decipher.update(sealed.subarray(0, sealed.length - TAG_BYTES)), decipher.final()]);
+  } catch { return null; }
+}
+
 export function cryptoCapabilities() {
   const present = [];
   const missing = [];
@@ -774,11 +827,11 @@ export function cryptoCapabilities() {
   check('blake2s256', () => blake2s256Support().ok);
   check('sha256', () => createHash('sha256').update('').digest().length === 32);
   check('chacha20-poly1305', () => {
+    // Count the JS fallback as available: what the handshake needs is the AEAD, not OpenSSL's copy.
     const key = randomBytes(32);
-    const cipher = createCipheriv('chacha20-poly1305', key, Buffer.alloc(12), { authTagLength: 16 });
-    cipher.update(Buffer.from('probe'));
-    cipher.final();
-    return cipher.getAuthTag().length === 16;
+    const sealed = aeadSeal(key, Buffer.alloc(12), Buffer.from('probe'));
+    const opened = aeadOpen(key, Buffer.alloc(12), sealed);
+    return sealed.length === 21 && opened !== null && opened.toString('utf8') === 'probe';
   });
   check('hkdf-sha256', () => hkdfSync('sha256', randomBytes(32), Buffer.alloc(0), Buffer.from('probe'), 32).byteLength === 32);
   check('x25519+diffieHellman', () => {
@@ -993,10 +1046,8 @@ export function sessionKeys({ ephemeralShared, initiatorStaticShared, responderS
  * @param {Buffer} message
  * @returns {Buffer} Ciphertext followed by the tag: 48 bytes for a 32-byte message.
  */
-export function sealMac(key, message) {
-  const cipher = createCipheriv('chacha20-poly1305', key, Buffer.alloc(12), { authTagLength: TAG_BYTES });
-  const ciphertext = Buffer.concat([cipher.update(message), cipher.final()]);
-  return Buffer.concat([ciphertext, cipher.getAuthTag()]);
+export function sealMac(key, message, context = {}) {
+  return aeadSeal(key, Buffer.alloc(12), message, Buffer.alloc(0), context);
 }
 
 /**
@@ -1008,13 +1059,7 @@ export function sealMac(key, message) {
  */
 export function openMac(key, sealed) {
   if (!Buffer.isBuffer(sealed) || sealed.length <= TAG_BYTES) return null;
-  try {
-    const decipher = createDecipheriv('chacha20-poly1305', key, Buffer.alloc(12), { authTagLength: TAG_BYTES });
-    decipher.setAuthTag(sealed.subarray(sealed.length - TAG_BYTES));
-    return Buffer.concat([decipher.update(sealed.subarray(0, sealed.length - TAG_BYTES)), decipher.final()]);
-  } catch {
-    return null;
-  }
+  return aeadOpen(key, Buffer.alloc(12), sealed);
 }
 
 /** @param {Buffer} a @param {Buffer} b @returns {boolean} Constant-time comparison. */
@@ -1600,13 +1645,11 @@ export class CryptoSession {
     cipherHeader.writeUInt8(this.sendEpoch & 0xff, 1);
     cipherHeader.writeBigUInt64LE(counter, 2);
 
-    const cipher = createCipheriv('chacha20-poly1305', key, nonceFor(counter), { authTagLength: TAG_BYTES });
     // The frame's own header —kind and session —rides as additional authenticated data. That is
     // what stops an attacker retagging a DATA frame as a BYE, or moving a frame into another session:
     // the tag covers the fields the receiving channel routes on.
-    cipher.setAAD(header);
-    const ciphertext = Buffer.concat([cipher.update(frame.subarray(FRAME_HEADER_BYTES)), cipher.final()]);
-    return Buffer.concat([header, cipherHeader, ciphertext, cipher.getAuthTag()]);
+    const sealed = aeadSeal(key, nonceFor(counter), frame.subarray(FRAME_HEADER_BYTES), header);
+    return Buffer.concat([header, cipherHeader, sealed]);
   }
 
   /**
@@ -1653,16 +1696,8 @@ export class CryptoSession {
     const key = this.receiveKey(isInitiator, epoch);
     if (key === null) return fail(CRYPTO_REASON.EPOCH_TOO_FAR);
 
-    let plaintext;
-    try {
-      const decipher = createDecipheriv('chacha20-poly1305', key, nonceFor(counter), { authTagLength: TAG_BYTES });
-      decipher.setAAD(header);
-      decipher.setAuthTag(body.subarray(body.length - TAG_BYTES));
-      plaintext = Buffer.concat([
-        decipher.update(body.subarray(CIPHER_HEADER_BYTES, body.length - TAG_BYTES)),
-        decipher.final(),
-      ]);
-    } catch {
+    const plaintext = aeadOpen(key, nonceFor(counter), body.subarray(CIPHER_HEADER_BYTES), header);
+    if (plaintext === null) {
       // Authentication failed. The frame is dropped and never processed, and the tag is *not* retried
       // against the other epochs: an attacker who could make us try keys until one verified would
       // have turned a 128-bit tag into a search.
