@@ -135,7 +135,7 @@ metadata:
 ### 10.1 目标与边界
 
 - 在 Rabbit relay 之外增加**编队共享记忆层**，不把记忆塞进 relay 状态；
-- 通过 MCP 暴露 `w2m_memory_read` / `w2m_memory_write`（可选 `w2m_memory_query` / `w2m_memory_approve`），任何 MCP 客户端可读写；
+- 通过 MCP 暴露 `memory_read` / `memory_write`（可选 `memory_query` / `memory_approve`），任何 MCP 客户端可读写；
 - 设备视角隔离：每条记忆携带 `origin_machine` / `origin_platform` / `scope`；读取按请求方平台与 scope 过滤，平台特定执行细节不污染跨平台记忆；
 - MMP（Mesh Memory Protocol）兼容：保留导入/导出适配器，不把 MMP 作为唯一内部格式。
 
@@ -166,8 +166,8 @@ memories(
 ### 10.3 与现有记忆工具的关系
 
 - 现有 `w2m_memory`（agent 本地 jsonl）保留为**本地热缓存**；
-- Hub 是**共享事实源**；跨机共享必须显式 `w2m_memory_write`，禁止隐式双写；
-- `w2m_memory_read` 先查 Hub，miss 时可选回落本地缓存，并标记 `source=local-cache`；
+- Hub 是**共享事实源**；跨机共享必须显式 `memory_write`，禁止隐式双写；
+- `memory_read` 先查 Hub，miss 时可选回落本地缓存，并标记 `source=local-cache`；
 - 任何 token/密钥/聊天明文不得写入 Hub；写入前做敏感字段扫描并拒绝。
 
 ### 10.4 外部基础设施策略
@@ -257,7 +257,7 @@ extensions/
 
 ### 12.2 MCP 作为统一调用协议
 
-- 能力调用统一走 MCP 工具面（`w2m_run/w2m_wait/w2m_memory_*` 等），不为任何平台写定制集成代码；
+- 能力调用统一走 MCP 工具面（`w2m_run/w2m_wait/memory_*` 等），不为任何平台写定制集成代码；
 - 平台适配层只负责**配置落点/传输方式**（stdio/http、config 文件位置），不复制工具逻辑；
 - ACA 作为可选协议适配器，位于 MCP 之下，不形成第二套工具语义；
 - 任何“平台专用分支”必须被拒绝，除非以数据/配置形式存在。

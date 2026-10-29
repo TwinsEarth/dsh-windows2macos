@@ -1,3 +1,7 @@
+# Changelog
+
+All notable changes to this project are documented here.
+
 ## [Unreleased]
 
 - `w2m_intent`: structured intents mapped onto allow-listed commands; unknown actions, parameters and types
@@ -11,9 +15,6 @@
 - 测试：chacha 回退（Node + Electron）、fleet-binding、xfer 套件。
 
 
-# Changelog
-
-All notable changes to this project are documented here.
 
 ## [2.0.7] - 2026-10-29
 

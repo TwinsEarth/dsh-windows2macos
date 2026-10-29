@@ -2225,10 +2225,13 @@ describe('happy paths', () => {
       const { tools } = await register({ rabbitUrl: RABBIT, stateDir: dir, projectDir: nonRepo, machineName: 'win-desktop' });
       const value = JSON.parse(await tools.get('w2m_status').execute({}, {}));
 
-      assert.equal(fetchStub.calls.length, 1);
+      assert.equal(fetchStub.calls.length, 2);
       assert.equal(fetchStub.calls[0].path, '/healthz');
       assert.equal(fetchStub.calls[0].method, 'GET');
       assert.equal(fetchStub.calls[0].headers.authorization, undefined, 'healthz needs no token');
+      assert.equal(fetchStub.calls[1].path, '/v1/devices');
+      assert.match(String(fetchStub.calls[1].headers.authorization), /^Bearer /);
+      assert.equal(value.fleet.state, 'unknown');
 
       assert.equal(value.ok, true);
       assert.equal(value.protocol_version, 1);
@@ -2639,8 +2642,9 @@ describe('v0.1.2 sub-path rabbitUrl', () => {
           '/team-a/w2m/v1/tasks/01JSUB',
           '/team-a/w2m/v1/tasks/01JSUB/report',
           '/team-a/w2m/healthz',
+          '/team-a/w2m/v1/devices',
         ],
-        'new URL(path, base) would have dropped /team-a/w2m and 404ed on all five',
+        'new URL(path, base) would have dropped /team-a/w2m and 404ed on all six',
       );
       for (const call of fetchStub.calls) {
         assert.ok(call.url.startsWith('https://w2m.example.com/team-a/w2m/'), call.url);
