@@ -1,0 +1,19 @@
+{
+  "version": "2.0.10",
+  "case": "RELEASE-2100",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-30T21:19:15.294Z",
+  "executor": "lead",
+  "task_id": "pre-release-2100-1793394641623",
+  "requirement": "v2.0.10: ship remote-view S2 capture probe as a script (no node -e)",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "s2_script": "bin/remote-s2-capture.mjs shipped (scripts/ is forbidden in the release tarball); summaryBits/platform test 2/2",
+      "preflight": "GREEN: 16 pass, 0 fail, 1 host-only UNVERIFIABLE; 3299 tests / 244 files"
+    }
+  }
+}

@@ -7,6 +7,11 @@ All notable changes to this project are documented here.
 - `w2m_intent`: structured intents mapped onto allow-listed commands; unknown actions, parameters and types
   are refused by name (the fleet does not invent commands).
 
+## [2.0.10] - 2026-10-31
+
+- remote-view S2: ship scripts/remote-s2-capture.mjs so macOS capture/TCC probes run as a normal script (no node -e, no reparse refusal); measures 1/2 fps capture timing, JPEG size, ffmpeg presence, writes w2m-s2-result.json and supports exit-code summary.
+- tests: remote-s2-capture summary/platform contract.
+
 ## [2.0.9] - 2026-10-30
 
 - P2P 可靠性：ACK 驱动窗口、自适应窗口、RFC 6298 RTT/自适应 RTO；明文通道复用改为强制新握手。
