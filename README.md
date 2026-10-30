@@ -9,7 +9,7 @@
 English | [中文说明](#中文说明)
 
 ---
-W2M是一个开源（MIT）的 AI 智能体舰队编排工具——用同一个 DeepSeek 账号把"你自己的多台机器"（Windows/Mac）编成一个舰队，统一派发命令、协同开发。
+W2M是一个开源（MIT）的 AI 智能体舰队编排工具——用同一个 DeepSeek 账号把"你自己的多台机器"（Windows/Mac/linux）编成一个舰队，统一派发命令、协同开发。
 组件有三块：Relay（HTTP+SSE 协调服务器）、Agent（每台机器上跑、执行白名单命令）、Plugin（给 Agent 用的 18 个工具，如 w2m_run/w2m_devices。
 
 ## 六大核心功能
