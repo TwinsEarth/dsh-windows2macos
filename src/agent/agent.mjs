@@ -69,6 +69,7 @@ import {
   readExecCapability,
 } from '../util/exec-capability.mjs';
 import { CRYPTO_REASON, DEVICE_KEY_FILE, DeviceKey, PeerKeyStore, deriveSigningKey } from './crypto.mjs';
+import { createXferFrameRouter } from './transfer/router.mjs';
 import { DEFAULT_P2P_MODE, P2P_DEFAULTS, P2PNode, normalizeP2PMode, normalizeP2PPort } from './p2p-node.mjs';
 import { punchSession, reverseDialSession } from './p2p.mjs';
 import { createSigner } from '../signing.mjs';
@@ -1142,6 +1143,8 @@ export function createAgent(options) {
    * @type {PeerKeyStore}
    */
   const peerKeys = new PeerKeyStore();
+  /** P0-a: xfer.* frames arriving on a P2P channel are routed here, not to task dispatch. */
+  const xferRouter = createXferFrameRouter();
   /**
    * What each task's direct channel actually was, for the result envelope.
    *
@@ -3959,6 +3962,10 @@ let attemptAttached = false;
    */
   function handleP2PMessage(event) {
     const payload = parseP2PFrame(event.payload);
+    if (payload !== null && typeof payload.type === 'string' && payload.type.startsWith('xfer.')) {
+      xferRouter.handle(payload, { channel: event.channel });
+      return;
+    }
     if (payload === null) {
       log('warn', 'ignoring non-JSON frame on a P2P channel', {
         peer: event.peer ?? null,

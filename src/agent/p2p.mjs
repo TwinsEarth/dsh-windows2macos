@@ -114,6 +114,42 @@ export const DEFAULT_WINDOW = 32;
 export const DEFAULT_RTO_MS = 300;
 export const MAX_RTO_MS = 3000;
 
+/**
+ * RFC 6298 RTT estimator. The old channel used a constant 300 ms RTO, which is
+ * wrong on both a LAN (too slow) and a lossy WAN (too fast). This keeps SRTT and
+ * RTTVAR and clamps the result; callers still apply per-attempt exponential
+ * backoff on top.
+ */
+export class RttEstimator {
+  constructor({ initialRtoMs = DEFAULT_RTO_MS, minRtoMs = 100, maxRtoMs = MAX_RTO_MS } = {}) {
+    this.srtt = null;
+    this.rttvar = null;
+    this.minRtoMs = minRtoMs;
+    this.maxRtoMs = maxRtoMs;
+    this.rtoMs = Math.min(maxRtoMs, Math.max(minRtoMs, initialRtoMs));
+  }
+
+  sample(rttMs) {
+    if (!Number.isFinite(rttMs) || rttMs < 0) return this.rtoMs;
+    if (this.srtt === null) {
+      this.srtt = rttMs;
+      this.rttvar = rttMs / 2;
+    } else {
+      this.rttvar = 0.75 * this.rttvar + 0.25 * Math.abs(this.srtt - rttMs);
+      this.srtt = 0.875 * this.srtt + 0.125 * rttMs;
+    }
+    this.rtoMs = Math.min(this.maxRtoMs, Math.max(this.minRtoMs, this.srtt + 4 * this.rttvar));
+    return this.rtoMs;
+  }
+
+  reset() {
+    this.srtt = null;
+    this.rttvar = null;
+    this.rtoMs = Math.min(this.maxRtoMs, Math.max(this.minRtoMs, DEFAULT_RTO_MS));
+  }
+}
+
+
 /** Retransmits per fragment before the message is declared undeliverable. */
 export const DEFAULT_MAX_ATTEMPTS = 8;
 
@@ -985,9 +1021,14 @@ export class P2PChannel extends EventEmitter {
     this.session = options.session;
     this.tuning = {
       window: options.tuning?.window ?? DEFAULT_WINDOW,
+      maxWindow: options.tuning?.maxWindow ?? 256,
       rtoMs: options.tuning?.rtoMs ?? DEFAULT_RTO_MS,
       maxAttempts: options.tuning?.maxAttempts ?? DEFAULT_MAX_ATTEMPTS,
     };
+    /** Adaptive send window: starts at the tuning value, grows on completed messages. */
+    this.window = this.tuning.window;
+    /** RTT/RTO measured from ACK arrival, instead of the fixed 300 ms default. */
+    this.rtt = new RttEstimator({ initialRtoMs: this.tuning.rtoMs, maxRtoMs: MAX_RTO_MS });
 
     const crypto = options.crypto ?? null;
     /** @type {CryptoSession|null} */
@@ -1150,11 +1191,25 @@ export class P2PChannel extends EventEmitter {
     const entry = this.outgoing.get(messageId);
     if (!entry) return;
     entry.acked.add(index);
+    entry.inFlight.delete(index);
+    // Karn: a fragment that was retransmitted has an ambiguous RTT, so only the
+    // first transmission is sampled.
+    if (entry.sentAt.has(index) && !entry.retransmitted.has(index)) {
+      this.rtt.sample(Date.now() - entry.sentAt.get(index));
+      entry.sentAt.delete(index);
+    }
     if (entry.acked.size === entry.fragments.length) {
       this.outgoing.delete(messageId);
       clearTimeout(entry.timer);
+      // A completed message is the only honest RTT-free signal that the path holds more
+      // than the previous window: grow conservatively, and halve on a retransmit timeout.
+      this.window = Math.min(this.tuning.maxWindow, this.window + Math.max(1, Math.floor(this.window / 8)));
       entry.resolve();
+      return;
     }
+    // ACK-driven progress: the next window leaves as soon as a slot frees, instead of
+    // waiting for the RTO timer (the 0.12 MiB/s ceiling).
+    if (entry.pump !== null) entry.pump();
   }
 
   /**
@@ -1207,6 +1262,10 @@ export class P2PChannel extends EventEmitter {
       const entry = {
         fragments,
         acked: new Set(),
+        inFlight: new Set(),
+        sentAt: new Map(),
+        retransmitted: new Set(),
+        pump: null,
         resolve,
         reject,
         attempts: new Map(),
@@ -1215,45 +1274,73 @@ export class P2PChannel extends EventEmitter {
 
       const pump = () => {
         if (this.closed) return;
-        const pending = [];
-        for (let i = 0; i < fragments.length; i += 1) {
-          if (entry.acked.has(i)) continue;
-          pending.push(i);
-          if (pending.length >= this.tuning.window) break;
-        }
-        if (pending.length === 0) return;
-
-        for (const index of pending) {
-          const attempt = (entry.attempts.get(index) ?? 0) + 1;
-          entry.attempts.set(index, attempt);
+        // Send only what the current window has room for. inFlight is the honest
+        // count of fragments the peer has not acknowledged yet; re-sending those
+        // is the timer's job, not pump's.
+        let budget = Math.max(1, this.window - entry.inFlight.size);
+        for (let i = 0; i < fragments.length && budget > 0; i += 1) {
+          if (entry.acked.has(i) || entry.inFlight.has(i)) continue;
+          const attempt = (entry.attempts.get(i) ?? 0) + 1;
+          entry.attempts.set(i, attempt);
           if (attempt > this.tuning.maxAttempts) {
             this.outgoing.delete(messageId);
+            clearTimeout(entry.timer);
+            this.window = Math.max(8, Math.floor(this.window / 2));
             reject(
               new Error(
-                `P2P_FRAGMENT_UNACKED: fragment ${index}/${fragments.length} of message ${messageId} ` +
+                `P2P_FRAGMENT_UNACKED: fragment ${i}/${fragments.length} of message ${messageId} ` +
                   `after ${this.tuning.maxAttempts} attempts`,
               ),
             );
             return;
           }
-          const body = Buffer.alloc(12 + fragments[index].length);
+          entry.inFlight.add(i);
+          if (!entry.sentAt.has(i)) entry.sentAt.set(i, Date.now());
+          budget -= 1;
+          const body = Buffer.alloc(12 + fragments[i].length);
           body.writeUInt32BE(messageId, 0);
-          body.writeUInt32BE(index, 4);
+          body.writeUInt32BE(i, 4);
           body.writeUInt32BE(fragments.length, 8);
-          fragments[index].copy(body, 12);
+          fragments[i].copy(body, 12);
           this.sendFrame(KIND.DATA, body);
         }
 
-        const worst = Math.max(...pending.map((i) => entry.attempts.get(i) ?? 1));
-        const delay = Math.min(this.tuning.rtoMs * 2 ** (worst - 1), MAX_RTO_MS);
+        if (entry.inFlight.size === 0) return;
+        const worst = Math.max(...[...entry.inFlight].map((i) => entry.attempts.get(i) ?? 1));
+        const delay = Math.min(this.rtt.rtoMs * 2 ** (worst - 1), MAX_RTO_MS);
         // One timer per message, not one per channel: a shared field means a second
         // concurrent send silently cancels the first one's retransmission schedule.
         clearTimeout(entry.timer);
         entry.timer = setTimeout(() => {
-          if (this.outgoing.has(messageId)) pump();
+          if (!this.outgoing.has(messageId)) return;
+          // Retransmit the fragments that are still unacknowledged, then schedule again.
+          for (const i of entry.inFlight) {
+            entry.retransmitted.add(i);
+            const attempt = (entry.attempts.get(i) ?? 0) + 1;
+            entry.attempts.set(i, attempt);
+            if (attempt > this.tuning.maxAttempts) {
+              this.outgoing.delete(messageId);
+              this.window = Math.max(8, Math.floor(this.window / 2));
+              reject(
+                new Error(
+                  `P2P_FRAGMENT_UNACKED: fragment ${i}/${fragments.length} of message ${messageId} ` +
+                    `after ${this.tuning.maxAttempts} attempts`,
+                ),
+              );
+              return;
+            }
+            const body = Buffer.alloc(12 + fragments[i].length);
+            body.writeUInt32BE(messageId, 0);
+            body.writeUInt32BE(i, 4);
+            body.writeUInt32BE(fragments.length, 8);
+            fragments[i].copy(body, 12);
+            this.sendFrame(KIND.DATA, body);
+          }
+          pump();
         }, delay);
         entry.timer.unref?.();
       };
+      entry.pump = pump;
 
       pump();
     });

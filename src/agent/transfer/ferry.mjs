@@ -86,6 +86,9 @@ export function verifyRefV2(ref) {
   if (typeof ref.ref !== 'string' || ref.ref === '') return { ok: false, code: 'ARTIFACT_REF_INVALID' };
   if (typeof ref.rootCid !== 'string' || !ROOT.test(ref.rootCid)) return { ok: false, code: 'ARTIFACT_ROOT_INVALID' };
   if (!Number.isSafeInteger(ref.size) || ref.size < 0 || !Number.isSafeInteger(ref.chunkCount) || ref.chunkCount < 0) return { ok: false, code: 'ARTIFACT_REF_INVALID' };
+  const plan = chunkLengths(ref.size, ref.chunkBytes);
+  if (plan.ok !== true) return plan;
+  if (plan.count !== ref.chunkCount) return { ok: false, code: 'ARTIFACT_REF_INCONSISTENT', detail: { expectedChunks: plan.count, chunkCount: ref.chunkCount } };
   if (typeof ref.originPeer !== 'string' || ref.originPeer === '') return { ok: false, code: 'ARTIFACT_ORIGIN_REQUIRED' };
   return { ok: true };
 }
@@ -165,7 +168,7 @@ export function createReceiver({ stateDir, sinkRoot, ref, destination, chunkByte
       if (buf.length !== range.length) return { ok: false, code: 'XFER_CHUNK_LENGTH_INVALID', detail: { expected: range.length, got: buf.length } };
       const digest = sha256(buf);
       if (typeof expectedSha256 !== 'string' || expectedSha256 !== digest) return { ok: false, code: 'XFER_CHUNK_HASH_MISMATCH', retry: index };
-      if (bitmap.hashes[index] !== null && bitmap.hashes[index] !== digest) return { ok: false, code: 'XFER_CHUNK_CONFLICT' };
+      if (bitmap.hashes[index] !== null && bitmap.hashes[index] !== digest) return { ok: false, code: 'XFER_CHUNK_CONFLICT', recoverable: true, retry: index };
       if (bitmap.hashes[index] === digest) return { ok: true, duplicate: true, index };
       const fd = openSync(partPath, 'r+');
       try { writeSync(fd, buf, 0, buf.length, range.offset); } finally { closeSync(fd); }
@@ -186,6 +189,14 @@ export function createReceiver({ stateDir, sinkRoot, ref, destination, chunkByte
       finalized = true;
       try { writeFileSync(join(dir, 'done.json'), JSON.stringify({ transferId, rootCid, size: bitmap.size, path: target, at: new Date().toISOString() }), { encoding: 'utf8', mode: 0o600 }); } catch { /* receipt is best effort */ }
       return { ok: true, path: target, verified: true, bytes: bitmap.size, transferId };
+    },
+    /** Explicit recovery for a conflicting source: drop the claimed block so a correct source can win. */
+    evictChunk(index) {
+      if (!Number.isInteger(index) || index < 0 || index >= bitmap.chunkCount) return { ok: false, code: 'XFER_CHUNK_INDEX_INVALID' };
+      if (bitmap.hashes[index] === null) return { ok: true, index, alreadyMissing: true };
+      bitmap.hashes[index] = null;
+      save();
+      return { ok: true, index, evicted: true };
     },
     /** 远端 P2P 拉取尚未接线：显式失败，不回落 relay。 */
     async pullFrom(originPeer) {

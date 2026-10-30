@@ -7,6 +7,14 @@ All notable changes to this project are documented here.
 - `w2m_intent`: structured intents mapped onto allow-listed commands; unknown actions, parameters and types
   are refused by name (the fleet does not invent commands).
 
+## [2.0.9] - 2026-10-30
+
+- P2P 可靠性：ACK 驱动窗口、自适应窗口、RFC 6298 RTT/自适应 RTO；明文通道复用改为强制新握手。
+- 传输抽象：P2PTransport / udp-v1、能力协商 + 竞速、PathScheduler 评分与 make-before-break、iroh sidecar 契约（假二进制测试）。
+- 传输层：ArtifactRef v3（SHA-256 Merkle + BLAKE3 回退标记）、xfer 帧路由、P0-a 通道适配器、verifyRefV2 自洽校验与冲突驱逐。
+- 编队：w2m_status.fleet / FLEET_UNBOUND、fleetKey 自动重新准入、底部状态栏（本编队/全服/Relay 圆点）。
+- 测试：新增 transport/race/scheduler/discovery/iroh-sidecar/xfer-channel/router/recovery/ref-v3 等套件。
+
 ## [2.0.8] - 2026-10-29
 
 - P2P 加密：新增 RFC 8439 ChaCha20-Poly1305 纯 JS 回退，Electron/BoringSSL 缺少 chacha 时自动启用，wire 字节与原生实现一致；保留 P2P_CIPHER_UNAVAILABLE 诊断。

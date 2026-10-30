@@ -68,6 +68,42 @@ export const ACCEPTED_ORPHANS = Object.freeze([
     removedBy: 'the 1.9.3 wiring slice that gives this module its production caller',
   },
   {
+    file: 'src/agent/transport.mjs',
+    reason: REASON.LIBRARY,
+    why: 'W0 P2PTransport contract + udp-v1 adapter; the agent still calls P2PNode directly, so wiring it into the dispatch path is the next slice',
+    removedBy: 'the agent dispatch path selecting a transport through this registry instead of calling P2PNode.dial directly',
+  },
+  {
+    file: 'src/agent/p2p-race.mjs',
+    reason: REASON.LIBRARY,
+    why: 'capability negotiation + first-usable-path race; no second transport exists yet, so there is nothing to race',
+    removedBy: 'the agent dispatch path calling raceTransports once iroh-v1 is implemented',
+  },
+  {
+    file: 'src/agent/path-scheduler.mjs',
+    reason: REASON.LIBRARY,
+    why: 'path scoring/switching policy with make-before-break; pure policy with no production sampler yet',
+    removedBy: 'the agent feeding live path samples into PathScheduler',
+  },
+  {
+    file: 'src/agent/iroh-sidecar.mjs',
+    reason: REASON.LIBRARY,
+    why: 'W1 iroh sidecar process contract; validated against a fake sidecar, but the real binary and TLS relay are not deployed',
+    removedBy: 'the iroh sidecar binary + relay being provisioned and the agent selecting iroh-v1',
+  },
+  {
+    file: 'src/agent/discovery.mjs',
+    reason: REASON.LIBRARY,
+    why: 'W3 discovery provider seam (relay/mDNS/DHT candidates); the dial path still reads /v1/peer directly',
+    removedBy: 'the agent merging discovery providers into the dial candidate list',
+  },
+  {
+    file: 'src/agent/transfer/artifact-ref-v3.mjs',
+    reason: REASON.LIBRARY,
+    why: 'optional ArtifactRef v3 (Merkle + dual hash); v2 remains the wire format and ferry does not emit v3 yet',
+    removedBy: 'the transfer engine emitting/consuming v3 behind the feature flag',
+  },
+  {
     file: 'src/agent/outbox.mjs',
     reason: REASON.LIBRARY,
     why: 'M6 result outbox: atomic per-result files, exponential backoff, cross-restart recovery, count/byte ceiling; the agent delivery path still uses the existing spool and does not call it yet',

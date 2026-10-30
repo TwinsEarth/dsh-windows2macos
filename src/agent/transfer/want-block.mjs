@@ -87,3 +87,49 @@ export function verifyChunkFrame(frame) {
   if (digest !== frame.sha256) return { ok: false, code: 'XFER_CHUNK_HASH_MISMATCH' };
   return { ok: true, data };
 }
+
+
+/**
+ * P0-a: run the chunk source over a MessageChannel (P2PChannel / iroh sidecar)
+ * instead of a bare dgram socket. Frames stay JSON for wire compatibility; the
+ * channel supplies encryption, ACK and fragmentation.
+ */
+export function attachChunkSource(channel, { chunked, filePath, transferId = null }) {
+  const source = createChunkSource({ chunked, filePath, transferId });
+  if (source.ok !== true) return source;
+  const handler = (payload) => {
+    let frame = null;
+    try { frame = JSON.parse(Buffer.from(payload).toString('utf8')); } catch { return; }
+    const served = source.handle(frame);
+    if (served.ok !== true) { channel.send(JSON.stringify({ type: ERROR, transferId: frame?.transferId ?? null, code: served.code })); return; }
+    for (const outgoing of served.frames) channel.send(JSON.stringify(outgoing));
+  };
+  channel.on('message', handler);
+  return { ok: true, close: () => channel.off?.('message', handler) };
+}
+
+/**
+ * P0-a: receiver side over a MessageChannel. request() sends the next window;
+ * inbound chunk frames are validated and written exactly as in the UDP path.
+ */
+export function attachWantClient(channel, { transferId, rootCid, receiver }) {
+  const client = createWantClient({ transferId, rootCid, receiver });
+  if (client.ok !== true) return client;
+  const handler = (payload) => {
+    let frame = null;
+    try { frame = JSON.parse(Buffer.from(payload).toString('utf8')); } catch { return; }
+    client.accept(frame);
+  };
+  channel.on('message', handler);
+  return {
+    ok: true,
+    client,
+    request() {
+      const missing = client.missing();
+      if (missing.length === 0) return 0;
+      channel.send(JSON.stringify(client.requestFrames(missing)[0]));
+      return missing.length;
+    },
+    close: () => channel.off?.('message', handler),
+  };
+}

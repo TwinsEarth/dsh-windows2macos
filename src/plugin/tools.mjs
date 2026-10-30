@@ -1681,7 +1681,17 @@ async function pushOffer(node, frame, crypto = {}) {
   // no channel at all.
   const dialOptions = session === undefined ? {} : { session };
   try {
-    const dialled = await node.dial(frame.machine_id, dialOptions);
+    let dialled = await node.dial(frame.machine_id, { ...dialOptions, peerKey });
+    if (dialled.ok === true
+      && dialled.reused === true
+      && dialled.channel?.encryption?.encrypted !== true
+      && peerKey !== null
+      && typeof node.dropChannel === 'function') {
+      // A plaintext channel from an earlier reverse dial must not win by reuse: drop it and
+      // immediately redial with the peer key, so this offer gets a real handshake.
+      node.dropChannel(dialled.session);
+      dialled = await node.dial(frame.machine_id, { ...dialOptions, peerKey });
+    }
     if (!dialled.ok) {
       return {
         ok: false,

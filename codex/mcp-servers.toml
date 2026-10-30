@@ -12,6 +12,6 @@
 
 [mcp_servers.w2m-fleet]
 command = "npx"
-args = ["-y", "-p", "@twinsearth/w2m-dsh-plugin@2.0.8", "w2m-mcp"]
+args = ["-y", "-p", "@twinsearth/w2m-dsh-plugin@2.0.9", "w2m-mcp"]
 startup_timeout_sec = 20
 tool_timeout_sec = 60

@@ -1232,7 +1232,7 @@ export class P2PNode extends EventEmitter {
      * that publishes no key is genuinely an older build and `PLAINTEXT_PEER` is honest; a peer that
      * publishes one we had not learned is *our* gap, and after this it is not a gap at all.
      */
-    let peerKey = this.peerKeys.get(machineId);
+    let peerKey = typeof options.peerKey === 'string' && options.peerKey !== '' ? options.peerKey : this.peerKeys.get(machineId);
     if (peerKey === null && announcedStaticKey !== null) {
       this.peerKeys.set(machineId, announcedStaticKey, 'relay');
       peerKey = announcedStaticKey;
@@ -1497,6 +1497,16 @@ export class P2PNode extends EventEmitter {
    * @param {import('./p2p.mjs').P2PChannel} channel
    * @param {{from:string|null, session:number}} details
    */
+  /** Close and forget a cached channel so a fresh dial can arm a new handshake. */
+  dropChannel(session) {
+    const channel = this.channels.get(session);
+    if (channel === undefined) return false;
+    this.channels.delete(session);
+    this.claimed.delete(session);
+    try { channel.close('replaced-by-rehandshake', { silent: true }); } catch { /* already gone */ }
+    return true;
+  }
+
   adoptChannel(channel, details) {
     const previous = this.channels.get(details.session);
     if (previous !== undefined && previous !== channel) {

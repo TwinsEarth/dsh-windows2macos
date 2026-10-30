@@ -1,0 +1,24 @@
+{
+  "version": "2.0.9",
+  "case": "RELEASE-2090",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-30T04:33:38.890Z",
+  "executor": "lead",
+  "task_id": "pre-release-2090-1793334046781",
+  "requirement": "v2.0.9: P2P reliability (ACK/RTT/window), transport abstraction + race/scheduler, iroh sidecar contract, xfer router/ref v3, fleet diagnostics, status bar",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "p2p_reliability": "p2p-transport 28/28; RTT estimator 3/3; benchmark 4 MiB loopback 15.07 MiB/s",
+      "transport_abstract": "transport 3/3, race 4/4, scheduler 4/4, discovery 3/3",
+      "iroh_sidecar": "fake-sidecar contract 4/4 (real binary pending infra)",
+      "xfer": "channel 2/2, router 2/2, recovery 2/14 combined, ref-v3 4/4",
+      "release": "preflight to be recorded before tag",
+      "preflight": "GREEN: 16 pass, 0 fail, 1 host-only UNVERIFIABLE",
+      "build": "dist/twinsearth-w2m-dsh-plugin-2.0.9.tgz sha256 dee553dc10c3a26107803517cb5a0f6bc010b31c70fe2e4e7a74371fc975aac7"
+    }
+  }
+}
