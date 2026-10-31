@@ -34,6 +34,7 @@ export const RELAY_FEATURES = Object.freeze([
   'relay-version-v1',
   'chat-text-only-v1',
   'chat-enc-v2',
+  'remote-view-v1',
 ]);
 import fs from 'node:fs';
 import os from 'node:os';

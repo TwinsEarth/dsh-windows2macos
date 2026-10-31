@@ -1,0 +1,21 @@
+{
+  "version": "2.1.5",
+  "case": "RELEASE-2150",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-31T04:33:51.426Z",
+  "executor": "lead",
+  "task_id": "pre-release-2150-1793420646683",
+  "requirement": "v2.1.5: package desktop subplugin entry + /GPW alias; root client owns UI",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "exports": "./GPW -> lib/gpw.js; ./desktop -> lib/desktop.js",
+      "idempotency": "WeakSet guard prevents double route registration",
+      "preflight": "GREEN: 16 pass, 0 fail, 1 host-only UNVERIFIABLE",
+      "build": "dist/twinsearth-w2m-dsh-plugin-2.1.5.tgz sha256 251765fdae33a8bde4e3f84fd23a844d5705a8b36a62fd2258ca86022b69429c"
+    }
+  }
+}

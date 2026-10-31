@@ -7,6 +7,12 @@ All notable changes to this project are documented here.
 - `w2m_intent`: structured intents mapped onto allow-listed commands; unknown actions, parameters and types
   are refused by name (the fleet does not invent commands).
 
+## [2.1.5] - 2026-10-31
+
+- Packaging: desktop subplugin entry `@twinsearth/w2m-dsh-plugin/desktop` (host routes) and `/GPW` alias; root client bundle keeps the UI, same model as GPW.
+- Idempotent route registration guard so root + /desktop do not mount remote-view twice.
+- No behavior change to the main plugin.
+
 ## [2.1.4] - 2026-10-31
 
 - P1.5 encrypted relay fallback: relay /v1/remote/request mailbox, host P2P-failure fallback, target polling + VK + sealed frame POST, host GET/decrypt/cache, '加密中继' UI label.

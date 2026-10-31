@@ -200,7 +200,7 @@ import { planProgress } from './joint-dev/progress.mjs';
 import { registerJointTools } from './tools-joint.mjs';
 import { fingerprintOf, readOperatorToken } from './operator-token.mjs';
 import { registerCaptureRoutes } from './capture-route.mjs';
-import { registerRemoteViewRoutes } from './remote-view-route.mjs';
+import { registerDesktop } from './desktop.mjs';
 import { defaultExecCapabilityFile } from '../util/exec-capability.mjs';
 import { createFleetCouncil, fleetCouncilThread } from './council-fleet.mjs';
 import { renderMemoryView } from './memory-view.mjs';
@@ -3619,7 +3619,7 @@ export async function apply(ctx, config = {}) {
   // renderer getDisplayMedia/navigator.clipboard, so the chat panel needs a host route that does not
   // depend on those permissions.
   registerCaptureRoutes(ctx);
-  const remoteViewRoutes = registerRemoteViewRoutes(ctx, { stateDir: cfg.stateDir ?? '', p2p });
+  const remoteViewRoutes = registerDesktop(ctx, { stateDir: cfg.stateDir ?? '', p2p });
   if (remoteViewRoutes.mounted !== true) {
     ctx.logger?.info?.('w2m: remote-view routes inactive — ' + remoteViewRoutes.reason);
   }
