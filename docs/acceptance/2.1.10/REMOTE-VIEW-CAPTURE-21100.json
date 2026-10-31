@@ -1,0 +1,20 @@
+{
+  "version": "2.1.10",
+  "case": "REMOTE-VIEW-CAPTURE-21100",
+  "kind": "positive",
+  "machines": [
+    "b1b19d49-20f1-4cdc-986e-f5630a5cd6f2"
+  ],
+  "executed_at": "2026-10-31T18:11:48.141Z",
+  "executor": "lead",
+  "task_id": "remote-view-capture-21100-1793470308142",
+  "requirement": "The relay view target must read spawnSync.status so a successful screen capture is published instead of CAPTURE_DENIED",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "status": "captureScreen reads result.status on darwin and win32",
+      "regression": "a runner returning {status:0,code:1} still captures",
+      "probe": "remote-s2-capture exit 162 on macmini"
+    }
+  }
+}

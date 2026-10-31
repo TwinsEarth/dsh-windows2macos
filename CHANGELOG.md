@@ -11,7 +11,8 @@ All notable changes to this project are documented here.
 
 - Fleet binding: a DeepSeek account switch now re-pairs the machine instead of leaving it in the previous account's fleet. Startup compares the relay's fleet_id with the fleet id derived from the signed-in account, and a 60s watcher covers a switch without a process restart. A stored token is only valid for the account that minted it; it is no longer treated as proof of the current account.
 - Fleet binding diagnostics: FLEET_MISMATCH names a binding to a different account's fleet; FLEET_UNBOUND keeps the existing re-admit rule.
-- Tests: mismatch and unbound re-admit cases in test/fleet-binding.test.mjs.
+- Remote view capture: read the `spawnSync` exit code from `status`, not the execFile-shaped `code`. `code` is `undefined` for `spawnSync`, so every successful screen capture was reported as CAPTURE_DENIED and the relay view target could never publish a frame. S2 used `status`, which is why its probe passed while the agent path failed.
+- Tests: mismatch and unbound re-admit cases in test/fleet-binding.test.mjs; a capture test pins the `status` contract and would fail on the old `code` read.
 
 ## [2.1.9] - 2026-10-31
 

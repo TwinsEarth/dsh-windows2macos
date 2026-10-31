@@ -74,7 +74,9 @@ export function captureScreen(options = {}) {
     let height = null;
     if (platform === 'win32') {
       const result = run(['powershell.exe', '-NoProfile', '-NonInteractive', '-STA', '-ExecutionPolicy', 'Bypass', '-Command', windowsCaptureScript(maxBytes)], { timeoutMs: 20000 });
-      if (result.code !== 0) return { ok: false, code: VIEW_CAPTURE_CODE.DENIED, error: `PowerShell capture failed (exit ${result.code ?? 'null'}${result.signal ? ', signal ' + result.signal : ''}${result.error?.message ? ', ' + result.error.message : ''})`, capture_ms: Date.now() - started };
+      // `spawnSync` reports the exit code as `status`; `code` is the execFile-shaped field
+      // and is undefined here, which made every successful capture look like a denial.
+      if (result.status !== 0) return { ok: false, code: VIEW_CAPTURE_CODE.DENIED, error: `PowerShell capture failed (exit ${result.status ?? 'null'}${result.signal ? ', signal ' + result.signal : ''}${result.error?.message ? ', ' + result.error.message : ''})`, capture_ms: Date.now() - started };
       base64 = String(result.stdout ?? '').trim().split(/\r?\n/).filter(Boolean).pop() ?? '';
       if (!/^[A-Za-z0-9+/=]{100,}$/.test(base64)) return { ok: false, code: VIEW_CAPTURE_CODE.FAILED, error: 'PowerShell returned no JPEG', capture_ms: Date.now() - started };
     } else if (platform === 'darwin') {
@@ -82,7 +84,9 @@ export function captureScreen(options = {}) {
       const file = join(dir, 'frame.jpg');
       try {
         const result = run(['/usr/sbin/screencapture', '-x', '-t', 'jpg', file], { timeoutMs: 15000 });
-        if (result.code !== 0) return { ok: false, code: VIEW_CAPTURE_CODE.DENIED, error: `screencapture failed (exit ${result.code})`, capture_ms: Date.now() - started };
+        // Same `spawnSync` contract: `status`, never `code`. S2 used the right field, which is
+        // why the probe succeeded while the relay view target reported CAPTURE_DENIED.
+        if (result.status !== 0) return { ok: false, code: VIEW_CAPTURE_CODE.DENIED, error: `screencapture failed (exit ${result.status})`, capture_ms: Date.now() - started };
         const data = readFileSync(file);
         base64 = data.toString('base64');
         const sips = run(['sips', '-g', 'pixelWidth', '-g', 'pixelHeight', file], { timeoutMs: 5000 });
