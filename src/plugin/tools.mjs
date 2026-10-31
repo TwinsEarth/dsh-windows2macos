@@ -1,5 +1,5 @@
 import { FAILOVER_DEFAULTS, createRelayFailover, relayPool } from './relay-failover.mjs';
-import { diagnoseFleetBinding, shouldRejoin } from './fleet-binding.mjs';
+import { diagnoseFleetBinding, shouldRejoin, selectFleetKey } from './fleet-binding.mjs';
 import { DEFAULT_BOOTSTRAP_URL, DEFAULT_BOOTSTRAP_OPERATOR_KEY_PEM } from './bootstrap.mjs';
 /**
  * DSH: Windows2MacO - the DSH Cordis plugin.
@@ -799,6 +799,17 @@ function readConfig(config = {}) {
         : (typeof process.env.W2M_FLEET_KEY === 'string' && process.env.W2M_FLEET_KEY.trim() !== ''
           ? process.env.W2M_FLEET_KEY.trim()
           : null),
+    /**
+     * v2.2.0: which key wins when a configured key and the signed-in account disagree.
+     *
+     * `'account'` (default) follows the account and treats the configured key as a fallback, so an
+     * account switch moves the machine without editing every profile. `'config'` is the explicit
+     * operator pin and keeps the old behaviour. The old silent "config always wins" made an account
+     * switch look like a binding bug on every machine that had ever stored a key.
+     */
+    fleetKeyPolicy: (config.fleetKeyPolicy === 'config' || process.env.W2M_FLEET_KEY_POLICY === 'config')
+      ? 'config'
+      : 'account',
     // From the merged layers, not from `config` alone: this is the value the fleet shares.
     allowedCommands: shared.values.allowedCommands
       .filter((entry) => typeof entry === 'string')
@@ -4904,7 +4915,18 @@ const result = await request({
       // Read, not required: this tool exists to describe a half-configured machine, so an absent or
       // unpaired device.json is part of the answer rather than a reason to refuse. `/healthz` needs
       // no bearer token, so nothing here depends on the token being present.
-      const device = await readDevice(cfg);
+      /**
+       * v2.2.0: use the same identity path every other tool uses.
+       *
+       * `readDevice(cfg)` returns an empty identity when `stateDir` is unset, while dispatch and
+       * history fall back to `DSH_HOME/xclient/device.json`. `w2m_status` was the only reader that
+       * skipped that fallback, so a working machine reported `paired: false` / `FLEET_UNPAIRED`
+       * and sent the reader to fix a pairing that was already fine.
+       */
+      const statusDeviceFile = devicePathFor(cfg);
+      const device = statusDeviceFile === null
+        ? await readDevice(cfg)
+        : await readDevice({ stateDir: path.dirname(statusDeviceFile) });
 
       // A cheap reachability probe of a documented endpoint. Without a configured URL there is
       // nothing to probe, and that is reported rather than guessed at.
@@ -5038,7 +5060,7 @@ const result = await request({
         relayUrl: cfg.rabbitUrl,
         token: device.device_token,
         machineId: device.machine_id,
-        fleetKey: cfg.fleetKey,
+        fleetKey: statusFleetKey,
         expectedFleetId,
       });
 
@@ -5078,6 +5100,7 @@ const result = await request({
             allowedCommands: cfg.allowedCommands,
             pairingCode_configured: cfg.pairingCode !== null,
             fleetKey_configured: cfg.fleetKey !== null,
+            fleetKey_policy: cfg.fleetKeyPolicy,
             p2pMode: cfg.p2pMode,
             // The resolved list, shared server first, exactly as the node will query it.
             stunServers: cfg.stunServers,
@@ -7962,10 +7985,24 @@ async function startLocalStack(ctx, cfg) {
      */
     async function deriveFleetKeyOnce(attempts = FAST_DERIVE_ATTEMPTS) {
       const configured = fleetKeyFromConfig;
-      if (configured !== null) return { fleetKey: configured, fleetKeySource: 'config', last: null };
+      /**
+       * v2.2.0: the configured key is a **fallback** unless the operator pins it.
+       *
+       * Before this, a key in the profile returned immediately and the account was never read.
+       * That is why a machine with an old key stayed in the previous account's fleet even after
+       * v2.1.10/v2.1.11 taught the binding code to compare and re-pair: it never got a new key to
+       * compare with. The default policy now reads the account first; `fleetKeyPolicy: 'config'`
+       * restores the explicit pin for fleets that outlive the signed-in account.
+       */
+      if (cfg.fleetKeyPolicy === 'config' && configured !== null) {
+        return { fleetKey: configured, fleetKeySource: 'config', last: null };
+      }
 
+      // A configured key is a usable fallback, so do not spend the full retry budget before
+      // using it. One account read is enough at mount; the watcher retries if the profile is cold.
+      const effectiveAttempts = configured !== null ? 1 : attempts;
       let last = null;
-      for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      for (let attempt = 1; attempt <= effectiveAttempts; attempt += 1) {
         try {
           const { createAccountIdentity } = await import('../chatops/account.mjs');
           last = await createAccountIdentity({ ctx, platform: process.platform }).resolve();
@@ -7982,20 +8019,28 @@ async function startLocalStack(ctx, cfg) {
          */
         const derived = last && typeof last.fleetKey === 'string' && last.fleetKey !== '' ? last.fleetKey : null;
         if (derived !== null) {
+          if (configured !== null && configured !== derived) {
+            ctx.logger?.warn?.('w2m: the signed-in account derives a different fleet than the configured fleetKey; following the account (set fleetKeyPolicy: config to pin the configured key)');
+          }
           ctx.logger?.info?.(
             `w2m: fleet key derived from the signed-in account on attempt ${attempt} (fleet ${last.accountCode})`
             + (last.ok === true ? '' : `; no serial number: ${last.reason ?? 'unknown reason'}`),
           );
           return { fleetKey: derived, fleetKeySource: 'account', last };
         }
-        if (attempt < attempts) {
+        if (attempt < effectiveAttempts) {
           const waitMs = Math.min(2000 * 2 ** (attempt - 1), 30000);
           ctx.logger?.info?.(`w2m: no fleet key yet (${describeIdentityFailure(last)}); retrying in ${waitMs}ms`);
           await new Promise((resolve) => { setTimeout(resolve, waitMs); });
         }
       }
+      // Account unavailable: the configured key, if any, is the documented fallback.
+      const fallback = selectFleetKey({ configured, account: null, policy: cfg.fleetKeyPolicy });
+      if (fallback.fleetKey !== null) {
+        ctx.logger?.warn?.('w2m: the signed-in account produced no fleet key; falling back to the configured fleetKey (mark it fleetKeyPolicy: config to make that choice explicit)');
+      }
       // Not fatal: the caller may pair by code, and a later attempt may still succeed.
-      return { fleetKey: null, fleetKeySource: null, last };
+      return { fleetKey: fallback.fleetKey, fleetKeySource: fallback.source, last };
     }
 
     let { fleetKey, fleetKeySource } = await deriveFleetKeyOnce();
@@ -8308,7 +8353,7 @@ async function startLocalStack(ctx, cfg) {
     let accountWatch = null;
     let accountWatchBusy = false;
     async function recheckAccountBinding() {
-      if (accountWatchBusy || fleetKeyFromConfig !== null) return;
+      if (accountWatchBusy || cfg.fleetKeyPolicy === 'config') return;
       accountWatchBusy = true;
       try {
         const { createAccountIdentity } = await import('../chatops/account.mjs');

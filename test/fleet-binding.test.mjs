@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { diagnoseFleetBinding, shouldRejoin, FLEET_BINDING_CODE } from '../src/plugin/fleet-binding.mjs';
+import { diagnoseFleetBinding, shouldRejoin, selectFleetKey, FLEET_BINDING_CODE } from '../src/plugin/fleet-binding.mjs';
 
 const response = (status, body) => ({ ok: status >= 200 && status < 300, status, json: async () => body });
 const devices = (entry) => response(200, { devices: entry === null ? [] : [entry] });
@@ -50,6 +50,14 @@ describe('fleet binding diagnostics', () => {
     assert.equal(block.fleet_id, 'fleet-a');
     assert.equal(block.expected_fleet_id, 'fleet-b');
     assert.match(block.remedy, /re-admit/i);
+  });
+
+  it('follows the account by default and only pins a configured key when asked', () => {
+    assert.deepEqual(selectFleetKey({ configured: 'cfg', account: 'acct' }), { fleetKey: 'acct', source: 'account' });
+    assert.deepEqual(selectFleetKey({ configured: 'cfg', account: 'acct', policy: 'config' }), { fleetKey: 'cfg', source: 'config' });
+    assert.deepEqual(selectFleetKey({ configured: 'cfg', account: null }), { fleetKey: 'cfg', source: 'config' });
+    assert.deepEqual(selectFleetKey({ configured: null, account: 'acct' }), { fleetKey: 'acct', source: 'account' });
+    assert.deepEqual(selectFleetKey({}), { fleetKey: null, source: null });
   });
 
   it('re-admits only when token is valid, fleet is missing or mismatched, and a key exists', () => {

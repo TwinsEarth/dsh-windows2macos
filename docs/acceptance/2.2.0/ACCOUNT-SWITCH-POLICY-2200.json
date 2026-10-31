@@ -1,0 +1,21 @@
+{
+  "version": "2.2.0",
+  "case": "ACCOUNT-SWITCH-POLICY-2200",
+  "kind": "positive",
+  "machines": [
+    "1bef9935-8c13-4dd9-9043-4e025320723f"
+  ],
+  "executed_at": "2026-10-31T20:06:14.655Z",
+  "executor": "lead",
+  "task_id": "account-switch-policy-2200-1793477174656",
+  "requirement": "A DeepSeek account switch must move a machine without per-machine fleetKey edits, while w2m_status must use the same device identity fallback as the other tools",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "policy": "fleetKeyPolicy defaults account; configured key is fallback; config opts out",
+      "status": "w2m_status reads DSH_HOME/xclient device.json when stateDir is unset",
+      "select": "selectFleetKey account/config/no-account tests pass",
+      "account": "profile refresh and fleet mismatch re-pair from 2.1.11"
+    }
+  }
+}

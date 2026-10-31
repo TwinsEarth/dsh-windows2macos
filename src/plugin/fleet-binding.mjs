@@ -40,6 +40,31 @@ export function shouldRejoin({ token, fleetId, fleetKey, expectedFleetId = null 
 }
 
 /**
+ * Choose the key a start actually binds with.
+ *
+ * `fleetKeyPolicy: 'account'` (the default) makes the signed-in account authoritative: an explicit
+ * `fleetKey` is a **fallback** for when the account cannot be read, not a pin that survives an
+ * account switch. `'config'` restores the old operator-pin behaviour for fleets that deliberately
+ * outlive the signed-in account.
+ *
+ * The distinction exists because a key in the profile has no provenance: it may have been placed
+ * there by an earlier setup for the *previous* account, or by an operator who means to pin the fleet.
+ * The policy is the machine-readable statement of which one it is; without it, auto-switching would
+ * silently override a deliberate pin.
+ *
+ * @param {{configured?: string|null, account?: string|null, policy?: string}} input
+ * @returns {{fleetKey: string|null, source: 'account'|'config'|null}}
+ */
+export function selectFleetKey({ configured = null, account = null, policy = 'account' } = {}) {
+  const hasConfig = typeof configured === 'string' && configured.trim() !== '';
+  const hasAccount = typeof account === 'string' && account.trim() !== '';
+  if (policy === 'config' && hasConfig) return { fleetKey: configured, source: 'config' };
+  if (hasAccount) return { fleetKey: account, source: 'account' };
+  if (hasConfig) return { fleetKey: configured, source: 'config' };
+  return { fleetKey: null, source: null };
+}
+
+/**
  * Read this machine's relay record and classify its fleet binding.
  *
  * @param {{relayUrl: string, token: string|null, machineId: string|null,

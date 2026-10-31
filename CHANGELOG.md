@@ -7,6 +7,13 @@ All notable changes to this project are documented here.
 - `w2m_intent`: structured intents mapped onto allow-listed commands; unknown actions, parameters and types
   are refused by name (the fleet does not invent commands).
 
+## [2.2.0] - 2026-11-01
+
+- Fleet binding policy: `fleetKeyPolicy: account` is the new default. A configured `fleetKey` is a fallback while the signed-in account is authoritative, so switching DeepSeek accounts moves the machine without editing every profile. Set `fleetKeyPolicy: config` to keep the old explicit-pin behaviour.
+- `w2m_status` now reads `device.json` through the `DSH_HOME/xclient` fallback when `stateDir` is unset; it no longer reports `paired: false` / `FLEET_UNPAIRED` on a working machine. The reported fleet is compared against the key the stack actually resolved.
+- Includes the v2.1.10 `spawnSync.status` capture fix and the v2.1.11 profile-refresh fix for a switched account.
+- Breaking: an explicit `fleetKey` no longer pins the fleet by default; add `fleetKeyPolicy: config` to opt out.
+
 ## [2.1.11] - 2026-11-01
 
 - Account switch: refresh the account profile when `getDeviceIdentity()` has no userId. After a DeepSeek account switch the host clears its cached profile, so the identity read returns no userId until someone calls `getProfile()`; the plugin then derived no new fleet key and kept the previous account's token. It now fetches the profile once, derives the new key, detects the fleet mismatch and re-pairs. This is the remaining half of the v2.1.10 account-switch fix.
