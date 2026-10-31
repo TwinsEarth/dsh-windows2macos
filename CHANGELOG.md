@@ -7,6 +7,11 @@ All notable changes to this project are documented here.
 - `w2m_intent`: structured intents mapped onto allow-listed commands; unknown actions, parameters and types
   are refused by name (the fleet does not invent commands).
 
+## [2.1.9] - 2026-10-31
+
+- Plugin identity: exported locale/zh.json + locale/en.json meta.title/meta.description. DSH reads these without activating the plugin, so the manager list and detail page render the custom name and copy.
+- package.json exports each locale JSON explicitly and ships locale/.
+
 ## [2.1.7] - 2026-10-31
 
 - Plugin identity: ship icon.png and package.json meta.title = "W2M：AI 智能体舰队编排工具" so a fresh install renders the custom icon/name.

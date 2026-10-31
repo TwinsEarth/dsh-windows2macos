@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "W2M: AI Agent Fleet!",
+    "description": "W2M is an open-source (MIT) AI agent fleet orchestrator. With one DeepSeek, Doubao or WorkBuddy account, it turns your own machines (Windows/Mac) into a fleet for unified command dispatch, collaboration and joint development.\nThree components: Relay (HTTP+SSE coordination server), Agent (runs on each machine, executes allow-listed commands) and Plugin (18 tools for the agent)."
+  }
+}

@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "twinsearth-w2m-dsh",
-  "version": "2.1.7",
+  "version": "2.1.9",
   "description": "Run one project across your own Windows and macOS machines from a single DeepSeek account, through 12 w2m_* tools. Four coordination modes (replicate, split, broadcast, pipeline) and six aggregate verdicts (consistent, divergent, divergent-platform, failed, partial, unverifiable). P2P hole punching by default, with a bundled relay, STUN responder and ledger fallback, so the fleet needs no third-party service. Joining needs a pairing code plus autoStartAgent: true; installing alone does not join.",
   "license": "MIT",
   "keywords": [
