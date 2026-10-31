@@ -300,6 +300,23 @@ export function createAccountIdentity(options = {}) {
     let identity;
     try {
       identity = await service.getDeviceIdentity();
+      /**
+       * A switched account is invisible until the profile is fetched.
+       *
+       * `getDeviceIdentity()` reads `getPlatformSession().userId`, and that is only populated
+       * from a profile already cached for the current grant. After credentials/record-updated
+       * the old profile is discarded and the session's userId is null until someone calls
+       * `getProfile()`. A machine that was paired before the switch therefore derived no new
+       * fleet key and kept its old token -- the reported "still in the previous account's
+       * fleet" state. Fetch the profile once when the identity is missing; the second read then
+       * sees the new account.
+       */
+      if ((identity?.userId == null) && typeof service.getProfile === 'function') {
+        try {
+          await service.getProfile();
+          identity = await service.getDeviceIdentity();
+        } catch { /* keep the signed-out answer if the profile cannot be read */ }
+      }
     } catch (error) {
       return { ok: false, reason: 'identity_read_failed', detail: error instanceof Error ? error.message : String(error) };
     }

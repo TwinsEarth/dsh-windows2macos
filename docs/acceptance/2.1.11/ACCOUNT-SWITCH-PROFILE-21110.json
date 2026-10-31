@@ -1,0 +1,20 @@
+{
+  "version": "2.1.11",
+  "case": "ACCOUNT-SWITCH-PROFILE-21110",
+  "kind": "positive",
+  "machines": [
+    "1bef9935-8c13-4dd9-9043-4e025320723f"
+  ],
+  "executed_at": "2026-10-31T19:11:34.238Z",
+  "executor": "lead",
+  "task_id": "account-switch-profile-21110-1793473894239",
+  "requirement": "After a DeepSeek account switch the plugin must refresh the cleared profile, derive the new fleet key and re-pair instead of keeping the previous fleet token",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "refresh": "identify() calls getProfile when getDeviceIdentity has no userId",
+      "key": "the switched account yields a different fleetKey",
+      "rebind": "the v2.1.10 fleet mismatch check then re-pairs"
+    }
+  }
+}

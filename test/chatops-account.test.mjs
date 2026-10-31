@@ -283,6 +283,18 @@ describe('the identity service', () => {
     assert.equal(result.ok, true);
   });
 
+  it('refreshes a stale profile so a switched account derives its own fleet key', async () => {
+    let userId = null;
+    const switched = {
+      getDeviceIdentity: async () => ({ ...(userId === null ? {} : { userId }), deviceId: 'dev-1', osVersion: '10.0' }),
+      getProfile: async () => { userId = USER; return { status: 'ready' }; },
+    };
+    const result = await createAccountIdentity({ account: switched, hardware }).resolve();
+    assert.equal(result.ok, true);
+    assert.equal(result.accountCode, accountCode(USER));
+    assert.equal(typeof result.fleetKey, 'string');
+  });
+
   it('says signed-out rather than inventing a fleet', async () => {
     // A placeholder here would put two unrelated machines in one pool — the defect being removed.
     const identity = createAccountIdentity({ account: { getDeviceIdentity: async () => ({ osVersion: '10.0' }) }, hardware });

@@ -7,6 +7,11 @@ All notable changes to this project are documented here.
 - `w2m_intent`: structured intents mapped onto allow-listed commands; unknown actions, parameters and types
   are refused by name (the fleet does not invent commands).
 
+## [2.1.11] - 2026-11-01
+
+- Account switch: refresh the account profile when `getDeviceIdentity()` has no userId. After a DeepSeek account switch the host clears its cached profile, so the identity read returns no userId until someone calls `getProfile()`; the plugin then derived no new fleet key and kept the previous account's token. It now fetches the profile once, derives the new key, detects the fleet mismatch and re-pairs. This is the remaining half of the v2.1.10 account-switch fix.
+- Tests: a stale-profile service yields the switched account's fleet key in test/chatops-account.test.mjs.
+
 ## [2.1.10] - 2026-11-01
 
 - Fleet binding: a DeepSeek account switch now re-pairs the machine instead of leaving it in the previous account's fleet. Startup compares the relay's fleet_id with the fleet id derived from the signed-in account, and a 60s watcher covers a switch without a process restart. A stored token is only valid for the account that minted it; it is no longer treated as proof of the current account.
