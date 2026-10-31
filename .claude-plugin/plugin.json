@@ -1,7 +1,7 @@
 {
   "name": "w2m-fleet",
   "description": "Drive the same project on online Windows, macOS and Linux machines from one account: read fleet state, dispatch commands and read results. The MCP surface is deliberately read-only.",
-  "version": "2.1.6",
+  "version": "2.1.7",
   "author": {
     "name": "TwinsEarth"
   },

@@ -7,6 +7,11 @@ All notable changes to this project are documented here.
 - `w2m_intent`: structured intents mapped onto allow-listed commands; unknown actions, parameters and types
   are refused by name (the fleet does not invent commands).
 
+## [2.1.7] - 2026-10-31
+
+- Plugin identity: ship icon.png and package.json meta.title = "W2M：AI 智能体舰队编排工具" so a fresh install renders the custom icon/name.
+- Desktop subplugin activation fix from 2.1.6 included.
+
 ## [2.1.6] - 2026-10-31
 
 - Desktop subplugin activation fix: no longer requires a Cordis `config` service; stateDir resolves from W2M_STATE_DIR / DSH_HOME / ~/.dsh/xclient.

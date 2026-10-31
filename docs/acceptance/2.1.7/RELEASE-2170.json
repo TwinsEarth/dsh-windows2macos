@@ -1,0 +1,21 @@
+{
+  "version": "2.1.7",
+  "case": "RELEASE-2170",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-31T06:11:59.865Z",
+  "executor": "lead",
+  "task_id": "pre-release-2170-1793426634987",
+  "requirement": "v2.1.7: plugin icon and display name metadata",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "icon": "icon.png shipped and referenced by package.json#icon",
+      "title": "meta.title set",
+      "preflight": "GREEN: 16 pass, 0 fail, 1 host-only UNVERIFIABLE",
+      "build": "dist/twinsearth-w2m-dsh-plugin-2.1.7.tgz sha256 45b8b3ae597f6ebe3843f992f1f74459f059938e42c6d409e5d6c976bc727144"
+    }
+  }
+}
