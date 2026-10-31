@@ -5021,11 +5021,25 @@ const result = await request({
       };
       })();
 
+      /**
+       * Compare against the key the stack actually resolved, not just `cfg.fleetKey`.
+       * A machine joined by account has no configured key, and that is exactly the case
+       * where a switched account used to look "bound" because only `fleet_id=null` was
+       * treated as wrong.
+       */
+      let expectedFleetId = null;
+      const statusFleetKey = resolvedFleetKey.value ?? cfg.fleetKey;
+      try {
+        const { planJoin } = await import('../chatops/fleet-join.mjs');
+        const plan = planJoin({ fleetKeyEncoded: statusFleetKey });
+        if (plan.ok === true) expectedFleetId = plan.fleetId;
+      } catch { /* malformed key: report without an expectation */ }
       const fleetBinding = await diagnoseFleetBinding({
         relayUrl: cfg.rabbitUrl,
         token: device.device_token,
         machineId: device.machine_id,
         fleetKey: cfg.fleetKey,
+        expectedFleetId,
       });
 
       return JSON.stringify(
@@ -8062,16 +8076,38 @@ async function startLocalStack(ctx, cfg) {
             if (identityOptions.identity !== undefined && identityOptions.identity !== null) identityOptions.identity.device_token = null;
             ctx.logger?.warn?.('w2m: stored device token was rejected by ' + relayForToken + ' (HTTP ' + probe.status + '); pairing again with the fleet key');
           }
-          if (alreadyPaired && fleetKeyFromConfig !== null) {
+          /**
+           * Compare the relay's binding with the fleet the **current** key derives.
+           *
+           * The old check ran only for a configured `fleetKey`, so the account-derived key
+           * (the normal case) was never compared. That is the account-switch defect: the
+           * stored token stays valid for the account that minted it, and the machine keeps
+           * heartbeating into the previous account's fleet. `fleetId=null` was the only
+           * rejoin trigger, so a non-null mismatch looked perfectly healthy.
+           */
+          const effectiveFleetKey = fleetKey ?? fleetKeyFromConfig;
+          if (alreadyPaired && effectiveFleetKey !== null) {
+            let expectedFleetId = null;
+            try {
+              const { planJoin } = await import('../chatops/fleet-join.mjs');
+              const plan = planJoin({ fleetKeyEncoded: effectiveFleetKey });
+              if (plan.ok === true) expectedFleetId = plan.fleetId;
+            } catch { /* malformed key: binding cannot be compared, keep the token */ }
             const binding = await diagnoseFleetBinding({
               relayUrl: relayForToken,
               token: existingToken,
               machineId: loaded.identity.machine_id,
-              fleetKey: fleetKeyFromConfig,
+              fleetKey: effectiveFleetKey,
+              expectedFleetId,
             });
-            if (shouldRejoin({ token: existingToken, fleetId: binding.fleet_id, fleetKey: fleetKeyFromConfig })) {
+            if (shouldRejoin({ token: existingToken, fleetId: binding.fleet_id, fleetKey: effectiveFleetKey, expectedFleetId })) {
               alreadyPaired = false;
-              ctx.logger?.warn?.('w2m: FLEET_UNBOUND (token valid, fleet_id=null); re-admitting with the configured fleet key');
+              loaded.identity.device_token = null;
+              if (identityOptions.identity !== undefined && identityOptions.identity !== null) identityOptions.identity.device_token = null;
+              ctx.logger?.warn?.(
+                `w2m: fleet binding changed (relay=${binding.fleet_id ?? 'none'}, account=${expectedFleetId ?? 'unknown'}); `
+                + `re-admitting with the ${fleetKeySource === 'config' ? 'configured' : 'account-derived'} fleet key`,
+              );
             }
           }
         } catch { /* network error: keep the token, do not force a re-pair */ }
@@ -8254,6 +8290,55 @@ async function startLocalStack(ctx, cfg) {
      */
     ensureFleetJoin = () => joinFleet();
 
+    /**
+     * Watch for an account switch while the process stays alive.
+     *
+     * The mount check repairs a switch that happened before start-up. This one covers the same
+     * event without a restart: a different DeepSeek account signs in, the account service starts
+     * returning a different user id, and the derived fleet key changes. The stored token is still
+     * valid for the *previous* account, so without this the machine keeps heartbeating into the
+     * old fleet -- the reported symptom. Re-pairing rotates the token and moves the machine.
+     *
+     * The account service is read on an interval rather than per request: it can touch the host's
+     * profile store, and a switch is a human-paced event, not a per-dispatch one. An operator-set
+     * `fleetKey` is not watched -- that is an explicit decision and must not be overwritten by
+     * whichever account happens to be signed in.
+     */
+    const ACCOUNT_WATCH_MS = 60_000;
+    let accountWatch = null;
+    let accountWatchBusy = false;
+    async function recheckAccountBinding() {
+      if (accountWatchBusy || fleetKeyFromConfig !== null) return;
+      accountWatchBusy = true;
+      try {
+        const { createAccountIdentity } = await import('../chatops/account.mjs');
+        const identity = await createAccountIdentity({ ctx, platform: process.platform }).resolve();
+        const next = typeof identity?.fleetKey === 'string' && identity.fleetKey !== '' ? identity.fleetKey : null;
+        if (next === null || next === fleetKey) return;
+        ctx.logger?.warn?.('w2m: the signed-in account changed; leaving the previous fleet and re-pairing with the new account fleet key');
+        fleetKey = next;
+        fleetKeySource = 'account';
+        resolvedFleetKey.value = next;
+        resolvedFleetKey.source = 'account';
+        resolvedFleetKey.at = Date.now();
+        alreadyPaired = false;
+        joinSucceeded = false;
+        joinPromise = null;
+        joinLastError = null;
+        joinLastWasKeyless = false;
+        loaded.identity.device_token = null;
+        if (identityOptions.identity !== undefined && identityOptions.identity !== null) identityOptions.identity.device_token = null;
+        const outcome = await joinFleet();
+        if (outcome.paired !== true) scheduleJoinRetry();
+      } catch (error) {
+        ctx.logger?.warn?.('w2m: account re-check failed: ' + (error instanceof Error ? error.message : String(error)));
+      } finally {
+        accountWatchBusy = false;
+      }
+    }
+    accountWatch = setInterval(() => { void recheckAccountBinding(); }, ACCOUNT_WATCH_MS);
+    accountWatch.unref?.();
+
     if (alreadyPaired) {
       joinSucceeded = true;
       joinPromise = Promise.resolve({ paired: true, by: 'existing token' });
@@ -8362,6 +8447,10 @@ async function startLocalStack(ctx, cfg) {
 
   return async () => {
     clearJoinRetry();
+    if (accountWatch !== null) {
+      clearInterval(accountWatch);
+      accountWatch = null;
+    }
     ensureFleetJoin = null;
     inProcessAgentStatus = null;
     await agent.stop();

@@ -13,6 +13,7 @@
 export const FLEET_BINDING_CODE = Object.freeze({
   BOUND: 'FLEET_BOUND',
   UNBOUND: 'FLEET_UNBOUND',
+  MISMATCH: 'FLEET_MISMATCH',
   UNPAIRED: 'FLEET_UNPAIRED',
   TOKEN_REJECTED: 'FLEET_TOKEN_REJECTED',
   UNKNOWN: 'FLEET_UNKNOWN',
@@ -20,12 +21,22 @@ export const FLEET_BINDING_CODE = Object.freeze({
 
 /**
  * Should a start-up re-admit even though a token exists?
- * Only when the token is valid, the machine has no fleet, and a key is available to bind it.
+ *
+ * Two states need it: the machine has no fleet (a token issued before fleet binding, or a
+ * run where the pairing code carried none), or the fleet it is in is **not the fleet the
+ * current account derives**. The second is the account-switch defect: a stored token stays
+ * valid for the account that minted it, so after a different DeepSeek account signs in the
+ * machine keeps heartbeating into the old account's fleet unless its binding is compared
+ * with the key the new account derives.
+ *
+ * An absent expected fleet id means the caller could not derive one; equality cannot be
+ * tested then, so only the unbound state re-admits.
  */
-export function shouldRejoin({ token, fleetId, fleetKey }) {
-  return typeof token === 'string' && token !== ''
-    && (fleetId === null || fleetId === undefined || fleetId === '')
-    && typeof fleetKey === 'string' && fleetKey.trim() !== '';
+export function shouldRejoin({ token, fleetId, fleetKey, expectedFleetId = null }) {
+  if (typeof token !== 'string' || token === '') return false;
+  if (typeof fleetKey !== 'string' || fleetKey.trim() === '') return false;
+  if (fleetId === null || fleetId === undefined || fleetId === '') return true;
+  return typeof expectedFleetId === 'string' && expectedFleetId !== '' && fleetId !== expectedFleetId;
 }
 
 /**
@@ -35,14 +46,16 @@ export function shouldRejoin({ token, fleetId, fleetKey }) {
  *          fleetKey: string|null, fetchImpl?: Function, timeoutMs?: number}} input
  * @returns {Promise<object>} a bounded, token-free status block
  */
-export async function diagnoseFleetBinding({ relayUrl, token, machineId, fleetKey = null, fetchImpl = fetch, timeoutMs = 2500 }) {
+export async function diagnoseFleetBinding({ relayUrl, token, machineId, fleetKey = null, expectedFleetId = null, fetchImpl = fetch, timeoutMs = 2500 }) {
   const checkedAt = new Date().toISOString();
   const fleetKeyConfigured = typeof fleetKey === 'string' && fleetKey.trim() !== '';
+  const expected = typeof expectedFleetId === 'string' && expectedFleetId !== '' ? expectedFleetId : null;
   const base = {
     ok: true,
     state: 'unknown',
     code: FLEET_BINDING_CODE.UNKNOWN,
     fleet_id: null,
+    expected_fleet_id: expected,
     token_present: typeof token === 'string' && token !== '',
     fleet_key_configured: fleetKeyConfigured,
     machine_id: machineId,
@@ -91,6 +104,16 @@ export async function diagnoseFleetBinding({ relayUrl, token, machineId, fleetKe
         remedy: fleetKeyConfigured
           ? 'a fleet key is configured; the next start re-admits this machine into its fleet'
           : 'set fleetKey / W2M_FLEET_KEY, then restart the agent so the machine can join its fleet',
+      };
+    }
+    if (expected !== null && fleetId !== expected) {
+      return {
+        ...base,
+        state: 'mismatch',
+        code: FLEET_BINDING_CODE.MISMATCH,
+        fleet_id: fleetId,
+        detail: 'the relay records this machine in a different fleet than the signed-in account derives',
+        remedy: 're-admit this machine with the account-derived fleet key; the old token must not keep it in the previous fleet',
       };
     }
     return { ...base, state: 'bound', code: FLEET_BINDING_CODE.BOUND, fleet_id: fleetId };

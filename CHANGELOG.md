@@ -7,6 +7,12 @@ All notable changes to this project are documented here.
 - `w2m_intent`: structured intents mapped onto allow-listed commands; unknown actions, parameters and types
   are refused by name (the fleet does not invent commands).
 
+## [2.1.10] - 2026-11-01
+
+- Fleet binding: a DeepSeek account switch now re-pairs the machine instead of leaving it in the previous account's fleet. Startup compares the relay's fleet_id with the fleet id derived from the signed-in account, and a 60s watcher covers a switch without a process restart. A stored token is only valid for the account that minted it; it is no longer treated as proof of the current account.
+- Fleet binding diagnostics: FLEET_MISMATCH names a binding to a different account's fleet; FLEET_UNBOUND keeps the existing re-admit rule.
+- Tests: mismatch and unbound re-admit cases in test/fleet-binding.test.mjs.
+
 ## [2.1.9] - 2026-10-31
 
 - Plugin identity: exported locale/zh.json + locale/en.json meta.title/meta.description. DSH reads these without activating the plugin, so the manager list and detail page render the custom name and copy.

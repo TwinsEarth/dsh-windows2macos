@@ -1,0 +1,20 @@
+{
+  "version": "2.1.10",
+  "case": "ACCOUNT-SWITCH-21100",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-31T18:03:23.303Z",
+  "executor": "lead",
+  "task_id": "account-switch-21100-1793469803304",
+  "requirement": "Switching the signed-in DeepSeek account must move the machine to that account fleet, not leave it heartbeating in the previous fleet",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "mismatch": "FLEET_MISMATCH names a relay fleet_id that differs from the account-derived fleet_id",
+      "rejoin": "shouldRejoin re-admits on null and on mismatch, and not when the ids agree",
+      "watch": "a 60s account check re-derives the fleet key and re-pairs after a switch"
+    }
+  }
+}

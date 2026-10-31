@@ -40,9 +40,23 @@ describe('fleet binding diagnostics', () => {
     assert.equal(network.code, FLEET_BINDING_CODE.UNKNOWN);
   });
 
-  it('re-admits only when token is valid, fleet is missing and a key exists', () => {
+  it('re-admits when the token is valid but the account derives a different fleet', async () => {
+    const block = await diagnoseFleetBinding({
+      relayUrl: 'http://relay.example', token: 't', machineId: 'm1', fleetKey: 'k', expectedFleetId: 'fleet-b',
+      fetchImpl: async () => devices({ machine_id: 'm1', fleet_id: 'fleet-a' }),
+    });
+    assert.equal(block.state, 'mismatch');
+    assert.equal(block.code, FLEET_BINDING_CODE.MISMATCH);
+    assert.equal(block.fleet_id, 'fleet-a');
+    assert.equal(block.expected_fleet_id, 'fleet-b');
+    assert.match(block.remedy, /re-admit/i);
+  });
+
+  it('re-admits only when token is valid, fleet is missing or mismatched, and a key exists', () => {
     assert.equal(shouldRejoin({ token: 't', fleetId: null, fleetKey: 'k' }), true);
-    assert.equal(shouldRejoin({ token: 't', fleetId: 'f', fleetKey: 'k' }), false);
+    assert.equal(shouldRejoin({ token: 't', fleetId: 'fleet-a', fleetKey: 'k', expectedFleetId: 'fleet-b' }), true);
+    assert.equal(shouldRejoin({ token: 't', fleetId: 'fleet-a', fleetKey: 'k', expectedFleetId: 'fleet-a' }), false);
+    assert.equal(shouldRejoin({ token: 't', fleetId: 'fleet-a', fleetKey: 'k' }), false);
     assert.equal(shouldRejoin({ token: 't', fleetId: null, fleetKey: null }), false);
     assert.equal(shouldRejoin({ token: '', fleetId: null, fleetKey: 'k' }), false);
   });
