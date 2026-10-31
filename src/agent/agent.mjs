@@ -72,6 +72,7 @@ import { CRYPTO_REASON, DEVICE_KEY_FILE, DeviceKey, PeerKeyStore, deriveSigningK
 import { createXferFrameRouter } from './transfer/router.mjs';
 import { captureScreen } from './view/capture.mjs';
 import { createViewTarget } from './view/frame-channel.mjs';
+import { startRelayViewTarget } from './view/relay-target.mjs';
 import { DEFAULT_P2P_MODE, P2P_DEFAULTS, P2PNode, normalizeP2PMode, normalizeP2PPort } from './p2p-node.mjs';
 import { punchSession, reverseDialSession } from './p2p.mjs';
 import { createSigner } from '../signing.mjs';
@@ -4469,6 +4470,10 @@ let attemptAttached = false;
     // the first heartbeat: "is an agent running here?" is the first question a
     // remote operator asks (task-16).
     publishState();
+    const viewRelay = process.env.W2M_VIEW_ALLOW === '1'
+      ? startRelayViewTarget({ rabbitUrl: baseUrl, token: () => identity.device_token, machineId: identity.machine_id, capture: (options) => captureScreen(options), log })
+      : null;
+    void viewRelay;
     if (statePublishIntervalMs > 0) {
       statePublishTimer = setInterval(() => publishState(), statePublishIntervalMs);
       // Never keep the process alive just to refresh a diagnostics file.

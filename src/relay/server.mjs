@@ -61,6 +61,7 @@ export const BLOB_FRAME_BYTES = 16 * 1024 * 1024; // 16 MiB per blob frame -- th
 // the JSON frame limit stays 64 KiB for every other route.
 import { createFleetMessages } from './fleet-messages.mjs';
 import { createRemoteMediaBroker, parseRemoteFrame } from './remote-media.mjs';
+import { createRemoteRequestBroker } from './remote-requests.mjs';
 import { can as mayAct } from '../util/policy-matrix.mjs';
 import { createFleetMemory } from './fleet-memory.mjs';
 import { createJoinChallenges } from './join-challenge.mjs';
@@ -1451,6 +1452,30 @@ export class RelayServer {
     this.fleetMessages ??= createFleetMessages({ now: () => this.state.nowMs() });
     this.fleetMemory ??= createFleetMemory({ now: () => this.state.nowMs() });
 
+    if (path === '/v1/remote/request') {
+      // P1.5 signalling: one pending request per target, relay memory only.
+      this.remoteRequests ??= createRemoteRequestBroker();
+      if (method === 'POST') {
+        const body = takeJson();
+        const target = typeof body?.target === 'string' ? body.target : '';
+        const targetDevice = target === '' ? null : this.state.devices.get(target);
+        if (targetDevice === undefined || targetDevice === null || targetDevice.fleet_id !== device.fleet_id) {
+          return sendJson(res, 403, { protocol_version: PROTOCOL_VERSION, ok: false, error: { code: 'REMOTE_REQUEST_BAD', message: 'target is not in this fleet' } });
+        }
+        const posted = this.remoteRequests.post(body);
+        if (posted.ok !== true) return sendJson(res, 400, { protocol_version: PROTOCOL_VERSION, ok: false, error: { code: posted.code, message: 'remote.request refused' } });
+        return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, ok: true, target: posted.target, ttl_ms: posted.ttl_ms });
+      }
+      if (method === 'GET') {
+        const target = url.searchParams.get('target');
+        if (target !== device.machine_id) return sendJson(res, 403, { protocol_version: PROTOCOL_VERSION, ok: false, error: { code: 'REMOTE_REQUEST_BAD', message: 'only the target may read its request' } });
+        const taken = this.remoteRequests.take(target);
+        if (taken.ok !== true) return sendJson(res, 404, { protocol_version: PROTOCOL_VERSION, ok: false, error: { code: taken.code, message: 'remote.request unavailable' } });
+        return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, ok: true, ...taken });
+      }
+      return sendJson(res, 405, { protocol_version: PROTOCOL_VERSION, ok: false, error: { code: 'METHOD_NOT_ALLOWED', message: 'GET or POST only' } });
+    }
+
     if (path === '/v1/remote/frame') {
       // P1.5: opaque ciphertext only. The body is never logged, parsed as media
       // or persisted; the broker keeps one newest frame per session with a TTL.
@@ -1466,7 +1491,7 @@ export class RelayServer {
         }
         const opened = this.remoteMedia.open(parsed.session_id, parsed.target);
         if (opened.ok !== true) return sendJson(res, 400, { protocol_version: PROTOCOL_VERSION, ok: false, error: { code: opened.code, message: 'remote.frame refused' } });
-        const stored = this.remoteMedia.put(parsed.session_id, parsed.target, parsed.ciphertext);
+        const stored = this.remoteMedia.put(parsed.session_id, parsed.target, parsed.ciphertext, parsed.public_key);
         if (stored.ok !== true) return sendJson(res, 413, { protocol_version: PROTOCOL_VERSION, ok: false, error: { code: stored.code, message: 'remote.frame refused' } });
         return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, ok: true, bytes: stored.bytes });
       }
@@ -1475,7 +1500,7 @@ export class RelayServer {
         const target = url.searchParams.get('target');
         const taken = this.remoteMedia.take(sessionId, target);
         if (taken.ok !== true) return sendJson(res, 404, { protocol_version: PROTOCOL_VERSION, ok: false, error: { code: taken.code, message: 'remote.frame unavailable' } });
-        return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, ok: true, ct: taken.ciphertext.toString('base64'), bytes: taken.bytes, at_ms: taken.at });
+        return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, ok: true, ct: taken.ciphertext.toString('base64'), public_key: taken.public_key ?? null, bytes: taken.bytes, at_ms: taken.at });
       }
       return sendJson(res, 405, { protocol_version: PROTOCOL_VERSION, ok: false, error: { code: 'METHOD_NOT_ALLOWED', message: 'GET or POST only' } });
     }

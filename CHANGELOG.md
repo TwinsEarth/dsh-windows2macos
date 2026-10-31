@@ -7,6 +7,13 @@ All notable changes to this project are documented here.
 - `w2m_intent`: structured intents mapped onto allow-listed commands; unknown actions, parameters and types
   are refused by name (the fleet does not invent commands).
 
+## [2.1.4] - 2026-10-31
+
+- P1.5 encrypted relay fallback: relay /v1/remote/request mailbox, host P2P-failure fallback, target polling + VK + sealed frame POST, host GET/decrypt/cache, '加密中继' UI label.
+- P2P: p2pPublicPort announcement override; p2pPort config normalization.
+- Target relay polling starts only with W2M_VIEW_ALLOW=1.
+- Verification: preflight GREEN; view/p2p/relay tests pass; real relay deployment + two-machine E2E still pending.
+
 ## [2.1.3] - 2026-10-31
 
 - Remote-view candidate: target selector, view.hello/VK (X25519+HKDF, AES-256-GCM), host decrypt, relay remote.frame broker/route, '加密中继' UI label.

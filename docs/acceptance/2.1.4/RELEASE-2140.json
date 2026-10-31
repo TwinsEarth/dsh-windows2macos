@@ -1,0 +1,22 @@
+{
+  "version": "2.1.4",
+  "case": "RELEASE-2140",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-31T03:04:58.412Z",
+  "executor": "lead",
+  "task_id": "pre-release-2140-1793415396132",
+  "requirement": "v2.1.4: P1.5 encrypted relay fallback + p2pPublicPort",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "preflight": "GREEN: 16 pass, 0 fail, 1 host-only UNVERIFIABLE",
+      "p1_5": "relay request mailbox, host fallback, target polling/encrypt, host decrypt",
+      "p2p": "p2pPort + p2pPublicPort, local three-way 31559 verified",
+      "e2e": "pending new relay deployment",
+      "build": "dist/twinsearth-w2m-dsh-plugin-2.1.4.tgz sha256 2be2c19720b20e7dcf36fb9032170ee13e711eec4e8e52d3ae1a4b6b6eb44ca1"
+    }
+  }
+}

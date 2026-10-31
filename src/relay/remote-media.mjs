@@ -48,14 +48,14 @@ export function createRemoteMediaBroker(options = {}) {
       return { ok: true, code: REMOTE_MEDIA_CODE.OK, session_id: sessionId, target: targetMachineId };
     },
     /** Store one opaque ciphertext frame (latest wins). */
-    put(sessionId, targetMachineId, ciphertext) {
+    put(sessionId, targetMachineId, ciphertext, publicKey = null) {
       prune();
       const entry = sessions.get(sessionId);
       if (entry === undefined) return { ok: false, code: REMOTE_MEDIA_CODE.NOT_FOUND };
       if (entry.target !== targetMachineId) return { ok: false, code: REMOTE_MEDIA_CODE.BAD_SESSION };
       if (!(ciphertext instanceof Uint8Array) || ciphertext.byteLength === 0) return { ok: false, code: REMOTE_MEDIA_CODE.BAD_PAYLOAD };
       if (ciphertext.byteLength > maxBytes) return { ok: false, code: REMOTE_MEDIA_CODE.TOO_LARGE };
-      entry.frame = { ciphertext: Buffer.from(ciphertext), bytes: ciphertext.byteLength, at: now() };
+      entry.frame = { ciphertext: Buffer.from(ciphertext), bytes: ciphertext.byteLength, public_key: typeof publicKey === 'string' ? publicKey : null, at: now() };
       entry.expiresAt = now() + ttlMs;
       return { ok: true, code: REMOTE_MEDIA_CODE.OK, bytes: ciphertext.byteLength };
     },
@@ -81,7 +81,8 @@ export function parseRemoteFrame(body) {
   if (typeof body.session_id !== 'string' || body.session_id === '') return { ok: false, code: REMOTE_MEDIA_CODE.BAD_SESSION };
   if (typeof body.target !== 'string' || body.target === '') return { ok: false, code: REMOTE_MEDIA_CODE.BAD_SESSION };
   if (typeof body.ct !== 'string' || body.ct === '') return { ok: false, code: REMOTE_MEDIA_CODE.BAD_PAYLOAD };
+  if (body.public_key !== undefined && (typeof body.public_key !== 'string' || Buffer.from(body.public_key, 'base64').length !== 32)) return { ok: false, code: REMOTE_MEDIA_CODE.BAD_PAYLOAD };
   let ciphertext;
   try { ciphertext = Buffer.from(body.ct, 'base64'); } catch { return { ok: false, code: REMOTE_MEDIA_CODE.BAD_PAYLOAD }; }
-  return { ok: true, session_id: body.session_id, target: body.target, ciphertext };
+  return { ok: true, session_id: body.session_id, target: body.target, ciphertext, public_key: body.public_key ?? null };
 }
