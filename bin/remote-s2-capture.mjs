@@ -44,6 +44,25 @@ export function summaryBits(result) {
   return bits;
 }
 
+function captureWindows() {
+  const script = [
+    'Add-Type -AssemblyName System.Windows.Forms,System.Drawing',
+    '$b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds',
+    '$bmp=New-Object System.Drawing.Bitmap $b.Width,$b.Height',
+    '$g=[System.Drawing.Graphics]::FromImage($bmp)',
+    '$g.CopyFromScreen($b.Left,$b.Top,0,0,$bmp.Size)',
+    '$ms=New-Object System.IO.MemoryStream',
+    '$bmp.Save($ms,[System.Drawing.Imaging.ImageFormat]::Jpeg)',
+    '[Convert]::ToBase64String($ms.ToArray())',
+  ].join(';');
+  const started = Date.now();
+  const run = spawnSync('powershell.exe', ['-NoProfile','-NonInteractive','-STA','-ExecutionPolicy','Bypass','-Command', script], { timeout: 20000, encoding: 'utf8' });
+  const ms = Date.now() - started;
+  const base64 = String(run.stdout ?? '').trim().split(/\r?\n/).filter(Boolean).pop() ?? '';
+  const bytes = /^[A-Za-z0-9+/=]{100,}$/.test(base64) ? Buffer.from(base64, 'base64').length : 0;
+  return { ok: run.status === 0 && bytes > 0, status: run.status, ms, bytes, width: null, height: null, error: run.status === 0 ? null : String(run.stderr ?? '').slice(0, 300) };
+}
+
 function capture(file, dimensions = true) {
   const started = Date.now();
   const run = spawnSync('screencapture', ['-x', '-t', 'jpg', file], { timeout: 15000, encoding: 'utf8' });
@@ -81,6 +100,16 @@ function main() {
     tcc_guess: 'unknown',
     code: null,
   };
+  if (process.platform === 'win32') {
+    result.captures.push(captureWindows());
+    spawnSync('ping', ['-n', opts.fps === 2 ? '1' : '2', '127.0.0.1'], { timeout: 5000 });
+    result.captures.push(captureWindows());
+    result.tcc_guess = 'not-applicable-windows';
+    result.ok = result.captures.every((entry) => entry.ok === true);
+    result.code = result.ok ? 'S2_CAPTURE_OK' : 'S2_CAPTURE_FAILED';
+    finish(result, opts, result.ok ? 0 : 3);
+    return;
+  }
   if (process.platform !== 'darwin') {
     result.code = 'S2_UNSUPPORTED_PLATFORM';
     finish(result, opts, 2);

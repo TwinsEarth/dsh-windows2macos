@@ -60,6 +60,7 @@ export const BLOB_FRAME_BYTES = 16 * 1024 * 1024; // 16 MiB per blob frame -- th
 // BLOB_UPLOAD_FAILED even though the agent had accepted it. One number for "how large may one artifact be" is the honest shape;
 // the JSON frame limit stays 64 KiB for every other route.
 import { createFleetMessages } from './fleet-messages.mjs';
+import { createRemoteMediaBroker, parseRemoteFrame } from './remote-media.mjs';
 import { can as mayAct } from '../util/policy-matrix.mjs';
 import { createFleetMemory } from './fleet-memory.mjs';
 import { createJoinChallenges } from './join-challenge.mjs';
@@ -737,7 +738,10 @@ export class RelayServer {
     // received bytes, so no route may consume the stream first and re-serialise.
     /** v1.2.7: only the blob channel gets the larger frame cap; every JSON route keeps the 64 KiB frame limit. */
     const blobFrameLimit = method === 'PUT' && path.startsWith('/v1/fleet/blobs/') ? BLOB_FRAME_BYTES : this.frameLimitBytes;
-    const rawBody = methodHasBody(method) ? await readRawBody(req, blobFrameLimit) : null;
+    // P1.5: 47 KiB ciphertext is ~63 KiB once base64-encoded inside JSON; give this
+    // one opaque route the headroom it needs, and no other JSON route gets it.
+    const bodyFrameLimit = method === 'POST' && path === '/v1/remote/frame' ? 70 * 1024 : blobFrameLimit;
+    const rawBody = methodHasBody(method) ? await readRawBody(req, bodyFrameLimit) : null;
     const takeJson = () => parseJsonBody(rawBody);
 
     /* ---- public endpoints ---- */
@@ -1446,6 +1450,35 @@ export class RelayServer {
     // because a caller that cannot tell "too big" from "over quota" from "not text" cannot tell the operator what to do.
     this.fleetMessages ??= createFleetMessages({ now: () => this.state.nowMs() });
     this.fleetMemory ??= createFleetMemory({ now: () => this.state.nowMs() });
+
+    if (path === '/v1/remote/frame') {
+      // P1.5: opaque ciphertext only. The body is never logged, parsed as media
+      // or persisted; the broker keeps one newest frame per session with a TTL.
+      this.remoteMedia ??= createRemoteMediaBroker();
+      if (method === 'POST') {
+        const body = takeJson();
+        const parsed = parseRemoteFrame(body);
+        if (parsed.ok !== true) {
+          return sendJson(res, 400, { protocol_version: PROTOCOL_VERSION, ok: false, error: { code: parsed.code, message: 'remote.frame refused' } });
+        }
+        if (parsed.target !== device.machine_id) {
+          return sendJson(res, 403, { protocol_version: PROTOCOL_VERSION, ok: false, error: { code: 'REMOTE_MEDIA_BAD_SESSION', message: 'only the target machine may publish its frame' } });
+        }
+        const opened = this.remoteMedia.open(parsed.session_id, parsed.target);
+        if (opened.ok !== true) return sendJson(res, 400, { protocol_version: PROTOCOL_VERSION, ok: false, error: { code: opened.code, message: 'remote.frame refused' } });
+        const stored = this.remoteMedia.put(parsed.session_id, parsed.target, parsed.ciphertext);
+        if (stored.ok !== true) return sendJson(res, 413, { protocol_version: PROTOCOL_VERSION, ok: false, error: { code: stored.code, message: 'remote.frame refused' } });
+        return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, ok: true, bytes: stored.bytes });
+      }
+      if (method === 'GET') {
+        const sessionId = url.searchParams.get('session_id');
+        const target = url.searchParams.get('target');
+        const taken = this.remoteMedia.take(sessionId, target);
+        if (taken.ok !== true) return sendJson(res, 404, { protocol_version: PROTOCOL_VERSION, ok: false, error: { code: taken.code, message: 'remote.frame unavailable' } });
+        return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, ok: true, ct: taken.ciphertext.toString('base64'), bytes: taken.bytes, at_ms: taken.at });
+      }
+      return sendJson(res, 405, { protocol_version: PROTOCOL_VERSION, ok: false, error: { code: 'METHOD_NOT_ALLOWED', message: 'GET or POST only' } });
+    }
 
     if (method === 'POST' && path === '/v1/fleet/messages') {
       /**

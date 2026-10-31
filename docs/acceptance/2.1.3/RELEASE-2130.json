@@ -1,0 +1,22 @@
+{
+  "version": "2.1.3",
+  "case": "RELEASE-2130",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-31T01:23:10.013Z",
+  "executor": "lead",
+  "task_id": "pre-release-2130-1793406434998",
+  "requirement": "v2.1.3 remote-view candidate: p2pPort config, VK/hello frame channel, relay media broker",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "p2p_port": "p2pPort/p2pPublicPort normalized; local bind=announced public=31559 verified on ToFuture",
+      "vk": "view.hello/VK + AES-GCM frame 3/3",
+      "relay": "remote.frame ciphertext broker/route; relay suite 189/189",
+      "preflight": "GREEN: 16 pass, 0 fail, 1 host-only UNVERIFIABLE",
+      "build": "dist/twinsearth-w2m-dsh-plugin-2.1.3.tgz sha256 3017057f63c68debef3116b4791e2ff937fd2fbb4715b92383c433433f20afcb"
+    }
+  }
+}

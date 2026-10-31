@@ -451,6 +451,7 @@ export class P2PNode extends EventEmitter {
       bindUdpSocket = bindUdpSocketDefault,
       bindAddress = '0.0.0.0',
       bindPort = 0,
+      publicPort = null,
       deviceKey = null,
       peerKeys = null,
       cryptoTuning = null,
@@ -465,6 +466,8 @@ export class P2PNode extends EventEmitter {
     }
     this.machineId = machineId;
     this.rabbitUrl = rabbitUrl;
+    const publicPortResult = normalizeP2PPort(publicPort);
+    this.publicPort = publicPortResult.ok ? publicPortResult.port : null;
 
     for (const [name, value] of [
       ['postJson', postJson],
@@ -927,7 +930,10 @@ export class P2PNode extends EventEmitter {
         ? 'unknown'
         : null;
 
-    const candidates = this.usableCandidates(reflexive);
+    // A port-forward can make an external port reachable while STUN still reports
+    // the router's outbound mapping. Announce the operator-declared port instead.
+    const announcedReflexive = reflexive !== null && this.publicPort !== null ? { ...reflexive, port: this.publicPort } : reflexive;
+    const candidates = this.usableCandidates(announcedReflexive);
 
     if (candidates.length === 0) {
       const error = `P2P_NO_CANDIDATES: nothing usable to announce (${discoveryError})`;
@@ -936,7 +942,7 @@ export class P2PNode extends EventEmitter {
         socket,
         candidates: [],
         mapping,
-        reflexive,
+        reflexive: announcedReflexive,
         ok: false,
         error,
         posted: false,

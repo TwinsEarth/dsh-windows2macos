@@ -7,6 +7,22 @@ All notable changes to this project are documented here.
 - `w2m_intent`: structured intents mapped onto allow-listed commands; unknown actions, parameters and types
   are refused by name (the fleet does not invent commands).
 
+## [2.1.3] - 2026-10-31
+
+- Remote-view candidate: target selector, view.hello/VK (X25519+HKDF, AES-256-GCM), host decrypt, relay remote.frame broker/route, '加密中继' UI label.
+- Still missing: P1.5 auto-fallback, target consent UI, deployed relay endpoint, real P2P verification. Test candidate.
+
+## [2.1.2] - 2026-10-31
+
+- Remote-view preview: settings toggle, iMac sidebar entry, local 1fps JPEG viewer, target capture module, P2P view frame protocol, host /remote/start|frame|stop routes, encrypted-relay media broker (safety core).
+- Known gaps: P1.5 relay media is not wired end-to-end; peerKey/consent UI and real remote-desktop verification are pending. This release is a test candidate, not feature-complete.
+
+## [2.1.0] - 2026-10-31
+
+- Remote-view planning: REMOTE-DESKTOP-2.1.0.md and S2 capture probe (bin/remote-s2-capture.mjs).
+- Packaging: GitHub Packages artifact published as 2.1.0 for version alignment.
+- Status: the remote-desktop UI (settings toggle, iMac sidebar tab, viewer) is **not implemented yet**; 2.1.0 must not be described as feature-complete.
+
 ## [2.0.10] - 2026-10-31
 
 - remote-view S2: ship scripts/remote-s2-capture.mjs so macOS capture/TCC probes run as a normal script (no node -e, no reparse refusal); measures 1/2 fps capture timing, JPEG size, ffmpeg presence, writes w2m-s2-result.json and supports exit-code summary.

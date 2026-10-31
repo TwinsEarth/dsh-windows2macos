@@ -137,6 +137,7 @@ import {
   P2PNode,
   SHARED_SERVER,
   normalizeP2PMode,
+  normalizeP2PPort,
   stunServersWithShared,
 } from '../agent/p2p-node.mjs';
 // The punch identity both ends have to agree on (v0.4.x). Imported from the transport that will use
@@ -199,6 +200,7 @@ import { planProgress } from './joint-dev/progress.mjs';
 import { registerJointTools } from './tools-joint.mjs';
 import { fingerprintOf, readOperatorToken } from './operator-token.mjs';
 import { registerCaptureRoutes } from './capture-route.mjs';
+import { registerRemoteViewRoutes } from './remote-view-route.mjs';
 import { defaultExecCapabilityFile } from '../util/exec-capability.mjs';
 import { createFleetCouncil, fleetCouncilThread } from './council-fleet.mjs';
 import { renderMemoryView } from './memory-view.mjs';
@@ -742,6 +744,8 @@ function readConfig(config = {}) {
   // silent default when a value *is* supplied.
   const p2p = resolveP2PMode(config);
   const p2pMode = p2p.mode;
+  const p2pPortResult = normalizeP2PPort(config.p2pPort);
+  const p2pPublicPortResult = normalizeP2PPort(config.p2pPublicPort);
   const stun = resolveStunServers(config);
   const stunList = stun.servers;
 
@@ -929,6 +933,9 @@ function readConfig(config = {}) {
       ? config.bootstrapOperatorKey
       : (typeof process.env.W2M_BOOTSTRAP_OPERATOR_KEY === 'string' && process.env.W2M_BOOTSTRAP_OPERATOR_KEY.trim() !== '' ? process.env.W2M_BOOTSTRAP_OPERATOR_KEY : DEFAULT_BOOTSTRAP_OPERATOR_KEY_PEM),
     p2pMode,
+    p2pPort: p2pPortResult.ok ? p2pPortResult.port : null,
+    p2pPortError: p2pPortResult.ok ? null : `P2P_PORT_INVALID: ${p2pPortResult.reason}`,
+    p2pPublicPort: p2pPublicPortResult.ok ? p2pPublicPortResult.port : null,
     stunServers: stunList,
   };
 }
@@ -2030,6 +2037,8 @@ async function initP2P(ctx, cfg, runtime, block) {
     getJson: transport.getJson,
     stunServers: cfg.stunServers,
     log: (line) => ctx?.logger?.info?.(`w2m ${line}`),
+    ...(Number.isInteger(cfg.p2pPort) ? { bindPort: cfg.p2pPort } : {}),
+    ...(Number.isInteger(cfg.p2pPublicPort) ? { publicPort: cfg.p2pPublicPort } : {}),
     ...(keyLoad.key === null ? {} : { deviceKey: keyLoad.key }),
     ...block,
   });
@@ -3610,6 +3619,10 @@ export async function apply(ctx, config = {}) {
   // renderer getDisplayMedia/navigator.clipboard, so the chat panel needs a host route that does not
   // depend on those permissions.
   registerCaptureRoutes(ctx);
+  const remoteViewRoutes = registerRemoteViewRoutes(ctx, { stateDir: cfg.stateDir ?? '', p2p });
+  if (remoteViewRoutes.mounted !== true) {
+    ctx.logger?.info?.('w2m: remote-view routes inactive — ' + remoteViewRoutes.reason);
+  }
   if (capabilityRoutes.mounted !== true) {
     ctx.logger?.warn?.('w2m: the execution-capability control is inactive — ' + capabilityRoutes.reason);
   }
