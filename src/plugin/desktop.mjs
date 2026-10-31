@@ -7,6 +7,8 @@
  * idempotency guard because both entries share this module instance.
  */
 import { registerRemoteViewRoutes } from './remote-view-route.mjs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 
 export const name = 'dsh-w2m-desktop';
 export const inject = ['connection'];
@@ -32,6 +34,7 @@ export function registerDesktop(ctx, deps = {}) {
  * owns the UI; this half only registers the host routes.
  */
 export function apply(ctx) {
-  const stateDir = typeof ctx?.config?.stateDir === 'string' ? ctx.config.stateDir : '';
+  const stateDir = process.env.W2M_STATE_DIR
+    ?? (process.env.DSH_HOME ? join(process.env.DSH_HOME, 'xclient') : join(homedir(), '.dsh', 'xclient'));
   return registerDesktop(ctx, { stateDir, p2p: null });
 }

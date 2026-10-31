@@ -1,0 +1,21 @@
+{
+  "version": "2.1.6",
+  "case": "RELEASE-2160",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-10-31T05:42:29.214Z",
+  "executor": "lead",
+  "task_id": "pre-release-2160-1793424835992",
+  "requirement": "v2.1.6: desktop subplugin activates without config service; three components listed",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "desktop": "inject=[connection]; stateDir fallback",
+      "components": "root + /desktop + /gpw",
+      "preflight": "GREEN: 16 pass, 0 fail, 1 host-only UNVERIFIABLE",
+      "build": "dist/twinsearth-w2m-dsh-plugin-2.1.6.tgz sha256 1588fd7f55aca6401367360b75599827c154005c545bc4ff13432490e4a3674a"
+    }
+  }
+}

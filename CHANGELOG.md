@@ -7,6 +7,12 @@ All notable changes to this project are documented here.
 - `w2m_intent`: structured intents mapped onto allow-listed commands; unknown actions, parameters and types
   are refused by name (the fleet does not invent commands).
 
+## [2.1.6] - 2026-10-31
+
+- Desktop subplugin activation fix: no longer requires a Cordis `config` service; stateDir resolves from W2M_STATE_DIR / DSH_HOME / ~/.dsh/xclient.
+- Plugin details now lists three components: root, /desktop, /gpw; /desktop activates alongside the root bundle (idempotent route guard).
+- Removed the duplicate case-only `./GPW` export key that broke case-insensitive manifest tooling; lowercase `/gpw` remains.
+
 ## [2.1.5] - 2026-10-31
 
 - Packaging: desktop subplugin entry `@twinsearth/w2m-dsh-plugin/desktop` (host routes) and `/GPW` alias; root client bundle keeps the UI, same model as GPW.

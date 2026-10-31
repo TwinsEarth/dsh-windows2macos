@@ -127,6 +127,10 @@
     #
     # What it does once enabled: answers `approval/request` with at most 10 auto-approvals per rolling 60 s, at
     # least 3000 ms apart, and defers everything past that to the human prompt, where it waits.
+    - id: dsh-desktop
+      name: '@twinsearth/w2m-dsh-plugin/desktop'
+      disabled: true
+      config: {}
     - id: dsh-gpw
       name: '@twinsearth/w2m-dsh-plugin/gpw'
       disabled: true
