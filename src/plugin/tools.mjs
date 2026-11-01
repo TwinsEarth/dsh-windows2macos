@@ -1,5 +1,7 @@
 import { FAILOVER_DEFAULTS, createRelayFailover, relayPool } from './relay-failover.mjs';
 import { diagnoseFleetBinding, shouldRejoin, selectFleetKey } from './fleet-binding.mjs';
+import { fleetHomePath, getFleetHome, readFleetHome, rememberFleetAccount, rememberFleetHome, shouldPreserveExistingFleet } from './fleet-home.mjs';
+import { fleetConfigPathFor, readFleetConfig } from './fleet-config.mjs';
 import { DEFAULT_BOOTSTRAP_URL, DEFAULT_BOOTSTRAP_OPERATOR_KEY_PEM } from './bootstrap.mjs';
 /**
  * DSH: Windows2MacO - the DSH Cordis plugin.
@@ -194,6 +196,7 @@ import { registerChatRoutes } from './fleet-chat-route.mjs';
 import { registerExecCapabilityRoutes } from './exec-capability-route.mjs';
 import { registerPluginUpdateRoutes } from './update-route.mjs';
 import { registerOperatorTokenRoute } from './operator-token-route.mjs';
+import { registerFleetConfigRoute } from './fleet-config-route.mjs';
 import { registerDataplaneSinkRoute } from './dataplane-sink-route.mjs';
 import { registerProjectStreamRoute } from './project-stream-route.mjs';
 import { planProgress } from './joint-dev/progress.mjs';
@@ -452,6 +455,28 @@ function configError(setting, why, hint, reasonCode) {
     ...(reasonCode === undefined ? {} : { reason_code: reasonCode }),
   });
 }
+
+/**
+ * Read `fleetKeyPolicy` without silently accepting a typo.
+ *
+ * The three values are materially different: `home` returns to the machine's previous fleet for
+ * this account, `account` follows the signed-in account and may create/join a new fleet, and
+ * `config` pins one operator-supplied key. A typo that defaulted to any one of them would be a
+ * silent fleet move, so it is a startup error naming the setting.
+ */
+function resolveFleetKeyPolicy(config, env) {
+  const fromConfig = typeof config?.fleetKeyPolicy === 'string' ? config.fleetKeyPolicy.trim() : '';
+  const fromEnv = typeof env?.W2M_FLEET_KEY_POLICY === 'string' ? env.W2M_FLEET_KEY_POLICY.trim() : '';
+  const value = fromConfig !== '' ? fromConfig : (fromEnv !== '' ? fromEnv : 'home');
+  if (value === 'home' || value === 'account' || value === 'config') return value;
+  const setting = fromConfig !== '' ? 'fleetKeyPolicy' : 'W2M_FLEET_KEY_POLICY';
+  throw configError(
+    setting,
+    `must be one of "home", "account" or "config" (got "${value}")`,
+    'set fleetKeyPolicy to home (return to the previous fleet for this account), account (follow the signed-in account) or config (pin the configured key)',
+  );
+}
+
 
 // ---------------------------------------------------------------------------------------------
 // Cooperative cancellation
@@ -738,6 +763,22 @@ function readConfig(config = {}) {
   const stateDir = typeof config.stateDir === 'string' && config.stateDir.trim() !== ''
     ? path.resolve(config.stateDir.trim())
     : null;
+  /**
+   * The settings-page pin. This is the supported alternative to editing `cordis.patch.yml`: the
+   * route writes it atomically and the plugin reads it here with higher precedence than the profile
+   * fields. A corrupt pin fails startup with the path named rather than silently using the account
+   * key and moving the machine.
+   */
+  const fleetConfigFile = fleetConfigPathFor(config.stateDir);
+  const fleetConfigRead = fleetConfigFile === null ? { ok: true, config: null } : readFleetConfig(fleetConfigFile);
+  if (fleetConfigRead.ok !== true) {
+    throw configError(
+      'fleet-config.json',
+      `is unreadable (${fleetConfigRead.code}: ${fleetConfigRead.error})`,
+      `repair or remove ${fleetConfigRead.path ?? fleetConfigFile ?? 'fleet-config.json'}; the settings page writes it atomically`,
+    );
+  }
+  const fleetPin = fleetConfigRead.config;
 
   // §7: both of these are validated here, at `apply()` time, so a typo is a startup error that names
   // the setting rather than a status field nobody reads. See the two resolvers for why there is no
@@ -794,22 +835,21 @@ function readConfig(config = {}) {
        * computed where it is used. `W2M_FLEET_KEY` is accepted too, so a machine can be pointed at
        * a fleet without editing a profile.
        */
-      fleetKey: typeof config.fleetKey === 'string' && config.fleetKey.trim() !== ''
+      fleetKey: fleetPin?.fleetKey ?? (typeof config.fleetKey === 'string' && config.fleetKey.trim() !== ''
         ? config.fleetKey.trim()
         : (typeof process.env.W2M_FLEET_KEY === 'string' && process.env.W2M_FLEET_KEY.trim() !== ''
           ? process.env.W2M_FLEET_KEY.trim()
-          : null),
+          : null)),
     /**
-     * v2.2.0: which key wins when a configured key and the signed-in account disagree.
+     * v2.2.1: which key wins when a configured key, the account-derived key and this machine's
+     * previous fleet for that account disagree.
      *
-     * `'account'` (default) follows the account and treats the configured key as a fallback, so an
-     * account switch moves the machine without editing every profile. `'config'` is the explicit
-     * operator pin and keeps the old behaviour. The old silent "config always wins" made an account
-     * switch look like a binding bug on every machine that had ever stored a key.
+     * `home` (default) returns to the last fleet used for the signed-in account; `account` is the
+     * v2.2.0 opt-in that always follows the account; `config` is the explicit operator pin. A pin
+     * written from the settings page is authoritative and carries its own policy.
      */
-    fleetKeyPolicy: (config.fleetKeyPolicy === 'config' || process.env.W2M_FLEET_KEY_POLICY === 'config')
-      ? 'config'
-      : 'account',
+    fleetKeyPolicy: fleetPin?.policy ?? resolveFleetKeyPolicy(config, process.env),
+    fleetConfigFile,
     // From the merged layers, not from `config` alone: this is the value the fleet shares.
     allowedCommands: shared.values.allowedCommands
       .filter((entry) => typeof entry === 'string')
@@ -3621,6 +3661,8 @@ export async function apply(ctx, config = {}) {
   // verified updater (SHA-256 checked, old package backed up, restart required afterwards).
   const _updateRoutes = registerPluginUpdateRoutes(ctx, { profileDir: () => cfg.profileDir });
     const _operatorTokenRoute = registerOperatorTokenRoute(ctx, { configuredToken: () => cfg.operatorToken });
+  // v2.2.1: the settings page writes an independent fleet pin. It never edits cordis.patch.yml.
+  const _fleetConfigRoute = registerFleetConfigRoute(ctx, { file: () => fleetConfigPathFor(cfg.stateDir) });
   // A3/S4: local-user authorization of the artifact sink. Not reachable from any tool schema.
   const _dataplaneSinkRoute = registerDataplaneSinkRoute(ctx, { stateDir: () => resolveStateDir(cfg.stateDir, 'joint-dev') });
   // A6: read-only project SSE proxy (device token stays in the host process).
@@ -5088,7 +5130,12 @@ const result = await request({
           rabbit_source: cfg.rabbitSource,
           rabbit_url: cfg.rabbitUrl,
           p2p: p2pStatus,
-          fleet: fleetBinding,
+          fleet: {
+            ...fleetBinding,
+            key_source: resolvedFleetKey.source
+              ?? (cfg.fleetKey !== null && cfg.fleetKeyPolicy === 'config' ? 'config' : null),
+            home_file: resolvedFleetKey.homeFile ?? null,
+          },
           rtt,
           config: {
             rabbitUrl: cfg.rabbitUrl,
@@ -5101,6 +5148,8 @@ const result = await request({
             pairingCode_configured: cfg.pairingCode !== null,
             fleetKey_configured: cfg.fleetKey !== null,
             fleetKey_policy: cfg.fleetKeyPolicy,
+            fleet_home_file: resolvedFleetKey.homeFile ?? null,
+            fleet_config_file: cfg.fleetConfigFile ?? null,
             p2pMode: cfg.p2pMode,
             // The resolved list, shared server first, exactly as the node will query it.
             stunServers: cfg.stunServers,
@@ -7619,7 +7668,7 @@ function sleepWithSignal(ms, signal) {
  * a machine that joined by account -- and the panel then refused every request with "no fleet-chat identity yet".
  * A holder rather than a parameter because the route is mounted before the stack starts, and reads lazily.
  */
-const resolvedFleetKey = { value: null, source: null, at: 0 };
+const resolvedFleetKey = { value: null, source: null, at: 0, homeFile: null, accountCode: null };
 
 /** Probe one relay /healthz; any failure is `false` (a timeout must not throw into the interval). */
 async function probeRelayHealth(url, timeoutMs) {
@@ -7719,6 +7768,16 @@ function agentIdentityOf(agent) {
   }
 }
 async function startLocalStack(ctx, cfg) {
+  /**
+   * The per-account history of this machine's fleets. It lives beside `device.json`, which is the
+   * one state directory the plugin already resolves consistently. Without a directory there is no
+   * safe place to remember a home, so `home` policy degrades to the account key and says so.
+   */
+  const fleetHomeFile = fleetHomePath(devicePathFor(cfg));
+  resolvedFleetKey.homeFile = fleetHomeFile;
+  if (fleetHomeFile === null && cfg.fleetKeyPolicy === 'home') {
+    ctx.logger?.warn?.('w2m: no state directory is known, so fleet homes cannot be recorded; falling back to the account key');
+  }
 
   /**
    * v1.5.2: bootstrap relay assignment. A fresh install has no relay list; without this it falls
@@ -7952,6 +8011,37 @@ async function startLocalStack(ctx, cfg) {
     const fleetKeyFromConfig = cfg.fleetKey ?? null;
 
     /**
+     * The home for one account, or the reason it cannot be read.
+     *
+     * A missing file is an empty history. A corrupt file is **not**: under `home` policy it must
+     * stop the derivation rather than silently mint a new account fleet.
+     */
+    const homeFor = (accountCode) => {
+      if (fleetHomeFile === null) return { ok: true, entry: null, lastAccount: null };
+      const read = readFleetHome(fleetHomeFile);
+      if (read.ok !== true) return { ok: false, error: read };
+      return { ok: true, entry: getFleetHome(read.homes, accountCode), lastAccount: read.lastAccount };
+    };
+
+    /** Record the fleet this account is actually using; never overwrite a different remembered one. */
+    const rememberHome = (accountCode, fleetKey) => {
+      if (fleetHomeFile === null || typeof accountCode !== 'string' || accountCode === '') return;
+      const written = rememberFleetHome(fleetHomeFile, { accountCode, fleetKey, lastAccount: accountCode });
+      if (written.ok !== true) {
+        ctx.logger?.warn?.(`w2m: could not record the fleet home (${written.code}: ${written.error})`);
+      }
+    };
+
+    /** Record only the account, for the case where a guard kept the fleet unchanged. */
+    const rememberAccount = (accountCode) => {
+      if (fleetHomeFile === null || typeof accountCode !== 'string' || accountCode === '') return;
+      const written = rememberFleetAccount(fleetHomeFile, accountCode);
+      if (written.ok !== true) {
+        ctx.logger?.warn?.(`w2m: could not record the last account (${written.code}: ${written.error})`);
+      }
+    };
+
+    /**
      * How many derivation tries the **mount path** may spend.
      *
      * Two, not the six of v0.8.9: `agent.start()` waits behind this, and a tool that asks to join
@@ -7985,6 +8075,7 @@ async function startLocalStack(ctx, cfg) {
      */
     async function deriveFleetKeyOnce(attempts = FAST_DERIVE_ATTEMPTS) {
       const configured = fleetKeyFromConfig;
+      const hasExistingToken = typeof loaded?.identity?.device_token === 'string' && loaded.identity.device_token !== '';
       /**
        * v2.2.0: the configured key is a **fallback** unless the operator pins it.
        *
@@ -8019,14 +8110,74 @@ async function startLocalStack(ctx, cfg) {
          */
         const derived = last && typeof last.fleetKey === 'string' && last.fleetKey !== '' ? last.fleetKey : null;
         if (derived !== null) {
-          if (configured !== null && configured !== derived) {
-            ctx.logger?.warn?.('w2m: the signed-in account derives a different fleet than the configured fleetKey; following the account (set fleetKeyPolicy: config to pin the configured key)');
+          const remembered = homeFor(last.accountCode);
+          if (remembered.ok !== true && cfg.fleetKeyPolicy === 'home') {
+            ctx.logger?.warn?.(`w2m: fleet home is unreadable (${remembered.error.code}: ${remembered.error.error}); not deriving a replacement fleet`);
+            return {
+              fleetKey: null,
+              fleetKeySource: null,
+              fleetKeyReason: `fleet_home_unreadable: ${remembered.error.code}`,
+              last,
+            };
           }
-          ctx.logger?.info?.(
-            `w2m: fleet key derived from the signed-in account on attempt ${attempt} (fleet ${last.accountCode})`
-            + (last.ok === true ? '' : `; no serial number: ${last.reason ?? 'unknown reason'}`),
-          );
-          return { fleetKey: derived, fleetKeySource: 'account', last };
+          if (remembered.ok !== true) {
+            ctx.logger?.warn?.(`w2m: fleet home is unreadable (${remembered.error.code}); continuing with the account key because policy is ${cfg.fleetKeyPolicy}`);
+          }
+          if (cfg.fleetKeyPolicy === 'home' && remembered.ok === true && remembered.entry === null) {
+            const accountChanged = remembered.lastAccount !== null && remembered.lastAccount !== last.accountCode;
+            if (configured !== null) {
+              // A legacy explicit key is the only evidence of the fleet this machine was already in.
+              // Seed the home with it rather than deriving an account fleet and moving the machine.
+              rememberHome(last.accountCode, configured);
+              ctx.logger?.info?.(`w2m: first home for account ${last.accountCode} seeded from the configured fleet key`);
+              return { fleetKey: configured, fleetKeySource: 'config', last };
+            }
+            if (shouldPreserveExistingFleet({
+              policy: cfg.fleetKeyPolicy,
+              hasHome: false,
+              hasConfiguredKey: false,
+              hasToken: hasExistingToken,
+              accountChanged,
+            })) {
+              rememberAccount(last.accountCode);
+              ctx.logger?.warn?.(
+                'w2m: this machine is paired but has no fleet home for this account, so it will stay in its current fleet; '
+                + 'set the old fleetKey to seed a home (do not derive a new account fleet)',
+              );
+              return {
+                fleetKey: null,
+                fleetKeySource: null,
+                fleetKeyReason: 'home_missing_existing_token',
+                last,
+              };
+            }
+          }
+          const picked = selectFleetKey({
+            configured,
+            account: derived,
+            home: remembered.ok === true ? remembered.entry?.fleet_key ?? null : null,
+            policy: cfg.fleetKeyPolicy,
+          });
+          if (picked.fleetKey !== null) {
+            if (picked.source === 'home') {
+              rememberAccount(last.accountCode);
+              ctx.logger?.info?.(`w2m: returning to the fleet home for account ${last.accountCode}`);
+            } else {
+              if (configured !== null && configured !== derived) {
+                ctx.logger?.warn?.('w2m: the signed-in account derives a different fleet than the configured fleetKey; following the account (set fleetKeyPolicy: config to pin the configured key, or home to return to this account’s previous fleet)');
+              }
+              ctx.logger?.info?.(
+                `w2m: fleet key derived from the signed-in account on attempt ${attempt} (fleet ${last.accountCode})`
+                + (last.ok === true ? '' : `; no serial number: ${last.reason ?? 'unknown reason'}`),
+              );
+              // First time this account is seen (or policy is explicitly account): remember the
+              // fleet it actually joins. An existing home is never overwritten while policy is
+              // account, so an opt-in to account following cannot destroy the history.
+              if (remembered.ok === true && remembered.entry === null) rememberHome(last.accountCode, picked.fleetKey);
+              else rememberAccount(last.accountCode);
+            }
+            return { fleetKey: picked.fleetKey, fleetKeySource: picked.source, last };
+          }
         }
         if (attempt < effectiveAttempts) {
           const waitMs = Math.min(2000 * 2 ** (attempt - 1), 30000);
@@ -8043,10 +8194,11 @@ async function startLocalStack(ctx, cfg) {
       return { fleetKey: fallback.fleetKey, fleetKeySource: fallback.source, last };
     }
 
-    let { fleetKey, fleetKeySource } = await deriveFleetKeyOnce();
+    let { fleetKey, fleetKeySource, last: fleetKeyIdentity } = await deriveFleetKeyOnce();
     resolvedFleetKey.value = fleetKey;
     resolvedFleetKey.source = fleetKeySource;
     resolvedFleetKey.at = Date.now();
+    resolvedFleetKey.accountCode = fleetKeyIdentity?.accountCode ?? null;
 
     /**
      * Name what actually went wrong, including the shapes that used to say nothing.
@@ -8358,14 +8510,54 @@ async function startLocalStack(ctx, cfg) {
       try {
         const { createAccountIdentity } = await import('../chatops/account.mjs');
         const identity = await createAccountIdentity({ ctx, platform: process.platform }).resolve();
-        const next = typeof identity?.fleetKey === 'string' && identity.fleetKey !== '' ? identity.fleetKey : null;
-        if (next === null || next === fleetKey) return;
-        ctx.logger?.warn?.('w2m: the signed-in account changed; leaving the previous fleet and re-pairing with the new account fleet key');
-        fleetKey = next;
-        fleetKeySource = 'account';
-        resolvedFleetKey.value = next;
-        resolvedFleetKey.source = 'account';
+        const derived = typeof identity?.fleetKey === 'string' && identity.fleetKey !== '' ? identity.fleetKey : null;
+        if (derived === null) return;
+        const remembered = homeFor(identity.accountCode);
+        if (remembered.ok !== true && cfg.fleetKeyPolicy === 'home') {
+          ctx.logger?.warn?.(`w2m: account changed but the fleet home is unreadable (${remembered.error.code}); not switching fleets`);
+          return;
+        }
+        if (remembered.ok !== true) {
+          ctx.logger?.warn?.(`w2m: fleet home is unreadable (${remembered.error.code}); continuing with the account key because policy is ${cfg.fleetKeyPolicy}`);
+        }
+        const hasExistingToken = typeof loaded?.identity?.device_token === 'string' && loaded.identity.device_token !== '';
+        const accountChanged = remembered.ok === true
+          && remembered.lastAccount !== null
+          && identity.accountCode !== remembered.lastAccount;
+        if (shouldPreserveExistingFleet({
+          policy: cfg.fleetKeyPolicy,
+          hasHome: remembered.ok === true && remembered.entry !== null,
+          hasConfiguredKey: fleetKeyFromConfig !== null,
+          hasToken: hasExistingToken,
+          accountChanged,
+        })) {
+          // Upgrading a paired machine with no home must not move it. A real account switch is
+          // different: rule 1 says the first appearance of account B may join B's fleet.
+          if (remembered.lastAccount === null) rememberAccount(identity.accountCode);
+          ctx.logger?.warn?.('w2m: this machine has no fleet home and the account did not change; staying in its current fleet');
+          return;
+        }
+        const picked = selectFleetKey({
+          configured: fleetKeyFromConfig,
+          account: derived,
+          home: remembered.ok === true ? remembered.entry?.fleet_key ?? null : null,
+          policy: cfg.fleetKeyPolicy,
+        });
+        if (picked.fleetKey === null || picked.fleetKey === fleetKey) return;
+        if (picked.source === 'home') {
+          rememberAccount(identity.accountCode);
+          ctx.logger?.warn?.(`w2m: the signed-in account changed; returning to this account’s fleet home (${identity.accountCode})`);
+        } else {
+          ctx.logger?.warn?.('w2m: the signed-in account changed; first time for this account, joining its fleet (other machines are not moved)');
+          if (remembered.ok === true && remembered.entry === null) rememberHome(identity.accountCode, picked.fleetKey);
+          else rememberAccount(identity.accountCode);
+        }
+        fleetKey = picked.fleetKey;
+        fleetKeySource = picked.source;
+        resolvedFleetKey.value = picked.fleetKey;
+        resolvedFleetKey.source = picked.source;
         resolvedFleetKey.at = Date.now();
+        resolvedFleetKey.accountCode = identity.accountCode ?? resolvedFleetKey.accountCode;
         alreadyPaired = false;
         joinSucceeded = false;
         joinPromise = null;

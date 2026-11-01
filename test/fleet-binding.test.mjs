@@ -52,12 +52,14 @@ describe('fleet binding diagnostics', () => {
     assert.match(block.remedy, /re-admit/i);
   });
 
-  it('follows the account by default and only pins a configured key when asked', () => {
+  it('returns to the account home by default, and only follows the account when asked', () => {
+    assert.deepEqual(selectFleetKey({ configured: 'cfg', account: 'acct', home: 'home' }), { fleetKey: 'home', source: 'home' });
+    assert.deepEqual(selectFleetKey({ configured: 'cfg', account: 'acct', home: 'home', policy: 'account' }), { fleetKey: 'acct', source: 'account' });
     assert.deepEqual(selectFleetKey({ configured: 'cfg', account: 'acct' }), { fleetKey: 'acct', source: 'account' });
     assert.deepEqual(selectFleetKey({ configured: 'cfg', account: 'acct', policy: 'config' }), { fleetKey: 'cfg', source: 'config' });
     assert.deepEqual(selectFleetKey({ configured: 'cfg', account: null }), { fleetKey: 'cfg', source: 'config' });
     assert.deepEqual(selectFleetKey({ configured: null, account: 'acct' }), { fleetKey: 'acct', source: 'account' });
-    assert.deepEqual(selectFleetKey({}), { fleetKey: null, source: null });
+    assert.deepEqual(selectFleetKey({ configured: null, account: null, policy: 'home' }), { fleetKey: null, source: null });
   });
 
   it('re-admits only when token is valid, fleet is missing or mismatched, and a key exists', () => {

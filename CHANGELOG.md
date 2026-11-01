@@ -7,6 +7,17 @@ All notable changes to this project are documented here.
 - `w2m_intent`: structured intents mapped onto allow-listed commands; unknown actions, parameters and types
   are refused by name (the fleet does not invent commands).
 
+## [2.2.1] - 2026-11-01
+
+- Fleet identity is now per-account **home**-first. Each machine records the fleet key it actually joined under `fleet-home.json` beside `device.json`; switching back to an account returns to that account’s previous fleet instead of deriving a new one. This is the “whoever leaves returns by themselves” rule: a first appearance of account B may join B’s account fleet, but an existing home for A is never rewritten by B, and no other machine is moved.
+- `fleetKeyPolicy` is now `home` by default. `account` keeps the v2.2.0 always-follow-the-account behaviour as an opt-in; `config` remains the explicit operator pin. An invalid policy is a startup error naming the setting, not a silent default.
+- A corrupt or unreadable `fleet-home.json` is reported and blocks `home` policy instead of silently creating a new fleet; `account` policy may continue without the history. The file is written atomically with mode 0600 (ACL protection on Windows).
+- Upgrading a paired 2.2.0 machine with no home to 2.2.1 keeps it in its current fleet instead of deriving the account key; an actual account switch is still allowed to make its first join, and that first join is remembered.
+- leet-home.json` now also records the last account code, so a restart can tell `same account, no home yet` (stay put) from a real account switch (first join allowed).
+- Composer target control: selecting a machine now writes a visible `@machine` token into the draft after the host accepts the selection. Switching targets replaces the previous token, and selecting All machines removes it; names containing whitespace use `@"machine name"`. A refused host write reopens the menu with the host’s reason; an editor rejection is shown instead of leaving a stale token.
+
+- Settings page: new `编队绑定` section for machines that must return to an old fleet. It previews the `fleet_id` derived from a pasted key, requires explicit confirmation, then writes an independent `fleet-config.json` (0600) with a timestamped backup and rollback; `cordis.patch.yml` is never modified. The file takes precedence over the profile's `fleetKey`/`fleetKeyPolicy` at startup, and the raw key is never returned by the route.
+- Tests: fleet-config storage/backup/corruption and the preview/save route, including an explicit assertion that the profile patch is untouched.
 ## [2.2.0] - 2026-11-01
 
 - Fleet binding policy: `fleetKeyPolicy: account` is the new default. A configured `fleetKey` is a fallback while the signed-in account is authoritative, so switching DeepSeek accounts moves the machine without editing every profile. Set `fleetKeyPolicy: config` to keep the old explicit-pin behaviour.

@@ -42,23 +42,20 @@ export function shouldRejoin({ token, fleetId, fleetKey, expectedFleetId = null 
 /**
  * Choose the key a start actually binds with.
  *
- * `fleetKeyPolicy: 'account'` (the default) makes the signed-in account authoritative: an explicit
- * `fleetKey` is a **fallback** for when the account cannot be read, not a pin that survives an
- * account switch. `'config'` restores the old operator-pin behaviour for fleets that deliberately
- * outlive the signed-in account.
+ * `fleetKeyPolicy: 'home'` (the default in 2.2.1) is the "the leaver returns, nobody else moves"
+ * rule: a machine that has been in a fleet for this account uses that fleet's key again, even when
+ * the freshly derived account key differs. `'account'` is the v2.2.0 opt-in that always follows the
+ * signed-in account, and `'config'` is the explicit operator pin.
  *
- * The distinction exists because a key in the profile has no provenance: it may have been placed
- * there by an earlier setup for the *previous* account, or by an operator who means to pin the fleet.
- * The policy is the machine-readable statement of which one it is; without it, auto-switching would
- * silently override a deliberate pin.
- *
- * @param {{configured?: string|null, account?: string|null, policy?: string}} input
- * @returns {{fleetKey: string|null, source: 'account'|'config'|null}}
+ * @param {{configured?: string|null, account?: string|null, home?: string|null, policy?: string}} input
+ * @returns {{fleetKey: string|null, source: 'home'|'account'|'config'|null}}
  */
-export function selectFleetKey({ configured = null, account = null, policy = 'account' } = {}) {
+export function selectFleetKey({ configured = null, account = null, home = null, policy = 'home' } = {}) {
   const hasConfig = typeof configured === 'string' && configured.trim() !== '';
   const hasAccount = typeof account === 'string' && account.trim() !== '';
+  const hasHome = typeof home === 'string' && home.trim() !== '';
   if (policy === 'config' && hasConfig) return { fleetKey: configured, source: 'config' };
+  if (policy === 'home' && hasHome) return { fleetKey: home, source: 'home' };
   if (hasAccount) return { fleetKey: account, source: 'account' };
   if (hasConfig) return { fleetKey: configured, source: 'config' };
   return { fleetKey: null, source: null };

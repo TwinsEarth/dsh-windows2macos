@@ -37,6 +37,7 @@ import * as plugin from '../src/plugin/tools.mjs';
 import { MATCH_REFUSAL } from '../src/agent/allowed-commands.mjs';
 import { hasPathSeparator, resolveCommand } from '../src/agent/resolve.mjs';
 import { SHARED_SERVER } from '../src/agent/p2p-node.mjs';
+import { planJoin } from '../src/chatops/fleet-join.mjs';
 // The composer's selection store, driven directly by the refusal-code tests: the browser route is the
 // production writer, and asserting what a *stored* selection reports does not need a route registry.
 import { defaultSelectionStore } from '../src/plugin/fleet-target.mjs';
@@ -2247,6 +2248,36 @@ describe('happy paths', () => {
       assert.equal(value.project.base_commit, null);
       assert.match(value.project.error, /not a git work tree/);
       assert.equal(value.project.fingerprint_algo, 'git-temp-index-tree/v1');
+    } finally {
+      fetchStub.restore();
+    }
+  });
+
+  it('w2m_status reads the settings-page fleet pin from fleet-config.json and never prints the key', async () => {
+    const dir = await makeStateDir(PAIRED_DEVICE);
+    const key = planJoin({ userId: 'settings-pin-status-test' });
+    const pinFile = path.join(dir, 'fleet-config.json');
+    await fs.writeFile(pinFile, JSON.stringify({
+      version: 1,
+      fleet_key: key.fleetKey,
+      fleet_key_policy: 'config',
+      fleet_id: key.fleetId,
+      updated_at: '2026-11-01T10:00:00.000Z',
+    }), 'utf8');
+    const fetchStub = installFetch([
+      { path: '/healthz', body: { ok: true, protocol_version: 1 } },
+      { path: '/v1/devices', body: { devices: [{ machine_id: PAIRED_DEVICE.machine_id, fleet_id: key.fleetId, online: true }] } },
+    ]);
+    try {
+      const nonRepo = await makeNonRepoDir();
+      const { tools } = await register({ rabbitUrl: RABBIT, stateDir: dir, projectDir: nonRepo, machineName: 'win-desktop' });
+      const value = JSON.parse(await tools.get('w2m_status').execute({}, {}));
+      assert.equal(value.config.fleetKey_configured, true);
+      assert.equal(value.config.fleetKey_policy, 'config');
+      assert.equal(value.config.fleet_config_file, pinFile);
+      assert.equal(value.fleet.fleet_id, key.fleetId);
+      assert.equal(value.fleet.key_source, 'config');
+      assert.equal(JSON.stringify(value).includes(key.fleetKey), false, 'the status must carry a fingerprint, never the key');
     } finally {
       fetchStub.restore();
     }

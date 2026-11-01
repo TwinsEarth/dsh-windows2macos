@@ -115,6 +115,7 @@ function loadBundle(options = {}) {
     module,
     exports: module.exports,
     console: hostConsole,
+    ...options.globals,
   });
   // The filename is only for stack traces; `timeout` bounds a bundle that loops forever.
   vm.runInContext(source, context, { filename: BUNDLE_PATH, timeout: 5_000 });
@@ -316,8 +317,8 @@ describe('client bundle: the activation contract', () => {
       () => exports.apply(ctx),
       'an undeclared service read throws in Cordis and takes the whole app down; the bundle must read only what it declares',
     );
-    assert.deepEqual(registry.announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', 'sidebar.panellist', 'main'], 'the entry still has to take its seat');
-    assert.equal(registry.registered.length, 15);
+    assert.deepEqual(registry.announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', 'sidebar.panellist', 'main'], 'the entry still has to take its seat');
+    assert.equal(registry.registered.length, 16);
     assert.equal(locale.registered.has('w2m.target'), true, 'the dictionaries go to the locale service when there is one');
   });
 
@@ -421,8 +422,8 @@ describe('client bundle: the seat it registers into', () => {
 
   it('announces and registers all five composer controls plus the sidebar and update sections into conversation.input.left', () => {
     const { announced, registered } = applyTo();
-    assert.deepEqual(announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', 'sidebar.panellist', 'main']);
-    assert.equal(registered.length, 15);
+    assert.deepEqual(announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', 'sidebar.panellist', 'main']);
+    assert.equal(registered.length, 16);
     assert.equal(registered[0].options.name, SEAT);
   });
 
@@ -470,7 +471,7 @@ describe('client bundle: the seat it registers into', () => {
     };
     const { exports } = loadBundle();
     assert.doesNotThrow(() => exports.apply(ctx));
-    assert.equal(registered.length, 15);
+    assert.equal(registered.length, 16);
   });
 });
 
@@ -608,4 +609,257 @@ it('debounces conversation search and waits for the history loader (v2.0.5)', ()
   assert.ok(source.includes("addEventListener('scroll', onScroll, true)"), 'scrolling repaints the viewport');
   assert.ok(source.includes('await waitForLoadSettled();'), 'the top button waits for in-flight history instead of re-pressing');
   assert.ok(source.includes('if (stagnant >= 2) break;'), 'two pages that add nothing end the loop instead of spinning');
+});
+
+// ---------------------------------------------------------------------------------------------
+// The @machine handle a target click writes into the composer
+// ---------------------------------------------------------------------------------------------
+
+describe('client bundle: target @mention planning', () => {
+  const { exports } = loadBundle();
+  // Objects built inside the vm have that realm's prototypes; compare their plain data shape.
+  const plain = (value) => JSON.parse(JSON.stringify(value));
+
+  it('renders a plain name as @name and a spaced name as a quoted token', () => {
+    assert.equal(exports.targetTokenForName('macmini'), '@macmini');
+    assert.equal(exports.targetTokenForName('Mac mini'), '@"Mac mini"');
+    assert.equal(exports.targetTokenForName('办公室/东区'), '@"办公室/东区"');
+    assert.equal(exports.targetTokenForName('a"b'), null, 'an unescapable name gets no token');
+    assert.equal(exports.targetTokenForName('   '), null, 'an empty name gets no token');
+  });
+
+  it('inserts at the caret with the spaces DSH needs to see a token boundary', () => {
+    const empty = exports.planTargetMention({ draft: '', caret: { start: 0, end: 0, draftRev: 7 }, nextName: 'macmini' });
+    assert.deepEqual(plain(empty), { kind: 'insert', text: '@macmini ', start: 0, end: 0, draftRev: 7 });
+
+    const afterWord = exports.planTargetMention({ draft: 'run', caret: { start: 3, end: 3, draftRev: 8 }, nextName: 'macmini' });
+    assert.deepEqual(plain(afterWord), { kind: 'insert', text: ' @macmini ', start: 3, end: 3, draftRev: 8 });
+
+    const beforeSpace = exports.planTargetMention({ draft: 'run ', caret: { start: 4, end: 4, draftRev: 9 }, nextName: 'macmini' });
+    assert.equal(beforeSpace.text, '@macmini ');
+  });
+
+  it('replaces the previous machine token instead of leaving two targets in the draft', () => {
+    const plan = exports.planTargetMention({
+      draft: '@alpha run this',
+      caret: { start: 6, end: 6, draftRev: 3 },
+      previousName: 'alpha',
+      nextName: 'beta',
+    });
+    assert.deepEqual(plain(plan), { kind: 'replace', text: '@beta', start: 0, end: 6, draftRev: 3 });
+  });
+
+  it('clears the token when the target is cleared, and never duplicates an existing token', () => {
+    assert.deepEqual(plain(exports.planTargetMention({
+      draft: '@alpha run this',
+      caret: { start: 6, end: 6, draftRev: 4 },
+      previousName: 'alpha',
+      nextName: null,
+    })), { kind: 'remove', start: 0, end: 7, draftRev: 4 });
+
+    assert.deepEqual(plain(exports.planTargetMention({
+      draft: 'look @beta',
+      caret: { start: 9, end: 9, draftRev: 5 },
+      nextName: 'beta',
+    })), { kind: 'present' });
+
+    assert.deepEqual(plain(exports.planTargetMention({
+      draft: '@alpha and @beta',
+      caret: { start: 15, end: 15, draftRev: 6 },
+      previousName: 'alpha',
+      nextName: 'beta',
+    })), { kind: 'remove', start: 0, end: 7, draftRev: 6 });
+  });
+
+  it('keeps a non-collapsed selection instead of consuming the operator’s words', () => {
+    const plan = exports.planTargetMention({
+      draft: 'rewrite me',
+      caret: { start: 0, end: 10, draftRev: 8 },
+      nextName: 'beta',
+    });
+    assert.deepEqual(plain(plan), { kind: 'insert', text: ' @beta ', start: 10, end: 10, draftRev: 8 });
+  });
+
+  it('maps a token span through a reference chip (clipboard offsets vs editor offsets)', () => {
+    // Clipboard "chipped @alpha": the chip's clipboard text is 7 chars but one editor glyph.
+    const plan = exports.planTargetMention({
+      draft: 'chipped @alpha',
+      occurrences: [{ offset: 0, length: 7 }],
+      caret: { start: 9, end: 9, draftRev: 2 },
+      previousName: 'alpha',
+      nextName: null,
+    });
+    assert.deepEqual(plain(plan), { kind: 'remove', start: 2, end: 8, draftRev: 2 });
+  });
+});
+
+/**
+ * A minimal hook-capable React stand-in for one component.
+ *
+ * `client-bundle.test.mjs` otherwise checks the bundle as a module. This one test executes the real
+ * `TargetSelect` function, clicks the real trigger and the real machine row, and inspects the editor
+ * action the control calls — the half that a pure `planTargetMention` unit test cannot prove.
+ */
+function makeHookReact() {
+  const hooks = [];
+  let index = 0;
+  let pending = [];
+  let dirty = false;
+  const fakeNode = {
+    getBoundingClientRect: () => ({ left: 10, top: 700, width: 120, right: 130, bottom: 720 }),
+    contains: () => false,
+    focus: () => {},
+  };
+  const React = {
+    Fragment: Symbol('Fragment'),
+    createElement(type, props, ...children) {
+      const resolved = props ?? {};
+      if (resolved.ref !== null && resolved.ref !== undefined && resolved.ref.current == null) {
+        resolved.ref.current = fakeNode;
+      }
+      return { type, props: resolved, children };
+    },
+    useState(initial) {
+      const at = index++;
+      if (!(at in hooks)) hooks[at] = typeof initial === 'function' ? initial() : initial;
+      return [hooks[at], (next) => {
+        hooks[at] = typeof next === 'function' ? next(hooks[at]) : next;
+        dirty = true;
+      }];
+    },
+    useRef(initial) {
+      const at = index++;
+      if (!(at in hooks)) hooks[at] = { current: initial ?? null };
+      return hooks[at];
+    },
+    useEffect(effect, deps) {
+      const at = index++;
+      const previous = hooks[at];
+      const changed = previous === undefined
+        || deps === undefined
+        || deps.length !== previous.length
+        || deps.some((value, i) => !Object.is(value, previous[i]));
+      if (changed) {
+        hooks[at] = deps ?? [];
+        pending.push(effect);
+      }
+    },
+  };
+  const render = (component, props) => {
+    let tree = null;
+    for (let pass = 0; pass < 30; pass += 1) {
+      index = 0;
+      pending = [];
+      dirty = false;
+      tree = component(props);
+      for (const effect of pending) effect();
+      if (!dirty) break;
+    }
+    return tree;
+  };
+  return { React, render };
+}
+
+/** Walk the element tree the stand-in renderer returns (arrays and `children` only). */
+function findBy(node, predicate, found = []) {
+  if (Array.isArray(node)) {
+    for (const child of node) findBy(child, predicate, found);
+    return found;
+  }
+  if (node === null || typeof node !== 'object') return found;
+  if (predicate(node)) found.push(node);
+  if (Array.isArray(node.children)) {
+    for (const child of node.children) findBy(child, predicate, found);
+  }
+  return found;
+}
+
+describe('client bundle: selecting a machine writes the @mention', () => {
+  it('clicks a machine row and asks the editor for one insertion at the caret', async () => {
+    const machines = [
+      { machine_id: 'a', name: 'alpha', online: true, local: true, os: 'win32', state: 'online' },
+      { machine_id: 'b', name: 'beta', online: true, local: false, os: 'darwin', state: 'online' },
+    ];
+    let state = {
+      selected: { machine_id: null, name: null, online: null, stale: false },
+      machines,
+      fleet: { ok: true, online: 2, total: 2 },
+      relays: null,
+    };
+    let posted = null;
+    const hostFetch = async (url, init = {}) => {
+      if (init.method === 'POST') {
+        posted = JSON.parse(init.body);
+        const picked = machines.find((machine) => machine.machine_id === posted.machine_id) ?? null;
+        state = {
+          ...state,
+          selected: picked === null
+            ? { machine_id: null, name: null, online: null, stale: false }
+            : { machine_id: picked.machine_id, name: picked.name, online: true, stale: false },
+        };
+      }
+      return new Response(JSON.stringify(state), { status: 200, headers: { 'content-type': 'application/json' } });
+    };
+    const document = {
+      querySelector: () => null,
+      querySelectorAll: () => [],
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    };
+    const { React, render } = makeHookReact();
+    const bundle = loadBundle({
+      requireImpl: (specifier) => {
+        if (specifier === 'react') return React;
+        throw new Error(`unexpected require(${specifier})`);
+      },
+      document,
+      globals: { fetch: hostFetch, AbortController, Response },
+    });
+    bundle.window.innerWidth = 1_200;
+    bundle.window.innerHeight = 800;
+    bundle.window.addEventListener = () => {};
+    bundle.window.removeEventListener = () => {};
+
+    const edits = [];
+    const inputState = { draft: '', occurrences: [], phase: 'idle' };
+    const inputActions = {
+      captureInsertion: () => ({ start: 0, end: 0, draftRev: 1 }),
+      insertText: (text, span) => { edits.push({ text, span }); return true; },
+    };
+    const props = {
+      sessionId: 'sess-ui',
+      locked: false,
+      t: (key) => key,
+      inputActions,
+      useInput: () => inputState,
+    };
+
+    const tick = () => new Promise((resolve) => { setTimeout(resolve, 0); });
+
+    let tree = render(bundle.exports.TargetSelect, props);
+    await tick();
+    tree = render(bundle.exports.TargetSelect, props);
+
+    const triggers = findBy(tree, (node) => node.type === 'button'
+      && String(node.props.className).includes('w2mTarget_trigger'));
+    assert.equal(triggers.length, 1, 'the target control is mounted');
+    triggers[0].props.onClick();
+
+    // Opening runs two effects (reload seq and placement), and each schedules one more render.
+    for (let pass = 0; pass < 3; pass += 1) {
+      await tick();
+      tree = render(bundle.exports.TargetSelect, props);
+    }
+
+    const rows = findBy(tree, (node) => node.type === 'button'
+      && node.props.role === 'option'
+      && String(node.props.title ?? '').startsWith('beta'));
+    assert.equal(rows.length, 1, 'the online beta row is in the open menu');
+    rows[0].props.onClick();
+    await tick();
+    render(bundle.exports.TargetSelect, props);
+
+    assert.deepEqual(posted, { session_id: 'sess-ui', machine_id: 'b', machine_name: 'beta' });
+    assert.deepEqual(JSON.parse(JSON.stringify(edits)), [{ text: '@beta ', span: { start: 0, end: 0, draftRev: 1 } }]);
+  });
 });
