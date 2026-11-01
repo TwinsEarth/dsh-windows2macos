@@ -1,0 +1,31 @@
+{
+  "version": "2.2.1",
+  "case": "RELEASE-2210",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-01T03:05:23.452Z",
+  "executor": "lead",
+  "task_id": "pre-release-2210-1793511923452",
+  "requirement": "v2.2.1: fleet membership returns to the per-account home after an account switch, a first appearance of a new account may join its fleet without moving other machines, and the settings page can pin an old fleet key without editing cordis.patch.yml",
+  "commands": [
+    ["node", "--test", "--test-force-exit", "test/fleet-home.test.mjs", "test/fleet-binding.test.mjs"],
+    ["node", "--test", "--test-force-exit", "test/fleet-config.test.mjs", "test/fleet-config-route.test.mjs"],
+    ["node", "--test", "--test-force-exit", "test/tools.test.mjs"],
+    ["node", "--test", "--test-force-exit", "test/client-bundle.test.mjs"],
+    ["node", "--test", "--test-force-exit", "test/loader-entry.test.mjs"]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "fleet_home": "test/fleet-home.test.mjs 6/6: A first join, B first join, B->A returns A's home, account policy does not overwrite home, config pin wins, corrupt home blocks a new fleet, upgrade with an existing token stays put",
+      "fleet_config": "test/fleet-config.test.mjs 4/4 and test/fleet-config-route.test.mjs 3/3: preview does not write, mismatch is shown before saving, save writes fleet-config.json with a backup, a wrong expected fleet_id is refused, and cordis.patch.yml is untouched",
+      "tools": "test/tools.test.mjs 141/141, including w2m_status reading the settings-page pin without printing the key",
+      "bundle": "test/client-bundle.test.mjs 34/34; the 编队绑定 settings section is registered and target @mention tests remain green",
+      "loader": "test/loader-entry.test.mjs 10/10 against the packed 2.2.1 tarball in the real DSH Loader",
+      "lint": "eslint 0 errors; layer-check clean",
+      "scope": "local code, tests and packed artifact only; the release tag is pushed separately; no machine profile was edited by the tests"
+    }
+  }
+}
