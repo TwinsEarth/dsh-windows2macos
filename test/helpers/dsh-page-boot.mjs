@@ -239,6 +239,33 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
       report.composer = state.composer;
     }
     report.bootFailure = report.consoleErrors.find((line) => BOOT_FAILURE_PATTERN.test(line)) ?? null;
+    if (process.env.W2M_CAPABILITY_PROBE === '1') {
+      const read = async (expression) => {
+        const value = await evaluate(`JSON.stringify((() => { ${expression} })())`);
+        return value === null ? null : JSON.parse(value);
+      };
+      let opened = { found: false };
+      for (let attempt = 0; attempt < 25; attempt += 1) {
+        opened = await read(`const t=document.querySelector('.w2mCap_trigger'); if(t===null)return {found:false}; t.click(); return {found:true};`);
+        if (opened.found === true) break;
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      const menu = await read(`
+        const trigger=document.querySelector('.w2mCap_trigger');
+        const menu=document.querySelector('.w2mCap_menu');
+        const options=[...document.querySelectorAll('.w2mCap_option')].map((button)=>({text:button.textContent}));
+        return {expanded: trigger?.getAttribute('aria-expanded') ?? null, menu: menu !== null, options};
+      `);
+      const temp = await read(`const b=document.querySelectorAll('.w2mCap_option')[1] ?? null; if(b===null)return {clicked:false}; b.click(); return {clicked:true};`);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      const after = await read(`
+        const trigger=document.querySelector('.w2mCap_trigger');
+        const error=[...document.querySelectorAll('.w2mCap_note')].map((n)=>n.textContent).filter((t)=>t!=='');
+        return {label: trigger?.textContent ?? null, on: trigger?.getAttribute('data-on') ?? null, expanded: trigger?.getAttribute('aria-expanded') ?? null, menu: document.querySelector('.w2mCap_menu') !== null, error};
+      `);
+      report.capabilityProbe = { opened, menu, temp, after };
+    }
     socket.close();
     return report;
   } finally {

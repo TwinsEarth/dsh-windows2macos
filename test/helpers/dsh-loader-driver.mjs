@@ -53,6 +53,7 @@
  * plugin's own status call off the network and how it can mount a deliberately failing probe.
  */
 
+import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { activateClientEntries } from './dsh-client-activation.mjs';
@@ -268,6 +269,24 @@ try {
   ctx.logger.exporter({ levels: { default: 2 }, export: record });
   stage('profile booted');
 
+  // The composer controls only render inside a Session; a fresh profile has no Workspace, so the
+  // real page would stop at the Workspace picker before any `.w2mCap_trigger` exists. Register one
+  // throwaway Workspace through the profile's own service before the page boots.
+  stage('seed a Workspace for the page');
+  const workDir = path.join(dshHome, 'profiles', profile, 'w2m-page-workspace');
+  fs.mkdirSync(workDir, { recursive: true });
+  const workspaceRegistry = ctx.get('workspaceRegistry');
+  if (workspaceRegistry !== undefined && typeof workspaceRegistry.create === 'function') {
+    try {
+      await workspaceRegistry.create(workDir, 'W2M Page');
+      stage('Workspace seeded');
+    } catch (error) {
+      stage(`Workspace seed skipped: ${error?.message ?? String(error)}`);
+    }
+  } else {
+    stage('Workspace seed skipped: no workspaceRegistry');
+  }
+
   stage('read the loader entries and sweep every fiber');
   const entries = entryReport(ctx);
   const failedFibers = failedFiberReport(ctx);
@@ -305,6 +324,16 @@ try {
 
   stage('read the composer control’s route from w2m_status');
   const targetSelection = await targetSelectionReport(ctx);
+  const routeProbe = (() => {
+    if (connection === undefined) return { present: false, routes: [] };
+    const routes = connection.fetchRoutes instanceof Map ? [...connection.fetchRoutes.keys()] : [];
+    return {
+      present: true,
+      routes,
+      target: routes.includes('/api/w2m/target'),
+      capability: routes.includes('/api/w2m/capability'),
+    };
+  })();
 
   report = {
     ok: true,
@@ -318,6 +347,7 @@ try {
     clientActivation,
     clientPage,
     targetSelection,
+    routeProbe,
     diagnostics,
   };
 

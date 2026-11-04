@@ -1,0 +1,25 @@
+{
+  "version": "2.2.2",
+  "case": "RELEASE-2220",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-04T20:16:04.717Z",
+  "executor": "lead",
+  "task_id": "pre-release-2220-1793823364724",
+  "requirement": "v2.2.2: DSH 0.2.2-rc.1 users can open the Node-execution menu and select temporary execution from the composer",
+  "commands": [
+    ["node", "--test", "--test-force-exit", "test/client-bundle.test.mjs"],
+    ["node", "--test", "--test-force-exit", "test/loader-entry.test.mjs"]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "client": "test/client-bundle.test.mjs 36/36: popup menus portal to document.body when react-dom is available and fall back inline without it",
+      "loader": "test/loader-entry.test.mjs 10/10 against the packed 2.2.2 tarball in the real DSH 0.2.2-rc.1 Loader and its own Edge page; the route probe finds /api/w2m/capability and W2M_CAPABILITY_PROBE=1 opens the Node-execution menu and selects temporary execution",
+      "dsh": "the installed runtime is @deepseek-ai/dsh-desktop-runtime 0.2.2-rc.1 (resources/app.asar), not the 0.2.1-rc.5 profile pins",
+      "scope": "local code and packed artifact only; no installed profile was edited by the tests; the release is published separately"
+    }
+  }
+}

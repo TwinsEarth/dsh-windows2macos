@@ -520,6 +520,11 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
       true,
       `the control has no route to read: ${String(report.targetSelection.detail)}`,
     );
+    assert.equal(
+      report.routeProbe?.capability,
+      true,
+      `the Node-execution control has no GET/POST route (routes: ${JSON.stringify(report.routeProbe?.routes ?? [])})`,
+    );
   });
 
   it('reports no failed entry that names this package', (t) => {
@@ -614,5 +619,10 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
       `the page never finished booting (boot surface still up after ${String(page.settledAfterMs)}ms; ` +
         `body: ${String(page.bodyText ?? '').slice(0, 300)})`,
     );
+    if (process.env.W2M_CAPABILITY_PROBE === '1') {
+      const probe = page.capabilityProbe ?? {};
+      assert.equal(probe.menu?.menu, true, `the Node-execution menu never opened: ${JSON.stringify(probe)}`);
+      assert.equal(probe.after?.on, 'true', `selecting temporary Node execution did not take effect: ${JSON.stringify(probe)}`);
+    }
   });
 });

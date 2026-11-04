@@ -281,6 +281,37 @@ describe('client bundle: the module-system entry', () => {
 });
 
 // ---------------------------------------------------------------------------------------------
+// Composer popup containment (DSH 0.2.2-rc.1)
+// ---------------------------------------------------------------------------------------------
+
+describe('client bundle: composer popup containment', () => {
+  it('portals popup menus to document.body when react-dom is available', () => {
+    const document = makeFakeDocument();
+    document.body = {};
+    const menu = { type: 'menu' };
+    const bundle = loadBundle({
+      document,
+      requireImpl: (specifier) => {
+        if (specifier === 'react') return makeFakeReact();
+        if (specifier === 'react-dom') {
+          return { createPortal: (child, container) => ({ child, container }) };
+        }
+        throw new Error(`unexpected require(${specifier})`);
+      },
+    });
+    const portaled = bundle.exports.portalNode(menu);
+    assert.equal(portaled.child, menu);
+    assert.equal(portaled.container, document.body);
+  });
+
+  it('keeps the inline menu when no document or react-dom is present', () => {
+    const bundle = loadBundle();
+    const menu = { type: 'menu' };
+    assert.equal(bundle.exports.portalNode(menu), menu);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
 // The activation contract
 // ---------------------------------------------------------------------------------------------
 //

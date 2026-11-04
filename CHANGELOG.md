@@ -7,6 +7,16 @@ All notable changes to this project are documented here.
 - `w2m_intent`: structured intents mapped onto allow-listed commands; unknown actions, parameters and types
   are refused by name (the fleet does not invent commands).
 
+## [2.2.2] - 2026-11-05
+
+- DSH 0.2.2-rc.1 compatibility: composer popups (the dispatch-target menu and the Node-execution menu)
+  now render through a `react-dom` portal under `document.body`. The release candidate puts
+  `container-type: inline-size` on the composer row, which makes that row the containing block for
+  `position: fixed` descendants; the Node-execution menu was positioned relative to the row and its
+  options could not be selected. A portal keeps the viewport coordinates the menus compute.
+- Loader tests: the bundle-fetch helper sends a Fetch `Request` as 0.2.2-rc.1 requires, the real-page
+  probe seeds a Workspace, opens the Node-execution menu and selects temporary execution, and the
+  host route probe confirms `GET/POST /api/w2m/capability` is mounted.
 ## [2.2.1] - 2026-11-01
 
 - Fleet identity is now per-account **home**-first. Each machine records the fleet key it actually joined under `fleet-home.json` beside `device.json`; switching back to an account returns to that account’s previous fleet instead of deriving a new one. This is the “whoever leaves returns by themselves” rule: a first appearance of account B may join B’s account fleet, but an existing home for A is never rewritten by B, and no other machine is moved.

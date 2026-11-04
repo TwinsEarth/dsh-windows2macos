@@ -107,7 +107,11 @@ function narrowGraph(graph, rows) {
  * @returns {Promise<string>} the response body.
  */
 async function fetchServed(registry, url) {
-  const response = await registry.fetchBundle({ method: 'GET', url });
+  // 0.2.2-rc.1 takes a Fetch Request (it reads `headers.get('if-none-match')`), not the plain
+  // `{method, url}` descriptor the old helper sent. The request origin is irrelevant: the host
+  // parses the path from the URL and serves the bundle registry.
+  const requestUrl = URL.canParse(url) ? url : new URL(url, 'http://127.0.0.1').href;
+  const response = await registry.fetchBundle(new Request(requestUrl, { method: 'GET' }));
   if (response.status !== 200) throw new Error(`the client bundle host answered ${String(response.status)} for ${url}`);
   return response.text();
 }
