@@ -134,7 +134,7 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
           if (dialled?.ok !== true) p2pError = dialled?.error ?? 'P2P_DIAL_FAILED';
         }
         if (dialled?.ok === true) {
-          active = { mode: 'p2p', machineId, sessionId, channel: dialled.channel, side, vk: null, encrypted: dialled.channel?.encryption?.encrypted === true, latest: null, error: null, startedAt: Date.now() };
+          active = { mode: 'p2p', machineId, sessionId, channel: dialled.channel, side, vk: null, encrypted: dialled.channel?.encryption?.encrypted === true, latest: null, error: null, p2pRenewAt: Date.now() + 10_000, startedAt: Date.now() };
           listener = (event) => {
             const frame = payloadJson(event?.payload);
             if (frame === null || frame?.session_id !== sessionId) return;
@@ -165,7 +165,7 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
         if (relayRequest.ok !== true) {
           return Response.json({ ok: false, code: 'P2P_UNAVAILABLE', error: p2pError, relay_error: relayRequest.error ?? null }, { status: 502, headers: NO_STORE });
         }
-        active = { mode: 'relay', machineId, sessionId, channel: null, side, vk: null, encrypted: true, latest: null, error: null, startedAt: Date.now() };
+        active = { mode: 'relay', machineId, sessionId, channel: null, side, vk: null, encrypted: true, latest: null, error: null, lastRelayAt: 0, relayRenewAt: Date.now() + 10_000, startedAt: Date.now() };
         return Response.json({ ok: true, machine_id: machineId, session_id: sessionId, encrypted: true, channel: 'relay', relay_ttl_ms: relayRequest.ttl_ms ?? null }, { headers: NO_STORE });
       },
     });
@@ -182,17 +182,41 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
       fetch: async () => {
         if (readConfig(file).enabled !== true) return Response.json({ ok: false, code: 'VIEW_DISABLED' }, { status: 403, headers: NO_STORE });
         if (active !== null) {
-          if (active.mode === 'relay' && active.latest === null) {
+          // A P2P target stops after its frame budget. The viewer's 1 Hz poll renews the request
+          // every ten seconds so an open page keeps the stream alive; closing the page stops the
+          // renewals and the target's bounded budget expires on its own.
+          if (active.mode === 'p2p' && Date.now() >= active.p2pRenewAt) {
+            active.p2pRenewAt = Date.now() + 10_000;
+            try {
+              void active.channel.send(JSON.stringify({ type: 'view.request', session_id: active.sessionId, machine_id: active.machineId, fps: 1, max_bytes: maxBytes }));
+            } catch { /* peer gone */ }
+          }
+          // The viewer polls at 1 Hz. Relay media is latest-frame-wins, so each poll asks the relay
+          // for the next frame instead of serving the first frame forever.
+          if (active.mode === 'relay' && (active.latest === null || Date.now() - active.lastRelayAt >= 900)) {
+            active.lastRelayAt = Date.now();
+            // The target's relay stream is bounded (60 frames). A renewed request sits in the
+            // mailbox and is consumed by the next poll after that stream ends, so the viewer keeps
+            // receiving frames without reconnect churn.
+            if (Date.now() >= active.relayRenewAt) {
+              active.relayRenewAt = Date.now() + 10_000;
+              void postRelayRequest({ stateDir: deps.stateDir, machineId: active.machineId, sessionId: active.sessionId, publicKey: active.side.public_key });
+            }
             const got = await fetchRelayFrame({ stateDir: deps.stateDir, sessionId: active.sessionId, machineId: active.machineId });
             if (got.ok === true) {
               try {
-                if (active.vk === null) {
-                  if (typeof got.public_key !== 'string') { active.error = 'VIEW_VK_REQUIRED'; return Response.json({ ok: false, code: active.error }, { status: 502, headers: NO_STORE }); }
-                  active.vk = active.side.finish(got.public_key).key;
-                }
+                // A renewed relay stream creates a new target ephemeral keypair; re-derive the
+                // viewer side whenever the target publishes a different public key.
+                if (typeof got.public_key === 'string') active.vk = active.side.finish(got.public_key).key;
+                if (active.vk === null) { active.error = 'VIEW_VK_REQUIRED'; return Response.json({ ok: false, code: active.error }, { status: 502, headers: NO_STORE }); }
                 const plaintext = openViewFrame(active.vk, got.ct);
-                if (plaintext.length <= maxBytes) active.latest = { seq: null, mime: 'image/jpeg', bytes: plaintext.length, data_base64: plaintext.toString('base64'), at: new Date().toISOString(), encrypted: true, channel: 'relay' };
+                if (plaintext.length <= maxBytes) {
+                  active.latest = { seq: null, mime: 'image/jpeg', bytes: plaintext.length, data_base64: plaintext.toString('base64'), at: new Date().toISOString(), encrypted: true, channel: 'relay' };
+                  active.error = null;
+                }
               } catch { active.error = 'VIEW_VK_BAD'; }
+            } else if (got.waiting !== true) {
+              active.error = 'VIEW_RELAY_UNAVAILABLE';
             }
           }
           if (active.latest !== null) return Response.json({ ok: true, ...active.latest }, { headers: NO_STORE });

@@ -7,6 +7,21 @@ All notable changes to this project are documented here.
 - `w2m_intent`: structured intents mapped onto allow-listed commands; unknown actions, parameters and types
   are refused by name (the fleet does not invent commands).
 
+## [2.2.3] - 2026-11-05
+
+- Remote desktop (view-only) now reaches 1 frame per second in a fleet. A machine opts in by
+  enabling 远程桌面 in its own settings; the target agent reads that file before consuming a
+  request and before every frame, so enabling or disabling takes effect without an agent restart.
+- The target sends repeated frames instead of one: P2P renews the request from the viewer, and the
+  relay target runs a bounded encrypted-frame stream while the viewer renews its request. The viewer
+  fetches the next relay frame on every 1 Hz poll and re-derives the key when a renewed stream uses a
+  new target ephemeral key.
+- Windows capture uses a once-compiled .NET helper (with the PowerShell path as fallback) so a frame
+  costs hundreds of milliseconds rather than a PowerShell startup; the frame scheduler compensates
+  for capture time to keep the one-second cadence.
+- Tests: target consent (including the localside parent directory), relay streaming at the configured
+  interval, P2P frame streaming and stop, viewer relay frame refresh, and a 1 Hz viewer route probe.
+
 ## [2.2.2] - 2026-11-05
 
 - DSH 0.2.2-rc.1 compatibility: composer popups (the dispatch-target menu and the Node-execution menu)

@@ -37,6 +37,30 @@ describe('P2P view frame channel', () => {
     assert.equal(frames[0].ok, true);
     assert.equal(frames[0].bytes, 2048);
     assert.equal(frames[0].encrypted, true);
+    target.stop();
+  });
+
+  it('streams one frame per interval until the target is stopped', async () => {
+    const targetSent = [];
+    let captures = 0;
+    const target = createViewTarget({
+      capture: () => { captures += 1; return fakeCapture(); },
+      allow: true,
+      send: (frame) => targetSent.push(JSON.parse(frame)),
+      intervalMs: 10,
+      maxFrames: 3,
+    });
+    const clientSent = [];
+    const client = createViewClient({ send: (frame) => clientSent.push(JSON.parse(frame)), onFrame: () => {} });
+    client.request({ machineId: 'm-stream', session: 's-stream' });
+    target.handle(clientSent[0]);
+    client.accept(targetSent[0]);
+    target.handle(clientSent[1]);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    target.stop();
+    const frames = targetSent.filter((frame) => frame.type === VIEW_FRAME.FRAME);
+    assert.equal(frames.length, 3, 'the configured frame budget is streamed at one frame per interval');
+    assert.equal(captures, 3);
   });
 
   it('refuses input frames and encrypted frames before the handshake', () => {

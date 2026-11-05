@@ -48,13 +48,44 @@ export function parseViewFrame(payload) {
   return frame;
 }
 
-/** @param {{capture:Function, allow?:boolean, send:Function, maxBytes?:number, fps?:number}} deps */
-export function createViewTarget({ capture, allow = false, send, maxBytes = 96 * 1024, fps = 1 } = {}) {
+/** @param {{capture:Function, allow?:boolean|Function, send:Function, maxBytes?:number, fps?:number, intervalMs?:number, maxFrames?:number}} deps */
+export function createViewTarget({ capture, allow = false, send, maxBytes = 96 * 1024, fps = 1, intervalMs, maxFrames = 300 } = {}) {
   if (typeof capture !== 'function' || typeof send !== 'function') return { ok: false, code: VIEW_CODE.BAD_FRAME };
   let seq = 0;
+  let frames = 0;
   let stopped = false;
   let vk = null;
+  let timer = null;
+  let sessionId = null;
+  const delay = Number.isInteger(intervalMs) && intervalMs > 0 ? intervalMs : Math.max(100, Math.round(1000 / Math.max(1, fps)));
+  const allowed = () => (typeof allow === 'function' ? allow() === true : allow === true);
   const reply = (frame) => { try { send(JSON.stringify(frame)); } catch { /* channel gone */ } };
+  const stopTimer = () => { if (timer !== null) clearTimeout(timer); timer = null; };
+  const schedule = (waitMs) => {
+    if (stopped || vk === null) return;
+    timer = setTimeout(() => { timer = null; tick(); }, Math.max(0, waitMs));
+    if (typeof timer.unref === 'function') timer.unref();
+  };
+  const fail = (code) => {
+    stopped = true;
+    stopTimer();
+    reply({ type: VIEW_FRAME.ERROR, code, session_id: sessionId });
+  };
+  const tick = () => {
+    if (stopped || vk === null || sessionId === null) { stopTimer(); return; }
+    if (!allowed()) { fail(VIEW_CODE.CONSENT_REQUIRED); return; }
+    if (maxFrames > 0 && frames >= maxFrames) { stopTimer(); return; }
+    const started = Date.now();
+    const result = capture({ maxBytes });
+    if (result?.ok !== true) { fail(result?.code ?? VIEW_CODE.CAPTURE_FAILED); return; }
+    let ct;
+    try { ct = sealViewFrame(vk, result.data ?? Buffer.from(result.base64 ?? '', 'base64')); }
+    catch { fail(VIEW_CODE.VK_BAD); return; }
+    seq += 1;
+    frames += 1;
+    reply({ type: VIEW_FRAME.FRAME, session_id: sessionId, seq, ts_ms: Date.now(), mime: result.mime ?? 'image/jpeg', bytes: result.bytes, enc: 'aes-256-gcm', ct });
+    if (maxFrames <= 0 || frames < maxFrames) schedule(delay - (Date.now() - started));
+  };
   return {
     ok: true,
     handle(payload) {
@@ -65,30 +96,34 @@ export function createViewTarget({ capture, allow = false, send, maxBytes = 96 *
       }
       const frame = parseViewFrame(payload);
       if (frame === null) return false;
-      if (frame.type === VIEW_FRAME.STOP) { stopped = true; return true; }
+      if (frame.type === VIEW_FRAME.STOP) { stopped = true; stopTimer(); return true; }
       if (frame.type === VIEW_FRAME.HELLO) {
-        if (typeof frame.public_key !== 'string' || frame.public_key === '') { reply({ type: VIEW_FRAME.ERROR, code: VIEW_CODE.VK_BAD, session_id: frame.session_id ?? null }); return true; }
+        stopTimer();
+        stopped = false;
+        frames = 0;
+        sessionId = typeof frame.session_id === 'string' ? frame.session_id : null;
+        if (typeof frame.public_key !== 'string' || frame.public_key === '') { reply({ type: VIEW_FRAME.ERROR, code: VIEW_CODE.VK_BAD, session_id: sessionId }); return true; }
         try {
           const side = createViewSide();
           vk = side.finish(frame.public_key).key;
-          reply({ type: VIEW_FRAME.HELLO_ACK, session_id: frame.session_id ?? null, public_key: side.public_key });
-        } catch { reply({ type: VIEW_FRAME.ERROR, code: VIEW_CODE.VK_BAD, session_id: frame.session_id ?? null }); }
+          reply({ type: VIEW_FRAME.HELLO_ACK, session_id: sessionId, public_key: side.public_key });
+        } catch { reply({ type: VIEW_FRAME.ERROR, code: VIEW_CODE.VK_BAD, session_id: sessionId }); }
         return true;
       }
       if (frame.type !== VIEW_FRAME.REQUEST) return true;
-      if (allow !== true) { reply({ type: VIEW_FRAME.ERROR, code: VIEW_CODE.CONSENT_REQUIRED, session_id: frame.session_id ?? null }); return true; }
-      if (stopped) { reply({ type: VIEW_FRAME.ERROR, code: VIEW_CODE.DISABLED, session_id: frame.session_id ?? null }); return true; }
-      if (vk === null) { reply({ type: VIEW_FRAME.ERROR, code: VIEW_CODE.VK_REQUIRED, session_id: frame.session_id ?? null }); return true; }
-      const result = capture({ maxBytes });
-      if (result?.ok !== true) { reply({ type: VIEW_FRAME.ERROR, code: result?.code ?? VIEW_CODE.CAPTURE_FAILED, session_id: frame.session_id ?? null }); return true; }
-      let ct;
-      try { ct = sealViewFrame(vk, result.data ?? Buffer.from(result.base64 ?? '', 'base64')); }
-      catch { reply({ type: VIEW_FRAME.ERROR, code: VIEW_CODE.VK_BAD, session_id: frame.session_id ?? null }); return true; }
-      seq += 1;
-      reply({ type: VIEW_FRAME.FRAME, session_id: frame.session_id ?? null, seq, ts_ms: Date.now(), mime: result.mime ?? 'image/jpeg', bytes: result.bytes, enc: 'aes-256-gcm', ct });
+      if (!allowed()) { fail(VIEW_CODE.CONSENT_REQUIRED); return true; }
+      if (stopped) { fail(VIEW_CODE.DISABLED); return true; }
+      if (vk === null) { fail(VIEW_CODE.VK_REQUIRED); return true; }
+      if (typeof frame.session_id === 'string' && frame.session_id !== '') sessionId = frame.session_id;
+      // A renewal is a fresh viewer request; its budget starts over so an actively polling viewer
+      // keeps the stream alive, while a viewer that disappears leaves the target to expire its budget.
+      frames = 0;
+      stopTimer();
+      tick();
       return true;
     },
-    stats() { return { seq, stopped, allow: allow === true, fps, max_bytes: maxBytes, encrypted: vk !== null }; },
+    stop() { stopped = true; stopTimer(); vk = null; sessionId = null; },
+    stats() { return { seq, frames, stopped, allow: allowed(), fps, intervalMs: delay, max_bytes: maxBytes, encrypted: vk !== null }; },
   };
 }
 
