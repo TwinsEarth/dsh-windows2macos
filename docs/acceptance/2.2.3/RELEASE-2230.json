@@ -1,0 +1,32 @@
+{
+  "version": "2.2.3",
+  "case": "RELEASE-2230",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-05T02:16:57.551Z",
+  "executor": "lead",
+  "task_id": "pre-release-2230-1793845017571",
+  "requirement": "v2.2.3: a fleet target that enables remote desktop serves repeated encrypted view frames to an online viewer at a one-second cadence, over P2P when available and the encrypted relay frame channel otherwise",
+  "commands": [
+    ["node", "--test", "--test-force-exit", "test/view-capture.test.mjs", "test/view-frame-channel.test.mjs", "test/view-consent.test.mjs"],
+    ["node", "--test", "--test-force-exit", "test/relay-target.test.mjs", "test/remote-view-route.test.mjs"],
+    ["node", "--test", "--test-force-exit", "test/client-bundle.test.mjs"],
+    ["node", "--test", "--test-force-exit", "test/loader-entry.test.mjs"]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "capture": "test/view-capture.test.mjs 4/4: unsupported platform, macOS capture, spawnSync status, and the transport size refusal",
+      "p2p": "test/view-frame-channel.test.mjs 4/4: consent denial, handshake, repeated frames at the configured interval, and input-frame refusal",
+      "consent": "test/view-consent.test.mjs 4/4: default deny, local enable, localside/ parent fallback, and W2M_VIEW_ALLOW overrides",
+      "relay": "test/relay-target.test.mjs 3/3: first sealed frame, repeated frames at the interval, and no request consumption while consent is off",
+      "viewer": "test/remote-view-route.test.mjs 3/3: P2P session, P2P refusal, and a fresh relay frame on each 1 Hz poll",
+      "client": "test/client-bundle.test.mjs 36/36: the client bundle still loads with the remote-view settings and page copy",
+      "loader": "test/loader-entry.test.mjs 10/10 against the packed 2.2.3 tarball in the real DSH 0.2.2-rc.1 Loader and Edge page",
+      "capture_timing": "local Windows real-capture relay stream produced 3 frames at 1.067 s, 2.087 s and 3.123 s (1.02-1.06 s cadence); the fast helper itself measured 0.23-0.40 s after compilation",
+      "scope": "local code and tests only; no installed profile was edited by the tests; release is published separately"
+    }
+  }
+}

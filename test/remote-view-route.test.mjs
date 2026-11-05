@@ -68,4 +68,49 @@ describe('remote-view host routes', () => {
     const body = await started.json();
     assert.equal(body.code, 'P2P_UNAVAILABLE');
   });
+
+  it('fetches a fresh relay frame on each 1 Hz viewer poll', async () => {
+    const h = harness();
+    h.node.dial = async () => ({ ok: false, error: 'P2P_PUNCH_TIMEOUT' });
+    const { writeFileSync } = await import('node:fs');
+    writeFileSync(join(h.stateDir, 'device.json'), JSON.stringify({ rabbit_url: 'http://relay.invalid', device_token: 't' }));
+    const originalFetch = globalThis.fetch;
+    const targetSide = createViewSide();
+    let viewerKey = null;
+    let targetKey = null;
+    let frameSeq = 0;
+    globalThis.fetch = async (url, options = {}) => {
+      if (String(url).includes('/v1/remote/request')) {
+        viewerKey = JSON.parse(options.body).viewer_public_key;
+        return { ok: true, status: 200, json: async () => ({ ok: true, ttl_ms: 15000 }) };
+      }
+      if (String(url).includes('/v1/remote/frame')) {
+        targetKey ??= targetSide.finish(viewerKey).key;
+        frameSeq += 1;
+        const plaintext = Buffer.alloc(2048, frameSeq);
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ ok: true, ct: sealViewFrame(targetKey, plaintext), public_key: targetSide.public_key }),
+        };
+      }
+      return { ok: false, status: 404, json: async () => ({ ok: false }) };
+    };
+    try {
+      await h.routes.get('/api/w2m/remote/config').fetch(request({ enabled: true }));
+      const started = await h.routes.get('/api/w2m/remote/start').fetch(request({ machine_id: 'm-relay' }));
+      assert.equal(started.status, 200);
+      const first = await h.routes.get('/api/w2m/remote/frame').fetch(request({}));
+      assert.equal(first.status, 200);
+      const firstBody = await first.json();
+      await new Promise((resolve) => setTimeout(resolve, 950));
+      const second = await h.routes.get('/api/w2m/remote/frame').fetch(request({}));
+      const secondBody = await second.json();
+      assert.equal(second.status, 200);
+      assert.notEqual(secondBody.data_base64, firstBody.data_base64, 'the second poll carries a new frame');
+    } finally {
+      globalThis.fetch = originalFetch;
+      await h.routes.get('/api/w2m/remote/stop').fetch(request({}));
+    }
+  });
 });

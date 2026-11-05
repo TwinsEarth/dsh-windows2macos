@@ -73,6 +73,7 @@ import { createXferFrameRouter } from './transfer/router.mjs';
 import { captureScreen } from './view/capture.mjs';
 import { createViewTarget } from './view/frame-channel.mjs';
 import { startRelayViewTarget } from './view/relay-target.mjs';
+import { viewAllowed } from './view/consent.mjs';
 import { DEFAULT_P2P_MODE, P2P_DEFAULTS, P2PNode, normalizeP2PMode, normalizeP2PPort } from './p2p-node.mjs';
 import { punchSession, reverseDialSession } from './p2p.mjs';
 import { createSigner } from '../signing.mjs';
@@ -1149,6 +1150,7 @@ export function createAgent(options) {
   /** P0-a: xfer.* frames arriving on a P2P channel are routed here, not to task dispatch. */
   const xferRouter = createXferFrameRouter();
   let viewTargets = null;
+  let viewRelayRunner = null;
   /**
    * What each task's direct channel actually was, for the result envelope.
    *
@@ -3978,8 +3980,8 @@ let attemptAttached = false;
       let target = viewTargets.get(key);
       if (target === undefined || payload.type === 'view.hello') {
         target = createViewTarget({
-          capture: () => captureScreen({}),
-          allow: process.env.W2M_VIEW_ALLOW === '1',
+          capture: () => captureScreen({ fast: true }),
+          allow: () => viewAllowed(stateDir),
           send: (frame) => { try { event.channel.send(frame); } catch { /* peer gone */ } },
         });
         viewTargets.set(key, target);
@@ -4434,6 +4436,10 @@ let attemptAttached = false;
     if (idleHeartbeatTimer) clearInterval(idleHeartbeatTimer);
     idleHeartbeatTimer = null;
     heartbeat?.stop();
+    viewRelayRunner?.stop();
+    viewRelayRunner = null;
+    for (const target of viewTargets?.values() ?? []) target?.stop?.();
+    viewTargets = null;
     runAbort?.abort();
     streamAbort?.abort();
     // Final snapshot: a reader must be able to tell "stopped" from "crashed
@@ -4470,10 +4476,17 @@ let attemptAttached = false;
     // the first heartbeat: "is an agent running here?" is the first question a
     // remote operator asks (task-16).
     publishState();
-    const viewRelay = process.env.W2M_VIEW_ALLOW === '1'
-      ? startRelayViewTarget({ rabbitUrl: baseUrl, token: () => identity.device_token, machineId: identity.machine_id, capture: (options) => captureScreen(options), log })
-      : null;
-    void viewRelay;
+    // The poller always runs; the consent file is checked before a request is consumed and before
+    // every frame, so enabling remote viewing in the settings page takes effect without an agent
+    // restart. A disabled machine never consumes a viewer request.
+    viewRelayRunner = startRelayViewTarget({
+      rabbitUrl: baseUrl,
+      token: () => identity.device_token,
+      machineId: identity.machine_id,
+      capture: (options) => captureScreen({ ...(options ?? {}), fast: true }),
+      allow: () => viewAllowed(stateDir),
+      log,
+    });
     if (statePublishIntervalMs > 0) {
       statePublishTimer = setInterval(() => publishState(), statePublishIntervalMs);
       // Never keep the process alive just to refresh a diagnostics file.
