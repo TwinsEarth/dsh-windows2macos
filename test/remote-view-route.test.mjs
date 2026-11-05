@@ -30,6 +30,24 @@ function harness() {
 const request = (body, method = 'POST') => ({ method, json: async () => body });
 
 describe('remote-view host routes', () => {
+  it('mounts the remote routes under the default state directory when none is configured', () => {
+    const routes = new Map();
+    const ctx = { inject: (_deps, callback) => callback({ connection: { fetch: { register: (route) => routes.set(route.path, route) } } }) };
+    const previous = process.env.DSH_HOME;
+    process.env.DSH_HOME = mkdtempSync(join(tmpdir(), 'w2m-view-default-'));
+    try {
+      const status = registerRemoteViewRoutes(ctx, { stateDir: '' });
+      assert.equal(status.mounted, true);
+      assert.equal(status.reason, null);
+      assert.ok(routes.has('/api/w2m/remote/config'));
+      assert.ok(routes.has('/api/w2m/remote/start'));
+      assert.ok(routes.has('/api/w2m/remote/frame'));
+    } finally {
+      if (previous === undefined) delete process.env.DSH_HOME;
+      else process.env.DSH_HOME = previous;
+    }
+  });
+
   it('starts a P2P session, caches one frame, and stops it', async () => {
     const h = harness();
     await h.routes.get('/api/w2m/remote/config').fetch(request({ enabled: true }));

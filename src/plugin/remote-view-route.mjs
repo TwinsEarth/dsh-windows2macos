@@ -12,6 +12,7 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { captureHostScreen } from './capture-route.mjs';
 import { createViewSide, openViewFrame } from '../agent/view/session-key.mjs';
+import { resolveStateDir } from '../util/cli.mjs';
 
 export const REMOTE_CONFIG_PATH = '/api/w2m/remote/config';
 export const REMOTE_FRAME_PATH = '/api/w2m/remote/frame';
@@ -43,8 +44,13 @@ function payloadJson(payload) {
 export function registerRemoteViewRoutes(ctx, deps = {}) {
   const status = { mounted: false, reason: 'the host has no Connection service', configPath: null };
   if (typeof ctx?.inject !== 'function') return status;
-  if (typeof deps.stateDir !== 'string' || deps.stateDir === '') { status.reason = 'stateDir is not configured'; return status; }
-  const file = join(deps.stateDir, 'remote-view.json');
+  // stateDir is unset on a default desktop profile. That must not silently remove the
+  // remote-view routes: the settings toggle and every /api/w2m/remote/* call would 404.
+  // Resolve the same default the agent uses so consent lives beside device.json.
+  const stateDir = typeof deps.stateDir === 'string' && deps.stateDir !== ''
+    ? deps.stateDir
+    : resolveStateDir(null, '');
+  const file = join(stateDir, 'remote-view.json');
   const capture = deps.capture ?? captureHostScreen;
   const platform = deps.platform ?? process.platform;
   const p2p = deps.p2p ?? null;
