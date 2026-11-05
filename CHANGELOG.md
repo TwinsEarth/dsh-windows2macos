@@ -7,6 +7,13 @@ All notable changes to this project are documented here.
 - `w2m_intent`: structured intents mapped onto allow-listed commands; unknown actions, parameters and types
   are refused by name (the fleet does not invent commands).
 
+## [2.2.4] - 2026-11-05
+
+- Fixes the remote desktop `HTTP 404`: a default desktop profile leaves `stateDir` empty, and
+  the remote-view route registration returned not-mounted in that case. The host now resolves
+  the same `~/.dsh/xclient` directory the agent uses, so `/api/w2m/remote/config|start|frame|stop`
+  are mounted and the settings toggle works without configuring `stateDir` by hand.
+- Remote-view route coverage now includes the default-stateDir mount path.
 ## [2.2.3] - 2026-11-05
 
 - Remote desktop (view-only) now reaches 1 frame per second in a fleet. A machine opts in by

@@ -1,0 +1,32 @@
+{
+  "version": "2.2.4",
+  "case": "RELEASE-2240",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-05T15:10:00.000Z",
+  "executor": "lead",
+  "task_id": "pre-release-2240",
+  "requirement": "v2.2.4: remote-view host routes mount on a default desktop profile whose stateDir is unset, so the settings toggle and /api/w2m/remote/{config,start,frame,stop} no longer return HTTP 404",
+  "commands": [
+    ["node", "--test", "--test-force-exit", "test/remote-view-route.test.mjs", "test/view-consent.test.mjs", "test/view-frame-channel.test.mjs", "test/relay-target.test.mjs", "test/client-bundle.test.mjs"],
+    ["node", "scripts/check-entrypoints.mjs"],
+    ["node", "--test", "--test-force-exit", "test/loader-entry.test.mjs"]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "remote_view": "test/remote-view-route.test.mjs 4/4: default-stateDir mount, P2P session, P2P refusal, and relay refresh",
+      "consent": "test/view-consent.test.mjs 4/4",
+      "p2p": "test/view-frame-channel.test.mjs 4/4",
+      "relay": "test/relay-target.test.mjs 3/3",
+      "client": "test/client-bundle.test.mjs 36/36",
+      "entrypoints": "node scripts/check-entrypoints.mjs: all entry points PASS",
+      "loader": "test/loader-entry.test.mjs 10/10 against the packed 2.2.4 artifact in the real DSH 0.2.2-rc.1 Loader and Edge page",
+      "root_cause": "registerRemoteViewRoutes returned { mounted: false, reason: 'stateDir is not configured' } when cfg.stateDir was empty; no /api/w2m/remote/* route existed",
+      "fix": "resolveStateDir(null, '') resolves ~/.dsh/xclient, matching the agent's default state directory",
+      "scope": "code and tests only; no profile was edited by the tests; npm publish is separate"
+    }
+  }
+}

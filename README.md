@@ -93,7 +93,7 @@ w2m-mcp --help
 # 复制进你自己的 codex/mcp-servers.toml
 [mcp_servers.w2m]
 command = "npx"
-args = ["-y", "@twinsearth/w2m-dsh-plugin@2.2.3", "w2m-mcp"]
+args = ["-y", "@twinsearth/w2m-dsh-plugin@2.2.4", "w2m-mcp"]
 ```
 
 ### 5. 验证过的 release tarball（离线）
