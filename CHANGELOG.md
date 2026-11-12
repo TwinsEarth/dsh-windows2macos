@@ -4,6 +4,28 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [2.2.5] - 2026-11-12
+
+- DSH 0.2.2-rc.2 compatibility, measured rather than assumed: the packed artifact mounts and boots in
+  the rc.2 runtime (`@deepseek-ai/dsh@0.2.2-rc.2`) with every host entry active, all `w2m_*` tools
+  registered, the browser half composed into `__DSH_BOOT__` and activated, the real page booting in a
+  browser, and the Node-execution menu opening and taking temporary execution from the composer.
+- The compatibility gate now pins that host: `DSH_HOST_VERSION` moves from `0.2.0-rc.2` to
+  `0.2.2-rc.2`, with the Cordis versions that release carries (`@deepseek-ai/cordis@4.1.0`,
+  `@deepseek-ai/cordis-plugin-loader@1.1.0`) and the pnpm the runtime bundles (`11.28.5`). The gate is
+  what turns "the host moved" into a measurement instead of a surprise.
+- `package.json#engines.dsh` is declared for the first time: `>=0.2.0 <0.3.0`. The requirement is read
+  before any plugin code loads, so a host outside the line is refused with a named requirement instead
+  of failing later. Prereleases participate in the range (DSH evaluates it with `includePrerelease`),
+  which is why `0.2.2-rc.2` and `0.2.2-rc.1` both satisfy it; declaring `engines.dsh` also means the
+  old `@deepseek-ai/dsh-*` peer fallback no longer decides compatibility for this package.
+- Reviewed the two rc.2 changes an extension could depend on, and neither needs this package to move:
+  tool failures now carry structured identity (`ToolGuardDenial.info`, `ToolContextUnavailableError`,
+  approval and context error codes) but this package registers no `tools` guards and already returns a
+  named refusal reason, so the change is additive from here; and plugins can register MCP servers for
+  their own lifetime through `ctx.mcpManager`, which this package deliberately does **not** do — its
+  bundled `w2m-mcp` server mirrors the same `w2m_*` tools for codex/Claude hosts, so mounting it inside
+  DSH would register every tool twice.
 - `w2m_intent`: structured intents mapped onto allow-listed commands; unknown actions, parameters and types
   are refused by name (the fleet does not invent commands).
 

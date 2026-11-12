@@ -1,0 +1,34 @@
+{
+  "version": "2.2.5",
+  "case": "RELEASE-2250",
+  "kind": "positive",
+  "machines": ["b53a37f4-1464-4512-9259-33a7df091e3e"],
+  "executed_at": "2026-11-12T12:43:04Z",
+  "executor": "lead",
+  "task_id": "pre-release-2250",
+  "requirement": "v2.2.5: the packed artifact mounts and boots in DSH 0.2.2-rc.2 (host entries active, all w2m_* tools registered, browser half composed and activated, real page boots, composer menus usable), and package.json#engines.dsh declares the supported host range before any plugin code loads",
+  "commands": [
+    ["node", "scripts/pack.mjs"],
+    ["node", "test/helpers/dsh-loader-driver.mjs", "<harnessRoot>", "<dshHome>", "w2mrc2", "[\"--port\",\"0\",\"--no-open\"]", "<overlay>"],
+    ["node", "--test", "--test-force-exit", "test/loader-entry.test.mjs"],
+    ["node", "--test", "--test-force-exit", "test/installed-version.test.mjs", "test/evidence.test.mjs", "test/claims.test.mjs", "test/agent-plugins.test.mjs"],
+    ["node", "scripts/preflight.mjs"]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "host": "DSH 0.2.2-rc.2 (@deepseek-ai/dsh@0.2.2-rc.2 installed from npm; cordis 4.1.0, cordis-plugin-loader 1.1.0, cordis-plugin-group 1.1.0 resolved by that tree)",
+      "loader": "drive the packed 2.2.5 artifact through the real Loader in a web profile: 177 entries active, 0 failed fibers, the w2m row active, 23 tools registered through the tools service projection",
+      "client_host_half": "the real clientModules registry accepted the package's dsh.client declaration and composed a boot-graph row for @twinsearth/w2m-dsh-plugin from the shipped lib/client.js",
+      "client_activation": "the real client module system plus a real Cordis fiber activated the entry (state active, no error) and it took 16 composer/sidebar/settings seats",
+      "client_page": "the profile's Web app booted in headless Edge against the real server: the package stylesheet arrived, the boot overlay was dismissed, and no entry reported a boot failure",
+      "composer_control": "the Node-execution menu opened from the composer with three options, and selecting temporary execution updated the control to 'Node-execution: temporary 24h, 24h left' with data-on=true and no error note",
+      "routes": "w2m_status reports target_selection.attached=true and the live connection registry holds 25 fetch routes, including /api/w2m/target, /api/w2m/capability and the four /api/w2m/remote/* routes",
+      "engines_dsh": "package.json#engines.dsh is '>=0.2.0 <0.3.0'; DSH evaluates it with includePrerelease, so 0.2.2-rc.1 and 0.2.2-rc.2 both satisfy it, and the packed tarball installed into the rc.2 profile without a compatibility refusal",
+      "compat_gate": "compat.yml pins DSH_HOST_VERSION 0.2.2-rc.2 with cordis 4.1.0 / cordis-plugin-loader 1.1.0 / pnpm 11.28.5; the pin is the release gate's measurement of this host",
+      "not_adopted": "rc.2 lets a plugin register MCP servers through ctx.mcpManager; this package does not, because its bundled w2m-mcp server mirrors the same w2m_* tools for codex and Claude hosts, so mounting it inside DSH would register every tool twice",
+      "artifact": "scripts/pack.mjs packs dist/twinsearth-w2m-dsh-plugin-2.2.5.tgz deterministically from this tree; the published sha256 is the one release.yml writes into dist/SHA256SUMS beside the tarball, so the artifact digest is not restated here -- a record that named its own tarball's hash would be inside the tarball it describes",
+      "scope": "code, tests, manifests and docs; the probe profile and the rc.2 runtime live under a temporary directory, and publishing is a separate workflow run"
+    }
+  }
+}
