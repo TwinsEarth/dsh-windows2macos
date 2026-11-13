@@ -216,8 +216,12 @@ export function registerDecisionCenterRoutes(ctx) {
       if (center === undefined || typeof center.ingest !== 'function') return unavailable();
       const body = await bodyOf(request);
       const out = center.ingest(body ?? {});
-      const statusCode = out.ok ? 200
-        : out.reason === 'title-required' || out.reason === 'options-required' || out.reason === 'gray-is-terminal' ? 400
+      const statusCode = out.ok
+        ? 200
+        : out.reason === 'title-required' ||
+            out.reason === 'options-required' ||
+            out.reason === 'gray-is-terminal'
+          ? 400
           : 409;
       return json(statusCode, out);
     });
@@ -228,7 +232,12 @@ export function registerDecisionCenterRoutes(ctx) {
       if (center === undefined || typeof center.list !== 'function') return unavailable();
       if (streams >= MAX_EVENT_STREAMS) return json(429, { ok: false, error: 'too-many-event-streams' });
       streams += 1;
-      const response = sseResponse({ center, pump: () => () => { streams = Math.max(0, streams - 1); } });
+      const response = sseResponse({
+        center,
+        pump: () => () => {
+          streams = Math.max(0, streams - 1);
+        },
+      });
       return response;
     });
 
@@ -237,17 +246,25 @@ export function registerDecisionCenterRoutes(ctx) {
       if (center === undefined || typeof center.resolve !== 'function') return unavailable();
       const body = await bodyOf(request);
       if (Array.isArray(body?.ids)) {
-        if (typeof center.resolveMany !== 'function') return json(503, { ok: false, error: 'decision-center-batch-unavailable' });
-        return json(200, center.resolveMany(body.ids, { option: body?.option, by: body?.by ?? 'w2m-api', note: body?.note }));
+        if (typeof center.resolveMany !== 'function')
+          return json(503, { ok: false, error: 'decision-center-batch-unavailable' });
+        return json(
+          200,
+          center.resolveMany(body.ids, { option: body?.option, by: body?.by ?? 'w2m-api', note: body?.note }),
+        );
       }
       const resolveOptions = { by: body?.by ?? 'w2m-api', note: body?.note };
       if (body?.custom !== undefined) resolveOptions.custom = body.custom;
-      const out = (body?.actionId !== undefined && typeof center.resolveAction === 'function')
-        ? center.resolveAction(body?.id, body.actionId, body?.payload, resolveOptions)
-        : center.resolve(body?.id, body?.option, resolveOptions);
-      const statusCode = out.ok ? 200
-        : out.reason === 'not-found' ? 404
-          : out.reason === 'option-required' || out.reason === 'unknown-option' ? 400
+      const out =
+        body?.actionId !== undefined && typeof center.resolveAction === 'function'
+          ? center.resolveAction(body?.id, body.actionId, body?.payload, resolveOptions)
+          : center.resolve(body?.id, body?.option, resolveOptions);
+      const statusCode = out.ok
+        ? 200
+        : out.reason === 'not-found'
+          ? 404
+          : out.reason === 'option-required' || out.reason === 'unknown-option'
+            ? 400
             : 409;
       return json(statusCode, out);
     });
@@ -257,11 +274,12 @@ export function registerDecisionCenterRoutes(ctx) {
       if (center === undefined || typeof center.abandon !== 'function') return unavailable();
       const body = await bodyOf(request);
       if (Array.isArray(body?.ids)) {
-        if (typeof center.abandonMany !== 'function') return json(503, { ok: false, error: 'decision-center-batch-unavailable' });
+        if (typeof center.abandonMany !== 'function')
+          return json(503, { ok: false, error: 'decision-center-batch-unavailable' });
         return json(200, center.abandonMany(body.ids, { by: body?.by ?? 'w2m-api', note: body?.note }));
       }
       const out = center.abandon(body?.id, { by: body?.by ?? 'w2m-api', note: body?.note });
-      return json(out.ok ? 200 : (out.reason === 'not-found' ? 404 : 409), out);
+      return json(out.ok ? 200 : out.reason === 'not-found' ? 404 : 409, out);
     });
 
     register(`${DECISION_ROUTE_PREFIX}/ai`, ['GET'], () => {
@@ -274,7 +292,7 @@ export function registerDecisionCenterRoutes(ctx) {
       const center = centerOf(ctx);
       if (center === undefined || typeof center.testAi !== 'function') return unavailable();
       const out = await center.testAi((await bodyOf(request)) ?? {});
-      return json(out.ok ? 200 : (out.status === 429 ? 429 : 400), out);
+      return json(out.ok ? 200 : out.status === 429 ? 429 : 400, out);
     });
 
     register(`${DECISION_ROUTE_PREFIX}/ai/config`, ['POST'], async (request) => {
@@ -296,17 +314,21 @@ export function registerDecisionCenterRoutes(ctx) {
           send('start', { id });
           void (async () => {
             try {
-              const out = typeof center.adviseStream === 'function'
-                ? await center.adviseStream(id, (delta, text) => {
-                  if (!cancelled) send('delta', { delta, text });
-                })
-                : await center.advise(id);
-              if (!cancelled) send(out.ok ? 'done' : 'error', out.ok ? { advice: out.advice, ticket: out.ticket } : out);
+              const out =
+                typeof center.adviseStream === 'function'
+                  ? await center.adviseStream(id, (delta, text) => {
+                      if (!cancelled) send('delta', { delta, text });
+                    })
+                  : await center.advise(id);
+              if (!cancelled)
+                send(out.ok ? 'done' : 'error', out.ok ? { advice: out.advice, ticket: out.ticket } : out);
             } catch (error) {
               if (!cancelled) send('error', { ok: false, error: String(error?.message ?? error) });
             }
           })();
-          return () => { cancelled = true; };
+          return () => {
+            cancelled = true;
+          };
         },
       });
     });
@@ -316,11 +338,15 @@ export function registerDecisionCenterRoutes(ctx) {
       if (center === undefined || typeof center.advise !== 'function') return unavailable();
       const body = await bodyOf(request);
       const out = await center.advise(body?.id);
-      const limited = out?.reason === 'ai-rate-limited' || out?.reason === 'ai-circuit-open' || out?.reason === 'ai-daily-quota-exceeded';
-      const headers = limited && Number.isFinite(out?.retryAfterMs) && out.retryAfterMs > 0
-        ? { 'retry-after': String(Math.ceil(out.retryAfterMs / 1000)) }
-        : {};
-      return json(out.ok ? 200 : (out.reason === 'not-found' ? 404 : limited ? 429 : 409), out, headers);
+      const limited =
+        out?.reason === 'ai-rate-limited' ||
+        out?.reason === 'ai-circuit-open' ||
+        out?.reason === 'ai-daily-quota-exceeded';
+      const headers =
+        limited && Number.isFinite(out?.retryAfterMs) && out.retryAfterMs > 0
+          ? { 'retry-after': String(Math.ceil(out.retryAfterMs / 1000)) }
+          : {};
+      return json(out.ok ? 200 : out.reason === 'not-found' ? 404 : limited ? 429 : 409, out, headers);
     });
 
     status.mounted = true;

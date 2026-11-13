@@ -11,7 +11,12 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { apply, QUEUE_JOURNAL_ROUTE_PREFIX, QUEUE_JOURNAL_SERVICE, QUEUE_RESTORE_ROUTE_PATH } from '../src/queue-journal/index.mjs';
+import {
+  apply,
+  QUEUE_JOURNAL_ROUTE_PREFIX,
+  QUEUE_JOURNAL_SERVICE,
+  QUEUE_RESTORE_ROUTE_PATH,
+} from '../src/queue-journal/index.mjs';
 
 function mount(config = {}) {
   const requests = new Map();
@@ -24,7 +29,16 @@ function mount(config = {}) {
     },
     inject(names, callback) {
       if (names.includes('connection')) {
-        callback({ connection: { fetch: { register: (entry) => { routes.set(entry.path, entry); return () => routes.delete(entry.path); } } } });
+        callback({
+          connection: {
+            fetch: {
+              register: (entry) => {
+                routes.set(entry.path, entry);
+                return () => routes.delete(entry.path);
+              },
+            },
+          },
+        });
       }
     },
     get(name) {
@@ -47,23 +61,32 @@ function mount(config = {}) {
   return { routes, service: provided.get(QUEUE_JOURNAL_SERVICE), call };
 }
 
-const post = (body) => ({ method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+const post = (body) => ({
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: JSON.stringify(body),
+});
 
 test('queue journal: save, read back and list newest first', async () => {
   const root = mkdtempSync(join(tmpdir(), 'w2m-qj-'));
   const { routes, service, call } = mount({ dataDir: root });
-  assert.deepEqual([...routes.keys()].sort(), [
-    QUEUE_JOURNAL_ROUTE_PREFIX,
-    `${QUEUE_JOURNAL_ROUTE_PREFIX}/history`,
-    QUEUE_RESTORE_ROUTE_PATH,
-  ].sort());
+  assert.deepEqual(
+    [...routes.keys()].sort(),
+    [QUEUE_JOURNAL_ROUTE_PREFIX, `${QUEUE_JOURNAL_ROUTE_PREFIX}/history`, QUEUE_RESTORE_ROUTE_PATH].sort(),
+  );
   assert.ok(service, 'the journal service is provided');
-  const saved = await call(QUEUE_JOURNAL_ROUTE_PREFIX, post({
-    key: 'session-a',
-    draft: 'unsent text',
-    path: '#/sessions/session-a',
-    queue: [{ text: 'queued one', at: 1 }, { text: 'queued two', at: 2 }],
-  }));
+  const saved = await call(
+    QUEUE_JOURNAL_ROUTE_PREFIX,
+    post({
+      key: 'session-a',
+      draft: 'unsent text',
+      path: '#/sessions/session-a',
+      queue: [
+        { text: 'queued one', at: 1 },
+        { text: 'queued two', at: 2 },
+      ],
+    }),
+  );
   assert.equal(saved.status, 200);
   assert.equal(saved.body.ok, true);
   assert.equal(saved.body.entry.draft, 'unsent text');
@@ -106,7 +129,10 @@ test('queue journal: malformed keys and missing keys are refused', async () => {
 test('queue journal: restore refuses a session that is not live instead of pretending to queue', async () => {
   const root = mkdtempSync(join(tmpdir(), 'w2m-qj-'));
   const { call } = mount({ dataDir: root });
-  const restored = await call(QUEUE_RESTORE_ROUTE_PATH, post({ sessionId: 'session-a', items: [{ text: 'hello' }] }));
+  const restored = await call(
+    QUEUE_RESTORE_ROUTE_PATH,
+    post({ sessionId: 'session-a', items: [{ text: 'hello' }] }),
+  );
   assert.equal(restored.status, 409);
   assert.equal(restored.body.error, 'session-not-live');
 });

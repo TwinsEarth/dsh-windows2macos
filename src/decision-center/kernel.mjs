@@ -147,9 +147,8 @@ export function writeJsonAtomic(file, value, { indent = 2 } = {}) {
 export function resolveFangLayout(options = {}) {
   const { dataRoot = '' } = options;
   const explicit = String(dataRoot ?? '').trim();
-  const dataDir = explicit !== ''
-    ? path.resolve(explicit)
-    : path.join(resolveStateDir(null, ''), 'decision-center');
+  const dataDir =
+    explicit !== '' ? path.resolve(explicit) : path.join(resolveStateDir(null, ''), 'decision-center');
   return { dataDir };
 }
 

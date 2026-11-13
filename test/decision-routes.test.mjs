@@ -47,7 +47,16 @@ function mount() {
     },
     inject(names, callback) {
       if (names.includes('connection')) {
-        callback({ connection: { fetch: { register: (entry) => { routes.set(entry.path, entry); return () => routes.delete(entry.path); } } } });
+        callback({
+          connection: {
+            fetch: {
+              register: (entry) => {
+                routes.set(entry.path, entry);
+                return () => routes.delete(entry.path);
+              },
+            },
+          },
+        });
       }
       if (names.includes('tools')) {
         callback({ get: () => ({ register: () => () => {} }) });

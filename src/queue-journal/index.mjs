@@ -126,18 +126,24 @@ export function registerQueueJournalRoutes(ctx, deps) {
       let queued = 0;
       let failed = 0;
       for (const item of items.slice(0, 100)) {
-        const text = String(item?.text ?? '').trim().slice(0, 4000);
+        const text = String(item?.text ?? '')
+          .trim()
+          .slice(0, 4000);
         if (text === '') {
           failed += 1;
           continue;
         }
         try {
-          agent.send({
-            id: `msg_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
-            role: 'user',
-            content: [{ type: 'text', text }],
-            source: { kind: 'user' },
-          }, 'next-turn', false);
+          agent.send(
+            {
+              id: `msg_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
+              role: 'user',
+              content: [{ type: 'text', text }],
+              source: { kind: 'user' },
+            },
+            'next-turn',
+            false,
+          );
           queued += 1;
         } catch {
           failed += 1;
@@ -159,9 +165,10 @@ export function registerQueueJournalRoutes(ctx, deps) {
  * @param {{dataDir?: string}} [config]
  */
 export function apply(ctx, config = {}) {
-  const dataDir = typeof config?.dataDir === 'string' && config.dataDir.trim() !== ''
-    ? path.resolve(config.dataDir)
-    : path.join(resolveStateDir(null, ''), 'queue-journal');
+  const dataDir =
+    typeof config?.dataDir === 'string' && config.dataDir.trim() !== ''
+      ? path.resolve(config.dataDir)
+      : path.join(resolveStateDir(null, ''), 'queue-journal');
   const journal = new ComposerJournal(dataDir);
   const service = {
     dataDir,
