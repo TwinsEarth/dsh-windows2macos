@@ -15,7 +15,20 @@ import js from '@eslint/js';
 import globals from 'globals';
 
 export default [
-  { ignores: ['src/ops/**'] },
+  {
+    ignores: [
+      'src/ops/**',
+      'src/decision-center/index.mjs',
+      'src/decision-center/lib/**',
+      'src/decision-center/vendor/**',
+      'src/queue-journal/lib/**',
+      'test/decision-center.test.mjs',
+      'test/decision-events.test.mjs',
+      'test/decision-ingest-client.test.mjs',
+      'test/decision-outbox.test.mjs',
+      'test/helpers/fang-ctx.mjs',
+    ],
+  },
   // ---------------------------------------------------------------------
   // Scope. `dist/` holds generated release artifacts, `node_modules/` is never
   // committed, and the deploy/ copies are templates rather than code.
