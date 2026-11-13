@@ -4,6 +4,23 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [3.1.0] - 2026-11-14
+
+- 队列子插件：`@twinsearth/dsh-fang-queue-journal`（瓮城）移植为 `@twinsearth/w2m-dsh-plugin/queue-journal`。
+  Fang 的包只有空宿主（`apply(){}`），HTTP 面在 fang orchestrator 里；W2M 没有 orchestrator，所以
+  `src/queue-journal/index.mjs` 自带存储与四条路由，线上形状与移植的客户端完全一致：
+  `GET/POST /api/w2m/composer/journal`（单条/恢复列表）、`GET /api/w2m/composer/journal/history`
+  （append-only 快照，可按 sessionKey 过滤）、`POST /api/w2m/composer/queue`（恢复到会话收件箱；
+  无 live agent 时返回 `session-not-live`，绝不假装入队）。
+- 存储 `ComposerJournal` 逐字移植（`src/queue-journal/lib/composer-journal.mjs`），数据落在
+  `$DSH_HOME/xclient/queue-journal`；保存上限、历史上限与原子写保持不变。
+- 客户端：Fang 的独立客户端模块（`window.__ModuleLoader__.load`）展开成 W2M 单一客户端 bundle 里的
+  `createQueueJournalModule()`，由根 `apply(ctx)` 挂到 `conversation.composer.dock`：草稿输入捕获、
+  queue dock 的 MutationObserver、15 秒兜底与 pagehide flush 全部保留；恢复只能由用户显式点击。
+  Fang 的 `x-fang-auth` 取 token 逻辑替换为同源占位（W2M 路由走 cookie 鉴权）。
+- 测试：新增 `test/queue-journal.test.mjs` 4 项（保存/读回/恢复列表、历史过滤、缺 key 拒绝、
+  非 live 会话拒绝恢复）；client-bundle 的座位断言更新为 17 个（新增队列 dock）。
+
 ## [3.0.0] - 2026-11-14
 
 - 决策中心子插件：`@twinsearth/dsh-fang/decision-center`（瓮城）完整移植为

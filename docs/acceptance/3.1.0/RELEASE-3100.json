@@ -1,0 +1,46 @@
+{
+  "version": "3.1.0",
+  "case": "RELEASE-3100",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-13T21:00:13.167Z",
+  "executor": "lead",
+  "task_id": "pre-release-3100",
+  "requirement": "v3.1.0: the Fang queue journal is ported to W2M as @twinsearth/w2m-dsh-plugin/queue-journal (store + four /api/w2m/composer/* routes + composer dock client UI in the single client bundle) and its tests pass",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/queue-journal.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/client-bundle.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/loader-entry.test.mjs"
+    ],
+    [
+      "node",
+      "scripts/pack.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "store": "ComposerJournal is copied verbatim from Fang (src/queue-journal/lib/composer-journal.mjs); its data directory defaults to $DSH_HOME/xclient/queue-journal",
+      "routes": "GET/POST /api/w2m/composer/journal, GET /api/w2m/composer/journal/history and POST /api/w2m/composer/queue are registered on the connection fetch registry; the restore route answers session-not-live (409) when no live agent can take the rows, exactly as the Fang route did",
+      "client": "createQueueJournalModule() in lib/client.js is the Fang factory body with only the auth-token shim and /fang/api -> /api/w2m rewrites; the root apply(ctx) mounts it on conversation.composer.dock, so the draft/queue journal UI appears in the composer dock",
+      "suites": "queue-journal 4/4 and client bundle 36/36 (the seat expectation now lists 17 seats including conversation.composer.dock)",
+      "artifact": "scripts/pack.mjs packs dist/twinsearth-w2m-dsh-plugin-3.1.0.tgz deterministically; the published sha256 is the one release.yml writes into dist/SHA256SUMS, so the record does not restate the hash of the archive that contains it"
+    }
+  }
+}

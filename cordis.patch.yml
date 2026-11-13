@@ -151,6 +151,11 @@
     # floating launcher render (read through /api/w2m/decisions), and a disabled row would leave that
     # panel with no store behind it. The store lives under $DSH_HOME/xclient/decision-center; the row
     # carries no config so the plugin's own defaults apply.
+    # 队列日志 (queue journal): composer drafts and the queue mirror, ported from dsh-Fang's
+    # @twinsearth/dsh-fang-queue-journal in v3.1.0. Enabled so the composer dock appears.
+    - id: dsh-queue-journal
+      name: '@twinsearth/w2m-dsh-plugin/queue-journal'
+      config: {}
     - id: dsh-decision-center
       name: '@twinsearth/w2m-dsh-plugin/decision-center'
       config: {}
