@@ -631,13 +631,21 @@ describe('client bundle: the stylesheet', () => {
   });
 });
 
-it('debounces conversation search and waits for the history loader (v2.0.5)', () => {
+it('searches the whole conversation after 1s (v2.2.6)', () => {
   const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
-  assert.ok(source.includes('}, 3000)'), 'search waits 3s after the last keystroke');
-  assert.ok(source.includes('function isLoadingEarlier()'), 'the scroll control can see the loading row');
+  assert.ok(
+    source.includes('paintRef.current(true); }, 1000);'),
+    'search waits 1s after the last keystroke (v2.0.5 waited 3s, which read as "search does nothing")',
+  );
+  assert.ok(!source.includes('function viewportRect'), 'no viewport-only filter: a scrolled-out match is still a match');
+  assert.ok(
+    !source.includes("addEventListener('scroll', onScroll, true)"),
+    'marks persist after a query settles, so scrolling no longer repaints them',
+  );
+  assert.ok(source.includes('const SEARCH_MAX_MARKS = 120;'), 'the wrap cap bounds paint cost, not the count');
+  assert.ok(source.includes('return ranges.length;'), 'the count is every match, not only the wrapped ones');
   assert.ok(source.includes('function searchQueryAllowed'), 'pure numbers <= 100 are refused');
-  assert.ok(source.includes('const SEARCH_MAX_MARKS = 6;'), 'at most six matches per viewport');
-  assert.ok(source.includes("addEventListener('scroll', onScroll, true)"), 'scrolling repaints the viewport');
+  assert.ok(source.includes('function isLoadingEarlier()'), 'the scroll control can see the loading row');
   assert.ok(source.includes('await waitForLoadSettled();'), 'the top button waits for in-flight history instead of re-pressing');
   assert.ok(source.includes('if (stagnant >= 2) break;'), 'two pages that add nothing end the loop instead of spinning');
 });

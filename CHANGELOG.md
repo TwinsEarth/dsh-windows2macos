@@ -4,6 +4,19 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [2.2.6] - 2026-11-14
+
+- Fixes 搜索本对话: the walk covered only the viewport and stopped counting at six matches, so a
+  word that was merely scrolled out of sight reported `0/0` and the feature looked broken. It now
+  searches the whole rendered conversation, counts every match, and wraps up to 120 of them (the cap
+  bounds paint cost, not the count). The count shows `…` while a query is still being applied.
+- The search settles 1s after the last keystroke instead of 3s (the 3s delay was the second half of
+  the same complaint: typing appeared to do nothing). Enter searches immediately.
+- Marks persist after the query settles, so the scroll-triggered repaint is gone; it was re-walking
+  the tree on every scroll for a result that no longer needed refreshing.
+- Tests: the client-bundle suite now asserts the 1s settle, the whole-conversation walk (no
+  viewport rect filter) and the count-every-match cap, instead of the old 3s/six-mark contract.
+
 ## [2.2.5] - 2026-11-12
 
 - DSH 0.2.2-rc.2 compatibility, measured rather than assumed: the packed artifact mounts and boots in
