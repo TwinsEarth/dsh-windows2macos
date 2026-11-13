@@ -13,6 +13,7 @@
     "./package.json": "./package.json",
     "./gpw": "./lib/gpw.js",
     "./desktop": "./lib/desktop.js",
+    "./decision-center": "./lib/decision-center.js",
     "./locale/en.json": "./locale/en.json",
     "./locale/zh.json": "./locale/zh.json"
   },

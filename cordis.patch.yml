@@ -144,4 +144,15 @@
         whitelist: []
         blacklist: []
         pendingTimeoutMs: 120000
+    # 决策中心 (decision center): the human-attention queue, ported from dsh-Fang's
+    # `@twinsearth/dsh-fang/decision-center` in v3.0.0.
+    #
+    # Unlike GPW this row is **enabled**: the center is the panel the GPW settings page and the GPW
+    # floating launcher render (read through /api/w2m/decisions), and a disabled row would leave that
+    # panel with no store behind it. The store lives under $DSH_HOME/xclient/decision-center; the row
+    # carries no config so the plugin's own defaults apply.
+    - id: dsh-decision-center
+      name: '@twinsearth/w2m-dsh-plugin/decision-center'
+      config: {}
+
 
