@@ -1,0 +1,30 @@
+{
+  "version": "2.2.6",
+  "case": "RELEASE-2260",
+  "kind": "positive",
+  "machines": ["b53a37f4-1464-4512-9259-33a7df091e3e"],
+  "executed_at": "2026-11-13T19:13:00Z",
+  "executor": "lead",
+  "task_id": "pre-release-2260",
+  "requirement": "v2.2.6: the in-conversation search (search conversation, the header magnifier) counts matches across the whole rendered conversation instead of only the viewport, and starts searching 1s after the last keystroke instead of 3s",
+  "commands": [
+    ["node", "--check", "lib/client.js"],
+    ["node", "--test", "--test-force-exit", "test/client-bundle.test.mjs"],
+    ["node", "--test", "--test-force-exit", "test/loader-entry.test.mjs"],
+    ["node", "scripts/pack.mjs"]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "defect": "the walk was restricted to the current viewport and stopped counting at six matches, so a word that existed only above the fold reported 0/0 and the feature looked broken; the 3s settle made every query look ignored for its first three seconds",
+      "scope": "paintSearchMarks walks every text node under the conversation region (falling back to document.body), counts every occurrence, and wraps at most 120 of them -- the cap bounds paint cost, not the count; counting stops at 2000 matches so a one-letter query cannot stall the UI",
+      "settle": "the query settles 1000ms after the last keystroke (was 3000ms); Enter searches immediately; the count shows an ellipsis while the query is still being applied",
+      "no_viewport_filter": "the viewport rectangle filter and its six-match ceiling are gone, and the scroll-triggered repaint is removed because marks persist once painted",
+      "syntax": "node --check lib/client.js: exit 0",
+      "client_bundle": "test/client-bundle.test.mjs 36/36, including the rewritten contract assertions: 1s settle string, no viewportRect, count is ranges.length, no scroll repaint",
+      "loader": "test/loader-entry.test.mjs 10/10 against the packed 2.2.6 artifact in the real DSH 0.2.2-rc.3 desktop runtime (entry active, tools registered, client half composed and activated, page booted in a browser)",
+      "installed": "the packed 2.2.6 tarball is installed in this machine's desktop profile from ~/.dsh/w2m/w2m-dsh-plugin-2.2.6.tgz, so the running app serves the fixed client bundle on its next page load",
+      "artifact": "scripts/pack.mjs packs dist/twinsearth-w2m-dsh-plugin-2.2.6.tgz deterministically from this tree; the published sha256 is the one release.yml writes into dist/SHA256SUMS beside the tarball, so the record does not restate the hash of the archive that contains it"
+    }
+  }
+}
