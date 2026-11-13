@@ -4,6 +4,24 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-11-14
+
+- 决策中心子插件：`@twinsearth/dsh-fang/decision-center`（瓮城）完整移植为
+  `@twinsearth/w2m-dsh-plugin/decision-center`。宿主模块逐字移植（`src/decision-center/index.mjs`，
+  27 个服务方法、`request_human_decision` 工具），四个依赖（AI 密钥库、决策 outbox、生产者契约、
+  SSRF 守卫）与 MIT 内置 schemastery 原样随包；Fang 内核 barrel 由 `kernel.mjs` 顶替，提供同样的
+  `z`/`SERVICE`/bus/原子读写/数据目录解析/角色门。
+- 新增 `/api/w2m/decisions*` 14 条路由：列表、单票、配额、分身聚合、生产者目录、外部 ingest、
+  SSE 实时推送、解决（含批量与 actionId）、放弃（含批量）、AI 状态/测试/配置/建议/流式建议；
+  `routes.mjs` 用 Connection fetch 注册表承载，SSE 事件名与负载与 Fang 一致。
+- 决策中心面板进入 GPW：`GpwSettingsPage` 与 `GpwLauncher` 共用同一个 `GpwPanel`，因此设置页与浮标
+  同时显示——4 秒轮询、红票置顶、绿/灰折叠、按票面选项一键解决、无选项可放弃、AI 建议只推荐不执行。
+- 测试：移植 Fang 决策套件 79 项 + 出站箱/事件/ingest 10 项，新增路由面 3 项，共 92 项通过；
+  `decision-center-fork` 与 `decision-action-integration` 不移植：前者依赖 Fang 母体/分身角色矩阵，
+  后者的主体是 Fang orchestrator 与 restart-guard，W2M 里没有对应组件。
+- 包元数据：新增 `./decision-center` 子路径导出与`dsh-decision-center` patch 行（启用），
+  `engines.dsh` 保持 `>=0.2.0 <0.3.0`。
+
 ## [2.2.6] - 2026-11-14
 
 - Fixes 搜索本对话: the walk covered only the viewport and stopped counting at six matches, so a
