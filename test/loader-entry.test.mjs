@@ -692,6 +692,12 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
       assert.equal(jq.idHiddenByDefault, true, 'Session IDs are hidden by default');
       assert.equal(jq.idShownAfterEye, true, 'the eye toggle reveals Session IDs: ' + JSON.stringify(jq));
       assert.equal(page.jq626?.sessionsApi?.ok, true, `the sessions route answers: ${JSON.stringify(page.jq626?.sessionsApi)}`);
+      const gpwClose = page.gpwClose ?? {};
+      assert.equal(gpwClose.gpwOpen?.open, true, 'the GPW floating panel opens from its launcher for the close checks');
+      assert.equal(gpwClose.outsideClick?.clicked, true, 'a click on the GPW overlay background is dispatched');
+      assert.equal(gpwClose.outsideClosed?.closed, true, 'clicking outside the GPW panel closes it');
+      assert.equal(gpwClose.reopened?.open, true, 'the GPW panel reopens for the Escape check');
+      assert.equal(gpwClose.escClosed?.closed, true, 'Escape closes the GPW panel');
       if (parity.rightTab?.marker === '1') {
         assert.equal(parity.rightTab.marker, '1');
       } else {

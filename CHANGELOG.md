@@ -19,6 +19,7 @@ All notable changes to this project are documented here.
   记录（无会话键、`page:` 实例键、测试/探针记录等）统一折叠进「客户端生成的记录 · N 条（默认折叠，仅排错用）」，
   展开才可见；没有人类记录时会明确提示。浮标计数只统计人类输入，避免客户端记录把徽标刷成红/黄。
 - 本机已清理已产生的垃圾记录（备份于临时目录），并重新写入干净的记录。
+- GPW 浮动面板：点击面板外的遮罩自动收起，按 `Esc` 也关闭（设置页内联渲染不受影响）。
 - 验证：`queue-journal` 5/5（含 sessions 路由）、`client-bundle` 36/36（含“不再扫描任意 queue/pending 元素”
   与 `validSessionKey` 的静态断言）、真实 Chromium 断言：抽屉有 👁 / 清空全部、Session ID 默认不可见、
   点 👁 后出现、sessions 路由 200。

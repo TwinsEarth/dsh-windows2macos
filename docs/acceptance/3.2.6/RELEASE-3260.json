@@ -43,7 +43,8 @@
       "privacy": "Session IDs are hidden by default and only rendered after the eye toggle (aria-pressed flips)",
       "cleanup": "the drawer has 清空全部; page-keyed leftovers are hidden with a hint, and the already-polluted records on this machine were backed up and cleaned",
       "proof": "real Chromium probe: the human-keyed entry is visible, the client-keyed entry is absent from the default body and present only after opening the folded section (collapsed by default), the drawer has the Session ID eye toggle and 清空全部, Session IDs stay hidden until the eye is clicked, and the sessions route answers 200; queue-journal 5/5; client-bundle 36/36; loader-entry 10/10",
-      "human_only": "the drawer shows only real-session (human) records by default; client/page-generated records are collapsed under 客户端生成的记录 · N 条（默认折叠）, the badge counts human records only, and an explicit note appears when there are no human records"
+      "human_only": "the drawer shows only real-session (human) records by default; client/page-generated records are collapsed under 客户端生成的记录 · N 条（默认折叠）, the badge counts human records only, and an explicit note appears when there are no human records",
+      "gpw_close": "the GPW floating panel closes on an outside click on its overlay background and on Escape, while the inline settings-page rendering (no onClose) is unaffected; the real-browser probe opens the panel, dispatches an overlay click and asserts the card is gone, reopens it and asserts Escape closes it"
     }
   }
 }

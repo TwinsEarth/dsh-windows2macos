@@ -458,6 +458,21 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
       const qGeom = await read(`const d=document.querySelector('.w2mJqDrawer'); const b=document.querySelector('.w2mJqDrawer .w2mDcBody'); const r=d===null?null:d.getBoundingClientRect(); return {open:d!==null&&d.style.display!=='none', height:r===null?null:Math.round(r.height), bottomGap:r===null?null:Math.round(innerHeight-r.bottom), rightGap:r===null?null:Math.round(innerWidth-r.right), overflow:b===null?null:getComputedStyle(b).overflowY, viewportH:innerHeight};`);
       await read(`const b=[...document.querySelectorAll('.w2mJqDrawer .w2mDcBtn')].find((x)=>x.textContent==='关闭'); if(b!==undefined)b.click(); return{closed:true};`);
       report.ui324 = { ui324, qOpened, qGeom };
+      const ensureClosed = await read(`const l=document.querySelector('.w2mGpw_launcher'); if(l===null)return{launcher:false}; if(document.querySelector('.w2mGpw_card')!==null) l.click(); return{launcher:true};`);
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      await read(`const l=document.querySelector('.w2mGpw_launcher'); if(l!==null) l.click(); return{opened:true};`);
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      const gpwOpen = await read(`return {open:document.querySelector('.w2mGpw_card')!==null, overlay:document.querySelector('.w2mGpw_overlay')!==null};`);
+      const outsideClick = await read(`const o=document.querySelector('.w2mGpw_overlay'); if(o===null)return{clicked:false}; o.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true,view:window})); return{clicked:true};`);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      const outsideClosed = await read(`return {closed:document.querySelector('.w2mGpw_card')===null};`);
+      await read(`const l=document.querySelector('.w2mGpw_launcher'); if(l!==null) l.click(); return{opened:true};`);
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      const reopened = await read(`return {open:document.querySelector('.w2mGpw_card')!==null};`);
+      await read(`document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true})); return{sent:true};`);
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      const escClosed = await read(`return {closed:document.querySelector('.w2mGpw_card')===null};`);
+      report.gpwClose = { ensureClosed, gpwOpen, outsideClick, outsideClosed, reopened, escClosed };
       await evaluate(`
         (async () => {
           const r = await fetch('/api/w2m/decisions?includeArchived=1');
