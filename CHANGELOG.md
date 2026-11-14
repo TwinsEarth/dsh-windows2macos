@@ -33,7 +33,7 @@ All notable changes to this project are documented here.
   `routes.mjs` 用 Connection fetch 注册表承载，SSE 事件名与负载与 Fang 一致。
 - 决策中心面板进入 GPW：`GpwSettingsPage` 与 `GpwLauncher` 共用同一个 `GpwPanel`，因此设置页与浮标
   同时显示——4 秒轮询、红票置顶、绿/灰折叠、按票面选项一键解决、无选项可放弃、AI 建议只推荐不执行。
-- 测试：移植 Fang 决策套件 79 项 + 出站箱/事件/ingest 10 项，新增路由面 3 项，共 92 项通过；
+- 测试：移植 Fang 决策套件 79 项 + 新增路由面 3 项通过；Fang 的 Node-SSE 辅助（decision-events）与 fork 侧 ingest 客户端不随包（W2M 路由走 fetch SSE、没有 fork 半体）。
   `decision-center-fork` 与 `decision-action-integration` 不移植：前者依赖 Fang 母体/分身角色矩阵，
   后者的主体是 Fang orchestrator 与 restart-guard，W2M 里没有对应组件。
 - 包元数据：新增 `./decision-center` 子路径导出与`dsh-decision-center` patch 行（启用），
