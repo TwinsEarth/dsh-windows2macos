@@ -4,6 +4,21 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [3.2.5] - 2026-11-14
+
+- 修复：决策中心「AI 建议设置」导入 Token 失败。原因有两处：
+  1. 表单即使留空也会把 `provider/model/baseUrl` 作为空字符串发上去，而宿主的预设查找是
+     `String(input.provider ?? 'deepseek')` —— 空字符串不是 nullish，导致 `unknown-provider`；
+     现在表单预填 DeepSeek 预设（`deepseek` / `deepseek-flash` / `https://api.deepseek.com/v1`），
+     并且只提交非空字段，服务端预设得以生效；
+  2. 4xx 响应体用的是 `reason` 而不是 `error`，UI 只显示「HTTP 400」；现在请求层同时读取两者，
+     失败时能看到 `unknown-provider` / `api-key-required` / `base-url-required` 等真实原因。
+- 保存成功后会回显已保存的 `provider / model`，而不是笼统的「已保存」。
+- 与本次操作配套的事实：DeepSeek Key 已按宿主相同的 DPAPI（CurrentUser）格式写入
+  `$DSH_HOME/xclient/decision-center/decision-ai-secret.enc` + 元数据，插件下次启动会自动恢复；
+  该 Key 已实测 `POST /v1/chat/completions`（model `deepseek-flash`）返回 200。
+- 验证：`client-bundle` 36/36、`eslint` 0 errors；AI 表单默认值与错误透传均有静态断言覆盖。
+
 ## [3.2.4] - 2026-11-14
 
 - UI 对齐（按用户截图）：

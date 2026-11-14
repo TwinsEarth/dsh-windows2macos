@@ -1,0 +1,41 @@
+{
+  "version": "3.2.5",
+  "case": "RELEASE-3250",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-14T09:42:45.469Z",
+  "executor": "lead",
+  "task_id": "pre-release-3250",
+  "requirement": "v3.2.5: make importing a large-model token in the decision center work -- prefill the DeepSeek preset, omit blank fields so the server preset lookup is not defeated by empty strings, and surface 4xx reasons instead of a bare HTTP status",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/client-bundle.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/claims.test.mjs"
+    ],
+    [
+      "node",
+      "scripts/pack.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "root_cause": "the form sent provider/model/baseUrl as empty strings when left blank; normalizeAiProfile reads String(input.provider ?? 'deepseek') and an empty string is not nullish, so the preset lookup failed with unknown-provider; 4xx bodies also carry `reason`, while the client only read `error`, hiding the cause behind HTTP 400",
+      "form": "the AI settings form prefills deepseek / deepseek-flash / https://api.deepseek.com/v1 and submits only non-empty fields, so pasting a key alone now saves through the provider preset",
+      "errors": "dcRequest throws body.error ?? body.reason ?? HTTP status, so a rejected save names unknown-provider / api-key-required / base-url-required",
+      "feedback": "a successful save reports the stored provider/model instead of a bare 已保存",
+      "key_setup": "the operator key was validated against POST /v1/chat/completions (model deepseek-flash, HTTP 200) and persisted in the host data dir with the plugin's own DPAPI(CurrentUser) format; the plugin's createAiSecretStore().load() reads it back as provider=deepseek model=deepseek-flash backend=dpapi, so the advisor is configured after the next start",
+      "suites": "client-bundle 36/36; claims green with the network skip; eslint 0 errors"
+    }
+  }
+}
