@@ -406,6 +406,29 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
       `);
       const qOpened = await read(`const b=document.querySelector('.w2mJqBadge'); if(b===null)return{clicked:false}; b.click(); return{clicked:true};`);
       await new Promise((resolve) => setTimeout(resolve, 700));
+      const jq626 = await read(`
+        const sessionsApi=document.querySelector('.w2mJqDrawer');
+        const eye=document.querySelector('.w2mJqEye');
+        const clearAll=document.querySelector('.w2mJqClearAll');
+        const bodyText=(document.querySelector('.w2mJqDrawer .w2mDcBody')?.innerText ?? '');
+        if(eye!==null) eye.click();
+        const bodyAfter=(document.querySelector('.w2mJqDrawer .w2mDcBody')?.innerText ?? '');
+        if(eye!==null) eye.click();
+        return {
+          eye: eye!==null,
+          clearAll: clearAll!==null,
+          idHiddenByDefault: !bodyText.includes('Session ID：'),
+          idShownAfterEye: bodyAfter.includes('Session ID：'),
+        };
+      `);
+      const sessionsApi = parseP(await evaluate(`
+        (async () => {
+          const r = await fetch('/api/w2m/composer/journal/sessions');
+          const b = await r.json().catch(() => null);
+          return JSON.stringify({ status: r.status, ok: b?.ok === true, items: Array.isArray(b?.items) ? b.items.length : null });
+        })()
+      `));
+      report.jq626 = { jq626, sessionsApi };
       const qGeom = await read(`const d=document.querySelector('.w2mJqDrawer'); const b=document.querySelector('.w2mJqDrawer .w2mDcBody'); const r=d===null?null:d.getBoundingClientRect(); return {open:d!==null&&d.style.display!=='none', height:r===null?null:Math.round(r.height), bottomGap:r===null?null:Math.round(innerHeight-r.bottom), rightGap:r===null?null:Math.round(innerWidth-r.right), overflow:b===null?null:getComputedStyle(b).overflowY, viewportH:innerHeight};`);
       await read(`const b=[...document.querySelectorAll('.w2mJqDrawer .w2mDcBtn')].find((x)=>x.textContent==='关闭'); if(b!==undefined)b.click(); return{closed:true};`);
       report.ui324 = { ui324, qOpened, qGeom };

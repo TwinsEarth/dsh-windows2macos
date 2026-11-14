@@ -55,6 +55,44 @@ async function bodyOf(request) {
 }
 
 /**
+ * Best-effort session-id -> title map for the journal drawer. The host may expose a `sessions` service,
+ * an `agents` service, or neither; every shape is optional here and an absent service is not an error.
+ * The drawer falls back to a short id when a title is missing.
+ *
+ * @param {object} ctx Cordis context.
+ * @returns {Promise<Array<{id: string, title: string}>>}
+ */
+export async function listSessionTitles(ctx) {
+  const titles = new Map();
+  const take = (id, title) => {
+    const key = String(id ?? '').trim();
+    if (key === '') return;
+    const name = String(title ?? '').trim();
+    if (!titles.has(key) || (titles.get(key) === '' && name !== '')) titles.set(key, name);
+  };
+  for (const serviceName of ['sessions', 'agents']) {
+    let service;
+    try { service = ctx?.get?.(serviceName); } catch { continue; }
+    if (service === undefined || service === null) continue;
+    let items = null;
+    try {
+      if (typeof service.list === 'function') items = await Promise.resolve(service.list());
+      else if (typeof service.values === 'function') items = Array.from(service.values());
+      else if (typeof service.entries === 'function') items = Array.from(service.entries()).map(([id, value]) => ({ id, ...(value !== null && typeof value === 'object' ? value : {}) }));
+    } catch { items = null; }
+    if (!Array.isArray(items)) continue;
+    for (const item of items) {
+      if (item === null || typeof item !== 'object') continue;
+      take(
+        item.id ?? item.sessionId ?? item.session?.id,
+        item.title ?? item.name ?? item.displayName ?? item.session?.title,
+      );
+    }
+  }
+  return [...titles.entries()].map(([id, title]) => ({ id, title }));
+}
+
+/**
  * Mount the four composer-journal routes on the host's Connection fetch registry.
  *
  * @param {object} ctx Cordis context.
@@ -105,6 +143,15 @@ export function registerQueueJournalRoutes(ctx, deps) {
       const limit = Math.max(1, Math.min(200, Number(query.get('limit') ?? 20) || 20));
       const sessionKey = String(query.get('sessionKey') ?? '');
       return json(200, { ok: true, items: deps.journal.history({ limit, sessionKey }) });
+    });
+
+    // v3.2.6：会话标题映射，供队列日志抽屉显示会话名（Session ID 默认隐藏）。
+    register(`${QUEUE_JOURNAL_ROUTE_PREFIX}/sessions`, ['GET'], async () => {
+      try {
+        return json(200, { ok: true, items: await listSessionTitles(ctx) });
+      } catch (error) {
+        return json(200, { ok: true, items: [], reason: String(error?.message ?? error) });
+      }
     });
 
     register(QUEUE_RESTORE_ROUTE_PATH, ['POST'], async (request) => {

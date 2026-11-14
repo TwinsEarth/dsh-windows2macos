@@ -1,0 +1,48 @@
+{
+  "version": "3.2.6",
+  "case": "RELEASE-3260",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-14T09:50:23.868Z",
+  "executor": "lead",
+  "task_id": "pre-release-3260",
+  "requirement": "v3.2.6: stop the queue journal from recording garbage (it scanned arbitrary queue/pending DOM and stored innerText, including our own drawer and tool output, and kept regenerating after each clear), only journal real session keys, show session titles with Session IDs hidden behind an eye toggle, and add clear-all",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/queue-journal.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/client-bundle.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/loader-entry.test.mjs"
+    ],
+    [
+      "node",
+      "scripts/pack.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "cause": "scanQueue() fell back to document.querySelectorAll on [class*=\"queue\" i] / pending variants and stored each match innerText; our own drawer, conversation text and tool output matched, and the body MutationObserver plus 8s refresh kept writing new rows after every clear",
+      "capture": "queue rows now come only from [data-queue-dock] li elements (plus the aria-controls fallback); with no official dock the queue is empty; elements inside [data-w2m-queue-ui] are skipped",
+      "keys": "commitSave/flushNow refuse to write unless the resolved key is a real session key (page-instance keys, empty keys and \"/\" are dropped)",
+      "titles": "the drawer renders the conversation title from the host sessions/agents service via the new GET /api/w2m/composer/journal/sessions route, falling back to a short id",
+      "privacy": "Session IDs are hidden by default and only rendered after the eye toggle (aria-pressed flips)",
+      "cleanup": "the drawer has 清空全部; page-keyed leftovers are hidden with a hint, and the already-polluted records on this machine were backed up and cleaned",
+      "proof": "real Chromium probe: eye and clear-all exist, Session ID text is absent by default and appears after the eye click, the sessions route answers 200; queue-journal 5/5; client-bundle 36/36; loader-entry 10/10"
+    }
+  }
+}

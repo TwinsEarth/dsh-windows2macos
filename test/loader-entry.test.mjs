@@ -681,6 +681,12 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
       assert.ok(qh > qvh * 0.35 && qh < qvh * 0.85, `the queue drawer is half height: ${JSON.stringify({ qh, qvh })}`);
       assert.ok(Number(page.ui324?.qGeom?.bottomGap) >= 0 && Number(page.ui324?.qGeom?.bottomGap) <= 40, 'the queue drawer opens at the bottom right');
       assert.equal(page.ui324?.qGeom?.overflow, 'auto', 'the queue drawer body scrolls');
+      const jq = page.jq626?.jq626 ?? {};
+      assert.equal(jq.eye, true, 'the queue journal drawer has the Session ID eye toggle');
+      assert.equal(jq.clearAll, true, 'the queue journal drawer has 清空全部');
+      assert.equal(jq.idHiddenByDefault, true, 'Session IDs are hidden by default');
+      assert.equal(jq.idShownAfterEye, true, 'the eye toggle reveals Session IDs');
+      assert.equal(page.jq626?.sessionsApi?.ok, true, `the sessions route answers: ${JSON.stringify(page.jq626?.sessionsApi)}`);
       if (parity.rightTab?.marker === '1') {
         assert.equal(parity.rightTab.marker, '1');
       } else {

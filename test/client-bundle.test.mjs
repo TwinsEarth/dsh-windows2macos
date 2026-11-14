@@ -902,3 +902,11 @@ describe('client bundle: selecting a machine writes the @mention', () => {
     assert.deepEqual(JSON.parse(JSON.stringify(edits)), [{ text: '@beta ', span: { start: 0, end: 0, draftRev: 1 } }]);
   });
 });
+it('queue journal only records the official dock and real sessions (v3.2.6)', () => {
+  const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
+  assert.ok(!source.includes('[class*="queue" i]'), 'no generic queue class scan: it captured drawer and page text');
+  assert.ok(!source.includes('[data-testid*="pending" i]'), 'no generic pending scan either');
+  assert.ok(source.includes('validSessionKey('), 'writes are gated on a real session key');
+  assert.ok(source.includes("startsWith('page:')"), 'page-instance keys are refused');
+  assert.ok(source.includes('data-w2m-queue-ui'), 'our own UI is marked and skipped by the capture');
+});

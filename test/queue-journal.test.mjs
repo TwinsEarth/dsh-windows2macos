@@ -18,7 +18,7 @@ import {
   QUEUE_RESTORE_ROUTE_PATH,
 } from '../src/queue-journal/index.mjs';
 
-function mount(config = {}) {
+function mount(config = {}, services = {}) {
   const requests = new Map();
   const provided = new Map();
   const routes = new Map();
@@ -49,6 +49,7 @@ function mount(config = {}) {
       provided.set(name, value);
     },
   };
+  for (const [name, value] of Object.entries(services)) provided.set(name, value);
   apply(ctx, config);
   const call = async (path, init) => {
     const entry = routes.get(path.split('?')[0]);
@@ -72,7 +73,7 @@ test('queue journal: save, read back and list newest first', async () => {
   const { routes, service, call } = mount({ dataDir: root });
   assert.deepEqual(
     [...routes.keys()].sort(),
-    [QUEUE_JOURNAL_ROUTE_PREFIX, `${QUEUE_JOURNAL_ROUTE_PREFIX}/history`, QUEUE_RESTORE_ROUTE_PATH].sort(),
+    [QUEUE_JOURNAL_ROUTE_PREFIX, `${QUEUE_JOURNAL_ROUTE_PREFIX}/history`, `${QUEUE_JOURNAL_ROUTE_PREFIX}/sessions`, QUEUE_RESTORE_ROUTE_PATH].sort(),
   );
   assert.ok(service, 'the journal service is provided');
   const saved = await call(
@@ -135,4 +136,15 @@ test('queue journal: restore refuses a session that is not live instead of prete
   );
   assert.equal(restored.status, 409);
   assert.equal(restored.body.error, 'session-not-live');
+});
+
+test('queue journal: session titles come from the host session service', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'w2m-qj-'));
+  const { call } = mount({ dataDir: root }, {
+    sessions: { list: () => [{ id: 'session-a', title: '部署排查' }, { id: 'session-b', title: '' }] },
+  });
+  const out = await call(`${QUEUE_JOURNAL_ROUTE_PREFIX}/sessions`);
+  assert.equal(out.status, 200);
+  assert.equal(out.body.ok, true);
+  assert.deepEqual(out.body.items, [{ id: 'session-a', title: '部署排查' }, { id: 'session-b', title: '' }]);
 });

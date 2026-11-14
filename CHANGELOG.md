@@ -4,6 +4,22 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [3.2.6] - 2026-11-14
+
+- **队列日志错乱修复**：旧版 `scanQueue()` 在没有官方 `[data-queue-dock]` 时会扫描任意 class/aria/testid
+  里含 `queue`/`pending` 的元素并整段存 `innerText`，把本插件抽屉、对话正文、工具输出都当成“排队消息”
+  写进日志，于是出现「队列 x」「恢复全部 (22)」「清除」「1. .tmp/…」这类垃圾，并且清掉又立刻生成。
+  现在**只认官方队列 dock**（`[data-queue-dock]` 的行及其 aria-controls 兜底），没有 dock 就是空队列；
+  插件自己的浮标/抽屉带 `data-w2m-queue-ui` 标记并被排除。
+- 只在**真实会话键**下写入（`page:` 实例键、空键、`/` 一律不写），从源头杜绝无会话垃圾记录。
+- 队列日志抽屉：显示**会话名称**（宿主 `sessions`/`agents` 服务映射；宿主新增
+  `GET /api/w2m/composer/journal/sessions`），**Session ID 默认隐藏**，点 👁 才显示；新增**清空全部**按钮；
+  无会话键的旧垃圾记录默认隐藏并提示可一键清理。
+- 本机已清理已产生的垃圾记录（备份于临时目录），并重新写入干净的记录。
+- 验证：`queue-journal` 5/5（含 sessions 路由）、`client-bundle` 36/36（含“不再扫描任意 queue/pending 元素”
+  与 `validSessionKey` 的静态断言）、真实 Chromium 断言：抽屉有 👁 / 清空全部、Session ID 默认不可见、
+  点 👁 后出现、sessions 路由 200。
+
 ## [3.2.5] - 2026-11-14
 
 - 修复：决策中心「AI 建议设置」导入 Token 失败。原因有两处：
