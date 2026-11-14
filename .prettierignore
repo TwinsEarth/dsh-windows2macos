@@ -33,3 +33,20 @@ LICENSE
 package.json
 .gitattributes
 .gitignore
+
+# Ported from dsh-Fang (v3.0.0 decision center, v3.1.0 queue journal). These files are
+# committed as ported code: their layout is the upstream worktree's, not this repo's style,
+# and reformatting them would make "copied verbatim" no longer true.
+src/decision-center/index.mjs
+src/decision-center/lib/
+src/decision-center/vendor/
+src/queue-journal/lib/
+test/decision-center.test.mjs
+test/decision-events.test.mjs
+test/decision-ingest-client.test.mjs
+test/decision-outbox.test.mjs
+test/helpers/fang-ctx.mjs
+
+# The published contract SDK, vendored byte for byte (v3.2.0). Its layout belongs to the upstream
+# package and PROVENANCE.md records its integrity; reformatting it would break the byte equality.
+src/interop/contract/

@@ -4,9 +4,326 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [3.3.2] - 2026-11-14
+
+- **历史对话只挂在输入框上方**：窗口改为 composer 内的绝对定位（`.w2mHistWrap` + `position:absolute`），
+  不再固定在页面右下/底部；Esc/关闭按钮照常收起。
+- **队列日志的底部 dock 不再渲染**：截图里「历史 10 + 恢复」那一列（conversation.composer.dock 的 JournalDock）
+  已隐藏，草稿保存/恢复能力仍保留在历史对话窗口、操作面板「消息与草稿」页与队列日志抽屉里。
+- **找回 v2.2.6 的原始模块/功能/按钮**：
+  「全部机器」目标选择控件、执行能力开关、编队聊天面板重新显示在输入框行（v3.3.0 曾把它们隐藏）；
+  「编队群组」视图页签、GPW 浮标、右下角浮标与底部状态栏保持。
+- 验证：`client-bundle 40/40`（历史窗口锚定/原控件恢复/编队聊天两处注册/全部机器标签/队列 dock 隐藏），
+  真实 Chromium `loader-entry 10/10`（历史窗口 wrapped+absolute、全部机器按钮可见、编队聊天按钮可见、
+  操作面板四页签），`gpw-ai 10/10`、`claims`/`layer-model` 绿、`eslint 0 errors`。
+
+## [3.3.1] - 2026-11-14
+
+- **修复 GPW 智能分级 `unparseable-classification`**：解析器现在接受中文键（危险等级/建议/理由）、数字等级（1-4）、
+  同义词与散文；模型回复无法解析时自动做一次「修复重试」（把原始回复发回，要求只输出 JSON）；两次都失败时
+  `POST /api/w2m/gpw/ai/test` 会带回模型原始回复片段（`raw`），面板直接显示出来，便于定位。
+- **AI Token 设置 UI/交互优化**：状态徽标（已配置=绿 / 未配置=黄）、provider/model/baseUrl/Token 分字段、
+  保存与“测试分级”按钮带进度（保存中…/测试中…）、测试结果按成功/失败着色并显示等级、动作、理由、耗时、
+  自动修复提示与模型原始返回；另有“刷新状态”按钮与本机保存说明。
+- **左侧边栏操作面板**：点击侧栏按钮打开的面板新增四个页签：
+  「智能分级&审批」（AI Token 设置 + 待审批队列，可直接允许/拒绝并显示倒计时）、
+  「消息与草稿」（队列日志的人类记录 + 恢复草稿/恢复队列/清除/打开窗口）、
+  「决策中心」（待处理计数 + 列表 + 打开决策中心）、
+  「操作入口」（目标机器、执行能力，以及 GPW 浮窗/队列日志/决策中心快捷按钮）。
+- 聊天框仍只有 v3.3.0 的「历史对话」一个按钮；右下角浮标与底部状态栏保持不变。
+- 验证：`gpw-ai 10/10`（中文键/数字/散文解析、修复重试、原始回复回传）、`client-bundle 40/40`、
+  真实 Chromium `loader-entry 10/10`（侧栏打开操作面板、四个页签、消息与草稿页、关闭面板），
+  `claims`/`layer-model` 绿、`eslint 0 errors`。
+
+## [3.3.0] - 2026-11-14
+
+- **聊天框只保留一个「历史对话」按钮**：目标机器选择、执行能力开关、队列日志 chip、GPW 行内待审批提示、
+  编队群聊面板不再占用聊天框（控件为探针/内部保留而隐藏）；右下角浮标与底部状态栏保持不变。
+- **点击才展开窗口**：历史对话窗口默认关闭，点按钮展开；Esc/关闭按钮收起。
+- **窗口只显示人类输入**：我发过的消息（`user/message`，排除系统/机器注入的 user 消息）、待发送提交、
+  当前草稿、当前会话的排队消息；助手/工具等机器生成内容一律不显示。
+- **点击条目填入输入框**：任意一条人类输入点击后直接填回 composer，方便复用历史提问。
+- 验证：`client-bundle 39/39`（新增：单一历史按钮、隐藏旧控件、仅 user/message、pendingSubmissions、
+  writeComposer 填入、仅人类输入提示），真实 Chromium `loader-entry 10/10`（按钮存在、点击展开窗口、
+  标题「历史对话」、副标题「仅人类输入」、关闭窗口），`claims`/`layer-model` 绿、`eslint 0 errors`。
+
+## [3.2.10] - 2026-11-14
+
+- **取消左侧边栏的「决策中心」按钮**：决策收件箱入口仍保留在 GPW 面板的收件箱按钮、右侧「待选」浮钮与抽屉里；
+  左侧栏不再出现该条目（相关 slot 注册与组件一并移除）。
+- **队列日志显示会话中文名称**：标题来自客户端 `sessions` 服务的 `displayTitle`（并随记录持久化到 `title` 字段），
+  不再显示 `会话 0c36661d` 这类短 ID；会话标题取不到时显示「未知会话」。
+- **队列日志不显示 Session ID**：移除 👁 眼睛按钮与「Session ID」行，抽屉里不出现任何原始会话编号。
+- **没有草稿也没有排队消息的会话不再出现在队列日志里**（徽标计数同样只统计有内容的记录）。
+- 验证：`client-bundle 38/38`（含“不显示 Session ID/眼睛按钮、标题来自 sessions 服务、空记录被过滤”的静态断言）、
+  `queue-journal 6/6`（新增 title 持久化用例）、真实 Chromium `loader-entry 10/10`（左侧栏无「决策中心」、
+  队列抽屉无 Session ID/原始会话号、清空按钮仍在）、`claims`/`layer-model` 绿、真实浏览器截图核对通过。
+
+## [3.2.9] - 2026-11-14
+
+- **修复 Linux CI 上 GPW auto-approve 的偶发失败**：v3.2.7 起给 GPW 倒计时 timer 加了 `unref()`，
+  在 CI 的受控事件循环里可能先于测试结束，导致 `gpw-auto-approve` 第一个子测试失败、发布流水线在
+  `End-to-end suites` 步骤挂掉。现恢复 timer 强引用（与原始实现一致），红/黄/蓝/绿倒计时与自动动作语义不变。
+- 验证：`gpw-auto-approve`、`gpw-ai-priority`、`gpw-modes` 本地全绿；CI 诊断 run 已定位失败子测试为
+  “approves a yellow call after the timeout and makes its next occurrence blue”。
+- 同一轮 CI 还暴露出分层模型（layer-model）未声明的新依赖边 `plugin -> decision-center`（GPW 复用决策中心的密钥存储），已在 `scripts/layer-model.mjs` 的 ALLOWED_EDGES 显式声明，`layer-model 24/24` 通过。
+- 发布会话的 e2e 改为**自诊断**（保持 `npm run test:e2e` 单一入口，符合 claims 的“单一事实源”约束）：
+  步骤内捕获输出，把失败文件名以 `::error title=e2e::FAILED <file>` 注解写出并写入 step summary；即使读不到日志，也能从注解/摘要看到是哪个 e2e 文件挂了。
+
+## [3.2.8] - 2026-11-14
+
+- **GPW 行内提示补齐**：composer 行内的 `GpwPrompt` 现在显示等级色点、AI 推荐（建议允许/拒绝 + 理由）与
+  剩余倒计时秒数，不再只有工具名和允许/拒绝按钮；红/黄/蓝/绿的倒计时文案统一由 `gpwCountdownText()` 生成。
+- **红色确认弹窗改为全局**：新增 `mountGpwRedAlert()`，随插件激活挂到 document.body，每 2 秒读取
+  `/api/w2m/gpw/state`；出现红色待审批就浮出「确认允许 / 确认拒绝」弹窗，**不需要打开 GPW 面板**，条目消失后自动收起；
+  同时删除面板内的红色弹窗副本，避免两个弹窗叠加。
+- **优先级不变式**：黑名单仍是最高优先级红线（命中立即拒绝、永不进入 pending/AI 分级），白名单立即放行；
+  AI 分级与倒计时只作用于其余调用，并与硬规则并行独立运行（新增 `test/gpw-ai-priority.test.mjs` 锁定）。
+- 验证：`gpw-ai 9/9`、`gpw-ai-priority 3/3`、GPW 既有套件全绿、`client-bundle 36/36`、真实 Chromium
+  `loader-entry 10/10`（页面启动、GPW AI 设置区、队列日志、决策中心、GPW 点外关闭）、`claims` 绿、`eslint 0 errors`。
+
+## [3.2.7] - 2026-11-14
+
+- **GPW 智能风险分级（操作面板填入大模型 Token）**，按用户要求：
+  - 红：立即暂停并弹窗，必须人工「确认允许/确认拒绝」，不倒计时；
+  - 黄：倒计时 **180 秒**，到点执行 AI 推荐动作（无推荐则放行）；
+  - 蓝：倒计时 **30 秒**，到点执行 AI 推荐动作；
+  - 绿：倒计时 **3 秒**，默认放行；
+  - 没有配置 Token 时保持旧的统一 pending 超时行为，不影响既有安装与测试。
+- 宿主：新增 `src/plugin/gpw-ai.mjs`（提示词、回复解析、四级倒计时、自动动作、配置归一化、模型调用）；
+  `src/plugin/gpw.mjs` 里每张待审批记录携带 `level / ai / countdown_ms / deadline_at`，按等级重排倒计时；
+  AI 失败时安全退回规则颜色，绝不自动放宽。新增 `GET /api/w2m/gpw/ai`、`POST /api/w2m/gpw/ai/config`、
+  `POST /api/w2m/gpw/ai/test`；Token 只存 DPAPI/钥匙串，并默认复用决策中心已配置的同一把 Key。
+- 客户端：GPW 面板新增「AI 智能分级（红/黄/蓝/绿）」设置区（provider/model/baseUrl/Token/保存/测试），
+  待审批条目显示等级、AI 推荐与倒计时；红色待审批会浮出确认弹窗。
+- 验证：`gpw-ai` 8/8（倒计时/自动动作/解析/配置/模型调用失败回退）、GPW 既有套件全绿、
+  `client-bundle` 36/36、真实 Chromium 断言 GPW 面板存在 AI 设置区、`loader-entry` 10/10、`claims` 绿、`eslint 0 errors`。
+
+## [3.2.6] - 2026-11-14
+
+- **队列日志错乱修复**：旧版 `scanQueue()` 在没有官方 `[data-queue-dock]` 时会扫描任意 class/aria/testid
+  里含 `queue`/`pending` 的元素并整段存 `innerText`，把本插件抽屉、对话正文、工具输出都当成“排队消息”
+  写进日志，于是出现「队列 x」「恢复全部 (22)」「清除」「1. .tmp/…」这类垃圾，并且清掉又立刻生成。
+  现在**只认官方队列 dock**（`[data-queue-dock]` 的行及其 aria-controls 兜底），没有 dock 就是空队列；
+  插件自己的浮标/抽屉带 `data-w2m-queue-ui` 标记并被排除。
+- 只在**真实会话键**下写入（`page:` 实例键、空键、`/` 一律不写），从源头杜绝无会话垃圾记录。
+- 队列日志抽屉：显示**会话名称**（宿主 `sessions`/`agents` 服务映射；宿主新增
+  `GET /api/w2m/composer/journal/sessions`），**Session ID 默认隐藏**，点 👁 才显示；新增**清空全部**按钮；
+  无会话键的旧垃圾记录默认隐藏并提示可一键清理。
+- **默认只显示人类输入**：抽屉默认只列出真实会话（`session-…`）的草稿与排队消息；客户端/页面自己生成的
+  记录（无会话键、`page:` 实例键、测试/探针记录等）统一折叠进「客户端生成的记录 · N 条（默认折叠，仅排错用）」，
+  展开才可见；没有人类记录时会明确提示。浮标计数只统计人类输入，避免客户端记录把徽标刷成红/黄。
+- 本机已清理已产生的垃圾记录（备份于临时目录），并重新写入干净的记录。
+- GPW 浮动面板：点击面板外的遮罩自动收起，按 `Esc` 也关闭（设置页内联渲染不受影响）。
+- 验证：`queue-journal` 5/5（含 sessions 路由）、`client-bundle` 36/36（含“不再扫描任意 queue/pending 元素”
+  与 `validSessionKey` 的静态断言）、真实 Chromium 断言：抽屉有 👁 / 清空全部、Session ID 默认不可见、
+  点 👁 后出现、sessions 路由 200。
+
+## [3.2.5] - 2026-11-14
+
+- 修复：决策中心「AI 建议设置」导入 Token 失败。原因有两处：
+  1. 表单即使留空也会把 `provider/model/baseUrl` 作为空字符串发上去，而宿主的预设查找是
+     `String(input.provider ?? 'deepseek')` —— 空字符串不是 nullish，导致 `unknown-provider`；
+     现在表单预填 DeepSeek 预设（`deepseek` / `deepseek-flash` / `https://api.deepseek.com/v1`），
+     并且只提交非空字段，服务端预设得以生效；
+  2. 4xx 响应体用的是 `reason` 而不是 `error`，UI 只显示「HTTP 400」；现在请求层同时读取两者，
+     失败时能看到 `unknown-provider` / `api-key-required` / `base-url-required` 等真实原因。
+- 保存成功后会回显已保存的 `provider / model`，而不是笼统的「已保存」。
+- 与本次操作配套的事实：DeepSeek Key 已按宿主相同的 DPAPI（CurrentUser）格式写入
+  `$DSH_HOME/xclient/decision-center/decision-ai-secret.enc` + 元数据，插件下次启动会自动恢复；
+  该 Key 已实测 `POST /v1/chat/completions`（model `deepseek-flash`）返回 200。
+- 验证：`client-bundle` 36/36、`eslint` 0 errors；AI 表单默认值与错误透传均有静态断言覆盖。
+
+## [3.2.4] - 2026-11-14
+
+- UI 对齐（按用户截图）：
+  - 左侧栏入口改名为 **决策中心**，点击行为与右侧浮标一致（打开同一个收件箱抽屉）；
+  - 右侧居中浮标改为药丸样式：`◈ 待选 <数字>`；无待处理时黑色，有待处理时按最高优先级显示
+    红 / 黄 / 蓝 / 绿，数字药丸同色；
+  - 收件箱抽屉改为**右侧居中、半高**（`min(70vh,620px)`、圆角、右缘 14px），内容区可滚动并带细滚动条，
+    不再全高满屏；
+  - 队列日志浮标移到**右下角、GPW 浮标下方**（`right:14px; bottom:52px`），药丸样式；
+    条数配色：0 条黑色、1–30 蓝色、31–50 黄色、>50 红色；
+  - 队列日志抽屉改为**右下角半高**（`min(60vh,520px)`、圆角、下缘/右缘 14px），内容区可滚动；
+- 每会话「待选」独立浮钮不再单独显示（由药丸承担；会话筛选仍保留在抽屉里）。
+- 验证：真实 Chromium 页面断言——药丸文案含「待选」、两张蓝票时 `data-tone=blue`、侧栏文案含「决策中心」、
+  决策抽屉高度在视口 40%–85% 之间且垂直居中/贴右、内容区 `overflow-y:auto`；队列浮标贴右下、
+  1 条记录时 `data-tone=blue`、队列抽屉半高且内容可滚动。
+
+## [3.2.3] - 2026-11-14
+
+- **发布产物一致性修复**：v3.2.2 发布过程中 tag 曾在多个提交间移动，导致 npm 上的 3.2.2 包（`ff433810…`，
+  对应 `751d8da` 树）与 GitHub Release 资产（`65b88098…`，对应最终 `4d50435` 树）不是同一份字节。
+  本版从最终 tag 一次性构建并发布，发布后按 `tag 树打包 = Release 资产 = SHA256SUMS = npm tarball` 四方核验。
+  `3.2.2` 因字节不一致在 npm 上标记为弃用；`3.0.0/3.1.0/3.2.0` 的重大缺陷弃用声明保持有效。
+- 内容与 v3.2.2 最终树一致：客户端锁屏修复、队列子插件浮标/抽屉/GPW 入口/composer chip、
+  决策中心 parity（每会话待选浮钮、键盘导航、按等级批量处理、分叉·生产者面板、右侧栏页签）。
+- 流程改进：tag 一旦推送并进入审批，就不再移动；如需改动，升新版本号重新发。
+
+## [3.2.2] - 2026-11-14
+
+- **弃用声明**：`@twinsearth/w2m-dsh-plugin` 的 `3.0.0`、`3.1.0`、`3.2.0` 三个已发布版本有重大缺陷
+  （决策中心客户端 UI 不完整/缺失；3.2.1 预览构建还存在弹窗遮罩锁死客户端的问题），npm 上以
+  `>=3.0.0 <3.2.2` 范围标记 deprecate；请安装 3.2.2 或更高版本。3.2.1 从未发布到 npm。
+
+- 决策中心对齐瓮城的剩余能力（v3.2.3 之前合并进本版）：
+  - **每会话「待选」浮钮**：会话席位（`conversation.input.left`）发布当前 sessionId；当该会话有 pending 决策时，
+    右侧上方出现「待选 N」浮钮（红票变红），点击打开只看该会话的抽屉（带「显示全部会话」清除筛选）；
+  - **键盘导航**：抽屉内 `↑/↓` 移动选中项、`1-9` 按选中票的第 N 个选项处理、`r` 刷新、`Esc` 关闭；
+  - **按等级批量处理**：每个等级分组头部在 ≥2 张 pending 时出现「批量解决 / 批量放弃」，走 `resolveMany`/`abandonMany`；
+    红色/阻塞票按宿主红线拒绝批量（按钮置灰并提示“必须逐条处理”），批量结果如实显示成功数与未处理原因；
+  - **分叉聚合 / 生产者面板**：抽屉底部可展开，展示 `/forks` 聚合与 `/producers` 目录；宿主不提供时如实说明；
+  - **会话筛选**：抽屉顶部显示“只看会话：xxx”并可一键清除。
+  - **右侧栏页签（sidebar.right.pane.tab）**：按宿主契约先向 `sidebarRightTabs` 注册 tab 类型
+    （`w2m-decision-inbox`，地址 `dsh-resource://w2m-decision-inbox/**`），再挂页签主体；页签里是收件箱紧凑列表
+    与「打开抽屉」按钮。该服务可选：没有 `sidebarRightTabs` 的宿主上注册不执行、其它入口不受影响。
+- **严重修复（v3.2.1 回归）**：决策收件箱与队列日志的遮罩层/抽屉用了 `hidden` 属性切换，但样式表里
+  `.w2mDcOverlay{display:flex}` 是作者规则、`[hidden]{display:none}` 只是 UA 规则，作者规则获胜 ——
+  遮罩层永远铺满全屏并吞掉点击，点关闭只改状态不改显示，表现为「整个客户端被弹窗锁死、点哪都没反应、
+  点空白也不收回」。现在改为显式 `style.display` 开关 + 全局 `[hidden]{display:none!important}` 兜底，
+  并在真实浏览器里断言：打开时抽屉 `display != none`、关闭后抽屉与遮罩 `display == none`、
+  页面中心点击不再被遮罩拦截（`elementFromPoint` 不在遮罩内）。
+- 重要提示：遇到 3.2.1 锁屏不需要删除整个 profile，删除该 profile 的
+  `node_modules/@twinsearth/w2m-dsh-plugin` 目录（或把 `dsh.profile.bundles` 里的 w2m 行移除）即可恢复；
+  本版修好后重新安装即可。
+
+- 修复：队列子插件（queue-journal）只有宿主路由与 composer 内联按钮，草稿/队列为空时整块不渲染
+  （瓮城原版行为），用户看到的就是「未生效」。本版把队列日志做成常驻入口，并用真实 DSH 页面验证。
+- 右侧中部新增第二枚「队列」浮标（收件箱浮标下方，固定可见，显示保存条数），点开右侧抽屉：
+  按时间列出所有会话的草稿/队列快照（会话键、更新时间、草稿预览、排队消息逐条预览），
+  每张卡片提供「恢复草稿」（写回输入框）、「恢复队列」（`/api/w2m/composer/queue`，
+  无 live 会话时如实报 session-not-live）、「清除」，全部由用户点击触发，插件从不自动发送消息。
+- composer dock 常驻 chip：没有草稿时也显示「队列日志 / 打开」，不再整块消失（原版 return null）。
+- GPW 面板头部新增「队列 N」按钮（与「收件箱」按钮并列），点开同一个队列日志抽屉。
+- 数据面：`GET /api/w2m/composer/journal?list=1` 列表、`POST /api/w2m/composer/journal` 清除、
+  `POST /api/w2m/composer/queue` 恢复；抽屉每 8 秒刷新一次，打开时立即刷新。
+- composer dock 的注册 id 从 `fang-queue-journal` 改为 `w2m-queue-journal`，避免与本机可能同时安装的
+  瓮城 queue-journal 插件撞 id。
+- 验证：`test/client-bundle.test.mjs` 36/36；`test/loader-entry.test.mjs` 10/10，真实 Chromium 页面探针新增：
+  队列路由 POST/list 均 200、浮标存在、点击打开抽屉、抽屉标题含「队列日志」、抽屉正文含刚保存的草稿、
+  GPW 面板含队列日志按钮（composer dock 是会话级插槽，落地页可能不渲染，探针以诊断输出而不误判）。
+- 与瓮城对比仍暂缺（后续版本）：抽屉键盘导航、批量恢复、按会话筛选、时间线历史快照分组。
+
+## [3.2.1] - 2026-11-14
+
+- 修复：v3.0.0/v3.2.0 的决策中心只有宿主与路由，没有把瓮城的两个用户入口挂出来，表现为
+  「没有右侧浮标&浮窗」「GPW 里没有收件箱按钮」。本版补齐客户端 UI，并用真实 DSH 页面验证。
+- 右侧居中的「收件箱」浮标（固定`right:0; top:50%`，红/黄/无三种色调 + 未读数）+ 从右向左的
+  抽屉：分组（红/黄/蓝/绿/灰）、过滤（待处理/全部/已归档 + 等级）、选项按钮、自定义答复、
+  AI 建议、放弃、上下文折叠、Escape/遮罩关闭、红色 ticket 顶部提醒（不自动处理）。
+- 数据面：`/api/w2m/decisions*` 的 list + SSE（`/events`）实时推送，断线自动回退 4 秒轮询；
+  resolve 支持票面选项与自定义答复，abandon 单票放弃，`ai/advise` 只展示建议不自动执行。
+- GPW：面板头部新增「收件箱 N」按钮（GPW 设置页与 GPW 浮标打开的面板都有），点击打开同一个抽屉；
+  原有面板内联摘要保留。
+- 侧栏入口：新增「收件箱」侧栏席位（图标 + 未读红点），对齐瓮城的收件箱侧栏入口。
+- AI 设置：抽屉内新增「AI 建议设置」（provider / model / baseUrl / apiKey + 保存 + 测试连接），
+  对应 `/ai/config` 与 `/ai/test`；没有配置时如实提示，而不是让建议按钮静默失败。
+- 验证：`test/client-bundle.test.mjs` 36/36（座位断言更新为 18 个，含收件箱侧栏席位）；
+  `test/loader-entry.test.mjs` 10/10，新增真实 Chromium 页面探针（`W2M_DECISION_PROBE=1`）：
+  浮标存在、点击打开抽屉、抽屉标题含「收件箱」、关闭生效、侧栏入口存在、GPW 面板含收件箱按钮。
+- 与瓮城对比仍暂缺（后续版本补）：收件箱的键盘导航、按等级批量处理、分叉聚合/生产者面板的完整展示。
+
+## [3.2.0] - 2026-11-14
+
+- 互联契约子插件：`@twinsearth/w2m-dsh-plugin/contract`，基于独立发布的版本化契约 SDK
+  `@twinsearth/dsh-fang-contract@1.1.1`（逐字节副本 + `src/interop/contract/PROVENANCE.md`，
+  `scripts/check-contract-vendor.mjs` 逐字节复核并纳入测试）。三个项目（w2m / 瓮城 dsh-fang / 房主
+  dsh-master）各自独立发布，互不 import 内部代码、互不改对方资料，只经方法表 + 信封 + 传输层互联。
+- w2m 方法表（`w2m.*`，契约版本 `1.0.0`，与插件版本解耦）：`w2m.status`、`w2m.methods`、
+  `w2m.fleet.snapshot`、`w2m.devices.list`、`w2m.tasks.list`；MINOR 只新增，删/改义升 MAJOR 并双写。
+  provider 由 `w2m.*` 宿主注入（`providers` 或 `w2mContractProviders` 服务），缺席时如实报
+  `handler-threw: … exposes no … provider`，不返回空数据冒充成功。
+- 服务端：`createContractServer` 承载 hello/health/invoke（协议 `fang-master` v1）；提供
+  `w2mContract` 服务；同宿主对端（fang/master 的 local 传输）默认找 `fangContract`，本插件在该名
+  缺席时补位、已存在时不覆盖，避免与瓮城抢服务键。HTTP 路由固定 `/api/w2m/contract/{hello,health,invoke}`，
+  不占用 fang 的 `/fang/api/contract/*`；配置 `fileDir` 时再挂 file 兜底服务端。
+- 客户端：`createW2mContractClient` 复用 SDK 的 **local → http → file → legacy** 四级自动降级
+  （legacy 走 3.1.x 旧服务键 `fangForker` 等兜底），可调用 `fang.*` / `contract.*` / `w2m.*` 方法。
+- 与 3.1.0 的关系：本版包含 3.0.0（决策中心）与 3.1.0（队列子插件）的全部内容，三者一起作为
+  v3.2.0 发布；版本号语义仍各自独立（插件 3.2.0 / w2m 契约 1.0.0 / 契约 SDK 1.1.1）。
+- 测试：新增 `test/contract-interop.test.mjs` 9 项（方法表与 hello 广告、信封往返与显式拒绝、
+  provider 注入与缺席、三路由注册、服务补位/不覆盖、local/http/file/legacy 四级降级、SDK 副本逐字节一致）。
+
+## [3.1.0] - 2026-11-14
+
+- 队列子插件：`@twinsearth/dsh-fang-queue-journal`（瓮城）移植为 `@twinsearth/w2m-dsh-plugin/queue-journal`。
+  Fang 的包只有空宿主（`apply(){}`），HTTP 面在 fang orchestrator 里；W2M 没有 orchestrator，所以
+  `src/queue-journal/index.mjs` 自带存储与四条路由，线上形状与移植的客户端完全一致：
+  `GET/POST /api/w2m/composer/journal`（单条/恢复列表）、`GET /api/w2m/composer/journal/history`
+  （append-only 快照，可按 sessionKey 过滤）、`POST /api/w2m/composer/queue`（恢复到会话收件箱；
+  无 live agent 时返回 `session-not-live`，绝不假装入队）。
+- 存储 `ComposerJournal` 逐字移植（`src/queue-journal/lib/composer-journal.mjs`），数据落在
+  `$DSH_HOME/xclient/queue-journal`；保存上限、历史上限与原子写保持不变。
+- 客户端：Fang 的独立客户端模块（`window.__ModuleLoader__.load`）展开成 W2M 单一客户端 bundle 里的
+  `createQueueJournalModule()`，由根 `apply(ctx)` 挂到 `conversation.composer.dock`：草稿输入捕获、
+  queue dock 的 MutationObserver、15 秒兜底与 pagehide flush 全部保留；恢复只能由用户显式点击。
+  Fang 的 `x-fang-auth` 取 token 逻辑替换为同源占位（W2M 路由走 cookie 鉴权）。
+- 测试：新增 `test/queue-journal.test.mjs` 4 项（保存/读回/恢复列表、历史过滤、缺 key 拒绝、
+  非 live 会话拒绝恢复）；client-bundle 的座位断言更新为 17 个（新增队列 dock）。
+
+## [3.0.0] - 2026-11-14
+
+- 决策中心子插件：`@twinsearth/dsh-fang/decision-center`（瓮城）完整移植为
+  `@twinsearth/w2m-dsh-plugin/decision-center`。宿主模块逐字移植（`src/decision-center/index.mjs`，
+  27 个服务方法、`request_human_decision` 工具），四个依赖（AI 密钥库、决策 outbox、生产者契约、
+  SSRF 守卫）与 MIT 内置 schemastery 原样随包；Fang 内核 barrel 由 `kernel.mjs` 顶替，提供同样的
+  `z`/`SERVICE`/bus/原子读写/数据目录解析/角色门。
+- 新增 `/api/w2m/decisions*` 14 条路由：列表、单票、配额、分身聚合、生产者目录、外部 ingest、
+  SSE 实时推送、解决（含批量与 actionId）、放弃（含批量）、AI 状态/测试/配置/建议/流式建议；
+  `routes.mjs` 用 Connection fetch 注册表承载，SSE 事件名与负载与 Fang 一致。
+- 决策中心面板进入 GPW：`GpwSettingsPage` 与 `GpwLauncher` 共用同一个 `GpwPanel`，因此设置页与浮标
+  同时显示——4 秒轮询、红票置顶、绿/灰折叠、按票面选项一键解决、无选项可放弃、AI 建议只推荐不执行。
+- 测试：移植 Fang 决策套件 79 项 + 新增路由面 3 项通过；Fang 的 Node-SSE 辅助（decision-events）与 fork 侧 ingest 客户端不随包（W2M 路由走 fetch SSE、没有 fork 半体）。
+  `decision-center-fork` 与 `decision-action-integration` 不移植：前者依赖 Fang 母体/分身角色矩阵，
+  后者的主体是 Fang orchestrator 与 restart-guard，W2M 里没有对应组件。
+- 包元数据：新增 `./decision-center` 子路径导出与`dsh-decision-center` patch 行（启用），
+  `engines.dsh` 保持 `>=0.2.0 <0.3.0`。
+
+## [2.2.6] - 2026-11-14
+
+- Fixes 搜索本对话: the walk covered only the viewport and stopped counting at six matches, so a
+  word that was merely scrolled out of sight reported `0/0` and the feature looked broken. It now
+  searches the whole rendered conversation, counts every match, and wraps up to 120 of them (the cap
+  bounds paint cost, not the count). The count shows `…` while a query is still being applied.
+- The search settles 1s after the last keystroke instead of 3s (the 3s delay was the second half of
+  the same complaint: typing appeared to do nothing). Enter searches immediately.
+- Marks persist after the query settles, so the scroll-triggered repaint is gone; it was re-walking
+  the tree on every scroll for a result that no longer needed refreshing.
+- Tests: the client-bundle suite now asserts the 1s settle, the whole-conversation walk (no
+  viewport rect filter) and the count-every-match cap, instead of the old 3s/six-mark contract.
+
+## [2.2.5] - 2026-11-12
+
+- DSH 0.2.2-rc.2 compatibility, measured rather than assumed: the packed artifact mounts and boots in
+  the rc.2 runtime (`@deepseek-ai/dsh@0.2.2-rc.2`) with every host entry active, all `w2m_*` tools
+  registered, the browser half composed into `__DSH_BOOT__` and activated, the real page booting in a
+  browser, and the Node-execution menu opening and taking temporary execution from the composer.
+- The compatibility gate now pins that host: `DSH_HOST_VERSION` moves from `0.2.0-rc.2` to
+  `0.2.2-rc.2`, with the Cordis versions that release carries (`@deepseek-ai/cordis@4.1.0`,
+  `@deepseek-ai/cordis-plugin-loader@1.1.0`) and the pnpm the runtime bundles (`11.28.5`). The gate is
+  what turns "the host moved" into a measurement instead of a surprise.
+- `package.json#engines.dsh` is declared for the first time: `>=0.2.0 <0.3.0`. The requirement is read
+  before any plugin code loads, so a host outside the line is refused with a named requirement instead
+  of failing later. Prereleases participate in the range (DSH evaluates it with `includePrerelease`),
+  which is why `0.2.2-rc.2` and `0.2.2-rc.1` both satisfy it; declaring `engines.dsh` also means the
+  old `@deepseek-ai/dsh-*` peer fallback no longer decides compatibility for this package.
+- Reviewed the two rc.2 changes an extension could depend on, and neither needs this package to move:
+  tool failures now carry structured identity (`ToolGuardDenial.info`, `ToolContextUnavailableError`,
+  approval and context error codes) but this package registers no `tools` guards and already returns a
+  named refusal reason, so the change is additive from here; and plugins can register MCP servers for
+  their own lifetime through `ctx.mcpManager`, which this package deliberately does **not** do — its
+  bundled `w2m-mcp` server mirrors the same `w2m_*` tools for codex/Claude hosts, so mounting it inside
+  DSH would register every tool twice.
 - `w2m_intent`: structured intents mapped onto allow-listed commands; unknown actions, parameters and types
   are refused by name (the fleet does not invent commands).
 
+## [2.2.4] - 2026-11-05
+
+- Fixes the remote desktop `HTTP 404`: a default desktop profile leaves `stateDir` empty, and
+  the remote-view route registration returned not-mounted in that case. The host now resolves
+  the same `~/.dsh/xclient` directory the agent uses, so `/api/w2m/remote/config|start|frame|stop`
+  are mounted and the settings toggle works without configuring `stateDir` by hand.
+- Remote-view route coverage now includes the default-stateDir mount path.
 ## [2.2.3] - 2026-11-05
 
 - Remote desktop (view-only) now reaches 1 frame per second in a fleet. A machine opts in by

@@ -145,7 +145,10 @@ describe('GPW tampered lists fail closed (v1.7.9)', () => {
 
   it('carries the inline prompt and the fold controls in the client bundle', () => {
     const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
-    assert.ok(source.includes("id: 'w2m-gpw-prompt'"), 'the pending prompt is mounted in the composer row');
+    // v3.3.0/v3.3.1: the inline prompt was replaced by the single history button; the pending queue lives
+    // in the operation panel / red alert instead.
+    assert.equal(source.includes("id: 'w2m-gpw-prompt'"), false, 'the inline prompt entry is gone (v3.3.0)');
+    assert.ok(source.includes("id: 'w2m-history'"), 'the composer carries the single history button');
     assert.ok(source.includes('w2m-gpw-open'), 'the prompt can open the panel');
     assert.ok(source.includes('gpwMore') && source.includes('gpwFold'), 'list rows fold beyond three');
     assert.ok(source.includes('gpwAddWhiteAllow') && source.includes('gpwAddBlackDeny'), 'pending offers one-click list actions');

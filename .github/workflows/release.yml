@@ -80,12 +80,23 @@ jobs:
       - name: Install dev tooling
         run: npm install --no-audit --no-fund
 
-      - name: End-to-end suites (package.json#scripts.test:e2e, via npm run test:e2e)
-        # The e2e suites exercise real processes over real sockets -- restart, sub-path mounting, the
-        # credential kinds -- and they gate the release. The list lives in `scripts.test:e2e` and is
-        # not repeated here: it used to be, and the copy went stale. `scripts/preflight.mjs` fails the
-        # run if this workflow stops covering every suite `package.json#scripts.test` declares.
-        run: npm run test:e2e
+      # SELF-DIAGNOSING E2E: the single `npm run test:e2e` gate stays the one source of truth (claims.test.mjs
+      # refuses a workflow that hand-lists suites), but its output is captured so each FAILED FILE is
+      # emitted as a ::error annotation and written to the step summary. The public jobs/annotations API
+      # then names the failing files without log access.
+      - name: End-to-end suites (package.json#scripts.test:e2e, failures annotated per file)
+        run: |
+          set +e
+          npm run test:e2e 2>&1 | tee "$RUNNER_TEMP/e2e.log"
+          code=${PIPESTATUS[0]}
+          if [ "$code" -ne 0 ]; then
+            echo "### e2e failed files" >> "$GITHUB_STEP_SUMMARY"
+            grep -Eo 'test/[A-Za-z0-9._-]+\.test\.mjs' "$RUNNER_TEMP/e2e.log" | sort | uniq -c | sort -rn | head -n 12 >> "$GITHUB_STEP_SUMMARY" || true
+            for f in $(grep -Eo 'test/[A-Za-z0-9._-]+\.test\.mjs' "$RUNNER_TEMP/e2e.log" | sort -u | head -n 12); do
+              echo "::error title=e2e::FAILED $f"
+            done
+          fi
+          exit "$code"
 
       # PACK BEFORE THE PRE-FLIGHT, NOT AFTER IT.
       #

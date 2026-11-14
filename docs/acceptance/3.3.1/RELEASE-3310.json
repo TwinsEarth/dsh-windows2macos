@@ -1,0 +1,43 @@
+{
+  "version": "3.3.1",
+  "case": "RELEASE-3310",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-14T14:11:00.292Z",
+  "executor": "lead",
+  "task_id": "pre-release-3310",
+  "requirement": "v3.3.1: make GPW AI grading setup/test usable - stop unparseable-classification failures (accept Chinese keys, numeric levels, synonyms and prose, repair-retry once, surface the model raw reply), improve the AI token UI (status chip colours, field labels, progress buttons, coloured pass/fail feedback), and put the operation entries (AI grading & approvals, messages & drafts, decision inbox, actions) into the panel opened from the left sidebar button",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/gpw-ai.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/client-bundle.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/loader-entry.test.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "ai_parsing": "levelFromText/normalizeClassified accept red/yellow/blue/green words, Chinese synonyms, numeric levels 1-4, Chinese keys (危险等级/建议/理由) and bare prose; JSON in fences/noise still works",
+      "repair_retry": "an unparseable first reply triggers exactly one repair request (original reply + a strict JSON instruction); the repaired answer is parsed and flagged repaired:true; a second failure returns reason unparseable-classification with the raw snippet",
+      "ai_test_route": "POST /api/w2m/gpw/ai/test now returns {ok:false,error,raw} so the panel can show the model raw reply",
+      "ai_ui": "GpwAiSettings shows a green/amber status chip (已配置/未配置), provider/model/baseUrl/token fields, save/test buttons with 保存中…/测试中… progress, coloured feedback (ok=green, err=red, info=neutral) with level dot, action, reason, elapsed ms and the raw reply on failure, plus a refresh button",
+      "ops_panel": "the left sidebar button opens W2mOpsPanel with four tabs: 智能分级&审批 (AI settings + pending list with allow/deny + countdown), 消息与草稿 (queue entries + restore/clear/open), 决策中心 (counts + pending list + open), 操作入口 (embedded target selector and execution capability + quick links)",
+      "proof": "gpw-ai 10/10, client-bundle 40/40 with new invariants, real Chromium loader-entry 10/10 (sidebar opens the panel, the four tabs exist, the queue tab renders its section and the open-queue button, the overlay closes), claims/layer-model green, eslint 0 errors"
+    }
+  }
+}

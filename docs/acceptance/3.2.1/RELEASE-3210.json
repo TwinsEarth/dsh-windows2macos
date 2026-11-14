@@ -1,0 +1,50 @@
+{
+  "version": "3.2.1",
+  "case": "RELEASE-3210",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-14T07:12:44.822Z",
+  "executor": "lead",
+  "task_id": "pre-release-3210",
+  "requirement": "v3.2.1: restore the decision-center client UI surfaces (right-edge floating inbox badge + drawer, GPW inbox button, sidebar entry, AI settings) that v3.0.0/v3.2.0 shipped without, and prove them in a real DSH page",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/client-bundle.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/claims.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/loader-entry.test.mjs"
+    ],
+    [
+      "node",
+      "scripts/pack.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "floating": "a fixed right-edge, vertically centred inbox badge with a per-level tone and unread count; clicking it opens a right-to-left drawer over a dimmed overlay",
+      "drawer": "the drawer groups tickets red/yellow/blue/green/gray, filters pending/all/archived and by level, resolves through the ticket options or a free-text answer, abandons a pending ticket, shows AI advice without applying it, folds long context, and closes on Escape or overlay click",
+      "data": "list comes from GET /api/w2m/decisions?includeArchived=1, live updates from the /events SSE stream with a 4s polling fallback; resolve/abandon/advise hit the ported routes",
+      "gpw": "the GPW panel header carries an inbox button on both surfaces (GPW settings page and GPW launcher panel); it opens the same drawer",
+      "sidebar": "a 收件箱 sidebar entry with an unread dot opens the same drawer, matching the Fang inbox seat",
+      "ai": "an AI settings panel posts provider/model/baseUrl/apiKey to /ai/config and /ai/test and reports the result, instead of leaving the advise button silently failing",
+      "proof": "real Chromium page probe (W2M_DECISION_PROBE=1) confirms the badge is in the DOM, a click opens the drawer with a 收件箱 title, close hides it, the sidebar entry exists and the GPW panel contains the inbox button",
+      "suites": "client-bundle 36/36 (18 seats, the inbox sidebar entry included); loader-entry 10/10 with the browser probe; claims 47 pass + 1 network skip",
+      "remaining": "not yet ported from Fang: keyboard navigation inside the drawer, per-level batch resolve, and full fork/producer panels; recorded in CHANGELOG as follow-up work"
+    }
+  }
+}

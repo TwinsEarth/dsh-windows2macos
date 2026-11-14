@@ -1,0 +1,52 @@
+{
+  "version": "3.2.7",
+  "case": "RELEASE-3270",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-14T10:08:43.946Z",
+  "executor": "lead",
+  "task_id": "pre-release-3270",
+  "requirement": "v3.2.7: GPW panel token input plus AI risk grading -- red pauses and needs explicit human confirmation, yellow counts down 180s then executes the AI recommendation, blue 30s, green 3s default allow; without a token the legacy pending timeout is preserved",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/gpw-ai.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/gpw-modes.test.mjs",
+      "test/gpw-auto-approve.test.mjs",
+      "test/gpw-colors.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/client-bundle.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/loader-entry.test.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "levels": "countdowns: red 0 (manual confirmation), yellow 180000 ms, blue 30000 ms, green 3000 ms; overrides may tune them but red can never be given a countdown",
+      "actions": "green always allows; yellow/blue execute the AI recommendation (deny only when the model recommends deny); red never auto-resolves",
+      "host": "every pending entry carries level/ai/countdown_ms/deadline_at; AI classification reschedules the countdown when the level changes; classification failures fall back to the rule colour instead of widening permissions",
+      "routes": "GET /api/w2m/gpw/ai (status), POST /api/w2m/gpw/ai/config (DPAPI-persisted token, sharing the decision-center key by default), POST /api/w2m/gpw/ai/test (connectivity + sample classification)",
+      "client": "the GPW panel shows the AI settings block (provider/model/baseUrl/token/save/test), pending rows show level + AI recommendation + countdown, and a red pending raises a confirmation dialog with 确认允许/确认拒绝",
+      "fallback": "with no token, the legacy single pending timeout behaviour is unchanged, so existing installations and the existing GPW suites keep passing",
+      "proof": "gpw-ai 8/8 unit tests; existing GPW suites green; client-bundle 36/36; real Chromium probe asserts the GPW panel carries the AI settings section; loader-entry 10/10; claims green; eslint 0 errors"
+    }
+  }
+}

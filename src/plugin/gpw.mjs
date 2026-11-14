@@ -41,6 +41,15 @@ import { createHmac, randomBytes, randomUUID } from 'node:crypto';
 
 import { classifyToolCall, isInside, normalizeFolder } from './folder-policy.mjs';
 import { classifyGpwCall, fingerprintOf } from './gpw-colors.mjs';
+import {
+  autoActionOfLevel,
+  classifyPendingWithAi,
+  countdownMsOfLevel,
+  GPW_AI_COUNTDOWN_MS,
+  levelOfColor,
+  normalizeGpwAiConfig,
+} from './gpw-ai.mjs';
+import { createAiSecretStore } from '../decision-center/lib/ai-secret-store.mjs';
 
 export const name = 'dsh-gpw';
 
@@ -93,6 +102,10 @@ export const GPW_FOLDERS_ROUTE = '/api/w2m/gpw/folders';
 export const GPW_DECIDE_ROUTE = '/api/w2m/gpw/decide';
 export const GPW_PICK_ROUTE = '/api/w2m/gpw/pick';
 export const GPW_RESET_ROUTE = '/api/w2m/gpw/reset';
+/** v3.2.7: GPW 智能风险分级的配置/状态/连通性测试。 */
+export const GPW_AI_ROUTE = '/api/w2m/gpw/ai';
+export const GPW_AI_CONFIG_ROUTE = '/api/w2m/gpw/ai/config';
+export const GPW_AI_TEST_ROUTE = '/api/w2m/gpw/ai/test';
 
 const DEFAULT_BUDGET = { maxPerWindow: 10, windowMs: 60_000, minGapMs: 3_000 };
 const DEFAULT_PENDING_TIMEOUT_MS = 10_000;
@@ -382,6 +395,70 @@ export function apply(ctx, config = {}) {
   const configuredMode = config.gpwMode === 'advanced' ? 'advanced' : DEFAULT_GPW_MODE;
   const foldersFile = foldersFileOf(config);
   const keyInfo = ensureFoldersKey(foldersFile, config);
+  const foldersDir = dirname(foldersFile);
+  const aiTimeoutOverrides = config.gpwAiTimeouts !== null && typeof config.gpwAiTimeouts === 'object' ? config.gpwAiTimeouts : null;
+  const aiSecretStore = createAiSecretStore({ dataDir: foldersDir, service: 'w2m-gpw-ai', logger: ctx.logger });
+  /** 当前 GPW 分级配置；null = 未配置（回退旧的单定时器行为）。 */
+  let aiCurrent = null;
+  try {
+    const saved = aiSecretStore.load();
+    if (saved) aiCurrent = { provider: saved.provider, model: saved.model, baseUrl: saved.baseUrl, apiKey: saved.apiKey, source: `os:${saved.backend}` };
+  } catch { /* unavailable backend: stay unconfigured */ }
+  if (aiCurrent === null) {
+    // 默认复用决策中心已经配置好的同一把 Key，用户不必在 GPW 里再填一次。
+    try {
+      const shared = createAiSecretStore({ dataDir: join(foldersDir, 'decision-center'), service: 'w2m-decision-ai', logger: ctx.logger });
+      const saved = shared.load();
+      if (saved) aiCurrent = { provider: saved.provider, model: saved.model, baseUrl: saved.baseUrl, apiKey: saved.apiKey, source: 'shared:decision-center' };
+    } catch { /* not configured there either */ }
+  }
+  // 显式配置（profile/测试）优先于 DPAPI/共享 Key；不改变"黑名单硬规则"的优先级。
+  if (config.gpwAi !== null && typeof config.gpwAi === 'object' && typeof config.gpwAi.apiKey === 'string' && config.gpwAi.apiKey.trim() !== '') {
+    const explicit = normalizeGpwAiConfig(config.gpwAi);
+    if (explicit.ok) aiCurrent = { ...explicit.config, source: 'config' };
+  }
+  const aiEnabled = () => aiCurrent !== null && String(aiCurrent.apiKey ?? '') !== '';
+  const aiStatus = () => ({
+    configured: aiEnabled(),
+    provider: aiCurrent?.provider ?? null,
+    model: aiCurrent?.model ?? null,
+    baseUrl: aiCurrent?.baseUrl ?? null,
+    source: aiCurrent?.source ?? null,
+    backend: aiSecretStore.backend,
+    levels: Object.keys(GPW_AI_COUNTDOWN_MS),
+    countdown_ms: { ...GPW_AI_COUNTDOWN_MS, ...(aiTimeoutOverrides ?? {}) },
+  });
+
+  /** 把一次待审批调用的 AI 分级结果挂到 entry 上，并（重新）安排倒计时。 */
+  const schedulePendingLevel = (entry, level) => {
+    const nextLevel = levelOfColor(level);
+    entry.level = nextLevel;
+    entry.color = nextLevel;
+    const timeoutMs = countdownMsOfLevel(nextLevel, aiTimeoutOverrides);
+    entry.timeoutMs = timeoutMs;
+    entry.deadlineAt = timeoutMs > 0 ? Date.now() + timeoutMs : 0;
+    if (typeof entry.timer !== 'undefined' && entry.timer !== null) {
+      try { clearTimeout(entry.timer); } catch { /* already fired */ }
+      entry.timer = null;
+    }
+    if (timeoutMs <= 0) return; // red：必须人工确认
+    entry.timer = setTimeout(() => {
+      if (!pending.has(entry.id)) return;
+      const action = autoActionOfLevel(nextLevel, entry.ai?.action ?? null);
+      if (action === null) return;
+      pending.delete(entry.id);
+      if (action === 'allow') {
+        allowedTotal += 1;
+        if (typeof entry.fingerprint === 'string' && entry.fingerprint !== '') sessionGrants.add(entry.fingerprint);
+      } else {
+        deniedTotal += 1;
+      }
+      const why = `GPW: ${Math.round(timeoutMs / 1000)} s 倒计时结束，自动${action === 'allow' ? '放行' : '拒绝'}（${nextLevel}${entry.ai !== null ? ' · AI 推荐' : ''}）`;
+      entry.resolve({ kind: action, reason: why });
+    }, timeoutMs);
+    // v3.2.9: 不给倒计时 timer unref——unref 的 timer 在 Linux CI 的受控事件循环里可能先于测试结束，
+    // 表现为 auto-approve 测试"偶发"失败；保持 timer 强引用，行为与原实现一致。
+  };
   const foldersKey = keyInfo.key;
   /** Set once the signed file has been read cleanly; a later disappearance then reads as tampering. */
   let foldersSeen = false;
@@ -479,36 +556,64 @@ export function apply(ctx, config = {}) {
     }
   };
 
-  /** Hold a class-C (or over-budget B) call until the operator answers. */
+  /** Hold a class-C (or over-budget B) call until the operator answers or the level countdown fires. */
   const waitForOperator = (exec, reason, paths) => new Promise((resolveDecision) => {
     const id = randomUUID();
+    const call = toolCallOf(exec);
+    const rule = classifyGpwCall({ tool: String(call.name ?? 'tool'), paths, reason, mode: folderLists().mode });
     const entry = {
+      id,
       resolve: resolveDecision,
       createdAt: Date.now(),
-      tool: String(toolCallOf(exec).name ?? 'tool'),
+      tool: String(call.name ?? 'tool'),
       reason,
       paths,
-      color: 'yellow',
-      fingerprint: fingerprintOf(toolCallOf(exec)),
+      color: levelOfColor(rule?.color),
+      level: levelOfColor(rule?.color),
+      ai: null,
+      fingerprint: fingerprintOf(call),
       sessionId: String(exec?.agent?.session?.header?.id ?? ''),
+      timer: null,
+      timeoutMs: pendingTimeoutMs,
+      deadlineAt: 0,
     };
     pending.set(id, entry);
     pendingTotal += 1;
-    const timer = setTimeout(() => {
+    if (!aiEnabled()) {
+      // 未配置 AI：保持旧行为（单一 pendingTimeout 后自动放行），不影响现有安装与测试。
+      entry.level = 'yellow';
+      entry.color = 'yellow';
+      entry.timeoutMs = pendingTimeoutMs;
+      entry.deadlineAt = Date.now() + pendingTimeoutMs;
+      entry.timer = setTimeout(() => {
+        if (!pending.has(id)) return;
+        pending.delete(id);
+        allowedTotal += 1;
+        colorCounts.blue += 1;
+        if (typeof entry.fingerprint === 'string' && entry.fingerprint !== '') sessionGrants.add(entry.fingerprint);
+        resolveDecision({ kind: 'allow', reason: `GPW: auto-approved after ${Math.round(pendingTimeoutMs / 1000)} s with no operator answer (yellow path; black/white lists keep their own rules)` });
+      }, pendingTimeoutMs);
+      // v3.2.9: 同上，倒计时 timer 保持强引用。
+      return;
+    }
+    // 有 AI：先按规则颜色起倒计时，AI 结果回来后按新等级重排（red 不自动执行）。
+    schedulePendingLevel(entry, entry.level);
+    void classifyPendingWithAi({
+      config: aiCurrent,
+      tool: entry.tool,
+      paths,
+      reason,
+      mode: folderLists().mode,
+    }).then((out) => {
       if (!pending.has(id)) return;
-      pending.delete(id);
-      // v1.8.2 timeout policy: a yellow (class-C) call that nobody answered is approved after 100 s. Red never reaches
-      // this queue (it is denied outright) and black/white list hits never become pending, so this rule cannot widen
-      // either list's authority. The approval is recorded as a session grant, which is what turns its next occurrence
-      // blue.
-      allowedTotal += 1;
-      colorCounts.blue += 1;
-      if (typeof entry.fingerprint === 'string' && entry.fingerprint !== '') sessionGrants.add(entry.fingerprint);
-      resolveDecision({ kind: 'allow', reason: `GPW: auto-approved after ${Math.round(pendingTimeoutMs / 1000)} s with no operator answer (yellow path; black/white lists keep their own rules)` });
-    }, pendingTimeoutMs);
-    entry.timer = timer;
+      if (out.ok) {
+        entry.ai = { level: out.level, action: out.action, reason: out.reason, model: out.model };
+        if (out.level !== entry.level) schedulePendingLevel(entry, out.level);
+      } else {
+        entry.ai = { level: entry.level, action: 'allow', reason: `AI 不可用（${out.reason}），按规则颜色倒计时`, failed: true };
+      }
+    }).catch(() => { /* classification is best-effort */ });
   });
-
   const decidePending = (id, decision) => {
     const entry = pending.get(id);
     if (entry === undefined) return { ok: false, error: 'unknown pending request' };
@@ -707,6 +812,7 @@ export function apply(ctx, config = {}) {
           modes: [...GPW_MODES],
           protected_folders: lists.mode === 'novice' ? [...DEFAULT_PROTECTED_FOLDERS, ...lists.blacklist] : [...lists.blacklist],
           pending_timeout_ms: pendingTimeoutMs,
+          ai: aiStatus(),
           novice_approve_gap_ms: NOVICE_APPROVE_GAP_MS,
           tampered: lists.tampered,
           tampered_reason: lists.reason,
@@ -731,6 +837,12 @@ export function apply(ctx, config = {}) {
             paths: entry.paths,
             folder: entry.paths.length > 0 ? folderForPath(entry.paths[0]) : null,
             pending_ms: Date.now() - entry.createdAt,
+            color: entry.color ?? 'yellow',
+            level: entry.level ?? entry.color ?? 'yellow',
+            ai: entry.ai ?? null,
+            countdown_ms: entry.timeoutMs ?? pendingTimeoutMs,
+            deadline_at: entry.deadlineAt ?? 0,
+            remaining_ms: entry.deadlineAt > 0 ? Math.max(0, entry.deadlineAt - Date.now()) : 0,
           })),
         });
       },
@@ -848,6 +960,48 @@ export function apply(ctx, config = {}) {
       },
     });
 
+    // v3.2.7: GPW 智能分级配置（Token）与状态。Key 只进 DPAPI/钥匙串，不落明文。
+    registry.register({
+      path: GPW_AI_ROUTE,
+      methods: ['GET'],
+      requestBody: 'buffered',
+      fetch: async () => json({ ok: true, ...aiStatus() }),
+    });
+
+    registry.register({
+      path: GPW_AI_CONFIG_ROUTE,
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: async (request) => {
+        let body = null;
+        try { body = await request.json(); } catch { /* refused below */ }
+        const normalized = normalizeGpwAiConfig(body ?? {});
+        if (!normalized.ok) return json({ ok: false, error: normalized.reason }, 400);
+        aiCurrent = { ...normalized.config, source: 'memory' };
+        let persisted = null;
+        try { persisted = aiSecretStore.save(normalized.config); } catch (error) { persisted = { ok: false, reason: String(error?.message ?? error) }; }
+        if (persisted?.ok) aiCurrent.source = `os:${persisted.backend}`;
+        return json({ ok: true, persisted, ...aiStatus() });
+      },
+    });
+
+    registry.register({
+      path: GPW_AI_TEST_ROUTE,
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: async (request) => {
+        let body = null;
+        try { body = await request.json(); } catch { /* empty body: test the saved config */ }
+        const normalized = normalizeGpwAiConfig(body ?? {});
+        const config = normalized.ok ? normalized.config : aiCurrent;
+        if (config === null) return json({ ok: false, error: 'ai-not-configured' }, 400);
+        const started = Date.now();
+        const out = await classifyPendingWithAi({ config, tool: 'write_file', paths: ['<连接测试>'], reason: '这是 GPW 智能分级的连通性测试', mode: 'advanced' });
+        if (!out.ok) return json({ ok: false, error: out.reason, raw: out.raw ?? null, elapsed_ms: Date.now() - started }, 400);
+        return json({ ok: true, level: out.level, action: out.action, reason: out.reason, model: out.model, elapsed_ms: Date.now() - started, ...aiStatus() });
+      },
+    });
+
     registry.register({
       path: GPW_PICK_ROUTE,
       methods: ['POST'],
@@ -858,6 +1012,7 @@ export function apply(ctx, config = {}) {
 
   ctx.logger?.info?.(
     `dsh-gpw: active -- full-access only=${requireFullAccess}, at most ${maxPerWindow} auto-approvals per ${Math.round(windowMs / 1000)} s, `
-    + `pending timeout ${Math.round(pendingTimeoutMs / 1000)} s; blacklist denies, whitelist passes, everything else waits for the operator`,
+    + `pending timeout ${Math.round(pendingTimeoutMs / 1000)} s; blacklist denies, whitelist passes, everything else waits for the operator; `
+    + (aiEnabled() ? `AI 分级已启用（${aiCurrent.provider}/${aiCurrent.model}，红/黄/蓝/绿倒计时）` : 'AI 分级未配置（回退统一 pending 超时）'),
   );
 }

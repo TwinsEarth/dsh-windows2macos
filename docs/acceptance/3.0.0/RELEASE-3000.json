@@ -1,0 +1,52 @@
+{
+  "version": "3.0.0",
+  "case": "RELEASE-3000",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-13T20:45:02.369Z",
+  "executor": "lead",
+  "task_id": "pre-release-3000",
+  "requirement": "v3.0.0: the Fang decision center is ported to W2M as @twinsearth/w2m-dsh-plugin/decision-center (host module, /api/w2m/decisions* routes, GPW page and GPW launcher panel) and its ported test suites pass",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/decision-center.test.mjs",
+      "test/decision-routes.test.mjs",
+      "test/decision-events.test.mjs",
+      "test/decision-ingest-client.test.mjs",
+      "test/decision-outbox.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/client-bundle.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/loader-entry.test.mjs"
+    ],
+    [
+      "node",
+      "scripts/pack.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "port": "src/decision-center/index.mjs is the Fang plugin module with import specifiers and plugin name rewritten only; its four lib dependencies and the MIT schemastery are copied verbatim, and kernel.mjs supplies the Fang kernel names on W2M paths",
+      "service": "apply() provides w2mDecisionCenter with 27 methods and registers request_human_decision / ask_user_choice",
+      "routes": "14 /api/w2m/decisions* routes registered on the connection fetch registry, including the SSE events and AI advise streams; create -> list -> item -> quota -> resolve round-trips through HTTP",
+      "panel": "DecisionCenterSection renders inside GpwPanel, which GpwSettingsPage embeds and GpwLauncher opens, so the GPW page and the GPW launcher show the same center; it polls every 4s, groups by level, resolves via the ticket options, abandons option-less tickets and only displays AI advice",
+      "suites": "92 tests pass: 79 ported Fang decision-center tests + 10 outbox/events/ingest tests + 3 new route-surface tests",
+      "not_ported": "decision-center-fork and decision-action-integration stay out: the former needs the Fang mother/fork role matrix, the latter the Fang orchestrator and restart-guard, neither of which exists in W2M",
+      "artifact": "scripts/pack.mjs packs dist/twinsearth-w2m-dsh-plugin-3.0.0.tgz deterministically; the published sha256 is the one release.yml writes into dist/SHA256SUMS, so the record does not restate the hash of the archive that contains it"
+    }
+  }
+}

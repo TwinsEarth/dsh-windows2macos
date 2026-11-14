@@ -1,0 +1,47 @@
+{
+  "version": "3.2.0",
+  "case": "RELEASE-3200",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-14T01:11:13.111Z",
+  "executor": "lead",
+  "task_id": "pre-release-3200",
+  "requirement": "v3.2.0: w2m speaks the independently published, versioned interop contract SDK (@twinsearth/dsh-fang-contract 1.1.1) for w2m <-> dsh-fang and w2m <-> dsh-master interop: own w2m.* method table, server (local service + /api/w2m/contract routes + optional file fallback), client with local->http->file->legacy downgrade, and byte-identical vendored SDK copy; no dsh-fang or dsh-master source is imported or modified",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/contract-interop.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/layer-model.test.mjs",
+      "test/claims.test.mjs"
+    ],
+    [
+      "node",
+      "scripts/check-contract-vendor.mjs"
+    ],
+    [
+      "node",
+      "scripts/pack.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "independence": "the three projects stay independent: w2m imports no dsh-fang or dsh-master source, modifies neither tree, and depends only on the published @twinsearth/dsh-fang-contract package, whose 1.1.1 files are vendored byte for byte under src/interop/contract/ with sha256 recorded in PROVENANCE.md",
+      "methodTable": "w2m.* methods at contractVersion 1.0.0: w2m.status, w2m.methods, w2m.fleet.snapshot, w2m.devices.list, w2m.tasks.list; the SDK protocol (fang-master v1) and contract package version (1.1.1) stay separate from the plugin version (3.2.0)",
+      "server": "createW2mContractServer wraps the SDK server; apply() provides w2mContract, yields the fangContract name only when it is free, registers /api/w2m/contract/{hello,health,invoke} on the connection registry and mounts the SDK file contract server when fileDir is configured",
+      "client": "createW2mContractClient reuses the SDK router, so local -> http -> file -> legacy downgrade works; the legacy hop calls the 3.1.x service keys (fangForker etc.) as the last resort",
+      "suites": "contract-interop 9/9; layer model and claims 71 pass with 1 network skip; vendor checker 9/9 files match PROVENANCE.md",
+      "no_fake_data": "a handler without an injected provider answers handler-threw carrying w2m-service-absent instead of returning empty success data",
+      "artifact": "scripts/pack.mjs packs dist/twinsearth-w2m-dsh-plugin-3.2.0.tgz deterministically; the published sha256 is the one release.yml writes into dist/SHA256SUMS, so the record does not restate the hash of the archive that contains it"
+    }
+  }
+}

@@ -1,0 +1,42 @@
+{
+  "version": "3.2.10",
+  "case": "RELEASE-32100",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-14T13:01:39.691Z",
+  "executor": "lead",
+  "task_id": "pre-release-32100",
+  "requirement": "v3.2.10 UI polish: remove the left-sidebar decision-center entry; the queue journal must show the Chinese session name instead of an id, must never render a Session ID, and must not list sessions with neither a draft nor queued messages",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/client-bundle.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/queue-journal.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/loader-entry.test.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "sidebar_removed": "the sidebar.panellist decision-center registration and its component are gone; the real-browser probe now asserts the sidebar entry is absent (the drawer stays reachable from the GPW inbox button and the 待选 badge)",
+      "session_names": "queue entries render entry.title (persisted at save time) or the client sessions service displayTitle; the host journal stores a title field; the fallback is 未知会话, never a short id",
+      "no_session_id": "the eye toggle, showIds state and the Session ID row are removed and the client-bundle static test refuses their return; the browser probe asserts neither the label nor a raw session key appears in the drawer",
+      "empty_hidden": "jqHasContent filters both the snapshot counts and the rendered human/client lists, so a record with an empty draft and no queued messages never appears and does not affect the badge",
+      "proof": "client-bundle 38/38 (new static invariants), queue-journal 6/6 (new title persistence case), real Chromium loader-entry 10/10 with the updated sidebar/no-id assertions, claims and layer-model green"
+    }
+  }
+}

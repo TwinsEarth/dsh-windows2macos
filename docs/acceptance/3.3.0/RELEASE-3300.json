@@ -1,0 +1,40 @@
+{
+  "version": "3.3.0",
+  "case": "RELEASE-3300",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-14T14:01:23.046Z",
+  "executor": "lead",
+  "task_id": "pre-release-3300",
+  "requirement": "v3.3.0: the composer/bottom area keeps exactly one «历史对话» button; clicking it expands a window; the window lists human input only (user messages, pending submissions, draft, queued messages) and never machine-generated content; clicking an entry fills the composer",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/client-bundle.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/loader-entry.test.mjs"
+    ],
+    [
+      "node",
+      "scripts/pack.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "single_button": "the only composer entry is w2m-history (历史对话); the target trigger, capability switch, queue dock chip and fleet-chat composer control are hidden, and the inline GPW prompt entry is gone; the right-bottom floating badges and the bottom status bar are unchanged",
+      "window": "the window is closed by default and toggled by the button; Escape and the close button collapse it; a human-only note is shown in the header",
+      "human_only": "the list combines sent user/message events (role user, source.kind user, machine-injected user messages excluded), pendingSubmissions, the live draft and the current session queue mirror; assistant/tool/system events are never read",
+      "click_to_fill": "clicking any entry writes it back into the composer through the queue-journal writeComposer helper and closes the window",
+      "proof": "client-bundle 39/39 with the new static invariants; real Chromium loader-entry 10/10 (button present, window opens with 历史对话/仅人类输入, closes again); claims and layer-model green; eslint 0 errors"
+    }
+  }
+}

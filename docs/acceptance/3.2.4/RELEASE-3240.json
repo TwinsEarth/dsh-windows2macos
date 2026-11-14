@@ -1,0 +1,49 @@
+{
+  "version": "3.2.4",
+  "case": "RELEASE-3240",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-14T09:17:53.318Z",
+  "executor": "lead",
+  "task_id": "pre-release-3240",
+  "requirement": "v3.2.4: match the operator screenshots -- 决策中心 sidebar entry opening the inbox, the right-centre 待选 pill coloured by the highest pending level (black when idle), the decision drawer half-height/scrollable, and the queue-journal pill moved to the bottom-right below the GPW launcher with 1-30 blue / 31-50 yellow / >50 red bands and a half-height scrollable drawer",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/client-bundle.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/loader-entry.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/claims.test.mjs"
+    ],
+    [
+      "node",
+      "scripts/pack.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "sidebar": "the left sidebar entry is labelled 决策中心 and calls the same store.openDrawer() as the floating badge",
+      "decision_badge": "the right-centre badge is a ◈ 待选 <count> pill; idle is neutral/black, otherwise it takes red > yellow > blue > green by the highest pending level, and the count pill follows the tone",
+      "decision_drawer": "right-centre, vertically centred, height min(70vh,620px), rounded, 14px from the right edge; the body is overflow-y:auto with a thin styled scrollbar instead of the old full-height sheet",
+      "queue_badge": "bottom-right (right:14px, bottom:52px, below the GPW launcher), pill shaped; 0 entries neutral/black, 1-30 blue, 31-50 yellow, over 50 red",
+      "queue_drawer": "bottom-right, height min(60vh,520px), rounded, scrollable body",
+      "relay": "the standalone per-session 待选 floating button no longer renders (the pill carries the count); session filtering stays available in the drawer",
+      "proof": "real Chromium probe: badge text contains 待选, two blue tickets give data-tone=blue, sidebar text contains 决策中心, the decision drawer height is between 40% and 85% of the viewport, vertically centred and near the right edge with overflow-y auto, the queue badge sits within 120px of the bottom, has data-tone=blue with one saved entry, and its drawer is half-height at the bottom right and scrollable",
+      "web": "client-bundle 36/36 (the stylesheet still uses shell theme tokens only, no literal colours); loader-entry 10/10 with the probes; claims green with the network skip; eslint 0 errors"
+    }
+  }
+}

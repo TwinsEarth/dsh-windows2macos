@@ -348,8 +348,8 @@ describe('client bundle: the activation contract', () => {
       () => exports.apply(ctx),
       'an undeclared service read throws in Cordis and takes the whole app down; the bundle must read only what it declares',
     );
-    assert.deepEqual(registry.announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', 'sidebar.panellist', 'main'], 'the entry still has to take its seat');
-    assert.equal(registry.registered.length, 16);
+    assert.deepEqual(registry.announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, 'conversation.composer.dock', 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', 'sidebar.panellist', 'main', SEAT], 'the entry still has to take its seat');
+    assert.equal(registry.registered.length, 18);
     assert.equal(locale.registered.has('w2m.target'), true, 'the dictionaries go to the locale service when there is one');
   });
 
@@ -453,8 +453,8 @@ describe('client bundle: the seat it registers into', () => {
 
   it('announces and registers all five composer controls plus the sidebar and update sections into conversation.input.left', () => {
     const { announced, registered } = applyTo();
-    assert.deepEqual(announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', 'sidebar.panellist', 'main']);
-    assert.equal(registered.length, 16);
+    assert.deepEqual(announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, 'conversation.composer.dock', 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', 'sidebar.panellist', 'main', SEAT]);
+    assert.equal(registered.length, 18);
     assert.equal(registered[0].options.name, SEAT);
   });
 
@@ -502,7 +502,7 @@ describe('client bundle: the seat it registers into', () => {
     };
     const { exports } = loadBundle();
     assert.doesNotThrow(() => exports.apply(ctx));
-    assert.equal(registered.length, 16);
+    assert.equal(registered.length, 18);
   });
 });
 
@@ -631,13 +631,21 @@ describe('client bundle: the stylesheet', () => {
   });
 });
 
-it('debounces conversation search and waits for the history loader (v2.0.5)', () => {
+it('searches the whole conversation after 1s (v2.2.6)', () => {
   const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
-  assert.ok(source.includes('}, 3000)'), 'search waits 3s after the last keystroke');
-  assert.ok(source.includes('function isLoadingEarlier()'), 'the scroll control can see the loading row');
+  assert.ok(
+    source.includes('paintRef.current(true); }, 1000);'),
+    'search waits 1s after the last keystroke (v2.0.5 waited 3s, which read as "search does nothing")',
+  );
+  assert.ok(!source.includes('function viewportRect'), 'no viewport-only filter: a scrolled-out match is still a match');
+  assert.ok(
+    !source.includes("addEventListener('scroll', onScroll, true)"),
+    'marks persist after a query settles, so scrolling no longer repaints them',
+  );
+  assert.ok(source.includes('const SEARCH_MAX_MARKS = 120;'), 'the wrap cap bounds paint cost, not the count');
+  assert.ok(source.includes('return ranges.length;'), 'the count is every match, not only the wrapped ones');
   assert.ok(source.includes('function searchQueryAllowed'), 'pure numbers <= 100 are refused');
-  assert.ok(source.includes('const SEARCH_MAX_MARKS = 6;'), 'at most six matches per viewport');
-  assert.ok(source.includes("addEventListener('scroll', onScroll, true)"), 'scrolling repaints the viewport');
+  assert.ok(source.includes('function isLoadingEarlier()'), 'the scroll control can see the loading row');
   assert.ok(source.includes('await waitForLoadSettled();'), 'the top button waits for in-flight history instead of re-pressing');
   assert.ok(source.includes('if (stagnant >= 2) break;'), 'two pages that add nothing end the loop instead of spinning');
 });
@@ -893,4 +901,58 @@ describe('client bundle: selecting a machine writes the @mention', () => {
     assert.deepEqual(posted, { session_id: 'sess-ui', machine_id: 'b', machine_name: 'beta' });
     assert.deepEqual(JSON.parse(JSON.stringify(edits)), [{ text: '@beta ', span: { start: 0, end: 0, draftRev: 1 } }]);
   });
+});
+it('queue journal only records the official dock and real sessions (v3.2.6)', () => {
+  const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
+  assert.ok(!source.includes('[class*="queue" i]'), 'no generic queue class scan: it captured drawer and page text');
+  assert.ok(!source.includes('[data-testid*="pending" i]'), 'no generic pending scan either');
+  assert.ok(source.includes('validSessionKey('), 'writes are gated on a real session key');
+  assert.ok(source.includes("startsWith('page:')"), 'page-instance keys are refused');
+  assert.ok(source.includes('data-w2m-queue-ui'), 'our own UI is marked and skipped by the capture');
+});
+
+it('the queue journal shows session titles and never session ids (v3.2.10)', () => {
+  const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
+  assert.equal(source.includes('Session ID'), false, 'the drawer must not render a Session ID label');
+  assert.equal(source.includes('w2mJqEye'), false, 'the eye toggle is gone; ids are never shown');
+  assert.equal(source.includes('showIds'), false, 'no id-visibility state remains');
+  assert.ok(source.includes('clientSessionTitles'), 'titles come from the client sessions service');
+  assert.ok(source.includes('未知会话'), 'an unknown session shows 未知会话 instead of an id');
+  assert.ok(source.includes('jqHasContent'), 'records without a draft and without queued messages are filtered out');
+});
+
+it('v3.3.2: the history window is anchored in the composer and the original controls are restored', () => {
+  const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
+  assert.ok(source.includes("id: 'w2m-history'"), 'the history button is the composer entry');
+  assert.equal(source.includes("id: 'w2m-gpw-prompt'"), false, 'the old inline prompt entry stays retired');
+  assert.equal(source.includes("'.w2mTarget_trigger{display:none"), false, 'the 全部机器 target control is visible again');
+  assert.equal(source.includes("'.w2mCap_trigger{display:none"), false, 'the execution capability switch is visible again');
+  assert.ok(source.includes("'.w2mJqDockChip{display:none!important}'"), 'the bottom queue dock chip stays hidden');
+  assert.ok(source.includes('w2mHistWrap'), 'the history window is wrapped next to the history button');
+  assert.ok(source.includes("'.w2mHistWindow{position:absolute"), 'the window is anchored above the composer, not fixed to the page bottom');
+  assert.equal(source.split('}, FleetChat));').length - 1, 2, 'the fleet-chat composer panel and view tab are both back');
+  assert.ok(source.includes('w2mChat_shotButton'), 'the restored fleet-chat panel is the v2.2.6 module');
+  assert.ok(source.includes('全部机器'), 'the 全部机器 label is back');
+  assert.ok(source.includes('pendingSubmissions'), 'the history window still lists pending human submissions');
+  assert.ok(source.includes('writeComposer(text)'), 'clicking an entry fills the composer');
+  assert.ok(source.includes('仅人类输入'), 'the window states it shows human input only');
+});
+
+it('v3.3.1: the sidebar opens an operation panel with the four sections', () => {
+  const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
+  assert.ok(source.includes('function W2mOpsPanel('), 'the operation panel exists');
+  assert.ok(source.includes("['approvals', '智能分级&审批']"), 'approvals tab');
+  assert.ok(source.includes("['queue', '消息与草稿']"), 'queue tab');
+  assert.ok(source.includes("['decisions', '决策中心']"), 'decision tab');
+  assert.ok(source.includes("['actions', '操作入口']"), 'actions tab');
+  assert.ok(source.includes('function OpsQueueSection('), 'queue section');
+  assert.ok(source.includes('function OpsDecisionSection('), 'decision section');
+  assert.ok(source.includes('function OpsApprovalSection('), 'approval section');
+  assert.ok(source.includes('function OpsActionsSection('), 'actions section');
+  assert.ok(source.includes('function GpwAiSettings('), 'the AI settings component');
+  assert.ok(source.includes('w2mAiChip'), 'the AI status chip');
+  assert.ok(source.includes('模型原始返回'), 'a failed test shows the model raw reply');
+  assert.ok(source.includes('测试中…'), 'the test button shows progress');
+  assert.ok(source.includes('function GpwAiSettings(') && source.includes('w2mAiFeedback'), 'feedback is coloured');
+  assert.ok(source.includes('w2mOpsPanel .w2mTarget_trigger'), 'the embedded target control is visible inside the ops panel');
 });

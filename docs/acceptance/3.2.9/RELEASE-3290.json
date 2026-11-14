@@ -1,0 +1,37 @@
+{
+  "version": "3.2.9",
+  "case": "RELEASE-3290",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-14T10:50:28.170Z",
+  "executor": "lead",
+  "task_id": "pre-release-3290",
+  "requirement": "v3.2.9: the CI release failed at the End-to-end suites step for v3.2.7 and v3.2.8; a per-file diagnostic workflow identified gpw-auto-approve.test.mjs and a subtest matrix identified the first case (timeout auto-approve + session grant) as the failing one on Linux",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/gpw-auto-approve.test.mjs",
+      "test/gpw-ai-priority.test.mjs",
+      "test/gpw-modes.test.mjs"
+    ],
+    [
+      "node",
+      "scripts/pack.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "root_cause": "v3.2.7 added unref() to the GPW countdown timers; in the CI-controlled event loop an unref timer may finish after the test runner has no other active handles, so the 60 ms auto-approve subtest failed on ubuntu while passing on Windows",
+      "fix": "the countdown timers (legacy pending timeout and per-level countdown) are referenced timers again, matching the original implementation; the AI grading semantics, countdown durations and priority invariants are unchanged",
+      "localization": "two temporary diagnostic workflows (one step per e2e file, then a matrix over gpw-auto-approve subtests) localized the failure on the public CI: only “approves a yellow call after the timeout and makes its next occurrence blue” failed",
+      "proof": "gpw-auto-approve, gpw-ai-priority and gpw-modes all green locally after the fix; the diagnostic workflows are removed from the repository before this release",
+      "layer_model": "the pre-flight also refused the new cross-layer edge plugin -> decision-center (GPW reuses the decision center OS-keychain secret store); it is declared in scripts/layer-model.mjs ALLOWED_EDGES and test/layer-model.test.mjs passes 24/24",
+      "self_diagnosing_e2e": "the release workflow keeps the single `npm run test:e2e` gate (claims.test.mjs refuses a workflow that hand-lists suites) but captures its output; on failure it emits one ::error annotation per failed test file and writes the file list to the step summary, so a CI failure self-identifies without log access"
+    }
+  }
+}

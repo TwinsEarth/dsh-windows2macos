@@ -42,6 +42,12 @@ export const LAYERS = Object.freeze([
   { name: 'agent', rank: 2, kind: 'capability', note: 'the machine-side agent; depended on by plugin' },
   { name: 'relay', rank: 3, kind: 'service', note: 'the relay server; depends on chatops' },
   { name: 'plugin', rank: 4, kind: 'surface', note: 'the DSH-facing tool surface; the only entry point' },
+  // v3.0.0: the Fang decision center, ported as a subplugin; it reaches down to util only.
+  { name: 'decision-center', rank: 1, kind: 'capability', note: 'ported Fang decision center (store, routes, kernel shim)' },
+  // v3.1.0: the Fang composer queue journal, ported as a subplugin; it reaches down to util only.
+  { name: 'queue-journal', rank: 1, kind: 'capability', note: 'ported Fang queue journal (store + composer routes)' },
+  // v3.2.0: w2m interop contract layer (own method table over the vendored published SDK copy).
+  { name: 'interop', rank: 1, kind: 'capability', note: 'w2m.* contract server/client over the versioned contract SDK' },
   // v1.9.1: internal telemetry adapter. A leaf capability: it imports only Node builtins and itself, and it is
   // dormant unless the host supplies the relay/token environment contract. Declared because the directory exists;
   // leaving it unnamed is the silent cross-layer edge the checker exists to refuse.
@@ -67,6 +73,9 @@ export const ALLOWED_EDGES = Object.freeze([
   // v0.30.0: the shared sliding-window limiter. Not ['agent', 'relay'] -- that edge points UP (agent is
   // rank 2, relay is rank 3), and the class moved to util rather than the model being widened.
   ['agent', 'util'],
+  // v3.0.0/v3.1.0: both ported subplugins resolve their state directory through the CLI helpers.
+  ['decision-center', 'util'],
+  ['queue-journal', 'util'],
   // v1.3.10-beta.2: the agent verifies a signed maintenance request and ferries it; the root runner executes it.
   ['agent', 'maintenance'],
   // v1.3.12-beta.1: the relay preflights a task-level execution grant against the shared grant protocol (argv hash, expiry).
@@ -76,6 +85,8 @@ export const ALLOWED_EDGES = Object.freeze([
   // and the second half of the same decision: one shared window rather than two that could disagree.
   ['relay', 'util'],
   ['relay', 'shared'],
+  // v3.2.7: GPW 智能分级复用决策中心的 OS 钥匙串/DPAPI 密钥存储来保存大模型 Token（向下：plugin 4 -> decision-center 1）。
+  ['plugin', 'decision-center'],
 ]);
 
 /** Layer names, for a caller that wants just the vocabulary. */

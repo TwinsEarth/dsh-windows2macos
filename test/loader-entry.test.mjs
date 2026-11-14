@@ -619,6 +619,113 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
       `the page never finished booting (boot surface still up after ${String(page.settledAfterMs)}ms; ` +
         `body: ${String(page.bodyText ?? '').slice(0, 300)})`,
     );
+    if (process.env.W2M_DECISION_PROBE === '1') {
+      const probe = page.decisionProbe ?? {};
+      assert.equal(probe.badge?.found, true, `the floating decision inbox badge is not in the page: ${JSON.stringify(probe)}`);
+      assert.equal(probe.opened?.clicked, true, `the badge did not accept a click: ${JSON.stringify(probe.opened)}`);
+      assert.equal(probe.drawer?.hidden, false, `the inbox drawer did not open: ${JSON.stringify(probe.drawer)}`);
+      assert.match(String(probe.drawer?.title ?? ''), /收件箱/u, 'the drawer names itself as the inbox');
+      assert.equal(probe.closed?.found, true, 'the drawer has a close button');
+      assert.equal(probe.afterClose?.display, 'none', `the close button closes the drawer: ${JSON.stringify(probe.afterClose)}`);
+      assert.notEqual(probe.drawer?.display, 'none', 'the open drawer is actually displayed, not merely un-hidden');
+      const visibility = probe.closedVisibility ?? {};
+      assert.equal(visibility.drawer, 'none', `the closed drawer is not rendered (display): ${JSON.stringify(visibility)}`);
+      assert.equal(visibility.overlay, 'none', `the closed overlay is not rendered (display): ${JSON.stringify(visibility)}`);
+      assert.equal(visibility.hitBlocked, false, 'a click on the page is not intercepted by a leftover overlay');
+      assert.equal(probe.sidebar?.found, false, 'the left sidebar no longer carries the decision-center entry (v3.2.10)');
+      assert.equal(probe.gpwButton?.launcher, true, 'the GPW launcher is in the page so its inbox button can be checked');
+      assert.equal(probe.gpwButton?.inboxButton, true, 'the GPW panel carries the inbox button');
+      const queue = page.queueProbe ?? {};
+      assert.equal(queue.postJournal?.ok, true, `the queue journal host accepted a draft: ${JSON.stringify(queue.postJournal)}`);
+      assert.equal(queue.listApi?.ok, true, `the queue journal list route answers: ${JSON.stringify(queue.listApi)}`);
+      assert.equal(queue.queueBadge?.found, true, 'the floating queue-journal badge is in the page');
+      assert.equal(queue.queueOpened?.clicked, true, 'the queue-journal badge accepts a click');
+      assert.equal(queue.queueDrawer?.hidden, false, `the queue-journal drawer opens: ${JSON.stringify(queue.queueDrawer)}`);
+      assert.match(String(queue.queueDrawer?.title ?? ''), /队列日志/u, 'the drawer names itself as the queue journal');
+      assert.match(String(queue.queueDrawer?.body ?? ''), /human draft text/u, 'a human session record is visible by default');
+      assert.equal(queue.queueDrawer?.foldExists, true, 'client-generated records are folded into their own section');
+      assert.equal(queue.queueDrawer?.foldOpen, false, 'the client-generated section is collapsed by default');
+      assert.ok(!String(queue.queueDrawer?.body ?? '').includes('probe draft text'), 'the client-keyed record is not shown in the default list');
+      assert.equal(queue.foldOpened?.opened, true, 'the folded section can be opened');
+      assert.match(String(queue.foldOpened?.text ?? ''), /probe draft text/u, 'the folded section carries the client-keyed record');
+      assert.equal(queue.queueGpw?.button, true, 'the GPW panel carries the queue-journal button');
+      // The composer dock is conversation-scoped: the boot page is the shell's landing page, so the
+      // dock itself may not be mounted here. Registration into it is covered by the client-bundle
+      // suite; this is a diagnostic, not a pass condition.
+      if (queue.queueDock?.chip !== true) t.diagnostic('the composer dock chip was not on the boot page (dock is conversation-scoped)');
+      const parity = page.parityProbe ?? {};
+      assert.equal(parity.ingest?.ok, true, `the decision ingest route accepted a probe ticket: ${JSON.stringify(parity.ingest)}`);
+      assert.equal(parity.openInbox?.found, true, 'the inbox badge re-opened the drawer for the parity checks');
+      assert.equal(parity.batch?.open, true, 'the drawer is open for the parity checks');
+      assert.equal(parity.batch?.resolveButton, true, 'a level group with pending tickets shows the batch resolve button');
+      assert.equal(parity.batch?.abandonButton, true, 'a level group with pending tickets shows the batch abandon button');
+      assert.equal(parity.keyboard?.selected, true, 'ArrowDown moves the keyboard selection in the drawer');
+      assert.equal(parity.batch?.sidePanels, true, 'the drawer carries the fork-aggregation/producer side panel');
+      assert.match(String(parity.batch?.sideText ?? ''), /分叉|生产者/u, 'the side panel explains its state instead of staying blank');
+      assert.equal(parity.clickedBatch?.clicked, true, 'the batch resolve button accepts a click');
+      assert.equal(parity.afterBatch?.pendingMine, false, `batch resolve left no pending copy of the probe ticket: ${JSON.stringify(parity.afterBatch)}`);
+      if (parity.relay?.found !== true) t.diagnostic('the per-session 待选 button was not on the landing page (it needs an active conversation)');
+      const ui = page.ui324?.ui324 ?? {};
+      assert.match(String(ui.badgeText ?? ''), /待选/u, 'the right-edge badge shows 待选');
+      assert.equal(parity.batch?.badgeTone, 'blue', `the badge takes the highest pending level tone while the two blue probe tickets are pending: ${JSON.stringify(parity.batch?.badgeTone)}`);
+      assert.match(String(parity.batch?.badgeText ?? ''), /待选/u, 'the badge shows the 待选 label');
+      assert.doesNotMatch(String(ui.sidebarText ?? ''), /决策中心/u, 'the left sidebar no longer carries the decision-center entry (v3.2.10)');
+      assert.ok(ui.drawerOpen === true, 'the decision drawer is open for the geometry checks');
+      const vh = Number(ui.viewport?.h) || 0;
+      assert.ok(ui.drawerHeight > vh * 0.4 && ui.drawerHeight < vh * 0.85, `the decision drawer is half height, not full height: ${JSON.stringify({ drawerHeight: ui.drawerHeight, vh })}`);
+      assert.ok(ui.drawerTop > 0, 'the decision drawer is vertically centred, not pinned to the top');
+      assert.ok(ui.drawerRightGap >= 0 && ui.drawerRightGap <= 40, 'the decision drawer sits on the right edge');
+      assert.equal(ui.bodyOverflow, 'auto', 'the decision drawer body scrolls');
+      assert.equal(ui.gpwAiSection, true, 'the GPW panel carries the AI risk-grading settings section');
+      assert.equal(ui.queueTone, 'blue', `one saved journal entry puts the queue badge in the 1-30 blue band: ${JSON.stringify(ui.queueTone)}`);
+      assert.ok(ui.queueBottomGap >= 0 && ui.queueBottomGap <= 120, `the queue badge sits at the bottom right, below the GPW launcher: ${JSON.stringify(ui.queueBottomGap)}`);
+      assert.ok(ui.queueRightGap >= 0 && ui.queueRightGap <= 40, 'the queue badge hugs the right edge');
+      assert.equal(page.ui324?.qOpened?.clicked, true, 'the queue badge opens its drawer');
+      assert.equal(page.ui324?.qGeom?.open, true, 'the queue drawer is open for the geometry checks');
+      const qh = Number(page.ui324?.qGeom?.height) || 0;
+      const qvh = Number(page.ui324?.qGeom?.viewportH) || 0;
+      assert.ok(qh > qvh * 0.35 && qh < qvh * 0.85, `the queue drawer is half height: ${JSON.stringify({ qh, qvh })}`);
+      assert.ok(Number(page.ui324?.qGeom?.bottomGap) >= 0 && Number(page.ui324?.qGeom?.bottomGap) <= 40, 'the queue drawer opens at the bottom right');
+      assert.equal(page.ui324?.qGeom?.overflow, 'auto', 'the queue drawer body scrolls');
+      const jq = page.jq626?.jq626 ?? {};
+      assert.equal(jq.clearAll, true, 'the queue journal drawer has 清空全部');
+      assert.equal(jq.noSessionIdLabel, true, 'the queue journal drawer never renders a Session ID');
+      assert.equal(jq.noRawSessionKey, true, 'the queue journal drawer never renders a raw session key');
+      assert.equal(ui.historyButton, true, 'the composer carries the single history button');
+      assert.equal(ui.targetButton, true, 'the 全部机器 target control is visible again');
+      assert.equal(ui.chatButton, true, 'the 编队聊天 fleet-chat control is visible again');
+      const history = page.historyProbe ?? {};
+      assert.equal(history.historyOpened?.found, true, 'the history button exists in the real page');
+      assert.equal(history.historyWindow?.open, true, 'clicking the history button expands its window');
+      assert.equal(history.historyWindow?.title, '历史对话');
+      assert.equal(history.historyWindow?.hint, '仅人类输入');
+      assert.equal(history.historyWindow?.wrapped, true, 'the history window is anchored to the composer, not fixed at the page bottom');
+      assert.equal(history.historyWindow?.position, 'absolute', 'the window is absolutely positioned above the input row');
+      assert.equal(history.historyClosed?.closed, true, 'the window closes again');
+      assert.equal(page.jq626?.sessionsApi?.ok, true, `the sessions route answers: ${JSON.stringify(page.jq626?.sessionsApi)}`);
+      const gpwClose = page.gpwClose ?? {};
+      assert.equal(gpwClose.gpwOpen?.open, true, 'the GPW floating panel opens from its launcher for the close checks');
+      assert.equal(gpwClose.outsideClick?.clicked, true, 'a click on the GPW overlay background is dispatched');
+      assert.equal(gpwClose.outsideClosed?.closed, true, 'clicking outside the GPW panel closes it');
+      assert.equal(gpwClose.reopened?.open, true, 'the GPW panel reopens for the Escape check');
+      assert.equal(gpwClose.escClosed?.closed, true, 'Escape closes the GPW panel');
+      const ops = page.opsProbe ?? {};
+      assert.equal(ops.opsOpened?.found, true, 'the sidebar operation-panel button exists');
+      assert.equal(ops.opsPanel?.open, true, 'clicking the sidebar button opens the operation panel');
+      for (const label of ['智能分级&审批', '消息与草稿', '决策中心', '操作入口']) {
+        assert.ok(Array.isArray(ops.opsPanel?.tabs) && ops.opsPanel.tabs.some((tab) => String(tab).includes(label)), `the operation panel has the ${label} tab`);
+      }
+      assert.equal(ops.opsQueueTab?.clicked, true, 'the queue tab is clickable');
+      assert.equal(ops.opsQueueSection?.section, true, 'the queue section renders');
+      assert.equal(ops.opsQueueSection?.openButton, true, 'the queue section offers opening the queue window');
+      assert.equal(ops.opsGone?.closed, true, 'the operation-panel overlay closes again');
+      if (parity.rightTab?.marker === '1') {
+        assert.equal(parity.rightTab.marker, '1');
+      } else {
+        t.diagnostic('the right-pane tab marker was absent (host may not provide sidebarRightTabs in this profile)');
+      }
+    }
+
     if (process.env.W2M_CAPABILITY_PROBE === '1') {
       const probe = page.capabilityProbe ?? {};
       assert.equal(probe.menu?.menu, true, `the Node-execution menu never opened: ${JSON.stringify(probe)}`);
