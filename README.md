@@ -93,7 +93,7 @@ w2m-mcp --help
 # 复制进你自己的 codex/mcp-servers.toml
 [mcp_servers.w2m]
 command = "npx"
-args = ["-y", "@twinsearth/w2m-dsh-plugin@3.1.0", "w2m-mcp"]
+args = ["-y", "@twinsearth/w2m-dsh-plugin@3.2.0", "w2m-mcp"]
 ```
 
 ### 5. 验证过的 release tarball（离线）
@@ -195,3 +195,18 @@ plugins:
 - [Issues](https://github.com/TwinsEarth/dsh-windows2macos/issues)
 
 MIT.
+
+## 互联契约（contract 1.x）
+
+`@twinsearth/w2m-dsh-plugin/contract` 是 w2m 与瓮城 dsh-Fang、房主 dsh-Master 之间的唯一通道：
+三个项目各自独立发布、互不 import 内部代码，只经由版本化契约 SDK
+`@twinsearth/dsh-fang-contract` 的方法表 + 信封 + 传输层协作。
+
+- 子插件行：`@twinsearth/w2m-dsh-plugin/contract`（默认启用）。
+- 服务端方法（`w2m.*`，契约版本 1.0.0）：`w2m.status`、`w2m.methods`、`w2m.fleet.snapshot`、
+  `w2m.devices.list`、`w2m.tasks.list`。
+- HTTP：`POST /api/w2m/contract/invoke`、`GET /api/w2m/contract/hello`、`GET /api/w2m/contract/health`。
+- 同宿主互通走 local 服务：w2m 提供 `w2mContract`，并在 `fangContract` 缺席时补位（已存在则不覆盖）。
+- 跨宿主互通走 http 或 file：客户端按 **local → http → file → legacy** 自动降级。
+- 升级契约 SDK：`npm pack @twinsearth/dsh-fang-contract@<版本>` → 覆盖 `src/interop/contract/` →
+  重生成 `PROVENANCE.md` → `npm run verify:contract`。

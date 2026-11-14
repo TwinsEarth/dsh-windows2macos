@@ -4,6 +4,27 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [3.2.0] - 2026-11-14
+
+- 互联契约子插件：`@twinsearth/w2m-dsh-plugin/contract`，基于独立发布的版本化契约 SDK
+  `@twinsearth/dsh-fang-contract@1.1.1`（逐字节副本 + `src/interop/contract/PROVENANCE.md`，
+  `scripts/check-contract-vendor.mjs` 逐字节复核并纳入测试）。三个项目（w2m / 瓮城 dsh-fang / 房主
+  dsh-master）各自独立发布，互不 import 内部代码、互不改对方资料，只经方法表 + 信封 + 传输层互联。
+- w2m 方法表（`w2m.*`，契约版本 `1.0.0`，与插件版本解耦）：`w2m.status`、`w2m.methods`、
+  `w2m.fleet.snapshot`、`w2m.devices.list`、`w2m.tasks.list`；MINOR 只新增，删/改义升 MAJOR 并双写。
+  provider 由 `w2m.*` 宿主注入（`providers` 或 `w2mContractProviders` 服务），缺席时如实报
+  `handler-threw: … exposes no … provider`，不返回空数据冒充成功。
+- 服务端：`createContractServer` 承载 hello/health/invoke（协议 `fang-master` v1）；提供
+  `w2mContract` 服务；同宿主对端（fang/master 的 local 传输）默认找 `fangContract`，本插件在该名
+  缺席时补位、已存在时不覆盖，避免与瓮城抢服务键。HTTP 路由固定 `/api/w2m/contract/{hello,health,invoke}`，
+  不占用 fang 的 `/fang/api/contract/*`；配置 `fileDir` 时再挂 file 兜底服务端。
+- 客户端：`createW2mContractClient` 复用 SDK 的 **local → http → file → legacy** 四级自动降级
+  （legacy 走 3.1.x 旧服务键 `fangForker` 等兜底），可调用 `fang.*` / `contract.*` / `w2m.*` 方法。
+- 与 3.1.0 的关系：本版包含 3.0.0（决策中心）与 3.1.0（队列子插件）的全部内容，三者一起作为
+  v3.2.0 发布；版本号语义仍各自独立（插件 3.2.0 / w2m 契约 1.0.0 / 契约 SDK 1.1.1）。
+- 测试：新增 `test/contract-interop.test.mjs` 9 项（方法表与 hello 广告、信封往返与显式拒绝、
+  provider 注入与缺席、三路由注册、服务补位/不覆盖、local/http/file/legacy 四级降级、SDK 副本逐字节一致）。
+
 ## [3.1.0] - 2026-11-14
 
 - 队列子插件：`@twinsearth/dsh-fang-queue-journal`（瓮城）移植为 `@twinsearth/w2m-dsh-plugin/queue-journal`。

@@ -153,6 +153,11 @@
     # carries no config so the plugin's own defaults apply.
     # 队列日志 (queue journal): composer drafts and the queue mirror, ported from dsh-Fang's
     # @twinsearth/dsh-fang-queue-journal in v3.1.0. Enabled so the composer dock appears.
+    # 互联契约 (contract 1.x): w2m.* methods over the published @twinsearth/dsh-fang-contract SDK.
+    # Independent from dsh-fang and dsh-master: no shared code, only method table + envelope + transport.
+    - id: dsh-w2m-contract
+      name: '@twinsearth/w2m-dsh-plugin/contract'
+      config: {}
     - id: dsh-queue-journal
       name: '@twinsearth/w2m-dsh-plugin/queue-journal'
       config: {}

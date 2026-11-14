@@ -22,6 +22,7 @@ export default [
       'src/decision-center/lib/**',
       'src/decision-center/vendor/**',
       'src/queue-journal/lib/**',
+      'src/interop/contract/**',
       'test/decision-center.test.mjs',
       'test/decision-events.test.mjs',
       'test/decision-ingest-client.test.mjs',

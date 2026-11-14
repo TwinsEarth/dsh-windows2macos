@@ -46,3 +46,7 @@ test/decision-events.test.mjs
 test/decision-ingest-client.test.mjs
 test/decision-outbox.test.mjs
 test/helpers/fang-ctx.mjs
+
+# The published contract SDK, vendored byte for byte (v3.2.0). Its layout belongs to the upstream
+# package and PROVENANCE.md records its integrity; reformatting it would break the byte equality.
+src/interop/contract/
