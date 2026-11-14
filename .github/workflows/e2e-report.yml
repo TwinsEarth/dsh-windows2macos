@@ -14,14 +14,16 @@ jobs:
         with:
           node-version: '22'
       - run: npm install --no-audit --no-fund --ignore-scripts
-      - name: run the e2e gate, keep the failing files
+      - name: run the e2e gate, keep the failure details
         run: |
           set +e
           npm run test:e2e > "$RUNNER_TEMP/e2e.log" 2>&1
           code=$?
           echo "exit_code=$code" > e2e-report.txt
-          grep -E '^✖ test/|^not ok [0-9]+ - test/|^ℹ (tests|pass|fail)' "$RUNNER_TEMP/e2e.log" | head -n 80 >> e2e-report.txt
-          grep -Eo 'test/[A-Za-z0-9._-]+\.test\.mjs' "$RUNNER_TEMP/e2e.log" | sort | uniq -c | sort -rn | head -n 20 >> e2e-report.txt
+          echo "--- failure lines ---" >> e2e-report.txt
+          grep -nE -A4 '✖|not ok [0-9]+|AssertionError|failing tests|# fail' "$RUNNER_TEMP/e2e.log" | head -n 220 >> e2e-report.txt
+          echo "--- tail ---" >> e2e-report.txt
+          tail -n 100 "$RUNNER_TEMP/e2e.log" >> e2e-report.txt
           exit 0
       - name: publish the report branch
         run: |
