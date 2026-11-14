@@ -1,0 +1,43 @@
+{
+  "version": "3.2.8",
+  "case": "RELEASE-3280",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-14T10:19:52.577Z",
+  "executor": "lead",
+  "task_id": "pre-release-3280",
+  "requirement": "v3.2.8: finish the GPW AI grading UX - the composer-row prompt must show the level colour, the AI recommendation and the remaining countdown, and the red confirmation dialog must be global (visible with the GPW panel closed) instead of living only inside the panel",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/gpw-ai.test.mjs",
+      "test/gpw-ai-priority.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/client-bundle.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/loader-entry.test.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "inline_prompt": "GpwPrompt renders the level colour dot, gpwCountdownText() output (red pausing / N seconds until auto-allow-or-deny) and the AI recommendation line next to the allow/deny buttons",
+      "global_red_dialog": "mountGpwRedAlert() is mounted from apply() on document.body and polls /api/w2m/gpw/state every 2 s; a red pending raises a 确认允许/确认拒绝 dialog even when the GPW panel is closed, and it hides when the record disappears; the panel-inline duplicate was removed so two dialogs cannot stack",
+      "priority": "blacklist stays the highest-priority hard rule (immediate deny, never graded or queued), whitelist is allowed immediately, and only the remaining calls are graded/counted down; test/gpw-ai-priority.test.mjs locks these invariants, including a pending call running in parallel with blacklist/whitelist hits",
+      "fallback": "AI failure falls back to the rule colour countdown; no token keeps the legacy pending timeout; a red item never auto-resolves",
+      "proof": "gpw-ai 9/9, gpw-ai-priority 3/3, existing GPW suites green, client-bundle 36/36, loader-entry 10/10 in real Chromium, claims green, eslint 0 errors"
+    }
+  }
+}

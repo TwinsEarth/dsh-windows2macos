@@ -4,6 +4,18 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [3.2.8] - 2026-11-14
+
+- **GPW 行内提示补齐**：composer 行内的 `GpwPrompt` 现在显示等级色点、AI 推荐（建议允许/拒绝 + 理由）与
+  剩余倒计时秒数，不再只有工具名和允许/拒绝按钮；红/黄/蓝/绿的倒计时文案统一由 `gpwCountdownText()` 生成。
+- **红色确认弹窗改为全局**：新增 `mountGpwRedAlert()`，随插件激活挂到 document.body，每 2 秒读取
+  `/api/w2m/gpw/state`；出现红色待审批就浮出「确认允许 / 确认拒绝」弹窗，**不需要打开 GPW 面板**，条目消失后自动收起；
+  同时删除面板内的红色弹窗副本，避免两个弹窗叠加。
+- **优先级不变式**：黑名单仍是最高优先级红线（命中立即拒绝、永不进入 pending/AI 分级），白名单立即放行；
+  AI 分级与倒计时只作用于其余调用，并与硬规则并行独立运行（新增 `test/gpw-ai-priority.test.mjs` 锁定）。
+- 验证：`gpw-ai 9/9`、`gpw-ai-priority 3/3`、GPW 既有套件全绿、`client-bundle 36/36`、真实 Chromium
+  `loader-entry 10/10`（页面启动、GPW AI 设置区、队列日志、决策中心、GPW 点外关闭）、`claims` 绿、`eslint 0 errors`。
+
 ## [3.2.7] - 2026-11-14
 
 - **GPW 智能风险分级（操作面板填入大模型 Token）**，按用户要求：
