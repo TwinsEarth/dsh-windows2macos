@@ -1,0 +1,51 @@
+{
+  "version": "3.2.2",
+  "case": "RELEASE-3220",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-14T07:29:02.674Z",
+  "executor": "lead",
+  "task_id": "pre-release-3220",
+  "requirement": "v3.2.2: fix the v3.2.1 regression where the decision-inbox/queue-journal overlay locked the whole client (hidden attribute lost to an author display rule), and give the queue journal the persistent surfaces it lacked (right-edge floating badge + drawer, GPW button, always-visible composer dock chip), proven in a real DSH page",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/client-bundle.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/loader-entry.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/claims.test.mjs"
+    ],
+    [
+      "node",
+      "scripts/pack.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "badge": "a fixed right-edge 队列 badge below the inbox badge shows the number of saved journals and opens a drawer",
+      "drawer": "the drawer lists every saved journal newest-first with session key, update time, draft preview and per-row queued messages; each row restores the draft into the composer, restores the queue through POST /api/w2m/composer/queue (reporting session-not-live honestly) or clears the record; nothing is sent automatically",
+      "dock": "the composer dock no longer disappears when empty: it carries a 队列日志 chip that opens the drawer (the original Fang component returned null)",
+      "gpw": "the GPW panel header carries a 队列 N button next to the inbox button, opening the same drawer",
+      "data": "GET /api/w2m/composer/journal?list=1 lists entries, POST /api/w2m/composer/journal clears one, POST /api/w2m/composer/queue restores queued messages; the drawer refreshes on open and every 8s",
+      "id": "the composer dock registration id is w2m-queue-journal so it cannot collide with a simultaneously installed Fang queue-journal plugin",
+      "proof": "real Chromium page probe: POST and GET journal routes answer 200, the badge is in the DOM, a click opens the drawer whose title names 队列日志 and whose body contains the draft that was just saved, and the GPW panel contains the queue button; the conversation-scoped dock chip is reported as a diagnostic",
+      "suites": "queue-journal 4/4; client-bundle 36/36; loader-entry 10/10 with both probes; claims and layer model green",
+      "remaining": "not yet ported from Fang: drawer keyboard navigation, batch restore, per-session filtering and grouped history snapshots",
+      "overlay_lock": "the overlay and drawer toggle style.display instead of the hidden attribute, a [hidden]{display:none!important} rule backs it up, and the browser probe asserts the closed drawer/overlay compute to display:none and that elementFromPoint at the page centre is not inside the overlay"
+    }
+  }
+}

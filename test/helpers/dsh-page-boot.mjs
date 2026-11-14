@@ -293,9 +293,15 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
         return{found:true};
       `);
       await new Promise((resolve) => setTimeout(resolve, 400));
+      const closedVisibility = await read(`
+        const d=document.querySelector('.w2mDcDrawer'), o=document.querySelector('.w2mDcOverlay');
+        const disp=(el)=>el===null?null:getComputedStyle(el).display;
+        const hit=document.elementFromPoint(24, Math.floor(innerHeight/2));
+        return {drawer:disp(d), overlay:disp(o), hitBlocked:hit!==null&&typeof hit.closest==='function'&&hit.closest('.w2mDcOverlay')!==null};
+      `);
       const afterClose = await read(`
         const d=document.querySelector('.w2mDcDrawer');
-        return{hidden:d===null?null:d.hidden};
+        return{hidden:d===null?null:d.hidden, display:d===null?null:getComputedStyle(d).display};
       `);
       const gpwClicked = await read(`
         const launcher=document.querySelector('.w2mGpw_launcher');
@@ -311,7 +317,30 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
         const b=document.querySelector('.w2mDcSidebarBtn');
         return {found:b!==null, text:(b?.textContent ?? '').trim(), tone:b?.getAttribute('data-tone') ?? null};
       `);
-      report.decisionProbe = { badge, sidebar, opened, drawer, closed, afterClose, gpwButton };
+      report.decisionProbe = { badge, sidebar, opened, drawer, closed, afterClose, closedVisibility, gpwButton };
+      const parse = (value) => (typeof value === 'string' ? JSON.parse(value) : value);
+      const postJournal = parse(await evaluate(`
+        (async () => {
+          const r = await fetch('/api/w2m/composer/journal', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ key: 'probe-ui', sessionKey: 'probe-ui', draft: 'probe draft text', queue: [{ text: 'queued probe', at: Date.now() }] }) });
+          const b = await r.json().catch(() => null);
+          return JSON.stringify({ status: r.status, ok: b?.ok === true });
+        })()
+      `));
+      const listApi = parse(await evaluate(`
+        (async () => {
+          const r = await fetch('/api/w2m/composer/journal?list=1');
+          const b = await r.json().catch(() => null);
+          return JSON.stringify({ status: r.status, ok: b?.ok === true, entries: Array.isArray(b?.entries) ? b.entries.length : null });
+        })()
+      `));
+      const queueBadge = await read(`const b=document.querySelector('.w2mJqBadge'); return {found:b!==null, text:(b?.textContent??'').trim()};`);
+      const queueOpened = await read(`const b=document.querySelector('.w2mJqBadge'); if(b===null)return{clicked:false}; b.click(); return{clicked:true};`);
+      await new Promise((resolve) => setTimeout(resolve, 900));
+      const queueDrawer = await read(`const d=document.querySelector('.w2mJqDrawer'); return {found:d!==null, hidden:d===null?null:d.hidden, title:(d?.querySelector('.w2mDcDrawerTitle')?.textContent ?? null), body:((d?.querySelector('.w2mDcBody')?.innerText ?? '')).slice(0,400)};`);
+      const queueGpw = await read(`return {button:document.querySelector('.w2mJqGpwBtn')!==null};`);
+      const queueDock = await read(`return {chip:document.querySelector('.w2mJqDockChip')!==null, dock:document.querySelector('[data-fang-entry="queue-journal"]')!==null};`);
+      await evaluate(`fetch('/api/w2m/composer/journal', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ key: 'probe-ui', draft: '', queue: [] }) })`);
+      report.queueProbe = { postJournal, listApi, queueBadge, queueOpened, queueDrawer, queueGpw, queueDock };
     }
     socket.close();
     return report;

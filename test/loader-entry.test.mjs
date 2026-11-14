@@ -626,10 +626,28 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
       assert.equal(probe.drawer?.hidden, false, `the inbox drawer did not open: ${JSON.stringify(probe.drawer)}`);
       assert.match(String(probe.drawer?.title ?? ''), /收件箱/u, 'the drawer names itself as the inbox');
       assert.equal(probe.closed?.found, true, 'the drawer has a close button');
-      assert.equal(probe.afterClose?.hidden, true, 'the close button closes the drawer');
+      assert.equal(probe.afterClose?.display, 'none', `the close button closes the drawer: ${JSON.stringify(probe.afterClose)}`);
+      assert.notEqual(probe.drawer?.display, 'none', 'the open drawer is actually displayed, not merely un-hidden');
+      const visibility = probe.closedVisibility ?? {};
+      assert.equal(visibility.drawer, 'none', `the closed drawer is not rendered (display): ${JSON.stringify(visibility)}`);
+      assert.equal(visibility.overlay, 'none', `the closed overlay is not rendered (display): ${JSON.stringify(visibility)}`);
+      assert.equal(visibility.hitBlocked, false, 'a click on the page is not intercepted by a leftover overlay');
       assert.equal(probe.sidebar?.found, true, 'the decision inbox sidebar entry is in the page');
       assert.equal(probe.gpwButton?.launcher, true, 'the GPW launcher is in the page so its inbox button can be checked');
       assert.equal(probe.gpwButton?.inboxButton, true, 'the GPW panel carries the inbox button');
+      const queue = page.queueProbe ?? {};
+      assert.equal(queue.postJournal?.ok, true, `the queue journal host accepted a draft: ${JSON.stringify(queue.postJournal)}`);
+      assert.equal(queue.listApi?.ok, true, `the queue journal list route answers: ${JSON.stringify(queue.listApi)}`);
+      assert.equal(queue.queueBadge?.found, true, 'the floating queue-journal badge is in the page');
+      assert.equal(queue.queueOpened?.clicked, true, 'the queue-journal badge accepts a click');
+      assert.equal(queue.queueDrawer?.hidden, false, `the queue-journal drawer opens: ${JSON.stringify(queue.queueDrawer)}`);
+      assert.match(String(queue.queueDrawer?.title ?? ''), /队列日志/u, 'the drawer names itself as the queue journal');
+      assert.match(String(queue.queueDrawer?.body ?? ''), /probe draft text/u, 'the drawer shows the saved draft from the host');
+      assert.equal(queue.queueGpw?.button, true, 'the GPW panel carries the queue-journal button');
+      // The composer dock is conversation-scoped: the boot page is the shell's landing page, so the
+      // dock itself may not be mounted here. Registration into it is covered by the client-bundle
+      // suite; this is a diagnostic, not a pass condition.
+      if (queue.queueDock?.chip !== true) t.diagnostic('the composer dock chip was not on the boot page (dock is conversation-scoped)');
     }
 
     if (process.env.W2M_CAPABILITY_PROBE === '1') {

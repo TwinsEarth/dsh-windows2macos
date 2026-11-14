@@ -4,6 +4,35 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [3.2.2] - 2026-11-14
+
+- **严重修复（v3.2.1 回归）**：决策收件箱与队列日志的遮罩层/抽屉用了 `hidden` 属性切换，但样式表里
+  `.w2mDcOverlay{display:flex}` 是作者规则、`[hidden]{display:none}` 只是 UA 规则，作者规则获胜 ——
+  遮罩层永远铺满全屏并吞掉点击，点关闭只改状态不改显示，表现为「整个客户端被弹窗锁死、点哪都没反应、
+  点空白也不收回」。现在改为显式 `style.display` 开关 + 全局 `[hidden]{display:none!important}` 兜底，
+  并在真实浏览器里断言：打开时抽屉 `display != none`、关闭后抽屉与遮罩 `display == none`、
+  页面中心点击不再被遮罩拦截（`elementFromPoint` 不在遮罩内）。
+- 重要提示：遇到 3.2.1 锁屏不需要删除整个 profile，删除该 profile 的
+  `node_modules/@twinsearth/w2m-dsh-plugin` 目录（或把 `dsh.profile.bundles` 里的 w2m 行移除）即可恢复；
+  本版修好后重新安装即可。
+
+- 修复：队列子插件（queue-journal）只有宿主路由与 composer 内联按钮，草稿/队列为空时整块不渲染
+  （瓮城原版行为），用户看到的就是「未生效」。本版把队列日志做成常驻入口，并用真实 DSH 页面验证。
+- 右侧中部新增第二枚「队列」浮标（收件箱浮标下方，固定可见，显示保存条数），点开右侧抽屉：
+  按时间列出所有会话的草稿/队列快照（会话键、更新时间、草稿预览、排队消息逐条预览），
+  每张卡片提供「恢复草稿」（写回输入框）、「恢复队列」（`/api/w2m/composer/queue`，
+  无 live 会话时如实报 session-not-live）、「清除」，全部由用户点击触发，插件从不自动发送消息。
+- composer dock 常驻 chip：没有草稿时也显示「队列日志 / 打开」，不再整块消失（原版 return null）。
+- GPW 面板头部新增「队列 N」按钮（与「收件箱」按钮并列），点开同一个队列日志抽屉。
+- 数据面：`GET /api/w2m/composer/journal?list=1` 列表、`POST /api/w2m/composer/journal` 清除、
+  `POST /api/w2m/composer/queue` 恢复；抽屉每 8 秒刷新一次，打开时立即刷新。
+- composer dock 的注册 id 从 `fang-queue-journal` 改为 `w2m-queue-journal`，避免与本机可能同时安装的
+  瓮城 queue-journal 插件撞 id。
+- 验证：`test/client-bundle.test.mjs` 36/36；`test/loader-entry.test.mjs` 10/10，真实 Chromium 页面探针新增：
+  队列路由 POST/list 均 200、浮标存在、点击打开抽屉、抽屉标题含「队列日志」、抽屉正文含刚保存的草稿、
+  GPW 面板含队列日志按钮（composer dock 是会话级插槽，落地页可能不渲染，探针以诊断输出而不误判）。
+- 与瓮城对比仍暂缺（后续版本）：抽屉键盘导航、批量恢复、按会话筛选、时间线历史快照分组。
+
 ## [3.2.1] - 2026-11-14
 
 - 修复：v3.0.0/v3.2.0 的决策中心只有宿主与路由，没有把瓮城的两个用户入口挂出来，表现为
