@@ -101,7 +101,22 @@ export function parseClassifyReply(text) {
       return { level, action, reason };
     } catch { /* try next candidate */ }
   }
-  return null;
+  // 模型偶尔返回散文而不是 JSON：按关键词做最后兜底（仍然安全，识别不出就返回 null 走规则颜色）。
+  const lower = raw.toLowerCase();
+  const LEVEL_WORDS = [
+    ['red', /\bred\b|红色|极高风险|高危/i],
+    ['yellow', /\byellow\b|黄色|中风险|需人工/i],
+    ['blue', /\bblue\b|蓝色|低风险|常规/i],
+    ['green', /\bgreen\b|绿色|安全|只读/i],
+  ];
+  let level = null;
+  for (const [name, pattern] of LEVEL_WORDS) {
+    if (pattern.test(lower)) { level = name; break; }
+  }
+  if (level === null) return null;
+  const action = /拒绝|deny|禁止|拦截/i.test(raw) && !/允许|放行|allow/i.test(raw) ? 'deny' : 'allow';
+  const reason = raw.replace(/^[\s\S]{0,40}?(?:风险|level)[:：]?/i, '').slice(0, 120).trim() || '按关键词兜底分类';
+  return { level, action, reason };
 }
 
 /**

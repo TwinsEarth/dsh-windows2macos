@@ -59,6 +59,10 @@ test('gpw ai: reply parsing accepts fenced and noisy JSON and rejects garbage', 
   assert.equal(parseClassifyReply('not json'), null);
   assert.equal(parseClassifyReply('{"level":"purple"}'), null);
   assert.equal(parseClassifyReply(''), null);
+  // 模型偶尔返回散文：关键词兜底仍给出等级/动作（test: prose fallback）
+  assert.deepEqual(parseClassifyReply('该操作属于红色风险，建议拒绝：递归删除不可恢复'), { level: 'red', action: 'deny', reason: '，建议拒绝：递归删除不可恢复' });
+  assert.deepEqual(parseClassifyReply('这是安全的只读操作，允许执行'), { level: 'green', action: 'allow', reason: '这是安全的只读操作，允许执行' });
+  assert.equal(parseClassifyReply('无法判断'), null);
 });
 
 test('gpw ai: config normalization requires a token and accepts the deepseek default', () => {
