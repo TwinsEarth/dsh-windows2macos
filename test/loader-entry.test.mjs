@@ -694,6 +694,8 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
       assert.equal(ui.historyButton, true, 'the composer carries the single history button');
       assert.equal(ui.targetButton, true, 'the 全部机器 target control is visible again');
       assert.equal(ui.chatButton, true, 'the 编队聊天 fleet-chat control is visible again');
+      assert.match(String(ui.fleetStatusText ?? ''), /本编队在线机器/u, 'the bottom bar shows this fleet\'s machine ratio');
+      assert.match(String(ui.fleetStatusText ?? ''), /在线编队/u, 'the bottom bar shows the online-fleets ratio');
       const history = page.historyProbe ?? {};
       assert.equal(history.historyOpened?.found, true, 'the history button exists in the real page');
       assert.equal(history.historyWindow?.open, true, 'clicking the history button expands its window');

@@ -4,6 +4,17 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [3.3.4] - 2026-11-15
+
+- **底部状态栏恢复两条比例**（此前把“全服机器”显示成了第二项，且数据缺失时整段变成 —）：
+  - 本编队在线机器 `在线数/本编队机器总数`
+  - 在线编队 `在线编队数/全服编队总数`（来自主 Relay `/healthz` 的 fleets_online / fleets_total）
+  - 全服机器在线数/总数保留在第二项的悬浮提示里；数据真的取不到时该比例显示 —（不伪造 0）。
+  - Relay 在线圆点保留。
+- 验证：`client-bundle 41/41`（新增状态栏两条比例标签与 fleets/devices 计数断言）、
+  真实 Chromium `loader-entry 10/10`（底部状态栏文本包含「本编队在线机器」「在线编队」），
+  `claims`/`layer-model` 绿、`eslint 0 errors`。
+
 ## [3.3.3] - 2026-11-15
 
 - **仅版本号递增，功能与 3.3.2 完全相同**：npm 的 staged-publish 窗口把 3.3.2 变成“已暂存但不可见”的占位版本

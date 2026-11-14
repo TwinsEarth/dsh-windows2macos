@@ -956,3 +956,11 @@ it('v3.3.1: the sidebar opens an operation panel with the four sections', () => 
   assert.ok(source.includes('function GpwAiSettings(') && source.includes('w2mAiFeedback'), 'feedback is coloured');
   assert.ok(source.includes('w2mOpsPanel .w2mTarget_trigger'), 'the embedded target control is visible inside the ops panel');
 });
+
+it('v3.3.3: the bottom status bar keeps the two fleet ratios', () => {
+  const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
+  assert.ok(source.includes('本编队在线机器'), 'fleet machine ratio label');
+  assert.ok(source.includes('在线编队 '), 'online fleets ratio label');
+  assert.ok(source.includes('fleets_online') && source.includes('fleets_total'), 'the server totals read the fleets counters');
+  assert.ok(source.includes('devices_online') && source.includes('devices_total'), 'the server machine ratio stays in the tooltip');
+});

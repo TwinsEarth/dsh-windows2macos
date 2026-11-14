@@ -426,6 +426,7 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
           historyButton:document.querySelector('.w2mHistBtn')!==null,
           targetButton:document.querySelector('.w2mTarget_trigger')!==null,
           chatButton:document.querySelector('.w2mChat_trigger')!==null,
+          fleetStatusText:(document.querySelector('.w2mFleetStatus')?.innerText??null),
           queueTone:qbadge?.getAttribute('data-tone')??null,
           queueBottomGap:qr===null?null:Math.round(innerHeight-qr.bottom),
           queueRightGap:qr===null?null:Math.round(innerWidth-qr.right),
