@@ -42,6 +42,8 @@ export const LAYERS = Object.freeze([
   { name: 'agent', rank: 2, kind: 'capability', note: 'the machine-side agent; depended on by plugin' },
   { name: 'relay', rank: 3, kind: 'service', note: 'the relay server; depends on chatops' },
   { name: 'plugin', rank: 4, kind: 'surface', note: 'the DSH-facing tool surface; the only entry point' },
+  // v3.0.0: the Fang decision center, ported as a subplugin; it reaches down to util only.
+  { name: 'decision-center', rank: 1, kind: 'capability', note: 'ported Fang decision center (store, routes, kernel shim)' },
   // v1.9.1: internal telemetry adapter. A leaf capability: it imports only Node builtins and itself, and it is
   // dormant unless the host supplies the relay/token environment contract. Declared because the directory exists;
   // leaving it unnamed is the silent cross-layer edge the checker exists to refuse.
@@ -67,6 +69,8 @@ export const ALLOWED_EDGES = Object.freeze([
   // v0.30.0: the shared sliding-window limiter. Not ['agent', 'relay'] -- that edge points UP (agent is
   // rank 2, relay is rank 3), and the class moved to util rather than the model being widened.
   ['agent', 'util'],
+  // v3.0.0: the decision center resolves its state directory through the shared CLI helpers.
+  ['decision-center', 'util'],
   // v1.3.10-beta.2: the agent verifies a signed maintenance request and ferries it; the root runner executes it.
   ['agent', 'maintenance'],
   // v1.3.12-beta.1: the relay preflights a task-level execution grant against the shared grant protocol (argv hash, expiry).

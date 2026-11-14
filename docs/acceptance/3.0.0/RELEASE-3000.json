@@ -16,8 +16,6 @@
       "--test-force-exit",
       "test/decision-center.test.mjs",
       "test/decision-routes.test.mjs",
-      "test/decision-events.test.mjs",
-      "test/decision-ingest-client.test.mjs",
       "test/decision-outbox.test.mjs"
     ],
     [
@@ -44,7 +42,7 @@
       "service": "apply() provides w2mDecisionCenter with 27 methods and registers request_human_decision / ask_user_choice",
       "routes": "14 /api/w2m/decisions* routes registered on the connection fetch registry, including the SSE events and AI advise streams; create -> list -> item -> quota -> resolve round-trips through HTTP",
       "panel": "DecisionCenterSection renders inside GpwPanel, which GpwSettingsPage embeds and GpwLauncher opens, so the GPW page and the GPW launcher show the same center; it polls every 4s, groups by level, resolves via the ticket options, abandons option-less tickets and only displays AI advice",
-      "suites": "92 tests pass: 79 ported Fang decision-center tests + 10 outbox/events/ingest tests + 3 new route-surface tests",
+      "suites": "82 tests pass: 79 ported Fang decision-center tests + 3 new route-surface tests; the outbox suite is wired separately in scripts.test. The ported Node-SSE helper (decision-events) and fork-side ingest client were not carried over: W2M's routes stream through fetch and it has no fork half",
       "not_ported": "decision-center-fork and decision-action-integration stay out: the former needs the Fang mother/fork role matrix, the latter the Fang orchestrator and restart-guard, neither of which exists in W2M",
       "artifact": "scripts/pack.mjs packs dist/twinsearth-w2m-dsh-plugin-3.0.0.tgz deterministically; the published sha256 is the one release.yml writes into dist/SHA256SUMS, so the record does not restate the hash of the archive that contains it"
     }
