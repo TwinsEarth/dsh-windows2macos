@@ -326,6 +326,13 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
           return JSON.stringify({ status: r.status, ok: b?.ok === true });
         })()
       `));
+      const postHuman = parse(await evaluate(`
+        (async () => {
+          const r = await fetch('/api/w2m/composer/journal', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ key: 'session-probe-ui', sessionKey: 'session-probe-ui', draft: 'human draft text', queue: [{ text: 'human queued message', at: Date.now() }] }) });
+          const b = await r.json().catch(() => null);
+          return JSON.stringify({ status: r.status, ok: b?.ok === true });
+        })()
+      `));
       const listApi = parse(await evaluate(`
         (async () => {
           const r = await fetch('/api/w2m/composer/journal?list=1');
@@ -336,13 +343,30 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
       const queueBadge = await read(`const b=document.querySelector('.w2mJqBadge'); return {found:b!==null, text:(b?.textContent??'').trim()};`);
       const queueOpened = await read(`const b=document.querySelector('.w2mJqBadge'); if(b===null)return{clicked:false}; b.click(); return{clicked:true};`);
       await new Promise((resolve) => setTimeout(resolve, 900));
-      const queueDrawer = await read(`const d=document.querySelector('.w2mJqDrawer'); return {found:d!==null, hidden:d===null?null:d.hidden, title:(d?.querySelector('.w2mDcDrawerTitle')?.textContent ?? null), body:((d?.querySelector('.w2mDcBody')?.innerText ?? '')).slice(0,400)};`);
+      const queueDrawer = await read(`
+        const d=document.querySelector('.w2mJqDrawer');
+        const fold=d?.querySelector('.w2mJqClientFold') ?? null;
+        return {
+          found:d!==null,
+          hidden:d===null?null:d.hidden,
+          title:(d?.querySelector('.w2mDcDrawerTitle')?.textContent ?? null),
+          body:((d?.querySelector('.w2mDcBody')?.innerText ?? '')).slice(0,600),
+          foldExists:fold!==null,
+          foldOpen:fold===null?null:fold.open===true,
+        };
+      `);
+      const foldOpened = await read(`
+        const fold=document.querySelector('.w2mJqClientFold');
+        if(fold===null)return{opened:false,text:''};
+        fold.open=true;
+        return {opened:true, text:((document.querySelector('.w2mJqClientFoldBody')?.innerText ?? '')).slice(0,400)};
+      `);
       const queueGpw = await read(`return {button:document.querySelector('.w2mJqGpwBtn')!==null};`);
       const queueDock = await read(`return {chip:document.querySelector('.w2mJqDockChip')!==null, dock:document.querySelector('[data-fang-entry="queue-journal"]')!==null};`);
       await evaluate(`fetch('/api/w2m/composer/journal', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ key: 'probe-ui', draft: '', queue: [] }) })`);
       const queueClosed = await read(`const b=[...document.querySelectorAll('.w2mJqDrawer .w2mDcBtn')].find((x)=>x.textContent==='关闭'); if(b===undefined)return{closed:false}; b.click(); return{closed:true};`);
       await new Promise((resolve) => setTimeout(resolve, 350));
-      report.queueProbe = { postJournal, listApi, queueBadge, queueOpened, queueDrawer, queueGpw, queueDock, queueClosed };
+      report.queueProbe = { postJournal, postHuman, listApi, queueBadge, queueOpened, queueDrawer, foldOpened, queueGpw, queueDock, queueClosed };
       const parseP = (value) => (typeof value === 'string' ? JSON.parse(value) : value);
       const ingest = parseP(await evaluate(`
         (async () => {
@@ -419,6 +443,8 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
           clearAll: clearAll!==null,
           idHiddenByDefault: !bodyText.includes('Session ID：'),
           idShownAfterEye: bodyAfter.includes('Session ID：'),
+          beforeSnippet: bodyText.slice(0, 160),
+          afterSnippet: bodyAfter.slice(0, 300),
         };
       `);
       const sessionsApi = parseP(await evaluate(`
@@ -444,6 +470,8 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
       `);
       const rightTab = parseP(await evaluate(`JSON.stringify({ marker: document.body?.dataset?.w2mDecisionRightTab ?? null })`));
       report.parityProbe = { ingest, openInbox, batch, keyboard, clickedBatch, afterBatch, relay, rightTab };
+      await evaluate(`fetch('/api/w2m/composer/journal', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ key: 'probe-ui', draft: '', queue: [] }) })`);
+      await evaluate(`fetch('/api/w2m/composer/journal', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ key: 'session-probe-ui', draft: '', queue: [] }) })`);
     }
     socket.close();
     return report;

@@ -42,7 +42,8 @@
       "titles": "the drawer renders the conversation title from the host sessions/agents service via the new GET /api/w2m/composer/journal/sessions route, falling back to a short id",
       "privacy": "Session IDs are hidden by default and only rendered after the eye toggle (aria-pressed flips)",
       "cleanup": "the drawer has 清空全部; page-keyed leftovers are hidden with a hint, and the already-polluted records on this machine were backed up and cleaned",
-      "proof": "real Chromium probe: eye and clear-all exist, Session ID text is absent by default and appears after the eye click, the sessions route answers 200; queue-journal 5/5; client-bundle 36/36; loader-entry 10/10"
+      "proof": "real Chromium probe: the human-keyed entry is visible, the client-keyed entry is absent from the default body and present only after opening the folded section (collapsed by default), the drawer has the Session ID eye toggle and 清空全部, Session IDs stay hidden until the eye is clicked, and the sessions route answers 200; queue-journal 5/5; client-bundle 36/36; loader-entry 10/10",
+      "human_only": "the drawer shows only real-session (human) records by default; client/page-generated records are collapsed under 客户端生成的记录 · N 条（默认折叠）, the badge counts human records only, and an explicit note appears when there are no human records"
     }
   }
 }

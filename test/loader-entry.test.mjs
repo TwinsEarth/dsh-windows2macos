@@ -642,7 +642,12 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
       assert.equal(queue.queueOpened?.clicked, true, 'the queue-journal badge accepts a click');
       assert.equal(queue.queueDrawer?.hidden, false, `the queue-journal drawer opens: ${JSON.stringify(queue.queueDrawer)}`);
       assert.match(String(queue.queueDrawer?.title ?? ''), /队列日志/u, 'the drawer names itself as the queue journal');
-      assert.match(String(queue.queueDrawer?.body ?? ''), /probe draft text/u, 'the drawer shows the saved draft from the host');
+      assert.match(String(queue.queueDrawer?.body ?? ''), /human draft text/u, 'a human session record is visible by default');
+      assert.equal(queue.queueDrawer?.foldExists, true, 'client-generated records are folded into their own section');
+      assert.equal(queue.queueDrawer?.foldOpen, false, 'the client-generated section is collapsed by default');
+      assert.ok(!String(queue.queueDrawer?.body ?? '').includes('probe draft text'), 'the client-keyed record is not shown in the default list');
+      assert.equal(queue.foldOpened?.opened, true, 'the folded section can be opened');
+      assert.match(String(queue.foldOpened?.text ?? ''), /probe draft text/u, 'the folded section carries the client-keyed record');
       assert.equal(queue.queueGpw?.button, true, 'the GPW panel carries the queue-journal button');
       // The composer dock is conversation-scoped: the boot page is the shell's landing page, so the
       // dock itself may not be mounted here. Registration into it is covered by the client-bundle
@@ -685,7 +690,7 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
       assert.equal(jq.eye, true, 'the queue journal drawer has the Session ID eye toggle');
       assert.equal(jq.clearAll, true, 'the queue journal drawer has 清空全部');
       assert.equal(jq.idHiddenByDefault, true, 'Session IDs are hidden by default');
-      assert.equal(jq.idShownAfterEye, true, 'the eye toggle reveals Session IDs');
+      assert.equal(jq.idShownAfterEye, true, 'the eye toggle reveals Session IDs: ' + JSON.stringify(jq));
       assert.equal(page.jq626?.sessionsApi?.ok, true, `the sessions route answers: ${JSON.stringify(page.jq626?.sessionsApi)}`);
       if (parity.rightTab?.marker === '1') {
         assert.equal(parity.rightTab.marker, '1');

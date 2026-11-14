@@ -15,6 +15,9 @@ All notable changes to this project are documented here.
 - 队列日志抽屉：显示**会话名称**（宿主 `sessions`/`agents` 服务映射；宿主新增
   `GET /api/w2m/composer/journal/sessions`），**Session ID 默认隐藏**，点 👁 才显示；新增**清空全部**按钮；
   无会话键的旧垃圾记录默认隐藏并提示可一键清理。
+- **默认只显示人类输入**：抽屉默认只列出真实会话（`session-…`）的草稿与排队消息；客户端/页面自己生成的
+  记录（无会话键、`page:` 实例键、测试/探针记录等）统一折叠进「客户端生成的记录 · N 条（默认折叠，仅排错用）」，
+  展开才可见；没有人类记录时会明确提示。浮标计数只统计人类输入，避免客户端记录把徽标刷成红/黄。
 - 本机已清理已产生的垃圾记录（备份于临时目录），并重新写入干净的记录。
 - 验证：`queue-journal` 5/5（含 sessions 路由）、`client-bundle` 36/36（含“不再扫描任意 queue/pending 元素”
   与 `validSessionKey` 的静态断言）、真实 Chromium 断言：抽屉有 👁 / 清空全部、Session ID 默认不可见、
