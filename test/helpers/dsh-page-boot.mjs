@@ -432,20 +432,13 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
       const qOpened = await read(`const b=document.querySelector('.w2mJqBadge'); if(b===null)return{clicked:false}; b.click(); return{clicked:true};`);
       await new Promise((resolve) => setTimeout(resolve, 700));
       const jq626 = await read(`
-        const sessionsApi=document.querySelector('.w2mJqDrawer');
-        const eye=document.querySelector('.w2mJqEye');
         const clearAll=document.querySelector('.w2mJqClearAll');
         const bodyText=(document.querySelector('.w2mJqDrawer .w2mDcBody')?.innerText ?? '');
-        if(eye!==null) eye.click();
-        const bodyAfter=(document.querySelector('.w2mJqDrawer .w2mDcBody')?.innerText ?? '');
-        if(eye!==null) eye.click();
         return {
-          eye: eye!==null,
           clearAll: clearAll!==null,
-          idHiddenByDefault: !bodyText.includes('Session ID：'),
-          idShownAfterEye: bodyAfter.includes('Session ID：'),
-          beforeSnippet: bodyText.slice(0, 160),
-          afterSnippet: bodyAfter.slice(0, 300),
+          noSessionIdLabel: !bodyText.includes('Session ID'),
+          noRawSessionKey: !/session-[0-9a-f]{8}/.test(bodyText),
+          bodySnippet: bodyText.slice(0, 300),
         };
       `);
       const sessionsApi = parseP(await evaluate(`

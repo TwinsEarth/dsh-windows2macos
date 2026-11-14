@@ -148,3 +148,12 @@ test('queue journal: session titles come from the host session service', async (
   assert.equal(out.body.ok, true);
   assert.deepEqual(out.body.items, [{ id: 'session-a', title: '部署排查' }, { id: 'session-b', title: '' }]);
 });
+
+test('queue journal: the display title is persisted with the record', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'w2m-qj-'));
+  const { call } = mount({ dataDir: root });
+  await call(QUEUE_JOURNAL_ROUTE_PREFIX, post({ key: 'session-titled', sessionKey: 'session-titled', draft: 'hello', queue: [], title: '部署排查' }));
+  const list = await call(`${QUEUE_JOURNAL_ROUTE_PREFIX}?list=1`);
+  const entry = list.body.entries.find((item) => item.key === 'session-titled');
+  assert.equal(entry.title, '部署排查');
+});

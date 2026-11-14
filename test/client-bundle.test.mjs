@@ -348,8 +348,8 @@ describe('client bundle: the activation contract', () => {
       () => exports.apply(ctx),
       'an undeclared service read throws in Cordis and takes the whole app down; the bundle must read only what it declares',
     );
-    assert.deepEqual(registry.announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, 'conversation.composer.dock', 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', 'sidebar.panellist', 'main', 'sidebar.panellist', 'conversation.input.left'], 'the entry still has to take its seat');
-    assert.equal(registry.registered.length, 19);
+    assert.deepEqual(registry.announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, 'conversation.composer.dock', 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', 'sidebar.panellist', 'main', SEAT], 'the entry still has to take its seat');
+    assert.equal(registry.registered.length, 18);
     assert.equal(locale.registered.has('w2m.target'), true, 'the dictionaries go to the locale service when there is one');
   });
 
@@ -453,8 +453,8 @@ describe('client bundle: the seat it registers into', () => {
 
   it('announces and registers all five composer controls plus the sidebar and update sections into conversation.input.left', () => {
     const { announced, registered } = applyTo();
-    assert.deepEqual(announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, 'conversation.composer.dock', 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', 'sidebar.panellist', 'main', 'sidebar.panellist', 'conversation.input.left']);
-    assert.equal(registered.length, 19);
+    assert.deepEqual(announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, 'conversation.composer.dock', 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', 'sidebar.panellist', 'main', SEAT]);
+    assert.equal(registered.length, 18);
     assert.equal(registered[0].options.name, SEAT);
   });
 
@@ -502,7 +502,7 @@ describe('client bundle: the seat it registers into', () => {
     };
     const { exports } = loadBundle();
     assert.doesNotThrow(() => exports.apply(ctx));
-    assert.equal(registered.length, 19);
+    assert.equal(registered.length, 18);
   });
 });
 
@@ -909,4 +909,14 @@ it('queue journal only records the official dock and real sessions (v3.2.6)', ()
   assert.ok(source.includes('validSessionKey('), 'writes are gated on a real session key');
   assert.ok(source.includes("startsWith('page:')"), 'page-instance keys are refused');
   assert.ok(source.includes('data-w2m-queue-ui'), 'our own UI is marked and skipped by the capture');
+});
+
+it('the queue journal shows session titles and never session ids (v3.2.10)', () => {
+  const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
+  assert.equal(source.includes('Session ID'), false, 'the drawer must not render a Session ID label');
+  assert.equal(source.includes('w2mJqEye'), false, 'the eye toggle is gone; ids are never shown');
+  assert.equal(source.includes('showIds'), false, 'no id-visibility state remains');
+  assert.ok(source.includes('clientSessionTitles'), 'titles come from the client sessions service');
+  assert.ok(source.includes('未知会话'), 'an unknown session shows 未知会话 instead of an id');
+  assert.ok(source.includes('jqHasContent'), 'records without a draft and without queued messages are filtered out');
 });

@@ -4,6 +4,18 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [3.2.10] - 2026-11-14
+
+- **取消左侧边栏的「决策中心」按钮**：决策收件箱入口仍保留在 GPW 面板的收件箱按钮、右侧「待选」浮钮与抽屉里；
+  左侧栏不再出现该条目（相关 slot 注册与组件一并移除）。
+- **队列日志显示会话中文名称**：标题来自客户端 `sessions` 服务的 `displayTitle`（并随记录持久化到 `title` 字段），
+  不再显示 `会话 0c36661d` 这类短 ID；会话标题取不到时显示「未知会话」。
+- **队列日志不显示 Session ID**：移除 👁 眼睛按钮与「Session ID」行，抽屉里不出现任何原始会话编号。
+- **没有草稿也没有排队消息的会话不再出现在队列日志里**（徽标计数同样只统计有内容的记录）。
+- 验证：`client-bundle 38/38`（含“不显示 Session ID/眼睛按钮、标题来自 sessions 服务、空记录被过滤”的静态断言）、
+  `queue-journal 6/6`（新增 title 持久化用例）、真实 Chromium `loader-entry 10/10`（左侧栏无「决策中心」、
+  队列抽屉无 Session ID/原始会话号、清空按钮仍在）、`claims`/`layer-model` 绿、真实浏览器截图核对通过。
+
 ## [3.2.9] - 2026-11-14
 
 - **修复 Linux CI 上 GPW auto-approve 的偶发失败**：v3.2.7 起给 GPW 倒计时 timer 加了 `unref()`，

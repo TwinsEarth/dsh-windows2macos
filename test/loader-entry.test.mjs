@@ -632,7 +632,7 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
       assert.equal(visibility.drawer, 'none', `the closed drawer is not rendered (display): ${JSON.stringify(visibility)}`);
       assert.equal(visibility.overlay, 'none', `the closed overlay is not rendered (display): ${JSON.stringify(visibility)}`);
       assert.equal(visibility.hitBlocked, false, 'a click on the page is not intercepted by a leftover overlay');
-      assert.equal(probe.sidebar?.found, true, 'the decision inbox sidebar entry is in the page');
+      assert.equal(probe.sidebar?.found, false, 'the left sidebar no longer carries the decision-center entry (v3.2.10)');
       assert.equal(probe.gpwButton?.launcher, true, 'the GPW launcher is in the page so its inbox button can be checked');
       assert.equal(probe.gpwButton?.inboxButton, true, 'the GPW panel carries the inbox button');
       const queue = page.queueProbe ?? {};
@@ -669,7 +669,7 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
       assert.match(String(ui.badgeText ?? ''), /待选/u, 'the right-edge badge shows 待选');
       assert.equal(parity.batch?.badgeTone, 'blue', `the badge takes the highest pending level tone while the two blue probe tickets are pending: ${JSON.stringify(parity.batch?.badgeTone)}`);
       assert.match(String(parity.batch?.badgeText ?? ''), /待选/u, 'the badge shows the 待选 label');
-      assert.match(String(ui.sidebarText ?? ''), /决策中心/u, 'the sidebar entry is renamed 决策中心');
+      assert.doesNotMatch(String(ui.sidebarText ?? ''), /决策中心/u, 'the left sidebar no longer carries the decision-center entry (v3.2.10)');
       assert.ok(ui.drawerOpen === true, 'the decision drawer is open for the geometry checks');
       const vh = Number(ui.viewport?.h) || 0;
       assert.ok(ui.drawerHeight > vh * 0.4 && ui.drawerHeight < vh * 0.85, `the decision drawer is half height, not full height: ${JSON.stringify({ drawerHeight: ui.drawerHeight, vh })}`);
@@ -688,10 +688,9 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
       assert.ok(Number(page.ui324?.qGeom?.bottomGap) >= 0 && Number(page.ui324?.qGeom?.bottomGap) <= 40, 'the queue drawer opens at the bottom right');
       assert.equal(page.ui324?.qGeom?.overflow, 'auto', 'the queue drawer body scrolls');
       const jq = page.jq626?.jq626 ?? {};
-      assert.equal(jq.eye, true, 'the queue journal drawer has the Session ID eye toggle');
       assert.equal(jq.clearAll, true, 'the queue journal drawer has 清空全部');
-      assert.equal(jq.idHiddenByDefault, true, 'Session IDs are hidden by default');
-      assert.equal(jq.idShownAfterEye, true, 'the eye toggle reveals Session IDs: ' + JSON.stringify(jq));
+      assert.equal(jq.noSessionIdLabel, true, 'the queue journal drawer never renders a Session ID');
+      assert.equal(jq.noRawSessionKey, true, 'the queue journal drawer never renders a raw session key');
       assert.equal(page.jq626?.sessionsApi?.ok, true, `the sessions route answers: ${JSON.stringify(page.jq626?.sessionsApi)}`);
       const gpwClose = page.gpwClose ?? {};
       assert.equal(gpwClose.gpwOpen?.open, true, 'the GPW floating panel opens from its launcher for the close checks');

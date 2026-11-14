@@ -64,6 +64,7 @@ export class ComposerJournal {
       queue,
       path: cleanText(input.path, 500),
       sessionKey: cleanText(input.sessionKey, 200),
+      title: cleanText(input.title, 200),
       updatedAt: new Date().toISOString(),
     }
     const all = this.load()
