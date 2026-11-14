@@ -12,6 +12,8 @@ All notable changes to this project are documented here.
 - 验证：`gpw-auto-approve`、`gpw-ai-priority`、`gpw-modes` 本地全绿；CI 诊断 run 已定位失败子测试为
   “approves a yellow call after the timeout and makes its next occurrence blue”。
 - 同一轮 CI 还暴露出分层模型（layer-model）未声明的新依赖边 `plugin -> decision-center`（GPW 复用决策中心的密钥存储），已在 `scripts/layer-model.mjs` 的 ALLOWED_EDGES 显式声明，`layer-model 24/24` 通过。
+- 发布会话的 e2e 改为**自诊断**：release workflow 里 27 个 e2e 文件各占一个步骤（失败步骤名即文件），
+  并用 ts 汇总步骤汇总失败文件、标记 `::error`，即使读不到日志也能从 jobs API 的失败步骤名定位。
 
 ## [3.2.8] - 2026-11-14
 

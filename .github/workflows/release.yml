@@ -80,12 +80,126 @@ jobs:
       - name: Install dev tooling
         run: npm install --no-audit --no-fund
 
-      - name: End-to-end suites (package.json#scripts.test:e2e, via npm run test:e2e)
-        # The e2e suites exercise real processes over real sockets -- restart, sub-path mounting, the
-        # credential kinds -- and they gate the release. The list lives in `scripts.test:e2e` and is
-        # not repeated here: it used to be, and the copy went stale. `scripts/preflight.mjs` fails the
-        # run if this workflow stops covering every suite `package.json#scripts.test` declares.
-        run: npm run test:e2e
+      # SELF-DIAGNOSING E2E: one step per file, so the failed STEP NAME names the file even when the
+      # run log is unreadable (the public check-runs/jobs API exposes step conclusions). Each step
+      # records its file in $RUNNER_TEMP/e2e-failed; the final step turns any marker into the job failure.
+      # The list mirrors package.json#scripts.test:e2e and must be kept in sync with it.
+      - name: e2e test/e2e.test.mjs
+        continue-on-error: true
+        run: |
+          node --test --test-force-exit test/e2e.test.mjs || { echo "test/e2e.test.mjs" >> "$RUNNER_TEMP/e2e-failed"; exit 1; }
+      - name: e2e test/crossnetwork.test.mjs
+        continue-on-error: true
+        run: |
+          node --test --test-force-exit test/crossnetwork.test.mjs || { echo "test/crossnetwork.test.mjs" >> "$RUNNER_TEMP/e2e-failed"; exit 1; }
+      - name: e2e test/signing-e2e.test.mjs
+        continue-on-error: true
+        run: |
+          node --test --test-force-exit test/signing-e2e.test.mjs || { echo "test/signing-e2e.test.mjs" >> "$RUNNER_TEMP/e2e-failed"; exit 1; }
+      - name: e2e test/outbound-only.test.mjs
+        continue-on-error: true
+        run: |
+          node --test --test-force-exit test/outbound-only.test.mjs || { echo "test/outbound-only.test.mjs" >> "$RUNNER_TEMP/e2e-failed"; exit 1; }
+      - name: e2e test/recovery.test.mjs
+        continue-on-error: true
+        run: |
+          node --test --test-force-exit test/recovery.test.mjs || { echo "test/recovery.test.mjs" >> "$RUNNER_TEMP/e2e-failed"; exit 1; }
+      - name: e2e test/pipeline-e2e.test.mjs
+        continue-on-error: true
+        run: |
+          node --test --test-force-exit test/pipeline-e2e.test.mjs || { echo "test/pipeline-e2e.test.mjs" >> "$RUNNER_TEMP/e2e-failed"; exit 1; }
+      - name: e2e test/p2p-agent.test.mjs
+        continue-on-error: true
+        run: |
+          node --test --test-force-exit test/p2p-agent.test.mjs || { echo "test/p2p-agent.test.mjs" >> "$RUNNER_TEMP/e2e-failed"; exit 1; }
+      - name: e2e test/secondary-link.test.mjs
+        continue-on-error: true
+        run: |
+          node --test --test-force-exit test/secondary-link.test.mjs || { echo "test/secondary-link.test.mjs" >> "$RUNNER_TEMP/e2e-failed"; exit 1; }
+      - name: e2e test/bootstrap-cli.test.mjs
+        continue-on-error: true
+        run: |
+          node --test --test-force-exit test/bootstrap-cli.test.mjs || { echo "test/bootstrap-cli.test.mjs" >> "$RUNNER_TEMP/e2e-failed"; exit 1; }
+      - name: e2e test/bootstrap.test.mjs
+        continue-on-error: true
+        run: |
+          node --test --test-force-exit test/bootstrap.test.mjs || { echo "test/bootstrap.test.mjs" >> "$RUNNER_TEMP/e2e-failed"; exit 1; }
+      - name: e2e test/windows-hidden-task.test.mjs
+        continue-on-error: true
+        run: |
+          node --test --test-force-exit test/windows-hidden-task.test.mjs || { echo "test/windows-hidden-task.test.mjs" >> "$RUNNER_TEMP/e2e-failed"; exit 1; }
+      - name: e2e test/relay-failover.test.mjs
+        continue-on-error: true
+        run: |
+          node --test --test-force-exit test/relay-failover.test.mjs || { echo "test/relay-failover.test.mjs" >> "$RUNNER_TEMP/e2e-failed"; exit 1; }
+      - name: e2e test/npm-update.test.mjs
+        continue-on-error: true
+        run: |
+          node --test --test-force-exit test/npm-update.test.mjs || { echo "test/npm-update.test.mjs" >> "$RUNNER_TEMP/e2e-failed"; exit 1; }
+      - name: e2e test/agent-start-nonblocking.test.mjs
+        continue-on-error: true
+        run: |
+          node --test --test-force-exit test/agent-start-nonblocking.test.mjs || { echo "test/agent-start-nonblocking.test.mjs" >> "$RUNNER_TEMP/e2e-failed"; exit 1; }
+      - name: e2e test/fleet-chat-capture.test.mjs
+        continue-on-error: true
+        run: |
+          node --test --test-force-exit test/fleet-chat-capture.test.mjs || { echo "test/fleet-chat-capture.test.mjs" >> "$RUNNER_TEMP/e2e-failed"; exit 1; }
+      - name: e2e test/capture-route.test.mjs
+        continue-on-error: true
+        run: |
+          node --test --test-force-exit test/capture-route.test.mjs || { echo "test/capture-route.test.mjs" >> "$RUNNER_TEMP/e2e-failed"; exit 1; }
+      - name: e2e test/update-resolver.test.mjs
+        continue-on-error: true
+        run: |
+          node --test --test-force-exit test/update-resolver.test.mjs || { echo "test/update-resolver.test.mjs" >> "$RUNNER_TEMP/e2e-failed"; exit 1; }
+      - name: e2e test/agent-identity-safe.test.mjs
+        continue-on-error: true
+        run: |
+          node --test --test-force-exit test/agent-identity-safe.test.mjs || { echo "test/agent-identity-safe.test.mjs" >> "$RUNNER_TEMP/e2e-failed"; exit 1; }
+      - name: e2e test/re-pair-stale-token.test.mjs
+        continue-on-error: true
+        run: |
+          node --test --test-force-exit test/re-pair-stale-token.test.mjs || { echo "test/re-pair-stale-token.test.mjs" >> "$RUNNER_TEMP/e2e-failed"; exit 1; }
+      - name: e2e test/gpw-folder-policy.test.mjs
+        continue-on-error: true
+        run: |
+          node --test --test-force-exit test/gpw-folder-policy.test.mjs || { echo "test/gpw-folder-policy.test.mjs" >> "$RUNNER_TEMP/e2e-failed"; exit 1; }
+      - name: e2e test/gpw-activation.test.mjs
+        continue-on-error: true
+        run: |
+          node --test --test-force-exit test/gpw-activation.test.mjs || { echo "test/gpw-activation.test.mjs" >> "$RUNNER_TEMP/e2e-failed"; exit 1; }
+      - name: e2e test/gpw-hardening.test.mjs
+        continue-on-error: true
+        run: |
+          node --test --test-force-exit test/gpw-hardening.test.mjs || { echo "test/gpw-hardening.test.mjs" >> "$RUNNER_TEMP/e2e-failed"; exit 1; }
+      - name: e2e test/gpw-tamper-gate.test.mjs
+        continue-on-error: true
+        run: |
+          node --test --test-force-exit test/gpw-tamper-gate.test.mjs || { echo "test/gpw-tamper-gate.test.mjs" >> "$RUNNER_TEMP/e2e-failed"; exit 1; }
+      - name: e2e test/gpw-persistence.test.mjs
+        continue-on-error: true
+        run: |
+          node --test --test-force-exit test/gpw-persistence.test.mjs || { echo "test/gpw-persistence.test.mjs" >> "$RUNNER_TEMP/e2e-failed"; exit 1; }
+      - name: e2e test/gpw-colors.test.mjs
+        continue-on-error: true
+        run: |
+          node --test --test-force-exit test/gpw-colors.test.mjs || { echo "test/gpw-colors.test.mjs" >> "$RUNNER_TEMP/e2e-failed"; exit 1; }
+      - name: e2e test/gpw-recent-fold.test.mjs
+        continue-on-error: true
+        run: |
+          node --test --test-force-exit test/gpw-recent-fold.test.mjs || { echo "test/gpw-recent-fold.test.mjs" >> "$RUNNER_TEMP/e2e-failed"; exit 1; }
+      - name: e2e test/gpw-auto-approve.test.mjs
+        continue-on-error: true
+        run: |
+          node --test --test-force-exit test/gpw-auto-approve.test.mjs || { echo "test/gpw-auto-approve.test.mjs" >> "$RUNNER_TEMP/e2e-failed"; exit 1; }
+      - name: e2e verdict (fails the job with the list of failed files)
+        run: |
+          if [ -s "$RUNNER_TEMP/e2e-failed" ]; then
+            echo "e2e failed files:";
+            sort -u "$RUNNER_TEMP/e2e-failed" | tee /dev/stderr | while IFS= read -r f; do echo "::error title=e2e::FAILED $f"; done
+            exit 1
+          fi
+          echo "e2e: all files passed"
 
       # PACK BEFORE THE PRE-FLIGHT, NOT AFTER IT.
       #

@@ -30,7 +30,8 @@
       "fix": "the countdown timers (legacy pending timeout and per-level countdown) are referenced timers again, matching the original implementation; the AI grading semantics, countdown durations and priority invariants are unchanged",
       "localization": "two temporary diagnostic workflows (one step per e2e file, then a matrix over gpw-auto-approve subtests) localized the failure on the public CI: only “approves a yellow call after the timeout and makes its next occurrence blue” failed",
       "proof": "gpw-auto-approve, gpw-ai-priority and gpw-modes all green locally after the fix; the diagnostic workflows are removed from the repository before this release",
-      "layer_model": "the pre-flight also refused the new cross-layer edge plugin -> decision-center (GPW reuses the decision center OS-keychain secret store); it is declared in scripts/layer-model.mjs ALLOWED_EDGES and test/layer-model.test.mjs passes 24/24"
+      "layer_model": "the pre-flight also refused the new cross-layer edge plugin -> decision-center (GPW reuses the decision center OS-keychain secret store); it is declared in scripts/layer-model.mjs ALLOWED_EDGES and test/layer-model.test.mjs passes 24/24",
+      "self_diagnosing_e2e": "the release workflow now runs each of the 27 e2e files in its own continue-on-error step named after the file, appends failures to $RUNNER_TEMP/e2e-failed, and a final verdict step fails the job with ::error annotations listing the failed files; the jobs API exposes the failed step name, so a future CI failure localizes itself without log access"
     }
   }
 }
