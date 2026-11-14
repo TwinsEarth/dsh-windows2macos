@@ -29,7 +29,8 @@
       "root_cause": "v3.2.7 added unref() to the GPW countdown timers; in the CI-controlled event loop an unref timer may finish after the test runner has no other active handles, so the 60 ms auto-approve subtest failed on ubuntu while passing on Windows",
       "fix": "the countdown timers (legacy pending timeout and per-level countdown) are referenced timers again, matching the original implementation; the AI grading semantics, countdown durations and priority invariants are unchanged",
       "localization": "two temporary diagnostic workflows (one step per e2e file, then a matrix over gpw-auto-approve subtests) localized the failure on the public CI: only “approves a yellow call after the timeout and makes its next occurrence blue” failed",
-      "proof": "gpw-auto-approve, gpw-ai-priority and gpw-modes all green locally after the fix; the diagnostic workflows are removed from the repository before this release"
+      "proof": "gpw-auto-approve, gpw-ai-priority and gpw-modes all green locally after the fix; the diagnostic workflows are removed from the repository before this release",
+      "layer_model": "the pre-flight also refused the new cross-layer edge plugin -> decision-center (GPW reuses the decision center OS-keychain secret store); it is declared in scripts/layer-model.mjs ALLOWED_EDGES and test/layer-model.test.mjs passes 24/24"
     }
   }
 }

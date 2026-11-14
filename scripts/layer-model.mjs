@@ -85,6 +85,8 @@ export const ALLOWED_EDGES = Object.freeze([
   // and the second half of the same decision: one shared window rather than two that could disagree.
   ['relay', 'util'],
   ['relay', 'shared'],
+  // v3.2.7: GPW 智能分级复用决策中心的 OS 钥匙串/DPAPI 密钥存储来保存大模型 Token（向下：plugin 4 -> decision-center 1）。
+  ['plugin', 'decision-center'],
 ]);
 
 /** Layer names, for a caller that wants just the vocabulary. */

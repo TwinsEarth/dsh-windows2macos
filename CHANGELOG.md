@@ -10,7 +10,8 @@ All notable changes to this project are documented here.
   在 CI 的受控事件循环里可能先于测试结束，导致 `gpw-auto-approve` 第一个子测试失败、发布流水线在
   `End-to-end suites` 步骤挂掉。现恢复 timer 强引用（与原始实现一致），红/黄/蓝/绿倒计时与自动动作语义不变。
 - 验证：`gpw-auto-approve`、`gpw-ai-priority`、`gpw-modes` 本地全绿；CI 诊断 run 已定位失败子测试为
-  “approves a yellow call after the timeout and makes its next occurrence blue”。
+  “approves a yellow call after the timeout and makes its next occurrence blue”。
+- 同一轮 CI 还暴露出分层模型（layer-model）未声明的新依赖边 `plugin -> decision-center`（GPW 复用决策中心的密钥存储），已在 `scripts/layer-model.mjs` 的 ALLOWED_EDGES 显式声明，`layer-model 24/24` 通过。
 
 ## [3.2.8] - 2026-11-14
 
