@@ -964,3 +964,31 @@ it('v3.3.3: the bottom status bar keeps the two fleet ratios', () => {
   assert.ok(source.includes('fleets_online') && source.includes('fleets_total'), 'the server totals read the fleets counters');
   assert.ok(source.includes('devices_online') && source.includes('devices_total'), 'the server machine ratio stays in the tooltip');
 });
+
+it('v3.3.5: parses end-of-turn choice prompts (single/multi, numbers/letters)', () => {
+  const { exports } = loadBundle();
+  const parse = exports.parseChoiceOptions;
+  assert.equal(typeof parse, 'function');
+  const numbered = parse('请选择下一步：\n1. 继续\n2. 停止\n3. 回滚');
+  assert.equal((numbered?.options ?? []).map((option) => option.key).join(','), '1,2,3');
+  assert.match(numbered?.question ?? '', /请选择/u);
+  const letters = parse('选哪个？\nA. 方案一\nB. 方案二');
+  assert.equal((letters?.options ?? []).map((option) => option.key).join(','), 'A,B');
+  const multi = parse('可多选：\n[ ] 甲\n[ ] 乙\n[ ] 丙');
+  assert.equal(multi?.multi, true);
+  assert.equal(multi?.options?.length, 3);
+  const inline = parse('请选择：1、继续 2、停止 3、回滚');
+  assert.equal(inline?.options?.length, 3);
+  assert.equal(parse('这是一段总结。\n- 第一点\n- 第二点'), null);
+  assert.equal(parse('1. 只有一项'), null);
+});
+
+it('v3.3.5: the choice watcher mirrors prompts into the decision center and feeds the reply back', () => {
+  const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
+  assert.ok(source.includes('function installChoiceWatcher('), 'the watcher exists');
+  assert.ok(source.includes("'/api/w2m/decisions/ingest'") || source.includes('api/w2m/decisions/ingest'), 'it ingests into the decision center');
+  assert.ok(source.includes("event.type !== 'assistant/message'"), 'it reads the last assistant message');
+  assert.ok(source.includes('本轮待选'), 'ticket title marks the pending choice');
+  assert.ok(source.includes('dsh-choice:'), 'dedupe key prefix');
+  assert.ok(source.includes('writeComposer(String(option?.label'), 'picking an option fills the composer');
+});
