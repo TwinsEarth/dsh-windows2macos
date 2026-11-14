@@ -412,6 +412,11 @@ export function apply(ctx, config = {}) {
       if (saved) aiCurrent = { provider: saved.provider, model: saved.model, baseUrl: saved.baseUrl, apiKey: saved.apiKey, source: 'shared:decision-center' };
     } catch { /* not configured there either */ }
   }
+  // 显式配置（profile/测试）优先于 DPAPI/共享 Key；不改变"黑名单硬规则"的优先级。
+  if (config.gpwAi !== null && typeof config.gpwAi === 'object' && typeof config.gpwAi.apiKey === 'string' && config.gpwAi.apiKey.trim() !== '') {
+    const explicit = normalizeGpwAiConfig(config.gpwAi);
+    if (explicit.ok) aiCurrent = { ...explicit.config, source: 'config' };
+  }
   const aiEnabled = () => aiCurrent !== null && String(aiCurrent.apiKey ?? '') !== '';
   const aiStatus = () => ({
     configured: aiEnabled(),
