@@ -456,7 +456,8 @@ export function apply(ctx, config = {}) {
       const why = `GPW: ${Math.round(timeoutMs / 1000)} s 倒计时结束，自动${action === 'allow' ? '放行' : '拒绝'}（${nextLevel}${entry.ai !== null ? ' · AI 推荐' : ''}）`;
       entry.resolve({ kind: action, reason: why });
     }, timeoutMs);
-    entry.timer.unref?.();
+    // v3.2.9: 不给倒计时 timer unref——unref 的 timer 在 Linux CI 的受控事件循环里可能先于测试结束，
+    // 表现为 auto-approve 测试"偶发"失败；保持 timer 强引用，行为与原实现一致。
   };
   const foldersKey = keyInfo.key;
   /** Set once the signed file has been read cleanly; a later disappearance then reads as tampering. */
@@ -592,7 +593,7 @@ export function apply(ctx, config = {}) {
         if (typeof entry.fingerprint === 'string' && entry.fingerprint !== '') sessionGrants.add(entry.fingerprint);
         resolveDecision({ kind: 'allow', reason: `GPW: auto-approved after ${Math.round(pendingTimeoutMs / 1000)} s with no operator answer (yellow path; black/white lists keep their own rules)` });
       }, pendingTimeoutMs);
-      entry.timer.unref?.();
+      // v3.2.9: 同上，倒计时 timer 保持强引用。
       return;
     }
     // 有 AI：先按规则颜色起倒计时，AI 结果回来后按新等级重排（red 不自动执行）。

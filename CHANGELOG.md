@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [3.2.9] - 2026-11-14
+
+- **修复 Linux CI 上 GPW auto-approve 的偶发失败**：v3.2.7 起给 GPW 倒计时 timer 加了 `unref()`，
+  在 CI 的受控事件循环里可能先于测试结束，导致 `gpw-auto-approve` 第一个子测试失败、发布流水线在
+  `End-to-end suites` 步骤挂掉。现恢复 timer 强引用（与原始实现一致），红/黄/蓝/绿倒计时与自动动作语义不变。
+- 验证：`gpw-auto-approve`、`gpw-ai-priority`、`gpw-modes` 本地全绿；CI 诊断 run 已定位失败子测试为
+  “approves a yellow call after the timeout and makes its next occurrence blue”。
+
 ## [3.2.8] - 2026-11-14
 
 - **GPW 行内提示补齐**：composer 行内的 `GpwPrompt` 现在显示等级色点、AI 推荐（建议允许/拒绝 + 理由）与
