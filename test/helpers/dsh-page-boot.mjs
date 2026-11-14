@@ -266,6 +266,53 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
       `);
       report.capabilityProbe = { opened, menu, temp, after };
     }
+    if (process.env.W2M_DECISION_PROBE === '1') {
+      const read = async (expression) => {
+        const value = await evaluate(`JSON.stringify((() => { ${expression} })())`);
+        return value === null ? null : JSON.parse(value);
+      };
+      const badge = await read(`
+        const b=document.querySelector('.w2mDcBadge');
+        return {found:b!==null, tone:b?.getAttribute('data-tone') ?? null, text:(b?.textContent ?? '').trim()};
+      `);
+      const opened = await read(`
+        const b=document.querySelector('.w2mDcBadge');
+        if(b===null)return{clicked:false};
+        b.click();
+        return{clicked:true};
+      `);
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      const drawer = await read(`
+        const d=document.querySelector('.w2mDcDrawer');
+        return {found:d!==null, hidden:d===null?null:d.hidden, title:document.querySelector('.w2mDcDrawerTitle')?.textContent ?? null, body:(document.querySelector('.w2mDcBody')?.innerText ?? '').slice(0,300)};
+      `);
+      const closed = await read(`
+        const b=[...document.querySelectorAll('.w2mDcDrawer .w2mDcBtn')].find((x)=>x.textContent==='关闭');
+        if(b===undefined)return{found:false};
+        b.click();
+        return{found:true};
+      `);
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      const afterClose = await read(`
+        const d=document.querySelector('.w2mDcDrawer');
+        return{hidden:d===null?null:d.hidden};
+      `);
+      const gpwClicked = await read(`
+        const launcher=document.querySelector('.w2mGpw_launcher');
+        if(launcher!==null)launcher.click();
+        return {launcher:launcher!==null};
+      `);
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      const gpwPanel = await read(`
+        return {panel:document.querySelector('.w2mGpw_card')!==null, inboxButton:document.querySelector('.w2mDcGpwBtn')!==null, inboxText:(document.querySelector('.w2mDcGpwBtn')?.textContent ?? '').trim()};
+      `);
+      const gpwButton = { ...gpwClicked, ...gpwPanel };
+      const sidebar = await read(`
+        const b=document.querySelector('.w2mDcSidebarBtn');
+        return {found:b!==null, text:(b?.textContent ?? '').trim(), tone:b?.getAttribute('data-tone') ?? null};
+      `);
+      report.decisionProbe = { badge, sidebar, opened, drawer, closed, afterClose, gpwButton };
+    }
     socket.close();
     return report;
   } finally {

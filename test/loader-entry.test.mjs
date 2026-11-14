@@ -619,6 +619,19 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
       `the page never finished booting (boot surface still up after ${String(page.settledAfterMs)}ms; ` +
         `body: ${String(page.bodyText ?? '').slice(0, 300)})`,
     );
+    if (process.env.W2M_DECISION_PROBE === '1') {
+      const probe = page.decisionProbe ?? {};
+      assert.equal(probe.badge?.found, true, `the floating decision inbox badge is not in the page: ${JSON.stringify(probe)}`);
+      assert.equal(probe.opened?.clicked, true, `the badge did not accept a click: ${JSON.stringify(probe.opened)}`);
+      assert.equal(probe.drawer?.hidden, false, `the inbox drawer did not open: ${JSON.stringify(probe.drawer)}`);
+      assert.match(String(probe.drawer?.title ?? ''), /收件箱/u, 'the drawer names itself as the inbox');
+      assert.equal(probe.closed?.found, true, 'the drawer has a close button');
+      assert.equal(probe.afterClose?.hidden, true, 'the close button closes the drawer');
+      assert.equal(probe.sidebar?.found, true, 'the decision inbox sidebar entry is in the page');
+      assert.equal(probe.gpwButton?.launcher, true, 'the GPW launcher is in the page so its inbox button can be checked');
+      assert.equal(probe.gpwButton?.inboxButton, true, 'the GPW panel carries the inbox button');
+    }
+
     if (process.env.W2M_CAPABILITY_PROBE === '1') {
       const probe = page.capabilityProbe ?? {};
       assert.equal(probe.menu?.menu, true, `the Node-execution menu never opened: ${JSON.stringify(probe)}`);
