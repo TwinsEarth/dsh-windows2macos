@@ -1,0 +1,25 @@
+exit_code=1
+    not ok 1 - has no undeclared cross-layer edge
+not ok 519 - layer model: the real tree obeys the declared model
+    not ok 1 - exits zero when the tree is clean, and says so in the same breath
+not ok 520 - layer-check as a program: its EXIT STATUS has to mean something
+    ok 7 - moveText names both squares
+      ---
+      duration_ms: 0.129673
+      type: 'test'
+      ...
+    1..7
+ok 904 - xiangqi rules
+  ---
+  duration_ms: 19.81577
+  type: 'suite'
+  ...
+1..904
+# tests 3461
+# suites 796
+# pass 3438
+# fail 2
+# cancelled 0
+# skipped 21
+# todo 0
+# duration_ms 65653.137808
