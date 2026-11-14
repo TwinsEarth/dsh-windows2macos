@@ -1,0 +1,26 @@
+{
+  "version": "3.3.3",
+  "case": "RELEASE-3330",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-14T16:23:14.905Z",
+  "executor": "lead",
+  "task_id": "pre-release-3330",
+  "requirement": "v3.3.3: npm publication of 3.3.2 is impossible from our side because npm staged it (E409 Cannot publish over previously staged version); npm docs say a staged version shares the semver unique index but does not block publishing other versions, so bump the patch version and publish that (functionally identical to 3.3.2)",
+  "commands": [
+    [
+      "node",
+      "scripts/pack.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "cause": "the CI npm step left 3.3.2 in npm staged-publish state: the version is absent from the public packument (404) and any republish is refused with E409 Cannot publish over previously staged version",
+      "fix": "version bumped to 3.3.3 (no functional changes); it will be published directly with a 2FA-satisfying interactive publish, so no staged placeholder can exist for it",
+      "note": "CI should switch to Trusted Publisher (OIDC) or stop using a bypass-2FA granular token, otherwise every release risks staging instead of publishing"
+    }
+  }
+}

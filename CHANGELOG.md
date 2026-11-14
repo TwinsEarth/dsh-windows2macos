@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [3.3.3] - 2026-11-15
+
+- **仅版本号递增，功能与 3.3.2 完全相同**：npm 的 staged-publish 窗口把 3.3.2 变成“已暂存但不可见”的占位版本
+  （`npm view` 404，重发报 `E409 Cannot publish over previously staged version "3.3.2"`），该版本号无法自助补完；
+  按 npm 文档的规则改发下一个版本号（staged 版本不影响发布其他版本）。
+- GitHub Release v3.3.2 的资产字节与 3.3.3 的功能完全一致，仅 package version 不同。
+- 建议随后把 CI 的 npm 发布改为 Trusted Publisher (OIDC) 或移除 bypass-2FA 的 NPM_TOKEN，避免再次出现 staged 占位。
+
 ## [3.3.2] - 2026-11-14
 
 - **历史对话只挂在输入框上方**：窗口改为 composer 内的绝对定位（`.w2mHistWrap` + `position:absolute`），
