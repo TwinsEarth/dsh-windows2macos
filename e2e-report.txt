@@ -1,0 +1,126 @@
+exit_code=1
+--- failure lines ---
+836:    not ok 3 - carries the inline prompt and the fold controls in the client bundle
+837-      ---
+838-      duration_ms: 2.10368
+839-      type: 'test'
+840-      location: '/home/runner/work/dsh-windows2macos/dsh-windows2macos/test/gpw-tamper-gate.test.mjs:146:3'
+--
+844:      name: 'AssertionError'
+845-      expected: true
+846-      actual: false
+847-      operator: '=='
+848-      stack: |-
+--
+858:not ok 26 - GPW tampered lists fail closed (v1.7.9)
+859-  ---
+860-  duration_ms: 62.979679
+861-  type: 'suite'
+862-  location: '/home/runner/work/dsh-windows2macos/dsh-windows2macos/test/gpw-tamper-gate.test.mjs:85:1'
+--
+1465:# fail 1
+1466-# cancelled 0
+1467-# skipped 2
+1468-# todo 0
+1469-# duration_ms 82606.333651
+--- tail ---
+  ---
+  duration_ms: 301.179074
+  type: 'suite'
+  ...
+# Subtest: the frozen protocol vectors (§9.4.1), recomputed locally
+    # Subtest: recomputes the canonical string and signature byte for byte
+    ok 1 - recomputes the canonical string and signature byte for byte
+      ---
+      duration_ms: 0.416938
+      type: 'test'
+      ...
+    # Subtest: shows that the deployment prefix changes the signature
+    ok 2 - shows that the deployment prefix changes the signature
+      ---
+      duration_ms: 0.162345
+      type: 'test'
+      ...
+    1..2
+ok 47 - the frozen protocol vectors (§9.4.1), recomputed locally
+  ---
+  duration_ms: 0.754356
+  type: 'suite'
+  ...
+# Subtest: updater discovery in the desktop layout (v1.7.1)
+    # Subtest: includes the desktop resources runtime and the per-user dsh-runtimes
+    ok 1 - includes the desktop resources runtime and the per-user dsh-runtimes
+      ---
+      duration_ms: 0.690301
+      type: 'test'
+      ...
+    # Subtest: reads W2M_NODE as the runtime node override, and refuses a missing one
+    ok 2 - reads W2M_NODE as the runtime node override, and refuses a missing one
+      ---
+      duration_ms: 0.707696
+      type: 'test'
+      ...
+    # Subtest: finds pnpm through W2M_RUNTIME_ROOT when DSH_HOME points elsewhere
+    ok 3 - finds pnpm through W2M_RUNTIME_ROOT when DSH_HOME points elsewhere
+      ---
+      duration_ms: 0.636809
+      type: 'test'
+      ...
+    # Subtest: resolves the per-user layout even when DSH_HOME is rewritten
+    ok 4 - resolves the per-user layout even when DSH_HOME is rewritten
+      ---
+      duration_ms: 0.474485
+      type: 'test'
+      ...
+    1..4
+ok 48 - updater discovery in the desktop layout (v1.7.1)
+  ---
+  duration_ms: 3.802249
+  type: 'suite'
+  ...
+# Subtest: windows hidden background tasks (v1.6.5)
+    # Subtest: schedules wscript in batch mode, never the command directly
+    ok 1 - schedules wscript in batch mode, never the command directly
+      ---
+      duration_ms: 1.245878
+      type: 'test'
+      ...
+    # Subtest: builds a wrapper that runs the command with window style 0 (hidden)
+    ok 2 - builds a wrapper that runs the command with window style 0 (hidden)
+      ---
+      duration_ms: 0.309647
+      type: 'test'
+      ...
+    # Subtest: escapes VBScript double quotes by doubling them
+    ok 3 - escapes VBScript double quotes by doubling them
+      ---
+      duration_ms: 0.183406
+      type: 'test'
+      ...
+    # Subtest: sets the working directory when asked, and omits the line otherwise
+    ok 4 - sets the working directory when asked, and omits the line otherwise
+      ---
+      duration_ms: 0.134413
+      type: 'test'
+      ...
+    # Subtest: parses the CLI flags and refuses incomplete or unknown input
+    ok 5 - parses the CLI flags and refuses incomplete or unknown input
+      ---
+      duration_ms: 0.410759
+      type: 'test'
+      ...
+    1..5
+ok 49 - windows hidden background tasks (v1.6.5)
+  ---
+  duration_ms: 3.640956
+  type: 'suite'
+  ...
+1..49
+# tests 189
+# suites 40
+# pass 186
+# fail 1
+# cancelled 0
+# skipped 2
+# todo 0
+# duration_ms 82606.333651
