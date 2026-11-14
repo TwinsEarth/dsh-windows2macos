@@ -424,6 +424,8 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
           sidebarText:(side?.textContent??'').trim(),
           gpwAiSection:document.querySelector('.w2mAiPanel')!==null,
           historyButton:document.querySelector('.w2mHistBtn')!==null,
+          targetButton:document.querySelector('.w2mTarget_trigger')!==null,
+          chatButton:document.querySelector('.w2mChat_trigger')!==null,
           queueTone:qbadge?.getAttribute('data-tone')??null,
           queueBottomGap:qr===null?null:Math.round(innerHeight-qr.bottom),
           queueRightGap:qr===null?null:Math.round(innerWidth-qr.right),
@@ -454,7 +456,7 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
       await new Promise((resolve) => setTimeout(resolve, 500));
       const historyWindow = await read(`
         const win=document.querySelector('.w2mHistWindow');
-        return {open:win!==null, title:(win?.querySelector('.w2mHistTitle')?.textContent??null), hint:(win?.querySelector('.w2mHistHint')?.textContent??null), rows:win===null?0:win.querySelectorAll('.w2mHistItem').length};
+        return {open:win!==null, title:(win?.querySelector('.w2mHistTitle')?.textContent??null), hint:(win?.querySelector('.w2mHistHint')?.textContent??null), rows:win===null?0:win.querySelectorAll('.w2mHistItem').length, wrapped:win!==null&&win.parentElement?.classList.contains('w2mHistWrap')===true, position:win===null?null:getComputedStyle(win).position};
       `);
       const historyCloseClicked = await read(`const b=document.querySelector('.w2mHistClose'); if(b===null)return{clicked:false}; b.click(); return{clicked:true};`);
       await new Promise((resolve) => setTimeout(resolve, 400));

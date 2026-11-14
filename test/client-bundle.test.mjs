@@ -921,16 +921,19 @@ it('the queue journal shows session titles and never session ids (v3.2.10)', () 
   assert.ok(source.includes('jqHasContent'), 'records without a draft and without queued messages are filtered out');
 });
 
-it('v3.3.0: the composer has one history button and the window shows only human inputs', () => {
+it('v3.3.2: the history window is anchored in the composer and the original controls are restored', () => {
   const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
-  assert.ok(source.includes("id: 'w2m-history'"), 'the single composer entry is the history button');
-  assert.equal(source.includes("id: 'w2m-gpw-prompt'"), false, 'the inline GPW prompt entry is gone');
-  assert.ok(source.includes("'.w2mTarget_trigger{display:none!important}'"), 'the legacy target control stays mounted for probes but is hidden');
-  assert.ok(source.includes("'.w2mCap_trigger{display:none!important}'"), 'the capability switch is hidden');
-  assert.ok(source.includes("'.w2mJqDockChip{display:none!important}'"), 'the queue dock chip is hidden');
-  assert.ok(source.includes('function HistoryPanel('), 'the history window component exists');
-  assert.ok(source.includes("event.type !== 'user/message'"), 'only human user messages are collected');
-  assert.ok(source.includes('pendingSubmissions'), 'pending human submissions are included');
+  assert.ok(source.includes("id: 'w2m-history'"), 'the history button is the composer entry');
+  assert.equal(source.includes("id: 'w2m-gpw-prompt'"), false, 'the old inline prompt entry stays retired');
+  assert.equal(source.includes("'.w2mTarget_trigger{display:none"), false, 'the 全部机器 target control is visible again');
+  assert.equal(source.includes("'.w2mCap_trigger{display:none"), false, 'the execution capability switch is visible again');
+  assert.ok(source.includes("'.w2mJqDockChip{display:none!important}'"), 'the bottom queue dock chip stays hidden');
+  assert.ok(source.includes('w2mHistWrap'), 'the history window is wrapped next to the history button');
+  assert.ok(source.includes("'.w2mHistWindow{position:absolute"), 'the window is anchored above the composer, not fixed to the page bottom');
+  assert.equal(source.split('}, FleetChat));').length - 1, 2, 'the fleet-chat composer panel and view tab are both back');
+  assert.ok(source.includes('w2mChat_shotButton'), 'the restored fleet-chat panel is the v2.2.6 module');
+  assert.ok(source.includes('全部机器'), 'the 全部机器 label is back');
+  assert.ok(source.includes('pendingSubmissions'), 'the history window still lists pending human submissions');
   assert.ok(source.includes('writeComposer(text)'), 'clicking an entry fills the composer');
   assert.ok(source.includes('仅人类输入'), 'the window states it shows human input only');
 });

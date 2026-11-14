@@ -1,0 +1,41 @@
+{
+  "version": "3.3.2",
+  "case": "RELEASE-3320",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-14T15:47:34.760Z",
+  "executor": "lead",
+  "task_id": "pre-release-3320",
+  "requirement": "v3.3.2: the 历史对话 window must live in the input box only (not pinned at the page bottom); and the v2.2.6 original modules/buttons (全部机器 target selector, 编队聊天 fleet-chat panel, execution capability, etc.) lost after v3.0.0 must be restored",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/client-bundle.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/loader-entry.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/gpw-ai.test.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "history_anchored": "the history button and window are wrapped in .w2mHistWrap inside the composer slot; the window is position:absolute with bottom:calc(100% + 8px) so it opens above the input row instead of being fixed to the page bottom",
+      "queue_dock_removed": "the composer.dock JournalDock component renders nothing; saving listeners remain; the queue history/draft restore paths stay available in the history window, the operation panel and the queue drawer",
+      "restored_modules": "the 全部机器 target selector, the execution-capability switch and the 编队聊天 composer panel are visible in the composer row again (their v3.3.0 CSS hiding and null-component swaps were reverted); the fleet-chat view tab, GPW launcher, floating badges and status bar stay",
+      "proof": "client-bundle 40/40 (anchored window, restored controls, fleet-chat registered twice, 全部机器 label, queue chip hidden), real Chromium loader-entry 10/10 (window wrapped+absolute, target button visible, fleet-chat button visible, operation-panel tabs), gpw-ai 10/10, claims/layer-model green, eslint 0 errors"
+    }
+  }
+}

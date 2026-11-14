@@ -4,6 +4,19 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [3.3.2] - 2026-11-14
+
+- **历史对话只挂在输入框上方**：窗口改为 composer 内的绝对定位（`.w2mHistWrap` + `position:absolute`），
+  不再固定在页面右下/底部；Esc/关闭按钮照常收起。
+- **队列日志的底部 dock 不再渲染**：截图里「历史 10 + 恢复」那一列（conversation.composer.dock 的 JournalDock）
+  已隐藏，草稿保存/恢复能力仍保留在历史对话窗口、操作面板「消息与草稿」页与队列日志抽屉里。
+- **找回 v2.2.6 的原始模块/功能/按钮**：
+  「全部机器」目标选择控件、执行能力开关、编队聊天面板重新显示在输入框行（v3.3.0 曾把它们隐藏）；
+  「编队群组」视图页签、GPW 浮标、右下角浮标与底部状态栏保持。
+- 验证：`client-bundle 40/40`（历史窗口锚定/原控件恢复/编队聊天两处注册/全部机器标签/队列 dock 隐藏），
+  真实 Chromium `loader-entry 10/10`（历史窗口 wrapped+absolute、全部机器按钮可见、编队聊天按钮可见、
+  操作面板四页签），`gpw-ai 10/10`、`claims`/`layer-model` 绿、`eslint 0 errors`。
+
 ## [3.3.1] - 2026-11-14
 
 - **修复 GPW 智能分级 `unparseable-classification`**：解析器现在接受中文键（危险等级/建议/理由）、数字等级（1-4）、
