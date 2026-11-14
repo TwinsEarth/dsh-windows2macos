@@ -384,7 +384,8 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
           return null;
         })()
       `);
-      report.parityProbe = { ingest, openInbox, batch, keyboard, clickedBatch, afterBatch, relay };
+      const rightTab = parseP(await evaluate(`JSON.stringify({ marker: document.body?.dataset?.w2mDecisionRightTab ?? null })`));
+      report.parityProbe = { ingest, openInbox, batch, keyboard, clickedBatch, afterBatch, relay, rightTab };
     }
     socket.close();
     return report;

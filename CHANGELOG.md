@@ -18,8 +18,9 @@ All notable changes to this project are documented here.
     红色/阻塞票按宿主红线拒绝批量（按钮置灰并提示“必须逐条处理”），批量结果如实显示成功数与未处理原因；
   - **分叉聚合 / 生产者面板**：抽屉底部可展开，展示 `/forks` 聚合与 `/producers` 目录；宿主不提供时如实说明；
   - **会话筛选**：抽屉顶部显示“只看会话：xxx”并可一键清除。
-  - 右侧 `sidebar.right.pane.tab` 页签仍暂缓：宿主要求先向 `sidebarRightTabs` 注册 tab 类型再挂 slot，
-    为避免再次引入客户端稳定性问题，本轮未接线（功能已由浮标/侧栏/抽屉覆盖）。
+  - **右侧栏页签（sidebar.right.pane.tab）**：按宿主契约先向 `sidebarRightTabs` 注册 tab 类型
+    （`w2m-decision-inbox`，地址 `dsh-resource://w2m-decision-inbox/**`），再挂页签主体；页签里是收件箱紧凑列表
+    与「打开抽屉」按钮。该服务可选：没有 `sidebarRightTabs` 的宿主上注册不执行、其它入口不受影响。
 - **严重修复（v3.2.1 回归）**：决策收件箱与队列日志的遮罩层/抽屉用了 `hidden` 属性切换，但样式表里
   `.w2mDcOverlay{display:flex}` 是作者规则、`[hidden]{display:none}` 只是 UA 规则，作者规则获胜 ——
   遮罩层永远铺满全屏并吞掉点击，点关闭只改状态不改显示，表现为「整个客户端被弹窗锁死、点哪都没反应、

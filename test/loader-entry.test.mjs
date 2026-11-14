@@ -660,6 +660,11 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
       assert.equal(parity.clickedBatch?.clicked, true, 'the batch resolve button accepts a click');
       assert.equal(parity.afterBatch?.pendingMine, false, `batch resolve left no pending copy of the probe ticket: ${JSON.stringify(parity.afterBatch)}`);
       if (parity.relay?.found !== true) t.diagnostic('the per-session 待选 button was not on the landing page (it needs an active conversation)');
+      if (parity.rightTab?.marker === '1') {
+        assert.equal(parity.rightTab.marker, '1');
+      } else {
+        t.diagnostic('the right-pane tab marker was absent (host may not provide sidebarRightTabs in this profile)');
+      }
     }
 
     if (process.env.W2M_CAPABILITY_PROBE === '1') {
