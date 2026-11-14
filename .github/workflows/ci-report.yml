@@ -1,0 +1,34 @@
+﻿name: ci-report
+on:
+  push:
+    branches:
+      - release/2.2.2
+permissions:
+  contents: write
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install --no-audit --no-fund --ignore-scripts
+      - run: node scripts/pack.mjs --out dist
+      - name: run the declared suite, keep the failure lines
+        run: |
+          set +e
+          npm test > "$RUNNER_TEMP/test.log" 2>&1
+          code=$?
+          echo "exit_code=$code" > ci-report.txt
+          grep -E '✖|not ok|failing tests|^ℹ fail' "$RUNNER_TEMP/test.log" | head -n 60 >> ci-report.txt
+          tail -n 20 "$RUNNER_TEMP/test.log" >> ci-report.txt
+          exit 0
+      - name: publish the report branch
+        run: |
+          git config user.email "ci@w2m.local"
+          git config user.name "w2m-ci"
+          git checkout -B ci-report
+          git add -f ci-report.txt
+          git commit -m "ci report"
+          git push --force origin ci-report
