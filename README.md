@@ -11,8 +11,8 @@ English | [中文说明](#中文说明)
 > ## ⚠️ 已弃用版本：3.0.0 / 3.1.0 / 3.2.0
 >
 > 这三个版本有重大缺陷（决策中心客户端 UI 不完整/缺失；3.2.1 预览构建还存在弹窗遮罩锁死客户端的问题），
-> **请勿下载、安装或使用**，npm 上已对 `@twinsearth/w2m-dsh-plugin@>=3.0.0 <3.2.10` 设置 deprecate 警告。
-> 请安装 **3.2.10 或更高版本**。
+> **请勿下载、安装或使用**，npm 上已对 `@twinsearth/w2m-dsh-plugin@>=3.0.0 <3.3.0` 设置 deprecate 警告。
+> 请安装 **3.3.0 或更高版本**。
 
 ## W2M是一个开源（MIT）的 AI 智能体舰队编排工具
 ————用同一个 DeepSeek 、豆包、WorkBuddy账号把"你自己的多台机器"（Windows/Mac）编成一个舰队，统一派发命令、协作&协同开发。
@@ -99,7 +99,7 @@ w2m-mcp --help
 # 复制进你自己的 codex/mcp-servers.toml
 [mcp_servers.w2m]
 command = "npx"
-args = ["-y", "@twinsearth/w2m-dsh-plugin@3.2.10", "w2m-mcp"]
+args = ["-y", "@twinsearth/w2m-dsh-plugin@3.3.0", "w2m-mcp"]
 ```
 
 ### 5. 验证过的 release tarball（离线）

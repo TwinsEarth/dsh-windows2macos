@@ -920,3 +920,17 @@ it('the queue journal shows session titles and never session ids (v3.2.10)', () 
   assert.ok(source.includes('未知会话'), 'an unknown session shows 未知会话 instead of an id');
   assert.ok(source.includes('jqHasContent'), 'records without a draft and without queued messages are filtered out');
 });
+
+it('v3.3.0: the composer has one history button and the window shows only human inputs', () => {
+  const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
+  assert.ok(source.includes("id: 'w2m-history'"), 'the single composer entry is the history button');
+  assert.equal(source.includes("id: 'w2m-gpw-prompt'"), false, 'the inline GPW prompt entry is gone');
+  assert.ok(source.includes("'.w2mTarget_trigger{display:none!important}'"), 'the legacy target control stays mounted for probes but is hidden');
+  assert.ok(source.includes("'.w2mCap_trigger{display:none!important}'"), 'the capability switch is hidden');
+  assert.ok(source.includes("'.w2mJqDockChip{display:none!important}'"), 'the queue dock chip is hidden');
+  assert.ok(source.includes('function HistoryPanel('), 'the history window component exists');
+  assert.ok(source.includes("event.type !== 'user/message'"), 'only human user messages are collected');
+  assert.ok(source.includes('pendingSubmissions'), 'pending human submissions are included');
+  assert.ok(source.includes('writeComposer(text)'), 'clicking an entry fills the composer');
+  assert.ok(source.includes('仅人类输入'), 'the window states it shows human input only');
+});

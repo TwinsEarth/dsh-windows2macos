@@ -423,6 +423,7 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
           bodyOverflow:bodyEl===null?null:getComputedStyle(bodyEl).overflowY,
           sidebarText:(side?.textContent??'').trim(),
           gpwAiSection:document.querySelector('.w2mGpwAi')!==null,
+          historyButton:document.querySelector('.w2mHistBtn')!==null,
           queueTone:qbadge?.getAttribute('data-tone')??null,
           queueBottomGap:qr===null?null:Math.round(innerHeight-qr.bottom),
           queueRightGap:qr===null?null:Math.round(innerWidth-qr.right),
@@ -449,6 +450,16 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
         })()
       `));
       report.jq626 = { jq626, sessionsApi };
+      const historyOpened = await read(`const b=document.querySelector('.w2mHistBtn'); if(b===null)return{found:false}; b.click(); return{found:true};`);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      const historyWindow = await read(`
+        const win=document.querySelector('.w2mHistWindow');
+        return {open:win!==null, title:(win?.querySelector('.w2mHistTitle')?.textContent??null), hint:(win?.querySelector('.w2mHistHint')?.textContent??null), rows:win===null?0:win.querySelectorAll('.w2mHistItem').length};
+      `);
+      const historyCloseClicked = await read(`const b=document.querySelector('.w2mHistClose'); if(b===null)return{clicked:false}; b.click(); return{clicked:true};`);
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      const historyClosed = await read(`return {closed:document.querySelector('.w2mHistWindow')===null};`);
+      report.historyProbe = { historyOpened, historyWindow, historyCloseClicked, historyClosed };
       const qGeom = await read(`const d=document.querySelector('.w2mJqDrawer'); const b=document.querySelector('.w2mJqDrawer .w2mDcBody'); const r=d===null?null:d.getBoundingClientRect(); return {open:d!==null&&d.style.display!=='none', height:r===null?null:Math.round(r.height), bottomGap:r===null?null:Math.round(innerHeight-r.bottom), rightGap:r===null?null:Math.round(innerWidth-r.right), overflow:b===null?null:getComputedStyle(b).overflowY, viewportH:innerHeight};`);
       await read(`const b=[...document.querySelectorAll('.w2mJqDrawer .w2mDcBtn')].find((x)=>x.textContent==='关闭'); if(b!==undefined)b.click(); return{closed:true};`);
       report.ui324 = { ui324, qOpened, qGeom };

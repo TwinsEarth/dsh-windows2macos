@@ -691,6 +691,13 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
       assert.equal(jq.clearAll, true, 'the queue journal drawer has 清空全部');
       assert.equal(jq.noSessionIdLabel, true, 'the queue journal drawer never renders a Session ID');
       assert.equal(jq.noRawSessionKey, true, 'the queue journal drawer never renders a raw session key');
+      assert.equal(ui.historyButton, true, 'the composer carries the single history button');
+      const history = page.historyProbe ?? {};
+      assert.equal(history.historyOpened?.found, true, 'the history button exists in the real page');
+      assert.equal(history.historyWindow?.open, true, 'clicking the history button expands its window');
+      assert.equal(history.historyWindow?.title, '历史对话');
+      assert.equal(history.historyWindow?.hint, '仅人类输入');
+      assert.equal(history.historyClosed?.closed, true, 'the window closes again');
       assert.equal(page.jq626?.sessionsApi?.ok, true, `the sessions route answers: ${JSON.stringify(page.jq626?.sessionsApi)}`);
       const gpwClose = page.gpwClose ?? {};
       assert.equal(gpwClose.gpwOpen?.open, true, 'the GPW floating panel opens from its launcher for the close checks');
