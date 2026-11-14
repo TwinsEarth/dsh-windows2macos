@@ -934,3 +934,22 @@ it('v3.3.0: the composer has one history button and the window shows only human 
   assert.ok(source.includes('writeComposer(text)'), 'clicking an entry fills the composer');
   assert.ok(source.includes('仅人类输入'), 'the window states it shows human input only');
 });
+
+it('v3.3.1: the sidebar opens an operation panel with the four sections', () => {
+  const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
+  assert.ok(source.includes('function W2mOpsPanel('), 'the operation panel exists');
+  assert.ok(source.includes("['approvals', '智能分级&审批']"), 'approvals tab');
+  assert.ok(source.includes("['queue', '消息与草稿']"), 'queue tab');
+  assert.ok(source.includes("['decisions', '决策中心']"), 'decision tab');
+  assert.ok(source.includes("['actions', '操作入口']"), 'actions tab');
+  assert.ok(source.includes('function OpsQueueSection('), 'queue section');
+  assert.ok(source.includes('function OpsDecisionSection('), 'decision section');
+  assert.ok(source.includes('function OpsApprovalSection('), 'approval section');
+  assert.ok(source.includes('function OpsActionsSection('), 'actions section');
+  assert.ok(source.includes('function GpwAiSettings('), 'the AI settings component');
+  assert.ok(source.includes('w2mAiChip'), 'the AI status chip');
+  assert.ok(source.includes('模型原始返回'), 'a failed test shows the model raw reply');
+  assert.ok(source.includes('测试中…'), 'the test button shows progress');
+  assert.ok(source.includes('function GpwAiSettings(') && source.includes('w2mAiFeedback'), 'feedback is coloured');
+  assert.ok(source.includes('w2mOpsPanel .w2mTarget_trigger'), 'the embedded target control is visible inside the ops panel');
+});

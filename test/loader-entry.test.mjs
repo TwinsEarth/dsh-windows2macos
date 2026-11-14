@@ -705,6 +705,16 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
       assert.equal(gpwClose.outsideClosed?.closed, true, 'clicking outside the GPW panel closes it');
       assert.equal(gpwClose.reopened?.open, true, 'the GPW panel reopens for the Escape check');
       assert.equal(gpwClose.escClosed?.closed, true, 'Escape closes the GPW panel');
+      const ops = page.opsProbe ?? {};
+      assert.equal(ops.opsOpened?.found, true, 'the sidebar operation-panel button exists');
+      assert.equal(ops.opsPanel?.open, true, 'clicking the sidebar button opens the operation panel');
+      for (const label of ['智能分级&审批', '消息与草稿', '决策中心', '操作入口']) {
+        assert.ok(Array.isArray(ops.opsPanel?.tabs) && ops.opsPanel.tabs.some((tab) => String(tab).includes(label)), `the operation panel has the ${label} tab`);
+      }
+      assert.equal(ops.opsQueueTab?.clicked, true, 'the queue tab is clickable');
+      assert.equal(ops.opsQueueSection?.section, true, 'the queue section renders');
+      assert.equal(ops.opsQueueSection?.openButton, true, 'the queue section offers opening the queue window');
+      assert.equal(ops.opsGone?.closed, true, 'the operation-panel overlay closes again');
       if (parity.rightTab?.marker === '1') {
         assert.equal(parity.rightTab.marker, '1');
       } else {

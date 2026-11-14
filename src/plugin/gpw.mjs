@@ -997,7 +997,7 @@ export function apply(ctx, config = {}) {
         if (config === null) return json({ ok: false, error: 'ai-not-configured' }, 400);
         const started = Date.now();
         const out = await classifyPendingWithAi({ config, tool: 'write_file', paths: ['<连接测试>'], reason: '这是 GPW 智能分级的连通性测试', mode: 'advanced' });
-        if (!out.ok) return json({ ok: false, error: out.reason, elapsed_ms: Date.now() - started }, 400);
+        if (!out.ok) return json({ ok: false, error: out.reason, raw: out.raw ?? null, elapsed_ms: Date.now() - started }, 400);
         return json({ ok: true, level: out.level, action: out.action, reason: out.reason, model: out.model, elapsed_ms: Date.now() - started, ...aiStatus() });
       },
     });

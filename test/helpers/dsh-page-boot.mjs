@@ -422,7 +422,7 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
           drawerRightGap:dr===null?null:Math.round(innerWidth-dr.right),
           bodyOverflow:bodyEl===null?null:getComputedStyle(bodyEl).overflowY,
           sidebarText:(side?.textContent??'').trim(),
-          gpwAiSection:document.querySelector('.w2mGpwAi')!==null,
+          gpwAiSection:document.querySelector('.w2mAiPanel')!==null,
           historyButton:document.querySelector('.w2mHistBtn')!==null,
           queueTone:qbadge?.getAttribute('data-tone')??null,
           queueBottomGap:qr===null?null:Math.round(innerHeight-qr.bottom),
@@ -478,6 +478,16 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
       await new Promise((resolve) => setTimeout(resolve, 400));
       const escClosed = await read(`return {closed:document.querySelector('.w2mGpw_card')===null};`);
       report.gpwClose = { ensureClosed, gpwOpen, outsideClick, outsideClosed, reopened, escClosed };
+      const opsOpened = await read(`const b=document.querySelector('.w2mGpw_sideEntry'); if(b===null)return{found:false}; b.click(); return{found:true};`);
+      await new Promise((resolve) => setTimeout(resolve, 800));
+      const opsPanel = await read(`const p=document.querySelector('.w2mOpsPanel'); return {open:p!==null, tabs:[...document.querySelectorAll('.w2mOpsTab')].map((x)=>x.textContent), active:(document.querySelector('.w2mOpsTab[data-active=true]')?.textContent??null)};`);
+      const opsQueueTab = await read(`const tabs=[...document.querySelectorAll('.w2mOpsTab')]; const q=tabs.find((x)=>x.textContent.includes('消息与草稿')); if(q===undefined)return{clicked:false}; q.click(); return{clicked:true};`);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      const opsQueueSection = await read(`return {section:document.querySelector('.w2mOpsSection')!==null, openButton:[...document.querySelectorAll('.w2mOpsBtn')].some((b)=>b.textContent.includes('打开队列日志'))};`);
+      const opsClosed = await read(`const b=document.querySelector('.w2mGpw_fullPage .w2mGpw_close'); if(b===null)return{closed:false}; b.click(); return{clicked:true};`);
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      const opsGone = await read(`return {closed:document.querySelector('.w2mGpw_fullPage')===null};`);
+      report.opsProbe = { opsOpened, opsPanel, opsQueueTab, opsQueueSection, opsClosed, opsGone };
       await evaluate(`
         (async () => {
           const r = await fetch('/api/w2m/decisions?includeArchived=1');

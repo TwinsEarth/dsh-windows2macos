@@ -43,28 +43,48 @@ test('gpw ai: rule colours map to levels with a yellow fallback', () => {
   assert.equal(levelOfColor(null), 'yellow');
 });
 
-test('gpw ai: reply parsing accepts fenced and noisy JSON and rejects garbage', () => {
-  assert.deepEqual(
-    parseClassifyReply('{"level":"red","action":"deny","reason":"写到系统目录"}'),
-    { level: 'red', action: 'deny', reason: '写到系统目录' },
-  );
-  assert.deepEqual(
-    parseClassifyReply('```json\n{"level":"green","action":"allow","reason":"只读"}\n```'),
-    { level: 'green', action: 'allow', reason: '只读' },
-  );
-  assert.deepEqual(
-    parseClassifyReply('判定如下：{"level":"blue","action":"allow","reason":"常规写入"} 以上'),
-    { level: 'blue', action: 'allow', reason: '常规写入' },
-  );
-  assert.equal(parseClassifyReply('not json'), null);
-  assert.equal(parseClassifyReply('{"level":"purple"}'), null);
+test('gpw ai: reply parsing accepts JSON, fenced/noisy JSON, Chinese keys, numbers and prose', () => {
+  assert.deepEqual(parseClassifyReply('{"level":"red","action":"deny","reason":"写到系统目录"}'), { level: 'red', action: 'deny', reason: '写到系统目录' });
+  assert.deepEqual(parseClassifyReply('```json\n{"level":"green","action":"allow","reason":"只读"}\n```'), { level: 'green', action: 'allow', reason: '只读' });
+  assert.deepEqual(parseClassifyReply('判定如下：{"level":"blue","action":"allow","reason":"常规写入"} 以上'), { level: 'blue', action: 'allow', reason: '常规写入' });
+  assert.deepEqual(parseClassifyReply('{"危险等级":"中风险","建议":"拒绝","理由":"路径不明确"}'), { level: 'yellow', action: 'deny', reason: '路径不明确' });
+  assert.deepEqual(parseClassifyReply('{"level":4,"action":"block","reason":"系统目录"}'), { level: 'red', action: 'deny', reason: '系统目录' });
+  assert.deepEqual(parseClassifyReply('属于绿色安全操作，允许执行'), { level: 'green', action: 'allow', reason: '属于绿色安全操作，允许执行' });
+  assert.equal(parseClassifyReply('嗯，这个不好说'), null);
   assert.equal(parseClassifyReply(''), null);
-  // 模型偶尔返回散文：关键词兜底仍给出等级/动作（test: prose fallback）
-  assert.deepEqual(parseClassifyReply('该操作属于红色风险，建议拒绝：递归删除不可恢复'), { level: 'red', action: 'deny', reason: '，建议拒绝：递归删除不可恢复' });
-  assert.deepEqual(parseClassifyReply('这是安全的只读操作，允许执行'), { level: 'green', action: 'allow', reason: '这是安全的只读操作，允许执行' });
-  assert.equal(parseClassifyReply('无法判断'), null);
 });
 
+test('gpw ai: an unparseable reply is repaired once before giving up (v3.3.1)', async () => {
+  const calls = [];
+  const fetchImpl = async (_url, init) => {
+    calls.push(JSON.parse(init.body));
+    const content = calls.length === 1 ? '嗯，这个不好说' : '{"level":"yellow","action":"allow","reason":"修复后的 JSON"}';
+    return new Response(JSON.stringify({ choices: [{ message: { content } }] }), { status: 200 });
+  };
+  const out = await classifyPendingWithAi({
+    config: { apiKey: 'sk-0123456789abcdef', baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-flash' },
+    tool: 'run_command',
+    reason: '测试修复重试',
+    fetchImpl,
+  });
+  assert.equal(out.ok, true);
+  assert.equal(out.level, 'yellow');
+  assert.equal(out.repaired, true);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].messages.at(-1).role, 'user');
+});
+
+test('gpw ai: a second unparseable reply reports the raw snippet', async () => {
+  const fetchImpl = async () => new Response(JSON.stringify({ choices: [{ message: { content: '完全无法判定的自然语言回答' } }] }), { status: 200 });
+  const out = await classifyPendingWithAi({
+    config: { apiKey: 'sk-0123456789abcdef', baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-flash' },
+    tool: 't',
+    fetchImpl,
+  });
+  assert.equal(out.ok, false);
+  assert.equal(out.reason, 'unparseable-classification');
+  assert.match(out.raw, /完全无法判定/);
+});
 test('gpw ai: config normalization requires a token and accepts the deepseek default', () => {
   assert.equal(normalizeGpwAiConfig({}).ok, false);
   assert.equal(normalizeGpwAiConfig({ apiKey: 'short' }).reason, 'api-key-required');
