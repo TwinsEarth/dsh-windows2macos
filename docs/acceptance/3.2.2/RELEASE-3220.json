@@ -44,8 +44,10 @@
       "id": "the composer dock registration id is w2m-queue-journal so it cannot collide with a simultaneously installed Fang queue-journal plugin",
       "proof": "real Chromium page probe: POST and GET journal routes answer 200, the badge is in the DOM, a click opens the drawer whose title names 队列日志 and whose body contains the draft that was just saved, and the GPW panel contains the queue button; the conversation-scoped dock chip is reported as a diagnostic",
       "suites": "queue-journal 4/4; client-bundle 36/36; loader-entry 10/10 with both probes; claims and layer model green",
-      "remaining": "not yet ported from Fang: drawer keyboard navigation, batch restore, per-session filtering and grouped history snapshots",
-      "overlay_lock": "the overlay and drawer toggle style.display instead of the hidden attribute, a [hidden]{display:none!important} rule backs it up, and the browser probe asserts the closed drawer/overlay compute to display:none and that elementFromPoint at the page centre is not inside the overlay"
+      "remaining": "the right sidebar tab (sidebar.right.pane.tab) is deferred: the host requires registering a tab type through the sidebarRightTabs service before a slot can be attached, and that integration needs its own stability pass; the surfaces it would duplicate are already reachable from the badge, the sidebar entry and the GPW button",
+      "overlay_lock": "the overlay and drawer toggle style.display instead of the hidden attribute, a [hidden]{display:none!important} rule backs it up, and the browser probe asserts the closed drawer/overlay compute to display:none and that elementFromPoint at the page centre is not inside the overlay",
+      "parity": "per-session 待选 floating button driven by a conversation.input.left seat; drawer keyboard nav (arrows/1-9/r/Esc); per-level batch resolve and abandon (red tickets refused by the host rule and greyed out); fork-aggregation and producer side panels opened from the drawer; session filter chip",
+      "parity_proof": "real Chromium probe: two tickets are ingested through /api/w2m/decisions/ingest, the drawer shows batch resolve/abandon and the side panel (opened, text non-empty), ArrowDown moves the selection, clicking batch resolve leaves no pending copy of either probe ticket, and the per-session relay button is reported as a diagnostic because the landing page has no active conversation"
     }
   }
 }

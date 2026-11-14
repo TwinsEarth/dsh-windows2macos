@@ -648,6 +648,18 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
       // dock itself may not be mounted here. Registration into it is covered by the client-bundle
       // suite; this is a diagnostic, not a pass condition.
       if (queue.queueDock?.chip !== true) t.diagnostic('the composer dock chip was not on the boot page (dock is conversation-scoped)');
+      const parity = page.parityProbe ?? {};
+      assert.equal(parity.ingest?.ok, true, `the decision ingest route accepted a probe ticket: ${JSON.stringify(parity.ingest)}`);
+      assert.equal(parity.openInbox?.found, true, 'the inbox badge re-opened the drawer for the parity checks');
+      assert.equal(parity.batch?.open, true, 'the drawer is open for the parity checks');
+      assert.equal(parity.batch?.resolveButton, true, 'a level group with pending tickets shows the batch resolve button');
+      assert.equal(parity.batch?.abandonButton, true, 'a level group with pending tickets shows the batch abandon button');
+      assert.equal(parity.keyboard?.selected, true, 'ArrowDown moves the keyboard selection in the drawer');
+      assert.equal(parity.batch?.sidePanels, true, 'the drawer carries the fork-aggregation/producer side panel');
+      assert.match(String(parity.batch?.sideText ?? ''), /分叉|生产者/u, 'the side panel explains its state instead of staying blank');
+      assert.equal(parity.clickedBatch?.clicked, true, 'the batch resolve button accepts a click');
+      assert.equal(parity.afterBatch?.pendingMine, false, `batch resolve left no pending copy of the probe ticket: ${JSON.stringify(parity.afterBatch)}`);
+      if (parity.relay?.found !== true) t.diagnostic('the per-session 待选 button was not on the landing page (it needs an active conversation)');
     }
 
     if (process.env.W2M_CAPABILITY_PROBE === '1') {

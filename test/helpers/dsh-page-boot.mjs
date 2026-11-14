@@ -341,6 +341,50 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
       const queueDock = await read(`return {chip:document.querySelector('.w2mJqDockChip')!==null, dock:document.querySelector('[data-fang-entry="queue-journal"]')!==null};`);
       await evaluate(`fetch('/api/w2m/composer/journal', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ key: 'probe-ui', draft: '', queue: [] }) })`);
       report.queueProbe = { postJournal, listApi, queueBadge, queueOpened, queueDrawer, queueGpw, queueDock };
+      const parseP = (value) => (typeof value === 'string' ? JSON.parse(value) : value);
+      const ingest = parseP(await evaluate(`
+        (async () => {
+          const ids = [];
+          let ok = true;
+          for (const title of ['probe-batch-1', 'probe-batch-2']) {
+            const r = await fetch('/api/w2m/decisions/ingest', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ producer: 'probe', level: 'blue', title, context: 'parity probe', options: [{ value: 'ok', label: 'OK' }] }) });
+            const b = await r.json().catch(() => null);
+            if (b?.ok === true) ids.push(b?.ticket?.id ?? null); else ok = false;
+          }
+          return JSON.stringify({ ok, ids });
+        })()
+      `));
+      const openInbox = await read(`const b=document.querySelector('.w2mDcBadge'); if(b===null)return{found:false}; b.click(); return{found:true};`);
+      await new Promise((resolve) => setTimeout(resolve, 900));
+      const batch = await read(`
+        const d=document.querySelector('.w2mDcDrawer');
+        const sp=document.querySelector('.w2mDcSidePanels'); if(sp!==null) sp.open=true;
+        return {open:d!==null&&d.style.display!=='none', resolveButton:document.querySelector('.w2mDcBatchResolve')!==null, abandonButton:document.querySelector('.w2mDcBatchAbandon')!==null, sidePanels:sp!==null, sideText:(document.querySelector('.w2mDcSideBody')?.innerText ?? '').slice(0,200)};
+      `);
+      const keyboard = await read(`document.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true })); return {selected:document.querySelector('.w2mDcSelected')!==null};`);
+      const clickedBatch = await read(`const b=document.querySelector('.w2mDcBatchResolve'); if(b===null)return{clicked:false}; b.click(); return{clicked:true};`);
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+      const afterBatch = parseP(await evaluate(`
+        (async () => {
+          const r = await fetch('/api/w2m/decisions?includeArchived=1');
+          const b = await r.json().catch(() => null);
+          const items = Array.isArray(b?.items) ? b.items : [];
+          const mine = items.find((item) => String(item?.title ?? '').startsWith('probe-batch')) ?? null;
+          return JSON.stringify({ found: mine !== null, status: mine?.status ?? null, pendingMine: items.some((item) => String(item?.title ?? '').startsWith('probe-batch') && (item?.status === 'pending' || item?.status === undefined)) });
+        })()
+      `));
+      const relay = await read(`const b=document.querySelector('.w2mDcRelayBtn'); return {found:b!==null, display:b===null?null:getComputedStyle(b).display};`);
+      await evaluate(`
+        (async () => {
+          const r = await fetch('/api/w2m/decisions?includeArchived=1');
+          const b = await r.json().catch(() => null);
+          const ids = (Array.isArray(b?.items) ? b.items : []).filter((item) => String(item?.title ?? '').startsWith('probe-batch') && (item?.status === 'pending' || item?.status === undefined)).map((item) => item.id);
+          if (ids.length > 0) await fetch('/api/w2m/decisions/abandon', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ids }) });
+          const close = document.querySelector('.w2mDcDrawer .w2mDcBtn');
+          return null;
+        })()
+      `);
+      report.parityProbe = { ingest, openInbox, batch, keyboard, clickedBatch, afterBatch, relay };
     }
     socket.close();
     return report;

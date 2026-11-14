@@ -348,8 +348,8 @@ describe('client bundle: the activation contract', () => {
       () => exports.apply(ctx),
       'an undeclared service read throws in Cordis and takes the whole app down; the bundle must read only what it declares',
     );
-    assert.deepEqual(registry.announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, 'conversation.composer.dock', 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', 'sidebar.panellist', 'main', 'sidebar.panellist'], 'the entry still has to take its seat');
-    assert.equal(registry.registered.length, 18);
+    assert.deepEqual(registry.announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, 'conversation.composer.dock', 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', 'sidebar.panellist', 'main', 'sidebar.panellist', 'conversation.input.left'], 'the entry still has to take its seat');
+    assert.equal(registry.registered.length, 19);
     assert.equal(locale.registered.has('w2m.target'), true, 'the dictionaries go to the locale service when there is one');
   });
 
@@ -453,8 +453,8 @@ describe('client bundle: the seat it registers into', () => {
 
   it('announces and registers all five composer controls plus the sidebar and update sections into conversation.input.left', () => {
     const { announced, registered } = applyTo();
-    assert.deepEqual(announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, 'conversation.composer.dock', 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', 'sidebar.panellist', 'main', 'sidebar.panellist']);
-    assert.equal(registered.length, 18);
+    assert.deepEqual(announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, 'conversation.composer.dock', 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', 'sidebar.panellist', 'main', 'sidebar.panellist', 'conversation.input.left']);
+    assert.equal(registered.length, 19);
     assert.equal(registered[0].options.name, SEAT);
   });
 
@@ -502,7 +502,7 @@ describe('client bundle: the seat it registers into', () => {
     };
     const { exports } = loadBundle();
     assert.doesNotThrow(() => exports.apply(ctx));
-    assert.equal(registered.length, 18);
+    assert.equal(registered.length, 19);
   });
 });
 
