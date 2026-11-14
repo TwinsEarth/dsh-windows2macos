@@ -340,7 +340,9 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
       const queueGpw = await read(`return {button:document.querySelector('.w2mJqGpwBtn')!==null};`);
       const queueDock = await read(`return {chip:document.querySelector('.w2mJqDockChip')!==null, dock:document.querySelector('[data-fang-entry="queue-journal"]')!==null};`);
       await evaluate(`fetch('/api/w2m/composer/journal', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ key: 'probe-ui', draft: '', queue: [] }) })`);
-      report.queueProbe = { postJournal, listApi, queueBadge, queueOpened, queueDrawer, queueGpw, queueDock };
+      const queueClosed = await read(`const b=[...document.querySelectorAll('.w2mJqDrawer .w2mDcBtn')].find((x)=>x.textContent==='关闭'); if(b===undefined)return{closed:false}; b.click(); return{closed:true};`);
+      await new Promise((resolve) => setTimeout(resolve, 350));
+      report.queueProbe = { postJournal, listApi, queueBadge, queueOpened, queueDrawer, queueGpw, queueDock, queueClosed };
       const parseP = (value) => (typeof value === 'string' ? JSON.parse(value) : value);
       const ingest = parseP(await evaluate(`
         (async () => {
@@ -359,7 +361,9 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
       const batch = await read(`
         const d=document.querySelector('.w2mDcDrawer');
         const sp=document.querySelector('.w2mDcSidePanels'); if(sp!==null) sp.open=true;
-        return {open:d!==null&&d.style.display!=='none', resolveButton:document.querySelector('.w2mDcBatchResolve')!==null, abandonButton:document.querySelector('.w2mDcBatchAbandon')!==null, sidePanels:sp!==null, sideText:(document.querySelector('.w2mDcSideBody')?.innerText ?? '').slice(0,200)};
+        const badgeEl=document.querySelector('.w2mDcBadge');
+        const sideEl=document.querySelector('.w2mDcSidebarBtn');
+        return {open:d!==null&&d.style.display!=='none', resolveButton:document.querySelector('.w2mDcBatchResolve')!==null, abandonButton:document.querySelector('.w2mDcBatchAbandon')!==null, sidePanels:sp!==null, sideText:(document.querySelector('.w2mDcSideBody')?.innerText ?? '').slice(0,200), badgeTone:badgeEl?.getAttribute('data-tone')??null, badgeText:(badgeEl?.textContent??'').trim(), sidebarText:(sideEl?.textContent??'').trim()};
       `);
       const keyboard = await read(`document.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true })); return {selected:document.querySelector('.w2mDcSelected')!==null};`);
       const clickedBatch = await read(`const b=document.querySelector('.w2mDcBatchResolve'); if(b===null)return{clicked:false}; b.click(); return{clicked:true};`);
@@ -374,6 +378,37 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
         })()
       `));
       const relay = await read(`const b=document.querySelector('.w2mDcRelayBtn'); return {found:b!==null, display:b===null?null:getComputedStyle(b).display};`);
+      const ui324 = await read(`
+        const badge=document.querySelector('.w2mDcBadge');
+        const count=document.querySelector('.w2mDcBadgeCount');
+        const drawer=document.querySelector('.w2mDcDrawer');
+        const bodyEl=document.querySelector('.w2mDcDrawer .w2mDcBody');
+        const side=document.querySelector('.w2mDcSidebarBtn');
+        const qbadge=document.querySelector('.w2mJqBadge');
+        const rect=(el)=>el===null?null:el.getBoundingClientRect();
+        const br=rect(badge), dr=rect(drawer), qr=rect(qbadge);
+        return {
+          badgeText:(badge?.textContent??'').trim(),
+          badgeTone:badge?.getAttribute('data-tone')??null,
+          badgeCount:(count?.textContent??'').trim(),
+          badgeRect:br?{top:Math.round(br.top),left:Math.round(br.left),width:Math.round(br.width),height:Math.round(br.height)}:null,
+          drawerOpen:drawer!==null&&drawer.style.display!=='none',
+          drawerHeight:dr===null?null:Math.round(dr.height),
+          drawerTop:dr===null?null:Math.round(dr.top),
+          drawerRightGap:dr===null?null:Math.round(innerWidth-dr.right),
+          bodyOverflow:bodyEl===null?null:getComputedStyle(bodyEl).overflowY,
+          sidebarText:(side?.textContent??'').trim(),
+          queueTone:qbadge?.getAttribute('data-tone')??null,
+          queueBottomGap:qr===null?null:Math.round(innerHeight-qr.bottom),
+          queueRightGap:qr===null?null:Math.round(innerWidth-qr.right),
+          viewport:{w:innerWidth,h:innerHeight},
+        };
+      `);
+      const qOpened = await read(`const b=document.querySelector('.w2mJqBadge'); if(b===null)return{clicked:false}; b.click(); return{clicked:true};`);
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      const qGeom = await read(`const d=document.querySelector('.w2mJqDrawer'); const b=document.querySelector('.w2mJqDrawer .w2mDcBody'); const r=d===null?null:d.getBoundingClientRect(); return {open:d!==null&&d.style.display!=='none', height:r===null?null:Math.round(r.height), bottomGap:r===null?null:Math.round(innerHeight-r.bottom), rightGap:r===null?null:Math.round(innerWidth-r.right), overflow:b===null?null:getComputedStyle(b).overflowY, viewportH:innerHeight};`);
+      await read(`const b=[...document.querySelectorAll('.w2mJqDrawer .w2mDcBtn')].find((x)=>x.textContent==='关闭'); if(b!==undefined)b.click(); return{closed:true};`);
+      report.ui324 = { ui324, qOpened, qGeom };
       await evaluate(`
         (async () => {
           const r = await fetch('/api/w2m/decisions?includeArchived=1');
