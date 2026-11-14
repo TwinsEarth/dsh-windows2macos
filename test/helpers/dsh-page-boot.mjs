@@ -422,6 +422,7 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
           drawerRightGap:dr===null?null:Math.round(innerWidth-dr.right),
           bodyOverflow:bodyEl===null?null:getComputedStyle(bodyEl).overflowY,
           sidebarText:(side?.textContent??'').trim(),
+          gpwAiSection:document.querySelector('.w2mGpwAi')!==null,
           queueTone:qbadge?.getAttribute('data-tone')??null,
           queueBottomGap:qr===null?null:Math.round(innerHeight-qr.bottom),
           queueRightGap:qr===null?null:Math.round(innerWidth-qr.right),

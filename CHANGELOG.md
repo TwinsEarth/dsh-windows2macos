@@ -4,6 +4,23 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [3.2.7] - 2026-11-14
+
+- **GPW 智能风险分级（操作面板填入大模型 Token）**，按用户要求：
+  - 红：立即暂停并弹窗，必须人工「确认允许/确认拒绝」，不倒计时；
+  - 黄：倒计时 **180 秒**，到点执行 AI 推荐动作（无推荐则放行）；
+  - 蓝：倒计时 **30 秒**，到点执行 AI 推荐动作；
+  - 绿：倒计时 **3 秒**，默认放行；
+  - 没有配置 Token 时保持旧的统一 pending 超时行为，不影响既有安装与测试。
+- 宿主：新增 `src/plugin/gpw-ai.mjs`（提示词、回复解析、四级倒计时、自动动作、配置归一化、模型调用）；
+  `src/plugin/gpw.mjs` 里每张待审批记录携带 `level / ai / countdown_ms / deadline_at`，按等级重排倒计时；
+  AI 失败时安全退回规则颜色，绝不自动放宽。新增 `GET /api/w2m/gpw/ai`、`POST /api/w2m/gpw/ai/config`、
+  `POST /api/w2m/gpw/ai/test`；Token 只存 DPAPI/钥匙串，并默认复用决策中心已配置的同一把 Key。
+- 客户端：GPW 面板新增「AI 智能分级（红/黄/蓝/绿）」设置区（provider/model/baseUrl/Token/保存/测试），
+  待审批条目显示等级、AI 推荐与倒计时；红色待审批会浮出确认弹窗。
+- 验证：`gpw-ai` 8/8（倒计时/自动动作/解析/配置/模型调用失败回退）、GPW 既有套件全绿、
+  `client-bundle` 36/36、真实 Chromium 断言 GPW 面板存在 AI 设置区、`loader-entry` 10/10、`claims` 绿、`eslint 0 errors`。
+
 ## [3.2.6] - 2026-11-14
 
 - **队列日志错乱修复**：旧版 `scanQueue()` 在没有官方 `[data-queue-dock]` 时会扫描任意 class/aria/testid

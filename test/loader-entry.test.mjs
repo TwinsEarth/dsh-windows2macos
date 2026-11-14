@@ -676,6 +676,7 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
       assert.ok(ui.drawerTop > 0, 'the decision drawer is vertically centred, not pinned to the top');
       assert.ok(ui.drawerRightGap >= 0 && ui.drawerRightGap <= 40, 'the decision drawer sits on the right edge');
       assert.equal(ui.bodyOverflow, 'auto', 'the decision drawer body scrolls');
+      assert.equal(ui.gpwAiSection, true, 'the GPW panel carries the AI risk-grading settings section');
       assert.equal(ui.queueTone, 'blue', `one saved journal entry puts the queue badge in the 1-30 blue band: ${JSON.stringify(ui.queueTone)}`);
       assert.ok(ui.queueBottomGap >= 0 && ui.queueBottomGap <= 120, `the queue badge sits at the bottom right, below the GPW launcher: ${JSON.stringify(ui.queueBottomGap)}`);
       assert.ok(ui.queueRightGap >= 0 && ui.queueRightGap <= 40, 'the queue badge hugs the right edge');
