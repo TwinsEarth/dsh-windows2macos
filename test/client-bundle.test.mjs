@@ -1122,3 +1122,12 @@ it('v3.3.10: the target menu folds the web group by default', () => {
   assert.ok(source.includes("cls('groupToggle')"), 'the web toggle exists');
   assert.ok(source.includes('unknownPlatform'), 'a missing platform is shown instead of hidden as online');
 });
+
+it('v3.3.14: the queue drawer splits 人类输入 from a folded 机器生成 block', () => {
+  const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
+  assert.ok(source.includes('w2mJqSectionHead'), 'the drawer renders a section header');
+  assert.ok(source.includes('人类输入 · ') && source.includes('humanEntries.length'), 'human input has its own block count');
+  assert.ok(source.includes("'机器生成 · ' + clientAll.length"), 'machine records have a folded block count');
+  assert.ok(source.includes('const clientAll = store.state.entries.filter((entry) => !isHumanEntry(entry))'), 'machine records are counted before content filtering');
+  assert.ok(source.includes("dcEl('details', { className: 'w2mJqClientFold' })"), 'the machine block is a details element (folded by default)');
+});
