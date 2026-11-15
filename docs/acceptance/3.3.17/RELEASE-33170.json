@@ -1,0 +1,39 @@
+{
+  "version": "3.3.17",
+  "case": "RELEASE-33170",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-15T11:01:42.357Z",
+  "executor": "lead",
+  "task_id": "pre-release-33170",
+  "requirement": "v3.3.17: the 历史对话 panel lists human input newest first, with the current draft pinned above the timestamp order",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/client-bundle.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/claims.test.mjs"
+    ],
+    [
+      "node",
+      "scripts/pack.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "order": "sortHistoryItems keeps the draft first, then sorts items with at > 0 by descending timestamp, and puts undated entries last",
+      "wiring": "HistoryPanel calls setItems(sortHistoryItems(next)) after collecting draft, queue and session-log human messages",
+      "label": "the panel hint says 仅人类输入 · 从新到旧",
+      "proof": "client-bundle 52 pass; claims 47 pass; eslint 0 errors"
+    }
+  }
+}

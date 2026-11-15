@@ -1143,3 +1143,12 @@ it('v3.3.15: the target menu adds a folded offline group after clients and web h
   assert.ok(source.includes("key: '__offlineToggle__'"), 'the offline toggle exists');
   assert.ok(source.includes('setOfflineOpen(false)'), 'offline resets to folded on every open');
 });
+
+it('v3.3.17: the history panel defaults to newest first, with the draft pinned above it', () => {
+  const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
+  assert.ok(source.includes('function sortHistoryItems(items)'), 'one sort helper owns the history order');
+  assert.ok(source.includes('setItems(sortHistoryItems(next))'), 'the loaded list goes through the sorter');
+  assert.ok(source.includes('Number(right.at) - Number(left.at)'), 'timed entries are compared newest to oldest');
+  assert.ok(source.includes("item?.key === 'draft'"), 'the current draft is kept outside the timestamp sort');
+  assert.ok(source.includes('仅人类输入 · 从新到旧'), 'the panel says which order it uses');
+});
