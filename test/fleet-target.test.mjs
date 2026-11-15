@@ -957,6 +957,52 @@ describe('fleet-target: the selection routes w2m_run', () => {
  * assert \`records\` (everything the relay sent) as well as \`machines\` (what is shown), and the third test proves the
  * return requires no bookkeeping at all.
  */
+describe('v3.3.16: stateDir default, unified online and version drift', () => {
+  it('defaults stateDir to DSH_HOME/xclient when the profile omits it', () => {
+    assert.equal(plugin.configuredStateDir({}, { DSH_HOME: 'C:/tmp/dsh-home' }), path.join('C:/tmp/dsh-home', 'xclient'));
+    assert.equal(plugin.configuredStateDir({ stateDir: 'D:/explicit' }, { DSH_HOME: 'C:/tmp/dsh-home' }), path.resolve('D:/explicit'));
+    assert.equal(plugin.configuredStateDir({ stateDir: '   ' }, { DSH_HOME: 'C:/tmp/dsh-home' }), path.join('C:/tmp/dsh-home', 'xclient'));
+  });
+
+  it('summarises fleet plugin versions without inventing a current version', () => {
+    const records = [
+      { machine_id: 'a', machine_name: 'A', caps: { plugin_version: '3.3.16' } },
+      { machine_id: 'b', machine_name: 'B', caps: { plugin_version: '2.2.5' } },
+      { machine_id: 'c', machine_name: 'C', caps: {} },
+    ];
+    const drift = plugin.summarizeFleetVersions(records, '3.3.16');
+    assert.deepEqual(drift.versions, { '3.3.16': 1, '2.2.5': 1 });
+    assert.equal(drift.behind_count, 1);
+    assert.equal(drift.behind[0].name, 'B');
+    assert.equal(plugin.summarizeFleetVersions(records, null).behind_count, 0);
+  });
+
+  it('w2m_devices reports a stale lease as offline, not online', async () => {
+    const body = {
+      protocol_version: 1,
+      rabbit_time: new Date().toISOString(),
+      devices: [
+        { machine_id: 'live-1', machine_name: 'live', online: true, last_seen: new Date().toISOString() },
+        { machine_id: 'silent-1', machine_name: 'silent', online: false, last_seen: new Date(Date.now() - 3_600_000).toISOString() },
+      ],
+    };
+    const fetchStub = installFetch([{ path: '/v1/devices', body }]);
+    try {
+      const { tools } = await register(await runConfig());
+      const live = JSON.parse(await tools.get('w2m_devices').execute({}, {}));
+      assert.deepEqual(live.devices.map((device) => device.name), ['live']);
+      assert.equal(live.devices[0].online, true);
+      assert.equal(live.excluded_stale, 1);
+      const all = JSON.parse(await tools.get('w2m_devices').execute({ include_stale: true }, {}));
+      const silent = all.devices.find((device) => device.name === 'silent');
+      assert.equal(silent.online, false);
+      assert.equal(silent.state, 'offline');
+    } finally {
+      fetchStub.restore();
+    }
+  });
+});
+
 describe('72h archive: hidden from the list, never deleted', () => {
   const DAY = 24 * 60 * 60 * 1000;
   const body = (archivedLastSeen) => ({

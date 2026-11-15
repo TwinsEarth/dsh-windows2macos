@@ -185,6 +185,7 @@ import {
   createLocalIdentity,
   defaultSelectionStore,
   dispatchSelectionFields,
+  isSelectableDevice,
   readFleet,
   registerTargetRoutes,
   sessionKeyFor,
@@ -721,6 +722,40 @@ async function loadDefineTool() {
  *            autoStartAgent: boolean, allowedCommands: string[], pairingCode: string|null,
  *            p2pMode: string, stunServers: string[]}}
  */
+/**
+ * The state directory the plugin must use when the profile does not set one.
+ *
+ * The documented layout is `$DSH_HOME/xclient` (or `~/.dsh/xclient`); the CLI already resolves it
+ * through `resolveStateDir`, but the host plugin used to keep an unset value as null. That silently
+ * disabled the local memory file, the RTT state file and the P2P inbox on every machine whose
+ * profile did not repeat the path. v3.3.16 makes the default explicit and testable.
+ */
+export function configuredStateDir(config = {}, env = process.env) {
+  const explicit = typeof config?.stateDir === 'string' ? config.stateDir.trim() : '';
+  if (explicit !== '') return path.resolve(explicit);
+  const home = typeof env?.DSH_HOME === 'string' && env.DSH_HOME.trim() !== ''
+    ? env.DSH_HOME.trim()
+    : path.join(os.homedir(), '.dsh');
+  return path.join(home, 'xclient');
+}
+
+/**
+ * Fleet version summary for `w2m_devices`: one version map plus the machines that differ from
+ * the running plugin. Pure so the drift rule is testable without a relay or a live fleet.
+ */
+export function summarizeFleetVersions(records, currentVersion = null) {
+  const versions = {};
+  const behind = [];
+  for (const record of Array.isArray(records) ? records : []) {
+    const version = record?.caps?.plugin_version;
+    if (typeof version !== 'string' || version.trim() === '') continue;
+    const key = version.trim();
+    versions[key] = (versions[key] ?? 0) + 1;
+    if (currentVersion !== null && key !== currentVersion) behind.push({ machine_id: record?.machine_id ?? null, name: record?.machine_name ?? record?.name ?? null, version: key });
+  }
+  return { current: currentVersion, versions, behind_count: behind.length, behind };
+}
+
 function readConfig(config = {}) {
   let operatorTokenSource = null;
   const cwd = process.cwd();
@@ -760,16 +795,16 @@ function readConfig(config = {}) {
     rabbitUrlOverride = 'device.rabbit_url';
   }
 
-  const stateDir = typeof config.stateDir === 'string' && config.stateDir.trim() !== ''
-    ? path.resolve(config.stateDir.trim())
-    : null;
+  // v3.3.16: an unset stateDir is the documented default layout, not "no state": without this
+  // fallback every machine without an explicit profile value lost local memory and RTT.
+  const stateDir = configuredStateDir(config);
   /**
    * The settings-page pin. This is the supported alternative to editing `cordis.patch.yml`: the
    * route writes it atomically and the plugin reads it here with higher precedence than the profile
    * fields. A corrupt pin fails startup with the path named rather than silently using the account
    * key and moving the machine.
    */
-  const fleetConfigFile = fleetConfigPathFor(config.stateDir);
+  const fleetConfigFile = fleetConfigPathFor(stateDir);
   const fleetConfigRead = fleetConfigFile === null ? { ok: true, config: null } : readFleetConfig(fleetConfigFile);
   if (fleetConfigRead.ok !== true) {
     throw configError(
@@ -3800,7 +3835,10 @@ export async function apply(ctx, config = {}) {
       // is described by identity and capabilities, and the relay's own `state` is the honest
       // default for a device it still lists.
       const includeStale = args?.include_stale === true;
-      const listed = fleet.records.filter((machine) => includeStale || String(machine?.state ?? 'online') !== 'expired');
+      // v3.3.16: the target control already treats `online` as authoritative; this tool read only
+      // `state`, so a device with online:false and no state was reported "online" here while the
+      // composer listed it as offline (the two-count defect). One predicate now feeds both.
+      const listed = fleet.records.filter((machine) => includeStale || isSelectableDevice(machine));
 
       // The LAN hint layer. `include_discovered` runs one bounded scan; without it the block reports
       // the *last* scan's candidates against this call's roster, so a model that already paid for a
@@ -3833,9 +3871,11 @@ export async function apply(ctx, config = {}) {
             shell: machine?.platform?.shell ?? machine?.shell ?? null,
             caps: machine?.caps ?? null,
             last_seen: machine?.last_seen ?? machine?.last_seen_at ?? null,
-            state: machine?.state ?? 'online',
+            online: isSelectableDevice(machine),
+            state: isSelectableDevice(machine) ? 'online' : (String(machine?.state ?? '') || 'offline'),
           })),
           excluded_stale: includeStale ? 0 : fleet.records.length - listed.length,
+          version_drift: summarizeFleetVersions(fleet.records, resolveCurrentVersion(PLUGIN_VERSION, process.env)),
           discovery: discoveryBlock,
           note:
             'a listed device has paired and is being tracked; it can still refuse the next command ' +
