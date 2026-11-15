@@ -20,6 +20,7 @@
 import { parseArgs } from 'node:util';
 import { pathToFileURL } from 'node:url';
 import { createRelayServer } from '../src/relay/server.mjs';
+import { normalizeClusterConfig } from '../src/relay/cluster-sync.mjs';
 import { resolveStateDir, formatError } from '../src/util/cli.mjs';
 
 const USAGE = `w2m-rabbit — W2M relay (Rabbit)
@@ -72,6 +73,23 @@ Request signing (v0.3.0):
                          this is set without one, rather than silently verifying nothing.
   --signature-skew <s>   Allowed clock difference in seconds. Default 120.
 
+Cluster sync (v3.0.0):
+  --cluster-peers <json> Pull durable state from peer relays, e.g.
+                         [{"id":"node-0123456789abcdef","url":"http://106.53.197.47:8787"}].
+                         Omitted/empty keeps this relay single-node (no cluster routes).
+                         [env W2M_RELAY_PEERS]
+  --cluster-secret <b64> Shared cluster secret (base64, 32 bytes). Required when peers
+                         are configured. Never printed, never logged. [env W2M_RELAY_CLUSTER_SECRET]
+  --cluster-node-id <id> Stable node id (node-<8-32 hex>) used in cursors and peer lists.
+                         Default: generated once into <state>/cluster-node.json.
+                         [env W2M_RELAY_NODE_ID]
+  --cluster-sync-ms <n>  Periodic sync interval. Default 3600000 (1 hour).
+                         [env W2M_RELAY_SYNC_INTERVAL_MS]
+                         Optional source allow-list: [env W2M_RELAY_CLUSTER_ALLOW_IPS=ip1,ip2]
+                         First-sync window override: [env W2M_RELAY_SYNC_BOOT_MIN_MS / MAX_MS]
+                         Snapshot sizing: [env W2M_RELAY_SYNC_CHUNK_BYTES / W2M_RELAY_SYNC_TIMEOUT_MS]
+                         (snapshots are gzipped; chunk bytes is the plaintext ledger chunk cap)
+
 Observability:
   --metrics              Serve GET /metrics in Prometheus text format. Off by default, and
                          token-free like /healthz, so a scraper never needs a credential in
@@ -120,6 +138,11 @@ try {
       'require-signature': { type: 'boolean', default: false },
   metrics: { type: 'boolean', default: false },
       'signature-skew': { type: 'string' },
+      // v3.0.0 relay-to-relay cluster sync.
+      'cluster-peers': { type: 'string' },
+      'cluster-secret': { type: 'string' },
+      'cluster-node-id': { type: 'string' },
+      'cluster-sync-ms': { type: 'string' },
       'no-persist': { type: 'boolean', default: false },
       json: { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h', default: false },
@@ -242,6 +265,50 @@ if (signatureSkewSeconds !== undefined && (!Number.isFinite(signatureSkewSeconds
   fail(`--signature-skew must be a positive number of seconds, got ${JSON.stringify(skewRaw)}`);
 }
 
+/* ---------- v3.0.0 relay cluster sync ---------- */
+
+/**
+ * Cluster sync is opt-in: configured only when peers or a secret are supplied. A relay without it is
+ * byte-for-byte the single-node relay (no `/v1/cluster/*` routes, no scheduler, no extra feature bit),
+ * which keeps the upgrade safe for a host that is not part of a cluster yet.
+ */
+const clusterPeersRaw = values['cluster-peers'] ?? process.env.W2M_RELAY_PEERS;
+const clusterSecretRaw = values['cluster-secret'] ?? process.env.W2M_RELAY_CLUSTER_SECRET;
+const clusterNodeIdRaw = values['cluster-node-id'] ?? process.env.W2M_RELAY_NODE_ID;
+let cluster;
+if (clusterPeersRaw !== undefined || clusterSecretRaw !== undefined) {
+  const envNumber = (name, label) => {
+    const raw = process.env[name];
+    if (raw === undefined || raw === '') return undefined;
+    const n = Number(raw);
+    if (!Number.isFinite(n)) fail(`${name} (${label}) must be a number, got ${JSON.stringify(raw)}`);
+    return n;
+  };
+  try {
+    cluster = normalizeClusterConfig({
+      enabled: true,
+      peers: clusterPeersRaw,
+      secret: clusterSecretRaw,
+      nodeId: clusterNodeIdRaw,
+      intervalMs: values['cluster-sync-ms'] === undefined ? envNumber('W2M_RELAY_SYNC_INTERVAL_MS', 'periodic sync interval') : Number(values['cluster-sync-ms']),
+      bootMinMs: envNumber('W2M_RELAY_SYNC_BOOT_MIN_MS', 'first sync minimum delay'),
+      bootMaxMs: envNumber('W2M_RELAY_SYNC_BOOT_MAX_MS', 'first sync maximum delay'),
+      jitterMs: envNumber('W2M_RELAY_SYNC_JITTER_MS', 'periodic sync jitter'),
+      // Snapshot sizing: a raw snapshot is several MB on the live fleet; smaller chunks and a longer
+      // timeout help slow relay-to-relay links (responses are gzipped, this is the plaintext cap).
+      chunkBytes: envNumber('W2M_RELAY_SYNC_CHUNK_BYTES', 'snapshot chunk bytes'),
+      requestTimeoutMs: envNumber('W2M_RELAY_SYNC_TIMEOUT_MS', 'peer request timeout'),
+      devicePageSize: envNumber('W2M_RELAY_SYNC_DEVICE_PAGE_SIZE', 'devices per page'),
+      // Optional source allow-list for the two cluster routes. Default: HMAC only, any source address.
+      allowIps: typeof process.env.W2M_RELAY_CLUSTER_ALLOW_IPS === 'string' && process.env.W2M_RELAY_CLUSTER_ALLOW_IPS.trim() !== ''
+        ? process.env.W2M_RELAY_CLUSTER_ALLOW_IPS.split(',').map((entry) => entry.trim()).filter(Boolean)
+        : [],
+    });
+  } catch (error) {
+    fail(`cluster sync configuration is invalid: ${error.message}`);
+  }
+}
+
 const stateDir = resolveStateDir(values.state, 'rabbit');
 // Diagnostics go to stderr, data goes to stdout. `--json` promises one machine
 // readable line on stdout, so the pairing-code rotation notice must not land
@@ -291,6 +358,9 @@ if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.a
       requireSignature,
       metrics: values.metrics === true,
       signatureSkewSeconds,
+      // v3.0.0: undefined keeps the relay single-node; a normalized config enables the peer routes
+      // and the 1-hour/random-boot sync scheduler.
+      cluster,
     });
     // The pairing code rotates on every successful pairing, so the CLI has to
     // follow it rather than print it once: an operator pairing a second machine
@@ -350,6 +420,8 @@ if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.a
       pairingCode,
       relayId: listenInfo.relayId ?? null,
       protocolVersion: 1,
+      // v3.0.0: posture only — node id, peers, cursors. The cluster secret is never part of this line.
+      cluster: listenInfo.cluster ?? null,
     }));
   } else {
     log('');
@@ -360,6 +432,16 @@ if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.a
     if (basePath !== '/') log(`  Base path    ${basePath}`);
     log(`  State        ${stateDir}${values['no-persist'] ? '  (persistence DISABLED)' : ''}`);
     log(`  Protocol     v1   relay id ${listenInfo.relayId ?? '(none)'}`);
+    if (listenInfo.cluster !== null && listenInfo.cluster !== undefined) {
+      const peerList = (listenInfo.cluster.peers ?? []).map((peer) => `${peer.id}@${peer.url}`).join(', ');
+      log(`  Cluster      ON   node ${listenInfo.cluster.node_id}`);
+      log(`               peers: ${peerList}`);
+      log(`               first sync in ${Math.round((listenInfo.cluster.boot_delay_ms?.min ?? 60000) / 1000)}-`
+        + `${Math.round((listenInfo.cluster.boot_delay_ms?.max ?? 600000) / 1000)}s (random), then every `
+        + `${Math.round((listenInfo.cluster.interval_ms ?? 3600000) / 60000)} min`);
+    } else {
+      log('  Cluster      OFF  (single relay; --cluster-peers + --cluster-secret to enable)');
+    }
 
     if (values['trust-proxy']) {
       log('');

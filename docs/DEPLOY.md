@@ -182,6 +182,42 @@ sudo systemctl enable --now w2m-rabbit
 journalctl -u w2m-rabbit -f
 ```
 
+#### 2.4.1 Production: keep the operator token out of the unit and out of argv
+
+`--operator-token <value>` in `ExecStart` is visible in `ps` and in
+`systemctl show`, and unit files are world-readable. For a long-lived relay,
+inject the token through a root-owned `0600` environment file instead:
+
+```bash
+# 1. Read the current token from the state dir (0600, owned by the relay user).
+TOKEN=$(sudo cat /var/lib/w2m/operator-token.txt)
+
+# 2. Write a root-owned 0600 environment file. It holds exactly one assignment.
+sudo install -d -m 0700 /etc/w2m
+( umask 077; printf 'W2M_OPERATOR_TOKEN=%s\n' "$TOKEN" \
+    | sudo tee /etc/w2m/relay-operator.env >/dev/null )
+sudo chmod 600 /etc/w2m/relay-operator.env
+
+# 3. Reference it from the unit (not from ExecStart) and remove any token flag:
+#      [Service]
+#      EnvironmentFile=/etc/w2m/relay-operator.env
+#    ExecStart must NOT contain --operator-token or --print-operator-token.
+sudo systemctl daemon-reload
+sudo systemctl restart w2m-rabbit
+
+# 4. Verify: argv and ExecStart show no token; the token still authorises POST /v1/task.
+ps -eo args | grep '[w]2m-rabbit.mjs'
+systemctl show w2m-rabbit -p ExecStart
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8787/v1/task \
+  -H 'content-type: application/json' -H "authorization: Bearer $TOKEN" -d '{}'
+# => 400 (authenticated, empty body rejected); without the header => 401.
+```
+
+The relay already accepts `W2M_OPERATOR_TOKEN` (see `--help`), so no CLI change is
+needed. `EnvironmentFile` values are readable only by root via
+`/proc/<pid>/environ`; they are no longer part of the process arguments.
+
+
 ### 2.5 Pair each machine
 
 On every machine that should take part (Windows, macOS, Linux):
@@ -813,6 +849,12 @@ Two things worth knowing about the implementation:
   do on the wire by itself.
 - The startup log records only that it is configured and its **length**, never
   its value — so a localside log is safe to share.
+
+On the **relay host** (or any systemd-managed dispatching host), inject the token
+through the `0600` `EnvironmentFile` described in §2.4.1. Never pass
+`--operator-token` in `ExecStart` and never enable `--print-operator-token` in
+production: both put the credential in places every local user can read
+(`ps`, `systemctl show`, journald).
 
 **Do not** put `--operator-token` on every machine. The whole point of the
 device/operator split (protocol §5) is that one compromised executor cannot

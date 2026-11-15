@@ -1,0 +1,44 @@
+{
+  "version": "3.3.16",
+  "case": "RELEASE-33160",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-15T10:15:36.030Z",
+  "executor": "lead",
+  "task_id": "pre-release-33160",
+  "requirement": "v3.3.16 integrates Relay v3.0.0 three-node cluster sync with the plugin P0 stateDir fix, one online predicate and visible version drift; never-ask keeps the red approval channel",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/cluster-sync.test.mjs",
+      "test/cluster-sync-integration.test.mjs",
+      "test/relay-version.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/fleet-target.test.mjs",
+      "test/claims.test.mjs"
+    ],
+    [
+      "node",
+      "scripts/pack.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "relay_cluster": "all three relays report relay_version 3.0.0, features contain relay-cluster-sync-v1 and cluster.last_ok is true",
+      "state_dir": "configuredStateDir falls back to $DSH_HOME/xclient when the profile omits stateDir, so memory/RTT/P2P survive on every machine",
+      "online_predicate": "w2m_devices and the target control both use isSelectableDevice; a device with online:false is no longer reported as online",
+      "version_drift": "w2m_devices version_drift lists current/versions/behind; older 2.0.x and 2.2.x machines are visible as behind",
+      "dispatch_states": "docs/DISPATCH-TRI-STATE-20261115.md records real ok, failed, divergent and partial tasks, all write:false",
+      "approval_policy": "never-ask + joint-dev stays blocked with the red channel retained; no pre-signed approval and no dispatch closure"
+    }
+  }
+}

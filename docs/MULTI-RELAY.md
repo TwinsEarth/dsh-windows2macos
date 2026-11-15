@@ -65,3 +65,29 @@ Relays are expected to be online whether or not they currently have fleet member
 3. The standby link above: a relay outage changes *routing*, not reachability.
 
 See `deploy/relay/README.md` for installation and the verification commands.
+
+## Data sync between relays (Relay v3.0.0)
+
+Active-passive links make a relay *outage* survivable, but until v3.0.0 the relays themselves were
+independent databases: a task created on one relay was invisible on the others, and a freshly
+restarted relay only knew what was in its own `--state` directory. Relay v3.0.0 adds a pull-based
+peer sync:
+
+* every relay pulls a snapshot from each peer **60–600 s after boot** (randomised, so a rolling
+  restart never makes the three pull at the same instant) and then **once per hour ± 5 min**;
+* synchronized: `devices` (record + device token + fleet binding) and the task ledger
+  (`task.created` / `lease.changed` / `result.stored` / `task.cancelled`);
+* never synchronized: blobs (data-plane red line), operator tokens / signing secrets (per-relay
+  authority), presence/leases, and the in-memory fleet chat / fleet memory domains;
+* peer routes are HMAC-authenticated and answered in an AES-256-GCM envelope, so device tokens never
+  cross the network in the clear even when the relays speak plain HTTP;
+* `/healthz.features` advertises `relay-cluster-sync-v1` and `/healthz.cluster` reports node id,
+  peers, cursors and import counts (never the secret or the payload).
+
+Design, verification and the rolling-restart runbook:
+
+* `docs/RELAY-CLUSTER-SYNC-DESIGN-v3.0.0.md`
+* `docs/RELAY-CLUSTER-SYNC-V3.0.0-VERIFICATION.md`
+* `docs/RELAY-V3.0.0-DEPLOY-RUNBOOK.md`
+* `deploy/relay/rolling-restart.sh`, `deploy/relay/cluster.conf.example`
+

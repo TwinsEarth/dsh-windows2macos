@@ -20,6 +20,20 @@ import { rfc3339 } from './state.mjs';
 export const DEVICES_FILE = 'devices.json';
 export const LEDGER_FILE = 'ledger.jsonl';
 export const OPERATOR_TOKEN_FILE = 'operator-token.txt';
+/**
+ * v3.0.0 relay cluster sync state (docs/RELAY-CLUSTER-SYNC-DESIGN-v3.0.0.md).
+ *
+ * Everything below lives under `<state>/cluster/` and is written 0600: the imported ledger carries
+ * other relays' task facts (which include command lines), and the cursor tells a peer how far this
+ * relay has read from it. Nothing here is ever logged.
+ */
+export const CLUSTER_DIR = 'cluster';
+export const CLUSTER_NODE_FILE = 'cluster-node.json';
+export const CLUSTER_CURSORS_FILE = 'cursors.json';
+export const CLUSTER_LEDGER_FILE = 'ledger.jsonl';
+export const CLUSTER_LAST_SYNC_FILE = 'last-sync.json';
+/** How many bytes of the local ledger one snapshot chunk may carry. */
+export const CLUSTER_LEDGER_CHUNK_BYTES = 2 * 1024 * 1024;
 /** v1.0.7: the content-addressed blob directory, and the two caps that keep it bounded. */
 export const BLOB_DIR = 'blobs';
 export const MAX_BLOB_BYTES = 8 * 1024 * 1024;
@@ -99,6 +113,11 @@ export class Persistence {
   get devicesFile() { return this.enabled ? path.join(this.dir, DEVICES_FILE) : null; }
   get ledgerFile() { return this.enabled ? path.join(this.dir, LEDGER_FILE) : null; }
   get operatorTokenFile() { return this.enabled ? path.join(this.dir, OPERATOR_TOKEN_FILE) : null; }
+  get clusterDir() { return this.enabled ? path.join(this.dir, CLUSTER_DIR) : null; }
+  get clusterNodeFile() { return this.enabled ? path.join(this.dir, CLUSTER_NODE_FILE) : null; }
+  get clusterCursorsFile() { return this.enabled ? path.join(this.dir, CLUSTER_DIR, CLUSTER_CURSORS_FILE) : null; }
+  get clusterLedgerFile() { return this.enabled ? path.join(this.dir, CLUSTER_DIR, CLUSTER_LEDGER_FILE) : null; }
+  get clusterLastSyncFile() { return this.enabled ? path.join(this.dir, CLUSTER_DIR, CLUSTER_LAST_SYNC_FILE) : null; }
 
   warn(file, message, extra = {}) {
     // Deduplicated (v0.6.2). A full disk fails *every* append, and appending an identical entry each
@@ -610,6 +629,177 @@ export class Persistence {
   }
 
   /** Redacted view for `/healthz` — never contains tokens. */
+  /* ---------------- v3.0.0: relay cluster sync ---------------- */
+
+  /** Atomic JSON write (tmp + rename), 0600, with the parent directory created 0700. */
+  _writeJsonAtomic(file, value) {
+    if (!this.enabled || typeof file !== 'string') return false;
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+      const tmp = `${file}.tmp-${process.pid}-${Date.now().toString(36)}`;
+      fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+      fs.renameSync(tmp, file);
+      try { fs.chmodSync(file, 0o600); } catch { /* best effort on Windows */ }
+      return true;
+    } catch (err) {
+      this.warn(path.basename(file), `write failed: ${err.message}`);
+      return false;
+    }
+  }
+
+  /** The stable node id used by cluster sync; `null` when never generated. */
+  loadClusterNodeId() {
+    if (!this.enabled) return null;
+    try {
+      if (!fs.existsSync(this.clusterNodeFile)) return null;
+      const parsed = JSON.parse(fs.readFileSync(this.clusterNodeFile, 'utf8'));
+      const nodeId = parsed?.node_id;
+      return typeof nodeId === 'string' && /^node-[0-9a-f]{8,32}$/.test(nodeId) ? nodeId : null;
+    } catch (err) {
+      this.warn(CLUSTER_NODE_FILE, `unreadable (${err.message}); a new node id will be generated`);
+      return null;
+    }
+  }
+
+  saveClusterNodeId(nodeId) {
+    if (!/^node-[0-9a-f]{8,32}$/.test(String(nodeId))) return false;
+    return this._writeJsonAtomic(this.clusterNodeFile, { v: 1, node_id: nodeId });
+  }
+
+  /** Per-peer sync cursors: `{ "<peer-node-id>": { ledger_offset, last_ok_at_ms, ... } }`. */
+  loadClusterCursors() {
+    if (!this.enabled) return {};
+    try {
+      if (!fs.existsSync(this.clusterCursorsFile)) return {};
+      const parsed = JSON.parse(fs.readFileSync(this.clusterCursorsFile, 'utf8'));
+      const cursors = parsed?.cursors;
+      return cursors !== null && typeof cursors === 'object' && !Array.isArray(cursors) ? cursors : {};
+    } catch (err) {
+      this.warn(CLUSTER_CURSORS_FILE, `unreadable (${err.message}); starting from an empty cursor set`);
+      return {};
+    }
+  }
+
+  saveClusterCursors(cursors) {
+    return this._writeJsonAtomic(this.clusterCursorsFile, { v: 1, cursors: cursors ?? {} });
+  }
+
+  saveClusterLastSync(info) {
+    return this._writeJsonAtomic(this.clusterLastSyncFile, { v: 1, ...info });
+  }
+
+  loadClusterLastSync() {
+    if (!this.enabled) return null;
+    try {
+      if (!fs.existsSync(this.clusterLastSyncFile)) return null;
+      return JSON.parse(fs.readFileSync(this.clusterLastSyncFile, 'utf8'));
+    } catch { return null; }
+  }
+
+  /**
+   * Foreign ledger entries imported from peers, as `{origin, offset, ts, entry}`.
+   *
+   * Deduplicated on load by `(origin, offset)`: a snapshot chunk may legitimately be re-requested
+   * after a crash between "applied" and "cursor saved", and replaying an entry twice must not
+   * double-apply it to the live task table.
+   */
+  loadClusterLedger() {
+    if (!this.enabled) return [];
+    try {
+      if (!fs.existsSync(this.clusterLedgerFile)) return [];
+      const raw = fs.readFileSync(this.clusterLedgerFile, 'utf8');
+      const records = [];
+      const seen = new Set();
+      for (const line of raw.split('\n')) {
+        if (line.trim() === '') continue;
+        try {
+          const record = JSON.parse(line);
+          if (typeof record?.origin !== 'string' || !Number.isInteger(record?.offset) || record?.entry === null || typeof record.entry !== 'object') {
+            this.ledgerLinesSkipped += 1;
+            continue;
+          }
+          const key = `${record.origin}@${record.offset}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          records.push(record);
+        } catch (err) {
+          this.ledgerLinesSkipped += 1;
+          this.warn(CLUSTER_LEDGER_FILE, `line skipped: ${err.message}`);
+        }
+      }
+      return records;
+    } catch (err) {
+      this.warn(CLUSTER_LEDGER_FILE, `unreadable (${err.message}); imported ledger not replayed`);
+      return [];
+    }
+  }
+
+  appendClusterLedger(record) {
+    if (!this.enabled || !this._clusterDirReady()) return false;
+    try {
+      fs.appendFileSync(this.clusterLedgerFile, `${JSON.stringify(record)}\n`, { encoding: 'utf8', mode: 0o600 });
+      return true;
+    } catch (err) {
+      this.warn(CLUSTER_LEDGER_FILE, `append failed: ${err.message}`);
+      return false;
+    }
+  }
+
+  _clusterDirReady() {
+    if (!this.enabled) return false;
+    try { fs.mkdirSync(this.clusterDir, { recursive: true, mode: 0o700 }); return true; } catch (err) {
+      this.warn(CLUSTER_DIR, `mkdir failed: ${err.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Read the local ledger from a byte offset, in complete lines only.
+   *
+   * Offsets are byte offsets in the file (not line numbers) because appends never rewrite earlier
+   * bytes: a byte offset is the only cursor that is stable while the file grows. A trailing partial
+   * line is never consumed (it is a write in progress), so the next read starts at the same offset.
+   *
+   * @param {{offset?: number, maxBytes?: number}} [options]
+   * @returns {{entries: {offset:number, entry:object}[], nextOffset:number, totalBytes:number, eof:boolean}}
+   */
+  readLedgerSlice({ offset = 0, maxBytes = CLUSTER_LEDGER_CHUNK_BYTES } = {}) {
+    const empty = { entries: [], nextOffset: offset, totalBytes: 0, eof: true };
+    if (!this.enabled) return empty;
+    let buf;
+    try {
+      buf = fs.readFileSync(this.ledgerFile);
+    } catch (err) {
+      if (err.code !== 'ENOENT') this.warn(LEDGER_FILE, `unreadable for cluster sync (${err.message})`);
+      return empty;
+    }
+    const start = Number.isInteger(offset) && offset >= 0 && offset <= buf.length ? offset : 0;
+    const entries = [];
+    let pos = start;
+    let consumed = 0;
+    while (pos < buf.length) {
+      const nl = buf.indexOf(0x0a, pos);
+      if (nl < 0) break; // trailing partial line: leave it for the next tick
+      const lineStart = pos;
+      pos = nl + 1;
+      const line = buf.subarray(lineStart, nl).toString('utf8').trim();
+      if (line !== '') {
+        try {
+          const entry = JSON.parse(line);
+          if (entry !== null && typeof entry === 'object' && typeof entry.type === 'string') {
+            entries.push({ offset: lineStart, entry });
+          }
+        } catch (err) {
+          this.ledgerLinesSkipped += 1;
+          this.warn(LEDGER_FILE, `cluster slice skipped malformed line: ${err.message}`);
+        }
+      }
+      consumed = pos - start;
+      if (consumed >= maxBytes) break;
+    }
+    return { entries, nextOffset: pos, totalBytes: buf.length, eof: pos >= buf.length };
+  }
+
   describe() {
     const blobs = this.listBlobs();
     return {

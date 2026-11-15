@@ -4,6 +4,30 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [3.3.16] - 2026-11-15
+
+### Relay v3.0.0 — 三节点数据同步（server-side, 插件协议不变）
+
+- **Relay 之间新增拉取式数据同步**：三台 relay 互为 peer，每台按自己的调度从另外两台拉取 durable 状态并经加密信封传输：
+  - `devices`：设备记录、device_token、fleet 绑定（LWW 合并；presence 仍由本机观测）；
+  - `ledger`：`task.created` / `lease.changed` / `result.stored` / `task.cancelled`（`origin@offset` 幂等回放，重启时与本地账本合并重放）。
+  - 不同步：blobs（数据面红线）、operator token / signing secret（各 relay 独立权威）、心跳/租约/presence、fleet chat / fleet memory（当前非 durable，留 Phase 2）。
+- **调度**：进程启动后 **60–600 秒随机**触发首次同步（滚动重启不会三台同刻拉取）；之后每 **1 小时 ± 5 分钟抖动**一次；单飞、失败退避（30s/2m/10m），单个 peer 故障不阻塞其他 peer。
+- **安全**：peer 路由只接受 cluster HMAC（`method/path/ts/nonce/since`，±120s 时间窗 + nonce 防重放），响应为 AES-256-GCM 加密信封（含 device token 的同步内容不裸奔）；healthz 只暴露 node id/peer/游标/计数，不暴露 secret 或 payload。未配置 cluster 时行为与 2.1.5 完全一致（无 `/v1/cluster/*`、无新 feature）。
+- **新版 healthz**：`features` 增加 `relay-cluster-sync-v1`（仅 cluster 启用时），新增 `cluster` 诊断对象（node_id/peers/last_sync_at/next_sync_at/last_ok/imported counts）。
+- **部署**：`W2M_RELAY_VERSION=3.0.0` 报告 relay 3.0.0；参数 `--cluster-peers/--cluster-secret/--cluster-node-id/--cluster-sync-ms`（或 `W2M_RELAY_*` env）；滚动重启脚本 `deploy/relay/rolling-restart.sh`，手册 `docs/RELAY-V3.0.0-DEPLOY-RUNBOOK.md`。
+- 设计/验证：`docs/RELAY-CLUSTER-SYNC-DESIGN-v3.0.0.md`、`docs/RELAY-CLUSTER-SYNC-V3.0.0-VERIFICATION.md`（本地：cluster 单元 16/16、三 relay 集成 2/2、relay+health 回归 209/209、capabilities 5/5、eslint 0）。
+
+
+### 插件侧
+
+- **P0：`stateDir` 默认值修复**：未配置 `stateDir` 时默认 `$DSH_HOME/xclient`（`~/.dsh/xclient` 回退），不再让本地 memory、RTT 状态文件与 P2P inbox 静默失效；新增 `configuredStateDir()` 便于测试。
+- **在线口径统一**：`w2m_devices` 与「全部机器」选择器共用 `isSelectableDevice`（`online` 优先、`state` 回退）；`w2m_devices` 现在同时输出 `online`/`state`，离线设备不再显示成 `online`。
+- **版本漂移可见**：`w2m_devices` 新增 `version_drift { current, versions, behind_count, behind[] }`；当前发布 3.3.16，2.0.x/2.2.x 标记为落后并纳入「统一到最新版本、放弃旧版本」治理。
+- **派发三态真实样本**：新增 `docs/DISPATCH-TRI-STATE-20261115.md`，记录 ok / failed / divergent / partial 四个真实 task（含隔离测试机、只读命令与逐机结果）。
+- **审批策略定档 C（保留 red 通道）**：never-ask 下 joint-dev 派发保持 `blocked`（`APPROVAL_REQUIRED`）是预期边界，不预置签名审批、不关闭入口；需要能力时由有审批通道的运营操作。
+- **Relay v3.0.0 部署验证**：三台 relay 均报告 `relay_version=3.0.0` 且 `features` 含 `relay-cluster-sync-v1`，`cluster.last_ok=true`；三节点的设备/账本按设计拉取同步。
+
 ## [3.3.15] - 2026-11-15
 
 - **「全部机器」增加离线分类**：现在分为 **客户端 / Web端 / 离线** 三组——

@@ -1,0 +1,36 @@
+# Relay v3.0.0 cluster sync — systemd drop-in example.
+#
+# Install as /etc/systemd/system/w2m-rabbit.service.d/cluster.conf on EACH relay
+# (chmod 0600: the file contains the shared cluster secret). Then:
+#
+#   systemctl daemon-reload
+#   systemctl restart w2m-rabbit
+#
+# Every relay uses the SAME secret, a DIFFERENT node id, and lists the OTHER TWO
+# relays as peers (never itself). The three node ids below are examples; generate
+# them once and keep them stable (they key the sync cursors):
+#
+#   node-primary  -> primary  (43.142.74.71)
+#   node-tencent  -> tencent  (106.53.197.47)
+#   node-vultr    -> vultr    (202.182.123.154)
+#
+# The secret is generated on the operator machine and never committed:
+#
+#   openssl rand -base64 32
+
+[Service]
+Environment=W2M_RELAY_VERSION=3.0.0
+
+# ---- primary relay (43.142.74.71) ----
+Environment=W2M_RELAY_NODE_ID=node-<stable-id-primary>
+Environment=W2M_RELAY_PEERS=[{"id":"node-<stable-id-tencent>","url":"http://106.53.197.47:8787"},{"id":"node-<stable-id-vultr>","url":"http://202.182.123.154:8787"}]
+Environment=W2M_RELAY_CLUSTER_SECRET=<openssl rand -base64 32>
+
+# Sync cadence (defaults shown; the first sync is random 60–600s after boot).
+Environment=W2M_RELAY_SYNC_INTERVAL_MS=3600000
+Environment=W2M_RELAY_SYNC_BOOT_MIN_MS=60000
+Environment=W2M_RELAY_SYNC_BOOT_MAX_MS=600000
+Environment=W2M_RELAY_SYNC_JITTER_MS=300000
+
+# Optional hardening: only accept cluster requests from the other relay IPs.
+# Environment=W2M_RELAY_CLUSTER_ALLOW_IPS=106.53.197.47,202.182.123.154

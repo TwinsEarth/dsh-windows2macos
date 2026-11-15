@@ -92,17 +92,23 @@ ExecStart=@RELAY_BIN@ --host 127.0.0.1 --port 8787 --state %S/w2m
 #     --trust-proxy
 
 # --- secrets ---------------------------------------------------------------
-# Do NOT put the operator token in this file: the unit is world-readable and
-# the token authorises SENDING work to every paired machine.
-# Preferred: let the relay generate one and read /var/lib/w2m/operator-token.txt.
-# If you must inject your own, keep it in an EnvironmentFile with mode 0600
-# owned by root, and let systemd read it:
-# EnvironmentFile=-/etc/w2m/relay.env      # W2M_OPERATOR_TOKEN=...
-# (the leading '-' means "start anyway if the file is missing")
+# Do NOT put the operator token in this file or in ExecStart: the unit is
+# world-readable, `ps`/`systemctl show` expose argv to every local user, and the
+# token authorises SENDING work to every paired machine.
+# Preferred A: let the relay generate one and read /var/lib/w2m/operator-token.txt.
+# Preferred B: inject your own through a root-owned 0600 EnvironmentFile:
+#   sudo install -d -m 0700 /etc/w2m
+#   ( umask 077; printf 'W2M_OPERATOR_TOKEN=%s\n' '<token>' \
+#       | sudo tee /etc/w2m/relay-operator.env >/dev/null )
+#   sudo chmod 600 /etc/w2m/relay-operator.env
+# and uncomment the line below. `-` means "start anyway if the file is missing".
+# EnvironmentFile=-/etc/w2m/relay-operator.env
+# Never pass --print-operator-token / W2M_PRINT_OPERATOR_TOKEN=1 in production:
+# the startup banner goes to journald and would put the token in the logs.
 #
-# NOTE: the relay prints the operator token and the pairing code to stdout, so
-# they end up in the journal. For a public deployment, restrict journal access
-# (sudo usermod -aG systemd-journal <user>) or send them elsewhere.
+# NOTE: on a generating start the relay still prints the token once (journal /
+# stdout). Rotate or scrub that start's log, or keep journal access restricted
+# (sudo usermod -aG systemd-journal <user>).
 
 # --- restart policy --------------------------------------------------------
 Restart=on-failure

@@ -536,6 +536,12 @@ export class RabbitState {
     this._persist = options.persistence ?? null;
     /** True while replaying a ledger — suppresses event emission and re-persistence. */
     this._restoring = false;
+    /**
+     * v3.0.0 cluster sync: identities (`origin@offset`) of imported ledger entries already applied to
+     * the live tables. `null` means "not loaded yet"; the first import seeds it from the imported
+     * ledger file so a crash between apply and cursor-save cannot double-apply an entry.
+     */
+    this._clusterApplied = null;
     /** Ledger entries that could not be replayed. */
     this.replayWarnings = [];
     this.seq = 0;
@@ -868,6 +874,17 @@ export class RabbitState {
       max_attempts: Number.isInteger(t.max_attempts) ? t.max_attempts : 1,
       retry_on: Array.isArray(t.retry_on) ? t.retry_on : [],
           created_by: t.created_by ?? null,
+          /**
+           * v3.0.0: the fleet the task belongs to must survive a restart *and* a cluster import.
+           *
+           * `listTasks` scopes a fleet-bound device to `task.fleet_id`, so a task restored without it
+           * disappears from every fleet-scoped listing. Older ledgers do not carry the field: fall back
+           * to the creator's device record (devices are restored before the ledger is replayed), which
+           * is the same rule `createTask` used to compute it.
+           */
+          fleet_id: typeof t.fleet_id === 'string' && t.fleet_id !== ''
+            ? t.fleet_id
+            : (typeof t.created_by === 'string' ? (this.devices.get(t.created_by)?.fleet_id ?? null) : null),
           created_at_ms: Number.isFinite(createdAt) ? createdAt : this.nowMs(),
           command_hash: t.command_hash ?? null,
           plan_sha256: t.plan_sha256 ?? null,
@@ -945,6 +962,154 @@ export class RabbitState {
   }
 
   /* ---------------- events (§3) ---------------- */
+
+  /* ---------------- v3.0.0: relay cluster sync merge ---------------- */
+
+  /**
+   * Merge device records pulled from a peer relay.
+   *
+   * LWW per `machine_id`: `re_paired` first, then `paired_at_ms`. Presence is never imported — a device
+   * that is online on the peer is not online here, and reporting otherwise would make the local SSE
+   * stream promise a connection this relay does not have. Missing `device_token`/`fleet_id` are filled
+   * in without downgrading a newer local record: a standby relay cannot authenticate a device it has
+   * no token for, which is the whole reason devices are synced at all.
+   *
+   * @param {object[]} records
+   * @returns {{added:number, updated:number, unchanged:number, rejected:number}}
+   */
+  mergeClusterDevices(records) {
+    const stats = { added: 0, updated: 0, unchanged: 0, rejected: 0 };
+    if (!Array.isArray(records)) return stats;
+    for (const raw of records) {
+      if (raw === null || typeof raw !== 'object' || typeof raw.machine_id !== 'string' || raw.machine_id === '') {
+        stats.rejected += 1;
+        continue;
+      }
+      const machineId = raw.machine_id;
+      const remotePairedAt = Number.isFinite(raw.paired_at_ms) ? raw.paired_at_ms : 0;
+      const remoteRePaired = raw.re_paired === true;
+      const local = this.devices.get(machineId) ?? null;
+      const localPairedAt = local !== null && Number.isFinite(local.paired_at_ms) ? local.paired_at_ms : 0;
+      const localRePaired = local !== null && local.re_paired === true;
+      const remoteIsNewer = local === null
+        || (remoteRePaired && !localRePaired)
+        || (remoteRePaired === localRePaired && remotePairedAt > localPairedAt);
+      if (!remoteIsNewer) {
+        if (local !== null) {
+          let touched = false;
+          if (!local.device_token && typeof raw.device_token === 'string' && raw.device_token !== '') {
+            local.device_token = raw.device_token;
+            this.tokens.set(raw.device_token, machineId);
+            touched = true;
+          }
+          if (!local.fleet_id && typeof raw.fleet_id === 'string' && raw.fleet_id !== '') {
+            local.fleet_id = raw.fleet_id;
+            local.fleet_source = typeof raw.fleet_source === 'string' && raw.fleet_source !== '' ? raw.fleet_source : 'cluster-sync';
+            touched = true;
+          }
+          if (touched) stats.updated += 1;
+          else stats.unchanged += 1;
+        } else {
+          stats.unchanged += 1;
+        }
+        continue;
+      }
+      const device = {
+        machine_id: machineId,
+        machine_name: typeof raw.machine_name === 'string' && raw.machine_name !== '' ? raw.machine_name : machineId,
+        platform: raw.platform ?? {},
+        caps: raw.caps ?? {},
+        user_id: raw.user_id ?? null,
+        device_token: typeof raw.device_token === 'string' ? raw.device_token : null,
+        paired_at_ms: remotePairedAt,
+        re_paired: remoteRePaired,
+        fleet_id: typeof raw.fleet_id === 'string' && raw.fleet_id !== '' ? raw.fleet_id : null,
+        fleet_source: typeof raw.fleet_source === 'string' && raw.fleet_source !== '' ? raw.fleet_source : 'cluster-sync',
+        last_seen_at_ms: this.nowMs(),
+        online: false,
+        streams: 0,
+        rtt_ms: null,
+        rtt_at_ms: null,
+        last_heartbeat_at_ms: null,
+        stream_connects: 0,
+      };
+      if (local !== null) {
+        // keep volatile presence/measurements from this relay
+        device.online = local.online === true;
+        device.streams = typeof local.streams === 'number' ? local.streams : 0;
+        device.last_seen_at_ms = local.last_seen_at_ms ?? device.last_seen_at_ms;
+        device.last_heartbeat_at_ms = local.last_heartbeat_at_ms ?? null;
+        device.rtt_ms = local.rtt_ms ?? null;
+        device.rtt_at_ms = local.rtt_at_ms ?? null;
+        device.stream_connects = local.stream_connects ?? 0;
+        stats.updated += 1;
+      } else {
+        stats.added += 1;
+      }
+      if (local?.device_token && local.device_token !== device.device_token) this.tokens.delete(local.device_token);
+      this.devices.set(machineId, device);
+      if (device.device_token) this.tokens.set(device.device_token, machineId);
+    }
+    if (stats.added > 0 || stats.updated > 0) this._saveDevices();
+    return stats;
+  }
+
+  /**
+   * Apply ledger entries imported from a peer relay.
+   *
+   * The entries are already durable on the peer; this relay only replays them into the live task/result
+   * tables so a task created on relay A is answerable on relay B before B restarts. Replay is
+   * idempotent: `(origin, offset)` is the identity of an imported entry, and the set of applied
+   * identities is seeded from the imported-ledger file on first use.
+   *
+   * `operator.key.registered` is intentionally not imported: operator keys are per-relay authority,
+   * and copying one would let a key registered on one relay authorise work on another.
+   *
+   * @param {{origin:string, offset:number, entry:object}[]} records
+   * @returns {{applied:number, duplicates:number, skipped:number}}
+   */
+  applyClusterLedger(records) {
+    const stats = { applied: 0, duplicates: 0, skipped: 0 };
+    if (!Array.isArray(records)) return stats;
+    if (this._clusterApplied === null) {
+      this._clusterApplied = new Set();
+      try {
+        for (const record of this.persistence?.loadClusterLedger?.() ?? []) {
+          this._clusterApplied.add(`${record.origin}@${record.offset}`);
+        }
+      } catch { /* an unreadable imported ledger means no identities are known; duplicates are still keyed by (origin,offset) */ }
+    }
+    const previousRestoring = this._restoring;
+    this._restoring = true; // replaying must never append to our own ledger
+    try {
+      for (const record of records) {
+        if (record === null || typeof record !== 'object' || typeof record.origin !== 'string' || !Number.isInteger(record.offset)
+          || record.entry === null || typeof record.entry !== 'object' || typeof record.entry.type !== 'string') {
+          stats.skipped += 1;
+          continue;
+        }
+        const key = `${record.origin}@${record.offset}`;
+        if (this._clusterApplied.has(key)) {
+          stats.duplicates += 1;
+          continue;
+        }
+        this._clusterApplied.add(key);
+        if (record.entry.type === 'operator.key.registered') {
+          stats.skipped += 1;
+          continue;
+        }
+        try {
+          this._applyLedgerEntry(record.entry);
+          stats.applied += 1;
+        } catch {
+          stats.skipped += 1;
+        }
+      }
+    } finally {
+      this._restoring = previousRestoring;
+    }
+    return stats;
+  }
 
   nextSeq() { this.seq += 1; return this.seq; }
 
@@ -2332,6 +2497,9 @@ export class RabbitState {
         compare_policy: task.compare_policy,
         halt: task.halt,
         created_by: task.created_by,
+        // v3.0.0: carry the fleet binding into the ledger, otherwise a restored/imported task is
+        // invisible to every fleet-scoped listing (see `_applyLedgerEntry`).
+        fleet_id: task.fleet_id ?? null,
         created_at_ms: task.created_at_ms,
         command_hash: task.command_hash,
         attempt: task.attempt,

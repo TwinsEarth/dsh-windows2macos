@@ -1427,6 +1427,7 @@ describe('happy paths', () => {
         shell: 'pwsh',
         caps: { case_sensitive_fs: false, symlinks: false, exec_bit: false },
         last_seen: '2026-10-07T12:00:00Z',
+        online: true,
         state: 'online',
       });
     } finally {

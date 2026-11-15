@@ -1733,7 +1733,7 @@ function makeAgent({
     platform: { os: 'windows', os_version: '10.0', arch: 'x64', shell: 'cmd', shell_version: null },
     // The documented API accepts both forms; `stringForm` exercises the raw
     // `['node -e']` shape that a caller would read straight off the CLI.
-    allowedCommands: stringForm ? serialized : parseAllowedCommands(JSON.stringify(serialized)),
+    allowedCommands: stringForm ? serialized : parseAllowedCommands(allowed),
     once,
     // The contract's cadence is 10s (asserted via HEARTBEAT_INTERVAL_MS); the
     // end-to-end tests use a fast cadence so cancel does not cost 10s.

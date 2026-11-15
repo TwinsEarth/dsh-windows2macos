@@ -1,4 +1,5 @@
 import { guardBlobRoute, guardResultEnvelope, guardTaskBody } from './redline-guard.mjs';
+import { CLUSTER_FEATURE, CLUSTER_ROUTES, createClusterSync } from './cluster-sync.mjs';
 /**
  * W2M Rabbit relay — node:http / node:https server.
  *
@@ -13,13 +14,29 @@ import http from 'node:http';
 import https from 'node:https';
 import { createRequire } from 'node:module';
 
-/** The relay's own version, from the package it was installed from (W2M_RELAY_VERSION overrides). */
+/**
+ * The relay's own version.
+ *
+ * Two facts pull in different directions:
+ *
+ *   - the relay IS the plugin package (`bin/w2m-rabbit.mjs` lives in it), so the package version is
+ *     the honest default;
+ *   - the relay also has its own deployment release line. `W2M_RELAY_VERSION=3.0.0` declares "this
+ *     host runs Relay 3.0.0" while the package it was unpacked from is the plugin release (3.3.15).
+ *
+ * The explicit override therefore wins. A relay whose version is silently reported from the package
+ * would make a deployment of 3.0.0 look like a no-op in `/healthz` and in client capability checks.
+ * Empty/unset means "follow the package"; a missing package (single-file bundles) falls back to
+ * `unknown`.
+ */
 function readRelayVersion() {
+  const override = process.env.W2M_RELAY_VERSION;
+  if (typeof override === 'string' && override.trim() !== '') return override.trim();
   try {
     const pkg = createRequire(import.meta.url)('../../package.json');
     if (typeof pkg?.version === 'string' && pkg.version !== '') return pkg.version;
   } catch { /* packaged without package.json */ }
-  return process.env.W2M_RELAY_VERSION ?? 'unknown';
+  return 'unknown';
 }
 export const RELAY_VERSION = readRelayVersion();
 
@@ -391,9 +408,46 @@ export class RelayServer {
       const snapshot = this.persistence.loadDevices();
       this.persistence.devicesMissing = snapshot.missing;
       const ledger = this.persistence.loadLedger();
-      const revived = this.state.restore({ devices: snapshot.devices, ledger });
+      /**
+       * v3.0.0: replay the imported cluster ledger together with the local one.
+       *
+       * The imported file is append-only and written by `cluster-sync.mjs`; replaying it here is what
+       * makes a task created on another relay survive a restart of this one. Sorting by the entry
+       * timestamp keeps the combined order as close to "when it happened" as the two files allow.
+       * `cluster-sync.mjs` never persists `operator.key.registered` entries (per-relay authority), so
+       * replaying the imported file cannot import one.
+       */
+      const imported = this.persistence.loadClusterLedger().map((record) => record.entry);
+      const mergedLedger = imported.length === 0 ? ledger : [...ledger, ...imported];
+      if (imported.length > 0) {
+        mergedLedger.sort((a, b) => {
+          const left = Date.parse(a?.ts ?? '');
+          const right = Date.parse(b?.ts ?? '');
+          return (Number.isFinite(left) ? left : 0) - (Number.isFinite(right) ? right : 0);
+        });
+      }
+      const revived = this.state.restore({ devices: snapshot.devices, ledger: mergedLedger });
       this.persistence.revivedDevices = revived.revived_devices;
       this.persistence.revivedTasks = revived.revived_tasks;
+    }
+
+    /* ---- v3.0.0: relay cluster sync (peer-to-peer pull) ---- */
+    this.cluster = null;
+    if (options.cluster !== undefined && options.cluster !== null && options.cluster.enabled === true) {
+      if (!this.persistence.enabled) {
+        this.startupMessages.push('[w2m-rabbit] !! cluster sync requested but persistence is off (--no-persist); cross-relay sync disabled');
+      } else {
+        this.cluster = createClusterSync({
+          state: this.state,
+          persistence: this.persistence,
+          config: options.cluster,
+          relayVersion: RELAY_VERSION,
+          logger: this.logger,
+          fetchImpl: options.fetchImpl,
+          now: () => this.state.nowMs(),
+        });
+        this.cluster.ensureNodeId();
+      }
     }
 
     /* ---- operator token (§5) ---- */
@@ -483,6 +537,30 @@ export class RelayServer {
    * `this.logger(...)` call after `res.writeHead()` once threw a TypeError that
    * surfaced as "Cannot write headers after they are sent to the client".)
    */
+  /**
+   * Attach cluster sync to a relay that is already constructed (also used by the integration tests to
+   * start three relays on OS-assigned ports before their peer URLs exist).
+   *
+   * @param {object} config normalized cluster configuration
+   * @returns {import('./cluster-sync.mjs').ClusterSync}
+   */
+  attachCluster(config) {
+    if (this.cluster !== null) throw new ProtocolError('BAD_REQUEST', 'cluster sync is already attached to this relay');
+    if (!this.persistence.enabled) throw new ProtocolError('PERSISTENCE_DISABLED', 'cluster sync needs a persistent state directory (cursors and the imported ledger)');
+    this.cluster = createClusterSync({
+      state: this.state,
+      persistence: this.persistence,
+      config,
+      relayVersion: RELAY_VERSION,
+      logger: this.logger,
+      fetchImpl: this.options.fetchImpl,
+      now: () => this.state.nowMs(),
+    });
+    this.cluster.ensureNodeId();
+    if (this.server?.listening === true) this.cluster.start();
+    return this.cluster;
+  }
+
   _log(message) {
     if (typeof this.logger !== 'function') return;
     try {
@@ -571,6 +649,15 @@ export class RelayServer {
     } else {
       m.push('[w2m-rabbit] persistence=off (in-memory only; devices and tasks are lost on restart)');
     }
+    if (this.cluster !== null) {
+      const clusterStatus = this.cluster.status();
+      const peers = this.cluster.config.peers.map((peer) => `${peer.id}@${peer.url}`).join(', ');
+      m.push(`[w2m-rabbit] cluster sync=ON node_id=${clusterStatus.node_id} peers=[${peers}] `
+        + `first_sync_in=${Math.round(this.cluster.config.bootMinMs / 1000)}-${Math.round(this.cluster.config.bootMaxMs / 1000)}s `
+        + `interval=${Math.round(this.cluster.config.intervalMs / 60000)}min jitter=${Math.round(this.cluster.config.jitterMs / 1000)}s`);
+    } else if (this.persistence.enabled) {
+      m.push('[w2m-rabbit] cluster sync=off (single relay; set --cluster-peers/--cluster-secret to enable)');
+    }
     if (this.persistence.devicesCorrupt) {
       m.push('[w2m-rabbit] !! WARNING: devices.json was CORRUPT — started from an EMPTY device table; '
         + 'every machine must pair again. The damaged file was left untouched.');
@@ -631,6 +718,9 @@ export class RelayServer {
           this.maintenance();
         }, this.sweepIntervalMs);
         this._sweepTimer.unref?.();
+        // v3.0.0: the first peer pull is scheduled 60–600 s from now (random), never at listen time —
+        // a rolling restart of three relays must not make them all pull at the same instant.
+        this.cluster?.start();
         if (this.logger) {
           this._log(`[w2m-rabbit] listening on ${this.url}  pairing code: ${this.pairingCode}`);
           for (const message of this.startupMessages) this._log(message);
@@ -650,6 +740,7 @@ export class RelayServer {
           operatorTokenPrintable: this.operatorTokenPrintable === true,
           operatorTokenPrintReason: this.operatorTokenPrintReason ?? null,
           scheme: this.scheme,
+          cluster: this.cluster === null ? null : this.cluster.status(),
         });
       });
     });
@@ -663,6 +754,7 @@ export class RelayServer {
     return new Promise((resolve) => {
       if (this._sweepTimer) clearInterval(this._sweepTimer);
       this._sweepTimer = null;
+      this.cluster?.stop();
       // v0.4.0: a deferred P2P offer is a pending timer, and a closed relay must not fire one.
       this.state.clearPendingOffers?.();
       for (const sub of [...this.subscribers]) this._closeSubscriber(sub);
@@ -757,6 +849,30 @@ export class RelayServer {
       this.enforcePairRateLimit(req);
       const result = this.state.pair(takeJson());
       return sendJson(res, 200, result);
+    }
+    /* ---- v3.0.0: relay cluster sync (peer-only, cluster HMAC — never a device/operator token) ---- */
+    if (CLUSTER_ROUTES.includes(path)) {
+      if (this.cluster === null) {
+        throw new ProtocolError('NOT_FOUND', 'cluster sync is not enabled on this relay', { hint: 'start the relay with --cluster-peers and --cluster-secret' });
+      }
+      const routed = this.cluster.route({
+        method,
+        path,
+        headers: req.headers,
+        query: url.searchParams,
+        ip: this.clientIp(req),
+      });
+      // Snapshots are pre-encoded (gzip) by cluster-sync: device caps and ledger JSON compress ~5–10x,
+      // and the uncompressed response was large enough to time out on slower relay-to-relay links.
+      if (routed.raw !== undefined) {
+        res.writeHead(routed.status, {
+          'content-type': 'application/json',
+          'cache-control': 'no-store',
+          ...(routed.headers ?? {}),
+        });
+        return res.end(routed.raw);
+      }
+      return sendJson(res, routed.status, routed.body);
     }
     /**
      * v1.2.4: cancellation over HTTP. state.cancelTask has existed since the task ledger gained a cancel flag, but no route
@@ -1673,7 +1789,10 @@ export class RelayServer {
       relay_id: this.relayId,
       version: RELAY_VERSION,
       relay_version: RELAY_VERSION,
-      features: RELAY_FEATURES,
+      features: this.cluster === null ? RELAY_FEATURES : [...RELAY_FEATURES, CLUSTER_FEATURE],
+      // v3.0.0: peer-pull diagnostics only (node id, cursors, counts). Never the cluster secret, never
+      // the synchronized payloads: this endpoint is public.
+      cluster: this.cluster === null ? null : this.cluster.status(),
       started_at: rfc3339(this._startedAtMs),
       effective_scheme: this.effectiveScheme(req),
       base_path: this.basePath,
