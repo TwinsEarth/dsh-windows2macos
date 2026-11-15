@@ -1088,3 +1088,31 @@ it('v3.3.9: marks inside a shadow root are found and activated (document.querySe
   assert.equal(shadowMark.getAttribute("data-active"), "true");
   assert.equal(shadowMark.scrolled, true);
 });
+
+it('v3.3.10: groups target machines into clients first and web hosts second', () => {
+  const { exports } = loadBundle();
+  const group = exports.groupTargetMachines;
+  assert.equal(typeof group, "function");
+  const machines = [
+    { machine_id: "a", name: "win-desktop", os: "windows", kind: "client" },
+    { machine_id: "b", name: "tencent-relay", os: "linux", kind: "web" },
+    { machine_id: "c", name: "macmini", os: "macos" },
+    { machine_id: "d", name: "vultr-relay", kind: "web" },
+  ];
+  const grouped = group(machines);
+  assert.equal(grouped.client.map((m) => m.machine_id).join(","), "a,c");
+  assert.equal(grouped.web.map((m) => m.machine_id).join(","), "b,d");
+  assert.equal(exports.targetMachineKindOf({ os: "linux" }), "web");
+  assert.equal(exports.targetMachineKindOf({ name: "web-host", os: "windows" }), "web");
+  assert.equal(exports.targetMachineKindOf({}), "client");
+});
+
+it('v3.3.10: the target menu folds the web group by default', () => {
+  const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
+  assert.ok(source.includes('const [webOpen, setWebOpen] = React.useState(false)'), 'web group starts folded');
+  assert.ok(source.includes("clientGroup: '客户端'"), 'client group label');
+  assert.ok(source.includes("webGroup: 'Web端'"), 'web group label');
+  assert.ok(source.includes('machineGroups.client.map(renderMachineOption)'), 'clients render first');
+  assert.ok(source.includes('webOpen ? machineGroups.web.map(renderMachineOption) : []'), 'web machines only render after expanding');
+  assert.ok(source.includes("cls('groupToggle')"), 'the web toggle exists');
+});

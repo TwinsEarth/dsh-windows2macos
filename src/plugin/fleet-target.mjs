@@ -165,6 +165,23 @@ export function isSelectableDevice(device) {
  */
 const ARCHIVE_AFTER_MS = 72 * 60 * 60 * 1000;
 
+/**
+ * Which half of the 全部机器 list this machine belongs to.
+ *
+ * v3.3.10: the fleet mixes the operator's desktop clients (Windows/macOS) with the Linux
+ * relay/web hosts (tencent-relay, vultr-relay, …). The relay records no explicit "kind"
+ * field, so the classification is OS-first and name-second: Linux or a relay/web name is
+ * 客户端/Web端's Web half; everything else is a client. A machine with no platform keeps
+ * the old behaviour and stays a client rather than disappearing into the folded half.
+ */
+export function targetMachineKind({ os = null, name = null } = {}) {
+  const osKey = typeof os === 'string' ? os.trim().toLowerCase() : '';
+  if (osKey === 'linux') return 'web';
+  const machineName = typeof name === 'string' ? name.trim() : '';
+  if (machineName !== '' && /(^|[-_\s])(web|relay)([-_\s]|$)/i.test(machineName)) return 'web';
+  return 'client';
+}
+
 export function describeTargetMachine(device, localMachineId = null) {
   const machineId = typeof device?.machine_id === 'string' && device.machine_id !== '' ? device.machine_id : null;
   return {
@@ -173,6 +190,7 @@ export function describeTargetMachine(device, localMachineId = null) {
       ? device.machine_name
       : (typeof device?.name === 'string' && device.name !== '' ? device.name : null),
     os: device?.platform?.os ?? device?.os ?? null,
+    kind: targetMachineKind({ os: device?.platform?.os ?? device?.os ?? null, name: typeof device?.machine_name === 'string' && device.machine_name !== '' ? device.machine_name : (typeof device?.name === 'string' ? device.name : null) }),
     arch: device?.platform?.arch ?? device?.arch ?? null,
     state: typeof device?.state === 'string' && device.state !== '' ? device.state : (isSelectableDevice(device) ? 'online' : 'unknown'),
     online: isSelectableDevice(device),

@@ -46,6 +46,7 @@ import {
   createSelectionStore,
   defaultSelectionStore,
   describeTargetMachine,
+  targetMachineKind,
   dispatchSelectionFields,
   foldRelayItems,
   isSelectableDevice,
@@ -248,6 +249,18 @@ function execFor(sessionId) {
 // ---------------------------------------------------------------------------------------------
 // The roster is the relay's
 // ---------------------------------------------------------------------------------------------
+
+describe('fleet-target: a machine is a client or a web host (v3.3.10)', () => {
+  it('classifies Linux/relay machines as web and desktop machines as client', () => {
+    assert.equal(targetMachineKind({ os: 'windows', name: 'win-desktop' }), 'client');
+    assert.equal(targetMachineKind({ os: 'macos', name: 'macmini' }), 'client');
+    assert.equal(targetMachineKind({ os: 'linux', name: 'tencent-relay' }), 'web');
+    assert.equal(targetMachineKind({ os: null, name: 'vultr-relay' }), 'web');
+    assert.equal(targetMachineKind({ os: null, name: null }), 'client');
+    const described = describeTargetMachine({ machine_id: 'm', machine_name: 'tencent-relay', platform: { os: 'linux' }, online: true });
+    assert.equal(described.kind, 'web');
+  });
+});
 
 describe('fleet-target: the roster comes from the relay', () => {
   it('reads GET /v1/devices with the device token and describes every machine the relay lists', async () => {

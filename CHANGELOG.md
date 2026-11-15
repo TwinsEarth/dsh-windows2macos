@@ -4,6 +4,17 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [3.3.10] - 2026-11-15
+
+- **「全部机器」按客户端 / Web端分组显示**：
+  - 客户端在前（Windows/macOS 的桌面客户端机器），Web端在后；
+  - Web端默认折叠，点击 `Web端 · N · 展开` 才列出（再次点击收起）；
+  - 分类规则（宿主 `targetMachineKind`）：`platform.os === linux`，或机器名匹配 `web`/`relay` 词根 → Web端；其余（含未知平台）→ 客户端；
+  - 旧版宿主没有 `kind` 字段时，浏览器端用同一规则兜底，不影响旧快照；
+  - `全部机器` 行、Relay 折叠与更新提示的位置保持不变。
+- 验证：`fleet-target` 新增分类用例；`client-bundle` 新增分组用例（客户端顺序、Web端折叠、旧宿主兜底），合计 100 项通过；
+  真实 Chromium `loader-entry 10/10`；`claims`/`layer-model` 71 项全绿；`eslint 0 errors`。
+
 ## [3.3.9] - 2026-11-15
 
 - **对话内搜索：↑/↓ 真正跳到上/下一个匹配并居中**（此前只改计数器，正文不滚动、当前匹配没有视觉区分）：
