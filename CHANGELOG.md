@@ -4,6 +4,15 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [3.3.8] - 2026-11-15
+
+- **修复 v3.3.7 的 Release 工作流被整条跳过**：上一版把 npm 的 opt-in 开关误加到了 `release` 作业（verify/pack/publish）上，
+  导致 tag 推送后 Release 直接 skipped。现在 `release` 作业恢复原条件，只有 `publish to npm` 作业要求仓库变量
+  `W2M_PUBLISH_NPM == 'true'`；GitHub Release 本身照常运行并可审批。
+- v3.3.6/3.3.7 的内容不变：队列日志清空可恢复（确认 + 历史快照归档 + 抽屉恢复入口）、历史对话/待选改读宿主会话日志、
+  Node 20 zstd 降级跳过、session-log 测试登记进 scripts.test。
+- 验证：affected suites 126 pass；`loader-entry 10/10`；`eslint 0 errors`；pre-flight 的 test-wiring 已绿。
+
 ## [3.3.7] - 2026-11-15
 
 - **修复 v3.3.6 发布失败的 CI 问题**：

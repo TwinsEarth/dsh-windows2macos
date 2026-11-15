@@ -25,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     # v3.3.7: opt-in via repository variable. A bypass-2FA token can only "stage" a version here,
     # and a staged version is invisible and cannot be republished; publishing stays explicit.
-    if: ${{ !contains(github.event.inputs.tag || '', '-beta.') && vars.W2M_PUBLISH_NPM == 'true' }}
+    if: ${{ !contains(github.event.inputs.tag || '', '-beta.') }}
     # The operator's rule: a STABLE release must be approved online. The beta workflow has no environment at
     # all -- for a beta the control point is who may push its tag.
     environment: Stable
@@ -218,7 +218,10 @@ jobs:
     name: publish to npm
     needs: release
     runs-on: ubuntu-latest
-    if: ${{ !contains(github.event.inputs.tag || '', '-beta.') }}
+    # v3.3.7: npm publishing is opt-in. A bypass-2FA token on this repository only
+    # "stages" a version (invisible and unrepeatable), so the job stays off unless
+    # the repository variable W2M_PUBLISH_NPM is set to true.
+    if: ${{ !contains(github.event.inputs.tag || '', '-beta.') && vars.W2M_PUBLISH_NPM == 'true' }}
     continue-on-error: true
     permissions:
       contents: read

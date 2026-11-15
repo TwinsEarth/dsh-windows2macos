@@ -1,0 +1,37 @@
+{
+  "version": "3.3.8",
+  "case": "RELEASE-3380",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-15T01:44:55.179Z",
+  "executor": "lead",
+  "task_id": "pre-release-3380",
+  "requirement": "v3.3.8 restores the Release workflow release job (which v3.3.7 inadvertently gated with the npm opt-in variable) and keeps the npm job opt-in",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/session-log.test.mjs",
+      "test/queue-journal.test.mjs",
+      "test/client-bundle.test.mjs",
+      "test/claims.test.mjs",
+      "test/layer-model.test.mjs"
+    ],
+    [
+      "node",
+      "scripts/pack.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "release_job": "release.yml release job condition is back to the beta filter, so a v* tag produces the verify/pack/publish run again",
+      "npm_job": "publish to npm additionally requires repository variable W2M_PUBLISH_NPM == true; default off because a bypass-2FA token only stages versions on this repository",
+      "evidence": "v3.3.7 run 43664479529 is skipped=all jobs skipped; the workflow diff shows the gate had landed on the release job and is now moved to the npm job",
+      "proof": "affected suites 126 pass; eslint 0; pre-flight test-wiring green"
+    }
+  }
+}
