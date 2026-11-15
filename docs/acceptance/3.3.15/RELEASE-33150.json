@@ -1,0 +1,33 @@
+{
+  "version": "3.3.15",
+  "case": "RELEASE-33150",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-15T04:40:05.755Z",
+  "executor": "lead",
+  "task_id": "pre-release-33150",
+  "requirement": "v3.3.15: the 全部机器 menu must add an offline group after 客户端 and Web端; offline machines are folded by default and remain non-selectable",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/client-bundle.test.mjs"
+    ],
+    [
+      "node",
+      "scripts/pack.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "groups": "groupTargetMachines returns {client, web, offline}: online machines are split by targetMachineKindOf, every machine with online !== true goes to offline",
+      "order": "the menu renders 客户端 first, the Web端 toggle second, and the 离线 toggle last; both folded groups start closed and are reset to closed on every open",
+      "state": "offline options reuse renderMachineOption, so they stay disabled (online !== true) exactly like before the grouping change",
+      "proof": "client-bundle 51 pass (order, fold default, offline buckets, old-snapshot fallback); eslint 0 errors"
+    }
+  }
+}

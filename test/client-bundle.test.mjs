@@ -1094,15 +1094,18 @@ it('v3.3.10: groups target machines into clients first and web hosts second', ()
   const group = exports.groupTargetMachines;
   assert.equal(typeof group, "function");
   const machines = [
-    { machine_id: "a", name: "win-desktop", os: "windows", kind: "client" },
-    { machine_id: "b", name: "tencent-relay", os: "linux", kind: "web" },
-    { machine_id: "c", name: "macmini", os: "macos" },
-    { machine_id: "d", name: "vultr-relay", kind: "web" },
-    { machine_id: "e", name: "mystery-box" },
+    { machine_id: "a", name: "win-desktop", os: "windows", kind: "client", online: true },
+    { machine_id: "b", name: "tencent-relay", os: "linux", kind: "web", online: true },
+    { machine_id: "c", name: "macmini", os: "macos", online: true },
+    { machine_id: "d", name: "vultr-relay", kind: "web", online: true },
+    { machine_id: "e", name: "mystery-box", online: true },
+    { machine_id: "f", name: "old-win", os: "windows", online: false },
+    { machine_id: "g", name: "old-relay", os: "linux", online: false },
   ];
   const grouped = group(machines);
   assert.equal(grouped.client.map((m) => m.machine_id).join(","), "a,c");
   assert.equal(grouped.web.map((m) => m.machine_id).join(","), "b,d,e");
+  assert.equal(grouped.offline.map((m) => m.machine_id).join(","), "f,g");
   assert.equal(exports.targetMachineKindOf({ os: "linux" }), "web");
   assert.equal(exports.targetMachineKindOf({ name: "web-host", os: "windows" }), "web");
   assert.equal(exports.targetMachineKindOf({}), "web");
@@ -1130,4 +1133,13 @@ it('v3.3.14: the queue drawer splits 人类输入 from a folded 机器生成 blo
   assert.ok(source.includes("'机器生成 · ' + clientAll.length"), 'machine records have a folded block count');
   assert.ok(source.includes('const clientAll = store.state.entries.filter((entry) => !isHumanEntry(entry))'), 'machine records are counted before content filtering');
   assert.ok(source.includes("dcEl('details', { className: 'w2mJqClientFold' })"), 'the machine block is a details element (folded by default)');
+});
+
+it('v3.3.15: the target menu adds a folded offline group after clients and web hosts', () => {
+  const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
+  assert.ok(source.includes("offlineGroup: '离线'"), 'offline group label');
+  assert.ok(source.includes('const [offlineOpen, setOfflineOpen] = React.useState(false)'), 'offline starts folded');
+  assert.ok(source.includes('machineGroups.offline.map(renderMachineOption)'), 'offline machines render in their own group');
+  assert.ok(source.includes("key: '__offlineToggle__'"), 'the offline toggle exists');
+  assert.ok(source.includes('setOfflineOpen(false)'), 'offline resets to folded on every open');
 });
