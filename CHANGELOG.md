@@ -4,6 +4,13 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [3.4.3] - 2026-11-15
+
+- **发布产物一致性修复**：v3.4.2 的 GitHub Release 是干净 tag 产物（1,928,320 B / sha256 0458b2…），但本地 pack 时把未跟踪的 `docs/RELAY-CLUSTER-SYNC-PHASE2-DESIGN.md` 一并打进了 npm staging（1,938,223 B / 不同 shasum）。
+  - Phase2 设计草稿已移出仓库，3.4.3 从**干净工作区**重新打包；GitHub Release、npm、本机 profile 使用同一份字节。
+  - 功能代码与 3.4.2 相同；仅修正发布产物。
+- 3.4.2 的 npm staged 条目（40ed0f72…）作废，请只批准 3.4.3。
+
 ## [3.4.2] - 2026-11-15
 
 - **Release pre-flight 第二个根因修复**：3.4.1 在 CI 仍红，但测试计数是 `3502 tests / fail 0`，实际是 Relay cluster 的两处重试延迟 timer 被 `unref()`；`node:test` 等待期间事件循环已空，Node 22 报 `Promise resolution is still pending but the event loop has already resolved` 并把测试标记为 cancelled/failed。

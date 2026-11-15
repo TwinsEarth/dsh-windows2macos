@@ -1,0 +1,30 @@
+{
+  "version": "3.4.3",
+  "case": "RELEASE-3430",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-15T12:35:53.858Z",
+  "executor": "lead",
+  "task_id": "pre-release-3430",
+  "requirement": "v3.4.3: GitHub Release, npm staging and local install must be byte-identical; the untracked Phase2 design draft must not enter the artifact",
+  "commands": [
+    [
+      "node",
+      "scripts/pack.mjs"
+    ],
+    [
+      "node",
+      "scripts/preflight.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "clean_tree": "git status clean before pack; Phase2 draft moved out of the repo",
+      "artifact": "local pack hash equals the CI Release asset for the same tag",
+      "functional": "no functional change from 3.4.2"
+    }
+  }
+}
