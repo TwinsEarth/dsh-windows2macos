@@ -797,6 +797,7 @@ function readConfig(config = {}) {
 
   // v3.3.16: an unset stateDir is the documented default layout, not "no state": without this
   // fallback every machine without an explicit profile value lost local memory and RTT.
+  const stateDirExplicit = typeof config.stateDir === 'string' && config.stateDir.trim() !== '';
   const stateDir = configuredStateDir(config);
   /**
    * The settings-page pin. This is the supported alternative to editing `cordis.patch.yml`: the
@@ -854,6 +855,7 @@ function readConfig(config = {}) {
 
   return {
     stateDir,
+    stateDirExplicit,
     projectDir: typeof config.projectDir === 'string' && config.projectDir.trim() !== ''
       ? path.resolve(config.projectDir.trim())
       : cwd,
@@ -1346,6 +1348,8 @@ const P2P_INBOX_NAME_MAX = 128;
  * @returns {string|null}
  */
 function devicePathFor(cfg) {
+  const explicitFile = typeof process.env.DSH_DEVICE_FILE === 'string' ? process.env.DSH_DEVICE_FILE.trim() : '';
+  if (explicitFile !== '') return path.resolve(explicitFile);
   if (cfg.stateDir) return path.join(cfg.stateDir, 'device.json');
   try {
     return deviceFilePath({});
@@ -2402,25 +2406,6 @@ function p2pTransportFacts(node) {
   };
 }
 
-/**
- * Require the state directory, naming the setting when it is absent.
- *
- * Used by the paths that genuinely cannot work without a `device.json - see {@link resolveToken},
- * which is the only caller, and which explains why an unset `stateDir` is not an error there.
- *
- * @param {{stateDir: string|null}} cfg
- * @returns {string}
- */
-function requireStateDir(cfg) {
-  if (!cfg.stateDir) {
-    throw configError(
-      'stateDir',
-      'is not set, so device.json cannot be located',
-      'set `stateDir` to the directory holding device.json (the agent writes it there after pairing)',
-    );
-  }
-  return cfg.stateDir;
-}
 
 /**
  * Require the operator token, naming the setting when it is absent (PROTOCOL-v0.1.2 §5).
@@ -2950,11 +2935,17 @@ function endpointOf(target) {
  * @returns {Promise<string|null>}
  */
 async function resolveToken(cfg) {
-  if (cfg.stateDir) return requireToken(await readDevice({ stateDir: requireStateDir(cfg) }));
   const file = devicePathFor(cfg);
   if (file === null) return null;
   const device = await readDevice({ stateDir: path.dirname(file) });
-  return device.present ? requireToken(device) : null;
+  if (!device.present) {
+    // An explicit stateDir is the operator pointing at a pairing; an unpaired one is a loud
+    // error. The default stateDir (v3.3.16) is just a layout, and a machine that has never
+    // paired still dispatches over the relay with the operator token.
+    if (cfg.stateDirExplicit === true) return requireToken(device);
+    return null;
+  }
+  return requireToken(device);
 }
 
 // ---------------------------------------------------------------------------------------------

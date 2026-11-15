@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [3.4.1] - 2026-11-15
+
+- **CI 根因修复**：3.3.18/3.4.0 的 Release pre-flight 失败，不是代码功能问题，而是测试主机依赖泄漏：P0 的默认 `stateDir` 让 `DSH_DEVICE_FILE` 不再优先，CI 干净环境没有 `~/.dsh/xclient/device.json` 时 6 个 `update-wiring` 用例读到宿主路径并报 `W2M_NO_TOKEN`。
+  - `devicePathFor` 恢复优先级：`DSH_DEVICE_FILE`（显式 override）→ 显式 `stateDir` → `$DSH_HOME/xclient`；
+  - `resolveToken` 只在 `stateDir` 被显式配置时才把缺失 device 当硬错误，默认 stateDir 下仍可回退 operator token；
+  - 增加回归用例：设置 `DSH_DEVICE_FILE` 时必须使用其中的 `device_token`。
+- 已用**空 DSH_HOME** 模拟 CI 跑 pre-flight，避免再依赖本机 device token。
+
 ## [3.4.0] - 2026-11-15
 
 **主题：Relay 三节点数据同步正式发布，并完成队列/历史可靠性修复。**

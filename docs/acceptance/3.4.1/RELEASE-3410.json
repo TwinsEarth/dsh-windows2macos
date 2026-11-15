@@ -1,0 +1,36 @@
+{
+  "version": "3.4.1",
+  "case": "RELEASE-3410",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-15T11:46:02.715Z",
+  "executor": "lead",
+  "task_id": "pre-release-3410",
+  "requirement": "v3.4.1: Release pre-flight must pass in a clean DSH_HOME; DSH_DEVICE_FILE must outrank the default stateDir for device identity",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/update-wiring.test.mjs"
+    ],
+    [
+      "node",
+      "scripts/preflight.mjs"
+    ],
+    [
+      "node",
+      "scripts/pack.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "device_env": "DSH_DEVICE_FILE is consulted before stateDir and its device_token is used",
+      "ci_simulation": "update-wiring 35/35 passes with an empty DSH_HOME; pre-flight passes there",
+      "proof": "local pre-flight with DSH_HOME empty: 16/16 GREEN"
+    }
+  }
+}

@@ -390,6 +390,30 @@ describe('w2m_history and w2m_stats (v0.3.0)', () => {
     ],
   };
 
+  it('v3.4.1: DSH_DEVICE_FILE wins over the default stateDir for the device token', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'w2m-device-env-'));
+    cleanup.push(dir);
+    const file = path.join(dir, 'device.json');
+    writeFileSync(file, JSON.stringify({ machine_id: 'm-env', device_token: 'tok-env', rabbit_url: 'http://relay.test' }), 'utf8');
+    const previous = process.env.DSH_DEVICE_FILE;
+    process.env.DSH_DEVICE_FILE = file;
+    const calls = [];
+    const original = globalThis.fetch;
+    globalThis.fetch = async (url, init) => {
+      calls.push({ url: String(url), headers: init?.headers ?? {} });
+      return { ok: true, status: 200, json: async () => ({ protocol_version: 1, tasks: [] }), text: async () => '{}', arrayBuffer: async () => new ArrayBuffer(0) };
+    };
+    try {
+      const { tools } = await register({ rabbitUrl: 'http://relay.test', profileDir: makeProfile(), operatorToken: 'op' });
+      await tools.get('w2m_history').execute({}, {});
+      assert.ok(calls.length > 0);
+      assert.equal(String(calls[0].headers.authorization ?? calls[0].headers.Authorization ?? ''), 'Bearer tok-env');
+    } finally {
+      process.env.DSH_DEVICE_FILE = previous;
+      globalThis.fetch = original;
+    }
+  });
+
   it('lists recent tasks in the order the relay gave, without fetching any result', async () => {
     const profileDir = makeProfile();
     const { tools } = await register({ rabbitUrl: 'http://relay.test', profileDir, operatorToken: 'op' });
