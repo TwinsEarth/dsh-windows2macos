@@ -1152,3 +1152,10 @@ it('v3.3.17: the history panel defaults to newest first, with the draft pinned a
   assert.ok(source.includes("item?.key === 'draft'"), 'the current draft is kept outside the timestamp sort');
   assert.ok(source.includes('仅人类输入 · 从新到旧'), 'the panel says which order it uses');
 });
+
+it('v3.3.18: an empty sessionKey still counts as a human entry', () => {
+  const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
+  assert.ok(source.includes("entry?.sessionKey || entry?.key"), 'empty sessionKey falls back to key');
+  assert.ok(!source.includes("entry?.sessionKey ?? entry?.key"), 'nullish fallback would hide empty-string sessionKeys');
+  assert.ok(source.includes("startsWith('session-')"), 'the human/machine split still keys off session-');
+});

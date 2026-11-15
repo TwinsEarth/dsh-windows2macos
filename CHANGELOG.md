@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [3.3.18] - 2026-11-15
+
+- **队列日志：人类输入恢复**。旧客户端保存的记录里 `sessionKey` 是空字符串、真实会话键在 `key` 上；`??` 把空字符串当成“已存在”，导致所有人类队伍都被折进「机器生成」，标题显示 0 条人类输入。现在客户端与宿主统一用「空值回退到 key」判定：
+  - 客户端 `isHumanJournalEntry`：`sessionKey || key` 以 `session-` 开头即人类；徽标计数、抽屉分块、恢复队列共用同一判定；
+  - 宿主 `ComposerJournal.list/get/save`：缺失的 `sessionKey` 从 `session-<uuid>` key 自动补齐；页面级 key 仍不冒充会话。
+- **修复 release pre-flight 的 mojibake 误报**：`test/cluster-sync.test.mjs` 注释里的乱码标点改为 ASCII 连字符，CI 的 mojibake 扫描恢复通过（这是 3.3.16/3.3.17 GitHub Release 失败的直接原因）。
+- 包含 3.3.17 的「历史对话从新到旧」与 3.3.16 的 Relay v3.0.0 集群同步、P0/P2 修复。
+
 ## [3.3.17] - 2026-11-15
 
 - **历史对话默认从新到旧**：聊天框「历史对话」窗口按时间倒序展示（当前草稿固定在最上方，随后是带时间戳的排队/已发送消息，从新到旧；无时间戳的条目排在最后）。标题标注「仅人类输入 · 从新到旧」。

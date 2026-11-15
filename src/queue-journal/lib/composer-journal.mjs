@@ -16,6 +16,18 @@ function cleanText(value, limit) {
   return String(value ?? '').replace(/\0/g, '').slice(0, limit)
 }
 
+/**
+ * `sessionKey` is the field the human/machine split reads. Older clients saved it as an empty
+ * string beside a real `session-<uuid>` key, which made every human row look client-generated.
+ * Derive it from the key when it is missing; return '' for page-scoped keys (not human).
+ */
+function sessionKeyFor(entry, fallbackKey = '') {
+  const stored = cleanText(entry?.sessionKey, 200)
+  if (stored !== '') return stored
+  const key = cleanText(entry?.key ?? fallbackKey, 200)
+  return key.startsWith('session-') ? key : ''
+}
+
 export class ComposerJournal {
   constructor(dataDir) {
     this.file = path.join(dataDir, 'composer-journal.json')
@@ -38,7 +50,8 @@ export class ComposerJournal {
 
   get(key) {
     const entry = this.load()[String(key)]
-    return entry && typeof entry === 'object' ? entry : null
+    if (entry === null || typeof entry !== 'object') return null
+    return { ...entry, sessionKey: sessionKeyFor(entry, String(key)) }
   }
 
   /** All recoverable journal entries, newest first (bounded by the same 100-session cap). */
@@ -46,6 +59,7 @@ export class ComposerJournal {
     const all = this.load()
     return Object.values(all)
       .filter((entry) => entry && typeof entry === 'object')
+      .map((entry) => ({ ...entry, sessionKey: sessionKeyFor(entry) }))
       .sort((a, b) => String(b?.updatedAt || '').localeCompare(String(a?.updatedAt || '')))
   }
 
@@ -63,7 +77,7 @@ export class ComposerJournal {
       draft: cleanText(input.draft, MAX_DRAFT),
       queue,
       path: cleanText(input.path, 500),
-      sessionKey: cleanText(input.sessionKey, 200),
+      sessionKey: cleanText(input.sessionKey, 200) || (id.startsWith('session-') ? id : ''),
       title: cleanText(input.title, 200),
       updatedAt: new Date().toISOString(),
     }

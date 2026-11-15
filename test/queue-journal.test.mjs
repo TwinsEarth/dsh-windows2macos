@@ -7,7 +7,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as zlib from 'node:zlib';
@@ -211,4 +211,20 @@ test('queue journal: the sessions route resolves a journal session title from it
   assert.equal(out.status, 200);
   const item = (out.body.items ?? []).find((row) => row.id === 'session-titled');
   assert.equal(item?.title, 'DSH：房主');
+});
+
+test('v3.3.18: an empty sessionKey is derived from the key for legacy rows', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'w2m-journal-key-'));
+  try {
+    const file = join(dir, 'composer-journal.json');
+    writeFileSync(file, JSON.stringify({ 'session-legacy-1': { key: 'session-legacy-1', draft: 'x', queue: [], sessionKey: '', title: '', updatedAt: '2026-11-15T00:00:00.000Z' }, 'page:abc': { key: 'page:abc', draft: 'y', queue: [], sessionKey: '', title: '', updatedAt: '2026-11-15T00:00:01.000Z' } }), 'utf8');
+    const journal = new ComposerJournal(dir);
+    const listed = journal.list();
+    assert.equal(listed.find((e) => e.key === 'session-legacy-1')?.sessionKey, 'session-legacy-1');
+    assert.equal(listed.find((e) => e.key === 'page:abc')?.sessionKey, '');
+    const saved = journal.save('session-new-1', { draft: 'new' });
+    assert.equal(saved.sessionKey, 'session-new-1', 'a new human row stores the key as sessionKey');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

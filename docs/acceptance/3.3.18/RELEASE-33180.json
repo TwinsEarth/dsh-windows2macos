@@ -1,0 +1,39 @@
+{
+  "version": "3.3.18",
+  "case": "RELEASE-33180",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-15T11:19:25.690Z",
+  "executor": "lead",
+  "task_id": "pre-release-33180",
+  "requirement": "v3.3.18: queue-journal rows saved with sessionKey \"\" must still count as human input in the client and the host, and the release pre-flight mojibake scan must pass",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/queue-journal.test.mjs",
+      "test/client-bundle.test.mjs",
+      "test/cluster-sync.test.mjs"
+    ],
+    [
+      "node",
+      "scripts/preflight.mjs"
+    ],
+    [
+      "node",
+      "scripts/pack.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "client": "isHumanJournalEntry uses sessionKey || key; badge snapshot, drawer split and queue restore share it",
+      "host": "ComposerJournal.list/get/save derive sessionKey from a session-<uuid> key when stored sessionKey is empty; page keys stay non-human",
+      "mojibake": "test/cluster-sync.test.mjs contains no U+9225 sequence; the pre-flight mojibake scan is green",
+      "proof": "queue-journal 12 pass; client-bundle 53 pass; pre-flight 16/16 checks pass"
+    }
+  }
+}

@@ -1,5 +1,5 @@
 /**
- * Relay v3.0.0 cluster sync 鈥?unit tests.
+ * Relay v3.0.0 cluster sync - unit tests.
  *
  * Covers configuration validation, the signed/encrypted peer protocol, scheduling bounds, the device
  * LWW merge, ledger replay idempotency and the end-to-end pull between two in-memory relays.
@@ -119,7 +119,7 @@ describe('cluster envelope and request auth', () => {
     assert.equal(safeEqualBase64(token, token.slice(0, -2) + 'AA'), false);
   });
 
-  it('keeps the first-sync delay inside 60鈥?00 s and the periodic delay inside interval+jitter', () => {
+  it('keeps the first-sync delay inside 60-600 s and the periodic delay inside interval+jitter', () => {
     const config = clusterConfig();
     for (const value of [0, 0.5, 0.999999]) {
       const first = bootDelayMs(config, () => value);

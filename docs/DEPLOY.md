@@ -217,6 +217,12 @@ The relay already accepts `W2M_OPERATOR_TOKEN` (see `--help`), so no CLI change 
 needed. `EnvironmentFile` values are readable only by root via
 `/proc/<pid>/environ`; they are no longer part of the process arguments.
 
+The same rule applies to **every other unit on the relay host that needs the
+token** — `w2m-localside*` and member agents accept `$W2M_OPERATOR_TOKEN` too, so
+give them the same `EnvironmentFile=` line instead of `--operator-token` in
+`ExecStart`. A token in any unit's argv is visible to every local user through
+`ps`.
+
 
 ### 2.5 Pair each machine
 
