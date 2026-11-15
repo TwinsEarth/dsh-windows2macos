@@ -1,0 +1,42 @@
+{
+  "version": "3.3.7",
+  "case": "RELEASE-3370",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-15T01:41:36.948Z",
+  "executor": "lead",
+  "task_id": "pre-release-3370",
+  "requirement": "v3.3.7 repairs the v3.3.6 release CI red (session-log suite not declared in scripts.test, node 20 has no zstd) and makes the CI npm publish opt-in so a staged (invisible, unrepeatable) version cannot be produced silently",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/session-log.test.mjs",
+      "test/queue-journal.test.mjs",
+      "test/client-bundle.test.mjs",
+      "test/claims.test.mjs",
+      "test/layer-model.test.mjs"
+    ],
+    [
+      "node",
+      "scripts/preflight.mjs"
+    ],
+    [
+      "node",
+      "scripts/pack.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "test_wiring": "test/session-log.test.mjs is named by package.json#scripts.test, so the pre-flight test-wiring check finds no undeclared suite",
+      "node20": "the session-log reader reports supported:false on Node < 22.15 (no zlib zstd), the route answers zstd-unsupported and the client falls back to the sessions service; the zstd tests skip on that Node instead of failing",
+      "npm_gate": "release.yml publish-to-npm job now also requires repository variable W2M_PUBLISH_NPM == true, because a bypass-2FA token only stages a version on this repository",
+      "prior_fixes": "v3.3.6 content ships here: archive-then-clear queue journal with recoverable history snapshots, and host session-log reading for the history window and choice detection",
+      "proof": "affected suites all pass locally; loader-entry 10/10; eslint 0 errors; the v3.3.6 failures were reproduced from the CI job/step list and the pre-flight log"
+    }
+  }
+}

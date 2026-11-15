@@ -4,6 +4,18 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [3.3.7] - 2026-11-15
+
+- **修复 v3.3.6 发布失败的 CI 问题**：
+  - `test/session-log.test.mjs` 未登记进 `package.json#scripts.test` → release pre-flight 的 test wiring 判红；已登记。
+  - Node 20 没有 `node:zlib` zstd API：新增读取器在 Node<22.15 上返回 `supported:false`（宿主路由回 `zstd-unsupported`，客户端自动回退 sessions 服务），
+    对应测试在 Node 20 上跳过而不是整套失败。
+- **CI 的 npm 发布改为显式开关**：`release.yml` 的 `publish to npm` 现在要求仓库变量 `W2M_PUBLISH_NPM == 'true'`。
+  带 bypass-2FA 的 token 在本仓库只会把一个版本「stage」到 npm（不可见、同版本不可重发），因此默认跳过 CI 发布，
+  由本地 `npm publish` 显式完成；需要恢复 CI 发布时在仓库 Variables 里打开该开关。
+- v3.3.6 的内容不变：队列日志清空可恢复（确认 + 历史快照归档 + 抽屉恢复入口）、历史对话/待选改读宿主会话日志。
+- 验证：`session-log`/`queue-journal`/`client-bundle`/`claims`/`layer-model` 全绿；`loader-entry 10/10`；`eslint 0 errors`。
+
 ## [3.3.6] - 2026-11-15
 
 - **队列日志「清空全部」不再造成不可逆丢失**：清空前先确认，并把每条记录（含仅有草稿的）归档到历史快照，再逐条清空；

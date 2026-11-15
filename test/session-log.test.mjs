@@ -7,9 +7,13 @@ import assert from 'node:assert/strict';
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { zstdCompressSync } from 'node:zlib';
+import * as zlib from 'node:zlib';
 
 import { findSessionLog, readSessionById, readSessionLog, sessionsRoot } from '../src/queue-journal/lib/session-log.mjs';
+
+// Node < 22.15 has no zstd in node:zlib (CI's node 20 lane); those tests skip, the reader degrades.
+const ZSTD_READY = typeof zlib.zstdCompressSync === 'function';
+const skip = ZSTD_READY ? false : 'this Node has no zstd API (needs >= 22.15)';
 
 const fixtures = [];
 function fixture() {
@@ -23,7 +27,7 @@ test.after(() => {
 
 const event = (value) => `${JSON.stringify(value)}\n`;
 function frame(events) {
-  return zstdCompressSync(Buffer.from(events.map(event).join(''), 'utf8'));
+  return zlib.zstdCompressSync(Buffer.from(events.map(event).join(''), 'utf8'));
 }
 function makeLog(root, sessionId) {
   const file = join(root, 'workspace-a', sessionId, 'session.v4.jsonl.zstd');
@@ -31,7 +35,7 @@ function makeLog(root, sessionId) {
   return file;
 }
 
-test('session-log: reads title, human messages and the last assistant reply, excluding machine-injected user messages', () => {
+test('session-log: reads title, human messages and the last assistant reply, excluding machine-injected user messages', { skip }, () => {
   const root = fixture();
   const file = makeLog(root, 'session-abc');
   writeFileSync(file, frame([
@@ -48,7 +52,7 @@ test('session-log: reads title, human messages and the last assistant reply, exc
   assert.equal(out.assistant, '旧回复');
 });
 
-test('session-log: appended zstd frames are picked up incrementally without duplicating history', () => {
+test('session-log: appended zstd frames are picked up incrementally without duplicating history', { skip }, () => {
   const root = fixture();
   const file = makeLog(root, 'session-abc');
   writeFileSync(file, frame([
@@ -71,7 +75,7 @@ test('session-log: appended zstd frames are picked up incrementally without dupl
   assert.equal(second.assistant, '回复二');
 });
 
-test('session-log: resolves session ids with or without the session- prefix and returns null when the log is missing', () => {
+test('session-log: resolves session ids with or without the session- prefix and returns null when the log is missing', { skip }, () => {
   const root = fixture();
   const file = makeLog(root, 'session-xyz');
   writeFileSync(file, frame([{ type: 'session/title', time: 1, data: { title: '定位' } }]));

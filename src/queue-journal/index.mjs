@@ -156,6 +156,7 @@ export function registerQueueJournalRoutes(ctx, deps) {
       try {
         const log = readSessionById(sessionId, { root: deps.sessionLogRoot ?? sessionsRoot() });
         if (log === null) return json(200, { ok: true, found: false, human: [], assistant: '', title: '' });
+        if (log.supported === false) return json(200, { ok: false, error: 'zstd-unsupported', found: false, human: [], assistant: '', title: '' });
         return json(200, {
           ok: true,
           found: true,

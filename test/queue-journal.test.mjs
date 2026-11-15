@@ -10,7 +10,9 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { zstdCompressSync } from 'node:zlib';
+import * as zlib from 'node:zlib';
+
+const ZSTD_READY = typeof zlib.zstdCompressSync === 'function';
 
 import {
   apply,
@@ -159,7 +161,7 @@ test('queue journal: the display title is persisted with the record', async () =
   assert.equal(entry.title, '部署排查');
 });
 
-test('queue journal: the session-log route reads human history and the last assistant reply', async () => {
+test('queue journal: the session-log route reads human history and the last assistant reply', { skip: ZSTD_READY ? false : 'this Node has no zstd API (needs >= 22.15)' }, async () => {
   const root = mkdtempSync(join(tmpdir(), 'w2m-qj-log-'));
   const sessionDir = join(root, 'sessions', 'workspace-a', 'session-demo');
   mkdirSync(sessionDir, { recursive: true });
@@ -169,7 +171,7 @@ test('queue journal: the session-log route reads human history and the last assi
     { type: 'user/message', time: 2000, data: { content: [{ type: 'text', text: '人类问了一句' }], source: { kind: 'user' }, role: 'user' } },
     { type: 'assistant/message', time: 3000, data: { message: { role: 'assistant', content: [{ type: 'text', text: '助手回复' }] } } },
   ];
-  writeFileSync(join(sessionDir, 'session.v4.jsonl.zstd'), zstdCompressSync(Buffer.from(payload.map(event).join(''), 'utf8')));
+  writeFileSync(join(sessionDir, 'session.v4.jsonl.zstd'), zlib.zstdCompressSync(Buffer.from(payload.map(event).join(''), 'utf8')));
   const { call } = mount({ dataDir: join(root, 'journal'), sessionLogRoot: join(root, 'sessions') });
   const out = await call(`${QUEUE_JOURNAL_ROUTE_PREFIX}/session-log?sessionId=demo`);
   assert.equal(out.status, 200);

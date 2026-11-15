@@ -12,6 +12,8 @@ import { homedir } from 'node:os'
 import zlib from 'node:zlib'
 
 const ZSTD_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
+// Node < 22.15 has no zstd in node:zlib (CI's node 20 lane); the reader degrades honestly instead of crashing.
+const ZSTD_READY = typeof zlib.zstdDecompressSync === 'function'
 const MAX_HUMAN = 200
 const MAX_TEXT = 12_000
 
@@ -86,6 +88,7 @@ function freshCache() {
  * @returns {{title:string, human:Array<{text:string,time:number|null}>, assistant:string, assistantTime:number|null, size:number}}
  */
 export function readSessionLog(file) {
+  if (!ZSTD_READY) return { supported: false, title: '', human: [], assistant: '', assistantTime: null, size: 0 }
   const stat = fs.statSync(file)
   let cache = caches.get(file)
   if (cache === undefined || stat.size < cache.size) {
@@ -128,7 +131,7 @@ export function readSessionLog(file) {
     cache.offset = stat.size - cache.carryFrame.length
     cache.size = stat.size
   }
-  return { title: cache.title, human: cache.human.slice(), assistant: cache.assistant, assistantTime: cache.assistantTime || null, size: cache.size }
+  return { supported: true, title: cache.title, human: cache.human.slice(), assistant: cache.assistant, assistantTime: cache.assistantTime || null, size: cache.size }
 }
 
 /** Resolve and read one session in a single call; null when the log does not exist. */
