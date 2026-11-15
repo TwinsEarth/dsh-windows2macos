@@ -134,6 +134,55 @@ export function readSessionLog(file) {
   return { supported: true, title: cache.title, human: cache.human.slice(), assistant: cache.assistant, assistantTime: cache.assistantTime || null, size: cache.size }
 }
 
+/**
+ * Resolve a session title from the HEAD of its log, without decoding the whole file.
+ *
+ * `session/title` events are written near the start (right after the first message), so reading the
+ * first few megabytes of zstd frames is enough for the journal drawer; decoding a 100 MB log per
+ * session on every drawer refresh would not be. Cache is keyed by file+size so an append-only log
+ * is re-read only when it actually grew.
+ */
+const TITLE_BYTES = 4_000_000
+const TITLE_CACHE_LIMIT = 200
+const titleCache = new Map()
+
+export function readSessionTitle(sessionId, { root = sessionsRoot(), maxBytes = TITLE_BYTES } = {}) {
+  const found = findSessionLog(root, sessionId)
+  if (found === null) return null
+  const stat = fs.statSync(found.file)
+  const cacheKey = found.file + ':' + stat.size
+  if (titleCache.has(cacheKey)) return titleCache.get(cacheKey)
+  let title = null
+  try {
+    const length = Math.min(stat.size, Math.max(1024, Number(maxBytes) || TITLE_BYTES))
+    const buffer = Buffer.alloc(length)
+    const fd = fs.openSync(found.file, 'r')
+    try { fs.readSync(fd, buffer, 0, length, 0) } finally { fs.closeSync(fd) }
+    let start = buffer.indexOf(ZSTD_MAGIC)
+    while (start !== -1) {
+      const next = buffer.indexOf(ZSTD_MAGIC, start + ZSTD_MAGIC.length)
+      const end = next === -1 ? buffer.length : next
+      const frame = buffer.subarray(start, end)
+      let text = null
+      try { text = zlib.zstdDecompressSync(frame).toString('utf8') } catch { text = null }
+      if (text !== null) {
+        for (const line of text.split('\n')) {
+          if (line.trim() === '') continue
+          try {
+            const event = JSON.parse(line)
+            if (event?.type === 'session/title' && typeof event.data?.title === 'string' && event.data.title.trim() !== '') title = event.data.title.trim()
+          } catch { /* skip a line split across frames */ }
+        }
+      }
+      if (next === -1) break
+      start = next
+    }
+  } catch { title = null }
+  titleCache.set(cacheKey, title)
+  while (titleCache.size > TITLE_CACHE_LIMIT) titleCache.delete(titleCache.keys().next().value)
+  return title
+}
+
 /** Resolve and read one session in a single call; null when the log does not exist. */
 export function readSessionById(sessionId, { root = sessionsRoot() } = {}) {
   const found = findSessionLog(root, sessionId)

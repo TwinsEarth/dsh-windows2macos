@@ -198,3 +198,17 @@ test('queue journal: heals an accidentally cleared journal from its history snap
   assert.equal(journal.recoverEmpty(), 0);
   assert.equal(journal.get('session-a').draft, '');
 });
+
+test('queue journal: the sessions route resolves a journal session title from its log', { skip: ZSTD_READY ? false : 'this Node has no zstd API (needs >= 22.15)' }, async () => {
+  const root = mkdtempSync(join(tmpdir(), 'w2m-qj-title-'));
+  const sessionDir = join(root, 'sessions', 'workspace-a', 'session-titled');
+  mkdirSync(sessionDir, { recursive: true });
+  const event = (value) => `${JSON.stringify(value)}\n`;
+  writeFileSync(join(sessionDir, 'session.v4.jsonl.zstd'), zlib.zstdCompressSync(Buffer.from(event({ type: 'session/title', time: 1, data: { title: 'DSH：房主' } }), 'utf8')));
+  const { call } = mount({ dataDir: join(root, 'journal'), sessionLogRoot: join(root, 'sessions') });
+  await call(QUEUE_JOURNAL_ROUTE_PREFIX, post({ key: 'session-titled', draft: 'd', queue: [], sessionKey: 'session-titled' }));
+  const out = await call(`${QUEUE_JOURNAL_ROUTE_PREFIX}/sessions`);
+  assert.equal(out.status, 200);
+  const item = (out.body.items ?? []).find((row) => row.id === 'session-titled');
+  assert.equal(item?.title, 'DSH：房主');
+});

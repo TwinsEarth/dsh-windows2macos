@@ -1,0 +1,38 @@
+{
+  "version": "3.3.13",
+  "case": "RELEASE-33130",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-15T03:51:44.736Z",
+  "executor": "lead",
+  "task_id": "pre-release-33130",
+  "requirement": "v3.3.13: queue journal entries must show the DSH session name instead of 未知会话; the Session ID stays the unique key, the display name comes from the session title",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/session-log.test.mjs",
+      "test/queue-journal.test.mjs",
+      "test/client-bundle.test.mjs",
+      "test/fleet-target.test.mjs"
+    ],
+    [
+      "node",
+      "scripts/pack.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "title_sources": "the /sessions route tries the stored journal title, then the host sessions/agents service, then the session log title event; the log-head reader covers 4 MB and long sessions fall back to the cached incremental reader",
+      "real_titles": "session-39bb… -> DSH：房主, session-0c366… -> DSH：瓮城, session-3238… -> dsh-windows2macos 0.8.7 (verified against the live DSH_HOME/sessions)",
+      "identity": "journal entries keep sessionKey = session-<uuid> as the unique restore key; a missing title is the only case that renders 未知会话, and a raw ID is never used as the display name",
+      "queue_selfheal": "v3.3.12 all-empty journal healing is retained (newest draft/queue per session from history, .bak-recovered-* backup)",
+      "platform_grouping": "v3.3.12 hardening is retained (client only for windows/macos/darwin/win32; missing/unknown/other platforms are Web端; stale host kind ignored)",
+      "proof": "session-log + queue-journal + client-bundle + fleet-target + claims + layer-model = 185 pass; eslint 0 errors"
+    }
+  }
+}

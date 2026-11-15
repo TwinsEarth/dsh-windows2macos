@@ -4,6 +4,18 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [3.3.13] - 2026-11-15
+
+- **队列日志恢复会话名**：宿主 `/api/w2m/composer/journal/sessions` 现在按以下顺序取标题——
+  ① 队列记录保存时写入的 title；② 宿主 sessions/agents 服务；③ **DSH 会话日志里的 `session/title` 事件**
+  （先读日志头部 4MB，长会话再回退到增量全量读取并缓存）。此前宿主服务拿不到标题、记录里 title 为空时，
+  抽屉只能显示「未知会话」。
+- **澄清标识符与显示名**：队列记录的唯一键始终是 Session ID（`sessionKey = session-…`），用于恢复/匹配；
+  「会话名」来自 DSH 的会话标题事件，不是 Session ID 本身，也不会把裸 ID 当名字显示（保持既有约定）。
+- 实测标题解析：`session-39bb…` → `DSH：房主`；`session-0c366…` → `DSH：瓮城`；`session-3238…` → `dsh-windows2macos 0.8.7`。
+- 本版同时包含 3.3.12：队列日志全空自愈（从历史快照恢复草稿/队列）、未知平台归 Web端及旧宿主 kind 兼容。
+- 验证：`session-log`/`queue-journal`/`client-bundle`/`fleet-target`/`claims`/`layer-model` 合计 **185 pass**；`eslint 0 errors`。
+
 ## [3.3.12] - 2026-11-15
 
 - **队列日志自愈**：若主 journal 的**所有**记录同时变空（清空全部/旧客户端覆盖的特征），宿主启动时自动从

@@ -22,7 +22,7 @@ import path from 'node:path';
 
 import { resolveStateDir } from '../util/cli.mjs';
 import { ComposerJournal } from './lib/composer-journal.mjs';
-import { readSessionById, sessionsRoot } from './lib/session-log.mjs';
+import { readSessionById, readSessionTitle, sessionsRoot } from './lib/session-log.mjs';
 
 export const name = 'w2m-queue-journal';
 export const inject = [];
@@ -173,9 +173,33 @@ export function registerQueueJournalRoutes(ctx, deps) {
     });
 
     // v3.2.6：会话标题映射，供队列日志抽屉显示会话名（Session ID 默认隐藏）。
+    // v3.3.13: the host session service may be absent or late; the authoritative fallback is the
+    // session log itself — its `session/title` event is what DSH displays, and the journal stores
+    // only the session id. Never render the raw id when a title can be read.
     register(`${QUEUE_JOURNAL_ROUTE_PREFIX}/sessions`, ['GET'], async () => {
       try {
-        return json(200, { ok: true, items: await listSessionTitles(ctx) });
+        const titles = new Map();
+        for (const item of await listSessionTitles(ctx)) {
+          const id = String(item?.id ?? '').trim();
+          const title = String(item?.title ?? '').trim();
+          if (id !== '') titles.set(id, title);
+        }
+        const root = deps.sessionLogRoot ?? sessionsRoot();
+        for (const entry of deps.journal.list()) {
+          const key = String(entry?.sessionKey || entry?.key || '').trim();
+          if (key === '') continue;
+          if (String(titles.get(key) ?? '').trim() !== '') continue;
+          const storedTitle = String(entry?.title ?? '').trim();
+          if (storedTitle !== '') { titles.set(key, storedTitle); continue; }
+          let fromLog = readSessionTitle(key, { root });
+          if (typeof fromLog !== 'string' || fromLog.trim() === '') {
+            // The title event can sit past the cheap head window on a long session; the full
+            // incremental reader is the fallback (it caches frames, so only the first read is costly).
+            try { fromLog = readSessionById(key, { root })?.title ?? null; } catch { fromLog = null; }
+          }
+          if (typeof fromLog === 'string' && fromLog.trim() !== '') titles.set(key, fromLog.trim());
+        }
+        return json(200, { ok: true, items: [...titles.entries()].map(([id, title]) => ({ id, title })) });
       } catch (error) {
         return json(200, { ok: true, items: [], reason: String(error?.message ?? error) });
       }

@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as zlib from 'node:zlib';
 
-import { findSessionLog, readSessionById, readSessionLog, sessionsRoot } from '../src/queue-journal/lib/session-log.mjs';
+import { findSessionLog, readSessionById, readSessionLog, readSessionTitle, sessionsRoot } from '../src/queue-journal/lib/session-log.mjs';
 
 // Node < 22.15 has no zstd in node:zlib (CI's node 20 lane); those tests skip, the reader degrades.
 const ZSTD_READY = typeof zlib.zstdCompressSync === 'function';
@@ -88,4 +88,17 @@ test('session-log: resolves session ids with or without the session- prefix and 
 
 test('session-log: sessionsRoot honours DSH_HOME', () => {
   assert.equal(sessionsRoot({ DSH_HOME: 'C:/tmp/home-a' }), join('C:/tmp/home-a', 'sessions'));
+});
+
+test('session-log: reads the newest title from the log head; null when the log is missing', { skip }, () => {
+  const root = fixture();
+  const file = makeLog(root, 'session-title-demo');
+  writeFileSync(file, frame([
+    { type: 'session/title', time: 1000, data: { title: '旧标题' } },
+    { type: 'user/message', time: 1100, data: { content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' }, role: 'user' } },
+    { type: 'session/title', time: 2000, data: { title: 'DSH：房主' } },
+  ]));
+  assert.equal(readSessionTitle('session-title-demo', { root }), 'DSH：房主');
+  assert.equal(readSessionTitle('session-title-demo', { root }), 'DSH：房主');
+  assert.equal(readSessionTitle('missing', { root }), null);
 });
