@@ -1106,6 +1106,10 @@ it('v3.3.10: groups target machines into clients first and web hosts second', ()
   assert.equal(exports.targetMachineKindOf({ os: "linux" }), "web");
   assert.equal(exports.targetMachineKindOf({ name: "web-host", os: "windows" }), "web");
   assert.equal(exports.targetMachineKindOf({}), "web");
+  assert.equal(exports.targetMachineKindOf({ os: "unknown" }), "web");
+  assert.equal(exports.targetMachineKindOf({ os: "freebsd" }), "web");
+  assert.equal(exports.targetMachineKindOf({ os: "windows" }), "client");
+  assert.equal(exports.targetMachineKindOf({ os: "", kind: "client" }), "web");
 });
 
 it('v3.3.10: the target menu folds the web group by default', () => {
@@ -1116,4 +1120,5 @@ it('v3.3.10: the target menu folds the web group by default', () => {
   assert.ok(source.includes('machineGroups.client.map(renderMachineOption)'), 'clients render first');
   assert.ok(source.includes('webOpen ? machineGroups.web.map(renderMachineOption) : []'), 'web machines only render after expanding');
   assert.ok(source.includes("cls('groupToggle')"), 'the web toggle exists');
+  assert.ok(source.includes('unknownPlatform'), 'a missing platform is shown instead of hidden as online');
 });

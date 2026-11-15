@@ -257,9 +257,13 @@ describe('fleet-target: a machine is a client or a web host (v3.3.10)', () => {
     assert.equal(targetMachineKind({ os: 'linux', name: 'tencent-relay' }), 'web');
     assert.equal(targetMachineKind({ os: null, name: 'vultr-relay' }), 'web');
     assert.equal(targetMachineKind({ os: null, name: null }), 'web');
+    assert.equal(targetMachineKind({ os: 'unknown', name: 'mystery-box' }), 'web');
+    assert.equal(targetMachineKind({ os: 'freebsd', name: 'bsd-box' }), 'web');
     assert.equal(targetMachineKind({ os: '', name: 'mystery-box' }), 'web');
     const described = describeTargetMachine({ machine_id: 'm', machine_name: 'tencent-relay', platform: { os: 'linux' }, online: true });
     assert.equal(described.kind, 'web');
+    const unknown = describeTargetMachine({ machine_id: 'u', machine_name: 'mystery-box', platform: {}, online: true });
+    assert.equal(unknown.kind, 'web');
   });
 });
 

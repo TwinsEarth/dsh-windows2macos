@@ -176,11 +176,12 @@ const ARCHIVE_AFTER_MS = 72 * 60 * 60 * 1000;
  */
 export function targetMachineKind({ os = null, name = null } = {}) {
   const osKey = typeof os === 'string' ? os.trim().toLowerCase() : '';
-  // v3.3.11: an unknown platform is folded into the Web half rather than presumed a client.
-  if (osKey === '' || osKey === 'linux') return 'web';
   const machineName = typeof name === 'string' ? name.trim() : '';
   if (machineName !== '' && /(^|[-_\s])(web|relay)([-_\s]|$)/i.test(machineName)) return 'web';
-  return 'client';
+  // v3.3.12: only a known desktop platform counts as 客户端. Missing/unknown/other platforms,
+  // and linux web hosts, belong to the Web half.
+  if (osKey === 'windows' || osKey === 'macos' || osKey === 'darwin' || osKey === 'win32') return 'client';
+  return 'web';
 }
 
 export function describeTargetMachine(device, localMachineId = null) {

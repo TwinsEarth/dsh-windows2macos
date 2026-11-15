@@ -244,6 +244,13 @@ export function apply(ctx, config = {}) {
       ? path.resolve(config.dataDir)
       : path.join(resolveStateDir(null, ''), 'queue-journal');
   const journal = new ComposerJournal(dataDir);
+  // v3.3.12: an all-empty journal is the signature of an accidental clear; heal it from history.
+  try {
+    const recovered = journal.recoverEmpty();
+    if (recovered > 0) ctx.logger?.info?.(`[queue-journal] recovered ${recovered} empty record(s) from the history snapshots`);
+  } catch (error) {
+    ctx.logger?.warn?.(`[queue-journal] history recovery skipped: ${String(error?.message ?? error)}`);
+  }
   const service = {
     dataDir,
     get: (key) => journal.get(key),

@@ -119,6 +119,54 @@ export class ComposerJournal {
     } catch { return [] }
   }
 
+  /**
+   * Recover a journal the operator (or an old client) cleared back to empty records.
+   *
+   * The append-only history is the record of every queue snapshot; when *every* main entry is
+   * empty, that is the signature of 清空全部 (or an old client overwriting records), not of a user
+   * having no drafts. Restore the newest non-empty draft and queue per session, keeping the
+   * originals in a timestamped backup. Only the globally-empty case is healed: a single empty
+   * entry among entries with content was cleared deliberately and must stay cleared.
+   *
+   * @returns {number} entries restored (0 when nothing needed healing)
+   */
+  recoverEmpty() {
+    const all = this.load()
+    const hasContent = (entry) => String(entry?.draft ?? '').trim() !== '' || (Array.isArray(entry?.queue) && entry.queue.length > 0)
+    const values = Object.values(all).filter((entry) => entry && typeof entry === 'object')
+    if (values.length === 0 || values.some((entry) => hasContent(entry))) return 0
+    const history = this.history({ limit: MAX_HISTORY })
+    const newestDraft = new Map()
+    const newestQueue = new Map()
+    for (const item of history) {
+      const key = String(item?.sessionKey || item?.key || '')
+      if (key === '') continue
+      const draft = String(item?.draft ?? '')
+      if (draft.trim() !== '' && !newestDraft.has(key)) newestDraft.set(key, { draft, at: String(item?.updatedAt || '') })
+      const queue = Array.isArray(item?.queue) ? item.queue.filter((entry) => String(entry?.text ?? '').trim() !== '') : []
+      if (queue.length > 0 && !newestQueue.has(key)) newestQueue.set(key, { queue, at: String(item?.updatedAt || '') })
+    }
+    let changed = 0
+    for (const [key, entry] of Object.entries(all)) {
+      if (!entry || typeof entry !== 'object') continue
+      const sessionKey = String(entry.sessionKey || key)
+      const draft = newestDraft.get(key) ?? newestDraft.get(sessionKey) ?? null
+      const queue = newestQueue.get(key) ?? newestQueue.get(sessionKey) ?? null
+      if (draft === null && queue === null) continue
+      if (draft !== null) { entry.draft = draft.draft; entry.restoredDraftFrom = draft.at }
+      if (queue !== null) { entry.queue = queue.queue; entry.restoredQueueFrom = queue.at }
+      entry.updatedAt = new Date().toISOString()
+      changed += 1
+    }
+    if (changed === 0) return 0
+    try {
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+      fs.copyFileSync(this.file, this.file + '.bak-recovered-' + stamp)
+    } catch { /* the backup is best effort; the recovery itself must not be lost */ }
+    this.saveFile(all)
+    return changed
+  }
+
   remove(key) {
     const all = this.load()
     const id = String(key)

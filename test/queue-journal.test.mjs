@@ -14,6 +14,7 @@ import * as zlib from 'node:zlib';
 
 const ZSTD_READY = typeof zlib.zstdCompressSync === 'function';
 
+import { ComposerJournal } from '../src/queue-journal/lib/composer-journal.mjs';
 import {
   apply,
   QUEUE_JOURNAL_ROUTE_PREFIX,
@@ -179,4 +180,21 @@ test('queue journal: the session-log route reads human history and the last assi
   assert.equal(out.body.title, 'DSH：房主');
   assert.deepEqual(out.body.human.map((item) => item.text), ['人类问了一句']);
   assert.equal(out.body.assistant, '助手回复');
+});
+
+test('queue journal: heals an accidentally cleared journal from its history snapshots', () => {
+  const root = mkdtempSync(join(tmpdir(), 'w2m-qj-heal-'));
+  const journal = new ComposerJournal(root);
+  journal.save('session-a', { draft: 'old draft', queue: [{ text: 'queued one' }], title: 'A' });
+  journal.save('session-a', { draft: '', queue: [] });
+  assert.equal(journal.get('session-a').draft, '');
+  assert.equal(journal.recoverEmpty(), 1);
+  const healed = journal.get('session-a');
+  assert.equal(healed.draft, 'old draft');
+  assert.equal(healed.queue.length, 1);
+  // A single deliberately-cleared entry among content is NOT healed globally.
+  journal.save('session-b', { draft: 'keep me', queue: [] });
+  journal.save('session-a', { draft: '', queue: [] });
+  assert.equal(journal.recoverEmpty(), 0);
+  assert.equal(journal.get('session-a').draft, '');
 });
