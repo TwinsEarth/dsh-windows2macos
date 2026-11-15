@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [3.4.2] - 2026-11-15
+
+- **Release pre-flight 第二个根因修复**：3.4.1 在 CI 仍红，但测试计数是 `3502 tests / fail 0`，实际是 Relay cluster 的两处重试延迟 timer 被 `unref()`；`node:test` 等待期间事件循环已空，Node 22 报 `Promise resolution is still pending but the event loop has already resolved` 并把测试标记为 cancelled/failed。
+  - `fetchSnapshotWithRetry` / `fetchDevicesPageWithRetry` 的 **awaited retry delay 去掉 unref**，让重试真正等到下一轮；
+  - 后台调度 timer 仍保留 unref（不阻止进程退出）；
+  - 用 **Node 22** 复现并验证：修复前 `cluster-sync` 出现 pending promise；修复后 22/22 pass。
+- 发布验证统一改为 **Node 22 + 空 DSH_HOME**，与 GitHub Actions 的 release runner 完全一致。
+
 ## [3.4.1] - 2026-11-15
 
 - **CI 根因修复**：3.3.18/3.4.0 的 Release pre-flight 失败，不是代码功能问题，而是测试主机依赖泄漏：P0 的默认 `stateDir` 让 `DSH_DEVICE_FILE` 不再优先，CI 干净环境没有 `~/.dsh/xclient/device.json` 时 6 个 `update-wiring` 用例读到宿主路径并报 `W2M_NO_TOKEN`。

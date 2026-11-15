@@ -517,10 +517,9 @@ export class ClusterSync {
       } catch (err) {
         lastError = err;
         if (attempt < this.retryAttempts) {
-          await new Promise((resolveDelay) => {
-            const timer = setTimeout(resolveDelay, this.retryDelayMs * attempt);
-            timer.unref?.();
-          });
+          // Awaited retry delays must be ref'd: unref'ing them lets Node resolve the event loop
+          // before the timer fires, which node:test reports as a pending promise (CI Node 22).
+          await new Promise((resolveDelay) => { setTimeout(resolveDelay, this.retryDelayMs * attempt); });
         }
       }
     }
@@ -578,10 +577,9 @@ export class ClusterSync {
       } catch (err) {
         lastError = err;
         if (attempt < this.retryAttempts) {
-          await new Promise((resolveDelay) => {
-            const timer = setTimeout(resolveDelay, this.retryDelayMs * attempt);
-            timer.unref?.();
-          });
+          // Awaited retry delays must be ref'd: unref'ing them lets Node resolve the event loop
+          // before the timer fires, which node:test reports as a pending promise (CI Node 22).
+          await new Promise((resolveDelay) => { setTimeout(resolveDelay, this.retryDelayMs * attempt); });
         }
       }
     }

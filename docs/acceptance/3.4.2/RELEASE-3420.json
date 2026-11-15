@@ -1,0 +1,36 @@
+{
+  "version": "3.4.2",
+  "case": "RELEASE-3420",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-15T11:57:46.059Z",
+  "executor": "lead",
+  "task_id": "pre-release-3420",
+  "requirement": "v3.4.2: release pre-flight must pass on Node 22 with an empty DSH_HOME; awaited cluster-sync retry timers must stay ref'd",
+  "commands": [
+    [
+      "npx",
+      "-y",
+      "node@22",
+      "--test",
+      "--test-force-exit",
+      "test/cluster-sync.test.mjs"
+    ],
+    [
+      "npx",
+      "-y",
+      "node@22",
+      "scripts/preflight.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "cluster_retry": "retry delays are awaited with a ref'd setTimeout; cluster-sync 22/22 passes on Node 22",
+      "ci_parity": "pre-flight run on Node 22 with empty DSH_HOME is GREEN; no pending-promise cancellations",
+      "proof": "cluster-sync Node22 22/22; pre-flight Node22 GREEN"
+    }
+  }
+}
