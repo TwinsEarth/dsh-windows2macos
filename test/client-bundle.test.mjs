@@ -1098,13 +1098,14 @@ it('v3.3.10: groups target machines into clients first and web hosts second', ()
     { machine_id: "b", name: "tencent-relay", os: "linux", kind: "web" },
     { machine_id: "c", name: "macmini", os: "macos" },
     { machine_id: "d", name: "vultr-relay", kind: "web" },
+    { machine_id: "e", name: "mystery-box" },
   ];
   const grouped = group(machines);
   assert.equal(grouped.client.map((m) => m.machine_id).join(","), "a,c");
-  assert.equal(grouped.web.map((m) => m.machine_id).join(","), "b,d");
+  assert.equal(grouped.web.map((m) => m.machine_id).join(","), "b,d,e");
   assert.equal(exports.targetMachineKindOf({ os: "linux" }), "web");
   assert.equal(exports.targetMachineKindOf({ name: "web-host", os: "windows" }), "web");
-  assert.equal(exports.targetMachineKindOf({}), "client");
+  assert.equal(exports.targetMachineKindOf({}), "web");
 });
 
 it('v3.3.10: the target menu folds the web group by default', () => {

@@ -1,0 +1,40 @@
+{
+  "version": "3.3.11",
+  "case": "RELEASE-33110",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-15T03:07:14.484Z",
+  "executor": "lead",
+  "task_id": "pre-release-33110",
+  "requirement": "v3.3.11: unknown platform defaults to the Web端 group (the v3.3.10 rule defaulted it to 客户端)",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/fleet-target.test.mjs",
+      "test/client-bundle.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/loader-entry.test.mjs"
+    ],
+    [
+      "node",
+      "scripts/pack.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "host_rule": "targetMachineKind({os:'',name:null}) === 'web'; linux and web/relay names stay web; windows/macos stay client",
+      "client_fallback": "targetMachineKindOf({}) === 'web'; an old snapshot with no kind and no os is grouped into the folded Web端, not the client list",
+      "prior_feature": "v3.3.10 grouping is retained: 客户端 first, Web端 folded by default; relayUrls pin retained",
+      "proof": "fleet-target + client-bundle 100 pass; real Chromium loader-entry 10/10; claims/layer-model 71 pass; eslint 0 errors"
+    }
+  }
+}

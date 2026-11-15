@@ -4,6 +4,15 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [3.3.11] - 2026-11-15
+
+- **「全部机器」分组规则调整：未知平台默认归入 Web端**（此前默认按客户端处理）：
+  - Web端 = `platform.os === linux`、机器名含 `web`/`relay`、或 **平台缺失/为空**（未知平台）；
+  - 客户端 = 其余已知桌面平台（Windows/macOS 等）；
+  - 宿主 `targetMachineKind` 与浏览器端旧快照兜底规则同步修改，`kind` 缺失且 `os` 缺失的机器现在出现在折叠的 Web端里，而不是客户端列表。
+- 其余同 v3.3.10：全部机器分「客户端（前）/ Web端（后，默认折叠）」；本次也包含 relayUrls 固定（bootstrap 不再覆盖 202.182 原始 relay）。
+- 验证：`fleet-target` 分类 + `client-bundle` 分组/折叠/未知平台用例 100 项通过；真实 Chromium `loader-entry 10/10`；`claims`/`layer-model` 71 项绿；`eslint 0 errors`。
+
 ## [3.3.10] - 2026-11-15
 
 - **「全部机器」按客户端 / Web端分组显示**：

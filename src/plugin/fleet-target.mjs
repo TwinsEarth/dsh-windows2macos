@@ -176,7 +176,8 @@ const ARCHIVE_AFTER_MS = 72 * 60 * 60 * 1000;
  */
 export function targetMachineKind({ os = null, name = null } = {}) {
   const osKey = typeof os === 'string' ? os.trim().toLowerCase() : '';
-  if (osKey === 'linux') return 'web';
+  // v3.3.11: an unknown platform is folded into the Web half rather than presumed a client.
+  if (osKey === '' || osKey === 'linux') return 'web';
   const machineName = typeof name === 'string' ? name.trim() : '';
   if (machineName !== '' && /(^|[-_\s])(web|relay)([-_\s]|$)/i.test(machineName)) return 'web';
   return 'client';
