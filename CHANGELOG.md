@@ -4,6 +4,18 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [3.3.9] - 2026-11-15
+
+- **对话内搜索：↑/↓ 真正跳到上/下一个匹配并居中**（此前只改计数器，正文不滚动、当前匹配没有视觉区分）：
+  - 不再依赖 `mark.scrollIntoView`：找出匹配所在的**真实滚动容器**，直接把它居中（`scrollTop` 计算），
+    并在下一帧/120ms 后再校正一次，避免虚拟列表/布局变化把滚动吃掉；
+  - 当前匹配加 `data-active` 高亮（橙色 + outline），之前所有匹配同色，看不出选中了哪个；
+  - 箭头读取**实时 active 索引**（`activeRef`）而不是可能过期的 `cursor` state，连点不会卡住；↑ 从第一个回绕到最后一个；
+  - 匹配元素改为从**所有搜索根（含 shadow root）**收集：`document.querySelectorAll` 穿不透 shadow root，
+    这也是此前“计数变了但正文不动”的一个来源；清除高亮同样覆盖 shadow root，不再留下残留 mark。
+- 验证：client-bundle **47/47**（真实 DOM 伪对象：激活/居中/回绕/阴影根）；真实 Chromium `loader-entry 10/10`；
+  `claims`/`layer-model` 71 项全绿；`eslint 0 errors`。
+
 ## [3.3.8] - 2026-11-15
 
 - **修复 v3.3.7 的 Release 工作流被整条跳过**：上一版把 npm 的 opt-in 开关误加到了 `release` 作业（verify/pack/publish）上，

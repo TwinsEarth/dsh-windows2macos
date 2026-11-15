@@ -1,0 +1,40 @@
+{
+  "version": "3.3.9",
+  "case": "RELEASE-3390",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-15T02:01:16.910Z",
+  "executor": "lead",
+  "task_id": "pre-release-3390",
+  "requirement": "v3.3.9: the in-conversation search ↑/↓ buttons must move to the previous/next match, highlight it, and center it in the conversation scroller (the counter alone was changing)",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/client-bundle.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/loader-entry.test.mjs"
+    ],
+    [
+      "node",
+      "scripts/pack.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "navigation": "step() uses activeRef (live index) and activateSearchMark() instead of a bare scrollIntoView; wrap-around works; every click sets exactly one data-active match",
+      "centering": "centerSearchMark() finds every scrollable ancestor (probe-based, same detection the shell scroll controls use), sets scrollTop so the match center equals the surface center, and re-centers on the next frame and after 120 ms",
+      "shadow_roots": "searchMarkElements() gathers marks from document plus every root searchRoots() finds (including shadow roots), and clearSearchMarks() uses it too, so navigation is not blind to shadow-DOM matches",
+      "styling": ".w2mSearchMark[data-active=\"true\"] is orange with an outline; the other matches stay yellow",
+      "proof": "client-bundle 47/47 (fake DOM: activation/centering/wrap/shadow-root); real Chromium loader-entry 10/10; claims+layer-model 71 pass; eslint 0 errors"
+    }
+  }
+}

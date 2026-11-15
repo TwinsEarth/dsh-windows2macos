@@ -1005,3 +1005,86 @@ it('v3.3.6: history and choice detection read the host session log and clear-all
   const choiceBody = source.slice(choiceStart, choiceEnd);
   assert.ok(choiceBody.indexOf('sessionLogRequest(sessionId, 5)') < choiceBody.indexOf("source: 'w2m-choice-watch'"), 'choice detection asks the host log before the client service');
 });
+
+it('v3.3.9: search arrows activate a match, wrap, and center it in the real scroll surface', () => {
+  const env = loadBundle();
+  const document = env.document;
+  document.body = undefined;
+  const surface = {
+    scrollTop: 0,
+    scrollHeight: 2000,
+    clientHeight: 400,
+    parentElement: null,
+    getBoundingClientRect: () => ({ top: 0, left: 0, width: 800, height: 400, bottom: 400, right: 800 }),
+  };
+  const makeMark = (top) => {
+    const mark = {
+      attrs: {},
+      parentElement: surface,
+      textContent: "match",
+      getBoundingClientRect: () => ({ top, height: 20, bottom: top + 20, left: 0, right: 100 }),
+      setAttribute(name, value) { this.attrs[name] = value; },
+      getAttribute(name) { return this.attrs[name] ?? null; },
+      removeAttribute(name) { delete this.attrs[name]; },
+      scrollIntoView() { this.scrolled = true; },
+    };
+    return mark;
+  };
+  const marks = [makeMark(1000), makeMark(1400), makeMark(200)];
+  document.querySelectorAll = (selector) => (String(selector).includes("mark.w2mSearchMark") ? marks : []);
+  const activate = env.exports.activateSearchMark;
+  assert.equal(typeof activate, "function");
+  assert.equal(activate(0), 0);
+  assert.equal(marks[0].getAttribute("data-active"), "true");
+  assert.equal(marks[1].getAttribute("data-active"), null);
+  assert.equal(marks[0].scrolled, true, "the active match is scrolled into view");
+  assert.ok(surface.scrollTop > 0, "the real scroll surface was moved, not just the mark attribute");
+  const before = surface.scrollTop;
+  assert.equal(activate(1), 1, "next advances");
+  assert.equal(marks[1].getAttribute("data-active"), "true");
+  assert.equal(marks[0].getAttribute("data-active"), null);
+  assert.ok(surface.scrollTop !== before, "the next match is centered too");
+  assert.equal(activate(-1), 2, "previous wraps to the last match");
+  assert.equal(marks[2].getAttribute("data-active"), "true");
+});
+
+it('v3.3.9: the search fix wires active styling and the shell scroller', () => {
+  const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
+  assert.ok(source.includes('function centerSearchMark('), 'centering helper exists');
+  assert.ok(source.includes('function activateSearchMark('), 'activation helper exists');
+  assert.ok(source.includes('w2mSearchMark[data-active="true"]'), 'the active match has its own style');
+  assert.ok(source.includes('const base = activeRef.current >= 0 ? activeRef.current'), 'step uses the live active index, not a stale state');
+  assert.ok(source.includes('function scrollableAncestors('), 'the shell scroller is discovered by walking ancestors');
+});
+
+it('v3.3.9: marks inside a shadow root are found and activated (document.querySelectorAll cannot see them)', () => {
+  const env = loadBundle();
+  const document = env.document;
+  const surface = {
+    scrollTop: 0,
+    scrollHeight: 2000,
+    clientHeight: 400,
+    parentElement: null,
+    getBoundingClientRect: () => ({ top: 0, left: 0, width: 800, height: 400, bottom: 400, right: 800 }),
+  };
+  const shadowMark = {
+    attrs: {},
+    parentElement: surface,
+    getBoundingClientRect: () => ({ top: 900, height: 20, bottom: 920, left: 0, right: 100 }),
+    setAttribute(name, value) { this.attrs[name] = value; },
+    getAttribute(name) { return this.attrs[name] ?? null; },
+    removeAttribute(name) { delete this.attrs[name]; },
+    scrollIntoView() { this.scrolled = true; },
+  };
+  const shadowRoot = {
+    querySelectorAll: (selector) => (String(selector).includes("mark.w2mSearchMark") ? [shadowMark] : []),
+  };
+  const region = { nodeType: 1, children: [], shadowRoot, querySelectorAll: () => [] };
+  document.body = { nodeType: 1, children: [] };
+  document.documentElement = { nodeType: 1, children: [] };
+  document.querySelector = (selector) => (String(selector).includes("[data-conversation-region]") ? region : null);
+  document.querySelectorAll = (selector) => (String(selector).includes("mark.w2mSearchMark") ? [] : []);
+  assert.equal(env.exports.activateSearchMark(0), 0);
+  assert.equal(shadowMark.getAttribute("data-active"), "true");
+  assert.equal(shadowMark.scrolled, true);
+});
