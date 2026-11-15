@@ -4,6 +4,29 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [3.4.0] - 2026-11-15
+
+**主题：Relay 三节点数据同步正式发布，并完成队列/历史可靠性修复。**
+
+### Relay v3.0.0（server-side，插件协议不变）
+
+- 三台 relay 互为 peer，按各自调度拉取 durable 状态：`devices`（设备记录/device_token/fleet 绑定，LWW 合并）与 `ledger`（task.created / lease.changed / result.stored / task.cancelled，`origin@offset` 幂等回放）；
+- 不同步：blobs、operator token / signing secret、心跳/租约/presence、fleet chat / fleet memory（留 Phase 2）；
+- 调度：启动后 60–600 秒随机首同步，此后每小时 ±5 分钟抖动；单飞、失败退避（30s/2m/10m），单 peer 故障不阻塞其他 peer；
+- 安全：peer 路由仅接受 cluster HMAC（method/path/ts/nonce/since，±120s + nonce），响应 AES-256-GCM 加密；healthz 只暴露 node/peer/游标/计数；
+- 部署：三台 relay 已上线 `relay_version=3.0.0`，features 含 `relay-cluster-sync-v1`，`cluster.last_ok=true`；systemd operator token 加固与滚动重启手册随包发布。
+
+### 插件侧
+
+- **P0**：未配置 `stateDir` 时默认 `$DSH_HOME/xclient`，本地 memory / RTT / P2P inbox 不再失效；
+- **P2**：`w2m_devices` 与目标选择器共用 online 判定，并输出 `version_drift { current, versions, behind_count, behind[] }`；旧版本（2.0.x/2.2.x）标记落后并纳入统一治理；
+- **队列日志人类输入修复**：旧记录 `sessionKey: ""` + `key: session-…` 被 `??` 判成机器记录；客户端与宿主统一改为空值回退到 key，并回填既有 journal；
+- **会话名修复**：记录里的 `title` 为空时不再被 `??` 截断，回退到 sessions 映射（同时尝试 `session-<uuid>` 与裸 `<uuid>` 键，优先裸 id），并已回填现有 journal 的会话标题。
+- **历史对话从新到旧**：当前草稿置顶，带时间戳的人类输入按时间倒序；
+- **派发三态真实样本**：`docs/DISPATCH-TRI-STATE-20261115.md`（ok / failed / divergent / partial）；
+- **审批策略 C（保留 red 通道）**：never-ask 下 joint-dev 派发保持 blocked 是预期边界；
+- **测试**：`test/agent.test.mjs` 的绝对路径 allow-list 改为数组形式（Windows `Program Files` 含空格），`w2m_devices` 期望补充 `online` 字段。
+
 ## [3.3.18] - 2026-11-15
 
 - **队列日志：人类输入恢复**。旧客户端保存的记录里 `sessionKey` 是空字符串、真实会话键在 `key` 上；`??` 把空字符串当成“已存在”，导致所有人类队伍都被折进「机器生成」，标题显示 0 条人类输入。现在客户端与宿主统一用「空值回退到 key」判定：

@@ -1,0 +1,45 @@
+{
+  "version": "3.4.0",
+  "case": "RELEASE-3400",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-15T11:23:05.849Z",
+  "executor": "lead",
+  "task_id": "pre-release-3400",
+  "requirement": "v3.4.0: Relay v3.0.0 three-node cluster sync is deployed and the plugin carries the stateDir/online/version-drift, queue-journal human-input and history-order fixes",
+  "commands": [
+    [
+      "node",
+      "scripts/preflight.mjs"
+    ],
+    [
+      "node",
+      "scripts/pack.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/queue-journal.test.mjs",
+      "test/client-bundle.test.mjs",
+      "test/cluster-sync.test.mjs",
+      "test/cluster-sync-integration.test.mjs",
+      "test/relay-version.test.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "relay_cluster": "all three relays answer relay_version 3.0.0 with relay-cluster-sync-v1 and cluster.last_ok=true; devices/ledger sync by design",
+      "queue_human": "empty sessionKey rows are human when key is session-<uuid>; live journal backfilled and old-client predicate was verified to count 4 human rows",
+      "history_order": "历史对话 lists newest first with the draft pinned above",
+      "state_dir": "unset stateDir defaults to $DSH_HOME/xclient",
+      "online_version": "w2m_devices uses the same online predicate as the target control and reports version_drift",
+      "dispatch_evidence": "docs/DISPATCH-TRI-STATE-20261115.md records real ok/failed/divergent/partial tasks",
+      "preflight": "scripts/preflight.mjs 16/16 checks pass (mojibake scan clean)",
+      "session_titles": "an empty stored title falls back to the sessions map, trying bare uuid and session-<uuid> keys; live journal titles were backfilled"
+    }
+  }
+}

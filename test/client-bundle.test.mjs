@@ -1159,3 +1159,11 @@ it('v3.3.18: an empty sessionKey still counts as a human entry', () => {
   assert.ok(!source.includes("entry?.sessionKey ?? entry?.key"), 'nullish fallback would hide empty-string sessionKeys');
   assert.ok(source.includes("startsWith('session-')"), 'the human/machine split still keys off session-');
 });
+
+it('v3.4.0: a stored empty title falls back to the sessions map', () => {
+  const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
+  assert.ok(source.includes('function sessionTitleForEntry(entry, sessions)'), 'the title lookup is one helper');
+  assert.ok(source.includes("const stored = String(entry?.title ?? '').trim();"), 'an empty stored title is detected before falling back');
+  assert.ok(source.includes("for (const key of [bare, raw, 'session-' + bare])"), 'both raw uuid and session-<uuid> map keys are tried, bare uuid first');
+  assert.ok(source.includes('sessionTitleForEntry(entry, store.state.sessions)'), 'entryCard uses the helper');
+});
