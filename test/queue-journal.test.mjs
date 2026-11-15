@@ -7,9 +7,10 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { zstdCompressSync } from 'node:zlib';
 
 import {
   apply,
@@ -73,7 +74,7 @@ test('queue journal: save, read back and list newest first', async () => {
   const { routes, service, call } = mount({ dataDir: root });
   assert.deepEqual(
     [...routes.keys()].sort(),
-    [QUEUE_JOURNAL_ROUTE_PREFIX, `${QUEUE_JOURNAL_ROUTE_PREFIX}/history`, `${QUEUE_JOURNAL_ROUTE_PREFIX}/sessions`, QUEUE_RESTORE_ROUTE_PATH].sort(),
+    [QUEUE_JOURNAL_ROUTE_PREFIX, `${QUEUE_JOURNAL_ROUTE_PREFIX}/history`, `${QUEUE_JOURNAL_ROUTE_PREFIX}/sessions`, `${QUEUE_JOURNAL_ROUTE_PREFIX}/session-log`, QUEUE_RESTORE_ROUTE_PATH].sort(),
   );
   assert.ok(service, 'the journal service is provided');
   const saved = await call(
@@ -156,4 +157,24 @@ test('queue journal: the display title is persisted with the record', async () =
   const list = await call(`${QUEUE_JOURNAL_ROUTE_PREFIX}?list=1`);
   const entry = list.body.entries.find((item) => item.key === 'session-titled');
   assert.equal(entry.title, '部署排查');
+});
+
+test('queue journal: the session-log route reads human history and the last assistant reply', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'w2m-qj-log-'));
+  const sessionDir = join(root, 'sessions', 'workspace-a', 'session-demo');
+  mkdirSync(sessionDir, { recursive: true });
+  const event = (value) => `${JSON.stringify(value)}\n`;
+  const payload = [
+    { type: 'session/title', time: 1000, data: { title: 'DSH：房主' } },
+    { type: 'user/message', time: 2000, data: { content: [{ type: 'text', text: '人类问了一句' }], source: { kind: 'user' }, role: 'user' } },
+    { type: 'assistant/message', time: 3000, data: { message: { role: 'assistant', content: [{ type: 'text', text: '助手回复' }] } } },
+  ];
+  writeFileSync(join(sessionDir, 'session.v4.jsonl.zstd'), zstdCompressSync(Buffer.from(payload.map(event).join(''), 'utf8')));
+  const { call } = mount({ dataDir: join(root, 'journal'), sessionLogRoot: join(root, 'sessions') });
+  const out = await call(`${QUEUE_JOURNAL_ROUTE_PREFIX}/session-log?sessionId=demo`);
+  assert.equal(out.status, 200);
+  assert.equal(out.body.found, true);
+  assert.equal(out.body.title, 'DSH：房主');
+  assert.deepEqual(out.body.human.map((item) => item.text), ['人类问了一句']);
+  assert.equal(out.body.assistant, '助手回复');
 });

@@ -1,0 +1,42 @@
+{
+  "version": "3.3.6",
+  "case": "RELEASE-3360",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-15T01:21:12.259Z",
+  "executor": "lead",
+  "task_id": "pre-release-3360",
+  "requirement": "v3.3.6: the queue journal must survive 清空全部 (archive-then-clear, recoverable history section) and the 历史对话 window / choice detection must read the DSH session log on the host instead of depending on the client sessions service",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/session-log.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/queue-journal.test.mjs",
+      "test/client-bundle.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/loader-entry.test.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "recovery": "the main journal had been cleared by the 清空全部 loop at 00:33:22 (8 entries with empty draft/queue and blank sessionKey/path within 269 ms); the newest non-empty history snapshot per session was restored (4 entries) with the original files backed up",
+      "clear_safety": "clearAll now asks for confirmation, posts each non-empty record (draft and/or queue) once to archive it (appendHistory also stores draft-only snapshots), then clears it; the drawer lists the last 20 history snapshots with 恢复草稿/恢复队列 buttons",
+      "history_source": "GET /api/w2m/composer/journal/session-log reads session.v4.jsonl.zstd incrementally (zstd frame cursor, incomplete frame carried), filtering user/message to source.kind==user and returning the title plus the last assistant text; the HistoryPanel and the choice watcher use it first with the client sessions service as fallback",
+      "evidence": "session-log reader verified against the real DSH：房主 session (session-39bb0148…): title 正确、200 条人类消息窗口、最后 assistant 回复正确；reader/route/client tests 55 pass; loader-entry 10/10; claims/layer-model green; eslint 0"
+    }
+  }
+}

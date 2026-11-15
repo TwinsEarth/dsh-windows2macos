@@ -992,3 +992,16 @@ it('v3.3.5: the choice watcher mirrors prompts into the decision center and feed
   assert.ok(source.includes('dsh-choice:'), 'dedupe key prefix');
   assert.ok(source.includes('writeComposer(String(option?.label'), 'picking an option fills the composer');
 });
+
+it('v3.3.6: history and choice detection read the host session log and clear-all archives first', () => {
+  const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
+  assert.ok(source.includes('function sessionLogRequest('), 'the host session-log request helper exists');
+  assert.ok(source.includes("/session-log?sessionId="), 'the history window queries the host session log');
+  assert.ok(source.includes("'/history?limit=20'"), 'the drawer loads recoverable history snapshots');
+  assert.ok(source.includes('历史快照 · '), 'the drawer shows the history snapshots section');
+  assert.ok(source.includes('已归档到历史快照'), 'clear-all archives before clearing');
+  const choiceStart = source.indexOf('function installChoiceWatcher(');
+  const choiceEnd = source.indexOf('\n    }', choiceStart);
+  const choiceBody = source.slice(choiceStart, choiceEnd);
+  assert.ok(choiceBody.indexOf('sessionLogRequest(sessionId, 5)') < choiceBody.indexOf("source: 'w2m-choice-watch'"), 'choice detection asks the host log before the client service');
+});

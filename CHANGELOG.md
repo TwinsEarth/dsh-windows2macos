@@ -4,6 +4,20 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [3.3.6] - 2026-11-15
+
+- **队列日志「清空全部」不再造成不可逆丢失**：清空前先确认，并把每条记录（含仅有草稿的）归档到历史快照，再逐条清空；
+  抽屉新增「历史快照 · N 条（可恢复）」折叠区，可逐条恢复草稿/恢复队列。宿主 `appendHistory` 现在也归档仅有草稿的快照。
+- **历史对话改为宿主直读 DSH 会话日志**：新增 `GET /api/w2m/composer/journal/session-log?sessionId=`，
+  增量解码 `session.v4.jsonl.zstd` 的追加帧（不重复解整份大日志），返回会话标题、最近人类消息、最后一条 assistant 消息；
+  不再依赖客户端 `sessions` 服务的事件窗口（该服务不可用时历史窗口为空）。
+- **待选机制同源修复**：选择题检测优先读同一条宿主会话日志，客户端 sessions 服务只作兜底；长会话（如 1565 条人类消息的
+  「DSH：房主」）也能稳定工作。
+- 本机 `DSH：房主` 会话已验证可读：标题、最近人类消息、最后 assistant 回复均正确（200 条窗口）；
+  队列日志主文件已从历史快照恢复 4 条可恢复记录（备份在临时目录）。
+- 验证：`session-log 4/4`、`queue-journal` 路由用例、`client-bundle` 新断言，合计 55 pass；真实 Chromium `loader-entry 10/10`；
+  `claims`/`layer-model` 绿；`eslint 0 errors`。
+
 ## [3.3.5] - 2026-11-15
 - **决策中心接管每轮末尾的选择题**：轮询当前会话最后一条 assistant 消息，识别 1/2/3/4、A/B/C/D
   （含 `[ ]`/`☐` 多选与单行内联写法），自动在决策中心创建黄色「本轮待选」ticket（带选项按钮）；

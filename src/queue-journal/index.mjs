@@ -22,6 +22,7 @@ import path from 'node:path';
 
 import { resolveStateDir } from '../util/cli.mjs';
 import { ComposerJournal } from './lib/composer-journal.mjs';
+import { readSessionById, sessionsRoot } from './lib/session-log.mjs';
 
 export const name = 'w2m-queue-journal';
 export const inject = [];
@@ -145,6 +146,31 @@ export function registerQueueJournalRoutes(ctx, deps) {
       return json(200, { ok: true, items: deps.journal.history({ limit, sessionKey }) });
     });
 
+    // v3.3.6：直接从 DSH 会话日志读取人类输入历史与最后一条 assistant 消息。
+    // 客户端 sessions 服务不可用时，历史对话窗口与选择题检测仍能工作；增量解码只读新增的 zstd 帧。
+    register(`${QUEUE_JOURNAL_ROUTE_PREFIX}/session-log`, ['GET'], (request) => {
+      const query = queryOf(request);
+      const sessionId = String(query.get('sessionId') ?? '').trim();
+      if (sessionId === '') return json(400, { ok: false, error: 'sessionId-required' });
+      const limit = Math.max(1, Math.min(200, Number(query.get('limit') ?? 60) || 60));
+      try {
+        const log = readSessionById(sessionId, { root: deps.sessionLogRoot ?? sessionsRoot() });
+        if (log === null) return json(200, { ok: true, found: false, human: [], assistant: '', title: '' });
+        return json(200, {
+          ok: true,
+          found: true,
+          sessionId: log.sessionId,
+          title: log.title,
+          human: log.human.slice(-limit),
+          assistant: log.assistant,
+          assistant_time: log.assistantTime,
+          size: log.size,
+        });
+      } catch (error) {
+        return json(200, { ok: false, error: String(error?.message ?? error), found: false, human: [], assistant: '', title: '' });
+      }
+    });
+
     // v3.2.6：会话标题映射，供队列日志抽屉显示会话名（Session ID 默认隐藏）。
     register(`${QUEUE_JOURNAL_ROUTE_PREFIX}/sessions`, ['GET'], async () => {
       try {
@@ -230,6 +256,6 @@ export function apply(ctx, config = {}) {
   } else if (typeof ctx?.provide === 'function') {
     ctx.provide(QUEUE_JOURNAL_SERVICE, service);
   }
-  registerQueueJournalRoutes(ctx, { journal, dataDir });
+  registerQueueJournalRoutes(ctx, { journal, dataDir, sessionLogRoot: config?.sessionLogRoot });
   return service;
 }

@@ -84,7 +84,8 @@ export class ComposerJournal {
   appendHistory(entry) {
     try {
       const queue = Array.isArray(entry?.queue) ? entry.queue : []
-      if (queue.length === 0) return
+      const draft = String(entry?.draft ?? '')
+      if (queue.length === 0 && draft.trim() === '') return
       fs.mkdirSync(path.dirname(this.historyFile), { recursive: true })
       fs.appendFileSync(this.historyFile, JSON.stringify({
         key: entry.key,
