@@ -44,7 +44,12 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 
 /**
  * @param {{now?: () => number, quota24hBytes?: number, hardCapBytes?: number, retentionDays?: number,
- *          maxMessageBytes?: number}} [options]
+ *          maxMessageBytes?: number, epoch?: string, initialMessages?: object[], onAppend?: (message: object) => void,
+ *          onDelete?: (sessionId: string) => void, onImported?: (message: object) => void}} [options]
+ *   Phase 2A additions (all optional, all additive):
+ *   `initialMessages` seeds restored rows at construction (restart recovery); `onAppend`/`onDelete`/`onImported` are the
+ *   persistence hooks the relay wires to `chat-store.mjs`. A hook is synchronous and its exception can never change what
+ *   chat does -- a full disk must not fail a message that is already in memory.
  */
 export function createFleetMessages(options = {}) {
   const now = typeof options.now === 'function' ? options.now : () => Date.now();
@@ -76,13 +81,79 @@ export function createFleetMessages(options = {}) {
   const MAX_IDEMPOTENCY_KEYS = 2000;
   /** session_id -> [{ message_id, session_id, machine_id, text, at_ms, bytes }] */
   const sessions = new Map();
+  /** message_id -> the same row, so dedupe on import and lookup by id never scan the whole history. */
+  const messageIds = new Map();
   let seq = 0;
+
+  /**
+   * Phase 2A persistence hooks. Options, not imports: `fleet-messages.mjs` stays the in-memory chat and does not depend on
+   * a disk existing. Each hook is wrapped so its failure cannot change a chat result -- but the store behind it reports its
+   * own IO errors, so nothing is silently lost twice.
+   */
+  const onAppend = typeof options.onAppend === 'function' ? options.onAppend : null;
+  const onDelete = typeof options.onDelete === 'function' ? options.onDelete : null;
+  const onImported = typeof options.onImported === 'function' ? options.onImported : null;
 
   const all = () => {
     const out = [];
     for (const rows of sessions.values()) out.push(...rows);
     return out;
   };
+
+  const bytesOf = (message) => (Number.isInteger(message.bytes) && message.bytes >= 0
+    ? message.bytes
+    : Buffer.byteLength(typeof message.text === 'string' ? message.text : '', 'utf8'));
+
+  function safelyInvoke(hook, ...args) {
+    if (hook === null) return;
+    try { hook(...args); } catch { /* a persistence hook must never change what chat does */ }
+  }
+
+  /**
+   * Tell subscribers that a message exists. The event carries addressing and mentions -- never the text: the reader fetches
+   * the text through the endpoint that already authenticated it.
+   */
+  function notifyListeners(message) {
+    const mentions = Array.isArray(message.mentions) ? message.mentions.filter((entry) => typeof entry === 'string') : [];
+    for (const listener of listeners) {
+      if (listener.sessionId !== null && listener.sessionId !== message.session_id) continue;
+      try {
+        listener.fn({
+          session_id: message.session_id,
+          message_id: message.message_id,
+          machine_id: message.machine_id,
+          at_ms: message.at_ms,
+          to: message.to ?? 'all',
+          ...(mentions.length === 0 ? {} : { mentions }),
+        });
+      }
+      catch { /* a dead listener must not fail the write */ }
+    }
+  }
+
+  /**
+   * A restored row must be safe to serve: reject shapes that `list()`/`usage()` would crash on. Bytes are recomputed only
+   * when missing, so a restored row keeps the exact shape it was persisted with.
+   */
+  function normalizeSeed(raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    if (typeof raw.message_id !== 'string' || raw.message_id === '') return null;
+    if (typeof raw.session_id !== 'string' || raw.session_id === '') return null;
+    if (typeof raw.machine_id !== 'string' || raw.machine_id === '') return null;
+    if (!Number.isFinite(raw.at_ms) || typeof raw.text !== 'string') return null;
+    return { ...raw, bytes: bytesOf(raw) };
+  }
+
+  /**
+   * If a restored id was minted in THIS process's epoch (only possible when `epoch` was supplied explicitly), continue the
+   * counter after it: otherwise a restart would hand out an id a restored message already owns.
+   */
+  function advanceSeqPast(messageId) {
+    const prefix = 'msg-' + epoch + '-';
+    if (!messageId.startsWith(prefix)) return;
+    const parsed = Number.parseInt(messageId.slice(prefix.length), 10);
+    if (Number.isInteger(parsed) && parsed > seq) seq = parsed;
+  }
 
   function usage() {
     const t = now();
@@ -247,21 +318,8 @@ export function createFleetMessages(options = {}) {
     };
     if (!sessions.has(sessionId)) sessions.set(sessionId, []);
     sessions.get(sessionId).push(message);
-    for (const listener of listeners) {
-      if (listener.sessionId !== null && listener.sessionId !== sessionId) continue;
-      try {
-        // The event carries addressing and mentions so a listener can say "you were named"; it never carries the text.
-        listener.fn({
-          session_id: sessionId,
-          message_id: message.message_id,
-          machine_id: message.machine_id,
-          at_ms: message.at_ms,
-          to: message.to,
-          ...(mentions.length === 0 ? {} : { mentions }),
-        });
-      }
-      catch { /* a dead listener must not fail the write */ }
-    }
+    messageIds.set(message.message_id, message);
+    notifyListeners(message);
     if (idempotencyKey !== null) {
       idempotency.set(sessionId + '\u0000' + idempotencyKey, message.message_id);
       if (idempotency.size > MAX_IDEMPOTENCY_KEYS) {
@@ -269,6 +327,8 @@ export function createFleetMessages(options = {}) {
         if (oldest !== undefined) idempotency.delete(oldest);
       }
     }
+    // Phase 2A: persist the accepted row (never a replay -- the first post already persisted it).
+    safelyInvoke(onAppend, message);
 
     return { ok: true, message };
   }
@@ -288,9 +348,126 @@ export function createFleetMessages(options = {}) {
     return { ok: true, messages: capped.map((m) => ({ ...m })), count: capped.length };
   }
 
-  /** Deleting a session deletes its history -- the operator's rule, not a side effect. */
+  /**
+   * Phase 2A: insert a message another relay accepted (design §4.3 `chat.message` union, keyed by `message_id`).
+   *
+   * **No quota check, on purpose.** §5.1: an imported message is not checked against the local quota, otherwise one
+   * relay's full budget would block another relay's writes. Retention and the byte cap are enforced by `pruneBefore`.
+   * The row keeps its shape and is placed in `at_ms` order so a page applied out of order still reads as a conversation.
+   *
+   * @returns {{ok: true, inserted: boolean} | {ok: false, code: string}}
+   */
+  function insertImported(raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return { ok: false, code: 'BAD_MESSAGE' };
+    const messageId = typeof raw.message_id === 'string' ? raw.message_id.trim() : '';
+    if (messageId === '') return { ok: false, code: 'BAD_MESSAGE_ID' };
+    const sessionId = typeof raw.session_id === 'string' ? raw.session_id.trim() : '';
+    if (sessionId === '') return { ok: false, code: 'BAD_SESSION' };
+    const machineId = typeof raw.machine_id === 'string' ? raw.machine_id.trim() : '';
+    if (machineId === '') return { ok: false, code: 'BAD_MACHINE' };
+    if (!Number.isFinite(raw.at_ms)) return { ok: false, code: 'BAD_AT_MS' };
+    if (typeof raw.text !== 'string') return { ok: false, code: 'NOT_TEXT' };
+    // The same message can arrive from every peer; a second copy is a no-op, not a duplicate row.
+    if (messageIds.has(messageId)) return { ok: true, inserted: false };
+
+    const message = {
+      ...raw,
+      message_id: messageId,
+      session_id: sessionId,
+      machine_id: machineId,
+      at_ms: Math.floor(raw.at_ms),
+      bytes: bytesOf(raw),
+    };
+    const rows = sessions.get(sessionId) ?? [];
+    let at = rows.length;
+    while (at > 0 && rows[at - 1].at_ms > message.at_ms) at -= 1;
+    rows.splice(at, 0, message);
+    sessions.set(sessionId, rows);
+    messageIds.set(messageId, message);
+    notifyListeners(message);
+    safelyInvoke(onImported, { ...message });
+    return { ok: true, inserted: true };
+  }
+
+  /**
+   * Phase 2A retention: drop messages older than `cutoffMs`, then (when `maxBytes` is given) keep dropping the oldest
+   * remaining messages until the stored byte total fits. Sessions emptied by pruning disappear; a session tombstone is a
+   * separate decision made by `deleteSession`/the replication store.
+   *
+   * @returns {{removed: number}}
+   */
+  function pruneBefore(cutoffMs, { maxBytes } = {}) {
+    const cutoff = Number.isFinite(cutoffMs) ? cutoffMs : 0;
+    let removed = 0;
+    const removedIds = new Set();
+    for (const [sessionId, rows] of sessions) {
+      const kept = rows.filter((m) => m.at_ms >= cutoff);
+      if (kept.length === rows.length) continue;
+      for (const m of rows) {
+        if (m.at_ms < cutoff) removedIds.add(m.message_id);
+      }
+      removed += rows.length - kept.length;
+      if (kept.length === 0) sessions.delete(sessionId);
+      else sessions.set(sessionId, kept);
+    }
+    if (Number.isFinite(maxBytes) && maxBytes >= 0) {
+      const entries = [];
+      let total = 0;
+      for (const [sessionId, rows] of sessions) {
+        for (const m of rows) {
+          const bytes = bytesOf(m);
+          total += bytes;
+          entries.push({ sessionId, message: m, bytes });
+        }
+      }
+      if (total > maxBytes) {
+        // Oldest first, then a deterministic tie-break, so every relay prunes the same rows.
+        entries.sort((a, b) => (a.message.at_ms - b.message.at_ms)
+          || (a.sessionId < b.sessionId ? -1 : a.sessionId > b.sessionId ? 1 : 0)
+          || (a.message.message_id < b.message.message_id ? -1 : a.message.message_id > b.message.message_id ? 1 : 0));
+        const dropped = new Set();
+        for (const entry of entries) {
+          if (total <= maxBytes) break;
+          total -= entry.bytes;
+          dropped.add(entry.message);
+          removedIds.add(entry.message.message_id);
+          removed += 1;
+        }
+        if (dropped.size > 0) {
+          for (const [sessionId, rows] of sessions) {
+            const kept = rows.filter((m) => !dropped.has(m));
+            if (kept.length === rows.length) continue;
+            if (kept.length === 0) sessions.delete(sessionId);
+            else sessions.set(sessionId, kept);
+          }
+        }
+      }
+    }
+    for (const id of removedIds) messageIds.delete(id);
+    return { removed };
+  }
+
+  /** One message by id, or null. Phase 2A diagnostics/tests. */
+  function findMessage(messageId) {
+    if (typeof messageId !== 'string' || messageId === '') return null;
+    const message = messageIds.get(messageId);
+    return message === undefined ? null : { ...message };
+  }
+
+  /** The session ids currently held, in first-seen order. Phase 2A diagnostics/tests. */
+  function getSessionIds() {
+    return [...sessions.keys()];
+  }
+
+  /** Deleting a session deletes its history -- the operator's rule, not a side effect. Phase 2A also records the tombstone. */
   function deleteSession(sessionId) {
-    return sessions.delete(sessionId);
+    const rows = sessions.get(sessionId);
+    if (!sessions.delete(sessionId)) return false;
+    if (rows !== undefined) {
+      for (const message of rows) messageIds.delete(message.message_id);
+    }
+    safelyInvoke(onDelete, sessionId);
+    return true;
   }
 
   /** @param {string|null} sessionId null subscribes to every session; returns the unsubscribe function. */
@@ -300,5 +477,27 @@ export function createFleetMessages(options = {}) {
     return () => listeners.delete(listener);
   }
 
-  return { post, list, usage, limitBytes, deleteSession, subscribe, _sessions: sessions };
+  // Phase 2A restart recovery: seed rows restored from `chat-store.load()`, preserving the given order exactly.
+  for (const raw of Array.isArray(options.initialMessages) ? options.initialMessages : []) {
+    const message = normalizeSeed(raw);
+    if (message === null || messageIds.has(message.message_id)) continue;
+    if (!sessions.has(message.session_id)) sessions.set(message.session_id, []);
+    sessions.get(message.session_id).push(message);
+    messageIds.set(message.message_id, message);
+    advanceSeqPast(message.message_id);
+  }
+
+  return {
+    post,
+    list,
+    usage,
+    limitBytes,
+    deleteSession,
+    subscribe,
+    insertImported,
+    pruneBefore,
+    findMessage,
+    getSessionIds,
+    _sessions: sessions,
+  };
 }

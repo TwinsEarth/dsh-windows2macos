@@ -5,7 +5,7 @@
  * disagree about *who is editing what* before they disagree about merge conflicts, and so a crashed client's claim expires
  * instead of blocking the project forever.
  *
- * Rules (docs/COLLAB/M5-MULTI-CLIENT-PRIMITIVES.md §2):
+ * Rules (docs/COLLAB/M5-MULTI-CLIENT-PRIMITIVES.md 搂2):
  *  - one exclusive holder per (project, branch) or (project, path);
  *  - a lock has a lease and is renewed by its holder; an expired lock does not block a newcomer (it is released as it is taken,
  *    and both the expiry and the new acquisition are events);
@@ -29,8 +29,9 @@ export class LockError extends Error {
 
 const holderKey = (holder) => holder.kind + ':' + holder.id;
 
-export function createProjectLocks({ now = () => Date.now(), defaultLeaseMs = DEFAULT_LOCK_LEASE_MS, limits = DEFAULT_LOCK_LIMITS, onEvent = null } = {}) {
+export function createProjectLocks({ now = () => Date.now(), defaultLeaseMs = DEFAULT_LOCK_LEASE_MS, limits = DEFAULT_LOCK_LIMITS, onEvent = null, idPrefix = '' } = {}) {
   const locks = new Map(); // lock_id -> lock
+  const idScope = typeof idPrefix === 'string' && idPrefix !== '' ? idPrefix + '-' : '';
   let counter = 0;
   let seq = 0;
 
@@ -54,6 +55,55 @@ export function createProjectLocks({ now = () => Date.now(), defaultLeaseMs = DE
       }
     }
     return expired;
+  };
+
+  const LOCK_STATES = Object.freeze(['held', 'expired', 'released', 'force_released']);
+  const asIso = (value) => (typeof value === 'string' && !Number.isNaN(Date.parse(value)) ? new Date(Date.parse(value)).toISOString() : null);
+
+  /**
+   * Rebuild one internal lock from a serialised row. Accepts the wire spelling (`project_id`) and the
+   * internal one (`projectId`), normalises timestamps and drops anything that cannot be a lock.
+   */
+  const normalizeLockRow = (row) => {
+    if (row === null || typeof row !== 'object') return null;
+    if (typeof row.lock_id !== 'string' || row.lock_id === '') return null;
+    const projectId = typeof row.project_id === 'string' && row.project_id !== ''
+      ? row.project_id
+      : (typeof row.projectId === 'string' && row.projectId !== '' ? row.projectId : '');
+    if (projectId === '') return null;
+    if (!LOCK_KINDS.includes(row.kind)) return null;
+    if (row.target === null || typeof row.target !== 'object') return null;
+    const target = row.kind === 'branch'
+      ? (typeof row.target.branch === 'string' && row.target.branch !== '' ? { branch: row.target.branch } : null)
+      : (typeof row.target.path === 'string' && row.target.path !== '' ? { path: row.target.path } : null);
+    if (target === null) return null;
+    if (row.holder === null || typeof row.holder !== 'object' || typeof row.holder.kind !== 'string' || typeof row.holder.id !== 'string') return null;
+    if (!LOCK_STATES.includes(row.state)) return null;
+    const leaseMs = Number.isFinite(row.lease_ms) && row.lease_ms > 0 ? row.lease_ms : defaultLeaseMs;
+    const expiresMs = Number.isFinite(row.expires_at_ms)
+      ? row.expires_at_ms
+      : (Number.isFinite(Date.parse(row.expires_at)) ? Date.parse(row.expires_at) : null);
+    if (expiresMs === null) return null;
+    const acquiredAt = asIso(row.acquired_at) ?? new Date(expiresMs - leaseMs).toISOString();
+    return {
+      lock_id: row.lock_id,
+      projectId,
+      kind: row.kind,
+      target,
+      holder: { kind: row.holder.kind, id: row.holder.id },
+      reason: typeof row.reason === 'string' ? row.reason : null,
+      lease_ms: leaseMs,
+      acquired_at: acquiredAt,
+      expires_at: asIso(row.expires_at) ?? new Date(expiresMs).toISOString(),
+      expires_at_ms: expiresMs,
+      renewed_at: asIso(row.renewed_at),
+      state: row.state,
+    };
+  };
+
+  const idCounter = (id) => {
+    const match = /(\d+)$/.exec(id);
+    return match === null ? 0 : Number(match[1]);
   };
 
   const describe = (lock) => ({
@@ -94,7 +144,7 @@ export function createProjectLocks({ now = () => Date.now(), defaultLeaseMs = DE
       counter += 1;
       const acquired = now();
       const lock = {
-        lock_id: 'lk-' + String(counter).padStart(6, '0'),
+        lock_id: 'lk-' + idScope + String(counter).padStart(6, '0'),
         projectId,
         kind,
         target: kind === 'branch' ? { branch: target.branch } : { path: target.path },
@@ -158,7 +208,7 @@ export function createProjectLocks({ now = () => Date.now(), defaultLeaseMs = DE
         .filter((lock) => lock.projectId === projectId && lock.state === 'held')
         .map((lock) => describe(lock));
     },
-    /** Would a write to this branch / these paths collide with someone else's claim? Used by the merge preflight (§2.3). */
+    /** Would a write to this branch / these paths collide with someone else's claim? Used by the merge preflight (搂2.3). */
     conflicts({ projectId, branch = null, paths = [] }) {
       expireDue();
       const result = [];
@@ -174,6 +224,56 @@ export function createProjectLocks({ now = () => Date.now(), defaultLeaseMs = DE
       const lock = locks.get(lockId);
       return lock === undefined ? null : lock.expires_at;
     },
+    /**
+     * Serialisable copy of every lock the module still records (held, expired and released alike).
+     *
+     * Used for cross-relay merge and restart persistence: the internal record uses `projectId` and
+     * `expires_at_ms`, while the wire shape names `project_id` like every other project object.
+     */
+    snapshot() {
+      return [...locks.values()]
+        .map((lock) => ({
+          lock_id: lock.lock_id,
+          project_id: lock.projectId,
+          kind: lock.kind,
+          target: { ...lock.target },
+          mode: 'exclusive',
+          holder: { ...lock.holder },
+          reason: lock.reason ?? null,
+          lease_ms: lock.lease_ms,
+          acquired_at: lock.acquired_at,
+          expires_at: lock.expires_at,
+          expires_at_ms: lock.expires_at_ms,
+          renewed_at: lock.renewed_at ?? null,
+          state: lock.state,
+        }))
+        .sort((left, right) => (left.lock_id < right.lock_id ? -1 : left.lock_id > right.lock_id ? 1 : 0));
+    },
+    /**
+     * Replace the whole lock table with rows produced by `snapshot()` (or a deterministic merge of
+     * several snapshots). Malformed rows are skipped rather than throwing: a peer's bad record must
+     * not take the local lock table down.
+     */
+    restore(rows) {
+      if (!Array.isArray(rows)) return { ok: false, code: 'BAD_SNAPSHOT' };
+      const rebuilt = new Map();
+      let skipped = 0;
+      let maxCounter = counter;
+      for (const row of rows) {
+        const lock = normalizeLockRow(row);
+        if (lock === null) { skipped += 1; continue; }
+        rebuilt.set(lock.lock_id, lock);
+        maxCounter = Math.max(maxCounter, idCounter(lock.lock_id));
+      }
+      locks.clear();
+      for (const [lockId, lock] of rebuilt) locks.set(lockId, lock);
+      counter = maxCounter;
+      seq = Math.max(seq, rebuilt.size);
+      return { ok: true, restored: rebuilt.size, skipped };
+    },
     size() { return { held: [...locks.values()].filter((lock) => lock.state === 'held').length, recorded: locks.size, events: seq }; },
   };
 }
+
+
+

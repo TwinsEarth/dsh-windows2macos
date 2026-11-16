@@ -562,9 +562,15 @@ export class RabbitState {
     // read by every member, so "what we agreed" is the same object for every client rather than a chat history.
     this.decisions = new Map();
     this.projectMemory = new Map();
+    // Shared-object ids are scoped per state directory (instance id) so two relays that each start a
+    // counter at 1 cannot produce the same lock/review/notification/queue id and be conflated on merge.
+    let projectObjectIdPrefix = '';
+    try { projectObjectIdPrefix = this.persistence?.loadInstanceId?.() ?? ''; } catch { /* tests without persistence keep legacy ids */ }
+    this._projectObjectIdPrefix = projectObjectIdPrefix;
     // v1.3.13-beta.4: branch heads and merge outcomes live with the project room so one stream answers "where is the branch".
     this.refs = createProjectRefs({
       now: () => this.nowMs(),
+      idPrefix: projectObjectIdPrefix,
       onEvent: (event) => { try { this.projects.appendEvent({ projectId: event.payload.project_id, type: event.type, actor: { kind: 'operator', id: 'relay' }, payload: event.payload }); } catch { /* history */ } },
     });
     // Every project-room event is counted once, here: the room's own events and the lock/review/notification events projected
@@ -582,6 +588,9 @@ export class RabbitState {
       try { this.metrics.inc('wm_project_events_total', { type: event.type }); } catch { /* metrics never break the room */ }
       for (const listener of this.projectSubscribers) { try { listener(event); } catch { /* a subscriber never breaks the room */ } }
       if (typeof this._persistProjects === 'function') this._persistProjects();
+      // Shared objects (artifacts/decisions/memory/locks/reviews/refs/notifications) are derived from
+      // these events; persist them alongside the room so a restart keeps what clients could read.
+      if (typeof this.persistProjectObjects === 'function') this.persistProjectObjects();
       const notified = NOTIFIED[event.type];
       if (notified !== undefined) {
         try {
@@ -595,6 +604,17 @@ export class RabbitState {
     // project object and its cursor instead of silently starting from an empty room.
     this._projectsFile = typeof this.persistence?.dir === 'string' && this.persistence.dir !== ''
       ? join(this.persistence.dir, 'projects', 'room-snapshot.json')
+      : null;
+    /**
+     * Phase 2: durable shared project objects.
+     *
+     * The room snapshot only carries projects/members/events; artifacts, decisions, project memory,
+     * refs, locks, reviews and notifications used to live in memory only (lost on restart). They are
+     * written next to the room snapshot so a restart — and a cross-relay merge — starts from the same
+     * objects the clients can read.
+     */
+    this._projectObjectsFile = typeof this.persistence?.dir === 'string' && this.persistence.dir !== ''
+      ? join(this.persistence.dir, 'projects', 'objects.json')
       : null;
     if (this._projectsFile !== null) {
       try {
@@ -610,9 +630,12 @@ export class RabbitState {
         this.projects.appendEvent({ projectId: event.payload.project_id, type: event.type, actor: { kind: 'operator', id: 'relay' }, payload: { ...event.payload, module_seq: event.seq } });
       } catch { /* an event about a project that is gone is history, not an error */ }
     };
-    this.locks = createProjectLocks({ now: () => this.nowMs(), onEvent: roomEvent });
-    this.reviews = createProjectReviews({ now: () => this.nowMs(), onEvent: roomEvent });
-    this.notifications = createProjectNotifications({ now: () => this.nowMs(), onEvent: roomEvent });
+    // Shared-object ids use the per-state-directory prefix declared above.
+    this.locks = createProjectLocks({ now: () => this.nowMs(), onEvent: roomEvent, idPrefix: projectObjectIdPrefix });
+    this.reviews = createProjectReviews({ now: () => this.nowMs(), onEvent: roomEvent, idPrefix: projectObjectIdPrefix });
+    this.notifications = createProjectNotifications({ now: () => this.nowMs(), onEvent: roomEvent, idPrefix: projectObjectIdPrefix });
+    // Phase 2: bring the memory-only shared objects back from disk (and later merge peers' copies).
+    this._restoreProjectObjects();
     // v1.3.10-beta.20: a committed chunk session becomes a fleet blob with the same verified bytes. A store failure does not
     // undo the commit (the session is gone), but it is reported through the route so a caller never believes a blob exists.
     // v1.3.12-beta.2: revoked grants. The operator can stop one authorisation from being used; the dispatch preflight
@@ -665,6 +688,117 @@ export class RabbitState {
       writeFileSync(tmp, JSON.stringify(this.projects.toSnapshot()), { encoding: 'utf8', mode: 0o600 });
       renameSync(tmp, this._projectsFile);
     } catch { /* a failed snapshot write must not break the live room */ }
+  }
+
+  /**
+   * Phase 2: persist the shared project objects next to the project room snapshot.
+   *
+   * These are the objects a client reads through the project routes (artifacts, decisions, memory,
+   * refs, locks, reviews, notifications). Without this file a restart kept the event log but lost the
+   * objects, which is one of the gaps the Phase 2 design named.
+   */
+  persistProjectObjects() {
+    if (typeof this._projectObjectsFile !== 'string' || this._projectObjectsFile === '') return;
+    try {
+      const value = {
+        v: 1,
+        artifacts: [...(this.artifacts?.values?.() ?? [])],
+        decisions: [...(this.decisions?.values?.() ?? [])].flat(),
+        memory: [...(this.projectMemory?.values?.() ?? [])],
+        refs: typeof this.refs?.snapshot === 'function' ? this.refs.snapshot() : null,
+        locks: typeof this.locks?.snapshot === 'function' ? this.locks.snapshot() : [],
+        reviews: typeof this.reviews?.snapshot === 'function' ? this.reviews.snapshot() : [],
+        notifications: typeof this.notifications?.snapshot === 'function' ? this.notifications.snapshot() : [],
+        notification_read_marks: typeof this.notifications?.snapshotReadMarks === 'function' ? this.notifications.snapshotReadMarks() : [],
+      };
+      mkdirSync(dirname(this._projectObjectsFile), { recursive: true, mode: 0o700 });
+      const tmp = this._projectObjectsFile + '.tmp-' + process.pid + '-' + Date.now().toString(36);
+      writeFileSync(tmp, JSON.stringify(value), { encoding: 'utf8', mode: 0o600 });
+      renameSync(tmp, this._projectObjectsFile);
+    } catch { /* a failed object write must not break the live room */ }
+  }
+
+  /** Load project objects written by `persistProjectObjects()` (best effort). */
+  _restoreProjectObjects() {
+    if (typeof this._projectObjectsFile !== 'string' || this._projectObjectsFile === '') return;
+    let loaded = null;
+    try {
+      loaded = JSON.parse(readFileSync(this._projectObjectsFile, 'utf8').replace(/^\uFEFF/, ''));
+    } catch { return; }
+    if (loaded === null || typeof loaded !== 'object') return;
+    try {
+      if (Array.isArray(loaded.artifacts)) {
+        for (const artifact of loaded.artifacts) {
+          if (artifact !== null && typeof artifact === 'object' && typeof artifact.sha256 === 'string') this.artifacts.set(artifact.sha256, artifact);
+        }
+      }
+    } catch { /* one bad object never blocks boot */ }
+    try {
+      if (Array.isArray(loaded.decisions)) {
+        for (const decision of loaded.decisions) {
+          if (decision === null || typeof decision !== 'object' || typeof decision.project_id !== 'string') continue;
+          const list = this.decisions.get(decision.project_id) ?? [];
+          list.push(decision);
+          this.decisions.set(decision.project_id, list);
+        }
+      }
+    } catch { /* ignore */ }
+    try {
+      if (Array.isArray(loaded.memory)) {
+        for (const doc of loaded.memory) {
+          if (doc !== null && typeof doc === 'object' && typeof doc.project_id === 'string') this.projectMemory.set(doc.project_id, doc);
+        }
+      }
+    } catch { /* ignore */ }
+    const restoreModule = (module, value) => {
+      try { if (value !== null && value !== undefined && typeof module?.restore === 'function') module.restore(value); } catch { /* ignore */ }
+    };
+    restoreModule(this.refs, loaded.refs);
+    restoreModule(this.locks, loaded.locks);
+    restoreModule(this.reviews, loaded.reviews);
+    restoreModule(this.notifications, loaded.notifications);
+    try {
+      if (Array.isArray(loaded.notification_read_marks) && typeof this.notifications?.restoreReadMarks === 'function') {
+        this.notifications.restoreReadMarks(loaded.notification_read_marks);
+      }
+    } catch { /* ignore */ }
+  }
+
+  /** Persist room + objects after an imported merge (called by the cluster domain sync). */
+  persistProjectState() {
+    this._persistProjects();
+    this.persistProjectObjects();
+  }
+
+  /** Push an imported project event to the existing SSE subscribers. */
+  broadcastProjectEvent(event) {
+    for (const listener of this.projectSubscribers) {
+      try { listener(event); } catch { /* a subscriber never breaks the room */ }
+    }
+  }
+
+  /** Chat read watermarks as a flat list, for the durable chat store. */
+  snapshotReadMarks() {
+    const rows = [];
+    for (const [sessionId, perSession] of this.readMarks) {
+      for (const [machineId, mark] of perSession) {
+        if (mark === null || typeof mark !== 'object' || !Number.isFinite(mark.at_ms)) continue;
+        rows.push({ session_id: sessionId, machine_id: machineId, at_ms: mark.at_ms, message_id: typeof mark.message_id === 'string' ? mark.message_id : null });
+      }
+    }
+    return rows;
+  }
+
+  /** Restore chat read watermarks (LWW: `markRead` only advances a watermark). */
+  restoreReadMarks(rows) {
+    if (!Array.isArray(rows)) return 0;
+    let restored = 0;
+    for (const row of rows) {
+      if (row === null || typeof row !== 'object') continue;
+      if (typeof row.session_id !== 'string' || typeof row.machine_id !== 'string' || !Number.isFinite(row.at_ms)) continue;
+      try { this.markRead(row.session_id, row.machine_id, { at_ms: row.at_ms, message_id: typeof row.message_id === 'string' ? row.message_id : null }); restored += 1; } catch { /* ignore */ }
+    }
+    return restored;
   }
 
   /* ---------------- v1.0.7: the content-addressed blob channel (#1) ---------------- */
@@ -2862,7 +2996,7 @@ export class RabbitState {
     const list = this.decisions.get(wanted) ?? [];
     const index = list.length + 1;
     const decision = {
-      decision_id: wanted + "-d" + String(index).padStart(4, "0"),
+      decision_id: wanted + "-d" + (this._projectObjectIdPrefix ? this._projectObjectIdPrefix + "-" : "") + String(index).padStart(4, "0"),
       project_id: wanted, title: title.trim().slice(0, 200), text: typeof text === "string" ? text.slice(0, 4000) : null,
       kind: String(kind), refs: refs !== null && typeof refs === "object" ? { ...refs } : {},
       actor, created_at: this.nowIso(),

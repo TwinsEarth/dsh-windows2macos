@@ -90,6 +90,15 @@ Cluster sync (v3.0.0):
                          Snapshot sizing: [env W2M_RELAY_SYNC_CHUNK_BYTES / W2M_RELAY_SYNC_TIMEOUT_MS]
                          (snapshots are gzipped; chunk bytes is the plaintext ledger chunk cap)
 
+  Phase 2 domains (v3.1.0, on by default when cluster sync is configured):
+                         Chat: [env W2M_RELAY_CHAT_SYNC_MS=60000]
+                               first sync window: [env W2M_RELAY_CHAT_SYNC_BOOT_MIN_MS / MAX_MS]
+                               retention/cap: [env W2M_RELAY_CHAT_RETENTION_DAYS=7 /
+                                               W2M_RELAY_CHAT_HARD_CAP_BYTES=209715200]
+                               page size: [env W2M_RELAY_CHAT_PAGE_BYTES=131072]
+                         Project room: [env W2M_RELAY_PROJECTS_SYNC_MS=3600000]
+                         Disable one domain: W2M_RELAY_CHAT_SYNC=0 / W2M_RELAY_PROJECTS_SYNC=0
+
 Observability:
   --metrics              Serve GET /metrics in Prometheus text format. Off by default, and
                          token-free like /healthz, so a scraper never needs a credential in
@@ -299,6 +308,18 @@ if (clusterPeersRaw !== undefined || clusterSecretRaw !== undefined) {
       chunkBytes: envNumber('W2M_RELAY_SYNC_CHUNK_BYTES', 'snapshot chunk bytes'),
       requestTimeoutMs: envNumber('W2M_RELAY_SYNC_TIMEOUT_MS', 'peer request timeout'),
       devicePageSize: envNumber('W2M_RELAY_SYNC_DEVICE_PAGE_SIZE', 'devices per page'),
+      // Phase 2 domains. Chat is incremental and cheap enough for a short interval; project room
+      // state is small but changes rarely, so it follows the hourly rhythm. Both are on by default
+      // when cluster sync is configured; `=0` turns one domain off without disabling the cluster.
+      chatSyncMs: envNumber('W2M_RELAY_CHAT_SYNC_MS', 'chat sync interval'),
+      projectSyncMs: envNumber('W2M_RELAY_PROJECTS_SYNC_MS', 'project room sync interval'),
+      chatBootMinMs: envNumber('W2M_RELAY_CHAT_SYNC_BOOT_MIN_MS', 'chat first sync minimum delay'),
+      chatBootMaxMs: envNumber('W2M_RELAY_CHAT_SYNC_BOOT_MAX_MS', 'chat first sync maximum delay'),
+      chatRetentionDays: envNumber('W2M_RELAY_CHAT_RETENTION_DAYS', 'chat retention days'),
+      chatHardCapBytes: envNumber('W2M_RELAY_CHAT_HARD_CAP_BYTES', 'chat hard cap bytes'),
+      chatPageBytes: envNumber('W2M_RELAY_CHAT_PAGE_BYTES', 'chat page plaintext bytes'),
+      chatEnabled: process.env.W2M_RELAY_CHAT_SYNC !== '0',
+      projectEnabled: process.env.W2M_RELAY_PROJECTS_SYNC !== '0',
       // Optional source allow-list for the two cluster routes. Default: HMAC only, any source address.
       allowIps: typeof process.env.W2M_RELAY_CLUSTER_ALLOW_IPS === 'string' && process.env.W2M_RELAY_CLUSTER_ALLOW_IPS.trim() !== ''
         ? process.env.W2M_RELAY_CLUSTER_ALLOW_IPS.split(',').map((entry) => entry.trim()).filter(Boolean)

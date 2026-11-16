@@ -170,6 +170,149 @@ export function createProjectRoom({ now = () => Date.now(), onEvent = null } = {
       requireProject(projectId);
       return { ok: true, event: emit(projectId, type, actor, payload) };
     },
+    /** Every event in the room, as copies (cross-relay export; the caller must not mutate the log). */
+    allEvents() {
+      return events.map((event) => JSON.parse(JSON.stringify(event)));
+    },
+    /**
+     * Append an event that arrived from another relay, assigning this room's own seq.
+     *
+     * Deliberately silent: imported history must not look like a local mutation, so `onEvent`
+     * (metrics, SSE push, notifications, persistence) is not invoked here. The caller decides how
+     * imported events are surfaced and made durable.
+     */
+    importEvent(event) {
+      if (event === null || typeof event !== 'object') throw new ProjectRoomError('BAD_REQUEST', 'event is required');
+      if (typeof event.project_id !== 'string' || event.project_id === '') throw new ProjectRoomError('BAD_REQUEST', 'event.project_id is required');
+      if (typeof event.type !== 'string' || event.type.trim() === '') throw new ProjectRoomError('BAD_REQUEST', 'event.type is required');
+      if (typeof event.at !== 'string' || Number.isNaN(Date.parse(event.at))) throw new ProjectRoomError('BAD_REQUEST', 'event.at must be a timestamp', { at: event.at });
+      seq += 1;
+      const stored = {
+        seq,
+        project_id: event.project_id,
+        type: event.type,
+        actor: event.actor !== null && typeof event.actor === 'object' ? JSON.parse(JSON.stringify(event.actor)) : null,
+        payload: event.payload !== null && typeof event.payload === 'object' ? JSON.parse(JSON.stringify(event.payload)) : {},
+        at: event.at,
+      };
+      for (const key of Object.keys(event)) {
+        if (key === 'seq' || key === 'project_id' || key === 'type' || key === 'actor' || key === 'payload' || key === 'at') continue;
+        if (event[key] === undefined) continue;
+        try { stored[key] = JSON.parse(JSON.stringify(event[key])); } catch { /* a field that cannot be copied is dropped */ }
+      }
+      events.push(stored);
+      return JSON.parse(JSON.stringify(stored));
+    },
+    /**
+     * Import a project another relay created (or fill in missing fields on one that already exists).
+     *
+     * A new project keeps the id/name/origin/created_at/created_by/settings/members it arrived with.
+     * An existing project is only filled in where a field is missing, so a plain fill can never
+     * clobber newer local metadata. A deterministic merge that has already decided a name/settings
+     * pair is the winner can pass `options.overwriteMeta`; only name and settings are overwritten then.
+     */
+    importProject(project, members = null, options = {}) {
+      if (project === null || typeof project !== 'object') throw new ProjectRoomError('BAD_REQUEST', 'project is required');
+      const projectId = typeof project.project_id === 'string' ? project.project_id.trim() : '';
+      if (projectId === '') throw new ProjectRoomError('BAD_REQUEST', 'project.project_id is required');
+      const overwriteMeta = options !== null && typeof options === 'object' && options.overwriteMeta === true;
+      const copy = (value) => JSON.parse(JSON.stringify(value));
+      const isoOrNow = (value) => (typeof value === 'string' && !Number.isNaN(Date.parse(value)) ? value : new Date(now()).toISOString());
+      const actorOf = (value) => (value !== null && typeof value === 'object' && typeof value.kind === 'string' && typeof value.id === 'string' ? copy(value) : null);
+      const settingsOf = (value) => {
+        if (value === null || typeof value !== 'object' || Array.isArray(value)) return { merge_requires_review: false, merge_requires_tests: false };
+        return copy(value);
+      };
+      const normalizeMembers = (rows) => {
+        if (!Array.isArray(rows)) return [];
+        const out = [];
+        for (const row of rows) {
+          if (row === null || typeof row !== 'object') continue;
+          if (typeof row.kind !== 'string' || typeof row.id !== 'string' || row.id === '') continue;
+          if (!PROJECT_ROLES.includes(row.role)) continue;
+          out.push({
+            kind: row.kind,
+            id: row.id,
+            name: typeof row.name === 'string' ? row.name : null,
+            role: row.role,
+            joined_at: isoOrNow(row.joined_at),
+          });
+        }
+        return out;
+      };
+      const incomingName = typeof project.name === 'string' && project.name.trim() !== '' ? project.name.trim() : null;
+      const incomingCreatedAt = isoOrNow(project.created_at);
+      const incomingCreatedBy = actorOf(project.created_by);
+      const existing = projects.get(projectId);
+      if (existing === undefined) {
+        counter += 1;
+        const created = {
+          project_id: projectId,
+          name: incomingName ?? projectId,
+          origin: project.origin !== null && project.origin !== undefined && typeof project.origin === 'object' ? copy(project.origin) : null,
+          created_at: incomingCreatedAt,
+          created_by: incomingCreatedBy ?? { kind: 'operator', id: 'relay' },
+          settings: settingsOf(project.settings),
+          members: normalizeMembers(members !== null ? members : project.members),
+        };
+        projects.set(projectId, created);
+        return { ok: true, created: true, updated: false, project: copy(created) };
+      }
+      let updated = false;
+      if (typeof existing.name !== 'string' || existing.name.trim() === '') {
+        if (incomingName !== null) { existing.name = incomingName; updated = true; }
+      }
+      if ((existing.origin === null || typeof existing.origin !== 'object') && project.origin !== null && typeof project.origin === 'object') {
+        existing.origin = copy(project.origin);
+        updated = true;
+      }
+      if (typeof existing.created_at !== 'string' || Number.isNaN(Date.parse(existing.created_at))) {
+        existing.created_at = incomingCreatedAt;
+        updated = true;
+      }
+      if (existing.created_by === null || typeof existing.created_by !== 'object') {
+        if (incomingCreatedBy !== null) { existing.created_by = incomingCreatedBy; updated = true; }
+      }
+      if (existing.settings === null || typeof existing.settings !== 'object') {
+        existing.settings = settingsOf(project.settings);
+        updated = true;
+      } else if (project.settings !== null && typeof project.settings === 'object') {
+        for (const key of Object.keys(project.settings)) {
+          if (existing.settings[key] === undefined && project.settings[key] !== undefined) {
+            existing.settings[key] = copy(project.settings[key]);
+            updated = true;
+          }
+        }
+      }
+      if (!Array.isArray(existing.members)) { existing.members = normalizeMembers(members); updated = true; }
+      if (overwriteMeta) {
+        if (incomingName !== null && existing.name !== incomingName) { existing.name = incomingName; updated = true; }
+        const remoteSettings = project.settings !== null && typeof project.settings === 'object' ? project.settings : {};
+        const mergedSettings = settingsOf({ ...existing.settings, ...remoteSettings });
+        if (JSON.stringify(mergedSettings) !== JSON.stringify(existing.settings)) { existing.settings = mergedSettings; updated = true; }
+      }
+      return { ok: true, created: false, updated, project: copy(existing) };
+    },
+    /** Replace a project's member list wholesale (cross-relay merge). Does not emit an event. */
+    replaceMembers(projectId, members) {
+      const project = requireProject(projectId);
+      if (!Array.isArray(members)) throw new ProjectRoomError('BAD_REQUEST', 'members must be an array');
+      const normalized = [];
+      for (const member of members) {
+        if (member === null || typeof member !== 'object') throw new ProjectRoomError('BAD_REQUEST', 'member entry is invalid');
+        if (typeof member.kind !== 'string' || typeof member.id !== 'string' || member.id === '') throw new ProjectRoomError('BAD_REQUEST', 'member needs kind and id', { member });
+        if (!PROJECT_ROLES.includes(member.role)) throw new ProjectRoomError('BAD_ROLE', 'unknown role', { role: member.role });
+        normalized.push({
+          kind: member.kind,
+          id: member.id,
+          name: typeof member.name === 'string' ? member.name : null,
+          role: member.role,
+          joined_at: typeof member.joined_at === 'string' && !Number.isNaN(Date.parse(member.joined_at)) ? member.joined_at : new Date(now()).toISOString(),
+        });
+      }
+      project.members = normalized;
+      return { ok: true, members: normalized.map((member) => ({ ...member })) };
+    },
     /**
      * A6: self-contained state for persistence. Projects and the event log are plain data, so the
      * snapshot is the exact object that <stateDir>/projects can be rebuilt from.

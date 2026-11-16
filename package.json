@@ -183,6 +183,11 @@
     "test:cluster-sync:integration": "node --test --test-force-exit test/cluster-sync-integration.test.mjs",
     "test:relay-version": "node --test --test-force-exit test/relay-version.test.mjs",
     "verify:relay-cluster": "node scripts/verify-relay-cluster-v3.mjs",
+    "test:cluster-domains": "node --test --test-force-exit test/cluster-domains.test.mjs",
+    "test:chat-store": "node --test --test-force-exit test/chat-store.test.mjs",
+    "test:project-sync": "node --test --test-force-exit test/project-sync.test.mjs",
+    "test:cluster-phase2": "node --test --test-force-exit test/cluster-domains.test.mjs test/chat-store.test.mjs test/project-sync.test.mjs",
+    "verify:relay-cluster-phase2": "node scripts/verify-relay-cluster-phase2.mjs",
     "test:gpw-ai": "node --test --test-force-exit test/gpw-ai.test.mjs test/gpw-ai-priority.test.mjs"
   },
   "devDependencies": {

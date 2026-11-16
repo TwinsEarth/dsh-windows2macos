@@ -6,7 +6,7 @@
  * status follows from those records. That is what lets a merge gate ask "does this exact patch sha have an approval?" and get
  * an answer that cannot be edited afterwards.
  *
- * Rules (docs/COLLAB/M5-MULTI-CLIENT-PRIMITIVES.md §3):
+ * Rules (docs/COLLAB/M5-MULTI-CLIENT-PRIMITIVES.md 搂3):
  *  - only maintainer/owner may be a reviewer, and only the listed reviewers may decide;
  *  - nobody reviews their own request (an owner may override, and the override is recorded);
  *  - a reviewer may not record the same verdict twice; a second approve on the same review is a refusal, not a no-op;
@@ -28,8 +28,9 @@ export class ReviewError extends Error {
 
 const memberKey = (member) => (member && typeof member.kind === 'string' && typeof member.id === 'string' ? member.kind + ':' + member.id : null);
 
-export function createProjectReviews({ now = () => Date.now(), onEvent = null } = {}) {
+export function createProjectReviews({ now = () => Date.now(), onEvent = null, idPrefix = '' } = {}) {
   const reviews = new Map();
+  const idScope = typeof idPrefix === 'string' && idPrefix !== '' ? idPrefix + '-' : '';
   let counter = 0;
   let seq = 0;
 
@@ -69,6 +70,72 @@ export function createProjectReviews({ now = () => Date.now(), onEvent = null } 
 
   const approvalsOf = (review) => new Set(review.decisions.filter((decision) => decision.decision === 'approve').map((decision) => memberKey(decision.reviewer))).size;
 
+  const asIso = (value) => (typeof value === 'string' && !Number.isNaN(Date.parse(value)) ? new Date(Date.parse(value)).toISOString() : null);
+  const idCounter = (id) => {
+    const match = /(\d+)$/.exec(id);
+    return match === null ? 0 : Number(match[1]);
+  };
+
+  /** Rebuild one internal review from a serialised row; null when the row cannot be a review. */
+  const normalizeReviewRow = (row) => {
+    if (row === null || typeof row !== 'object') return null;
+    if (typeof row.review_id !== 'string' || row.review_id === '') return null;
+    if (typeof row.project_id !== 'string' || row.project_id === '') return null;
+    if (row.target === null || typeof row.target !== 'object') return null;
+    if (!['patch', 'artifact'].includes(row.target.kind)) return null;
+    if (!/^[0-9a-f]{64}$/.test(String(row.target.sha256 ?? ''))) return null;
+    if (row.requested_by === null || typeof row.requested_by !== 'object' || typeof row.requested_by.kind !== 'string' || typeof row.requested_by.id !== 'string') return null;
+    const reviewers = [];
+    if (Array.isArray(row.reviewers)) {
+      for (const reviewer of row.reviewers) {
+        if (reviewer === null || typeof reviewer !== 'object' || typeof reviewer.kind !== 'string' || typeof reviewer.id !== 'string') continue;
+        reviewers.push({ kind: reviewer.kind, id: reviewer.id });
+      }
+    }
+    if (reviewers.length === 0) return null;
+    if (!REVIEW_STATUSES.includes(row.status)) return null;
+    const decisions = [];
+    if (Array.isArray(row.decisions)) {
+      for (const decision of row.decisions) {
+        if (decision === null || typeof decision !== 'object') continue;
+        if (!REVIEW_DECISIONS.includes(decision.decision)) continue;
+        if (decision.reviewer === null || typeof decision.reviewer !== 'object' || typeof decision.reviewer.kind !== 'string' || typeof decision.reviewer.id !== 'string') continue;
+        const decidedAt = asIso(decision.decided_at);
+        if (decidedAt === null) continue;
+        decisions.push({
+          reviewer: { kind: decision.reviewer.kind, id: decision.reviewer.id },
+          decision: decision.decision,
+          comment: typeof decision.comment === 'string' ? decision.comment : null,
+          findings: Array.isArray(decision.findings) ? decision.findings.map((finding) => ({ file: finding?.file ?? null, line: Number.isInteger(finding?.line) ? finding.line : null, severity: finding?.severity ?? null, text: finding?.text ?? null })) : [],
+          decided_at: decidedAt,
+        });
+      }
+    }
+    const createdAt = asIso(row.created_at);
+    if (createdAt === null) return null;
+    const updatedAt = asIso(row.updated_at);
+    const dueAtMs = Number.isFinite(row.due_at_ms) ? row.due_at_ms : (Number.isFinite(Date.parse(row.due_at)) ? Date.parse(row.due_at) : null);
+    return {
+      review_id: row.review_id,
+      project_id: row.project_id,
+      target: {
+        kind: row.target.kind,
+        sha256: String(row.target.sha256),
+        source_task_id: typeof row.target.source_task_id === 'string' ? row.target.source_task_id : null,
+        diffstat: row.target.diffstat ?? null,
+      },
+      requested_by: { ...row.requested_by },
+      reviewers,
+      required_approvals: Number.isInteger(row.required_approvals) && row.required_approvals >= 1 ? row.required_approvals : 1,
+      status: row.status,
+      decisions,
+      created_at: createdAt,
+      due_at: dueAtMs === null ? null : new Date(dueAtMs).toISOString(),
+      due_at_ms: dueAtMs,
+      ...(updatedAt === null ? {} : { updated_at: updatedAt }),
+    };
+  };
+
   return {
     create({ projectId, target, requestedBy, reviewers, requiredApprovals = 1, dueAt = null, roleOf = null, allowSelfReview = false }) {
       if (typeof projectId !== 'string' || projectId === '') throw new ReviewError('INVALID_PROJECT', 'project_id is required');
@@ -88,7 +155,7 @@ export function createProjectReviews({ now = () => Date.now(), onEvent = null } 
         }
       }
       counter += 1;
-      const reviewId = 'rv-' + String(counter).padStart(6, '0');
+      const reviewId = 'rv-' + idScope + String(counter).padStart(6, '0');
       const dueMs = dueAt === null ? null : Date.parse(dueAt);
       const review = {
         review_id: reviewId,
@@ -150,12 +217,43 @@ export function createProjectReviews({ now = () => Date.now(), onEvent = null } 
         .filter((review) => review.project_id === projectId && (status === null || review.status === status))
         .map((review) => ({ review_id: review.review_id, target: review.target, status: review.status, approvals: approvalsOf(review), required_approvals: review.required_approvals, created_at: review.created_at, due_at: review.due_at }));
     },
-    /** Merge gate (§3.2): is this exact patch sha approved by a review on this project? */
+    /** Merge gate (搂3.2): is this exact patch sha approved by a review on this project? */
     approvedFor({ projectId, sha256 }) {
       expireDue();
       const approved = [...reviews.values()].find((review) => review.project_id === projectId && review.status === 'approved' && review.target.sha256 === sha256);
       return approved === undefined ? { ok: false, code: 'REVIEW_REQUIRED', sha256 } : { ok: true, review_id: approved.review_id };
     },
+    /** Serialisable copy of every review (cross-relay merge / restart persistence). */
+    snapshot() {
+      return [...reviews.values()]
+        .map((review) => ({
+          ...describe(review),
+          due_at_ms: review.due_at_ms,
+          ...(typeof review.updated_at === 'string' ? { updated_at: review.updated_at } : {}),
+        }))
+        .sort((left, right) => (left.review_id < right.review_id ? -1 : left.review_id > right.review_id ? 1 : 0));
+    },
+    /** Replace the whole review table with rows produced by `snapshot()` or a merge of snapshots. */
+    restore(rows) {
+      if (!Array.isArray(rows)) return { ok: false, code: 'BAD_SNAPSHOT' };
+      const rebuilt = new Map();
+      let skipped = 0;
+      let maxCounter = counter;
+      for (const row of rows) {
+        const review = normalizeReviewRow(row);
+        if (review === null) { skipped += 1; continue; }
+        rebuilt.set(review.review_id, review);
+        maxCounter = Math.max(maxCounter, idCounter(review.review_id));
+      }
+      reviews.clear();
+      for (const [reviewId, review] of rebuilt) reviews.set(reviewId, review);
+      counter = maxCounter;
+      seq = Math.max(seq, rebuilt.size);
+      return { ok: true, restored: rebuilt.size, skipped };
+    },
     size() { return { reviews: reviews.size, events: seq }; },
   };
 }
+
+
+
