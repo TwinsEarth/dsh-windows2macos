@@ -1,0 +1,34 @@
+{
+  "version": "3.4.4",
+  "case": "RELEASE-3440",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-16T04:49:31.834Z",
+  "executor": "lead",
+  "task_id": "pre-release-3440",
+  "requirement": "v3.4.4: the GPW, queue-journal and decision-center floating badges appear only while their own subplugin route exists; disabling a subplugin hides its badge",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/client-bundle.test.mjs"
+    ],
+    [
+      "node",
+      "scripts/pack.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "gpw": "GpwLauncher renders null until /api/w2m/gpw/state answers; enabled state comes from the same probe",
+      "queue": "queue badge hidden and store not started until /api/w2m/composer/journal answers",
+      "decision": "decision badge hidden and drawer closed until /api/w2m/decisions answers",
+      "hidden_css": "badge[hidden] rules beat the class display rules",
+      "proof": "client-bundle 55 pass; eslint 0 errors"
+    }
+  }
+}

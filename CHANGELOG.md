@@ -4,6 +4,16 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [3.4.4] - 2026-11-16
+
+- **子插件浮标与子插件一一对应**：GPW、队列日志、决策中心三枚浮标只在对应子插件启用（HTTP 路由存在）时显示；子插件关闭时浮标隐藏，重新启用后自动出现。
+  - GPW 浮标监听 `/api/w2m/gpw/state`（dsh-gpw 未启用时 404 → 不渲染）；
+  - 队列浮标监听 `/api/w2m/composer/journal?list=1`（dsh-queue-journal 未启用时隐藏，启用后才启动队列存储）；
+  - 决策中心浮标监听 `/api/w2m/decisions`（dsh-decision-center 未启用时隐藏）；
+  - 统一 `watchSubpluginRoute` 每 5 秒复核，禁用后抽屉自动关闭，重新启用后恢复。
+
+
+
 ## [3.4.3] - 2026-11-15
 
 - **发布产物一致性修复**：v3.4.2 的 GitHub Release 是干净 tag 产物（1,928,320 B / sha256 0458b2…），但本地 pack 时把未跟踪的 `docs/RELAY-CLUSTER-SYNC-PHASE2-DESIGN.md` 一并打进了 npm staging（1,938,223 B / 不同 shasum）。

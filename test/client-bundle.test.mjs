@@ -1167,3 +1167,15 @@ it('v3.4.0: a stored empty title falls back to the sessions map', () => {
   assert.ok(source.includes("for (const key of [bare, raw, 'session-' + bare])"), 'both raw uuid and session-<uuid> map keys are tried, bare uuid first');
   assert.ok(source.includes('sessionTitleForEntry(entry, store.state.sessions)'), 'entryCard uses the helper');
 });
+
+it('v3.4.4: each floating badge follows its own subplugin route', () => {
+  const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
+  assert.ok(source.includes('function subpluginRouteAvailable(route)'), 'one route probe');
+  assert.ok(source.includes('function watchSubpluginRoute(route, onChange'), 'one availability watcher');
+  assert.ok(source.includes("watchSubpluginRoute('/api/w2m/decisions'"), 'decision badge follows decision-center');
+  assert.ok(source.includes("watchSubpluginRoute('/api/w2m/composer/journal?list=1'"), 'queue badge follows queue-journal');
+  assert.ok(source.includes("if (alive) setAvailable(response.status !== 404);"), 'GPW launcher follows dsh-gpw');
+  assert.ok(source.includes('if (available !== true) return null;'), 'GPW launcher renders nothing while disabled');
+  assert.ok(source.includes('badge.hidden = !enabled;'), 'both DOM badges follow their route');
+  assert.ok(source.includes('.w2mDcBadge[hidden],.w2mJqBadge[hidden]'), 'hidden beats the class display rule');
+});
