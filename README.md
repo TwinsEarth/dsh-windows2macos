@@ -12,7 +12,7 @@ English | [中文说明](#中文说明)
 >
 > 这三个版本有重大缺陷（决策中心客户端 UI 不完整/缺失；3.2.1 预览构建还存在弹窗遮罩锁死客户端的问题），
 > **请勿下载、安装或使用**，npm 上已对 `@twinsearth/w2m-dsh-plugin@>=3.0.0 <3.4.4` 设置 deprecate 警告。
-> 请安装 **3.4.4 或更高版本**。
+> 请安装 **3.4.5 或更高版本**。
 
 ## W2M是一个开源（MIT）的 AI 智能体舰队编排工具
 ————用同一个 DeepSeek 、豆包、WorkBuddy账号把"你自己的多台机器"（Windows/Mac）编成一个舰队，统一派发命令、协作&协同开发。
@@ -99,7 +99,7 @@ w2m-mcp --help
 # 复制进你自己的 codex/mcp-servers.toml
 [mcp_servers.w2m]
 command = "npx"
-args = ["-y", "@twinsearth/w2m-dsh-plugin@3.4.4", "w2m-mcp"]
+args = ["-y", "@twinsearth/w2m-dsh-plugin@3.4.5", "w2m-mcp"]
 ```
 
 ### 5. 验证过的 release tarball（离线）
@@ -201,6 +201,28 @@ plugins:
 - [Issues](https://github.com/TwinsEarth/dsh-windows2macos/issues)
 
 MIT.
+
+## 自修复子插件（dsh-fix，v3.4.5+）
+
+会话历史里的图片附件是内容寻址存储的；对象文件一旦被删，这条会话每一轮都会在准备请求时失败，
+界面上是「执行出错 · DeepSeek Messages transport failed」，重试 5 次也没用（真因不是网络）。
+v3.4.5 起包内自带 `@twinsearth/w2m-dsh-plugin/dsh-fix` 子插件，默认启用：
+
+- 挂在 `agent/request-error` waterfall，只处理 `TRANSPORT` / `ATTACHMENT_NOT_FOUND`；
+- 扫描当前请求视图，只针对「对象文件确实不存在且尚未 offloaded」的图片，追加官方既有的
+  `image/offload` 事件、`flush` 后让这一轮立即重试（不消耗 provider 重试预算）；
+- 没有可修的图就原样交给下游，所以真正的网络错误不会被掩盖；同一轮最多修 3 次。
+
+离线批量体检（需先退出 DSH；CLI 需要 Node ≥ 22.15 的同步 zstd API）：
+
+```bash
+node cli/bin/dsh-fix-attachments.mjs scan          # 只报告：哪些会话坏了、要补几处
+node cli/bin/dsh-fix-attachments.mjs fix --apply   # 真的写：写前备份、写后全量复核
+node cli/bin/dsh-fix-attachments.mjs backups --session <片段>
+node cli/bin/dsh-fix-attachments.mjs restore --session <片段> --apply
+```
+
+完整说明（判定依据、边界、配置覆盖、状态文件）见 [docs/DSH-FIX.md](./docs/DSH-FIX.md)。
 
 ## 互联契约（contract 1.x）
 

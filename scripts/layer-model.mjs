@@ -48,6 +48,10 @@ export const LAYERS = Object.freeze([
   { name: 'queue-journal', rank: 1, kind: 'capability', note: 'ported Fang queue journal (store + composer routes)' },
   // v3.2.0: w2m interop contract layer (own method table over the vendored published SDK copy).
   { name: 'interop', rank: 1, kind: 'capability', note: 'w2m.* contract server/client over the versioned contract SDK' },
+  // v3.4.5: the self-repair subplugin. A capability leaf: the host listener and the offline CLI import only
+  // Node builtins and each other, so it adds no cross-layer edge. Declared because the directory exists and
+  // because its row in cordis.patch.yml makes it a mountable component, not a helper library.
+  { name: 'fix', rank: 1, kind: 'capability', note: 'attachment self-repair (agent/request-error listener + offline CLI)' },
   // v1.9.1: internal telemetry adapter. A leaf capability: it imports only Node builtins and itself, and it is
   // dormant unless the host supplies the relay/token environment contract. Declared because the directory exists;
   // leaving it unnamed is the silent cross-layer edge the checker exists to refuse.

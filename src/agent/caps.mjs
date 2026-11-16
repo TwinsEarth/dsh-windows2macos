@@ -196,8 +196,12 @@ async function probeNpm(env, depsDir, nodePath) {
     return { version, path: cli, source: 'npm-cli', error };
   }
 
-  // A directly executable npm (POSIX shell script, or npm.exe on Windows).
-  const direct = probeToolOnPath(['npm'], env);
+  // A directly executable npm: the POSIX shell wrapper on Unix, `npm.exe` on
+  // Windows. Windows Node distributions also ship an extensionless `npm`
+  // shell script, and spawning that with `shell: false` fails with ENOENT -
+  // so the direct probe must not accept it there. The `.cmd` shim below is the
+  // honest answer and is reported as NEEDS_SHELL.
+  const direct = probeToolOnPath(['npm'], env, process.platform === 'win32' ? ['.exe'] : ['']);
   if (direct) {
     const { version, error } = await probeVersion(direct, ['--version'], RE_NPM);
     return { version, path: direct, source: 'path', error };
@@ -212,10 +216,14 @@ async function probeNpm(env, depsDir, nodePath) {
   };
 }
 
-/** @param {string[]} names @param {Record<string,string|undefined>} env */
-function probeToolOnPath(names, env) {
+/**
+ * @param {string[]} names
+ * @param {Record<string,string|undefined>} env
+ * @param {string[]} [extensions]
+ */
+function probeToolOnPath(names, env, extensions = ['']) {
   for (const name of names) {
-    const found = findExecutable(name, { env, extensions: [''] });
+    const found = findExecutable(name, { env, extensions });
     if (found) return found;
   }
   return null;

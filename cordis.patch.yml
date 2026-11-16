@@ -164,5 +164,19 @@
     - id: dsh-decision-center
       name: '@twinsearth/w2m-dsh-plugin/decision-center'
       config: {}
+    # 自修复 (dsh-fix): repairs sessions whose history references a deleted image attachment object.
+    #
+    # Enabled: this is the release's headline behaviour and the failure it addresses is permanent
+    # (the bytes are gone, so retrying cannot help). It listens on the agent loop's
+    # `agent/request-error` waterfall, appends the official `image/offload` event for unreadable
+    # images on the current surface, flushes, and retries the step. A real network failure is
+    # delegated untouched; at most 3 repairs per session per turn.
+    #
+    # The mount marker is $DSH_HOME/xclient/dsh-fix-state.json; the offline CLI is `w2m-fix`
+    # (also `node cli/bin/dsh-fix-attachments.mjs`), documented in docs/DSH-FIX.md.
+    - id: dsh-fix
+      name: '@twinsearth/w2m-dsh-plugin/dsh-fix'
+      config:
+        maxRepairsPerTurn: 3
 
 

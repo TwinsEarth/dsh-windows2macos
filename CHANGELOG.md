@@ -4,6 +4,21 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [3.4.5] - 2026-11-16
+
+- **新增自修复子插件 `dsh-fix`**（`@twinsearth/w2m-dsh-plugin/dsh-fix`，默认启用）：当会话历史引用的图片附件对象已被删除、导致每一轮都以 `TRANSPORT`（`DeepSeek Messages transport failed`）失败时，在进程内自动修复：
+  - 挂在 `agent/request-error` waterfall，只检查 `TRANSPORT` / `ATTACHMENT_NOT_FOUND`；
+  - 扫描当前请求视图（`session.surface.nodes`，被 compaction 阴影掉的旧消息自动排除），只针对对象文件确实缺失且尚未 `offloaded` 的图片；
+  - 追加官方既有的 `image/offload` 事件并 `await ctx.sessions.flush(session)` 过持久化屏障，然后返回 `{ kind: 'retry' }` 重试该步（不消耗 provider 重试预算、不记 `llm/retry`）；
+  - 没有可修的图 → `next()`，真网络错误原样交给下游；同一 session 同一轮最多修 `maxRepairsPerTurn`（默认 3）次。
+- **离线 CLI**：新增 `w2m-fix`（`bin/w2m-fix.mjs`；兼容路径 `cli/bin/dsh-fix-attachments.mjs`）：
+  - `scan` 只报告；`fix --apply` 追加一条带 checksum 的 `image/offload` 帧（需先退出 DSH；写前备份、写后全量复核）；
+  - `backups --session <片段>` / `restore --session <片段> --apply` 查看与回滚备份；
+  - 拒绝：DSH 正在运行、日志末尾有撕裂帧、不认识的会话格式版本；CLI 需要 Node ≥ 22.15（同步 zstd）。
+- **来源与迁移**：功能移植自 `xuzhunzhi/dsh-fix-attachments`（MIT）；挂载点、状态目录（`$DSH_HOME/xclient/dsh-fix-state.json`）与 CLI 名称按 w2m 约定调整，详见 `docs/DSH-FIX.md`。
+  升级到 v3.4.5 后如仍装有独立包 `dsh-fix-attachments`，请移除它（两个监听器能力重叠；本包已包含该修复）。
+- **Windows 能力探测修复**：Node 的 Windows 发行版同时带一个无扩展名的 `npm` shell 脚本；`probeNpm()` 在找不到 `npm-cli.js` 时会把它当成可直接执行文件，`spawn(..., {shell:false})` 得到 `SPAWN_ENOENT`。现在 Windows 上的直接探测只接受 `npm.exe`，无扩展名脚本改由 `npm.cmd` 分支报 `NEEDS_SHELL`（与既有语义一致）。
+
 ## [3.4.4] - 2026-11-16
 
 - **子插件浮标与子插件一一对应**：GPW、队列日志、决策中心三枚浮标只在对应子插件启用（HTTP 路由存在）时显示；子插件关闭时浮标隐藏，重新启用后自动出现。
