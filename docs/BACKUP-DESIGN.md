@@ -34,6 +34,7 @@
 <root>/snapshots/<snapshot_id>/keys.json       同一份信封的副本（快照可独立还原）
 <root>/current/<workspace>/<session>.json      当前版本指针：rel/sha256/blocks/snapshot_id
 <root>/old/<workspace>/<session>/<ts>-<sha12>.json   被取代版本的可还原记录（v3.4.7 轮转）
+<root>/old/<workspace>/<session>/<ts>-<sha12>.json.enc 该版本的密封整文件副本（oldFormat: full，v3.5.0）
 <root>/archive/<date>/archived-sessions-<ts>.tar.zst 归档会话打包（v3.4.8）
 <root>/index.jsonl                             追加式快照日志：只有 id 与计数，没有路径
 <root>/tmp/                                    临时区；backup.lock 也在这里（单写者锁）
@@ -42,7 +43,7 @@
 **v3.4.7 对布局的三处细化**（协议还没发布，在 v1 内提前定稿并记录理由）：
 
 1. **DEK 属于仓库，不属于快照**：块是内容寻址的，跨快照复用（一个会话增长 10%，其余块全部复用）要求新旧快照能用同一把钥匙解密。所以 DEK 在首次运行生成，权威信封存 `<root>/keys.json`，每个快照再存一份**副本**——副本让"一个 snapshot 目录 + objects/"可以独立还原，代价只是每个快照多几百字节。
-2. **`old/` 存可还原记录，不存整文件加密副本**：整文件副本（原计划的 `.zst.enc`）会把同一份字节在 `objects/` 之外再存一遍，114 MB 的会话每天变化就会为十份保留窗口累积 1.1 GB——正好抵消内容寻址去重。记录里只有 rel/size/sha256/blocks/snapshot_id，还原时从 `objects/` 取字节，体积为几百字节。
+2. **`old/` 存可还原记录，另可选整文件密封副本**（**v3.5.0 更新**，取代 v3.4.7 的"不存副本"决定）：记录只有 rel/size/sha256/blocks/snapshot_id，几百字节，还原时从 `objects/` 取字节；`oldFormat: full` 时**每发生一次真正轮转**，同一目录下再写一份密封整文件副本 `…<ts>-<sha12>.json.enc`（记录里的 `full_copy` 指向它），见 §24。副本会把同一份字节在 `objects/` 之外再存一遍（114 MB 的会话 × 保留窗口会累积到 GB 级），所以**默认仍是 records**；插件行按用户要求设为 `full`，并提供 300 MB 单份上限与特批、`old/` 总量 10 GB 增长提醒（§24.2/§24.3）。
 3. **`current/` 存指针，不存副本**：同上；"这个会话现在是哪个版本"是一个指针问题。
 
 默认根目录：Windows `D:\DeepSeekHarness\BackUP`；其它平台 `~/DSH-BackUP`。优先级：显式配置 > `W2M_BACKUP_DIR` > 平台默认。
