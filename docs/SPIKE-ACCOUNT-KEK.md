@@ -4,6 +4,7 @@
 - 适用版本：w2m v3.4.6（分支 `work/v3.4.6`，HEAD `8c04ef7`）
 - 调查时间：2026-11-17 12:30–12:45（Asia/Shanghai）
 - 调查方式：**只读**。未写 `C:\Users\fangw\.dsh\`、未写 `E:\DSH\`、未改任何仓库文件、未运行测试套件、未执行 git/npm/pnpm 的变更型命令。
+- **增补（2026-11-17 16:37）**：宿主内实测已补齐，w2m 的 `getProfile(client)` 调用已修；调查结论（`account` 信封不实现）不变。见 §8，实测脚本在 `E:\GPT\.tmp\w2m-account-probe-driver.mjs` 等。
 - 凭据纪律：本文只记录**文件名、大小、mtime、顶层/嵌套键名与形状**；全文不包含任何 token、私钥、密码、密钥材料或其前缀/哈希。可行性脚本只在内存里用合成字符串与随机字节，只输出"可/不可 + 长度 + 毫秒"。
 
 ## 0. 结论（先行）
@@ -12,7 +13,7 @@
 2. **machine 信封：可行。** 本机 DPAPI（CurrentUser）32B→262B 密文 round-trip 实测通过，跨独立 PowerShell 进程可解；把随机 32B machine key 交给 DPAPI 保护即可同机免密。限制：仅 Windows（仓库现有 DPAPI 实现对 macOS 明确返回 `keychain-not-implemented`）。
 3. **password 信封：可行且是唯一保证。** 本机 scrypt 实测：N=2^14 ≈56ms、2^15 ≈111ms、2^16 ≈227ms、2^17 ≈461ms；建议 **N=2^17 / r=8 / p=1 / keylen=32**（≤1s 目标下约 2.2× 余量，内存约 128 MiB）。
 4. **建议默认信封组合：`machine + password` 默认写入；`account` 作为可选第三信封（拿到 `userId` 且产品确认后再写）。** 三种信封包裹的都是**同一个随机 32B DEK**（不是直接派生文件密钥），与工作树里已存在的 `src/backup/crypto.mjs`（`wrapDek`/`unwrapDek`/`ENVELOPE_KINDS=['account','machine','password']`）一致。
-5. **实现前必须修一处调用**：w2m 现有 `await service.getProfile()`（零参，`src/chatops/account.mjs:314-318`）与 DSH 0.2.2-rc.3 的 `getProfile(client: AccountClientMetadata)` 签名不符（`dsh-deepseek-account/src/index.ts:228`；`client-metadata.ts:37-45` 会直接解引用 `client.version`；`@Remote` 装饰器只登记 RPC 元数据、不包裹 Host 直接调用，见 `dsh-typert-protocol/src/index.ts:277-317`）。沿用零参调用时 `userId` 大概率保持 null，账户信封会"看起来支持、实际不可用"。
+5. **实现前必须修一处调用**：w2m 现有 `await service.getProfile()`（零参，`src/chatops/account.mjs:314-318`）与 DSH 0.2.2-rc.3 的 `getProfile(client: AccountClientMetadata)` 签名不符（`dsh-deepseek-account/src/index.ts:228`；`client-metadata.ts:37-45` 会直接解引用 `client.version`；`@Remote` 装饰器只登记 RPC 元数据、不包裹 Host 直接调用，见 `dsh-typert-protocol/src/index.ts:277-317`）。沿用零参调用时 `userId` 大概率保持 null，账户信封会"看起来支持、实际不可用"。**（2026-11-17 16:37：该校验已修并在宿主内实测闭环，见 §8；结论不变——账户信封仍不实现。）**
 
 ---
 
@@ -40,7 +41,7 @@
 - 按 DSH 自带 `dsh-doc` 技能的 `references/locate-docs.md:27,31-60` 指引：asar 内文件用 **Host `read` 工具**读取；目录列举与有界文本搜索用 **Electron as Node**（`ELECTRON_RUN_AS_NODE=1` + `$env:DSH_NODE_EXECUTABLE` + 只读脚本）完成。脚本位于 `E:\GPT\.tmp\spike-account\`（`asar-tools.cjs`、`structure-probe.cjs`、`feasibility.cjs`），只读文件、不落明文。
 - `~/.dsh` 与 `E:\DSH` 的所有读取均只读；调查前后对 6 个候选文件做了 size/mtime 复核，**完全一致**（见 §2.3）。
 - 直接以 PowerShell 命令点名 `.credentials.yaml` 的读取被本机 GPW 守卫拦截（`SENSITIVE_EXTENSION`），因此结构读取通过只读 helper 脚本完成；未绕过、未重试其它读取方式。
-- 本会话没有 `cordis_inspect_*` 工具，**无法在宿主进程内实测 `ctx.deepseekAccount.getDeviceIdentity()` 的真实返回值**；第 3 节的运行时结论来自 DSH 源码静态阅读 + w2m 已发布代码 + 本机磁盘证据，已在 §6 标注"未实测"。
+- 本会话没有 `cordis_inspect_*` 工具，**无法在宿主进程内实测 `ctx.deepseekAccount.getDeviceIdentity()` 的真实返回值**；第 3 节的运行时结论来自 DSH 源码静态阅读 + w2m 已发布代码 + 本机磁盘证据，已在 §6 标注"未实测"。**（2026-11-17 16:37 已用 Harness 运行时内的驱动补齐实测，见 §8。）**
 
 ---
 
@@ -275,14 +276,14 @@ keys.json = wrapDek(DEK, [account?, machine?, password])   // :306-339，AAD 绑
 ### 6.2 机密性/可用性风险
 
 - **R6（account 信封不是秘密）**：`userId` 是账户**标识**而非秘密；平台运营方、或任何已知该 userId 的一方都能重新算出 account KEK。DSH profile 的 `id` schema 只是 `z.string()`（`details.ts:6-8`），实际熵未知（w2m 自己假设 UUID 且要求 ≥16 字符，`src/chatops/fleet-join.mjs:48-49,62-74`）。因此 account 信封**必须**声明为"便捷/身份绑定"，不能当作机密性保证；不得用它替代 password。
-- **R7（account 信封的运行时可得性未实测）**：`userId` 需要：已登录 + 有效 grant + 联网 + 本进程内一次成功 `getProfile`。w2m 现有零参调用与 0.2.2-rc.3 签名不符（§3.6），若不在实现前修正，账户信封会经常不可用。**建议 v3.4.6 实现时先修调用并做运行时 A/B（这也补上本 spike 无法在宿主内实测的唯一环节）。**
+- **R7（account 信封的运行时可得性未实测）**：`userId` 需要：已登录 + 有效 grant + 联网 + 本进程内一次成功 `getProfile`。w2m 现有零参调用与 0.2.2-rc.3 签名不符（§3.6），若不在实现前修正，账户信封会经常不可用。**建议 v3.4.6 实现时先修调用并做运行时 A/B（这也补上本 spike 无法在宿主内实测的唯一环节）。** **（2026-11-17 16:37：调用已修、A/B 已在宿主内完成——零参确抛 TypeError，带 metadata 可得 `userId`；见 §8。但 `userId` 仍只是标识，account 信封维持不实现。）**
 - **R8（profile/身份只在内存）**：`.dsh` 磁盘上没有 userId；恢复现场若 DSH 未登录或未联网，账户信封不可用——password 是兜底。
 - **R9（凭据文件不可信边界）**：`.credentials.yaml` 同 UID 可读（DSH 文档明说，`dsh-credentials-local/README.md:115,199`）；本 spike 的任何设计都不应把"文件里的东西"当秘密边界。**备份仓库中绝不能出现 `.credentials.yaml`**（DEV-PLAN:52,154）。
 - **R10（hint/元数据泄露）**：`keys.json` 的 `hint`、仓库状态里的账号信息可能泄露账户标识；建议 hint 恒为 null、状态里只放 `account_available: true/false`，不放 userId/email。
 
 ### 6.3 本调查未解决的未知（2 条核心）
 
-- **U1**：宿主进程内 `ctx.deepseekAccount.getDeviceIdentity()` 当前实际是否返回 `userId`、何时返回（尤其 w2m 零参 `getProfile()` 是否真的抛错并被吞）。本会话没有 `cordis_inspect_*`，也无法在宿主内调用服务——只能静态推断（§3.6）。实现账户信封前必须实测。
+- **U1**：宿主进程内 `ctx.deepseekAccount.getDeviceIdentity()` 当前实际是否返回 `userId`、何时返回（尤其 w2m 零参 `getProfile()` 是否真的抛错并被吞）。本会话没有 `cordis_inspect_*`，也无法在宿主内调用服务——只能静态推断（§3.6）。实现账户信封前必须实测。**（2026-11-17 16:37 已闭环，见 §8：实测 `userId` 在成功 `getProfile(client)` 后可得的 string；零参调用确抛 `TypeError`。`userId` 仍不是秘密。）**
 - **U2**：DeepSeek Platform 账户 `id` 的真实格式与熵（UUID？数字 id？是否会被平台/日志/第三方泄露）。benchmark 需要平台侧信息；本调查不能读 profile 值。若熵低，account 信封的机密性进一步下降甚至不可接受。
 
 ### 6.4 其它未验证项
@@ -380,6 +381,65 @@ git -C 'E:\GPT\w2m\w2m-345-fresh' status --short
 - 未运行 npm/pnpm；
 - 未写 `C:\Users\fangw\.dsh\`、`E:\DSH\` 或仓库内其它文件；**本调查新增的文件只有本文 `docs/SPIKE-ACCOUNT-KEK.md`**（工作树中并行 backup 任务的文件见附录 B，不是本调查的改动）。
 
+> 以上是**原 spike（只读）**的边界；2026-11-17 16:37 的增补（§8）在 `E:\GPT\.tmp` 写了探针脚本、运行了 `chatops-account`/`backup-wiring` 测试，并对真实凭据库做了**只读**比较（副本测量、真库 size/mtime 未变）。
+
+---
+
+## 8. 宿主内实测与 `getProfile(client)` 修复（2026-11-17 16:37，v3.4.7 后增补）
+
+**状态**：§0 第 5 条与 §6.3 U1/R7 的两个前置条件——(a) 修 `getProfile(client)` 调用、(b) 在宿主进程内实测 `userId` 可得性——**均已闭环**。调查结论不变：**`account` 信封仍不实现**（默认信封组合保持 `machine + password`）。本节只记录名称/类型/布尔/毫秒，不含任何 token、账户 id、email 的值或其哈希。
+
+### 8.1 方法与环境
+
+- 宿主运行环境：`E:\DSH\DS`（`@deepseek-ai/dsh` 0.2.2-rc.3；Electron 44.7.0 / Node 24.21.0；win32-x64），用安装版自己的 `runProfile`（即 `dsh --profile` 的同一入口）启动真实 Loader 组合。
+- 组合：临时 `DSH_HOME` 下自建 profile `desktop`，bundles = `@deepseek-ai/dsh-base` + `@deepseek-ai/dsh-web-app`；用 profile 补丁把 `credentials` 行的 `path` 指向**凭据库副本**（805 B，测完立即删除）——401/issuer 清理只可能删副本，真实 `C:\Users\fangw\.dsh\.credentials.yaml` 测量前后 size/mtime 一致、未被写。
+- 驱动（`E:\GPT\.tmp\`）：`w2m-account-probe-driver.mjs`（字段测量，boot 两次）；`w2m-account-fix-probe.mjs`（导入**本仓库修后**的 `src/chatops/account.mjs`，走真实 `identify()`）；由 `run-account-probe.mjs` / `run-account-fix-probe.mjs` 用 Node `spawnSync` 以 Harness 运行时（`ELECTRON_RUN_AS_NODE=1`）启动。报告：`E:\GPT\.tmp\account-probe-20261117-083720\report.json`、`E:\GPT\.tmp\account-fix-probe-20261117-083904\report.json`。
+- 为什么用 Node 编排：`DeepSeek Harness.exe` 是 GUI 子系统程序，PowerShell `&` 不等待它；`Start-Process` 在本机因环境表 `HTTP_PROXY`/`http_proxy` 大小写重复键失败（本机环境问题，与探针无关）。
+
+```powershell
+# 两个探针都由 Node 编排：自建临时 DSH_HOME + 凭据副本，再 spawn Harness 运行时，测完删副本
+node E:\GPT\.tmp\run-account-probe.mjs       # 服务/字段/稳定性测量 → report.json
+node E:\GPT\.tmp\run-account-fix-probe.mjs   # 修后 w2m identify() 的宿主内端到端 → report.json
+```
+
+### 8.2 测量结果（两次独立 boot 一致）
+
+| 测量项 | 结果 |
+|---|---|
+| 服务可达 | `ctx.get('deepseekAccount')` 存在；`getState/getProfile/getDeviceIdentity/getPlatformSession` 均为 function；`getState().status = 'credential-stored'` |
+| 零参 `getProfile()` | **抛 `TypeError`**（错误信息指向 metadata 字段、提及 undefined），发生在网络请求之前 → §3.6 静态推断被证实 |
+| `getProfile({version,locale,timezoneOffsetSeconds})` | `status='ready'`，392 ms / 471 ms；字段名恰为 `avatarUrl, contact, id, name`，均为非空 string；**结果中没有 token/秘密字段** |
+| `getDeviceIdentity().userId` | 任意 `getProfile` 之前：undefined（不可得）；成功读取之后：非空 string |
+| 稳定性 | 同进程两次 `getProfile` 的 id 相等=true；两次独立 boot 的 id 相等=true；`getPlatformSession().userId` 与 profile id 相等=true |
+| Host-only `getPlatformSession()` | 可读：`origin`(string)、`token`(string 非空)、`userId`(string)；两次读取 token 相等=true |
+| 修后的 w2m 路径 | 本仓库 `createAccountIdentity({ctx}).identify()` → `ok:true`、`userId` 为非空 string，且与直接 `getProfile` 的 id **相等=true** |
+
+### 8.3 机密性判断：没有可做稳定 KEK 的秘密材料
+
+- `userId`：**可得、稳定，但只是标识**——平台运营方或任何已知该 id 的一方可重算 `HKDF(userId)`；只能做"身份绑定/便捷解封"，不是机密性（R6 不变）。
+- `name/contact/avatarUrl`：PII（`contact` 还是平台脱敏后的手机号/邮箱），不是密钥材料，也不得进 `keys.json`（R10）。
+- `getPlatformSession().token`：**确是 bearer secret 且 Host-only 可读**，但**易变**——登出/401/40003/issuer 变化会删除，重新登录会替换（§3.3）。用它派生 KEK 的后果是"重新登录后旧备份永久打不开"，比没有 account 信封更糟。
+- 结论：**没有"同一账户、长期稳定、对插件可得"的秘密材料** → `account` 信封维持不实现。
+
+### 8.4 已做的修复（前置条件 a）
+
+- `src/chatops/account.mjs`：新增 `accountClientMetadata(options)`（`:266-303`，含 `ownPackageVersion()` 与其后 JSDoc），按 DSH 的 `AccountClientMetadata` 生成 `{version, locale, timezoneOffsetSeconds}`（version 依次取 `options.clientVersion` → `DSH_CLIENT_VERSION` → 本包版本；locale 取注入值 → 进程 locale；tz = `-getTimezoneOffset()*60`）；`identify()` 改为 `await service.getProfile(accountClientMetadata(options))`（`:387`）。JSDoc 说明：该参数是请求方 UI 的构建版本/语言/时区偏移，用于生成 `x-client-*` 头，**不是凭据**；零参调用会在网络请求前抛错。
+- `test/chatops-account.test.mjs`：断言 `getProfile` 收到三字段 metadata（零参回归防护）、注入值可测、默认 version 非空；`node --test --test-force-exit test/chatops-account.test.mjs` 45/45 通过。
+- 行为等价性：其余路径不变；profile 读取失败仍被 catch 为 signed-out。§8.2 最后一行是宿主内端到端证明。
+
+### 8.5 上游需要什么变化，account 信封才可能成为"真信封"
+
+1. Host 提供**每账户稳定秘密**（不是标识、不是可替换 token）：例如登录时用 OS 钥匙串/DPAPI 保护的随机 32B 账户密钥，以 Host-only 方法（类似 `getDeviceIdentity()`）返回，并承诺生命周期。
+2. 定义**换代语义**：重新登录/换设备/撤销后旧备份是否仍可解，且不得静默失效。
+3. 或者产品**显式接受"身份绑定、不承诺机密性"的便捷解封**：实现为 `HKDF(userId)` + 仓库 salt 的可选第三信封，UI 标注非机密性，且不得替代 password（与 §5.3 一致）。
+4. 版本门禁与降级：Host-only 方法无 schema 承诺（R2），实现须 feature-detect、不可用即跳过、绝不崩溃。
+
+### 8.6 边界
+
+- 只测了本机/本账户/signed-in 且联网的状态；signed-out、断网、token 过期后的失败路径未在本节实测（代码路径见 §3.2/§3.3）。
+- 未测 `userId` 的格式/熵（U2 仍开放）；不改变上述结论。
+- 未改 `lib/client.js`；测试确定性由注入 metadata 保证；本节新增的实测命令见 §7 同目录的 `.tmp` 脚本，不加入仓库测试。
+
 ---
 
 ## 附录 A：证据索引（claim → 证据）
@@ -403,6 +463,10 @@ git -C 'E:\GPT\w2m\w2m-345-fresh' status --short
 | 默认 scrypt 当前 N=2^16、建议 2^17 | `src/backup/crypto.mjs:80-87`；本机实测 C1；`DEV-PLAN:147` |
 | 备份不包含 `.credentials.yaml` | `docs/DEV-PLAN-3.4.6-3.5.0.md:52,154` |
 | Q1=A 的既有决策 | `docs/DEV-PLAN-3.4.6-3.5.0.md:305-310` |
+| 宿主内：零参 `getProfile` 真抛 TypeError、带 metadata 可得 ready profile（id/name/contact/avatarUrl） | 本文 §8.2；`E:\GPT\.tmp\account-probe-20261117-083720\report.json` |
+| 宿主内：`userId` 跨两次调用/两次 boot 稳定，`getPlatformSession()` 可读 token（易变 bearer） | 本文 §8.2/§8.3；同上报告 |
+| 修后 w2m `identify()` 在宿主内可用且与宿主 id 一致 | 本文 §8.4；`E:\GPT\.tmp\account-fix-probe-20261117-083904\report.json`；`src/chatops/account.mjs:266-303,387` |
+| account 信封不实现的最终决定 | 本文 §8.3/§8.5；`docs/BACKUP-DESIGN.md` §6、§12；`src/backup/keystore.mjs:18-22` |
 
 ## 附录 B：工作树状态说明（重要）
 

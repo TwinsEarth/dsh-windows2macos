@@ -37,6 +37,7 @@ import {
   isUsefulHardwareValue,
   readHardwareValues,
   createAccountIdentity,
+  accountClientMetadata,
   HW_SOURCES,
   SN_PATTERN,
 } from '../src/chatops/account.mjs';
@@ -285,14 +286,45 @@ describe('the identity service', () => {
 
   it('refreshes a stale profile so a switched account derives its own fleet key', async () => {
     let userId = null;
+    let seenClient = null;
     const switched = {
       getDeviceIdentity: async () => ({ ...(userId === null ? {} : { userId }), deviceId: 'dev-1', osVersion: '10.0' }),
-      getProfile: async () => { userId = USER; return { status: 'ready' }; },
+      getProfile: async (client) => { seenClient = client; userId = USER; return { status: 'ready' }; },
     };
     const result = await createAccountIdentity({ account: switched, hardware }).resolve();
     assert.equal(result.ok, true);
     assert.equal(result.accountCode, accountCode(USER));
     assert.equal(typeof result.fleetKey, 'string');
+    // DSH 0.2.2-rc.3 requires `getProfile(client)`; a zero-argument call throws before the network
+    // request, so the profile would never be cached and the switched account would never be seen.
+    assert.ok(seenClient !== null, 'getProfile must be called with its required client metadata');
+    assert.deepEqual(Object.keys(seenClient).sort(), ['locale', 'timezoneOffsetSeconds', 'version']);
+    assert.equal(typeof seenClient.version, 'string');
+    assert.notEqual(seenClient.version.trim(), '', 'x-client-version may not be empty');
+    assert.equal(typeof seenClient.locale, 'string');
+    assert.equal(seenClient.timezoneOffsetSeconds, -new Date().getTimezoneOffset() * 60);
+  });
+
+  it('passes the injected client identity, so the metadata is testable and not environment-derived', async () => {
+    let seenClient = null;
+    const switched = {
+      getDeviceIdentity: async () => ({ osVersion: '10.0' }),
+      getProfile: async (client) => { seenClient = client; return { status: 'ready' }; },
+    };
+    await createAccountIdentity({ account: switched, hardware, clientVersion: '9.9.9-test', locale: 'zh-CN' }).resolve();
+    assert.deepEqual(seenClient, {
+      version: '9.9.9-test',
+      locale: 'zh-CN',
+      timezoneOffsetSeconds: -new Date().getTimezoneOffset() * 60,
+    });
+  });
+
+  it('builds client metadata with a non-empty version even when none is injected', () => {
+    const meta = accountClientMetadata();
+    assert.equal(typeof meta.version, 'string');
+    assert.notEqual(meta.version.trim(), '', 'the package version is the last non-empty fallback');
+    assert.equal(typeof meta.locale, 'string');
+    assert.equal(meta.timezoneOffsetSeconds, -new Date().getTimezoneOffset() * 60);
   });
 
   it('says signed-out rather than inventing a fleet', async () => {

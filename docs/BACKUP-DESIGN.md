@@ -165,6 +165,8 @@
 3. scrypt 实测：N=2^14≈56 ms、2^15≈111 ms、2^16≈227 ms、**2^17≈461 ms**（参考机）；默认取 **N=2^17 / r=8 / p=1**（约 1 s 预算的 2.2× 余量，单次 128 MiB 内存）。
 4. 因此**默认信封组合 = `machine` + `password`**；`account` 是可选第三信封，且写入前必须修掉一处调用：w2m 现有 `await service.getProfile()`（零参，`src/chatops/account.mjs`）与 DSH 的 `getProfile(client)` 签名不符，沿用零参时 `userId` 大概率恒为 null，会"看起来支持、实际不可用"。
 
+> **2026-11-17 16:37 增补**：上一条的两项前置条件已闭环——`getProfile(client)` 已修（`src/chatops/account.mjs` 的 `accountClientMetadata`）并在宿主内实测（`docs/SPIKE-ACCOUNT-KEK.md` §8）：`userId` 可得且跨调用/跨 boot 稳定，但**仍只是标识**；Host-only `getPlatformSession()` 能读到 bearer token，但它在登出/401/重新登录时被删除或替换，**不是稳定的每账户秘密**。结论不变：`account` 仍默认不写。
+
 规则：
 
 1. **AAD 绑定**：每份信封的 AAD = `w2m-session-backup|<version>|account/machine/password|aes-256-gcm|<salt>`。所以信封不能被挪到别的 kind 槽、KDF 参数不能被改小——都会变成认证失败。
@@ -267,7 +269,7 @@
 
 ## 12. 未决问题
 
-1. **账户信封**：spike 已给出结论（§6）：`userId` 不是秘密，默认不写；实现前必须做两件事——修 `getProfile(client)` 调用、在宿主进程内实测 `userId` 可得性（`docs/SPIKE-ACCOUNT-KEK.md` §6 唯一未闭环项）。
+1. **账户信封**：spike 已给出结论（§6）：`userId` 不是秘密，默认不写。实现前的两件事已于 2026-11-17 16:37 完成——`getProfile(client)` 已修并做宿主内实测（`docs/SPIKE-ACCOUNT-KEK.md` §8）：`userId` 可得且稳定但仍只是标识；Host-only token 可读但易变，不能做稳定 KEK。故 `account` 维持不实现；等上游提供"每账户稳定秘密、且换代语义明确"再开（条件清单见 `docs/SPIKE-ACCOUNT-KEK.md` §8.5）。
 2. **清单是否也该加密**：v1 选择明文（§4 理由）。若用户要求，v2 可加 `manifest.enc` + 明文 `snapshot.json`（只留计数）。
 3. **`current/` 已定稿**：存指针（见 §3 细化 3），轮转与 gc 都以它为根之一。
 4. **保留策略默认值已定稿**：每会话 10 份旧版本（Q4=A），`keepOldPerSession` 可配；轮转后立即裁剪，窗口不会无声增长。

@@ -399,7 +399,7 @@ v3.4.6 协议+加密+扫描 ──▶ v3.4.7 引擎/定时/轮转 ──▶ v3.4
 | Q6 | 备份是否走 Relay 异地 | A v3.5.0 仅本地/网络盘；B 增加 Relay 传输 | **A**（Phase 3 再议） |
 | Q7 | 定时默认时间 | A 22:00；B 22:00+03:00 | **A**（可自行更改） |
 
-> **2026-11-17 spike 对 Q1 的更正**：DSH 只提供账户**标识** `userId`（仅内存、需联网、需一次成功的 `getProfile`），磁盘没有稳定账户秘密；只用标识派生 KEK 不构成机密性。因此 v3.4.7 起默认信封组合为 **machine（Windows DPAPI，同机免密）+ password（scrypt，唯一保证）**，`account` 降级为可选，且启用前必须先修 `getProfile(client)` 调用并做宿主内实测。详见 `docs/SPIKE-ACCOUNT-KEK.md` 与 `docs/BACKUP-DESIGN.md` §6。
+> **2026-11-17 spike 对 Q1 的更正**：DSH 只提供账户**标识** `userId`（仅内存、需联网、需一次成功的 `getProfile`），磁盘没有稳定账户秘密；只用标识派生 KEK 不构成机密性。因此 v3.4.7 起默认信封组合为 **machine（Windows DPAPI，同机免密）+ password（scrypt，唯一保证）**，`account` 降级为可选，且启用前必须先修 `getProfile(client)` 调用并做宿主内实测。详见 `docs/SPIKE-ACCOUNT-KEK.md` 与 `docs/BACKUP-DESIGN.md` §6。**（2026-11-17 16:37：两项前置已闭环——调用已修、宿主内实测完成；`userId` 可得且稳定但仍只是标识，token 可读但易变，故 `account` 仍不实现。见 SPIKE §8。）**
 
 ---
 
@@ -449,7 +449,7 @@ v3.4.6 协议+加密+扫描 ──▶ v3.4.7 引擎/定时/轮转 ──▶ v3.4
 1. **去重发生在“同一会话的历史版本之间”，不是会话之间**：设计必须按会话文件哈希判定“未变则跳过”，并按块级内容寻址复用历史块；否则每天会重写 114 MB。
 2. **存在未注册会话**（`session-e4350615…`，在默认工作区目录下、`archived=true` 却不在 `workspace.json`）：还原逻辑必须支持“补注册工作区 + 恢复归档标记”，否则还原后在 DSH 里看不见。这条已写进 §7 v3.4.8 验收。
 3. **附件体量极小（0.1 MB）但不可省略**：删除附件对象正是 dsh-fix 存在的理由，备份必须包含 `attachments/v1/objects/**`。
-4. **账户 KEK 需要宿主侧核验**：磁盘上只有凭据文件与 w2m 设备密钥，无法直接判定“DSH 登录账户”的稳定身份；Q1=A 的前提是 v3.4.6 用 `cordis_inspect` 查账号/凭据服务，确认可读账户材料后才实现账户信封，否则退回密码模式。
+4. **账户 KEK 需要宿主侧核验**：磁盘上只有凭据文件与 w2m 设备密钥，无法直接判定“DSH 登录账户”的稳定身份；Q1=A 的前提是 v3.4.6 用 `cordis_inspect` 查账号/凭据服务，确认可读账户材料后才实现账户信封，否则退回密码模式。**（2026-11-17 16:37 已闭环：宿主内实测确认 `userId` 是标识不是秘密、token 易变；`account` 维持不实现，见 SPIKE §8。）**
 5. **`D:\DeepSeekHarness\BackUP` 尚未创建**：v3.4.6 的 `layout.mjs` 首个职责就是“安全创建 + 无权限/盘符缺失具名报错”。
 
 ---
@@ -515,3 +515,29 @@ v3.4.8 的验收新增一条：还原后必须再跑一次 doctor 且零发现�
 还原到空 home 后日志字节与备份一致、`workspace.json` 已登记；错误密码/错误身份被 `BACKUP_NO_PERMISSION` 拒绝。
 
 > **2026-11-17 实测（默认仓库）**：`unlock` → `machine` 信封、本机可用；`verify` 2 快照 / 32 文件 / 337.4 MB / 108 块全通过，30/30 未来追加模拟通过，49.1 s；`archive --scope all` 16 文件 → 168.7 MB tar → 164.7 MB zstd，2.3 s；`restore` 计划 15/15 会话由安装的 Harness 终审通过（13 identical / 2 conflict，冲突来自备份后仍在写入的活会话），dry-run 零写入；未注册工作区的会话默认拒绝，`--workspace-path` 显式挂接后进入计划。计划阶段对 15 份会话做运行时终审约 1.4 min —— 面板应按需逐份规划，而不是一次性全量。
+
+### v3.4.7 引擎条目核验（2026-11-17）
+
+> 只读核验：对照 HEAD `e80fc67` 的树与 `git log` 逐条给出文件:行与测试套件；套件名/断言标题取自 `test/backup-*.test.mjs`。本核验未全量复跑套件（静态证据对照），收尾只运行了 `backup-wiring`。
+
+| # | 声明条目 | 证据（文件:行） | 证明它的测试 |
+|---|---|---|---|
+| 1a | `objects/` 内容寻址块 | `src/backup/layout.mjs:14-22,61-68,147-160`；`src/backup/engine.mjs:124-127`（`objects/<aa>/<sha256>`） | `backup-layout` “derives every repository path from the root”；`backup-engine` “commits a snapshot, writes blocks once…” |
+| 1b | 内容寻址去重 | `src/backup/engine.mjs:185-205`（对象已存在即复用）、`:590`（`dedupe_ratio`） | `backup-engine` “writes no blocks on a second backup of unchanged sessions (deduplication)” |
+| 1c | `current/` 指针 | `src/backup/rotation.mjs:84-121,392-411` | `backup-rotation` “derives a per-session pointer path and writes it atomically” |
+| 1d | `index.jsonl` | `src/backup/repo.mjs:52-70,168-211,261-280` | `backup-repo` “reads valid lines, tolerates a torn tail…”、“appends an entry and reads it back” |
+| 1e | `old/` 轮转 | `src/backup/rotation.mjs:109-121,129-154,325-384` | `backup-rotation` “rotates when the digest changed…”、“keeps the newest N versions…” |
+| 1f | 22:00 每日定时器 | `src/backup/schedule.mjs:32-39,128-155`（默认 22:00 Asia/Shanghai + 12h 补偿）；`src/plugin/backup.mjs:279-289`（`createDailyScheduler` + `ctx.effect` 卸载停表）；`src/plugin/schedule.mjs:91-213`；`cordis.patch.yml:193` | `backup-schedule` “defaults to 22:00 Asia/Shanghai…”、“finds Beijing 22:00 as 14:00 UTC…”、“reports a recently missed slot once”；`backup-run` “registers one run route and starts a scheduler that the effect can stop” |
+| 2a | machine 信封 → Windows DPAPI | `src/backup/machine-key.mjs:47-63`（PowerShell `ProtectedData.Protect/Unprotect`, CurrentUser）、`:91-111`（真实 protect/unprotect 探测）、`:173-238`（0600 落盘） | `backup-machine-key` “protects and unprotects 32 bytes through a real PowerShell round trip”；`backup-access` “uses the real DPAPI when the platform is Windows” |
+| 2b | password 兜底 | `src/backup/keystore.mjs:150-216`（machine 可解则封装）、`:233-274`（首用按可得凭证建信封）；`src/backup/engine.mjs:305-322`（两者皆无 → `BACKUP_NO_PERMISSION`） | `backup-keystore` “mints one DEK and wraps it under the machine secret and the password”、“refuses to create a repository no credential can open”；`backup-engine` “refuses with BACKUP_NO_PERMISSION…” |
+| 3a | `dsh-backup` 行与引擎同批引入 | `cordis.patch.yml:188-195`（`id: dsh-backup`，`disabled: true`）；commit `37653b6` 同一提交新增引擎 + 行（`git show --stat 37653b6`） | `backup-wiring` “declares the dsh-backup subpath and ships a disable-by-default row for it” |
+| 3b | 导出 | `package.json:22`（`"./dsh-backup": "./lib/backup.js"`）、`lib/backup.js:13-30`；同 commit | `backup-wiring` 同上 + “declares the CLI in package.json#bin” |
+| 3c | 路由 | `src/plugin/backup.mjs:54-78`（run/restore/archive/verify/unlock + 确认令牌）、`:297-359`（`ctx.inject(['connection'])` 注册）；只读 status/scan 见 `src/backup/routes.mjs:29,32` | `backup-run` “registers one run route…”、“requires the confirmation token…”、“exposes the v3.4.8 routes…”；`backup-wiring` “registers two GET routes on the host registry” |
+
+**差距/注意（文档 vs 实际）**
+
+1. `old/` 形态：本文 §7 v3.4.7 计划 `:214` 仍写“复制到 `old/<ws>/<sid>/<ts>-<sha12>.zst.enc`”，实际是**可还原 JSON 记录** `.json`（`src/backup/rotation.mjs:109-121`）；偏差理由已记在 `:229`。以代码/实施记录为准。
+2. 定时器是**能力**不是默认行为：`cordis.patch.yml:190` 的 `dsh-backup` 行 `disabled: true`；即使挂载，`backupEnabled:false` 也会在 `src/plugin/backup.mjs:197-200` 提前返回、不装表。装上包不会自动在 22:00 备份。
+3. `account` 信封：`src/backup/crypto.mjs` 的 `ENVELOPE_KINDS`/`unwrapDek` 仍接受该 kind，但**无写入者**（`src/backup/keystore.mjs:18-22` 明确“unwritten kind”）；kind 槽存在 ≠ 功能实现，文档 §6 的“默认不写”才是实际状态。
+4. machine 信封平台边界：Windows 实测可用；macOS `keychain-not-implemented`（`src/backup/machine-key.mjs:94-100`），非 Windows 的定时任务会具名拒绝 `BACKUP_NO_PERMISSION`（`src/plugin/backup.mjs:18-25`）——设计行为，不是缺口。
+5. “默认组合 = machine + password”要读作“**密码被提供时**”：面板 `POST /api/w2m/backup/run` 与定时任务都不传密码（`src/plugin/backup.mjs:18-25,364-366`；密码只经 CLI stdin，`src/backup/cli.mjs:501-506`），因此 Windows 上首次建库得到的是**仅 machine 信封**的仓库——同机可解、换机不可解；可移植性要求先跑 `w2m-backup run --password-stdin`。`docs/BACKUP-DESIGN.md` §6.6 的“password（提供时）”与实现一致。
