@@ -159,6 +159,43 @@ function realPathTolerant(target) {
 }
 
 /**
+ * Refuse a write whose ancestors inside the mirror, once links are followed, leave their lexical place.
+ *
+ * `resolveMirrorRoot` checks the mirror root once, before the first write. A junction created **inside** the mirror
+ * tree (or the root swapped for one) between that check and the write would make the copy land somewhere else --
+ * the repository, the home, or an arbitrary directory. This guard is the re-check at write time: every existing
+ * ancestor between the target and the mirror root must resolve to itself, and the target must stay under the root.
+ *
+ * @param {string} realRoot the validated mirror root (real path)
+ * @param {string} target the file about to be written
+ * @throws {MirrorError} `BACKUP_MIRROR_SYMLINK` / `BACKUP_MIRROR_INVALID`
+ */
+function guardWritablePath(realRoot, target) {
+  const wanted = path.resolve(target);
+  if (containmentRelative(realRoot, wanted) === null) {
+    throw new MirrorError(MIRROR_CODES.SYMLINK, `${wanted} is not inside the validated mirror root ${realRoot}`);
+  }
+  let current = path.dirname(wanted);
+  for (;;) {
+    const real = realPathTolerant(current);
+    if (real.ok !== true) {
+      throw new MirrorError(MIRROR_CODES.INVALID, `cannot resolve ${current} before writing ${wanted}: ${real.code}`);
+    }
+    const lexical = path.resolve(current);
+    if (path.resolve(real.real) !== lexical && lexical !== path.resolve(realRoot)) {
+      throw new MirrorError(
+        MIRROR_CODES.SYMLINK,
+        `${current} resolves to ${real.real} through a symbolic link or junction; refusing to write ${wanted} through it`,
+      );
+    }
+    if (lexical === path.resolve(realRoot)) break;
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+}
+
+/**
  * Resolve and validate the mirror root.
  *
  * Refusals name the reason rather than returning a bare `false`, and each one is a case where copying would be
@@ -285,6 +322,13 @@ export function syncToMirror(input) {
   if (resolved.ok !== true) throw new MirrorError(resolved.reason_code ?? MIRROR_CODES.INVALID, resolved.detail);
   const root = path.resolve(input.root);
   const mirror = resolved.root;
+  // The root was validated a moment ago; resolve it again now, because the write-time guard needs a real path and
+  // because a root swapped for a junction in between must not redirect this sync.
+  const mirrorReal = realPathTolerant(mirror);
+  if (mirrorReal.ok !== true) {
+    throw new MirrorError(MIRROR_CODES.INVALID, `cannot resolve the mirror root ${mirror}: ${mirrorReal.code}`);
+  }
+  const guardRoot = mirrorReal.real;
   const primaryPaths = repoPaths(root);
   const mirrorPaths = repoPaths(mirror);
   const copied = { files: 0, bytes: 0, repaired: 0 };
@@ -322,6 +366,7 @@ export function syncToMirror(input) {
       }
       const sealed = readIfExists(sourceObject);
       if (sealed === null) throw fail(`the primary repository has no sealed block ${sha256}, so the mirror copy would be incomplete`);
+      guardWritablePath(guardRoot, mirrorObject);
       try {
         writeFileAtomic(mirrorObject, sealed);
       } catch (error) {
@@ -335,6 +380,7 @@ export function syncToMirror(input) {
     // (c) The snapshot's own two files: the encrypted manifest and the wrapped-key envelopes. They are small, so
     // they are compared byte for byte (a same-length corruption is caught too); only an exact copy is skipped.
     const mirrorSnapshotDir = path.join(mirrorPaths.snapshots, input.snapshotId);
+    guardWritablePath(guardRoot, path.join(mirrorSnapshotDir, 'x'));
     try {
       fs.mkdirSync(mirrorSnapshotDir, { recursive: true });
     } catch (error) {
@@ -344,6 +390,7 @@ export function syncToMirror(input) {
       const bytes = readIfExists(path.join(snapshot.dir, name));
       if (bytes === null) throw fail(`the primary snapshot has no ${name} under ${snapshot.dir}`);
       const mirrorFile = path.join(mirrorSnapshotDir, name);
+      guardWritablePath(guardRoot, mirrorFile);
       const existing = readIfExists(mirrorFile);
       if (sameBytes(existing, bytes)) {
         skipped.files += 1;
@@ -369,6 +416,7 @@ export function syncToMirror(input) {
       const bytes = readIfExists(source);
       if (bytes === null) throw fail(`the primary repository has no ${name}, so the mirror would not open as a repository`);
       const target = path.join(mirror, name);
+      guardWritablePath(guardRoot, target);
       const existing = readIfExists(target);
       if (sameBytes(existing, bytes)) {
         skipped.files += 1;
@@ -410,6 +458,7 @@ export function syncToMirror(input) {
         const text = existing.toString('utf8');
         if (!text.endsWith('\n')) separator = '\n';
       }
+      guardWritablePath(guardRoot, mirrorPaths.index);
       try {
         fs.mkdirSync(path.dirname(mirrorPaths.index), { recursive: true });
         fs.appendFileSync(mirrorPaths.index, `${separator}${line}`, 'utf8');

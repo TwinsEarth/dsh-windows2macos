@@ -1352,3 +1352,23 @@ node --input-type=module -e "import { bindAccount } from 'file:///E:/GPT/w2m/w2m
   从旧快照直接还原仍走它自己那份 `keys.json`。
 * 关闭保护**不会**重写 `objects/`：块仍是同一把 DEK 封的密文；"不加密"准确地说只是"钥匙明文存在旁边"。
 * 不 bump 版本号、不跑 preflight、不提交；真实仓库迁移由 lead 用 §25.3 的命令或 `unlock` 命令执行。
+
+## 26. 镜像写入时的链接防护（realpath 加固补记）
+
+§21.2 已经在**校验时**把镜像根解析成真实路径（`fs.realpathSync` 取最深已存在前缀，解开 symlink/junction）并与真实仓库根、
+真实 `$DSH_HOME` 做包含判定。仍有一类窗口：镜像根通过校验之后、真正写文件之前，攻击者（或一次误操作）在镜像树**内部**
+造一个 junction/symlink，或把某个目录换成链接，写入就会落到仓库、home 或任意目录。
+
+修复（`src/backup/mirror.mjs`）：
+
+* `syncToMirror` 在写入前**重新解析**镜像根的真实路径（根在校验后变成链接 → 具名拒绝），并把该真实路径作为守卫根；
+* 新增 `guardWritablePath(realRoot, target)`：目标必须在守卫根之下；从目标父目录向上走到守卫根，**每个已存在的祖先**
+  都必须解析到它自己（`realPathTolerant` 的真实路径 == 词法路径），否则拒绝 `BACKUP_MIRROR_SYMLINK`；
+  无法解析的分量拒绝 `BACKUP_MIRROR_INVALID`；
+* 每个写入点都过守卫：对象块、快照目录（先对将要创建的路径守卫再 mkdir）、快照两个文件、根 `backup.json`/`keys.json`、
+  `index.jsonl`（append 前）。
+* 失败语义不变：镜像阶段的拒绝只让本次镜像失败（`ok:true` + `mirror.ok:false`），**不回滚**已提交的备份。
+
+**边界**：守卫与 `writeFileAtomic` 之间仍是毫秒级 TOCTOU（原子写自己先写 tmp 再 rename，链接若在 tmp 目录内被换仍可能
+影响那一次写）；彻底关闭需要句柄级写入（`O_NOFOLLOW` 链）或目录 fd 打开，当前 Node/Windows 组合不做承诺。守卫覆盖的是
+"镜像树内部出现链接"这一实际可达的破坏面，测试用真实 junction 验证（环境禁止时按名 skip）。

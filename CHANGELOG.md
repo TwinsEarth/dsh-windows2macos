@@ -4,6 +4,13 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### 异地镜像：写入时链接防护（realpath 加固补记，未发布）
+
+- 校验时已解析真实路径；新增**写入时**守卫：`syncToMirror` 重新解析镜像根，每个已存在的祖先必须解析到它自己，否则拒绝 `BACKUP_MIRROR_SYMLINK`；对象块/快照目录/快照文件/根元数据/索引追加全部过守卫。
+- 测试：镜像树内 junction 指向外部 → 拒绝且目标目录零写入；快照目录被 junction 顶替 → 拒绝；正常同步不受影响（23/23）。
+- 边界：守卫与原子写之间仍有毫秒级 TOCTOU；彻底关闭需要句柄级写入，当前不做承诺。
+
+
 ### 三条边界的真机加固：register watch + 宿主服务、缓存运行时终审、renumber 追加分支可达性（未发布）
 
 - **A · register vs 运行中的客户端**：调查确认安装的 Harness 提供可被插件 `ctx` 访问的宿主服务 **`ctx.workspaceRegistry`**（`@deepseek-ai/dsh-workspace`：拥有内存工作区域 + `storages/workspace.json`，先持久化再发 `domain/changed`，GUI 读投影）。新增 `registerThroughHost()` —— `resolveByPath`/`create` + `attachSession(sessionId)`，**不写文件**，因此没有可被客户端保存覆盖的文件级写入；面板路由 `POST /api/w2m/backup/register {confirm:"register", session_ids}` 优先走它（响应 `via:"host-service"`、`residual_risk:null`）。宿主没有该服务时（或离线 CLI）退回文件路径：`w2m-backup register --session <id> --watch <minutes>` 在 apply 成功后按 2/8/20/60 s、之后每 60 s 采样直到分钟预算，发现被覆盖就用 `recheckRegistry` 重放**同一 plan**（不写第二份注册表副本），报告 `watch:{minutes,samples,clobbered,reapplied,stable_at}`；文本/JSON 均带一行诚实残余风险 `a client save after the watch window can still remove it; re-run or enable the plugin route`。面板状态卡新增「修复注册表」按钮（登记勾选会话，无勾选则登记未登记会话）并显示登记/已存在/被覆盖/已重放计数；残余风险只在 file-write 路径渲染。**诚实的边界**：watch 只缩小并量化窗口、不消除它；宿主服务也有自身边界（`attachSession` 要求会话被 `sessionPersistence` 认识且 header cwd realpath 到工作区，cwd 已消失的灾难恢复会话不接，由 CLI + watch 兜住）。

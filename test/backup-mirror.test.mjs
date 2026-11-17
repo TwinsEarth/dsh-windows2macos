@@ -636,3 +636,66 @@ describe('mirror: the copy is restorable', () => {
     }
   });
 });
+
+describe('mirror: write-time link guard (realpath hardening)', () => {
+  it('refuses a junction created inside the mirror tree and writes nothing through it', (t) => {
+    const { dir, cleanup } = tempDir('w2m-mirror-guard-objects-');
+    const fixture = homeFixture();
+    try {
+      const root = join(dir, 'repo');
+      const mirrorRoot = join(dir, 'mirror');
+      const outside = join(dir, 'outside');
+      fs.mkdirSync(join(mirrorRoot, 'objects'), { recursive: true });
+      fs.mkdirSync(outside, { recursive: true });
+      const backedUp = run({ root, dshHome: fixture.home });
+      assert.equal(backedUp.ok, true, backedUp.detail);
+      const snapshot = readSnapshot({ root, snapshotId: backedUp.snapshot_id });
+      const [firstBlock] = manifestBlocks(snapshot);
+      assert.ok(typeof firstBlock === 'string' && firstBlock.length === 64, 'the fixture snapshot must have at least one block');
+      const link = join(mirrorRoot, 'objects', firstBlock.slice(0, 2));
+      const failure = tryJunction(outside, link);
+      if (failure !== null) {
+        t.skip(`this environment forbids creating a directory junction/symlink (${failure})`);
+        return;
+      }
+      assert.throws(
+        () => syncToMirror({ root, mirrorRoot, dshHome: fixture.home, snapshotId: backedUp.snapshot_id }),
+        (error) => error instanceof MirrorError && /BACKUP_MIRROR_SYMLINK/.test(String(error.message ?? error)),
+        'a junction inside the mirror must be refused at write time',
+      );
+      assert.deepEqual(fs.readdirSync(outside), [], 'nothing may be written through the junction');
+    } finally {
+      cleanup();
+      fixture.cleanup();
+    }
+  });
+
+  it('refuses a junction standing in for the snapshot directory', (t) => {
+    const { dir, cleanup } = tempDir('w2m-mirror-guard-snapshot-');
+    const fixture = homeFixture();
+    try {
+      const root = join(dir, 'repo');
+      const mirrorRoot = join(dir, 'mirror');
+      const outside = join(dir, 'outside');
+      fs.mkdirSync(join(mirrorRoot, 'snapshots'), { recursive: true });
+      fs.mkdirSync(outside, { recursive: true });
+      const backedUp = run({ root, dshHome: fixture.home });
+      assert.equal(backedUp.ok, true, backedUp.detail);
+      const link = join(mirrorRoot, 'snapshots', backedUp.snapshot_id);
+      const failure = tryJunction(outside, link);
+      if (failure !== null) {
+        t.skip(`this environment forbids creating a directory junction/symlink (${failure})`);
+        return;
+      }
+      assert.throws(
+        () => syncToMirror({ root, mirrorRoot, dshHome: fixture.home, snapshotId: backedUp.snapshot_id }),
+        (error) => error instanceof MirrorError && /BACKUP_MIRROR_SYMLINK/.test(String(error.message ?? error)),
+        'a junction standing in for the snapshot directory must be refused',
+      );
+      assert.deepEqual(fs.readdirSync(outside), [], 'nothing may be written through the junction');
+    } finally {
+      cleanup();
+      fixture.cleanup();
+    }
+  });
+});
