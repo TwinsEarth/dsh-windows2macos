@@ -447,9 +447,11 @@ export function formatRun(result) {
   }
   if (result.mirror !== undefined) {
     if (result.mirror.ok === true) {
+      const repaired = result.mirror.copied.repaired ?? 0;
       lines.push(
-        `mirror        : ${result.mirror.root} (${result.mirror.copied.files} file(s), ${humanBytes(result.mirror.copied.bytes)} copied, ` +
-          `${result.mirror.skipped.files} already present${result.mirror.index_appended === true ? ', index line appended' : ''})`,
+        `mirror        : ${result.mirror.root} (${result.mirror.copied.files} file(s), ${humanBytes(result.mirror.copied.bytes)} copied` +
+          `${repaired > 0 ? `, ${repaired} repaired` : ''}, ${result.mirror.skipped.files} already present` +
+          `${result.mirror.index_appended === true ? ', index line appended' : ''})`,
       );
     } else {
       lines.push(`mirror        : FAILED ${result.mirror.reason_code} — ${result.mirror.reason ?? 'the copy failed'} (the primary repository is committed)`);

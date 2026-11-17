@@ -24,8 +24,9 @@
  *   * a scope that selects nothing (`BACKUP_SCOPED_NOTHING`);
  *   * a non-repository target (`BACKUP_DIR_*` codes from `layout.mjs`);
  *   * an invalid retention window (`BACKUP_ROTATION_POLICY_INVALID`) or a mirror path inside the repository /
- *     the home it copies (`BACKUP_MIRROR_INVALID`) -- both before any write, so a configuration mistake leaves
- *     no half-built snapshot behind.
+ *     the home it copies, including through a symlink or junction (`BACKUP_MIRROR_INVALID` /
+ *     `BACKUP_MIRROR_SYMLINK`) -- both before any write, so a configuration mistake leaves no half-built
+ *     snapshot behind.
  *
  * ## The offsite mirror is best effort, and strictly after the primary
  *
@@ -560,7 +561,7 @@ export function runBackup(input) {
           ok: false,
           reason_code: reasonCode,
           reason: error?.detail ?? (error instanceof Error ? error.message : String(error)),
-          copied: error?.copied ?? { files: 0, bytes: 0 },
+          copied: error?.copied ?? { files: 0, bytes: 0, repaired: 0 },
         };
         mirrorWarnings = [`${reasonCode}: the primary backup is committed, but the offsite copy failed: ${mirror.reason}`];
       }

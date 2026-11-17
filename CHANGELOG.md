@@ -77,6 +77,19 @@ All notable changes to this project are documented here.
 - **诚实边界**：异地副本是**加法**——不做跨镜像去重（每个镜像独立持有一份密封块），未做 Relay/云端传输
   （Phase 3），未做镜像侧 `current/old` 视图与镜像 gc；面板「编队版本」卡片 UI 未做；Relay Phase 2 合并是
   **独立评审线**，不在本条交付内；本次不 bump 版本号、不跑 preflight、不提交。
+- **D 异地副本加固（评审两处收口）**：`src/backup/mirror.mjs`。① `resolveMirrorRoot` 在词法包含判定之外增加
+  **真实路径判定**——取最深已存在分量 `fs.realpathSync`（Windows 上解开 junction/symlink）再拼接未创建段，对真实
+  仓库根与真实 `$DSH_HOME` 重复包含判定；经链接实际落进仓库/home → 具名 `BACKUP_MIRROR_SYMLINK`（写盘前零提交）；
+  真实路径不可解析（`ELOOP`/`EACCES`/坏 junction）→ `BACKUP_MIRROR_INVALID` 具名拒绝；不存在的镜像路径（含多级）
+  仍照常解析并在首次同步创建。② 镜像对象不再“名字在即视为正确”：已存在对象须与源**字节长度一致**才跳过，截断/
+  损坏（长度不符）用 `writeFileAtomic` 重写并计入新增的 `copied.repaired`；快照 `manifest.json`/`keys.json` 与根
+  `backup.json`/`keys.json` 按字节比较，不符即重写并计入 `repaired`。完好镜像第二次同步仍是
+  `copied:{files:0,bytes:0,repaired:0}` 且零写入（测试比较 size+mtime）；镜像 `index.jsonl` 尾部半行即使正是该
+  快照自己的未完成追加行，也只补一行完整 JSON、`snapshot_id` 不重复；CLI mirror 行在修复时显示 `N repaired`。
+  ③ 诚实边界：仍**不做跨镜像去重**、**没有**镜像侧 `current/old` 视图与镜像 gc、**没有** Relay/云端传输；对象修复
+  只覆盖“长度可发现”的损坏（同长度位翻转由还原时的清单 sha256 发现）。`docs/BACKUP-DESIGN.md` §21 与
+  `test/backup-mirror.test.mjs` 同步（junction 逃逸在环境禁止建 junction 时按名跳过）。本次不 bump 版本号、不跑
+  preflight、不提交。
 
 ### G4 seq 重编号工具（删/插事件的唯一合法方式，v3.4.8 补全）
 

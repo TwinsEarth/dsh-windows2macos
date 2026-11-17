@@ -4,7 +4,10 @@
  * Two properties carry the feature: the copy must be **complete and byte-identical** (a mirror that cannot
  * restore is not a backup), and a repeated sync must be **free** (copying the whole repository every night is a
  * second backup, not a mirror). The refusals matter as much as the copy: a mirror path inside the repository or
- * the home it copies is a way to back up a backup, and it is refused before the primary run writes anything.
+ * the home it copies -- lexically *or* through a symlink/junction -- is a way to back up a backup, and it is
+ * refused before the primary run writes anything. The mirror also must not trust a file name: an object that is
+ * present at the right content address but truncated is repaired on the next sync, while an intact mirror is
+ * left untouched (`copied.repaired: 0`, no rewrites).
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -64,6 +67,37 @@ function manifestBlocks(snapshot) {
   const out = new Set();
   for (const file of snapshot.manifest.files) for (const block of file.blocks ?? []) out.add(block.sha256);
   return [...out];
+}
+
+/**
+ * Create a directory junction (on Windows) or a directory symlink (elsewhere), or report why this environment
+ * forbids it. A test that needs one skips by name with the returned reason instead of passing vacuously.
+ */
+function tryJunction(target, link) {
+  try {
+    fs.symlinkSync(target, link, 'junction');
+    return null;
+  } catch (error) {
+    return error?.code ?? (error instanceof Error ? error.message : String(error));
+  }
+}
+
+/** Every file under `root` with its byte size and mtime, so "no write happened" is measured, not assumed. */
+function fileStamps(root) {
+  const stamps = {};
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+      } else if (entry.isFile()) {
+        const stat = fs.statSync(full);
+        stamps[full.slice(root.length)] = `${stat.size}:${stat.mtimeMs}`;
+      }
+    }
+  };
+  walk(root);
+  return stamps;
 }
 
 describe('mirror: resolving the location', () => {
@@ -146,6 +180,71 @@ describe('mirror: resolving the location', () => {
       assert.equal(verdict.root, 'Q:\\w2m-offsite');
     },
   );
+
+  it('refuses a junction whose real target is inside the repository or the DSH home', (t) => {
+    const { dir, cleanup } = tempDir('w2m-mirror-resolve-junction-');
+    try {
+      const repoRoot = join(dir, 'repo');
+      const dshHome = join(dir, 'home');
+      fs.mkdirSync(join(repoRoot, 'objects'), { recursive: true });
+      fs.mkdirSync(join(dshHome, 'sessions'), { recursive: true });
+
+      const repoLink = join(dir, 'repo-link');
+      const repoFailure = tryJunction(repoRoot, repoLink);
+      if (repoFailure !== null) {
+        t.skip(`this environment forbids creating a directory junction/symlink (${repoFailure})`);
+        return;
+      }
+      // The lexical path (`<tmp>/repo-link`) is outside the repository; its real target is the repository root.
+      const escaped = resolveMirrorRoot({ repoRoot, dshHome, mirrorRoot: repoLink });
+      assert.equal(escaped.ok, false, 'a junction into the repository must be refused');
+      assert.equal(escaped.reason_code, 'BACKUP_MIRROR_SYMLINK');
+      assert.match(escaped.detail, /real path/iu);
+      assert.match(escaped.detail, /repository root/u);
+
+      // The refusal reaches both write paths: the engine before any commit, and syncToMirror with its own code.
+      const engineResult = run({ root: repoRoot, dshHome, mirrorRoot: repoLink });
+      assert.equal(engineResult.ok, false);
+      assert.equal(engineResult.reason_code, 'BACKUP_MIRROR_SYMLINK');
+      assert.equal(readIndex(repoRoot).entries.length, 0, 'the repository must have no snapshot after the refusal');
+      assert.throws(
+        () => syncToMirror({ root: repoRoot, mirrorRoot: repoLink, dshHome, snapshotId: SESSION }),
+        (error) => error instanceof MirrorError && error.code === 'BACKUP_MIRROR_SYMLINK',
+      );
+
+      const homeLink = join(dir, 'home-link');
+      const homeFailure = tryJunction(join(dshHome, 'sessions'), homeLink);
+      if (homeFailure === null) {
+        const homeEscaped = resolveMirrorRoot({ repoRoot, dshHome, mirrorRoot: homeLink });
+        assert.equal(homeEscaped.ok, false, 'a junction into the DSH home must be refused');
+        assert.equal(homeEscaped.reason_code, 'BACKUP_MIRROR_SYMLINK');
+        assert.match(homeEscaped.detail, /DSH home/u);
+      }
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('still accepts a mirror path that does not exist yet, however many levels are missing', () => {
+    const { dir, cleanup } = tempDir('w2m-mirror-resolve-nested-');
+    const fixture = homeFixture();
+    try {
+      const root = join(dir, 'repo');
+      const mirrorRoot = join(dir, 'not', 'created', 'yet', 'offsite');
+      const verdict = resolveMirrorRoot({ repoRoot: root, dshHome: fixture.home, mirrorRoot });
+      assert.equal(verdict.ok, true, verdict.detail);
+      assert.equal(verdict.root, mirrorRoot);
+      // "Works" is a first sync that creates every missing level, not just a resolver that says yes.
+      const backedUp = run({ root, dshHome: fixture.home });
+      assert.equal(backedUp.ok, true, backedUp.detail);
+      const synced = syncToMirror({ root, mirrorRoot, dshHome: fixture.home, snapshotId: backedUp.snapshot_id });
+      assert.equal(synced.ok, true);
+      assert.equal(fs.existsSync(join(mirrorRoot, 'backup.json')), true, 'the first sync must create the missing levels');
+    } finally {
+      cleanup();
+      fixture.cleanup();
+    }
+  });
 });
 
 describe('mirror: copying a snapshot', () => {
@@ -166,6 +265,7 @@ describe('mirror: copying a snapshot', () => {
       assert.equal(first.descriptor_copied, true);
       assert.ok(first.copied.files > 0);
       assert.ok(first.copied.bytes > 0);
+      assert.equal(first.copied.repaired, 0, 'a fresh mirror has nothing to repair');
 
       for (const sha256 of manifestBlocks(snapshot)) {
         assert.equal(fs.existsSync(objectFile(mirrorRoot, sha256)), true, `the mirror is missing block ${sha256}`);
@@ -184,9 +284,11 @@ describe('mirror: copying a snapshot', () => {
       assert.deepEqual(fs.readFileSync(objectFile(mirrorRoot, sampleBlock)), fs.readFileSync(objectFile(root, sampleBlock)));
       assert.equal(readIndex(mirrorRoot).entries.filter((entry) => entry.snapshot_id === backedUp.snapshot_id).length, 1);
 
+      const stampsBeforeResync = fileStamps(mirrorRoot);
       const second = syncToMirror({ root, mirrorRoot, dshHome: fixture.home, snapshotId: backedUp.snapshot_id });
       assert.equal(second.ok, true);
-      assert.deepEqual(second.copied, { files: 0, bytes: 0 }, 'a re-sync of the same snapshot copies nothing');
+      assert.deepEqual(second.copied, { files: 0, bytes: 0, repaired: 0 }, 'a re-sync of the same snapshot copies nothing');
+      assert.deepEqual(fileStamps(mirrorRoot), stampsBeforeResync, 'an intact mirror is not rewritten at all (size and mtime unchanged)');
       assert.equal(second.index_appended, false);
       assert.equal(second.descriptor_copied, false);
       assert.ok(second.skipped.files > 0);
@@ -217,8 +319,107 @@ describe('mirror: copying a snapshot', () => {
       const repaired = syncToMirror({ root, mirrorRoot, dshHome: fixture.home, snapshotId: backedUp.snapshot_id });
       assert.equal(repaired.ok, true);
       assert.equal(repaired.copied.files, 1, 'only the missing object is copied again');
+      assert.equal(repaired.copied.repaired, 0, 'a missing object is a copy, not a repair');
       assert.equal(fs.existsSync(objectFile(mirrorRoot, missing)), true);
       assert.equal(repaired.index_appended, false);
+    } finally {
+      cleanup();
+      fixture.cleanup();
+    }
+  });
+
+  it('repairs a truncated mirror object on the next sync, then reports the intact mirror as untouched', () => {
+    const { dir, cleanup } = tempDir('w2m-mirror-corrupt-object-');
+    const fixture = homeFixture();
+    try {
+      const root = join(dir, 'repo');
+      const mirrorRoot = join(dir, 'mirror');
+      const backedUp = run({ root, dshHome: fixture.home });
+      assert.equal(backedUp.ok, true, backedUp.detail);
+      const snapshot = readSnapshot({ root, snapshotId: backedUp.snapshot_id });
+      syncToMirror({ root, mirrorRoot, dshHome: fixture.home, snapshotId: backedUp.snapshot_id });
+
+      const [sha256] = manifestBlocks(snapshot);
+      const sourceBytes = fs.readFileSync(objectFile(root, sha256));
+      const mirrorObject = objectFile(mirrorRoot, sha256);
+      fs.writeFileSync(mirrorObject, sourceBytes.subarray(0, sourceBytes.length - 1));
+      assert.notEqual(fs.statSync(mirrorObject).size, sourceBytes.length, 'the fixture must actually be truncated');
+
+      const repaired = syncToMirror({ root, mirrorRoot, dshHome: fixture.home, snapshotId: backedUp.snapshot_id });
+      assert.equal(repaired.ok, true);
+      assert.ok(repaired.copied.repaired >= 1, 'a truncated object must be reported as repaired');
+      assert.deepEqual(fs.readFileSync(mirrorObject), sourceBytes, 'the repaired object is byte-identical to the source');
+      assert.equal(repaired.index_appended, false);
+
+      const stampsAfterRepair = fileStamps(mirrorRoot);
+      const again = syncToMirror({ root, mirrorRoot, dshHome: fixture.home, snapshotId: backedUp.snapshot_id });
+      assert.deepEqual(again.copied, { files: 0, bytes: 0, repaired: 0 }, 'the repaired mirror is idempotent again');
+      assert.deepEqual(fileStamps(mirrorRoot), stampsAfterRepair, 'the second sync writes nothing');
+    } finally {
+      cleanup();
+      fixture.cleanup();
+    }
+  });
+
+  it('rewrites mirror metadata that no longer matches the primary', () => {
+    const { dir, cleanup } = tempDir('w2m-mirror-corrupt-metadata-');
+    const fixture = homeFixture();
+    try {
+      const root = join(dir, 'repo');
+      const mirrorRoot = join(dir, 'mirror');
+      const backedUp = run({ root, dshHome: fixture.home });
+      assert.equal(backedUp.ok, true, backedUp.detail);
+      syncToMirror({ root, mirrorRoot, dshHome: fixture.home, snapshotId: backedUp.snapshot_id });
+
+      const snapshotManifest = join(mirrorRoot, 'snapshots', backedUp.snapshot_id, 'manifest.json');
+      const primaryManifest = join(repoPaths(root).snapshots, backedUp.snapshot_id, 'manifest.json');
+      fs.writeFileSync(join(mirrorRoot, 'backup.json'), '{"format":');
+      fs.writeFileSync(snapshotManifest, '{"format":');
+
+      const repaired = syncToMirror({ root, mirrorRoot, dshHome: fixture.home, snapshotId: backedUp.snapshot_id });
+      assert.equal(repaired.ok, true);
+      assert.equal(repaired.copied.repaired, 2, 'the damaged descriptor and snapshot manifest are both rewritten');
+      assert.deepEqual(fs.readFileSync(join(mirrorRoot, 'backup.json')), fs.readFileSync(repoPaths(root).descriptor));
+      assert.deepEqual(fs.readFileSync(snapshotManifest), fs.readFileSync(primaryManifest));
+      assert.equal(repaired.descriptor_copied, true, 'a repaired descriptor is still reported as copied');
+    } finally {
+      cleanup();
+      fixture.cleanup();
+    }
+  });
+
+  it('does not duplicate a snapshot id when its own index line was left torn', () => {
+    const { dir, cleanup } = tempDir('w2m-mirror-torn-self-');
+    const fixture = homeFixture();
+    try {
+      const root = join(dir, 'repo');
+      const mirrorRoot = join(dir, 'mirror');
+      const backedUp = run({ root, dshHome: fixture.home });
+      assert.equal(backedUp.ok, true, backedUp.detail);
+      syncToMirror({ root, mirrorRoot, dshHome: fixture.home, snapshotId: backedUp.snapshot_id });
+
+      // A crash mid-append of this snapshot's line: the index now holds a partial line without its newline, so
+      // `readIndex` honestly reports no entry for the snapshot (the mirror may never have recorded the commit).
+      const indexFile = join(mirrorRoot, 'index.jsonl');
+      const complete = fs.readFileSync(indexFile, 'utf8');
+      fs.writeFileSync(indexFile, complete.slice(0, complete.length - 8));
+      const torn = readIndex(mirrorRoot);
+      assert.equal(torn.entries.length, 0, 'a torn line is not an entry');
+      assert.equal(torn.torn_tail, true);
+
+      const synced = syncToMirror({ root, mirrorRoot, dshHome: fixture.home, snapshotId: backedUp.snapshot_id });
+      assert.equal(synced.ok, true);
+      assert.equal(synced.index_appended, true, 'completing the snapshot line is the only way to record it');
+      const index = readIndex(mirrorRoot);
+      assert.deepEqual(index.entries.map((entry) => entry.snapshot_id), [backedUp.snapshot_id], 'the snapshot id must appear exactly once');
+      assert.ok(index.problems.length >= 1, 'the torn fragment stays reported as a problem');
+      const lines = fs.readFileSync(indexFile, 'utf8').split('\n').filter((line) => line.trim() !== '');
+      const lastLine = lines[lines.length - 1];
+      assert.equal(JSON.parse(lastLine).snapshot_id, backedUp.snapshot_id, 'the appended line is complete JSON');
+
+      const again = syncToMirror({ root, mirrorRoot, dshHome: fixture.home, snapshotId: backedUp.snapshot_id });
+      assert.equal(again.index_appended, false, 'a further sync sees the completed line and appends nothing');
+      assert.equal(readIndex(mirrorRoot).entries.filter((entry) => entry.snapshot_id === backedUp.snapshot_id).length, 1);
     } finally {
       cleanup();
       fixture.cleanup();
@@ -386,7 +587,7 @@ describe('mirror: the run integration', () => {
       assert.equal(second.mirror?.ok, false);
       assert.equal(second.mirror.reason_code, 'BACKUP_MIRROR_FAILED');
       assert.equal(typeof second.mirror.reason, 'string');
-      assert.deepEqual(second.mirror.copied, { files: 0, bytes: 0 });
+      assert.deepEqual(second.mirror.copied, { files: 0, bytes: 0, repaired: 0 });
       assert.equal(second.warnings.length, 1);
       assert.match(second.warnings[0], /BACKUP_MIRROR_FAILED/u);
 

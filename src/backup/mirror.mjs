@@ -8,7 +8,7 @@
  * "newest-file" heuristic that can copy a snapshot directory before its blocks. This module performs the copy
  * with the repository protocol's own vocabulary: it reads a **committed** snapshot through `repo.mjs`, knows
  * exactly which content addresses that snapshot needs, and copies only the ones the mirror does not already
- * have.
+ * have -- repairing the ones it has in the wrong byte length, because a file name is not proof of content.
  *
  * ## What is copied, and what is never touched
  *
@@ -24,12 +24,13 @@
  *     They are wrapped-key envelopes only; no plaintext secret and no password is copied.
  *   * one line in `index.jsonl` for the snapshot, appended only if the mirror index does not already name it.
  *
- * ## Idempotent by construction
+ * ## Idempotent by construction, but not blind
  *
- * Every write is skipped when the destination already has the same content (objects by content address, snapshot
- * and metadata files by byte comparison, the index by snapshot id). Syncing the same snapshot twice copies
- * nothing the second time, so a scheduled mirror costs the size of the new session versions, not the size of the
- * repository.
+ * Every write is skipped when the destination already matches the source: an object must exist at its content
+ * address **and have the source's byte length** (a truncated or externally damaged copy is rewritten, not
+ * trusted), snapshot and root metadata files are compared byte for byte (they are small), and the index by
+ * snapshot id. An intact mirror therefore re-syncs with zero writes and reports `copied.repaired: 0`, so a
+ * scheduled mirror costs the size of the new session versions, not the size of the repository.
  */
 
 import fs from 'node:fs';
@@ -43,6 +44,8 @@ import { readIndex, readSnapshot, serializeIndexEntry } from './repo.mjs';
 export const MIRROR_CODES = Object.freeze({
   INVALID: 'BACKUP_MIRROR_INVALID',
   FAILED: 'BACKUP_MIRROR_FAILED',
+  /** The mirror's real path (through a symlink/junction) is the repository, inside it, or inside the home. */
+  SYMLINK: 'BACKUP_MIRROR_SYMLINK',
 });
 
 /** A mirror failure with a stable code, carrying the partial copy counts a failure did achieve. */
@@ -62,12 +65,13 @@ const REPO_KEYS_FILE = 'keys.json';
 /** The two files a snapshot directory owns. */
 const SNAPSHOT_FILES = Object.freeze(['manifest.json', 'keys.json']);
 
-/** Size of an existing file, or 0 when it cannot be read. */
-function fileSize(file) {
+/** Size of an existing regular file, or `null` when it is missing, unreadable, or not a file. */
+function sizeIfFile(file) {
   try {
-    return fs.statSync(file).size;
+    const stat = fs.statSync(file);
+    return stat.isFile() ? stat.size : null;
   } catch {
-    return 0;
+    return null;
   }
 }
 
@@ -90,6 +94,70 @@ function invalid(detail) {
   return { ok: false, reason_code: MIRROR_CODES.INVALID, detail };
 }
 
+/** The refusal shape for a mirror whose real path (through a symlink/junction) is not a separate location. */
+function symlinked(detail) {
+  return { ok: false, reason_code: MIRROR_CODES.SYMLINK, detail };
+}
+
+/**
+ * The relative path from `root` to `candidate` when it is `root` itself or below it, otherwise `null`.
+ *
+ * Decided with `path.relative`, never by string prefix: `D:\BackUP2` is not inside `D:\BackUP`. A path on another
+ * drive has no relative form, so `path.relative` returns an absolute path and that is treated as "outside" --
+ * cross-drive is exactly what a mirror is for, not an error.
+ */
+function containmentRelative(root, candidate) {
+  const relative = path.relative(root, candidate);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative)) ? relative : null;
+}
+
+/** Filesystem codes that mean "the component is not there (yet)", not "the component cannot be inspected". */
+const ABSENT_CODES = new Set(['ENOENT', 'ENOTDIR']);
+
+/**
+ * Resolve `target` to the path the filesystem actually uses, tolerating components that do not exist yet.
+ *
+ * The deepest existing component is resolved with `fs.realpathSync` -- which follows symlinks and, on Windows,
+ * junctions -- and the not-yet-created remainder is appended to that real path. A mirror normally does not exist
+ * before its first sync, so a missing suffix is expected and must stay usable. What is not expected is a component
+ * that exists but cannot be resolved (`ELOOP`, `EACCES`, a broken junction): its containment cannot be verified,
+ * so the failure is reported back and the caller refuses the path instead of assuming it is outside.
+ *
+ * @param {string} target
+ * @returns {{ok: true, real: string} | {ok: false, code: string, at: string}}
+ */
+function realPathTolerant(target) {
+  const wanted = path.resolve(target);
+  let current = wanted;
+  for (;;) {
+    let present = false;
+    let failed = null;
+    try {
+      fs.lstatSync(current);
+      present = true;
+    } catch (error) {
+      if (!ABSENT_CODES.has(error?.code)) failed = error?.code ?? 'unknown';
+    }
+    if (failed !== null) return { ok: false, code: failed, at: current };
+    if (present) {
+      try {
+        const real = fs.realpathSync(current);
+        const rest = path.relative(current, wanted);
+        return { ok: true, real: rest === '' ? real : path.resolve(real, rest) };
+      } catch (error) {
+        return { ok: false, code: error?.code ?? 'unknown', at: current };
+      }
+    }
+    const parent = path.dirname(current);
+    if (parent === current) {
+      // No component of the path exists (a disconnected drive, for example). There is no existing link to
+      // follow, so the resolved lexical path is the most truthful real path this validation can state.
+      return { ok: true, real: wanted };
+    }
+    current = parent;
+  }
+}
+
 /**
  * Resolve and validate the mirror root.
  *
@@ -101,12 +169,19 @@ function invalid(detail) {
  *   * the mirror is inside (or is) the DSH home being backed up -- the offsite copy would live in the tree the
  *     primary backup scans, so the next backup would capture the mirror and grow the repository with its own
  *     history;
+ *   * a symlink or Windows junction redirects the mirror into the repository or the home even though the lexical
+ *     path looks outside -- `path.resolve` does not follow links, so the check is repeated on real paths;
  *   * the mirror path exists and is a file, not a directory -- a write into it can only fail after blocks were
  *     already copied, and the failure would look like a broken mirror rather than a wrong path.
  *
  * Containment is decided on resolved paths with `path.relative`, never by string prefix: `D:\BackUP2` is not
  * inside `D:\BackUP`. A path on another drive has no relative form, so `path.relative` returns an absolute path
  * and that is treated as "outside" -- cross-drive is exactly what a mirror is for, not an error.
+ *
+ * The real-path comparison resolves the deepest existing component with `fs.realpathSync` and appends the
+ * not-yet-created remainder, so a mirror that does not exist before its first sync is still accepted (including
+ * several missing levels) while a path whose existing component cannot be resolved is refused with a named
+ * reason instead of being assumed safe.
  *
  * @param {{repoRoot?: string, dshHome?: string|null, mirrorRoot?: string}} input
  * @returns {{ok: true, root: string} | {ok: false, reason_code: string, detail: string}}
@@ -121,20 +196,49 @@ export function resolveMirrorRoot(input = {}) {
   }
   const mirror = path.resolve(raw.trim());
   const repo = path.resolve(input.repoRoot.trim());
-  const relativeToRepo = path.relative(repo, mirror);
-  const insideRepo = relativeToRepo === '' || (!relativeToRepo.startsWith('..') && !path.isAbsolute(relativeToRepo));
-  if (insideRepo) {
+  const relativeToRepo = containmentRelative(repo, mirror);
+  if (relativeToRepo !== null) {
     return relativeToRepo === ''
       ? invalid(`${mirror} is the repository root itself; a mirror must be a separate location from the repository it copies`)
       : invalid(`${mirror} is inside the repository root (${repo}); a mirror copied into the repository would be captured by its own next run`);
   }
   const home = typeof input.dshHome === 'string' && input.dshHome.trim() !== '' ? path.resolve(input.dshHome.trim()) : null;
+  if (home !== null && containmentRelative(home, mirror) !== null) {
+    return invalid(`${mirror} is inside (or is) the DSH home being backed up (${home}); the offsite copy must not live in the tree the primary backup scans`);
+  }
+
+  // The lexical checks above use `path.resolve` output, which does not follow links. A symlink or junction can
+  // point the mirror's real target inside the repository (or the home) while the path string looks outside; the
+  // copies would then land in the tree the mirror must never touch. Repeat the same containment checks on real
+  // paths. A path that cannot be resolved is refused rather than assumed outside.
+  const mirrorReal = realPathTolerant(mirror);
+  if (mirrorReal.ok !== true) {
+    return invalid(`could not resolve the real path of ${mirror} (${mirrorReal.code} at ${mirrorReal.at}); refusing the mirror rather than assuming its containment is safe`);
+  }
+  const repoReal = realPathTolerant(repo);
+  if (repoReal.ok !== true) {
+    return invalid(`could not resolve the real path of the repository root ${repo} (${repoReal.code} at ${repoReal.at}); the mirror's containment cannot be verified`);
+  }
+  const realRelativeToRepo = containmentRelative(repoReal.real, mirrorReal.real);
+  if (realRelativeToRepo !== null) {
+    return symlinked(
+      realRelativeToRepo === ''
+        ? `${mirror} resolves to the repository root itself once links are followed (real path ${mirrorReal.real}); a symlink or junction must not turn the mirror into the repository it copies`
+        : `${mirror} resolves inside the repository root (${repoReal.real}) once links are followed (real path ${mirrorReal.real}); a symlink or junction would copy the repository into itself`,
+    );
+  }
   if (home !== null) {
-    const relativeToHome = path.relative(home, mirror);
-    if (relativeToHome === '' || (!relativeToHome.startsWith('..') && !path.isAbsolute(relativeToHome))) {
-      return invalid(`${mirror} is inside (or is) the DSH home being backed up (${home}); the offsite copy must not live in the tree the primary backup scans`);
+    const homeReal = realPathTolerant(home);
+    if (homeReal.ok !== true) {
+      return invalid(`could not resolve the real path of the DSH home ${home} (${homeReal.code} at ${homeReal.at}); the mirror's containment cannot be verified`);
+    }
+    if (containmentRelative(homeReal.real, mirrorReal.real) !== null) {
+      return symlinked(
+        `${mirror} resolves inside (or is) the DSH home being backed up once links are followed (real path ${mirrorReal.real}); a symlink or junction would put the offsite copy in the tree the primary backup scans`,
+      );
     }
   }
+
   let stat = null;
   try {
     stat = fs.statSync(mirror);
@@ -161,24 +265,29 @@ export function resolveMirrorRoot(input = {}) {
  * leaves extra objects and, at worst, a snapshot directory the index does not name yet, which the next sync of
  * the same snapshot completes.
  *
- * Failures throw a {@link MirrorError}: `BACKUP_MIRROR_INVALID` when the location is refused, and
- * `BACKUP_MIRROR_FAILED` (with `copied` carrying the partial counts) when a read or write fails. The engine
- * treats both as a warning on a committed backup -- the primary is never rolled back because a copy failed.
+ * Failures throw a {@link MirrorError}: the location's refusal code (`BACKUP_MIRROR_INVALID`, or
+ * `BACKUP_MIRROR_SYMLINK` when a link redirects the mirror) when it is refused, and `BACKUP_MIRROR_FAILED` (with
+ * `copied` carrying the partial counts) when a read or write fails. The engine treats both as a warning on a
+ * committed backup -- the primary is never rolled back because a copy failed.
+ *
+ * `copied.files`/`copied.bytes` count written bytes; `copied.repaired` is the subset of those writes that
+ * replaced a file already present with the wrong content (truncated object, damaged metadata). An intact mirror
+ * therefore reports `{files: 0, bytes: 0, repaired: 0}` on a re-sync.
  *
  * @param {{root: string, mirrorRoot: string, dshHome?: string|null, snapshotId: string, now?: Date}} input
  * @returns {{ok: true, root: string,
- *   copied: {files: number, bytes: number}, skipped: {files: number, bytes: number},
+ *   copied: {files: number, bytes: number, repaired: number}, skipped: {files: number, bytes: number},
  *   index_appended: boolean, descriptor_copied: boolean}}
  * @throws {MirrorError}
  */
 export function syncToMirror(input) {
   const resolved = resolveMirrorRoot({ repoRoot: input.root, dshHome: input.dshHome, mirrorRoot: input.mirrorRoot });
-  if (resolved.ok !== true) throw new MirrorError(MIRROR_CODES.INVALID, resolved.detail);
+  if (resolved.ok !== true) throw new MirrorError(resolved.reason_code ?? MIRROR_CODES.INVALID, resolved.detail);
   const root = path.resolve(input.root);
   const mirror = resolved.root;
   const primaryPaths = repoPaths(root);
   const mirrorPaths = repoPaths(mirror);
-  const copied = { files: 0, bytes: 0 };
+  const copied = { files: 0, bytes: 0, repaired: 0 };
   const skipped = { files: 0, bytes: 0 };
   /** A named copy failure carrying the counts the partial copy did achieve. */
   const fail = (detail) => new MirrorError(MIRROR_CODES.FAILED, detail, { copied: { ...copied } });
@@ -194,25 +303,24 @@ export function syncToMirror(input) {
       throw fail(`could not create the mirror layout under ${mirror}: ${error?.code ?? (error instanceof Error ? error.message : String(error))}`);
     }
 
-    // (b) Objects, deduplicated by content address. A block is copied only when the mirror does not already have
-    // a file at that address; the sealed bytes are copied verbatim because decrypting here would create a
-    // plaintext copy in memory for no reason.
+    // (b) Objects, deduplicated by content address. The address proves what the source bytes *are*, not what a
+    // file in the mirror actually contains: a truncated/damaged copy (bad disk, an external tool, a crash outside
+    // writeFileAtomic) would otherwise stay "already present" forever. So an existing object is reused only when
+    // it is a regular file of exactly the source's byte length; anything else is rewritten and counted as
+    // repaired. Byte length is the cheap check that needs no decryption -- this module never holds the DEK.
     const blockShas = new Set();
     for (const file of snapshot.manifest.files) for (const block of file.blocks ?? []) blockShas.add(block.sha256);
     for (const sha256 of blockShas) {
+      const sourceObject = path.join(primaryPaths.objects, sha256.slice(0, 2), sha256);
       const mirrorObject = path.join(mirrorPaths.objects, sha256.slice(0, 2), sha256);
-      let present = false;
-      try {
-        present = fs.statSync(mirrorObject).isFile();
-      } catch {
-        present = false;
-      }
-      if (present) {
+      const sourceSize = sizeIfFile(sourceObject);
+      const mirrorSize = sizeIfFile(mirrorObject);
+      if (sourceSize !== null && mirrorSize === sourceSize) {
         skipped.files += 1;
-        skipped.bytes += fileSize(mirrorObject);
+        skipped.bytes += mirrorSize;
         continue;
       }
-      const sealed = readIfExists(path.join(primaryPaths.objects, sha256.slice(0, 2), sha256));
+      const sealed = readIfExists(sourceObject);
       if (sealed === null) throw fail(`the primary repository has no sealed block ${sha256}, so the mirror copy would be incomplete`);
       try {
         writeFileAtomic(mirrorObject, sealed);
@@ -221,10 +329,11 @@ export function syncToMirror(input) {
       }
       copied.files += 1;
       copied.bytes += sealed.length;
+      if (mirrorSize !== null) copied.repaired += 1;
     }
 
-    // (c) The snapshot's own two files: the encrypted manifest and the wrapped-key envelopes. Byte-identical
-    // copies are skipped, so a re-sync does not rewrite files it already has.
+    // (c) The snapshot's own two files: the encrypted manifest and the wrapped-key envelopes. They are small, so
+    // they are compared byte for byte (a same-length corruption is caught too); only an exact copy is skipped.
     const mirrorSnapshotDir = path.join(mirrorPaths.snapshots, input.snapshotId);
     try {
       fs.mkdirSync(mirrorSnapshotDir, { recursive: true });
@@ -235,7 +344,8 @@ export function syncToMirror(input) {
       const bytes = readIfExists(path.join(snapshot.dir, name));
       if (bytes === null) throw fail(`the primary snapshot has no ${name} under ${snapshot.dir}`);
       const mirrorFile = path.join(mirrorSnapshotDir, name);
-      if (sameBytes(readIfExists(mirrorFile), bytes)) {
+      const existing = readIfExists(mirrorFile);
+      if (sameBytes(existing, bytes)) {
         skipped.files += 1;
         skipped.bytes += bytes.length;
         continue;
@@ -247,19 +357,22 @@ export function syncToMirror(input) {
       }
       copied.files += 1;
       copied.bytes += bytes.length;
+      if (existing !== null) copied.repaired += 1;
     }
 
-    // (d) Repository metadata, copied only when missing. `backup.json` is what lets `openRepo(mirror)` report
-    // `initialized: true`, and the root `keys.json` holds the authoritative wrapped-DEK envelopes; without both,
-    // the objects and manifests on the mirror would be unreadable and the "offsite backup" would not restore.
+    // (d) Repository metadata. `backup.json` is what lets `openRepo(mirror)` report `initialized: true`, and the
+    // root `keys.json` holds the authoritative wrapped-DEK envelopes; without both, the objects and manifests on
+    // the mirror would be unreadable and the "offsite backup" would not restore. They are compared byte for byte
+    // and rewritten when damaged (a name-only "already present" would keep a corrupt descriptor forever).
     let descriptorCopied = false;
     for (const [name, source] of [['backup.json', primaryPaths.descriptor], [REPO_KEYS_FILE, path.join(root, REPO_KEYS_FILE)]]) {
       const bytes = readIfExists(source);
       if (bytes === null) throw fail(`the primary repository has no ${name}, so the mirror would not open as a repository`);
       const target = path.join(mirror, name);
-      if (fs.existsSync(target)) {
+      const existing = readIfExists(target);
+      if (sameBytes(existing, bytes)) {
         skipped.files += 1;
-        skipped.bytes += fileSize(target);
+        skipped.bytes += bytes.length;
         continue;
       }
       try {
@@ -269,14 +382,16 @@ export function syncToMirror(input) {
       }
       copied.files += 1;
       copied.bytes += bytes.length;
+      if (existing !== null) copied.repaired += 1;
       if (name === 'backup.json') descriptorCopied = true;
     }
 
     // (e) The index line, appended only when the mirror does not already name the snapshot. `index.jsonl` is
     // append-only: a plain append of one complete line is safe (a crash leaves a torn final line, which
-    // `readIndex` reports honestly), and the id check makes a repeated sync a no-op. A torn tail is not
-    // "repaired" here: the mirror may be missing the line that tail was writing, and inventing it would claim a
-    // snapshot the mirror's own index never recorded.
+    // `readIndex` reports honestly and excludes from `entries`), and the id check makes a repeated sync a no-op.
+    // The torn line itself is not rewritten: it may be the beginning of this snapshot's own append, in which case
+    // completing the line (separated by a newline, so nothing is glued) records the snapshot exactly once and
+    // leaves the torn fragment to be reported as a problem, never as a duplicate entry.
     let indexAppended = false;
     const mirrorIndex = readIndex(mirror);
     if (!mirrorIndex.entries.some((entry) => entry.snapshot_id === input.snapshotId)) {
