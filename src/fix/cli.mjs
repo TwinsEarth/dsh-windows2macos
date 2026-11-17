@@ -524,6 +524,8 @@ function summarizePlan(plan) {
     changed: plan.changed === true,
     events_before: plan.events_before ?? 0,
     events_after: plan.events_after ?? 0,
+    deleted: plan.deleted ?? 0,
+    inserted: plan.inserted ?? 0,
     mapping: plan.mapping ?? {},
     rewritten_references: plan.rewritten_references ?? 0,
     inherited_event_count: plan.inherited_event_count ?? 0,
@@ -556,6 +558,7 @@ function formatRenumber(plan, applied) {
   }
   const validation = plan.validation ?? {};
   lines.push(`events        : ${plan.events_before} -> ${plan.events_after}`);
+  lines.push(`edits         : -${plan.deleted ?? 0} deleted, +${plan.inserted ?? 0} inserted`);
   lines.push(`changed seqs  : ${formatMapping(plan.mapping)}`);
   lines.push(`references    : ${plan.rewritten_references} rewritten`);
   lines.push(`inherited     : ${plan.inherited_event_count}`);

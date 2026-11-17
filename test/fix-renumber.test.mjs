@@ -151,6 +151,8 @@ describe('renumber: deleting an event renumbers densely and rewrites every refer
     assert.equal(result.changed, true);
     assert.equal(result.events_before, 5);
     assert.equal(result.events_after, 4);
+    assert.equal(result.deleted, 1, 'the result reports one deleted event');
+    assert.equal(result.inserted, 0, 'the delete fixture inserts nothing');
     assert.equal(result.session_id, sessionId);
     assert.equal(result.inherited_event_count, 0);
     assert.deepEqual(result.mapping, { 3: 2, 4: 3 });
@@ -184,6 +186,8 @@ describe('renumber: deleting an event renumbers densely and rewrites every refer
     const plan = planRenumber({ file, deleteSeqs: [2], ...STATIC_ONLY });
     assert.equal(plan.ok, true, plan.detail);
     assert.equal(plan.changed, true);
+    assert.equal(plan.deleted, 1, 'the plan carries the deleted count');
+    assert.equal(plan.inserted, 0, 'the plan carries the inserted count');
     assert.deepEqual(plan.mapping, { 3: 2, 4: 3 });
     assert.equal(plan.validation.static.ok, true);
     assert.equal(plan.validation.runtime_verified, false);
@@ -203,6 +207,8 @@ describe('renumber: inserting an event shifts references (and appending is the a
     assert.equal(result.changed, true);
     assert.equal(result.events_before, 4);
     assert.equal(result.events_after, 5);
+    assert.equal(result.inserted, 1, 'the result reports the inserted event');
+    assert.equal(result.deleted, 0, 'the insert fixture deletes nothing');
     assert.deepEqual(result.mapping, { 1: 2, 2: 3, 3: 4 });
     assert.equal(result.rewritten_references, 4, 'sourceEventSeqs 1->2, parentSeq 1->2, anchorSeqs 2->3, expectedSeqs 2->3');
 
@@ -518,6 +524,7 @@ describe('renumber: the CLI', () => {
     assert.match(run.stdout, /wrote \d+ byte/);
     assert.match(run.stdout, /backup\s+: .*\.bak-/);
     assert.match(run.stdout, /runtime\s+:/);
+    assert.match(run.stdout, /edits\s+: -0 deleted, \+1 inserted/, 'the human output names the edit counts');
 
     const written = fs.readFileSync(file);
     assert.equal(written.equals(original), false);

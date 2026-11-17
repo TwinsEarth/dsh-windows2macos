@@ -727,6 +727,9 @@ parse（拆帧→解行；torn / 非 v4 / 非 dense / 非法编辑 → 具名拒
 
 ### 20.4 CLI
 
+输出新增一行 `edits : -N deleted, +M inserted`（删除/插入条数；`--json` 亦有 `deleted`/`inserted` 字段），
+配合 `events : before -> after` 与 `changed seqs` 一起读。
+
 ```
 node bin/w2m-fix.mjs renumber --file <session.v4.jsonl.zstd> [--delete-seq <n>]...
                                   [--insert-file <json>] [--dry-run] [--allow-static-validation] [--json]

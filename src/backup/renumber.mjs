@@ -437,6 +437,8 @@ export function renumberBuffer(buffer, edits = {}) {
     inherited_event_count: inheritedEventCount,
     events_before: eventsBefore,
     events_after: rows.length,
+    deleted: deleted.size,
+    inserted: normalized.insert.length,
     session_id: sessionId,
     codes: [],
     detail: { frames: rows.length + 1, header_is_seeded: parsed.header.isSeeded === true },
@@ -528,6 +530,8 @@ export function planRenumber(input = {}) {
 
   const core = renumberBuffer(original, { deleteSeqs: input.deleteSeqs, insert: input.insert });
   plan.events_before = core.events_before;
+  plan.deleted = core.deleted ?? 0;
+  plan.inserted = core.inserted ?? 0;
   plan.session_id = core.session_id;
   if (core.ok !== true) {
     return {
