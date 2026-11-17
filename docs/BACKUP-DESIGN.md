@@ -1008,6 +1008,42 @@ blocks 重建旧版本，不把 `.enc` 计入引用。
   校验不变。
 * 本次不 bump 版本号、不跑 preflight、不提交；与 §13/§21 的默认行为完全一致（默认 `records`）。
 
+### 24.1 迁移：给既有 `old/` 记录补整文件副本（`w2m-backup old-backfill`）
+
+**问题（为什么需要一次性迁移）**：`full` 只在**版本被淘汰的那一刻**写整文件副本。本功能之前创建的仓库里，`old/`
+只有去重记录；把配置切到 `full` 之后，**已有记录**仍然没有副本，要等对应会话**再次变化**才会补上——而最老的那些
+版本（迁移最想保住的部分）可能再也不会变化。因此 `full` 上线时提供一条显式迁移命令，而不是把"下一次 run 会慢慢
+修好"当成立不住的安慰。
+
+**做什么**：`w2m-backup old-backfill`（`src/backup/old-backfill.mjs` 的
+`backfillOldFullCopies({root, dshHome, password?, accountId?, platform?, runner?, machineKey?, dryRun?, limit?})`）
+对每条**没有** `full_copy` 的记录：用该记录自己的 blocks 经 `materialize.rebuildFile` 重建明文 → 与记录的
+`sha256`/`size` 比对 → 用 `sealObject`（`kind: 'old'`，即 `w2m-session-backup/old|<sha256>|<length>`）封印 →
+写到与 full 模式**同名**的 `<record>.json.enc`（`FULL_COPY_SUFFIX` / `oldFullCopyPath` 的命名契约）→ 最后原子地
+给记录补 `full_copy: {file, sha256, size}`（记录的 `format`/`version` 不变）。写序与轮转一致：**先副本、后记录**。
+仓库 key 打不开 → `BACKUP_NO_PERMISSION`；另一个写者持锁 → `BACKUP_LOCKED`；目录不是本仓库格式 →
+`BACKUP_REPO_NOT_INITIALIZED`（迁移命令绝不向任意目录写 `keys.json`）。逐记录的失败用
+`BACKUP_OLD_RECORD_INVALID`（记录描述的字节与自身 blocks 重建结果不符、或 `full_copy.file` 越出 `old/`）与
+`BACKUP_OLD_BACKFILL_FAILED`（重建/写入/记录更新失败）报告在 `failed: [{record, reason_code, detail}]` 里。
+
+**先 dry-run，再迁移**：`w2m-backup old-backfill --dry-run`（可加 `--json`）只读旧记录内容与副本文件长度做计划：
+报告 would-backfill / would-repair / already-full / orphan 计数，并明确打印 "nothing was written"；它**不取锁、
+不打开 key**（与 `run --dry-run` 同一规则），所以不可能产生任何写入。先跑它确认路径与数量，再去掉 `--dry-run`。
+
+**幂等**：对已迁移的记录，第二次运行只报 `skipped`（`backfilled: 0, repaired: 0, bytes_written: 0`）；不重写
+记录、不重写副本。可以安全地重复执行，也可在中断后直接重跑。
+
+**修复（torn copy）**：崩溃可能留下**短写**的 `.enc`。`backfill` 把记录里 `full_copy.size`（明文长度）+
+`SEALED_COPY_OVERHEAD`（`MAGIC|nonce|tag` = 36 字节）当作副本**应有的磁盘长度**，长度不符或文件缺失时重建并
+**重写**该副本（`repaired`）；副本元数据与记录不一致时一并把记录里的 `full_copy` 改回正确值。孤儿 `.json.enc`
+（没有任何记录引用）只**计数**（`orphans`），**不在此命令删除**——删除只属于 `gc` 的安全路径（§24 的
+`collectOrphanFullCopies`），保持"没有完整引用集就不删副本"的规则。
+
+**限制与诚实边界**：`--limit <n>` 限制本次**写副本**的数量（0 = 只出计划；已完整的记录/失败记录不消耗预算），
+用于大仓库分批迁移，反复运行直到 `backfilled`/`repaired` 为 0。副本检查只覆盖**长度**：长度正确但内容被同长度
+篡改的副本不会被本命令发现（`verify` 也尚未逐份解密 `.enc`，见上面的诚实边界）。本命令不改配置、不自动启用
+`full`、不自动运行（引擎**不**自动回填），只补磁盘上已有的记录；`run`/`gc` 的默认行为不变。
+
 ## 25. 账户 ID 绑定解锁（用户决定：只比对唯一识别码，2026-11-17）
 
 **用户决定（原话）**：

@@ -35,8 +35,11 @@ import {
   selectPrunable,
   writeCurrentPointer,
 } from '../src/backup/rotation.mjs';
-import { OLD_COPY_KIND, openObject, randomDek, sealObject } from '../src/backup/crypto.mjs';
-import { repoPaths } from '../src/backup/layout.mjs';
+import { MIN_SCRYPT, OLD_COPY_KIND, openObject, randomDek, sealObject } from '../src/backup/crypto.mjs';
+import { ensureLayout, repoPaths } from '../src/backup/layout.mjs';
+import { openRepoKey } from '../src/backup/keystore.mjs';
+import { SEALED_COPY_OVERHEAD, backfillOldFullCopies } from '../src/backup/old-backfill.mjs';
+import { formatOldBackfill, main, parseArgs } from '../src/backup/cli.mjs';
 import { readJsonSafe } from '../src/backup/atomic.mjs';
 import { tempDir } from './helpers/backup-fixture.mjs';
 
@@ -562,6 +565,445 @@ describe('rotation: oldFormat (records vs the literal full copy)', () => {
         (error) => error instanceof RotationError && error.code === ROTATION_CODES.WRITE_FAILED,
       );
       assert.equal(listOldVersions(dir).length, 0);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+const BACKFILL_KDF = { algo: 'scrypt', N: MIN_SCRYPT.N, r: MIN_SCRYPT.r, p: MIN_SCRYPT.p, keylen: 32 };
+const BACKFILL_PASSWORD = 'correct horse battery staple';
+
+/** A real repository root with an openable password envelope, plus the DEK the fixture sealed its blocks with. */
+function backfillRepo(prefix) {
+  const { dir, cleanup } = tempDir(prefix);
+  const root = join(dir, 'repo');
+  const home = join(dir, 'home');
+  ensureLayout(root);
+  const key = openRepoKey({
+    root,
+    dshHome: home,
+    password: BACKFILL_PASSWORD,
+    platform: 'linux',
+    machineKey: false,
+    kdf: BACKFILL_KDF,
+  });
+  assert.equal(key.ok, true, key.detail ?? 'the fixture repository must open');
+  return { dir, root, home, dek: key.dek, cleanup };
+}
+
+/**
+ * Store one superseded version (its blocks really exist under `objects/`) and write its record.
+ *
+ * `format: 'records'` (default) is exactly the pre-full-mode shape the migration exists for.
+ */
+function backfillVersion(root, dek, sessionId, bytes, stamp, format = 'records') {
+  const previous = {
+    ...ENTRY,
+    session_id: sessionId,
+    rel: `sessions/--E-GPT--/${sessionId}/session.v4.jsonl.zstd`,
+    ...storedVersion(root, dek, bytes),
+    snapshot_id: `snapshot-${stamp}`,
+    updated_at: stamp,
+  };
+  return recordSupersededVersion({
+    root,
+    previous,
+    snapshotId: `next-${stamp}`,
+    now: new Date(stamp),
+    format,
+    dek: format === 'full' ? dek : undefined,
+  });
+}
+
+/** Every sealed whole-file copy under `old/` (`*.json.enc`). */
+function fullCopyFiles(root) {
+  const out = [];
+  const walk = (dir) => {
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.isFile() && entry.name.endsWith('.json.enc')) out.push(full);
+    }
+  };
+  walk(join(root, 'old'));
+  return out;
+}
+
+/** The record document as it is on disk. */
+function readRecordJson(file) {
+  return JSON.parse(readFileSync(file, 'utf8'));
+}
+
+/** Open a copy with the `old` identity and return its plaintext. */
+function openCopy(file, dek, record) {
+  return openObject(readFileSync(file), dek, {
+    sha256: record.full_copy.sha256,
+    length: record.full_copy.size,
+    kind: OLD_COPY_KIND,
+  });
+}
+
+describe('rotation: old-backfill (migrating records that predate full mode)', () => {
+  it('writes exactly the missing sealed copy, verifies it against the record, and decrypts to the original bytes', () => {
+    const repo = backfillRepo('w2m-rot-backfill-write-');
+    try {
+      const bytesA = Buffer.from('the record-only version, byte for byte\n');
+      const bytesB = Buffer.from('a version that already had its full copy\n');
+      const recordA = backfillVersion(repo.root, repo.dek, 'session-aaaaaaaa-0001', bytesA, '2026-11-17T13:00:00.000Z');
+      const recordB = backfillVersion(repo.root, repo.dek, 'session-bbbbbbbb-0002', bytesB, '2026-11-17T14:00:00.000Z', 'full');
+      assert.equal(fullCopyFiles(repo.root).length, 1, 'the fixture starts with exactly the full record\'s copy');
+      const recordBBefore = readFileSync(recordB.file);
+
+      const result = backfillOldFullCopies({
+        root: repo.root,
+        dshHome: repo.home,
+        password: BACKFILL_PASSWORD,
+        platform: 'linux',
+        machineKey: false,
+      });
+      assert.equal(result.ok, true, JSON.stringify(result.failed));
+      assert.equal(result.backfilled, 1);
+      assert.equal(result.repaired, 0);
+      assert.equal(result.skipped, 1);
+      assert.equal(result.orphans, 0);
+      assert.deepEqual(result.failed, []);
+      assert.equal(result.dry_run, false);
+      assert.equal(result.reason_code, null);
+      assert.equal(fullCopyFiles(repo.root).length, 2, 'backfill adds exactly one .json.enc');
+      assert.equal(result.bytes_written, bytesA.length + SEALED_COPY_OVERHEAD);
+
+      const updated = readRecordJson(recordA.file);
+      assert.equal(updated.format, OLD_FORMAT, 'the record format stays the frozen v1 shape');
+      assert.equal(updated.version, OLD_VERSION);
+      assert.equal(updated.sha256, recordA.record.sha256);
+      assert.equal(updated.full_copy.sha256, recordA.record.sha256);
+      assert.equal(updated.full_copy.size, bytesA.length);
+      assert.match(
+        updated.full_copy.file,
+        /^old\/--E-GPT--\/session-aaaaaaaa-0001\/20261117T130000Z-[0-9a-f]{12}\.json\.enc$/u,
+      );
+      const copyFile = join(repo.root, ...updated.full_copy.file.split('/'));
+      assert.equal(existsSync(copyFile), true);
+      assert.equal(fullCopyPathFor(repo.root, updated), copyFile, 'the recorded path points at the file that was written');
+      assert.deepEqual(openCopy(copyFile, repo.dek, updated), bytesA, 'the copy must decrypt to the superseded bytes');
+      assert.throws(
+        () => openObject(readFileSync(copyFile), repo.dek, { sha256: updated.full_copy.sha256, length: updated.full_copy.size }),
+        (error) => error.code === 'BACKUP_DECRYPT_AUTH_FAILED',
+        'a whole-file copy must not open as a block object',
+      );
+      assert.equal(readFileSync(recordB.file).equals(recordBBefore), true, 'a record that already had a copy is not rewritten');
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('is idempotent: the second run writes nothing and reports every record as skipped', () => {
+    const repo = backfillRepo('w2m-rot-backfill-idempotent-');
+    try {
+      const bytesA = Buffer.from('version a\n');
+      const bytesB = Buffer.from('version b\n');
+      const recordA = backfillVersion(repo.root, repo.dek, 'session-aaaaaaaa-0001', bytesA, '2026-11-17T13:00:00.000Z');
+      backfillVersion(repo.root, repo.dek, 'session-bbbbbbbb-0002', bytesB, '2026-11-17T14:00:00.000Z');
+      const input = { root: repo.root, dshHome: repo.home, password: BACKFILL_PASSWORD, platform: 'linux', machineKey: false };
+      assert.equal(backfillOldFullCopies(input).backfilled, 2);
+      const recordBefore = readFileSync(recordA.file);
+      const copiesBefore = fullCopyFiles(repo.root).map((file) => readFileSync(file));
+
+      const second = backfillOldFullCopies(input);
+      assert.deepEqual(second, {
+        ok: true,
+        backfilled: 0,
+        repaired: 0,
+        skipped: 2,
+        orphans: 0,
+        failed: [],
+        bytes_written: 0,
+        dry_run: false,
+        reason_code: null,
+        detail: null,
+      });
+      assert.equal(readFileSync(recordA.file).equals(recordBefore), true, 'an already-migrated record is not rewritten');
+      assert.deepEqual(fullCopyFiles(repo.root).map((file) => readFileSync(file)), copiesBefore, 'no copy is rewritten');
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('refuses BACKUP_NO_PERMISSION without writing when the key cannot be opened', () => {
+    const repo = backfillRepo('w2m-rot-backfill-refuse-');
+    try {
+      const bytes = Buffer.from('a version nobody can open\n');
+      const record = backfillVersion(repo.root, repo.dek, 'session-aaaaaaaa-0001', bytes, '2026-11-17T13:00:00.000Z');
+      const recordBefore = readFileSync(record.file);
+      const base = { root: repo.root, dshHome: repo.home, platform: 'linux', machineKey: false };
+
+      for (const password of ['', 'not-the-password']) {
+        const refused = backfillOldFullCopies({ ...base, password });
+        assert.equal(refused.ok, false);
+        assert.equal(refused.reason_code, 'BACKUP_NO_PERMISSION');
+        assert.match(refused.detail, /BACKUP_NO_PERMISSION/u);
+        assert.equal(refused.backfilled, 0);
+        assert.equal(fullCopyFiles(repo.root).length, 0, 'a refused run writes no copy');
+        assert.equal(readFileSync(record.file).equals(recordBefore), true, 'a refused run rewrites no record');
+      }
+
+      // A closed key is the same refusal, not a throw: a malformed keys.json must be reported with its detail.
+      const keysFile = join(repo.root, 'keys.json');
+      writeFileSync(keysFile, '{ not json');
+      const corrupt = backfillOldFullCopies({ ...base, password: BACKFILL_PASSWORD });
+      assert.equal(corrupt.ok, false);
+      assert.equal(corrupt.reason_code, 'BACKUP_NO_PERMISSION');
+      assert.equal(fullCopyFiles(repo.root).length, 0);
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('repairs a short or missing .json.enc instead of trusting its length', () => {
+    const repo = backfillRepo('w2m-rot-backfill-repair-');
+    try {
+      const bytes = Buffer.from('the bytes the copy must keep\n');
+      const record = backfillVersion(repo.root, repo.dek, 'session-aaaaaaaa-0001', bytes, '2026-11-17T13:00:00.000Z', 'full');
+      const copyFile = fullCopyFiles(repo.root)[0];
+      const input = { root: repo.root, dshHome: repo.home, password: BACKFILL_PASSWORD, platform: 'linux', machineKey: false };
+
+      // A crash during the copy write leaves a short file; the record's length is the authority.
+      writeFileSync(copyFile, readFileSync(copyFile).subarray(0, 12));
+      const first = backfillOldFullCopies(input);
+      assert.equal(first.ok, true, JSON.stringify(first.failed));
+      assert.equal(first.repaired, 1);
+      assert.equal(first.backfilled, 0);
+      assert.equal(first.skipped, 0);
+      assert.equal(first.orphans, 0);
+      assert.equal(first.bytes_written, bytes.length + SEALED_COPY_OVERHEAD);
+      assert.deepEqual(openCopy(copyFile, repo.dek, readRecordJson(record.file)), bytes);
+
+      // A missing copy is repaired the same way.
+      rmSync(copyFile);
+      const second = backfillOldFullCopies(input);
+      assert.equal(second.repaired, 1);
+      assert.equal(existsSync(copyFile), true);
+      assert.deepEqual(openCopy(copyFile, repo.dek, readRecordJson(record.file)), bytes);
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('reports an unrebuildable record as a per-record failure instead of writing a copy of something else', () => {
+    const repo = backfillRepo('w2m-rot-backfill-failed-');
+    try {
+      const bytes = Buffer.from('whose block will go missing\n');
+      const record = backfillVersion(repo.root, repo.dek, 'session-aaaaaaaa-0001', bytes, '2026-11-17T13:00:00.000Z');
+      const object = join(repoPaths(repo.root).objects, record.record.sha256.slice(0, 2), record.record.sha256);
+      rmSync(object);
+
+      const rebuilt = backfillOldFullCopies({
+        root: repo.root,
+        dshHome: repo.home,
+        password: BACKFILL_PASSWORD,
+        platform: 'linux',
+        machineKey: false,
+      });
+      assert.equal(rebuilt.ok, false);
+      assert.equal(rebuilt.backfilled, 0);
+      assert.equal(rebuilt.failed.length, 1);
+      assert.equal(rebuilt.failed[0].record, record.file);
+      assert.equal(rebuilt.failed[0].reason_code, 'BACKUP_OLD_BACKFILL_FAILED');
+      assert.match(rebuilt.failed[0].detail, /BACKUP_OBJECT_MISSING/u);
+      assert.equal(fullCopyFiles(repo.root).length, 0, 'a record that cannot rebuild gets no copy');
+      assert.match(formatOldBackfill(rebuilt), /failed\s+: 1 record/u);
+
+      // A record whose declared digest is not a sha256 is refused by code, before any rebuild.
+      const invalid = { ...record.record, sha256: 'not-a-digest' };
+      const invalidFile = join(dirname(record.file), '20260101T000000Z-invalid.json');
+      writeFileSync(invalidFile, `${JSON.stringify(invalid, null, 2)}\n`);
+      const refused = backfillOldFullCopies({
+        root: repo.root,
+        dshHome: repo.home,
+        password: BACKFILL_PASSWORD,
+        platform: 'linux',
+        machineKey: false,
+      });
+      assert.equal(refused.ok, false);
+      assert.equal(refused.failed.some((row) => row.reason_code === 'BACKUP_OLD_RECORD_INVALID'), true);
+      assert.equal(fullCopyFiles(repo.root).length, 0);
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('counts an unreferenced .json.enc as orphan, leaves it alone, and counts the plan in a dry run', () => {
+    const repo = backfillRepo('w2m-rot-backfill-orphan-');
+    try {
+      const bytes = Buffer.from('a version with its full copy\n');
+      backfillVersion(repo.root, repo.dek, 'session-aaaaaaaa-0001', bytes, '2026-11-17T13:00:00.000Z', 'full');
+      const referenced = fullCopyFiles(repo.root)[0];
+      const orphan = join(dirname(referenced), '20260101T000000Z-ffffffffffff.json.enc');
+      writeFileSync(orphan, Buffer.alloc(5, 7));
+
+      const result = backfillOldFullCopies({
+        root: repo.root,
+        dshHome: repo.home,
+        password: BACKFILL_PASSWORD,
+        platform: 'linux',
+        machineKey: false,
+      });
+      assert.equal(result.ok, true);
+      assert.equal(result.skipped, 1, 'the record with a valid copy is skipped');
+      assert.equal(result.orphans, 1, 'a copy no record references is counted');
+      assert.equal(existsSync(orphan), true, 'backfill never deletes: orphan cleanup belongs to gc');
+      assert.equal(existsSync(referenced), true);
+      assert.match(formatOldBackfill(result), /orphan copies : 1/u);
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('honours limit as the number of copies written, so skips do not consume the budget', () => {
+    const repo = backfillRepo('w2m-rot-backfill-limit-');
+    try {
+      backfillVersion(repo.root, repo.dek, 'session-aaaaaaaa-0001', Buffer.from('a\n'), '2026-11-17T12:00:00.000Z');
+      backfillVersion(repo.root, repo.dek, 'session-bbbbbbbb-0002', Buffer.from('b\n'), '2026-11-17T13:00:00.000Z');
+      backfillVersion(repo.root, repo.dek, 'session-cccccccc-0003', Buffer.from('c\n'), '2026-11-17T14:00:00.000Z', 'full');
+      const input = {
+        root: repo.root,
+        dshHome: repo.home,
+        password: BACKFILL_PASSWORD,
+        platform: 'linux',
+        machineKey: false,
+        limit: 1,
+      };
+      // The full record is newest (it sorts first): one skip plus one write, and then the budget is spent.
+      const first = backfillOldFullCopies(input);
+      assert.equal(first.backfilled, 1);
+      assert.equal(first.skipped, 1);
+      assert.equal(fullCopyFiles(repo.root).length, 2);
+      const second = backfillOldFullCopies(input);
+      assert.equal(second.backfilled, 1);
+      assert.equal(second.skipped, 2);
+      assert.equal(fullCopyFiles(repo.root).length, 3);
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('a dry run needs no credential, writes nothing, and reports the plan', () => {
+    const repo = backfillRepo('w2m-rot-backfill-dry-');
+    try {
+      const bytes = Buffer.from('plan me, do not write me\n');
+      const record = backfillVersion(repo.root, repo.dek, 'session-aaaaaaaa-0001', bytes, '2026-11-17T13:00:00.000Z');
+      const recordBefore = readFileSync(record.file);
+      const copiesBefore = fullCopyFiles(repo.root).length;
+
+      // No dsh-home, no password: a dry run must not need (or touch) the repository key.
+      const result = backfillOldFullCopies({ root: repo.root, dryRun: true });
+      assert.equal(result.ok, true);
+      assert.equal(result.dry_run, true);
+      assert.equal(result.backfilled, 1, 'the plan reports what a real run would backfill');
+      assert.equal(result.repaired, 0);
+      assert.equal(result.skipped, 0);
+      assert.equal(result.bytes_written, 0);
+      assert.equal(fullCopyFiles(repo.root).length, copiesBefore, 'a dry run writes no copy');
+      assert.equal(readFileSync(record.file).equals(recordBefore), true, 'a dry run rewrites no record');
+      assert.equal(existsSync(join(repo.root, 'tmp', 'backup.lock')), false, 'a dry run takes no lock');
+      assert.match(formatOldBackfill(result), /nothing was written/u);
+    } finally {
+      repo.cleanup();
+    }
+  });
+});
+
+describe('rotation: old-backfill CLI', () => {
+  const capture = (password) => {
+    const lines = [];
+    const io = {
+      stdout: (text) => lines.push(text),
+      stderr: (text) => lines.push(text),
+      env: {},
+      ...(password === undefined ? {} : { password }),
+    };
+    return { lines, io };
+  };
+
+  it('is named in usage, parses --limit, and uses exit code 2 for a bad value', () => {
+    const help = capture();
+    assert.equal(main(['help'], help.io), 0);
+    const usage = help.lines.join('\n');
+    assert.match(usage, /old-backfill/u);
+    assert.match(usage, /--limit <n>/u);
+
+    assert.equal(parseArgs(['old-backfill', '--limit', '2'], {}).limit, 2);
+    assert.equal(parseArgs(['old-backfill', '--limit=0'], {}).limit, 0);
+    assert.match(parseArgs(['old-backfill', '--limit'], {}).error, /--limit needs a non-negative integer/u);
+    assert.match(parseArgs(['old-backfill', '--limit=abc'], {}).error, /--limit needs a non-negative integer/u);
+
+    const bad = capture(BACKFILL_PASSWORD);
+    assert.equal(main(['old-backfill', '--backup-dir', 'E:\\nowhere', '--limit', 'lots'], bad.io), 2);
+  });
+
+  it('runs the migration through the real entry point and prints the JSON result', () => {
+    const repo = backfillRepo('w2m-rot-backfill-cli-');
+    try {
+      const bytes = Buffer.from('the CLI must migrate this version\n');
+      const record = backfillVersion(repo.root, repo.dek, 'session-aaaaaaaa-0001', bytes, '2026-11-17T13:00:00.000Z');
+      const argv = ['old-backfill', '--backup-dir', repo.root, '--dsh-home', repo.home, '--no-machine-key', '--json'];
+      const first = capture(BACKFILL_PASSWORD);
+      assert.equal(main(argv, first.io), 0, first.lines.join('\n'));
+      const payload = JSON.parse(first.lines.join('\n'));
+      assert.deepEqual(Object.keys(payload).sort(), [
+        'backfilled',
+        'bytes_written',
+        'detail',
+        'dry_run',
+        'failed',
+        'ok',
+        'orphans',
+        'reason_code',
+        'repaired',
+        'skipped',
+      ]);
+      assert.equal(payload.ok, true);
+      assert.equal(payload.backfilled, 1);
+      assert.equal(payload.dry_run, false);
+      assert.equal(payload.bytes_written, bytes.length + SEALED_COPY_OVERHEAD);
+      assert.equal(readRecordJson(record.file).full_copy.sha256, record.record.sha256);
+
+      const human = capture(BACKFILL_PASSWORD);
+      assert.equal(main(['old-backfill', '--backup-dir', repo.root, '--dsh-home', repo.home, '--no-machine-key', '--dry-run'], human.io), 0);
+      const text = human.lines.join('\n');
+      assert.match(text, /old-backfill/u);
+      assert.match(text, /dry run \(nothing was written\)/u);
+      assert.match(text, /nothing was written \(dry run\)/u);
+      assert.match(text, /already full {2}: 1 record/u);
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('exits 1 with a JSON refusal when the repository cannot be opened, and writes nothing', () => {
+    const { dir, cleanup } = tempDir('w2m-rot-backfill-cli-refuse-');
+    const root = join(dir, 'repo');
+    ensureLayout(root);
+    try {
+      const home = join(dir, 'home');
+      const captured = capture();
+      const code = main(
+        ['old-backfill', '--backup-dir', root, '--dsh-home', home, '--no-machine-key', '--json'],
+        captured.io,
+      );
+      assert.equal(code, 1);
+      const payload = JSON.parse(captured.lines.join('\n'));
+      assert.equal(payload.ok, false);
+      assert.equal(payload.reason_code, 'BACKUP_NO_PERMISSION');
+      assert.equal(payload.backfilled, 0);
+      assert.equal(existsSync(join(root, 'keys.json')), false, 'a refused backfill must not mint a key file');
     } finally {
       cleanup();
     }

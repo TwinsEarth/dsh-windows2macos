@@ -29,6 +29,7 @@ import { buildManifest, manifestDigest, manifestSummary } from './manifest.mjs';
 import { buildStatus } from './routes.mjs';
 import { runBackup, SCOPES } from './engine.mjs';
 import { OLD_FORMATS } from './rotation.mjs';
+import { backfillOldFullCopies } from './old-backfill.mjs';
 import { gc } from './gc.mjs';
 import { openRepo } from './repo.mjs';
 import { buildArchive } from './archive.mjs';
@@ -200,6 +201,7 @@ function usage() {
     '  run                 perform one backup now (writes blocks, a snapshot and rotation records)',
     '  list                snapshots in the repository, newest first (read-only)',
     '  gc                  remove unreferenced blocks and prune old versions (writes)',
+    '  old-backfill        write the optional sealed whole-file copy for old/ records that predate full mode (writes)',
     '  unlock              which credential opens this repository (read-only; --check tries it)',
     '  verify              re-hash every snapshot: blocks, bytes, manifests, index, old records',
     '  archive             pack archived sessions (or --scope all) into one .tar.zst (writes)',
@@ -220,8 +222,9 @@ function usage() {
     '  --old-format <f>    run: how a superseded version is kept: records (default, deduped record only)',
     '                      or full (also one sealed whole-file copy under old/, doubling that version\'s bytes)',
     '  --max-old-days <n>  run/gc: also prune old version records older than N days (0 = per-session count only)',
+    '  --limit <n>         old-backfill: write at most N sealed copies this run (0 = plan only, writes nothing)',
     '  --mirror <dir>      run: copy the sealed blocks and snapshot metadata to this offsite directory',
-    '  --dry-run           run/gc/restore/register: report what would happen, write nothing',
+    '  --dry-run           run/gc/old-backfill/restore/register: report what would happen, write nothing',
     '  --snapshot <id>     verify/archive/restore: a specific snapshot (default: the latest)',
     '  --archive <file>    restore: read the session bytes from a .tar.zst archive instead of the repository',
     '  --apply             restore: actually write (without it, restore only prints the plan)',
@@ -237,7 +240,7 @@ function usage() {
     '                      it after a successful run, so a matching account unlocks later without a password)',
     '  --check             unlock: attempt the unlock instead of only describing it',
     '  --set-password      unlock: add a password envelope to this repository (reads the password from stdin/env) so it opens without this machine',
-    '  --password-stdin    run/restore/unlock --check: read the password from stdin (never argv)',
+    '  --password-stdin    run/restore/unlock --check/old-backfill: read the password from stdin (never argv)',
     '                      (environment fallback: W2M_BACKUP_PASSWORD, same "never argv" rule)',
     '  --no-machine-key    run: do not use (or create) the OS-keystore machine envelope',
     '  --no-future-append  run: skip the "next append still loads" simulation (it decodes every log)',
@@ -266,6 +269,7 @@ export function parseArgs(argv, env = process.env) {
     keepOld: null,
     oldFormat: null,
     maxOldDays: null,
+    limit: null,
     mirror: null,
     dryRun: false,
     passwordStdin: false,
@@ -359,6 +363,20 @@ export function parseArgs(argv, env = process.env) {
         return { ...options, error: `--max-old-days needs a non-negative integer, got ${JSON.stringify(raw)}` };
       }
       options.maxOldDays = value;
+    } else if (arg === '--limit') {
+      const raw = rest.shift() ?? '';
+      const value = Number(raw);
+      if (raw.trim() === '' || !Number.isSafeInteger(value) || value < 0) {
+        return { ...options, error: `--limit needs a non-negative integer, got ${JSON.stringify(raw)}` };
+      }
+      options.limit = value;
+    } else if (arg.startsWith('--limit=')) {
+      const raw = arg.slice('--limit='.length);
+      const value = Number(raw);
+      if (raw.trim() === '' || !Number.isSafeInteger(value) || value < 0) {
+        return { ...options, error: `--limit needs a non-negative integer, got ${JSON.stringify(raw)}` };
+      }
+      options.limit = value;
     } else if (arg === '--mirror') {
       const raw = rest.shift() ?? '';
       if (raw.trim() === '') return { ...options, error: '--mirror needs a directory' };
@@ -592,6 +610,38 @@ export function formatGc(result) {
   return lines.join('\n');
 }
 
+/**
+ * Render an old-backfill result for a terminal.
+ *
+ * Shows the four counts that answer "what changed", bounded per-record failure lines (a repository with a
+ * thousand broken records must not bury the summary), and the explicit "nothing was written" line a dry run
+ * needs so it cannot be mistaken for an applied migration.
+ */
+export function formatOldBackfill(result) {
+  const lines = ['w2m-backup old-backfill', ''];
+  lines.push(`mode          : ${result.dry_run ? 'dry run (nothing was written)' : 'applied'}`);
+  if (result.ok !== true && result.reason_code !== null && result.failed.length === 0) {
+    // A top-level refusal (no key, locked, not a repository): there is no per-record work to report.
+    lines.push(`refused       : ${result.reason_code}${result.detail ? ` — ${result.detail}` : ''}`);
+    return lines.join('\n');
+  }
+  lines.push(`backfilled    : ${result.backfilled} record(s) gained a sealed whole-file copy`);
+  lines.push(`repaired      : ${result.repaired} copy(ies) rebuilt (a file was missing or the wrong length)`);
+  lines.push(`already full  : ${result.skipped} record(s) already had a usable copy`);
+  lines.push(`orphan copies : ${result.orphans} left for gc (nothing is deleted here)`);
+  if (result.bytes_written > 0) lines.push(`bytes written : ${humanBytes(result.bytes_written)}`);
+  if (result.failed.length > 0) lines.push('', `failed        : ${result.failed.length} record(s)`, ...failureLines(result.failed));
+  if (result.dry_run) lines.push('', 'nothing was written (dry run)');
+  return lines.join('\n');
+}
+
+/** Bounded per-record failure lines, shared by both old-backfill branches. */
+function failureLines(failed) {
+  const lines = failed.slice(0, 10).map((row) => `  ${row.record}: ${row.reason_code} — ${row.detail}`);
+  if (failed.length > 10) lines.push(`  … ${failed.length - 10} more`);
+  return lines;
+}
+
 /** Read the unlock password from the injected value, stdin, or the environment (never from argv). */
 function passwordFor(options, io) {
   if (typeof io.password === 'string') return io.password;
@@ -780,6 +830,25 @@ export function main(argv, io = {}) {
       maxOldVersionDays: options.maxOldDays ?? undefined,
     });
     write(options.json ? JSON.stringify(result, null, 2) : formatGc(result));
+    return result.ok === true ? 0 : 1;
+  }
+
+  if (options.command === 'old-backfill') {
+    const resolved = resolveDir(options, env);
+    if (resolved.ok !== true) {
+      writeErr(`${resolved.error.code}: ${resolved.error.detail}`);
+      return 1;
+    }
+    const result = backfillOldFullCopies({
+      root: resolved.dir,
+      dshHome: options.dshHome,
+      password: passwordFor(options, io),
+      accountId: options.accountId ?? undefined,
+      dryRun: options.dryRun,
+      limit: options.limit ?? undefined,
+      machineKey: options.noMachineKey === true || env.W2M_BACKUP_NO_MACHINE_KEY === '1' ? false : undefined,
+    });
+    write(options.json ? JSON.stringify(result, null, 2) : formatOldBackfill(result));
     return result.ok === true ? 0 : 1;
   }
 
