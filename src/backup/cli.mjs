@@ -34,6 +34,7 @@ import { buildArchive } from './archive.mjs';
 import { applyRestore, planRestore, planRestoreFromArchive } from './restore.mjs';
 import { detectClientRunning } from './client.mjs';
 import { recheckRegistry } from './registry-watch.mjs';
+import { applyRegister, planRegister } from './register.mjs';
 import { describeUnlock, unlockRepo } from './unlock.mjs';
 import { verifyRepo } from './verify.mjs';
 
@@ -137,6 +138,43 @@ export function formatRestore(plan, applied) {
   return lines.join('\n');
 }
 
+/** Render a register plan or result for a terminal. */
+export function formatRegister(plan, applied) {
+  const lines = ['w2m-backup register', ''];
+  lines.push(`DSH home      : ${plan.dsh_home ?? '—'}`);
+  if (typeof plan.workspace_path === 'string' && plan.workspace_path !== '') lines.push(`workspace     : ${plan.workspace_path}`);
+  lines.push(`requested     : ${Array.isArray(plan.requested) ? plan.requested.length : 0} session(s)`);
+  if (plan.ok !== true) {
+    lines.push(`refused       : ${plan.reason_code} ${plan.detail ?? ''}`.trimEnd());
+    if (Array.isArray(plan.unknown) && plan.unknown.length > 0) lines.push(`unknown       : ${plan.unknown.join(', ')}`);
+    lines.push('');
+    lines.push('nothing was written.');
+    return lines.join('\n');
+  }
+  const already = Array.isArray(plan.already_registered) ? plan.already_registered : [];
+  if (already.length > 0) lines.push(`already reg.  : ${already.join(', ')}`);
+  const result = applied === undefined ? null : applied;
+  const registered = result === null ? (Array.isArray(plan.registered) ? plan.registered : []) : result.registered;
+  lines.push(`registered    : ${registered.length > 0 ? registered.join(', ') : '(none)'}`);
+  for (const action of (result === null ? plan.actions : result.actions) ?? []) lines.push(`  - ${action}`);
+  if (result === null) {
+    lines.push('');
+    lines.push(plan.changed === true ? 'dry run: nothing was written. Re-run without --dry-run to register.' : 'nothing to do: every requested session is already registered.');
+    return lines.join('\n');
+  }
+  lines.push(`registry      : ${result.verified === true ? 'verified (read back)' : 'NOT VERIFIED'}`);
+  if (typeof result.backup_file === 'string' && result.backup_file !== '') lines.push(`registry copy : ${result.backup_file}`);
+  if (result.pruned_register_backups !== null && result.pruned_register_backups !== undefined) {
+    const pruned = result.pruned_register_backups;
+    lines.push(`copies kept   : ${pruned.kept.length} of ${pruned.scanned} (pruned ${pruned.removed_count})`);
+  }
+  if (result.recheck !== undefined) {
+    lines.push(`re-check      : ${result.recheck.ok ? 'still holds' : 'STILL OVERWRITTEN'} (rewrote: ${result.recheck.rewrote ? 'yes' : 'no'})`);
+  }
+  if (typeof result.warning === 'string') lines.push(`warning       : ${result.warning}`);
+  return lines.join('\n');
+}
+
 function usage() {
   return [
     'usage: w2m-backup <command> [options]',
@@ -152,6 +190,7 @@ function usage() {
     '  verify              re-hash every snapshot: blocks, bytes, manifests, index, old records',
     '  archive             pack archived sessions (or --scope all) into one .tar.zst (writes)',
     '  restore             plan a restore; --apply writes sessions, attachments and the workspace registry',
+    '  register            register sessions that are already on disk in the workspace registry (writes it)',
     '  help                this text',
     '',
     'options:',
@@ -162,19 +201,19 @@ function usage() {
     '  --hash              hash every file (sha256; slower)',
     '  --manifest          build the in-memory manifest and print its digest (no writes)',
     '  --scope <s>         run: all | active | archived | selected (default: all)',
-    '  --session <id>      run --scope selected: a session id to include (repeatable)',
+    '  --session <id>      run --scope selected / register: a session id (repeatable)',
     '  --keep-old <n>      old versions kept per session (default: 10)',
     '  --max-old-days <n>  run/gc: also prune old version records older than N days (0 = per-session count only)',
     '  --mirror <dir>      run: copy the sealed blocks and snapshot metadata to this offsite directory',
-    '  --dry-run           run/gc: report what would happen, write nothing',
+    '  --dry-run           run/gc/restore/register: report what would happen, write nothing',
     '  --snapshot <id>     verify/archive/restore: a specific snapshot (default: the latest)',
     '  --archive <file>    restore: read the session bytes from a .tar.zst archive instead of the repository',
     '  --apply             restore: actually write (without it, restore only prints the plan)',
     '  --keep-both         restore: keep an existing different file and write the restored one beside it',
     '  --allow-static-validation  restore: accept static-only evidence when no Harness is installed',
-    '  --allow-live-home   restore: write even though the DSH client is running (read-back + recheck protocol)',
-    '  --registry-recheck <ms>  restore --apply: wait this long, then re-check the registry once (client save)',
-    '  --workspace-path <p> restore: attach a restored session to this directory if the workspace is absent',
+    '  --allow-live-home   restore/register: write even though the DSH client is running (read-back + recheck protocol)',
+    '  --registry-recheck <ms>  restore --apply / register: wait this long, then re-check the registry once (client save)',
+    '  --workspace-path <p> restore/register: attach an unknown workspace to this directory, or create the registry there',
     '  --runtime           verify/run: confirm with the installed Harness validator (G5), not only the pre-filter',
     '  --check             unlock: attempt the unlock instead of only describing it',
     '  --password-stdin    run/restore/unlock --check: read the password from stdin (never argv)',
@@ -805,6 +844,35 @@ export function main(argv, io = {}) {
       applied.registry_recheck = recheckRegistry({ dshHome: options.dshHome, plan });
     }
     write(options.json ? JSON.stringify(applied, null, 2) : formatRestore(plan, applied));
+    return applied.ok === true ? 0 : 1;
+  }
+
+  if (options.command === 'register') {
+    const requested = options.selected.filter((sessionId) => typeof sessionId === 'string' && sessionId !== '');
+    if (requested.length === 0) {
+      writeErr(`error: register needs at least one --session <id>\n\n${usage()}`);
+      return 2;
+    }
+    const plan = planRegister({
+      dshHome: options.dshHome,
+      sessionIds: requested,
+      workspacePath: options.workspacePath,
+      allowLiveHome: options.allowLiveHome,
+      // The same injectable gate the restore command uses: tests answer it, production asks the process list.
+      clientCheck: io.clientCheck ?? (() => detectClientRunning({})),
+      now: io.now?.() ?? new Date(),
+    });
+    if (plan.ok !== true || options.dryRun === true) {
+      write(options.json ? JSON.stringify(plan, null, 2) : formatRegister(plan));
+      return plan.ok === true ? 0 : 1;
+    }
+    const applied = applyRegister({ dshHome: options.dshHome, plan });
+    if (applied.ok === true && applied.changed === true && options.registryRecheckMs > 0) {
+      // Sync wait: the CLI is offline, so there is no event loop to keep the process alive for a deferred check.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, options.registryRecheckMs);
+      applied.recheck = recheckRegistry({ dshHome: options.dshHome, plan: plan.registry });
+    }
+    write(options.json ? JSON.stringify(applied, null, 2) : formatRegister(plan, applied));
     return applied.ok === true ? 0 : 1;
   }
 

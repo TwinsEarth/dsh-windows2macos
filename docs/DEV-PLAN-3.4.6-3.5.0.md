@@ -342,6 +342,17 @@ preflight、三方发布）属于发布审批，不在本半执行。
 
 ---
 
+### 复盘门禁 G2/G3/G4/G5 收口补记（2026-11-17，未发布）
+
+在 v3.4.9 面板与 v3.5.0 非 UI 半之后，补齐四个边角（不改既有协议，不新增测试文件）：① **G2** 新增
+`w2m-backup register` 一等公民入口（`src/backup/register.mjs`：磁盘会话解析 → 客户端门禁 → 注册表副本 →
+整次一个文档 plan/apply → 回读校验 → 可选保存后复查；已登记会话 no-op，archived/pinned 读出再写回，绝不用默认值）；
+② **G4** renumber 的 `.bak-<时间戳>` 兄弟副本有保留上限（`pruneRenumberBackups` + `w2m-fix renumber
+--keep-backups <n>`，默认 5、0 = 全留、当前次副本永不删）；③ **G3** 新增证据测试把「每条会改字节/改声明的路径
+都复查未来追加」钉死（restore 计划 / renumber 计划 / verify 的 `static-prefilter` 与 `installed-harness` 标签）；
+④ **G5** 面板校验卡增加默认关闭的「用安装的 Harness 终审（慢）」勾选框，勾上才走
+`GET /api/w2m/backup/verify?runtime=1`。详见 `docs/BACKUP-DESIGN.md` §22（诚实边界见 §22.5）。
+
 ## 8. 每个版本的 Definition of Done（统一清单）
 
 1. 版本号 6 处同步（`package.json`、`plugin.json`、`.claude-plugin/*`、`codex/mcp-servers.toml`、`README.md`）；

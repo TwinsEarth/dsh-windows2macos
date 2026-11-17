@@ -9,6 +9,8 @@ import { join } from 'node:path';
 
 import { runBackup } from '../src/backup/engine.mjs';
 import { verifyRepo } from '../src/backup/verify.mjs';
+import { planRestore } from '../src/backup/restore.mjs';
+import { applyRenumber, planRenumber, RENUMBER_CODES } from '../src/backup/renumber.mjs';
 import { appendLegalEvent, countLogRows, futureAppendVerdict } from '../src/backup/future-append.mjs';
 import { findHarnessInstallation } from '../src/backup/runtime-validate.mjs';
 import { repoPaths } from '../src/backup/layout.mjs';
@@ -219,6 +221,85 @@ describe('verify: damage is named, not averaged away', () => {
       assert.ok(result.problems.some((problem) => problem.code === 'BACKUP_OLD_RECORD_BLOCK_MISSING'), JSON.stringify(result.problems));
     } finally {
       first.repo.cleanup();
+      home.cleanup();
+    }
+  });
+});
+
+/**
+ * Gate G3's evidence matrix, said once for every path that can change bytes or claims:
+ *
+ *   * restore publishes bytes -> the plan validates the log AND the log plus one legal append;
+ *   * renumber restructures a log -> the plan carries the same after-append verdict and refuses when it fails;
+ *   * verify makes claims about old bytes -> its simulation is labelled `static-prefilter` and its runtime verdict
+ *     is labelled `installed-harness`, so a report cannot quote the pre-filter as the gate (G5).
+ *
+ * These are deliberately assertions about EVIDENCE rather than about damage: the damage cases live above and in
+ * `backup-verify`/`fix-renumber`; this suite pins that no restructuring path silently skips the after-append check.
+ */
+describe('G3 evidence: every restructuring path re-validates the future append', () => {
+  it(
+    'a restore plan carries the future-append verdict for every candidate (installed-Harness evidence)',
+    { skip: findHarnessInstallation() === null ? 'no DeepSeek Harness installation on this machine' : false },
+    () => {
+      const home = runtimeValidHome();
+      const { repo } = repoFor(home.home);
+      try {
+        const plan = planRestore({ root: repo.dir, dshHome: home.home, password: PASSWORD, platform: 'linux', machineKey: false });
+        assert.equal(plan.ok, true, plan.detail);
+        assert.equal(plan.candidates.length, 1);
+        assert.equal(plan.candidates[0].validation.future_append, true, 'the appended log was part of the runtime batch, not skipped');
+        assert.equal(plan.candidates[0].validation.runtime_verified, true);
+        assert.equal(plan.summary.runtime_verified, 1);
+      } finally {
+        repo.cleanup();
+        home.cleanup();
+      }
+    },
+  );
+
+  it('a renumber plan carries the future-append verdict and refuses when the appended log would fail', () => {
+    const { dir, cleanup } = tempDir('w2m-g3-renumber-');
+    const file = join(dir, 'session.v4.jsonl.zstd');
+    fs.writeFileSync(file, runtimeValidSessionLog(SESSION));
+    try {
+      const plan = planRenumber({ file, allowStaticValidation: true, harness: null });
+      assert.equal(plan.ok, true, plan.detail);
+      assert.equal(plan.validation.future_append, true, 'the plan result carries the after-append verdict');
+      assert.equal(plan.validation.future_append_evidence, 'static-prefilter', 'static evidence is labelled as the pre-filter, never quoted as the gate');
+      assert.equal(plan.validation.static_future_append.evidence, 'static-prefilter');
+
+      // `futureAppendCheck` is a documented test seam (production passes nothing): the in-memory renumber result is
+      // always dense and legal, so the "appended log would fail" branch cannot be produced by a fixture alone. With
+      // the seam the branch is exercised deterministically: the plan must refuse before a byte is written.
+      const refused = planRenumber({
+        file,
+        allowStaticValidation: true,
+        harness: null,
+        futureAppendCheck: () => ({ ok: false, codes: ['BACKUP_FUTURE_APPEND_SIMULATED'], detail: null, appended_bytes: 0, evidence: 'static-prefilter' }),
+      });
+      assert.equal(refused.ok, false);
+      assert.equal(refused.reason_code, RENUMBER_CODES.STATIC_REJECTED);
+      assert.match(refused.detail, /future-append simulation refused/u);
+      assert.equal(refused.new_bytes, null, 'a refusal carries no bytes to write');
+      const applied = applyRenumber({ plan: refused });
+      assert.equal(applied.ok, false);
+      assert.deepEqual(fs.readdirSync(dir), ['session.v4.jsonl.zstd'], 'the refusal left no sibling backup and did not touch the log');
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("labels verify's evidence: the after-append simulation is the pre-filter, the runtime verdict is the gate", () => {
+    const home = runtimeValidHome();
+    const { repo } = repoFor(home.home);
+    try {
+      const result = verify(repo.dir, home.home);
+      assert.equal(result.ok, true, result.problems.map((problem) => `${problem.code}: ${problem.detail}`).join('; '));
+      assert.equal(result.future_append.evidence, 'static-prefilter', 'the future-append block says it is not the gate');
+      assert.equal(result.runtime_verified.evidence, 'installed-harness', 'the runtime block names the evidence it would come from');
+    } finally {
+      repo.cleanup();
       home.cleanup();
     }
   });

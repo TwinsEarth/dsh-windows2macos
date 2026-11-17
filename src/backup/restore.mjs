@@ -593,12 +593,22 @@ export function applyRestore(input) {
   };
 }
 
-/** List the pre-restore copies in a home, newest first by name (names are sortable timestamps). */
+/**
+ * List the pre-restore copies in a home, newest first by name (names are sortable timestamps).
+ *
+ * Only timestamp-named directories are restore copies. The register path keeps its registry copies in the same
+ * root (`register-<timestamp>/`, see `register.mjs`), and counting them here would make a restore's retention keep
+ * fewer real pre-restore copies than it promised -- and would then prune directories it does not own.
+ */
 export function listPreRestoreSnapshots(dshHome) {
   const root = preRestoreRoot(dshHome);
   let names = [];
   try {
-    names = fs.readdirSync(root, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort();
+    names = fs
+      .readdirSync(root, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && /^\d{8}T\d{6}Z$/.test(entry.name))
+      .map((entry) => entry.name)
+      .sort();
   } catch {
     return [];
   }

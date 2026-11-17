@@ -1478,10 +1478,13 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
     assert.ok(text.includes('20261117T100000Z-abcdef12'), 'the last snapshot summary is shown');
     assert.ok(text.includes('panel.backup.plan.summary'), 'the plan card renders its summary');
     assert.ok(text.includes('panel.backup.status.runResult'), 'the last run summary is shown');
-    const checkboxes = findBy(tree, (node) => node.type === 'input' && node.props?.type === 'checkbox');
+    const checkboxes = findBy(tree, (node) => node.type === 'input' && node.props?.type === 'checkbox'
+      && node.props?.['data-w2m-backup-session'] !== undefined);
     assert.equal(checkboxes.length, 2, 'one checkbox per candidate session');
     assert.deepEqual(checkboxes.map((node) => node.props.checked), [true, false], 'the selected session is checked');
     assert.deepEqual(checkboxes.map((node) => node.props['data-w2m-backup-session']), ['sess-a', 'sess-b']);
+    assert.equal(findBy(tree, (node) => node.props?.['data-w2m-backup-runtime'] === 'true').length, 1,
+      'the slow-path toggle is a checkbox too, and is not a session checkbox');
     assert.equal(findBy(tree, (node) => node.props?.['data-w2m-backup-log-row'] === 'run').length, 1, 'the log lists the operation');
   });
 
@@ -1645,6 +1648,108 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
     handle.unmount();
   });
 
+  it('gates the slow runtime verdict behind an explicit checkbox (?runtime=1 only when checked)', async () => {
+    const document = makeFakeDocument();
+    const requests = [];
+    const statusBody = { ok: true, repository: { root: 'D:\\BackUP', initialized: true, counts: { snapshots: 1 }, free_bytes: 1_024 } };
+    const verifyBody = {
+      ok: true,
+      counts: { snapshots: 1, files: 1, blocks: 1, old: 0, current: 0 },
+      problems: [{ code: 'BACKUP_RUNTIME_UNAVAILABLE', file: 'sessions/x', detail: 'no installation' }],
+      snapshots: [],
+      future_append: { checked: 1, failed: 0, evidence: 'static-prefilter' },
+      runtime_verified: { checked: 1, failed: 0, evidence: 'installed-harness' },
+    };
+    const hostFetch = async (url, init = {}) => {
+      requests.push({ url, method: init.method ?? 'GET' });
+      const send = (payload) => ({ ok: true, status: 200, json: async () => payload });
+      if (url === '/api/w2m/backup/run') {
+        return send({ ok: true, enabled: true, backup_dir: 'D:\\BackUP', schedule: { times: ['22:00:00'], time_zone: 'UTC' }, status: statusBody, state: {} });
+      }
+      if (url === '/api/w2m/backup/status') return send(statusBody);
+      if (url === '/api/w2m/backup/unlock') {
+        return send({ ok: true, initialized: true, envelopes: ['machine'], machine_available: true, machine_reason: null, password_required: false });
+      }
+      if (url === '/api/w2m/backup/verify' || url === '/api/w2m/backup/verify?runtime=1') return send(verifyBody);
+      throw new Error(`unexpected fetch(${url})`);
+    };
+    const mountReact = makeMountReact();
+    const registry = makeRegistry();
+    const bundle = loadBundle({
+      document,
+      requireImpl: (specifier) => {
+        if (specifier === 'react') return mountReact.React;
+        throw new Error(`unexpected require(${specifier})`);
+      },
+      globals: { fetch: hostFetch },
+    });
+    bundle.exports.apply({ slots: registry, effect: (callback) => callback(), get: () => undefined });
+    const page = registry.registered.find((entry) => entry.options.key === 'w2m-backup');
+    assert.ok(page !== undefined, 'the backup page is registered');
+    const handle = mountReact.mount(page.component, { t: (key) => key });
+    const settle = async () => {
+      await new Promise((resolve) => { setTimeout(resolve, 0); });
+      handle.rerender();
+    };
+    await settle();
+
+    const verifyUrls = () => requests.filter((request) => request.url.startsWith('/api/w2m/backup/verify')).map((request) => request.url);
+    const clickAction = (action) => {
+      const node = findBy(handle.tree, (element) => element.props?.['data-w2m-backup-action'] === action)[0];
+      assert.ok(node !== undefined, `the ${action} operation is rendered`);
+      node.props.onClick();
+    };
+    const runtimeToggle = () => findBy(handle.tree, (node) => node.type === 'input' && node.props?.['data-w2m-backup-runtime'] === 'true')[0];
+
+    // The checkbox exists before any result, and the default is the cheap read-only path.
+    assert.ok(runtimeToggle() !== undefined, 'the toggle is rendered even before a verify result exists');
+    assert.equal(runtimeToggle().props.checked, false, 'the slow path is opt-in');
+    clickAction('verify');
+    await settle();
+    assert.deepEqual(verifyUrls(), ['/api/w2m/backup/verify'], 'unchecked: no runtime=1');
+    assert.equal(findBy(handle.tree, (node) => node.props?.['data-w2m-backup-panel'] === 'verify').length, 1, 'the verify result is shown');
+
+    const text = collectText(handle.tree).join('\n');
+    assert.ok(text.includes('panel.backup.verify.runtime'), 'the toggle label goes through the dictionary');
+    assert.ok(text.includes('panel.backup.verify.runtimeHint'), 'the hint (slow, needs an installation) is rendered');
+    assert.ok(text.includes('panel.backup.verify.runtimeCounts'), 'the runtime_verified counts are still rendered');
+
+    // The real translator proves the copy and the reason-code map: a runtime problem shows the operator sentence,
+    // not the raw code (BACKUP_RUNTIME_UNAVAILABLE / BACKUP_RUNTIME_REJECTED are already mapped).
+    const t = bundle.exports.makeTranslator(() => undefined);
+    const realTree = bundle.exports.BackupPanelView({
+      t,
+      repo: null,
+      status: null,
+      unlock: null,
+      plan: null,
+      selected: [],
+      busy: '',
+      log: [],
+      verify: verifyBody,
+      lastAction: null,
+      error: null,
+      archiveScope: 'archived',
+      restoreArmed: false,
+      runMissing: false,
+      verifyRuntime: true,
+    });
+    const realText = collectText(realTree).join('\n');
+    assert.ok(realText.includes('用安装的 Harness 终审（慢）'), 'the toggle label is the Chinese slow-path copy');
+    assert.ok(realText.includes('可能耗时数分钟'), 'the hint says it can take minutes');
+    assert.ok(realText.includes('本机没有可用的运行时校验环境'), 'a runtime problem code is rendered through the reason-code map');
+
+    // Check the box: the next verify asks the host for the installed-Harness verdict.
+    runtimeToggle().props.onChange({ target: { checked: true } });
+    handle.rerender();
+    assert.equal(runtimeToggle().props.checked, true);
+    clickAction('verify');
+    await settle();
+    assert.deepEqual(verifyUrls(), ['/api/w2m/backup/verify', '/api/w2m/backup/verify?runtime=1'],
+      'only the checked box turns the runtime evidence on');
+    handle.unmount();
+  });
+
   it('registers panel.backup.* strings in both the Chinese and English dictionaries', () => {
     const { exports } = loadBundle();
     const registry = makeRegistry();
@@ -1661,11 +1766,19 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
       'panel.backup.action.verify',
       'panel.backup.unlock.passwordPath',
       'panel.backup.reason.BACKUP_NO_PERMISSION',
+      // G5: the slow runtime verdict is an explicit toggle with its own hint.
+      'panel.backup.verify.runtime',
+      'panel.backup.verify.runtimeCounts',
+      'panel.backup.verify.runtimeHint',
     ];
     for (const key of keys) {
       assert.equal(typeof dictionary.zh[key], 'string', `the zh dictionary has ${key}`);
       assert.equal(typeof dictionary.en[key], 'string', `the en dictionary has ${key}`);
     }
+    assert.equal(dictionary.zh['panel.backup.verify.runtime'], '用安装的 Harness 终审（慢）',
+      'the toggle label is the slow path, labelled as slow');
+    assert.notEqual(dictionary.zh['panel.backup.verify.runtimeHint'], dictionary.en['panel.backup.verify.runtimeHint'],
+      'the hint is translated, not copied');
     assert.equal(dictionary.zh['panel.backup.reason.BACKUP_NO_PERMISSION'], '没有权限：请用原账户登录，或输入解锁密码');
     assert.notEqual(dictionary.zh['panel.backup.title'], dictionary.en['panel.backup.title'], 'both languages are real translations');
     const mapped = Object.keys(exports.BACKUP_REASON_KEYS);

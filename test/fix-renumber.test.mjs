@@ -18,7 +18,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { RENUMBER_CODES, applyRenumber, planRenumber, renumberBuffer } from '../src/backup/renumber.mjs';
+import { RENUMBER_CODES, applyRenumber, DEFAULT_KEEP_RENUMBER_BACKUPS, listRenumberBackups, planRenumber, pruneRenumberBackups, renumberBuffer } from '../src/backup/renumber.mjs';
 import { findHarnessInstallation, runtimeValidate } from '../src/backup/runtime-validate.mjs';
 import { sha256Hex } from '../src/backup/manifest.mjs';
 import { decompressFrame, scanFrames } from '../src/fix/zstd.mjs';
@@ -528,5 +528,103 @@ describe('renumber: the CLI', () => {
     const siblings = backupSiblings(file);
     assert.equal(siblings.length, 1);
     assert.equal(fs.readFileSync(path.join(dir, siblings[0])).equals(original), true);
+  });
+});
+
+describe('renumber: sibling backup retention (G4)', () => {
+  const sessionId = 'session-kkkkkkkk-0010';
+
+  /** A log fixture plus pre-existing sibling copies named exactly the way the tool names them. */
+  function withBackups(stamps) {
+    const { dir, file } = fixtureFile(referenceLog(sessionId));
+    const original = fs.readFileSync(file);
+    for (const stamp of stamps) put(path.join(dir, `${path.basename(file)}.bak-${stamp}`), original);
+    return { dir, file, original };
+  }
+
+  it('keeps the newest N copies and prunes the oldest', () => {
+    const { file } = withBackups(['20260101T000000Z', '20260102T000000Z', '20260103T000000Z']);
+    const result = pruneRenumberBackups({ file, keep: 2 });
+    assert.equal(result.ok, true);
+    assert.equal(result.scanned, 3);
+    assert.equal(result.removed_count, 1);
+    assert.deepEqual(result.removed, ['session.v4.jsonl.zstd.bak-20260101T000000Z']);
+    assert.deepEqual(listRenumberBackups(file).map((row) => row.stamp), ['20260103T000000Z', '20260102T000000Z']);
+    assert.deepEqual(backupSiblings(file).sort(), ['session.v4.jsonl.zstd.bak-20260102T000000Z', 'session.v4.jsonl.zstd.bak-20260103T000000Z']);
+  });
+
+  it('a dry run reports the prune and deletes nothing', () => {
+    const { dir, file } = withBackups(['20260101T000000Z', '20260102T000000Z', '20260103T000000Z']);
+    const before = fs.readdirSync(dir).sort();
+    const result = pruneRenumberBackups({ file, keep: 1, dryRun: true });
+    assert.equal(result.dry_run, true);
+    assert.equal(result.removed_count, 2);
+    assert.deepEqual(fs.readdirSync(dir).sort(), before, 'a dry run is read-only');
+  });
+
+  it("never deletes the copy the current run wrote, even when an older clock put others ahead of it", () => {
+    const { dir, file } = fixtureFile(referenceLog(sessionId));
+    const original = fs.readFileSync(file);
+    for (const stamp of ['20990101T000000Z', '20990102T000000Z']) put(path.join(dir, `${path.basename(file)}.bak-${stamp}`), original);
+    const plan = planRenumber({ file, deleteSeqs: [2], ...STATIC_ONLY });
+    assert.equal(plan.ok, true, plan.detail);
+    const applied = applyRenumber({ plan, keepBackups: 1 });
+    assert.equal(applied.ok, true, applied.detail);
+    assert.equal(fs.existsSync(applied.backup_file), true, 'the way back of this run survives its own retention pass');
+    assert.equal(applied.pruned_backups.protected, applied.backup_file);
+    assert.equal(applied.pruned_backups.removed_count, 1, 'the older future-stamped copy is the one pruned');
+    assert.equal(backupSiblings(file).filter((name) => name.includes('2099')).length, 1);
+  });
+
+  it('keep=0 disables pruning entirely', () => {
+    const { file } = withBackups(['20260101T000000Z', '20260102T000000Z', '20260103T000000Z']);
+    const plan = planRenumber({ file, deleteSeqs: [2], ...STATIC_ONLY });
+    assert.equal(plan.ok, true, plan.detail);
+    const applied = applyRenumber({ plan, keepBackups: 0 });
+    assert.equal(applied.ok, true, applied.detail);
+    assert.equal(applied.pruned_backups.keep, 0);
+    assert.equal(applied.pruned_backups.removed_count, 0);
+    assert.equal(backupSiblings(file).length, 4, 'three pre-existing copies plus this run\'s');
+    assert.equal(DEFAULT_KEEP_RENUMBER_BACKUPS, 5);
+  });
+
+  it('apply defaults to keeping 5 copies (including the one it just wrote)', () => {
+    const { file } = withBackups(['20260101T000000Z', '20260102T000000Z', '20260103T000000Z', '20260104T000000Z', '20260105T000000Z', '20260106T000000Z']);
+    const plan = planRenumber({ file, deleteSeqs: [2], ...STATIC_ONLY });
+    assert.equal(plan.ok, true, plan.detail);
+    const applied = applyRenumber({ plan });
+    assert.equal(applied.ok, true, applied.detail);
+    assert.equal(applied.pruned_backups.keep, DEFAULT_KEEP_RENUMBER_BACKUPS);
+    assert.equal(applied.pruned_backups.removed_count, 2);
+    assert.equal(backupSiblings(file).length, DEFAULT_KEEP_RENUMBER_BACKUPS);
+    assert.equal(fs.existsSync(applied.backup_file), true);
+  });
+
+  it('exposes --keep-backups on the CLI (help, default apply, and a usage error for a bad value)', () => {
+    const help = execFileSync(process.execPath, [CLI, '--help'], { encoding: 'utf8' });
+    assert.match(help, /--keep-backups/u);
+
+    const bad = spawnSync(process.execPath, [CLI, 'renumber', '--file', 'x', '--keep-backups', 'abc'], { encoding: 'utf8' });
+    assert.equal(bad.status, 2);
+    assert.match(bad.stderr, /--keep-backups/u);
+
+    // The fixture must be one the installed Harness accepts: this CLI call is validated for real when one is
+    // installed, and this case is about retention, not about the runtime gate.
+    const { dir, file } = fixtureFile(runtimeValidSessionLog(sessionId));
+    const original = fs.readFileSync(file);
+    for (const stamp of ['20260101T000000Z', '20260102T000000Z']) put(path.join(dir, `${path.basename(file)}.bak-${stamp}`), original);
+    const insertFile = put(
+      path.join(dir, 'insert.json'),
+      JSON.stringify([{ atSeq: 2, event: { type: 'permission/preset', time: 1794842804377, data: { preset: 'workspace-write' } } }]),
+    );
+    const run = spawnSync(
+      process.execPath,
+      [CLI, 'renumber', '--file', file, '--insert-file', insertFile, '--allow-static-validation', '--keep-backups', '1'],
+      { encoding: 'utf8' },
+    );
+    assert.equal(run.status, 0, `${run.stderr}\n${run.stdout}`);
+    assert.match(run.stdout, /backups kept\s+: 1 of 3/u);
+    assert.equal(backupSiblings(file).length, 1, 'keep=1 leaves this run\'s copy and prunes the two older ones');
+    assert.equal(fs.readFileSync(file).equals(original), false);
   });
 });

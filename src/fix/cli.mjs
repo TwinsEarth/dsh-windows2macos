@@ -38,7 +38,7 @@ import { applyFix, groupTargets, listBackups, pendingFixes, restoreBackup, BACKU
 // Gate G4 lives in `src/backup/renumber.mjs`: the renumber tool is gated by the backup validator (static doctor +
 // future append + the installed Harness), so its one implementation sits with those gates instead of growing a
 // second validator here. The layer edge (`fix -> backup`) is declared in `scripts/layer-model.mjs`.
-import { applyRenumber, planRenumber } from '../backup/renumber.mjs';
+import { applyRenumber, DEFAULT_KEEP_RENUMBER_BACKUPS, planRenumber } from '../backup/renumber.mjs';
 
 const EXIT = { OK: 0, FAILED: 1, USAGE: 2, UNSUPPORTED_NODE: 2, REFUSED: 3 };
 
@@ -54,7 +54,7 @@ image attachment object referenced by its history has been deleted.
   node bin/w2m-fix.mjs fix [--apply]                append one image/offload event per broken session
   node bin/w2m-fix.mjs backups --session <part>     list the backups of one session
   node bin/w2m-fix.mjs restore --session <part> --apply   roll back from a backup
-  node bin/w2m-fix.mjs renumber --file <log> [--delete-seq <n>]... [--insert-file <json>] [--dry-run]
+  node bin/w2m-fix.mjs renumber --file <log> [--delete-seq <n>]... [--insert-file <json>] [--keep-backups <n>] [--dry-run]
                                                     delete/insert events, renumber seq densely, rewrite
                                                     every *Seq reference, validate, then write
 
@@ -73,6 +73,8 @@ Renumber options (gate G4; the ONLY legal way to delete or insert an event)
   --insert-file <json>    JSON file holding an array of {atSeq, event}; {atSeq} places the event
                           BEFORE the event currently at that seq (atSeq === event count appends)
   --dry-run               plan only: validate and report, write nothing
+  --keep-backups <n>      how many sibling .bak-<timestamp> copies to keep (default 5; 0 = keep all;
+                          the copy of the current run is never deleted)
   --allow-static-validation  accept static-only evidence when no Harness installation is found
                           (the report then says runtime_verified:false; the runtime verdict is the gate)
 
@@ -81,6 +83,8 @@ Renumber notes
     integer (or an array of integers) is rewritten old -> new. A reference to a deleted
     event is a refusal, never a guess.
   * every successful run first copies the log to <file>.bak-<timestamp>; that copy is the way back.
+  * the sibling copies are bounded by --keep-backups only after a successful write; this run's
+    copy is never pruned, and 0 disables pruning entirely.
   * the renumbered log is validated with the static doctor, the "next append still loads"
     simulation, and the installed Harness's own validator before anything is written.
 
@@ -105,7 +109,7 @@ function writeErr(text) {
  * @param {string[]} argv
  * @returns {{command: string, session: string|null, dshHome: string, stamp: string|null, apply: boolean,
  *   force: boolean, json: boolean, help: boolean, file: string|null, deleteSeqs: number[], insertFile: string|null,
- *   dryRun: boolean, allowStaticValidation: boolean, error: string|null}}
+ *   dryRun: boolean, allowStaticValidation: boolean, keepBackups: number, error: string|null}}
  */
 function parseArgs(argv) {
   const opts = {
@@ -122,6 +126,7 @@ function parseArgs(argv) {
     insertFile: null,
     dryRun: false,
     allowStaticValidation: false,
+    keepBackups: DEFAULT_KEEP_RENUMBER_BACKUPS,
     error: null,
   };
   const commands = new Set(['scan', 'fix', 'backups', 'restore', 'renumber']);
@@ -156,7 +161,21 @@ function parseArgs(argv) {
     else if (arg.startsWith('--insert-file=')) opts.insertFile = arg.slice('--insert-file='.length);
     else if (arg === '--dry-run') opts.dryRun = true;
     else if (arg === '--allow-static-validation') opts.allowStaticValidation = true;
-    else return { ...opts, error: `unknown argument: ${arg}` };
+    else if (arg === '--keep-backups') {
+      const raw = rest.shift() ?? '';
+      const value = Number(raw);
+      if (raw.trim() === '' || !Number.isSafeInteger(value) || value < 0) {
+        return { ...opts, error: `--keep-backups needs a non-negative integer, got ${JSON.stringify(raw)}` };
+      }
+      opts.keepBackups = value;
+    } else if (arg.startsWith('--keep-backups=')) {
+      const raw = arg.slice('--keep-backups='.length);
+      const value = Number(raw);
+      if (raw.trim() === '' || !Number.isSafeInteger(value) || value < 0) {
+        return { ...opts, error: `--keep-backups needs a non-negative integer, got ${JSON.stringify(raw)}` };
+      }
+      opts.keepBackups = value;
+    } else return { ...opts, error: `unknown argument: ${arg}` };
   }
   return opts;
 }
@@ -561,6 +580,10 @@ function formatRenumber(plan, applied) {
     return lines.join('\n');
   }
   lines.push(`backup        : ${applied.backup_file}`);
+  if (applied.pruned_backups !== null && applied.pruned_backups !== undefined) {
+    const pruned = applied.pruned_backups;
+    lines.push(`backups kept  : ${pruned.kept.length} of ${pruned.scanned} (pruned ${pruned.removed_count}; --keep-backups ${pruned.keep === 0 ? '0 = keep all' : pruned.keep})`);
+  }
   lines.push(`result        : wrote ${applied.bytes} byte(s) to the log`);
   lines.push(`sha256        : ${applied.sha256}`);
   return lines.join('\n');
@@ -578,7 +601,7 @@ function formatRenumber(plan, applied) {
 function runRenumber(opts) {
   if (opts.file === null || opts.file === '') {
     writeErr('renumber needs --file <path>');
-    writeErr('usage: node bin/w2m-fix.mjs renumber --file <session.v4.jsonl.zstd> [--delete-seq <n>]... [--insert-file <json>] [--dry-run]');
+    writeErr('usage: node bin/w2m-fix.mjs renumber --file <session.v4.jsonl.zstd> [--delete-seq <n>]... [--insert-file <json>] [--keep-backups <n>] [--dry-run]');
     return EXIT.USAGE;
   }
   let insert = [];
@@ -604,7 +627,7 @@ function runRenumber(opts) {
     writeErr(`error: renumber planning crashed: ${error?.message ?? String(error)}`);
     return EXIT.FAILED;
   }
-  const applied = plan.ok === true ? applyRenumber({ plan, dryRun: opts.dryRun === true }) : null;
+  const applied = plan.ok === true ? applyRenumber({ plan, dryRun: opts.dryRun === true, keepBackups: opts.keepBackups }) : null;
   const outcome = applied ?? plan;
 
   if (opts.json) {

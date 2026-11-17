@@ -358,6 +358,9 @@ plan  解块 → 运行时校验(G5) → 冲突分类 → 注册表计划       
 | **G4** seq 重编号工具 | v3.4.8 **本版不做**（还原只发布原始字节，从不删/插事件，所以不需要重编号）；2026-11-17 已补全为**独立工具** `src/backup/renumber.mjs` + `w2m-fix renumber`，见 §20 |
 | **G5** 校验用运行时同一份代码 | `runtime-validate.mjs` 用安装的 Harness 跑 `sessionFormatCatalog.createRestore(..., validation:'current')`；自写 doctor 只预筛，不单独作为证据 |
 
+> 2026-11-17 收口补记：G2 增加 `w2m-backup register` 一等公民入口（§22.1）；G3 的证据矩阵固化成测试（§22.2）；
+> G4 的 `.bak` 兄弟副本有了保留上限（§22.3）；G5 的面板可显式勾选运行时终审（§22.4）。
+
 ### 15.3 运行时校验：为什么是子进程
 
 Harness 的会话格式代码在 `resources/app.asar` 里，plain node 读不了。所以 node 侧只做两件事：
@@ -547,14 +550,16 @@ UI 半只有一个文件：`lib/client.js`（手写、由 `window.__ModuleLoader
 * **四类一键操作**：`run`（立即备份，`{confirm:'run',scope:'all'}`）、`restore`（先取计划 → 展示
   new/identical/differs 与勾选列表 → 二次危险确认 → `{confirm:'restore',apply:true,sessions}`）、
   `archive`（`{confirm:'archive',scope:'archived'|'all'}`）、`verify`（`GET /verify`，展示 counts/problems/
-  future_append/runtime）。操作期间按钮禁用、进度可见；失败可重试。
+  future_append/runtime；2026-11-17 起校验卡有「用安装的 Harness 终审（慢）」勾选框，勾上才请求
+  `GET /verify?runtime=1`，见 §22.4）。操作期间按钮禁用、进度可见；失败可重试。
 * **解锁卡**：`GET /unlock` 描述两条路径——本机信封按钮 `POST {confirm:'unlock'}`；密码路径**不在 HTTP 上传输**，
   面板显示终端命令 `w2m-backup unlock --check --password-stdin`。`BACKUP_NO_PERMISSION` 的文案为
   「没有权限：请用原账户登录，或输入解锁密码」（`account` 信封已按 spike 结论不做，见 §6/§15.5）。
 * **日志区**：当前页内最多 50 条操作记录（时间、结果码、detail），失败时同时显示错误卡。
 * **刷新**：挂载即读状态；之后 10 s 轮询只读状态（`typeof window !== 'undefined'` 守卫），页面卸载清定时器；
   每个操作完成后立即重读状态。
-* **i18n**：`panel.backup.*` 共 121 个键 × 中/英，随既有 `registerDictionaries` 注册（内联字典是该 bundle 的
+* **i18n**：`panel.backup.*` 共 123 个键 × 中/英（2026-11-17 增加 `verify.runtimeCounts` / `verify.runtimeHint`
+  两键，`verify.runtime` 改为勾选框标签，见 §22.4），随既有 `registerDictionaries` 注册（内联字典是该 bundle 的
   实际机制；`locale/*.json` 只是商店清单元数据）；34 个 reason-code 到文案的映射。
 * **主题**：只用宿主 `--dsw-alias-*` 设计令牌，无字面色值、无媒体查询（深浅色由宿主切换）；窄宽度用
   `auto-fit` 网格。
@@ -597,7 +602,8 @@ UI 半只有一个文件：`lib/client.js`（手写、由 `window.__ModuleLoader
   `runtime_future_append: {available, evidence:'installed-harness', checked, failed, sessions}`；默认关闭
   （171 MB 真实 home 会多花约 20 s），静态报告同时保留并标 `static-prefilter`。
 * **verify（`--runtime` / `GET /api/w2m/backup/verify?runtime=1`）**：对每个快照会话的**原日志与追加后日志**
-  同批终审，失败码 `BACKUP_RUNTIME_REJECTED` / `BACKUP_RUNTIME_APPEND_FAILED`。
+  同批终审，失败码 `BACKUP_RUNTIME_REJECTED` / `BACKUP_RUNTIME_APPEND_FAILED`。面板自 2026-11-17 起用勾选框
+  显式选择这条慢路径（§22.4）：默认不勾，报告只给标了 `static-prefilter` 的模拟结果——不勾就没有门禁级证据。
 * **批量与流式**：小 artifact 每约 96 MiB 一批；单会话 JSON 超过 32 MiB 走 NDJSON 流式 driver（真实 152 MB /
   370 MB 会话实测通过）；verdict 缓存按"安装身份 + 内容摘要"分键，避免拿另一份安装的结论复用。
 
@@ -783,4 +789,86 @@ plan 后文件变化拒绝覆盖、dry-run 零写入、CLI 退出码/帮助/真�
 `openRepo`+`rebuildFile` 完整性、`resolveMirrorRoot` 的路径段包含判定。`test/backup-run.test.mjs`：引擎传递与
 CLI `--max-old-days`/`--mirror` 解析。插件配置归一化在 `test/backup-run.test.mjs` 覆盖（`backupOldVersionDays` /
 `backupMirrorDir`）。
+
+## 22. G2/G3/G4/G5 收口补记（2026-11-17）
+
+v3.4.9 面板与 v3.5.0 非 UI 半之后，复盘门禁的四个"最后一段"补成可执行、可测试的入口。本节只记新增面与诚实边界，
+既有协议（§15–§21）不变。
+
+### 22.1 G2：`w2m-backup register` 一等公民入口（`src/backup/register.mjs`）
+
+2026-11-17 的现场修复是"手写脚本把磁盘上的会话加进 `workspace.json`"。那次脚本有两个缺陷：没有走 G2 协议
+（客户端门禁 + 回读 + 保存后复查），且用默认值重建 archived/pinned —— 把一个**已归档**的会话静默取消了归档。
+`register` 把这个动作变成一个具名命令，流水线就是 G2 的三半：
+
+```
+解析每个 --session 对应的磁盘目录（与 doctor 同一个 listSessionDirs 走法，工作区 slug 取路径段）
+  → 客户端门禁：客户端在跑就拒绝（BACKUP_CLIENT_RUNNING），除非 --allow-live-home
+  → 读注册表视图，取会话**当前**的 archived/pinned；已登记 = 该 id 完全 no-op（不重写，不可能改旗标）
+  → 复制 workspace.json 到 <DSH_HOME>/.w2m-restore-backups/register-<ts>/workspace.json（回退路径）
+  → 整次一个文档 planRegistryRestores → 原子写 → 回读校验（applyRegistryRestore）
+  → 可选 --registry-recheck <ms>：等一个客户端保存窗口后复查（recheckRegistry）
+```
+
+* 输入：`--session <id>`（可重复）、`--workspace-path <dir>`（**唯一**能创建/挂接未知工作区的方式）、
+  `--allow-live-home`、`--registry-recheck <ms>`、`--json`、`--dsh-home`、`--dry-run`。
+* 返回 `{ok, registered, already_registered, unknown, actions, verified, backup_file, recheck?}`；磁盘上找不到的
+  id 整单拒绝 `BACKUP_REGISTER_SESSION_MISSING` 并列出（register 只让已存在会话可见，不创建会话）。
+* 退出码与 restore 一致：0 成功、1 具名拒绝、2 用法错误。
+* 归档/置顶 = **读出来再写回**，绝不默认；已登记会话不进 plan，因此第二次运行是 no-op（`already_registered`），
+  连注册表副本都不写。`register-*` 目录只由 register 自己按份数保留（默认 10，0 = 全留，当前次副本永不删）；
+  `listPreRestoreSnapshots` 只认时间戳目录，restore 的保留策略不会把注册表副本算进去、也不会删它。
+* 测试：`test/backup-g2.test.mjs` 新增 8 条（登记 + 回读 + 副本、no-op、归档/置顶保持、未知工作区只在给
+  `--workspace-path` 时创建、未知 id 拒绝且零写入、副本保留、客户端门禁 + `--allow-live-home` + 复查、CLI 用法）。
+* 残余风险：与 restore 相同（§16 末）——复查窗口之间客户端仍可能再存一次。
+
+### 22.2 G3：一条证据测试覆盖每条"会改字节/改声明"的路径
+
+| 路径 | 证据断言（`test/backup-verify.test.mjs`） |
+|---|---|
+| restore 计划 | 每个候选的 `validation.future_append === true`，且 `runtime_verified === true`（安装 Harness 时；无安装则跳过） |
+| renumber 计划 | 结果带 `validation.future_append`（静态路径 = `true`，标 `static-prefilter`）；未来追加模拟失败时 plan 拒绝 `RENUMBER_STATIC_REJECTED` 且零写入 |
+| verify 报告 | `future_append.evidence === 'static-prefilter'`、`runtime_verified.evidence === 'installed-harness'`——报告不能把预筛当门禁（G5） |
+
+renumber 的"追加后日志失败"分支用 `planRenumber({futureAppendCheck})` 测试缝驱动：内存重编号的结果总是 dense、
+本身合法，单靠 fixture 造不出"医生过、追加模拟不过"的输入，所以缝是让这条拒绝分支可测的最小改动（生产不传）。
+
+### 22.3 G4：renumber 兄弟副本保留上限
+
+`applyRenumber` 每次成功都写 `<file>.bak-<timestamp>`，此前无上限。现在成功写入并回读校验后调用
+`pruneRenumberBackups({file, keep, dryRun, protect})`：
+
+* 只看本工具命名的副本（`<log>.bak-<YYYYMMDDTHHMMSSZ>[-<n>]`；`w2m-fix fix` 的 `.bak-<stamp>` 不匹配、不删）；
+* 按名字里的时间戳保留最新 `keep` 份，**当前次运行的副本用 `protect` 传入，永不删除**（plan 与 prune 之间时钟
+  漂移或别的写入者时间戳更新时，"改日志"不能变成"删掉回退路径"）；`0` = 全留；无法删除的旧副本留在列表里，
+  不把删除失败升级成写入失败；
+* 只在成功路径剪：失败路径保留全部副本（最新那份正是现场要用的）。
+* CLI：`w2m-fix renumber --keep-backups <n>`（默认 5，0 = 全留）；非负整数之外的用法错误退出 2。结果与人类输出
+  新增 `backups kept : N of M (pruned K; --keep-backups 5)`。测试：`test/fix-renumber.test.mjs` 新增 6 条（保留最新
+  N、dry-run 零删除、当前次副本永不删、keep=0、默认 5、CLI 解析/帮助/真实入口）。
+
+### 22.4 G5：面板勾选运行时终审（慢）
+
+校验卡新增一个**默认关闭**的勾选框（i18n `panel.backup.verify.runtime`，zh「用安装的 Harness
+终审（慢）」/ en `Runtime verdict with the installed Harness (slow)`），旁边一行提示
+`panel.backup.verify.runtimeHint`：会用安装的 Harness 逐条终审、可能耗时数分钟、本机必须已安装。勾上时
+`verifyNow` 请求 `GET /api/w2m/backup/verify?runtime=1`（宿主路由已支持，§19.2），不勾就是便宜的那条。结果区域
+仍显示 `runtime_verified` 计数（文案键改为 `panel.backup.verify.runtimeCounts`，原 `…verify.runtime` 已被勾选框
+标签使用）；问题列表里的稳定码经 `backupReasonText` 翻成可操作句子（`BACKUP_RUNTIME_UNAVAILABLE` /
+`BACKUP_RUNTIME_REJECTED` 本来就在映射表里）。校验卡改为常驻（之前结果为空时整卡不渲染），否则勾选框在点
+「全量校验」之前无处可点。面板 i18n 由 121 键增至 123 键（`…verify.runtimeCounts` 与 `…verify.runtimeHint` 为
+新增，`…verify.runtime` 为复用改文案）。测试：`test/client-bundle.test.mjs` 新增 1 条（未勾选只请求无参数 URL、
+勾选后请求 `?runtime=1`、默认关闭、中英字典有标签与提示、问题码走映射），既有 67 条保持通过（checkbox 计数
+按 `data-w2m-backup-session` 收窄）。
+
+### 22.5 诚实边界（本次不承诺的）
+
+* register 仍依赖客户端门禁与保存后复查；复查窗口之间的客户端保存仍可能覆盖（§16 末同一条残余风险）。
+  它也不提供宿主路由：登记一个 home 是带 home 路径的操作员动作，走离线 CLI。
+* 面板运行时勾选是 opt-in（慢）——默认的 `verify` 只给静态预筛，报告里的 `future_append` 永远标
+  `static-prefilter`；要"门禁级"证据必须勾选或有安装的 Harness 走 `--runtime`。
+* renumber 副本保留只处理**兄弟副本**；它不清理 `$DSH_HOME` 其它位置的副本，也不动 `old/` 版本记录（那是
+  §21 的保留策略）。
+* 本次不 bump 版本号、不跑 preflight、不提交；G2/G4 的新测试挂在既有套件上（`backup-g2` / `fix-renumber`），
+  没有新增测试文件，`package.json#scripts.test` 清单不变。
 

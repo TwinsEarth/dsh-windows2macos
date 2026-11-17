@@ -4,6 +4,44 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### G2/G3/G4/G5 收口补记（未发布）
+
+- **G2 `w2m-backup register`（`src/backup/register.mjs`）**：磁盘上已存在、注册表里没有的会话不再需要手写脚本——
+  `--session <id>`（可重复）经 `listSessionDirs` 定位（工作区 slug 取路径段），先过客户端门禁（在跑就拒绝，
+  `--allow-live-home` 才接受回读 + 保存后复查协议），把 `workspace.json` 复制到
+  `<DSH_HOME>/.w2m-restore-backups/register-<ts>/workspace.json`，整次一个文档 plan → 原子写 → 回读校验，可选
+  `--registry-recheck <ms>` 在客户端保存后再复查一次。已登记 id 是 no-op（不重写、不可能改旗标），archived/pinned
+  从注册表视图读出再写回（手写脚本用默认值把已归档会话取消归档——本次用测试钉死）；磁盘上找不到的 id 整单拒绝
+  `BACKUP_REGISTER_SESSION_MISSING` 并列出；未知工作区只能用 `--workspace-path` 创建/挂接。返回
+  `{ok, registered, already_registered, unknown, actions, verified, backup_file, recheck?}`；退出码 0/1/2 与 restore
+  一致。`register-*` 副本自身按份数保留（默认 10、0 = 全留、当前次永不删），`listPreRestoreSnapshots` 只认时间戳
+  目录，restore 的保留策略不会误删它们。
+- **G4 renumber 备份保留上限（`pruneRenumberBackups` + `w2m-fix renumber --keep-backups <n>`）**：成功 apply 后按
+  名字里的时间戳保留最新 N 份兄弟副本（默认 5，0 = 全留）；当前次运行的副本通过 `protect` 传入、永不删除
+  （时钟漂移时"改日志"不能变成"删回退路径"）；dry-run 与失败路径零删除；只匹配本工具命名的
+  `.bak-<YYYYMMDDTHHMMSSZ>[-<n>]`，不动 `w2m-fix fix` 的 `.bak-<stamp>` 副本。结果新增 `pruned_backups`，
+  人类输出新增 `backups kept : N of M (pruned K)`。
+- **G3 证据测试（`test/backup-verify.test.mjs`）**：一条 describe 覆盖每条会改字节/改声明的路径——restore 计划每个
+  候选 `validation.future_append === true` 且 `runtime_verified === true`（装 Harness 时；无安装跳过）；renumber 计划
+  携带 `validation.future_append`（静态 = `true`，标 `static-prefilter`），未来追加模拟失败时
+  `RENUMBER_STATIC_REJECTED` 且零写入（用 `planRenumber({futureAppendCheck})` 测试缝驱动，生产不传）；verify 的
+  `future_append.evidence === 'static-prefilter'`、`runtime_verified.evidence === 'installed-harness'`。
+- **G5 面板运行时终审勾选框（`lib/client.js`，备份面板最小 diff）**：校验卡增加默认关闭的
+  「用安装的 Harness 终审（慢）」勾选框（i18n `panel.backup.verify.runtime`）+ 提示
+  `panel.backup.verify.runtimeHint`（可能耗时数分钟、需已安装 Harness）；勾上时 `verifyNow` 请求
+  `GET /api/w2m/backup/verify?runtime=1`，不勾走便宜路径；结果仍显示 `runtime_verified` 计数（文案键改为
+  `panel.backup.verify.runtimeCounts`），问题码经既有 `backupReasonText` 映射。校验卡改为常驻，勾选框在第一次
+  校验前就可见。中英字典各新增两键（123 键）。
+- **文档**：`docs/BACKUP-DESIGN.md` §22（G2/G3/G4/G5 收口补记与诚实边界）并更新 §15.2/§18/§19 相邻注记；
+  `docs/DEV-PLAN-3.4.6-3.5.0.md` v3.5.0 实施记录附近新增指向 §22 的短记。
+- **测试**：`test/backup-g2.test.mjs` +8、`test/fix-renumber.test.mjs` +6、`test/backup-verify.test.mjs` +3、
+  `test/client-bundle.test.mjs` +1；套件清单不变（新用例挂在既有套件上），`npx eslint .`、`node
+  scripts/layer-check.mjs`、`node scripts/scan-mojibake.mjs`、`node scripts/pack.mjs` 全绿。
+- **诚实边界**：register 仍依赖客户端门禁 + 保存后复查（窗口之间客户端仍可能覆盖，§16 末同一风险），且刻意不提供
+  宿主路由（登记 home 是带路径的操作员动作，走离线 CLI）；面板运行时勾选是 **opt-in**（慢），不勾的 verify 只有
+  标了 `static-prefilter` 的模拟结果，不是门禁级证据；renumber 保留只处理兄弟副本，不清理 `$DSH_HOME` 其它位置、
+  也不动 `old/` 记录；本次不 bump 版本号、不跑 preflight、不提交。
+
 ### v3.5.0 版本治理、保留策略与异地副本（未发布）
 
 - **A 最低版本门禁（`MACHINE_VERSION_UNSUPPORTED`）**：新增 `src/plugin/version-gate.mjs`——唯一常量

@@ -459,8 +459,11 @@ function describeCoreRefusal(core) {
  * @param {{
  *   file: string, deleteSeqs?: number[], insert?: Array<{atSeq: number, event: object}>,
  *   allowStaticValidation?: boolean, harness?: object|null, env?: Record<string, string|undefined>,
- *   now?: Date,
+ *   now?: Date, futureAppendCheck?: Function,
  * }} input
+ *   `futureAppendCheck` is a test seam: production never passes it, and it must answer in the shape of
+ *   {@link futureAppendVerdict} (the gate G3 simulation). It exists so the "refuse when the appended log would
+ *   fail" branch is testable without handwriting a log that passes the doctor but not the append simulation.
  * @returns {object} a plan -- `ok:false` carries `reason_code`/`detail` and no bytes to write
  */
 export function planRenumber(input = {}) {
@@ -543,7 +546,8 @@ export function planRenumber(input = {}) {
   // Validation of the RESULT, never of the input: the edit can break a surface/seq rule even when the source was
   // healthy, and an unchanged result still has to be legal before the tool says "nothing to do".
   const requireRuntime = input.allowStaticValidation !== true;
-  const staticFuture = futureAppendVerdict(core.buffer);
+  const futureAppendCheck = typeof input.futureAppendCheck === 'function' ? input.futureAppendCheck : futureAppendVerdict;
+  const staticFuture = futureAppendCheck(core.buffer);
   const gate = validateCandidate({
     buffer: core.buffer,
     expectedSessionId: core.session_id ?? null,
@@ -622,21 +626,108 @@ function reserveBackupPath(planned) {
   throw new Error(`could not find a free backup name next to ${planned}`);
 }
 
+/** How many sibling `.bak-<timestamp>` copies are kept per log by default (0 = keep all). */
+export const DEFAULT_KEEP_RENUMBER_BACKUPS = 5;
+
+/** The matcher for the sibling copies this tool writes: `<log>.bak-<compact timestamp>[-<collision>]`. */
+function backupNameMatcher(file) {
+  const escaped = path.basename(file).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`^${escaped}\\.bak-(\\d{8}T\\d{6}Z)(?:-(\\d+))?$`);
+}
+
+/**
+ * List a log's sibling renumber copies, newest first by the timestamp in the name.
+ *
+ * Only names this tool writes are listed: the repair command's own copies are named `*.bak-<stamp>` **without** the
+ * trailing `Z`, so they do not match and are never pruned here. The timestamp is fixed-width, so it sorts
+ * lexicographically; the `-<n>` collision suffix is numeric.
+ *
+ * @param {string} file
+ * @returns {Array<{name: string, path: string, stamp: string, suffix: number}>}
+ */
+export function listRenumberBackups(file) {
+  const target = path.resolve(String(file));
+  const dir = path.dirname(target);
+  const matcher = backupNameMatcher(target);
+  let names = [];
+  try {
+    names = fs.readdirSync(dir).filter((name) => matcher.test(name));
+  } catch {
+    return [];
+  }
+  return names
+    .map((name) => {
+      const match = matcher.exec(name);
+      return { name, path: path.join(dir, name), stamp: match[1], suffix: match[2] === undefined ? 0 : Number(match[2]) };
+    })
+    .sort((a, b) => (a.stamp === b.stamp ? b.suffix - a.suffix : a.stamp > b.stamp ? -1 : 1));
+}
+
+/**
+ * Bound a log's sibling renumber copies: keep the newest `keep`, `0` keeps all.
+ *
+ * `applyRenumber` calls this after a successful write, because every run leaves a copy and a log edited daily for a
+ * year would otherwise leave 365 copies of itself. The copy of **this** run is passed as `protect` and is never
+ * deleted: a clock that moved between plan and prune (or another writer's newer timestamp) must not turn "edit the
+ * log" into "delete the way back". A copy that cannot be deleted is harmless and stays listed.
+ *
+ * @param {{file: string, keep?: number, dryRun?: boolean, protect?: string|null}} input
+ * @returns {{ok: boolean, keep: number, dry_run: boolean, scanned: number, kept: string[],
+ *   removed: string[], removed_count: number, protected: string|null}}
+ */
+export function pruneRenumberBackups(input = {}) {
+  const keep = Number.isSafeInteger(input.keep) && input.keep >= 0 ? input.keep : DEFAULT_KEEP_RENUMBER_BACKUPS;
+  const dryRun = input.dryRun === true;
+  const file = input.file === undefined || input.file === null ? null : path.resolve(String(input.file));
+  const protect = typeof input.protect === 'string' && input.protect !== '' ? path.resolve(input.protect) : null;
+  if (file === null) {
+    return { ok: false, keep, dry_run: dryRun, scanned: 0, kept: [], removed: [], removed_count: 0, protected: protect };
+  }
+  const backups = listRenumberBackups(file);
+  if (keep === 0) {
+    return { ok: true, keep: 0, dry_run: dryRun, scanned: backups.length, kept: backups.map((backup) => backup.name), removed: [], removed_count: 0, protected: protect };
+  }
+  const keepPaths = new Set(backups.slice(0, keep).map((backup) => backup.path));
+  if (protect !== null) keepPaths.add(protect);
+  const kept = [];
+  const removed = [];
+  for (const backup of backups) {
+    if (keepPaths.has(backup.path)) {
+      kept.push(backup.name);
+      continue;
+    }
+    if (dryRun) {
+      removed.push(backup.name);
+      continue;
+    }
+    try {
+      fs.rmSync(backup.path, { force: true });
+      removed.push(backup.name);
+    } catch {
+      kept.push(backup.name);
+    }
+  }
+  return { ok: true, keep, dry_run: dryRun, scanned: backups.length, kept, removed, removed_count: removed.length, protected: protect };
+}
+
 /**
  * Apply a planned renumber: copy the original to `<file>.bak-<timestamp>`, write the new bytes atomically, then
- * read the file back and verify both its digest and the doctor.
+ * read the file back and verify both its digest and the doctor. On success the sibling copies are bounded to
+ * `keepBackups` (default {@link DEFAULT_KEEP_RENUMBER_BACKUPS}, `0` = keep all); this run's own copy is never
+ * pruned.
  *
- * @param {{plan: object, dryRun?: boolean}} input
+ * @param {{plan: object, dryRun?: boolean, keepBackups?: number}} input
  * @returns {{
  *   ok: boolean, dry_run: boolean, changed: boolean, file: string|null, backup_file: string|null,
  *   bytes: number, mapping_changes: number, rewritten_references: number, sha256: string|null,
- *   reason_code: string|null, detail: string, duration_ms: number,
+ *   pruned_backups: object|null, reason_code: string|null, detail: string, duration_ms: number,
  * }}
  */
 export function applyRenumber(input = {}) {
   const started = Date.now();
   const plan = input.plan;
   const dryRun = input.dryRun === true;
+  const keepBackups = Number.isSafeInteger(input.keepBackups) && input.keepBackups >= 0 ? input.keepBackups : DEFAULT_KEEP_RENUMBER_BACKUPS;
   const mappingChanges = plan?.mapping !== null && typeof plan?.mapping === 'object' ? Object.keys(plan.mapping).length : 0;
   const base = {
     ok: false,
@@ -648,6 +739,7 @@ export function applyRenumber(input = {}) {
     mapping_changes: mappingChanges,
     rewritten_references: Number.isSafeInteger(plan?.rewritten_references) ? plan.rewritten_references : 0,
     sha256: null,
+    pruned_backups: null,
     reason_code: null,
     detail: '',
     duration_ms: 0,
@@ -792,6 +884,9 @@ export function applyRenumber(input = {}) {
     };
   }
 
+  // Bound the sibling copies only after the write is proven: a failure path keeps every copy (the newest one is
+  // the state the operator needs right then), and the copy this run just wrote is protected by name.
+  const pruned = pruneRenumberBackups({ file: plan.file, keep: keepBackups, protect: backupFile });
   return {
     ...base,
     ok: true,
@@ -799,7 +894,10 @@ export function applyRenumber(input = {}) {
     backup_file: backupFile,
     bytes: written.length,
     sha256: writtenSha,
-    detail: `wrote ${written.length} byte(s); the original is preserved at ${backupFile}`,
+    pruned_backups: pruned,
+    detail:
+      `wrote ${written.length} byte(s); the original is preserved at ${backupFile}` +
+      (pruned.removed_count > 0 ? ` (pruned ${pruned.removed_count} older copy/copies, kept ${pruned.kept.length})` : ''),
     duration_ms: Date.now() - started,
   };
 }
