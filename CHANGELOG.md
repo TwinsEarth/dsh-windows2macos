@@ -4,6 +4,19 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### 备份引擎、22:00 定时与旧版本轮转（v3.4.7）
+
+- 新增 `src/backup/engine.mjs`：一次备份 = 锁 → 建库 → 开 KEK → 扫描 → 按 scope 选会话 → 写缺失块（内容寻址去重）→ 提交快照 → 轮转。第二次未改动备份 `blocks_new = 0`（单测断言），备份前后源目录字节与 mtime 不变。
+- 新增 `src/backup/keystore.mjs` + `src/backup/machine-key.mjs`：仓库级随机 DEK（权威 `<root>/keys.json`，每个快照存副本以便独立还原）；默认 `machine`（Windows DPAPI，本机实测 round-trip）+ `password` 双信封；两者皆无时 `BACKUP_NO_PERMISSION`，**绝不写一个打不开的仓库**。
+- 新增 `src/backup/locks.mjs`：`tmp/backup.lock` 以 `wx` 原子创建；死 pid / 超龄 / 不可读三种回收；只释放自己的锁。第二个写入者得到 `BACKUP_LOCKED`（含持有者信息）。
+- 新增 `src/backup/atomic.mjs`：tmp 同目录 → 写入 → **fsync** → rename；内容地址只在字节落盘后出现，避免"名字在、字节不完整"的块被永久跳过。
+- 新增 `src/backup/rotation.mjs`：只有内容 sha256 变化才记 `old/<ws>/<sid>/<ts>-<sha12>.json`（**可还原记录**，不是整文件加密副本——副本会与内容寻址去重重复存储）；每会话默认保留 10 份，`current/` 存指针。
+- 新增 `src/backup/gc.mjs`：引用根 = 快照清单 + old 记录 + current 指针；删除无引用块并裁剪 old 窗口；**任一引用不可读即 `BACKUP_GC_UNSAFE`，一个字节都不删**；`--dry-run` 只报告。
+- 新增 `src/backup/schedule.mjs` + `src/plugin/backup.mjs` + `lib/backup.js`：默认 **22:00 Asia/Shanghai**（`backupTimes`/`backupTimeZone` 可改），睡眠跨时段只补跑一次，定时器由 `ctx.effect` 拥有、卸载即停；`dsh-backup` 子插件行随包发布但 `disabled: true`（启用它才意味着"定时器可以写盘"）；`GET/POST /api/w2m/backup/run`，POST 必须带 `{"confirm":"run"}`。
+- CLI：`w2m-backup run|list|gc`（`--scope` / `--session` / `--keep-old` / `--dry-run` / `--password-stdin` / `--no-machine-key`）；密码只经 stdin 或环境变量，绝不进 argv。
+- 时区日历算术抽到 `src/util/daily-clock.mjs`，自更新检查与备份计划共用一份（两份实现会在换夏令时那天给出不同答案）。
+- 新增 6 个测试套件：引擎（去重/增量/scope/拒绝）、轮转（记录/窗口/dry-run）、gc（孤儿/引用/拒绝）、锁（并发/回收/释放）、调度（默认值/精确时刻/补跑）、子插件+CLI（确认令牌/生命周期/离线 run）。
+
 ### 备份地基（v3.4.6）：协议冻结、只读勘察、加密自检
 
 - 新增 `docs/BACKUP-DESIGN.md`：仓库布局、清单 v1 字段表、4 MiB 定长块、三信封加密（账户/本机/密码）、错误码表、排除项理由、版本兼容承诺，以及 2026-11-17 复盘门禁 G1–G5 的落点。

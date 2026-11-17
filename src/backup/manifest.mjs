@@ -275,7 +275,9 @@ export function buildManifest(input) {
   const files = [];
   for (const row of input.sessions ?? []) {
     const rel = normalizeRelPath(row.rel);
-    const description = describeFile(row.file, { blockSize });
+    // A caller that already read the file (the engine splits it into blocks to write) passes `description`
+    // so the bytes are not read twice; a caller that has not (tests, dry tooling) lets this module read them.
+    const description = row.description ?? describeFile(row.file, { blockSize });
     files.push({
       rel,
       kind: 'session',
@@ -295,7 +297,7 @@ export function buildManifest(input) {
   }
   for (const row of input.attachments ?? []) {
     const rel = normalizeRelPath(row.rel);
-    const description = describeFile(row.file, { blockSize });
+    const description = row.description ?? describeFile(row.file, { blockSize });
     files.push({
       rel,
       kind: 'attachment',

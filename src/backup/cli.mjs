@@ -1,25 +1,35 @@
 #!/usr/bin/env node
 /**
- * `w2m-backup` command line: `status`, `scan`, `selftest`.
+ * `w2m-backup` command line: `status`, `scan`, `selftest`, `run`, `list`, `gc`.
  *
- * ## What this CLI is (and is not) in v3.4.6
+ * ## What this CLI is
  *
- * It is the operator's read-only window onto the backup substrate: where the repository would be, whether it
- * exists, what a backup would copy, and whether the cryptography on *this* machine actually round-trips. It is
- * **not** a backup command yet -- `run` arrives in v3.4.7 with the engine. Every command here is safe to run
- * on a live machine: nothing is created, nothing is modified, and `selftest` only touches memory.
+ * The operator's window onto the backup repository. In v3.4.6 it was read-only (`status`/`scan`/`selftest`);
+ * v3.4.7 adds the commands that write, and they are all **explicit**: `run` performs one backup now, `list`
+ * reads snapshots, `gc` removes unreferenced blocks. The scheduled path (daily 22:00) lives in the subplugin, not
+ * here: a CLI process that exits cannot own a timer, and a scheduled backup must not depend on a terminal.
+ *
+ * ## What it never does
+ *
+ * No command stores a password. `run --password-stdin` reads it from stdin (never argv: a password in argv is in
+ * the shell history and in every process listing), and the environment variable `W2M_BACKUP_PASSWORD` is accepted
+ * for scripted use. Without either, the run opens the repository with the machine envelope only.
  *
  * Exit codes: 0 success; 1 a named refusal (the code is printed); 2 usage error.
  */
 
+import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { BackupLayoutError, LAYOUT_CODES } from './layout.mjs';
+import { BackupLayoutError, LAYOUT_CODES, resolveBackupDir } from './layout.mjs';
 import { scanHome } from './scan.mjs';
 import { selftest } from './crypto.mjs';
 import { buildManifest, manifestDigest, manifestSummary } from './manifest.mjs';
 import { buildStatus } from './routes.mjs';
+import { runBackup, SCOPES } from './engine.mjs';
+import { gc } from './gc.mjs';
+import { openRepo } from './repo.mjs';
 
 /** Human-readable bytes: `172.0 MB`, `1.2 GB`. */
 export function humanBytes(bytes) {
@@ -42,6 +52,9 @@ function usage() {
     '  status              where the repository is, whether it exists, free space (read-only)',
     '  scan                what a backup would copy: sessions, registry flags, attachments (read-only)',
     '  selftest            wrap/unwrap and tamper self-test of the backup cryptography (memory only)',
+    '  run                 perform one backup now (writes blocks, a snapshot and rotation records)',
+    '  list                snapshots in the repository, newest first (read-only)',
+    '  gc                  remove unreferenced blocks and prune old versions (writes)',
     '  help                this text',
     '',
     'options:',
@@ -51,8 +64,14 @@ function usage() {
     '  --deep              decompress every session log (event counts; slower)',
     '  --hash              hash every file (sha256; slower)',
     '  --manifest          build the in-memory manifest and print its digest (no writes)',
+    '  --scope <s>         run: all | active | archived | selected (default: all)',
+    '  --session <id>      run --scope selected: a session id to include (repeatable)',
+    '  --keep-old <n>      old versions kept per session (default: 10)',
+    '  --dry-run           run/gc: report what would happen, write nothing',
+    '  --password-stdin    run: read the unlock password from stdin (never argv)',
+    '  --no-machine-key    run: do not use (or create) the OS-keystore machine envelope',
     '',
-    'read-only: v3.4.6 ships no command that writes a repository.',
+    'scheduling: the daily run lives in the dsh-backup subplugin (default 22:00 Asia/Shanghai), not in this CLI.',
   ].join('\n');
 }
 
@@ -71,6 +90,12 @@ export function parseArgs(argv, env = process.env) {
     deep: false,
     hash: false,
     manifest: false,
+    scope: null,
+    selected: [],
+    keepOld: null,
+    dryRun: false,
+    passwordStdin: false,
+    noMachineKey: false,
   };
   const rest = [...argv];
   if (rest.length > 0 && !rest[0].startsWith('-')) options.command = rest.shift();
@@ -80,11 +105,23 @@ export function parseArgs(argv, env = process.env) {
     else if (arg === '--deep') options.deep = true;
     else if (arg === '--hash') options.hash = true;
     else if (arg === '--manifest') options.manifest = true;
-    else if (arg === '--help' || arg === '-h') options.command = 'help';
+    else if (arg === '--dry-run') options.dryRun = true;
+    else if (arg === '--password-stdin') options.passwordStdin = true;
+    else if (arg === '--no-machine-key') options.noMachineKey = true;
+    else if (arg === '--scope') options.scope = rest.shift() ?? null;
+    else if (arg === '--session') options.selected.push(rest.shift() ?? '');
+    else if (arg === '--keep-old') {
+      const raw = rest.shift() ?? '';
+      const value = Number(raw);
+      if (!Number.isSafeInteger(value) || value < 0) return { ...options, error: `--keep-old needs a non-negative integer, got ${JSON.stringify(raw)}` };
+      options.keepOld = value;
+    } else if (arg === '--help' || arg === '-h') options.command = 'help';
     else if (arg === '--dsh-home') options.dshHome = path.resolve(rest.shift() ?? options.dshHome);
     else if (arg === '--backup-dir') options.backupDir = path.resolve(rest.shift() ?? '');
     else if (arg.startsWith('--dsh-home=')) options.dshHome = path.resolve(arg.slice('--dsh-home='.length));
     else if (arg.startsWith('--backup-dir=')) options.backupDir = path.resolve(arg.slice('--backup-dir='.length));
+    else if (arg.startsWith('--scope=')) options.scope = arg.slice('--scope='.length);
+    else if (arg.startsWith('--session=')) options.selected.push(arg.slice('--session='.length));
     else return { ...options, error: `unknown argument: ${arg}` };
   }
   return options;
@@ -175,6 +212,97 @@ export function formatSelftest(result) {
   lines.push('');
   lines.push(result.ok ? 'result: OK — this machine can wrap and unwrap the backup key' : `result: FAILED (${result.code})`);
   return lines.join('\n');
+}
+
+/** Render a backup run summary for a terminal. */
+export function formatRun(result) {
+  const lines = ['w2m-backup run', ''];
+  if (result.ok !== true) {
+    lines.push(`refused       : ${result.reason_code}${result.detail === undefined ? '' : ` — ${result.detail}`}`);
+    return lines.join('\n');
+  }
+  const dry = result.dry_run === true;
+  lines.push(`mode          : ${dry ? 'dry run (nothing written)' : 'committed'}`);
+  lines.push(`scope         : ${result.scope}${result.skipped_sessions > 0 ? ` (${result.skipped_sessions} session(s) skipped by scope)` : ''}`);
+  lines.push(`snapshot      : ${result.snapshot_id}${dry ? ' (not committed)' : ''}`);
+  if (result.digest !== undefined) lines.push(`digest        : ${result.digest}`);
+  lines.push(`sessions      : ${result.sessions}`);
+  lines.push(`files         : ${result.files} (${humanBytes(result.bytes)})`);
+  lines.push(`blocks        : ${result.blocks_new} new, ${result.blocks_reused} reused (dedupe ${(result.dedupe_ratio * 100).toFixed(0)}%)`);
+  lines.push(`bytes         : read ${humanBytes(result.bytes_read)}, written ${humanBytes(result.bytes_written)}`);
+  if (result.rotated !== undefined) lines.push(`rotated       : ${result.rotated} old version(s) recorded`);
+  if (result.unlocked_via !== undefined) {
+    lines.push(`unlocked via  : ${result.unlocked_via}${result.key_created === true ? ' (repository key created)' : ''}`);
+  }
+  lines.push(`duration      : ${result.duration_ms} ms`);
+  if (Array.isArray(result.unknown_selected) && result.unknown_selected.length > 0) {
+    lines.push(`unknown ids   : ${result.unknown_selected.join(', ')}`);
+  }
+  return lines.join('\n');
+}
+
+/** Render the snapshot list for a terminal. */
+export function formatList(state) {
+  const lines = ['w2m-backup list', ''];
+  lines.push(`repository    : ${state.root}`);
+  lines.push(`initialized   : ${state.initialized ? 'yes' : 'no'}`);
+  if (state.initialized !== true) return lines.join('\n');
+  lines.push(`snapshots     : ${state.snapshots.length}`);
+  if (state.snapshots.length > 0) {
+    lines.push('');
+    lines.push('snapshot                          created_at                sessions  files        size  digest');
+    for (const row of state.snapshots) {
+      const manifest = row.manifest;
+      lines.push(
+        `${row.snapshot_id.padEnd(33)} ${String(manifest?.created_at ?? '?').padEnd(24)} ` +
+          `${String(manifest?.sessions ?? '?').padStart(8)} ${String(manifest?.files ?? '?').padStart(6)} ` +
+          `${humanBytes(manifest?.session_bytes ?? 0).padStart(11)}  ${String(row.digest ?? (row.valid === false ? 'INVALID' : '?')).slice(0, 16)}`,
+      );
+    }
+  }
+  const index = state.index;
+  lines.push('');
+  lines.push(`index         : ${index.entries} entr(ies)${index.torn_tail ? ', TORN tail' : ''}${index.problems > 0 ? `, ${index.problems} problem(s)` : ''}`);
+  return lines.join('\n');
+}
+
+/** Render a gc result for a terminal. */
+export function formatGc(result) {
+  const lines = ['w2m-backup gc', ''];
+  if (result.safe !== true) {
+    lines.push(`refused       : ${result.reason_code} — ${result.problems.length} unreadable reference(s); nothing was deleted`);
+    for (const problem of result.problems.slice(0, 10)) lines.push(`  ${problem.file}: ${problem.detail}`);
+    return lines.join('\n');
+  }
+  lines.push(`mode          : ${result.dry_run ? 'dry run (nothing deleted)' : 'applied'}`);
+  lines.push(`references    : ${result.references.blocks} block(s) from ${result.references.snapshots} snapshot(s), ${result.references.old} old version(s), ${result.references.current} current pointer(s)`);
+  lines.push(`blocks        : ${result.blocks.scanned} scanned, ${result.blocks.removed} removed, ${result.blocks.kept} kept (${humanBytes(result.blocks.reclaimed_bytes)} reclaimed)`);
+  lines.push(`old versions  : ${result.old_versions.pruned} pruned by the retention window`);
+  return lines.join('\n');
+}
+
+/** Read the unlock password from the injected value, stdin, or the environment (never from argv). */
+function passwordFor(options, io) {
+  if (typeof io.password === 'string') return io.password;
+  if (options.passwordStdin === true) {
+    try {
+      return fs.readFileSync(0, 'utf8').replace(/\r?\n$/, '');
+    } catch {
+      return '';
+    }
+  }
+  const fromEnv = (io.env ?? process.env).W2M_BACKUP_PASSWORD;
+  return typeof fromEnv === 'string' && fromEnv.length > 0 ? fromEnv : null;
+}
+
+/** Resolve the repository root, or report the layout refusal. */
+function resolveDir(options, env) {
+  try {
+    return { ok: true, dir: resolveBackupDir({ explicit: options.backupDir, env }) };
+  } catch (error) {
+    if (error instanceof BackupLayoutError) return { ok: false, error };
+    throw error;
+  }
 }
 
 /**
@@ -285,6 +413,56 @@ export function main(argv, io = {}) {
       }
     }
     return 0;
+  }
+
+  if (options.command === 'run') {
+    if (options.scope !== null && !SCOPES.includes(options.scope)) {
+      writeErr(`error: --scope must be one of ${SCOPES.join(', ')}\n\n${usage()}`);
+      return 2;
+    }
+    const resolved = resolveDir(options, env);
+    if (resolved.ok !== true) {
+      writeErr(`${resolved.error.code}: ${resolved.error.detail}`);
+      return 1;
+    }
+    const result = runBackup({
+      root: resolved.dir,
+      dshHome: options.dshHome,
+      scope: options.scope ?? 'all',
+      selected: options.selected,
+      keepOldPerSession: options.keepOld ?? undefined,
+      dryRun: options.dryRun,
+      password: passwordFor(options, io),
+      machineKey: options.noMachineKey === true || (io.env ?? process.env).W2M_BACKUP_NO_MACHINE_KEY === '1' ? false : undefined,
+    });
+    write(options.json ? JSON.stringify(result, null, 2) : formatRun(result));
+    return result.ok === true ? 0 : 1;
+  }
+
+  if (options.command === 'list') {
+    const resolved = resolveDir(options, env);
+    if (resolved.ok !== true) {
+      writeErr(`${resolved.error.code}: ${resolved.error.detail}`);
+      return 1;
+    }
+    const state = openRepo({ root: resolved.dir, dshHome: options.dshHome, full: true });
+    write(options.json ? JSON.stringify(state, null, 2) : formatList(state));
+    return 0;
+  }
+
+  if (options.command === 'gc') {
+    const resolved = resolveDir(options, env);
+    if (resolved.ok !== true) {
+      writeErr(`${resolved.error.code}: ${resolved.error.detail}`);
+      return 1;
+    }
+    const result = gc({
+      root: resolved.dir,
+      dryRun: options.dryRun,
+      keepOldPerSession: options.keepOld ?? undefined,
+    });
+    write(options.json ? JSON.stringify(result, null, 2) : formatGc(result));
+    return result.ok === true ? 0 : 1;
   }
 
   if (options.command === 'selftest') {

@@ -30,13 +30,20 @@
 <root>/backup.json                             描述符：format/version/block_size/cipher（明文）
 <root>/objects/<aa>/<sha256>                   内容寻址的加密块（去重单元，明文块哈希命名）
 <root>/snapshots/<snapshot_id>/manifest.json   路径/大小/时间/哈希（明文，不含消息正文）
-<root>/snapshots/<snapshot_id>/keys.json       被包裹的 DEK 信封（明文，含 KDF 参数）
-<root>/current/<workspace>/<session>/...       每个会话文件的最新版本（加密块引用）
-<root>/old/<workspace>/<session>/<ts>-<sha12>.zst.enc   被取代的历史版本（v3.4.7 轮转）
-<root>/archive/<date>/archived-sessions-<ts>.tar.zst    归档会话打包（v3.4.8）
+<root>/keys.json                               仓库级 DEK 的加密信封（权威副本；v3.4.7）
+<root>/snapshots/<snapshot_id>/keys.json       同一份信封的副本（快照可独立还原）
+<root>/current/<workspace>/<session>.json      当前版本指针：rel/sha256/blocks/snapshot_id
+<root>/old/<workspace>/<session>/<ts>-<sha12>.json   被取代版本的可还原记录（v3.4.7 轮转）
+<root>/archive/<date>/archived-sessions-<ts>.tar.zst 归档会话打包（v3.4.8）
 <root>/index.jsonl                             追加式快照日志：只有 id 与计数，没有路径
-<root>/tmp/                                    临时区，随时可删
+<root>/tmp/                                    临时区；backup.lock 也在这里（单写者锁）
 ```
+
+**v3.4.7 对布局的三处细化**（协议还没发布，在 v1 内提前定稿并记录理由）：
+
+1. **DEK 属于仓库，不属于快照**：块是内容寻址的，跨快照复用（一个会话增长 10%，其余块全部复用）要求新旧快照能用同一把钥匙解密。所以 DEK 在首次运行生成，权威信封存 `<root>/keys.json`，每个快照再存一份**副本**——副本让"一个 snapshot 目录 + objects/"可以独立还原，代价只是每个快照多几百字节。
+2. **`old/` 存可还原记录，不存整文件加密副本**：整文件副本（原计划的 `.zst.enc`）会把同一份字节在 `objects/` 之外再存一遍，114 MB 的会话每天变化就会为十份保留窗口累积 1.1 GB——正好抵消内容寻址去重。记录里只有 rel/size/sha256/blocks/snapshot_id，还原时从 `objects/` 取字节，体积为几百字节。
+3. **`current/` 存指针，不存副本**：同上；"这个会话现在是哪个版本"是一个指针问题。
 
 默认根目录：Windows `D:\DeepSeekHarness\BackUP`；其它平台 `~/DSH-BackUP`。优先级：显式配置 > `W2M_BACKUP_DIR` > 平台默认。
 
@@ -165,6 +172,7 @@
 3. **GCM 分不清"密码错"和"文件被改"**：两者都是 `BACKUP_DECRYPT_AUTH_FAILED` / `BACKUP_KEY_UNWRAP_FAILED`，文案必须同时说明两种可能。**不允许**在代码或 UI 里断言"密码错误"。
 4. **正文块**：`objects/<aa>/<sha256>` 是 `W2MBLOB1 | nonce | ciphertext | tag`，AAD = `w2m-session-backup/object|<plaintext sha256>|<plaintext length>`；打开后再校验 `sha256(明文) == 文件名`。块被搬到别的哈希位上会认证失败。
 5. **DLQ/自检**：`w2m-backup selftest` 在**用户自己的机器上**跑一遍真实 wrap/unwrap + 三种必须失败的篡改，建库前必须先绿。
+6. **仓库级 DEK（v3.4.7 定稿）**：一把随机 DEK 服务整个仓库（见 §3 细化 1）；信封仍是 `account`/`machine`/`password` 三种，默认写 `machine`（可用时）+ `password`（提供时）。**至少一个信封可用才允许建库**，否则 `BACKUP_NO_PERMISSION`——写一个谁也打不开的仓库比不写更糟。定时任务没有密码可输，只能走 `machine` 信封；没有 OS keystore 的平台会具名拒绝（`BACKUP_NO_PERMISSION`），人工路径是 `w2m-backup run --password-stdin`（密码只经 stdin/env，绝不进 argv）。
 
 ## 7. 门禁（来自 2026-11-17 复盘，必须接进还原路径）
 
@@ -198,7 +206,7 @@
 4. 加密参数（scrypt N/r/p、salt）**永远随文件**，不是程序常量；算法替换 = 新 `cipher`/`kdf.algo` 值，旧文件继续可读。
 5. 任何协议字段变更必须同时改：本文、`test/backup-protocol.test.mjs`、`docs/DEV-PLAN` 的版本计划。
 
-## 10. 组件边界（v3.4.6 实际交付）
+## 10. 组件边界（v3.4.7）
 
 | 模块 | 职责 | 写盘？ |
 |---|---|---|
@@ -207,9 +215,19 @@
 | `src/backup/manifest.mjs` | 清单 schema、块切分、路径规范化、严格校验、摘要 | 只读源文件 |
 | `src/backup/crypto.mjs` | scrypt/hkdf 派生、AES-256-GCM 封包、三信封、块对象、`selftest` | **绝不**（纯内存） |
 | `src/backup/repo.mjs` | 快照 id、快照两文件、`index.jsonl` 行格式与读写、`commitSnapshot`、只读 `openRepo` | 仅 `commitSnapshot`/`appendIndex` 会写（测试与 v3.4.7 引擎；路由与 CLI 不调用） |
-| `src/backup/routes.mjs` | `GET /api/w2m/backup/status`、`GET /api/w2m/backup/scan` | **绝不** |
-| `src/backup/cli.mjs` + `bin/w2m-backup.mjs` | `status` / `scan` / `selftest`（`scan --manifest` 在内存里构建清单） | **绝不** |
+| `src/backup/engine.mjs` | `runBackup`：锁 → 建库 → 开 KEK → 扫描 → 按 scope 选会话 → 写缺失块（去重）→ 提交快照 → 轮转 | 会写（这是引擎） |
+| `src/backup/rotation.mjs` | `current/` 指针、`old/` 版本记录、每会话保留窗口 | 会写 |
+| `src/backup/gc.mjs` | 引用收集（快照 + old + current）、孤儿块删除、old 保留窗口；任一引用不可读即**拒绝删除** | 会写（`dryRun` 时只读） |
+| `src/backup/locks.mjs` | `tmp/backup.lock`：`wx` 原子创建、死 pid/超龄/不可读三种回收、只释放自己的锁 | 只写锁文件 |
+| `src/backup/atomic.mjs` | `writeFileAtomic`（tmp → fsync → rename）、`writeJsonAtomic`、`readJsonSafe` | 会写 |
+| `src/backup/keystore.mjs` | 打开/创建仓库 DEK：machine + password 信封，二者皆无则 `BACKUP_NO_PERMISSION` | 写 `keys.json` |
+| `src/backup/machine-key.mjs` | 32B 随机机器秘密 + OS 钥匙串（Windows DPAPI，实测 round-trip）；macOS/Linux 明确 `unavailable` | 写 `$DSH_HOME/xclient/backup/machine.key` |
+| `src/backup/schedule.mjs` | 备份计划配置（默认 22:00 Asia/Shanghai）、时间/时区严格校验、next/missed 计算 | **绝不** |
+| `src/plugin/backup.mjs` + `lib/backup.js` | `dsh-backup` 子插件：`ctx.effect` 拥有的定时器 + `GET/POST /api/w2m/backup/run`（POST 需 `{"confirm":"run"}`） | 经引擎写 |
+| `src/backup/routes.mjs` | `GET /api/w2m/backup/status`、`GET /api/w2m/backup/scan`（只读，主插件挂载） | **绝不** |
+| `src/backup/cli.mjs` + `bin/w2m-backup.mjs` | `status` / `scan` / `selftest` / `run` / `list` / `gc`（`scan --manifest` 在内存里构建清单） | `run`/`gc` 经引擎写；其余只读 |
 | `src/util/dsh-workspace.mjs` | `workspace.json` 解析，doctor 与 scan **共用一份** | **绝不** |
+| `src/util/daily-clock.mjs` | 时区日历算术（解析/下一班/漏班），更新检查与备份计划**共用一份** | **绝不** |
 
 **接线决策（与计划的一次偏差，记录原因）**：计划原写"v3.4.6 在 `cordis.patch.yml` 增加 `dsh-backup` 行、默认 disabled"。实际改为**由主插件挂只读路由**，`dsh-backup` 子插件行推迟到 v3.4.7 与引擎一起引入。理由：只读路由没有需要"关掉"的副作用，而一个默认关闭的行会让状态卡片在默认配置下直接报"未启用"——把可用功能藏起来。子插件真正有意义是在**它可能写盘**之后（定时器、还原、打包）。
 
@@ -231,11 +249,57 @@
 | **`BACKUP_NO_PERMISSION`** | **没有权限：请用原账户登录，或输入解锁密码**（v3.4.8 解锁失败的统一对外码） |
 | `BACKUP_SELFTEST_FAILED` | 加密自检未通过：这台机器上的备份不可信 |
 | `MANIFEST_*` | 清单校验失败（具体到字段路径，供诊断用） |
+| `BACKUP_LOCKED` | 另一个备份正在运行（含持有者 pid/主机/开始时间） |
+| `BACKUP_BUSY` | 本进程内已有一次备份在跑 |
+| `BACKUP_CONFIRM_REQUIRED` | 面板请求缺少 `{"confirm":"run"}` 确认令牌 |
+| `BACKUP_SCOPED_NOTHING` | 选定的范围没有匹配到任何会话（含未知 session id） |
+| `BACKUP_SCOPE_INVALID` | scope 不是 all/active/archived/selected |
+| `BACKUP_WRITE_FAILED` / `BACKUP_DISK_FULL` | 写入失败 / 卷已满 |
+| `BACKUP_GC_UNSAFE` | 有引用不可读，**拒绝删除任何块** |
+| `BACKUP_SCHEDULE_TIME_INVALID` / `BACKUP_SCHEDULE_ZONE_INVALID` | 计划时间/时区配置非法 |
 
 ## 12. 未决问题
 
 1. **账户信封**：spike 已给出结论（§6）：`userId` 不是秘密，默认不写；实现前必须做两件事——修 `getProfile(client)` 调用、在宿主进程内实测 `userId` 可得性（`docs/SPIKE-ACCOUNT-KEK.md` §6 唯一未闭环项）。
 2. **清单是否也该加密**：v1 选择明文（§4 理由）。若用户要求，v2 可加 `manifest.enc` + 明文 `snapshot.json`（只留计数）。
-3. **`current/` 是否需要**：若 `objects/` + 清单已足够，`current/` 只是人的可读视图（v3.4.7 决定是否保留）。
-4. **保留策略默认值**：每会话 10 份旧版本（Q4=A），v3.4.7 实测磁盘后再定是否给"按天"策略。
+3. **`current/` 已定稿**：存指针（见 §3 细化 3），轮转与 gc 都以它为根之一。
+4. **保留策略默认值已定稿**：每会话 10 份旧版本（Q4=A），`keepOldPerSession` 可配；轮转后立即裁剪，窗口不会无声增长。
 5. **macOS 的 machine 信封**：需要 keychain 实现；在补齐之前，macOS 只有密码路径（v3.4.8 解锁流程要按平台给出不同文案）。
+
+## 13. 引擎、调度与轮转（v3.4.7）
+
+**一次备份的顺序**（顺序本身就是正确性的一部分）：
+
+1. `withRepoLock`：单写者，或具名 `BACKUP_LOCKED`；
+2. `ensureLayout`：首次运行建库；
+3. `openRepoKey`：**先拿到钥匙再写任何块**——否则可能出现"块已写、仓库打不开"；
+4. `scanHome`：只读枚举；
+5. 按 scope 选会话（`all` / `active`（未归档）/ `archived` / `selected`），附件对象每次都带上；
+6. 每个文件读一次：sha256 + 4 MiB 块切分 → 只写**内容地址不存在**的块（这一步就是去重）；
+7. `commitSnapshot`：manifest + keys 副本 staging → rename → index append + 回读校验；
+8. `rotateForEntry`：内容变化才记旧版本，并把 `current/` 前移。**轮转在提交之后**：中途崩溃时快照仍在、指针仍指旧版本，重跑只会幂等地重记一次。
+
+**scope 语义**：`active` 排除 `archivedSessionIds` 里的会话；`archived` 只备它们；注册表读不到时 flags 为 `null`（未知按 active 处理——静默漏备比多备一个更难发现）。`selected` 必须给 id，未知 id 会列在结果的 `unknown_selected` 里；一个都没匹配到则 `BACKUP_SCOPED_NOTHING`。
+
+**去重**：块按**明文** sha256 寻址（`objects/<aa>/<sha256>`），已存在即跳过写入并计入 `blocks_reused`。第二次备份未改动时应为 `blocks_new = 0`（测试断言），这也是"每天不重写 166 MB"的判据。
+
+**原子写**（`atomic.mjs`）：tmp 同目录 → write → **fsync** → rename。文件名的内容地址只在字节落盘后才出现；否则下一次备份会认为块已存在，永久跳过一条坏块。
+
+**轮转**：只有内容 sha256 变化才记 `old/`；记录含 rel/size/blocks/snapshot_id/superseded_by，可逐字节还原上一版。`keepOldPerSession`（默认 10）由轮转同步裁剪。
+
+**调度**：默认 **22:00 Asia/Shanghai**，配置项 `backupTimes`（`HH:mm` 或 `HH:mm:ss` 数组）/ `backupTimeZone`/`backupCatchUpMs`（默认 12 小时）。机器睡眠跨过 22:00 后唤醒只**补跑一次**；`catchUpMs` 之外不补，避免"每次启动都备一次"。定时器由 `ctx.effect` 拥有，卸载即停。
+
+**未无人值守的凭据边界**：定时任务不能弹窗，也不能存密码，因此只走 `machine` 信封；OS keystore 不可用时具名拒绝（`BACKUP_NO_PERMISSION`），人工用 `w2m-backup run --password-stdin`。
+
+## 14. v3.4.7 的接口面（面板将在 v3.4.9 调用）
+
+| 接口 | 方法 | 说明 |
+|---|---|---|
+| `/api/w2m/backup/status` | GET | 只读状态（仓库布局 + 快照数 + 最新 digest + index 健康） |
+| `/api/w2m/backup/scan` | GET | 只读扫描（`?detail=1` 带逐会话行） |
+| `/api/w2m/backup/run` | GET | 子插件挂载时的运行态（schedule + 上次结果 + 计数） |
+| `/api/w2m/backup/run` | POST | `{"confirm":"run","scope?":"all|active|archived|selected","selected?":[],"dryRun?":bool}` |
+| `w2m-backup run` | CLI | `--scope` / `--session` / `--keep-old` / `--dry-run` / `--password-stdin` / `--no-machine-key` |
+| `w2m-backup list` / `gc` | CLI | 快照列表 / 孤儿块与 old 窗口清理（`--dry-run` 只报不删） |
+
+`dsh-backup` 子插件行随包发布但 `disabled: true`：**启用它才意味着"定时器可以写盘"**。只读路由仍在主插件上，因此面板的"状态卡片"不需要先启用子插件。

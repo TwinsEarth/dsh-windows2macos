@@ -59,13 +59,22 @@ describe('backup wiring: package and entry points', () => {
   });
 
   it('names every backup suite in scripts.test, test:all and its own script', () => {
-    const suites = ['backup-layout', 'backup-scan', 'backup-crypto', 'backup-protocol', 'backup-repo', 'backup-wiring'];
+    const suites = ['backup-layout', 'backup-scan', 'backup-crypto', 'backup-protocol', 'backup-repo', 'backup-engine', 'backup-rotation', 'backup-gc', 'backup-locks', 'backup-schedule', 'backup-run', 'backup-wiring'];
     for (const suite of suites) {
       assert.equal(pkg.scripts[`test:${suite}`], `node --test --test-force-exit test/${suite}.test.mjs`, `test:${suite} missing`);
       assert.ok(pkg.scripts.test.includes(`test/${suite}.test.mjs`), `${suite} missing from scripts.test`);
       assert.ok(pkg.scripts['test:all'].includes(`test/${suite}.test.mjs`), `${suite} missing from test:all`);
       assert.ok(existsSync(join(ROOT, 'test', `${suite}.test.mjs`)), `${suite}.test.mjs missing`);
     }
+  });
+
+  it('declares the dsh-backup subpath and ships a disable-by-default row for it', () => {
+    assert.equal(pkg.exports['./dsh-backup'], './lib/backup.js');
+    assert.ok(existsSync(join(ROOT, 'lib', 'backup.js')), 'lib/backup.js must exist for the subpath export to resolve');
+    const yml = readFileSync(join(ROOT, 'cordis.patch.yml'), 'utf8');
+    assert.match(yml, /- id: dsh-backup\n {6}name: '@twinsearth\/w2m-dsh-plugin\/dsh-backup'\n {6}disabled: true/u,
+      'the backup row must ship disabled: a timer that writes to disk cannot arrive enabled');
+    assert.match(yml, /backupTimes: \['22:00:00'\]/u, 'the row documents the default slot the engine uses');
   });
 
   it('documents the protocol in docs/BACKUP-DESIGN.md', () => {
@@ -142,7 +151,7 @@ describe('backup wiring: routes', () => {
       assert.equal(body.read_only, true);
       assert.equal(body.dsh_home, home);
       assert.equal(body.repository.exists, false);
-      assert.equal(body.schedule.times[0], '22:00');
+      assert.equal(body.schedule.times[0], '22:00:00');
 
       const refused = await status.fetch(new Request(`http://local.invalid${BACKUP_STATUS_ROUTE_PATH}`, { method: 'POST' }));
       assert.equal(refused.status, 405);
@@ -270,9 +279,9 @@ describe('backup wiring: the CLI', () => {
       ok: true,
       dsh_home: 'C:\\Users\\x\\.dsh',
       repository: { root: 'D:\\BackUP', exists: true, is_file: false, initialized: false, writable: true, free_bytes: 1024, counts: { objects: 0, snapshots: 0, old: 0 } },
-      schedule: { times: ['22:00'], time_zone: 'Asia/Shanghai', implemented: false },
+      schedule: { times: ['22:00:00'], time_zone: 'Asia/Shanghai', implemented: true },
     });
-    assert.match(status, /22:00/u);
+    assert.match(status, /22:00:00/u);
     const scan = formatScan({ dsh_home: 'C:\\x', exists: true, totals: { sessions: 1, session_bytes: 10 }, registry: { ok: true, workspaces: 1, registered: 1 }, exclusions: [] });
     assert.match(scan, /sessions\s+: 1/u);
   });

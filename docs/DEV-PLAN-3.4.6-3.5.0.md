@@ -221,6 +221,13 @@ D:\DeepSeekHarness\BackUP\
 
 **验收**：真实 D 盘仓库跑一次全量（含 113.8 MB 会话），记录耗时/新增块数/仓库体积；再跑一次，新增块≈0；改一个会话后再跑，`old/` 出现 1 个旧版本文件。
 
+**实施记录（2026-11-17，v3.4.7 落地）**
+
+- 交付面：`engine` / `keystore` / `machine-key` / `locks` / `atomic` / `rotation` / `gc` / `schedule`，加 `src/plugin/backup.mjs` + `lib/backup.js` 子插件、`dsh-backup` 行（`disabled: true`）、`POST /api/w2m/backup/run`、CLI `run` / `list` / `gc`；时区算术抽到 `src/util/daily-clock.mjs` 复用。
+- **两处与计划的偏差（均已写进设计文档并记录理由）**：① `old/` 存**可还原记录** `<ts>-<sha12>.json` 而不是整文件 `.zst.enc` 副本——副本会与内容寻址去重重复存储，114 MB 会话的十份窗口会膨胀到 GB 级；② DEK 是**仓库级**的（权威 `<root>/keys.json`，快照存副本），不是每快照一把——否则跨快照的块无法复用，第二次备份会重写整份会话。
+- 无人值守凭据边界：定时任务只走 `machine`（DPAPI）信封；无 OS keystore 的平台具名拒绝 `BACKUP_NO_PERMISSION`，人工路径是 `w2m-backup run --password-stdin`。密码不入配置、不入 argv。
+- 实测（本机真实 `$DSH_HOME`，临时 D 盘仓库）：首备写入块数 > 0；第二次未改动 `blocks_new = 0`、`dedupe_ratio = 1`；追加事件后再备只新增 1 块并记 1 条 old 记录；`gc` 引用齐全、零误删。
+
 ### v3.4.8 — 还原、解锁与归档打包
 
 **交付**

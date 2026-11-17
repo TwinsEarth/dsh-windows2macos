@@ -45,13 +45,14 @@ export function resolveDshHome(env = process.env) {
   return explicit !== '' ? path.resolve(explicit) : path.join(os.homedir(), '.dsh');
 }
 
-/** The schedule shape the status card shows. The engine that honours it ships in v3.4.7. */
+/** The schedule shape the status card shows. The engine ships in v3.4.7 behind the `dsh-backup` row. */
 export const DEFAULT_SCHEDULE = Object.freeze({
   enabled: false,
-  times: ['22:00'],
+  times: ['22:00:00'],
   time_zone: 'Asia/Shanghai',
-  implemented: false,
-  note: 'the daily schedule engine ships in v3.4.7; this field describes the default that v3.4.4 documented',
+  implemented: true,
+  engine: 'v3.4.7',
+  note: 'a schedule is armed only while the dsh-backup subplugin row is mounted and enabled; until then the default is documented, not running',
 });
 
 /**
