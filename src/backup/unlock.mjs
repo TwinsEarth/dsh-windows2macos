@@ -10,27 +10,39 @@
  *   * `describeUnlock` -- read-only, no secret touched, safe on a status path;
  *   * `unlockRepo` -- one attempt with the credentials supplied, returning only `{ok, via}` (never the DEK).
  *
- * ## The three paths, and what they really are
+ * ## The four paths, and what they really are
  *
  * The original plan said "账户 / 密码双解锁". The account-material spike measured that the host exposes an
  * account *identifier*, not a secret (`docs/SPIKE-ACCOUNT-KEK.md`). On 2026-11-17 the user decided to use it
  * exactly that way: **read the unique account id, compare it with the id the repository was bound to, and allow
  * the account path when they match; otherwise fall back to the password path** (`docs/BACKUP-DESIGN.md` §25).
- * So the real paths are:
+ * The product's goal is not absolute confidentiality (the same decision), so the real paths are:
  *
+ *   * **none** -- the repository is unencrypted (default): the DEK is in clear in `keys.json`, no credential is
+ *     needed. `describeUnlock` reports a warning because anyone who can read the directory can restore it;
  *   * **machine** -- the random secret protected by the OS keystore (same machine, no prompt);
  *   * **account** -- an **identity binding**, not a secret: a KEK derived from the account id. Anyone who knows
- *     the id and has the files could derive it, which is the trade-off the user accepted for "same account
- *     works without a password"; it is masked in all output (`id_hint`: last four characters only);
- *   * **password** -- scrypt; the only path that survives a new machine *and* a new account.
+ *     the id and has the files could derive it, which is the trade-off accepted for "same account works
+ *     without a password"; it is masked in all output (`id_hint`: last four characters only);
+ *   * **password** -- scrypt; the path that survives a new machine *and* a new account. Expected use is a 4-6
+ *     digit PIN: a convenience threshold, not confidentiality.
  *
- * `describeUnlock` reports which of the three a repository has -- and, when the host supplies its current account
- * id, whether it matches the bound one -- so the UI can say "this is the original account" or "this is not the
- * original account: use the unlock password" for the right reason.
+ * `describeUnlock` reports the mode (`encryption`), which paths exist (`available_paths`) and, when the host
+ * supplies its current account id, whether it matches the bound one -- so the UI can say "this is the original
+ * account" or "this is not the original account: use the unlock password" for the right reason.
  */
 
 import { ENVELOPE_KINDS } from './crypto.mjs';
-import { accountBindingState, boundAccountId, openRepoKey, readRepoKeys } from './keystore.mjs';
+import {
+  UNENCRYPTED_WARNING,
+  accountBindingState,
+  availablePaths,
+  boundAccountId,
+  keysEncryption,
+  openRepoKey,
+  readRepoKeys,
+} from './keystore.mjs';
+import { descriptorEncryption, readDescriptor } from './layout.mjs';
 import { detectMachineKeySupport, loadMachineSecret } from './machine-key.mjs';
 
 /** Named unlock refusal. */
@@ -58,6 +70,7 @@ const NO_ACCOUNT = Object.freeze({ bound: false, matched: null, id_hint: null })
  *   ok: boolean, initialized: boolean, file: string,
  *   envelopes: string[], machine_available: boolean, machine_reason: string|null,
  *   password_required: boolean, account_supported: boolean,
+ *   encryption: 'none'|'sealed'|null, available_paths: string[], warning: string|null,
  *   account: {bound: boolean, matched: boolean|null, id_hint: string|null},
  *   reason_code: string|null, detail: string|null
  * }}
@@ -65,6 +78,15 @@ const NO_ACCOUNT = Object.freeze({ bound: false, matched: null, id_hint: null })
 export function describeUnlock(input) {
   const keys = readRepoKeys(input.root);
   if (keys.ok !== true) {
+    // A descriptor without keys means a half-initialised repository: report the mode it was created with (when
+    // it says so) instead of guessing, and never read a credential.
+    let encryption = null;
+    try {
+      const descriptor = readDescriptor(input.root);
+      encryption = descriptor === null ? null : descriptorEncryption(descriptor);
+    } catch {
+      encryption = null;
+    }
     return {
       ok: false,
       initialized: keys.reason !== 'missing',
@@ -74,15 +96,24 @@ export function describeUnlock(input) {
       machine_reason: null,
       password_required: false,
       account_supported: false,
+      encryption,
+      available_paths: [],
+      warning: encryption === 'none' ? UNENCRYPTED_WARNING : null,
       account: { ...NO_ACCOUNT },
       reason_code: keys.reason === 'missing' ? UNLOCK_CODES.NOT_INITIALIZED : UNLOCK_CODES.UNREADABLE,
       detail: keys.reason === 'missing' ? 'this repository has no key document yet; the first backup creates it' : keys.detail,
     };
   }
-  const envelopes = keys.keys.envelopes.map((envelope) => String(envelope.kind)).filter((kind) => ENVELOPE_KINDS.includes(kind));
-  const support = typeof input.platform === 'string' || input.machineKey !== false
-    ? detectMachineKeySupport({ platform: input.platform, runner: input.runner })
-    : { available: false, reason: 'disabled-by-configuration' };
+  const encryption = keysEncryption(keys.keys);
+  const envelopes = keys.keys.envelopes
+    .map((envelope) => String(envelope.kind))
+    .filter((kind) => ENVELOPE_KINDS.includes(kind));
+  // An unencrypted repository needs no OS-keystore probe: there is no credential path to report.
+  const support = encryption === 'none'
+    ? { available: false, reason: 'repository-is-unencrypted' }
+    : (typeof input.platform === 'string' || input.machineKey !== false
+        ? detectMachineKeySupport({ platform: input.platform, runner: input.runner })
+        : { available: false, reason: 'disabled-by-configuration' });
   return {
     ok: true,
     initialized: true,
@@ -92,6 +123,9 @@ export function describeUnlock(input) {
     machine_reason: support.reason ?? null,
     password_required: envelopes.includes('password'),
     account_supported: boundAccountId(keys.keys) !== null,
+    encryption,
+    available_paths: availablePaths(keys.keys),
+    warning: encryption === 'none' ? UNENCRYPTED_WARNING : null,
     account: accountBindingState(keys.keys, input.accountId ?? null),
     reason_code: null,
     detail: null,
@@ -109,7 +143,7 @@ export function describeUnlock(input) {
  * @param {{root: string, dshHome: string, password?: string|Buffer|null, machineKey?: boolean,
  *   platform?: string, runner?: Function, accountId?: string|null}} input
  * @returns {{ok: boolean, via: string|null, account: {bound: boolean, matched: boolean|null, id_hint: string|null},
- *   reason_code: string|null, detail: string|null,
+ *   encryption: 'none'|'sealed'|null, reason_code: string|null, detail: string|null,
  *   attempts: Array<object>, machine_available: boolean, machine_envelope_added: boolean}}
  */
 export function unlockRepo(input) {
@@ -126,6 +160,7 @@ export function unlockRepo(input) {
   return {
     ok: opened.ok === true,
     via: opened.unlocked_via,
+    encryption: opened.encryption ?? null,
     account: opened.account ?? { ...NO_ACCOUNT },
     reason_code: opened.reason_code,
     detail: opened.detail,

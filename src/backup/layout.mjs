@@ -42,6 +42,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+import { writeFileAtomic } from './atomic.mjs';
+
 /** The descriptor's `format` string. Bumping it is a new repository kind, not a new version. */
 export const REPO_FORMAT = 'w2m-session-backup';
 
@@ -53,6 +55,26 @@ export const DESCRIPTOR_FILE = 'backup.json';
 
 /** Cipher written by v3.4.6 (the only one this version can create). */
 export const REPO_CIPHER = 'aes-256-gcm';
+
+/**
+ * Repository protection modes recorded by the descriptor's additive `encryption` field.
+ *
+ *   * `none` -- the data key is stored in clear in `keys.json` (an `open` envelope): the repository is
+ *     deliberately unencrypted. The file layout, blocks and manifests are unchanged; anyone who can read the
+ *     directory can decrypt the backup.
+ *   * `sealed` -- the DEK is wrapped under the account/machine/password envelopes. This is the mode every
+ *     repository created before the field existed is treated as having.
+ */
+export const REPO_ENCRYPTION_MODES = Object.freeze(['none', 'sealed']);
+
+/** Default protection mode for a **new** repository: unencrypted (the user's 2026-11-17 decision). */
+export const DEFAULT_REPO_ENCRYPTION = 'none';
+
+/** The mode an existing descriptor means. A missing field means `sealed`: old repositories were sealed. */
+export function descriptorEncryption(descriptor) {
+  if (descriptor === null || descriptor === undefined) return null;
+  return descriptor.encryption === 'none' ? 'none' : 'sealed';
+}
 
 /** Block size recorded by the descriptor. Kept in step with `manifest.mjs#BLOCK_SIZE` by the protocol test. */
 export const REPO_BLOCK_SIZE = 4 * 1024 * 1024;
@@ -235,6 +257,18 @@ export function validateDescriptor(descriptor) {
       ),
     };
   }
+  // Additive field (`encryption: 'none' | 'sealed'`). Absent means `sealed` (every pre-existing repository);
+  // an unknown value is refused rather than read as one of the modes, because guessing here would decide
+  // whether a repository opens with a credential.
+  if (descriptor.encryption !== undefined && !REPO_ENCRYPTION_MODES.includes(descriptor.encryption)) {
+    return {
+      ok: false,
+      error: new BackupLayoutError(
+        LAYOUT_CODES.DESCRIPTOR_UNREADABLE,
+        `the descriptor names encryption ${JSON.stringify(String(descriptor.encryption))}, which is not one of ${REPO_ENCRYPTION_MODES.join(', ')}`,
+      ),
+    };
+  }
   return { ok: true, descriptor };
 }
 
@@ -261,7 +295,7 @@ export function freeBytes(root) {
  * @returns {{
  *   root: string, exists: boolean, is_file: boolean, initialized: boolean, writable: boolean|null,
  *   format: string|null, version: number|null, block_size: number|null, cipher: string|null,
- *   created_at: string|null, free_bytes: number|null, dsh_home: string|null,
+ *   encryption: 'none'|'sealed'|null, created_at: string|null, free_bytes: number|null, dsh_home: string|null,
  *   counts: {objects: number, snapshots: number, old: number},
  *   error: {code: string, detail: string}|null
  * }}
@@ -281,6 +315,9 @@ export function inspectLayout(root, options = {}) {
     version: null,
     block_size: null,
     cipher: null,
+    // `'none' | 'sealed' | null`: null means "no descriptor yet", so there is no mode to report. An existing
+    // descriptor without the field means `sealed` (descriptorEncryption handles that).
+    encryption: null,
     created_at: null,
     free_bytes: null,
     dsh_home: dshHome,
@@ -322,6 +359,7 @@ export function inspectLayout(root, options = {}) {
         report.version = Number(descriptor.version);
         report.block_size = Number.isSafeInteger(descriptor.block_size) ? descriptor.block_size : null;
         report.cipher = typeof descriptor.cipher === 'string' ? descriptor.cipher : null;
+        report.encryption = descriptorEncryption(descriptor);
         report.created_at = typeof descriptor.created_at === 'string' ? descriptor.created_at : null;
       } else if (report.error === null) {
         report.error = { code: validated.error.code, detail: validated.error.detail };
@@ -353,14 +391,60 @@ function countEntries(dir) {
 }
 
 /** The descriptor this version writes for a fresh repository. */
-export function newDescriptor(now = new Date()) {
+export function newDescriptor(now = new Date(), encryption = DEFAULT_REPO_ENCRYPTION) {
+  if (!REPO_ENCRYPTION_MODES.includes(encryption)) {
+    throw new BackupLayoutError(
+      LAYOUT_CODES.DESCRIPTOR_UNREADABLE,
+      `encryption must be one of ${REPO_ENCRYPTION_MODES.join(', ')}, got ${JSON.stringify(String(encryption))}`,
+    );
+  }
   return {
     format: REPO_FORMAT,
     version: REPO_VERSION,
     block_size: REPO_BLOCK_SIZE,
     cipher: REPO_CIPHER,
+    encryption,
     created_at: now.toISOString(),
   };
+}
+
+/**
+ * Rewrite an existing descriptor's additive `encryption` field, atomically, and only when it differs.
+ *
+ * The descriptor is descriptive, not authoritative: the key document decides how a repository opens. This
+ * helper keeps the metadata truthful after the key document changes mode (`setRepositoryPassword` upgrades an
+ * open repository to sealed; `setEncryptionMode` downgrades a sealed one to open). Absent descriptor or an
+ * unreadable one is reported as `{ok:false}` -- never created here, because a mode change is not a reason to
+ * initialise a repository.
+ *
+ * @param {string} root
+ * @param {'none'|'sealed'} encryption
+ * @returns {{ok: boolean, changed: boolean, file: string, reason_code: string|null, detail: string|null}}
+ */
+export function syncDescriptorEncryption(root, encryption) {
+  if (!REPO_ENCRYPTION_MODES.includes(encryption)) {
+    throw new BackupLayoutError(
+      LAYOUT_CODES.DESCRIPTOR_UNREADABLE,
+      `encryption must be one of ${REPO_ENCRYPTION_MODES.join(', ')}, got ${JSON.stringify(String(encryption))}`,
+    );
+  }
+  const file = path.join(path.resolve(root), DESCRIPTOR_FILE);
+  let descriptor;
+  try {
+    descriptor = readDescriptor(root);
+  } catch (error) {
+    return { ok: false, changed: false, file, reason_code: error?.code ?? LAYOUT_CODES.DESCRIPTOR_UNREADABLE, detail: error?.detail ?? String(error?.message ?? error) };
+  }
+  if (descriptor === null) {
+    return { ok: false, changed: false, file, reason_code: LAYOUT_CODES.NOT_A_REPO, detail: `${file} does not exist; no descriptor to update` };
+  }
+  if (descriptor.encryption === encryption) return { ok: true, changed: false, file, reason_code: null, detail: null };
+  try {
+    writeFileAtomic(file, `${JSON.stringify({ ...descriptor, encryption }, null, 2)}\n`);
+  } catch (error) {
+    return { ok: false, changed: false, file, reason_code: error?.code ?? LAYOUT_CODES.CREATE_FAILED, detail: error?.detail ?? String(error?.message ?? error) };
+  }
+  return { ok: true, changed: true, file, reason_code: null, detail: null };
 }
 
 /**
@@ -371,7 +455,8 @@ export function newDescriptor(now = new Date()) {
  * first-run problems happened instead of printing EPERM.
  *
  * @param {string} root
- * @param {{dshHome?: string|null, now?: Date}} [options]
+ * @param {{dshHome?: string|null, now?: Date, encryption?: 'none'|'sealed'}} [options] `encryption` is written
+ *   only when the descriptor does not exist yet; an existing repository is never re-initialised or re-written.
  * @returns {{
  *   created: boolean, paths: ReturnType<typeof repoPaths>, descriptor: object,
  *   free_bytes: number|null, writable_probe: string
@@ -414,7 +499,7 @@ export function ensureLayout(root, options = {}) {
   }
   if (stat === null) created = existing === null;
 
-  const descriptor = existing ?? newDescriptor(options.now);
+  const descriptor = existing ?? newDescriptor(options.now, options.encryption ?? DEFAULT_REPO_ENCRYPTION);
   if (existing === null) {
     const staging = path.join(paths.tmp, `descriptor-${process.pid}-${Date.now()}.tmp`);
     try {

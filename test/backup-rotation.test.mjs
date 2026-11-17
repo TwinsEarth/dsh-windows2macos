@@ -987,12 +987,18 @@ describe('rotation: old-backfill CLI', () => {
     }
   });
 
-  it('exits 1 with a JSON refusal when the repository cannot be opened, and writes nothing', () => {
+  it('exits 1 with a JSON refusal when an existing repository cannot be opened, and writes nothing', () => {
     const { dir, cleanup } = tempDir('w2m-rot-backfill-cli-refuse-');
     const root = join(dir, 'repo');
     ensureLayout(root);
     try {
       const home = join(dir, 'home');
+      // A sealed repository: the CLI below has neither a password nor a machine key, so it must be refused.
+      // (An *uninitialised* repository is no longer a refusal: the default protection mode is `none`, so opening
+      // it legitimately creates an open envelope. This test keeps the "cannot open an existing repo" case.)
+      const created = openRepoKey({ root, dshHome: home, password: BACKFILL_PASSWORD, platform: 'linux', machineKey: false });
+      assert.equal(created.ok, true, created.detail ?? '');
+      const before = readFileSync(join(root, 'keys.json'), 'utf8');
       const captured = capture();
       const code = main(
         ['old-backfill', '--backup-dir', root, '--dsh-home', home, '--no-machine-key', '--json'],
@@ -1003,7 +1009,7 @@ describe('rotation: old-backfill CLI', () => {
       assert.equal(payload.ok, false);
       assert.equal(payload.reason_code, 'BACKUP_NO_PERMISSION');
       assert.equal(payload.backfilled, 0);
-      assert.equal(existsSync(join(root, 'keys.json')), false, 'a refused backfill must not mint a key file');
+      assert.equal(readFileSync(join(root, 'keys.json'), 'utf8'), before, 'a refused backfill must not rewrite the key file');
     } finally {
       cleanup();
     }

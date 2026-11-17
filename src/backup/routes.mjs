@@ -24,6 +24,7 @@ import path from 'node:path';
 import { inspectLayout, resolveBackupDir, LAYOUT_CODES, BackupLayoutError } from './layout.mjs';
 import { openRepo } from './repo.mjs';
 import { scanHome, summarize } from './scan.mjs';
+import { UNENCRYPTED_WARNING, availablePaths, keysEncryption, readRepoKeys } from './keystore.mjs';
 
 /** Path of the read-only status route. */
 export const BACKUP_STATUS_ROUTE_PATH = '/api/w2m/backup/status';
@@ -72,6 +73,13 @@ export function buildStatus(options = {}) {
     return { ok: false, ...refusal, dsh_home: dshHome, checked_at: new Date().toISOString() };
   }
   const inspected = inspectLayout(backupDir, { dshHome });
+  // The status card answers "how protected is this repository" with facts the key document carries. This is a
+  // read-only read: `readRepoKeys` validates structurally and never touches a credential, and an unencrypted
+  // repository is reported as such (with the honest warning) rather than hidden.
+  const keys = readRepoKeys(backupDir);
+  const encryption = keys.ok === true ? keysEncryption(keys.keys) : inspected.encryption;
+  const available = keys.ok === true ? availablePaths(keys.keys) : [];
+  const warning = encryption === 'none' ? UNENCRYPTED_WARNING : null;
   // An initialised repository additionally reports its snapshots and index health; an absent or empty one does
   // not get opened, because openRepo would only restate "not initialised" and the cheap inspection already knows.
   const repoState = inspected.error === null && inspected.initialized ? openRepo({ root: backupDir, dshHome }) : null;
@@ -102,6 +110,9 @@ export function buildStatus(options = {}) {
     checked_at: new Date().toISOString(),
     dsh_home: dshHome,
     repository,
+    encryption,
+    available_paths: available,
+    warning,
     schedule: { ...DEFAULT_SCHEDULE },
     read_only: true,
     ...(inspected.error === null ? {} : { reason_code: inspected.error.code, detail: inspected.error.detail }),

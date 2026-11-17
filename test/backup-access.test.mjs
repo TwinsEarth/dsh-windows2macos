@@ -8,7 +8,7 @@ import { join } from 'node:path';
 
 import { runBackup } from '../src/backup/engine.mjs';
 import { describeUnlock, machineSecretAvailable, unlockRepo } from '../src/backup/unlock.mjs';
-import { bindAccount } from '../src/backup/keystore.mjs';
+import { UNENCRYPTED_WARNING, bindAccount } from '../src/backup/keystore.mjs';
 import {
   applyRegistryRestore,
   findWorkspaceForSlug,
@@ -46,6 +46,19 @@ function passwordRepo() {
   const repo = tempDir('w2m-access-repo-');
   const run = runBackup({ root: repo.dir, dshHome: home.home, password: PASSWORD, platform: 'linux', machineKey: false });
   assert.equal(run.ok, true, run.detail);
+  return { repo, home };
+}
+
+/** A repository in the default mode: unencrypted (the user decision), created with no credential at all. */
+function unencryptedRepo() {
+  const home = makeHome({
+    sessions: [{ workspace: '--E-GPT--', id: SESSION }],
+    registry: registryDocument({ sessionIds: [SESSION] }),
+  });
+  const repo = tempDir('w2m-access-open-repo-');
+  const run = runBackup({ root: repo.dir, dshHome: home.home, platform: 'linux', machineKey: false });
+  assert.equal(run.ok, true, run.detail);
+  assert.equal(run.encryption, 'none');
   return { repo, home };
 }
 
@@ -93,6 +106,44 @@ describe('unlock: describing the repository without touching a secret', () => {
       cleanup();
     }
   });
+
+  it('reports the unencrypted state with the honest warning and no credential path', () => {
+    const { repo, home } = unencryptedRepo();
+    try {
+      const described = describeUnlock({ root: repo.dir, dshHome: home.home, platform: 'linux', machineKey: false });
+      assert.equal(described.ok, true);
+      assert.equal(described.encryption, 'none');
+      assert.deepEqual(described.available_paths, ['none']);
+      assert.equal(described.warning, UNENCRYPTED_WARNING);
+      assert.equal(described.password_required, false);
+      assert.equal(described.machine_available, false, 'an unencrypted repository does not probe the OS keystore');
+      assert.deepEqual(described.envelopes, ['open']);
+      const payload = JSON.stringify(described);
+      assert.equal(payload.includes(UNENCRYPTED_WARNING), true);
+      // The DEK sits in clear in keys.json; it must not also travel in the describe payload.
+      const keysText = fs.readFileSync(join(repo.dir, 'keys.json'), 'utf8');
+      const dek = JSON.parse(keysText).envelopes[0].dek;
+      assert.equal(payload.includes(dek), false, 'the describe payload never carries the data key');
+    } finally {
+      repo.cleanup();
+      home.cleanup();
+    }
+  });
+
+  it('reports a sealed repository as sealed with its credential paths', () => {
+    const { repo, home } = passwordRepo();
+    try {
+      const described = describeUnlock({ root: repo.dir, dshHome: home.home, platform: 'linux', machineKey: false });
+      assert.equal(described.ok, true);
+      assert.equal(described.encryption, 'sealed');
+      assert.deepEqual(described.available_paths, ['password']);
+      assert.equal(described.warning, null);
+      assert.equal(described.password_required, true);
+    } finally {
+      repo.cleanup();
+      home.cleanup();
+    }
+  });
 });
 
 describe('unlock: the attempt', () => {
@@ -107,6 +158,20 @@ describe('unlock: the attempt', () => {
       const bad = unlockRepo({ root: repo.dir, dshHome: home.home, password: 'nope', platform: 'linux', machineKey: false });
       assert.equal(bad.ok, false);
       assert.equal(bad.reason_code, 'BACKUP_NO_PERMISSION');
+    } finally {
+      repo.cleanup();
+      home.cleanup();
+    }
+  });
+
+  it('unlocks an unencrypted repository with no credential and never returns the key', () => {
+    const { repo, home } = unencryptedRepo();
+    try {
+      const opened = unlockRepo({ root: repo.dir, dshHome: home.home, platform: 'linux', machineKey: false });
+      assert.equal(opened.ok, true, opened.detail ?? '');
+      assert.equal(opened.via, 'none');
+      assert.equal(opened.encryption, 'none');
+      assert.equal('dek' in opened, false, 'the unlock result must not carry the data key');
     } finally {
       repo.cleanup();
       home.cleanup();

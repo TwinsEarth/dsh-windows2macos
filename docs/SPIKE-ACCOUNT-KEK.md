@@ -502,3 +502,34 @@ node E:\GPT\.tmp\run-account-fix-probe.mjs   # 修后 w2m identify() 的宿主�
 ```
 
 **这些不是本调查的改动**（本调查只新增 `docs/SPIKE-ACCOUNT-KEK.md`）。本文引用 `src/backup/crypto.mjs` 的接口/行号是在其 mtime 2026-11-17 12:34 时读取的快照；并行任务提交后请重新核对行号，但 `wrapDek/unwrapDek/ENVELOPE_KINDS/DEFAULT_SCRYPT/CRYPTO_CODES` 这些导出名是设计对接点。
+
+## 9. 用户最终决定：便捷优先（2026-11-17 晚，推翻"信封组合"的默认，不改写上文测量）
+
+**用户原话**：
+
+> 我们追求的不是绝对保密：
+> 1，用账户ID是为了方便实现自动化（账户能快捷解锁，不是必须）
+> 2，密码也是4-6位数字（账户不对输入密码）
+> 3，也可以选择不加密（1账户不对，2又没有设置密码，3默认是不加密的）
+
+**这条决定如何落地（代码事实，不是计划）**：
+
+1. **默认 = 不加密**：新仓库写 `encryption: "none"` + 一个 `open` 信封，DEK **明文**保存在 `keys.json`
+   （`src/backup/crypto.mjs` 的 `openEnvelopeRecord`/`wrapOpenDek`）。这不是"弱加密"，是明确的无保护状态：
+   任何能读仓库目录的人都能还原备份。产品在状态卡/解锁卡/CLI 里原文提示
+   「未加密：任何能访问该目录的人都能还原备份」。
+2. **账户 ID 只用于自动化便捷解锁**：`account` 信封仍是身份绑定（HKDF(id)，非秘密），只对 `sealed` 仓库
+   生效，且 `runBackup` 在 `none` 模式下**不会**绑定（否则第一次 run 会把默认的不加密仓库静默改成 sealed）。
+   宿主读不到 id 时不影响其它路径——这正是"不是必须"。
+3. **PIN = 4-6 位数字的便捷门槛**：`setRepositoryPassword` 的下限从 8 字节降到 4 字节；数字 PIN 被接受但
+   结果带 `weak: true` + 「4 位数字 PIN 只是便捷门槛，不是保密强度」；**不静默提高 scrypt 成本**。
+4. **可逆**：`unlock --disable-protection --confirm disable-protection` 用现有凭据打开后，用**同一 DEK** 写
+   `open` 信封（先 `keys.json.bak-<ts>`、原子写、无凭据解封验证）；块格式不变，所以不重写任何对象。
+5. **模式记录在仓库描述符**：`backup.json` 增加加法字段 `encryption: 'none' | 'sealed'`（旧仓库缺省 = 
+   `sealed`）。`open` 信封与任何 account/machine/password 信封**混存会被 `validateKeysFile` 拒绝**，避免
+   open 路径静默绕过 PIN。
+
+**上文 §4-§8 的测量没有被改写**：`userId` 仍只是标识、token 仍易变、仍没有稳定的每账户秘密；变化的只是
+**产品默认**与**接受的风险等级**：用户明确选择便捷优先，因此 `none`（默认）/ `account` 比对 / 4-6 位 PIN
+都**不是**机密性保证。要真正的机密性，只能 `sealed` + 长密码（≥8 位、非纯数字）+ 仓库目录访问控制。
+详见 `docs/BACKUP-DESIGN.md` §25.0（总声明）与 §6/§8/§11/§12 的更新。

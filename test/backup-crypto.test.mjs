@@ -19,8 +19,11 @@ import {
   ENVELOPE_FORMAT,
   ENVELOPE_VERSION,
   MIN_SCRYPT,
+  OPEN_ALG,
+  OPEN_KIND,
   deriveKek,
   isDek,
+  openEnvelopeRecord,
   openObject,
   openPayload,
   randomDek,
@@ -32,6 +35,7 @@ import {
   validateKdf,
   validateKeysFile,
   wrapDek,
+  wrapOpenDek,
 } from '../src/backup/crypto.mjs';
 
 /** The cheapest scrypt the module will *create*, so the suite stays fast without weakening what it tests. */
@@ -270,6 +274,54 @@ describe('backup crypto: sealed block objects', () => {
     refuses(() => openObject(sealed, dek, { sha256: 'f'.repeat(64), length: plaintext.length }), CRYPTO_CODES.DECRYPT_AUTH_FAILED);
     refuses(() => openObject(sealed.subarray(0, 8), dek, { sha256: digest }), CRYPTO_CODES.ENVELOPE_MALFORMED);
     refuses(() => openObject(Buffer.from('NOTMAGIC'.repeat(4)), dek, { sha256: digest }), CRYPTO_CODES.ENVELOPE_MALFORMED);
+  });
+});
+
+describe('backup crypto: the open envelope (protection explicitly off)', () => {
+  const dek = randomDek();
+
+  it('writes the DEK in clear, documented, and unwraps with no credential', () => {
+    const keys = wrapOpenDek(dek);
+    assert.equal(keys.format, ENVELOPE_FORMAT);
+    assert.equal(keys.version, ENVELOPE_VERSION);
+    assert.equal(keys.envelopes.length, 1);
+    const record = keys.envelopes[0];
+    assert.equal(record.kind, OPEN_KIND);
+    assert.equal(record.alg, OPEN_ALG);
+    assert.equal(record.dek, dek.toString('base64'), 'the documented consequence: anyone with the directory can decrypt');
+    assert.equal(typeof record.created_at, 'string');
+    assert.equal(JSON.stringify(keys).includes(dek.toString('hex')), false, 'no second copy in hex');
+    assert.equal(validateKeysFile(keys), keys);
+
+    const opened = unwrapDek(keys, {});
+    assert.deepEqual(opened.dek, dek);
+    assert.equal(opened.kind, 'open');
+    assert.deepEqual(opened.attempts, [{ kind: 'open', ok: true, code: null }], 'one attempt, and it did not fail');
+    assert.deepEqual(unwrapDek(keys, { password: 'ignored' }).dek, dek, 'a credential is optional and ignored');
+    assert.deepEqual(openEnvelopeRecord(dek).dek, dek.toString('base64'));
+  });
+
+  it('refuses an open record mixed with any credential envelope (it would bypass the credential)', () => {
+    const sealed = wrapDek(dek, [{ kind: 'password', secret: PASSWORD }], { kdf: KDF });
+    for (const kind of ['account', 'machine', 'password']) {
+      const record = kind === 'password'
+        ? sealed.envelopes[0]
+        : wrapDek(dek, [{ kind, secret: randomBytes(32), kdf: { algo: 'hkdf-sha256', keylen: DEK_LENGTH } }]).envelopes[0];
+      const mixed = { ...wrapOpenDek(dek), envelopes: [...wrapOpenDek(dek).envelopes, record] };
+      refuses(() => validateKeysFile(mixed), CRYPTO_CODES.ENVELOPE_MALFORMED);
+    }
+    refuses(() => validateKeysFile({ ...wrapOpenDek(dek), envelopes: [] }), CRYPTO_CODES.ENVELOPE_MALFORMED);
+  });
+
+  it('refuses a malformed open record by name', () => {
+    const keys = wrapOpenDek(dek);
+    const record = keys.envelopes[0];
+    const bad = (patch) => validateKeysFile({ ...keys, envelopes: [{ ...record, ...patch }] });
+    refuses(() => bad({ alg: 'aes-256-gcm' }), CRYPTO_CODES.ENVELOPE_MALFORMED);
+    refuses(() => bad({ dek: Buffer.alloc(DEK_LENGTH - 1).toString('base64') }), CRYPTO_CODES.ENVELOPE_MALFORMED);
+    refuses(() => bad({ dek: '' }), CRYPTO_CODES.ENVELOPE_MALFORMED);
+    refuses(() => bad({ kdf: { algo: 'scrypt' } }), CRYPTO_CODES.ENVELOPE_MALFORMED);
+    refuses(() => bad({ created_at: 'not a date' }), CRYPTO_CODES.ENVELOPE_MALFORMED);
   });
 });
 

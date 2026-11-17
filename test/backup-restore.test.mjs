@@ -421,4 +421,26 @@ describe('restore: the round trip', () => {
       target.cleanup();
     }
   });
+
+  it('restores an unencrypted repository with no credential at all (the default mode)', () => {
+    const source = runtimeValidHome();
+    const { dir, cleanup } = tempDir('w2m-restore-none-');
+    const target = emptyTargetHome();
+    try {
+      const run = runBackup({ root: join(dir, 'repo'), dshHome: source.home, platform: 'linux', machineKey: false });
+      assert.equal(run.ok, true, run.detail);
+      assert.equal(run.encryption, 'none');
+      const plan = planRestore({ root: join(dir, 'repo'), dshHome: target.home, platform: 'linux', machineKey: false });
+      assert.equal(plan.ok, true, plan.detail);
+      assert.equal(plan.summary.new, 1);
+      const applied = applyRestore({ plan, dshHome: target.home });
+      assert.equal(applied.ok, true, applied.detail);
+      assert.equal(applied.restored.length, 1);
+      assert.ok(fs.readFileSync(logPath(target.home)).equals(runtimeValidSessionLog(SESSION)), 'the restored bytes must equal the source');
+    } finally {
+      cleanup();
+      source.cleanup();
+      target.cleanup();
+    }
+  });
 });

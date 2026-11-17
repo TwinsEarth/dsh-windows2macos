@@ -21,7 +21,8 @@ import {
   registerBackupRoutes,
 } from '../src/backup/routes.mjs';
 import { formatScan, formatStatus, main } from '../src/backup/cli.mjs';
-import { makeHome, registryDocument } from './helpers/backup-fixture.mjs';
+import { runBackup } from '../src/backup/engine.mjs';
+import { makeHome, registryDocument, tempDir } from './helpers/backup-fixture.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
@@ -214,6 +215,42 @@ describe('backup wiring: routes', () => {
       assert.equal(scan.sessions.length, 1);
     } finally {
       cleanup();
+    }
+  });
+
+  it('reports the protection mode, the available paths, and the honest unencrypted warning', () => {
+    const { home, cleanup } = makeHome();
+    const { dir, cleanup: cleanRepo } = tempDir('w2m-wiring-status-mode-');
+    try {
+      const root = join(dir, 'repo');
+      const run = runBackup({ root, dshHome: home, platform: 'linux', machineKey: false });
+      assert.equal(run.ok, true, run.detail);
+      assert.equal(run.encryption, 'none');
+
+      const status = buildStatus({ backupDir: root, dshHome: home, env: {} });
+      assert.equal(status.encryption, 'none');
+      assert.deepEqual(status.available_paths, ['none']);
+      assert.equal(status.warning, '未加密：任何能访问该目录的人都能还原备份');
+      assert.equal(status.repository.encryption, 'none', 'the descriptor mode is part of the repository facts');
+      const human = formatStatus(status);
+      assert.match(human, /protection {4}: none/u);
+      assert.match(human, /未加密：任何能访问该目录的人都能还原备份/u);
+      assert.match(human, /unlock paths {2}: none/u);
+
+      // A sealed repository reports no unencrypted warning and only the paths it really has.
+      const sealedRoot = join(dir, 'sealed');
+      const sealed = runBackup({ root: sealedRoot, dshHome: home, password: '1234', platform: 'linux', machineKey: false });
+      assert.equal(sealed.ok, true, sealed.detail);
+      const sealedStatus = buildStatus({ backupDir: sealedRoot, dshHome: home, env: {} });
+      assert.equal(sealedStatus.encryption, 'sealed');
+      assert.deepEqual(sealedStatus.available_paths, ['password']);
+      assert.equal(sealedStatus.warning, null);
+      const sealedHuman = formatStatus(sealedStatus);
+      assert.match(sealedHuman, /protection {4}: sealed/u);
+      assert.equal(sealedHuman.includes('未加密：任何能访问该目录的人都能还原备份'), false);
+    } finally {
+      cleanup();
+      cleanRepo();
     }
   });
 });

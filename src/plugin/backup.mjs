@@ -15,25 +15,33 @@
  * This file is a composition root: paths, configuration, logging, lifecycle. Nothing about hashing, encryption or
  * rotation is implemented here.
  *
- * ## Unattended runs have no password
+ * ## Protection is convenience-first, and `none` is the default
  *
- * A scheduled run cannot prompt. It opens the repository with the **machine** envelope (the DPAPI-protected key),
- * which is why that envelope exists. On a platform without an OS keystore the scheduled run refuses with
- * `BACKUP_NO_PERMISSION` and logs it; the operator's path is the offline CLI's password unlock
- * (`w2m-backup run --password-stdin`), which is an explicit human action rather than a stored secret. Storing the
- * password in configuration to make the timer work would trade the whole point of the encryption for convenience,
+ * The user's decision (2026-11-17, `docs/BACKUP-DESIGN.md` §25) is explicit: this product does **not** pursue
+ * absolute confidentiality. Three states exist -- no protection (the default), account-id compare (a
+ * convenience), and a 4-6 digit PIN (a convenience threshold when the account does not match). A scheduled run
+ * therefore writes an **unencrypted** repository by default (`backupEncryption: none`): the data key sits next
+ * to the data, and anyone who can read the repository directory can restore it. That is what "default is
+ * unencrypted" means, and the panel says so in words.
+ *
+ * An operator who wants the old behaviour (machine envelope under DPAPI, so an unattended run types no
+ * password) sets `backupEncryption: sealed`. On a platform without an OS keystore a `sealed` scheduled run
+ * refuses with `BACKUP_NO_PERMISSION` and logs it; the operator's path is the offline CLI
+ * (`w2m-backup run --password-stdin`), which is an explicit human action rather than a stored secret. Storing
+ * the password in configuration to make the timer work trades the little protection there is for convenience,
  * so it is not offered.
  *
- * ## The account path is a compare-only identity binding
+ * ## The account path is a compare-only identity binding, and only for sealed repositories
  *
- * The user's decision (2026-11-17, `docs/BACKUP-DESIGN.md` §25): read the host's **account identifier**, compare it
- * with the id the repository is bound to, and allow the account path when they match; on a mismatch fall back to
- * the password path. It is deliberately **not** a secret and never replaces the password envelope -- anyone who
- * knows the id and has the files could derive the same KEK, which is the accepted trade-off. With
+ * The user's decision (2026-11-17, `docs/BACKUP-DESIGN.md` §25): read the host's **account identifier**, compare
+ * it with the id the repository is bound to, and allow the account path when they match; on a mismatch fall back
+ * to the password path. It is deliberately **not** a secret and never replaces the password envelope -- anyone
+ * who knows the id and has the files could derive the same KEK, which is the accepted trade-off. With
  * `backupAccountBinding` on (the default) the route reads the id through `createAccountIdentity({ctx}).identify()`
  * (best effort, never throws: signed out or no account service simply yields `null`), passes it to the run (which
- * binds it after a successful commit) and to the unlock probes, where it is only compared. The account id is
- * masked in every response (`account.id_hint`, last four characters only).
+ * binds it after a successful commit) and to the unlock probes, where it is only compared. An **unencrypted**
+ * repository is never bound: it opens with no credential, so binding it would silently re-seal the default mode
+ * after the first run. The account id is masked in every response (`account.id_hint`, last four characters only).
  *
  * ## The route requires a confirmation token
  *
@@ -56,6 +64,7 @@ import { runBackup, SCOPES } from '../backup/engine.mjs';
 import { buildStatus } from '../backup/routes.mjs';
 import { describeBackupSchedule, normalizeBackupSchedule } from '../backup/schedule.mjs';
 import { DEFAULT_KEEP_OLD, DEFAULT_OLD_FORMAT, OLD_FORMATS } from '../backup/rotation.mjs';
+import { REPO_ENCRYPTION_MODES } from '../backup/layout.mjs';
 
 export const name = 'w2m-dsh-backup';
 
@@ -113,12 +122,16 @@ export function defaultBackupDir(platform = process.platform) {
  * `backupMirrorDir` is the offsite mirror directory; absent/empty means no mirror, and a non-string value is
  * refused rather than silently ignored (a typo in the row should not mount a plugin that silently copies
  * nowhere).
+ * `backupEncryption` selects the **protection** mode used when a repository is first created: `none` (default)
+ * stores the data key in clear next to the data (no credential needed), `sealed` keeps the account/machine/PIN
+ * envelopes. It never changes an existing repository's mode; the CLI's `unlock --set-password` /
+ * `--disable-protection` are the explicit conversion commands.
  *
  * @param {object} [config]
  * @param {{env?: Record<string, string|undefined>, platform?: string}} [deps]
  * @returns {{ok: true, enabled: boolean, backup_dir: string, times: string[], time_zone: string, catch_up_ms: number,
  *   scope: string, keep_old_per_session: number, old_version_days: number, old_format: 'records'|'full',
- *   mirror_dir: string|null, account_binding: boolean, dsh_home: string}
+ *   encryption: 'none'|'sealed', mirror_dir: string|null, account_binding: boolean, dsh_home: string}
  *   | {ok: false, reason_code: string, detail: string}}
  */
 export function normalizeConfig(config = {}, deps = {}) {
@@ -172,6 +185,16 @@ export function normalizeConfig(config = {}, deps = {}) {
       detail: `backupOldFormat must be one of ${OLD_FORMATS.join(', ')}, got ${JSON.stringify(oldFormat)}`,
     };
   }
+  // The protection mode for a NEW repository. `none` is the default (the user's decision: 默认是不加密); a bad
+  // value fails the mount with a configuration code instead of becoming a silent surprise in a scheduled run.
+  const encryption = config.backupEncryption ?? 'none';
+  if (!REPO_ENCRYPTION_MODES.includes(encryption)) {
+    return {
+      ok: false,
+      reason_code: 'BACKUP_CONFIG_INVALID',
+      detail: `backupEncryption must be one of ${REPO_ENCRYPTION_MODES.join(', ')}, got ${JSON.stringify(encryption)}`,
+    };
+  }
   // The offsite mirror directory: absent/empty -> no mirror; a non-string given value is refused. The path is
   // resolved here, but containment (inside the repository / the home) is checked by the engine at run time,
   // because only the engine knows whether the repository will be created at that path.
@@ -208,6 +231,7 @@ export function normalizeConfig(config = {}, deps = {}) {
     machine_key: machineKey,
     future_append: futureAppend,
     account_binding: accountBinding,
+    encryption,
     keep_old_per_session: keepOld,
     old_version_days: oldVersionDays ?? 0,
     old_format: oldFormat,
@@ -245,6 +269,7 @@ export function apply(ctx, config = {}) {
     keep_old_per_session: cfg.keep_old_per_session,
     old_version_days: cfg.old_version_days,
     old_format: cfg.old_format,
+    encryption: cfg.encryption,
     mirror_dir: cfg.mirror_dir,
     runs: 0,
     failures: 0,
@@ -298,6 +323,7 @@ export function apply(ctx, config = {}) {
         keepOldPerSession: cfg.keep_old_per_session,
         maxOldVersionDays: cfg.old_version_days,
         oldFormat: cfg.old_format,
+        encryption: cfg.encryption,
         mirrorRoot: cfg.mirror_dir,
         machineKey: cfg.machine_key,
         futureAppend: cfg.future_append,
@@ -390,6 +416,9 @@ export function apply(ctx, config = {}) {
               dsh_home: cfg.dsh_home,
               retention: { keep_old_per_session: cfg.keep_old_per_session, old_version_days: cfg.old_version_days },
               old_format: cfg.old_format,
+              // The mode this row will create a NEW repository with. The repository's actual mode is
+              // `status.repository.encryption` / `encryption` (an existing sealed repository keeps its mode).
+              encryption: cfg.encryption,
               account_binding: cfg.account_binding,
               mirror_dir: cfg.mirror_dir,
               schedule: describeBackupSchedule({ enabled: true, times: cfg.times, timeZone: cfg.time_zone }),
@@ -473,7 +502,7 @@ export function apply(ctx, config = {}) {
           }
           const result = unlockRepo(await unlockInput());
           return Response.json(
-            { ok: result.ok, via: result.via, account: result.account, reason_code: result.reason_code, detail: result.detail, attempts: result.attempts },
+            { ok: result.ok, via: result.via, encryption: result.encryption, account: result.account, reason_code: result.reason_code, detail: result.detail, attempts: result.attempts },
             { headers: NO_STORE },
           );
         },

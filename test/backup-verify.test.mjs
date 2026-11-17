@@ -303,4 +303,22 @@ describe('G3 evidence: every restructuring path re-validates the future append',
       home.cleanup();
     }
   });
+
+  it('verifies an unencrypted repository with no credential at all (the default mode)', () => {
+    const home = runtimeValidHome();
+    const { dir, cleanup } = tempDir('w2m-verify-none-');
+    try {
+      const run = runBackup({ root: join(dir, 'repo'), dshHome: home.home, platform: 'linux', machineKey: false });
+      assert.equal(run.ok, true, run.detail);
+      assert.equal(run.encryption, 'none');
+      // No password and no machine key: `none` means the key is in clear in keys.json, so verification needs neither.
+      const result = verifyRepo({ root: join(dir, 'repo'), dshHome: home.home, platform: 'linux', machineKey: false });
+      assert.equal(result.ok, true, result.problems.map((problem) => `${problem.code}: ${problem.detail}`).join('; '));
+      assert.equal(result.counts.snapshots, 1);
+      assert.equal(result.counts.files, 1);
+    } finally {
+      cleanup();
+      home.cleanup();
+    }
+  });
 });

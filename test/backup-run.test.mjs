@@ -7,7 +7,7 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import {
@@ -26,7 +26,8 @@ import {
 } from '../src/plugin/backup.mjs';
 import { main, parseArgs } from '../src/backup/cli.mjs';
 import { runBackup } from '../src/backup/engine.mjs';
-import { bindAccount } from '../src/backup/keystore.mjs';
+import { bindAccount, readRepoKeys } from '../src/backup/keystore.mjs';
+import { descriptorEncryption, readDescriptor } from '../src/backup/layout.mjs';
 import { readIndex, readSnapshot } from '../src/backup/repo.mjs';
 import { listOldVersions, recordSupersededVersion } from '../src/backup/rotation.mjs';
 import { tempDir, makeHome, registryDocument, runtimeValidHome, sessionLog, event } from './helpers/backup-fixture.mjs';
@@ -183,11 +184,25 @@ describe('subplugin: configuration', () => {
   });
   it('normalizes the account-binding switch (on by default, config can turn it off)', () => {
     assert.equal(normalizeConfig({}, { env: {}, platform: 'win32' }).account_binding, true,
-      'the user decision is on by default: bind the account id after a successful run');
+      'the user decision is on by default: bind the account id after a successful sealed run');
     assert.equal(normalizeConfig({ backupAccountBinding: true }, { env: {}, platform: 'win32' }).account_binding, true);
     assert.equal(normalizeConfig({ backupAccountBinding: false }, { env: {}, platform: 'win32' }).account_binding, false);
     // Any other value is truthy-by-default rather than silently disabling a compare-only convenience path.
     assert.equal(normalizeConfig({ backupAccountBinding: 0 }, { env: {}, platform: 'win32' }).account_binding, true);
+  });
+
+  it('normalizes the protection mode (none is the default) and refuses an invalid value', () => {
+    const defaults = normalizeConfig({}, { env: {}, platform: 'win32' });
+    assert.equal(defaults.ok, true);
+    assert.equal(defaults.encryption, 'none', 'the user decision: a new repository is unencrypted by default');
+    assert.equal(normalizeConfig({ backupEncryption: 'none' }, { env: {}, platform: 'win32' }).encryption, 'none');
+    assert.equal(normalizeConfig({ backupEncryption: 'sealed' }, { env: {}, platform: 'win32' }).encryption, 'sealed');
+    for (const bad of ['NONE', 'encrypted', 1, true]) {
+      const refused = normalizeConfig({ backupEncryption: bad }, { env: {}, platform: 'win32' });
+      assert.equal(refused.ok, false, `backupEncryption=${String(bad)} must be refused`);
+      assert.equal(refused.reason_code, 'BACKUP_CONFIG_INVALID');
+      assert.match(refused.detail, /backupEncryption must be one of none, sealed/u);
+    }
   });
 });
 
@@ -250,12 +265,41 @@ describe('subplugin: the route and the timer', () => {
     }
   });
 
-  it('answers a confirmed run with the engine refusal when this platform has no usable credential', async () => {
+  it('runs an unencrypted repository by default, and refuses a sealed run when this platform has no credential', async () => {
+    const { home, cleanup: cleanHome } = homeFixture();
+    const { dir, cleanup } = tempDir('w2m-run-default-mode-');
+    try {
+      // Even with a resolvable host account id, an unencrypted repository must stay unencrypted: the id is a
+      // convenience path for sealed repositories, not a reason to seal the default mode after the first run.
+      const fake = fakeCtx({ services: { deepseekAccount: fakeAccountService(ACCOUNT) } });
+      apply(fake.ctx, { backupDir: join(dir, 'repo'), dshHome: home, backupMachineKey: false, ...NO_FIRE });
+      const route = fake.registrations.find((row) => row.path === BACKUP_RUN_ROUTE_PATH);
+      const post = () => route.fetch(new Request(`http://local.invalid${BACKUP_RUN_ROUTE_PATH}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ confirm: RUN_CONFIRM_TOKEN }),
+      }));
+      const response = await post();
+      assert.equal(response.status, 200);
+      const body = await response.json();
+      assert.equal(body.ok, true, `${body.reason_code}: ${body.detail}`);
+      assert.equal(body.encryption, 'none', 'backupEncryption defaults to none: no credential is needed');
+      assert.equal(body.unlocked_via, 'none');
+      assert.equal(body.account_binding, undefined, 'an unencrypted repository is never account-bound');
+      assert.deepEqual(readRepoKeys(join(dir, 'repo')).keys.envelopes.map((envelope) => envelope.kind), ['open']);
+      assert.equal(fake.logs.some((entry) => entry.level === 'warn' && entry.message.includes('BACKUP_NO_PERMISSION')), false);
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+
+  it('answers a confirmed sealed run with the engine refusal when this platform has no usable credential', async () => {
     const { home, cleanup: cleanHome } = homeFixture();
     const { dir, cleanup } = tempDir('w2m-run-noperm-');
     try {
       const fake = fakeCtx();
-      apply(fake.ctx, { backupDir: join(dir, 'repo'), dshHome: home, backupMachineKey: false, ...NO_FIRE });
+      apply(fake.ctx, { backupDir: join(dir, 'repo'), dshHome: home, backupMachineKey: false, backupEncryption: 'sealed', ...NO_FIRE });
       const response = await fake.registrations.find((row) => row.path === BACKUP_RUN_ROUTE_PATH).fetch(
         new Request(`http://local.invalid${BACKUP_RUN_ROUTE_PATH}`, {
           method: 'POST',
@@ -266,8 +310,8 @@ describe('subplugin: the route and the timer', () => {
       assert.equal(response.status, 200);
       const body = await response.json();
       assert.equal(body.ok, false);
-      assert.equal(body.reason_code, 'BACKUP_NO_PERMISSION', 'a scheduled/UI run has no password and must refuse rather than write an unopenable repository');
-      assert.match(body.detail, /no credential/u);
+      assert.equal(body.reason_code, 'BACKUP_NO_PERMISSION', 'a sealed scheduled/UI run has no PIN and must refuse rather than write an unopenable repository');
+      assert.match(body.detail, /sealed/u);
       assert.ok(fake.logs.some((entry) => entry.level === 'warn' && entry.message.includes('BACKUP_NO_PERMISSION')));
     } finally {
       cleanup();
@@ -284,7 +328,7 @@ describe('subplugin: the route and the timer', () => {
       const { dir, cleanup } = tempDir('w2m-run-win32-');
       try {
         const fake = fakeCtx();
-        apply(fake.ctx, { backupDir: join(dir, 'repo'), dshHome: home, ...NO_FIRE });
+        apply(fake.ctx, { backupDir: join(dir, 'repo'), dshHome: home, backupEncryption: 'sealed', ...NO_FIRE });
         const response = await fake.registrations.find((row) => row.path === BACKUP_RUN_ROUTE_PATH).fetch(
           new Request(`http://local.invalid${BACKUP_RUN_ROUTE_PATH}`, {
             method: 'POST',
@@ -347,7 +391,7 @@ describe('subplugin: the route and the timer', () => {
       const { dir, cleanup } = tempDir('w2m-route-v348-win-');
       try {
         const fake = fakeCtx();
-        apply(fake.ctx, { backupDir: join(dir, 'repo'), dshHome: source.home, ...NO_FIRE });
+        apply(fake.ctx, { backupDir: join(dir, 'repo'), dshHome: source.home, backupEncryption: 'sealed', ...NO_FIRE });
         const find = (path) => fake.registrations.find((row) => row.path === path);
         const post = (path, body) => find(path).fetch(new Request(`http://local.invalid${path}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }));
 
@@ -422,7 +466,7 @@ describe('subplugin: the route and the timer', () => {
       const { dir, cleanup } = tempDir('w2m-route-account-run-');
       try {
         const fake = fakeCtx({ services: { deepseekAccount: fakeAccountService(ACCOUNT) } });
-        apply(fake.ctx, { backupDir: join(dir, 'repo'), dshHome: home, ...NO_FIRE });
+        apply(fake.ctx, { backupDir: join(dir, 'repo'), dshHome: home, backupEncryption: 'sealed', ...NO_FIRE });
         const find = (path) => fake.registrations.find((row) => row.path === path);
         const post = (path, body) => find(path).fetch(new Request(`http://local.invalid${path}`, {
           method: 'POST',
@@ -526,6 +570,8 @@ describe('cli: run / list / gc', () => {
       assert.equal(firstJson.ok, true, firstJson.detail);
       assert.equal(firstJson.sessions, 1);
       assert.ok(firstJson.blocks_new > 0);
+      assert.equal(firstJson.encryption, 'sealed', 'a password/PIN creates a sealed repository');
+      assert.equal(firstJson.unlocked_via, 'password');
 
       const second = capture();
       assert.equal(main(['run', '--backup-dir', repo, '--dsh-home', home, '--json'], { ...second.io, env, password: PASSWORD }), 0);
@@ -551,16 +597,42 @@ describe('cli: run / list / gc', () => {
     }
   });
 
-  it('refuses without a credential, and reports usage errors as exit 2', () => {
+  it('runs unencrypted by default without a credential, and refuses only when sealed protection is requested', () => {
     const { home, cleanup: cleanHome } = homeFixture();
     const { dir, cleanup } = tempDir('w2m-cli-refuse-');
     try {
       const env = { W2M_BACKUP_NO_MACHINE_KEY: '1' };
+      // The default is none: no credential, no refusal, no key typing.
+      const quiet = capture();
+      assert.equal(main(['run', '--backup-dir', join(dir, 'repo'), '--dsh-home', home, '--json'], { ...quiet.io, env }), 0,
+        quiet.lines.join('\n'));
+      const payload = JSON.parse(quiet.lines.join('\n'));
+      assert.equal(payload.ok, true, payload.detail);
+      assert.equal(payload.encryption, 'none');
+      assert.equal(payload.unlocked_via, 'none');
+      assert.deepEqual(payload.available_paths, ['none']);
+      assert.equal(payload.key_created, true);
+      // The CLI output must never leak the data key that now sits in keys.json.
+      assert.equal(quiet.lines.join('\n').includes(JSON.parse(readFileSync(join(dir, 'repo', 'keys.json'), 'utf8')).envelopes[0].dek), false);
+
+      // Asking for sealed with no credential is the old refusal, and it still walks the exit-1 path.
       const refusal = capture();
-      const code = main(['run', '--backup-dir', join(dir, 'repo'), '--dsh-home', home, '--json'], { ...refusal.io, env });
+      const code = main(['run', '--backup-dir', join(dir, 'sealed'), '--dsh-home', home, '--encrypt', 'sealed', '--json'], { ...refusal.io, env });
       assert.equal(code, 1);
-      const payload = JSON.parse(refusal.lines.join('\n'));
-      assert.equal(payload.reason_code, 'BACKUP_NO_PERMISSION');
+      const refused = JSON.parse(refusal.lines.join('\n'));
+      assert.equal(refused.reason_code, 'BACKUP_NO_PERMISSION');
+      assert.match(refused.detail, /sealed/u);
+
+      // The explicit `--encrypt none` spelling is accepted, and an invalid value is a usage error (exit 2).
+      const explicit = capture();
+      assert.equal(main(['run', '--backup-dir', join(dir, 'explicit'), '--dsh-home', home, '--encrypt', 'none', '--json'], { ...explicit.io, env }), 0);
+      assert.equal(JSON.parse(explicit.lines.join('\n')).encryption, 'none');
+      const bad = capture();
+      assert.equal(main(['run', '--encrypt', 'encrypted'], { ...bad.io, env }), 2);
+      assert.match(bad.lines.join('\n'), /--encrypt must be one of none, sealed/u);
+      const shorthand = capture();
+      assert.equal(main(['run', '--backup-dir', join(dir, 'shorthand'), '--dsh-home', home, '--no-encryption', '--json'], { ...shorthand.io, env }), 0);
+      assert.equal(JSON.parse(shorthand.lines.join('\n')).encryption, 'none');
 
       const badScope = capture();
       assert.equal(main(['run', '--scope', 'everything'], { ...badScope.io, env, password: PASSWORD }), 2);
@@ -569,6 +641,91 @@ describe('cli: run / list / gc', () => {
       const badKeep = capture();
       assert.equal(main(['run', '--keep-old', 'lots'], { ...badKeep.io, env, password: PASSWORD }), 2);
       assert.match(badKeep.lines.join('\n'), /--keep-old needs a non-negative integer/u);
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+
+  it('set-password accepts a 4-digit PIN, prints the weak-PIN warning, and seals an unencrypted repository', () => {
+    const { home, cleanup: cleanHome } = homeFixture();
+    const { dir, cleanup } = tempDir('w2m-cli-pin-');
+    try {
+      const repo = join(dir, 'repo');
+      const env = { W2M_BACKUP_NO_MACHINE_KEY: '1' };
+      const seed = capture();
+      assert.equal(main(['run', '--backup-dir', repo, '--dsh-home', home, '--json'], { ...seed.io, env }), 0, seed.lines.join('\n'));
+
+      const set = capture();
+      const code = main(['unlock', '--backup-dir', repo, '--dsh-home', home, '--set-password', '--password-stdin', '--no-machine-key'], {
+        ...set.io,
+        env,
+        password: '1234',
+      });
+      assert.equal(code, 0, set.lines.join('\n'));
+      assert.match(set.lines.join('\n'), /4 位数字 PIN 只是便捷门槛，不是保密强度/u, 'the honest warning is printed');
+      assert.match(set.lines.join('\n'), /protection {8}: sealed/u);
+      const keys = JSON.parse(readFileSync(join(repo, 'keys.json'), 'utf8'));
+      assert.deepEqual(keys.envelopes.map((envelope) => envelope.kind), ['password'], 'the open envelope is gone');
+      assert.equal(descriptorEncryption(readDescriptor(repo)), 'sealed', 'the descriptor records the sealed mode');
+
+      // The PIN alone now opens the repository; no credential is a refusal.
+      const check = capture();
+      assert.equal(main(['unlock', '--backup-dir', repo, '--dsh-home', home, '--check', '--json', '--no-machine-key'], { ...check.io, env, password: '1234' }), 0);
+      assert.equal(JSON.parse(check.lines.join('\n')).check.via, 'password');
+      const noCredential = capture();
+      assert.equal(main(['unlock', '--backup-dir', repo, '--dsh-home', home, '--check', '--json', '--no-machine-key'], { ...noCredential.io, env }), 1);
+      assert.equal(JSON.parse(noCredential.lines.join('\n')).check.reason_code, 'BACKUP_NO_PERMISSION');
+
+      // `--enable-protection` is an alias of the set-password path; without a PIN it is refused.
+      const enabled = capture();
+      assert.equal(main(['unlock', '--backup-dir', repo, '--dsh-home', home, '--enable-protection', '--json', '--no-machine-key'], { ...enabled.io, env }), 1);
+      assert.equal(JSON.parse(enabled.lines.join('\n')).reason_code, 'BACKUP_PASSWORD_EMPTY');
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+
+  it('disable-protection needs its confirmation token, turns sealed into open, and then unlocks with no credential', () => {
+    const { home, cleanup: cleanHome } = homeFixture();
+    const { dir, cleanup } = tempDir('w2m-cli-disable-');
+    try {
+      const repo = join(dir, 'repo');
+      const env = { W2M_BACKUP_NO_MACHINE_KEY: '1' };
+      runBackup({ root: repo, dshHome: home, password: '1234', platform: 'linux', machineKey: false });
+      assert.equal(readRepoKeys(repo).keys.envelopes.map((envelope) => envelope.kind).join(','), 'password');
+
+      const unconfirmed = capture();
+      assert.equal(main(['unlock', '--backup-dir', repo, '--dsh-home', home, '--disable-protection', '--password-stdin', '--no-machine-key'], {
+        ...unconfirmed.io,
+        env,
+        password: '1234',
+      }), 2);
+      assert.match(unconfirmed.lines.join('\n'), /--confirm disable-protection/u);
+      assert.deepEqual(readRepoKeys(repo).keys.envelopes.map((envelope) => envelope.kind), ['password'], 'nothing was written without confirmation');
+
+      const disabled = capture();
+      const code = main(['unlock', '--backup-dir', repo, '--dsh-home', home, '--disable-protection', '--confirm', 'disable-protection', '--password-stdin', '--no-machine-key', '--json'], {
+        ...disabled.io,
+        env,
+        password: '1234',
+      });
+      assert.equal(code, 0, disabled.lines.join('\n'));
+      const payload = JSON.parse(disabled.lines.join('\n'));
+      assert.equal(payload.ok, true, payload.detail);
+      assert.equal(payload.changed, true);
+      assert.equal(payload.mode_before, 'sealed');
+      assert.equal(payload.mode_after, 'none');
+      assert.equal(payload.warning, '未加密：任何能访问该目录的人都能还原备份');
+      assert.deepEqual(readRepoKeys(repo).keys.envelopes.map((envelope) => envelope.kind), ['open']);
+
+      const unlocked = capture();
+      assert.equal(main(['unlock', '--backup-dir', repo, '--dsh-home', home, '--check', '--json'], { ...unlocked.io, env }), 0);
+      const unlockedPayload = JSON.parse(unlocked.lines.join('\n'));
+      assert.equal(unlockedPayload.check.via, 'none', 'after disabling protection no credential is needed');
+      assert.equal(unlockedPayload.encryption, 'none');
+      assert.equal(unlockedPayload.warning, '未加密：任何能访问该目录的人都能还原备份');
     } finally {
       cleanup();
       cleanHome();

@@ -10,7 +10,7 @@
 
 1. 把 `$DSH_HOME` 里**不可再生的东西**（会话日志、附件对象、工作区索引）完整备份到 `D:\DeepSeekHarness\BackUP`，默认每天 22:00（时区可配）。
 2. 还原后 **DSH 能直接打开**——不是"文件回去了"，而是"侧边栏看得见、点得开、能继续对话"。
-3. 全程加密；解锁走**账户 / 本机 / 密码**三信封，任一条可用即可；无权限时给具名提示而不是 EPERM。
+3. **三种保护状态（不是绝对保密，§25.0）**：默认 `none`（不加密；DEK 明文在 `keys.json`，任何人读到仓库目录即可还原）、`sealed` + 账户 ID 比对（同账户快捷解锁）、`sealed` + 4-6 位数字 PIN（账户不匹配时的便捷门槛）。`sealed` 下解锁走**账户 / 本机 / PIN** 信封，任一条可用即可；无权限时给具名提示而不是 EPERM。
 4. 会话被**持续写入**时也能安全备份（只读快照语义，绝不改源文件）。
 
 **非目标（v1 明确不做）**
@@ -27,7 +27,7 @@
 ## 3. 仓库布局
 
 ```
-<root>/backup.json                             描述符：format/version/block_size/cipher（明文）
+<root>/backup.json                             描述符：format/version/block_size/cipher/encryption（明文）
 <root>/objects/<aa>/<sha256>                   内容寻址的加密块（去重单元，明文块哈希命名）
 <root>/snapshots/<snapshot_id>/manifest.json   路径/大小/时间/哈希（明文，不含消息正文）
 <root>/keys.json                               仓库级 DEK 的加密信封（权威副本；v3.4.7）
@@ -154,22 +154,31 @@
 
 | 信封 | 材料来源 | 作用 | 可得性 |
 |---|---|---|---|
-| `account` | HKDF(`w2m-account-binding|<accountId>`)：账户**标识**，不是秘密（§25，2026-11-17 用户决定） | 身份绑定：同账户免密（比对 id，一致放行） | 宿主能读到 `userId` 时；**不承诺机密性** |
+| `open` | **DEK 明文**写在 `keys.json` 的 `open` 记录里（无 KDF、无 sealed 负载） | **不加密**（默认）：不需要任何凭据即可解封 | 一直可得；**等于没有机密性**：任何能读仓库目录的人都能还原（§25.0） |
+| `account` | HKDF(`w2m-account-binding|<accountId>`)：账户**标识**，不是秘密（§25） | 身份绑定：同账户免密（比对 id，一致放行） | 宿主能读到 `userId` 时；**不承诺机密性** |
 | `machine` | 本机随机 key，由 OS 钥匙串/DPAPI 保护 | 同机免密 | Windows 可得（DPAPI）；macOS 未实现 |
-| `password` | 用户密码，scrypt | 换机/清材料后唯一路径 | **必须永远可用** |
+| `password` | 用户 PIN/密码（4-6 位数字是预期用法），scrypt | 换机/清材料/账户不一致时的便捷门槛 | **必须永远可用**；**不是保密强度**（§25.0） |
+
+**保护状态（2026-11-17 用户最终决定，见 §25.0）**：仓库级模式记在 `backup.json` 的加法字段
+`encryption: 'none' | 'sealed'`（旧仓库没有该字段 = `sealed`）。**新建仓库默认 `none`**（`open` 信封，DEK
+明文）；只有调用方明确要求（提供 PIN/密码、`machineKey: true`、可解析的账户 id 绑定，或显式
+`run --encrypt sealed` / `backupEncryption: sealed`）才建 `sealed` 仓库。`open` 记录**绝不与任何凭据信封
+混存**：`validateKeysFile` 具名拒绝（否则 open 路径会静默绕过已设置的 PIN）。把 `sealed` 转回 `none` 的显式
+命令是 `w2m-backup unlock --disable-protection --confirm disable-protection`（同一 DEK，不重写任何块）。
 
 **spike 之后的结论（2026-11-17，见 `docs/SPIKE-ACCOUNT-KEK.md` §0）**
 
 1. DSH 0.2.2-rc.3 只向 Host 提供账户**标识** `userId`（仅内存缓存、需已登录+联网+一次成功 `getProfile`），磁盘上没有稳定的 account id/email/公钥指纹；`.anonymous-user-id` 是安装级随机 UUID，grant token 会随登录/过期/issuer 变化被替换或删除。**`userId` 是标识不是秘密**——只用它派生 KEK 等于"任何人都能解密"的加密表演，所以 v3.4.7 **默认不写 `account` 信封**；只有当宿主能提供真正的每账户秘密（或产品明确接受这种非机密性"便捷解封"）才启用。
-2. `machine` 信封可行：本机 DPAPI（CurrentUser）32B→262B 密文 round-trip 实测通过，跨进程可解；仓库里已有实现可复用（`src/decision-center/lib/ai-secret-store.mjs`）。macOS 分支目前明确 `keychain-not-implemented`，所以非 Windows 机器在 v3.4.7 只有密码路径。
+2. `machine` 信封可行：本机 DPAPI（CurrentUser）32B→262B 密文 round-trip 实测通过，跨进程可解；仓库里已有实现可复用（`src/decision-center/lib/ai-secret-store.mjs`）。macOS 分支目前明确 `keychain-not-implemented`，所以非 Windows 机器在 **`sealed` 模式**下只有 PIN/密码路径（默认 `none` 不需要任何路径）。
 3. scrypt 实测：N=2^14≈56 ms、2^15≈111 ms、2^16≈227 ms、**2^17≈461 ms**（参考机）；默认取 **N=2^17 / r=8 / p=1**（约 1 s 预算的 2.2× 余量，单次 128 MiB 内存）。
-4. 因此**默认信封组合 = `machine` + `password`**；`account` 是可选第三信封，且写入前必须修掉一处调用：w2m 现有 `await service.getProfile()`（零参，`src/chatops/account.mjs`）与 DSH 的 `getProfile(client)` 签名不符，沿用零参时 `userId` 大概率恒为 null，会"看起来支持、实际不可用"。
+4. 因此（本次最终决定之前）**默认信封组合 = `machine` + `password`**；`account` 是可选第三信封。**2026-11-17 最终决定（§25.0）改写了默认**：新仓库默认 `encryption: "none"`，只写 `open` 信封；`machine`/`password`/`account` 只在显式选择 `sealed`（提供 PIN、`machineKey: true`、账户绑定或配置 `backupEncryption: sealed`）时写入。
 
 > **2026-11-17 16:37 增补**：上一条的两项前置条件已闭环——`getProfile(client)` 已修（`src/chatops/account.mjs` 的 `accountClientMetadata`）并在宿主内实测（`docs/SPIKE-ACCOUNT-KEK.md` §8）：`userId` 可得且跨调用/跨 boot 稳定，但**仍只是标识**；Host-only `getPlatformSession()` 能读到 bearer token，但它在登出/401/重新登录时被删除或替换，**不是稳定的每账户秘密**。结论不变：`account` 仍默认不写。
 
-> **2026-11-17 决定增补**：用户明确选择"只读账户唯一识别码做比对，一致就放行，不一致就切换密码模式"，于是
-> `account` 作为**身份绑定**启用（不承诺机密性、不替代 password），默认随成功 run 写入。设计、面板、配置与诚实
-> 安全声明见 **§25**；本节的"`account` 默认不写"是决定之前的结论，保留作为历史记录。
+> **2026-11-17 决定增补**：用户明确选择"只读账户唯一识别码做比对，一致就放行，不一致就切换密码/PIN 模式"，于是
+> `account` 作为**身份绑定**启用（不承诺机密性、不替代 password）。**最终决定（§25.0）进一步把默认改成不加密**：
+> 只有在 `sealed` 仓库里 `account` 才随成功 run 写入（`none` 仓库永不绑定，因为它本来就不需要凭据）。设计、面板、
+> 配置与诚实安全声明见 **§25**；本节的"`account` 默认不写"是决定之前的结论，保留作为历史记录。
 
 规则：
 
@@ -178,7 +187,16 @@
 3. **GCM 分不清"密码错"和"文件被改"**：两者都是 `BACKUP_DECRYPT_AUTH_FAILED` / `BACKUP_KEY_UNWRAP_FAILED`，文案必须同时说明两种可能。**不允许**在代码或 UI 里断言"密码错误"。
 4. **正文块**：`objects/<aa>/<sha256>` 是 `W2MBLOB1 | nonce | ciphertext | tag`，AAD = `w2m-session-backup/object|<plaintext sha256>|<plaintext length>`；打开后再校验 `sha256(明文) == 文件名`。块被搬到别的哈希位上会认证失败。
 5. **DLQ/自检**：`w2m-backup selftest` 在**用户自己的机器上**跑一遍真实 wrap/unwrap + 三种必须失败的篡改，建库前必须先绿。
-6. **仓库级 DEK（v3.4.7 定稿）**：一把随机 DEK 服务整个仓库（见 §3 细化 1）；信封仍是 `account`/`machine`/`password` 三种，默认写 `machine`（可用时）+ `password`（提供时）。**至少一个信封可用才允许建库**，否则 `BACKUP_NO_PERMISSION`——写一个谁也打不开的仓库比不写更糟。定时任务没有密码可输，只能走 `machine` 信封；没有 OS keystore 的平台会具名拒绝（`BACKUP_NO_PERMISSION`），人工路径是 `w2m-backup run --password-stdin`（密码只经 stdin/env，绝不进 argv）。
+6. **仓库级 DEK（v3.4.7 定稿）**：一把随机 DEK 服务整个仓库（见 §3 细化 1）。**保护模式决定信封组合**：
+   `none`（默认）只写一个 `open` 信封（DEK 明文；§25.0）；`sealed` 写 `account`/`machine`/`password` 中
+   可用的组合（默认写 `machine`（可用时）+ `password`（提供时））。`sealed` 建库时**至少一个信封可用**才
+   允许，否则 `BACKUP_NO_PERMISSION`——写一个谁也打不开的仓库比不写更糟。`none` 不需要凭据，因此不会因为
+   "没有凭据"被拒。定时任务没有 PIN 可输：`none` 模式照常可跑；`sealed` 模式只能走 `machine` 信封，没有
+   OS keystore 的平台具名拒绝（`BACKUP_NO_PERMISSION`），人工路径是 `w2m-backup run --password-stdin`
+   （PIN/密码只经 stdin/env，绝不进 argv）。
+7. **open 信封的实现边界**：只新增一种信封记录，**不改**块/清单/轮转/校验/归档/镜像/gc 的任何代码路径——
+   `sealObject`/`openObject` 仍用同一把 DEK；区别只在"钥匙从哪来"。因此关闭保护不重写任何对象，只是
+   `keys.json` 多/换一条记录。
 
 ## 7. 门禁（来自 2026-11-17 复盘，必须接进还原路径）
 
@@ -196,7 +214,9 @@
 
 | 威胁 | 对策 | 残余风险 |
 |---|---|---|
-| 仓库目录被拷走/云盘同步泄露 | 块级 AES-256-GCM；DEK 只在信封里 | 清单明文暴露会话 id/工作区名/大小/时间（**接受并声明**） |
+| 仓库目录被拷走/云盘同步泄露 | 块级 AES-256-GCM；DEK 只在信封里；**默认 `none` 时 DEK 明文在 `keys.json`** | 清单明文暴露会话 id/工作区名/大小/时间（**接受并声明**）；**`none` 模式下整个仓库可被还原**（这是默认状态，见 §25.0）；`sealed` 模式仍有下面的 PIN 残险 |
+| 只防"误操作/随手分享/换机" | 三种模式（§25.0）：不加密（默认）/ 账户比对 / 4-6 位数字 PIN | **都不是机密性**：知道账户 id 且有仓库文件的人可推导 account KEK；4-6 位数字 PIN 可被穷举；两者都是便捷门槛 |
+| 真正要防"文件泄露后仍保密" | 只能 `sealed` + **长密码**（≥8 位、非纯数字）+ 仓库目录访问控制（ACL/加密卷） | 产品**不承诺**默认配置下的机密性；scrypt 参数随文件记录 |
 | 攻击者改一个字节 | GCM tag + AAD + 打开后哈希 | 无法区分"改"与"密码错"（协议如实上报） |
 | 密码被穷举 | scrypt（默认 N=2^16,r=8,p=1，参数随文件） | 弱密码仍可被字典攻击；UI 应给强度提示（v3.4.9） |
 | 仓库被换入别的会话内容 | 块按明文哈希寻址 + 全文件哈希 + 清单计数自洽 | 攻击者若能同时改清单，需要重算全部哈希（无签名） |
@@ -219,14 +239,14 @@
 | `src/backup/layout.mjs` | 路径解析、`inspectLayout`（只读）、`ensureLayout`（建库，v3.4.7 才调用）、具名错误 | `ensureLayout` 会写（测试/未来引擎用） |
 | `src/backup/scan.mjs` | 会话/附件/注册表枚举、header 读取、可选 hash/deep | **绝不** |
 | `src/backup/manifest.mjs` | 清单 schema、块切分、路径规范化、严格校验、摘要 | 只读源文件 |
-| `src/backup/crypto.mjs` | scrypt/hkdf 派生、AES-256-GCM 封包、三信封、块对象、`selftest` | **绝不**（纯内存） |
+| `src/backup/crypto.mjs` | scrypt/hkdf 派生、AES-256-GCM 封包、四信封（open/account/machine/password）、块对象、`selftest` | **绝不**（纯内存） |
 | `src/backup/repo.mjs` | 快照 id、快照两文件、`index.jsonl` 行格式与读写、`commitSnapshot`、只读 `openRepo` | 仅 `commitSnapshot`/`appendIndex` 会写（测试与 v3.4.7 引擎；路由与 CLI 不调用） |
 | `src/backup/engine.mjs` | `runBackup`：锁 → 建库 → 开 KEK → 扫描 → 按 scope 选会话 → 写缺失块（去重）→ 提交快照 → 轮转 | 会写（这是引擎） |
 | `src/backup/rotation.mjs` | `current/` 指针、`old/` 版本记录、每会话保留窗口 | 会写 |
 | `src/backup/gc.mjs` | 引用收集（快照 + old + current）、孤儿块删除、old 保留窗口；任一引用不可读即**拒绝删除** | 会写（`dryRun` 时只读） |
 | `src/backup/locks.mjs` | `tmp/backup.lock`：`wx` 原子创建、死 pid/超龄/不可读三种回收、只释放自己的锁 | 只写锁文件 |
 | `src/backup/atomic.mjs` | `writeFileAtomic`（tmp → fsync → rename）、`writeJsonAtomic`、`readJsonSafe` | 会写 |
-| `src/backup/keystore.mjs` | 打开/创建仓库 DEK：machine + password 信封，二者皆无则 `BACKUP_NO_PERMISSION` | 写 `keys.json` |
+| `src/backup/keystore.mjs` | 打开/创建仓库 DEK：`none`（open 信封）/ `sealed`（machine + password/PIN + 可选 account），模式创建/升级/降级（`setRepositoryPassword` / `setEncryptionMode`） | 写 `keys.json`、同步 `backup.json` 的 `encryption` |
 | `src/backup/machine-key.mjs` | 32B 随机机器秘密 + OS 钥匙串（Windows DPAPI，实测 round-trip）；macOS/Linux 明确 `unavailable` | 写 `$DSH_HOME/xclient/backup/machine.key` |
 | `src/backup/schedule.mjs` | 备份计划配置（默认 22:00 Asia/Shanghai）、时间/时区严格校验、next/missed 计算 | **绝不** |
 | `src/plugin/backup.mjs` + `lib/backup.js` | `dsh-backup` 子插件：`ctx.effect` 拥有的定时器 + `GET/POST /api/w2m/backup/run`（POST 需 `{"confirm":"run"}`） | 经引擎写 |
@@ -251,8 +271,9 @@
 | `BACKUP_KDF_WEAK` | 加密参数过弱，拒绝创建 |
 | `BACKUP_DECRYPT_AUTH_FAILED` | 解锁失败：密码/账户不对，或文件被改动过（无法区分） |
 | `BACKUP_KEY_UNWRAP_FAILED` | 当前凭据打不开这份备份，请用原账户或解锁密码 |
-| `BACKUP_PASSWORD_EMPTY` | 请输入解锁密码 |
-| **`BACKUP_NO_PERMISSION`** | **没有权限：请用原账户登录，或输入解锁密码**（v3.4.8 解锁失败的统一对外码） |
+| `BACKUP_PASSWORD_EMPTY` | 请输入解锁 PIN/密码（至少 4 个字符；4-6 位数字是便捷门槛，不是保密强度） |
+| `BACKUP_ENVELOPE_MALFORMED` | 信封结构无效；**同一 `keys.json` 里的 `open` 信封不能与 account/machine/password 混存**（会静默绕过凭据） |
+| **`BACKUP_NO_PERMISSION`** | **没有权限：请用原账户登录，或输入解锁 PIN/密码**（v3.4.8 解锁失败的统一对外码；`none` 模式不需要凭据，不会出现此码） |
 | `BACKUP_ACCOUNT_MISMATCH` | 当前账户不是原账户：已改走密码路径（§25；`attempts` 里的具名原因，对外仍可能是 `BACKUP_NO_PERMISSION`） |
 | `BACKUP_ACCOUNT_ID_INVALID` / `BACKUP_ACCOUNT_BINDING_UNKNOWN` | 账户 id 不可用 / 已有 account 信封但缺 `account_binding` 元数据，无法比对（拒绝且不改写） |
 | `BACKUP_SELFTEST_FAILED` | 加密自检未通过：这台机器上的备份不可信 |
@@ -270,17 +291,17 @@
 | `BACKUP_MIRROR_INVALID` | 异地副本路径非法（仓库/home 内、等于仓库根、是文件、真实路径不可解析），本次备份未开始 |
 | `BACKUP_MIRROR_SYMLINK` | 异地副本经 symlink/junction 的真实路径落在仓库/home 内，本次备份未开始 |
 | `BACKUP_MIRROR_FAILED` | 异地副本复制失败；主库备份**已提交且可用**，下次同步会自动补齐 |
-| `BACKUP_CONFIG_INVALID` | 备份子插件配置项非法（v3.5.0 新增的两项在此校验） |
+| `BACKUP_CONFIG_INVALID` | 备份子插件配置项非法（含 `backupEncryption`；`run --encrypt` 非法值在 CLI 是退出码 2） |
 | `BACKUP_REPO_SNAPSHOT_*` / `BACKUP_REPO_INDEX_LINE_INVALID` | 快照或索引行不可用 |
 | `BACKUP_SCAN_HEADER_UNREADABLE` / `BACKUP_SCAN_NOT_ZSTD` | 会话日志头部不可读/不是 zstd |
 
 ## 12. 未决问题
 
-1. **账户信封**：spike 已给出结论（§6）：`userId` 不是秘密，默认不写。实现前的两件事已于 2026-11-17 16:37 完成——`getProfile(client)` 已修并做宿主内实测（`docs/SPIKE-ACCOUNT-KEK.md` §8）：`userId` 可得且稳定但仍只是标识；Host-only token 可读但易变，不能做稳定 KEK。**2026-11-17 决定（§25）**：用户选择只做"比对唯一识别码"的身份绑定，`account` 信封按 §25 启用，明确不承诺机密性、不替代 password；等上游提供"每账户稳定秘密"后再评估更强的账户信封（条件清单见 `docs/SPIKE-ACCOUNT-KEK.md` §8.5）。
+1. **账户信封 → 已定稿为"便捷优先"（§25.0，2026-11-17 用户最终决定）**：用户明确"追求的不是绝对保密"：默认**不加密**（`none`，DEK 明文在 `keys.json`）；账户 id 只做比对以便自动化快捷解锁；PIN 是 4-6 位数字、只在账户不匹配时使用。spike 的结论（`userId` 是标识不是秘密、token 易变）未被改写；因此 `account` 信封**只当便捷路径**，永不替代 password，也不当机密性承诺。等上游提供"每账户稳定秘密"后再评估更强的账户信封（条件清单见 `docs/SPIKE-ACCOUNT-KEK.md` §8.5、§9）。
 2. **清单是否也该加密**：v1 选择明文（§4 理由）。若用户要求，v2 可加 `manifest.enc` + 明文 `snapshot.json`（只留计数）。
 3. **`current/` 已定稿**：存指针（见 §3 细化 3），轮转与 gc 都以它为根之一。
 4. **保留策略默认值已定稿**：每会话 10 份旧版本（Q4=A），`keepOldPerSession` 可配；轮转后立即裁剪，窗口不会无声增长。
-5. **macOS 的 machine 信封**：需要 keychain 实现；在补齐之前，macOS 只有密码路径（v3.4.8 解锁流程要按平台给出不同文案）。
+5. **macOS 的 machine 信封**：需要 keychain 实现；在补齐之前，macOS 的 **`sealed` 模式**只有 PIN/密码路径（`none` 模式不需要凭据；v3.4.8 解锁流程要按平台给出不同文案）。
 
 ## 13. 引擎、调度与轮转（v3.4.7）
 
@@ -1044,9 +1065,48 @@ blocks 重建旧版本，不把 `.enc` 计入引用。
 篡改的副本不会被本命令发现（`verify` 也尚未逐份解密 `.enc`，见上面的诚实边界）。本命令不改配置、不自动启用
 `full`、不自动运行（引擎**不**自动回填），只补磁盘上已有的记录；`run`/`gc` 的默认行为不变。
 
-## 25. 账户 ID 绑定解锁（用户决定：只比对唯一识别码，2026-11-17）
+## 25. 保护模式（用户最终决定：便捷优先，不是绝对保密，2026-11-17）
 
-**用户决定（原话）**：
+### 25.0 用户最终决定：三种保护状态，默认不加密
+
+**用户原话（最终决定）**：
+
+> 我们追求的不是绝对保密：
+> 1，用账户ID是为了方便实现自动化（账户能快捷解锁，不是必须）
+> 2，密码也是4-6位数字（账户不对输入密码）
+> 3，也可以选择不加密（1账户不对，2又没有设置密码，3默认是不加密的）
+
+**一句话：本产品的目标不是绝对保密。** 它防的是**误操作、随手分享、换机/换账户后的打不开**，不是"拿到
+仓库文件的人也打不开"。仓库级模式记在 `backup.json` 的加法字段 `encryption: 'none' | 'sealed'`（旧仓库
+没有该字段 = `sealed`）；真正的行为以 `keys.json` 的信封为准（`open` = `none`，其余 = `sealed`）。
+
+| 状态 | 凭据 | 它实际防什么 | 它不防什么 |
+|---|---|---|---|
+| **`none`（默认）** | 无。`keys.json` 里的 `open` 信封**明文保存 DEK** | 只防"忘了密码/账户换了"：仓库永远打得开 | **一切**：任何能访问仓库目录的人都能还原备份（状态卡与解锁卡都显示这句警告） |
+| **`sealed` + 账户比对** | 宿主账户唯一识别码，与绑定的 id 比对；一致即免密 | 账户不匹配时的误用；自动化快捷解锁 | 知道该账户 id 且拿到仓库文件的人（可推导 account KEK） |
+| **`sealed` + 4-6 位数字 PIN** | scrypt(PIN)，PIN 只在终端/stdin 输入 | 账户不一致、或换机时没有 PIN 的人 | 4-6 位数字空间很小，可被穷举；它不是保密强度 |
+
+**模式的创建 / 升级 / 降级（实现规则）**：
+
+1. **默认**：新建仓库 `none`，写一个 `open` 信封；不需要任何凭据，也不会因为"没有凭据"被拒。
+2. **升级为 `sealed`**：以下任一明确要求——提供 PIN/密码（`run --password-stdin` /
+   `setRepositoryPassword`）、`machineKey: true`、可解析的账户 id（`backupAccountBinding`）、或显式
+   `run --encrypt sealed` / `backupEncryption: sealed`。向 `open` 仓库写入 PIN 或 account 绑定时，**同一次
+   写入删除 `open` 记录**并同步 `backup.json` 的 `encryption: sealed`（否则 open 路径会静默绕过凭据）。
+3. **降级为 `none`**：`setEncryptionMode({mode:'none'})` / CLI
+   `w2m-backup unlock --disable-protection --confirm disable-protection`——先用**现有凭据**打开，再用**同一
+   DEK** 写 `open` 记录，先备份 `keys.json.bak-<ts>` 再原子写，最后用**无凭据**解一次验证。不重写任何
+   块（块格式不变）。
+4. **混存拒绝**：`validateKeysFile` 拒绝同时含 `open` 与任何 account/machine/password 信封的文档；这是
+   `BACKUP_ENVELOPE_MALFORMED`，不是"优先选一个"。
+5. **弱凭据提示**：4-6 位数字 PIN 被接受（下限 4 字节），但结果带 `weak: true` + 警告
+   「4 位数字 PIN 只是便捷门槛，不是保密强度」；**不静默提高 scrypt 成本**来假装它更强。
+
+**什么时候才值得选 `sealed` + 强密码**：当威胁是"仓库文件本身会泄露"（共享盘、云同步、别人能读 D 盘）而不是
+"自己忘了/账户不对"。那就必须 `sealed` + **≥8 位、非纯数字的长密码**（`weak` 为 false），并且仍然用 ACL /
+加密卷保护仓库目录；本产品不会宣称默认配置具备这种保护。
+
+**用户此前的账户决定（历史记录，仍然有效）**：
 
 > 不用打开账户，只需要读取账户唯一识别码ID，进行比对就行，一致就放行。不一致就切换密码模式。
 
@@ -1055,9 +1115,10 @@ blocks 重建旧版本，不把 `.enc` 计入引用。
 （Host-only，`src/chatops/account.mjs` 的 `createAccountIdentity({ctx}).identify()`，`getProfile(client)` 已修），
 但**没有**稳定的每账户秘密。用户明确选择了"只拿这个标识做比对"的第三条路。
 
-### 25.1 这是什么：身份绑定，不是机密性（必须先读）
+### 25.1 账户路径是什么：身份绑定，不是机密性（必须先读）
 
-仓库多一个 `account` 信封：DEK 被 `HKDF(w2m-account-binding|<accountId>)` 包裹（`deriveKek`，hkdf-sha256，随机
+**先读 §25.0：本产品默认不加密，账户路径只是便捷路径。** 在 `sealed` 模式下，仓库多一个 `account` 信封：
+DEK 被 `HKDF(w2m-account-binding|<accountId>)` 包裹（`deriveKek`，hkdf-sha256，随机
 salt 随信封记录），绑定的账户 id 与绑定时间记在 `keys.json` 根字段：
 
 ```json
@@ -1072,38 +1133,50 @@ salt 随信封记录），绑定的账户 id 与绑定时间记在 `keys.json` �
 }
 ```
 
-> ### 诚实安全声明（用户已知并接受）
+> ### 诚实安全声明（用户已知并接受，§25.0 是总声明）
 >
-> **账户 id 是标识，不是秘密。这条路径提供的是"身份绑定/便捷解封"，不是机密性。** 任何知道该账户 id 且拿到
-> 仓库文件（`keys.json` + `objects/`）的人，都能推导出同一个 KEK 并解开备份——这正是"只比对 ID"这一决定的直接
+> **本产品的目标不是绝对保密。账户 id 是标识，不是秘密；4-6 位数字 PIN 是便捷门槛，不是保密强度；默认
+> 模式甚至不加密。** 任何知道该账户 id 且拿到仓库文件（`keys.json` + `objects/`）的人，都能推导出同一个
+> account KEK 并解开备份；任何能读到仓库目录的人都能解开 `none` 模式。这正是"便捷优先"这一决定的直接
 > 代价，用户在原话里明确接受。因此：
 >
-> * `account` 信封**永不替代** `password` 信封：`password` 仍是跨机器/跨账户的唯一秘密路径，仍必须永远可用；
+> * `none`（默认）下**没有任何机密性**：`open` 信封明文保存 DEK。状态/解锁卡必须显示
+>   「未加密：任何能访问该目录的人都能还原备份」，不许把默认说成"已加密"。
+> * `account` 信封**永不替代** `password` 信封：`password`（PIN）仍是跨机器/跨账户的便捷路径；
 > * 面板/CLI/日志**永远不打印完整账户 id**，只打印后 4 位（`id_hint`，形如 `…abcd`）；
 > * `keys.json` 里**明文**保存了账户 id（比对需要它）；这不是新增的机密性假设，但它是可识别信息，仓库文件
->   仍应按"可泄露会话清单"对待（§8 的威胁模型不变：真正的秘密是密码与机器密钥）；
-> * 仅当 `backupAccountBinding`（默认 `true`）开启时才读取/绑定；关闭后行为与本功能之前完全一致。
+>   仍应按"可泄露会话清单"对待（§8 的威胁模型不变：真正的秘密是长密码与机器密钥）；
+> * 仅当 `backupAccountBinding`（默认 `true`）开启**且仓库是 `sealed`**时才读取/绑定账户 id；`none` 仓库
+>   永不绑定（它已经不需要凭据）。关闭后行为与本功能之前完全一致。
 
 ### 25.2 匹配 / 不匹配流程
 
-候选凭据顺序由协议固定（`crypto.unwrapDek` 的 `ENVELOPE_KINDS`）：**account → machine → password**。
+候选凭据顺序由协议固定（`crypto.unwrapDek` 的 `CREDENTIAL_ENVELOPE_KINDS`）：**account → machine → password**。
+`open` 信封不是凭据：它存在时直接返回 DEK（`kind: "open"`，`unlocked_via: "none"`），不尝试也不要求任何凭据。
 
 | 情况 | 行为 |
 |---|---|
+| 仓库是 `none`（`open` 信封） | 不需要凭据，直接解封；`unlocked_via: "none"`；结果带未加密警告 |
 | 仓库绑定了账户 id，宿主读到的 id **一致** | account 信封参与解封（无密码、无 machine 也可打开，`unlocked_via: "account"`） |
 | 仓库绑定了账户 id，宿主 id **不一致** | 不尝试 account 信封；`attempts` 记录 `{kind:"account", ok:false, code:"BACKUP_ACCOUNT_MISMATCH"}`，继续 machine/password |
 | 不一致且没有可用的 machine/password | 对外仍是统一的 `BACKUP_NO_PERMISSION`（与 §11 一致；不新增第二套"拒绝"文案） |
 | 仓库未绑定账户 id | 不比较（`account.matched: null`），行为与本功能之前一致 |
 | 宿主读不到 id（未登录/无账户服务/绑定关闭） | 不比较（`matched: null`），面板提示改用密码 |
 
-结果字段（`openRepoKey` / `describeUnlock` / `unlockRepo` 都带，纯加法）：
+结果字段（`openRepoKey` / `describeUnlock` / `unlockRepo` / 状态路由都带，纯加法）：
 
 ```js
+encryption: 'none' | 'sealed' | null,       // 仓库真实保护模式（null = 还没有 key 文档/未初始化）
+available_paths: ['none'] | ('account'|'machine'|'password')[],  // 实际存在哪些解封路径
+warning: '未加密：任何能访问该目录的人都能还原备份' | null,       // 仅 none 模式
 account: { bound: true|false, matched: true|false|null, id_hint: '…abcd'|null }
 ```
 
 `matched` 只在"仓库有绑定且调用方给了 id"时才是布尔值；其余情况 `null`（没有可比较的对象，不猜）。
 **完整账户 id 绝不出现在任何结果、CLI 输出、HTTP 响应或日志里**——只有 `id_hint`（后 4 位）。
+**DEK 也绝不出现在任何结果对象里**：`none` 模式下它明文存在 `keys.json` 的 `open` 信封中（这是它的定义），
+但 describe/status/run/CLI 结果都不回显它；`openRepoKey` 的内部 `dek` Buffer 只给包内调用者（引擎/verify/
+restore）使用。
 
 ### 25.3 绑定（写入）语义
 
@@ -1120,7 +1193,10 @@ account: { bound: true|false, matched: true|false|null, id_hint: '…abcd'|null 
 * 账户 id 不可用（空/非字符串/超长）→ `BACKUP_ACCOUNT_ID_INVALID`；
 * 存在 `account` 信封但没有 `account_binding` 元数据（无法比对）→ `BACKUP_ACCOUNT_BINDING_UNKNOWN`，不覆盖、不猜；
 * 绑定**永远发生在一次成功 run 之后**（或操作员显式调用 `bindAccount`），账户 id 本身**不能**成为建库理由：
-  建库仍要求 machine 或 password（§6 规则 6 不变）。
+  `sealed` 建库仍要求 machine 或 password/PIN（§6 规则 6）；`none` 建库不需要任何凭据。
+* **只对 `sealed` 仓库绑定**：`runBackup` 在 `encryption: "none"` 时跳过 account 绑定（否则第一次 run 会把默认
+  的不加密仓库静默改成 sealed）。直接调用 `addAccountEnvelope`/`bindAccount` 于 `open` 文档时会移除 `open`
+  记录并把它转成 `sealed`（同一 DEK）——这是显式操作，不是运行路径的副作用。
 
 **真实仓库迁移不在本次代码任务内**（由 lead 执行）；`bindAccount` 可独立调用，一行示例（PowerShell，先替换
 `<accountId>`；正斜杠路径在 Windows Node 下合法）：
@@ -1145,38 +1221,53 @@ node --input-type=module -e "import { bindAccount } from 'file:///E:/GPT/w2m/w2m
 
 ### 25.5 面板文案（`lib/client.js`）
 
-解锁卡在"仓库绑定了账户"时增加账户路径行（HTTP 仍不接收任何凭据，按钮只发 `{"confirm":"unlock"}`）：
+解锁卡按仓库的 `encryption` 画三种状态（HTTP 仍不接收任何凭据，按钮只发 `{"confirm":"unlock"}`）：
 
 | 状态 | 文案（中） | 按钮 |
 |---|---|---|
-| `bound: true, matched: true` | 本机账户与原账户一致，可直接解锁。 | 「用原账户解锁」可点 |
-| `bound: true, matched: false` | 当前账户不是原账户：请使用解锁密码。 | 禁用（不能点） |
-| `bound: true, matched: null` | 读取不到本机账户 ID（可能未登录，或账户绑定已关闭）：请使用解锁密码。 | 禁用 |
-| `bound: false` | 不显示账户行（原卡片不变） | — |
+| `encryption: none`（默认） | 「未加密：任何能访问该目录的人都能还原备份」+「仓库未加密：不需要账户或 PIN，直接可以解锁」+ 关闭保护说明 | 「解锁」可点（无凭据） |
+| `sealed`，`bound: true, matched: true` | 本机账户与原账户一致，可直接解锁。 | 「用原账户解锁」可点 |
+| `sealed`，`bound: true, matched: false` | 当前账户不是原账户：请使用解锁 PIN。（面板只提示） | 禁用的账户按钮；文案说明 PIN 只在终端输入（`w2m-backup unlock --check --password-stdin`），并显示「4 位数字 PIN 只是便捷门槛，不是保密强度」 |
+| `sealed`，`bound: true, matched: null` | 读取不到本机账户 ID（可能未登录，或账户绑定已关闭）：请使用解锁 PIN。 | 禁用 |
+| `sealed`，`bound: false` | 不显示账户行 | — |
 
-行内始终显示"原账户绑定：{hint}（只显示后 4 位）"；新错误码 `BACKUP_ACCOUNT_MISMATCH` 走
-`panel.backup.reason.*` 文案映射（未知码仍原样显示）。
+状态卡同时显示保护模式徽标（`未加密（默认）` 用警告色 / `已加密`）与未加密警告行；仓库真实模式来自
+`GET /api/w2m/backup/status` 的 `encryption` / `repository.encryption` 与 `GET /api/w2m/backup/unlock` 的
+`encryption`，面板不自行推断。行内仍显示"原账户绑定：{hint}（只显示后 4 位）"；新错误码
+`BACKUP_ACCOUNT_MISMATCH`、`BACKUP_CONFIG_INVALID` 走 `panel.backup.reason.*` 文案映射（未知码仍原样显示）。
 
 ### 25.6 测试与验证
 
-* `test/backup-keystore.test.mjs`：machine-only 仓库加 account 信封后 `machineKey:false + accountId` 可开且 DEK 不变；
-  错误 id 被拒但 machine/password 仍可开；重复绑定 no-op、换绑具名拒绝；`account_binding` 元数据存在；信封列表含
-  `account`；空/非法 id 拒绝且零写入。
-* `test/backup-access.test.mjs`：`describeUnlock` 报告 bound/matched 且不泄露完整 id（JSON 里搜不到 id 原文）；
-  mismatch 文案状态；mismatch + password 走密码成功；mismatch 且无密码 → `BACKUP_NO_PERMISSION` + attempts 记录。
-* `test/backup-run.test.mjs`：插件路由用假 `deepseekAccount` 服务比对 id（不联网）、绑定关闭时 `matched: null`、
-  Windows 真实 DPAPI 下 run 后自动绑定并经 account 解锁、CLI `--account-id` 解析/真实入口/JSON 形状/人类输出脱敏/
-  usage。
-* `test/client-bundle.test.mjs`：账户路径三态（matched 可点、mismatch 按钮禁用 + 密码提示、未绑定卡片不变）、
-  字典与 reason code 映射。
-* `docs/SPIKE-ACCOUNT-KEK.md` 顶部加"决定更新"注记（不改写原测量）。
+* `test/backup-keystore.test.mjs`：新增"默认 `none` + `open` 信封 + 无凭据可开"、"显式 `sealed` 无凭据被拒"、
+  "4 位 PIN 建 sealed 仓库并拒绝无凭据打开"、"往 open 仓库加 PIN → 删 open、转 sealed、此后无凭据打不开"、
+  "`setEncryptionMode('none')` 把 sealed 转回 open（同 DEK、无凭据可开、幂等）"、"open 与任何凭据信封混存被
+  `validateKeysFile` 拒绝"、"DEK 不出现在 describe/status/conversion 结果"；外加既有 machine-only/account 绑定
+  （改用 `machineKey: true` 显式要求 sealed）。
+* `test/backup-crypto.test.mjs`：open 记录形状/明文语义/`unwrapDek` attempts、混存与畸形记录拒绝。
+* `test/backup-access.test.mjs`：`describeUnlock` 报告 `encryption`/`available_paths`/未加密警告；无凭据
+  `unlockRepo` 得 `via: "none"` 且不带 DEK；sealed 仓库报告 `sealed`。
+* `test/backup-engine.test.mjs`：无凭据首次建库 `encryption: "none"`、第二次仍去重；`password: "1234"` 建
+  sealed 并拒绝无凭据 run；非法 `encryption` 与 `none + password` 在 `ensureLayout` 前拒绝；显式 sealed 无凭据
+  的 `BACKUP_NO_PERMISSION`。
+* `test/backup-run.test.mjs`：配置 `backupEncryption` 默认 `none`/非法值拒绝；插件默认 run 成功且
+  `unlocked_via: "none"`、显式 sealed 才拒绝；CLI `run --encrypt none|sealed`/`--no-encryption`、退出码、
+  `unlock --set-password` 的 4 位 PIN 与警告行、`--disable-protection --confirm` 前后状态。
+* `test/backup-verify.test.mjs` / `test/backup-restore.test.mjs`：`none` 仓库无需密码即可 verify / plan+apply
+  restore。
+* `test/client-bundle.test.mjs`：解锁卡三态（未加密/账户一致/账户不一致 + PIN 提示）、状态卡模式徽标、未加密
+  警告、新 i18n 键与 `BACKUP_CONFIG_INVALID` 映射。
+* `docs/SPIKE-ACCOUNT-KEK.md` §9 记录"用户最终决定：便捷优先"。
 
 ### 25.7 诚实边界（本次不承诺的）
 
-* **不是机密性**：见 §25.1 的声明。知道账户 id 的人拿到仓库文件即可解密——这是用户决定的直接代价，不是缺陷。
-* 账户 id 由宿主提供；**CLI 不会自己读**。宿主未登录/断网/无账户服务时 account 路径不可用，密码路径照旧。
-* 面板的账户路径按钮与 machine 按钮都只发同一个确认令牌；面板从不接收密码，密码路径仍只在离线 CLI。
-* `account` 信封**不能**在"换账户 + 无 machine + 无 password"时救回仓库：那是 password 路径的职责。
-* 已经存在的旧快照目录里的 `keys.json` 副本没有新绑定（绑定只写根 `keys.json`，下一次快照起副本才有）；从旧快照
-  直接还原仍走 machine/password。
-* 不 bump 版本号、不跑 preflight、不提交；真实仓库迁移由 lead 用 §25.3 的命令执行。
+* **不是机密性**：见 §25.0 的声明。默认 `none` 下仓库目录本身即可解密；`sealed` 下知道账户 id 的人可推导
+  account KEK、4-6 位数字 PIN 可被穷举。这些都不是缺陷，是"便捷优先"决定的直接代价。
+* **默认不加密是产品行为，不是错误**：状态卡/解锁卡/CLI 明确显示「未加密：任何能访问该目录的人都能还原备份」，
+  不把 `none` 说成"已加密"。
+* 账户 id 由宿主提供；**CLI 不会自己读**。宿主未登录/断网/无账户服务时 account 路径不可用，PIN 路径照旧。
+* 面板的账户路径按钮与 machine 按钮都只发同一个确认令牌；面板从不接收密码，PIN 路径仍只在离线 CLI。
+* `account` 信封**不能**在"换账户 + 无 machine + 无 password"时救回仓库：那是 PIN 路径的职责。
+* 已经存在的旧快照目录里的 `keys.json` 副本没有新绑定/新模式变化（只写根 `keys.json`，下一次快照起副本才更新）；
+  从旧快照直接还原仍走它自己那份 `keys.json`。
+* 关闭保护**不会**重写 `objects/`：块仍是同一把 DEK 封的密文；"不加密"准确地说只是"钥匙明文存在旁边"。
+* 不 bump 版本号、不跑 preflight、不提交；真实仓库迁移由 lead 用 §25.3 的命令或 `unlock` 命令执行。

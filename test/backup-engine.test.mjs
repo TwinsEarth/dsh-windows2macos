@@ -22,7 +22,7 @@ import { readCurrent, listOldVersions } from '../src/backup/rotation.mjs';
 import { readSnapshot } from '../src/backup/repo.mjs';
 import { scanHome } from '../src/backup/scan.mjs';
 import { openObject } from '../src/backup/crypto.mjs';
-import { openRepoKey } from '../src/backup/keystore.mjs';
+import { openRepoKey, readRepoKeys } from '../src/backup/keystore.mjs';
 import { findHarnessInstallation } from '../src/backup/runtime-validate.mjs';
 
 const HARNESS = findHarnessInstallation();
@@ -386,15 +386,84 @@ describe('engine: a first and a second backup', () => {
     }
   });
 
-  it('refuses with BACKUP_NO_PERMISSION when no credential can protect a new repository', () => {
+  it('creates an unencrypted repository with no credential at all (the default), and reports it', () => {
+    const { home, cleanup: cleanHome } = homeFixture();
+    const { dir, cleanup } = tempDir('w2m-engine-default-none-');
+    try {
+      const root = join(dir, 'repo');
+      const first = runBackup({ root, dshHome: home, platform: 'linux', machineKey: false });
+      assert.equal(first.ok, true, `${first.reason_code}: ${first.detail}`);
+      assert.equal(first.encryption, 'none', 'the default protection mode is none');
+      assert.equal(first.unlocked_via, 'none');
+      assert.equal(first.key_created, true);
+      assert.deepEqual(first.available_paths, ['none']);
+      assert.deepEqual(readRepoKeys(root).keys.envelopes.map((envelope) => envelope.kind), ['open']);
+      const second = runBackup({ root, dshHome: home, platform: 'linux', machineKey: false });
+      assert.equal(second.ok, true, second.detail);
+      assert.equal(second.encryption, 'none');
+      assert.equal(second.blocks_new, 0, 'the second unencrypted run must still deduplicate');
+      assert.equal(JSON.stringify(second).includes(JSON.parse(fs.readFileSync(join(root, 'keys.json'), 'utf8')).envelopes[0].dek), false,
+        'the run result never leaks the data key');
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+
+  it('creates a sealed repository when a 4-digit PIN is supplied, and then refuses credential-less runs', () => {
+    const { home, cleanup: cleanHome } = homeFixture();
+    const { dir, cleanup } = tempDir('w2m-engine-pin-');
+    try {
+      const root = join(dir, 'repo');
+      const created = runBackup({ root, dshHome: home, password: '1234', platform: 'linux', machineKey: false });
+      assert.equal(created.ok, true, created.detail);
+      assert.equal(created.encryption, 'sealed');
+      assert.equal(created.unlocked_via, 'password');
+      const refused = runBackup({ root, dshHome: home, platform: 'linux', machineKey: false });
+      assert.equal(refused.ok, false);
+      assert.equal(refused.reason_code, 'BACKUP_NO_PERMISSION');
+      const reopened = runBackup({ root, dshHome: home, password: '1234', platform: 'linux', machineKey: false });
+      assert.equal(reopened.ok, true, reopened.detail);
+      assert.equal(reopened.encryption, 'sealed');
+      assert.equal(reopened.unlocked_via, 'password');
+      assert.equal(reopened.blocks_new, 0);
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+
+  it('refuses an invalid encryption option, and the contradiction of none + a password, before the layout', () => {
+    const { home, cleanup: cleanHome } = homeFixture();
+    const { dir, cleanup } = tempDir('w2m-engine-enc-invalid-');
+    try {
+      const root = join(dir, 'repo');
+      const invalid = runBackup({ root, dshHome: home, platform: 'linux', machineKey: false, encryption: 'maybe' });
+      assert.equal(invalid.ok, false);
+      assert.equal(invalid.reason_code, 'BACKUP_CONFIG_INVALID');
+      assert.match(invalid.detail, /encryption must be one of none, sealed/u);
+      assert.equal(existsSync(root), false, 'the refusal happens before ensureLayout');
+
+      const contradiction = runBackup({ root, dshHome: home, platform: 'linux', machineKey: false, encryption: 'none', password: '1234' });
+      assert.equal(contradiction.ok, false);
+      assert.equal(contradiction.reason_code, 'BACKUP_CONFIG_INVALID');
+      assert.match(contradiction.detail, /cannot be combined with a password/u);
+      assert.equal(existsSync(root), false);
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+
+  it('refuses with BACKUP_NO_PERMISSION when sealed protection is requested with no credential', () => {
     const { home, cleanup: cleanHome } = homeFixture();
     const { dir, cleanup } = tempDir('w2m-engine-noperm-');
     try {
       const root = join(dir, 'repo');
-      const result = runBackup({ root, dshHome: home, platform: 'linux' });
+      const result = runBackup({ root, dshHome: home, platform: 'linux', encryption: 'sealed' });
       assert.equal(result.ok, false);
       assert.equal(result.reason_code, 'BACKUP_NO_PERMISSION');
-      assert.match(result.detail, /no credential/u);
+      assert.match(result.detail, /sealed/u);
       // The refusal happens before the layout: a first run that cannot protect anything must not leave a
       // half-initialised repository behind.
       assert.equal(existsSync(root), false, 'a refused first run must not create the repository');

@@ -22,7 +22,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { BackupLayoutError, LAYOUT_CODES, resolveBackupDir } from './layout.mjs';
+import { BackupLayoutError, LAYOUT_CODES, REPO_ENCRYPTION_MODES, resolveBackupDir } from './layout.mjs';
 import { scanHome } from './scan.mjs';
 import { selftest } from './crypto.mjs';
 import { buildManifest, manifestDigest, manifestSummary } from './manifest.mjs';
@@ -38,7 +38,13 @@ import { detectClientRunning } from './client.mjs';
 import { recheckRegistry } from './registry-watch.mjs';
 import { applyRegister, planRegister } from './register.mjs';
 import { describeUnlock, unlockRepo } from './unlock.mjs';
-import { setRepositoryPassword } from './keystore.mjs';
+import {
+  MIN_PASSWORD_BYTES,
+  UNENCRYPTED_WARNING,
+  WEAK_PIN_WARNING,
+  setEncryptionMode,
+  setRepositoryPassword,
+} from './keystore.mjs';
 import { verifyRepo } from './verify.mjs';
 
 /** Human-readable bytes: `172.0 MB`, `1.2 GB`. */
@@ -59,22 +65,36 @@ export function formatUnlock(payload) {
   const lines = ['w2m-backup unlock', ''];
   lines.push(`repository    : ${payload.repository}`);
   lines.push(`initialized   : ${payload.initialized ? 'yes' : 'no'}`);
+  if (payload.encryption !== undefined && payload.encryption !== null) {
+    lines.push(`protection    : ${payload.encryption}${payload.encryption === 'none' ? ' (no credential required)' : ''}`);
+  }
+  if (Array.isArray(payload.available_paths) && payload.available_paths.length > 0) {
+    lines.push(`available     : ${payload.available_paths.join(', ')}`);
+  }
+  if (payload.warning !== undefined && payload.warning !== null) {
+    lines.push(`warning       : ${payload.warning}`);
+  }
   if (payload.initialized) {
     lines.push(`envelopes     : ${payload.envelopes.join(', ') || 'none'}`);
-    lines.push(`machine path  : ${payload.machine_available ? 'available on this machine' : `unavailable (${payload.machine_reason ?? 'unknown'})`}`);
-    // The account path is a comparison, not a secret: bound + matched means the account envelope opens without a
-    // password; mismatch says to use the unlock password. Only the masked hint is printed.
-    const account = payload.account ?? null;
-    if (account === null || account.bound !== true) {
-      lines.push('account path  : not bound (an identity binding is added after a successful run)');
-    } else if (account.matched === true) {
-      lines.push(`account path  : matched (original account ${account.id_hint ?? '…'}) -- unlocks without a password`);
-    } else if (account.matched === false) {
-      lines.push(`account path  : this is not the original account (${account.id_hint ?? '…'}) -- switch to the unlock password`);
+    if (payload.encryption === 'none') {
+      lines.push('unlock path   : none (the data key sits next to the data; anyone with this directory can restore)');
+      lines.push('disable       : already unprotected (w2m-backup unlock --disable-protection is a no-op)');
     } else {
-      lines.push(`account path  : bound (${account.id_hint ?? '…'}), not compared -- pass --account-id to compare`);
+      lines.push(`machine path  : ${payload.machine_available ? 'available on this machine' : `unavailable (${payload.machine_reason ?? 'unknown'})`}`);
+      // The account path is a comparison, not a secret: bound + matched means the account envelope opens without
+      // a password; mismatch says to use the unlock password/PIN. Only the masked hint is printed.
+      const account = payload.account ?? null;
+      if (account === null || account.bound !== true) {
+        lines.push('account path  : not bound (an identity binding is added after a successful sealed run)');
+      } else if (account.matched === true) {
+        lines.push(`account path  : matched (original account ${account.id_hint ?? '…'}) -- unlocks without a PIN`);
+      } else if (account.matched === false) {
+        lines.push(`account path  : this is not the original account (${account.id_hint ?? '…'}) -- switch to the unlock PIN/password`);
+      } else {
+        lines.push(`account path  : bound (${account.id_hint ?? '…'}), not compared -- pass --account-id to compare`);
+      }
+      lines.push(`password path : ${payload.password_required ? `available (a ${MIN_PASSWORD_BYTES}-6 digit PIN is a convenience gate, not confidentiality)` : 'not configured'}`);
     }
-    lines.push(`password path : ${payload.password_required ? 'available (the only path on a new machine)' : 'not configured'}`);
   }
   if (payload.check !== undefined) {
     lines.push(`check         : ${payload.check.ok ? `opened via ${payload.check.via}` : `refused: ${payload.check.reason_code} ${payload.check.detail ?? ''}`.trimEnd()}`);
@@ -221,6 +241,9 @@ function usage() {
     '  --keep-old <n>      old versions kept per session (default: 10)',
     '  --old-format <f>    run: how a superseded version is kept: records (default, deduped record only)',
     '                      or full (also one sealed whole-file copy under old/, doubling that version\'s bytes)',
+    '  --encrypt <mode>    run: repository protection for a NEW repository: none (default, unencrypted) or sealed',
+    '                      (account/machine/PIN envelopes). An existing repository keeps its mode.',
+    '  --no-encryption     run: shorthand for --encrypt none',
     '  --max-old-days <n>  run/gc: also prune old version records older than N days (0 = per-session count only)',
     '  --limit <n>         old-backfill: write at most N sealed copies this run (0 = plan only, writes nothing)',
     '  --mirror <dir>      run: copy the sealed blocks and snapshot metadata to this offsite directory',
@@ -237,11 +260,19 @@ function usage() {
     '  --account-id <id>   unlock/run: the host account id to compare against the repository\'s bound id',
     '                      (advanced/manual: the host normally supplies it; the account id is an identifier,',
     '                      not a secret -- see docs/BACKUP-DESIGN.md section 25. `run --account-id` also binds',
-    '                      it after a successful run, so a matching account unlocks later without a password)',
+    '                      it after a successful sealed run, so a matching account unlocks later without a PIN)',
     '  --check             unlock: attempt the unlock instead of only describing it',
-    '  --set-password      unlock: add a password envelope to this repository (reads the password from stdin/env) so it opens without this machine',
-    '  --password-stdin    run/restore/unlock --check/old-backfill: read the password from stdin (never argv)',
-    '                      (environment fallback: W2M_BACKUP_PASSWORD, same "never argv" rule)',
+    '  --set-password      unlock: add a password/PIN envelope to this repository (reads it from stdin/env) so it',
+    '                      opens without this machine. 4-6 digits are the expected PIN: convenience, not',
+    '                      confidentiality (the CLI prints that warning). Also turns an unencrypted repository',
+    '                      back into a sealed one.',
+    '  --enable-protection alias of --set-password (turning protection on needs a PIN/password)',
+    '  --disable-protection unlock: turn protection OFF: open with existing credentials, write an open envelope',
+    '                      carrying the same data key; the repository then unlocks with no credential at all.',
+    '                      Requires --confirm disable-protection because it weakens the repository.',
+    '  --confirm <token>   unlock --disable-protection: the explicit confirmation token (disable-protection)',
+    '  --password-stdin    run/restore/unlock --check/--set-password/old-backfill: read the PIN/password from',
+    '                      stdin (never argv) (environment fallback: W2M_BACKUP_PASSWORD, same "never argv" rule)',
     '  --no-machine-key    run: do not use (or create) the OS-keystore machine envelope',
     '  --no-future-append  run: skip the "next append still loads" simulation (it decodes every log)',
     '',
@@ -286,6 +317,10 @@ export function parseArgs(argv, env = process.env) {
     runtime: false,
     check: false,
     setPassword: false,
+    enableProtection: false,
+    disableProtection: false,
+    confirm: null,
+    encryption: null,
     accountId: null,
   };
   const rest = [...argv];
@@ -307,6 +342,33 @@ export function parseArgs(argv, env = process.env) {
     else if (arg === '--runtime') options.runtime = true;
     else if (arg === '--check') options.check = true;
     else if (arg === '--set-password') options.setPassword = true;
+    else if (arg === '--enable-protection') options.enableProtection = true;
+    else if (arg === '--disable-protection') options.disableProtection = true;
+    else if (arg === '--no-encryption') options.encryption = 'none';
+    else if (arg === '--confirm') {
+      const raw = rest.shift() ?? '';
+      if (raw.trim() === '') return { ...options, error: '--confirm needs a token' };
+      options.confirm = raw.trim();
+    }
+    else if (arg.startsWith('--confirm=')) {
+      const raw = arg.slice('--confirm='.length);
+      if (raw.trim() === '') return { ...options, error: '--confirm needs a token' };
+      options.confirm = raw.trim();
+    }
+    else if (arg === '--encrypt') {
+      const raw = rest.shift() ?? '';
+      if (!REPO_ENCRYPTION_MODES.includes(raw)) {
+        return { ...options, error: `--encrypt must be one of ${REPO_ENCRYPTION_MODES.join(', ')}, got ${JSON.stringify(raw)}` };
+      }
+      options.encryption = raw;
+    }
+    else if (arg.startsWith('--encrypt=')) {
+      const raw = arg.slice('--encrypt='.length);
+      if (!REPO_ENCRYPTION_MODES.includes(raw)) {
+        return { ...options, error: `--encrypt must be one of ${REPO_ENCRYPTION_MODES.join(', ')}, got ${JSON.stringify(raw)}` };
+      }
+      options.encryption = raw;
+    }
     else if (arg === '--account-id') {
       const raw = rest.shift() ?? '';
       if (raw.trim() === '') return { ...options, error: '--account-id needs an account id' };
@@ -414,6 +476,15 @@ export function formatStatus(payload) {
   lines.push(`exists        : ${repo.exists ? 'yes' : 'no (the first backup creates it)'}`);
   if (repo.is_file) lines.push('state         : the path is a file, not a directory');
   lines.push(`initialized   : ${repo.initialized ? `yes (${repo.format} v${repo.version})` : 'no'}`);
+  if (payload.encryption !== undefined && payload.encryption !== null) {
+    lines.push(`protection    : ${payload.encryption}${payload.encryption === 'none' ? ' (unencrypted)' : ''}`);
+  } else if (repo.encryption !== undefined && repo.encryption !== null) {
+    lines.push(`protection    : ${repo.encryption}`);
+  }
+  if (Array.isArray(payload.available_paths) && payload.available_paths.length > 0) {
+    lines.push(`unlock paths  : ${payload.available_paths.join(', ')}`);
+  }
+  if (payload.warning !== undefined && payload.warning !== null) lines.push(`warning       : ${payload.warning}`);
   // `null` means "not measurable without creating the directory", which is not the same as "not writable".
   lines.push(`writable      : ${repo.writable === null ? 'unknown (not created yet)' : repo.writable ? 'yes' : 'NO'}`);
   lines.push(`free space    : ${repo.free_bytes === null ? 'unknown' : humanBytes(repo.free_bytes)}`);
@@ -524,6 +595,10 @@ export function formatRun(result) {
   }
   if (result.unlocked_via !== undefined) {
     lines.push(`unlocked via  : ${result.unlocked_via}${result.key_created === true ? ' (repository key created)' : ''}`);
+  }
+  if (result.encryption !== undefined && result.encryption !== null) {
+    lines.push(`protection    : ${result.encryption}${result.encryption === 'none' ? ' (unencrypted)' : ''}`);
+    if (result.encryption === 'none') lines.push(`warning       : ${UNENCRYPTED_WARNING}`);
   }
   if (result.key_upgraded === true) {
     lines.push('key           : machine envelope added to this repository (future runs need no password here)');
@@ -794,6 +869,7 @@ export function main(argv, io = {}) {
       keepOldPerSession: options.keepOld ?? undefined,
       maxOldVersionDays: options.maxOldDays ?? undefined,
       oldFormat: options.oldFormat ?? undefined,
+      encryption: options.encryption ?? undefined,
       mirrorRoot: options.mirror ?? undefined,
       dryRun: options.dryRun,
       futureAppend: options.noFutureAppend === true ? false : undefined,
@@ -858,6 +934,49 @@ export function main(argv, io = {}) {
       writeErr(`${resolved.error.code}: ${resolved.error.detail}`);
       return 1;
     }
+    if (options.disableProtection === true) {
+      if (options.setPassword === true || options.enableProtection === true) {
+        writeErr('error: --disable-protection cannot be combined with --set-password/--enable-protection\n\n' + usage());
+        return 2;
+      }
+      // Turning protection off weakens the repository: it needs an explicit token, exactly like a write route.
+      if (options.confirm !== 'disable-protection') {
+        writeErr('error: --disable-protection removes the account/machine/PIN protection and lets anyone with the repository directory restore it');
+        writeErr(`re-run with --confirm disable-protection to do it\n\n${usage()}`);
+        return 2;
+      }
+      const result = setEncryptionMode({
+        root: resolved.dir,
+        dshHome: options.dshHome,
+        mode: 'none',
+        password: passwordFor(options, io),
+        accountId: options.accountId ?? undefined,
+        platform: process.platform,
+        machineKey: options.noMachineKey === true ? false : undefined,
+      });
+      if (options.json) {
+        write(JSON.stringify(result, null, 2));
+      } else if (result.ok !== true) {
+        writeErr(`${result.reason_code}: ${result.detail}`);
+      } else {
+        write('w2m-backup unlock --disable-protection');
+        write('');
+        if (result.changed !== true) {
+          write(`protection        : already ${result.mode_after} (nothing written)`);
+          write(`envelopes         : ${result.envelopes.join(', ')}`);
+        } else {
+          write(`protection        : ${result.mode_before} -> ${result.mode_after}`);
+          write('data key          : unchanged (the same key now sits in clear in keys.json)');
+          write(`envelopes         : ${result.envelopes.join(', ')}`);
+          write(`keys backup       : ${result.backup_file}`);
+          write(`file              : ${result.file}`);
+        }
+        write(`warning           : ${result.warning ?? UNENCRYPTED_WARNING}`);
+      }
+      return result.ok === true ? 0 : 1;
+    }
+    // `--enable-protection` is an alias of the set-password path: turning protection on requires a PIN/password.
+    if (options.enableProtection === true) options.setPassword = true;
     if (options.setPassword) {
       const result = setRepositoryPassword({
         root: resolved.dir,
@@ -874,14 +993,17 @@ export function main(argv, io = {}) {
         } else if (result.added !== true) {
           write(`password envelope : already present (nothing written) — ${result.detail ?? ''}`.trimEnd());
           write(`envelopes         : ${result.envelopes.join(', ')}`);
+          write(`protection        : ${result.mode_after}`);
         } else {
           write('w2m-backup unlock --set-password');
           write('');
           write(`password envelope : added (another envelope, same data key)`);
           write(`envelopes         : ${result.envelopes.join(', ')}`);
+          write(`protection        : ${result.mode_after} (credential-less opens now refused)`);
           write(`keys backup       : ${result.backup_file}`);
           write(`file              : ${result.file}`);
         }
+        if (result.weak === true) write(`warning           : ${result.warning ?? WEAK_PIN_WARNING}`);
       }
       return result.ok === true ? 0 : 1;
     }
@@ -902,6 +1024,9 @@ export function main(argv, io = {}) {
       // Compare-only identity binding: the masked id hint is the only form of the account id that is printed.
       account: described.account,
       account_supported: described.account_supported,
+      encryption: described.encryption,
+      available_paths: described.available_paths,
+      warning: described.warning,
       reason_code: described.reason_code,
       detail: described.detail,
     };

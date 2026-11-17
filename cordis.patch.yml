@@ -197,7 +197,11 @@
         # 字面兼容需求 3：被替换的旧版本除记录外再写一份整文件加密副本（old/<ws>/<sid>/…json.enc）。
         # 代价：每个被替换版本在去重块之外多占一份整文件字节；不想要时改成 records。
         backupOldFormat: full
+        # §25.0 用户最终决定：默认不加密（none = DEK 明文在 keys.json；任何人读到仓库目录即可还原）。
+        # 想要账户/机器/PIN 保护时改成 sealed（会在新建仓库时写 account/machine/password 信封）。
+        backupEncryption: none
         # §25 账户 ID 绑定解锁（用户决定）：只读取账户唯一识别码做比对，一致免密放行；不是机密性路径。
+        # 只对 sealed 仓库生效；none 仓库永不绑定（它本来就不需要凭据）。
         backupAccountBinding: true
 
 

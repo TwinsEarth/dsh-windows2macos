@@ -54,12 +54,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { BackupLayoutError, ensureLayout, repoPaths } from './layout.mjs';
+import { BackupLayoutError, descriptorEncryption, ensureLayout, readDescriptor, repoPaths } from './layout.mjs';
 import { buildManifest, normalizeRelPath, sha256Hex, splitBlocks } from './manifest.mjs';
 import { sealObject } from './crypto.mjs';
 import { writeFileAtomic } from './atomic.mjs';
 import { withRepoLock } from './locks.mjs';
-import { openRepoKey, bindAccount } from './keystore.mjs';
+import { openRepoKey, bindAccount, resolveEncryptionMode } from './keystore.mjs';
 import { detectMachineKeySupport } from './machine-key.mjs';
 import { appendLegalEvent, futureAppendVerdict } from './future-append.mjs';
 import { buildArtifactFromBuffer, runtimeValidateBatch } from './runtime-validate.mjs';
@@ -327,9 +327,31 @@ export function runBackup(input) {
   let lock = null;
   try {
     const existed = fs.existsSync(repoPaths(root).descriptor);
-    // A first run that has no credential path must not create the repository: the same no-permission rule the
-    // keystore enforces, applied *before* the layout, so a refused run leaves no half-initialised directory.
-    if (dryRun !== true && existed !== true) {
+    // The protection mode is validated here, like the retention window and the mirror: an invalid
+    // `encryption` value, or an explicit `none` combined with a password, is a configuration mistake and must
+    // be refused before the lock/layout/key -- not discovered after blocks were written.
+    const modePolicy = resolveEncryptionMode({
+      encryption: input.encryption,
+      password: input.password,
+      machineKey: input.machineKey,
+      accountId: input.accountId,
+    });
+    if (modePolicy.ok !== true) return { ok: false, reason_code: modePolicy.reason_code, detail: modePolicy.detail, dry_run: dryRun };
+    // A descriptor that already says `sealed` is never silently downgraded on first use (a half-initialised
+    // sealed repository must not become unencrypted because this run carried no credential).
+    let creationMode = modePolicy.mode;
+    if (input.encryption === undefined && existed === true) {
+      try {
+        const descriptor = readDescriptor(root);
+        if (descriptorEncryption(descriptor) === 'sealed') creationMode = 'sealed';
+      } catch {
+        creationMode = 'sealed';
+      }
+    }
+    // A first run that asks for protection but has no credential path must not create the repository: the same
+    // no-permission rule the keystore enforces, applied *before* the layout, so a refused run leaves no
+    // half-initialised directory. The default `none` mode needs no credential by design and is never refused.
+    if (dryRun !== true && existed !== true && creationMode === 'sealed') {
       const password = input.password ?? null;
       const hasPassword = Buffer.isBuffer(password) ? password.length > 0 : typeof password === 'string' && password.length > 0;
       const support = input.machineKey === false ? { available: false, reason: 'disabled-by-configuration' } : detectMachineKeySupport({ platform: input.platform, runner: input.runner });
@@ -337,14 +359,14 @@ export function runBackup(input) {
         return {
           ok: false,
           reason_code: ENGINE_CODES.NO_PERMISSION,
-          detail: `no credential can protect a new backup on this machine: the OS keystore is unavailable (${support.reason ?? 'unknown'}) and no unlock password was supplied`,
+          detail: `encryption "sealed" was requested, but no credential can protect a new backup on this machine: the OS keystore is unavailable (${support.reason ?? 'unknown'}) and no unlock PIN/password was supplied`,
           dry_run: false,
         };
       }
     }
     if (dryRun !== true) {
       try {
-        ensureLayout(root, { dshHome, now });
+        ensureLayout(root, { dshHome, now, encryption: input.encryption === undefined && existed === true ? undefined : creationMode });
       } catch (error) {
         if (error instanceof BackupLayoutError) return { ok: false, reason_code: error.code, detail: error.detail, dry_run: dryRun };
         throw error;
@@ -356,12 +378,13 @@ export function runBackup(input) {
     // A dry run never writes -- including no layout and no key -- so it needs neither the lock nor the credential.
     // It still reports what would be written, and block reuse is decided by object existence, which needs no key.
     const key = dryRun === true
-      ? { ok: true, dek: null, keys: null, created: false, unlocked_via: 'dry-run', machine: { ok: false, reason: 'dry-run' }, machine_envelope_added: false }
+      ? { ok: true, dek: null, keys: null, created: false, unlocked_via: 'dry-run', encryption: null, available_paths: [], machine: { ok: false, reason: 'dry-run' }, machine_envelope_added: false }
       : openRepoKey({
           root,
           dshHome,
           accountId: input.accountId ?? null,
           password: input.password ?? null,
+          encryption: input.encryption,
           platform: input.platform,
           runner: input.runner,
           machineKey: input.machineKey,
@@ -526,6 +549,8 @@ export function runBackup(input) {
         runtime_future_append: runtimeFutureAppend,
         dedupe_ratio: blocksNew + blocksReused === 0 ? 0 : blocksReused / (blocksNew + blocksReused),
         key_upgraded: key.machine_envelope_added === true,
+        encryption: key.encryption ?? null,
+        available_paths: key.available_paths ?? [],
         keep_old_per_session: keepOld,
         max_old_version_days: maxOldVersionDays,
         old_format: oldFormat,
@@ -569,14 +594,13 @@ export function runBackup(input) {
     // in that mode so a default run keeps exactly the result shape it had before this option existed.
     const fullOldVersions = rotated.map((row) => row.full_copy?.file).filter((file) => typeof file === 'string');
 
-    // Account binding is best effort and strictly after the committed snapshot. The user's rule is compare-only:
-    // the account id is an identifier, not a secret (docs/BACKUP-DESIGN.md §25), so this is a convenience path and
-    // a failure here is a warning on an otherwise good backup -- never a refusal, and never a replacement for the
-    // machine/password envelopes. `runBackup` only reaches this point when the repository already opened with a
-    // real credential, so the binding can never be the reason a repository exists.
+    // Account binding is best effort and strictly after the committed snapshot. It only makes sense for a
+    // **sealed** repository: an unencrypted repository opens without any credential, so binding it to an
+    // account would silently turn the default `none` mode back into `sealed` after the first run (and the
+    // requirement is that `none` stays `none` until the operator asks otherwise).
     const warnings = [];
     let accountBinding = null;
-    if (typeof input.accountId === 'string' && input.accountId.trim() !== '') {
+    if (key.encryption !== 'none' && typeof input.accountId === 'string' && input.accountId.trim() !== '') {
       try {
         const bound = bindAccount({
           root,
@@ -656,6 +680,8 @@ export function runBackup(input) {
       runtime_future_append: runtimeFutureAppend,
       dedupe_ratio: blocksNew + blocksReused === 0 ? 0 : blocksReused / (blocksNew + blocksReused),
       unlocked_via: key.unlocked_via,
+      encryption: key.encryption ?? null,
+      available_paths: key.available_paths ?? [],
       key_created: key.created,
       key_upgraded: key.machine_envelope_added === true,
       machine: { available: key.machine?.ok === true, reason: key.machine?.reason ?? null },

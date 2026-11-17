@@ -8,19 +8,30 @@
  * unreadable the day the user changes it. Instead the DEK is *wrapped* -- sealed under a key derived from
  * each available credential -- and the wrapped copies travel with the snapshot (`keys.json`).
  *
- * Three envelope kinds, in the order they are tried:
+ * Four envelope kinds:
  *
+ *   * `open` -- **the repository is explicitly unencrypted**: the record stores the 32-byte DEK in clear in
+ *     `keys.json`, next to the data. It is the default (the user's 2026-11-17 decision: 默认是不加密), and it
+ *     provides no confidentiality at all: anyone who can read the repository directory can decrypt the
+ *     backup. It exists so "no protection configured" is a *real, openable* state instead of an unopenable
+ *     repository, and so an operator can turn protection back off without re-encrypting every block.
  *   * `account` -- a KEK derived from the account **identifier** the host reports. This is an identity
  *     binding, not a secret: anyone who knows the account id and has the repository files can derive the same
- *     KEK. The user accepted that trade-off explicitly (docs/BACKUP-DESIGN.md §25); it is a convenience path
- *     that makes "same account, new machine" unlockable without a password, and it never replaces `password`.
+ *     KEK. It is a convenience path that makes "same account, new machine" unlockable without a password, and
+ *     it never replaces `password`.
  *   * `machine` -- a random key protected by the OS keystore (DPAPI on Windows), so restoring on the same
  *     machine needs no password;
  *   * `password` -- scrypt(password, salt). The only kind that survives a machine change, and therefore the
- *     only one that must always be available.
+ *     only one that must always be available. The expected use is a 4-6 digit PIN: a convenience threshold,
+ *     *not* confidentiality (docs/BACKUP-DESIGN.md §25).
  *
- * The first two are conveniences; the password envelope is the guarantee. Losing every envelope is losing the
- * backup, which is why `selftest` exercises a full wrap/unwrap round trip before a repository is created.
+ * An `open` record is deliberately never mixed with a credential envelope: `validateKeysFile` refuses such a
+ * document, because the open path would silently bypass the password the user configured.
+ *
+ * The credential envelopes are best-effort conveniences; `open` is no protection on purpose (the default), and
+ * `password` is the one kind that survives a machine *and* an account change (as a 4-6 digit PIN it is still only
+ * a convenience threshold, not confidentiality). Losing every envelope is losing the backup, which is why
+ * `selftest` exercises a full wrap/unwrap round trip before a repository is created.
  *
  * ## What is authenticated, and what a failure means
  *
@@ -87,8 +98,22 @@ export const OBJECT_MAGIC = Buffer.from('W2MBLOB1', 'ascii');
  */
 export const OLD_COPY_KIND = 'old';
 
-/** Envelope kinds, in the order `unwrapDek` tries them. */
-export const ENVELOPE_KINDS = Object.freeze(['account', 'machine', 'password']);
+/** Envelope kind that stores the DEK in clear: the repository is explicitly unencrypted. */
+export const OPEN_KIND = 'open';
+
+/** Marker written in an open envelope's `alg` field: no wrapping algorithm touched the data key. */
+export const OPEN_ALG = 'none';
+
+/**
+ * Envelope kinds, in the order `unwrapDek` tries credential envelopes.
+ *
+ * `open` is first because when it is present it is the only kind a valid document may carry. The credential
+ * order (`account`, then `machine`, then `password`) is fixed by the protocol and reported in `attempts`.
+ */
+export const ENVELOPE_KINDS = Object.freeze([OPEN_KIND, 'account', 'machine', 'password']);
+
+/** The credential-bearing kinds, in the order they are attempted. An `open` record is not a credential. */
+export const CREDENTIAL_ENVELOPE_KINDS = Object.freeze(['account', 'machine', 'password']);
 
 /**
  * Default scrypt parameters for a new password envelope.
@@ -253,6 +278,45 @@ export function buildAad(parts) {
 }
 
 /**
+ * The `open` envelope record: the DEK in clear.
+ *
+ * **What this means.** There is no KDF, no sealed payload and no AAD behind this record -- by design. The
+ * repository is explicitly unencrypted (user decision 2026-11-17: "也可以选择不加密"), so the data key sits
+ * next to the data and anyone who can read `keys.json` can open every object in `objects/`. Keeping the DEK in
+ * an envelope (rather than a fourth "plaintext object" format) means every block, manifest, rotation, verify,
+ * archive, mirror and gc code path keeps working unchanged: only key acquisition differs.
+ *
+ * @param {Buffer} dek 32 bytes
+ * @param {{now?: Date}} [options]
+ * @returns {{kind: 'open', alg: 'none', dek: string, created_at: string}}
+ */
+export function openEnvelopeRecord(dek, options = {}) {
+  if (!isDek(dek)) throw new BackupCryptoError(CRYPTO_CODES.DEK_INVALID, `a DEK must be ${DEK_LENGTH} bytes`);
+  return {
+    kind: OPEN_KIND,
+    alg: OPEN_ALG,
+    dek: dek.toString('base64'),
+    created_at: (options.now ?? new Date()).toISOString(),
+  };
+}
+
+/**
+ * A complete `keys.json` document for an explicitly unencrypted repository (a single `open` envelope).
+ *
+ * @param {Buffer} dek
+ * @param {{now?: Date}} [options]
+ * @returns {object}
+ */
+export function wrapOpenDek(dek, options = {}) {
+  return {
+    format: ENVELOPE_FORMAT,
+    version: ENVELOPE_VERSION,
+    created_at: (options.now ?? new Date()).toISOString(),
+    envelopes: [openEnvelopeRecord(dek, options)],
+  };
+}
+
+/**
  * Seal a plaintext with AES-256-GCM.
  *
  * @param {Buffer} plaintext
@@ -334,7 +398,13 @@ export function wrapDek(dek, envelopes, options = {}) {
   const records = [];
   for (const envelope of envelopes) {
     const kind = envelope?.kind;
-    if (!ENVELOPE_KINDS.includes(kind)) {
+    if (kind === OPEN_KIND) {
+      throw new BackupCryptoError(
+        CRYPTO_CODES.ENVELOPE_MALFORMED,
+        'an open envelope is written by wrapOpenDek/addOpenEnvelope, not wrapped under a credential',
+      );
+    }
+    if (!CREDENTIAL_ENVELOPE_KINDS.includes(kind)) {
       throw new BackupCryptoError(CRYPTO_CODES.ENVELOPE_MALFORMED, `unknown envelope kind: ${JSON.stringify(String(kind))}`);
     }
     if (seen.has(kind)) throw new BackupCryptoError(CRYPTO_CODES.ENVELOPE_MALFORMED, `duplicate envelope kind: ${kind}`);
@@ -367,6 +437,10 @@ export function wrapDek(dek, envelopes, options = {}) {
  * order). Every attempt is reported, including the failures, so a UI can say "the account material on this
  * machine no longer opens this backup -- try the password" instead of a bare refusal.
  *
+ * An `open` envelope short-circuits everything: the repository is unencrypted, so no credential is needed and
+ * none is consulted. `attempts` then starts with `{kind:'open', ok:true, code:null}` -- still an attempt list
+ * (the UI shape does not change), just one that never failed.
+ *
  * @param {object} keysFile
  * @param {{accountSecret?: string|Buffer|null, machineSecret?: string|Buffer|null, password?: string|Buffer|null}} credentials
  * @returns {{dek: Buffer, kind: string, attempts: Array<{kind: string, ok: boolean, code: string|null}>}}
@@ -374,8 +448,14 @@ export function wrapDek(dek, envelopes, options = {}) {
  */
 export function unwrapDek(keysFile, credentials = {}) {
   const validated = validateKeysFile(keysFile);
+  const open = validated.envelopes.find((envelope) => envelope.kind === OPEN_KIND);
+  if (open !== undefined) {
+    const dek = Buffer.from(open.dek, 'base64');
+    if (!isDek(dek)) throw new BackupCryptoError(CRYPTO_CODES.DEK_INVALID, 'the open envelope does not carry a 32-byte key');
+    return { dek, kind: OPEN_KIND, attempts: [{ kind: OPEN_KIND, ok: true, code: null }] };
+  }
   const attempts = [];
-  for (const kind of ENVELOPE_KINDS) {
+  for (const kind of CREDENTIAL_ENVELOPE_KINDS) {
     const secret = kind === 'account' ? credentials.accountSecret : kind === 'machine' ? credentials.machineSecret : credentials.password;
     if (secret === undefined || secret === null) {
       attempts.push({ kind, ok: false, code: null });
@@ -462,6 +542,10 @@ export function validateKeysFile(keysFile) {
       throw new BackupCryptoError(CRYPTO_CODES.ENVELOPE_MALFORMED, `duplicate envelope kind: ${envelope.kind}`);
     }
     kinds.add(envelope.kind);
+    if (envelope.kind === OPEN_KIND) {
+      validateOpenEnvelope(envelope);
+      continue;
+    }
     validateKdf(envelope.kdf, { enforceFloor: false });
     if (typeof envelope.kdf.salt !== 'string' || Buffer.from(envelope.kdf.salt, 'base64').length < 8) {
       throw new BackupCryptoError(CRYPTO_CODES.ENVELOPE_MALFORMED, 'an envelope has no usable salt');
@@ -474,7 +558,40 @@ export function validateKeysFile(keysFile) {
       throw new BackupCryptoError(CRYPTO_CODES.ENVELOPE_MALFORMED, 'an envelope has a malformed nonce or tag');
     }
   }
+  // Refuse mixing, because the open path never asks for a credential: a document carrying both would silently
+  // bypass the password the user configured. This is a named refusal, not a silent preference for one kind.
+  if (kinds.has(OPEN_KIND) && kinds.size > 1) {
+    throw new BackupCryptoError(
+      CRYPTO_CODES.ENVELOPE_MALFORMED,
+      'an open (unencrypted) envelope cannot be combined with account/machine/password envelopes: the repository would unlock without the credential',
+    );
+  }
   return keysFile;
+}
+
+/**
+ * Validate one `open` envelope: the only fields it may carry are `kind`, `alg`, `dek`, `created_at`.
+ *
+ * @param {object} envelope
+ * @throws {BackupCryptoError} `BACKUP_ENVELOPE_MALFORMED`
+ */
+function validateOpenEnvelope(envelope) {
+  if (envelope.alg !== OPEN_ALG) {
+    throw new BackupCryptoError(CRYPTO_CODES.ENVELOPE_MALFORMED, `an open envelope carries alg ${JSON.stringify(String(envelope.alg ?? 'missing'))}, not ${OPEN_ALG}`);
+  }
+  if (typeof envelope.dek !== 'string' || envelope.dek === '') {
+    throw new BackupCryptoError(CRYPTO_CODES.ENVELOPE_MALFORMED, 'the open envelope has no key');
+  }
+  const dek = Buffer.from(envelope.dek, 'base64');
+  if (dek.length !== DEK_LENGTH) {
+    throw new BackupCryptoError(CRYPTO_CODES.ENVELOPE_MALFORMED, 'the open envelope key has the wrong length');
+  }
+  if (envelope.kdf !== undefined || envelope.sealed !== undefined) {
+    throw new BackupCryptoError(CRYPTO_CODES.ENVELOPE_MALFORMED, 'an open envelope must not carry kdf/sealed fields');
+  }
+  if (envelope.created_at !== undefined && (typeof envelope.created_at !== 'string' || Number.isNaN(Date.parse(envelope.created_at)))) {
+    throw new BackupCryptoError(CRYPTO_CODES.ENVELOPE_MALFORMED, 'an open envelope created_at must be an ISO timestamp when it is present');
+  }
 }
 
 /**

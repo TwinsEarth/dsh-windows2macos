@@ -1588,6 +1588,99 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
     assert.ok(collectText(unread).join('\n').includes('读取不到本机账户 ID'));
   });
 
+  it('renders the three protection states, with the mode badge and the honest unencrypted warning', () => {
+    const { bundle } = mountBackup();
+    const t = bundle.exports.makeTranslator(() => undefined);
+
+    // State 1: unencrypted (the default). No credential, a warning, and the "turn protection off" explanation.
+    const none = bundle.exports.BackupPanelView(viewProps({
+      t,
+      repo: {
+        ok: true,
+        encryption: 'none',
+        repository: { root: 'D:\\BackUP', initialized: true, encryption: 'none', counts: { snapshots: 1 }, free_bytes: 1048576 },
+      },
+      unlock: {
+        ok: true,
+        initialized: true,
+        envelopes: ['open'],
+        encryption: 'none',
+        available_paths: ['none'],
+        warning: '未加密：任何能访问该目录的人都能还原备份',
+        machine_available: false,
+        machine_reason: 'repository-is-unencrypted',
+        password_required: false,
+        account: { bound: false, matched: null, id_hint: null },
+      },
+    }));
+    const noneState = findBy(none, (node) => node.props?.['data-w2m-backup-unlock-state'] !== undefined)[0];
+    assert.equal(noneState.props['data-w2m-backup-unlock-state'], 'none', 'the unlock card has an explicit unencrypted state');
+    const noneUnlockCard = findBy(none, (node) => node.props?.['data-w2m-backup-panel'] === 'unlock')[0];
+    assert.equal(noneUnlockCard.props['data-w2m-backup-unlock-mode'], 'none');
+    const noneText = collectText(none).join('\n');
+    assert.ok(noneText.includes('未加密：任何能访问该目录的人都能还原备份'), 'the status/unlock cards show the real consequence');
+    assert.ok(noneText.includes('不需要账户或 PIN'), 'the unencrypted copy says no credential is needed');
+    assert.equal(actionButton(none, 'unlock').props.disabled, false, 'an unencrypted repository can unlock with one click');
+    assert.ok(findBy(none, (node) => node.props?.['data-w2m-backup-disable-protection-hint'] !== undefined).length >= 1,
+      'the "turn protection off" explanation is present');
+    assert.equal(findBy(none, (node) => node.type === 'input' && node.props?.type === 'password').length, 0,
+      'even the unencrypted card has no password field');
+    // Mode badges: one on the status card, one on the unlock card.
+    const noneBadges = findBy(none, (node) => node.props?.['data-w2m-backup-mode'] === 'none');
+    assert.equal(noneBadges.length, 2, 'the status card and the unlock card both carry the mode badge');
+    assert.ok(collectText(none).join('\n').includes('未加密（默认）'), 'the badge label is translated');
+
+    // State 2: sealed + account match -> quick unlock.
+    const matched = bundle.exports.BackupPanelView(viewProps({
+      t,
+      repo: { ok: true, encryption: 'sealed', repository: { root: 'D:\\BackUP', initialized: true, encryption: 'sealed', counts: { snapshots: 1 } } },
+      unlock: {
+        ok: true,
+        initialized: true,
+        envelopes: ['machine', 'account', 'password'],
+        encryption: 'sealed',
+        available_paths: ['account', 'machine', 'password'],
+        warning: null,
+        machine_available: true,
+        machine_reason: null,
+        password_required: true,
+        account: { bound: true, matched: true, id_hint: '…abcd' },
+      },
+    }));
+    const matchedState = findBy(matched, (node) => node.props?.['data-w2m-backup-unlock-state'] !== undefined)[0];
+    assert.equal(matchedState.props['data-w2m-backup-unlock-state'], 'account-matched');
+    assert.equal(actionButton(matched, 'unlock-account').props.disabled, false);
+    assert.equal(findBy(matched, (node) => node.props?.['data-w2m-backup-mode'] === 'sealed').length, 2, 'sealed badges are shown');
+    assert.equal(collectText(matched).join('\n').includes('未加密'), false, 'a sealed repository shows no unencrypted warning');
+
+    // State 3: sealed + account mismatch with a PIN -> account button disabled, PIN only in the terminal.
+    const mismatch = bundle.exports.BackupPanelView(viewProps({
+      t,
+      repo: { ok: true, encryption: 'sealed', repository: { root: 'D:\\BackUP', initialized: true, encryption: 'sealed', counts: { snapshots: 1 } } },
+      unlock: {
+        ok: true,
+        initialized: true,
+        envelopes: ['machine', 'account', 'password'],
+        encryption: 'sealed',
+        available_paths: ['account', 'machine', 'password'],
+        warning: null,
+        machine_available: false,
+        machine_reason: 'dpapi-probe-failed',
+        password_required: true,
+        account: { bound: true, matched: false, id_hint: '…abcd' },
+      },
+    }));
+    const mismatchState = findBy(mismatch, (node) => node.props?.['data-w2m-backup-unlock-state'] !== undefined)[0];
+    assert.equal(mismatchState.props['data-w2m-backup-unlock-state'], 'account-mismatch');
+    assert.equal(actionButton(mismatch, 'unlock-account').props.disabled, true);
+    const mismatchText = collectText(mismatch).join('\n');
+    assert.ok(mismatchText.includes('请在本机终端用 4–6 位数字 PIN 解锁'), 'the mismatch copy points at the terminal PIN');
+    assert.ok(mismatchText.includes('4 位数字 PIN 只是便捷门槛，不是保密强度'), 'the weak-PIN caveat is shown');
+    assert.ok(mismatchText.includes('w2m-backup unlock --check --password-stdin'), 'the CLI command is still named');
+    assert.equal(findBy(mismatch, (node) => node.props?.['data-w2m-backup-unlock-password-hint'] !== undefined).length, 1);
+    assert.equal(findBy(mismatch, (node) => node.props?.['data-w2m-backup-unlock-weak-pin'] !== undefined).length, 1);
+  });
+
   it('never carries a password into a request body (the section posts confirmation tokens only)', () => {
     const source = readFileSync(BUNDLE_PATH, 'utf8');
     const start = source.indexOf('备份&还原面板（v3.4.9）');
@@ -2178,6 +2271,16 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
       'panel.backup.busy.backupActive',
       'panel.backup.log.backupSelected',
       'panel.backup.log.backupActive',
+      // v3.5.x protection modes (user decision: convenience, not absolute confidentiality; none is the default).
+      'panel.backup.status.mode',
+      'panel.backup.mode.none',
+      'panel.backup.mode.sealed',
+      'panel.backup.mode.noneWarning',
+      'panel.backup.unlock.none',
+      'panel.backup.unlock.passwordHint',
+      'panel.backup.unlock.weakPinHint',
+      'panel.backup.unlock.disableProtectionHint',
+      'panel.backup.reason.BACKUP_CONFIG_INVALID',
     ];
     for (const key of keys) {
       assert.equal(typeof dictionary.zh[key], 'string', `the zh dictionary has ${key}`);
@@ -2205,6 +2308,20 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
     assert.ok(dictionary.en['panel.backup.scope.hint'].includes('active'), 'the English hint names the active scope');
     assert.ok(dictionary.zh['panel.backup.scope.hint'].includes('已归档'), 'the Chinese hint names the archived difference of scope all');
     assert.equal(dictionary.zh['panel.backup.pick.archivedTag'], '已归档');
+    // The honest security copy: an unencrypted repository says so in words, and a 4-digit PIN is labelled
+    // as a convenience gate rather than confidentiality.
+    assert.equal(dictionary.zh['panel.backup.mode.noneWarning'], '未加密：任何能访问该目录的人都能还原备份');
+    assert.equal(dictionary.en['panel.backup.mode.noneWarning'], 'Not encrypted: anyone who can reach this directory can restore the backup');
+    assert.ok(dictionary.zh['panel.backup.mode.none'].includes('未加密'));
+    assert.ok(dictionary.en['panel.backup.mode.sealed'].includes('Encrypted'));
+    assert.ok(dictionary.zh['panel.backup.unlock.weakPinHint'].includes('不是保密强度'),
+      'the weak-PIN hint says a PIN is not confidentiality');
+    assert.ok(dictionary.zh['panel.backup.unlock.passwordHint'].includes('终端'),
+      'the password hint keeps the PIN in the terminal');
+    assert.ok(dictionary.zh['panel.backup.unlock.disableProtectionHint'].includes('--disable-protection'),
+      'the disable-protection copy names the CLI command');
+    assert.ok(dictionary.zh['panel.backup.unlock.none'].includes('不需要账户'),
+      'the unencrypted unlock copy says it needs no account or PIN');
     const mapped = Object.keys(exports.BACKUP_REASON_KEYS);
     assert.ok(mapped.length >= 20, 'the reason-code map covers the host codes');
     for (const code of mapped) {
