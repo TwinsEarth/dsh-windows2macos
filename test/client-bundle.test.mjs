@@ -1557,6 +1557,11 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
     const injected = sidebar.options.inject();
     assert.equal(typeof injected.t, 'function', 'visible copy goes through the locale seam');
     assert.equal(injected.t('panel.backup.title'), '备份&还原', 'the label is translated, not hardcoded in the host UI');
+    // The host draws the seat's own `label` beside the component. The component already draws the icon AND
+    // the text, so a non-empty host label showed the row twice ("备份&还原 备份&还原"); GPW solved the same
+    // problem with an empty label, and this seat must do the same.
+    assert.equal(typeof sidebar.options.label, 'function', 'the seat declares a label function');
+    assert.equal(sidebar.options.label(), '', 'the host-side label is empty: the component draws the only copy');
   });
 
   it('draws the sidebar icon as an inline currentColor SVG that wakes the panel', () => {

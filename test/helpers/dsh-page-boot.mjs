@@ -508,6 +508,16 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
       // v3.4.9: the backup entry and the page it switches to. The profile ships the dsh-backup row disabled by
       // default, so the panel is expected to render its "route missing / needs enabling" state: the probe checks
       // the seat, the page, and the four action markers, not the host routes (those have their own tests).
+      // The seat must show ONE label: the component draws icon + text, so a host-side label would print the
+      // text twice in the same row ("备份&还原 备份&还原"). Read the enclosing row's text and count.
+      const backupSeatText = await read(`
+        const b=document.querySelector('[data-w2m-backup-sidebar]');
+        if(b===null) return {found:false};
+        const row=b.closest('.w2mBackup_sideEntry') ?? b.parentElement ?? b;
+        const text=(row.innerText ?? row.textContent ?? '').trim();
+        const count=(text.match(/备份&还原/g) ?? []).length;
+        return {found:true, text:text.slice(0,120), count};
+      `);
       const backupOpened = await read(`const b=document.querySelector('[data-w2m-backup-sidebar]'); if(b===null)return{found:false}; b.click(); return{found:true};`);
       await new Promise((resolve) => setTimeout(resolve, 900));
       const backupPanel = await read(`
@@ -551,7 +561,7 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
           panelStillOpen: document.querySelector('[data-w2m-backup-panel]')!==null,
         };
       `);
-      report.backupProbe = { backupOpened, backupPanel, backupClicks, backupLog, scopeActions };
+      report.backupProbe = { backupOpened, backupPanel, backupClicks, backupLog, scopeActions, backupSeatText };
       await evaluate(`
         (async () => {
           const r = await fetch('/api/w2m/decisions?includeArchived=1');

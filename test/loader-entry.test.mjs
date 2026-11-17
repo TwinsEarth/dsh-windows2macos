@@ -729,6 +729,12 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
       }
       const backup = page.backupProbe ?? {};
       assert.equal(backup.backupOpened?.found, true, 'the left sidebar carries the backup entry (v3.4.9)');
+      assert.equal(backup.backupSeatText?.found, true, 'the backup seat is readable');
+      assert.equal(
+        backup.backupSeatText?.count,
+        1,
+        `the backup seat shows its label exactly once (text: ${backup.backupSeatText?.text})`,
+      );
       assert.equal(backup.backupPanel?.open, true, 'clicking the backup entry opens its main page');
       for (const action of ['run', 'restore', 'archive', 'verify']) {
         assert.ok(
