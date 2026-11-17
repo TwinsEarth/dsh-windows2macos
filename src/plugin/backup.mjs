@@ -66,8 +66,14 @@ import { createDailyScheduler, DEFAULT_CATCH_UP_MS } from './schedule.mjs';
 import { runBackup, SCOPES } from '../backup/engine.mjs';
 import { buildStatus } from '../backup/routes.mjs';
 import { describeBackupSchedule, normalizeBackupSchedule } from '../backup/schedule.mjs';
-import { DEFAULT_KEEP_OLD, DEFAULT_OLD_FORMAT, OLD_FORMATS } from '../backup/rotation.mjs';
+import { DEFAULT_FULL_COPY_MAX_BYTES, DEFAULT_KEEP_OLD, DEFAULT_OLD_FORMAT, OLD_FORMATS } from '../backup/rotation.mjs';
 import { REPO_ENCRYPTION_MODES } from '../backup/layout.mjs';
+
+/** The row's `backupFullCopyMaxMb` default, expressed in MB (the engine's cap is in bytes). */
+export const DEFAULT_FULL_COPY_MAX_MB = DEFAULT_FULL_COPY_MAX_BYTES / (1024 * 1024);
+
+/** The named engine refusal that means "a human must approve this full-copy write (特批)". */
+export const FULL_COPY_APPROVAL_CODE = 'BACKUP_FULL_COPY_APPROVAL_REQUIRED';
 
 export const name = 'w2m-dsh-backup';
 
@@ -129,6 +135,9 @@ export function defaultBackupDir(platform = process.platform) {
  * keeps the deduplicated version record only, `full` also writes one sealed whole-file copy per rotated version
  * and therefore doubles that version's bytes. Any other value is refused rather than ignored -- an operator who
  * wrote `backupOldFormat: full` and silently got records would believe copies exist that do not.
+ * `backupFullCopyMaxMb` caps ONE `full` whole-file copy: a session file larger than the cap makes a run refuse
+ * before writing (`BACKUP_FULL_COPY_APPROVAL_REQUIRED`) until a human approves that run ("特批"). It defaults to
+ * 300 MB; `0` disables the cap explicitly, and a non-integer/negative value is refused rather than coerced.
  * `backupMirrorDir` is the offsite mirror directory; absent/empty means no mirror, and a non-string value is
  * refused rather than silently ignored (a typo in the row should not mount a plugin that silently copies
  * nowhere).
@@ -141,6 +150,7 @@ export function defaultBackupDir(platform = process.platform) {
  * @param {{env?: Record<string, string|undefined>, platform?: string}} [deps]
  * @returns {{ok: true, enabled: boolean, backup_dir: string, times: string[], time_zone: string, catch_up_ms: number,
  *   scope: string, keep_old_per_session: number, old_version_days: number, old_format: 'records'|'full',
+ *   full_copy_max_mb: number, full_copy_max_bytes: number,
  *   encryption: 'none'|'sealed', mirror_dir: string|null, account_binding: boolean, dsh_home: string}
  *   | {ok: false, reason_code: string, detail: string}}
  */
@@ -195,6 +205,18 @@ export function normalizeConfig(config = {}, deps = {}) {
       detail: `backupOldFormat must be one of ${OLD_FORMATS.join(', ')}, got ${JSON.stringify(oldFormat)}`,
     };
   }
+  // The `full` whole-file copy cap: 300 MB by default, `0` means "no cap" (explicit, documented), and anything
+  // that is not a non-negative integer is refused here so a typo cannot silently disable a cost guard. The value
+  // is MB on the row and bytes in the engine (which compares it with each session file's size).
+  const fullCopyMaxMb = config.backupFullCopyMaxMb ?? DEFAULT_FULL_COPY_MAX_MB;
+  if (!Number.isSafeInteger(fullCopyMaxMb) || fullCopyMaxMb < 0) {
+    return {
+      ok: false,
+      reason_code: 'BACKUP_CONFIG_INVALID',
+      detail: `backupFullCopyMaxMb must be a non-negative integer number of MB (0 = no cap), got ${JSON.stringify(config.backupFullCopyMaxMb)}`,
+    };
+  }
+  const fullCopyMaxBytes = fullCopyMaxMb * 1024 * 1024;
   // The protection mode for a NEW repository. `none` is the default (the user's decision: 默认是不加密); a bad
   // value fails the mount with a configuration code instead of becoming a silent surprise in a scheduled run.
   const encryption = config.backupEncryption ?? 'none';
@@ -255,6 +277,8 @@ export function normalizeConfig(config = {}, deps = {}) {
     keep_old_per_session: keepOld,
     old_version_days: oldVersionDays ?? 0,
     old_format: oldFormat,
+    full_copy_max_mb: fullCopyMaxMb,
+    full_copy_max_bytes: fullCopyMaxBytes,
     mirror_dir: mirrorDir,
     registry_recheck_ms: registryRecheckMs,
     runtime_verify: runtimeVerify,
@@ -267,8 +291,8 @@ export function normalizeConfig(config = {}, deps = {}) {
  *
  * @param {object} ctx Cordis context
  * @param {object} [config] row configuration (`backupDir`, `backupTimes`, `backupTimeZone`, `backupScope`,
- *   `keepOldPerSession`, `backupOldVersionDays`, `backupOldFormat`, `backupMirrorDir`, `backupEnabled`,
- *   `backupRuntimeVerify: 'off'|'nightly'`)
+ *   `keepOldPerSession`, `backupOldVersionDays`, `backupOldFormat`, `backupFullCopyMaxMb`, `backupMirrorDir`,
+ *   `backupEnabled`, `backupRuntimeVerify: 'off'|'nightly'`)
  * @param {{runtimeVerify?: Function, registerWatch?: Function, createScheduler?: Function, now?: Function}} [deps]
  *   Injectable seams for tests. `runtimeVerify` replaces the real `verifyRepo({runtime:true})` call the cached
  *   verdict store runs (so a unit test never spawns the Harness); `registerWatch` replaces the bounded watch the
@@ -296,6 +320,7 @@ export function apply(ctx, config = {}, deps = {}) {
     keep_old_per_session: cfg.keep_old_per_session,
     old_version_days: cfg.old_version_days,
     old_format: cfg.old_format,
+    full_copy_max_mb: cfg.full_copy_max_mb,
     encryption: cfg.encryption,
     mirror_dir: cfg.mirror_dir,
     runtime_verify_mode: cfg.runtime_verify,
@@ -408,6 +433,11 @@ export function apply(ctx, config = {}, deps = {}) {
         keepOldPerSession: cfg.keep_old_per_session,
         maxOldVersionDays: cfg.old_version_days,
         oldFormat: cfg.old_format,
+        // The cap is bytes in the engine; the row configures MB. The schedule path never sets allowLargeFullCopy:
+        // a timer must not approve a write on a person's behalf, which is exactly what makes the refusal below a
+        // named pending state instead of an unattended over-cap write.
+        maxFullCopyBytes: cfg.full_copy_max_bytes,
+        allowLargeFullCopy: request?.allowLargeFullCopy === true,
         encryption: cfg.encryption,
         mirrorRoot: cfg.mirror_dir,
         machineKey: cfg.machine_key,
@@ -429,6 +459,8 @@ export function apply(ctx, config = {}, deps = {}) {
           rotated: result.rotated,
           old_format: result.old_format,
           full_old_versions: result.full_old_versions ?? [],
+          full_copy_approved_over_cap: result.full_copy_approved_over_cap ?? [],
+          full_copy_max_mb: cfg.full_copy_max_mb,
           future_append: result.future_append ?? null,
           // The offsite copy is best effort: the primary result stays `ok` and the failure is visible here.
           mirror: result.mirror ?? null,
@@ -444,7 +476,36 @@ export function apply(ctx, config = {}, deps = {}) {
       } else {
         state.failures += 1;
         state.last_error = { at: new Date().toISOString(), reason_code: result.reason_code, detail: result.detail };
-        ctx.logger?.warn?.(`w2m-dsh-backup: ${reason} backup refused: ${result.reason_code}: ${result.detail}`);
+        if (result.reason_code === FULL_COPY_APPROVAL_CODE) {
+          // A named PENDING state, not a lost backup: the engine refused before writing anything, so the
+          // repository is untouched and the same run can be approved and retried. A scheduled run gets no person,
+          // so it records the pending refusal here for the panel instead of waiting -- a timer that blocks on a
+          // prompt is a dead timer. No approval is ever inferred: only an explicit panel/CLI action sets it.
+          state.last_result = {
+            ok: false,
+            reason_code: FULL_COPY_APPROVAL_CODE,
+            detail: result.detail ?? null,
+            reason,
+            at: new Date().toISOString(),
+            scope: request?.scope ?? cfg.scope,
+            selected: Array.isArray(request?.selected) ? request.selected : [],
+            full_copy_approval_required: true,
+            over_cap_count: Number.isFinite(Number(result.over_cap_count)) ? Number(result.over_cap_count) : 0,
+            cap_bytes: Number.isFinite(Number(result.cap_bytes)) ? Number(result.cap_bytes) : cfg.full_copy_max_bytes,
+            full_copy_max_mb: cfg.full_copy_max_mb,
+            full_copy_oversized: Array.isArray(result.full_copy_oversized) ? result.full_copy_oversized : [],
+            warnings: [
+              `${FULL_COPY_APPROVAL_CODE}: ${result.over_cap_count ?? 0} session(s) exceed the ` +
+                `${cfg.full_copy_max_mb} MB full-copy cap; nothing was written and the run awaits an explicit approval`,
+            ],
+          };
+          ctx.logger?.warn?.(
+            `w2m-dsh-backup: ${reason} backup refused before writing: ${FULL_COPY_APPROVAL_CODE}: ` +
+              `${result.over_cap_count ?? 0} session(s) exceed the ${cfg.full_copy_max_mb} MB full-copy cap; approval required (the repository is untouched)`,
+          );
+        } else {
+          ctx.logger?.warn?.(`w2m-dsh-backup: ${reason} backup refused: ${result.reason_code}: ${result.detail}`);
+        }
       }
       return result;
     } catch (error) {
@@ -508,6 +569,9 @@ export function apply(ctx, config = {}, deps = {}) {
               dsh_home: cfg.dsh_home,
               retention: { keep_old_per_session: cfg.keep_old_per_session, old_version_days: cfg.old_version_days },
               old_format: cfg.old_format,
+              // The `full` whole-file copy cap (MB; 0 = no cap). The panel shows it as the threshold and the
+              // approval dialog quotes it, so the number on screen is the number the engine compares against.
+              full_copy_max_mb: cfg.full_copy_max_mb,
               // The mode this row will create a NEW repository with. The repository's actual mode is
               // `status.repository.encryption` / `encryption` (an existing sealed repository keeps its mode).
               encryption: cfg.encryption,
@@ -548,6 +612,9 @@ export function apply(ctx, config = {}, deps = {}) {
             scope: body.scope,
             selected: Array.isArray(body.selected) ? body.selected : [],
             dryRun: body.dryRun === true,
+            // The explicit "特批" flag: only the literal `true` approves a write above the full-copy cap. The
+            // dialog re-posts the same request with this field, so an approval is always a second, human click.
+            allowLargeFullCopy: body.allowLargeFullCopy === true,
           });
           // 200 even for a refusal: the panel renders the reason code, and a 4xx/5xx would show as a broken
           // request rather than as the named reason the engine produced.

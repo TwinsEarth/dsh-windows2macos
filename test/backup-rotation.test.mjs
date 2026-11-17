@@ -13,6 +13,7 @@ import { dirname, join } from 'node:path';
 
 import {
   CURRENT_FORMAT,
+  DEFAULT_FULL_COPY_MAX_BYTES,
   DEFAULT_KEEP_OLD,
   DEFAULT_OLD_FORMAT,
   OLD_FORMAT,
@@ -30,6 +31,7 @@ import {
   readCurrent,
   recordSupersededVersion,
   resolveMaxAgeDays,
+  resolveMaxFullCopyBytes,
   resolveOldFormat,
   rotateForEntry,
   selectPrunable,
@@ -1010,6 +1012,90 @@ describe('rotation: old-backfill CLI', () => {
       assert.equal(payload.reason_code, 'BACKUP_NO_PERMISSION');
       assert.equal(payload.backfilled, 0);
       assert.equal(readFileSync(join(root, 'keys.json'), 'utf8'), before, 'a refused backfill must not rewrite the key file');
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe('rotation: the full-copy cap and its approval annotation', () => {
+  it('normalizes the injected cap: absent = 300 MiB, 0 = no cap, anything else is refused by name', () => {
+    assert.deepEqual(resolveMaxFullCopyBytes(undefined), { ok: true, maxBytes: DEFAULT_FULL_COPY_MAX_BYTES });
+    assert.deepEqual(resolveMaxFullCopyBytes(null), { ok: true, maxBytes: DEFAULT_FULL_COPY_MAX_BYTES });
+    assert.equal(DEFAULT_FULL_COPY_MAX_BYTES, 300 * 1024 * 1024);
+    assert.deepEqual(resolveMaxFullCopyBytes(0), { ok: true, maxBytes: 0 });
+    assert.deepEqual(resolveMaxFullCopyBytes(1024), { ok: true, maxBytes: 1024 });
+    for (const bad of [-1, 1.5, '1024', true]) {
+      const refused = resolveMaxFullCopyBytes(bad);
+      assert.equal(refused.ok, false, `maxFullCopyBytes=${String(bad)} must be refused`);
+      assert.equal(refused.reason_code, ROTATION_CODES.POLICY_INVALID);
+      assert.match(refused.detail, /maxFullCopyBytes must be 0/u);
+    }
+  });
+
+  it('annotates the copy with approved_over_cap/cap_bytes only when the engine approved it', () => {
+    const { dir, cleanup } = tempDir('w2m-rot-full-approved-');
+    try {
+      const dek = randomDek();
+      const bytes = Buffer.from('an explicitly approved over-cap version\n');
+      pointAtStoredVersion(dir, dek, bytes);
+      const result = rotateForEntry({
+        root: dir,
+        entry: CHANGED,
+        snapshotId: '20261117T150000Z-feedface',
+        format: 'full',
+        dek,
+        now: ROTATION_NOW,
+        approvedOverCap: true,
+        capBytes: 1024,
+      });
+      assert.equal(result.rotated, true);
+      assert.equal(result.full_copy.approved_over_cap, true);
+      assert.equal(result.full_copy.cap_bytes, 1024);
+      const record = listOldVersions(dir)[0].record;
+      assert.equal(record.full_copy.approved_over_cap, true);
+      assert.equal(record.full_copy.cap_bytes, 1024);
+      assert.equal(record.full_copy.size, bytes.length);
+      const copyFile = fullCopyPathFor(dir, record);
+      assert.deepEqual(
+        openObject(readFileSync(copyFile), dek, { sha256: record.full_copy.sha256, length: record.full_copy.size, kind: OLD_COPY_KIND }),
+        bytes,
+        'the annotated copy is still the superseded bytes',
+      );
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('keeps the pre-cap record shape when the copy was not over the cap', () => {
+    const { dir, cleanup } = tempDir('w2m-rot-full-unannotated-');
+    try {
+      const dek = randomDek();
+      pointAtStoredVersion(dir, dek, Buffer.from('under the cap\n'));
+      rotateForEntry({ root: dir, entry: CHANGED, snapshotId: '20261117T150000Z-feedface', format: 'full', dek, now: ROTATION_NOW });
+      const record = listOldVersions(dir)[0].record;
+      assert.equal('approved_over_cap' in record.full_copy, false, 'no approval means no approval field');
+      assert.equal('cap_bytes' in record.full_copy, false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('never annotates a records-mode record (it has no full copy at all)', () => {
+    const { dir, cleanup } = tempDir('w2m-rot-records-approved-');
+    try {
+      writeCurrentPointer({ root: dir, entry: ENTRY, snapshotId: '20261117T140000Z-deadbeef' });
+      const result = rotateForEntry({
+        root: dir,
+        entry: CHANGED,
+        snapshotId: '20261117T150000Z-feedface',
+        approvedOverCap: true,
+        capBytes: 1024,
+        now: ROTATION_NOW,
+      });
+      assert.equal(result.rotated, true);
+      assert.equal(result.full_copy, null);
+      assert.equal(listOldVersions(dir)[0].record.full_copy, undefined);
     } finally {
       cleanup();
     }

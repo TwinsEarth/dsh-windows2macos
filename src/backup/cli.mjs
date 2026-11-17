@@ -19,6 +19,13 @@
  * (stored in clear in the repository's `keys.json` and shown by `unlock`), so putting it on the command line is
  * the intended use. A hint equal to the PIN is refused by the keystore, so the PIN cannot be smuggled in as one.
  *
+ * ## The `full` whole-file-copy cap and "特批"
+ *
+ * `run --old-format full` refuses BEFORE writing when a session file that would become an old version is larger
+ * than `--max-full-copy-mb` (default 300; `0` = no cap). `--allow-large-full-copy` approves that one run; without
+ * it an interactive TTY asks `...是否特批本次写入？[y/N]` once and only `y` retries (a non-interactive stdin prints
+ * the flag and exits 1 instead of waiting). The question goes to stderr in `--json` mode, so stdout stays JSON.
+ *
  * `unlock --rotate-password` follows the same rule for both secrets: the new PIN comes from stdin or
  * `W2M_BACKUP_PASSWORD`, and the old PIN (only needed when the machine/account path cannot open the repository)
  * comes from `W2M_BACKUP_OLD_PASSWORD` or `--old-password-stdin`. With one stdin stream both are passed as two
@@ -70,6 +77,69 @@ export function humanBytes(bytes) {
     index += 1;
   }
   return `${index === 0 ? String(size) : size.toFixed(1)} ${units[index]}`;
+}
+
+/** The named engine refusal that asks for a human ("特批") approval before writing oversized full copies. */
+export const FULL_COPY_APPROVAL_CODE = 'BACKUP_FULL_COPY_APPROVAL_REQUIRED';
+
+/**
+ * The full-copy cap as MB text: the default 300 MiB cap reads `300`, a fractional cap keeps two decimals.
+ *
+ * The cap is stored in bytes (it is compared against `fs.statSync().size`), but the operator-facing unit is MB
+ * because that is how the requirement and the design document phrase it.
+ */
+export function fullCopyCapText(bytes) {
+  const value = Number(bytes);
+  if (!Number.isFinite(value) || value <= 0) return '0';
+  const mb = value / (1024 * 1024);
+  return Number.isInteger(mb) ? String(mb) : mb.toFixed(2).replace(/\.?0+$/u, '');
+}
+
+/**
+ * The interactive question asked when a `full` run needs an over-cap approval.
+ *
+ * Deliberately explicit about "this write only" (特批本次写入): answering y approves one run, it does not lift the
+ * cap for later runs. The default is N -- an empty line refuses -- and the CLI never prompts a non-interactive
+ * stdin (a script must pass `--allow-large-full-copy`).
+ *
+ * @param {object} result the `BACKUP_FULL_COPY_APPROVAL_REQUIRED` refusal from the engine
+ * @returns {string}
+ */
+export function formatFullCopyApprovalPrompt(result) {
+  const count = Number(result?.over_cap_count) || 0;
+  const cap = fullCopyCapText(result?.cap_bytes);
+  const rows = Array.isArray(result?.full_copy_oversized) ? result.full_copy_oversized : [];
+  const names = rows.slice(0, 5).map((row) => String(row?.session_id ?? '')).filter((name) => name !== '');
+  const shown = names.length === 0 ? '' : `（${names.join('、')}${count > names.length ? ' 等' : ''}）`;
+  return `${count} 个会话的 full 副本超过 ${cap} MB${shown}：是否特批本次写入？[y/N] `;
+}
+
+/** Injected TTY seam first (`io.stdinIsTTY`), then a possibly absent `process.stdin`: a test never needs a TTY. */
+function stdinIsInteractive(io) {
+  if (typeof io?.stdinIsTTY === 'boolean') return io.stdinIsTTY;
+  if (typeof io?.stdin?.isTTY === 'boolean') return io.stdin.isTTY;
+  return process.stdin?.isTTY === true;
+}
+
+/**
+ * Print a question and read one line synchronously.
+ *
+ * `io.ask(question)` is the test seam (it returns the answer instead of reading stdin); production reads fd 0,
+ * which is the same primitive `--password-stdin` already uses. A read failure is an empty answer, i.e. "no".
+ */
+function askLine(io, write, question) {
+  write(question);
+  if (typeof io?.ask === 'function') {
+    const injected = io.ask(question);
+    return typeof injected === 'string' ? injected : String(injected ?? '');
+  }
+  const buffer = Buffer.alloc(256);
+  try {
+    const read = fs.readSync(0, buffer, 0, buffer.length, null);
+    return buffer.subarray(0, read).toString('utf8').replace(/\r?\n$/u, '');
+  } catch {
+    return '';
+  }
 }
 
 /** Render the unlock probe for a terminal. */
@@ -268,6 +338,11 @@ function usage() {
     '  --keep-old <n>      old versions kept per session (default: 10)',
     '  --old-format <f>    run: how a superseded version is kept: records (default, deduped record only)',
     '                      or full (also one sealed whole-file copy under old/, doubling that version\'s bytes)',
+    '  --max-full-copy-mb <n>  run: cap on one full whole-file copy in MB (default 300; 0 = no cap). A session',
+    '                      file larger than the cap refuses the run BEFORE any write unless it is approved.',
+    '  --allow-large-full-copy run: explicitly approve this run when the full-copy cap is exceeded ("特批").',
+    '                      Without it an interactive terminal asks y/N; a non-interactive run prints this flag',
+    '                      and refuses without writing.',
     '  --encrypt <mode>    run: repository protection for a NEW repository: none (default, unencrypted) or sealed',
     '                      (account/machine/PIN envelopes). An existing repository keeps its mode.',
     '  --no-encryption     run: shorthand for --encrypt none',
@@ -349,6 +424,8 @@ export function parseArgs(argv, env = process.env) {
     selected: [],
     keepOld: null,
     oldFormat: null,
+    maxFullCopyMb: null,
+    allowLargeFullCopy: false,
     maxOldDays: null,
     limit: null,
     mirror: null,
@@ -508,6 +585,22 @@ export function parseArgs(argv, env = process.env) {
       const raw = arg.slice('--old-format='.length);
       if (!OLD_FORMATS.includes(raw)) return { ...options, error: `--old-format must be one of ${OLD_FORMATS.join(', ')}, got ${JSON.stringify(raw)}` };
       options.oldFormat = raw;
+    } else if (arg === '--max-full-copy-mb') {
+      const raw = rest.shift() ?? '';
+      const value = Number(raw);
+      if (raw.trim() === '' || !Number.isSafeInteger(value) || value < 0) {
+        return { ...options, error: `--max-full-copy-mb needs a non-negative integer (0 = no cap), got ${JSON.stringify(raw)}` };
+      }
+      options.maxFullCopyMb = value;
+    } else if (arg.startsWith('--max-full-copy-mb=')) {
+      const raw = arg.slice('--max-full-copy-mb='.length);
+      const value = Number(raw);
+      if (raw.trim() === '' || !Number.isSafeInteger(value) || value < 0) {
+        return { ...options, error: `--max-full-copy-mb needs a non-negative integer (0 = no cap), got ${JSON.stringify(raw)}` };
+      }
+      options.maxFullCopyMb = value;
+    } else if (arg === '--allow-large-full-copy') {
+      options.allowLargeFullCopy = true;
     } else if (arg === '--max-old-days') {
       const raw = rest.shift() ?? '';
       const value = Number(raw);
@@ -649,6 +742,21 @@ export function formatRun(result) {
     if (result.committed === true) {
       lines.push(`snapshot      : ${result.snapshot_id} (committed before the failure; the backup itself is durable)`);
     }
+    // The full-copy cap refusal is a named *pending* state, not a broken run: nothing was written, and the same
+    // run can be approved and retried. Name the sessions, the cap and the exact flag so the next command is obvious.
+    if (result.reason_code === FULL_COPY_APPROVAL_CODE) {
+      const rows = Array.isArray(result.full_copy_oversized) ? result.full_copy_oversized : [];
+      lines.push(`cap           : ${fullCopyCapText(result.cap_bytes)} MB per sealed whole-file old copy`);
+      for (const row of rows) {
+        lines.push(
+          `  over cap    : ${String(row.session_id)}  ${humanBytes(row.size)}  cap ${humanBytes(row.cap)}  ${String(row.rel)}`,
+        );
+      }
+      if (Number(result.over_cap_count) > rows.length) {
+        lines.push(`  …           : ${Number(result.over_cap_count) - rows.length} more session(s)`);
+      }
+      lines.push('approval      : nothing was written; re-run with --allow-large-full-copy to approve this run');
+    }
     return lines.join('\n');
   }
   const dry = result.dry_run === true;
@@ -670,6 +778,15 @@ export function formatRun(result) {
   if (result.old_format === 'full') {
     const copies = Array.isArray(result.full_old_versions) ? result.full_old_versions.length : 0;
     lines.push(`old format    : full (${copies} sealed whole-file copy(-ies); storage doubles per superseded version)`);
+  }
+  if (Array.isArray(result.full_copy_approved_over_cap) && result.full_copy_approved_over_cap.length > 0) {
+    lines.push(
+      `approved cap  : ${result.full_copy_approved_over_cap.length} session(s) explicitly approved over the full-copy cap ` +
+        `(recorded on the old/ version record as approved_over_cap)`,
+    );
+    for (const row of result.full_copy_approved_over_cap) {
+      lines.push(`  - ${String(row.session_id)}  ${humanBytes(row.size)}`);
+    }
   }
   if (result.mirror !== undefined) {
     if (result.mirror.ok === true) {
@@ -1012,7 +1129,7 @@ export function main(argv, io = {}) {
       return 1;
     }
     const machineKey = options.noMachineKey === true || (io.env ?? process.env).W2M_BACKUP_NO_MACHINE_KEY === '1' ? false : undefined;
-    const result = runBackup({
+    const runInput = {
       root: resolved.dir,
       dshHome: options.dshHome,
       scope: options.scope ?? 'all',
@@ -1020,6 +1137,9 @@ export function main(argv, io = {}) {
       keepOldPerSession: options.keepOld ?? undefined,
       maxOldVersionDays: options.maxOldDays ?? undefined,
       oldFormat: options.oldFormat ?? undefined,
+      // MB on the command line, bytes in the engine (the engine compares against the session file's size).
+      maxFullCopyBytes: options.maxFullCopyMb === null ? undefined : options.maxFullCopyMb * 1024 * 1024,
+      allowLargeFullCopy: options.allowLargeFullCopy === true,
       encryption: options.encryption ?? undefined,
       mirrorRoot: options.mirror ?? undefined,
       dryRun: options.dryRun,
@@ -1028,7 +1148,31 @@ export function main(argv, io = {}) {
       accountId: options.accountId ?? undefined,
       password: passwordFor(options, io),
       machineKey,
-    });
+    };
+    let result = runBackup(runInput);
+    // The full-copy cap: an interactive terminal may approve THIS run once and retry; a script must pass the flag.
+    // The question goes to stderr in --json mode so stdout stays the machine-readable result. Either way the
+    // refusal wrote nothing, so "no" is a complete, safe outcome.
+    let approvalHint = null;
+    if (result.ok !== true && result.reason_code === FULL_COPY_APPROVAL_CODE && options.allowLargeFullCopy !== true) {
+      if (stdinIsInteractive(io)) {
+        const answer = askLine(io, options.json === true ? writeErr : write, formatFullCopyApprovalPrompt(result));
+        if (/^\s*(y|yes|是)\s*$/iu.test(answer)) {
+          result = runBackup({ ...runInput, allowLargeFullCopy: true });
+          if (result.ok === true) result.approval = 'prompted';
+        } else {
+          approvalHint = '未特批：没有写入任何内容（回答不是 y）。';
+        }
+      } else {
+        approvalHint =
+          'hint          : 非交互环境不会等待确认；确认特批请加 --allow-large-full-copy（或调大 --max-full-copy-mb）。';
+      }
+    }
+    if (approvalHint !== null) {
+      // The hint must never corrupt --json output: a machine-readable run writes it to stderr instead.
+      if (options.json === true) writeErr(approvalHint);
+      else write(approvalHint);
+    }
     if (options.runtimeVerify === true && result.ok === true && options.dryRun !== true) {
       // One manual runtime verdict, after the backup is committed: the verdict can never change the backup's
       // outcome (the bytes are already durable), so a failure here is a warning on a committed result.

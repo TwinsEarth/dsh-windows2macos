@@ -194,6 +194,8 @@
         backupTimeZone: Asia/Shanghai
         backupScope: all
         keepOldPerSession: 10
+        # 整文件副本上限（MB）：oldFormat=full 时单个会话文件超过 300 MB 需显式「特批」才会写入；0 = 不设上限。
+        backupFullCopyMaxMb: 300
         # 字面兼容需求 3：被替换的旧版本除记录外再写一份整文件加密副本（old/<ws>/<sid>/…json.enc）。
         # 代价：每个被替换版本在去重块之外多占一份整文件字节；不想要时改成 records。
         backupOldFormat: full

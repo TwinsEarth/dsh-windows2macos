@@ -72,6 +72,17 @@ export const DEFAULT_OLD_FORMAT = 'records';
 /** Suffix of a sealed whole-file copy: `<ts>-<sha12>.json` -> `<ts>-<sha12>.json.enc`. */
 export const FULL_COPY_SUFFIX = '.enc';
 
+/**
+ * Default cap on ONE `full` whole-file copy: 300 MiB.
+ *
+ * `full` doubles a superseded version's bytes on top of the deduplicated blocks, so a single 1 GB session would
+ * silently add 1 GB per rotation. The engine therefore refuses a `full` run *before writing anything* when a
+ * session file that this run would store is larger than this cap, and requires the operator's explicit approval
+ * (`allowLargeFullCopy` / CLI `--allow-large-full-copy` / the panel's 「特批并继续」 dialog). `0` disables the cap
+ * (an explicit "I accept unbounded copies"); absent means this default.
+ */
+export const DEFAULT_FULL_COPY_MAX_BYTES = 300 * 1024 * 1024;
+
 /** Format of a `current/` pointer. */
 export const CURRENT_FORMAT = 'w2m-session-backup/current';
 
@@ -157,6 +168,28 @@ export function resolveOldFormat(value) {
     ok: false,
     reason_code: ROTATION_CODES.FORMAT_INVALID,
     detail: `oldFormat must be one of ${OLD_FORMATS.join(', ')}, got ${shown}`,
+  };
+}
+
+/**
+ * Normalize the `maxFullCopyBytes` option (the `full` whole-file copy cap).
+ *
+ * Absent (`undefined`/`null`) means {@link DEFAULT_FULL_COPY_MAX_BYTES}: a `full` run refuses oversized sessions
+ * unless it is explicitly approved. `0` means "no cap" (the operator accepts whole-file copies of any size). Any
+ * other value must be a non-negative safe integer; anything else is a policy error naming what it refused, so a
+ * typo cannot silently turn the cap off.
+ *
+ * @param {unknown} value
+ * @returns {{ok: true, maxBytes: number} | {ok: false, reason_code: string, detail: string}}
+ */
+export function resolveMaxFullCopyBytes(value) {
+  if (value === undefined || value === null) return { ok: true, maxBytes: DEFAULT_FULL_COPY_MAX_BYTES };
+  if (Number.isSafeInteger(value) && value >= 0) return { ok: true, maxBytes: value };
+  const shown = typeof value === 'number' ? String(value) : (JSON.stringify(value) ?? String(value));
+  return {
+    ok: false,
+    reason_code: ROTATION_CODES.POLICY_INVALID,
+    detail: `maxFullCopyBytes must be 0 (no cap) or a non-negative integer number of bytes, got ${shown}`,
   };
 }
 
@@ -276,7 +309,10 @@ function writeFullCopy(input) {
  * `full` record is still a `w2m-session-backup/old-version` v1 that older readers can list and restore from.
  *
  * @param {{root: string, previous: object, snapshotId: string, now?: Date, format?: 'records'|'full',
- *   dek?: Buffer}} input `dek` is required for `full` and unused for `records`
+ *   dek?: Buffer, approvedOverCap?: boolean, capBytes?: number}} input `dek` is required for `full` and unused for
+ *   `records`; `approvedOverCap`/`capBytes` are supplied by the engine only when the operator explicitly approved
+ *   a whole-file copy larger than the configured cap (the record then carries `full_copy.approved_over_cap: true`
+ *   and `full_copy.cap_bytes`, so the approval that paid for the bytes is auditable on the record itself)
  * @returns {{file: string, record: object, full_copy: object|null}}
  * @throws {RotationError} `BACKUP_ROTATION_FORMAT_INVALID`, `BACKUP_ROTATION_ENTRY_INVALID` or
  *   `BACKUP_ROTATION_WRITE_FAILED` (the last one for either the copy or the record)
@@ -289,8 +325,19 @@ export function recordSupersededVersion(input) {
   const file = oldVersionPath(input.root, previous, stamp);
   // Copy FIRST, record second: a record must never claim a copy that failed to land. The reverse crash window
   // (record written, copy missing) is the one that would lie, so it is not the order used here.
+  const approvedOverCap = input.approvedOverCap === true;
   const fullCopy = formatPolicy.format === 'full'
-    ? writeFullCopy({ root: input.root, previous, stamp, dek: input.dek })
+    ? {
+        ...writeFullCopy({ root: input.root, previous, stamp, dek: input.dek }),
+        // Additive audit trail: the approval is written onto the record (not only into the run's result), so a
+        // reader of `old/` can tell a deliberately approved oversized copy from one the cap never saw.
+        ...(approvedOverCap
+          ? {
+              approved_over_cap: true,
+              cap_bytes: Number.isSafeInteger(input.capBytes) && input.capBytes > 0 ? input.capBytes : DEFAULT_FULL_COPY_MAX_BYTES,
+            }
+          : {}),
+      }
     : null;
   const record = {
     format: OLD_FORMAT,
@@ -500,7 +547,9 @@ export function pruneOldVersions(input) {
  * DEK) to rebuild and seal it. A bad `format` is refused before any write, like a bad retention window.
  *
  * @param {{root: string, entry: object, snapshotId: string, keep?: number, maxAgeDays?: number|null,
- *   now?: Date, dryRun?: boolean, format?: 'records'|'full', dek?: Buffer}} input
+ *   now?: Date, dryRun?: boolean, format?: 'records'|'full', dek?: Buffer, approvedOverCap?: boolean,
+ *   capBytes?: number}} input `approvedOverCap`/`capBytes` are forwarded to
+ *   {@link recordSupersededVersion} (the engine sets them only for an explicitly approved over-cap copy)
  * @returns {{rotated: boolean, unchanged: boolean, previous_sha256: string|null, old_file: string|null,
  *   full_copy: object|null, current_file: string, pruned: Array<object>, pruned_by_age: number}}
  * @throws {RotationError} `BACKUP_ROTATION_ENTRY_INVALID` for an unusable entry,
@@ -563,6 +612,8 @@ export function rotateForEntry(input) {
     now: input.now,
     format: formatPolicy.format,
     dek: input.dek,
+    approvedOverCap: input.approvedOverCap,
+    capBytes: input.capBytes,
   });
   writeCurrentPointer({ root: input.root, entry, snapshotId: input.snapshotId, now: input.now });
   const pruned = pruneOldVersions({ root: input.root, keep: input.keep ?? DEFAULT_KEEP_OLD, maxAgeDays: agePolicy.maxAgeDays, now: input.now });

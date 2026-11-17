@@ -7,6 +7,7 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { randomBytes } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -47,6 +48,26 @@ const PASSWORD = 'correct horse battery staple';
 function homeFixture() {
   return makeHome({
     sessions: [{ workspace: '--E-GPT--', id: 'session-aaaaaaaa-0001' }],
+    registry: registryDocument({ sessionIds: ['session-aaaaaaaa-0001'] }),
+  });
+}
+
+/**
+ * A home with one registered session whose log exceeds 1 MiB, so the row's one-MB full-copy cap is exceeded.
+ *
+ * Random bytes, not repetition: zstd would compress a repeated character to nothing and the fixture would stay
+ * under the cap, making the tests pass without ever exercising the refusal.
+ */
+function largeHomeFixture() {
+  const blob = randomBytes(3 * 1024 * 1024).toString('base64');
+  return makeHome({
+    sessions: [
+      {
+        workspace: '--E-GPT--',
+        id: 'session-aaaaaaaa-0001',
+        events: [{ type: 'turn/start', seq: 0, time: 1794842804375, data: { turn: 1, blob } }],
+      },
+    ],
     registry: registryDocument({ sessionIds: ['session-aaaaaaaa-0001'] }),
   });
 }
@@ -211,6 +232,25 @@ describe('subplugin: configuration', () => {
       assert.equal(refused.ok, false, `backupEncryption=${String(bad)} must be refused`);
       assert.equal(refused.reason_code, 'BACKUP_CONFIG_INVALID');
       assert.match(refused.detail, /backupEncryption must be one of none, sealed/u);
+    }
+  });
+
+  it('normalizes backupFullCopyMaxMb (300 MB default, 0 = no cap) and refuses an invalid value', () => {
+    const defaults = normalizeConfig({}, { env: {}, platform: 'win32' });
+    assert.equal(defaults.ok, true);
+    assert.equal(defaults.full_copy_max_mb, 300, 'the documented default cap is 300 MB');
+    assert.equal(defaults.full_copy_max_bytes, 300 * 1024 * 1024, 'the engine receives bytes, not MB');
+    const disabled = normalizeConfig({ backupFullCopyMaxMb: 0 }, { env: {}, platform: 'win32' });
+    assert.equal(disabled.ok, true);
+    assert.equal(disabled.full_copy_max_mb, 0, '0 is the explicit "no cap"');
+    assert.equal(disabled.full_copy_max_bytes, 0);
+    const raised = normalizeConfig({ backupFullCopyMaxMb: 2048 }, { env: {}, platform: 'win32' });
+    assert.equal(raised.full_copy_max_bytes, 2048 * 1024 * 1024);
+    for (const bad of [-1, 1.5, '300', true]) {
+      const refused = normalizeConfig({ backupFullCopyMaxMb: bad }, { env: {}, platform: 'win32' });
+      assert.equal(refused.ok, false, `backupFullCopyMaxMb=${String(bad)} must be refused`);
+      assert.equal(refused.reason_code, 'BACKUP_CONFIG_INVALID');
+      assert.match(refused.detail, /backupFullCopyMaxMb must be a non-negative integer/u);
     }
   });
 });
@@ -603,6 +643,65 @@ describe('subplugin: the route and the timer', () => {
       }
     },
   );
+
+  it('records a scheduled full-copy cap refusal as a pending state and writes nothing; only an explicit route approval writes', async () => {
+    const { home, cleanup: cleanHome } = largeHomeFixture();
+    const { dir, cleanup } = tempDir('w2m-run-full-cap-pending-');
+    try {
+      const fake = fakeCtx();
+      const harness = schedulerHarness();
+      apply(
+        fake.ctx,
+        {
+          backupDir: join(dir, 'repo'),
+          dshHome: home,
+          backupMachineKey: false,
+          backupOldFormat: 'full',
+          backupFullCopyMaxMb: 1,
+          backupFutureAppend: false,
+          ...NO_FIRE,
+        },
+        { createScheduler: harness.createScheduler },
+      );
+      // The scheduled path (which is also the missed-slot catch-up) has no person to ask, so it must not block and
+      // must not write: the engine refusal is recorded as a named pending state.
+      const result = await harness.captured.options.run();
+      assert.equal(result.ok, false);
+      assert.equal(result.reason_code, 'BACKUP_FULL_COPY_APPROVAL_REQUIRED');
+      assert.equal(result.over_cap_count, 1);
+      assert.equal(existsSync(join(dir, 'repo')), false, 'a refused scheduled run writes nothing (not even the layout)');
+
+      const route = fake.registrations.find((row) => row.path === BACKUP_RUN_ROUTE_PATH);
+      const readState = async () => (await route.fetch(new Request(`http://local.invalid${BACKUP_RUN_ROUTE_PATH}`, { method: 'GET' }))).json();
+      const state = await readState();
+      assert.equal(state.full_copy_max_mb, 1, 'the describe payload names the configured cap');
+      assert.equal(state.state.last_result.reason_code, 'BACKUP_FULL_COPY_APPROVAL_REQUIRED');
+      assert.equal(state.state.last_result.full_copy_approval_required, true);
+      assert.equal(state.state.last_result.over_cap_count, 1);
+      assert.equal(state.state.last_result.cap_bytes, 1024 * 1024);
+      assert.equal(state.state.last_result.scope, 'all');
+      assert.equal(state.state.last_result.full_copy_oversized.length, 1);
+      assert.ok(
+        fake.logs.some((entry) => entry.level === 'warn' && entry.message.includes('BACKUP_FULL_COPY_APPROVAL_REQUIRED')),
+        'the refusal is logged as a warning naming the code',
+      );
+
+      // The panel's approve action re-posts the same request with the explicit flag; that is the only write path.
+      const approved = await (await route.fetch(new Request(`http://local.invalid${BACKUP_RUN_ROUTE_PATH}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ confirm: RUN_CONFIRM_TOKEN, allowLargeFullCopy: true }),
+      }))).json();
+      assert.equal(approved.ok, true, `${approved.reason_code}: ${approved.detail}`);
+      assert.equal(approved.full_copy_approved_over_cap.length, 1);
+      assert.equal(existsSync(join(dir, 'repo')), true, 'the approved run writes the repository');
+      const after = await readState();
+      assert.equal(after.state.last_result.full_copy_approval_required, undefined, 'a successful run replaces the pending state');
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
 });
 
 describe('cli: run / list / gc', () => {
@@ -1105,6 +1204,107 @@ describe('cli: run / list / gc', () => {
       const text = human.lines.join('\n');
       assert.match(text, /old format {4}: full/u);
       assert.match(text, /storage doubles/u, 'the human summary must state the doubled-storage cost');
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+
+  it('refuses an over-cap full copy before writing, prints the approval flag without a TTY, and honours --allow-large-full-copy', () => {
+    const { home, cleanup: cleanHome } = largeHomeFixture();
+    const { dir, cleanup } = tempDir('w2m-cli-full-cap-');
+    try {
+      const env = { W2M_BACKUP_NO_MACHINE_KEY: '1' };
+      // Flag surface first: the cap is MB on the CLI and 0 means "no cap"; a bad value is a usage error (exit 2).
+      assert.equal(parseArgs(['run', '--allow-large-full-copy'], env).allowLargeFullCopy, true);
+      assert.equal(parseArgs(['run', '--max-full-copy-mb', '0'], env).maxFullCopyMb, 0);
+      assert.equal(parseArgs(['run', '--max-full-copy-mb=5'], env).maxFullCopyMb, 5);
+      assert.equal(parseArgs(['run'], env).maxFullCopyMb, null, 'absent means the engine default cap');
+      for (const argv of [['--max-full-copy-mb'], ['--max-full-copy-mb', 'lots'], ['--max-full-copy-mb=-1'], ['--max-full-copy-mb=1.5']]) {
+        const bad = capture();
+        assert.equal(main(['run', ...argv], { ...bad.io, env, password: PASSWORD }), 2, argv.join(' '));
+        assert.match(bad.lines.join('\n'), /--max-full-copy-mb needs a non-negative integer \(0 = no cap\)/u);
+      }
+
+      const repo = join(dir, 'repo');
+      const nonTty = capture();
+      const refused = main(
+        ['run', '--backup-dir', repo, '--dsh-home', home, '--old-format', 'full', '--max-full-copy-mb', '1'],
+        { ...nonTty.io, env, password: PASSWORD, stdinIsTTY: false },
+      );
+      assert.equal(refused, 1);
+      const text = nonTty.lines.join('\n');
+      assert.match(text, /BACKUP_FULL_COPY_APPROVAL_REQUIRED/u);
+      assert.match(text, /--allow-large-full-copy/u, 'a non-interactive run prints the flag instead of asking');
+      assert.equal(text.includes('是否特批本次写入'), false, 'no prompt without a TTY');
+      assert.match(text, /cap {11}: 1 MB/u);
+      assert.equal(existsSync(repo), false, 'the refusal wrote nothing');
+
+      const approved = capture();
+      assert.equal(
+        main(
+          ['run', '--backup-dir', repo, '--dsh-home', home, '--old-format', 'full', '--max-full-copy-mb', '1', '--allow-large-full-copy', '--json'],
+          { ...approved.io, env, password: PASSWORD, stdinIsTTY: false },
+        ),
+        0,
+        approved.lines.join('\n'),
+      );
+      const payload = JSON.parse(approved.lines.join('\n'));
+      assert.equal(payload.ok, true, payload.detail);
+      assert.equal(payload.full_copy_approved_over_cap.length, 1);
+      assert.equal(payload.full_copy_approved_over_cap[0].session_id, 'session-aaaaaaaa-0001');
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+
+  it('asks the 特批 question once on a TTY: y retries with the approval, n refuses without writing', () => {
+    const { home, cleanup: cleanHome } = largeHomeFixture();
+    const { dir, cleanup } = tempDir('w2m-cli-full-cap-tty-');
+    try {
+      const env = { W2M_BACKUP_NO_MACHINE_KEY: '1' };
+      const promptsDenied = [];
+      const denied = capture();
+      const deniedCode = main(
+        ['run', '--backup-dir', join(dir, 'denied'), '--dsh-home', home, '--old-format', 'full', '--max-full-copy-mb', '1'],
+        {
+          ...denied.io,
+          env,
+          password: PASSWORD,
+          stdinIsTTY: true,
+          ask: (question) => { promptsDenied.push(question); return 'n'; },
+        },
+      );
+      assert.equal(deniedCode, 1);
+      assert.equal(promptsDenied.length, 1, 'exactly one question is asked');
+      assert.match(promptsDenied[0], /1 个会话的 full 副本超过 1 MB/u);
+      assert.match(promptsDenied[0], /：是否特批本次写入？\[y\/N\] $/u);
+      assert.equal(existsSync(join(dir, 'denied')), false, 'answering n writes nothing');
+
+      const promptsApproved = [];
+      const acceptedOut = [];
+      const acceptedErr = [];
+      const acceptedCode = main(
+        ['run', '--backup-dir', join(dir, 'accepted'), '--dsh-home', home, '--old-format', 'full', '--max-full-copy-mb', '1', '--json'],
+        {
+          stdout: (text) => acceptedOut.push(text),
+          stderr: (text) => acceptedErr.push(text),
+          env,
+          password: PASSWORD,
+          stdinIsTTY: true,
+          ask: (question) => { promptsApproved.push(question); return 'y'; },
+        },
+      );
+      assert.equal(acceptedCode, 0, acceptedOut.join('\n') + acceptedErr.join('\n'));
+      assert.equal(promptsApproved.length, 1);
+      assert.match(promptsApproved[0], /：是否特批本次写入？\[y\/N\] $/u, 'the question is the documented one');
+      assert.equal(existsSync(join(dir, 'accepted')), true, 'answering y retries the same run with the approval and writes');
+      const payload = JSON.parse(acceptedOut.join('\n'));
+      assert.equal(payload.ok, true, payload.detail);
+      assert.equal(payload.approval, 'prompted', 'the result records that the approval came from the prompt');
+      assert.equal(payload.full_copy_approved_over_cap.length, 1);
+      assert.ok(acceptedErr.join('\n').includes('是否特批本次写入'), 'in --json mode the question goes to stderr, so stdout stays parseable');
     } finally {
       cleanup();
       cleanHome();

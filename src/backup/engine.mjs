@@ -3,11 +3,13 @@
  *
  * ## The order the steps happen in, and why
  *
- *   1. **lock** -- one writer, or none (see `locks.mjs`);
+ *   1. **scan** -- read-only enumeration of the home, FIRST: the scope, the rel-path pre-check and the `full`
+ *      whole-file copy cap are all derived from it, and a refusal derived from the scan must leave no state at all
+ *      (not even a repository directory);
  *   2. **layout** -- create the repository on the first run;
- *   3. **key** -- open or mint the repository DEK before writing anything, so a run cannot fail *after* it has
+ *   3. **lock** -- one writer, or none (see `locks.mjs`);
+ *   4. **key** -- open or mint the repository DEK before writing anything, so a run cannot fail *after* it has
  *      already written blocks nobody can ever read;
- *   4. **scan** -- read-only enumeration of the home;
  *   5. **blocks** -- read each selected file once, split it into 4 MiB blocks, and write only the blocks whose
  *      content address is absent (that absence check *is* the deduplication);
  *   6. **commit** -- manifest + key copy staged, renamed, index appended (see `repo.mjs`);
@@ -26,7 +28,9 @@
  *   * an invalid retention window (`BACKUP_ROTATION_POLICY_INVALID`) or a mirror path inside the repository /
  *     the home it copies, including through a symlink or junction (`BACKUP_MIRROR_INVALID` /
  *     `BACKUP_MIRROR_SYMLINK`) -- both before any write, so a configuration mistake leaves no half-built
- *     snapshot behind.
+ *     snapshot behind;
+ *   * in `full` mode, a session file larger than the whole-file-copy cap without an explicit approval
+ *     (`BACKUP_FULL_COPY_APPROVAL_REQUIRED`) -- also before any write, so the refusal is a clean pending state.
  *
  * ## The offsite mirror is best effort, and strictly after the primary
  *
@@ -49,6 +53,19 @@
  *
  * Every refusal is a `{ok:false, reason_code, detail}` result, not an exception: the route and the CLI print the
  * same refusal, and a scheduled run logs it instead of tearing the timer down.
+ *
+ * ## The `full` whole-file copy cap (`maxFullCopyBytes`, default 300 MiB)
+ *
+ * `oldFormat: 'full'` writes one sealed whole-file copy per superseded version, so a single huge session would
+ * silently double its bytes on every change. The run therefore scans the sessions it would back up **before the
+ * repository is laid out, locked or opened**, and refuses with `BACKUP_FULL_COPY_APPROVAL_REQUIRED` when any
+ * session file is larger than the cap and the run was not explicitly approved (`allowLargeFullCopy: true`). The
+ * refusal is complete and leaves the repository untouched -- nothing is committed and no partial state is written,
+ * which is what makes "refused, awaiting approval" a safe state for an unattended schedule slot. An approved run
+ * records the approval twice: `full_copy_approved_over_cap: [{session_id, size}]` in the result, and
+ * `full_copy.approved_over_cap: true` + `full_copy.cap_bytes` on the version record it wrote. `maxFullCopyBytes: 0`
+ * disables the cap explicitly (documented, never the default); `records` mode ignores it because it writes no
+ * whole-file copy at all.
  */
 
 import fs from 'node:fs';
@@ -64,7 +81,7 @@ import { detectMachineKeySupport } from './machine-key.mjs';
 import { appendLegalEvent, futureAppendVerdict } from './future-append.mjs';
 import { buildArtifactFromBuffer, runtimeValidateBatch } from './runtime-validate.mjs';
 import { scanHome } from './scan.mjs';
-import { DEFAULT_KEEP_OLD, resolveMaxAgeDays, resolveOldFormat, rotateForEntry } from './rotation.mjs';
+import { DEFAULT_KEEP_OLD, resolveMaxAgeDays, resolveMaxFullCopyBytes, resolveOldFormat, rotateForEntry } from './rotation.mjs';
 import { MIRROR_CODES, resolveMirrorRoot, syncToMirror } from './mirror.mjs';
 import { commitSnapshot, makeSnapshotId } from './repo.mjs';
 import { scanFrames } from '../fix/zstd.mjs';
@@ -81,6 +98,8 @@ export const ENGINE_CODES = Object.freeze({
   HOME_MISSING: 'BACKUP_SCAN_HOME_MISSING',
   KEY_UNWRAP_FAILED: 'BACKUP_KEY_UNWRAP_FAILED',
   WRITE_FAILED: 'BACKUP_WRITE_FAILED',
+  /** `oldFormat: 'full'`: a whole-file copy would exceed `maxFullCopyBytes` and was not explicitly approved. */
+  FULL_COPY_APPROVAL_REQUIRED: 'BACKUP_FULL_COPY_APPROVAL_REQUIRED',
 });
 
 /** Block size used by the engine; identical to the manifest's, referenced for readability. */
@@ -277,6 +296,8 @@ function safeMtime(file) {
  *   keepOldPerSession?: number,
  *   maxOldVersionDays?: number|null,
  *   oldFormat?: 'records'|'full',
+ *   maxFullCopyBytes?: number,
+ *   allowLargeFullCopy?: boolean,
  *   mirrorRoot?: string|null,
  *   dryRun?: boolean,
  *   exclude_session_ids?: string[],
@@ -308,6 +329,16 @@ export function runBackup(input) {
     return { ok: false, reason_code: formatPolicy.reason_code, detail: formatPolicy.detail, dry_run: dryRun };
   }
   const oldFormat = formatPolicy.format;
+  // The `full` whole-file copy cap is a policy value, so it is validated with the rest of them: before the scan,
+  // the layout, the lock and the key. A refused run therefore writes nothing at all.
+  const capPolicy = resolveMaxFullCopyBytes(input.maxFullCopyBytes);
+  if (capPolicy.ok !== true) {
+    return { ok: false, reason_code: capPolicy.reason_code, detail: capPolicy.detail, dry_run: dryRun };
+  }
+  const maxFullCopyBytes = capPolicy.maxBytes;
+  // Only the exact boolean counts: `allowLargeFullCopy: 1` / `"yes"` is a caller bug, not an approval. An approval
+  // is a deliberate act by the operator, never something inferred from a truthy value.
+  const allowLargeFullCopy = input.allowLargeFullCopy === true;
 
   // The offsite mirror is validated here too: a mirror path that points inside the repository (or the home it
   // copies) is refused before ensureLayout/lock/commit, so a refused configuration leaves no snapshot behind.
@@ -364,36 +395,9 @@ export function runBackup(input) {
         };
       }
     }
-    if (dryRun !== true) {
-      try {
-        ensureLayout(root, { dshHome, now, encryption: input.encryption === undefined && existed === true ? undefined : creationMode });
-      } catch (error) {
-        if (error instanceof BackupLayoutError) return { ok: false, reason_code: error.code, detail: error.detail, dry_run: dryRun };
-        throw error;
-      }
-      lock = withRepoLock({ root, now: () => now.getTime() });
-      if (lock.ok !== true) return { ok: false, reason_code: lock.reason_code, detail: lock.detail, holder: lock.holder, dry_run: dryRun };
-    }
-
-    // A dry run never writes -- including no layout and no key -- so it needs neither the lock nor the credential.
-    // It still reports what would be written, and block reuse is decided by object existence, which needs no key.
-    const key = dryRun === true
-      ? { ok: true, dek: null, keys: null, created: false, unlocked_via: 'dry-run', encryption: null, available_paths: [], machine: { ok: false, reason: 'dry-run' }, machine_envelope_added: false }
-      : openRepoKey({
-          root,
-          dshHome,
-          accountId: input.accountId ?? null,
-          password: input.password ?? null,
-          encryption: input.encryption,
-          platform: input.platform,
-          runner: input.runner,
-          machineKey: input.machineKey,
-          now,
-        });
-    if (key.ok !== true) {
-      return { ok: false, reason_code: key.reason_code, detail: key.detail, machine: key.machine, dry_run: dryRun };
-    }
-
+    // The scan is READ-ONLY and therefore runs before the layout/lock/key: the scope selection, the rel-path
+    // fail-fast and the `full` copy cap are all derived from it, and a refusal derived from it must leave the
+    // repository exactly as it was -- not even created. (The scan never writes; see scan.mjs.)
     const run = typeof input.scan === 'function' ? input.scan : scanHome;
     const scan = run({ dshHome });
     if (scan.exists !== true) {
@@ -429,6 +433,72 @@ export function runBackup(input) {
           dry_run: dryRun,
         };
       }
+    }
+
+    // `full` doubles a superseded version's bytes, so a run that would write a whole-file copy larger than the cap
+    // refuses BEFORE any write unless the operator explicitly approved this run. The scan's `size` is the size of
+    // the version on disk right now -- exactly the version that becomes the old record -- so the decision needs no
+    // repository read and cannot drift from what rotation will later copy. `records` mode writes no whole-file copy
+    // and therefore ignores the cap; `maxFullCopyBytes: 0` disables it explicitly.
+    const oversizedSessions =
+      oldFormat === 'full' && maxFullCopyBytes > 0
+        ? selection.chosen.filter((row) => Number.isSafeInteger(row.size) && row.size > maxFullCopyBytes)
+        : [];
+    if (oversizedSessions.length > 0 && allowLargeFullCopy !== true) {
+      const listed = oversizedSessions.slice(0, 20).map((row) => ({
+        session_id: row.session_id,
+        rel: row.rel,
+        size: row.size,
+        cap: maxFullCopyBytes,
+      }));
+      const described = listed.map((row) => `${row.session_id} (${row.rel}): ${row.size} bytes > cap ${row.cap} bytes`).join('; ');
+      return {
+        ok: false,
+        reason_code: ENGINE_CODES.FULL_COPY_APPROVAL_REQUIRED,
+        codes: [ENGINE_CODES.FULL_COPY_APPROVAL_REQUIRED],
+        detail:
+          `${oversizedSessions.length} session(s) would get an old-format "full" whole-file copy larger than the ` +
+          `${maxFullCopyBytes}-byte cap; nothing was written. Re-run with an explicit approval ` +
+          `(allowLargeFullCopy: true / --allow-large-full-copy) to write them: ${described}` +
+          `${oversizedSessions.length > listed.length ? `; … ${oversizedSessions.length - listed.length} more` : ''}`,
+        full_copy_oversized: listed,
+        over_cap_count: oversizedSessions.length,
+        cap_bytes: maxFullCopyBytes,
+        dry_run: dryRun,
+      };
+    }
+    const approvedOverCapIds = new Set(
+      oversizedSessions.map((row) => row.session_id),
+    );
+
+    if (dryRun !== true) {
+      try {
+        ensureLayout(root, { dshHome, now, encryption: input.encryption === undefined && existed === true ? undefined : creationMode });
+      } catch (error) {
+        if (error instanceof BackupLayoutError) return { ok: false, reason_code: error.code, detail: error.detail, dry_run: dryRun };
+        throw error;
+      }
+      lock = withRepoLock({ root, now: () => now.getTime() });
+      if (lock.ok !== true) return { ok: false, reason_code: lock.reason_code, detail: lock.detail, holder: lock.holder, dry_run: dryRun };
+    }
+
+    // A dry run never writes -- including no layout and no key -- so it needs neither the lock nor the credential.
+    // It still reports what would be written, and block reuse is decided by object existence, which needs no key.
+    const key = dryRun === true
+      ? { ok: true, dek: null, keys: null, created: false, unlocked_via: 'dry-run', encryption: null, available_paths: [], machine: { ok: false, reason: 'dry-run' }, machine_envelope_added: false }
+      : openRepoKey({
+          root,
+          dshHome,
+          accountId: input.accountId ?? null,
+          password: input.password ?? null,
+          encryption: input.encryption,
+          platform: input.platform,
+          runner: input.runner,
+          machineKey: input.machineKey,
+          now,
+        });
+    if (key.ok !== true) {
+      return { ok: false, reason_code: key.reason_code, detail: key.detail, machine: key.machine, dry_run: dryRun };
     }
 
     // The snapshot id is minted here, before any block is written, because block objects are content-addressed
@@ -574,6 +644,10 @@ export function runBackup(input) {
         // the call site from having two shapes that could drift apart.
         format: oldFormat,
         dek: key.dek,
+        // Only a session the pre-write check found over the cap carries the approval onto its record: the approval
+        // is tied to the bytes that triggered it, not to the whole run.
+        approvedOverCap: approvedOverCapIds.has(entry.session_id),
+        capBytes: maxFullCopyBytes,
       }));
     } catch (error) {
       return {
@@ -593,6 +667,13 @@ export function runBackup(input) {
     // The sealed whole-file copies, in rotation order. Only `full` mode produces them, and the key is only added
     // in that mode so a default run keeps exactly the result shape it had before this option existed.
     const fullOldVersions = rotated.map((row) => row.full_copy?.file).filter((file) => typeof file === 'string');
+    // The sessions whose over-cap copy this run was explicitly allowed to write. Present only when an approval
+    // actually covered something; a `full` run that stayed under the cap keeps the shape it had before the cap.
+    const approvedOverCap = oldFormat === 'full' && allowLargeFullCopy === true
+      ? selection.chosen
+          .filter((row) => approvedOverCapIds.has(row.session_id))
+          .map((row) => ({ session_id: row.session_id, size: row.size }))
+      : [];
 
     // Account binding is best effort and strictly after the committed snapshot. It only makes sense for a
     // **sealed** repository: an unencrypted repository opens without any credential, so binding it to an
@@ -691,6 +772,7 @@ export function runBackup(input) {
       rotated: rotated.length,
       old_versions: rotated.map((row) => row.old_file),
       ...(oldFormat === 'full' ? { full_old_versions: fullOldVersions } : {}),
+      ...(approvedOverCap.length === 0 ? {} : { full_copy_approved_over_cap: approvedOverCap }),
       // Absent unless a mirror is configured: a repository with no mirror keeps the exact result shape it had
       // before the offsite feature existed.
       ...(mirrorRoot === null ? {} : { mirror }),

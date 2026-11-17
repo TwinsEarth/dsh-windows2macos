@@ -2162,6 +2162,223 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
       'the copy label is translated, not copied');
   });
 
+  // -------------------------------------------------------------------------------------------
+  // v3.5.0 full-copy cap: the pending state and the 「特批」 approval dialog
+  // -------------------------------------------------------------------------------------------
+  it('registers the full-copy approval strings in both dictionaries', () => {
+    const { exports } = loadBundle();
+    const registry = makeRegistry();
+    const locale = makeLocale();
+    const ctx = makeStrictContext({ inject: [...exports.inject], services: { slots: registry, locale } });
+    exports.apply(ctx);
+    const dictionary = locale.registered.get('w2m.target');
+    assert.ok(dictionary !== undefined, 'the dictionaries reach the locale service');
+    const keys = [
+      'panel.backup.reason.BACKUP_FULL_COPY_APPROVAL_REQUIRED',
+      'panel.backup.approval.open',
+      'panel.backup.approval.pending',
+      'panel.backup.approval.pendingHint',
+      'panel.backup.approval.dialog.title',
+      'panel.backup.approval.dialog.subtitle',
+      'panel.backup.approval.dialog.session',
+      'panel.backup.approval.dialog.more',
+      'panel.backup.approval.dialog.hint',
+      'panel.backup.approval.confirm',
+      'panel.backup.approval.cancel',
+      'panel.backup.approval.close',
+      'panel.backup.approval.busy',
+    ];
+    for (const key of keys) {
+      assert.equal(typeof dictionary.zh[key], 'string', `the zh dictionary has ${key}`);
+      assert.equal(typeof dictionary.en[key], 'string', `the en dictionary has ${key}`);
+      assert.notEqual(dictionary.zh[key].trim(), '', `the zh value for ${key} is not empty`);
+      assert.notEqual(dictionary.en[key].trim(), '', `the en value for ${key} is not empty`);
+    }
+    assert.equal(dictionary.zh['panel.backup.approval.confirm'], '特批并继续', 'the confirm label is the user-facing 特批 verb');
+    assert.equal(dictionary.zh['panel.backup.approval.cancel'], '取消');
+    assert.ok(dictionary.zh['panel.backup.approval.pending'].includes('需要特批'), 'the pending banner asks for approval');
+    assert.ok(dictionary.zh['panel.backup.approval.pending'].includes('{count}') && dictionary.zh['panel.backup.approval.pending'].includes('{cap}'),
+      'the pending copy keeps both placeholders');
+    assert.ok(dictionary.zh['panel.backup.approval.dialog.hint'].includes('不会自动批准'), 'the dialog says it never approves itself');
+    assert.notEqual(dictionary.zh['panel.backup.approval.confirm'], dictionary.en['panel.backup.approval.confirm'],
+      'both languages are real translations');
+    const mapped = Object.keys(exports.BACKUP_REASON_KEYS);
+    assert.ok(mapped.includes('BACKUP_FULL_COPY_APPROVAL_REQUIRED'), 'the reason-code map covers the new code');
+  });
+
+  it('renders the scheduled pending-approval banner from state.last_result with its approve action', () => {
+    const { exports } = loadBundle();
+    const t = exports.makeTranslator(() => undefined);
+    const cap = 1024 * 1024;
+    const status = {
+      ok: true,
+      enabled: true,
+      full_copy_max_mb: 1,
+      state: {
+        running: false,
+        last_result: {
+          ok: false,
+          reason_code: 'BACKUP_FULL_COPY_APPROVAL_REQUIRED',
+          detail: 'scheduled refusal',
+          full_copy_approval_required: true,
+          over_cap_count: 2,
+          cap_bytes: cap,
+          full_copy_max_mb: 1,
+          scope: 'all',
+          full_copy_oversized: [
+            { session_id: 'sess-scheduled-0001', rel: 'sessions/a/sess-scheduled-0001/session.v4.jsonl.zstd', size: 2 * cap, cap },
+            { session_id: 'sess-scheduled-0002', rel: 'sessions/b/sess-scheduled-0002/session.v4.jsonl.zstd', size: 3 * cap, cap },
+          ],
+        },
+      },
+    };
+    const tree = exports.BackupPanelView(viewProps({ t, status }));
+    const banner = findBy(tree, (node) => node.props?.['data-w2m-backup-approval-pending'] === 'true')[0];
+    assert.ok(banner !== undefined, 'a scheduled full-copy refusal is a visible pending state, not a silent skip');
+    const text = collectText(banner).join('\n');
+    assert.ok(text.includes('有 2 个会话的旧版本副本超过 1 MB，需要特批'), 'the banner states the count and the cap');
+    assert.ok(text.includes('定时备份不会等待人工确认'), 'the banner says the timer did not wait and wrote nothing');
+    const open = findBy(banner, (node) => node.props?.['data-w2m-backup-approval-open'] === 'true')[0];
+    assert.ok(open !== undefined, 'the pending state carries its approve action');
+    assert.equal(open.props.disabled, false);
+    // A run that succeeded has no pending state, so the banner disappears.
+    const quiet = exports.BackupPanelView(viewProps({ t, status: { ...status, state: { running: false, last_result: { ok: true, snapshot_id: 'x' } } } }));
+    assert.equal(findBy(quiet, (node) => node.props?.['data-w2m-backup-approval-pending'] === 'true').length, 0);
+    // The banner is derived from state.last_result, not from a local page flag: no approval is ever inferred.
+    assert.equal(findBy(tree, (node) => node.props?.['data-w2m-backup-approval-dialog'] !== undefined).length, 0,
+      'the dialog is not open until the operator opens it');
+  });
+
+  it('opens the approval dialog on the reason code, re-posts with allowLargeFullCopy:true only on confirm, and cancels without a request', async () => {
+    const posts = [];
+    const cap = 1024 * 1024;
+    const refusal = {
+      ok: false,
+      reason_code: 'BACKUP_FULL_COPY_APPROVAL_REQUIRED',
+      codes: ['BACKUP_FULL_COPY_APPROVAL_REQUIRED'],
+      detail: 'one session is over the cap',
+      over_cap_count: 1,
+      cap_bytes: cap,
+      full_copy_max_mb: 1,
+      full_copy_oversized: [{ session_id: 'sess-big-0001', rel: 'sessions/proj-a/sess-big-0001/session.v4.jsonl.zstd', size: 2 * cap, cap }],
+      dry_run: false,
+    };
+    const base = standardBackupHost();
+    const host = mountBackupPage((request) => {
+      if (request.url === '/api/w2m/backup/run' && request.method === 'POST') {
+        posts.push(request.body);
+        if (request.body?.allowLargeFullCopy === true) {
+          return {
+            ok: true,
+            snapshot_id: 'snap-approved',
+            sessions: 1,
+            files: 2,
+            blocks_new: 1,
+            blocks_reused: 0,
+            duration_ms: 8,
+            full_copy_approved_over_cap: [{ session_id: 'sess-big-0001', size: 2 * cap }],
+          };
+        }
+        return refusal;
+      }
+      return base(request);
+    });
+    try {
+      await host.settle();
+      actionButton(host.handle.tree, 'run').props.onClick();
+      await host.settle();
+      assert.equal(posts.length, 1);
+      assert.equal(posts[0].confirm, 'run');
+      assert.equal('allowLargeFullCopy' in posts[0], false, 'the first run never carries an approval');
+      const dialog = findBy(host.handle.tree, (node) => node.props?.['data-w2m-backup-approval-dialog'] !== undefined)[0];
+      assert.ok(dialog !== undefined, 'the named code opens the confirm dialog');
+      assert.equal(dialog.props.role, 'dialog');
+      assert.equal(dialog.props['aria-modal'], 'true');
+      assert.equal(dialog.props['aria-labelledby'], 'w2m-backup-approval-dialog-title');
+      assert.equal(dialog.props['data-w2m-backup-approval-count'], '1');
+      assert.equal(findBy(dialog, (node) => node.props?.['data-w2m-backup-approval-session'] !== undefined).length, 1);
+      const dialogText = collectText(dialog).join('\n');
+      assert.ok(dialogText.includes('sess-big-0001'), 'the dialog lists the oversized session');
+      assert.ok(dialogText.includes('2.0 MiB'), 'the dialog lists its size');
+      assert.ok(dialogText.includes('特批并继续') && dialogText.includes('取消'), 'both actions are rendered');
+      // Cancel: closes the dialog and sends nothing.
+      findBy(dialog, (node) => node.props?.['data-w2m-backup-approval-cancel'] === 'true')[0].props.onClick();
+      await host.settle();
+      assert.equal(findBy(host.handle.tree, (node) => node.props?.['data-w2m-backup-approval-dialog'] !== undefined).length, 0, 'cancel closes the dialog');
+      assert.equal(posts.length, 1, 'cancel sends no request');
+      // Run again -> refused -> dialog; only the explicit confirm re-posts with the approval flag.
+      actionButton(host.handle.tree, 'run').props.onClick();
+      await host.settle();
+      const dialog2 = findBy(host.handle.tree, (node) => node.props?.['data-w2m-backup-approval-dialog'] !== undefined)[0];
+      assert.ok(dialog2 !== undefined);
+      findBy(dialog2, (node) => node.props?.['data-w2m-backup-approval-confirm'] === 'true')[0].props.onClick();
+      await host.settle();
+      assert.equal(posts.length, 3, 'run, run again, then the approval');
+      assert.deepEqual(posts[2], { confirm: 'run', scope: 'all', allowLargeFullCopy: true },
+        'the approval re-posts the same run with the explicit flag');
+      assert.equal(findBy(host.handle.tree, (node) => node.props?.['data-w2m-backup-approval-dialog'] !== undefined).length, 0,
+        'a successful approved run closes the dialog');
+    } finally {
+      host.handle.unmount();
+    }
+  });
+
+  it('shows the scheduled pending banner and approves the scheduled scope from the dialog', async () => {
+    const posts = [];
+    const cap = 1024 * 1024;
+    const runGet = {
+      ok: true,
+      enabled: true,
+      backup_dir: 'D:\\BackUP',
+      full_copy_max_mb: 1,
+      old_format: 'full',
+      schedule: { times: ['22:00:00'], time_zone: 'UTC' },
+      status: { ok: true, repository: { root: 'D:\\BackUP', initialized: true, counts: { snapshots: 1 }, free_bytes: 1_048_576 } },
+      state: {
+        running: false,
+        last_result: {
+          ok: false,
+          reason_code: 'BACKUP_FULL_COPY_APPROVAL_REQUIRED',
+          detail: 'scheduled refusal',
+          full_copy_approval_required: true,
+          over_cap_count: 1,
+          cap_bytes: cap,
+          full_copy_max_mb: 1,
+          scope: 'all',
+          full_copy_oversized: [{ session_id: 'sess-scheduled-0001', rel: 'sessions/a/sess-scheduled-0001/session.v4.jsonl.zstd', size: 2 * cap, cap }],
+        },
+      },
+    };
+    const base = standardBackupHost();
+    const host = mountBackupPage((request) => {
+      if (request.url === '/api/w2m/backup/run' && request.method === 'GET') return runGet;
+      if (request.url === '/api/w2m/backup/run' && request.method === 'POST') {
+        posts.push(request.body);
+        return { ok: true, snapshot_id: 'snap-now', sessions: 1, files: 1, blocks_new: 1, blocks_reused: 0, duration_ms: 4 };
+      }
+      return base(request);
+    });
+    try {
+      await host.settle();
+      assert.ok(host.text().includes('有 1 个会话的旧版本副本超过 1 MB，需要特批'),
+        'the panel shows the pending state the scheduled run left behind');
+      const banner = findBy(host.handle.tree, (node) => node.props?.['data-w2m-backup-approval-pending'] === 'true')[0];
+      assert.ok(banner !== undefined);
+      findBy(banner, (node) => node.props?.['data-w2m-backup-approval-open'] === 'true')[0].props.onClick({ currentTarget: null });
+      await host.settle();
+      const dialog = findBy(host.handle.tree, (node) => node.props?.['data-w2m-backup-approval-dialog'] !== undefined)[0];
+      assert.ok(dialog !== undefined, 'the pending banner opens the same approval dialog');
+      assert.equal(findBy(dialog, (node) => node.props?.['data-w2m-backup-approval-session'] !== undefined).length, 1);
+      findBy(dialog, (node) => node.props?.['data-w2m-backup-approval-confirm'] === 'true')[0].props.onClick();
+      await host.settle();
+      assert.deepEqual(posts, [{ confirm: 'run', scope: 'all', allowLargeFullCopy: true }],
+        'the scheduled scope is approved explicitly, and never automatically');
+    } finally {
+      host.handle.unmount();
+    }
+  });
+
+
   it('never carries a password into a request body (the section posts confirmation tokens only)', () => {
     const source = readFileSync(BUNDLE_PATH, 'utf8');
     const start = source.indexOf('备份&还原面板（v3.4.9）');

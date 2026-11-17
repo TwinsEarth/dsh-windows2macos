@@ -4,6 +4,16 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### old-format full 整文件副本的 300 MB 上限与「特批」流程（未发布）
+
+- **问题**：`oldFormat: full` 每个被淘汰版本多写一份整文件副本；单个超大会话会让仓库悄悄翻倍，定时备份更是无人值守。
+- **常量/配置**：`DEFAULT_FULL_COPY_MAX_BYTES = 300 * 1024 * 1024`（`src/backup/rotation.mjs`）；引擎 `runBackup({maxFullCopyBytes})` 缺省 300 MiB，`0` = 不设上限（显式）；CLI `run --max-full-copy-mb <n>`；插件行 `backupFullCopyMaxMb: 300`（非法值 → `BACKUP_CONFIG_INVALID`）。非法 cap（负数/小数/字符串/布尔）一律具名拒绝，绝不静默关闭。
+- **写盘前拒绝**：`full` 模式下引擎在 ensureLayout/锁/key 之前用只读扫描判定；任一将被备份的会话文件大于 cap 且未显式批准 → `{ok:false, reason_code:'BACKUP_FULL_COPY_APPROVAL_REQUIRED', codes:[…], detail:列出 session_id/rel/size/cap, full_copy_oversized:[…最多20], over_cap_count, cap_bytes}`。零写入：不建仓库、不写 snapshot/old/current/镜像，所以"被拒绝"是完整可重试的 pending 状态；`records` 模式忽略 cap；`0` 关闭 cap。
+- **批准**：引擎 `allowLargeFullCopy: true`；成功结果 `full_copy_approved_over_cap: [{session_id, size}]`，并且旧版本记录 `full_copy` 上写入 `approved_over_cap: true` + `cap_bytes`（批准与它买下的字节记在一起）。CLI `run --allow-large-full-copy`；无 flag 且 stdin 是 TTY 时只问一次 `N 个会话的 full 副本超过 <cap> MB（…）：是否特批本次写入？[y/N] `，y 才重跑同一次（仅这一次）；非 TTY 不提问、打印 flag 并退出码 1（`--json` 模式问题走 stderr，stdout 保持 JSON）。
+- **面板**：`reason_code` 命中时打开 `role="dialog"` 的 `[data-w2m-backup-approval-dialog]`，列出超限会话与大小，「特批并继续」重 POST `{confirm:'run', scope, allowLargeFullCopy:true}`、「取消」只关闭不发请求；从不自动批准、无密码参与。定时运行不等待人工：拒绝记为 `state.last_result`（`reason_code` + `full_copy_approval_required` + 计数/cap/会话列表），仓库零改动；面板显示「有 X 个会话的旧版本副本超过 300 MB，需要特批」的待批准卡（`[data-w2m-backup-approval-pending]`）与「查看并特批」入口，打开同一个确认对话框。
+- **文档/测试**：`docs/BACKUP-DESIGN.md` §24 接口表补 cap 行并新增 §24.2（默认/0=off/三条批准路径/定时行为/记录标注/测试/诚实边界）；`test/backup-engine`、`test/backup-rotation`、`test/backup-run`、`test/client-bundle` 新增覆盖（1 KiB 注入 cap 的写盘前拒绝与仓库逐字节不变、批准记录标注、CLI flag/TTY 提示 y 与 n、定时 pending、面板对话框与字典）；`npx eslint .` 0 error、`node scripts/layer-check.mjs` clean、`node scripts/scan-mojibake.mjs` clean、相关 suite 全绿。
+- **声明**：不 bump 版本（仍 3.5.0）、不跑 preflight、不提交。
+
 ### PIN 轮换：旧凭据解开 → 去掉旧 PIN → 写新 PIN（撤销"不提供轮换"的决定，未发布）
 
 - **用户决定（撤销）**：此前"不提供 PIN 轮换"的决定作废——"目前若忘了密码且本机 DPAPI 不可用，仓库无法打开"，需要一条"旧凭据解开→移除旧 password 信封→写新信封"的轮换命令。**边界不变**：没有可用凭据（machine/account/旧 PIN）时仓库仍然打不开，轮换不是恢复手段。

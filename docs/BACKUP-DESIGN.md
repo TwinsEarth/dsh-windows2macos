@@ -1089,7 +1089,9 @@ old/<ws>/<sid>/<ts>-<sha12>.json.enc   # full 新增：该版本的整文件密�
 | 插件配置 | `backupOldFormat: 'records' \| 'full'`，缺省 `records`；非法值拒绝挂载 `BACKUP_CONFIG_INVALID` |
 | 引擎 | `runBackup({oldFormat})`，写盘前校验；结果 `old_format` 恒有，`full_old_versions: [<相对路径>…]` 仅 `full` 时出现 |
 | 轮转 | `rotateForEntry({format, dek})` / `recordSupersededVersion({format, dek})`；`dek` 仅 `full` 需要 |
+| 整文件副本 cap | `runBackup({maxFullCopyBytes, allowLargeFullCopy})` / 配置 `backupFullCopyMaxMb`（缺省 300，`0` = 不设上限）/ CLI `--max-full-copy-mb <n>` 与 `--allow-large-full-copy`；写盘前拒绝见 §24.2 |
 | 错误码 | `BACKUP_ROTATION_FORMAT_INVALID`（未知 `oldFormat`，写盘前）、`BACKUP_ROTATION_WRITE_FAILED`（副本或记录写失败） |
+| cap 错误码 | `BACKUP_FULL_COPY_APPROVAL_REQUIRED`（`full` 副本超限且未特批，写盘前、零写入，见 §24.2） |
 
 **兼容性**：记录的 `format`/`version` 字段不变（仍 `w2m-session-backup/old-version` v1），`full_copy` 只是新增
 可选字段；`listOldVersions`/`readOldRecords` 只认 `.json`，`.json.enc` 不会被当记录读取；`verify` 仍按记录
@@ -1149,6 +1151,88 @@ blocks 重建旧版本，不把 `.enc` 计入引用。
 用于大仓库分批迁移，反复运行直到 `backfilled`/`repaired` 为 0。副本检查只覆盖**长度**：长度正确但内容被同长度
 篡改的副本不会被本命令发现（`verify` 也尚未逐份解密 `.enc`，见上面的诚实边界）。本命令不改配置、不自动启用
 `full`、不自动运行（引擎**不**自动回填），只补磁盘上已有的记录；`run`/`gc` 的默认行为不变。
+
+### 24.2 整文件副本的 300 MB 上限与「特批」流程（v3.5.0）
+
+**问题**：§24 的 `full` 让每个被淘汰版本的字节**再加一份**。默认窗口 10 份时，一个 400 MB 的会话每次变化都会
+悄悄多出 400 MB；如果它每天变一次，一年就是 ~146 GB。`full` 是用户明确要的选项，但"一次写入就能让仓库翻倍"
+不能是**无人值守**路径的默认结果——尤其不能是 22:00 定时备份的默认结果。
+
+**常量与默认值**：`rotation.mjs` 的 `DEFAULT_FULL_COPY_MAX_BYTES = 300 * 1024 * 1024`（300 MiB）。配置面：
+
+| 入口 | 形状 | 缺省 |
+|---|---|---|
+| 引擎 | `runBackup({maxFullCopyBytes, allowLargeFullCopy})` | 缺省 300 MiB；`0` = **不设上限**（显式关闭，不是缺省） |
+| 插件配置 | `backupFullCopyMaxMb: <非负整数>`（MB；`0` = 不设上限） | `300`；非法值拒绝挂载 `BACKUP_CONFIG_INVALID` |
+| CLI | `run --max-full-copy-mb <n>`（MB，`0` = 不设上限）、`run --allow-large-full-copy` | 缺省 300 MB；非法值退出码 2 |
+| 面板 | 从 describe 的 `full_copy_max_mb` 读取；不写请求体里的 cap | 与行配置一致 |
+
+`maxFullCopyBytes: 0` 是**显式**的"我接受任意大小的整文件副本"，不是"没有配置"；非法值（负数、小数、字符串、
+`true`）一律具名拒绝（引擎 `BACKUP_ROTATION_POLICY_INVALID`，插件配置 `BACKUP_CONFIG_INVALID`，CLI 退出码 2），
+绝不静默回退到默认或静默关闭上限。
+
+**写盘前拒绝（选定的设计：零部分状态）**：`full` 模式下，引擎在**落盘布局（ensureLayout）、取锁、开 key 之前**
+先用只读扫描得到本次要备份的会话及其文件大小（`scan.mjs` 的 `size` 正是"将被淘汰、成为旧版本"的那一版的大小）。
+只要任一文件 **大于** cap 且本次运行没有显式批准（`allowLargeFullCopy` 严格等于 `true`），运行返回：
+
+```
+{ ok:false,
+  reason_code: "BACKUP_FULL_COPY_APPROVAL_REQUIRED",
+  codes: ["BACKUP_FULL_COPY_APPROVAL_REQUIRED"],
+  detail: "<计数、cap 字节数、前 20 个会话的 session_id/rel/size/cap 的可读列表>",
+  full_copy_oversized: [{session_id, rel, size, cap}, ... 最多 20 条],
+  over_cap_count: <全部超限会话数>,
+  cap_bytes: <本次生效的 cap 字节数>,
+  dry_run: <boolean> }
+```
+
+**什么都不会写**：不建仓库目录、不写 blocks/snapshot/index、不写 `old/` 记录、不动 `current/` 指针、不写镜像。
+因此"被拒绝"是一个**完整、安全、可重试**的状态，而不是半个快照；`records` 模式不写整文件副本，**完全忽略**这个
+cap（它不是 `full` 的成本来源）。任何真值（`1`、`"yes"`）都不算批准——批准是操作者的一个明确动作，不能从
+truthy 值推断。首次备份同样受检查（第一版超大也先拒绝，而不是"先写一次再说"）。**`--dry-run` 也返回同一个
+拒绝**：计划本身同样受 cap 约束，避免 dry-run 说"没问题"而真跑被拒；它的结果里 `dry_run: true` 原样保留。
+
+**批准路径（三条，都是显式动作）**：
+
+1. **引擎**：`runBackup({allowLargeFullCopy: true, ...})` 重跑同一次备份。成功结果新增
+   `full_copy_approved_over_cap: [{session_id, size}]`（只在该次运行确实批准了超限会话时出现），并且**被轮转到
+   `old/` 的那条旧版本记录自己的 `full_copy` 上**写入 `approved_over_cap: true` + `cap_bytes`——批准与它买下的字节
+   记在同一个文件里，读 `old/` 的人无需翻运行日志就知道这是"被特批过的副本"。
+2. **CLI**：`w2m-backup run --allow-large-full-copy` 直接非交互批准。**没有**该 flag 且 stdin 是 TTY 时，CLI 拒绝后
+   只问一次：`N 个会话的 full 副本超过 <cap> MB（<前几个 session_id>）：是否特批本次写入？[y/N] `，默认 N；
+   回答 `y`/`yes`/`是` 才带批准重跑**同一次** run（只能批准这一次，不是永久关闭 cap），回答其它则保持拒绝并且
+   **零写入**。stdin **不是** TTY 时不提问：打印 `--allow-large-full-copy` 提示并以退出码 1 结束（`--json` 模式下
+   问题与提示走 stderr，stdout 保持可解析的 JSON）。人类输出列出超限会话、cap 与下一步命令；批准成功时打印
+   `approved cap` 行。
+3. **面板**：`POST /api/w2m/backup/run` 的拒绝响应里带 `reason_code === 'BACKUP_FULL_COPY_APPROVAL_REQUIRED'`
+   时，面板打开确认对话框（`role="dialog"`、`[data-w2m-backup-approval-dialog]`），列出超限会话与大小，
+   提供「特批并继续」（重新 POST `{confirm:'run', scope, allowLargeFullCopy:true, …}`）与「取消」（只关闭，**不发
+   任何请求**）。对话框**从不自动批准**（只有确认按钮会带上 flag），也不涉及任何密码/PIN；打开/关闭遵循与解锁
+   对话框相同的焦点/ESC/遮罩规则。
+
+**定时路径：绝不等待人工**。22:00 的调度（含错过的时段补跑）没有人可问，所以它**不**调用任何交互批准、也不
+阻塞：引擎在写盘前拒绝，插件的 `runNow` 把这次拒绝记为 `state.last_result` 的**具名待批准状态**：
+`{ ok:false, reason_code:'BACKUP_FULL_COPY_APPROVAL_REQUIRED', full_copy_approval_required:true, over_cap_count,
+cap_bytes, full_copy_max_mb, scope, full_copy_oversized:[…], warnings:[…] }`（同时 `last_error`、`failures` 与一条
+warn 日志照旧，仓库零改动）。面板从 `GET /run` 内嵌状态读到它时，显示
+「有 X 个会话的旧版本副本超过 300 MB，需要特批」的待批准卡（`[data-w2m-backup-approval-pending]`）和
+「查看并特批」动作；用户点开的是**同一个**确认对话框，确认后才用记录里的 `scope` 重发批准请求。也就是说：
+**定时运行不写、不跳过、也不假装成功**——它留下一个可见、可操作的 pending 状态，下一次成功运行会替换它。
+
+**测试**（挂在既有套件上，无新测试文件）：`test/backup-engine.test.mjs`（注入 1 KiB cap + 大 fixture：写盘前拒绝
+且仓库未创建/已有仓库逐字节不变、`codes`/`full_copy_oversized`/`over_cap_count` 形状、`allowLargeFullCopy:true`
+成功且结果列出批准、旧记录 `full_copy.approved_over_cap === true`＋`cap_bytes`、副本仍能按 `old` 身份逐字节解开、
+`records` 忽略 cap、`0` 关闭 cap、非法 cap 在建仓前拒绝、truthy 非布尔不算批准）；`test/backup-rotation.test.mjs`
+（`resolveMaxFullCopyBytes` 归一化、记录标注只在批准时出现、未批准时记录形状不变、`records` 记录无标注）；
+`test/backup-run.test.mjs`（配置归一化与非法值、定时拒绝进入 `last_result` 且仓库未创建、显式路由批准才写入、CLI
+flag 解析/退出码、非 TTY 打印 flag 不提问、注入 TTY 的 y/N 两条路径与 `--json` stdout 干净）；`test/client-bundle.test.mjs`
+（待批准卡文案与 cap 占位、对话框 `role=dialog`＋会话/大小列表、确认才发 `allowLargeFullCopy:true`、取消不发请求、
+定时 pending 打开同一对话框、中英字典完整）。
+
+**诚实边界**：cap 判断用的是**扫描时**的会话文件大小（不是磁盘上 `current/` 记录里上一版的大小）——对活日志
+两者可能相差一次追加；这是"写盘前拒绝"必须接受的近似，偏差方向是可能多问一次批准，而不会少问。批准**只对
+一次运行**有效，不会改变配置、不会永久关闭 cap；要永久关闭必须显式配置 `0` 并承担无限副本的代价。本次不 bump
+版本号、不跑 preflight、不提交。
 
 ## 25. 保护模式（用户最终决定：便捷优先，不是绝对保密，2026-11-17）
 

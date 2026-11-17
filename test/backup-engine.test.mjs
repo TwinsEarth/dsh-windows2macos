@@ -10,6 +10,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 
@@ -63,6 +64,28 @@ function repoFixture() {
   const root = join(dir, 'repo');
   ensureLayout(root);
   return { root, cleanup };
+}
+
+/**
+ * A home with one registered session whose log file is larger than a tiny injected cap.
+ *
+ * The event payload is random bytes, not a repeated character: zstd compresses repetition to almost nothing, and a
+ * fixture that stays below the cap would let the refusal tests pass without exercising the refusal.
+ *
+ * @param {{sizeBytes?: number}} [options]
+ */
+function largeHomeFixture({ sizeBytes = 8 * 1024 } = {}) {
+  const blob = randomBytes(sizeBytes).toString('base64');
+  return makeHome({
+    sessions: [
+      {
+        workspace: '--E-GPT--',
+        id: 'session-aaaaaaaa-0001',
+        events: [event(0), event(1, 'turn/start', { turn: 1, blob })],
+      },
+    ],
+    registry: registryDocument({ sessionIds: ['session-aaaaaaaa-0001'] }),
+  });
 }
 
 /** Every file under `root` with size and mtime. */
@@ -749,6 +772,141 @@ describe('engine: oldFormat full (a literal sealed copy of the superseded versio
       assert.match(second.snapshot_id, /^\d{8}T\d{6}Z-[0-9a-f]{8}$/u);
       assert.equal(readIndex(root).entries.length, 2, 'the index still records the committed snapshot');
       assert.equal(listOldVersions(root).length, 0, 'no record may claim a copy that was never written');
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+});
+
+describe('engine: the oldFormat full whole-file copy cap and its explicit approval', () => {
+  const CAP = 1024;
+
+  it('refuses before writing anything when a session exceeds the cap and the run is not approved', () => {
+    const { home, cleanup: cleanHome } = largeHomeFixture();
+    const { dir, cleanup } = tempDir('w2m-engine-full-cap-refuse-');
+    try {
+      const repo = join(dir, 'repo');
+      const result = runBackup({ root: repo, dshHome: home, password: PASSWORD, platform: PLATFORM, oldFormat: 'full', maxFullCopyBytes: CAP, futureAppend: false });
+      assert.equal(result.ok, false);
+      assert.equal(result.reason_code, 'BACKUP_FULL_COPY_APPROVAL_REQUIRED');
+      assert.deepEqual(result.codes, ['BACKUP_FULL_COPY_APPROVAL_REQUIRED'], 'the named code is in codes for a caller that reads the list');
+      assert.equal(result.cap_bytes, CAP);
+      assert.equal(result.over_cap_count, 1);
+      assert.equal(result.full_copy_oversized.length, 1);
+      const row = result.full_copy_oversized[0];
+      assert.equal(row.session_id, 'session-aaaaaaaa-0001');
+      assert.match(row.rel, /session-aaaaaaaa-0001/u);
+      assert.ok(row.size > CAP, 'the fixture session really is over the injected cap');
+      assert.equal(row.cap, CAP);
+      assert.match(result.detail, /session-aaaaaaaa-0001/u, 'the detail lists the oversized session');
+      assert.match(result.detail, /allowLargeFullCopy/u, 'the detail names the approval option');
+      assert.equal(existsSync(repo), false, 'the refusal happens before ensureLayout: no repository is created');
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+
+  it('refuses an existing repository without changing a byte (no snapshot, no old record)', () => {
+    const { home, cleanup: cleanHome } = largeHomeFixture();
+    const { root, cleanup } = repoFixture();
+    try {
+      const before = treeState(root);
+      const result = run(root, home, { oldFormat: 'full', maxFullCopyBytes: CAP, futureAppend: false });
+      assert.equal(result.reason_code, 'BACKUP_FULL_COPY_APPROVAL_REQUIRED');
+      assert.deepEqual(treeState(root), before, 'the repository is byte-for-byte unchanged');
+      assert.equal(readIndex(root).entries.length, 0);
+      assert.equal(listOldVersions(root).length, 0);
+      assert.deepEqual(readdirSync(repoPaths(root).snapshots), []);
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+
+  it('proceeds when the run is explicitly approved, listing the approval and recording it on the old version', () => {
+    const { home, cleanup: cleanHome } = largeHomeFixture();
+    const { root, cleanup } = repoFixture();
+    try {
+      // records mode ignores the cap, so the first snapshot is allowed to create the version to be superseded.
+      const first = run(root, home, { futureAppend: false });
+      assert.equal(first.ok, true, first.detail);
+
+      const target = join(home, 'sessions', '--E-GPT--', 'session-aaaaaaaa-0001', 'session.v4.jsonl.zstd');
+      const superseded = readFileSync(target);
+      const blob = randomBytes(8 * 1024).toString('base64');
+      writeFileSync(target, sessionLog('session-aaaaaaaa-0001', [event(0), event(1), event(2, 'turn/start', { turn: 2, blob })]));
+
+      // Without the flag: refused, and the committed first snapshot stays the newest one.
+      const refused = run(root, home, { oldFormat: 'full', maxFullCopyBytes: CAP, futureAppend: false });
+      assert.equal(refused.reason_code, 'BACKUP_FULL_COPY_APPROVAL_REQUIRED');
+      assert.equal(readIndex(root).entries.length, 1, 'no new snapshot was committed');
+
+      // Explicit approval: the run writes, the result records which sessions were approved, and the version
+      // record itself carries the approval next to the copy it paid for.
+      const approved = run(root, home, { oldFormat: 'full', maxFullCopyBytes: CAP, allowLargeFullCopy: true, futureAppend: false });
+      assert.equal(approved.ok, true, approved.detail);
+      assert.equal(approved.rotated, 1);
+      assert.equal(approved.full_old_versions.length, 1);
+      assert.equal(approved.full_copy_approved_over_cap.length, 1);
+      assert.equal(approved.full_copy_approved_over_cap[0].session_id, 'session-aaaaaaaa-0001');
+      assert.ok(approved.full_copy_approved_over_cap[0].size > CAP);
+      assert.equal(readIndex(root).entries.length, 2);
+
+      const record = listOldVersions(root, { sessionId: 'session-aaaaaaaa-0001' })[0]?.record;
+      assert.ok(record?.full_copy, 'the rotation wrote the sealed copy');
+      assert.equal(record.full_copy.approved_over_cap, true);
+      assert.equal(record.full_copy.cap_bytes, CAP);
+      // The copy is still the superseded version, byte for byte, under the old-copy identity.
+      const key = openRepoKey({ root, dshHome: home, password: PASSWORD, platform: PLATFORM });
+      assert.equal(key.ok, true, key.detail ?? '');
+      const opened = openObject(readFileSync(join(root, ...record.full_copy.file.split('/'))), key.dek, {
+        sha256: record.full_copy.sha256,
+        length: record.full_copy.size,
+        kind: 'old',
+      });
+      assert.deepEqual(opened, superseded);
+      assert.equal(sha256Hex(opened), record.sha256);
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+
+  it('treats only a literal true as approval, and records mode ignores the cap entirely', () => {
+    const { home, cleanup: cleanHome } = largeHomeFixture();
+    const { dir, cleanup } = tempDir('w2m-engine-full-cap-flag-');
+    try {
+      const truthy = runBackup({ root: join(dir, 'truthy'), dshHome: home, password: PASSWORD, platform: PLATFORM, oldFormat: 'full', maxFullCopyBytes: CAP, allowLargeFullCopy: 1, futureAppend: false });
+      assert.equal(truthy.reason_code, 'BACKUP_FULL_COPY_APPROVAL_REQUIRED', 'a truthy non-boolean is not an approval');
+      const records = runBackup({ root: join(dir, 'records'), dshHome: home, password: PASSWORD, platform: PLATFORM, maxFullCopyBytes: CAP, futureAppend: false });
+      assert.equal(records.ok, true, records.detail);
+      assert.equal(records.old_format, 'records');
+      assert.equal('full_copy_approved_over_cap' in records, false);
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+
+  it('treats 0 as no cap and rejects an invalid cap before creating the repository', () => {
+    const { home, cleanup: cleanHome } = largeHomeFixture();
+    const { dir, cleanup } = tempDir('w2m-engine-full-cap-zero-');
+    try {
+      const open = runBackup({ root: join(dir, 'open'), dshHome: home, password: PASSWORD, platform: PLATFORM, oldFormat: 'full', maxFullCopyBytes: 0, futureAppend: false });
+      assert.equal(open.ok, true, open.detail);
+      assert.equal(open.old_format, 'full');
+      assert.equal('full_copy_approved_over_cap' in open, false, 'no approval was needed, so none is claimed');
+
+      for (const bad of [-1, 1.5, '1024', true]) {
+        const repo = join(dir, `bad-${String(bad).replace(/[^0-9a-z]/gu, '')}`);
+        const refused = runBackup({ root: repo, dshHome: home, password: PASSWORD, platform: PLATFORM, oldFormat: 'full', maxFullCopyBytes: bad });
+        assert.equal(refused.ok, false, `maxFullCopyBytes=${String(bad)} must be refused`);
+        assert.equal(refused.reason_code, 'BACKUP_ROTATION_POLICY_INVALID');
+        assert.match(refused.detail, /maxFullCopyBytes must be/u);
+        assert.equal(existsSync(repo), false, 'the invalid option is refused before ensureLayout');
+      }
     } finally {
       cleanup();
       cleanHome();
