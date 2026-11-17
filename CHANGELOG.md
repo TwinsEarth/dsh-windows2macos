@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### 注册表写入的边界（一句话，未发布）
+
+- **注册表写入的边界（一句话）**：宿主内走 `ctx.workspaceRegistry` 服务（`attachSession` 先持久化再改内存），**不存在客户端回写竞态**；离线 CLI 走文件写 + `--watch` 复查，**只能缩小窗口、不能消除**——watch 结束后客户端一次保存仍可能移除登记（`residual_risk` 非空）。
+
+
 ### 宿主 register 的移动目录回退：按会话 header cwd 挂接（未发布）
 
 - **问题**：面板/插件登记的宿主路径 `registerThroughHost()` 走 `ctx.workspaceRegistry.attachSession`；该服务用会话 header cwd 的 realpath 比工作区路径，目录被移动/改名后必然拒绝，只能回退离线 CLI + 有界 watch，留下残余窗口。

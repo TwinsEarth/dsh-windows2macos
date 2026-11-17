@@ -931,6 +931,9 @@ v3.4.9 面板与 v3.5.0 非 UI 半之后，复盘门禁的四个"最后一段"�
   或服务在 fallback 后仍拒绝时，按 `BACKUP_REGISTER_HOST_ATTACH_FAILED` 具名拒绝：`detail` 写出会话 id、它的 cwd
   字符串和下一步 `run the offline CLI \`w2m-backup register --session … --watch <minutes>\` with the client stopped
   when possible; the watch re-applies on clobber`，且 `residual_risk` 非空（文件路径的窗口仍在）。
+
+**注册表写入的边界（一句话）**：宿主内走 `ctx.workspaceRegistry` 服务（`attachSession` 先持久化再改内存），**不存在客户端回写竞态**；离线 CLI 走文件写 + `--watch` 复查，**只能缩小窗口、不能消除**——watch 结束后客户端一次保存仍可能移除登记（`residual_risk` 非空）。
+
 * 退出码与 restore 一致：0 成功、1 具名拒绝、2 用法错误。
 * 归档/置顶 = **读出来再写回**，绝不默认；已登记会话不进 plan，因此第二次运行是 no-op（`already_registered`），
   连注册表副本都不写。`register-*` 目录只由 register 自己按份数保留（默认 10，0 = 全留，当前次副本永不删）；
