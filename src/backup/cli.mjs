@@ -31,6 +31,16 @@
  * comes from `W2M_BACKUP_OLD_PASSWORD` or `--old-password-stdin`. With one stdin stream both are passed as two
  * lines (`old\nnew`). The hint stays public metadata, so `--hint` may be on argv, and `--clear-hint` drops it.
  *
+ * ## The size of `old/` is not capped; it is reported and reminded (v3.5.0, §24.3)
+ *
+ * The user's decision is "no total limit on `old/`; remind every 10 GB and let the user decide whether to clean up
+ * manually". `run` therefore prints `old usage : X GB (Y files)` and, once the tree has grown by
+ * `--old-usage-reminder-gb` (default 10; `0` = reminders off) since the persisted acknowledgement, also the
+ * reminder warning plus the manual-cleanup hint (`w2m-backup gc --dry-run` first). `status` prints the same size
+ * and whether a reminder is pending, and `gc` prints `old usage before/after : X GB -> Y GB`. This CLI never
+ * deletes anything because a size was crossed, and it has no acknowledgement command: acknowledging is the panel's
+ * 「知道了」 action (`POST /api/w2m/backup/old-usage/ack`), which only moves the ack mark.
+ *
  * Exit codes: 0 success; 1 a named refusal (the code is printed); 2 usage error.
  */
 
@@ -44,7 +54,7 @@ import { selftest } from './crypto.mjs';
 import { buildManifest, manifestDigest, manifestSummary } from './manifest.mjs';
 import { buildStatus } from './routes.mjs';
 import { runBackup, SCOPES } from './engine.mjs';
-import { OLD_FORMATS } from './rotation.mjs';
+import { OLD_FORMATS, oldUsageGbText, oldUsageReminderWarning } from './rotation.mjs';
 import { backfillOldFullCopies } from './old-backfill.mjs';
 import { gc } from './gc.mjs';
 import { openRepo } from './repo.mjs';
@@ -54,7 +64,7 @@ import { detectClientRunning } from './client.mjs';
 import { recheckRegistry } from './registry-watch.mjs';
 import { applyRegister, planRegister } from './register.mjs';
 import { REGISTER_RESIDUAL_RISK_LINE, watchRegistrationSync } from './register-watch.mjs';
-import { buildRuntimeVerdictRecord, writeBackupState } from './runtime-verdict.mjs';
+import { buildRuntimeVerdictRecord, readBackupState, writeBackupState } from './runtime-verdict.mjs';
 import { describeUnlock, unlockRepo } from './unlock.mjs';
 import {
   MIN_PASSWORD_BYTES,
@@ -343,6 +353,9 @@ function usage() {
     '  --allow-large-full-copy run: explicitly approve this run when the full-copy cap is exceeded ("特批").',
     '                      Without it an interactive terminal asks y/N; a non-interactive run prints this flag',
     '                      and refuses without writing.',
+    '  --old-usage-reminder-gb <n>  run: remind when old/ has grown by N GB since the last acknowledgement',
+    '                      (default 10; 0 = reminders off). The reminder never deletes anything: clean up',
+    '                      manually with `w2m-backup gc --dry-run` first, then `w2m-backup gc`.',
     '  --encrypt <mode>    run: repository protection for a NEW repository: none (default, unencrypted) or sealed',
     '                      (account/machine/PIN envelopes). An existing repository keeps its mode.',
     '  --no-encryption     run: shorthand for --encrypt none',
@@ -425,6 +438,7 @@ export function parseArgs(argv, env = process.env) {
     keepOld: null,
     oldFormat: null,
     maxFullCopyMb: null,
+    oldUsageReminderGb: null,
     allowLargeFullCopy: false,
     maxOldDays: null,
     limit: null,
@@ -599,6 +613,22 @@ export function parseArgs(argv, env = process.env) {
         return { ...options, error: `--max-full-copy-mb needs a non-negative integer (0 = no cap), got ${JSON.stringify(raw)}` };
       }
       options.maxFullCopyMb = value;
+    } else if (arg === '--old-usage-reminder-gb') {
+      const raw = rest.shift() ?? '';
+      const value = Number(raw);
+      // A non-negative number of GB; `0` disables reminders. Fractional values are accepted (the engine consumes
+      // bytes), so a 0.5 GB reminder is expressible and a test can use a tiny threshold.
+      if (raw.trim() === '' || !Number.isFinite(value) || value < 0 || !Number.isSafeInteger(Math.round(value * 1024 ** 3))) {
+        return { ...options, error: `--old-usage-reminder-gb needs a non-negative number of GB (0 = reminders off), got ${JSON.stringify(raw)}` };
+      }
+      options.oldUsageReminderGb = value;
+    } else if (arg.startsWith('--old-usage-reminder-gb=')) {
+      const raw = arg.slice('--old-usage-reminder-gb='.length);
+      const value = Number(raw);
+      if (raw.trim() === '' || !Number.isFinite(value) || value < 0 || !Number.isSafeInteger(Math.round(value * 1024 ** 3))) {
+        return { ...options, error: `--old-usage-reminder-gb needs a non-negative number of GB (0 = reminders off), got ${JSON.stringify(raw)}` };
+      }
+      options.oldUsageReminderGb = value;
     } else if (arg === '--allow-large-full-copy') {
       options.allowLargeFullCopy = true;
     } else if (arg === '--max-old-days') {
@@ -671,6 +701,19 @@ export function formatStatus(payload) {
   // `null` means "not measurable without creating the directory", which is not the same as "not writable".
   lines.push(`writable      : ${repo.writable === null ? 'unknown (not created yet)' : repo.writable ? 'yes' : 'NO'}`);
   lines.push(`free space    : ${repo.free_bytes === null ? 'unknown' : humanBytes(repo.free_bytes)}`);
+  // `old/` has no total cap (v3.5.0 §24.3): the size and whether a growth reminder is pending are the two facts the
+  // operator needs to decide whether to clean up manually. A missing `old_usage` (an older payload) prints nothing.
+  const oldUsage = payload.old_usage !== null && payload.old_usage !== undefined && typeof payload.old_usage === 'object'
+    ? payload.old_usage
+    : null;
+  if (oldUsage !== null) {
+    lines.push(`old usage     : ${oldUsageGbText(oldUsage.bytes)} GB (${Number(oldUsage.files) || 0} file(s))`);
+    const pending = oldUsage.pending === true || oldUsage.due === true;
+    const dueText = pending
+      ? `pending (自上次确认增加 ${oldUsageGbText(oldUsage.since_last_ack_bytes)} GB，阈值 ${oldUsageGbText(oldUsage.reminder_bytes)} GB)`
+      : (Number(oldUsage.reminder_bytes) === 0 ? 'off (reminders disabled)' : 'none');
+    lines.push(`reminder      : ${dueText}`);
+  }
   if (repo.initialized) {
     lines.push(`objects       : ${repo.counts.objects} prefix(es)`);
     lines.push(`snapshots     : ${repo.counts.snapshots}`);
@@ -774,6 +817,18 @@ export function formatRun(result) {
       `retention     : keep ${result.keep_old_per_session} old version(s) per session` +
         (result.max_old_version_days > 0 ? `, no record older than ${result.max_old_version_days} day(s)` : ' (age rule off)'),
     );
+  }
+  if (result.old_usage !== undefined && result.old_usage !== null) {
+    const usage = result.old_usage;
+    lines.push(`old usage     : ${oldUsageGbText(usage.bytes)} GB (${Number(usage.files) || 0} files)`);
+    if (usage.due === true) {
+      // The engine already puts the reminder into `warnings` on a committed run; a dry run has no `warnings` list,
+      // so the line is printed here when it is not already present. The hint is always printed: a reminder is never
+      // an action, and cleanup is the operator's `gc`.
+      const warned = Array.isArray(result.warnings) && result.warnings.some((line) => typeof line === 'string' && line.startsWith('old/ 已增长'));
+      if (warned !== true) lines.push(`warning       : ${oldUsageReminderWarning(usage)}`);
+      lines.push('hint          : nothing was deleted; run `w2m-backup gc --dry-run` first, then `w2m-backup gc` (or `--max-old-days <n>`) to clean up manually');
+    }
   }
   if (result.old_format === 'full') {
     const copies = Array.isArray(result.full_old_versions) ? result.full_old_versions.length : 0;
@@ -889,6 +944,13 @@ export function formatGc(result) {
   lines.push(`old versions  : ${result.old_versions.pruned} pruned by the retention window`);
   if (result.old_versions?.pruned_by_age !== undefined) lines.push(`old by age    : ${result.old_versions.pruned_by_age} pruned by the age rule`);
   if (result.old_versions?.full_copies_pruned > 0) lines.push(`full copies   : ${result.old_versions.full_copies_pruned} pruned with their record(s)`);
+  if (result.old_usage !== undefined && result.old_usage !== null && typeof result.old_usage === 'object') {
+    const before = result.old_usage.before !== null && typeof result.old_usage.before === 'object' ? result.old_usage.before : {};
+    const after = result.old_usage.after !== null && typeof result.old_usage.after === 'object' ? result.old_usage.after : {};
+    // The whole `old/` tree (records + sealed full copies), before and after this pass: gc is the manual cleanup the
+    // usage reminder points at, so it reports the number the reminder talks about.
+    lines.push(`old usage before/after: ${oldUsageGbText(before.bytes)} GB -> ${oldUsageGbText(after.bytes)} GB`);
+  }
   if (result.orphan_full_copies !== undefined && result.orphan_full_copies.scanned > 0) {
     lines.push(
       `orphan copies : ${result.orphan_full_copies.scanned} scanned, ${result.orphan_full_copies.removed} removed (${humanBytes(result.orphan_full_copies.reclaimed_bytes)} reclaimed)`,
@@ -1129,6 +1191,12 @@ export function main(argv, io = {}) {
       return 1;
     }
     const machineKey = options.noMachineKey === true || (io.env ?? process.env).W2M_BACKUP_NO_MACHINE_KEY === '1' ? false : undefined;
+    // The acknowledgement mark lives in the plugin's persisted state; the CLI only READS it, so a panel 「知道了」
+    // is honoured by the next CLI run and the CLI never moves the mark on its own.
+    const persistedState = readBackupState(options.dshHome).state;
+    const oldUsageAckBytes = Number.isSafeInteger(persistedState.old_usage_ack_bytes) && persistedState.old_usage_ack_bytes >= 0
+      ? persistedState.old_usage_ack_bytes
+      : 0;
     const runInput = {
       root: resolved.dir,
       dshHome: options.dshHome,
@@ -1139,6 +1207,9 @@ export function main(argv, io = {}) {
       oldFormat: options.oldFormat ?? undefined,
       // MB on the command line, bytes in the engine (the engine compares against the session file's size).
       maxFullCopyBytes: options.maxFullCopyMb === null ? undefined : options.maxFullCopyMb * 1024 * 1024,
+      // GB on the command line, bytes in the engine (the engine compares growth since the acknowledgement).
+      oldUsageReminderBytes: options.oldUsageReminderGb === null ? undefined : Math.round(options.oldUsageReminderGb * 1024 ** 3),
+      oldUsageAckBytes,
       allowLargeFullCopy: options.allowLargeFullCopy === true,
       encryption: options.encryption ?? undefined,
       mirrorRoot: options.mirror ?? undefined,

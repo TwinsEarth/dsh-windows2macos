@@ -47,6 +47,15 @@
  * survives only if it is among the newest `keep` **and** not older than `maxAgeDays` days. A record inside the
  * newest N but older than the window is pruned by age; a recent record beyond the newest N is pruned by count.
  * `0`/absent disables the age rule explicitly (0 means "count rule only", never "prune everything").
+ *
+ * ## The total size of `old/` is not capped -- it is measured and reminded (v3.5.0, §24.3)
+ *
+ * The user's decision is "no total limit; remind every 10 GB and let the user decide whether to clean up
+ * manually". So there is no total-size limit here: the per-session window and the 300 MiB per-full-copy cap stay
+ * exactly as they are, and {@link measureOldUsage} only **reads** the tree. The engine reports the measurement as
+ * `old_usage` and, once it has grown by `oldUsageReminderBytes` since the last acknowledgement, adds a warning;
+ * {@link buildOldUsageReport} / {@link oldUsageReminderWarning} are the pure decision half. Nothing in this module
+ * deletes anything because a size was crossed.
  */
 
 import fs from 'node:fs';
@@ -82,6 +91,17 @@ export const FULL_COPY_SUFFIX = '.enc';
  * (an explicit "I accept unbounded copies"); absent means this default.
  */
 export const DEFAULT_FULL_COPY_MAX_BYTES = 300 * 1024 * 1024;
+
+/**
+ * Default **usage reminder** for the whole `old/` tree: 10 GiB.
+ *
+ * `old/` has **no total cap by decision** (the per-session keep window and the 300 MiB per-full-copy cap are the
+ * only bounds). What grows without one is the sum of every kept record and sealed full copy, so the engine
+ * measures the tree after every successful run and raises a reminder once it has grown by this much **since the
+ * last acknowledgement**. It is a reminder, never a limit: nothing is deleted automatically, and the operator's
+ * answer is `w2m-backup gc` (or the panel's acknowledgement, which only moves the ack mark). `0` disables it.
+ */
+export const DEFAULT_OLD_USAGE_REMINDER_BYTES = 10 * 1024 * 1024 * 1024;
 
 /** Format of a `current/` pointer. */
 export const CURRENT_FORMAT = 'w2m-session-backup/current';
@@ -191,6 +211,123 @@ export function resolveMaxFullCopyBytes(value) {
     reason_code: ROTATION_CODES.POLICY_INVALID,
     detail: `maxFullCopyBytes must be 0 (no cap) or a non-negative integer number of bytes, got ${shown}`,
   };
+}
+
+/**
+ * Normalize the `oldUsageReminderBytes` option (the usage reminder threshold).
+ *
+ * Absent (`undefined`/`null`) means {@link DEFAULT_OLD_USAGE_REMINDER_BYTES}: remind the operator after `old/`
+ * has grown 10 GiB since the last acknowledgement. `0` means "reminders off" (not "remind immediately"). Any
+ * other value must be a non-negative safe integer; anything else is a policy error naming what it refused, so a
+ * typo cannot silently turn the reminder off.
+ *
+ * @param {unknown} value
+ * @returns {{ok: true, reminderBytes: number} | {ok: false, reason_code: string, detail: string}}
+ */
+export function resolveOldUsageReminderBytes(value) {
+  if (value === undefined || value === null) return { ok: true, reminderBytes: DEFAULT_OLD_USAGE_REMINDER_BYTES };
+  if (Number.isSafeInteger(value) && value >= 0) return { ok: true, reminderBytes: value };
+  const shown = typeof value === 'number' ? String(value) : (JSON.stringify(value) ?? String(value));
+  return {
+    ok: false,
+    reason_code: ROTATION_CODES.POLICY_INVALID,
+    detail: `oldUsageReminderBytes must be 0 (reminders off) or a non-negative integer number of bytes, got ${shown}`,
+  };
+}
+
+/**
+ * Measure the `old/` tree: total size of its **regular files** and how many there are.
+ *
+ * One walk (`readdirSync` + `statSync`), no file contents read, so it stays cheap enough to run after the 22:00
+ * scheduled backup. A missing `old/` directory is a size of 0 files / 0 bytes, not an error: the first backup of
+ * a fresh repository has no old versions yet. Symlinks are not regular files and are not counted (the walk uses
+ * the directory entry's own type, never a followed target), so a link placed under `old/` cannot inflate the sum.
+ *
+ * @param {string} root repository root
+ * @returns {{bytes: number, files: number}}
+ */
+export function measureOldUsage(root) {
+  const base = path.join(path.resolve(root), 'old');
+  let bytes = 0;
+  let files = 0;
+  const walk = (dir) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      try {
+        bytes += fs.statSync(full).size;
+        files += 1;
+      } catch {
+        // A file that vanished between readdir and stat is not part of the tree we measured; counting a size
+        // that could not be read would fabricate a number.
+      }
+    }
+  };
+  walk(base);
+  return { bytes, files };
+}
+
+/** `10` for 10 GiB, `10.5` for 10.5 GiB: the operator-facing number in the reminder text, never a byte count. */
+export function oldUsageGbText(bytes) {
+  const gib = Number(bytes) / (1024 * 1024 * 1024);
+  if (!Number.isFinite(gib) || gib <= 0) return '0';
+  return Number.isInteger(gib) ? String(gib) : gib.toFixed(1);
+}
+
+/**
+ * Fold a measurement and the acknowledgement mark into the `old_usage` report.
+ *
+ * The threshold is **growth since the last acknowledgement**, not a fixed 10/20/30 ladder: an operator who
+ * acknowledged 40 GB should not be reminded again at 50 GB just because a ladder says so, and an operator who
+ * acknowledged 0 should be reminded at 10 GB. `due` therefore compares `bytes - ack_bytes` with the reminder.
+ * Pure: no filesystem access and no deletion.
+ *
+ * @param {{bytes?: number, files?: number, ackBytes?: number, reminderBytes?: number}} input
+ * @returns {{bytes: number, files: number, reminder_bytes: number, due: boolean, since_last_ack_bytes: number,
+ *   next_reminder_at_bytes: number|null}}
+ */
+export function buildOldUsageReport(input = {}) {
+  const bytes = Number.isSafeInteger(input.bytes) && input.bytes >= 0 ? input.bytes : 0;
+  const files = Number.isSafeInteger(input.files) && input.files >= 0 ? input.files : 0;
+  // A corrupt persisted ack is treated as 0 rather than refused: the failure mode of a bad ack must be an
+  // extra reminder, never a silently suppressed one.
+  const ack = Number.isSafeInteger(input.ackBytes) && input.ackBytes >= 0 ? input.ackBytes : 0;
+  const reminder = Number.isSafeInteger(input.reminderBytes) && input.reminderBytes >= 0
+    ? input.reminderBytes
+    : DEFAULT_OLD_USAGE_REMINDER_BYTES;
+  const since = Math.max(0, bytes - ack);
+  return {
+    bytes,
+    files,
+    reminder_bytes: reminder,
+    due: reminder > 0 && since >= reminder,
+    since_last_ack_bytes: since,
+    next_reminder_at_bytes: reminder > 0 ? ack + reminder : null,
+  };
+}
+
+/**
+ * The warning line the engine adds when the reminder is due.
+ *
+ * Deliberately a question ("是否手动清理？") rather than an action: `old/` is never pruned by this feature. The
+ * operator's options are the exit routes named in the design (§24.3): `w2m-backup gc`, the per-session window, or
+ * acknowledging in the panel.
+ *
+ * @param {{bytes: number, reminder_bytes: number, since_last_ack_bytes: number}} report
+ * @returns {string}
+ */
+export function oldUsageReminderWarning(report) {
+  return `old/ 已增长 ${oldUsageGbText(report?.since_last_ack_bytes)} GB，自上次确认以来超过 ${oldUsageGbText(report?.reminder_bytes)} GB；是否手动清理？`;
 }
 
 /**

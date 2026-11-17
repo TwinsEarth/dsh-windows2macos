@@ -16,16 +16,21 @@ import {
   DEFAULT_FULL_COPY_MAX_BYTES,
   DEFAULT_KEEP_OLD,
   DEFAULT_OLD_FORMAT,
+  DEFAULT_OLD_USAGE_REMINDER_BYTES,
   OLD_FORMAT,
   OLD_FORMATS,
   OLD_VERSION,
   ROTATION_CODES,
   RotationError,
+  buildOldUsageReport,
   currentPath,
   currentRel,
   fullCopyPathFor,
   listOldVersions,
+  measureOldUsage,
   oldFullCopyPath,
+  oldUsageGbText,
+  oldUsageReminderWarning,
   oldVersionPath,
   pruneOldVersions,
   readCurrent,
@@ -33,6 +38,7 @@ import {
   resolveMaxAgeDays,
   resolveMaxFullCopyBytes,
   resolveOldFormat,
+  resolveOldUsageReminderBytes,
   rotateForEntry,
   selectPrunable,
   writeCurrentPointer,
@@ -1096,6 +1102,130 @@ describe('rotation: the full-copy cap and its approval annotation', () => {
       assert.equal(result.rotated, true);
       assert.equal(result.full_copy, null);
       assert.equal(listOldVersions(dir)[0].record.full_copy, undefined);
+    } finally {
+      cleanup();
+    }
+  });
+});
+describe('rotation: old/ usage measurement and the growth reminder (24.3)', () => {
+  const GiB = 1024 ** 3;
+
+  /** Write one plain file under `old/`, creating parents, and return its byte length. */
+  function putOldFile(root, rel, buffer) {
+    const file = join(root, 'old', ...rel.split('/'));
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, buffer);
+    return buffer.length;
+  }
+
+  it('normalizes the reminder threshold: 10 GiB default, 0 = reminders off, anything else refused by name', () => {
+    assert.deepEqual(resolveOldUsageReminderBytes(undefined), { ok: true, reminderBytes: DEFAULT_OLD_USAGE_REMINDER_BYTES });
+    assert.deepEqual(resolveOldUsageReminderBytes(null), { ok: true, reminderBytes: DEFAULT_OLD_USAGE_REMINDER_BYTES });
+    assert.equal(DEFAULT_OLD_USAGE_REMINDER_BYTES, 10 * GiB, 'the documented default is 10 GiB');
+    assert.equal(resolveOldUsageReminderBytes(0).reminderBytes, 0, '0 means off, not "remind immediately"');
+    assert.equal(resolveOldUsageReminderBytes(4096).reminderBytes, 4096);
+    for (const bad of [-1, 1.5, '1024', true]) {
+      const refused = resolveOldUsageReminderBytes(bad);
+      assert.equal(refused.ok, false, `oldUsageReminderBytes=${String(bad)} must be refused`);
+      assert.equal(refused.reason_code, ROTATION_CODES.POLICY_INVALID);
+      assert.match(refused.detail, /oldUsageReminderBytes must be 0/u);
+    }
+  });
+
+  it('measures the regular files under old/ (record JSON and sealed copies both count), and a missing dir is 0', () => {
+    const { dir, cleanup } = tempDir('w2m-rot-usage-measure-');
+    try {
+      assert.deepEqual(measureOldUsage(dir), { bytes: 0, files: 0 }, 'a repository with no old/ directory measures 0');
+      putOldFile(dir, '--E-GPT--/session-aaaaaaaa-0001/20261117T140000Z-aaaaaaaaaaaa.json', Buffer.alloc(123, 7));
+      putOldFile(dir, '--E-GPT--/session-aaaaaaaa-0001/20261117T140000Z-aaaaaaaaaaaa.json.enc', Buffer.alloc(456, 1));
+      putOldFile(dir, '--E-GPT--/session-bbbbbbbb-0002/20261117T150000Z-bbbbbbbbbbbb.json', Buffer.alloc(78, 2));
+      assert.deepEqual(measureOldUsage(dir), { bytes: 123 + 456 + 78, files: 3 });
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('computes due from growth since the acknowledgement, not from a fixed ladder', () => {
+    const disabled = buildOldUsageReport({ bytes: 11 * GiB, ackBytes: 0, reminderBytes: 0 });
+    assert.equal(disabled.due, false, '0 disables due even for a huge tree');
+    assert.equal(disabled.next_reminder_at_bytes, null);
+    assert.equal(disabled.reminder_bytes, 0);
+
+    const below = buildOldUsageReport({ bytes: 9 * GiB, ackBytes: 0, reminderBytes: 10 * GiB });
+    assert.equal(below.due, false);
+    assert.equal(below.since_last_ack_bytes, 9 * GiB);
+    assert.equal(below.next_reminder_at_bytes, 10 * GiB);
+
+    const atThreshold = buildOldUsageReport({ bytes: 10 * GiB, ackBytes: 0, reminderBytes: 10 * GiB });
+    assert.equal(atThreshold.due, true, 'exactly at the threshold is due (>=)');
+    assert.equal(atThreshold.since_last_ack_bytes, 10 * GiB);
+
+    const acked = buildOldUsageReport({ bytes: 50 * GiB, ackBytes: 40 * GiB, reminderBytes: 10 * GiB });
+    assert.equal(acked.due, true, 'growth since the ack crosses the threshold even at a high absolute size');
+    assert.equal(acked.next_reminder_at_bytes, 50 * GiB);
+
+    const notYet = buildOldUsageReport({ bytes: 49 * GiB, ackBytes: 40 * GiB, reminderBytes: 10 * GiB });
+    assert.equal(notYet.due, false);
+
+    const shrunk = buildOldUsageReport({ bytes: 5 * GiB, ackBytes: 10 * GiB, reminderBytes: 10 * GiB });
+    assert.equal(shrunk.since_last_ack_bytes, 0, 'a tree smaller than the ack is 0 growth, not a negative amount');
+    assert.equal(shrunk.due, false);
+  });
+
+  it('formats the operator-facing GB number and the reminder question', () => {
+    assert.equal(oldUsageGbText(0), '0');
+    assert.equal(oldUsageGbText(10 * GiB), '10');
+    assert.equal(oldUsageGbText(10.5 * GiB), '10.5');
+    const report = buildOldUsageReport({ bytes: 10 * GiB, ackBytes: 0, reminderBytes: 10 * GiB });
+    const warning = oldUsageReminderWarning(report);
+    assert.match(warning, /old\/ 已增长 10 GB/u);
+    assert.match(warning, /自上次确认以来超过 10 GB/u);
+    assert.match(warning, /是否手动清理/u);
+  });
+
+  it('counts a records-mode record and a full_copy-bearing record in one fixture, and measuring deletes nothing', () => {
+    const { dir, cleanup } = tempDir('w2m-rot-usage-fixture-');
+    try {
+      // A record-only version (records mode, written by the real recorder)...
+      recordSupersededVersion({
+        root: dir,
+        previous: { ...ENTRY, updated_at: '2026-11-17T13:00:00.000Z' },
+        snapshotId: '20261117T140000Z-deadbeef',
+        now: new Date('2026-11-17T14:00:00.000Z'),
+      });
+      // ...and a record that carries a full_copy (what full mode writes), written literally so the fixture does not
+      // need a DEK: the measurement counts files by size and must not care which shape produced them.
+      const manualRecord = {
+        format: OLD_FORMAT,
+        version: OLD_VERSION,
+        rel: ENTRY.rel,
+        session_id: 'session-bbbbbbbb-0002',
+        workspace: '--E-GPT--',
+        sha256: 'b'.repeat(64),
+        size: 10,
+        blocks: [{ index: 0, offset: 0, length: 10, sha256: 'b'.repeat(64) }],
+        snapshot_id: '20261117T130000Z-deadbeef',
+        superseded_by: '20261117T140000Z-deadbeef',
+        recorded_at: '2026-11-17T12:00:00.000Z',
+        full_copy: { file: 'old/--E-GPT--/session-bbbbbbbb-0002/20261117T120000Z-bbbbbbbbbbbb.json.enc', sha256: 'b'.repeat(64), size: 10 },
+      };
+      const recordBytes = putOldFile(dir, '--E-GPT--/session-bbbbbbbb-0002/20261117T120000Z-bbbbbbbbbbbb.json', Buffer.from(JSON.stringify(manualRecord), 'utf8'));
+      const copyBytes = putOldFile(dir, '--E-GPT--/session-bbbbbbbb-0002/20261117T120000Z-bbbbbbbbbbbb.json.enc', Buffer.alloc(512, 3));
+
+      const rows = listOldVersions(dir);
+      assert.equal(rows.length, 2, 'the fixture holds both record shapes');
+      assert.ok(rows.some((row) => row.record.full_copy !== undefined), 'one record names its sealed full copy');
+      assert.ok(rows.some((row) => row.record.full_copy === undefined), 'the other is record-only');
+      const expectedBytes = rows.reduce((sum, row) => sum + readFileSync(row.file).length, 0) + copyBytes;
+      assert.ok(expectedBytes > recordBytes, 'the fixture is not empty');
+      assert.deepEqual(measureOldUsage(dir), { bytes: expectedBytes, files: 3 }, 'the measurement is the hand sum');
+
+      // Measuring is read-only: a no-op prune (keep 100) finds nothing to remove and every file stays.
+      const fileList = rows.map((row) => row.file).sort();
+      const pruned = pruneOldVersions({ root: dir, keep: 100 });
+      assert.equal(pruned.removed.length, 0);
+      assert.deepEqual(listOldVersions(dir).map((row) => row.file).sort(), fileList);
+      assert.deepEqual(measureOldUsage(dir), { bytes: expectedBytes, files: 3 }, 'measureOldUsage writes and deletes nothing');
     } finally {
       cleanup();
     }

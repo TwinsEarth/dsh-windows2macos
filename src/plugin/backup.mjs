@@ -48,6 +48,19 @@
  * A `POST` from the panel model is not a button click -- it is a network request a stale page can replay. The body
  * must carry `{"confirm":"run"}` (plus the scope), so "run a backup now" is never the meaning of an accidental
  * empty POST.
+ *
+ * ## `old/` has no total cap; the row configures a growth reminder (v3.5.0, §24.3)
+ *
+ * The user's decision is "no total limit; remind every 10 GB and let the user decide whether to clean up
+ * manually". `backupOldUsageReminderGb` (default `10`, `0` = reminders off) is therefore a **reminder threshold,
+ * not a cap**: the engine measures `old/` after every successful run (post-rotation, one read-only walk), and when
+ * the tree has grown by at least that much since the persisted acknowledgement it adds a warning -- nothing is
+ * pruned. This subplugin persists the measurement and the ack mark in the plugin state file
+ * (`<DSH_HOME>/xclient/w2m-backup/state.json`, the same store the cached runtime verdict uses) as
+ * `state.old_usage` / `state.old_usage_ack_bytes`, exposes them in the embedded describe, and mounts
+ * `POST /api/w2m/backup/old-usage/ack` (`{"confirm":"ack"}`) for the panel's 「知道了」 button. That route sets
+ * `old_usage_ack_bytes` to the size measured **now**, clears `state.old_usage.due` and deletes nothing: the only
+ * cleanup path is the operator running `w2m-backup gc` (the panel's 「如何清理」 explains it and never executes it).
  */
 
 import { applyRestore, planRestore } from '../backup/restore.mjs';
@@ -55,7 +68,7 @@ import { buildArchive } from '../backup/archive.mjs';
 import { DEFAULT_RECHECK_DELAYS, scheduleRegistryRecheck } from '../backup/registry-watch.mjs';
 import { applyRegister, planRegister, registerThroughHost, REGISTER_CODES } from '../backup/register.mjs';
 import { DEFAULT_ROUTE_WATCH_CAP_MS, REGISTER_RESIDUAL_RISK_LINE, sampleWatchSchedule } from '../backup/register-watch.mjs';
-import { RUNTIME_VERDICT_MODES, createRuntimeVerdictStore } from '../backup/runtime-verdict.mjs';
+import { RUNTIME_VERDICT_MODES, createRuntimeVerdictStore, readBackupState, writeBackupState } from '../backup/runtime-verdict.mjs';
 import { describeUnlock, unlockRepo } from '../backup/unlock.mjs';
 import { verifyRepo } from '../backup/verify.mjs';
 import { createAccountIdentity } from '../chatops/account.mjs';
@@ -66,11 +79,14 @@ import { createDailyScheduler, DEFAULT_CATCH_UP_MS } from './schedule.mjs';
 import { runBackup, SCOPES } from '../backup/engine.mjs';
 import { buildStatus } from '../backup/routes.mjs';
 import { describeBackupSchedule, normalizeBackupSchedule } from '../backup/schedule.mjs';
-import { DEFAULT_FULL_COPY_MAX_BYTES, DEFAULT_KEEP_OLD, DEFAULT_OLD_FORMAT, OLD_FORMATS } from '../backup/rotation.mjs';
+import { DEFAULT_FULL_COPY_MAX_BYTES, DEFAULT_KEEP_OLD, DEFAULT_OLD_FORMAT, DEFAULT_OLD_USAGE_REMINDER_BYTES, OLD_FORMATS, buildOldUsageReport, measureOldUsage } from '../backup/rotation.mjs';
 import { REPO_ENCRYPTION_MODES } from '../backup/layout.mjs';
 
 /** The row's `backupFullCopyMaxMb` default, expressed in MB (the engine's cap is in bytes). */
 export const DEFAULT_FULL_COPY_MAX_MB = DEFAULT_FULL_COPY_MAX_BYTES / (1024 * 1024);
+
+/** The row's `backupOldUsageReminderGb` default, in GB (the engine's threshold is in bytes). */
+export const DEFAULT_OLD_USAGE_REMINDER_GB = DEFAULT_OLD_USAGE_REMINDER_BYTES / (1024 ** 3);
 
 /** The named engine refusal that means "a human must approve this full-copy write (特批)". */
 export const FULL_COPY_APPROVAL_CODE = 'BACKUP_FULL_COPY_APPROVAL_REQUIRED';
@@ -99,6 +115,15 @@ export const BACKUP_UNLOCK_ROUTE_PATH = '/api/w2m/backup/unlock';
  *  watches the registry inside the host, where the client is by definition running. */
 export const BACKUP_REGISTER_ROUTE_PATH = '/api/w2m/backup/register';
 
+/**
+ * Old-version usage acknowledgement route (v3.5.0, §24.3): POST with `{"confirm":"ack"}`.
+ *
+ * `old/` has no total cap by decision; the panel's 「知道了」 posts here to move the acknowledgement mark to the
+ * bytes measured **now**, which clears the pending growth reminder. It deletes nothing and the panel has no
+ * destructive action.
+ */
+export const BACKUP_OLD_USAGE_ACK_ROUTE_PATH = '/api/w2m/backup/old-usage/ack';
+
 /** Confirmation token for the restore route. */
 export const RESTORE_CONFIRM_TOKEN = 'restore';
 
@@ -110,6 +135,9 @@ export const UNLOCK_CONFIRM_TOKEN = 'unlock';
 
 /** Confirmation token for the register repair (a file write under the client's own home). */
 export const REGISTER_CONFIRM_TOKEN = 'register';
+
+/** Confirmation token for the old-version usage acknowledgement (moves an ack mark; deletes nothing). */
+export const OLD_USAGE_ACK_CONFIRM_TOKEN = 'ack';
 
 /** Confirmation token a POST must carry. */
 export const RUN_CONFIRM_TOKEN = 'run';
@@ -138,6 +166,10 @@ export function defaultBackupDir(platform = process.platform) {
  * `backupFullCopyMaxMb` caps ONE `full` whole-file copy: a session file larger than the cap makes a run refuse
  * before writing (`BACKUP_FULL_COPY_APPROVAL_REQUIRED`) until a human approves that run ("特批"). It defaults to
  * 300 MB; `0` disables the cap explicitly, and a non-integer/negative value is refused rather than coerced.
+ * `backupOldUsageReminderGb` is NOT a cap on `old/`: it is the growth (since the last acknowledgement) at which a
+ * run raises the manual-cleanup reminder. It defaults to 10 GB and `0` turns reminders off; a negative,
+ * non-numeric or non-finite value is refused rather than coerced. The tree is measured after every successful run
+ * and the measurement is persisted as `state.old_usage`; nothing is ever deleted because of it.
  * `backupMirrorDir` is the offsite mirror directory; absent/empty means no mirror, and a non-string value is
  * refused rather than silently ignored (a typo in the row should not mount a plugin that silently copies
  * nowhere).
@@ -151,6 +183,7 @@ export function defaultBackupDir(platform = process.platform) {
  * @returns {{ok: true, enabled: boolean, backup_dir: string, times: string[], time_zone: string, catch_up_ms: number,
  *   scope: string, keep_old_per_session: number, old_version_days: number, old_format: 'records'|'full',
  *   full_copy_max_mb: number, full_copy_max_bytes: number,
+ *   old_usage_reminder_gb: number, old_usage_reminder_bytes: number,
  *   encryption: 'none'|'sealed', mirror_dir: string|null, account_binding: boolean, dsh_home: string}
  *   | {ok: false, reason_code: string, detail: string}}
  */
@@ -217,6 +250,20 @@ export function normalizeConfig(config = {}, deps = {}) {
     };
   }
   const fullCopyMaxBytes = fullCopyMaxMb * 1024 * 1024;
+  // The `old/` usage reminder (v3.5.0, §24.3): `old/` has **no total cap by decision**. The row configures how much
+  // growth since the last acknowledgement should trigger the reminder; `0` disables reminders. It is explicitly not
+  // a limit -- validating it here only means a typo fails the mount instead of surfacing as a missing reminder on
+  // the 22:00 path. Non-negative numbers (including fractions) are accepted; anything else is refused by name.
+  const oldUsageReminderGb = config.backupOldUsageReminderGb ?? DEFAULT_OLD_USAGE_REMINDER_GB;
+  if (typeof oldUsageReminderGb !== 'number' || !Number.isFinite(oldUsageReminderGb) || oldUsageReminderGb < 0 ||
+    !Number.isSafeInteger(Math.round(oldUsageReminderGb * 1024 ** 3))) {
+    return {
+      ok: false,
+      reason_code: 'BACKUP_CONFIG_INVALID',
+      detail: `backupOldUsageReminderGb must be a non-negative number of GB (0 = reminders off), got ${JSON.stringify(config.backupOldUsageReminderGb)}`,
+    };
+  }
+  const oldUsageReminderBytes = Math.round(oldUsageReminderGb * 1024 ** 3);
   // The protection mode for a NEW repository. `none` is the default (the user's decision: 默认是不加密); a bad
   // value fails the mount with a configuration code instead of becoming a silent surprise in a scheduled run.
   const encryption = config.backupEncryption ?? 'none';
@@ -279,6 +326,8 @@ export function normalizeConfig(config = {}, deps = {}) {
     old_format: oldFormat,
     full_copy_max_mb: fullCopyMaxMb,
     full_copy_max_bytes: fullCopyMaxBytes,
+    old_usage_reminder_gb: oldUsageReminderGb,
+    old_usage_reminder_bytes: oldUsageReminderBytes,
     mirror_dir: mirrorDir,
     registry_recheck_ms: registryRecheckMs,
     runtime_verify: runtimeVerify,
@@ -292,7 +341,7 @@ export function normalizeConfig(config = {}, deps = {}) {
  * @param {object} ctx Cordis context
  * @param {object} [config] row configuration (`backupDir`, `backupTimes`, `backupTimeZone`, `backupScope`,
  *   `keepOldPerSession`, `backupOldVersionDays`, `backupOldFormat`, `backupFullCopyMaxMb`, `backupMirrorDir`,
- *   `backupEnabled`, `backupRuntimeVerify: 'off'|'nightly'`)
+ *   `backupOldUsageReminderGb`, `backupEnabled`, `backupRuntimeVerify: 'off'|'nightly'`)
  * @param {{runtimeVerify?: Function, registerWatch?: Function, createScheduler?: Function, now?: Function}} [deps]
  *   Injectable seams for tests. `runtimeVerify` replaces the real `verifyRepo({runtime:true})` call the cached
  *   verdict store runs (so a unit test never spawns the Harness); `registerWatch` replaces the bounded watch the
@@ -324,6 +373,13 @@ export function apply(ctx, config = {}, deps = {}) {
     encryption: cfg.encryption,
     mirror_dir: cfg.mirror_dir,
     runtime_verify_mode: cfg.runtime_verify,
+    // `old/` has no total cap; this is the reminder threshold the row configures (0 = reminders off). It is exposed
+    // in the describe payload so the panel's 「如何清理」 text and the reminder banner quote the number in effect.
+    old_usage_reminder_gb: cfg.old_usage_reminder_gb,
+    old_usage_reminder_bytes: cfg.old_usage_reminder_bytes,
+    // Filled from the persisted plugin state below: the acknowledgement mark (bytes) and the last reminder record.
+    old_usage_ack_bytes: 0,
+    old_usage: null,
     runs: 0,
     failures: 0,
     last_run: null,
@@ -332,6 +388,20 @@ export function apply(ctx, config = {}, deps = {}) {
     last_runtime_verify: null,
     running: false,
   };
+
+  // Restore the reminder state a previous process persisted: the panel must show a pending reminder left behind by
+  // the 22:00 run, and the next run must measure growth against the operator's last acknowledgement. A corrupt or
+  // missing state file reads as "no acknowledgement yet" (0), which errs toward reminding, never toward silence.
+  try {
+    const persisted = readBackupState(cfg.dsh_home).state;
+    state.old_usage_ack_bytes = Number.isSafeInteger(persisted.old_usage_ack_bytes) && persisted.old_usage_ack_bytes >= 0
+      ? persisted.old_usage_ack_bytes
+      : 0;
+    state.old_usage = persisted.old_usage !== null && typeof persisted.old_usage === 'object' ? persisted.old_usage : null;
+  } catch {
+    state.old_usage_ack_bytes = 0;
+    state.old_usage = null;
+  }
 
   /**
    * The host's account identifier, best effort, or `null`.
@@ -438,6 +508,11 @@ export function apply(ctx, config = {}, deps = {}) {
         // named pending state instead of an unattended over-cap write.
         maxFullCopyBytes: cfg.full_copy_max_bytes,
         allowLargeFullCopy: request?.allowLargeFullCopy === true,
+        // The usage reminder: the row configures GB, the engine takes bytes, and the acknowledgement mark is the
+        // plugin's persisted state (moved only by the panel's 「知道了」 route, never by a run). The engine measures
+        // `old/` after rotation; it never deletes anything because of it.
+        oldUsageReminderBytes: cfg.old_usage_reminder_bytes,
+        oldUsageAckBytes: state.old_usage_ack_bytes,
         encryption: cfg.encryption,
         mirrorRoot: cfg.mirror_dir,
         machineKey: cfg.machine_key,
@@ -462,10 +537,41 @@ export function apply(ctx, config = {}, deps = {}) {
           full_copy_approved_over_cap: result.full_copy_approved_over_cap ?? [],
           full_copy_max_mb: cfg.full_copy_max_mb,
           future_append: result.future_append ?? null,
+          // The `old/` measurement this run produced (bytes/files/reminder.threshold/due). It is also persisted below,
+          // in the plugin state, because the panel must render a pending reminder after a page refresh.
+          old_usage: result.old_usage ?? null,
           // The offsite copy is best effort: the primary result stays `ok` and the failure is visible here.
           mirror: result.mirror ?? null,
           warnings: result.warnings ?? [],
         };
+        // Persist the measurement and (when due) the pending reminder. This is a state write, not a cleanup: `old/`
+        // is untouched, nothing is deleted, and the record is what the panel's banner renders until the operator
+        // acknowledges. A state-file failure never downgrades the committed backup -- it is logged as a warning.
+        const measuredOldUsage = result.old_usage !== null && typeof result.old_usage === 'object' ? result.old_usage : null;
+        if (measuredOldUsage !== null) {
+          const oldUsageRecord = {
+            due: measuredOldUsage.due === true,
+            bytes: measuredOldUsage.bytes,
+            files: measuredOldUsage.files,
+            ack_bytes: state.old_usage_ack_bytes,
+            reminder_bytes: measuredOldUsage.reminder_bytes,
+            at: new Date().toISOString(),
+          };
+          state.old_usage = oldUsageRecord;
+          const persistedUsage = writeBackupState(cfg.dsh_home, {
+            old_usage: oldUsageRecord,
+            old_usage_ack_bytes: state.old_usage_ack_bytes,
+          });
+          if (persistedUsage.ok !== true) {
+            ctx.logger?.warn?.(`w2m-dsh-backup: the old/ usage measurement could not be persisted: ${persistedUsage.error ?? 'unknown error'}`);
+          }
+          if (oldUsageRecord.due === true) {
+            ctx.logger?.warn?.(
+              `w2m-dsh-backup: old/ grew ${measuredOldUsage.since_last_ack_bytes} bytes since the last acknowledgement ` +
+                `(reminder at ${measuredOldUsage.reminder_bytes}); nothing was deleted -- manual cleanup is w2m-backup gc`,
+            );
+          }
+        }
         ctx.logger?.info?.(
           `w2m-dsh-backup: ${reason} backup ${result.snapshot_id}: ${result.sessions} session(s), ` +
             `${result.blocks_new} new block(s), ${result.blocks_reused} reused`,
@@ -572,6 +678,9 @@ export function apply(ctx, config = {}, deps = {}) {
               // The `full` whole-file copy cap (MB; 0 = no cap). The panel shows it as the threshold and the
               // approval dialog quotes it, so the number on screen is the number the engine compares against.
               full_copy_max_mb: cfg.full_copy_max_mb,
+              // The `old/` usage reminder threshold (GB; 0 = reminders off). A reminder, never a cap: the engine
+              // measures `old/` and the state below carries the pending record the panel's banner renders.
+              old_usage_reminder_gb: cfg.old_usage_reminder_gb,
               // The mode this row will create a NEW repository with. The repository's actual mode is
               // `status.repository.encryption` / `encryption` (an existing sealed repository keeps its mode).
               encryption: cfg.encryption,
@@ -667,6 +776,69 @@ export function apply(ctx, config = {}, deps = {}) {
               reason_code: result.reason_code,
               detail: result.detail,
               attempts: result.attempts,
+            },
+            { headers: NO_STORE },
+          );
+        },
+      });
+
+      /**
+       * The panel's 「知道了」 acknowledgement for the `old/` growth reminder (v3.5.0, §24.3).
+       *
+       * `old/` has no total cap by decision, so this route is **not a cleanup**: it measures the tree now, sets
+       * `old_usage_ack_bytes` to that size and clears the pending record (`state.old_usage.due` becomes false). No
+       * file is deleted here, and the panel exposes no destructive button -- the only cleanup path is the operator
+       * running `w2m-backup gc` in a terminal, which the panel's 「如何清理」 guidance spells out. The confirmation
+       * token is required because a stale page must not move the mark by accident.
+       */
+      registry.register({
+        path: BACKUP_OLD_USAGE_ACK_ROUTE_PATH,
+        methods: ['POST'],
+        requestBody: 'buffered',
+        fetch: async (request) => {
+          if (request.method !== 'POST') return refuse('METHOD_NOT_ALLOWED', `${request.method} is not a method this route answers`, 405);
+          const body = await readBody(request);
+          if (body === null || body.confirm !== OLD_USAGE_ACK_CONFIRM_TOKEN) {
+            return refuse('BACKUP_CONFIRM_REQUIRED', `a JSON body with {"confirm":"${OLD_USAGE_ACK_CONFIRM_TOKEN}"} is required`);
+          }
+          const measured = measureOldUsage(cfg.backup_dir);
+          const report = buildOldUsageReport({
+            ...measured,
+            ackBytes: measured.bytes,
+            reminderBytes: cfg.old_usage_reminder_bytes,
+          });
+          const record = {
+            due: false,
+            bytes: measured.bytes,
+            files: measured.files,
+            ack_bytes: measured.bytes,
+            reminder_bytes: cfg.old_usage_reminder_bytes,
+            at: new Date().toISOString(),
+          };
+          const persisted = writeBackupState(cfg.dsh_home, { old_usage: record, old_usage_ack_bytes: measured.bytes });
+          if (persisted.ok !== true) {
+            return Response.json(
+              {
+                ok: false,
+                reason_code: 'BACKUP_WRITE_FAILED',
+                detail: `the acknowledgement could not be persisted: ${persisted.error ?? 'unknown error'}`,
+              },
+              { status: 500, headers: NO_STORE },
+            );
+          }
+          state.old_usage_ack_bytes = measured.bytes;
+          state.old_usage = record;
+          ctx.logger?.info?.(
+            `w2m-dsh-backup: old/ usage acknowledged at ${measured.bytes} bytes (${measured.files} file(s)); nothing was deleted`,
+          );
+          // The new state is returned so the panel can hide the banner without a second round-trip.
+          return Response.json(
+            {
+              ok: true,
+              deleted: false,
+              old_usage_ack_bytes: measured.bytes,
+              old_usage: { ...report, ack_bytes: measured.bytes, pending: false },
+              state: { ...state, old_usage: record },
             },
             { headers: NO_STORE },
           );

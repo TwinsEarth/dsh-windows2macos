@@ -66,6 +66,19 @@
  * `full_copy.approved_over_cap: true` + `full_copy.cap_bytes` on the version record it wrote. `maxFullCopyBytes: 0`
  * disables the cap explicitly (documented, never the default); `records` mode ignores it because it writes no
  * whole-file copy at all.
+ *
+ * ## The size of `old/` is not capped: it is measured, and a growth reminder is reported (v3.5.0, §24.3)
+ *
+ * The user's decision is explicit: **no total limit on `old/`; remind every 10 GB and let the user decide whether
+ * to clean up manually.** The per-session keep window and the per-full-copy cap are untouched; what this run adds
+ * is one read-only walk of `old/` after rotation (the point where `old/` is final) whose result is reported as
+ * `old_usage: {bytes, files, reminder_bytes, due, since_last_ack_bytes, next_reminder_at_bytes}`. The reminder is
+ * **growth since the last acknowledgement** (`oldUsageAckBytes`), not a fixed 10/20/30 ladder: the plugin persists
+ * the ack mark when the operator clicks 「知道了」, and `due` is `reminder_bytes > 0 && bytes - ack >= reminder`.
+ * When it is due the warning is added to `warnings`, and **nothing is deleted**: the walk only reads directory
+ * entries and file sizes, the engine has no cleanup path for it, and manual cleanup is the operator's
+ * `w2m-backup gc` (which is also the thing the reminder points at). `oldUsageReminderBytes: 0` disables `due`;
+ * an invalid value is refused before the scan/layout/lock/key like every other policy option.
  */
 
 import fs from 'node:fs';
@@ -81,7 +94,7 @@ import { detectMachineKeySupport } from './machine-key.mjs';
 import { appendLegalEvent, futureAppendVerdict } from './future-append.mjs';
 import { buildArtifactFromBuffer, runtimeValidateBatch } from './runtime-validate.mjs';
 import { scanHome } from './scan.mjs';
-import { DEFAULT_KEEP_OLD, resolveMaxAgeDays, resolveMaxFullCopyBytes, resolveOldFormat, rotateForEntry } from './rotation.mjs';
+import { DEFAULT_KEEP_OLD, buildOldUsageReport, measureOldUsage, oldUsageReminderWarning, resolveMaxAgeDays, resolveMaxFullCopyBytes, resolveOldFormat, resolveOldUsageReminderBytes, rotateForEntry } from './rotation.mjs';
 import { MIRROR_CODES, resolveMirrorRoot, syncToMirror } from './mirror.mjs';
 import { commitSnapshot, makeSnapshotId } from './repo.mjs';
 import { scanFrames } from '../fix/zstd.mjs';
@@ -298,6 +311,8 @@ function safeMtime(file) {
  *   oldFormat?: 'records'|'full',
  *   maxFullCopyBytes?: number,
  *   allowLargeFullCopy?: boolean,
+ *   oldUsageReminderBytes?: number,
+ *   oldUsageAckBytes?: number,
  *   mirrorRoot?: string|null,
  *   dryRun?: boolean,
  *   exclude_session_ids?: string[],
@@ -336,6 +351,19 @@ export function runBackup(input) {
     return { ok: false, reason_code: capPolicy.reason_code, detail: capPolicy.detail, dry_run: dryRun };
   }
   const maxFullCopyBytes = capPolicy.maxBytes;
+  // The `old/` usage reminder is a policy value like the cap: validated before the scan, the layout, the lock and
+  // the key, so a typo is refused without leaving a repository behind. `0` disables only the reminder, never the
+  // measurement: the run still reports how big `old/` is.
+  const reminderPolicy = resolveOldUsageReminderBytes(input.oldUsageReminderBytes);
+  if (reminderPolicy.ok !== true) {
+    return { ok: false, reason_code: reminderPolicy.reason_code, detail: reminderPolicy.detail, dry_run: dryRun };
+  }
+  const oldUsageReminderBytes = reminderPolicy.reminderBytes;
+  // The acknowledgement mark is state, not policy: a corrupt value (a missing/corrupt plugin state file) is read as
+  // 0 so the failure mode is an extra reminder, never a suppressed one. It is never written by the engine.
+  const oldUsageAckBytes = Number.isSafeInteger(input.oldUsageAckBytes) && input.oldUsageAckBytes >= 0
+    ? input.oldUsageAckBytes
+    : 0;
   // Only the exact boolean counts: `allowLargeFullCopy: 1` / `"yes"` is a caller bug, not an approval. An approval
   // is a deliberate act by the operator, never something inferred from a truthy value.
   const allowLargeFullCopy = input.allowLargeFullCopy === true;
@@ -598,6 +626,15 @@ export function runBackup(input) {
     }
 
     if (dryRun) {
+      // A dry run writes nothing, but `old/` that already exists is a read fact: measuring it answers "how big is
+      // the old-version tree now, and would the reminder be due" without writing a byte. No warning is emitted
+      // here because a dry run has no `warnings` list; the CLI prints the `old_usage` line from the result.
+      const measuredOld = measureOldUsage(root);
+      const oldUsage = buildOldUsageReport({
+        ...measuredOld,
+        ackBytes: oldUsageAckBytes,
+        reminderBytes: oldUsageReminderBytes,
+      });
       return {
         ok: true,
         dry_run: true,
@@ -624,6 +661,7 @@ export function runBackup(input) {
         keep_old_per_session: keepOld,
         max_old_version_days: maxOldVersionDays,
         old_format: oldFormat,
+        old_usage: oldUsage,
         duration_ms: Date.now() - started,
       };
     }
@@ -664,6 +702,15 @@ export function runBackup(input) {
       };
     }
     const rotated = rotations.filter((row) => row.rotated === true);
+    // `old/` is final now (this run's records and sealed copies are written, the per-session window is pruned), so
+    // this is the one point where the measurement describes what the repository actually keeps. One read-only walk;
+    // the report compares it with the persisted acknowledgement mark and never deletes anything.
+    const measuredOld = measureOldUsage(root);
+    const oldUsage = buildOldUsageReport({
+      ...measuredOld,
+      ackBytes: oldUsageAckBytes,
+      reminderBytes: oldUsageReminderBytes,
+    });
     // The sealed whole-file copies, in rotation order. Only `full` mode produces them, and the key is only added
     // in that mode so a default run keeps exactly the result shape it had before this option existed.
     const fullOldVersions = rotated.map((row) => row.full_copy?.file).filter((file) => typeof file === 'string');
@@ -680,6 +727,9 @@ export function runBackup(input) {
     // account would silently turn the default `none` mode back into `sealed` after the first run (and the
     // requirement is that `none` stays `none` until the operator asks otherwise).
     const warnings = [];
+    // The usage reminder is a warning, not a limit: the run is `ok`, the snapshot is committed, and the line is the
+    // operator's cue to clean up manually (`w2m-backup gc`) or acknowledge in the panel.
+    if (oldUsage.due) warnings.push(oldUsageReminderWarning(oldUsage));
     let accountBinding = null;
     if (key.encryption !== 'none' && typeof input.accountId === 'string' && input.accountId.trim() !== '') {
       try {
@@ -769,6 +819,7 @@ export function runBackup(input) {
       keep_old_per_session: keepOld,
       max_old_version_days: maxOldVersionDays,
       old_format: oldFormat,
+      old_usage: oldUsage,
       rotated: rotated.length,
       old_versions: rotated.map((row) => row.old_file),
       ...(oldFormat === 'full' ? { full_old_versions: fullOldVersions } : {}),

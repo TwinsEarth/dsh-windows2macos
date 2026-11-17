@@ -14,11 +14,14 @@ import { join } from 'node:path';
 import {
   ARCHIVE_CONFIRM_TOKEN,
   BACKUP_ARCHIVE_ROUTE_PATH,
+  BACKUP_OLD_USAGE_ACK_ROUTE_PATH,
   BACKUP_REGISTER_ROUTE_PATH,
   BACKUP_RESTORE_ROUTE_PATH,
   BACKUP_RUN_ROUTE_PATH,
   BACKUP_UNLOCK_ROUTE_PATH,
   BACKUP_VERIFY_ROUTE_PATH,
+  DEFAULT_OLD_USAGE_REMINDER_GB,
+  OLD_USAGE_ACK_CONFIRM_TOKEN,
   REGISTER_CONFIRM_TOKEN,
   RESTORE_CONFIRM_TOKEN,
   RUN_CONFIRM_TOKEN,
@@ -33,8 +36,7 @@ import {
   writeBackupState,
 } from '../src/backup/runtime-verdict.mjs';
 import { REGISTER_RESIDUAL_RISK_LINE } from '../src/backup/register-watch.mjs';
-import { main, parseArgs } from '../src/backup/cli.mjs';
-import { runBackup } from '../src/backup/engine.mjs';
+import { formatGc, formatRun, formatStatus, main, parseArgs } from '../src/backup/cli.mjs';import { runBackup } from '../src/backup/engine.mjs';
 import { bindAccount, openRepoKey, readRepoKeys, setRepositoryPassword } from '../src/backup/keystore.mjs';
 import { MIN_SCRYPT } from '../src/backup/crypto.mjs';
 import { descriptorEncryption, readDescriptor } from '../src/backup/layout.mjs';
@@ -253,6 +255,28 @@ describe('subplugin: configuration', () => {
       assert.match(refused.detail, /backupFullCopyMaxMb must be a non-negative integer/u);
     }
   });
+
+  it('normalizes backupOldUsageReminderGb (10 GB default, 0 = reminders off) and refuses an invalid value', () => {
+    assert.equal(DEFAULT_OLD_USAGE_REMINDER_GB, 10, 'the documented default reminder is 10 GB');
+    const defaults = normalizeConfig({}, { env: {}, platform: 'win32' });
+    assert.equal(defaults.ok, true);
+    assert.equal(defaults.old_usage_reminder_gb, 10, 'the row default is 10 GB');
+    assert.equal(defaults.old_usage_reminder_bytes, 10 * 1024 ** 3, 'the engine receives bytes');
+    const disabled = normalizeConfig({ backupOldUsageReminderGb: 0 }, { env: {}, platform: 'win32' });
+    assert.equal(disabled.ok, true);
+    assert.equal(disabled.old_usage_reminder_gb, 0, '0 is the explicit "reminders off"');
+    assert.equal(disabled.old_usage_reminder_bytes, 0);
+    const raised = normalizeConfig({ backupOldUsageReminderGb: 25 }, { env: {}, platform: 'win32' });
+    assert.equal(raised.old_usage_reminder_bytes, 25 * 1024 ** 3);
+    // A non-negative number (fractions included) is a valid threshold; anything else is refused rather than coerced.
+    assert.equal(normalizeConfig({ backupOldUsageReminderGb: 0.5 }, { env: {}, platform: 'win32' }).old_usage_reminder_bytes, 512 * 1024 * 1024);
+    for (const bad of [-1, '10', true, {}]) {
+      const refused = normalizeConfig({ backupOldUsageReminderGb: bad }, { env: {}, platform: 'win32' });
+      assert.equal(refused.ok, false, `backupOldUsageReminderGb=${String(bad)} must be refused`);
+      assert.equal(refused.reason_code, 'BACKUP_CONFIG_INVALID');
+      assert.match(refused.detail, /backupOldUsageReminderGb must be a non-negative number/u);
+    }
+  });
 });
 
 describe('subplugin: the route and the timer', () => {
@@ -262,10 +286,10 @@ describe('subplugin: the route and the timer', () => {
     try {
       const fake = fakeCtx();
       apply(fake.ctx, { backupDir: join(dir, 'repo'), dshHome: home, backupMachineKey: false, ...NO_FIRE });
-      assert.equal(fake.registrations.length, 6, 'v3.4.8 adds restore/archive/verify/unlock; the register repair adds the sixth');
+      assert.equal(fake.registrations.length, 7, 'v3.4.8 adds restore/archive/verify/unlock; the register repair adds the sixth; the old/ usage ack route is the seventh');
       assert.deepEqual(
         fake.registrations.map((row) => row.path).sort(),
-        [BACKUP_RUN_ROUTE_PATH, BACKUP_RESTORE_ROUTE_PATH, BACKUP_ARCHIVE_ROUTE_PATH, BACKUP_VERIFY_ROUTE_PATH, BACKUP_UNLOCK_ROUTE_PATH, BACKUP_REGISTER_ROUTE_PATH].sort(),
+        [BACKUP_RUN_ROUTE_PATH, BACKUP_RESTORE_ROUTE_PATH, BACKUP_ARCHIVE_ROUTE_PATH, BACKUP_VERIFY_ROUTE_PATH, BACKUP_UNLOCK_ROUTE_PATH, BACKUP_REGISTER_ROUTE_PATH, BACKUP_OLD_USAGE_ACK_ROUTE_PATH].sort(),
       );
       assert.deepEqual(fake.registrations.find((row) => row.path === BACKUP_RUN_ROUTE_PATH).methods, ['GET', 'POST']);
       assert.deepEqual(fake.registrations.find((row) => row.path === BACKUP_RUN_ROUTE_PATH).methods, ['GET', 'POST']);
@@ -1732,5 +1756,284 @@ describe('subplugin: the in-host register repair route (G2)', () => {
       cleanup();
       cleanHome();
     }
+  });
+});
+
+describe('subplugin: the old/ usage reminder and its acknowledgement route (24.3)', () => {
+  /** Mount the real subplugin with a tiny reminder threshold (GB on the row, bytes in the engine). */
+  function mountWithReminder(home, repo, reminderGb, deps = {}) {
+    const fake = fakeCtx();
+    apply(fake.ctx, {
+      backupDir: repo,
+      dshHome: home,
+      backupMachineKey: false,
+      backupFutureAppend: false,
+      // 1e-9 GB rounds to 1 byte, so a few hundred bytes of version record is over the reminder: this exercises the
+      // reminder plumbing, not a 10 GiB fixture.
+      backupOldUsageReminderGb: reminderGb,
+      ...NO_FIRE,
+    }, deps);
+    const find = (path) => fake.registrations.find((row) => row.path === path);
+    const readRun = async () => (await find(BACKUP_RUN_ROUTE_PATH).fetch(new Request(`http://local.invalid${BACKUP_RUN_ROUTE_PATH}`, { method: 'GET' }))).json();
+    const runOnce = async () => (await find(BACKUP_RUN_ROUTE_PATH).fetch(new Request(`http://local.invalid${BACKUP_RUN_ROUTE_PATH}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ confirm: RUN_CONFIRM_TOKEN }),
+    }))).json();
+    return { fake, find, readRun, runOnce };
+  }
+
+  it('persists state.old_usage, exposes it on /run and the embedded /status, and acknowledges only with the token', async () => {
+    const { home, files, cleanup: cleanHome } = homeFixture();
+    const { dir, cleanup } = tempDir('w2m-run-old-usage-');
+    try {
+      const repo = join(dir, 'repo');
+      const { fake, find, readRun, runOnce } = mountWithReminder(home, repo, 1e-9);
+      const ackRoute = find(BACKUP_OLD_USAGE_ACK_ROUTE_PATH);
+      assert.ok(ackRoute !== undefined, 'the acknowledgement route is mounted with the subplugin');
+      assert.deepEqual(ackRoute.methods, ['POST']);
+
+      // First run: no old/ tree yet -> measured, not due, and persisted.
+      const first = await runOnce();
+      assert.equal(first.ok, true, `${first.reason_code}: ${first.detail}`);
+      assert.equal(first.old_usage.due, false);
+      assert.equal(first.old_usage.bytes, 0);
+      const afterFirst = await readRun();
+      assert.equal(afterFirst.old_usage_reminder_gb, 1e-9, 'the describe payload names the configured reminder');
+      assert.equal(afterFirst.state.old_usage.due, false);
+      assert.equal(afterFirst.state.old_usage.ack_bytes, 0);
+      assert.equal(afterFirst.status.old_usage.pending, false, 'the embedded /status payload carries the same decision');
+
+      // Second run: the changed session rotates and writes a version record -> growth over 1 byte is due.
+      writeFileSync(files['session-aaaaaaaa-0001'], sessionLog('session-aaaaaaaa-0001', [event(0), event(1), event(2)]));
+      const second = await runOnce();
+      assert.equal(second.ok, true, `${second.reason_code}: ${second.detail}`);
+      assert.equal(second.rotated, 1);
+      assert.equal(second.old_usage.due, true);
+      assert.ok(second.warnings.some((line) => line.includes('old/ 已增长')));
+      const persisted = readBackupState(home).state;
+      assert.equal(persisted.old_usage.due, true, 'the run persists the pending record');
+      assert.equal(persisted.old_usage.bytes, second.old_usage.bytes);
+      assert.equal(persisted.old_usage.files, second.old_usage.files);
+      assert.equal(persisted.old_usage.ack_bytes, 0);
+      assert.equal(persisted.old_usage.reminder_bytes, 1);
+      assert.equal(typeof persisted.old_usage.at, 'string');
+      assert.equal(persisted.old_usage_ack_bytes, 0);
+      const pendingDescribe = await readRun();
+      assert.equal(pendingDescribe.state.old_usage.due, true, 'GET /run exposes the pending reminder');
+      assert.equal(pendingDescribe.status.old_usage.pending, true, 'the embedded /status payload shows it as pending');
+      assert.ok(pendingDescribe.status.old_usage.bytes > 0);
+
+      // The ack route: token required; a valid ack moves the mark to the current bytes, clears due, deletes nothing.
+      const oldVersionsBefore = listOldVersions(repo).length;
+      assert.ok(oldVersionsBefore > 0);
+      const refused = await ackRoute.fetch(new Request(`http://local.invalid${BACKUP_OLD_USAGE_ACK_ROUTE_PATH}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ confirm: 'nope' }),
+      }));
+      assert.equal(refused.status, 400);
+      assert.equal((await refused.json()).reason_code, 'BACKUP_CONFIRM_REQUIRED');
+      const acked = await ackRoute.fetch(new Request(`http://local.invalid${BACKUP_OLD_USAGE_ACK_ROUTE_PATH}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ confirm: OLD_USAGE_ACK_CONFIRM_TOKEN }),
+      }));
+      assert.equal(acked.status, 200);
+      const ackBody = await acked.json();
+      assert.equal(ackBody.ok, true);
+      assert.equal(ackBody.deleted, false, 'acknowledging is never a deletion');
+      assert.equal(ackBody.state.old_usage.due, false);
+      assert.equal(ackBody.old_usage_ack_bytes, ackBody.old_usage.bytes);
+      assert.equal(ackBody.old_usage.due, false);
+      assert.equal(ackBody.old_usage.since_last_ack_bytes, 0);
+      assert.equal(listOldVersions(repo).length, oldVersionsBefore, 'the acknowledgement deleted no old version');
+      const ackedState = readBackupState(home).state;
+      assert.equal(ackedState.old_usage_ack_bytes, ackBody.old_usage.bytes);
+      assert.equal(ackedState.old_usage.due, false);
+      assert.equal(ackedState.old_usage.bytes, ackBody.old_usage.bytes);
+      const quiet = await readRun();
+      assert.equal(quiet.state.old_usage.due, false, 'the same state clears the panel banner');
+      assert.equal(quiet.status.old_usage.pending, false);
+      assert.ok(fake.logs.some((entry) => entry.level === 'info' && entry.message.includes('acknowledged')));
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+
+  it('keeps 0 = reminders off end-to-end: a rotated old/ tree is measured but never due', async () => {
+    const { home, files, cleanup: cleanHome } = homeFixture();
+    const { dir, cleanup } = tempDir('w2m-run-old-usage-off-');
+    try {
+      const repo = join(dir, 'repo');
+      const { find, readRun, runOnce } = mountWithReminder(home, repo, 0);
+      assert.equal((await runOnce()).ok, true);
+      writeFileSync(files['session-aaaaaaaa-0001'], sessionLog('session-aaaaaaaa-0001', [event(0), event(1), event(2)]));
+      const second = await runOnce();
+      assert.equal(second.ok, true, second.detail);
+      assert.ok(second.old_usage.bytes > 0, 'the tree is still measured');
+      assert.equal(second.old_usage.reminder_bytes, 0);
+      assert.equal(second.old_usage.due, false);
+      assert.deepEqual(second.warnings ?? [], [], 'no reminder warning when reminders are off');
+      const state = readBackupState(home).state;
+      assert.equal(state.old_usage.due, false);
+      assert.equal(state.old_usage.reminder_bytes, 0);
+      const describe = await readRun();
+      assert.equal(describe.status.old_usage.pending, false);
+      // 0-only runs are still mountable and the ack route exists (it is harmless: it just moves the mark).
+      assert.ok(find(BACKUP_OLD_USAGE_ACK_ROUTE_PATH) !== undefined);
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+
+  it('the scheduled path (no person) persists the due state without blocking or deleting', async () => {
+    const { home, files, cleanup: cleanHome } = homeFixture();
+    const { dir, cleanup } = tempDir('w2m-run-old-usage-scheduled-');
+    try {
+      const repo = join(dir, 'repo');
+      const harness = schedulerHarness();
+      const { find, readRun } = mountWithReminder(home, repo, 1e-9, { createScheduler: harness.createScheduler });
+      // First scheduled run: no old/ yet.
+      const first = await harness.captured.options.run();
+      assert.equal(first.ok, true, first.detail);
+      assert.equal(first.old_usage.due, false);
+      // The 22:00 slot has no person to ask: the changed session rotates, the reminder is recorded as state, and the
+      // timer returns normally (never waits for an acknowledgement).
+      writeFileSync(files['session-aaaaaaaa-0001'], sessionLog('session-aaaaaaaa-0001', [event(0), event(1), event(2)]));
+      const second = await harness.captured.options.run();
+      assert.equal(second.ok, true, second.detail);
+      assert.equal(second.old_usage.due, true);
+      const persisted = readBackupState(home).state;
+      assert.equal(persisted.old_usage.due, true, 'the scheduled run persists the pending reminder for the panel');
+      assert.equal(persisted.old_usage.bytes, second.old_usage.bytes);
+      assert.equal(persisted.old_usage.ack_bytes, 0);
+      assert.ok(persisted.old_usage.bytes > 0);
+      // The panel phase reads it from GET /run after the fact.
+      const describe = await readRun();
+      assert.equal(describe.state.old_usage.due, true);
+      assert.ok(find(BACKUP_OLD_USAGE_ACK_ROUTE_PATH) !== undefined);
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+});
+
+describe('cli: the old/ usage reminder output and flag (24.3)', () => {
+  /** Recorded stdout/stderr for one CLI invocation (the helper lives in the other CLI describe, so repeat it here). */
+  const capture = () => {
+    const lines = [];
+    return { lines, io: { stdout: (text) => lines.push(text), stderr: (text) => lines.push(text), env: {} } };
+  };
+
+  it('parses --old-usage-reminder-gb and refuses invalid values with exit code 2', () => {
+    const env = { W2M_BACKUP_NO_MACHINE_KEY: '1' };
+    assert.equal(parseArgs(['run', '--old-usage-reminder-gb', '5'], env).oldUsageReminderGb, 5);
+    assert.equal(parseArgs(['run', '--old-usage-reminder-gb=0'], env).oldUsageReminderGb, 0);
+    assert.equal(parseArgs(['run', '--old-usage-reminder-gb=0.5'], env).oldUsageReminderGb, 0.5);
+    assert.equal(parseArgs(['run'], env).oldUsageReminderGb, null, 'absent means the engine default');
+    for (const argv of [['--old-usage-reminder-gb'], ['--old-usage-reminder-gb', 'lots'], ['--old-usage-reminder-gb=-1'], ['--old-usage-reminder-gb=NaN']]) {
+      const bad = capture();
+      assert.equal(main(['run', ...argv], { ...bad.io, env, password: PASSWORD }), 2, argv.join(' '));
+      assert.match(bad.lines.join('\n'), /--old-usage-reminder-gb needs a non-negative number of GB/u);
+    }
+  });
+
+  it('formats the old usage line for run, status and gc, and the due warning plus manual gc hint', () => {
+    const GiB = 1024 ** 3;
+    const dueReport = {
+      bytes: 10 * GiB,
+      files: 3,
+      reminder_bytes: 10 * GiB,
+      due: true,
+      since_last_ack_bytes: 10 * GiB,
+      next_reminder_at_bytes: 20 * GiB,
+    };
+    const runText = formatRun({
+      ok: true,
+      dry_run: false,
+      scope: 'all',
+      skipped_sessions: 0,
+      snapshot_id: 'snap-1',
+      sessions: 1,
+      files: 1,
+      bytes: 10,
+      blocks_new: 1,
+      blocks_reused: 0,
+      dedupe_ratio: 0,
+      bytes_read: 10,
+      bytes_written: 10,
+      rotated: 1,
+      keep_old_per_session: 10,
+      max_old_version_days: 0,
+      old_format: 'records',
+      old_usage: dueReport,
+      warnings: ['old/ 已增长 10 GB，自上次确认以来超过 10 GB；是否手动清理？'],
+      duration_ms: 5,
+    });
+    assert.match(runText, /old usage {5}: 10 GB \(3 files\)/u);
+    assert.match(runText, /是否手动清理/u);
+    assert.match(runText, /w2m-backup gc --dry-run/u, 'the hint tells the operator to preview the manual cleanup first');
+    assert.equal(runText.match(/old\/ 已增长/gu).length, 1, 'the reminder line appears exactly once (engine warning)');
+    const quietRun = formatRun({
+      ok: true,
+      dry_run: false,
+      scope: 'all',
+      skipped_sessions: 0,
+      snapshot_id: 'snap-2',
+      sessions: 1,
+      files: 1,
+      bytes: 10,
+      blocks_new: 0,
+      blocks_reused: 1,
+      dedupe_ratio: 1,
+      bytes_read: 10,
+      bytes_written: 0,
+      rotated: 0,
+      keep_old_per_session: 10,
+      max_old_version_days: 0,
+      old_format: 'records',
+      old_usage: { ...dueReport, due: false, since_last_ack_bytes: 0 },
+      warnings: [],
+      duration_ms: 5,
+    });
+    assert.match(quietRun, /old usage {5}: 10 GB \(3 files\)/u);
+    assert.equal(quietRun.includes('w2m-backup gc --dry-run'), false, 'no cleanup hint when nothing is due');
+
+    const statusText = formatStatus({
+      ok: true,
+      dsh_home: 'C:\\Users\\x\\.dsh',
+      repository: { root: 'D:\\BackUP', exists: true, is_file: false, initialized: true, writable: true, free_bytes: 1024, counts: { objects: 0, snapshots: 1, old: 3 } },
+      schedule: { times: ['22:00:00'], time_zone: 'Asia/Shanghai', implemented: true },
+      old_usage: { ...dueReport, ack_bytes: 0, pending: true, last_measured_at: '2026-11-17T14:00:00.000Z' },
+    });
+    assert.match(statusText, /old usage {5}: 10 GB \(3 file\(s\)\)/u);
+    assert.match(statusText, /reminder {6}: pending/u);
+    const quietStatus = formatStatus({
+      ok: true,
+      dsh_home: 'C:\\Users\\x\\.dsh',
+      repository: { root: 'D:\\BackUP', exists: true, is_file: false, initialized: true, writable: true, free_bytes: 1024, counts: { objects: 0, snapshots: 1, old: 0 } },
+      schedule: { times: ['22:00:00'], time_zone: 'Asia/Shanghai', implemented: true },
+      old_usage: { ...dueReport, bytes: 0, files: 0, due: false, pending: false, since_last_ack_bytes: 0, ack_bytes: 0 },
+    });
+    assert.match(quietStatus, /reminder {6}: none/u);
+
+    const gcText = formatGc({
+      safe: true,
+      dry_run: true,
+      references: { blocks: 0, snapshots: 0, old: 2, current: 0 },
+      blocks: { scanned: 0, removed: 0, kept: 0, reclaimed_bytes: 0 },
+      old_versions: { pruned: 0, pruned_by_age: 0, full_copies_pruned: 0 },
+      orphan_full_copies: { scanned: 0, removed: 0, reclaimed_bytes: 0 },
+      tmp: { scanned: 0, removed: 0, reclaimed_bytes: 0 },
+      empty_prefixes_removed: 0,
+      old_usage: { before: { bytes: 10 * GiB, files: 2 }, after: { bytes: 5 * GiB, files: 1 } },
+      problems: [],
+      reason_code: null,
+    });
+    assert.match(gcText, /old usage before\/after: 10 GB -> 5 GB/u);
   });
 });

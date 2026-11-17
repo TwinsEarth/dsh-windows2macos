@@ -1092,6 +1092,8 @@ old/<ws>/<sid>/<ts>-<sha12>.json.enc   # full 新增：该版本的整文件密�
 | 整文件副本 cap | `runBackup({maxFullCopyBytes, allowLargeFullCopy})` / 配置 `backupFullCopyMaxMb`（缺省 300，`0` = 不设上限）/ CLI `--max-full-copy-mb <n>` 与 `--allow-large-full-copy`；写盘前拒绝见 §24.2 |
 | 错误码 | `BACKUP_ROTATION_FORMAT_INVALID`（未知 `oldFormat`，写盘前）、`BACKUP_ROTATION_WRITE_FAILED`（副本或记录写失败） |
 | cap 错误码 | `BACKUP_FULL_COPY_APPROVAL_REQUIRED`（`full` 副本超限且未特批，写盘前、零写入，见 §24.2） |
+| `old/` 用量提醒 | `runBackup({oldUsageReminderBytes, oldUsageAckBytes})` / 配置 `backupOldUsageReminderGb`（缺省 10，`0` = 关闭提醒）/ CLI `--old-usage-reminder-gb <n>`；结果恒有 `old_usage`，见 §24.3 |
+| 用量确认路由 | `POST /api/w2m/backup/old-usage/ack`，请求体 `{"confirm":"ack"}`；只移动确认水位，**不删除任何文件**，见 §24.3 |
 
 **兼容性**：记录的 `format`/`version` 字段不变（仍 `w2m-session-backup/old-version` v1），`full_copy` 只是新增
 可选字段；`listOldVersions`/`readOldRecords` 只认 `.json`，`.json.enc` 不会被当记录读取；`verify` 仍按记录
@@ -1233,6 +1235,73 @@ flag 解析/退出码、非 TTY 打印 flag 不提问、注入 TTY 的 y/N 两�
 两者可能相差一次追加；这是"写盘前拒绝"必须接受的近似，偏差方向是可能多问一次批准，而不会少问。批准**只对
 一次运行**有效，不会改变配置、不会永久关闭 cap；要永久关闭必须显式配置 `0` 并承担无限副本的代价。本次不 bump
 版本号、不跑 preflight、不提交。
+
+### 24.3 `old/` 总量不设上限：每增长 10 GB 提醒、由用户决定是否手动清理（v3.5.0）
+
+**用户决定**：`old/` **总量不设上限**；每增加 10 GB 提醒用户一次，是否手动清理由用户决定。所以本版**不加任何
+总量上限**，只加"测量 + 提醒 + 确认"三件事：§24.2 的每份整文件副本 300 MB 上限、§13/§21 的每会话保留规则全部
+不变，`old/` 的增长从"隐形"变成"可见、可确认"。
+
+**测量与报告**：每次成功备份在**轮转与剪枝之后**（此时 `old/` 是最终状态）做一次只读目录遍历
+（`rotation.measureOldUsage`：`readdirSync` + `statSync`，不读文件内容），统计 `old/` 下**普通文件**的总字节数与
+文件数；目录不存在 = 0 字节 / 0 文件。结果恒带：
+
+```js
+old_usage: { bytes, files, reminder_bytes, due, since_last_ack_bytes, next_reminder_at_bytes }
+```
+
+**阈值语义：自上次确认以来的增长，不是固定 10/20/30 阶梯**。持久化的确认水位是 `old_usage_ack_bytes`（缺省 0）：
+
+```
+due = reminder_bytes > 0 && bytes - ack_bytes >= reminder_bytes
+since_last_ack_bytes = max(0, bytes - ack_bytes)
+next_reminder_at_bytes = reminder_bytes > 0 ? ack_bytes + reminder_bytes : null
+```
+
+所以确认过 40 GB 的用户不会在 50 GB 再被提醒一次，从未确认的用户在 10 GB 就会。`reminder_bytes = 0` 表示
+**关闭提醒**（`due` 恒 false），不是"立刻提醒"。
+
+**接口面**：
+
+| 入口 | 形状 | 缺省 |
+|---|---|---|
+| 常量 | `DEFAULT_OLD_USAGE_REMINDER_BYTES = 10 * 1024 ** 3`（10 GiB，`rotation.mjs`） | 10 GiB |
+| 引擎 | `runBackup({oldUsageReminderBytes, oldUsageAckBytes})`；`due` 时把提醒行加入 `warnings`，成功结果恒有 `old_usage` | 10 GiB；ack 0 |
+| 插件配置 | `backupOldUsageReminderGb: <非负数字>`（GB；`0` = 关闭提醒；非法值拒绝挂载 `BACKUP_CONFIG_INVALID`） | `10` |
+| CLI | `run --old-usage-reminder-gb <n>`（`0` = 关闭；非法值退出码 2）；`run` 打印 `old usage`，`status` 打印占用与是否 pending，`gc` 打印 `old usage before/after : X GB -> Y GB` | 10 GB |
+| 持久化 | `<DSH_HOME>/xclient/w2m-backup/state.json` 的 `state.old_usage = {due, bytes, files, ack_bytes, reminder_bytes, at}` 与 `state.old_usage_ack_bytes` | — |
+| 确认路由 | `POST /api/w2m/backup/old-usage/ack`，请求体必须是 `{"confirm":"ack"}`；把 `old_usage_ack_bytes` 设为**现在测得的字节数**、清掉 `state.old_usage.due`、返回新 state。**不删除任何文件** | — |
+| 面板 | `[data-w2m-backup-old-usage]` 提醒卡：`old/ 已占用 X GB（自上次确认增加 Y GB）：建议手动清理` + 「知道了」（走确认路由）+「如何清理」（展开 `w2m-backup gc --dry-run` → `w2m-backup gc --max-old-days <n>` / 每会话保留份数的指引）。**没有删除按钮** | — |
+
+**提醒文案与手动清理**：`due` 时引擎的 warning 是
+`old/ 已增长 X GB，自上次确认以来超过 10 GB；是否手动清理？`；CLI 另外打印
+`hint : nothing was deleted; run w2m-backup gc --dry-run first, then w2m-backup gc ...`。
+清理是**操作者的显式动作**：`w2m-backup gc --dry-run` 先看计划，`w2m-backup gc`（可加 `--max-old-days <n>`，
+或调低 `keepOldPerSession`）再执行；`gc` 沿用 §13/§24 的同一套引用与保留规则，并在本次运行前后各测一次 `old/`
+打印 `before -> after`。任何时候都**不会**因为"超过 10 GB"自动删除任何东西。
+
+**测试**（挂在既有套件上，无新测试文件）：`test/backup-rotation.test.mjs`（`resolveOldUsageReminderBytes` 归一化、
+`measureOldUsage` 缺失目录 = 0 / 记录 JSON + `full_copy` 的 `.enc` 都计入、`buildOldUsageReport` 阈值边界
+（恰好等于阈值时 due、ack 之后按增长计算、ack 大于当前大小时增长为 0、`reminder_bytes: 0` 关闭）、提醒文案）；
+`test/backup-engine.test.mjs`（注入 1 字节阈值：`records` 与 `full` 两种 `old/` 都在 `old_usage.bytes` 的手算值里、
+due true/false、提醒为 0 时 due 恒 false、due 触发时 `old/` 文件列表前后不变——不删除）；`test/backup-gc.test.mjs`
+（`old_usage.before/after`）；`test/backup-run.test.mjs`（配置归一化/非法值拒绝挂载、定时运行持久化 due 的
+`state.old_usage`、确认路由缺令牌被拒/确认后 ack 字节 = 当前测量且 due 清除、`/status` 与 `/run` 内嵌状态暴露、
+`old/` 文件零删除、CLI 三行输出与 `--old-usage-reminder-gb` 解析）；`test/client-bundle.test.mjs`（due 时提醒卡
+文案含字节与增长、中英字典、「知道了」只 POST `{confirm:'ack'}` 且卡片消失、「如何清理」展开 gc 指引、无删除动作）。
+
+**诚实边界**：
+
+* **这是一次 O(文件数) 的目录遍历**：不读文件内容，但 `old/` 的全量 `readdir`+`stat` 在记录极多（尤其 `full` 的
+  `.json.enc` 很多）时会随文件数线性增长；它在快照**提交之后**运行，所以遍历慢不会让备份失败，只会让结果/提醒
+  晚一点出现。面板的 `/status` 也会在读取时做这一次遍历（所以看到的是"现在的磁盘占用"，不是上次运行时的快照）。
+* **`bytes` 包含记录 JSON 与整文件副本密文**：`old/` 下的普通文件都计入——记录几百字节、`full` 模式的
+  `<ts>-<sha12>.json.enc` 是整份密文（含 36 字节信封开销）。所以"10 GB"是这两类文件之和，不是"旧版本原始字节"。
+* **提醒不判断"值不值得清理"**：它只看增长量；确认水位只在你点「知道了」/ 调用确认路由时移动，删除文件不会自动
+  下调水位（当前字节数低于水位时增长按 0 计算，因此不会立刻再提醒，直到重新长回 `ack + reminder`）。
+* **不是保留策略**：本功能不改变任何剪枝规则；要真正清理只能跑 `gc`（或调低保留份数）。面板、引擎、CLI 都**没有**
+  "按大小自动删除"的路径，这是用户决定的一部分。
+* 本次不 bump 版本号（仍 3.5.0）、不跑 preflight、不提交。
 
 ## 25. 保护模式（用户最终决定：便捷优先，不是绝对保密，2026-11-17）
 

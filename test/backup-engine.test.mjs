@@ -913,3 +913,177 @@ describe('engine: the oldFormat full whole-file copy cap and its explicit approv
     }
   });
 });
+describe('engine: the old/ usage measurement and the growth reminder (24.3)', () => {
+  /** Manual `old/` walk: the hand calculation the engine's report is compared against. */
+  function manualOldUsage(root) {
+    let bytes = 0;
+    let files = 0;
+    const walk = (dir) => {
+      let entries;
+      try {
+        entries = readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        const full = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          walk(full);
+          continue;
+        }
+        if (!entry.isFile()) continue;
+        bytes += statSync(full).size;
+        files += 1;
+      }
+    };
+    walk(join(root, 'old'));
+    return { bytes, files };
+  }
+
+  /** Repository-relative file list under `old/`, to prove a reminder deleted nothing. */
+  function oldFiles(root) {
+    const out = [];
+    const walk = (dir) => {
+      let entries;
+      try {
+        entries = readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const entry of entries) {
+        const full = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          walk(full);
+          continue;
+        }
+        if (entry.isFile()) out.push(relative(root, full).split('\\').join('/'));
+      }
+    };
+    walk(join(root, 'old'));
+    return out.sort();
+  }
+
+  it('measures records and sealed full copies in the real repository, reports under/over the reminder, and deletes nothing', () => {
+    const { home, cleanup: cleanHome } = homeFixture();
+    const { root, cleanup } = repoFixture();
+    try {
+      const target = join(home, 'sessions', '--E-GPT--', 'session-aaaaaaaa-0001', 'session.v4.jsonl.zstd');
+      const first = run(root, home, { oldUsageReminderBytes: 1 });
+      assert.equal(first.ok, true, first.detail);
+      assert.deepEqual(first.old_usage, {
+        bytes: 0,
+        files: 0,
+        reminder_bytes: 1,
+        due: false,
+        since_last_ack_bytes: 0,
+        next_reminder_at_bytes: 1,
+      }, 'a fresh repository has no old/ files, so nothing is due');
+
+      // records mode: one record-only old version, and the reminder is injected as 1 byte so the tiny fixture is due.
+      writeFileSync(target, sessionLog('session-aaaaaaaa-0001', [event(0), event(1), event(2)]));
+      const second = run(root, home, { oldUsageReminderBytes: 1 });
+      assert.equal(second.ok, true, second.detail);
+      assert.equal(second.rotated, 1);
+      const afterRecords = manualOldUsage(root);
+      assert.ok(afterRecords.bytes > 0, 'the fixture really has an old record');
+      assert.equal(second.old_usage.bytes, afterRecords.bytes, 'records mode bytes equal the hand sum');
+      assert.equal(second.old_usage.files, afterRecords.files);
+      assert.equal(second.old_usage.due, true, 'growth over a 1-byte reminder is due');
+      assert.equal(second.old_usage.since_last_ack_bytes, afterRecords.bytes);
+
+      // full mode adds one sealed whole-file copy beside its record; both shapes are counted.
+      writeFileSync(target, sessionLog('session-aaaaaaaa-0001', [event(0), event(1), event(2), event(3)]));
+      const third = run(root, home, { oldFormat: 'full', oldUsageReminderBytes: 1 });
+      assert.equal(third.ok, true, third.detail);
+      assert.equal(third.full_old_versions.length, 1);
+      const afterFull = manualOldUsage(root);
+      assert.ok(afterFull.bytes > afterRecords.bytes, 'the sealed copy adds bytes to old/');
+      assert.equal(afterFull.files, afterRecords.files + 2, 'one record plus one sealed copy were added');
+      assert.equal(third.old_usage.bytes, afterFull.bytes, 'full mode bytes equal the hand sum');
+      assert.equal(third.old_usage.files, afterFull.files);
+      assert.equal(third.old_usage.due, true);
+      assert.ok(
+        third.warnings.some((line) => typeof line === 'string' && line.includes('old/ 已增长') && line.includes('是否手动清理')),
+        'due adds the reminder warning (a question, not an action)',
+      );
+
+      // A reminder is not an action: the next unchanged run measures exactly the same tree and deletes nothing.
+      const before = oldFiles(root);
+      const fourth = run(root, home, { oldUsageReminderBytes: 1 });
+      assert.equal(fourth.ok, true, fourth.detail);
+      assert.deepEqual(oldFiles(root), before, 'handling the reminder must not delete a file');
+      assert.equal(fourth.old_usage.bytes, third.old_usage.bytes, 'an unchanged session rotates nothing');
+      assert.equal(fourth.rotated, 0);
+
+      // A dry run is read-only and still reports the current tree (same bytes, no write).
+      const dry = run(root, home, { dryRun: true });
+      assert.equal(dry.ok, true, dry.detail);
+      assert.deepEqual(dry.old_usage.bytes, manualOldUsage(root).bytes);
+      assert.deepEqual(oldFiles(root), before, 'a dry run must not delete either');
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+
+  it('computes due from growth since the acknowledgement and treats 0 as reminders off', () => {
+    const { home, cleanup: cleanHome } = homeFixture();
+    const { root, cleanup } = repoFixture();
+    try {
+      const target = join(home, 'sessions', '--E-GPT--', 'session-aaaaaaaa-0001', 'session.v4.jsonl.zstd');
+      assert.equal(run(root, home).ok, true);
+      writeFileSync(target, sessionLog('session-aaaaaaaa-0001', [event(0), event(1), event(2)]));
+      const measured = run(root, home, { oldUsageReminderBytes: 1 });
+      assert.equal(measured.ok, true, measured.detail);
+      const bytes = measured.old_usage.bytes;
+      assert.ok(bytes > 2, 'the fixture is large enough for the arithmetic below');
+
+      // 0 disables due, and reports that fact rather than pretending the tree is small.
+      const off = run(root, home, { oldUsageReminderBytes: 0 });
+      assert.equal(off.old_usage.reminder_bytes, 0);
+      assert.equal(off.old_usage.due, false);
+      assert.equal(off.old_usage.next_reminder_at_bytes, null);
+      assert.equal(off.old_usage.bytes, bytes);
+
+      // A reminder larger than the tree is not due yet; next_reminder_at_bytes names the absolute size that would be.
+      const quiet = run(root, home, { oldUsageReminderBytes: bytes + 1 });
+      assert.equal(quiet.old_usage.due, false);
+      assert.equal(quiet.old_usage.next_reminder_at_bytes, bytes + 1);
+
+      // An ack at the current size means 0 growth: quiet until the tree grows by the reminder again.
+      const acked = run(root, home, { oldUsageReminderBytes: 1, oldUsageAckBytes: bytes });
+      assert.equal(acked.old_usage.due, false);
+      assert.equal(acked.old_usage.since_last_ack_bytes, 0);
+      assert.equal(acked.old_usage.next_reminder_at_bytes, bytes + 1);
+
+      // An ack below the current size means the growth already crosses the threshold: due again.
+      const grown = run(root, home, { oldUsageReminderBytes: 1, oldUsageAckBytes: bytes - 1 });
+      assert.equal(grown.old_usage.due, true, 'growth since the ack is what the reminder measures');
+      assert.equal(grown.old_usage.since_last_ack_bytes, 1);
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+
+  it('refuses an invalid reminder before creating the repository; a corrupt ack is read as 0', () => {
+    const { home, cleanup: cleanHome } = homeFixture();
+    const { dir, cleanup } = tempDir('w2m-engine-old-usage-invalid-');
+    try {
+      const repo = join(dir, 'repo');
+      const refused = runBackup({ root: repo, dshHome: home, password: PASSWORD, platform: PLATFORM, oldUsageReminderBytes: -1 });
+      assert.equal(refused.ok, false);
+      assert.equal(refused.reason_code, 'BACKUP_ROTATION_POLICY_INVALID');
+      assert.match(refused.detail, /oldUsageReminderBytes must be 0/u);
+      assert.equal(existsSync(repo), false, 'the refusal happens before ensureLayout');
+
+      // A corrupt persisted ack (undefined / negative / a string) is treated as "never acknowledged", never as a
+      // silently suppressed reminder.
+      assert.equal(runBackup({ root: repo, dshHome: home, password: PASSWORD, platform: PLATFORM, oldUsageAckBytes: -5 }).ok, true);
+      assert.equal(runBackup({ root: repo, dshHome: home, password: PASSWORD, platform: PLATFORM, oldUsageAckBytes: 'lots' }).ok, true);
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+});

@@ -3270,6 +3270,151 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
     assert.equal(document.appended.length, 1, 'a second mount in the same document reuses the one stylesheet');
     second.unmount();
   });
+
+  // -------------------------------------------------------------------------------------------
+  // v3.5.0 §24.3: old/ has NO total cap; the growth reminder is acknowledged, never deleted
+  // -------------------------------------------------------------------------------------------
+
+  it('registers the old/ usage reminder strings in both dictionaries', () => {
+    const { exports } = loadBundle();
+    const registry = makeRegistry();
+    const locale = makeLocale();
+    const ctx = makeStrictContext({ inject: [...exports.inject], services: { slots: registry, locale } });
+    exports.apply(ctx);
+    const dictionary = locale.registered.get('w2m.target');
+    assert.ok(dictionary !== undefined, 'the dictionaries reach the locale service');
+    const keys = [
+      'panel.backup.oldUsage.title',
+      'panel.backup.oldUsage.banner',
+      'panel.backup.oldUsage.hint',
+      'panel.backup.oldUsage.ack',
+      'panel.backup.oldUsage.howTo',
+      'panel.backup.oldUsage.guidance',
+      'panel.backup.oldUsage.ackDone',
+      'panel.backup.busy.oldUsageAck',
+      'panel.backup.log.ackOldUsage',
+    ];
+    for (const key of keys) {
+      assert.equal(typeof dictionary.zh[key], 'string', `the zh dictionary has ${key}`);
+      assert.equal(typeof dictionary.en[key], 'string', `the en dictionary has ${key}`);
+      assert.notEqual(dictionary.zh[key].trim(), '', `the zh value for ${key} is not empty`);
+      assert.notEqual(dictionary.en[key].trim(), '', `the en value for ${key} is not empty`);
+    }
+    assert.equal(dictionary.zh['panel.backup.oldUsage.ack'], '知道了');
+    assert.equal(dictionary.zh['panel.backup.oldUsage.howTo'], '如何清理');
+    assert.ok(dictionary.zh['panel.backup.oldUsage.banner'].includes('old/ 已占用'), 'the banner text names old/ and its size');
+    assert.ok(dictionary.zh['panel.backup.oldUsage.banner'].includes('建议手动清理'));
+    assert.ok(
+      dictionary.zh['panel.backup.oldUsage.banner'].includes('{bytes}') && dictionary.zh['panel.backup.oldUsage.banner'].includes('{growth}'),
+      'the banner keeps both size placeholders',
+    );
+    assert.ok(dictionary.zh['panel.backup.oldUsage.guidance'].includes('w2m-backup gc --dry-run'), 'the guidance starts with the preview command');
+    assert.ok(dictionary.zh['panel.backup.oldUsage.guidance'].includes('w2m-backup gc --max-old-days <n>'));
+    assert.notEqual(dictionary.zh['panel.backup.oldUsage.ack'], dictionary.en['panel.backup.oldUsage.ack'],
+      'both languages are real translations');
+  });
+
+  it('renders the due old/ reminder with exactly two non-destructive actions and stays quiet when not due', () => {
+    const { exports } = loadBundle();
+    const t = exports.makeTranslator(() => undefined);
+    const GiB = 1024 ** 3;
+    const status = {
+      ok: true,
+      enabled: true,
+      old_usage_reminder_gb: 10,
+      state: {
+        running: false,
+        old_usage: { due: true, bytes: 12 * GiB, files: 4, ack_bytes: 2 * GiB, reminder_bytes: 10 * GiB, at: '2026-11-17T14:00:00.000Z' },
+      },
+    };
+    const tree = exports.BackupPanelView(viewProps({ t, status }));
+    const banner = findBy(tree, (node) => node.props?.['data-w2m-backup-old-usage'] === 'true')[0];
+    assert.ok(banner !== undefined, 'a due growth reminder is a visible banner (there is no cap to enforce)');
+    const text = collectText(banner).join('\n');
+    assert.ok(text.includes('old/ 已占用 12 GB'), 'the banner states the current size');
+    assert.ok(text.includes('自上次确认增加 10 GB'), 'the banner states growth since the last acknowledgement');
+    assert.ok(text.includes('建议手动清理'));
+    const ack = findBy(banner, (node) => node.props?.['data-w2m-backup-old-usage-ack'] === 'true')[0];
+    const help = findBy(banner, (node) => node.props?.['data-w2m-backup-old-usage-help'] === 'true')[0];
+    assert.ok(ack !== undefined, '「知道了」 is rendered');
+    assert.ok(help !== undefined, '「如何清理」 is rendered');
+    assert.ok(collectText(ack).join('').includes('知道了'));
+    assert.ok(collectText(help).join('').includes('如何清理'));
+    const buttons = findBy(banner, (node) => node.type === 'button');
+    assert.equal(buttons.length, 2, 'exactly two actions: acknowledge and how-to -- no destructive button');
+    assert.equal(/删除|delete/u.test(collectText(buttons[0]).join('') + collectText(buttons[1]).join('')), false,
+      'neither action promises a deletion');
+    // The gc guidance is collapsed until the operator asks for it.
+    assert.equal(findBy(banner, (node) => node.props?.['data-w2m-backup-old-usage-guidance'] !== undefined).length, 0);
+    const expanded = exports.BackupPanelView(viewProps({ t, status, oldUsageHelpOpen: true }));
+    const guidance = findBy(expanded, (node) => node.props?.['data-w2m-backup-old-usage-guidance'] === 'true')[0];
+    assert.ok(guidance !== undefined, '「如何清理」 expands the gc guidance');
+    const guidanceText = collectText(guidance).join('\n');
+    assert.ok(guidanceText.includes('w2m-backup gc --dry-run'), 'preview first');
+    assert.ok(guidanceText.includes('w2m-backup gc --max-old-days <n>'), 'then the cleanup command');
+    assert.ok(guidanceText.includes('面板不会删除任何文件'), 'the guidance says the panel deletes nothing');
+
+    // Not due (acknowledged, under threshold, or reminders off) = no banner at all.
+    for (const oldUsage of [
+      { due: false, bytes: 12 * GiB, files: 4, ack_bytes: 12 * GiB, reminder_bytes: 10 * GiB },
+      { due: false, bytes: 3 * GiB, files: 1, ack_bytes: 0, reminder_bytes: 10 * GiB },
+      { due: true, bytes: 12 * GiB, files: 4, ack_bytes: 2 * GiB, reminder_bytes: 0 },
+    ]) {
+      const quiet = exports.BackupPanelView(viewProps({ t, status: { ...status, state: { running: false, old_usage: oldUsage } } }));
+      assert.equal(findBy(quiet, (node) => node.props?.['data-w2m-backup-old-usage'] !== undefined).length, 0,
+        `no banner for ${JSON.stringify(oldUsage)}`);
+    }
+  });
+
+  it('acknowledges through the ack route with only the confirmation token and hides the banner', async () => {
+    const GiB = 1024 ** 3;
+    const posts = [];
+    let acknowledged = false;
+    const dueState = { running: false, old_usage: { due: true, bytes: 12 * GiB, files: 4, ack_bytes: 2 * GiB, reminder_bytes: 10 * GiB } };
+    const quietState = { running: false, old_usage: { due: false, bytes: 12 * GiB, files: 4, ack_bytes: 12 * GiB, reminder_bytes: 10 * GiB } };
+    const base = standardBackupHost();
+    const host = mountBackupPage((request) => {
+      if (request.url === '/api/w2m/backup/run' && request.method === 'GET') {
+        return {
+          ok: true,
+          enabled: true,
+          backup_dir: 'D:\\BackUP',
+          full_copy_max_mb: 300,
+          old_usage_reminder_gb: 10,
+          schedule: { times: ['22:00:00'], time_zone: 'UTC' },
+          status: { ok: true, repository: { root: 'D:\\BackUP', initialized: true, counts: { snapshots: 1 }, free_bytes: 1_048_576 } },
+          state: acknowledged ? quietState : dueState,
+        };
+      }
+      if (request.url === '/api/w2m/backup/old-usage/ack' && request.method === 'POST') {
+        posts.push(request.body);
+        acknowledged = true;
+        return {
+          ok: true,
+          deleted: false,
+          old_usage_ack_bytes: 12 * GiB,
+          old_usage: { bytes: 12 * GiB, files: 4, reminder_bytes: 10 * GiB, due: false, since_last_ack_bytes: 0, next_reminder_at_bytes: 22 * GiB },
+        };
+      }
+      return base(request);
+    });
+    try {
+      await host.settle();
+      const banner = findBy(host.handle.tree, (node) => node.props?.['data-w2m-backup-old-usage'] === 'true')[0];
+      assert.ok(banner !== undefined, 'the page shows the reminder the persisted state carries');
+      findBy(banner, (node) => node.props?.['data-w2m-backup-old-usage-ack'] === 'true')[0].props.onClick();
+      await host.settle();
+      assert.deepEqual(posts, [{ confirm: 'ack' }], 'the ack request carries ONLY the confirmation token');
+      assert.equal(findBy(host.handle.tree, (node) => node.props?.['data-w2m-backup-old-usage'] !== undefined).length, 0,
+        'a successful acknowledgement hides the banner');
+      assert.equal(findBy(host.handle.tree, (node) => node.props?.['data-w2m-backup-log-row'] === 'ack-old-usage').length, 1,
+        'the acknowledgement is logged');
+      assert.equal(host.requests.some((request) => /delete|purge|gc/u.test(request.url)), false,
+        'the panel never calls a destructive or gc route');
+    } finally {
+      host.handle.unmount();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------------------------

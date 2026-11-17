@@ -23,6 +23,8 @@ import path from 'node:path';
 
 import { inspectLayout, resolveBackupDir, LAYOUT_CODES, BackupLayoutError } from './layout.mjs';
 import { openRepo } from './repo.mjs';
+import { DEFAULT_OLD_USAGE_REMINDER_BYTES, buildOldUsageReport, measureOldUsage } from './rotation.mjs';
+import { readBackupState } from './runtime-verdict.mjs';
 import { scanHome, summarize } from './scan.mjs';
 import { UNENCRYPTED_WARNING, availablePaths, keysEncryption, passwordHintState, readRepoKeys } from './keystore.mjs';
 
@@ -108,6 +110,31 @@ export function buildStatus(options = {}) {
     ...(repoState === null || repoState.ok ? {} : { repo_error: repoState.error }),
   };
   const ok = inspected.error === null && (repoState === null || repoState.ok);
+  // The `old/` usage reminder (v3.5.0, §24.3). `old/` has no total cap by decision, so the status card answers two
+  // read-only questions: how big the tree is on disk **now** (one walk -- deliberately the current size, not the
+  // size the last run saw), and whether a growth reminder is pending. The acknowledgement mark and the last reminder
+  // record come from the plugin's persisted state (`<DSH_HOME>/xclient/w2m-backup/state.json`); a missing state file
+  // is a normal first run and the documented 10 GiB default is used. Nothing here writes or deletes.
+  const persistedState = readBackupState(dshHome).state;
+  const persistedUsage = persistedState.old_usage !== null && typeof persistedState.old_usage === 'object'
+    ? persistedState.old_usage
+    : null;
+  const ackBytes = Number.isSafeInteger(persistedState.old_usage_ack_bytes) && persistedState.old_usage_ack_bytes >= 0
+    ? persistedState.old_usage_ack_bytes
+    : (Number.isSafeInteger(persistedUsage?.ack_bytes) && persistedUsage.ack_bytes >= 0 ? persistedUsage.ack_bytes : 0);
+  const reminderBytes = Number.isSafeInteger(persistedUsage?.reminder_bytes) && persistedUsage.reminder_bytes >= 0
+    ? persistedUsage.reminder_bytes
+    : DEFAULT_OLD_USAGE_REMINDER_BYTES;
+  const measuredOld = measureOldUsage(backupDir);
+  const oldUsageReport = buildOldUsageReport({ ...measuredOld, ackBytes, reminderBytes });
+  const oldUsage = {
+    ...oldUsageReport,
+    // The report's `due` and this `pending` are the same decision: a reminder is pending exactly when it is due.
+    // Both names exist because the engine's result speaks `due` and the status card speaks "pending".
+    ack_bytes: ackBytes,
+    pending: oldUsageReport.due,
+    last_measured_at: typeof persistedUsage?.at === 'string' ? persistedUsage.at : null,
+  };
   return {
     ok,
     checked_at: new Date().toISOString(),
@@ -117,6 +144,7 @@ export function buildStatus(options = {}) {
     available_paths: available,
     password_hint: passwordHint,
     warning,
+    old_usage: oldUsage,
     schedule: { ...DEFAULT_SCHEDULE },
     read_only: true,
     ...(inspected.error === null ? {} : { reason_code: inspected.error.code, detail: inspected.error.detail }),

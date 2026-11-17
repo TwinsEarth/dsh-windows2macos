@@ -15,7 +15,7 @@ import { LOCK_FILE } from '../src/backup/locks.mjs';
 import { ensureLayout, repoPaths } from '../src/backup/layout.mjs';
 import { buildManifest } from '../src/backup/manifest.mjs';
 import { commitSnapshot, makeSnapshotId } from '../src/backup/repo.mjs';
-import { OLD_FORMAT, writeCurrentPointer, recordSupersededVersion, listOldVersions } from '../src/backup/rotation.mjs';
+import { OLD_FORMAT, writeCurrentPointer, recordSupersededVersion, listOldVersions, measureOldUsage } from '../src/backup/rotation.mjs';
 import { MIN_SCRYPT, randomDek, wrapDek } from '../src/backup/crypto.mjs';
 import { tempDir } from './helpers/backup-fixture.mjs';
 
@@ -499,6 +499,53 @@ describe('gc: whole-file copies (oldFormat: full)', () => {
       assert.equal(result.reason_code, 'BACKUP_GC_UNSAFE');
       assert.equal(result.orphan_full_copies.removed, 0);
       assert.equal(existsSync(orphan), true, 'an unsafe gc deletes nothing, including orphan copies');
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe('gc: old/ usage before and after (24.3)', () => {
+  /** Two record-only old versions of the fixture's session, each with its own block list. */
+  function seedOldVersions(root, entry) {
+    for (let index = 0; index < 2; index += 1) {
+      const sha = String(index + 1).repeat(64);
+      recordSupersededVersion({
+        root,
+        previous: {
+          ...entry,
+          sha256: sha,
+          blocks: [{ index: 0, offset: 0, length: entry.size, sha256: sha }],
+          updated_at: new Date(Date.UTC(2026, 10, 17, index, 0, 0)).toISOString(),
+        },
+        snapshotId: `20261117T0${index}0000Z-deadbeef`,
+        now: new Date(Date.UTC(2026, 10, 17, index, 0, 0)),
+      });
+    }
+  }
+
+  it('reports the old/ tree before and after a pass, and a dry run reports it unchanged', () => {
+    const { root, cleanup, manifest } = repoWithSnapshot();
+    try {
+      seedOldVersions(root, manifest.files[0]);
+
+      const dry = gc({ root, dryRun: true, keepOldPerSession: 1 });
+      assert.equal(dry.safe, true);
+      assert.equal(dry.old_usage.before.files, 2);
+      assert.ok(dry.old_usage.before.bytes > 0, 'the two record JSON files have a size');
+      assert.deepEqual(dry.old_usage.after, dry.old_usage.before, 'a dry run deletes nothing, so before == after');
+      assert.equal(listOldVersions(root).length, 2);
+
+      const applied = gc({ root, keepOldPerSession: 1 });
+      assert.equal(applied.safe, true);
+      assert.equal(applied.old_versions.pruned, 1);
+      assert.equal(applied.old_usage.before.files, 2);
+      assert.equal(applied.old_usage.after.files, 1, 'the pruned record is gone from the after measurement');
+      assert.ok(applied.old_usage.after.bytes < applied.old_usage.before.bytes);
+      assert.equal(listOldVersions(root).length, 1);
+      // The before/after numbers are the same measurement the engine uses for the usage reminder: a hand walk of
+      // what remains equals the reported `after`.
+      assert.deepEqual(measureOldUsage(root), applied.old_usage.after);
     } finally {
       cleanup();
     }

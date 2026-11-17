@@ -42,7 +42,7 @@ import { repoPaths } from './layout.mjs';
 import { readJsonSafe } from './atomic.mjs';
 import { withRepoLock } from './locks.mjs';
 import { readSnapshot, listSnapshots } from './repo.mjs';
-import { DEFAULT_KEEP_OLD, OLD_FORMAT, ROTATION_CODES, fullCopyPathFor, pruneOldVersions, resolveMaxAgeDays } from './rotation.mjs';
+import { DEFAULT_KEEP_OLD, OLD_FORMAT, ROTATION_CODES, fullCopyPathFor, measureOldUsage, pruneOldVersions, resolveMaxAgeDays } from './rotation.mjs';
 
 /** Named gc failure codes. */
 export const GC_CODES = Object.freeze({
@@ -396,6 +396,7 @@ export function listObjects(root) {
  *   orphan_full_copies: {scanned: number, removed: number, reclaimed_bytes: number},
  *   tmp: {scanned: number, removed: number, reclaimed_bytes: number},
  *   empty_prefixes_removed: number,
+ *   old_usage: {before: {bytes: number, files: number}, after: {bytes: number, files: number}},
  *   problems: Array<object>, reason_code: string|null
  * }}
  */
@@ -438,6 +439,11 @@ export function gc(input) {
     };
   }
   try {
+    // The `old/` tree is measured before and after this pass. The walk is read-only and is the same one the engine
+    // uses for the usage reminder (§24.3): it answers "did the cleanup change the old-version tree", and it gives
+    // the CLI the `old usage before/after` line without a second command. `old/` itself is still never deleted
+    // wholesale -- gc only applies the same retention window rotation does.
+    const oldUsageBefore = measureOldUsage(root);
     const references = collectReferences(root);
     if (!references.ok) {
       return {
@@ -491,6 +497,7 @@ export function gc(input) {
     const orphans = collectOrphanFullCopies({ root, dryRun });
     for (const problem of orphans.problems) failed.push(problem);
     const emptyPrefixesRemoved = dryRun ? 0 : removeEmptyPrefixes(root);
+    const oldUsageAfter = measureOldUsage(root);
 
     return {
       ok: failed.length === 0,
@@ -502,6 +509,7 @@ export function gc(input) {
       orphan_full_copies: { scanned: orphans.scanned, removed: orphans.removed, reclaimed_bytes: orphans.reclaimed_bytes },
       tmp: { scanned: leftovers.scanned, removed: leftovers.removed, reclaimed_bytes: leftovers.reclaimed_bytes },
       empty_prefixes_removed: emptyPrefixesRemoved,
+      old_usage: { before: oldUsageBefore, after: oldUsageAfter },
       problems: failed.map((row) => ({ file: row.file, detail: row.detail })),
       reason_code: failed.length === 0 ? null : GC_CODES.FAILED,
     };

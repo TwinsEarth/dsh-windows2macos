@@ -4,6 +4,17 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### old/ 总量不设上限：每增长 10 GB 提醒、由用户决定是否手动清理（未发布）
+
+- **用户决定**：`old/` **总量不设上限**；每增加 10 GB 提醒一次，是否手动清理由用户决定。所以本次不加上限，只加"测量 + 提醒 + 确认"三件事：每会话保留规则与单份整文件副本 300 MB 上限都不变。
+- **常量/配置**：`DEFAULT_OLD_USAGE_REMINDER_BYTES = 10 * 1024 ** 3`（10 GiB，`src/backup/rotation.mjs`）；引擎 `runBackup({oldUsageReminderBytes, oldUsageAckBytes})`；插件行 `backupOldUsageReminderGb: 10`（`0` = 关闭提醒；非法值 → `BACKUP_CONFIG_INVALID`）；CLI `run --old-usage-reminder-gb <n>`（GB，`0` = 关闭）。
+- **测量/结果**：成功备份在轮转与剪枝之后做一次只读目录遍历（`measureOldUsage`：readdir + stat，不读文件内容；缺失目录 = 0 字节/0 文件），结果恒有 `old_usage: {bytes, files, reminder_bytes, due, since_last_ack_bytes, next_reminder_at_bytes}`。阈值语义是**自上次确认以来的增长**，不是 10/20/30 阶梯：`due = reminder_bytes > 0 && bytes - ack_bytes >= reminder_bytes`，确认水位持久化为 `old_usage_ack_bytes`（缺省 0），`next_reminder_at_bytes = ack_bytes + reminder_bytes`。
+- **提醒（绝不自动删除）**：`due` 时引擎把 `old/ 已增长 X GB，自上次确认以来超过 10 GB；是否手动清理？` 加入 `warnings`，结果 `old_usage.due: true`；插件把 `state.old_usage = {due, bytes, files, ack_bytes, reminder_bytes, at}` 持久化到 `<DSH_HOME>/xclient/w2m-backup/state.json`。备份、面板、CLI 都没有"按大小删除"的路径。
+- **确认**：`POST /api/w2m/backup/old-usage/ack`，请求体必须是 `{"confirm":"ack"}`；把 `old_usage_ack_bytes` 设为**当前测量字节数**、清掉 `state.old_usage.due` 并返回新 state（`deleted: false`）。面板 `[data-w2m-backup-old-usage]` 提醒卡文本 `old/ 已占用 X GB（自上次确认增加 Y GB）：建议手动清理` +「知道了」（走 ack 路由，不删除）+「如何清理」（展开 `w2m-backup gc --dry-run` → `w2m-backup gc --max-old-days <n>` / 每会话保留份数指引），中英 i18n，**面板没有删除按钮**。
+- **CLI**：`run` 打印 `old usage : X GB (Y files)`，due 时另打印提醒与手动清理提示（先 `w2m-backup gc --dry-run`）；`status` 打印 old 占用与 reminder 是否 pending；`gc` 打印 `old usage before/after : X GB -> Y GB`；`--old-usage-reminder-gb` 解析/校验（`0` = 关闭，非法值退出码 2）。
+- **文档/测试**：`docs/BACKUP-DESIGN.md` 新增 §24.3（不设上限的决定、按增长提醒、确认路由、手动 gc、诚实边界：walk 为 O(文件数) 且在提交后运行、`bytes` 含记录 JSON 与整文件副本密文）；`test/backup-rotation`、`test/backup-engine`、`test/backup-gc`、`test/backup-run`、`test/client-bundle` 新增覆盖（records + full 两种 `old/` 的手算一致、due 边界、提醒 0 关闭、零删除、持久化/确认路由/describe、CLI 行、面板文案与「知道了」/「如何清理」、字典完整、无删除动作）；`npx eslint .` 0 error、`node scripts/layer-check.mjs` clean、`node scripts/scan-mojibake.mjs` clean、相关 suite 全绿。
+- **声明**：不 bump 版本（仍 3.5.0）、不跑 preflight、不提交；不新增 `old/` 总量上限，不自动删除任何文件。
+
 ### old-format full 整文件副本的 300 MB 上限与「特批」流程（未发布）
 
 - **问题**：`oldFormat: full` 每个被淘汰版本多写一份整文件副本；单个超大会话会让仓库悄悄翻倍，定时备份更是无人值守。
