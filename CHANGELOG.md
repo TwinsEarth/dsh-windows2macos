@@ -4,6 +4,16 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### 账户 ID 绑定解锁：只比对唯一识别码（用户决定，未发布）
+
+- **用户决定（原话）**："不用打开账户，只需要读取账户唯一识别码ID，进行比对就行，一致就放行。不一致就切换密码模式。" 实现为 compare-only 身份绑定：`keys.json` 新增可选根字段 `account_binding: {account_id, bound_at}` + 复用现有 `account` 信封（KEK = HKDF(`w2m-account-binding|<accountId>`)，无新密码学）。**诚实声明：账户 id 是标识，不是秘密**——知道 id 且拿到仓库文件的人可推导同一 KEK，这是用户明确接受的代价；它不替代 `password`（跨机器秘密路径），完整 id 永不出现在结果/CLI/HTTP/日志，只有 `…abcd`（后 4 位）。
+- **绑定**：新增 `addAccountEnvelope(keys, dek, accountId)` + `bindAccount({root, dshHome, accountId})`（用现有凭据打开 → 同一 DEK 再包 account 信封 → 复制 `keys.json.bak-<ts>` → 原子写 → 只用 account 凭据解一次并与 DEK 比对）；幂等（同 id 不重写）、换绑具名拒绝 `BACKUP_ACCOUNT_MISMATCH`、id 非法 `BACKUP_ACCOUNT_ID_INVALID`、已有 account 信封但无 `account_binding` 元数据 `BACKUP_ACCOUNT_BINDING_UNKNOWN`；`validateKeysFile` 以可选字段加法校验。
+- **解锁**：`openRepoKey({accountId})` / `describeUnlock` / `unlockRepo` 增加比较结果 `account: {bound, matched, id_hint}`；匹配 → account 路径放行（`unlocked_via: "account"`，无密码/无 machine 也可开）；不匹配 → `attempts` 记 `{kind:"account", code:"BACKUP_ACCOUNT_MISMATCH"}` 并回退 machine/password；全不可用仍是统一的 `BACKUP_NO_PERMISSION`（mismatch 不是独立拒绝码）。插件 unlock 路由与 restore/archive/verify 每次请求经 `createAccountIdentity({ctx}).identify()` best effort 读宿主 id（不联网要求、不抛错，未登录即 `null`）。
+- **配置 / CLI / 面板**：配置 `backupAccountBinding: boolean`（默认 `true`；`cordis.patch.yml` 的 dsh-backup 行显式 `true`）；成功后绑定、失败只 warning、不改 `ok`。CLI `w2m-backup unlock --account-id <id>`、`unlock --check --account-id <id>`、`run --account-id <id>`（成功后绑定；CLI 不自己读宿主 id，避免可手填的"账户凭据"）；面板解锁卡新增账户行三态：一致 →「本机账户与原账户一致，可直接解锁」+ 可点按钮；不一致 →「当前账户不是原账户：请使用解锁密码」+ 按钮禁用；读不到 → 提示改用密码；未绑定则原卡片不变。新增 6 个 i18n 键与 `BACKUP_ACCOUNT_MISMATCH` 的 reason 文案映射。
+- **测试**：`backup-keystore` +4（绑定后无 machine key 可开且 DEK 不变；错 id 被拒但 machine/password 仍可开；重绑 no-op、换绑具名拒绝且文件不变；非法 id 零写入 + `account_binding` 元数据）；`backup-access` +3（describe 报告 bound/matched 且 JSON 不泄露完整 id；mismatch+password 走密码成功；mismatch 无密码 → `BACKUP_NO_PERMISSION` 且 attempts 具名）；`backup-run` +3（配置归一化；路由用假 `deepseekAccount` 比对/绑定关闭时 `matched:null`；Windows DPAPI 下 run 后自动绑定并经 account 解锁；CLI `--account-id` 解析/真实入口/JSON 形状/人类输出脱敏/usage）；`client-bundle` +2（账户路径三态与按钮禁用、字典与 reason 映射）。无新增测试文件，`package.json#scripts.test` 不变。
+- **文档**：`docs/BACKUP-DESIGN.md` 新增 §25「账户 ID 绑定解锁（用户决定）」并更新 §6/§11/§12/§18 相邻注记；`docs/SPIKE-ACCOUNT-KEK.md` 顶部加"决定更新"短记指向 §25（不改写原测量）。**诚实边界**：见 §25.1/§25.7；旧快照目录里的 `keys.json` 副本要等下一次快照才有绑定；真实仓库迁移（`bindAccount` 一行命令）由 lead 执行，不在本次代码任务内；不 bump 版本号、不跑 preflight、不提交。
+
+
 ### 备份轮转 `--old-format full`：字面兼容的整文件加密副本（P2，未发布）
 
 - **新增 opt-in 选项 `oldFormat: 'records' | 'full'`（默认 `records`）**：默认仍是去重版本记录（§13/§21 行为不变）；`full` 在每次真正轮转时额外写一份密封整文件副本 `old/<ws>/<sid>/<ts>-<sha12>.json.enc`，记录新增 `full_copy: {file, sha256, size}`（纯加法，记录的 `format`/`version` 不变，仍是 `w2m-session-backup/old-version` v1）。

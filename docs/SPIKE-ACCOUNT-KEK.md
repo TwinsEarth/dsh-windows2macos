@@ -15,6 +15,15 @@
 4. **建议默认信封组合：`machine + password` 默认写入；`account` 作为可选第三信封（拿到 `userId` 且产品确认后再写）。** 三种信封包裹的都是**同一个随机 32B DEK**（不是直接派生文件密钥），与工作树里已存在的 `src/backup/crypto.mjs`（`wrapDek`/`unwrapDek`/`ENVELOPE_KINDS=['account','machine','password']`）一致。
 5. **实现前必须修一处调用**：w2m 现有 `await service.getProfile()`（零参，`src/chatops/account.mjs:314-318`）与 DSH 0.2.2-rc.3 的 `getProfile(client: AccountClientMetadata)` 签名不符（`dsh-deepseek-account/src/index.ts:228`；`client-metadata.ts:37-45` 会直接解引用 `client.version`；`@Remote` 装饰器只登记 RPC 元数据、不包裹 Host 直接调用，见 `dsh-typert-protocol/src/index.ts:277-317`）。沿用零参调用时 `userId` 大概率保持 null，账户信封会"看起来支持、实际不可用"。**（2026-11-17 16:37：该校验已修并在宿主内实测闭环，见 §8；结论不变——账户信封仍不实现。）**
 
+> **决定更新（2026-11-17，用户决定，晚于本节实测）：选择"只读账户唯一识别码做比对"的身份绑定解锁。**
+> 用户原话："不用打开账户，只需要读取账户唯一识别码ID，进行比对就行，一致就放行。不一致就切换密码模式。"
+> 因此 `account` 信封现在作为**身份绑定**写入：KEK = HKDF(`w2m-account-binding|<accountId>`)，绑定的 id 记在
+> `keys.json` 的 `account_binding`；解锁时只比对 id —— 一致 → account 路径放行；不一致 → 记录
+> `BACKUP_ACCOUNT_MISMATCH` 并回退密码路径；没有密码则仍是 `BACKUP_NO_PERMISSION`。
+> **诚实边界（必须同时读）**：账户 id 是标识不是秘密，知道 id 且拿到仓库文件的人可推导同一 KEK，所以这条路径
+> **不承诺机密性**、只是"同账户免密"的便捷路径，且不替代 password。设计、面板文案、配置与测试见
+> `docs/BACKUP-DESIGN.md` §25。本文 §8.3/§8.5 的实测与"没有稳定每账户秘密"的结论未被改写，仍然有效。
+
 ---
 
 ## 1. 方法与边界（含对任务前提的两处更正）

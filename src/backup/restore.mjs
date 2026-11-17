@@ -121,7 +121,7 @@ function itemsFromSnapshot(snapshot, wanted) {
  *
  * @param {{
  *   root: string, dshHome: string, snapshotId?: string|null, sessionIds?: string[],
- *   password?: string|Buffer|null, machineKey?: boolean, platform?: string, runner?: Function,
+ *   accountId?: string|null, password?: string|Buffer|null, machineKey?: boolean, platform?: string, runner?: Function,
  *   allowStaticValidation?: boolean, requireFutureAppend?: boolean, workspacePath?: string|null,
  *   keepBoth?: boolean, keepPreRestore?: number, now?: Date, harness?: object|null,
  *   env?: Record<string, string|undefined>,
@@ -140,6 +140,7 @@ export function planRestore(input) {
   const key = openRepoKey({
     root: input.root,
     dshHome: input.dshHome,
+    accountId: input.accountId ?? null,
     password: input.password ?? null,
     machineKey: input.machineKey,
     platform: input.platform,

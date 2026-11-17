@@ -26,6 +26,7 @@ import {
 } from '../src/plugin/backup.mjs';
 import { main, parseArgs } from '../src/backup/cli.mjs';
 import { runBackup } from '../src/backup/engine.mjs';
+import { bindAccount } from '../src/backup/keystore.mjs';
 import { readIndex, readSnapshot } from '../src/backup/repo.mjs';
 import { listOldVersions, recordSupersededVersion } from '../src/backup/rotation.mjs';
 import { tempDir, makeHome, registryDocument, runtimeValidHome, sessionLog, event } from './helpers/backup-fixture.mjs';
@@ -41,7 +42,7 @@ function homeFixture() {
 }
 
 /** A fake Cordis context recording registrations, effects and log lines. */
-function fakeCtx() {
+function fakeCtx(options = {}) {
   const registrations = [];
   const disposers = [];
   const logs = [];
@@ -59,12 +60,38 @@ function fakeCtx() {
       info: (message) => logs.push({ level: 'info', message }),
       warn: (message) => logs.push({ level: 'warn', message }),
     },
+    // The account path reads the optional `deepseekAccount` service the same way the real host exposes it
+    // (`ctx.get`). Absent by default, which is exactly the signed-out / older-host state the plugin must tolerate.
+    get: (name) => (options.services === undefined ? null : (options.services[name] ?? null)),
   };
   return { ctx, registrations, disposers, logs };
 }
 
-/** A far-future slot so the timer never fires during the test. */
-const NO_FIRE = { backupTimes: ['23:59:59'], backupTimeZone: 'UTC' };
+/** A fake identity service: the account id is already known, so `identify()` never calls getProfile. */
+function fakeAccountService(userId) {
+  return {
+    async getDeviceIdentity() {
+      return { userId, deviceId: 'device-1', osVersion: 'win32' };
+    },
+    async getProfile() {
+      throw new Error('getProfile must not be needed when getDeviceIdentity already reports the id');
+    },
+  };
+}
+
+/**
+ * A slot that never fires during a test.
+ *
+ * `backupCatchUpMs: 1` is part of "never": the backup schedule's catch-up window defaults to 12 hours, so a
+ * "far-future" 23:59:59 UTC slot is still treated as *missed* (and run immediately) for the twelve hours after
+ * midnight UTC -- which made these route tests time-of-day dependent. One millisecond keeps catch-up effectively
+ * off for a test while staying inside the config's "positive integer" rule.
+ */
+const NO_FIRE = { backupTimes: ['23:59:59'], backupTimeZone: 'UTC', backupCatchUpMs: 1 };
+
+/** The account id the compare-only binding tests use (docs/BACKUP-DESIGN.md §25). */
+const ACCOUNT = 'user-1234abcd';
+const OTHER_ACCOUNT = 'user-9999ffff';
 
 describe('subplugin: configuration', () => {
   it('defaults the directory per platform and the schedule to 22:00 Asia/Shanghai', () => {
@@ -153,6 +180,14 @@ describe('subplugin: configuration', () => {
     } finally {
       cleanup();
     }
+  });
+  it('normalizes the account-binding switch (on by default, config can turn it off)', () => {
+    assert.equal(normalizeConfig({}, { env: {}, platform: 'win32' }).account_binding, true,
+      'the user decision is on by default: bind the account id after a successful run');
+    assert.equal(normalizeConfig({ backupAccountBinding: true }, { env: {}, platform: 'win32' }).account_binding, true);
+    assert.equal(normalizeConfig({ backupAccountBinding: false }, { env: {}, platform: 'win32' }).account_binding, false);
+    // Any other value is truthy-by-default rather than silently disabling a compare-only convenience path.
+    assert.equal(normalizeConfig({ backupAccountBinding: 0 }, { env: {}, platform: 'win32' }).account_binding, true);
   });
 });
 
@@ -337,6 +372,80 @@ describe('subplugin: the route and the timer', () => {
       } finally {
         cleanup();
         source.cleanup();
+      }
+    },
+  );
+
+  it('compares the host account id on the unlock describe route and only returns the masked hint', async () => {
+    const { home, cleanup: cleanHome } = homeFixture();
+    const { dir, cleanup } = tempDir('w2m-route-account-');
+    try {
+      const repo = join(dir, 'repo');
+      const created = runBackup({ root: repo, dshHome: home, password: PASSWORD, platform: 'linux', machineKey: false });
+      assert.equal(created.ok, true, created.detail);
+      const bound = bindAccount({ root: repo, dshHome: home, accountId: ACCOUNT, password: PASSWORD, platform: 'linux', machineKey: false });
+      assert.equal(bound.ok, true, bound.detail ?? '');
+
+      const describedWith = async (userId, config = {}) => {
+        const fake = fakeCtx({ services: { deepseekAccount: fakeAccountService(userId) } });
+        apply(fake.ctx, { backupDir: repo, dshHome: home, backupMachineKey: false, ...NO_FIRE, ...config });
+        const route = fake.registrations.find((row) => row.path === BACKUP_UNLOCK_ROUTE_PATH);
+        const response = await route.fetch(new Request(`http://local.invalid${BACKUP_UNLOCK_ROUTE_PATH}`, { method: 'GET' }));
+        return response.json();
+      };
+
+      const matched = await describedWith(ACCOUNT);
+      assert.equal(matched.ok, true);
+      assert.deepEqual(matched.account, { bound: true, matched: true, id_hint: '…abcd' });
+      assert.equal(JSON.stringify(matched).includes(ACCOUNT), false, 'the full account id never reaches the panel');
+
+      const mismatched = await describedWith(OTHER_ACCOUNT);
+      assert.equal(mismatched.account.matched, false, 'the panel gets the "not the original account" state');
+      assert.equal(JSON.stringify(mismatched).includes(OTHER_ACCOUNT), false);
+
+      // Binding switched off: no account id is read, so nothing is compared -- the password/machine paths are
+      // unchanged and the panel sees `matched: null` rather than a guess.
+      const off = await describedWith(ACCOUNT, { backupAccountBinding: false });
+      assert.equal(off.account.bound, true);
+      assert.equal(off.account.matched, null, 'binding off means no comparison happens');
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+
+  it(
+    'binds the host account id after a successful run route call, then unlocks through it (Windows DPAPI)',
+    { skip: process.platform === 'win32' ? false : 'DPAPI is Windows-only' },
+    async () => {
+      const { home, cleanup: cleanHome } = homeFixture();
+      const { dir, cleanup } = tempDir('w2m-route-account-run-');
+      try {
+        const fake = fakeCtx({ services: { deepseekAccount: fakeAccountService(ACCOUNT) } });
+        apply(fake.ctx, { backupDir: join(dir, 'repo'), dshHome: home, ...NO_FIRE });
+        const find = (path) => fake.registrations.find((row) => row.path === path);
+        const post = (path, body) => find(path).fetch(new Request(`http://local.invalid${path}`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+        }));
+
+        const run = await (await post(BACKUP_RUN_ROUTE_PATH, { confirm: RUN_CONFIRM_TOKEN, scope: 'all' })).json();
+        assert.equal(run.ok, true, `${run.reason_code}: ${run.detail}`);
+        assert.equal(run.account_binding?.bound, true, 'the run result reports the account binding');
+        assert.equal(run.account_binding?.added, true);
+        assert.equal(run.account_binding?.id_hint, '…abcd');
+
+        const unlock = await (await find(BACKUP_UNLOCK_ROUTE_PATH).fetch(new Request(`http://local.invalid${BACKUP_UNLOCK_ROUTE_PATH}`, { method: 'GET' }))).json();
+        assert.equal(unlock.account.matched, true, 'the host id read back through the same account service matches');
+
+        const opened = await (await post(BACKUP_UNLOCK_ROUTE_PATH, { confirm: UNLOCK_CONFIRM_TOKEN })).json();
+        assert.equal(opened.ok, true, opened.detail ?? '');
+        assert.equal(opened.via, 'account', 'the matching account is the credential that opened it');
+        assert.equal(JSON.stringify(opened).includes(ACCOUNT), false, 'the unlock response never carries the full id');
+      } finally {
+        cleanup();
+        cleanHome();
       }
     },
   );
@@ -553,6 +662,72 @@ describe('cli: run / list / gc', () => {
       const text = human.lines.join('\n');
       assert.match(text, /old format {4}: full/u);
       assert.match(text, /storage doubles/u, 'the human summary must state the doubled-storage cost');
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+
+  it('parses --account-id for run/unlock, binds after a run, and compares without printing the id', () => {
+    const { home, cleanup: cleanHome } = homeFixture();
+    const { dir, cleanup } = tempDir('w2m-cli-account-');
+    try {
+      const env = { W2M_BACKUP_NO_MACHINE_KEY: '1' };
+      assert.equal(parseArgs(['unlock', '--account-id', ACCOUNT], env).accountId, ACCOUNT);
+      assert.equal(parseArgs(['run', '--account-id=' + ACCOUNT], env).accountId, ACCOUNT);
+      assert.equal(parseArgs(['unlock'], env).accountId, null, 'absent means no comparison');
+      assert.match(parseArgs(['unlock', '--account-id'], env).error, /--account-id needs an account id/u);
+      assert.match(parseArgs(['unlock', '--account-id='], env).error, /--account-id needs an account id/u);
+      const usage = capture();
+      assert.equal(main(['--help'], usage.io), 0);
+      assert.match(usage.lines.join('\n'), /--account-id <id>/u, 'the usage names the manual account-id flag');
+
+      const repo = join(dir, 'repo');
+      const run = capture();
+      assert.equal(
+        main(['run', '--backup-dir', repo, '--dsh-home', home, '--account-id', ACCOUNT, '--json'], { ...run.io, env, password: PASSWORD }),
+        0,
+        run.lines.join('\n'),
+      );
+      const runJson = JSON.parse(run.lines.join('\n'));
+      assert.equal(runJson.account_binding?.bound, true, 'a successful run binds the id (best effort)');
+      assert.equal(runJson.account_binding?.added, true);
+      assert.equal(runJson.account_binding?.id_hint, '…abcd');
+      assert.equal(JSON.stringify(runJson).includes(ACCOUNT), false, 'CLI JSON never prints the full account id');
+
+      const described = capture();
+      assert.equal(
+        main(['unlock', '--backup-dir', repo, '--dsh-home', home, '--account-id', ACCOUNT, '--json'], { ...described.io, env }),
+        0,
+      );
+      const describedJson = JSON.parse(described.lines.join('\n'));
+      assert.deepEqual(describedJson.account, { bound: true, matched: true, id_hint: '…abcd' });
+      assert.equal(describedJson.account_supported, true);
+      assert.equal(JSON.stringify(describedJson).includes(ACCOUNT), false);
+
+      const checked = capture();
+      assert.equal(
+        main(['unlock', '--backup-dir', repo, '--dsh-home', home, '--account-id', ACCOUNT, '--check', '--json'], { ...checked.io, env }),
+        0,
+      );
+      const checkedJson = JSON.parse(checked.lines.join('\n'));
+      assert.equal(checkedJson.check.ok, true);
+      assert.equal(checkedJson.check.via, 'account', 'the matching id alone opens the repository: no password needed');
+
+      const mismatched = capture();
+      assert.equal(
+        main(['unlock', '--backup-dir', repo, '--dsh-home', home, '--account-id', OTHER_ACCOUNT, '--json'], { ...mismatched.io, env }),
+        0,
+        'describing a mismatch is a read-only report, not a failure of the command',
+      );
+      assert.equal(JSON.parse(mismatched.lines.join('\n')).account.matched, false);
+
+      const human = capture();
+      assert.equal(main(['unlock', '--backup-dir', repo, '--dsh-home', home, '--account-id', ACCOUNT], { ...human.io, env }), 0);
+      const text = human.lines.join('\n');
+      assert.match(text, /account path {2}: matched/u);
+      assert.match(text, /…abcd/u, 'the human output shows the masked hint');
+      assert.equal(text.includes(ACCOUNT), false, 'the human output never prints the full account id');
     } finally {
       cleanup();
       cleanHome();

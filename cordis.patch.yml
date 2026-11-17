@@ -197,5 +197,7 @@
         # 字面兼容需求 3：被替换的旧版本除记录外再写一份整文件加密副本（old/<ws>/<sid>/…json.enc）。
         # 代价：每个被替换版本在去重块之外多占一份整文件字节；不想要时改成 records。
         backupOldFormat: full
+        # §25 账户 ID 绑定解锁（用户决定）：只读取账户唯一识别码做比对，一致免密放行；不是机密性路径。
+        backupAccountBinding: true
 
 

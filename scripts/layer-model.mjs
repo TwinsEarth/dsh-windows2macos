@@ -100,6 +100,10 @@ export const ALLOWED_EDGES = Object.freeze([
   // v3.4.6: the plugin mounts the read-only backup routes, and the backup substrate reuses the frame reader
   // and the registry parser instead of duplicating them. Both edges are downward (4 -> 1 and 1 -> 0).
   ['plugin', 'backup'],
+  // v3.5.x: the backup subplugin reads the host's account identifier through the ONE account-identity module
+  // (`chatops/account.mjs`), so the compare-only account unlock reuses the `getProfile(client)` path fixed in
+  // v3.4.7 instead of growing a second identity reader. Downward (plugin 4 -> chatops 1).
+  ['plugin', 'chatops'],
   ['backup', 'fix'],
   ['backup', 'util'],
   // v3.4.8 G4 补全: the offline repair CLI exposes the seq renumber tool (`w2m-fix renumber`), which lives in

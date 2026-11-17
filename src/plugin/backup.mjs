@@ -24,6 +24,17 @@
  * password in configuration to make the timer work would trade the whole point of the encryption for convenience,
  * so it is not offered.
  *
+ * ## The account path is a compare-only identity binding
+ *
+ * The user's decision (2026-11-17, `docs/BACKUP-DESIGN.md` §25): read the host's **account identifier**, compare it
+ * with the id the repository is bound to, and allow the account path when they match; on a mismatch fall back to
+ * the password path. It is deliberately **not** a secret and never replaces the password envelope -- anyone who
+ * knows the id and has the files could derive the same KEK, which is the accepted trade-off. With
+ * `backupAccountBinding` on (the default) the route reads the id through `createAccountIdentity({ctx}).identify()`
+ * (best effort, never throws: signed out or no account service simply yields `null`), passes it to the run (which
+ * binds it after a successful commit) and to the unlock probes, where it is only compared. The account id is
+ * masked in every response (`account.id_hint`, last four characters only).
+ *
  * ## The route requires a confirmation token
  *
  * A `POST` from the panel model is not a button click -- it is a network request a stale page can replay. The body
@@ -36,6 +47,7 @@ import { buildArchive } from '../backup/archive.mjs';
 import { DEFAULT_RECHECK_DELAYS, scheduleRegistryRecheck } from '../backup/registry-watch.mjs';
 import { describeUnlock, unlockRepo } from '../backup/unlock.mjs';
 import { verifyRepo } from '../backup/verify.mjs';
+import { createAccountIdentity } from '../chatops/account.mjs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -106,7 +118,7 @@ export function defaultBackupDir(platform = process.platform) {
  * @param {{env?: Record<string, string|undefined>, platform?: string}} [deps]
  * @returns {{ok: true, enabled: boolean, backup_dir: string, times: string[], time_zone: string, catch_up_ms: number,
  *   scope: string, keep_old_per_session: number, old_version_days: number, old_format: 'records'|'full',
- *   mirror_dir: string|null, dsh_home: string}
+ *   mirror_dir: string|null, account_binding: boolean, dsh_home: string}
  *   | {ok: false, reason_code: string, detail: string}}
  */
 export function normalizeConfig(config = {}, deps = {}) {
@@ -130,6 +142,12 @@ export function normalizeConfig(config = {}, deps = {}) {
   // The future-append simulation costs one decode per session (measured: 4.8 s -> 26 s on a 171 MB real home).
   // It stays on by default; a host that values the time over the signal can turn it off here.
   const futureAppend = config.backupFutureAppend !== false;
+  // The account path is a compare-only identity binding (docs/BACKUP-DESIGN.md §25, the user's 2026-11-17 decision).
+  // When enabled, a run asks the host for its account id (best effort) and binds it after a successful run, so a
+  // matching account unlocks without a password. The id is an identifier, not a secret: this never replaces the
+  // password envelope, and a host without an account service simply yields `null` -- the run and the unlock
+  // probes continue exactly as before.
+  const accountBinding = config.backupAccountBinding !== false;
   const keepOld = Number.isSafeInteger(config.keepOldPerSession) && config.keepOldPerSession >= 0
     ? config.keepOldPerSession
     : DEFAULT_KEEP_OLD;
@@ -189,6 +207,7 @@ export function normalizeConfig(config = {}, deps = {}) {
     scope,
     machine_key: machineKey,
     future_append: futureAppend,
+    account_binding: accountBinding,
     keep_old_per_session: keepOld,
     old_version_days: oldVersionDays ?? 0,
     old_format: oldFormat,
@@ -235,13 +254,42 @@ export function apply(ctx, config = {}) {
     running: false,
   };
 
+  /**
+   * The host's account identifier, best effort, or `null`.
+   *
+   * Never throws and never blocks a run or a probe on an identity problem: `identify()` reports `signed-out` as a
+   * normal state, and a host without the `deepseekAccount` service has no account path at all. The raw id is used
+   * only in-process (bound into a KEK and compared with the recorded binding); it is never logged or returned --
+   * the audit line account.mjs emits carries the hashed account code, and every response carries `id_hint` only.
+   */
+  const identifyAccountId = async () => {
+    if (cfg.account_binding !== true) return null;
+    try {
+      const identity = createAccountIdentity({
+        ctx,
+        audit: (event, detail) => ctx.logger?.info?.(
+          `w2m-dsh-backup: ${event}${detail === undefined ? '' : ' ' + JSON.stringify(detail)}`,
+        ),
+      });
+      const identified = await identity.identify();
+      if (identified.ok !== true) return null;
+      return typeof identified.userId === 'string' && identified.userId.trim() !== '' ? identified.userId : null;
+    } catch {
+      // A failed identity read is the machine/password paths' turn, not an error the operator has to see.
+      return null;
+    }
+  };
+
   /** Run one backup and never throw: the timer and the route both need a result, not an exception. */
-  const runNow = (reason, request) => {
+  const runNow = async (reason, request) => {
     if (state.running) {
       return { ok: false, reason_code: 'BACKUP_BUSY', detail: 'a backup is already running', reason };
     }
     state.running = true;
     try {
+      // Account binding: the id is read here (once per run) and passed to the engine, which binds it after a
+      // successful commit. `null` means "no account path on this host", never an error.
+      const accountId = await identifyAccountId();
       const result = runBackup({
         root: cfg.backup_dir,
         dshHome: cfg.dsh_home,
@@ -254,6 +302,7 @@ export function apply(ctx, config = {}) {
         machineKey: cfg.machine_key,
         futureAppend: cfg.future_append,
         dryRun: request?.dryRun === true,
+        accountId,
       });
       if (result.ok === true) {
         state.runs += 1;
@@ -341,6 +390,7 @@ export function apply(ctx, config = {}) {
               dsh_home: cfg.dsh_home,
               retention: { keep_old_per_session: cfg.keep_old_per_session, old_version_days: cfg.old_version_days },
               old_format: cfg.old_format,
+              account_binding: cfg.account_binding,
               mirror_dir: cfg.mirror_dir,
               schedule: describeBackupSchedule({ enabled: true, times: cfg.times, timeZone: cfg.time_zone }),
               scheduler: scheduler.describe(),
@@ -370,7 +420,7 @@ export function apply(ctx, config = {}) {
               { status: 400, headers: NO_STORE },
             );
           }
-          const result = runNow('manual', {
+          const result = await runNow('manual', {
             scope: body.scope,
             selected: Array.isArray(body.selected) ? body.selected : [],
             dryRun: body.dryRun === true,
@@ -398,7 +448,15 @@ export function apply(ctx, config = {}) {
         }
       };
       const refuse = (reason_code, detail, status = 400) => Response.json({ ok: false, reason_code, detail }, { status, headers: NO_STORE });
-      const unlockInput = () => ({ root: cfg.backup_dir, dshHome: cfg.dsh_home, machineKey: cfg.machine_key });
+      // Read the host account id once per request (best effort, never throws) and pass it to every path that can
+      // open the repository. The describe/attempt paths only compare it; restore/archive/verify accept it as an
+      // additional credential path, exactly like the CLI accepts --password. The route never receives a password.
+      const unlockInput = async () => ({
+        root: cfg.backup_dir,
+        dshHome: cfg.dsh_home,
+        machineKey: cfg.machine_key,
+        accountId: await identifyAccountId(),
+      });
 
       registry.register({
         path: BACKUP_UNLOCK_ROUTE_PATH,
@@ -406,15 +464,18 @@ export function apply(ctx, config = {}) {
         requestBody: 'buffered',
         fetch: async (request) => {
           if (request.method === 'GET') {
-            return Response.json(describeUnlock(unlockInput()), { headers: NO_STORE });
+            return Response.json(describeUnlock(await unlockInput()), { headers: NO_STORE });
           }
           if (request.method !== 'POST') return refuse('METHOD_NOT_ALLOWED', `${request.method} is not a method this route answers`, 405);
           const body = await readBody(request);
           if (body === null || body.confirm !== UNLOCK_CONFIRM_TOKEN) {
             return refuse('BACKUP_CONFIRM_REQUIRED', `a JSON body with {"confirm":"${UNLOCK_CONFIRM_TOKEN}"} is required`);
           }
-          const result = unlockRepo(unlockInput());
-          return Response.json({ ok: result.ok, via: result.via, reason_code: result.reason_code, detail: result.detail, attempts: result.attempts }, { headers: NO_STORE });
+          const result = unlockRepo(await unlockInput());
+          return Response.json(
+            { ok: result.ok, via: result.via, account: result.account, reason_code: result.reason_code, detail: result.detail, attempts: result.attempts },
+            { headers: NO_STORE },
+          );
         },
       });
 
@@ -426,7 +487,7 @@ export function apply(ctx, config = {}) {
           // Read-only but expensive: it decrypts every block of every snapshot to re-hash it. With ?runtime=1 it
           // also asks the installed Harness about every log and every appended log (G5), which is slower.
           const runtime = new URL(request.url).searchParams.get('runtime') === '1';
-          const result = verifyRepo({ ...unlockInput(), futureAppend: true, runtime });
+          const result = verifyRepo({ ...(await unlockInput()), futureAppend: true, runtime });
           state.last_verify = { at: new Date().toISOString(), ok: result.ok, counts: result.counts, problems: result.problems.length };
           return Response.json(result, { headers: NO_STORE });
         },
@@ -447,7 +508,7 @@ export function apply(ctx, config = {}) {
             return refuse('BACKUP_SCOPE_INVALID', 'scope must be archived, all or selected');
           }
           const result = buildArchive({
-            ...unlockInput(),
+            ...(await unlockInput()),
             snapshotId: typeof body.snapshot === 'string' ? body.snapshot : null,
             scope,
             sessionIds: Array.isArray(body.sessions) ? body.sessions : [],
@@ -468,7 +529,7 @@ export function apply(ctx, config = {}) {
             return refuse('BACKUP_CONFIRM_REQUIRED', `a JSON body with {"confirm":"${RESTORE_CONFIRM_TOKEN}"} is required`);
           }
           const plan = planRestore({
-            ...unlockInput(),
+            ...(await unlockInput()),
             snapshotId: typeof body.snapshot === 'string' ? body.snapshot : null,
             sessionIds: Array.isArray(body.sessions) ? body.sessions : [],
             keepBoth: body.keepBoth === true,

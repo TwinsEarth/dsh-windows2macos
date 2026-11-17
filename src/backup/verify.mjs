@@ -63,7 +63,7 @@ export function simulateFutureAppend(buffer) {
  * Verify a whole repository.
  *
  * @param {{
- *   root: string, dshHome: string, password?: string|Buffer|null, machineKey?: boolean,
+ *   root: string, dshHome: string, accountId?: string|null, password?: string|Buffer|null, machineKey?: boolean,
  *   platform?: string, runner?: Function,
  *   futureAppend?: boolean, runtime?: boolean,
  * }} input
@@ -98,6 +98,7 @@ export function verifyRepo(input) {
   const key = openRepoKey({
     root: input.root,
     dshHome: input.dshHome,
+    accountId: input.accountId ?? null,
     password: input.password ?? null,
     machineKey: input.machineKey,
     platform: input.platform,

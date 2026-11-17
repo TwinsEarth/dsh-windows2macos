@@ -8,6 +8,7 @@ import { join } from 'node:path';
 
 import { runBackup } from '../src/backup/engine.mjs';
 import { describeUnlock, machineSecretAvailable, unlockRepo } from '../src/backup/unlock.mjs';
+import { bindAccount } from '../src/backup/keystore.mjs';
 import {
   applyRegistryRestore,
   findWorkspaceForSlug,
@@ -23,6 +24,9 @@ import { makeHome, registryDocument, tempDir } from './helpers/backup-fixture.mj
 const PASSWORD = 'correct horse battery staple';
 const SESSION = 'session-aaaaaaaa-0001';
 const WIN32 = process.platform === 'win32';
+/** The account id the repository is bound to, and a different one for the mismatch cases. */
+const ACCOUNT = 'user-1234abcd';
+const OTHER_ACCOUNT = 'user-9999ffff';
 
 /** Identity-faking DPAPI transport (protect echoes base64, unprotect decodes it). */
 function fakeRunner(command, args, input = '') {
@@ -45,6 +49,22 @@ function passwordRepo() {
   return { repo, home };
 }
 
+/** The same repository, bound to an account id (the compare-only identity binding of docs/BACKUP-DESIGN.md §25). */
+function accountBoundRepo() {
+  const { repo, home } = passwordRepo();
+  const bound = bindAccount({
+    root: repo.dir,
+    dshHome: home.home,
+    accountId: ACCOUNT,
+    password: PASSWORD,
+    platform: 'linux',
+    machineKey: false,
+  });
+  assert.equal(bound.ok, true, bound.detail ?? '');
+  assert.equal(bound.added, true);
+  return { repo, home, bound };
+}
+
 describe('unlock: describing the repository without touching a secret', () => {
   it('reports a password-only repository as exactly that', () => {
     const { repo, home } = passwordRepo();
@@ -54,7 +74,8 @@ describe('unlock: describing the repository without touching a secret', () => {
       assert.deepEqual(described.envelopes, ['password']);
       assert.equal(described.password_required, true);
       assert.equal(described.machine_available, false);
-      assert.equal(described.account_supported, false, 'no account envelope is written; the spy measured no secret');
+      assert.equal(described.account_supported, false, 'no account binding exists on this repository yet');
+      assert.deepEqual(described.account, { bound: false, matched: null, id_hint: null });
     } finally {
       repo.cleanup();
       home.cleanup();
@@ -131,6 +152,68 @@ describe('unlock: the attempt', () => {
       assert.equal(result.available, true, result.reason ?? '');
       assert.equal(result.created, true);
     } finally {
+      home.cleanup();
+    }
+  });
+});
+
+describe('unlock: account id binding (compare-only, the user decision)', () => {
+  it('describes bound/matched without leaking the full account id', () => {
+    const { repo, home } = accountBoundRepo();
+    try {
+      const matched = describeUnlock({ root: repo.dir, dshHome: home.home, platform: 'linux', machineKey: false, accountId: ACCOUNT });
+      assert.equal(matched.ok, true);
+      assert.equal(matched.account_supported, true, 'the repository names an account');
+      assert.deepEqual(matched.account, { bound: true, matched: true, id_hint: '…abcd' });
+      assert.equal(JSON.stringify(matched).includes(ACCOUNT), false, 'the full account id must never leave describeUnlock');
+      assert.equal(JSON.stringify(matched).includes(OTHER_ACCOUNT), false);
+
+      const mismatched = describeUnlock({ root: repo.dir, dshHome: home.home, platform: 'linux', machineKey: false, accountId: OTHER_ACCOUNT });
+      assert.equal(mismatched.account.bound, true);
+      assert.equal(mismatched.account.matched, false, 'the description says "not the original account" for the panel copy');
+      assert.equal(mismatched.account.id_hint, '…abcd', 'the hint names the ORIGINAL account, not the current one');
+      assert.equal(JSON.stringify(mismatched).includes(OTHER_ACCOUNT), false);
+
+      const uncompared = describeUnlock({ root: repo.dir, dshHome: home.home, platform: 'linux', machineKey: false });
+      assert.equal(uncompared.account.bound, true);
+      assert.equal(uncompared.account.matched, null, 'without a host id there is nothing to compare');
+    } finally {
+      repo.cleanup();
+      home.cleanup();
+    }
+  });
+
+  it('mismatched id + password succeeds through the password path', () => {
+    const { repo, home } = accountBoundRepo();
+    try {
+      const opened = unlockRepo({ root: repo.dir, dshHome: home.home, password: PASSWORD, platform: 'linux', machineKey: false, accountId: OTHER_ACCOUNT });
+      assert.equal(opened.ok, true, opened.detail ?? '');
+      assert.equal(opened.via, 'password', 'a mismatched account must fall back to the password path, not refuse');
+      assert.equal(opened.account.matched, false);
+      assert.ok(opened.attempts.some((attempt) => attempt.kind === 'account' && attempt.code === 'BACKUP_ACCOUNT_MISMATCH'),
+        'the fallback records why the account path was skipped');
+      assert.equal('dek' in opened, false, 'the unlock result must not carry the data key');
+
+      const viaAccount = unlockRepo({ root: repo.dir, dshHome: home.home, platform: 'linux', machineKey: false, accountId: ACCOUNT });
+      assert.equal(viaAccount.ok, true, viaAccount.detail ?? '');
+      assert.equal(viaAccount.via, 'account', 'the matching account id alone unlocks it: no password needed');
+      assert.deepEqual(viaAccount.account, { bound: true, matched: true, id_hint: '…abcd' });
+    } finally {
+      repo.cleanup();
+      home.cleanup();
+    }
+  });
+
+  it('mismatched id with no password is the existing no-permission refusal, with the mismatch recorded', () => {
+    const { repo, home } = accountBoundRepo();
+    try {
+      const refused = unlockRepo({ root: repo.dir, dshHome: home.home, platform: 'linux', machineKey: false, accountId: OTHER_ACCOUNT });
+      assert.equal(refused.ok, false);
+      assert.equal(refused.reason_code, 'BACKUP_NO_PERMISSION', 'the outward code stays the unified unlock refusal');
+      assert.equal(refused.account.matched, false);
+      assert.ok(refused.attempts.some((attempt) => attempt.kind === 'account' && attempt.code === 'BACKUP_ACCOUNT_MISMATCH'));
+    } finally {
+      repo.cleanup();
       home.cleanup();
     }
   });

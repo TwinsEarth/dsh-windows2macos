@@ -78,7 +78,7 @@ export function selectArchiveFiles(input) {
  * Build one archive from a repository snapshot.
  *
  * @param {{root: string, dshHome: string, snapshotId?: string|null, scope?: 'archived'|'all'|'selected',
- *   sessionIds?: string[], password?: string|Buffer|null, machineKey?: boolean, platform?: string,
+ *   sessionIds?: string[], accountId?: string|null, password?: string|Buffer|null, machineKey?: boolean, platform?: string,
  *   runner?: Function, now?: Date}} input
  * @returns {object} `{ok, reason_code?, detail?, file, bytes, compressed_bytes, sessions, files, source_snapshot}`
  */
@@ -91,6 +91,7 @@ export function buildArchive(input) {
   const key = openRepoKey({
     root: input.root,
     dshHome: input.dshHome,
+    accountId: input.accountId ?? null,
     password: input.password ?? null,
     machineKey: input.machineKey,
     platform: input.platform,

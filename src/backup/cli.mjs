@@ -61,6 +61,18 @@ export function formatUnlock(payload) {
   if (payload.initialized) {
     lines.push(`envelopes     : ${payload.envelopes.join(', ') || 'none'}`);
     lines.push(`machine path  : ${payload.machine_available ? 'available on this machine' : `unavailable (${payload.machine_reason ?? 'unknown'})`}`);
+    // The account path is a comparison, not a secret: bound + matched means the account envelope opens without a
+    // password; mismatch says to use the unlock password. Only the masked hint is printed.
+    const account = payload.account ?? null;
+    if (account === null || account.bound !== true) {
+      lines.push('account path  : not bound (an identity binding is added after a successful run)');
+    } else if (account.matched === true) {
+      lines.push(`account path  : matched (original account ${account.id_hint ?? '…'}) -- unlocks without a password`);
+    } else if (account.matched === false) {
+      lines.push(`account path  : this is not the original account (${account.id_hint ?? '…'}) -- switch to the unlock password`);
+    } else {
+      lines.push(`account path  : bound (${account.id_hint ?? '…'}), not compared -- pass --account-id to compare`);
+    }
     lines.push(`password path : ${payload.password_required ? 'available (the only path on a new machine)' : 'not configured'}`);
   }
   if (payload.check !== undefined) {
@@ -219,6 +231,10 @@ function usage() {
     '  --registry-recheck <ms>  restore --apply / register: wait this long, then re-check the registry once (client save)',
     '  --workspace-path <p> restore/register: attach an unknown workspace to this directory, or create the registry there',
     '  --runtime           verify/run: confirm with the installed Harness validator (G5), not only the pre-filter',
+    '  --account-id <id>   unlock/run: the host account id to compare against the repository\'s bound id',
+    '                      (advanced/manual: the host normally supplies it; the account id is an identifier,',
+    '                      not a secret -- see docs/BACKUP-DESIGN.md section 25. `run --account-id` also binds',
+    '                      it after a successful run, so a matching account unlocks later without a password)',
     '  --check             unlock: attempt the unlock instead of only describing it',
     '  --set-password      unlock: add a password envelope to this repository (reads the password from stdin/env) so it opens without this machine',
     '  --password-stdin    run/restore/unlock --check: read the password from stdin (never argv)',
@@ -266,6 +282,7 @@ export function parseArgs(argv, env = process.env) {
     runtime: false,
     check: false,
     setPassword: false,
+    accountId: null,
   };
   const rest = [...argv];
   if (rest.length > 0 && !rest[0].startsWith('-')) options.command = rest.shift();
@@ -286,6 +303,16 @@ export function parseArgs(argv, env = process.env) {
     else if (arg === '--runtime') options.runtime = true;
     else if (arg === '--check') options.check = true;
     else if (arg === '--set-password') options.setPassword = true;
+    else if (arg === '--account-id') {
+      const raw = rest.shift() ?? '';
+      if (raw.trim() === '') return { ...options, error: '--account-id needs an account id' };
+      options.accountId = raw.trim();
+    }
+    else if (arg.startsWith('--account-id=')) {
+      const raw = arg.slice('--account-id='.length);
+      if (raw.trim() === '') return { ...options, error: '--account-id needs an account id' };
+      options.accountId = raw.trim();
+    }
     else if (arg === '--snapshot') options.snapshot = rest.shift() ?? null;
     else if (arg === '--archive') options.archiveFile = rest.shift() ?? null;
     else if (arg === '--workspace-path') options.workspacePath = path.resolve(rest.shift() ?? '');
@@ -721,6 +748,7 @@ export function main(argv, io = {}) {
       dryRun: options.dryRun,
       futureAppend: options.noFutureAppend === true ? false : undefined,
       runtimeFutureAppend: options.runtime === true,
+      accountId: options.accountId ?? undefined,
       password: passwordFor(options, io),
       machineKey: options.noMachineKey === true || (io.env ?? process.env).W2M_BACKUP_NO_MACHINE_KEY === '1' ? false : undefined,
     });
@@ -792,6 +820,7 @@ export function main(argv, io = {}) {
       root: resolved.dir,
       dshHome: options.dshHome,
       machineKey: options.noMachineKey === true ? false : undefined,
+      accountId: options.accountId,
     });
     const payload = {
       ok: described.ok,
@@ -801,6 +830,9 @@ export function main(argv, io = {}) {
       machine_available: described.machine_available,
       machine_reason: described.machine_reason,
       password_required: described.password_required,
+      // Compare-only identity binding: the masked id hint is the only form of the account id that is printed.
+      account: described.account,
+      account_supported: described.account_supported,
       reason_code: described.reason_code,
       detail: described.detail,
     };
@@ -810,6 +842,7 @@ export function main(argv, io = {}) {
         dshHome: options.dshHome,
         password: passwordFor(options, io),
         machineKey: options.noMachineKey === true ? false : undefined,
+        accountId: options.accountId,
       });
     }
     write(options.json ? JSON.stringify(payload, null, 2) : formatUnlock(payload));

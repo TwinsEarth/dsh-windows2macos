@@ -154,7 +154,7 @@
 
 | 信封 | 材料来源 | 作用 | 可得性 |
 |---|---|---|---|
-| `account` | 账户材料派生的 32 字节（spike 见 `docs/SPIKE-ACCOUNT-KEK.md`） | 同账户免密 | **有条件，且不作为机密性保证** |
+| `account` | HKDF(`w2m-account-binding|<accountId>`)：账户**标识**，不是秘密（§25，2026-11-17 用户决定） | 身份绑定：同账户免密（比对 id，一致放行） | 宿主能读到 `userId` 时；**不承诺机密性** |
 | `machine` | 本机随机 key，由 OS 钥匙串/DPAPI 保护 | 同机免密 | Windows 可得（DPAPI）；macOS 未实现 |
 | `password` | 用户密码，scrypt | 换机/清材料后唯一路径 | **必须永远可用** |
 
@@ -166,6 +166,10 @@
 4. 因此**默认信封组合 = `machine` + `password`**；`account` 是可选第三信封，且写入前必须修掉一处调用：w2m 现有 `await service.getProfile()`（零参，`src/chatops/account.mjs`）与 DSH 的 `getProfile(client)` 签名不符，沿用零参时 `userId` 大概率恒为 null，会"看起来支持、实际不可用"。
 
 > **2026-11-17 16:37 增补**：上一条的两项前置条件已闭环——`getProfile(client)` 已修（`src/chatops/account.mjs` 的 `accountClientMetadata`）并在宿主内实测（`docs/SPIKE-ACCOUNT-KEK.md` §8）：`userId` 可得且跨调用/跨 boot 稳定，但**仍只是标识**；Host-only `getPlatformSession()` 能读到 bearer token，但它在登出/401/重新登录时被删除或替换，**不是稳定的每账户秘密**。结论不变：`account` 仍默认不写。
+
+> **2026-11-17 决定增补**：用户明确选择"只读账户唯一识别码做比对，一致就放行，不一致就切换密码模式"，于是
+> `account` 作为**身份绑定**启用（不承诺机密性、不替代 password），默认随成功 run 写入。设计、面板、配置与诚实
+> 安全声明见 **§25**；本节的"`account` 默认不写"是决定之前的结论，保留作为历史记录。
 
 规则：
 
@@ -249,6 +253,8 @@
 | `BACKUP_KEY_UNWRAP_FAILED` | 当前凭据打不开这份备份，请用原账户或解锁密码 |
 | `BACKUP_PASSWORD_EMPTY` | 请输入解锁密码 |
 | **`BACKUP_NO_PERMISSION`** | **没有权限：请用原账户登录，或输入解锁密码**（v3.4.8 解锁失败的统一对外码） |
+| `BACKUP_ACCOUNT_MISMATCH` | 当前账户不是原账户：已改走密码路径（§25；`attempts` 里的具名原因，对外仍可能是 `BACKUP_NO_PERMISSION`） |
+| `BACKUP_ACCOUNT_ID_INVALID` / `BACKUP_ACCOUNT_BINDING_UNKNOWN` | 账户 id 不可用 / 已有 account 信封但缺 `account_binding` 元数据，无法比对（拒绝且不改写） |
 | `BACKUP_SELFTEST_FAILED` | 加密自检未通过：这台机器上的备份不可信 |
 | `MANIFEST_*` | 清单校验失败（具体到字段路径，供诊断用） |
 | `BACKUP_LOCKED` | 另一个备份正在运行（含持有者 pid/主机/开始时间） |
@@ -270,7 +276,7 @@
 
 ## 12. 未决问题
 
-1. **账户信封**：spike 已给出结论（§6）：`userId` 不是秘密，默认不写。实现前的两件事已于 2026-11-17 16:37 完成——`getProfile(client)` 已修并做宿主内实测（`docs/SPIKE-ACCOUNT-KEK.md` §8）：`userId` 可得且稳定但仍只是标识；Host-only token 可读但易变，不能做稳定 KEK。故 `account` 维持不实现；等上游提供"每账户稳定秘密、且换代语义明确"再开（条件清单见 `docs/SPIKE-ACCOUNT-KEK.md` §8.5）。
+1. **账户信封**：spike 已给出结论（§6）：`userId` 不是秘密，默认不写。实现前的两件事已于 2026-11-17 16:37 完成——`getProfile(client)` 已修并做宿主内实测（`docs/SPIKE-ACCOUNT-KEK.md` §8）：`userId` 可得且稳定但仍只是标识；Host-only token 可读但易变，不能做稳定 KEK。**2026-11-17 决定（§25）**：用户选择只做"比对唯一识别码"的身份绑定，`account` 信封按 §25 启用，明确不承诺机密性、不替代 password；等上游提供"每账户稳定秘密"后再评估更强的账户信封（条件清单见 `docs/SPIKE-ACCOUNT-KEK.md` §8.5）。
 2. **清单是否也该加密**：v1 选择明文（§4 理由）。若用户要求，v2 可加 `manifest.enc` + 明文 `snapshot.json`（只留计数）。
 3. **`current/` 已定稿**：存指针（见 §3 细化 3），轮转与 gc 都以它为根之一。
 4. **保留策略默认值已定稿**：每会话 10 份旧版本（Q4=A），`keepOldPerSession` 可配；轮转后立即裁剪，窗口不会无声增长。
@@ -560,15 +566,20 @@ UI 半只有一个文件：`lib/client.js`（手写、由 `window.__ModuleLoader
   404/失败显示中性提示 +「刷新会话」重试，不阻塞面板其余部分），勾选只存在页面内存里、刷新即丢。两个入口
   仍然走带 `confirm:'run'` 的 POST：没有确认令牌不会写入任何字节，选中不持久化，扫描本身从不写盘；已归档
   会话仍由 `archived` 范围或 `all` 范围覆盖，`selected` 不会静默改变这一点。
-* **解锁卡**：`GET /unlock` 描述两条路径——本机信封按钮 `POST {confirm:'unlock'}`；密码路径**不在 HTTP 上传输**，
-  面板显示终端命令 `w2m-backup unlock --check --password-stdin`。`BACKUP_NO_PERMISSION` 的文案为
-  「没有权限：请用原账户登录，或输入解锁密码」（`account` 信封已按 spike 结论不做，见 §6/§15.5）。
+* **解锁卡**：`GET /unlock` 描述路径——本机信封按钮 `POST {confirm:'unlock'}`；2026-11-17 起当仓库绑定了账户 id
+  时还有**账户身份绑定行**（§25：一致 → 「用原账户解锁」可点；不一致/读不到 → 按钮禁用并提示改用密码；未绑定则
+  原卡片不变，只显示后 4 位 `id_hint`）；密码路径**不在 HTTP 上传输**，面板显示终端命令
+  `w2m-backup unlock --check --password-stdin`。`BACKUP_NO_PERMISSION` 的文案为
+  「没有权限：请用原账户登录，或输入解锁密码」，`BACKUP_ACCOUNT_MISMATCH` 映射为「当前账户不是原账户：已改走
+  解锁密码路径，请用密码解锁」（§25）。
 * **日志区**：当前页内最多 50 条操作记录（时间、结果码、detail），失败时同时显示错误卡。
 * **刷新**：挂载即读状态；之后 10 s 轮询只读状态（`typeof window !== 'undefined'` 守卫），页面卸载清定时器；
   每个操作完成后立即重读状态。
-* **i18n**：`panel.backup.*` 共 139 个键 × 中/英（2026-11-17 增加 `verify.runtimeCounts` / `verify.runtimeHint`
-  两键，`verify.runtime` 改为勾选框标签，见 §22.4；v3.5.0 增加两个范围入口与只读扫描卡 16 键），随既有
-  `registerDictionaries` 注册（内联字典是该 bundle 的实际机制；`locale/*.json` 只是商店清单元数据）；34 个
+* **i18n**：`panel.backup.*` 共 145 个键 × 中/英（2026-11-17 增加 `verify.runtimeCounts` / `verify.runtimeHint`
+  两键，`verify.runtime` 改为勾选框标签，见 §22.4；v3.5.0 增加两个范围入口与只读扫描卡 16 键；账户 ID 绑定再加
+  `unlock.accountBound/accountMatched/accountMismatch/accountUnavailable`、`action.unlockAccount`、
+  `reason.BACKUP_ACCOUNT_MISMATCH` 6 键，见 §25），随既有
+  `registerDictionaries` 注册（内联字典是该 bundle 的实际机制；`locale/*.json` 只是商店清单元数据）；35 个
   reason-code 到文案的映射。
 * **主题**：只用宿主 `--dsw-alias-*` 设计令牌，无字面色值、无媒体查询（深浅色由宿主切换）；窄宽度用
   `auto-fit` 网格。
@@ -996,3 +1007,140 @@ blocks 重建旧版本，不把 `.enc` 计入引用。
 * **`verify` 尚未逐份解密 `.enc`**：损坏的副本要等 gc/人工按上面的 `openObject` 方式发现；记录本身的完整性
   校验不变。
 * 本次不 bump 版本号、不跑 preflight、不提交；与 §13/§21 的默认行为完全一致（默认 `records`）。
+
+## 25. 账户 ID 绑定解锁（用户决定：只比对唯一识别码，2026-11-17）
+
+**用户决定（原话）**：
+
+> 不用打开账户，只需要读取账户唯一识别码ID，进行比对就行，一致就放行。不一致就切换密码模式。
+
+**问题**：§23 完成后仓库有 `machine` + `password` 两个信封。`machine` 换机/重装即失效，`password` 是唯一跨机器
+路径但每次都要求人输入密码。spike（`docs/SPIKE-ACCOUNT-KEK.md`）证明宿主能稳定读到账户**标识** `userId`
+（Host-only，`src/chatops/account.mjs` 的 `createAccountIdentity({ctx}).identify()`，`getProfile(client)` 已修），
+但**没有**稳定的每账户秘密。用户明确选择了"只拿这个标识做比对"的第三条路。
+
+### 25.1 这是什么：身份绑定，不是机密性（必须先读）
+
+仓库多一个 `account` 信封：DEK 被 `HKDF(w2m-account-binding|<accountId>)` 包裹（`deriveKek`，hkdf-sha256，随机
+salt 随信封记录），绑定的账户 id 与绑定时间记在 `keys.json` 根字段：
+
+```json
+{
+  "format": "w2m-session-backup/keys",
+  "version": 1,
+  "account_binding": { "account_id": "<host userId>", "bound_at": "2026-11-17T…Z" },
+  "envelopes": [
+    { "kind": "machine", ... },
+    { "kind": "account", "kdf": { "algo": "hkdf-sha256", "keylen": 32, "salt": "base64" }, "sealed": {...} }
+  ]
+}
+```
+
+> ### 诚实安全声明（用户已知并接受）
+>
+> **账户 id 是标识，不是秘密。这条路径提供的是"身份绑定/便捷解封"，不是机密性。** 任何知道该账户 id 且拿到
+> 仓库文件（`keys.json` + `objects/`）的人，都能推导出同一个 KEK 并解开备份——这正是"只比对 ID"这一决定的直接
+> 代价，用户在原话里明确接受。因此：
+>
+> * `account` 信封**永不替代** `password` 信封：`password` 仍是跨机器/跨账户的唯一秘密路径，仍必须永远可用；
+> * 面板/CLI/日志**永远不打印完整账户 id**，只打印后 4 位（`id_hint`，形如 `…abcd`）；
+> * `keys.json` 里**明文**保存了账户 id（比对需要它）；这不是新增的机密性假设，但它是可识别信息，仓库文件
+>   仍应按"可泄露会话清单"对待（§8 的威胁模型不变：真正的秘密是密码与机器密钥）；
+> * 仅当 `backupAccountBinding`（默认 `true`）开启时才读取/绑定；关闭后行为与本功能之前完全一致。
+
+### 25.2 匹配 / 不匹配流程
+
+候选凭据顺序由协议固定（`crypto.unwrapDek` 的 `ENVELOPE_KINDS`）：**account → machine → password**。
+
+| 情况 | 行为 |
+|---|---|
+| 仓库绑定了账户 id，宿主读到的 id **一致** | account 信封参与解封（无密码、无 machine 也可打开，`unlocked_via: "account"`） |
+| 仓库绑定了账户 id，宿主 id **不一致** | 不尝试 account 信封；`attempts` 记录 `{kind:"account", ok:false, code:"BACKUP_ACCOUNT_MISMATCH"}`，继续 machine/password |
+| 不一致且没有可用的 machine/password | 对外仍是统一的 `BACKUP_NO_PERMISSION`（与 §11 一致；不新增第二套"拒绝"文案） |
+| 仓库未绑定账户 id | 不比较（`account.matched: null`），行为与本功能之前一致 |
+| 宿主读不到 id（未登录/无账户服务/绑定关闭） | 不比较（`matched: null`），面板提示改用密码 |
+
+结果字段（`openRepoKey` / `describeUnlock` / `unlockRepo` 都带，纯加法）：
+
+```js
+account: { bound: true|false, matched: true|false|null, id_hint: '…abcd'|null }
+```
+
+`matched` 只在"仓库有绑定且调用方给了 id"时才是布尔值；其余情况 `null`（没有可比较的对象，不猜）。
+**完整账户 id 绝不出现在任何结果、CLI 输出、HTTP 响应或日志里**——只有 `id_hint`（后 4 位）。
+
+### 25.3 绑定（写入）语义
+
+`addAccountEnvelope(keys, dek, accountId)`：在现有 `keys.json` 上追加 `account` 信封 + `account_binding` 元数据，
+**复用现有 envelope 机制**（`wrapDek`/`validateKeysFile`，没有新密码学）。`validateKeysFile` 把 `account_binding`
+作为**可选**字段校验（形状/长度/ISO 时间），没有它的旧文件照常可读。
+
+`bindAccount({root, dshHome, accountId, ...})`：用**现有凭据**打开仓库（machine 或已有 password）→ 同一 DEK 再包
+一个 account 信封 → 复制 `keys.json` 为 `keys.json.bak-<ts>` → 原子写 → **只用 account 凭据解一次并与 DEK 比对**。
+规则：
+
+* 幂等：已绑定同一 id → `added: false`，不重写文件；
+* 已绑定**不同** id → 具名拒绝 `BACKUP_ACCOUNT_MISMATCH`，永不静默改绑；
+* 账户 id 不可用（空/非字符串/超长）→ `BACKUP_ACCOUNT_ID_INVALID`；
+* 存在 `account` 信封但没有 `account_binding` 元数据（无法比对）→ `BACKUP_ACCOUNT_BINDING_UNKNOWN`，不覆盖、不猜；
+* 绑定**永远发生在一次成功 run 之后**（或操作员显式调用 `bindAccount`），账户 id 本身**不能**成为建库理由：
+  建库仍要求 machine 或 password（§6 规则 6 不变）。
+
+**真实仓库迁移不在本次代码任务内**（由 lead 执行）；`bindAccount` 可独立调用，一行示例（PowerShell，先替换
+`<accountId>`；正斜杠路径在 Windows Node 下合法）：
+
+```powershell
+node --input-type=module -e "import { bindAccount } from 'file:///E:/GPT/w2m/w2m-345-fresh/src/backup/keystore.mjs'; console.log(JSON.stringify(bindAccount({ root: 'D:/DeepSeekHarness/BackUP', dshHome: process.env.USERPROFILE + '/.dsh', accountId: '<accountId>' }), null, 2))"
+```
+
+### 25.4 宿主接线（无账户网络调用要求）
+
+* 面板路由（`src/plugin/backup.mjs`）：`GET/POST /api/w2m/backup/unlock`、restore/archive/verify 每次请求用
+  `createAccountIdentity({ctx}).identify()` **best effort** 读一次宿主 id（`ctx.get('deepseekAccount')`；无服务/未登录
+  → `null`，绝不抛错、绝不因此拒绝请求），传给 `describeUnlock`/`unlockRepo`/`openRepoKey`。用户已修好的
+  `getProfile(client)` 路径只在 `userId` 缺失时才可能触发一次 profile 读取（signed-out 时会被 catch 成 null）。
+* 成功 run 后：`runBackup({accountId})` 在快照提交/轮转之后调用 `bindAccount`，失败**只记 warning**，不改 `ok`、
+  不导致回滚；结果新增 `account_binding: {bound, added, id_hint, reason_code?}`（只在提供 id 时出现）。
+* 配置：`backupAccountBinding: boolean`（默认 `true`；`false` = 不读 id、不绑定、不比较）。`cordis.patch.yml` 的
+  dsh-backup 行显式写 `backupAccountBinding: true`。
+* CLI（离线、手动）：`w2m-backup unlock --account-id <id>`（描述/比对）与 `unlock --check --account-id <id>`（尝试），
+  `w2m-backup run --account-id <id>`（成功后绑定）。CLI 不会自己读宿主 id：id 只能由宿主或操作员提供，避免又造一个
+  "可手填的账户凭据"（见 `src/chatops/account.mjs` 开头的原则）。`--account-id` 是高级/手动参数，其余命令不变。
+
+### 25.5 面板文案（`lib/client.js`）
+
+解锁卡在"仓库绑定了账户"时增加账户路径行（HTTP 仍不接收任何凭据，按钮只发 `{"confirm":"unlock"}`）：
+
+| 状态 | 文案（中） | 按钮 |
+|---|---|---|
+| `bound: true, matched: true` | 本机账户与原账户一致，可直接解锁。 | 「用原账户解锁」可点 |
+| `bound: true, matched: false` | 当前账户不是原账户：请使用解锁密码。 | 禁用（不能点） |
+| `bound: true, matched: null` | 读取不到本机账户 ID（可能未登录，或账户绑定已关闭）：请使用解锁密码。 | 禁用 |
+| `bound: false` | 不显示账户行（原卡片不变） | — |
+
+行内始终显示"原账户绑定：{hint}（只显示后 4 位）"；新错误码 `BACKUP_ACCOUNT_MISMATCH` 走
+`panel.backup.reason.*` 文案映射（未知码仍原样显示）。
+
+### 25.6 测试与验证
+
+* `test/backup-keystore.test.mjs`：machine-only 仓库加 account 信封后 `machineKey:false + accountId` 可开且 DEK 不变；
+  错误 id 被拒但 machine/password 仍可开；重复绑定 no-op、换绑具名拒绝；`account_binding` 元数据存在；信封列表含
+  `account`；空/非法 id 拒绝且零写入。
+* `test/backup-access.test.mjs`：`describeUnlock` 报告 bound/matched 且不泄露完整 id（JSON 里搜不到 id 原文）；
+  mismatch 文案状态；mismatch + password 走密码成功；mismatch 且无密码 → `BACKUP_NO_PERMISSION` + attempts 记录。
+* `test/backup-run.test.mjs`：插件路由用假 `deepseekAccount` 服务比对 id（不联网）、绑定关闭时 `matched: null`、
+  Windows 真实 DPAPI 下 run 后自动绑定并经 account 解锁、CLI `--account-id` 解析/真实入口/JSON 形状/人类输出脱敏/
+  usage。
+* `test/client-bundle.test.mjs`：账户路径三态（matched 可点、mismatch 按钮禁用 + 密码提示、未绑定卡片不变）、
+  字典与 reason code 映射。
+* `docs/SPIKE-ACCOUNT-KEK.md` 顶部加"决定更新"注记（不改写原测量）。
+
+### 25.7 诚实边界（本次不承诺的）
+
+* **不是机密性**：见 §25.1 的声明。知道账户 id 的人拿到仓库文件即可解密——这是用户决定的直接代价，不是缺陷。
+* 账户 id 由宿主提供；**CLI 不会自己读**。宿主未登录/断网/无账户服务时 account 路径不可用，密码路径照旧。
+* 面板的账户路径按钮与 machine 按钮都只发同一个确认令牌；面板从不接收密码，密码路径仍只在离线 CLI。
+* `account` 信封**不能**在"换账户 + 无 machine + 无 password"时救回仓库：那是 password 路径的职责。
+* 已经存在的旧快照目录里的 `keys.json` 副本没有新绑定（绑定只写根 `keys.json`，下一次快照起副本才有）；从旧快照
+  直接还原仍走 machine/password。
+* 不 bump 版本号、不跑 preflight、不提交；真实仓库迁移由 lead 用 §25.3 的命令执行。

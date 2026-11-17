@@ -1509,6 +1509,8 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
     assert.ok(text.includes('密码不经过 HTTP'), 'the copy says a password never travels over HTTP');
     assert.equal(findBy(available, (node) => node.type === 'input' && node.props?.type === 'password').length, 0,
       'HTTP never takes a password, so there is no password field');
+    assert.equal(findBy(available, (node) => node.props?.['data-w2m-backup-unlock-account'] !== undefined).length, 0,
+      'a repository with no account binding shows no account row: the unbound card is unchanged');
 
     const unavailable = bundle.exports.BackupPanelView(viewProps({
       t,
@@ -1518,6 +1520,72 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
       'no machine button when the envelope cannot be loaded');
     assert.ok(collectText(unavailable).join('\n').includes('w2m-backup unlock --check --password-stdin'),
       'the password path is still shown instead');
+  });
+
+  it('shows the compare-only account path: a match unlocks, a mismatch sends the operator to the password', () => {
+    const { bundle } = mountBackup();
+    const t = bundle.exports.makeTranslator(() => undefined);
+
+    const matched = bundle.exports.BackupPanelView(viewProps({
+      t,
+      unlock: {
+        ok: true,
+        initialized: true,
+        envelopes: ['machine', 'account', 'password'],
+        machine_available: true,
+        machine_reason: null,
+        password_required: true,
+        account: { bound: true, matched: true, id_hint: '…abcd' },
+      },
+    }));
+    const matchedRow = findBy(matched, (node) => node.props?.['data-w2m-backup-unlock-account'] !== undefined)[0];
+    assert.ok(matchedRow !== undefined, 'the account row is rendered when the repository is bound');
+    assert.equal(matchedRow.props['data-w2m-backup-unlock-account'], 'matched');
+    const matchedButton = actionButton(matched, 'unlock-account');
+    assert.ok(matchedButton !== undefined, 'the account path gets its own one-click button');
+    assert.equal(matchedButton.props.disabled, false, 'a matching account id may unlock without a password');
+    const matchedText = collectText(matched).join('\n');
+    assert.ok(matchedText.includes('本机账户与原账户一致，可直接解锁'), 'the match copy is the "original account" sentence');
+    assert.ok(matchedText.includes('…abcd'), 'the masked hint is shown');
+    assert.equal(matchedText.includes('user-1234abcd'), false, 'the full account id never reaches the panel copy');
+
+    const mismatch = bundle.exports.BackupPanelView(viewProps({
+      t,
+      unlock: {
+        ok: true,
+        initialized: true,
+        envelopes: ['account', 'password'],
+        machine_available: false,
+        machine_reason: 'dpapi-probe-failed',
+        password_required: true,
+        account: { bound: true, matched: false, id_hint: '…abcd' },
+      },
+    }));
+    const mismatchRow = findBy(mismatch, (node) => node.props?.['data-w2m-backup-unlock-account'] !== undefined)[0];
+    assert.equal(mismatchRow.props['data-w2m-backup-unlock-account'], 'mismatch');
+    const mismatchButton = actionButton(mismatch, 'unlock-account');
+    assert.equal(mismatchButton.props.disabled, true, 'a different account must not be presented as an unlock button');
+    const mismatchText = collectText(mismatch).join('\n');
+    assert.ok(mismatchText.includes('当前账户不是原账户：请使用解锁密码'), 'the mismatch copy tells the operator to use the password');
+    assert.ok(mismatchText.includes('w2m-backup unlock --check --password-stdin'), 'the password path is still explained');
+
+    // Bound, but the host could not read an id to compare (signed out, or account binding switched off in config).
+    const unread = bundle.exports.BackupPanelView(viewProps({
+      t,
+      unlock: {
+        ok: true,
+        initialized: true,
+        envelopes: ['account'],
+        machine_available: false,
+        machine_reason: 'dpapi-probe-failed',
+        password_required: false,
+        account: { bound: true, matched: null, id_hint: '…abcd' },
+      },
+    }));
+    const unreadRow = findBy(unread, (node) => node.props?.['data-w2m-backup-unlock-account'] !== undefined)[0];
+    assert.equal(unreadRow.props['data-w2m-backup-unlock-account'], 'unknown');
+    assert.equal(actionButton(unread, 'unlock-account').props.disabled, true, 'no comparison means no account unlock');
+    assert.ok(collectText(unread).join('\n').includes('读取不到本机账户 ID'));
   });
 
   it('never carries a password into a request body (the section posts confirmation tokens only)', () => {
@@ -2082,6 +2150,13 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
       'panel.backup.action.verify',
       'panel.backup.unlock.passwordPath',
       'panel.backup.reason.BACKUP_NO_PERMISSION',
+      // v3.5.x compare-only account-id binding: the account row, its three states and the new reason code.
+      'panel.backup.unlock.accountBound',
+      'panel.backup.unlock.accountMatched',
+      'panel.backup.unlock.accountMismatch',
+      'panel.backup.unlock.accountUnavailable',
+      'panel.backup.action.unlockAccount',
+      'panel.backup.reason.BACKUP_ACCOUNT_MISMATCH',
       // G5: the slow runtime verdict is an explicit toggle with its own hint.
       'panel.backup.verify.runtime',
       'panel.backup.verify.runtimeCounts',
@@ -2113,6 +2188,12 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
     assert.notEqual(dictionary.zh['panel.backup.verify.runtimeHint'], dictionary.en['panel.backup.verify.runtimeHint'],
       'the hint is translated, not copied');
     assert.equal(dictionary.zh['panel.backup.reason.BACKUP_NO_PERMISSION'], '没有权限：请用原账户登录，或输入解锁密码');
+    assert.ok(dictionary.zh['panel.backup.unlock.accountMismatch'].includes('不是原账户'),
+      'the mismatch copy says the current account is not the original one');
+    assert.ok(dictionary.en['panel.backup.unlock.accountMatched'].includes('matches the original account'),
+      'the English match copy says the account matches');
+    assert.ok(dictionary.zh['panel.backup.reason.BACKUP_ACCOUNT_MISMATCH'].includes('密码'),
+      'the mismatch reason code points the operator at the password path');
     assert.notEqual(dictionary.zh['panel.backup.title'], dictionary.en['panel.backup.title'], 'both languages are real translations');
     assert.equal(dictionary.zh['panel.backup.pick.count'], '已选 {n}/{m}', 'the count copy keeps both placeholders');
     assert.equal(dictionary.zh['panel.backup.action.backupSelected'], '备份选中会话');
@@ -2137,6 +2218,7 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
     const { exports } = loadBundle();
     const t = exports.makeTranslator(() => undefined);
     assert.equal(exports.backupReasonText('BACKUP_NO_PERMISSION', t), '没有权限：请用原账户登录，或输入解锁密码');
+    assert.equal(exports.backupReasonText('BACKUP_ACCOUNT_MISMATCH', t), '当前账户不是原账户：已改走解锁密码路径，请用密码解锁');
     assert.equal(exports.backupReasonText('BACKUP_BUSY', t), '上一次备份还在运行，请稍候。');
     assert.equal(exports.backupReasonText('BACKUP_SOMETHING_NEW', t), 'BACKUP_SOMETHING_NEW', 'an unknown code is never guessed');
     assert.equal(exports.backupReasonText('', t), '');

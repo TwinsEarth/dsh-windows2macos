@@ -13,7 +13,9 @@ import {
   KEYSTORE_CODES,
   setRepositoryPassword,
   NO_PERMISSION,
+  addAccountEnvelope,
   addMachineEnvelope,
+  bindAccount,
   openRepoKey,
   readRepoKeys,
   repoKeysPath,
@@ -202,6 +204,121 @@ describe('keystore: adding a password envelope to a machine-only repository', ()
       const short = setRepositoryPassword({ root, dshHome: home, password: 'short', platform: 'win32', runner: fakeRunner, kdf: KDF });
       assert.equal(short.ok, false);
       assert.equal(readFileSync(repoKeysPath(root), 'utf8'), before);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe('keystore: account id binding (compare-only, docs/BACKUP-DESIGN.md §25)', () => {
+  const ACCOUNT = 'user-1234abcd';
+  const OTHER = 'user-9999ffff';
+
+  /** A repository with only a machine envelope (the scheduled-run default). */
+  function machineOnlyRepo() {
+    const { dir, cleanup } = tempDir('w2m-keystore-account-');
+    const root = `${dir}/repo`;
+    ensureLayout(root);
+    const home = `${dir}/home`;
+    const created = openRepoKey({ root, dshHome: home, platform: 'win32', runner: fakeRunner, kdf: KDF });
+    assert.equal(created.ok, true, created.detail ?? '');
+    assert.deepEqual(readRepoKeys(root).keys.envelopes.map((envelope) => envelope.kind), ['machine']);
+    return { dir, root, home, created, cleanup };
+  }
+
+  it('binds a machine-only repository, records the id, and the account credential alone opens the same DEK', () => {
+    const { root, home, created, cleanup } = machineOnlyRepo();
+    try {
+      const bound = bindAccount({ root, dshHome: home, accountId: ACCOUNT, platform: 'win32', runner: fakeRunner, kdf: KDF });
+      assert.equal(bound.ok, true, bound.detail ?? '');
+      assert.equal(bound.added, true);
+      assert.deepEqual(bound.envelopes.slice().sort(), ['account', 'machine']);
+      assert.equal(bound.account.bound, true);
+      assert.equal(bound.account.matched, true);
+      assert.equal(bound.account.id_hint, '…abcd', 'only the last four characters are reported');
+      assert.equal(String(bound.account.id_hint).includes(ACCOUNT), false);
+      assert.equal(existsSync(bound.backup_file), true, 'the previous key document is kept before the write');
+
+      const document = readRepoKeys(root);
+      assert.equal(document.ok, true);
+      assert.equal(document.keys.account_binding.account_id, ACCOUNT);
+      assert.match(document.keys.account_binding.bound_at, /^\d{4}-\d{2}-\d{2}T/u);
+      assert.ok(document.keys.envelopes.some((envelope) => envelope.kind === 'account'), 'the envelope list includes account');
+
+      // The point of the binding: no machine key, no password -- the matching account id alone opens it.
+      const viaAccount = openRepoKey({ root, dshHome: home, platform: 'linux', machineKey: false, accountId: ACCOUNT, kdf: KDF });
+      assert.equal(viaAccount.ok, true, viaAccount.detail ?? '');
+      assert.equal(viaAccount.unlocked_via, 'account');
+      assert.deepEqual(viaAccount.dek, created.dek, 'the DEK must not change: existing blocks stay readable');
+      assert.deepEqual(viaAccount.account, { bound: true, matched: true, id_hint: '…abcd' });
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('refuses a different account id but leaves the machine and password paths working', () => {
+    const { root, home, created, cleanup } = machineOnlyRepo();
+    try {
+      const bound = bindAccount({ root, dshHome: home, accountId: ACCOUNT, platform: 'win32', runner: fakeRunner, kdf: KDF });
+      assert.equal(bound.ok, true, bound.detail ?? '');
+      setRepositoryPassword({ root, dshHome: home, password: 'recovery-password', platform: 'win32', runner: fakeRunner, kdf: KDF });
+
+      // Wrong id, no other credential: the account path is refused (the user's rule: mismatch -> password mode).
+      const refused = openRepoKey({ root, dshHome: home, platform: 'linux', machineKey: false, accountId: OTHER, kdf: KDF });
+      assert.equal(refused.ok, false);
+      assert.equal(refused.reason_code, NO_PERMISSION);
+      assert.deepEqual(refused.account, { bound: true, matched: false, id_hint: '…abcd' });
+      assert.ok(refused.attempts.some((attempt) => attempt.kind === 'account' && attempt.code === KEYSTORE_CODES.ACCOUNT_MISMATCH),
+        'the mismatch is named, not reported as a generic authentication failure');
+
+      // Wrong id + password: the password path still opens the same DEK.
+      const viaPassword = openRepoKey({ root, dshHome: home, password: 'recovery-password', platform: 'linux', machineKey: false, accountId: OTHER, kdf: KDF });
+      assert.equal(viaPassword.ok, true, viaPassword.detail ?? '');
+      assert.equal(viaPassword.unlocked_via, 'password');
+      assert.deepEqual(viaPassword.dek, created.dek);
+
+      // Wrong id + machine key: the machine path still opens it on its own machine.
+      const viaMachine = openRepoKey({ root, dshHome: home, platform: 'win32', runner: fakeRunner, accountId: OTHER, kdf: KDF });
+      assert.equal(viaMachine.ok, true, viaMachine.detail ?? '');
+      assert.equal(viaMachine.unlocked_via, 'machine');
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('re-binding the same id is a no-op and binding a different id is refused', () => {
+    const { root, home, cleanup } = machineOnlyRepo();
+    try {
+      const first = bindAccount({ root, dshHome: home, accountId: ACCOUNT, platform: 'win32', runner: fakeRunner, kdf: KDF });
+      assert.equal(first.ok, true, first.detail ?? '');
+      const before = readFileSync(repoKeysPath(root), 'utf8');
+      const again = bindAccount({ root, dshHome: home, accountId: ACCOUNT, platform: 'win32', runner: fakeRunner, kdf: KDF });
+      assert.equal(again.ok, true);
+      assert.equal(again.added, false);
+      assert.equal(readFileSync(repoKeysPath(root), 'utf8'), before, 'a second bind must not rewrite the document');
+
+      const other = bindAccount({ root, dshHome: home, accountId: OTHER, platform: 'win32', runner: fakeRunner, kdf: KDF });
+      assert.equal(other.ok, false);
+      assert.equal(other.reason_code, KEYSTORE_CODES.ACCOUNT_MISMATCH);
+      assert.match(other.detail, /different account/u);
+      assert.equal(readFileSync(repoKeysPath(root), 'utf8'), before, 'a refused re-bind must not touch the document');
+      assert.equal(readRepoKeys(root).keys.account_binding.account_id, ACCOUNT);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('addAccountEnvelope refuses unusable ids and never invents a binding for an empty id', () => {
+    const { root, home, cleanup } = machineOnlyRepo();
+    try {
+      const opened = openRepoKey({ root, dshHome: home, platform: 'win32', runner: fakeRunner, kdf: KDF });
+      assert.equal(opened.ok, true);
+      for (const bad of ['', '   ', null, 42]) {
+        const refused = addAccountEnvelope(opened.keys, opened.dek, bad);
+        assert.equal(refused.added, false, `accountId=${JSON.stringify(bad)} must be refused`);
+        assert.equal(refused.reason_code, KEYSTORE_CODES.ACCOUNT_INVALID);
+      }
+      assert.equal(readRepoKeys(root).keys.account_binding, undefined, 'nothing is written for a refused binding');
     } finally {
       cleanup();
     }

@@ -10,8 +10,10 @@
  *
  * Three envelope kinds, in the order they are tried:
  *
- *   * `account` -- a 32-byte secret derived from account material when the host can supply it (see
- *     `docs/SPIKE-ACCOUNT-KEK.md` for whether it can);
+ *   * `account` -- a KEK derived from the account **identifier** the host reports. This is an identity
+ *     binding, not a secret: anyone who knows the account id and has the repository files can derive the same
+ *     KEK. The user accepted that trade-off explicitly (docs/BACKUP-DESIGN.md §25); it is a convenience path
+ *     that makes "same account, new machine" unlockable without a password, and it never replaces `password`.
  *   * `machine` -- a random key protected by the OS keystore (DPAPI on Windows), so restoring on the same
  *     machine needs no password;
  *   * `password` -- scrypt(password, salt). The only kind that survives a machine change, and therefore the
@@ -427,6 +429,23 @@ export function validateKeysFile(keysFile) {
   }
   if (!Number.isSafeInteger(keysFile.version) || keysFile.version < 1 || keysFile.version > ENVELOPE_VERSION) {
     throw new BackupCryptoError(CRYPTO_CODES.ENVELOPE_MALFORMED, `unsupported key-file version: ${JSON.stringify(keysFile.version)}`);
+  }
+  // Additive optional (v3.5.x): the account identifier this repository is bound to. It is written next to the
+  // `account` envelope so the two cannot be desynchronised by an edit in one place, and validating it here means
+  // every reader (snapshot copies included) rejects a malformed binding instead of silently comparing a
+  // half-parsed one. An `account` envelope without this metadata stays valid: it is an envelope this build
+  // cannot compare against a host account, which is a normal older file, not corruption.
+  if (keysFile.account_binding !== undefined && keysFile.account_binding !== null) {
+    const binding = keysFile.account_binding;
+    if (typeof binding !== 'object' || Array.isArray(binding)) {
+      throw new BackupCryptoError(CRYPTO_CODES.ENVELOPE_MALFORMED, 'the account_binding record is not an object');
+    }
+    if (typeof binding.account_id !== 'string' || binding.account_id.trim() === '' || binding.account_id.length > 1024) {
+      throw new BackupCryptoError(CRYPTO_CODES.ENVELOPE_MALFORMED, 'account_binding.account_id must be a non-empty string of at most 1024 characters');
+    }
+    if (binding.bound_at !== undefined && (typeof binding.bound_at !== 'string' || Number.isNaN(Date.parse(binding.bound_at)))) {
+      throw new BackupCryptoError(CRYPTO_CODES.ENVELOPE_MALFORMED, 'account_binding.bound_at must be an ISO timestamp when it is present');
+    }
   }
   if (!Array.isArray(keysFile.envelopes) || keysFile.envelopes.length === 0) {
     throw new BackupCryptoError(CRYPTO_CODES.ENVELOPE_MALFORMED, 'the key file has no envelopes');

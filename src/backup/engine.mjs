@@ -59,7 +59,7 @@ import { buildManifest, normalizeRelPath, sha256Hex, splitBlocks } from './manif
 import { sealObject } from './crypto.mjs';
 import { writeFileAtomic } from './atomic.mjs';
 import { withRepoLock } from './locks.mjs';
-import { openRepoKey } from './keystore.mjs';
+import { openRepoKey, bindAccount } from './keystore.mjs';
 import { detectMachineKeySupport } from './machine-key.mjs';
 import { appendLegalEvent, futureAppendVerdict } from './future-append.mjs';
 import { buildArtifactFromBuffer, runtimeValidateBatch } from './runtime-validate.mjs';
@@ -269,6 +269,7 @@ function safeMtime(file) {
  *   dshHome: string,
  *   scope?: string,
  *   selected?: string[],
+ *   accountId?: string|null,
  *   password?: string|Buffer|null,
  *   platform?: string,
  *   runner?: Function,
@@ -359,6 +360,7 @@ export function runBackup(input) {
       : openRepoKey({
           root,
           dshHome,
+          accountId: input.accountId ?? null,
           password: input.password ?? null,
           platform: input.platform,
           runner: input.runner,
@@ -567,6 +569,42 @@ export function runBackup(input) {
     // in that mode so a default run keeps exactly the result shape it had before this option existed.
     const fullOldVersions = rotated.map((row) => row.full_copy?.file).filter((file) => typeof file === 'string');
 
+    // Account binding is best effort and strictly after the committed snapshot. The user's rule is compare-only:
+    // the account id is an identifier, not a secret (docs/BACKUP-DESIGN.md §25), so this is a convenience path and
+    // a failure here is a warning on an otherwise good backup -- never a refusal, and never a replacement for the
+    // machine/password envelopes. `runBackup` only reaches this point when the repository already opened with a
+    // real credential, so the binding can never be the reason a repository exists.
+    const warnings = [];
+    let accountBinding = null;
+    if (typeof input.accountId === 'string' && input.accountId.trim() !== '') {
+      try {
+        const bound = bindAccount({
+          root,
+          dshHome,
+          accountId: input.accountId,
+          password: input.password ?? null,
+          platform: input.platform,
+          runner: input.runner,
+          machineKey: input.machineKey,
+          now,
+        });
+        accountBinding = {
+          bound: bound.account?.bound === true,
+          added: bound.added === true,
+          id_hint: bound.account?.id_hint ?? null,
+          ...(bound.ok === true ? {} : { reason_code: bound.reason_code }),
+        };
+        if (bound.ok !== true) {
+          warnings.push(`${String(bound.reason_code ?? 'BACKUP_ACCOUNT_BIND_FAILED')}: the snapshot is committed, but the account id was not bound: ${String(bound.detail ?? '')}`.trimEnd());
+        }
+      } catch (error) {
+        warnings.push(
+          `${String(error?.code ?? 'BACKUP_ACCOUNT_BIND_FAILED')}: the snapshot is committed, but the account id was not bound: ` +
+            `${String(error?.detail ?? (error instanceof Error ? error.message : error))}`,
+        );
+      }
+    }
+
     // The offsite copy is strictly after the primary commit and rotation: it is a second, best-effort location,
     // never a precondition. A mirror failure is reported in the result and as a warning, but it does not roll
     // back (the primary backup is durable and correct) and it must never turn `ok` false or throw.
@@ -630,7 +668,8 @@ export function runBackup(input) {
       // Absent unless a mirror is configured: a repository with no mirror keeps the exact result shape it had
       // before the offsite feature existed.
       ...(mirrorRoot === null ? {} : { mirror }),
-      ...(mirrorWarnings === null ? {} : { warnings: mirrorWarnings }),
+      ...(accountBinding === null ? {} : { account_binding: accountBinding }),
+      ...(warnings.length + (mirrorWarnings?.length ?? 0) === 0 ? {} : { warnings: [...warnings, ...(mirrorWarnings ?? [])] }),
       duration_ms: Date.now() - started,
     };
   } catch (error) {
