@@ -2419,6 +2419,11 @@ describe('Localside agent end to end', () => {
   });
 
   it('answers a transport re-delivery from cache but re-runs a new attempt', async () => {
+    // Load-sensitive on purpose: this case performs a real child spawn plus three IPC round trips, and on a
+    // loaded machine that chain once needed ~22 s and tripped the 15 s default budget. Every condition here is
+    // event-based -- nothing sleeps for a fixed duration -- and the budgets are now large enough that "slow" is
+    // never reported as "broken". 60 s stays a ceiling: a genuine hang still fails, only later.
+    const BUDGET_MS = 60_000;
     const rabbit = await startFakeRabbit();
     const project = await makeRepo('e2e-dedupe');
     const marker = join(project, 'runs.txt');
@@ -2426,7 +2431,7 @@ describe('Localside agent end to end', () => {
     try {
       const agent = makeAgent({ rabbit: rabbit.url, project, allowed: [['node', '-e']], once: false, name: 'dedupe' });
       const running = agent.start();
-      const stream = await rabbit.stream();
+      const stream = await rabbit.stream(BUDGET_MS);
       stream.send('ready', { protocol_version: 1, machine_id: 'rabbit' });
       const offer = {
         task_id: '01J-E2E-DEDUPE',
@@ -2445,12 +2450,12 @@ describe('Localside agent end to end', () => {
         dedupe_key: 'dk-e2e-dedupe',
       };
       stream.send('task.offer', offer);
-      await waitFor(() => rabbit.state.results.length === 1, { label: 'first result' });
+      await waitFor(() => rabbit.state.results.length === 1, { timeoutMs: BUDGET_MS, label: 'first result' });
 
       // Same (machine_id, dedupe_key, attempt) again: a transport re-delivery,
       // so it must be answered without executing a second time.
       stream.send('task.offer', { ...offer });
-      await waitFor(() => rabbit.state.results.length === 2, { label: 'cached resend' });
+      await waitFor(() => rabbit.state.results.length === 2, { timeoutMs: BUDGET_MS, label: 'cached resend' });
       assert.equal(runCount(), 1, 'command ran again for an identical attempt');
       assert.equal(rabbit.state.results[1].attempt, 1);
       assert.equal(rabbit.state.results[1].stdout_sha256, rabbit.state.results[0].stdout_sha256);
@@ -2458,7 +2463,7 @@ describe('Localside agent end to end', () => {
       // attempt=2 is a genuine retry (§4.4 keeps attempt out of dedupe_key):
       // it must execute and report its own attempt.
       stream.send('task.offer', { ...offer, attempt: 2 });
-      await waitFor(() => rabbit.state.results.length === 3, { label: 'retry result' });
+      await waitFor(() => rabbit.state.results.length === 3, { timeoutMs: BUDGET_MS, label: 'retry result' });
       assert.equal(runCount(), 2, 'a new attempt must actually run');
       assert.equal(rabbit.state.results[2].attempt, 2);
 

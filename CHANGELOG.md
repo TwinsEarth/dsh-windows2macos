@@ -4,6 +4,316 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### 异地镜像：写入时链接防护（realpath 加固补记，未发布）
+
+- 校验时已解析真实路径；新增**写入时**守卫：`syncToMirror` 重新解析镜像根，每个已存在的祖先必须解析到它自己，否则拒绝 `BACKUP_MIRROR_SYMLINK`；对象块/快照目录/快照文件/根元数据/索引追加全部过守卫。
+- 测试：镜像树内 junction 指向外部 → 拒绝且目标目录零写入；快照目录被 junction 顶替 → 拒绝；正常同步不受影响（23/23）。
+- 边界：守卫与原子写之间仍有毫秒级 TOCTOU；彻底关闭需要句柄级写入，当前不做承诺。
+
+
+### 三条边界的真机加固：register watch + 宿主服务、缓存运行时终审、renumber 追加分支可达性（未发布）
+
+- **A · register vs 运行中的客户端**：调查确认安装的 Harness 提供可被插件 `ctx` 访问的宿主服务 **`ctx.workspaceRegistry`**（`@deepseek-ai/dsh-workspace`：拥有内存工作区域 + `storages/workspace.json`，先持久化再发 `domain/changed`，GUI 读投影）。新增 `registerThroughHost()` —— `resolveByPath`/`create` + `attachSession(sessionId)`，**不写文件**，因此没有可被客户端保存覆盖的文件级写入；面板路由 `POST /api/w2m/backup/register {confirm:"register", session_ids}` 优先走它（响应 `via:"host-service"`、`residual_risk:null`）。宿主没有该服务时（或离线 CLI）退回文件路径：`w2m-backup register --session <id> --watch <minutes>` 在 apply 成功后按 2/8/20/60 s、之后每 60 s 采样直到分钟预算，发现被覆盖就用 `recheckRegistry` 重放**同一 plan**（不写第二份注册表副本），报告 `watch:{minutes,samples,clobbered,reapplied,stable_at}`；文本/JSON 均带一行诚实残余风险 `a client save after the watch window can still remove it; re-run or enable the plugin route`。面板状态卡新增「修复注册表」按钮（登记勾选会话，无勾选则登记未登记会话）并显示登记/已存在/被覆盖/已重放计数；残余风险只在 file-write 路径渲染。**诚实的边界**：watch 只缩小并量化窗口、不消除它；宿主服务也有自身边界（`attachSession` 要求会话被 `sessionPersistence` 认识且 header cwd realpath 到工作区，cwd 已消失的灾难恢复会话不接，由 CLI + watch 兜住）。
+- **B · 运行时终审不阻塞面板**：`GET /api/w2m/backup/verify?runtime=1` 的结论现在持久化为 `<DSH_HOME>/xclient/w2m-backup/state.json` 的 `state.last_runtime_verify = {started_at, finished_at, ok, checked, failed, snapshots, reason_codes, evidence:"installed-harness"}`；`?runtime=cached` 只读该记录、绝不 spawn，`finished_at` 超过 24 h 标 `stale:true`（无记录/坏时间戳同样 stale）；`GET /run` 内嵌状态带 `state.last_runtime_verify`。配置 `backupRuntimeVerify: "off" | "nightly"`（默认 `off`，非法值 `BACKUP_CONFIG_INVALID` 拒绝挂载）：`nightly` 只在**成功**的定时备份（含错过时段补跑）之后 fire-and-forget 跑一次并持久化，失败只记 warning，绝不让备份/调度失败；CLI `w2m-backup run --runtime-verify` 是手动一次。面板校验卡显示缓存记录（上次时间/checked/failed/快照数/证据标签/24 h stale 徽标）与「立即运行（慢，需要安装 Harness）」按钮（`?runtime=1`，忙碌期禁用并显示进度）；原勾选框保留，仍决定「全量校验」走静态还是运行时。**诚实的边界**：缓存记录有 24 h 时效；nightly 默认关闭；失败的终审不回滚已提交备份。
+- **C · renumber 追加失败分支**：调查（`src/util/session-validate.mjs` 规则 + 安装 Harness 实测 84 个规范形态）结论是**规范产出上不可达**——`renumberBuffer` 规范重编码（header 单帧、每事件一帧、`seq===下标`）且附录事件是 `permission/preset`（会话级、无 surface、无 `*Seq` 引用、下一 dense seq），所以 doctor 通过则追加模拟必过。保留 `planRenumber({futureAppendCheck})` 测试缝，重写代码注释与 `docs/BACKUP-DESIGN.md` §20.5/§22.2 措辞，并新增机器校验：生产源码中只有 `src/backup/renumber.mjs` 提到该选项（无调用者传它）；规范 plan 的 `static_future_append.ok` 为真；安装 Harness 存在时 plan 结果是 dense 且 `future_append_evidence:"installed-harness"`。**诚实写出函数级例外**：非规范输入（多一行非事件文本、帧外杂字节）确实可能“doctor 过、追加模拟不过”，但它们在 `parseLog`/`scanFrames` 阶段就被 `RENUMBER_INPUT_INVALID` 拒绝，到不了该分支；备份/verify 对原始字节仍会如实报告。
+- **测试/文档**：`test/backup-g2.test.mjs` +15（watch 调度/预算/注入时钟、无覆盖 `clobbered:0`、模拟覆盖后 `reapplied:1` 且不写第二份副本、CLI `--watch` JSON/文本/残余风险/参数错误、`registerThroughHost` 服务写入/已登记 no-op/无服务具名拒绝/attach 拒绝不回退）；`test/backup-run.test.mjs` +5（缓存路由不 spawn/过期/`?runtime=1` 更新/内嵌状态、nightly 每成功备份一次 + 失败只 warning + 默认 off + 配置拒绝、register 路由 file-write/host-service 两路径）；`test/backup-verify.test.mjs` +5（记录字段与 reason codes 去重/24 h stale 边界/状态文件持久化/in-flight 单次 spawn/失败也持久化/CLI `run --runtime-verify`）；`test/fix-renumber.test.mjs` +3（缝仅一个生产文件/规范产出追加必过/安装 Harness 证据与 dense 结果）；`test/client-bundle.test.mjs` +3（缓存三态与证据标签、运行按钮禁用态、页面点击 `verify-runtime` 与 `repair-register` 走对路由）。`docs/BACKUP-DESIGN.md` §19.2/§19.3/§20.5/§22.1/§22.2/§22.4/§22.5 与 `docs/DEV-PLAN-3.4.6-3.5.0.md` 同步。**声明**：本次不 bump 版本、不跑 preflight、不提交；无新增测试文件，`package.json#scripts.test` 不变。
+
+### 账户 ID 绑定解锁：只比对唯一识别码（用户决定，未发布）
+
+- **用户决定（原话）**："不用打开账户，只需要读取账户唯一识别码ID，进行比对就行，一致就放行。不一致就切换密码模式。" 实现为 compare-only 身份绑定：`keys.json` 新增可选根字段 `account_binding: {account_id, bound_at}` + 复用现有 `account` 信封（KEK = HKDF(`w2m-account-binding|<accountId>`)，无新密码学）。**诚实声明：账户 id 是标识，不是秘密**——知道 id 且拿到仓库文件的人可推导同一 KEK，这是用户明确接受的代价；它不替代 `password`（跨机器秘密路径），完整 id 永不出现在结果/CLI/HTTP/日志，只有 `…abcd`（后 4 位）。
+- **绑定**：新增 `addAccountEnvelope(keys, dek, accountId)` + `bindAccount({root, dshHome, accountId})`（用现有凭据打开 → 同一 DEK 再包 account 信封 → 复制 `keys.json.bak-<ts>` → 原子写 → 只用 account 凭据解一次并与 DEK 比对）；幂等（同 id 不重写）、换绑具名拒绝 `BACKUP_ACCOUNT_MISMATCH`、id 非法 `BACKUP_ACCOUNT_ID_INVALID`、已有 account 信封但无 `account_binding` 元数据 `BACKUP_ACCOUNT_BINDING_UNKNOWN`；`validateKeysFile` 以可选字段加法校验。
+- **解锁**：`openRepoKey({accountId})` / `describeUnlock` / `unlockRepo` 增加比较结果 `account: {bound, matched, id_hint}`；匹配 → account 路径放行（`unlocked_via: "account"`，无密码/无 machine 也可开）；不匹配 → `attempts` 记 `{kind:"account", code:"BACKUP_ACCOUNT_MISMATCH"}` 并回退 machine/password；全不可用仍是统一的 `BACKUP_NO_PERMISSION`（mismatch 不是独立拒绝码）。插件 unlock 路由与 restore/archive/verify 每次请求经 `createAccountIdentity({ctx}).identify()` best effort 读宿主 id（不联网要求、不抛错，未登录即 `null`）。
+- **配置 / CLI / 面板**：配置 `backupAccountBinding: boolean`（默认 `true`；`cordis.patch.yml` 的 dsh-backup 行显式 `true`）；成功后绑定、失败只 warning、不改 `ok`。CLI `w2m-backup unlock --account-id <id>`、`unlock --check --account-id <id>`、`run --account-id <id>`（成功后绑定；CLI 不自己读宿主 id，避免可手填的"账户凭据"）；面板解锁卡新增账户行三态：一致 →「本机账户与原账户一致，可直接解锁」+ 可点按钮；不一致 →「当前账户不是原账户：请使用解锁密码」+ 按钮禁用；读不到 → 提示改用密码；未绑定则原卡片不变。新增 6 个 i18n 键与 `BACKUP_ACCOUNT_MISMATCH` 的 reason 文案映射。
+- **测试**：`backup-keystore` +4（绑定后无 machine key 可开且 DEK 不变；错 id 被拒但 machine/password 仍可开；重绑 no-op、换绑具名拒绝且文件不变；非法 id 零写入 + `account_binding` 元数据）；`backup-access` +3（describe 报告 bound/matched 且 JSON 不泄露完整 id；mismatch+password 走密码成功；mismatch 无密码 → `BACKUP_NO_PERMISSION` 且 attempts 具名）；`backup-run` +3（配置归一化；路由用假 `deepseekAccount` 比对/绑定关闭时 `matched:null`；Windows DPAPI 下 run 后自动绑定并经 account 解锁；CLI `--account-id` 解析/真实入口/JSON 形状/人类输出脱敏/usage）；`client-bundle` +2（账户路径三态与按钮禁用、字典与 reason 映射）。无新增测试文件，`package.json#scripts.test` 不变。
+- **文档**：`docs/BACKUP-DESIGN.md` 新增 §25「账户 ID 绑定解锁（用户决定）」并更新 §6/§11/§12/§18 相邻注记；`docs/SPIKE-ACCOUNT-KEK.md` 顶部加"决定更新"短记指向 §25（不改写原测量）。**诚实边界**：见 §25.1/§25.7；旧快照目录里的 `keys.json` 副本要等下一次快照才有绑定；真实仓库迁移（`bindAccount` 一行命令）由 lead 执行，不在本次代码任务内；不 bump 版本号、不跑 preflight、不提交。
+
+
+### 备份轮转 `--old-format full`：字面兼容的整文件加密副本（P2，未发布）
+
+- **新增 opt-in 选项 `oldFormat: 'records' | 'full'`（默认 `records`）**：默认仍是去重版本记录（§13/§21 行为不变）；`full` 在每次真正轮转时额外写一份密封整文件副本 `old/<ws>/<sid>/<ts>-<sha12>.json.enc`，记录新增 `full_copy: {file, sha256, size}`（纯加法，记录的 `format`/`version` 不变，仍是 `w2m-session-backup/old-version` v1）。
+- **复用现有密码学，只换 AAD 身份**：整文件副本仍用 `sealObject` 的 `MAGIC|nonce|ciphertext|tag` 信封 + 仓库 DEK，AAD 容器名改为 `w2m-session-backup/old|<sha256>|<length>`（块是 `…/object|…`，见 `crypto.OLD_COPY_KIND`）；明文由该版本记录自己的 blocks 经 `materialize.rebuildFile` 重建并先比对 `sha256`/`size`，不是重读已经变化的源文件。
+- **失败语义（先写副本、后写记录）**：副本重建/写入失败 → 具名 `BACKUP_ROTATION_WRITE_FAILED` 且**不写记录**（记录不承诺不存在的副本），快照已提交时引擎照旧返回 `committed: true`；记录写失败留下的孤儿 `.enc` 无害，由 `gc` 清理。
+- **剪枝/gc**：`pruneOldVersions` 剪记录时先删记录、再删配对副本；`gc` 在安全路径上删除 `old/` 下没有任何剩余记录引用的 `.json.enc`，被引用的副本永不删；`BACKUP_GC_UNSAFE` 仍然整体拒绝、零删除（结果新增 `old_versions.full_copies_pruned` 与 `orphan_full_copies`）。
+- **接口面**：CLI `w2m-backup run --old-format records|full`（非法值退出码 2，人类输出新增 `old format` 行）；插件配置 `backupOldFormat`（非法值 `BACKUP_CONFIG_INVALID` 拒绝挂载）；引擎 `runBackup({oldFormat})`，结果恒有 `old_format`、仅 `full` 时出现 `full_old_versions`；错误码新增 `BACKUP_ROTATION_FORMAT_INVALID`。完整设计见 `docs/BACKUP-DESIGN.md` §24。
+- **存储诚实**：`full` 让每个被淘汰版本的字节在去重 blocks 之上**再加一份**（114 MB 会话、10 个版本 ≈ 多 1.1 GB），所以默认保持 `records`；CLI 人类输出会打印 "storage doubles per superseded version"。
+- **测试**：`backup-rotation`（默认/非法值、写记录 + 副本并用 `openObject` 以 `old` 身份解开逐字节比对、块身份解不开、records 模式无 `.enc`、剪枝删配对副本、副本写失败/重建失败/缺 DEK 三类具名拒绝且指针不动）；`backup-gc`（孤儿副本删、被引用副本留、剪枝连带删、dry-run 只报不删、UNSAFE 零删除）；`backup-engine`（`oldFormat: 'full'` 轮转并回报 `full_old_versions`、默认无该键、非法值在 ensureLayout 前拒绝、副本写失败时 `committed: true`）；`backup-run`（CLI `--old-format` 解析/退出码 2/真实入口、人类输出、插件配置归一化）。无新增测试文件，`package.json#scripts.test` 不变。
+- **诚实边界**：restore/archive/verify 仍走记录 + blocks，尚无"从 full 副本直接还原"的命令；镜像仍不复制 `old/`；`verify` 尚未逐份解密 `.enc`；未 bump 版本、未跑 preflight、未提交。
+- **迁移命令 `old-backfill`（本次新增，未发布）**：`w2m-backup old-backfill [--dry-run] [--limit <n>] [--json]` 给 `full` 之前写入的每条 `old/` 记录补上密封整文件副本——用记录自己的 blocks 经 `materialize.rebuildFile` 重建 → 与记录的 `sha256`/`size` 比对 → `sealObject`（`kind: 'old'`，命名 `<record>.json.enc`）→ 先写副本、再原子补 `full_copy: {file, sha256, size}`（记录的 `format`/`version` 不变）；幂等（第二次全部 `skipped`）；`--dry-run` 不取锁、不打开 key、什么都不写并打印 "nothing was written"；长度不符或缺失的副本重建并计 `repaired`；孤儿 `.json.enc` 只计数、留给 `gc` 删除；`--limit` 限制本次写副本数（0 = 只出计划）；key 打不开 → `BACKUP_NO_PERMISSION`，逐记录失败用 `BACKUP_OLD_RECORD_INVALID` / `BACKUP_OLD_BACKFILL_FAILED`。实现 `src/backup/old-backfill.mjs`，`src/backup/cli.mjs` 接线，测试挂在 `test/backup-rotation.test.mjs`（无新增测试文件），`docs/BACKUP-DESIGN.md` §24.1 记录迁移/幂等/修复语义；引擎无改动（不自动回填），本条为纯追加。
+### 备份面板范围入口（v3.5.0 面板补全，未发布）
+
+- **`lib/client.js`：备份&还原面板补上 DEV-PLAN 4.1 的两个范围入口**：`backup-selected`（勾选会话 → `{confirm:'run',scope:'selected',selected:[ids]}`，无勾选时禁用）与 `backup-active`（`{confirm:'run',scope:'active'}`），与既有四个操作并列；新增「备份范围」卡，会话来自**只读**的 `GET /api/w2m/backup/scan?detail=1`（每个会话一个 `data-w2m-backup-pick` 勾选框，显示 id 后缀/工作区/已归档标记，`已选 n/m` 计数、全选/清空、上限滚动列表），404 或扫描失败只显示中性提示 +「刷新会话」重试，**不抛异常、不阻塞面板**；两个入口各有独立 busy 文案，操作期间六个操作一起禁用。i18n `panel.backup.*` 中英各 +16 键（共 139 键）。诚实边界：扫描只读、勾选不持久化（刷新页面即丢）、选中不会改变 `archived`/`all` 的覆盖范围——已归档会话仍按原范围备份。
+- **测试/文档**：`test/client-bundle.test.mjs` 新增 6 项（扫描完成前两个入口禁用；3 会话勾 2 后 `selected` 请求体恰为 `{confirm:'run',scope:'selected',selected:[两个 id]}` 且无其它 scope；`active` 请求体；既有 `all` 不变；全选/清空计数；404/空列表/拒绝原因与归一化边界）；`docs/BACKUP-DESIGN.md` §18 增补范围入口段落并更新键数（123→139）。`npx eslint .` 0 error、`node scripts/layer-check.mjs` 与 `node scripts/scan-mojibake.mjs` clean、`node --test --test-force-exit test/client-bundle.test.mjs` 全绿、`node scripts/pack.mjs` 打包一次。本次不 bump 版本号、不跑 preflight、不提交。
+
+### 双解锁补全：给机器信封仓库补 password 信封（未发布）
+
+- 需求 5.3 的 P0 缺口：无人值守只建 `machine`（DPAPI）信封，换机器/换账户后仓库打不开，而 `password` 是唯一跨机器路径且此前无法事后补。
+- 新增 `addPasswordEnvelope` + `setRepositoryPassword`（`src/backup/keystore.mjs`）与 CLI `w2m-backup unlock --set-password`：用现有凭据打开 → 同一 DEK 再包一个 password 信封（scrypt）→ 原 `keys.json` 复制为 `.bak-<ts>` → 原子写 → **只用一个密码单独解一次并与 DEK 比对**。密码只从 stdin 或 `W2M_BACKUP_PASSWORD` 读取（绝不 argv/配置），最短 8 字节，重复调用 no-op。
+- 测试：`backup-keystore` 覆盖"machine-only 仓库补 password 后仅凭密码可开且 DEK 不变""错误密码被拒""重复调用不重写""短密码拒绝且文件不变""写前备份存在"。
+- 诚实边界：已有 password 信封不会被覆盖——**换密码**（轮换）尚未实现，需要"旧凭据解开→移除旧 password→写新"的命令；本机真实仓库已补 password 信封（密码文件在 `C:\Users\fangw\w2m-backup-unlock-password.txt`，请抄入密码管理器后删除）。
+
+
+### v3.5.0 「编队版本」看板卡片（UI 半，未发布）
+
+- **`lib/client.js`：操作面板 →「操作入口」页新增「编队版本」卡片**：v3.5.0 交付项 2 的 UI 半——显示
+  最低支持版本、版本分布（`version × count`）、落后机器（`machine_id @ version`）、版本未知机器与
+  `all_current` 徽标（为 `true` 时隐藏落后块），并提供「一键复制升级指引」（`npm i -g
+  @twinsearth/w2m-dsh-plugin@<supported_min>` + 机器清单；优先 `navigator.clipboard.writeText`，
+  回退 `document.execCommand('copy')`，成功显示「已复制」，headless 安全返回 false）。i18n
+  `panel.fleet.version.*` 中英各 12 键。**它只读宿主既有的只读 `versions` 块**（`GET
+  /api/w2m/target` / `w2m_devices` 上 `summarizeVersionDashboard` 的输出），不派发任务、不写选择、
+  不新增 relay 端点；请求失败或旧宿主没有该块时显示「版本信息未知」中性状态，**不把读取失败当成
+  全部达标**。未新增侧栏槽位：卡片就放在「目标机器」旁边，两侧读同一份快照。测试见
+  `test/client-bundle.test.mjs` 新增的 8 项；`npx eslint .` 0 error、`node
+  scripts/layer-check.mjs` 与 `node scripts/scan-mojibake.mjs` clean。本次不 bump 版本号、不跑
+  preflight、不提交。
+
+### G2/G3/G4/G5 收口补记（未发布）
+
+- **G2 `w2m-backup register`（`src/backup/register.mjs`）**：磁盘上已存在、注册表里没有的会话不再需要手写脚本——
+  `--session <id>`（可重复）经 `listSessionDirs` 定位（工作区 slug 取路径段），先过客户端门禁（在跑就拒绝，
+  `--allow-live-home` 才接受回读 + 保存后复查协议），把 `workspace.json` 复制到
+  `<DSH_HOME>/.w2m-restore-backups/register-<ts>/workspace.json`，整次一个文档 plan → 原子写 → 回读校验，可选
+  `--registry-recheck <ms>` 在客户端保存后再复查一次。已登记 id 是 no-op（不重写、不可能改旗标），archived/pinned
+  从注册表视图读出再写回（手写脚本用默认值把已归档会话取消归档——本次用测试钉死）；磁盘上找不到的 id 整单拒绝
+  `BACKUP_REGISTER_SESSION_MISSING` 并列出；未知工作区只能用 `--workspace-path` 创建/挂接。返回
+  `{ok, registered, already_registered, unknown, actions, verified, backup_file, recheck?}`；退出码 0/1/2 与 restore
+  一致。`register-*` 副本自身按份数保留（默认 10、0 = 全留、当前次永不删），`listPreRestoreSnapshots` 只认时间戳
+  目录，restore 的保留策略不会误删它们。
+- **G4 renumber 备份保留上限（`pruneRenumberBackups` + `w2m-fix renumber --keep-backups <n>`）**：成功 apply 后按
+  名字里的时间戳保留最新 N 份兄弟副本（默认 5，0 = 全留）；当前次运行的副本通过 `protect` 传入、永不删除
+  （时钟漂移时"改日志"不能变成"删回退路径"）；dry-run 与失败路径零删除；只匹配本工具命名的
+  `.bak-<YYYYMMDDTHHMMSSZ>[-<n>]`，不动 `w2m-fix fix` 的 `.bak-<stamp>` 副本。结果新增 `pruned_backups`，
+  人类输出新增 `backups kept : N of M (pruned K)`。
+- **G3 证据测试（`test/backup-verify.test.mjs`）**：一条 describe 覆盖每条会改字节/改声明的路径——restore 计划每个
+  候选 `validation.future_append === true` 且 `runtime_verified === true`（装 Harness 时；无安装跳过）；renumber 计划
+  携带 `validation.future_append`（静态 = `true`，标 `static-prefilter`），未来追加模拟失败时
+  `RENUMBER_STATIC_REJECTED` 且零写入（用 `planRenumber({futureAppendCheck})` 测试缝驱动，生产不传）；verify 的
+  `future_append.evidence === 'static-prefilter'`、`runtime_verified.evidence === 'installed-harness'`。
+- **G5 面板运行时终审勾选框（`lib/client.js`，备份面板最小 diff）**：校验卡增加默认关闭的
+  「用安装的 Harness 终审（慢）」勾选框（i18n `panel.backup.verify.runtime`）+ 提示
+  `panel.backup.verify.runtimeHint`（可能耗时数分钟、需已安装 Harness）；勾上时 `verifyNow` 请求
+  `GET /api/w2m/backup/verify?runtime=1`，不勾走便宜路径；结果仍显示 `runtime_verified` 计数（文案键改为
+  `panel.backup.verify.runtimeCounts`），问题码经既有 `backupReasonText` 映射。校验卡改为常驻，勾选框在第一次
+  校验前就可见。中英字典各新增两键（123 键）。
+- **文档**：`docs/BACKUP-DESIGN.md` §22（G2/G3/G4/G5 收口补记与诚实边界）并更新 §15.2/§18/§19 相邻注记；
+  `docs/DEV-PLAN-3.4.6-3.5.0.md` v3.5.0 实施记录附近新增指向 §22 的短记。
+- **测试**：`test/backup-g2.test.mjs` +8、`test/fix-renumber.test.mjs` +6、`test/backup-verify.test.mjs` +3、
+  `test/client-bundle.test.mjs` +1；套件清单不变（新用例挂在既有套件上），`npx eslint .`、`node
+  scripts/layer-check.mjs`、`node scripts/scan-mojibake.mjs`、`node scripts/pack.mjs` 全绿。
+- **诚实边界**：register 仍依赖客户端门禁 + 保存后复查（窗口之间客户端仍可能覆盖，§16 末同一风险），且刻意不提供
+  宿主路由（登记 home 是带路径的操作员动作，走离线 CLI）；面板运行时勾选是 **opt-in**（慢），不勾的 verify 只有
+  标了 `static-prefilter` 的模拟结果，不是门禁级证据；renumber 保留只处理兄弟副本，不清理 `$DSH_HOME` 其它位置、
+  也不动 `old/` 记录；本次不 bump 版本号、不跑 preflight、不提交。
+
+### v3.5.0 版本治理、保留策略与异地副本（未发布）
+
+- **A 最低版本门禁（`MACHINE_VERSION_UNSUPPORTED`）**：新增 `src/plugin/version-gate.mjs`——唯一常量
+  `MIN_SUPPORTED_PLUGIN_VERSION = '3.5.0'`、semver 比较器（支持 `x.y.z` 与预发布后缀；无法解析一律按 unknown，
+  绝不猜相等）与纯决策 `evaluateVersionGate`。`w2m_run` 在 POST 前读一次 relay 名册（与 narrowed-target 预检
+  共用），对**本次派发会用到的在线机器**逐个判定：低于基线或版本不可读 → 整单拒绝，`detail.machines` 逐一列出
+  `machine_id` / `version` / 原因码（`MACHINE_VERSION_OUTDATED` / `MACHINE_VERSION_UNKNOWN`）与 `supported_min`。
+  `allowOutdated: true` 显式覆盖：结果含 `outdated_allowed` 与 `version_gate.audit`（逐机原因码），并留一条 host
+  警告日志；只读工具（`w2m_devices`/`w2m_stats`）永不拒绝。门禁只在构建自身版本 ≥ 基线时生效（3.4.x 构建不拦截，
+  紧急回滚不会被自己的规则拒绝）；测试用 `W2M_PLUGIN_VERSION` 激活（与 updater 同一机制）。
+- **B 版本漂移看板数据**：`summarizeVersionDashboard` 纯函数输出 `{supported_min, distribution, outdated, unknown,
+  all_current}`；`w2m_devices` 与 `GET /api/w2m/target` 增量携带 `versions` 块（既有 `version_drift`/`machines`/
+  `fleet` 字段不变；名册读取失败时 `all_current:false`）。面板「编队版本」卡片 UI 不在本次（`lib/client.js` 属
+  UI 半，另行实现）。
+- **C 保留策略（份数 + 天数同时生效）**：`rotation.selectPrunable(records,{keep,maxAgeDays,now})` 纯函数；
+  `pruneOldVersions`/`rotateForEntry` 支持 `maxAgeDays`（与 `keep` **同时生效**："最新但超 N 天"仍按天剪除，
+  "N 天内但超出最新 N 份"仍按份数剪除；0/缺省 = 仅份数；非法值 `BACKUP_ROTATION_POLICY_INVALID` 写盘前拒绝）。
+  `gc({maxOldVersionDays})`、CLI `run/gc --max-old-days <n>`、插件配置 `backupOldVersionDays` 全链路接线；
+  gc 的 `BACKUP_GC_UNSAFE` 规则与"先收集全部引用、再删块、最后剪旧记录"的顺序不变——仍被快照/current/old 引用的
+  块永不删除，同一次 gc 中被剪掉的记录不会让它的块在同一次运行里被误删。
+- **D 异地副本**：新增 `src/backup/mirror.mjs`。`runBackup({mirrorRoot})` 在提交且轮转成功后，把本次快照引用的
+  密封块（**只补缺失**）、`snapshots/<id>/{manifest.json,keys.json}`、仓库描述与信封元数据复制到镜像，并按
+  `snapshot_id` 幂等追加镜像 `index.jsonl`；文件复制走 `atomic.writeFileAtomic`，**明文永不复制**。
+  镜像路径在仓库内 / `$DSH_HOME` 内 / 等于仓库根 / 是文件 → 写盘前拒绝 `BACKUP_MIRROR_INVALID`（零提交）；
+  运行期复制失败**不回滚**已提交备份：`ok:true` + `mirror:{ok:false, reason_code, reason, copied}` + `warnings`，
+  下次成功同步自动补齐。CLI `run --mirror <dir>`、插件配置 `backupMirrorDir`。
+- **测试**：新增 `test/fleet-version-gate.test.mjs`（比较器/预发布边界/决策/看板/派发路径/覆盖审计/只读面不被拒/
+  未激活构建不拦截）与 `test/backup-mirror.test.mjs`（只补缺失+幂等/索引只追加一次/镜像路径拒绝/失败不回滚/
+  镜像侧 `openRepo`+`rebuildFile` 完整性）；扩展 `test/backup-rotation.test.mjs`、`test/backup-gc.test.mjs`、
+  `test/backup-run.test.mjs`；`package.json#scripts.test`/`test:all` 与 `test/backup-wiring.test.mjs` 套件清单同步。
+- **文档**：`docs/BACKUP-DESIGN.md` §21（保留策略与异地副本协议、优先级、幂等与失败语义）、
+  `docs/DEV-PLAN-3.4.6-3.5.0.md` 实施记录（A–D 已交付、UI 延期）、`FLEET-RULES.md` §9（门禁规则）。
+- **诚实边界**：异地副本是**加法**——不做跨镜像去重（每个镜像独立持有一份密封块），未做 Relay/云端传输
+  （Phase 3），未做镜像侧 `current/old` 视图与镜像 gc；面板「编队版本」卡片 UI 未做；Relay Phase 2 合并是
+  **独立评审线**，不在本条交付内；本次不 bump 版本号、不跑 preflight、不提交。
+- **D 异地副本加固（评审两处收口）**：`src/backup/mirror.mjs`。① `resolveMirrorRoot` 在词法包含判定之外增加
+  **真实路径判定**——取最深已存在分量 `fs.realpathSync`（Windows 上解开 junction/symlink）再拼接未创建段，对真实
+  仓库根与真实 `$DSH_HOME` 重复包含判定；经链接实际落进仓库/home → 具名 `BACKUP_MIRROR_SYMLINK`（写盘前零提交）；
+  真实路径不可解析（`ELOOP`/`EACCES`/坏 junction）→ `BACKUP_MIRROR_INVALID` 具名拒绝；不存在的镜像路径（含多级）
+  仍照常解析并在首次同步创建。② 镜像对象不再“名字在即视为正确”：已存在对象须与源**字节长度一致**才跳过，截断/
+  损坏（长度不符）用 `writeFileAtomic` 重写并计入新增的 `copied.repaired`；快照 `manifest.json`/`keys.json` 与根
+  `backup.json`/`keys.json` 按字节比较，不符即重写并计入 `repaired`。完好镜像第二次同步仍是
+  `copied:{files:0,bytes:0,repaired:0}` 且零写入（测试比较 size+mtime）；镜像 `index.jsonl` 尾部半行即使正是该
+  快照自己的未完成追加行，也只补一行完整 JSON、`snapshot_id` 不重复；CLI mirror 行在修复时显示 `N repaired`。
+  ③ 诚实边界：仍**不做跨镜像去重**、**没有**镜像侧 `current/old` 视图与镜像 gc、**没有** Relay/云端传输；对象修复
+  只覆盖“长度可发现”的损坏（同长度位翻转由还原时的清单 sha256 发现）。`docs/BACKUP-DESIGN.md` §21 与
+  `test/backup-mirror.test.mjs` 同步（junction 逃逸在环境禁止建 junction 时按名跳过）。本次不 bump 版本号、不跑
+  preflight、不提交。
+
+### G4 seq 重编号工具（删/插事件的唯一合法方式，v3.4.8 补全）
+
+- **新增 `src/backup/renumber.mjs`（G4 收口）**：`renumberBuffer(buffer,{deleteSeqs,insert})` 纯内存完成
+  "删/插 → seq 重编为 0..N-1 → 递归改写所有 `*Seq`/`*Seqs` 引用 → 重算 inheritedEventCount → header 单帧 +
+  每事件一帧重编码"；torn / 非 v4 / 非 dense 输入 / 越界编辑都给具名拒绝，引用指向被删事件即
+  `RENUMBER_DANGLING_REFERENCE`（detail 带事件类型/键/seq，不猜替代值）。
+- **plan/apply 分离**：`planRenumber` 只读，并用 doctor 预筛 + "未来追加"模拟 + 安装 Harness 终审校验**结果**
+  （G1/G3/G5 同一条门禁链）；无安装时默认 `RENUMBER_RUNTIME_UNAVAILABLE`，`allowStaticValidation` 才降级并
+  如实标 `runtime_verified:false`。`applyRenumber` 先写 `<file>.bak-<时间戳>` 并回读比对，再原子写、回读
+  sha256 + doctor 复验；plan 之后文件被客户端追加则 `RENUMBER_TARGET_CHANGED` 拒绝覆盖。
+- **CLI**：`w2m-fix renumber --file <log> [--delete-seq <n>]... [--insert-file <json>] [--dry-run]
+  [--allow-static-validation] [--json]`（默认写入，`--dry-run` 只规划；退出码 0 成功 / 1 具名拒绝 / 2 用法错误）。
+  人类输出给事件前后数、仅变化的 seq mapping（约 20 条封顶）、引用改写数、static/runtime/future-append 证据与
+  `.bak` 路径。`fix -> backup` 同级边已在 `scripts/layer-model.mjs` 声明（模块级无环）。
+- **测试**：新增 `test/fix-renumber.test.mjs`（21 项，接进 `scripts.test` / `test:all` / `test:fix-renumber`）；
+  覆盖删中间事件、插入/追加、悬空引用 / torn / 非 dense 拒绝且零写入、no-op + 幂等、运行时门禁正反两向、
+  `.bak` 保留原始字节 + 回读校验、plan 后文件变化、dry-run 零写入、CLI 退出码与真实入口追加。
+- **诚实边界**：工具改历史，不是 backup/restore 的一部分（还原仍只发布原始字节）；每次成功 apply 都留
+  `.bak-<时间戳>`；能还原的日志应走还原 + verify，不要用它"修"——拒绝非 dense 输入正是为了不制造第二次损坏。
+  设计见 `docs/BACKUP-DESIGN.md` §20。
+
+### G5 校验只用运行时同一份代码（v3.4.6 补全）
+
+- **证据链收口**：静态 doctor 只在报告里带 `evidence:'static-prefilter'`；结论性证据来自 `runtime-driver.mjs`
+  调用安装 Harness 的 `sessionFormatCatalog.createRestore(header,{validation:'current'})`，带
+  `evidence:'installed-harness'`。还原/归档还原把"原日志 + 追加后日志"一起交给运行时批量终审，无安装时
+  `BACKUP_RUNTIME_UNAVAILABLE` 拒绝（`--allow-static-validation` 才降级并如实标注）。
+- **真实运行时才暴露的漏洞（已修）**：`decodeRow` 对 seq 不落位的行**静默丢弃**（首事件 seq=5 的日志得到
+  `events:0` 且不抛错），运行时曾把这种日志判为通过。driver 现在要求事件数守恒
+  （`restored.events.length === 输入事件数`），否则判失败并写明 "accepted only N of M event(s); rows were
+  dropped, so this verdict is not evidence"。
+- **新接线点**：`run --runtime` 对追加后日志做运行时批量终审，结果 `runtime_future_append`（默认关，静态报告
+  标 prefilter）；`GET /api/w2m/backup/verify?runtime=1` 打开运行时终审；CLI 报告新增 `runtime append` 行。
+- **测试**：driver 静态证明（必须是 `createRestore` + `validation:'current'`，禁止使用我们的解析器）；
+  seq 缺口拒绝 + dense 通过的事件数断言；`run --runtime` 正/反向；`verify --runtime`；真实 Chromium 页面
+  （loader-entry）入口/面板/四操作断言。
+
+### 面板与侧边栏入口（v3.4.9）
+
+- **复盘加固（同日）**：① 真实 Chromium E2E 从"只验证入口/标记存在"加强为"**逐个点击四类一键操作**"——
+  每个按钮都真实点击、路由缺失时在日志区留下记录、面板保持挂载（loader-entry 10/10 通过）；② 核对面板的
+  `/api/w2m/backup/status` 回退确实由插件根（`src/plugin/tools.mjs`）常驻注册，不是死链；③ 更正措辞：
+  `restore --apply` **已**按 `keep_pre_restore`（默认 10）保留最新预还原副本并报告 `pruned_pre_restore`，
+  失败路径不清理；④ 明确边界：面板"全量校验"目前走静态全套 + 宿主 `runtime_verified` 计数，`?runtime=1`
+  的运行时终审已由宿主支持但面板尚无开关（下一次 UI 迭代再加，避免把分钟级操作做成默认）。
+
+- `lib/client.js` 新增「备份&还原」面板，与 GPW 同构：`sidebar.panellist`（id `w2m-backup`，order 6）+ `main`
+  （key `w2m-backup`）。状态条（仓库/快照/计划/上次结果/注册表复查）、四类一键操作（立即备份、还原选中、
+  归档打包、全量校验）、还原计划卡（new/identical/differs + 勾选 + 二次危险确认）、解锁卡（本机信封按钮 +
+  密码路径只在终端，**HTTP 不接受密码**）、50 条运行日志、10 s 只读轮询（卸载清理）、失败可重试。
+- i18n：`panel.backup.*` 121 键 × 中/英 + 34 个 reason-code 文案映射（`BACKUP_NO_PERMISSION` =「没有权限：请用
+  原账户登录，或输入解锁密码」）；主题只用宿主 `--dsw-alias-*` 令牌，深浅色随宿主。
+- 宿主：`GET /api/w2m/backup/run` 增加内嵌只读 `status`（面板状态条一次往返；老宿主回退 `/status`）。
+- 测试：`test/client-bundle.test.mjs` +12 项（注册对、四操作标记、解锁双分支且无密码、备份段无 password 请求、
+  可重渲染 fake React 驱动四操作与确认令牌、i18n 完整性、日志上限、无样式/定时器泄漏）；
+  `test/loader-entry.test.mjs`（真实 Chromium + 抛空 profile）新增断言：侧边栏入口存在、点击打开面板、
+  四个操作标记齐全。该 profile 默认关闭 `dsh-backup` 行，面板显示"需要启用"；四类操作的写入由
+  `test/backup-run.test.mjs` 的路由级测试覆盖（含 Windows 真实 DPAPI 与令牌拒绝）。
+
+### G3 只存原始字节 + "未来追加"模拟（v3.4.6 补全）
+
+- **原始字节**：引擎从不解析后重写日志；块按明文 sha256 内容寻址。新增两条证据型单测：① 损坏日志（seq 跳号）
+  照样入库，清单 `sha256` 等于源文件哈希（保留证据优先于拒收）；② 备份前后源文件**字节与 mtime 均不变**。
+- **未来追加模拟**（新增 `src/backup/future-append.mjs`，一条实现三处调用）：`appendLegalEvent` 在原始字节后
+  追加一帧合法 `permission/preset`（实测最弱合法事件：会话级、无 turn/surface/引用），`futureAppendVerdict`
+  做静态预筛。引擎对每个会话在已读入内存的字节上跑模拟并报告 `future_append: {checked, failed, sessions}`
+  （不因此拒绝备份）；还原把"原日志 + 追加后日志"一起交给安装的 Harness 批量终审，失败即拒收；verify 默认
+  静态模拟、`--runtime` 时连 append 后的 artifact 一起终审（新码 `BACKUP_RUNTIME_APPEND_FAILED`）。
+- **CLI**：`run` 报告新增 `future append : N/M session(s) still load after one legal append` 并列出失败会话。
+- **真实实测 + 布局 bug**：默认仓库 `run --scope all`：15 会话 / 171.5 MB / 2 新块 + 53 复用（96%）/ **future append 15/15** / 26.1 s（未做模拟时 4.8 s，约 5× 代价，因此默认开、可用 `--no-future-append` 或 `backupFutureAppend:false` 关闭）。同日发现并修复布局 bug：还原前副本原先放在 `sessions/.w2m-restore-backups/`，被会话扫描器当成第 17/18 个会话（`MANIFEST_REL_PATH` 失败）；现移到 home 根、walk 器跳过点目录、扫描器增加排除行、引擎在写块前预校验 rel（四层修复 + 两条回归测试）。
+- **测试**：引擎 +4 项（模拟计数、坏日志入库仍保原始字节、源文件不变）、verify +3 项（行数/追加前缀、坏日志
+  判失败、`--runtime` 连 append 一起终审），共 7 项。
+
+### G2 `workspace.json` 写入协议（v3.4.6 补全，v3.4.8 收口）
+
+- **暂停客户端**（`src/backup/client.mjs`）：`detectClientRunning()` 通过 `tasklist`/`ps` 判断客户端是否运行，
+  并区分"没在跑"与"查不到"（后者不冒充安全）。离线 CLI `restore --apply` 在客户端运行时拒绝
+  （`BACKUP_CLIENT_RUNNING`），除非显式 `--allow-live-home`；面板在客户端内部运行，按定义接受活 home，
+  依赖下面两半。
+- **写后回读**（`registry.mjs`，v3.4.8 已有）：原子写 → 重读 → 逐会话校验登记、工作区 id、archived/pinned；
+  写失败/被客户端覆盖分别报 `BACKUP_REGISTRY_WRITE_FAILED` / `BACKUP_REGISTRY_VERIFY_FAILED`。
+- **客户端保存后复查**（新增 `src/backup/registry-watch.mjs`）：还原成功后按 2 s / 8 s / 20 s 采样注册表，
+  发现登记丢失就再应用一次计划并再校验；每次采样经 `onResult` 上报，面板写入 `state.last_registry_recheck`
+  并记日志；定时器由 `ctx.effect` 持有，卸载即取消。不用文件监视器（客户端每次保存都是原子替换，watcher
+  会被无关改动触发）。
+- **CLI**：`restore --allow-live-home`、`restore --registry-recheck <ms>`（离线等待一次保存窗口后同步复查）。
+- **测试**：新增 `backup-g2` 套件（10 项，进程列表与定时器均注入，不 spawn、不等真实时间）。
+- **真实事故后补的保护**：apply 前重读目标、与计划记录的 `existing_sha256` 比对，变了即
+  `BACKUP_RESTORE_TARGET_CHANGED`；写后读回发现"我们写入的字节 + 帧对齐的客户端追加"，自动重建为
+  "预还原副本 + 追加帧"并报告 `healed`（无损，保留客户端事件）。详见 `docs/BACKUP-DESIGN.md` §16.1。
+
+### 还原、解锁、全量校验与归档包（v3.4.8）
+
+- **还原（`src/backup/restore.mjs`）**：先规划后写入。规划阶段把每份候选从内容寻址块解回、用运行时同一份校验代码判定、算清冲突与注册表改动，**一行都不写**；`--apply` 才按"预还原副本 → 原子写会话 → 写附件对象 → 注册表写入并回读校验 → 复读字节与清单比对"的顺序落地。四条复盘门禁（G1/G2/G3/G5）全部接进这条路径。
+- **还原前快照**：任何被覆盖的会话语义文件与 `workspace.json` 先复制到 `$DSH_HOME/sessions/.w2m-restore-backups/<时间戳>/`；冲突默认"先备份后覆盖"，`--keep-both` 则保留原文件、把还原结果写成 `session.v4.jsonl.zstd.restored-<ts>`。
+- **补注册工作区/归档标记（`src/backup/registry.mjs`）**：`workspace.json` 是客户端内存态，写入协议 = 原子写 + 回读校验 + 明示"客户端会回写"的残余风险；只登记会话 id 与 archived/pinned 标记，**绝不凭空创建工作区**（除非显式 `--workspace-path`）；工作区目录名按 DSH 规则从路径推导（`E:\GPT` → `--E-GPT--`）。
+- **运行时校验（`src/backup/runtime-validate.mjs` + `runtime-driver.mjs`）**：用安装的 Harness 本体（Electron Node 模式）加载 `sessionFormatCatalog.createRestore(..., validation=current)`，由它给出终审；自写 doctor 只作预筛。找不到安装时默认拒绝还原，`--allow-static-validation` 才接受纯静态证据，且报告写明 `runtime_verified:false`。
+- **两条解锁路径（`src/backup/unlock.mjs`）**：`machine`（OS keystore 保护的随机秘密，定时任务用）与 `password`（scrypt，跨机器唯一路径）。账户信封不做——spike 证明宿主只给账户标识不给秘密，写了就是加密摆设（`docs/SPIKE-ACCOUNT-KEK.md`）。密码种子仓库首次遇到可用 keystore 时自动补 `machine` 信封，之后面板/定时任务免密。
+- **全量校验（`src/backup/verify.mjs`）**：逐快照解块、验认证标签、复算 sha256、"未来追加"模拟（在内存里追加一条合法事件再校验，证明它**以后仍能加载**）；索引↔快照目录双向核对、old 记录与 current 指针引用的块必须存在。任何一处不对都报出具体码，不清零、不平均。
+- **归档包（`src/backup/archive.mjs` + 自写 `tar.mjs`）**：只打包清单校验过的字节，产出 `archive/<日期>/archived-sessions-<ts>.tar.zst`，内含 `manifest.json`（逐文件 size/sha256）+ `README.txt` + 会话/附件文件树；默认只打已归档会话，`--scope all` 打全部；`readArchive`/`extractArchive` 回读时逐文件对 sha256，并拒绝写出目标目录之外的条目（防路径穿越）。
+- **子插件路由（v3.4.8）**：新增 `POST /api/w2m/backup/restore`（body 先返回计划，`{"apply":true}` 才写）、`POST /api/w2m/backup/archive`、`GET /api/w2m/backup/verify`、`GET|POST /api/w2m/backup/unlock`；写路由各带确认令牌，面板不使用密码（走 machine 信封）。CLI 同步新增 `unlock / verify / archive / restore`（`restore` 默认只打印计划）。
+- **测试**：新增 5 个套件（runtime / restore / archive / verify / access），备份侧共 20 套件；包含"真实 Harness 终审通过"与"错误候选被拒绝"两个方向的用例，以及预还原副本、冲突、keep-both、路径穿越、损坏块、索引漂移、old-only 块缺失等失败路径。
+- **复盘加固（同日）**：① 无凭据的首次运行不再创建半个仓库；② `run --dry-run` 真正零写入（不建目录、不取锁、不解锁）；③ 多会话还原的注册表改为"整次还原一个文档"，修掉 last-write-wins；④ 支持还原到全新 home（显式 `--workspace-path` 时创建最小注册表），并拒绝凭空建库；⑤ 运行时批量校验在真实仓库上暴露 V8 字符串上限（`Invalid string length`）与 Electron 堆崩溃（exit 134），改为"小批 JSON + 大会话 NDJSON 流式"，真实 15 会话计划通过；⑥ 归档包可**直接还原**（`restore --archive`，与仓库还原同一套门禁），补齐计划 4.3 的"可还原"；⑦ 还原前副本按 N 份保留；⑧ identical 会话跳过重写；⑨ verify 增加 descriptor 检查与 old 记录摘要重建；⑩ 新增 4 个 v3.4.8 路由行为用例（确认令牌、未建库状态、Windows 真实 DPAPI 全链路）。
+- **真实闭环（默认仓库 `D:\DeepSeekHarness\BackUP`，2026-11-17）**：`unlock` 报 `machine` 信封、本机可用；`verify` 2 快照 / 32 文件 / 337.4 MB / 108 块全部解块验签通过，30/30 "未来追加"模拟通过（49.1 s）；`archive --scope all` 把 16 文件打成 168.7 MB tar → 164.7 MB `.tar.zst`（2.3 s）；`restore` 计划把 15 份会话全部交给安装的 Harness 终审通过（15/15），识别出 13 份 identical、2 份 conflict（备份之后 DSH 又写过这些活会话），dry-run 零写入；来自未注册工作区的会话被默认拒绝，并以 `--workspace-path` 显式挂接后才进入计划。
+
+
+### 备份引擎、22:00 定时与旧版本轮转（v3.4.7）
+
+- 新增 `src/backup/engine.mjs`：一次备份 = 锁 → 建库 → 开 KEK → 扫描 → 按 scope 选会话 → 写缺失块（内容寻址去重）→ 提交快照 → 轮转。第二次未改动备份 `blocks_new = 0`（单测断言），备份前后源目录字节与 mtime 不变。
+- 新增 `src/backup/keystore.mjs` + `src/backup/machine-key.mjs`：仓库级随机 DEK（权威 `<root>/keys.json`，每个快照存副本以便独立还原）；默认 `machine`（Windows DPAPI，本机实测 round-trip）+ `password` 双信封；两者皆无时 `BACKUP_NO_PERMISSION`，**绝不写一个打不开的仓库**。
+- 新增 `src/backup/locks.mjs`：`tmp/backup.lock` 以 `wx` 原子创建；死 pid / 超龄 / 不可读三种回收；只释放自己的锁。第二个写入者得到 `BACKUP_LOCKED`（含持有者信息）。
+- 新增 `src/backup/atomic.mjs`：tmp 同目录 → 写入 → **fsync** → rename；内容地址只在字节落盘后出现，避免"名字在、字节不完整"的块被永久跳过。
+- 新增 `src/backup/rotation.mjs`：只有内容 sha256 变化才记 `old/<ws>/<sid>/<ts>-<sha12>.json`（**可还原记录**，不是整文件加密副本——副本会与内容寻址去重重复存储）；每会话默认保留 10 份，`current/` 存指针。
+- 新增 `src/backup/gc.mjs`：引用根 = 快照清单 + old 记录 + current 指针；删除无引用块并裁剪 old 窗口；**任一引用不可读即 `BACKUP_GC_UNSAFE`，一个字节都不删**；`--dry-run` 只报告。
+- 新增 `src/backup/schedule.mjs` + `src/plugin/backup.mjs` + `lib/backup.js`：默认 **22:00 Asia/Shanghai**（`backupTimes`/`backupTimeZone` 可改），睡眠跨时段只补跑一次，定时器由 `ctx.effect` 拥有、卸载即停；`dsh-backup` 子插件行随包发布但 `disabled: true`（启用它才意味着"定时器可以写盘"）；`GET/POST /api/w2m/backup/run`，POST 必须带 `{"confirm":"run"}`。
+- CLI：`w2m-backup run|list|gc`（`--scope` / `--session` / `--keep-old` / `--dry-run` / `--password-stdin` / `--no-machine-key`）；密码只经 stdin 或环境变量，绝不进 argv。
+- 时区日历算术抽到 `src/util/daily-clock.mjs`，自更新检查与备份计划共用一份（两份实现会在换夏令时那天给出不同答案）。
+- 新增 6 个测试套件：引擎（去重/增量/scope/拒绝）、轮转（记录/窗口/dry-run）、gc（孤儿/引用/拒绝）、锁（并发/回收/释放）、调度（默认值/精确时刻/补跑）、子插件+CLI（确认令牌/生命周期/离线 run）。
+- **可还原性证明**：单测用仓库钥匙把每个块解回、按清单拼回整文件、逐字节与源文件比对（同时验证"块被搬到别的地址会认证失败"）。备份是否可还原不再靠推断。
+- **抗崩溃**：块先写、快照后提交，因此崩溃遗留的块下次备份会被复用（单测模拟"删掉快照与索引、只留块"→ 第二次 0 新块）；轮转失败时快照已提交，引擎如实返回 `committed: true` + `snapshot_id`，不把"备份成功但指针没前进"报成"没备份"。
+- **活会话截断**：写入前用运行时同一份 `scanFrames` 检查 zstd 帧完整性；若会话正被追加导致尾部截断，重读一次，仍截断则照存原始字节并在 `torn_sessions` 报告中列出——不静默丢弃、也不把半个帧当成完整日志。
+- **密钥升级**：用密码种下的仓库，在首次遇到可用 OS keystore 的机器上自动追加 `machine` 信封（DEK 不变，旧块不受影响），此后定时任务无需密码；这是"密码种子 + 无人值守"两个需求能同时成立的唯一路径。
+- **gc 加固**：现在持有仓库锁（不会与正在运行的备份竞争），清理崩溃残留的 `.tmp-` 文件（仅超过 1 小时）与空 objects 前缀目录；任一引用不可读仍拒绝删除任何块。
+- 新增 3 个套件：`backup-atomic`（临时文件/替换/失败清理）、`backup-keystore`（DEK 与信封升级）、`backup-machine-key`（真实 DPAPI round-trip + 文件生命周期）；备份共 15 个套件 / 210 项。子插件面板路径在 Windows 上有真实 DPAPI 端到端用例。
+- **真实闭环（默认路径首次建库）**：`D:\DeepSeekHarness\BackUP` 首次备份 16 文件 / 168.7 MB / 54 块 / 4.8 s，`machine` 信封（DPAPI）解锁；第二次 1 新块 + 53 复用（98%），耗时 2.0 s —— 那 1 个新块来自**正在写入的当前会话**（两次运行之间增长），同时产生 1 条 old 记录，正好验证"活会话也能安全备份 + 轮转"；`gc --dry-run` 引用 55 块、0 误删；`status` 报 2 快照 / 1 旧版本 / 剩余 171.7 GB。
+
+### 备份地基（v3.4.6）：协议冻结、只读勘察、加密自检
+
+- 新增 `docs/BACKUP-DESIGN.md`：仓库布局、清单 v1 字段表、4 MiB 定长块、三信封加密（账户/本机/密码）、错误码表、排除项理由、版本兼容承诺，以及 2026-11-17 复盘门禁 G1–G5 的落点。
+- 新增 `src/backup/{layout,scan,manifest,crypto}.mjs`：仓库路径与具名失败（盘符缺失/无权限/别家仓库/仓库在 `$DSH_HOME` 内）、只读扫描（会话 + 注册表标记 + 附件对象，可选 hash/deep）、清单 schema 与严格校验（块对齐、路径规范化、计数自洽）、scrypt/HKDF + AES-256-GCM 三信封 + 块对象 + `selftest`。
+- 新增 `docs/SPIKE-ACCOUNT-KEK.md`（只读 spike，329 行）：核对 DSH 账户材料后确认——磁盘没有稳定账户标识，`userId` 只是标识不是秘密，用它派生 KEK 等于加密表演；**默认信封组合改为 `machine`（Windows DPAPI，同机免密）+ `password`（scrypt，唯一保证）**，`account` 降级为可选、且写入前必须先修 `getProfile(client)` 调用并做宿主内实测。scrypt 默认按实测取 N=2^17（约 461 ms）。
+- 新增只读路由 `GET /api/w2m/backup/status|scan`（由主插件挂载，不写盘）与 `bin/w2m-backup.mjs`（`status` / `scan` / `selftest`；`scan --manifest` 在内存里构建清单并给出摘要）。
+- 新增 `src/backup/repo.mjs`：快照 id（`YYYYMMDDTHHMMSSZ-<8 hex>`，字典序即时间序）、快照两文件、`index.jsonl` 行格式（只有计数与摘要，**不含路径**）、`commitSnapshot`（staging → rename → append → **回读校验**）、`openRepo` 只读状态；`status` 路由与 CLI 打印同一份状态，不再各推一遍。
+- 顺带修债：`test/agent.test.mjs`「transport re-delivery from cache」原先用 15s 默认预算，满载实测曾需 ~22s 而红；改为全程事件条件 + 60s 显式预算（`rabbit.stream(60_000)` 与三个 `waitFor`），不加 sleep、不放松断言，真实挂起仍会在 60s 失败。
+- `workspace.json` 的解析抽到 `src/util/dsh-workspace.mjs`，`session-doctor` 与备份扫描共用一份——两个解析器会静默给出不同答案，而复盘里正是“注册表状态不一致”害得会话看不见。
+- 新增 6 个测试套件共 120 项：布局的 5 类失败、只读扫描（含“扫描前后字节与 mtime 完全一致”）、加密三态（错密码/错账户/篡改一字节）与“信封换槽/降低参数”拒绝、清单字段冻结与 17 类非法清单、仓库协议（快照 id/索引行/提交回读/只读打开）、接线（bin/路由/层模型/脚本清单）。
+- 本机实测（真实 `$DSH_HOME`）：15 条会话 / 166.3 MiB、附件 1 个 / 62 KB、归档 4 / 置顶 4 / 未注册 2；`scan --manifest` 得到 54 个块；`selftest` 9 步全绿；`status` 对尚未创建的 `D:\DeepSeekHarness\BackUP` 报告“未初始化”且不创建它。
+
+### session-doctor：把"会话找回"的四类失败变成可执行门禁
+
+- 新增 `scripts/session-doctor.mjs`（只读）：检查 zstd 首帧只含 header、`surfaceOp`（含压缩检查点的对象形态）、`system/message` 保护头、`seq` 连续性与悬空引用、以及 `workspace.json` 未注册会话；`--json` 供还原流程调用。
+- 新增 `test/session-doctor.test.mjs`（11 项）：每条用例对应 2026-11-16/17 复盘里的一次真实失败，另有"健康日志必须零发现项"的防误报控制。
+- 新增 `docs/RETRO-SESSION-RECOVERY-20261117.md`：时间线、四类根因、最终生效做法、门禁清单（含后续版本 G1–G5），以及下一次会话找回的"必须/禁止"一页清单。
+- 本机实测：14 条会话日志全部通过格式检查，唯一发现项为 1 条未注册会话 —— 检查有效且不误报。
+
+## [3.4.5] - 2026-11-16
+
+- **新增自修复子插件 `dsh-fix`**（`@twinsearth/w2m-dsh-plugin/dsh-fix`，默认启用）：当会话历史引用的图片附件对象已被删除、导致每一轮都以 `TRANSPORT`（`DeepSeek Messages transport failed`）失败时，在进程内自动修复：
+  - 挂在 `agent/request-error` waterfall，只检查 `TRANSPORT` / `ATTACHMENT_NOT_FOUND`；
+  - 扫描当前请求视图（`session.surface.nodes`，被 compaction 阴影掉的旧消息自动排除），只针对对象文件确实缺失且尚未 `offloaded` 的图片；
+  - 追加官方既有的 `image/offload` 事件并 `await ctx.sessions.flush(session)` 过持久化屏障，然后返回 `{ kind: 'retry' }` 重试该步（不消耗 provider 重试预算、不记 `llm/retry`）；
+  - 没有可修的图 → `next()`，真网络错误原样交给下游；同一 session 同一轮最多修 `maxRepairsPerTurn`（默认 3）次。
+- **离线 CLI**：新增 `w2m-fix`（`bin/w2m-fix.mjs`；兼容路径 `cli/bin/dsh-fix-attachments.mjs`）：
+  - `scan` 只报告；`fix --apply` 追加一条带 checksum 的 `image/offload` 帧（需先退出 DSH；写前备份、写后全量复核）；
+  - `backups --session <片段>` / `restore --session <片段> --apply` 查看与回滚备份；
+  - 拒绝：DSH 正在运行、日志末尾有撕裂帧、不认识的会话格式版本；CLI 需要 Node ≥ 22.15（同步 zstd）。
+- **来源与迁移**：功能移植自 `xuzhunzhi/dsh-fix-attachments`（MIT）；挂载点、状态目录（`$DSH_HOME/xclient/dsh-fix-state.json`）与 CLI 名称按 w2m 约定调整，详见 `docs/DSH-FIX.md`。
+  升级到 v3.4.5 后如仍装有独立包 `dsh-fix-attachments`，请移除它（两个监听器能力重叠；本包已包含该修复）。
+- **Windows 能力探测修复**：Node 的 Windows 发行版同时带一个无扩展名的 `npm` shell 脚本；`probeNpm()` 在找不到 `npm-cli.js` 时会把它当成可直接执行文件，`spawn(..., {shell:false})` 得到 `SPAWN_ENOENT`。现在 Windows 上的直接探测只接受 `npm.exe`，无扩展名脚本改由 `npm.cmd` 分支报 `NEEDS_SHELL`（与既有语义一致）。
+
 ## [3.4.4] - 2026-11-16
 
 - **子插件浮标与子插件一一对应**：GPW、队列日志、决策中心三枚浮标只在对应子插件启用（HTTP 路由存在）时显示；子插件关闭时浮标隐藏，重新启用后自动出现。
@@ -11711,3 +12021,16 @@ First release. Scope: **one DeepSeek account, one instruction, several machines 
 
 [0.0.1]: https://github.com/TwinsEarth/dsh-windows2macos/releases/tag/v0.0.1
 [0.1.2]: https://github.com/TwinsEarth/dsh-windows2macos/releases/tag/v0.1.2
+
+### 保护模式：不加密（默认）/ 账户比对 / 4-6 位数字 PIN（用户最终决定，未发布）
+
+- **用户决定（原话）**：我们追求的不是绝对保密：1，用账户ID是为了方便实现自动化（账户能快捷解锁，不是必须）；2，密码也是4-6位数字（账户不对输入密码）；3，也可以选择不加密（1账户不对，2又没有设置密码，3默认是不加密的）。
+- **默认不加密**：新增第四种信封 `open`（`src/backup/crypto.mjs`）：记录里**明文**保存 32 字节 DEK（无 KDF、无 sealed 负载、无 AAD），`validateKeysFile` 接受它并**拒绝与 account/machine/password 混存**（否则 open 路径会静默绕过已设置的 PIN）。新建仓库默认 `encryption: 'none'` + `open` 信封，无需任何凭据即可开；`backup.json` 增加加法字段 `encryption: 'none'|'sealed'`（旧仓库缺省 = `sealed`）。
+- **模式规则（keystore/engine）**：`openRepoKey` 对 `none` 仓库不探测 OS keystore、不要求凭据（`unlocked_via: "none"`）；首次建库按 `resolveEncryptionMode` 解析：显式 `encryption` > 提供 PIN/密码 > `machineKey: true` > 可解析账户 id > 默认 `none`；显式 `none` + 密码是具名 `BACKUP_CONFIG_INVALID` 矛盾拒绝；显式 `sealed` 无凭据仍在 `ensureLayout` 前 `BACKUP_NO_PERMISSION`。向 `open` 仓库加 PIN/account 绑定时同一次写入删除 `open` 并同步 `encryption: sealed`；新增 `setEncryptionMode({mode:'none'})`（现有凭据打开 → 同一 DEK 写 open → `keys.json.bak-<ts>` → 原子写 → **无凭据**解封验证），块格式不变、不重写对象。`runBackup({encryption})` 在 `none` 时跳过 account 绑定，默认仓库不会被第一次 run 静默改成 sealed。
+- **PIN 从 8 字节降到 4 字节**：`setRepositoryPassword`/`addPasswordEnvelope` 接受 ≥4 字符（数字为预期用法），空值仍拒；结果新增 `weak: true`（<8 字节或纯数字）+ 警告「4 位数字 PIN 只是便捷门槛，不是保密强度」，**不静默提高 scrypt 成本**；`mode_after`/`envelopes` 报告升级后的状态。
+- **Describe/status/CLI**：`describeUnlock`、`GET /api/w2m/backup/status`、`GET /api/w2m/backup/unlock`、CLI `status`/`unlock` 均报告 `encryption`、`available_paths`（`none`/`account`/`machine`/`password`）与 `none` 模式的警告「未加密：任何能访问该目录的人都能还原备份」；任何结果/CLI 输出都不回显 DEK。CLI `run --encrypt none|sealed` / `--no-encryption`（非法值退出码 2）、`unlock --set-password`（4 位 PIN + 警告行）、`unlock --enable-protection`（= set-password 别名）、`unlock --disable-protection --confirm disable-protection`（缺确认令牌退出码 2）。
+- **插件**：配置 `backupEncryption`（默认 `none`；非法值挂载即 `BACKUP_CONFIG_INVALID`），run 结果/describe 带 `encryption`；`cordis.patch.yml` 的 dsh-backup 行写 `backupEncryption: none` 并保留 `backupAccountBinding: true`（账户绑定只对 sealed 仓库生效）。
+- **面板**（`lib/client.js`，仅备份面板）：状态卡显示保护模式徽标（未加密=警告色 / 已加密）+ 未加密警告行；解锁卡三态——未加密（免密解锁 + 警告 + 关闭保护说明）/ 账户一致（快捷解锁）/ 账户不一致但有 PIN（账户按钮禁用、提示只用终端输入 PIN + weak-PIN 提示）；新增 zh/en 键 `panel.backup.mode.*`、`status.mode`、`unlock.none|passwordHint|weakPinHint|disableProtectionHint`、`reason.BACKUP_CONFIG_INVALID`。HTTP 仍不接收密码，无输入框。
+- **测试**：`backup-keystore`（默认 none 无凭据开、PIN 建 sealed、open→sealed 删除 open、disable-protection 回 open、open 混存拒绝、DEK 不回显、模式解析优先级）；`backup-crypto`（open 记录/attempts/畸形拒绝）；`backup-access`（describe 三态 + 无凭据 unlock）；`backup-engine`（默认 none/PIN sealed/非法模式/矛盾组合）；`backup-run`（配置、路由默认 none、CLI encrypt/set-password/disable 与退出码）；`backup-verify`/`backup-restore`（none 模式无需密码）；`client-bundle`（三态解锁卡 + 徽标 + 新字典键）。既有 fixture 传密码的建库仍是 sealed。
+- **文档**：`docs/BACKUP-DESIGN.md` 新增 §25.0（用户最终决定：不是绝对保密；三态表；保护/不保护什么；何时才值得 sealed + 强密码）并重写 §25 的账户诚实声明、更新 §6/§8/§10/§11/§12；`docs/SPIKE-ACCOUNT-KEK.md` 新增 §9「用户最终决定：便捷优先」（不改写 §4-§8 的测量）。
+- **验证**：`npx eslint .` 0 error；`node scripts/layer-check.mjs`、`node scripts/scan-mojibake.mjs` clean；`backup-keystore`、`backup-crypto`、`backup-access`、`backup-engine`、`backup-run`、`backup-restore`、`backup-verify`、`backup-gc`、`backup-mirror`、`backup-wiring`、`backup-rotation`、`backup-layout`、`client-bundle`、`backup-runtime` 全绿；`node scripts/pack.mjs` 打包一次。**不 bump 版本号、不跑 preflight、不提交。**

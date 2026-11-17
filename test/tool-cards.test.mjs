@@ -228,8 +228,27 @@ const FORBIDDEN_PARAMETER_PATTERNS = [
   { why: 'a key path or identity file', re: /state[_-]?dir/i },
 ];
 
+/**
+ * Named exceptions to the patterns below, each with the reason it is a *narrowing* rather than a
+ * widening. Kept as an explicit map instead of narrowing the regexes: the default-deny shape is the
+ * point, and a future parameter that merely sounds like a credential or a list must still be refused
+ * by review. A test asserts every key here is still legitimate and that the patterns still match
+ * something (a pattern list gone stale would pass every future tool).
+ *
+ * `allowOutdated` (v3.5.0) is the fleet minimum-version gate's per-dispatch override. It cannot set
+ * the command allow-list, which is what the `/allow/` pattern is protecting: it is read only by the
+ * version gate, it is refused by default, and when set it is audited in the dispatch result and the
+ * host log. The alternative — refusing the required override — would remove the only escape hatch
+ * from a mixed fleet without making the allow-list any stricter.
+ */
+const NAMED_PARAMETER_EXCEPTIONS = Object.freeze({
+  allowOutdated:
+    'the v3.5.0 minimum-version gate override: per-dispatch, default false, audited; it cannot write an allow-list',
+});
+
 /** Is this parameter name forbidden, and why? `null` when it is fine. */
 function forbiddenParameter(name) {
+  if (Object.hasOwn(NAMED_PARAMETER_EXCEPTIONS, name)) return null;
   const hit = FORBIDDEN_PARAMETER_PATTERNS.find((entry) => entry.re.test(name));
   return hit ? hit.why : null;
 }
@@ -386,8 +405,14 @@ describe('exposure boundary: a tool may not hold a credential, an allow-list or 
     }
     // ...and the names this surface legitimately carries are not caught, so the sweep cannot be
     // satisfied by renaming a real parameter into something unrecognisable.
-    for (const name of ['executor_machine_id', 'command_argv', 'write_scope', 'cwd_rel', 'timeout_ms', 'include_stale']) {
+    for (const name of ['executor_machine_id', 'command_argv', 'write_scope', 'cwd_rel', 'timeout_ms', 'include_stale', 'allowOutdated']) {
       assert.equal(forbiddenParameter(name), null, `\`${name}\` is a legitimate parameter`);
+    }
+    // The one named exception must stay a real exception, not a hole: every other allow-shaped name
+    // is still refused, and the exception list is small and documented.
+    assert.deepEqual(Object.keys(NAMED_PARAMETER_EXCEPTIONS), ['allowOutdated']);
+    for (const name of ['allowed_commands', 'allowList', 'allowPaths', 'allowedTools']) {
+      assert.notEqual(forbiddenParameter(name), null, `\`${name}\` must still be refused as an allow-list`);
     }
   });
 

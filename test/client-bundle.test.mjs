@@ -348,8 +348,8 @@ describe('client bundle: the activation contract', () => {
       () => exports.apply(ctx),
       'an undeclared service read throws in Cordis and takes the whole app down; the bundle must read only what it declares',
     );
-    assert.deepEqual(registry.announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, 'conversation.composer.dock', 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', 'sidebar.panellist', 'main', SEAT], 'the entry still has to take its seat');
-    assert.equal(registry.registered.length, 18);
+    assert.deepEqual(registry.announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'sidebar.panellist', 'main', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, 'conversation.composer.dock', 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', 'sidebar.panellist', 'main', SEAT], 'the entry still has to take its seat');
+    assert.equal(registry.registered.length, 20);
     assert.equal(locale.registered.has('w2m.target'), true, 'the dictionaries go to the locale service when there is one');
   });
 
@@ -453,8 +453,8 @@ describe('client bundle: the seat it registers into', () => {
 
   it('announces and registers all five composer controls plus the sidebar and update sections into conversation.input.left', () => {
     const { announced, registered } = applyTo();
-    assert.deepEqual(announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, 'conversation.composer.dock', 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', 'sidebar.panellist', 'main', SEAT]);
-    assert.equal(registered.length, 18);
+    assert.deepEqual(announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'sidebar.panellist', 'main', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, 'conversation.composer.dock', 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', 'sidebar.panellist', 'main', SEAT]);
+    assert.equal(registered.length, 20);
     assert.equal(registered[0].options.name, SEAT);
   });
 
@@ -502,7 +502,7 @@ describe('client bundle: the seat it registers into', () => {
     };
     const { exports } = loadBundle();
     assert.doesNotThrow(() => exports.apply(ctx));
-    assert.equal(registered.length, 18);
+    assert.equal(registered.length, 20);
   });
 });
 
@@ -811,6 +811,125 @@ function findBy(node, predicate, found = []) {
     for (const child of node.children) findBy(child, predicate, found);
   }
   return found;
+}
+
+/** Every string child of the element tree, in render order (used to read the panel's copy). */
+function collectText(node, found = []) {
+  if (Array.isArray(node)) {
+    for (const child of node) collectText(child, found);
+    return found;
+  }
+  if (typeof node === 'string') {
+    found.push(node);
+    return found;
+  }
+  if (node === null || typeof node !== 'object') return found;
+  if (Array.isArray(node.children)) {
+    for (const child of node.children) collectText(child, found);
+  }
+  return found;
+}
+
+/**
+ * A hook-capable React stand-in that mounts one component, re-renders it, **and can unmount it**.
+ *
+ * {@link makeHookReact} intentionally drops cleanup functions; the backup page's 10 s poll is
+ * exactly the kind of side effect a test has to be able to stop, so this one keeps each effect's
+ * cleanup and hands back the unmount function. Re-rendering is what lets a test click a button,
+ * let the handler's fetch promises settle, and read the rendered result. Hooks are keyed by call
+ * order, which matches the component's fixed hook list.
+ */
+function makeMountReact() {
+  const hooks = [];
+  let index = 0;
+  let cleanups = [];
+  let pending = [];
+  let dirty = false;
+  let mounted = false;
+  let lastTree = null;
+  const runPending = () => {
+    const effects = pending;
+    pending = [];
+    for (const effect of effects) {
+      const cleanup = effect();
+      if (typeof cleanup === 'function') cleanups.push(cleanup);
+    }
+  };
+  const renderPass = (component, props) => {
+    for (let pass = 0; pass < 60; pass += 1) {
+      index = 0;
+      dirty = false;
+      lastTree = expandComponent(component(props));
+      runPending();
+      if (!dirty) break;
+    }
+    return lastTree;
+  };
+  /**
+   * Render child function components the way React would.
+   *
+   * The page renders the pure `BackupPanelView` as a child; it uses no hooks, so expanding it here
+   * cannot disturb the page's own hook order. Elements produced by `createElement` in this fake are
+   * plain objects with a `type`, so a function `type` is exactly the child-component case.
+   */
+  const expandComponent = (node) => {
+    if (Array.isArray(node)) return node.map(expandComponent);
+    if (node === null || typeof node !== 'object') return node;
+    if (typeof node.type === 'function') return expandComponent(node.type(node.props));
+    if (Array.isArray(node.children)) return { ...node, children: node.children.map(expandComponent) };
+    return node;
+  };
+  const React = {
+    createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }),
+    useState(initial) {
+      const at = index++;
+      if (!(at in hooks)) hooks[at] = typeof initial === 'function' ? initial() : initial;
+      return [hooks[at], (next) => {
+        hooks[at] = typeof next === 'function' ? next(hooks[at]) : next;
+        dirty = true;
+      }];
+    },
+    useRef(initial) {
+      const at = index++;
+      if (!(at in hooks)) hooks[at] = { current: initial ?? null };
+      return hooks[at];
+    },
+    useEffect(effect, deps) {
+      const at = index++;
+      const previous = hooks[at];
+      const changed = previous === undefined
+        || deps === undefined
+        || deps.length !== previous.length
+        || deps.some((value, i) => !Object.is(value, previous[i]));
+      if (!changed) return;
+      hooks[at] = deps ?? [];
+      pending.push(effect);
+    },
+  };
+  return {
+    React,
+    mount(component, props) {
+      index = 0;
+      cleanups = [];
+      pending = [];
+      mounted = true;
+      renderPass(component, props);
+      return {
+        get tree() { return lastTree; },
+        rerender(nextProps = props) {
+          if (mounted) renderPass(component, nextProps);
+        },
+        unmount() {
+          if (!mounted) return;
+          mounted = false;
+          for (const cleanup of cleanups.reverse()) {
+            try { cleanup(); } catch { /* a cleanup must not decide the test outcome */ }
+          }
+          cleanups = [];
+        },
+      };
+    },
+  };
 }
 
 describe('client bundle: selecting a machine writes the @mention', () => {
@@ -1179,3 +1298,1594 @@ it('v3.4.4: each floating badge follows its own subplugin route', () => {
   assert.ok(source.includes('badge.hidden = !enabled;'), 'both DOM badges follow their route');
   assert.ok(source.includes('.w2mDcBadge[hidden],.w2mJqBadge[hidden]'), 'hidden beats the class display rule');
 });
+
+// ---------------------------------------------------------------------------------------------
+// The 备份&还原 panel (v3.4.9)
+// ---------------------------------------------------------------------------------------------
+//
+// The panel is the UI half of a feature whose host routes (src/plugin/backup.mjs) already exist.
+// What is asserted here is everything a static read of the bundle can get wrong without a browser
+// noticing: the sidebar/main registration pair, the four one-click operations, the two unlock
+// branches (and the absence of any password field), the reason-code → copy mapping, the bounded
+// in-memory log, and the two lifecycle leaks that would rot the page — a second stylesheet and a
+// surviving poll timer after the slot unmounts.
+
+describe('client bundle: the backup & restore panel (v3.4.9)', () => {
+  /** Apply the bundle into a recording registry and hand back the two backup registrations. */
+  function mountBackup(options = {}) {
+    const registry = makeRegistry();
+    const bundle = loadBundle(options);
+    bundle.exports.apply({ slots: registry, effect: (callback) => callback(), get: () => undefined });
+    const sidebar = registry.registered.find((entry) => entry.options.id === 'w2m-backup');
+    const main = registry.registered.find((entry) => entry.options.key === 'w2m-backup');
+    return { bundle, registry, sidebar, main };
+  }
+
+  /** The props the pure view needs; every case starts from a rendered, all-null page. */
+  function viewProps(overrides = {}) {
+    return {
+      t: (key) => key,
+      repo: null,
+      status: null,
+      unlock: null,
+      plan: null,
+      selected: [],
+      busy: '',
+      log: [],
+      verify: null,
+      lastAction: null,
+      error: null,
+      archiveScope: 'archived',
+      restoreArmed: false,
+      runMissing: false,
+      // v3.5.0: the backup-scope card starts before the read-only scan has resolved (scan === null).
+      scan: null,
+      picked: [],
+      ...overrides,
+    };
+  }
+
+  /** One rendered button by its stable `data-w2m-backup-action` marker (the v3.5.0 scope entries too). */
+  function actionButton(tree, action) {
+    return findBy(tree, (node) => node.props?.['data-w2m-backup-action'] === action)[0];
+  }
+
+  /**
+   * Mount the real backup page behind the fake hook-capable React with a recording fetch.
+   *
+   * `respond` receives `{url, method, body}` and returns the JSON payload to answer with, or
+   * `{status: 404}` for a missing route. Returning `undefined` marks the request as unexpected: it is
+   * recorded in `unexpected` (and answered with a 404) instead of throwing, because `callBackup`
+   * never throws and a silent catch would turn a wrong route into a green test.
+   */
+  function mountBackupPage(respond) {
+    const requests = [];
+    const unexpected = [];
+    const hostFetch = async (url, init = {}) => {
+      const method = init.method ?? 'GET';
+      const body = init.body === undefined ? null : JSON.parse(init.body);
+      const answer = respond({ url, method, body });
+      requests.push({ url, method, body });
+      if (answer === undefined) {
+        unexpected.push(method + ' ' + url);
+        return { ok: false, status: 404, json: async () => ({ ok: false, reason_code: 'BACKUP_ROUTE_MISSING', detail: 'unexpected in this test' }) };
+      }
+      if (answer.status === 404) {
+        return { ok: false, status: 404, json: async () => ({ ok: false, reason_code: 'BACKUP_ROUTE_MISSING', detail: 'the host has no such route' }) };
+      }
+      return { ok: true, status: 200, json: async () => answer };
+    };
+    const mountReact = makeMountReact();
+    const registry = makeRegistry();
+    const bundle = loadBundle({
+      document: makeFakeDocument(),
+      requireImpl: (specifier) => {
+        if (specifier === 'react') return mountReact.React;
+        throw new Error(`unexpected require(${specifier})`);
+      },
+      globals: { fetch: hostFetch },
+    });
+    bundle.exports.apply({ slots: registry, effect: (callback) => callback(), get: () => undefined });
+    const page = registry.registered.find((entry) => entry.options.key === 'w2m-backup');
+    assert.ok(page !== undefined, 'the backup page is registered');
+    const handle = mountReact.mount(page.component, { t: bundle.exports.makeTranslator(() => undefined) });
+    return {
+      bundle,
+      handle,
+      requests,
+      unexpected,
+      settle: async () => {
+        await new Promise((resolve) => { setTimeout(resolve, 0); });
+        handle.rerender();
+      },
+      text: () => collectText(handle.tree).join('\n'),
+    };
+  }
+
+  /**
+   * The ordinary host: read-only scan (by default an empty list), run GET with the embedded status,
+   * the standalone status route, and the unlock describe route. The two scope entries hit the same
+   * `/api/w2m/backup/run` route the four existing operations use.
+   */
+  function standardBackupHost(options = {}) {
+    const statusBody = { ok: true, repository: { root: 'D:\\BackUP', initialized: true, counts: { snapshots: 1 }, free_bytes: 1_048_576 } };
+    const scanBody = options.scanBody ?? { ok: true, sessions: [], totals: { sessions: 0 }, registry: { ok: true } };
+    const runPost = options.runPost ?? (() => ({ ok: true, snapshot_id: 'snap-scope', sessions: 1, files: 2, blocks_new: 1, blocks_reused: 0, duration_ms: 10 }));
+    return ({ url, method }) => {
+      if (url === '/api/w2m/backup/scan?detail=1') return scanBody;
+      if (url === '/api/w2m/backup/run') {
+        if (method === 'POST') return runPost();
+        return { ok: true, enabled: true, backup_dir: 'D:\\BackUP', schedule: { times: ['22:00:00'], time_zone: 'UTC' }, status: statusBody, state: { running: false } };
+      }
+      if (url === '/api/w2m/backup/status') return statusBody;
+      if (url === '/api/w2m/backup/unlock') return { ok: true, initialized: true, envelopes: ['machine'], machine_available: true, machine_reason: null, password_required: false };
+      return undefined;
+    };
+  }
+
+  /** Three sessions whose mix covers archived / unregistered, as the read-only scan reports them. */
+  function scanSessionsBody() {
+    return {
+      ok: true,
+      read_only: true,
+      scanned_at: '2026-11-17T10:00:00.000Z',
+      sessions: [
+        { session_id: 'sess-alpha-0001', workspace: 'proj-a', size: 2048, flags: { registered: true, archived: false } },
+        { session_id: 'sess-beta-0002', workspace: 'proj-b', size: 4096, flags: { registered: true, archived: true } },
+        { session_id: 'sess-gamma-0003', workspace: 'proj-c', size: 8192, flags: { registered: false, archived: false } },
+      ],
+      totals: { sessions: 3 },
+      registry: { ok: true, workspaces: 3, registered: 2, archived: 1, pinned: 0 },
+    };
+  }
+
+  it('takes a sidebar seat after GPW and a main page keyed by the same id', () => {
+    const { registry, sidebar, main } = mountBackup();
+    assert.ok(sidebar !== undefined, 'the backup sidebar entry is registered');
+    assert.equal(sidebar.options.name, 'sidebar.panellist');
+    assert.equal(sidebar.options.id, 'w2m-backup');
+    assert.ok(main !== undefined, 'the backup main page is registered');
+    assert.equal(main.options.name, 'main');
+    assert.equal(main.options.key, 'w2m-backup');
+    assert.equal(main.options.key, sidebar.options.id, 'the main key must equal the panellist id');
+    const gpw = registry.registered.find((entry) => entry.options.name === 'sidebar.panellist'
+      && entry.options.id === 'w2m-gpw');
+    assert.ok(gpw !== undefined, 'the GPW sidebar entry is still registered');
+    assert.ok(sidebar.options.order > gpw.options.order, 'the entry is listed after GPW');
+    assert.equal(typeof sidebar.component, 'function', 'the sidebar entry is a component');
+    assert.equal(typeof main.component, 'function', 'the main page is a component');
+    const injected = sidebar.options.inject();
+    assert.equal(typeof injected.t, 'function', 'visible copy goes through the locale seam');
+    assert.equal(injected.t('panel.backup.title'), '备份&还原', 'the label is translated, not hardcoded in the host UI');
+  });
+
+  it('draws the sidebar icon as an inline currentColor SVG that wakes the panel', () => {
+    const { bundle } = mountBackup({
+      globals: { CustomEvent: class { constructor(type) { this.type = type; } } },
+    });
+    const tree = bundle.exports.BackupSidebarIcon({ t: (key) => key });
+    const svgs = findBy(tree, (node) => node.type === 'svg');
+    assert.equal(svgs.length, 1, 'the icon is an inline SVG, not an external asset');
+    assert.equal(svgs[0].props.stroke, 'currentColor', 'the icon follows the host theme text colour');
+    assert.equal(svgs[0].props.fill, 'none');
+    const events = [];
+    bundle.window.dispatchEvent = (event) => { events.push(event); };
+    const button = findBy(tree, (node) => node.props?.['data-w2m-backup-sidebar'] === 'true')[0];
+    assert.ok(button !== undefined, 'the entry is a button');
+    button.props.onClick();
+    assert.equal(events[0]?.type, 'w2m-backup-open', 'clicking the entry asks the panel to refresh');
+  });
+
+  it('renders the four one-click operations with stable action markers', () => {
+    const { bundle } = mountBackup();
+    const tree = bundle.exports.BackupPanelView(viewProps());
+    const actions = findBy(tree, (node) => node.props?.['data-w2m-backup-action'] !== undefined)
+      .map((node) => node.props['data-w2m-backup-action']);
+    for (const action of ['run', 'restore', 'archive', 'verify']) {
+      assert.ok(actions.includes(action), `the ${action} operation is rendered`);
+    }
+    // While an operation is in flight every operation button is disabled: no double submit.
+    const busyTree = bundle.exports.BackupPanelView(viewProps({ busy: 'run' }));
+    const operationButtons = findBy(busyTree, (node) => node.type === 'button'
+      && ['run', 'restore', 'archive', 'verify'].includes(node.props?.['data-w2m-backup-action']));
+    assert.equal(operationButtons.length, 4);
+    for (const button of operationButtons) {
+      assert.equal(button.props.disabled, true, 'an in-flight operation disables its siblings');
+    }
+  });
+
+  it('offers the machine unlock and always explains the CLI password path, never posting a password', () => {
+    const { bundle } = mountBackup();
+    // The real translator: the CLI command is part of the Chinese/English copy, not a key.
+    const t = bundle.exports.makeTranslator(() => undefined);
+    const available = bundle.exports.BackupPanelView(viewProps({
+      t,
+      unlock: { ok: true, initialized: true, envelopes: ['machine', 'password'], machine_available: true, machine_reason: null, password_required: true },
+    }));
+    assert.equal(findBy(available, (node) => node.props?.['data-w2m-backup-action'] === 'unlock').length, 1,
+      'the machine envelope gets a one-click unlock button');
+    const text = collectText(available).join('\n');
+    assert.ok(text.includes('w2m-backup unlock --check --password-stdin'), 'the password path names the local CLI command');
+    assert.ok(text.includes('密码不经过 HTTP'), 'the copy says a password never travels over HTTP');
+    assert.equal(findBy(available, (node) => node.type === 'input' && node.props?.type === 'password').length, 0,
+      'HTTP never takes a password, so there is no password field');
+    assert.equal(findBy(available, (node) => node.props?.['data-w2m-backup-unlock-account'] !== undefined).length, 0,
+      'a repository with no account binding shows no account row: the unbound card is unchanged');
+
+    const unavailable = bundle.exports.BackupPanelView(viewProps({
+      t,
+      unlock: { ok: true, initialized: true, envelopes: ['password'], machine_available: false, machine_reason: 'dpapi-probe-failed', password_required: true },
+    }));
+    assert.equal(findBy(unavailable, (node) => node.props?.['data-w2m-backup-action'] === 'unlock').length, 0,
+      'no machine button when the envelope cannot be loaded');
+    assert.ok(collectText(unavailable).join('\n').includes('w2m-backup unlock --check --password-stdin'),
+      'the password path is still shown instead');
+  });
+
+  it('shows the compare-only account path: a match unlocks, a mismatch sends the operator to the password', () => {
+    const { bundle } = mountBackup();
+    const t = bundle.exports.makeTranslator(() => undefined);
+
+    const matched = bundle.exports.BackupPanelView(viewProps({
+      t,
+      unlock: {
+        ok: true,
+        initialized: true,
+        envelopes: ['machine', 'account', 'password'],
+        machine_available: true,
+        machine_reason: null,
+        password_required: true,
+        account: { bound: true, matched: true, id_hint: '…abcd' },
+      },
+    }));
+    const matchedRow = findBy(matched, (node) => node.props?.['data-w2m-backup-unlock-account'] !== undefined)[0];
+    assert.ok(matchedRow !== undefined, 'the account row is rendered when the repository is bound');
+    assert.equal(matchedRow.props['data-w2m-backup-unlock-account'], 'matched');
+    const matchedButton = actionButton(matched, 'unlock-account');
+    assert.ok(matchedButton !== undefined, 'the account path gets its own one-click button');
+    assert.equal(matchedButton.props.disabled, false, 'a matching account id may unlock without a password');
+    const matchedText = collectText(matched).join('\n');
+    assert.ok(matchedText.includes('本机账户与原账户一致，可直接解锁'), 'the match copy is the "original account" sentence');
+    assert.ok(matchedText.includes('…abcd'), 'the masked hint is shown');
+    assert.equal(matchedText.includes('user-1234abcd'), false, 'the full account id never reaches the panel copy');
+
+    const mismatch = bundle.exports.BackupPanelView(viewProps({
+      t,
+      unlock: {
+        ok: true,
+        initialized: true,
+        envelopes: ['account', 'password'],
+        machine_available: false,
+        machine_reason: 'dpapi-probe-failed',
+        password_required: true,
+        account: { bound: true, matched: false, id_hint: '…abcd' },
+      },
+    }));
+    const mismatchRow = findBy(mismatch, (node) => node.props?.['data-w2m-backup-unlock-account'] !== undefined)[0];
+    assert.equal(mismatchRow.props['data-w2m-backup-unlock-account'], 'mismatch');
+    const mismatchButton = actionButton(mismatch, 'unlock-account');
+    assert.equal(mismatchButton.props.disabled, true, 'a different account must not be presented as an unlock button');
+    const mismatchText = collectText(mismatch).join('\n');
+    assert.ok(mismatchText.includes('当前账户不是原账户：请使用解锁密码'), 'the mismatch copy tells the operator to use the password');
+    assert.ok(mismatchText.includes('w2m-backup unlock --check --password-stdin'), 'the password path is still explained');
+
+    // Bound, but the host could not read an id to compare (signed out, or account binding switched off in config).
+    const unread = bundle.exports.BackupPanelView(viewProps({
+      t,
+      unlock: {
+        ok: true,
+        initialized: true,
+        envelopes: ['account'],
+        machine_available: false,
+        machine_reason: 'dpapi-probe-failed',
+        password_required: false,
+        account: { bound: true, matched: null, id_hint: '…abcd' },
+      },
+    }));
+    const unreadRow = findBy(unread, (node) => node.props?.['data-w2m-backup-unlock-account'] !== undefined)[0];
+    assert.equal(unreadRow.props['data-w2m-backup-unlock-account'], 'unknown');
+    assert.equal(actionButton(unread, 'unlock-account').props.disabled, true, 'no comparison means no account unlock');
+    assert.ok(collectText(unread).join('\n').includes('读取不到本机账户 ID'));
+  });
+
+  it('renders the three protection states, with the mode badge and the honest unencrypted warning', () => {
+    const { bundle } = mountBackup();
+    const t = bundle.exports.makeTranslator(() => undefined);
+
+    // State 1: unencrypted (the default). No credential, a warning, and the "turn protection off" explanation.
+    const none = bundle.exports.BackupPanelView(viewProps({
+      t,
+      repo: {
+        ok: true,
+        encryption: 'none',
+        repository: { root: 'D:\\BackUP', initialized: true, encryption: 'none', counts: { snapshots: 1 }, free_bytes: 1048576 },
+      },
+      unlock: {
+        ok: true,
+        initialized: true,
+        envelopes: ['open'],
+        encryption: 'none',
+        available_paths: ['none'],
+        warning: '未加密：任何能访问该目录的人都能还原备份',
+        machine_available: false,
+        machine_reason: 'repository-is-unencrypted',
+        password_required: false,
+        account: { bound: false, matched: null, id_hint: null },
+      },
+    }));
+    const noneState = findBy(none, (node) => node.props?.['data-w2m-backup-unlock-state'] !== undefined)[0];
+    assert.equal(noneState.props['data-w2m-backup-unlock-state'], 'none', 'the unlock card has an explicit unencrypted state');
+    const noneUnlockCard = findBy(none, (node) => node.props?.['data-w2m-backup-panel'] === 'unlock')[0];
+    assert.equal(noneUnlockCard.props['data-w2m-backup-unlock-mode'], 'none');
+    const noneText = collectText(none).join('\n');
+    assert.ok(noneText.includes('未加密：任何能访问该目录的人都能还原备份'), 'the status/unlock cards show the real consequence');
+    assert.ok(noneText.includes('不需要账户或 PIN'), 'the unencrypted copy says no credential is needed');
+    assert.equal(actionButton(none, 'unlock').props.disabled, false, 'an unencrypted repository can unlock with one click');
+    assert.ok(findBy(none, (node) => node.props?.['data-w2m-backup-disable-protection-hint'] !== undefined).length >= 1,
+      'the "turn protection off" explanation is present');
+    assert.equal(findBy(none, (node) => node.type === 'input' && node.props?.type === 'password').length, 0,
+      'even the unencrypted card has no password field');
+    // Mode badges: one on the status card, one on the unlock card.
+    const noneBadges = findBy(none, (node) => node.props?.['data-w2m-backup-mode'] === 'none');
+    assert.equal(noneBadges.length, 2, 'the status card and the unlock card both carry the mode badge');
+    assert.ok(collectText(none).join('\n').includes('未加密（默认）'), 'the badge label is translated');
+
+    // State 2: sealed + account match -> quick unlock.
+    const matched = bundle.exports.BackupPanelView(viewProps({
+      t,
+      repo: { ok: true, encryption: 'sealed', repository: { root: 'D:\\BackUP', initialized: true, encryption: 'sealed', counts: { snapshots: 1 } } },
+      unlock: {
+        ok: true,
+        initialized: true,
+        envelopes: ['machine', 'account', 'password'],
+        encryption: 'sealed',
+        available_paths: ['account', 'machine', 'password'],
+        warning: null,
+        machine_available: true,
+        machine_reason: null,
+        password_required: true,
+        account: { bound: true, matched: true, id_hint: '…abcd' },
+      },
+    }));
+    const matchedState = findBy(matched, (node) => node.props?.['data-w2m-backup-unlock-state'] !== undefined)[0];
+    assert.equal(matchedState.props['data-w2m-backup-unlock-state'], 'account-matched');
+    assert.equal(actionButton(matched, 'unlock-account').props.disabled, false);
+    assert.equal(findBy(matched, (node) => node.props?.['data-w2m-backup-mode'] === 'sealed').length, 2, 'sealed badges are shown');
+    assert.equal(collectText(matched).join('\n').includes('未加密'), false, 'a sealed repository shows no unencrypted warning');
+
+    // State 3: sealed + account mismatch with a PIN -> account button disabled, PIN only in the terminal.
+    const mismatch = bundle.exports.BackupPanelView(viewProps({
+      t,
+      repo: { ok: true, encryption: 'sealed', repository: { root: 'D:\\BackUP', initialized: true, encryption: 'sealed', counts: { snapshots: 1 } } },
+      unlock: {
+        ok: true,
+        initialized: true,
+        envelopes: ['machine', 'account', 'password'],
+        encryption: 'sealed',
+        available_paths: ['account', 'machine', 'password'],
+        warning: null,
+        machine_available: false,
+        machine_reason: 'dpapi-probe-failed',
+        password_required: true,
+        account: { bound: true, matched: false, id_hint: '…abcd' },
+      },
+    }));
+    const mismatchState = findBy(mismatch, (node) => node.props?.['data-w2m-backup-unlock-state'] !== undefined)[0];
+    assert.equal(mismatchState.props['data-w2m-backup-unlock-state'], 'account-mismatch');
+    assert.equal(actionButton(mismatch, 'unlock-account').props.disabled, true);
+    const mismatchText = collectText(mismatch).join('\n');
+    assert.ok(mismatchText.includes('请在本机终端用 4–6 位数字 PIN 解锁'), 'the mismatch copy points at the terminal PIN');
+    assert.ok(mismatchText.includes('4 位数字 PIN 只是便捷门槛，不是保密强度'), 'the weak-PIN caveat is shown');
+    assert.ok(mismatchText.includes('w2m-backup unlock --check --password-stdin'), 'the CLI command is still named');
+    assert.equal(findBy(mismatch, (node) => node.props?.['data-w2m-backup-unlock-password-hint'] !== undefined).length, 1);
+    assert.equal(findBy(mismatch, (node) => node.props?.['data-w2m-backup-unlock-weak-pin'] !== undefined).length, 1);
+  });
+
+  it('never carries a password into a request body (the section posts confirmation tokens only)', () => {
+    const source = readFileSync(BUNDLE_PATH, 'utf8');
+    const start = source.indexOf('备份&还原面板（v3.4.9）');
+    assert.ok(start > 0, 'the panel section is in the bundle');
+    const end = source.indexOf('function FleetChat(', start);
+    assert.ok(end > start, 'the section ends before the fleet-chat module');
+    const section = source.slice(start, end);
+    assert.equal(/type:\s*'password'/.test(section), false, 'no password input in the backup panel');
+    assert.equal(/JSON\.stringify\(\{[^}]*password/isu.test(section), false, 'no request body carries a password');
+    for (const route of [
+      '/api/w2m/backup/run',
+      '/api/w2m/backup/restore',
+      '/api/w2m/backup/archive',
+      '/api/w2m/backup/verify',
+      '/api/w2m/backup/unlock',
+    ]) {
+      assert.ok(section.includes(route), `the panel calls ${route}`);
+    }
+  });
+
+  it('renders the status bar, the plan card with checkboxes and the run log', () => {
+    const { bundle } = mountBackup();
+    const tree = bundle.exports.BackupPanelView(viewProps({
+      repo: { ok: true, repository: { root: 'D:\\BackUP', initialized: true, counts: { snapshots: 3 }, free_bytes: 1048576 } },
+      status: {
+        ok: true,
+        backup_dir: 'D:\\BackUP',
+        schedule: { times: ['22:00:00'], time_zone: 'Asia/Shanghai' },
+        state: {
+          running: false,
+          last_run: '2026-11-17T10:00:00.000Z',
+          last_result: { snapshot_id: '20261117T100000Z-abcdef12', sessions: 2, files: 4, duration_ms: 4800 },
+          last_error: null,
+          last_registry_recheck: { at: '2026-11-17T10:00:05.000Z', ok: true, rewritten: true },
+        },
+      },
+      plan: {
+        ok: true,
+        snapshot_id: '20261117T100000Z-abcdef12',
+        summary: { sessions: 2, new: 1, identical: 1, conflicts: 0, attachments: 0 },
+        candidates: [
+          { session_id: 'sess-a', workspace: 'proj-a', size: 2048, conflict: 'new' },
+          { session_id: 'sess-b', workspace: 'proj-b', size: 4096, conflict: 'identical' },
+        ],
+      },
+      selected: ['sess-a'],
+      log: [{ at: '2026-11-17T10:00:01.000Z', action: 'run', ok: true, code: 'OK', detail: null }],
+    }));
+    const text = collectText(tree).join('\n');
+    assert.ok(text.includes('D:\\BackUP'), 'the repository path is shown');
+    assert.ok(text.includes('panel.backup.status.yes'), 'the initialised state is shown');
+    assert.ok(text.includes('panel.backup.status.recheckRewrote'), 'a registry re-check result is shown when it exists');
+    assert.ok(text.includes('20261117T100000Z-abcdef12'), 'the last snapshot summary is shown');
+    assert.ok(text.includes('panel.backup.plan.summary'), 'the plan card renders its summary');
+    assert.ok(text.includes('panel.backup.status.runResult'), 'the last run summary is shown');
+    const checkboxes = findBy(tree, (node) => node.type === 'input' && node.props?.type === 'checkbox'
+      && node.props?.['data-w2m-backup-session'] !== undefined);
+    assert.equal(checkboxes.length, 2, 'one checkbox per candidate session');
+    assert.deepEqual(checkboxes.map((node) => node.props.checked), [true, false], 'the selected session is checked');
+    assert.deepEqual(checkboxes.map((node) => node.props['data-w2m-backup-session']), ['sess-a', 'sess-b']);
+    assert.equal(findBy(tree, (node) => node.props?.['data-w2m-backup-runtime'] === 'true').length, 1,
+      'the slow-path toggle is a checkbox too, and is not a session checkbox');
+    assert.equal(findBy(tree, (node) => node.props?.['data-w2m-backup-log-row'] === 'run').length, 1, 'the log lists the operation');
+  });
+
+  it('shows the danger confirmation only after the restore is armed', () => {
+    const { bundle } = mountBackup();
+    const plan = {
+      ok: true,
+      snapshot_id: 'snap-1',
+      summary: { sessions: 1, new: 0, identical: 0, conflicts: 1, attachments: 0 },
+      candidates: [{ session_id: 'sess-a', workspace: 'proj-a', size: 12, conflict: 'differs' }],
+    };
+    const quiet = bundle.exports.BackupPanelView(viewProps({ plan }));
+    assert.equal(findBy(quiet, (node) => node.props?.['data-w2m-backup-confirm'] === 'restore').length, 0,
+      'nothing dangerous is shown before the first click');
+    const armed = bundle.exports.BackupPanelView(viewProps({ plan, restoreArmed: true }));
+    assert.equal(findBy(armed, (node) => node.props?.['data-w2m-backup-confirm'] === 'restore').length, 1,
+      'the second click is gated by a visible warning');
+    const restore = findBy(armed, (node) => node.props?.['data-w2m-backup-action'] === 'restore')[0];
+    assert.equal(restore.props['data-armed'], 'true');
+    assert.ok(String(restore.children[0]).includes('panel.backup.action.confirmRestore'),
+      'the button asks for confirmation in words, not in colour only');
+  });
+
+  it('drives the four operations through the host route contracts and gates restore behind two clicks', async () => {
+    const document = makeFakeDocument();
+    const requests = [];
+    const statusBody = {
+      ok: true,
+      repository: { root: 'D:\\BackUP', initialized: true, counts: { snapshots: 2 }, free_bytes: 1_048_576 },
+    };
+    const planBody = {
+      ok: true,
+      snapshot_id: 'snap-1',
+      summary: { sessions: 1, new: 1, identical: 0, conflicts: 0, attachments: 0 },
+      candidates: [{ session_id: 'sess-a', workspace: 'proj-a', size: 10, conflict: 'new' }],
+    };
+    const hostFetch = async (url, init = {}) => {
+      const method = init.method ?? 'GET';
+      const body = init.body === undefined ? null : JSON.parse(init.body);
+      requests.push({ url, method, body });
+      const send = (payload) => ({ ok: true, status: 200, json: async () => payload });
+      if (url === '/api/w2m/backup/run') {
+        if (method === 'POST') {
+          return send({ ok: true, snapshot_id: 'snap-1', sessions: 1, files: 2, blocks_new: 1, blocks_reused: 0, duration_ms: 10 });
+        }
+        // v3.4.9 host: the read-only status rides on the run GET (`status` field).
+        return send({
+          ok: true,
+          enabled: true,
+          backup_dir: 'D:\\BackUP',
+          dsh_home: 'C:\\dsh',
+          schedule: { times: ['22:00:00'], time_zone: 'UTC', next_at: '2026-11-17T14:00:00.000Z' },
+          scheduler: {},
+          status: statusBody,
+          state: { running: false, last_run: null, last_result: null, last_error: null },
+        });
+      }
+      if (url === '/api/w2m/backup/status') return send(statusBody);
+      if (url === '/api/w2m/backup/restore') {
+        if (body?.apply === true) {
+          return send({ ok: true, restored: [{ session_id: 'sess-a' }], skipped: 0, bytes_written: 10, pre_restore_dir: 'pre' });
+        }
+        return send(planBody);
+      }
+      if (url === '/api/w2m/backup/archive') {
+        return send({ ok: true, file: 'archive/x.tar.zst', sessions: 1, bytes: 100, compressed_bytes: 50 });
+      }
+      if (url === '/api/w2m/backup/verify') {
+        return send({
+          ok: true,
+          counts: { snapshots: 1, files: 2, blocks: 3, old: 0, current: 1 },
+          problems: [],
+          snapshots: [],
+          future_append: { checked: 1, failed: 0 },
+          runtime_verified: { checked: 1, failed: 0 },
+        });
+      }
+      if (url === '/api/w2m/backup/unlock') {
+        if (method === 'POST') return send({ ok: true, via: 'machine', reason_code: null, detail: null });
+        return send({
+          ok: true,
+          initialized: true,
+          envelopes: ['machine', 'password'],
+          machine_available: true,
+          machine_reason: null,
+          password_required: true,
+        });
+      }
+      throw new Error(`unexpected fetch(${url}, ${method})`);
+    };
+    const mountReact = makeMountReact();
+    const registry = makeRegistry();
+    const bundle = loadBundle({
+      document,
+      requireImpl: (specifier) => {
+        if (specifier === 'react') return mountReact.React;
+        throw new Error(`unexpected require(${specifier})`);
+      },
+      globals: { fetch: hostFetch },
+    });
+    bundle.exports.apply({ slots: registry, effect: (callback) => callback(), get: () => undefined });
+    const page = registry.registered.find((entry) => entry.options.key === 'w2m-backup');
+    assert.ok(page !== undefined);
+    const handle = mountReact.mount(page.component, { t: (key) => key });
+    const settle = async () => {
+      await new Promise((resolve) => { setTimeout(resolve, 0); });
+      handle.rerender();
+    };
+    await settle();
+
+    const clickAction = (action) => {
+      const node = findBy(handle.tree, (element) => element.props?.['data-w2m-backup-action'] === action)[0];
+      assert.ok(node !== undefined, `the ${action} operation is rendered`);
+      node.props.onClick();
+    };
+    const bodies = (url) => requests
+      .filter((request) => request.url === url && request.body !== null)
+      .map((request) => request.body);
+
+    // ① 立即备份: scope=all, and the attempt is logged.
+    clickAction('run');
+    await settle();
+    assert.deepEqual(bodies('/api/w2m/backup/run'), [{ confirm: 'run', scope: 'all' }]);
+    assert.equal(findBy(handle.tree, (node) => node.props?.['data-w2m-backup-log-row'] === 'run').length, 1, 'the run is logged');
+
+    // ② 全量校验: read-only GET, and the counts are rendered.
+    clickAction('verify');
+    await settle();
+    assert.ok(requests.some((request) => request.url === '/api/w2m/backup/verify' && request.method === 'GET'));
+    assert.equal(findBy(handle.tree, (node) => node.props?.['data-w2m-backup-panel'] === 'verify').length, 1, 'the verify result is shown');
+
+    // ③ 归档打包: archived by default; switch to all and pack again.
+    clickAction('archive');
+    await settle();
+    assert.deepEqual(bodies('/api/w2m/backup/archive'), [{ confirm: 'archive', scope: 'archived' }]);
+    const scope = findBy(handle.tree, (node) => node.props?.['data-w2m-backup-archive-scope'] === 'true')[0];
+    scope.props.onChange({ target: { value: 'all' } });
+    handle.rerender();
+    clickAction('archive');
+    await settle();
+    assert.deepEqual(bodies('/api/w2m/backup/archive')[1], { confirm: 'archive', scope: 'all' });
+
+    // ④ 还原: the first click only plans (no apply) and raises the danger confirmation; only the second click writes.
+    clickAction('restore');
+    await settle();
+    const planned = bodies('/api/w2m/backup/restore');
+    assert.equal(planned.length, 1, 'the first click posts a plan request');
+    assert.equal(planned[0].apply, undefined, 'the first click must not write');
+    assert.equal(findBy(handle.tree, (node) => node.props?.['data-w2m-backup-confirm'] === 'restore').length, 1,
+      'the danger confirmation is visible between the two clicks');
+    clickAction('restore');
+    await settle();
+    const applied = bodies('/api/w2m/backup/restore')[1];
+    assert.equal(applied.apply, true, 'only the second click applies');
+    assert.deepEqual(applied.sessions, ['sess-a'], 'the applied plan carries the selected session');
+
+    // 解锁: only the confirmation token, no credential of any kind.
+    clickAction('unlock');
+    await settle();
+    assert.deepEqual(bodies('/api/w2m/backup/unlock'), [{ confirm: 'unlock' }]);
+    handle.unmount();
+  });
+
+  it('gates the slow runtime verdict behind an explicit checkbox (?runtime=1 only when checked)', async () => {
+    const document = makeFakeDocument();
+    const requests = [];
+    const statusBody = { ok: true, repository: { root: 'D:\\BackUP', initialized: true, counts: { snapshots: 1 }, free_bytes: 1_024 } };
+    const verifyBody = {
+      ok: true,
+      counts: { snapshots: 1, files: 1, blocks: 1, old: 0, current: 0 },
+      problems: [{ code: 'BACKUP_RUNTIME_UNAVAILABLE', file: 'sessions/x', detail: 'no installation' }],
+      snapshots: [],
+      future_append: { checked: 1, failed: 0, evidence: 'static-prefilter' },
+      runtime_verified: { checked: 1, failed: 0, evidence: 'installed-harness' },
+    };
+    const hostFetch = async (url, init = {}) => {
+      requests.push({ url, method: init.method ?? 'GET' });
+      const send = (payload) => ({ ok: true, status: 200, json: async () => payload });
+      if (url === '/api/w2m/backup/run') {
+        return send({ ok: true, enabled: true, backup_dir: 'D:\\BackUP', schedule: { times: ['22:00:00'], time_zone: 'UTC' }, status: statusBody, state: {} });
+      }
+      if (url === '/api/w2m/backup/status') return send(statusBody);
+      if (url === '/api/w2m/backup/unlock') {
+        return send({ ok: true, initialized: true, envelopes: ['machine'], machine_available: true, machine_reason: null, password_required: false });
+      }
+      if (url === '/api/w2m/backup/verify' || url === '/api/w2m/backup/verify?runtime=1') return send(verifyBody);
+      throw new Error(`unexpected fetch(${url})`);
+    };
+    const mountReact = makeMountReact();
+    const registry = makeRegistry();
+    const bundle = loadBundle({
+      document,
+      requireImpl: (specifier) => {
+        if (specifier === 'react') return mountReact.React;
+        throw new Error(`unexpected require(${specifier})`);
+      },
+      globals: { fetch: hostFetch },
+    });
+    bundle.exports.apply({ slots: registry, effect: (callback) => callback(), get: () => undefined });
+    const page = registry.registered.find((entry) => entry.options.key === 'w2m-backup');
+    assert.ok(page !== undefined, 'the backup page is registered');
+    const handle = mountReact.mount(page.component, { t: (key) => key });
+    const settle = async () => {
+      await new Promise((resolve) => { setTimeout(resolve, 0); });
+      handle.rerender();
+    };
+    await settle();
+
+    const verifyUrls = () => requests.filter((request) => request.url.startsWith('/api/w2m/backup/verify')).map((request) => request.url);
+    const clickAction = (action) => {
+      const node = findBy(handle.tree, (element) => element.props?.['data-w2m-backup-action'] === action)[0];
+      assert.ok(node !== undefined, `the ${action} operation is rendered`);
+      node.props.onClick();
+    };
+    const runtimeToggle = () => findBy(handle.tree, (node) => node.type === 'input' && node.props?.['data-w2m-backup-runtime'] === 'true')[0];
+
+    // The checkbox exists before any result, and the default is the cheap read-only path.
+    assert.ok(runtimeToggle() !== undefined, 'the toggle is rendered even before a verify result exists');
+    assert.equal(runtimeToggle().props.checked, false, 'the slow path is opt-in');
+    clickAction('verify');
+    await settle();
+    assert.deepEqual(verifyUrls(), ['/api/w2m/backup/verify'], 'unchecked: no runtime=1');
+    assert.equal(findBy(handle.tree, (node) => node.props?.['data-w2m-backup-panel'] === 'verify').length, 1, 'the verify result is shown');
+
+    const text = collectText(handle.tree).join('\n');
+    assert.ok(text.includes('panel.backup.verify.runtime'), 'the toggle label goes through the dictionary');
+    assert.ok(text.includes('panel.backup.verify.runtimeHint'), 'the hint (slow, needs an installation) is rendered');
+    assert.ok(text.includes('panel.backup.verify.runtimeCounts'), 'the runtime_verified counts are still rendered');
+
+    // The real translator proves the copy and the reason-code map: a runtime problem shows the operator sentence,
+    // not the raw code (BACKUP_RUNTIME_UNAVAILABLE / BACKUP_RUNTIME_REJECTED are already mapped).
+    const t = bundle.exports.makeTranslator(() => undefined);
+    const realTree = bundle.exports.BackupPanelView({
+      t,
+      repo: null,
+      status: null,
+      unlock: null,
+      plan: null,
+      selected: [],
+      busy: '',
+      log: [],
+      verify: verifyBody,
+      lastAction: null,
+      error: null,
+      archiveScope: 'archived',
+      restoreArmed: false,
+      runMissing: false,
+      verifyRuntime: true,
+    });
+    const realText = collectText(realTree).join('\n');
+    assert.ok(realText.includes('用安装的 Harness 终审（慢）'), 'the toggle label is the Chinese slow-path copy');
+    assert.ok(realText.includes('可能耗时数分钟'), 'the hint says it can take minutes');
+    assert.ok(realText.includes('本机没有可用的运行时校验环境'), 'a runtime problem code is rendered through the reason-code map');
+
+    // Check the box: the next verify asks the host for the installed-Harness verdict.
+    runtimeToggle().props.onChange({ target: { checked: true } });
+    handle.rerender();
+    assert.equal(runtimeToggle().props.checked, true);
+    clickAction('verify');
+    await settle();
+    assert.deepEqual(verifyUrls(), ['/api/w2m/backup/verify', '/api/w2m/backup/verify?runtime=1'],
+      'only the checked box turns the runtime evidence on');
+    handle.unmount();
+  });
+
+  it('renders the two backup-scope entries and disables them until the read-only scan resolves', () => {
+    const { bundle } = mountBackup();
+    const t = bundle.exports.makeTranslator(() => undefined);
+    // Before the scan resolves the card is present (loading), the two action markers exist, both are
+    // disabled, and there is nothing to tick: a slow/failed scan can never take the panel down.
+    const before = bundle.exports.BackupPanelView(viewProps());
+    for (const action of ['backup-selected', 'backup-active']) {
+      assert.ok(actionButton(before, action) !== undefined, `the ${action} scope entry is rendered`);
+      assert.equal(actionButton(before, action).props.disabled, true, `${action} waits for the scan`);
+    }
+    assert.equal(findBy(before, (node) => node.props?.['data-w2m-backup-panel'] === 'scope').length, 1,
+      'the scope card itself renders, in a neutral state');
+    assert.equal(findBy(before, (node) => node.props?.['data-w2m-backup-pick'] !== undefined).length, 0);
+    assert.ok(collectText(before).join('\n').includes('panel.backup.pick.loading'));
+
+    const scan = {
+      available: true,
+      total: 3,
+      sessions: [
+        { session_id: 'sess-a', workspace: 'proj-a', size: 10, archived: false, registered: true },
+        { session_id: 'sess-b', workspace: 'proj-b', size: 20, archived: true, registered: true },
+        { session_id: 'sess-c', workspace: 'proj-c', size: 30, archived: false, registered: false },
+      ],
+    };
+    // After a successful scan: 'selected' still needs a tick, 'active' needs none.
+    const after = bundle.exports.BackupPanelView(viewProps({ scan, picked: [] }));
+    const markers = findBy(after, (node) => node.props?.['data-w2m-backup-action'] !== undefined)
+      .map((node) => node.props['data-w2m-backup-action']);
+    assert.ok(['run', 'restore', 'archive', 'verify'].every((action) => markers.includes(action)),
+      'the existing four operations stay beside the two scope entries');
+    assert.equal(actionButton(after, 'backup-selected').props.disabled, true, 'selected needs at least one tick');
+    assert.equal(actionButton(after, 'backup-active').props.disabled, false, 'active needs no selection');
+    assert.deepEqual(
+      findBy(after, (node) => node.props?.['data-w2m-backup-pick'] !== undefined).map((node) => node.props['data-w2m-backup-pick']),
+      ['sess-a', 'sess-b', 'sess-c'],
+      'one pick checkbox per scanned session, in host order',
+    );
+    assert.equal(actionButton(bundle.exports.BackupPanelView(viewProps({ scan, picked: ['sess-a'] })), 'backup-selected').props.disabled, false,
+      'one tick is enough for the selected entry');
+
+    // The count line goes through the dictionary with both numbers, and the archived tag is shown.
+    const real = bundle.exports.BackupPanelView(viewProps({ t, scan, picked: ['sess-a', 'sess-b'] }));
+    assert.ok(collectText(real).join('\n').includes('已选 2/3'), 'the count line reads 已选 {n}/{m}');
+    assert.ok(collectText(real).join('\n').includes('已归档'), 'an archived session carries the archived tag');
+    const archivedBox = findBy(real, (node) => node.type === 'input' && node.props?.['data-w2m-backup-pick'] === 'sess-b')[0];
+    assert.equal(archivedBox.props.checked, true, 'the checked archived session is listed like any other');
+
+    // Long ids are shortened for display; the full id stays available as the title tooltip.
+    const longId = 'session-20261117-abcdef123456';
+    const longScan = { available: true, total: 1, sessions: [{ session_id: longId, workspace: 'proj', size: 1, archived: false, registered: true }] };
+    const longTree = bundle.exports.BackupPanelView(viewProps({ scan: longScan }));
+    const suffix = findBy(longTree, (node) => node.props?.title === longId)[0];
+    assert.ok(String(suffix?.children?.[0] ?? '').startsWith('…'), 'the list shows the id suffix, not the whole id');
+
+    // Busy state: all six operations disabled, and the label names the operation that is running.
+    const busyTree = bundle.exports.BackupPanelView(viewProps({ scan, picked: ['sess-a'], busy: 'backup-selected' }));
+    const operations = findBy(busyTree, (node) => node.type === 'button'
+      && ['run', 'restore', 'archive', 'verify', 'backup-selected', 'backup-active'].includes(node.props?.['data-w2m-backup-action']));
+    assert.equal(operations.length, 6);
+    for (const node of operations) assert.equal(node.props.disabled, true, 'an in-flight operation disables its five siblings');
+    assert.equal(String(actionButton(busyTree, 'backup-selected').children[0]), 'panel.backup.busy.backupSelected',
+      'the running entry says what it is doing, not what it would do');
+    assert.equal(String(actionButton(busyTree, 'backup-active').children[0]), 'panel.backup.action.backupActive',
+      'the idle entry keeps its action label');
+  });
+
+  it('normalizes the read-only scan defensively: any failure is an unavailable state, never a throw', () => {
+    const { exports } = loadBundle();
+    for (const result of [
+      undefined,
+      null,
+      { ok: false, http: false, routeMissing: true },
+      { ok: true, body: null },
+      { ok: true, body: { ok: true } },
+      { ok: true, body: { ok: true, sessions: 'not-a-list' } },
+    ]) {
+      const scan = exports.normalizeBackupScan(result);
+      assert.equal(scan.available, false, 'a missing/failed scan is reported as unavailable');
+      // Host-realm Array.from: the bundle's arrays come from the vm realm, and deepStrictEqual would
+      // reject them on the prototype alone even though the values match.
+      assert.deepEqual(Array.from(scan.sessions), []);
+      assert.equal(scan.total, 0);
+    }
+    assert.equal(exports.normalizeBackupScan({ ok: false, routeMissing: true }).routeMissing, true,
+      'a 404 stays distinguishable from a payload the host did not send');
+    const scan = exports.normalizeBackupScan({
+      ok: true,
+      body: {
+        ok: true,
+        sessions: [
+          { session_id: 'sess-a', workspace: 'proj-a', size: 10, flags: { registered: true, archived: false } },
+          null,
+          { session_id: 42 },
+          { session_id: '', workspace: 'x' },
+          { session_id: 'sess-b', size: 'not-a-number', flags: null },
+        ],
+        totals: { sessions: 9 },
+      },
+    });
+    assert.equal(scan.available, true);
+    assert.deepEqual(Array.from(scan.sessions, (row) => row.session_id), ['sess-a', 'sess-b'], 'malformed rows are dropped');
+    assert.equal(scan.sessions[0].archived, false);
+    assert.equal(scan.sessions[1].size, null);
+    assert.equal(scan.sessions[1].workspace, '');
+    assert.equal(scan.total, 9, 'the host total is kept when it is a finite number');
+    assert.equal(exports.BACKUP_SCAN_ROUTE, '/api/w2m/backup/scan', 'the panel reads the mounted read-only route');
+  });
+
+  it('drives the read-only scan and the two backup-scope entries through the run contract', async () => {
+    const { handle, requests, unexpected, settle } = mountBackupPage(standardBackupHost({ scanBody: scanSessionsBody() }));
+    await settle();
+    assert.deepEqual(unexpected, [],
+      'the first render reads only the status/run/unlock/scan routes the panel knows');
+    const pickBoxes = () => findBy(handle.tree, (node) => node.type === 'input' && node.props?.['data-w2m-backup-pick'] !== undefined);
+    const pickCount = () => findBy(handle.tree, (node) => node.props?.['data-w2m-backup-pick-count'] === 'true')[0];
+    const click = (node) => { node.props.onClick(); };
+    assert.deepEqual(pickBoxes().map((node) => node.props['data-w2m-backup-pick']),
+      ['sess-alpha-0001', 'sess-beta-0002', 'sess-gamma-0003'], 'the scan list reaches the card');
+    assert.equal(pickCount().children[0], '已选 0/3');
+
+    // Select-all / clear move the count line (both operate on the scanned list only).
+    click(findBy(handle.tree, (node) => node.props?.['data-w2m-backup-pick-all'] === 'true')[0]);
+    handle.rerender();
+    assert.equal(pickCount().children[0], '已选 3/3', 'select-all ticks the whole scanned list');
+    assert.deepEqual(pickBoxes().map((node) => node.props.checked), [true, true, true]);
+    click(findBy(handle.tree, (node) => node.props?.['data-w2m-backup-pick-clear'] === 'true')[0]);
+    handle.rerender();
+    assert.equal(pickCount().children[0], '已选 0/3', 'clear empties the selection');
+    assert.deepEqual(pickBoxes().map((node) => node.props.checked), [false, false, false]);
+
+    // Tick two specific sessions, then run scope=selected: exactly those ids, no other scope.
+    for (const id of ['sess-beta-0002', 'sess-gamma-0003']) {
+      pickBoxes().find((node) => node.props['data-w2m-backup-pick'] === id).props.onChange();
+    }
+    handle.rerender();
+    assert.equal(pickCount().children[0], '已选 2/3');
+    const posts = () => requests.filter((request) => request.url === '/api/w2m/backup/run' && request.method === 'POST').map((request) => request.body);
+    const scanReads = () => requests.filter((request) => request.url.startsWith('/api/w2m/backup/scan')).length;
+    const scansBefore = scanReads();
+    click(actionButton(handle.tree, 'backup-selected'));
+    await settle();
+    let bodies = posts();
+    assert.equal(bodies.length, 1, 'the selected entry posts exactly one run body');
+    // Order-insensitive: the run body carries the two ticked ids in some order (the panel keeps the
+    // operator's tick order), and nothing else in the body may differ from the host contract.
+    assert.deepEqual({ ...bodies[0], selected: Array.from(bodies[0].selected).sort() }, {
+      confirm: 'run',
+      scope: 'selected',
+      selected: ['sess-beta-0002', 'sess-gamma-0003'].sort(),
+    }, 'the run body carries the confirm token, scope selected, and exactly the ticked ids');
+    assert.equal(new Set(bodies.map((body) => body.scope)).size, 1, 'no other scope is sent by the selected entry');
+    assert.ok(scanReads() > scansBefore, 'the selected run refreshes the read-only session list afterwards');
+    assert.ok(requests.filter((request) => request.url === '/api/w2m/backup/run' && request.method === 'GET').length >= 2,
+      'the selected run refreshes the status afterwards');
+
+    // The active-scope entry needs no selection and sends scope=active only.
+    click(actionButton(handle.tree, 'backup-active'));
+    await settle();
+    bodies = posts();
+    assert.equal(bodies.length, 2);
+    assert.deepEqual(bodies[1], { confirm: 'run', scope: 'active' });
+
+    // The pre-existing run is untouched: still scope=all with exactly the old body.
+    click(actionButton(handle.tree, 'run'));
+    await settle();
+    bodies = posts();
+    assert.equal(bodies.length, 3);
+    assert.deepEqual(bodies[2], { confirm: 'run', scope: 'all' });
+    assert.deepEqual(unexpected, [], 'no operation invented a route');
+    handle.unmount();
+  });
+
+  it('renders the neutral unavailable state for a host without the scan route, without blocking the panel', async () => {
+    const host = standardBackupHost();
+    const { handle, settle, text } = mountBackupPage(({ url, method }) => (
+      url === '/api/w2m/backup/scan?detail=1' ? { status: 404 } : host({ url, method })
+    ));
+    await settle();
+    assert.equal(findBy(handle.tree, (node) => node.props?.['data-w2m-backup-scan-state'] === 'unavailable').length, 1,
+      'a missing scan route is a stated neutral state');
+    assert.ok(text().includes('该宿主未启用备份路由或扫描失败'), 'the hint names the cause and stays actionable');
+    assert.ok(text().includes('刷新会话'), 'the retry entry is visible in the same card');
+    // A missing read route must not take the write entries away: run/active stay usable, selected cannot.
+    assert.equal(actionButton(handle.tree, 'run').props.disabled, false);
+    assert.equal(actionButton(handle.tree, 'backup-active').props.disabled, false);
+    assert.equal(actionButton(handle.tree, 'backup-selected').props.disabled, true);
+    handle.unmount();
+  });
+
+  it('renders the empty hint when the scan reports no sessions', async () => {
+    const { handle, settle, text } = mountBackupPage(standardBackupHost());
+    await settle();
+    assert.equal(findBy(handle.tree, (node) => node.props?.['data-w2m-backup-scan-state'] === 'empty').length, 1);
+    assert.ok(text().includes('没有可备份的会话'));
+    assert.equal(findBy(handle.tree, (node) => node.props?.['data-w2m-backup-pick'] !== undefined).length, 0);
+    assert.equal(actionButton(handle.tree, 'backup-selected').props.disabled, true);
+    assert.equal(actionButton(handle.tree, 'backup-active').props.disabled, false);
+    handle.unmount();
+  });
+
+  it('shows the host reason text when a scope run is refused, instead of throwing', async () => {
+    const { handle, settle, text } = mountBackupPage(standardBackupHost({
+      scanBody: scanSessionsBody(),
+      runPost: () => ({ ok: false, reason_code: 'BACKUP_SCOPED_NOTHING', detail: 'no active sessions' }),
+    }));
+    await settle();
+    const box = findBy(handle.tree, (node) => node.type === 'input' && node.props?.['data-w2m-backup-pick'] === 'sess-alpha-0001')[0];
+    assert.ok(box !== undefined, 'the scanned session is tickable');
+    box.props.onChange();
+    handle.rerender();
+    actionButton(handle.tree, 'backup-selected').props.onClick();
+    await settle();
+    assert.equal(findBy(handle.tree, (node) => node.props?.['data-w2m-backup-panel'] === 'error').length, 1,
+      'a refusal is rendered as the named reason, not as an exception');
+    assert.ok(text().includes('选定范围内没有可备份的会话'), 'the stable reason code is translated for the operator');
+    assert.ok(text().includes('no active sessions'), 'the host detail stays visible');
+    handle.unmount();
+  });
+
+  it('registers panel.backup.* strings in both the Chinese and English dictionaries', () => {
+    const { exports } = loadBundle();
+    const registry = makeRegistry();
+    const locale = makeLocale();
+    const ctx = makeStrictContext({ inject: [...exports.inject], services: { slots: registry, locale } });
+    exports.apply(ctx);
+    const dictionary = locale.registered.get('w2m.target');
+    assert.ok(dictionary !== undefined, 'the dictionaries reach the locale service');
+    const keys = [
+      'panel.backup.title',
+      'panel.backup.action.run',
+      'panel.backup.action.restore',
+      'panel.backup.action.archive',
+      'panel.backup.action.verify',
+      'panel.backup.unlock.passwordPath',
+      'panel.backup.reason.BACKUP_NO_PERMISSION',
+      // v3.5.x compare-only account-id binding: the account row, its three states and the new reason code.
+      'panel.backup.unlock.accountBound',
+      'panel.backup.unlock.accountMatched',
+      'panel.backup.unlock.accountMismatch',
+      'panel.backup.unlock.accountUnavailable',
+      'panel.backup.action.unlockAccount',
+      'panel.backup.reason.BACKUP_ACCOUNT_MISMATCH',
+      // G5: the slow runtime verdict is an explicit toggle with its own hint.
+      'panel.backup.verify.runtime',
+      'panel.backup.verify.runtimeCounts',
+      'panel.backup.verify.runtimeHint',
+      // v3.5.x: the cached runtime verdict block, its stale badge and the explicit run-now button.
+      'panel.backup.verify.cachedTitle',
+      'panel.backup.verify.cachedLine',
+      'panel.backup.verify.cachedNone',
+      'panel.backup.verify.stale',
+      'panel.backup.verify.fresh',
+      'panel.backup.action.verifyRuntime',
+      'panel.backup.action.repairRegister',
+      'panel.backup.busy.verifyRuntime',
+      'panel.backup.busy.repairRegister',
+      'panel.backup.log.verifyRuntime',
+      'panel.backup.log.repairRegister',
+      'panel.backup.status.registerFix',
+      'panel.backup.register.none',
+      'panel.backup.register.done',
+      'panel.backup.register.residual',
+      'panel.backup.reason.BACKUP_REGISTER_NO_SESSION',
+      'panel.backup.reason.BACKUP_REGISTER_SESSION_MISSING',
+      'panel.backup.reason.BACKUP_REGISTER_BACKUP_FAILED',
+      // v3.5.0: the two backup-scope entries and the read-only scan card around them.
+      'panel.backup.action.backupSelected',
+      'panel.backup.action.backupActive',
+      'panel.backup.scope.hint',
+      'panel.backup.pick.title',
+      'panel.backup.pick.count',
+      'panel.backup.pick.selected',
+      'panel.backup.pick.clear',
+      'panel.backup.pick.refresh',
+      'panel.backup.pick.loading',
+      'panel.backup.pick.unavailable',
+      'panel.backup.pick.empty',
+      'panel.backup.pick.archivedTag',
+      'panel.backup.busy.backupSelected',
+      'panel.backup.busy.backupActive',
+      'panel.backup.log.backupSelected',
+      'panel.backup.log.backupActive',
+      // v3.5.x protection modes (user decision: convenience, not absolute confidentiality; none is the default).
+      'panel.backup.status.mode',
+      'panel.backup.mode.none',
+      'panel.backup.mode.sealed',
+      'panel.backup.mode.noneWarning',
+      'panel.backup.unlock.none',
+      'panel.backup.unlock.passwordHint',
+      'panel.backup.unlock.weakPinHint',
+      'panel.backup.unlock.disableProtectionHint',
+      'panel.backup.reason.BACKUP_CONFIG_INVALID',
+    ];
+    for (const key of keys) {
+      assert.equal(typeof dictionary.zh[key], 'string', `the zh dictionary has ${key}`);
+      assert.equal(typeof dictionary.en[key], 'string', `the en dictionary has ${key}`);
+    }
+    assert.equal(dictionary.zh['panel.backup.verify.runtime'], '用安装的 Harness 终审（慢）',
+      'the toggle label is the slow path, labelled as slow');
+    assert.notEqual(dictionary.zh['panel.backup.verify.runtimeHint'], dictionary.en['panel.backup.verify.runtimeHint'],
+      'the hint is translated, not copied');
+    assert.equal(dictionary.zh['panel.backup.reason.BACKUP_NO_PERMISSION'], '没有权限：请用原账户登录，或输入解锁密码');
+    assert.ok(dictionary.zh['panel.backup.unlock.accountMismatch'].includes('不是原账户'),
+      'the mismatch copy says the current account is not the original one');
+    assert.ok(dictionary.en['panel.backup.unlock.accountMatched'].includes('matches the original account'),
+      'the English match copy says the account matches');
+    assert.ok(dictionary.zh['panel.backup.reason.BACKUP_ACCOUNT_MISMATCH'].includes('密码'),
+      'the mismatch reason code points the operator at the password path');
+    assert.notEqual(dictionary.zh['panel.backup.title'], dictionary.en['panel.backup.title'], 'both languages are real translations');
+    assert.equal(dictionary.zh['panel.backup.pick.count'], '已选 {n}/{m}', 'the count copy keeps both placeholders');
+    assert.equal(dictionary.zh['panel.backup.action.backupSelected'], '备份选中会话');
+    assert.equal(dictionary.zh['panel.backup.action.backupActive'], '备份所有当前活动会话');
+    assert.notEqual(dictionary.zh['panel.backup.action.backupSelected'], dictionary.en['panel.backup.action.backupSelected'],
+      'the scope entry labels are translated, not copied');
+    assert.notEqual(dictionary.zh['panel.backup.scope.hint'], dictionary.en['panel.backup.scope.hint'],
+      'the scope hint explains selected vs active vs all in both languages');
+    assert.ok(dictionary.en['panel.backup.scope.hint'].includes('active'), 'the English hint names the active scope');
+    assert.ok(dictionary.zh['panel.backup.scope.hint'].includes('已归档'), 'the Chinese hint names the archived difference of scope all');
+    assert.equal(dictionary.zh['panel.backup.pick.archivedTag'], '已归档');
+    // The honest security copy: an unencrypted repository says so in words, and a 4-digit PIN is labelled
+    // as a convenience gate rather than confidentiality.
+    assert.equal(dictionary.zh['panel.backup.mode.noneWarning'], '未加密：任何能访问该目录的人都能还原备份');
+    assert.equal(dictionary.en['panel.backup.mode.noneWarning'], 'Not encrypted: anyone who can reach this directory can restore the backup');
+    assert.ok(dictionary.zh['panel.backup.mode.none'].includes('未加密'));
+    assert.ok(dictionary.en['panel.backup.mode.sealed'].includes('Encrypted'));
+    assert.ok(dictionary.zh['panel.backup.unlock.weakPinHint'].includes('不是保密强度'),
+      'the weak-PIN hint says a PIN is not confidentiality');
+    assert.ok(dictionary.zh['panel.backup.unlock.passwordHint'].includes('终端'),
+      'the password hint keeps the PIN in the terminal');
+    assert.ok(dictionary.zh['panel.backup.unlock.disableProtectionHint'].includes('--disable-protection'),
+      'the disable-protection copy names the CLI command');
+    assert.ok(dictionary.zh['panel.backup.unlock.none'].includes('不需要账户'),
+      'the unencrypted unlock copy says it needs no account or PIN');
+    const mapped = Object.keys(exports.BACKUP_REASON_KEYS);
+    assert.ok(mapped.length >= 20, 'the reason-code map covers the host codes');
+    for (const code of mapped) {
+      const key = exports.BACKUP_REASON_KEYS[code];
+      assert.equal(typeof dictionary.zh[key], 'string', `the zh dictionary maps ${code}`);
+      assert.equal(typeof dictionary.en[key], 'string', `the en dictionary maps ${code}`);
+    }
+  });
+
+  it('turns a reason code into the operator sentence and keeps unknown codes visible', () => {
+    const { exports } = loadBundle();
+    const t = exports.makeTranslator(() => undefined);
+    assert.equal(exports.backupReasonText('BACKUP_NO_PERMISSION', t), '没有权限：请用原账户登录，或输入解锁密码');
+    assert.equal(exports.backupReasonText('BACKUP_ACCOUNT_MISMATCH', t), '当前账户不是原账户：已改走解锁密码路径，请用密码解锁');
+    assert.equal(exports.backupReasonText('BACKUP_BUSY', t), '上一次备份还在运行，请稍候。');
+    assert.equal(exports.backupReasonText('BACKUP_SOMETHING_NEW', t), 'BACKUP_SOMETHING_NEW', 'an unknown code is never guessed');
+    assert.equal(exports.backupReasonText('', t), '');
+  });
+
+  it('renders the cached runtime verdict (fresh/none/stale) and the run-now button’s disabled state', () => {
+    const { bundle } = mountBackup();
+    const nowIso = new Date().toISOString();
+    const oldIso = new Date(Date.now() - 30 * 60 * 60 * 1000).toISOString();
+    const record = { started_at: oldIso, finished_at: nowIso, ok: true, checked: 3, failed: 0, snapshots: 2, reason_codes: [], evidence: 'installed-harness' };
+    const marker = (tree) => findBy(tree, (node) => node.props?.['data-w2m-backup-runtime-cached'] !== undefined)[0];
+
+    const none = bundle.exports.BackupPanelView(viewProps());
+    assert.equal(marker(none).props['data-w2m-backup-runtime-cached'], 'none');
+    assert.ok(collectText(none).join('\n').includes('panel.backup.verify.cachedNone'));
+    assert.equal(actionButton(none, 'verify-runtime').props.disabled, false, 'the run-now button is available before any cache exists');
+
+    const fresh = bundle.exports.BackupPanelView(viewProps({ status: { ok: true, state: { last_runtime_verify: record } } }));
+    assert.equal(marker(fresh).props['data-w2m-backup-runtime-cached'], 'fresh');
+    const realT = bundle.exports.makeTranslator(() => undefined);
+    const freshText = collectText(bundle.exports.BackupPanelView(viewProps({ t: realT, status: { ok: true, state: { last_runtime_verify: record } } }))).join('\n');
+    assert.ok(freshText.includes('缓存的运行时终审'), 'the cached block names what it is');
+    assert.ok(freshText.includes('installed-harness'), 'the evidence label is shown verbatim');
+    assert.ok(freshText.includes('24 小时内'));
+    assert.equal(findBy(fresh, (node) => node.props?.['data-w2m-backup-runtime-stale'] !== undefined).length, 0);
+
+    const busy = bundle.exports.BackupPanelView(viewProps({ status: { ok: true, state: { last_runtime_verify: record } }, busy: 'verify-runtime' }));
+    assert.equal(actionButton(busy, 'verify-runtime').props.disabled, true, 'the button is disabled while the verdict runs');
+    assert.ok(collectText(busy).join('\n').includes('panel.backup.busy.verifyRuntime'));
+
+    const stale = bundle.exports.BackupPanelView(viewProps({ status: { ok: true, state: { last_runtime_verify: { ...record, finished_at: oldIso } } } }));
+    assert.equal(marker(stale).props['data-w2m-backup-runtime-cached'], 'stale');
+    assert.equal(findBy(stale, (node) => node.props?.['data-w2m-backup-runtime-stale'] !== undefined).length, 1, 'a stale badge is rendered');
+    assert.ok(collectText(stale).join('\n').includes('panel.backup.verify.stale'));
+  });
+
+  it('renders the register-repair button/state and states the residual risk only for the file-write path', () => {
+    const { bundle } = mountBackup();
+    const scan = {
+      available: true,
+      total: 1,
+      routeMissing: false,
+      sessions: [{ session_id: 'sess-gamma-0003', workspace: 'proj-c', size: 1, archived: false, registered: false }],
+    };
+    const waiting = bundle.exports.BackupPanelView(viewProps());
+    assert.equal(actionButton(waiting, 'repair-register').props.disabled, true, 'disabled until the read-only scan resolves');
+    const ready = bundle.exports.BackupPanelView(viewProps({ scan }));
+    assert.equal(actionButton(ready, 'repair-register').props.disabled, false, 'an unregistered session gives the button a target');
+    assert.ok(collectText(ready).join('\n').includes('panel.backup.action.repairRegister'));
+
+    const fileFix = bundle.exports.BackupPanelView(viewProps({
+      scan,
+      registerFix: {
+        ok: true,
+        via: 'file-write',
+        registered: ['sess-gamma-0003'],
+        already_registered: [],
+        watch: { clobbered: 1, reapplied: 1 },
+        residual_risk: 'a client save after the watch window can still remove it; re-run or enable the plugin route',
+      },
+    }));
+    const fileText = collectText(fileFix).join('\n');
+    assert.ok(fileText.includes('panel.backup.status.registerFix'));
+    assert.ok(fileText.includes('panel.backup.register.done'));
+    assert.ok(fileText.includes('panel.backup.register.residual'), 'the file-write path states its residual risk');
+    assert.equal(findBy(fileFix, (node) => node.props?.['data-w2m-backup-register-residual'] !== undefined).length, 1);
+
+    const hostFix = bundle.exports.BackupPanelView(viewProps({
+      scan,
+      registerFix: { ok: true, via: 'host-service', host_service: true, registered: ['sess-gamma-0003'], already_registered: [], residual_risk: null },
+    }));
+    assert.equal(
+      findBy(hostFix, (node) => node.props?.['data-w2m-backup-register-residual'] !== undefined).length,
+      0,
+      'the host-service path has no file-level race to announce',
+    );
+  });
+
+  it('drives the run-now runtime verdict and the register repair through their host routes', async () => {
+    const statusBody = { ok: true, repository: { root: 'D:\\BackUP', initialized: true, counts: { snapshots: 1 }, free_bytes: 1_024 } };
+    const cachedRecord = {
+      started_at: '2026-11-17T07:00:00.000Z',
+      finished_at: new Date().toISOString(),
+      ok: true,
+      checked: 2,
+      failed: 0,
+      snapshots: 1,
+      reason_codes: [],
+      evidence: 'installed-harness',
+    };
+    let verifyCalls = 0;
+    let registerBody = null;
+    const host = mountBackupPage(({ url, method, body }) => {
+      if (url === '/api/w2m/backup/run') {
+        if (method === 'POST') return { ok: true, snapshot_id: 'snap', sessions: 1, files: 1, blocks_new: 0, blocks_reused: 0, duration_ms: 1 };
+        return {
+          ok: true,
+          enabled: true,
+          backup_dir: 'D:\\BackUP',
+          schedule: { times: ['22:00:00'], time_zone: 'UTC' },
+          status: statusBody,
+          state: { running: false, last_runtime_verify: cachedRecord },
+        };
+      }
+      if (url === '/api/w2m/backup/status') return statusBody;
+      if (url === '/api/w2m/backup/unlock') {
+        return { ok: true, initialized: true, envelopes: ['machine'], machine_available: true, machine_reason: null, password_required: false };
+      }
+      if (url === '/api/w2m/backup/scan?detail=1') {
+        return {
+          ok: true,
+          sessions: [{ session_id: 'sess-gamma-0003', workspace: 'proj-c', size: 1, flags: { registered: false, archived: false } }],
+          totals: { sessions: 1 },
+          registry: { ok: true },
+        };
+      }
+      if (url === '/api/w2m/backup/verify?runtime=1') {
+        verifyCalls += 1;
+        return {
+          ok: true,
+          counts: { snapshots: 1, files: 1, blocks: 1, old: 0, current: 0 },
+          problems: [],
+          future_append: { checked: 1, failed: 0, evidence: 'static-prefilter' },
+          runtime_verified: { checked: 2, failed: 0, evidence: 'installed-harness' },
+          runtime_verify: { ...cachedRecord, checked: 2 },
+        };
+      }
+      if (url === '/api/w2m/backup/register') {
+        registerBody = body;
+        return { ok: true, via: 'host-service', host_service: true, registered: ['sess-gamma-0003'], already_registered: [], changed: true, residual_risk: null };
+      }
+      return undefined;
+    });
+    try {
+      await host.settle();
+      const click = (action) => {
+        const node = findBy(host.handle.tree, (element) => element.props?.['data-w2m-backup-action'] === action)[0];
+        assert.ok(node !== undefined, `the ${action} action is rendered`);
+        node.props.onClick();
+      };
+      click('verify-runtime');
+      await host.settle();
+      assert.equal(verifyCalls, 1, 'the run-now button posts the synchronous ?runtime=1');
+      assert.ok(host.text().includes('缓存的运行时终审'), 'the cached block renders after the refresh');
+
+      click('repair-register');
+      await host.settle();
+      assert.deepEqual(registerBody, { confirm: 'register', session_ids: ['sess-gamma-0003'] });
+      assert.ok(host.text().includes('注册表修复'), 'the repair outcome is rendered');
+      assert.deepEqual(host.unexpected, [], 'every request went to a route the panel is expected to use');
+    } finally {
+      host.handle.unmount();
+    }
+  });
+
+  it('keeps the in-memory run log bounded to the last 50 entries', () => {
+    const { exports } = loadBundle();
+    const t = exports.makeTranslator(() => undefined);
+    let entries = [];
+    for (let index = 0; index < 60; index += 1) {
+      entries = exports.appendBackupLog(entries, exports.backupLogEntry('run', { ok: true }));
+    }
+    assert.equal(exports.BACKUP_MAX_LOG, 50);
+    assert.equal(entries.length, 50, 'the log never grows past its bound');
+    assert.equal(entries[entries.length - 1].code, 'OK');
+    const failure = exports.backupLogEntry('restore', { ok: false, reason_code: 'BACKUP_NO_PERMISSION', detail: 'x' });
+    assert.equal(failure.code, 'BACKUP_NO_PERMISSION');
+    assert.equal(failure.detail, 'x');
+    assert.equal(exports.backupReasonText(failure.code, t), '没有权限：请用原账户登录，或输入解锁密码');
+  });
+
+  it('mounts the page twice on one document without leaking a stylesheet or a poll timer', () => {
+    const document = makeFakeDocument();
+    const intervals = new Set();
+    const globals = {
+      setInterval: (callback) => {
+        const timer = { callback };
+        intervals.add(timer);
+        return timer;
+      },
+      clearInterval: (timer) => { intervals.delete(timer); },
+      fetch: async () => ({ ok: true, status: 200, json: async () => ({ ok: true }) }),
+    };
+    const mountOnce = () => {
+      const mountReact = makeMountReact();
+      const registry = makeRegistry();
+      const bundle = loadBundle({
+        document,
+        requireImpl: (specifier) => {
+          if (specifier === 'react') return mountReact.React;
+          throw new Error(`unexpected require(${specifier})`);
+        },
+        globals,
+      });
+      bundle.exports.apply({ slots: registry, effect: (callback) => callback(), get: () => undefined });
+      // Other subplugins own timers of their own (they are disposed through ctx.effect); this test is
+      // about the backup page's poll, so count the delta the page itself adds.
+      const baseline = intervals.size;
+      const page = registry.registered.find((entry) => entry.options.key === 'w2m-backup');
+      assert.ok(page !== undefined, 'the backup page is registered');
+      const handle = mountReact.mount(page.component, { t: (key) => key });
+      assert.equal(intervals.size, baseline + 1, 'the mounted page owns exactly one poll timer');
+      return {
+        unmount() {
+          handle.unmount();
+          assert.equal(intervals.size, baseline, 'unmounting clears the page poll timer');
+        },
+      };
+    };
+    const first = mountOnce();
+    assert.equal(document.appended.length, 1, 'the first mount installs exactly one stylesheet');
+    first.unmount();
+    assert.equal(document.removed.length, 0, 'unmounting does not remove the shared stylesheet');
+    const second = mountOnce();
+    assert.equal(document.appended.length, 1, 'a second mount in the same document reuses the one stylesheet');
+    second.unmount();
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// The 「编队版本」 card (v3.5.0)
+// ---------------------------------------------------------------------------------------------
+//
+// The dashboard half of the version gate: `GET /api/w2m/target` already carries the `versions`
+// block (`summarizeVersionDashboard` in `src/plugin/version-gate.mjs`), and `w2m_devices` returns
+// the same shape. What is asserted here is that the card renders that block in the operation
+// panel's actions section, that a missing/failed block is a stated "unknown" rather than an
+// exception or an empty-looking fleet, and that the copy affordance works in a page and degrades
+// to a no-op with no clipboard at all.
+
+describe('client bundle: the 编队版本 card (v3.5.0)', () => {
+  /** A `/api/w2m/target` snapshot with (or without) the versions block under test. */
+  function versionSnapshot(versions) {
+    return {
+      session_id: 'sess-drift',
+      selected: { machine_id: null, name: null, selected_at: null, online: null, stale: false },
+      machines: [],
+      fleet: { ok: true, error: null, online: 2, total: 3, excluded: 1, rabbit_time: null },
+      ...(versions === undefined ? {} : { versions }),
+      host: { local_machine_name: null, detail_unavailable: false },
+      relays: null,
+    };
+  }
+
+  /** The block a 3.5.0 host sends when one machine is behind and one cannot report its version. */
+  function driftVersions() {
+    return {
+      supported_min: '3.5.0',
+      distribution: { '3.5.0': 2, '3.4.5': 1 },
+      outdated: [{ machine_id: 'win-old', version: '3.4.5' }],
+      unknown: [{ machine_id: 'mac-unknown' }],
+      all_current: false,
+    };
+  }
+
+  /**
+   * Mount one exported component with the hook-capable React stand-in and a fake fetch.
+   *
+   * Every request is recorded so a test can assert *which* route the card read; `settle()` runs the
+   * effects (the read) and re-renders once the promise has landed.
+   */
+  function mountWith(options = {}) {
+    const mountReact = makeMountReact();
+    const requests = [];
+    const respond = options.fetch ?? (async () => ({ ok: true, status: 200, json: async () => versionSnapshot(driftVersions()) }));
+    const bundle = loadBundle({
+      document: options.document,
+      requireImpl: (specifier) => {
+        if (specifier === 'react') return mountReact.React;
+        throw new Error(`unexpected require(${specifier})`);
+      },
+      globals: {
+        fetch: async (url, init) => {
+          requests.push(String(url));
+          return respond(String(url), init);
+        },
+        AbortController,
+        ...(options.globals ?? {}),
+      },
+    });
+    const t = bundle.exports.makeTranslator(() => undefined);
+    const handle = mountReact.mount(bundle.exports[options.component ?? 'FleetVersionsCard'], {
+      t,
+      sessionId: options.sessionId ?? 'sess-drift',
+    });
+    const settle = async (rounds = 1) => {
+      for (let round = 0; round < rounds; round += 1) {
+        await new Promise((resolve) => { setTimeout(resolve, 0); });
+        handle.rerender();
+      }
+    };
+    return { bundle, handle, requests, t, settle };
+  }
+
+  it('renders inside the operation panel actions section, next to the fleet target control', async () => {
+    const capabilityResponse = async () => ({ ok: true, status: 200, json: async () => ({ ok: true, capability: null }) });
+    const targetResponse = async () => ({ ok: true, status: 200, json: async () => versionSnapshot(driftVersions()) });
+    const { handle, requests, settle } = mountWith({
+      component: 'OpsActionsSection',
+      fetch: async (url) => (url.startsWith('/api/w2m/capability') ? capabilityResponse() : targetResponse()),
+    });
+    await settle(3);
+
+    const cards = findBy(handle.tree, (node) => node.props?.['data-w2m-fleet-version-card'] === 'true');
+    assert.equal(cards.length, 1, 'the card is rendered in the actions section, not as a new panel');
+    assert.ok(requests.some((url) => url.startsWith('/api/w2m/target')), 'it reads the same target snapshot as the target control');
+
+    const text = collectText(handle.tree).join('\n');
+    assert.ok(text.includes('编队版本'), 'the card title is the Chinese default');
+    assert.ok(text.includes('最低支持版本: 3.5.0'), 'the supported minimum is rendered');
+    const rows = findBy(handle.tree, (node) => node.props?.['data-w2m-version-row'] !== undefined);
+    assert.deepEqual(rows.map((node) => node.props['data-w2m-version-row']), ['3.5.0', '3.4.5'],
+      'the stock distribution keeps the host order, newest first');
+    assert.ok(text.includes('3.5.0 × 2') && text.includes('3.4.5 × 1'), 'each distribution row is version × count');
+    const outdated = findBy(handle.tree, (node) => node.props?.['data-w2m-version-outdated'] === 'true');
+    assert.equal(outdated.length, 1, 'the outdated machine is listed');
+    assert.ok(collectText(outdated[0]).join('').includes('win-old @ 3.4.5'), 'the outdated row is machine_id @ version');
+    const unknown = findBy(handle.tree, (node) => node.props?.['data-w2m-version-unknown'] === 'true');
+    assert.equal(unknown.length, 1, 'the unknown-version machine is listed');
+    assert.ok(collectText(unknown[0]).join('').includes('mac-unknown'));
+    assert.equal(findBy(handle.tree, (node) => node.props?.['data-w2m-version-all-current'] === 'true').length, 0,
+      'a drifting fleet does not show the all-current badge');
+
+    // The refresh button re-reads the snapshot; the card is mounted, not polled, so this is the only
+    // way the operator can ask again without leaving the tab.
+    const readsBefore = requests.filter((url) => url.startsWith('/api/w2m/target')).length;
+    findBy(handle.tree, (node) => node.props?.['data-w2m-version-refresh'] === 'true')[0].props.onClick();
+    await settle();
+    assert.equal(requests.filter((url) => url.startsWith('/api/w2m/target')).length, readsBefore + 1,
+      'the refresh button re-fetches the target snapshot');
+  });
+
+  it('is mounted in the operation panel actions tab, with no new sidebar slot', () => {
+    const source = readFileSync(BUNDLE_PATH, 'utf8');
+    assert.ok(source.includes('function FleetVersionsCard('), 'the card exists');
+    assert.ok(source.includes('function OpsActionsSection('), 'the section that owns it');
+    const start = source.indexOf('function OpsActionsSection(');
+    const end = source.indexOf('function FleetVersionsCard(', start);
+    assert.ok(end > start, 'the card is declared after the section body');
+    const section = source.slice(start, end);
+    assert.ok(section.includes('h(FleetVersionsCard,'), 'the actions section renders the card');
+    assert.ok(section.includes('h(TargetSelect,'), 'next to the fleet target control reading the same snapshot');
+    assert.ok(source.includes("['actions', '操作入口']"), 'the operation-panel tab that shows the section');
+    assert.ok(source.includes('h(OpsActionsSection, { t, sessionId })'), 'the panel body switches to that section');
+    assert.equal(source.includes("id: 'w2m-fleet-versions'"), false, 'no extra sidebar entry was added for it');
+  });
+
+  it('an all-current fleet hides the outdated block and shows the badge', async () => {
+    const { handle, settle } = mountWith({
+      fetch: async () => ({
+        ok: true,
+        status: 200,
+        json: async () => versionSnapshot({
+          supported_min: '3.5.0',
+          distribution: { '3.5.0': 3 },
+          outdated: [],
+          unknown: [],
+          all_current: true,
+        }),
+      }),
+    });
+    await settle();
+    assert.equal(findBy(handle.tree, (node) => node.props?.['data-w2m-version-all-current'] === 'true').length, 1,
+      'the all-current badge is shown');
+    assert.equal(findBy(handle.tree, (node) => node.props?.['data-w2m-version-outdated'] === 'true').length, 0);
+    const text = collectText(handle.tree).join('\n');
+    assert.ok(!text.includes('落后机器'), 'the whole outdated block is hidden, not just its rows');
+    assert.ok(text.includes('3.5.0 × 3'), 'the distribution is still rendered');
+  });
+
+  it('renders the neutral unavailable state for an older host or a failed read, without throwing', async () => {
+    // ① a 2xx snapshot from a host that predates the versions block
+    const older = mountWith({
+      fetch: async () => ({ ok: true, status: 200, json: async () => versionSnapshot(undefined) }),
+    });
+    await older.settle();
+    const olderCard = findBy(older.handle.tree, (node) => node.props?.['data-w2m-fleet-version-card'] === 'true');
+    assert.equal(olderCard.length, 1, 'the card still renders');
+    assert.equal(olderCard[0].props['data-w2m-version-state'], 'unavailable');
+    assert.ok(collectText(older.handle.tree).join('\n').includes('版本信息未知'));
+    assert.equal(findBy(older.handle.tree, (node) => node.props?.['data-w2m-version-copy'] === 'true').length, 0,
+      'nothing honest to copy is offered without a block');
+
+    // ② the route is absent on the host (404), which is how an older host answers
+    const missing = mountWith({
+      fetch: async () => ({ ok: false, status: 404, json: async () => ({ ok: false, error: 'not found' }) }),
+    });
+    await missing.settle();
+    assert.equal(findBy(missing.handle.tree, (node) => node.props?.['data-w2m-fleet-version-card'] === 'true')[0]
+      .props['data-w2m-version-state'], 'unavailable');
+
+    // ③ the fetch itself fails (host/relay down): a value, not an exception
+    const failed = mountWith({
+      fetch: async () => { throw new Error('host down'); },
+    });
+    await failed.settle();
+    assert.equal(findBy(failed.handle.tree, (node) => node.props?.['data-w2m-fleet-version-card'] === 'true')[0]
+      .props['data-w2m-version-state'], 'unavailable');
+
+    // ④ the host answered, but its own roster read failed: the empty block it still sends must not
+    //    be presented as a drift-free fleet.
+    const unreadable = mountWith({
+      fetch: async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ...versionSnapshot({ supported_min: '3.5.0', distribution: {}, outdated: [], unknown: [], all_current: false }),
+          fleet: { ok: false, error: 'the fleet could not be read', online: 0, total: 0, excluded: 0, rabbit_time: null },
+        }),
+      }),
+    });
+    await unreadable.settle();
+    assert.equal(findBy(unreadable.handle.tree, (node) => node.props?.['data-w2m-fleet-version-card'] === 'true')[0]
+      .props['data-w2m-version-state'], 'unavailable', 'an unreadable roster is "unknown", never "no outdated machines"');
+  });
+
+  it('copies the upgrade guidance through the clipboard and shows the copied state', async () => {
+    const writes = [];
+    const { handle, settle } = mountWith({
+      globals: {
+        navigator: { clipboard: { writeText: async (text) => { writes.push(text); } } },
+      },
+    });
+    await settle();
+    const copyButton = findBy(handle.tree, (node) => node.props?.['data-w2m-version-copy'] === 'true')[0];
+    assert.ok(copyButton !== undefined, 'the copy button is rendered');
+    assert.equal(collectText(copyButton).join(''), '一键复制升级指引');
+    copyButton.props.onClick();
+    await settle();
+    assert.equal(writes.length, 1, 'the clipboard received the guidance exactly once');
+    const guidance = writes[0];
+    assert.ok(guidance.includes('升级到 @twinsearth/w2m-dsh-plugin@3.5.0'), 'the guidance names the target version');
+    assert.ok(guidance.includes('npm i -g @twinsearth/w2m-dsh-plugin@3.5.0'), 'the npm command is in the guidance');
+    assert.ok(guidance.includes('- win-old @ 3.4.5'), 'the outdated machine is named with its version');
+    assert.ok(guidance.includes('- mac-unknown'), 'the unknown machine is named');
+    const copiedButton = findBy(handle.tree, (node) => node.props?.['data-w2m-version-copy'] === 'true')[0];
+    assert.equal(copiedButton.props['data-copied'], 'true', 'the copied state is visible');
+    assert.equal(collectText(copiedButton).join(''), '已复制');
+  });
+
+  it('falls back to document.execCommand and is a safe no-op with no clipboard at all', async () => {
+    // ① legacy path: navigator.clipboard is absent but the document can still copy
+    let copyCalls = 0;
+    let appended = 0;
+    const legacyDocument = {
+      body: { appendChild: () => { appended += 1; }, removeChild: () => {} },
+      createElement: () => ({ style: {}, select: () => {}, value: '' }),
+      execCommand: (command) => { copyCalls += 1; return command === 'copy'; },
+      querySelector: () => null,
+      querySelectorAll: () => [],
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    };
+    const legacy = mountWith({ document: legacyDocument });
+    await legacy.settle();
+    findBy(legacy.handle.tree, (node) => node.props?.['data-w2m-version-copy'] === 'true')[0].props.onClick();
+    await legacy.settle();
+    assert.equal(copyCalls, 1, 'the legacy path ran exactly once');
+    assert.equal(appended, 1, 'the textarea was attached for execCommand');
+    assert.equal(findBy(legacy.handle.tree, (node) => node.props?.['data-w2m-version-copy'] === 'true')[0]
+      .props['data-copied'], 'true');
+
+    // ② headless: no navigator, no document body, no execCommand — no throw and no false claim
+    const headlessDocument = {
+      createElement: () => ({ style: {} }),
+      querySelector: () => null,
+      querySelectorAll: () => [],
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    };
+    const headless = mountWith({ document: headlessDocument });
+    await headless.settle();
+    const headlessCopy = findBy(headless.handle.tree, (node) => node.props?.['data-w2m-version-copy'] === 'true')[0];
+    assert.doesNotThrow(() => headlessCopy.props.onClick());
+    await headless.settle();
+    const after = findBy(headless.handle.tree, (node) => node.props?.['data-w2m-version-copy'] === 'true')[0];
+    assert.equal(after.props['data-copied'], 'false', 'a headless page never claims a copy it did not make');
+    assert.equal(collectText(after).join(''), '一键复制升级指引');
+  });
+
+  it('registers the panel.fleet.version.* strings in both dictionaries', () => {
+    const { exports } = loadBundle();
+    const registry = makeRegistry();
+    const locale = makeLocale();
+    const ctx = makeStrictContext({ inject: [...exports.inject], services: { slots: registry, locale } });
+    exports.apply(ctx);
+    const dictionary = locale.registered.get('w2m.target');
+    assert.ok(dictionary !== undefined, 'the dictionaries reach the locale service');
+    const suffixes = [
+      'title', 'supportedMin', 'distribution', 'outdated', 'unknown', 'allCurrent',
+      'refresh', 'copyGuidance', 'copied', 'unavailable', 'noOutdated', 'guidanceTitle',
+    ];
+    for (const suffix of suffixes) {
+      const key = `panel.fleet.version.${suffix}`;
+      assert.equal(typeof dictionary.zh[key], 'string', `the zh dictionary has ${key}`);
+      assert.equal(typeof dictionary.en[key], 'string', `the en dictionary has ${key}`);
+      assert.notEqual(dictionary.zh[key].trim(), '', `the zh value for ${key} is not empty`);
+      assert.notEqual(dictionary.en[key].trim(), '', `the en value for ${key} is not empty`);
+    }
+    assert.equal(dictionary.zh['panel.fleet.version.title'], '编队版本', 'Chinese is the default');
+    assert.equal(dictionary.en['panel.fleet.version.title'], 'Fleet versions');
+    assert.notEqual(dictionary.zh['panel.fleet.version.unavailable'], dictionary.en['panel.fleet.version.unavailable'],
+      'the unavailable copy is translated, not copied');
+  });
+
+  it('normalizes a partial block defensively and refuses to build guidance from an unusable one', () => {
+    const { exports } = loadBundle();
+    const block = exports.fleetVersionBlock({
+      versions: {
+        supported_min: '3.5.0',
+        distribution: { '3.5.0': 2, '': 1, '3.4.5': 'x' },
+        outdated: [{ machine_id: 'win-old', version: '3.4.5' }, { machine_id: '', version: '3.4.0' }],
+        unknown: [{ machine_id: 'mac-unknown' }, null],
+        all_current: false,
+      },
+    });
+    assert.deepEqual(JSON.parse(JSON.stringify(block)), {
+      supported_min: '3.5.0',
+      distribution: [{ version: '3.5.0', count: 2 }],
+      outdated: [{ machine_id: 'win-old', version: '3.4.5' }],
+      unknown: [{ machine_id: 'mac-unknown' }],
+      all_current: false,
+    }, 'unnamed machines and non-numeric counts are dropped, not guessed at');
+    assert.equal(exports.fleetVersionBlock(null), null);
+    assert.equal(exports.fleetVersionBlock(undefined), null);
+    assert.equal(exports.fleetVersionBlock({}), null, 'a host without the block is unavailable');
+    assert.equal(exports.fleetVersionBlock({ versions: null }), null);
+    assert.equal(exports.fleetVersionBlock({ versions: { distribution: {} } }), null,
+      'no supported_min means no comparison, so the block is unusable');
+    assert.equal(exports.buildVersionGuidance(null, exports.makeTranslator(() => undefined)), '');
+    assert.equal(exports.buildVersionGuidance({ supported_min: '' }, exports.makeTranslator(() => undefined)), '');
+  });
+});
+

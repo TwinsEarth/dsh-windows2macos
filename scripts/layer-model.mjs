@@ -48,6 +48,16 @@ export const LAYERS = Object.freeze([
   { name: 'queue-journal', rank: 1, kind: 'capability', note: 'ported Fang queue journal (store + composer routes)' },
   // v3.2.0: w2m interop contract layer (own method table over the vendored published SDK copy).
   { name: 'interop', rank: 1, kind: 'capability', note: 'w2m.* contract server/client over the versioned contract SDK' },
+  // v3.4.5: the self-repair subplugin. The host listener imports only Node builtins; the offline CLI imports the
+  // backup layer's renumber tool (v3.4.8 G4 补全), which is why this is no longer an edge-free leaf. The edge is
+  // same-rank (1 -> 1) and one-way at module level: `fix/cli -> backup/renumber -> fix/zstd`, and `backup/renumber`
+  // never imports `fix/cli`. Declared because the directory exists and because its row in cordis.patch.yml makes
+  // it a mountable component, not a helper library.
+  { name: 'fix', rank: 1, kind: 'capability', note: 'attachment self-repair (agent/request-error listener + offline CLI, which also exposes the G4 seq renumber command)' },
+  // v3.4.6: the backup substrate (layout, scan, manifest, crypto) and its read-only CLI/routes. It reaches DOWN
+  // to `fix` for the zstd frame reader and to `util` for the workspace registry parser -- deliberately reusing
+  // both rather than growing a second parser, which is the mistake the 2026-11-17 recovery drill made.
+  { name: 'backup', rank: 1, kind: 'capability', note: 'session-backup substrate: repository layout, scan, manifest protocol, crypto, read-only routes/CLI' },
   // v1.9.1: internal telemetry adapter. A leaf capability: it imports only Node builtins and itself, and it is
   // dormant unless the host supplies the relay/token environment contract. Declared because the directory exists;
   // leaving it unnamed is the silent cross-layer edge the checker exists to refuse.
@@ -87,6 +97,20 @@ export const ALLOWED_EDGES = Object.freeze([
   ['relay', 'shared'],
   // v3.2.7: GPW 智能分级复用决策中心的 OS 钥匙串/DPAPI 密钥存储来保存大模型 Token（向下：plugin 4 -> decision-center 1）。
   ['plugin', 'decision-center'],
+  // v3.4.6: the plugin mounts the read-only backup routes, and the backup substrate reuses the frame reader
+  // and the registry parser instead of duplicating them. Both edges are downward (4 -> 1 and 1 -> 0).
+  ['plugin', 'backup'],
+  // v3.5.x: the backup subplugin reads the host's account identifier through the ONE account-identity module
+  // (`chatops/account.mjs`), so the compare-only account unlock reuses the `getProfile(client)` path fixed in
+  // v3.4.7 instead of growing a second identity reader. Downward (plugin 4 -> chatops 1).
+  ['plugin', 'chatops'],
+  ['backup', 'fix'],
+  ['backup', 'util'],
+  // v3.4.8 G4 补全: the offline repair CLI exposes the seq renumber tool (`w2m-fix renumber`), which lives in
+  // `backup/` because it is gated by the backup validator (doctor + future append + installed Harness). The edge
+  // is same-rank (1 -> 1); it does not point upward, and there is no module-level cycle: backup/renumber imports
+  // fix/zstd, never fix/cli.
+  ['fix', 'backup'],
 ]);
 
 /** Layer names, for a caller that wants just the vocabulary. */

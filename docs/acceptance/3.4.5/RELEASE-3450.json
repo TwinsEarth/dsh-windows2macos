@@ -1,0 +1,46 @@
+{
+  "version": "3.4.5",
+  "case": "RELEASE-3450",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-16T05:52:52.139Z",
+  "executor": "lead",
+  "task_id": "pre-release-3450",
+  "requirement": "v3.4.5: the dsh-fix subplugin repairs a session whose history references a deleted image attachment object by appending image/offload for unreadable surface images, flushing, and asking for one retry; the offline CLI scan/fix/backups/restore reads the v4 container, hides compaction-shadowed messages, backs up before writing, and verifies after writing",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/dsh-fix.test.mjs"
+    ],
+    [
+      "node",
+      "scripts/layer-check.mjs"
+    ],
+    [
+      "node",
+      "scripts/pack.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "plugin": "TRANSPORT fail with one unreadable surface image -> one image/offload append, flush, { kind: retry }; no image or a non-transport code -> next()",
+      "convergence": "at most maxRepairsPerTurn repairs per session per turn; aborted signal delegates",
+      "projection": "the plugin registers no message projection, so the core image-offload row mounts; a session that refuses the event delegates",
+      "cli": "v4 artifact read, compaction shadow set respected, append verified and idempotent, backup/restore and torn-frame/format refusals covered",
+      "wiring": "lib/dsh-fix.js export, cordis.patch.yml row dsh-fix, and package files/bin/exports asserted by the suite",
+      "tests": "test/dsh-fix.test.mjs 23 pass; eslint 0 errors; layer-check clean",
+      "artifact": "clean-tree pack: 1,950,563 bytes, sha256 f6ebab1a... (two independent packs byte-identical)"
+    }
+  },
+  "artifacts": [
+    {
+      "sha256": "f6ebab1af2b2f10c2003b4eeb049d3bb0e39eaa49f7dff647cf44973fff40eac",
+      "bytes": 1950563
+    }
+  ]
+}

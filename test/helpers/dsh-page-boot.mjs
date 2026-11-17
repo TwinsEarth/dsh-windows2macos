@@ -484,13 +484,74 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
       const opsOpened = await read(`const b=document.querySelector('.w2mGpw_sideEntry'); if(b===null)return{found:false}; b.click(); return{found:true};`);
       await new Promise((resolve) => setTimeout(resolve, 800));
       const opsPanel = await read(`const p=document.querySelector('.w2mOpsPanel'); return {open:p!==null, tabs:[...document.querySelectorAll('.w2mOpsTab')].map((x)=>x.textContent), active:(document.querySelector('.w2mOpsTab[data-active=true]')?.textContent??null)};`);
+      // v3.5.0: the fleet version-drift card lives in the operation panel's action section; the profile may have
+      // no relay configured, in which case the card must render its neutral "unavailable" state instead of blank.
+      const opsFleetVersion = await read(`
+        const card=document.querySelector('[data-w2m-fleet-version-card]');
+        const title=card?.querySelector('.w2mVerTitle');
+        return {
+          present: card!==null,
+          state: card?.getAttribute('data-w2m-version-state') ?? null,
+          title: (title?.textContent ?? '').trim(),
+          copyButton: card===null ? false : (card.querySelector('[data-w2m-version-copy]')!==null),
+          allCurrentBadge: card===null ? false : (card.querySelector('[data-w2m-version-all-current]')!==null),
+          text: (card?.innerText ?? '').slice(0, 200),
+        };
+      `);
       const opsQueueTab = await read(`const tabs=[...document.querySelectorAll('.w2mOpsTab')]; const q=tabs.find((x)=>x.textContent.includes('消息与草稿')); if(q===undefined)return{clicked:false}; q.click(); return{clicked:true};`);
       await new Promise((resolve) => setTimeout(resolve, 500));
       const opsQueueSection = await read(`return {section:document.querySelector('.w2mOpsSection')!==null, openButton:[...document.querySelectorAll('.w2mOpsBtn')].some((b)=>b.textContent.includes('打开队列日志'))};`);
       const opsClosed = await read(`const b=document.querySelector('.w2mGpw_fullPage .w2mGpw_close'); if(b===null)return{closed:false}; b.click(); return{clicked:true};`);
       await new Promise((resolve) => setTimeout(resolve, 400));
       const opsGone = await read(`return {closed:document.querySelector('.w2mGpw_fullPage')===null};`);
-      report.opsProbe = { opsOpened, opsPanel, opsQueueTab, opsQueueSection, opsClosed, opsGone };
+      report.opsProbe = { opsOpened, opsPanel, opsFleetVersion, opsQueueTab, opsQueueSection, opsClosed, opsGone };
+      // v3.4.9: the backup entry and the page it switches to. The profile ships the dsh-backup row disabled by
+      // default, so the panel is expected to render its "route missing / needs enabling" state: the probe checks
+      // the seat, the page, and the four action markers, not the host routes (those have their own tests).
+      const backupOpened = await read(`const b=document.querySelector('[data-w2m-backup-sidebar]'); if(b===null)return{found:false}; b.click(); return{found:true};`);
+      await new Promise((resolve) => setTimeout(resolve, 900));
+      const backupPanel = await read(`
+        const p=document.querySelector('[data-w2m-backup-panel]');
+        return {
+          open: p!==null,
+          title: (document.querySelector('.w2mBackup_title')?.textContent ?? null),
+          actions: [...document.querySelectorAll('[data-w2m-backup-action]')].map((x) => x.getAttribute('data-w2m-backup-action')),
+          cards: p===null?0:p.querySelectorAll('.w2mBackup_card').length,
+          hasUnlock: (p?.querySelector('[data-w2m-backup-unlock]') ?? null)!==null,
+          text: (p?.innerText ?? '').slice(0, 240),
+        };
+      `);
+      report.backupProbe = { backupOpened, backupPanel };
+      // v3.4.9: the four one-click handlers must be wired even when the row is disabled: each click attempts its
+      // route, gets the route-missing refusal, and records it in the log area without taking the page down.
+      const backupClicks = [];
+      for (const action of ['run', 'restore', 'archive', 'verify']) {
+        const clicked = await read(`const b=document.querySelector('[data-w2m-backup-action="${action}"]'); if(b===null)return{action:'${action}',clicked:false}; b.click(); return{action:'${action}',clicked:true};`);
+        await new Promise((resolve) => setTimeout(resolve, 700));
+        backupClicks.push(clicked);
+      }
+      // v3.5.0/P1: the two scope entries must exist too. `backup-active` works without the session list (the
+      // scan route is missing on a disabled row, so its click reaches the run route and logs the refusal);
+      // `backup-selected` must be visibly disabled because there is nothing to pick without a scan.
+      const scopeActions = await read(`
+        const read = (id) => {
+          const b = document.querySelector('[data-w2m-backup-action="' + id + '"]');
+          return b === null ? null : { disabled: b.disabled === true || b.getAttribute('aria-disabled') === 'true', label: b.textContent };
+        };
+        return { selected: read('backup-selected'), active: read('backup-active'), pickers: document.querySelectorAll('[data-w2m-backup-pick]').length, scanState: document.querySelector('[data-w2m-backup-scan-state]')?.getAttribute('data-w2m-backup-scan-state') ?? null };
+      `);
+      const activeClick = await read(`const b=document.querySelector('[data-w2m-backup-action="backup-active"]'); if(b===null)return{action:'backup-active',clicked:false}; b.click(); return{action:'backup-active',clicked:true};`);
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      backupClicks.push(activeClick);
+      const backupLog = await read(`
+        const rows=[...document.querySelectorAll('.w2mBackup_logRow')];
+        return {
+          rows: rows.length,
+          text: rows.map((row) => row.innerText).join(' | ').slice(0, 400),
+          panelStillOpen: document.querySelector('[data-w2m-backup-panel]')!==null,
+        };
+      `);
+      report.backupProbe = { backupOpened, backupPanel, backupClicks, backupLog, scopeActions };
       await evaluate(`
         (async () => {
           const r = await fetch('/api/w2m/decisions?includeArchived=1');

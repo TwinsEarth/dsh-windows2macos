@@ -73,8 +73,8 @@ describe('layer model: undeclared edges are refused, and the reason is specific'
   });
 
   it('refuses an edge that is simply not declared', () => {
-    // `plugin -> chatops` does not exist today. If somebody adds it, this is what must happen.
-    const r = checkEdges([{ from: 'plugin', to: 'chatops', count: 1, example: 'plugin/tools.mjs' }]);
+    // `plugin -> shared` is not declared (and is downward, so it is "undeclared", not "upward").
+    const r = checkEdges([{ from: 'plugin', to: 'shared', count: 1, example: 'plugin/tools.mjs' }]);
     assert.equal(r.ok, false);
     assert.equal(r.violations.length, 1);
     assert.equal(r.violations[0].from, 'plugin');
@@ -104,7 +104,7 @@ describe('layer model: undeclared edges are refused, and the reason is specific'
   it('reports every bad edge rather than stopping at the first', () => {
     // A checker that reports one problem per run makes cleanup a sequence of runs.
     const r = checkEdges([
-      { from: 'plugin', to: 'chatops', count: 1, example: 'a' },
+      { from: 'plugin', to: 'shared', count: 1, example: 'a' },
       { from: 'chatops', to: 'plugin', count: 1, example: 'b' },
       { from: 'agent', to: 'nowhere', count: 1, example: 'c' },
     ]);

@@ -14,10 +14,12 @@
  * *"read existing login identity without creating a device or returning credentials"*. It
  * returns `{ deviceId?, userId?, osVersion }`, and `userId` is the account's unique identifier.
  *
- * So there is **no account API call here**, and there is deliberately **no way to set the account
- * code from configuration**. That second point is not a limitation to work around: a value an
- * operator can type is a value an attacker can type, so a hand-entered "account code" would be a
- * forgeable account code. The only accepted source is the one the host authenticates.
+ * The one account-service call this file makes is `getProfile(client)` and it exists **only** to
+ * repopulate the Host's in-memory profile cache after an account switch -- it returns profile
+ * fields (`id/name/contact/avatarUrl`), never a credential, and it sets no account code. So an
+ * account code still cannot be typed in from configuration: a value an operator can type is a
+ * value an attacker can type, so a hand-entered "account code" would be a forgeable account code.
+ * The only accepted source is the one the host authenticates.
  *
  * ## Three things this file refuses to pretend
  *
@@ -40,6 +42,7 @@ import { createHash } from 'node:crypto';
 // v0.8.1: the account-derived fleet key, so a machine joins its account's fleet with no human step.
 import { deriveAccountFleetKey, encodeFleetKey } from './fleet-join.mjs';
 import { execFile } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { promisify } from 'node:util';
 
@@ -260,6 +263,63 @@ export async function readHardwareValues(options = {}) {
   return { platform, values };
 }
 
+/** This plugin's own version, read once from the package this file ships in. */
+let cachedOwnVersion;
+function ownPackageVersion() {
+  if (cachedOwnVersion !== undefined) return cachedOwnVersion;
+  try {
+    const manifest = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8'));
+    cachedOwnVersion = typeof manifest?.version === 'string' && manifest.version.trim() !== '' ? manifest.version.trim() : '';
+  } catch {
+    // A missing/broken manifest must not break account identification: the caller falls back further.
+    cachedOwnVersion = '';
+  }
+  return cachedOwnVersion;
+}
+
+/**
+ * The `client` argument DSH's account service requires on `getProfile`.
+ *
+ * ## What the argument is, and what it is not
+ *
+ * DSH 0.2.2-rc.3's signature is `getProfile(client: AccountClientMetadata)` (verified on the
+ * installed host: `dsh-deepseek-account/src/index.ts:228`), where
+ * `AccountClientMetadata = {version, locale, timezoneOffsetSeconds}` (`src/types.ts:7-13`).
+ * The Host turns those three fields into the Platform request headers `x-client-version`,
+ * `x-client-locale` and `x-client-timezone-offset` (`src/client-metadata.ts:37-45`); they describe
+ * **the caller**, never a credential, and the service dereferences them before any network call,
+ * so a zero-argument call throws instead of fetching the profile.
+ *
+ * A UI caller inlines its own build version (the account UI reads `DSH_CLIENT_VERSION`). This
+ * plugin is a **Host-side caller**, so it reports the real process locale and UTC offset, and the
+ * version of the package that is asking. No value is secret, and none of it reaches the fleet
+ * key or the serial number.
+ *
+ * @param {object} [options]
+ * @param {string} [options.clientVersion] Version to report, highest precedence. Tests inject it.
+ * @param {string} [options.locale] UI language to report; defaults to the process locale.
+ * @returns {{version: string, locale: string, timezoneOffsetSeconds: number}}
+ */
+export function accountClientMetadata(options = {}) {
+  const explicitVersion = typeof options.clientVersion === 'string' ? options.clientVersion.trim() : '';
+  const environmentVersion = typeof process.env.DSH_CLIENT_VERSION === 'string' ? process.env.DSH_CLIENT_VERSION.trim() : '';
+  const version = explicitVersion || environmentVersion || ownPackageVersion() || 'unknown';
+  const explicitLocale = typeof options.locale === 'string' ? options.locale.trim() : '';
+  let processLocale = '';
+  try {
+    processLocale = Intl.DateTimeFormat().resolvedOptions().locale;
+  } catch {
+    processLocale = '';
+  }
+  const locale = explicitLocale || processLocale || 'en-US';
+  return {
+    version,
+    locale,
+    // Date.getTimezoneOffset reports minutes west of UTC; the service wants seconds east.
+    timezoneOffsetSeconds: -new Date().getTimezoneOffset() * 60,
+  };
+}
+
 /**
  * The host-facing identity service.
  *
@@ -274,6 +334,11 @@ export async function readHardwareValues(options = {}) {
  * @param {object} [options.hardware] Overrides for `readHardwareValues`.
  * @param {object} [options.stored] An SN already on disk, so it is never regenerated.
  * @param {(event: string, detail?: object) => void} [options.audit]
+ * @param {string} [options.clientVersion] Version reported to the Platform in the account
+ *   `getProfile` call's client metadata; defaults to `DSH_CLIENT_VERSION`, then this package's
+ *   own version. See {@link accountClientMetadata}.
+ * @param {string} [options.locale] UI language reported in the same call; defaults to the
+ *   process locale.
  */
 export function createAccountIdentity(options = {}) {
   const audit = options.audit ?? (() => {});
@@ -310,10 +375,16 @@ export function createAccountIdentity(options = {}) {
        * fleet key and kept its old token -- the reported "still in the previous account's
        * fleet" state. Fetch the profile once when the identity is missing; the second read then
        * sees the new account.
+       *
+       * The call takes DSH's required `AccountClientMetadata` argument (see
+       * {@link accountClientMetadata}). A zero-argument call is **not** a harmless simplification:
+       * the service dereferences `client.version` before the network request, so it throws a
+       * `TypeError`, the `catch` below keeps the signed-out answer, and the account envelope would
+       * look supported while never being writable.
        */
       if ((identity?.userId == null) && typeof service.getProfile === 'function') {
         try {
-          await service.getProfile();
+          await service.getProfile(accountClientMetadata(options));
           identity = await service.getDeviceIdentity();
         } catch { /* keep the signed-out answer if the profile cannot be read */ }
       }

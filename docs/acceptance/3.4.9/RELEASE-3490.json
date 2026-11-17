@@ -1,0 +1,48 @@
+{
+  "version": "3.4.9",
+  "case": "RELEASE-3490",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-17T13:25:26.090Z",
+  "executor": "lead",
+  "task_id": "w2m-v349-panel",
+  "requirement": "v3.4.9: the backup panel mounts as a sidebar entry (sidebar.panellist id w2m-backup) with a main page and offers per-session restore planning, registry recheck status, the unlock card and four one-click operations (backup / restore selected / archive archived / verify); G5 is additionally closed in the engine (runtime_future_append) and verify (?runtime=1).",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/client-bundle.test.mjs",
+      "test/loader-entry.test.mjs",
+      "test/backup-engine.test.mjs",
+      "test/backup-runtime.test.mjs",
+      "test/backup-verify.test.mjs"
+    ],
+    [
+      "node",
+      "scripts/layer-check.mjs"
+    ],
+    [
+      "node",
+      "scripts/pack.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "registration": "sidebar.panellist (id w2m-backup, order 6) + main (key w2m-backup) are registered; the panel renders the four one-click actions, the plan card with per-session checkboxes, the unlock card and the registry recheck state",
+      "constraints": "the panel posts no password (machine envelope + CLI password path only); restore is plan -> danger confirmation -> apply; polling is read-only and cleared on unmount",
+      "e2e": "the real Chromium loader entry test (W2M_DSH_RUNTIME) mounts the packed plugin and clicks the actions; skipped by name when no Harness is installed",
+      "g5": "engine runtime_future_append and GET /verify?runtime=1 run the installed Harness, with evidence labels static-prefilter / installed-harness",
+      "artifact": "pack rebuilt from commit 757e328: 509 file(s), 2170057 bytes, sha256 c7568da4…"
+    }
+  },
+  "artifacts": [
+    {
+      "sha256": "c7568da4cc3619d5e49d7cacecf2d4868058b2d86b2659884cd25eefc20b1fab",
+      "bytes": 2170057
+    }
+  ]
+}

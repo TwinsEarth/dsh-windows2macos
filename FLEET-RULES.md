@@ -144,3 +144,21 @@ single success is not evidence that the path works.
 The first two attempts at "make Windows a git participant" assumed the failure was a configuration problem
 and tried proxy settings and retries. Both were wrong, and both cost a round. **The measurements above are
 cheaper to read than to repeat.**
+
+---
+
+## 9. The fleet minimum plugin version is enforced at dispatch
+
+**Added 2026-11-17 with v3.5.0.** `w2m_run` refuses to dispatch when any online machine it would use is
+below `MIN_SUPPORTED_PLUGIN_VERSION` (3.5.0) or cannot report a readable version: the whole dispatch is
+refused with `MACHINE_VERSION_UNSUPPORTED`, and the refusal names every affected `machine_id`, its version
+(or "unreadable") and the minimum. This is a gate, not a warning — a machine running older plugin code may
+not implement the protocol fields the command relies on, and a divergence discovered after the fact is
+worse than a refusal before it. The override is `allowOutdated: true` on that dispatch: per-call, explicit
+and audited. The result carries `outdated_allowed` plus a `version_gate.audit` record naming every machine
+waved through, and the host log gets a warning line. Read-only tools (`w2m_devices`, `w2m_stats`, …) are
+never refused — looking at the fleet is how you fix it — and the drift data (per-version distribution,
+outdated and unknown machines, `all_current`) is exposed additively as the `versions` block of
+`w2m_devices` and `GET /api/w2m/target`. The gate activates on a build that is itself at least the
+minimum, so an emergency rollback to a pre-3.5.0 build is not refused by its own rule.
+

@@ -1,0 +1,54 @@
+{
+  "version": "3.5.0",
+  "case": "RELEASE-3500",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-17T13:25:26.090Z",
+  "executor": "lead",
+  "task_id": "w2m-v350-governance-retention-mirror",
+  "requirement": "v3.5.0: version governance (minimum supported plugin version gate with named refusal and an allowOutdated override, plus the read-only fleet version dashboard), backup retention by count and age, offsite mirror with real-path containment and corrupt-object repair, account-id compare-only unlock, three protection states (unencrypted default / account-id convenience / 4-6 digit PIN), old-format full copies with backfill, and the Relay Phase 2 merge review.",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/fleet-version-gate.test.mjs",
+      "test/backup-mirror.test.mjs",
+      "test/backup-rotation.test.mjs",
+      "test/backup-gc.test.mjs",
+      "test/backup-keystore.test.mjs",
+      "test/fix-renumber.test.mjs",
+      "test/client-bundle.test.mjs",
+      "test/backup-g2.test.mjs",
+      "test/backup-verify.test.mjs"
+    ],
+    [
+      "node",
+      "scripts/layer-check.mjs"
+    ],
+    [
+      "node",
+      "scripts/pack.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "version_gate": "a dispatch whose online targets include a machine below MIN_SUPPORTED_PLUGIN_VERSION is refused with MACHINE_VERSION_UNSUPPORTED naming every machine/version/minimum; allowOutdated:true proceeds with an audit record; read-only tools are never refused; the dashboard renders the distribution/outdated/unknown/all_current block",
+      "retention": "keep-N and max-age rules apply together; a referenced record is never pruned; full copies are pruned with their records and orphan copies are collected",
+      "mirror": "only missing sealed objects are copied; truncated/corrupt copies are repaired; a junction escaping into the repo or DSH_HOME is refused with BACKUP_MIRROR_SYMLINK; a mirror failure never rolls back the committed backup",
+      "protection": "new repositories default to unencrypted (open envelope) and open without a credential; adding a password/PIN or account binding removes the open envelope and flips to sealed; 4-6 digit PINs are accepted with a weak-password warning; account-id compare unlocks only on a match and otherwise falls back to the password path",
+      "old_format": "old-format full writes a sealed whole-file copy next to each record; old-backfill migrates records created before the mode existed and is idempotent",
+      "phase2": "the Relay Phase 2 branch was reviewed (merge-with-conditions) and is not merged",
+      "artifact": "pack rebuilt from commit 58a2b77: 516 file(s), 2322108 bytes, sha256 a5330e23…"
+    }
+  },
+  "artifacts": [
+    {
+      "sha256": "a5330e233f0b49db189c6d0d3fbfbf4f6d70054df67eab0c187116469fee260d",
+      "bytes": 2322108
+    }
+  ]
+}

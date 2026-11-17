@@ -191,6 +191,16 @@ import {
   sessionKeyFor,
   TARGET_ROUTE_PATH,
 } from './fleet-target.mjs';
+// v3.5.0: the fleet minimum-version gate and its dashboard data. One module owns the comparator and
+// the decision, so the dispatch refusal, the `w2m_devices`/`/api/w2m/target` drift block and the
+// tests can never disagree about what "below the minimum" means.
+import {
+  evaluateVersionGate,
+  isVersionGateActive,
+  MIN_SUPPORTED_PLUGIN_VERSION,
+  summarizeVersionDashboard,
+  VERSION_GATE_CODES,
+} from './version-gate.mjs';
 // v1.1.17 chat: the host route behind the composer's fleet-chat panel. The relay side and the
 // `w2m_chat` tool shipped first; this is the browser-facing half that was still missing.
 import { registerChatRoutes } from './fleet-chat-route.mjs';
@@ -200,6 +210,8 @@ import { registerOperatorTokenRoute } from './operator-token-route.mjs';
 import { registerFleetConfigRoute } from './fleet-config-route.mjs';
 import { registerDataplaneSinkRoute } from './dataplane-sink-route.mjs';
 import { registerProjectStreamRoute } from './project-stream-route.mjs';
+// v3.4.6: the read-only backup substrate's two GET routes (`status`, `scan`). Nothing behind them writes.
+import { registerBackupRoutes } from '../backup/routes.mjs';
 import { planProgress } from './joint-dev/progress.mjs';
 import { registerJointTools } from './tools-joint.mjs';
 import { fingerprintOf, readOperatorToken } from './operator-token.mjs';
@@ -298,6 +310,17 @@ const MAX_STAGES = 16;
  * overrides it at runtime for tests and packagers.
  */
 const PLUGIN_VERSION = '__W2M_PLUGIN_VERSION__';
+
+/**
+ * v3.5.0: the fleet minimum, re-exported from the module that owns the comparator.
+ *
+ * One definition, two access points: `version-gate.mjs` is where the rule lives (and where a pure
+ * test can import it from), and this file is "the module that owns dispatch" -- a caller reading the
+ * dispatch surface should not have to know which helper file the constant moved to. Re-exported
+ * rather than redefined on purpose: two copies of a minimum version is two answers to "is this
+ * machine too old", which is the defect this milestone is about.
+ */
+export { MIN_SUPPORTED_PLUGIN_VERSION };
 
 /** How long any single HTTP call may take before it is aborted, in milliseconds. */
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
@@ -3693,6 +3716,15 @@ export async function apply(ctx, config = {}) {
   const _dataplaneSinkRoute = registerDataplaneSinkRoute(ctx, { stateDir: () => resolveStateDir(cfg.stateDir, 'joint-dev') });
   // A6: read-only project SSE proxy (device token stays in the host process).
   const _projectStreamRoute = registerProjectStreamRoute(ctx, { relayUrl: () => cfg.rabbitUrl, deviceToken: () => resolveToken(cfg) });
+  // v3.4.6: the backup panel's read-only half (`GET /api/w2m/backup/status` and `/scan`). Mounted from the
+  // plugin root rather than a disable-by-default subplugin row, because both routes only read: a status card
+  // that was absent until somebody edited `cordis.patch.yml` would report "not enabled" for a feature that has
+  // nothing to enable yet. The `dsh-backup` subplugin row arrives with the engine (v3.4.7), where enabling it
+  // starts meaning "a timer may write".
+  const _backupRoutes = registerBackupRoutes(ctx, {
+    dshHome: () => (typeof process.env.DSH_HOME === 'string' && process.env.DSH_HOME.trim() !== '' ? process.env.DSH_HOME : join(os.homedir(), '.dsh')),
+    backupDir: () => cfg.backupDir ?? null,
+  });
 
   // v1.7.1: host-side screenshot + clipboard fallbacks. The DSH desktop shell does not grant the
   // renderer getDisplayMedia/navigator.clipboard, so the chat panel needs a host route that does not
@@ -3867,6 +3899,16 @@ export async function apply(ctx, config = {}) {
           })),
           excluded_stale: includeStale ? 0 : fleet.records.length - listed.length,
           version_drift: summarizeFleetVersions(fleet.records, resolveCurrentVersion(PLUGIN_VERSION, process.env)),
+          /**
+           * v3.5.0: the drift dashboard's data, additive beside `version_drift`.
+           *
+           * `distribution` counts every machine the relay lists by the version it advertises;
+           * `outdated`/`unknown` are the machines behind the fleet minimum or unable to say their
+           * version. `all_current` is the one boolean a panel header wants. Computed from the same
+           * roster read this tool already made, so the dashboard cannot show a different fleet than
+           * the list above it.
+           */
+          versions: summarizeVersionDashboard(fleet.records),
           discovery: discoveryBlock,
           note:
             'a listed device has paired and is being tracked; it can still refuse the next command ' +
@@ -3957,6 +3999,19 @@ export async function apply(ctx, config = {}) {
         description:
           'Default false: the relay leases only the machines that are online and have not gone silent. Set true to ' +
           'include machines that are currently down (their lease will simply expire if they do not come back).',
+        default: false,
+      },
+      allowOutdated: {
+        type: 'boolean',
+        // v3.5.0: the minimum-version gate. Deliberately a per-dispatch, default-false override: the
+        // safe answer to "one machine is old" is to refuse and name it, and an operator who has read
+        // the refusal can override once, explicitly.
+        description:
+          'Default false: a dispatch whose online target machines include one below the fleet minimum plugin ' +
+          `version (${MIN_SUPPORTED_PLUGIN_VERSION}) or one that cannot report its version is refused whole with ` +
+          'MACHINE_VERSION_UNSUPPORTED, naming every affected machine. Set true to dispatch anyway: the override is ' +
+          'audited (an `audit` record in the result and a warning line) and the machines waved through are listed ' +
+          'in `outdated_allowed`.',
         default: false,
       },
       cwd_rel: {
@@ -4468,25 +4523,131 @@ export async function apply(ctx, config = {}) {
       const narrowedTo = selectionAppliedAs === 'executor_machine_id' || selectionAppliedAs === 'target_machines'
         ? (selection?.machine_id ?? null)
         : (executorMachineId ?? null);
-      if (narrowedTo !== null) {
-        // A roster read is a best-effort guard: if it fails, the relay itself still decides and the
-        // post-dispatch lease check below remains the authority on whether the narrowing held.
-        let preflight = null;
+      // v3.5.0: a named `assignee` is a target restriction too. It is kept apart from the
+      // composer-selection contract above (the relay owns `assignee`) so nothing about selection
+      // behaviour changes; it only tells the version gate which machines this task can run on.
+      const assignedTo =
+        typeof args?.assignee === 'string' && args.assignee.trim() !== '' ? args.assignee.trim() : null;
+      const gateTargetIds = narrowedTo !== null || assignedTo !== null
+        ? [...new Set([narrowedTo, assignedTo].filter((id) => id !== null))]
+        : null;
+
+      const runningVersion = resolveCurrentVersion(PLUGIN_VERSION, process.env);
+      const versionGateActive = isVersionGateActive(runningVersion, MIN_SUPPORTED_PLUGIN_VERSION);
+
+      /**
+       * One roster read for both the narrowed-target revalidation and the version gate.
+       *
+       * Best-effort by design: the relay remains the authority on whether a dispatch is allowed, so
+       * a transient `GET /v1/devices` failure must not become a dispatch refusal. The version gate
+       * reports the gap (`version_gate.checked: false`) instead of silently treating an unreadable
+       * roster as "everything is current" -- an unreadable roster is not evidence of anything.
+       */
+      let roster = null;
+      if (narrowedTo !== null || versionGateActive) {
         try {
-          preflight = await readFleet({ rabbitUrl: base, token, localMachineId: null, signal: exec?.signal, request });
-        } catch { preflight = null; }
-        if (preflight.ok === true) {
-          const listed = (preflight.devices ?? []).find((device) => device?.machine_id === narrowedTo);
-          const online = listed !== undefined && (listed.state === 'online' || listed.state === undefined);
-          if (!online) {
-            throw new W2MError(
-              'TARGET_UNAVAILABLE',
-              `TARGET_UNAVAILABLE: the target machine ${narrowedTo} is not online on the relay right now; nothing was dispatched and no other machine was chosen`,
-              { hint: 'pick another machine in the composer, or clear the selection to dispatch to the whole fleet' },
-            );
-          }
+          roster = await readFleet({ rabbitUrl: base, token, localMachineId: null, signal: exec?.signal, request });
+        } catch { roster = null; }
+      }
+
+      if (narrowedTo !== null && roster?.ok === true) {
+        // `readFleet` projects the roster into `machines`, where `online` is the same liveness rule
+        // the composer renders. (This check used to read a `devices` field `readFleet` never
+        // returned, which refused every narrowed dispatch whenever the roster read succeeded; the
+        // projection is the fix, and the version gate below reads the same snapshot.)
+        const listed = (roster.machines ?? []).find((machine) => machine?.machine_id === narrowedTo);
+        if (listed === undefined || listed.online !== true) {
+          throw new W2MError(
+            'TARGET_UNAVAILABLE',
+            `TARGET_UNAVAILABLE: the target machine ${narrowedTo} is not online on the relay right now; nothing was dispatched and no other machine was chosen`,
+            { hint: 'pick another machine in the composer, or clear the selection to dispatch to the whole fleet' },
+          );
         }
       }
+
+      /**
+       * v3.5.0: the fleet minimum-version gate.
+       *
+       * Only machines this dispatch would actually use are graded: every online machine for a
+       * dispatch the relay may route anywhere, exactly the named machine(s) for a narrowed dispatch,
+       * a named executor or a named assignee. An old machine that will not run this command does not
+       * block it -- it is refused on the dispatch that would use it.
+       *
+       * Offline machines are not graded (they are gated on the dispatch that brings them back), but
+       * an online machine whose version cannot be read is `unknown`, and unknown is refused for the
+       * same reason as outdated: the gate must not pass what it could not check.
+       */
+      let versionGate = null;
+      let outdatedAllowed = [];
+      if (versionGateActive) {
+        if (roster?.ok === true) {
+          const online = (roster.records ?? []).filter((record) => isSelectableDevice(record));
+          const decision = evaluateVersionGate({
+            machines: online.map((record) => ({
+              machine_id: record?.machine_id ?? null,
+              name: record?.machine_name ?? record?.name ?? null,
+              version: record?.caps?.plugin_version,
+            })),
+            targetIds: gateTargetIds,
+            supportedMin: MIN_SUPPORTED_PLUGIN_VERSION,
+            runningVersion,
+            allowOutdated: args?.allowOutdated === true,
+          });
+          if (decision.ok !== true) {
+            throw new W2MError(
+              VERSION_GATE_CODES.MACHINE_VERSION_UNSUPPORTED,
+              `MACHINE_VERSION_UNSUPPORTED: refusing to dispatch: ${decision.detail.summary}; the fleet ` +
+                `minimum is ${MIN_SUPPORTED_PLUGIN_VERSION}. Upgrade the named machine(s), or pass ` +
+                'allowOutdated: true to dispatch anyway (an explicit, audited override)',
+              {
+                hint: `upgrade the named machine(s) to ${MIN_SUPPORTED_PLUGIN_VERSION} or newer, or re-run with allowOutdated: true after accepting that the old machine may not implement this protocol`,
+                detail: decision.detail,
+              },
+            );
+          }
+          const audit = decision.allow_outdated
+            ? {
+                event: 'dispatch.outdated_allowed',
+                at: new Date().toISOString(),
+                supported_min: MIN_SUPPORTED_PLUGIN_VERSION,
+                machines: decision.outdated_allowed,
+                note:
+                  'allowOutdated: true was supplied, so these machines were dispatched to even though the fleet ' +
+                  `minimum is ${MIN_SUPPORTED_PLUGIN_VERSION}; the override is recorded here and in the host log`,
+              }
+            : null;
+          if (audit !== null) {
+            outdatedAllowed = decision.outdated_allowed;
+            // Best-effort durable trace: the dispatch result names the machines, and this line is
+            // what a host log grep finds. Never fatal.
+            ctx.logger?.warn?.(
+              'w2m: MACHINE_VERSION_UNSUPPORTED override allowed for ' +
+                decision.outdated_allowed
+                  .map((machine) => `${machine.machine_id}=${machine.version ?? 'unknown'}`)
+                  .join(', ') +
+                ` (fleet minimum ${MIN_SUPPORTED_PLUGIN_VERSION})`,
+            );
+          }
+          versionGate = {
+            active: true,
+            checked: decision.checked,
+            supported_min: MIN_SUPPORTED_PLUGIN_VERSION,
+            allow_outdated: decision.allow_outdated,
+            ...(audit === null ? {} : { audit }),
+          };
+        } else {
+          versionGate = {
+            active: true,
+            checked: false,
+            supported_min: MIN_SUPPORTED_PLUGIN_VERSION,
+            reason_code: 'VERSION_GATE_UNVERIFIABLE',
+            detail:
+              'the fleet roster could not be read, so no machine version was checked; the relay remains the ' +
+              'authority on whether the dispatch is allowed',
+          };
+        }
+      }
+
 
 const result = await request({
         rabbitUrl: base,
@@ -4636,6 +4797,17 @@ const result = await request({
                 session: sessionKey,
                 ...selectionReason,
               },
+          /**
+           * v3.5.0: what the minimum-version gate decided. Present only when the gate is active for
+           * this build (a 3.5.0+ dispatcher); a pre-3.5.0 build does not pretend it checked anything.
+           * `checked: false` means the roster could not be read -- an unverifiable dispatch is
+           * reported as such rather than as "all machines are current".
+           */
+          ...(versionGate === null ? {} : { version_gate: versionGate }),
+          // v3.5.0: the machines an explicit `allowOutdated: true` waved through, named with their
+          // own reason codes. Only present when the override actually changed the outcome, so a
+          // normal dispatch's result stays byte-shape-compatible.
+          ...(outdatedAllowed.length === 0 ? {} : { outdated_allowed: outdatedAllowed }),
           /**
            * The note has to match what the relay will actually do.
            *

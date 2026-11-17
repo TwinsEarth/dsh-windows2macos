@@ -1,0 +1,51 @@
+{
+  "version": "3.4.8",
+  "case": "RELEASE-3480",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-17T13:25:26.090Z",
+  "executor": "lead",
+  "task_id": "w2m-v348-restore-unlock-archive-verify",
+  "requirement": "v3.4.8: restore is plan-then-apply and must pass session-doctor, the G2 registry protocol and the G5 runtime verdict before writing; unlock opens the repository (machine/password) without disclosing the data key; archive produces a .tar.zst with a verified manifest and can itself be restored; verify checks every snapshot block, digest and index in both directions.",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/backup-restore.test.mjs",
+      "test/backup-archive.test.mjs",
+      "test/backup-verify.test.mjs",
+      "test/backup-access.test.mjs",
+      "test/backup-g2.test.mjs",
+      "test/backup-runtime.test.mjs"
+    ],
+    [
+      "node",
+      "scripts/layer-check.mjs"
+    ],
+    [
+      "node",
+      "scripts/pack.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "restore": "plan classifies new/identical/differs; apply refuses on static reject, registry uncertainty or runtime reject; pre-restore copies kept and pruned by keep_pre_restore; target re-check refuses a changed file (BACKUP_RESTORE_TARGET_CHANGED)",
+      "registry": "one registry document is planned and written atomically with read-back verification; the recheck replays a client overwrite",
+      "unlock": "describe/unlock report available paths; the password path never echoes a secret; the DEK is not returned by the CLI",
+      "archive": "tar.zst written with manifest + README; extract refuses path escape; restore --archive applies the same gates as repository restore",
+      "verify": "all blocks decrypt and re-hash, index<->snapshot both directions checked, old records rebuilt, future-append simulated (static and, with --runtime, by the installed Harness)",
+      "runtime": "the installed Harness validates original + appended logs through sessionFormatCatalog.createRestore(..., validation:'current')",
+      "artifact": "pack rebuilt from commit 29d0930: 508 file(s), 2130970 bytes, sha256 f4d6c07b…"
+    }
+  },
+  "artifacts": [
+    {
+      "sha256": "f4d6c07b6d60d35813a43b375f79131c11ddfe62d89a0f63ea8b1ab3503cf9c9",
+      "bytes": 2130970
+    }
+  ]
+}

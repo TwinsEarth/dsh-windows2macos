@@ -164,5 +164,44 @@
     - id: dsh-decision-center
       name: '@twinsearth/w2m-dsh-plugin/decision-center'
       config: {}
+    # 自修复 (dsh-fix): repairs sessions whose history references a deleted image attachment object.
+    #
+    # Enabled: this is the release's headline behaviour and the failure it addresses is permanent
+    # (the bytes are gone, so retrying cannot help). It listens on the agent loop's
+    # `agent/request-error` waterfall, appends the official `image/offload` event for unreadable
+    # images on the current surface, flushes, and retries the step. A real network failure is
+    # delegated untouched; at most 3 repairs per session per turn.
+    #
+    # The mount marker is $DSH_HOME/xclient/dsh-fix-state.json; the offline CLI is `w2m-fix`
+    # (also `node cli/bin/dsh-fix-attachments.mjs`), documented in docs/DSH-FIX.md.
+    - id: dsh-fix
+      name: '@twinsearth/w2m-dsh-plugin/dsh-fix'
+      config:
+        maxRepairsPerTurn: 3
+
+    # 备份&还原 (dsh-backup): scheduled session backup (default 22:00 Asia/Shanghai) plus the
+    # `POST /api/w2m/backup/run` route the panel calls. It ships `disabled: true` for the same reason
+    # dsh-gpw does: this is the first W2M row whose timer WRITES to disk, so it must be discoverable in
+    # the plugin manager and turned on by an explicit operator action -- not arrive with the package.
+    # Offline CLI: `w2m-backup` (`run` / `status` / `scan` / `list` / `gc` / `selftest`).
+    # Design + protocol: docs/BACKUP-DESIGN.md.
+    - id: dsh-backup
+      name: '@twinsearth/w2m-dsh-plugin/dsh-backup'
+      disabled: true
+      config:
+        backupDir: 'D:\DeepSeekHarness\BackUP'
+        backupTimes: ['22:00:00']
+        backupTimeZone: Asia/Shanghai
+        backupScope: all
+        keepOldPerSession: 10
+        # 字面兼容需求 3：被替换的旧版本除记录外再写一份整文件加密副本（old/<ws>/<sid>/…json.enc）。
+        # 代价：每个被替换版本在去重块之外多占一份整文件字节；不想要时改成 records。
+        backupOldFormat: full
+        # §25.0 用户最终决定：默认不加密（none = DEK 明文在 keys.json；任何人读到仓库目录即可还原）。
+        # 想要账户/机器/PIN 保护时改成 sealed（会在新建仓库时写 account/machine/password 信封）。
+        backupEncryption: none
+        # §25 账户 ID 绑定解锁（用户决定）：只读取账户唯一识别码做比对，一致免密放行；不是机密性路径。
+        # 只对 sealed 仓库生效；none 仓库永不绑定（它本来就不需要凭据）。
+        backupAccountBinding: true
 
 
