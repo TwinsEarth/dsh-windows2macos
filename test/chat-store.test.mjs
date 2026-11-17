@@ -437,3 +437,53 @@ describe('damaged/partial files are tolerated', () => {
     assert.deepEqual(JSON.parse(readFileSync(join(h.chatDir(), 'state.json'), 'utf8')), { v: 1, generation: 1, next_local_offset: 2 });
   });
 });
+
+/**
+ * Phase 2 condition 4: deletion has to close. `load()` used to return the tombstoned session ids but keep the
+ * messages, so a restart (or a fresh node that pulled the whole log) re-seeded a conversation the operator had
+ * deleted. These are the three readings that make "deleted" mean deleted: the loader filters, a late import is
+ * filtered too, and compaction drops the dead rows while keeping the tombstone that stops resurrection.
+ */
+describe('deletion semantics: a tombstone wins over any message', () => {
+  it('load() hides a tombstoned session, including a message imported after the deletion', () => {
+    const h = harness();
+    h.store.appendMessage({ origin: 'node-a', message: message('msg-before', { at_ms: T0 - 5_000 }) });
+    h.store.appendSessionDeleted({ origin: 'node-a', session_id: 's-1' });
+    // A peer that had not seen the deletion yet ships an older message back in.
+    const imported = h.store.importRecord(peerMessage('node-b', 3, 'msg-late', { at_ms: T0 + 60_000 }));
+    assert.equal(imported.applied, true);
+
+    const loaded = h.reopen().load();
+    assert.deepEqual(loaded.messages, [], 'a deleted conversation does not come back on restart');
+    assert.deepEqual(loaded.deletedSessions, ['s-1']);
+    assert.equal(loaded.stats.messages, 0);
+    assert.equal(loaded.stats.records, 3, 'the raw log keeps the rows until prune; the view does not');
+  });
+
+  it('only the tombstoned session is hidden; another session in the same log still loads', () => {
+    const h = harness();
+    h.store.appendSessionDeleted({ origin: 'node-a', session_id: 's-deleted' });
+    h.store.appendMessage({ origin: 'node-a', message: message('alive', { session_id: 's-kept' }) });
+    const loaded = h.reopen().load();
+    assert.deepEqual(loaded.messages.map((m) => m.message_id), ['alive']);
+    assert.deepEqual(loaded.deletedSessions, ['s-deleted']);
+  });
+
+  it('prune() drops the tombstoned rows, keeps the tombstone, and bumps the generation', () => {
+    const h = harness();
+    h.store.appendSessionDeleted({ origin: 'node-a', session_id: 's-1' });
+    h.store.appendMessage({ origin: 'node-a', message: message('dead') });
+    h.store.appendMessage({ origin: 'node-a', message: message('alive', { session_id: 's-2' }) });
+
+    const pruned = h.store.prune();
+    assert.equal(pruned.removed_messages, 1);
+    assert.equal(pruned.removed_records, 1);
+    assert.equal(pruned.kept_records, 2, 'tombstone + the live message');
+    assert.equal(pruned.generation, 2);
+
+    const loaded = h.reopen().load();
+    assert.deepEqual(loaded.messages.map((m) => m.message_id), ['alive']);
+    assert.deepEqual(loaded.deletedSessions, ['s-1'], 'the tombstone is retained forever');
+    assert.equal(loaded.stats.records, 2);
+  });
+});

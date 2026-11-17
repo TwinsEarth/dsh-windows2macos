@@ -658,6 +658,9 @@ export class RelayServer {
     if (record === null || typeof record !== 'object' || record.data === null || typeof record.data !== 'object') return;
     const data = record.data;
     if (record.kind === 'chat.message') {
+      // A tombstone is final: a peer may still be shipping a message it accepted before it saw the deletion, and
+      // inserting it would make the deleted conversation reappear on this relay.
+      if (this._chatDeletedSessions.has(data.session_id)) return;
       try { this.fleetMessages?.insertImported(data); } catch (err) { this._log(`[w2m-rabbit] imported chat message rejected: ${err instanceof Error ? err.message : String(err)}`); }
       return;
     }
@@ -688,6 +691,40 @@ export class RelayServer {
     const cutoffMs = this.state.nowMs() - retentionDays * 24 * 60 * 60 * 1000;
     try { this.fleetMessages.pruneBefore(cutoffMs, { maxBytes: hardCapBytes }); } catch { /* memory prune is best effort */ }
     try { this.chatStore.prune(); } catch (err) { this._log(`[w2m-rabbit] chat prune failed: ${err instanceof Error ? err.message : String(err)}`); }
+  }
+
+  /**
+   * Delete one chat session's history locally and, through the replication log, on every peer.
+   *
+   * Deleting a conversation used to be a store-only operation with no caller: the tombstone set was written but never
+   * read, so a restart or a new node re-seeded the "deleted" history from disk. The Phase 2 closure is that `load()`
+   * filters tombstoned sessions and imported messages for them are refused; this method is the single write path that
+   * any future delete route will call, and the restart tests drive it directly. There is deliberately **no**
+   * device-facing HTTP delete route in this merge -- adding one is a protocol change that needs its own review (see
+   * `docs/RELAY-CLUSTER-SYNC-PHASE2-DESIGN.md` §5.4).
+   *
+   * @returns {{ok: boolean, deleted: boolean, tombstoned: boolean} | {ok: false, code: string}}
+   */
+  deleteChatSession(sessionId) {
+    if (typeof sessionId !== 'string' || sessionId.trim() === '') return { ok: false, code: 'BAD_SESSION' };
+    const alreadyDeleted = this._chatDeletedSessions.has(sessionId);
+    this._chatDeletedSessions.add(sessionId);
+    // The `onDelete` hook writes the tombstone; suppress it here so this method appends exactly one record whether or
+    // not the session still had rows in memory.
+    this._applyingChatDeletion = true;
+    try { this.fleetMessages?.deleteSession(sessionId); } finally { this._applyingChatDeletion = false; }
+    const persistable = this.chatStore !== null;
+    if (!alreadyDeleted && persistable) {
+      try {
+        this.chatStore.appendSessionDeleted({ origin: this._recordOriginId(), session_id: sessionId });
+      } catch (err) {
+        this._log(`[w2m-rabbit] chat tombstone persistence failed: ${err instanceof Error ? err.message : String(err)}`);
+        return { ok: false, code: 'CHAT_DELETE_NOT_PERSISTED', deleted: true, tombstoned: false };
+      }
+    }
+    // Without persistence (`--no-persist`) a deletion is memory-only: no log exists to replicate it from, and the
+    // result says so rather than claiming a durable tombstone.
+    return { ok: true, deleted: true, tombstoned: persistable };
   }
 
   _log(message) {
@@ -1785,6 +1822,12 @@ export class RelayServer {
         });
       }
       const body = takeJson();
+      // A deleted session id is retired: `load()` filters its history forever, so accepting a new message would report
+      // success for a message that is invisible after the next restart. (Reachable only through the relay-level delete
+      // path / cluster tombstone; there is no device-facing delete route in this merge.)
+      if (this._chatDeletedSessions.has(body.session_id)) {
+        throw new ProtocolError('BAD_REQUEST', 'this chat session was deleted; its session id is retired', { code: 'SESSION_DELETED' });
+      }
       const posted = this.fleetMessages.post({
         session_id: body.session_id,
         fleet_id: device.fleet_id ?? null,

@@ -22,6 +22,14 @@
  * older-to-newer, which invalidates every peer cursor -- so a rewrite bumps `generation`, and a peer that sees a different
  * generation resets its cursor to zero and re-pulls. Import deduplication makes that replay idempotent.
  *
+ * ## Deletion
+ *
+ * A `chat.session.deleted` tombstone is permanent: `load()` never returns a message of a tombstoned session (regardless
+ * of the message's `at_ms`, so a re-import or a restart cannot resurrect a deleted conversation) and `prune()` removes
+ * those message records from the log. The tombstone itself is retained forever; dropping it would let a later sync bring
+ * the conversation back. The relay's HTTP API has no device-facing delete route yet -- the tombstone is produced by the
+ * relay-level delete path and by peers that already recorded the deletion.
+ *
  * ## Crash ordering
  *
  * * `append*` persists `next_local_offset` **before** appending the line. A crash between the two leaves an unused offset
@@ -469,7 +477,8 @@ export function createChatStore(options = {}) {
    * Read the log back into the shapes the relay needs at boot.
    *
    * * `messages`: chat.message rows within `retentionDays`, ascending by `at_ms` (ties by origin then offset), deduplicated
-   *   by `message_id` -- the full original row, ready to seed `createFleetMessages({initialMessages})`.
+   *   by `message_id` -- the full original row, ready to seed `createFleetMessages({initialMessages})`. A message whose
+   *   session carries a tombstone is **not** returned: deletion wins over any statement about the meaning of a timestamp.
    * * `readMarks`: one LWW winner per `(session_id, machine_id)`, within retention.
    * * `deletedSessions`: the tombstoned session ids (`string[]`, sorted) -- the relay applies a deletion by session id.
    *   Tombstones are **never** filtered by retention; they are what stops a re-import from resurrecting a deleted
@@ -511,6 +520,9 @@ export function createChatStore(options = {}) {
     const seenMessageIds = new Set();
     const messages = [];
     for (const record of messageCandidates) {
+      // The tombstone is the session's final state: filter here (not only at import) so a restart or a fresh node
+      // that pulls the whole log cannot bring a deleted conversation back.
+      if (tombstoneWinners.has(record.data.session_id)) continue;
       if (seenMessageIds.has(record.data.message_id)) continue;
       seenMessageIds.add(record.data.message_id);
       messages.push(cloneJson(record.data));
@@ -706,7 +718,8 @@ export function createChatStore(options = {}) {
 
   /**
    * Retention + hard-cap compaction. Drops message/read records outside `retentionDays` (oldest first under the byte cap),
-   * keeps every tombstone, keeps only the LWW read per `(session_id, machine_id)`, and rewrites the log atomically.
+   * drops message records of tombstoned sessions (deletion is permanent; their bytes have no reader), keeps every
+   * tombstone, keeps only the LWW read per `(session_id, machine_id)`, and rewrites the log atomically.
    *
    * The generation is bumped **only when the rewritten log actually differs** -- a periodic prune with nothing to remove is
    * a no-op, otherwise every peer would be forced to re-pull the whole log every sync round. `next_local_offset` never goes
@@ -722,7 +735,10 @@ export function createChatStore(options = {}) {
 
     // Read marks are LWW state: only the winning record per (session, machine) needs to survive.
     const readWinners = new Map();
+    /** Sessions whose history was deleted: their message rows are dead bytes in the log. */
+    const tombstonedSessions = new Set();
     for (const record of records) {
+      if (record.kind === KIND_DELETED) tombstonedSessions.add(record.data.session_id);
       if (record.kind !== KIND_READ) continue;
       if (record.data.at_ms < cutoff) continue;
       const key = `${record.data.session_id}\u0000${record.data.machine_id}`;
@@ -735,7 +751,7 @@ export function createChatStore(options = {}) {
     let removedRecords = 0;
     for (const record of records) {
       if (record.kind === KIND_MESSAGE) {
-        if (record.data.at_ms < cutoff) {
+        if (record.data.at_ms < cutoff || tombstonedSessions.has(record.data.session_id)) {
           removedMessages += 1;
           removedRecords += 1;
           continue;
@@ -805,18 +821,23 @@ export function createChatStore(options = {}) {
   /**
    * Occupancy counters for `/healthz`: never message content, never secrets.
    *
-   * `messages` counts the distinct chat.message rows within the retention window (what `load().messages` returns);
-   * `records` counts distinct `(origin, offset)` records still in the log.
+   * `messages` counts the distinct chat.message rows within the retention window (what `load().messages` returns; a
+   * tombstoned session's rows are not counted); `records` counts distinct `(origin, offset)` records still in the log.
    */
   function stats() {
     loadState();
     const records = ensureCache();
     const cutoff = now() - retentionMs;
+    const tombstonedSessions = new Set();
+    for (const record of records) {
+      if (record.kind === KIND_DELETED) tombstonedSessions.add(record.data.session_id);
+    }
     const seenMessageIds = new Set();
     let messages = 0;
     for (const record of records) {
       if (record.kind !== KIND_MESSAGE) continue;
       if (record.data.at_ms < cutoff) continue;
+      if (tombstonedSessions.has(record.data.session_id)) continue;
       if (seenMessageIds.has(record.data.message_id)) continue;
       seenMessageIds.add(record.data.message_id);
       messages += 1;
