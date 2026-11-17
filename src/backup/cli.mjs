@@ -15,6 +15,10 @@
  * the shell history and in every process listing), and the environment variable `W2M_BACKUP_PASSWORD` is accepted
  * for scripted use. Without either, the run opens the repository with the machine envelope only.
  *
+ * The one argv exception is `unlock --set-password --hint "..."`: the hint is **public metadata by design**
+ * (stored in clear in the repository's `keys.json` and shown by `unlock`), so putting it on the command line is
+ * the intended use. A hint equal to the PIN is refused by the keystore, so the PIN cannot be smuggled in as one.
+ *
  * Exit codes: 0 success; 1 a named refusal (the code is printed); 2 usage error.
  */
 
@@ -97,6 +101,12 @@ export function formatUnlock(payload) {
       }
       lines.push(`password path : ${payload.password_required ? `available (a ${MIN_PASSWORD_BYTES}-6 digit PIN is a convenience gate, not confidentiality)` : 'not configured'}`);
     }
+  }
+  // The PUBLIC "备注提示词" (`--hint`): plain text on purpose, so it is printed verbatim to whoever asks how to
+  // unlock. It never contains the PIN (the writer refuses a hint equal to the PIN).
+  const passwordHint = payload.password_hint ?? null;
+  if (passwordHint !== null && typeof passwordHint === 'object' && passwordHint.set === true && typeof passwordHint.text === 'string') {
+    lines.push(`密码提示：${passwordHint.text}`);
   }
   if (payload.check !== undefined) {
     lines.push(`check         : ${payload.check.ok ? `opened via ${payload.check.via}` : `refused: ${payload.check.reason_code} ${payload.check.detail ?? ''}`.trimEnd()}`);
@@ -281,6 +291,11 @@ function usage() {
     '                      confidentiality (the CLI prints that warning). Also turns an unencrypted repository',
     '                      back into a sealed one.',
     '  --enable-protection alias of --set-password (turning protection on needs a PIN/password)',
+    '  --hint <text>       unlock --set-password: attach a PUBLIC hint/note to the PIN (e.g. --hint "周六生日"),',
+    '                      stored in the repository and printed by unlock. It is NOT a secret: it is plain text',
+    '                      in keys.json, so argv is allowed for it (unlike the PIN, which stays on stdin). No PIN',
+    '                      rotation by decision: once a PIN is set it cannot be changed and a supplied hint is not',
+    '                      updated; a forgotten PIN means the machine/account path or creating the repository anew.',
     '  --disable-protection unlock: turn protection OFF: open with existing credentials, write an open envelope',
     '                      carrying the same data key; the repository then unlocks with no credential at all.',
     '                      Requires --confirm disable-protection because it weakens the repository.',
@@ -335,6 +350,9 @@ export function parseArgs(argv, env = process.env) {
     setPassword: false,
     enableProtection: false,
     disableProtection: false,
+    // The public "备注提示词" for a new PIN. Not a secret: it is stored in clear in keys.json, so argv is allowed
+    // for it (the PIN itself never is).
+    hint: null,
     confirm: null,
     encryption: null,
     accountId: null,
@@ -361,6 +379,16 @@ export function parseArgs(argv, env = process.env) {
     else if (arg === '--set-password') options.setPassword = true;
     else if (arg === '--enable-protection') options.enableProtection = true;
     else if (arg === '--disable-protection') options.disableProtection = true;
+    else if (arg === '--hint') {
+      const raw = rest.shift() ?? '';
+      if (raw.trim() === '') return { ...options, error: '--hint needs a hint text (it is public metadata, not the PIN)' };
+      options.hint = raw;
+    }
+    else if (arg.startsWith('--hint=')) {
+      const raw = arg.slice('--hint='.length);
+      if (raw.trim() === '') return { ...options, error: '--hint needs a hint text (it is public metadata, not the PIN)' };
+      options.hint = raw;
+    }
     else if (arg === '--no-encryption') options.encryption = 'none';
     else if (arg === '--confirm') {
       const raw = rest.shift() ?? '';
@@ -1058,6 +1086,7 @@ export function main(argv, io = {}) {
         root: resolved.dir,
         dshHome: options.dshHome,
         password: passwordFor(options, io),
+        hint: options.hint ?? undefined,
         platform: process.platform,
         machineKey: options.noMachineKey === true ? false : undefined,
       });
@@ -1079,6 +1108,10 @@ export function main(argv, io = {}) {
           write(`keys backup       : ${result.backup_file}`);
           write(`file              : ${result.file}`);
         }
+        // The hint is public metadata, printed verbatim; it never contains the PIN (the writer refuses that).
+        if (result.ok === true && result.hint !== undefined && result.hint !== null && result.hint.set === true && typeof result.hint.text === 'string') {
+          write(`密码提示：${result.hint.text}`);
+        }
         if (result.weak === true) write(`warning           : ${result.warning ?? WEAK_PIN_WARNING}`);
       }
       return result.ok === true ? 0 : 1;
@@ -1097,6 +1130,8 @@ export function main(argv, io = {}) {
       machine_available: described.machine_available,
       machine_reason: described.machine_reason,
       password_required: described.password_required,
+      // The public "备注提示词" (plain text in keys.json by design); never the PIN.
+      password_hint: described.password_hint,
       // Compare-only identity binding: the masked id hint is the only form of the account id that is printed.
       account: described.account,
       account_supported: described.account_supported,

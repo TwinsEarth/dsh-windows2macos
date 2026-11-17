@@ -1826,6 +1826,44 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
     }
   });
 
+  it('shows the public password hint in the dialog and says there is no PIN rotation', async () => {
+    const host = mountBackupPage(unlockDialogHost({ password_hint: { set: true, text: '周六生日' } }));
+    try {
+      await host.settle();
+      const dialog = await openUnlockDialog(host);
+      assert.ok(dialog !== undefined, 'the dialog opened');
+      const hint = inDialog(host.handle.tree, (node) => node.props?.['data-w2m-backup-unlock-hint'] === 'true')[0];
+      assert.ok(hint !== undefined, 'the public hint line is rendered in the password section');
+      assert.ok(collectText(hint).join('').includes('密码提示：周六生日'), 'the hint is shown verbatim, with its label');
+      const dialogText = collectText(dialog).join('\n');
+      assert.ok(dialogText.includes('不提供 PIN 轮换'), 'the dialog states that PIN rotation is not offered by design');
+      assert.ok(dialogText.includes('本机/原账户路径'), 'the no-rotation note names the recovery paths');
+      assert.equal(inDialog(host.handle.tree, (node) => node.props?.['data-w2m-backup-unlock-hint-none'] !== undefined).length, 0);
+      assert.equal(inDialog(host.handle.tree, (node) => node.type === 'input' || node.type === 'textarea').length, 0,
+        'a public hint is displayed text, never an input: the dialog still accepts no password');
+    } finally {
+      host.handle.unmount();
+    }
+
+    // A repository with a machine envelope but no PIN: the password section says no PIN is set.
+    const noPinHost = mountBackupPage(unlockDialogHost({
+      envelopes: ['machine'],
+      password_required: false,
+      password_hint: { set: false, text: null },
+    }));
+    try {
+      await noPinHost.settle();
+      assert.ok(await openUnlockDialog(noPinHost) !== undefined, 'the dialog opened');
+      const none = inDialog(noPinHost.handle.tree, (node) => node.props?.['data-w2m-backup-unlock-hint-none'] === 'true')[0];
+      assert.ok(none !== undefined, 'the "no password set" line is rendered');
+      assert.ok(collectText(none).join('').includes('未设置密码'), 'the no-PIN copy is the documented "未设置密码" text');
+      assert.equal(inDialog(noPinHost.handle.tree, (node) => node.props?.['data-w2m-backup-unlock-hint'] === 'true').length, 0);
+      assert.equal(inDialog(noPinHost.handle.tree, (node) => node.type === 'input' || node.type === 'textarea').length, 0);
+    } finally {
+      noPinHost.handle.unmount();
+    }
+  });
+
   it('closes the unlock dialog with Escape and puts focus back on the card trigger', async () => {
     const host = mountBackupPage(unlockDialogHost());
     try {
@@ -2068,6 +2106,9 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
       'panel.backup.unlock.dialog.localUnavailable',
       'panel.backup.unlock.dialog.optionB',
       'panel.backup.unlock.dialog.optionBHint',
+      'panel.backup.unlock.dialog.hintLabel',
+      'panel.backup.unlock.dialog.hintNone',
+      'panel.backup.unlock.dialog.noRotation',
       'panel.backup.unlock.dialog.noPasswordNeeded',
       'panel.backup.unlock.dialog.commandCaption',
       'panel.backup.unlock.dialog.copy',

@@ -4,6 +4,15 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### 解锁 PIN 的公开提示词：可留备注，但按决定不提供 PIN 轮换（未发布）
+
+- **用户决定**：不为密码/PIN 提供轮换（设置后不能改），默认仍然不设密码；用户可以在设置 4–6 位 PIN 时附加一条**公开的**备注提示词（"备注提示词"），随仓库保存并在解锁时显示。
+- **`keys.json` 纯加法新增可选根字段 `password_hint: {text, updated_at}`**：它**按设计就是公开元数据**——明文存在仓库的 keys 文件里，任何能打开该文件的人都能看到，所以它只能提示"PIN 大概是什么"，绝不能写 PIN 本身。`validateKeysFile` 接受该字段，拒绝 `text` 非字符串或超过 120 字符，以及"有提示词却没有 password 信封"的文档。
+- **API**：`setRepositoryPassword({password, hint})`（`hint` 可选；trim、折叠空白、上限 120，拒绝非字符串、空值与和 PIN 逐字相同的提示词）；结果新增 `hint: {set, text?}`。仓库已有 password 信封时行为不变：`added:false` 的 no-op，现有 PIN 与提示词都不变——"改 PIN"按决定不支持，也不存在"只改提示词"的后门。`describeUnlock`、`unlockRepo`、`buildStatus`、插件 unlock（GET/POST）与 CLI `unlock` 均以加法方式暴露 `password_hint: {set, text}`（`set:false` 时 `text:null`）。
+- **CLI**：`w2m-backup unlock --set-password --hint "周六生日"`——提示词不是秘密，所以允许走 argv 并在此注明（PIN 仍只从 stdin/环境变量读）；人类输出打印 `密码提示：…`，`--json` 带 `hint`，`unlock`（describe）也打印提示词；usage 增加 `--hint <text>`。
+- **面板**：解锁对话框选项 B 在 `password_hint.set` 时渲染「密码提示：<text>」（`data-w2m-backup-unlock-hint`），没有提示词且没有 PIN 时渲染「未设置密码」（`data-w2m-backup-unlock-hint-none`），并加一句「不提供 PIN 轮换（用户决定）」（`data-w2m-backup-unlock-no-rotation`）；新增 zh/en i18n `panel.backup.unlock.dialog.hintLabel/hintNone/noRotation`。对话框仍然没有任何密码输入框，HTTP 仍只收确认令牌。
+- **文档/测试**：`docs/BACKUP-DESIGN.md` §25.5/§25.7 记录提示词为何公开、在哪里显示，以及"不提供 PIN 轮换（用户决定）：设置后不能改；忘记时用 machine/account 路径或按新仓库重建"；测试覆盖 keystore（提示词持久化与返回、trim/折叠空白、>120 拒绝、与 PIN 相同拒绝、无 password 信封被 `validateKeysFile` 拒绝、再次设置 no-op 不改提示词、PIN `1234` 仍可开、PIN 与 DEK 不泄露）、access（describe/attempt 携带 `password_hint` 且仍只暴露掩码账户 id、不含 PIN）、CLI（`--hint` 解析/人类输出/`--json`/usage）、client-bundle（对话框渲染提示词与「未设置密码」、中英新键、仍无密码输入框）。**声明**：不 bump 版本、不跑 preflight、不提交。
+
 ### 默认启用 dsh-backup 行：面板与 22:00 定时器开箱可用（未发布）
 
 - 面板此前依赖操作员先启用 `dsh-backup` 行（默认 `disabled: true`），否则只显示"备份子插件未启用"。现改为随包默认启用：安装后面板直接可用，22:00（Asia/Shanghai）调度也会照常启动；操作员仍可在插件页关闭整行。

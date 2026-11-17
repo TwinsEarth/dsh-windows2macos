@@ -587,8 +587,20 @@ export function apply(ctx, config = {}, deps = {}) {
             return refuse('BACKUP_CONFIRM_REQUIRED', `a JSON body with {"confirm":"${UNLOCK_CONFIRM_TOKEN}"} is required`);
           }
           const result = unlockRepo(await unlockInput());
+          // The payload is additive: `password_hint` is the PUBLIC "备注提示词" (plain text in keys.json by design),
+          // never the PIN. The GET describe already carries it; the POST repeats it so the dialog can refresh
+          // from either half without a second request.
           return Response.json(
-            { ok: result.ok, via: result.via, encryption: result.encryption, account: result.account, reason_code: result.reason_code, detail: result.detail, attempts: result.attempts },
+            {
+              ok: result.ok,
+              via: result.via,
+              encryption: result.encryption,
+              account: result.account,
+              password_hint: result.password_hint,
+              reason_code: result.reason_code,
+              detail: result.detail,
+              attempts: result.attempts,
+            },
             { headers: NO_STORE },
           );
         },

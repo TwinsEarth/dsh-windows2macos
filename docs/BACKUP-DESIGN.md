@@ -1320,11 +1320,26 @@ node --input-type=module -e "import { bindAccount } from 'file:///E:/GPT/w2m/w2m
   `input`/`textarea`。显示可复制的 `<code>` 命令 `w2m-backup unlock --check --password-stdin`（复制走
   `navigator.clipboard.writeText`，失败回退 `document.execCommand('copy')`）与「我已运行，刷新状态」；未加密时
   明确说明不需要密码。
+* **密码提示词（`password_hint`，公开元数据）**：用户可以在设置 4–6 位 PIN 时附带一条"备注提示词"
+  （`w2m-backup unlock --set-password --hint "周六生日"`），它作为**可选根字段** `password_hint:
+  {text, updated_at}` 写进仓库的 `keys.json`（与 `account_binding` 同级，纯加法；`validateKeysFile` 接受它，
+  拒绝 `text` 非字符串或超过 120 字符，以及"有提示词却没有 password 信封"的文档）。它**按设计就是公开的**：
+  以明文躺在仓库里，任何能读 `keys.json` 的人都能看到，所以只能用来提示"PIN 大概是什么"，绝不能写 PIN 本身
+  （写入时拒绝与 PIN 逐字相同的提示词，非字符串/空值/>120 字符同样拒绝）。正因为它不是秘密，CLI 允许它走
+  argv（PIN 仍只能从 stdin/环境变量读）；`describeUnlock`、CLI `unlock`、插件 unlock（GET/POST）与 status
+  payload 都以加法方式返回 `password_hint: {set, text}`（`set:false` 时 `text:null`）。对话框选项 B 在
+  `password_hint.set` 时显示「密码提示：<text>」（`data-w2m-backup-unlock-hint`）；没有 PIN 时显示「未设置密码」
+  （`data-w2m-backup-unlock-hint-none`），并用一句话说明按用户决定**不提供 PIN 轮换**
+  （`data-w2m-backup-unlock-no-rotation`）。
+* **提示词写入语义（与"不轮换"一致）**：`setRepositoryPassword({password, hint})` 只在**本次真的新增** password
+  信封时写提示词；仓库已有 password 信封时调用是 no-op（`added:false`），已有 PIN 与提示词都保持不变——"改 PIN"
+  按决定不支持，因此也不存在"只改提示词"的后门。
 * 末尾一行 `w2m-backup unlock --disable-protection --confirm disable-protection`（关闭保护）**只作为可复制文本**
   展示，面板从不执行它。
 * **密码永远不进浏览器、不过 HTTP**：对话框里常驻 `panel.backup.unlock.dialog.passwordNeverInBrowser` 的说明；
   新增文案键（zh+en）为 `panel.backup.unlock.dialog.*`：`open`、`title`、`subtitle`、`state.*`、`optionA`、
-  `optionAHint`、`localUnavailable`、`optionB`、`optionBHint`、`noPasswordNeeded`、`commandCaption`、`copy`、
+  `optionAHint`、`localUnavailable`、`optionB`、`optionBHint`、`hintLabel`（「密码提示：{hint}」）、`hintNone`
+  （「未设置密码」）、`noRotation`（「不提供 PIN 轮换」）、`noPasswordNeeded`、`commandCaption`、`copy`、
   `copied`、`refresh`、`refreshing`、`close`、`busy`、`failed`、`success`、`passwordNeverInBrowser`、
   `disableProtection`。
 
@@ -1377,6 +1392,8 @@ node --input-type=module -e "import { bindAccount } from 'file:///E:/GPT/w2m/w2m
 * 账户 id 由宿主提供；**CLI 不会自己读**。宿主未登录/断网/无账户服务时 account 路径不可用，PIN 路径照旧。
 * 面板的账户路径按钮与 machine 按钮都只发同一个确认令牌；面板从不接收密码，PIN 路径仍只在离线 CLI。
 * `account` 信封**不能**在"换账户 + 无 machine + 无 password"时救回仓库：那是 PIN 路径的职责。
+* **不提供 PIN 轮换（用户决定）**：PIN 设置后不能改；忘记时用 machine/account 路径或按新仓库重建。提示词
+  （`password_hint`）也只是提示，不是恢复手段，且它按设计是公开明文。
 * 已经存在的旧快照目录里的 `keys.json` 副本没有新绑定/新模式变化（只写根 `keys.json`，下一次快照起副本才更新）；
   从旧快照直接还原仍走它自己那份 `keys.json`。
 * 关闭保护**不会**重写 `objects/`：块仍是同一把 DEK 封的密文；"不加密"准确地说只是"钥匙明文存在旁边"。

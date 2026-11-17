@@ -105,6 +105,15 @@ export const OPEN_KIND = 'open';
 export const OPEN_ALG = 'none';
 
 /**
+ * Maximum length of the PUBLIC password hint stored at the `keys.json` root (`password_hint.text`).
+ *
+ * The hint is a "备注提示词" for a forgotten 4-6 digit PIN, and it is **public metadata by design**: it is
+ * written in clear into the repository's keys file, so anyone who can open that file can read it. It must
+ * therefore stay short enough that a reader cannot mistake it for a stored secret, and it is never the PIN.
+ */
+export const MAX_PASSWORD_HINT_LENGTH = 120;
+
+/**
  * Envelope kinds, in the order `unwrapDek` tries credential envelopes.
  *
  * `open` is first because when it is present it is the only kind a valid document may carry. The credential
@@ -491,6 +500,26 @@ export function unwrapDek(keysFile, credentials = {}) {
 }
 
 /**
+ * Normalise a public password hint for storage: trim the ends and collapse every whitespace run to one space.
+ *
+ * **The hint is public metadata by design** (see {@link MAX_PASSWORD_HINT_LENGTH}): it lives in `keys.json`, is
+ * shown by every unlock probe, and is explicitly *not* a secret. That is why `w2m-backup unlock --set-password
+ * --hint` may take it on argv while the PIN itself must stay on stdin.
+ *
+ * Returns `null` for a non-string, an empty/whitespace-only value, or anything longer than
+ * {@link MAX_PASSWORD_HINT_LENGTH} after normalisation, so the caller can refuse with a clear detail.
+ *
+ * @param {unknown} value
+ * @returns {string|null}
+ */
+export function normalizePasswordHint(value) {
+  if (typeof value !== 'string') return null;
+  const text = value.replace(/\s+/gu, ' ').trim();
+  if (text === '' || text.length > MAX_PASSWORD_HINT_LENGTH) return null;
+  return text;
+}
+
+/**
  * Validate a `keys.json` document structurally.
  *
  * @param {object} keysFile
@@ -527,6 +556,30 @@ export function validateKeysFile(keysFile) {
       throw new BackupCryptoError(CRYPTO_CODES.ENVELOPE_MALFORMED, 'account_binding.bound_at must be an ISO timestamp when it is present');
     }
   }
+  // Additive optional (v3.5.x): the PUBLIC hint that travels with the password envelope, written at the root
+  // next to `account_binding`. It is a hint, not a secret -- anyone who can read `keys.json` can read it, and the
+  // CLI may pass it on argv for exactly that reason. Validating it here means every reader (snapshot copies
+  // included) rejects a malformed hint instead of showing half-parsed text; the envelope check below refuses a
+  // hint without the password envelope it describes, because such a document would show a hint for a PIN that
+  // does not exist.
+  if (keysFile.password_hint !== undefined && keysFile.password_hint !== null) {
+    const hint = keysFile.password_hint;
+    if (typeof hint !== 'object' || Array.isArray(hint)) {
+      throw new BackupCryptoError(CRYPTO_CODES.ENVELOPE_MALFORMED, 'the password_hint record is not an object');
+    }
+    if (typeof hint.text !== 'string' || hint.text.trim() === '') {
+      throw new BackupCryptoError(CRYPTO_CODES.ENVELOPE_MALFORMED, 'password_hint.text must be a non-empty string');
+    }
+    if (hint.text.length > MAX_PASSWORD_HINT_LENGTH) {
+      throw new BackupCryptoError(
+        CRYPTO_CODES.ENVELOPE_MALFORMED,
+        `password_hint.text must be at most ${MAX_PASSWORD_HINT_LENGTH} characters`,
+      );
+    }
+    if (hint.updated_at !== undefined && (typeof hint.updated_at !== 'string' || Number.isNaN(Date.parse(hint.updated_at)))) {
+      throw new BackupCryptoError(CRYPTO_CODES.ENVELOPE_MALFORMED, 'password_hint.updated_at must be an ISO timestamp when it is present');
+    }
+  }
   if (!Array.isArray(keysFile.envelopes) || keysFile.envelopes.length === 0) {
     throw new BackupCryptoError(CRYPTO_CODES.ENVELOPE_MALFORMED, 'the key file has no envelopes');
   }
@@ -557,6 +610,14 @@ export function validateKeysFile(keysFile) {
     if (Buffer.from(sealed.nonce, 'base64').length !== NONCE_LENGTH || Buffer.from(sealed.tag, 'base64').length !== TAG_LENGTH) {
       throw new BackupCryptoError(CRYPTO_CODES.ENVELOPE_MALFORMED, 'an envelope has a malformed nonce or tag');
     }
+  }
+  // A hint describes a PIN: without the `password` envelope there is nothing it could hint at, and showing it at
+  // an unlock would promise a credential path the repository does not have. Named refusal, not a silent drop.
+  if (keysFile.password_hint !== undefined && keysFile.password_hint !== null && !kinds.has('password')) {
+    throw new BackupCryptoError(
+      CRYPTO_CODES.ENVELOPE_MALFORMED,
+      'a password_hint is only valid next to a password envelope: the hint would describe a PIN this repository does not have',
+    );
   }
   // Refuse mixing, because the open path never asks for a credential: a document carrying both would silently
   // bypass the password the user configured. This is a named refusal, not a silent preference for one kind.

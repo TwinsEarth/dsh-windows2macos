@@ -55,8 +55,10 @@ import path from 'node:path';
 import {
   CRYPTO_CODES,
   DEFAULT_SCRYPT,
+  MAX_PASSWORD_HINT_LENGTH,
   MIN_SCRYPT,
   OPEN_KIND,
+  normalizePasswordHint,
   openEnvelopeRecord,
   randomDek,
   unwrapDek,
@@ -107,6 +109,8 @@ export const KEYSTORE_CODES = Object.freeze({
   ACCOUNT_INVALID: 'BACKUP_ACCOUNT_ID_INVALID',
   /** An `account` envelope exists but carries no `account_binding` metadata, so it cannot be compared. */
   ACCOUNT_BINDING_UNKNOWN: 'BACKUP_ACCOUNT_BINDING_UNKNOWN',
+  /** The public password hint is unusable: not a string, empty after trimming, too long, or equal to the PIN. */
+  HINT_INVALID: 'BACKUP_PASSWORD_HINT_INVALID',
 });
 
 /** Domain separation of the account binding: the KEK is derived from `w2m-account-binding|<accountId>`. */
@@ -195,6 +199,28 @@ export function accountBindingState(keys, accountId = null) {
     matched: bound === null || provided === null ? null : bound === provided,
     id_hint: accountIdHint(bound),
   };
+}
+
+/**
+ * The public password hint that travels with the `password` envelope.
+ *
+ * **It is public metadata by design.** The user's decision (2026-11-17) is that a 4-6 digit PIN may carry a
+ * free-text "备注提示词" ("周六生日"), stored in the repository's `keys.json` at the root
+ * (`password_hint: {text, updated_at}`) and shown by every unlock probe. Because it is written in clear next to
+ * the repository, anyone who can read the keys file can read it -- so it may hold a reminder of the PIN, never
+ * the PIN itself (the writer refuses a hint equal to the PIN, and this reader never touches the envelope).
+ *
+ * The returned shape is what `describeUnlock`, the CLI and the panel consume: `{set, text}`. When no hint is
+ * stored it is `{set: false, text: null}`, so a caller never has to distinguish "missing" from "malformed".
+ *
+ * @param {object|null} keys a `keys.json` document (or an envelope-bearing snapshot copy)
+ * @returns {{set: boolean, text: string|null}}
+ */
+export function passwordHintState(keys) {
+  const hint = keys?.password_hint;
+  if (hint === null || typeof hint !== 'object' || Array.isArray(hint)) return { set: false, text: null };
+  if (typeof hint.text !== 'string' || hint.text === '') return { set: false, text: null };
+  return { set: true, text: hint.text };
 }
 
 /** Envelope kind names of a key document, in document order. */
@@ -416,7 +442,7 @@ export function addMachineEnvelope(keys, dek, machineSecret, options = {}) {
  * refuses the mixture (the open path would otherwise silently bypass a configured password). The caller is
  * therefore `setEncryptionMode`, which opens a sealed repository with its existing credentials, builds the
  * converted document and verifies it; this function adds the record and drops the now-meaningless
- * `account_binding` metadata.
+ * `account_binding` and `password_hint` root metadata (both describe credentials that no longer exist).
  *
  * **Security consequence (documented, on purpose).** After this write the DEK sits in clear in `keys.json`:
  * anyone who can read the repository directory can decrypt every object. That is what "turn protection off"
@@ -440,7 +466,10 @@ export function addOpenEnvelope(keys, dek, options = {}) {
     };
   }
   if (!Buffer.isBuffer(dek) || dek.length === 0) return { added: false, keys, reason: 'no data key to wrap' };
-  const { account_binding: _removedBinding, ...rest } = keys;
+  // Both root metadata fields describe a credential that is being removed: `account_binding` names the account
+  // envelope, `password_hint` is public text about the password envelope. `validateKeysFile` refuses a hint
+  // without its envelope, so both are dropped in the same write rather than leaving a dangling promise.
+  const { account_binding: _removedBinding, password_hint: _removedHint, ...rest } = keys;
   const converted = { ...rest, envelopes: [openEnvelopeRecord(dek, { now: options.now ?? new Date() })] };
   validateKeysFile(converted);
   return { added: true, keys: converted, reason: null };
@@ -703,18 +732,28 @@ export function bindAccount(input) {
  * `WEAK_PIN_WARNING`: the caller surfaces it, and the scrypt cost is *not* silently raised to pretend the PIN is
  * stronger than it is.
  *
+ * **The public hint (`hint`, optional).** A forgotten PIN may carry a "备注提示词" ("周六生日"). It is stored in
+ * `keys.json` at the root as `password_hint: {text, updated_at}` and is therefore **public metadata by design**:
+ * anyone who can read the repository's keys file can read it, so it may only remind of the PIN, never be the PIN
+ * (a hint equal to the PIN is refused, as are non-strings, empty values and anything over 120 characters). The
+ * result reports it as `hint: {set, text?}` and `docs/BACKUP-DESIGN.md` §25.5 records where it is shown.
+ *
+ * **No rotation (the user's decision).** When the repository already has a password envelope this function is a
+ * no-op (`added: false`): the existing PIN keeps working and a supplied `hint` is **not** updated. "Change PIN" is
+ * deliberately unsupported; a forgotten PIN means creating a new repository or using the machine/account path.
+ *
  * Adding a password to an `open` (unencrypted) repository removes the `open` record in the same write and
  * reports `mode_after: 'sealed'`; the descriptor is synced too. The repository then refuses credential-less
  * opens.
  *
  * @param {{
- *   root: string, dshHome: string, password: string|Buffer,
+ *   root: string, dshHome: string, password: string|Buffer, hint?: string|null,
  *   platform?: string, runner?: Function, machineKey?: boolean, now?: Date, kdf?: object,
  *   backupDir?: string|null,
  * }} input
  * @returns {{ok: boolean, added: boolean, file: string|null, backup_file: string|null,
  *   envelopes: string[], weak: boolean, encryption: 'none'|'sealed'|null, mode_after: 'none'|'sealed'|null,
- *   warning: string|null, reason_code: string|null, detail: string|null}}
+ *   hint: {set: boolean, text?: string}, warning: string|null, reason_code: string|null, detail: string|null}}
  */
 export function setRepositoryPassword(input) {
   const bytes = Buffer.isBuffer(input.password) ? input.password : Buffer.from(String(input.password ?? ''), 'utf8');
@@ -729,6 +768,7 @@ export function setRepositoryPassword(input) {
       encryption: null,
       mode_after: null,
       warning: null,
+      hint: { set: false },
       reason_code: bytes.length === 0 ? CRYPTO_CODES.PASSWORD_EMPTY : NO_PERMISSION,
       detail:
         bytes.length === 0
@@ -737,6 +777,37 @@ export function setRepositoryPassword(input) {
     };
   }
   const weak = isWeakPassword(bytes);
+  // Validate the PUBLIC hint before touching the repository: a rejected hint must not produce a write. The hint
+  // is stored in clear in keys.json (by design), so it may remind of the PIN and may never be the PIN itself.
+  let hintText = null;
+  if (input.hint !== undefined && input.hint !== null) {
+    const hintRefusal = (detail) => ({
+      ok: false,
+      added: false,
+      file: null,
+      backup_file: null,
+      envelopes: [],
+      weak,
+      encryption: null,
+      mode_after: null,
+      hint: { set: false },
+      warning: weak ? WEAK_PIN_WARNING : null,
+      reason_code: KEYSTORE_CODES.HINT_INVALID,
+      detail,
+    });
+    const normalized = normalizePasswordHint(input.hint);
+    if (normalized === null) {
+      return hintRefusal(
+        typeof input.hint !== 'string'
+          ? 'the hint must be a string: it is public metadata stored in keys.json, never a secret'
+          : `the hint must be 1-${MAX_PASSWORD_HINT_LENGTH} characters after trimming whitespace`,
+      );
+    }
+    if (normalized === bytes.toString('utf8')) {
+      return hintRefusal('the hint must not be the PIN/password itself: it is stored in clear in keys.json');
+    }
+    hintText = normalized;
+  }
   const opened = openRepoKey({
     root: input.root,
     dshHome: input.dshHome,
@@ -756,6 +827,7 @@ export function setRepositoryPassword(input) {
       weak,
       encryption: keysEncryption(opened.keys),
       mode_after: null,
+      hint: passwordHintState(opened.keys),
       warning: weak ? WEAK_PIN_WARNING : null,
       reason_code: opened.reason_code,
       detail: opened.detail,
@@ -772,18 +844,32 @@ export function setRepositoryPassword(input) {
       weak,
       encryption: keysEncryption(upgraded.keys),
       mode_after: keysEncryption(upgraded.keys),
+      hint: passwordHintState(upgraded.keys),
       warning: weak ? WEAK_PIN_WARNING : null,
       reason_code: null,
-      detail: upgraded.reason,
+      // No rotation by decision: an existing PIN (and its hint) is never replaced. Say so when a hint was
+      // supplied, so no caller can believe the new text was stored.
+      detail: hintText === null
+        ? upgraded.reason
+        : `${upgraded.reason}; the hint was not updated (PIN rotation is not offered by design)`,
     };
   }
   const file = opened.file;
-  const stamp = (input.now ?? new Date()).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+  const now = input.now ?? new Date();
+  // The hint rides at the root of the same document, in the same atomic write as the envelope: a hint can never
+  // exist without the PIN it describes (validateKeysFile enforces both halves).
+  const hinted = hintText === null
+    ? upgraded.keys
+    : { ...upgraded.keys, password_hint: { text: hintText, updated_at: now.toISOString() } };
+  if (hintText !== null) validateKeysFile(hinted);
+  const hintedEnvelopes = envelopeKinds(hinted);
+  const resultHint = passwordHintState(hinted);
+  const stamp = now.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
   const backupFile = input.backupDir ?? path.join(path.dirname(file), 'keys.json.bak-' + stamp);
   try {
     fs.mkdirSync(path.dirname(backupFile), { recursive: true });
     fs.copyFileSync(file, backupFile);
-    writeFileAtomic(file, JSON.stringify(upgraded.keys));
+    writeFileAtomic(file, JSON.stringify(hinted));
   } catch (error) {
     return {
       ok: false,
@@ -794,6 +880,7 @@ export function setRepositoryPassword(input) {
       weak,
       encryption: keysEncryption(opened.keys),
       mode_after: keysEncryption(opened.keys),
+      hint: passwordHintState(opened.keys),
       warning: weak ? WEAK_PIN_WARNING : null,
       reason_code: error?.code ?? 'BACKUP_WRITE_FAILED',
       detail: error?.detail ?? String(error?.message ?? error),
@@ -804,21 +891,22 @@ export function setRepositoryPassword(input) {
   // The point of the write: the new credential alone must open the same DEK.
   let verify = null;
   try {
-    verify = unwrapDek(upgraded.keys, { password: bytes });
+    verify = unwrapDek(hinted, { password: bytes });
   } catch {
     verify = null;
   }
-  const modeAfter = keysEncryption(upgraded.keys);
+  const modeAfter = keysEncryption(hinted);
   if (verify === null || Buffer.isBuffer(verify.dek) !== true || verify.dek.equals(opened.dek) !== true) {
     return {
       ok: false,
       added: true,
       file,
       backup_file: backupFile,
-      envelopes: envelopeKinds(upgraded.keys),
+      envelopes: hintedEnvelopes,
       weak,
       encryption: modeAfter,
       mode_after: modeAfter,
+      hint: resultHint,
       warning: weak ? WEAK_PIN_WARNING : null,
       reason_code: NO_PERMISSION,
       detail: 'the written password envelope did not verify against the data key',
@@ -829,10 +917,11 @@ export function setRepositoryPassword(input) {
     added: true,
     file,
     backup_file: backupFile,
-    envelopes: envelopeKinds(upgraded.keys),
+    envelopes: hintedEnvelopes,
     weak,
     encryption: modeAfter,
     mode_after: modeAfter,
+    hint: resultHint,
     warning: weak ? WEAK_PIN_WARNING : null,
     reason_code: null,
     detail: null,

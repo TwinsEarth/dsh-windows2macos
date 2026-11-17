@@ -279,6 +279,192 @@ describe('keystore: adding a password envelope to a machine-only repository', ()
   });
 });
 
+describe('keystore: the public password hint (no PIN rotation by decision)', () => {
+  const PIN = '1234';
+  const HINT = '周六生日';
+
+  /** A machine-only repository: the shape that can still gain a PIN (an existing PIN is never rotated). */
+  function machineOnlyRepo() {
+    const { dir, cleanup } = tempDir('w2m-keystore-hint-');
+    const root = `${dir}/repo`;
+    ensureLayout(root);
+    const home = `${dir}/home`;
+    const created = openRepoKey({ root, dshHome: home, platform: 'win32', runner: fakeRunner, machineKey: true, kdf: KDF });
+    assert.equal(created.ok, true, created.detail ?? '');
+    return { dir, root, home, created, cleanup };
+  }
+
+  it('stores the hint with the password envelope, returns it, and the 4-digit PIN alone still opens', () => {
+    const { root, home, created, cleanup } = machineOnlyRepo();
+    try {
+      const upgraded = setRepositoryPassword({
+        root, dshHome: home, password: PIN, hint: '  周六   生日  ',
+        platform: 'win32', runner: fakeRunner, machineKey: true, kdf: KDF,
+      });
+      assert.equal(upgraded.ok, true, upgraded.detail ?? '');
+      assert.equal(upgraded.added, true);
+      // Trimmed AND whitespace-collapsed: the stored text is the public hint in its canonical one-line form.
+      const collapsed = '周六 生日';
+      assert.deepEqual(upgraded.hint, { set: true, text: collapsed }, 'the hint is trimmed, whitespace-collapsed and returned');
+      assert.equal(upgraded.weak, true, 'a 4-digit PIN is accepted and reported weak');
+      assert.equal(upgraded.warning, WEAK_PIN_WARNING);
+
+      const document = readRepoKeys(root);
+      assert.equal(document.ok, true);
+      assert.equal(document.keys.password_hint.text, collapsed, 'the hint is persisted at the keys.json root');
+      assert.match(document.keys.password_hint.updated_at, /^\d{4}-\d{2}-\d{2}T/u);
+      assert.deepEqual(document.keys.envelopes.map((envelope) => envelope.kind).sort(), ['machine', 'password']);
+      assert.equal(JSON.stringify(document.keys.envelopes).includes(collapsed), false, 'the hint is root metadata, not envelope material');
+
+      // Neither the PIN nor the data key may leak through the hint, the result or the written document.
+      const keysText = readFileSync(repoKeysPath(root), 'utf8');
+      assert.equal(keysText.includes(PIN), false, 'the PIN itself is never stored in clear');
+      const resultText = JSON.stringify(upgraded);
+      assert.equal(resultText.includes(PIN), false, 'the result never echoes the PIN');
+      assert.equal(resultText.includes(collapsed), true, 'the hint is public, so the result reports it');
+      assert.equal(resultText.includes(created.dek.toString('base64')), false, 'the DEK never appears in the result');
+      assert.equal(resultText.includes(created.dek.toString('hex')), false);
+
+      const opened = openRepoKey({ root, dshHome: home, password: PIN, platform: 'linux', machineKey: false, kdf: KDF });
+      assert.equal(opened.ok, true, opened.detail ?? '');
+      assert.equal(opened.unlocked_via, 'password', 'the stored hint changes nothing about the PIN path');
+      assert.deepEqual(opened.dek, created.dek, 'the DEK must not change: existing blocks stay readable');
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('refuses an unusable hint without writing anything, and accepts exactly 120 characters', () => {
+    const refused = machineOnlyRepo();
+    try {
+      const before = readFileSync(repoKeysPath(refused.root), 'utf8');
+      const cases = [
+        { hint: 'x'.repeat(121), pattern: /1-120 characters/u },
+        { hint: PIN, pattern: /PIN\/password itself/u },
+        { hint: 42, pattern: /must be a string/u },
+        { hint: '   ', pattern: /1-120 characters/u },
+      ];
+      for (const entry of cases) {
+        const result = setRepositoryPassword({
+          root: refused.root, dshHome: refused.home, password: PIN, hint: entry.hint,
+          platform: 'win32', runner: fakeRunner, machineKey: true, kdf: KDF,
+        });
+        assert.equal(result.ok, false, `hint=${JSON.stringify(entry.hint)} must be refused`);
+        assert.equal(result.reason_code, KEYSTORE_CODES.HINT_INVALID);
+        assert.match(result.detail, entry.pattern);
+        assert.deepEqual(result.hint, { set: false });
+        assert.equal(readFileSync(repoKeysPath(refused.root), 'utf8'), before, 'a refused hint must not write the repository');
+      }
+    } finally {
+      refused.cleanup();
+    }
+
+    const boundary = machineOnlyRepo();
+    try {
+      const accepted = setRepositoryPassword({
+        root: boundary.root, dshHome: boundary.home, password: PIN, hint: 'x'.repeat(120),
+        platform: 'win32', runner: fakeRunner, machineKey: true, kdf: KDF,
+      });
+      assert.equal(accepted.ok, true, accepted.detail ?? '');
+      assert.equal(accepted.hint.text.length, 120, '120 characters is the accepted boundary');
+    } finally {
+      boundary.cleanup();
+    }
+  });
+
+  it('refuses a hint without a password envelope (validateKeysFile), and malformed hint records', () => {
+    const dek = randomDek();
+    const openDocument = wrapOpenDek(dek);
+    assert.throws(
+      () => validateKeysFile({ ...openDocument, password_hint: { text: HINT } }),
+      (error) => error.code === CRYPTO_CODES.ENVELOPE_MALFORMED && /only valid next to a password envelope/u.test(error.detail),
+      'an unencrypted repository must not promise a PIN hint',
+    );
+    const machineOnlyDocument = wrapDek(
+      dek,
+      [{ kind: 'machine', secret: Buffer.alloc(32, 5), kdf: { algo: 'hkdf-sha256', keylen: 32 } }],
+    );
+    assert.throws(
+      () => validateKeysFile({ ...machineOnlyDocument, password_hint: { text: HINT } }),
+      /password envelope/u,
+      'a machine-only repository has no PIN to hint at',
+    );
+    const passwordDocument = wrapDek(dek, [{ kind: 'password', secret: PIN }], { kdf: KDF });
+    assert.doesNotThrow(
+      () => validateKeysFile({ ...passwordDocument, password_hint: { text: HINT, updated_at: new Date().toISOString() } }),
+      'the additive root field is accepted when the envelope it describes exists',
+    );
+    for (const bad of [{ text: 42 }, { text: 'x'.repeat(121) }, { text: '' }]) {
+      assert.throws(
+        () => validateKeysFile({ ...passwordDocument, password_hint: bad }),
+        (error) => error.code === CRYPTO_CODES.ENVELOPE_MALFORMED,
+        `password_hint.text=${JSON.stringify(bad.text)} must be refused`,
+      );
+    }
+    assert.throws(
+      () => validateKeysFile({ ...passwordDocument, password_hint: { text: HINT, updated_at: 'not-a-date' } }),
+      /ISO timestamp/u,
+    );
+  });
+
+  it('is a no-op on a repository that already has a PIN and never updates the hint', () => {
+    const { root, home, cleanup } = machineOnlyRepo();
+    try {
+      const first = setRepositoryPassword({
+        root, dshHome: home, password: PIN, hint: HINT,
+        platform: 'win32', runner: fakeRunner, machineKey: true, kdf: KDF,
+      });
+      assert.equal(first.added, true);
+      const before = readFileSync(repoKeysPath(root), 'utf8');
+      const again = setRepositoryPassword({
+        root, dshHome: home, password: PIN, hint: '另一个提示',
+        platform: 'win32', runner: fakeRunner, machineKey: true, kdf: KDF,
+      });
+      assert.equal(again.ok, true, again.detail ?? '');
+      assert.equal(again.added, false, 'no rotation: a second call is a no-op');
+      assert.deepEqual(again.hint, { set: true, text: HINT }, 'the stored hint is returned unchanged');
+      assert.match(again.detail, /not updated/u);
+      assert.match(again.detail, /not offered by design/u);
+      assert.equal(readFileSync(repoKeysPath(root), 'utf8'), before, 'a no-op must not rewrite the document');
+      assert.equal(readRepoKeys(root).keys.password_hint.text, HINT);
+
+      const plainNoop = setRepositoryPassword({
+        root, dshHome: home, password: PIN,
+        platform: 'win32', runner: fakeRunner, machineKey: true, kdf: KDF,
+      });
+      assert.equal(plainNoop.added, false);
+      assert.deepEqual(plainNoop.hint, { set: true, text: HINT }, 'no hint supplied still reports what the repository carries');
+      assert.equal(readFileSync(repoKeysPath(root), 'utf8'), before);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('drops the public hint together with the password envelope when protection is turned off', () => {
+    const { root, home, cleanup } = machineOnlyRepo();
+    try {
+      const set = setRepositoryPassword({
+        root, dshHome: home, password: PIN, hint: HINT,
+        platform: 'win32', runner: fakeRunner, machineKey: true, kdf: KDF,
+      });
+      assert.equal(set.added, true);
+      assert.equal(readRepoKeys(root).keys.password_hint.text, HINT);
+      const disabled = setEncryptionMode({ root, dshHome: home, mode: 'none', platform: 'win32', runner: fakeRunner, machineKey: true, kdf: KDF });
+      assert.equal(disabled.ok, true, disabled.detail ?? '');
+      assert.equal(disabled.changed, true);
+      const document = readRepoKeys(root);
+      assert.equal(document.ok, true, 'the converted document still validates without a dangling hint');
+      assert.equal(document.keys.password_hint, undefined, 'a hint without its envelope would be a promise the repository cannot keep');
+      assert.deepEqual(document.keys.envelopes.map((envelope) => envelope.kind), ['open']);
+      const naked = openRepoKey({ root, dshHome: home, platform: 'linux', machineKey: false, kdf: KDF });
+      assert.equal(naked.ok, true, naked.detail ?? '');
+      assert.equal(naked.unlocked_via, 'none');
+    } finally {
+      cleanup();
+    }
+  });
+});
+
 describe('keystore: account id binding (compare-only, docs/BACKUP-DESIGN.md §25)', () => {
   const ACCOUNT = 'user-1234abcd';
   const OTHER = 'user-9999ffff';

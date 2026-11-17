@@ -8,7 +8,7 @@ import { join } from 'node:path';
 
 import { runBackup } from '../src/backup/engine.mjs';
 import { describeUnlock, machineSecretAvailable, unlockRepo } from '../src/backup/unlock.mjs';
-import { UNENCRYPTED_WARNING, bindAccount } from '../src/backup/keystore.mjs';
+import { UNENCRYPTED_WARNING, bindAccount, setRepositoryPassword } from '../src/backup/keystore.mjs';
 import {
   applyRegistryRestore,
   findWorkspaceForSlug,
@@ -142,6 +142,86 @@ describe('unlock: describing the repository without touching a secret', () => {
     } finally {
       repo.cleanup();
       home.cleanup();
+    }
+  });
+});
+
+describe('unlock: the public password hint (docs/BACKUP-DESIGN.md §25.5)', () => {
+  /** An unencrypted repository that then gains a PIN and its public hint (the supported creation path). */
+  function hintedRepo() {
+    const { repo, home } = unencryptedRepo();
+    const set = setRepositoryPassword({
+      root: repo.dir,
+      dshHome: home.home,
+      password: '1234',
+      hint: '周六生日',
+      platform: 'linux',
+      machineKey: false,
+    });
+    assert.equal(set.ok, true, set.detail ?? '');
+    assert.equal(set.added, true);
+    return { repo, home };
+  }
+
+  it('carries the hint verbatim on describe and on the attempt, and never the PIN', () => {
+    const { repo, home } = hintedRepo();
+    try {
+      const described = describeUnlock({ root: repo.dir, dshHome: home.home, platform: 'linux', machineKey: false });
+      assert.equal(described.ok, true);
+      assert.deepEqual(described.password_hint, { set: true, text: '周六生日' });
+      const describedJson = JSON.stringify(described);
+      assert.equal(describedJson.includes('周六生日'), true, 'the hint is public metadata: describe shows it verbatim');
+      assert.equal(describedJson.includes('1234'), false, 'the PIN never travels in the describe payload');
+      assert.equal(described.password_required, true, 'the hint does not replace the PIN path');
+
+      const refused = unlockRepo({ root: repo.dir, dshHome: home.home, platform: 'linux', machineKey: false });
+      assert.equal(refused.ok, false);
+      assert.deepEqual(refused.password_hint, { set: true, text: '周六生日' }, 'even a failed attempt tells the operator what the hint says');
+      assert.equal(JSON.stringify(refused).includes('1234'), false);
+
+      const opened = unlockRepo({ root: repo.dir, dshHome: home.home, password: '1234', platform: 'linux', machineKey: false });
+      assert.equal(opened.ok, true, opened.detail ?? '');
+      assert.deepEqual(opened.password_hint, { set: true, text: '周六生日' });
+      assert.equal(JSON.stringify(opened).includes('1234'), false);
+    } finally {
+      repo.cleanup();
+      home.cleanup();
+    }
+  });
+
+  it('is additive next to the masked account id, and reports {set:false} when no hint is stored', () => {
+    const { repo, home } = hintedRepo();
+    try {
+      // The hinted PIN repository gains the compare-only account binding: the hint must not interfere with it.
+      const bound = bindAccount({
+        root: repo.dir,
+        dshHome: home.home,
+        accountId: ACCOUNT,
+        password: '1234',
+        platform: 'linux',
+        machineKey: false,
+      });
+      assert.equal(bound.ok, true, bound.detail ?? '');
+      assert.equal(bound.added, true);
+      const described = describeUnlock({ root: repo.dir, dshHome: home.home, platform: 'linux', machineKey: false, accountId: ACCOUNT });
+      assert.equal(described.ok, true);
+      assert.deepEqual(described.account, { bound: true, matched: true, id_hint: '…abcd' }, 'the account id stays masked');
+      assert.deepEqual(described.password_hint, { set: true, text: '周六生日' }, 'the hint is additive next to the account binding');
+      const describedJson = JSON.stringify(described);
+      assert.equal(describedJson.includes(ACCOUNT), false, 'the full account id never leaves describeUnlock');
+      assert.equal(describedJson.includes('1234'), false);
+    } finally {
+      repo.cleanup();
+      home.cleanup();
+    }
+
+    const { repo: plainRepo, home: plainHome } = passwordRepo();
+    try {
+      const described = describeUnlock({ root: plainRepo.dir, dshHome: plainHome.home, platform: 'linux', machineKey: false });
+      assert.deepEqual(described.password_hint, { set: false, text: null }, 'a repository without a hint reports the empty state');
+    } finally {
+      plainRepo.cleanup();
+      plainHome.cleanup();
     }
   });
 });

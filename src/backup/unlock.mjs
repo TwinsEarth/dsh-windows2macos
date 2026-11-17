@@ -40,6 +40,7 @@ import {
   boundAccountId,
   keysEncryption,
   openRepoKey,
+  passwordHintState,
   readRepoKeys,
 } from './keystore.mjs';
 import { descriptorEncryption, readDescriptor } from './layout.mjs';
@@ -57,6 +58,9 @@ export const UNLOCK_CODES = Object.freeze({
 /** The `account` field for a repository that cannot be read at all. */
 const NO_ACCOUNT = Object.freeze({ bound: false, matched: null, id_hint: null });
 
+/** The `password_hint` field for a repository that cannot be read at all. */
+const NO_PASSWORD_HINT = Object.freeze({ set: false, text: null });
+
 /**
  * Describe, without touching a secret, how this repository can be opened.
  *
@@ -64,12 +68,17 @@ const NO_ACCOUNT = Object.freeze({ bound: false, matched: null, id_hint: null })
  * `account.matched` is `true/false` when the caller supplied the host's current id, and `id_hint` is the masked
  * original id. No full account id ever leaves this function.
  *
+ * The `password_hint` half is the **public** "备注提示词" that may accompany a PIN (`{set, text}`); it is stored
+ * in clear in the repository's `keys.json` by design, so it is shown verbatim to anyone asking how to unlock --
+ * it never contains the PIN itself (the writer refuses a hint equal to the PIN).
+ *
  * @param {{root: string, dshHome: string, platform?: string, runner?: Function, machineKey?: boolean,
  *   accountId?: string|null}} input
  * @returns {{
  *   ok: boolean, initialized: boolean, file: string,
  *   envelopes: string[], machine_available: boolean, machine_reason: string|null,
- *   password_required: boolean, account_supported: boolean,
+ *   password_required: boolean, password_hint: {set: boolean, text: string|null},
+ *   account_supported: boolean,
  *   encryption: 'none'|'sealed'|null, available_paths: string[], warning: string|null,
  *   account: {bound: boolean, matched: boolean|null, id_hint: string|null},
  *   reason_code: string|null, detail: string|null
@@ -95,6 +104,7 @@ export function describeUnlock(input) {
       machine_available: false,
       machine_reason: null,
       password_required: false,
+      password_hint: { ...NO_PASSWORD_HINT },
       account_supported: false,
       encryption,
       available_paths: [],
@@ -122,6 +132,7 @@ export function describeUnlock(input) {
     machine_available: support.available === true,
     machine_reason: support.reason ?? null,
     password_required: envelopes.includes('password'),
+    password_hint: passwordHintState(keys.keys),
     account_supported: boundAccountId(keys.keys) !== null,
     encryption,
     available_paths: availablePaths(keys.keys),
@@ -143,6 +154,7 @@ export function describeUnlock(input) {
  * @param {{root: string, dshHome: string, password?: string|Buffer|null, machineKey?: boolean,
  *   platform?: string, runner?: Function, accountId?: string|null}} input
  * @returns {{ok: boolean, via: string|null, account: {bound: boolean, matched: boolean|null, id_hint: string|null},
+ *   password_hint: {set: boolean, text: string|null},
  *   encryption: 'none'|'sealed'|null, reason_code: string|null, detail: string|null,
  *   attempts: Array<object>, machine_available: boolean, machine_envelope_added: boolean}}
  */
@@ -162,6 +174,8 @@ export function unlockRepo(input) {
     via: opened.unlocked_via,
     encryption: opened.encryption ?? null,
     account: opened.account ?? { ...NO_ACCOUNT },
+    // The public hint is shown even when the attempt failed: it is the thing the operator needs to type the PIN.
+    password_hint: passwordHintState(opened.keys),
     reason_code: opened.reason_code,
     detail: opened.detail,
     attempts: opened.attempts,

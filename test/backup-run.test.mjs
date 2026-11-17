@@ -34,7 +34,7 @@ import {
 import { REGISTER_RESIDUAL_RISK_LINE } from '../src/backup/register-watch.mjs';
 import { main, parseArgs } from '../src/backup/cli.mjs';
 import { runBackup } from '../src/backup/engine.mjs';
-import { bindAccount, readRepoKeys } from '../src/backup/keystore.mjs';
+import { bindAccount, readRepoKeys, setRepositoryPassword } from '../src/backup/keystore.mjs';
 import { descriptorEncryption, readDescriptor } from '../src/backup/layout.mjs';
 import { readIndex, readSnapshot } from '../src/backup/repo.mjs';
 import { listOldVersions, recordSupersededVersion } from '../src/backup/rotation.mjs';
@@ -392,6 +392,51 @@ describe('subplugin: the route and the timer', () => {
     }
   });
 
+  it('exposes the PUBLIC password hint on the unlock and status payloads, never the PIN', async () => {
+    const { home, cleanup: cleanHome } = homeFixture();
+    const { dir, cleanup } = tempDir('w2m-route-hint-');
+    try {
+      const repo = join(dir, 'repo');
+      // Seed an unencrypted repository, then give it a 4-digit PIN and its public hint (the supported path;
+      // an existing PIN is never rotated, so this is how a hinted PIN repository is created).
+      const seed = runBackup({ root: repo, dshHome: home, platform: 'linux', machineKey: false });
+      assert.equal(seed.ok, true, seed.detail);
+      const pinned = setRepositoryPassword({
+        root: repo, dshHome: home, password: '1234', hint: '周六生日', platform: 'linux', machineKey: false,
+      });
+      assert.equal(pinned.ok, true, pinned.detail);
+      assert.equal(pinned.added, true);
+
+      const fake = fakeCtx();
+      apply(fake.ctx, { backupDir: repo, dshHome: home, backupMachineKey: false, ...NO_FIRE });
+      const find = (path) => fake.registrations.find((row) => row.path === path);
+      const get = async (path) => (await find(path).fetch(new Request(`http://local.invalid${path}`, { method: 'GET' }))).json();
+
+      const described = await get(BACKUP_UNLOCK_ROUTE_PATH);
+      assert.equal(described.ok, true);
+      assert.deepEqual(described.password_hint, { set: true, text: '周六生日' }, 'the unlock describe carries the public hint');
+      assert.equal(JSON.stringify(described).includes('"1234"'), false, 'the PIN is never part of the unlock describe');
+
+      // The status half of the run describe carries the same additive field (the panel's status card source).
+      const runDescribe = await get(BACKUP_RUN_ROUTE_PATH);
+      assert.deepEqual(runDescribe.status.password_hint, { set: true, text: '周六生日' }, 'the status payload carries the public hint');
+      assert.equal(JSON.stringify(runDescribe.status).includes('"1234"'), false);
+
+      // The POST attempt carries it too: a failed attempt still tells the operator what the hint says.
+      const attempted = await (await find(BACKUP_UNLOCK_ROUTE_PATH).fetch(new Request(`http://local.invalid${BACKUP_UNLOCK_ROUTE_PATH}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ confirm: UNLOCK_CONFIRM_TOKEN }),
+      }))).json();
+      assert.equal(attempted.ok, false, 'no machine/account credential is available here, so the attempt is the unified refusal');
+      assert.deepEqual(attempted.password_hint, { set: true, text: '周六生日' });
+      assert.equal(JSON.stringify(attempted).includes('"1234"'), false);
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+
   it(
     'answers a confirmed restore plan and archive on Windows (machine envelope, real DPAPI)',
     { skip: process.platform === 'win32' ? false : 'DPAPI is Windows-only' },
@@ -690,6 +735,79 @@ describe('cli: run / list / gc', () => {
       const enabled = capture();
       assert.equal(main(['unlock', '--backup-dir', repo, '--dsh-home', home, '--enable-protection', '--json', '--no-machine-key'], { ...enabled.io, env }), 1);
       assert.equal(JSON.parse(enabled.lines.join('\n')).reason_code, 'BACKUP_PASSWORD_EMPTY');
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+
+  it('parses --hint, prints the public hint, and includes it in --json (no PIN rotation)', () => {
+    const { home, cleanup: cleanHome } = homeFixture();
+    const { dir, cleanup } = tempDir('w2m-cli-hint-');
+    try {
+      const env = { W2M_BACKUP_NO_MACHINE_KEY: '1' };
+      assert.equal(parseArgs(['unlock', '--hint', '周六生日'], env).hint, '周六生日');
+      assert.equal(parseArgs(['unlock', '--hint=周六生日'], env).hint, '周六生日');
+      assert.equal(parseArgs(['unlock'], env).hint, null, 'absent means no hint');
+      assert.match(parseArgs(['unlock', '--hint'], env).error, /--hint needs a hint text/u);
+      assert.match(parseArgs(['unlock', '--hint='], env).error, /--hint needs a hint text/u);
+      const usage = capture();
+      assert.equal(main(['--help'], usage.io), 0);
+      assert.match(usage.lines.join('\n'), /--hint <text>/u, 'the usage names the public hint flag');
+
+      const repo = join(dir, 'repo');
+      const seed = capture();
+      assert.equal(main(['run', '--backup-dir', repo, '--dsh-home', home, '--json'], { ...seed.io, env }), 0, seed.lines.join('\n'));
+
+      const set = capture();
+      const code = main(['unlock', '--backup-dir', repo, '--dsh-home', home, '--set-password', '--hint', '周六生日', '--password-stdin', '--json', '--no-machine-key'], {
+        ...set.io,
+        env,
+        password: '1234',
+      });
+      assert.equal(code, 0, set.lines.join('\n'));
+      const setJson = JSON.parse(set.lines.join('\n'));
+      assert.equal(setJson.ok, true, setJson.detail);
+      assert.equal(setJson.added, true);
+      assert.deepEqual(setJson.hint, { set: true, text: '周六生日' });
+      assert.equal(setJson.weak, true);
+      assert.equal(Object.keys(setJson).some((key) => /pin|password/iu.test(key)), false, 'the result has no PIN field at all');
+
+      // The describe half carries the hint in --json and prints it (with its Chinese label) in the human output.
+      const described = capture();
+      assert.equal(main(['unlock', '--backup-dir', repo, '--dsh-home', home, '--json'], { ...described.io, env }), 0);
+      const describedJson = JSON.parse(described.lines.join('\n'));
+      assert.deepEqual(describedJson.password_hint, { set: true, text: '周六生日' });
+      assert.equal(describedJson.password_required, true);
+
+      const human = capture();
+      assert.equal(main(['unlock', '--backup-dir', repo, '--dsh-home', home], { ...human.io, env }), 0);
+      assert.match(human.lines.join('\n'), /密码提示：周六生日/u, 'the human describe output prints the public hint');
+
+      // The human set-password output prints the hint too, next to the honest weak-PIN warning.
+      const humanRepo = join(dir, 'repo-human');
+      const seedHuman = capture();
+      assert.equal(main(['run', '--backup-dir', humanRepo, '--dsh-home', home, '--json'], { ...seedHuman.io, env }), 0, seedHuman.lines.join('\n'));
+      const humanSet = capture();
+      assert.equal(main(['unlock', '--backup-dir', humanRepo, '--dsh-home', home, '--set-password', '--hint', '周六生日', '--password-stdin', '--no-machine-key'], {
+        ...humanSet.io,
+        env,
+        password: '1234',
+      }), 0, humanSet.lines.join('\n'));
+      assert.match(humanSet.lines.join('\n'), /密码提示：周六生日/u);
+      assert.match(humanSet.lines.join('\n'), /4 位数字 PIN 只是便捷门槛/u);
+
+      // A hint equal to the PIN is refused: argv can never smuggle the PIN in as the "public" hint.
+      const equalRepo = join(dir, 'repo-equal');
+      const seedEqual = capture();
+      assert.equal(main(['run', '--backup-dir', equalRepo, '--dsh-home', home, '--json'], { ...seedEqual.io, env }), 0, seedEqual.lines.join('\n'));
+      const equal = capture();
+      assert.equal(main(['unlock', '--backup-dir', equalRepo, '--dsh-home', home, '--set-password', '--hint', '1234', '--password-stdin', '--json', '--no-machine-key'], {
+        ...equal.io,
+        env,
+        password: '1234',
+      }), 1);
+      assert.equal(JSON.parse(equal.lines.join('\n')).reason_code, 'BACKUP_PASSWORD_HINT_INVALID');
     } finally {
       cleanup();
       cleanHome();
