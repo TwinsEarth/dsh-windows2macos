@@ -14,6 +14,8 @@
 > - **条件 4（删除语义）**：按"实现闭环"处理——`chat-store.load()` 按 tombstone 过滤消息、`prune()` 删除 tombstoned 会话的死行（tombstone 永久保留）、`server._applyChatRecord()` 拒绝晚到的已删会话消息、`server.deleteChatSession()` 是唯一删除写路径、`POST /v1/fleet/messages` 对退役 `session_id` 返回 400 `SESSION_DELETED`；设备面 HTTP 删除路由**明确推迟**（ADR §5.4 写明理由与后续）。
 > - **保留为发布前证据项**：风险 5（relay 版本标签口径）与风险 6（`verify-relay-cluster-mixed.mjs` 混合版本真实运行、三节点 `verify-relay-cluster-phase2.mjs` 留证）不在本次收口范围，见 ADR §12。
 > - **未执行**：不 push、不改包版本、不跑全量 preflight（主线合并后跑一次）。
+- **合并时点的全量 pre-flight（已补记）**：空 `DSH_HOME` + `DSH_RUNTIME_DEPS` 下 **GREEN — 4168 tests / 4144 pass / 0 fail / 24 accepted skip（296 suites）**；这是合并提交 `0b7e8e1` 的记录，保留作历史证据。
+- **当前线（2026-11-18 更新）**：此后新增的备份功能使全量测试增长到 **4236 tests / 4212 pass / 0 fail / 24 accepted skip**，pre-flight 仍 GREEN——引用数字时请注明时点，避免把合并时点当成现状。这两行就是全量 pre-flight 的时点记录。
 
 ---
 
