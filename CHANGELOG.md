@@ -4,6 +4,13 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### session-doctor：把"会话找回"的四类失败变成可执行门禁
+
+- 新增 `scripts/session-doctor.mjs`（只读）：检查 zstd 首帧只含 header、`surfaceOp`（含压缩检查点的对象形态）、`system/message` 保护头、`seq` 连续性与悬空引用、以及 `workspace.json` 未注册会话；`--json` 供还原流程调用。
+- 新增 `test/session-doctor.test.mjs`（11 项）：每条用例对应 2026-11-16/17 复盘里的一次真实失败，另有"健康日志必须零发现项"的防误报控制。
+- 新增 `docs/RETRO-SESSION-RECOVERY-20261117.md`：时间线、四类根因、最终生效做法、门禁清单（含后续版本 G1–G5），以及下一次会话找回的"必须/禁止"一页清单。
+- 本机实测：14 条会话日志全部通过格式检查，唯一发现项为 1 条未注册会话 —— 检查有效且不误报。
+
 ## [3.4.5] - 2026-11-16
 
 - **新增自修复子插件 `dsh-fix`**（`@twinsearth/w2m-dsh-plugin/dsh-fix`，默认启用）：当会话历史引用的图片附件对象已被删除、导致每一轮都以 `TRANSPORT`（`DeepSeek Messages transport failed`）失败时，在进程内自动修复：
