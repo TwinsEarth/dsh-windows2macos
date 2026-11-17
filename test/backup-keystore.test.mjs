@@ -7,7 +7,7 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 
 import {
   KEYSTORE_CODES,
@@ -15,6 +15,7 @@ import {
   WEAK_PIN_WARNING,
   setEncryptionMode,
   setRepositoryPassword,
+  rotatePassword,
   NO_PERMISSION,
   addAccountEnvelope,
   addMachineEnvelope,
@@ -32,6 +33,7 @@ import {
   ENVELOPE_FORMAT,
   MIN_SCRYPT,
   randomDek,
+  unwrapDek,
   validateKeysFile,
   wrapDek,
   wrapOpenDek,
@@ -279,11 +281,11 @@ describe('keystore: adding a password envelope to a machine-only repository', ()
   });
 });
 
-describe('keystore: the public password hint (no PIN rotation by decision)', () => {
+describe('keystore: the public password hint (the --set-password path)', () => {
   const PIN = '1234';
   const HINT = '周六生日';
 
-  /** A machine-only repository: the shape that can still gain a PIN (an existing PIN is never rotated). */
+  /** A machine-only repository: the shape that can still gain a PIN (an existing PIN is never replaced here). */
   function machineOnlyRepo() {
     const { dir, cleanup } = tempDir('w2m-keystore-hint-');
     const root = `${dir}/repo`;
@@ -421,10 +423,10 @@ describe('keystore: the public password hint (no PIN rotation by decision)', () 
         platform: 'win32', runner: fakeRunner, machineKey: true, kdf: KDF,
       });
       assert.equal(again.ok, true, again.detail ?? '');
-      assert.equal(again.added, false, 'no rotation: a second call is a no-op');
+      assert.equal(again.added, false, 'no rotation here: a second set call is a no-op');
       assert.deepEqual(again.hint, { set: true, text: HINT }, 'the stored hint is returned unchanged');
       assert.match(again.detail, /not updated/u);
-      assert.match(again.detail, /not offered by design/u);
+      assert.match(again.detail, /rotatePassword/u, 'the refusal names the command that can change an existing PIN');
       assert.equal(readFileSync(repoKeysPath(root), 'utf8'), before, 'a no-op must not rewrite the document');
       assert.equal(readRepoKeys(root).keys.password_hint.text, HINT);
 
@@ -459,6 +461,254 @@ describe('keystore: the public password hint (no PIN rotation by decision)', () 
       const naked = openRepoKey({ root, dshHome: home, platform: 'linux', machineKey: false, kdf: KDF });
       assert.equal(naked.ok, true, naked.detail ?? '');
       assert.equal(naked.unlocked_via, 'none');
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe('keystore: PIN rotation (docs/BACKUP-DESIGN.md §25.8, the decision reversed)', () => {
+  const OLD_PIN = '1234';
+  const NEW_PIN = '5678';
+
+  /** A sealed repository: machine+password on a fake-DPAPI machine, or password-only when withMachine is false. */
+  function sealedRepo({ withMachine = true, password = OLD_PIN } = {}) {
+    const { dir, cleanup } = tempDir('w2m-keystore-rotate-');
+    const root = `${dir}/repo`;
+    ensureLayout(root);
+    const home = `${dir}/home`;
+    const created = openRepoKey({
+      root,
+      dshHome: home,
+      password,
+      platform: withMachine ? 'win32' : 'linux',
+      runner: withMachine ? fakeRunner : undefined,
+      machineKey: withMachine,
+      kdf: KDF,
+    });
+    assert.equal(created.ok, true, created.detail ?? '');
+    return { dir, root, home, created, cleanup };
+  }
+
+  it('replaces the PIN on a machine+password repository: new PIN opens, old PIN stops, DEK unchanged', () => {
+    const { root, home, created, cleanup } = sealedRepo();
+    try {
+      const before = readFileSync(repoKeysPath(root), 'utf8');
+      const rotated = rotatePassword({
+        root,
+        dshHome: home,
+        newPassword: NEW_PIN,
+        hint: '周六生日',
+        oldPassword: OLD_PIN,
+        platform: 'win32',
+        runner: fakeRunner,
+        kdf: KDF,
+        now: new Date('2026-11-17T12:00:00Z'),
+      });
+      assert.equal(rotated.ok, true, rotated.detail ?? '');
+      assert.equal(rotated.rotated, true);
+      assert.equal(rotated.mode_after, 'sealed');
+      assert.deepEqual(rotated.hint, { set: true, text: '周六生日' });
+      assert.equal(rotated.weak, true, 'a 4-digit PIN is accepted and reported weak, not silently strengthened');
+      assert.equal(rotated.warning, WEAK_PIN_WARNING);
+      assert.equal(rotated.old_password_still_opens, false);
+      assert.equal(rotated.restored, false);
+      assert.equal(existsSync(rotated.backup_file), true, 'the old key document is kept before the write');
+      assert.equal(readFileSync(rotated.backup_file, 'utf8'), before, 'the backup is the pre-rotation document');
+      assert.equal(readFileSync(rotated.backup_file, 'utf8').includes(OLD_PIN), false, 'the PIN is never in clear');
+
+      const document = readRepoKeys(root);
+      assert.equal(document.ok, true);
+      assert.deepEqual(document.keys.envelopes.map((envelope) => envelope.kind), ['machine', 'password'],
+        'the machine envelope is untouched and exactly one password envelope remains');
+      assert.equal(document.keys.envelopes.filter((envelope) => envelope.kind === 'password').length, 1);
+      assert.equal(document.keys.password_hint.text, '周六生日', 'the hint is replaced in the same write');
+      assert.match(document.keys.password_hint.updated_at, /^\d{4}-\d{2}-\d{2}T/u);
+
+      // The new PIN alone opens the SAME data key (existing blocks stay readable); the old PIN opens nothing.
+      const viaNew = openRepoKey({ root, dshHome: home, password: NEW_PIN, platform: 'linux', machineKey: false, kdf: KDF });
+      assert.equal(viaNew.ok, true, viaNew.detail ?? '');
+      assert.equal(viaNew.unlocked_via, 'password');
+      assert.deepEqual(viaNew.dek, created.dek, 'the DEK must not change');
+      const viaOld = openRepoKey({ root, dshHome: home, password: OLD_PIN, platform: 'linux', machineKey: false, kdf: KDF });
+      assert.equal(viaOld.ok, false);
+      assert.equal(viaOld.reason_code, NO_PERMISSION);
+
+      // Neither PIN nor the DEK may leak through the result (the hint is public metadata and may appear).
+      const resultText = JSON.stringify({ ...rotated, backup_file: null, file: null });
+      assert.equal(resultText.includes(created.dek.toString('base64')), false, 'the DEK never appears in the result');
+      assert.equal(resultText.includes(created.dek.toString('hex')), false);
+      assert.equal(resultText.includes(OLD_PIN), false);
+      assert.equal(resultText.includes(NEW_PIN), false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('replaces the hint on one rotation and drops it when the next rotation omits the hint', () => {
+    const { root, home, cleanup } = sealedRepo();
+    try {
+      const first = rotatePassword({
+        root, dshHome: home, newPassword: NEW_PIN, hint: '新提示', oldPassword: OLD_PIN,
+        platform: 'win32', runner: fakeRunner, kdf: KDF,
+      });
+      assert.equal(first.ok, true, first.detail ?? '');
+      assert.deepEqual(first.hint, { set: true, text: '新提示' });
+      assert.equal(readRepoKeys(root).keys.password_hint.text, '新提示');
+
+      const second = rotatePassword({
+        root, dshHome: home, newPassword: '9012', oldPassword: NEW_PIN, platform: 'linux', machineKey: false, kdf: KDF,
+      });
+      assert.equal(second.ok, true, second.detail ?? '');
+      assert.deepEqual(second.hint, { set: false, text: null }, 'an omitted hint drops the stored one (never appends)');
+      assert.equal(readRepoKeys(root).keys.password_hint, undefined, 'a hint without a stored hint is the empty state');
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('rotates a password-only repository when the old PIN is supplied', () => {
+    const { root, home, created, cleanup } = sealedRepo({ withMachine: false });
+    try {
+      assert.deepEqual(readRepoKeys(root).keys.envelopes.map((envelope) => envelope.kind), ['password']);
+      const rotated = rotatePassword({
+        root, dshHome: home, newPassword: NEW_PIN, oldPassword: OLD_PIN, platform: 'linux', machineKey: false, kdf: KDF,
+      });
+      assert.equal(rotated.ok, true, rotated.detail ?? '');
+      assert.deepEqual(rotated.envelopes, ['password'], 'exactly one password envelope remains');
+      assert.equal(existsSync(rotated.backup_file), true);
+      const viaNew = openRepoKey({ root, dshHome: home, password: NEW_PIN, platform: 'linux', machineKey: false, kdf: KDF });
+      assert.equal(viaNew.ok, true, viaNew.detail ?? '');
+      assert.deepEqual(viaNew.dek, created.dek);
+      const viaOld = openRepoKey({ root, dshHome: home, password: OLD_PIN, platform: 'linux', machineKey: false, kdf: KDF });
+      assert.equal(viaOld.ok, false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('refuses with no working credential and with no password envelope, and writes nothing', () => {
+    // A password-only repository whose old PIN is not supplied: nothing on this Linux machine opens it.
+    const locked = sealedRepo({ withMachine: false });
+    try {
+      const before = readFileSync(repoKeysPath(locked.root), 'utf8');
+      const filesBefore = readdirSync(locked.root).sort();
+      const refused = rotatePassword({
+        root: locked.root, dshHome: locked.home, newPassword: NEW_PIN, platform: 'linux', machineKey: false, kdf: KDF,
+      });
+      assert.equal(refused.ok, false);
+      assert.equal(refused.reason_code, NO_PERMISSION, 'the unified refusal code of §11');
+      assert.match(refused.detail, /working credential/u, 'the refusal says rotation needs one');
+      assert.match(refused.detail, /old PIN/u, 'and names the parameter that can supply it');
+      assert.equal(refused.rotated, false);
+      assert.equal(readFileSync(repoKeysPath(locked.root), 'utf8'), before, 'no write without a working credential');
+      assert.deepEqual(readdirSync(locked.root).sort(), filesBefore, 'no keys.json.bak-<ts> was created');
+    } finally {
+      locked.cleanup();
+    }
+
+    // An unencrypted repository opens without a credential, but there is no PIN to rotate: named refusal.
+    const plain = fixture();
+    try {
+      const opened = openRepoKey({ root: plain.root, dshHome: plain.home, platform: 'linux', machineKey: false, kdf: KDF });
+      assert.equal(opened.ok, true, opened.detail ?? '');
+      const filesBefore = readdirSync(plain.root).sort();
+      const refused = rotatePassword({
+        root: plain.root, dshHome: plain.home, newPassword: NEW_PIN, platform: 'linux', machineKey: false, kdf: KDF,
+      });
+      assert.equal(refused.ok, false);
+      assert.equal(refused.reason_code, KEYSTORE_CODES.NO_PASSWORD_ENVELOPE);
+      assert.match(refused.detail, /--set-password/u, 'the refusal points at the command that ADDS a PIN');
+      assert.equal(refused.mode_after, 'none', 'the failed rotation reports the current state, not a new one');
+      assert.deepEqual(readdirSync(plain.root).sort(), filesBefore, 'a rotation never creates a repository or a backup');
+    } finally {
+      plain.cleanup();
+    }
+
+    // A machine-only repository: the machine credential opens it, but it still has no PIN to replace.
+    const machineOnly = fixture();
+    try {
+      const opened = openRepoKey({ root: machineOnly.root, dshHome: machineOnly.home, platform: 'win32', runner: fakeRunner, machineKey: true, kdf: KDF });
+      assert.equal(opened.ok, true, opened.detail ?? '');
+      const refused = rotatePassword({
+        root: machineOnly.root, dshHome: machineOnly.home, newPassword: NEW_PIN,
+        platform: 'win32', runner: fakeRunner, machineKey: true, kdf: KDF,
+      });
+      assert.equal(refused.ok, false);
+      assert.equal(refused.reason_code, KEYSTORE_CODES.NO_PASSWORD_ENVELOPE);
+    } finally {
+      machineOnly.cleanup();
+    }
+  });
+
+  it('restores the pre-rotation document when the old PIN would still open the written one', () => {
+    const { root, home, created, cleanup } = sealedRepo();
+    try {
+      const before = readFileSync(repoKeysPath(root), 'utf8');
+      // The seam: `unwrap` claims the OLD PIN still opens anything. A real rotation cannot produce that, so this is
+      // how the restore path is exercised without shipping a way to create such a document.
+      const unwrapStub = (keys, credentials) => {
+        if (String(credentials?.password) === OLD_PIN) return { dek: created.dek, kind: 'password', attempts: [] };
+        return unwrapDek(keys, credentials);
+      };
+      const failed = rotatePassword({
+        root,
+        dshHome: home,
+        newPassword: NEW_PIN,
+        oldPassword: OLD_PIN,
+        platform: 'win32',
+        runner: fakeRunner,
+        kdf: KDF,
+        unwrap: unwrapStub,
+      });
+      assert.equal(failed.ok, false);
+      assert.equal(failed.reason_code, KEYSTORE_CODES.ROTATION_VERIFY_FAILED);
+      assert.equal(failed.restored, true, 'the .bak copy is put back');
+      assert.equal(failed.old_password_still_opens, true);
+      assert.match(failed.detail, /old PIN/u);
+      assert.match(failed.detail, /restored/u);
+      assert.equal(existsSync(failed.backup_file), true);
+      assert.equal(readFileSync(repoKeysPath(root), 'utf8'), before, 'the document on disk is the pre-rotation one');
+      // After the restore the old PIN works and the new one does not: the failure changed nothing.
+      const oldAfter = openRepoKey({ root, dshHome: home, password: OLD_PIN, platform: 'linux', machineKey: false, kdf: KDF });
+      assert.equal(oldAfter.ok, true, oldAfter.detail ?? '');
+      const newAfter = openRepoKey({ root, dshHome: home, password: NEW_PIN, platform: 'linux', machineKey: false, kdf: KDF });
+      assert.equal(newAfter.ok, false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('refuses a bad hint, a short PIN, the same PIN, and a missing repository without writing', () => {
+    const { root, home, created, cleanup } = sealedRepo();
+    try {
+      const before = readFileSync(repoKeysPath(root), 'utf8');
+      const filesBefore = readdirSync(root).sort();
+      const cases = [
+        { input: { newPassword: 'abc', oldPassword: OLD_PIN }, code: NO_PERMISSION, pattern: /at least 4/u },
+        { input: { newPassword: '', oldPassword: OLD_PIN }, code: CRYPTO_CODES.PASSWORD_EMPTY, pattern: /empty/u },
+        { input: { newPassword: NEW_PIN, oldPassword: OLD_PIN, hint: NEW_PIN }, code: KEYSTORE_CODES.HINT_INVALID, pattern: /new PIN\/password itself/u },
+        { input: { newPassword: NEW_PIN, oldPassword: OLD_PIN, hint: 42 }, code: KEYSTORE_CODES.HINT_INVALID, pattern: /must be a string/u },
+        { input: { newPassword: OLD_PIN, oldPassword: OLD_PIN }, code: KEYSTORE_CODES.ROTATION_VERIFY_FAILED, pattern: /identical/u },
+      ];
+      for (const entry of cases) {
+        const refused = rotatePassword({
+          root, dshHome: home, platform: 'win32', runner: fakeRunner, kdf: KDF, ...entry.input,
+        });
+        assert.equal(refused.ok, false, `rotation ${JSON.stringify(entry.input)} must be refused`);
+        assert.equal(refused.reason_code, entry.code);
+        assert.match(refused.detail, entry.pattern);
+        assert.equal(readFileSync(repoKeysPath(root), 'utf8'), before, 'a refused rotation must not write');
+        assert.deepEqual(readdirSync(root).sort(), filesBefore, 'a refused rotation must not leave a backup copy');
+      }
+      // The same PIN case never even used the created DEK; keep the machine-sealed fixture honest about that.
+      assert.equal(created.ok, true);
+
+      const missing = rotatePassword({
+        root: `${root}-missing`, dshHome: home, newPassword: NEW_PIN, platform: 'linux', machineKey: false, kdf: KDF,
+      });
+      assert.equal(missing.ok, false);
+      assert.equal(missing.reason_code, 'BACKUP_DIR_NOT_A_REPO', 'rotation never creates a repository');
     } finally {
       cleanup();
     }

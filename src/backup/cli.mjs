@@ -19,6 +19,11 @@
  * (stored in clear in the repository's `keys.json` and shown by `unlock`), so putting it on the command line is
  * the intended use. A hint equal to the PIN is refused by the keystore, so the PIN cannot be smuggled in as one.
  *
+ * `unlock --rotate-password` follows the same rule for both secrets: the new PIN comes from stdin or
+ * `W2M_BACKUP_PASSWORD`, and the old PIN (only needed when the machine/account path cannot open the repository)
+ * comes from `W2M_BACKUP_OLD_PASSWORD` or `--old-password-stdin`. With one stdin stream both are passed as two
+ * lines (`old\nnew`). The hint stays public metadata, so `--hint` may be on argv, and `--clear-hint` drops it.
+ *
  * Exit codes: 0 success; 1 a named refusal (the code is printed); 2 usage error.
  */
 
@@ -48,6 +53,7 @@ import {
   MIN_PASSWORD_BYTES,
   UNENCRYPTED_WARNING,
   WEAK_PIN_WARNING,
+  rotatePassword,
   setEncryptionMode,
   setRepositoryPassword,
 } from './keystore.mjs';
@@ -242,7 +248,8 @@ function usage() {
     '  list                snapshots in the repository, newest first (read-only)',
     '  gc                  remove unreferenced blocks and prune old versions (writes)',
     '  old-backfill        write the optional sealed whole-file copy for old/ records that predate full mode (writes)',
-    '  unlock              which credential opens this repository (read-only; --check tries it)',
+    '  unlock              which credential opens this repository (read-only; --check tries it). Writing modes:',
+    '                      --set-password adds a PIN, --rotate-password changes an existing one',
     '  verify              re-hash every snapshot: blocks, bytes, manifests, index, old records',
     '  archive             pack archived sessions (or --scope all) into one .tar.zst (writes)',
     '  restore             plan a restore; --apply writes sessions, attachments and the workspace registry',
@@ -289,19 +296,33 @@ function usage() {
     '  --set-password      unlock: add a password/PIN envelope to this repository (reads it from stdin/env) so it',
     '                      opens without this machine. 4-6 digits are the expected PIN: convenience, not',
     '                      confidentiality (the CLI prints that warning). Also turns an unencrypted repository',
-    '                      back into a sealed one.',
+    '                      back into a sealed one. A repository that already has a PIN is a no-op: use',
+    '                      --rotate-password to change it.',
     '  --enable-protection alias of --set-password (turning protection on needs a PIN/password)',
+    '  --rotate-password   unlock: change the existing PIN/PIN hint: open with a working credential (machine, a',
+    '                      matching account id, or the old PIN), remove every old PIN envelope, write one new PIN',
+    '                      envelope around the SAME data key, then verify the new PIN opens it and the OLD PIN no',
+    '                      longer does (keys.json is copied to .bak-<ts> first and restored if a check fails).',
+    '                      The new PIN comes from stdin/env like --set-password; the old PIN (only needed when the',
+    '                      machine/account path cannot open the repository) from W2M_BACKUP_OLD_PASSWORD or',
+    '                      --old-password-stdin. Without --hint the old public hint is dropped.',
     '  --hint <text>       unlock --set-password: attach a PUBLIC hint/note to the PIN (e.g. --hint "周六生日"),',
     '                      stored in the repository and printed by unlock. It is NOT a secret: it is plain text',
-    '                      in keys.json, so argv is allowed for it (unlike the PIN, which stays on stdin). No PIN',
-    '                      rotation by decision: once a PIN is set it cannot be changed and a supplied hint is not',
-    '                      updated; a forgotten PIN means the machine/account path or creating the repository anew.',
+    '                      in keys.json, so argv is allowed for it (unlike the PIN, which stays on stdin).',
+    '                      unlock --rotate-password: REPLACE the stored hint with this text; omitting it (or',
+    '                      --clear-hint) drops the old hint. A new hint only replaces, it never appends.',
+    '  --clear-hint        unlock --rotate-password: remove the stored public hint (the explicit spelling of omitting',
+    '                      --hint). Cannot be combined with --hint.',
+    '  --old-password-stdin unlock --rotate-password: read the OLD PIN from stdin; the new PIN then comes from',
+    '                      W2M_BACKUP_PASSWORD (stdin is already taken). Not combinable with --password-stdin;',
+    '                      that flag accepts both secrets as two lines: old\\nnew.',
     '  --disable-protection unlock: turn protection OFF: open with existing credentials, write an open envelope',
     '                      carrying the same data key; the repository then unlocks with no credential at all.',
     '                      Requires --confirm disable-protection because it weakens the repository.',
     '  --confirm <token>   unlock --disable-protection: the explicit confirmation token (disable-protection)',
-    '  --password-stdin    run/restore/unlock --check/--set-password/old-backfill: read the PIN/password from',
-    '                      stdin (never argv) (environment fallback: W2M_BACKUP_PASSWORD, same "never argv" rule)',
+    '  --password-stdin    run/restore/unlock --check/--set-password/--rotate-password/old-backfill: read the',
+    '                      PIN/password from stdin (never argv) (environment fallback: W2M_BACKUP_PASSWORD, same',
+    '                      "never argv" rule). With --rotate-password, two lines are accepted: old PIN, then new PIN.',
     '  --no-machine-key    run: do not use (or create) the OS-keystore machine envelope',
     '  --no-future-append  run: skip the "next append still loads" simulation (it decodes every log)',
     '',
@@ -349,6 +370,11 @@ export function parseArgs(argv, env = process.env) {
     check: false,
     setPassword: false,
     enableProtection: false,
+    // PIN rotation (docs/BACKUP-DESIGN.md §25.8): replaces the existing password envelope with a new one around the
+    // same DEK. The old PIN and the new PIN never share a channel: see `rotateSecretsFor`.
+    rotatePassword: false,
+    oldPasswordStdin: false,
+    clearHint: false,
     disableProtection: false,
     // The public "备注提示词" for a new PIN. Not a secret: it is stored in clear in keys.json, so argv is allowed
     // for it (the PIN itself never is).
@@ -378,6 +404,9 @@ export function parseArgs(argv, env = process.env) {
     else if (arg === '--check') options.check = true;
     else if (arg === '--set-password') options.setPassword = true;
     else if (arg === '--enable-protection') options.enableProtection = true;
+    else if (arg === '--rotate-password') options.rotatePassword = true;
+    else if (arg === '--old-password-stdin') options.oldPasswordStdin = true;
+    else if (arg === '--clear-hint') options.clearHint = true;
     else if (arg === '--disable-protection') options.disableProtection = true;
     else if (arg === '--hint') {
       const raw = rest.shift() ?? '';
@@ -801,6 +830,57 @@ function passwordFor(options, io) {
   return typeof fromEnv === 'string' && fromEnv.length > 0 ? fromEnv : null;
 }
 
+/** Read all of stdin once (a real run reads fd 0; `io.stdinText` is the test seam, like `io.password`). */
+function stdinTextFor(io) {
+  if (typeof io.stdinText === 'string') return io.stdinText;
+  try {
+    return fs.readFileSync(0, 'utf8');
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * The two rotation secrets, from their documented channels.
+ *
+ * The new PIN follows `--set-password` exactly: stdin (`--password-stdin`) or `W2M_BACKUP_PASSWORD`, never argv.
+ * The old PIN is needed only when the machine/account path cannot open the repository, and comes from
+ * `W2M_BACKUP_OLD_PASSWORD` or `--old-password-stdin`. Both on one stdin is the two-line form `old\nnew`
+ * (documented in the usage): when the supplied text has two lines the first is the old PIN, one line is the new
+ * PIN. A trailing newline is not a second line (so the ordinary single-secret stdin shape keeps working).
+ *
+ * @param {object} options parsed CLI options
+ * @param {{password?: string, oldPassword?: string, stdinText?: string,
+ *   env?: Record<string, string|undefined>}} io injection seam (tests pass secrets here; production reads stdin)
+ * @returns {{newPassword: string|null, oldPassword: string|null}}
+ */
+function rotateSecretsFor(options, io) {
+  const env = io.env ?? process.env;
+  let newPassword = typeof io.password === 'string' ? io.password : null;
+  let oldPassword = typeof io.oldPassword === 'string' ? io.oldPassword : null;
+  if (options.passwordStdin === true && newPassword === null) {
+    const lines = stdinTextFor(io).replace(/\r\n/g, '\n').split('\n');
+    if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop();
+    if (lines.length > 1) {
+      if (oldPassword === null) oldPassword = lines[0];
+      newPassword = lines[1];
+    } else {
+      newPassword = lines[0] ?? '';
+    }
+  } else if (options.oldPasswordStdin === true && oldPassword === null) {
+    oldPassword = stdinTextFor(io).replace(/\r?\n$/, '');
+  }
+  if (newPassword === null) {
+    const fromEnv = env.W2M_BACKUP_PASSWORD;
+    newPassword = typeof fromEnv === 'string' && fromEnv.length > 0 ? fromEnv : null;
+  }
+  if (oldPassword === null) {
+    const fromEnv = env.W2M_BACKUP_OLD_PASSWORD;
+    oldPassword = typeof fromEnv === 'string' && fromEnv.length > 0 ? fromEnv : null;
+  }
+  return { newPassword, oldPassword };
+}
+
 /** Resolve the repository root, or report the layout refusal. */
 function resolveDir(options, env) {
   try {
@@ -1038,9 +1118,19 @@ export function main(argv, io = {}) {
       writeErr(`${resolved.error.code}: ${resolved.error.detail}`);
       return 1;
     }
+    // These two flags exist only for rotation; naming them without --rotate-password is a usage error rather than a
+    // silently ignored request (an ignored "clear the hint" is exactly the kind of surprise the CLI avoids).
+    if (options.clearHint === true && options.rotatePassword !== true) {
+      writeErr('error: --clear-hint only applies to --rotate-password\n\n' + usage());
+      return 2;
+    }
+    if (options.oldPasswordStdin === true && options.rotatePassword !== true) {
+      writeErr('error: --old-password-stdin only applies to --rotate-password\n\n' + usage());
+      return 2;
+    }
     if (options.disableProtection === true) {
-      if (options.setPassword === true || options.enableProtection === true) {
-        writeErr('error: --disable-protection cannot be combined with --set-password/--enable-protection\n\n' + usage());
+      if (options.setPassword === true || options.enableProtection === true || options.rotatePassword === true) {
+        writeErr('error: --disable-protection cannot be combined with --set-password/--enable-protection/--rotate-password\n\n' + usage());
         return 2;
       }
       // Turning protection off weakens the repository: it needs an explicit token, exactly like a write route.
@@ -1076,6 +1166,49 @@ export function main(argv, io = {}) {
           write(`file              : ${result.file}`);
         }
         write(`warning           : ${result.warning ?? UNENCRYPTED_WARNING}`);
+      }
+      return result.ok === true ? 0 : 1;
+    }
+    if (options.rotatePassword === true) {
+      if (options.setPassword === true || options.enableProtection === true) {
+        writeErr('error: --rotate-password cannot be combined with --set-password/--enable-protection (rotation changes an existing PIN; --set-password adds one)\n\n' + usage());
+        return 2;
+      }
+      if (options.clearHint === true && options.hint !== null) {
+        writeErr('error: --clear-hint cannot be combined with --hint (omit --hint to drop the old hint)\n\n' + usage());
+        return 2;
+      }
+      if (options.passwordStdin === true && options.oldPasswordStdin === true) {
+        writeErr('error: --password-stdin and --old-password-stdin both read stdin; for --rotate-password pass both secrets with --password-stdin as two lines (old, then new)\n\n' + usage());
+        return 2;
+      }
+      const secrets = rotateSecretsFor(options, io);
+      const result = rotatePassword({
+        root: resolved.dir,
+        dshHome: options.dshHome,
+        newPassword: secrets.newPassword ?? '',
+        oldPassword: secrets.oldPassword,
+        hint: options.clearHint === true ? null : (options.hint ?? undefined),
+        accountId: options.accountId ?? undefined,
+        platform: process.platform,
+        machineKey: options.noMachineKey === true ? false : undefined,
+        now: io.now?.() ?? new Date(),
+      });
+      if (options.json) {
+        write(JSON.stringify(result, null, 2));
+      } else if (result.ok !== true) {
+        writeErr(`${result.reason_code}: ${result.detail}`);
+      } else {
+        write('w2m-backup unlock --rotate-password');
+        write('');
+        write('rotated : yes');
+        write(`mode : ${result.mode_after}`);
+        write(`envelopes : ${result.envelopes.join(', ')}`);
+        write(`hint : ${result.hint.set === true ? result.hint.text : '(cleared)'}`);
+        write(`keys backup : ${result.backup_file}`);
+        write(`file : ${result.file}`);
+        write('old PIN no longer opens : confirmed');
+        if (result.weak === true) write(`warning : ${result.warning ?? WEAK_PIN_WARNING}`);
       }
       return result.ok === true ? 0 : 1;
     }

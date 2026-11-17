@@ -1826,7 +1826,7 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
     }
   });
 
-  it('shows the public password hint in the dialog and says there is no PIN rotation', async () => {
+  it('shows the public password hint in the dialog and the terminal rotation command', async () => {
     const host = mountBackupPage(unlockDialogHost({ password_hint: { set: true, text: '周六生日' } }));
     try {
       await host.settle();
@@ -1836,11 +1836,20 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
       assert.ok(hint !== undefined, 'the public hint line is rendered in the password section');
       assert.ok(collectText(hint).join('').includes('密码提示：周六生日'), 'the hint is shown verbatim, with its label');
       const dialogText = collectText(dialog).join('\n');
-      assert.ok(dialogText.includes('不提供 PIN 轮换'), 'the dialog states that PIN rotation is not offered by design');
-      assert.ok(dialogText.includes('本机/原账户路径'), 'the no-rotation note names the recovery paths');
-      assert.equal(inDialog(host.handle.tree, (node) => node.props?.['data-w2m-backup-unlock-hint-none'] !== undefined).length, 0);
+      // The earlier "no rotation" decision is reversed: the notice now explains that rotation exists, in a terminal.
+      assert.ok(dialogText.includes('轮换需要在终端运行：旧凭据解开 → 去掉旧 PIN → 写新 PIN（旧 PIN 随后失效）'),
+        'the dialog states that rotation exists and runs in a terminal');
+      assert.equal(dialogText.includes('不提供 PIN 轮换'), false, 'the old "no rotation" note is gone');
+      const rotateCommand = inDialog(host.handle.tree, (node) => node.props?.['data-w2m-backup-unlock-rotate-command'] === 'true')[0];
+      assert.ok(rotateCommand !== undefined, 'the copyable rotation command is rendered in the password section');
+      assert.equal(collectText(rotateCommand).join(''), 'w2m-backup unlock --rotate-password --hint "…"',
+        'the exact rotation command is shown in a code block');
+      assert.equal(inDialog(host.handle.tree, (node) => node.props?.['data-w2m-backup-unlock-rotate-copy'] === 'true').length, 1,
+        'the rotation command carries its own copy button');
+      assert.equal(inDialog(host.handle.tree, (node) => node.props?.['data-w2m-backup-unlock-no-rotation'] !== undefined).length, 0,
+        'the old no-rotation marker is not rendered any more');
       assert.equal(inDialog(host.handle.tree, (node) => node.type === 'input' || node.type === 'textarea').length, 0,
-        'a public hint is displayed text, never an input: the dialog still accepts no password');
+        'a public hint and a copyable command are displayed text, never inputs: the dialog still accepts no password');
     } finally {
       host.handle.unmount();
     }
@@ -1941,6 +1950,8 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
     assert.equal(exports.backupUnlockLocalAvailable({ encryption: 'sealed', machine_available: false, account: { bound: true, matched: false } }), false);
     assert.equal(exports.BACKUP_UNLOCK_COMMAND, 'w2m-backup unlock --check --password-stdin');
     assert.equal(exports.BACKUP_DISABLE_PROTECTION_COMMAND, 'w2m-backup unlock --disable-protection --confirm disable-protection');
+    assert.equal(exports.BACKUP_ROTATE_COMMAND, 'w2m-backup unlock --rotate-password --hint "…"',
+      'the rotation command is copyable text, with a placeholder for the public hint');
   });
 
   it('posts exactly {confirm:"unlock"} from the dialog and never sends a password', async () => {
@@ -2045,6 +2056,13 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
       const copied = inDialog(host.handle.tree, (node) => node.props?.['data-w2m-backup-unlock-copy'] === 'true')[0];
       assert.equal(copied.props['data-copied'], 'true', 'the copied state is visible');
       assert.ok(collectText(copied).join('').includes('已复制'), 'the label changes to the copied copy');
+      // The rotation command has its own copy control; both commands are terminal-only text.
+      inDialog(host.handle.tree, (node) => node.props?.['data-w2m-backup-unlock-rotate-copy'] === 'true')[0].props.onClick();
+      await host.settle();
+      assert.deepEqual(writes, ['w2m-backup unlock --check --password-stdin', 'w2m-backup unlock --rotate-password --hint "…"'],
+        'the clipboard receives the exact rotation command too');
+      const copiedRotate = inDialog(host.handle.tree, (node) => node.props?.['data-w2m-backup-unlock-rotate-copy'] === 'true')[0];
+      assert.equal(copiedRotate.props['data-copied'], 'true', 'the rotation copy state is visible');
       // The host now reports another account; the refresh must re-read and re-render the state.
       unlockPayload.machine_available = false;
       unlockPayload.account = { bound: true, matched: false, id_hint: '…abcd' };
@@ -2108,7 +2126,8 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
       'panel.backup.unlock.dialog.optionBHint',
       'panel.backup.unlock.dialog.hintLabel',
       'panel.backup.unlock.dialog.hintNone',
-      'panel.backup.unlock.dialog.noRotation',
+      'panel.backup.unlock.dialog.rotation',
+      'panel.backup.unlock.dialog.rotationCommand',
       'panel.backup.unlock.dialog.noPasswordNeeded',
       'panel.backup.unlock.dialog.commandCaption',
       'panel.backup.unlock.dialog.copy',
@@ -2134,6 +2153,11 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
       'the notice says the password never enters the browser');
     assert.ok(dictionary.zh['panel.backup.unlock.dialog.optionBHint'].includes('终端'),
       'option B says the password is typed in a terminal');
+    assert.ok(dictionary.zh['panel.backup.unlock.dialog.rotation'].includes('终端')
+      && dictionary.zh['panel.backup.unlock.dialog.rotation'].includes('旧 PIN'),
+      'the rotation note says rotation runs in a terminal and invalidates the old PIN');
+    assert.equal(dictionary.zh['panel.backup.unlock.dialog.noRotation'], undefined,
+      'the old "no rotation" key is gone (the decision was reversed)');
     assert.notEqual(dictionary.zh['panel.backup.unlock.dialog.copy'], dictionary.en['panel.backup.unlock.dialog.copy'],
       'the copy label is translated, not copied');
   });

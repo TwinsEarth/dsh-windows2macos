@@ -8,7 +8,8 @@ import { join } from 'node:path';
 
 import { runBackup } from '../src/backup/engine.mjs';
 import { describeUnlock, machineSecretAvailable, unlockRepo } from '../src/backup/unlock.mjs';
-import { UNENCRYPTED_WARNING, bindAccount, setRepositoryPassword } from '../src/backup/keystore.mjs';
+import { UNENCRYPTED_WARNING, bindAccount, rotatePassword, setRepositoryPassword } from '../src/backup/keystore.mjs';
+import { MIN_SCRYPT } from '../src/backup/crypto.mjs';
 import {
   applyRegistryRestore,
   findWorkspaceForSlug,
@@ -222,6 +223,47 @@ describe('unlock: the public password hint (docs/BACKUP-DESIGN.md §25.5)', () =
     } finally {
       plainRepo.cleanup();
       plainHome.cleanup();
+    }
+  });
+});
+
+describe('unlock: rotation updates the hint and invalidates the old PIN (docs/BACKUP-DESIGN.md §25.8)', () => {
+  const KDF = { algo: 'scrypt', N: MIN_SCRYPT.N, r: MIN_SCRYPT.r, p: MIN_SCRYPT.p, keylen: 32 };
+
+  it('reports the new hint and password path, and the old PIN no longer unlocks', () => {
+    const { repo, home } = passwordRepo();
+    try {
+      const rotated = rotatePassword({
+        root: repo.dir,
+        dshHome: home.home,
+        newPassword: '5678',
+        hint: '新提示',
+        oldPassword: PASSWORD,
+        platform: 'linux',
+        machineKey: false,
+        kdf: KDF,
+      });
+      assert.equal(rotated.ok, true, rotated.detail ?? '');
+
+      const described = describeUnlock({ root: repo.dir, dshHome: home.home, platform: 'linux', machineKey: false });
+      assert.equal(described.ok, true);
+      assert.deepEqual(described.password_hint, { set: true, text: '新提示' }, 'describe shows the replaced hint');
+      assert.equal(described.password_required, true);
+      assert.deepEqual(described.available_paths, ['password'], 'the credential path is still exactly the password one');
+      assert.equal(JSON.stringify(described).includes('5678'), false, 'the new PIN never travels in the describe payload');
+
+      const viaNew = unlockRepo({ root: repo.dir, dshHome: home.home, password: '5678', platform: 'linux', machineKey: false });
+      assert.equal(viaNew.ok, true, viaNew.detail ?? '');
+      assert.equal(viaNew.via, 'password');
+      assert.deepEqual(viaNew.password_hint, { set: true, text: '新提示' });
+
+      const viaOld = unlockRepo({ root: repo.dir, dshHome: home.home, password: PASSWORD, platform: 'linux', machineKey: false });
+      assert.equal(viaOld.ok, false, 'the rotated-away PIN must not unlock any more');
+      assert.equal(viaOld.reason_code, 'BACKUP_NO_PERMISSION');
+      assert.deepEqual(viaOld.password_hint, { set: true, text: '新提示' });
+    } finally {
+      repo.cleanup();
+      home.cleanup();
     }
   });
 });

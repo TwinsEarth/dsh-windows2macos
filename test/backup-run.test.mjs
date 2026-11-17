@@ -7,7 +7,7 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import {
@@ -34,7 +34,8 @@ import {
 import { REGISTER_RESIDUAL_RISK_LINE } from '../src/backup/register-watch.mjs';
 import { main, parseArgs } from '../src/backup/cli.mjs';
 import { runBackup } from '../src/backup/engine.mjs';
-import { bindAccount, readRepoKeys, setRepositoryPassword } from '../src/backup/keystore.mjs';
+import { bindAccount, openRepoKey, readRepoKeys, setRepositoryPassword } from '../src/backup/keystore.mjs';
+import { MIN_SCRYPT } from '../src/backup/crypto.mjs';
 import { descriptorEncryption, readDescriptor } from '../src/backup/layout.mjs';
 import { readIndex, readSnapshot } from '../src/backup/repo.mjs';
 import { listOldVersions, recordSupersededVersion } from '../src/backup/rotation.mjs';
@@ -808,6 +809,164 @@ describe('cli: run / list / gc', () => {
         password: '1234',
       }), 1);
       assert.equal(JSON.parse(equal.lines.join('\n')).reason_code, 'BACKUP_PASSWORD_HINT_INVALID');
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+
+  it('rotate-password: flags, two-line stdin, --json shape, and the old PIN stops opening it', () => {
+    const { home, cleanup: cleanHome } = homeFixture();
+    const { dir, cleanup } = tempDir('w2m-cli-rotate-');
+    try {
+      const repo = join(dir, 'repo');
+      const env = { W2M_BACKUP_NO_MACHINE_KEY: '1' };
+      const kdf = { algo: 'scrypt', N: MIN_SCRYPT.N, r: MIN_SCRYPT.r, p: MIN_SCRYPT.p, keylen: 32 };
+      // Seed a password-only sealed repository directly: the CLI carries no KDF flag, so the seed uses the fast
+      // test parameters and every rotation below still exercises the real CLI path.
+      const seeded = openRepoKey({ root: repo, dshHome: home, password: '1234', platform: 'linux', machineKey: false, kdf });
+      assert.equal(seeded.ok, true, seeded.detail ?? '');
+
+      // Flag parsing and the usage: the command plus both secret channels are documented, including `old\nnew`.
+      const parsed = parseArgs(['unlock', '--rotate-password', '--old-password-stdin', '--clear-hint'], env);
+      assert.equal(parsed.error, undefined);
+      assert.equal(parsed.rotatePassword, true);
+      assert.equal(parsed.oldPasswordStdin, true);
+      assert.equal(parsed.clearHint, true);
+      assert.equal(parseArgs(['unlock'], env).rotatePassword, false);
+      assert.equal(parseArgs(['unlock'], env).clearHint, false);
+      const help = capture();
+      assert.equal(main(['--help'], help.io), 0);
+      const usageText = help.lines.join('\n');
+      assert.match(usageText, /--rotate-password/u);
+      assert.match(usageText, /--old-password-stdin/u);
+      assert.match(usageText, /--clear-hint/u);
+      assert.match(usageText, /two lines: old\\nnew/u, 'the usage documents the two-line stdin format');
+
+      // Two-line stdin: the old PIN, then the new PIN. --hint replaces the stored public hint in the same write.
+      const rotated = capture();
+      const code = main(['unlock', '--backup-dir', repo, '--dsh-home', home, '--rotate-password', '--hint', '周六生日', '--password-stdin', '--json', '--no-machine-key'], {
+        ...rotated.io,
+        env,
+        stdinText: '1234\n5678\n',
+      });
+      assert.equal(code, 0, rotated.lines.join('\n'));
+      const payload = JSON.parse(rotated.lines.join('\n'));
+      assert.equal(payload.ok, true, payload.detail);
+      assert.equal(payload.rotated, true);
+      assert.equal(payload.mode_after, 'sealed');
+      assert.deepEqual(payload.envelopes, ['password'], 'exactly one password envelope remains');
+      assert.equal(payload.old_password_still_opens, false);
+      assert.deepEqual(payload.hint, { set: true, text: '周六生日' });
+      assert.equal(payload.weak, true);
+      assert.equal(typeof payload.backup_file, 'string');
+      assert.equal(existsSync(payload.backup_file), true, 'the pre-rotation key document is kept');
+      assert.equal(readRepoKeys(repo).keys.envelopes.filter((envelope) => envelope.kind === 'password').length, 1);
+      assert.equal(readRepoKeys(repo).keys.password_hint.text, '周六生日');
+
+      // Old PIN refused, new PIN opens, and the describe half carries the (public) replaced hint.
+      const oldCheck = capture();
+      assert.equal(main(['unlock', '--backup-dir', repo, '--dsh-home', home, '--check', '--json', '--no-machine-key'], {
+        ...oldCheck.io, env, password: '1234',
+      }), 1);
+      assert.equal(JSON.parse(oldCheck.lines.join('\n')).check.reason_code, 'BACKUP_NO_PERMISSION');
+      const newCheck = capture();
+      assert.equal(main(['unlock', '--backup-dir', repo, '--dsh-home', home, '--check', '--json', '--no-machine-key'], {
+        ...newCheck.io, env, password: '5678',
+      }), 0);
+      const newPayload = JSON.parse(newCheck.lines.join('\n'));
+      assert.equal(newPayload.check.via, 'password');
+      assert.deepEqual(newPayload.password_hint, { set: true, text: '周六生日' });
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+
+  it('rotate-password: old PIN from stdin/env, --clear-hint, human output, and the named refusals', () => {
+    const { home, cleanup: cleanHome } = homeFixture();
+    const { dir, cleanup } = tempDir('w2m-cli-rotate2-');
+    try {
+      const repo = join(dir, 'repo');
+      const kdf = { algo: 'scrypt', N: MIN_SCRYPT.N, r: MIN_SCRYPT.r, p: MIN_SCRYPT.p, keylen: 32 };
+      const env = { W2M_BACKUP_NO_MACHINE_KEY: '1' };
+      openRepoKey({ root: repo, dshHome: home, password: '1234', platform: 'linux', machineKey: false, kdf });
+
+      // --old-password-stdin reads the OLD PIN from stdin; the new PIN then comes from W2M_BACKUP_PASSWORD.
+      const human = capture();
+      const humanCode = main(['unlock', '--backup-dir', repo, '--dsh-home', home, '--rotate-password', '--hint', '旧提示', '--old-password-stdin', '--no-machine-key'], {
+        ...human.io,
+        env: { ...env, W2M_BACKUP_PASSWORD: '5678' },
+        stdinText: '1234',
+      });
+      assert.equal(humanCode, 0, human.lines.join('\n'));
+      const humanText = human.lines.join('\n');
+      assert.match(humanText, /rotated : yes/u);
+      assert.match(humanText, /hint : 旧提示/u);
+      assert.match(humanText, /keys backup : /u);
+      assert.match(humanText, /old PIN no longer opens : confirmed/u);
+      assert.match(humanText, /4 位数字 PIN 只是便捷门槛/u);
+      assert.equal(readRepoKeys(repo).keys.password_hint.text, '旧提示');
+
+      // --clear-hint drops the public hint (same write as the new envelope). The old PIN now comes from the previous
+      // rotation's PIN; the new one still travels through the environment, never argv.
+      const cleared = capture();
+      assert.equal(main(['unlock', '--backup-dir', repo, '--dsh-home', home, '--rotate-password', '--clear-hint', '--old-password-stdin', '--json', '--no-machine-key'], {
+        ...cleared.io,
+        env: { ...env, W2M_BACKUP_PASSWORD: '9012' },
+        stdinText: '5678\n',
+      }), 0, cleared.lines.join('\n'));
+      const clearedPayload = JSON.parse(cleared.lines.join('\n'));
+      assert.equal(clearedPayload.ok, true, clearedPayload.detail);
+      assert.deepEqual(clearedPayload.hint, { set: false, text: null });
+      assert.equal(readRepoKeys(repo).keys.password_hint, undefined);
+
+      // W2M_BACKUP_OLD_PASSWORD is the other old-PIN channel; the new PIN can still be injectable like `passwordFor`.
+      const envOld = capture();
+      assert.equal(main(['unlock', '--backup-dir', repo, '--dsh-home', home, '--rotate-password', '--json', '--no-machine-key'], {
+        ...envOld.io,
+        env: { ...env, W2M_BACKUP_OLD_PASSWORD: '9012' },
+        password: '3456',
+      }), 0, envOld.lines.join('\n'));
+      assert.equal(JSON.parse(envOld.lines.join('\n')).ok, true);
+
+      // No working credential: the old PIN channels are empty, so the refusal names what rotation needs.
+      const backupsBefore = readdirSync(repo).filter((name) => name.startsWith('keys.json.bak-')).length;
+      const keyBefore = readFileSync(join(repo, 'keys.json'), 'utf8');
+      const locked = capture();
+      assert.equal(main(['unlock', '--backup-dir', repo, '--dsh-home', home, '--rotate-password', '--json', '--no-machine-key'], {
+        ...locked.io, env, password: '7777',
+      }), 1);
+      const lockedPayload = JSON.parse(locked.lines.join('\n'));
+      assert.equal(lockedPayload.reason_code, 'BACKUP_NO_PERMISSION');
+      assert.match(lockedPayload.detail, /working credential/u);
+      assert.equal(readFileSync(join(repo, 'keys.json'), 'utf8'), keyBefore, 'a refused rotation writes nothing');
+      assert.equal(readdirSync(repo).filter((name) => name.startsWith('keys.json.bak-')).length, backupsBefore);
+
+      // A repository without a PIN: rotation is not "add a PIN" (that is --set-password), and nothing is written.
+      const openRepo = join(dir, 'open-repo');
+      const seedOpen = capture();
+      assert.equal(main(['run', '--backup-dir', openRepo, '--dsh-home', home, '--json'], { ...seedOpen.io, env }), 0);
+      const noPin = capture();
+      assert.equal(main(['unlock', '--backup-dir', openRepo, '--dsh-home', home, '--rotate-password', '--json', '--no-machine-key'], {
+        ...noPin.io, env, password: '1234',
+      }), 1);
+      assert.equal(JSON.parse(noPin.lines.join('\n')).reason_code, 'BACKUP_NO_PASSWORD_ENVELOPE');
+      assert.equal(readdirSync(openRepo).some((name) => name.startsWith('keys.json.bak-')), false);
+
+      // Flag conflicts are usage errors (exit 2), never silently ignored requests.
+      const conflicts = [
+        ['unlock', '--rotate-password', '--set-password'],
+        ['unlock', '--rotate-password', '--disable-protection', '--confirm', 'disable-protection'],
+        ['unlock', '--clear-hint'],
+        ['unlock', '--old-password-stdin'],
+        ['unlock', '--rotate-password', '--hint', 'x', '--clear-hint'],
+        ['unlock', '--rotate-password', '--password-stdin', '--old-password-stdin'],
+      ];
+      for (const argv of conflicts) {
+        const conflict = capture();
+        assert.equal(main(argv, { ...conflict.io, env }), 2, `expected a usage error for: ${argv.join(' ')}`);
+      }
     } finally {
       cleanup();
       cleanHome();

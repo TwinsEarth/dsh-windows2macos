@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### PIN 轮换：旧凭据解开 → 去掉旧 PIN → 写新 PIN（撤销"不提供轮换"的决定，未发布）
+
+- **用户决定（撤销）**：此前"不提供 PIN 轮换"的决定作废——"目前若忘了密码且本机 DPAPI 不可用，仓库无法打开"，需要一条"旧凭据解开→移除旧 password 信封→写新信封"的轮换命令。**边界不变**：没有可用凭据（machine/account/旧 PIN）时仓库仍然打不开，轮换不是恢复手段。
+- **API**：`rotatePassword({root, dshHome, newPassword, hint?, oldPassword?, accountId?, ...})`（`src/backup/keystore.mjs`，`lib/backup.js` 再导出）：先用现有凭据（account/machine/`oldPassword`）打开拿同一个 DEK → 删**所有** `password` 信封、写**一个**新信封（scrypt，沿用 KDF floor，4 位 PIN 仍接受并标 `weak`）→ `password_hint` 换成新 hint 或删除（`hint` 只替换不追加）→ 写前 `keys.json.bak-<ts>`、`writeFileAtomic` → **双向验证**（新 PIN 单独能解且 DEK 相同；旧 PIN 单独解不开且没有任何旧 password 信封残留）；任一失败即用 `.bak` 恢复并返回 `BACKUP_ROTATION_VERIFY_FAILED`，永不留下"旧 PIN 还能开"的文档。具名拒绝：`BACKUP_NO_PASSWORD_ENVELOPE`（没有 PIN 可换，加 PIN 用 `--set-password`）、`BACKUP_PASSWORD_HINT_INVALID`、`BACKUP_NO_PERMISSION`（没有可用凭据）；结果 `{ok, rotated:true, mode_after:'sealed', envelopes, backup_file, hint, weak, old_password_still_opens:false}`。
+- **CLI**：`w2m-backup unlock --rotate-password [--hint "…" | --clear-hint]`；新 PIN 与 `--set-password` 同渠道（`--password-stdin`/`W2M_BACKUP_PASSWORD`，绝无 argv）；旧 PIN 来自 `W2M_BACKUP_OLD_PASSWORD` 或 `--old-password-stdin`，两者共用一个 stdin 时是两行 `old\nnew`（`--password-stdin`）。`--hint` 替换旧提示词，省略或 `--clear-hint` 则丢弃；flag 冲突（`--rotate-password` 与 `--set-password`/`--disable-protection`、`--clear-hint` 与 `--hint`、`--password-stdin` 与 `--old-password-stdin`）退出码 2；人类输出 `rotated : yes`、`hint : …`、`keys backup : …`、`old PIN no longer opens : confirmed`，`--json` 形状与退出码 0/1/2 不变。
+- **面板**：解锁对话框选项 B 增加可复制的 `w2m-backup unlock --rotate-password --hint "…"` 与说明「轮换需要在终端运行：旧凭据解开 → 去掉旧 PIN → 写新 PIN（旧 PIN 随后失效）」（新 zh/en 键 `panel.backup.unlock.dialog.rotation`/`rotationCommand`，替换旧 `noRotation` 文案与 `data-w2m-backup-unlock-no-rotation` 标记）；仍无密码输入框、无接收密码的新 HTTP 端点。
+- **文档/测试**：`docs/BACKUP-DESIGN.md` 新增 §25.8（前置条件/写序/双向验证/CLI/测试），§23/§25.5/§25.6/§25.7 的"不提供轮换"表述改为"轮换存在"并保留"忘记 PIN 且无可用凭据仍打不开"；测试覆盖 keystore（两种仓库、旧 PIN 失效、新 PIN 可开、DEK 不变、恰好一个 password 信封、提示词替换/清除、`.bak`、三种具名拒绝零写入、`unwrap` 测试缝驱动恢复路径）、access、CLI（flag/两行 stdin/两个旧 PIN 渠道/人类输出/`--json`/退出码）、client-bundle（命令与说明、中英键、无输入框）。**声明**：不 bump 版本、不跑 preflight、不提交。
+
 ### 解锁 PIN 的公开提示词：可留备注，但按决定不提供 PIN 轮换（未发布）
 
 - **用户决定**：不为密码/PIN 提供轮换（设置后不能改），默认仍然不设密码；用户可以在设置 4–6 位 PIN 时附加一条**公开的**备注提示词（"备注提示词"），随仓库保存并在解锁时显示。

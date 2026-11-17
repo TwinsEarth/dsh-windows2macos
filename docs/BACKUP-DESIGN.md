@@ -246,7 +246,7 @@
 | `src/backup/gc.mjs` | 引用收集（快照 + old + current）、孤儿块删除、old 保留窗口；任一引用不可读即**拒绝删除** | 会写（`dryRun` 时只读） |
 | `src/backup/locks.mjs` | `tmp/backup.lock`：`wx` 原子创建、死 pid/超龄/不可读三种回收、只释放自己的锁 | 只写锁文件 |
 | `src/backup/atomic.mjs` | `writeFileAtomic`（tmp → fsync → rename）、`writeJsonAtomic`、`readJsonSafe` | 会写 |
-| `src/backup/keystore.mjs` | 打开/创建仓库 DEK：`none`（open 信封）/ `sealed`（machine + password/PIN + 可选 account），模式创建/升级/降级（`setRepositoryPassword` / `setEncryptionMode`） | 写 `keys.json`、同步 `backup.json` 的 `encryption` |
+| `src/backup/keystore.mjs` | 打开/创建仓库 DEK：`none`（open 信封）/ `sealed`（machine + password/PIN + 可选 account），模式创建/升级/降级（`setRepositoryPassword` / `setEncryptionMode`），PIN 轮换（`rotatePassword`，§25.8） | 写 `keys.json`、同步 `backup.json` 的 `encryption` |
 | `src/backup/machine-key.mjs` | 32B 随机机器秘密 + OS 钥匙串（Windows DPAPI，实测 round-trip）；macOS/Linux 明确 `unavailable` | 写 `$DSH_HOME/xclient/backup/machine.key` |
 | `src/backup/schedule.mjs` | 备份计划配置（默认 22:00 Asia/Shanghai）、时间/时区严格校验、next/missed 计算 | **绝不** |
 | `src/plugin/backup.mjs` + `lib/backup.js` | `dsh-backup` 子插件：`ctx.effect` 拥有的定时器 + `GET/POST /api/w2m/backup/run`（POST 需 `{"confirm":"run"}`） | 经引擎写 |
@@ -1031,8 +1031,9 @@ password 信封，**事后无法补**。
 4. 写后**只用新密码**单独解一次并与 DEK 比对，失败即报错（旧文件仍在备份路径）。
 
 **约束与边界**：密码只从 stdin（`--password-stdin`）或 `W2M_BACKUP_PASSWORD` 读取，绝不走 argv/配置；
-最短 8 字节；重复调用是 no-op（不会重写文档）；已有 password 信封的仓库不会被覆盖（换密码是另一个功能，
-尚未实现，届时需要"旧密码或 machine 解开 → 移除旧 password 信封 → 写新信封"的轮换命令）。
+最短 4 字节（4-6 位数字 PIN 是预期用法，见 §25.0）；重复调用是 no-op（不会重写文档）；已有 password 信封的
+仓库不会被覆盖——换 PIN 由独立的轮换命令负责（`rotatePassword` / `w2m-backup unlock --rotate-password`，见
+§25.8），它不是本函数的副作用。
 
 ## 24. `oldFormat: full`：字面兼容的整文件加密副本（P2，未发布）
 
@@ -1332,17 +1333,23 @@ node --input-type=module -e "import { bindAccount } from 'file:///E:/GPT/w2m/w2m
   argv（PIN 仍只能从 stdin/环境变量读）；`describeUnlock`、CLI `unlock`、插件 unlock（GET/POST）与 status
   payload 都以加法方式返回 `password_hint: {set, text}`（`set:false` 时 `text:null`）。对话框选项 B 在
   `password_hint.set` 时显示「密码提示：<text>」（`data-w2m-backup-unlock-hint`）；没有 PIN 时显示「未设置密码」
-  （`data-w2m-backup-unlock-hint-none`），并用一句话说明按用户决定**不提供 PIN 轮换**
-  （`data-w2m-backup-unlock-no-rotation`）。
-* **提示词写入语义（与"不轮换"一致）**：`setRepositoryPassword({password, hint})` 只在**本次真的新增** password
-  信封时写提示词；仓库已有 password 信封时调用是 no-op（`added:false`），已有 PIN 与提示词都保持不变——"改 PIN"
-  按决定不支持，因此也不存在"只改提示词"的后门。
+  （`data-w2m-backup-unlock-hint-none`）。
+* **轮换说明（用户撤销"不提供轮换"决定后）**：选项 B 另给一句「轮换需要在终端运行：旧凭据解开 → 去掉旧 PIN →
+  写新 PIN（旧 PIN 随后失效）」（`data-w2m-backup-unlock-rotation`）和一条可复制的
+  `w2m-backup unlock --rotate-password --hint "…"`（`data-w2m-backup-unlock-rotate-command`，复制走与选项 B
+  同一套 clipboard 回退）。面板**仍然没有密码输入框**，也**没有**接收密码的 HTTP 端点：轮换只在终端运行，
+  这正是"PIN 不进浏览器"规则对轮换的延续。
+* **提示词写入语义（set / rotate 分工）**：`setRepositoryPassword({password, hint})` 只在**本次真的新增** password
+  信封时写提示词；仓库已有 password 信封时调用是 no-op（`added:false`），已有 PIN 与提示词都保持不变——要改
+  既有 PIN/提示词时必须用 `rotatePassword`（CLI `unlock --rotate-password`），它让新提示词**替换**旧提示词；
+  不传 `hint`（或 `--clear-hint`）则**丢弃**旧提示词，提示词永远不会追加/嵌套。
 * 末尾一行 `w2m-backup unlock --disable-protection --confirm disable-protection`（关闭保护）**只作为可复制文本**
   展示，面板从不执行它。
 * **密码永远不进浏览器、不过 HTTP**：对话框里常驻 `panel.backup.unlock.dialog.passwordNeverInBrowser` 的说明；
   新增文案键（zh+en）为 `panel.backup.unlock.dialog.*`：`open`、`title`、`subtitle`、`state.*`、`optionA`、
   `optionAHint`、`localUnavailable`、`optionB`、`optionBHint`、`hintLabel`（「密码提示：{hint}」）、`hintNone`
-  （「未设置密码」）、`noRotation`（「不提供 PIN 轮换」）、`noPasswordNeeded`、`commandCaption`、`copy`、
+  （「未设置密码」）、`rotation`（「轮换需要在终端运行：旧凭据解开 → 去掉旧 PIN → 写新 PIN（旧 PIN 随后失效）」）、
+  `rotationCommand`（「轮换命令（只复制，不在面板里执行）」）、`noPasswordNeeded`、`commandCaption`、`copy`、
   `copied`、`refresh`、`refreshing`、`close`、`busy`、`failed`、`success`、`passwordNeverInBrowser`、
   `disableProtection`。
 
@@ -1365,7 +1372,8 @@ node --input-type=module -e "import { bindAccount } from 'file:///E:/GPT/w2m/w2m
   "4 位 PIN 建 sealed 仓库并拒绝无凭据打开"、"往 open 仓库加 PIN → 删 open、转 sealed、此后无凭据打不开"、
   "`setEncryptionMode('none')` 把 sealed 转回 open（同 DEK、无凭据可开、幂等）"、"open 与任何凭据信封混存被
   `validateKeysFile` 拒绝"、"DEK 不出现在 describe/status/conversion 结果"；外加既有 machine-only/account 绑定
-  （改用 `machineKey: true` 显式要求 sealed）。
+  （改用 `machineKey: true` 显式要求 sealed），以及 §25.8 的旋转用例（旧 PIN 失效/新 PIN 可开/DEK 不变/
+  只剩一个 password 信封/提示词替换与清除/`.bak` 存在/无凭据或无 password 信封被具名拒绝/校验失败恢复）。
 * `test/backup-crypto.test.mjs`：open 记录形状/明文语义/`unwrapDek` attempts、混存与畸形记录拒绝。
 * `test/backup-access.test.mjs`：`describeUnlock` 报告 `encryption`/`available_paths`/未加密警告；无凭据
   `unlockRepo` 得 `via: "none"` 且不带 DEK；sealed 仓库报告 `sealed`。
@@ -1374,14 +1382,18 @@ node --input-type=module -e "import { bindAccount } from 'file:///E:/GPT/w2m/w2m
   的 `BACKUP_NO_PERMISSION`。
 * `test/backup-run.test.mjs`：配置 `backupEncryption` 默认 `none`/非法值拒绝；插件默认 run 成功且
   `unlocked_via: "none"`、显式 sealed 才拒绝；CLI `run --encrypt none|sealed`/`--no-encryption`、退出码、
-  `unlock --set-password` 的 4 位 PIN 与警告行、`--disable-protection --confirm` 前后状态。
+  `unlock --set-password` 的 4 位 PIN 与警告行、`--disable-protection --confirm` 前后状态、§25.8 的
+  `unlock --rotate-password`（flag 解析、两行 stdin `old\nnew`、`--old-password-stdin`/`W2M_BACKUP_OLD_PASSWORD`、
+  `--hint` 替换与 `--clear-hint`、人类输出与 `--json`、退出码 0/1/2）。
 * `test/backup-verify.test.mjs` / `test/backup-restore.test.mjs`：`none` 仓库无需密码即可 verify / plan+apply
   restore。
 * `test/client-bundle.test.mjs`：解锁卡三态（未加密/账户一致/账户不一致 + PIN 提示）、状态卡模式徽标、未加密
   警告、新 i18n 键与 `BACKUP_CONFIG_INVALID` 映射。
 * `test/client-bundle.test.mjs`（解锁对话框，v3.5.x）：卡片触发器打开模态（`role`/`aria-modal`/`aria-labelledby`/
   遮罩）、Esc 与遮罩关闭、焦点进入对话框与回到触发器、选项 A 请求体恰好 `{"confirm":"unlock"}` 且全程无密码、
-  选项 B 命令复制（clipboard + `execCommand` 回退）与「刷新状态」重读 describe、失败原因文案、五态映射与中英字典键。
+  选项 B 命令复制（clipboard + `execCommand` 回退）与「刷新状态」重读 describe、失败原因文案、五态映射与中英字典键；
+  §25.8 起还断言轮换说明与可复制的 `--rotate-password --hint "…"` 命令出现、中英字典有 `rotation`/
+  `rotationCommand`，且对话框仍然没有任何 `input`/`textarea`。
 * `test/loader-entry.test.mjs` + `test/helpers/dsh-page-boot.mjs`（真实浏览器）：打开备份面板 → 点「解锁…」→
   `[data-w2m-backup-unlock-dialog]` 带 `role="dialog"` 且焦点在对话框内 → Esc 后对话框与遮罩消失。
 * `docs/SPIKE-ACCOUNT-KEK.md` §9 记录"用户最终决定：便捷优先"。
@@ -1395,12 +1407,72 @@ node --input-type=module -e "import { bindAccount } from 'file:///E:/GPT/w2m/w2m
 * 账户 id 由宿主提供；**CLI 不会自己读**。宿主未登录/断网/无账户服务时 account 路径不可用，PIN 路径照旧。
 * 面板的账户路径按钮与 machine 按钮都只发同一个确认令牌；面板从不接收密码，PIN 路径仍只在离线 CLI。
 * `account` 信封**不能**在"换账户 + 无 machine + 无 password"时救回仓库：那是 PIN 路径的职责。
-* **不提供 PIN 轮换（用户决定）**：PIN 设置后不能改；忘记时用 machine/account 路径或按新仓库重建。提示词
-  （`password_hint`）也只是提示，不是恢复手段，且它按设计是公开明文。
+* **轮换需要现有可用凭据**（2026-11-17 用户撤销"不提供轮换"后的边界，详见 §25.8）：`rotatePassword` 先用
+  machine/account/旧 PIN 之一打开仓库再改写 password 信封，所以"忘了 PIN 且本机 DPAPI 不可用、账户也不匹配"时
+  仍然**打不开仓库**——轮换不是恢复手段。提示词（`password_hint`）也只是提示，不是恢复手段，且它按设计是
+  公开明文。
 * 已经存在的旧快照目录里的 `keys.json` 副本没有新绑定/新模式变化（只写根 `keys.json`，下一次快照起副本才更新）；
   从旧快照直接还原仍走它自己那份 `keys.json`。
 * 关闭保护**不会**重写 `objects/`：块仍是同一把 DEK 封的密文；"不加密"准确地说只是"钥匙明文存在旁边"。
 * 不 bump 版本号、不跑 preflight、不提交；真实仓库迁移由 lead 用 §25.3 的命令或 `unlock` 命令执行。
+
+### 25.8 PIN 轮换（2026-11-17 决定撤销：轮换存在）
+
+**背景**：此前的决定是"不提供 PIN 轮换"。用户在同一天撤销该决定，原话是"需要'旧凭据解开→移除旧 password
+信封→写新信封'的轮换命令；目前若忘了密码且本机 DPAPI 不可用，仓库无法打开"。于是新增 `rotatePassword` 与
+`w2m-backup unlock --rotate-password`。这是**加法**改动：`setRepositoryPassword` 的"已有 password 信封 = no-op"
+行为不变（"加 PIN"和"换 PIN"是两个不同的承诺），轮换是独立命令；包入口 `lib/backup.js` 也再导出
+`rotatePassword`。
+
+**API**（`src/backup/keystore.mjs`）：
+
+```js
+rotatePassword({ root, dshHome, newPassword, hint?, oldPassword?, accountId?, platform?, runner?, machineKey?, now? })
+```
+
+**前置条件（缺一即具名拒绝，零写入）**：
+
+| 条件 | 行为 |
+|---|---|
+| 仓库没有 key 文档 | `BACKUP_DIR_NOT_A_REPO`（轮换绝不创建仓库） |
+| 没有可用凭据（machine/account/`oldPassword` 都开不了） | `BACKUP_NO_PERMISSION`，detail 说明 "rotate needs a working credential; run it on the machine that can open the repository, or pass the old PIN" |
+| 仓库没有 password 信封（未加密或只有 machine/account） | `BACKUP_NO_PASSWORD_ENVELOPE`——轮换不是"加 PIN"，加 PIN 用 `--set-password` |
+| 新 PIN < 4 字节 / hint 非法（非字符串、空、>120 字符、等于新 PIN） | `BACKUP_PASSWORD_EMPTY`/`BACKUP_NO_PERMISSION`/`BACKUP_PASSWORD_HINT_INVALID`，均在写仓库前拒绝 |
+| 新旧 PIN 逐字相同 | `BACKUP_ROTATION_VERIFY_FAILED`（相同 PIN 会让"旧 PIN 随后失效"不成立，直接拒绝而不写） |
+
+**写与验证（顺序即安全语义）**：
+
+1. 用现有凭据打开仓库（`openRepoKey` 的 account → machine → password 顺序；`oldPassword` 走 password 槽），
+   拿到**同一个 DEK**；
+2. 删除**所有** `password` 信封，用同一 DEK 写**恰好一个**新 password 信封（scrypt，沿用现有 KDF floor；
+   4 位 PIN 仍被接受并标记 `weak: true`）；account/machine 信封原样保留；
+3. `password_hint` 换成新 hint（`{text, updated_at}`），不传或传 null 时**删除**；提示词只替换，不追加、不嵌套；
+4. 写前把 `keys.json` 复制为 `keys.json.bak-<ts>`，再用 `writeFileAtomic` 替换；
+5. **双向验证**（对**从磁盘重读**的文档，不是内存副本）：(a) 只用新 PIN 解出的 DEK 必须与打开时的 DEK 相同；
+   (b) 只用旧 PIN 必须解不开，并且**任何**轮换前的 password 信封记录（salt+tag）都不得残留。任一失败 → 用
+   `.bak` 覆盖 `keys.json` 并返回 `BACKUP_ROTATION_VERIFY_FAILED`（`restored: true`）：**永不**留下"旧 PIN 还能开"
+   的文档。结构检查让调用方没提供旧 PIN 时也能如实返回 `old_password_still_opens: false`（旧 PIN 已无信封可解）。
+
+**结果**：`{ok, rotated: true, mode_after: 'sealed', envelopes, backup_file, hint: {set, text|null}, weak,
+old_password_still_opens: false, warning?, ...}`；失败共用同一 shape（`rotated: false`、`restored`、
+`reason_code`、`detail`）。DEK 与 PIN 都不出现在结果里。
+
+**CLI**：`w2m-backup unlock --rotate-password [--hint "…" | --clear-hint]`。新 PIN 与 `--set-password` 同渠道
+（`--password-stdin` 或 `W2M_BACKUP_PASSWORD`；绝无 argv）；旧 PIN 只在本机/账户路径开不了时才需要，来自
+`W2M_BACKUP_OLD_PASSWORD` 或 `--old-password-stdin`；两者共用 stdin 时用两行格式 `old\nnew`（`--password-stdin`，
+行序为旧、新）。`--hint` **替换**旧提示词，省略 `--hint`（或 `--clear-hint`）则丢弃；`--clear-hint` 不能与
+`--hint` 同用，`--password-stdin`/`--old-password-stdin` 不能同用，`--rotate-password` 不能与 `--set-password`/
+`--disable-protection` 同用（均退出码 2）。人类输出：`rotated : yes`、`hint : …`、`keys backup : …`、
+`old PIN no longer opens : confirmed`；退出码 0/1/2 与 `--json` 形状不变。
+
+**面板**：解锁对话框选项 B 显示轮换说明与可复制的 `w2m-backup unlock --rotate-password --hint "…"`，
+**没有**密码输入框，也**没有**新的接收密码 HTTP 端点；轮换仍只在终端运行。
+
+**测试**：`test/backup-keystore.test.mjs`（machine+password 与 password-only 两种仓库、旧 PIN 失效/新 PIN 可开/
+DEK 不变/恰好一个 password 信封/提示词替换与清除/`.bak` 存在、无凭据与无 password 信封两种具名拒绝且零写入、
+`unwrap` 测试缝让旧 PIN 在写后"仍可解"以驱动恢复路径）、`test/backup-access.test.mjs`（describe/attempt 在轮换后
+报告新提示词、旧 PIN 不再解锁）、`test/backup-run.test.mjs`（CLI flag/两行 stdin/旧 PIN 的两个渠道/人类输出/
+`--json`/退出码）、`test/client-bundle.test.mjs`（命令与说明、中英字典键、仍无密码输入）。
 
 ## 26. 镜像写入时的链接防护（realpath 加固补记）
 

@@ -47,6 +47,17 @@
  * nobody can open is worse than not writing one. The default `none` mode needs no credential by design, so it
  * is never refused for that reason. The account binding is added **after** a successful run, never as the only
  * reason a repository exists.
+ *
+ * ## Rotating the PIN
+ *
+ * The PIN *can* be changed: `rotatePassword` opens the repository with a working credential, removes **every**
+ * existing `password` envelope, writes exactly one new envelope around the **same** DEK, and then verifies both
+ * ways -- the new PIN opens the document, and the old PIN no longer does. The document is copied to
+ * `keys.json.bak-<ts>` before the write and restored if either check fails, so a broken rotation never leaves a
+ * repository whose old credential still works (`BACKUP_ROTATION_VERIFY_FAILED`).
+ *
+ * That is not a recovery path: rotation needs an existing working credential (machine, a matching account id, or
+ * the old PIN). A forgotten PIN with no machine/account path still means the repository cannot be opened.
  */
 
 import fs from 'node:fs';
@@ -111,6 +122,13 @@ export const KEYSTORE_CODES = Object.freeze({
   ACCOUNT_BINDING_UNKNOWN: 'BACKUP_ACCOUNT_BINDING_UNKNOWN',
   /** The public password hint is unusable: not a string, empty after trimming, too long, or equal to the PIN. */
   HINT_INVALID: 'BACKUP_PASSWORD_HINT_INVALID',
+  /** `rotatePassword` was asked to change a PIN on a repository that has no `password` envelope to replace. */
+  NO_PASSWORD_ENVELOPE: 'BACKUP_NO_PASSWORD_ENVELOPE',
+  /**
+   * The rotation wrote a document whose old PIN still opened it (or whose new PIN did not). The pre-write
+   * `keys.json.bak-<ts>` copy is restored before this is returned, so the repository is left as it was.
+   */
+  ROTATION_VERIFY_FAILED: 'BACKUP_ROTATION_VERIFY_FAILED',
 });
 
 /** Domain separation of the account binding: the KEK is derived from `w2m-account-binding|<accountId>`. */
@@ -738,9 +756,10 @@ export function bindAccount(input) {
  * (a hint equal to the PIN is refused, as are non-strings, empty values and anything over 120 characters). The
  * result reports it as `hint: {set, text?}` and `docs/BACKUP-DESIGN.md` §25.5 records where it is shown.
  *
- * **No rotation (the user's decision).** When the repository already has a password envelope this function is a
- * no-op (`added: false`): the existing PIN keeps working and a supplied `hint` is **not** updated. "Change PIN" is
- * deliberately unsupported; a forgotten PIN means creating a new repository or using the machine/account path.
+ * **No rotation here.** When the repository already has a password envelope this function is a no-op
+ * (`added: false`): the existing PIN keeps working and a supplied `hint` is **not** updated. Changing an existing
+ * PIN is {@link rotatePassword} (`w2m-backup unlock --rotate-password`), which also replaces or clears the hint;
+ * this function never replaces a credential because "add a PIN" and "change the PIN" are different promises.
  *
  * Adding a password to an `open` (unencrypted) repository removes the `open` record in the same write and
  * reports `mode_after: 'sealed'`; the descriptor is synced too. The repository then refuses credential-less
@@ -847,11 +866,11 @@ export function setRepositoryPassword(input) {
       hint: passwordHintState(upgraded.keys),
       warning: weak ? WEAK_PIN_WARNING : null,
       reason_code: null,
-      // No rotation by decision: an existing PIN (and its hint) is never replaced. Say so when a hint was
-      // supplied, so no caller can believe the new text was stored.
+      // No rotation by this function: an existing PIN (and its hint) is never replaced. Say so when a hint was
+      // supplied, so no caller can believe the new text was stored, and name the command that DOES rotate.
       detail: hintText === null
         ? upgraded.reason
-        : `${upgraded.reason}; the hint was not updated (PIN rotation is not offered by design)`,
+        : `${upgraded.reason}; the hint was not updated (setRepositoryPassword never replaces an existing PIN: use rotatePassword, i.e. w2m-backup unlock --rotate-password)`,
     };
   }
   const file = opened.file;
@@ -923,6 +942,281 @@ export function setRepositoryPassword(input) {
     mode_after: modeAfter,
     hint: resultHint,
     warning: weak ? WEAK_PIN_WARNING : null,
+    reason_code: null,
+    detail: null,
+  };
+}
+
+/**
+ * Rotate the repository PIN: replace every `password` envelope with one new envelope around the same data key.
+ *
+ * The case this exists for: a repository seeded with a PIN whose value is known wrong (leaked, forgotten-and-
+ * re-derived, or just wanted changed) had no way out except deleting the repository -- and a repository created
+ * offline has no machine envelope to fall back on. Rotation keeps the **DEK unchanged**, so every stored block
+ * stays readable; only the credential path is rewritten.
+ *
+ * Order, and why it is this order:
+ *
+ *   1. open the repository with a credential that already works -- `machine`, a matching `account`, or
+ *      `oldPassword` if the caller supplied it (the injected order is `openRepoKey`'s: account, machine, password).
+ *      Without any working credential this is refused with `BACKUP_NO_PERMISSION`: rotation must never be a way to
+ *      "claim" a repository, and it must not create one. A repository with no key document is refused too.
+ *   2. refuse `BACKUP_NO_PASSWORD_ENVELOPE` when there is no `password` envelope to replace: rotation changes a
+ *      PIN, it never adds one (`--set-password` does that).
+ *   3. copy `keys.json` to `keys.json.bak-<ts>`, then write atomically: every old `password` envelope is removed,
+ *      exactly one new one (same DEK, scrypt, the existing KDF floor) is added, and `password_hint` is replaced by
+ *      the new hint -- or dropped when `hint` is null/omitted. A hint never appends and never nests.
+ *   4. verify **both ways** against the document re-read from disk: (a) the new PIN alone unwraps the DEK; (b) the
+ *      old PIN alone does not (and no pre-rotation password envelope survived). If either check fails the backup is
+ *      copied back over `keys.json` and the call returns `BACKUP_ROTATION_VERIFY_FAILED`, so a failed rotation can
+ *      never leave a document in which the old PIN still works.
+ *
+ * Result: `{ok, rotated: true, mode_after: 'sealed', envelopes, backup_file, hint, weak, old_password_still_opens:
+ * false, ...}`. Existing machine/account envelopes are preserved untouched; only the password path is rewritten.
+ *
+ * @param {{
+ *   root: string, dshHome: string, newPassword: string|Buffer, hint?: string|null,
+ *   oldPassword?: string|Buffer|null, accountId?: string|null, platform?: string, runner?: Function,
+ *   machineKey?: boolean, now?: Date, kdf?: object,
+ *   unwrap?: Function,
+ * }} input `kdf` overrides the new envelope's scrypt parameters (tests); `unwrap` is a test seam for the
+ *   post-write verification (production omits it and uses `crypto.unwrapDek`).
+ * @returns {{ok: boolean, rotated: boolean, file: string|null, backup_file: string|null,
+ *   envelopes: string[], weak: boolean, encryption: 'none'|'sealed'|null,
+ *   mode_after: 'none'|'sealed'|null, hint: {set: boolean, text: string|null},
+ *   warning: string|null, old_password_still_opens: boolean|null, restored: boolean,
+ *   reason_code: string|null, detail: string|null}}
+ */
+export function rotatePassword(input) {
+  const newBytes = Buffer.isBuffer(input?.newPassword)
+    ? input.newPassword
+    : Buffer.from(String(input?.newPassword ?? ''), 'utf8');
+  const weak = isWeakPassword(newBytes);
+  /** Every refusal shares the success shape, so a caller never has to guess which fields exist. */
+  const failed = (reasonCode, detail, extra = {}) => ({
+    ...extra,
+    ok: false,
+    rotated: false,
+    file: extra.file ?? null,
+    backup_file: extra.backup_file ?? null,
+    envelopes: extra.envelopes ?? [],
+    weak,
+    encryption: extra.encryption ?? null,
+    mode_after: extra.mode_after ?? null,
+    hint: extra.hint ?? { set: false, text: null },
+    warning: weak ? WEAK_PIN_WARNING : null,
+    old_password_still_opens: extra.old_password_still_opens ?? null,
+    restored: extra.restored === true,
+    reason_code: reasonCode,
+    detail,
+  });
+  if (newBytes.length < MIN_PASSWORD_BYTES) {
+    return failed(
+      newBytes.length === 0 ? CRYPTO_CODES.PASSWORD_EMPTY : NO_PERMISSION,
+      newBytes.length === 0
+        ? 'the new unlock PIN/password is empty'
+        : `the new unlock PIN/password must be at least ${MIN_PASSWORD_BYTES} characters`,
+    );
+  }
+  // Validate the PUBLIC hint before touching the repository: a rejected hint must not produce a write. An omitted
+  // or null `hint` is the documented "drop the old hint" request, not an error.
+  let hintText = null;
+  if (input.hint !== undefined && input.hint !== null) {
+    const normalized = normalizePasswordHint(input.hint);
+    if (normalized === null) {
+      return failed(
+        KEYSTORE_CODES.HINT_INVALID,
+        typeof input.hint !== 'string'
+          ? 'the hint must be a string: it is public metadata stored in keys.json, never a secret'
+          : `the hint must be 1-${MAX_PASSWORD_HINT_LENGTH} characters after trimming whitespace`,
+      );
+    }
+    if (normalized === newBytes.toString('utf8')) {
+      return failed(
+        KEYSTORE_CODES.HINT_INVALID,
+        'the hint must not be the new PIN/password itself: it is stored in clear in keys.json',
+      );
+    }
+    hintText = normalized;
+  }
+  // Read the document first: `openRepoKey` creates a repository on first use, and a rotation must never create
+  // one. A missing/corrupt key document is a named refusal, not a reason to mint a fresh DEK.
+  const existing = readRepoKeys(input.root);
+  if (existing.ok !== true) {
+    const code = existing.reason === 'missing' ? LAYOUT_CODES.NOT_A_REPO : KEYSTORE_CODES.CORRUPT;
+    return failed(
+      code,
+      existing.reason === 'missing'
+        ? `${existing.file} does not exist; there is no repository to rotate`
+        : String(existing.detail),
+      { file: existing.file, hint: passwordHintState(existing.keys) },
+    );
+  }
+  const oldBytes = passwordBytes(input.oldPassword);
+  if (oldBytes !== null && oldBytes.equals(newBytes)) {
+    // Re-wrapping under the same secret cannot satisfy the post-write check (the "old" PIN would still open it).
+    // Refuse before the write instead of writing a document and then restoring it.
+    return failed(
+      KEYSTORE_CODES.ROTATION_VERIFY_FAILED,
+      'the new PIN is identical to the old PIN: the old PIN would still open the repository; choose a different PIN',
+      { file: existing.file, hint: passwordHintState(existing.keys) },
+    );
+  }
+  const opened = openRepoKey({
+    root: input.root,
+    dshHome: input.dshHome,
+    accountId: input.accountId ?? null,
+    password: oldBytes,
+    platform: input.platform,
+    runner: input.runner,
+    machineKey: input.machineKey,
+    now: input.now,
+    kdf: input.kdf,
+  });
+  if (opened.ok !== true) {
+    return failed(
+      NO_PERMISSION,
+      'rotate needs a working credential: run it on the machine that can open the repository, or pass the old PIN ' +
+        `(${opened.reason_code}: ${opened.detail ?? 'the repository could not be opened'})`,
+      {
+        file: opened.file ?? existing.file,
+        envelopes: envelopeKinds(opened.keys),
+        encryption: keysEncryption(opened.keys),
+        mode_after: keysEncryption(opened.keys),
+        hint: passwordHintState(opened.keys),
+      },
+    );
+  }
+  const oldPasswordEnvelopes = opened.keys.envelopes.filter((envelope) => envelope?.kind === 'password');
+  if (oldPasswordEnvelopes.length === 0) {
+    return failed(
+      KEYSTORE_CODES.NO_PASSWORD_ENVELOPE,
+      'this repository has no password/PIN envelope to rotate: add one with w2m-backup unlock --set-password ' +
+        '(rotation replaces an existing PIN; it never adds one)',
+      {
+        file: opened.file,
+        envelopes: envelopeKinds(opened.keys),
+        encryption: keysEncryption(opened.keys),
+        mode_after: keysEncryption(opened.keys),
+        hint: passwordHintState(opened.keys),
+      },
+    );
+  }
+  const now = input.now ?? new Date();
+  const { password_hint: _previousHint, ...base } = opened.keys;
+  let next;
+  try {
+    const wrapped = wrapDek(opened.dek, [{ kind: 'password', secret: newBytes }], {
+      now,
+      ...(input.kdf === undefined ? {} : { kdf: input.kdf }),
+    });
+    next = {
+      ...base,
+      envelopes: [
+        ...base.envelopes.filter((envelope) => envelope?.kind !== 'password'),
+        ...wrapped.envelopes,
+      ],
+    };
+    if (hintText !== null) next.password_hint = { text: hintText, updated_at: now.toISOString() };
+    validateKeysFile(next);
+  } catch (error) {
+    return failed(error?.code ?? KEYSTORE_CODES.CORRUPT, error?.detail ?? String(error?.message ?? error), {
+      file: opened.file,
+      envelopes: envelopeKinds(opened.keys),
+      encryption: keysEncryption(opened.keys),
+      mode_after: keysEncryption(opened.keys),
+      hint: passwordHintState(opened.keys),
+    });
+  }
+  const file = opened.file;
+  const stamp = now.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+  const backupFile = path.join(path.dirname(file), 'keys.json.bak-' + stamp);
+  try {
+    fs.mkdirSync(path.dirname(backupFile), { recursive: true });
+    fs.copyFileSync(file, backupFile);
+    writeFileAtomic(file, JSON.stringify(next));
+  } catch (error) {
+    return failed(error?.code ?? 'BACKUP_WRITE_FAILED', error?.detail ?? String(error?.message ?? error), {
+      file,
+      backup_file: backupFile,
+      envelopes: envelopeKinds(opened.keys),
+      encryption: keysEncryption(opened.keys),
+      mode_after: keysEncryption(opened.keys),
+      hint: passwordHintState(opened.keys),
+    });
+  }
+  // Verify both ways against the document re-read from disk, not the in-memory copy: a write that produced
+  // something other than `next` must not pass. `input.unwrap` is the documented test seam that lets a test prove
+  // the restore path; production omits it and uses the real `unwrapDek`.
+  const unwrap = typeof input.unwrap === 'function' ? input.unwrap : unwrapDek;
+  const written = readRepoKeys(input.root);
+  const writtenKeys = written.ok === true ? written.keys : next;
+  let newPinOpens = false;
+  try {
+    const verified = unwrap(writtenKeys, { password: newBytes });
+    newPinOpens = verified !== null && typeof verified === 'object'
+      && Buffer.isBuffer(verified.dek) && verified.dek.equals(opened.dek);
+  } catch {
+    newPinOpens = false;
+  }
+  let oldPinOpens = false;
+  if (oldBytes !== null) {
+    try {
+      const verified = unwrap(writtenKeys, { password: oldBytes });
+      oldPinOpens = verified !== null && typeof verified === 'object'
+        && Buffer.isBuffer(verified.dek) && verified.dek.equals(opened.dek);
+    } catch {
+      oldPinOpens = false;
+    }
+  }
+  // Structural half, always available: no password envelope record from before the write may survive. This is what
+  // makes `old_password_still_opens: false` a statement even when the caller could not supply the old PIN -- there
+  // is no envelope left that the old PIN could unwrap (the same-PIN case was refused before the write).
+  const survivingOldEnvelope = (writtenKeys.envelopes ?? []).some((currentEnvelope) => currentEnvelope?.kind === 'password'
+    && oldPasswordEnvelopes.some((previousEnvelope) => previousEnvelope?.kdf?.salt === currentEnvelope?.kdf?.salt
+      && previousEnvelope?.sealed?.tag === currentEnvelope?.sealed?.tag));
+  if (newPinOpens !== true || oldPinOpens === true || survivingOldEnvelope === true) {
+    let restored = false;
+    try {
+      fs.copyFileSync(backupFile, file);
+      restored = true;
+    } catch {
+      restored = false;
+    }
+    let detail;
+    if (newPinOpens !== true) detail = 'the written password envelope did not open the data key with the new PIN';
+    else if (oldPinOpens === true) detail = 'the old PIN still opened the written document';
+    else detail = 'a pre-rotation password envelope survived the write';
+    detail += restored
+      ? `; keys.json was restored from ${backupFile}`
+      : `; the restore from ${backupFile} FAILED -- inspect keys.json before trusting this repository`;
+    return failed(KEYSTORE_CODES.ROTATION_VERIFY_FAILED, detail, {
+      file,
+      backup_file: backupFile,
+      envelopes: envelopeKinds(opened.keys),
+      encryption: keysEncryption(opened.keys),
+      mode_after: keysEncryption(opened.keys),
+      hint: passwordHintState(opened.keys),
+      old_password_still_opens: oldBytes === null ? false : oldPinOpens,
+      surviving_old_envelope: survivingOldEnvelope === true,
+      restored,
+    });
+  }
+  // The key document is authoritative and was already sealed, so this only repairs pre-existing descriptor drift.
+  syncDescriptorEncryption(path.dirname(file), 'sealed');
+  return {
+    ok: true,
+    rotated: true,
+    file,
+    backup_file: backupFile,
+    envelopes: envelopeKinds(writtenKeys),
+    weak,
+    encryption: keysEncryption(writtenKeys),
+    mode_after: keysEncryption(writtenKeys),
+    hint: passwordHintState(writtenKeys),
+    warning: weak ? WEAK_PIN_WARNING : null,
+    old_password_still_opens: false,
+    restored: false,
     reason_code: null,
     detail: null,
   };
