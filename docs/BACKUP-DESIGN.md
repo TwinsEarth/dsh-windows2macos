@@ -917,3 +917,82 @@ password 信封，**事后无法补**。
 **约束与边界**：密码只从 stdin（`--password-stdin`）或 `W2M_BACKUP_PASSWORD` 读取，绝不走 argv/配置；
 最短 8 字节；重复调用是 no-op（不会重写文档）；已有 password 信封的仓库不会被覆盖（换密码是另一个功能，
 尚未实现，届时需要"旧密码或 machine 解开 → 移除旧 password 信封 → 写新信封"的轮换命令）。
+
+## 24. `oldFormat: full`：字面兼容的整文件加密副本（P2，未发布）
+
+**问题**：§13/§21 的 `old/` 存的是**去重记录**（`<ts>-<sha12>.json`：rel/size/sha256/blocks +
+`snapshot_id`/`superseded_by`），能逐字节还原上一版，但磁盘上并不存在"上一版文件"这个对象。计划里原本写的是
+`old/<ws>/<sid>/<ts>-<sha12>.zst.enc`（把上一版整文件加密复制过去）；用户明确要这个**字面兼容**选项，同时
+默认必须保持去重记录（否则 §13 开头算过的那笔账重新成立）。
+
+**实现**：新增选项 `oldFormat: 'records' | 'full'`，默认 `records`（行为、结果形状、`old/` 文件都与本功能之前
+逐字节一致）。`full` 在**每次真正轮转时**，除现有记录外再写**一份**密封整文件副本：
+
+```
+old/<ws>/<sid>/<ts>-<sha12>.json       # 版本记录（不变；format 仍是 w2m-session-backup/old-version v1）
+old/<ws>/<sid>/<ts>-<sha12>.json.enc   # full 新增：该版本的整文件密文（同一 stamp、同一 sha12）
+```
+
+* **记录新增字段**（纯加法，旧读取者忽略）：`full_copy: {file, sha256, size}`，`file` 是仓库相对路径
+  （正斜杠），`sha256`/`size` 是**明文整文件**的摘要与长度（`openObject` 校验用的同一身份）。
+* **明文来源**：不是重读磁盘上已经变化/消失的源文件，而是用该版本记录自己的 blocks 经
+  `materialize.rebuildFile`（还原路径的同一实现）重建，并先与记录的 `sha256`/`size` 比对；不一致即拒绝。
+* **封印身份**：复用块对象的信封形状（`sealObject`：`MAGIC | nonce | ciphertext | tag`，AES-256-GCM），
+  但 AAD 容器名不同——`w2m-session-backup/old|<sha256>|<length>`（块是
+  `w2m-session-backup/object|<sha256>|<length>`；见 `crypto.OLD_COPY_KIND`）。两个命名空间不互通：整文件副本
+  不能当块打开，块也不能当副本打开，测试两条都断言。**没有新密码学，只有新的 AAD 身份**。
+* **写序**：先写 `.enc`（`writeFileAtomic`），再写记录。记录里出现 `full_copy` 就保证副本已经在盘上。
+
+**存储诚实**：`full` 让每个被淘汰版本的字节**再加一份**（在去重 blocks 之上整文件复制）。按 §13 的例子，
+114 MB 的会话每天变一次、窗口 10 份 ≈ 多 1.1 GB——这正是默认 `records` 要避免的成本，所以 `full` 是 opt-in，
+且 CLI 人类输出会写 "storage doubles per superseded version"。此外 `full` 轮转时整文件会在内存里重建一次
+（与 restore 相同的峰值），默认模式没有这笔开销。
+
+**失败与崩溃语义**：
+
+| 情况 | 行为 |
+|---|---|
+| 副本重建失败（块缺失/认证失败/记录的 sha 不符） | 轮转拒绝 `BACKUP_ROTATION_WRITE_FAILED`；**不写记录**（记录不能承诺不存在的副本） |
+| 副本写失败（目录不可写/`old/` 是文件/磁盘满） | 同上，具名拒绝；`current/` 指针不前移 |
+| 记录已写、写指针前崩溃 | 与 v3.4.7 相同：重跑按幂等文件名重记；`full` 会重写同名 `.enc` |
+| 副本已写、记录写失败 | 留下一个无人引用的 `.enc`：**无害**，`gc` 下次安全运行时清掉（见下） |
+| 记录已剪、副本未删（崩溃窗口） | 同上，孤儿 `.enc` 由 `gc` 清理 |
+
+**剪枝与 gc**：`pruneOldVersions` 在剪掉一条记录时**先删记录、再删配对副本**（顺序写进代码注释与本文；反过来会
+留下"记录指向缺失副本"的坏状态）。`gc` 在安全路径（引用集已收集且无不可读）上，于剪枝之后扫描 `old/` 下所有
+`.json.enc`，删除**没有任何剩余记录引用**的副本；被记录引用的副本永不删。`BACKUP_GC_UNSAFE`（任一引用不可读）
+仍然整体拒绝、零删除——孤儿副本清理也不会越过这条规则。结果新增：`old_versions.full_copies_pruned`、
+`orphan_full_copies: {scanned, removed, reclaimed_bytes}`；`pruneOldVersions` 结果新增 `full_copies_removed`。
+
+**接口面**：
+
+| 入口 | 形状 |
+|---|---|
+| CLI | `w2m-backup run --old-format records\|full`（非法值退出码 2；人类输出新增 `old format` 行，仅 `full` 时打印） |
+| 插件配置 | `backupOldFormat: 'records' \| 'full'`，缺省 `records`；非法值拒绝挂载 `BACKUP_CONFIG_INVALID` |
+| 引擎 | `runBackup({oldFormat})`，写盘前校验；结果 `old_format` 恒有，`full_old_versions: [<相对路径>…]` 仅 `full` 时出现 |
+| 轮转 | `rotateForEntry({format, dek})` / `recordSupersededVersion({format, dek})`；`dek` 仅 `full` 需要 |
+| 错误码 | `BACKUP_ROTATION_FORMAT_INVALID`（未知 `oldFormat`，写盘前）、`BACKUP_ROTATION_WRITE_FAILED`（副本或记录写失败） |
+
+**兼容性**：记录的 `format`/`version` 字段不变（仍 `w2m-session-backup/old-version` v1），`full_copy` 只是新增
+可选字段；`listOldVersions`/`readOldRecords` 只认 `.json`，`.json.enc` 不会被当记录读取；`verify` 仍按记录
+blocks 重建旧版本，不把 `.enc` 计入引用。
+
+**测试**（挂在既有套件上，无新测试文件）：`test/backup-rotation.test.mjs`（默认/非法值、写记录+副本、用
+`openObject` 以 `old` 身份解开并逐字节比对、块身份解不开、records 模式无 `.enc`、剪枝删配对副本、副本写失败/
+重建失败/缺 DEK 三种具名拒绝且零记录、指针不动）；`test/backup-gc.test.mjs`（孤儿副本删、被引用副本留、剪枝
+连带删、dry-run 只报不删、`BACKUP_GC_UNSAFE` 零删除）；`test/backup-engine.test.mjs`（`runBackup({oldFormat:'full'})`
+轮转并回报 `full_old_versions`、默认无该键、非法值在 ensureLayout 前拒绝、副本写失败时 `committed:true` +
+`BACKUP_ROTATION_WRITE_FAILED`）；`test/backup-run.test.mjs`（CLI 解析/退出码 2/真实入口、人类输出、插件配置归一化）。
+
+**诚实边界（本次不承诺的）**：
+
+* **还原/归档/校验不用这份副本**：restore/archive/verify 仍走记录 + blocks；`.enc` 是"字面兼容"的额外副本，
+  可以用仓库 DEK 与 `openObject(bytes, dek, {sha256, size, kind:'old'})` 手工验证（测试即这么做的），但还没有
+  "从 full 副本直接还原"的命令。要看副本内容，用现有记录即可；副本的用途是让磁盘上真的存在上一版整文件。
+* **镜像不含 `old/`**（§21.2 的"永不复制"不变）：异地副本只承诺已提交快照，`full` 的整文件副本不进镜像。
+* **不去重副本**：`.enc` 按版本整份写；同一会话两次轮转之间未变的字节不会被合并（这正是 opt-in 的代价）。
+  也不跨仓库去重。
+* **`verify` 尚未逐份解密 `.enc`**：损坏的副本要等 gc/人工按上面的 `openObject` 方式发现；记录本身的完整性
+  校验不变。
+* 本次不 bump 版本号、不跑 preflight、不提交；与 §13/§21 的默认行为完全一致（默认 `records`）。

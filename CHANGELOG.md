@@ -4,6 +4,16 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### 备份轮转 `--old-format full`：字面兼容的整文件加密副本（P2，未发布）
+
+- **新增 opt-in 选项 `oldFormat: 'records' | 'full'`（默认 `records`）**：默认仍是去重版本记录（§13/§21 行为不变）；`full` 在每次真正轮转时额外写一份密封整文件副本 `old/<ws>/<sid>/<ts>-<sha12>.json.enc`，记录新增 `full_copy: {file, sha256, size}`（纯加法，记录的 `format`/`version` 不变，仍是 `w2m-session-backup/old-version` v1）。
+- **复用现有密码学，只换 AAD 身份**：整文件副本仍用 `sealObject` 的 `MAGIC|nonce|ciphertext|tag` 信封 + 仓库 DEK，AAD 容器名改为 `w2m-session-backup/old|<sha256>|<length>`（块是 `…/object|…`，见 `crypto.OLD_COPY_KIND`）；明文由该版本记录自己的 blocks 经 `materialize.rebuildFile` 重建并先比对 `sha256`/`size`，不是重读已经变化的源文件。
+- **失败语义（先写副本、后写记录）**：副本重建/写入失败 → 具名 `BACKUP_ROTATION_WRITE_FAILED` 且**不写记录**（记录不承诺不存在的副本），快照已提交时引擎照旧返回 `committed: true`；记录写失败留下的孤儿 `.enc` 无害，由 `gc` 清理。
+- **剪枝/gc**：`pruneOldVersions` 剪记录时先删记录、再删配对副本；`gc` 在安全路径上删除 `old/` 下没有任何剩余记录引用的 `.json.enc`，被引用的副本永不删；`BACKUP_GC_UNSAFE` 仍然整体拒绝、零删除（结果新增 `old_versions.full_copies_pruned` 与 `orphan_full_copies`）。
+- **接口面**：CLI `w2m-backup run --old-format records|full`（非法值退出码 2，人类输出新增 `old format` 行）；插件配置 `backupOldFormat`（非法值 `BACKUP_CONFIG_INVALID` 拒绝挂载）；引擎 `runBackup({oldFormat})`，结果恒有 `old_format`、仅 `full` 时出现 `full_old_versions`；错误码新增 `BACKUP_ROTATION_FORMAT_INVALID`。完整设计见 `docs/BACKUP-DESIGN.md` §24。
+- **存储诚实**：`full` 让每个被淘汰版本的字节在去重 blocks 之上**再加一份**（114 MB 会话、10 个版本 ≈ 多 1.1 GB），所以默认保持 `records`；CLI 人类输出会打印 "storage doubles per superseded version"。
+- **测试**：`backup-rotation`（默认/非法值、写记录 + 副本并用 `openObject` 以 `old` 身份解开逐字节比对、块身份解不开、records 模式无 `.enc`、剪枝删配对副本、副本写失败/重建失败/缺 DEK 三类具名拒绝且指针不动）；`backup-gc`（孤儿副本删、被引用副本留、剪枝连带删、dry-run 只报不删、UNSAFE 零删除）；`backup-engine`（`oldFormat: 'full'` 轮转并回报 `full_old_versions`、默认无该键、非法值在 ensureLayout 前拒绝、副本写失败时 `committed: true`）；`backup-run`（CLI `--old-format` 解析/退出码 2/真实入口、人类输出、插件配置归一化）。无新增测试文件，`package.json#scripts.test` 不变。
+- **诚实边界**：restore/archive/verify 仍走记录 + blocks，尚无"从 full 副本直接还原"的命令；镜像仍不复制 `old/`；`verify` 尚未逐份解密 `.enc`；未 bump 版本、未跑 preflight、未提交。
 ### 备份面板范围入口（v3.5.0 面板补全，未发布）
 
 - **`lib/client.js`：备份&还原面板补上 DEV-PLAN 4.1 的两个范围入口**：`backup-selected`（勾选会话 → `{confirm:'run',scope:'selected',selected:[ids]}`，无勾选时禁用）与 `backup-active`（`{confirm:'run',scope:'active'}`），与既有四个操作并列；新增「备份范围」卡，会话来自**只读**的 `GET /api/w2m/backup/scan?detail=1`（每个会话一个 `data-w2m-backup-pick` 勾选框，显示 id 后缀/工作区/已归档标记，`已选 n/m` 计数、全选/清空、上限滚动列表），404 或扫描失败只显示中性提示 +「刷新会话」重试，**不抛异常、不阻塞面板**；两个入口各有独立 busy 文案，操作期间六个操作一起禁用。i18n `panel.backup.*` 中英各 +16 键（共 139 键）。诚实边界：扫描只读、勾选不持久化（刷新页面即丢）、选中不会改变 `archived`/`all` 的覆盖范围——已归档会话仍按原范围备份。

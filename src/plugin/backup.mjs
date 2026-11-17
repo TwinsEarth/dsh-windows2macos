@@ -43,7 +43,7 @@ import { createDailyScheduler, DEFAULT_CATCH_UP_MS } from './schedule.mjs';
 import { runBackup, SCOPES } from '../backup/engine.mjs';
 import { buildStatus } from '../backup/routes.mjs';
 import { describeBackupSchedule, normalizeBackupSchedule } from '../backup/schedule.mjs';
-import { DEFAULT_KEEP_OLD } from '../backup/rotation.mjs';
+import { DEFAULT_KEEP_OLD, DEFAULT_OLD_FORMAT, OLD_FORMATS } from '../backup/rotation.mjs';
 
 export const name = 'w2m-dsh-backup';
 
@@ -94,14 +94,19 @@ export function defaultBackupDir(platform = process.platform) {
  * Normalize the row's configuration into everything `apply` needs.
  *
  * `backupOldVersionDays` is the age half of the retention policy: an integer >= 0, where 0 (the default) means
- * "per-session count only". `backupMirrorDir` is the offsite mirror directory; absent/empty means no mirror, and
- * a non-string value is refused rather than silently ignored (a typo in the row should not mount a plugin that
- * silently copies nowhere).
+ * "per-session count only". `backupOldFormat` selects what a superseded version costs: `records` (the default)
+ * keeps the deduplicated version record only, `full` also writes one sealed whole-file copy per rotated version
+ * and therefore doubles that version's bytes. Any other value is refused rather than ignored -- an operator who
+ * wrote `backupOldFormat: full` and silently got records would believe copies exist that do not.
+ * `backupMirrorDir` is the offsite mirror directory; absent/empty means no mirror, and a non-string value is
+ * refused rather than silently ignored (a typo in the row should not mount a plugin that silently copies
+ * nowhere).
  *
  * @param {object} [config]
  * @param {{env?: Record<string, string|undefined>, platform?: string}} [deps]
  * @returns {{ok: true, enabled: boolean, backup_dir: string, times: string[], time_zone: string, catch_up_ms: number,
- *   scope: string, keep_old_per_session: number, old_version_days: number, mirror_dir: string|null, dsh_home: string}
+ *   scope: string, keep_old_per_session: number, old_version_days: number, old_format: 'records'|'full',
+ *   mirror_dir: string|null, dsh_home: string}
  *   | {ok: false, reason_code: string, detail: string}}
  */
 export function normalizeConfig(config = {}, deps = {}) {
@@ -136,6 +141,17 @@ export function normalizeConfig(config = {}, deps = {}) {
       ok: false,
       reason_code: 'BACKUP_CONFIG_INVALID',
       detail: `backupOldVersionDays must be a non-negative integer, got ${JSON.stringify(oldVersionDays)}`,
+    };
+  }
+  // The `old/` shape: `records` (default) keeps the deduplicated record only, `full` adds a sealed whole-file
+  // copy per superseded version. Refused here, like the age rule, so a bad row fails the mount with a
+  // configuration code instead of failing a scheduled run at 22:00.
+  const oldFormat = config.backupOldFormat ?? DEFAULT_OLD_FORMAT;
+  if (!OLD_FORMATS.includes(oldFormat)) {
+    return {
+      ok: false,
+      reason_code: 'BACKUP_CONFIG_INVALID',
+      detail: `backupOldFormat must be one of ${OLD_FORMATS.join(', ')}, got ${JSON.stringify(oldFormat)}`,
     };
   }
   // The offsite mirror directory: absent/empty -> no mirror; a non-string given value is refused. The path is
@@ -175,6 +191,7 @@ export function normalizeConfig(config = {}, deps = {}) {
     future_append: futureAppend,
     keep_old_per_session: keepOld,
     old_version_days: oldVersionDays ?? 0,
+    old_format: oldFormat,
     mirror_dir: mirrorDir,
     registry_recheck_ms: registryRecheckMs,
     dsh_home: dshHome,
@@ -186,7 +203,7 @@ export function normalizeConfig(config = {}, deps = {}) {
  *
  * @param {object} ctx Cordis context
  * @param {object} [config] row configuration (`backupDir`, `backupTimes`, `backupTimeZone`, `backupScope`,
- *   `keepOldPerSession`, `backupOldVersionDays`, `backupMirrorDir`, `backupEnabled`)
+ *   `keepOldPerSession`, `backupOldVersionDays`, `backupOldFormat`, `backupMirrorDir`, `backupEnabled`)
  */
 export function apply(ctx, config = {}) {
   const cfg = normalizeConfig(config);
@@ -208,6 +225,7 @@ export function apply(ctx, config = {}) {
     scope: cfg.scope,
     keep_old_per_session: cfg.keep_old_per_session,
     old_version_days: cfg.old_version_days,
+    old_format: cfg.old_format,
     mirror_dir: cfg.mirror_dir,
     runs: 0,
     failures: 0,
@@ -231,6 +249,7 @@ export function apply(ctx, config = {}) {
         selected: request?.selected ?? [],
         keepOldPerSession: cfg.keep_old_per_session,
         maxOldVersionDays: cfg.old_version_days,
+        oldFormat: cfg.old_format,
         mirrorRoot: cfg.mirror_dir,
         machineKey: cfg.machine_key,
         futureAppend: cfg.future_append,
@@ -248,6 +267,8 @@ export function apply(ctx, config = {}) {
           dedupe_ratio: result.dedupe_ratio,
           duration_ms: result.duration_ms,
           rotated: result.rotated,
+          old_format: result.old_format,
+          full_old_versions: result.full_old_versions ?? [],
           future_append: result.future_append ?? null,
           // The offsite copy is best effort: the primary result stays `ok` and the failure is visible here.
           mirror: result.mirror ?? null,
@@ -319,6 +340,7 @@ export function apply(ctx, config = {}) {
               backup_dir: cfg.backup_dir,
               dsh_home: cfg.dsh_home,
               retention: { keep_old_per_session: cfg.keep_old_per_session, old_version_days: cfg.old_version_days },
+              old_format: cfg.old_format,
               mirror_dir: cfg.mirror_dir,
               schedule: describeBackupSchedule({ enabled: true, times: cfg.times, timeZone: cfg.time_zone }),
               scheduler: scheduler.describe(),

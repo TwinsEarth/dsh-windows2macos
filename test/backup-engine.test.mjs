@@ -601,3 +601,88 @@ describe('engine: unlocking the way the scheduler will', () => {
     }
   });
 });
+
+describe('engine: oldFormat full (a literal sealed copy of the superseded version)', () => {
+  it('rotates with a decryptable whole-file copy and reports it, while the default reports none', () => {
+    const { home, cleanup: cleanHome } = homeFixture();
+    const { root, cleanup } = repoFixture();
+    try {
+      const first = run(root, home);
+      assert.equal(first.ok, true, first.detail);
+      assert.equal(first.old_format, 'records', 'records stays the default');
+      assert.equal('full_old_versions' in first, false, 'the default result shape is unchanged');
+
+      const target = join(home, 'sessions', '--E-GPT--', 'session-aaaaaaaa-0001', 'session.v4.jsonl.zstd');
+      const superseded = readFileSync(target);
+      writeFileSync(target, sessionLog('session-aaaaaaaa-0001', [event(0), event(1), event(2), event(3)]));
+
+      const second = run(root, home, { oldFormat: 'full' });
+      assert.equal(second.ok, true, second.detail);
+      assert.equal(second.old_format, 'full');
+      assert.equal(second.rotated, 1);
+      assert.equal(second.full_old_versions.length, 1);
+
+      const record = listOldVersions(root, { sessionId: 'session-aaaaaaaa-0001' })[0]?.record;
+      assert.ok(record?.full_copy, 'the version record must name its sealed copy');
+      assert.equal(record.full_copy.file, second.full_old_versions[0]);
+      const key = openRepoKey({ root, dshHome: home, password: PASSWORD, platform: PLATFORM });
+      assert.equal(key.ok, true, key.detail ?? '');
+      const opened = openObject(readFileSync(join(root, ...record.full_copy.file.split('/'))), key.dek, {
+        sha256: record.full_copy.sha256,
+        length: record.full_copy.size,
+        kind: 'old',
+      });
+      assert.deepEqual(opened, superseded, 'the copy must be the superseded version, byte for byte');
+      assert.equal(sha256Hex(opened), sha256Hex(superseded));
+
+      // An unchanged session rotates nothing, so it gains neither a record nor a copy.
+      const third = run(root, home, { oldFormat: 'full' });
+      assert.equal(third.ok, true, third.detail);
+      assert.equal(third.rotated, 0);
+      assert.deepEqual(third.full_old_versions, []);
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+
+  it('refuses an invalid oldFormat before creating the repository', () => {
+    const { home, cleanup: cleanHome } = homeFixture();
+    const { dir, cleanup } = tempDir('w2m-engine-format-invalid-');
+    try {
+      const repo = join(dir, 'repo');
+      const result = runBackup({ root: repo, dshHome: home, password: PASSWORD, platform: PLATFORM, oldFormat: 'full-ish' });
+      assert.equal(result.ok, false);
+      assert.equal(result.reason_code, 'BACKUP_ROTATION_FORMAT_INVALID');
+      assert.match(result.detail, /oldFormat/u);
+      assert.equal(existsSync(repo), false, 'the refusal happens before ensureLayout');
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+
+  it('reports the committed snapshot when the full copy cannot be written', () => {
+    const { home, cleanup: cleanHome } = homeFixture();
+    const { root, cleanup } = repoFixture();
+    try {
+      const first = run(root, home);
+      assert.equal(first.ok, true, first.detail);
+      // A file where the workspace's rotation directory should be makes the sealed copy's write fail.
+      writeFileSync(join(root, 'old', '--E-GPT--'), 'not a directory');
+      const target = join(home, 'sessions', '--E-GPT--', 'session-aaaaaaaa-0001', 'session.v4.jsonl.zstd');
+      writeFileSync(target, sessionLog('session-aaaaaaaa-0001', [event(9), event(10)]));
+
+      const second = run(root, home, { oldFormat: 'full' });
+      assert.equal(second.ok, false, 'the copy failure must make the run report a problem');
+      assert.equal(second.reason_code, 'BACKUP_ROTATION_WRITE_FAILED');
+      assert.equal(second.committed, true, 'the snapshot itself is durable and must be reported as such');
+      assert.match(second.snapshot_id, /^\d{8}T\d{6}Z-[0-9a-f]{8}$/u);
+      assert.equal(readIndex(root).entries.length, 2, 'the index still records the committed snapshot');
+      assert.equal(listOldVersions(root).length, 0, 'no record may claim a copy that was never written');
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+});

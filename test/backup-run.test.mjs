@@ -118,6 +118,20 @@ describe('subplugin: configuration', () => {
     }
   });
 
+  it('normalizes backupOldFormat and refuses an invalid value', () => {
+    const defaults = normalizeConfig({}, { env: {}, platform: 'win32' });
+    assert.equal(defaults.ok, true);
+    assert.equal(defaults.old_format, 'records', 'records is the default: the dedupe-preserving shape');
+    assert.equal(normalizeConfig({ backupOldFormat: 'records' }, { env: {}, platform: 'win32' }).old_format, 'records');
+    assert.equal(normalizeConfig({ backupOldFormat: 'full' }, { env: {}, platform: 'win32' }).old_format, 'full');
+    for (const bad of ['FULL', 'record', 1, true]) {
+      const refused = normalizeConfig({ backupOldFormat: bad }, { env: {}, platform: 'win32' });
+      assert.equal(refused.ok, false, `backupOldFormat=${String(bad)} must be refused`);
+      assert.equal(refused.reason_code, 'BACKUP_CONFIG_INVALID');
+      assert.match(refused.detail, /backupOldFormat must be one of records, full/u);
+    }
+  });
+
   it('normalizes the offsite mirror directory, treating absent/empty as none and refusing a non-string', () => {
     const { dir, cleanup } = tempDir('w2m-config-mirror-');
     try {
@@ -165,6 +179,7 @@ describe('subplugin: the route and the timer', () => {
       assert.deepEqual(state.schedule.times, ['23:59:59']);
       assert.equal(state.schedule.time_zone, 'UTC');
       assert.equal(state.scheduler.time_zone, 'UTC');
+      assert.equal(state.old_format, 'records', 'the describe payload names the default old-version shape');
 
       fake.disposers[0]();
       const stopped = await (await fake.registrations.find((row) => row.path === BACKUP_RUN_ROUTE_PATH).fetch(new Request(`http://local.invalid${BACKUP_RUN_ROUTE_PATH}`, { method: 'GET' }))).json();
@@ -492,6 +507,55 @@ describe('cli: run / list / gc', () => {
       assert.equal(parseArgs(['gc', '--max-old-days='], env).error, '--max-old-days needs a non-negative integer, got ""');
     } finally {
       cleanup();
+    }
+  });
+
+  it('parses --old-format, refuses an invalid value with exit 2, and sends full through to the engine', () => {
+    const { home, files, cleanup: cleanHome } = homeFixture();
+    const { dir, cleanup } = tempDir('w2m-cli-old-format-');
+    try {
+      const env = { W2M_BACKUP_NO_MACHINE_KEY: '1' };
+      assert.equal(parseArgs(['run', '--old-format', 'full'], env).oldFormat, 'full');
+      assert.equal(parseArgs(['run', '--old-format=records'], env).oldFormat, 'records');
+      assert.equal(parseArgs(['run'], env).oldFormat, null, 'absent means the engine default (records)');
+      const invalid = parseArgs(['run', '--old-format=nope'], env);
+      assert.match(invalid.error, /--old-format must be one of records, full/u);
+      const usage = capture();
+      assert.equal(main(['run', '--old-format', 'nope'], { ...usage.io, env, password: PASSWORD }), 2);
+      assert.match(usage.lines.join('\n'), /--old-format must be one of records, full/u);
+
+      const repo = join(dir, 'repo');
+      const first = capture();
+      assert.equal(main(['run', '--backup-dir', repo, '--dsh-home', home, '--json'], { ...first.io, env, password: PASSWORD }), 0, first.lines.join('\n'));
+      const firstJson = JSON.parse(first.lines.join('\n'));
+      assert.equal(firstJson.old_format, 'records');
+      assert.equal('full_old_versions' in firstJson, false);
+
+      writeFileSync(files['session-aaaaaaaa-0001'], sessionLog('session-aaaaaaaa-0001', [event(0), event(1), event(2), event(3)]));
+      const second = capture();
+      assert.equal(
+        main(['run', '--backup-dir', repo, '--dsh-home', home, '--old-format', 'full', '--json'], { ...second.io, env, password: PASSWORD }),
+        0,
+        second.lines.join('\n'),
+      );
+      const payload = JSON.parse(second.lines.join('\n'));
+      assert.equal(payload.old_format, 'full');
+      assert.equal(payload.rotated, 1);
+      assert.equal(payload.full_old_versions.length, 1);
+      assert.equal(existsSync(join(repo, ...payload.full_old_versions[0].split('/'))), true);
+
+      const human = capture();
+      assert.equal(
+        main(['run', '--backup-dir', repo, '--dsh-home', home, '--old-format', 'full'], { ...human.io, env, password: PASSWORD }),
+        0,
+        human.lines.join('\n'),
+      );
+      const text = human.lines.join('\n');
+      assert.match(text, /old format {4}: full/u);
+      assert.match(text, /storage doubles/u, 'the human summary must state the doubled-storage cost');
+    } finally {
+      cleanup();
+      cleanHome();
     }
   });
 });

@@ -10,12 +10,12 @@ import { existsSync, mkdirSync, renameSync, utimesSync, writeFileSync } from 'no
 import os from 'node:os';
 import { join } from 'node:path';
 
-import { gc, collectReferences, listObjects, STALE_TMP_MS } from '../src/backup/gc.mjs';
+import { collectOrphanFullCopies, gc, collectReferences, listFullCopies, listObjects, STALE_TMP_MS } from '../src/backup/gc.mjs';
 import { LOCK_FILE } from '../src/backup/locks.mjs';
 import { ensureLayout, repoPaths } from '../src/backup/layout.mjs';
 import { buildManifest } from '../src/backup/manifest.mjs';
 import { commitSnapshot, makeSnapshotId } from '../src/backup/repo.mjs';
-import { writeCurrentPointer, recordSupersededVersion, listOldVersions } from '../src/backup/rotation.mjs';
+import { OLD_FORMAT, writeCurrentPointer, recordSupersededVersion, listOldVersions } from '../src/backup/rotation.mjs';
 import { MIN_SCRYPT, randomDek, wrapDek } from '../src/backup/crypto.mjs';
 import { tempDir } from './helpers/backup-fixture.mjs';
 
@@ -393,6 +393,112 @@ describe('gc: leftovers and locking', () => {
       assert.equal(result.safe, false);
       assert.equal(result.reason_code, 'BACKUP_LOCKED');
       assert.equal(listObjects(root).length, objectsBefore, 'a locked gc must delete nothing');
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+/** Write one v1 version record that points at a sealed copy, creating both files. */
+function putFullCopyRecord(root, entry, name) {
+  const dir = join(root, 'old', entry.workspace, entry.session_id);
+  mkdirSync(dir, { recursive: true });
+  const copyName = `${name}.json.enc`;
+  const copy = join(dir, copyName);
+  writeFileSync(copy, Buffer.alloc(24, 7));
+  const record = {
+    format: OLD_FORMAT,
+    version: 1,
+    rel: entry.rel,
+    session_id: entry.session_id,
+    workspace: entry.workspace,
+    sha256: entry.sha256,
+    size: entry.size,
+    blocks: entry.blocks,
+    snapshot_id: `${name}-snap`,
+    superseded_by: `${name}-next`,
+    recorded_at: '2026-11-17T13:00:00.000Z',
+    full_copy: { file: `old/${entry.workspace}/${entry.session_id}/${copyName}`, sha256: entry.sha256, size: entry.size },
+  };
+  const recordFile = join(dir, `${name}.json`);
+  writeFileSync(recordFile, `${JSON.stringify(record, null, 2)}\n`);
+  return { recordFile, copy };
+}
+
+describe('gc: whole-file copies (oldFormat: full)', () => {
+  it('removes a sealed copy no record references and keeps the one a record points at', () => {
+    const { root, cleanup, manifest } = repoWithSnapshot();
+    try {
+      const entry = manifest.files[0];
+      const { copy } = putFullCopyRecord(root, entry, '20261117T130000Z-aaaaaaaaaaaa');
+      const orphan = join(root, 'old', entry.workspace, entry.session_id, '20261117T120000Z-bbbbbbbbbbbb.json.enc');
+      writeFileSync(orphan, Buffer.alloc(9, 1));
+      assert.equal(listFullCopies(root).length, 2);
+      assert.deepEqual(collectOrphanFullCopies({ root, dryRun: true }).files, [orphan]);
+
+      const result = gc({ root });
+      assert.equal(result.safe, true);
+      assert.equal(result.ok, true);
+      assert.deepEqual(result.orphan_full_copies, { scanned: 2, removed: 1, reclaimed_bytes: 9 });
+      assert.equal(existsSync(orphan), false);
+      assert.equal(existsSync(copy), true, 'a copy a live record references must never be deleted');
+      assert.equal(listOldVersions(root).length, 1);
+
+      const second = gc({ root });
+      assert.equal(second.orphan_full_copies.removed, 0, 'a second gc has nothing left to collect');
+      assert.equal(existsSync(copy), true);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('prunes a record and its paired copy together, so nothing is left for the orphan sweep', () => {
+    const { root, cleanup, manifest } = repoWithSnapshot();
+    try {
+      const { recordFile, copy } = putFullCopyRecord(root, manifest.files[0], '20261117T130000Z-aaaaaaaaaaaa');
+      const result = gc({ root, keepOldPerSession: 0 });
+      assert.equal(result.safe, true);
+      assert.equal(result.old_versions.pruned, 1);
+      assert.equal(result.old_versions.full_copies_pruned, 1);
+      assert.equal(result.orphan_full_copies.scanned, 0, 'the paired copy was already deleted with its record');
+      assert.equal(existsSync(recordFile), false);
+      assert.equal(existsSync(copy), false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('reports orphan copies in a dry run and deletes nothing', () => {
+    const { root, cleanup, manifest } = repoWithSnapshot();
+    try {
+      const entry = manifest.files[0];
+      putFullCopyRecord(root, entry, '20261117T130000Z-aaaaaaaaaaaa');
+      const orphan = join(root, 'old', entry.workspace, entry.session_id, '20261117T110000Z-cccccccccccc.json.enc');
+      writeFileSync(orphan, Buffer.alloc(5, 1));
+      const result = gc({ root, dryRun: true });
+      assert.equal(result.dry_run, true);
+      assert.equal(result.orphan_full_copies.scanned, 2);
+      assert.equal(result.orphan_full_copies.removed, 1);
+      assert.equal(result.orphan_full_copies.reclaimed_bytes, 5);
+      assert.equal(existsSync(orphan), true, 'a dry run must not delete');
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('the unsafe refusal still wins: an unreadable reference deletes no orphan copy either', () => {
+    const { root, cleanup, snapshotId, manifest } = repoWithSnapshot();
+    try {
+      const entry = manifest.files[0];
+      const orphan = join(root, 'old', entry.workspace, entry.session_id, '20261117T110000Z-cccccccccccc.json.enc');
+      mkdirSync(join(root, 'old', entry.workspace, entry.session_id), { recursive: true });
+      writeFileSync(orphan, Buffer.alloc(5, 1));
+      writeFileSync(join(repoPaths(root).snapshots, snapshotId, 'manifest.json'), '{ not json');
+      const result = gc({ root });
+      assert.equal(result.safe, false);
+      assert.equal(result.reason_code, 'BACKUP_GC_UNSAFE');
+      assert.equal(result.orphan_full_copies.removed, 0);
+      assert.equal(existsSync(orphan), true, 'an unsafe gc deletes nothing, including orphan copies');
     } finally {
       cleanup();
     }

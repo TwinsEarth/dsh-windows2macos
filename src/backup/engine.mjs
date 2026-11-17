@@ -35,6 +35,18 @@
  * `ok: true` result: the primary backup is durable and correct, and a second copy that failed must not downgrade
  * it. With no mirror configured the result shape is unchanged (no `mirror` key).
  *
+ * ## `oldFormat` decides what a superseded version costs
+ *
+ * `oldFormat: 'records'` (the default) keeps the deduplicated version record only. `oldFormat: 'full'` also
+ * writes one sealed whole-file copy per rotated version (see `rotation.mjs`), which doubles the bytes of every
+ * superseded version on top of the blocks it already references -- the cost the default exists to avoid, so it
+ * is opt-in. The option is validated before the lock, the layout and the key, like the retention window and the
+ * mirror: a typo is a configuration mistake and must not surface after a committed snapshot. In `full` mode the
+ * DEK is handed to rotation, which rebuilds the superseded bytes from their blocks and seals them; a copy that
+ * cannot be written refuses the rotation (`BACKUP_ROTATION_WRITE_FAILED`) rather than recording a copy that is
+ * not there, and the already-committed snapshot is reported with `committed: true` exactly as any rotation
+ * failure is.
+ *
  * Every refusal is a `{ok:false, reason_code, detail}` result, not an exception: the route and the CLI print the
  * same refusal, and a scheduled run logs it instead of tearing the timer down.
  */
@@ -52,7 +64,7 @@ import { detectMachineKeySupport } from './machine-key.mjs';
 import { appendLegalEvent, futureAppendVerdict } from './future-append.mjs';
 import { buildArtifactFromBuffer, runtimeValidateBatch } from './runtime-validate.mjs';
 import { scanHome } from './scan.mjs';
-import { DEFAULT_KEEP_OLD, resolveMaxAgeDays, rotateForEntry } from './rotation.mjs';
+import { DEFAULT_KEEP_OLD, resolveMaxAgeDays, resolveOldFormat, rotateForEntry } from './rotation.mjs';
 import { MIRROR_CODES, resolveMirrorRoot, syncToMirror } from './mirror.mjs';
 import { commitSnapshot, makeSnapshotId } from './repo.mjs';
 import { scanFrames } from '../fix/zstd.mjs';
@@ -263,6 +275,7 @@ function safeMtime(file) {
  *   now?: Date,
  *   keepOldPerSession?: number,
  *   maxOldVersionDays?: number|null,
+ *   oldFormat?: 'records'|'full',
  *   mirrorRoot?: string|null,
  *   dryRun?: boolean,
  *   exclude_session_ids?: string[],
@@ -287,6 +300,13 @@ export function runBackup(input) {
     return { ok: false, reason_code: agePolicy.reason_code, detail: agePolicy.detail, dry_run: dryRun };
   }
   const maxOldVersionDays = agePolicy.maxAgeDays;
+  // The `old/` shape is validated here for the same reason as the retention window: `full` changes what rotation
+  // writes, and an unknown value must be refused before the lock/layout/key rather than discovered after commit.
+  const formatPolicy = resolveOldFormat(input.oldFormat);
+  if (formatPolicy.ok !== true) {
+    return { ok: false, reason_code: formatPolicy.reason_code, detail: formatPolicy.detail, dry_run: dryRun };
+  }
+  const oldFormat = formatPolicy.format;
 
   // The offsite mirror is validated here too: a mirror path that points inside the repository (or the home it
   // copies) is refused before ensureLayout/lock/commit, so a refused configuration leaves no snapshot behind.
@@ -506,6 +526,7 @@ export function runBackup(input) {
         key_upgraded: key.machine_envelope_added === true,
         keep_old_per_session: keepOld,
         max_old_version_days: maxOldVersionDays,
+        old_format: oldFormat,
         duration_ms: Date.now() - started,
       };
     }
@@ -522,6 +543,10 @@ export function runBackup(input) {
         keep: keepOld,
         maxAgeDays: maxOldVersionDays,
         now,
+        // `full` needs the DEK to seal the whole-file copy; `records` ignores it. Passing it unconditionally keeps
+        // the call site from having two shapes that could drift apart.
+        format: oldFormat,
+        dek: key.dek,
       }));
     } catch (error) {
       return {
@@ -538,6 +563,9 @@ export function runBackup(input) {
       };
     }
     const rotated = rotations.filter((row) => row.rotated === true);
+    // The sealed whole-file copies, in rotation order. Only `full` mode produces them, and the key is only added
+    // in that mode so a default run keeps exactly the result shape it had before this option existed.
+    const fullOldVersions = rotated.map((row) => row.full_copy?.file).filter((file) => typeof file === 'string');
 
     // The offsite copy is strictly after the primary commit and rotation: it is a second, best-effort location,
     // never a precondition. A mirror failure is reported in the result and as a warning, but it does not roll
@@ -595,8 +623,10 @@ export function runBackup(input) {
       machine: { available: key.machine?.ok === true, reason: key.machine?.reason ?? null },
       keep_old_per_session: keepOld,
       max_old_version_days: maxOldVersionDays,
+      old_format: oldFormat,
       rotated: rotated.length,
       old_versions: rotated.map((row) => row.old_file),
+      ...(oldFormat === 'full' ? { full_old_versions: fullOldVersions } : {}),
       // Absent unless a mirror is configured: a repository with no mirror keeps the exact result shape it had
       // before the offsite feature existed.
       ...(mirrorRoot === null ? {} : { mirror }),

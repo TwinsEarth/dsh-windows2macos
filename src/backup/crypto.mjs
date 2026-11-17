@@ -74,6 +74,17 @@ export const SALT_LENGTH = 16;
 /** Magic bytes at the start of an encrypted block object (`objects/<aa>/<hash>`). */
 export const OBJECT_MAGIC = Buffer.from('W2MBLOB1', 'ascii');
 
+/**
+ * AAD container name of a sealed **whole-file copy**: `old/<ws>/<sid>/<ts>-<sha12>.json.enc`.
+ *
+ * A deduplicated block is bound to `w2m-session-backup/object|<sha256>|<length>`; a whole-file copy is bound to
+ * `w2m-session-backup/old|<sha256>|<length>` (`rotation.mjs`'s `oldFormat: 'full'`). The two namespaces are
+ * deliberately disjoint -- a copy cannot be swapped in where a block object is expected (or the reverse),
+ * because the AAD differs and GCM authentication fails. Pass it as `identity.kind`; block objects omit `kind`
+ * and keep the AAD they have always had, so this is purely additive.
+ */
+export const OLD_COPY_KIND = 'old';
+
 /** Envelope kinds, in the order `unwrapDek` tries them. */
 export const ENVELOPE_KINDS = Object.freeze(['account', 'machine', 'password']);
 
@@ -448,14 +459,16 @@ export function validateKeysFile(keysFile) {
 }
 
 /**
- * Seal one block object for disk: `MAGIC | nonce | ciphertext | tag`, bound to the block's digest.
+ * Seal one object for disk: `MAGIC | nonce | ciphertext | tag`, bound to the plaintext's digest.
  *
- * The object name is the digest of the *plaintext* block, so the AAD is that digest plus the plaintext length.
- * A block moved to another digest's slot therefore fails authentication even though the ciphertext is intact.
+ * The same container is used for a deduplicated block (`objects/<aa>/<sha256>`) and for the optional
+ * whole-file copy of a superseded version (`old/<ws>/<sid>/<ts>-<sha12>.json.enc`); `identity.kind` names which
+ * one it is. The AAD is the digest plus the plaintext length, so an object moved to another digest's slot fails
+ * authentication even though the ciphertext is intact, and a copy cannot open as a block.
  *
  * @param {Buffer} plaintext
  * @param {Buffer} dek
- * @param {{sha256: string}} identity
+ * @param {{sha256: string, kind?: string}} identity `kind: OLD_COPY_KIND` names a whole-file copy; omit for a block
  * @returns {Buffer}
  */
 export function sealObject(plaintext, dek, identity) {
@@ -467,12 +480,12 @@ export function sealObject(plaintext, dek, identity) {
 }
 
 /**
- * Open one block object and verify both the container and the digest.
+ * Open one sealed object and verify both the container and the digest.
  *
  * @param {Buffer} object
  * @param {Buffer} dek
- * @param {{sha256: string, length?: number}} identity
- * @returns {Buffer} the plaintext block
+ * @param {{sha256: string, length?: number, kind?: string}} identity `kind: OLD_COPY_KIND` for a whole-file copy
+ * @returns {Buffer} the plaintext (a block, or the whole superseded file for `kind: OLD_COPY_KIND`)
  */
 export function openObject(object, dek, identity) {
   if (!Buffer.isBuffer(object) || object.length < OBJECT_MAGIC.length + NONCE_LENGTH + TAG_LENGTH) {
@@ -505,10 +518,13 @@ export function openObject(object, dek, identity) {
   return plaintext;
 }
 
-/** The AAD of a sealed block object. */
+/** The AAD of a sealed object: `w2m-session-backup/<kind>|<sha256>|<length>`, `kind` defaulting to `object`. */
 function objectAad(identity, length) {
   const declared = length === null || length === undefined ? '' : String(length);
-  return `w2m-session-backup/object|${String(identity?.sha256 ?? '')}|${declared}`;
+  // `kind` is opt-in and only `OLD_COPY_KIND` is recognised: anything else stays a block object, so a typo
+  // cannot silently invent a third namespace that nothing else knows how to open.
+  const kind = identity?.kind === OLD_COPY_KIND ? OLD_COPY_KIND : 'object';
+  return `w2m-session-backup/${kind}|${String(identity?.sha256 ?? '')}|${declared}`;
 }
 
 /**

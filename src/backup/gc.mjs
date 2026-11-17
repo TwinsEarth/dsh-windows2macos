@@ -16,6 +16,15 @@
  * `keepOldPerSession` and, optionally, by the `maxOldVersionDays` age window; both are the same retention
  * function rotation uses (`rotation.mjs#pruneOldVersions`), so a scheduled gc and a rotation prune identically.
  *
+ * ## Orphan whole-file copies (`oldFormat: 'full'`)
+ *
+ * A `full` repository keeps `<ts>-<sha12>.json.enc` beside each version record. Two harmless leftovers are
+ * possible: rotation prunes a record and then deletes its copy (a crash between the two leaves the copy), or a
+ * record write fails after the copy already landed. Such a copy is referenced by nothing, so gc removes every
+ * `.json.enc` under `old/` that no **remaining** record points at. A copy a live record references is never
+ * touched. The scan only runs on the safe path (after `collectReferences` returned no problems), so an
+ * unreadable repository still deletes nothing at all.
+ *
  * ## Ordering: a record pruned here cannot orphan a block in the same run
  *
  * The reference set is collected **once, before any deletion**, and every block is judged against that set.
@@ -33,7 +42,7 @@ import { repoPaths } from './layout.mjs';
 import { readJsonSafe } from './atomic.mjs';
 import { withRepoLock } from './locks.mjs';
 import { readSnapshot, listSnapshots } from './repo.mjs';
-import { DEFAULT_KEEP_OLD, OLD_FORMAT, ROTATION_CODES, pruneOldVersions, resolveMaxAgeDays } from './rotation.mjs';
+import { DEFAULT_KEEP_OLD, OLD_FORMAT, ROTATION_CODES, fullCopyPathFor, pruneOldVersions, resolveMaxAgeDays } from './rotation.mjs';
 
 /** Named gc failure codes. */
 export const GC_CODES = Object.freeze({
@@ -111,6 +120,92 @@ export function readOldRecords(root) {
   };
   walk(base);
   return { records: out, problems };
+}
+
+/**
+ * Every sealed whole-file copy under `old/` (`<ts>-<sha12>.json.enc`), with its size.
+ *
+ * Deliberately name-based: these files are ciphertext, so gc cannot ask them what record they belong to -- the
+ * records are the authority, which is why {@link collectOrphanFullCopies} re-reads them.
+ *
+ * @param {string} root
+ * @returns {Array<{file: string, size: number}>}
+ */
+export function listFullCopies(root) {
+  const base = path.join(path.resolve(root), 'old');
+  const out = [];
+  const walk = (dir) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+        continue;
+      }
+      if (!entry.isFile() || !entry.name.endsWith('.json.enc')) continue;
+      let stat;
+      try {
+        stat = fs.statSync(full);
+      } catch {
+        continue;
+      }
+      out.push({ file: full, size: stat.size });
+    }
+  };
+  walk(base);
+  return out;
+}
+
+/**
+ * Remove whole-file copies that no remaining version record references.
+ *
+ * Called **after** `pruneOldVersions`, so a record pruned in this same run no longer counts as a reference and
+ * its copy (if the paired delete did not happen) is collected here. The reference set is re-read from the
+ * records that are actually left; if any of them is unreadable the cleanup refuses to delete anything and
+ * reports the problems instead -- a `.enc` whose ownership cannot be established survives to the next run, which
+ * is the same posture the block collector takes.
+ *
+ * @param {{root: string, dryRun?: boolean}} input
+ * @returns {{scanned: number, removed: number, reclaimed_bytes: number, files: string[],
+ *   problems: Array<{file: string, detail: string}>}}
+ */
+export function collectOrphanFullCopies(input) {
+  const root = path.resolve(input.root);
+  const copies = listFullCopies(root);
+  const old = readOldRecords(root);
+  if (old.problems.length > 0) {
+    return { scanned: copies.length, removed: 0, reclaimed_bytes: 0, files: [], problems: old.problems };
+  }
+  const referenced = new Set();
+  for (const row of old.records) {
+    const file = fullCopyPathFor(root, row.record);
+    if (file !== null) referenced.add(path.resolve(file));
+  }
+  let removed = 0;
+  let reclaimed = 0;
+  const files = [];
+  for (const copy of copies) {
+    if (referenced.has(path.resolve(copy.file))) continue;
+    files.push(copy.file);
+    if (input.dryRun === true) {
+      removed += 1;
+      reclaimed += copy.size;
+      continue;
+    }
+    try {
+      fs.rmSync(copy.file, { force: true });
+      removed += 1;
+      reclaimed += copy.size;
+    } catch {
+      // Reported through the count only: an undeletable orphan stays visible instead of failing the whole gc.
+    }
+  }
+  return { scanned: copies.length, removed, reclaimed_bytes: reclaimed, files, problems: [] };
 }
 
 /**
@@ -297,7 +392,8 @@ export function listObjects(root) {
  *   ok: boolean, safe: boolean, dry_run: boolean, detail?: string,
  *   references: {blocks: number, snapshots: number, old: number, current: number},
  *   blocks: {scanned: number, removed: number, reclaimed_bytes: number, kept: number},
- *   old_versions: {pruned: number, pruned_by_age: number},
+ *   old_versions: {pruned: number, pruned_by_age: number, full_copies_pruned: number},
+ *   orphan_full_copies: {scanned: number, removed: number, reclaimed_bytes: number},
  *   tmp: {scanned: number, removed: number, reclaimed_bytes: number},
  *   empty_prefixes_removed: number,
  *   problems: Array<object>, reason_code: string|null
@@ -316,7 +412,8 @@ export function gc(input) {
       dry_run: dryRun,
       references: { blocks: 0, snapshots: 0, old: 0, current: 0 },
       blocks: { scanned: 0, removed: 0, reclaimed_bytes: 0, kept: 0 },
-      old_versions: { pruned: 0, pruned_by_age: 0 },
+      old_versions: { pruned: 0, pruned_by_age: 0, full_copies_pruned: 0 },
+      orphan_full_copies: { scanned: 0, removed: 0, reclaimed_bytes: 0 },
       tmp: { scanned: 0, removed: 0, reclaimed_bytes: 0 },
       empty_prefixes_removed: 0,
       problems: [],
@@ -332,7 +429,8 @@ export function gc(input) {
       dry_run: dryRun,
       references: { blocks: 0, snapshots: 0, old: 0, current: 0 },
       blocks: { scanned: 0, removed: 0, reclaimed_bytes: 0, kept: 0 },
-      old_versions: { pruned: 0, pruned_by_age: 0 },
+      old_versions: { pruned: 0, pruned_by_age: 0, full_copies_pruned: 0 },
+      orphan_full_copies: { scanned: 0, removed: 0, reclaimed_bytes: 0 },
       tmp: { scanned: 0, removed: 0, reclaimed_bytes: 0 },
       empty_prefixes_removed: 0,
       problems: [{ file: lock.path, detail: lock.detail }],
@@ -348,7 +446,8 @@ export function gc(input) {
         dry_run: dryRun,
         references: { blocks: references.blocks.size, ...references.counts },
         blocks: { scanned: 0, removed: 0, reclaimed_bytes: 0, kept: 0 },
-        old_versions: { pruned: 0, pruned_by_age: 0 },
+        old_versions: { pruned: 0, pruned_by_age: 0, full_copies_pruned: 0 },
+      orphan_full_copies: { scanned: 0, removed: 0, reclaimed_bytes: 0 },
         tmp: { scanned: 0, removed: 0, reclaimed_bytes: 0 },
         empty_prefixes_removed: 0,
         problems: references.problems,
@@ -386,6 +485,11 @@ export function gc(input) {
       dryRun,
     });
     const leftovers = collectTmpLeftovers({ root, dryRun, nowMs: input.nowMs, staleMs: input.staleTmpMs });
+    // `full` repositories: a `.json.enc` no remaining record references is a leftover from a crash between
+    // "prune the record" and "delete the copy" (or from a failed record write after the copy landed). Only the
+    // safe path reaches here, so an unreadable reference has already refused the whole run.
+    const orphans = collectOrphanFullCopies({ root, dryRun });
+    for (const problem of orphans.problems) failed.push(problem);
     const emptyPrefixesRemoved = dryRun ? 0 : removeEmptyPrefixes(root);
 
     return {
@@ -394,7 +498,8 @@ export function gc(input) {
       dry_run: dryRun,
       references: { blocks: references.blocks.size, ...references.counts },
       blocks: { scanned: objects.length, removed, reclaimed_bytes: reclaimed, kept: objects.length - removed },
-      old_versions: { pruned: pruned.removed.length, pruned_by_age: pruned.pruned_by_age },
+      old_versions: { pruned: pruned.removed.length, pruned_by_age: pruned.pruned_by_age, full_copies_pruned: pruned.full_copies_removed },
+      orphan_full_copies: { scanned: orphans.scanned, removed: orphans.removed, reclaimed_bytes: orphans.reclaimed_bytes },
       tmp: { scanned: leftovers.scanned, removed: leftovers.removed, reclaimed_bytes: leftovers.reclaimed_bytes },
       empty_prefixes_removed: emptyPrefixesRemoved,
       problems: failed.map((row) => ({ file: row.file, detail: row.detail })),

@@ -28,6 +28,7 @@ import { selftest } from './crypto.mjs';
 import { buildManifest, manifestDigest, manifestSummary } from './manifest.mjs';
 import { buildStatus } from './routes.mjs';
 import { runBackup, SCOPES } from './engine.mjs';
+import { OLD_FORMATS } from './rotation.mjs';
 import { gc } from './gc.mjs';
 import { openRepo } from './repo.mjs';
 import { buildArchive } from './archive.mjs';
@@ -204,6 +205,8 @@ function usage() {
     '  --scope <s>         run: all | active | archived | selected (default: all)',
     '  --session <id>      run --scope selected / register: a session id (repeatable)',
     '  --keep-old <n>      old versions kept per session (default: 10)',
+    '  --old-format <f>    run: how a superseded version is kept: records (default, deduped record only)',
+    '                      or full (also one sealed whole-file copy under old/, doubling that version\'s bytes)',
     '  --max-old-days <n>  run/gc: also prune old version records older than N days (0 = per-session count only)',
     '  --mirror <dir>      run: copy the sealed blocks and snapshot metadata to this offsite directory',
     '  --dry-run           run/gc/restore/register: report what would happen, write nothing',
@@ -245,6 +248,7 @@ export function parseArgs(argv, env = process.env) {
     scope: null,
     selected: [],
     keepOld: null,
+    oldFormat: null,
     maxOldDays: null,
     mirror: null,
     dryRun: false,
@@ -313,6 +317,14 @@ export function parseArgs(argv, env = process.env) {
       const value = Number(raw);
       if (!Number.isSafeInteger(value) || value < 0) return { ...options, error: `--keep-old needs a non-negative integer, got ${JSON.stringify(raw)}` };
       options.keepOld = value;
+    } else if (arg === '--old-format') {
+      const raw = rest.shift() ?? '';
+      if (!OLD_FORMATS.includes(raw)) return { ...options, error: `--old-format must be one of ${OLD_FORMATS.join(', ')}, got ${JSON.stringify(raw)}` };
+      options.oldFormat = raw;
+    } else if (arg.startsWith('--old-format=')) {
+      const raw = arg.slice('--old-format='.length);
+      if (!OLD_FORMATS.includes(raw)) return { ...options, error: `--old-format must be one of ${OLD_FORMATS.join(', ')}, got ${JSON.stringify(raw)}` };
+      options.oldFormat = raw;
     } else if (arg === '--max-old-days') {
       const raw = rest.shift() ?? '';
       const value = Number(raw);
@@ -449,6 +461,10 @@ export function formatRun(result) {
         (result.max_old_version_days > 0 ? `, no record older than ${result.max_old_version_days} day(s)` : ' (age rule off)'),
     );
   }
+  if (result.old_format === 'full') {
+    const copies = Array.isArray(result.full_old_versions) ? result.full_old_versions.length : 0;
+    lines.push(`old format    : full (${copies} sealed whole-file copy(-ies); storage doubles per superseded version)`);
+  }
   if (result.mirror !== undefined) {
     if (result.mirror.ok === true) {
       const repaired = result.mirror.copied.repaired ?? 0;
@@ -536,6 +552,12 @@ export function formatGc(result) {
   lines.push(`blocks        : ${result.blocks.scanned} scanned, ${result.blocks.removed} removed, ${result.blocks.kept} kept (${humanBytes(result.blocks.reclaimed_bytes)} reclaimed)`);
   lines.push(`old versions  : ${result.old_versions.pruned} pruned by the retention window`);
   if (result.old_versions?.pruned_by_age !== undefined) lines.push(`old by age    : ${result.old_versions.pruned_by_age} pruned by the age rule`);
+  if (result.old_versions?.full_copies_pruned > 0) lines.push(`full copies   : ${result.old_versions.full_copies_pruned} pruned with their record(s)`);
+  if (result.orphan_full_copies !== undefined && result.orphan_full_copies.scanned > 0) {
+    lines.push(
+      `orphan copies : ${result.orphan_full_copies.scanned} scanned, ${result.orphan_full_copies.removed} removed (${humanBytes(result.orphan_full_copies.reclaimed_bytes)} reclaimed)`,
+    );
+  }
   if (result.tmp !== undefined) lines.push(`tmp leftovers : ${result.tmp.scanned} scanned, ${result.tmp.removed} removed (crashed writers)`);
   if (result.empty_prefixes_removed !== undefined && result.empty_prefixes_removed > 0) {
     lines.push(`empty prefixes: ${result.empty_prefixes_removed} removed`);
@@ -694,6 +716,7 @@ export function main(argv, io = {}) {
       selected: options.selected,
       keepOldPerSession: options.keepOld ?? undefined,
       maxOldVersionDays: options.maxOldDays ?? undefined,
+      oldFormat: options.oldFormat ?? undefined,
       mirrorRoot: options.mirror ?? undefined,
       dryRun: options.dryRun,
       futureAppend: options.noFutureAppend === true ? false : undefined,

@@ -7,27 +7,36 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 
 import {
   CURRENT_FORMAT,
   DEFAULT_KEEP_OLD,
+  DEFAULT_OLD_FORMAT,
   OLD_FORMAT,
+  OLD_FORMATS,
+  OLD_VERSION,
   ROTATION_CODES,
   RotationError,
   currentPath,
   currentRel,
+  fullCopyPathFor,
   listOldVersions,
+  oldFullCopyPath,
   oldVersionPath,
   pruneOldVersions,
   readCurrent,
   recordSupersededVersion,
   resolveMaxAgeDays,
+  resolveOldFormat,
   rotateForEntry,
   selectPrunable,
   writeCurrentPointer,
 } from '../src/backup/rotation.mjs';
+import { OLD_COPY_KIND, openObject, randomDek, sealObject } from '../src/backup/crypto.mjs';
+import { repoPaths } from '../src/backup/layout.mjs';
 import { readJsonSafe } from '../src/backup/atomic.mjs';
 import { tempDir } from './helpers/backup-fixture.mjs';
 
@@ -353,5 +362,208 @@ describe('rotation: old version paths', () => {
     assert.match(file, /old[\\/]--E-GPT--[\\/]session-aaaaaaaa-0001[\\/]escape-aaaaaaaaaaaa\.json$/u);
     assert.ok(!file.includes('..'));
     assert.equal(join('D:\\repo', 'old', '--E-GPT--', 'session-aaaaaaaa-0001', `escape-${'a'.repeat(12)}.json`), file);
+  });
+
+  it('derives the full copy name from the record name, so escaping is impossible through either', () => {
+    const record = oldVersionPath('D:\\repo', { ...ENTRY }, '../../escape', ENTRY.sha256);
+    const copy = oldFullCopyPath('D:\\repo', { ...ENTRY }, '../../escape', ENTRY.sha256);
+    assert.equal(`${record}.enc`, copy);
+    assert.match(copy, /escape-aaaaaaaaaaaa\.json\.enc$/u);
+    assert.ok(!copy.includes('..'));
+  });
+
+  it('refuses a record full_copy path that would leave old/', () => {
+    const { dir, cleanup } = tempDir('w2m-rot-full-path-');
+    try {
+      assert.equal(fullCopyPathFor(dir, { full_copy: { file: 'old/--E-GPT--/session-x/a.json.enc' } }), join(dir, 'old', '--E-GPT--', 'session-x', 'a.json.enc'));
+      for (const bad of ['../escape.json.enc', 'current/x.json.enc', join(dir, 'old', 'x.json.enc'), 42, null]) {
+        const record = bad === null ? { full_copy: null } : { full_copy: { file: bad } };
+        assert.equal(fullCopyPathFor(dir, record), null, `must refuse ${JSON.stringify(bad)}`);
+      }
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+/** Store `bytes` as one sealed block under `objects/` and return the entry fields describing them. */
+function storedVersion(root, dek, bytes) {
+  const sha256 = createHash('sha256').update(bytes).digest('hex');
+  const block = { index: 0, offset: 0, length: bytes.length, sha256 };
+  const object = join(repoPaths(root).objects, sha256.slice(0, 2), sha256);
+  mkdirSync(dirname(object), { recursive: true });
+  writeFileSync(object, sealObject(bytes, dek, { sha256, length: bytes.length }));
+  return { sha256, size: bytes.length, blocks: [block] };
+}
+
+/** Write a `current/` pointer whose blocks really exist, so a `full` rotation can rebuild the version. */
+function pointAtStoredVersion(root, dek, bytes, extra = {}) {
+  const previous = {
+    ...ENTRY,
+    ...storedVersion(root, dek, bytes),
+    snapshot_id: '20261117T140000Z-deadbeef',
+    updated_at: '2026-11-17T14:00:00.000Z',
+    ...extra,
+  };
+  // The pointer's own `updated_at` is what rotation stamps the record/copy name from, so pin it to the same
+  // instant rather than to the wall clock (otherwise the expected file name is untestable).
+  writeCurrentPointer({ root, entry: previous, snapshotId: previous.snapshot_id, now: new Date(previous.updated_at) });
+  return previous;
+}
+
+const ROTATION_NOW = new Date('2026-11-17T15:00:00.000Z');
+
+describe('rotation: oldFormat (records vs the literal full copy)', () => {
+  it('defaults to records, accepts full, and refuses anything else with the named code', () => {
+    assert.equal(DEFAULT_OLD_FORMAT, 'records');
+    assert.deepEqual([...OLD_FORMATS], ['records', 'full']);
+    assert.deepEqual(resolveOldFormat(undefined), { ok: true, format: 'records' });
+    assert.deepEqual(resolveOldFormat(null), { ok: true, format: 'records' });
+    assert.deepEqual(resolveOldFormat('records'), { ok: true, format: 'records' });
+    assert.deepEqual(resolveOldFormat('full'), { ok: true, format: 'full' });
+    for (const bad of ['FULL', 'record', 1, true]) {
+      const refused = resolveOldFormat(bad);
+      assert.equal(refused.ok, false);
+      assert.equal(refused.reason_code, ROTATION_CODES.FORMAT_INVALID);
+      assert.match(refused.detail, /oldFormat must be one of records, full/u);
+    }
+    const { dir, cleanup } = tempDir('w2m-rot-format-');
+    try {
+      writeCurrentPointer({ root: dir, entry: ENTRY, snapshotId: '20261117T140000Z-deadbeef' });
+      assert.throws(
+        () => rotateForEntry({ root: dir, entry: CHANGED, snapshotId: '20261117T150000Z-feedface', format: 'FULL' }),
+        (error) => error instanceof RotationError && error.code === ROTATION_CODES.FORMAT_INVALID,
+        'a direct caller must be refused before any write',
+      );
+      assert.equal(listOldVersions(dir).length, 0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('writes the record plus one sealed whole-file copy, which decrypts to the superseded bytes', () => {
+    const { dir, cleanup } = tempDir('w2m-rot-full-');
+    try {
+      const dek = randomDek();
+      const bytes = Buffer.from('the superseded version, byte for byte\n');
+      const previous = pointAtStoredVersion(dir, dek, bytes);
+      const result = rotateForEntry({ root: dir, entry: CHANGED, snapshotId: '20261117T150000Z-feedface', format: 'full', dek, now: ROTATION_NOW });
+      assert.equal(result.rotated, true);
+      assert.ok(result.full_copy, 'full mode must report the copy it wrote');
+      const rows = listOldVersions(dir);
+      assert.equal(rows.length, 1);
+      const { record } = rows[0];
+      // The record stays the same versioned shape: `full_copy` is an additive field older readers ignore.
+      assert.equal(record.format, OLD_FORMAT);
+      assert.equal(record.version, OLD_VERSION);
+      assert.equal(record.full_copy.sha256, previous.sha256);
+      assert.equal(record.full_copy.size, bytes.length);
+      assert.equal(record.full_copy.file, result.full_copy.file);
+      assert.match(record.full_copy.file, /^old\/--E-GPT--\/session-aaaaaaaa-0001\/20261117T140000Z-[0-9a-f]{12}\.json\.enc$/u);
+      const copyFile = fullCopyPathFor(dir, record);
+      assert.equal(copyFile, oldFullCopyPath(dir, previous, '20261117T140000Z'));
+      assert.equal(existsSync(copyFile), true);
+      const opened = openObject(readFileSync(copyFile), dek, {
+        sha256: record.full_copy.sha256,
+        length: record.full_copy.size,
+        kind: OLD_COPY_KIND,
+      });
+      assert.deepEqual(opened, bytes, 'the copy must decrypt to the superseded bytes');
+      assert.equal(createHash('sha256').update(opened).digest('hex'), record.full_copy.sha256);
+      // The copy is NOT a block: the same bytes under the block identity must not authenticate.
+      assert.throws(
+        () => openObject(readFileSync(copyFile), dek, { sha256: record.full_copy.sha256, length: record.full_copy.size }),
+        (error) => error.code === 'BACKUP_DECRYPT_AUTH_FAILED',
+        'a whole-file copy must not open as a block object',
+      );
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('writes no sealed copy in records mode (the default)', () => {
+    const { dir, cleanup } = tempDir('w2m-rot-records-');
+    try {
+      const dek = randomDek();
+      pointAtStoredVersion(dir, dek, Buffer.from('records mode\n'));
+      const result = rotateForEntry({ root: dir, entry: CHANGED, snapshotId: '20261117T150000Z-feedface', now: ROTATION_NOW });
+      assert.equal(result.rotated, true);
+      assert.equal(result.full_copy, null);
+      const rows = listOldVersions(dir);
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].record.full_copy, undefined);
+      const names = readdirSync(join(dir, 'old', '--E-GPT--', 'session-aaaaaaaa-0001'));
+      assert.deepEqual(names.filter((name) => name.endsWith('.json.enc')), [], 'records mode writes no .enc');
+      assert.equal(names.filter((name) => name.endsWith('.json')).length, 1);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('prunes the paired sealed copy together with its record', () => {
+    const { dir, cleanup } = tempDir('w2m-rot-full-prune-');
+    try {
+      const dek = randomDek();
+      pointAtStoredVersion(dir, dek, Buffer.from('prune me\n'));
+      rotateForEntry({ root: dir, entry: CHANGED, snapshotId: '20261117T150000Z-feedface', format: 'full', dek, now: ROTATION_NOW });
+      const copyFile = fullCopyPathFor(dir, listOldVersions(dir)[0].record);
+      assert.equal(existsSync(copyFile), true);
+      const pruned = pruneOldVersions({ root: dir, keep: 0, now: ROTATION_NOW });
+      assert.equal(pruned.removed.length, 1);
+      assert.equal(pruned.full_copies_removed, 1);
+      assert.equal(listOldVersions(dir).length, 0);
+      assert.equal(existsSync(copyFile), false, 'a pruned record must take its copy with it');
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('refuses rotation with BACKUP_ROTATION_WRITE_FAILED when the copy cannot be written', () => {
+    const { dir, cleanup } = tempDir('w2m-rot-full-fail-');
+    try {
+      const dek = randomDek();
+      const previous = pointAtStoredVersion(dir, dek, Buffer.from('cannot copy me\n'));
+      // A file where `old/` should be: the copy's atomic write cannot create its parent directory.
+      writeFileSync(join(dir, 'old'), 'not a directory');
+      assert.throws(
+        () => rotateForEntry({ root: dir, entry: CHANGED, snapshotId: '20261117T150000Z-feedface', format: 'full', dek, now: ROTATION_NOW }),
+        (error) => error instanceof RotationError && error.code === ROTATION_CODES.WRITE_FAILED,
+        'the failure must be the named rotation write code, not a raw fs error',
+      );
+      assert.equal(listOldVersions(dir).length, 0, 'no record may claim a copy that was never written');
+      assert.equal(readCurrent(dir, ENTRY).sha256, previous.sha256, 'the current pointer must not move on a refused rotation');
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('refuses rotation when the copy cannot be rebuilt from the stored blocks', () => {
+    const { dir, cleanup } = tempDir('w2m-rot-full-missing-');
+    try {
+      const dek = randomDek();
+      const previous = pointAtStoredVersion(dir, dek, Buffer.from('blocks that will go missing\n'));
+      rmSync(join(repoPaths(dir).objects, previous.sha256.slice(0, 2), previous.sha256));
+      assert.throws(
+        () => rotateForEntry({ root: dir, entry: CHANGED, snapshotId: '20261117T150000Z-feedface', format: 'full', dek, now: ROTATION_NOW }),
+        (error) => error instanceof RotationError && error.code === ROTATION_CODES.WRITE_FAILED,
+      );
+      assert.equal(listOldVersions(dir).length, 0, 'a copy that cannot be built must not produce a record');
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('refuses full mode without a DEK instead of writing a record without its copy', () => {
+    const { dir, cleanup } = tempDir('w2m-rot-full-nodek-');
+    try {
+      pointAtStoredVersion(dir, randomDek(), Buffer.from('needs a key\n'));
+      assert.throws(
+        () => rotateForEntry({ root: dir, entry: CHANGED, snapshotId: '20261117T150000Z-feedface', format: 'full', now: ROTATION_NOW }),
+        (error) => error instanceof RotationError && error.code === ROTATION_CODES.WRITE_FAILED,
+      );
+      assert.equal(listOldVersions(dir).length, 0);
+    } finally {
+      cleanup();
+    }
   });
 });
