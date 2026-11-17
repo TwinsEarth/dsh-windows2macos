@@ -345,6 +345,16 @@ All notable changes to this project are documented here.
 - 新增 `docs/RETRO-SESSION-RECOVERY-20261117.md`：时间线、四类根因、最终生效做法、门禁清单（含后续版本 G1–G5），以及下一次会话找回的"必须/禁止"一页清单。
 - 本机实测：14 条会话日志全部通过格式检查，唯一发现项为 1 条未注册会话 —— 检查有效且不误报。
 
+## [3.5.0] - 2026-11-18
+
+会话备份&还原（v3.4.6–v3.5.0 合并发布）：内容寻址仓库（objects/current/index、原子写、锁、22:00 调度与补跑、old/ 轮转、gc 引用安全）、
+还原（session-doctor + G2 注册表协议 + G5 运行时终审、pre-restore 副本与其保留）、解锁（machine DPAPI / account ID 比对 / 4-6 位 PIN + 公开提示词 + 轮换）、
+归档（.tar.zst 含 manifest 且可还原）、全量校验、G4 seq 重编号工具、备份&还原面板（侧边栏入口、按会话计划、四类一键操作、注册表复查、解锁对话框、运行时终审缓存）、
+三种保护状态（默认不加密 / 账户便捷 / PIN 门槛）、old-format full 整文件副本与 old-backfill、异地镜像（真实路径包含性 + 写入时链接守卫 + 损坏修复）、
+版本治理（最低版本门禁具名拒绝 + allowOutdated 审计 + 漂移看板 + 保留策略）、Relay Phase 2 合并（chat/project sync，含编码修复、ADR 与滚动升级手册）。
+
+详细条目见下方各未发布条目（自 v3.4.6 起）。
+
 ## [3.4.5] - 2026-11-16
 
 - **新增自修复子插件 `dsh-fix`**（`@twinsearth/w2m-dsh-plugin/dsh-fix`，默认启用）：当会话历史引用的图片附件对象已被删除、导致每一轮都以 `TRANSPORT`（`DeepSeek Messages transport failed`）失败时，在进程内自动修复：
