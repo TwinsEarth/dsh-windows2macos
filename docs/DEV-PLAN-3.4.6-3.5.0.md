@@ -410,7 +410,7 @@ Phase 2 分支 → `aee1a9b` 独立编码修复 → ADR/手册/门禁收口）�
   对 cwd 已消失的灾难恢复会话不接（由 CLI + watch 兜住）。
 * **B · 运行时终审不阻塞面板**：`?runtime=1` 的结论持久化为 `<DSH_HOME>/xclient/w2m-backup/state.json` 里的
   `last_runtime_verify`（字段固定、证据 `installed-harness`），`?runtime=cached` 只读并标 24 h stale，
-  `GET /run` 内嵌状态带缓存；配置 `backupRuntimeVerify:'off'|'nightly'`（默认 off）在**成功**的定时备份后跑一次
+  `GET /run` 内嵌状态带缓存；配置 `backupRuntimeVerify:'off'|'nightly'`（**v3.5.0 起默认 nightly**；早先版本默认 off）在**成功**的定时备份后跑一次
   （fire-and-forget，失败只 warning，记录照存），CLI `run --runtime-verify` 手动一次。面板校验卡显示缓存记录 +
   「立即运行（慢）」按钮。测试：`backup-verify` +5、`backup-run` +3、`client-bundle` +3。
 * **C · renumber 追加失败分支**：调查结论是**规范产出上不可达**（规范重编码 + 附录 `permission/preset` ⇒ doctor
