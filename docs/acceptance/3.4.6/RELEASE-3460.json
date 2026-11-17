@@ -1,0 +1,46 @@
+{
+  "version": "3.4.6",
+  "case": "RELEASE-3460",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-17T13:25:26.090Z",
+  "executor": "lead",
+  "task_id": "w2m-v346-substrate-gates",
+  "requirement": "v3.4.6: the session-recovery drill's four failure classes become executable gates (G1 doctor-first, G2 registry protocol with read-back, G3 raw bytes + future-append simulation, G5 runtime validation), and the backup substrate freezes its repository protocol (objects/current/index, content-addressed blocks, atomic writes, encryption self-test) with a read-only scan.",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/backup-engine.test.mjs",
+      "test/backup-protocol.test.mjs",
+      "test/backup-wiring.test.mjs",
+      "test/session-doctor.test.mjs"
+    ],
+    [
+      "node",
+      "scripts/layer-check.mjs"
+    ],
+    [
+      "node",
+      "scripts/pack.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "gates": "G1 doctor-first ordering, G2 single-document registry write with read-back verification, G3 future-append simulation, G5 runtime delegation are all bound to tests (test/backup-engine, test/backup-g2, test/backup-runtime)",
+      "protocol": "repository v1 layout (objects/<aa>/<sha256>, snapshots/<id>, current/, old/, index.jsonl, tmp/backup.lock) frozen and asserted; atomic tmp->fsync->rename writes; AAD `w2m-session-backup/object|<sha>|<len>`",
+      "scan": "the read-only scan reports sessions without writing anything (route + CLI tests)",
+      "artifact": "pack rebuilt from commit f242aae: 484 file(s), 2034570 bytes, sha256 2565b2a4…"
+    }
+  },
+  "artifacts": [
+    {
+      "sha256": "2565b2a4b5daa42af26bf3f6be375328a00bb7e013ca922092cd58254465c7a5",
+      "bytes": 2034570
+    }
+  ]
+}

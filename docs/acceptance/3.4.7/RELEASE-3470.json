@@ -1,0 +1,52 @@
+{
+  "version": "3.4.7",
+  "case": "RELEASE-3470",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-17T13:25:26.090Z",
+  "executor": "lead",
+  "task_id": "w2m-v347-engine",
+  "requirement": "v3.4.7: the backup engine ships content-addressed dedupe, atomic writes, repository locks, the 22:00 Asia/Shanghai schedule with missed-slot catch-up, per-session old/ rotation, gc with reference safety, the Windows DPAPI machine envelope with password fallback, and the dsh-backup subplugin row introduced together with the engine.",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/backup-engine.test.mjs",
+      "test/backup-rotation.test.mjs",
+      "test/backup-gc.test.mjs",
+      "test/backup-schedule.test.mjs",
+      "test/backup-machine-key.test.mjs",
+      "test/backup-keystore.test.mjs"
+    ],
+    [
+      "node",
+      "scripts/layer-check.mjs"
+    ],
+    [
+      "node",
+      "scripts/pack.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "dedupe": "second backup of unchanged sessions writes no new blocks; dedupe_ratio reported",
+      "schedule": "defaults to 22:00 Asia/Shanghai; a missed slot is caught up once; the effect can stop the scheduler",
+      "rotation": "newest-N per session, old records readable, pointers updated atomically",
+      "gc": "unreferenced blocks collected; referenced blocks never deleted; BACKUP_GC_UNSAFE refuses on unreadable references",
+      "locks": "a held lock refuses a second writer with BACKUP_LOCKED",
+      "envelope": "machine secret protected through a real PowerShell DPAPI round trip; password path via scrypt",
+      "wiring": "the dsh-backup row, lib/backup.js export and routes land in the same commit as the engine (37653b6)",
+      "artifact": "pack rebuilt from commit f330221: 495 file(s), 2070182 bytes, sha256 9d332be2…"
+    }
+  },
+  "artifacts": [
+    {
+      "sha256": "9d332be2c19cdb8a80dd2291083c8520b5789d29cc8f373297070b11bcdf2333",
+      "bytes": 2070182
+    }
+  ]
+}
