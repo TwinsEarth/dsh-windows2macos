@@ -36,6 +36,7 @@ import { detectClientRunning } from './client.mjs';
 import { recheckRegistry } from './registry-watch.mjs';
 import { applyRegister, planRegister } from './register.mjs';
 import { describeUnlock, unlockRepo } from './unlock.mjs';
+import { setRepositoryPassword } from './keystore.mjs';
 import { verifyRepo } from './verify.mjs';
 
 /** Human-readable bytes: `172.0 MB`, `1.2 GB`. */
@@ -216,6 +217,7 @@ function usage() {
     '  --workspace-path <p> restore/register: attach an unknown workspace to this directory, or create the registry there',
     '  --runtime           verify/run: confirm with the installed Harness validator (G5), not only the pre-filter',
     '  --check             unlock: attempt the unlock instead of only describing it',
+    '  --set-password      unlock: add a password envelope to this repository (reads the password from stdin/env) so it opens without this machine',
     '  --password-stdin    run/restore/unlock --check: read the password from stdin (never argv)',
     '                      (environment fallback: W2M_BACKUP_PASSWORD, same "never argv" rule)',
     '  --no-machine-key    run: do not use (or create) the OS-keystore machine envelope',
@@ -259,6 +261,7 @@ export function parseArgs(argv, env = process.env) {
     workspacePath: null,
     runtime: false,
     check: false,
+    setPassword: false,
   };
   const rest = [...argv];
   if (rest.length > 0 && !rest[0].startsWith('-')) options.command = rest.shift();
@@ -278,6 +281,7 @@ export function parseArgs(argv, env = process.env) {
     else if (arg === '--allow-live-home') options.allowLiveHome = true;
     else if (arg === '--runtime') options.runtime = true;
     else if (arg === '--check') options.check = true;
+    else if (arg === '--set-password') options.setPassword = true;
     else if (arg === '--snapshot') options.snapshot = rest.shift() ?? null;
     else if (arg === '--archive') options.archiveFile = rest.shift() ?? null;
     else if (arg === '--workspace-path') options.workspacePath = path.resolve(rest.shift() ?? '');
@@ -733,6 +737,33 @@ export function main(argv, io = {}) {
     if (resolved.ok !== true) {
       writeErr(`${resolved.error.code}: ${resolved.error.detail}`);
       return 1;
+    }
+    if (options.setPassword) {
+      const result = setRepositoryPassword({
+        root: resolved.dir,
+        dshHome: options.dshHome,
+        password: passwordFor(options, io),
+        platform: process.platform,
+        machineKey: options.noMachineKey === true ? false : undefined,
+      });
+      if (options.json) {
+        write(JSON.stringify(result, null, 2));
+      } else {
+        if (result.ok !== true) {
+          writeErr(`${result.reason_code}: ${result.detail}`);
+        } else if (result.added !== true) {
+          write(`password envelope : already present (nothing written) — ${result.detail ?? ''}`.trimEnd());
+          write(`envelopes         : ${result.envelopes.join(', ')}`);
+        } else {
+          write('w2m-backup unlock --set-password');
+          write('');
+          write(`password envelope : added (another envelope, same data key)`);
+          write(`envelopes         : ${result.envelopes.join(', ')}`);
+          write(`keys backup       : ${result.backup_file}`);
+          write(`file              : ${result.file}`);
+        }
+      }
+      return result.ok === true ? 0 : 1;
     }
     const described = describeUnlock({
       root: resolved.dir,

@@ -11,6 +11,7 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 
 import {
   KEYSTORE_CODES,
+  setRepositoryPassword,
   NO_PERMISSION,
   addMachineEnvelope,
   openRepoKey,
@@ -150,5 +151,59 @@ describe('keystore: envelope arithmetic', () => {
     assert.equal(result.added, false);
     assert.equal(result.reason, 'no data key to wrap');
     assert.equal(addMachineEnvelope(null, Buffer.alloc(32, 1), Buffer.alloc(32, 1)).added, false);
+  });
+});
+
+describe('keystore: adding a password envelope to a machine-only repository', () => {
+  it('opens the machine-only repo, adds a password envelope with the same DEK, and the password alone opens it', () => {
+    const { dir, cleanup } = tempDir('w2m-keystore-setpw-');
+    try {
+      const root = `${dir}/repo`;
+      ensureLayout(root);
+      const home = `${dir}/home`;
+      const created = openRepoKey({ root, dshHome: home, platform: 'win32', runner: fakeRunner, kdf: KDF });
+      assert.equal(created.ok, true, created.detail ?? '');
+      assert.deepEqual(readRepoKeys(root).keys.envelopes.map((envelope) => envelope.kind), ['machine']);
+
+      const upgraded = setRepositoryPassword({ root, dshHome: home, password: 'recovery-password', platform: 'win32', runner: fakeRunner, kdf: KDF });
+      assert.equal(upgraded.ok, true, upgraded.detail ?? '');
+      assert.equal(upgraded.added, true);
+      assert.deepEqual(upgraded.envelopes.sort(), ['machine', 'password']);
+      assert.equal(existsSync(upgraded.backup_file), true, 'the old key document is kept before the write');
+
+      const passwordOnly = openRepoKey({ root, dshHome: home, password: 'recovery-password', platform: 'linux', machineKey: false, kdf: KDF });
+      assert.equal(passwordOnly.ok, true, passwordOnly.detail ?? '');
+      assert.deepEqual(passwordOnly.dek, created.dek, 'the DEK must not change');
+      assert.equal(passwordOnly.unlocked_via, 'password');
+
+      const wrong = openRepoKey({ root, dshHome: home, password: 'not-the-password', platform: 'linux', machineKey: false, kdf: KDF });
+      assert.equal(wrong.ok, false);
+      assert.equal(wrong.reason_code, NO_PERMISSION);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('is idempotent and refuses a short password without touching the file', () => {
+    const { dir, cleanup } = tempDir('w2m-keystore-setpw2-');
+    try {
+      const root = `${dir}/repo`;
+      ensureLayout(root);
+      const home = `${dir}/home`;
+      openRepoKey({ root, dshHome: home, platform: 'win32', runner: fakeRunner, kdf: KDF });
+      const first = setRepositoryPassword({ root, dshHome: home, password: 'recovery-password', platform: 'win32', runner: fakeRunner, kdf: KDF });
+      assert.equal(first.ok, true);
+      const before = readFileSync(repoKeysPath(root), 'utf8');
+      const again = setRepositoryPassword({ root, dshHome: home, password: 'recovery-password', platform: 'win32', runner: fakeRunner, kdf: KDF });
+      assert.equal(again.ok, true);
+      assert.equal(again.added, false);
+      assert.equal(readFileSync(repoKeysPath(root), 'utf8'), before, 'a second call must not rewrite the document');
+
+      const short = setRepositoryPassword({ root, dshHome: home, password: 'short', platform: 'win32', runner: fakeRunner, kdf: KDF });
+      assert.equal(short.ok, false);
+      assert.equal(readFileSync(repoKeysPath(root), 'utf8'), before);
+    } finally {
+      cleanup();
+    }
   });
 });

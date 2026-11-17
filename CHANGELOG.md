@@ -4,6 +4,14 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### 双解锁补全：给机器信封仓库补 password 信封（未发布）
+
+- 需求 5.3 的 P0 缺口：无人值守只建 `machine`（DPAPI）信封，换机器/换账户后仓库打不开，而 `password` 是唯一跨机器路径且此前无法事后补。
+- 新增 `addPasswordEnvelope` + `setRepositoryPassword`（`src/backup/keystore.mjs`）与 CLI `w2m-backup unlock --set-password`：用现有凭据打开 → 同一 DEK 再包一个 password 信封（scrypt）→ 原 `keys.json` 复制为 `.bak-<ts>` → 原子写 → **只用一个密码单独解一次并与 DEK 比对**。密码只从 stdin 或 `W2M_BACKUP_PASSWORD` 读取（绝不 argv/配置），最短 8 字节，重复调用 no-op。
+- 测试：`backup-keystore` 覆盖"machine-only 仓库补 password 后仅凭密码可开且 DEK 不变""错误密码被拒""重复调用不重写""短密码拒绝且文件不变""写前备份存在"。
+- 诚实边界：已有 password 信封不会被覆盖——**换密码**（轮换）尚未实现，需要"旧凭据解开→移除旧 password→写新"的命令；本机真实仓库已补 password 信封（密码文件在 `C:\Users\fangw\w2m-backup-unlock-password.txt`，请抄入密码管理器后删除）。
+
+
 ### v3.5.0 「编队版本」看板卡片（UI 半，未发布）
 
 - **`lib/client.js`：操作面板 →「操作入口」页新增「编队版本」卡片**：v3.5.0 交付项 2 的 UI 半——显示

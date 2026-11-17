@@ -892,3 +892,20 @@ renumber 的"追加后日志失败"分支用 `planRenumber({futureAppendCheck})`
 * 本次不 bump 版本号、不跑 preflight、不提交；G2/G4 的新测试挂在既有套件上（`backup-g2` / `fix-renumber`），
   没有新增测试文件，`package.json#scripts.test` 清单不变。
 
+
+## 23. 双解锁：给机器信封仓库补 password 信封（2026-11-17）
+
+**问题**：调度的无人值守备份只会创建 `machine` 信封（定时器不能输入密码）。如果这台机器重装/换用户，
+DPAPI 解不开，仓库就再也打不开——而 `password` 是唯一跨机器的路径。此前只在"建库时提供了密码"才会写
+password 信封，**事后无法补**。
+
+**实现**：`addPasswordEnvelope(keys, dek, password)` + `setRepositoryPassword({root, dshHome, password, ...})`
+（`src/backup/keystore.mjs`）与 CLI `w2m-backup unlock --set-password`：
+1. 先用现有凭据打开仓库（machine 或已有 password）——拿到的 **DEK 不变**；
+2. 用同一个 DEK 再包一个 `password` 信封（scrypt，现有 KDF floor）；
+3. 写前把原 `keys.json` 复制为 `keys.json.bak-<ts>`，再用原子写替换；
+4. 写后**只用新密码**单独解一次并与 DEK 比对，失败即报错（旧文件仍在备份路径）。
+
+**约束与边界**：密码只从 stdin（`--password-stdin`）或 `W2M_BACKUP_PASSWORD` 读取，绝不走 argv/配置；
+最短 8 字节；重复调用是 no-op（不会重写文档）；已有 password 信封的仓库不会被覆盖（换密码是另一个功能，
+尚未实现，届时需要"旧密码或 machine 解开 → 移除旧 password 信封 → 写新信封"的轮换命令）。

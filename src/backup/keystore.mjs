@@ -39,7 +39,7 @@ import {
   validateKeysFile,
   wrapDek,
 } from './crypto.mjs';
-import { writeJsonAtomic } from './atomic.mjs';
+import { writeFileAtomic, writeJsonAtomic } from './atomic.mjs';
 import { loadMachineSecret, machineKeyPath } from './machine-key.mjs';
 
 /** File name of the authoritative wrapped-key document, at the repository root. */
@@ -120,6 +120,113 @@ export function addMachineEnvelope(keys, dek, machineSecret, options = {}) {
   const upgraded = { ...keys, envelopes: [...keys.envelopes, ...wrapped.envelopes] };
   validateKeysFile(upgraded);
   return { added: true, keys: upgraded, reason: null };
+}
+
+/**
+ * Add a `password` envelope to an existing key document.
+ *
+ * The case this exists for: a repository created on this machine with only a `machine` envelope (the default for a
+ * scheduled run, because a timer cannot type a password) is unusable after a reinstall / on another machine. The
+ * password envelope is the **only** path that survives that, so a machine-only repository must be able to gain one
+ * later -- with the same DEK, so every stored block stays readable.
+ *
+ * Existing envelopes are preserved byte-for-byte; a second call is a no-op.
+ *
+ * @param {object} keys existing `keys.json` document
+ * @param {Buffer} dek the already-unwrapped data key
+ * @param {string|Buffer} password non-empty password (minimum length enforced by the caller)
+ * @param {{now?: Date}} [options]
+ * @returns {{added: boolean, keys: object, reason: string|null}}
+ */
+export function addPasswordEnvelope(keys, dek, password, options = {}) {
+  if (keys === null || typeof keys !== 'object' || !Array.isArray(keys.envelopes)) {
+    return { added: false, keys, reason: 'not a key document' };
+  }
+  if (keys.envelopes.some((envelope) => envelope?.kind === 'password')) {
+    return { added: false, keys, reason: 'already has a password envelope' };
+  }
+  if (!Buffer.isBuffer(dek) || dek.length === 0) return { added: false, keys, reason: 'no data key to wrap' };
+  const bytes = Buffer.isBuffer(password) ? password : Buffer.from(String(password ?? ''), 'utf8');
+  if (bytes.length === 0) return { added: false, keys, reason: 'the password is empty' };
+  const wrapped = wrapDek(dek, [{ kind: 'password', secret: bytes }], { now: options.now ?? new Date() });
+  const upgraded = { ...keys, envelopes: [...keys.envelopes, ...wrapped.envelopes] };
+  validateKeysFile(upgraded);
+  return { added: true, keys: upgraded, reason: null };
+}
+
+/**
+ * Add a password envelope to a live repository (the "two unlock options" repair).
+ *
+ * Order matters: the existing repository is opened first (machine or an existing password), then the new envelope
+ * is wrapped around the **same** DEK, then the document is written atomically after a sibling backup, then the new
+ * credential is verified by unwrapping it in isolation.
+ *
+ * @param {{
+ *   root: string, dshHome: string, password: string|Buffer,
+ *   platform?: string, runner?: Function, machineKey?: boolean, now?: Date, kdf?: object,
+ *   backupDir?: string|null,
+ * }} input
+ * @returns {{ok: boolean, added: boolean, file: string|null, backup_file: string|null,
+ *   envelopes: string[], reason_code: string|null, detail: string|null}}
+ */
+export function setRepositoryPassword(input) {
+  const bytes = Buffer.isBuffer(input.password) ? input.password : Buffer.from(String(input.password ?? ''), 'utf8');
+  if (bytes.length < 8) {
+    return { ok: false, added: false, file: null, backup_file: null, envelopes: [], reason_code: NO_PERMISSION, detail: 'the unlock password must be at least 8 bytes' };
+  }
+  const opened = openRepoKey({
+    root: input.root,
+    dshHome: input.dshHome,
+    platform: input.platform,
+    runner: input.runner,
+    machineKey: input.machineKey,
+    now: input.now,
+    kdf: input.kdf,
+  });
+  if (opened.ok !== true) {
+    return { ok: false, added: false, file: opened.file ?? null, backup_file: null, envelopes: [], reason_code: opened.reason_code, detail: opened.detail };
+  }
+  const upgraded = addPasswordEnvelope(opened.keys, opened.dek, bytes, { now: input.now });
+  if (upgraded.added !== true) {
+    return {
+      ok: true,
+      added: false,
+      file: opened.file,
+      backup_file: null,
+      envelopes: opened.keys.envelopes.map((envelope) => String(envelope.kind)),
+      reason_code: null,
+      detail: upgraded.reason,
+    };
+  }
+  const file = opened.file;
+  const stamp = (input.now ?? new Date()).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+  const backupFile = input.backupDir ?? path.join(path.dirname(file), 'keys.json.bak-' + stamp);
+  try {
+    fs.mkdirSync(path.dirname(backupFile), { recursive: true });
+    fs.copyFileSync(file, backupFile);
+    writeFileAtomic(file, JSON.stringify(upgraded.keys));
+  } catch (error) {
+    return { ok: false, added: false, file, backup_file: backupFile, envelopes: [], reason_code: error?.code ?? 'BACKUP_WRITE_FAILED', detail: error?.detail ?? String(error?.message ?? error) };
+  }
+  // The point of the write: the new credential alone must open the same DEK.
+  let verify = null;
+  try {
+    verify = unwrapDek(upgraded.keys, { password: bytes });
+  } catch {
+    verify = null;
+  }
+  if (verify === null || Buffer.isBuffer(verify.dek) !== true || verify.dek.equals(opened.dek) !== true) {
+    return { ok: false, added: true, file, backup_file: backupFile, envelopes: [], reason_code: NO_PERMISSION, detail: 'the written password envelope did not verify against the data key' };
+  }
+  return {
+    ok: true,
+    added: true,
+    file,
+    backup_file: backupFile,
+    envelopes: upgraded.keys.envelopes.map((envelope) => String(envelope.kind)),
+    reason_code: null,
+    detail: null,
+  };
 }
 
 /**
