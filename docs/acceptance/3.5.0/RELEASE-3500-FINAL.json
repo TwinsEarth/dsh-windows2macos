@@ -1,0 +1,67 @@
+{
+  "version": "3.5.0",
+  "case": "RELEASE-3500-FINAL",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-17T15:59:45.298Z",
+  "executor": "lead",
+  "task_id": "w2m-v350-final-line",
+  "requirement": "v3.5.0 final line: Relay Phase 2 merged into work/v3.4.6 after the approved conditions (HEAD synced into the branch, a separate encoding-repair commit, the Phase 2 ADR + rolling-upgrade runbook, the Phase 2 suites wired into the gates, and the server-wiring tests); the backup panel now has a modal unlock dialog (password never enters the browser), the dsh-backup row ships enabled, a PIN may carry a public hint and can be rotated through the old credential, renumber reports deleted/inserted counts and says to prefer restore, and the fleet version-drift card is covered by the real-browser probe.",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/client-bundle.test.mjs",
+      "test/fix-renumber.test.mjs",
+      "test/backup-keystore.test.mjs",
+      "test/backup-access.test.mjs",
+      "test/backup-run.test.mjs",
+      "test/backup-verify.test.mjs",
+      "test/backup-mirror.test.mjs",
+      "test/backup-g2.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/chat-store.test.mjs",
+      "test/project-sync.test.mjs",
+      "test/cluster-domains.test.mjs",
+      "test/relay-phase2-server.test.mjs"
+    ],
+    [
+      "node",
+      "scripts/layer-check.mjs"
+    ],
+    [
+      "node",
+      "scripts/scan-mojibake.mjs"
+    ],
+    [
+      "node",
+      "scripts/pack.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "phase2_merge": "main line contains the Phase 2 merge (20 files / +5754/-115 at merge time) with the encoding repair (server.mjs § chars, em dashes, SIGNATURE_* strings restored, ASCII-only diff on the base text), ADR docs/RELAY-CLUSTER-SYNC-PHASE2-DESIGN.md and runbook docs/RUNBOOK-RELAY-ROLLING-UPGRADE.md, the four suites in scripts.test/test:all, and the 10-test in-process server wiring suite",
+      "phase2_real_process": "scripts/verify-relay-cluster-phase2.mjs 9/9 PASS (three real relay child processes, real HTTP, restart recovery) and the mixed-version script 6/6 PASS (two 3.0.0 + this build)",
+      "unlock_dialog": "modal dialog with role=dialog/aria-modal, Escape/backdrop/× close, focus enter+restore, POST /unlock body exactly {confirm:\"unlock\"}, zero password fields, copyable CLI command; real Chromium probe 10/10 with passwordFields=0",
+      "row_default": "cordis.patch.yml ships the dsh-backup row enabled (panel + 22:00 schedule mount on install; backupEnabled:false can still disable the timer); backup-wiring asserts it",
+      "pin": "a 4-6 digit PIN may carry a public hint (keys.json password_hint, <=120 chars, rejected when equal to the PIN or without a password envelope); unlock --rotate-password opens with an existing credential, removes every old password envelope, writes one new envelope around the same DEK, replaces/clears the hint, and verifies both that the new PIN opens it and that the old PIN no longer does (restoring keys.json.bak on failure)",
+      "renumber_ux": "renumber plan/CLI report deleted/inserted counts; help and every plan line say to prefer restore when a backup holds the original log; fix-renumber 30/30",
+      "drift_card": "fleet version-drift card renders in the operation panel with ready/unavailable states and copy-guidance; client-bundle 98/98 and the real Chromium page asserts the card",
+      "artifact": "pack rebuilt from the current tree: 525 files, 2,411,166 bytes, sha256 7f41479f... (a second pack produced the same sha)"
+    }
+  },
+  "artifacts": [
+    {
+      "sha256": "7f41479fe56521ce188d7b7df2300512b1f0318723b3b5284e13585d03384324",
+      "bytes": 2411166
+    }
+  ]
+}
