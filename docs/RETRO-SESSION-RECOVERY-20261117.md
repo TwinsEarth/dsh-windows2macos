@@ -102,7 +102,7 @@ node scripts/session-doctor.mjs --file <session.v4.jsonl.zstd> --session-id <id>
 | G1 还原候选必须先过 doctor | v3.4.8 已接线 | `planRestore` 对每份解回字节跑 `validateCandidate`，任一失败整单拒绝；`applyRestore` 写后复验（`src/backup/restore.mjs`） |
 | G2 注册表写入协议 | v3.4.8 已完整实现 | 三半齐备：① `client.mjs` 暂停门（CLI 拒绝活 home，面板接受并依赖后续）；② `registry.mjs` 原子写 + 回读校验；③ `registry-watch.mjs` 客户端保存后按 2/8/20 s 复查并自动重放；测试见 `backup-g2` |
 | G3 禁止手工事件 | v3.4.8 已完整实现 | ① 引擎只存原始字节（坏日志也入库，清单 sha 等于源哈希；源文件字节/mtime 不变有单测）；② `future-append.mjs` 一条模拟实现，引擎报告 `future_append`、还原用运行时终审"原日志+追加后日志"、verify 静态与 `--runtime` 双重复核 |
-| G4 seq 重编号工具 | 本版不做 | 还原路径不含删/插事件，不需要重编号；工具本身是"改历史"的入口，留待真实修复场景单独设计（DESIGN §15.6） |
+| G4 seq 重编号工具 | 已实现（G4 补全） | 删/插事件的唯一合法入口：`src/backup/renumber.mjs` 纯内存重编号（seq 重编为 0..N-1、递归改写 `*Seq`/`*Seqs` 引用、悬空引用拒绝不猜、重算 `inheritedEventCount`、header 单帧 + 每事件一帧重编码）；`planRenumber` 用 doctor + 未来追加 + 安装 Harness 终审校验结果，`applyRenumber` 先写 `.bak-<时间戳>` 再原子写并回读复验；CLI `w2m-fix renumber`；测试 `test/fix-renumber.test.mjs`（21 项，详见 DESIGN §20） |
 | G5 校验用运行时 | v3.4.8 接线 + v3.4.9 收口 | 证据来自安装的 Harness（`createRestore(..., validation:'current')`），doctor 只预筛并标 `static-prefilter`；还原/归档还原对"原日志+追加后日志"批量终审；driver 新增事件数守恒（seq 缺口日志会被静默丢行，必须判为不是证据）；`run --runtime` / `verify --runtime` 可要求运行时证据 |
 
 ---

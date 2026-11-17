@@ -1,14 +1,20 @@
 /**
- * Offline CLI for the session-attachment repair.
+ * Offline CLI for the session-attachment repair, and for the one legal way to
+ * delete or insert events in a v4 session log (retrospective gate G4).
  *
  *   w2m-fix scan                       only report: which sessions are broken, how many places need a repair
  *   w2m-fix fix [--apply]              append one image/offload event (needs --apply; requires DSH to be stopped)
  *   w2m-fix backups --session <id>     list the backups next to one session's artifact
  *   w2m-fix restore --session <id> --apply   roll back from a backup
+ *   w2m-fix renumber --file <log> [--delete-seq <n>]... [--insert-file <json>] [--dry-run]
+ *                                      delete/insert events, renumber seq densely, rewrite every seq reference,
+ *                                      then validate the result (doctor + future append + installed Harness) and
+ *                                      only then write (`--dry-run` plans without writing; the original is always
+ *                                      copied to `<file>.bak-<timestamp>` first)
  *
- * Exit codes: 0 ok, 1 failed, 2 this Node has no synchronous zstd API, 3 refused
- * (DSH running / restore without --apply). 0 and non-zero are the contract; the
- * numbers exist so a wrapper can tell "refused" from "broke".
+ * Exit codes: 0 ok, 1 refused/failed, 2 usage error (or this Node has no synchronous
+ * zstd API), 3 refused (DSH running / restore without --apply). 0 and non-zero are
+ * the contract; the numbers exist so a wrapper can tell "refused" from "broke".
  *
  * Two safety rules are enforced here rather than left to the caller:
  *   * writing is refused while DeepSeek Harness is running, because its live
@@ -29,10 +35,15 @@ import { execSync } from 'node:child_process';
 import { hasZstd } from './zstd.mjs';
 import { listSessionDirs, pickSessionFile, readSession } from './session.mjs';
 import { applyFix, groupTargets, listBackups, pendingFixes, restoreBackup, BACKUP_MARK } from './repair.mjs';
+// Gate G4 lives in `src/backup/renumber.mjs`: the renumber tool is gated by the backup validator (static doctor +
+// future append + the installed Harness), so its one implementation sits with those gates instead of growing a
+// second validator here. The layer edge (`fix -> backup`) is declared in `scripts/layer-model.mjs`.
+import { applyRenumber, planRenumber } from '../backup/renumber.mjs';
 
-const EXIT = { OK: 0, FAILED: 1, UNSUPPORTED_NODE: 2, REFUSED: 3 };
+const EXIT = { OK: 0, FAILED: 1, USAGE: 2, UNSUPPORTED_NODE: 2, REFUSED: 3 };
 
 const USAGE = `w2m-fix - repair "attachment object deleted -> every turn fails with transport failed"
+         and the one legal way to delete/insert events in a v4 session log (gate G4)
 
 Symptom: a session fails every turn with "DeepSeek Messages transport failed",
 each attempt failing in 20-60 ms without sending an HTTP request, because an
@@ -43,6 +54,9 @@ image attachment object referenced by its history has been deleted.
   node bin/w2m-fix.mjs fix [--apply]                append one image/offload event per broken session
   node bin/w2m-fix.mjs backups --session <part>     list the backups of one session
   node bin/w2m-fix.mjs restore --session <part> --apply   roll back from a backup
+  node bin/w2m-fix.mjs renumber --file <log> [--delete-seq <n>]... [--insert-file <json>] [--dry-run]
+                                                    delete/insert events, renumber seq densely, rewrite
+                                                    every *Seq reference, validate, then write
 
 Options
   --session <part>        only sessions whose directory name contains this part
@@ -52,6 +66,23 @@ Options
   --force                 write even though DeepSeek Harness appears to be running
   --json                  machine-readable output
   -h, --help              this text
+
+Renumber options (gate G4; the ONLY legal way to delete or insert an event)
+  --file <path>           the v4 session log to edit (required)
+  --delete-seq <n>        delete the event at dense zero-based seq <n> (repeatable)
+  --insert-file <json>    JSON file holding an array of {atSeq, event}; {atSeq} places the event
+                          BEFORE the event currently at that seq (atSeq === event count appends)
+  --dry-run               plan only: validate and report, write nothing
+  --allow-static-validation  accept static-only evidence when no Harness installation is found
+                          (the report then says runtime_verified:false; the runtime verdict is the gate)
+
+Renumber notes
+  * seq becomes the dense index 0..N-1 and every key ending in Seq/Seqs whose value is an
+    integer (or an array of integers) is rewritten old -> new. A reference to a deleted
+    event is a refusal, never a guess.
+  * every successful run first copies the log to <file>.bak-<timestamp>; that copy is the way back.
+  * the renumbered log is validated with the static doctor, the "next append still loads"
+    simulation, and the installed Harness's own validator before anything is written.
 
 Standard flow
   1. quit DeepSeek Harness;
@@ -72,7 +103,9 @@ function writeErr(text) {
 
 /**
  * @param {string[]} argv
- * @returns {{command: string, session: string|null, dshHome: string, stamp: string|null, apply: boolean, force: boolean, json: boolean, help: boolean}}
+ * @returns {{command: string, session: string|null, dshHome: string, stamp: string|null, apply: boolean,
+ *   force: boolean, json: boolean, help: boolean, file: string|null, deleteSeqs: number[], insertFile: string|null,
+ *   dryRun: boolean, allowStaticValidation: boolean, error: string|null}}
  */
 function parseArgs(argv) {
   const opts = {
@@ -84,8 +117,14 @@ function parseArgs(argv) {
     force: false,
     json: false,
     help: false,
+    file: null,
+    deleteSeqs: [],
+    insertFile: null,
+    dryRun: false,
+    allowStaticValidation: false,
+    error: null,
   };
-  const commands = new Set(['scan', 'fix', 'backups', 'restore']);
+  const commands = new Set(['scan', 'fix', 'backups', 'restore', 'renumber']);
   const rest = [...argv];
   while (rest.length > 0) {
     const arg = rest.shift();
@@ -97,7 +136,27 @@ function parseArgs(argv) {
     else if (arg === '--force') opts.force = true;
     else if (arg === '--json') opts.json = true;
     else if (arg === '-h' || arg === '--help') opts.help = true;
-    else throw new Error(`unknown argument: ${arg}`);
+    else if (arg === '--file') opts.file = rest.shift() ?? null;
+    else if (arg.startsWith('--file=')) opts.file = arg.slice('--file='.length);
+    else if (arg === '--delete-seq') {
+      const raw = rest.shift() ?? '';
+      const value = Number(raw);
+      if (!Number.isSafeInteger(value) || value < 0) {
+        return { ...opts, error: `--delete-seq needs a non-negative integer, got ${JSON.stringify(raw)}` };
+      }
+      opts.deleteSeqs.push(value);
+    } else if (arg.startsWith('--delete-seq=')) {
+      const raw = arg.slice('--delete-seq='.length);
+      const value = Number(raw);
+      if (!Number.isSafeInteger(value) || value < 0) {
+        return { ...opts, error: `--delete-seq needs a non-negative integer, got ${JSON.stringify(raw)}` };
+      }
+      opts.deleteSeqs.push(value);
+    } else if (arg === '--insert-file') opts.insertFile = rest.shift() ?? null;
+    else if (arg.startsWith('--insert-file=')) opts.insertFile = arg.slice('--insert-file='.length);
+    else if (arg === '--dry-run') opts.dryRun = true;
+    else if (arg === '--allow-static-validation') opts.allowStaticValidation = true;
+    else return { ...opts, error: `unknown argument: ${arg}` };
   }
   return opts;
 }
@@ -394,6 +453,181 @@ function runRestore(opts, shared) {
 }
 
 /**
+ * Load `--insert-file`: a JSON array of `{atSeq, event}`.
+ *
+ * Malformed JSON or a non-array is a usage error, not a refusal of the session log: the file the operator
+ * pointed at is not what the option promises.
+ *
+ * @param {string} file
+ * @returns {{ok: true, insert: object[]} | {ok: false, detail: string}}
+ */
+function readInsertFile(file) {
+  let text;
+  try {
+    text = fs.readFileSync(file, 'utf8');
+  } catch (error) {
+    return { ok: false, detail: `--insert-file ${file} could not be read (${error?.code ?? error?.message ?? error})` };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    return { ok: false, detail: `--insert-file ${file} is not valid JSON: ${error.message}` };
+  }
+  if (!Array.isArray(parsed)) {
+    return { ok: false, detail: `--insert-file ${file} must contain a JSON array of {atSeq, event}` };
+  }
+  return { ok: true, insert: parsed };
+}
+
+/** `3->2, 4->3`, bounded so one pathological edit set cannot print hundreds of lines. */
+function formatMapping(mapping, limit = 20) {
+  const entries = Object.entries(mapping ?? {});
+  if (entries.length === 0) return 'none';
+  const shown = entries.slice(0, limit).map(([oldSeq, newSeq]) => `${oldSeq}->${newSeq}`);
+  const rest = entries.length - shown.length;
+  return `${shown.join(', ')}${rest > 0 ? ` (+${rest} more)` : ''}`;
+}
+
+/**
+ * The serializable half of a plan: a plan carries Buffers for apply, which a `--json` report must not print.
+ *
+ * @param {object} plan
+ * @returns {object}
+ */
+function summarizePlan(plan) {
+  return {
+    ok: plan.ok === true,
+    file: plan.file ?? null,
+    session_id: plan.session_id ?? null,
+    reason_code: plan.reason_code ?? null,
+    detail: plan.detail ?? '',
+    changed: plan.changed === true,
+    events_before: plan.events_before ?? 0,
+    events_after: plan.events_after ?? 0,
+    mapping: plan.mapping ?? {},
+    rewritten_references: plan.rewritten_references ?? 0,
+    inherited_event_count: plan.inherited_event_count ?? 0,
+    original_size: plan.original_size ?? 0,
+    new_size: plan.new_size ?? 0,
+    original_sha256: plan.original_sha256 ?? null,
+    new_sha256: plan.new_sha256 ?? null,
+    backup_file: plan.backup_file ?? null,
+    validation: plan.validation ?? null,
+    codes: plan.codes ?? [],
+  };
+}
+
+/**
+ * Render the plan (and, when it was applied, the result) for a terminal.
+ *
+ * @param {object} plan
+ * @param {object|null} applied
+ * @returns {string}
+ */
+function formatRenumber(plan, applied) {
+  const lines = ['w2m-fix renumber', ''];
+  lines.push(`file          : ${plan.file ?? '(none)'}`);
+  if (plan.session_id !== null && plan.session_id !== undefined) lines.push(`session id    : ${plan.session_id}`);
+  if (plan.ok !== true) {
+    lines.push(`refused       : ${plan.reason_code ?? 'unknown'} ${plan.detail ?? ''}`.trimEnd());
+    lines.push('');
+    lines.push('nothing was written.');
+    return lines.join('\n');
+  }
+  const validation = plan.validation ?? {};
+  lines.push(`events        : ${plan.events_before} -> ${plan.events_after}`);
+  lines.push(`changed seqs  : ${formatMapping(plan.mapping)}`);
+  lines.push(`references    : ${plan.rewritten_references} rewritten`);
+  lines.push(`inherited     : ${plan.inherited_event_count}`);
+  lines.push(`static        : ${validation.static?.ok === true ? 'ok (static pre-filter, not evidence)' : `REFUSED (${(validation.static?.codes ?? []).join(', ')})`}`);
+  lines.push(`runtime       : ${validation.runtime_verified === true ? 'verified by the installed Harness' : 'static-only evidence (runtime_verified:false)'}`);
+  lines.push(`future append : ${validation.future_append === true ? 'ok' : 'not confirmed'} [${validation.future_append_evidence ?? 'static-prefilter'}]`);
+  if (!plan.changed) {
+    lines.push('');
+    lines.push('no change: the log is already dense; nothing was written.');
+    return lines.join('\n');
+  }
+  if (applied === null) return lines.join('\n');
+  if (applied.ok !== true) {
+    lines.push(`failed        : ${applied.reason_code} ${applied.detail ?? ''}`.trimEnd());
+    if (applied.backup_file !== null && applied.backup_file !== undefined) lines.push(`backup        : ${applied.backup_file} (the way back)`);
+    return lines.join('\n');
+  }
+  if (applied.dry_run === true) {
+    lines.push(`backup        : ${applied.backup_file ?? '(planned)'} (dry run: not created)`);
+    lines.push('');
+    lines.push('dry run: nothing was written. Re-run without --dry-run to apply.');
+    return lines.join('\n');
+  }
+  lines.push(`backup        : ${applied.backup_file}`);
+  lines.push(`result        : wrote ${applied.bytes} byte(s) to the log`);
+  lines.push(`sha256        : ${applied.sha256}`);
+  return lines.join('\n');
+}
+
+/**
+ * `renumber`: gate G4's command -- delete/insert events only through this path.
+ *
+ * The default is to apply (`--dry-run` only plans), because the plan has already validation-gated the result and
+ * every apply makes its own `.bak-<timestamp>` copy before writing.
+ *
+ * @param {object} opts parsed options
+ * @returns {number} exit code
+ */
+function runRenumber(opts) {
+  if (opts.file === null || opts.file === '') {
+    writeErr('renumber needs --file <path>');
+    writeErr('usage: node bin/w2m-fix.mjs renumber --file <session.v4.jsonl.zstd> [--delete-seq <n>]... [--insert-file <json>] [--dry-run]');
+    return EXIT.USAGE;
+  }
+  let insert = [];
+  if (opts.insertFile !== null) {
+    const loaded = readInsertFile(opts.insertFile);
+    if (loaded.ok !== true) {
+      writeErr(`error: ${loaded.detail}`);
+      writeErr('run with --help to see usage');
+      return EXIT.USAGE;
+    }
+    insert = loaded.insert;
+  }
+
+  let plan;
+  try {
+    plan = planRenumber({
+      file: opts.file,
+      deleteSeqs: opts.deleteSeqs,
+      insert,
+      allowStaticValidation: opts.allowStaticValidation === true,
+    });
+  } catch (error) {
+    writeErr(`error: renumber planning crashed: ${error?.message ?? String(error)}`);
+    return EXIT.FAILED;
+  }
+  const applied = plan.ok === true ? applyRenumber({ plan, dryRun: opts.dryRun === true }) : null;
+  const outcome = applied ?? plan;
+
+  if (opts.json) {
+    writeOut(
+      JSON.stringify(
+        {
+          command: 'renumber',
+          ok: outcome.ok === true,
+          dry_run: opts.dryRun === true,
+          plan: summarizePlan(plan),
+          applied: applied === null ? null : { ...applied },
+        },
+        null,
+        2,
+      ),
+    );
+  } else {
+    writeOut(formatRenumber(plan, applied));
+  }
+  return outcome.ok === true ? EXIT.OK : EXIT.FAILED;
+}
+
+/**
  * CLI entry point: parse arguments, resolve paths, dispatch one command.
  *
  * @param {string[]} argv arguments after the script name
@@ -405,10 +639,17 @@ export function main(argv) {
     process.stdout.write(USAGE);
     return EXIT.OK;
   }
+  if (opts.error !== null && opts.error !== undefined) {
+    writeErr(`error: ${opts.error}`);
+    writeErr('run with --help to see usage');
+    return EXIT.USAGE;
+  }
   if (!hasZstd()) {
     writeErr(`this Node has no synchronous zstd API (needs >= 22.15 or >= 23); current ${process.version}`);
     return EXIT.UNSUPPORTED_NODE;
   }
+  // Renumber needs only `--file`: it must not require a full `$DSH_HOME` layout the way scan/fix do.
+  if (opts.command === 'renumber') return runRenumber(opts);
   const { sessionsRoot, storeRoot } = resolvePaths(opts);
   const dirs = selectSessions(sessionsRoot, opts.session);
   const shared = { sessionsRoot, storeRoot, dirs };

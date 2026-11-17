@@ -273,6 +273,15 @@ seq 缺口拒绝、dense 通过、运行时证据正/反向。详见 `docs/BACKU
 - i18n：`panel.backup.*` 121 键 × 中/英（内联字典）+ 34 个 reason-code 映射；主题只用宿主 `--dsw-alias-*` 令牌。
 - 测试：`client-bundle` +12 项；`loader-entry`（真实 Chromium + 抛空 profile 安装当前 tarball）新增侧边栏入口/
   面板/四操作断言（本机实测 10/10 通过；CI 无 Harness 时按名 skip）。
+**G4 收口（2026-11-17）**：删/插事件现在只有一条合法路径——`src/backup/renumber.mjs`（`renumberBuffer` /
+`planRenumber` / `applyRenumber`）：解析 → 应用删/插 → seq 重编为 0..N-1 → 递归改写 `*Seq`/`*Seqs` 引用（悬空拒绝）
+→ 重算 inheritedEventCount → header 单帧 + 每事件一帧重编码 → doctor 预筛 + "未来追加"模拟 + 安装 Harness 终审
+（G1/G3/G5 同链）→ 先写 `.bak-<时间戳>` 再原子写、回读 sha256 + doctor 复验。CLI：`w2m-fix renumber --file <log>
+[--delete-seq <n>]... [--insert-file <json>] [--dry-run] [--allow-static-validation] [--json]`（默认写入，dry-run 零
+写入）；`fix -> backup` 同级边已在 `scripts/layer-model.mjs` 声明。测试 `test/fix-renumber.test.mjs` 21 项（删/插、
+悬空/torn/非 dense 拒绝、幂等、运行时门禁正反、`.bak` 回读、CLI）。边界：它改历史，不属于 backup/restore；能还原
+的日志应走还原 + verify，不要用它"修"。详见 `docs/BACKUP-DESIGN.md` §20。
+
 ### v3.5.0 — 版本治理、Phase 2 与备份增强（里程碑）
 
 **交付**

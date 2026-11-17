@@ -4,6 +4,27 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### G4 seq 重编号工具（删/插事件的唯一合法方式，v3.4.8 补全）
+
+- **新增 `src/backup/renumber.mjs`（G4 收口）**：`renumberBuffer(buffer,{deleteSeqs,insert})` 纯内存完成
+  "删/插 → seq 重编为 0..N-1 → 递归改写所有 `*Seq`/`*Seqs` 引用 → 重算 inheritedEventCount → header 单帧 +
+  每事件一帧重编码"；torn / 非 v4 / 非 dense 输入 / 越界编辑都给具名拒绝，引用指向被删事件即
+  `RENUMBER_DANGLING_REFERENCE`（detail 带事件类型/键/seq，不猜替代值）。
+- **plan/apply 分离**：`planRenumber` 只读，并用 doctor 预筛 + "未来追加"模拟 + 安装 Harness 终审校验**结果**
+  （G1/G3/G5 同一条门禁链）；无安装时默认 `RENUMBER_RUNTIME_UNAVAILABLE`，`allowStaticValidation` 才降级并
+  如实标 `runtime_verified:false`。`applyRenumber` 先写 `<file>.bak-<时间戳>` 并回读比对，再原子写、回读
+  sha256 + doctor 复验；plan 之后文件被客户端追加则 `RENUMBER_TARGET_CHANGED` 拒绝覆盖。
+- **CLI**：`w2m-fix renumber --file <log> [--delete-seq <n>]... [--insert-file <json>] [--dry-run]
+  [--allow-static-validation] [--json]`（默认写入，`--dry-run` 只规划；退出码 0 成功 / 1 具名拒绝 / 2 用法错误）。
+  人类输出给事件前后数、仅变化的 seq mapping（约 20 条封顶）、引用改写数、static/runtime/future-append 证据与
+  `.bak` 路径。`fix -> backup` 同级边已在 `scripts/layer-model.mjs` 声明（模块级无环）。
+- **测试**：新增 `test/fix-renumber.test.mjs`（21 项，接进 `scripts.test` / `test:all` / `test:fix-renumber`）；
+  覆盖删中间事件、插入/追加、悬空引用 / torn / 非 dense 拒绝且零写入、no-op + 幂等、运行时门禁正反两向、
+  `.bak` 保留原始字节 + 回读校验、plan 后文件变化、dry-run 零写入、CLI 退出码与真实入口追加。
+- **诚实边界**：工具改历史，不是 backup/restore 的一部分（还原仍只发布原始字节）；每次成功 apply 都留
+  `.bak-<时间戳>`；能还原的日志应走还原 + verify，不要用它"修"——拒绝非 dense 输入正是为了不制造第二次损坏。
+  设计见 `docs/BACKUP-DESIGN.md` §20。
+
 ### G5 校验只用运行时同一份代码（v3.4.6 补全）
 
 - **证据链收口**：静态 doctor 只在报告里带 `evidence:'static-prefilter'`；结论性证据来自 `runtime-driver.mjs`

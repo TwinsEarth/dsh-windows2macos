@@ -349,7 +349,7 @@ plan  解块 → 运行时校验(G5) → 冲突分类 → 注册表计划       
 | **G1** 候选先过 doctor 再发布 | `planRestore` 对每份解回的字节跑 `validateCandidate`，任一失败即整单拒绝；`applyRestore` 写后再复验 |
 | **G2** 注册表写入协议 | `registry.mjs`：原子写 + 回读校验（会话已登记、archived/pinned 与计划一致）+ 明示"客户端内存态会回写" |
 | **G3** 禁止手工事件 | 只写快照里的**原始字节**（解块后逐字节比对清单）；写入前做 `simulateFutureAppend`，追加一条合法事件后仍须通过校验 |
-| **G4** seq 重编号工具 | **本版不做**。还原只发布原始字节，从不删/插事件，所以不需要重编号；工具本身是"改历史"的入口，等有真实修复需求（且先有运行时 diff 证据）再单独设计，见 §15.6 |
+| **G4** seq 重编号工具 | v3.4.8 **本版不做**（还原只发布原始字节，从不删/插事件，所以不需要重编号）；2026-11-17 已补全为**独立工具** `src/backup/renumber.mjs` + `w2m-fix renumber`，见 §20 |
 | **G5** 校验用运行时同一份代码 | `runtime-validate.mjs` 用安装的 Harness 跑 `sessionFormatCatalog.createRestore(..., validation:'current')`；自写 doctor 只预筛，不单独作为证据 |
 
 ### 15.3 运行时校验：为什么是子进程
@@ -389,6 +389,9 @@ Harness 的会话格式代码在 `resources/app.asar` 里，plain node 读不了
 运行时给出 diff 证据、必须改写所有 `*Seq` 引用、必须过 doctor + 运行时双校验，并且要有一个"同一条
 会话两处修改合并"的策略。把它做成还原的一部分会让 v3.4.8 的失败面凭空变大。设计留在此处，等真实修复
 场景出现后单独提出。
+
+**2026-11-17 更新（G4 收口）**：上面这段记录的是 v3.4.8 当时**为什么不在还原路径里**，该理由不变；工具本身已
+作为独立能力补全（`src/backup/renumber.mjs` + `w2m-fix renumber`），不进 restore 路径，见 §20。
 
 ### 15.7 v3.4.8 新增错误码
 
@@ -602,3 +605,93 @@ UI 半只有一个文件：`lib/client.js`（手写、由 `window.__ModuleLoader
   追加 artifact 被拒，`failed ≥ 1`，无静态回退）。
 * `test/backup-verify.test.mjs`：`--runtime` 连 append 后 artifact 一起终审。
 * `test/loader-entry.test.mjs`：真实 Chromium 页面（抛空 profile 安装当前 tarball）断言面板入口与四操作标记。
+
+## 20. G4 收口：seq 重编号工具（v3.4.8/v3.4.9）
+
+复盘 G4 的原文是"删/插事件的唯一合法方式是重编号工具：全局 renumber + 改写所有指向 seq 的引用 + 医生校验"。
+v3.4.8 当时**没有做**（还原只发布原始字节，§15.6）；2026-11-17 补全为 `src/backup/renumber.mjs` + 固定 CLI 命令
+`w2m-fix renumber` + `test/fix-renumber.test.mjs`。
+
+### 20.1 规则
+
+* **唯一入口**：手工改 JSON 文本是复盘点名的陷阱——删掉一行后 `seq` 不连续，`sourceEventSeqs`/`messageSeqs`/
+  `headerSeq`/`surfaceOp.{startSeq,endSeq}` 仍指向旧位置，日志要么打不开、要么以"静默错位的历史"打开。除本工具
+  外没有第二条合法路径。
+* **输入前提**：待编辑日志必须是**已经 dense** 的 v4 日志（`seq === 数组下标`）。已经跳号的日志拒绝编辑——
+  `deleteSeqs` 的地址会歧义，那类日志应该走还原（备份里有原始字节）。
+* **引用规则**：任何键名匹配 `/(?:Seq|Seqs)$/`、值为整数（或整数数组）的字段都是引用，一律 old→new 改写；
+  递归遍历，所以 `data.sourceEventSeqs`、`data.messageSeqs`、`headerSeq`、`surfaceOp.startSeq/endSeq` 以及将来
+  新增的 `*Seq` 字段都被覆盖。指向**被删除事件**的引用直接拒绝（`RENUMBER_DANGLING_REFERENCE`，detail 给出事件
+  类型/键/seq），不猜替代值。
+* **插入事件**：`atSeq` 把事件插在"当前位于 atSeq 的事件之前"，`atSeq === 事件数` 追加。插入事件自身的 `seq`
+  被覆盖为新的 dense 下标；它携带的 `*Seq` 引用按**编辑前**的 seq 解释（因此无法用新 seq 指向另一个插入事件）。
+* **inherited 计数**：按"最后一个 `session/end-seed` 且 `data.inherited === true` 的位置"重算
+  `inheritedEventCount`；`isSeeded:false` 的日志若算出非 0 直接拒绝（`RENUMBER_INPUT_INVALID`）。
+* **编码**：header 单独一帧，随后一条事件一帧（与本包写日志的格式一致），不产生半帧；空编辑集且日志已 dense 时
+  原样返回调用方字节（`changed:false`）。
+
+### 20.2 流水线
+
+```
+parse（拆帧→解行；torn / 非 v4 / 非 dense / 非法编辑 → 具名拒绝）
+  → 应用 delete/insert
+  → renumber（seq = 0..N-1）
+  → 改写所有 *Seq 引用（悬空 → 拒绝，不猜）
+  → 重算 inheritedEventCount
+  → 编码（header 单帧 + 每事件一帧）
+  → 校验 RESULT：doctor 预筛(G1) + "未来追加"模拟(G3) + 安装 Harness 终审(G5，唯一证据)
+  → apply：先写 <file>.bak-<时间戳> 并回读比对 → 原子写 → 回读 sha256 + doctor 复验
+```
+
+`planRenumber` 只读、零写入（plan 对象带原始字节、新字节、mapping、校验结论与备份路径）；`applyRenumber` 才写。
+`--dry-run` 只走到 plan。
+
+### 20.3 拒绝清单
+
+| 码 | 何时 |
+|---|---|
+| `RENUMBER_TORN_INPUT` | 尾部有半帧（崩溃残留） |
+| `RENUMBER_INPUT_INVALID` | 空文件/非 v4 header/行不是事件/非 dense 输入/越界编辑/插入 `session` header/`isSeeded:false` 却算出 inherited 事件 |
+| `RENUMBER_DANGLING_REFERENCE` | 引用指向被删除的 seq（或本来就不存在） |
+| `RENUMBER_STATIC_REJECTED` | 结果过不了 doctor（或静态"未来追加"模拟） |
+| `RENUMBER_RUNTIME_UNAVAILABLE` | 需要运行时证据但本机没有可用安装，且未给 `--allow-static-validation` |
+| `RENUMBER_RUNTIME_REJECTED` | 安装的 Harness 拒绝结果（或"结果 + 一条合法追加"） |
+| `RENUMBER_TARGET_CHANGED` | plan 之后文件被客户端追加；apply 拒绝覆盖 |
+| `RENUMBER_WRITE_FAILED` / `RENUMBER_VERIFY_FAILED` | 备份/写入失败；写后回读不一致（备份即回退路径） |
+
+### 20.4 CLI
+
+```
+node bin/w2m-fix.mjs renumber --file <session.v4.jsonl.zstd> [--delete-seq <n>]...
+                                  [--insert-file <json>] [--dry-run] [--allow-static-validation] [--json]
+```
+
+* `--delete-seq <n>` 可重复，`n` 是 dense 的零基 seq（即数组下标）。
+* `--insert-file` 是 JSON 数组：`[{"atSeq":1,"event":{...}}]`。
+* 默认**写入**（与 `fix`/`restore` 需要 `--apply` 不同）：结果已经被 plan 的全部门禁验证，且每次 apply 都先留
+  `.bak-<时间戳>`；`--dry-run` 只规划并打印证据。退出码：0 成功、1 具名拒绝、2 用法错误。
+* 人类输出：事件数前后、仅变化 seq 的 mapping（约 20 条封顶）、改写引用数、inherited 计数、static/runtime/
+  future-append 证据、备份路径；失败打印 `reason_code` 与 detail。`--json` 输出 plan + applied 的可序列化摘要
+  （不含 Buffer）。
+
+### 20.5 测试与诚实边界
+
+`test/fix-renumber.test.mjs`（21 项）覆盖：删中间事件（dense、递归引用改写、`surfaceOp` 改写、header/其他字段
+保留、mapping/持有计数正确）、插入/追加、悬空引用拒绝且零写入、torn 拒绝、no-op、apply 后再 plan 的幂等、运行时
+门禁（安装的 Harness 拒绝静态合法日志 → `RENUMBER_RUNTIME_REJECTED`；注入无安装 → `RENUMBER_RUNTIME_UNAVAILABLE`；
+`--allow-static-validation` 才降级且标 `runtime_verified:false`）、`.bak` 保留原始字节 + 写后 sha/doctor 复验、
+plan 后文件变化拒绝覆盖、dry-run 零写入、CLI 退出码/帮助/真实入口追加。
+
+**诚实边界**：
+
+* 它**改历史**。不是 backup/restore 的一部分——还原永远只发布快照里的原始字节，从不删/插事件；本工具只在
+  "没有可用原始字节、必须从当前日志里移除或补一条事件"时使用。
+* 每次成功 apply 都在同目录留下 `.bak-<时间戳>`；那是唯一回退路径，不要删。
+* **能还原就不要用它"修"**：一条已经跳号/损坏的日志，正确做法是从备份还原并跑 verify；本工具拒绝非 dense 输入
+  正是为了不把"修复"变成第二次损坏。
+* 失败方向：plan 失败 = 零写入；写入失败 = 原文件仍在（备份先写好）；回读失败 = 报 `RENUMBER_VERIFY_FAILED` 并
+  给出备份路径。
+* 层规则：工具在 backup 层（复用 backup 的 doctor / 未来追加 / 运行时门禁），命令挂在 fix CLI 上；`fix -> backup`
+  是同级边，已在 `scripts/layer-model.mjs` 声明，模块级无环（`backup/renumber -> fix/zstd`，从不 import
+  `fix/cli`）。
+
