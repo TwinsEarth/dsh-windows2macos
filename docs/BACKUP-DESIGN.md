@@ -322,3 +322,87 @@
 | `w2m-backup list` / `gc` | CLI | 快照列表 / 孤儿块与 old 窗口清理（`--dry-run` 只报不删） |
 
 `dsh-backup` 子插件行随包发布但 `disabled: true`：**启用它才意味着"定时器可以写盘"**。只读路由仍在主插件上，因此面板的"状态卡片"不需要先启用子插件。
+
+
+## 15. 还原、解锁、校验与归档（v3.4.8）
+
+### 15.1 还原流水线：先规划，后写入
+
+```
+plan  解块 → 运行时校验(G5) → 冲突分类 → 注册表计划        （零写入）
+  ↓  --apply
+预还原副本（被覆盖的会话文件 + workspace.json）
+  ↓
+原子写会话文件 → 写附件对象 → 注册表原子写 → 回读校验(G2)
+  ↓
+复读每个写入文件：sha256 必须等于计划值 + doctor 复验      （失败如实报告）
+```
+
+失败方向是明确的：规划失败 = 什么都没写；写入中途失败 = 写过的会话不完整，但预还原副本已经在
+`sessions/.w2m-restore-backups/<ts>/`，报告会给出路径；注册表写后校验失败 = 会话在盘上但注册表没认，
+报 `BACKUP_REGISTRY_VERIFY_FAILED` 并重试。
+
+### 15.2 四条门禁的接线状态
+
+| 门禁 | v3.4.8 落点 |
+|---|---|
+| **G1** 候选先过 doctor 再发布 | `planRestore` 对每份解回的字节跑 `validateCandidate`，任一失败即整单拒绝；`applyRestore` 写后再复验 |
+| **G2** 注册表写入协议 | `registry.mjs`：原子写 + 回读校验（会话已登记、archived/pinned 与计划一致）+ 明示"客户端内存态会回写" |
+| **G3** 禁止手工事件 | 只写快照里的**原始字节**（解块后逐字节比对清单）；写入前做 `simulateFutureAppend`，追加一条合法事件后仍须通过校验 |
+| **G4** seq 重编号工具 | **本版不做**。还原只发布原始字节，从不删/插事件，所以不需要重编号；工具本身是"改历史"的入口，等有真实修复需求（且先有运行时 diff 证据）再单独设计，见 §15.6 |
+| **G5** 校验用运行时同一份代码 | `runtime-validate.mjs` 用安装的 Harness 跑 `sessionFormatCatalog.createRestore(..., validation:'current')`；自写 doctor 只预筛，不单独作为证据 |
+
+### 15.3 运行时校验：为什么是子进程
+
+Harness 的会话格式代码在 `resources/app.asar` 里，plain node 读不了。所以 node 侧只做两件事：
+把 zstd 帧解成"header + 事件行"的 artifact，然后以 `ELECTRON_RUN_AS_NODE=1` 启动 Harness 本体跑
+`runtime-driver.mjs`。driver 只做一件事：`createRestore(header,{validation:'current'})` → 逐行
+`decodeRow` → `finish()`。判定行以 `W2M-RUNTIME-VALIDATE:` 前缀回传；**没有判定行 = 失败**，绝不
+当成通过。找不到安装时默认 `BACKUP_RUNTIME_UNAVAILABLE` 拒绝还原。
+
+### 15.4 归档包
+
+`archive/<YYYY-MM-DD>/archived-sessions-<ts>.tar.zst`：
+
+* 内层是 ustar（自写 reader/writer，无 PAX；长路径按 prefix+name 拆分，超长拒绝）；
+* `manifest.json` 记录每一个文件的 rel/size/sha256/session_id/flags，来源快照 id 与 digest；
+* 字节**从仓库解块**，进包前已逐文件对过快照清单——包内清单因此是可独立验证的；
+* 默认只打 `flags.archived` 的会话，`--scope all` 打全部；
+* 回读 `readArchive` 逐文件对 sha256；`extractArchive` 拒绝 `..` 逃逸条目。
+* 包是**明文** tar：它写在用户自己的仓库目录里，manifest 与 README 都写明这一点；加密整包是 v2 议题。
+
+### 15.5 解锁：两条真实路径
+
+| 路径 | 材料 | 适用 |
+|---|---|---|
+| `machine` | OS keystore（Windows DPAPI CurrentUser）保护的 32B 随机秘密 | 定时任务、同一台机器上的面板还原 |
+| `password` | 用户密码 + scrypt(N=2^17) | 换机器、换用户、机器信封不可用 |
+| `account` | **不写**：spike 证明宿主只暴露账户标识，不暴露秘密 | — |
+
+密码种子的仓库在首次遇到可用 keystore 的机器上自动追加 `machine` 信封（DEK 不变，旧块不受影响），
+这是"密码种子 + 无人值守"能同时成立的唯一路径。面板路由从不接收密码。
+
+### 15.6 为什么 G4（seq 重编号）不在 v3.4.8
+
+还原全链路只写**快照里的原始字节**：解块 → 校验 → 原子写。整条路径没有任何"删一条/插一条"的步骤，
+所以还原不需要重编号。G4 要解决的是"用户想手工修正历史"——那不是一个可以顺手交付的能力：它必须由
+运行时给出 diff 证据、必须改写所有 `*Seq` 引用、必须过 doctor + 运行时双校验，并且要有一个"同一条
+会话两处修改合并"的策略。把它做成还原的一部分会让 v3.4.8 的失败面凭空变大。设计留在此处，等真实修复
+场景出现后单独提出。
+
+### 15.7 v3.4.8 新增错误码
+
+| 码 | 含义 |
+|---|---|
+| `BACKUP_CANDIDATE_INVALID` | 候选日志没过静态预筛 |
+| `BACKUP_RUNTIME_UNAVAILABLE` | 需要运行时校验但本机没有可用安装（可用 `--allow-static-validation` 显式降级） |
+| `BACKUP_RUNTIME_REJECTED` | 安装的 Harness 拒绝了候选日志 |
+| `BACKUP_FUTURE_APPEND_FAILED` | 追加一条合法事件后校验失败（"今天能开、明天打不开"） |
+| `BACKUP_RESTORE_NO_SESSION` | 快照里没有请求的会话 |
+| `BACKUP_RESTORE_WORKSPACE_UNKNOWN` | 备份所属工作区不在本机注册表，且没给 `--workspace-path` |
+| `BACKUP_ATTACHMENT_CONFLICT` | 附件 id 相同但字节不同（内容寻址被破坏） |
+| `BACKUP_RESTORE_VERIFY_FAILED` | 写入后复读字节/清单不一致 |
+| `BACKUP_REGISTRY_UNREADABLE` / `BACKUP_REGISTRY_WRITE_FAILED` / `BACKUP_REGISTRY_VERIFY_FAILED` | 注册表读/写/回读失败 |
+| `BACKUP_INDEX_MISMATCH` / `BACKUP_OLD_RECORD_BLOCK_MISSING` | 索引与快照目录不一致 / old 记录引用的块缺失 |
+| `BACKUP_ARCHIVE_EMPTY` / `BACKUP_ARCHIVE_UNREADABLE` | 归档无内容 / 归档不可读 |
+| `BACKUP_OBJECT_MISSING` / `BACKUP_SIZE_MISMATCH` / `BACKUP_MANIFEST_DIGEST_MISMATCH` | 块缺失 / 长度不符 / 摘要不符 |

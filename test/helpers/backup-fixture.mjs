@@ -12,7 +12,13 @@ import { dirname, join } from 'node:path';
 
 import { compressFrame } from '../../src/fix/zstd.mjs';
 
-/** A correct v4 header for one session. */
+/**
+ * A correct v4 header for one session.
+ *
+ * `isSeeded` and `delegationDepth` are required by the installed Harness's own v4 header validation
+ * (`assertReleasedV4Header`); a header without them is interpreted as an older physical format and refused. The
+ * fixture therefore carries them, so a fixture log is *format-valid* even before it is content-valid.
+ */
 export function header(sessionId, overrides = {}) {
   return {
     type: 'session',
@@ -20,6 +26,8 @@ export function header(sessionId, overrides = {}) {
     id: sessionId,
     cwd: 'E:\\GPT',
     createdAt: 1794842804375,
+    isSeeded: false,
+    delegationDepth: 0,
     agentPreset: 'standard',
     ...overrides,
   };
@@ -127,4 +135,37 @@ export function makeHome(spec = {}) {
 /** A 64-character content address for fixtures. */
 export function attachmentId(seed = 0) {
   return `${String(seed).padStart(2, '0')}${'ab'.repeat(31)}`;
+}
+
+/**
+ * A session log the installed Harness's own validator accepts.
+ *
+ * Minimal on purpose: one turn with a start and an end. It is the smallest artifact that passes
+ * `sessionFormatCatalog.createRestore` with `validation: 'current'` (verified against the installed Harness), which
+ * is exactly what restore's G5 gate needs: a candidate whose runtime validity is a measured fact, not a hope.
+ *
+ * The general-purpose {@link sessionLog} above stays deliberately minimal-and-not-runtime-valid for suites that
+ * only need *format* validity (scan, manifest, engine dedup) -- making every fixture a model-generated conversation
+ * would hide which tests depend on the runtime gate.
+ *
+ * @param {string} sessionId
+ * @returns {Buffer}
+ */
+export function runtimeValidSessionLog(sessionId) {
+  return framesFor([
+    header(sessionId),
+    { type: 'turn/start', seq: 0, time: 1794842804375, data: { turn: 1 } },
+    { type: 'turn/end', seq: 1, time: 1794842804376, data: { turn: 1, reason: { kind: 'completed' } } },
+  ]);
+}
+
+/** A DSH home holding one runtime-valid session plus one format-only session. */
+export function runtimeValidHome() {
+  const spec = makeHome({
+    sessions: [{ workspace: '--E-GPT--', id: 'session-aaaaaaaa-0001', events: [] }],
+    registry: registryDocument({ sessionIds: ['session-aaaaaaaa-0001'] }),
+  });
+  // Replace the log with one the installed Harness accepts.
+  put(spec.files['session-aaaaaaaa-0001'], runtimeValidSessionLog('session-aaaaaaaa-0001'));
+  return spec;
 }

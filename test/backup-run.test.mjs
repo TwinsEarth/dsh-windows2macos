@@ -10,7 +10,11 @@ import assert from 'node:assert/strict';
 import { join } from 'node:path';
 
 import {
+  BACKUP_ARCHIVE_ROUTE_PATH,
+  BACKUP_RESTORE_ROUTE_PATH,
   BACKUP_RUN_ROUTE_PATH,
+  BACKUP_UNLOCK_ROUTE_PATH,
+  BACKUP_VERIFY_ROUTE_PATH,
   RUN_CONFIRM_TOKEN,
   apply,
   defaultBackupDir,
@@ -102,12 +106,16 @@ describe('subplugin: the route and the timer', () => {
     try {
       const fake = fakeCtx();
       apply(fake.ctx, { backupDir: join(dir, 'repo'), dshHome: home, backupMachineKey: false, ...NO_FIRE });
-      assert.equal(fake.registrations.length, 1);
-      assert.equal(fake.registrations[0].path, BACKUP_RUN_ROUTE_PATH);
-      assert.deepEqual(fake.registrations[0].methods, ['GET', 'POST']);
+      assert.equal(fake.registrations.length, 5, 'v3.4.8 adds restore/archive/verify/unlock beside the run route');
+      assert.deepEqual(
+        fake.registrations.map((row) => row.path).sort(),
+        [BACKUP_RUN_ROUTE_PATH, BACKUP_RESTORE_ROUTE_PATH, BACKUP_ARCHIVE_ROUTE_PATH, BACKUP_VERIFY_ROUTE_PATH, BACKUP_UNLOCK_ROUTE_PATH].sort(),
+      );
+      assert.deepEqual(fake.registrations.find((row) => row.path === BACKUP_RUN_ROUTE_PATH).methods, ['GET', 'POST']);
+      assert.deepEqual(fake.registrations.find((row) => row.path === BACKUP_RUN_ROUTE_PATH).methods, ['GET', 'POST']);
       assert.equal(fake.disposers.length, 1, 'the timer must be owned by ctx.effect');
 
-      const get = await fake.registrations[0].fetch(new Request(`http://local.invalid${BACKUP_RUN_ROUTE_PATH}`, { method: 'GET' }));
+      const get = await fake.registrations.find((row) => row.path === BACKUP_RUN_ROUTE_PATH).fetch(new Request(`http://local.invalid${BACKUP_RUN_ROUTE_PATH}`, { method: 'GET' }));
       const state = await get.json();
       assert.equal(state.ok, true);
       assert.equal(state.enabled, true);
@@ -116,7 +124,7 @@ describe('subplugin: the route and the timer', () => {
       assert.equal(state.scheduler.time_zone, 'UTC');
 
       fake.disposers[0]();
-      const stopped = await (await fake.registrations[0].fetch(new Request(`http://local.invalid${BACKUP_RUN_ROUTE_PATH}`, { method: 'GET' }))).json();
+      const stopped = await (await fake.registrations.find((row) => row.path === BACKUP_RUN_ROUTE_PATH).fetch(new Request(`http://local.invalid${BACKUP_RUN_ROUTE_PATH}`, { method: 'GET' }))).json();
       assert.equal(stopped.scheduler.stopped, true, 'the effect disposer must stop the timer');
     } finally {
       cleanup();
@@ -131,7 +139,7 @@ describe('subplugin: the route and the timer', () => {
       const fake = fakeCtx();
       apply(fake.ctx, { backupDir: join(dir, 'repo'), dshHome: home, backupMachineKey: false, ...NO_FIRE });
       const url = `http://local.invalid${BACKUP_RUN_ROUTE_PATH}`;
-      const fetch = fake.registrations[0].fetch;
+      const fetch = fake.registrations.find((row) => row.path === BACKUP_RUN_ROUTE_PATH).fetch;
 
       const noConfirm = await fetch(new Request(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({}) }));
       assert.equal(noConfirm.status, 400);
@@ -155,7 +163,7 @@ describe('subplugin: the route and the timer', () => {
     try {
       const fake = fakeCtx();
       apply(fake.ctx, { backupDir: join(dir, 'repo'), dshHome: home, backupMachineKey: false, ...NO_FIRE });
-      const response = await fake.registrations[0].fetch(
+      const response = await fake.registrations.find((row) => row.path === BACKUP_RUN_ROUTE_PATH).fetch(
         new Request(`http://local.invalid${BACKUP_RUN_ROUTE_PATH}`, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
@@ -184,7 +192,7 @@ describe('subplugin: the route and the timer', () => {
       try {
         const fake = fakeCtx();
         apply(fake.ctx, { backupDir: join(dir, 'repo'), dshHome: home, ...NO_FIRE });
-        const response = await fake.registrations[0].fetch(
+        const response = await fake.registrations.find((row) => row.path === BACKUP_RUN_ROUTE_PATH).fetch(
           new Request(`http://local.invalid${BACKUP_RUN_ROUTE_PATH}`, {
             method: 'POST',
             headers: { 'content-type': 'application/json' },

@@ -395,3 +395,31 @@ v3.4.6 协议+加密+扫描 ──▶ v3.4.7 引擎/定时/轮转 ──▶ v3.4
 
 v3.4.6 的验收新增一条：`node scripts/session-doctor.mjs --root "$DSH_HOME"` 在真实数据上只报已知的未注册会话（≤1 项），且新增单测覆盖"健康日志零发现项"。
 v3.4.8 的验收新增一条：还原后必须再跑一次 doctor 且零发现项，并模拟"未来追加"仍通过。
+
+## 实施记录：v3.4.8（2026-11-17）
+
+**已交付**
+
+- `src/backup/restore.mjs`：plan/apply 两段式；规划阶段解块 + 运行时校验 + 冲突分类 + 注册表计划，零写入；
+  apply 顺序为"预还原副本 → 原子写会话 → 写附件 → 注册表写+回读 → 复读字节比对"。冲突默认先备份后覆盖，
+  `--keep-both` 写 `session.v4.jsonl.zstd.restored-<ts>`。
+- `src/backup/registry.mjs`（G2）：原子写 + 回读校验 + 客户端回写警告；只登记会话 id 与 archived/pinned；
+  工作区由路径 slug 匹配（`E:\GPT` → `--E-GPT--`），未知工作区拒绝，`--workspace-path` 才能新建。
+- `src/backup/runtime-validate.mjs` + `runtime-driver.mjs`（G5）：node 侧解 zstd 帧 → artifact JSON →
+  以 `ELECTRON_RUN_AS_NODE=1` 启动安装的 Harness 跑 `sessionFormatCatalog.createRestore(header,{validation:'current'})`
+  → 逐行 decodeRow → finish。没有判定行按失败处理；无安装默认拒绝（`--allow-static-validation` 显式降级）。
+- `src/backup/unlock.mjs`：machine（DPAPI）/ password（scrypt）两条路径；账户信封不做（spike 结论）。
+- `src/backup/verify.mjs`：全量解块校验 + 索引↔快照双向核对 + old/current 引用块存在性 + 未来追加模拟。
+- `src/backup/archive.mjs` + `tar.mjs`：`.tar.zst` 归档（manifest + README + 文件树），回读逐文件验 sha256，
+  解包拒绝路径逃逸。
+- `src/util/session-validate.mjs`：doctor 规则下沉到 util（脚本变薄并 re-export），供还原门禁复用同一份规则。
+- 子插件 4 个路由（restore/archive/verify/unlock）+ CLI 4 个命令（restore 默认只打印计划）。
+- 测试新增 5 套件：runtime / restore / archive / verify / access；备份侧共 20 套件。
+
+**门禁状态**：G1/G2/G3/G5 已接线；G4（seq 重编号）本版不做 —— 还原只写原始字节，不需要重编号，
+理由与将来的设计边界写在 `docs/BACKUP-DESIGN.md` §15.6。
+
+**验收**：真实仓库上 `verify` 全绿；`archive --scope all` 产出的包 `readArchive` 逐文件校验通过；
+还原到空 home 后日志字节与备份一致、`workspace.json` 已登记；错误密码/错误身份被 `BACKUP_NO_PERMISSION` 拒绝。
+
+> **2026-11-17 实测（默认仓库）**：`unlock` → `machine` 信封、本机可用；`verify` 2 快照 / 32 文件 / 337.4 MB / 108 块全通过，30/30 未来追加模拟通过，49.1 s；`archive --scope all` 16 文件 → 168.7 MB tar → 164.7 MB zstd，2.3 s；`restore` 计划 15/15 会话由安装的 Harness 终审通过（13 identical / 2 conflict，冲突来自备份后仍在写入的活会话），dry-run 零写入；未注册工作区的会话默认拒绝，`--workspace-path` 显式挂接后进入计划。计划阶段对 15 份会话做运行时终审约 1.4 min —— 面板应按需逐份规划，而不是一次性全量。

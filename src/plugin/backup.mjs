@@ -31,6 +31,10 @@
  * empty POST.
  */
 
+import { applyRestore, planRestore } from '../backup/restore.mjs';
+import { buildArchive } from '../backup/archive.mjs';
+import { describeUnlock, unlockRepo } from '../backup/unlock.mjs';
+import { verifyRepo } from '../backup/verify.mjs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -46,6 +50,27 @@ export const inject = [];
 
 /** Path of the write route (GET reads the state, POST runs a backup). */
 export const BACKUP_RUN_ROUTE_PATH = '/api/w2m/backup/run';
+
+/** Restore plan/apply route (v3.4.8). A POST needs `{"confirm":"restore"}`. */
+export const BACKUP_RESTORE_ROUTE_PATH = '/api/w2m/backup/restore';
+
+/** Archive-pack route (v3.4.8). A POST needs `{"confirm":"archive"}`. */
+export const BACKUP_ARCHIVE_ROUTE_PATH = '/api/w2m/backup/archive';
+
+/** Full verification route (v3.4.8, read-only). */
+export const BACKUP_VERIFY_ROUTE_PATH = '/api/w2m/backup/verify';
+
+/** Unlock probe route (v3.4.8): GET describes, POST with `{"confirm":"unlock"}` attempts. */
+export const BACKUP_UNLOCK_ROUTE_PATH = '/api/w2m/backup/unlock';
+
+/** Confirmation token for the restore route. */
+export const RESTORE_CONFIRM_TOKEN = 'restore';
+
+/** Confirmation token for the archive route. */
+export const ARCHIVE_CONFIRM_TOKEN = 'archive';
+
+/** Confirmation token for the unlock attempt. */
+export const UNLOCK_CONFIRM_TOKEN = 'unlock';
 
 /** Confirmation token a POST must carry. */
 export const RUN_CONFIRM_TOKEN = 'run';
@@ -254,6 +279,113 @@ export function apply(ctx, config = {}) {
           // 200 even for a refusal: the panel renders the reason code, and a 4xx/5xx would show as a broken
           // request rather than as the named reason the engine produced.
           return Response.json(result, { headers: NO_STORE });
+        },
+      });
+    });
+  }
+
+  // v3.4.8: restore / archive / verify / unlock. Every writing route needs its own confirmation token; the
+  // read-only describe routes need none. The panel never supplies a password: it unlocks through the machine
+  // envelope, and a password-only repository is refused with the reason that names the CLI command to run.
+  if (typeof ctx?.inject === 'function') {
+    ctx.inject(['connection'], (webCtx) => {
+      const registry = webCtx?.connection?.fetch;
+      if (registry === undefined || typeof registry.register !== 'function') return;
+      const readBody = async (request) => {
+        try {
+          return await request.json();
+        } catch {
+          return null;
+        }
+      };
+      const refuse = (reason_code, detail, status = 400) => Response.json({ ok: false, reason_code, detail }, { status, headers: NO_STORE });
+      const unlockInput = () => ({ root: cfg.backup_dir, dshHome: cfg.dsh_home, machineKey: cfg.machine_key });
+
+      registry.register({
+        path: BACKUP_UNLOCK_ROUTE_PATH,
+        methods: ['GET', 'POST'],
+        requestBody: 'buffered',
+        fetch: async (request) => {
+          if (request.method === 'GET') {
+            return Response.json(describeUnlock(unlockInput()), { headers: NO_STORE });
+          }
+          if (request.method !== 'POST') return refuse('METHOD_NOT_ALLOWED', `${request.method} is not a method this route answers`, 405);
+          const body = await readBody(request);
+          if (body === null || body.confirm !== UNLOCK_CONFIRM_TOKEN) {
+            return refuse('BACKUP_CONFIRM_REQUIRED', `a JSON body with {"confirm":"${UNLOCK_CONFIRM_TOKEN}"} is required`);
+          }
+          const result = unlockRepo(unlockInput());
+          return Response.json({ ok: result.ok, via: result.via, reason_code: result.reason_code, detail: result.detail, attempts: result.attempts }, { headers: NO_STORE });
+        },
+      });
+
+      registry.register({
+        path: BACKUP_VERIFY_ROUTE_PATH,
+        methods: ['GET'],
+        fetch: async (request) => {
+          if (request.method !== 'GET') return refuse('METHOD_NOT_ALLOWED', `${request.method} is not a method this route answers`, 405);
+          // Read-only but expensive: it decrypts every block of every snapshot to re-hash it.
+          const result = verifyRepo({ ...unlockInput(), futureAppend: true });
+          state.last_verify = { at: new Date().toISOString(), ok: result.ok, counts: result.counts, problems: result.problems.length };
+          return Response.json(result, { headers: NO_STORE });
+        },
+      });
+
+      registry.register({
+        path: BACKUP_ARCHIVE_ROUTE_PATH,
+        methods: ['POST'],
+        requestBody: 'buffered',
+        fetch: async (request) => {
+          if (request.method !== 'POST') return refuse('METHOD_NOT_ALLOWED', `${request.method} is not a method this route answers`, 405);
+          const body = await readBody(request);
+          if (body === null || body.confirm !== ARCHIVE_CONFIRM_TOKEN) {
+            return refuse('BACKUP_CONFIRM_REQUIRED', `a JSON body with {"confirm":"${ARCHIVE_CONFIRM_TOKEN}"} is required`);
+          }
+          const scope = body.scope ?? 'archived';
+          if (!['archived', 'all', 'selected'].includes(scope)) {
+            return refuse('BACKUP_SCOPE_INVALID', 'scope must be archived, all or selected');
+          }
+          const result = buildArchive({
+            ...unlockInput(),
+            snapshotId: typeof body.snapshot === 'string' ? body.snapshot : null,
+            scope,
+            sessionIds: Array.isArray(body.sessions) ? body.sessions : [],
+          });
+          state.last_archive = { at: new Date().toISOString(), ok: result.ok, file: result.file ?? null, sessions: result.sessions ?? 0 };
+          return Response.json(result, { headers: NO_STORE });
+        },
+      });
+
+      registry.register({
+        path: BACKUP_RESTORE_ROUTE_PATH,
+        methods: ['POST'],
+        requestBody: 'buffered',
+        fetch: async (request) => {
+          if (request.method !== 'POST') return refuse('METHOD_NOT_ALLOWED', `${request.method} is not a method this route answers`, 405);
+          const body = await readBody(request);
+          if (body === null || body.confirm !== RESTORE_CONFIRM_TOKEN) {
+            return refuse('BACKUP_CONFIRM_REQUIRED', `a JSON body with {"confirm":"${RESTORE_CONFIRM_TOKEN}"} is required`);
+          }
+          const plan = planRestore({
+            ...unlockInput(),
+            snapshotId: typeof body.snapshot === 'string' ? body.snapshot : null,
+            sessionIds: Array.isArray(body.sessions) ? body.sessions : [],
+            keepBoth: body.keepBoth === true,
+            allowStaticValidation: body.allowStaticValidation === true,
+            workspacePath: typeof body.workspacePath === 'string' ? body.workspacePath : null,
+          });
+          if (plan.ok !== true || body.apply !== true) {
+            // No confirmation of the *write* yet: return the plan so the panel can show exactly what would happen.
+            return Response.json(plan, { headers: NO_STORE });
+          }
+          const applied = applyRestore({ plan, dshHome: cfg.dsh_home });
+          state.last_restore = {
+            at: new Date().toISOString(),
+            ok: applied.ok,
+            sessions: applied.restored?.length ?? 0,
+            pre_restore_dir: applied.pre_restore_dir ?? null,
+          };
+          return Response.json(applied, { headers: NO_STORE });
         },
       });
     });

@@ -4,6 +4,20 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### 还原、解锁、全量校验与归档包（v3.4.8）
+
+- **还原（`src/backup/restore.mjs`）**：先规划后写入。规划阶段把每份候选从内容寻址块解回、用运行时同一份校验代码判定、算清冲突与注册表改动，**一行都不写**；`--apply` 才按"预还原副本 → 原子写会话 → 写附件对象 → 注册表写入并回读校验 → 复读字节与清单比对"的顺序落地。四条复盘门禁（G1/G2/G3/G5）全部接进这条路径。
+- **还原前快照**：任何被覆盖的会话语义文件与 `workspace.json` 先复制到 `$DSH_HOME/sessions/.w2m-restore-backups/<时间戳>/`；冲突默认"先备份后覆盖"，`--keep-both` 则保留原文件、把还原结果写成 `session.v4.jsonl.zstd.restored-<ts>`。
+- **补注册工作区/归档标记（`src/backup/registry.mjs`）**：`workspace.json` 是客户端内存态，写入协议 = 原子写 + 回读校验 + 明示"客户端会回写"的残余风险；只登记会话 id 与 archived/pinned 标记，**绝不凭空创建工作区**（除非显式 `--workspace-path`）；工作区目录名按 DSH 规则从路径推导（`E:\GPT` → `--E-GPT--`）。
+- **运行时校验（`src/backup/runtime-validate.mjs` + `runtime-driver.mjs`）**：用安装的 Harness 本体（Electron Node 模式）加载 `sessionFormatCatalog.createRestore(..., validation=current)`，由它给出终审；自写 doctor 只作预筛。找不到安装时默认拒绝还原，`--allow-static-validation` 才接受纯静态证据，且报告写明 `runtime_verified:false`。
+- **两条解锁路径（`src/backup/unlock.mjs`）**：`machine`（OS keystore 保护的随机秘密，定时任务用）与 `password`（scrypt，跨机器唯一路径）。账户信封不做——spike 证明宿主只给账户标识不给秘密，写了就是加密摆设（`docs/SPIKE-ACCOUNT-KEK.md`）。密码种子仓库首次遇到可用 keystore 时自动补 `machine` 信封，之后面板/定时任务免密。
+- **全量校验（`src/backup/verify.mjs`）**：逐快照解块、验认证标签、复算 sha256、"未来追加"模拟（在内存里追加一条合法事件再校验，证明它**以后仍能加载**）；索引↔快照目录双向核对、old 记录与 current 指针引用的块必须存在。任何一处不对都报出具体码，不清零、不平均。
+- **归档包（`src/backup/archive.mjs` + 自写 `tar.mjs`）**：只打包清单校验过的字节，产出 `archive/<日期>/archived-sessions-<ts>.tar.zst`，内含 `manifest.json`（逐文件 size/sha256）+ `README.txt` + 会话/附件文件树；默认只打已归档会话，`--scope all` 打全部；`readArchive`/`extractArchive` 回读时逐文件对 sha256，并拒绝写出目标目录之外的条目（防路径穿越）。
+- **子插件路由（v3.4.8）**：新增 `POST /api/w2m/backup/restore`（body 先返回计划，`{"apply":true}` 才写）、`POST /api/w2m/backup/archive`、`GET /api/w2m/backup/verify`、`GET|POST /api/w2m/backup/unlock`；写路由各带确认令牌，面板不使用密码（走 machine 信封）。CLI 同步新增 `unlock / verify / archive / restore`（`restore` 默认只打印计划）。
+- **测试**：新增 5 个套件（runtime / restore / archive / verify / access），备份侧共 20 套件；包含"真实 Harness 终审通过"与"错误候选被拒绝"两个方向的用例，以及预还原副本、冲突、keep-both、路径穿越、损坏块、索引漂移、old-only 块缺失等失败路径。
+- **真实闭环（默认仓库 `D:\DeepSeekHarness\BackUP`，2026-11-17）**：`unlock` 报 `machine` 信封、本机可用；`verify` 2 快照 / 32 文件 / 337.4 MB / 108 块全部解块验签通过，30/30 "未来追加"模拟通过（49.1 s）；`archive --scope all` 把 16 文件打成 168.7 MB tar → 164.7 MB `.tar.zst`（2.3 s）；`restore` 计划把 15 份会话全部交给安装的 Harness 终审通过（15/15），识别出 13 份 identical、2 份 conflict（备份之后 DSH 又写过这些活会话），dry-run 零写入；来自未注册工作区的会话被默认拒绝，并以 `--workspace-path` 显式挂接后才进入计划。
+
+
 ### 备份引擎、22:00 定时与旧版本轮转（v3.4.7）
 
 - 新增 `src/backup/engine.mjs`：一次备份 = 锁 → 建库 → 开 KEK → 扫描 → 按 scope 选会话 → 写缺失块（内容寻址去重）→ 提交快照 → 轮转。第二次未改动备份 `blocks_new = 0`（单测断言），备份前后源目录字节与 mtime 不变。

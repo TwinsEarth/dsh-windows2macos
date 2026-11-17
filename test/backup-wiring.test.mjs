@@ -59,7 +59,7 @@ describe('backup wiring: package and entry points', () => {
   });
 
   it('names every backup suite in scripts.test, test:all and its own script', () => {
-    const suites = ['backup-layout', 'backup-scan', 'backup-crypto', 'backup-protocol', 'backup-repo', 'backup-engine', 'backup-rotation', 'backup-gc', 'backup-locks', 'backup-schedule', 'backup-run', 'backup-wiring', 'backup-atomic', 'backup-keystore', 'backup-machine-key'];
+    const suites = ['backup-layout', 'backup-scan', 'backup-crypto', 'backup-protocol', 'backup-repo', 'backup-engine', 'backup-rotation', 'backup-gc', 'backup-locks', 'backup-schedule', 'backup-run', 'backup-atomic', 'backup-keystore', 'backup-machine-key', 'backup-runtime', 'backup-restore', 'backup-archive', 'backup-verify', 'backup-access', 'backup-wiring'];
     for (const suite of suites) {
       assert.equal(pkg.scripts[`test:${suite}`], `node --test --test-force-exit test/${suite}.test.mjs`, `test:${suite} missing`);
       assert.ok(pkg.scripts.test.includes(`test/${suite}.test.mjs`), `${suite} missing from scripts.test`);
@@ -107,7 +107,9 @@ describe('backup wiring: the layer model', () => {
   it('parses the workspace registry through ONE module, shared with the doctor', () => {
     const doctor = readFileSync(join(ROOT, 'scripts', 'session-doctor.mjs'), 'utf8');
     const scan = readFileSync(join(ROOT, 'src', 'backup', 'scan.mjs'), 'utf8');
-    assert.match(doctor, /util\/dsh-workspace\.mjs/u, 'the doctor must reuse the shared parser');
+    const validate = readFileSync(join(ROOT, 'src', 'util', 'session-validate.mjs'), 'utf8');
+    assert.match(doctor, /util\/session-validate\.mjs/u, 'the doctor script must be a thin CLI over the shared validator');
+    assert.match(validate, /from '\.\/dsh-workspace\.mjs'/u, 'the shared validator must reuse the shared registry parser');
     assert.match(scan, /util\/dsh-workspace\.mjs/u, 'the scanner must reuse the shared parser');
   });
 

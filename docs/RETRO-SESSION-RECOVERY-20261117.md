@@ -99,11 +99,11 @@ node scripts/session-doctor.mjs --file <session.v4.jsonl.zstd> --session-id <id>
 
 | 门禁 | 落在哪个版本 | 内容 |
 |---|---|---|
-| G1 还原候选必须先过 doctor | v3.4.6 | `restore` 只发布通过 `diagnoseSessionFile` 的候选日志；失败即拒绝，绝不"先写后看" |
-| G2 注册表写入协议 | v3.4.6 | 不直接改 `workspace.json`：要么暂停客户端，要么写后**回读校验**并在客户端保存后复查；文档写明"客户端会用内存态回写" |
-| G3 禁止手工事件 | v3.4.6 | 备份只存**原始字节**；任何重构路径必须过 G1 且做"未来追加"模拟 |
-| G4 seq 重编号工具 | v3.4.8 | 删/插事件的唯一合法方式：统一 renumber + 引用改写 + 校验 |
-| G5 校验用运行时 | v3.4.6 | 只用运行时同一份校验（`mode=current`），自写解析器结论不作为证据 |
+| G1 还原候选必须先过 doctor | v3.4.8 已接线 | `planRestore` 对每份解回字节跑 `validateCandidate`，任一失败整单拒绝；`applyRestore` 写后复验（`src/backup/restore.mjs`） |
+| G2 注册表写入协议 | v3.4.8 已接线 | `registry.mjs`：原子写 + 回读校验（登记/archived/pinned）+ 明示客户端回写风险；绝不凭空建工作区 |
+| G3 禁止手工事件 | v3.4.8 已接线 | 还原只写快照原始字节（逐字节对清单）；写入前 `simulateFutureAppend` 证明"以后仍能加载" |
+| G4 seq 重编号工具 | 本版不做 | 还原路径不含删/插事件，不需要重编号；工具本身是"改历史"的入口，留待真实修复场景单独设计（DESIGN §15.6） |
+| G5 校验用运行时 | v3.4.8 已接线 | `runtime-validate.mjs` 以 `ELECTRON_RUN_AS_NODE` 启动安装的 Harness，跑 `sessionFormatCatalog.createRestore(..., validation:'current')`；doctor 只预筛 |
 
 ---
 

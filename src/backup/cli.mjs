@@ -30,6 +30,10 @@ import { buildStatus } from './routes.mjs';
 import { runBackup, SCOPES } from './engine.mjs';
 import { gc } from './gc.mjs';
 import { openRepo } from './repo.mjs';
+import { buildArchive } from './archive.mjs';
+import { applyRestore, planRestore } from './restore.mjs';
+import { describeUnlock, unlockRepo } from './unlock.mjs';
+import { verifyRepo } from './verify.mjs';
 
 /** Human-readable bytes: `172.0 MB`, `1.2 GB`. */
 export function humanBytes(bytes) {
@@ -44,6 +48,90 @@ export function humanBytes(bytes) {
   return `${index === 0 ? String(size) : size.toFixed(1)} ${units[index]}`;
 }
 
+/** Render the unlock probe for a terminal. */
+export function formatUnlock(payload) {
+  const lines = ['w2m-backup unlock', ''];
+  lines.push(`repository    : ${payload.repository}`);
+  lines.push(`initialized   : ${payload.initialized ? 'yes' : 'no'}`);
+  if (payload.initialized) {
+    lines.push(`envelopes     : ${payload.envelopes.join(', ') || 'none'}`);
+    lines.push(`machine path  : ${payload.machine_available ? 'available on this machine' : `unavailable (${payload.machine_reason ?? 'unknown'})`}`);
+    lines.push(`password path : ${payload.password_required ? 'available (the only path on a new machine)' : 'not configured'}`);
+  }
+  if (payload.check !== undefined) {
+    lines.push(`check         : ${payload.check.ok ? `opened via ${payload.check.via}` : `refused: ${payload.check.reason_code} ${payload.check.detail ?? ''}`.trimEnd()}`);
+  }
+  if (payload.ok !== true) lines.push(`refusal       : ${payload.reason_code} ${payload.detail ?? ''}`.trimEnd());
+  return lines.join('\n');
+}
+
+/** Render a verification report for a terminal. */
+export function formatVerify(result) {
+  const lines = ['w2m-backup verify', ''];
+  if (result.ok !== true) {
+    lines.push(`refused       : ${result.reason_code} ${result.detail ?? ''}`.trimEnd());
+    return lines.join('\n');
+  }
+  lines.push(`snapshots     : ${result.counts.snapshots}`);
+  lines.push(`files         : ${result.counts.files} (${humanBytes(result.counts.bytes)})`);
+  lines.push(`blocks        : ${result.counts.blocks}`);
+  lines.push(`old versions  : ${result.counts.old}`);
+  lines.push(`current ptrs  : ${result.counts.current}`);
+  lines.push(`future append : ${result.future_append.checked - result.future_append.failed}/${result.future_append.checked} passed`);
+  if (result.runtime_verified.checked > 0) lines.push(`runtime check : ${result.runtime_verified.checked - result.runtime_verified.failed}/${result.runtime_verified.checked} passed`);
+  lines.push(`result        : ${result.ok ? 'every claim holds' : `${result.problems.length} problem(s)`}`);
+  for (const problem of result.problems.slice(0, 12)) lines.push(`  - ${problem.code} ${problem.file ?? ''} ${problem.detail}`.trimEnd());
+  return lines.join('\n');
+}
+
+/** Render an archive result for a terminal. */
+export function formatArchive(result) {
+  const lines = ['w2m-backup archive', ''];
+  if (result.ok !== true) {
+    lines.push(`refused       : ${result.reason_code} ${result.detail ?? ''}`.trimEnd());
+    return lines.join('\n');
+  }
+  lines.push(`file          : ${result.file}`);
+  lines.push(`snapshot      : ${result.source_snapshot}`);
+  lines.push(`sessions      : ${result.sessions}`);
+  lines.push(`files         : ${result.files}`);
+  lines.push(`size          : ${humanBytes(result.bytes)} tar -> ${humanBytes(result.compressed_bytes)} zstd`);
+  return lines.join('\n');
+}
+
+/** Render a restore plan or result for a terminal. */
+export function formatRestore(plan, applied) {
+  const lines = ['w2m-backup restore', ''];
+  if (plan.ok !== true) {
+    lines.push(`refused       : ${plan.reason_code} ${plan.detail ?? ''}`.trimEnd());
+    return lines.join('\n');
+  }
+  lines.push(`snapshot      : ${plan.snapshot_id}`);
+  lines.push(`sessions      : ${plan.summary.sessions} (new ${plan.summary.new}, identical ${plan.summary.identical}, conflict ${plan.summary.conflicts})`);
+  lines.push(`attachments   : ${plan.summary.attachments}`);
+  lines.push(`runtime check : ${plan.summary.runtime_verified}/${plan.summary.sessions} sessions validated by the installed Harness`);
+  lines.push(`pre-restore   : ${plan.pre_restore.dir}`);
+  for (const candidate of plan.candidates) {
+    lines.push(`  - ${candidate.session_id} ${candidate.conflict}${candidate.resolution === 'backup-and-replace' ? ' -> backup then replace' : ''}`);
+  }
+  if (applied === undefined) {
+    lines.push('');
+    lines.push('dry run: nothing was written. Re-run with --apply to restore.');
+    return lines.join('\n');
+  }
+  lines.push('');
+  if (applied.ok !== true) {
+    lines.push(`failed        : ${applied.reason_code} ${applied.detail ?? ''}`.trimEnd());
+    if (applied.pre_restore_dir) lines.push(`pre-restore   : ${applied.pre_restore_dir} (the way back)`);
+    return lines.join('\n');
+  }
+  lines.push(`written       : ${applied.restored.length} session(s), ${humanBytes(applied.bytes_written)}`);
+  lines.push(`registry      : ${applied.registry.filter((row) => row.ok).length}/${applied.registry.length} verified`);
+  if (applied.pre_restore_dir) lines.push(`pre-restore   : ${applied.pre_restore_dir}`);
+  for (const warning of applied.warnings ?? []) lines.push(`warning       : ${warning}`);
+  return lines.join('\n');
+}
+
 function usage() {
   return [
     'usage: w2m-backup <command> [options]',
@@ -55,6 +143,10 @@ function usage() {
     '  run                 perform one backup now (writes blocks, a snapshot and rotation records)',
     '  list                snapshots in the repository, newest first (read-only)',
     '  gc                  remove unreferenced blocks and prune old versions (writes)',
+    '  unlock              which credential opens this repository (read-only; --check tries it)',
+    '  verify              re-hash every snapshot: blocks, bytes, manifests, index, old records',
+    '  archive             pack archived sessions (or --scope all) into one .tar.zst (writes)',
+    '  restore             plan a restore; --apply writes sessions, attachments and the workspace registry',
     '  help                this text',
     '',
     'options:',
@@ -68,7 +160,14 @@ function usage() {
     '  --session <id>      run --scope selected: a session id to include (repeatable)',
     '  --keep-old <n>      old versions kept per session (default: 10)',
     '  --dry-run           run/gc: report what would happen, write nothing',
-    '  --password-stdin    run: read the unlock password from stdin (never argv)',
+    '  --snapshot <id>     verify/archive/restore: a specific snapshot (default: the latest)',
+    '  --apply             restore: actually write (without it, restore only prints the plan)',
+    '  --keep-both         restore: keep an existing different file and write the restored one beside it',
+    '  --allow-static-validation  restore: accept static-only evidence when no Harness is installed',
+    '  --workspace-path <p> restore: attach a restored session to this directory if the workspace is absent',
+    '  --runtime           verify: also confirm every session with the installed Harness validator',
+    '  --check             unlock: attempt the unlock instead of only describing it',
+    '  --password-stdin    run/restore/unlock --check: read the password from stdin (never argv)',
     '                      (environment fallback: W2M_BACKUP_PASSWORD, same "never argv" rule)',
     '  --no-machine-key    run: do not use (or create) the OS-keystore machine envelope',
     '',
@@ -97,6 +196,13 @@ export function parseArgs(argv, env = process.env) {
     dryRun: false,
     passwordStdin: false,
     noMachineKey: false,
+    snapshot: null,
+    apply: false,
+    keepBoth: false,
+    allowStaticValidation: false,
+    workspacePath: null,
+    runtime: false,
+    check: false,
   };
   const rest = [...argv];
   if (rest.length > 0 && !rest[0].startsWith('-')) options.command = rest.shift();
@@ -109,6 +215,15 @@ export function parseArgs(argv, env = process.env) {
     else if (arg === '--dry-run') options.dryRun = true;
     else if (arg === '--password-stdin') options.passwordStdin = true;
     else if (arg === '--no-machine-key') options.noMachineKey = true;
+    else if (arg === '--apply') options.apply = true;
+    else if (arg === '--keep-both') options.keepBoth = true;
+    else if (arg === '--allow-static-validation') options.allowStaticValidation = true;
+    else if (arg === '--runtime') options.runtime = true;
+    else if (arg === '--check') options.check = true;
+    else if (arg === '--snapshot') options.snapshot = rest.shift() ?? null;
+    else if (arg === '--workspace-path') options.workspacePath = path.resolve(rest.shift() ?? '');
+    else if (arg.startsWith('--snapshot=')) options.snapshot = arg.slice('--snapshot='.length);
+    else if (arg.startsWith('--workspace-path=')) options.workspacePath = path.resolve(arg.slice('--workspace-path='.length));
     else if (arg === '--scope') options.scope = rest.shift() ?? null;
     else if (arg === '--session') options.selected.push(rest.shift() ?? '');
     else if (arg === '--keep-old') {
@@ -480,6 +595,109 @@ export function main(argv, io = {}) {
     });
     write(options.json ? JSON.stringify(result, null, 2) : formatGc(result));
     return result.ok === true ? 0 : 1;
+  }
+
+  if (options.command === 'unlock') {
+    const resolved = resolveDir(options, env);
+    if (resolved.ok !== true) {
+      writeErr(`${resolved.error.code}: ${resolved.error.detail}`);
+      return 1;
+    }
+    const described = describeUnlock({
+      root: resolved.dir,
+      dshHome: options.dshHome,
+      machineKey: options.noMachineKey === true ? false : undefined,
+    });
+    const payload = {
+      ok: described.ok,
+      repository: resolved.dir,
+      initialized: described.initialized,
+      envelopes: described.envelopes,
+      machine_available: described.machine_available,
+      machine_reason: described.machine_reason,
+      password_required: described.password_required,
+      reason_code: described.reason_code,
+      detail: described.detail,
+    };
+    if (options.check) {
+      payload.check = unlockRepo({
+        root: resolved.dir,
+        dshHome: options.dshHome,
+        password: passwordFor(options, io),
+        machineKey: options.noMachineKey === true ? false : undefined,
+      });
+    }
+    write(options.json ? JSON.stringify(payload, null, 2) : formatUnlock(payload));
+    const failed = options.check === true && payload.check?.ok !== true;
+    return payload.ok !== true || failed ? 1 : 0;
+  }
+
+  if (options.command === 'verify') {
+    const resolved = resolveDir(options, env);
+    if (resolved.ok !== true) {
+      writeErr(`${resolved.error.code}: ${resolved.error.detail}`);
+      return 1;
+    }
+    const result = verifyRepo({
+      root: resolved.dir,
+      dshHome: options.dshHome,
+      password: passwordFor(options, io),
+      machineKey: options.noMachineKey === true ? false : undefined,
+      futureAppend: true,
+      runtime: options.runtime,
+    });
+    write(options.json ? JSON.stringify(result, null, 2) : formatVerify(result));
+    return result.ok === true ? 0 : 1;
+  }
+
+  if (options.command === 'archive') {
+    const resolved = resolveDir(options, env);
+    if (resolved.ok !== true) {
+      writeErr(`${resolved.error.code}: ${resolved.error.detail}`);
+      return 1;
+    }
+    const scope = options.scope ?? 'archived';
+    if (!['archived', 'all', 'selected'].includes(scope)) {
+      writeErr('error: --scope for archive must be archived, all or selected');
+      return 2;
+    }
+    const result = buildArchive({
+      root: resolved.dir,
+      dshHome: options.dshHome,
+      snapshotId: options.snapshot,
+      scope,
+      sessionIds: options.selected,
+      password: passwordFor(options, io),
+      machineKey: options.noMachineKey === true ? false : undefined,
+    });
+    write(options.json ? JSON.stringify(result, null, 2) : formatArchive(result));
+    return result.ok === true ? 0 : 1;
+  }
+
+  if (options.command === 'restore') {
+    const resolved = resolveDir(options, env);
+    if (resolved.ok !== true) {
+      writeErr(`${resolved.error.code}: ${resolved.error.detail}`);
+      return 1;
+    }
+    const plan = planRestore({
+      root: resolved.dir,
+      dshHome: options.dshHome,
+      snapshotId: options.snapshot,
+      sessionIds: options.selected,
+      password: passwordFor(options, io),
+      machineKey: options.noMachineKey === true ? false : undefined,
+      allowStaticValidation: options.allowStaticValidation,
+      keepBoth: options.keepBoth,
+      workspacePath: options.workspacePath,
+    });
+    if (plan.ok !== true || options.apply !== true) {
+      write(options.json ? JSON.stringify(plan, null, 2) : formatRestore(plan));
+      return plan.ok === true ? 0 : 1;
+    }
+    const applied = applyRestore({ plan, dshHome: options.dshHome, dryRun: options.dryRun });
+    write(options.json ? JSON.stringify(applied, null, 2) : formatRestore(plan, applied));
+    return applied.ok === true ? 0 : 1;
   }
 
   if (options.command === 'selftest') {
