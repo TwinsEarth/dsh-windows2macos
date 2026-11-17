@@ -1007,6 +1007,17 @@ export const ACCEPTED_SKIPS = [
     platforms: ['win32'],
     why: 'the 0640 mode assertion is a POSIX fact; the repair itself runs on every host',
   },
+  {
+    key: 'chat-store-file-mode-posix-only',
+    suite: /^damaged\/partial files are tolerated$/,
+    match: /^POSIX file mode is not measurable on Windows$/,
+    maxCount: 1,
+    platforms: ['win32'],
+    why:
+      'the 0600/0700 chat-store permission assertions are POSIX facts; the on-disk round trip, the log ' +
+      'shape and the damaged-file cases in the same suite run on every host. This suite is in the release ' +
+      'gate since the Phase 2 wiring, which is when the unqualified Windows skip surfaced',
+  },
 ];
 
 /**
