@@ -645,6 +645,12 @@ UI 半只有一个文件：`lib/client.js`（手写、由 `window.__ModuleLoader
 * **verify（`--runtime` / `GET /api/w2m/backup/verify?runtime=1`）**：对每个快照会话的**原日志与追加后日志**
   同批终审，失败码 `BACKUP_RUNTIME_REJECTED` / `BACKUP_RUNTIME_APPEND_FAILED`。面板自 2026-11-17 起用勾选框
   显式选择这条慢路径（§22.4）：默认不勾，报告只给标了 `static-prefilter` 的模拟结果——不勾就没有门禁级证据。
+* **`old/` 整文件副本的逐份解密（v3.5.0 增补）**：`verifyRepo` 对**每条带 `full_copy` 的旧版本记录**读对应
+  `.enc`，用仓库 DEK 以 `old` 身份（`openObject(bytes, dek, {sha256, length: size, kind:'old'})`）解密，校验明文
+  sha256 与长度；结果新增 `old_copies: {checked, ok, failed, missing}`，缺失/解密失败分别报
+  `BACKUP_VERIFY_OLD_COPY_MISSING` / `BACKUP_VERIFY_OLD_COPY_FAILED`（`detail` 写明是哪条记录）。没有 `full_copy`
+  的记录**不计入**（它本来就只由 blocks 承诺）。未加密仓库同样工作：`open` 信封直接给出 DEK。这是密码学预筛，
+  **不是** G5 运行时证据：它证明"副本能解开且与记录一致"，不证明"安装的 Harness 接受这份日志"。
 * **批量与流式**：小 artifact 每约 96 MiB 一批；单会话 JSON 超过 32 MiB 走 NDJSON 流式 driver（真实 152 MB /
   370 MB 会话实测通过）；verdict 缓存按"安装身份 + 内容摘要"分键，避免拿另一份安装的结论复用。
 * **缓存终审 + nightly（v3.5.x）**：`?runtime=1` 同步跑完后把结论写成一个**记录**
@@ -666,7 +672,10 @@ UI 半只有一个文件：`lib/client.js`（手写、由 `window.__ModuleLoader
 * `test/backup-engine.test.mjs`：`run --runtime` 正向（15/15 类场景用 runtime-valid home）与反向（坏日志的
   追加 artifact 被拒，`failed ≥ 1`，无静态回退）。
 * `test/backup-verify.test.mjs`：`--runtime` 连 append 后 artifact 一起终审；缓存记录（字段/证据标签/去重 reason
-  codes/24 h stale 边界/持久化路径/in-flight 单次 spawn/失败也持久化）与 CLI `run --runtime-verify` 的持久化记录。
+  codes/24 h stale 边界/持久化路径/in-flight 单次 spawn/失败也持久化）与 CLI `run --runtime-verify` 的持久化记录；
+  `old_copies`（健康仓库 `checked>0, failed=0, ok=checked` 且零 problem、损坏 `.enc` → `failed:1` 与 `_FAILED`、
+  删除 `.enc` → `missing:1` 与 `_MISSING`、无副本记录零计数、未加密仓库可验、CLI 人类输出 `old copies` 行 /
+  `--json` 块 / 退出码）。
 * `test/backup-run.test.mjs`：`?runtime=cached` 不 spawn、过期标 stale、`?runtime=1` 更新缓存、`GET /run` 内嵌
   `state.last_runtime_verify`；`backupRuntimeVerify: 'off'|'nightly'` 的配置归一化，nightly 每个成功定时备份恰好
   跑一次、失败只 warning 且记录持久化、默认 nightly（`off` 可显式关闭）。
@@ -814,6 +823,8 @@ plan 后文件变化拒绝覆盖、dry-run 零写入、CLI 退出码/帮助/真�
   snapshots/<snapshotId>/
     manifest.json                 # 加密清单（与主库逐字节一致）
     keys.json                     # 该快照的信封副本
+  old/<ws>/<sid>/<ts>-<sha12>.json      # 旧版本记录（与主库逐字节一致）
+  old/<ws>/<sid>/<ts>-<sha12>.json.enc  # full 模式的密封整文件副本（与主库逐字节一致）
   index.jsonl                     # 按 snapshot_id 幂等追加
 ```
 
@@ -822,15 +833,29 @@ plan 后文件变化拒绝覆盖、dry-run 零写入、CLI 退出码/帮助/真�
 * **只补缺失 + 损坏即修**：块按内容寻址，但"名字存在"不等于"内容正确"——镜像块必须与主库源块**字节长度一致**才
   视为已复制（截断/被外部工具改坏的块长度不符），否则用 `writeFileAtomic` 重写并计入 `copied.repaired`；快照
   `manifest.json`/`keys.json` 与根 `backup.json`/`keys.json` 体积小，按**逐字节比较**，长度或内容不符即重写并计入
-  `copied.repaired`。完好镜像重复同步仍是幂等的：`copied:{files:0,bytes:0,repaired:0}`、零写入（测试比较镜像文件
-  的 size+mtime 不变）。块只比长度是成本选择：本模块从不持 DEK，为省一次写而整块读取不划算；同长度位翻转留给还原
-  时的清单 `sha256` 发现（见"边界与诚实说明"）。
+  `copied.repaired`。完好镜像重复同步仍是幂等的：`copied:{files:0,bytes:0,repaired:0,old_files:0,old_bytes:0}`、
+  零写入（测试比较镜像文件的 size+mtime 不变）。块只比长度是成本选择：本模块从不持 DEK，为省一次写而整块读取不划算；
+  同长度位翻转留给还原时的清单 `sha256` 发现（见"边界与诚实说明"）。
 * **索引幂等**：镜像 `index.jsonl` 只有在其中**尚无该 `snapshot_id`** 时追加一行（内容与主库 `readIndex()` 的条目
   一致）；重复同步不重复追加。若镜像索引尾部是半行（写入者被强杀），`readIndex` 不把它算作条目，新行以换行分隔
   追加，不会把半行拼接成坏行；即使那半行正是**该快照自己**未完成的追加行，重同步也只补出**一行**完整 JSON，
   `snapshot_id` 不会重复，半行仍作为 problem 如实报告（测试覆盖）。
-* **永远不复制**：明文会话字节、明文附件、密码、锁文件、`tmp/`、`logs/`、`current/`、`old/`、`archive/`。
-  镜像只承诺"已提交快照的灾难副本"，不是主库工作状态的同步盘；还原时按 `--snapshot` 从镜像快照走。
+* **`old/` 版本树也镜像（v3.5.0 增补）**：快照、objects、元数据与索引行都复制完之后，把主库**整棵 `old/` 树**
+  镜像过去——每条 `<ts>-<sha12>.json` 版本记录和每条配对的 `<ts>-<sha12>.json.enc` 密封副本。理由与 §24 相同：
+  记录靠 blocks 还原，**块没了**时就只剩 `.enc`；镜像若不含 `old/`，它能救回快照却救不回被淘汰的版本。安全规则
+  与其它步骤一致：每次 `mkdir`/写之前先 `guardWritablePath`（镜像 `old/` 内被放入 symlink/junction 时具名拒绝
+  `BACKUP_MIRROR_SYMLINK`，绝不把文件写出去）；记录**逐字节比较**（小文件，同长度损坏也能修），`.enc` 按
+  **字节长度**比较（本模块不持 DEK，与块对象同一条成本选择；同长度篡改由 `verify` 解密发现），不符即
+  `writeFileAtomic` 重写；只复制 `old/` 下的普通文件，symlink/junction 不跟随。计数：`copied.old_files` /
+  `copied.old_bytes` 是本次写入量，`copied.repaired`（共享）是"已存在但内容/长度不符、被重写"的文件数，
+  `skipped.old_files` 是已存在且一致的文件数；主库没有 `old/` 时全部为 0。完好镜像第二次同步对 `old/` 也是
+  零写入。`old/` **只增不删**：主库 gc 剪掉的记录/副本不会从镜像删除（镜像不是主库的同步盘）。
+  **存储诚实**：镜像的总量约等于主库 `old/` 的总量（记录很小，`full` 副本是整份密文），不做跨镜像/跨版本
+  去重；`old/` 在 §24.3 决定的总量不设上限下会持续增长，因此镜像里那一份也会跟着增长，直到操作者在**主库**
+  跑 `gc` 或调低保留份数。
+* **永远不复制**：明文会话字节、明文附件、密码、锁文件、`tmp/`、`logs/`、`current/`、`archive/`；`old/` 只复制
+  版本记录与密封副本（见上一条），不是把 `old/` 当普通目录整盘拖走。镜像只承诺"已提交快照 + 版本树的灾难副本"，
+  不是主库工作状态的同步盘；还原时按 `--snapshot` 从镜像快照走。
 * **路径拒绝（词法判定 + 真实路径判定）**：`mirrorRoot` 指向仓库内部、`$DSH_HOME` 内部、等于仓库根、或本身是文件 →
   **写盘前**拒绝 `BACKUP_MIRROR_INVALID`（零提交，不留下半次备份）。跨盘/跨机器路径按"外部"处理（`path.relative`
   返回绝对路径）；包含判定按路径段而非字符串前缀（`D:\BackUP2` 不算 `D:\BackUP` 内部）。词法判定用 `path.resolve`
@@ -846,10 +871,11 @@ plan 后文件变化拒绝覆盖、dry-run 零写入、CLI 退出码/帮助/真�
   用与主库相同的 DEK 对镜像块 `rebuildFile` 可得到与清单一致的 sha256（`test/backup-mirror.test.mjs` 的廉价款
   完整性校验）。
 * **边界与诚实说明**：真实路径判定只保证"包含判定按文件系统实际指向执行"，不改变镜像的信任模型。仍**不做跨镜像
-  去重**（每个镜像独立持有一份密封块，用空间换恢复独立性）；**未实现**镜像侧 `current/old` 视图与镜像 gc（镜像
-  只增，清理由运维按需删快照目录）；**未实现** Relay/云端传输（Phase 3）。对象修复的判据是**字节长度**：同长度
-  位翻转/内容篡改不在同步时检测（本模块不持 DEK、不重算清单），由还原时的清单 `sha256` 校验发现；镜像路径仍受
-  §19 的 `$DSH_HOME` 判定约束，故"把镜像放进 home 图省事"明确不支持。
+  去重**（每个镜像独立持有一份密封块，用空间换恢复独立性）；**未实现**镜像侧 `current/` 视图与镜像 gc（镜像
+  只增，清理由运维按需删快照目录）；`old/` 复制的是**同步时的版本树快照且只增不删**，不是实时视图；**未实现**
+  Relay/云端传输（Phase 3）。块与 `old/*.json.enc` 的修复判据都是**字节长度**：同长度位翻转/内容篡改不在同步时
+  检测（本模块不持 DEK、不重算清单），块的由还原时的清单 `sha256` 发现，副本的由 `verify`/`old-restore` 解密发现；
+  镜像路径仍受 §19 的 `$DSH_HOME` 判定约束，故"把镜像放进 home 图省事"明确不支持。
 
 ### 21.3 配置面与错误码
 
@@ -867,8 +893,10 @@ plan 后文件变化拒绝覆盖、dry-run 零写入、CLI 退出码/帮助/真�
 | `BACKUP_MIRROR_FAILED` | 提交后复制失败；主库仍 `ok:true`，结果含 `mirror` 与 `warnings` |
 | `BACKUP_GC_UNSAFE` | 存在不可读引用，gc 整体不删除（v3.4.7 规则不变） |
 
-成功同步时 `mirror.copied:{files,bytes,repaired}`：`files`/`bytes` 是本次写入量，`repaired` 是其中"镜像已存在但
-字节不符、被重写"的文件数（完好镜像为 0）。
+成功同步时 `mirror.copied:{files,bytes,repaired,old_files,old_bytes}` 与 `mirror.skipped:{files,bytes,old_files}`：
+`files`/`bytes` 是快照自身（块 + 元数据 + 索引）的本次写入量，`old_files`/`old_bytes` 是 `old/` 版本树的本次写入量，
+`repaired` 是其中"镜像已存在但内容/长度不符、被重写"的文件总数（完好镜像为 0），`skipped.old_files` 是 `old/` 已一致
+无需写入的文件数。
 
 ### 21.4 测试
 
@@ -879,9 +907,12 @@ size+mtime 证明零写入）、截断块与损坏的 `backup.json`/快照 `mani
 且字节与主库一致）、索引只追加一次 + 尾部半行（含某快照自己的半行）不重复 `snapshot_id`、镜像路径四类拒绝、
 symlink/junction 真实路径逃逸具名拒绝（环境禁止建 junction 时按名跳过）与不存在的多级镜像路径仍可创建、复制失败
 不回滚（`ok:true` + `mirror.ok:false` + warnings + 主库可读）、镜像侧
-`openRepo`+`rebuildFile` 完整性、`resolveMirrorRoot` 的路径段包含判定。`test/backup-run.test.mjs`：引擎传递与
-CLI `--max-old-days`/`--mirror` 解析。插件配置归一化在 `test/backup-run.test.mjs` 覆盖（`backupOldVersionDays` /
-`backupMirrorDir`）。
+`openRepo`+`rebuildFile` 完整性、`resolveMirrorRoot` 的路径段包含判定；**`old/` 版本树**：记录 + `.json.enc` 都被
+复制且字节一致、镜像自己的 `keys.json` 解出的 DEK 能按 `old` 身份解开副本并与记录摘要一致、第二次同步零写入
+（`copied.old_files:0` + size+mtime 不变）、截断副本与同长度损坏记录在下次同步被修（`repaired`）、主库无 `old/`
+时报 0 且不创建镜像 `old/`、镜像 `old/` 内的 junction 在写前被 `BACKUP_MIRROR_SYMLINK` 拒绝且外部目录为空。
+`test/backup-run.test.mjs`：引擎传递与 CLI `--max-old-days`/`--mirror` 解析。插件配置归一化在
+`test/backup-run.test.mjs` 覆盖（`backupOldVersionDays` / `backupMirrorDir`）。
 
 ## 22. G2/G3/G4/G5 收口补记（2026-11-17）
 
@@ -1110,10 +1141,11 @@ old/<ws>/<sid>/<ts>-<sha12>.json.enc   # full 新增：该版本的整文件密�
 | cap 错误码 | `BACKUP_FULL_COPY_APPROVAL_REQUIRED`（`full` 副本超限且未特批，写盘前、零写入，见 §24.2） |
 | `old/` 用量提醒 | `runBackup({oldUsageReminderBytes, oldUsageAckBytes})` / 配置 `backupOldUsageReminderGb`（缺省 10，`0` = 关闭提醒）/ CLI `--old-usage-reminder-gb <n>`；结果恒有 `old_usage`，见 §24.3 |
 | 用量确认路由 | `POST /api/w2m/backup/old-usage/ack`，请求体 `{"confirm":"ack"}`；只移动确认水位，**不删除任何文件**，见 §24.3 |
+| 从副本还原 | `w2m-backup old-restore --record <path>` / `--session <id> [--rel <rel>]` / `--latest-for <session-id>`，加 `[--out <file>] [--apply] [--overwrite\|--keep-both] [--force-invalid] [--json]`；API `planOldRestore` / `applyOldRestore`，见 §24.4 |
 
 **兼容性**：记录的 `format`/`version` 字段不变（仍 `w2m-session-backup/old-version` v1），`full_copy` 只是新增
-可选字段；`listOldVersions`/`readOldRecords` 只认 `.json`，`.json.enc` 不会被当记录读取；`verify` 仍按记录
-blocks 重建旧版本，不把 `.enc` 计入引用。
+可选字段；`listOldVersions`/`readOldRecords` 只认 `.json`，`.json.enc` 不会被当记录读取，也不进 gc 的块引用集；
+`verify` 仍按记录 blocks 重建旧版本，并对**带 `full_copy` 的记录**逐份解密 `.enc`（§19、§24.4）。
 
 **测试**（挂在既有套件上，无新测试文件）：`test/backup-rotation.test.mjs`（默认/非法值、写记录+副本、用
 `openObject` 以 `old` 身份解开并逐字节比对、块身份解不开、records 模式无 `.enc`、剪枝删配对副本、副本写失败/
@@ -1124,14 +1156,17 @@ blocks 重建旧版本，不把 `.enc` 计入引用。
 
 **诚实边界（本次不承诺的）**：
 
-* **还原/归档/校验不用这份副本**：restore/archive/verify 仍走记录 + blocks；`.enc` 是"字面兼容"的额外副本，
-  可以用仓库 DEK 与 `openObject(bytes, dek, {sha256, length, kind:'old'})` 手工验证（`length` 取记录里的 `size`；测试即这么做的），但还没有
-  "从 full 副本直接还原"的命令。要看副本内容，用现有记录即可；副本的用途是让磁盘上真的存在上一版整文件。
-* **镜像不含 `old/`**（§21.2 的"永不复制"不变）：异地副本只承诺已提交快照，`full` 的整文件副本不进镜像。
+* **restore/archive 仍走记录 + blocks**：`w2m-backup restore` / `w2m-backup archive` 不把 `.enc` 当数据源；"从 full
+  副本直接还原"是独立命令 `w2m-backup old-restore`（§24.4）——它一次还原**一个版本文件**，不是整快照还原（不写
+  附件、不碰工作区注册表、不做 G5 运行时终审）。
+* **镜像现在包含 `old/`**（§21.2 v3.5.0 增补，替换此前"镜像不含 `old/`"的边界）：版本记录与密封副本都会镜像，
+  镜像侧仍是只增不删的快照；镜像目录可当作 `--backup-dir` 跑 `old-restore`（它要求 `backup.json` + `keys.json`，
+  两者都在镜像里）。
 * **不去重副本**：`.enc` 按版本整份写；同一会话两次轮转之间未变的字节不会被合并（这正是 opt-in 的代价）。
   也不跨仓库去重。
-* **`verify` 尚未逐份解密 `.enc`**：损坏的副本要等 gc/人工按上面的 `openObject` 方式发现；记录本身的完整性
-  校验不变。
+* **`verify` 会逐份解密 `.enc`**（v3.5.0 增补）：带 `full_copy` 的记录由 `verify` 解密校验，缺失/损坏分别报
+  `BACKUP_VERIFY_OLD_COPY_MISSING` / `BACKUP_VERIFY_OLD_COPY_FAILED`（§19）；`old-backfill` 自己的计划仍只按长度
+  处理（它是在重建副本，不是校验别人的副本）。
 * 本次不 bump 版本号、不跑 preflight、不提交；与 §13/§21 的默认行为完全一致（默认 `records`）。
 
 ### 24.1 迁移：给既有 `old/` 记录补整文件副本（`w2m-backup old-backfill`）
@@ -1167,8 +1202,9 @@ blocks 重建旧版本，不把 `.enc` 计入引用。
 
 **限制与诚实边界**：`--limit <n>` 限制本次**写副本**的数量（0 = 只出计划；已完整的记录/失败记录不消耗预算），
 用于大仓库分批迁移，反复运行直到 `backfilled`/`repaired` 为 0。副本检查只覆盖**长度**：长度正确但内容被同长度
-篡改的副本不会被本命令发现（`verify` 也尚未逐份解密 `.enc`，见上面的诚实边界）。本命令不改配置、不自动启用
-`full`、不自动运行（引擎**不**自动回填），只补磁盘上已有的记录；`run`/`gc` 的默认行为不变。
+篡改的副本不会被本命令发现（`verify` 会逐份解密带 `full_copy` 的记录并报告，见 §19；`backfill` 自己的计划不做
+解密）。本命令不改配置、不自动启用 `full`、不自动运行（引擎**不**自动回填），只补磁盘上已有的记录；`run`/`gc`
+的默认行为不变。
 
 ### 24.2 整文件副本的 300 MB 上限与「特批」流程（v3.5.0）
 
@@ -1318,6 +1354,74 @@ due true/false、提醒为 0 时 due 恒 false、due 触发时 `old/` 文件列�
 * **不是保留策略**：本功能不改变任何剪枝规则；要真正清理只能跑 `gc`（或调低保留份数）。面板、引擎、CLI 都**没有**
   "按大小自动删除"的路径，这是用户决定的一部分。
 * 本次不 bump 版本号（仍 3.5.0）、不跑 preflight、不提交。
+
+### 24.4 从 full 副本还原一个版本（`w2m-backup old-restore`，v3.5.0）
+
+**问题（为什么记录 + blocks 还不够）**：§24 的 `.enc` 是"字面兼容"的副本，§21 的记录靠 blocks 还原。块被 `gc`
+删掉本来不该发生（引用集保护），但**仓库可能已经不是 `gc` 管得到的那个仓库**：对象目录被外部工具或磁盘损坏、
+从半份仓库目录恢复、记录还在而块不在了。这时记录仍能列出这个版本、`.enc` 仍在盘上、用仓库 DEK 仍能解开，但
+此前没有任何命令把它写成文件。`old-restore` 就是这条"最后一段"。
+
+**形状（plan / apply，和 restore 同一套纪律）**：
+`planOldRestore({root, dshHome, recordFile?/sessionId?+rel?/latestFor?, outFile?, overwrite?, keepBoth?,
+forceInvalid?, password?, accountId?, machineKey?, now?})`：
+
+```
+选记录（--record 精确 / --latest-for 同会话最新 / --session 必须唯一，多个版本时具名拒绝而不是猜）
+  → 打开仓库 key（machine → account → password；未加密仓库的 open 信封无需任何凭据）
+  → 读 <record>.json.enc，openObject(bytes, dek, {sha256, length: size, kind:'old'}) 解密
+  → 校验明文 sha256 与长度（与记录一致）
+  → 静态 doctor 预筛（diagnoseSessionBuffer，G1 的便宜一半）
+  → 决定目标（--out，缺省 <record>.restored）、是否已存在、是否需要 .bak
+```
+
+plan **不写目标**：唯一的副作用是 `openRepoKey` 那条既有的、尽力而为的 machine 信封升级（属于 key 管理；未加密
+仓库连它都没有）。解密出的明文以**不可枚举**的 `plan.plaintext` 挂在 plan 上，所以 `--json` 打印的 plan 是小的
+报告，而 `applyOldRestore({plan})` 写的正是 plan 校验过的那份字节。
+
+`applyOldRestore` 的顺序：复核目标（plan 之后被改 → `BACKUP_OLD_RESTORE_TARGET_CHANGED`，不覆盖）→ 已存在且没给
+`--overwrite`/`--keep-both` → `BACKUP_OLD_RESTORE_TARGET_EXISTS` →（overwrite）先把现有字节逐字节写成
+`<target>.bak-<ts>` → `writeFileAtomic` → 回读并比对 sha256，结果 `{ok, file, backup_file, bytes, sha256,
+doctor_ok}`。`--keep-both` 不动现有文件，写 `<target>.restored-<ts>`（与 restore 相同的拼法）。
+
+**doctor 门禁与 `--force-invalid`**：恢复出的日志必须过静态 doctor（G1 的预筛）。不过 → plan 拒绝
+`BACKUP_OLD_RESTORE_DOCTOR_REFUSED`、零写入；这些字节是给**人看**的取证材料，不是能直接放回 `sessions/` 的日志。
+`--force-invalid` 是操作者的显式决定：仍然写，但 plan/结果里 `doctor_ok:false`、`doctor_codes` 保留，任何后续
+读者都不会把它误当成"校验通过"。注意 `old-restore` **不做** G5 运行时终审（那需要安装的 Harness，属于
+`restore` / `verify --runtime` 的路径）。
+
+**CLI**：
+
+```
+w2m-backup old-restore --record <old/.../<ts>-<sha12>.json>
+w2m-backup old-restore --session <session-id> [--rel <sessions/.../session.v4.jsonl.zstd>]
+w2m-backup old-restore --latest-for <session-id>
+    [--out <file>] [--apply] [--overwrite | --keep-both] [--force-invalid] [--json]
+```
+
+缺省是 dry run：打印 record / source digest / recovered 大小与摘要 / doctor / target / plan，并写
+"nothing was written"；`--apply` 才写。退出码 0 成功、1 具名拒绝、2 用法错误（与其它命令一致；选择器互斥、
+`--overwrite` 与 `--keep-both` 同给都是 2）。人类输出在 apply 后打印 `written` / `sha256` / `backup` 与
+`--force-invalid` 警告。
+
+**错误码**：`BACKUP_OLD_RESTORE_NOT_FOUND`（没有匹配记录、`--session` 命中多个版本、或路径不在 `old/` 下）、
+`BACKUP_OLD_RESTORE_NO_FULL_COPY`（记录没有 `full_copy`；先 `old-backfill`）、`BACKUP_OLD_RESTORE_CORRUPT`（副本
+缺失/不可读/解密失败/摘要或长度不符/元数据与记录不一致/写后回读不符）、`BACKUP_OLD_RESTORE_TARGET_EXISTS`、
+`BACKUP_OLD_RESTORE_TARGET_CHANGED`、`BACKUP_OLD_RESTORE_DOCTOR_REFUSED`。仓库/密钥问题沿用
+`BACKUP_REPO_NOT_INITIALIZED` / `BACKUP_NO_PERMISSION`。
+
+**测试**（挂在 `test/backup-rotation.test.mjs`，无新测试文件）：先跑两次备份（或 fixture）得到一条带 `.enc` 的
+轮转记录，**删掉主库全部块**后 plan+apply 仍逐字节还原（证明独立性）；篡改 `.enc` → `_CORRUPT` 且零写入；
+目标已存在 → 不给 `--overwrite` 拒绝、给了先用 `.bak-<ts>` 保存旧字节再替换；keep-both 保留旧文件另写
+`.restored-<ts>`；dry run / plan 零写入且缺省目标是 `<record>.restored`；plan 后目标被改 → `_TARGET_CHANGED`
+零覆盖；静态无效副本默认 `_DOCTOR_REFUSED`、`--force-invalid` 才写且结果 `doctor_ok:false`；CLI 解析/互斥
+用法错误 2、`--latest-for` 选最新、`--session` 多版本具名拒绝、`--record` 精确、无副本记录 `_NO_FULL_COPY`、
+`--json` 形状与退出码、真实入口写盘。
+
+**诚实边界**：这是**单版本、单文件**还原，不是整快照还原——不恢复附件、不动工作区注册表、不做运行时 G5 终审，
+也不做"放回 home"前的那套冲突/回滚协议（那是 `restore` 的事）。缺省输出 `<record>.restored` 落在 `old/` 目录里，
+会被 §24.3 的 `old/` 用量统计计入；要写到别处用 `--out`。副本能证明"字节是当时封印的那一份"（AAD 绑定
+sha256+length），不能证明"日志符合安装的 Harness 的当前校验"（G5）。本次不 bump 版本号、不跑 preflight、不提交。
 
 ## 25. 保护模式（用户最终决定：便捷优先，不是绝对保密，2026-11-17）
 

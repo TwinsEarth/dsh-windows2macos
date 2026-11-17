@@ -782,7 +782,7 @@ export function runBackup(input) {
           ok: false,
           reason_code: reasonCode,
           reason: error?.detail ?? (error instanceof Error ? error.message : String(error)),
-          copied: error?.copied ?? { files: 0, bytes: 0, repaired: 0 },
+          copied: error?.copied ?? { files: 0, bytes: 0, repaired: 0, old_files: 0, old_bytes: 0 },
         };
         mirrorWarnings = [`${reasonCode}: the primary backup is committed, but the offsite copy failed: ${mirror.reason}`];
       }

@@ -21,7 +21,8 @@ import { repoPaths } from '../src/backup/layout.mjs';
 import { openRepoKey } from '../src/backup/keystore.mjs';
 import { rebuildFile } from '../src/backup/materialize.mjs';
 import { sha256Hex } from '../src/backup/manifest.mjs';
-import { makeHome, registryDocument, tempDir } from './helpers/backup-fixture.mjs';
+import { OLD_COPY_KIND, openObject } from '../src/backup/crypto.mjs';
+import { framesFor, header, makeHome, registryDocument, tempDir } from './helpers/backup-fixture.mjs';
 
 const PASSWORD = 'correct horse battery staple';
 const PLATFORM = 'linux'; // no OS keystore: the password envelope is the credential, without DPAPI
@@ -287,7 +288,7 @@ describe('mirror: copying a snapshot', () => {
       const stampsBeforeResync = fileStamps(mirrorRoot);
       const second = syncToMirror({ root, mirrorRoot, dshHome: fixture.home, snapshotId: backedUp.snapshot_id });
       assert.equal(second.ok, true);
-      assert.deepEqual(second.copied, { files: 0, bytes: 0, repaired: 0 }, 'a re-sync of the same snapshot copies nothing');
+      assert.deepEqual(second.copied, { files: 0, bytes: 0, repaired: 0, old_files: 0, old_bytes: 0 }, 'a re-sync of the same snapshot copies nothing');
       assert.deepEqual(fileStamps(mirrorRoot), stampsBeforeResync, 'an intact mirror is not rewritten at all (size and mtime unchanged)');
       assert.equal(second.index_appended, false);
       assert.equal(second.descriptor_copied, false);
@@ -353,7 +354,7 @@ describe('mirror: copying a snapshot', () => {
 
       const stampsAfterRepair = fileStamps(mirrorRoot);
       const again = syncToMirror({ root, mirrorRoot, dshHome: fixture.home, snapshotId: backedUp.snapshot_id });
-      assert.deepEqual(again.copied, { files: 0, bytes: 0, repaired: 0 }, 'the repaired mirror is idempotent again');
+      assert.deepEqual(again.copied, { files: 0, bytes: 0, repaired: 0, old_files: 0, old_bytes: 0 }, 'the repaired mirror is idempotent again');
       assert.deepEqual(fileStamps(mirrorRoot), stampsAfterRepair, 'the second sync writes nothing');
     } finally {
       cleanup();
@@ -587,7 +588,7 @@ describe('mirror: the run integration', () => {
       assert.equal(second.mirror?.ok, false);
       assert.equal(second.mirror.reason_code, 'BACKUP_MIRROR_FAILED');
       assert.equal(typeof second.mirror.reason, 'string');
-      assert.deepEqual(second.mirror.copied, { files: 0, bytes: 0, repaired: 0 });
+      assert.deepEqual(second.mirror.copied, { files: 0, bytes: 0, repaired: 0, old_files: 0, old_bytes: 0 });
       assert.equal(second.warnings.length, 1);
       assert.match(second.warnings[0], /BACKUP_MIRROR_FAILED/u);
 
@@ -696,6 +697,193 @@ describe('mirror: write-time link guard (realpath hardening)', () => {
     } finally {
       cleanup();
       fixture.cleanup();
+    }
+  });
+});
+
+/** Every regular file under `<root>/old`, recursively (the mirror and the primary are compared file by file). */
+function oldFiles(root) {
+  const base = join(root, 'old');
+  const out = [];
+  const walk = (dir) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.isFile()) out.push(full);
+    }
+  };
+  walk(base);
+  return out.sort();
+}
+
+/** Write a different (still valid) session version so the next backup rotates the previous one into `old/`. */
+function changeSession(homeDir) {
+  fs.writeFileSync(
+    join(homeDir, 'sessions', '--E-GPT--', SESSION, 'session.v4.jsonl.zstd'),
+    framesFor([
+      header(SESSION),
+      { type: 'turn/start', seq: 0, time: 1794842804375, data: { turn: 1 } },
+      { type: 'turn/end', seq: 1, time: 1794842804377, data: { turn: 1, reason: { kind: 'completed' } } },
+    ]),
+  );
+}
+
+/** A repository holding exactly one rotated `full` version: a record and its sealed `.json.enc`. */
+function repoWithFullCopy(prefix) {
+  const { dir, cleanup } = tempDir(prefix);
+  const fixture = homeFixture();
+  const root = join(dir, 'repo');
+  const first = run({ root, dshHome: fixture.home, oldFormat: 'full' });
+  assert.equal(first.ok, true, first.detail);
+  changeSession(fixture.home);
+  const second = run({ root, dshHome: fixture.home, oldFormat: 'full' });
+  assert.equal(second.ok, true, second.detail);
+  assert.equal(second.rotated, 1, 'the fixture must have rotated one version into old/');
+  const cleanupAll = () => {
+    fixture.cleanup();
+    cleanup();
+  };
+  return { dir, root, fixture, oldBase: join(root, 'old'), cleanup: cleanupAll, snapshotId: second.snapshot_id };
+}
+
+/** The record document inside a repository's `old/` tree (there is exactly one in this fixture). */
+function onlyRecord(repoRoot) {
+  const file = oldFiles(repoRoot).find((candidate) => candidate.endsWith('.json'));
+  assert.ok(file, 'the fixture must hold one version record');
+  return { file, record: JSON.parse(fs.readFileSync(file, 'utf8')) };
+}
+
+describe('mirror: the old/ version tree', () => {
+  it('mirrors every version record and its sealed copy, and a second sync writes nothing', () => {
+    const repo = repoWithFullCopy('w2m-mirror-old-copy-');
+    try {
+      const mirrorRoot = join(repo.dir, 'mirror');
+      const primaryOld = oldFiles(repo.root);
+      assert.equal(primaryOld.length, 2, 'one record and one sealed copy');
+      assert.equal(primaryOld.filter((file) => file.endsWith('.json.enc')).length, 1);
+
+      const first = syncToMirror({ root: repo.root, mirrorRoot, dshHome: repo.fixture.home, snapshotId: repo.snapshotId });
+      assert.equal(first.ok, true);
+      assert.equal(first.copied.old_files, 2, 'the record and its paired .enc are both copied');
+      assert.ok(first.copied.old_bytes > 0);
+      assert.equal(first.copied.repaired, 0, 'a fresh mirror has nothing to repair');
+      assert.equal(first.skipped.old_files, 0);
+
+      const primaryRelBase = join(repo.root, 'old').length + 1;
+      for (const file of primaryOld) {
+        const rel = file.slice(primaryRelBase);
+        const mirrorFile = join(mirrorRoot, 'old', rel);
+        assert.equal(fs.existsSync(mirrorFile), true, `the mirror is missing old/${rel}`);
+        assert.deepEqual(fs.readFileSync(mirrorFile), fs.readFileSync(file), `old/${rel} must be byte-identical`);
+      }
+
+      // The mirrored copy is self-sufficient: the mirror's own keys.json opens the DEK, and the `.enc` decrypts
+      // with the `old` identity to the digest the record claims.
+      const { record } = onlyRecord(repo.root);
+      const mirrorRecord = onlyRecord(mirrorRoot);
+      assert.deepEqual(mirrorRecord.record, record, 'the mirrored record is the same document');
+      const mirrorKey = openRepoKey({ root: mirrorRoot, dshHome: repo.fixture.home, password: PASSWORD, platform: PLATFORM, machineKey: false });
+      assert.equal(mirrorKey.ok, true, mirrorKey.detail);
+      const copyFile = join(mirrorRoot, 'old', record.full_copy.file.split('/').slice(1).join('/'));
+      const plaintext = openObject(fs.readFileSync(copyFile), mirrorKey.dek, {
+        sha256: record.full_copy.sha256,
+        length: record.full_copy.size,
+        kind: OLD_COPY_KIND,
+      });
+      assert.equal(sha256Hex(plaintext), record.sha256, 'the mirrored copy decrypts to the recorded digest');
+
+      const stampsBeforeResync = fileStamps(mirrorRoot);
+      const second = syncToMirror({ root: repo.root, mirrorRoot, dshHome: repo.fixture.home, snapshotId: repo.snapshotId });
+      assert.equal(second.ok, true);
+      assert.deepEqual(second.copied, { files: 0, bytes: 0, repaired: 0, old_files: 0, old_bytes: 0 });
+      assert.equal(second.skipped.old_files, 2, 'both version-tree files are already present');
+      assert.deepEqual(fileStamps(mirrorRoot), stampsBeforeResync, 'an intact mirror is not rewritten at all');
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('copies nothing and reports zeros when the primary has no old/', () => {
+    const { dir, cleanup } = tempDir('w2m-mirror-old-absent-');
+    const fixture = homeFixture();
+    try {
+      const root = join(dir, 'repo');
+      const mirrorRoot = join(dir, 'mirror');
+      const backedUp = run({ root, dshHome: fixture.home });
+      assert.equal(backedUp.ok, true, backedUp.detail);
+      assert.deepEqual(oldFiles(root), [], 'a first backup has no rotated version file');
+      const synced = syncToMirror({ root, mirrorRoot, dshHome: fixture.home, snapshotId: backedUp.snapshot_id });
+      assert.equal(synced.ok, true);
+      assert.equal(synced.copied.old_files, 0);
+      assert.equal(synced.copied.old_bytes, 0);
+      assert.equal(synced.skipped.old_files, 0);
+      assert.deepEqual(oldFiles(mirrorRoot), [], 'nothing under old/ means no mirrored version files');
+    } finally {
+      cleanup();
+      fixture.cleanup();
+    }
+  });
+
+  it('repairs a truncated or same-length-corrupt sealed copy on the next sync', () => {
+    const repo = repoWithFullCopy('w2m-mirror-old-repair-');
+    try {
+      const mirrorRoot = join(repo.dir, 'mirror');
+      syncToMirror({ root: repo.root, mirrorRoot, dshHome: repo.fixture.home, snapshotId: repo.snapshotId });
+      const mirrorEnc = oldFiles(mirrorRoot).find((file) => file.endsWith('.json.enc'));
+      assert.ok(mirrorEnc, 'the mirror must hold the sealed copy');
+      const source = fs.readFileSync(mirrorEnc);
+      fs.writeFileSync(mirrorEnc, source.subarray(0, source.length - 1));
+
+      const repaired = syncToMirror({ root: repo.root, mirrorRoot, dshHome: repo.fixture.home, snapshotId: repo.snapshotId });
+      assert.equal(repaired.ok, true);
+      assert.equal(repaired.copied.old_files, 1, 'only the damaged copy is written again');
+      assert.ok(repaired.copied.repaired >= 1, 'a truncated copy must be reported as repaired');
+      assert.deepEqual(fs.readFileSync(mirrorEnc), source, 'the repaired copy is byte-identical to the primary');
+
+      // A record is compared by content: a same-length corruption is repaired even though the length matches.
+      const mirrorRecord = oldFiles(mirrorRoot).find((file) => file.endsWith('.json'));
+      const recordBytes = fs.readFileSync(mirrorRecord);
+      const corrupted = Buffer.from(recordBytes);
+      corrupted[corrupted.length - 2] = corrupted[corrupted.length - 2] ^ 0x01;
+      fs.writeFileSync(mirrorRecord, corrupted);
+      const recordRepaired = syncToMirror({ root: repo.root, mirrorRoot, dshHome: repo.fixture.home, snapshotId: repo.snapshotId });
+      assert.equal(recordRepaired.copied.old_files, 1);
+      assert.ok(recordRepaired.copied.repaired >= 1);
+      assert.deepEqual(fs.readFileSync(mirrorRecord), recordBytes);
+
+      const again = syncToMirror({ root: repo.root, mirrorRoot, dshHome: repo.fixture.home, snapshotId: repo.snapshotId });
+      assert.deepEqual(again.copied, { files: 0, bytes: 0, repaired: 0, old_files: 0, old_bytes: 0 });
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('refuses a junction inside mirror/old at write time and writes nothing through it', (t) => {
+    const repo = repoWithFullCopy('w2m-mirror-old-guard-');
+    try {
+      const mirrorRoot = join(repo.dir, 'mirror');
+      const outside = join(repo.dir, 'outside');
+      fs.mkdirSync(mirrorRoot, { recursive: true });
+      fs.mkdirSync(outside, { recursive: true });
+      const failure = tryJunction(outside, join(mirrorRoot, 'old'));
+      if (failure !== null) {
+        t.skip(`this environment forbids creating a directory junction/symlink (${failure})`);
+        return;
+      }
+      assert.throws(
+        () => syncToMirror({ root: repo.root, mirrorRoot, dshHome: repo.fixture.home, snapshotId: repo.snapshotId }),
+        (error) => error instanceof MirrorError && error.code === 'BACKUP_MIRROR_SYMLINK',
+        'a junction standing in for mirror/old must be refused at write time',
+      );
+      assert.deepEqual(fs.readdirSync(outside), [], 'nothing may be written through the junction');
+    } finally {
+      repo.cleanup();
     }
   });
 });

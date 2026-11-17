@@ -14,6 +14,16 @@
  * ops are wrong fails on the *next* append by the client. So verify optionally appends one legal event to the
  * reassembled bytes **in memory** and runs the validator on the result. A log that passes today and fails after
  * one append is reported as `FUTURE_APPEND_FAILED` before it is ever published.
+ *
+ * ## Old full copies are decrypted too (v3.5.0 additive)
+ *
+ * A version record is verified through its blocks (§24), but a record that also carries `full_copy` makes a second
+ * promise: those bytes are recoverable even if `objects/` is not. Verify now keeps that promise honest by opening
+ * the `.enc` with the repository DEK and the `old` identity (`{sha256, length: size, kind: 'old'}`), checking the
+ * plaintext digest and length, and reporting `BACKUP_VERIFY_OLD_COPY_MISSING`/`BACKUP_VERIFY_OLD_COPY_FAILED` with
+ * the offending record. The counters live in `old_copies: {checked, ok, failed, missing}`; a record without a copy
+ * is not counted, because there is nothing extra to verify. This works for an unencrypted repository too: the
+ * `open` envelope supplies the DEK without any credential.
  */
 
 import fs from 'node:fs';
@@ -23,7 +33,8 @@ import { openRepo, readIndex, readSnapshot, listSnapshots } from './repo.mjs';
 import { openRepoKey } from './keystore.mjs';
 import { sha256Hex } from './manifest.mjs';
 import { rebuildFile, objectFile } from './materialize.mjs';
-import { listOldVersions } from './rotation.mjs';
+import { OLD_COPY_KIND, openObject } from './crypto.mjs';
+import { fullCopyPathFor, listOldVersions } from './rotation.mjs';
 import { readCurrentPointers } from './gc.mjs';
 import { buildArtifactFromBuffer, runtimeValidateBatch } from './runtime-validate.mjs';
 import { appendLegalEvent, futureAppendVerdict } from './future-append.mjs';
@@ -40,9 +51,74 @@ export const VERIFY_CODES = Object.freeze({
   SNAPSHOT_INVALID: 'BACKUP_REPO_SNAPSHOT_INVALID',
   INDEX_MISMATCH: 'BACKUP_INDEX_MISMATCH',
   OLD_RECORD_BLOCK_MISSING: 'BACKUP_OLD_RECORD_BLOCK_MISSING',
+  OLD_COPY_MISSING: 'BACKUP_VERIFY_OLD_COPY_MISSING',
+  OLD_COPY_FAILED: 'BACKUP_VERIFY_OLD_COPY_FAILED',
   FUTURE_APPEND_FAILED: 'BACKUP_FUTURE_APPEND_FAILED',
   RUNTIME_APPEND_FAILED: 'BACKUP_RUNTIME_APPEND_FAILED',
 });
+
+/** The zeroed `old_copies` counter block (also the shape every early return reports). */
+function emptyOldCopies() {
+  return { checked: 0, ok: 0, failed: 0, missing: 0 };
+}
+
+/**
+ * Check one old record's sealed whole-file copy, if it has one.
+ *
+ * A record without `full_copy` is not checked at all: there is no copy to verify, and the record's own blocks are
+ * already verified above. A record WITH one promises the bytes are recoverable without `objects/`, so absence,
+ * malformed metadata, a failed authentication and a digest/size mismatch are all divergences that must be named.
+ * The identity passed to `openObject` is the record's plaintext identity (`sha256`, `length: size`) under
+ * `kind: 'old'`: exactly what rotation/backfill sealed with, and the reason a block object cannot be passed off as
+ * a whole-file copy.
+ *
+ * @param {{root: string, record: object, dek: Buffer}} input
+ * @returns {null | {missing: boolean, detail: string}} `null` when the copy is fine
+ */
+function verifyOldFullCopy(input) {
+  const { root, record } = input;
+  const copyFile = fullCopyPathFor(root, record);
+  if (copyFile === null) {
+    return { missing: true, detail: 'full_copy.file does not name a path under old/, so it is never followed' };
+  }
+  if (record.full_copy.sha256 !== record.sha256 || record.full_copy.size !== record.size) {
+    return {
+      missing: false,
+      detail:
+        `full_copy metadata (${String(record.full_copy.sha256)} / ${String(record.full_copy.size)}) disagrees with ` +
+        `the version's own identity (${String(record.sha256)} / ${String(record.size)})`,
+    };
+  }
+  if (typeof record.sha256 !== 'string' || !Number.isSafeInteger(record.size)) {
+    return { missing: false, detail: 'the record has no usable sha256/size to verify the copy against' };
+  }
+  let sealed;
+  try {
+    sealed = fs.readFileSync(copyFile);
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') {
+      return { missing: true, detail: `the full copy at ${copyFile} is missing` };
+    }
+    return { missing: false, detail: `the full copy at ${copyFile} is unreadable: ${error?.code ?? 'unknown'}` };
+  }
+  let plaintext;
+  try {
+    plaintext = openObject(sealed, input.dek, { sha256: record.sha256, length: record.size, kind: OLD_COPY_KIND });
+  } catch (error) {
+    return {
+      missing: false,
+      detail: `the full copy at ${copyFile} does not decrypt to the recorded version: ${error?.code ?? 'BACKUP_DECRYPT_AUTH_FAILED'}: ${error?.detail ?? error?.message ?? String(error)}`,
+    };
+  }
+  const digest = sha256Hex(plaintext);
+  if (plaintext.length !== record.size || digest !== record.sha256) {
+    return {
+      missing: false,
+      detail: `the full copy at ${copyFile} decrypts to ${plaintext.length} bytes / ${digest}, not the recorded ${record.size} bytes / ${record.sha256}`,
+    };
+  }
+  return null;
+}
 
 /**
  * Append one legal event to a session log, in memory, and validate the result.
@@ -74,6 +150,7 @@ export function simulateFutureAppend(buffer) {
  *   snapshots: Array<{snapshot_id: string, files: number, blocks: number, bytes: number, ok: boolean, problems: number}>,
  *   future_append: {checked: number, failed: number},
  *   runtime_verified: {checked: number, failed: number},
+ *   old_copies: {checked: number, ok: number, failed: number, missing: number},
  * }}
  */
 export function verifyRepo(input) {
@@ -82,6 +159,7 @@ export function verifyRepo(input) {
   const counts = { snapshots: 0, files: 0, blocks: 0, bytes: 0, old: 0, current: 0 };
   const futureAppend = { checked: 0, failed: 0, evidence: 'static-prefilter' };
   const runtimeChecked = { checked: 0, failed: 0, evidence: 'installed-harness' };
+  const oldCopies = emptyOldCopies();
   const state = openRepo({ root: input.root, dshHome: input.dshHome });
   if (state.initialized !== true) {
     return {
@@ -93,6 +171,7 @@ export function verifyRepo(input) {
       snapshots,
       future_append: futureAppend,
       runtime_verified: runtimeChecked,
+      old_copies: oldCopies,
     };
   }
   const key = openRepoKey({
@@ -114,6 +193,7 @@ export function verifyRepo(input) {
       snapshots,
       future_append: futureAppend,
       runtime_verified: runtimeChecked,
+      old_copies: oldCopies,
     };
   }
 
@@ -227,6 +307,32 @@ export function verifyRepo(input) {
         problems.push({ code: VERIFY_CODES.DIGEST_MISMATCH, file: record.file, snapshot_id: info.snapshot_id ?? null, detail: 'the rebuilt old version does not hash to the digest the record stored' });
       }
     }
+    // Records WITH a sealed whole-file copy promise those bytes are recoverable without `objects/`; verify that
+    // promise by decrypting the copy. A record without `full_copy` has nothing extra to check (its blocks above are
+    // the whole claim), so the counters stay untouched for it.
+    if (info.full_copy !== undefined && info.full_copy !== null) {
+      oldCopies.checked += 1;
+      const failure = verifyOldFullCopy({ root: input.root, record: info, dek: key.dek });
+      if (failure === null) {
+        oldCopies.ok += 1;
+      } else if (failure.missing === true) {
+        oldCopies.missing += 1;
+        problems.push({
+          code: VERIFY_CODES.OLD_COPY_MISSING,
+          file: record.file,
+          snapshot_id: info.snapshot_id ?? null,
+          detail: `${record.file}: the version record claims a full copy: ${failure.detail}`,
+        });
+      } else {
+        oldCopies.failed += 1;
+        problems.push({
+          code: VERIFY_CODES.OLD_COPY_FAILED,
+          file: record.file,
+          snapshot_id: info.snapshot_id ?? null,
+          detail: `${record.file}: the version record's full copy is not usable: ${failure.detail}`,
+        });
+      }
+    }
   }
   const current = readCurrentPointers(input.root);
   counts.current = current.pointers.length;
@@ -279,5 +385,6 @@ export function verifyRepo(input) {
     snapshots,
     future_append: futureAppend,
     runtime_verified: runtimeChecked,
+    old_copies: oldCopies,
   };
 }

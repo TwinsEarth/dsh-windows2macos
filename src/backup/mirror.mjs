@@ -23,14 +23,21 @@
  *     `initialized: true` without a descriptor, and unwrapping the DEK needs the authoritative envelopes file.
  *     They are wrapped-key envelopes only; no plaintext secret and no password is copied.
  *   * one line in `index.jsonl` for the snapshot, appended only if the mirror index does not already name it.
+ *   * `old/` -- the **whole superseded-version tree**: every `<ts>-<sha12>.json` record and its paired
+ *     `<ts>-<sha12>.json.enc` sealed copy. These are not needed to open a snapshot (the record restores from
+ *     `objects/`), but they are the only thing that restores a version whose blocks are gone, which is exactly the
+ *     disaster a mirror exists for. `old/` is copied after the snapshot itself and is never a precondition for it;
+ *     it does grow without a total cap (§21.2/§24.3), so the mirrored tree grows with it and is not deduplicated.
  *
  * ## Idempotent by construction, but not blind
  *
  * Every write is skipped when the destination already matches the source: an object must exist at its content
  * address **and have the source's byte length** (a truncated or externally damaged copy is rewritten, not
- * trusted), snapshot and root metadata files are compared byte for byte (they are small), and the index by
- * snapshot id. An intact mirror therefore re-syncs with zero writes and reports `copied.repaired: 0`, so a
- * scheduled mirror costs the size of the new session versions, not the size of the repository.
+ * trusted), a version record must be byte-identical (records are small, so the content check is cheap), a sealed
+ * whole-file copy must have the source's byte length (the mirror never holds the DEK, so length is the cheap
+ * check), snapshot and root metadata files are compared byte for byte, and the index by snapshot id. An intact
+ * mirror therefore re-syncs with zero writes and reports `copied.repaired: 0`, so a scheduled mirror costs the
+ * size of the new session versions, not the size of the repository.
  */
 
 import fs from 'node:fs';
@@ -294,6 +301,50 @@ export function resolveMirrorRoot(input = {}) {
 }
 
 /**
+ * Every regular file in the primary `old/` tree that belongs to the version tree.
+ *
+ * `old/` holds two kinds of files: `<ts>-<sha12>.json` version records and their optional `<ts>-<sha12>.json.enc`
+ * sealed whole-file copies. Anything else under `old/` (a crashed writer's temporary file, a human's note) is not
+ * part of the protocol and is not copied: a mirror reproduces the version tree, not an arbitrary directory.
+ *
+ * The walk lists with `withFileTypes` and only follows directory entries; a symlink or Windows junction is neither
+ * a directory nor a regular file, so it is skipped instead of followed out of `old/`. A listing failure other than
+ * "the directory is not there" is reported: silently treating an unreadable `old/` as empty would claim the
+ * mirror is complete when it is not.
+ *
+ * @param {string} root primary repository root
+ * @returns {{ok: true, files: Array<{file: string, rel: string[]}>} | {ok: false, detail: string}}
+ */
+function listPrimaryOldFiles(root) {
+  const base = path.join(path.resolve(root), 'old');
+  const files = [];
+  const walk = (dir, parts) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (error) {
+      if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return null;
+      return `could not list ${dir}: ${error?.code ?? (error instanceof Error ? error.message : String(error))}`;
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        const problem = walk(full, [...parts, entry.name]);
+        if (problem !== null) return problem;
+        continue;
+      }
+      // `isFile()` is false for symlinks/junctions: they are skipped, never followed.
+      if (!entry.isFile()) continue;
+      if (!entry.name.endsWith('.json') && !entry.name.endsWith('.json.enc')) continue;
+      files.push({ file: full, rel: [...parts, entry.name] });
+    }
+    return null;
+  };
+  const problem = walk(base, []);
+  return problem === null ? { ok: true, files } : { ok: false, detail: problem };
+}
+
+/**
  * Copy one committed snapshot to the mirror.
  *
  * The steps run in dependency order: objects first (a manifest names them), then the snapshot's own files, then
@@ -307,13 +358,16 @@ export function resolveMirrorRoot(input = {}) {
  * `copied` carrying the partial counts) when a read or write fails. The engine treats both as a warning on a
  * committed backup -- the primary is never rolled back because a copy failed.
  *
- * `copied.files`/`copied.bytes` count written bytes; `copied.repaired` is the subset of those writes that
- * replaced a file already present with the wrong content (truncated object, damaged metadata). An intact mirror
- * therefore reports `{files: 0, bytes: 0, repaired: 0}` on a re-sync.
+ * `copied.files`/`copied.bytes` count the snapshot's own written bytes; `copied.old_files`/`copied.old_bytes` count
+ * the `old/` version tree written by the same sync; `copied.repaired` is the subset of all those writes that
+ * replaced a file already present with the wrong content (truncated object, damaged metadata, torn copy). An intact
+ * mirror therefore reports `{files: 0, bytes: 0, repaired: 0, old_files: 0, old_bytes: 0}` on a re-sync (with
+ * `skipped.old_files` naming the version-tree files that were already present).
  *
  * @param {{root: string, mirrorRoot: string, dshHome?: string|null, snapshotId: string, now?: Date}} input
  * @returns {{ok: true, root: string,
- *   copied: {files: number, bytes: number, repaired: number}, skipped: {files: number, bytes: number},
+ *   copied: {files: number, bytes: number, repaired: number, old_files: number, old_bytes: number},
+ *   skipped: {files: number, bytes: number, old_files: number},
  *   index_appended: boolean, descriptor_copied: boolean}}
  * @throws {MirrorError}
  */
@@ -331,8 +385,8 @@ export function syncToMirror(input) {
   const guardRoot = mirrorReal.real;
   const primaryPaths = repoPaths(root);
   const mirrorPaths = repoPaths(mirror);
-  const copied = { files: 0, bytes: 0, repaired: 0 };
-  const skipped = { files: 0, bytes: 0 };
+  const copied = { files: 0, bytes: 0, repaired: 0, old_files: 0, old_bytes: 0 };
+  const skipped = { files: 0, bytes: 0, old_files: 0 };
   /** A named copy failure carrying the counts the partial copy did achieve. */
   const fail = (detail) => new MirrorError(MIRROR_CODES.FAILED, detail, { copied: { ...copied } });
 
@@ -466,6 +520,61 @@ export function syncToMirror(input) {
         throw fail(`appending to ${mirrorPaths.index}: ${error?.code ?? (error instanceof Error ? error.message : String(error))}`);
       }
       indexAppended = true;
+    }
+
+    // (f) The whole `old/` version tree: records and their sealed whole-file copies. It is supplemental to the
+    // snapshot (nothing here is needed by `openRepo(mirror)` or `rebuildFile`), so it runs last; but a mirror that
+    // could not hand back a superseded version would not be a disaster copy of the version history. The tree is
+    // never pruned here: a mirror is additive, and `old/` keeps growing until the operator's `gc` prunes the
+    // primary (§24.3) is an honest property of the feature, not something this loop is allowed to guess around.
+    const oldTree = listPrimaryOldFiles(root);
+    if (oldTree.ok !== true) throw fail(oldTree.detail);
+    for (const row of oldTree.files) {
+      const mirrorFile = path.join(mirror, 'old', ...row.rel);
+      // Before the directory is created: a junction placed inside mirror/old between the root check and this write
+      // must refuse the copy rather than redirect it outside the mirror.
+      guardWritablePath(guardRoot, mirrorFile);
+      const existingSize = sizeIfFile(mirrorFile);
+      const isRecord = row.rel[row.rel.length - 1].endsWith('.json');
+      if (isRecord) {
+        // Small: compare the bytes, so a same-length corruption of a record is repaired too.
+        const bytes = readIfExists(row.file);
+        if (bytes === null) throw fail(`the primary old/ record ${row.file} is unreadable`);
+        if (sameBytes(readIfExists(mirrorFile), bytes)) {
+          skipped.old_files += 1;
+          continue;
+        }
+        try {
+          fs.mkdirSync(path.dirname(mirrorFile), { recursive: true });
+          writeFileAtomic(mirrorFile, bytes);
+        } catch (error) {
+          throw fail(`writing ${mirrorFile}: ${error?.code ?? (error instanceof Error ? error.message : String(error))}`);
+        }
+        copied.old_files += 1;
+        copied.old_bytes += bytes.length;
+        if (existingSize !== null) copied.repaired += 1;
+        continue;
+      }
+      // A sealed whole-file copy is ciphertext and this module never holds the DEK, so byte length is the cheap
+      // integrity check (exactly the rule applied to object blocks): an intact copy is skipped, a truncated one is
+      // rewritten. A same-length corruption is reported by `verify` (which decrypts it) or by a restore.
+      const sourceSize = sizeIfFile(row.file);
+      if (sourceSize === null) throw fail(`the primary old/ copy ${row.file} is unreadable`);
+      if (existingSize === sourceSize) {
+        skipped.old_files += 1;
+        continue;
+      }
+      const sealed = readIfExists(row.file);
+      if (sealed === null) throw fail(`the primary old/ copy ${row.file} is unreadable`);
+      try {
+        fs.mkdirSync(path.dirname(mirrorFile), { recursive: true });
+        writeFileAtomic(mirrorFile, sealed);
+      } catch (error) {
+        throw fail(`writing ${mirrorFile}: ${error?.code ?? (error instanceof Error ? error.message : String(error))}`);
+      }
+      copied.old_files += 1;
+      copied.old_bytes += sealed.length;
+      if (existingSize !== null) copied.repaired += 1;
     }
 
     return { ok: true, root: mirror, copied, skipped, index_appended: indexAppended, descriptor_copied: descriptorCopied };

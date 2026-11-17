@@ -4,6 +4,39 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### old/ 整文件副本：从副本还原、镜像 old/、verify 逐份解密（未发布）
+
+- **从 full 副本还原一个版本（`w2m-backup old-restore`，`src/backup/old-restore.mjs`）**：记录 + blocks 还在时用
+  `restore`；对象目录损坏/块已丢失时，`.enc` 是最后一份能还原该版本的字节。`planOldRestore` 按 `--record` /
+  `--session <id> [--rel]` / `--latest-for <id>` 选记录（同会话多个版本时具名拒绝，不猜），打开仓库 key
+  （machine→account→password，未加密仓库的 `open` 信封零凭据）、读 `.enc` 并以 `{sha256, length: size,
+  kind:'old'}` 解密、核对 sha256+长度、跑静态 doctor 预筛；缺省 dry run（打印 record/source digest/doctor/target/
+  plan，目标缺省 `<record>.restored`），`--apply` 才写：plan 后目标被改 → `BACKUP_OLD_RESTORE_TARGET_CHANGED`
+  拒绝覆盖，已存在需 `--overwrite`（先写 `.bak-<ts>`）或 `--keep-both`（另写 `.restored-<ts>`），写后回读
+  sha256 校验。静态 doctor 不过默认拒绝 `BACKUP_OLD_RESTORE_DOCTOR_REFUSED`；只有显式 `--force-invalid` 才写，
+  且 plan/结果保留 `doctor_ok:false`。错误码还有 `_NOT_FOUND` / `_NO_FULL_COPY` / `_CORRUPT` / `_TARGET_EXISTS`。
+- **镜像现在包含整棵 `old/`（`src/backup/mirror.mjs`）**：快照/objects/元数据/索引行之后，把每条
+  `<ts>-<sha12>.json` 记录与配对 `.json.enc` 复制到镜像（记录逐字节比较、`.enc` 按长度，损坏即
+  `writeFileAtomic` 重写；每次写前 `guardWritablePath`，镜像 `old/` 内的 symlink/junction 具名
+  `BACKUP_MIRROR_SYMLINK` 且零写入；只复制 `old/` 下普通文件，不跟随链接）。新增计数
+  `copied.old_files`/`copied.old_bytes`/`skipped.old_files`（`repaired` 共享）；完好镜像第二次同步对 `old/`
+  零写入；主库无 `old/` 时全 0。
+- **`verify` 逐份解密 `.enc`（`src/backup/verify.mjs`）**：对每条带 `full_copy` 的旧记录读 `.enc`、以
+  `{sha256, length: size, kind:'old'}` 解密并核对明文 sha256+长度，结果新增
+  `old_copies:{checked,ok,failed,missing}`；缺失报 `BACKUP_VERIFY_OLD_COPY_MISSING`、解密/摘要/长度不符报
+  `BACKUP_VERIFY_OLD_COPY_FAILED`（`detail` 写明记录）。没有 `full_copy` 的记录不计入；未加密仓库同样工作。CLI
+  `verify` 人类输出新增 `old copies : N ok / M failed / K missing`，`--json` 有该块。
+- **文档/测试**：`docs/BACKUP-DESIGN.md` §24.4（从副本还原、doctor 门禁、`--force-invalid` 语义、CLI/错误码/
+  诚实边界）、§21.2（`old/` 镜像、计数、存储与"只增不删"边界）、§19.2/§19.3（`.enc` 逐份校验与测试）；测试挂在
+  `test/backup-rotation`（old-restore API+CLI）、`test/backup-mirror`（`old/` 镜像/幂等/截断修复/junction 拒绝/
+  镜像副本可解密）、`test/backup-verify`（健康/损坏/缺失/无副本/未加密/CLI）；`npx eslint .` 0 error、
+  `node scripts/layer-check.mjs` clean、`node scripts/scan-mojibake.mjs` clean、相关 suite 全绿。
+- **诚实边界**：`old-restore` 是**单版本、单文件**还原，不是整快照还原（不恢复附件、不动注册表、不做 G5 运行时
+  终审）；缺省输出落在 `old/` 内会计入 §24.3 用量。镜像里的 `old/` 会随主库增长（§24.3 无总量上限），且镜像只增
+  不删、不做跨镜像去重。`verify` 只对**带 `full_copy` 的记录**解密副本，没有副本的记录仍只验 blocks。
+- **声明**：不 bump 版本（仍 3.5.0）、不跑 preflight、不提交。
+
+
 ### G5 运行时终审默认 nightly（未发布）
 
 - `backupRuntimeVerify` 的默认值从 `off` 改为 **`nightly`**：每次成功的定时备份（含补跑）之后异步跑一次终审并把记录写入 `state.last_runtime_verify`，面板默认显示的就是最新记录（仍带时间戳，不是实时保证）；显式 `backupRuntimeVerify: off` 可关闭，`?runtime=1` 仍可手动跑。

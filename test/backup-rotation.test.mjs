@@ -47,9 +47,10 @@ import { MIN_SCRYPT, OLD_COPY_KIND, openObject, randomDek, sealObject } from '..
 import { ensureLayout, repoPaths } from '../src/backup/layout.mjs';
 import { openRepoKey } from '../src/backup/keystore.mjs';
 import { SEALED_COPY_OVERHEAD, backfillOldFullCopies } from '../src/backup/old-backfill.mjs';
+import { OLD_RESTORE_CODES, applyOldRestore, planOldRestore } from '../src/backup/old-restore.mjs';
 import { formatOldBackfill, main, parseArgs } from '../src/backup/cli.mjs';
 import { readJsonSafe } from '../src/backup/atomic.mjs';
-import { tempDir } from './helpers/backup-fixture.mjs';
+import { framesFor, header, runtimeValidSessionLog, tempDir } from './helpers/backup-fixture.mjs';
 
 const ENTRY = {
   rel: 'sessions/--E-GPT--/session-aaaaaaaa-0001/session.v4.jsonl.zstd',
@@ -1229,5 +1230,319 @@ describe('rotation: old/ usage measurement and the growth reminder (24.3)', () =
     } finally {
       cleanup();
     }
+  });
+});
+/**
+ * `old-restore`: get one superseded version's bytes back from its sealed whole-file copy, with the same
+ * plan/apply split as restore. The failure mode that motivates the command is the one the tests start with: the
+ * record survives but the blocks it names are gone, so only the `.enc` can produce the bytes.
+ */
+describe('rotation: old-restore (restoring a version from its full copy)', () => {
+  const OLD_RESTORE_PASSWORD = BACKFILL_PASSWORD;
+  const RESTORE_SESSION = 'session-aaaaaaaa-0001';
+  const FIXED_NOW = new Date('2026-11-18T02:00:00.000Z');
+
+  /** A sealed repository holding one rotated `full` record, then all blocks deleted. */
+  function fullCopyFixture(prefix, bytes = runtimeValidSessionLog(RESTORE_SESSION)) {
+    const repo = backfillRepo(prefix);
+    const record = backfillVersion(repo.root, repo.dek, RESTORE_SESSION, bytes, '2026-11-17T13:00:00.000Z', 'full');
+    // The record is intact, the `.enc` is intact, and every block it names is gone: only the copy can restore now.
+    rmSync(repoPaths(repo.root).objects, { recursive: true, force: true });
+    return { ...repo, bytes, record };
+  }
+
+  /** Plan one restore from the fixture (absolute paths only; the CLI resolves its own). */
+  function planFor(repo, extra = {}) {
+    return planOldRestore({
+      root: repo.root,
+      dshHome: repo.home,
+      recordFile: repo.record.file,
+      outFile: join(repo.dir, 'restored.log'),
+      password: OLD_RESTORE_PASSWORD,
+      platform: 'linux',
+      machineKey: false,
+      now: FIXED_NOW,
+      ...extra,
+    });
+  }
+
+  function capture(password = OLD_RESTORE_PASSWORD) {
+    const lines = [];
+    const io = { stdout: (text) => lines.push(text), stderr: (text) => lines.push(text), env: {}, password };
+    return { lines, io };
+  }
+
+  it('plans and applies a byte-identical restore from the copy alone (primary blocks deleted)', () => {
+    const bytes = runtimeValidSessionLog(RESTORE_SESSION);
+    const repo = fullCopyFixture('w2m-rot-old-restore-bytes-', bytes);
+    try {
+      const plan = planFor(repo);
+      assert.equal(plan.ok, true, plan.detail);
+      assert.equal(plan.record.file, repo.record.file);
+      assert.equal(plan.source_sha256, repo.record.record.sha256);
+      assert.equal(plan.recovered.bytes, bytes.length);
+      assert.equal(plan.recovered.sha256, createHash('sha256').update(bytes).digest('hex'));
+      assert.equal(plan.recovered.doctor_ok, true, 'the fixture version is a valid session log');
+      assert.equal(plan.target.exists, false);
+      assert.equal(plan.apply_plan.mode, 'create');
+
+      const applied = applyOldRestore({ plan, now: FIXED_NOW });
+      assert.equal(applied.ok, true, applied.detail);
+      assert.equal(applied.file, join(repo.dir, 'restored.log'));
+      assert.equal(applied.backup_file, null);
+      assert.equal(applied.bytes, bytes.length);
+      assert.equal(applied.doctor_ok, true);
+      assert.deepEqual(readFileSync(applied.file), bytes, 'the restored file is the superseded version byte for byte');
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('reports a tampered .enc as CORRUPT and writes nothing', () => {
+    const repo = fullCopyFixture('w2m-rot-old-restore-corrupt-');
+    try {
+      const [copyFile] = fullCopyFiles(repo.root);
+      const sealed = readFileSync(copyFile);
+      sealed[sealed.length - 1] ^= 0x01;
+      writeFileSync(copyFile, sealed);
+      const outFile = join(repo.dir, 'restored.log');
+
+      const plan = planFor(repo);
+      assert.equal(plan.ok, false);
+      assert.equal(plan.reason_code, OLD_RESTORE_CODES.CORRUPT);
+      assert.match(plan.detail, /does not open as the recorded version/u);
+      assert.equal(existsSync(outFile), false, 'a refused plan writes nothing');
+
+      const applied = applyOldRestore({ plan });
+      assert.equal(applied.ok, false);
+      assert.equal(applied.reason_code, OLD_RESTORE_CODES.CORRUPT);
+      assert.equal(existsSync(outFile), false, 'an apply on a refused plan writes nothing');
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('refuses an existing target without --overwrite, and backs it up to .bak-<ts> with it', () => {
+    const repo = fullCopyFixture('w2m-rot-old-restore-overwrite-');
+    try {
+      const outFile = join(repo.dir, 'restored.log');
+      writeFileSync(outFile, 'the bytes that were already there\n');
+      const refused = planFor(repo);
+      assert.equal(refused.ok, false);
+      assert.equal(refused.reason_code, OLD_RESTORE_CODES.TARGET_EXISTS);
+      assert.equal(applyOldRestore({ plan: refused }).ok, false);
+      assert.equal(readFileSync(outFile, 'utf8'), 'the bytes that were already there\n', 'the refusal wrote nothing');
+
+      const plan = planFor(repo, { overwrite: true });
+      assert.equal(plan.ok, true, plan.detail);
+      assert.equal(plan.apply_plan.mode, 'overwrite');
+      assert.equal(plan.apply_plan.backs_up_existing, true);
+      const applied = applyOldRestore({ plan, now: FIXED_NOW });
+      assert.equal(applied.ok, true, applied.detail);
+      assert.match(applied.backup_file, /restored\.log\.bak-\d{8}T\d{6}Z$/u);
+      assert.equal(readFileSync(applied.backup_file, 'utf8'), 'the bytes that were already there\n', 'the .bak is the way back');
+      assert.deepEqual(readFileSync(outFile), repo.bytes, 'the target now holds the recovered version');
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('keep-both leaves the existing target alone and writes the recovered log beside it', () => {
+    const repo = fullCopyFixture('w2m-rot-old-restore-keep-both-');
+    try {
+      const outFile = join(repo.dir, 'restored.log');
+      writeFileSync(outFile, 'keep me\n');
+      const plan = planFor(repo, { keepBoth: true });
+      assert.equal(plan.ok, true, plan.detail);
+      assert.equal(plan.apply_plan.mode, 'keep-both');
+      assert.equal(plan.apply_plan.backs_up_existing, false);
+      const applied = applyOldRestore({ plan, now: FIXED_NOW });
+      assert.equal(applied.ok, true, applied.detail);
+      assert.equal(applied.file, `${outFile}.restored-20261118T020000Z`);
+      assert.equal(applied.backup_file, null);
+      assert.equal(readFileSync(outFile, 'utf8'), 'keep me\n', 'the existing target is untouched');
+      assert.deepEqual(readFileSync(applied.file), repo.bytes);
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('a dry run writes nothing, and the default target is the record plus .restored', () => {
+    const repo = fullCopyFixture('w2m-rot-old-restore-dry-');
+    try {
+      const recordBefore = readFileSync(repo.record.file);
+      const copyBefore = readFileSync(fullCopyFiles(repo.root)[0]);
+      const plan = planOldRestore({
+        root: repo.root,
+        dshHome: repo.home,
+        recordFile: repo.record.file,
+        password: OLD_RESTORE_PASSWORD,
+        platform: 'linux',
+        machineKey: false,
+        now: FIXED_NOW,
+      });
+      assert.equal(plan.ok, true, plan.detail);
+      assert.equal(plan.target.path, `${repo.record.file}.restored`, 'the default target is a sibling of the record');
+      assert.equal(existsSync(plan.target.path), false, 'planning writes no target');
+      assert.equal(existsSync(`${plan.target.path}.bak`), false);
+      assert.deepEqual(readFileSync(repo.record.file), recordBefore, 'the record is not touched');
+      assert.deepEqual(readFileSync(fullCopyFiles(repo.root)[0]), copyBefore, 'the copy is not touched');
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('refuses a target that changed after the plan instead of overwriting it', () => {
+    const repo = fullCopyFixture('w2m-rot-old-restore-changed-');
+    try {
+      const outFile = join(repo.dir, 'restored.log');
+      const plan = planFor(repo);
+      assert.equal(plan.ok, true, plan.detail);
+      writeFileSync(outFile, 'a client appended here while the plan sat around\n');
+      const applied = applyOldRestore({ plan });
+      assert.equal(applied.ok, false);
+      assert.equal(applied.reason_code, OLD_RESTORE_CODES.TARGET_CHANGED);
+      assert.equal(readFileSync(outFile, 'utf8'), 'a client appended here while the plan sat around\n');
+      assert.equal(readdirSync(repo.dir).some((name) => name.startsWith('restored.log.bak-')), false, 'no .bak was written');
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('refuses a statically invalid recovery unless --force-invalid is given', () => {
+    // A structurally-invalid but decodable zstd log: the doctor fails it with a named code, not with `unreadable`.
+    const payload = framesFor([{ hello: 'world' }]);
+    const repo = fullCopyFixture('w2m-rot-old-restore-doctor-', payload);
+    try {
+      const outFile = join(repo.dir, 'restored.log');
+      const refused = planFor(repo);
+      assert.equal(refused.ok, false);
+      assert.equal(refused.reason_code, OLD_RESTORE_CODES.DOCTOR_REFUSED);
+      assert.equal(refused.recovered.doctor_ok, false);
+      assert.ok(refused.recovered.doctor_codes.length > 0);
+      assert.equal(existsSync(outFile), false);
+
+      const forced = planFor(repo, { forceInvalid: true });
+      assert.equal(forced.ok, true, forced.detail);
+      assert.equal(forced.recovered.doctor_ok, false, 'the forced plan never claims the log is valid');
+      const applied = applyOldRestore({ plan: forced, now: FIXED_NOW });
+      assert.equal(applied.ok, true, applied.detail);
+      assert.equal(applied.doctor_ok, false, 'the result records that the doctor refused these bytes');
+      assert.deepEqual(readFileSync(outFile), payload);
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  describe('rotation: old-restore CLI', () => {
+    it('is named in usage, parses the selection flags, and exits 2 for a contradictory request', () => {
+      const help = capture();
+      assert.equal(main(['help'], help.io), 0);
+      const usage = help.lines.join('\n');
+      assert.match(usage, /old-restore/u);
+      assert.match(usage, /--record <path>/u);
+      assert.match(usage, /--latest-for <id>/u);
+      assert.match(usage, /--force-invalid/u);
+
+      const parsed = parseArgs(['old-restore', '--record', 'x.json', '--out', 'y.log', '--overwrite', '--force-invalid'], {});
+      assert.equal(parsed.recordFile.endsWith('x.json'), true);
+      assert.equal(parsed.outFile.endsWith('y.log'), true);
+      assert.equal(parsed.overwrite, true);
+      assert.equal(parsed.forceInvalid, true);
+      assert.match(parseArgs(['old-restore', '--record'], {}).error, /--record needs a path/u);
+      assert.match(parseArgs(['old-restore', '--latest-for'], {}).error, /--latest-for needs a session id/u);
+
+      const noSelection = capture();
+      assert.equal(main(['old-restore', '--backup-dir', '.'], noSelection.io), 2);
+      assert.match(noSelection.lines.join('\n'), /needs exactly one of --record/u);
+
+      const contradictory = capture();
+      assert.equal(
+        main(['old-restore', '--record', 'x.json', '--out', 'y.log', '--overwrite', '--keep-both'], contradictory.io),
+        2,
+      );
+      assert.match(contradictory.lines.join('\n'), /--overwrite and --keep-both are opposite/u);
+    });
+
+    it('restores through the real entry point, prints the plan, and returns 0 only when it writes', () => {
+      const repo = fullCopyFixture('w2m-rot-old-restore-cli-');
+      try {
+        const outFile = join(repo.dir, 'restored.log');
+        const common = ['--backup-dir', repo.root, '--dsh-home', repo.home, '--no-machine-key'];
+
+        const dry = capture();
+        assert.equal(main(['old-restore', ...common, '--record', repo.record.file, '--out', outFile], dry.io), 0);
+        const dryText = dry.lines.join('\n');
+        assert.match(dryText, /old-restore/u);
+        assert.match(dryText, /record\s+:/u);
+        assert.match(dryText, /doctor\s+:/u);
+        assert.match(dryText, /target\s+:/u);
+        assert.match(dryText, /plan\s+:/u);
+        assert.match(dryText, /dry run: nothing was written/u);
+        assert.equal(existsSync(outFile), false);
+
+        // `--apply --dry-run` is a contradiction; the conservative reading (write nothing) must win.
+        const contradictory = capture();
+        assert.equal(
+          main(['old-restore', ...common, '--record', repo.record.file, '--out', outFile, '--apply', '--dry-run'], contradictory.io),
+          0,
+        );
+        assert.match(contradictory.lines.join('\n'), /dry run: nothing was written/u);
+        assert.equal(existsSync(outFile), false);
+
+        const applied = capture();
+        assert.equal(
+          main(['old-restore', ...common, '--record', repo.record.file, '--out', outFile, '--apply', '--json'], applied.io),
+          0,
+          applied.lines.join('\n'),
+        );
+        const payload = JSON.parse(applied.lines.join('\n'));
+        assert.equal(payload.ok, true);
+        assert.equal(payload.doctor_ok, true);
+        assert.equal(payload.backup_file, null);
+        assert.deepEqual(readFileSync(outFile), repo.bytes);
+      } finally {
+        repo.cleanup();
+      }
+    });
+
+    it('picks the newest record with --latest-for, refuses an ambiguous --session, and names a record without a copy', () => {
+      const repo = backfillRepo('w2m-rot-old-restore-cli-select-');
+      try {
+        // Both versions must be valid session logs, or the doctor gate (correctly) refuses the newest one.
+        const bytesOld = runtimeValidSessionLog(RESTORE_SESSION);
+        const bytesNew = framesFor([
+          header(RESTORE_SESSION),
+          { type: 'turn/start', seq: 0, time: 1794842804375, data: { turn: 1 } },
+          { type: 'turn/end', seq: 1, time: 1794842804379, data: { turn: 1, reason: { kind: 'completed' } } },
+        ]);
+        backfillVersion(repo.root, repo.dek, RESTORE_SESSION, bytesOld, '2026-11-17T13:00:00.000Z', 'full');
+        backfillVersion(repo.root, repo.dek, RESTORE_SESSION, bytesNew, '2026-11-17T14:00:00.000Z', 'full');
+        const common = ['--backup-dir', repo.root, '--dsh-home', repo.home, '--no-machine-key'];
+
+        const latest = capture();
+        assert.equal(main(['old-restore', ...common, '--latest-for', RESTORE_SESSION, '--json'], latest.io), 0, latest.lines.join('\n'));
+        const latestPayload = JSON.parse(latest.lines.join('\n'));
+        assert.equal(latestPayload.ok, true);
+        assert.match(latestPayload.record.file, /20261117T140000Z/u, '--latest-for picks the newest record');
+        assert.equal(existsSync(latestPayload.apply_plan.target), false, 'a plan writes no target');
+
+        const ambiguous = capture();
+        assert.equal(main(['old-restore', ...common, '--session', RESTORE_SESSION, '--json'], ambiguous.io), 1);
+        const ambiguousPayload = JSON.parse(ambiguous.lines.join('\n'));
+        assert.equal(ambiguousPayload.ok, false);
+        assert.equal(ambiguousPayload.reason_code, OLD_RESTORE_CODES.NOT_FOUND);
+        assert.match(ambiguousPayload.detail, /pass --record|--latest-for/u);
+
+        // A records-mode record (no full copy) is a named refusal, not "not found".
+        const recordsOnly = backfillVersion(repo.root, repo.dek, 'session-bbbbbbbb-0002', Buffer.from('record only\n'), '2026-11-17T15:00:00.000Z');
+        const noCopy = capture();
+        assert.equal(main(['old-restore', ...common, '--record', recordsOnly.file, '--json'], noCopy.io), 1);
+        const noCopyPayload = JSON.parse(noCopy.lines.join('\n'));
+        assert.equal(noCopyPayload.reason_code, OLD_RESTORE_CODES.NO_FULL_COPY);
+      } finally {
+        repo.cleanup();
+      }
+    });
   });
 });

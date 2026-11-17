@@ -56,6 +56,7 @@ import { buildStatus } from './routes.mjs';
 import { runBackup, SCOPES } from './engine.mjs';
 import { OLD_FORMATS, oldUsageGbText, oldUsageReminderWarning } from './rotation.mjs';
 import { backfillOldFullCopies } from './old-backfill.mjs';
+import { applyOldRestore, planOldRestore } from './old-restore.mjs';
 import { gc } from './gc.mjs';
 import { openRepo } from './repo.mjs';
 import { buildArchive } from './archive.mjs';
@@ -212,6 +213,10 @@ export function formatVerify(result) {
   lines.push(`files         : ${result.counts.files} (${humanBytes(result.counts.bytes)})`);
   lines.push(`blocks        : ${result.counts.blocks}`);
   lines.push(`old versions  : ${result.counts.old}`);
+  if (result.old_copies !== undefined && result.old_copies !== null) {
+    const copies = result.old_copies;
+    lines.push(`old copies    : ${copies.ok} ok / ${copies.failed} failed / ${copies.missing} missing`);
+  }
   lines.push(`current ptrs  : ${result.counts.current}`);
   lines.push(`future append : ${result.future_append.checked - result.future_append.failed}/${result.future_append.checked} passed`);
   if (result.runtime_verified.checked > 0) lines.push(`runtime check : ${result.runtime_verified.checked - result.runtime_verified.failed}/${result.runtime_verified.checked} passed`);
@@ -328,6 +333,7 @@ function usage() {
     '  list                snapshots in the repository, newest first (read-only)',
     '  gc                  remove unreferenced blocks and prune old versions (writes)',
     '  old-backfill        write the optional sealed whole-file copy for old/ records that predate full mode (writes)',
+    '  old-restore         restore one superseded version from its sealed full copy under old/ (plan; --apply writes)',
     '  unlock              which credential opens this repository (read-only; --check tries it). Writing modes:',
     '                      --set-password adds a PIN, --rotate-password changes an existing one',
     '  verify              re-hash every snapshot: blocks, bytes, manifests, index, old records',
@@ -361,12 +367,18 @@ function usage() {
     '  --no-encryption     run: shorthand for --encrypt none',
     '  --max-old-days <n>  run/gc: also prune old version records older than N days (0 = per-session count only)',
     '  --limit <n>         old-backfill: write at most N sealed copies this run (0 = plan only, writes nothing)',
+    '  --record <path>     old-restore: the exact old/ version record to restore from',
+    '  --rel <rel>         old-restore --session: narrow the match to this session log rel path',
+    '  --latest-for <id>   old-restore: restore the newest version record of this session',
+    '  --out <file>        old-restore: write the recovered log here (default: <record>.restored)',
+    '  --overwrite         old-restore: replace an existing target (a .bak-<ts> copy is written first)',
+    '  --force-invalid     old-restore: write even when the recovered log fails the static doctor',
     '  --mirror <dir>      run: copy the sealed blocks and snapshot metadata to this offsite directory',
     '  --dry-run           run/gc/old-backfill/restore/register: report what would happen, write nothing',
     '  --snapshot <id>     verify/archive/restore: a specific snapshot (default: the latest)',
     '  --archive <file>    restore: read the session bytes from a .tar.zst archive instead of the repository',
-    '  --apply             restore: actually write (without it, restore only prints the plan)',
-    '  --keep-both         restore: keep an existing different file and write the restored one beside it',
+    '  --apply             restore/old-restore: actually write (without it, only the plan is printed)',
+    '  --keep-both         restore/old-restore: keep an existing different file and write the restored one beside it',
     '  --allow-static-validation  restore: accept static-only evidence when no Harness is installed',
     '  --allow-live-home   restore/register: write even though the DSH client is running (read-back + recheck protocol)',
     '  --watch <minutes>   register: after writing, sample the registry for this many minutes (2/8/20/60 s, then every 60 s)',
@@ -442,6 +454,12 @@ export function parseArgs(argv, env = process.env) {
     allowLargeFullCopy: false,
     maxOldDays: null,
     limit: null,
+    recordFile: null,
+    rel: null,
+    latestFor: null,
+    outFile: null,
+    overwrite: false,
+    forceInvalid: false,
     mirror: null,
     dryRun: false,
     passwordStdin: false,
@@ -488,6 +506,8 @@ export function parseArgs(argv, env = process.env) {
     else if (arg === '--no-future-append') options.noFutureAppend = true;
     else if (arg === '--apply') options.apply = true;
     else if (arg === '--keep-both') options.keepBoth = true;
+    else if (arg === '--overwrite') options.overwrite = true;
+    else if (arg === '--force-invalid') options.forceInvalid = true;
     else if (arg === '--allow-static-validation') options.allowStaticValidation = true;
     else if (arg === '--allow-live-home') options.allowLiveHome = true;
     else if (arg === '--runtime') options.runtime = true;
@@ -652,6 +672,38 @@ export function parseArgs(argv, env = process.env) {
         return { ...options, error: `--limit needs a non-negative integer, got ${JSON.stringify(raw)}` };
       }
       options.limit = value;
+    } else if (arg === '--record') {
+      const raw = rest.shift() ?? '';
+      if (raw.trim() === '') return { ...options, error: '--record needs a path' };
+      options.recordFile = path.resolve(raw);
+    } else if (arg.startsWith('--record=')) {
+      const raw = arg.slice('--record='.length);
+      if (raw.trim() === '') return { ...options, error: '--record needs a path' };
+      options.recordFile = path.resolve(raw);
+    } else if (arg === '--rel') {
+      const raw = rest.shift() ?? '';
+      if (raw.trim() === '') return { ...options, error: '--rel needs a session log rel path' };
+      options.rel = raw.trim();
+    } else if (arg.startsWith('--rel=')) {
+      const raw = arg.slice('--rel='.length);
+      if (raw.trim() === '') return { ...options, error: '--rel needs a session log rel path' };
+      options.rel = raw.trim();
+    } else if (arg === '--latest-for') {
+      const raw = rest.shift() ?? '';
+      if (raw.trim() === '') return { ...options, error: '--latest-for needs a session id' };
+      options.latestFor = raw.trim();
+    } else if (arg.startsWith('--latest-for=')) {
+      const raw = arg.slice('--latest-for='.length);
+      if (raw.trim() === '') return { ...options, error: '--latest-for needs a session id' };
+      options.latestFor = raw.trim();
+    } else if (arg === '--out') {
+      const raw = rest.shift() ?? '';
+      if (raw.trim() === '') return { ...options, error: '--out needs a file path' };
+      options.outFile = path.resolve(raw);
+    } else if (arg.startsWith('--out=')) {
+      const raw = arg.slice('--out='.length);
+      if (raw.trim() === '') return { ...options, error: '--out needs a file path' };
+      options.outFile = path.resolve(raw);
     } else if (arg === '--mirror') {
       const raw = rest.shift() ?? '';
       if (raw.trim() === '') return { ...options, error: '--mirror needs a directory' };
@@ -995,6 +1047,51 @@ function failureLines(failed) {
   return lines;
 }
 
+/**
+ * Render an old-restore plan or result for a terminal.
+ *
+ * The dry run prints record/source digest/doctor/target/plan and the explicit "nothing was written" line; the
+ * applied output prints the file, its digest, the `.bak` path (the way back) and a warning when `--force-invalid`
+ * wrote bytes the static doctor refused.
+ */
+export function formatOldRestore(plan, applied) {
+  const lines = ['w2m-backup old-restore', ''];
+  if (plan?.ok !== true) {
+    lines.push(`refused       : ${plan?.reason_code ?? 'UNKNOWN'} ${plan?.detail ?? ''}`.trimEnd());
+    return lines.join('\n');
+  }
+  lines.push(`record        : ${plan.record.file}`);
+  lines.push(`session       : ${plan.record.session_id ?? '—'}${plan.record.rel === null ? '' : ` (${plan.record.rel})`}`);
+  lines.push(`source digest : ${plan.source_sha256}`);
+  lines.push(`recovered     : ${humanBytes(plan.recovered.bytes)} sha256 ${plan.recovered.sha256}`);
+  const doctorText = plan.recovered.doctor_ok
+    ? 'passed (static pre-filter)'
+    : `FAILED (${plan.recovered.doctor_codes.join(', ') || 'no code'})${plan.force_invalid === true ? ' — forced by --force-invalid' : ''}`;
+  lines.push(`doctor        : ${doctorText}`);
+  lines.push(`target        : ${plan.target.path} (${plan.target.exists ? 'exists' : 'does not exist'})`);
+  lines.push(
+    `plan          : ${plan.apply_plan.mode}` +
+      `${plan.apply_plan.backs_up_existing === true ? ' (existing target is copied to .bak-<ts> first)' : ''} -> ${plan.target.write_path}`,
+  );
+  if (applied === undefined) {
+    lines.push('');
+    lines.push('dry run: nothing was written. Re-run with --apply to restore.');
+    return lines.join('\n');
+  }
+  lines.push('');
+  if (applied.ok !== true) {
+    lines.push(`failed        : ${applied.reason_code} ${applied.detail ?? ''}`.trimEnd());
+    return lines.join('\n');
+  }
+  lines.push(`written       : ${applied.file} (${humanBytes(applied.bytes)})`);
+  lines.push(`sha256        : ${applied.sha256}`);
+  if (applied.backup_file !== null) lines.push(`backup        : ${applied.backup_file} (the way back)`);
+  if (applied.doctor_ok !== true) {
+    lines.push('warning       : the recovered log failed the static doctor and was written because --force-invalid was given');
+  }
+  return lines.join('\n');
+}
+
 /** Read the unlock password from the injected value, stdin, or the environment (never from argv). */
 function passwordFor(options, io) {
   if (typeof io.password === 'string') return io.password;
@@ -1325,6 +1422,60 @@ export function main(argv, io = {}) {
     });
     write(options.json ? JSON.stringify(result, null, 2) : formatOldBackfill(result));
     return result.ok === true ? 0 : 1;
+  }
+
+  if (options.command === 'old-restore') {
+    const resolved = resolveDir(options, env);
+    if (resolved.ok !== true) {
+      writeErr(`${resolved.error.code}: ${resolved.error.detail}`);
+      return 1;
+    }
+    const sessions = options.selected.filter((sessionId) => typeof sessionId === 'string' && sessionId !== '');
+    const selections = (options.recordFile === null ? 0 : 1) + (options.latestFor === null ? 0 : 1) + (sessions.length > 0 ? 1 : 0);
+    if (selections !== 1) {
+      writeErr(
+        'error: old-restore needs exactly one of --record <path>, --session <id> [--rel <rel>] or --latest-for <session-id>\n\n' +
+          usage(),
+      );
+      return 2;
+    }
+    if (sessions.length > 1) {
+      writeErr('error: old-restore takes one --session id; use --record to name one exact version record\n\n' + usage());
+      return 2;
+    }
+    if (options.rel !== null && sessions.length !== 1) {
+      writeErr('error: --rel only applies together with --session\n\n' + usage());
+      return 2;
+    }
+    if (options.overwrite === true && options.keepBoth === true) {
+      writeErr('error: --overwrite and --keep-both are opposite choices; pass one\n\n' + usage());
+      return 2;
+    }
+    const plan = planOldRestore({
+      root: resolved.dir,
+      dshHome: options.dshHome,
+      recordFile: options.recordFile,
+      sessionId: sessions[0] ?? null,
+      rel: options.rel,
+      latestFor: options.latestFor,
+      outFile: options.outFile,
+      overwrite: options.overwrite,
+      keepBoth: options.keepBoth,
+      forceInvalid: options.forceInvalid,
+      password: passwordFor(options, io),
+      accountId: options.accountId ?? undefined,
+      machineKey: options.noMachineKey === true || env.W2M_BACKUP_NO_MACHINE_KEY === '1' ? false : undefined,
+      now: io.now?.() ?? new Date(),
+    });
+    // `old-restore` is a dry run unless `--apply` is given; `--dry-run` is honoured defensively so
+    // `--apply --dry-run` can never write (the conservative reading of a contradictory pair).
+    if (plan.ok !== true || options.apply !== true || options.dryRun === true) {
+      write(options.json ? JSON.stringify(plan, null, 2) : formatOldRestore(plan));
+      return plan.ok === true ? 0 : 1;
+    }
+    const applied = applyOldRestore({ plan, now: io.now?.() ?? new Date() });
+    write(options.json ? JSON.stringify(applied, null, 2) : formatOldRestore(plan, applied));
+    return applied.ok === true ? 0 : 1;
   }
 
   if (options.command === 'unlock') {

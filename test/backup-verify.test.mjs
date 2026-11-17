@@ -496,3 +496,201 @@ describe('G3 evidence: every restructuring path re-validates the future append',
     }
   });
 });
+
+/**
+ * The `oldFormat: 'full'` half of verify: a version record that carries `full_copy` promises its bytes are
+ * recoverable without `objects/`, and verify now decrypts those copies instead of trusting the field.
+ */
+function changeSessionLog(homeDir) {
+  fs.writeFileSync(
+    join(homeDir, 'sessions', WORKSPACE, SESSION, 'session.v4.jsonl.zstd'),
+    framesFor([
+      header(SESSION),
+      { type: 'turn/start', seq: 0, time: 1794842804375, data: { turn: 1 } },
+      { type: 'turn/end', seq: 1, time: 1794842804377, data: { turn: 1, reason: { kind: 'completed' } } },
+    ]),
+  );
+}
+
+/** Every regular file under `<root>/old`, recursively. */
+function oldVersionFiles(root) {
+  const base = join(root, 'old');
+  const out = [];
+  const walk = (dir) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.isFile()) out.push(full);
+    }
+  };
+  walk(base);
+  return out.sort();
+}
+
+/** A sealed repository holding exactly one rotated `full` version (a record plus its sealed `.json.enc`). */
+function repoWithFullCopy(homeDir) {
+  const first = repoFor(homeDir);
+  changeSessionLog(homeDir);
+  const second = runBackup({
+    root: first.repo.dir,
+    dshHome: homeDir,
+    password: PASSWORD,
+    platform: 'linux',
+    machineKey: false,
+    oldFormat: 'full',
+  });
+  assert.equal(second.ok, true, second.detail);
+  assert.equal(second.rotated, 1, 'the fixture must rotate the previous version into old/');
+  return first.repo;
+}
+
+describe('verify: sealed old/ full copies are decrypted, not trusted', () => {
+  it('reports every full copy as ok on a healthy repository, with no problem added', () => {
+    const home = runtimeValidHome();
+    const repo = repoWithFullCopy(home.home);
+    try {
+      const result = verify(repo.dir, home.home);
+      assert.equal(result.ok, true, result.problems.map((problem) => `${problem.code}: ${problem.detail}`).join('; '));
+      assert.ok(result.old_copies.checked > 0, 'the fixture must hold at least one record with a full copy');
+      assert.equal(result.old_copies.ok, result.old_copies.checked, 'every checked copy decrypted to its record');
+      assert.equal(result.old_copies.failed, 0);
+      assert.equal(result.old_copies.missing, 0);
+    } finally {
+      repo.cleanup();
+      home.cleanup();
+    }
+  });
+
+  it('reports a corrupt .enc as failed with the named code and the record in the detail', () => {
+    const home = runtimeValidHome();
+    const repo = repoWithFullCopy(home.home);
+    try {
+      const enc = oldVersionFiles(repo.dir).find((file) => file.endsWith('.json.enc'));
+      assert.ok(enc, 'the fixture must hold the sealed copy');
+      const bytes = fs.readFileSync(enc);
+      bytes[bytes.length - 1] ^= 0x01;
+      fs.writeFileSync(enc, bytes);
+
+      const result = verify(repo.dir, home.home);
+      assert.equal(result.ok, false);
+      assert.equal(result.old_copies.checked, 1);
+      assert.equal(result.old_copies.failed, 1);
+      assert.equal(result.old_copies.missing, 0);
+      const problem = result.problems.find((row) => row.code === 'BACKUP_VERIFY_OLD_COPY_FAILED');
+      assert.ok(problem, JSON.stringify(result.problems));
+      assert.match(problem.detail, /BACKUP_DECRYPT_AUTH_FAILED|does not decrypt/u);
+      assert.equal(problem.file.endsWith('.json'), true, 'the problem names the version record');
+      assert.ok(problem.detail.includes(problem.file), 'the detail names the record it belongs to');
+    } finally {
+      repo.cleanup();
+      home.cleanup();
+    }
+  });
+
+  it('reports a deleted .enc as missing with the _MISSING code', () => {
+    const home = runtimeValidHome();
+    const repo = repoWithFullCopy(home.home);
+    try {
+      const enc = oldVersionFiles(repo.dir).find((file) => file.endsWith('.json.enc'));
+      fs.rmSync(enc);
+      const result = verify(repo.dir, home.home);
+      assert.equal(result.ok, false);
+      assert.equal(result.old_copies.checked, 1);
+      assert.equal(result.old_copies.missing, 1);
+      assert.equal(result.old_copies.failed, 0);
+      const problem = result.problems.find((row) => row.code === 'BACKUP_VERIFY_OLD_COPY_MISSING');
+      assert.ok(problem, JSON.stringify(result.problems));
+      assert.ok(problem.detail.includes(problem.file), 'the detail names the record it belongs to');
+    } finally {
+      repo.cleanup();
+      home.cleanup();
+    }
+  });
+
+  it('leaves the counters untouched for a record without a full copy', () => {
+    const home = runtimeValidHome();
+    const first = repoFor(home.home);
+    try {
+      changeSessionLog(home.home);
+      const second = runBackup({
+        root: first.repo.dir,
+        dshHome: home.home,
+        password: PASSWORD,
+        platform: 'linux',
+        machineKey: false,
+      });
+      assert.equal(second.ok, true, second.detail);
+      assert.equal(second.rotated, 1);
+      const recordFile = oldVersionFiles(first.repo.dir).find((file) => file.endsWith('.json'));
+      assert.equal(JSON.parse(fs.readFileSync(recordFile, 'utf8')).full_copy, undefined, 'the default mode writes no copy');
+      const result = verify(first.repo.dir, home.home);
+      assert.equal(result.ok, true, result.problems.map((problem) => `${problem.code}: ${problem.detail}`).join('; '));
+      assert.deepEqual(result.old_copies, { checked: 0, ok: 0, failed: 0, missing: 0 });
+    } finally {
+      first.repo.cleanup();
+      home.cleanup();
+    }
+  });
+
+  it('decrypts full copies in an unencrypted repository (the open envelope supplies the DEK)', () => {
+    const home = runtimeValidHome();
+    const { dir, cleanup } = tempDir('w2m-verify-old-copies-none-');
+    try {
+      const root = join(dir, 'repo');
+      const first = runBackup({ root, dshHome: home.home, platform: 'linux', machineKey: false });
+      assert.equal(first.ok, true, first.detail);
+      assert.equal(first.encryption, 'none');
+      changeSessionLog(home.home);
+      const second = runBackup({ root, dshHome: home.home, platform: 'linux', machineKey: false, oldFormat: 'full' });
+      assert.equal(second.ok, true, second.detail);
+      // No password and no machine key: `none` means keys.json carries the DEK in clear, so verify needs neither.
+      const result = verifyRepo({ root, dshHome: home.home, platform: 'linux', machineKey: false });
+      assert.equal(result.ok, true, result.problems.map((problem) => `${problem.code}: ${problem.detail}`).join('; '));
+      assert.ok(result.old_copies.checked > 0);
+      assert.equal(result.old_copies.ok, result.old_copies.checked);
+    } finally {
+      cleanup();
+      home.cleanup();
+    }
+  });
+
+  it('adds the old copies line to the human report, the block to --json, and follows the exit code', () => {
+    const home = runtimeValidHome();
+    const repo = repoWithFullCopy(home.home);
+    const capture = () => {
+      const lines = [];
+      return { lines, io: { stdout: (text) => lines.push(text), stderr: (text) => lines.push(text), env: {}, password: PASSWORD } };
+    };
+    try {
+      const json = capture();
+      const code = main(['verify', '--backup-dir', repo.dir, '--dsh-home', home.home, '--no-machine-key', '--json'], json.io);
+      assert.equal(code, 0, json.lines.join('\n'));
+      const payload = JSON.parse(json.lines.join('\n'));
+      assert.equal(payload.ok, true, payload.detail);
+      assert.ok(payload.old_copies.checked > 0);
+      assert.deepEqual(Object.keys(payload.old_copies).sort(), ['checked', 'failed', 'missing', 'ok']);
+
+      const human = capture();
+      assert.equal(main(['verify', '--backup-dir', repo.dir, '--dsh-home', home.home, '--no-machine-key'], human.io), 0);
+      assert.match(human.lines.join('\n'), /old copies\s+: 1 ok \/ 0 failed \/ 0 missing/u);
+
+      const enc = oldVersionFiles(repo.dir).find((file) => file.endsWith('.json.enc'));
+      fs.rmSync(enc);
+      const missingJson = capture();
+      const missingCode = main(['verify', '--backup-dir', repo.dir, '--dsh-home', home.home, '--no-machine-key', '--json'], missingJson.io);
+      assert.equal(missingCode, 1, 'a missing copy is a verification failure');
+      const missingPayload = JSON.parse(missingJson.lines.join('\n'));
+      assert.equal(missingPayload.old_copies.missing, 1);
+      assert.ok(missingPayload.problems.some((problem) => problem.code === 'BACKUP_VERIFY_OLD_COPY_MISSING'));
+    } finally {
+      repo.cleanup();
+      home.cleanup();
+    }
+  });
+});
