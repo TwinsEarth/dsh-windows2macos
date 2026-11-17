@@ -174,6 +174,34 @@ describe('subplugin: the route and the timer', () => {
     }
   });
 
+
+  it(
+    'answers a confirmed run on Windows with a real machine envelope (the panel path)',
+    { skip: process.platform === 'win32' ? false : 'DPAPI is Windows-only' },
+    async () => {
+      const { home, cleanup: cleanHome } = homeFixture();
+      const { dir, cleanup } = tempDir('w2m-run-win32-');
+      try {
+        const fake = fakeCtx();
+        apply(fake.ctx, { backupDir: join(dir, 'repo'), dshHome: home, ...NO_FIRE });
+        const response = await fake.registrations[0].fetch(
+          new Request(`http://local.invalid${BACKUP_RUN_ROUTE_PATH}`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ confirm: RUN_CONFIRM_TOKEN }),
+          }),
+        );
+        const body = await response.json();
+        assert.equal(body.ok, true, body.reason_code + ': ' + body.detail);
+        assert.equal(body.unlocked_via, 'machine', 'the OS keystore must be what unlocks an unattended run');
+        assert.match(body.snapshot_id, /^\d{8}T\d{6}Z-[0-9a-f]{8}$/u);
+      } finally {
+        cleanup();
+        cleanHome();
+      }
+    },
+  );
+
   it('registers nothing when the row is mounted but disabled', () => {
     const fake = fakeCtx();
     apply(fake.ctx, { backupEnabled: false, backupDir: 'E:\\unused' });

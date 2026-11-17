@@ -40,6 +40,7 @@ import { openRepoKey } from './keystore.mjs';
 import { scanHome } from './scan.mjs';
 import { DEFAULT_KEEP_OLD, rotateForEntry } from './rotation.mjs';
 import { commitSnapshot, makeSnapshotId } from './repo.mjs';
+import { scanFrames } from '../fix/zstd.mjs';
 
 /** Backup scopes. `selected` is only meaningful with an explicit list of session ids. */
 export const SCOPES = Object.freeze(['all', 'active', 'archived', 'selected']);
@@ -117,8 +118,18 @@ export function blockObjectPath(root, sha256) {
  * The bytes are read once: `sha256Hex` and `splitBlocks` need the same buffer, and the resulting description is
  * handed to `buildManifest` so the manifest does not re-read the file.
  *
- * @param {{root: string, file: string, dek: Buffer, dryRun: boolean}} input
- * @returns {{description: object, blocks_new: number, blocks_reused: number, bytes_written: number, bytes_read: number}}
+ * ## A live session log may end mid-frame
+ *
+ * The DSH client appends zstd frames to a session log while it is being used, so a backup read can catch the file
+ * between two writes. That is not corruption of the file, but the captured prefix would restore as a torn log --
+ * so the container is checked with the same frame walker the repair path uses, and a torn tail is retried once
+ * (the appending process usually finishes the frame in milliseconds). If it is still torn, the bytes are stored
+ * anyway (a backup must not silently drop a session) and the session is reported in `torn_sessions` so the
+ * operator and the next run know.
+ *
+ * @param {{root: string, file: string, dek: Buffer, dryRun: boolean, expectZstd?: boolean}} input
+ * @returns {{description: object, blocks_new: number, blocks_reused: number, bytes_written: number, bytes_read: number,
+ *   torn: boolean, container_error: string|null}}
  */
 export function storeFileBlocks(input) {
   let buffer;
@@ -126,6 +137,31 @@ export function storeFileBlocks(input) {
     buffer = fs.readFileSync(input.file);
   } catch (error) {
     return { error: { reason_code: ENGINE_CODES.WRITE_FAILED, detail: `${input.file}: ${error?.code ?? 'unreadable'}` } };
+  }
+  let torn = false;
+  let containerError = null;
+  if (input.expectZstd === true && buffer.length > 0) {
+    const check = (candidate) => {
+      try {
+        return { tornStart: scanFrames(candidate).tornStart !== undefined, error: null };
+      } catch (error) {
+        return { tornStart: false, error: error instanceof Error ? error.message : String(error) };
+      }
+    };
+    let verdict = check(buffer);
+    if (verdict.tornStart) {
+      // One short retry: a session log in the middle of an append is normally complete a few milliseconds later.
+      const retry = fs.existsSync(input.file) ? safeRead(input.file) : null;
+      if (retry !== null) {
+        const second = check(retry);
+        if (second.tornStart === false && second.error === null) {
+          buffer = retry;
+          verdict = second;
+        }
+      }
+    }
+    torn = verdict.tornStart;
+    containerError = verdict.error;
   }
   const blocks = splitBlocks(buffer, BLOCK_BYTES);
   const description = { size: buffer.length, mtime_ms: safeMtime(input.file), sha256: sha256Hex(buffer), blocks };
@@ -153,7 +189,24 @@ export function storeFileBlocks(input) {
     blocksNew += 1;
     bytesWritten += block.length;
   }
-  return { description, blocks_new: blocksNew, blocks_reused: blocksReused, bytes_written: bytesWritten, bytes_read: buffer.length };
+  return {
+    description,
+    blocks_new: blocksNew,
+    blocks_reused: blocksReused,
+    bytes_written: bytesWritten,
+    bytes_read: buffer.length,
+    torn,
+    container_error: containerError,
+  };
+}
+
+/** Read a file, or `null` when it cannot be read. */
+function safeRead(file) {
+  try {
+    return fs.readFileSync(file);
+  } catch {
+    return null;
+  }
 }
 
 /** `statSync().mtimeMs`, or the current time when it cannot be read (the file was already read successfully). */
@@ -247,18 +300,22 @@ export function runBackup(input) {
     // (not snapshot-addressed) -- but the manifest and the rotation records both name it.
     const snapshotId = makeSnapshotId(now);
     const entries = [];
+    const tornSessions = [];
+    const invalidContainers = [];
     let blocksNew = 0;
     let blocksReused = 0;
     let bytesWritten = 0;
     let bytesRead = 0;
 
     for (const session of selection.chosen) {
-      const stored = storeFileBlocks({ root, file: session.file, dek: key.dek, dryRun });
+      const stored = storeFileBlocks({ root, file: session.file, dek: key.dek, dryRun, expectZstd: true });
       if (stored.error !== undefined) return { ok: false, ...stored.error, dry_run: dryRun };
       blocksNew += stored.blocks_new;
       blocksReused += stored.blocks_reused;
       bytesWritten += stored.bytes_written;
       bytesRead += stored.bytes_read;
+      if (stored.torn) tornSessions.push(session.rel);
+      if (stored.container_error !== null) invalidContainers.push({ rel: session.rel, detail: stored.container_error });
       entries.push({
         rel: session.rel,
         file: session.file,
@@ -275,7 +332,7 @@ export function runBackup(input) {
       });
     }
     for (const attachment of scan.attachments.filter((row) => row.ok === true)) {
-      const stored = storeFileBlocks({ root, file: attachment.file, dek: key.dek, dryRun });
+      const stored = storeFileBlocks({ root, file: attachment.file, dek: key.dek, dryRun, expectZstd: false });
       if (stored.error !== undefined) return { ok: false, ...stored.error, dry_run: dryRun };
       blocksNew += stored.blocks_new;
       blocksReused += stored.blocks_reused;
@@ -322,15 +379,33 @@ export function runBackup(input) {
         bytes_read: bytesRead,
         skipped_sessions: selection.skipped,
         unknown_selected: selection.unknown_selected,
+        torn_sessions: tornSessions,
+        invalid_containers: invalidContainers,
         dedupe_ratio: blocksNew + blocksReused === 0 ? 0 : blocksReused / (blocksNew + blocksReused),
+        key_upgraded: key.machine_envelope_added === true,
         duration_ms: Date.now() - started,
       };
     }
 
     const committed = commitSnapshot({ root, manifest, keys: key.keys });
-    const rotations = [];
-    for (const entry of sessionEntries) {
-      rotations.push(rotateForEntry({ root, entry, snapshotId: committed.snapshot_id, keep: keepOld, now }));
+
+    // Rotation happens after the commit, so a rotation failure must not read as "no backup happened".
+    let rotations;
+    try {
+      rotations = sessionEntries.map((entry) => rotateForEntry({ root, entry, snapshotId: committed.snapshot_id, keep: keepOld, now }));
+    } catch (error) {
+      return {
+        ok: false,
+        reason_code: error?.code ?? ENGINE_CODES.WRITE_FAILED,
+        detail: `the snapshot was committed but rotation failed (the previous version pointers were not updated): ${error?.detail ?? error?.message ?? String(error)}`,
+        committed: true,
+        snapshot_id: committed.snapshot_id,
+        digest: committed.digest,
+        sessions: selection.chosen.length,
+        files: manifest.counts.files,
+        dry_run: false,
+        duration_ms: Date.now() - started,
+      };
     }
     const rotated = rotations.filter((row) => row.rotated === true);
 
@@ -351,9 +426,12 @@ export function runBackup(input) {
       bytes_read: bytesRead,
       skipped_sessions: selection.skipped,
       unknown_selected: selection.unknown_selected,
+      torn_sessions: tornSessions,
+      invalid_containers: invalidContainers,
       dedupe_ratio: blocksNew + blocksReused === 0 ? 0 : blocksReused / (blocksNew + blocksReused),
       unlocked_via: key.unlocked_via,
       key_created: key.created,
+      key_upgraded: key.machine_envelope_added === true,
       machine: { available: key.machine?.ok === true, reason: key.machine?.reason ?? null },
       rotated: rotated.length,
       old_versions: rotated.map((row) => row.old_file),

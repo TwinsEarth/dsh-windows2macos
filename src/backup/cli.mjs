@@ -69,6 +69,7 @@ function usage() {
     '  --keep-old <n>      old versions kept per session (default: 10)',
     '  --dry-run           run/gc: report what would happen, write nothing',
     '  --password-stdin    run: read the unlock password from stdin (never argv)',
+    '                      (environment fallback: W2M_BACKUP_PASSWORD, same "never argv" rule)',
     '  --no-machine-key    run: do not use (or create) the OS-keystore machine envelope',
     '',
     'scheduling: the daily run lives in the dsh-backup subplugin (default 22:00 Asia/Shanghai), not in this CLI.',
@@ -219,6 +220,9 @@ export function formatRun(result) {
   const lines = ['w2m-backup run', ''];
   if (result.ok !== true) {
     lines.push(`refused       : ${result.reason_code}${result.detail === undefined ? '' : ` — ${result.detail}`}`);
+    if (result.committed === true) {
+      lines.push(`snapshot      : ${result.snapshot_id} (committed before the failure; the backup itself is durable)`);
+    }
     return lines.join('\n');
   }
   const dry = result.dry_run === true;
@@ -233,6 +237,15 @@ export function formatRun(result) {
   if (result.rotated !== undefined) lines.push(`rotated       : ${result.rotated} old version(s) recorded`);
   if (result.unlocked_via !== undefined) {
     lines.push(`unlocked via  : ${result.unlocked_via}${result.key_created === true ? ' (repository key created)' : ''}`);
+  }
+  if (result.key_upgraded === true) {
+    lines.push('key           : machine envelope added to this repository (future runs need no password here)');
+  }
+  if (Array.isArray(result.torn_sessions) && result.torn_sessions.length > 0) {
+    lines.push(`torn sessions : ${result.torn_sessions.length} captured mid-append (bytes kept; the next run supersedes them)`);
+  }
+  if (Array.isArray(result.invalid_containers) && result.invalid_containers.length > 0) {
+    lines.push(`invalid logs  : ${result.invalid_containers.map((row) => row.rel).join(', ')}`);
   }
   lines.push(`duration      : ${result.duration_ms} ms`);
   if (Array.isArray(result.unknown_selected) && result.unknown_selected.length > 0) {
@@ -278,6 +291,10 @@ export function formatGc(result) {
   lines.push(`references    : ${result.references.blocks} block(s) from ${result.references.snapshots} snapshot(s), ${result.references.old} old version(s), ${result.references.current} current pointer(s)`);
   lines.push(`blocks        : ${result.blocks.scanned} scanned, ${result.blocks.removed} removed, ${result.blocks.kept} kept (${humanBytes(result.blocks.reclaimed_bytes)} reclaimed)`);
   lines.push(`old versions  : ${result.old_versions.pruned} pruned by the retention window`);
+  if (result.tmp !== undefined) lines.push(`tmp leftovers : ${result.tmp.scanned} scanned, ${result.tmp.removed} removed (crashed writers)`);
+  if (result.empty_prefixes_removed !== undefined && result.empty_prefixes_removed > 0) {
+    lines.push(`empty prefixes: ${result.empty_prefixes_removed} removed`);
+  }
   return lines.join('\n');
 }
 

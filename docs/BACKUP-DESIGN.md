@@ -257,6 +257,9 @@
 | `BACKUP_WRITE_FAILED` / `BACKUP_DISK_FULL` | 写入失败 / 卷已满 |
 | `BACKUP_GC_UNSAFE` | 有引用不可读，**拒绝删除任何块** |
 | `BACKUP_SCHEDULE_TIME_INVALID` / `BACKUP_SCHEDULE_ZONE_INVALID` | 计划时间/时区配置非法 |
+| `BACKUP_ROTATION_ENTRY_INVALID` / `BACKUP_ROTATION_WRITE_FAILED` | 轮转输入/写入失败 |
+| `BACKUP_REPO_SNAPSHOT_*` / `BACKUP_REPO_INDEX_LINE_INVALID` | 快照或索引行不可用 |
+| `BACKUP_SCAN_HEADER_UNREADABLE` / `BACKUP_SCAN_NOT_ZSTD` | 会话日志头部不可读/不是 zstd |
 
 ## 12. 未决问题
 
@@ -290,6 +293,22 @@
 **调度**：默认 **22:00 Asia/Shanghai**，配置项 `backupTimes`（`HH:mm` 或 `HH:mm:ss` 数组）/ `backupTimeZone`/`backupCatchUpMs`（默认 12 小时）。机器睡眠跨过 22:00 后唤醒只**补跑一次**；`catchUpMs` 之外不补，避免"每次启动都备一次"。定时器由 `ctx.effect` 拥有，卸载即停。
 
 **未无人值守的凭据边界**：定时任务不能弹窗，也不能存密码，因此只走 `machine` 信封；OS keystore 不可用时具名拒绝（`BACKUP_NO_PERMISSION`），人工用 `w2m-backup run --password-stdin`。
+
+## 13.1 加固与闭环（2026-11-17 复盘后）
+
+这一版把"能写"变成"写坏了也知道"：
+
+| 场景 | 行为 |
+|---|---|
+| 进程在"块已写、快照未提交"之间崩溃 | 块留在 `objects/`；下次备份按内容地址复用（0 新块），不会重写整份 |
+| 快照已提交、轮转步骤失败 | 引擎返回 `ok:false, committed:true, snapshot_id`——备份本身是持久的，失败的是"指针没前移"，不能报成"没备份" |
+| 会话正被客户端追加、尾部帧不完整 | 用运行时同一份 `scanFrames` 检查，重读一次；仍截断则照存字节并在 `torn_sessions` 报告 |
+| 备份运行中执行 gc | gc 先取仓库锁，拿不到即 `BACKUP_LOCKED` 且零删除 |
+| 崩溃留下的 `.tmp-` / 空 objects 前缀 | gc 清理（临时文件仅超过 1 小时，避免删到正在写的那份） |
+| 密码种子仓库遇到可用 OS keystore | 自动追加 `machine` 信封（DEK 不变），之后无人值守运行无需密码 |
+| 还原依据 | 单测把块解回、按清单拼回整文件、与源文件逐字节比对；块被搬到别的地址必须认证失败 |
+
+**可还原性证据**：`test/backup-engine.test.mjs` 的"reassembles every file from its blocks"读 `objects/`、用 DEK 逐个 `openObject`、按清单拼接，再与源文件 `deepEqual`。这条测试是 v3.4.8 还原实现的前置保证。
 
 ## 14. v3.4.7 的接口面（面板将在 v3.4.9 调用）
 

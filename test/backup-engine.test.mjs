@@ -9,6 +9,7 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 
@@ -19,6 +20,17 @@ import { readCurrent, listOldVersions } from '../src/backup/rotation.mjs';
 import { readSnapshot } from '../src/backup/repo.mjs';
 import { scanHome } from '../src/backup/scan.mjs';
 import { sha256Hex } from '../src/backup/manifest.mjs';
+import { openObject } from '../src/backup/crypto.mjs';
+import { openRepoKey } from '../src/backup/keystore.mjs';
+
+/** Identity-faking DPAPI transport: protect echoes base64, unprotect decodes it. */
+function fakeRunner(command, args, input = '') {
+  const text = args.join(' ');
+  if (text.includes('ProtectedData]::Protect') || text.includes('ProtectedData]::Unprotect')) {
+    return { ok: true, status: 0, stdout: input, stderr: '', error: '' };
+  }
+  return { ok: true, status: 0, stdout: 'ok', stderr: '', error: '' };
+}
 import { tempDir, makeHome, registryDocument, sessionLog, event } from './helpers/backup-fixture.mjs';
 
 const PASSWORD = 'correct horse battery staple';
@@ -269,6 +281,160 @@ describe('engine: one writer, and an unwritable target', () => {
       assert.equal(readIndex(root).entries.length, 0);
     } finally {
       cleanup();
+    }
+  });
+});
+
+describe('engine: the backup is actually restorable', () => {
+  it('reassembles every file from its blocks, byte for byte, with the repository key', () => {
+    const { home, cleanup: cleanHome } = homeFixture();
+    const { root, cleanup } = repoFixture();
+    try {
+      const runResult = run(root, home);
+      assert.equal(runResult.ok, true, runResult.detail);
+      const key = openRepoKey({ root, dshHome: home, password: PASSWORD, platform: PLATFORM });
+      assert.equal(key.ok, true, key.detail ?? '');
+      const snapshot = readSnapshot({ root, snapshotId: runResult.snapshot_id });
+      assert.equal(snapshot.manifest.counts.files, 4);
+
+      for (const entry of snapshot.manifest.files) {
+        const parts = [];
+        for (const block of entry.blocks) {
+          const object = join(repoPaths(root).objects, block.sha256.slice(0, 2), block.sha256);
+          assert.ok(existsSync(object), `missing object for block ${block.sha256}`);
+          parts.push(openObject(readFileSync(object), key.dek, { sha256: block.sha256, length: block.length }));
+        }
+        const rebuilt = Buffer.concat(parts);
+        assert.equal(rebuilt.length, entry.size, `block lengths must cover ${entry.rel}`);
+        assert.equal(sha256Hex(rebuilt), entry.sha256, `rebuilt bytes must hash to the manifest digest for ${entry.rel}`);
+        const source = readFileSync(join(home, entry.rel));
+        assert.deepEqual(rebuilt, source, `rebuilt bytes must equal the source for ${entry.rel}`);
+      }
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+
+  it('does not double-encrypt: a block sealed for one identity does not open under another', () => {
+    const { home, cleanup: cleanHome } = homeFixture();
+    const { root, cleanup } = repoFixture();
+    try {
+      const runResult = run(root, home);
+      assert.equal(runResult.ok, true);
+      const key = openRepoKey({ root, dshHome: home, password: PASSWORD, platform: PLATFORM });
+      const snapshot = readSnapshot({ root, snapshotId: runResult.snapshot_id });
+      const entry = snapshot.manifest.files.find((row) => row.kind === 'session');
+      const block = entry.blocks[0];
+      const object = join(repoPaths(root).objects, block.sha256.slice(0, 2), block.sha256);
+      assert.throws(
+        () => openObject(readFileSync(object), key.dek, { sha256: 'f'.repeat(64), length: block.length }),
+        (error) => error.code === 'BACKUP_DECRYPT_AUTH_FAILED',
+        'a block must be bound to the content address it was sealed for',
+      );
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+});
+
+describe('engine: crash resilience', () => {
+  it('reuses the blocks a crashed run wrote but never committed', () => {
+    const { home, cleanup: cleanHome } = homeFixture();
+    const { root, cleanup } = repoFixture();
+    try {
+      const first = run(root, home);
+      assert.equal(first.ok, true);
+      // Simulate a crash between "blocks written" and "snapshot committed": the objects stay, the snapshot and
+      // the index entry are gone.
+      const paths = repoPaths(root);
+      for (const name of fs.readdirSync(paths.snapshots)) fs.rmSync(join(paths.snapshots, name), { recursive: true, force: true });
+      fs.rmSync(paths.index, { force: true });
+
+      const second = run(root, home);
+      assert.equal(second.ok, true, second.detail);
+      assert.equal(second.blocks_new, 0, 'previously written blocks must be reused, not rewritten');
+      assert.equal(second.blocks_reused, first.blocks_new + first.blocks_reused);
+      assert.equal(readIndex(root).entries.length, 1);
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+
+  it('reports the committed snapshot when only the rotation step fails', () => {
+    const { home, cleanup: cleanHome } = homeFixture();
+    const { root, cleanup } = repoFixture();
+    try {
+      const first = run(root, home);
+      assert.equal(first.ok, true);
+      // A file where the workspace's rotation directory should be makes the version-record write fail.
+      fs.writeFileSync(join(root, 'old', '--E-GPT--'), 'not a directory');
+      const target = join(home, 'sessions', '--E-GPT--', 'session-aaaaaaaa-0001', 'session.v4.jsonl.zstd');
+      fs.writeFileSync(target, sessionLog('session-aaaaaaaa-0001', [event(9), event(10)]));
+
+      const second = run(root, home);
+      assert.equal(second.ok, false, 'the rotation failure must make the run report a problem');
+      assert.equal(second.committed, true, 'but the snapshot itself is durable and must be reported as such');
+      assert.match(second.snapshot_id, /^\d{8}T\d{6}Z-[0-9a-f]{8}$/u);
+      assert.equal(readIndex(root).entries.length, 2, 'the index still records the committed snapshot');
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+
+  it('reports a session captured mid-append instead of silently dropping it', () => {
+    const { home, cleanup: cleanHome } = homeFixture();
+    const { root, cleanup } = repoFixture();
+    try {
+      const target = join(home, 'sessions', '--E-GPT--', 'session-aaaaaaaa-0001', 'session.v4.jsonl.zstd');
+      const bytes = fs.readFileSync(target);
+      fs.writeFileSync(target, bytes.subarray(0, bytes.length - 1)); // a torn last frame
+
+      const result = run(root, home);
+      assert.equal(result.ok, true, result.detail);
+      assert.deepEqual(result.torn_sessions, ['sessions/--E-GPT--/session-aaaaaaaa-0001/session.v4.jsonl.zstd']);
+      assert.equal(result.sessions, 3, 'the torn session is still backed up, not skipped');
+
+      const clean = runBackup({ root, dshHome: home, password: PASSWORD, platform: PLATFORM, scope: 'selected', selected: ['session-bbbbbbbb-0002'] });
+      assert.deepEqual(clean.torn_sessions, [], 'a clean snapshot must not report a torn session');
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+});
+
+describe('engine: unlocking the way the scheduler will', () => {
+  it('upgrades a password-only repository so a later run needs no password', () => {
+    const { home, cleanup: cleanHome } = homeFixture();
+    const { root, cleanup } = repoFixture();
+    try {
+      // Seeded offline: a password, no OS keystore.
+      const created = runBackup({ root, dshHome: home, password: PASSWORD, platform: 'linux', machineKey: false });
+      assert.equal(created.ok, true, created.detail);
+      assert.equal(created.key_created, true);
+      assert.equal(created.unlocked_via, 'password');
+      assert.equal(created.key_upgraded, false);
+
+      // First run on a machine that can hold a machine envelope: it upgrades the repository.
+      const upgraded = runBackup({ root, dshHome: home, password: PASSWORD, platform: 'win32', runner: fakeRunner });
+      assert.equal(upgraded.ok, true, upgraded.detail);
+      assert.equal(upgraded.key_upgraded, true);
+      assert.equal(upgraded.unlocked_via, 'password', 'the password is what opened it this time');
+      assert.equal(upgraded.blocks_new, 0, 'an upgrade run must not rewrite the blocks');
+
+      // The point: an unattended run with no password at all now succeeds.
+      const scheduled = runBackup({ root, dshHome: home, platform: 'win32', runner: fakeRunner });
+      assert.equal(scheduled.ok, true, scheduled.detail);
+      assert.equal(scheduled.unlocked_via, 'machine');
+      assert.equal(scheduled.key_upgraded, false);
+      assert.equal(scheduled.blocks_new, 0);
+    } finally {
+      cleanup();
+      cleanHome();
     }
   });
 });

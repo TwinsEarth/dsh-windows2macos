@@ -89,6 +89,40 @@ export function readRepoKeys(root) {
 }
 
 /**
+ * Add a `machine` envelope to an existing key document.
+ *
+ * The case this exists for: a repository seeded offline with a password (or created on a machine whose keystore
+ * was unavailable), then opened on a machine that *does* have an OS keystore. Without the upgrade, every
+ * scheduled run on that machine would refuse with `BACKUP_NO_PERMISSION`, because a timer cannot type a password.
+ *
+ * Existing envelopes are preserved byte-for-byte -- a password someone wrote down keeps working -- and nothing is
+ * added when a machine envelope already exists. Returns the new document; writing it is the caller's decision
+ * (inside the repository lock), so a failed write cannot leave a half-upgraded file.
+ *
+ * @param {object} keys existing `keys.json` document
+ * @param {Buffer} dek the already-unwrapped data key
+ * @param {Buffer} machineSecret
+ * @param {{now?: Date}} [options]
+ * @returns {{added: boolean, keys: object, reason: string|null}}
+ */
+export function addMachineEnvelope(keys, dek, machineSecret, options = {}) {
+  if (keys === null || typeof keys !== 'object' || !Array.isArray(keys.envelopes)) {
+    return { added: false, keys, reason: 'not a key document' };
+  }
+  if (keys.envelopes.some((envelope) => envelope?.kind === 'machine')) {
+    return { added: false, keys, reason: 'already has a machine envelope' };
+  }
+  if (!Buffer.isBuffer(dek) || dek.length === 0) return { added: false, keys, reason: 'no data key to wrap' };
+  if (!Buffer.isBuffer(machineSecret) || machineSecret.length === 0) {
+    return { added: false, keys, reason: 'no machine secret available' };
+  }
+  const wrapped = wrapDek(dek, [{ kind: 'machine', secret: machineSecret }], { now: options.now ?? new Date() });
+  const upgraded = { ...keys, envelopes: [...keys.envelopes, ...wrapped.envelopes] };
+  validateKeysFile(upgraded);
+  return { added: true, keys: upgraded, reason: null };
+}
+
+/**
  * Open the repository key, creating it on first use.
  *
  * @param {{
@@ -131,14 +165,33 @@ export function openRepoKey(input) {
     };
     try {
       const opened = unwrapDek(existing.keys, credentials);
+      // Upgrade opportunity: a repository created with only a password becomes passwordless on this machine the
+      // first time it is opened here with a working OS keystore. Without this, a scheduled run on a machine whose
+      // repository was seeded offline could never succeed -- it has no password to type.
+      let keys = existing.keys;
+      let machineEnvelopeAdded = false;
+      if (machine.ok === true) {
+        try {
+          const upgrade = addMachineEnvelope(keys, opened.dek, machine.secret, { now: input.now });
+          if (upgrade.added === true) {
+            writeJsonAtomic(file, upgrade.keys);
+            keys = upgrade.keys;
+            machineEnvelopeAdded = true;
+          }
+        } catch {
+          // Best effort by design: the run has a working credential, and failing it because an optional
+          // convenience envelope could not be added would be the tail wagging the dog.
+        }
+      }
       return {
         ok: true,
         dek: opened.dek,
-        keys: existing.keys,
+        keys,
         file,
         created: false,
         unlocked_via: opened.kind,
         machine,
+        machine_envelope_added: machineEnvelopeAdded,
         attempts: opened.attempts,
         reason_code: null,
         detail: null,
@@ -153,6 +206,7 @@ export function openRepoKey(input) {
         unlocked_via: null,
         machine,
         attempts: error?.attempts ?? [],
+        machine_envelope_added: false,
         reason_code: KEYSTORE_CODES.NO_PERMISSION,
         detail:
           'this repository cannot be opened with the credentials available on this machine: ' +
@@ -170,6 +224,7 @@ export function openRepoKey(input) {
       unlocked_via: null,
       machine,
       attempts: [],
+      machine_envelope_added: false,
       reason_code: KEYSTORE_CODES.CORRUPT,
       detail: `${existing.file}: ${existing.reason}${existing.detail === null ? '' : ` (${existing.detail})`}`,
     };
@@ -192,6 +247,7 @@ export function openRepoKey(input) {
       unlocked_via: null,
       machine,
       attempts: [],
+      machine_envelope_added: false,
       reason_code: KEYSTORE_CODES.NO_PERMISSION,
       detail:
         'no credential can protect a new backup on this machine: the OS keystore is unavailable ' +
@@ -209,6 +265,7 @@ export function openRepoKey(input) {
       unlocked_via: null,
       machine,
       attempts: [],
+      machine_envelope_added: false,
       reason_code: CRYPTO_CODES.KDF_WEAK,
       detail: `scrypt N=${kdf.N} is below the floor N=${MIN_SCRYPT.N}`,
     };
@@ -227,6 +284,7 @@ export function openRepoKey(input) {
       unlocked_via: null,
       machine,
       attempts: [],
+      machine_envelope_added: false,
       reason_code: error?.code ?? KEYSTORE_CODES.CORRUPT,
       detail: error?.detail ?? String(error?.message ?? error),
     };
@@ -240,6 +298,7 @@ export function openRepoKey(input) {
     unlocked_via: machine.ok === true ? 'machine' : 'password',
     machine,
     attempts: [],
+    machine_envelope_added: false,
     reason_code: null,
     detail: null,
   };

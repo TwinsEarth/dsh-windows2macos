@@ -6,10 +6,12 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, renameSync, utimesSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
 import { join } from 'node:path';
 
-import { gc, collectReferences, listObjects } from '../src/backup/gc.mjs';
+import { gc, collectReferences, listObjects, STALE_TMP_MS } from '../src/backup/gc.mjs';
+import { LOCK_FILE } from '../src/backup/locks.mjs';
 import { ensureLayout, repoPaths } from '../src/backup/layout.mjs';
 import { buildManifest } from '../src/backup/manifest.mjs';
 import { commitSnapshot, makeSnapshotId } from '../src/backup/repo.mjs';
@@ -201,6 +203,69 @@ describe('gc: refusing to guess', () => {
       assert.equal(result.safe, true);
       assert.equal(result.blocks.scanned, 0);
       assert.equal(result.references.snapshots, 0);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe('gc: leftovers and locking', () => {
+  it('removes a crashed writer\'s stale temp files and keeps recent ones', () => {
+    const { root, cleanup } = repoWithSnapshot();
+    try {
+      const objectsRoot = repoPaths(root).objects;
+      const stale = join(objectsRoot, 'aa', '.object.tmp-1-1-1');
+      const recent = join(objectsRoot, 'aa', '.object.tmp-2-2-2');
+      mkdirSync(join(objectsRoot, 'aa'), { recursive: true });
+      writeFileSync(stale, Buffer.alloc(7, 1));
+      writeFileSync(recent, Buffer.alloc(9, 1));
+      const old = new Date(Date.now() - STALE_TMP_MS - 60_000);
+      utimesSync(stale, old, old);
+
+      const before = gc({ root, dryRun: true });
+      assert.equal(before.tmp.scanned, 2);
+      assert.equal(before.tmp.removed, 1, 'only the stale temp file is reported for removal');
+      assert.equal(existsSync(stale), true);
+
+      const result = gc({ root });
+      assert.equal(result.safe, true);
+      assert.equal(result.tmp.removed, 1);
+      assert.equal(result.tmp.reclaimed_bytes, 7);
+      assert.equal(existsSync(stale), false);
+      assert.equal(existsSync(recent), true, 'a recent temp file may belong to a running writer');
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('removes an empty object prefix directory, and never touches the lock', () => {
+    const { root, cleanup } = repoWithSnapshot();
+    try {
+      const prefix = join(repoPaths(root).objects, 'ff');
+      mkdirSync(prefix, { recursive: true });
+      const result = gc({ root });
+      assert.equal(result.safe, true);
+      assert.equal(result.empty_prefixes_removed, 1);
+      assert.equal(existsSync(prefix), false);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('refuses to run while a backup lock is held', () => {
+    const { root, cleanup } = repoWithSnapshot();
+    try {
+      putObject(root, 'e'.repeat(64), 4);
+      const objectsBefore = listObjects(root).length;
+      writeFileSync(
+        join(repoPaths(root).tmp, LOCK_FILE),
+        JSON.stringify({ format: 'w2m-session-backup/lock/1', pid: process.pid, host: os.hostname(), started_at: new Date().toISOString() }),
+      );
+      const result = gc({ root });
+      assert.equal(result.ok, false);
+      assert.equal(result.safe, false);
+      assert.equal(result.reason_code, 'BACKUP_LOCKED');
+      assert.equal(listObjects(root).length, objectsBefore, 'a locked gc must delete nothing');
     } finally {
       cleanup();
     }
