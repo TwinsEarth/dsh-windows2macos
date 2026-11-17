@@ -4,6 +4,17 @@
 > 性质：**只读合并评审**。本评审不合并、不 rebase、不改代码/版本、不发布；唯一新增文件就是本文。
 > 证据边界：只读 `git` 命令 + 分支文件静态阅读（`git show <branch>:<path>`）。未 checkout 分支，未运行分支测试、`scripts/verify-*.mjs`、`scripts/preflight.mjs` 或全量套件；凡未验证处均显式标注。
 
+> **合并状态更新（2026-11-17，人类批准后的执行记录）**
+>
+> 人类已批准按"先 merge HEAD 进分支 + 独立编码修复 commit + ADR/手册补齐"执行合并。§6 的建议顺序已落地：
+>
+> - **分支侧**：`eee9c16` 把 `work/v3.4.6` 合入 `wip/relay-phase2-20261117`（唯一文本冲突 `package.json`，两侧 scripts/bin/exports 全保留）；`aee1a9b` 是**独立编码修复 commit**（5 文件：`server.mjs`、`project-locks`、`project-notifications`、`project-reviews`、`test/cluster-domains`；`git diff work/v3.4.6 -- <file>` 只剩 Phase 2 真实改动，`§`×49、`—`×27、`–`×2、`→`×2 与 `SIGNATURE_MISMATCH/EXPIRED/REPLAY`、device_token 提示文案全部恢复）。
+> - **条件 2（文档）**：新增 `docs/RELAY-CLUSTER-SYNC-PHASE2-DESIGN.md`（Phase 2 ADR，含数据模型/协议兼容/删除语义/安全/回滚/迁移与验证命令）与 `docs/RUNBOOK-RELAY-ROLLING-UPGRADE.md`（滚动升级手册：顺序、混合版本矩阵、逐步门禁、回滚、禁止事项）；v3.0.0 设计 §2.3 已加交叉链接。
+> - **条件 3（门禁）**：`chat-store` / `project-sync` / `cluster-domains` / 新增 `relay-phase2-server` 四个套件全部进入 `package.json#scripts.test` 与 `test:all`，并各有独立脚本；`test/relay-phase2-server.test.mjs` 覆盖 §4 风险 3 点名的 server 接线（feature/路由、chat 持久化与重启、真实 HTTP 跨 relay 拉取、混合版本跳过、tombstone、签名错误文案、套件门禁接线）。
+> - **条件 4（删除语义）**：按"实现闭环"处理——`chat-store.load()` 按 tombstone 过滤消息、`prune()` 删除 tombstoned 会话的死行（tombstone 永久保留）、`server._applyChatRecord()` 拒绝晚到的已删会话消息、`server.deleteChatSession()` 是唯一删除写路径、`POST /v1/fleet/messages` 对退役 `session_id` 返回 400 `SESSION_DELETED`；设备面 HTTP 删除路由**明确推迟**（ADR §5.4 写明理由与后续）。
+> - **保留为发布前证据项**：风险 5（relay 版本标签口径）与风险 6（`verify-relay-cluster-mixed.mjs` 混合版本真实运行、三节点 `verify-relay-cluster-phase2.mjs` 留证）不在本次收口范围，见 ADR §12。
+> - **未执行**：不 push、不改包版本、不跑全量 preflight（主线合并后跑一次）。
+
 ---
 
 ## 1. 结论摘要
