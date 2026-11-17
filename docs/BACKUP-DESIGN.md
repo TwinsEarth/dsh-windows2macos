@@ -1067,7 +1067,7 @@ old/<ws>/<sid>/<ts>-<sha12>.json.enc   # full 新增：该版本的整文件密�
 ```
 
 * **记录新增字段**（纯加法，旧读取者忽略）：`full_copy: {file, sha256, size}`，`file` 是仓库相对路径
-  （正斜杠），`sha256`/`size` 是**明文整文件**的摘要与长度（`openObject` 校验用的同一身份）。
+  （正斜杠），`sha256`/`size` 是**明文整文件**的摘要与长度（`openObject` 的同一身份：其 `sha256` 直接取记录值，`length` 取记录的 `size`）。
 * **明文来源**：不是重读磁盘上已经变化/消失的源文件，而是用该版本记录自己的 blocks 经
   `materialize.rebuildFile`（还原路径的同一实现）重建，并先与记录的 `sha256`/`size` 比对；不一致即拒绝。
 * **封印身份**：复用块对象的信封形状（`sealObject`：`MAGIC | nonce | ciphertext | tag`，AES-256-GCM），
@@ -1125,7 +1125,7 @@ blocks 重建旧版本，不把 `.enc` 计入引用。
 **诚实边界（本次不承诺的）**：
 
 * **还原/归档/校验不用这份副本**：restore/archive/verify 仍走记录 + blocks；`.enc` 是"字面兼容"的额外副本，
-  可以用仓库 DEK 与 `openObject(bytes, dek, {sha256, size, kind:'old'})` 手工验证（测试即这么做的），但还没有
+  可以用仓库 DEK 与 `openObject(bytes, dek, {sha256, length, kind:'old'})` 手工验证（`length` 取记录里的 `size`；测试即这么做的），但还没有
   "从 full 副本直接还原"的命令。要看副本内容，用现有记录即可；副本的用途是让磁盘上真的存在上一版整文件。
 * **镜像不含 `old/`**（§21.2 的"永不复制"不变）：异地副本只承诺已提交快照，`full` 的整文件副本不进镜像。
 * **不去重副本**：`.enc` 按版本整份写；同一会话两次轮转之间未变的字节不会被合并（这正是 opt-in 的代价）。
