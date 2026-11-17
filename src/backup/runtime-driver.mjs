@@ -52,6 +52,17 @@ function validateOne(catalog, artifact) {
     const restore = catalog.createRestore(artifact.header, { validation: 'current' });
     for (const event of artifact.events) restore.decodeRow(event);
     const restored = restore.finish();
+    // The decoder silently drops rows whose seq does not land where it expects (measured: a log whose first event was
+    // seq 5 produced events=0 and no error). A verdict that accounts for fewer events than it was given is not
+    // evidence, so it is reported as a refusal -- the runtime is authoritative, and this is what its refusal looks
+    // like when it happens by omission rather than by exception.
+    if (restored.events.length !== artifact.events.length) {
+      return {
+        ok: false,
+        detail: `the installed Harness accepted only ${restored.events.length} of ${artifact.events.length} event(s); rows were dropped, so this log is not valid and this verdict is not evidence`,
+        events: restored.events.length,
+      };
+    }
     return { ok: true, detail: `validated by the installed Harness (format v${restored.header.version})`, events: restored.events.length };
   } catch (error) {
     const name = error?.constructor?.name ?? 'Error';
@@ -79,6 +90,13 @@ async function validateStreamed(catalog, file) {
     }
     if (restore === null) return { ok: false, detail: 'the NDJSON artifact has no header line', events: 0 };
     const restored = restore.finish();
+    if (restored.events.length !== events) {
+      return {
+        ok: false,
+        detail: `the installed Harness accepted only ${restored.events.length} of ${events} event(s); rows were dropped, so this log is not valid and this verdict is not evidence`,
+        events: restored.events.length,
+      };
+    }
     return { ok: true, detail: `validated by the installed Harness (format v${restored.header.version})`, events: restored.events.length };
   } catch (error) {
     const name = error?.constructor?.name ?? 'Error';

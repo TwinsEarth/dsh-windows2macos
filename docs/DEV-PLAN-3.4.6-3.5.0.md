@@ -255,6 +255,24 @@ D:\DeepSeekHarness\BackUP\
 
 **验收**：真实页面截图级验证（按钮在左侧边栏、面板可操作），四类操作全部成功；错误态（错误密码、磁盘满模拟）有明确中文提示；`npm test` 全绿；preflight GREEN。
 
+
+**G5 收口（2026-11-17）**：证据链分离（doctor 标 `static-prefilter`，安装的 Harness 标 `installed-harness`）；
+driver 新增事件数守恒，修掉 `decodeRow` 对 seq 缺口静默丢行导致"运行时通过"的伪证据；新增 `run --runtime` 的
+`runtime_future_append` 与 `GET /verify?runtime=1`；测试覆盖 driver 只走 `createRestore(validation:'current')`、
+seq 缺口拒绝、dense 通过、运行时证据正/反向。详见 `docs/BACKUP-DESIGN.md` §19。
+
+### 面板与侧边栏入口（v3.4.9）
+
+- UI 半只改 `lib/client.js`（手写、无构建）：`sidebar.panellist` id `w2m-backup`（order 6，GPW 之后）+
+  `main` key `w2m-backup`；`BackupSidebarIcon` + `BackupPanelView`（纯视图）+ `BackupMainPage`（状态/副作用容器）。
+- 状态条数据来自 `GET /api/w2m/backup/run` 新增的内嵌只读 `status`（老宿主回退 `GET /api/w2m/backup/status`）；
+  10 s 只读轮询、卸载清定时器；四操作期间禁用与进度、失败可重试。
+- 还原路径：先 `POST /api/w2m/backup/restore`（不带 apply）取计划 → 勾选/全选 → 二次危险确认 → `{apply:true}`。
+- 解锁：`GET /unlock` 描述 + `POST {confirm:unlock}` 走本机信封；密码路径只在终端（`--password-stdin`），
+  HTTP 面板不接受也不发送密码。
+- i18n：`panel.backup.*` 121 键 × 中/英（内联字典）+ 34 个 reason-code 映射；主题只用宿主 `--dsw-alias-*` 令牌。
+- 测试：`client-bundle` +12 项；`loader-entry`（真实 Chromium + 抛空 profile 安装当前 tarball）新增侧边栏入口/
+  面板/四操作断言（本机实测 10/10 通过；CI 无 Harness 时按名 skip）。
 ### v3.5.0 — 版本治理、Phase 2 与备份增强（里程碑）
 
 **交付**

@@ -19,6 +19,7 @@ import {
   validateCandidate,
   validateCandidates,
 } from '../src/backup/runtime-validate.mjs';
+import fs from 'node:fs';
 import { framesFor, runtimeValidSessionLog, sessionLog, header } from './helpers/backup-fixture.mjs';
 
 const harness = findHarnessInstallation();
@@ -78,6 +79,40 @@ describe('runtime validation: refusing the wrong things', () => {
     assert.equal(verdict.available, true);
     assert.equal(verdict.ok, false);
     assert.match(verdict.detail, /no verdict|refused|app\.asar/u);
+  });
+});
+
+describe('G5: the installed Harness is the only evidence path', () => {
+  it('the driver delegates to the catalog with validation=current and never to our own validator', () => {
+    const driver = fs.readFileSync(new URL('../src/backup/runtime-driver.mjs', import.meta.url), 'utf8');
+    assert.match(driver, /sessionFormatCatalog/);
+    assert.match(driver, /createRestore\(/, 'the verdict must come from the catalog restore');
+    assert.match(driver, /validation: 'current'/, 'mode=current is what selects the installed Session validation');
+    assert.doesNotMatch(driver, /diagnoseSessionBuffer|splitFrames/, 'the driver must not use the static pre-filter as evidence');
+  });
+
+  it('the static validator is labelled a pre-filter wherever it is reported', () => {
+    const future = fs.readFileSync(new URL('../src/backup/future-append.mjs', import.meta.url), 'utf8');
+    assert.match(future, /evidence:\s*'static-prefilter'/u);
+    const verify = fs.readFileSync(new URL('../src/backup/verify.mjs', import.meta.url), 'utf8');
+    assert.match(verify, /evidence:\s*'static-prefilter'/u);
+    assert.match(verify, /evidence:\s*'installed-harness'/u);
+  });
+});
+
+describe('G5: the verdict must account for every row', () => {
+  it('refuses a log whose rows the decoder would silently drop (seq gap)', { skip: harness === null ? 'no DeepSeek Harness installation on this machine' : false }, () => {
+    const gap = framesFor([header('session-aaaaaaaa-0001'), { type: 'turn/start', seq: 5, time: 1, data: { turn: 1 } }]);
+    const verdict = runtimeValidate({ buffer: gap });
+    assert.equal(verdict.ok, false);
+    assert.match(verdict.detail, /accepted only \d+ of \d+ event/u);
+    assert.equal(verdict.events, 0);
+  });
+
+  it('still accepts a dense log and reports its event count', { skip: harness === null ? 'no DeepSeek Harness installation on this machine' : false }, () => {
+    const verdict = runtimeValidate({ buffer: runtimeValidSessionLog('session-aaaaaaaa-0001') });
+    assert.equal(verdict.ok, true, verdict.detail);
+    assert.equal(verdict.events, 2);
   });
 });
 

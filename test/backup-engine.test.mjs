@@ -16,13 +16,16 @@ import { join, relative } from 'node:path';
 import { runBackup, selectSessions, normalizeScope, blockObjectPath } from '../src/backup/engine.mjs';
 import { ensureLayout, repoPaths } from '../src/backup/layout.mjs';
 import { sha256Hex } from '../src/backup/manifest.mjs';
-import { framesFor, header } from './helpers/backup-fixture.mjs';
+import { framesFor, header, runtimeValidHome } from './helpers/backup-fixture.mjs';
 import { readIndex } from '../src/backup/repo.mjs';
 import { readCurrent, listOldVersions } from '../src/backup/rotation.mjs';
 import { readSnapshot } from '../src/backup/repo.mjs';
 import { scanHome } from '../src/backup/scan.mjs';
 import { openObject } from '../src/backup/crypto.mjs';
 import { openRepoKey } from '../src/backup/keystore.mjs';
+import { findHarnessInstallation } from '../src/backup/runtime-validate.mjs';
+
+const HARNESS = findHarnessInstallation();
 
 /** Identity-faking DPAPI transport: protect echoes base64, unprotect decodes it. */
 function fakeRunner(command, args, input = '') {
@@ -234,6 +237,55 @@ describe('engine: a first and a second backup', () => {
       assert.equal(result.reason_code, 'MANIFEST_REL_PATH');
       assert.match(result.detail, /cannot be expressed as a manifest rel path/u);
       assert.deepEqual(readdirSync(repoPaths(repo).objects), [], 'fail-fast: no block object is written for a bad rel');
+    } finally {
+      cleanRepo();
+      cleanup();
+    }
+  });
+
+  it(
+    'asks the installed Harness about the appended logs when runtime evidence is requested (G5)',
+    { skip: HARNESS === null ? 'no DeepSeek Harness installation on this machine' : false },
+    () => {
+      const home = runtimeValidHome();
+      const { root: repo, cleanup: cleanRepo } = repoFixture();
+      try {
+        const result = runBackup({
+          root: repo,
+          dshHome: home.home,
+          password: PASSWORD,
+          platform: 'linux',
+          machineKey: false,
+          runtimeFutureAppend: true,
+        });
+        assert.equal(result.ok, true, result.detail);
+        assert.equal(result.future_append.evidence, 'static-prefilter');
+        assert.equal(result.runtime_future_append.available, true);
+        assert.equal(result.runtime_future_append.evidence, 'installed-harness');
+        assert.equal(result.runtime_future_append.checked, result.sessions);
+        assert.equal(result.runtime_future_append.failed, 0);
+      } finally {
+        cleanRepo();
+        home.cleanup();
+      }
+    },
+  );
+
+  it('still reports runtime evidence as failed when the appended log is refused (no static fallback)', () => {
+    const { home, cleanup } = homeFixture();
+    const { root: repo, cleanup: cleanRepo } = repoFixture();
+    try {
+      const broken = framesFor([
+        header('session-aaaaaaaa-0001'),
+        { type: 'turn/start', seq: 5, time: 1, data: { turn: 1 } },
+      ]);
+      fs.writeFileSync(join(home, 'sessions', '--E-GPT--', 'session-aaaaaaaa-0001', 'session.v4.jsonl.zstd'), broken);
+      const result = runBackup({ root: repo, dshHome: home, password: PASSWORD, platform: 'linux', machineKey: false, runtimeFutureAppend: true });
+      assert.equal(result.ok, true, result.detail);
+      if (result.runtime_future_append.available === true) {
+        assert.ok(result.runtime_future_append.failed >= 1, 'the runtime must not accept the broken log');
+        assert.equal(result.runtime_future_append.sessions.length, result.runtime_future_append.failed);
+      }
     } finally {
       cleanRepo();
       cleanup();

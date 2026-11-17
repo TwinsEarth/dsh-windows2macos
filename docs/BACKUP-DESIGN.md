@@ -519,3 +519,86 @@ v3.4.8 把还原前副本放在 `$DSH_HOME/sessions/.w2m-restore-backups/`，而
 
 测试：扫描器"遗留副本目录不被当成会话"、引擎"坏 rel 在写块前拒绝"各一条；仓库本身未受影响（快照/索引仍 2 条，
 孤儿块由 gc 清理）。
+
+## 18. 面板与侧边栏入口（v3.4.9）
+
+UI 半只有一个文件：`lib/client.js`（手写、由 `window.__ModuleLoader__.load` 加载，无构建步骤）。新增
+「备份&还原」面板与 GPW 同构，占两个槽位：
+
+| 槽位 | 注册 | 行为 |
+|---|---|---|
+| `sidebar.panellist` | `id: 'w2m-backup'`, `order: 6`（GPW 的 4 之后） | 左侧导航一行：内联 SVG（`currentColor`）+ 文案；点击切换主面板 |
+| `main` | `key: 'w2m-backup'`（必须等于 panellist id） | 面板页：状态条、四个一键操作、还原计划卡、解锁卡、日志区 |
+
+**面板内容**
+
+* **状态条**：仓库目录、初始化/加密、快照数、剩余空间、计划（22:00 Asia/Shanghai）与下次时间、上次备份摘要、
+  运行态、注册表复查结果；数据来自 `GET /api/w2m/backup/run` 内嵌的只读 `status`（v3.4.9 新增；老宿主回退到
+  `GET /api/w2m/backup/status`）。
+* **四类一键操作**：`run`（立即备份，`{confirm:'run',scope:'all'}`）、`restore`（先取计划 → 展示
+  new/identical/differs 与勾选列表 → 二次危险确认 → `{confirm:'restore',apply:true,sessions}`）、
+  `archive`（`{confirm:'archive',scope:'archived'|'all'}`）、`verify`（`GET /verify`，展示 counts/problems/
+  future_append/runtime）。操作期间按钮禁用、进度可见；失败可重试。
+* **解锁卡**：`GET /unlock` 描述两条路径——本机信封按钮 `POST {confirm:'unlock'}`；密码路径**不在 HTTP 上传输**，
+  面板显示终端命令 `w2m-backup unlock --check --password-stdin`。`BACKUP_NO_PERMISSION` 的文案为
+  「没有权限：请用原账户登录，或输入解锁密码」（`account` 信封已按 spike 结论不做，见 §6/§15.5）。
+* **日志区**：当前页内最多 50 条操作记录（时间、结果码、detail），失败时同时显示错误卡。
+* **刷新**：挂载即读状态；之后 10 s 轮询只读状态（`typeof window !== 'undefined'` 守卫），页面卸载清定时器；
+  每个操作完成后立即重读状态。
+* **i18n**：`panel.backup.*` 共 121 个键 × 中/英，随既有 `registerDictionaries` 注册（内联字典是该 bundle 的
+  实际机制；`locale/*.json` 只是商店清单元数据）；34 个 reason-code 到文案的映射。
+* **主题**：只用宿主 `--dsw-alias-*` 设计令牌，无字面色值、无媒体查询（深浅色由宿主切换）；窄宽度用
+  `auto-fit` 网格。
+
+**验证**
+
+* `test/client-bundle.test.mjs`：新增 12 个 describe/测试——注册对与 `key===id`、order 在 GPW 后、SVG
+  `currentColor`、四操作标记齐全、解锁双分支且**无密码输入框**、备份段静态扫描无 `type:'password'`/含密码的
+  请求体、五条路由齐全、危险确认仅在 armed 后出现、**可重渲染 fake React 驱动四操作**（校验确认令牌、
+  restore 先计划后 apply 且只带选中会话、unlock 只发确认令牌）、中英字典完整性、日志上限 50、同文档挂载两次
+  只有一个 `<style>` 且无残留定时器。
+* `test/loader-entry.test.mjs`（真实 Chromium，抛空 profile 安装当前 tarball）：新增断言——左侧边栏出现
+  `[data-w2m-backup-sidebar]`、点击打开 `[data-w2m-backup-panel]`、四个 `data-w2m-backup-action` 齐全。
+  该 profile 默认 `dsh-backup` 行关闭，因此面板显示"需要启用该行"的状态；四类操作的**写入**由
+  `test/backup-run.test.mjs` 的路由级测试覆盖（含 Windows 真实 DPAPI 与确认令牌拒绝）。
+
+## 19. G5 收口：校验只用运行时同一份代码（v3.4.6 补全）
+
+复盘 G5 的原文是"结论性校验必须用运行时同一份代码（`restoreCurrent → Session.fromRestore`，`mode=current`）；
+自写解析器只能**预筛**，不能作为证据"。v3.4.8 起接线，v3.4.9 收口，并修掉一个只有真实运行时才会暴露的漏洞。
+
+### 19.1 证据链（谁是证据，谁是预筛）
+
+| 层 | 文件 | 结论的地位 |
+|---|---|---|
+| 静态预筛 | `src/util/session-validate.mjs`（doctor） | 便宜、可离线、覆盖复盘实测的失败类；**不是证据**。它给出的"未来追加"结论带 `evidence: 'static-prefilter'` 标签 |
+| 运行时终审 | `src/backup/runtime-validate.mjs` + `runtime-driver.mjs` | 用 `ELECTRON_RUN_AS_NODE=1` 启动安装的 Harness 本体，调用 `sessionFormatCatalog.createRestore(header, {validation:'current'})` → 逐行 `decodeRow` → `finish()`；结论带 `evidence: 'installed-harness'` |
+| 门禁 | `validateCandidate` / `validateCandidates` | 先静态预筛（失败即拒，不 spawn）；通过后由运行时终审；`requireRuntime` 为真时**没有安装就拒绝**（`BACKUP_RUNTIME_UNAVAILABLE`），只有 `--allow-static-validation` 才接受纯静态证据，并在结果里写 `runtime_verified:false` |
+
+**行数守恒（v3.4.9 新增的硬规则）**：`decodeRow` 对 seq 不落位的行是**静默丢弃**的（实测：首事件 seq=5 的日志
+得到 `events: 0` 且不抛错）。因此 driver 现在要求 `restored.events.length === 输入事件数`，否则判为
+`ok:false`，detail 写明"accepted only N of M event(s); rows were dropped, so this verdict is not evidence"。
+没有这条规则，"运行时通过"会变成"运行时没吭声"——正是 G5 要禁的那种伪证据。
+
+### 19.2 接线点
+
+* **还原/归档还原**：`planRestore` / `planRestoreFromArchive` 对每份候选调用 `validateCandidates`，把"原日志"和
+  "原日志 + 一帧合法追加"**一起**交给运行时批量终审（§17.2）；任一失败整单拒绝。
+* **引擎（`run --runtime`）**：可选地对每个会话的"追加后日志"做一次运行时批量终审，结果写入
+  `runtime_future_append: {available, evidence:'installed-harness', checked, failed, sessions}`；默认关闭
+  （171 MB 真实 home 会多花约 20 s），静态报告同时保留并标 `static-prefilter`。
+* **verify（`--runtime` / `GET /api/w2m/backup/verify?runtime=1`）**：对每个快照会话的**原日志与追加后日志**
+  同批终审，失败码 `BACKUP_RUNTIME_REJECTED` / `BACKUP_RUNTIME_APPEND_FAILED`。
+* **批量与流式**：小 artifact 每约 96 MiB 一批；单会话 JSON 超过 32 MiB 走 NDJSON 流式 driver（真实 152 MB /
+  370 MB 会话实测通过）；verdict 缓存按"安装身份 + 内容摘要"分键，避免拿另一份安装的结论复用。
+
+### 19.3 测试
+
+* `test/backup-runtime.test.mjs`：driver 静态证明（含 `createRestore(` 与 `validation: 'current'`，且**不含**
+  `diagnoseSessionBuffer`/`splitFrames`——运行时 driver 不许调用我们的解析器）；证据标签检查；seq 缺口日志
+  被拒绝且事件数为 0；dense 日志通过且事件数为 2；无安装时 `BACKUP_RUNTIME_UNAVAILABLE`；`requireRuntime:false`
+  时静态证据显式降级。
+* `test/backup-engine.test.mjs`：`run --runtime` 正向（15/15 类场景用 runtime-valid home）与反向（坏日志的
+  追加 artifact 被拒，`failed ≥ 1`，无静态回退）。
+* `test/backup-verify.test.mjs`：`--runtime` 连 append 后 artifact 一起终审。
+* `test/loader-entry.test.mjs`：真实 Chromium 页面（抛空 profile 安装当前 tarball）断言面板入口与四操作标记。

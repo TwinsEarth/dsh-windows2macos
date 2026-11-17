@@ -41,6 +41,7 @@ import path from 'node:path';
 
 import { createDailyScheduler, DEFAULT_CATCH_UP_MS } from './schedule.mjs';
 import { runBackup, SCOPES } from '../backup/engine.mjs';
+import { buildStatus } from '../backup/routes.mjs';
 import { describeBackupSchedule, normalizeBackupSchedule } from '../backup/schedule.mjs';
 import { DEFAULT_KEEP_OLD } from '../backup/rotation.mjs';
 
@@ -260,15 +261,26 @@ export function apply(ctx, config = {}) {
         methods: ['GET', 'POST'],
         requestBody: 'buffered',
         fetch: async (request) => {
-          const describe = () => ({
-            ok: true,
-            enabled: true,
-            backup_dir: cfg.backup_dir,
-            dsh_home: cfg.dsh_home,
-            schedule: describeBackupSchedule({ enabled: true, times: cfg.times, timeZone: cfg.time_zone }),
-            scheduler: scheduler.describe(),
-            state,
-          });
+          const describe = () => {
+            // Read-only and cheap: the panel shows repository facts (initialized, snapshots, latest) without a
+            // second round-trip, and a probe failure must not take the whole status payload down.
+            let status = null;
+            try {
+              status = buildStatus({ backupDir: cfg.backup_dir, dshHome: cfg.dsh_home });
+            } catch (error) {
+              status = { ok: false, reason_code: 'BACKUP_STATUS_FAILED', detail: error?.message ?? String(error) };
+            }
+            return {
+              ok: true,
+              enabled: true,
+              backup_dir: cfg.backup_dir,
+              dsh_home: cfg.dsh_home,
+              schedule: describeBackupSchedule({ enabled: true, times: cfg.times, timeZone: cfg.time_zone }),
+              scheduler: scheduler.describe(),
+              status,
+              state,
+            };
+          };
           if (request.method === 'GET') return Response.json(describe(), { headers: NO_STORE });
           if (request.method !== 'POST') {
             return Response.json({ ok: false, reason_code: 'METHOD_NOT_ALLOWED', detail: `${request.method} is not a method this route answers` }, { status: 405, headers: NO_STORE });
@@ -344,8 +356,10 @@ export function apply(ctx, config = {}) {
         methods: ['GET'],
         fetch: async (request) => {
           if (request.method !== 'GET') return refuse('METHOD_NOT_ALLOWED', `${request.method} is not a method this route answers`, 405);
-          // Read-only but expensive: it decrypts every block of every snapshot to re-hash it.
-          const result = verifyRepo({ ...unlockInput(), futureAppend: true });
+          // Read-only but expensive: it decrypts every block of every snapshot to re-hash it. With ?runtime=1 it
+          // also asks the installed Harness about every log and every appended log (G5), which is slower.
+          const runtime = new URL(request.url).searchParams.get('runtime') === '1';
+          const result = verifyRepo({ ...unlockInput(), futureAppend: true, runtime });
           state.last_verify = { at: new Date().toISOString(), ok: result.ok, counts: result.counts, problems: result.problems.length };
           return Response.json(result, { headers: NO_STORE });
         },

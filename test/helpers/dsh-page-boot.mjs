@@ -491,6 +491,23 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
       await new Promise((resolve) => setTimeout(resolve, 400));
       const opsGone = await read(`return {closed:document.querySelector('.w2mGpw_fullPage')===null};`);
       report.opsProbe = { opsOpened, opsPanel, opsQueueTab, opsQueueSection, opsClosed, opsGone };
+      // v3.4.9: the backup entry and the page it switches to. The profile ships the dsh-backup row disabled by
+      // default, so the panel is expected to render its "route missing / needs enabling" state: the probe checks
+      // the seat, the page, and the four action markers, not the host routes (those have their own tests).
+      const backupOpened = await read(`const b=document.querySelector('[data-w2m-backup-sidebar]'); if(b===null)return{found:false}; b.click(); return{found:true};`);
+      await new Promise((resolve) => setTimeout(resolve, 900));
+      const backupPanel = await read(`
+        const p=document.querySelector('[data-w2m-backup-panel]');
+        return {
+          open: p!==null,
+          title: (document.querySelector('.w2mBackup_title')?.textContent ?? null),
+          actions: [...document.querySelectorAll('[data-w2m-backup-action]')].map((x) => x.getAttribute('data-w2m-backup-action')),
+          cards: p===null?0:p.querySelectorAll('.w2mBackup_card').length,
+          hasUnlock: (p?.querySelector('[data-w2m-backup-unlock]') ?? null)!==null,
+          text: (p?.innerText ?? '').slice(0, 240),
+        };
+      `);
+      report.backupProbe = { backupOpened, backupPanel };
       await evaluate(`
         (async () => {
           const r = await fetch('/api/w2m/decisions?includeArchived=1');

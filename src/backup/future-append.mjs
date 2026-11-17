@@ -65,7 +65,9 @@ export function appendLegalEvent(buffer, options = {}) {
  * Simulate the next append and validate the result with the static pre-filter.
  *
  * @param {Buffer} buffer
- * @returns {{ok: boolean, codes: string[], detail: object|null, appended_bytes: number}}
+ * @returns {{ok: boolean, codes: string[], detail: object|null, appended_bytes: number, evidence: string}}
+ *   `evidence` is always `'static-prefilter'`: G5 says this may pre-screen but must never be quoted as the gate;
+ *   the installed Harness's verdict (`runtime-validate.mjs`) is the evidence.
  */
 export function futureAppendVerdict(buffer) {
   let appended;
@@ -80,5 +82,6 @@ export function futureAppendVerdict(buffer) {
     codes: verdict.codes,
     detail: verdict.detail ?? null,
     appended_bytes: appended.length - buffer.length,
+    evidence: 'static-prefilter',
   };
 }

@@ -38,7 +38,8 @@ import { writeFileAtomic } from './atomic.mjs';
 import { withRepoLock } from './locks.mjs';
 import { openRepoKey } from './keystore.mjs';
 import { detectMachineKeySupport } from './machine-key.mjs';
-import { futureAppendVerdict } from './future-append.mjs';
+import { appendLegalEvent, futureAppendVerdict } from './future-append.mjs';
+import { buildArtifactFromBuffer, runtimeValidateBatch } from './runtime-validate.mjs';
 import { scanHome } from './scan.mjs';
 import { DEFAULT_KEEP_OLD, rotateForEntry } from './rotation.mjs';
 import { commitSnapshot, makeSnapshotId } from './repo.mjs';
@@ -195,6 +196,16 @@ export function storeFileBlocks(input) {
   // extra decode and turns a silent problem into a reported one. It does not refuse the backup: preserving the
   // evidence is the point; restore is where a failing log is refused.
   const future = input.expectZstd === true && input.futureAppend !== false ? futureAppendVerdict(buffer) : null;
+  // G5 runtime evidence: the appended log is decoded here, while the bytes are still in hand, and validated once
+  // for all sessions after the loop. Only when the caller explicitly asked for runtime evidence.
+  let runtimeArtifact;
+  if (input.expectZstd === true && input.runtimeFutureAppend === true && input.dryRun !== true) {
+    try {
+      runtimeArtifact = buildArtifactFromBuffer(appendLegalEvent(buffer));
+    } catch {
+      runtimeArtifact = undefined;
+    }
+  }
   return {
     description,
     blocks_new: blocksNew,
@@ -204,6 +215,7 @@ export function storeFileBlocks(input) {
     torn,
     container_error: containerError,
     future_append: future,
+    runtime_artifact: runtimeArtifact,
   };
 }
 
@@ -346,14 +358,16 @@ export function runBackup(input) {
     const entries = [];
     const tornSessions = [];
     const invalidContainers = [];
-    const futureAppend = { checked: 0, failed: 0, sessions: [] };
+    const futureAppend = { checked: 0, failed: 0, sessions: [], evidence: 'static-prefilter' };
+    // G5 runtime evidence: appended logs are queued and validated once, at the end, by the installed Harness.
+    const runtimeQueue = input.runtimeFutureAppend === true ? [] : null;
     let blocksNew = 0;
     let blocksReused = 0;
     let bytesWritten = 0;
     let bytesRead = 0;
 
     for (const session of selection.chosen) {
-      const stored = storeFileBlocks({ root, file: session.file, dek: key.dek, dryRun, expectZstd: true, futureAppend: input.futureAppend });
+      const stored = storeFileBlocks({ root, file: session.file, dek: key.dek, dryRun, expectZstd: true, futureAppend: input.futureAppend, runtimeFutureAppend: input.runtimeFutureAppend });
       if (stored.error !== undefined) return { ok: false, ...stored.error, dry_run: dryRun };
       blocksNew += stored.blocks_new;
       blocksReused += stored.blocks_reused;
@@ -367,6 +381,9 @@ export function runBackup(input) {
           futureAppend.failed += 1;
           futureAppend.sessions.push({ rel: session.rel, codes: stored.future_append.codes });
         }
+      }
+      if (runtimeQueue !== null && stored.runtime_artifact !== undefined) {
+        runtimeQueue.push({ rel: session.rel, artifact: stored.runtime_artifact });
       }
       entries.push({
         rel: session.rel,
@@ -415,6 +432,22 @@ export function runBackup(input) {
       exclusions: scan.exclusions,
     });
 
+    // G5: one runtime process validates every appended log. A failed measurement is reported, never turned into
+    // a pass; a refused appended log is reported with the Harness's own detail.
+    let runtimeFutureAppend = null;
+    if (runtimeQueue !== null && runtimeQueue.length > 0) {
+      const batch = runtimeValidateBatch({ artifacts: runtimeQueue.map((row) => row.artifact), env: input.env });
+      const summary = { available: batch.available, evidence: 'installed-harness', checked: runtimeQueue.length, failed: 0, sessions: [] };
+      for (const [index, row] of runtimeQueue.entries()) {
+        const verdict = batch.verdicts[index] ?? { ok: false, detail: 'no verdict' };
+        if (verdict.ok !== true) {
+          summary.failed += 1;
+          summary.sessions.push({ rel: row.rel, detail: verdict.detail });
+        }
+      }
+      runtimeFutureAppend = summary;
+    }
+
     if (dryRun) {
       return {
         ok: true,
@@ -434,6 +467,7 @@ export function runBackup(input) {
         torn_sessions: tornSessions,
         invalid_containers: invalidContainers,
         future_append: futureAppend,
+        runtime_future_append: runtimeFutureAppend,
         dedupe_ratio: blocksNew + blocksReused === 0 ? 0 : blocksReused / (blocksNew + blocksReused),
         key_upgraded: key.machine_envelope_added === true,
         duration_ms: Date.now() - started,
@@ -482,6 +516,7 @@ export function runBackup(input) {
       torn_sessions: tornSessions,
       invalid_containers: invalidContainers,
       future_append: futureAppend,
+      runtime_future_append: runtimeFutureAppend,
       dedupe_ratio: blocksNew + blocksReused === 0 ? 0 : blocksReused / (blocksNew + blocksReused),
       unlocked_via: key.unlocked_via,
       key_created: key.created,

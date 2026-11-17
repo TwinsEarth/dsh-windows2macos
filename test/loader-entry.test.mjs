@@ -721,6 +721,15 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
       assert.equal(ops.opsQueueSection?.section, true, 'the queue section renders');
       assert.equal(ops.opsQueueSection?.openButton, true, 'the queue section offers opening the queue window');
       assert.equal(ops.opsGone?.closed, true, 'the operation-panel overlay closes again');
+      const backup = page.backupProbe ?? {};
+      assert.equal(backup.backupOpened?.found, true, 'the left sidebar carries the backup entry (v3.4.9)');
+      assert.equal(backup.backupPanel?.open, true, 'clicking the backup entry opens its main page');
+      for (const action of ['run', 'restore', 'archive', 'verify']) {
+        assert.ok(
+          Array.isArray(backup.backupPanel?.actions) && backup.backupPanel.actions.includes(action),
+          `the backup panel renders the ${action} one-click operation (actions: ${JSON.stringify(backup.backupPanel?.actions)})`,
+        );
+      }
       if (parity.rightTab?.marker === '1') {
         assert.equal(parity.rightTab.marker, '1');
       } else {

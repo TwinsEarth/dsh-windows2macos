@@ -80,8 +80,8 @@ export function verifyRepo(input) {
   const problems = [];
   const snapshots = [];
   const counts = { snapshots: 0, files: 0, blocks: 0, bytes: 0, old: 0, current: 0 };
-  const futureAppend = { checked: 0, failed: 0 };
-  const runtimeChecked = { checked: 0, failed: 0 };
+  const futureAppend = { checked: 0, failed: 0, evidence: 'static-prefilter' };
+  const runtimeChecked = { checked: 0, failed: 0, evidence: 'installed-harness' };
   const state = openRepo({ root: input.root, dshHome: input.dshHome });
   if (state.initialized !== true) {
     return {

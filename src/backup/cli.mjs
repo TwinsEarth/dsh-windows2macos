@@ -173,7 +173,7 @@ function usage() {
     '  --allow-live-home   restore: write even though the DSH client is running (read-back + recheck protocol)',
     '  --registry-recheck <ms>  restore --apply: wait this long, then re-check the registry once (client save)',
     '  --workspace-path <p> restore: attach a restored session to this directory if the workspace is absent',
-    '  --runtime           verify: also confirm every session with the installed Harness validator',
+    '  --runtime           verify/run: confirm with the installed Harness validator (G5), not only the pre-filter',
     '  --check             unlock: attempt the unlock instead of only describing it',
     '  --password-stdin    run/restore/unlock --check: read the password from stdin (never argv)',
     '                      (environment fallback: W2M_BACKUP_PASSWORD, same "never argv" rule)',
@@ -384,11 +384,19 @@ export function formatRun(result) {
   }
   if (result.future_append !== undefined) {
     lines.push(
-      `future append : ${result.future_append.checked - result.future_append.failed}/${result.future_append.checked} session(s) still load after one legal append`,
+      `future append : ${result.future_append.checked - result.future_append.failed}/${result.future_append.checked} session(s) still load after one legal append (static pre-filter)`,
     );
     for (const failing of result.future_append.sessions ?? []) {
       lines.push(`  - ${failing.rel} ${(failing.codes ?? []).join(', ')}`);
     }
+  }
+  if (result.runtime_future_append !== undefined && result.runtime_future_append !== null) {
+    const runtime = result.runtime_future_append;
+    lines.push(
+      `runtime append: ${runtime.checked - runtime.failed}/${runtime.checked} validated by the installed Harness` +
+        `${runtime.available ? '' : ' (unavailable: this is not runtime evidence)'}`,
+    );
+    for (const failing of runtime.sessions ?? []) lines.push(`  - ${failing.rel} ${failing.detail ?? ''}`.trimEnd());
   }
   if (Array.isArray(result.invalid_containers) && result.invalid_containers.length > 0) {
     lines.push(`invalid logs  : ${result.invalid_containers.map((row) => row.rel).join(', ')}`);
@@ -596,6 +604,7 @@ export function main(argv, io = {}) {
       keepOldPerSession: options.keepOld ?? undefined,
       dryRun: options.dryRun,
       futureAppend: options.noFutureAppend === true ? false : undefined,
+      runtimeFutureAppend: options.runtime === true,
       password: passwordFor(options, io),
       machineKey: options.noMachineKey === true || (io.env ?? process.env).W2M_BACKUP_NO_MACHINE_KEY === '1' ? false : undefined,
     });

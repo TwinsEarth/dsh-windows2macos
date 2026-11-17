@@ -348,8 +348,8 @@ describe('client bundle: the activation contract', () => {
       () => exports.apply(ctx),
       'an undeclared service read throws in Cordis and takes the whole app down; the bundle must read only what it declares',
     );
-    assert.deepEqual(registry.announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, 'conversation.composer.dock', 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', 'sidebar.panellist', 'main', SEAT], 'the entry still has to take its seat');
-    assert.equal(registry.registered.length, 18);
+    assert.deepEqual(registry.announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'sidebar.panellist', 'main', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, 'conversation.composer.dock', 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', 'sidebar.panellist', 'main', SEAT], 'the entry still has to take its seat');
+    assert.equal(registry.registered.length, 20);
     assert.equal(locale.registered.has('w2m.target'), true, 'the dictionaries go to the locale service when there is one');
   });
 
@@ -453,8 +453,8 @@ describe('client bundle: the seat it registers into', () => {
 
   it('announces and registers all five composer controls plus the sidebar and update sections into conversation.input.left', () => {
     const { announced, registered } = applyTo();
-    assert.deepEqual(announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, 'conversation.composer.dock', 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', 'sidebar.panellist', 'main', SEAT]);
-    assert.equal(registered.length, 18);
+    assert.deepEqual(announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'sidebar.panellist', 'main', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, 'conversation.composer.dock', 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', 'sidebar.panellist', 'main', SEAT]);
+    assert.equal(registered.length, 20);
     assert.equal(registered[0].options.name, SEAT);
   });
 
@@ -502,7 +502,7 @@ describe('client bundle: the seat it registers into', () => {
     };
     const { exports } = loadBundle();
     assert.doesNotThrow(() => exports.apply(ctx));
-    assert.equal(registered.length, 18);
+    assert.equal(registered.length, 20);
   });
 });
 
@@ -811,6 +811,125 @@ function findBy(node, predicate, found = []) {
     for (const child of node.children) findBy(child, predicate, found);
   }
   return found;
+}
+
+/** Every string child of the element tree, in render order (used to read the panel's copy). */
+function collectText(node, found = []) {
+  if (Array.isArray(node)) {
+    for (const child of node) collectText(child, found);
+    return found;
+  }
+  if (typeof node === 'string') {
+    found.push(node);
+    return found;
+  }
+  if (node === null || typeof node !== 'object') return found;
+  if (Array.isArray(node.children)) {
+    for (const child of node.children) collectText(child, found);
+  }
+  return found;
+}
+
+/**
+ * A hook-capable React stand-in that mounts one component, re-renders it, **and can unmount it**.
+ *
+ * {@link makeHookReact} intentionally drops cleanup functions; the backup page's 10 s poll is
+ * exactly the kind of side effect a test has to be able to stop, so this one keeps each effect's
+ * cleanup and hands back the unmount function. Re-rendering is what lets a test click a button,
+ * let the handler's fetch promises settle, and read the rendered result. Hooks are keyed by call
+ * order, which matches the component's fixed hook list.
+ */
+function makeMountReact() {
+  const hooks = [];
+  let index = 0;
+  let cleanups = [];
+  let pending = [];
+  let dirty = false;
+  let mounted = false;
+  let lastTree = null;
+  const runPending = () => {
+    const effects = pending;
+    pending = [];
+    for (const effect of effects) {
+      const cleanup = effect();
+      if (typeof cleanup === 'function') cleanups.push(cleanup);
+    }
+  };
+  const renderPass = (component, props) => {
+    for (let pass = 0; pass < 60; pass += 1) {
+      index = 0;
+      dirty = false;
+      lastTree = expandComponent(component(props));
+      runPending();
+      if (!dirty) break;
+    }
+    return lastTree;
+  };
+  /**
+   * Render child function components the way React would.
+   *
+   * The page renders the pure `BackupPanelView` as a child; it uses no hooks, so expanding it here
+   * cannot disturb the page's own hook order. Elements produced by `createElement` in this fake are
+   * plain objects with a `type`, so a function `type` is exactly the child-component case.
+   */
+  const expandComponent = (node) => {
+    if (Array.isArray(node)) return node.map(expandComponent);
+    if (node === null || typeof node !== 'object') return node;
+    if (typeof node.type === 'function') return expandComponent(node.type(node.props));
+    if (Array.isArray(node.children)) return { ...node, children: node.children.map(expandComponent) };
+    return node;
+  };
+  const React = {
+    createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }),
+    useState(initial) {
+      const at = index++;
+      if (!(at in hooks)) hooks[at] = typeof initial === 'function' ? initial() : initial;
+      return [hooks[at], (next) => {
+        hooks[at] = typeof next === 'function' ? next(hooks[at]) : next;
+        dirty = true;
+      }];
+    },
+    useRef(initial) {
+      const at = index++;
+      if (!(at in hooks)) hooks[at] = { current: initial ?? null };
+      return hooks[at];
+    },
+    useEffect(effect, deps) {
+      const at = index++;
+      const previous = hooks[at];
+      const changed = previous === undefined
+        || deps === undefined
+        || deps.length !== previous.length
+        || deps.some((value, i) => !Object.is(value, previous[i]));
+      if (!changed) return;
+      hooks[at] = deps ?? [];
+      pending.push(effect);
+    },
+  };
+  return {
+    React,
+    mount(component, props) {
+      index = 0;
+      cleanups = [];
+      pending = [];
+      mounted = true;
+      renderPass(component, props);
+      return {
+        get tree() { return lastTree; },
+        rerender(nextProps = props) {
+          if (mounted) renderPass(component, nextProps);
+        },
+        unmount() {
+          if (!mounted) return;
+          mounted = false;
+          for (const cleanup of cleanups.reverse()) {
+            try { cleanup(); } catch { /* a cleanup must not decide the test outcome */ }
+          }
+          cleanups = [];
+        },
+      };
+    },
+  };
 }
 
 describe('client bundle: selecting a machine writes the @mention', () => {
@@ -1179,3 +1298,455 @@ it('v3.4.4: each floating badge follows its own subplugin route', () => {
   assert.ok(source.includes('badge.hidden = !enabled;'), 'both DOM badges follow their route');
   assert.ok(source.includes('.w2mDcBadge[hidden],.w2mJqBadge[hidden]'), 'hidden beats the class display rule');
 });
+
+// ---------------------------------------------------------------------------------------------
+// The 备份&还原 panel (v3.4.9)
+// ---------------------------------------------------------------------------------------------
+//
+// The panel is the UI half of a feature whose host routes (src/plugin/backup.mjs) already exist.
+// What is asserted here is everything a static read of the bundle can get wrong without a browser
+// noticing: the sidebar/main registration pair, the four one-click operations, the two unlock
+// branches (and the absence of any password field), the reason-code → copy mapping, the bounded
+// in-memory log, and the two lifecycle leaks that would rot the page — a second stylesheet and a
+// surviving poll timer after the slot unmounts.
+
+describe('client bundle: the backup & restore panel (v3.4.9)', () => {
+  /** Apply the bundle into a recording registry and hand back the two backup registrations. */
+  function mountBackup(options = {}) {
+    const registry = makeRegistry();
+    const bundle = loadBundle(options);
+    bundle.exports.apply({ slots: registry, effect: (callback) => callback(), get: () => undefined });
+    const sidebar = registry.registered.find((entry) => entry.options.id === 'w2m-backup');
+    const main = registry.registered.find((entry) => entry.options.key === 'w2m-backup');
+    return { bundle, registry, sidebar, main };
+  }
+
+  /** The props the pure view needs; every case starts from a rendered, all-null page. */
+  function viewProps(overrides = {}) {
+    return {
+      t: (key) => key,
+      repo: null,
+      status: null,
+      unlock: null,
+      plan: null,
+      selected: [],
+      busy: '',
+      log: [],
+      verify: null,
+      lastAction: null,
+      error: null,
+      archiveScope: 'archived',
+      restoreArmed: false,
+      runMissing: false,
+      ...overrides,
+    };
+  }
+
+  it('takes a sidebar seat after GPW and a main page keyed by the same id', () => {
+    const { registry, sidebar, main } = mountBackup();
+    assert.ok(sidebar !== undefined, 'the backup sidebar entry is registered');
+    assert.equal(sidebar.options.name, 'sidebar.panellist');
+    assert.equal(sidebar.options.id, 'w2m-backup');
+    assert.ok(main !== undefined, 'the backup main page is registered');
+    assert.equal(main.options.name, 'main');
+    assert.equal(main.options.key, 'w2m-backup');
+    assert.equal(main.options.key, sidebar.options.id, 'the main key must equal the panellist id');
+    const gpw = registry.registered.find((entry) => entry.options.name === 'sidebar.panellist'
+      && entry.options.id === 'w2m-gpw');
+    assert.ok(gpw !== undefined, 'the GPW sidebar entry is still registered');
+    assert.ok(sidebar.options.order > gpw.options.order, 'the entry is listed after GPW');
+    assert.equal(typeof sidebar.component, 'function', 'the sidebar entry is a component');
+    assert.equal(typeof main.component, 'function', 'the main page is a component');
+    const injected = sidebar.options.inject();
+    assert.equal(typeof injected.t, 'function', 'visible copy goes through the locale seam');
+    assert.equal(injected.t('panel.backup.title'), '备份&还原', 'the label is translated, not hardcoded in the host UI');
+  });
+
+  it('draws the sidebar icon as an inline currentColor SVG that wakes the panel', () => {
+    const { bundle } = mountBackup({
+      globals: { CustomEvent: class { constructor(type) { this.type = type; } } },
+    });
+    const tree = bundle.exports.BackupSidebarIcon({ t: (key) => key });
+    const svgs = findBy(tree, (node) => node.type === 'svg');
+    assert.equal(svgs.length, 1, 'the icon is an inline SVG, not an external asset');
+    assert.equal(svgs[0].props.stroke, 'currentColor', 'the icon follows the host theme text colour');
+    assert.equal(svgs[0].props.fill, 'none');
+    const events = [];
+    bundle.window.dispatchEvent = (event) => { events.push(event); };
+    const button = findBy(tree, (node) => node.props?.['data-w2m-backup-sidebar'] === 'true')[0];
+    assert.ok(button !== undefined, 'the entry is a button');
+    button.props.onClick();
+    assert.equal(events[0]?.type, 'w2m-backup-open', 'clicking the entry asks the panel to refresh');
+  });
+
+  it('renders the four one-click operations with stable action markers', () => {
+    const { bundle } = mountBackup();
+    const tree = bundle.exports.BackupPanelView(viewProps());
+    const actions = findBy(tree, (node) => node.props?.['data-w2m-backup-action'] !== undefined)
+      .map((node) => node.props['data-w2m-backup-action']);
+    for (const action of ['run', 'restore', 'archive', 'verify']) {
+      assert.ok(actions.includes(action), `the ${action} operation is rendered`);
+    }
+    // While an operation is in flight every operation button is disabled: no double submit.
+    const busyTree = bundle.exports.BackupPanelView(viewProps({ busy: 'run' }));
+    const operationButtons = findBy(busyTree, (node) => node.type === 'button'
+      && ['run', 'restore', 'archive', 'verify'].includes(node.props?.['data-w2m-backup-action']));
+    assert.equal(operationButtons.length, 4);
+    for (const button of operationButtons) {
+      assert.equal(button.props.disabled, true, 'an in-flight operation disables its siblings');
+    }
+  });
+
+  it('offers the machine unlock and always explains the CLI password path, never posting a password', () => {
+    const { bundle } = mountBackup();
+    // The real translator: the CLI command is part of the Chinese/English copy, not a key.
+    const t = bundle.exports.makeTranslator(() => undefined);
+    const available = bundle.exports.BackupPanelView(viewProps({
+      t,
+      unlock: { ok: true, initialized: true, envelopes: ['machine', 'password'], machine_available: true, machine_reason: null, password_required: true },
+    }));
+    assert.equal(findBy(available, (node) => node.props?.['data-w2m-backup-action'] === 'unlock').length, 1,
+      'the machine envelope gets a one-click unlock button');
+    const text = collectText(available).join('\n');
+    assert.ok(text.includes('w2m-backup unlock --check --password-stdin'), 'the password path names the local CLI command');
+    assert.ok(text.includes('密码不经过 HTTP'), 'the copy says a password never travels over HTTP');
+    assert.equal(findBy(available, (node) => node.type === 'input' && node.props?.type === 'password').length, 0,
+      'HTTP never takes a password, so there is no password field');
+
+    const unavailable = bundle.exports.BackupPanelView(viewProps({
+      t,
+      unlock: { ok: true, initialized: true, envelopes: ['password'], machine_available: false, machine_reason: 'dpapi-probe-failed', password_required: true },
+    }));
+    assert.equal(findBy(unavailable, (node) => node.props?.['data-w2m-backup-action'] === 'unlock').length, 0,
+      'no machine button when the envelope cannot be loaded');
+    assert.ok(collectText(unavailable).join('\n').includes('w2m-backup unlock --check --password-stdin'),
+      'the password path is still shown instead');
+  });
+
+  it('never carries a password into a request body (the section posts confirmation tokens only)', () => {
+    const source = readFileSync(BUNDLE_PATH, 'utf8');
+    const start = source.indexOf('备份&还原面板（v3.4.9）');
+    assert.ok(start > 0, 'the panel section is in the bundle');
+    const end = source.indexOf('function FleetChat(', start);
+    assert.ok(end > start, 'the section ends before the fleet-chat module');
+    const section = source.slice(start, end);
+    assert.equal(/type:\s*'password'/.test(section), false, 'no password input in the backup panel');
+    assert.equal(/JSON\.stringify\(\{[^}]*password/isu.test(section), false, 'no request body carries a password');
+    for (const route of [
+      '/api/w2m/backup/run',
+      '/api/w2m/backup/restore',
+      '/api/w2m/backup/archive',
+      '/api/w2m/backup/verify',
+      '/api/w2m/backup/unlock',
+    ]) {
+      assert.ok(section.includes(route), `the panel calls ${route}`);
+    }
+  });
+
+  it('renders the status bar, the plan card with checkboxes and the run log', () => {
+    const { bundle } = mountBackup();
+    const tree = bundle.exports.BackupPanelView(viewProps({
+      repo: { ok: true, repository: { root: 'D:\\BackUP', initialized: true, counts: { snapshots: 3 }, free_bytes: 1048576 } },
+      status: {
+        ok: true,
+        backup_dir: 'D:\\BackUP',
+        schedule: { times: ['22:00:00'], time_zone: 'Asia/Shanghai' },
+        state: {
+          running: false,
+          last_run: '2026-11-17T10:00:00.000Z',
+          last_result: { snapshot_id: '20261117T100000Z-abcdef12', sessions: 2, files: 4, duration_ms: 4800 },
+          last_error: null,
+          last_registry_recheck: { at: '2026-11-17T10:00:05.000Z', ok: true, rewritten: true },
+        },
+      },
+      plan: {
+        ok: true,
+        snapshot_id: '20261117T100000Z-abcdef12',
+        summary: { sessions: 2, new: 1, identical: 1, conflicts: 0, attachments: 0 },
+        candidates: [
+          { session_id: 'sess-a', workspace: 'proj-a', size: 2048, conflict: 'new' },
+          { session_id: 'sess-b', workspace: 'proj-b', size: 4096, conflict: 'identical' },
+        ],
+      },
+      selected: ['sess-a'],
+      log: [{ at: '2026-11-17T10:00:01.000Z', action: 'run', ok: true, code: 'OK', detail: null }],
+    }));
+    const text = collectText(tree).join('\n');
+    assert.ok(text.includes('D:\\BackUP'), 'the repository path is shown');
+    assert.ok(text.includes('panel.backup.status.yes'), 'the initialised state is shown');
+    assert.ok(text.includes('panel.backup.status.recheckRewrote'), 'a registry re-check result is shown when it exists');
+    assert.ok(text.includes('20261117T100000Z-abcdef12'), 'the last snapshot summary is shown');
+    assert.ok(text.includes('panel.backup.plan.summary'), 'the plan card renders its summary');
+    assert.ok(text.includes('panel.backup.status.runResult'), 'the last run summary is shown');
+    const checkboxes = findBy(tree, (node) => node.type === 'input' && node.props?.type === 'checkbox');
+    assert.equal(checkboxes.length, 2, 'one checkbox per candidate session');
+    assert.deepEqual(checkboxes.map((node) => node.props.checked), [true, false], 'the selected session is checked');
+    assert.deepEqual(checkboxes.map((node) => node.props['data-w2m-backup-session']), ['sess-a', 'sess-b']);
+    assert.equal(findBy(tree, (node) => node.props?.['data-w2m-backup-log-row'] === 'run').length, 1, 'the log lists the operation');
+  });
+
+  it('shows the danger confirmation only after the restore is armed', () => {
+    const { bundle } = mountBackup();
+    const plan = {
+      ok: true,
+      snapshot_id: 'snap-1',
+      summary: { sessions: 1, new: 0, identical: 0, conflicts: 1, attachments: 0 },
+      candidates: [{ session_id: 'sess-a', workspace: 'proj-a', size: 12, conflict: 'differs' }],
+    };
+    const quiet = bundle.exports.BackupPanelView(viewProps({ plan }));
+    assert.equal(findBy(quiet, (node) => node.props?.['data-w2m-backup-confirm'] === 'restore').length, 0,
+      'nothing dangerous is shown before the first click');
+    const armed = bundle.exports.BackupPanelView(viewProps({ plan, restoreArmed: true }));
+    assert.equal(findBy(armed, (node) => node.props?.['data-w2m-backup-confirm'] === 'restore').length, 1,
+      'the second click is gated by a visible warning');
+    const restore = findBy(armed, (node) => node.props?.['data-w2m-backup-action'] === 'restore')[0];
+    assert.equal(restore.props['data-armed'], 'true');
+    assert.ok(String(restore.children[0]).includes('panel.backup.action.confirmRestore'),
+      'the button asks for confirmation in words, not in colour only');
+  });
+
+  it('drives the four operations through the host route contracts and gates restore behind two clicks', async () => {
+    const document = makeFakeDocument();
+    const requests = [];
+    const statusBody = {
+      ok: true,
+      repository: { root: 'D:\\BackUP', initialized: true, counts: { snapshots: 2 }, free_bytes: 1_048_576 },
+    };
+    const planBody = {
+      ok: true,
+      snapshot_id: 'snap-1',
+      summary: { sessions: 1, new: 1, identical: 0, conflicts: 0, attachments: 0 },
+      candidates: [{ session_id: 'sess-a', workspace: 'proj-a', size: 10, conflict: 'new' }],
+    };
+    const hostFetch = async (url, init = {}) => {
+      const method = init.method ?? 'GET';
+      const body = init.body === undefined ? null : JSON.parse(init.body);
+      requests.push({ url, method, body });
+      const send = (payload) => ({ ok: true, status: 200, json: async () => payload });
+      if (url === '/api/w2m/backup/run') {
+        if (method === 'POST') {
+          return send({ ok: true, snapshot_id: 'snap-1', sessions: 1, files: 2, blocks_new: 1, blocks_reused: 0, duration_ms: 10 });
+        }
+        // v3.4.9 host: the read-only status rides on the run GET (`status` field).
+        return send({
+          ok: true,
+          enabled: true,
+          backup_dir: 'D:\\BackUP',
+          dsh_home: 'C:\\dsh',
+          schedule: { times: ['22:00:00'], time_zone: 'UTC', next_at: '2026-11-17T14:00:00.000Z' },
+          scheduler: {},
+          status: statusBody,
+          state: { running: false, last_run: null, last_result: null, last_error: null },
+        });
+      }
+      if (url === '/api/w2m/backup/status') return send(statusBody);
+      if (url === '/api/w2m/backup/restore') {
+        if (body?.apply === true) {
+          return send({ ok: true, restored: [{ session_id: 'sess-a' }], skipped: 0, bytes_written: 10, pre_restore_dir: 'pre' });
+        }
+        return send(planBody);
+      }
+      if (url === '/api/w2m/backup/archive') {
+        return send({ ok: true, file: 'archive/x.tar.zst', sessions: 1, bytes: 100, compressed_bytes: 50 });
+      }
+      if (url === '/api/w2m/backup/verify') {
+        return send({
+          ok: true,
+          counts: { snapshots: 1, files: 2, blocks: 3, old: 0, current: 1 },
+          problems: [],
+          snapshots: [],
+          future_append: { checked: 1, failed: 0 },
+          runtime_verified: { checked: 1, failed: 0 },
+        });
+      }
+      if (url === '/api/w2m/backup/unlock') {
+        if (method === 'POST') return send({ ok: true, via: 'machine', reason_code: null, detail: null });
+        return send({
+          ok: true,
+          initialized: true,
+          envelopes: ['machine', 'password'],
+          machine_available: true,
+          machine_reason: null,
+          password_required: true,
+        });
+      }
+      throw new Error(`unexpected fetch(${url}, ${method})`);
+    };
+    const mountReact = makeMountReact();
+    const registry = makeRegistry();
+    const bundle = loadBundle({
+      document,
+      requireImpl: (specifier) => {
+        if (specifier === 'react') return mountReact.React;
+        throw new Error(`unexpected require(${specifier})`);
+      },
+      globals: { fetch: hostFetch },
+    });
+    bundle.exports.apply({ slots: registry, effect: (callback) => callback(), get: () => undefined });
+    const page = registry.registered.find((entry) => entry.options.key === 'w2m-backup');
+    assert.ok(page !== undefined);
+    const handle = mountReact.mount(page.component, { t: (key) => key });
+    const settle = async () => {
+      await new Promise((resolve) => { setTimeout(resolve, 0); });
+      handle.rerender();
+    };
+    await settle();
+
+    const clickAction = (action) => {
+      const node = findBy(handle.tree, (element) => element.props?.['data-w2m-backup-action'] === action)[0];
+      assert.ok(node !== undefined, `the ${action} operation is rendered`);
+      node.props.onClick();
+    };
+    const bodies = (url) => requests
+      .filter((request) => request.url === url && request.body !== null)
+      .map((request) => request.body);
+
+    // ① 立即备份: scope=all, and the attempt is logged.
+    clickAction('run');
+    await settle();
+    assert.deepEqual(bodies('/api/w2m/backup/run'), [{ confirm: 'run', scope: 'all' }]);
+    assert.equal(findBy(handle.tree, (node) => node.props?.['data-w2m-backup-log-row'] === 'run').length, 1, 'the run is logged');
+
+    // ② 全量校验: read-only GET, and the counts are rendered.
+    clickAction('verify');
+    await settle();
+    assert.ok(requests.some((request) => request.url === '/api/w2m/backup/verify' && request.method === 'GET'));
+    assert.equal(findBy(handle.tree, (node) => node.props?.['data-w2m-backup-panel'] === 'verify').length, 1, 'the verify result is shown');
+
+    // ③ 归档打包: archived by default; switch to all and pack again.
+    clickAction('archive');
+    await settle();
+    assert.deepEqual(bodies('/api/w2m/backup/archive'), [{ confirm: 'archive', scope: 'archived' }]);
+    const scope = findBy(handle.tree, (node) => node.props?.['data-w2m-backup-archive-scope'] === 'true')[0];
+    scope.props.onChange({ target: { value: 'all' } });
+    handle.rerender();
+    clickAction('archive');
+    await settle();
+    assert.deepEqual(bodies('/api/w2m/backup/archive')[1], { confirm: 'archive', scope: 'all' });
+
+    // ④ 还原: the first click only plans (no apply) and raises the danger confirmation; only the second click writes.
+    clickAction('restore');
+    await settle();
+    const planned = bodies('/api/w2m/backup/restore');
+    assert.equal(planned.length, 1, 'the first click posts a plan request');
+    assert.equal(planned[0].apply, undefined, 'the first click must not write');
+    assert.equal(findBy(handle.tree, (node) => node.props?.['data-w2m-backup-confirm'] === 'restore').length, 1,
+      'the danger confirmation is visible between the two clicks');
+    clickAction('restore');
+    await settle();
+    const applied = bodies('/api/w2m/backup/restore')[1];
+    assert.equal(applied.apply, true, 'only the second click applies');
+    assert.deepEqual(applied.sessions, ['sess-a'], 'the applied plan carries the selected session');
+
+    // 解锁: only the confirmation token, no credential of any kind.
+    clickAction('unlock');
+    await settle();
+    assert.deepEqual(bodies('/api/w2m/backup/unlock'), [{ confirm: 'unlock' }]);
+    handle.unmount();
+  });
+
+  it('registers panel.backup.* strings in both the Chinese and English dictionaries', () => {
+    const { exports } = loadBundle();
+    const registry = makeRegistry();
+    const locale = makeLocale();
+    const ctx = makeStrictContext({ inject: [...exports.inject], services: { slots: registry, locale } });
+    exports.apply(ctx);
+    const dictionary = locale.registered.get('w2m.target');
+    assert.ok(dictionary !== undefined, 'the dictionaries reach the locale service');
+    const keys = [
+      'panel.backup.title',
+      'panel.backup.action.run',
+      'panel.backup.action.restore',
+      'panel.backup.action.archive',
+      'panel.backup.action.verify',
+      'panel.backup.unlock.passwordPath',
+      'panel.backup.reason.BACKUP_NO_PERMISSION',
+    ];
+    for (const key of keys) {
+      assert.equal(typeof dictionary.zh[key], 'string', `the zh dictionary has ${key}`);
+      assert.equal(typeof dictionary.en[key], 'string', `the en dictionary has ${key}`);
+    }
+    assert.equal(dictionary.zh['panel.backup.reason.BACKUP_NO_PERMISSION'], '没有权限：请用原账户登录，或输入解锁密码');
+    assert.notEqual(dictionary.zh['panel.backup.title'], dictionary.en['panel.backup.title'], 'both languages are real translations');
+    const mapped = Object.keys(exports.BACKUP_REASON_KEYS);
+    assert.ok(mapped.length >= 20, 'the reason-code map covers the host codes');
+    for (const code of mapped) {
+      const key = exports.BACKUP_REASON_KEYS[code];
+      assert.equal(typeof dictionary.zh[key], 'string', `the zh dictionary maps ${code}`);
+      assert.equal(typeof dictionary.en[key], 'string', `the en dictionary maps ${code}`);
+    }
+  });
+
+  it('turns a reason code into the operator sentence and keeps unknown codes visible', () => {
+    const { exports } = loadBundle();
+    const t = exports.makeTranslator(() => undefined);
+    assert.equal(exports.backupReasonText('BACKUP_NO_PERMISSION', t), '没有权限：请用原账户登录，或输入解锁密码');
+    assert.equal(exports.backupReasonText('BACKUP_BUSY', t), '上一次备份还在运行，请稍候。');
+    assert.equal(exports.backupReasonText('BACKUP_SOMETHING_NEW', t), 'BACKUP_SOMETHING_NEW', 'an unknown code is never guessed');
+    assert.equal(exports.backupReasonText('', t), '');
+  });
+
+  it('keeps the in-memory run log bounded to the last 50 entries', () => {
+    const { exports } = loadBundle();
+    const t = exports.makeTranslator(() => undefined);
+    let entries = [];
+    for (let index = 0; index < 60; index += 1) {
+      entries = exports.appendBackupLog(entries, exports.backupLogEntry('run', { ok: true }));
+    }
+    assert.equal(exports.BACKUP_MAX_LOG, 50);
+    assert.equal(entries.length, 50, 'the log never grows past its bound');
+    assert.equal(entries[entries.length - 1].code, 'OK');
+    const failure = exports.backupLogEntry('restore', { ok: false, reason_code: 'BACKUP_NO_PERMISSION', detail: 'x' });
+    assert.equal(failure.code, 'BACKUP_NO_PERMISSION');
+    assert.equal(failure.detail, 'x');
+    assert.equal(exports.backupReasonText(failure.code, t), '没有权限：请用原账户登录，或输入解锁密码');
+  });
+
+  it('mounts the page twice on one document without leaking a stylesheet or a poll timer', () => {
+    const document = makeFakeDocument();
+    const intervals = new Set();
+    const globals = {
+      setInterval: (callback) => {
+        const timer = { callback };
+        intervals.add(timer);
+        return timer;
+      },
+      clearInterval: (timer) => { intervals.delete(timer); },
+      fetch: async () => ({ ok: true, status: 200, json: async () => ({ ok: true }) }),
+    };
+    const mountOnce = () => {
+      const mountReact = makeMountReact();
+      const registry = makeRegistry();
+      const bundle = loadBundle({
+        document,
+        requireImpl: (specifier) => {
+          if (specifier === 'react') return mountReact.React;
+          throw new Error(`unexpected require(${specifier})`);
+        },
+        globals,
+      });
+      bundle.exports.apply({ slots: registry, effect: (callback) => callback(), get: () => undefined });
+      // Other subplugins own timers of their own (they are disposed through ctx.effect); this test is
+      // about the backup page's poll, so count the delta the page itself adds.
+      const baseline = intervals.size;
+      const page = registry.registered.find((entry) => entry.options.key === 'w2m-backup');
+      assert.ok(page !== undefined, 'the backup page is registered');
+      const handle = mountReact.mount(page.component, { t: (key) => key });
+      assert.equal(intervals.size, baseline + 1, 'the mounted page owns exactly one poll timer');
+      return {
+        unmount() {
+          handle.unmount();
+          assert.equal(intervals.size, baseline, 'unmounting clears the page poll timer');
+        },
+      };
+    };
+    const first = mountOnce();
+    assert.equal(document.appended.length, 1, 'the first mount installs exactly one stylesheet');
+    first.unmount();
+    assert.equal(document.removed.length, 0, 'unmounting does not remove the shared stylesheet');
+    const second = mountOnce();
+    assert.equal(document.appended.length, 1, 'a second mount in the same document reuses the one stylesheet');
+    second.unmount();
+  });
+});
+

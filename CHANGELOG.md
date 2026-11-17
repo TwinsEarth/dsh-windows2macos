@@ -4,6 +4,37 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### G5 校验只用运行时同一份代码（v3.4.6 补全）
+
+- **证据链收口**：静态 doctor 只在报告里带 `evidence:'static-prefilter'`；结论性证据来自 `runtime-driver.mjs`
+  调用安装 Harness 的 `sessionFormatCatalog.createRestore(header,{validation:'current'})`，带
+  `evidence:'installed-harness'`。还原/归档还原把"原日志 + 追加后日志"一起交给运行时批量终审，无安装时
+  `BACKUP_RUNTIME_UNAVAILABLE` 拒绝（`--allow-static-validation` 才降级并如实标注）。
+- **真实运行时才暴露的漏洞（已修）**：`decodeRow` 对 seq 不落位的行**静默丢弃**（首事件 seq=5 的日志得到
+  `events:0` 且不抛错），运行时曾把这种日志判为通过。driver 现在要求事件数守恒
+  （`restored.events.length === 输入事件数`），否则判失败并写明 "accepted only N of M event(s); rows were
+  dropped, so this verdict is not evidence"。
+- **新接线点**：`run --runtime` 对追加后日志做运行时批量终审，结果 `runtime_future_append`（默认关，静态报告
+  标 prefilter）；`GET /api/w2m/backup/verify?runtime=1` 打开运行时终审；CLI 报告新增 `runtime append` 行。
+- **测试**：driver 静态证明（必须是 `createRestore` + `validation:'current'`，禁止使用我们的解析器）；
+  seq 缺口拒绝 + dense 通过的事件数断言；`run --runtime` 正/反向；`verify --runtime`；真实 Chromium 页面
+  （loader-entry）入口/面板/四操作断言。
+
+### 面板与侧边栏入口（v3.4.9）
+
+- `lib/client.js` 新增「备份&还原」面板，与 GPW 同构：`sidebar.panellist`（id `w2m-backup`，order 6）+ `main`
+  （key `w2m-backup`）。状态条（仓库/快照/计划/上次结果/注册表复查）、四类一键操作（立即备份、还原选中、
+  归档打包、全量校验）、还原计划卡（new/identical/differs + 勾选 + 二次危险确认）、解锁卡（本机信封按钮 +
+  密码路径只在终端，**HTTP 不接受密码**）、50 条运行日志、10 s 只读轮询（卸载清理）、失败可重试。
+- i18n：`panel.backup.*` 121 键 × 中/英 + 34 个 reason-code 文案映射（`BACKUP_NO_PERMISSION` =「没有权限：请用
+  原账户登录，或输入解锁密码」）；主题只用宿主 `--dsw-alias-*` 令牌，深浅色随宿主。
+- 宿主：`GET /api/w2m/backup/run` 增加内嵌只读 `status`（面板状态条一次往返；老宿主回退 `/status`）。
+- 测试：`test/client-bundle.test.mjs` +12 项（注册对、四操作标记、解锁双分支且无密码、备份段无 password 请求、
+  可重渲染 fake React 驱动四操作与确认令牌、i18n 完整性、日志上限、无样式/定时器泄漏）；
+  `test/loader-entry.test.mjs`（真实 Chromium + 抛空 profile）新增断言：侧边栏入口存在、点击打开面板、
+  四个操作标记齐全。该 profile 默认关闭 `dsh-backup` 行，面板显示"需要启用"；四类操作的写入由
+  `test/backup-run.test.mjs` 的路由级测试覆盖（含 Windows 真实 DPAPI 与令牌拒绝）。
+
 ### G3 只存原始字节 + "未来追加"模拟（v3.4.6 补全）
 
 - **原始字节**：引擎从不解析后重写日志；块按明文 sha256 内容寻址。新增两条证据型单测：① 损坏日志（seq 跳号）
