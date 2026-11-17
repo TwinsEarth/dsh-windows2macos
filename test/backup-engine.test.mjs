@@ -156,7 +156,7 @@ describe('engine: a first and a second backup', () => {
       assert.ok(existsSync(join(root, 'keys.json')), 'the repository key document must exist');
       const snapshot = readSnapshot({ root, snapshotId: first.snapshot_id });
       assert.equal(snapshot.manifest.counts.sessions, 3);
-      assert.equal(snapshot.manifest.counts.files, 4, 'three sessions plus one attachment');
+      assert.equal(snapshot.manifest.counts.files, 5, 'three sessions, one attachment and the workspace registry (P0 scope expansion)');
       assert.equal(snapshot.keys.format, 'w2m-session-backup/keys');
 
       // Every block object named in the manifest exists on disk.
@@ -550,7 +550,7 @@ describe('engine: the backup is actually restorable', () => {
       const key = openRepoKey({ root, dshHome: home, password: PASSWORD, platform: PLATFORM });
       assert.equal(key.ok, true, key.detail ?? '');
       const snapshot = readSnapshot({ root, snapshotId: runResult.snapshot_id });
-      assert.equal(snapshot.manifest.counts.files, 4);
+      assert.equal(snapshot.manifest.counts.files, 5, 'sessions + attachment + registry document');
 
       for (const entry of snapshot.manifest.files) {
         const parts = [];

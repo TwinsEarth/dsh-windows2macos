@@ -99,7 +99,8 @@ describe('archive: building a pack', () => {
       const result = buildArchive({ root: repo.dir, dshHome: home.home, password: PASSWORD, platform: 'linux', machineKey: false, scope: 'all' });
       assert.equal(result.ok, true, result.detail);
       assert.equal(result.sessions, 2);
-      assert.equal(result.files, 2);
+      assert.ok(result.files >= 2, `the pack carries both sessions plus the expanded-scope entries, got ${result.files}`);
+      assert.ok(result.counts.registry >= 1, 'the registry document travels with the pack');
       assert.ok(result.file.startsWith(join(repo.dir, 'archive')), result.file);
     } finally {
       repo.cleanup();

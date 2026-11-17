@@ -230,6 +230,19 @@ export function normalizeConfig(config = {}, deps = {}) {
   // The `old/` shape: `records` (default) keeps the deduplicated record only, `full` adds a sealed whole-file
   // copy per superseded version. Refused here, like the age rule, so a bad row fails the mount with a
   // configuration code instead of failing a scheduled run at 22:00.
+  // Backup scopes (P0): registry/config/state are part of the default because a backup that omits the
+  // registry and the profile configuration cannot restore a usable home on another machine.
+  const scopesRaw = config.backupScopes ?? undefined;
+  if (scopesRaw !== undefined && (!Array.isArray(scopesRaw) || scopesRaw.some((name) => typeof name !== 'string'))) {
+    return {
+      ok: false,
+      reason_code: 'BACKUP_CONFIG_INVALID',
+      detail: `backupScopes must be an array of scope names, got ${JSON.stringify(scopesRaw)}`,
+    };
+  }
+  const scopes = scopesRaw === undefined ? undefined : scopesRaw;
+  // P1: credentials opt-in. Only the literal boolean true counts; anything else is off.
+  const includeSecrets = config.backupIncludeSecrets === true;
   const oldFormat = config.backupOldFormat ?? DEFAULT_OLD_FORMAT;
   if (!OLD_FORMATS.includes(oldFormat)) {
     return {
@@ -324,6 +337,8 @@ export function normalizeConfig(config = {}, deps = {}) {
     keep_old_per_session: keepOld,
     old_version_days: oldVersionDays ?? 0,
     old_format: oldFormat,
+    scopes,
+    include_secrets: includeSecrets,
     full_copy_max_mb: fullCopyMaxMb,
     full_copy_max_bytes: fullCopyMaxBytes,
     old_usage_reminder_gb: oldUsageReminderGb,
@@ -503,7 +518,9 @@ export function apply(ctx, config = {}, deps = {}) {
         keepOldPerSession: cfg.keep_old_per_session,
         maxOldVersionDays: cfg.old_version_days,
         oldFormat: cfg.old_format,
-        // The cap is bytes in the engine; the row configures MB. The schedule path never sets allowLargeFullCopy:
+            scopes: cfg.scopes,
+    includeSecrets: cfg.include_secrets === true,
+// The cap is bytes in the engine; the row configures MB. The schedule path never sets allowLargeFullCopy:
         // a timer must not approve a write on a person's behalf, which is exactly what makes the refusal below a
         // named pending state instead of an unattended over-cap write.
         maxFullCopyBytes: cfg.full_copy_max_bytes,

@@ -58,7 +58,7 @@ describe('verify: a healthy repository', () => {
       const result = verify(repo.dir, home.home);
       assert.equal(result.ok, true, result.problems.map((problem) => `${problem.code}: ${problem.detail}`).join('; '));
       assert.equal(result.counts.snapshots, 1);
-      assert.equal(result.counts.files, 1);
+      assert.equal(result.counts.files, run.files ?? run.counts?.files ?? 1, 'the manifest file count, which now also includes registry/config/state entries');
       assert.equal(result.counts.blocks, run.blocks_total);
       assert.equal(result.future_append.checked, 1);
       assert.equal(result.future_append.failed, 0);
@@ -489,7 +489,7 @@ describe('G3 evidence: every restructuring path re-validates the future append',
       const result = verifyRepo({ root: join(dir, 'repo'), dshHome: home.home, platform: 'linux', machineKey: false });
       assert.equal(result.ok, true, result.problems.map((problem) => `${problem.code}: ${problem.detail}`).join('; '));
       assert.equal(result.counts.snapshots, 1);
-      assert.equal(result.counts.files, 1);
+      assert.ok(result.counts.files >= 1);
     } finally {
       cleanup();
       home.cleanup();

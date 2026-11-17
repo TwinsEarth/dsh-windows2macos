@@ -1783,3 +1783,63 @@ DEK 不变/恰好一个 password 信封/提示词替换与清除/`.bak` 存在�
 发现路径：`w2m-fix --help` 的第一段就是"the one legal way to delete/insert events in a v4 session log (gate G4)"；
 `docs/BACKUP-DESIGN.md` §20 与本轮 `--keep-backups` 说明给出完整参数。若未来要在面板暴露它，必须先有"逐事件预览 +
 双人确认 + 只读审计记录"的设计，否则不做。
+
+## 27. 备份范围：scopes 与覆盖率（v3.5.0 P0/P1）
+
+### 27.1 为什么扩围
+
+P0 审计（`docs/BACKUP-SCOPE.md`）证明了旧版的缺口：只备份会话日志与附件，`storages/workspace.json`（注册表本体）、
+根/Profile 配置、`xclient` 状态都不在备份里。后果是"同一台机器覆盖还原可用，全新 home 不可用"——即
+"备份不完全 ≈ 完全不备份"。v3.5.0 把备份范围扩展为五个 scope，并给出**覆盖率报告**。
+
+### 27.2 五个 scope
+
+| scope | 内容 | 说明 |
+|---|---|---|
+| `sessions` | `sessions/<ws>/<sid>/session.v<N>.jsonl.zstd`（每会话最高版本） | 原有行为 |
+| `attachments` | `attachments/v1/objects/**` 全部合法对象 | 原有行为 |
+| `registry` | `storages/workspace.json` | **注册表本体**：workspaces 的 path/title/order、`global.defaultWorkspaceId`、archived/pinned |
+| `config` | 根 `cordis.patch.yml`；`profiles/*/{package.json,cordis.patch.yml,cordis.yml,pnpm-lock.yaml,pnpm-workspace.yaml}` | 决定"装了哪些插件、哪些行启用、版本锁定"；跳过 `node_modules`/`*.bak*` |
+| `state` | `xclient/**`（跳过 `*.log`/`*.bak*`）、`storages/dsh-context/**`、`llm-deepseek/**`、`fang/**` | 设备身份、GPW 策略、决策中心、agent/fleet 状态等；**不含凭据**（见 27.4） |
+
+默认五个 scope **全开**（`DEFAULT_BACKUP_SCOPES`）。`run --scopes sessions,attachments,...` 可缩小；
+插件配置 `backupScopes`、`backupIncludeSecrets` 同义。
+
+永远排除并记录理由/类别：`dsh-runtimes/`、`profiles/*/node_modules/`、`xray-proxy/`（`reinstallable`）；
+`sessions/.event-cache/`、`storages/session_projcache/`（`cache`）；`.w2m-restore-backups/`、`storages/*.bak*`（`self-copy`）；
+凭据类（见 27.4，`credential`）。符号链接永不跟随。单文件上限 8 MiB，总量上限 256 MiB（超限 `BACKUP_SCOPE_TOO_LARGE`，零写入）。
+
+### 27.3 manifest / restore / verify
+
+- **manifest** 新增 `scopes`、`secrets_included`，每个条目带 `kind/scope/reason`；旧快照（无这些字段）在 restore/verify/archive
+  里保持可用。计数按 kind 拆分。
+- **restore**：快照里有 `registry` 条目时，**以备份的注册表文档为基底**（workspaces 的 path/title/order、
+  defaultWorkspaceId、archived/pinned 原样保留），再把还原的会话登记进去——不再按 slug 猜测；文档损坏 →
+  `BACKUP_RESTORE_REGISTRY_INVALID`（不回退猜测）。`config`/`state` 文件作为 restore 计划里的 `files` 一起写：
+  写前 pre-restore 副本、目标冲突默认先 `.bak` 再覆盖、`--keep-both` 写 `<rel>.restored-<ts>`、路径必须留在
+  `$DSH_HOME` 内（`BACKUP_RESTORE_TARGET_ESCAPE`）。写序：pre-restore → 会话 → 附件 → 注册表 → config/state。
+- **verify**：新增 `coverage`：`home` 实测字节/文件、`covered`（按 scope）、`uncovered`（分类：reinstallable/cache/
+  credential/self-copy/not-in-scope/unknown）、`percent`、`gaps`/`gap_count`。**gap = 快照里有的 scope 文件与今天的 home
+  不一致**（新增或删除都算），有 gap 时新增问题码 `BACKUP_VERIFY_COVERAGE_GAP`；凭据只在快照包含它们时才参与比较。
+- **archive**：`.tar.zst` 现在同时装 `registry/config/state` 条目（随非空会话包一起），归档自带 manifest 记录各类计数。
+- **mirror**：镜像按 manifest 的块列表复制，新条目自动随快照进入镜像（真实路径包含性与写入守卫不变）。
+
+### 27.4 P1：凭据开关（默认关）
+
+`backupIncludeSecrets`（CLI `--include-secrets`，默认 **false**）打开时才把 `.credentials.yaml`、`.anonymous-user-id`、
+`xclient/device.key`、`xclient/gpw-folders.json.key` 纳入 `state` scope。打开后：
+
+- manifest 记录 `secrets_included: true`，run 结果带 `secrets_included: true` 与一条**显著警告**；
+- CLI 人类输出打印「已包含凭据……任何拿到这个仓库的人都能登录此账户、使用这台机器的身份」；
+- 面板状态卡应显示红色警告（UI 文案已预留，见 P1 面板项）。
+
+**诚实边界**：默认不加密仓库 + 包含凭据 = 仓库目录即身份；只在完全信任仓库存放位置时开启。
+
+### 27.5 诚实边界（本版不承诺）
+
+- `state` 文件可能在客户端写入过程中被备份（读到的是某一瞬间，不保证它内部自洽）；注册表还原会**替换存活文档**，
+  仍走 G2 的原子写 + 回读校验 + 保存后复查，但采样窗口理论仍在。
+- `.w2m-restore-backups/`（还原前副本）**仍未纳入**：避免"备份里套备份"的自引用；作为后续决策项。
+- 凭据恢复后不自动重新登录：`.credentials.yaml` 是 DSH 的凭据库格式，恢复后仍建议重新走一次登录以验证。
+- 覆盖率里的 `uncovered.percent` 受"可重装依赖"影响（`dsh-runtimes`/`node_modules` 占大头），因此百分比不能单独当作
+  "备份完整度"；`gaps` 才是完整度信号。

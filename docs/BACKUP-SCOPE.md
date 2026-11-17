@@ -1,5 +1,18 @@
 # 备份范围审计：到底备份了什么、漏了什么（v3.5.0，2026-11-18）
 
+## 实现状态（2026-11-18）
+
+- **P0 已实现**：五个 scope（`sessions`/`attachments`/`registry`/`config`/`state`，默认全开）——`storages/workspace.json`、
+  根与 profile 配置、`xclient`/`dsh-context`/`llm-deepseek`/`fang` 状态都进入快照；manifest 记录 `scopes` 与每项 `reason`；
+  还原以备份的注册表文档为基底（多 workspace / title / order / defaultWorkspaceId 原样恢复）；`verify` 输出覆盖率与
+  `BACKUP_VERIFY_COVERAGE_GAP`；`.tar.zst` 与镜像同步携带这些条目。见 `docs/BACKUP-DESIGN.md` §27。
+- **P1 已实现**：`backupIncludeSecrets` / `--include-secrets`（默认 **false**）显式开启才备份凭据；开启时 manifest 标
+  `secrets_included:true`，CLI 打印显著警告；面板状态卡的红色警告为本轮遗留 UI 项。
+- **仍未纳入**：`.w2m-restore-backups/`（避免自引用）、`dsh-runtimes/`、`profiles/*/node_modules/`、`xray-proxy/`（可重装）。
+- **P2（待做）**：`docs/RESTORE-RUNBOOK.md` 全新 home 的恢复顺序。
+
+> 下面的审计快照保留为"扩围前"的历史证据（2026-11-18 04:00 前后）；其中的"未备份清单"已由上述实现关闭。
+
 > 结论先行：**当前备份 = 每个会话的「最高版本日志」+ 附件对象**。`$DSH_HOME` 里其它一切（注册表本体、插件/配置文件、
 > 设备身份、凭据、其它插件状态）**不在备份范围内**。
 >

@@ -88,26 +88,44 @@ describe('restore: the plan refuses what the gates refuse', () => {
     }
   });
 
-  it('refuses a workspace this home does not register, unless an explicit path is supplied', () => {
+  it('restores the backed-up registry document over a different live registry; an archive still needs an explicit path', () => {
     const source = runtimeValidHome();
     const repo = repoFor(source.home);
     const other = emptyTargetHome(registryDocument({ workspace: 'E:\\ToFuture', workspaceId: 'w2', sessionIds: [] }));
     try {
-      const refused = planRestore({ root: repo.dir, dshHome: other.home, password: PASSWORD, platform: 'linux', machineKey: false });
-      assert.equal(refused.ok, false);
-      assert.equal(refused.reason_code, 'BACKUP_REGISTRY_WRITE_FAILED');
-      assert.match(refused.detail, /does not register/u);
+      // P0: the snapshot carries `storages/workspace.json`, so the restore starts from the BACKUP document. The
+      // live registry of the target home (a different workspace) is replaced by it, instead of failing on a slug
+      // mismatch and demanding one `--workspace-path` per workspace.
+      const fromDocument = planRestore({ root: repo.dir, dshHome: other.home, password: PASSWORD, platform: 'linux', machineKey: false });
+      assert.equal(fromDocument.ok, true, fromDocument.detail);
+      assert.equal(fromDocument.registry_from_backup_document, true);
+      assert.equal(fromDocument.registry.base_document_restored, true);
 
-      const attached = planRestore({
-        root: repo.dir,
+      // An archive carries session logs and attachments, not the expanded-scope files: restoring it into a home whose
+      // registry does not know the backup workspace still refuses, and --workspace-path is still the way to attach it.
+      const archive = buildArchive({ root: repo.dir, dshHome: source.home, password: PASSWORD, platform: 'linux', machineKey: false, scope: 'all' });
+      assert.equal(archive.ok, true, archive.detail);
+      const refused = planRestoreFromArchive({ file: archive.file, dshHome: other.home, password: PASSWORD, platform: 'linux', machineKey: false, allowStaticValidation: true });
+      assert.equal(refused.ok, false);
+      const attached = planRestoreFromArchive({
+        file: archive.file,
         dshHome: other.home,
         password: PASSWORD,
         platform: 'linux',
         machineKey: false,
+        allowStaticValidation: true,
         workspacePath: 'E:\\GPT',
       });
       assert.equal(attached.ok, true, attached.detail);
       assert.equal(attached.registry.assignments[0].workspace_id, 'restored-e-gpt');
+
+      const applied = applyRestore({ plan: fromDocument, dshHome: other.home });
+      assert.equal(applied.ok, true, applied.detail);
+      assert.equal(applied.registry_from_backup_document, true);
+      const registry = JSON.parse(fs.readFileSync(join(other.home, 'storages', 'workspace.json'), 'utf8'));
+      assert.ok(registry.tables.workspaces.w1, 'the backed-up workspace id survives');
+      assert.equal(registry.tables.workspaces.w1.path, 'E:\\GPT');
+      assert.equal(registry.global.defaultWorkspaceId, 'w1');
     } finally {
       repo.cleanup();
       source.cleanup();
@@ -229,37 +247,46 @@ describe('restore: the round trip', () => {
     }
   });
 
-  it('restores into a brand-new home when the operator names a directory', () => {
+  it('restores into a brand-new home from the backed-up registry document (no --workspace-path needed)', () => {
     const source = runtimeValidHome();
     const repo = repoFor(source.home);
     const fresh = tempDir('w2m-restore-fresh-');
     try {
-      // A home with no storages/workspace.json at all: the disaster-recovery case.
+      // A home with no storages/workspace.json at all: the disaster-recovery case. The P0 snapshot carries the
+      // workspace registry, so the restore can build a usable home without the operator naming a directory.
       fs.mkdirSync(join(fresh.dir, 'sessions'), { recursive: true });
       fs.writeFileSync(join(fresh.dir, 'sessions', '.keep'), '');
       fs.rmSync(join(fresh.dir, 'sessions', '.keep'));
-      const refused = planRestore({ root: repo.dir, dshHome: fresh.dir, password: PASSWORD, platform: 'linux', machineKey: false });
-      assert.equal(refused.ok, false);
-      assert.match(refused.detail, /--workspace-path/u);
-
-      const plan = planRestore({
-        root: repo.dir,
-        dshHome: fresh.dir,
-        password: PASSWORD,
-        platform: 'linux',
-        machineKey: false,
-        workspacePath: fresh.dir,
-      });
+      const plan = planRestore({ root: repo.dir, dshHome: fresh.dir, password: PASSWORD, platform: 'linux', machineKey: false });
       assert.equal(plan.ok, true, plan.detail);
+      assert.equal(plan.registry_from_backup_document, true);
       assert.equal(plan.registry.created_document, true);
-      assert.equal(plan.registry.created_workspaces.length, 1);
+      assert.equal(plan.files_summary.registry, 1);
       const applied = applyRestore({ plan, dshHome: fresh.dir });
       assert.equal(applied.ok, true, applied.detail);
+      assert.equal(applied.files.registry, 1);
       assert.ok(fs.readFileSync(logPath(fresh.dir)).equals(runtimeValidSessionLog(SESSION)));
       const registry = JSON.parse(fs.readFileSync(join(fresh.dir, 'storages', 'workspace.json'), 'utf8'));
       assert.equal(registry.unit.name, 'workspace');
       assert.equal(registry.global.initialized, true);
       assert.deepEqual(registry.tables.workspaces[registry.global.defaultWorkspaceId].sessionIds, [SESSION]);
+
+      // An archive carries no registry document, so the pre-P0 rule still applies there: the operator must name a
+      // directory (or restore from the repository, as above).
+      const archive = buildArchive({ root: repo.dir, dshHome: source.home, password: PASSWORD, platform: 'linux', machineKey: false, scope: 'all' });
+      assert.equal(archive.ok, true, archive.detail);
+      const freshArchive = tempDir('w2m-restore-fresh-archive-');
+      try {
+        const refused = planRestoreFromArchive({
+          file: archive.file,
+          dshHome: freshArchive.dir,
+          allowStaticValidation: true,
+        });
+        assert.equal(refused.ok, false);
+        assert.match(refused.detail, /--workspace-path/u);
+      } finally {
+        freshArchive.cleanup();
+      }
     } finally {
       repo.cleanup();
       source.cleanup();

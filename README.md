@@ -72,6 +72,9 @@ DSH 默认的权限模型是“限制 or 全开”，一旦放开就难以精细
 - **诚实边界**：默认不加密时，任何能访问仓库目录的人都能还原；账户 ID 只是标识不是秘密；PIN 是便捷门槛不是保密强度。
   需要真正保密时用 sealed + ≥8 位非纯数字长密码 + 目录 ACL/加密卷。详见 [BACKUP-DESIGN §25](./docs/BACKUP-DESIGN.md)。
 
+备份范围（v3.5.0 P0）：默认同时覆盖 **注册表/配置/状态**（`storages/workspace.json`、根与 profile 配置、`xclient` 状态等），
+`verify` 会报告"备份对 home 的覆盖率"与缺口；凭据默认**不**备份，可用 `--include-secrets` 显式开启（仓库即身份，慎用）。
+
 离线 CLI（`w2m-backup`）：`status` / `scan` / `list` / `run` / `restore` / `archive` / `verify` / `unlock` /
 `register` / `gc` / `old-backfill` / `old-restore` / `selftest`，与面板同一套协议与门禁。
 

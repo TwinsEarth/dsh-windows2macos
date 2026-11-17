@@ -39,6 +39,7 @@ import { readCurrentPointers } from './gc.mjs';
 import { buildArtifactFromBuffer, runtimeValidateBatch } from './runtime-validate.mjs';
 import { appendLegalEvent, futureAppendVerdict } from './future-append.mjs';
 import { readJsonSafe } from './atomic.mjs';
+import { DEFAULT_BACKUP_SCOPES, classReason, classifyHomePath, collectScopeFiles, displayRel, homeInventory } from './scopes.mjs';
 
 /** Codes `verifyRepo` can report. */
 export const VERIFY_CODES = Object.freeze({
@@ -55,6 +56,7 @@ export const VERIFY_CODES = Object.freeze({
   OLD_COPY_FAILED: 'BACKUP_VERIFY_OLD_COPY_FAILED',
   FUTURE_APPEND_FAILED: 'BACKUP_FUTURE_APPEND_FAILED',
   RUNTIME_APPEND_FAILED: 'BACKUP_RUNTIME_APPEND_FAILED',
+  COVERAGE_GAP: 'BACKUP_VERIFY_COVERAGE_GAP',
 });
 
 /** The zeroed `old_copies` counter block (also the shape every early return reports). */
@@ -135,6 +137,131 @@ export function simulateFutureAppend(buffer) {
   return { ok: verdict.ok === true, codes: verdict.codes, detail: verdict.detail };
 }
 
+/** The scope a manifest file entry counts toward. */
+function scopeOfEntry(entry) {
+  if (entry.kind === 'session') return 'sessions';
+  if (entry.kind === 'attachment') return 'attachments';
+  return entry.kind;
+}
+
+/** Pick the dominant class of an uncovered row: most bytes, ties by report order. */
+function dominantClass(classes) {
+  const order = ['credential', 'self-copy', 'cache', 'reinstallable', 'not-in-scope', 'unknown'];
+  let best = 'unknown';
+  let bestBytes = -1;
+  for (const [cls, bytes] of classes) {
+    if (bytes > bestBytes || (bytes === bestBytes && order.indexOf(cls) < order.indexOf(best))) {
+      best = cls;
+      bestBytes = bytes;
+    }
+  }
+  return best;
+}
+
+/**
+ * Home coverage: how much of the live `$DSH_HOME` the latest snapshot covers, what the rest is, and which files
+ * the selected scopes would capture but the snapshot does not hold.
+ *
+ * This is the answer to the audit's finding ("42 files of 13,462, ~22.6% of the bytes"). It is deliberately honest:
+ * `covered` is the manifest's own bytes, `uncovered` is a real walk of the live home classified by the same scope
+ * rules, and `gaps` is the **symmetric difference** between the files `collectScopeFiles` selects today and the
+ * expanded-scope entries in the snapshot. A file created after the snapshot and a file deleted after it are both
+ * named: the backup does not match the home it is supposed to cover.
+ *
+ * @param {{dshHome: string, manifest: object}} input
+ * @returns {object} the `coverage` block `verifyRepo` reports
+ */
+export function buildCoverage(input) {
+  const manifest = input.manifest;
+  const scopes = Array.isArray(manifest?.scopes) ? [...manifest.scopes] : [...DEFAULT_BACKUP_SCOPES];
+  const secretsIncluded = manifest?.secrets_included === true;
+  const inventory = homeInventory({ dshHome: input.dshHome });
+  const covered = { bytes: 0, files: 0, by_scope: {} };
+  for (const name of ['sessions', 'attachments', 'registry', 'config', 'state']) covered.by_scope[name] = { files: 0, bytes: 0 };
+  const coveredRels = new Map();
+  for (const entry of manifest?.files ?? []) {
+    covered.files += 1;
+    covered.bytes += entry.size;
+    const scope = scopeOfEntry(entry);
+    covered.by_scope[scope].files += 1;
+    covered.by_scope[scope].bytes += entry.size;
+    coveredRels.set(entry.rel, scope);
+  }
+
+  // Walk the live home: covered rels are skipped by path; the rest is aggregated into display rows by class. A path
+  // that is "in scope" by shape but absent from the manifest is reported as `not-in-scope` -- the incompleteness
+  // signal the audit asked for.
+  const uncoveredAgg = new Map();
+  const walk = (dir, relDir) => {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      let stat;
+      try {
+        stat = fs.lstatSync(`${dir}/${entry.name}`);
+      } catch {
+        continue;
+      }
+      const rel = relDir === '' ? entry.name : `${relDir}/${entry.name}`;
+      if (stat.isSymbolicLink()) continue;
+      if (stat.isDirectory()) {
+        walk(`${dir}/${entry.name}`, rel);
+        continue;
+      }
+      if (!stat.isFile()) continue;
+      if (coveredRels.has(rel)) continue;
+      let cls = classifyHomePath(rel);
+      if (cls === 'in-scope') cls = 'not-in-scope';
+      const row = displayRel(rel);
+      const key = `${row}\0${cls}`;
+      const bucket = uncoveredAgg.get(key) ?? { rel: row, bytes: 0, files: 0, class: cls, classes: new Map() };
+      bucket.bytes += stat.size;
+      bucket.files += 1;
+      bucket.classes.set(cls, (bucket.classes.get(cls) ?? 0) + stat.size);
+      uncoveredAgg.set(key, bucket);
+    }
+  };
+  if (inventory.exists) walk(input.dshHome, '');
+
+  const uncovered = [...uncoveredAgg.values()].map((row) => {
+    const cls = dominantClass(row.classes);
+    return { rel: row.rel, bytes: row.bytes, files: row.files, class: cls, reason: classReason(row.rel, cls) };
+  }).sort((a, b) => (a.rel === b.rel ? a.class.localeCompare(b.class) : a.rel.localeCompare(b.rel)));
+
+  // The gap set: expanded-scope files the snapshot has but the home lost, and files the scopes would select today
+  // but the snapshot does not hold. Credentials are in this comparison only when the snapshot included them.
+  const manifestExtraRels = new Set([...coveredRels].filter(([, scope]) => scope === 'registry' || scope === 'config' || scope === 'state').map(([rel]) => rel));
+  const collected = collectScopeFiles({ dshHome: input.dshHome, scopes, includeSecrets: secretsIncluded });
+  const expanded = new Set(['registry', 'config', 'state']);
+  const collectedRels = new Set(
+    collected.ok === true
+      ? collected.files.filter((row) => expanded.has(row.scope)).map((row) => row.rel)
+      : [],
+  );
+  const gaps = [
+    ...[...manifestExtraRels].filter((rel) => !collectedRels.has(rel)),
+    ...[...collectedRels].filter((rel) => !manifestExtraRels.has(rel)),
+  ].sort();
+  const homeBytes = inventory.bytes;
+  const percent = homeBytes === 0 ? 100 : Math.min(100, Math.round((covered.bytes / homeBytes) * 1000) / 10);
+  return {
+    snapshot_id: manifest?.snapshot_id ?? null,
+    scopes,
+    secrets_included: secretsIncluded,
+    home: { bytes: homeBytes, files: inventory.files },
+    covered,
+    uncovered,
+    percent,
+    gaps: gaps.slice(0, 20),
+    gap_count: gaps.length,
+    truncated: inventory.truncated === true,
+  };
+}
+
 /**
  * Verify a whole repository.
  *
@@ -160,6 +287,8 @@ export function verifyRepo(input) {
   const futureAppend = { checked: 0, failed: 0, evidence: 'static-prefilter' };
   const runtimeChecked = { checked: 0, failed: 0, evidence: 'installed-harness' };
   const oldCopies = emptyOldCopies();
+  let latestManifest = null;
+  let coverage = null;
   const state = openRepo({ root: input.root, dshHome: input.dshHome });
   if (state.initialized !== true) {
     return {
@@ -230,6 +359,7 @@ export function verifyRepo(input) {
       continue;
     }
     const snapshot = readSnapshot({ root: input.root, snapshotId: row.snapshot_id });
+    if (latestManifest === null) latestManifest = snapshot.manifest;
     for (const entry of snapshot.manifest.files) {
       summary.files += 1;
       summary.blocks += entry.blocks.length;
@@ -347,6 +477,20 @@ export function verifyRepo(input) {
   }
   void objectsRoot;
 
+  if (latestManifest !== null) {
+    coverage = buildCoverage({ dshHome: input.dshHome, manifest: latestManifest });
+    if (coverage.gap_count > 0) {
+      problems.push({
+        code: VERIFY_CODES.COVERAGE_GAP,
+        file: null,
+        snapshot_id: coverage.snapshot_id,
+        detail:
+          `${coverage.gap_count} file(s) the enabled scopes cover do not match the snapshot (first: ` +
+          `${coverage.gaps.slice(0, 5).join(', ')})`,
+      });
+    }
+  }
+
   if (runtimeQueue.length > 0) {
     const artifacts = runtimeQueue.flatMap((row) => [row.artifact, row.appended]);
     const batch = runtimeValidateBatch({ artifacts, env: input.env });
@@ -386,5 +530,6 @@ export function verifyRepo(input) {
     future_append: futureAppend,
     runtime_verified: runtimeChecked,
     old_copies: oldCopies,
+    coverage,
   };
 }

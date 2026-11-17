@@ -61,6 +61,23 @@ export const MANIFEST_KEYS = Object.freeze([
   'exclusions',
 ]);
 
+/**
+ * Optional top-level keys added in v3.5.0 with the backup-scope expansion.
+ *
+ * They are **optional** on read so a manifest written before the expansion keeps validating exactly as it did; a
+ * new manifest always writes all three (the engine passes them to `buildManifest`).
+ */
+export const OPTIONAL_MANIFEST_KEYS = Object.freeze(['scopes', 'secrets_included', 'counts_by_scope']);
+
+/** The scopes a run can record; kept here as data so a manifest cannot name a scope nobody can restore. */
+const MANIFEST_SCOPES = Object.freeze(['sessions', 'attachments', 'registry', 'config', 'state']);
+
+/** File kinds the expanded scope set adds. */
+export const EXTRA_FILE_KINDS = Object.freeze(['registry', 'config', 'state']);
+
+/** Keys an extra (registry/config/state) entry additionally carries. */
+export const EXTRA_FILE_KEYS = Object.freeze(['scope', 'reason']);
+
 /** Required keys of every file entry. */
 export const FILE_KEYS = Object.freeze(['rel', 'kind', 'size', 'mtime_ms', 'sha256', 'blocks']);
 
@@ -248,6 +265,9 @@ export function describeFile(file, options = {}) {
  *   dshHome: string,
  *   sessions?: Array<object>,
  *   attachments?: Array<object>,
+ *   extraFiles?: Array<{rel: string, kind: string, scope: string, reason: string, file?: string, description?: object}>,
+ *   scopes?: string[],
+ *   secretsIncluded?: boolean,
  *   registry?: {workspaces?: number, registered?: number, archived?: number, pinned?: number},
  *   exclusions?: Array<{rel: string, reason: string}>,
  *   blockSize?: number
@@ -308,6 +328,29 @@ export function buildManifest(input) {
       attachment_id: String(row.attachment_id ?? ''),
     });
   }
+  for (const row of input.extraFiles ?? []) {
+    const rel = normalizeRelPath(row.rel);
+    if (!EXTRA_FILE_KINDS.includes(row.kind)) {
+      throw new ManifestError(MANIFEST_CODES.KIND, `an extra file must be one of ${EXTRA_FILE_KINDS.join(', ')}, got ${JSON.stringify(row.kind)}`);
+    }
+    if (!MANIFEST_SCOPES.includes(row.scope)) {
+      throw new ManifestError(MANIFEST_CODES.VALUE, `${rel}: unknown scope ${JSON.stringify(row.scope)}`);
+    }
+    if (typeof row.reason !== 'string' || row.reason.trim() === '') {
+      throw new ManifestError(MANIFEST_CODES.VALUE, `${rel}: an extra file needs a non-empty reason`);
+    }
+    const description = row.description ?? describeFile(row.file, { blockSize });
+    files.push({
+      rel,
+      kind: row.kind,
+      size: description.size,
+      mtime_ms: description.mtime_ms,
+      sha256: description.sha256,
+      blocks: description.blocks,
+      scope: row.scope,
+      reason: row.reason,
+    });
+  }
   files.sort((a, b) => a.rel.localeCompare(b.rel));
 
   const counts = {
@@ -319,8 +362,18 @@ export function buildManifest(input) {
     attachments: files.filter((file) => file.kind === 'attachment').length,
   };
 
+  // Per-scope counts: the status card and the restore plan read these; `counts` stays exactly the six keys a v1
+  // manifest always carried so an old reader is untouched.
+  const countsByScope = {};
+  for (const scope of MANIFEST_SCOPES) countsByScope[scope] = { files: 0, bytes: 0 };
+  for (const file of files) {
+    const scope = file.kind === 'session' ? 'sessions' : file.kind === 'attachment' ? 'attachments' : file.kind;
+    countsByScope[scope].files += 1;
+    countsByScope[scope].bytes += file.size;
+  }
+
   const registry = input.registry ?? {};
-  return {
+  const manifest = {
     format: MANIFEST_FORMAT,
     version: MANIFEST_VERSION,
     snapshot_id: input.snapshotId,
@@ -339,6 +392,14 @@ export function buildManifest(input) {
     },
     exclusions: (input.exclusions ?? []).map((entry) => ({ rel: entry.rel, reason: entry.reason })),
   };
+  // Written only when the caller is a scope-aware writer (the engine). A manifest built by a tool that does not
+  // collect scopes keeps the pre-expansion shape, so the wire format only grows where the meaning is known.
+  if (input.scopes !== undefined || input.extraFiles !== undefined || input.secretsIncluded !== undefined) {
+    manifest.scopes = Array.isArray(input.scopes) ? [...input.scopes] : [...MANIFEST_SCOPES];
+    manifest.secrets_included = input.secretsIncluded === true;
+    manifest.counts_by_scope = countsByScope;
+  }
+  return manifest;
 }
 
 /**
@@ -375,7 +436,15 @@ export function validateManifest(manifest) {
     if (!(key in manifest)) fail(MANIFEST_CODES.KEY_MISSING, `$.${key}`, 'required key is missing');
   }
   for (const key of Object.keys(manifest)) {
-    if (!MANIFEST_KEYS.includes(key)) fail(MANIFEST_CODES.KEY_UNKNOWN, `$.${key}`, 'unknown key in a v1 manifest');
+    if (!MANIFEST_KEYS.includes(key) && !OPTIONAL_MANIFEST_KEYS.includes(key)) fail(MANIFEST_CODES.KEY_UNKNOWN, `$.${key}`, 'unknown key in a v1 manifest');
+  }
+  if ('scopes' in manifest) {
+    if (!Array.isArray(manifest.scopes) || manifest.scopes.some((scope) => !MANIFEST_SCOPES.includes(scope))) {
+      fail(MANIFEST_CODES.VALUE, '$.scopes', `scopes must be an array of ${MANIFEST_SCOPES.join(', ')}`);
+    }
+  }
+  if ('secrets_included' in manifest && typeof manifest.secrets_included !== 'boolean') {
+    fail(MANIFEST_CODES.TYPE, '$.secrets_included', 'secrets_included must be a boolean');
   }
 
   if (manifest.format !== MANIFEST_FORMAT) {
@@ -442,10 +511,14 @@ export function validateManifest(manifest) {
       for (const key of FILE_KEYS) {
         if (!(key in entry)) fail(MANIFEST_CODES.KEY_MISSING, `${at}.${key}`, 'required key is missing');
       }
-      if (entry.kind !== 'session' && entry.kind !== 'attachment') {
-        fail(MANIFEST_CODES.KIND, `${at}.kind`, `expected "session" or "attachment", got ${JSON.stringify(entry.kind)}`);
+      if (!['session', 'attachment', ...EXTRA_FILE_KINDS].includes(entry.kind)) {
+        fail(MANIFEST_CODES.KIND, `${at}.kind`, `expected "session", "attachment" or one of ${EXTRA_FILE_KINDS.join(', ')}, got ${JSON.stringify(entry.kind)}`);
       }
-      const allowed = entry.kind === 'attachment' ? [...FILE_KEYS, ...ATTACHMENT_KEYS] : [...FILE_KEYS, ...SESSION_KEYS];
+      const allowed = entry.kind === 'attachment'
+        ? [...FILE_KEYS, ...ATTACHMENT_KEYS]
+        : entry.kind === 'session'
+          ? [...FILE_KEYS, ...SESSION_KEYS]
+          : [...FILE_KEYS, ...EXTRA_FILE_KEYS];
       for (const key of Object.keys(entry)) {
         if (!allowed.includes(key)) fail(MANIFEST_CODES.KEY_UNKNOWN, `${at}.${key}`, `unknown key for a ${entry.kind} entry`);
       }
@@ -544,7 +617,7 @@ export function validateManifest(manifest) {
           }
         }
         sessionCount += 1;
-      } else {
+      } else if (entry.kind === 'attachment') {
         if (typeof entry.attachment_id !== 'string' || !SHA256_HEX.test(entry.attachment_id)) {
           fail(MANIFEST_CODES.SHA256, `${at}.attachment_id`, 'attachment_id must be 64 lowercase hex characters');
         }
@@ -555,6 +628,13 @@ export function validateManifest(manifest) {
           }
         }
         attachmentCount += 1;
+      } else {
+        if (!MANIFEST_SCOPES.includes(entry.scope)) {
+          fail(MANIFEST_CODES.VALUE, `${at}.scope`, `scope must be one of ${MANIFEST_SCOPES.join(', ')}, got ${JSON.stringify(entry.scope)}`);
+        }
+        if (typeof entry.reason !== 'string' || entry.reason.trim() === '') {
+          fail(MANIFEST_CODES.VALUE, `${at}.reason`, 'an expanded-scope entry must record why it is backed up');
+        }
       }
     });
 
@@ -571,6 +651,40 @@ export function validateManifest(manifest) {
         if (manifest.counts[key] !== value) {
           fail(MANIFEST_CODES.COUNT_MISMATCH, `$.counts.${key}`, `declared ${JSON.stringify(manifest.counts[key])}, files say ${value}`);
         }
+      }
+    }
+  }
+
+  if ('counts_by_scope' in manifest) {
+    if (!isObject(manifest.counts_by_scope)) {
+      fail(MANIFEST_CODES.TYPE, '$.counts_by_scope', 'counts_by_scope must be an object');
+    } else {
+      const expected = {};
+      for (const scope of MANIFEST_SCOPES) expected[scope] = { files: 0, bytes: 0 };
+      for (const entry of Array.isArray(manifest.files) ? manifest.files : []) {
+        if (entry === null || typeof entry !== 'object') continue;
+        const scope = entry.kind === 'session' ? 'sessions' : entry.kind === 'attachment' ? 'attachments' : entry.kind;
+        if (expected[scope] === undefined) continue;
+        expected[scope].files += 1;
+        if (Number.isSafeInteger(entry.size)) expected[scope].bytes += entry.size;
+      }
+      for (const scope of MANIFEST_SCOPES) {
+        const at = `$.counts_by_scope.${scope}`;
+        const value = manifest.counts_by_scope[scope];
+        if (!isObject(value)) {
+          fail(MANIFEST_CODES.KEY_MISSING, at, 'a per-scope count is missing');
+          continue;
+        }
+        for (const key of ['files', 'bytes']) {
+          if (!Number.isSafeInteger(value[key]) || value[key] < 0) fail(MANIFEST_CODES.VALUE, `${at}.${key}`, 'count must be a non-negative integer');
+          else if (value[key] !== expected[scope][key]) fail(MANIFEST_CODES.COUNT_MISMATCH, `${at}.${key}`, `declared ${value[key]}, files say ${expected[scope][key]}`);
+        }
+        for (const key of Object.keys(value)) {
+          if (!['files', 'bytes'].includes(key)) fail(MANIFEST_CODES.KEY_UNKNOWN, `${at}.${key}`, 'unknown per-scope count key');
+        }
+      }
+      for (const key of Object.keys(manifest.counts_by_scope)) {
+        if (!MANIFEST_SCOPES.includes(key)) fail(MANIFEST_CODES.KEY_UNKNOWN, `$.counts_by_scope.${key}`, 'unknown scope in counts_by_scope');
       }
     }
   }
@@ -632,6 +746,9 @@ export function manifestSummary(manifest) {
     blocks: manifest?.counts?.blocks ?? 0,
     sessions: manifest?.counts?.sessions ?? 0,
     attachments: manifest?.counts?.attachments ?? 0,
+    ...(manifest?.scopes === undefined ? {} : { scopes: [...manifest.scopes] }),
+    ...(manifest?.secrets_included === undefined ? {} : { secrets_included: manifest.secrets_included === true }),
+    ...(manifest?.counts_by_scope === undefined ? {} : { counts_by_scope: JSON.parse(JSON.stringify(manifest.counts_by_scope)) }),
     digest: manifest === undefined || manifest === null ? null : manifestDigest(manifest),
   };
 }

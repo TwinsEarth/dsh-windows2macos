@@ -1151,7 +1151,7 @@ describe('cli: run / list / gc', () => {
       assert.equal(main(['run', '--backup-dir', repo, '--dsh-home', home], { ...first.io, env, password: PASSWORD }), 0);
       const text = first.lines.join('\n');
       assert.match(text, /snapshot {6}: 2026/u);
-      assert.match(text, /blocks {8}: 1 new, 0 reused/u);
+      assert.match(text, /blocks {8}: \d+ new, \d+ reused/u);
       assert.match(text, /unlocked via {2}: password/u);
     } finally {
       cleanup();

@@ -4,6 +4,16 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### 备份范围扩围（P0/P1）：registry/config/state scopes 与覆盖率（未发布）
+
+- **P0**：备份默认包含五个 scope——`sessions`、`attachments`、`registry`（`storages/workspace.json` 本体）、`config`（根与 profile 的 package.json/cordis.patch.yml/pnpm-lock 等）、`state`（`xclient/**`、`dsh-context`、`llm-deepseek`、`fang`）；排除项（可重装依赖、缓存、还原前副本）逐条记录 reason/class；单文件 8 MiB、总量 256 MiB 上限。
+- **P0 restore**：快照带注册表时以备份文档为基底重建（多 workspace/标题/顺序/defaultWorkspaceId/archived/pinned 原样），不再按 slug 猜测；config/state 文件随计划写入（pre-restore 副本、冲突先 `.bak`、`--keep-both` 写旁路、路径逃逸拒绝）。
+- **P0 verify**：新增 `coverage` 块（home/covered 按 scope/ uncovered 分类/ gaps），有 gap 时报 `BACKUP_VERIFY_COVERAGE_GAP`；CLI 打印 `coverage : X% ... gaps: N`。`archive` 与 `mirror` 同步携带新条目。
+- **P1**：`backupIncludeSecrets` / `--include-secrets`（默认 **false**）；开启才备份 `.credentials.yaml`、`.anonymous-user-id`、`device.key`、`gpw-folders.json.key`，manifest 标 `secrets_included:true`，CLI 打印显著警告。面板状态卡红色警告尚未接（遗留 UI 项）。
+- **CLI/配置**：`run --scopes <list>`、`--include-secrets`；插件配置 `backupScopes` / `backupIncludeSecrets`；`cordis.patch.yml` 记录默认值。
+- **测试**：新增 `backup-scopes`（scope 规则/凭据开关/上限）、`backup-scope-run`（manifest 与回滚行为）、`backup-scope-restore`（注册表基底还原与文件写回）；已有备份套件相应更新。
+
+
 ### old/ 整文件副本：从副本还原、镜像 old/、verify 逐份解密（未发布）
 
 - **从 full 副本还原一个版本（`w2m-backup old-restore`，`src/backup/old-restore.mjs`）**：记录 + blocks 还在时用

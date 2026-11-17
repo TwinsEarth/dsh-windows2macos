@@ -94,6 +94,7 @@ import { detectMachineKeySupport } from './machine-key.mjs';
 import { appendLegalEvent, futureAppendVerdict } from './future-append.mjs';
 import { buildArtifactFromBuffer, runtimeValidateBatch } from './runtime-validate.mjs';
 import { scanHome } from './scan.mjs';
+import { SECRETS_WARNING, collectScopeFiles, resolveBackupScopes } from './scopes.mjs';
 import { DEFAULT_KEEP_OLD, buildOldUsageReport, measureOldUsage, oldUsageReminderWarning, resolveMaxAgeDays, resolveMaxFullCopyBytes, resolveOldFormat, resolveOldUsageReminderBytes, rotateForEntry } from './rotation.mjs';
 import { MIRROR_CODES, resolveMirrorRoot, syncToMirror } from './mirror.mjs';
 import { commitSnapshot, makeSnapshotId } from './repo.mjs';
@@ -316,6 +317,8 @@ function safeMtime(file) {
  *   mirrorRoot?: string|null,
  *   dryRun?: boolean,
  *   exclude_session_ids?: string[],
+ *   scopes?: string[],
+ *   includeSecrets?: boolean,
  *   scan?: typeof scanHome,
  * }} input
  * @returns {object} `{ok, reason_code?, detail?, ..., summary}` -- never throws for an expected refusal
@@ -367,6 +370,14 @@ export function runBackup(input) {
   // Only the exact boolean counts: `allowLargeFullCopy: 1` / `"yes"` is a caller bug, not an approval. An approval
   // is a deliberate act by the operator, never something inferred from a truthy value.
   const allowLargeFullCopy = input.allowLargeFullCopy === true;
+  // The expanded P0 scope set. Absent means "all five" (the approved default); an unknown name is a configuration
+  // mistake and must be refused before the lock/layout/key, exactly like the retention policy above.
+  const scopePolicy = resolveBackupScopes(input.scopes);
+  if (scopePolicy.ok !== true) return { ok: false, reason_code: scopePolicy.reason_code, detail: scopePolicy.detail, dry_run: dryRun };
+  const selectedScopes = new Set(scopePolicy.scopes);
+  // The P1 credential opt-in. Only the exact boolean `true` includes credentials: `backupIncludeSecrets: 1` is a
+  // caller bug, not consent.
+  const includeSecrets = input.includeSecrets === true;
 
   // The offsite mirror is validated here too: a mirror path that points inside the repository (or the home it
   // copies) is refused before ensureLayout/lock/commit, so a refused configuration leaves no snapshot behind.
@@ -431,10 +442,26 @@ export function runBackup(input) {
     if (scan.exists !== true) {
       return { ok: false, reason_code: ENGINE_CODES.HOME_MISSING, detail: `${dshHome} does not exist`, dry_run: dryRun };
     }
+    // The expanded scopes are collected read-only, before the layout/lock/key: an over-cap refusal (or an unknown
+    // scope) therefore leaves the repository exactly as it was, not even created.
+    const scopeSkipped = [];
+    const collected = collectScopeFiles({ dshHome, scopes: scopePolicy.scopes, includeSecrets });
+    if (collected.ok !== true) return { ok: false, reason_code: collected.reason_code, detail: collected.detail, dry_run: dryRun };
+    for (const row of collected.skipped) scopeSkipped.push(row);
+    if (!selectedScopes.has('sessions')) {
+      scopeSkipped.push({ rel: 'sessions', reason: 'scope "sessions" not selected for this run', class: 'not-in-scope' });
+    }
+    if (!selectedScopes.has('attachments')) {
+      scopeSkipped.push({ rel: 'attachments', reason: 'scope "attachments" not selected for this run', class: 'not-in-scope' });
+    }
     const excluded = new Set((input.exclude_session_ids ?? []).map(String));
-    const candidates = scan.sessions.filter((row) => row.ok === true && !excluded.has(row.session_id));
-    const selection = selectSessions(candidates, { scope: scope.scope, selected: scope.selected });
-    if (selection.chosen.length === 0) {
+    const candidates = selectedScopes.has('sessions')
+      ? scan.sessions.filter((row) => row.ok === true && !excluded.has(row.session_id))
+      : [];
+    const selection = selectedScopes.has('sessions')
+      ? selectSessions(candidates, { scope: scope.scope, selected: scope.selected })
+      : { chosen: [], skipped: scan.sessions.length, unknown_selected: [] };
+    if (selectedScopes.has('sessions') && selection.chosen.length === 0) {
       return {
         ok: false,
         reason_code: ENGINE_CODES.SCOPED_NOTHING,
@@ -446,11 +473,22 @@ export function runBackup(input) {
         unknown_selected: selection.unknown_selected,
       };
     }
+    if (selection.chosen.length === 0 && collected.files.length === 0) {
+      return {
+        ok: false,
+        reason_code: ENGINE_CODES.SCOPED_NOTHING,
+        detail: `the selected scopes (${[...selectedScopes].join(', ') || 'none'}) captured no file in ${dshHome}`,
+        dry_run: dryRun,
+        scopes: [...scopePolicy.scopes],
+        scope_skipped: scopeSkipped,
+      };
+    }
+    const attachmentsToStore = selectedScopes.has('attachments') ? scan.attachments.filter((attachment) => attachment.ok === true) : [];
 
     // Fail fast on a rel path the manifest would reject: without this, a stray directory (a pre-restore copy area,
     // say) is written as blocks first and only then refused -- minutes of work for nothing, and a half-built
     // snapshot directory to clean up.
-    for (const row of [...selection.chosen, ...scan.attachments.filter((attachment) => attachment.ok === true)]) {
+    for (const row of [...selection.chosen, ...attachmentsToStore, ...collected.files]) {
       try {
         normalizeRelPath(row.rel);
       } catch (error) {
@@ -577,7 +615,7 @@ export function runBackup(input) {
         blocks: stored.description.blocks,
       });
     }
-    for (const attachment of scan.attachments.filter((row) => row.ok === true)) {
+    for (const attachment of attachmentsToStore) {
       const stored = storeFileBlocks({ root, file: attachment.file, dek: key.dek, dryRun, expectZstd: false });
       if (stored.error !== undefined) return { ok: false, ...stored.error, dry_run: dryRun };
       blocksNew += stored.blocks_new;
@@ -591,15 +629,40 @@ export function runBackup(input) {
         description: stored.description,
       });
     }
+    // The expanded P0/P1 files (registry/config/state). They are ordinary content-addressed blocks too; only the
+    // manifest entry differs (`kind`/`scope`/`reason`). No future-append simulation and no rotation: they are not
+    // session logs.
+    for (const extra of collected.files) {
+      const stored = storeFileBlocks({ root, file: extra.file, dek: key.dek, dryRun, expectZstd: false });
+      if (stored.error !== undefined) return { ok: false, ...stored.error, dry_run: dryRun };
+      blocksNew += stored.blocks_new;
+      blocksReused += stored.blocks_reused;
+      bytesWritten += stored.bytes_written;
+      bytesRead += stored.bytes_read;
+      entries.push({
+        rel: extra.rel,
+        file: extra.file,
+        kind: extra.kind,
+        scope: extra.scope,
+        reason: extra.reason,
+        description: stored.description,
+      });
+    }
 
-    const sessionEntries = entries.filter((entry) => entry.session_id !== undefined);
+    // Rotation: session entries only. The expanded scope files are state, not versioned logs, and rotating one
+    // would record a `current/` pointer for a file the restore path does not read (and could delete the live state).
+    const sessionEntries = entries.filter((entry) => entry.kind === undefined && entry.session_id !== undefined);
     const attachmentEntries = entries.filter((entry) => entry.attachment_id !== undefined);
+    const extraEntries = entries.filter((entry) => entry.kind === 'registry' || entry.kind === 'config' || entry.kind === 'state');
     const manifest = buildManifest({
       snapshotId,
       createdAt: now,
       dshHome,
       sessions: sessionEntries,
       attachments: attachmentEntries,
+      extraFiles: extraEntries,
+      scopes: scopePolicy.scopes,
+      secretsIncluded: includeSecrets,
       registry: {
         workspaces: scan.registry.workspaces.length,
         registered: scan.registry.registered.size,
@@ -640,10 +703,15 @@ export function runBackup(input) {
         dry_run: true,
         snapshot_id: snapshotId,
         scope: scope.scope,
+        scopes: [...scopePolicy.scopes],
         sessions: selection.chosen.length,
         attachments: attachmentEntries.length,
         files: manifest.counts.files,
         bytes: manifest.counts.bytes,
+        counts_by_scope: manifest.counts_by_scope,
+        secrets_included: includeSecrets,
+        scope_skipped: scopeSkipped,
+        ...(includeSecrets ? { warnings: [SECRETS_WARNING] } : {}),
         blocks_new: blocksNew,
         blocks_reused: blocksReused,
         bytes_written: bytesWritten,
@@ -727,6 +795,9 @@ export function runBackup(input) {
     // account would silently turn the default `none` mode back into `sealed` after the first run (and the
     // requirement is that `none` stays `none` until the operator asks otherwise).
     const warnings = [];
+    // P1: a run that includes credentials must be impossible to mistake for a safe one. The warning is part of the
+    // result, not only the CLI text, so the panel and the operation log carry it too.
+    if (includeSecrets) warnings.push(SECRETS_WARNING);
     // The usage reminder is a warning, not a limit: the run is `ok`, the snapshot is committed, and the line is the
     // operator's cue to clean up manually (`w2m-backup gc`) or acknowledge in the panel.
     if (oldUsage.due) warnings.push(oldUsageReminderWarning(oldUsage));
@@ -794,10 +865,14 @@ export function runBackup(input) {
       snapshot_id: committed.snapshot_id,
       digest: committed.digest,
       scope: scope.scope,
+      scopes: [...scopePolicy.scopes],
       sessions: selection.chosen.length,
       attachments: attachmentEntries.length,
       files: manifest.counts.files,
       bytes: manifest.counts.bytes,
+      counts_by_scope: manifest.counts_by_scope,
+      secrets_included: includeSecrets,
+      scope_skipped: scopeSkipped,
       blocks_new: blocksNew,
       blocks_reused: blocksReused,
       blocks_total: blocksNew + blocksReused,

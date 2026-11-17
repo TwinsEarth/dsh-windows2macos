@@ -216,6 +216,13 @@ export function formatVerify(result) {
   if (result.old_copies !== undefined && result.old_copies !== null) {
     const copies = result.old_copies;
     lines.push(`old copies    : ${copies.ok} ok / ${copies.failed} failed / ${copies.missing} missing`);
+  if (result.coverage !== null && result.coverage !== undefined) {
+    const cov = result.coverage;
+    lines.push(`coverage      : ${cov.percent}% (covered ${(cov.covered.bytes / 1024 ** 2).toFixed(1)} MB / home ${(cov.home.bytes / 1024 ** 2).toFixed(1)} MB), gaps: ${cov.gap_count}`);
+    if (cov.gap_count > 0) {
+      for (const rel of cov.gaps.slice(0, 5)) lines.push(`gap           : ${rel}`);
+    }
+  }
   }
   lines.push(`current ptrs  : ${result.counts.current}`);
   lines.push(`future append : ${result.future_append.checked - result.future_append.failed}/${result.future_append.checked} passed`);
@@ -350,6 +357,9 @@ function usage() {
     '  --hash              hash every file (sha256; slower)',
     '  --manifest          build the in-memory manifest and print its digest (no writes)',
     '  --scope <s>         run: all | active | archived | selected (default: all)',
+    '  --scopes <list>     run: sessions,attachments,registry,config,state (default: all five)',
+    '  --include-secrets   run: also back up credentials (device keys, account credentials): off by default,',
+    '                      the repository then holds everything needed to act as this machine/account',
     '  --session <id>      run --scope selected / register: a session id (repeatable)',
     '  --keep-old <n>      old versions kept per session (default: 10)',
     '  --old-format <f>    run: how a superseded version is kept: records (default, deduped record only)',
@@ -605,6 +615,15 @@ export function parseArgs(argv, env = process.env) {
       options.mirror = path.resolve(raw);
     }
     else if (arg === '--scope') options.scope = rest.shift() ?? null;
+    else if (arg === '--scopes') {
+      const raw = rest.shift() ?? '';
+      options.scopes = raw.split(',').map((name) => name.trim()).filter((name) => name !== '');
+      if (options.scopes.length === 0) return { ...options, error: '--scopes needs at least one scope' };
+    } else if (arg.startsWith('--scopes=')) {
+      const raw = arg.slice('--scopes='.length);
+      options.scopes = raw.split(',').map((name) => name.trim()).filter((name) => name !== '');
+      if (options.scopes.length === 0) return { ...options, error: '--scopes needs at least one scope' };
+    } else if (arg === '--include-secrets') options.includeSecrets = true;
     else if (arg === '--session') options.selected.push(rest.shift() ?? '');
     else if (arg === '--keep-old') {
       const raw = rest.shift() ?? '';
@@ -1308,6 +1327,8 @@ export function main(argv, io = {}) {
       oldUsageReminderBytes: options.oldUsageReminderGb === null ? undefined : Math.round(options.oldUsageReminderGb * 1024 ** 3),
       oldUsageAckBytes,
       allowLargeFullCopy: options.allowLargeFullCopy === true,
+      scopes: options.scopes ?? undefined,
+      includeSecrets: options.includeSecrets === true,
       encryption: options.encryption ?? undefined,
       mirrorRoot: options.mirror ?? undefined,
       dryRun: options.dryRun,
@@ -1318,6 +1339,13 @@ export function main(argv, io = {}) {
       machineKey,
     };
     let result = runBackup(runInput);
+    if (result.ok === true && result.secrets_included === true) {
+      // The warning is deliberately loud and on both channels: a repository with credentials is an identity.
+      const secretsLine =
+        'secrets       : 已包含凭据（device.key / gpw key / .credentials.yaml）：任何拿到这个仓库的人都能登录此账户、使用这台机器的身份。';
+      if (options.json === true) writeErr(secretsLine);
+      else write(secretsLine);
+    }
     // The full-copy cap: an interactive terminal may approve THIS run once and retry; a script must pass the flag.
     // The question goes to stderr in --json mode so stdout stays the machine-readable result. Either way the
     // refusal wrote nothing, so "no" is a complete, safe outcome.

@@ -140,28 +140,48 @@ export function findWorkspaceForSlug(registry, workspaceName) {
 /**
  * Plan the registry change for **one restore** (any number of sessions), without writing it.
  *
+ * `baseDocument` (v3.5.0 P0) makes the backed-up registry document the starting point: all workspaces (with their
+ * `path`/`title`/order), `global.defaultWorkspaceId` and archived/pinned **workspace-level** data survive, and a
+ * session is matched against the document's own paths instead of being guessed from directory slugs. The restored
+ * sessions are then added/updated on top. Without it, the pre-expansion behaviour (match the live registry by slug,
+ * create one only when the operator named a directory) is unchanged.
+ *
  * @param {{
  *   dshHome: string,
  *   sessions: Array<{session_id: string, workspace: string, archived?: boolean, pinned?: boolean}>,
  *   workspacePath?: string|null,
  *   allowCreateRegistry?: boolean,
+ *   baseDocument?: object|null,
  * }} input
  * @returns {{
  *   ok: boolean, reason_code: string|null, detail: string|null, file: string,
  *   document: object|null, changed: boolean, actions: string[],
  *   created_document: boolean, created_workspaces: string[],
+ *   base_document_restored: boolean,
  *   assignments: Array<{session_id: string, workspace_id: string, archived: boolean, pinned: boolean}>,
  * }}
  */
 export function planRegistryRestores(input) {
   const file = workspaceRegistryPath(input.dshHome);
   const exists = fs.existsSync(file);
-  let document = exists ? readJsonSafe(file) : null;
+  const useBaseDocument = input.baseDocument !== undefined && input.baseDocument !== null;
+  /** @type {object|null} */
+  let document = null;
+  let liveDocument = null;
   let createdDocument = false;
   const actions = [];
   const createdWorkspaces = [];
 
-  if (document !== null && (typeof document !== 'object' || document.tables === undefined)) {
+  if (useBaseDocument) {
+    if (typeof input.baseDocument !== 'object' || Array.isArray(input.baseDocument) || input.baseDocument.tables === undefined) {
+      return refusal(REGISTRY_CODES.UNREADABLE, `${file}: the backed-up registry document is not a workspace registry document`, file, null);
+    }
+    document = JSON.parse(JSON.stringify(input.baseDocument));
+    liveDocument = exists ? readJsonSafe(file) : null;
+  } else {
+    document = exists ? readJsonSafe(file) : null;
+  }
+  if (!useBaseDocument && document !== null && (typeof document !== 'object' || document.tables === undefined)) {
     return refusal(REGISTRY_CODES.UNREADABLE, `${file}: not a workspace registry document`, file, document);
   }
   const workspacePath = typeof input.workspacePath === 'string' && input.workspacePath.trim() !== '' ? path.resolve(input.workspacePath.trim()) : null;
@@ -225,11 +245,15 @@ export function planRegistryRestores(input) {
     }
 
     workspace.record.sessionIds = Array.isArray(workspace.record.sessionIds) ? workspace.record.sessionIds : [];
+    let workspaceChanged = false;
     if (!workspace.record.sessionIds.includes(session.session_id)) {
       workspace.record.sessionIds.push(session.session_id);
       actions.push(`register ${session.session_id} in workspace ${workspace.id}`);
+      workspaceChanged = true;
     }
-    workspace.record.updatedAt = new Date().toISOString();
+    // Only a real change moves `updatedAt`: a restore of an unchanged document must compare equal to the live one,
+    // or every repeat restore would rewrite the registry for nothing.
+    if (workspaceChanged) workspace.record.updatedAt = new Date().toISOString();
 
     const archived = session.archived === true;
     const archivedSet = new Set(Array.isArray(next.global.archivedSessionIds) ? next.global.archivedSessionIds.map(String) : []);
@@ -251,18 +275,42 @@ export function planRegistryRestores(input) {
     assignments.push({ session_id: session.session_id, workspace_id: workspace.id, archived, pinned });
   }
 
+  // With a backed-up base document the whole document is the deliverable: it is "changed" when it differs from the
+  // live file, not only when a session had to be added (the workspace list/titles/order/default are part of it).
+  let changed = actions.length > 0;
+  if (useBaseDocument) {
+    changed = !sameDocument(liveDocument, next);
+    if (changed) actions.unshift(`replace the live registry with the backed-up document (${Object.keys(next.tables.workspaces).length} workspace(s))`);
+    createdDocument = exists !== true;
+  }
+
   return {
     ok: true,
     reason_code: null,
     detail: null,
     file,
     document: next,
-    changed: actions.length > 0,
+    changed,
     actions,
     created_document: createdDocument,
     created_workspaces: createdWorkspaces,
+    base_document_restored: useBaseDocument,
     assignments,
   };
+}
+
+/** Structural JSON equality (property order independent, because the live file and the plan are built separately). */
+function sameDocument(left, right) {
+  if (left === null || left === undefined || right === null || right === undefined) return false;
+  return canonical(left) === canonical(right);
+}
+
+/** Canonical JSON with sorted keys: enough for equality, small documents only (the registry is a few KB). */
+function canonical(value) {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map((item) => canonical(item)).join(',')}]`;
+  const keys = Object.keys(value).sort();
+  return `{${keys.map((key) => `${JSON.stringify(key)}:${canonical(value[key])}`).join(',')}}`;
 }
 
 /** One-session wrapper: kept for callers that only restore a single session. */
@@ -284,6 +332,7 @@ function refusal(reason_code, detail, file, document) {
     actions: [],
     created_document: false,
     created_workspaces: [],
+    base_document_restored: false,
     assignments: [],
   };
 }
@@ -346,6 +395,10 @@ export function verifyRegistryWrite(input) {
   const sessionIds = new Set(Object.values(workspaces).flatMap((record) => (Array.isArray(record?.sessionIds) ? record.sessionIds : [])));
   const archived = new Set((document?.global?.archivedSessionIds ?? []).map(String));
   const pinned = new Set((document?.global?.pinnedSessionIds ?? []).map(String));
+  // A base-document restore promises the whole document, not only this run's sessions: read it back and compare.
+  if (plan.base_document_restored === true && !sameDocument(document, plan.document)) {
+    return { ok: false, detail: 'the registry on disk differs from the backed-up document the plan wrote' };
+  }
   for (const assignment of plan.assignments ?? []) {
     if (!sessionIds.has(assignment.session_id)) {
       return { ok: false, detail: `session ${assignment.session_id} is still not registered after the write (the client may have replaced the registry)` };

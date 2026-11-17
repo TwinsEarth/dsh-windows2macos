@@ -37,10 +37,11 @@ import { openRepoKey } from './keystore.mjs';
 import { rebuildFile } from './materialize.mjs';
 import { writeFileAtomic } from './atomic.mjs';
 import { sha256Hex } from './manifest.mjs';
-import { applyRegistryRestore, planRegistryRestores, workspaceSlug } from './registry.mjs';
+import { applyRegistryRestore, planRegistryRestores, workspaceRegistryPath, workspaceSlug } from './registry.mjs';
 import { readArchive } from './archive.mjs';
 import { validateCandidates } from './runtime-validate.mjs';
 import { clientGate } from './client.mjs';
+import { isInside, resolveBackupScopes } from './scopes.mjs';
 import { scanFrames } from '../fix/zstd.mjs';
 import { diagnoseSessionBuffer } from '../util/session-validate.mjs';
 
@@ -59,6 +60,9 @@ export const RESTORE_CODES = Object.freeze({
   VERIFY_FAILED: 'BACKUP_RESTORE_VERIFY_FAILED',
   TARGET_CHANGED: 'BACKUP_RESTORE_TARGET_CHANGED',
   ARCHIVE_UNREADABLE: 'BACKUP_ARCHIVE_UNREADABLE',
+  REGISTRY_INVALID: 'BACKUP_RESTORE_REGISTRY_INVALID',
+  TARGET_ESCAPE: 'BACKUP_RESTORE_TARGET_ESCAPE',
+  SCOPE_UNKNOWN: 'BACKUP_SCOPE_UNKNOWN',
 });
 
 /** How many pre-restore copies are kept by default. */
@@ -110,10 +114,36 @@ function gateClient(input) {
   return gate;
 }
 
-function itemsFromSnapshot(snapshot, wanted) {
-  const sessions = snapshot.manifest.files.filter((entry) => entry.kind === 'session' && (wanted === null || wanted.has(entry.session_id)));
-  const attachments = snapshot.manifest.files.filter((entry) => entry.kind === 'attachment');
-  return { sessions, attachments };
+/**
+ * Entries of the snapshot, split the way a restore treats them.
+ *
+ * @param {object} snapshot
+ * @param {Set<string>|null} wanted session ids, or null for every session
+ * @param {Set<string>} scopes the restore's selected scopes (default: all present)
+ * @returns {{sessions: Array<object>, attachments: Array<object>, extras: Array<object>, registryEntry: object|null}}
+ */
+function itemsFromSnapshot(snapshot, wanted, scopes) {
+  const files = snapshot.manifest.files;
+  const sessions = scopes.has('sessions')
+    ? files.filter((entry) => entry.kind === 'session' && (wanted === null || wanted.has(entry.session_id)))
+    : [];
+  const attachments = scopes.has('attachments') ? files.filter((entry) => entry.kind === 'attachment') : [];
+  const extras = files.filter((entry) => entry.kind === 'registry' || entry.kind === 'config' || entry.kind === 'state')
+    .filter((entry) => scopes.has(entry.kind));
+  const registryEntry = extras.find((entry) => entry.kind === 'registry' && entry.rel === 'storages/workspace.json') ?? null;
+  return { sessions, attachments, extras, registryEntry };
+}
+
+/** Resolve a restore's scope filter (absent = every scope present in the snapshot). */
+function restoreScopes(value) {
+  return resolveBackupScopes(value);
+}
+
+/** The target path of an extra (config/state) entry, refused when it would escape the home. */
+function extraTargetPath(dshHome, entry) {
+  const target = path.join(dshHome, ...String(entry.rel).replace(/\\/g, '/').split('/'));
+  if (!isInside(dshHome, target)) return { ok: false, target };
+  return { ok: true, target };
 }
 
 /**
@@ -156,13 +186,23 @@ export function planRestore(input) {
   } catch (error) {
     return { ok: false, reason_code: RESTORE_CODES.NO_SNAPSHOT, detail: error?.detail ?? String(error?.message ?? error) };
   }
+  const scopePolicy = restoreScopes(input.scopes);
+  if (scopePolicy.ok !== true) return { ok: false, reason_code: RESTORE_CODES.SCOPE_UNKNOWN, detail: scopePolicy.detail };
+  const scopes = new Set(scopePolicy.scopes);
   const wanted = Array.isArray(input.sessionIds) && input.sessionIds.length > 0 ? new Set(input.sessionIds.map(String)) : null;
-  const { sessions, attachments } = itemsFromSnapshot(snapshot, wanted);
-  if (sessions.length === 0) {
+  const { sessions, attachments, extras } = itemsFromSnapshot(snapshot, wanted, scopes);
+  if (sessions.length === 0 && scopes.has('sessions')) {
     return {
       ok: false,
       reason_code: RESTORE_CODES.NO_SESSION,
       detail: wanted === null ? `snapshot ${snapshotId} contains no session` : `none of the requested session(s) are in snapshot ${snapshotId}`,
+    };
+  }
+  if (sessions.length === 0 && extras.length === 0) {
+    return {
+      ok: false,
+      reason_code: RESTORE_CODES.NO_SESSION,
+      detail: `snapshot ${snapshotId} contains none of the selected scopes (${scopePolicy.scopes.join(', ') || 'none'})`,
     };
   }
 
@@ -179,15 +219,53 @@ export function planRestore(input) {
   for (const entry of attachments) {
     const rebuilt = rebuildFile({ root: input.root, entry, dek: key.dek });
     if (rebuilt.ok !== true) return { ok: false, reason_code: rebuilt.code, detail: rebuilt.detail };
+    if (sha256Hex(rebuilt.buffer) !== entry.sha256) {
+      return { ok: false, reason_code: RESTORE_CODES.VERIFY_FAILED, detail: `${entry.rel}: the repository bytes do not match the manifest digest` };
+    }
     decodedAttachments.push({ entry, buffer: rebuilt.buffer });
+  }
+  const decodedExtras = [];
+  let registryDocument = null;
+  for (const entry of extras) {
+    const rebuilt = rebuildFile({ root: input.root, entry, dek: key.dek });
+    if (rebuilt.ok !== true) return { ok: false, reason_code: rebuilt.code, detail: rebuilt.detail };
+    if (sha256Hex(rebuilt.buffer) !== entry.sha256) {
+      return { ok: false, reason_code: RESTORE_CODES.VERIFY_FAILED, detail: `${entry.rel}: the repository bytes do not match the manifest digest` };
+    }
+    if (entry.kind === 'registry') {
+      // The backed-up registry document is a **base**, not a copied file: parse it now, and refuse by name when it
+      // is present but broken. Falling back to slug guessing here would restore sessions into wrong/absent
+      // workspaces while looking successful -- the exact failure the backup document exists to prevent.
+      try {
+        registryDocument = JSON.parse(rebuilt.buffer.toString('utf8'));
+      } catch (error) {
+        return {
+          ok: false,
+          reason_code: RESTORE_CODES.REGISTRY_INVALID,
+          detail: `${entry.rel}: the backed-up workspace registry is not valid JSON (${error instanceof Error ? error.message : String(error)}); refusing to guess workspace mappings`,
+        };
+      }
+      if (registryDocument === null || typeof registryDocument !== 'object' || registryDocument.tables === undefined) {
+        return {
+          ok: false,
+          reason_code: RESTORE_CODES.REGISTRY_INVALID,
+          detail: `${entry.rel}: the backed-up file is not a workspace registry document (no tables); refusing to guess workspace mappings`,
+        };
+      }
+      continue;
+    }
+    decodedExtras.push({ entry, buffer: rebuilt.buffer });
   }
 
   return buildPlan({
     input,
     now,
+    scopes: scopePolicy.scopes,
     source: { kind: 'repository', snapshot_id: snapshotId, snapshot_digest: snapshot.digest },
     sessions: decoded,
     attachments: decodedAttachments,
+    extras: decodedExtras,
+    registryDocument,
   });
 }
 
@@ -195,7 +273,7 @@ export function planRestore(input) {
  * Plan one restore directly from a `.tar.zst` archive.
  *
  * The archive carries the same manifest a snapshot does (files, digests, session ids, flags), so the same gates
- * and the same writer apply. This is what makes an archive "可解压、可校验、可还原" rather than "可解压".
+ * and the same writer apply. This is what makes an archive "鍙В鍘嬨€佸彲鏍￠獙銆佸彲杩樺師" rather than "鍙В鍘?.
  *
  * @param {{file: string, dshHome: string, sessionIds?: string[], allowStaticValidation?: boolean,
  *   requireFutureAppend?: boolean, workspacePath?: string|null, keepBoth?: boolean, now?: Date,
@@ -216,10 +294,15 @@ export function planRestoreFromArchive(input) {
     };
   }
   const entries = new Map(archive.entries.map((entry) => [entry.name, entry.data]));
+  const scopePolicy = restoreScopes(input.scopes);
+  if (scopePolicy.ok !== true) return { ok: false, reason_code: RESTORE_CODES.SCOPE_UNKNOWN, detail: scopePolicy.detail };
+  const scopes = new Set(scopePolicy.scopes);
   const wanted = Array.isArray(input.sessionIds) && input.sessionIds.length > 0 ? new Set(input.sessionIds.map(String)) : null;
   const sessions = [];
   const attachments = [];
   for (const file of archive.manifest.files) {
+    if (file.kind === 'registry' || file.kind === 'config' || file.kind === 'state') continue;
+    if (!scopes.has(file.kind === 'session' ? 'sessions' : 'attachments')) continue;
     if (wanted !== null && file.kind === 'session' && !wanted.has(file.session_id)) continue;
     const data = entries.get(file.rel);
     if (data === undefined) {
@@ -237,21 +320,29 @@ export function planRestoreFromArchive(input) {
   return buildPlan({
     input,
     now,
+    scopes: scopePolicy.scopes,
     source: { kind: 'archive', archive_file: input.file, snapshot_id: archive.manifest.source_snapshot ?? null, snapshot_digest: archive.manifest.source_digest ?? null },
     sessions,
     attachments,
+    // An archive is a plaintext pack of session logs and attachment objects; the expanded-scope files are not in it,
+    // so a restore from an archive restores what the archive actually carries (and says so in the plan).
+    extras: [],
+    registryDocument: null,
   });
 }
 
 /**
- * Shared planning: validate every candidate through both gates, classify conflicts, plan the registry once.
+ * Shared planning: validate every candidate through both gates, classify conflicts, plan the registry once, and
+ * classify every config/state file the snapshot carries.
  *
- * @param {{input: object, now: Date, source: object,
- *   sessions: Array<{entry: object, buffer: Buffer}>, attachments: Array<{entry: object, buffer: Buffer}>}} context
+ * @param {{input: object, now: Date, scopes: string[], source: object,
+ *   sessions: Array<{entry: object, buffer: Buffer}>, attachments: Array<{entry: object, buffer: Buffer}>,
+ *   extras?: Array<{entry: object, buffer: Buffer}>, registryDocument?: object|null}} context
  * @returns {object}
  */
 function buildPlan(context) {
-  const { input, now, source, sessions, attachments } = context;
+  const { input, now, source, sessions, attachments, extras, registryDocument } = context;
+  const scopes = Array.isArray(context.scopes) ? context.scopes : ['sessions', 'attachments', 'registry', 'config', 'state'];
   const requireRuntime = input.allowStaticValidation !== true;
   const validation = validateCandidates({
     items: sessions.map((row) => ({
@@ -307,19 +398,74 @@ function buildPlan(context) {
   }
 
   // One registry plan for the whole restore: planning per session would let the last write erase the others.
-  const registry = planRegistryRestores({
-    dshHome: input.dshHome,
-    sessions: candidates.map((candidate) => ({
-      session_id: candidate.session_id,
-      workspace: candidate.workspace,
-      archived: candidate.flags.archived === true,
-      pinned: candidate.flags.pinned === true,
-    })),
-    workspacePath: input.workspacePath ?? null,
-    allowCreateRegistry: true,
-  });
+  // A backed-up registry document is the **base** when the registry scope is selected: every workspace and its
+  // path/title/order/default survive, and sessions are matched against the document's own paths.
+  //
+  // A restore that selects neither `sessions` nor `registry` (for example `--scopes config`) plans no registry at
+  // all: there is nothing to register, and demanding a workspace path for it would make a config-only restore
+  // impossible on a fresh home.
+  let registry;
+  if (candidates.length === 0 && (registryDocument === null || registryDocument === undefined) && !scopes.includes('sessions')) {
+    registry = {
+      ok: true,
+      reason_code: null,
+      detail: null,
+      file: workspaceRegistryPath(input.dshHome),
+      document: null,
+      changed: false,
+      actions: [],
+      created_document: false,
+      created_workspaces: [],
+      base_document_restored: false,
+      assignments: [],
+    };
+  } else {
+    registry = planRegistryRestores({
+      dshHome: input.dshHome,
+      sessions: candidates.map((candidate) => ({
+        session_id: candidate.session_id,
+        workspace: candidate.workspace,
+        archived: candidate.flags.archived === true,
+        pinned: candidate.flags.pinned === true,
+      })),
+      workspacePath: input.workspacePath ?? null,
+      allowCreateRegistry: true,
+      ...(registryDocument !== null && registryDocument !== undefined ? { baseDocument: registryDocument } : {}),
+    });
+  }
   if (registry.ok !== true) {
     return { ok: false, reason_code: RESTORE_CODES.REGISTRY_FAILED, detail: registry.detail, registry };
+  }
+
+  // Config/state files carried by the snapshot. They are ordinary file writes with a conflict classification; an
+  // existing different file is replaced only after a `.bak` copy (or written beside it with keepBoth).
+  const decoratedExtras = [];
+  for (const row of extras ?? []) {
+    const resolved = extraTargetPath(input.dshHome, row.entry);
+    if (resolved.ok !== true) {
+      return {
+        ok: false,
+        reason_code: RESTORE_CODES.TARGET_ESCAPE,
+        detail: `${row.entry.rel}: the restore target would resolve outside the DSH home; refusing to write it`,
+      };
+    }
+    const existing = fs.existsSync(resolved.target) ? sha256Hex(fs.readFileSync(resolved.target)) : null;
+    const sha256 = sha256Hex(row.buffer);
+    const conflict = existing === null ? 'new' : existing === sha256 ? 'identical' : 'differs';
+    decoratedExtras.push({
+      rel: row.entry.rel,
+      kind: row.entry.kind,
+      scope: row.entry.scope ?? row.entry.kind,
+      reason: row.entry.reason ?? null,
+      sha256,
+      size: row.buffer.length,
+      buffer: row.buffer,
+      target: resolved.target,
+      existing_sha256: existing,
+      conflict,
+      resolution: conflict === 'differs' ? (input.keepBoth === true ? 'keep-both' : 'backup-and-replace') : conflict,
+      action: conflict === 'differs' ? (input.keepBoth === true ? 'write kept-both copy' : 'backup then replace') : conflict,
+    });
   }
 
   const decoratedAttachments = [];
@@ -332,6 +478,24 @@ function buildPlan(context) {
     decoratedAttachments.push({ rel: row.entry.rel, attachment_id: row.entry.attachment_id, sha256: sha256Hex(row.buffer), buffer: row.buffer, target, existing: existing !== null });
   }
 
+  const filesSummary = {
+    registry: registry.base_document_restored === true ? 1 : 0,
+    config: decoratedExtras.filter((row) => row.kind === 'config').length,
+    state: decoratedExtras.filter((row) => row.kind === 'state').length,
+    written: 0,
+    conflicts: decoratedExtras.filter((row) => row.conflict === 'differs').length,
+    entries: decoratedExtras.map((row) => ({
+      rel: row.rel,
+      kind: row.kind,
+      size: row.size,
+      sha256: row.sha256,
+      target: row.target,
+      conflict: row.conflict,
+      action: row.action,
+      resolution: row.resolution,
+    })),
+  };
+
   return {
     ok: true,
     created_at: now.toISOString(),
@@ -339,9 +503,14 @@ function buildPlan(context) {
     dsh_home: input.dshHome,
     snapshot_id: source.snapshot_id,
     snapshot_digest: source.snapshot_digest,
+    scopes,
     candidates,
     attachments: decoratedAttachments,
+    files: decoratedExtras,
+    files_summary: filesSummary,
     registry,
+    registry_from_backup_document: registry.base_document_restored === true,
+    registry_source: registry.base_document_restored === true ? 'backup-document' : 'live-registry',
     pre_restore: { dir: preRestoreDir(input.dshHome, now), files: [] },
     keep_pre_restore: Number.isSafeInteger(input.keepPreRestore) ? input.keepPreRestore : DEFAULT_KEEP_PRE_RESTORE,
     summary: {
@@ -350,6 +519,10 @@ function buildPlan(context) {
       identical: candidates.filter((row) => row.conflict === 'identical').length,
       conflicts: candidates.filter((row) => row.conflict === 'differs').length,
       attachments: decoratedAttachments.length,
+      registry: filesSummary.registry,
+      config: filesSummary.config,
+      state: filesSummary.state,
+      file_conflicts: filesSummary.conflicts,
       runtime_verified: candidates.filter((row) => row.validation.runtime_verified).length,
       runtime_available: validation.runtime_available,
     },
@@ -420,6 +593,14 @@ export function applyRestore(input) {
     return { ok: false, reason_code: plan.reason_code, detail: plan.detail, dry_run: input.dryRun === true, restored: [], skipped: 0, attachments: 0, pre_restore_dir: null, bytes_written: 0, duration_ms: 0 };
   }
   const toWrite = plan.candidates.filter((candidate) => candidate.conflict !== 'identical');
+  const extrasToWrite = (plan.files ?? []).filter((row) => row.conflict !== 'identical');
+  const fileCounts = () => ({
+    registry: plan.registry_from_backup_document === true && plan.registry?.changed === true ? 1 : 0,
+    config: extrasToWrite.filter((row) => row.kind === 'config').length,
+    state: extrasToWrite.filter((row) => row.kind === 'state').length,
+    written: 0,
+    conflicts: extrasToWrite.filter((row) => row.conflict === 'differs').length,
+  });
   if (input.dryRun === true) {
     return {
       ok: true,
@@ -429,6 +610,10 @@ export function applyRestore(input) {
       attachments: plan.attachments.filter((row) => !row.existing).length,
       pre_restore_dir: plan.pre_restore.dir,
       registry: plan.registry.actions,
+      registry_from_backup_document: plan.registry_from_backup_document === true,
+      scopes: plan.scopes,
+      files: { ...fileCounts(), skipped_identical: (plan.files ?? []).filter((row) => row.conflict === 'identical').length },
+      files_summary: plan.files_summary,
       bytes_written: 0,
       duration_ms: Date.now() - started,
     };
@@ -443,6 +628,15 @@ export function applyRestore(input) {
       const copy = path.join(preDir, ...String(candidate.rel).replace(/\\/g, '/').split('/'));
       fs.mkdirSync(path.dirname(copy), { recursive: true });
       fs.copyFileSync(candidate.target, copy);
+      copied.push(copy);
+    }
+    // Every config/state target that will be overwritten gets a pre-restore copy too: the write is atomic per file,
+    // but the `.bak` that an overwrite leaves is one file back, not the pre-restore snapshot.
+    for (const extra of extrasToWrite) {
+      if (!fs.existsSync(extra.target)) continue;
+      const copy = path.join(preDir, ...String(extra.rel).replace(/\\/g, '/').split('/'));
+      fs.mkdirSync(path.dirname(copy), { recursive: true });
+      fs.copyFileSync(extra.target, copy);
       copied.push(copy);
     }
     if (fs.existsSync(plan.registry.file)) {
@@ -540,6 +734,86 @@ export function applyRestore(input) {
     };
   }
 
+  // Config/state files from the snapshot: one atomic write each, then a read-back digest check. A conflicting file
+  // is first copied to `<target>.bak-<stamp>` (or, with keepBoth, the restored copy is written beside it as
+  // `<target>.restored-<stamp>` and the live file is left alone). This is after the registry document so a failure
+  // here names the file and does not leave a half-written registry.
+  const writtenFiles = [];
+  try {
+    for (const extra of extrasToWrite) {
+      let target = extra.target;
+      if (extra.resolution === 'keep-both') {
+        target = `${extra.target}.restored-${stamp}`;
+      } else if (extra.conflict === 'differs' && fs.existsSync(extra.target)) {
+        fs.copyFileSync(extra.target, `${extra.target}.bak-${stamp}`);
+      }
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      writeFileAtomic(target, extra.buffer);
+      const readBack = fs.readFileSync(target);
+      const digest = sha256Hex(readBack);
+      if (digest !== extra.sha256) {
+        return {
+          ok: false,
+          reason_code: RESTORE_CODES.VERIFY_FAILED,
+          detail: `${extra.rel}: the written file hashes to ${digest}, not the planned ${extra.sha256}`,
+          dry_run: false,
+          restored,
+          skipped: plan.candidates.length - toWrite.length,
+          attachments: plan.attachments.filter((row) => !row.existing).length,
+          pre_restore_dir: preDir,
+          bytes_written: bytesWritten,
+          registry: [applied],
+          files: {
+            registry: plan.registry_from_backup_document === true && plan.registry.changed === true ? 1 : 0,
+            config: writtenFiles.filter((row) => row.kind === 'config').length,
+            state: writtenFiles.filter((row) => row.kind === 'state').length,
+            written: writtenFiles.length,
+            conflicts: extrasToWrite.filter((row) => row.conflict === 'differs').length,
+          },
+          duration_ms: Date.now() - started,
+        };
+      }
+      bytesWritten += extra.buffer.length;
+      writtenFiles.push({
+        rel: extra.rel,
+        kind: extra.kind,
+        target,
+        conflict: extra.conflict,
+        resolution: extra.resolution,
+        bytes: extra.buffer.length,
+        sha256: extra.sha256,
+      });
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      reason_code: error?.code ?? RESTORE_CODES.WRITE_FAILED,
+      detail: error?.detail ?? String(error?.message ?? error),
+      dry_run: false,
+      restored,
+      skipped: plan.candidates.length - toWrite.length,
+      attachments: plan.attachments.filter((row) => !row.existing).length,
+      pre_restore_dir: preDir,
+      bytes_written: bytesWritten,
+      registry: [applied],
+      files: {
+        registry: plan.registry_from_backup_document === true && plan.registry.changed === true ? 1 : 0,
+        config: writtenFiles.filter((row) => row.kind === 'config').length,
+        state: writtenFiles.filter((row) => row.kind === 'state').length,
+        written: writtenFiles.length,
+        conflicts: extrasToWrite.filter((row) => row.conflict === 'differs').length,
+      },
+      duration_ms: Date.now() - started,
+    };
+  }
+  const fileResult = {
+    registry: plan.registry_from_backup_document === true && plan.registry.changed === true ? 1 : 0,
+    config: writtenFiles.filter((row) => row.kind === 'config').length,
+    state: writtenFiles.filter((row) => row.kind === 'state').length,
+    written: writtenFiles.length,
+    conflicts: extrasToWrite.filter((row) => row.conflict === 'differs').length,
+  };
+
   // Read back what was written: same bytes, and still a valid file on disk. A mismatch here has one known cause:
   // the running client appended to the session between our write and this read. That case is recoverable without
   // losing the client's events -- restore the pre-copy (newest pre-write content), append the client's post-write
@@ -587,6 +861,10 @@ export function applyRestore(input) {
     pre_restore_files: copied.length,
     bytes_written: bytesWritten,
     registry: [applied],
+    registry_from_backup_document: plan.registry_from_backup_document === true,
+    scopes: plan.scopes,
+    files: fileResult,
+    files_written: writtenFiles,
     healed: healed.length > 0 ? healed : [],
     pruned_pre_restore: pruned.removed,
     warnings: typeof applied.warning === 'string' ? [applied.warning] : [],

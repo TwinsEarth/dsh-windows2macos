@@ -200,6 +200,10 @@
         backupOldUsageReminderGb: 10
         # 每次成功的定时备份后异步跑一次 G5 运行时终审并写缓存（面板默认显示最新记录；off 可关闭）。
         backupRuntimeVerify: nightly
+        # P0: registry/config/state are on by default - a backup without them cannot rebuild a usable home.
+        backupScopes: ['sessions', 'attachments', 'registry', 'config', 'state']
+        # P1: credentials are OFF by default; turn on only when the repository itself is trusted.
+        backupIncludeSecrets: false
         # 字面兼容需求 3：被替换的旧版本除记录外再写一份整文件加密副本（old/<ws>/<sid>/…json.enc）。
         # 代价：每个被替换版本在去重块之外多占一份整文件字节；不想要时改成 records。
         backupOldFormat: full
