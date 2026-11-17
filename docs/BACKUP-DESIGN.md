@@ -1418,3 +1418,17 @@ node --input-type=module -e "import { bindAccount } from 'file:///E:/GPT/w2m/w2m
 **边界**：守卫与 `writeFileAtomic` 之间仍是毫秒级 TOCTOU（原子写自己先写 tmp 再 rename，链接若在 tmp 目录内被换仍可能
 影响那一次写）；彻底关闭需要句柄级写入（`O_NOFOLLOW` 链）或目录 fd 打开，当前 Node/Windows 组合不做承诺。守卫覆盖的是
 "镜像树内部出现链接"这一实际可达的破坏面，测试用真实 junction 验证（环境禁止时按名 skip）。
+
+### 20.6 为什么不进面板（有意的边界）
+
+`renumber` 是**受控修复工具**，不是日常操作，因此面板（备份&还原）里没有它的入口——这是决定，不是遗漏：
+
+* **它改历史**：删除/插入事件会改变会话记录本身，必须由人判断"删哪一条、插什么"，不能做成一键按钮；
+* **入口固定为 `w2m-fix renumber`**（`bin/w2m-fix.mjs`），与 `dsh-fix` 的修复语义放在一起；`--dry-run` 先看映射与门禁结论，
+  apply 才写，并始终先留 `<file>.bak-<时间戳>`（保留数量见 `--keep-backups`）；
+* **门禁比面板操作更重**：静态 doctor + 未来追加模拟 + 安装的 Harness 终审（G5），任一失败零写入；
+* 面板只暴露非破坏性/可回滚的操作（备份、还原计划、归档、校验、注册表修复、解锁），破坏性历史编辑留在 CLI。
+
+发现路径：`w2m-fix --help` 的第一段就是"the one legal way to delete/insert events in a v4 session log (gate G4)"；
+`docs/BACKUP-DESIGN.md` §20 与本轮 `--keep-backups` 说明给出完整参数。若未来要在面板暴露它，必须先有"逐事件预览 +
+双人确认 + 只读审计记录"的设计，否则不做。
