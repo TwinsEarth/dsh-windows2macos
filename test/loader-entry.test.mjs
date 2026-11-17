@@ -732,9 +732,13 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
       }
       assert.deepEqual(
         (backup.backupClicks ?? []).map((row) => row.clicked),
-        [true, true, true, true],
-        'every one-click operation is clickable in the real page',
+        [true, true, true, true, true],
+        'the four one-click operations plus backup-active are clickable in the real page',
       );
+      assert.equal(backup.backupPanel?.actions?.includes('backup-selected'), true, 'the backup-selected entry exists');
+      assert.equal(backup.backupPanel?.actions?.includes('backup-active'), true, 'the backup-active entry exists');
+      assert.equal(backup.scopeActions?.active?.disabled, false, 'backup-active is usable even when the scan route is missing');
+      assert.equal(backup.scopeActions?.selected?.disabled, true, 'backup-selected stays disabled while there is nothing to pick');
       assert.equal(backup.backupLog?.rows >= 4, true, `each click records a log row (rows: ${backup.backupLog?.rows}, text: ${backup.backupLog?.text})`);
       assert.equal(backup.backupLog?.panelStillOpen, true, 'the panel stays mounted after route refusals');
       if (parity.rightTab?.marker === '1') {

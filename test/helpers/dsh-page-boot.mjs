@@ -516,6 +516,19 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
         await new Promise((resolve) => setTimeout(resolve, 700));
         backupClicks.push(clicked);
       }
+      // v3.5.0/P1: the two scope entries must exist too. `backup-active` works without the session list (the
+      // scan route is missing on a disabled row, so its click reaches the run route and logs the refusal);
+      // `backup-selected` must be visibly disabled because there is nothing to pick without a scan.
+      const scopeActions = await read(`
+        const read = (id) => {
+          const b = document.querySelector('[data-w2m-backup-action="' + id + '"]');
+          return b === null ? null : { disabled: b.disabled === true || b.getAttribute('aria-disabled') === 'true', label: b.textContent };
+        };
+        return { selected: read('backup-selected'), active: read('backup-active'), pickers: document.querySelectorAll('[data-w2m-backup-pick]').length, scanState: document.querySelector('[data-w2m-backup-scan-state]')?.getAttribute('data-w2m-backup-scan-state') ?? null };
+      `);
+      const activeClick = await read(`const b=document.querySelector('[data-w2m-backup-action="backup-active"]'); if(b===null)return{action:'backup-active',clicked:false}; b.click(); return{action:'backup-active',clicked:true};`);
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      backupClicks.push(activeClick);
       const backupLog = await read(`
         const rows=[...document.querySelectorAll('.w2mBackup_logRow')];
         return {
@@ -524,7 +537,7 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
           panelStillOpen: document.querySelector('[data-w2m-backup-panel]')!==null,
         };
       `);
-      report.backupProbe = { backupOpened, backupPanel, backupClicks, backupLog };
+      report.backupProbe = { backupOpened, backupPanel, backupClicks, backupLog, scopeActions };
       await evaluate(`
         (async () => {
           const r = await fetch('/api/w2m/decisions?includeArchived=1');
