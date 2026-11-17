@@ -1568,7 +1568,7 @@ describe('subplugin: cached runtime verdict and the nightly option (G5)', () => 
       const status = await (await find(BACKUP_RUN_ROUTE_PATH).fetch(new Request(`http://local.invalid${BACKUP_RUN_ROUTE_PATH}`, { method: 'GET' }))).json();
       assert.equal(status.state.last_runtime_verify.evidence, 'installed-harness', 'the embedded status exposes the cached record');
       assert.equal(status.state.last_runtime_verify.checked, 1);
-      assert.equal(status.runtime_verify.mode, 'off');
+      assert.equal(status.runtime_verify.mode, 'nightly', 'nightly is the default mode now');
       assert.equal(verifyCalls, 1, 'reading the status does not spawn the verifier again');
       assert.equal(readBackupState(home).state.last_runtime_verify.evidence, 'installed-harness');
     } finally {
@@ -1577,15 +1577,15 @@ describe('subplugin: cached runtime verdict and the nightly option (G5)', () => 
     }
   });
 
-  it('runs the runtime verify once per successful scheduled backup when nightly, never on the default off, and a failed verdict is a warning that still persists', async () => {
+  it('runs the runtime verify once per successful scheduled backup when nightly (the default), never when explicitly off, and a failed verdict is a warning that still persists', async () => {
     const { home, cleanup: cleanHome } = homeFixture();
     const { dir, cleanup } = tempDir('w2m-nightly-verify-');
     try {
-      // off (the default): a scheduled backup does not run a verdict at all.
+      // explicitly off: a scheduled backup does not run a verdict at all.
       const offFake = fakeCtx();
       const offHarness = schedulerHarness();
       let offCalls = 0;
-      apply(offFake.ctx, { backupDir: join(dir, 'repo-off'), dshHome: home, backupMachineKey: false, ...NO_FIRE }, {
+      apply(offFake.ctx, { backupDir: join(dir, 'repo-off'), dshHome: home, backupMachineKey: false, backupRuntimeVerify: 'off', ...NO_FIRE }, {
         createScheduler: offHarness.createScheduler,
         runtimeVerify: () => {
           offCalls += 1;
@@ -1595,7 +1595,7 @@ describe('subplugin: cached runtime verdict and the nightly option (G5)', () => 
       const offRun = await offHarness.captured.options.run();
       assert.equal(offRun.ok, true, offRun.detail);
       await flushScheduled();
-      assert.equal(offCalls, 0, 'off is the default: no runtime verdict after a scheduled backup');
+      assert.equal(offCalls, 0, 'off is explicit here: no runtime verdict after a scheduled backup');
 
       // nightly: after the backup is produced, exactly one verdict per successful slot.
       const fake = fakeCtx();
@@ -1644,7 +1644,7 @@ describe('subplugin: cached runtime verdict and the nightly option (G5)', () => 
     const refused = normalizeConfig({ backupRuntimeVerify: 'hourly' }, { env: {}, platform: 'win32' });
     assert.equal(refused.ok, false);
     assert.equal(refused.reason_code, 'BACKUP_CONFIG_INVALID');
-    assert.equal(normalizeConfig({}, { env: {}, platform: 'win32' }).runtime_verify, 'off');
+    assert.equal(normalizeConfig({}, { env: {}, platform: 'win32' }).runtime_verify, 'nightly', 'nightly is the default');
     assert.equal(normalizeConfig({ backupRuntimeVerify: 'nightly' }, { env: {}, platform: 'win32' }).runtime_verify, 'nightly');
   });
 });

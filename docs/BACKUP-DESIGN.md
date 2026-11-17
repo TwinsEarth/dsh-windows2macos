@@ -652,7 +652,7 @@ UI 半只有一个文件：`lib/client.js`（手写、由 `window.__ModuleLoader
   原子持久化到 `<DSH_HOME>/xclient/w2m-backup/state.json`（`xclient/` 是本包自己的状态区；`storages/` 是客户端
   所有，插件不写）。`GET /verify?runtime=cached` 只读该记录、**绝不 spawn**；`finished_at` 超过 24 h 标
   `stale:true`，没有记录与不可解析的时间戳同样按 stale 报（"没有新证据"不是"新鲜"）。`GET /run` 的内嵌状态带
-  `state.last_runtime_verify`（只会是缓存）。插件配置 `backupRuntimeVerify: 'off' | 'nightly'`（默认 `off`，
+  `state.last_runtime_verify`（只会是缓存）。插件配置 `backupRuntimeVerify: 'off' | 'nightly'`（**默认 `nightly`**：每次成功的定时备份后异步跑一次终审并刷新缓存；`off` 显式关闭，
   非法值 `BACKUP_CONFIG_INVALID` 拒绝挂载）：`nightly` 只在**成功**的定时备份（含错过时段补跑）之后
   fire-and-forget 跑一次，失败只写 warning、记录照样持久化，**绝不让备份或调度失败**；CLI 手动入口
   `w2m-backup run --runtime-verify`（跑完后执行一次并持久化，失败只加 warning，备份结果不变）。
@@ -669,7 +669,7 @@ UI 半只有一个文件：`lib/client.js`（手写、由 `window.__ModuleLoader
   codes/24 h stale 边界/持久化路径/in-flight 单次 spawn/失败也持久化）与 CLI `run --runtime-verify` 的持久化记录。
 * `test/backup-run.test.mjs`：`?runtime=cached` 不 spawn、过期标 stale、`?runtime=1` 更新缓存、`GET /run` 内嵌
   `state.last_runtime_verify`；`backupRuntimeVerify: 'off'|'nightly'` 的配置归一化，nightly 每个成功定时备份恰好
-  跑一次、失败只 warning 且记录持久化、默认 off。
+  跑一次、失败只 warning 且记录持久化、默认 nightly（`off` 可显式关闭）。
 * `test/loader-entry.test.mjs`：真实 Chromium 页面（抛空 profile 安装当前 tarball）断言面板入口与四操作标记。
 
 ## 20. G4 收口：seq 重编号工具（v3.4.8/v3.4.9）
@@ -1023,7 +1023,7 @@ cachedNone/stale/fresh`。测试：`test/client-bundle.test.mjs` 新增 3 条（
   是这个边界**：`registerThroughHost` 会读会话 header cwd，并挂到那个仍存在的目录（`cwd_fallback`）；只有 header cwd
   缺失/无法 realpath（盘符或目录已删）或服务在 fallback 后仍拒绝时，才退回离线 CLI + watch。
 * 面板运行时终审仍是 opt-in（慢）：勾选框让「全量校验」同步跑 `?runtime=1`，或点「立即运行（慢）」按钮；缓存块
-  只读最近一次记录并明确标 stale（>24 h）。nightly 只在配置 `backupRuntimeVerify: 'nightly'` 时启用，默认 `off`；
+  只读最近一次记录并明确标 stale（>24 h）。nightly 默认启用（`backupRuntimeVerify: 'nightly'`），显式 `off` 可关闭；
   失败的终审只记 warning 并持久化失败记录，**不**让备份/调度失败，也**不**回滚已提交备份。
 * renumber 的"追加后失败"拒绝分支在规范产出上不可达（§20.5 论证），只由测试缝驱动；生产代码里该选项只有一个
   定义处、没有调用者，测试机器校验了这一点。文件级例外（非规范输入）由 `parseLog` 在更早处具名拒绝，不会走到分支。

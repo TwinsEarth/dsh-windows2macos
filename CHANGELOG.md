@@ -4,6 +4,12 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### G5 运行时终审默认 nightly（未发布）
+
+- `backupRuntimeVerify` 的默认值从 `off` 改为 **`nightly`**：每次成功的定时备份（含补跑）之后异步跑一次终审并把记录写入 `state.last_runtime_verify`，面板默认显示的就是最新记录（仍带时间戳，不是实时保证）；显式 `backupRuntimeVerify: off` 可关闭，`?runtime=1` 仍可手动跑。
+- `cordis.patch.yml` 的 `dsh-backup` 行显式写 `backupRuntimeVerify: nightly`；测试更新默认断言与「显式 off 不跑、nightly 每个成功槽跑一次、失败只 warning」三组行为。
+
+
 ### 注册表写入的边界（一句话，未发布）
 
 - **注册表写入的边界（一句话）**：宿主内走 `ctx.workspaceRegistry` 服务（`attachSession` 先持久化再改内存），**不存在客户端回写竞态**；离线 CLI 走文件写 + `--watch` 复查，**只能缩小窗口、不能消除**——watch 结束后客户端一次保存仍可能移除登记（`residual_risk` 非空）。

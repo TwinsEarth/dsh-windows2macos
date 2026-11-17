@@ -297,7 +297,7 @@ export function normalizeConfig(config = {}, deps = {}) {
     : null;
   // The runtime verdict after the scheduled backup: `off` (default) or `nightly`. Refused here like the other
   // enum options so a typo cannot silently mean "never" when the operator asked for a nightly verdict.
-  const runtimeVerify = config.backupRuntimeVerify ?? 'off';
+  const runtimeVerify = config.backupRuntimeVerify ?? 'nightly';
   if (!RUNTIME_VERDICT_MODES.includes(runtimeVerify)) {
     return {
       ok: false,
@@ -341,7 +341,7 @@ export function normalizeConfig(config = {}, deps = {}) {
  * @param {object} ctx Cordis context
  * @param {object} [config] row configuration (`backupDir`, `backupTimes`, `backupTimeZone`, `backupScope`,
  *   `keepOldPerSession`, `backupOldVersionDays`, `backupOldFormat`, `backupFullCopyMaxMb`, `backupMirrorDir`,
- *   `backupOldUsageReminderGb`, `backupEnabled`, `backupRuntimeVerify: 'off'|'nightly'`)
+ *   `backupOldUsageReminderGb`, `backupEnabled`, `backupRuntimeVerify: 'off'|'nightly'` (default nightly))
  * @param {{runtimeVerify?: Function, registerWatch?: Function, createScheduler?: Function, now?: Function}} [deps]
  *   Injectable seams for tests. `runtimeVerify` replaces the real `verifyRepo({runtime:true})` call the cached
  *   verdict store runs (so a unit test never spawns the Harness); `registerWatch` replaces the bounded watch the
