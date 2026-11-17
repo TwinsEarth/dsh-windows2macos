@@ -1863,3 +1863,318 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
   });
 });
 
+// ---------------------------------------------------------------------------------------------
+// The 「编队版本」 card (v3.5.0)
+// ---------------------------------------------------------------------------------------------
+//
+// The dashboard half of the version gate: `GET /api/w2m/target` already carries the `versions`
+// block (`summarizeVersionDashboard` in `src/plugin/version-gate.mjs`), and `w2m_devices` returns
+// the same shape. What is asserted here is that the card renders that block in the operation
+// panel's actions section, that a missing/failed block is a stated "unknown" rather than an
+// exception or an empty-looking fleet, and that the copy affordance works in a page and degrades
+// to a no-op with no clipboard at all.
+
+describe('client bundle: the 编队版本 card (v3.5.0)', () => {
+  /** A `/api/w2m/target` snapshot with (or without) the versions block under test. */
+  function versionSnapshot(versions) {
+    return {
+      session_id: 'sess-drift',
+      selected: { machine_id: null, name: null, selected_at: null, online: null, stale: false },
+      machines: [],
+      fleet: { ok: true, error: null, online: 2, total: 3, excluded: 1, rabbit_time: null },
+      ...(versions === undefined ? {} : { versions }),
+      host: { local_machine_name: null, detail_unavailable: false },
+      relays: null,
+    };
+  }
+
+  /** The block a 3.5.0 host sends when one machine is behind and one cannot report its version. */
+  function driftVersions() {
+    return {
+      supported_min: '3.5.0',
+      distribution: { '3.5.0': 2, '3.4.5': 1 },
+      outdated: [{ machine_id: 'win-old', version: '3.4.5' }],
+      unknown: [{ machine_id: 'mac-unknown' }],
+      all_current: false,
+    };
+  }
+
+  /**
+   * Mount one exported component with the hook-capable React stand-in and a fake fetch.
+   *
+   * Every request is recorded so a test can assert *which* route the card read; `settle()` runs the
+   * effects (the read) and re-renders once the promise has landed.
+   */
+  function mountWith(options = {}) {
+    const mountReact = makeMountReact();
+    const requests = [];
+    const respond = options.fetch ?? (async () => ({ ok: true, status: 200, json: async () => versionSnapshot(driftVersions()) }));
+    const bundle = loadBundle({
+      document: options.document,
+      requireImpl: (specifier) => {
+        if (specifier === 'react') return mountReact.React;
+        throw new Error(`unexpected require(${specifier})`);
+      },
+      globals: {
+        fetch: async (url, init) => {
+          requests.push(String(url));
+          return respond(String(url), init);
+        },
+        AbortController,
+        ...(options.globals ?? {}),
+      },
+    });
+    const t = bundle.exports.makeTranslator(() => undefined);
+    const handle = mountReact.mount(bundle.exports[options.component ?? 'FleetVersionsCard'], {
+      t,
+      sessionId: options.sessionId ?? 'sess-drift',
+    });
+    const settle = async (rounds = 1) => {
+      for (let round = 0; round < rounds; round += 1) {
+        await new Promise((resolve) => { setTimeout(resolve, 0); });
+        handle.rerender();
+      }
+    };
+    return { bundle, handle, requests, t, settle };
+  }
+
+  it('renders inside the operation panel actions section, next to the fleet target control', async () => {
+    const capabilityResponse = async () => ({ ok: true, status: 200, json: async () => ({ ok: true, capability: null }) });
+    const targetResponse = async () => ({ ok: true, status: 200, json: async () => versionSnapshot(driftVersions()) });
+    const { handle, requests, settle } = mountWith({
+      component: 'OpsActionsSection',
+      fetch: async (url) => (url.startsWith('/api/w2m/capability') ? capabilityResponse() : targetResponse()),
+    });
+    await settle(3);
+
+    const cards = findBy(handle.tree, (node) => node.props?.['data-w2m-fleet-version-card'] === 'true');
+    assert.equal(cards.length, 1, 'the card is rendered in the actions section, not as a new panel');
+    assert.ok(requests.some((url) => url.startsWith('/api/w2m/target')), 'it reads the same target snapshot as the target control');
+
+    const text = collectText(handle.tree).join('\n');
+    assert.ok(text.includes('编队版本'), 'the card title is the Chinese default');
+    assert.ok(text.includes('最低支持版本: 3.5.0'), 'the supported minimum is rendered');
+    const rows = findBy(handle.tree, (node) => node.props?.['data-w2m-version-row'] !== undefined);
+    assert.deepEqual(rows.map((node) => node.props['data-w2m-version-row']), ['3.5.0', '3.4.5'],
+      'the stock distribution keeps the host order, newest first');
+    assert.ok(text.includes('3.5.0 × 2') && text.includes('3.4.5 × 1'), 'each distribution row is version × count');
+    const outdated = findBy(handle.tree, (node) => node.props?.['data-w2m-version-outdated'] === 'true');
+    assert.equal(outdated.length, 1, 'the outdated machine is listed');
+    assert.ok(collectText(outdated[0]).join('').includes('win-old @ 3.4.5'), 'the outdated row is machine_id @ version');
+    const unknown = findBy(handle.tree, (node) => node.props?.['data-w2m-version-unknown'] === 'true');
+    assert.equal(unknown.length, 1, 'the unknown-version machine is listed');
+    assert.ok(collectText(unknown[0]).join('').includes('mac-unknown'));
+    assert.equal(findBy(handle.tree, (node) => node.props?.['data-w2m-version-all-current'] === 'true').length, 0,
+      'a drifting fleet does not show the all-current badge');
+
+    // The refresh button re-reads the snapshot; the card is mounted, not polled, so this is the only
+    // way the operator can ask again without leaving the tab.
+    const readsBefore = requests.filter((url) => url.startsWith('/api/w2m/target')).length;
+    findBy(handle.tree, (node) => node.props?.['data-w2m-version-refresh'] === 'true')[0].props.onClick();
+    await settle();
+    assert.equal(requests.filter((url) => url.startsWith('/api/w2m/target')).length, readsBefore + 1,
+      'the refresh button re-fetches the target snapshot');
+  });
+
+  it('is mounted in the operation panel actions tab, with no new sidebar slot', () => {
+    const source = readFileSync(BUNDLE_PATH, 'utf8');
+    assert.ok(source.includes('function FleetVersionsCard('), 'the card exists');
+    assert.ok(source.includes('function OpsActionsSection('), 'the section that owns it');
+    const start = source.indexOf('function OpsActionsSection(');
+    const end = source.indexOf('function FleetVersionsCard(', start);
+    assert.ok(end > start, 'the card is declared after the section body');
+    const section = source.slice(start, end);
+    assert.ok(section.includes('h(FleetVersionsCard,'), 'the actions section renders the card');
+    assert.ok(section.includes('h(TargetSelect,'), 'next to the fleet target control reading the same snapshot');
+    assert.ok(source.includes("['actions', '操作入口']"), 'the operation-panel tab that shows the section');
+    assert.ok(source.includes('h(OpsActionsSection, { t, sessionId })'), 'the panel body switches to that section');
+    assert.equal(source.includes("id: 'w2m-fleet-versions'"), false, 'no extra sidebar entry was added for it');
+  });
+
+  it('an all-current fleet hides the outdated block and shows the badge', async () => {
+    const { handle, settle } = mountWith({
+      fetch: async () => ({
+        ok: true,
+        status: 200,
+        json: async () => versionSnapshot({
+          supported_min: '3.5.0',
+          distribution: { '3.5.0': 3 },
+          outdated: [],
+          unknown: [],
+          all_current: true,
+        }),
+      }),
+    });
+    await settle();
+    assert.equal(findBy(handle.tree, (node) => node.props?.['data-w2m-version-all-current'] === 'true').length, 1,
+      'the all-current badge is shown');
+    assert.equal(findBy(handle.tree, (node) => node.props?.['data-w2m-version-outdated'] === 'true').length, 0);
+    const text = collectText(handle.tree).join('\n');
+    assert.ok(!text.includes('落后机器'), 'the whole outdated block is hidden, not just its rows');
+    assert.ok(text.includes('3.5.0 × 3'), 'the distribution is still rendered');
+  });
+
+  it('renders the neutral unavailable state for an older host or a failed read, without throwing', async () => {
+    // ① a 2xx snapshot from a host that predates the versions block
+    const older = mountWith({
+      fetch: async () => ({ ok: true, status: 200, json: async () => versionSnapshot(undefined) }),
+    });
+    await older.settle();
+    const olderCard = findBy(older.handle.tree, (node) => node.props?.['data-w2m-fleet-version-card'] === 'true');
+    assert.equal(olderCard.length, 1, 'the card still renders');
+    assert.equal(olderCard[0].props['data-w2m-version-state'], 'unavailable');
+    assert.ok(collectText(older.handle.tree).join('\n').includes('版本信息未知'));
+    assert.equal(findBy(older.handle.tree, (node) => node.props?.['data-w2m-version-copy'] === 'true').length, 0,
+      'nothing honest to copy is offered without a block');
+
+    // ② the route is absent on the host (404), which is how an older host answers
+    const missing = mountWith({
+      fetch: async () => ({ ok: false, status: 404, json: async () => ({ ok: false, error: 'not found' }) }),
+    });
+    await missing.settle();
+    assert.equal(findBy(missing.handle.tree, (node) => node.props?.['data-w2m-fleet-version-card'] === 'true')[0]
+      .props['data-w2m-version-state'], 'unavailable');
+
+    // ③ the fetch itself fails (host/relay down): a value, not an exception
+    const failed = mountWith({
+      fetch: async () => { throw new Error('host down'); },
+    });
+    await failed.settle();
+    assert.equal(findBy(failed.handle.tree, (node) => node.props?.['data-w2m-fleet-version-card'] === 'true')[0]
+      .props['data-w2m-version-state'], 'unavailable');
+
+    // ④ the host answered, but its own roster read failed: the empty block it still sends must not
+    //    be presented as a drift-free fleet.
+    const unreadable = mountWith({
+      fetch: async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ...versionSnapshot({ supported_min: '3.5.0', distribution: {}, outdated: [], unknown: [], all_current: false }),
+          fleet: { ok: false, error: 'the fleet could not be read', online: 0, total: 0, excluded: 0, rabbit_time: null },
+        }),
+      }),
+    });
+    await unreadable.settle();
+    assert.equal(findBy(unreadable.handle.tree, (node) => node.props?.['data-w2m-fleet-version-card'] === 'true')[0]
+      .props['data-w2m-version-state'], 'unavailable', 'an unreadable roster is "unknown", never "no outdated machines"');
+  });
+
+  it('copies the upgrade guidance through the clipboard and shows the copied state', async () => {
+    const writes = [];
+    const { handle, settle } = mountWith({
+      globals: {
+        navigator: { clipboard: { writeText: async (text) => { writes.push(text); } } },
+      },
+    });
+    await settle();
+    const copyButton = findBy(handle.tree, (node) => node.props?.['data-w2m-version-copy'] === 'true')[0];
+    assert.ok(copyButton !== undefined, 'the copy button is rendered');
+    assert.equal(collectText(copyButton).join(''), '一键复制升级指引');
+    copyButton.props.onClick();
+    await settle();
+    assert.equal(writes.length, 1, 'the clipboard received the guidance exactly once');
+    const guidance = writes[0];
+    assert.ok(guidance.includes('升级到 @twinsearth/w2m-dsh-plugin@3.5.0'), 'the guidance names the target version');
+    assert.ok(guidance.includes('npm i -g @twinsearth/w2m-dsh-plugin@3.5.0'), 'the npm command is in the guidance');
+    assert.ok(guidance.includes('- win-old @ 3.4.5'), 'the outdated machine is named with its version');
+    assert.ok(guidance.includes('- mac-unknown'), 'the unknown machine is named');
+    const copiedButton = findBy(handle.tree, (node) => node.props?.['data-w2m-version-copy'] === 'true')[0];
+    assert.equal(copiedButton.props['data-copied'], 'true', 'the copied state is visible');
+    assert.equal(collectText(copiedButton).join(''), '已复制');
+  });
+
+  it('falls back to document.execCommand and is a safe no-op with no clipboard at all', async () => {
+    // ① legacy path: navigator.clipboard is absent but the document can still copy
+    let copyCalls = 0;
+    let appended = 0;
+    const legacyDocument = {
+      body: { appendChild: () => { appended += 1; }, removeChild: () => {} },
+      createElement: () => ({ style: {}, select: () => {}, value: '' }),
+      execCommand: (command) => { copyCalls += 1; return command === 'copy'; },
+      querySelector: () => null,
+      querySelectorAll: () => [],
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    };
+    const legacy = mountWith({ document: legacyDocument });
+    await legacy.settle();
+    findBy(legacy.handle.tree, (node) => node.props?.['data-w2m-version-copy'] === 'true')[0].props.onClick();
+    await legacy.settle();
+    assert.equal(copyCalls, 1, 'the legacy path ran exactly once');
+    assert.equal(appended, 1, 'the textarea was attached for execCommand');
+    assert.equal(findBy(legacy.handle.tree, (node) => node.props?.['data-w2m-version-copy'] === 'true')[0]
+      .props['data-copied'], 'true');
+
+    // ② headless: no navigator, no document body, no execCommand — no throw and no false claim
+    const headlessDocument = {
+      createElement: () => ({ style: {} }),
+      querySelector: () => null,
+      querySelectorAll: () => [],
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    };
+    const headless = mountWith({ document: headlessDocument });
+    await headless.settle();
+    const headlessCopy = findBy(headless.handle.tree, (node) => node.props?.['data-w2m-version-copy'] === 'true')[0];
+    assert.doesNotThrow(() => headlessCopy.props.onClick());
+    await headless.settle();
+    const after = findBy(headless.handle.tree, (node) => node.props?.['data-w2m-version-copy'] === 'true')[0];
+    assert.equal(after.props['data-copied'], 'false', 'a headless page never claims a copy it did not make');
+    assert.equal(collectText(after).join(''), '一键复制升级指引');
+  });
+
+  it('registers the panel.fleet.version.* strings in both dictionaries', () => {
+    const { exports } = loadBundle();
+    const registry = makeRegistry();
+    const locale = makeLocale();
+    const ctx = makeStrictContext({ inject: [...exports.inject], services: { slots: registry, locale } });
+    exports.apply(ctx);
+    const dictionary = locale.registered.get('w2m.target');
+    assert.ok(dictionary !== undefined, 'the dictionaries reach the locale service');
+    const suffixes = [
+      'title', 'supportedMin', 'distribution', 'outdated', 'unknown', 'allCurrent',
+      'refresh', 'copyGuidance', 'copied', 'unavailable', 'noOutdated', 'guidanceTitle',
+    ];
+    for (const suffix of suffixes) {
+      const key = `panel.fleet.version.${suffix}`;
+      assert.equal(typeof dictionary.zh[key], 'string', `the zh dictionary has ${key}`);
+      assert.equal(typeof dictionary.en[key], 'string', `the en dictionary has ${key}`);
+      assert.notEqual(dictionary.zh[key].trim(), '', `the zh value for ${key} is not empty`);
+      assert.notEqual(dictionary.en[key].trim(), '', `the en value for ${key} is not empty`);
+    }
+    assert.equal(dictionary.zh['panel.fleet.version.title'], '编队版本', 'Chinese is the default');
+    assert.equal(dictionary.en['panel.fleet.version.title'], 'Fleet versions');
+    assert.notEqual(dictionary.zh['panel.fleet.version.unavailable'], dictionary.en['panel.fleet.version.unavailable'],
+      'the unavailable copy is translated, not copied');
+  });
+
+  it('normalizes a partial block defensively and refuses to build guidance from an unusable one', () => {
+    const { exports } = loadBundle();
+    const block = exports.fleetVersionBlock({
+      versions: {
+        supported_min: '3.5.0',
+        distribution: { '3.5.0': 2, '': 1, '3.4.5': 'x' },
+        outdated: [{ machine_id: 'win-old', version: '3.4.5' }, { machine_id: '', version: '3.4.0' }],
+        unknown: [{ machine_id: 'mac-unknown' }, null],
+        all_current: false,
+      },
+    });
+    assert.deepEqual(JSON.parse(JSON.stringify(block)), {
+      supported_min: '3.5.0',
+      distribution: [{ version: '3.5.0', count: 2 }],
+      outdated: [{ machine_id: 'win-old', version: '3.4.5' }],
+      unknown: [{ machine_id: 'mac-unknown' }],
+      all_current: false,
+    }, 'unnamed machines and non-numeric counts are dropped, not guessed at');
+    assert.equal(exports.fleetVersionBlock(null), null);
+    assert.equal(exports.fleetVersionBlock(undefined), null);
+    assert.equal(exports.fleetVersionBlock({}), null, 'a host without the block is unavailable');
+    assert.equal(exports.fleetVersionBlock({ versions: null }), null);
+    assert.equal(exports.fleetVersionBlock({ versions: { distribution: {} } }), null,
+      'no supported_min means no comparison, so the block is unusable');
+    assert.equal(exports.buildVersionGuidance(null, exports.makeTranslator(() => undefined)), '');
+    assert.equal(exports.buildVersionGuidance({ supported_min: '' }, exports.makeTranslator(() => undefined)), '');
+  });
+});
+

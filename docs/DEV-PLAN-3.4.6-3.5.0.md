@@ -295,7 +295,7 @@ seq 缺口拒绝、dense 通过、运行时证据正/反向。详见 `docs/BACKU
 
 ### v3.5.0 实施记录（2026-11-17，本次交付：可测试的非 UI 半）
 
-**已交付 A–D**（面板 UI 与 Phase 2 合并评审不在本次范围）：
+**已交付 A–D**（本轮；面板「编队版本」卡片 UI 半见下方补记，Phase 2 合并评审仍不在本半范围）：
 
 - **A 最低版本门禁**：`src/plugin/version-gate.mjs` 定义唯一常量 `MIN_SUPPORTED_PLUGIN_VERSION = '3.5.0'`、
   semver 比较器（`x.y.z` + 预发布后缀，无法解析一律按 unknown 处理、绝不猜相等，因此不会把同版本误判为通过）
@@ -313,7 +313,8 @@ seq 缺口拒绝、dense 通过、运行时证据正/反向。详见 `docs/BACKU
 - **B 版本漂移看板数据**：`summarizeVersionDashboard(records,{supportedMin})` 纯函数输出
   `{supported_min, distribution, outdated, unknown, all_current}`；`w2m_devices` 与 `GET /api/w2m/target` 的
   payload **增量**携带 `versions` 块（既有 `version_drift`/`machines`/`fleet` 字段不变，名册读取失败时
-  `all_current:false`）。面板「编队版本」卡片 UI 本次不做（`lib/client.js` 不在本半）。
+  `all_current:false`）。面板「编队版本」卡片 UI 不在本半（后续补记已交付，见下方
+  「v3.5.0 实施记录补记」）。
 - **C 保留策略**：`rotation.mjs` 新增 `selectPrunable(records,{keep,maxAgeDays,now})` 纯函数与 `maxAgeDays` 规则：
   **两条规则同时生效**——只有既在“最新 `keep` 份之内”又“不早于 N 天”的记录才保留；0/缺省 = 仅按份数。
   `resolveMaxAgeDays` 在 engine/gc 任何写盘前校验，非法值具名拒绝 `BACKUP_ROTATION_POLICY_INVALID`。
@@ -336,9 +337,34 @@ seq 缺口拒绝、dense 通过、运行时证据正/反向。详见 `docs/BACKU
 `node scripts/pack.mjs` 通过。`docs/BACKUP-DESIGN.md` §21 记录保留策略与异地副本协议；`FLEET-RULES.md` §9
 记录门禁规则。
 
-**延期（明确不在本次）**：① 面板「编队版本」卡片（UI 半，`lib/client.js`）；② Relay Phase 2 合并（独立评审线，
-不阻塞本半）；③ 协议 v2 变更规则文档（`w2m-session-backup/v1` 仍冻结，只增字段）。发布步骤（6 处版本号同步、
-preflight、三方发布）属于发布审批，不在本半执行。
+**延期（明确不在本次）**：① 面板「编队版本」卡片（UI 半，`lib/client.js`）——已在下一条补记中交付；
+② Relay Phase 2 合并（独立评审线，不阻塞本半）；③ 协议 v2 变更规则文档（`w2m-session-backup/v1` 仍冻结，只增字段）。
+发布步骤（6 处版本号同步、preflight、三方发布）属于发布审批，不在本半执行。
+
+### v3.5.0 实施记录补记（2026-11-17：面板「编队版本」卡片，交付项 2 的 UI 半）
+
+v3.5.0 交付项 2「版本漂移看板」的 UI 半已补齐，数据半见上 B：
+
+- **面板位置**：操作面板（左侧栏「操作面板」/ composer 浮窗打开的 `W2mOpsPanel`）→「操作入口」页
+  `OpsActionsSection`，紧挨已有的「目标机器」控件；**不新增侧栏槽位**。理由：`versions` 块本来就随该页
+  「目标机器」读取的 `GET /api/w2m/target` 快照返回（宿主 `FLEET_CACHE_MS = 10s` 缓存），把「哪台机器跑」
+  与「每台机器是什么版本」放在同一页；单开侧栏页只会让同一份只读数据多一个入口。
+- **内容**：最低支持版本（`supported_min`）、版本分布（`version × count`）、落后机器（`machine_id @ version`）、
+  版本未知机器（`machine_id`）、`all_current` 徽标（为 `true` 时隐藏落后块）。「一键复制升级指引」按当前块生成
+  `npm i -g @twinsearth/w2m-dsh-plugin@<supported_min>` + 机器清单，优先 `navigator.clipboard.writeText`，
+  回退 `document.execCommand('copy')`，成功显示「已复制」；无 navigator/document 时安全返回 false，不抛错。
+  i18n `panel.fleet.version.*` 中英各 12 键（默认中文）。
+- **只读与降级（诚实边界）**：卡片只读宿主既有 `versions` 块（`summarizeVersionDashboard` 的输出），不派发、
+  不写选择、不新增 relay 端点；请求失败、旧宿主没有该块、或快照自报 `fleet.ok:false`（名册读取失败）时
+  显示「版本信息未知」中性状态，**不把读取失败渲染成全部达标**；挂载即读 + 「刷新」按钮重读，
+  无轮询定时器（卸载时 abort）。
+- **测试**：`test/client-bundle.test.mjs` 新增 `client bundle: the 编队版本 card (v3.5.0)` 共 8 项——操作入口页内
+  渲染（分布/落后/未知/徽标）、无新侧栏槽位、`all_current` 隐藏落后块、缺块/404/读取失败均为不可用态且不抛错、
+  剪贴板复制 + `execCommand` 回退 + headless 安全、中英字典 12 键齐全、`fleetVersionBlock` 防御性归一化。
+  `npx eslint .` 0 error、`node scripts/layer-check.mjs` clean、`node scripts/scan-mojibake.mjs` clean。
+- **仍待（发布审批时收集）**：② Relay Phase 2 合并评审；v3.5.0 完整验收证据（真实拒绝一台 3.4.5 机器、Phase 2
+  三节点集成 2/2、备份保留策略审计、全量套件 + preflight GREEN、三方发布字节一致）。本次不 bump 版本、
+  不跑 preflight、不提交。
 
 ---
 

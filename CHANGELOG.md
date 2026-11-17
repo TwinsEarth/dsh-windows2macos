@@ -4,6 +4,21 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### v3.5.0 「编队版本」看板卡片（UI 半，未发布）
+
+- **`lib/client.js`：操作面板 →「操作入口」页新增「编队版本」卡片**：v3.5.0 交付项 2 的 UI 半——显示
+  最低支持版本、版本分布（`version × count`）、落后机器（`machine_id @ version`）、版本未知机器与
+  `all_current` 徽标（为 `true` 时隐藏落后块），并提供「一键复制升级指引」（`npm i -g
+  @twinsearth/w2m-dsh-plugin@<supported_min>` + 机器清单；优先 `navigator.clipboard.writeText`，
+  回退 `document.execCommand('copy')`，成功显示「已复制」，headless 安全返回 false）。i18n
+  `panel.fleet.version.*` 中英各 12 键。**它只读宿主既有的只读 `versions` 块**（`GET
+  /api/w2m/target` / `w2m_devices` 上 `summarizeVersionDashboard` 的输出），不派发任务、不写选择、
+  不新增 relay 端点；请求失败或旧宿主没有该块时显示「版本信息未知」中性状态，**不把读取失败当成
+  全部达标**。未新增侧栏槽位：卡片就放在「目标机器」旁边，两侧读同一份快照。测试见
+  `test/client-bundle.test.mjs` 新增的 8 项；`npx eslint .` 0 error、`node
+  scripts/layer-check.mjs` 与 `node scripts/scan-mojibake.mjs` clean。本次不 bump 版本号、不跑
+  preflight、不提交。
+
 ### G2/G3/G4/G5 收口补记（未发布）
 
 - **G2 `w2m-backup register`（`src/backup/register.mjs`）**：磁盘上已存在、注册表里没有的会话不再需要手写脚本——
