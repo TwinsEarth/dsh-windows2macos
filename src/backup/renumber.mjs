@@ -461,9 +461,15 @@ function describeCoreRefusal(core) {
  *   allowStaticValidation?: boolean, harness?: object|null, env?: Record<string, string|undefined>,
  *   now?: Date, futureAppendCheck?: Function,
  * }} input
- *   `futureAppendCheck` is a test seam: production never passes it, and it must answer in the shape of
- *   {@link futureAppendVerdict} (the gate G3 simulation). It exists so the "refuse when the appended log would
- *   fail" branch is testable without handwriting a log that passes the doctor but not the append simulation.
+ *   `futureAppendCheck` is a test seam, and the branch it drives is **unreachable by construction** from a
+ *   successful `renumberBuffer`: that function re-encodes canonically (the header alone in frame 1, then exactly
+ *   one JSON event per frame) with dense `seq === index`, and the one appended event is `permission/preset` --
+ *   session-level, no surface, no `*Seq` reference, next dense seq. Given the source log passed the static doctor,
+ *   the appended buffer therefore cannot trip a doctor rule (header/frame, dense seq, surface, reference), so
+ *   `staticFuture.ok` is always true for a canonical result. The seam exists so the call site can still be
+ *   exercised deterministically; `test/fix-renumber.test.mjs` machine-checks that no production caller passes it.
+ *   (A non-canonical buffer *can* pass the doctor and fail the append simulation -- e.g. a stray non-event row
+ *   shifts the computed next seq -- but `parseLog` refuses such a buffer before this check is reached.)
  * @returns {object} a plan -- `ok:false` carries `reason_code`/`detail` and no bytes to write
  */
 export function planRenumber(input = {}) {
@@ -569,6 +575,8 @@ export function planRenumber(input = {}) {
   };
 
   if (plan.validation.static.ok !== true || staticFuture.ok !== true) {
+    // `staticFuture.ok === false` with `static.ok === true` is only reachable through the injected seam: a
+    // canonical re-encoded result always passes the append simulation (see the `futureAppendCheck` doc above).
     const parts = [];
     if (plan.validation.static.ok !== true) parts.push(`the doctor refused the renumbered log: ${plan.validation.static.codes.join(', ') || 'no code'}`);
     if (staticFuture.ok !== true) parts.push(`the future-append simulation refused the renumbered log: ${staticFuture.codes.join(', ') || 'no code'}`);

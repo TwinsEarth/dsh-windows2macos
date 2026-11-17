@@ -53,6 +53,9 @@
 import { applyRestore, planRestore } from '../backup/restore.mjs';
 import { buildArchive } from '../backup/archive.mjs';
 import { DEFAULT_RECHECK_DELAYS, scheduleRegistryRecheck } from '../backup/registry-watch.mjs';
+import { applyRegister, planRegister, registerThroughHost, REGISTER_CODES } from '../backup/register.mjs';
+import { DEFAULT_ROUTE_WATCH_CAP_MS, REGISTER_RESIDUAL_RISK_LINE, sampleWatchSchedule } from '../backup/register-watch.mjs';
+import { RUNTIME_VERDICT_MODES, createRuntimeVerdictStore } from '../backup/runtime-verdict.mjs';
 import { describeUnlock, unlockRepo } from '../backup/unlock.mjs';
 import { verifyRepo } from '../backup/verify.mjs';
 import { createAccountIdentity } from '../chatops/account.mjs';
@@ -86,6 +89,10 @@ export const BACKUP_VERIFY_ROUTE_PATH = '/api/w2m/backup/verify';
 /** Unlock probe route (v3.4.8): GET describes, POST with `{"confirm":"unlock"}` attempts. */
 export const BACKUP_UNLOCK_ROUTE_PATH = '/api/w2m/backup/unlock';
 
+/** Register-repair route (v3.5.x): POST with `{"confirm":"register","session_ids":[...]}` plans, applies and
+ *  watches the registry inside the host, where the client is by definition running. */
+export const BACKUP_REGISTER_ROUTE_PATH = '/api/w2m/backup/register';
+
 /** Confirmation token for the restore route. */
 export const RESTORE_CONFIRM_TOKEN = 'restore';
 
@@ -94,6 +101,9 @@ export const ARCHIVE_CONFIRM_TOKEN = 'archive';
 
 /** Confirmation token for the unlock attempt. */
 export const UNLOCK_CONFIRM_TOKEN = 'unlock';
+
+/** Confirmation token for the register repair (a file write under the client's own home). */
+export const REGISTER_CONFIRM_TOKEN = 'register';
 
 /** Confirmation token a POST must carry. */
 export const RUN_CONFIRM_TOKEN = 'run';
@@ -216,6 +226,16 @@ export function normalizeConfig(config = {}, deps = {}) {
     config.backupRegistryRecheckMs.every((value) => Number.isSafeInteger(value) && value >= 0)
     ? [...config.backupRegistryRecheckMs]
     : null;
+  // The runtime verdict after the scheduled backup: `off` (default) or `nightly`. Refused here like the other
+  // enum options so a typo cannot silently mean "never" when the operator asked for a nightly verdict.
+  const runtimeVerify = config.backupRuntimeVerify ?? 'off';
+  if (!RUNTIME_VERDICT_MODES.includes(runtimeVerify)) {
+    return {
+      ok: false,
+      reason_code: 'BACKUP_CONFIG_INVALID',
+      detail: `backupRuntimeVerify must be one of ${RUNTIME_VERDICT_MODES.join(', ')}, got ${JSON.stringify(runtimeVerify)}`,
+    };
+  }
   const dshHome = typeof config.dshHome === 'string' && config.dshHome.trim() !== ''
     ? path.resolve(config.dshHome.trim())
     : resolveDshHome(env);
@@ -237,6 +257,7 @@ export function normalizeConfig(config = {}, deps = {}) {
     old_format: oldFormat,
     mirror_dir: mirrorDir,
     registry_recheck_ms: registryRecheckMs,
+    runtime_verify: runtimeVerify,
     dsh_home: dshHome,
   };
 }
@@ -246,9 +267,15 @@ export function normalizeConfig(config = {}, deps = {}) {
  *
  * @param {object} ctx Cordis context
  * @param {object} [config] row configuration (`backupDir`, `backupTimes`, `backupTimeZone`, `backupScope`,
- *   `keepOldPerSession`, `backupOldVersionDays`, `backupOldFormat`, `backupMirrorDir`, `backupEnabled`)
+ *   `keepOldPerSession`, `backupOldVersionDays`, `backupOldFormat`, `backupMirrorDir`, `backupEnabled`,
+ *   `backupRuntimeVerify: 'off'|'nightly'`)
+ * @param {{runtimeVerify?: Function, registerWatch?: Function, createScheduler?: Function, now?: Function}} [deps]
+ *   Injectable seams for tests. `runtimeVerify` replaces the real `verifyRepo({runtime:true})` call the cached
+ *   verdict store runs (so a unit test never spawns the Harness); `registerWatch` replaces the bounded watch the
+ *   register route awaits (so the route test does not sleep 30 s); `createScheduler` lets a test drive the
+ *   nightly hook without waiting for 22:00.
  */
-export function apply(ctx, config = {}) {
+export function apply(ctx, config = {}, deps = {}) {
   const cfg = normalizeConfig(config);
   if (cfg.ok !== true) {
     ctx.logger?.warn?.(`w2m-dsh-backup: not mounted: ${cfg.reason_code}: ${cfg.detail}`);
@@ -271,11 +298,13 @@ export function apply(ctx, config = {}) {
     old_format: cfg.old_format,
     encryption: cfg.encryption,
     mirror_dir: cfg.mirror_dir,
+    runtime_verify_mode: cfg.runtime_verify,
     runs: 0,
     failures: 0,
     last_run: null,
     last_result: null,
     last_error: null,
+    last_runtime_verify: null,
     running: false,
   };
 
@@ -303,6 +332,62 @@ export function apply(ctx, config = {}) {
       // A failed identity read is the machine/password paths' turn, not an error the operator has to see.
       return null;
     }
+  };
+
+  /**
+   * The inputs every route that has to open the repository passes: paths plus the account id (compare-only).
+   *
+   * It lives here, once, because the cached runtime verdict's verify function needs the same credential path as
+   * the verify route that refreshes it -- a second copy would let the two disagree about which credential opened
+   * the repository.
+   */
+  const unlockInput = async () => ({
+    root: cfg.backup_dir,
+    dshHome: cfg.dsh_home,
+    machineKey: cfg.machine_key,
+    accountId: await identifyAccountId(),
+  });
+
+  /**
+   * The cached runtime verdict (G5). `cached()` never spawns; `run()` spawns the installed Harness through
+   * `verifyRepo({runtime:true})` (or the injected test runner) exactly once per in-flight request and persists the
+   * record under `<dshHome>/xclient/w2m-backup/state.json`.
+   */
+  const runtimeVerdict = createRuntimeVerdictStore({
+    dshHome: cfg.dsh_home,
+    verify: typeof deps.runtimeVerify === 'function'
+      ? deps.runtimeVerify
+      : async () => verifyRepo({ ...(await unlockInput()), futureAppend: true, runtime: true }),
+    ...(typeof deps.now === 'function' ? { now: deps.now } : {}),
+  });
+  state.last_runtime_verify = runtimeVerdict.record();
+
+  /**
+   * Fire the nightly runtime verdict after a successful scheduled backup. Deliberately NOT awaited: the backup is
+   * committed and its result is returned first, so a slow or failing verdict can only produce a log line and a
+   * record -- never a failed schedule slot.
+   */
+  const queueNightlyRuntimeVerify = () => {
+    runtimeVerdict.run({ trigger: 'nightly' })
+      .then((outcome) => {
+        state.last_runtime_verify = outcome.record;
+        if (outcome.persisted !== true) {
+          ctx.logger?.warn?.(`w2m-dsh-backup: nightly runtime verdict could not be persisted: ${outcome.persist_error ?? 'unknown error'}`);
+        }
+        if (outcome.record.ok === true) {
+          ctx.logger?.info?.(
+            `w2m-dsh-backup: nightly runtime verdict passed: checked ${outcome.record.checked}, failed ${outcome.record.failed}, ` +
+              `${outcome.record.snapshots} snapshot(s), evidence ${outcome.record.evidence}`,
+          );
+        } else {
+          ctx.logger?.warn?.(
+            `w2m-dsh-backup: nightly runtime verdict failed: ${outcome.record.reason_codes.join(', ') || 'no code'} (the backup itself is committed)`,
+          );
+        }
+      })
+      .catch((error) => {
+        ctx.logger?.warn?.(`w2m-dsh-backup: nightly runtime verdict threw: ${error instanceof Error ? error.message : String(error)}`);
+      });
   };
 
   /** Run one backup and never throw: the timer and the route both need a result, not an exception. */
@@ -372,8 +457,15 @@ export function apply(ctx, config = {}) {
     }
   };
 
-  const scheduler = createDailyScheduler({
-    run: () => runNow('scheduled'),
+  const createScheduler = typeof deps.createScheduler === 'function' ? deps.createScheduler : createDailyScheduler;
+  const scheduler = createScheduler({
+    // The scheduled path (and the missed-slot catch-up, which runs through this same function) is the one place
+    // the nightly runtime verdict is attached: after the backup result is produced, never before it.
+    run: async () => {
+      const result = await runNow('scheduled');
+      if (result?.ok === true && cfg.runtime_verify === 'nightly') queueNightlyRuntimeVerify();
+      return result;
+    },
     times: cfg.times,
     timeZone: cfg.time_zone,
     catchUpMs: cfg.catch_up_ms || DEFAULT_CATCH_UP_MS,
@@ -424,7 +516,10 @@ export function apply(ctx, config = {}) {
               schedule: describeBackupSchedule({ enabled: true, times: cfg.times, timeZone: cfg.time_zone }),
               scheduler: scheduler.describe(),
               status,
-              state,
+              // The cached runtime verdict is exposed by the embedded status so the panel can render it without a
+              // second request; `cached: true` is spoken here too, because this record never spawns anything.
+              runtime_verify: { mode: cfg.runtime_verify, cached: true },
+              state: { ...state, last_runtime_verify: runtimeVerdict.record() },
             };
           };
           if (request.method === 'GET') return Response.json(describe(), { headers: NO_STORE });
@@ -477,15 +572,6 @@ export function apply(ctx, config = {}) {
         }
       };
       const refuse = (reason_code, detail, status = 400) => Response.json({ ok: false, reason_code, detail }, { status, headers: NO_STORE });
-      // Read the host account id once per request (best effort, never throws) and pass it to every path that can
-      // open the repository. The describe/attempt paths only compare it; restore/archive/verify accept it as an
-      // additional credential path, exactly like the CLI accepts --password. The route never receives a password.
-      const unlockInput = async () => ({
-        root: cfg.backup_dir,
-        dshHome: cfg.dsh_home,
-        machineKey: cfg.machine_key,
-        accountId: await identifyAccountId(),
-      });
 
       registry.register({
         path: BACKUP_UNLOCK_ROUTE_PATH,
@@ -513,12 +599,147 @@ export function apply(ctx, config = {}) {
         methods: ['GET'],
         fetch: async (request) => {
           if (request.method !== 'GET') return refuse('METHOD_NOT_ALLOWED', `${request.method} is not a method this route answers`, 405);
+          const runtimeParam = new URL(request.url).searchParams.get('runtime');
+          // ?runtime=cached: read the persisted record and its staleness. It never spawns the runtime -- returning
+          // a record with its timestamp is the honest answer, and the timestamp is what the `stale` badge says.
+          if (runtimeParam === 'cached') {
+            const cached = runtimeVerdict.cached();
+            return Response.json({ ...cached, mode: 'cached' }, { headers: NO_STORE });
+          }
           // Read-only but expensive: it decrypts every block of every snapshot to re-hash it. With ?runtime=1 it
-          // also asks the installed Harness about every log and every appended log (G5), which is slower.
-          const runtime = new URL(request.url).searchParams.get('runtime') === '1';
-          const result = verifyRepo({ ...(await unlockInput()), futureAppend: true, runtime });
+          // also asks the installed Harness about every log and every appended log (G5), which is slower. That
+          // path writes the cached verdict record before the response.
+          const runtime = runtimeParam === '1';
+          if (runtime === true) {
+            const outcome = await runtimeVerdict.run({ trigger: 'manual-route' });
+            state.last_runtime_verify = outcome.record;
+            const result = outcome.verify_result ?? {
+              ok: outcome.record.ok,
+              reason_code: outcome.record.reason_codes[0] ?? null,
+              detail: 'the runtime verdict produced no verify report',
+              counts: { snapshots: outcome.record.snapshots },
+              problems: [],
+              runtime_verified: { checked: outcome.record.checked, failed: outcome.record.failed, evidence: outcome.record.evidence },
+            };
+            result.runtime_verify = outcome.record;
+            result.runtime_verify_persisted = outcome.persisted;
+            state.last_verify = {
+              at: new Date().toISOString(),
+              ok: result.ok === true,
+              counts: result.counts,
+              problems: Array.isArray(result.problems) ? result.problems.length : 0,
+              runtime_verified: outcome.record.evidence,
+            };
+            return Response.json(result, { headers: NO_STORE });
+          }
+          const result = verifyRepo({ ...(await unlockInput()), futureAppend: true, runtime: false });
           state.last_verify = { at: new Date().toISOString(), ok: result.ok, counts: result.counts, problems: result.problems.length };
           return Response.json(result, { headers: NO_STORE });
+        },
+      });
+
+      /**
+       * The in-host register repair (G2, panel path).
+       *
+       * Preference order matters and is stated in the response:
+       *
+       *   1. **`ctx.workspaceRegistry`** -- the Harness's own workspace service. It persists the domain, mutates
+       *      memory and emits `domain/changed`, and the GUI reads that projection; there is no file write for a
+       *      later client save to clobber, so this path has no watch and `residual_risk: null`.
+       *   2. **file-level G2** -- only for a profile that exposes no service (or the offline CLI). The client gate
+       *      is told `allowLiveHome: true` because the host is by definition live, and the bounded watch (capped at
+       *      {@link DEFAULT_ROUTE_WATCH_CAP_MS}) is the protocol instead. The response says `via: 'file-write'` and
+       *      repeats the residual risk; it never silently pretends the race was removed.
+       */
+      const watchRegister = typeof deps.registerWatch === 'function'
+        ? deps.registerWatch
+        : (args) => sampleWatchSchedule({
+            ...args,
+            wait: (ms) => new Promise((resolve) => {
+              setTimeout(resolve, ms);
+            }),
+            now: () => Date.now(),
+          });
+      const hostWorkspaceRegistry = () => {
+        try {
+          return typeof ctx?.get === 'function' ? (ctx.get('workspaceRegistry') ?? null) : null;
+        } catch {
+          return null;
+        }
+      };
+      registry.register({
+        path: BACKUP_REGISTER_ROUTE_PATH,
+        methods: ['POST'],
+        requestBody: 'buffered',
+        fetch: async (request) => {
+          if (request.method !== 'POST') return refuse('METHOD_NOT_ALLOWED', `${request.method} is not a method this route answers`, 405);
+          const body = await readBody(request);
+          if (body === null || body.confirm !== REGISTER_CONFIRM_TOKEN) {
+            return refuse('BACKUP_CONFIRM_REQUIRED', `a JSON body with {"confirm":"${REGISTER_CONFIRM_TOKEN}"} is required`);
+          }
+          const sessionIds = Array.isArray(body.session_ids)
+            ? body.session_ids.map((value) => String(value ?? '')).filter((value) => value !== '')
+            : [];
+          if (sessionIds.length === 0) {
+            return refuse('BACKUP_REGISTER_NO_SESSION', 'session_ids must name at least one session that exists on disk');
+          }
+          const workspacePath = typeof body.workspacePath === 'string' ? body.workspacePath : null;
+          // 1) The host service: no file write, so no file-level race to watch.
+          const hostOutcome = await registerThroughHost({
+            dshHome: cfg.dsh_home,
+            sessionIds,
+            workspacePath,
+            workspaceRegistry: hostWorkspaceRegistry(),
+            now: new Date(),
+          });
+          if (hostOutcome.reason_code !== REGISTER_CODES.HOST_UNAVAILABLE) {
+            state.last_register = {
+              at: new Date().toISOString(),
+              via: hostOutcome.via,
+              ok: hostOutcome.ok,
+              changed: hostOutcome.changed,
+              registered: hostOutcome.registered,
+              already_registered: hostOutcome.already_registered,
+              failed: hostOutcome.failed,
+            };
+            return Response.json(hostOutcome, { headers: NO_STORE });
+          }
+          // 2) File-level G2 for a host without the service: plan, apply, bounded watch, residual risk said out loud.
+          const plan = planRegister({
+            dshHome: cfg.dsh_home,
+            sessionIds,
+            workspacePath,
+            // Inside the host the client is running by definition: the gate's pause half cannot apply here. The
+            // watch below is the half that can, and it is bounded.
+            allowLiveHome: true,
+            now: new Date(),
+          });
+          if (plan.ok !== true) {
+            state.last_register = { at: new Date().toISOString(), ok: false, reason_code: plan.reason_code, detail: plan.detail };
+            return Response.json(plan, { headers: NO_STORE });
+          }
+          const applied = applyRegister({ dshHome: cfg.dsh_home, plan });
+          applied.via = 'file-write';
+          applied.host_service = false;
+          if (applied.ok === true && applied.changed === true) {
+            applied.watch = await watchRegister({
+              dshHome: cfg.dsh_home,
+              plan: plan.registry,
+              minutes: DEFAULT_ROUTE_WATCH_CAP_MS / 60_000,
+              budgetMs: DEFAULT_ROUTE_WATCH_CAP_MS,
+            });
+          }
+          applied.residual_risk = REGISTER_RESIDUAL_RISK_LINE;
+          state.last_register = {
+            at: new Date().toISOString(),
+            via: applied.via,
+            ok: applied.ok,
+            changed: applied.changed,
+            registered: applied.registered,
+            already_registered: applied.already_registered,
+            watch: applied.watch ?? null,
+          };
+          return Response.json(applied, { headers: NO_STORE });
         },
       });
 

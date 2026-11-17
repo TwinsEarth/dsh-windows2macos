@@ -13,10 +13,12 @@ import { join } from 'node:path';
 import {
   ARCHIVE_CONFIRM_TOKEN,
   BACKUP_ARCHIVE_ROUTE_PATH,
+  BACKUP_REGISTER_ROUTE_PATH,
   BACKUP_RESTORE_ROUTE_PATH,
   BACKUP_RUN_ROUTE_PATH,
   BACKUP_UNLOCK_ROUTE_PATH,
   BACKUP_VERIFY_ROUTE_PATH,
+  REGISTER_CONFIRM_TOKEN,
   RESTORE_CONFIRM_TOKEN,
   RUN_CONFIRM_TOKEN,
   UNLOCK_CONFIRM_TOKEN,
@@ -24,6 +26,12 @@ import {
   defaultBackupDir,
   normalizeConfig,
 } from '../src/plugin/backup.mjs';
+import {
+  buildRuntimeVerdictRecord,
+  readBackupState,
+  writeBackupState,
+} from '../src/backup/runtime-verdict.mjs';
+import { REGISTER_RESIDUAL_RISK_LINE } from '../src/backup/register-watch.mjs';
 import { main, parseArgs } from '../src/backup/cli.mjs';
 import { runBackup } from '../src/backup/engine.mjs';
 import { bindAccount, readRepoKeys } from '../src/backup/keystore.mjs';
@@ -213,10 +221,10 @@ describe('subplugin: the route and the timer', () => {
     try {
       const fake = fakeCtx();
       apply(fake.ctx, { backupDir: join(dir, 'repo'), dshHome: home, backupMachineKey: false, ...NO_FIRE });
-      assert.equal(fake.registrations.length, 5, 'v3.4.8 adds restore/archive/verify/unlock beside the run route');
+      assert.equal(fake.registrations.length, 6, 'v3.4.8 adds restore/archive/verify/unlock; the register repair adds the sixth');
       assert.deepEqual(
         fake.registrations.map((row) => row.path).sort(),
-        [BACKUP_RUN_ROUTE_PATH, BACKUP_RESTORE_ROUTE_PATH, BACKUP_ARCHIVE_ROUTE_PATH, BACKUP_VERIFY_ROUTE_PATH, BACKUP_UNLOCK_ROUTE_PATH].sort(),
+        [BACKUP_RUN_ROUTE_PATH, BACKUP_RESTORE_ROUTE_PATH, BACKUP_ARCHIVE_ROUTE_PATH, BACKUP_VERIFY_ROUTE_PATH, BACKUP_UNLOCK_ROUTE_PATH, BACKUP_REGISTER_ROUTE_PATH].sort(),
       );
       assert.deepEqual(fake.registrations.find((row) => row.path === BACKUP_RUN_ROUTE_PATH).methods, ['GET', 'POST']);
       assert.deepEqual(fake.registrations.find((row) => row.path === BACKUP_RUN_ROUTE_PATH).methods, ['GET', 'POST']);
@@ -360,6 +368,7 @@ describe('subplugin: the route and the timer', () => {
         [BACKUP_RESTORE_ROUTE_PATH, RESTORE_CONFIRM_TOKEN],
         [BACKUP_ARCHIVE_ROUTE_PATH, ARCHIVE_CONFIRM_TOKEN],
         [BACKUP_UNLOCK_ROUTE_PATH, UNLOCK_CONFIRM_TOKEN],
+        [BACKUP_REGISTER_ROUTE_PATH, REGISTER_CONFIRM_TOKEN],
       ]) {
         const refused = await post(path, {});
         assert.equal(refused.status, 400);
@@ -965,6 +974,283 @@ describe('engine: retention and mirror options', () => {
       assert.equal(result.dry_run, true);
       assert.equal('mirror' in result, false, 'a dry run writes no mirror and reports none');
       assert.equal(existsSync(join(repo, 'inside-mirror')), false);
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// G5: the cached runtime verdict (state cache, `?runtime=cached`, nightly option)
+// ---------------------------------------------------------------------------------------------
+
+/** A real-shaped runtime verify result; the injected runner returns it, so no Harness is spawned. */
+function fakeRuntimeVerifyResult(overrides = {}) {
+  return {
+    ok: true,
+    counts: { snapshots: 1, files: 1, blocks: 1, bytes: 1, old: 0, current: 0 },
+    runtime_verified: { checked: 1, failed: 0, evidence: 'installed-harness' },
+    future_append: { checked: 1, failed: 0, evidence: 'static-prefilter' },
+    problems: [],
+    duration_ms: 7,
+    ...overrides,
+  };
+}
+
+/** A scheduler whose `run` a test can invoke directly, without waiting for 22:00. */
+function schedulerHarness() {
+  const captured = { options: null };
+  const createScheduler = (options) => {
+    captured.options = options;
+    return {
+      start() {},
+      stop() {},
+      describe() {
+        return { time_zone: options.timeZone, times: options.times, stopped: false, next_at: null };
+      },
+      async triggerNow() {
+        await options.run({ scheduledAtMs: null, ranAtMs: Date.now(), slot: 'manual', late: false });
+      },
+    };
+  };
+  return { captured, createScheduler };
+}
+
+/** Let the fire-and-forget nightly verdict settle (it is deliberately not awaited by the schedule). */
+async function flushScheduled() {
+  await new Promise((resolve) => { setImmediate(resolve); });
+  await new Promise((resolve) => { setImmediate(resolve); });
+}
+
+describe('subplugin: cached runtime verdict and the nightly option (G5)', () => {
+  it('serves ?runtime=cached from the persisted record without spawning, marks it stale by age, and refreshes it on ?runtime=1', async () => {
+    const { home, cleanup: cleanHome } = homeFixture();
+    const { dir, cleanup } = tempDir('w2m-cached-verify-');
+    try {
+      const oldFinished = Date.now() - 26 * 60 * 60 * 1000;
+      const seeded = buildRuntimeVerdictRecord({
+        verifyResult: fakeRuntimeVerifyResult(),
+        startedAt: oldFinished - 1_000,
+        finishedAt: oldFinished,
+        trigger: 'nightly',
+      });
+      assert.equal(writeBackupState(home, { last_runtime_verify: seeded }).ok, true);
+
+      let verifyCalls = 0;
+      const fake = fakeCtx();
+      apply(fake.ctx, { backupDir: join(dir, 'repo'), dshHome: home, backupMachineKey: false, ...NO_FIRE }, {
+        runtimeVerify: () => {
+          verifyCalls += 1;
+          return fakeRuntimeVerifyResult();
+        },
+      });
+      const find = (path) => fake.registrations.find((row) => row.path === path);
+      const verifyRoute = find(BACKUP_VERIFY_ROUTE_PATH);
+
+      const cached = await (await verifyRoute.fetch(new Request(`http://local.invalid${BACKUP_VERIFY_ROUTE_PATH}?runtime=cached`, { method: 'GET' }))).json();
+      assert.equal(cached.ok, true);
+      assert.equal(cached.mode, 'cached');
+      assert.equal(cached.cached, true);
+      assert.equal(cached.stale, true, 'a 26 h old record is stale');
+      assert.equal(cached.record.evidence, 'installed-harness');
+      assert.equal(cached.record.checked, 1);
+      assert.equal(verifyCalls, 0, 'the cached route never spawns the verifier');
+
+      const ran = await (await verifyRoute.fetch(new Request(`http://local.invalid${BACKUP_VERIFY_ROUTE_PATH}?runtime=1`, { method: 'GET' }))).json();
+      assert.equal(verifyCalls, 1);
+      assert.equal(ran.runtime_verify.evidence, 'installed-harness');
+      assert.equal(ran.runtime_verify_persisted, true);
+      const refreshed = await (await verifyRoute.fetch(new Request(`http://local.invalid${BACKUP_VERIFY_ROUTE_PATH}?runtime=cached`, { method: 'GET' }))).json();
+      assert.equal(refreshed.stale, false, '?runtime=1 updated the cache before answering');
+
+      const status = await (await find(BACKUP_RUN_ROUTE_PATH).fetch(new Request(`http://local.invalid${BACKUP_RUN_ROUTE_PATH}`, { method: 'GET' }))).json();
+      assert.equal(status.state.last_runtime_verify.evidence, 'installed-harness', 'the embedded status exposes the cached record');
+      assert.equal(status.state.last_runtime_verify.checked, 1);
+      assert.equal(status.runtime_verify.mode, 'off');
+      assert.equal(verifyCalls, 1, 'reading the status does not spawn the verifier again');
+      assert.equal(readBackupState(home).state.last_runtime_verify.evidence, 'installed-harness');
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+
+  it('runs the runtime verify once per successful scheduled backup when nightly, never on the default off, and a failed verdict is a warning that still persists', async () => {
+    const { home, cleanup: cleanHome } = homeFixture();
+    const { dir, cleanup } = tempDir('w2m-nightly-verify-');
+    try {
+      // off (the default): a scheduled backup does not run a verdict at all.
+      const offFake = fakeCtx();
+      const offHarness = schedulerHarness();
+      let offCalls = 0;
+      apply(offFake.ctx, { backupDir: join(dir, 'repo-off'), dshHome: home, backupMachineKey: false, ...NO_FIRE }, {
+        createScheduler: offHarness.createScheduler,
+        runtimeVerify: () => {
+          offCalls += 1;
+          return fakeRuntimeVerifyResult();
+        },
+      });
+      const offRun = await offHarness.captured.options.run();
+      assert.equal(offRun.ok, true, offRun.detail);
+      await flushScheduled();
+      assert.equal(offCalls, 0, 'off is the default: no runtime verdict after a scheduled backup');
+
+      // nightly: after the backup is produced, exactly one verdict per successful slot.
+      const fake = fakeCtx();
+      const harness = schedulerHarness();
+      let verifyCalls = 0;
+      let nextResult = fakeRuntimeVerifyResult();
+      apply(fake.ctx, {
+        backupDir: join(dir, 'repo-nightly'),
+        dshHome: home,
+        backupMachineKey: false,
+        backupRuntimeVerify: 'nightly',
+        ...NO_FIRE,
+      }, {
+        createScheduler: harness.createScheduler,
+        runtimeVerify: () => {
+          verifyCalls += 1;
+          return nextResult;
+        },
+      });
+      const first = await harness.captured.options.run();
+      assert.equal(first.ok, true, first.detail);
+      await flushScheduled();
+      assert.equal(verifyCalls, 1);
+      const persisted = readBackupState(home).state.last_runtime_verify;
+      assert.equal(persisted.evidence, 'installed-harness');
+      assert.equal(persisted.trigger, 'nightly');
+      assert.equal(persisted.ok, true);
+
+      nextResult = fakeRuntimeVerifyResult({ ok: false, runtime_verified: { checked: 1, failed: 1 }, problems: [{ code: 'BACKUP_RUNTIME_REJECTED' }], reason_code: 'BACKUP_RUNTIME_REJECTED' });
+      const second = await harness.captured.options.run();
+      assert.equal(second.ok, true, 'a failed verdict never fails the backup');
+      await flushScheduled();
+      assert.equal(verifyCalls, 2, 'one verdict per successful scheduled backup');
+      assert.equal(readBackupState(home).state.last_runtime_verify.ok, false, 'the failed verdict is still persisted');
+      assert.ok(
+        fake.logs.some((entry) => entry.level === 'warn' && entry.message.includes('nightly runtime verdict failed')),
+        'a failed verdict is a logged warning, not a failed schedule',
+      );
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+
+  it('refuses an unknown backupRuntimeVerify value at mount instead of silently meaning off', () => {
+    const refused = normalizeConfig({ backupRuntimeVerify: 'hourly' }, { env: {}, platform: 'win32' });
+    assert.equal(refused.ok, false);
+    assert.equal(refused.reason_code, 'BACKUP_CONFIG_INVALID');
+    assert.equal(normalizeConfig({}, { env: {}, platform: 'win32' }).runtime_verify, 'off');
+    assert.equal(normalizeConfig({ backupRuntimeVerify: 'nightly' }, { env: {}, platform: 'win32' }).runtime_verify, 'nightly');
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// G2: the in-host register repair route
+// ---------------------------------------------------------------------------------------------
+
+const REGISTER_SESSION = 'session-aaaaaaaa-0001';
+
+describe('subplugin: the in-host register repair route (G2)', () => {
+  /** A home with one on-disk session that the registry does not list yet. */
+  function unregisteredHome() {
+    return makeHome({
+      sessions: [{ workspace: '--E-GPT--', id: REGISTER_SESSION }],
+      registry: registryDocument({ sessionIds: [] }),
+    });
+  }
+
+  const postRegister = (route, body) => route.fetch(new Request(`http://local.invalid${BACKUP_REGISTER_ROUTE_PATH}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  }));
+
+  it('falls back to the file path + bounded watch when the profile has no workspaceRegistry, and states the residual risk', async () => {
+    const { home, cleanup: cleanHome } = unregisteredHome();
+    const { dir, cleanup } = tempDir('w2m-route-register-file-');
+    try {
+      const watchCalls = [];
+      const fake = fakeCtx();
+      apply(fake.ctx, { backupDir: join(dir, 'repo'), dshHome: home, backupMachineKey: false, ...NO_FIRE }, {
+        // The 30 s watch is injected: this test is about the route contract, not about sleeping 30 s.
+        registerWatch: async (args) => {
+          watchCalls.push(args);
+          return { minutes: 0.5, samples: 3, clobbered: 0, reapplied: 0, stable_at: '2026-11-17T08:00:03.000Z' };
+        },
+      });
+      const route = fake.registrations.find((row) => row.path === BACKUP_REGISTER_ROUTE_PATH);
+      assert.ok(route, 'the register repair route is mounted');
+      assert.deepEqual(route.methods, ['POST']);
+
+      const noConfirm = await postRegister(route, { session_ids: [REGISTER_SESSION] });
+      assert.equal(noConfirm.status, 400);
+      assert.equal((await noConfirm.json()).reason_code, 'BACKUP_CONFIRM_REQUIRED');
+
+      const empty = await postRegister(route, { confirm: REGISTER_CONFIRM_TOKEN, session_ids: [] });
+      assert.equal(empty.status, 400);
+      assert.equal((await empty.json()).reason_code, 'BACKUP_REGISTER_NO_SESSION');
+
+      const response = await postRegister(route, { confirm: REGISTER_CONFIRM_TOKEN, session_ids: [REGISTER_SESSION] });
+      const body = await response.json();
+      assert.equal(body.ok, true, body.detail);
+      assert.equal(body.via, 'file-write');
+      assert.equal(body.host_service, false);
+      assert.deepEqual(body.registered, [REGISTER_SESSION]);
+      assert.equal(body.watch.clobbered, 0);
+      assert.equal(body.watch.samples, 3);
+      assert.equal(body.residual_risk, REGISTER_RESIDUAL_RISK_LINE);
+      assert.equal(watchCalls.length, 1);
+      assert.equal(watchCalls[0].budgetMs, 30_000, 'the route watch is capped at 30 s');
+      assert.equal(watchCalls[0].minutes, 0.5);
+      const registry = JSON.parse(readFileSync(join(home, 'storages', 'workspace.json'), 'utf8'));
+      assert.deepEqual(registry.tables.workspaces.w1.sessionIds, [REGISTER_SESSION]);
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+
+  it('prefers ctx.workspaceRegistry: attaches there, writes no workspace.json, and has no file-level residual risk', async () => {
+    const { home, cleanup: cleanHome } = unregisteredHome();
+    const { dir, cleanup } = tempDir('w2m-route-register-host-');
+    try {
+      const attached = [];
+      const resolved = [];
+      const service = {
+        async resolveByPath(workspacePath) {
+          resolved.push(workspacePath);
+          return {
+            path: workspacePath,
+            async attachSession(sessionId) {
+              attached.push(sessionId);
+            },
+          };
+        },
+        async create() {
+          throw new Error('an existing workspace must resolve, not be created');
+        },
+      };
+      const before = readFileSync(join(home, 'storages', 'workspace.json'));
+      const fake = fakeCtx({ services: { workspaceRegistry: service } });
+      apply(fake.ctx, { backupDir: join(dir, 'repo'), dshHome: home, backupMachineKey: false, ...NO_FIRE }, {
+        registerWatch: () => {
+          throw new Error('the host-service path must not run the file-level watch');
+        },
+      });
+      const route = fake.registrations.find((row) => row.path === BACKUP_REGISTER_ROUTE_PATH);
+      const body = await (await postRegister(route, { confirm: REGISTER_CONFIRM_TOKEN, session_ids: [REGISTER_SESSION] })).json();
+      assert.equal(body.ok, true, body.detail);
+      assert.equal(body.via, 'host-service');
+      assert.equal(body.host_service, true);
+      assert.deepEqual(body.registered, [REGISTER_SESSION]);
+      assert.deepEqual(attached, [REGISTER_SESSION]);
+      assert.equal(resolved.length, 1);
+      assert.equal(body.residual_risk, null, 'the service path has no file write for the client to overwrite');
+      assert.ok(readFileSync(join(home, 'storages', 'workspace.json')).equals(before), 'no file-level write happened');
     } finally {
       cleanup();
       cleanHome();

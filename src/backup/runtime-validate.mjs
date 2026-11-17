@@ -26,8 +26,8 @@
  * ## The future append is validated too (G3)
  *
  * "It opens today" is not "it keeps opening". `appendLegalEvent` builds the bytes of the log plus one legal
- * `turn/start` event; `validateCandidates` asks the runtime about both the original and the appended artifact in
- * the same batch, so a log that would break on the next real append is refused *before* it is published.
+ * `permission/preset` event; `validateCandidates` asks the runtime about both the original and the appended artifact
+ * in the same batch, so a log that would break on the next real append is refused *before* it is published.
  */
 
 import { spawnSync } from 'node:child_process';

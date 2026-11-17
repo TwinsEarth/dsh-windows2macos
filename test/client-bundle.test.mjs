@@ -2254,6 +2254,25 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
       'panel.backup.verify.runtime',
       'panel.backup.verify.runtimeCounts',
       'panel.backup.verify.runtimeHint',
+      // v3.5.x: the cached runtime verdict block, its stale badge and the explicit run-now button.
+      'panel.backup.verify.cachedTitle',
+      'panel.backup.verify.cachedLine',
+      'panel.backup.verify.cachedNone',
+      'panel.backup.verify.stale',
+      'panel.backup.verify.fresh',
+      'panel.backup.action.verifyRuntime',
+      'panel.backup.action.repairRegister',
+      'panel.backup.busy.verifyRuntime',
+      'panel.backup.busy.repairRegister',
+      'panel.backup.log.verifyRuntime',
+      'panel.backup.log.repairRegister',
+      'panel.backup.status.registerFix',
+      'panel.backup.register.none',
+      'panel.backup.register.done',
+      'panel.backup.register.residual',
+      'panel.backup.reason.BACKUP_REGISTER_NO_SESSION',
+      'panel.backup.reason.BACKUP_REGISTER_SESSION_MISSING',
+      'panel.backup.reason.BACKUP_REGISTER_BACKUP_FAILED',
       // v3.5.0: the two backup-scope entries and the read-only scan card around them.
       'panel.backup.action.backupSelected',
       'panel.backup.action.backupActive',
@@ -2339,6 +2358,156 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
     assert.equal(exports.backupReasonText('BACKUP_BUSY', t), '上一次备份还在运行，请稍候。');
     assert.equal(exports.backupReasonText('BACKUP_SOMETHING_NEW', t), 'BACKUP_SOMETHING_NEW', 'an unknown code is never guessed');
     assert.equal(exports.backupReasonText('', t), '');
+  });
+
+  it('renders the cached runtime verdict (fresh/none/stale) and the run-now button’s disabled state', () => {
+    const { bundle } = mountBackup();
+    const nowIso = new Date().toISOString();
+    const oldIso = new Date(Date.now() - 30 * 60 * 60 * 1000).toISOString();
+    const record = { started_at: oldIso, finished_at: nowIso, ok: true, checked: 3, failed: 0, snapshots: 2, reason_codes: [], evidence: 'installed-harness' };
+    const marker = (tree) => findBy(tree, (node) => node.props?.['data-w2m-backup-runtime-cached'] !== undefined)[0];
+
+    const none = bundle.exports.BackupPanelView(viewProps());
+    assert.equal(marker(none).props['data-w2m-backup-runtime-cached'], 'none');
+    assert.ok(collectText(none).join('\n').includes('panel.backup.verify.cachedNone'));
+    assert.equal(actionButton(none, 'verify-runtime').props.disabled, false, 'the run-now button is available before any cache exists');
+
+    const fresh = bundle.exports.BackupPanelView(viewProps({ status: { ok: true, state: { last_runtime_verify: record } } }));
+    assert.equal(marker(fresh).props['data-w2m-backup-runtime-cached'], 'fresh');
+    const realT = bundle.exports.makeTranslator(() => undefined);
+    const freshText = collectText(bundle.exports.BackupPanelView(viewProps({ t: realT, status: { ok: true, state: { last_runtime_verify: record } } }))).join('\n');
+    assert.ok(freshText.includes('缓存的运行时终审'), 'the cached block names what it is');
+    assert.ok(freshText.includes('installed-harness'), 'the evidence label is shown verbatim');
+    assert.ok(freshText.includes('24 小时内'));
+    assert.equal(findBy(fresh, (node) => node.props?.['data-w2m-backup-runtime-stale'] !== undefined).length, 0);
+
+    const busy = bundle.exports.BackupPanelView(viewProps({ status: { ok: true, state: { last_runtime_verify: record } }, busy: 'verify-runtime' }));
+    assert.equal(actionButton(busy, 'verify-runtime').props.disabled, true, 'the button is disabled while the verdict runs');
+    assert.ok(collectText(busy).join('\n').includes('panel.backup.busy.verifyRuntime'));
+
+    const stale = bundle.exports.BackupPanelView(viewProps({ status: { ok: true, state: { last_runtime_verify: { ...record, finished_at: oldIso } } } }));
+    assert.equal(marker(stale).props['data-w2m-backup-runtime-cached'], 'stale');
+    assert.equal(findBy(stale, (node) => node.props?.['data-w2m-backup-runtime-stale'] !== undefined).length, 1, 'a stale badge is rendered');
+    assert.ok(collectText(stale).join('\n').includes('panel.backup.verify.stale'));
+  });
+
+  it('renders the register-repair button/state and states the residual risk only for the file-write path', () => {
+    const { bundle } = mountBackup();
+    const scan = {
+      available: true,
+      total: 1,
+      routeMissing: false,
+      sessions: [{ session_id: 'sess-gamma-0003', workspace: 'proj-c', size: 1, archived: false, registered: false }],
+    };
+    const waiting = bundle.exports.BackupPanelView(viewProps());
+    assert.equal(actionButton(waiting, 'repair-register').props.disabled, true, 'disabled until the read-only scan resolves');
+    const ready = bundle.exports.BackupPanelView(viewProps({ scan }));
+    assert.equal(actionButton(ready, 'repair-register').props.disabled, false, 'an unregistered session gives the button a target');
+    assert.ok(collectText(ready).join('\n').includes('panel.backup.action.repairRegister'));
+
+    const fileFix = bundle.exports.BackupPanelView(viewProps({
+      scan,
+      registerFix: {
+        ok: true,
+        via: 'file-write',
+        registered: ['sess-gamma-0003'],
+        already_registered: [],
+        watch: { clobbered: 1, reapplied: 1 },
+        residual_risk: 'a client save after the watch window can still remove it; re-run or enable the plugin route',
+      },
+    }));
+    const fileText = collectText(fileFix).join('\n');
+    assert.ok(fileText.includes('panel.backup.status.registerFix'));
+    assert.ok(fileText.includes('panel.backup.register.done'));
+    assert.ok(fileText.includes('panel.backup.register.residual'), 'the file-write path states its residual risk');
+    assert.equal(findBy(fileFix, (node) => node.props?.['data-w2m-backup-register-residual'] !== undefined).length, 1);
+
+    const hostFix = bundle.exports.BackupPanelView(viewProps({
+      scan,
+      registerFix: { ok: true, via: 'host-service', host_service: true, registered: ['sess-gamma-0003'], already_registered: [], residual_risk: null },
+    }));
+    assert.equal(
+      findBy(hostFix, (node) => node.props?.['data-w2m-backup-register-residual'] !== undefined).length,
+      0,
+      'the host-service path has no file-level race to announce',
+    );
+  });
+
+  it('drives the run-now runtime verdict and the register repair through their host routes', async () => {
+    const statusBody = { ok: true, repository: { root: 'D:\\BackUP', initialized: true, counts: { snapshots: 1 }, free_bytes: 1_024 } };
+    const cachedRecord = {
+      started_at: '2026-11-17T07:00:00.000Z',
+      finished_at: new Date().toISOString(),
+      ok: true,
+      checked: 2,
+      failed: 0,
+      snapshots: 1,
+      reason_codes: [],
+      evidence: 'installed-harness',
+    };
+    let verifyCalls = 0;
+    let registerBody = null;
+    const host = mountBackupPage(({ url, method, body }) => {
+      if (url === '/api/w2m/backup/run') {
+        if (method === 'POST') return { ok: true, snapshot_id: 'snap', sessions: 1, files: 1, blocks_new: 0, blocks_reused: 0, duration_ms: 1 };
+        return {
+          ok: true,
+          enabled: true,
+          backup_dir: 'D:\\BackUP',
+          schedule: { times: ['22:00:00'], time_zone: 'UTC' },
+          status: statusBody,
+          state: { running: false, last_runtime_verify: cachedRecord },
+        };
+      }
+      if (url === '/api/w2m/backup/status') return statusBody;
+      if (url === '/api/w2m/backup/unlock') {
+        return { ok: true, initialized: true, envelopes: ['machine'], machine_available: true, machine_reason: null, password_required: false };
+      }
+      if (url === '/api/w2m/backup/scan?detail=1') {
+        return {
+          ok: true,
+          sessions: [{ session_id: 'sess-gamma-0003', workspace: 'proj-c', size: 1, flags: { registered: false, archived: false } }],
+          totals: { sessions: 1 },
+          registry: { ok: true },
+        };
+      }
+      if (url === '/api/w2m/backup/verify?runtime=1') {
+        verifyCalls += 1;
+        return {
+          ok: true,
+          counts: { snapshots: 1, files: 1, blocks: 1, old: 0, current: 0 },
+          problems: [],
+          future_append: { checked: 1, failed: 0, evidence: 'static-prefilter' },
+          runtime_verified: { checked: 2, failed: 0, evidence: 'installed-harness' },
+          runtime_verify: { ...cachedRecord, checked: 2 },
+        };
+      }
+      if (url === '/api/w2m/backup/register') {
+        registerBody = body;
+        return { ok: true, via: 'host-service', host_service: true, registered: ['sess-gamma-0003'], already_registered: [], changed: true, residual_risk: null };
+      }
+      return undefined;
+    });
+    try {
+      await host.settle();
+      const click = (action) => {
+        const node = findBy(host.handle.tree, (element) => element.props?.['data-w2m-backup-action'] === action)[0];
+        assert.ok(node !== undefined, `the ${action} action is rendered`);
+        node.props.onClick();
+      };
+      click('verify-runtime');
+      await host.settle();
+      assert.equal(verifyCalls, 1, 'the run-now button posts the synchronous ?runtime=1');
+      assert.ok(host.text().includes('缓存的运行时终审'), 'the cached block renders after the refresh');
+
+      click('repair-register');
+      await host.settle();
+      assert.deepEqual(registerBody, { confirm: 'register', session_ids: ['sess-gamma-0003'] });
+      assert.ok(host.text().includes('注册表修复'), 'the repair outcome is rendered');
+      assert.deepEqual(host.unexpected, [], 'every request went to a route the panel is expected to use');
+    } finally {
+      host.handle.unmount();
+    }
   });
 
   it('keeps the in-memory run log bounded to the last 50 entries', () => {

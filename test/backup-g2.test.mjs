@@ -23,7 +23,14 @@ import {
   planRegister,
   pruneRegisterBackups,
   REGISTER_CODES,
+  registerThroughHost,
 } from '../src/backup/register.mjs';
+import {
+  REGISTER_RESIDUAL_RISK_LINE,
+  sampleWatchSchedule,
+  watchRegistrationSync,
+  watchSampleSchedule,
+} from '../src/backup/register-watch.mjs';
 import { planRestore } from '../src/backup/restore.mjs';
 import { runBackup } from '../src/backup/engine.mjs';
 import { main } from '../src/backup/cli.mjs';
@@ -403,6 +410,7 @@ describe('G2: the first-class register path (no ad-hoc scripts)', () => {
     assert.equal(help.code, 0);
     assert.match(help.stdout, /register\s+register sessions that are already on disk/u);
     assert.match(help.stdout, /--registry-recheck/u);
+    assert.match(help.stdout, /--watch <minutes>/u);
 
     const missing = runCli(['register'], { env });
     assert.equal(missing.code, 2);
@@ -410,6 +418,309 @@ describe('G2: the first-class register path (no ad-hoc scripts)', () => {
 
     const unknownFlag = runCli(['register', '--session', SESSION, '--wat'], { env });
     assert.equal(unknownFlag.code, 2);
+  });
+
+  it('refuses a malformed --watch value with a usage error', () => {
+    const env = { ...process.env };
+    for (const raw of ['-1', 'abc', '1.5', '']) {
+      const bad = runCli(['register', '--session', SESSION, '--watch', raw], { env });
+      assert.equal(bad.code, 2, `--watch ${JSON.stringify(raw)} must be a usage error`);
+      assert.match(bad.stderr, /--watch needs a non-negative integer number of minutes/u);
+    }
+  });
+});
+
+describe('G2: the bounded register watch (race shrunk and quantified, not removed)', () => {
+  function registryOf(homeDir) {
+    return JSON.parse(fs.readFileSync(join(homeDir, 'storages', 'workspace.json'), 'utf8'));
+  }
+
+  function watchHome() {
+    return makeHome({ sessions: [{ workspace: '--E-GPT--', id: SESSION }], registry: registryDocument({ sessionIds: [] }) });
+  }
+
+  /** A applied register plan plus the home it applies to. */
+  function appliedRegister() {
+    const home = watchHome();
+    const plan = planRegister({ dshHome: home.home, sessionIds: [SESSION] });
+    const applied = applyRegister({ dshHome: home.home, plan });
+    assert.equal(applied.ok, true, applied.detail);
+    return { home, plan };
+  }
+
+  it('samples 2/8/20/60 s, then every 60 s, and stops at the budget', () => {
+    assert.deepEqual(watchSampleSchedule({ minutes: 5 }).delays_ms, [2_000, 8_000, 20_000, 60_000, 60_000, 60_000, 60_000]);
+    assert.deepEqual(watchSampleSchedule({ budgetMs: 30_000 }).delays_ms, [2_000, 8_000, 20_000]);
+    assert.deepEqual(watchSampleSchedule({ minutes: 0 }).delays_ms, [], 'no budget means no watch');
+    // A budget that fits none of the early samples schedules nothing rather than sampling after the end.
+    assert.deepEqual(watchSampleSchedule({ budgetMs: 1_999 }).delays_ms, []);
+  });
+
+  it('without a clobber reports clobbered:0 and a stable_at', () => {
+    const { home, plan } = appliedRegister();
+    try {
+      let now = 0;
+      const slept = [];
+      const report = watchRegistrationSync({
+        dshHome: home.home,
+        plan: plan.registry,
+        minutes: 5,
+        sleep: (ms) => { slept.push(ms); now += ms; },
+        now: () => now,
+      });
+      assert.deepEqual(slept, [2_000, 8_000, 20_000, 60_000, 60_000, 60_000, 60_000]);
+      assert.deepEqual(Object.keys(report).sort(), ['clobbered', 'minutes', 'reapplied', 'samples', 'stable_at'].sort());
+      assert.equal(report.minutes, 5);
+      assert.equal(report.samples, 7);
+      assert.equal(report.clobbered, 0);
+      assert.equal(report.reapplied, 0);
+      assert.equal(typeof report.stable_at, 'string');
+    } finally {
+      home.cleanup();
+    }
+  });
+
+  it('detects a simulated client save, re-applies the SAME plan, and does not write a second registry copy', () => {
+    const { home, plan } = appliedRegister();
+    try {
+      const copyRoot = join(home.home, '.w2m-restore-backups');
+      const copiesBefore = fs.readdirSync(copyRoot).filter((name) => name.startsWith('register-'));
+      assert.equal(copiesBefore.length, 1);
+      let now = 0;
+      const slept = [];
+      const report = watchRegistrationSync({
+        dshHome: home.home,
+        plan: plan.registry,
+        budgetMs: 24_000,
+        sleep: (ms) => {
+          slept.push(ms);
+          now += ms;
+          // The client saves its in-memory copy between the first and the second sample.
+          if (slept.length === 2) {
+            fs.writeFileSync(join(home.home, 'storages', 'workspace.json'), JSON.stringify(registryDocument({ sessionIds: [] })));
+          }
+        },
+        now: () => now,
+      });
+      assert.deepEqual(slept, [2_000, 8_000], 'a 24 s budget fits exactly the 2 s and 8 s sample');
+      assert.equal(report.samples, 2);
+      assert.equal(report.clobbered, 1);
+      assert.equal(report.reapplied, 1);
+      assert.deepEqual(registryOf(home.home).tables.workspaces.w1.sessionIds, [SESSION], 'the same plan was re-applied');
+      assert.equal(
+        fs.readdirSync(copyRoot).filter((name) => name.startsWith('register-')).length,
+        copiesBefore.length,
+        'the watch re-apply never takes a second registry copy',
+      );
+    } finally {
+      home.cleanup();
+    }
+  });
+
+  it('honours the budget with an injectable clock: a sample that would land past the end is not taken', () => {
+    const { home, plan } = appliedRegister();
+    try {
+      let now = 0;
+      const samples = [];
+      const report = watchRegistrationSync({
+        dshHome: home.home,
+        plan: plan.registry,
+        budgetMs: 6_000,
+        sleep: (ms) => { samples.push(ms); now += ms; },
+        now: () => now,
+      });
+      assert.deepEqual(samples, [2_000], 'only the 2 s sample fits in 6 s (the next is 8 s)');
+      assert.equal(report.samples, 1);
+      assert.deepEqual(watchSampleSchedule({ budgetMs: 6_000 }).delays_ms, [2_000]);
+    } finally {
+      home.cleanup();
+    }
+  });
+
+  it('runs the same schedule asynchronously for the host route (injected wait + clock)', async () => {
+    const { home, plan } = appliedRegister();
+    try {
+      let now = 0;
+      const waits = [];
+      const report = await sampleWatchSchedule({
+        dshHome: home.home,
+        plan: plan.registry,
+        budgetMs: 30_000,
+        wait: async (ms) => { waits.push(ms); now += ms; },
+        now: () => now,
+      });
+      assert.deepEqual(waits, [2_000, 8_000, 20_000], 'the host route is capped at 30 s');
+      assert.equal(report.samples, 3);
+      assert.equal(report.clobbered, 0);
+      assert.equal(typeof report.stable_at, 'string');
+    } finally {
+      home.cleanup();
+    }
+  });
+
+  it('the CLI --watch reports watch{...} and the honest residual-risk line, with an injectable clock', () => {
+    const home = watchHome();
+    const stdout = [];
+    const stderr = [];
+    try {
+      let now = 0;
+      const slept = [];
+      const code = main(['register', '--session', SESSION, '--dsh-home', home.home, '--watch', '5', '--json'], {
+        env: { ...process.env, DSH_HOME: home.home },
+        stdout: (text) => stdout.push(text),
+        stderr: (text) => stderr.push(text),
+        // This test runs on a machine where the real client is open; the gate is injected so the case is about
+        // the watch report, not about process detection (which backup-g2's client-gate cases cover).
+        clientCheck: () => ({ running: false, detail: 'test: no client' }),
+        sleep: (ms) => { slept.push(ms); now += ms; },
+        watchNow: () => now,
+        // The first sample holds; every later sample reports the client overwrote the entry.
+        watchRecheck: () => ({ ok: true, rewrote: slept.length > 1, detail: null }),
+      });
+      assert.equal(code, 0, stderr.join('\n'));
+      const payload = JSON.parse(stdout.join('\n'));
+      assert.equal(payload.watch.minutes, 5);
+      assert.equal(payload.watch.samples, 7);
+      assert.equal(payload.watch.clobbered, 6);
+      assert.equal(payload.watch.reapplied, 6);
+      assert.equal(typeof payload.watch.stable_at, 'string');
+      assert.equal(payload.residual_risk, REGISTER_RESIDUAL_RISK_LINE);
+      assert.match(payload.residual_risk, /a client save after the watch window can still remove it; re-run or enable the plugin route/u);
+    } finally {
+      home.cleanup();
+    }
+  });
+
+  it('the CLI prints the watch line and the residual-risk line in human output too', () => {
+    const home = watchHome();
+    const stdout = [];
+    const stderr = [];
+    try {
+      let now = 0;
+      const code = main(['register', '--session', SESSION, '--dsh-home', home.home, '--watch', '1'], {
+        env: { ...process.env, DSH_HOME: home.home },
+        stdout: (text) => stdout.push(text),
+        stderr: (text) => stderr.push(text),
+        clientCheck: () => ({ running: false, detail: 'test: no client' }),
+        sleep: (ms) => { now += ms; },
+        watchNow: () => now,
+      });
+      const text = stdout.join('\n');
+      assert.equal(code, 0, stderr.join('\n') + text);
+      // 1 minute fits 2 s + 8 s + 20 s; the 60 s sample would land at 90 s, past the budget.
+      assert.match(text, /watch {9}: 1 min · 3 sample\(s\) · clobbered 0 · re-applied 0/u);
+      assert.match(text, /residual risk : a client save after the watch window can still remove it/u);
+    } finally {
+      home.cleanup();
+    }
+  });
+});
+
+describe('G2: the in-host workspace service path (no file-level race)', () => {
+  /** A `ctx.workspaceRegistry` fake that records what the host would have been asked to do. */
+  function fakeWorkspaceService(options = {}) {
+    const attached = [];
+    const resolved = [];
+    const created = [];
+    const service = {
+      attached,
+      resolved,
+      created,
+      async resolveByPath(workspacePath) {
+        resolved.push(workspacePath);
+        if (options.resolve === false) return null;
+        return {
+          path: workspacePath,
+          async attachSession(sessionId) {
+            if (options.attachThrows === true) throw new Error('the session header cwd does not resolve to the workspace path');
+            attached.push(sessionId);
+          },
+        };
+      },
+      async create(workspacePath) {
+        created.push(workspacePath);
+        return {
+          path: workspacePath,
+          async attachSession(sessionId) {
+            if (options.attachThrows === true) throw new Error('refused by the host service');
+            attached.push(sessionId);
+          },
+        };
+      },
+    };
+    return service;
+  }
+
+  function hostHome(registry = registryDocument({ sessionIds: [] })) {
+    return makeHome({ sessions: [{ workspace: '--E-GPT--', id: SESSION }], registry });
+  }
+
+  it('attaches through the host service and writes nothing to workspace.json', async () => {
+    const home = hostHome();
+    try {
+      const before = fs.readFileSync(join(home.home, 'storages', 'workspace.json'));
+      const service = fakeWorkspaceService();
+      const result = await registerThroughHost({ dshHome: home.home, sessionIds: [SESSION], workspaceRegistry: service });
+      assert.equal(result.ok, true, result.detail);
+      assert.equal(result.via, 'host-service');
+      assert.equal(result.host_service, true);
+      assert.equal(result.residual_risk, null, 'the service path has no file-level residual race to announce');
+      assert.deepEqual(result.registered, [SESSION]);
+      assert.deepEqual(service.attached, [SESSION]);
+      assert.equal(service.resolved.length, 1);
+      assert.ok(service.resolved[0].endsWith('E:\\GPT'), `the workspace path comes from the registry view, got ${service.resolved[0]}`);
+      assert.ok(fs.readFileSync(join(home.home, 'storages', 'workspace.json')).equals(before), 'the host service owns the write; no file edit happened');
+    } finally {
+      home.cleanup();
+    }
+  });
+
+  it('reports already_registered and never attaches an entry that is already in the registry', async () => {
+    const home = hostHome(registryDocument({ sessionIds: [SESSION] }));
+    try {
+      const service = fakeWorkspaceService();
+      const result = await registerThroughHost({ dshHome: home.home, sessionIds: [SESSION], workspaceRegistry: service });
+      assert.equal(result.ok, true, result.detail);
+      assert.deepEqual(result.already_registered, [SESSION]);
+      assert.deepEqual(result.registered, []);
+      assert.equal(result.changed, false);
+      assert.deepEqual(service.attached, []);
+    } finally {
+      home.cleanup();
+    }
+  });
+
+  it('refuses with a named code when the profile exposes no service, instead of silently editing the file', async () => {
+    const home = hostHome();
+    try {
+      const before = fs.readFileSync(join(home.home, 'storages', 'workspace.json'));
+      const result = await registerThroughHost({ dshHome: home.home, sessionIds: [SESSION], workspaceRegistry: null });
+      assert.equal(result.ok, false);
+      assert.equal(result.reason_code, REGISTER_CODES.HOST_UNAVAILABLE);
+      assert.match(result.detail, /w2m-backup register/u);
+      assert.ok(fs.readFileSync(join(home.home, 'storages', 'workspace.json')).equals(before));
+    } finally {
+      home.cleanup();
+    }
+  });
+
+  it('reports the service’s own attach refusal rather than falling back to a file write', async () => {
+    const home = hostHome();
+    try {
+      const before = fs.readFileSync(join(home.home, 'storages', 'workspace.json'));
+      const result = await registerThroughHost({
+        dshHome: home.home,
+        sessionIds: [SESSION],
+        workspaceRegistry: fakeWorkspaceService({ attachThrows: true }),
+      });
+      assert.equal(result.ok, false);
+      assert.equal(result.reason_code, REGISTER_CODES.HOST_ATTACH_FAILED);
+      assert.equal(result.failed.length, 1);
+      assert.equal(result.failed[0].session_id, SESSION);
+      assert.ok(fs.readFileSync(join(home.home, 'storages', 'workspace.json')).equals(before));
+    } finally {
+      home.cleanup();
+    }
   });
 });
 

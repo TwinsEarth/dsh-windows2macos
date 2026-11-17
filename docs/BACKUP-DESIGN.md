@@ -647,6 +647,15 @@ UI 半只有一个文件：`lib/client.js`（手写、由 `window.__ModuleLoader
   显式选择这条慢路径（§22.4）：默认不勾，报告只给标了 `static-prefilter` 的模拟结果——不勾就没有门禁级证据。
 * **批量与流式**：小 artifact 每约 96 MiB 一批；单会话 JSON 超过 32 MiB 走 NDJSON 流式 driver（真实 152 MB /
   370 MB 会话实测通过）；verdict 缓存按"安装身份 + 内容摘要"分键，避免拿另一份安装的结论复用。
+* **缓存终审 + nightly（v3.5.x）**：`?runtime=1` 同步跑完后把结论写成一个**记录**
+  `{started_at, finished_at, ok, checked, failed, snapshots, reason_codes, evidence:'installed-harness'}`，
+  原子持久化到 `<DSH_HOME>/xclient/w2m-backup/state.json`（`xclient/` 是本包自己的状态区；`storages/` 是客户端
+  所有，插件不写）。`GET /verify?runtime=cached` 只读该记录、**绝不 spawn**；`finished_at` 超过 24 h 标
+  `stale:true`，没有记录与不可解析的时间戳同样按 stale 报（"没有新证据"不是"新鲜"）。`GET /run` 的内嵌状态带
+  `state.last_runtime_verify`（只会是缓存）。插件配置 `backupRuntimeVerify: 'off' | 'nightly'`（默认 `off`，
+  非法值 `BACKUP_CONFIG_INVALID` 拒绝挂载）：`nightly` 只在**成功**的定时备份（含错过时段补跑）之后
+  fire-and-forget 跑一次，失败只写 warning、记录照样持久化，**绝不让备份或调度失败**；CLI 手动入口
+  `w2m-backup run --runtime-verify`（跑完后执行一次并持久化，失败只加 warning，备份结果不变）。
 
 ### 19.3 测试
 
@@ -656,7 +665,11 @@ UI 半只有一个文件：`lib/client.js`（手写、由 `window.__ModuleLoader
   时静态证据显式降级。
 * `test/backup-engine.test.mjs`：`run --runtime` 正向（15/15 类场景用 runtime-valid home）与反向（坏日志的
   追加 artifact 被拒，`failed ≥ 1`，无静态回退）。
-* `test/backup-verify.test.mjs`：`--runtime` 连 append 后 artifact 一起终审。
+* `test/backup-verify.test.mjs`：`--runtime` 连 append 后 artifact 一起终审；缓存记录（字段/证据标签/去重 reason
+  codes/24 h stale 边界/持久化路径/in-flight 单次 spawn/失败也持久化）与 CLI `run --runtime-verify` 的持久化记录。
+* `test/backup-run.test.mjs`：`?runtime=cached` 不 spawn、过期标 stale、`?runtime=1` 更新缓存、`GET /run` 内嵌
+  `state.last_runtime_verify`；`backupRuntimeVerify: 'off'|'nightly'` 的配置归一化，nightly 每个成功定时备份恰好
+  跑一次、失败只 warning 且记录持久化、默认 off。
 * `test/loader-entry.test.mjs`：真实 Chromium 页面（抛空 profile 安装当前 tarball）断言面板入口与四操作标记。
 
 ## 20. G4 收口：seq 重编号工具（v3.4.8/v3.4.9）
@@ -734,6 +747,23 @@ node bin/w2m-fix.mjs renumber --file <session.v4.jsonl.zstd> [--delete-seq <n>].
 门禁（安装的 Harness 拒绝静态合法日志 → `RENUMBER_RUNTIME_REJECTED`；注入无安装 → `RENUMBER_RUNTIME_UNAVAILABLE`；
 `--allow-static-validation` 才降级且标 `runtime_verified:false`）、`.bak` 保留原始字节 + 写后 sha/doctor 复验、
 plan 后文件变化拒绝覆盖、dry-run 零写入、CLI 退出码/帮助/真实入口追加。
+
+**"未来追加模拟失败"分支的可达性（2026-11-17 补齐论证）**：`planRenumber({futureAppendCheck})` 是一条**只有
+测试能走**的缝，因为对 `renumberBuffer` 的产出它在构造上不可达：
+
+1. `renumberBuffer` 用 `encodeLog` 规范重编码：header 单独一帧，之后每个事件恰好一帧、一行 JSON；
+2. `seq` 被重写为 `0..N-1`（数组下标），附录事件 `permission/preset` 的 seq = 行数−1 = N，仍 dense；
+3. 附录事件是会话级、无 turn 状态、无 surface、无任何 `*Seq`/`*Seqs` 键，因此 doctor 的 header/surface/引用
+   规则都不会因它改变；header 规则只看第 0 帧，附录只追加新帧。
+
+因此"doctor 通过 + 追加模拟不过"对规范产出**不可能**同时成立，`staticFuture.ok===false` 只可能由注入的
+`futureAppendCheck` 产生；测试因此分两层钉住这条边界：`test/fix-renumber.test.mjs` 断言**生产源码中只有
+`src/backup/renumber.mjs` 提到该选项**（没有生产调用者传它），并断言规范产出的 `static_future_append.ok` 为真、
+安装 Harness 存在时 `future_append_evidence:'installed-harness'` 且结果是 dense；`test/backup-verify.test.mjs`
+用缝确定性地驱动拒绝分支（零写入）。**函数级例外（诚实写出）**：非规范输入确实可能"doctor 过、追加模拟不过"
+（例如多一行非事件文本使 `countLogRows` 算错下一个 seq，或帧外杂字节让 `scanFrames` 抛错），但那类输入在
+`parseLog` 阶段就以 `RENUMBER_INPUT_INVALID` 被拒，根本到不了这个分支；备份/verify 对**原始字节**的追加模拟
+仍会如实报告它们（§19.2）。
 
 **诚实边界**：
 
@@ -868,19 +898,41 @@ v3.4.9 面板与 v3.5.0 非 UI 半之后，复盘门禁的四个"最后一段"�
   → 复制 workspace.json 到 <DSH_HOME>/.w2m-restore-backups/register-<ts>/workspace.json（回退路径）
   → 整次一个文档 planRegistryRestores → 原子写 → 回读校验（applyRegistryRestore）
   → 可选 --registry-recheck <ms>：等一个客户端保存窗口后复查（recheckRegistry）
+  → 可选 --watch <minutes>：按 2/8/20/60 s、之后每 60 s 采样直到分钟预算；发现被覆盖就重放同一 plan
+（宿主内有第二条路径：ctx.workspaceRegistry.attachSession，见下）
 ```
 
 * 输入：`--session <id>`（可重复）、`--workspace-path <dir>`（**唯一**能创建/挂接未知工作区的方式）、
-  `--allow-live-home`、`--registry-recheck <ms>`、`--json`、`--dsh-home`、`--dry-run`。
-* 返回 `{ok, registered, already_registered, unknown, actions, verified, backup_file, recheck?}`；磁盘上找不到的
-  id 整单拒绝 `BACKUP_REGISTER_SESSION_MISSING` 并列出（register 只让已存在会话可见，不创建会话）。
+  `--allow-live-home`、`--registry-recheck <ms>`、`--watch <minutes>`、`--json`、`--dsh-home`、`--dry-run`。
+* 返回 `{ok, registered, already_registered, unknown, actions, verified, backup_file, recheck?, watch?, residual_risk}`；
+  磁盘上找不到的 id 整单拒绝 `BACKUP_REGISTER_SESSION_MISSING` 并列出（register 只让已存在会话可见，不创建会话）。
+* **有界 watch（v3.5.x）**：apply 成功后按 2 s / 8 s / 20 s / 60 s、之后每 60 s 采样，直到 `--watch` 的分钟预算
+  （0 = 默认，不监视）。任一样本显示登记被客户端覆盖，就用 `recheckRegistry` **重放同一 plan**（注册表副本已在
+  apply 时取过，不会写第二份），计 `clobbered/reapplied`；最终报告
+  `watch: {minutes, samples, clobbered, reapplied, stable_at}`，并在文本输出打一行诚实残余风险：
+  `a client save after the watch window can still remove it; re-run or enable the plugin route`。watch 缩小并量化
+  了窗口，**没有**消除它。
+* **宿主服务路径（v3.5.x，安装的 Harness 存在时）**：Harness 的 `@deepseek-ai/dsh-workspace` 把
+  `ctx.workspaceRegistry` 注册到 Cordis 宿主上下文；它拥有内存域与 `storages/workspace.json`，先持久化再改内存并
+  发 `domain/changed`，GUI 读的是该投影。因此 `registerThroughHost()` 用 `resolveByPath`/`create` +
+  `attachSession(sessionId)` 登记，**不写文件，也就没有客户端保存可覆盖**（`residual_risk:null`）。面板路由
+  `POST /api/w2m/backup/register {confirm:'register', session_ids}` 优先走它；宿主没有该服务（或离线 CLI）时才退回上面的
+  文件路径（响应 `via:'file-write'`，带 watch 与残余风险），**不会静默降级**。服务自己的 `attachSession` 校验
+  （会话必须被 `sessionPersistence` 认识、header cwd 必须 realpath 到工作区路径）拒绝时按 `BACKUP_REGISTER_HOST_*`
+  具名报告，不回退文件写。
 * 退出码与 restore 一致：0 成功、1 具名拒绝、2 用法错误。
 * 归档/置顶 = **读出来再写回**，绝不默认；已登记会话不进 plan，因此第二次运行是 no-op（`already_registered`），
   连注册表副本都不写。`register-*` 目录只由 register 自己按份数保留（默认 10，0 = 全留，当前次副本永不删）；
   `listPreRestoreSnapshots` 只认时间戳目录，restore 的保留策略不会把注册表副本算进去、也不会删它。
-* 测试：`test/backup-g2.test.mjs` 新增 8 条（登记 + 回读 + 副本、no-op、归档/置顶保持、未知工作区只在给
-  `--workspace-path` 时创建、未知 id 拒绝且零写入、副本保留、客户端门禁 + `--allow-live-home` + 复查、CLI 用法）。
-* 残余风险：与 restore 相同（§16 末）——复查窗口之间客户端仍可能再存一次。
+* 测试：`test/backup-g2.test.mjs` 新增 15 条（watch 调度/预算/时钟注入、无覆盖 `clobbered:0`、模拟覆盖后
+  `reapplied:1` 且不写第二份副本、CLI `--watch` 的 JSON/文本/残余风险行/参数错误、`registerThroughHost` 的
+  服务写入/已登记 no-op/无服务具名拒绝/attach 拒绝不回退）；`test/backup-run.test.mjs` 新增 2 条路由测试
+  （无服务时 file-write + 30 s 有界 watch + residual_risk；有 `ctx.workspaceRegistry` 时 host-service、
+  workspace.json 字节不变、不跑 watch）；面板代价见 §22.4。
+* 残余风险：**只有文件路径有**（离线 CLI，或配置隐藏了 workspace 服务的宿主）——watch 窗口之后的客户端保存仍可能
+  覆盖；要彻底消除，必须在宿主内走 `workspaceRegistry` 服务（面板路由已优先这样做），或停掉客户端再跑 CLI。
+  服务路径的残留边界是 Harness 自己的 `attachSession` 校验范围（cwd 已不存在等灾难恢复场景它不接），那种 case 由
+  CLI 文件路径 + watch 兜住。
 
 ### 22.2 G3：一条证据测试覆盖每条"会改字节/改声明"的路径
 
@@ -890,8 +942,12 @@ v3.4.9 面板与 v3.5.0 非 UI 半之后，复盘门禁的四个"最后一段"�
 | renumber 计划 | 结果带 `validation.future_append`（静态路径 = `true`，标 `static-prefilter`）；未来追加模拟失败时 plan 拒绝 `RENUMBER_STATIC_REJECTED` 且零写入 |
 | verify 报告 | `future_append.evidence === 'static-prefilter'`、`runtime_verified.evidence === 'installed-harness'`——报告不能把预筛当门禁（G5） |
 
-renumber 的"追加后日志失败"分支用 `planRenumber({futureAppendCheck})` 测试缝驱动：内存重编号的结果总是 dense、
-本身合法，单靠 fixture 造不出"医生过、追加模拟不过"的输入，所以缝是让这条拒绝分支可测的最小改动（生产不传）。
+renumber 的"追加后日志失败"分支用 `planRenumber({futureAppendCheck})` 测试缝驱动。该分支对规范产出**不可达**：
+`renumberBuffer` 规范重编码（header 单帧 + 每事件一帧、`seq===下标`、附录 `permission/preset` 是下一 dense seq、
+无 surface/引用），doctor 通过则追加模拟必过（完整论证与"函数级例外"见 §20.5）。测试因此同时机器校验：生产源码
+中**只有** `src/backup/renumber.mjs` 提到该选项（无生产调用者传它），且规范 plan 的
+`static_future_append.ok===true`；安装 Harness 存在时 `future_append_evidence==='installed-harness'`。
+§22.2 新增：`test/backup-verify.test.mjs` 仍用缝驱动"拒绝且零写入"的调用点。
 
 ### 22.3 G4：renumber 兄弟副本保留上限
 
@@ -921,12 +977,37 @@ renumber 的"追加后日志失败"分支用 `planRenumber({futureAppendCheck})`
 勾选后请求 `?runtime=1`、默认关闭、中英字典有标签与提示、问题码走映射），既有 67 条保持通过（checkbox 计数
 按 `data-w2m-backup-session` 收窄）。
 
+**缓存终审与「立即运行」按钮（v3.5.x 补）**：校验卡现在先显示缓存记录：`state.last_runtime_verify` 的
+`finished_at`（本地时间）、`checked/failed`、快照数、证据标签 `installed-harness`，以及 24 h 过期徽标
+（`data-w2m-backup-runtime-cached = none|fresh|stale`，stale 时另渲染 `data-w2m-backup-runtime-stale` 标签）。
+「立即运行（慢，需要安装 Harness）」按钮（`data-w2m-backup-action="verify-runtime"`）是唯一同步触发终审的控件：
+请求 `GET /api/w2m/backup/verify?runtime=1`，期间 `busy='verify-runtime'` 禁用所有操作并显示进度，结束后重读
+`GET /run` 的内嵌状态刷新缓存块。原勾选框保留：它决定「全量校验」按钮走静态（无 `?runtime`）还是运行时
+（`?runtime=1`），两个入口共享同一份缓存记录。i18n 新增 zh/en 键：`panel.backup.action.verifyRuntime`、
+`panel.backup.busy.verifyRuntime`、`panel.backup.log.verifyRuntime`、`panel.backup.verify.cachedTitle/cachedLine/
+cachedNone/stale/fresh`。测试：`test/client-bundle.test.mjs` 新增 3 条（缓存三态与证据标签/过期徽标；运行按钮
+禁用态与忙碌文案；真实页面点击 `verify-runtime` 发 `?runtime=1`、点击「修复注册表」发
+`{confirm:'register', session_ids:[未登记会话]}`）。
+
+**面板的「修复注册表」按钮（G2，v3.5.x 补）**：状态卡新增 `data-w2m-backup-action="repair-register"`，登记**勾选
+会话**，没有勾选时登记只读扫描里的**未登记会话**；两者皆空则禁用（不发空请求）。成功后显示
+`已登记/已存在/被覆盖/已重放` 四个计数；只有 file-write 路径（响应 `residual_risk` 为字符串）才渲染一行
+`panel.backup.register.residual` 残余风险，host-service 路径不渲染（服务自己持久化并推送 GUI，没有可覆盖的文件
+写入）。i18n：`panel.backup.action.repairRegister`、`panel.backup.busy.repairRegister`、
+`panel.backup.status.registerFix`、`panel.backup.register.done/residual`、`panel.backup.log.repairRegister`。
+
 ### 22.5 诚实边界（本次不承诺的）
 
-* register 仍依赖客户端门禁与保存后复查；复查窗口之间的客户端保存仍可能覆盖（§16 末同一条残余风险）。
-  它也不提供宿主路由：登记一个 home 是带 home 路径的操作员动作，走离线 CLI。
-* 面板运行时勾选是 opt-in（慢）——默认的 `verify` 只给静态预筛，报告里的 `future_append` 永远标
-  `static-prefilter`；要"门禁级"证据必须勾选或有安装的 Harness 走 `--runtime`。
+* register 的文件路径仍依赖客户端门禁 + 保存后复查/有界 watch；**窗口之后的客户端保存仍可能覆盖**（§16 末同一条
+  残余风险）。watch 把它缩小到一个明确预算并给出 `clobbered/reapplied` 数据，不声称消除。消除路径只有一条：
+  在宿主内走 `ctx.workspaceRegistry`（面板路由在有该服务时优先走它；离线 CLI 没有宿主上下文）；该服务也有自己的
+  边界——`attachSession` 要求会话被 `sessionPersistence` 认识且 header cwd realpath 到工作区，cwd 已消失的灾难
+  恢复场景它不接，那种 case 仍要离线 CLI + watch。
+* 面板运行时终审仍是 opt-in（慢）：勾选框让「全量校验」同步跑 `?runtime=1`，或点「立即运行（慢）」按钮；缓存块
+  只读最近一次记录并明确标 stale（>24 h）。nightly 只在配置 `backupRuntimeVerify: 'nightly'` 时启用，默认 `off`；
+  失败的终审只记 warning 并持久化失败记录，**不**让备份/调度失败，也**不**回滚已提交备份。
+* renumber 的"追加后失败"拒绝分支在规范产出上不可达（§20.5 论证），只由测试缝驱动；生产代码里该选项只有一个
+  定义处、没有调用者，测试机器校验了这一点。文件级例外（非规范输入）由 `parseLog` 在更早处具名拒绝，不会走到分支。
 * renumber 副本保留只处理**兄弟副本**；它不清理 `$DSH_HOME` 其它位置的副本，也不动 `old/` 版本记录（那是
   §21 的保留策略）。
 * 本次不 bump 版本号、不跑 preflight、不提交；G2/G4 的新测试挂在既有套件上（`backup-g2` / `fix-renumber`），

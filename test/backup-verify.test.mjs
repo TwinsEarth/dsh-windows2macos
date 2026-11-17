@@ -8,11 +8,20 @@ import fs from 'node:fs';
 import { join } from 'node:path';
 
 import { runBackup } from '../src/backup/engine.mjs';
+import { main } from '../src/backup/cli.mjs';
 import { verifyRepo } from '../src/backup/verify.mjs';
 import { planRestore } from '../src/backup/restore.mjs';
 import { applyRenumber, planRenumber, RENUMBER_CODES } from '../src/backup/renumber.mjs';
 import { appendLegalEvent, countLogRows, futureAppendVerdict } from '../src/backup/future-append.mjs';
 import { findHarnessInstallation } from '../src/backup/runtime-validate.mjs';
+import {
+  buildRuntimeVerdictRecord,
+  createRuntimeVerdictStore,
+  readBackupState,
+  RUNTIME_VERDICT_EVIDENCE,
+  runtimeVerdictStaleness,
+  writeBackupState,
+} from '../src/backup/runtime-verdict.mjs';
 import { repoPaths } from '../src/backup/layout.mjs';
 import { header, framesFor, makeHome, registryDocument, runtimeValidHome, runtimeValidSessionLog, tempDir } from './helpers/backup-fixture.mjs';
 
@@ -98,6 +107,169 @@ describe('G3: only raw bytes, plus a simulated next append', () => {
         assert.equal(result.runtime_verified.failed, 0);
       } finally {
         repo.cleanup();
+        home.cleanup();
+      }
+    },
+  );
+});
+
+describe('G5: the cached runtime verdict is a record with a timestamp, not an inference', () => {
+  /** A real-shaped verify result; nothing here spawns the runtime. */
+  function verifyResult(overrides = {}) {
+    return {
+      ok: true,
+      counts: { snapshots: 2, files: 3, blocks: 4, bytes: 5, old: 0, current: 0 },
+      runtime_verified: { checked: 2, failed: 0, evidence: 'installed-harness' },
+      future_append: { checked: 2, failed: 0, evidence: 'static-prefilter' },
+      problems: [],
+      duration_ms: 42,
+      ...overrides,
+    };
+  }
+
+  it('copies the counts, deduplicates the reason codes, and always labels the evidence installed-harness', () => {
+    const record = buildRuntimeVerdictRecord({
+      verifyResult: verifyResult({
+        ok: false,
+        runtime_verified: { checked: 2, failed: 1 },
+        problems: [{ code: 'BACKUP_RUNTIME_REJECTED' }, { code: 'BACKUP_RUNTIME_REJECTED' }, { code: 'BACKUP_FUTURE_APPEND_FAILED' }],
+      }),
+      startedAt: Date.UTC(2026, 10, 17, 8, 0, 0),
+      finishedAt: Date.UTC(2026, 10, 17, 8, 0, 42),
+      trigger: 'nightly',
+    });
+    assert.equal(record.evidence, RUNTIME_VERDICT_EVIDENCE);
+    assert.equal(record.evidence, 'installed-harness');
+    assert.equal(record.ok, false);
+    assert.equal(record.checked, 2);
+    assert.equal(record.failed, 1);
+    assert.equal(record.snapshots, 2);
+    assert.deepEqual(record.reason_codes, ['BACKUP_RUNTIME_REJECTED', 'BACKUP_FUTURE_APPEND_FAILED']);
+    assert.equal(record.started_at, '2026-11-17T08:00:00.000Z');
+    assert.equal(record.finished_at, '2026-11-17T08:00:42.000Z');
+    assert.equal(record.trigger, 'nightly');
+  });
+
+  it('marks a record stale only after the 24 h window, and treats an unreadable timestamp as stale', () => {
+    const finishedAt = Date.UTC(2026, 10, 17, 8, 0, 0);
+    const record = buildRuntimeVerdictRecord({ verifyResult: verifyResult(), startedAt: finishedAt, finishedAt });
+    const fresh = runtimeVerdictStaleness(record, { nowMs: finishedAt + 23 * 60 * 60 * 1000 });
+    assert.equal(fresh.stale, false);
+    assert.equal(fresh.age_ms, 23 * 60 * 60 * 1000);
+    const stale = runtimeVerdictStaleness(record, { nowMs: finishedAt + 25 * 60 * 60 * 1000 });
+    assert.equal(stale.stale, true);
+    assert.equal(runtimeVerdictStaleness(null, { nowMs: finishedAt }).stale, true);
+    assert.equal(runtimeVerdictStaleness({ finished_at: 'not-a-date' }, { nowMs: finishedAt }).stale, true);
+    assert.equal(runtimeVerdictStaleness(record, { nowMs: finishedAt + 2_000, staleAfterMs: 1 }).stale, true);
+  });
+
+  it('persists the record in the plugin state dir and serves it from cache without calling the verifier', () => {
+    const { dir, cleanup } = tempDir('w2m-runtime-verdict-');
+    const home = join(dir, 'home');
+    try {
+      let verifyCalls = 0;
+      const store = createRuntimeVerdictStore({
+        dshHome: home,
+        verify: () => {
+          verifyCalls += 1;
+          return verifyResult();
+        },
+        now: () => Date.UTC(2026, 10, 17, 9, 0, 0),
+      });
+      const empty = store.cached();
+      assert.equal(empty.cached, true);
+      assert.equal(empty.record, null);
+      assert.equal(empty.stale, true, 'no record is not a fresh record');
+      assert.equal(store.stateFile, join(home, 'xclient', 'w2m-backup', 'state.json'));
+
+      const outcome = store.run({ trigger: 'nightly' });
+      return outcome.then(async (ran) => {
+        assert.equal(verifyCalls, 1);
+        assert.equal(ran.record.evidence, 'installed-harness');
+        assert.equal(ran.persisted, true);
+        const loaded = readBackupState(home);
+        assert.equal(loaded.ok, true);
+        assert.deepEqual(loaded.state.last_runtime_verify, ran.record, 'the cached record is the persisted record');
+        assert.equal(loaded.state.last_runtime_verify_run.trigger, 'nightly');
+        const cached = store.cached();
+        assert.deepEqual(cached.record, ran.record);
+        assert.equal(cached.stale, false);
+        assert.equal(verifyCalls, 1, 'reading the cache never spawns the verifier');
+      });
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('runs one in-flight verdict at a time, and persists a failed record instead of throwing', async () => {
+    const { dir, cleanup } = tempDir('w2m-runtime-verdict-fail-');
+    const home = join(dir, 'home');
+    try {
+      let verifyCalls = 0;
+      let release;
+      const gate = new Promise((resolve) => { release = resolve; });
+      const store = createRuntimeVerdictStore({
+        dshHome: home,
+        verify: async () => {
+          verifyCalls += 1;
+          await gate;
+          return verifyResult({ ok: false, runtime_verified: { checked: 1, failed: 1 }, problems: [{ code: 'BACKUP_RUNTIME_REJECTED' }] });
+        },
+      });
+      const first = store.run({ trigger: 'nightly' });
+      const second = store.run({ trigger: 'manual-route' });
+      assert.equal(first, second, 'a second request joins the in-flight verdict');
+      release();
+      const outcome = await first;
+      assert.equal(verifyCalls, 1, 'the Harness is spawned once for two concurrent requests');
+      assert.equal(outcome.record.ok, false);
+      assert.equal(readBackupState(home).state.last_runtime_verify.ok, false, 'a failed verdict is still persisted');
+
+      const throwing = createRuntimeVerdictStore({
+        dshHome: home,
+        verify: () => {
+          throw new Error('the runtime is not installed');
+        },
+      });
+      const thrownOutcome = await throwing.run({ trigger: 'manual-route' });
+      assert.equal(thrownOutcome.ran, true);
+      assert.equal(thrownOutcome.record.ok, false);
+      assert.equal(thrownOutcome.record.evidence, 'installed-harness');
+      assert.ok(thrownOutcome.record.reason_codes.includes('BACKUP_RUNTIME_UNAVAILABLE'));
+      assert.equal(readBackupState(home).state.last_runtime_verify.runtime_available, false);
+      // A caller can seed a record directly (the CLI's manual run does the same through writeBackupState).
+      const seeded = writeBackupState(home, { last_runtime_verify: buildRuntimeVerdictRecord({ verifyResult: verifyResult() }) });
+      assert.equal(seeded.ok, true);
+      assert.equal(readBackupState(home).state.last_runtime_verify.ok, true);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it(
+    'CLI run --runtime-verify runs one manual verdict after the backup and persists it (installed Harness)',
+    { skip: findHarnessInstallation() === null ? 'no DeepSeek Harness installation on this machine' : false },
+    () => {
+      const home = runtimeValidHome();
+      const { dir, cleanup } = tempDir('w2m-cli-runtime-verify-');
+      try {
+        const stdout = [];
+        const stderr = [];
+        const code = main(
+          ['run', '--dsh-home', home.home, '--backup-dir', join(dir, 'repo'), '--runtime-verify', '--json'],
+          { env: { ...process.env, DSH_HOME: home.home }, stdout: (text) => stdout.push(text), stderr: (text) => stderr.push(text) },
+        );
+        assert.equal(code, 0, stderr.join('\n'));
+        const payload = JSON.parse(stdout.join('\n'));
+        assert.equal(payload.ok, true, payload.detail);
+        assert.equal(payload.runtime_verify.evidence, 'installed-harness');
+        assert.equal(payload.runtime_verify.ok, true);
+        assert.equal(payload.runtime_verify.checked, 1);
+        assert.equal(payload.runtime_verify_persisted, true);
+        const loaded = readBackupState(home.home);
+        assert.deepEqual(loaded.state.last_runtime_verify, payload.runtime_verify, 'the manual verdict is the cached record');
+      } finally {
+        cleanup();
         home.cleanup();
       }
     },
@@ -269,9 +441,11 @@ describe('G3 evidence: every restructuring path re-validates the future append',
       assert.equal(plan.validation.future_append_evidence, 'static-prefilter', 'static evidence is labelled as the pre-filter, never quoted as the gate');
       assert.equal(plan.validation.static_future_append.evidence, 'static-prefilter');
 
-      // `futureAppendCheck` is a documented test seam (production passes nothing): the in-memory renumber result is
-      // always dense and legal, so the "appended log would fail" branch cannot be produced by a fixture alone. With
-      // the seam the branch is exercised deterministically: the plan must refuse before a byte is written.
+      // `futureAppendCheck` is a documented test seam, and the branch it drives is unreachable by construction for
+      // `renumberBuffer`'s canonical output: dense seqs, header alone in frame 1, one `permission/preset` append with
+      // no surface/reference -- the doctor refuses nothing that canonical result plus that append adds (the full
+      // argument and the machine-check live in `docs/BACKUP-DESIGN.md` §20.5 and `test/fix-renumber.test.mjs`).
+      // The seam exercises the call site deterministically: the plan must refuse before a byte is written.
       const refused = planRenumber({
         file,
         allowStaticValidation: true,

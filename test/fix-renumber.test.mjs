@@ -19,6 +19,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { RENUMBER_CODES, applyRenumber, DEFAULT_KEEP_RENUMBER_BACKUPS, listRenumberBackups, planRenumber, pruneRenumberBackups, renumberBuffer } from '../src/backup/renumber.mjs';
+import { futureAppendVerdict } from '../src/backup/future-append.mjs';
 import { findHarnessInstallation, runtimeValidate } from '../src/backup/runtime-validate.mjs';
 import { sha256Hex } from '../src/backup/manifest.mjs';
 import { decompressFrame, scanFrames } from '../src/fix/zstd.mjs';
@@ -627,4 +628,78 @@ describe('renumber: sibling backup retention (G4)', () => {
     assert.equal(backupSiblings(file).length, 1, 'keep=1 leaves this run\'s copy and prunes the two older ones');
     assert.equal(fs.readFileSync(file).equals(original), false);
   });
+});
+
+/**
+ * The append-failure branch's boundary: reachable only through the test seam.
+ *
+ * The 2026-11-17 gate asked whether a dense, doctor-valid log can make the simulated legal append fail for real.
+ * It cannot for the values this tool produces: `renumberBuffer` re-encodes canonically and the appended event is
+ * `permission/preset`, so a canonical result plus one append satisfies every rule the doctor has (see the seam's doc
+ * comment in `src/backup/renumber.mjs`). What is machine-checked here is the claim that makes the seam legitimate:
+ * no production caller passes it, and canonical plans really do carry a passing append verdict -- from the
+ * installed Harness when it exists, labelled as the pre-filter when the caller accepts static-only evidence.
+ */
+describe('renumber: the append-failure branch is seam-only, machine-checked', () => {
+  /** Every `.mjs` file under `src/` (the production tree). */
+  function sourceFiles(dir) {
+    const out = [];
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) out.push(...sourceFiles(full));
+      else if (entry.name.endsWith('.mjs')) out.push(full);
+    }
+    return out;
+  }
+
+  it('names `futureAppendCheck` in exactly one production file: the module that defines the seam', () => {
+    const mentioned = sourceFiles(path.join(ROOT, 'src'))
+      .filter((file) => fs.readFileSync(file, 'utf8').includes('futureAppendCheck'))
+      .map((file) => path.relative(ROOT, file).replaceAll('\\', '/'));
+    assert.deepEqual(mentioned, ['src/backup/renumber.mjs'], 'no production caller may pass the seam');
+    // The doc comment states the reachability argument next to the option, so the code and the claim ship together.
+    const source = fs.readFileSync(path.join(ROOT, 'src', 'backup', 'renumber.mjs'), 'utf8');
+    assert.match(source, /unreachable by construction/u);
+    assert.match(source, /permission\/preset/u);
+  });
+
+  it('for canonical, doctor-valid logs the append simulation always passes (so the refuse branch cannot fire)', () => {
+    for (const [sessionId, buffer] of [
+      ['session-llllllll-0011', runtimeValidSessionLog('session-llllllll-0011')],
+      ['session-mmmmmmmm-0012', sessionLog('session-mmmmmmmm-0012')],
+    ]) {
+      const { file } = fixtureFile(buffer);
+      const plan = planRenumber({ file, ...STATIC_ONLY });
+      assert.equal(plan.ok, true, `${sessionId}: ${plan.detail}`);
+      assert.equal(plan.validation.static.ok, true, 'the fixture passes the doctor');
+      assert.equal(plan.validation.static_future_append.ok, true, 'the canonical result plus one append passes');
+      assert.equal(plan.validation.future_append, true);
+      assert.equal(futureAppendVerdict(buffer).ok, true, 'the source buffer, too, already passes the append simulation');
+    }
+  });
+
+  it(
+    'a plan result is dense and its future-append verdict is the installed Harness’s evidence (G3/G5)',
+    { skip: harness === null ? 'no DeepSeek Harness installation on this machine' : false },
+    () => {
+      const sessionId = 'session-kkkkkkkk-0010';
+      const { file } = fixtureFile(runtimeValidSessionLog(sessionId));
+      const plan = planRenumber({
+        file,
+        insert: [{ atSeq: 2, event: { type: 'permission/preset', time: 1794842804377, data: { preset: 'workspace-write' } } }],
+      });
+      assert.equal(plan.ok, true, plan.detail);
+      assert.equal(plan.changed, true);
+      assert.equal(plan.validation.runtime_verified, true, 'the installed Harness validated the result');
+      assert.equal(plan.validation.future_append, true);
+      assert.equal(plan.validation.future_append_evidence, 'installed-harness', 'the verdict is the gate, not the pre-filter');
+      assert.equal(plan.validation.static_future_append.ok, true, 'the pre-filter agrees; it is still not the evidence');
+
+      const applied = applyRenumber({ plan });
+      assert.equal(applied.ok, true, applied.detail);
+      const { rows } = decodeLog(fs.readFileSync(file));
+      assert.deepEqual(rows.slice(1).map((event) => event.seq), rows.slice(1).map((_event, index) => index), 'seq is the dense index');
+      assert.equal(futureAppendVerdict(fs.readFileSync(file)).ok, true);
+    },
+  );
 });

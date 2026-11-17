@@ -37,6 +37,8 @@ import { applyRestore, planRestore, planRestoreFromArchive } from './restore.mjs
 import { detectClientRunning } from './client.mjs';
 import { recheckRegistry } from './registry-watch.mjs';
 import { applyRegister, planRegister } from './register.mjs';
+import { REGISTER_RESIDUAL_RISK_LINE, watchRegistrationSync } from './register-watch.mjs';
+import { buildRuntimeVerdictRecord, writeBackupState } from './runtime-verdict.mjs';
 import { describeUnlock, unlockRepo } from './unlock.mjs';
 import {
   MIN_PASSWORD_BYTES,
@@ -206,6 +208,14 @@ export function formatRegister(plan, applied) {
   if (result.recheck !== undefined) {
     lines.push(`re-check      : ${result.recheck.ok ? 'still holds' : 'STILL OVERWRITTEN'} (rewrote: ${result.recheck.rewrote ? 'yes' : 'no'})`);
   }
+  if (result.watch !== undefined && result.watch !== null) {
+    const watch = result.watch;
+    lines.push(
+      `watch         : ${watch.minutes} min · ${watch.samples} sample(s) · clobbered ${watch.clobbered} · re-applied ${watch.reapplied}` +
+        (typeof watch.stable_at === 'string' && watch.stable_at !== '' ? ` · stable since ${watch.stable_at}` : ' · NOT STABLE at the last sample'),
+    );
+  }
+  if (typeof result.residual_risk === 'string') lines.push(`residual risk : ${result.residual_risk}`);
   if (typeof result.warning === 'string') lines.push(`warning       : ${result.warning}`);
   return lines.join('\n');
 }
@@ -254,9 +264,13 @@ function usage() {
     '  --keep-both         restore: keep an existing different file and write the restored one beside it',
     '  --allow-static-validation  restore: accept static-only evidence when no Harness is installed',
     '  --allow-live-home   restore/register: write even though the DSH client is running (read-back + recheck protocol)',
+    '  --watch <minutes>   register: after writing, sample the registry for this many minutes (2/8/20/60 s, then every 60 s)',
+    '                      and re-apply the same plan if a sample shows the client overwrote it (0 = no watch)',
     '  --registry-recheck <ms>  restore --apply / register: wait this long, then re-check the registry once (client save)',
     '  --workspace-path <p> restore/register: attach an unknown workspace to this directory, or create the registry there',
     '  --runtime           verify/run: confirm with the installed Harness validator (G5), not only the pre-filter',
+    '  --runtime-verify    run: after a successful backup, run one full runtime verify and persist its verdict',
+    '                      (cached for the panel; a failed verdict is reported as a warning, the backup stays ok)',
     '  --account-id <id>   unlock/run: the host account id to compare against the repository\'s bound id',
     '                      (advanced/manual: the host normally supplies it; the account id is an identifier,',
     '                      not a secret -- see docs/BACKUP-DESIGN.md section 25. `run --account-id` also binds',
@@ -313,6 +327,8 @@ export function parseArgs(argv, env = process.env) {
     allowStaticValidation: false,
     allowLiveHome: false,
     registryRecheckMs: 0,
+    watch: 0,
+    runtimeVerify: false,
     workspacePath: null,
     runtime: false,
     check: false,
@@ -340,6 +356,7 @@ export function parseArgs(argv, env = process.env) {
     else if (arg === '--allow-static-validation') options.allowStaticValidation = true;
     else if (arg === '--allow-live-home') options.allowLiveHome = true;
     else if (arg === '--runtime') options.runtime = true;
+    else if (arg === '--runtime-verify') options.runtimeVerify = true;
     else if (arg === '--check') options.check = true;
     else if (arg === '--set-password') options.setPassword = true;
     else if (arg === '--enable-protection') options.enableProtection = true;
@@ -387,6 +404,22 @@ export function parseArgs(argv, env = process.env) {
       const value = Number(raw);
       if (!Number.isSafeInteger(value) || value < 0) return { ...options, error: `--registry-recheck needs a non-negative integer, got ${JSON.stringify(raw)}` };
       options.registryRecheckMs = value;
+    }
+    else if (arg === '--watch') {
+      const raw = rest.shift() ?? '';
+      const value = Number(raw);
+      if (raw.trim() === '' || !Number.isSafeInteger(value) || value < 0) {
+        return { ...options, error: `--watch needs a non-negative integer number of minutes, got ${JSON.stringify(raw)}` };
+      }
+      options.watch = value;
+    }
+    else if (arg.startsWith('--watch=')) {
+      const raw = arg.slice('--watch='.length);
+      const value = Number(raw);
+      if (raw.trim() === '' || !Number.isSafeInteger(value) || value < 0) {
+        return { ...options, error: `--watch needs a non-negative integer number of minutes, got ${JSON.stringify(raw)}` };
+      }
+      options.watch = value;
     }
     else if (arg.startsWith('--snapshot=')) options.snapshot = arg.slice('--snapshot='.length);
     else if (arg.startsWith('--archive=')) options.archiveFile = arg.slice('--archive='.length);
@@ -621,6 +654,15 @@ export function formatRun(result) {
         `${runtime.available ? '' : ' (unavailable: this is not runtime evidence)'}`,
     );
     for (const failing of runtime.sessions ?? []) lines.push(`  - ${failing.rel} ${failing.detail ?? ''}`.trimEnd());
+  }
+  if (result.runtime_verify !== undefined && result.runtime_verify !== null) {
+    const record = result.runtime_verify;
+    lines.push(
+      `runtime verdict: ${record.ok ? 'passed' : 'FAILED'} · checked ${record.checked}, failed ${record.failed} · ` +
+        `${record.snapshots} snapshot(s) · evidence ${record.evidence}` +
+        (result.runtime_verify_persisted === false ? ' (not persisted)' : ''),
+    );
+    for (const code of record.reason_codes ?? []) lines.push(`  - reason: ${code}`);
   }
   if (Array.isArray(result.invalid_containers) && result.invalid_containers.length > 0) {
     lines.push(`invalid logs  : ${result.invalid_containers.map((row) => row.rel).join(', ')}`);
@@ -861,6 +903,7 @@ export function main(argv, io = {}) {
       writeErr(`${resolved.error.code}: ${resolved.error.detail}`);
       return 1;
     }
+    const machineKey = options.noMachineKey === true || (io.env ?? process.env).W2M_BACKUP_NO_MACHINE_KEY === '1' ? false : undefined;
     const result = runBackup({
       root: resolved.dir,
       dshHome: options.dshHome,
@@ -876,8 +919,41 @@ export function main(argv, io = {}) {
       runtimeFutureAppend: options.runtime === true,
       accountId: options.accountId ?? undefined,
       password: passwordFor(options, io),
-      machineKey: options.noMachineKey === true || (io.env ?? process.env).W2M_BACKUP_NO_MACHINE_KEY === '1' ? false : undefined,
+      machineKey,
     });
+    if (options.runtimeVerify === true && result.ok === true && options.dryRun !== true) {
+      // One manual runtime verdict, after the backup is committed: the verdict can never change the backup's
+      // outcome (the bytes are already durable), so a failure here is a warning on a committed result.
+      const startedMs = Date.now();
+      const verifyResult = verifyRepo({
+        root: resolved.dir,
+        dshHome: options.dshHome,
+        password: passwordFor(options, io),
+        accountId: options.accountId ?? undefined,
+        machineKey,
+        futureAppend: true,
+        runtime: true,
+      });
+      const record = buildRuntimeVerdictRecord({
+        verifyResult,
+        startedAt: startedMs,
+        finishedAt: Date.now(),
+        trigger: 'manual-cli',
+        runtimeAvailable: true,
+      });
+      result.runtime_verify = record;
+      const persisted = writeBackupState(options.dshHome, { last_runtime_verify: record });
+      result.runtime_verify_persisted = persisted.ok;
+      if (persisted.ok !== true) {
+        result.warnings = [...(result.warnings ?? []), `the runtime verdict could not be persisted: ${persisted.error}`];
+      }
+      if (record.ok !== true) {
+        result.warnings = [
+          ...(result.warnings ?? []),
+          `the runtime verdict failed: ${record.reason_codes.join(', ') || 'no code'} (the backup itself is committed)`,
+        ];
+      }
+    }
     write(options.json ? JSON.stringify(result, null, 2) : formatRun(result));
     return result.ok === true ? 0 : 1;
   }
@@ -1155,6 +1231,30 @@ export function main(argv, io = {}) {
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, options.registryRecheckMs);
       applied.recheck = recheckRegistry({ dshHome: options.dshHome, plan: plan.registry });
     }
+    if (applied.ok === true && applied.changed === true && options.watch > 0) {
+      // Bounded watch: the same 2/8/20/60 s schedule the host route runs, sampled synchronously because this
+      // process exits after printing. `io.sleep` / `io.watchNow` exist so a test can run the budget without
+      // spending the wall time; production sleeps for real and the budget is measured on the real clock.
+      const sleep = typeof io.sleep === 'function'
+        ? io.sleep
+        : (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+      const clock = typeof io.watchNow === 'function' ? io.watchNow : null;
+      const now = clock === null
+        ? Date.now
+        : () => {
+            const value = clock();
+            return value instanceof Date ? value.getTime() : Number(value);
+          };
+      applied.watch = watchRegistrationSync({
+        dshHome: options.dshHome,
+        plan: plan.registry,
+        minutes: options.watch,
+        sleep,
+        now,
+        ...(typeof io.watchRecheck === 'function' ? { recheck: io.watchRecheck } : {}),
+      });
+    }
+    if (applied.ok === true && applied.changed === true) applied.residual_risk = REGISTER_RESIDUAL_RISK_LINE;
     write(options.json ? JSON.stringify(applied, null, 2) : formatRegister(plan, applied));
     return applied.ok === true ? 0 : 1;
   }

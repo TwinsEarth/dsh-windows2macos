@@ -31,13 +31,23 @@
  * It does not create sessions (there is nothing to register), it does not edit session bytes, and it does not add a
  * host route: registering a home is an operator action with a home path, i.e. the offline CLI's job. The panel path
  * is untouched because the client is by definition live there (G2's other two halves cover it).
+ *
+ * ## The in-host path: `workspaceRegistry` (added after the service was found)
+ *
+ * The installed Harness exposes `ctx.workspaceRegistry` (`@deepseek-ai/dsh-workspace`), a Cordis service that owns
+ * both the in-memory workspace domain and `storages/workspace.json`; the GUI reads the domain projection. A plugin
+ * that can reach it should use {@link registerThroughHost} instead of writing the file: `attachSession` persists
+ * first, mutates memory and emits `domain/changed`, so there is no "client save" left to clobber the edit. That is
+ * why the plugin route prefers it, and why the file path (+ its bounded watch) is kept for the offline CLI and for
+ * a profile that hides the service -- where the route says `via: 'file-write'` and repeats the residual risk
+ * instead of pretending the race does not exist.
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
 
 import { clientGate } from './client.mjs';
-import { applyRegistryRestore, CLIENT_OVERWRITE_WARNING, planRegistryRestores, workspaceRegistryPath } from './registry.mjs';
+import { applyRegistryRestore, CLIENT_OVERWRITE_WARNING, findWorkspaceForSlug, planRegistryRestores, workspaceRegistryPath } from './registry.mjs';
 import { preRestoreRoot } from './restore.mjs';
 import { listSessionDirs } from '../fix/session.mjs';
 import { readWorkspaceRegistry } from '../util/dsh-workspace.mjs';
@@ -50,6 +60,12 @@ export const REGISTER_CODES = Object.freeze({
   SESSION_MISSING: 'BACKUP_REGISTER_SESSION_MISSING',
   /** The registry copy that is the way back could not be written; nothing was changed. */
   BACKUP_FAILED: 'BACKUP_REGISTER_BACKUP_FAILED',
+  /** The in-host path was asked for but this profile exposes no `workspaceRegistry` service. */
+  HOST_UNAVAILABLE: 'BACKUP_REGISTER_HOST_UNAVAILABLE',
+  /** The workspace a session belongs to could not be resolved to a path the host service can open. */
+  HOST_WORKSPACE_UNKNOWN: 'BACKUP_REGISTER_HOST_WORKSPACE_UNKNOWN',
+  /** The host workspace service refused `attachSession` for a session (its own validation, verbatim). */
+  HOST_ATTACH_FAILED: 'BACKUP_REGISTER_HOST_ATTACH_FAILED',
 });
 
 /** How many `register-<ts>` registry copies are kept by default (0 = keep all). */
@@ -375,5 +391,166 @@ export function applyRegister(input = {}) {
     changed: true,
     pruned_register_backups: pruned,
     warning: CLIENT_OVERWRITE_WARNING,
+  };
+}
+
+/** Does this object look like the host's `WorkspaceRegistry` service? */
+function usableWorkspaceRegistry(candidate) {
+  if (candidate === null || candidate === undefined || typeof candidate !== 'object') return false;
+  return typeof candidate.resolveByPath === 'function' || typeof candidate.create === 'function';
+}
+
+/**
+ * Register on-disk sessions **through the host's `workspaceRegistry` service** instead of writing the file.
+ *
+ * This is the in-host path: the service persists the domain before mutating memory and emits `domain/changed`, so
+ * the GUI projection and `storages/workspace.json` move together. There is no file-level race to watch, which is
+ * exactly why the plugin route prefers it; a session the service refuses (its `attachSession` validates that the
+ * session is known to `sessionPersistence` and that the header cwd resolves to the workspace's path) is reported
+ * with the service's own refusal rather than silently falling back to a file write.
+ *
+ * `already_registered` is computed from the registry view for the same reporting semantics as the file path; a
+ * registered session is never attached twice.
+ *
+ * @param {{
+ *   dshHome: string, sessionIds: string[], workspaceRegistry?: object|null, workspacePath?: string|null,
+ *   now?: Date,
+ * }} input
+ * @returns {Promise<object>} the apply-shaped result plus `via:'host-service'`, `failed: []`, `residual_risk: null`
+ */
+export async function registerThroughHost(input = {}) {
+  const dshHome = typeof input.dshHome === 'string' && input.dshHome.trim() !== '' ? path.resolve(input.dshHome) : null;
+  const requested = [...new Set((Array.isArray(input.sessionIds) ? input.sessionIds : []).map((value) => String(value ?? '')).filter((value) => value !== ''))];
+  const now = input.now instanceof Date ? input.now : new Date();
+  const workspacePath = typeof input.workspacePath === 'string' && input.workspacePath.trim() !== '' ? path.resolve(input.workspacePath.trim()) : null;
+  const service = input.workspaceRegistry ?? null;
+  const base = {    ok: false,
+    reason_code: null,
+    detail: null,
+    via: 'host-service',
+    dsh_home: dshHome,
+    workspace_path: workspacePath,
+    requested,
+    sessions: [],
+    registered: [],
+    already_registered: [],
+    unknown: [],
+    failed: [],
+    actions: [],
+    changed: false,
+    verified: false,
+    backup_file: null,
+    registry: null,
+    host_service: true,
+    residual_risk: null,
+    at: now.toISOString(),
+  };
+  /** A named refusal in the apply-shaped base; `extra` wins over the base's placeholder reason fields. */
+  const hostRefusal = (reasonCode, detail, extra = {}) => ({
+    ...base,
+    ...extra,
+    ok: false,
+    reason_code: reasonCode,
+    detail,
+  });
+  if (dshHome === null) return hostRefusal(REGISTER_CODES.NO_SESSION, 'registerThroughHost needs a dshHome');
+  if (requested.length === 0) return hostRefusal(REGISTER_CODES.NO_SESSION, 'register needs at least one session id');
+  if (usableWorkspaceRegistry(service) !== true) {
+    return hostRefusal(
+      REGISTER_CODES.HOST_UNAVAILABLE,
+      'this host exposes no workspaceRegistry service, so a session cannot be registered in-process; run the offline CLI (w2m-backup register) against a stopped home instead',
+    );
+  }
+
+  const onDisk = indexSessionsOnDisk(dshHome);
+  const unknown = requested.filter((sessionId) => !onDisk.has(sessionId));
+  if (unknown.length > 0) {
+    return hostRefusal(
+      REGISTER_CODES.SESSION_MISSING,
+      `no session directory under ${path.join(dshHome, 'sessions')} for: ${unknown.join(', ')}; register only makes an on-disk session visible, it does not create one`,
+      { unknown },
+    );
+  }
+
+  const view = readWorkspaceRegistry(dshHome);
+  const sessions = requested.map((sessionId) => {
+    const row = onDisk.get(sessionId);
+    return { session_id: sessionId, workspace: row.workspace, dir: row.dir };
+  });
+  const alreadyRegistered = sessions
+    .filter((session) => view.ok === true && view.registered.has(session.session_id))
+    .map((session) => session.session_id);
+  const fresh = sessions.filter((session) => !alreadyRegistered.includes(session.session_id));
+
+  const registered = [];
+  const failed = [];
+  const actions = [];
+  for (const session of fresh) {
+    // The service needs the workspace's canonical path. Prefer a caller-named path (the disaster-recovery case),
+    // otherwise the registry view's own record for this slug; the slug is what the backup recorded.
+    const matched = findWorkspaceForSlug(view, session.workspace);
+    const targetPath = workspacePath ?? (typeof matched?.path === 'string' && matched.path !== '' ? matched.path : null);
+    if (targetPath === null) {
+      failed.push({
+        session_id: session.session_id,
+        reason_code: REGISTER_CODES.HOST_WORKSPACE_UNKNOWN,
+        detail: `no workspace path is known for slug ${session.workspace}; pass an explicit workspace path`,
+      });
+      continue;
+    }
+    try {
+      let workspace = typeof service.resolveByPath === 'function' ? await service.resolveByPath(path.resolve(targetPath)) : null;
+      if (workspace === null || workspace === undefined) {
+        if (typeof service.create !== 'function') {
+          failed.push({ session_id: session.session_id, reason_code: REGISTER_CODES.HOST_WORKSPACE_UNKNOWN, detail: `the host service has no workspace at ${targetPath} and cannot create one` });
+          continue;
+        }
+        workspace = await service.create(path.resolve(targetPath));
+      }
+      if (workspace === null || workspace === undefined || typeof workspace.attachSession !== 'function') {
+        failed.push({ session_id: session.session_id, reason_code: REGISTER_CODES.HOST_WORKSPACE_UNKNOWN, detail: `the host service returned no attachable workspace for ${targetPath}` });
+        continue;
+      }
+      await workspace.attachSession(session.session_id);
+      registered.push(session.session_id);
+      actions.push(`attached ${session.session_id} to the host workspace ${workspacePath ?? targetPath}`);
+    } catch (error) {
+      failed.push({
+        session_id: session.session_id,
+        reason_code: REGISTER_CODES.HOST_ATTACH_FAILED,
+        detail: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  const changed = registered.length > 0;
+  if (failed.length > 0) {
+    return {
+      ...base,
+      reason_code: failed[0].reason_code,
+      detail: `the host workspace service refused ${failed.length} of ${fresh.length} session(s): ${failed.map((row) => row.session_id).join(', ')}`,
+      sessions,
+      registered,
+      already_registered: alreadyRegistered,
+      failed,
+      actions,
+      changed,
+      // A partial attach changed something but not the promise: "verified" only when every fresh session landed.
+      verified: false,
+    };
+  }
+  return {
+    ...base,
+    ok: true,
+    detail: changed ? null : 'already registered; the host service was not called',
+    sessions,
+    registered,
+    already_registered: alreadyRegistered,
+    failed: [],
+    actions,
+    changed,
+    // The service persists before it mutates memory (dsh-storage-domain), so a resolved attachSession call is
+    // durable by construction -- there is no read-back of a file we wrote.
+    verified: true,
   };
 }

@@ -379,6 +379,27 @@ v3.5.0 交付项 2「版本漂移看板」的 UI 半已补齐，数据半见上 
 ④ **G5** 面板校验卡增加默认关闭的「用安装的 Harness 终审（慢）」勾选框，勾上才走
 `GET /api/w2m/backup/verify?runtime=1`。详见 `docs/BACKUP-DESIGN.md` §22（诚实边界见 §22.5）。
 
+### 三条边界的真机加固补记（2026-11-17，未发布）
+
+* **A · register vs 运行中的客户端**：调查确认安装的 Harness 暴露宿主服务 `ctx.workspaceRegistry`
+  （`@deepseek-ai/dsh-workspace`，拥有内存域 + `storages/workspace.json`，先持久化再发 `domain/changed`；GUI 是
+  投影）。因此新增 `registerThroughHost()`（`resolveByPath`/`create` + `attachSession`，不写文件 → 无文件级
+  race），面板路由 `POST /api/w2m/backup/register {confirm:'register', session_ids}` 优先走它；宿主无该服务时退回
+  文件路径并保留 `--watch <minutes>` 有界采样（2/8/20/60 s 后每 60 s，重放同一 plan，报告
+  `watch:{minutes,samples,clobbered,reapplied,stable_at}`）与一行残余风险。CLI 仍走文件路径（离线）。测试：
+  `backup-g2` +15、`backup-run` +2、`client-bundle` +3。**未消除的边界**：文件路径窗口后的客户端保存；宿主服务
+  对 cwd 已消失的灾难恢复会话不接（由 CLI + watch 兜住）。
+* **B · 运行时终审不阻塞面板**：`?runtime=1` 的结论持久化为 `<DSH_HOME>/xclient/w2m-backup/state.json` 里的
+  `last_runtime_verify`（字段固定、证据 `installed-harness`），`?runtime=cached` 只读并标 24 h stale，
+  `GET /run` 内嵌状态带缓存；配置 `backupRuntimeVerify:'off'|'nightly'`（默认 off）在**成功**的定时备份后跑一次
+  （fire-and-forget，失败只 warning，记录照存），CLI `run --runtime-verify` 手动一次。面板校验卡显示缓存记录 +
+  「立即运行（慢）」按钮。测试：`backup-verify` +5、`backup-run` +3、`client-bundle` +3。
+* **C · renumber 追加失败分支**：调查结论是**规范产出上不可达**（规范重编码 + 附录 `permission/preset` ⇒ doctor
+  过则追加模拟必过；§20.5 给出逐条论证）。保留测试缝，重写代码注释/§20.5/§22.2 的措辞，并新增机器校验：生产源码
+  只有 `renumber.mjs` 提到 `futureAppendCheck`（无调用者传它）；规范 plan 的追加模拟必过；安装 Harness 存在时
+  `future_append_evidence==='installed-harness'` 且结果为 dense。测试：`fix-renumber` +3。
+* 本次不 bump 版本、不跑 preflight、不提交；无新增测试文件，`package.json#scripts.test` 不变。
+
 ## 8. 每个版本的 Definition of Done（统一清单）
 
 1. 版本号 6 处同步（`package.json`、`plugin.json`、`.claude-plugin/*`、`codex/mcp-servers.toml`、`README.md`）；
