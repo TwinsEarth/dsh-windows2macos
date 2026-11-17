@@ -13,13 +13,28 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 
 import { rfc3339 } from './state.mjs';
 
 export const DEVICES_FILE = 'devices.json';
 export const LEDGER_FILE = 'ledger.jsonl';
 export const OPERATOR_TOKEN_FILE = 'operator-token.txt';
+/**
+ * Phase 2 (project room / fleet chat cross-relay sync) state layout.
+ *
+ * `<state>/chat/`                     durable chat replication log + generation/applied state
+ * `<state>/projects/objects.json`     shared project objects (artifacts/decisions/memory/refs/locks/
+ *                                     reviews/notifications/read marks) so a restart keeps them
+ * `<state>/instance-id.json`          stable per-state-directory id used as the origin of records
+ *                                     created before cluster sync existed (and by single-node relays)
+ */
+export const INSTANCE_ID_FILE = 'instance-id.json';
+export const CHAT_DIR = 'chat';
+export const PROJECTS_DIR = 'projects';
+export const PROJECT_OBJECTS_FILE = 'objects.json';
+export const CLUSTER_DOMAINS_FILE = 'domains.json';
+
 /**
  * v3.0.0 relay cluster sync state (docs/RELAY-CLUSTER-SYNC-DESIGN-v3.0.0.md).
  *
@@ -118,6 +133,11 @@ export class Persistence {
   get clusterCursorsFile() { return this.enabled ? path.join(this.dir, CLUSTER_DIR, CLUSTER_CURSORS_FILE) : null; }
   get clusterLedgerFile() { return this.enabled ? path.join(this.dir, CLUSTER_DIR, CLUSTER_LEDGER_FILE) : null; }
   get clusterLastSyncFile() { return this.enabled ? path.join(this.dir, CLUSTER_DIR, CLUSTER_LAST_SYNC_FILE) : null; }
+  get instanceIdFile() { return this.enabled ? path.join(this.dir, INSTANCE_ID_FILE) : null; }
+  get chatDir() { return this.enabled ? path.join(this.dir, CHAT_DIR) : null; }
+  get projectsDir() { return this.enabled ? path.join(this.dir, PROJECTS_DIR) : null; }
+  get projectObjectsFile() { return this.enabled ? path.join(this.dir, PROJECTS_DIR, PROJECT_OBJECTS_FILE) : null; }
+  get clusterDomainsFile() { return this.enabled ? path.join(this.dir, CLUSTER_DIR, CLUSTER_DOMAINS_FILE) : null; }
 
   warn(file, message, extra = {}) {
     // Deduplicated (v0.6.2). A full disk fails *every* append, and appending an identical entry each
@@ -694,6 +714,68 @@ export class Persistence {
       if (!fs.existsSync(this.clusterLastSyncFile)) return null;
       return JSON.parse(fs.readFileSync(this.clusterLastSyncFile, 'utf8'));
     } catch { return null; }
+  }
+
+  /* ---------------- Phase 2: chat / project sync state ---------------- */
+
+  /**
+   * A stable per-state-directory id.
+   *
+   * Used as the origin of project events that predate cluster sync (they carry no origin), and by
+   * single-node relays that have no cluster node id. It is random, not secret, and must never change:
+   * changing it would make the same historical event look like a different one to peers.
+   */
+  loadInstanceId() {
+    if (!this.enabled) return null;
+    if (this._instanceId !== undefined) return this._instanceId;
+    try {
+      if (fs.existsSync(this.instanceIdFile)) {
+        const parsed = JSON.parse(fs.readFileSync(this.instanceIdFile, 'utf8'));
+        if (typeof parsed?.id === 'string' && parsed.id !== '') {
+          this._instanceId = parsed.id;
+          return this._instanceId;
+        }
+      }
+    } catch (err) {
+      this.warn(INSTANCE_ID_FILE, `unreadable (${err.message}); generating a new instance id`);
+    }
+    const id = 'inst-' + randomBytes(8).toString('hex');
+    this._instanceId = id;
+    this._writeJsonAtomic(this.instanceIdFile, { v: 1, id });
+    return id;
+  }
+
+  saveProjectObjects(value) {
+    if (!this.enabled) return false;
+    return this._writeJsonAtomic(this.projectObjectsFile, { v: 1, ...value });
+  }
+
+  loadProjectObjects() {
+    if (!this.enabled) return null;
+    try {
+      if (!fs.existsSync(this.projectObjectsFile)) return null;
+      const parsed = JSON.parse(fs.readFileSync(this.projectObjectsFile, 'utf8'));
+      return parsed !== null && typeof parsed === 'object' ? parsed : null;
+    } catch (err) {
+      this.warn('projects/objects.json', `unreadable (${err.message}); project objects start empty`);
+      return null;
+    }
+  }
+
+  saveClusterDomains(state) {
+    return this._writeJsonAtomic(this.clusterDomainsFile, { v: 1, ...state });
+  }
+
+  loadClusterDomains() {
+    if (!this.enabled) return null;
+    try {
+      if (!fs.existsSync(this.clusterDomainsFile)) return null;
+      const parsed = JSON.parse(fs.readFileSync(this.clusterDomainsFile, 'utf8'));
+      return parsed !== null && typeof parsed === 'object' ? parsed : null;
+    } catch (err) {
+      this.warn(CLUSTER_DOMAINS_FILE, `unreadable (${err.message}); domain cursors start empty`);
+      return null;
+    }
   }
 
   /**

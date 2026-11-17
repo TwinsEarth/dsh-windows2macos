@@ -30,6 +30,8 @@
 - 不做 operator token / relay signing secret 的同步（每台 relay 的权威凭据保持独立）；
 - 不做 fleet chat / fleet memory / admission / remote-frame 等**当前仅内存态**数据的持久化与同步
   （它们本身不在 `--state` 中，重启即丢；若要做，另立 Phase 2/3）；
+  - **更新（2026-11-17）**：fleet chat 的持久化与跨 relay 复制已在 Relay Phase 2 落地，见独立 ADR
+    `docs/RELAY-CLUSTER-SYNC-PHASE2-DESIGN.md`；fleet memory / admission / remote-frame 仍未做。
 - 不保证“同步后立即一致”：最长延迟 = 同步周期（默认 1h）+ 传输/重试时间。
 
 ---
@@ -61,6 +63,11 @@
 
 - 项目房间（projects snapshot）：需要把 project events 增加 `origin_node_id` 并做事件级合并；
 - 若希望 chat/memory 跨 relay 可见：先给它们加持久化，再纳入同步（单独 ADR）。
+
+> **Phase 2 后续状态（2026-11-17）**：上述两项已在 Relay Phase 2 落地，独立 ADR 见
+> `docs/RELAY-CLUSTER-SYNC-PHASE2-DESIGN.md`，滚动升级手册见 `docs/RUNBOOK-RELAY-ROLLING-UPGRADE.md`。
+> 实现与原设想的差异以 ADR 为准：项目域同步的是**整项目快照**（事件仍以内容 hash 去重合并），没有给
+> project events 增加 `origin_node_id` 字段；chat 与 fleet memory 的边界也不同——chat 已做，memory 仍未做。
 
 ---
 

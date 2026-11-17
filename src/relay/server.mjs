@@ -1,5 +1,7 @@
 import { guardBlobRoute, guardResultEnvelope, guardTaskBody } from './redline-guard.mjs';
-import { CLUSTER_FEATURE, CLUSTER_ROUTES, createClusterSync } from './cluster-sync.mjs';
+import { CLUSTER_ROUTES, createClusterSync } from './cluster-sync.mjs';
+import { createChatStore } from './chat-store.mjs';
+import { exportProjectState, mergeProjectState } from './project-sync.mjs';
 /**
  * W2M Rabbit relay — node:http / node:https server.
  *
@@ -403,6 +405,58 @@ export class RelayServer {
     this.relayId = this.state.relayId;
     this._startedAtMs = this.state.nowMs();
 
+    /* ---- Phase 2: durable chat + shared project objects ---- */
+    /**
+     * Chat used to be memory-only (`this.fleetMessages` was created lazily by two routes). Phase 2
+     * gives it a durable replication log first, then replicates that log between relays: a message
+     * that is only in memory cannot be synced usefully, because a restart would drop it on both the
+     * origin and the receiver.
+     */
+    this.chatStore = null;
+    this._chatDeletedSessions = new Set();
+    this._applyingChatDeletion = false;
+    this.applyChatRecord = (record) => this._applyChatRecord(record);
+    this.projectSource = {
+      exportPage: (offset, limit) => this._exportProjectPage(offset, limit),
+      applyProject: (remote) => this._applyRemoteProject(remote),
+    };
+    if (this.persistence.enabled) {
+      try {
+        this.chatStore = createChatStore({
+          dir: this.persistence.dir,
+          now: () => this.state.nowMs(),
+          ...(Number.isFinite(options.cluster?.chatRetentionDays) ? { retentionDays: options.cluster.chatRetentionDays } : {}),
+          ...(Number.isFinite(options.cluster?.chatHardCapBytes) ? { hardCapBytes: options.cluster.chatHardCapBytes } : {}),
+        });
+        const loaded = this.chatStore.load();
+        for (const sessionId of loaded.deletedSessions ?? []) {
+          if (typeof sessionId === 'string') this._chatDeletedSessions.add(sessionId);
+        }
+        this.state.restoreReadMarks(loaded.readMarks ?? []);
+        try { this.chatStore.prune(); } catch { /* retention is best effort; load already filtered */ }
+        this.fleetMessages = createFleetMessages({
+          now: () => this.state.nowMs(),
+          initialMessages: loaded.messages ?? [],
+          onAppend: (message) => {
+            try {
+              this.chatStore?.appendMessage({ origin: this._recordOriginId(), message });
+            } catch (err) {
+              this.logger?.(`[w2m-rabbit] chat persistence append failed: ${err instanceof Error ? err.message : String(err)}`);
+            }
+          },
+          onDelete: (sessionId) => {
+            if (this._applyingChatDeletion) return;
+            try {
+              this.chatStore?.appendSessionDeleted({ origin: this._recordOriginId(), session_id: sessionId });
+            } catch { /* a deletion that cannot be recorded stays local */ }
+          },
+        });
+      } catch (err) {
+        this.startupMessages.push(`[w2m-rabbit] !! chat persistence failed to load: ${err instanceof Error ? err.message : String(err)}; chat starts empty`);
+      }
+    }
+    this.fleetMessages ??= createFleetMessages({ now: () => this.state.nowMs() });
+
     /* ---- startup recovery (§7) ---- */
     if (this.persistence.enabled) {
       const snapshot = this.persistence.loadDevices();
@@ -445,6 +499,10 @@ export class RelayServer {
           logger: this.logger,
           fetchImpl: options.fetchImpl,
           now: () => this.state.nowMs(),
+          chatStore: this.chatStore,
+          applyChatRecord: this.applyChatRecord,
+          chatMaintenance: () => this._maintainChat(),
+          projectSource: this.projectSource,
         });
         this.cluster.ensureNodeId();
       }
@@ -555,10 +613,118 @@ export class RelayServer {
       logger: this.logger,
       fetchImpl: this.options.fetchImpl,
       now: () => this.state.nowMs(),
+      chatStore: this.chatStore,
+      applyChatRecord: this.applyChatRecord,
+      chatMaintenance: () => this._maintainChat(),
+      projectSource: this.projectSource,
     });
     this.cluster.ensureNodeId();
     if (this.server?.listening === true) this.cluster.start();
     return this.cluster;
+  }
+
+  /* ---------------- Phase 2: chat + project domain glue ---------------- */
+
+  /** Stable origin for records this relay creates (cluster node id, else the per-state instance id). */
+  _recordOriginId() {
+    if (this.cluster?.nodeId) return this.cluster.nodeId;
+    try { return this.persistence?.loadInstanceId?.() ?? 'inst-local'; } catch { return 'inst-local'; }
+  }
+
+  /** One page of whole project-room states for a peer. */
+  _exportProjectPage(offset, limit) {
+    const all = exportProjectState(this.state);
+    const start = Number.isInteger(offset) && offset >= 0 ? Math.min(offset, all.length) : 0;
+    const max = Number.isInteger(limit) && limit > 0 ? limit : 3;
+    const projects = all.slice(start, start + max);
+    return { projects, next_offset: start + projects.length, has_more: start + projects.length < all.length };
+  }
+
+  /** Merge one peer project state, then broadcast/persist the events it imported. */
+  _applyRemoteProject(remote) {
+    if (remote === null || typeof remote !== 'object') return { changed: false, conflicts: 0 };
+    const before = this.state.projects?.allEvents?.()?.length ?? 0;
+    const merged = mergeProjectState(this.state, remote, { nowMs: this.state.nowMs(), nodeId: this._recordOriginId() });
+    if (merged?.changed === true) {
+      const events = this.state.projects?.allEvents?.() ?? [];
+      for (const event of events.slice(before)) this.state.broadcastProjectEvent(event);
+      this.state.persistProjectState();
+    }
+    return merged ?? { changed: false, conflicts: 0 };
+  }
+
+  /** Apply one imported chat replication record to the live relay. */
+  _applyChatRecord(record) {
+    if (record === null || typeof record !== 'object' || record.data === null || typeof record.data !== 'object') return;
+    const data = record.data;
+    if (record.kind === 'chat.message') {
+      // A tombstone is final: a peer may still be shipping a message it accepted before it saw the deletion, and
+      // inserting it would make the deleted conversation reappear on this relay.
+      if (this._chatDeletedSessions.has(data.session_id)) return;
+      try { this.fleetMessages?.insertImported(data); } catch (err) { this._log(`[w2m-rabbit] imported chat message rejected: ${err instanceof Error ? err.message : String(err)}`); }
+      return;
+    }
+    if (record.kind === 'chat.read') {
+      if (typeof data.session_id === 'string' && typeof data.machine_id === 'string' && Number.isFinite(data.at_ms)) {
+        try {
+          this.state.markRead(data.session_id, data.machine_id, {
+            at_ms: data.at_ms,
+            message_id: typeof data.message_id === 'string' ? data.message_id : null,
+          });
+        } catch { /* a read watermark is not worth failing the round */ }
+      }
+      return;
+    }
+    if (record.kind === 'chat.session.deleted' && typeof data.session_id === 'string') {
+      const sessionId = data.session_id;
+      this._chatDeletedSessions.add(sessionId);
+      this._applyingChatDeletion = true;
+      try { this.fleetMessages?.deleteSession(sessionId); } finally { this._applyingChatDeletion = false; }
+    }
+  }
+
+  /** Retention/compaction for chat: 7 days + byte cap, in memory and on disk. */
+  _maintainChat() {
+    if (this.chatStore === null || this.fleetMessages === null) return;
+    const retentionDays = Number.isFinite(this.cluster?.config?.chatRetentionDays) ? this.cluster.config.chatRetentionDays : 7;
+    const hardCapBytes = Number.isFinite(this.cluster?.config?.chatHardCapBytes) ? this.cluster.config.chatHardCapBytes : undefined;
+    const cutoffMs = this.state.nowMs() - retentionDays * 24 * 60 * 60 * 1000;
+    try { this.fleetMessages.pruneBefore(cutoffMs, { maxBytes: hardCapBytes }); } catch { /* memory prune is best effort */ }
+    try { this.chatStore.prune(); } catch (err) { this._log(`[w2m-rabbit] chat prune failed: ${err instanceof Error ? err.message : String(err)}`); }
+  }
+
+  /**
+   * Delete one chat session's history locally and, through the replication log, on every peer.
+   *
+   * Deleting a conversation used to be a store-only operation with no caller: the tombstone set was written but never
+   * read, so a restart or a new node re-seeded the "deleted" history from disk. The Phase 2 closure is that `load()`
+   * filters tombstoned sessions and imported messages for them are refused; this method is the single write path that
+   * any future delete route will call, and the restart tests drive it directly. There is deliberately **no**
+   * device-facing HTTP delete route in this merge -- adding one is a protocol change that needs its own review (see
+   * `docs/RELAY-CLUSTER-SYNC-PHASE2-DESIGN.md` §5.4).
+   *
+   * @returns {{ok: boolean, deleted: boolean, tombstoned: boolean} | {ok: false, code: string}}
+   */
+  deleteChatSession(sessionId) {
+    if (typeof sessionId !== 'string' || sessionId.trim() === '') return { ok: false, code: 'BAD_SESSION' };
+    const alreadyDeleted = this._chatDeletedSessions.has(sessionId);
+    this._chatDeletedSessions.add(sessionId);
+    // The `onDelete` hook writes the tombstone; suppress it here so this method appends exactly one record whether or
+    // not the session still had rows in memory.
+    this._applyingChatDeletion = true;
+    try { this.fleetMessages?.deleteSession(sessionId); } finally { this._applyingChatDeletion = false; }
+    const persistable = this.chatStore !== null;
+    if (!alreadyDeleted && persistable) {
+      try {
+        this.chatStore.appendSessionDeleted({ origin: this._recordOriginId(), session_id: sessionId });
+      } catch (err) {
+        this._log(`[w2m-rabbit] chat tombstone persistence failed: ${err instanceof Error ? err.message : String(err)}`);
+        return { ok: false, code: 'CHAT_DELETE_NOT_PERSISTED', deleted: true, tombstoned: false };
+      }
+    }
+    // Without persistence (`--no-persist`) a deletion is memory-only: no log exists to replicate it from, and the
+    // result says so rather than claiming a durable tombstone.
+    return { ok: true, deleted: true, tombstoned: persistable };
   }
 
   _log(message) {
@@ -1348,11 +1514,24 @@ export class RelayServer {
       const sessionId = decodeURIComponent(readMatch[1]);
       if (method === 'PUT') {
         const body = takeJson();
-        const marked = this.state.markRead(sessionId, device.machine_id, {
+        const markInput = {
           at_ms: Number.isFinite(body.at_ms) ? body.at_ms : this.state.nowMs(),
           message_id: typeof body.message_id === 'string' ? body.message_id : null,
-        });
+        };
+        const marked = this.state.markRead(sessionId, device.machine_id, markInput);
         if (marked.ok !== true) return sendJson(res, 400, { protocol_version: PROTOCOL_VERSION, ok: false, error: { code: marked.code } });
+        // Phase 2: read watermarks are durable and replicated, so unread counts agree on standbys.
+        try {
+          this.chatStore?.appendRead({
+            origin: this._recordOriginId(),
+            session_id: sessionId,
+            machine_id: device.machine_id,
+            at_ms: markInput.at_ms,
+            message_id: markInput.message_id,
+          });
+        } catch (err) {
+          this._log(`[w2m-rabbit] chat read-mark persistence failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
         return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ok: true, ...marked });
       }
       if (method === 'GET') {
@@ -1643,6 +1822,12 @@ export class RelayServer {
         });
       }
       const body = takeJson();
+      // A deleted session id is retired: `load()` filters its history forever, so accepting a new message would report
+      // success for a message that is invisible after the next restart. (Reachable only through the relay-level delete
+      // path / cluster tombstone; there is no device-facing delete route in this merge.)
+      if (this._chatDeletedSessions.has(body.session_id)) {
+        throw new ProtocolError('BAD_REQUEST', 'this chat session was deleted; its session id is retired', { code: 'SESSION_DELETED' });
+      }
       const posted = this.fleetMessages.post({
         session_id: body.session_id,
         fleet_id: device.fleet_id ?? null,
@@ -1789,7 +1974,7 @@ export class RelayServer {
       relay_id: this.relayId,
       version: RELAY_VERSION,
       relay_version: RELAY_VERSION,
-      features: this.cluster === null ? RELAY_FEATURES : [...RELAY_FEATURES, CLUSTER_FEATURE],
+      features: this.cluster === null ? RELAY_FEATURES : [...RELAY_FEATURES, ...this.cluster.featureBits()],
       // v3.0.0: peer-pull diagnostics only (node id, cursors, counts). Never the cluster secret, never
       // the synchronized payloads: this endpoint is public.
       cluster: this.cluster === null ? null : this.cluster.status(),
@@ -2225,4 +2410,5 @@ export {
   rfc3339,
 };
 export default createRelayServer;
+
 

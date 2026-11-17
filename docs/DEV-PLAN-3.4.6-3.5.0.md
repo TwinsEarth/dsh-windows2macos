@@ -366,6 +366,24 @@ v3.5.0 交付项 2「版本漂移看板」的 UI 半已补齐，数据半见上 
   三节点集成 2/2、备份保留策略审计、全量套件 + preflight GREEN、三方发布字节一致）。本次不 bump 版本、
   不跑 preflight、不提交。
 
+### v3.5.0 实施记录补记（2026-11-17：Relay Phase 2 合并收口）
+
+Phase 2 已按 `docs/REVIEW-RELAY-PHASE2-20261117.md` 的批准条件合入 `work/v3.4.6`（分支侧：`eee9c16` 把主线合入
+Phase 2 分支 → `aee1a9b` 独立编码修复 → ADR/手册/门禁收口）：
+
+- **ADR**：`docs/RELAY-CLUSTER-SYNC-PHASE2-DESIGN.md` —— chat/project 数据模型、协议与混合版本兼容、删除语义、
+  安全边界、回滚与迁移、验证命令、残余风险。
+- **滚动升级手册**：`docs/RUNBOOK-RELAY-ROLLING-UPGRADE.md` —— 升级顺序、混合版本矩阵、每步健康门禁、回滚、
+  禁止事项与 24h 观察项。
+- **门禁**：`chat-store` / `project-sync` / `cluster-domains` / `relay-phase2-server` 进入
+  `package.json#scripts.test` 与 `test:all` 且各有独立脚本；新增 `test/relay-phase2-server.test.mjs` 覆盖
+  server 接线（feature/路由、chat 持久化与重启、真实 HTTP 跨 relay 拉取、混合版本跳过、tombstone、签名文案）。
+- **删除语义**：数据层闭环（tombstone 过滤、prune 清死行、导入旧消息拒收、`deleteChatSession` 唯一写路径、
+  退役 session 的 POST 返回 `SESSION_DELETED`）；设备面 HTTP 删除路由明确推迟（ADR §5.4）。
+- **仍待**：`scripts/verify-relay-cluster-phase2.mjs`（三节点 2/2）与 `scripts/verify-relay-cluster-mixed.mjs`
+  （需 Relay 3.0.0 归档）的发布前运行留证；relay 版本标签口径统一。本次不 bump 版本，版本号与三方发布由发布
+  审批统一处理。
+
 ---
 
 ### 复盘门禁 G2/G3/G4/G5 收口补记（2026-11-17，未发布）

@@ -6,6 +6,11 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import { createChatStore } from '../src/relay/chat-store.mjs';
 import { createFleetMessages } from '../src/relay/fleet-messages.mjs';
 
 function harness(options = {}) {
@@ -235,5 +240,201 @@ describe('message id epoch (v1.2.8)', () => {
   it('honours an explicit epoch, so a test can name the process', () => {
     const store = createFleetMessages({ now: () => 5_000, epoch: 'abc123' });
     assert.equal(store.post({ session_id: 's1', machine_id: 'a', text: 'x' }).message.message_id, 'msg-abc123-000001');
+  });
+});
+
+/* ------------------------------------------------------------------------------------------- */
+/* Phase 2A: restart recovery, persistence hooks, imported messages and retention pruning      */
+/* (chat-store.mjs and cluster sync build on exactly these surfaces)                           */
+/* ------------------------------------------------------------------------------------------- */
+
+function tempStateDir() {
+  return mkdtempSync(join(tmpdir(), 'w2m-chat-wire-'));
+}
+
+/** A row shaped like one `createFleetMessages` would have produced, for restore/import tests. */
+function storedRow(id, overrides = {}) {
+  const text = typeof overrides.text === 'string' ? overrides.text : `restored ${id}`;
+  return {
+    message_id: id,
+    session_id: 's-1',
+    fleet_id: null,
+    machine_id: 'm-1',
+    to: 'all',
+    thread_id: null,
+    reply_to: null,
+    turn: 1,
+    text,
+    at_ms: 1_700_000_000_000,
+    bytes: Buffer.byteLength(text, 'utf8'),
+    ...overrides,
+  };
+}
+
+describe('Phase 2A restart recovery (initialMessages)', () => {
+  it('seeds restored rows into their sessions without reordering them', () => {
+    const seeded = [
+      storedRow('msg-a', { at_ms: 1_000 }),
+      storedRow('msg-b', { at_ms: 2_000 }),
+      storedRow('msg-c', { session_id: 's-2', at_ms: 1_500 }),
+    ];
+    const chat = createFleetMessages({ now: () => 3_000, initialMessages: seeded });
+    assert.deepEqual(chat.list({ session_id: 's-1' }).messages.map((m) => m.message_id), ['msg-a', 'msg-b']);
+    assert.deepEqual(chat.list({ session_id: 's-2' }).messages.map((m) => m.message_id), ['msg-c']);
+    assert.deepEqual(chat.getSessionIds().sort(), ['s-1', 's-2']);
+    assert.equal(chat.usage().messages, 3, 'restored rows count against the quota again');
+    assert.deepEqual(chat.findMessage('msg-b'), storedRow('msg-b', { at_ms: 2_000 }));
+    assert.equal(chat.findMessage('nope'), null);
+  });
+
+  it('drops duplicate/invalid seeds and keeps message ids unique', () => {
+    const chat = createFleetMessages({
+      now: () => 3_000,
+      initialMessages: [storedRow('msg-a'), storedRow('msg-a'), { message_id: 'bad' }, null, storedRow('msg-b')],
+    });
+    assert.equal(chat.usage().messages, 2);
+    assert.deepEqual(chat.getSessionIds(), ['s-1']);
+  });
+
+  it('continues the explicit-epoch sequence past a restored id', () => {
+    const chat = createFleetMessages({
+      now: () => 3_000,
+      epoch: 'abc123',
+      initialMessages: [storedRow('msg-abc123-000007')],
+    });
+    assert.equal(chat.post({ session_id: 's-1', machine_id: 'm-1', text: 'after restart' }).message.message_id, 'msg-abc123-000008');
+  });
+});
+
+describe('Phase 2A persistence hooks', () => {
+  it('calls onAppend once per accepted message and never for a replay or a refusal', () => {
+    const persisted = [];
+    const chat = createFleetMessages({ now: () => 1_000, onAppend: (message) => persisted.push(message.message_id) });
+    const first = chat.post({ session_id: 's-1', machine_id: 'm-1', text: 'once', idempotency_key: 'k1' });
+    chat.post({ session_id: 's-1', machine_id: 'm-1', text: 'once', idempotency_key: 'k1' });
+    chat.post({ session_id: 's-1', machine_id: 'm-1', text: '   ' });
+    assert.deepEqual(persisted, [first.message.message_id]);
+  });
+
+  it('a throwing persistence hook cannot change the post result, and deleteSession still reports success', () => {
+    const chat = createFleetMessages({
+      now: () => 1_000,
+      onAppend: () => { throw new Error('disk full'); },
+      onDelete: () => { throw new Error('disk full'); },
+    });
+    const posted = chat.post({ session_id: 's-1', machine_id: 'm-1', text: 'still accepted' });
+    assert.equal(posted.ok, true);
+    assert.equal(chat.list({ session_id: 's-1' }).count, 1);
+    assert.equal(chat.deleteSession('s-1'), true);
+    assert.equal(chat.deleteSession('s-1'), false);
+  });
+
+  it('calls onDelete only when a session was actually deleted', () => {
+    const deleted = [];
+    const chat = createFleetMessages({ now: () => 1_000, onDelete: (sessionId) => deleted.push(sessionId) });
+    chat.post({ session_id: 's-1', machine_id: 'm-1', text: 'one' });
+    chat.deleteSession('s-missing');
+    chat.deleteSession('s-1');
+    assert.deepEqual(deleted, ['s-1']);
+  });
+});
+
+describe('Phase 2A imported messages (insertImported)', () => {
+  it('inserts a peer row, keeps at_ms order, and notifies without the text', () => {
+    const events = [];
+    const imported = [];
+    const chat = createFleetMessages({ now: () => 5_000, onImported: (message) => imported.push(message.message_id) });
+    const local = chat.post({ session_id: 's-1', machine_id: 'm-1', text: 'local' });
+    chat.subscribe('s-1', (event) => events.push(event));
+    assert.deepEqual(chat.insertImported(storedRow('msg-peer-new', { at_ms: 6_000 })), { ok: true, inserted: true });
+    assert.deepEqual(chat.insertImported(storedRow('msg-peer-old', { at_ms: 4_000 })), { ok: true, inserted: true });
+    assert.deepEqual(chat.insertImported(storedRow('msg-peer-new', { at_ms: 6_000 })), { ok: true, inserted: false });
+    assert.deepEqual(
+      chat.list({ session_id: 's-1' }).messages.map((m) => m.message_id),
+      ['msg-peer-old', local.message.message_id, 'msg-peer-new'],
+      'a page applied out of order still reads as a conversation',
+    );
+    assert.equal(events.length, 2, 'only the two inserts were new');
+    assert.equal('text' in events[0], false, 'the SSE event never carries text');
+    assert.equal(events[0].session_id, 's-1');
+    assert.deepEqual(imported, ['msg-peer-new', 'msg-peer-old']);
+  });
+
+  it('refuses a row without the fields a readable message needs', () => {
+    const chat = createFleetMessages({ now: () => 1_000 });
+    assert.equal(chat.insertImported(null).ok, false);
+    assert.equal(chat.insertImported({ message_id: 'x', session_id: 's', machine_id: 'm', text: 'hi' }).code, 'BAD_AT_MS');
+    assert.equal(chat.insertImported({ message_id: '', session_id: 's', machine_id: 'm', text: 'hi', at_ms: 1 }).code, 'BAD_MESSAGE_ID');
+    assert.equal(chat.insertImported({ message_id: 'x', session_id: 's', machine_id: 'm', text: 42, at_ms: 1 }).code, 'NOT_TEXT');
+    assert.equal(chat.usage().messages, 0);
+  });
+
+  it('imports without touching the local quota (design §5.1)', () => {
+    const chat = createFleetMessages({ now: () => 5_000, quota24hBytes: 10, hardCapBytes: 10 });
+    assert.equal(chat.post({ session_id: 's-1', machine_id: 'm-1', text: 'x'.repeat(20) }).ok, false);
+    assert.deepEqual(chat.insertImported(storedRow('msg-peer', { text: 'y'.repeat(200), at_ms: 5_000 })), { ok: true, inserted: true });
+    assert.equal(chat.usage().messages, 1);
+  });
+});
+
+describe('Phase 2A retention pruning (pruneBefore)', () => {
+  it('removes messages older than the cutoff and empties the session', () => {
+    const chat = createFleetMessages({ now: () => 5_000, initialMessages: [
+      storedRow('msg-old', { at_ms: 1_000 }),
+      storedRow('msg-new', { at_ms: 4_000 }),
+    ] });
+    assert.deepEqual(chat.pruneBefore(3_000), { removed: 1 });
+    assert.deepEqual(chat.list({ session_id: 's-1' }).messages.map((m) => m.message_id), ['msg-new']);
+    assert.equal(chat.findMessage('msg-old'), null);
+    assert.equal(chat.findMessage('msg-new').message_id, 'msg-new');
+  });
+
+  it('drops the oldest live messages until the byte budget fits', () => {
+    const chat = createFleetMessages({ now: () => 5_000, initialMessages: [
+      storedRow('msg-a', { at_ms: 1_000, text: 'a'.repeat(10) }),
+      storedRow('msg-b', { at_ms: 2_000, text: 'b'.repeat(10) }),
+      storedRow('msg-c', { at_ms: 3_000, text: 'c'.repeat(10) }),
+    ] });
+    assert.deepEqual(chat.pruneBefore(0, { maxBytes: 20 }), { removed: 1 });
+    assert.deepEqual(chat.list({ session_id: 's-1' }).messages.map((m) => m.message_id), ['msg-b', 'msg-c']);
+  });
+});
+
+describe('Phase 2A: chat-store and fleet messages wire together', () => {
+  it('persists posts/deletes, then restores messages, read marks and tombstones after a restart', () => {
+    const dir = tempStateDir();
+    const t = 1_700_000_000_000;
+    const store = createChatStore({ dir, now: () => t });
+    const chat = createFleetMessages({
+      now: () => t,
+      initialMessages: store.load().messages,
+      onAppend: (message) => store.appendMessage({ origin: 'node-a', message }),
+      onDelete: (sessionId) => store.appendSessionDeleted({ origin: 'node-a', session_id: sessionId }),
+      onImported: (message) => store.appendMessage({ origin: 'node-a', message }),
+    });
+    const posted = chat.post({ session_id: 's-1', machine_id: 'm-1', text: 'before restart' });
+    store.appendRead({ origin: 'node-a', session_id: 's-1', machine_id: 'm-1', at_ms: t + 1, message_id: posted.message.message_id });
+    chat.post({ session_id: 's-2', machine_id: 'm-2', text: 'other session' });
+    chat.deleteSession('s-2');
+
+    // "restart": a fresh store and a fresh in-memory chat, both rebuilt from disk only.
+    const restartedStore = createChatStore({ dir, now: () => t });
+    const restored = restartedStore.load();
+    const restartedChat = createFleetMessages({
+      now: () => t,
+      initialMessages: restored.messages,
+      onAppend: (message) => restartedStore.appendMessage({ origin: 'node-a', message }),
+      onDelete: (sessionId) => restartedStore.appendSessionDeleted({ origin: 'node-a', session_id: sessionId }),
+      onImported: (message) => restartedStore.appendMessage({ origin: 'node-a', message }),
+    });
+    assert.deepEqual(restartedChat.list({ session_id: 's-1' }).messages.map((m) => m.message_id), [posted.message.message_id]);
+    assert.deepEqual(restored.readMarks, [{ session_id: 's-1', machine_id: 'm-1', at_ms: t + 1, message_id: posted.message.message_id }]);
+    assert.deepEqual(restored.deletedSessions, ['s-2']);
+
+    // A message that arrived from a peer is served by the same read path and persisted by the import hook.
+    const peer = storedRow('msg-peer', { at_ms: t + 2, machine_id: 'm-b' });
+    assert.deepEqual(restartedChat.insertImported(peer), { ok: true, inserted: true });
+    assert.equal(restartedStore.load().messages.some((m) => m.message_id === 'msg-peer'), true);
+    assert.equal(restartedChat.list({ session_id: 's-1' }).messages.length, 2);
   });
 });

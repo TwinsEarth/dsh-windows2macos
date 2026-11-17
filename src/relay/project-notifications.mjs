@@ -35,11 +35,12 @@ export class NotificationError extends Error {
 
 const memberKey = (member) => (member && typeof member.kind === 'string' && typeof member.id === 'string' ? member.kind + ':' + member.id : null);
 
-export function createProjectNotifications({ now = () => Date.now(), onEvent = null, limits = DEFAULT_NOTIFICATION_LIMITS } = {}) {
+export function createProjectNotifications({ now = () => Date.now(), onEvent = null, limits = DEFAULT_NOTIFICATION_LIMITS, idPrefix = '' } = {}) {
   const rows = new Map(); // notification_id -> row
   const dedupe = new Map(); // dedupe key -> { id, at_ms }
   const watermarks = new Map(); // member key -> { ms, updated_at }
   const digests = new Map(); // project_id -> { window_start_ms, id, count }
+  const idScope = typeof idPrefix === 'string' && idPrefix !== '' ? idPrefix + '-' : '';
   let counter = 0;
   let seq = 0;
 
@@ -54,6 +55,48 @@ export function createProjectNotifications({ now = () => Date.now(), onEvent = n
     if (!refs || typeof refs !== 'object') return '';
     for (const key of ['task_id', 'review_id', 'lock_id', 'merge_queue_id', 'sha256']) if (typeof refs[key] === 'string' && refs[key] !== '') return key + ':' + refs[key];
     return '';
+  };
+
+  const asIso = (value) => (typeof value === 'string' && !Number.isNaN(Date.parse(value)) ? new Date(Date.parse(value)).toISOString() : null);
+  const copy = (value) => JSON.parse(JSON.stringify(value));
+  const idCounter = (id) => {
+    const match = /(\d+)$/.exec(id);
+    return match === null ? 0 : Number(match[1]);
+  };
+  const parseWatermarkKey = (storageKey) => {
+    const bar = storageKey.indexOf('|');
+    const colon = storageKey.indexOf(':', bar + 1);
+    if (bar < 0 || colon < 0) return null;
+    const projectId = storageKey.slice(0, bar);
+    const readerKind = storageKey.slice(bar + 1, colon);
+    const readerId = storageKey.slice(colon + 1);
+    if (projectId === '' || readerKind === '' || readerId === '') return null;
+    return { project_id: projectId, reader_kind: readerKind, reader_id: readerId };
+  };
+  /** Rebuild one notification row from a serialised row; null when it cannot be a notification. */
+  const normalizeNotificationRow = (row) => {
+    if (row === null || typeof row !== 'object') return null;
+    if (typeof row.notification_id !== 'string' || row.notification_id === '') return null;
+    if (typeof row.project_id !== 'string' || row.project_id === '') return null;
+    if (!NOTIFICATION_KINDS.includes(row.kind)) return null;
+    const createdAt = asIso(row.created_at);
+    const createdAtMs = Number.isFinite(row.created_at_ms) ? row.created_at_ms : (createdAt === null ? null : Date.parse(createdAt));
+    if (createdAtMs === null) return null;
+    const target = row.target !== null && typeof row.target === 'object' ? copy(row.target) : { kind: 'broadcast' };
+    const normalized = {
+      ...copy(row),
+      notification_id: row.notification_id,
+      project_id: row.project_id,
+      kind: row.kind,
+      target,
+      subject: typeof row.subject === 'string' ? row.subject : null,
+      refs: row.refs !== null && typeof row.refs === 'object' ? copy(row.refs) : {},
+      requires_action: row.requires_action === true,
+      created_at: createdAt ?? new Date(createdAtMs).toISOString(),
+      created_at_ms: createdAtMs,
+    };
+    if (row.kind === 'digest') normalized.count = Number.isInteger(row.count) && row.count >= 1 ? row.count : 1;
+    return normalized;
   };
 
   const targetKey = (target) => (!target || typeof target !== 'object' ? 'none' : target.kind === 'broadcast' ? 'broadcast' : memberKey(target) ?? 'none');
@@ -79,7 +122,7 @@ export function createProjectNotifications({ now = () => Date.now(), onEvent = n
     const current = digests.get(projectId);
     if (current !== undefined && current.window_start_ms === windowStart) return rows.get(current.id);
     counter += 1;
-    const id = 'nt-' + String(counter).padStart(6, '0');
+    const id = 'nt-' + idScope + String(counter).padStart(6, '0');
     const row = {
       notification_id: id,
       project_id: projectId,
@@ -121,7 +164,7 @@ export function createProjectNotifications({ now = () => Date.now(), onEvent = n
         return { ok: true, digest: true, notification: digest };
       }
       counter += 1;
-      const id = 'nt-' + String(counter).padStart(6, '0');
+      const id = 'nt-' + idScope + String(counter).padStart(6, '0');
       const row = {
         notification_id: id,
         project_id: projectId,
@@ -180,5 +223,78 @@ export function createProjectNotifications({ now = () => Date.now(), onEvent = n
       const all = [...rows.values()];
       return { rows: projectId === null ? all.length : all.filter((row) => row.project_id === projectId).length, events: seq };
     },
+    /** Serialisable copy of every notification row (cross-relay merge / restart persistence). */
+    snapshot() {
+      return [...rows.values()]
+        .map((row) => copy(row))
+        .sort((left, right) => (left.created_at_ms - right.created_at_ms) || (left.notification_id < right.notification_id ? -1 : left.notification_id > right.notification_id ? 1 : 0));
+    },
+    /**
+     * Replace the notification rows with rows produced by `snapshot()` or a merge of snapshots.
+     *
+     * Reader watermarks are deliberately kept: they are not part of `rows`, and clearing them would
+     * silently reset every unread count on a restart or a peer merge.
+     */
+    restore(rowsToRestore) {
+      if (!Array.isArray(rowsToRestore)) return { ok: false, code: 'BAD_SNAPSHOT' };
+      const rebuilt = new Map();
+      let skipped = 0;
+      let maxCounter = counter;
+      for (const row of rowsToRestore) {
+        const notification = normalizeNotificationRow(row);
+        if (notification === null) { skipped += 1; continue; }
+        rebuilt.set(notification.notification_id, notification);
+        maxCounter = Math.max(maxCounter, idCounter(notification.notification_id));
+      }
+      rows.clear();
+      for (const [notificationId, notification] of rebuilt) rows.set(notificationId, notification);
+      counter = maxCounter;
+      seq = Math.max(seq, rebuilt.size);
+      dedupe.clear();
+      digests.clear();
+      return { ok: true, restored: rebuilt.size, skipped };
+    },
+    /** Reader watermarks as a flat serialisable list (they are not notification rows). */
+    snapshotReadMarks() {
+      const out = [];
+      for (const [storageKey, mark] of watermarks) {
+        const parsed = parseWatermarkKey(storageKey);
+        if (parsed === null || mark === null || typeof mark !== 'object' || !Number.isFinite(mark.ms)) continue;
+        out.push({
+          project_id: parsed.project_id,
+          reader_kind: parsed.reader_kind,
+          reader_id: parsed.reader_id,
+          watermark_ms: mark.ms,
+          updated_at: typeof mark.updated_at === 'string' ? mark.updated_at : null,
+        });
+      }
+      return out.sort((left, right) => {
+        const leftKey = left.project_id + '|' + left.reader_kind + ':' + left.reader_id;
+        const rightKey = right.project_id + '|' + right.reader_kind + ':' + right.reader_id;
+        return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+      });
+    },
+    /** Restore reader watermarks from `snapshotReadMarks()` output; a watermark never moves backwards. */
+    restoreReadMarks(readMarkRows) {
+      if (!Array.isArray(readMarkRows)) return { ok: false, code: 'BAD_SNAPSHOT', restored: 0 };
+      let restored = 0;
+      for (const row of readMarkRows) {
+        if (row === null || typeof row !== 'object') continue;
+        if (typeof row.project_id !== 'string' || row.project_id === '') continue;
+        if (typeof row.reader_kind !== 'string' || row.reader_kind === '') continue;
+        if (typeof row.reader_id !== 'string' || row.reader_id === '') continue;
+        if (!Number.isFinite(row.watermark_ms)) continue;
+        const storageKey = row.project_id + '|' + row.reader_kind + ':' + row.reader_id;
+        const previous = watermarks.get(storageKey)?.ms ?? 0;
+        const next = Math.max(previous, row.watermark_ms);
+        const updatedAt = asIso(row.updated_at) ?? watermarks.get(storageKey)?.updated_at ?? new Date(now()).toISOString();
+        watermarks.set(storageKey, { ms: next, updated_at: updatedAt });
+        restored += 1;
+      }
+      return { ok: true, restored };
+    },
   };
 }
+
+
+

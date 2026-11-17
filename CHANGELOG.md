@@ -4,6 +4,15 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### Relay Phase 2 合并（chat / 项目房间跨 relay 同步，条件已收口，未发布）
+
+- **合并**：`work/v3.4.6` ← `wip/relay-phase2-20261117`（merge）。分支侧先 `eee9c16` 把主线合入 Phase 2 分支，`aee1a9b` 是独立编码修复 commit（5 个文件在 8e90aed 里被 GBK/UTF-8 双重编码损坏：`server.mjs` 的 49 个 `§`、27 个 `—`、2 个 `–`、2 个 `→` 与 `SIGNATURE_MISMATCH/EXPIRED/REPLAY`、device_token 提示等对外文案全部恢复；`git diff work/v3.4.6 -- <file>` 只剩 Phase 2 真实改动）。
+- **新增能力**：`src/relay/chat-store.mjs`（append-only 复制日志 + generation + applied 水位 + 分页 + 保留/硬上限压缩 + tombstone 过滤）、`src/relay/project-sync.mjs`（整项目快照导出 + 确定性幂等合并）、cluster 域扩展（`/v1/cluster/chat`、`/v1/cluster/projects`、feature bits `relay-cluster-chat-v1`/`relay-cluster-projects-v1`、混合版本跳过）、server 接线（chat 持久化装载、读水位复制、项目导出/合并、healthz `cluster.domains`）。设备线 `protocol_version` 与 `PROTOCOL.md` 未变。
+- **删除语义（评审条件 4）**：闭合数据层——`load()` 按 tombstone 过滤消息、`prune()` 删除被删会话的死行（tombstone 永久保留）、导入的晚到旧消息拒收、`deleteChatSession()` 为唯一删除写路径、退役 session 的 `POST /v1/fleet/messages` 返回 400 `SESSION_DELETED`；设备面 HTTP 删除路由**明确推迟**（理由与后续见 ADR §5.4）。
+- **文档（评审条件 2）**：新增 `docs/RELAY-CLUSTER-SYNC-PHASE2-DESIGN.md`（Phase 2 ADR：协议兼容/数据模型/删除语义/安全/回滚/迁移/验证/残余风险）与 `docs/RUNBOOK-RELAY-ROLLING-UPGRADE.md`（滚动升级手册：B→C→A、混合版本矩阵、每步门禁、回滚、禁止事项）；v3.0.0 设计 §1.3/§2.3、评审文档与 DEV-PLAN 均加交叉链接/状态更新。
+- **测试门禁（评审条件 3）**：`chat-store`/`project-sync`/`cluster-domains`/新增 `relay-phase2-server` 四套件进入 `package.json#scripts.test` 与 `test:all` 并各有独立脚本；`test/relay-phase2-server.test.mjs` 10 项覆盖 server 接线（feature/路由、chat 持久化与重启、真实 HTTP 跨 relay chat+项目拉取、混合版本跳过、tombstone 重启与 peer、`SIGNATURE_MISMATCH` 恢复后的用户文案、套件门禁接线）。`npx eslint .` 0 error、`node scripts/layer-check.mjs` clean、`node scripts/scan-mojibake.mjs` clean。
+- **未执行**：不 push、不改包版本（仍 3.4.5）、不跑三节点/混合版本真实进程验证（发布前留证，见 ADR §12）、不部署；preflight 在主线合并后跑一次。
+
 ### 异地镜像：写入时链接防护（realpath 加固补记，未发布）
 
 - 校验时已解析真实路径；新增**写入时**守卫：`syncToMirror` 重新解析镜像根，每个已存在的祖先必须解析到它自己，否则拒绝 `BACKUP_MIRROR_SYMLINK`；对象块/快照目录/快照文件/根元数据/索引追加全部过守卫。

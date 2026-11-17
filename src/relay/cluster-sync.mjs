@@ -33,12 +33,16 @@ import { gzipSync } from 'node:zlib';
 import { ProtocolError } from './state.mjs';
 
 export const CLUSTER_FEATURE = 'relay-cluster-sync-v1';
+export const CHAT_SYNC_FEATURE = 'relay-cluster-chat-v1';
+export const PROJECT_SYNC_FEATURE = 'relay-cluster-projects-v1';
 export const CLUSTER_PROTOCOL_VERSION = 1;
 
 export const CLUSTER_ROUTES = Object.freeze([
   '/v1/cluster/ping',
   '/v1/cluster/snapshot',
   '/v1/cluster/devices',
+  '/v1/cluster/chat',
+  '/v1/cluster/projects',
 ]);
 
 export const DEFAULT_SYNC_INTERVAL_MS = 60 * 60 * 1000;
@@ -47,6 +51,14 @@ export const DEFAULT_BOOT_MAX_MS = 10 * 60 * 1000;
 export const DEFAULT_JITTER_MS = 5 * 60 * 1000;
 export const DEFAULT_REQUEST_TIMEOUT_MS = 60 * 1000;
 export const DEFAULT_DEVICE_PAGE_SIZE = 25;
+/** Phase 2: chat is incremental and small, so it syncs on a short interval. */
+export const DEFAULT_CHAT_SYNC_MS = 60 * 1000;
+export const DEFAULT_PROJECT_SYNC_MS = 60 * 60 * 1000;
+export const DEFAULT_CHAT_BOOT_MIN_MS = 5 * 1000;
+export const DEFAULT_CHAT_BOOT_MAX_MS = 60 * 1000;
+export const DEFAULT_CHAT_RETENTION_DAYS = 7;
+export const DEFAULT_CHAT_HARD_CAP_BYTES = 200 * 1024 * 1024;
+export const DEFAULT_CHAT_PAGE_BYTES = 128 * 1024;
 export const DEFAULT_AUTH_SKEW_MS = 120 * 1000;
 export const DEFAULT_NONCE_RETENTION_MS = 10 * 60 * 1000;
 export const CLUSTER_NODE_ID_RE = /^node-[0-9a-f]{8,32}$/;
@@ -124,6 +136,11 @@ export function normalizeClusterConfig(raw = {}) {
   const chunkBytes = positiveInt(raw.chunkBytes, 2 * 1024 * 1024, 'chunkBytes', { min: 1024 });
   const requestTimeoutMs = positiveInt(raw.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS, 'requestTimeoutMs', { min: 1000 });
   const devicePageSize = positiveInt(raw.devicePageSize, DEFAULT_DEVICE_PAGE_SIZE, 'devicePageSize', { min: 1 });
+  const chatSyncMs = positiveInt(raw.chatSyncMs, DEFAULT_CHAT_SYNC_MS, 'chatSyncMs', { min: 5000 });
+  const projectSyncMs = positiveInt(raw.projectSyncMs, DEFAULT_PROJECT_SYNC_MS, 'projectSyncMs', { min: 60 * 1000 });
+  const chatBootMinMs = positiveInt(raw.chatBootMinMs, DEFAULT_CHAT_BOOT_MIN_MS, 'chatBootMinMs', { min: 0 });
+  const chatBootMaxMs = positiveInt(raw.chatBootMaxMs, DEFAULT_CHAT_BOOT_MAX_MS, 'chatBootMaxMs', { min: chatBootMinMs });
+  if (chatBootMaxMs < chatBootMinMs) throw new Error('cluster chatBootMaxMs must be >= chatBootMinMs');
   const config = {
     enabled,
     nodeId: typeof raw.nodeId === 'string' && raw.nodeId !== '' ? raw.nodeId : null,
@@ -136,6 +153,15 @@ export function normalizeClusterConfig(raw = {}) {
     chunkBytes,
     requestTimeoutMs,
     devicePageSize,
+    chatSyncMs,
+    projectSyncMs,
+    chatBootMinMs,
+    chatBootMaxMs,
+    chatEnabled: raw.chatEnabled !== false,
+    projectEnabled: raw.projectEnabled !== false,
+    chatPageBytes: positiveInt(raw.chatPageBytes, DEFAULT_CHAT_PAGE_BYTES, 'chatPageBytes', { min: 1024 }),
+    chatRetentionDays: positiveInt(raw.chatRetentionDays, DEFAULT_CHAT_RETENTION_DAYS, 'chatRetentionDays', { min: 1 }),
+    chatHardCapBytes: positiveInt(raw.chatHardCapBytes, DEFAULT_CHAT_HARD_CAP_BYTES, 'chatHardCapBytes', { min: 1024 }),
     authSkewMs: positiveInt(raw.authSkewMs, DEFAULT_AUTH_SKEW_MS, 'authSkewMs', { min: 1000 }),
     allowIps: Array.isArray(raw.allowIps) ? raw.allowIps.map(String).filter(Boolean) : [],
   };
@@ -256,6 +282,12 @@ export function periodicDelayMs(config, random = Math.random) {
   return config.intervalMs + Math.floor(random() * (config.jitterMs + 1));
 }
 
+/** Uniform integer in [min, max] (inclusive); used by the Phase 2 domain boot delays. */
+export function randomBetween(min, max, random = Math.random) {
+  const span = Math.max(0, max - min);
+  return min + Math.floor(random() * (span + 1));
+}
+
 /* ------------------------------------------------------------------ */
 /* state export / merge                                               */
 /* ------------------------------------------------------------------ */
@@ -309,6 +341,35 @@ export class ClusterSync {
     this.retryAttempts = Number.isInteger(options.retryAttempts) && options.retryAttempts > 0 ? options.retryAttempts : 3;
     this.retryDelayMs = Number.isInteger(options.retryDelayMs) && options.retryDelayMs >= 0 ? options.retryDelayMs : 2000;
 
+    /**
+     * Phase 2 domains.
+     *
+     * `chatStore` owns durability + the re-export log; `applyChatRecord` applies one imported record
+     * to the live relay (message/read/deletion). `projectSource` exports/merges full project-room
+     * state with deterministic rules (project-sync.mjs) — project state is small, so a periodic full
+     * pull with merge is both simpler and safer than a second cursor protocol.
+     */
+    this.chatStore = options.chatStore ?? null;
+    this.applyChatRecord = typeof options.applyChatRecord === 'function' ? options.applyChatRecord : null;
+    this.chatMaintenance = typeof options.chatMaintenance === 'function' ? options.chatMaintenance : null;
+    this.projectSource = options.projectSource ?? null;
+    const restoredDomains = this.persistence?.loadClusterDomains?.() ?? null;
+    const restoreDomain = (name) => {
+      const value = restoredDomains?.[name];
+      return value !== null && typeof value === 'object' ? value : { peers: {}, last_sync_at_ms: null, last_ok: false, last_error: null };
+    };
+    this.domains = { chat: restoreDomain('chat'), projects: restoreDomain('projects') };
+    if (this.domains.chat.peers === null || typeof this.domains.chat.peers !== 'object') this.domains.chat.peers = {};
+    if (this.domains.projects.peers === null || typeof this.domains.projects.peers !== 'object') this.domains.projects.peers = {};
+    this._chatTimer = null;
+    this._projectsTimer = null;
+    this._chatInFlight = false;
+    this._projectsInFlight = false;
+    this.chatNextSyncAtMs = null;
+    this.projectsNextSyncAtMs = null;
+    /** peer.id -> {features: string[]|null, at_ms, error|null}; used to skip domains a peer cannot serve. */
+    this.peerFeatures = new Map();
+
     this.nodeId = this.config.nodeId ?? this.persistence?.loadClusterNodeId?.() ?? null;
     this.cursors = this.persistence?.loadClusterCursors?.() ?? {};
     const restored = this.persistence?.loadClusterLastSync?.() ?? null;
@@ -332,6 +393,18 @@ export class ClusterSync {
 
   get enabled() { return this.config.enabled === true && this.config.secret !== null; }
 
+  get chatSyncEnabled() { return this.enabled && this.chatStore !== null && this.config.chatEnabled === true; }
+
+  get projectSyncEnabled() { return this.enabled && this.projectSource !== null && this.config.projectEnabled === true; }
+
+  /** Feature bits this relay advertises (phase 1, then each enabled Phase 2 domain). */
+  featureBits() {
+    const bits = [CLUSTER_FEATURE];
+    if (this.chatSyncEnabled) bits.push(CHAT_SYNC_FEATURE);
+    if (this.projectSyncEnabled) bits.push(PROJECT_SYNC_FEATURE);
+    return bits;
+  }
+
   /** Generate (once) and persist the stable node id. */
   ensureNodeId() {
     if (this.nodeId !== null) return this.nodeId;
@@ -344,20 +417,74 @@ export class ClusterSync {
   /* ---------------- scheduler ---------------- */
 
   start() {
-    if (!this.enabled || this._timer !== null) return this._timer !== null;
+    if (!this.enabled) return false;
     this.ensureNodeId();
     this._stopped = false;
-    const delay = bootDelayMs(this.config, this._random);
-    this.nextSyncAtMs = this._now() + delay;
-    this._timer = this._setTimer(() => this._runScheduled(), delay);
+    if (this._timer === null) {
+      const delay = bootDelayMs(this.config, this._random);
+      this.nextSyncAtMs = this._now() + delay;
+      this._timer = this._setTimer(() => this._runScheduled(), delay);
+    }
+    if (this.chatSyncEnabled && this._chatTimer === null) {
+      const delay = randomBetween(this.config.chatBootMinMs, this.config.chatBootMaxMs, this._random);
+      this.chatNextSyncAtMs = this._now() + delay;
+      this._chatTimer = this._setTimer(() => this._runChatScheduled(), delay);
+    }
+    if (this.projectSyncEnabled && this._projectsTimer === null) {
+      const delay = randomBetween(this.config.bootMinMs, this.config.bootMaxMs, this._random);
+      this.projectsNextSyncAtMs = this._now() + delay;
+      this._projectsTimer = this._setTimer(() => this._runProjectsScheduled(), delay);
+    }
     return true;
   }
 
   stop() {
     this._stopped = true;
     if (this._timer !== null) this._clearTimer(this._timer);
+    if (this._chatTimer !== null) this._clearTimer(this._chatTimer);
+    if (this._projectsTimer !== null) this._clearTimer(this._projectsTimer);
     this._timer = null;
+    this._chatTimer = null;
+    this._projectsTimer = null;
     this.nextSyncAtMs = null;
+    this.chatNextSyncAtMs = null;
+    this.projectsNextSyncAtMs = null;
+  }
+
+  _domainPeriodDelay(name) {
+    if (name === 'chat') {
+      const base = this.config.chatSyncMs;
+      return Math.max(1000, Math.round(base * (0.9 + this._random() * 0.2)));
+    }
+    const base = this.config.projectSyncMs;
+    const jitter = Math.round((this._random() - 0.5) * this.config.jitterMs);
+    return Math.max(60 * 1000, base + jitter);
+  }
+
+  _runChatScheduled() {
+    this._chatTimer = null;
+    Promise.resolve()
+      .then(() => this.tickChat())
+      .catch((err) => this.logger?.(`[w2m-rabbit] cluster chat sync failed: ${err instanceof Error ? err.message : String(err)}`))
+      .finally(() => {
+        if (this._stopped || !this.chatSyncEnabled) return;
+        const delay = this._domainPeriodDelay('chat');
+        this.chatNextSyncAtMs = this._now() + delay;
+        this._chatTimer = this._setTimer(() => this._runChatScheduled(), delay);
+      });
+  }
+
+  _runProjectsScheduled() {
+    this._projectsTimer = null;
+    Promise.resolve()
+      .then(() => this.tickProjects())
+      .catch((err) => this.logger?.(`[w2m-rabbit] cluster project sync failed: ${err instanceof Error ? err.message : String(err)}`))
+      .finally(() => {
+        if (this._stopped || !this.projectSyncEnabled) return;
+        const delay = this._domainPeriodDelay('projects');
+        this.projectsNextSyncAtMs = this._now() + delay;
+        this._projectsTimer = this._setTimer(() => this._runProjectsScheduled(), delay);
+      });
   }
 
   _runScheduled() {
@@ -400,6 +527,338 @@ export class ClusterSync {
       this.persistence?.saveClusterLastSync?.({ at_ms: this.lastSyncAtMs, ok: this.lastOk, results });
     }
     return { ok: this.lastOk, results, started_at_ms: startedAt, at_ms: this.lastSyncAtMs };
+  }
+
+  /* ---------------- Phase 2: chat / project domains ---------------- */
+
+  /**
+   * Learn a peer's feature bits from the (plain, Phase 1) ping route.
+   *
+   * A mixed-version rolling upgrade is the reason this exists: a 3.0.0 peer has no Phase 2 routes, so
+   * pulling chat/projects from it would return an auth/not-found error on every round. Ping already
+   * advertises `features`, so ask once (cached for five minutes) and skip a domain the peer cannot
+   * serve instead of reporting a failure the operator cannot act on.
+   */
+  async fetchPeerFeatures(peer) {
+    const path = '/v1/cluster/ping';
+    const ts = this._now();
+    const nonce = randomBytes(16).toString('base64url');
+    const auth = clusterAuthToken({ secret: this.config.secret, method: 'GET', path, ts, nonce, since: '' });
+    let response;
+    try {
+      response = await this.fetchImpl(`${peer.url.replace(/\/+$/, '')}${path}`, {
+        method: 'GET',
+        headers: {
+          accept: 'application/json',
+          'x-w2m-cluster-peer': this.ensureNodeId(),
+          'x-w2m-cluster-ts': String(ts),
+          'x-w2m-cluster-nonce': nonce,
+          'x-w2m-cluster-auth': auth,
+        },
+        signal: typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
+          ? AbortSignal.timeout(this.config.requestTimeoutMs)
+          : undefined,
+      });
+    } catch (err) {
+      this.peerFeatures.set(peer.id, { features: null, at_ms: this._now(), error: String(err?.message ?? err).slice(0, 120) });
+      throw new ProtocolError('UNAUTHORIZED', `cluster peer ${peer.id} is unreachable (ping)`, { peer: peer.id, detail: String(err?.message ?? err).slice(0, 120) });
+    }
+    const doc = await response.json().catch(() => null);
+    if (response.status !== 200 || doc === null || typeof doc !== 'object') {
+      this.peerFeatures.set(peer.id, { features: null, at_ms: this._now(), error: `HTTP_${response.status}` });
+      throw new ProtocolError('UNAUTHORIZED', `cluster peer ${peer.id} refused ping: HTTP_${response.status}`, { peer: peer.id, status: response.status });
+    }
+    const features = Array.isArray(doc.features) ? doc.features.filter((entry) => typeof entry === 'string') : [];
+    this.peerFeatures.set(peer.id, { features, at_ms: this._now(), error: null });
+    return features;
+  }
+
+  /** Whether a peer advertises one domain feature; probes ping when the cache is missing/stale. */
+  async peerSupportsDomain(peer, feature) {
+    const cached = this.peerFeatures.get(peer.id);
+    // Short TTL: a rolling upgrade replaces a peer's binary in place, and the next round must notice
+    // the new feature bits instead of treating the peer as Phase 1-only for the rest of the hour.
+    const fresh = cached !== undefined && Number.isFinite(cached.at_ms) && this._now() - cached.at_ms < 10_000;
+    if (!fresh) {
+      try {
+        await this.fetchPeerFeatures(peer);
+      } catch (err) {
+        // A probe failure on a flaky relay-to-relay link (observed on the vultr<->primary path) must
+        // not surface as a domain failure: use the last known feature set if there is one. A stale
+        // answer can delay a domain by one probe at worst; marking the whole domain failed is worse.
+        const known = this.peerFeatures.get(peer.id)?.features;
+        if (Array.isArray(known)) {
+          return { supported: known.includes(feature), unknown: false, stale: true };
+        }
+        return { supported: false, unknown: true, error: err instanceof Error ? err.message : String(err) };
+      }
+    }
+    const features = this.peerFeatures.get(peer.id)?.features;
+    if (!Array.isArray(features)) return { supported: false, unknown: true, error: 'feature probe failed' };
+    return { supported: features.includes(feature), unknown: false };
+  }
+
+  _saveDomains() {
+    this.persistence?.saveClusterDomains?.(this.domains);
+  }
+
+  /**
+   * One domain page from a peer: signed GET, then an encrypted (and gzip-encoded) JSON payload.
+   * Authentication is the Phase 1 cluster HMAC; the envelope binds the page to this peer pair.
+   */
+  async fetchDomainPage(peer, path, since) {
+    const sinceParam = String(since);
+    const ts = this._now();
+    const nonce = randomBytes(16).toString('base64url');
+    const auth = clusterAuthToken({ secret: this.config.secret, method: 'GET', path, ts, nonce, since: sinceParam });
+    const url = `${peer.url.replace(/\/+$/, '')}${path}?since=${encodeURIComponent(sinceParam)}`;
+    let response;
+    try {
+      response = await this.fetchImpl(url, {
+        method: 'GET',
+        headers: {
+          accept: 'application/json',
+          'x-w2m-cluster-peer': this.ensureNodeId(),
+          'x-w2m-cluster-ts': String(ts),
+          'x-w2m-cluster-nonce': nonce,
+          'x-w2m-cluster-auth': auth,
+        },
+        signal: typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function'
+          ? AbortSignal.timeout(this.config.requestTimeoutMs)
+          : undefined,
+      });
+    } catch (err) {
+      throw new ProtocolError('UNAUTHORIZED', `cluster peer ${peer.id} is unreachable (${path})`, { peer: peer.id, detail: String(err?.message ?? err).slice(0, 120) });
+    }
+    const doc = await response.json().catch(() => null);
+    if (response.status !== 200) {
+      const code = typeof doc?.error?.code === 'string' ? doc.error.code : `HTTP_${response.status}`;
+      throw new ProtocolError('UNAUTHORIZED', `cluster peer ${peer.id} refused ${path}: ${code}`, { peer: peer.id, status: response.status, remote_code: code });
+    }
+    if (doc === null || typeof doc !== 'object') throw new ProtocolError('BAD_REQUEST', `cluster peer ${peer.id} returned a non-JSON page for ${path}`, { peer: peer.id });
+    const opened = openClusterEnvelope({
+      secret: this.config.secret,
+      envelope: doc,
+      expectedSender: peer.id,
+      receiverNodeId: this.ensureNodeId(),
+      nowMs: this._now(),
+      skewMs: this.config.authSkewMs,
+    });
+    const payload = opened.payload;
+    if (payload === null || typeof payload !== 'object' || payload.node_id !== peer.id) {
+      throw new ProtocolError('UNAUTHORIZED', `cluster ${path} payload does not belong to the peer`, { peer: peer.id });
+    }
+    return payload;
+  }
+
+  async fetchDomainPageWithRetry(peer, path, since) {
+    let lastError = null;
+    for (let attempt = 1; attempt <= this.retryAttempts; attempt += 1) {
+      try {
+        return await this.fetchDomainPage(peer, path, since);
+      } catch (err) {
+        lastError = err;
+        if (attempt < this.retryAttempts) {
+          await new Promise((resolveDelay) => {
+            const timer = setTimeout(resolveDelay, this.retryDelayMs * attempt);
+            timer.unref?.();
+          });
+        }
+      }
+    }
+    throw lastError;
+  }
+
+  /** Pull the durable chat replication log from every peer. */
+  async tickChat() {
+    if (!this.chatSyncEnabled) return { ok: false, code: 'CHAT_SYNC_DISABLED', at_ms: this._now() };
+    if (this._chatInFlight) return { ok: false, code: 'SYNC_IN_FLIGHT', at_ms: this._now() };
+    this._chatInFlight = true;
+    const startedAt = this._now();
+    const results = [];
+    try {
+      for (const peer of this.config.peers) results.push(await this.syncPeerChat(peer));
+    } finally {
+      this._chatInFlight = false;
+      this.domains.chat.last_sync_at_ms = this._now();
+      this.domains.chat.last_ok = results.length > 0 && results.every((entry) => entry.ok === true);
+      const failure = results.find((entry) => entry.ok !== true);
+      this.domains.chat.last_error = failure !== undefined ? (failure.code ?? 'CHAT_SYNC_FAILED') : null;
+      // Retention/compaction runs with the hourly-ish chat round, not on every message: a rewrite
+      // bumps the generation and forces peers to re-pull, so it should only happen when it is due.
+      try { this.chatMaintenance?.(); } catch (err) { this.logger?.(`[w2m-rabbit] chat maintenance failed: ${err instanceof Error ? err.message : String(err)}`); }
+      this._saveDomains();
+    }
+    return { ok: this.domains.chat.last_ok, results, started_at_ms: startedAt, at_ms: this.domains.chat.last_sync_at_ms };
+  }
+
+  async syncPeerChat(peer) {
+    const previous = this.domains.chat.peers[peer.id] ?? {};
+    const support = await this.peerSupportsDomain(peer, CHAT_SYNC_FEATURE);
+    if (support.supported !== true) {
+      if (support.unknown === true) {
+        this.domains.chat.peers[peer.id] = { ...previous, last_error: 'FEATURE_PROBE_FAILED', last_error_detail: support.error ?? null };
+        return { peer: peer.id, ok: false, code: 'FEATURE_PROBE_FAILED', detail: support.error ?? 'peer feature probe failed' };
+      }
+      this.domains.chat.peers[peer.id] = { ...previous, last_error: null, last_ok_at_ms: this._now(), unsupported: true };
+      return { peer: peer.id, ok: true, skipped: true, unsupported: true, reason: 'peer is Phase 1 only' };
+    }
+    let generation = Number.isInteger(previous.generation) ? previous.generation : null;
+    let offset = Number.isInteger(previous.offset) && previous.offset >= 0 ? previous.offset : 0;
+    let applied = 0;
+    let pages = 0;
+    const selfId = this.ensureNodeId();
+    try {
+      for (let page = 0; page < MAX_PEER_PAGES; page += 1) {
+        const payload = await this.fetchDomainPageWithRetry(peer, '/v1/cluster/chat', offset);
+        if (!Number.isInteger(payload.generation) || !Array.isArray(payload.records)) {
+          throw new ProtocolError('BAD_REQUEST', 'cluster chat page is malformed', { peer: peer.id });
+        }
+        // A peer that compacted its log starts a new generation: a byte cursor means nothing there.
+        if (generation !== null && payload.generation !== generation) {
+          generation = payload.generation;
+          offset = 0;
+          continue;
+        }
+        generation = payload.generation;
+        for (const record of payload.records) {
+          // Our own records come back re-exported by the peer; they are already applied here.
+          if (record !== null && typeof record === 'object' && record.origin === selfId) continue;
+          const imported = this.chatStore.importRecord(record);
+          if (imported?.applied === true) {
+            try {
+              this.applyChatRecord?.(record);
+            } catch (err) {
+              // The record is durable in the store; a live apply failure must not fail the round.
+              this.logger?.(`[w2m-rabbit] cluster chat record apply failed: ${err instanceof Error ? err.message : String(err)}`);
+            }
+            applied += 1;
+          }
+        }
+        const next = Number.isInteger(payload.next_offset) ? payload.next_offset : offset;
+        if (next < offset) throw new ProtocolError('BAD_REQUEST', 'cluster chat cursor moved backwards', { peer: peer.id });
+        offset = next;
+        pages += 1;
+        if (payload.eof === true) break;
+      }
+      this.domains.chat.peers[peer.id] = {
+        ...previous,
+        generation,
+        offset,
+        last_ok_at_ms: this._now(),
+        last_error: null,
+        unsupported: false,
+      };
+      return { peer: peer.id, ok: true, pages, applied, generation, to_offset: offset };
+    } catch (err) {
+      // Mixed versions: a Phase 1-only peer has no /v1/cluster/chat route. That is "this peer does not
+      // speak the domain yet", not a sync failure; the relay-level feature bits make it visible.
+      if (err instanceof ProtocolError && err.detail?.status === 404) {
+        this.domains.chat.peers[peer.id] = { ...previous, last_error: null, last_ok_at_ms: this._now(), unsupported: true };
+        return { peer: peer.id, ok: true, skipped: true, unsupported: true };
+      }
+      const code = err instanceof ProtocolError ? err.code : 'CLUSTER_SYNC_FAILED';
+      this.domains.chat.peers[peer.id] = {
+        ...previous,
+        generation,
+        offset,
+        last_error: code,
+        last_error_detail: String(err?.message ?? err).slice(0, 200),
+      };
+      return { peer: peer.id, ok: false, code, detail: String(err?.message ?? err).slice(0, 200), pages, applied };
+    }
+  }
+
+  /**
+   * Pull full project-room state from every peer and merge it deterministically.
+   *
+   * Project room state is small (measured tens of KB on the live fleet), so a periodic full pull is
+   * simpler than a second cursor protocol: merge rules are idempotent and the next round heals any
+   * partial page failure.
+   */
+  async tickProjects() {
+    if (!this.projectSyncEnabled) return { ok: false, code: 'PROJECT_SYNC_DISABLED', at_ms: this._now() };
+    if (this._projectsInFlight) return { ok: false, code: 'SYNC_IN_FLIGHT', at_ms: this._now() };
+    this._projectsInFlight = true;
+    const startedAt = this._now();
+    const results = [];
+    try {
+      for (const peer of this.config.peers) results.push(await this.syncPeerProjects(peer));
+    } finally {
+      this._projectsInFlight = false;
+      this.domains.projects.last_sync_at_ms = this._now();
+      this.domains.projects.last_ok = results.length > 0 && results.every((entry) => entry.ok === true);
+      const failure = results.find((entry) => entry.ok !== true);
+      this.domains.projects.last_error = failure !== undefined ? (failure.code ?? 'PROJECT_SYNC_FAILED') : null;
+      this._saveDomains();
+    }
+    return { ok: this.domains.projects.last_ok, results, started_at_ms: startedAt, at_ms: this.domains.projects.last_sync_at_ms };
+  }
+
+  async syncPeerProjects(peer) {
+    const previous = this.domains.projects.peers[peer.id] ?? {};
+    const support = await this.peerSupportsDomain(peer, PROJECT_SYNC_FEATURE);
+    if (support.supported !== true) {
+      if (support.unknown === true) {
+        this.domains.projects.peers[peer.id] = { ...previous, last_error: 'FEATURE_PROBE_FAILED', last_error_detail: support.error ?? null };
+        return { peer: peer.id, ok: false, code: 'FEATURE_PROBE_FAILED', detail: support.error ?? 'peer feature probe failed' };
+      }
+      this.domains.projects.peers[peer.id] = { ...previous, last_error: null, last_ok_at_ms: this._now(), unsupported: true };
+      return { peer: peer.id, ok: true, skipped: true, unsupported: true, reason: 'peer is Phase 1 only' };
+    }
+    let offset = 0;
+    let projects = 0;
+    let changed = 0;
+    let conflicts = 0;
+    let pages = 0;
+    try {
+      for (let page = 0; page < MAX_PEER_PAGES; page += 1) {
+        const payload = await this.fetchDomainPageWithRetry(peer, '/v1/cluster/projects', offset);
+        if (!Array.isArray(payload.projects)) {
+          throw new ProtocolError('BAD_REQUEST', 'cluster projects page is malformed', { peer: peer.id });
+        }
+        for (const remote of payload.projects) {
+          try {
+            const merged = this.projectSource.applyProject(remote);
+            projects += 1;
+            if (merged?.changed === true) changed += 1;
+            if (Number.isInteger(merged?.conflicts)) conflicts += merged.conflicts;
+          } catch (err) {
+            this.logger?.(`[w2m-rabbit] project merge failed for ${String(remote?.project_id ?? '?')}: ${err instanceof Error ? err.message : String(err)}`);
+            conflicts += 1;
+          }
+        }
+        const next = Number.isInteger(payload.next_offset) ? payload.next_offset : offset;
+        if (next < offset) throw new ProtocolError('BAD_REQUEST', 'cluster project offset moved backwards', { peer: peer.id });
+        offset = next;
+        pages += 1;
+        if (payload.has_more !== true) break;
+      }
+      this.domains.projects.peers[peer.id] = {
+        ...previous,
+        last_ok_at_ms: this._now(),
+        last_error: null,
+        unsupported: false,
+        last_projects: projects,
+        last_changed: changed,
+        last_conflicts: conflicts,
+      };
+      return { peer: peer.id, ok: true, pages, projects, changed, conflicts };
+    } catch (err) {
+      // Mixed versions: a Phase 1-only peer has no /v1/cluster/projects route. Skip it instead of
+      // reporting a domain failure that would light up on every standby during a rolling upgrade.
+      if (err instanceof ProtocolError && err.detail?.status === 404) {
+        this.domains.projects.peers[peer.id] = { ...previous, last_error: null, last_ok_at_ms: this._now(), unsupported: true };
+        return { peer: peer.id, ok: true, skipped: true, unsupported: true, pages, projects, changed, conflicts };
+      }
+      const code = err instanceof ProtocolError ? err.code : 'CLUSTER_SYNC_FAILED';
+      this.domains.projects.peers[peer.id] = {
+        ...previous,
+        last_error: code,
+        last_error_detail: String(err?.message ?? err).slice(0, 200),
+      };
+      return { peer: peer.id, ok: false, code, detail: String(err?.message ?? err).slice(0, 200), pages, projects, changed, conflicts };
+    }
   }
 
   /** Pull all chunks for one peer and merge them. */
@@ -671,7 +1130,7 @@ export class ClusterSync {
           node_id: this.ensureNodeId(),
           relay_version: this.relayVersion,
           protocol_version: CLUSTER_PROTOCOL_VERSION,
-          features: [CLUSTER_FEATURE],
+          features: this.featureBits(),
         },
       };
     }
@@ -708,6 +1167,53 @@ export class ClusterSync {
       if (!Number.isInteger(offset) || offset < 0) throw new ProtocolError('BAD_REQUEST', 'cluster offset must be a non-negative integer');
       const { peerId } = this.verifyPeerRequest({ method, path, headers, since: '' });
       const payload = this.buildDevicesPayload(offset);
+      const envelope = sealClusterEnvelope({ secret: this.config.secret, senderNodeId: this.ensureNodeId(), receiverNodeId: peerId, payload, ts: this._now() });
+      const raw = gzipSync(Buffer.from(JSON.stringify(envelope), 'utf8'));
+      return {
+        status: 200,
+        raw,
+        headers: { 'content-type': 'application/json', 'content-encoding': 'gzip' },
+      };
+    }
+    if (path === '/v1/cluster/chat') {
+      if (!this.chatSyncEnabled) throw new ProtocolError('NOT_FOUND', 'chat sync is not enabled on this relay');
+      const sinceRaw = query?.get?.('since');
+      const since = sinceRaw === null || sinceRaw === undefined || sinceRaw === '' ? 0 : Number(sinceRaw);
+      if (!Number.isInteger(since) || since < 0) throw new ProtocolError('BAD_REQUEST', 'cluster chat since must be a non-negative integer');
+      const { peerId } = this.verifyPeerRequest({ method, path, headers, since: String(since) });
+      const slice = this.chatStore.exportSlice(since, this.config.chatPageBytes);
+      const payload = {
+        kind: 'chat',
+        node_id: this.ensureNodeId(),
+        generation: slice.generation,
+        records: slice.records,
+        next_offset: slice.next_offset,
+        eof: slice.eof,
+      };
+      const envelope = sealClusterEnvelope({ secret: this.config.secret, senderNodeId: this.ensureNodeId(), receiverNodeId: peerId, payload, ts: this._now() });
+      const raw = gzipSync(Buffer.from(JSON.stringify(envelope), 'utf8'));
+      return {
+        status: 200,
+        raw,
+        headers: { 'content-type': 'application/json', 'content-encoding': 'gzip' },
+      };
+    }
+    if (path === '/v1/cluster/projects') {
+      if (!this.projectSyncEnabled) throw new ProtocolError('NOT_FOUND', 'project sync is not enabled on this relay');
+      const offsetRaw = query?.get?.('since');
+      const offset = offsetRaw === null || offsetRaw === undefined || offsetRaw === '' ? 0 : Number(offsetRaw);
+      if (!Number.isInteger(offset) || offset < 0) throw new ProtocolError('BAD_REQUEST', 'cluster project offset must be a non-negative integer');
+      const { peerId } = this.verifyPeerRequest({ method, path, headers, since: String(offset) });
+      // A page is a handful of whole projects (each carries its event log), so a slow link still
+      // transfers one bounded response per request.
+      const page = this.projectSource.exportPage(offset, 3);
+      const payload = {
+        kind: 'projects',
+        node_id: this.ensureNodeId(),
+        projects: page.projects,
+        next_offset: page.next_offset,
+        has_more: page.has_more === true,
+      };
       const envelope = sealClusterEnvelope({ secret: this.config.secret, senderNodeId: this.ensureNodeId(), receiverNodeId: peerId, payload, ts: this._now() });
       const raw = gzipSync(Buffer.from(JSON.stringify(envelope), 'utf8'));
       return {
@@ -825,9 +1331,30 @@ export class ClusterSync {
         last_error: typeof cursor.last_error === 'string' ? cursor.last_error : null,
       };
     });
+    const domainStatus = (name, enabled, intervalMs, nextAtMs) => {
+      const state = this.domains[name];
+      const peers = Object.entries(state.peers ?? {}).map(([id, cursor]) => ({
+        id,
+        ...(name === 'chat' ? { generation: Number.isInteger(cursor.generation) ? cursor.generation : null, offset: Number.isInteger(cursor.offset) ? cursor.offset : null } : {}),
+        last_ok_at: Number.isFinite(cursor.last_ok_at_ms) ? rfc3339OrNull(cursor.last_ok_at_ms) : null,
+        last_error: typeof cursor.last_error === 'string' ? cursor.last_error : null,
+        unsupported: cursor.unsupported === true,
+        ...(name === 'projects' ? { last_projects: cursor.last_projects ?? null, last_conflicts: cursor.last_conflicts ?? null } : {}),
+      }));
+      return {
+        enabled,
+        interval_ms: intervalMs,
+        last_sync_at: Number.isFinite(state.last_sync_at_ms) ? rfc3339OrNull(state.last_sync_at_ms) : null,
+        next_sync_at: Number.isFinite(nextAtMs) ? rfc3339OrNull(nextAtMs) : null,
+        last_ok: state.last_ok === true,
+        last_error: typeof state.last_error === 'string' ? state.last_error : null,
+        peers,
+      };
+    };
     return {
       enabled: this.enabled,
       feature: CLUSTER_FEATURE,
+      features: this.featureBits(),
       node_id: this.nodeId,
       protocol_version: CLUSTER_PROTOCOL_VERSION,
       peers,
@@ -839,6 +1366,10 @@ export class ClusterSync {
       interval_ms: this.config.intervalMs,
       jitter_ms: this.config.jitterMs,
       boot_delay_ms: { min: this.config.bootMinMs, max: this.config.bootMaxMs },
+      domains: {
+        chat: domainStatus('chat', this.chatSyncEnabled, this.config.chatSyncMs, this.chatNextSyncAtMs),
+        projects: domainStatus('projects', this.projectSyncEnabled, this.config.projectSyncMs, this.projectsNextSyncAtMs),
+      },
     };
   }
 }
