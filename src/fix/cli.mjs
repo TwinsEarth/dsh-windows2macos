@@ -87,6 +87,9 @@ Renumber notes
     copy is never pruned, and 0 disables pruning entirely.
   * the renumbered log is validated with the static doctor, the "next append still loads"
     simulation, and the installed Harness's own validator before anything is written.
+  * PREFER RESTORE: if a backup holds the original log, restore it (w2m-backup restore) instead of
+    renumbering. Renumber is the fallback when there is no way to recover the original bytes; it
+    edits history on purpose, and the .bak copy is only the last resort, not a substitute for a backup.
 
 Standard flow
   1. quit DeepSeek Harness;
@@ -565,6 +568,7 @@ function formatRenumber(plan, applied) {
   lines.push(`static        : ${validation.static?.ok === true ? 'ok (static pre-filter, not evidence)' : `REFUSED (${(validation.static?.codes ?? []).join(', ')})`}`);
   lines.push(`runtime       : ${validation.runtime_verified === true ? 'verified by the installed Harness' : 'static-only evidence (runtime_verified:false)'}`);
   lines.push(`future append : ${validation.future_append === true ? 'ok' : 'not confirmed'} [${validation.future_append_evidence ?? 'static-prefilter'}]`);
+  lines.push('prefer restore: if a backup holds the original log, restore it instead of renumbering');
   if (!plan.changed) {
     lines.push('');
     lines.push('no change: the log is already dense; nothing was written.');

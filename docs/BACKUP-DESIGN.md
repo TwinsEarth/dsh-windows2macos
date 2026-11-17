@@ -1431,6 +1431,8 @@ node --input-type=module -e "import { bindAccount } from 'file:///E:/GPT/w2m/w2m
   apply 才写，并始终先留 `<file>.bak-<时间戳>`（保留数量见 `--keep-backups`）；
 * **门禁比面板操作更重**：静态 doctor + 未来追加模拟 + 安装的 Harness 终审（G5），任一失败零写入；
 * 面板只暴露非破坏性/可回滚的操作（备份、还原计划、归档、校验、注册表修复、解锁），破坏性历史编辑留在 CLI。
+* **优先还原**：如果备份能取回原始日志，先用 `w2m-backup restore` 还原，而不是 `renumber`——renumber 是有意改历史，
+  `.bak` 只是最后一次写入前的副本，不替代备份；CLI 的帮助与每次 plan 输出都会打印这条提醒。
 
 发现路径：`w2m-fix --help` 的第一段就是"the one legal way to delete/insert events in a v4 session log (gate G4)"；
 `docs/BACKUP-DESIGN.md` §20 与本轮 `--keep-backups` 说明给出完整参数。若未来要在面板暴露它，必须先有"逐事件预览 +

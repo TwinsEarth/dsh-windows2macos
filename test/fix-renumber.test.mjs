@@ -525,6 +525,7 @@ describe('renumber: the CLI', () => {
     assert.match(run.stdout, /backup\s+: .*\.bak-/);
     assert.match(run.stdout, /runtime\s+:/);
     assert.match(run.stdout, /edits\s+: -0 deleted, \+1 inserted/, 'the human output names the edit counts');
+    assert.match(run.stdout, /prefer restore/, 'the human output says to restore from a backup first when one exists');
 
     const written = fs.readFileSync(file);
     assert.equal(written.equals(original), false);
