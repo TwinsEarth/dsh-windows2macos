@@ -553,15 +553,23 @@ UI 半只有一个文件：`lib/client.js`（手写、由 `window.__ModuleLoader
   `archive`（`{confirm:'archive',scope:'archived'|'all'}`）、`verify`（`GET /verify`，展示 counts/problems/
   future_append/runtime；2026-11-17 起校验卡有「用安装的 Harness 终审（慢）」勾选框，勾上才请求
   `GET /verify?runtime=1`，见 §22.4）。操作期间按钮禁用、进度可见；失败可重试。
+* **两个备份范围入口（v3.5.0 面板补全）**：操作区在原有四个之后新增 `backup-selected`（勾选会话 →
+  `{confirm:'run',scope:'selected',selected:[ids]}`，无勾选时禁用）与 `backup-active`
+  （`{confirm:'run',scope:'active'}`）；旁边的「备份范围」卡列出会话，来源是**只读**的
+  `GET /api/w2m/backup/scan?detail=1`（`{ok,sessions:[{session_id,workspace,size,flags.archived}],totals:{sessions}}`；
+  404/失败显示中性提示 +「刷新会话」重试，不阻塞面板其余部分），勾选只存在页面内存里、刷新即丢。两个入口
+  仍然走带 `confirm:'run'` 的 POST：没有确认令牌不会写入任何字节，选中不持久化，扫描本身从不写盘；已归档
+  会话仍由 `archived` 范围或 `all` 范围覆盖，`selected` 不会静默改变这一点。
 * **解锁卡**：`GET /unlock` 描述两条路径——本机信封按钮 `POST {confirm:'unlock'}`；密码路径**不在 HTTP 上传输**，
   面板显示终端命令 `w2m-backup unlock --check --password-stdin`。`BACKUP_NO_PERMISSION` 的文案为
   「没有权限：请用原账户登录，或输入解锁密码」（`account` 信封已按 spike 结论不做，见 §6/§15.5）。
 * **日志区**：当前页内最多 50 条操作记录（时间、结果码、detail），失败时同时显示错误卡。
 * **刷新**：挂载即读状态；之后 10 s 轮询只读状态（`typeof window !== 'undefined'` 守卫），页面卸载清定时器；
   每个操作完成后立即重读状态。
-* **i18n**：`panel.backup.*` 共 123 个键 × 中/英（2026-11-17 增加 `verify.runtimeCounts` / `verify.runtimeHint`
-  两键，`verify.runtime` 改为勾选框标签，见 §22.4），随既有 `registerDictionaries` 注册（内联字典是该 bundle 的
-  实际机制；`locale/*.json` 只是商店清单元数据）；34 个 reason-code 到文案的映射。
+* **i18n**：`panel.backup.*` 共 139 个键 × 中/英（2026-11-17 增加 `verify.runtimeCounts` / `verify.runtimeHint`
+  两键，`verify.runtime` 改为勾选框标签，见 §22.4；v3.5.0 增加两个范围入口与只读扫描卡 16 键），随既有
+  `registerDictionaries` 注册（内联字典是该 bundle 的实际机制；`locale/*.json` 只是商店清单元数据）；34 个
+  reason-code 到文案的映射。
 * **主题**：只用宿主 `--dsw-alias-*` 设计令牌，无字面色值、无媒体查询（深浅色由宿主切换）；窄宽度用
   `auto-fit` 网格。
 

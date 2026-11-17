@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### 备份面板范围入口（v3.5.0 面板补全，未发布）
+
+- **`lib/client.js`：备份&还原面板补上 DEV-PLAN 4.1 的两个范围入口**：`backup-selected`（勾选会话 → `{confirm:'run',scope:'selected',selected:[ids]}`，无勾选时禁用）与 `backup-active`（`{confirm:'run',scope:'active'}`），与既有四个操作并列；新增「备份范围」卡，会话来自**只读**的 `GET /api/w2m/backup/scan?detail=1`（每个会话一个 `data-w2m-backup-pick` 勾选框，显示 id 后缀/工作区/已归档标记，`已选 n/m` 计数、全选/清空、上限滚动列表），404 或扫描失败只显示中性提示 +「刷新会话」重试，**不抛异常、不阻塞面板**；两个入口各有独立 busy 文案，操作期间六个操作一起禁用。i18n `panel.backup.*` 中英各 +16 键（共 139 键）。诚实边界：扫描只读、勾选不持久化（刷新页面即丢）、选中不会改变 `archived`/`all` 的覆盖范围——已归档会话仍按原范围备份。
+- **测试/文档**：`test/client-bundle.test.mjs` 新增 6 项（扫描完成前两个入口禁用；3 会话勾 2 后 `selected` 请求体恰为 `{confirm:'run',scope:'selected',selected:[两个 id]}` 且无其它 scope；`active` 请求体；既有 `all` 不变；全选/清空计数；404/空列表/拒绝原因与归一化边界）；`docs/BACKUP-DESIGN.md` §18 增补范围入口段落并更新键数（123→139）。`npx eslint .` 0 error、`node scripts/layer-check.mjs` 与 `node scripts/scan-mojibake.mjs` clean、`node --test --test-force-exit test/client-bundle.test.mjs` 全绿、`node scripts/pack.mjs` 打包一次。本次不 bump 版本号、不跑 preflight、不提交。
+
 ### 双解锁补全：给机器信封仓库补 password 信封（未发布）
 
 - 需求 5.3 的 P0 缺口：无人值守只建 `machine`（DPAPI）信封，换机器/换账户后仓库打不开，而 `password` 是唯一跨机器路径且此前无法事后补。

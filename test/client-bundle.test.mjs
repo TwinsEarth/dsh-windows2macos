@@ -1338,7 +1338,104 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
       archiveScope: 'archived',
       restoreArmed: false,
       runMissing: false,
+      // v3.5.0: the backup-scope card starts before the read-only scan has resolved (scan === null).
+      scan: null,
+      picked: [],
       ...overrides,
+    };
+  }
+
+  /** One rendered button by its stable `data-w2m-backup-action` marker (the v3.5.0 scope entries too). */
+  function actionButton(tree, action) {
+    return findBy(tree, (node) => node.props?.['data-w2m-backup-action'] === action)[0];
+  }
+
+  /**
+   * Mount the real backup page behind the fake hook-capable React with a recording fetch.
+   *
+   * `respond` receives `{url, method, body}` and returns the JSON payload to answer with, or
+   * `{status: 404}` for a missing route. Returning `undefined` marks the request as unexpected: it is
+   * recorded in `unexpected` (and answered with a 404) instead of throwing, because `callBackup`
+   * never throws and a silent catch would turn a wrong route into a green test.
+   */
+  function mountBackupPage(respond) {
+    const requests = [];
+    const unexpected = [];
+    const hostFetch = async (url, init = {}) => {
+      const method = init.method ?? 'GET';
+      const body = init.body === undefined ? null : JSON.parse(init.body);
+      const answer = respond({ url, method, body });
+      requests.push({ url, method, body });
+      if (answer === undefined) {
+        unexpected.push(method + ' ' + url);
+        return { ok: false, status: 404, json: async () => ({ ok: false, reason_code: 'BACKUP_ROUTE_MISSING', detail: 'unexpected in this test' }) };
+      }
+      if (answer.status === 404) {
+        return { ok: false, status: 404, json: async () => ({ ok: false, reason_code: 'BACKUP_ROUTE_MISSING', detail: 'the host has no such route' }) };
+      }
+      return { ok: true, status: 200, json: async () => answer };
+    };
+    const mountReact = makeMountReact();
+    const registry = makeRegistry();
+    const bundle = loadBundle({
+      document: makeFakeDocument(),
+      requireImpl: (specifier) => {
+        if (specifier === 'react') return mountReact.React;
+        throw new Error(`unexpected require(${specifier})`);
+      },
+      globals: { fetch: hostFetch },
+    });
+    bundle.exports.apply({ slots: registry, effect: (callback) => callback(), get: () => undefined });
+    const page = registry.registered.find((entry) => entry.options.key === 'w2m-backup');
+    assert.ok(page !== undefined, 'the backup page is registered');
+    const handle = mountReact.mount(page.component, { t: bundle.exports.makeTranslator(() => undefined) });
+    return {
+      bundle,
+      handle,
+      requests,
+      unexpected,
+      settle: async () => {
+        await new Promise((resolve) => { setTimeout(resolve, 0); });
+        handle.rerender();
+      },
+      text: () => collectText(handle.tree).join('\n'),
+    };
+  }
+
+  /**
+   * The ordinary host: read-only scan (by default an empty list), run GET with the embedded status,
+   * the standalone status route, and the unlock describe route. The two scope entries hit the same
+   * `/api/w2m/backup/run` route the four existing operations use.
+   */
+  function standardBackupHost(options = {}) {
+    const statusBody = { ok: true, repository: { root: 'D:\\BackUP', initialized: true, counts: { snapshots: 1 }, free_bytes: 1_048_576 } };
+    const scanBody = options.scanBody ?? { ok: true, sessions: [], totals: { sessions: 0 }, registry: { ok: true } };
+    const runPost = options.runPost ?? (() => ({ ok: true, snapshot_id: 'snap-scope', sessions: 1, files: 2, blocks_new: 1, blocks_reused: 0, duration_ms: 10 }));
+    return ({ url, method }) => {
+      if (url === '/api/w2m/backup/scan?detail=1') return scanBody;
+      if (url === '/api/w2m/backup/run') {
+        if (method === 'POST') return runPost();
+        return { ok: true, enabled: true, backup_dir: 'D:\\BackUP', schedule: { times: ['22:00:00'], time_zone: 'UTC' }, status: statusBody, state: { running: false } };
+      }
+      if (url === '/api/w2m/backup/status') return statusBody;
+      if (url === '/api/w2m/backup/unlock') return { ok: true, initialized: true, envelopes: ['machine'], machine_available: true, machine_reason: null, password_required: false };
+      return undefined;
+    };
+  }
+
+  /** Three sessions whose mix covers archived / unregistered, as the read-only scan reports them. */
+  function scanSessionsBody() {
+    return {
+      ok: true,
+      read_only: true,
+      scanned_at: '2026-11-17T10:00:00.000Z',
+      sessions: [
+        { session_id: 'sess-alpha-0001', workspace: 'proj-a', size: 2048, flags: { registered: true, archived: false } },
+        { session_id: 'sess-beta-0002', workspace: 'proj-b', size: 4096, flags: { registered: true, archived: true } },
+        { session_id: 'sess-gamma-0003', workspace: 'proj-c', size: 8192, flags: { registered: false, archived: false } },
+      ],
+      totals: { sessions: 3 },
+      registry: { ok: true, workspaces: 3, registered: 2, archived: 1, pinned: 0 },
     };
   }
 
@@ -1750,6 +1847,225 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
     handle.unmount();
   });
 
+  it('renders the two backup-scope entries and disables them until the read-only scan resolves', () => {
+    const { bundle } = mountBackup();
+    const t = bundle.exports.makeTranslator(() => undefined);
+    // Before the scan resolves the card is present (loading), the two action markers exist, both are
+    // disabled, and there is nothing to tick: a slow/failed scan can never take the panel down.
+    const before = bundle.exports.BackupPanelView(viewProps());
+    for (const action of ['backup-selected', 'backup-active']) {
+      assert.ok(actionButton(before, action) !== undefined, `the ${action} scope entry is rendered`);
+      assert.equal(actionButton(before, action).props.disabled, true, `${action} waits for the scan`);
+    }
+    assert.equal(findBy(before, (node) => node.props?.['data-w2m-backup-panel'] === 'scope').length, 1,
+      'the scope card itself renders, in a neutral state');
+    assert.equal(findBy(before, (node) => node.props?.['data-w2m-backup-pick'] !== undefined).length, 0);
+    assert.ok(collectText(before).join('\n').includes('panel.backup.pick.loading'));
+
+    const scan = {
+      available: true,
+      total: 3,
+      sessions: [
+        { session_id: 'sess-a', workspace: 'proj-a', size: 10, archived: false, registered: true },
+        { session_id: 'sess-b', workspace: 'proj-b', size: 20, archived: true, registered: true },
+        { session_id: 'sess-c', workspace: 'proj-c', size: 30, archived: false, registered: false },
+      ],
+    };
+    // After a successful scan: 'selected' still needs a tick, 'active' needs none.
+    const after = bundle.exports.BackupPanelView(viewProps({ scan, picked: [] }));
+    const markers = findBy(after, (node) => node.props?.['data-w2m-backup-action'] !== undefined)
+      .map((node) => node.props['data-w2m-backup-action']);
+    assert.ok(['run', 'restore', 'archive', 'verify'].every((action) => markers.includes(action)),
+      'the existing four operations stay beside the two scope entries');
+    assert.equal(actionButton(after, 'backup-selected').props.disabled, true, 'selected needs at least one tick');
+    assert.equal(actionButton(after, 'backup-active').props.disabled, false, 'active needs no selection');
+    assert.deepEqual(
+      findBy(after, (node) => node.props?.['data-w2m-backup-pick'] !== undefined).map((node) => node.props['data-w2m-backup-pick']),
+      ['sess-a', 'sess-b', 'sess-c'],
+      'one pick checkbox per scanned session, in host order',
+    );
+    assert.equal(actionButton(bundle.exports.BackupPanelView(viewProps({ scan, picked: ['sess-a'] })), 'backup-selected').props.disabled, false,
+      'one tick is enough for the selected entry');
+
+    // The count line goes through the dictionary with both numbers, and the archived tag is shown.
+    const real = bundle.exports.BackupPanelView(viewProps({ t, scan, picked: ['sess-a', 'sess-b'] }));
+    assert.ok(collectText(real).join('\n').includes('已选 2/3'), 'the count line reads 已选 {n}/{m}');
+    assert.ok(collectText(real).join('\n').includes('已归档'), 'an archived session carries the archived tag');
+    const archivedBox = findBy(real, (node) => node.type === 'input' && node.props?.['data-w2m-backup-pick'] === 'sess-b')[0];
+    assert.equal(archivedBox.props.checked, true, 'the checked archived session is listed like any other');
+
+    // Long ids are shortened for display; the full id stays available as the title tooltip.
+    const longId = 'session-20261117-abcdef123456';
+    const longScan = { available: true, total: 1, sessions: [{ session_id: longId, workspace: 'proj', size: 1, archived: false, registered: true }] };
+    const longTree = bundle.exports.BackupPanelView(viewProps({ scan: longScan }));
+    const suffix = findBy(longTree, (node) => node.props?.title === longId)[0];
+    assert.ok(String(suffix?.children?.[0] ?? '').startsWith('…'), 'the list shows the id suffix, not the whole id');
+
+    // Busy state: all six operations disabled, and the label names the operation that is running.
+    const busyTree = bundle.exports.BackupPanelView(viewProps({ scan, picked: ['sess-a'], busy: 'backup-selected' }));
+    const operations = findBy(busyTree, (node) => node.type === 'button'
+      && ['run', 'restore', 'archive', 'verify', 'backup-selected', 'backup-active'].includes(node.props?.['data-w2m-backup-action']));
+    assert.equal(operations.length, 6);
+    for (const node of operations) assert.equal(node.props.disabled, true, 'an in-flight operation disables its five siblings');
+    assert.equal(String(actionButton(busyTree, 'backup-selected').children[0]), 'panel.backup.busy.backupSelected',
+      'the running entry says what it is doing, not what it would do');
+    assert.equal(String(actionButton(busyTree, 'backup-active').children[0]), 'panel.backup.action.backupActive',
+      'the idle entry keeps its action label');
+  });
+
+  it('normalizes the read-only scan defensively: any failure is an unavailable state, never a throw', () => {
+    const { exports } = loadBundle();
+    for (const result of [
+      undefined,
+      null,
+      { ok: false, http: false, routeMissing: true },
+      { ok: true, body: null },
+      { ok: true, body: { ok: true } },
+      { ok: true, body: { ok: true, sessions: 'not-a-list' } },
+    ]) {
+      const scan = exports.normalizeBackupScan(result);
+      assert.equal(scan.available, false, 'a missing/failed scan is reported as unavailable');
+      // Host-realm Array.from: the bundle's arrays come from the vm realm, and deepStrictEqual would
+      // reject them on the prototype alone even though the values match.
+      assert.deepEqual(Array.from(scan.sessions), []);
+      assert.equal(scan.total, 0);
+    }
+    assert.equal(exports.normalizeBackupScan({ ok: false, routeMissing: true }).routeMissing, true,
+      'a 404 stays distinguishable from a payload the host did not send');
+    const scan = exports.normalizeBackupScan({
+      ok: true,
+      body: {
+        ok: true,
+        sessions: [
+          { session_id: 'sess-a', workspace: 'proj-a', size: 10, flags: { registered: true, archived: false } },
+          null,
+          { session_id: 42 },
+          { session_id: '', workspace: 'x' },
+          { session_id: 'sess-b', size: 'not-a-number', flags: null },
+        ],
+        totals: { sessions: 9 },
+      },
+    });
+    assert.equal(scan.available, true);
+    assert.deepEqual(Array.from(scan.sessions, (row) => row.session_id), ['sess-a', 'sess-b'], 'malformed rows are dropped');
+    assert.equal(scan.sessions[0].archived, false);
+    assert.equal(scan.sessions[1].size, null);
+    assert.equal(scan.sessions[1].workspace, '');
+    assert.equal(scan.total, 9, 'the host total is kept when it is a finite number');
+    assert.equal(exports.BACKUP_SCAN_ROUTE, '/api/w2m/backup/scan', 'the panel reads the mounted read-only route');
+  });
+
+  it('drives the read-only scan and the two backup-scope entries through the run contract', async () => {
+    const { handle, requests, unexpected, settle } = mountBackupPage(standardBackupHost({ scanBody: scanSessionsBody() }));
+    await settle();
+    assert.deepEqual(unexpected, [],
+      'the first render reads only the status/run/unlock/scan routes the panel knows');
+    const pickBoxes = () => findBy(handle.tree, (node) => node.type === 'input' && node.props?.['data-w2m-backup-pick'] !== undefined);
+    const pickCount = () => findBy(handle.tree, (node) => node.props?.['data-w2m-backup-pick-count'] === 'true')[0];
+    const click = (node) => { node.props.onClick(); };
+    assert.deepEqual(pickBoxes().map((node) => node.props['data-w2m-backup-pick']),
+      ['sess-alpha-0001', 'sess-beta-0002', 'sess-gamma-0003'], 'the scan list reaches the card');
+    assert.equal(pickCount().children[0], '已选 0/3');
+
+    // Select-all / clear move the count line (both operate on the scanned list only).
+    click(findBy(handle.tree, (node) => node.props?.['data-w2m-backup-pick-all'] === 'true')[0]);
+    handle.rerender();
+    assert.equal(pickCount().children[0], '已选 3/3', 'select-all ticks the whole scanned list');
+    assert.deepEqual(pickBoxes().map((node) => node.props.checked), [true, true, true]);
+    click(findBy(handle.tree, (node) => node.props?.['data-w2m-backup-pick-clear'] === 'true')[0]);
+    handle.rerender();
+    assert.equal(pickCount().children[0], '已选 0/3', 'clear empties the selection');
+    assert.deepEqual(pickBoxes().map((node) => node.props.checked), [false, false, false]);
+
+    // Tick two specific sessions, then run scope=selected: exactly those ids, no other scope.
+    for (const id of ['sess-beta-0002', 'sess-gamma-0003']) {
+      pickBoxes().find((node) => node.props['data-w2m-backup-pick'] === id).props.onChange();
+    }
+    handle.rerender();
+    assert.equal(pickCount().children[0], '已选 2/3');
+    const posts = () => requests.filter((request) => request.url === '/api/w2m/backup/run' && request.method === 'POST').map((request) => request.body);
+    const scanReads = () => requests.filter((request) => request.url.startsWith('/api/w2m/backup/scan')).length;
+    const scansBefore = scanReads();
+    click(actionButton(handle.tree, 'backup-selected'));
+    await settle();
+    let bodies = posts();
+    assert.equal(bodies.length, 1, 'the selected entry posts exactly one run body');
+    // Order-insensitive: the run body carries the two ticked ids in some order (the panel keeps the
+    // operator's tick order), and nothing else in the body may differ from the host contract.
+    assert.deepEqual({ ...bodies[0], selected: Array.from(bodies[0].selected).sort() }, {
+      confirm: 'run',
+      scope: 'selected',
+      selected: ['sess-beta-0002', 'sess-gamma-0003'].sort(),
+    }, 'the run body carries the confirm token, scope selected, and exactly the ticked ids');
+    assert.equal(new Set(bodies.map((body) => body.scope)).size, 1, 'no other scope is sent by the selected entry');
+    assert.ok(scanReads() > scansBefore, 'the selected run refreshes the read-only session list afterwards');
+    assert.ok(requests.filter((request) => request.url === '/api/w2m/backup/run' && request.method === 'GET').length >= 2,
+      'the selected run refreshes the status afterwards');
+
+    // The active-scope entry needs no selection and sends scope=active only.
+    click(actionButton(handle.tree, 'backup-active'));
+    await settle();
+    bodies = posts();
+    assert.equal(bodies.length, 2);
+    assert.deepEqual(bodies[1], { confirm: 'run', scope: 'active' });
+
+    // The pre-existing run is untouched: still scope=all with exactly the old body.
+    click(actionButton(handle.tree, 'run'));
+    await settle();
+    bodies = posts();
+    assert.equal(bodies.length, 3);
+    assert.deepEqual(bodies[2], { confirm: 'run', scope: 'all' });
+    assert.deepEqual(unexpected, [], 'no operation invented a route');
+    handle.unmount();
+  });
+
+  it('renders the neutral unavailable state for a host without the scan route, without blocking the panel', async () => {
+    const host = standardBackupHost();
+    const { handle, settle, text } = mountBackupPage(({ url, method }) => (
+      url === '/api/w2m/backup/scan?detail=1' ? { status: 404 } : host({ url, method })
+    ));
+    await settle();
+    assert.equal(findBy(handle.tree, (node) => node.props?.['data-w2m-backup-scan-state'] === 'unavailable').length, 1,
+      'a missing scan route is a stated neutral state');
+    assert.ok(text().includes('该宿主未启用备份路由或扫描失败'), 'the hint names the cause and stays actionable');
+    assert.ok(text().includes('刷新会话'), 'the retry entry is visible in the same card');
+    // A missing read route must not take the write entries away: run/active stay usable, selected cannot.
+    assert.equal(actionButton(handle.tree, 'run').props.disabled, false);
+    assert.equal(actionButton(handle.tree, 'backup-active').props.disabled, false);
+    assert.equal(actionButton(handle.tree, 'backup-selected').props.disabled, true);
+    handle.unmount();
+  });
+
+  it('renders the empty hint when the scan reports no sessions', async () => {
+    const { handle, settle, text } = mountBackupPage(standardBackupHost());
+    await settle();
+    assert.equal(findBy(handle.tree, (node) => node.props?.['data-w2m-backup-scan-state'] === 'empty').length, 1);
+    assert.ok(text().includes('没有可备份的会话'));
+    assert.equal(findBy(handle.tree, (node) => node.props?.['data-w2m-backup-pick'] !== undefined).length, 0);
+    assert.equal(actionButton(handle.tree, 'backup-selected').props.disabled, true);
+    assert.equal(actionButton(handle.tree, 'backup-active').props.disabled, false);
+    handle.unmount();
+  });
+
+  it('shows the host reason text when a scope run is refused, instead of throwing', async () => {
+    const { handle, settle, text } = mountBackupPage(standardBackupHost({
+      scanBody: scanSessionsBody(),
+      runPost: () => ({ ok: false, reason_code: 'BACKUP_SCOPED_NOTHING', detail: 'no active sessions' }),
+    }));
+    await settle();
+    const box = findBy(handle.tree, (node) => node.type === 'input' && node.props?.['data-w2m-backup-pick'] === 'sess-alpha-0001')[0];
+    assert.ok(box !== undefined, 'the scanned session is tickable');
+    box.props.onChange();
+    handle.rerender();
+    actionButton(handle.tree, 'backup-selected').props.onClick();
+    await settle();
+    assert.equal(findBy(handle.tree, (node) => node.props?.['data-w2m-backup-panel'] === 'error').length, 1,
+      'a refusal is rendered as the named reason, not as an exception');
+    assert.ok(text().includes('选定范围内没有可备份的会话'), 'the stable reason code is translated for the operator');
+    assert.ok(text().includes('no active sessions'), 'the host detail stays visible');
+    handle.unmount();
+  });
+
   it('registers panel.backup.* strings in both the Chinese and English dictionaries', () => {
     const { exports } = loadBundle();
     const registry = makeRegistry();
@@ -1770,6 +2086,23 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
       'panel.backup.verify.runtime',
       'panel.backup.verify.runtimeCounts',
       'panel.backup.verify.runtimeHint',
+      // v3.5.0: the two backup-scope entries and the read-only scan card around them.
+      'panel.backup.action.backupSelected',
+      'panel.backup.action.backupActive',
+      'panel.backup.scope.hint',
+      'panel.backup.pick.title',
+      'panel.backup.pick.count',
+      'panel.backup.pick.selected',
+      'panel.backup.pick.clear',
+      'panel.backup.pick.refresh',
+      'panel.backup.pick.loading',
+      'panel.backup.pick.unavailable',
+      'panel.backup.pick.empty',
+      'panel.backup.pick.archivedTag',
+      'panel.backup.busy.backupSelected',
+      'panel.backup.busy.backupActive',
+      'panel.backup.log.backupSelected',
+      'panel.backup.log.backupActive',
     ];
     for (const key of keys) {
       assert.equal(typeof dictionary.zh[key], 'string', `the zh dictionary has ${key}`);
@@ -1781,6 +2114,16 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
       'the hint is translated, not copied');
     assert.equal(dictionary.zh['panel.backup.reason.BACKUP_NO_PERMISSION'], '没有权限：请用原账户登录，或输入解锁密码');
     assert.notEqual(dictionary.zh['panel.backup.title'], dictionary.en['panel.backup.title'], 'both languages are real translations');
+    assert.equal(dictionary.zh['panel.backup.pick.count'], '已选 {n}/{m}', 'the count copy keeps both placeholders');
+    assert.equal(dictionary.zh['panel.backup.action.backupSelected'], '备份选中会话');
+    assert.equal(dictionary.zh['panel.backup.action.backupActive'], '备份所有当前活动会话');
+    assert.notEqual(dictionary.zh['panel.backup.action.backupSelected'], dictionary.en['panel.backup.action.backupSelected'],
+      'the scope entry labels are translated, not copied');
+    assert.notEqual(dictionary.zh['panel.backup.scope.hint'], dictionary.en['panel.backup.scope.hint'],
+      'the scope hint explains selected vs active vs all in both languages');
+    assert.ok(dictionary.en['panel.backup.scope.hint'].includes('active'), 'the English hint names the active scope');
+    assert.ok(dictionary.zh['panel.backup.scope.hint'].includes('已归档'), 'the Chinese hint names the archived difference of scope all');
+    assert.equal(dictionary.zh['panel.backup.pick.archivedTag'], '已归档');
     const mapped = Object.keys(exports.BACKUP_REASON_KEYS);
     assert.ok(mapped.length >= 20, 'the reason-code map covers the host codes');
     for (const code of mapped) {
