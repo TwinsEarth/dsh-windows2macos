@@ -508,6 +508,23 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
         };
       `);
       report.backupProbe = { backupOpened, backupPanel };
+      // v3.4.9: the four one-click handlers must be wired even when the row is disabled: each click attempts its
+      // route, gets the route-missing refusal, and records it in the log area without taking the page down.
+      const backupClicks = [];
+      for (const action of ['run', 'restore', 'archive', 'verify']) {
+        const clicked = await read(`const b=document.querySelector('[data-w2m-backup-action="${action}"]'); if(b===null)return{action:'${action}',clicked:false}; b.click(); return{action:'${action}',clicked:true};`);
+        await new Promise((resolve) => setTimeout(resolve, 700));
+        backupClicks.push(clicked);
+      }
+      const backupLog = await read(`
+        const rows=[...document.querySelectorAll('.w2mBackup_logRow')];
+        return {
+          rows: rows.length,
+          text: rows.map((row) => row.innerText).join(' | ').slice(0, 400),
+          panelStillOpen: document.querySelector('[data-w2m-backup-panel]')!==null,
+        };
+      `);
+      report.backupProbe = { backupOpened, backupPanel, backupClicks, backupLog };
       await evaluate(`
         (async () => {
           const r = await fetch('/api/w2m/decisions?includeArchived=1');

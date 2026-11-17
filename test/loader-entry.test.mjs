@@ -730,6 +730,13 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
           `the backup panel renders the ${action} one-click operation (actions: ${JSON.stringify(backup.backupPanel?.actions)})`,
         );
       }
+      assert.deepEqual(
+        (backup.backupClicks ?? []).map((row) => row.clicked),
+        [true, true, true, true],
+        'every one-click operation is clickable in the real page',
+      );
+      assert.equal(backup.backupLog?.rows >= 4, true, `each click records a log row (rows: ${backup.backupLog?.rows}, text: ${backup.backupLog?.text})`);
+      assert.equal(backup.backupLog?.panelStillOpen, true, 'the panel stays mounted after route refusals');
       if (parity.rightTab?.marker === '1') {
         assert.equal(parity.rightTab.marker, '1');
       } else {

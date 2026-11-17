@@ -43,6 +43,13 @@ All notable changes to this project are documented here.
 
 ### 面板与侧边栏入口（v3.4.9）
 
+- **复盘加固（同日）**：① 真实 Chromium E2E 从"只验证入口/标记存在"加强为"**逐个点击四类一键操作**"——
+  每个按钮都真实点击、路由缺失时在日志区留下记录、面板保持挂载（loader-entry 10/10 通过）；② 核对面板的
+  `/api/w2m/backup/status` 回退确实由插件根（`src/plugin/tools.mjs`）常驻注册，不是死链；③ 更正措辞：
+  `restore --apply` **已**按 `keep_pre_restore`（默认 10）保留最新预还原副本并报告 `pruned_pre_restore`，
+  失败路径不清理；④ 明确边界：面板"全量校验"目前走静态全套 + 宿主 `runtime_verified` 计数，`?runtime=1`
+  的运行时终审已由宿主支持但面板尚无开关（下一次 UI 迭代再加，避免把分钟级操作做成默认）。
+
 - `lib/client.js` 新增「备份&还原」面板，与 GPW 同构：`sidebar.panellist`（id `w2m-backup`，order 6）+ `main`
   （key `w2m-backup`）。状态条（仓库/快照/计划/上次结果/注册表复查）、四类一键操作（立即备份、还原选中、
   归档打包、全量校验）、还原计划卡（new/identical/differs + 勾选 + 二次危险确认）、解锁卡（本机信封按钮 +
