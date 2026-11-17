@@ -56,6 +56,11 @@
  * get.
  */
 
+// v3.5.0: the version-drift block is additive data on the same snapshot. Imported rather than
+// re-derived so the composer's dashboard and the dispatch gate use one definition of "below the
+// minimum" (a second comparator is exactly how two surfaces start disagreeing).
+import { MIN_SUPPORTED_PLUGIN_VERSION, summarizeVersionDashboard } from './version-gate.mjs';
+
 /**
  * Both routes hang off this exact path; the browser half reads the same constant.
  *
@@ -549,8 +554,10 @@ export async function probeRelays(urls, options = {}) {
  * @param {object} deps
  * @param {object} deps.store A selection store.
  * @param {string} deps.sessionId The session the control belongs to.
- * @param {{ok: boolean, error: string|null, machines: object[], online: number, total: number,
- *          rabbit_time: string|null, excluded: number}} deps.fleet Output of {@link readFleet}.
+ * @param {{ok: boolean, error: string|null, machines: object[], records?: object[], online: number,
+ *          total: number, rabbit_time: string|null, excluded: number}} deps.fleet Output of
+ *   {@link readFleet}. `records` (the relay's own device records, caps included) feeds the v3.5.0
+ *   version block; a caller that omits it still gets every pre-existing field unchanged.
  * @param {string|null} deps.localMachineName This machine's configured fleet name.
  * @param {boolean} deps.detailUnavailable True when the host provides no fetch-route registry.
  * @returns {object}
@@ -582,6 +589,18 @@ export function buildUiState(deps) {
       excluded: fleet?.excluded ?? 0,
       rabbit_time: fleet?.rabbit_time ?? null,
     },
+    /**
+     * v3.5.0: the fleet version block, additive beside the existing fields.
+     *
+     * `fleet.records` is the relay's own roster (including a stale lease), which is what a "which
+     * machines need upgrading" card should show; the dispatch gate separately grades only the
+     * machines a dispatch would use. `all_current: false` for an unreadable fleet: an empty
+     * distribution from a failed read is not evidence that every machine is current, and a panel
+     * that showed the header reassuringly in that state would be lying at exactly the wrong moment.
+     */
+    versions: fleet?.ok === true
+      ? summarizeVersionDashboard(fleet.records)
+      : { supported_min: MIN_SUPPORTED_PLUGIN_VERSION, distribution: {}, outdated: [], unknown: [], all_current: false },
     host: {
       local_machine_name: localMachineName,
       // True when the host process has no Connection fetch registry at all: the control is rendered

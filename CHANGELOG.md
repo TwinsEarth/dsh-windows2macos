@@ -4,6 +4,42 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### v3.5.0 版本治理、保留策略与异地副本（未发布）
+
+- **A 最低版本门禁（`MACHINE_VERSION_UNSUPPORTED`）**：新增 `src/plugin/version-gate.mjs`——唯一常量
+  `MIN_SUPPORTED_PLUGIN_VERSION = '3.5.0'`、semver 比较器（支持 `x.y.z` 与预发布后缀；无法解析一律按 unknown，
+  绝不猜相等）与纯决策 `evaluateVersionGate`。`w2m_run` 在 POST 前读一次 relay 名册（与 narrowed-target 预检
+  共用），对**本次派发会用到的在线机器**逐个判定：低于基线或版本不可读 → 整单拒绝，`detail.machines` 逐一列出
+  `machine_id` / `version` / 原因码（`MACHINE_VERSION_OUTDATED` / `MACHINE_VERSION_UNKNOWN`）与 `supported_min`。
+  `allowOutdated: true` 显式覆盖：结果含 `outdated_allowed` 与 `version_gate.audit`（逐机原因码），并留一条 host
+  警告日志；只读工具（`w2m_devices`/`w2m_stats`）永不拒绝。门禁只在构建自身版本 ≥ 基线时生效（3.4.x 构建不拦截，
+  紧急回滚不会被自己的规则拒绝）；测试用 `W2M_PLUGIN_VERSION` 激活（与 updater 同一机制）。
+- **B 版本漂移看板数据**：`summarizeVersionDashboard` 纯函数输出 `{supported_min, distribution, outdated, unknown,
+  all_current}`；`w2m_devices` 与 `GET /api/w2m/target` 增量携带 `versions` 块（既有 `version_drift`/`machines`/
+  `fleet` 字段不变；名册读取失败时 `all_current:false`）。面板「编队版本」卡片 UI 不在本次（`lib/client.js` 属
+  UI 半，另行实现）。
+- **C 保留策略（份数 + 天数同时生效）**：`rotation.selectPrunable(records,{keep,maxAgeDays,now})` 纯函数；
+  `pruneOldVersions`/`rotateForEntry` 支持 `maxAgeDays`（与 `keep` **同时生效**："最新但超 N 天"仍按天剪除，
+  "N 天内但超出最新 N 份"仍按份数剪除；0/缺省 = 仅份数；非法值 `BACKUP_ROTATION_POLICY_INVALID` 写盘前拒绝）。
+  `gc({maxOldVersionDays})`、CLI `run/gc --max-old-days <n>`、插件配置 `backupOldVersionDays` 全链路接线；
+  gc 的 `BACKUP_GC_UNSAFE` 规则与"先收集全部引用、再删块、最后剪旧记录"的顺序不变——仍被快照/current/old 引用的
+  块永不删除，同一次 gc 中被剪掉的记录不会让它的块在同一次运行里被误删。
+- **D 异地副本**：新增 `src/backup/mirror.mjs`。`runBackup({mirrorRoot})` 在提交且轮转成功后，把本次快照引用的
+  密封块（**只补缺失**）、`snapshots/<id>/{manifest.json,keys.json}`、仓库描述与信封元数据复制到镜像，并按
+  `snapshot_id` 幂等追加镜像 `index.jsonl`；文件复制走 `atomic.writeFileAtomic`，**明文永不复制**。
+  镜像路径在仓库内 / `$DSH_HOME` 内 / 等于仓库根 / 是文件 → 写盘前拒绝 `BACKUP_MIRROR_INVALID`（零提交）；
+  运行期复制失败**不回滚**已提交备份：`ok:true` + `mirror:{ok:false, reason_code, reason, copied}` + `warnings`，
+  下次成功同步自动补齐。CLI `run --mirror <dir>`、插件配置 `backupMirrorDir`。
+- **测试**：新增 `test/fleet-version-gate.test.mjs`（比较器/预发布边界/决策/看板/派发路径/覆盖审计/只读面不被拒/
+  未激活构建不拦截）与 `test/backup-mirror.test.mjs`（只补缺失+幂等/索引只追加一次/镜像路径拒绝/失败不回滚/
+  镜像侧 `openRepo`+`rebuildFile` 完整性）；扩展 `test/backup-rotation.test.mjs`、`test/backup-gc.test.mjs`、
+  `test/backup-run.test.mjs`；`package.json#scripts.test`/`test:all` 与 `test/backup-wiring.test.mjs` 套件清单同步。
+- **文档**：`docs/BACKUP-DESIGN.md` §21（保留策略与异地副本协议、优先级、幂等与失败语义）、
+  `docs/DEV-PLAN-3.4.6-3.5.0.md` 实施记录（A–D 已交付、UI 延期）、`FLEET-RULES.md` §9（门禁规则）。
+- **诚实边界**：异地副本是**加法**——不做跨镜像去重（每个镜像独立持有一份密封块），未做 Relay/云端传输
+  （Phase 3），未做镜像侧 `current/old` 视图与镜像 gc；面板「编队版本」卡片 UI 未做；Relay Phase 2 合并是
+  **独立评审线**，不在本条交付内；本次不 bump 版本号、不跑 preflight、不提交。
+
 ### G4 seq 重编号工具（删/插事件的唯一合法方式，v3.4.8 补全）
 
 - **新增 `src/backup/renumber.mjs`（G4 收口）**：`renumberBuffer(buffer,{deleteSeqs,insert})` 纯内存完成

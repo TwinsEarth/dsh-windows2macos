@@ -164,6 +164,8 @@ function usage() {
     '  --scope <s>         run: all | active | archived | selected (default: all)',
     '  --session <id>      run --scope selected: a session id to include (repeatable)',
     '  --keep-old <n>      old versions kept per session (default: 10)',
+    '  --max-old-days <n>  run/gc: also prune old version records older than N days (0 = per-session count only)',
+    '  --mirror <dir>      run: copy the sealed blocks and snapshot metadata to this offsite directory',
     '  --dry-run           run/gc: report what would happen, write nothing',
     '  --snapshot <id>     verify/archive/restore: a specific snapshot (default: the latest)',
     '  --archive <file>    restore: read the session bytes from a .tar.zst archive instead of the repository',
@@ -202,6 +204,8 @@ export function parseArgs(argv, env = process.env) {
     scope: null,
     selected: [],
     keepOld: null,
+    maxOldDays: null,
+    mirror: null,
     dryRun: false,
     passwordStdin: false,
     noMachineKey: false,
@@ -247,6 +251,18 @@ export function parseArgs(argv, env = process.env) {
     else if (arg.startsWith('--snapshot=')) options.snapshot = arg.slice('--snapshot='.length);
     else if (arg.startsWith('--archive=')) options.archiveFile = arg.slice('--archive='.length);
     else if (arg.startsWith('--workspace-path=')) options.workspacePath = path.resolve(arg.slice('--workspace-path='.length));
+    else if (arg.startsWith('--max-old-days=')) {
+      const raw = arg.slice('--max-old-days='.length);
+      const value = Number(raw);
+      if (raw.trim() === '' || !Number.isSafeInteger(value) || value < 0) {
+        return { ...options, error: `--max-old-days needs a non-negative integer, got ${JSON.stringify(raw)}` };
+      }
+      options.maxOldDays = value;
+    } else if (arg.startsWith('--mirror=')) {
+      const raw = arg.slice('--mirror='.length);
+      if (raw.trim() === '') return { ...options, error: '--mirror needs a directory' };
+      options.mirror = path.resolve(raw);
+    }
     else if (arg === '--scope') options.scope = rest.shift() ?? null;
     else if (arg === '--session') options.selected.push(rest.shift() ?? '');
     else if (arg === '--keep-old') {
@@ -254,6 +270,17 @@ export function parseArgs(argv, env = process.env) {
       const value = Number(raw);
       if (!Number.isSafeInteger(value) || value < 0) return { ...options, error: `--keep-old needs a non-negative integer, got ${JSON.stringify(raw)}` };
       options.keepOld = value;
+    } else if (arg === '--max-old-days') {
+      const raw = rest.shift() ?? '';
+      const value = Number(raw);
+      if (raw.trim() === '' || !Number.isSafeInteger(value) || value < 0) {
+        return { ...options, error: `--max-old-days needs a non-negative integer, got ${JSON.stringify(raw)}` };
+      }
+      options.maxOldDays = value;
+    } else if (arg === '--mirror') {
+      const raw = rest.shift() ?? '';
+      if (raw.trim() === '') return { ...options, error: '--mirror needs a directory' };
+      options.mirror = path.resolve(raw);
     } else if (arg === '--help' || arg === '-h') options.command = 'help';
     else if (arg === '--dsh-home') options.dshHome = path.resolve(rest.shift() ?? options.dshHome);
     else if (arg === '--backup-dir') options.backupDir = path.resolve(rest.shift() ?? '');
@@ -373,6 +400,22 @@ export function formatRun(result) {
   lines.push(`blocks        : ${result.blocks_new} new, ${result.blocks_reused} reused (dedupe ${(result.dedupe_ratio * 100).toFixed(0)}%)`);
   lines.push(`bytes         : read ${humanBytes(result.bytes_read)}, written ${humanBytes(result.bytes_written)}`);
   if (result.rotated !== undefined) lines.push(`rotated       : ${result.rotated} old version(s) recorded`);
+  if (result.keep_old_per_session !== undefined) {
+    lines.push(
+      `retention     : keep ${result.keep_old_per_session} old version(s) per session` +
+        (result.max_old_version_days > 0 ? `, no record older than ${result.max_old_version_days} day(s)` : ' (age rule off)'),
+    );
+  }
+  if (result.mirror !== undefined) {
+    if (result.mirror.ok === true) {
+      lines.push(
+        `mirror        : ${result.mirror.root} (${result.mirror.copied.files} file(s), ${humanBytes(result.mirror.copied.bytes)} copied, ` +
+          `${result.mirror.skipped.files} already present${result.mirror.index_appended === true ? ', index line appended' : ''})`,
+      );
+    } else {
+      lines.push(`mirror        : FAILED ${result.mirror.reason_code} — ${result.mirror.reason ?? 'the copy failed'} (the primary repository is committed)`);
+    }
+  }
   if (result.unlocked_via !== undefined) {
     lines.push(`unlocked via  : ${result.unlocked_via}${result.key_created === true ? ' (repository key created)' : ''}`);
   }
@@ -401,6 +444,7 @@ export function formatRun(result) {
   if (Array.isArray(result.invalid_containers) && result.invalid_containers.length > 0) {
     lines.push(`invalid logs  : ${result.invalid_containers.map((row) => row.rel).join(', ')}`);
   }
+  for (const warning of result.warnings ?? []) lines.push(`warning       : ${warning}`);
   lines.push(`duration      : ${result.duration_ms} ms`);
   if (Array.isArray(result.unknown_selected) && result.unknown_selected.length > 0) {
     lines.push(`unknown ids   : ${result.unknown_selected.join(', ')}`);
@@ -438,6 +482,7 @@ export function formatGc(result) {
   const lines = ['w2m-backup gc', ''];
   if (result.safe !== true) {
     lines.push(`refused       : ${result.reason_code} — ${result.problems.length} unreadable reference(s); nothing was deleted`);
+    if (result.detail !== undefined) lines.push(`detail        : ${result.detail}`);
     for (const problem of result.problems.slice(0, 10)) lines.push(`  ${problem.file}: ${problem.detail}`);
     return lines.join('\n');
   }
@@ -445,6 +490,7 @@ export function formatGc(result) {
   lines.push(`references    : ${result.references.blocks} block(s) from ${result.references.snapshots} snapshot(s), ${result.references.old} old version(s), ${result.references.current} current pointer(s)`);
   lines.push(`blocks        : ${result.blocks.scanned} scanned, ${result.blocks.removed} removed, ${result.blocks.kept} kept (${humanBytes(result.blocks.reclaimed_bytes)} reclaimed)`);
   lines.push(`old versions  : ${result.old_versions.pruned} pruned by the retention window`);
+  if (result.old_versions?.pruned_by_age !== undefined) lines.push(`old by age    : ${result.old_versions.pruned_by_age} pruned by the age rule`);
   if (result.tmp !== undefined) lines.push(`tmp leftovers : ${result.tmp.scanned} scanned, ${result.tmp.removed} removed (crashed writers)`);
   if (result.empty_prefixes_removed !== undefined && result.empty_prefixes_removed > 0) {
     lines.push(`empty prefixes: ${result.empty_prefixes_removed} removed`);
@@ -602,6 +648,8 @@ export function main(argv, io = {}) {
       scope: options.scope ?? 'all',
       selected: options.selected,
       keepOldPerSession: options.keepOld ?? undefined,
+      maxOldVersionDays: options.maxOldDays ?? undefined,
+      mirrorRoot: options.mirror ?? undefined,
       dryRun: options.dryRun,
       futureAppend: options.noFutureAppend === true ? false : undefined,
       runtimeFutureAppend: options.runtime === true,
@@ -633,6 +681,7 @@ export function main(argv, io = {}) {
       root: resolved.dir,
       dryRun: options.dryRun,
       keepOldPerSession: options.keepOld ?? undefined,
+      maxOldVersionDays: options.maxOldDays ?? undefined,
     });
     write(options.json ? JSON.stringify(result, null, 2) : formatGc(result));
     return result.ok === true ? 0 : 1;

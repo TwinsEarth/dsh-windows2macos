@@ -22,6 +22,11 @@
  *
  * `keepOldPerSession` (default 10) is enforced after every rotation, newest first. Pruning is part of rotation
  * rather than a separate chore so the window can never grow unobserved.
+ *
+ * An optional age window (`maxAgeDays`) can bound the records by time as well. **Both rules apply**: a record
+ * survives only if it is among the newest `keep` **and** not older than `maxAgeDays` days. A record inside the
+ * newest N but older than the window is pruned by age; a recent record beyond the newest N is pruned by count.
+ * `0`/absent disables the age rule explicitly (0 means "count rule only", never "prune everything").
  */
 
 import fs from 'node:fs';
@@ -44,10 +49,14 @@ export const CURRENT_VERSION = 1;
 /** Default number of old versions kept per session. */
 export const DEFAULT_KEEP_OLD = 10;
 
+/** Milliseconds in one day; the unit the age rule's `maxAgeDays` is expressed in. */
+const DAY_MS = 24 * 60 * 60 * 1000;
+
 /** Named rotation failures. */
 export const ROTATION_CODES = Object.freeze({
   ENTRY_INVALID: 'BACKUP_ROTATION_ENTRY_INVALID',
   WRITE_FAILED: 'BACKUP_ROTATION_WRITE_FAILED',
+  POLICY_INVALID: 'BACKUP_ROTATION_POLICY_INVALID',
 });
 
 /** A rotation failure with a stable code. */
@@ -174,13 +183,100 @@ export function listOldVersions(root, { workspace = null, sessionId = null } = {
 }
 
 /**
- * Enforce `keep` newest version records per session.
+ * Normalize the age half of the retention policy.
  *
- * @param {{root: string, keep?: number, dryRun?: boolean}} input
- * @returns {{kept: number, removed: Array<{file: string, session_id: string}>, failed: Array<{file: string, detail: string}>}}
+ * `undefined`, `null` and `0` all mean "the count rule only": 0 disables the age rule explicitly rather than
+ * meaning "prune everything", because a caller that passes 0 to turn a feature off must not get the most
+ * destructive possible reading of that value. A positive safe integer is the window in days; anything else
+ * (a negative number, a float, a string, NaN) is a policy error naming the value it refused.
+ *
+ * @param {unknown} value
+ * @returns {{ok: true, maxAgeDays: number} | {ok: false, reason_code: string, detail: string}}
+ */
+export function resolveMaxAgeDays(value) {
+  if (value === undefined || value === null) return { ok: true, maxAgeDays: 0 };
+  if (Number.isSafeInteger(value) && value >= 0) return { ok: true, maxAgeDays: value };
+  // `JSON.stringify` turns NaN/Infinity into `null` and a Symbol into undefined, none of which names the bad
+  // value; the fallback keeps the refusal readable instead of hiding what was actually passed.
+  const shown = typeof value === 'number' ? String(value) : (JSON.stringify(value) ?? String(value));
+  return {
+    ok: false,
+    reason_code: ROTATION_CODES.POLICY_INVALID,
+    detail: `maxAgeDays must be 0 (age rule disabled) or a positive integer number of days, got ${shown}`,
+  };
+}
+
+/**
+ * Decide which version records of ONE session survive the retention policy.
+ *
+ * Pure: no filesystem access and no deletion. `records` is one session's bucket in the shape
+ * `listOldVersions` returns (`{file, record}` rows, newest first); grouping is the caller's job because
+ * "newest N" is per session, not across the repository.
+ *
+ * **Both rules apply**, so a record survives only if it is among the newest `keep` rows **and** its
+ * `recorded_at` is not older than `maxAgeDays` days before `now`. A record inside the newest N but older than
+ * the window is pruned by age; a recent record beyond the newest N is pruned by count. A record whose
+ * `recorded_at` cannot be parsed is kept rather than age-pruned: an unreadable timestamp is not evidence that
+ * the version is old, and the count rule still bounds the bucket.
+ *
+ * @param {Array<{file: string, record: object}>} records newest first (as `listOldVersions` returns them)
+ * @param {{keep?: number, maxAgeDays?: number|null, now?: Date|number}} [options]
+ * @returns {{kept: Array<{file: string, record: object}>,
+ *   pruned: Array<{row: {file: string, record: object}, reason: 'count'|'age'}>}}
+ * @throws {RotationError} `BACKUP_ROTATION_POLICY_INVALID` for an invalid `maxAgeDays`/`now`
+ */
+export function selectPrunable(records, options = {}) {
+  const rows = Array.isArray(records) ? records : [];
+  const keep = Number.isSafeInteger(options.keep) && options.keep >= 0 ? options.keep : DEFAULT_KEEP_OLD;
+  const policy = resolveMaxAgeDays(options.maxAgeDays);
+  if (policy.ok !== true) throw new RotationError(policy.reason_code, policy.detail);
+  const nowValue = options.now ?? Date.now();
+  const nowMs = nowValue instanceof Date ? nowValue.getTime() : Number(nowValue);
+  if (!Number.isFinite(nowMs)) {
+    throw new RotationError(ROTATION_CODES.POLICY_INVALID, `now must be a Date or epoch milliseconds, got ${String(nowValue)}`);
+  }
+  // `cutoffMs === null` means the age rule is off. A record exactly at the cutoff is kept: the rule prunes
+  // records *older than* the window, and "one day old" at a one-day window is inside it.
+  const cutoffMs = policy.maxAgeDays > 0 ? nowMs - policy.maxAgeDays * DAY_MS : null;
+  const kept = [];
+  const pruned = [];
+  for (const [index, row] of rows.entries()) {
+    // Count first: a row beyond the newest N is pruned by the count rule whether or not it is also old, so a
+    // single reason (the first rule it violates) is enough to explain the decision.
+    if (index >= keep) {
+      pruned.push({ row, reason: 'count' });
+      continue;
+    }
+    if (cutoffMs !== null) {
+      const recordedMs = Date.parse(row?.record?.recorded_at ?? '');
+      if (Number.isFinite(recordedMs) && recordedMs < cutoffMs) {
+        pruned.push({ row, reason: 'age' });
+        continue;
+      }
+    }
+    kept.push(row);
+  }
+  return { kept, pruned };
+}
+
+/**
+ * Enforce the retention policy: the newest `keep` version records per session **and** the `maxAgeDays` window.
+ *
+ * Both rules apply (see {@link selectPrunable}); `0`/absent `maxAgeDays` keeps the historical count-only
+ * behaviour. Pruning is part of rotation rather than a separate chore so a window can never grow unobserved.
+ *
+ * @param {{root: string, keep?: number, maxAgeDays?: number|null, now?: Date|number, dryRun?: boolean}} input
+ * @returns {{kept: number, removed: Array<{file: string, session_id: string}>,
+ *   failed: Array<{file: string, detail: string}>, pruned_by_age: number}}
+ * @throws {RotationError} `BACKUP_ROTATION_POLICY_INVALID` for an invalid `maxAgeDays`, before reading anything
  */
 export function pruneOldVersions(input) {
   const keep = Number.isSafeInteger(input.keep) && input.keep >= 0 ? input.keep : DEFAULT_KEEP_OLD;
+  // Validate the policy before the walk: an invalid window is a configuration mistake, and it must be reported
+  // as one without first enumerating (and possibly refusing halfway through) the version tree.
+  const policy = resolveMaxAgeDays(input.maxAgeDays);
+  if (policy.ok !== true) throw new RotationError(policy.reason_code, policy.detail);
+  const now = input.now ?? Date.now();
   const bySession = new Map();
   for (const row of listOldVersions(input.root)) {
     const key = `${row.record.workspace}/${row.record.session_id}`;
@@ -191,13 +287,13 @@ export function pruneOldVersions(input) {
   const removed = [];
   const failed = [];
   let kept = 0;
+  let prunedByAge = 0;
   for (const rows of bySession.values()) {
     // `listOldVersions` returns newest first across the whole tree, so each bucket is already newest-first.
-    for (const [index, row] of rows.entries()) {
-      if (index < keep) {
-        kept += 1;
-        continue;
-      }
+    const decision = selectPrunable(rows, { keep, maxAgeDays: policy.maxAgeDays, now });
+    kept += decision.kept.length;
+    for (const { row, reason } of decision.pruned) {
+      if (reason === 'age') prunedByAge += 1;
       if (input.dryRun === true) {
         removed.push({ file: row.file, session_id: row.record.session_id });
         continue;
@@ -210,29 +306,63 @@ export function pruneOldVersions(input) {
       }
     }
   }
-  return { kept, removed, failed };
+  return { kept, removed, failed, pruned_by_age: prunedByAge };
 }
 
 /**
  * Rotate one session's version, then update its `current/` pointer.
  *
- * @param {{root: string, entry: object, snapshotId: string, keep?: number, now?: Date, dryRun?: boolean}} input
+ * The retention policy is applied right after the new record is written: `keep` bounds the count and
+ * `maxAgeDays` (when positive) bounds the age, and a record survives only if both rules accept it.
+ *
+ * @param {{root: string, entry: object, snapshotId: string, keep?: number, maxAgeDays?: number|null,
+ *   now?: Date, dryRun?: boolean}} input
  * @returns {{rotated: boolean, unchanged: boolean, previous_sha256: string|null, old_file: string|null,
- *   current_file: string, pruned: Array<object>}}
+ *   current_file: string, pruned: Array<object>, pruned_by_age: number}}
+ * @throws {RotationError} `BACKUP_ROTATION_ENTRY_INVALID` for an unusable entry, and
+ *   `BACKUP_ROTATION_POLICY_INVALID` for an invalid `maxAgeDays` (both before any write)
  */
 export function rotateForEntry(input) {
   const entry = requireEntry(input.entry);
+  // Validate the retention window before the first write: a bad policy must not write a version record and then
+  // fail in the prune that follows it. (`runBackup`/`gc` validate even earlier; this protects direct callers.)
+  const agePolicy = resolveMaxAgeDays(input.maxAgeDays);
+  if (agePolicy.ok !== true) throw new RotationError(agePolicy.reason_code, agePolicy.detail);
   const previous = readCurrent(input.root, entry);
   const currentFile = currentPath(input.root, entry);
   if (previous === null) {
     if (input.dryRun !== true) writeCurrentPointer({ root: input.root, entry, snapshotId: input.snapshotId, now: input.now });
-    return { rotated: false, unchanged: false, previous_sha256: null, old_file: null, current_file: currentFile, pruned: [] };
+    return {
+      rotated: false,
+      unchanged: false,
+      previous_sha256: null,
+      old_file: null,
+      current_file: currentFile,
+      pruned: [],
+      pruned_by_age: 0,
+    };
   }
   if (previous.sha256 === entry.sha256) {
-    return { rotated: false, unchanged: true, previous_sha256: previous.sha256, old_file: null, current_file: currentFile, pruned: [] };
+    return {
+      rotated: false,
+      unchanged: true,
+      previous_sha256: previous.sha256,
+      old_file: null,
+      current_file: currentFile,
+      pruned: [],
+      pruned_by_age: 0,
+    };
   }
   if (input.dryRun === true) {
-    return { rotated: true, unchanged: false, previous_sha256: previous.sha256, old_file: null, current_file: currentFile, pruned: [] };
+    return {
+      rotated: true,
+      unchanged: false,
+      previous_sha256: previous.sha256,
+      old_file: null,
+      current_file: currentFile,
+      pruned: [],
+      pruned_by_age: 0,
+    };
   }
   const recorded = recordSupersededVersion({
     root: input.root,
@@ -241,7 +371,7 @@ export function rotateForEntry(input) {
     now: input.now,
   });
   writeCurrentPointer({ root: input.root, entry, snapshotId: input.snapshotId, now: input.now });
-  const pruned = pruneOldVersions({ root: input.root, keep: input.keep ?? DEFAULT_KEEP_OLD });
+  const pruned = pruneOldVersions({ root: input.root, keep: input.keep ?? DEFAULT_KEEP_OLD, maxAgeDays: agePolicy.maxAgeDays, now: input.now });
   return {
     rotated: true,
     unchanged: false,
@@ -249,6 +379,7 @@ export function rotateForEntry(input) {
     old_file: recorded.file,
     current_file: currentFile,
     pruned: pruned.removed,
+    pruned_by_age: pruned.pruned_by_age,
   };
 }
 

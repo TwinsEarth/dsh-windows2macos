@@ -93,10 +93,15 @@ export function defaultBackupDir(platform = process.platform) {
 /**
  * Normalize the row's configuration into everything `apply` needs.
  *
+ * `backupOldVersionDays` is the age half of the retention policy: an integer >= 0, where 0 (the default) means
+ * "per-session count only". `backupMirrorDir` is the offsite mirror directory; absent/empty means no mirror, and
+ * a non-string value is refused rather than silently ignored (a typo in the row should not mount a plugin that
+ * silently copies nowhere).
+ *
  * @param {object} [config]
  * @param {{env?: Record<string, string|undefined>, platform?: string}} [deps]
  * @returns {{ok: true, enabled: boolean, backup_dir: string, times: string[], time_zone: string, catch_up_ms: number,
- *   scope: string, keep_old_per_session: number, dsh_home: string}
+ *   scope: string, keep_old_per_session: number, old_version_days: number, mirror_dir: string|null, dsh_home: string}
  *   | {ok: false, reason_code: string, detail: string}}
  */
 export function normalizeConfig(config = {}, deps = {}) {
@@ -123,6 +128,31 @@ export function normalizeConfig(config = {}, deps = {}) {
   const keepOld = Number.isSafeInteger(config.keepOldPerSession) && config.keepOldPerSession >= 0
     ? config.keepOldPerSession
     : DEFAULT_KEEP_OLD;
+  // The age retention rule: 0 means "count rule only", never "prune everything". Validated here so a bad row
+  // fails the mount with a configuration code instead of failing a scheduled run at 22:00.
+  const oldVersionDays = config.backupOldVersionDays;
+  if (oldVersionDays !== undefined && oldVersionDays !== null && (!Number.isSafeInteger(oldVersionDays) || oldVersionDays < 0)) {
+    return {
+      ok: false,
+      reason_code: 'BACKUP_CONFIG_INVALID',
+      detail: `backupOldVersionDays must be a non-negative integer, got ${JSON.stringify(oldVersionDays)}`,
+    };
+  }
+  // The offsite mirror directory: absent/empty -> no mirror; a non-string given value is refused. The path is
+  // resolved here, but containment (inside the repository / the home) is checked by the engine at run time,
+  // because only the engine knows whether the repository will be created at that path.
+  const mirrorValue = config.backupMirrorDir;
+  let mirrorDir = null;
+  if (mirrorValue !== undefined && mirrorValue !== null) {
+    if (typeof mirrorValue !== 'string') {
+      return {
+        ok: false,
+        reason_code: 'BACKUP_CONFIG_INVALID',
+        detail: `backupMirrorDir must be a path string when it is given, got ${JSON.stringify(mirrorValue)}`,
+      };
+    }
+    if (mirrorValue.trim() !== '') mirrorDir = path.resolve(mirrorValue.trim());
+  }
   // Optional override of the post-restore registry re-check schedule (tests use a short list; a host may want a
   // longer one). Absent means the module default (2 s / 8 s / 20 s).
   const registryRecheckMs = Array.isArray(config.backupRegistryRecheckMs) && config.backupRegistryRecheckMs.length > 0 &&
@@ -144,6 +174,8 @@ export function normalizeConfig(config = {}, deps = {}) {
     machine_key: machineKey,
     future_append: futureAppend,
     keep_old_per_session: keepOld,
+    old_version_days: oldVersionDays ?? 0,
+    mirror_dir: mirrorDir,
     registry_recheck_ms: registryRecheckMs,
     dsh_home: dshHome,
   };
@@ -154,7 +186,7 @@ export function normalizeConfig(config = {}, deps = {}) {
  *
  * @param {object} ctx Cordis context
  * @param {object} [config] row configuration (`backupDir`, `backupTimes`, `backupTimeZone`, `backupScope`,
- *   `keepOldPerSession`, `backupEnabled`)
+ *   `keepOldPerSession`, `backupOldVersionDays`, `backupMirrorDir`, `backupEnabled`)
  */
 export function apply(ctx, config = {}) {
   const cfg = normalizeConfig(config);
@@ -174,6 +206,9 @@ export function apply(ctx, config = {}) {
     times: cfg.times,
     time_zone: cfg.time_zone,
     scope: cfg.scope,
+    keep_old_per_session: cfg.keep_old_per_session,
+    old_version_days: cfg.old_version_days,
+    mirror_dir: cfg.mirror_dir,
     runs: 0,
     failures: 0,
     last_run: null,
@@ -195,6 +230,8 @@ export function apply(ctx, config = {}) {
         scope: request?.scope ?? cfg.scope,
         selected: request?.selected ?? [],
         keepOldPerSession: cfg.keep_old_per_session,
+        maxOldVersionDays: cfg.old_version_days,
+        mirrorRoot: cfg.mirror_dir,
         machineKey: cfg.machine_key,
         futureAppend: cfg.future_append,
         dryRun: request?.dryRun === true,
@@ -212,11 +249,17 @@ export function apply(ctx, config = {}) {
           duration_ms: result.duration_ms,
           rotated: result.rotated,
           future_append: result.future_append ?? null,
+          // The offsite copy is best effort: the primary result stays `ok` and the failure is visible here.
+          mirror: result.mirror ?? null,
+          warnings: result.warnings ?? [],
         };
         ctx.logger?.info?.(
           `w2m-dsh-backup: ${reason} backup ${result.snapshot_id}: ${result.sessions} session(s), ` +
             `${result.blocks_new} new block(s), ${result.blocks_reused} reused`,
         );
+        if (result.mirror?.ok === false) {
+          ctx.logger?.warn?.(`w2m-dsh-backup: ${reason} backup ${result.snapshot_id}: the offsite mirror failed: ${result.mirror.reason_code} ${result.mirror.reason}`);
+        }
       } else {
         state.failures += 1;
         state.last_error = { at: new Date().toISOString(), reason_code: result.reason_code, detail: result.detail };
@@ -275,6 +318,8 @@ export function apply(ctx, config = {}) {
               enabled: true,
               backup_dir: cfg.backup_dir,
               dsh_home: cfg.dsh_home,
+              retention: { keep_old_per_session: cfg.keep_old_per_session, old_version_days: cfg.old_version_days },
+              mirror_dir: cfg.mirror_dir,
               schedule: describeBackupSchedule({ enabled: true, times: cfg.times, timeZone: cfg.time_zone }),
               scheduler: scheduler.describe(),
               status,

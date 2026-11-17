@@ -258,6 +258,10 @@
 | `BACKUP_GC_UNSAFE` | 有引用不可读，**拒绝删除任何块** |
 | `BACKUP_SCHEDULE_TIME_INVALID` / `BACKUP_SCHEDULE_ZONE_INVALID` | 计划时间/时区配置非法 |
 | `BACKUP_ROTATION_ENTRY_INVALID` / `BACKUP_ROTATION_WRITE_FAILED` | 轮转输入/写入失败 |
+| `BACKUP_ROTATION_POLICY_INVALID` | 保留策略值非法（v3.5.0：`--max-old-days` / `backupOldVersionDays` 必须是 0 或正整数） |
+| `BACKUP_MIRROR_INVALID` | 异地副本路径非法（仓库/home 内、等于仓库根、是文件），本次备份未开始 |
+| `BACKUP_MIRROR_FAILED` | 异地副本复制失败；主库备份**已提交且可用**，下次同步会自动补齐 |
+| `BACKUP_CONFIG_INVALID` | 备份子插件配置项非法（v3.5.0 新增的两项在此校验） |
 | `BACKUP_REPO_SNAPSHOT_*` / `BACKUP_REPO_INDEX_LINE_INVALID` | 快照或索引行不可用 |
 | `BACKUP_SCAN_HEADER_UNREADABLE` / `BACKUP_SCAN_NOT_ZSTD` | 会话日志头部不可读/不是 zstd |
 
@@ -694,4 +698,87 @@ plan 后文件变化拒绝覆盖、dry-run 零写入、CLI 退出码/帮助/真�
 * 层规则：工具在 backup 层（复用 backup 的 doctor / 未来追加 / 运行时门禁），命令挂在 fix CLI 上；`fix -> backup`
   是同级边，已在 `scripts/layer-model.mjs` 声明，模块级无环（`backup/renumber -> fix/zstd`，从不 import
   `fix/cli`）。
+
+## 21. 保留策略与异地副本（v3.5.0）
+
+### 21.1 保留策略：份数 + 天数，两条规则同时生效
+
+`old/` 旧版本记录（§13）此前只按"每会话最新 N 份"保留（`keepOldPerSession`，默认 10）。v3.5.0 增加可选的
+年龄窗口 `maxAgeDays`（CLI `--max-old-days <n>`、插件配置 `backupOldVersionDays`）：
+
+* **规则（两条同时生效）**：一条版本记录只有在"属于该会话最新 `keep` 份之内"**且**"`recorded_at` 不早于
+  `now - maxAgeDays` 天"时才保留；任一条不满足即剪除。因此"最新但超过 N 天"仍按天剪除，"在 N 天窗口内但已超出
+  最新 N 份"仍按份数剪除。份数与天数不是二选一，也不存在"哪个更宽松用哪个"。
+* **0/缺省**：`0` 或未配置 = 仅按份数（保持 v3.4.7 语义），**不是**"立刻清空"。
+* **校验**：`rotation.resolveMaxAgeDays` 在 `engine.runBackup`、`gc`、`rotateForEntry` 写任何盘之前校验；负数/
+  小数/非数字具名拒绝 `BACKUP_ROTATION_POLICY_INVALID`；CLI 解析层直接以退出码 2 拒绝；插件 `normalizeConfig`
+  对非法 `backupOldVersionDays` 拒绝挂载（`BACKUP_CONFIG_INVALID`）。
+* **纯决策面**：`rotation.selectPrunable(records,{keep,maxAgeDays,now})` 不碰文件系统，`pruneOldVersions` 把每个
+  会话桶交给它决定——一处规则，rotation 与 gc 两个入口共用。
+* **gc 安全性不变**：`gc` 仍是"先收集全部引用（快照 + current + old）→ 有任何不可读即整体拒绝
+  `BACKUP_GC_UNSAFE`（一个都不删）→ 删无引用块 → 再剪 old 记录 → 清 tmp"。顺序保证：一次 gc 中被剪掉的 old
+  记录不会导致它引用的块在同一次运行里被删（引用集在删除前已固定），这些块最早下一次 gc 才可回收。
+  **gc 永远不会删除任何仍被快照/current/old 引用的块**，这条规则没有因为保留策略而放宽。
+
+### 21.2 异地副本（`mirrorRoot` / `backupMirrorDir` / `run --mirror`）
+
+**布局**（镜像根 = 用户指定目录；本地盘/网络盘均可）：
+
+```
+<mirror>/
+  backup.json                     # 仓库描述（首次复制；openRepo 需要它才能报告 initialized）
+  keys.json                       # 权威信封文件（包裹后的 DEK，无明文密钥）
+  objects/<aa>/<sha256>           # 本次快照引用的密封块（只补缺失）
+  snapshots/<snapshotId>/
+    manifest.json                 # 加密清单（与主库逐字节一致）
+    keys.json                     # 该快照的信封副本
+  index.jsonl                     # 按 snapshot_id 幂等追加
+```
+
+* **复制时机**：仅在**提交成功且轮转成功**之后；dry-run 不镜像。文件复制一律走 `atomic.writeFileAtomic`
+  （临时文件 → fsync → rename），因此镜像里不会出现"名字承诺了内容却没有内容"的块。
+* **只补缺失**：块按内容寻址，目标已存在即视为正确并跳过；快照元数据逐字节比较后跳过。所以重复同步同一快照是
+  幂等的、不重写已封存数据，计入 `skipped`。
+* **索引幂等**：镜像 `index.jsonl` 只有在其中**尚无该 `snapshot_id`** 时追加一行（内容与主库 `readIndex()` 的条目
+  一致）；重复同步不重复追加。若镜像索引尾部是半行（写入者被强杀），新行以换行分隔追加，不会把半行拼接成坏行，
+  `readIndex` 仍会如实报告该行的问题。
+* **永远不复制**：明文会话字节、明文附件、密码、锁文件、`tmp/`、`logs/`、`current/`、`old/`、`archive/`。
+  镜像只承诺"已提交快照的灾难副本"，不是主库工作状态的同步盘；还原时按 `--snapshot` 从镜像快照走。
+* **路径拒绝**：`mirrorRoot` 指向仓库内部、`$DSH_HOME` 内部、等于仓库根、或本身是文件 → **写盘前**拒绝
+  `BACKUP_MIRROR_INVALID`（零提交，不留下半次备份）。跨盘/跨机器路径按"外部"处理（`path.relative` 返回绝对
+  路径）；包含判定按路径段而非字符串前缀（`D:\BackUP2` 不算 `D:\BackUP` 内部，路径两侧同样做 resolve）。
+* **失败语义（关键）**：镜像复制是**加法**，不是提交的前置条件。提交后复制失败**不回滚、不抛异常**：主库结果仍为
+  `ok:true`（快照已持久化），结果带 `mirror:{ok:false, reason_code, reason, copied}` 与 `warnings`；
+  下一次成功同步会自动补齐缺失块（只补缺失使修复成本等于增量）。
+* **可还原性**：镜像带 `backup.json` + `keys.json` + 快照两文件 + 其引用的全部块；`openRepo(mirror)` 报告已初始化，
+  用与主库相同的 DEK 对镜像块 `rebuildFile` 可得到与清单一致的 sha256（`test/backup-mirror.test.mjs` 的廉价款
+  完整性校验）。
+* **边界与诚实说明**：不做跨镜像去重（每个镜像独立持有一份密封块，用空间换恢复独立性）；未实现 Relay/云端传输
+  （Phase 3）；未实现镜像侧 `current/old` 视图与镜像 gc（镜像只增，清理由运维按需删快照目录）。镜像路径含
+  §19 的 `$DSH_HOME` 判定，故"把镜像放进 home 图省事"明确不支持。
+
+### 21.3 配置面与错误码
+
+| 入口 | 保留策略 | 异地副本 |
+|---|---|---|
+| CLI | `w2m-backup run/gc --max-old-days <n>`（0 = 仅份数） | `w2m-backup run --mirror <dir>` |
+| 插件配置 | `backupOldVersionDays`（非负整数，缺省 = 仅份数） | `backupMirrorDir`（路径，缺省 = 不同步） |
+| 引擎 | `runBackup({maxOldVersionDays})` | `runBackup({mirrorRoot})` |
+
+| 错误码 | 含义 |
+|---|---|
+| `BACKUP_ROTATION_POLICY_INVALID` | 保留策略值非法（负数/小数/非数字），写盘前拒绝 |
+| `BACKUP_MIRROR_INVALID` | 镜像路径非法（仓库/home 内、等于仓库根、是文件），零提交拒绝 |
+| `BACKUP_MIRROR_FAILED` | 提交后复制失败；主库仍 `ok:true`，结果含 `mirror` 与 `warnings` |
+| `BACKUP_GC_UNSAFE` | 存在不可读引用，gc 整体不删除（v3.4.7 规则不变） |
+
+### 21.4 测试
+
+`test/backup-rotation.test.mjs`：`selectPrunable` 份数/天数/两者交互/0-缺省/非法值/注入 `now`；`pruneOldVersions`
+与 rotation 的两条规则同时生效、dry-run 零删除。`test/backup-gc.test.mjs`：`maxOldVersionDays` 生效、被快照引用的
+块不被删、`BACKUP_GC_UNSAFE` 不变。`test/backup-mirror.test.mjs`：只补缺失 + 第二次同步幂等、索引只追加一次、
+镜像路径四类拒绝、复制失败不回滚（`ok:true` + `mirror.ok:false` + warnings + 主库可读）、镜像侧
+`openRepo`+`rebuildFile` 完整性、`resolveMirrorRoot` 的路径段包含判定。`test/backup-run.test.mjs`：引擎传递与
+CLI `--max-old-days`/`--mirror` 解析。插件配置归一化在 `test/backup-run.test.mjs` 覆盖（`backupOldVersionDays` /
+`backupMirrorDir`）。
 

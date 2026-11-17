@@ -7,6 +7,7 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import {
@@ -23,9 +24,11 @@ import {
   defaultBackupDir,
   normalizeConfig,
 } from '../src/plugin/backup.mjs';
-import { main } from '../src/backup/cli.mjs';
-import { readIndex } from '../src/backup/repo.mjs';
-import { tempDir, makeHome, registryDocument, runtimeValidHome } from './helpers/backup-fixture.mjs';
+import { main, parseArgs } from '../src/backup/cli.mjs';
+import { runBackup } from '../src/backup/engine.mjs';
+import { readIndex, readSnapshot } from '../src/backup/repo.mjs';
+import { listOldVersions, recordSupersededVersion } from '../src/backup/rotation.mjs';
+import { tempDir, makeHome, registryDocument, runtimeValidHome, sessionLog, event } from './helpers/backup-fixture.mjs';
 
 const PASSWORD = 'correct horse battery staple';
 
@@ -99,6 +102,43 @@ describe('subplugin: configuration', () => {
     const bad = normalizeConfig({ backupTimes: ['25:00'] }, { env: {}, platform: 'win32' });
     assert.equal(bad.ok, false);
     assert.equal(bad.reason_code, 'BACKUP_SCHEDULE_TIME_INVALID');
+  });
+
+  it('normalizes the age retention window and refuses an invalid value', () => {
+    const defaults = normalizeConfig({}, { env: {}, platform: 'win32' });
+    assert.equal(defaults.ok, true);
+    assert.equal(defaults.old_version_days, 0, 'the age rule is off unless configured');
+    assert.equal(normalizeConfig({ backupOldVersionDays: 0 }, { env: {}, platform: 'win32' }).old_version_days, 0);
+    assert.equal(normalizeConfig({ backupOldVersionDays: 7 }, { env: {}, platform: 'win32' }).old_version_days, 7);
+    for (const bad of [-1, 1.5, '7', true]) {
+      const refused = normalizeConfig({ backupOldVersionDays: bad }, { env: {}, platform: 'win32' });
+      assert.equal(refused.ok, false, `backupOldVersionDays=${String(bad)} must be refused`);
+      assert.equal(refused.reason_code, 'BACKUP_CONFIG_INVALID');
+      assert.match(refused.detail, /backupOldVersionDays must be a non-negative integer/u);
+    }
+  });
+
+  it('normalizes the offsite mirror directory, treating absent/empty as none and refusing a non-string', () => {
+    const { dir, cleanup } = tempDir('w2m-config-mirror-');
+    try {
+      const mirror = join(dir, 'offsite');
+      const defaults = normalizeConfig({}, { env: {}, platform: 'win32' });
+      assert.equal(defaults.mirror_dir, null);
+      assert.equal(normalizeConfig({ backupMirrorDir: '' }, { env: {}, platform: 'win32' }).mirror_dir, null);
+      assert.equal(normalizeConfig({ backupMirrorDir: '   ' }, { env: {}, platform: 'win32' }).mirror_dir, null);
+      assert.equal(normalizeConfig({ backupMirrorDir: mirror }, { env: {}, platform: 'win32' }).mirror_dir, mirror);
+      // Containment (inside the repository/home) is a run-time refusal, because only a run knows the repository
+      // that will actually be used; the configuration layer only normalizes the path.
+      assert.equal(normalizeConfig({ backupMirrorDir: join(dir, 'repo', 'mirror'), backupDir: join(dir, 'repo') }, { env: {}, platform: 'win32' }).ok, true);
+      for (const bad of [42, {}, []]) {
+        const refused = normalizeConfig({ backupMirrorDir: bad }, { env: {}, platform: 'win32' });
+        assert.equal(refused.ok, false);
+        assert.equal(refused.reason_code, 'BACKUP_CONFIG_INVALID');
+        assert.match(refused.detail, /backupMirrorDir must be a path string/u);
+      }
+    } finally {
+      cleanup();
+    }
   });
 });
 
@@ -299,6 +339,47 @@ describe('subplugin: the route and the timer', () => {
     assert.equal(fake.registrations.length, 0);
     assert.ok(fake.logs.some((entry) => entry.level === 'warn' && entry.message.includes('BACKUP_SCHEDULE_TIME_INVALID')));
   });
+
+  it('logs and skips the mount when the retention configuration is invalid', () => {
+    const fake = fakeCtx();
+    apply(fake.ctx, { backupOldVersionDays: -1, backupDir: 'E:\\unused' });
+    assert.equal(fake.registrations.length, 0);
+    assert.ok(fake.logs.some((entry) => entry.level === 'warn' && entry.message.includes('BACKUP_CONFIG_INVALID')));
+  });
+
+  it(
+    'flows an offsite mirror through the run route and the describe payload (Windows DPAPI)',
+    { skip: process.platform === 'win32' ? false : 'DPAPI is Windows-only' },
+    async () => {
+      const { home, cleanup: cleanHome } = homeFixture();
+      const { dir, cleanup } = tempDir('w2m-route-mirror-');
+      try {
+        const fake = fakeCtx();
+        const mirror = join(dir, 'mirror');
+        apply(fake.ctx, { backupDir: join(dir, 'repo'), dshHome: home, backupMirrorDir: mirror, backupOldVersionDays: 30, ...NO_FIRE });
+        const find = (path) => fake.registrations.find((row) => row.path === path);
+        const url = `http://local.invalid${BACKUP_RUN_ROUTE_PATH}`;
+
+        const response = await find(BACKUP_RUN_ROUTE_PATH).fetch(
+          new Request(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ confirm: RUN_CONFIRM_TOKEN }) }),
+        );
+        const body = await response.json();
+        assert.equal(body.ok, true, `${body.reason_code}: ${body.detail}`);
+        assert.equal(body.mirror?.ok, true, body.mirror?.reason);
+        assert.equal(body.max_old_version_days, 30, 'the configured age window reaches the engine');
+        assert.equal(body.warnings, undefined, 'a successful mirror needs no warning');
+
+        const state = await (await find(BACKUP_RUN_ROUTE_PATH).fetch(new Request(url, { method: 'GET' }))).json();
+        assert.equal(state.mirror_dir, mirror);
+        assert.deepEqual(state.retention, { keep_old_per_session: 10, old_version_days: 30 });
+        assert.equal(state.state.last_result.mirror.ok, true);
+        assert.deepEqual(state.state.last_result.warnings, []);
+      } finally {
+        cleanup();
+        cleanHome();
+      }
+    },
+  );
 });
 
 describe('cli: run / list / gc', () => {
@@ -382,6 +463,112 @@ describe('cli: run / list / gc', () => {
       assert.match(text, /snapshot {6}: 2026/u);
       assert.match(text, /blocks {8}: 1 new, 0 reused/u);
       assert.match(text, /unlocked via {2}: password/u);
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+
+  it('parses --max-old-days and --mirror, and reports missing/invalid values as usage errors', () => {
+    const { dir, cleanup } = tempDir('w2m-cli-flags-');
+    try {
+      const env = { W2M_BACKUP_NO_MACHINE_KEY: '1' };
+      for (const argv of [['--max-old-days', 'lots'], ['--max-old-days', '-1'], ['--max-old-days', '1.5'], ['--max-old-days']]) {
+        const run = capture();
+        assert.equal(main(['gc', '--backup-dir', join(dir, 'repo'), ...argv], { ...run.io, env }), 2, argv.join(' '));
+        assert.match(run.lines.join('\n'), /--max-old-days needs a non-negative integer/u);
+      }
+      for (const argv of [['run', '--mirror'], ['run', '--mirror=']]) {
+        const run = capture();
+        assert.equal(main(argv, { ...run.io, env, password: PASSWORD }), 2, argv.join(' '));
+        assert.match(run.lines.join('\n'), /--mirror needs a directory/u);
+      }
+
+      const parsed = parseArgs(['run', '--mirror', join(dir, 'offsite'), '--max-old-days', '0'], env);
+      assert.equal(parsed.error, undefined);
+      assert.equal(parsed.mirror, join(dir, 'offsite'));
+      assert.equal(parsed.maxOldDays, 0);
+      assert.equal(parseArgs(['gc', '--max-old-days=30'], env).maxOldDays, 30);
+      assert.equal(parseArgs(['gc', '--max-old-days='], env).error, '--max-old-days needs a non-negative integer, got ""');
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe('engine: retention and mirror options', () => {
+  it('runBackup applies maxOldVersionDays during rotation and keeps the count rule intact', () => {
+    const { home, files, cleanup: cleanHome } = homeFixture();
+    const { dir, cleanup } = tempDir('w2m-run-retention-');
+    try {
+      const repo = join(dir, 'repo');
+      const base = { root: repo, dshHome: home, password: PASSWORD, platform: 'linux', machineKey: false };
+      const first = runBackup({ ...base, now: new Date('2026-11-17T12:00:00.000Z') });
+      assert.equal(first.ok, true, first.detail);
+
+      // An old version record left by a previous month's rotation, outside the configured window.
+      const snapshot = readSnapshot({ root: repo, snapshotId: first.snapshot_id });
+      const entry = snapshot.manifest.files.find((row) => row.kind === 'session');
+      assert.ok(entry, 'the snapshot must hold the session file');
+      recordSupersededVersion({ root: repo, previous: entry, snapshotId: '20260101T000000Z-deadbeef', now: new Date('2026-01-01T00:00:00.000Z') });
+      assert.equal(listOldVersions(repo).length, 1);
+
+      // Change the session so the next run supersedes the previous version and prunes by the age rule.
+      writeFileSync(files['session-aaaaaaaa-0001'], sessionLog('session-aaaaaaaa-0001', [event(0), event(1), event(2)]));
+      const second = runBackup({ ...base, now: new Date('2026-11-17T13:00:00.000Z'), maxOldVersionDays: 30 });
+      assert.equal(second.ok, true, second.detail);
+      assert.equal(second.rotated, 1);
+      assert.equal(second.max_old_version_days, 30);
+      const remaining = listOldVersions(repo);
+      assert.equal(remaining.length, 1, 'the record older than 30 days must be pruned');
+      assert.ok(Date.parse(remaining[0].record.recorded_at) > Date.parse('2026-01-01T00:00:00.000Z'));
+
+      // Absent maxOldVersionDays means the count rule only: the next rotation prunes nothing.
+      writeFileSync(files['session-aaaaaaaa-0001'], sessionLog('session-aaaaaaaa-0001', [event(0), event(1), event(2), event(3)]));
+      const third = runBackup({ ...base, now: new Date('2026-11-17T14:00:00.000Z') });
+      assert.equal(third.ok, true, third.detail);
+      assert.equal(third.max_old_version_days, 0, 'absent means the age rule is disabled, not "prune everything"');
+      assert.equal(listOldVersions(repo).length, 2);
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+
+  it('refuses an invalid maxOldVersionDays before creating the repository', () => {
+    const { home, cleanup: cleanHome } = homeFixture();
+    const { dir, cleanup } = tempDir('w2m-run-retention-invalid-');
+    try {
+      const repo = join(dir, 'repo');
+      const result = runBackup({ root: repo, dshHome: home, password: PASSWORD, platform: 'linux', machineKey: false, maxOldVersionDays: -1 });
+      assert.equal(result.ok, false);
+      assert.equal(result.reason_code, 'BACKUP_ROTATION_POLICY_INVALID');
+      assert.match(result.detail, /maxAgeDays/u);
+      assert.equal(existsSync(repo), false, 'the refusal happens before ensureLayout');
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+
+  it('never mirrors or validates a mirror on a dry run', () => {
+    const { home, cleanup: cleanHome } = homeFixture();
+    const { dir, cleanup } = tempDir('w2m-run-dry-mirror-');
+    try {
+      const repo = join(dir, 'repo');
+      const result = runBackup({
+        root: repo,
+        dshHome: home,
+        password: PASSWORD,
+        platform: 'linux',
+        machineKey: false,
+        dryRun: true,
+        mirrorRoot: join(repo, 'inside-mirror'),
+      });
+      assert.equal(result.ok, true, result.detail);
+      assert.equal(result.dry_run, true);
+      assert.equal('mirror' in result, false, 'a dry run writes no mirror and reports none');
+      assert.equal(existsSync(join(repo, 'inside-mirror')), false);
     } finally {
       cleanup();
       cleanHome();

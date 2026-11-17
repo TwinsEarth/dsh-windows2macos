@@ -15,7 +15,7 @@ import { LOCK_FILE } from '../src/backup/locks.mjs';
 import { ensureLayout, repoPaths } from '../src/backup/layout.mjs';
 import { buildManifest } from '../src/backup/manifest.mjs';
 import { commitSnapshot, makeSnapshotId } from '../src/backup/repo.mjs';
-import { writeCurrentPointer, recordSupersededVersion } from '../src/backup/rotation.mjs';
+import { writeCurrentPointer, recordSupersededVersion, listOldVersions } from '../src/backup/rotation.mjs';
 import { MIN_SCRYPT, randomDek, wrapDek } from '../src/backup/crypto.mjs';
 import { tempDir } from './helpers/backup-fixture.mjs';
 
@@ -137,6 +137,133 @@ describe('gc: deleting orphans', () => {
       const result = gc({ root, keepOldPerSession: 1 });
       assert.equal(result.safe, true);
       assert.equal(result.old_versions.pruned, 3);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+describe('gc: the age retention window', () => {
+  /** A version record `days` days old, with its own block list. */
+  function recordOldVersion(root, entry, name, days) {
+    const sha = name.repeat(64);
+    const when = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    return recordSupersededVersion({
+      root,
+      previous: { ...entry, sha256: sha, blocks: [{ index: 0, offset: 0, length: 10, sha256: sha }], updated_at: when.toISOString() },
+      snapshotId: `20261117T000000Z-${name.repeat(8).slice(0, 8)}`,
+      now: when,
+    });
+  }
+
+  it('prunes old records by the age window in addition to the per-session count', () => {
+    const { root, cleanup, manifest } = repoWithSnapshot();
+    try {
+      const entry = manifest.files[0];
+      recordOldVersion(root, entry, 'a', 1);
+      recordOldVersion(root, entry, 'b', 50);
+      recordOldVersion(root, entry, 'c', 100);
+      assert.equal(listOldVersions(root).length, 3);
+      const result = gc({ root, keepOldPerSession: 10, maxOldVersionDays: 30 });
+      assert.equal(result.safe, true);
+      assert.equal(result.old_versions.pruned, 2);
+      assert.equal(result.old_versions.pruned_by_age, 2);
+      assert.equal(listOldVersions(root).length, 1, 'only the record inside the age window remains');
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('never deletes a block a live snapshot references, and leaves a pruned record\'s block for the next run', () => {
+    const { root, cleanup, manifest } = repoWithSnapshot();
+    try {
+      for (const block of manifest.files[0].blocks) putObject(root, block.sha256, block.length);
+      const oldBlock = 'e'.repeat(64);
+      putObject(root, oldBlock, 16);
+      recordOldVersion(root, manifest.files[0], 'e', 90);
+      const result = gc({ root, keepOldPerSession: 10, maxOldVersionDays: 30 });
+      assert.equal(result.safe, true);
+      assert.equal(result.old_versions.pruned_by_age, 1);
+      for (const block of manifest.files[0].blocks) {
+        assert.equal(
+          existsSync(join(repoPaths(root).objects, block.sha256.slice(0, 2), block.sha256)),
+          true,
+          'a live snapshot block must never be deleted',
+        );
+      }
+      assert.equal(
+        existsSync(join(repoPaths(root).objects, oldBlock.slice(0, 2), oldBlock)),
+        true,
+        'the reference set is collected before any deletion, so a block referenced only by a record pruned in this run survives at least this run',
+      );
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('plans age pruning in a dry run, and deletes nothing', () => {
+    const { root, cleanup, manifest } = repoWithSnapshot();
+    try {
+      const { file } = recordOldVersion(root, manifest.files[0], 'a', 90);
+      const result = gc({ root, keepOldPerSession: 10, maxOldVersionDays: 30, dryRun: true });
+      assert.equal(result.safe, true);
+      assert.equal(result.dry_run, true);
+      assert.equal(result.old_versions.pruned, 1);
+      assert.equal(result.old_versions.pruned_by_age, 1);
+      assert.equal(existsSync(file), true, 'a dry run must not delete');
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('uses the injected nowMs as the age-rule clock, not the wall clock', () => {
+    const { root, cleanup, manifest } = repoWithSnapshot();
+    try {
+      const when = new Date(Date.now() - 100 * 24 * 60 * 60 * 1000);
+      recordSupersededVersion({
+        root,
+        previous: { ...manifest.files[0], sha256: '1'.repeat(64), blocks: [{ index: 0, offset: 0, length: 10, sha256: '1'.repeat(64) }], updated_at: when.toISOString() },
+        snapshotId: '20261117T000000Z-deadbeef',
+        now: when,
+      });
+      // The record is 100 days old against the wall clock, but the injected clock is 200 days earlier: by the
+      // supplied instant the record is not old at all, so the wall clock must not be what decided it.
+      const result = gc({ root, keepOldPerSession: 10, maxOldVersionDays: 30, nowMs: Date.now() - 200 * 24 * 60 * 60 * 1000 });
+      assert.equal(result.safe, true);
+      assert.equal(result.old_versions.pruned_by_age, 0);
+      assert.equal(result.old_versions.pruned, 0);
+      assert.equal(listOldVersions(root).length, 1);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('refuses an invalid age window before taking the lock and before deleting anything', () => {
+    const { root, cleanup } = repoWithSnapshot();
+    try {
+      putObject(root, 'd'.repeat(64), 8);
+      const result = gc({ root, maxOldVersionDays: -1 });
+      assert.equal(result.ok, false);
+      assert.equal(result.safe, false);
+      assert.equal(result.reason_code, 'BACKUP_ROTATION_POLICY_INVALID');
+      assert.match(result.detail, /maxAgeDays/u);
+      assert.equal(existsSync(join(repoPaths(root).objects, 'd'.repeat(2), 'd'.repeat(64))), true, 'nothing may be deleted');
+      assert.equal(existsSync(join(repoPaths(root).tmp, LOCK_FILE)), false, 'the policy is validated before the lock');
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('keeps the BACKUP_GC_UNSAFE refusal exactly as it was when an age window is configured', () => {
+    const { root, cleanup, snapshotId, manifest } = repoWithSnapshot();
+    try {
+      recordOldVersion(root, manifest.files[0], 'a', 90);
+      writeFileSync(join(repoPaths(root).snapshots, snapshotId, 'manifest.json'), '{ not json');
+      const result = gc({ root, maxOldVersionDays: 30 });
+      assert.equal(result.safe, false);
+      assert.equal(result.reason_code, 'BACKUP_GC_UNSAFE');
+      assert.equal(result.old_versions.pruned, 0);
+      assert.equal(listOldVersions(root).length, 1, 'an unsafe gc must prune nothing');
     } finally {
       cleanup();
     }

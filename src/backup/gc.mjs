@@ -13,7 +13,17 @@
  *
  * Snapshots are not deleted by v3.4.7 gc at all; pruning snapshots is a retention decision for a later version,
  * and doing it implicitly here would make "gc" mean two different things. `old/` pruning is bounded by
- * `keepOldPerSession` and is the same function rotation uses.
+ * `keepOldPerSession` and, optionally, by the `maxOldVersionDays` age window; both are the same retention
+ * function rotation uses (`rotation.mjs#pruneOldVersions`), so a scheduled gc and a rotation prune identically.
+ *
+ * ## Ordering: a record pruned here cannot orphan a block in the same run
+ *
+ * The reference set is collected **once, before any deletion**, and every block is judged against that set.
+ * The old-version prune runs after the unreferenced blocks are removed, so a block whose only reference is a
+ * record that this same run prunes is still treated as referenced for the whole run and survives at least this
+ * run. It becomes collectable on the *next* gc. That is deliberate: the alternative -- deleting a record and
+ * then re-deciding what its blocks were worth -- is how one pass removes the last reference to data it is about
+ * to delete, with no snapshot left to prove it existed.
  */
 
 import fs from 'node:fs';
@@ -23,7 +33,7 @@ import { repoPaths } from './layout.mjs';
 import { readJsonSafe } from './atomic.mjs';
 import { withRepoLock } from './locks.mjs';
 import { readSnapshot, listSnapshots } from './repo.mjs';
-import { DEFAULT_KEEP_OLD, OLD_FORMAT, pruneOldVersions } from './rotation.mjs';
+import { DEFAULT_KEEP_OLD, OLD_FORMAT, ROTATION_CODES, pruneOldVersions, resolveMaxAgeDays } from './rotation.mjs';
 
 /** Named gc failure codes. */
 export const GC_CODES = Object.freeze({
@@ -276,12 +286,18 @@ export function listObjects(root) {
  * Takes the repository lock: deleting blocks while a backup is writing them is the one way gc could destroy a
  * snapshot that is being committed.
  *
- * @param {{root: string, dryRun?: boolean, keepOldPerSession?: number, nowMs?: number, staleTmpMs?: number}} input
+ * `maxOldVersionDays` applies the age half of the retention policy in addition to the per-session count
+ * (`keepOldPerSession`); absent/0 disables the age rule. An invalid value is refused before the lock and before
+ * any walk, so a configuration mistake is never reported in the vocabulary of a damaged repository. A finite
+ * `nowMs` is the clock for both time-based decisions (stale temp files and the age rule), so tests can pin it.
+ *
+ * @param {{root: string, dryRun?: boolean, keepOldPerSession?: number, maxOldVersionDays?: number|null,
+ *   nowMs?: number, staleTmpMs?: number}} input
  * @returns {{
- *   ok: boolean, safe: boolean, dry_run: boolean,
+ *   ok: boolean, safe: boolean, dry_run: boolean, detail?: string,
  *   references: {blocks: number, snapshots: number, old: number, current: number},
  *   blocks: {scanned: number, removed: number, reclaimed_bytes: number, kept: number},
- *   old_versions: {pruned: number},
+ *   old_versions: {pruned: number, pruned_by_age: number},
  *   tmp: {scanned: number, removed: number, reclaimed_bytes: number},
  *   empty_prefixes_removed: number,
  *   problems: Array<object>, reason_code: string|null
@@ -290,6 +306,24 @@ export function listObjects(root) {
 export function gc(input) {
   const root = path.resolve(input.root);
   const dryRun = input.dryRun === true;
+  const agePolicy = resolveMaxAgeDays(input.maxOldVersionDays);
+  if (agePolicy.ok !== true) {
+    // Fail fast and write nothing: an invalid retention window is a configuration error, not a state of the
+    // repository, so it must not be discovered after the object walk (and must never delete anything).
+    return {
+      ok: false,
+      safe: false,
+      dry_run: dryRun,
+      references: { blocks: 0, snapshots: 0, old: 0, current: 0 },
+      blocks: { scanned: 0, removed: 0, reclaimed_bytes: 0, kept: 0 },
+      old_versions: { pruned: 0, pruned_by_age: 0 },
+      tmp: { scanned: 0, removed: 0, reclaimed_bytes: 0 },
+      empty_prefixes_removed: 0,
+      problems: [],
+      reason_code: agePolicy.reason_code ?? ROTATION_CODES.POLICY_INVALID,
+      detail: agePolicy.detail,
+    };
+  }
   const lock = withRepoLock({ root });
   if (lock.ok !== true) {
     return {
@@ -298,7 +332,7 @@ export function gc(input) {
       dry_run: dryRun,
       references: { blocks: 0, snapshots: 0, old: 0, current: 0 },
       blocks: { scanned: 0, removed: 0, reclaimed_bytes: 0, kept: 0 },
-      old_versions: { pruned: 0 },
+      old_versions: { pruned: 0, pruned_by_age: 0 },
       tmp: { scanned: 0, removed: 0, reclaimed_bytes: 0 },
       empty_prefixes_removed: 0,
       problems: [{ file: lock.path, detail: lock.detail }],
@@ -314,7 +348,7 @@ export function gc(input) {
         dry_run: dryRun,
         references: { blocks: references.blocks.size, ...references.counts },
         blocks: { scanned: 0, removed: 0, reclaimed_bytes: 0, kept: 0 },
-        old_versions: { pruned: 0 },
+        old_versions: { pruned: 0, pruned_by_age: 0 },
         tmp: { scanned: 0, removed: 0, reclaimed_bytes: 0 },
         empty_prefixes_removed: 0,
         problems: references.problems,
@@ -345,6 +379,10 @@ export function gc(input) {
     const pruned = pruneOldVersions({
       root,
       keep: Number.isSafeInteger(input.keepOldPerSession) ? input.keepOldPerSession : DEFAULT_KEEP_OLD,
+      maxAgeDays: agePolicy.maxAgeDays,
+      // One clock for both time-based decisions of the run: stale-tmp aging and the age retention rule. Tests
+      // inject it, so a policy is asserted against a fixed instant rather than against the wall clock.
+      now: Number.isFinite(input.nowMs) ? input.nowMs : undefined,
       dryRun,
     });
     const leftovers = collectTmpLeftovers({ root, dryRun, nowMs: input.nowMs, staleMs: input.staleTmpMs });
@@ -356,7 +394,7 @@ export function gc(input) {
       dry_run: dryRun,
       references: { blocks: references.blocks.size, ...references.counts },
       blocks: { scanned: objects.length, removed, reclaimed_bytes: reclaimed, kept: objects.length - removed },
-      old_versions: { pruned: pruned.removed.length },
+      old_versions: { pruned: pruned.removed.length, pruned_by_age: pruned.pruned_by_age },
       tmp: { scanned: leftovers.scanned, removed: leftovers.removed, reclaimed_bytes: leftovers.reclaimed_bytes },
       empty_prefixes_removed: emptyPrefixesRemoved,
       problems: failed.map((row) => ({ file: row.file, detail: row.detail })),

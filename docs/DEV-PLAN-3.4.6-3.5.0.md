@@ -293,6 +293,53 @@ seq 缺口拒绝、dense 通过、运行时证据正/反向。详见 `docs/BACKU
 
 **验收**：门禁真实拒绝一台 3.4.5 机器（`MACHINE_VERSION_UNSUPPORTED`），覆盖开关生效；Phase 2 三节点集成 2/2；备份保留策略生效并有审计日志；全量套件 + preflight GREEN；三方发布（GitHub Release / npm / 本机）字节一致。
 
+### v3.5.0 实施记录（2026-11-17，本次交付：可测试的非 UI 半）
+
+**已交付 A–D**（面板 UI 与 Phase 2 合并评审不在本次范围）：
+
+- **A 最低版本门禁**：`src/plugin/version-gate.mjs` 定义唯一常量 `MIN_SUPPORTED_PLUGIN_VERSION = '3.5.0'`、
+  semver 比较器（`x.y.z` + 预发布后缀，无法解析一律按 unknown 处理、绝不猜相等，因此不会把同版本误判为通过）
+  与纯决策函数 `evaluateVersionGate`。`w2m_run` 在 POST 前读一次 relay 名册（与既有 narrowed-target 预检共用），
+  对**本次派发会用到的在线机器**逐个判定（replicate/split/pipeline/mapreduce 的全体在线机器；broadcast/选中目标/
+  `assignee` 只判定具名目标）：低于基线或版本不可读 → 整单拒绝 `MACHINE_VERSION_UNSUPPORTED`，
+  `detail.machines` 逐一给出 `machine_id`/`version`/原因码（`MACHINE_VERSION_OUTDATED` /
+  `MACHINE_VERSION_UNKNOWN`）与 `supported_min`。`allowOutdated: true` 显式覆盖：结果带 `outdated_allowed` 与
+  `version_gate.audit`（含逐机原因码），并写一条 host 日志；只读工具（`w2m_devices`/`w2m_stats`）永不被拒。
+  **生效条件**：门禁只在构建自身版本 ≥ 基线时生效（`isVersionGateActive`）——3.4.x 构建不执行它无法理解的契约，
+  紧急回滚也不会被自己的规则拒绝；源码树（版本 3.4.5）以 `W2M_PLUGIN_VERSION` 覆盖激活，与 updater 同一机制。
+  名册读取失败按“未校验”处理（`version_gate.checked:false`），不把不可读当“全部合格”。
+  顺带修掉一处既有缺陷：narrowed-target 预检读的是 `readFleet` 从未返回的 `devices` 字段，导致名册读取成功时
+  任何具名目标派发都被误拒 `TARGET_UNAVAILABLE`；现改用 `machines` 投影。
+- **B 版本漂移看板数据**：`summarizeVersionDashboard(records,{supportedMin})` 纯函数输出
+  `{supported_min, distribution, outdated, unknown, all_current}`；`w2m_devices` 与 `GET /api/w2m/target` 的
+  payload **增量**携带 `versions` 块（既有 `version_drift`/`machines`/`fleet` 字段不变，名册读取失败时
+  `all_current:false`）。面板「编队版本」卡片 UI 本次不做（`lib/client.js` 不在本半）。
+- **C 保留策略**：`rotation.mjs` 新增 `selectPrunable(records,{keep,maxAgeDays,now})` 纯函数与 `maxAgeDays` 规则：
+  **两条规则同时生效**——只有既在“最新 `keep` 份之内”又“不早于 N 天”的记录才保留；0/缺省 = 仅按份数。
+  `resolveMaxAgeDays` 在 engine/gc 任何写盘前校验，非法值具名拒绝 `BACKUP_ROTATION_POLICY_INVALID`。
+  `gc({maxOldVersionDays})`、CLI `run/gc --max-old-days <n>`、插件配置 `backupOldVersionDays` 全链路接线；
+  gc 顺序保持“先收集全部引用、再删块、最后轮转清理”，`BACKUP_GC_UNSAFE` 规则不变（同一次 gc 中被清掉的
+  old 记录不会让它的块在同一次运行里被误删，块至少活到下一次 gc）。
+- **D 异地副本**：新增 `src/backup/mirror.mjs`。`runBackup({mirrorRoot})` 在提交（且轮转成功）之后把本次快照
+  引用的密封块（**只补缺失**）、`snapshots/<id>/{manifest.json,keys.json}`、仓库描述与信封元数据复制到镜像，
+  并按 `snapshot_id` 幂等追加镜像 `index.jsonl`；镜像路径在仓库内 / 在 `$DSH_HOME` 内 / 等于仓库根 / 是文件 →
+  写盘前拒绝 `BACKUP_MIRROR_INVALID`（零提交）；运行期复制失败**不回滚**已提交备份：
+  `ok:true` + `mirror:{ok:false,reason_code,reason,copied}` + `warnings`。CLI `run --mirror <dir>`、插件配置
+  `backupMirrorDir`。边界：镜像按快照增量补块，**不做跨镜像去重**（每个镜像各持一份密封块），明文永不复制；
+  Relay 传输（真正的异地）留 Phase 3。
+
+**测试与门禁（本次必须绿）**：新增 `test/fleet-version-gate.test.mjs`（比较器/预发布边界/决策/看板/派发路径/
+覆盖审计/只读面不被拒/未激活构建不拦截）与 `test/backup-mirror.test.mjs`（幂等、索引只追加一次、镜像路径拒绝、
+失败不回滚、镜像侧 `openRepo`+`rebuildFile` 完整性）；`test/backup-rotation.test.mjs`/`test/backup-gc.test.mjs`/
+`test/backup-run.test.mjs` 扩展保留策略与 CLI 解析；`package.json#scripts.test`/`test:all` 与
+`test/backup-wiring.test.mjs` 套件清单同步；`npx eslint .` 0 error、`node scripts/layer-check.mjs` clean、
+`node scripts/pack.mjs` 通过。`docs/BACKUP-DESIGN.md` §21 记录保留策略与异地副本协议；`FLEET-RULES.md` §9
+记录门禁规则。
+
+**延期（明确不在本次）**：① 面板「编队版本」卡片（UI 半，`lib/client.js`）；② Relay Phase 2 合并（独立评审线，
+不阻塞本半）；③ 协议 v2 变更规则文档（`w2m-session-backup/v1` 仍冻结，只增字段）。发布步骤（6 处版本号同步、
+preflight、三方发布）属于发布审批，不在本半执行。
+
 ---
 
 ## 8. 每个版本的 Definition of Done（统一清单）

@@ -22,7 +22,17 @@
  *   * no openable key (`BACKUP_NO_PERMISSION`) -- before any block is written;
  *   * another writer (`BACKUP_LOCKED`);
  *   * a scope that selects nothing (`BACKUP_SCOPED_NOTHING`);
- *   * a non-repository target (`BACKUP_DIR_*` codes from `layout.mjs`).
+ *   * a non-repository target (`BACKUP_DIR_*` codes from `layout.mjs`);
+ *   * an invalid retention window (`BACKUP_ROTATION_POLICY_INVALID`) or a mirror path inside the repository /
+ *     the home it copies (`BACKUP_MIRROR_INVALID`) -- both before any write, so a configuration mistake leaves
+ *     no half-built snapshot behind.
+ *
+ * ## The offsite mirror is best effort, and strictly after the primary
+ *
+ * When a mirror is configured, `runBackup` copies the committed snapshot's sealed blocks and metadata to it after
+ * the commit and rotation succeed. A mirror failure is reported as `mirror.ok: false` plus a warning on an
+ * `ok: true` result: the primary backup is durable and correct, and a second copy that failed must not downgrade
+ * it. With no mirror configured the result shape is unchanged (no `mirror` key).
  *
  * Every refusal is a `{ok:false, reason_code, detail}` result, not an exception: the route and the CLI print the
  * same refusal, and a scheduled run logs it instead of tearing the timer down.
@@ -41,7 +51,8 @@ import { detectMachineKeySupport } from './machine-key.mjs';
 import { appendLegalEvent, futureAppendVerdict } from './future-append.mjs';
 import { buildArtifactFromBuffer, runtimeValidateBatch } from './runtime-validate.mjs';
 import { scanHome } from './scan.mjs';
-import { DEFAULT_KEEP_OLD, rotateForEntry } from './rotation.mjs';
+import { DEFAULT_KEEP_OLD, resolveMaxAgeDays, rotateForEntry } from './rotation.mjs';
+import { MIRROR_CODES, resolveMirrorRoot, syncToMirror } from './mirror.mjs';
 import { commitSnapshot, makeSnapshotId } from './repo.mjs';
 import { scanFrames } from '../fix/zstd.mjs';
 
@@ -250,6 +261,8 @@ function safeMtime(file) {
  *   runner?: Function,
  *   now?: Date,
  *   keepOldPerSession?: number,
+ *   maxOldVersionDays?: number|null,
+ *   mirrorRoot?: string|null,
  *   dryRun?: boolean,
  *   exclude_session_ids?: string[],
  *   scan?: typeof scanHome,
@@ -265,6 +278,26 @@ export function runBackup(input) {
   const keepOld = Number.isSafeInteger(input.keepOldPerSession) && input.keepOldPerSession >= 0
     ? input.keepOldPerSession
     : DEFAULT_KEEP_OLD;
+  // The age half of the retention policy is validated before the lock, the layout and the key: an invalid
+  // window would otherwise be discovered only after the snapshot was committed (inside rotation), which would
+  // turn a configuration mistake into a reported rotation failure on an otherwise durable backup.
+  const agePolicy = resolveMaxAgeDays(input.maxOldVersionDays);
+  if (agePolicy.ok !== true) {
+    return { ok: false, reason_code: agePolicy.reason_code, detail: agePolicy.detail, dry_run: dryRun };
+  }
+  const maxOldVersionDays = agePolicy.maxAgeDays;
+
+  // The offsite mirror is validated here too: a mirror path that points inside the repository (or the home it
+  // copies) is refused before ensureLayout/lock/commit, so a refused configuration leaves no snapshot behind.
+  // A dry run never mirrors, so it needs no mirror validation.
+  let mirrorRoot = null;
+  if (dryRun !== true && typeof input.mirrorRoot === 'string' && input.mirrorRoot.trim() !== '') {
+    const resolved = resolveMirrorRoot({ repoRoot: root, dshHome, mirrorRoot: input.mirrorRoot });
+    if (resolved.ok !== true) {
+      return { ok: false, reason_code: resolved.reason_code ?? MIRROR_CODES.INVALID, detail: resolved.detail, dry_run: false };
+    }
+    mirrorRoot = resolved.root;
+  }
 
   const scope = normalizeScope({ scope: input.scope, selected: input.selected });
   if (scope.ok !== true) return { ok: false, reason_code: scope.reason_code, detail: scope.detail, dry_run: dryRun };
@@ -470,6 +503,8 @@ export function runBackup(input) {
         runtime_future_append: runtimeFutureAppend,
         dedupe_ratio: blocksNew + blocksReused === 0 ? 0 : blocksReused / (blocksNew + blocksReused),
         key_upgraded: key.machine_envelope_added === true,
+        keep_old_per_session: keepOld,
+        max_old_version_days: maxOldVersionDays,
         duration_ms: Date.now() - started,
       };
     }
@@ -479,7 +514,14 @@ export function runBackup(input) {
     // Rotation happens after the commit, so a rotation failure must not read as "no backup happened".
     let rotations;
     try {
-      rotations = sessionEntries.map((entry) => rotateForEntry({ root, entry, snapshotId: committed.snapshot_id, keep: keepOld, now }));
+      rotations = sessionEntries.map((entry) => rotateForEntry({
+        root,
+        entry,
+        snapshotId: committed.snapshot_id,
+        keep: keepOld,
+        maxAgeDays: maxOldVersionDays,
+        now,
+      }));
     } catch (error) {
       return {
         ok: false,
@@ -495,6 +537,34 @@ export function runBackup(input) {
       };
     }
     const rotated = rotations.filter((row) => row.rotated === true);
+
+    // The offsite copy is strictly after the primary commit and rotation: it is a second, best-effort location,
+    // never a precondition. A mirror failure is reported in the result and as a warning, but it does not roll
+    // back (the primary backup is durable and correct) and it must never turn `ok` false or throw.
+    let mirror = null;
+    let mirrorWarnings = null;
+    if (mirrorRoot !== null) {
+      try {
+        const synced = syncToMirror({ root, mirrorRoot, dshHome, snapshotId: committed.snapshot_id, now });
+        mirror = {
+          ok: true,
+          root: synced.root,
+          copied: synced.copied,
+          skipped: synced.skipped,
+          index_appended: synced.index_appended,
+          descriptor_copied: synced.descriptor_copied,
+        };
+      } catch (error) {
+        const reasonCode = error?.code ?? MIRROR_CODES.FAILED;
+        mirror = {
+          ok: false,
+          reason_code: reasonCode,
+          reason: error?.detail ?? (error instanceof Error ? error.message : String(error)),
+          copied: error?.copied ?? { files: 0, bytes: 0 },
+        };
+        mirrorWarnings = [`${reasonCode}: the primary backup is committed, but the offsite copy failed: ${mirror.reason}`];
+      }
+    }
 
     return {
       ok: true,
@@ -522,8 +592,14 @@ export function runBackup(input) {
       key_created: key.created,
       key_upgraded: key.machine_envelope_added === true,
       machine: { available: key.machine?.ok === true, reason: key.machine?.reason ?? null },
+      keep_old_per_session: keepOld,
+      max_old_version_days: maxOldVersionDays,
       rotated: rotated.length,
       old_versions: rotated.map((row) => row.old_file),
+      // Absent unless a mirror is configured: a repository with no mirror keeps the exact result shape it had
+      // before the offsite feature existed.
+      ...(mirrorRoot === null ? {} : { mirror }),
+      ...(mirrorWarnings === null ? {} : { warnings: mirrorWarnings }),
       duration_ms: Date.now() - started,
     };
   } catch (error) {
