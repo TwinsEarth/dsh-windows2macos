@@ -11,7 +11,8 @@ All notable changes to this project are documented here.
 - **删除语义（评审条件 4）**：闭合数据层——`load()` 按 tombstone 过滤消息、`prune()` 删除被删会话的死行（tombstone 永久保留）、导入的晚到旧消息拒收、`deleteChatSession()` 为唯一删除写路径、退役 session 的 `POST /v1/fleet/messages` 返回 400 `SESSION_DELETED`；设备面 HTTP 删除路由**明确推迟**（理由与后续见 ADR §5.4）。
 - **文档（评审条件 2）**：新增 `docs/RELAY-CLUSTER-SYNC-PHASE2-DESIGN.md`（Phase 2 ADR：协议兼容/数据模型/删除语义/安全/回滚/迁移/验证/残余风险）与 `docs/RUNBOOK-RELAY-ROLLING-UPGRADE.md`（滚动升级手册：B→C→A、混合版本矩阵、每步门禁、回滚、禁止事项）；v3.0.0 设计 §1.3/§2.3、评审文档与 DEV-PLAN 均加交叉链接/状态更新。
 - **测试门禁（评审条件 3）**：`chat-store`/`project-sync`/`cluster-domains`/新增 `relay-phase2-server` 四套件进入 `package.json#scripts.test` 与 `test:all` 并各有独立脚本；`test/relay-phase2-server.test.mjs` 10 项覆盖 server 接线（feature/路由、chat 持久化与重启、真实 HTTP 跨 relay chat+项目拉取、混合版本跳过、tombstone 重启与 peer、`SIGNATURE_MISMATCH` 恢复后的用户文案、套件门禁接线）。`npx eslint .` 0 error、`node scripts/layer-check.mjs` clean、`node scripts/scan-mojibake.mjs` clean。
-- **未执行**：不 push、不改包版本（仍 3.4.5）、不跑三节点/混合版本真实进程验证（发布前留证，见 ADR §12）、不部署；preflight 在主线合并后跑一次。
+- **验证（本机、合并后）**：`node scripts/verify-relay-cluster-phase2.mjs` **9/9 PASS**（3 个真实 relay 子进程 + 真实 HTTP，含重启恢复）；`W2M_RELAY_OLD_TGZ=<Relay 3.0.0 归档> node scripts/verify-relay-cluster-mixed.mjs` **6/6 PASS**（2×3.0.0 + 1×本构建，含混合版本跳过与滚动升级后 chat 收敛）。两者仍是发布前手工证据（不进 npm 门禁）。
+- **未执行**：不 push、不改包版本（仍 3.4.5）、不部署；全量 preflight 在主线上跑一次（GREEN：16 pass / 0 fail / 1 accepted UNVERIFIABLE；declared suite 4146 pass / 0 fail / 22 accepted skip）。
 
 ### 异地镜像：写入时链接防护（realpath 加固补记，未发布）
 

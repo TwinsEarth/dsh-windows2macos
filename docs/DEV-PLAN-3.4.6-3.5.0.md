@@ -380,9 +380,10 @@ Phase 2 分支 → `aee1a9b` 独立编码修复 → ADR/手册/门禁收口）�
   server 接线（feature/路由、chat 持久化与重启、真实 HTTP 跨 relay 拉取、混合版本跳过、tombstone、签名文案）。
 - **删除语义**：数据层闭环（tombstone 过滤、prune 清死行、导入旧消息拒收、`deleteChatSession` 唯一写路径、
   退役 session 的 POST 返回 `SESSION_DELETED`）；设备面 HTTP 删除路由明确推迟（ADR §5.4）。
-- **仍待**：`scripts/verify-relay-cluster-phase2.mjs`（三节点 2/2）与 `scripts/verify-relay-cluster-mixed.mjs`
-  （需 Relay 3.0.0 归档）的发布前运行留证；relay 版本标签口径统一。本次不 bump 版本，版本号与三方发布由发布
-  审批统一处理。
+- **验证（2026-11-17，合并后本机真进程）**：`verify-relay-cluster-phase2.mjs` **9/9 PASS** 与
+  `verify-relay-cluster-mixed.mjs` **6/6 PASS**（真实子进程 + 真实 HTTP，含混合版本跳过与滚动升级）；线上三台按
+  `docs/RUNBOOK-RELAY-ROLLING-UPGRADE.md` §5 复核。**仍待**：relay 版本标签口径统一（发布前）。本次不 bump
+  版本，版本号与三方发布由发布审批统一处理。
 
 ---
 

@@ -188,6 +188,10 @@ W2M_RELAY_OLD_TGZ=/path/to/w2m-relay-3.0.0.tgz node scripts/verify-relay-cluster
 ```
 
 > 这两个脚本在本机/构建机上跑（会自己开进程与端口），**不在线上三台执行**。
+>
+> 2026-11-17 构建机基线：`verify-relay-cluster-phase2.mjs` **9/9 PASS**；
+> `verify-relay-cluster-mixed.mjs`（默认 Relay 3.0.0 归档）**6/6 PASS**，含混合版本跳过与滚动升级后 chat 收敛。
+> 这两个数字是构建机的记录，线上三台仍按 §5.1–§5.4 复核。
 
 ---
 

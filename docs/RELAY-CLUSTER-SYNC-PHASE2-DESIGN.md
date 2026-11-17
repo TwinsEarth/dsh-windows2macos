@@ -353,7 +353,7 @@ curl -fsS http://127.0.0.1:8787/healthz | node -e "let s='';process.stdin.on('da
 
 1. **删除语义（风险 4）**：数据层已闭环（§5.2），设备面 HTTP 删除路由明确推迟（§5.4）；在路由落地前不得对外宣称跨 relay 删除可用。
 2. **版本标签（风险 5）**：展示标签未统一（§2.3）；feature bits 才是兼容契约。发布流程可统一 `W2M_RELAY_VERSION` 口径。
-3. **混合版本/滚动升级（风险 6）**：`verify-relay-cluster-mixed.mjs` 需要 Relay 3.0.0 归档（`W2M_RELAY_OLD_TGZ`），本次合并收口**未运行**它；三节点验证 `verify-relay-cluster-phase2.mjs` 本次合并后需在真实三节点/本地三进程跑一次并留证（不在本合并的自动化门禁内）。
+3. **混合版本/滚动升级（风险 6）**：已用真实进程跑通并留证（2026-11-17，合并后的树）：`verify-relay-cluster-phase2.mjs` **9/9 PASS**（3 个 relay 子进程、真实 HTTP cluster 路由、含重启恢复）；`verify-relay-cluster-mixed.mjs` **6/6 PASS**（2×Relay 3.0.0 归档 + 1×本构建，含 unsupported 跳过与滚动升级后 chat 收敛）。两个脚本仍是**发布前手工证据**而非 npm 门禁（需要多进程与旧版归档）；真实三台线上环境的验收按 `docs/RUNBOOK-RELAY-ROLLING-UPGRADE.md` §5 执行。
 4. **数据迁移与回滚（风险 7）**：见 §8；relay state 不在备份扫描（§7.3）——v3.5.0 备份增强可承接。
 5. **并发/原子性（风险 8）**：无 fsync；`projects/objects.json` 与房间快照两次写非事务；`persistence.saveProjectObjects/loadProjectObjects` 目前没有调用者（state 内联实现重复）——清理死代码列为后续。
 6. **容量/性能（风险 9）**：启动时同步 `readLog()` 加载 chat 日志；未开 cluster 的 relay 只在启动 prune；project 事件全量 JSON 写。当前状态可接受，优化（阈值/异步/分页加载）列为后续。
