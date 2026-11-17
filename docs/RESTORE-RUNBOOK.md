@@ -3,15 +3,27 @@
 适用：只有备份仓库（本地 `D:\DeepSeekHarness\BackUP` 或异地镜像），目标是一台**新的或清空的** `$DSH_HOME`。
 目标：会话可见、工作区名称/顺序/归档置顶一致、插件行配置一致、身份/凭据按开关处理。
 
-## 0. 先决条件
+## 恢复顺序（五步）
+
+| 步骤 | 做什么 | 在哪 |
+|---|---|---|
+| **1. 装 DSH** | 安装宿主与 w2m 插件（插件提供 `w2m-backup`；先装宿主，再 `dsh plugin add`，**不要启动**） | §1 |
+| **2. 装依赖** | `dsh-runtimes/`、`profiles/*/node_modules/`、`xray-proxy/`（可重装，故意不在备份里） | §2 |
+| **3. 恢复 scopes** | `restore --dry-run` 核对 → `restore --apply`（会话/附件/registry/config/state） | §3 |
+| **4. 登录/入队** | 启动 DSH → 原账户登录 → 编队入队；凭据是否随备份由 P1 开关决定 | §4 |
+| **5. 校验** | `verify`（coverage gap=0）→ 会话/工作区 → 插件行 → 面板 → 手动跑一次备份 | §5 |
+
+> 顺序不能颠倒：依赖不在位时 DSH 起不来；scopes 未恢复前登录会生成"新"的注册表/配置，覆盖备份语义；
+> 登录之后恢复 config/state 可能被运行中的客户端写回。每步失败都停在该步，不要带着半状态继续。
+## 步骤 1 · 装 DSH 与前置检查
 
 - [ ] DSH 已安装（版本 ≥ 插件 `engines.dsh` 要求），且**未启动**（恢复写文件时必须停客户端；G2 的复查只在启动后才有意义）。
 - [ ] 备份仓库可读：`w2m-backup status` 显示 `initialized: yes` 且快照非空。
 - [ ] 知道仓库的解锁方式（machine / account / PIN）。`w2m-backup unlock` 会列出可用路径。
 - [ ] 备份包含 P0 scopes（`registry`/`config`/`state`）：`w2m-backup list --json` 或 `verify` 的 `coverage` 可核对；
-      旧快照可能没有这些条目，此时按 §4 的"降级路径"处理。
+      旧快照可能没有这些条目，老快照的降级路径见步骤 3 末尾。
 
-## 1. 装回"可重装"依赖（不来自备份，故意不备份）
+## 步骤 2 · 装回"可重装"依赖（不来自备份，故意不备份）
 
 | 目录 | 大小量级 | 做法 |
 |---|---|---|
@@ -21,7 +33,7 @@
 
 这三项**不要**放进备份：它们可重装、体积大、且二进制与平台绑定。恢复后 DSH 启动失败时，先查这三项是否就位。
 
-## 2. 恢复数据（两次运行，顺序固定）
+## 步骤 3 · 恢复 scopes（两次运行，顺序固定）
 
 ```powershell
 # 2.1 预览计划：会话 / 附件 / registry / config / state 数量、冲突与写回目标
@@ -38,7 +50,7 @@ w2m-backup restore --root D:\DeepSeekHarness\BackUP --dsh-home <new-home> --appl
 - 老快照没有 `registry` 条目时：还原需要 `--workspace-path`（一次一个 workspace）；多 workspace 请按顺序跑多次，
   或先升级备份（`w2m-backup run` 用新版本 → 新快照带 registry 后再还原）。
 
-## 3. 身份与凭据（按 P1 开关）
+## 步骤 4 · 登录 / 入队（身份与凭据按 P1 开关）
 
 | 场景 | 做法 |
 |---|---|
@@ -47,7 +59,7 @@ w2m-backup restore --root D:\DeepSeekHarness\BackUP --dsh-home <new-home> --appl
 
 无论哪种，恢复后第一次启动都建议重新登录一次以验证凭据库格式与当前 DSH 版本匹配。
 
-## 4. 恢复后验收（逐项）
+## 步骤 5 · 恢复后校验（逐项）
 
 1. `w2m-backup verify` → `result: every claim holds`；`coverage` 的 `gap_count` 应为 0（或只剩已分类的可重装/凭据项）。
 2. 打开 DSH：会话列表数量与备份一致；工作区名称/顺序与备份时一致；归档/置顶状态一致。
@@ -55,7 +67,7 @@ w2m-backup restore --root D:\DeepSeekHarness\BackUP --dsh-home <new-home> --appl
 4. 打开「备份&还原」面板：状态卡显示正确的仓库路径/快照数/`old/` 用量；如显示"已包含凭据"红色警告，确认这是你有意为之。
 5. 手动跑一次备份：新快照提交成功、`verify` 全绿、`last_result` 里 `scopes` 与（如启用）`secrets_included` 正确。
 
-## 5. 回滚
+## 回滚
 
 恢复失败或恢复后不可用：
 
@@ -67,7 +79,7 @@ Get-ChildItem <new-home>\.w2m-restore-backups -Directory | Sort-Object Name -Des
 
 若连 `$DSH_HOME` 都不可用：删除它，从 §1 重新开始（备份仓库不受影响）。
 
-## 6. 已知边界（本版）
+## 已知边界（本版）
 
 - `.w2m-restore-backups/` 不在备份内（避免备份自引用）；跨机恢复依赖的是备份仓库本身。
 - `state` 文件是某一瞬间的快照：客户端正在写某个状态文件时备份的副本可能不是该文件的最新态。
