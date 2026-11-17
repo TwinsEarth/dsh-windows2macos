@@ -59,7 +59,7 @@ describe('backup wiring: package and entry points', () => {
   });
 
   it('names every backup suite in scripts.test, test:all and its own script', () => {
-    const suites = ['backup-layout', 'backup-scan', 'backup-crypto', 'backup-protocol', 'backup-wiring'];
+    const suites = ['backup-layout', 'backup-scan', 'backup-crypto', 'backup-protocol', 'backup-repo', 'backup-wiring'];
     for (const suite of suites) {
       assert.equal(pkg.scripts[`test:${suite}`], `node --test --test-force-exit test/${suite}.test.mjs`, `test:${suite} missing`);
       assert.ok(pkg.scripts.test.includes(`test/${suite}.test.mjs`), `${suite} missing from scripts.test`);
@@ -100,6 +100,14 @@ describe('backup wiring: the layer model', () => {
     const scan = readFileSync(join(ROOT, 'src', 'backup', 'scan.mjs'), 'utf8');
     assert.match(doctor, /util\/dsh-workspace\.mjs/u, 'the doctor must reuse the shared parser');
     assert.match(scan, /util\/dsh-workspace\.mjs/u, 'the scanner must reuse the shared parser');
+  });
+
+  it('exposes ONE status shape to the route and the CLI', () => {
+    const routes = readFileSync(join(ROOT, 'src', 'backup', 'routes.mjs'), 'utf8');
+    const cli = readFileSync(join(ROOT, 'src', 'backup', 'cli.mjs'), 'utf8');
+    assert.match(routes, /from '\.\/repo\.mjs'/u, 'the status route must read the repository through repo.mjs');
+    assert.match(cli, /buildStatus/u, 'the CLI must print the route payload rather than re-deriving it');
+    assert.match(cli, /from '\.\/routes\.mjs'/u);
   });
 });
 

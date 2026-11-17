@@ -22,6 +22,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { inspectLayout, resolveBackupDir, LAYOUT_CODES, BackupLayoutError } from './layout.mjs';
+import { openRepo } from './repo.mjs';
 import { scanHome, summarize } from './scan.mjs';
 
 /** Path of the read-only status route. */
@@ -70,11 +71,36 @@ export function buildStatus(options = {}) {
     return { ok: false, ...refusal, dsh_home: dshHome, checked_at: new Date().toISOString() };
   }
   const inspected = inspectLayout(backupDir, { dshHome });
+  // An initialised repository additionally reports its snapshots and index health; an absent or empty one does
+  // not get opened, because openRepo would only restate "not initialised" and the cheap inspection already knows.
+  const repoState = inspected.error === null && inspected.initialized ? openRepo({ root: backupDir, dshHome }) : null;
+  const repository = {
+    ...inspected,
+    ...(repoState === null
+      ? {}
+      : {
+          snapshots: repoState.snapshots.length,
+          latest:
+            repoState.latest === null || repoState.latest.valid !== true
+              ? null
+              : {
+                  snapshot_id: repoState.latest.snapshot_id,
+                  created_at: repoState.latest.manifest?.created_at ?? null,
+                  files: repoState.latest.manifest?.files ?? 0,
+                  sessions: repoState.latest.manifest?.sessions ?? 0,
+                  bytes: repoState.latest.manifest?.session_bytes ?? 0,
+                  digest: repoState.latest.digest,
+                },
+          index: repoState.index,
+        }),
+    ...(repoState === null || repoState.ok ? {} : { repo_error: repoState.error }),
+  };
+  const ok = inspected.error === null && (repoState === null || repoState.ok);
   return {
-    ok: inspected.error === null,
+    ok,
     checked_at: new Date().toISOString(),
     dsh_home: dshHome,
-    repository: inspected,
+    repository,
     schedule: { ...DEFAULT_SCHEDULE },
     read_only: true,
     ...(inspected.error === null ? {} : { reason_code: inspected.error.code, detail: inspected.error.detail }),

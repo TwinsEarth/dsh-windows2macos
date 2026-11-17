@@ -99,6 +99,19 @@
 
 **为什么清单是明文**：它只含路径、大小、时间和哈希，不含任何消息正文；而 `status`/`scan` 需要在**未解锁**时展示"备份了多少、什么时候"。代价是路径会暴露会话 id 与工作区名——这一点写在 §8 威胁模型里，不假装没有。正文在块里，块才是加密的。
 
+**索引行（`index.jsonl`，v1 冻结）**：快照提交后追加一行，只有计数与摘要，不含任何路径/工作区名——`status` 因此可以在未解锁时展示"备份了多少"，而 `verify`（v3.4.8）用 `digest` 把索引与清单串起来。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `format` | string | 固定 `w2m-session-backup/index` |
+| `version` | integer | 固定 `1` |
+| `snapshot_id` | string | `YYYYMMDDTHHMMSSZ-<8 hex>`，字典序 = 时间序 |
+| `created_at` | string | ISO 时间 |
+| `files` / `bytes` / `blocks` / `sessions` / `attachments` | integer | 全部由清单推导，不单独记录 |
+| `digest` | string | 清单 canonical JSON 的 sha256 |
+
+尾部半行（append 时崩溃）被读成 `torn_tail` 而不是"索引损坏"：快照仍在磁盘上，可以重新索引；中间某行损坏则逐行报告，其余行照常可读。提交时 **append 后立刻回读校验**——索引是"某个快照已提交"的唯一记录，半写必须在提交时就发现，而不是等到还原那天。
+
 **块切分**：固定 4 MiB 定长切块（不滚动哈希）。勘察显示跨会话去重率 **0%**（不同会话内容本就不重复），去重收益全部来自**同一会话的历史版本之间**；定长块在这种 append-only 场景下已经能复用除尾部块外的全部数据（172 MB 中 153.8 MB 可复用），滚动哈希只增加实现风险。
 
 ## 5. 备份范围与排除
@@ -193,6 +206,7 @@
 | `src/backup/scan.mjs` | 会话/附件/注册表枚举、header 读取、可选 hash/deep | **绝不** |
 | `src/backup/manifest.mjs` | 清单 schema、块切分、路径规范化、严格校验、摘要 | 只读源文件 |
 | `src/backup/crypto.mjs` | scrypt/hkdf 派生、AES-256-GCM 封包、三信封、块对象、`selftest` | **绝不**（纯内存） |
+| `src/backup/repo.mjs` | 快照 id、快照两文件、`index.jsonl` 行格式与读写、`commitSnapshot`、只读 `openRepo` | 仅 `commitSnapshot`/`appendIndex` 会写（测试与 v3.4.7 引擎；路由与 CLI 不调用） |
 | `src/backup/routes.mjs` | `GET /api/w2m/backup/status`、`GET /api/w2m/backup/scan` | **绝不** |
 | `src/backup/cli.mjs` + `bin/w2m-backup.mjs` | `status` / `scan` / `selftest`（`scan --manifest` 在内存里构建清单） | **绝不** |
 | `src/util/dsh-workspace.mjs` | `workspace.json` 解析，doctor 与 scan **共用一份** | **绝不** |

@@ -197,12 +197,13 @@ D:\DeepSeekHarness\BackUP\
 3. `src/backup/scan.mjs`：枚举 `sessions/**` 与 `attachments/**`，读 `workspace.json` 得到 活动/归档/置顶 标记；**只读**。
 4. `src/backup/manifest.mjs`：清单 schema、哈希与块切分（4 MiB）、路径规范化（大小写/分隔符）。
 5. `src/backup/crypto.mjs`：scrypt/HKDF KDF、AES-256-GCM 封包、三信封（account/machine/password，包裹同一个随机 DEK）、AAD 绑定、篡改检测与 `selftest`。**spike 后默认组合 = machine + password**（`docs/SPIKE-ACCOUNT-KEK.md`）。
-6. `src/queue-journal` 之外新增只读路由 `/api/w2m/backup/status`、`/api/w2m/backup/scan`（不写盘）。
-7. CLI 骨架 `bin/w2m-backup.mjs`：`status`、`scan`、`selftest`（加密自检）。
-8. **顺带修债**：把 `test/agent.test.mjs`「transport re-delivery from cache」的 15s 计时等待改为按事件条件 + 更大预算，消除满负载偶发超时（v3.4.5 本机全量套件曾因此 1 次红）。
-9. 接线：`scripts/layer-model.mjs` 增加 `backup` 层（rank 1，capability）与三条向下边（`plugin -> backup`、`backup -> fix`、`backup -> util`）；`package.json#scripts.test` 与 `test:all` 加 5 个 `test/backup-*.test.mjs` 并各配一条 `test:backup-*` 命名脚本；`package.json#bin` 加 `w2m-backup`。**偏差（2026-11-17 实施记录）**：原计划在 `cordis.patch.yml` 增加默认 `disabled: true` 的 `dsh-backup` 行，实际推迟到 v3.4.7 —— v3.4.6 只有只读路由与只读 CLI，没有需要关掉的副作用；一个默认关闭的子插件行会让状态卡片在默认配置下直接报未启用，把可用功能藏起来。等引擎/定时器开始可能写盘时再引入（见 `docs/BACKUP-DESIGN.md` §10）。
+6. `src/backup/repo.mjs`：快照 id（`YYYYMMDDTHHMMSSZ-<8 hex>`，字典序即时间序）、快照两文件（`manifest.json`/`keys.json`）、`index.jsonl` 行格式（只有计数与摘要，不含路径）、`commitSnapshot` 原语（staging → rename → append → 回读校验）、`openRepo` 只读状态；status 路由与 CLI 共用同一份状态。**协议冻结的一半在 manifest，另一半在 index。**
+7. `src/queue-journal` 之外新增只读路由 `/api/w2m/backup/status`、`/api/w2m/backup/scan`（不写盘）。
+8. CLI 骨架 `bin/w2m-backup.mjs`：`status`、`scan`、`selftest`（加密自检）。
+9. **顺带修债（已完成 2026-11-17）**：把 `test/agent.test.mjs`「transport re-delivery from cache」的 15s 默认预算改为按事件条件 + 60s 预算（`rabbit.stream(60_000)` 与三个 `waitFor` 显式 60s；不停表、不加 sleep）。实测：满载全量套件曾需要 ~22s 而红，隔离运行 ~3.0s。
+10. 接线：`scripts/layer-model.mjs` 增加 `backup` 层（rank 1，capability）与三条向下边（`plugin -> backup`、`backup -> fix`、`backup -> util`）；`package.json#scripts.test` 与 `test:all` 加 6 个 `test/backup-*.test.mjs` 并各配一条 `test:backup-*` 命名脚本；`package.json#bin` 加 `w2m-backup`。**偏差（2026-11-17 实施记录）**：原计划在 `cordis.patch.yml` 增加默认 `disabled: true` 的 `dsh-backup` 行，实际推迟到 v3.4.7 —— v3.4.6 只有只读路由与只读 CLI，没有需要关掉的副作用；一个默认关闭的子插件行会让状态卡片在默认配置下直接报未启用，把可用功能藏起来。等引擎/定时器开始可能写盘时再引入（见 `docs/BACKUP-DESIGN.md` §10）。
 
-**测试**：`test/backup-layout.test.mjs`、`test/backup-scan.test.mjs`、`test/backup-crypto.test.mjs`（含“错误密码/错误账户/篡改一字节”三态）、`test/backup-protocol.test.mjs`（清单字段与版本号冻结）、`test/backup-wiring.test.mjs`（导出/行/CLI 存在）。
+**测试**：`test/backup-layout.test.mjs`、`test/backup-scan.test.mjs`、`test/backup-crypto.test.mjs`（含“错误密码/错误账户/篡改一字节”三态）、`test/backup-protocol.test.mjs`（清单字段与版本号冻结）、`test/backup-repo.test.mjs`（快照 id/索引行/提交与回读/只读打开）、`test/backup-wiring.test.mjs`（导出/行/CLI 存在）。
 
 **验收**：本机真实 `$DSH_HOME` 扫描出 **15 个会话 / 166.3 MiB**、归档 4 / 置顶 4 / 未注册 2（2026-11-17 实测）；`w2m-backup status` 对尚未创建的 `D:\DeepSeekHarness\BackUP` 报告未初始化且**不创建它**；`w2m-backup selftest` 9 步全绿；`scan --manifest` 在内存里得到 54 个块并给出摘要（不写盘）；preflight 在 **空 `DSH_HOME`** 下 GREEN。
 

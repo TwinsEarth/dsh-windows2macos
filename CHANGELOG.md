@@ -10,8 +10,10 @@ All notable changes to this project are documented here.
 - 新增 `src/backup/{layout,scan,manifest,crypto}.mjs`：仓库路径与具名失败（盘符缺失/无权限/别家仓库/仓库在 `$DSH_HOME` 内）、只读扫描（会话 + 注册表标记 + 附件对象，可选 hash/deep）、清单 schema 与严格校验（块对齐、路径规范化、计数自洽）、scrypt/HKDF + AES-256-GCM 三信封 + 块对象 + `selftest`。
 - 新增 `docs/SPIKE-ACCOUNT-KEK.md`（只读 spike，329 行）：核对 DSH 账户材料后确认——磁盘没有稳定账户标识，`userId` 只是标识不是秘密，用它派生 KEK 等于加密表演；**默认信封组合改为 `machine`（Windows DPAPI，同机免密）+ `password`（scrypt，唯一保证）**，`account` 降级为可选、且写入前必须先修 `getProfile(client)` 调用并做宿主内实测。scrypt 默认按实测取 N=2^17（约 461 ms）。
 - 新增只读路由 `GET /api/w2m/backup/status|scan`（由主插件挂载，不写盘）与 `bin/w2m-backup.mjs`（`status` / `scan` / `selftest`；`scan --manifest` 在内存里构建清单并给出摘要）。
+- 新增 `src/backup/repo.mjs`：快照 id（`YYYYMMDDTHHMMSSZ-<8 hex>`，字典序即时间序）、快照两文件、`index.jsonl` 行格式（只有计数与摘要，**不含路径**）、`commitSnapshot`（staging → rename → append → **回读校验**）、`openRepo` 只读状态；`status` 路由与 CLI 打印同一份状态，不再各推一遍。
+- 顺带修债：`test/agent.test.mjs`「transport re-delivery from cache」原先用 15s 默认预算，满载实测曾需 ~22s 而红；改为全程事件条件 + 60s 显式预算（`rabbit.stream(60_000)` 与三个 `waitFor`），不加 sleep、不放松断言，真实挂起仍会在 60s 失败。
 - `workspace.json` 的解析抽到 `src/util/dsh-workspace.mjs`，`session-doctor` 与备份扫描共用一份——两个解析器会静默给出不同答案，而复盘里正是“注册表状态不一致”害得会话看不见。
-- 新增 5 个测试套件共 98 项：布局的 5 类失败、只读扫描（含“扫描前后字节与 mtime 完全一致”）、加密三态（错密码/错账户/篡改一字节）与“信封换槽/降低参数”拒绝、清单字段冻结与 17 类非法清单、接线（bin/路由/层模型/脚本清单）。
+- 新增 6 个测试套件共 120 项：布局的 5 类失败、只读扫描（含“扫描前后字节与 mtime 完全一致”）、加密三态（错密码/错账户/篡改一字节）与“信封换槽/降低参数”拒绝、清单字段冻结与 17 类非法清单、仓库协议（快照 id/索引行/提交回读/只读打开）、接线（bin/路由/层模型/脚本清单）。
 - 本机实测（真实 `$DSH_HOME`）：15 条会话 / 166.3 MiB、附件 1 个 / 62 KB、归档 4 / 置顶 4 / 未注册 2；`scan --manifest` 得到 54 个块；`selftest` 9 步全绿；`status` 对尚未创建的 `D:\DeepSeekHarness\BackUP` 报告“未初始化”且不创建它。
 
 ### session-doctor：把"会话找回"的四类失败变成可执行门禁

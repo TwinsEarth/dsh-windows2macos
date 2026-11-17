@@ -15,10 +15,11 @@
 import os from 'node:os';
 import path from 'node:path';
 
-import { BackupLayoutError, inspectLayout, resolveBackupDir } from './layout.mjs';
+import { BackupLayoutError, LAYOUT_CODES } from './layout.mjs';
 import { scanHome } from './scan.mjs';
 import { selftest } from './crypto.mjs';
 import { buildManifest, manifestDigest, manifestSummary } from './manifest.mjs';
+import { buildStatus } from './routes.mjs';
 
 /** Human-readable bytes: `172.0 MB`, `1.2 GB`. */
 export function humanBytes(bytes) {
@@ -110,12 +111,20 @@ export function formatStatus(payload) {
   lines.push(`exists        : ${repo.exists ? 'yes' : 'no (the first backup creates it)'}`);
   if (repo.is_file) lines.push('state         : the path is a file, not a directory');
   lines.push(`initialized   : ${repo.initialized ? `yes (${repo.format} v${repo.version})` : 'no'}`);
-  lines.push(`writable      : ${repo.writable ? 'yes' : 'NO'}`);
+  // `null` means "not measurable without creating the directory", which is not the same as "not writable".
+  lines.push(`writable      : ${repo.writable === null ? 'unknown (not created yet)' : repo.writable ? 'yes' : 'NO'}`);
   lines.push(`free space    : ${repo.free_bytes === null ? 'unknown' : humanBytes(repo.free_bytes)}`);
   if (repo.initialized) {
     lines.push(`objects       : ${repo.counts.objects} prefix(es)`);
     lines.push(`snapshots     : ${repo.counts.snapshots}`);
     lines.push(`old versions  : ${repo.counts.old}`);
+    if (repo.latest !== undefined && repo.latest !== null) {
+      lines.push(`latest        : ${repo.latest.snapshot_id} (${repo.latest.sessions} session(s), ${humanBytes(repo.latest.bytes)})`);
+      lines.push(`latest digest : ${repo.latest.digest}`);
+    }
+    if (repo.index !== undefined) {
+      lines.push(`index         : ${repo.index.entries} entr(ies)${repo.index.torn_tail ? ', TORN tail' : ''}${repo.index.problems > 0 ? `, ${repo.index.problems} problem(s)` : ''}`);
+    }
   }
   lines.push(`schedule      : ${payload.schedule.times.join(', ')} ${payload.schedule.time_zone} (${payload.schedule.implemented ? 'active' : 'engine in v3.4.7'})`);
   if (payload.ok !== true) lines.push(`refusal       : ${payload.reason_code} ${payload.detail ?? ''}`.trimEnd());
@@ -192,9 +201,11 @@ export function main(argv, io = {}) {
   }
 
   if (options.command === 'status') {
-    let backupDir;
+    // The CLI prints the route's payload, verbatim: one status shape means the panel and the terminal cannot
+    // disagree about whether a repository exists, what it holds, or why it is refusing.
+    let payload;
     try {
-      backupDir = resolveBackupDir({ explicit: options.backupDir, env });
+      payload = buildStatus({ backupDir: options.backupDir, dshHome: options.dshHome, env });
     } catch (error) {
       if (error instanceof BackupLayoutError) {
         writeErr(`${error.code}: ${error.detail}`);
@@ -202,18 +213,9 @@ export function main(argv, io = {}) {
       }
       throw error;
     }
-    const repository = inspectLayout(backupDir, { dshHome: options.dshHome });
-    const payload = {
-      ok: repository.error === null,
-      checked_at: new Date().toISOString(),
-      dsh_home: options.dshHome,
-      repository,
-      schedule: { enabled: false, times: ['22:00'], time_zone: 'Asia/Shanghai', implemented: false },
-      read_only: true,
-      ...(repository.error === null ? {} : { reason_code: repository.error.code, detail: repository.error.detail }),
-    };
     write(options.json ? JSON.stringify(payload, null, 2) : formatStatus(payload));
-    return 0;
+    // An unresolved directory is a configuration error (exit 1); an absent repository is a state (exit 0).
+    return payload.reason_code === LAYOUT_CODES.UNRESOLVED ? 1 : 0;
   }
 
   if (options.command === 'scan') {
