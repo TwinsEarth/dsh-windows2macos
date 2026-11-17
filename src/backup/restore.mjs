@@ -41,7 +41,7 @@ import { applyRegistryRestore, planRegistryRestores, workspaceRegistryPath, work
 import { readArchive } from './archive.mjs';
 import { validateCandidates } from './runtime-validate.mjs';
 import { clientGate } from './client.mjs';
-import { isInside, resolveBackupScopes } from './scopes.mjs';
+import { RESTORE_COPY_ROOT, isInside, resolveBackupScopes } from './scopes.mjs';
 import { scanFrames } from '../fix/zstd.mjs';
 import { diagnoseSessionBuffer } from '../util/session-validate.mjs';
 
@@ -77,7 +77,7 @@ export const DEFAULT_KEEP_PRE_RESTORE = 10;
  * outside every scan root, and the session walker skips dot-directories as a second line of defence.
  */
 export function preRestoreRoot(dshHome) {
-  return path.join(dshHome, '.w2m-restore-backups');
+  return path.join(dshHome, RESTORE_COPY_ROOT);
 }
 
 /** `<root>/<compact timestamp>` for one restore. */
@@ -117,10 +117,15 @@ function gateClient(input) {
 /**
  * Entries of the snapshot, split the way a restore treats them.
  *
+ * `restore-copy` entries are reported (the plan says how many the snapshot carries) but deliberately **not**
+ * decoded and never written: they are recovery material, not live state. Restoring them would overwrite the
+ * pre-restore copies a future rollback depends on.
+ *
  * @param {object} snapshot
  * @param {Set<string>|null} wanted session ids, or null for every session
  * @param {Set<string>} scopes the restore's selected scopes (default: all present)
- * @returns {{sessions: Array<object>, attachments: Array<object>, extras: Array<object>, registryEntry: object|null}}
+ * @returns {{sessions: Array<object>, attachments: Array<object>, extras: Array<object>, restoreCopies: Array<object>,
+ *   registryEntry: object|null}}
  */
 function itemsFromSnapshot(snapshot, wanted, scopes) {
   const files = snapshot.manifest.files;
@@ -130,8 +135,11 @@ function itemsFromSnapshot(snapshot, wanted, scopes) {
   const attachments = scopes.has('attachments') ? files.filter((entry) => entry.kind === 'attachment') : [];
   const extras = files.filter((entry) => entry.kind === 'registry' || entry.kind === 'config' || entry.kind === 'state')
     .filter((entry) => scopes.has(entry.kind));
+  // Counted and reported, never decoded: see the function comment. The scope is on by default, so a snapshot from
+  // a default run has these entries; the restore plan must say they are skipped rather than silently dropping them.
+  const restoreCopies = scopes.has('restore_copies') ? files.filter((entry) => entry.kind === 'restore-copy') : [];
   const registryEntry = extras.find((entry) => entry.kind === 'registry' && entry.rel === 'storages/workspace.json') ?? null;
-  return { sessions, attachments, extras, registryEntry };
+  return { sessions, attachments, extras, restoreCopies, registryEntry };
 }
 
 /** Resolve a restore's scope filter (absent = every scope present in the snapshot). */
@@ -190,7 +198,7 @@ export function planRestore(input) {
   if (scopePolicy.ok !== true) return { ok: false, reason_code: RESTORE_CODES.SCOPE_UNKNOWN, detail: scopePolicy.detail };
   const scopes = new Set(scopePolicy.scopes);
   const wanted = Array.isArray(input.sessionIds) && input.sessionIds.length > 0 ? new Set(input.sessionIds.map(String)) : null;
-  const { sessions, attachments, extras } = itemsFromSnapshot(snapshot, wanted, scopes);
+  const { sessions, attachments, extras, restoreCopies } = itemsFromSnapshot(snapshot, wanted, scopes);
   if (sessions.length === 0 && scopes.has('sessions')) {
     return {
       ok: false,
@@ -198,7 +206,9 @@ export function planRestore(input) {
       detail: wanted === null ? `snapshot ${snapshotId} contains no session` : `none of the requested session(s) are in snapshot ${snapshotId}`,
     };
   }
-  if (sessions.length === 0 && extras.length === 0) {
+  // Restore copies are recovery material, not restorable state: a snapshot that only holds them has nothing to
+  // write, but the plan still reports them (counted-and-skipped) instead of pretending the snapshot is empty.
+  if (sessions.length === 0 && extras.length === 0 && restoreCopies.length === 0) {
     return {
       ok: false,
       reason_code: RESTORE_CODES.NO_SESSION,
@@ -265,6 +275,7 @@ export function planRestore(input) {
     sessions: decoded,
     attachments: decodedAttachments,
     extras: decodedExtras,
+    restoreCopies,
     registryDocument,
   });
 }
@@ -301,7 +312,7 @@ export function planRestoreFromArchive(input) {
   const sessions = [];
   const attachments = [];
   for (const file of archive.manifest.files) {
-    if (file.kind === 'registry' || file.kind === 'config' || file.kind === 'state') continue;
+    if (file.kind === 'registry' || file.kind === 'config' || file.kind === 'state' || file.kind === 'restore-copy') continue;
     if (!scopes.has(file.kind === 'session' ? 'sessions' : 'attachments')) continue;
     if (wanted !== null && file.kind === 'session' && !wanted.has(file.session_id)) continue;
     const data = entries.get(file.rel);
@@ -324,9 +335,11 @@ export function planRestoreFromArchive(input) {
     source: { kind: 'archive', archive_file: input.file, snapshot_id: archive.manifest.source_snapshot ?? null, snapshot_digest: archive.manifest.source_digest ?? null },
     sessions,
     attachments,
-    // An archive is a plaintext pack of session logs and attachment objects; the expanded-scope files are not in it,
-    // so a restore from an archive restores what the archive actually carries (and says so in the plan).
+    // An archive is a plaintext pack of session logs and attachment objects; the expanded-scope files (including
+    // the restore copies, which are recovery material) are not in it, so a restore from an archive restores what
+    // the archive actually carries (and says so in the plan).
     extras: [],
+    restoreCopies: [],
     registryDocument: null,
   });
 }
@@ -337,12 +350,16 @@ export function planRestoreFromArchive(input) {
  *
  * @param {{input: object, now: Date, scopes: string[], source: object,
  *   sessions: Array<{entry: object, buffer: Buffer}>, attachments: Array<{entry: object, buffer: Buffer}>,
- *   extras?: Array<{entry: object, buffer: Buffer}>, registryDocument?: object|null}} context
+ *   extras?: Array<{entry: object, buffer: Buffer}>, restoreCopies?: Array<object>,
+ *   registryDocument?: object|null}} context
  * @returns {object}
  */
 function buildPlan(context) {
   const { input, now, source, sessions, attachments, extras, registryDocument } = context;
-  const scopes = Array.isArray(context.scopes) ? context.scopes : ['sessions', 'attachments', 'registry', 'config', 'state'];
+  // `restore-copy` entries are never decoded (their bytes are not needed): they are counted so the plan can say
+  // they were skipped. They must never reach `files`, which is the set apply writes.
+  const restoreCopies = Array.isArray(context.restoreCopies) ? context.restoreCopies : [];
+  const scopes = Array.isArray(context.scopes) ? context.scopes : ['sessions', 'attachments', 'registry', 'config', 'state', 'restore_copies'];
   const requireRuntime = input.allowStaticValidation !== true;
   const validation = validateCandidates({
     items: sessions.map((row) => ({
@@ -511,6 +528,14 @@ function buildPlan(context) {
     registry,
     registry_from_backup_document: registry.base_document_restored === true,
     registry_source: registry.base_document_restored === true ? 'backup-document' : 'live-registry',
+    // P3: the snapshot now carries `.w2m-restore-backups/**`. A restore must never write those bytes back onto the
+    // live home: they are the last-resort undo, and copying them over the live copies would destroy the very
+    // rollback material a failed restore depends on. Reported once, with a fixed detail, so the plan is honest.
+    restore_copies: {
+      count: restoreCopies.length,
+      skipped: true,
+      detail: 'pre-restore copies are recovery material, not live state',
+    },
     pre_restore: { dir: preRestoreDir(input.dshHome, now), files: [] },
     keep_pre_restore: Number.isSafeInteger(input.keepPreRestore) ? input.keepPreRestore : DEFAULT_KEEP_PRE_RESTORE,
     summary: {
@@ -593,6 +618,8 @@ export function applyRestore(input) {
     return { ok: false, reason_code: plan.reason_code, detail: plan.detail, dry_run: input.dryRun === true, restored: [], skipped: 0, attachments: 0, pre_restore_dir: null, bytes_written: 0, duration_ms: 0 };
   }
   const toWrite = plan.candidates.filter((candidate) => candidate.conflict !== 'identical');
+  // `plan.files` never contains a `restore-copy` entry: `buildPlan` counts those and reports them skipped, so the
+  // write loops below (pre-restore copies, `.bak`, atomic writes) cannot touch `.w2m-restore-backups/`.
   const extrasToWrite = (plan.files ?? []).filter((row) => row.conflict !== 'identical');
   const fileCounts = () => ({
     registry: plan.registry_from_backup_document === true && plan.registry?.changed === true ? 1 : 0,

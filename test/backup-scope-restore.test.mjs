@@ -17,7 +17,7 @@ const PLATFORM = 'linux';
 const SESSION = 'session-aaaaaaaa-0001';
 const WORKSPACE = '--E-GPT--';
 
-/** A source home with a session, a registry document and one config + one state file. */
+/** A source home with a session, a registry document, one config + one state file, and a pre-restore copy. */
 function sourceHome() {
   const home = tempDir('w2m-scope-restore-src-');
   put(join(home.dir, 'sessions', WORKSPACE, SESSION, 'session.v4.jsonl.zstd'), runtimeValidSessionLog(SESSION));
@@ -26,8 +26,13 @@ function sourceHome() {
   put(join(home.dir, 'profiles', 'desktop', 'package.json'), '{"name":"backed-up-profile"}\n');
   put(join(home.dir, 'xclient', 'device.json'), '{"sn":"from-backup"}\n');
   put(join(home.dir, 'llm-deepseek', 'config.json'), '{"model":"from-backup"}\n');
+  // P3: a pre-restore copy, so the snapshot carries a restore-copy entry a restore plan must report but never write.
+  put(join(home.dir, '.w2m-restore-backups', '20260101T000000Z', 'storages', 'workspace.json'), '{"restore-copy":true}\n');
   return home;
 }
+
+/** The restore-copy rel path the P3 fixture writes (and a restore must never publish). */
+const RESTORE_COPY_REL = '.w2m-restore-backups/20260101T000000Z/storages/workspace.json';
 
 function repoFor(dshHome, extra = {}) {
   const repo = tempDir('w2m-scope-restore-repo-');
@@ -176,6 +181,49 @@ describe('restore of the expanded scopes', () => {
       assert.equal(dry.files_summary.config, 2);
       assert.equal(fs.existsSync(join(target.dir, 'cordis.patch.yml')), false);
       assert.equal(fs.existsSync(join(target.dir, 'storages', 'workspace.json')), false);
+    } finally {
+      target.cleanup();
+      repo.cleanup();
+      source.cleanup();
+    }
+  });
+
+  it('reports restore copies as skipped recovery material and never writes them back', () => {
+    const source = sourceHome();
+    const { repo } = repoFor(source.dir);
+    const target = tempDir('w2m-scope-restore-copies-tgt-');
+    try {
+      const plan = planRestore({ root: repo.dir, dshHome: target.dir, password: PASSWORD, platform: PLATFORM, machineKey: false, allowStaticValidation: true });
+      assert.equal(plan.ok, true, `${plan.reason_code}: ${plan.detail}`);
+      // The plan names them, marks them skipped, and never puts them into the writable `files` set.
+      assert.deepEqual(plan.restore_copies, {
+        count: 1,
+        skipped: true,
+        detail: 'pre-restore copies are recovery material, not live state',
+      });
+      assert.equal(plan.files.some((row) => row.kind === 'restore-copy'), false);
+      assert.equal(plan.files.some((row) => String(row.rel).startsWith('.w2m-restore-backups')), false);
+
+      const applied = applyRestore({ plan, dshHome: target.dir });
+      assert.equal(applied.ok, true, `${applied.reason_code}: ${applied.detail}`);
+      // The restore-copy bytes are not published into the target home.
+      assert.equal(fs.existsSync(join(target.dir, ...RESTORE_COPY_REL.split('/'))), false, 'the snapshot restore copy must not be written');
+      assert.equal(applied.files.written, 4, 'registry/config/state behaviour is unchanged');
+      assert.equal(applied.files.config, 2);
+      assert.equal(applied.files.state, 2);
+      // The pre-restore directory the restore itself makes for overwritten files is distinct from the snapshot copy.
+      const restoreRoot = join(target.dir, '.w2m-restore-backups');
+      if (fs.existsSync(restoreRoot)) {
+        const dirs = fs.readdirSync(restoreRoot, { withFileTypes: true }).filter((entry) => entry.isDirectory());
+        for (const dir of dirs) {
+          assert.notEqual(dir.name, '20260101T000000Z', 'the restore must not recreate the snapshot restore-copy directory');
+        }
+      }
+      // A narrowed restore that excludes restore copies does not report them at all.
+      const narrowed = planRestore({ root: repo.dir, dshHome: target.dir, password: PASSWORD, platform: PLATFORM, machineKey: false, allowStaticValidation: true, scopes: ['config'] });
+      assert.equal(narrowed.ok, true, narrowed.detail);
+      assert.equal(narrowed.restore_copies.count, 0);
+      assert.equal(narrowed.restore_copies.skipped, true);
     } finally {
       target.cleanup();
       repo.cleanup();

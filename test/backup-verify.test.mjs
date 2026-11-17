@@ -11,6 +11,8 @@ import { runBackup } from '../src/backup/engine.mjs';
 import { main } from '../src/backup/cli.mjs';
 import { verifyRepo } from '../src/backup/verify.mjs';
 import { planRestore } from '../src/backup/restore.mjs';
+import { readSnapshot } from '../src/backup/repo.mjs';
+import { objectFile } from '../src/backup/materialize.mjs';
 import { applyRenumber, planRenumber, RENUMBER_CODES } from '../src/backup/renumber.mjs';
 import { appendLegalEvent, countLogRows, futureAppendVerdict } from '../src/backup/future-append.mjs';
 import { findHarnessInstallation } from '../src/backup/runtime-validate.mjs';
@@ -302,6 +304,34 @@ describe('verify: damage is named, not averaged away', () => {
       fs.writeFileSync(file, bytes);
       const result = verify(repo.dir, home.home);
       assert.equal(result.ok, false);
+      assert.equal(result.problems[0].code, 'BACKUP_DECRYPT_AUTH_FAILED');
+    } finally {
+      repo.cleanup();
+      home.cleanup();
+    }
+  });
+
+  it('digest-checks restore-copy entries like every other backed-up file', () => {
+    const home = runtimeValidHome();
+    fs.mkdirSync(join(home.home, '.w2m-restore-backups', '20260101T000000Z', 'storages'), { recursive: true });
+    fs.writeFileSync(join(home.home, '.w2m-restore-backups', '20260101T000000Z', 'storages', 'workspace.json'), '{"restore-copy":true}\n');
+    const { repo, run } = repoFor(home.home);
+    try {
+      const snapshot = readSnapshot({ root: repo.dir, snapshotId: run.snapshot_id });
+      const entry = snapshot.manifest.files.find((file) => file.kind === 'restore-copy');
+      assert.ok(entry, 'the run must have captured the restore copy');
+      // Flip one byte inside the restore copy's own block object: verify must name this file, exactly as it does
+      // for a session or a state file (the restore-copy kind is not a shortcut around the digest check).
+      const block = objectFile(repo.dir, entry.blocks[0].sha256);
+      const bytes = fs.readFileSync(block);
+      bytes[bytes.length - 1] ^= 0x01;
+      fs.writeFileSync(block, bytes);
+      const result = verify(repo.dir, home.home);
+      assert.equal(result.ok, false);
+      assert.ok(
+        result.problems.some((problem) => problem.file === entry.rel),
+        `the restore-copy file must be named: ${JSON.stringify(result.problems)}`,
+      );
       assert.equal(result.problems[0].code, 'BACKUP_DECRYPT_AUTH_FAILED');
     } finally {
       repo.cleanup();

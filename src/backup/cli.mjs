@@ -243,6 +243,9 @@ export function formatArchive(result) {
   lines.push(`snapshot      : ${result.source_snapshot}`);
   lines.push(`sessions      : ${result.sessions}`);
   lines.push(`files         : ${result.files}`);
+  if ((result.counts?.restore_copies_excluded ?? 0) > 0) {
+    lines.push(`restore copies: ${result.counts.restore_copies_excluded} excluded (recovery material, not packed)`);
+  }
   lines.push(`size          : ${humanBytes(result.bytes)} tar -> ${humanBytes(result.compressed_bytes)} zstd`);
   return lines.join('\n');
 }
@@ -258,6 +261,9 @@ export function formatRestore(plan, applied) {
   lines.push(`sessions      : ${plan.summary.sessions} (new ${plan.summary.new}, identical ${plan.summary.identical}, conflict ${plan.summary.conflicts})`);
   lines.push(`attachments   : ${plan.summary.attachments}`);
   lines.push(`runtime check : ${plan.summary.runtime_verified}/${plan.summary.sessions} sessions validated by the installed Harness`);
+  if (plan.restore_copies !== undefined && plan.restore_copies !== null && (plan.restore_copies.count ?? 0) > 0) {
+    lines.push(`restore copies: ${plan.restore_copies.count} skipped (${plan.restore_copies.detail})`);
+  }
   lines.push(`pre-restore   : ${plan.pre_restore.dir}`);
   for (const candidate of plan.candidates) {
     lines.push(`  - ${candidate.session_id} ${candidate.conflict}${candidate.resolution === 'backup-and-replace' ? ' -> backup then replace' : ''}`);
@@ -357,7 +363,7 @@ function usage() {
     '  --hash              hash every file (sha256; slower)',
     '  --manifest          build the in-memory manifest and print its digest (no writes)',
     '  --scope <s>         run: all | active | archived | selected (default: all)',
-    '  --scopes <list>     run: sessions,attachments,registry,config,state (default: all five)',
+    '  --scopes <list>     run: sessions,attachments,registry,config,state,restore_copies (default: all six)',
     '  --include-secrets   run: also back up credentials (device keys, account credentials): off by default,',
     '                      the repository then holds everything needed to act as this machine/account',
     '  --session <id>      run --scope selected / register: a session id (repeatable)',

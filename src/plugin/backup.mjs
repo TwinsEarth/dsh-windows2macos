@@ -230,8 +230,10 @@ export function normalizeConfig(config = {}, deps = {}) {
   // The `old/` shape: `records` (default) keeps the deduplicated record only, `full` adds a sealed whole-file
   // copy per superseded version. Refused here, like the age rule, so a bad row fails the mount with a
   // configuration code instead of failing a scheduled run at 22:00.
-  // Backup scopes (P0): registry/config/state are part of the default because a backup that omits the
-  // registry and the profile configuration cannot restore a usable home on another machine.
+  // Backup scopes (P0/P3): registry/config/state are part of the default because a backup that omits the
+  // registry and the profile configuration cannot restore a usable home on another machine; `restore_copies`
+  // (the last-resort undo material a restore writes) joined the default in P3. The list is validated by the one
+  // resolver in the engine, so this row only carries the configured value through.
   const scopesRaw = config.backupScopes ?? undefined;
   if (scopesRaw !== undefined && (!Array.isArray(scopesRaw) || scopesRaw.some((name) => typeof name !== 'string'))) {
     return {

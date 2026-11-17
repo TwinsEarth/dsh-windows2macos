@@ -370,7 +370,7 @@ export function runBackup(input) {
   // Only the exact boolean counts: `allowLargeFullCopy: 1` / `"yes"` is a caller bug, not an approval. An approval
   // is a deliberate act by the operator, never something inferred from a truthy value.
   const allowLargeFullCopy = input.allowLargeFullCopy === true;
-  // The expanded P0 scope set. Absent means "all five" (the approved default); an unknown name is a configuration
+  // The expanded scope set. Absent means "all six" (the approved default); an unknown name is a configuration
   // mistake and must be refused before the lock/layout/key, exactly like the retention policy above.
   const scopePolicy = resolveBackupScopes(input.scopes);
   if (scopePolicy.ok !== true) return { ok: false, reason_code: scopePolicy.reason_code, detail: scopePolicy.detail, dry_run: dryRun };
@@ -443,9 +443,11 @@ export function runBackup(input) {
       return { ok: false, reason_code: ENGINE_CODES.HOME_MISSING, detail: `${dshHome} does not exist`, dry_run: dryRun };
     }
     // The expanded scopes are collected read-only, before the layout/lock/key: an over-cap refusal (or an unknown
-    // scope) therefore leaves the repository exactly as it was, not even created.
+    // scope) therefore leaves the repository exactly as it was, not even created. `excludeRoots` is the
+    // self-reference guard: the repository root itself (before or after it exists) is never a backup candidate, so
+    // a misconfigured `backupDir` inside the home cannot make the backup copy its own repository.
     const scopeSkipped = [];
-    const collected = collectScopeFiles({ dshHome, scopes: scopePolicy.scopes, includeSecrets });
+    const collected = collectScopeFiles({ dshHome, scopes: scopePolicy.scopes, includeSecrets, excludeRoots: [root] });
     if (collected.ok !== true) return { ok: false, reason_code: collected.reason_code, detail: collected.detail, dry_run: dryRun };
     for (const row of collected.skipped) scopeSkipped.push(row);
     if (!selectedScopes.has('sessions')) {
@@ -629,9 +631,9 @@ export function runBackup(input) {
         description: stored.description,
       });
     }
-    // The expanded P0/P1 files (registry/config/state). They are ordinary content-addressed blocks too; only the
-    // manifest entry differs (`kind`/`scope`/`reason`). No future-append simulation and no rotation: they are not
-    // session logs.
+    // The expanded P0/P1/P3 files (registry/config/state and the restore copies). They are ordinary
+    // content-addressed blocks too; only the manifest entry differs (`kind`/`scope`/`reason`). No future-append
+    // simulation and no rotation: they are not session logs.
     for (const extra of collected.files) {
       const stored = storeFileBlocks({ root, file: extra.file, dek: key.dek, dryRun, expectZstd: false });
       if (stored.error !== undefined) return { ok: false, ...stored.error, dry_run: dryRun };
@@ -653,7 +655,7 @@ export function runBackup(input) {
     // would record a `current/` pointer for a file the restore path does not read (and could delete the live state).
     const sessionEntries = entries.filter((entry) => entry.kind === undefined && entry.session_id !== undefined);
     const attachmentEntries = entries.filter((entry) => entry.attachment_id !== undefined);
-    const extraEntries = entries.filter((entry) => entry.kind === 'registry' || entry.kind === 'config' || entry.kind === 'state');
+    const extraEntries = entries.filter((entry) => entry.kind === 'registry' || entry.kind === 'config' || entry.kind === 'state' || entry.kind === 'restore-copy');
     const manifest = buildManifest({
       snapshotId,
       createdAt: now,

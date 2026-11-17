@@ -1790,9 +1790,10 @@ DEK 不变/恰好一个 password 信封/提示词替换与清除/`.bak` 存在�
 
 P0 审计（`docs/BACKUP-SCOPE.md`）证明了旧版的缺口：只备份会话日志与附件，`storages/workspace.json`（注册表本体）、
 根/Profile 配置、`xclient` 状态都不在备份里。后果是"同一台机器覆盖还原可用，全新 home 不可用"——即
-"备份不完全 ≈ 完全不备份"。v3.5.0 把备份范围扩展为五个 scope，并给出**覆盖率报告**。
+"备份不完全 ≈ 完全不备份"。v3.5.0 把备份范围扩展为六个 scope（P0/P1 的五个 + P3 的 `restore_copies`），并给出
+**覆盖率报告**。
 
-### 27.2 五个 scope
+### 27.2 六个 scope
 
 | scope | 内容 | 说明 |
 |---|---|---|
@@ -1801,28 +1802,37 @@ P0 审计（`docs/BACKUP-SCOPE.md`）证明了旧版的缺口：只备份会话�
 | `registry` | `storages/workspace.json` | **注册表本体**：workspaces 的 path/title/order、`global.defaultWorkspaceId`、archived/pinned |
 | `config` | 根 `cordis.patch.yml`；`profiles/*/{package.json,cordis.patch.yml,cordis.yml,pnpm-lock.yaml,pnpm-workspace.yaml}` | 决定"装了哪些插件、哪些行启用、版本锁定"；跳过 `node_modules`/`*.bak*` |
 | `state` | `xclient/**`（跳过 `*.log`/`*.bak*`）、`storages/dsh-context/**`、`llm-deepseek/**`、`fang/**` | 设备身份、GPW 策略、决策中心、agent/fleet 状态等；**不含凭据**（见 27.4） |
+| `restore_copies` | `.w2m-restore-backups/**`（还原前副本） | P3：还原覆盖前写下的"最后手段撤销副本"；独立上限（单文件 64 MiB、整目录 1 GiB），超限只跳过并记录、**不拒绝**本次备份（见 27.6） |
 
-默认五个 scope **全开**（`DEFAULT_BACKUP_SCOPES`）。`run --scopes sessions,attachments,...` 可缩小；
+默认六个 scope **全开**（`DEFAULT_BACKUP_SCOPES`）。`run --scopes sessions,attachments,...` 可缩小；
 插件配置 `backupScopes`、`backupIncludeSecrets` 同义。
 
 永远排除并记录理由/类别：`dsh-runtimes/`、`profiles/*/node_modules/`、`xray-proxy/`（`reinstallable`）；
-`sessions/.event-cache/`、`storages/session_projcache/`（`cache`）；`.w2m-restore-backups/`、`storages/*.bak*`（`self-copy`）；
-凭据类（见 27.4，`credential`）。符号链接永不跟随。单文件上限 8 MiB，总量上限 256 MiB（超限 `BACKUP_SCOPE_TOO_LARGE`，零写入）。
+`sessions/.event-cache/`、`storages/session_projcache/`（`cache`）；`storages/*.bak*`（`self-copy`；`.w2m-restore-backups/`
+在 `restore_copies` 开启时不再属于此类）；凭据类（见 27.4，`credential`）。符号链接永不跟随。单文件上限 8 MiB
+（restore copy 单独 64 MiB），扩展集总量上限 256 MiB（restore copy 单独 1 GiB，且超限不拒绝，见 27.6）。
 
 ### 27.3 manifest / restore / verify
 
 - **manifest** 新增 `scopes`、`secrets_included`，每个条目带 `kind/scope/reason`；旧快照（无这些字段）在 restore/verify/archive
-  里保持可用。计数按 kind 拆分。
+  里保持可用。P3 追加 `restore-copy` kind 与 `restore_copies` scope；`counts_by_scope.restore_copies` 在旧快照里允许缺失
+  （只有前五个计数是必读的），新快照总写六个 bucket。计数按 kind 拆分。
 - **restore**：快照里有 `registry` 条目时，**以备份的注册表文档为基底**（workspaces 的 path/title/order、
   defaultWorkspaceId、archived/pinned 原样保留），再把还原的会话登记进去——不再按 slug 猜测；文档损坏 →
   `BACKUP_RESTORE_REGISTRY_INVALID`（不回退猜测）。`config`/`state` 文件作为 restore 计划里的 `files` 一起写：
   写前 pre-restore 副本、目标冲突默认先 `.bak` 再覆盖、`--keep-both` 写 `<rel>.restored-<ts>`、路径必须留在
   `$DSH_HOME` 内（`BACKUP_RESTORE_TARGET_ESCAPE`）。写序：pre-restore → 会话 → 附件 → 注册表 → config/state。
-- **verify**：新增 `coverage`：`home` 实测字节/文件、`covered`（按 scope）、`uncovered`（分类：reinstallable/cache/
-  credential/self-copy/not-in-scope/unknown）、`percent`、`gaps`/`gap_count`。**gap = 快照里有的 scope 文件与今天的 home
-  不一致**（新增或删除都算），有 gap 时新增问题码 `BACKUP_VERIFY_COVERAGE_GAP`；凭据只在快照包含它们时才参与比较。
+  P3：`restore-copy` 条目**只计数、永不写回**（计划 `restore_copies:{count,skipped:true,detail}`，不在 `plan.files`，
+  apply 不碰 `.w2m-restore-backups/`；见 27.6）。
+- **verify**：新增 `coverage`：`home` 实测字节/文件、`covered`（按 scope，P3 起含 `restore_copies` bucket）、`uncovered`
+  （分类：reinstallable/cache/credential/self-copy/restore-copy/not-in-scope/unknown）、`percent`、`gaps`/`gap_count`。
+  **gap = 快照里有的 scope 文件与今天的 home 不一致**（新增或删除都算），有 gap 时新增问题码
+  `BACKUP_VERIFY_COVERAGE_GAP`；凭据只在快照包含它们时才参与比较。P3：restore copies 只在快照 `scopes` 含
+  `restore_copies` **且** 目录仍存在时参与 gap 比较（narrowed 快照不产生噪音），其条目照常做块/摘要校验。
 - **archive**：`.tar.zst` 现在同时装 `registry/config/state` 条目（随非空会话包一起），归档自带 manifest 记录各类计数。
-- **mirror**：镜像按 manifest 的块列表复制，新条目自动随快照进入镜像（真实路径包含性与写入守卫不变）。
+  P3：restore copies **不进归档**（它们在快照里已有一份，打包会让体积翻倍），归档 manifest 记
+  `counts.restore_copies_excluded`，README/notes 写明原因。
+- **mirror**：镜像按 manifest 的块列表复制，新条目（含 restore copies）自动随快照进入镜像（真实路径包含性与写入守卫不变）。
 
 ### 27.4 P1：凭据开关（默认关）
 
@@ -1839,7 +1849,53 @@ P0 审计（`docs/BACKUP-SCOPE.md`）证明了旧版的缺口：只备份会话�
 
 - `state` 文件可能在客户端写入过程中被备份（读到的是某一瞬间，不保证它内部自洽）；注册表还原会**替换存活文档**，
   仍走 G2 的原子写 + 回读校验 + 保存后复查，但采样窗口理论仍在。
-- `.w2m-restore-backups/`（还原前副本）**仍未纳入**：避免"备份里套备份"的自引用；作为后续决策项。
+- `.w2m-restore-backups/`（还原前副本）已纳入（P3，见 27.6）：有独立上限、永不写回、不进归档；它带来的额外边界
+  在该节说明。
 - 凭据恢复后不自动重新登录：`.credentials.yaml` 是 DSH 的凭据库格式，恢复后仍建议重新走一次登录以验证。
 - 覆盖率里的 `uncovered.percent` 受"可重装依赖"影响（`dsh-runtimes`/`node_modules` 占大头），因此百分比不能单独当作
   "备份完整度"；`gaps` 才是完整度信号。
+
+### 27.6 还原前副本（restore_copies）与自引用环（P3）
+
+**scope**：`restore_copies` 是第六个 scope（`BACKUP_SCOPES` 末尾追加，`DEFAULT_BACKUP_SCOPES` 默认包含它）。
+CLI `run --scopes ...,restore_copies`、插件配置 `backupScopes` 与 `cordis.patch.yml` 的默认列表都走同一个
+`resolveBackupScopes`，因此不需要第二套解析。
+
+**采集**：选中时递归遍历 `.w2m-restore-backups/**`，每个普通文件进入 manifest：`kind: 'restore-copy'`、
+`scope: 'restore_copies'`、`reason: 'pre-restore copy written by w2m before overwriting a home file: the last-resort
+undo of a restore'`。加密/分块/去重与会话日志相同（普通内容寻址块），符号链接永不跟随。**未选中时**仍写一条
+`class: 'self-copy'` 的跳过记录（沿用旧的排除理由），所以一个 `--scopes sessions` 的瘦身运行会解释自己为什么没有
+包含这些副本，而不是静默变小。
+
+**上限（独立于扩展集的 8 MiB / 256 MiB 上限）**：单文件 `MAX_RESTORE_COPY_FILE_BYTES = 64 MiB`（一个 30 MB 的
+还原前会话日志副本必须能进来）；整目录 `MAX_RESTORE_COPY_TOTAL_BYTES = 1 GiB`。超单文件上限：该文件以
+`class: 'cap'` 跳过；超整目录上限：**整个目录只记一条 `class: 'cap'` 跳过行、本次运行不失败**，其余 scope 照常
+备份——恢复副本再大，也不能让"会话备份"本身失败。restore-copy 字节**不计入** 256 MiB 扩展集的拒绝阈值（那是一个
+拒绝而非跳过，语义不同）。
+
+**自引用环（P3 的重点）**：`collectScopeFiles` 接受 `excludeRoots`（绝对目录列表；engine 传 `[path.resolve(root)]`，
+仓库创建前后都成立）。任何候选路径——今天的 scope、restore copies、以后新增的 scope——只要其 **resolved real path**
+落在某个 excludeRoot 内，就以固定 reason `inside the backup repository or an excluded root (self-reference)` 跳过；
+`walkState` 与 restore-copy 递归在进入目录前先问同一个问题，因此**不会下探仓库**。junction/symlink 指向仓库时本就
+不会被跟随（按 `symlink` 跳过）。这同时覆盖 `backupDir` 被误配到 `$DSH_HOME` 内部（例如 `<home>/backup`）的情况：
+真实运行另有 `BACKUP_DIR_INSIDE_SOURCE` 拒绝（仓库必须在家之外），dry-run / 覆盖率这类不建仓库的路径则由
+`excludeRoots` 兜底。测试证明：仓库嵌套在 home 内时其文件不被收集且跳过有报告；仓库在 home 外时 restore copies
+正常收集；指向仓库的 junction 不被跟随。
+
+**restore 永不写回**：`itemsFromSnapshot` 把 `restore-copy` 归入只读集合，计划输出
+`restore_copies: {count, skipped: true, detail: 'pre-restore copies are recovery material, not live state'}`；这些条目
+不在 `plan.files` 里，所以 apply 的 pre-restore 复制、`.bak` 与原子写都不会碰 `.w2m-restore-backups/`。理由：还原前
+副本是失败还原的回滚材料，把快照里的旧副本覆盖回 live home 会毁掉回滚本身。
+
+**archive 不打包**：`.tar.zst` 继续只装 sessions / attachments / registry / config / state（+manifest/README）；
+restore copies 留在仓库快照里，归档 manifest 记 `counts.restore_copies_excluded`，README/notes 写明"恢复材料、不是
+活状态"，避免归档体积无谓翻倍。镜像按 manifest 的块列表复制，所以 restore copies 自然进入镜像，不需要额外代码。
+
+**诚实边界（本版不承诺）**：
+- restore copies 可能已经与会话/state 的内容重复：同一份字节既在快照的普通块里、又在 restore-copy 的块里；内容寻址
+  让块对象只存一份，但 **manifest 里是两个条目**（路径与语义不同），P3 的防线是**路径包含 + 归档排除 + restore 不写回**，
+  不是跨 scope 的按内容去重或引用计数。
+- 1 GiB 上限是"别把备份撑爆"的保护，不是对恢复能力的保证：超限时那些副本只存在于 live home；把目录备份变小不会让
+  它们自动变小，需要人工清理（副本的保留策略仍是 restore 的 `keep_pre_restore`）。
+- 启用 `restore_copies` 会增加快照的 manifest 条目数，`verify` 的 `coverage.covered.by_scope` 会多一个
+  `restore_copies` bucket，`uncovered` 里该目录的类别从 `self-copy` 变为 `restore-copy`；`--scopes` 可随时把它排除。

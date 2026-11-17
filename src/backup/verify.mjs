@@ -27,6 +27,7 @@
  */
 
 import fs from 'node:fs';
+import path from 'node:path';
 
 import { repoPaths } from './layout.mjs';
 import { openRepo, readIndex, readSnapshot, listSnapshots } from './repo.mjs';
@@ -39,7 +40,7 @@ import { readCurrentPointers } from './gc.mjs';
 import { buildArtifactFromBuffer, runtimeValidateBatch } from './runtime-validate.mjs';
 import { appendLegalEvent, futureAppendVerdict } from './future-append.mjs';
 import { readJsonSafe } from './atomic.mjs';
-import { DEFAULT_BACKUP_SCOPES, classReason, classifyHomePath, collectScopeFiles, displayRel, homeInventory } from './scopes.mjs';
+import { DEFAULT_BACKUP_SCOPES, RESTORE_COPY_ROOT, classReason, classifyHomePath, collectScopeFiles, displayRel, homeInventory } from './scopes.mjs';
 
 /** Codes `verifyRepo` can report. */
 export const VERIFY_CODES = Object.freeze({
@@ -141,12 +142,13 @@ export function simulateFutureAppend(buffer) {
 function scopeOfEntry(entry) {
   if (entry.kind === 'session') return 'sessions';
   if (entry.kind === 'attachment') return 'attachments';
+  if (entry.kind === 'restore-copy') return 'restore_copies';
   return entry.kind;
 }
 
 /** Pick the dominant class of an uncovered row: most bytes, ties by report order. */
 function dominantClass(classes) {
-  const order = ['credential', 'self-copy', 'cache', 'reinstallable', 'not-in-scope', 'unknown'];
+  const order = ['credential', 'self-copy', 'restore-copy', 'cache', 'reinstallable', 'not-in-scope', 'unknown'];
   let best = 'unknown';
   let bestBytes = -1;
   for (const [cls, bytes] of classes) {
@@ -177,12 +179,15 @@ export function buildCoverage(input) {
   const secretsIncluded = manifest?.secrets_included === true;
   const inventory = homeInventory({ dshHome: input.dshHome });
   const covered = { bytes: 0, files: 0, by_scope: {} };
-  for (const name of ['sessions', 'attachments', 'registry', 'config', 'state']) covered.by_scope[name] = { files: 0, bytes: 0 };
+  for (const name of DEFAULT_BACKUP_SCOPES) covered.by_scope[name] = { files: 0, bytes: 0 };
   const coveredRels = new Map();
   for (const entry of manifest?.files ?? []) {
     covered.files += 1;
     covered.bytes += entry.size;
     const scope = scopeOfEntry(entry);
+    // A snapshot written by a newer version may carry a scope this build does not know; count it rather than
+    // throwing, so verify still answers for the rest of the snapshot.
+    if (covered.by_scope[scope] === undefined) covered.by_scope[scope] = { files: 0, bytes: 0 };
     covered.by_scope[scope].files += 1;
     covered.by_scope[scope].bytes += entry.size;
     coveredRels.set(entry.rel, scope);
@@ -234,9 +239,23 @@ export function buildCoverage(input) {
 
   // The gap set: expanded-scope files the snapshot has but the home lost, and files the scopes would select today
   // but the snapshot does not hold. Credentials are in this comparison only when the snapshot included them.
-  const manifestExtraRels = new Set([...coveredRels].filter(([, scope]) => scope === 'registry' || scope === 'config' || scope === 'state').map(([rel]) => rel));
+  // Restore copies participate only when the snapshot recorded that scope AND the directory still exists: a
+  // narrowed snapshot (written without restore_copies) must not report every restore copy as a gap.
+  let restoreCopyDirExists = false;
+  try {
+    restoreCopyDirExists = fs.lstatSync(path.join(input.dshHome, RESTORE_COPY_ROOT)).isDirectory();
+  } catch {
+    restoreCopyDirExists = false;
+  }
+  const compareRestoreCopies = scopes.includes('restore_copies') && restoreCopyDirExists;
+  const manifestExtraRels = new Set(
+    [...coveredRels]
+      .filter(([, scope]) => scope === 'registry' || scope === 'config' || scope === 'state' || (compareRestoreCopies && scope === 'restore_copies'))
+      .map(([rel]) => rel),
+  );
   const collected = collectScopeFiles({ dshHome: input.dshHome, scopes, includeSecrets: secretsIncluded });
   const expanded = new Set(['registry', 'config', 'state']);
+  if (compareRestoreCopies) expanded.add('restore_copies');
   const collectedRels = new Set(
     collected.ok === true
       ? collected.files.filter((row) => expanded.has(row.scope)).map((row) => row.rel)

@@ -60,13 +60,16 @@ export function archivePath(root, now = new Date()) {
  * Choose the files a pack contains.
  *
  * @param {{manifest: object, scope?: 'archived'|'all'|'selected', sessionIds?: string[]}} input
- * @returns {{sessions: Array<object>, attachments: Array<object>}}
+ * @returns {{sessions: Array<object>, attachments: Array<object>, extras: Array<object>, restoreCopiesExcluded: number}}
  */
 export function selectArchiveFiles(input) {
   const sessions = input.manifest.files.filter((entry) => entry.kind === 'session');
   const attachments = input.manifest.files.filter((entry) => entry.kind === 'attachment');
   // P0: the registry/config/state files are what make a pack restorable on a fresh home; they are small
   // and always travel with the pack, independent of the session scope selected.
+  // P3: the restore copies under `.w2m-restore-backups/` are deliberately NOT packed: they are recovery leftovers
+  // of a *different* restore, and packing them would double the pack size to carry bytes the snapshot's own blocks
+  // already hold. Their exclusion is reported in the archive manifest (`counts.restore_copies_excluded`).
   const extras = input.manifest.files.filter((entry) => entry.kind === 'registry' || entry.kind === 'config' || entry.kind === 'state');
   const scope = input.scope ?? 'archived';
   const chosen = scope === 'all'
@@ -74,7 +77,8 @@ export function selectArchiveFiles(input) {
     : scope === 'selected'
       ? sessions.filter((entry) => (input.sessionIds ?? []).includes(entry.session_id))
       : sessions.filter((entry) => entry.flags?.archived === true);
-  return { sessions: chosen, attachments, extras };
+  const restoreCopiesExcluded = input.manifest.files.filter((entry) => entry.kind === 'restore-copy').length;
+  return { sessions: chosen, attachments, extras, restoreCopiesExcluded };
 }
 
 /**
@@ -143,12 +147,23 @@ export function buildArchive(input) {
     source_digest: snapshot.digest,
     dsh_home: input.dshHome,
     scope: input.scope ?? 'archived',
-    counts: { files: files.length, sessions: files.filter((file) => file.kind === 'session').length, attachments: files.filter((file) => file.kind === 'attachment').length, registry: files.filter((file) => file.kind === 'registry').length, config: files.filter((file) => file.kind === 'config').length, state: files.filter((file) => file.kind === 'state').length },
+    counts: {
+      files: files.length,
+      sessions: files.filter((file) => file.kind === 'session').length,
+      attachments: files.filter((file) => file.kind === 'attachment').length,
+      registry: files.filter((file) => file.kind === 'registry').length,
+      config: files.filter((file) => file.kind === 'config').length,
+      state: files.filter((file) => file.kind === 'state').length,
+      // P3: the snapshot carries restore copies, the pack deliberately does not (see selectArchiveFiles).
+      restore_copies_excluded: selection.restoreCopiesExcluded,
+    },
     files,
     notes: [
       'This pack is a plaintext tar of session logs and attachment objects, compressed with zstd.',
       'Extract with: zstd -d <file>.tar.zst && tar -xf <file>.tar',
       'Each file can be verified against the sha256 recorded here and in the source snapshot manifest.',
+      'Pre-restore copies (.w2m-restore-backups/) are not packed: they are recovery material of another restore, ' +
+        'not live state, and the source repository still holds them.',
     ],
   };
   const readme = [
@@ -161,9 +176,11 @@ export function buildArchive(input) {
     `registry   : ${manifest.counts.registry}`,
     `config     : ${manifest.counts.config}`,
     `state      : ${manifest.counts.state}`,
+    `restore copies excluded: ${manifest.counts.restore_copies_excluded}`,
     '',
     'manifest.json lists every file with its size and sha256.',
     'The pack is not encrypted: it is a copy of the repository content, written inside the repository directory.',
+    'Restore copies are deliberately absent: they are recovery material, not live state.',
   ].join('\n');
   const tar = writeTar([
     { name: 'manifest.json', data: `${JSON.stringify(manifest, null, 2)}\n`, mtimeMs: now.getTime() },

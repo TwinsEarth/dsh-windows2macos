@@ -2,15 +2,23 @@
 
 ## 实现状态（2026-11-18）
 
-- **P0 已实现**：五个 scope（`sessions`/`attachments`/`registry`/`config`/`state`，默认全开）——`storages/workspace.json`、
+- **P0 已实现**：五个 scope（`sessions`/`attachments`/`registry`/`config`/`state`，默认全开；P3 追加第六个
+  `restore_copies`）——`storages/workspace.json`、
   根与 profile 配置、`xclient`/`dsh-context`/`llm-deepseek`/`fang` 状态都进入快照；manifest 记录 `scopes` 与每项 `reason`；
   还原以备份的注册表文档为基底（多 workspace / title / order / defaultWorkspaceId 原样恢复）；`verify` 输出覆盖率与
   `BACKUP_VERIFY_COVERAGE_GAP`；`.tar.zst` 与镜像同步携带这些条目。见 `docs/BACKUP-DESIGN.md` §27。
 - **P1 已实现**：`backupIncludeSecrets` / `--include-secrets`（默认 **false**）显式开启才备份凭据；开启时 manifest 标
   `secrets_included:true`，CLI 打印显著警告，面板状态卡显示红色「已包含凭据」警告与范围行（`data-w2m-backup-scopes` /
   `data-w2m-backup-secrets-warning`）。
-- **仍未纳入**：`.w2m-restore-backups/`（避免自引用）、`dsh-runtimes/`、`profiles/*/node_modules/`、`xray-proxy/`（可重装）。
 - **P2 已实现**：`docs/RESTORE-RUNBOOK.md`——全新 home 的恢复顺序（可重装依赖 → 两次 restore → 身份/凭据 → 验收 → 回滚）。
+- **P3 已实现**：第六个 scope `restore_copies`（默认开）把 `.w2m-restore-backups/**` 纳入备份：条目
+  `kind:'restore-copy'` / `scope:'restore_copies'` / 固定 reason；独立上限（单文件 64 MiB、整目录 1 GiB，超限只跳过不拒绝）。
+  **自引用环**由 `collectScopeFiles({excludeRoots})` 关闭：任何候选路径的 resolved real path 落在仓库/排除根内即
+  `inside the backup repository or an excluded root (self-reference)` 跳过，walk 不下探；`backupDir` 误配进 `$DSH_HOME`
+  也覆盖（另有真实运行的 `BACKUP_DIR_INSIDE_SOURCE` 拒绝）。`restore` 只计数、**永不写回** restore copies；`.tar.zst`
+  不打包它们（`counts.restore_copies_excluded` + 说明），镜像自然携带。见 `docs/BACKUP-DESIGN.md` §27.6。
+- **仍未纳入**：`dsh-runtimes/`、`profiles/*/node_modules/`、`xray-proxy/`（可重装）、`.w2m-restore-backups/` 的
+  历史遗留位置 `sessions/.w2m-restore-backups/`（旧 home 迁移残留，仍按 self-copy 排除）。
 
 > 下面的审计快照保留为"扩围前"的历史证据（2026-11-18 04:00 前后）；其中的"未备份清单"已由上述实现关闭。
 
@@ -118,6 +126,7 @@
 3. **P2：重装步骤**——`docs/RESTORE-RUNBOOK.md`：全新 home 的恢复顺序（装 DSH → 装插件/运行依赖 → 恢复 `scopes` →
    登录/入队（或恢复凭据）→ 校验会话可见）。
 4. **P3：`old/` 与 `.w2m-restore-backups` 的关系**——明确"还原前副本"是否纳入备份（建议纳入，作为最后手段，但要避免镜像/备份自引用环）。
+   **✅ 已实现**：`restore_copies` scope + `excludeRoots` 自引用守卫 + restore 永不写回 + 归档排除，见 `docs/BACKUP-DESIGN.md` §27.6。
 
 **验收标准**：在**空的 `$DSH_HOME`** 上只用备份仓库（+ 安装脚本）恢复后：
 - `w2m-backup verify` 全绿；

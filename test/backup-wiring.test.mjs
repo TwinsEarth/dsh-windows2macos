@@ -20,8 +20,10 @@ import {
   buildStatus,
   registerBackupRoutes,
 } from '../src/backup/routes.mjs';
-import { formatScan, formatStatus, main } from '../src/backup/cli.mjs';
+import { formatScan, formatStatus, main, parseArgs } from '../src/backup/cli.mjs';
 import { runBackup } from '../src/backup/engine.mjs';
+import { BACKUP_SCOPES } from '../src/backup/scopes.mjs';
+import { normalizeConfig } from '../src/plugin/backup.mjs';
 import { makeHome, registryDocument, tempDir } from './helpers/backup-fixture.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
@@ -81,6 +83,28 @@ describe('backup wiring: package and entry points', () => {
     assert.match(yml, /- id: dsh-backup\n {6}name: '@twinsearth\/w2m-dsh-plugin\/dsh-backup'\n {6}disabled: false/u,
       'the backup row ships enabled: the panel and the 22:00 schedule are the product; an operator can switch it off');
     assert.match(yml, /backupTimes: \['22:00:00'\]/u, 'the row documents the default slot the engine uses');
+  });
+
+  it('accepts the sixth scope through the CLI, the plugin row and the shipped default list', () => {
+    // CLI: the existing `--scopes` parser hands the list to the one resolver; it does not keep its own copy.
+    const parsed = parseArgs(['run', '--scopes', 'sessions,restore_copies']);
+    assert.deepEqual(parsed.scopes, ['sessions', 'restore_copies']);
+    assert.equal(parsed.error, undefined);
+    // Plugin row: `backupScopes` passes through verbatim and is resolved by runBackup.
+    const cfg = normalizeConfig(
+      { backupScopes: [...BACKUP_SCOPES] },
+      { env: {}, platform: 'win32' },
+    );
+    assert.equal(cfg.ok, true, cfg.detail);
+    assert.deepEqual(cfg.scopes, [...BACKUP_SCOPES]);
+    assert.equal(cfg.scopes.includes('restore_copies'), true);
+    // The shipped row documents the same six-scope default.
+    const yml = readFileSync(join(ROOT, 'cordis.patch.yml'), 'utf8');
+    assert.match(
+      yml,
+      /backupScopes: \['sessions', 'attachments', 'registry', 'config', 'state', 'restore_copies'\]/u,
+      'the dsh-backup row must ship the six-scope default',
+    );
   });
 
   it('documents the protocol in docs/BACKUP-DESIGN.md', () => {

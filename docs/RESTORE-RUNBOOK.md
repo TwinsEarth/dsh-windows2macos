@@ -9,7 +9,7 @@
 |---|---|---|
 | **1. 装 DSH** | 安装宿主与 w2m 插件（插件提供 `w2m-backup`；先装宿主，再 `dsh plugin add`，**不要启动**） | §1 |
 | **2. 装依赖** | `dsh-runtimes/`、`profiles/*/node_modules/`、`xray-proxy/`（可重装，故意不在备份里） | §2 |
-| **3. 恢复 scopes** | `restore --dry-run` 核对 → `restore --apply`（会话/附件/registry/config/state） | §3 |
+| **3. 恢复 scopes** | `restore --dry-run` 核对 → `restore --apply`（会话/附件/registry/config/state；restore copies 只计数、不写回） | §3 |
 | **4. 登录/入队** | 启动 DSH → 原账户登录 → 编队入队；凭据是否随备份由 P1 开关决定 | §4 |
 | **5. 校验** | `verify`（coverage gap=0）→ 会话/工作区 → 插件行 → 面板 → 手动跑一次备份 | §5 |
 
@@ -45,6 +45,9 @@ w2m-backup restore --root D:\DeepSeekHarness\BackUP --dsh-home <new-home> --appl
 
 - 写序保证"注册表先能看见会话"与"配置随后生效"；任何一步失败会在结果里给出具名错误，**不会静默半写**。
 - 冲突（目标已有不同内容）：默认先 `.bak` 再覆盖；`--keep-both` 写 `<rel>.restored-<ts>` 旁路。
+- **restore copies（P3）**：快照现在也带 `.w2m-restore-backups/**`（`restore_copies` scope）。`restore` 的计划只报
+  `restore_copies: {count, skipped: true, detail: 'pre-restore copies are recovery material, not live state'}`，
+  **永不把它们写回** live home：它们是失败还原的回滚材料，不是活状态。恢复它们的方法见文末「回滚」。
 - 路径逃逸、目标在计划后被改、快照里注册表文档损坏都会拒绝（`BACKUP_RESTORE_TARGET_ESCAPE` /
   `BACKUP_RESTORE_TARGET_CHANGED` / `BACKUP_RESTORE_REGISTRY_INVALID`）。
 - 老快照没有 `registry` 条目时：还原需要 `--workspace-path`（一次一个 workspace）；多 workspace 请按顺序跑多次，
@@ -77,11 +80,25 @@ Get-ChildItem <new-home>\.w2m-restore-backups -Directory | Sort-Object Name -Des
 # 停 DSH 后，把该目录里的文件按相对路径覆盖回去；注册表同时恢复其 workspace.json
 ```
 
+**restore copies 现在也在备份里（P3）**：默认的 `restore_copies` scope 会把 `.w2m-restore-backups/**` 一起写进快照，
+所以"原机 home 丢了"时副本不会随之消失。但 `restore` **故意不写回**它们（它们不是活状态，覆盖回去会毁掉回滚材料），
+所以取回方式分两种：
+
+- **同机、home 还在**：直接按上面的命令用 `.w2m-restore-backups/<ts>/` 的相对路径覆盖（这是最快、最完整的回滚路径）。
+- **换机 / home 已不可用**：副本在备份仓库的快照里，可用 `w2m-backup verify --json`（或 `list --json`）确认
+  `coverage.covered.by_scope.restore_copies.files > 0`；目前 CLI 没有"把 restore copies 写回 live home"的命令
+  （`restore` 刻意不提供），需要维护者按快照 manifest 里的 `restore-copy` 条目从其块对象重建文件——或者，在换机前
+  就把原机 home 的 `.w2m-restore-backups/` 目录单独复制一份保留。`restore --scopes` 可以随时把 `restore_copies`
+  排除在这次还原之外（默认也不写回，所以只是少一次计数）。
+
 若连 `$DSH_HOME` 都不可用：删除它，从 §1 重新开始（备份仓库不受影响）。
 
 ## 已知边界（本版）
 
-- `.w2m-restore-backups/` 不在备份内（避免备份自引用）；跨机恢复依赖的是备份仓库本身。
+- `.w2m-restore-backups/` 现在**在备份内**（`restore_copies` scope，P3）：路径包含守卫保证备份不会把自己的仓库卷进来，
+  restore 也不会把这些副本写回 live home；跨机取回它们目前只能手工按快照块重建（见「回滚」），没有 `restore` 命令。
+- restore copies 有独立上限：单文件 64 MiB、整目录 1 GiB；超整目录上限时本次备份只记一条跳过、其余 scope 照常，
+  所以"备份里没有某些 restore copy"可能只是超限，不是丢失——原机 home 仍然是它们的唯一完整位置。
 - `state` 文件是某一瞬间的快照：客户端正在写某个状态文件时备份的副本可能不是该文件的最新态。
 - 注册表还原会替换存活文档（G2 原子写 + 回读 + 保存后复查仍生效，但复查窗口理论仍在）。
 - 覆盖率的百分比受可重装依赖影响，**以 `gaps` 是否为 0 作为完整度信号**，不要单看百分比。

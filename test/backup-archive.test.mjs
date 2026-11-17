@@ -108,6 +108,45 @@ describe('archive: building a pack', () => {
     }
   });
 
+  it('keeps restore copies out of the pack and records the exclusion', () => {
+    const home = twoSessionHome();
+    // P3: the snapshot now carries restore copies; a pack must not double-carry them.
+    const restoreCopy = join(home.home, '.w2m-restore-backups', '20260101T000000Z', 'storages', 'workspace.json');
+    fs.mkdirSync(join(home.home, '.w2m-restore-backups', '20260101T000000Z', 'storages'), { recursive: true });
+    fs.writeFileSync(restoreCopy, '{"restore-copy":true}\n');
+    const repo = repoFor(home.home);
+    try {
+      const result = buildArchive({ root: repo.dir, dshHome: home.home, password: PASSWORD, platform: 'linux', machineKey: false, scope: 'all' });
+      assert.equal(result.ok, true, result.detail);
+      assert.equal(result.counts.restore_copies_excluded, 1);
+      const read = readArchive(result.file);
+      assert.equal(read.ok, true, read.detail);
+      assert.equal(result.files, read.manifest.counts.files);
+      assert.equal(read.manifest.counts.restore_copies_excluded, 1);
+      assert.equal(read.manifest.files.some((file) => String(file.rel).startsWith('.w2m-restore-backups')), false);
+      assert.equal(read.entries.some((entry) => String(entry.name).startsWith('.w2m-restore-backups')), false);
+      const tarEntries = readTar(zlib.zstdDecompressSync(fs.readFileSync(result.file)));
+      const readme = tarEntries.find((entry) => entry.name === 'README.txt');
+      assert.ok(readme, 'the pack carries its README');
+      assert.match(readme.data.toString('utf8'), /restore copies excluded: 1/u);
+      assert.ok(read.manifest.notes.some((note) => /restore copies/u.test(note)));
+      // A source snapshot without restore copies reports 0, keeping the field stable for readers.
+      const bareHome = twoSessionHome();
+      const bareRepo = repoFor(bareHome.home);
+      try {
+        const bare = buildArchive({ root: bareRepo.dir, dshHome: bareHome.home, password: PASSWORD, platform: 'linux', machineKey: false, scope: 'all' });
+        assert.equal(bare.ok, true, bare.detail);
+        assert.equal(bare.counts.restore_copies_excluded, 0);
+      } finally {
+        bareRepo.cleanup();
+        bareHome.cleanup();
+      }
+    } finally {
+      repo.cleanup();
+      home.cleanup();
+    }
+  });
+
   it('refuses an empty pack rather than writing a manifest with nothing in it', () => {
     const home = runtimeValidHome(); // one session, not archived
     const repo = repoFor(home.home);

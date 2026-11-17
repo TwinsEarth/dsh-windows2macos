@@ -200,8 +200,9 @@
         backupOldUsageReminderGb: 10
         # 每次成功的定时备份后异步跑一次 G5 运行时终审并写缓存（面板默认显示最新记录；off 可关闭）。
         backupRuntimeVerify: nightly
-        # P0: registry/config/state are on by default - a backup without them cannot rebuild a usable home.
-        backupScopes: ['sessions', 'attachments', 'registry', 'config', 'state']
+        # P0/P3: registry/config/state and the w2m restore copies are on by default - a backup without them cannot
+        # rebuild a usable home or undo a bad restore. Restore copies carry their own larger, non-refusing caps.
+        backupScopes: ['sessions', 'attachments', 'registry', 'config', 'state', 'restore_copies']
         # P1: credentials are OFF by default; turn on only when the repository itself is trusted.
         backupIncludeSecrets: false
         # 字面兼容需求 3：被替换的旧版本除记录外再写一份整文件加密副本（old/<ws>/<sid>/…json.enc）。

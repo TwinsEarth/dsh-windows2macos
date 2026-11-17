@@ -70,13 +70,27 @@ export const MANIFEST_KEYS = Object.freeze([
 export const OPTIONAL_MANIFEST_KEYS = Object.freeze(['scopes', 'secrets_included', 'counts_by_scope']);
 
 /** The scopes a run can record; kept here as data so a manifest cannot name a scope nobody can restore. */
-const MANIFEST_SCOPES = Object.freeze(['sessions', 'attachments', 'registry', 'config', 'state']);
+const MANIFEST_SCOPES = Object.freeze(['sessions', 'attachments', 'registry', 'config', 'state', 'restore_copies']);
+
+/**
+ * The scopes every `counts_by_scope` block has always carried. `restore_copies` is newer, so a manifest written
+ * before P3 (five keys) still validates: only these five per-scope counts are required on read.
+ */
+const REQUIRED_COUNTS_SCOPES = Object.freeze(['sessions', 'attachments', 'registry', 'config', 'state']);
 
 /** File kinds the expanded scope set adds. */
-export const EXTRA_FILE_KINDS = Object.freeze(['registry', 'config', 'state']);
+export const EXTRA_FILE_KINDS = Object.freeze(['registry', 'config', 'state', 'restore-copy']);
 
-/** Keys an extra (registry/config/state) entry additionally carries. */
+/** Keys an extra (registry/config/state/restore-copy) entry additionally carries. */
 export const EXTRA_FILE_KEYS = Object.freeze(['scope', 'reason']);
+
+/** The scope a manifest file entry counts toward. `restore-copy` maps to its plural scope name. */
+function scopeOfFileKind(kind) {
+  if (kind === 'session') return 'sessions';
+  if (kind === 'attachment') return 'attachments';
+  if (kind === 'restore-copy') return 'restore_copies';
+  return kind;
+}
 
 /** Required keys of every file entry. */
 export const FILE_KEYS = Object.freeze(['rel', 'kind', 'size', 'mtime_ms', 'sha256', 'blocks']);
@@ -367,7 +381,7 @@ export function buildManifest(input) {
   const countsByScope = {};
   for (const scope of MANIFEST_SCOPES) countsByScope[scope] = { files: 0, bytes: 0 };
   for (const file of files) {
-    const scope = file.kind === 'session' ? 'sessions' : file.kind === 'attachment' ? 'attachments' : file.kind;
+    const scope = scopeOfFileKind(file.kind);
     countsByScope[scope].files += 1;
     countsByScope[scope].bytes += file.size;
   }
@@ -663,7 +677,7 @@ export function validateManifest(manifest) {
       for (const scope of MANIFEST_SCOPES) expected[scope] = { files: 0, bytes: 0 };
       for (const entry of Array.isArray(manifest.files) ? manifest.files : []) {
         if (entry === null || typeof entry !== 'object') continue;
-        const scope = entry.kind === 'session' ? 'sessions' : entry.kind === 'attachment' ? 'attachments' : entry.kind;
+        const scope = scopeOfFileKind(entry.kind);
         if (expected[scope] === undefined) continue;
         expected[scope].files += 1;
         if (Number.isSafeInteger(entry.size)) expected[scope].bytes += entry.size;
@@ -671,6 +685,7 @@ export function validateManifest(manifest) {
       for (const scope of MANIFEST_SCOPES) {
         const at = `$.counts_by_scope.${scope}`;
         const value = manifest.counts_by_scope[scope];
+        if (value === undefined && !REQUIRED_COUNTS_SCOPES.includes(scope)) continue;
         if (!isObject(value)) {
           fail(MANIFEST_CODES.KEY_MISSING, at, 'a per-scope count is missing');
           continue;

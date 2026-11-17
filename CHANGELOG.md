@@ -4,6 +4,18 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### 备份范围 P3：还原前副本（restore_copies）与自引用守卫（未发布）
+
+- **第六个 scope `restore_copies`（默认开）**：`.w2m-restore-backups/**` 以 `kind:'restore-copy'` / `scope:'restore_copies'` / 固定 reason 进入 manifest；`--scopes`、插件配置 `backupScopes` 与 `cordis.patch.yml` 默认列表同步接受。独立上限：单文件 64 MiB（30 MB 的还原前会话副本可以备份）、整目录 1 GiB；超整目录上限只记一条 `class:'cap'` 跳过、**不拒绝本次运行**，其余 scope 照常。未选中时仍写一条 `class:'self-copy'` 跳过记录解释瘦身运行。
+- **自引用环关闭（P3 的重点）**：`collectScopeFiles({excludeRoots})` 对每个候选路径（含 restore copies 与未来 scope）比较 resolved real path，落在仓库/排除根内即以固定 reason `inside the backup repository or an excluded root (self-reference)` 跳过，walk 在进入目录前先做同一判断、不下探仓库；engine 传入 `[path.resolve(root)]`。`backupDir` 被误配进 `$DSH_HOME`（如 `<home>/backup`）也覆盖；真实运行另有既有 `BACKUP_DIR_INSIDE_SOURCE` 拒绝。测试覆盖：仓库嵌套 home 时不收集并报告跳过、junction 指向仓库不被跟随、仓库在 home 外时 restore copies 正常收集。
+- **restore 永不写回**：`itemsFromSnapshot` 只对 `restore-copy` 计数；计划输出 `restore_copies: {count, skipped: true, detail: 'pre-restore copies are recovery material, not live state'}`，apply 不写它们（不在 `plan.files`），registry/config/state 行为不变；CLI 计划输出新增该行。
+- **verify/coverage**：`scopeOfEntry` 把 `restore-copy` 映射到 `restore_copies`，`coverage.covered.by_scope` 增加该 bucket；`.w2m-restore-backups` 在 inventory/coverage 中的类别从 `self-copy` 改为 `restore-copy`；gap 比较只在快照 `scopes` 含 `restore_copies` **且**目录存在时纳入（narrowed 快照不产生噪音）；restore-copy 条目照常做块/摘要校验。
+- **archive**：`.tar.zst` 不打包 restore copies（避免体积翻倍），归档 manifest 记 `counts.restore_copies_excluded`，README/notes 写明"恢复材料、不是活状态"；镜像按 manifest 的块列表复制，restore copies 自然进入镜像。
+- **文档/测试**：`docs/BACKUP-DESIGN.md` §27.2/§27.3/§27.5 更新并新增 §27.6（scope、上限、excludeRoots 规则、restore 不写回、归档排除、诚实边界：路径包含 + 归档排除 + 不写回，不是跨 scope 按内容去重）；`docs/BACKUP-SCOPE.md` 标记 P3 已实现；`docs/RESTORE-RUNBOOK.md` 步骤 3 与「回滚」说明 restore copies 现在在备份内、以及如何找回。测试扩展 `backup-scopes`（默认 kind/scope/reason、narrowed 跳过、30 MB 允许、64 MiB 单文件、1 GiB 整目录跳过、excludeRoots/自引用）、`backup-scope-run`（默认捕获、`scopes:['sessions']` 不捕获、manifest 按 kind 计数、repo 嵌套 home 不收集、verify coverage bucket）、`backup-scope-restore`（计划报告 skipped、apply 不写）、`backup-archive`（归档排除与计数）。
+- **验证**：`npx eslint .` 0 error、`node scripts/layer-check.mjs` clean、`node scripts/scan-mojibake.mjs` clean、相关备份 suite 与 `test/client-bundle.test.mjs` 全绿。
+- **声明**：不 bump 版本（仍 3.5.0）、不跑 preflight、不提交。
+
+
 ### 面板凭据警告、恢复手册与 P0/P1 收尾（未发布）
 
 - 面板状态卡新增「备份范围」行（`data-w2m-backup-scopes`）与「已包含凭据」红色警告（`data-w2m-backup-secrets-warning`，仅当 `backupIncludeSecrets` 开启）；describe 载荷暴露 `scopes` / `include_secrets`。

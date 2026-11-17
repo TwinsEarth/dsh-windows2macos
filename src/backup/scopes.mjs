@@ -10,18 +10,23 @@
  * `fang/`) all live in the same home, and without them "restore onto a fresh machine" does not produce a usable
  * DSH -- the sessions exist and are invisible, or the plugins that produced them are never loaded.
  *
- * ## The three rules that make an expanded scope safe
+ * ## The four rules that make an expanded scope safe
  *
- *   1. **Explicit, enumerable scopes.** `sessions`, `attachments`, `registry`, `config`, `state`. Nothing is
- *      backed up because a walker happened to find it; each file is named by a rule in this file.
+ *   1. **Explicit, enumerable scopes.** `sessions`, `attachments`, `registry`, `config`, `state`, `restore_copies`.
+ *      Nothing is backed up because a walker happened to find it; each file is named by a rule in this file.
  *   2. **The exclusions are data, not silence.** Anything deliberately left out (runtimes, dependency trees, the
- *      proxy binaries, derived caches, w2m's own restore copies, credential files unless opted in) is returned in
- *      `skipped` with a class and a reason. A reader can see the decision instead of wondering why the repository
- *      is smaller than the home.
+ *      proxy binaries, derived caches, restore copies when their scope is narrowed, credential files unless opted
+ *      in) is returned in `skipped` with a class and a reason. A reader can see the decision instead of wondering
+ *      why the repository is smaller than the home.
  *   3. **Credentials are opt-in.** `.credentials.yaml`, `xclient/device.key`, `xclient/gpw-folders.json.key` and
  *      `.anonymous-user-id` are identity: whoever holds the repository holds the account login / device identity /
  *      folder-policy key. They are skipped by default with `class: 'credential'`; `includeSecrets: true` includes
  *      them and the engine warns loudly. Default off is the only safe default for an unencrypted repository.
+ *   4. **The repository never backs itself up.** `collectScopeFiles` takes `excludeRoots` (absolute directories:
+ *      the repository root, before or after it is created) and every candidate -- including the restore copies and
+ *      any future scope -- is skipped with a `self-reference` reason when its resolved **real path** lies inside
+ *      one of those roots. The walkers never descend into an excluded root. This is what makes backing up the
+ *      restore copies safe even when `backupDir` is misconfigured to a path inside `$DSH_HOME`.
  *
  * ## Caps, because "back everything up" can quietly become 10 GB
  *
@@ -30,6 +35,11 @@
  * expanded set is capped at {@link MAX_SCOPE_TOTAL_BYTES}; exceeding it is a **refusal** (`BACKUP_SCOPE_TOO_LARGE`)
  * returned before the engine opens a lock, writes a block, or creates the repository -- so a refused run writes
  * nothing at all.
+ *
+ * Restore copies (`restore_copies`) are recovery material, not state: one pre-restore copy of a session log can be
+ * tens of MB, so that scope has its own caps -- {@link MAX_RESTORE_COPY_FILE_BYTES} per file and
+ * {@link MAX_RESTORE_COPY_TOTAL_BYTES} for the directory. Exceeding either is a **reported skip**, never a refusal:
+ * the directory is not backed up and the rest of the scopes still run.
  *
  * ## Symlinks are never followed
  *
@@ -41,10 +51,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-/** The five scopes a run can select. Order is canonical: status output and plans follow it. */
-export const BACKUP_SCOPES = Object.freeze(['sessions', 'attachments', 'registry', 'config', 'state']);
+/** The six scopes a run can select. Order is canonical: status output and plans follow it. */
+export const BACKUP_SCOPES = Object.freeze(['sessions', 'attachments', 'registry', 'config', 'state', 'restore_copies']);
 
-/** What an absent `scopes` value means: every scope (the P0 default). */
+/** What an absent `scopes` value means: every scope (the P0/P3 default). */
 export const DEFAULT_BACKUP_SCOPES = Object.freeze([...BACKUP_SCOPES]);
 
 /** Named scope failure codes. */
@@ -59,6 +69,32 @@ export const MAX_SCOPE_FILE_BYTES = 8 * 1024 * 1024;
 
 /** Total cap on the expanded (non-session) set. Exceeding it refuses the run before anything is written. */
 export const MAX_SCOPE_TOTAL_BYTES = 256 * 1024 * 1024;
+
+/** The home-root directory a restore writes its pre-restore copies into (`.w2m-restore-backups/<timestamp>/...`). */
+export const RESTORE_COPY_ROOT = '.w2m-restore-backups';
+
+/**
+ * One restore-copy file larger than this is skipped as `too-large`. Much larger than
+ * {@link MAX_SCOPE_FILE_BYTES} on purpose: a pre-restore copy of a session log is the whole session.
+ */
+export const MAX_RESTORE_COPY_FILE_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Per-scope total cap for `restore_copies`. Unlike {@link MAX_SCOPE_TOTAL_BYTES} this is not a refusal: over the
+ * cap the directory is skipped as one `cap` row and the rest of the scopes still run.
+ */
+export const MAX_RESTORE_COPY_TOTAL_BYTES = 1024 * 1024 * 1024;
+
+/** The reason every `restore-copy` manifest entry records. */
+export const RESTORE_COPY_REASON =
+  'pre-restore copy written by w2m before overwriting a home file: the last-resort undo of a restore';
+
+/** Why the restore-copy directory is skipped when its scope is narrowed away. */
+export const RESTORE_COPY_EXCLUDED_REASON =
+  "w2m's own pre-restore copies; the backup must not copy its own last-resort copies (self-reference)";
+
+/** The reason every candidate inside the repository (or any excluded root) is skipped with. */
+export const SELF_REFERENCE_REASON = 'inside the backup repository or an excluded root (self-reference)';
 
 /** Guard for the inventory walk: a home larger than this is reported `truncated` instead of walked forever. */
 export const MAX_INVENTORY_FILES = 200_000;
@@ -93,13 +129,14 @@ const STATE_ROOTS = Object.freeze([
 ]);
 
 /** Exclusion classes, in the order a report should prefer them when a row mixes classes. */
-const CLASS_ORDER = Object.freeze(['credential', 'self-copy', 'cache', 'reinstallable', 'not-in-scope', 'in-scope', 'symlink', 'cap', 'unknown']);
+const CLASS_ORDER = Object.freeze(['credential', 'self-copy', 'restore-copy', 'cache', 'reinstallable', 'not-in-scope', 'in-scope', 'symlink', 'cap', 'unknown']);
 
 /** Human explanation for each exclusion class. */
 const CLASS_REASON = Object.freeze({
   reinstallable: 'reinstallable: runtime/dependency/proxy binaries come back from the installer or pnpm install',
   cache: 'derived cache: rebuilt on demand, and restoring it would restore a stale projection',
   'self-copy': "w2m's own pre-restore copy: it is itself a last-resort copy and would make the backup self-referential",
+  'restore-copy': 'pre-restore copy from a w2m restore: recovery material carried by the restore_copies scope',
   credential: 'credential/identity file: excluded unless backupIncludeSecrets is explicitly enabled',
   'not-in-scope': 'in scope for a complete backup but not present in this snapshot (created or changed after it)',
   'in-scope': 'in scope and covered by this backup',
@@ -111,7 +148,7 @@ const CLASS_REASON = Object.freeze({
 /**
  * Validate a scopes value.
  *
- * Absent means **all five** (the approved P0 default). A non-array, or an array containing anything that is not one
+ * Absent means **every scope** (the approved default). A non-array, or an array containing anything that is not one
  * of {@link BACKUP_SCOPES}, is refused by name: silently dropping an unknown scope would make a typo look like a
  * narrower backup that succeeded.
  *
@@ -167,6 +204,27 @@ function lstatSafe(file) {
   }
 }
 
+/**
+ * `realpath` without throwing.
+ *
+ * A path that does not exist yet (the repository is created only after the read-only scope collection) is compared
+ * as its resolved form; a path that exists through a junction/symlink ancestor is compared as the target it really
+ * is, which is the whole point of the self-reference guard.
+ */
+function realPathSafe(target) {
+  try {
+    return fs.realpathSync(target);
+  } catch {
+    return path.resolve(target);
+  }
+}
+
+/** True when `file` is `root` itself or lies inside it, compared on resolved paths. */
+function isInsideOrEqual(root, file) {
+  const rel = path.relative(path.resolve(root), path.resolve(file));
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
+}
+
 /** Is this name a backup/good copy (`*.bak*`, `*.good-*`)? */
 export function isBackupCopyName(name) {
   return /\.bak/i.test(name) || /\.good-/i.test(name);
@@ -187,7 +245,7 @@ export function isCredentialRel(rel) {
  * report must stay cheap enough to run over a real 13k-file home during `verify`.
  *
  * @param {string} rel
- * @returns {'in-scope'|'reinstallable'|'cache'|'self-copy'|'credential'|'unknown'}
+ * @returns {'in-scope'|'reinstallable'|'cache'|'self-copy'|'restore-copy'|'credential'|'unknown'}
  */
 export function classifyHomePath(rel) {
   const clean = String(rel).replace(/\\/g, '/').replace(/^\/+/, '');
@@ -197,8 +255,8 @@ export function classifyHomePath(rel) {
   if (top === 'xray-proxy') return 'reinstallable';
   if (top === 'node_modules') return 'reinstallable';
   if (top === 'profiles' && segments[2] === 'node_modules') return 'reinstallable';
-  if (top === '.w2m-restore-backups') return 'self-copy';
-  if (top === 'sessions' && segments[1] === '.w2m-restore-backups') return 'self-copy';
+  if (top === RESTORE_COPY_ROOT) return 'restore-copy';
+  if (top === 'sessions' && segments[1] === RESTORE_COPY_ROOT) return 'self-copy';
   if (top === 'storages' && segments[1] !== undefined && isBackupCopyName(segments[1])) return 'self-copy';
   if (top === 'sessions' && segments[1] === '.event-cache') return 'cache';
   if (top === 'storages' && segments[1] === 'session_projcache') return 'cache';
@@ -223,7 +281,9 @@ export function classReason(rel, cls) {
 /**
  * Collect the regular files the expanded scopes select, and record everything deliberately skipped.
  *
- * @param {{dshHome: string, scopes?: string[], includeSecrets?: boolean}} input
+ * @param {{dshHome: string, scopes?: string[], includeSecrets?: boolean, excludeRoots?: string[]}} input
+ *   `excludeRoots` is the self-reference guard: absolute directories (the backup repository itself, before or after
+ *   it exists) whose contents must never be collected, even by a misconfigured `backupDir` inside `$DSH_HOME`.
  * @returns {{ok: true, dsh_home: string, scopes: string[], secrets_included: boolean,
  *   files: Array<{rel: string, file: string, kind: string, scope: string, reason: string, size: number}>,
  *   skipped: Array<{rel: string, reason: string, class: string, size?: number}>,
@@ -236,10 +296,26 @@ export function collectScopeFiles(input) {
   if (policy.ok !== true) return policy;
   const selected = new Set(policy.scopes);
   const includeSecrets = input.includeSecrets === true;
+  const excludedRoots = (Array.isArray(input.excludeRoots) ? input.excludeRoots : [])
+    .filter((root) => typeof root === 'string' && root.trim() !== '')
+    .map((root) => realPathSafe(root));
   const files = [];
   const skipped = [];
   const seen = new Set();
   let totalBytes = 0;
+  let expandedBytes = 0;
+
+  /**
+   * Is this home-relative path the repository itself (or inside another excluded root)?
+   *
+   * Asked of every candidate, not only restore copies: today's scopes and any scope added later go through the
+   * same check, and the walkers ask it of a directory before descending so they never enumerate the repository.
+   */
+  const insideExcludedRoot = (rel) => {
+    if (excludedRoots.length === 0) return false;
+    const real = realPathSafe(path.join(dshHome, ...String(rel).replace(/\\/g, '/').split('/')));
+    return excludedRoots.some((root) => isInsideOrEqual(root, real));
+  };
 
   const recordSkip = (rel, reason, cls, size) => {
     if (seen.has(rel)) return;
@@ -250,6 +326,10 @@ export function collectScopeFiles(input) {
   const addFile = (rel, kind, scope, reason) => {
     const relPath = rel.replace(/\\/g, '/');
     const file = path.join(dshHome, ...relPath.split('/'));
+    if (insideExcludedRoot(relPath)) {
+      recordSkip(relPath, SELF_REFERENCE_REASON, 'self-copy');
+      return;
+    }
     if (!isInside(dshHome, file)) {
       recordSkip(relPath, 'resolves outside the DSH home', 'unknown');
       return;
@@ -269,6 +349,7 @@ export function collectScopeFiles(input) {
     }
     files.push({ rel: relPath, file, kind, scope, reason, size: stat.size });
     totalBytes += stat.size;
+    expandedBytes += stat.size;
   };
 
   /** Record a whole-subtree exclusion, so an empty/runtime directory is still explained. */
@@ -297,6 +378,10 @@ export function collectScopeFiles(input) {
         continue;
       }
       if (stat.isDirectory()) {
+        if (insideExcludedRoot(rel)) {
+          recordSkip(rel, SELF_REFERENCE_REASON, 'self-copy');
+          continue;
+        }
         if (entry.name === 'node_modules') {
           recordExcludedDir(rel, 'reinstallable');
           continue;
@@ -338,6 +423,10 @@ export function collectScopeFiles(input) {
       }
       if (!profileStat.isDirectory()) continue;
       const profileRel = `profiles/${entry.name}`;
+      if (insideExcludedRoot(profileRel)) {
+        recordSkip(profileRel, SELF_REFERENCE_REASON, 'self-copy');
+        continue;
+      }
       for (const child of listDir(profileDir)) {
         const rel = `${profileRel}/${child.name}`;
         const childStat = lstatSafe(path.join(profileDir, child.name));
@@ -370,6 +459,10 @@ export function collectScopeFiles(input) {
         recordSkip(root.rel, 'symlink: not followed (the target may be outside the home)', 'symlink');
         continue;
       }
+      if (insideExcludedRoot(root.rel)) {
+        recordSkip(root.rel, SELF_REFERENCE_REASON, 'self-copy');
+        continue;
+      }
       if (stat.isDirectory()) walkState(root.rel, root.reason);
       else addFile(root.rel, 'state', 'state', root.reason);
     }
@@ -394,10 +487,94 @@ export function collectScopeFiles(input) {
     }
   }
 
+  // ---- restore copies (P3) ---------------------------------------------------------------------------------------
+  // `.w2m-restore-backups/<timestamp>/...` is what a restore leaves on disk before it overwrites a file: the
+  // last-resort undo. It is recovery material, so it is backed up only when its own scope is selected, with its own
+  // caps, and it is never allowed to point the backup back at the repository (the excludeRoots guard above).
+  if (selected.has('restore_copies')) {
+    const rootRel = RESTORE_COPY_ROOT;
+    const rootStat = lstatSafe(path.join(dshHome, rootRel));
+    if (rootStat !== null && rootStat.isSymbolicLink()) {
+      recordSkip(rootRel, 'symlink: not followed (the target may be outside the home)', 'symlink');
+    } else if (rootStat !== null && rootStat.isDirectory()) {
+      if (insideExcludedRoot(rootRel)) {
+        recordSkip(rootRel, SELF_REFERENCE_REASON, 'self-copy');
+      } else {
+        const restoreFiles = [];
+        const restoreSkipped = [];
+        let restoreBytes = 0;
+        let capped = false;
+        const walkRestoreCopies = (relDir) => {
+          for (const entry of listDir(path.join(dshHome, ...relDir.split('/')))) {
+            if (capped) return;
+            const rel = `${relDir}/${entry.name}`;
+            const full = path.join(dshHome, ...rel.split('/'));
+            const stat = lstatSafe(full);
+            if (stat === null) continue;
+            if (stat.isSymbolicLink()) {
+              restoreSkipped.push({ rel, reason: 'symlink: not followed (the target may be outside the home)', class: 'symlink' });
+              continue;
+            }
+            if (stat.isDirectory()) {
+              if (insideExcludedRoot(rel)) {
+                restoreSkipped.push({ rel, reason: SELF_REFERENCE_REASON, class: 'self-copy' });
+                continue;
+              }
+              walkRestoreCopies(rel);
+              continue;
+            }
+            if (!stat.isFile()) continue;
+            if (insideExcludedRoot(rel)) {
+              restoreSkipped.push({ rel, reason: SELF_REFERENCE_REASON, class: 'self-copy' });
+              continue;
+            }
+            if (stat.size > MAX_RESTORE_COPY_FILE_BYTES) {
+              restoreSkipped.push({
+                rel,
+                reason: `too-large: ${stat.size} bytes > ${MAX_RESTORE_COPY_FILE_BYTES}-byte (64 MiB) restore-copy per-file cap`,
+                class: 'cap',
+                size: stat.size,
+              });
+              continue;
+            }
+            restoreBytes += stat.size;
+            if (restoreBytes > MAX_RESTORE_COPY_TOTAL_BYTES) {
+              capped = true;
+              return;
+            }
+            restoreFiles.push({ rel, file: full, kind: 'restore-copy', scope: 'restore_copies', reason: RESTORE_COPY_REASON, size: stat.size });
+          }
+        };
+        walkRestoreCopies(rootRel);
+        if (capped) {
+          // Not a refusal: the whole directory is skipped as one reported row, and the run continues with the rest
+          // of the scopes. The alternative -- failing the run -- would let 1 GiB of recovery copies disable the
+          // session backup the user actually asked for.
+          recordSkip(
+            rootRel,
+            `restore copies are over the ${MAX_RESTORE_COPY_TOTAL_BYTES}-byte (1 GiB) per-scope cap; none of them are backed up and the rest of the scopes still run`,
+            'cap',
+          );
+        } else {
+          for (const row of restoreSkipped) recordSkip(row.rel, row.reason, row.class, row.size);
+          for (const row of restoreFiles) {
+            if (seen.has(row.rel)) continue;
+            seen.add(row.rel);
+            files.push(row);
+          }
+          totalBytes += restoreBytes;
+        }
+      }
+    }
+  }
+
   // ---- always-skipped classes (recorded whether or not a scope selected them) ------------------------------------
   recordExcludedDir('dsh-runtimes', 'reinstallable', 'reinstallable: Node/Python runtimes and their dependencies come back from the installer');
   recordExcludedDir('xray-proxy', 'reinstallable', 'reinstallable: proxy binaries/configuration come back from the installer');
-  recordExcludedDir('.w2m-restore-backups', 'self-copy', "w2m's own pre-restore copies; the backup must not copy its own last-resort copies (self-reference)");
+  if (!selected.has('restore_copies')) {
+    // A narrowed run still explains the directory it left out, with the same self-copy reason the old exclusion used.
+    recordExcludedDir(RESTORE_COPY_ROOT, 'self-copy', RESTORE_COPY_EXCLUDED_REASON);
+  }
   recordExcludedDir('sessions/.event-cache', 'cache', 'derived projection of the session logs; the client rebuilds it on demand');
   recordExcludedDir('sessions/.w2m-restore-backups', 'self-copy', 'legacy w2m restore copies (they now live at the home root)');
   recordExcludedDir('storages/session_projcache', 'cache', 'derived sessions-list/title projection; rebuilt from the registry on demand');
@@ -416,15 +593,16 @@ export function collectScopeFiles(input) {
     }
   }
 
-  // The total cap is a refusal, not a silent truncation: the engine must know before it writes anything.
-  if (totalBytes > MAX_SCOPE_TOTAL_BYTES) {
+  // The total cap is a refusal, not a silent truncation: the engine must know before it writes anything. It counts
+  // only the expanded (non-restore-copy) set; the restore copies have their own, non-refusing cap above.
+  if (expandedBytes > MAX_SCOPE_TOTAL_BYTES) {
     return {
       ok: false,
       reason_code: SCOPE_CODES.TOO_LARGE,
       detail:
-        `the expanded backup scope is ${totalBytes} bytes, over the ${MAX_SCOPE_TOTAL_BYTES}-byte cap; ` +
+        `the expanded backup scope is ${expandedBytes} bytes, over the ${MAX_SCOPE_TOTAL_BYTES}-byte cap; ` +
         'nothing was written. Narrow the scopes (run --scopes ...) or raise the cap in code after review.',
-      total_bytes: totalBytes,
+      total_bytes: expandedBytes,
       cap_bytes: MAX_SCOPE_TOTAL_BYTES,
     };
   }
