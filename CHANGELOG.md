@@ -4,6 +4,38 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### G3 只存原始字节 + "未来追加"模拟（v3.4.6 补全）
+
+- **原始字节**：引擎从不解析后重写日志；块按明文 sha256 内容寻址。新增两条证据型单测：① 损坏日志（seq 跳号）
+  照样入库，清单 `sha256` 等于源文件哈希（保留证据优先于拒收）；② 备份前后源文件**字节与 mtime 均不变**。
+- **未来追加模拟**（新增 `src/backup/future-append.mjs`，一条实现三处调用）：`appendLegalEvent` 在原始字节后
+  追加一帧合法 `permission/preset`（实测最弱合法事件：会话级、无 turn/surface/引用），`futureAppendVerdict`
+  做静态预筛。引擎对每个会话在已读入内存的字节上跑模拟并报告 `future_append: {checked, failed, sessions}`
+  （不因此拒绝备份）；还原把"原日志 + 追加后日志"一起交给安装的 Harness 批量终审，失败即拒收；verify 默认
+  静态模拟、`--runtime` 时连 append 后的 artifact 一起终审（新码 `BACKUP_RUNTIME_APPEND_FAILED`）。
+- **CLI**：`run` 报告新增 `future append : N/M session(s) still load after one legal append` 并列出失败会话。
+- **真实实测 + 布局 bug**：默认仓库 `run --scope all`：15 会话 / 171.5 MB / 2 新块 + 53 复用（96%）/ **future append 15/15** / 26.1 s（未做模拟时 4.8 s，约 5× 代价，因此默认开、可用 `--no-future-append` 或 `backupFutureAppend:false` 关闭）。同日发现并修复布局 bug：还原前副本原先放在 `sessions/.w2m-restore-backups/`，被会话扫描器当成第 17/18 个会话（`MANIFEST_REL_PATH` 失败）；现移到 home 根、walk 器跳过点目录、扫描器增加排除行、引擎在写块前预校验 rel（四层修复 + 两条回归测试）。
+- **测试**：引擎 +4 项（模拟计数、坏日志入库仍保原始字节、源文件不变）、verify +3 项（行数/追加前缀、坏日志
+  判失败、`--runtime` 连 append 一起终审），共 7 项。
+
+### G2 `workspace.json` 写入协议（v3.4.6 补全，v3.4.8 收口）
+
+- **暂停客户端**（`src/backup/client.mjs`）：`detectClientRunning()` 通过 `tasklist`/`ps` 判断客户端是否运行，
+  并区分"没在跑"与"查不到"（后者不冒充安全）。离线 CLI `restore --apply` 在客户端运行时拒绝
+  （`BACKUP_CLIENT_RUNNING`），除非显式 `--allow-live-home`；面板在客户端内部运行，按定义接受活 home，
+  依赖下面两半。
+- **写后回读**（`registry.mjs`，v3.4.8 已有）：原子写 → 重读 → 逐会话校验登记、工作区 id、archived/pinned；
+  写失败/被客户端覆盖分别报 `BACKUP_REGISTRY_WRITE_FAILED` / `BACKUP_REGISTRY_VERIFY_FAILED`。
+- **客户端保存后复查**（新增 `src/backup/registry-watch.mjs`）：还原成功后按 2 s / 8 s / 20 s 采样注册表，
+  发现登记丢失就再应用一次计划并再校验；每次采样经 `onResult` 上报，面板写入 `state.last_registry_recheck`
+  并记日志；定时器由 `ctx.effect` 持有，卸载即取消。不用文件监视器（客户端每次保存都是原子替换，watcher
+  会被无关改动触发）。
+- **CLI**：`restore --allow-live-home`、`restore --registry-recheck <ms>`（离线等待一次保存窗口后同步复查）。
+- **测试**：新增 `backup-g2` 套件（10 项，进程列表与定时器均注入，不 spawn、不等真实时间）。
+- **真实事故后补的保护**：apply 前重读目标、与计划记录的 `existing_sha256` 比对，变了即
+  `BACKUP_RESTORE_TARGET_CHANGED`；写后读回发现"我们写入的字节 + 帧对齐的客户端追加"，自动重建为
+  "预还原副本 + 追加帧"并报告 `healed`（无损，保留客户端事件）。详见 `docs/BACKUP-DESIGN.md` §16.1。
+
 ### 还原、解锁、全量校验与归档包（v3.4.8）
 
 - **还原（`src/backup/restore.mjs`）**：先规划后写入。规划阶段把每份候选从内容寻址块解回、用运行时同一份校验代码判定、算清冲突与注册表改动，**一行都不写**；`--apply` 才按"预还原副本 → 原子写会话 → 写附件对象 → 注册表写入并回读校验 → 复读字节与清单比对"的顺序落地。四条复盘门禁（G1/G2/G3/G5）全部接进这条路径。
@@ -15,6 +47,7 @@ All notable changes to this project are documented here.
 - **归档包（`src/backup/archive.mjs` + 自写 `tar.mjs`）**：只打包清单校验过的字节，产出 `archive/<日期>/archived-sessions-<ts>.tar.zst`，内含 `manifest.json`（逐文件 size/sha256）+ `README.txt` + 会话/附件文件树；默认只打已归档会话，`--scope all` 打全部；`readArchive`/`extractArchive` 回读时逐文件对 sha256，并拒绝写出目标目录之外的条目（防路径穿越）。
 - **子插件路由（v3.4.8）**：新增 `POST /api/w2m/backup/restore`（body 先返回计划，`{"apply":true}` 才写）、`POST /api/w2m/backup/archive`、`GET /api/w2m/backup/verify`、`GET|POST /api/w2m/backup/unlock`；写路由各带确认令牌，面板不使用密码（走 machine 信封）。CLI 同步新增 `unlock / verify / archive / restore`（`restore` 默认只打印计划）。
 - **测试**：新增 5 个套件（runtime / restore / archive / verify / access），备份侧共 20 套件；包含"真实 Harness 终审通过"与"错误候选被拒绝"两个方向的用例，以及预还原副本、冲突、keep-both、路径穿越、损坏块、索引漂移、old-only 块缺失等失败路径。
+- **复盘加固（同日）**：① 无凭据的首次运行不再创建半个仓库；② `run --dry-run` 真正零写入（不建目录、不取锁、不解锁）；③ 多会话还原的注册表改为"整次还原一个文档"，修掉 last-write-wins；④ 支持还原到全新 home（显式 `--workspace-path` 时创建最小注册表），并拒绝凭空建库；⑤ 运行时批量校验在真实仓库上暴露 V8 字符串上限（`Invalid string length`）与 Electron 堆崩溃（exit 134），改为"小批 JSON + 大会话 NDJSON 流式"，真实 15 会话计划通过；⑥ 归档包可**直接还原**（`restore --archive`，与仓库还原同一套门禁），补齐计划 4.3 的"可还原"；⑦ 还原前副本按 N 份保留；⑧ identical 会话跳过重写；⑨ verify 增加 descriptor 检查与 old 记录摘要重建；⑩ 新增 4 个 v3.4.8 路由行为用例（确认令牌、未建库状态、Windows 真实 DPAPI 全链路）。
 - **真实闭环（默认仓库 `D:\DeepSeekHarness\BackUP`，2026-11-17）**：`unlock` 报 `machine` 信封、本机可用；`verify` 2 快照 / 32 文件 / 337.4 MB / 108 块全部解块验签通过，30/30 "未来追加"模拟通过（49.1 s）；`archive --scope all` 把 16 文件打成 168.7 MB tar → 164.7 MB `.tar.zst`（2.3 s）；`restore` 计划把 15 份会话全部交给安装的 Harness 终审通过（15/15），识别出 13 份 identical、2 份 conflict（备份之后 DSH 又写过这些活会话），dry-run 零写入；来自未注册工作区的会话被默认拒绝，并以 `--workspace-path` 显式挂接后才进入计划。
 
 

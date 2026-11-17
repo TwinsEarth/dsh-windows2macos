@@ -25,8 +25,7 @@
 
 import { ENVELOPE_KINDS } from './crypto.mjs';
 import { detectMachineKeySupport, loadMachineSecret } from './machine-key.mjs';
-import { readRepoKeys } from './keystore.mjs';
-import { openRepoKey } from './keystore.mjs';
+import { openRepoKey, readRepoKeys } from './keystore.mjs';
 
 /** Named unlock refusal. */
 export const UNLOCK_CODES = Object.freeze({

@@ -31,7 +31,9 @@ import { runBackup, SCOPES } from './engine.mjs';
 import { gc } from './gc.mjs';
 import { openRepo } from './repo.mjs';
 import { buildArchive } from './archive.mjs';
-import { applyRestore, planRestore } from './restore.mjs';
+import { applyRestore, planRestore, planRestoreFromArchive } from './restore.mjs';
+import { detectClientRunning } from './client.mjs';
+import { recheckRegistry } from './registry-watch.mjs';
 import { describeUnlock, unlockRepo } from './unlock.mjs';
 import { verifyRepo } from './verify.mjs';
 
@@ -106,7 +108,7 @@ export function formatRestore(plan, applied) {
     lines.push(`refused       : ${plan.reason_code} ${plan.detail ?? ''}`.trimEnd());
     return lines.join('\n');
   }
-  lines.push(`snapshot      : ${plan.snapshot_id}`);
+  lines.push(`source        : ${plan.source?.kind === 'archive' ? `archive ${plan.source.archive_file}` : `repository snapshot ${plan.snapshot_id}`}`);
   lines.push(`sessions      : ${plan.summary.sessions} (new ${plan.summary.new}, identical ${plan.summary.identical}, conflict ${plan.summary.conflicts})`);
   lines.push(`attachments   : ${plan.summary.attachments}`);
   lines.push(`runtime check : ${plan.summary.runtime_verified}/${plan.summary.sessions} sessions validated by the installed Harness`);
@@ -127,6 +129,9 @@ export function formatRestore(plan, applied) {
   }
   lines.push(`written       : ${applied.restored.length} session(s), ${humanBytes(applied.bytes_written)}`);
   lines.push(`registry      : ${applied.registry.filter((row) => row.ok).length}/${applied.registry.length} verified`);
+  if (applied.registry_recheck !== undefined) {
+    lines.push(`re-check      : ${applied.registry_recheck.ok ? 'still holds' : 'STILL OVERWRITTEN'} (rewrote: ${applied.registry_recheck.rewrote ? 'yes' : 'no'})`);
+  }
   if (applied.pre_restore_dir) lines.push(`pre-restore   : ${applied.pre_restore_dir}`);
   for (const warning of applied.warnings ?? []) lines.push(`warning       : ${warning}`);
   return lines.join('\n');
@@ -161,15 +166,19 @@ function usage() {
     '  --keep-old <n>      old versions kept per session (default: 10)',
     '  --dry-run           run/gc: report what would happen, write nothing',
     '  --snapshot <id>     verify/archive/restore: a specific snapshot (default: the latest)',
+    '  --archive <file>    restore: read the session bytes from a .tar.zst archive instead of the repository',
     '  --apply             restore: actually write (without it, restore only prints the plan)',
     '  --keep-both         restore: keep an existing different file and write the restored one beside it',
     '  --allow-static-validation  restore: accept static-only evidence when no Harness is installed',
+    '  --allow-live-home   restore: write even though the DSH client is running (read-back + recheck protocol)',
+    '  --registry-recheck <ms>  restore --apply: wait this long, then re-check the registry once (client save)',
     '  --workspace-path <p> restore: attach a restored session to this directory if the workspace is absent',
     '  --runtime           verify: also confirm every session with the installed Harness validator',
     '  --check             unlock: attempt the unlock instead of only describing it',
     '  --password-stdin    run/restore/unlock --check: read the password from stdin (never argv)',
     '                      (environment fallback: W2M_BACKUP_PASSWORD, same "never argv" rule)',
     '  --no-machine-key    run: do not use (or create) the OS-keystore machine envelope',
+    '  --no-future-append  run: skip the "next append still loads" simulation (it decodes every log)',
     '',
     'scheduling: the daily run lives in the dsh-backup subplugin (default 22:00 Asia/Shanghai), not in this CLI.',
   ].join('\n');
@@ -196,10 +205,14 @@ export function parseArgs(argv, env = process.env) {
     dryRun: false,
     passwordStdin: false,
     noMachineKey: false,
+    noFutureAppend: false,
     snapshot: null,
+    archiveFile: null,
     apply: false,
     keepBoth: false,
     allowStaticValidation: false,
+    allowLiveHome: false,
+    registryRecheckMs: 0,
     workspacePath: null,
     runtime: false,
     check: false,
@@ -215,14 +228,24 @@ export function parseArgs(argv, env = process.env) {
     else if (arg === '--dry-run') options.dryRun = true;
     else if (arg === '--password-stdin') options.passwordStdin = true;
     else if (arg === '--no-machine-key') options.noMachineKey = true;
+    else if (arg === '--no-future-append') options.noFutureAppend = true;
     else if (arg === '--apply') options.apply = true;
     else if (arg === '--keep-both') options.keepBoth = true;
     else if (arg === '--allow-static-validation') options.allowStaticValidation = true;
+    else if (arg === '--allow-live-home') options.allowLiveHome = true;
     else if (arg === '--runtime') options.runtime = true;
     else if (arg === '--check') options.check = true;
     else if (arg === '--snapshot') options.snapshot = rest.shift() ?? null;
+    else if (arg === '--archive') options.archiveFile = rest.shift() ?? null;
     else if (arg === '--workspace-path') options.workspacePath = path.resolve(rest.shift() ?? '');
+    else if (arg === '--registry-recheck') {
+      const raw = rest.shift() ?? '';
+      const value = Number(raw);
+      if (!Number.isSafeInteger(value) || value < 0) return { ...options, error: `--registry-recheck needs a non-negative integer, got ${JSON.stringify(raw)}` };
+      options.registryRecheckMs = value;
+    }
     else if (arg.startsWith('--snapshot=')) options.snapshot = arg.slice('--snapshot='.length);
+    else if (arg.startsWith('--archive=')) options.archiveFile = arg.slice('--archive='.length);
     else if (arg.startsWith('--workspace-path=')) options.workspacePath = path.resolve(arg.slice('--workspace-path='.length));
     else if (arg === '--scope') options.scope = rest.shift() ?? null;
     else if (arg === '--session') options.selected.push(rest.shift() ?? '');
@@ -358,6 +381,14 @@ export function formatRun(result) {
   }
   if (Array.isArray(result.torn_sessions) && result.torn_sessions.length > 0) {
     lines.push(`torn sessions : ${result.torn_sessions.length} captured mid-append (bytes kept; the next run supersedes them)`);
+  }
+  if (result.future_append !== undefined) {
+    lines.push(
+      `future append : ${result.future_append.checked - result.future_append.failed}/${result.future_append.checked} session(s) still load after one legal append`,
+    );
+    for (const failing of result.future_append.sessions ?? []) {
+      lines.push(`  - ${failing.rel} ${(failing.codes ?? []).join(', ')}`);
+    }
   }
   if (Array.isArray(result.invalid_containers) && result.invalid_containers.length > 0) {
     lines.push(`invalid logs  : ${result.invalid_containers.map((row) => row.rel).join(', ')}`);
@@ -564,6 +595,7 @@ export function main(argv, io = {}) {
       selected: options.selected,
       keepOldPerSession: options.keepOld ?? undefined,
       dryRun: options.dryRun,
+      futureAppend: options.noFutureAppend === true ? false : undefined,
       password: passwordFor(options, io),
       machineKey: options.noMachineKey === true || (io.env ?? process.env).W2M_BACKUP_NO_MACHINE_KEY === '1' ? false : undefined,
     });
@@ -680,22 +712,40 @@ export function main(argv, io = {}) {
       writeErr(`${resolved.error.code}: ${resolved.error.detail}`);
       return 1;
     }
-    const plan = planRestore({
-      root: resolved.dir,
-      dshHome: options.dshHome,
-      snapshotId: options.snapshot,
-      sessionIds: options.selected,
-      password: passwordFor(options, io),
-      machineKey: options.noMachineKey === true ? false : undefined,
-      allowStaticValidation: options.allowStaticValidation,
-      keepBoth: options.keepBoth,
-      workspacePath: options.workspacePath,
-    });
+    const plan = options.archiveFile === null
+      ? planRestore({
+          root: resolved.dir,
+          dshHome: options.dshHome,
+          snapshotId: options.snapshot,
+          sessionIds: options.selected,
+          password: passwordFor(options, io),
+          machineKey: options.noMachineKey === true ? false : undefined,
+          allowStaticValidation: options.allowStaticValidation,
+          keepBoth: options.keepBoth,
+          workspacePath: options.workspacePath,
+          allowLiveHome: options.allowLiveHome,
+          clientCheck: io.clientCheck ?? (() => detectClientRunning({})),
+        })
+      : planRestoreFromArchive({
+          file: path.resolve(options.archiveFile),
+          dshHome: options.dshHome,
+          sessionIds: options.selected,
+          allowStaticValidation: options.allowStaticValidation,
+          keepBoth: options.keepBoth,
+          workspacePath: options.workspacePath,
+          allowLiveHome: options.allowLiveHome,
+          clientCheck: io.clientCheck ?? (() => detectClientRunning({})),
+        });
     if (plan.ok !== true || options.apply !== true) {
       write(options.json ? JSON.stringify(plan, null, 2) : formatRestore(plan));
       return plan.ok === true ? 0 : 1;
     }
     const applied = applyRestore({ plan, dshHome: options.dshHome, dryRun: options.dryRun });
+    if (applied.ok === true && applied.dry_run !== true && applied.registry?.some?.((row) => row.changed === true) && options.registryRecheckMs > 0) {
+      // Sync wait: the CLI is offline, so there is no event loop to keep the process alive for a deferred check.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, options.registryRecheckMs);
+      applied.registry_recheck = recheckRegistry({ dshHome: options.dshHome, plan });
+    }
     write(options.json ? JSON.stringify(applied, null, 2) : formatRestore(plan, applied));
     return applied.ok === true ? 0 : 1;
   }

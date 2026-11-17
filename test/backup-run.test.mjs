@@ -10,19 +10,22 @@ import assert from 'node:assert/strict';
 import { join } from 'node:path';
 
 import {
+  ARCHIVE_CONFIRM_TOKEN,
   BACKUP_ARCHIVE_ROUTE_PATH,
   BACKUP_RESTORE_ROUTE_PATH,
   BACKUP_RUN_ROUTE_PATH,
   BACKUP_UNLOCK_ROUTE_PATH,
   BACKUP_VERIFY_ROUTE_PATH,
+  RESTORE_CONFIRM_TOKEN,
   RUN_CONFIRM_TOKEN,
+  UNLOCK_CONFIRM_TOKEN,
   apply,
   defaultBackupDir,
   normalizeConfig,
 } from '../src/plugin/backup.mjs';
 import { main } from '../src/backup/cli.mjs';
 import { readIndex } from '../src/backup/repo.mjs';
-import { tempDir, makeHome, registryDocument } from './helpers/backup-fixture.mjs';
+import { tempDir, makeHome, registryDocument, runtimeValidHome } from './helpers/backup-fixture.mjs';
 
 const PASSWORD = 'correct horse battery staple';
 
@@ -113,7 +116,7 @@ describe('subplugin: the route and the timer', () => {
       );
       assert.deepEqual(fake.registrations.find((row) => row.path === BACKUP_RUN_ROUTE_PATH).methods, ['GET', 'POST']);
       assert.deepEqual(fake.registrations.find((row) => row.path === BACKUP_RUN_ROUTE_PATH).methods, ['GET', 'POST']);
-      assert.equal(fake.disposers.length, 1, 'the timer must be owned by ctx.effect');
+      assert.equal(fake.disposers.length, 2, 'ctx.effect owns the scheduler and the post-restore registry recheck');
 
       const get = await fake.registrations.find((row) => row.path === BACKUP_RUN_ROUTE_PATH).fetch(new Request(`http://local.invalid${BACKUP_RUN_ROUTE_PATH}`, { method: 'GET' }));
       const state = await get.json();
@@ -206,6 +209,79 @@ describe('subplugin: the route and the timer', () => {
       } finally {
         cleanup();
         cleanHome();
+      }
+    },
+  );
+
+  it('exposes the v3.4.8 routes with their confirmation tokens', async () => {
+    const { home, cleanup: cleanHome } = homeFixture();
+    const { dir, cleanup } = tempDir('w2m-route-v348-');
+    try {
+      const fake = fakeCtx();
+      apply(fake.ctx, { backupDir: join(dir, 'repo'), dshHome: home, backupMachineKey: false, ...NO_FIRE });
+      const find = (path) => fake.registrations.find((row) => row.path === path);
+      const post = (path, body) => find(path).fetch(new Request(`http://local.invalid${path}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }));
+
+      for (const [path, token] of [
+        [BACKUP_RESTORE_ROUTE_PATH, RESTORE_CONFIRM_TOKEN],
+        [BACKUP_ARCHIVE_ROUTE_PATH, ARCHIVE_CONFIRM_TOKEN],
+        [BACKUP_UNLOCK_ROUTE_PATH, UNLOCK_CONFIRM_TOKEN],
+      ]) {
+        const refused = await post(path, {});
+        assert.equal(refused.status, 400);
+        const payload = await refused.json();
+        assert.equal(payload.reason_code, 'BACKUP_CONFIRM_REQUIRED');
+        assert.match(payload.detail, new RegExp(token, 'u'));
+      }
+
+      const unlock = await find(BACKUP_UNLOCK_ROUTE_PATH).fetch(new Request(`http://local.invalid${BACKUP_UNLOCK_ROUTE_PATH}`, { method: 'GET' }));
+      const described = await unlock.json();
+      assert.equal(described.ok, false, 'no repository yet: the describe route names that state');
+      assert.equal(described.reason_code, 'BACKUP_REPO_NOT_INITIALIZED');
+
+      const verify = await find(BACKUP_VERIFY_ROUTE_PATH).fetch(new Request(`http://local.invalid${BACKUP_VERIFY_ROUTE_PATH}`, { method: 'GET' }));
+      const verified = await verify.json();
+      assert.equal(verified.ok, false);
+      assert.equal(verified.reason_code, 'BACKUP_REPO_NOT_INITIALIZED');
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+
+  it(
+    'answers a confirmed restore plan and archive on Windows (machine envelope, real DPAPI)',
+    { skip: process.platform === 'win32' ? false : 'DPAPI is Windows-only' },
+    async () => {
+      const source = runtimeValidHome();
+      const { dir, cleanup } = tempDir('w2m-route-v348-win-');
+      try {
+        const fake = fakeCtx();
+        apply(fake.ctx, { backupDir: join(dir, 'repo'), dshHome: source.home, ...NO_FIRE });
+        const find = (path) => fake.registrations.find((row) => row.path === path);
+        const post = (path, body) => find(path).fetch(new Request(`http://local.invalid${path}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }));
+
+        // First backup through the run route: it creates the repository with a machine envelope.
+        const runResponse = await post(BACKUP_RUN_ROUTE_PATH, { confirm: RUN_CONFIRM_TOKEN, scope: 'all' });
+        assert.equal((await runResponse.json()).ok, true);
+
+        const archive = await post(BACKUP_ARCHIVE_ROUTE_PATH, { confirm: ARCHIVE_CONFIRM_TOKEN, scope: 'all' });
+        const archived = await archive.json();
+        assert.equal(archived.ok, true, archived.detail);
+
+        const restore = await post(BACKUP_RESTORE_ROUTE_PATH, { confirm: RESTORE_CONFIRM_TOKEN });
+        const plan = await restore.json();
+        assert.equal(plan.ok, true, plan.detail);
+        assert.equal(plan.summary.sessions, 1);
+        assert.equal(plan.summary.conflicts, 0, 'restoring into the same home sees its own log as identical');
+
+        const applied = await (await post(BACKUP_RESTORE_ROUTE_PATH, { confirm: RESTORE_CONFIRM_TOKEN, apply: true })).json();
+        assert.equal(applied.ok, true, applied.detail);
+        assert.equal(applied.skipped, 1, 'an identical log must be skipped, not rewritten');
+        assert.equal(applied.registry_recheck?.scheduled, true, 'G2 half three: the registry is re-checked after the client saves');
+      } finally {
+        cleanup();
+        source.cleanup();
       }
     },
   );

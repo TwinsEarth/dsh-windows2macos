@@ -406,3 +406,116 @@ Harness 的会话格式代码在 `resources/app.asar` 里，plain node 读不了
 | `BACKUP_INDEX_MISMATCH` / `BACKUP_OLD_RECORD_BLOCK_MISSING` | 索引与快照目录不一致 / old 记录引用的块缺失 |
 | `BACKUP_ARCHIVE_EMPTY` / `BACKUP_ARCHIVE_UNREADABLE` | 归档无内容 / 归档不可读 |
 | `BACKUP_OBJECT_MISSING` / `BACKUP_SIZE_MISMATCH` / `BACKUP_MANIFEST_DIGEST_MISMATCH` | 块缺失 / 长度不符 / 摘要不符 |
+
+### 15.8 v3.4.8 复盘后的加固（2026-11-17）
+
+这一轮把"能还原"推到了"在真实仓库上也成立"，修掉的都是真实数据暴露出来的问题：
+
+| 发现 | 修复 |
+|---|---|
+| 首次运行没有可用凭据时仍会创建半个仓库（ensureLayout 先于凭据检查） | 引擎在建目录之前判断密码或 OS keystore 是否至少有一条路，没有就返回 BACKUP_NO_PERMISSION，仓库目录一个字节都不建；对应单测断言 root 不存在 |
+| run --dry-run 会创建仓库并要求解锁（不是只读） | dry-run 不建 layout、不取锁、不解锁：只在内存里数块并报告；在"仓库还不存在"时同样零写入 |
+| 多会话还原的注册表是 last-write-wins：每个会话各自基于原始文档规划，连续 apply 只剩最后一个 | 注册表规划改为**整次还原一个文档**（planRegistryRestores），一次写、一次回读、逐会话校验；新增多会话还原测试 |
+| 还原到全新 home（灾难恢复主场景）被拒：没有 workspace.json 就 BACKUP_REGISTRY_UNREADABLE | 允许在**显式给出 --workspace-path** 时创建最小注册表文档（unit/global/tables 形状与客户端一致），绝不凭空建；不给路径仍拒绝并提示 |
+| 运行时批量校验在真实仓库上崩溃：15 个会话的 artifact JSON 数组超过 V8 最大字符串（Invalid string length）；放宽后又把 Electron 的 V8 堆打爆（exit 134） | 小 artifact 走"每约 96 MiB 一批"的 JSON 数组；超过 32 MiB 的**单会话走 NDJSON 流式驱动**（首行 header、逐行事件、逐条 decodeRow），内存不再与日志体积成正比。真实 15 会话计划验证通过 |
+| 归档只能解压、不能还原（计划 4.3 要求"可解压、可校验、可还原"） | 新增 planRestoreFromArchive：从 .tar.zst 读字节，走与仓库还原**同一套**门禁/冲突/写入/注册表流程；CLI restore --archive <file> |
+| 还原前副本只增不减 | 成功 apply 后按时间保留最新 N 份（默认 10），报告 pruned_pre_restore；失败路径不清理（那正是要用的那份） |
+| identical 会话也被重写（无谓触碰客户端正在用的文件） | identical 跳过写入、仅补注册；报告 skipped，单测断言 mtime 不变 |
+| verify 只验证快照块：backup.json、old 记录的摘要没查 | verify 增加 descriptor 形状检查；old 记录按其自身 sha256/size 重建并比对（不只查块存在） |
+| 路由只有注册断言，没有行为断言 | 新增 v3.4.8 路由用例：三个写路由的确认令牌缺失即 400；unlock/verify 在未建库时报 BACKUP_REPO_NOT_INITIALIZED；Windows 上真实 DPAPI 走完 "run → archive → restore plan → apply（identical 跳过）" |
+
+**实测（真实仓库，2026-11-17 加固后）**：restore 计划 15/15 会话由安装的 Harness 终审通过（含两个
+artifact JSON 分别约 152 MB / 370 MB 的大会话，走流式路径），13 identical / 2 conflict，dry-run 零写入；
+整轮计划约 114 s，成本集中在那两个大会话的解码与逐事件验证 —— **面板必须按会话按需规划**，不要一次性全量。
+
+## 16. G2 收口：`workspace.json` 写入协议（v3.4.6 补全，v3.4.8 收口）
+
+复盘 G2 的原文是"要么暂停客户端，要么写后**回读校验**并在客户端保存后复查"。v3.4.6 只冻结了这条规则，
+v3.4.8 把三半全部落成代码、测试和运行时行为：
+
+| 半 | 实现 | 行为 |
+|---|---|---|
+| **暂停客户端** | `src/backup/client.mjs` | `detectClientRunning()` 用 `tasklist`/`ps` 找客户端进程，**区分"没在跑"与"查不到"**。离线 CLI `restore --apply` 在客户端运行时**拒绝**（`BACKUP_CLIENT_RUNNING`），除非显式 `--allow-live-home`；面板路径在客户端内部，按定义是"活 home"，因此传 `allowLiveHome: true` 并依赖后两半 |
+| **写后回读** | `src/backup/registry.mjs` | 原子写 → 重读 → 校验每个会话的登记、工作区 id、archived/pinned 三项；不整文件比对，以免把客户端无关改动当成失败 |
+| **客户端保存后复查** | `src/backup/registry-watch.mjs` | 还原成功后按 2 s / 8 s / 20 s 采样注册表；发现登记丢失就**再应用一次计划并再校验**；每次采样都经 `onResult` 上报，面板写入 `state.last_registry_recheck` 并记日志。定时器由 `ctx.effect` 持有，卸载即取消 |
+
+**为什么不用文件监视器**：客户端的保存是原子替换，watcher 会为每一次无关改动触发；固定几次采样覆盖"写完
+后那一次保存"这个真实窗口，也不会长期占着用户文件句柄。
+
+**测试**（`test/backup-g2.test.mjs`，10 项）：进程列表与定时器全部注入，因此不 spawn `tasklist`、不等 20 秒。
+覆盖 Windows/linux/mac 检测、"查不到"与"没在跑"的区分、暂停门（拒绝/allow-live-home）、计划阶段的拒绝、
+健康复查、客户端覆盖后的自动重放、定时器调度与取消、CLI 的两种结果。
+
+**残余风险（写明，不掩盖）**：采样窗口之间客户端仍可再保存一次；若它比采样更频繁地保存，重放可能再次被覆盖。
+面板会持续记 `warn`，`doctor` 能发现"盘上有、注册表里没有"的会话。彻底消除需要客户端提供协作钩子（v3.4.9
+面板设计里再谈），当前协议把风险从"静默丢失"降为"有记录、可重放"。
+
+### 16.1 真实事故与由此产生的保护
+
+v3.4.8 的真实仓库验收中，一次 restore 被误用了真实 `DSH_HOME`（本应指向临时 home），把 05:35 的快照字节
+写到了两个正在被客户端追加的会话日志上；客户端随后按自己的内存计数继续追加，导致日志出现 seq 间隙。
+这次事故的直接后果被两条既有设计兜住：**预还原副本**保存了写前内容，**读回校验**立刻报告了不一致。
+事后用"预还原副本 + 客户端追加的帧"无损重建了两个日志（doctor 通过，损坏原文另存），并据此补了两道保护：
+
+* **apply 前再校验目标**：计划里记录 `existing_sha256`，写入前重读目标；变了就整体拒绝该会话
+  （`BACKUP_RESTORE_TARGET_CHANGED`），避免覆盖"计划之后又被写过"的文件；
+* **写后自动修复**：读回发现文件以"我们写入的字节"开头、后面是**帧对齐的客户端追加**时，自动写回
+  "预还原副本 + 追加帧"并在结果里报告 `healed`（保留双方，不丢客户端事件）；否则报失败，预还原副本仍是退路。
+* CLI 增加 `--allow-live-home` 门槛（客户端运行时默认拒绝还原到该 home），与 `--registry-recheck <ms>`
+  （离线场景等待一次客户端保存窗口后再复查）。
+
+## 17. G3 收口：只存原始字节 + "未来追加"模拟（v3.4.6 补全）
+
+复盘 G3 的原文是"备份只存**原始字节**；任何重构路径必须过 G1 且做'未来追加'模拟"。v3.4.6 冻结了规则，
+v3.4.8 把两半都做成可执行、可报告、可测试的东西，并在 v3.4.8 加固里补齐引擎与 verify 的报告面。
+
+### 17.1 只存原始字节（证据链）
+
+| 环节 | 事实 | 证据 |
+|---|---|---|
+| 引擎 | 读文件 → `splitBlocks` → 逐块 `sealObject` → 清单记 `sha256/size/mtime`；**从不解析后重写日志** | 引擎单测：损坏日志（seq 跳号）照样入库且清单 `sha256` 等于源文件哈希；另一条单测断言备份前后源文件**字节与 mtime 均不变** |
+| 仓库 | 块按明文 sha256 内容寻址，`old/` 记录只存清单条目（不复制加密体） | 既有 repo/rotation 测试 |
+| 还原 | 解块 → 认证解密 → 与清单 sha 比对 → 原子写 → 写后复读哈希 | restore 单测 + 真实仓库 15/15 会话还原计划 |
+| 归档 | 包内字节来自仓库解块，入包前逐文件对清单 | archive 测试 |
+
+### 17.2 "未来追加"模拟（一条实现，三处调用）
+
+新增 `src/backup/future-append.mjs`：`countLogRows`（不解析 JSON 的行数）、`appendLegalEvent`（原始字节 + 一帧合法
+`permission/preset`）、`futureAppendVerdict`（静态预筛）。`permission/preset` 是实测选出的**最弱合法追加**：
+会话级、无 turn 状态、无 surface、无引用（`turn/start` 需要"下一个 turn 号"，依赖验证器不该去猜的状态）。
+
+| 调用点 | 行为 |
+|---|---|
+| **引擎**（`runBackup`） | 对每个会话在**已读入内存的字节**上做模拟，结果写进 `future_append: {checked, failed, sessions}`；**不因此拒绝备份**——保留原始证据才是备份的职责，拒收发生在还原 |
+| **还原**（`planRestore`/`planRestoreFromArchive`） | 通过 `validateCandidates(appendCheck: true)`：静态预筛后，把"原日志"和"追加后日志"**一起**交给安装的 Harness 批量终审；任一失败即整单拒绝（`BACKUP_RUNTIME_REJECTED`，detail 说明"after one legal append"） |
+| **verify** | 默认对每个快照会话跑静态模拟（`BACKUP_FUTURE_APPEND_FAILED`）；`--runtime` 时把 append 后的 artifact 也放进同一批运行时校验，失败报 `BACKUP_RUNTIME_APPEND_FAILED` |
+
+CLI `run` 的人类报告新增一行：`future append : 14/15 session(s) still load after one legal append`，并列出失败会话。
+
+### 17.3 边界（写明）
+
+* 追加事件是"最弱合法事件"，不是"用户下一条真实消息"：它证明日志的帧结构、seq 密度、保护头与 surface 规则
+  没坏，但**不**模拟一次带工具/压缩/重试的真实回合。
+* 引擎的模拟是静态预筛（便宜、可离线）；终审仍是运行时（G5）。两者失败都只报告，不修改日志。
+* 备份端**不会**因为模拟失败而少存字节；是否需要告警由调用方决定（面板日志 / CLI 输出 / `future_append.failed`）。
+
+### 17.4 真实实测，以及一个被真实数据抓到的布局 bug（2026-11-17）
+
+**实测（默认仓库，`run --scope all`）**：15 会话 / 16 文件 / 171.5 MB，**2 新块 + 53 复用（96%）**，2 条 old 记录，
+`machine` 解锁，**`future append: 15/15`**，总耗时 **26.1 s**。对照 v3.4.7 未做模拟时的 4.8 s：模拟对每份日志多做
+一次解码与逐事件 parse，代价约 5×（171 MB 数据）；对每日一次的后台任务可接受，因此默认开启，但提供
+`--no-future-append`（CLI）与 `backupFutureAppend: false`（面板配置）关闭。
+
+**被真实数据抓到的 bug**：这次运行第一次在"还原前副本存在"的 home 上跑，135 s 后以
+`BACKUP_REPO_SNAPSHOT_INVALID — MANIFEST_REL_PATH@$.files[16].rel, [17].rel` 失败。原因不是日志，而是布局：
+v3.4.8 把还原前副本放在 `$DSH_HOME/sessions/.w2m-restore-backups/`，而会话扫描器递归遍历 `sessions/`，于是把
+这些副本当成第 17、18 个会话；它们的 rel 含 `.` 段，清单校验拒绝。修复（四层）：
+
+1. 还原前副本移到 `$DSH_HOME/.w2m-restore-backups/`（home 根、不在任何扫描根之下）；真实目录已迁移。
+2. `listSessionDirs` 不再下探点目录（`.event-cache`、`.w2m-restore-backups` 都不会被当成工作区）。
+3. 扫描器的 `EXCLUSIONS` 增加 `sessions/.w2m-restore-backups` 行，把"旧 home 里遗留的副本"写明为排除项。
+4. 引擎在任何块写入**之前**用 `normalizeRelPath` 预校验每个 rel，坏路径立即返回
+   `MANIFEST_REL_PATH`（并断言 objects 目录仍为空），不再先写块后失败。
+
+测试：扫描器"遗留副本目录不被当成会话"、引擎"坏 rel 在写块前拒绝"各一条；仓库本身未受影响（快照/索引仍 2 条，
+孤儿块由 gc 清理）。

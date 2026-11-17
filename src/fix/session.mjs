@@ -60,7 +60,15 @@ export function listSessionDirs(sessionsRoot) {
       return;
     }
     if (entries.some((e) => e.isFile() && /^session\.v\d+\.jsonl\.zstd$/.test(e.name))) out.push(dir);
-    for (const e of entries) if (e.isDirectory()) walk(path.join(dir, e.name));
+    // Dot-directories under `sessions/` are not workspaces: `.event-cache` is a derived projection and
+    // `.w2m-restore-backups` is our own pre-restore copy area. Descending into them once turned a backup into a
+    // 135-second run that ended with an invalid manifest rel path (measured 2026-11-17); the walker now stops at
+    // them, and the backup scanner also excludes them explicitly.
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      if (e.name.startsWith('.')) continue;
+      walk(path.join(dir, e.name));
+    }
   };
   walk(sessionsRoot);
   return out;

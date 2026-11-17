@@ -9,7 +9,7 @@
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 
 import {
@@ -145,6 +145,31 @@ describe('backup scan: a fixture home', () => {
       assert.match(result.attachments[0].detail, /starts with ab/u);
     } finally {
       broken.cleanup();
+    }
+  });
+
+  it('never walks the restore pre-copy area (a legacy copy under sessions/ is not a workspace)', () => {
+    const home = makeHome({
+      sessions: [{ workspace: '--E-GPT--', id: 'session-aaaaaaaa-0001' }],
+      registry: registryDocument({ sessionIds: ['session-aaaaaaaa-0001'] }),
+    });
+    const legacy = join(
+      home.home,
+      'sessions',
+      '.w2m-restore-backups',
+      '20260101T000000Z',
+      'sessions',
+      '--E-GPT--',
+      'session-bbbbbbbb-0002',
+    );
+    mkdirSync(legacy, { recursive: true });
+    writeFileSync(join(legacy, 'session.v4.jsonl.zstd'), sessionLog('session-bbbbbbbb-0002'));
+    try {
+      const result = scanSessions({ dshHome: home.home });
+      assert.deepEqual(result.sessions.map((row) => row.session_id), ['session-aaaaaaaa-0001']);
+      assert.equal(result.sessions.some((row) => row.rel.includes('.w2m-restore-backups')), false);
+    } finally {
+      home.cleanup();
     }
   });
 

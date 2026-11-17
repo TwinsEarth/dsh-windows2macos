@@ -25,9 +25,9 @@ import { sha256Hex } from './manifest.mjs';
 import { rebuildFile, objectFile } from './materialize.mjs';
 import { listOldVersions } from './rotation.mjs';
 import { readCurrentPointers } from './gc.mjs';
-import { diagnoseSessionBuffer } from '../util/session-validate.mjs';
-import { buildArtifactFromBuffer, runtimeValidate } from './runtime-validate.mjs';
-import { compressFrame } from '../fix/zstd.mjs';
+import { buildArtifactFromBuffer, runtimeValidateBatch } from './runtime-validate.mjs';
+import { appendLegalEvent, futureAppendVerdict } from './future-append.mjs';
+import { readJsonSafe } from './atomic.mjs';
 
 /** Codes `verifyRepo` can report. */
 export const VERIFY_CODES = Object.freeze({
@@ -41,6 +41,7 @@ export const VERIFY_CODES = Object.freeze({
   INDEX_MISMATCH: 'BACKUP_INDEX_MISMATCH',
   OLD_RECORD_BLOCK_MISSING: 'BACKUP_OLD_RECORD_BLOCK_MISSING',
   FUTURE_APPEND_FAILED: 'BACKUP_FUTURE_APPEND_FAILED',
+  RUNTIME_APPEND_FAILED: 'BACKUP_RUNTIME_APPEND_FAILED',
 });
 
 /**
@@ -54,19 +55,8 @@ export const VERIFY_CODES = Object.freeze({
  * @returns {{ok: boolean, codes: string[], detail: object|null}}
  */
 export function simulateFutureAppend(buffer) {
-  let artifact;
-  try {
-    artifact = buildArtifactFromBuffer(buffer);
-  } catch (error) {
-    return { ok: false, codes: ['BACKUP_SCAN_HEADER_UNREADABLE'], detail: { error: error instanceof Error ? error.message : String(error) } };
-  }
-  const nextSeq = artifact.events.length;
-  const appended = Buffer.concat([
-    buffer,
-    compressFrame(Buffer.from(`${JSON.stringify({ type: 'turn/start', seq: nextSeq, time: Date.now(), data: { turn: 1 } })}\n`, 'utf8')),
-  ]);
-  const verdict = diagnoseSessionBuffer(appended, { expectedSessionId: artifact.header.id ?? null });
-  return { ok: verdict.ok === true, codes: verdict.codes, detail: verdict.detail ?? null };
+  const verdict = futureAppendVerdict(buffer);
+  return { ok: verdict.ok === true, codes: verdict.codes, detail: verdict.detail };
 }
 
 /**
@@ -141,6 +131,13 @@ export function verifyRepo(input) {
     }
   }
 
+  // The repository's own descriptor: if this is not readable, every path below it is a guess.
+  const descriptor = readJsonSafe(repoPaths(input.root).descriptor);
+  if (descriptor === null || typeof descriptor.format !== 'string' || !Number.isSafeInteger(descriptor.version)) {
+    problems.push({ code: VERIFY_CODES.SNAPSHOT_INVALID, file: repoPaths(input.root).descriptor, snapshot_id: null, detail: 'backup.json is missing or does not carry a format/version' });
+  }
+
+  const runtimeQueue = [];
   for (const row of valid) {
     const summary = { snapshot_id: row.snapshot_id, files: 0, blocks: 0, bytes: 0, ok: true, problems: 0 };
     snapshots.push(summary);
@@ -190,17 +187,21 @@ export function verifyRepo(input) {
         }
       }
       if (entry.kind === 'session' && input.runtime === true) {
-        const verdict = runtimeValidate({ buffer: rebuilt.buffer, env: input.env });
-        runtimeChecked.checked += 1;
-        if (verdict.available !== true) {
-          problems.push({ code: 'BACKUP_RUNTIME_UNAVAILABLE', file: entry.rel, snapshot_id: row.snapshot_id, detail: verdict.detail });
+        try {
+          runtimeQueue.push({
+            entry,
+            snapshot_id: row.snapshot_id,
+            summary,
+            artifact: buildArtifactFromBuffer(rebuilt.buffer),
+            // G3: the runtime is asked about the log *and* the log plus one legal append.
+            appended: buildArtifactFromBuffer(appendLegalEvent(rebuilt.buffer)),
+          });
+        } catch (error) {
           summary.ok = false;
           summary.problems += 1;
-        } else if (verdict.ok !== true) {
+          runtimeChecked.checked += 1;
           runtimeChecked.failed += 1;
-          summary.ok = false;
-          summary.problems += 1;
-          problems.push({ code: 'BACKUP_RUNTIME_REJECTED', file: entry.rel, snapshot_id: row.snapshot_id, detail: verdict.detail });
+          problems.push({ code: 'BACKUP_RUNTIME_REJECTED', file: entry.rel, snapshot_id: row.snapshot_id, detail: `could not decode for the runtime: ${error instanceof Error ? error.message : String(error)}` });
         }
       }
     }
@@ -211,10 +212,19 @@ export function verifyRepo(input) {
   const old = listOldVersions(input.root);
   counts.old = old.length;
   for (const record of old) {
-    for (const block of record.record.blocks ?? []) {
-      const file = objectFile(input.root, block.sha256);
-      if (fs.existsSync(file)) continue;
-      problems.push({ code: VERIFY_CODES.OLD_RECORD_BLOCK_MISSING, file: record.file, snapshot_id: record.record.snapshot_id ?? null, detail: `block ${block.sha256} named by the version record is missing` });
+    const info = record.record;
+    for (const block of info.blocks ?? []) {
+      if (fs.existsSync(objectFile(input.root, block.sha256))) continue;
+      problems.push({ code: VERIFY_CODES.OLD_RECORD_BLOCK_MISSING, file: record.file, snapshot_id: info.snapshot_id ?? null, detail: `block ${block.sha256} named by the version record is missing` });
+    }
+    // An old record is a manifest entry too: rebuild it and compare the digest it recorded.
+    if (typeof info.sha256 === 'string' && Number.isSafeInteger(info.size)) {
+      const rebuilt = rebuildFile({ root: input.root, entry: { blocks: info.blocks ?? [], size: info.size, sha256: info.sha256, rel: info.rel ?? 'old-record' }, dek: key.dek });
+      if (rebuilt.ok !== true) {
+        problems.push({ code: rebuilt.code, file: record.file, snapshot_id: info.snapshot_id ?? null, detail: rebuilt.detail });
+      } else if (rebuilt.buffer.length !== info.size || sha256Hex(rebuilt.buffer) !== info.sha256) {
+        problems.push({ code: VERIFY_CODES.DIGEST_MISMATCH, file: record.file, snapshot_id: info.snapshot_id ?? null, detail: 'the rebuilt old version does not hash to the digest the record stored' });
+      }
     }
   }
   const current = readCurrentPointers(input.root);
@@ -229,6 +239,35 @@ export function verifyRepo(input) {
     }
   }
   void objectsRoot;
+
+  if (runtimeQueue.length > 0) {
+    const artifacts = runtimeQueue.flatMap((row) => [row.artifact, row.appended]);
+    const batch = runtimeValidateBatch({ artifacts, env: input.env });
+    runtimeChecked.checked += runtimeQueue.length;
+    for (const [offset, row] of runtimeQueue.entries()) {
+      const original = batch.verdicts[offset * 2] ?? { ok: false, detail: 'no verdict', events: 0 };
+      const appended = batch.verdicts[offset * 2 + 1] ?? { ok: false, detail: 'no verdict', events: 0 };
+      if (batch.available !== true) {
+        row.summary.ok = false;
+        row.summary.problems += 1;
+        problems.push({ code: 'BACKUP_RUNTIME_UNAVAILABLE', file: row.entry.rel, snapshot_id: row.snapshot_id, detail: original.detail });
+        continue;
+      }
+      if (original.ok !== true) {
+        runtimeChecked.failed += 1;
+        row.summary.ok = false;
+        row.summary.problems += 1;
+        problems.push({ code: 'BACKUP_RUNTIME_REJECTED', file: row.entry.rel, snapshot_id: row.snapshot_id, detail: original.detail });
+        continue;
+      }
+      if (appended.ok !== true) {
+        runtimeChecked.failed += 1;
+        row.summary.ok = false;
+        row.summary.problems += 1;
+        problems.push({ code: VERIFY_CODES.RUNTIME_APPEND_FAILED, file: row.entry.rel, snapshot_id: row.snapshot_id, detail: `after one legal append the Harness refuses the log: ${appended.detail}` });
+      }
+    }
+  }
 
   return {
     ok: problems.length === 0,

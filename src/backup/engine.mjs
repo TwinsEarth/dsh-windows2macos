@@ -32,11 +32,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { BackupLayoutError, ensureLayout, repoPaths } from './layout.mjs';
-import { buildManifest, sha256Hex, splitBlocks } from './manifest.mjs';
+import { buildManifest, normalizeRelPath, sha256Hex, splitBlocks } from './manifest.mjs';
 import { sealObject } from './crypto.mjs';
 import { writeFileAtomic } from './atomic.mjs';
 import { withRepoLock } from './locks.mjs';
 import { openRepoKey } from './keystore.mjs';
+import { detectMachineKeySupport } from './machine-key.mjs';
+import { futureAppendVerdict } from './future-append.mjs';
 import { scanHome } from './scan.mjs';
 import { DEFAULT_KEEP_OLD, rotateForEntry } from './rotation.mjs';
 import { commitSnapshot, makeSnapshotId } from './repo.mjs';
@@ -189,6 +191,10 @@ export function storeFileBlocks(input) {
     blocksNew += 1;
     bytesWritten += block.length;
   }
+  // G3's simulation: the bytes are already in memory, so asking "would the next append still load?" costs one
+  // extra decode and turns a silent problem into a reported one. It does not refuse the backup: preserving the
+  // evidence is the point; restore is where a failing log is refused.
+  const future = input.expectZstd === true && input.futureAppend !== false ? futureAppendVerdict(buffer) : null;
   return {
     description,
     blocks_new: blocksNew,
@@ -197,6 +203,7 @@ export function storeFileBlocks(input) {
     bytes_read: buffer.length,
     torn,
     container_error: containerError,
+    future_append: future,
   };
 }
 
@@ -252,25 +259,46 @@ export function runBackup(input) {
 
   let lock = null;
   try {
-    try {
-      ensureLayout(root, { dshHome, now });
-    } catch (error) {
-      if (error instanceof BackupLayoutError) return { ok: false, reason_code: error.code, detail: error.detail, dry_run: dryRun };
-      throw error;
+    const existed = fs.existsSync(repoPaths(root).descriptor);
+    // A first run that has no credential path must not create the repository: the same no-permission rule the
+    // keystore enforces, applied *before* the layout, so a refused run leaves no half-initialised directory.
+    if (dryRun !== true && existed !== true) {
+      const password = input.password ?? null;
+      const hasPassword = Buffer.isBuffer(password) ? password.length > 0 : typeof password === 'string' && password.length > 0;
+      const support = input.machineKey === false ? { available: false, reason: 'disabled-by-configuration' } : detectMachineKeySupport({ platform: input.platform, runner: input.runner });
+      if (!hasPassword && support.available !== true) {
+        return {
+          ok: false,
+          reason_code: ENGINE_CODES.NO_PERMISSION,
+          detail: `no credential can protect a new backup on this machine: the OS keystore is unavailable (${support.reason ?? 'unknown'}) and no unlock password was supplied`,
+          dry_run: false,
+        };
+      }
+    }
+    if (dryRun !== true) {
+      try {
+        ensureLayout(root, { dshHome, now });
+      } catch (error) {
+        if (error instanceof BackupLayoutError) return { ok: false, reason_code: error.code, detail: error.detail, dry_run: dryRun };
+        throw error;
+      }
+      lock = withRepoLock({ root, now: () => now.getTime() });
+      if (lock.ok !== true) return { ok: false, reason_code: lock.reason_code, detail: lock.detail, holder: lock.holder, dry_run: dryRun };
     }
 
-    lock = withRepoLock({ root, now: () => now.getTime() });
-    if (lock.ok !== true) return { ok: false, reason_code: lock.reason_code, detail: lock.detail, holder: lock.holder, dry_run: dryRun };
-
-    const key = openRepoKey({
-      root,
-      dshHome,
-      password: input.password ?? null,
-      platform: input.platform,
-      runner: input.runner,
-      machineKey: input.machineKey,
-      now,
-    });
+    // A dry run never writes -- including no layout and no key -- so it needs neither the lock nor the credential.
+    // It still reports what would be written, and block reuse is decided by object existence, which needs no key.
+    const key = dryRun === true
+      ? { ok: true, dek: null, keys: null, created: false, unlocked_via: 'dry-run', machine: { ok: false, reason: 'dry-run' }, machine_envelope_added: false }
+      : openRepoKey({
+          root,
+          dshHome,
+          password: input.password ?? null,
+          platform: input.platform,
+          runner: input.runner,
+          machineKey: input.machineKey,
+          now,
+        });
     if (key.ok !== true) {
       return { ok: false, reason_code: key.reason_code, detail: key.detail, machine: key.machine, dry_run: dryRun };
     }
@@ -296,19 +324,36 @@ export function runBackup(input) {
       };
     }
 
+    // Fail fast on a rel path the manifest would reject: without this, a stray directory (a pre-restore copy area,
+    // say) is written as blocks first and only then refused -- minutes of work for nothing, and a half-built
+    // snapshot directory to clean up.
+    for (const row of [...selection.chosen, ...scan.attachments.filter((attachment) => attachment.ok === true)]) {
+      try {
+        normalizeRelPath(row.rel);
+      } catch (error) {
+        return {
+          ok: false,
+          reason_code: error?.code ?? ENGINE_CODES.WRITE_FAILED,
+          detail: `${row.file ?? row.rel}: the source path cannot be expressed as a manifest rel path: ${error?.detail ?? error?.message ?? error}`,
+          dry_run: dryRun,
+        };
+      }
+    }
+
     // The snapshot id is minted here, before any block is written, because block objects are content-addressed
     // (not snapshot-addressed) -- but the manifest and the rotation records both name it.
     const snapshotId = makeSnapshotId(now);
     const entries = [];
     const tornSessions = [];
     const invalidContainers = [];
+    const futureAppend = { checked: 0, failed: 0, sessions: [] };
     let blocksNew = 0;
     let blocksReused = 0;
     let bytesWritten = 0;
     let bytesRead = 0;
 
     for (const session of selection.chosen) {
-      const stored = storeFileBlocks({ root, file: session.file, dek: key.dek, dryRun, expectZstd: true });
+      const stored = storeFileBlocks({ root, file: session.file, dek: key.dek, dryRun, expectZstd: true, futureAppend: input.futureAppend });
       if (stored.error !== undefined) return { ok: false, ...stored.error, dry_run: dryRun };
       blocksNew += stored.blocks_new;
       blocksReused += stored.blocks_reused;
@@ -316,6 +361,13 @@ export function runBackup(input) {
       bytesRead += stored.bytes_read;
       if (stored.torn) tornSessions.push(session.rel);
       if (stored.container_error !== null) invalidContainers.push({ rel: session.rel, detail: stored.container_error });
+      if (stored.future_append !== null && stored.future_append !== undefined) {
+        futureAppend.checked += 1;
+        if (stored.future_append.ok !== true) {
+          futureAppend.failed += 1;
+          futureAppend.sessions.push({ rel: session.rel, codes: stored.future_append.codes });
+        }
+      }
       entries.push({
         rel: session.rel,
         file: session.file,
@@ -381,6 +433,7 @@ export function runBackup(input) {
         unknown_selected: selection.unknown_selected,
         torn_sessions: tornSessions,
         invalid_containers: invalidContainers,
+        future_append: futureAppend,
         dedupe_ratio: blocksNew + blocksReused === 0 ? 0 : blocksReused / (blocksNew + blocksReused),
         key_upgraded: key.machine_envelope_added === true,
         duration_ms: Date.now() - started,
@@ -428,6 +481,7 @@ export function runBackup(input) {
       unknown_selected: selection.unknown_selected,
       torn_sessions: tornSessions,
       invalid_containers: invalidContainers,
+      future_append: futureAppend,
       dedupe_ratio: blocksNew + blocksReused === 0 ? 0 : blocksReused / (blocksNew + blocksReused),
       unlocked_via: key.unlocked_via,
       key_created: key.created,

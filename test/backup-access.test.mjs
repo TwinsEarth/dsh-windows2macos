@@ -12,6 +12,7 @@ import {
   applyRegistryRestore,
   findWorkspaceForSlug,
   planRegistryRestore,
+  planRegistryRestores,
   verifyRegistryWrite,
   workspaceSlug,
 } from '../src/backup/registry.mjs';
@@ -188,6 +189,45 @@ describe('registry: the slug mapping and the plan', () => {
       assert.equal(plan.ok, false);
       assert.equal(plan.reason_code, 'BACKUP_RESTORE_WORKSPACE_UNKNOWN');
       assert.match(plan.detail, /pass --workspace-path/u);
+    } finally {
+      home.cleanup();
+    }
+  });
+
+  it('plans several sessions into one document and verifies all of them', () => {
+    const home = makeHome({ sessions: [{ workspace: '--E-GPT--', id: SESSION }], registry: registryDocument({ sessionIds: [] }) });
+    try {
+      const plan = planRegistryRestores({
+        dshHome: home.home,
+        sessions: [
+          { session_id: SESSION, workspace: '--E-GPT--', archived: false },
+          { session_id: 'session-bbbbbbbb-0002', workspace: '--E-GPT--', archived: true },
+        ],
+      });
+      assert.equal(plan.ok, true, plan.detail);
+      assert.equal(plan.assignments.length, 2);
+      const applied = applyRegistryRestore({ dshHome: home.home, plan });
+      assert.equal(applied.ok, true, applied.detail);
+      const registry = readWorkspaceRegistry(home.home);
+      assert.ok(registry.registered.has(SESSION));
+      assert.ok(registry.registered.has('session-bbbbbbbb-0002'));
+      assert.ok(registry.archived.has('session-bbbbbbbb-0002'));
+    } finally {
+      home.cleanup();
+    }
+  });
+
+  it('detects a client overwrite: the verification fails when the entry disappears', () => {
+    const home = makeHome({ sessions: [{ workspace: '--E-GPT--', id: SESSION }], registry: registryDocument({ sessionIds: [] }) });
+    try {
+      const plan = planRegistryRestore({ dshHome: home.home, sessionId: SESSION, workspaceName: '--E-GPT--' });
+      const applied = applyRegistryRestore({ dshHome: home.home, plan });
+      assert.equal(applied.ok, true);
+      // The client saves its in-memory copy over ours: the session disappears from the registry.
+      fs.writeFileSync(join(home.home, 'storages', 'workspace.json'), JSON.stringify(registryDocument({ sessionIds: [] })));
+      const verification = verifyRegistryWrite({ dshHome: home.home, plan });
+      assert.equal(verification.ok, false);
+      assert.match(verification.detail, /still not registered/u);
     } finally {
       home.cleanup();
     }

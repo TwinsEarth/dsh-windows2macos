@@ -418,6 +418,24 @@ v3.4.8 的验收新增一条：还原后必须再跑一次 doctor 且零发现�
 
 **门禁状态**：G1/G2/G3/G5 已接线；G4（seq 重编号）本版不做 —— 还原只写原始字节，不需要重编号，
 理由与将来的设计边界写在 `docs/BACKUP-DESIGN.md` §15.6。
+**复盘加固（同日）**：首次运行先验凭据再建库；dry-run 完全只读；多会话注册表一次成文；支持还原到全新 home；
+运行时校验改为"小批 JSON + 大会话 NDJSON 流式"（真实仓库暴露 V8 字符串上限与 Electron 堆崩溃）；
+归档包可直接还原；还原前副本按 N 份保留；identical 跳过；verify 增加 descriptor 与 old 记录摘要检查。
+详见 `docs/BACKUP-DESIGN.md` §15.8。
+**G2 注册表写入协议已收口（2026-11-17）**：`client.mjs` 暂停门（离线 CLI 拒绝活 home）、`registry.mjs` 写后回读、
+新增 `registry-watch.mjs` 客户端保存后 2/8/20 s 复查并自动重放；CLI 增加 `--allow-live-home` 与
+`--registry-recheck <ms>`；新增 `backup-g2` 套件。真实事故（误用真实 home）暴露的并发写入风险由
+"apply 前目标再校验 + 写后无损自愈"兜住，详见 `docs/BACKUP-DESIGN.md` §16 与 §16.1。
+**G3 收口（2026-11-17）**：新增 `future-append.mjs` 统一"未来追加"模拟（引擎报告、还原终审、verify 复核三处公用）；
+引擎新增 `future_append` 报告且仍只存原始字节；verify `--runtime` 连 append 后的 artifact 一起终审；新增 7 项测试
+（坏日志入库存原始字节、源文件字节/mtime 不变、追加前缀、运行时 append 失败码）。详见
+`docs/BACKUP-DESIGN.md` §17。
+
+> 实测（默认仓库）：15 会话 / 171.5 MB / 2 新块 + 53 复用 / future append 15/15 / 26.1 s（未做模拟 4.8 s；
+> 默认开启，可用 `--no-future-append` 关闭）。同日修复布局 bug：还原前副本所在目录被扫描器当成会话
+> （`MANIFEST_REL_PATH`），副本移到 home 根 + walk 跳过点目录 + 扫描排除 + 引擎写块前预校验，见 §17.4。
+
+
 
 **验收**：真实仓库上 `verify` 全绿；`archive --scope all` 产出的包 `readArchive` 逐文件校验通过；
 还原到空 home 后日志字节与备份一致、`workspace.json` 已登记；错误密码/错误身份被 `BACKUP_NO_PERMISSION` 拒绝。

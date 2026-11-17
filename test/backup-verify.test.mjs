@@ -9,6 +9,8 @@ import { join } from 'node:path';
 
 import { runBackup } from '../src/backup/engine.mjs';
 import { verifyRepo } from '../src/backup/verify.mjs';
+import { appendLegalEvent, countLogRows, futureAppendVerdict } from '../src/backup/future-append.mjs';
+import { findHarnessInstallation } from '../src/backup/runtime-validate.mjs';
 import { repoPaths } from '../src/backup/layout.mjs';
 import { header, framesFor, makeHome, registryDocument, runtimeValidHome, runtimeValidSessionLog, tempDir } from './helpers/backup-fixture.mjs';
 
@@ -54,6 +56,50 @@ describe('verify: a healthy repository', () => {
       home.cleanup();
     }
   });
+});
+
+describe('G3: only raw bytes, plus a simulated next append', () => {
+  it('counts rows without rewriting, appends one legal frame, and keeps the prefix intact', () => {
+    const log = runtimeValidSessionLog(SESSION);
+    const counted = countLogRows(log);
+    assert.equal(counted.frames, 3, 'framesFor writes one frame per JSON line');
+    assert.equal(counted.rows, 3, 'one header plus two events');
+    assert.equal(counted.torn, false);
+
+    const appended = appendLegalEvent(log);
+    assert.ok(appended.subarray(0, log.length).equals(log), 'the original bytes are a prefix, untouched');
+    assert.ok(appended.length > log.length);
+    const verdict = futureAppendVerdict(log);
+    assert.equal(verdict.ok, true, verdict.codes.join(','));
+  });
+
+  it('reports a broken log as failing the append simulation without touching it', () => {
+    const broken = framesFor([
+      header(SESSION),
+      { type: 'turn/start', seq: 7, time: 1, data: { turn: 1 } },
+    ]);
+    const verdict = futureAppendVerdict(broken);
+    assert.equal(verdict.ok, false);
+    assert.ok(verdict.codes.length > 0);
+  });
+
+  it(
+    'asks the installed Harness about the appended artifact too, with --runtime',
+    { skip: findHarnessInstallation() === null ? 'no DeepSeek Harness installation on this machine' : false },
+    () => {
+      const home = runtimeValidHome();
+      const { repo } = repoFor(home.home);
+      try {
+        const result = verifyRepo({ root: repo.dir, dshHome: home.home, password: PASSWORD, platform: 'linux', machineKey: false, runtime: true });
+        assert.equal(result.ok, true, result.problems.map((problem) => problem.code + ':' + problem.detail).join('; '));
+        assert.equal(result.runtime_verified.checked, 1);
+        assert.equal(result.runtime_verified.failed, 0);
+      } finally {
+        repo.cleanup();
+        home.cleanup();
+      }
+    },
+  );
 });
 
 describe('verify: damage is named, not averaged away', () => {

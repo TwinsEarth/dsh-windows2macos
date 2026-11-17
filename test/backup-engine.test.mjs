@@ -15,11 +15,12 @@ import { join, relative } from 'node:path';
 
 import { runBackup, selectSessions, normalizeScope, blockObjectPath } from '../src/backup/engine.mjs';
 import { ensureLayout, repoPaths } from '../src/backup/layout.mjs';
+import { sha256Hex } from '../src/backup/manifest.mjs';
+import { framesFor, header } from './helpers/backup-fixture.mjs';
 import { readIndex } from '../src/backup/repo.mjs';
 import { readCurrent, listOldVersions } from '../src/backup/rotation.mjs';
 import { readSnapshot } from '../src/backup/repo.mjs';
 import { scanHome } from '../src/backup/scan.mjs';
-import { sha256Hex } from '../src/backup/manifest.mjs';
 import { openObject } from '../src/backup/crypto.mjs';
 import { openRepoKey } from '../src/backup/keystore.mjs';
 
@@ -203,6 +204,115 @@ describe('engine: a first and a second backup', () => {
     }
   });
 
+  it('refuses a path the manifest cannot express before writing a single block', () => {
+    const { home, cleanup } = homeFixture();
+    const { root: repo, cleanup: cleanRepo } = repoFixture();
+    try {
+      const badScan = () => ({
+        exists: true,
+        scanned_at: new Date().toISOString(),
+        dsh_home: home,
+        zstd: true,
+        totals: {},
+        sessions: [
+          {
+            rel: '/absolute/path/session.v4.jsonl.zstd',
+            file: join(home, 'sessions', '--E-GPT--', 'session-aaaaaaaa-0001', 'session.v4.jsonl.zstd'),
+            session_id: 'session-aaaaaaaa-0001',
+            workspace: '--E-GPT--',
+            format_version: 4,
+            ok: true,
+            flags: { registered: true, archived: false, pinned: false },
+          },
+        ],
+        attachments: [],
+        registry: { ok: true, workspaces: [], registered: new Set(), archived: new Set(), pinned: new Set() },
+        exclusions: [],
+      });
+      const result = runBackup({ root: repo, dshHome: home, password: PASSWORD, platform: 'linux', machineKey: false, scan: badScan });
+      assert.equal(result.ok, false);
+      assert.equal(result.reason_code, 'MANIFEST_REL_PATH');
+      assert.match(result.detail, /cannot be expressed as a manifest rel path/u);
+      assert.deepEqual(readdirSync(repoPaths(repo).objects), [], 'fail-fast: no block object is written for a bad rel');
+    } finally {
+      cleanRepo();
+      cleanup();
+    }
+  });
+
+  it('reports the future-append simulation for every session it stores (G3)', () => {
+    const { home, cleanup } = homeFixture();
+    const { root: repo, cleanup: cleanRepo } = repoFixture();
+    try {
+      const result = runBackup({ root: repo, dshHome: home, password: PASSWORD, platform: 'linux', machineKey: false });
+      assert.equal(result.ok, true, result.detail);
+      assert.equal(result.future_append.checked, result.sessions);
+      assert.equal(result.future_append.failed, 0);
+      assert.deepEqual(result.future_append.sessions, []);
+    } finally {
+      cleanRepo();
+      cleanup();
+    }
+  });
+
+  it('still backs up a broken log -- raw bytes are the evidence -- and reports it as failing the append simulation', () => {
+    const { home, cleanup } = homeFixture();
+    const { root: repo, cleanup: cleanRepo } = repoFixture();
+    try {
+      // A seq gap: the backup must preserve it, not refuse it.
+      const broken = framesFor([
+        header('session-aaaaaaaa-0001'),
+        { type: 'turn/start', seq: 5, time: 1, data: { turn: 1 } },
+      ]);
+      const target = join(home, 'sessions', '--E-GPT--', 'session-aaaaaaaa-0001', 'session.v4.jsonl.zstd');
+      fs.writeFileSync(target, broken);
+
+      const result = runBackup({ root: repo, dshHome: home, password: PASSWORD, platform: 'linux', machineKey: false });
+      assert.equal(result.ok, true, result.detail);
+      assert.equal(result.future_append.failed, 1);
+      assert.match(result.future_append.sessions[0].rel, /session-aaaaaaaa-0001/u);
+
+      // The stored bytes are the source bytes: hash-compare the rebuilt file later; here prove the manifest digest.
+      const snapshot = readSnapshot({ root: repo, snapshotId: result.snapshot_id });
+      const entry = snapshot.manifest.files.find((file) => file.rel.includes('session-aaaaaaaa-0001'));
+      assert.equal(entry.sha256, sha256Hex(broken));
+    } finally {
+      cleanRepo();
+      cleanup();
+    }
+  });
+
+  it('never modifies the source logs (bytes and mtime are untouched by a backup)', () => {
+    const { home, cleanup } = homeFixture();
+    const { root: repo, cleanup: cleanRepo } = repoFixture();
+    try {
+      const target = join(home, 'sessions', '--E-GPT--', 'session-aaaaaaaa-0001', 'session.v4.jsonl.zstd');
+      const before = { bytes: fs.readFileSync(target), mtime: fs.statSync(target).mtimeMs };
+      const result = runBackup({ root: repo, dshHome: home, password: PASSWORD, platform: 'linux', machineKey: false });
+      assert.equal(result.ok, true, result.detail);
+      assert.deepEqual(fs.readFileSync(target), before.bytes, 'the source log must be byte-identical');
+      assert.equal(fs.statSync(target).mtimeMs, before.mtime, 'the source log mtime must not change');
+    } finally {
+      cleanRepo();
+      cleanup();
+    }
+  });
+
+  it('a dry run on a repository that does not exist writes nothing at all (read-only means read-only)', () => {
+    const { home, cleanup: cleanHome } = homeFixture();
+    const { dir, cleanup } = tempDir('w2m-engine-dry-fresh-');
+    try {
+      const root = join(dir, 'repo');
+      const result = runBackup({ root, dshHome: home, password: PASSWORD, platform: 'linux', machineKey: false, dryRun: true });
+      assert.equal(result.ok, true, result.detail);
+      assert.ok(result.blocks_new > 0, 'a dry run still reports what it would write');
+      assert.equal(existsSync(root), false, 'a dry run must not create the repository it describes');
+    } finally {
+      cleanup();
+      cleanHome();
+    }
+  });
+
   it('refuses a scope that selects nothing, and a dry run writes nothing', () => {
     const { home, cleanup: cleanHome } = homeFixture();
     const { root, cleanup } = repoFixture();
@@ -233,8 +343,9 @@ describe('engine: a first and a second backup', () => {
       assert.equal(result.ok, false);
       assert.equal(result.reason_code, 'BACKUP_NO_PERMISSION');
       assert.match(result.detail, /no credential/u);
-      assert.equal(existsSync(join(root, 'snapshots')), true, 'the layout exists, but no snapshot was written');
-      assert.equal(readdirSync(join(root, 'snapshots')).length, 0);
+      // The refusal happens before the layout: a first run that cannot protect anything must not leave a
+      // half-initialised repository behind.
+      assert.equal(existsSync(root), false, 'a refused first run must not create the repository');
     } finally {
       cleanup();
       cleanHome();

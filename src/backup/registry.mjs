@@ -10,25 +10,25 @@
  *
  * ## The protocol this module implements
  *
- *   * plan first: compute the exact document and every action, without writing (`planRegistryRestore`);
+ *   * plan first: compute the exact document and every action, without writing;
  *   * write atomically (`writeJsonAtomic`) after nothing else is half-done;
- *   * **read back and compare** the parts the plan promised (`verifyRegistryWrite`);
+ *   * **read back and compare** the parts the plan promised;
  *   * always report the residual risk: the client may overwrite it again, so the caller re-checks after the client
  *     saves (the host route does; the offline CLI prints the warning).
  *
- * ## What a restore may change
+ * ## One document, many sessions
  *
- * Only: the session id is present in the matching workspace's `sessionIds`; archived/pinned flags match the
- * backup. **Workspaces are never invented**: the backup records a workspace slug (derived from a directory name),
- * and the inverse mapping to an absolute path is ambiguous. A restore into a home that does not already contain
- * that workspace is refused with the registered list, unless the operator passes an explicit path.
+ * The first version planned one session at a time, and each plan copied the *original* document -- applying three
+ * plans in a row therefore left only the third session registered. The planner is now **per restore**, not per
+ * session: it owns one mutable copy of the document and returns one write. That also makes "restore into a
+ * brand-new home" expressible: with no registry file yet, one document can be created (only when the operator
+ * named a directory, so no workspace is ever invented by default).
  */
 
+import fs from 'node:fs';
 import path from 'node:path';
 
 import { readJsonSafe, writeJsonAtomic } from './atomic.mjs';
-import { readWorkspaceRegistry } from '../util/dsh-workspace.mjs';
-import { workspaceRegistryPath } from '../util/dsh-workspace.mjs';
 
 /** Named registry-refusal codes. */
 export const REGISTRY_CODES = Object.freeze({
@@ -44,6 +44,11 @@ export const CLIENT_OVERWRITE_WARNING =
   'is running can be replaced. Re-open the session list, and if the session is missing run the restore again after ' +
   'restarting the app.';
 
+/** The registry document lives at `storages/workspace.json`. */
+export function workspaceRegistryPath(dshHome) {
+  return path.join(dshHome, 'storages', 'workspace.json');
+}
+
 /**
  * The directory-name slug DSH derives from a workspace path (`E:\GPT` -> `--E-GPT--`).
  *
@@ -58,136 +63,192 @@ export function workspaceSlug(workspacePath) {
   return `--${normalized}--`;
 }
 
+/** A workspace id derived from a path, stable across restores. */
+function workspaceIdForPath(workspacePath) {
+  const slug = workspaceSlug(workspacePath).replace(/^-+|-+$/g, '').toLowerCase();
+  return `restored-${slug}`;
+}
+
+/** A fresh registry document in the shape the client writes. */
+function newRegistryDocument(workspaceId, workspacePath) {
+  const now = new Date().toISOString();
+  return {
+    unit: { name: 'workspace', version: 2 },
+    global: {
+      initialized: true,
+      defaultWorkspaceId: workspaceId,
+      workspaceIds: [workspaceId],
+      archivedSessionIds: [],
+      pinnedSessionIds: [],
+    },
+    tables: {
+      workspaces: {
+        [workspaceId]: {
+          path: workspacePath,
+          title: path.basename(workspacePath) || workspacePath,
+          sessionIds: [],
+          createdAt: now,
+          updatedAt: now,
+        },
+      },
+    },
+  };
+}
+
 /**
- * Find the registry workspace whose path (or slug) matches a backup's workspace name.
+ * Find the workspace record (in the *document being planned*) that matches a backup workspace slug.
  *
- * @param {ReturnType<typeof readWorkspaceRegistry>} registry
- * @param {string} workspaceName slug from the backup manifest (`--E-GPT--`)
- * @returns {{id: string, path: string|null, title: string|null, sessionIds: string[]} | null}
+ * Matching is by the slug the client derives from `path`, because a backup records the directory name, not the
+ * absolute path.
+ *
+ * @param {object} document
+ * @param {string} workspaceName
+ * @returns {{id: string, record: object} | null}
  */
-export function findWorkspaceForSlug(registry, workspaceName) {
+function findWorkspaceInDocument(document, workspaceName) {
+  const workspaces = document?.tables?.workspaces;
+  if (workspaces === null || typeof workspaces !== 'object') return null;
   const wanted = String(workspaceName);
-  for (const workspace of registry.workspaces) {
-    if (workspace.path !== null && workspaceSlug(workspace.path) === wanted) return { ...workspace };
-    if (workspace.id === wanted) return { ...workspace };
+  for (const [id, record] of Object.entries(workspaces)) {
+    if (typeof record?.path === 'string' && workspaceSlug(record.path) === wanted) return { id, record };
   }
   return null;
 }
 
 /**
- * Plan the registry change for one restored session, without writing it.
+ * Find the registered workspace whose path (or id) matches a backup's workspace name.
  *
- * @param {{dshHome: string, sessionId: string, workspaceName: string, archived?: boolean, pinned?: boolean,
- *   workspacePath?: string|null, registry?: ReturnType<typeof readWorkspaceRegistry>}} input
- * @returns {{ok: boolean, reason_code: string|null, detail: string|null, file: string, document: object|null,
- *   workspace_id: string|null, actions: string[], changed: boolean}}
+ * Accepts either the raw document (`{tables:{workspaces}}`) or the reader's view (`{workspaces:[...]}`), because
+ * callers legitimately hold both: planning has the document, verification has the reader.
+ *
+ * @param {object} registry
+ * @param {string} workspaceName slug from the backup manifest (`--E-GPT--`)
+ * @returns {{id: string, path: string|null, title: string|null, sessionIds: string[]} | null}
  */
-export function planRegistryRestore(input) {
+export function findWorkspaceForSlug(registry, workspaceName) {
+  const wanted = String(workspaceName);
+  const rows = Array.isArray(registry?.workspaces)
+    ? registry.workspaces
+    : Object.entries(registry?.tables?.workspaces ?? {}).map(([id, record]) => ({ id, ...record }));
+  for (const workspace of rows) {
+    if (typeof workspace?.path === 'string' && workspaceSlug(workspace.path) === wanted) return { ...workspace };
+    if (workspace?.id === wanted) return { ...workspace };
+  }
+  return null;
+}
+
+/**
+ * Plan the registry change for **one restore** (any number of sessions), without writing it.
+ *
+ * @param {{
+ *   dshHome: string,
+ *   sessions: Array<{session_id: string, workspace: string, archived?: boolean, pinned?: boolean}>,
+ *   workspacePath?: string|null,
+ *   allowCreateRegistry?: boolean,
+ * }} input
+ * @returns {{
+ *   ok: boolean, reason_code: string|null, detail: string|null, file: string,
+ *   document: object|null, changed: boolean, actions: string[],
+ *   created_document: boolean, created_workspaces: string[],
+ *   assignments: Array<{session_id: string, workspace_id: string, archived: boolean, pinned: boolean}>,
+ * }}
+ */
+export function planRegistryRestores(input) {
   const file = workspaceRegistryPath(input.dshHome);
-  const registry = input.registry ?? readWorkspaceRegistry(input.dshHome);
-  if (registry.ok !== true) {
-    return {
-      ok: false,
-      reason_code: REGISTRY_CODES.UNREADABLE,
-      detail: `${registry.file}: ${registry.error ?? 'unreadable'}`,
-      file,
-      document: null,
-      workspace_id: null,
-      actions: [],
-      changed: false,
-    };
-  }
-  const document = readJsonSafe(file);
-  if (document === null) {
-    return {
-      ok: false,
-      reason_code: REGISTRY_CODES.UNREADABLE,
-      detail: `${file}: not a JSON object`,
-      file,
-      document: null,
-      workspace_id: null,
-      actions: [],
-      changed: false,
-    };
-  }
-
-  let workspace = findWorkspaceForSlug(registry, input.workspaceName);
-  let created = false;
-  if (workspace === null && typeof input.workspacePath === 'string' && input.workspacePath.trim() !== '') {
-    const workspacePath = path.resolve(input.workspacePath.trim());
-    const id = `restored-${workspaceSlug(workspacePath).replace(/^-+|-+$/g, '').toLowerCase()}`;
-    workspace = { id, path: workspacePath, title: path.basename(workspacePath) || workspacePath, sessionIds: [] };
-    created = true;
-  }
-  if (workspace === null) {
-    return {
-      ok: false,
-      reason_code: REGISTRY_CODES.WORKSPACE_UNKNOWN,
-      detail:
-        `the backup belongs to workspace ${input.workspaceName}, which this home does not register ` +
-        `(registered: ${registry.workspaces.map((row) => row.id).join(', ') || 'none'}); pass --workspace-path to attach it to a directory`,
-      file,
-      document,
-      workspace_id: null,
-      actions: [],
-      changed: false,
-    };
-  }
-
+  const exists = fs.existsSync(file);
+  let document = exists ? readJsonSafe(file) : null;
+  let createdDocument = false;
   const actions = [];
+  const createdWorkspaces = [];
+
+  if (document !== null && (typeof document !== 'object' || document.tables === undefined)) {
+    return refusal(REGISTRY_CODES.UNREADABLE, `${file}: not a workspace registry document`, file, document);
+  }
+  const workspacePath = typeof input.workspacePath === 'string' && input.workspacePath.trim() !== '' ? path.resolve(input.workspacePath.trim()) : null;
+
+  if (document === null) {
+    if (exists) return refusal(REGISTRY_CODES.UNREADABLE, `${file}: not readable JSON`, file, null);
+    // A brand-new home (the disaster-recovery case) has no registry yet. Creating one is only allowed when the
+    // operator named a directory: otherwise there is nothing to attach the sessions to.
+    if (input.allowCreateRegistry !== true || workspacePath === null) {
+      return refusal(
+        REGISTRY_CODES.UNREADABLE,
+        `${file}: this home has no workspace registry yet; pass --workspace-path <dir> to create one and attach the restored sessions to that directory`,
+        file,
+        null,
+      );
+    }
+    const workspaceId = workspaceIdForPath(workspacePath);
+    document = newRegistryDocument(workspaceId, workspacePath);
+    createdDocument = true;
+    createdWorkspaces.push(workspaceId);
+    actions.push(`create workspace registry and workspace ${workspaceId} for ${workspacePath}`);
+  }
+
   const next = JSON.parse(JSON.stringify(document));
   next.tables = next.tables ?? {};
   next.tables.workspaces = next.tables.workspaces ?? {};
-  if (created) {
-    next.tables.workspaces[workspace.id] = {
-      path: workspace.path,
-      title: workspace.title,
-      sessionIds: [],
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
-    next.global = next.global ?? {};
-    next.global.workspaceIds = Array.isArray(next.global.workspaceIds) ? next.global.workspaceIds : [];
-    if (!next.global.workspaceIds.includes(workspace.id)) next.global.workspaceIds.push(workspace.id);
-    actions.push(`create workspace ${workspace.id} for ${workspace.path}`);
-  }
-  const record = next.tables.workspaces[workspace.id] ?? next.tables.workspaces[Object.keys(next.tables.workspaces).find((id) => id === workspace.id)];
-  if (record === undefined) {
-    return {
-      ok: false,
-      reason_code: REGISTRY_CODES.UNREADABLE,
-      detail: `the registry document does not contain workspace ${workspace.id}`,
-      file,
-      document,
-      workspace_id: workspace.id,
-      actions,
-      changed: false,
-    };
-  }
-  record.sessionIds = Array.isArray(record.sessionIds) ? record.sessionIds : [];
-  if (!record.sessionIds.includes(input.sessionId)) {
-    record.sessionIds.push(input.sessionId);
-    actions.push(`register ${input.sessionId} in workspace ${workspace.id}`);
-  }
-  record.updatedAt = new Date().toISOString();
+  next.global = next.global ?? {};
+  next.global.workspaceIds = Array.isArray(next.global.workspaceIds) ? next.global.workspaceIds : [];
 
-  const desiredArchived = input.archived === true;
-  if (desiredArchived !== registry.archived.has(input.sessionId)) {
-    next.global = next.global ?? {};
-    const archived = new Set(Array.isArray(next.global.archivedSessionIds) ? next.global.archivedSessionIds.map(String) : []);
-    if (desiredArchived) archived.add(input.sessionId);
-    else archived.delete(input.sessionId);
-    next.global.archivedSessionIds = [...archived];
-    actions.push(desiredArchived ? `archive ${input.sessionId}` : `unarchive ${input.sessionId}`);
-  }
-  const desiredPinned = input.pinned === true;
-  if (desiredPinned !== registry.pinned.has(input.sessionId)) {
-    next.global = next.global ?? {};
-    const pinned = new Set(Array.isArray(next.global.pinnedSessionIds) ? next.global.pinnedSessionIds.map(String) : []);
-    if (desiredPinned) pinned.add(input.sessionId);
-    else pinned.delete(input.sessionId);
-    next.global.pinnedSessionIds = [...pinned];
-    actions.push(desiredPinned ? `pin ${input.sessionId}` : `unpin ${input.sessionId}`);
+  const assignments = [];
+  for (const session of input.sessions) {
+    let workspace = findWorkspaceInDocument(next, session.workspace);
+    if (workspace === null) {
+      if (workspacePath === null) {
+        const registered = Object.entries(next.tables.workspaces).map(([id, record]) => `${id}${record?.path ? ` (${record.path})` : ''}`);
+        return refusal(
+          REGISTRY_CODES.WORKSPACE_UNKNOWN,
+          `the backup belongs to workspace ${session.workspace}, which this home does not register ` +
+            `(registered: ${registered.join(', ') || 'none'}); pass --workspace-path to attach it to a directory`,
+          file,
+          next,
+        );
+      }
+      // One named directory serves every unknown backup workspace: the backup keeps slugs, the target keeps paths,
+      // and inventing one directory per slug would be worse than attaching them all to the directory the operator
+      // actually named.
+      const workspaceId = workspaceIdForPath(workspacePath);
+      if (next.tables.workspaces[workspaceId] === undefined) {
+        next.tables.workspaces[workspaceId] = {
+          path: workspacePath,
+          title: path.basename(workspacePath) || workspacePath,
+          sessionIds: [],
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        };
+        actions.push(`create workspace ${workspaceId} for ${workspacePath}`);
+        createdWorkspaces.push(workspaceId);
+      }
+      if (!next.global.workspaceIds.includes(workspaceId)) next.global.workspaceIds.push(workspaceId);
+      workspace = { id: workspaceId, record: next.tables.workspaces[workspaceId] };
+    }
+
+    workspace.record.sessionIds = Array.isArray(workspace.record.sessionIds) ? workspace.record.sessionIds : [];
+    if (!workspace.record.sessionIds.includes(session.session_id)) {
+      workspace.record.sessionIds.push(session.session_id);
+      actions.push(`register ${session.session_id} in workspace ${workspace.id}`);
+    }
+    workspace.record.updatedAt = new Date().toISOString();
+
+    const archived = session.archived === true;
+    const archivedSet = new Set(Array.isArray(next.global.archivedSessionIds) ? next.global.archivedSessionIds.map(String) : []);
+    if (archived !== archivedSet.has(session.session_id)) {
+      if (archived) archivedSet.add(session.session_id);
+      else archivedSet.delete(session.session_id);
+      next.global.archivedSessionIds = [...archivedSet];
+      actions.push(archived ? `archive ${session.session_id}` : `unarchive ${session.session_id}`);
+    }
+    const pinned = session.pinned === true;
+    const pinnedSet = new Set(Array.isArray(next.global.pinnedSessionIds) ? next.global.pinnedSessionIds.map(String) : []);
+    if (pinned !== pinnedSet.has(session.session_id)) {
+      if (pinned) pinnedSet.add(session.session_id);
+      else pinnedSet.delete(session.session_id);
+      next.global.pinnedSessionIds = [...pinnedSet];
+      actions.push(pinned ? `pin ${session.session_id}` : `unpin ${session.session_id}`);
+    }
+
+    assignments.push({ session_id: session.session_id, workspace_id: workspace.id, archived, pinned });
   }
 
   return {
@@ -196,22 +257,41 @@ export function planRegistryRestore(input) {
     detail: null,
     file,
     document: next,
-    workspace_id: workspace.id,
-    session_id: input.sessionId,
-    archived: desiredArchived,
-    pinned: desiredPinned,
-    actions,
     changed: actions.length > 0,
+    actions,
+    created_document: createdDocument,
+    created_workspaces: createdWorkspaces,
+    assignments,
+  };
+}
+
+/** One-session wrapper: kept for callers that only restore a single session. */
+export function planRegistryRestore(input) {
+  const plan = planRegistryRestores({ ...input, sessions: [{ session_id: input.sessionId, workspace: input.workspaceName, archived: input.archived, pinned: input.pinned }] });
+  if (plan.ok !== true) return { ...plan, workspace_id: null };
+  return { ...plan, workspace_id: plan.assignments[0]?.workspace_id ?? null };
+}
+
+/** Build a named refusal. */
+function refusal(reason_code, detail, file, document) {
+  return {
+    ok: false,
+    reason_code,
+    detail,
+    file,
+    document,
+    changed: false,
+    actions: [],
+    created_document: false,
+    created_workspaces: [],
+    assignments: [],
   };
 }
 
 /**
  * Write a planned registry document and verify it by reading it back.
  *
- * The verification compares exactly what the plan promised -- session registered, archive/pin flags -- not the whole
- * file: another writer (the client) may legitimately touch `updatedAt` or unrelated entries.
- *
- * @param {{dshHome: string, plan: ReturnType<typeof planRegistryRestore>}} input
+ * @param {{dshHome: string, plan: ReturnType<typeof planRegistryRestores>}} input
  * @returns {{ok: boolean, verified: boolean, reason_code: string|null, detail: string|null,
  *   actions: string[], warning: string|null}}
  */
@@ -224,6 +304,7 @@ export function applyRegistryRestore(input) {
     return { ok: true, verified: true, reason_code: null, detail: null, actions: [], warning: null };
   }
   try {
+    fs.mkdirSync(path.dirname(plan.file), { recursive: true });
     writeJsonAtomic(plan.file, plan.document);
   } catch (error) {
     return {
@@ -247,30 +328,37 @@ export function applyRegistryRestore(input) {
 }
 
 /**
- * Re-read the registry and confirm the plan's promises hold.
+ * Re-read the registry and confirm every promise the plan made.
  *
- * Exactly three things are checked -- registered, archived, pinned -- because those are what the plan changed.
- * Other fields (the client's own `updatedAt`, unrelated entries) may legitimately differ: the purpose here is to
- * catch the client overwriting the entry, not to demand a byte-identical file.
+ * Checks registration, the workspace id, and archived/pinned flags for each session in the plan -- the things the
+ * plan changed. Other fields may legitimately differ (the client's own `updatedAt`, unrelated entries).
  *
- * @param {{dshHome: string, plan: ReturnType<typeof planRegistryRestore>}} input
+ * @param {{dshHome: string, plan: ReturnType<typeof planRegistryRestores>}} input
  * @returns {{ok: boolean, detail: string|null}}
  */
 export function verifyRegistryWrite(input) {
   const plan = input.plan;
   if (plan.ok !== true || plan.changed !== true) return { ok: true, detail: null };
-  const registry = readWorkspaceRegistry(input.dshHome);
-  if (registry.ok !== true) return { ok: false, detail: `the registry became unreadable after the write: ${registry.error}` };
-  const sessionId = plan.session_id;
-  if (typeof sessionId !== 'string' || sessionId === '') return { ok: false, detail: 'the plan names no session id' };
-  if (!registry.registered.has(sessionId)) {
-    return { ok: false, detail: `session ${sessionId} is still not registered after the write (the client may have replaced the registry)` };
-  }
-  if (registry.archived.has(sessionId) !== (plan.archived === true)) {
-    return { ok: false, detail: `session ${sessionId} archived flag does not match the plan after the write` };
-  }
-  if (registry.pinned.has(sessionId) !== (plan.pinned === true)) {
-    return { ok: false, detail: `session ${sessionId} pinned flag does not match the plan after the write` };
+  const file = workspaceRegistryPath(input.dshHome);
+  const document = readJsonSafe(file);
+  if (document === null) return { ok: false, detail: 'the registry is not readable JSON after the write' };
+  const workspaces = document?.tables?.workspaces ?? {};
+  const sessionIds = new Set(Object.values(workspaces).flatMap((record) => (Array.isArray(record?.sessionIds) ? record.sessionIds : [])));
+  const archived = new Set((document?.global?.archivedSessionIds ?? []).map(String));
+  const pinned = new Set((document?.global?.pinnedSessionIds ?? []).map(String));
+  for (const assignment of plan.assignments ?? []) {
+    if (!sessionIds.has(assignment.session_id)) {
+      return { ok: false, detail: `session ${assignment.session_id} is still not registered after the write (the client may have replaced the registry)` };
+    }
+    if (workspaces[assignment.workspace_id] === undefined) {
+      return { ok: false, detail: `workspace ${assignment.workspace_id} is missing after the write` };
+    }
+    if (archived.has(assignment.session_id) !== (assignment.archived === true)) {
+      return { ok: false, detail: `session ${assignment.session_id} archived flag does not match the plan after the write` };
+    }
+    if (pinned.has(assignment.session_id) !== (assignment.pinned === true)) {
+      return { ok: false, detail: `session ${assignment.session_id} pinned flag does not match the plan after the write` };
+    }
   }
   return { ok: true, detail: null };
 }

@@ -10,10 +10,14 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
+  appendLegalEvent,
   buildArtifactFromBuffer,
+  clearVerdictCache,
   findHarnessInstallation,
   runtimeValidate,
+  runtimeValidateBatch,
   validateCandidate,
+  validateCandidates,
 } from '../src/backup/runtime-validate.mjs';
 import { framesFor, runtimeValidSessionLog, sessionLog, header } from './helpers/backup-fixture.mjs';
 
@@ -124,6 +128,48 @@ describe('runtime validation: the restore gate', () => {
       assert.ok(['BACKUP_RUNTIME_REJECTED', 'BACKUP_CANDIDATE_INVALID'].includes(bad.reason_code), bad.reason_code);
     },
   );
+
+  it('validates a batch in one runtime process and caches verdicts by content', { skip: harness === null ? 'no DeepSeek Harness installation on this machine' : false }, () => {
+    clearVerdictCache();
+    const a = runtimeValidSessionLog('session-aaaaaaaa-0001');
+    const b = runtimeValidSessionLog('session-bbbbbbbb-0002');
+    const started = Date.now();
+    const batch = runtimeValidateBatch({
+      artifacts: [buildArtifactFromBuffer(a), buildArtifactFromBuffer(b)],
+      harness,
+    });
+    const elapsed = Date.now() - started;
+    assert.equal(batch.available, true);
+    assert.equal(batch.verdicts.length, 2);
+    assert.deepEqual(batch.verdicts.map((verdict) => verdict.ok), [true, true]);
+    // One process instead of two: on this machine a single spawn is ~0.5-1 s.
+    assert.ok(elapsed < 30_000, `batch validation took ${elapsed} ms`);
+
+    const again = runtimeValidateBatch({ artifacts: [buildArtifactFromBuffer(a)], harness });
+    assert.equal(again.verdicts[0].ok, true);
+    assert.ok(again.duration_ms <= elapsed, 'the cached second call must not be slower than the spawn that filled it');
+  });
+
+  it('validateCandidates appends one legal event and asks the runtime about both (G3+G5)', { skip: harness === null ? 'no DeepSeek Harness installation on this machine' : false }, () => {
+    clearVerdictCache();
+    const { results } = validateCandidates({
+      items: [{ buffer: runtimeValidSessionLog('session-aaaaaaaa-0001'), expectedSessionId: 'session-aaaaaaaa-0001', appendCheck: true }],
+    });
+    assert.equal(results[0].ok, true, results[0].detail);
+    assert.equal(results[0].runtime_verified, true);
+    assert.equal(results[0].future_append, true);
+  });
+
+  it('appendLegalEvent keeps the prefix bytes unchanged and adds one frame', () => {
+    const original = runtimeValidSessionLog('session-aaaaaaaa-0001');
+    const appended = appendLegalEvent(original);
+    assert.ok(appended.length > original.length);
+    assert.ok(appended.subarray(0, original.length).equals(original));
+    const artifact = buildArtifactFromBuffer(appended);
+    assert.equal(artifact.events.length, 3);
+    assert.equal(artifact.events[2].type, 'permission/preset');
+    assert.equal(artifact.events[2].seq, 2);
+  });
 
   it('refuses a log whose header id does not match the session being restored', () => {
     const gate = validateCandidate({ buffer: sessionLog('session-cccccccc-0003'), expectedSessionId: 'session-aaaaaaaa-0001', harness: null, requireRuntime: false });

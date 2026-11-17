@@ -37,6 +37,12 @@ export const SESSION_FILE_RE = /^session\.v(\d+)\.jsonl\.zstd$/;
 /** Derived caches that are never backed up, with the reason reported to the caller. */
 export const EXCLUSIONS = Object.freeze([
   {
+    rel: 'sessions/.w2m-restore-backups',
+    reason:
+      'w2m restore pre-copies; they now live at the home root, and this row keeps a legacy home from being walked ' +
+      'as if its backup copies were sessions',
+  },
+  {
     rel: 'sessions/.event-cache',
     reason: 'derived projection of the logs; the client rebuilds it, and restoring it would restore a stale view',
   },

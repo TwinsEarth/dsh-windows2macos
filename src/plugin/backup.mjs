@@ -33,6 +33,7 @@
 
 import { applyRestore, planRestore } from '../backup/restore.mjs';
 import { buildArchive } from '../backup/archive.mjs';
+import { DEFAULT_RECHECK_DELAYS, scheduleRegistryRecheck } from '../backup/registry-watch.mjs';
 import { describeUnlock, unlockRepo } from '../backup/unlock.mjs';
 import { verifyRepo } from '../backup/verify.mjs';
 import os from 'node:os';
@@ -115,9 +116,18 @@ export function normalizeConfig(config = {}, deps = {}) {
 
   const scope = typeof config.backupScope === 'string' && SCOPES.includes(config.backupScope) ? config.backupScope : 'all';
   const machineKey = config.backupMachineKey !== false && env.W2M_BACKUP_NO_MACHINE_KEY !== '1';
+  // The future-append simulation costs one decode per session (measured: 4.8 s -> 26 s on a 171 MB real home).
+  // It stays on by default; a host that values the time over the signal can turn it off here.
+  const futureAppend = config.backupFutureAppend !== false;
   const keepOld = Number.isSafeInteger(config.keepOldPerSession) && config.keepOldPerSession >= 0
     ? config.keepOldPerSession
     : DEFAULT_KEEP_OLD;
+  // Optional override of the post-restore registry re-check schedule (tests use a short list; a host may want a
+  // longer one). Absent means the module default (2 s / 8 s / 20 s).
+  const registryRecheckMs = Array.isArray(config.backupRegistryRecheckMs) && config.backupRegistryRecheckMs.length > 0 &&
+    config.backupRegistryRecheckMs.every((value) => Number.isSafeInteger(value) && value >= 0)
+    ? [...config.backupRegistryRecheckMs]
+    : null;
   const dshHome = typeof config.dshHome === 'string' && config.dshHome.trim() !== ''
     ? path.resolve(config.dshHome.trim())
     : resolveDshHome(env);
@@ -131,7 +141,9 @@ export function normalizeConfig(config = {}, deps = {}) {
     catch_up_ms: schedule.catch_up_ms,
     scope,
     machine_key: machineKey,
+    future_append: futureAppend,
     keep_old_per_session: keepOld,
+    registry_recheck_ms: registryRecheckMs,
     dsh_home: dshHome,
   };
 }
@@ -183,6 +195,7 @@ export function apply(ctx, config = {}) {
         selected: request?.selected ?? [],
         keepOldPerSession: cfg.keep_old_per_session,
         machineKey: cfg.machine_key,
+        futureAppend: cfg.future_append,
         dryRun: request?.dryRun === true,
       });
       if (result.ok === true) {
@@ -197,6 +210,7 @@ export function apply(ctx, config = {}) {
           dedupe_ratio: result.dedupe_ratio,
           duration_ms: result.duration_ms,
           rotated: result.rotated,
+          future_append: result.future_append ?? null,
         };
         ctx.logger?.info?.(
           `w2m-dsh-backup: ${reason} backup ${result.snapshot_id}: ${result.sessions} session(s), ` +
@@ -228,6 +242,12 @@ export function apply(ctx, config = {}) {
   scheduler.start();
   if (typeof ctx?.effect === 'function') {
     ctx.effect(() => () => scheduler.stop(), 'w2m: backup schedule');
+  }
+
+  /** The pending post-restore registry re-check, cancelled when this row unmounts (G2 half three). */
+  let activeRecheck = null;
+  if (typeof ctx?.effect === 'function') {
+    ctx.effect(() => () => activeRecheck?.cancel(), 'w2m: registry recheck');
   }
 
   // The write route: present only while this row is mounted, and refused unless enabled.
@@ -373,6 +393,7 @@ export function apply(ctx, config = {}) {
             keepBoth: body.keepBoth === true,
             allowStaticValidation: body.allowStaticValidation === true,
             workspacePath: typeof body.workspacePath === 'string' ? body.workspacePath : null,
+            allowLiveHome: true,
           });
           if (plan.ok !== true || body.apply !== true) {
             // No confirmation of the *write* yet: return the plan so the panel can show exactly what would happen.
@@ -385,6 +406,24 @@ export function apply(ctx, config = {}) {
             sessions: applied.restored?.length ?? 0,
             pre_restore_dir: applied.pre_restore_dir ?? null,
           };
+          if (applied.ok === true && applied.dry_run !== true) {
+            // G2's third half: the client may save its in-memory registry over ours; sample after it would have.
+            activeRecheck?.cancel();
+            activeRecheck = scheduleRegistryRecheck({
+              dshHome: cfg.dsh_home,
+              plan,
+              delaysMs: cfg.registry_recheck_ms,
+              onResult: (result) => {
+                state.last_registry_recheck = { at: new Date().toISOString(), ...result };
+                if (result.ok !== true) {
+                  ctx.logger?.warn?.(`w2m-dsh-backup: the registry re-check still fails after the client save: ${result.detail}`);
+                } else if (result.rewrote === true) {
+                  ctx.logger?.info?.(`w2m-dsh-backup: the client overwrote the restored registry entry; re-applied it (${result.delay_ms} ms sample)`);
+                }
+              },
+            });
+            applied.registry_recheck = { scheduled: true, delays_ms: [...(cfg.registry_recheck_ms ?? DEFAULT_RECHECK_DELAYS)] };
+          }
           return Response.json(applied, { headers: NO_STORE });
         },
       });
