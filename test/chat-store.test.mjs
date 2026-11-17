@@ -424,7 +424,7 @@ describe('damaged/partial files are tolerated', () => {
     assert.equal(h.reopen().stats().next_local_offset, 2);
   });
 
-  it('keeps the documents on disk to their contract shape and file modes (POSIX)', { skip: process.platform === 'win32' }, () => {
+  it('keeps the documents on disk to their contract shape and file modes (POSIX)', { skip: process.platform === 'win32' ? 'POSIX file mode is not measurable on Windows' : false }, () => {
     const h = harness();
     h.store.appendMessage({ origin: 'node-a', message: message('msg-1') });
     h.store.importRecord(peerMessage('node-b', 0, 'peer-1'));
