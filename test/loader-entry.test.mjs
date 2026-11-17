@@ -721,6 +721,12 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
       assert.equal(ops.opsQueueSection?.section, true, 'the queue section renders');
       assert.equal(ops.opsQueueSection?.openButton, true, 'the queue section offers opening the queue window');
       assert.equal(ops.opsGone?.closed, true, 'the operation-panel overlay closes again');
+      assert.equal(ops.opsFleetVersion?.present, true, 'the operation panel renders the fleet version-drift card (v3.5.0)');
+      assert.ok(['ready', 'unavailable'].includes(ops.opsFleetVersion?.state), `the fleet card reports a real state (state: ${ops.opsFleetVersion?.state}, text: ${ops.opsFleetVersion?.text})`);
+      assert.equal(ops.opsFleetVersion?.title, '编队版本', 'the fleet card carries its title');
+      if (ops.opsFleetVersion?.state === 'ready') {
+        assert.equal(ops.opsFleetVersion?.copyButton, true, 'the fleet card offers copying the upgrade guidance');
+      }
       const backup = page.backupProbe ?? {};
       assert.equal(backup.backupOpened?.found, true, 'the left sidebar carries the backup entry (v3.4.9)');
       assert.equal(backup.backupPanel?.open, true, 'clicking the backup entry opens its main page');

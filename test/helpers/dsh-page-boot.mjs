@@ -484,13 +484,27 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
       const opsOpened = await read(`const b=document.querySelector('.w2mGpw_sideEntry'); if(b===null)return{found:false}; b.click(); return{found:true};`);
       await new Promise((resolve) => setTimeout(resolve, 800));
       const opsPanel = await read(`const p=document.querySelector('.w2mOpsPanel'); return {open:p!==null, tabs:[...document.querySelectorAll('.w2mOpsTab')].map((x)=>x.textContent), active:(document.querySelector('.w2mOpsTab[data-active=true]')?.textContent??null)};`);
+      // v3.5.0: the fleet version-drift card lives in the operation panel's action section; the profile may have
+      // no relay configured, in which case the card must render its neutral "unavailable" state instead of blank.
+      const opsFleetVersion = await read(`
+        const card=document.querySelector('[data-w2m-fleet-version-card]');
+        const title=card?.querySelector('.w2mVerTitle');
+        return {
+          present: card!==null,
+          state: card?.getAttribute('data-w2m-version-state') ?? null,
+          title: (title?.textContent ?? '').trim(),
+          copyButton: card===null ? false : (card.querySelector('[data-w2m-version-copy]')!==null),
+          allCurrentBadge: card===null ? false : (card.querySelector('[data-w2m-version-all-current]')!==null),
+          text: (card?.innerText ?? '').slice(0, 200),
+        };
+      `);
       const opsQueueTab = await read(`const tabs=[...document.querySelectorAll('.w2mOpsTab')]; const q=tabs.find((x)=>x.textContent.includes('消息与草稿')); if(q===undefined)return{clicked:false}; q.click(); return{clicked:true};`);
       await new Promise((resolve) => setTimeout(resolve, 500));
       const opsQueueSection = await read(`return {section:document.querySelector('.w2mOpsSection')!==null, openButton:[...document.querySelectorAll('.w2mOpsBtn')].some((b)=>b.textContent.includes('打开队列日志'))};`);
       const opsClosed = await read(`const b=document.querySelector('.w2mGpw_fullPage .w2mGpw_close'); if(b===null)return{closed:false}; b.click(); return{clicked:true};`);
       await new Promise((resolve) => setTimeout(resolve, 400));
       const opsGone = await read(`return {closed:document.querySelector('.w2mGpw_fullPage')===null};`);
-      report.opsProbe = { opsOpened, opsPanel, opsQueueTab, opsQueueSection, opsClosed, opsGone };
+      report.opsProbe = { opsOpened, opsPanel, opsFleetVersion, opsQueueTab, opsQueueSection, opsClosed, opsGone };
       // v3.4.9: the backup entry and the page it switches to. The profile ships the dsh-backup row disabled by
       // default, so the panel is expected to render its "route missing / needs enabling" state: the probe checks
       // the seat, the page, and the four action markers, not the host routes (those have their own tests).
