@@ -1,0 +1,92 @@
+{
+  "version": "3.5.0",
+  "case": "RELEASE-3500-COVERAGE",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-17T17:38:56.299Z",
+  "executor": "lead",
+  "task_id": "w2m-v350-coverage-map",
+  "requirement": "v3.5.0 coverage map (eight areas): 3.4.6 protocol freeze + read-only scan; 3.4.7 dedupe/atomic writes/locks/22:00 schedule/rotation/gc/DPAPI/password fallback; 3.4.8 restore plan-apply with doctor+G2+G5 gates, pre-restore copies and target re-check, machine/password unlock without DEK disclosure, .tar.zst archive with manifest+README, path-escape refusal and restore --archive, bidirectional verify plus future-append; 3.4.9 runtime verdict (?runtime=1 and cached) and the panel (sidebar.panellist + main, per-session plan, registry recheck, unlock card, four one-click ops with the 4.1 scope entries, real-Chromium E2E); 3.4.9/3.5.0 G4 renumber and old-backfill; 3.5.0 minimum-version gate with named refusal + allowOutdated audit + read-only exemption, fleet version dashboard, retention policy and offsite mirror, and the Phase 2 review.",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/backup-engine.test.mjs",
+      "test/backup-protocol.test.mjs",
+      "test/backup-layout.test.mjs",
+      "test/backup-schedule.test.mjs",
+      "test/backup-machine-key.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/backup-restore.test.mjs",
+      "test/backup-g2.test.mjs",
+      "test/backup-runtime.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/backup-access.test.mjs",
+      "test/backup-keystore.test.mjs",
+      "test/chatops-account.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/backup-archive.test.mjs",
+      "test/backup-verify.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/fix-renumber.test.mjs",
+      "test/backup-rotation.test.mjs",
+      "test/backup-gc.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/client-bundle.test.mjs",
+      "test/fleet-version-gate.test.mjs",
+      "test/backup-mirror.test.mjs"
+    ],
+    [
+      "node",
+      "scripts/layer-check.mjs"
+    ],
+    [
+      "node",
+      "scripts/pack.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "engine_346": "repository v1 protocol frozen (objects/current/index/old/tmp lock), read-only scan writes nothing, atomic tmp->fsync->rename and AAD identities asserted",
+      "engine_347": "content-addressed dedupe (second backup writes no new blocks), locks refuse a second writer, 22:00 Asia/Shanghai schedule with missed-slot catch-up, per-session rotation, gc reference safety, DPAPI machine envelope round trip + password fallback",
+      "restore_348": "plan classifies new/identical/differs and performs no writes; apply is gated by static doctor, the single-document G2 registry protocol with read-back and post-save recheck, and the G5 runtime verdict; pre-restore copies are kept and pruned by keep_pre_restore; target re-check refuses a changed file before writing; conflicts keep originals aside",
+      "unlock_348_and_350": "describe/unlock open with machine or password without ever returning the DEK; three protection states (default unencrypted open envelope, account-id compare for convenience, 4-6 digit PIN with public hint and rotation); account path only on match, otherwise password path",
+      "archive_348": ".tar.zst with manifest+README and per-file hashes; extraction refuses path escape; restore --archive goes through the same gates as repository restore",
+      "verify_348_349": "blocks decrypt and re-hash, index and snapshot checked in both directions, old records rebuilt, future append simulated statically and, with --runtime or the cached verdict, by the installed Harness (evidence labels static-prefilter / installed-harness)",
+      "g4_renumber": "renumber is the only legal delete/insert path: dense re-encode, recursive *Seq rewrite, dangling-reference refusal, plan/apply with .bak retention; old-backfill gives pre-mode records their sealed copies; append-failure branch proven unreachable for canonical input",
+      "panel_349": "sidebar.panellist (w2m-backup) plus main page; per-session restore plan with danger confirmation; registry recheck state; unlock card and modal dialog (no password in the browser); four one-click operations plus the backup-selected/backup-active scope entries; real-Chromium loader entry test covers the page (skipped by name where no Harness is installed)",
+      "version_governance_350": "dispatch refuses MACHINE_VERSION_UNSUPPORTED naming every old/unknown machine, allowOutdated is audited, read-only tools are exempt; fleet version dashboard renders distribution/outdated/all_current; retention count+age, offsite mirror with real-path containment and write-time link guard, 300 MB full-copy cap with approval flow, old usage reminder; Phase 2 review delivered and merged with its conditions",
+      "artifact": "deterministic pack of the current tree: 526 files, 2,451,129 bytes, sha256 72b179cf... (a second pack produced the same sha)"
+    }
+  },
+  "artifacts": [
+    {
+      "sha256": "72b179cffb622a169eb5b61cd0c2def69198cdbed9283933c6a7bd425523767a",
+      "bytes": 2451129
+    }
+  ]
+}
