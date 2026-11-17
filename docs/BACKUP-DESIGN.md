@@ -1831,7 +1831,7 @@ P0 审计（`docs/BACKUP-SCOPE.md`）证明了旧版的缺口：只备份会话�
 
 - manifest 记录 `secrets_included: true`，run 结果带 `secrets_included: true` 与一条**显著警告**；
 - CLI 人类输出打印「已包含凭据……任何拿到这个仓库的人都能登录此账户、使用这台机器的身份」；
-- 面板状态卡应显示红色警告（UI 文案已预留，见 P1 面板项）。
+- 面板状态卡显示红色警告 `data-w2m-backup-secrets-warning` 与范围行 `data-w2m-backup-scopes`（i18n 中英）。
 
 **诚实边界**：默认不加密仓库 + 包含凭据 = 仓库目录即身份；只在完全信任仓库存放位置时开启。
 

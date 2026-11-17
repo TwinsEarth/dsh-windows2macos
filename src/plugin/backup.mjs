@@ -692,6 +692,10 @@ export function apply(ctx, config = {}, deps = {}) {
               dsh_home: cfg.dsh_home,
               retention: { keep_old_per_session: cfg.keep_old_per_session, old_version_days: cfg.old_version_days },
               old_format: cfg.old_format,
+              // P0/P1: the scopes this row runs with, and whether the row includes credentials. The panel
+              // renders both (scope line + a red "credentials included" warning) from this payload.
+              scopes: Array.isArray(cfg.scopes) && cfg.scopes.length > 0 ? cfg.scopes : null,
+              include_secrets: cfg.include_secrets === true,
               // The `full` whole-file copy cap (MB; 0 = no cap). The panel shows it as the threshold and the
               // approval dialog quotes it, so the number on screen is the number the engine compares against.
               full_copy_max_mb: cfg.full_copy_max_mb,

@@ -1388,6 +1388,25 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
     };
   }
 
+  it('shows the backup scopes and a loud credentials warning when the row includes secrets', () => {
+    const { bundle } = mountBackup();
+    const plain = bundle.exports.BackupPanelView(viewProps({
+      status: { ok: true, scopes: ['sessions', 'attachments', 'registry', 'config', 'state'], include_secrets: false, state: {} },
+    }));
+    const scopeRow = findBy(plain, (node) => node.props?.['data-w2m-backup-scopes'] !== undefined)[0];
+    assert.ok(scopeRow !== undefined, 'the status card names the backup scopes');
+    assert.equal(scopeRow.props['data-w2m-backup-scopes'], 'sessions,attachments,registry,config,state');
+    assert.equal(findBy(plain, (node) => node.props?.['data-w2m-backup-secrets-warning'] !== undefined).length, 0, 'no warning when the row does not include credentials');
+
+    const secret = bundle.exports.BackupPanelView(viewProps({
+      status: { ok: true, scopes: ['sessions', 'attachments', 'registry', 'config', 'state'], include_secrets: true, state: {} },
+    }));
+    const warning = findBy(secret, (node) => node.props?.['data-w2m-backup-secrets-warning'] !== undefined)[0];
+    assert.ok(warning !== undefined, 'a repository with credentials must be labelled');
+    // With the pass-through translator the label is its i18n key; check the rendered subtree contains it.
+    assert.match(JSON.stringify(warning), /secretsWarning/);
+  });
+
   /** One rendered button by its stable `data-w2m-backup-action` marker (the v3.5.0 scope entries too). */
   function actionButton(tree, action) {
     return findBy(tree, (node) => node.props?.['data-w2m-backup-action'] === action)[0];

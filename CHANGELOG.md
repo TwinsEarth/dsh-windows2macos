@@ -4,6 +4,13 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### 面板凭据警告、恢复手册与 P0/P1 收尾（未发布）
+
+- 面板状态卡新增「备份范围」行（`data-w2m-backup-scopes`）与「已包含凭据」红色警告（`data-w2m-backup-secrets-warning`，仅当 `backupIncludeSecrets` 开启）；describe 载荷暴露 `scopes` / `include_secrets`。
+- 新增 `docs/RESTORE-RUNBOOK.md`：全新 `$DSH_HOME` 的恢复顺序（先装可重装依赖 `dsh-runtimes`/`node_modules`/`xray-proxy` → `restore --dry-run` → `--apply` → 身份/凭据按 P1 开关 → 逐项验收 → 回滚），并写明老快照的降级路径与已知边界。
+- 文档：BACKUP-SCOPE 标记 P1/P2 完成；BACKUP-DESIGN §27.4 更新。
+
+
 ### 备份范围扩围（P0/P1）：registry/config/state scopes 与覆盖率（未发布）
 
 - **P0**：备份默认包含五个 scope——`sessions`、`attachments`、`registry`（`storages/workspace.json` 本体）、`config`（根与 profile 的 package.json/cordis.patch.yml/pnpm-lock 等）、`state`（`xclient/**`、`dsh-context`、`llm-deepseek`、`fang`）；排除项（可重装依赖、缓存、还原前副本）逐条记录 reason/class；单文件 8 MiB、总量 256 MiB 上限。

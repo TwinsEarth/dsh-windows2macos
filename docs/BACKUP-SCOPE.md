@@ -7,9 +7,10 @@
   还原以备份的注册表文档为基底（多 workspace / title / order / defaultWorkspaceId 原样恢复）；`verify` 输出覆盖率与
   `BACKUP_VERIFY_COVERAGE_GAP`；`.tar.zst` 与镜像同步携带这些条目。见 `docs/BACKUP-DESIGN.md` §27。
 - **P1 已实现**：`backupIncludeSecrets` / `--include-secrets`（默认 **false**）显式开启才备份凭据；开启时 manifest 标
-  `secrets_included:true`，CLI 打印显著警告；面板状态卡的红色警告为本轮遗留 UI 项。
+  `secrets_included:true`，CLI 打印显著警告，面板状态卡显示红色「已包含凭据」警告与范围行（`data-w2m-backup-scopes` /
+  `data-w2m-backup-secrets-warning`）。
 - **仍未纳入**：`.w2m-restore-backups/`（避免自引用）、`dsh-runtimes/`、`profiles/*/node_modules/`、`xray-proxy/`（可重装）。
-- **P2（待做）**：`docs/RESTORE-RUNBOOK.md` 全新 home 的恢复顺序。
+- **P2 已实现**：`docs/RESTORE-RUNBOOK.md`——全新 home 的恢复顺序（可重装依赖 → 两次 restore → 身份/凭据 → 验收 → 回滚）。
 
 > 下面的审计快照保留为"扩围前"的历史证据（2026-11-18 04:00 前后）；其中的"未备份清单"已由上述实现关闭。
 
