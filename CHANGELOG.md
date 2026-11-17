@@ -4,6 +4,16 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### 备份地基（v3.4.6）：协议冻结、只读勘察、加密自检
+
+- 新增 `docs/BACKUP-DESIGN.md`：仓库布局、清单 v1 字段表、4 MiB 定长块、三信封加密（账户/本机/密码）、错误码表、排除项理由、版本兼容承诺，以及 2026-11-17 复盘门禁 G1–G5 的落点。
+- 新增 `src/backup/{layout,scan,manifest,crypto}.mjs`：仓库路径与具名失败（盘符缺失/无权限/别家仓库/仓库在 `$DSH_HOME` 内）、只读扫描（会话 + 注册表标记 + 附件对象，可选 hash/deep）、清单 schema 与严格校验（块对齐、路径规范化、计数自洽）、scrypt/HKDF + AES-256-GCM 三信封 + 块对象 + `selftest`。
+- 新增 `docs/SPIKE-ACCOUNT-KEK.md`（只读 spike，329 行）：核对 DSH 账户材料后确认——磁盘没有稳定账户标识，`userId` 只是标识不是秘密，用它派生 KEK 等于加密表演；**默认信封组合改为 `machine`（Windows DPAPI，同机免密）+ `password`（scrypt，唯一保证）**，`account` 降级为可选、且写入前必须先修 `getProfile(client)` 调用并做宿主内实测。scrypt 默认按实测取 N=2^17（约 461 ms）。
+- 新增只读路由 `GET /api/w2m/backup/status|scan`（由主插件挂载，不写盘）与 `bin/w2m-backup.mjs`（`status` / `scan` / `selftest`；`scan --manifest` 在内存里构建清单并给出摘要）。
+- `workspace.json` 的解析抽到 `src/util/dsh-workspace.mjs`，`session-doctor` 与备份扫描共用一份——两个解析器会静默给出不同答案，而复盘里正是“注册表状态不一致”害得会话看不见。
+- 新增 5 个测试套件共 98 项：布局的 5 类失败、只读扫描（含“扫描前后字节与 mtime 完全一致”）、加密三态（错密码/错账户/篡改一字节）与“信封换槽/降低参数”拒绝、清单字段冻结与 17 类非法清单、接线（bin/路由/层模型/脚本清单）。
+- 本机实测（真实 `$DSH_HOME`）：15 条会话 / 166.3 MiB、附件 1 个 / 62 KB、归档 4 / 置顶 4 / 未注册 2；`scan --manifest` 得到 54 个块；`selftest` 9 步全绿；`status` 对尚未创建的 `D:\DeepSeekHarness\BackUP` 报告“未初始化”且不创建它。
+
 ### session-doctor：把"会话找回"的四类失败变成可执行门禁
 
 - 新增 `scripts/session-doctor.mjs`（只读）：检查 zstd 首帧只含 header、`surfaceOp`（含压缩检查点的对象形态）、`system/message` 保护头、`seq` 连续性与悬空引用、以及 `workspace.json` 未注册会话；`--json` 供还原流程调用。

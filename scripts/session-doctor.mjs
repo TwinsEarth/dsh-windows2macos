@@ -37,6 +37,8 @@ import path from 'node:path';
 import zlib from 'node:zlib';
 import process from 'node:process';
 
+import { readWorkspaceRegistry, workspaceRegistryPath } from '../src/util/dsh-workspace.mjs';
+
 /** Stable finding codes. Greppable on purpose: a report cites a code, not a sentence. */
 export const CODES = Object.freeze({
   UNREADABLE: 'LOG_UNREADABLE',
@@ -78,15 +80,6 @@ const SURFACE_TYPES = new Set(['user/message', 'assistant/message', 'system/mess
 
 /** Keys whose numeric values are event seq references. Matching is by suffix, so a new `*Seq` is covered. */
 const SEQ_REF_KEY = /(?:Seq|Seqs)$/;
-
-/** Read a UTF-8 file; null when it cannot be read. */
-function readText(file) {
-  try {
-    return fs.readFileSync(file, 'utf8');
-  } catch {
-    return null;
-  }
-}
 
 /**
  * Split a log into zstd frames and decode each frame's lines.
@@ -315,39 +308,27 @@ export function listSessionLogs(sessionsRoot) {
 export function diagnoseRoot(options) {
   const root = path.resolve(options.root);
   const sessionsRoot = path.join(root, 'sessions');
-  const registryFile = path.join(root, 'storages', 'workspace.json');
+  const registryFile = workspaceRegistryPath(root);
   const findings = [];
 
-  let registry = null;
-  const registryText = readText(registryFile);
-  if (registryText === null) {
-    findings.push({ code: CODES.REGISTRY_MISSING, file: registryFile });
-  } else {
-    try {
-      registry = JSON.parse(registryText);
-    } catch (error) {
-      findings.push({ code: CODES.REGISTRY_MISSING, file: registryFile, detail: String(error?.message ?? error) });
-    }
+  // The registry is parsed by the SAME module the backup scanner uses (`src/util/dsh-workspace.mjs`), so the
+  // doctor and a restore path cannot disagree about whether a session is registered or archived.
+  const registry = readWorkspaceRegistry(root);
+  if (!registry.ok) {
+    findings.push({
+      code: CODES.REGISTRY_MISSING,
+      file: registryFile,
+      ...(registry.error === null ? {} : { detail: registry.error }),
+    });
   }
-  const registered = new Set();
-  const archived = new Set();
-  const pinned = new Set();
-  if (registry !== null) {
-    const global = registry?.global ?? {};
-    for (const id of Array.isArray(global.archivedSessionIds) ? global.archivedSessionIds : []) archived.add(String(id));
-    for (const id of Array.isArray(global.pinnedSessionIds) ? global.pinnedSessionIds : []) pinned.add(String(id));
-    const tables = registry?.tables?.workspaces ?? {};
-    for (const record of Object.values(tables)) {
-      for (const id of Array.isArray(record?.sessionIds) ? record.sessionIds : []) registered.add(String(id));
-    }
-  }
+  const { registered, archived, pinned } = registry;
 
   const sessions = [];
   for (const entry of listSessionLogs(sessionsRoot)) {
     const result = diagnoseSessionFile(entry.file, { expectedSessionId: entry.sessionId });
     sessions.push({ ...result, session_id: entry.sessionId, workspace: entry.workspace });
     for (const code of result.codes) findings.push({ code, file: entry.file, session_id: entry.sessionId });
-    if (registry !== null && !registered.has(entry.sessionId)) {
+    if (registry.ok && !registered.has(entry.sessionId)) {
       findings.push({ code: CODES.NOT_REGISTERED, file: entry.file, session_id: entry.sessionId });
     }
   }
@@ -357,8 +338,8 @@ export function diagnoseRoot(options) {
     findings,
     registry: {
       file: registryFile,
-      ok: registry !== null,
-      workspaces: registry === null ? 0 : Object.keys(registry?.tables?.workspaces ?? {}).length,
+      ok: registry.ok,
+      workspaces: registry.workspaces.length,
       registered: registered.size,
       archived: archived.size,
       pinned: pinned.size,

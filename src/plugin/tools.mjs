@@ -200,6 +200,8 @@ import { registerOperatorTokenRoute } from './operator-token-route.mjs';
 import { registerFleetConfigRoute } from './fleet-config-route.mjs';
 import { registerDataplaneSinkRoute } from './dataplane-sink-route.mjs';
 import { registerProjectStreamRoute } from './project-stream-route.mjs';
+// v3.4.6: the read-only backup substrate's two GET routes (`status`, `scan`). Nothing behind them writes.
+import { registerBackupRoutes } from '../backup/routes.mjs';
 import { planProgress } from './joint-dev/progress.mjs';
 import { registerJointTools } from './tools-joint.mjs';
 import { fingerprintOf, readOperatorToken } from './operator-token.mjs';
@@ -3693,6 +3695,15 @@ export async function apply(ctx, config = {}) {
   const _dataplaneSinkRoute = registerDataplaneSinkRoute(ctx, { stateDir: () => resolveStateDir(cfg.stateDir, 'joint-dev') });
   // A6: read-only project SSE proxy (device token stays in the host process).
   const _projectStreamRoute = registerProjectStreamRoute(ctx, { relayUrl: () => cfg.rabbitUrl, deviceToken: () => resolveToken(cfg) });
+  // v3.4.6: the backup panel's read-only half (`GET /api/w2m/backup/status` and `/scan`). Mounted from the
+  // plugin root rather than a disable-by-default subplugin row, because both routes only read: a status card
+  // that was absent until somebody edited `cordis.patch.yml` would report "not enabled" for a feature that has
+  // nothing to enable yet. The `dsh-backup` subplugin row arrives with the engine (v3.4.7), where enabling it
+  // starts meaning "a timer may write".
+  const _backupRoutes = registerBackupRoutes(ctx, {
+    dshHome: () => (typeof process.env.DSH_HOME === 'string' && process.env.DSH_HOME.trim() !== '' ? process.env.DSH_HOME : join(os.homedir(), '.dsh')),
+    backupDir: () => cfg.backupDir ?? null,
+  });
 
   // v1.7.1: host-side screenshot + clipboard fallbacks. The DSH desktop shell does not grant the
   // renderer getDisplayMedia/navigator.clipboard, so the chat panel needs a host route that does not

@@ -196,15 +196,15 @@ D:\DeepSeekHarness\BackUP\
 2. `src/backup/layout.mjs`：仓库路径解析与创建（默认 `D:\DeepSeekHarness\BackUP`，可配置 `backupDir`）；无权限/盘符不存在 → 具名错误。
 3. `src/backup/scan.mjs`：枚举 `sessions/**` 与 `attachments/**`，读 `workspace.json` 得到 活动/归档/置顶 标记；**只读**。
 4. `src/backup/manifest.mjs`：清单 schema、哈希与块切分（4 MiB）、路径规范化（大小写/分隔符）。
-5. `src/backup/crypto.mjs`：scrypt KDF、AES-256-GCM 封包、双信封（account/password）、篡改检测。
+5. `src/backup/crypto.mjs`：scrypt/HKDF KDF、AES-256-GCM 封包、三信封（account/machine/password，包裹同一个随机 DEK）、AAD 绑定、篡改检测与 `selftest`。**spike 后默认组合 = machine + password**（`docs/SPIKE-ACCOUNT-KEK.md`）。
 6. `src/queue-journal` 之外新增只读路由 `/api/w2m/backup/status`、`/api/w2m/backup/scan`（不写盘）。
 7. CLI 骨架 `bin/w2m-backup.mjs`：`status`、`scan`、`selftest`（加密自检）。
 8. **顺带修债**：把 `test/agent.test.mjs`「transport re-delivery from cache」的 15s 计时等待改为按事件条件 + 更大预算，消除满负载偶发超时（v3.4.5 本机全量套件曾因此 1 次红）。
-9. 接线：`scripts/layer-model.mjs` 增加 `backup` 层（rank 1，capability）；`package.json#scripts.test` 加 `test/backup-*.test.mjs`；`package.json#files`/`exports` 增加 `bin/w2m-backup.mjs`；`cordis.patch.yml` 增加 `dsh-backup` 行（默认 `disabled: true`，与 GPW/dsh-fix 同一可切换形态）。
+9. 接线：`scripts/layer-model.mjs` 增加 `backup` 层（rank 1，capability）与三条向下边（`plugin -> backup`、`backup -> fix`、`backup -> util`）；`package.json#scripts.test` 与 `test:all` 加 5 个 `test/backup-*.test.mjs` 并各配一条 `test:backup-*` 命名脚本；`package.json#bin` 加 `w2m-backup`。**偏差（2026-11-17 实施记录）**：原计划在 `cordis.patch.yml` 增加默认 `disabled: true` 的 `dsh-backup` 行，实际推迟到 v3.4.7 —— v3.4.6 只有只读路由与只读 CLI，没有需要关掉的副作用；一个默认关闭的子插件行会让状态卡片在默认配置下直接报未启用，把可用功能藏起来。等引擎/定时器开始可能写盘时再引入（见 `docs/BACKUP-DESIGN.md` §10）。
 
 **测试**：`test/backup-layout.test.mjs`、`test/backup-scan.test.mjs`、`test/backup-crypto.test.mjs`（含“错误密码/错误账户/篡改一字节”三态）、`test/backup-protocol.test.mjs`（清单字段与版本号冻结）、`test/backup-wiring.test.mjs`（导出/行/CLI 存在）。
 
-**验收**：本机真实 `$DSH_HOME` 扫描出 14 个会话、3 个归档标记；`w2m-backup status` 输出仓库状态；加密自检通过；preflight 在 **空 `DSH_HOME` + Node 22** 下 GREEN。
+**验收**：本机真实 `$DSH_HOME` 扫描出 **15 个会话 / 166.3 MiB**、归档 4 / 置顶 4 / 未注册 2（2026-11-17 实测）；`w2m-backup status` 对尚未创建的 `D:\DeepSeekHarness\BackUP` 报告未初始化且**不创建它**；`w2m-backup selftest` 9 步全绿；`scan --manifest` 在内存里得到 54 个块并给出摘要（不写盘）；preflight 在 **空 `DSH_HOME`** 下 GREEN。
 
 ### v3.4.7 — 备份引擎、定时与旧版本轮转
 
@@ -224,7 +224,7 @@ D:\DeepSeekHarness\BackUP\
 
 **交付**
 1. `src/backup/restore.mjs`：按快照/按会话还原；还原前对目标会话目录做 `.bak-<ts>` 快照；写回 `session.v4.jsonl.zstd`（原子 rename）→ 更新 `workspace.json`（注册 sessionId、恢复 archived/pinned）→ 附件对象补回；冲突（目标已存在不同内容）默认“先备份后覆盖”，或 `--keep-both`。
-2. `src/backup/unlock.mjs`：两条解锁路径（账户 / 密码），失败 `BACKUP_NO_PERMISSION`；账户信封不可得时（清空账户材料、换机）只能走密码，并在 UI 明示。
+2. `src/backup/unlock.mjs`：解锁路径 **machine（Windows DPAPI，同机免密）/ password（唯一保证）**，`account` 为可选第三路径；失败 `BACKUP_NO_PERMISSION`；换机或清空本机材料时只能走密码，并在 UI 明示。macOS 在 keychain 补齐前只有密码路径。
 3. `src/backup/verify.mjs`：全量校验（块哈希 + 清单链 + 附件引用完整性）；输出可读报告。
 4. `src/backup/archive.mjs`：对“已归档会话”生成 `archive/<date>/archived-sessions-<ts>.tar.zst`；包内自带 `manifest.json`（可单独还原），解包即得会话文件树。
 5. CLI：`restore --session/--snapshot`、`verify`、`archive`、`unlock --password-stdin`（密码只经 stdin/env，不进 argv）。
@@ -313,6 +313,8 @@ v3.4.6 协议+加密+扫描 ──▶ v3.4.7 引擎/定时/轮转 ──▶ v3.4
 | Q5 | “已归档会话”的判定 | A `workspace.json#archivedSessionIds`；B 30 天无活动；C A∪B | 默认 **A** |
 | Q6 | 备份是否走 Relay 异地 | A v3.5.0 仅本地/网络盘；B 增加 Relay 传输 | **A**（Phase 3 再议） |
 | Q7 | 定时默认时间 | A 22:00；B 22:00+03:00 | **A**（可自行更改） |
+
+> **2026-11-17 spike 对 Q1 的更正**：DSH 只提供账户**标识** `userId`（仅内存、需联网、需一次成功的 `getProfile`），磁盘没有稳定账户秘密；只用标识派生 KEK 不构成机密性。因此 v3.4.7 起默认信封组合为 **machine（Windows DPAPI，同机免密）+ password（scrypt，唯一保证）**，`account` 降级为可选，且启用前必须先修 `getProfile(client)` 调用并做宿主内实测。详见 `docs/SPIKE-ACCOUNT-KEK.md` 与 `docs/BACKUP-DESIGN.md` §6。
 
 ---
 

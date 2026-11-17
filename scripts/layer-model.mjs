@@ -52,6 +52,10 @@ export const LAYERS = Object.freeze([
   // Node builtins and each other, so it adds no cross-layer edge. Declared because the directory exists and
   // because its row in cordis.patch.yml makes it a mountable component, not a helper library.
   { name: 'fix', rank: 1, kind: 'capability', note: 'attachment self-repair (agent/request-error listener + offline CLI)' },
+  // v3.4.6: the backup substrate (layout, scan, manifest, crypto) and its read-only CLI/routes. It reaches DOWN
+  // to `fix` for the zstd frame reader and to `util` for the workspace registry parser -- deliberately reusing
+  // both rather than growing a second parser, which is the mistake the 2026-11-17 recovery drill made.
+  { name: 'backup', rank: 1, kind: 'capability', note: 'session-backup substrate: repository layout, scan, manifest protocol, crypto, read-only routes/CLI' },
   // v1.9.1: internal telemetry adapter. A leaf capability: it imports only Node builtins and itself, and it is
   // dormant unless the host supplies the relay/token environment contract. Declared because the directory exists;
   // leaving it unnamed is the silent cross-layer edge the checker exists to refuse.
@@ -91,6 +95,11 @@ export const ALLOWED_EDGES = Object.freeze([
   ['relay', 'shared'],
   // v3.2.7: GPW 智能分级复用决策中心的 OS 钥匙串/DPAPI 密钥存储来保存大模型 Token（向下：plugin 4 -> decision-center 1）。
   ['plugin', 'decision-center'],
+  // v3.4.6: the plugin mounts the read-only backup routes, and the backup substrate reuses the frame reader
+  // and the registry parser instead of duplicating them. Both edges are downward (4 -> 1 and 1 -> 0).
+  ['plugin', 'backup'],
+  ['backup', 'fix'],
+  ['backup', 'util'],
 ]);
 
 /** Layer names, for a caller that wants just the vocabulary. */
