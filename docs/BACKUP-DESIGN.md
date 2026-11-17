@@ -355,7 +355,7 @@
 | `w2m-backup run` | CLI | `--scope` / `--session` / `--keep-old` / `--dry-run` / `--password-stdin` / `--no-machine-key` |
 | `w2m-backup list` / `gc` | CLI | 快照列表 / 孤儿块与 old 窗口清理（`--dry-run` 只报不删） |
 
-`dsh-backup` 子插件行随包发布但 `disabled: true`：**启用它才意味着"定时器可以写盘"**。只读路由仍在主插件上，因此面板的"状态卡片"不需要先启用子插件。
+`dsh-backup` 子插件行随包发布但 `disabled: false`（v3.5.0 起默认启用，操作员可关闭该行）：**启用它才意味着"定时器可以写盘"**。只读路由仍在主插件上，因此面板的"状态卡片"不需要先启用子插件。
 
 
 ## 15. 还原、解锁、校验与归档（v3.4.8）

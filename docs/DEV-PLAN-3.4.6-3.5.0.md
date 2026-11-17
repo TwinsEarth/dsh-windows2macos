@@ -201,7 +201,7 @@ D:\DeepSeekHarness\BackUP\
 7. `src/queue-journal` 之外新增只读路由 `/api/w2m/backup/status`、`/api/w2m/backup/scan`（不写盘）。
 8. CLI 骨架 `bin/w2m-backup.mjs`：`status`、`scan`、`selftest`（加密自检）。
 9. **顺带修债（已完成 2026-11-17）**：把 `test/agent.test.mjs`「transport re-delivery from cache」的 15s 默认预算改为按事件条件 + 60s 预算（`rabbit.stream(60_000)` 与三个 `waitFor` 显式 60s；不停表、不加 sleep）。实测：满载全量套件曾需要 ~22s 而红，隔离运行 ~3.0s。
-10. 接线：`scripts/layer-model.mjs` 增加 `backup` 层（rank 1，capability）与三条向下边（`plugin -> backup`、`backup -> fix`、`backup -> util`）；`package.json#scripts.test` 与 `test:all` 加 6 个 `test/backup-*.test.mjs` 并各配一条 `test:backup-*` 命名脚本；`package.json#bin` 加 `w2m-backup`。**偏差（2026-11-17 实施记录）**：原计划在 `cordis.patch.yml` 增加默认 `disabled: true` 的 `dsh-backup` 行，实际推迟到 v3.4.7 —— v3.4.6 只有只读路由与只读 CLI，没有需要关掉的副作用；一个默认关闭的子插件行会让状态卡片在默认配置下直接报未启用，把可用功能藏起来。等引擎/定时器开始可能写盘时再引入（见 `docs/BACKUP-DESIGN.md` §10）。
+10. 接线：`scripts/layer-model.mjs` 增加 `backup` 层（rank 1，capability）与三条向下边（`plugin -> backup`、`backup -> fix`、`backup -> util`）；`package.json#scripts.test` 与 `test:all` 加 6 个 `test/backup-*.test.mjs` 并各配一条 `test:backup-*` 命名脚本；`package.json#bin` 加 `w2m-backup`。**偏差（2026-11-17 实施记录）**：原计划在 `cordis.patch.yml` 增加默认 `disabled: false`（v3.5.0 起默认启用；记录时的值为 true） 的 `dsh-backup` 行，实际推迟到 v3.4.7 —— v3.4.6 只有只读路由与只读 CLI，没有需要关掉的副作用；一个默认关闭的子插件行会让状态卡片在默认配置下直接报未启用，把可用功能藏起来。等引擎/定时器开始可能写盘时再引入（见 `docs/BACKUP-DESIGN.md` §10）。
 
 **测试**：`test/backup-layout.test.mjs`、`test/backup-scan.test.mjs`、`test/backup-crypto.test.mjs`（含“错误密码/错误账户/篡改一字节”三态）、`test/backup-protocol.test.mjs`（清单字段与版本号冻结）、`test/backup-repo.test.mjs`（快照 id/索引行/提交与回读/只读打开）、`test/backup-wiring.test.mjs`（导出/行/CLI 存在）。
 
@@ -225,7 +225,7 @@ D:\DeepSeekHarness\BackUP\
 
 **实施记录（2026-11-17，v3.4.7 落地）**
 
-- 交付面：`engine` / `keystore` / `machine-key` / `locks` / `atomic` / `rotation` / `gc` / `schedule`，加 `src/plugin/backup.mjs` + `lib/backup.js` 子插件、`dsh-backup` 行（`disabled: true`）、`POST /api/w2m/backup/run`、CLI `run` / `list` / `gc`；时区算术抽到 `src/util/daily-clock.mjs` 复用。
+- 交付面：`engine` / `keystore` / `machine-key` / `locks` / `atomic` / `rotation` / `gc` / `schedule`，加 `src/plugin/backup.mjs` + `lib/backup.js` 子插件、`dsh-backup` 行（`disabled: false`（v3.5.0 起默认启用；记录时的值为 true））、`POST /api/w2m/backup/run`、CLI `run` / `list` / `gc`；时区算术抽到 `src/util/daily-clock.mjs` 复用。
 - **两处与计划的偏差（均已写进设计文档并记录理由）**：① `old/` 存**可还原记录** `<ts>-<sha12>.json` 而不是整文件 `.zst.enc` 副本——副本会与内容寻址去重重复存储，114 MB 会话的十份窗口会膨胀到 GB 级；② DEK 是**仓库级**的（权威 `<root>/keys.json`，快照存副本），不是每快照一把——否则跨快照的块无法复用，第二次备份会重写整份会话。
 - 无人值守凭据边界：定时任务只走 `machine`（DPAPI）信封；无 OS keystore 的平台具名拒绝 `BACKUP_NO_PERMISSION`，人工路径是 `w2m-backup run --password-stdin`。密码不入配置、不入 argv。
 - 实测（本机真实 `$DSH_HOME`，临时 D 盘仓库）：首备写入块数 > 0；第二次未改动 `blocks_new = 0`、`dedupe_ratio = 1`；追加事件后再备只新增 1 块并记 1 条 old 记录；`gc` 引用齐全、零误删。
@@ -607,14 +607,14 @@ v3.4.8 的验收新增一条：还原后必须再跑一次 doctor 且零发现�
 | 1f | 22:00 每日定时器 | `src/backup/schedule.mjs:32-39,128-155`（默认 22:00 Asia/Shanghai + 12h 补偿）；`src/plugin/backup.mjs:279-289`（`createDailyScheduler` + `ctx.effect` 卸载停表）；`src/plugin/schedule.mjs:91-213`；`cordis.patch.yml:193` | `backup-schedule` “defaults to 22:00 Asia/Shanghai…”、“finds Beijing 22:00 as 14:00 UTC…”、“reports a recently missed slot once”；`backup-run` “registers one run route and starts a scheduler that the effect can stop” |
 | 2a | machine 信封 → Windows DPAPI | `src/backup/machine-key.mjs:47-63`（PowerShell `ProtectedData.Protect/Unprotect`, CurrentUser）、`:91-111`（真实 protect/unprotect 探测）、`:173-238`（0600 落盘） | `backup-machine-key` “protects and unprotects 32 bytes through a real PowerShell round trip”；`backup-access` “uses the real DPAPI when the platform is Windows” |
 | 2b | password 兜底 | `src/backup/keystore.mjs:150-216`（machine 可解则封装）、`:233-274`（首用按可得凭证建信封）；`src/backup/engine.mjs:305-322`（两者皆无 → `BACKUP_NO_PERMISSION`） | `backup-keystore` “mints one DEK and wraps it under the machine secret and the password”、“refuses to create a repository no credential can open”；`backup-engine` “refuses with BACKUP_NO_PERMISSION…” |
-| 3a | `dsh-backup` 行与引擎同批引入 | `cordis.patch.yml:188-195`（`id: dsh-backup`，`disabled: true`）；commit `37653b6` 同一提交新增引擎 + 行（`git show --stat 37653b6`） | `backup-wiring` “declares the dsh-backup subpath and ships a disable-by-default row for it” |
+| 3a | `dsh-backup` 行与引擎同批引入 | `cordis.patch.yml:188-195`（`id: dsh-backup`，`disabled: false`（v3.5.0 起默认启用；记录时的值为 true））；commit `37653b6` 同一提交新增引擎 + 行（`git show --stat 37653b6`） | `backup-wiring` “declares the dsh-backup subpath and ships a disable-by-default row for it” |
 | 3b | 导出 | `package.json:22`（`"./dsh-backup": "./lib/backup.js"`）、`lib/backup.js:13-30`；同 commit | `backup-wiring` 同上 + “declares the CLI in package.json#bin” |
 | 3c | 路由 | `src/plugin/backup.mjs:54-78`（run/restore/archive/verify/unlock + 确认令牌）、`:297-359`（`ctx.inject(['connection'])` 注册）；只读 status/scan 见 `src/backup/routes.mjs:29,32` | `backup-run` “registers one run route…”、“requires the confirmation token…”、“exposes the v3.4.8 routes…”；`backup-wiring` “registers two GET routes on the host registry” |
 
 **差距/注意（文档 vs 实际）**
 
 1. `old/` 形态：本文 §7 v3.4.7 计划 `:214` 仍写“复制到 `old/<ws>/<sid>/<ts>-<sha12>.zst.enc`”，实际是**可还原 JSON 记录** `.json`（`src/backup/rotation.mjs:109-121`）；偏差理由已记在 `:229`。以代码/实施记录为准。
-2. 定时器是**能力**不是默认行为：`cordis.patch.yml:190` 的 `dsh-backup` 行 `disabled: true`；即使挂载，`backupEnabled:false` 也会在 `src/plugin/backup.mjs:197-200` 提前返回、不装表。装上包不会自动在 22:00 备份。
+2. ~~定时器是**能力**不是默认行为~~ → **v3.5.0 起默认启用**：`dsh-backup` 行 `disabled: false`，安装即挂载面板与 22:00 调度；`backupEnabled:false` 仍可显式关闭定时器（默认 true）。操作员可在插件页关闭整行。
 3. `account` 信封：`src/backup/crypto.mjs` 的 `ENVELOPE_KINDS`/`unwrapDek` 仍接受该 kind，但**无写入者**（`src/backup/keystore.mjs:18-22` 明确“unwritten kind”）；kind 槽存在 ≠ 功能实现，文档 §6 的“默认不写”才是实际状态。
 4. machine 信封平台边界：Windows 实测可用；macOS `keychain-not-implemented`（`src/backup/machine-key.mjs:94-100`），非 Windows 的定时任务会具名拒绝 `BACKUP_NO_PERMISSION`（`src/plugin/backup.mjs:18-25`）——设计行为，不是缺口。
 5. “默认组合 = machine + password”要读作“**密码被提供时**”：面板 `POST /api/w2m/backup/run` 与定时任务都不传密码（`src/plugin/backup.mjs:18-25,364-366`；密码只经 CLI stdin，`src/backup/cli.mjs:501-506`），因此 Windows 上首次建库得到的是**仅 machine 信封**的仓库——同机可解、换机不可解；可移植性要求先跑 `w2m-backup run --password-stdin`。`docs/BACKUP-DESIGN.md` §6.6 的“password（提供时）”与实现一致。

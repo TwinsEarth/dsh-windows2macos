@@ -180,14 +180,14 @@
         maxRepairsPerTurn: 3
 
     # 备份&还原 (dsh-backup): scheduled session backup (default 22:00 Asia/Shanghai) plus the
-    # `POST /api/w2m/backup/run` route the panel calls. It ships `disabled: true` for the same reason
+    # `POST /api/w2m/backup/run` route the panel calls. It ships `disabled: false`: the panel and the 22:00 timer ARE the product, and the operator can switch the row off
     # dsh-gpw does: this is the first W2M row whose timer WRITES to disk, so it must be discoverable in
     # the plugin manager and turned on by an explicit operator action -- not arrive with the package.
     # Offline CLI: `w2m-backup` (`run` / `status` / `scan` / `list` / `gc` / `selftest`).
     # Design + protocol: docs/BACKUP-DESIGN.md.
     - id: dsh-backup
       name: '@twinsearth/w2m-dsh-plugin/dsh-backup'
-      disabled: true
+      disabled: false
       config:
         backupDir: 'D:\DeepSeekHarness\BackUP'
         backupTimes: ['22:00:00']

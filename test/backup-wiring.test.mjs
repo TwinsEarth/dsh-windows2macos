@@ -71,12 +71,12 @@ describe('backup wiring: package and entry points', () => {
     }
   });
 
-  it('declares the dsh-backup subpath and ships a disable-by-default row for it', () => {
+  it('declares the dsh-backup subpath and ships an enabled row for it', () => {
     assert.equal(pkg.exports['./dsh-backup'], './lib/backup.js');
     assert.ok(existsSync(join(ROOT, 'lib', 'backup.js')), 'lib/backup.js must exist for the subpath export to resolve');
     const yml = readFileSync(join(ROOT, 'cordis.patch.yml'), 'utf8');
-    assert.match(yml, /- id: dsh-backup\n {6}name: '@twinsearth\/w2m-dsh-plugin\/dsh-backup'\n {6}disabled: true/u,
-      'the backup row must ship disabled: a timer that writes to disk cannot arrive enabled');
+    assert.match(yml, /- id: dsh-backup\n {6}name: '@twinsearth\/w2m-dsh-plugin\/dsh-backup'\n {6}disabled: false/u,
+      'the backup row ships enabled: the panel and the 22:00 schedule are the product; an operator can switch it off');
     assert.match(yml, /backupTimes: \['22:00:00'\]/u, 'the row documents the default slot the engine uses');
   });
 

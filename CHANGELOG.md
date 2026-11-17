@@ -4,6 +4,13 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### 默认启用 dsh-backup 行：面板与 22:00 定时器开箱可用（未发布）
+
+- 面板此前依赖操作员先启用 `dsh-backup` 行（默认 `disabled: true`），否则只显示"备份子插件未启用"。现改为随包默认启用：安装后面板直接可用，22:00（Asia/Shanghai）调度也会照常启动；操作员仍可在插件页关闭整行。
+- 安全边界不变：`backupEnabled:false` 仍可关闭定时器；备份目录/时间/范围/保留/加密全部可配置；未加密默认与 §25.0 一致。
+- 测试：`backup-wiring` 断言改为"随包启用 + 保留 22:00 默认槽"；文档同步更新。
+
+
 ### 备份面板解锁对话框（真正的模态，未发布）
 
 - **交互**：解锁卡标题栏新增可见的「解锁…」按钮（`data-w2m-backup-unlock-open`），打开真正的模态对话框（`data-w2m-backup-unlock-dialog`，`role="dialog"`、`aria-modal="true"`、`aria-labelledby` 指向标题；遮罩 `data-w2m-backup-unlock-overlay`）。×、Esc、点击遮罩关闭；打开时焦点进入对话框内第一个可用控件（`disabled`/`aria-disabled` 跳过），关闭后回到触发按钮；不锁 body 滚动。卡片的既有说明与按钮全部保留，行为不变。
