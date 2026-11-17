@@ -34,7 +34,7 @@ import {
 import { planRestore } from '../src/backup/restore.mjs';
 import { runBackup } from '../src/backup/engine.mjs';
 import { main } from '../src/backup/cli.mjs';
-import { makeHome, registryDocument, runtimeValidHome, tempDir } from './helpers/backup-fixture.mjs';
+import { event, makeHome, put, registryDocument, runtimeValidHome, sessionLog, tempDir } from './helpers/backup-fixture.mjs';
 
 const PASSWORD = 'correct horse battery staple';
 const SESSION = 'session-aaaaaaaa-0001';
@@ -622,30 +622,31 @@ describe('G2: the in-host workspace service path (no file-level race)', () => {
     const attached = [];
     const resolved = [];
     const created = [];
+    const createTitles = [];
+    const workspaceId = options.workspaceId ?? 'w-fake';
+    /** One returned workspace; `attachSession` records through the same arrays so the order stays observable. */
+    const workspaceFor = (workspacePath) => ({
+      id: workspaceId,
+      path: workspacePath,
+      async attachSession(sessionId) {
+        if (options.attachThrows === true) throw new Error(options.attachError ?? 'refused by the host service');
+        attached.push(sessionId);
+      },
+    });
     const service = {
       attached,
       resolved,
       created,
+      createTitles,
       async resolveByPath(workspacePath) {
         resolved.push(workspacePath);
         if (options.resolve === false) return null;
-        return {
-          path: workspacePath,
-          async attachSession(sessionId) {
-            if (options.attachThrows === true) throw new Error('the session header cwd does not resolve to the workspace path');
-            attached.push(sessionId);
-          },
-        };
+        return workspaceFor(workspacePath);
       },
-      async create(workspacePath) {
+      async create(workspacePath, title) {
         created.push(workspacePath);
-        return {
-          path: workspacePath,
-          async attachSession(sessionId) {
-            if (options.attachThrows === true) throw new Error('refused by the host service');
-            attached.push(sessionId);
-          },
-        };
+        createTitles.push(title);
+        return workspaceFor(workspacePath);
       },
     };
     return service;
@@ -669,6 +670,10 @@ describe('G2: the in-host workspace service path (no file-level race)', () => {
       assert.deepEqual(service.attached, [SESSION]);
       assert.equal(service.resolved.length, 1);
       assert.ok(service.resolved[0].endsWith('E:\\GPT'), `the workspace path comes from the registry view, got ${service.resolved[0]}`);
+      assert.deepEqual(result.cwd_fallback, [], 'a matching workspace is the happy path: no cwd substitution');
+      assert.deepEqual(service.created, [], 'an existing matching workspace is resolved, not created');
+      assert.equal(result.sessions[0].workspace_path_used, service.resolved[0]);
+      assert.equal(result.sessions[0].attached_workspace_id, 'w-fake');
       assert.ok(fs.readFileSync(join(home.home, 'storages', 'workspace.json')).equals(before), 'the host service owns the write; no file edit happened');
     } finally {
       home.cleanup();
@@ -715,8 +720,145 @@ describe('G2: the in-host workspace service path (no file-level race)', () => {
       });
       assert.equal(result.ok, false);
       assert.equal(result.reason_code, REGISTER_CODES.HOST_ATTACH_FAILED);
+      assert.equal(result.via, 'host-service');
       assert.equal(result.failed.length, 1);
       assert.equal(result.failed[0].session_id, SESSION);
+      assert.equal(result.residual_risk, REGISTER_RESIDUAL_RISK_LINE, 'the file path + watch is the next step, so its window is stated');
+      assert.ok(result.detail.includes('E:\\GPT'), `the refusal names the cwd string: ${result.detail}`);
+      assert.match(result.detail, /w2m-backup register --session … --watch <minutes>/u);
+      assert.ok(fs.readFileSync(join(home.home, 'storages', 'workspace.json')).equals(before));
+    } finally {
+      home.cleanup();
+    }
+  });
+
+  it('attaches a moved-folder session to its own header cwd and reports cwd_fallback, writing no registry file', async () => {
+    const home = hostHome();
+    try {
+      const movedCwd = join(home.home, 'moved-project');
+      fs.mkdirSync(movedCwd, { recursive: true });
+      put(home.files[SESSION], sessionLog(SESSION, [event(0), event(1)], { cwd: movedCwd }));
+      const requested = join(home.home, 'requested-workspace');
+      const realCwd = fs.realpathSync(movedCwd);
+      const before = fs.readFileSync(join(home.home, 'storages', 'workspace.json'));
+
+      // resolve:false forces the create branch: no workspace exists at the session's own header cwd yet.
+      const service = fakeWorkspaceService({ resolve: false });
+      const result = await registerThroughHost({ dshHome: home.home, sessionIds: [SESSION], workspaceRegistry: service, workspacePath: requested });
+      assert.equal(result.ok, true, result.detail);
+      assert.equal(result.via, 'host-service');
+      assert.equal(result.residual_risk, null);
+      assert.deepEqual(service.resolved, [realCwd], 'the service is asked for the header cwd, never for the requested workspace');
+      assert.deepEqual(service.created, [realCwd], 'no workspace existed there, so one is created at the header cwd');
+      assert.match(service.createTitles[0] ?? '', /^moved-project [0-9a-f]{8}$/u, 'the created workspace is titled by the folder it is, plus a short stable id');
+      assert.deepEqual(service.attached, [SESSION]);
+      assert.deepEqual(result.registered, [SESSION]);
+      assert.deepEqual(result.failed, []);
+      assert.deepEqual(result.cwd_fallback, [{ session_id: SESSION, requested_path: requested, used_path: realCwd }]);
+      const row = result.sessions[0];
+      assert.equal(row.cwd_fallback, true);
+      assert.equal(row.header_cwd, movedCwd);
+      assert.equal(row.workspace_path_used, realCwd);
+      assert.equal(row.attached_workspace_id, 'w-fake');
+      assert.ok(fs.readFileSync(join(home.home, 'storages', 'workspace.json')).equals(before), 'the host service owns the write; no file edit happened');
+
+      // Same session and still-unregistered registry view: a second pass reuses the workspace at the header cwd.
+      const reuse = fakeWorkspaceService();
+      const again = await registerThroughHost({ dshHome: home.home, sessionIds: [SESSION], workspaceRegistry: reuse, workspacePath: requested });
+      assert.equal(again.ok, true, again.detail);
+      assert.deepEqual(reuse.resolved, [realCwd], 'resolveByPath is asked for the header cwd');
+      assert.deepEqual(reuse.created, [], 'an existing workspace at the header cwd is reused, not created again');
+      assert.deepEqual(again.cwd_fallback[0].used_path, realCwd);
+      assert.deepEqual(reuse.attached, [SESSION]);
+    } finally {
+      home.cleanup();
+    }
+  });
+
+  it('refuses a missing header cwd with a named code, the cwd string, and the CLI + watch advice', async () => {
+    const home = hostHome();
+    try {
+      const deletedCwd = join(home.home, 'deleted-drive-missing-project');
+      put(home.files[SESSION], sessionLog(SESSION, [event(0), event(1)], { cwd: deletedCwd }));
+      const requested = join(home.home, 'requested-workspace');
+      fs.mkdirSync(requested, { recursive: true });
+      const before = fs.readFileSync(join(home.home, 'storages', 'workspace.json'));
+      const service = fakeWorkspaceService();
+      const result = await registerThroughHost({ dshHome: home.home, sessionIds: [SESSION], workspaceRegistry: service, workspacePath: requested });
+      assert.equal(result.ok, false);
+      assert.equal(result.reason_code, REGISTER_CODES.HOST_ATTACH_FAILED);
+      assert.equal(result.via, 'host-service');
+      assert.equal(result.host_service, true);
+      assert.equal(result.residual_risk, REGISTER_RESIDUAL_RISK_LINE, 'the file path + watch is the next step, so its window is stated');
+      assert.equal(result.failed.length, 1);
+      assert.equal(result.failed[0].session_id, SESSION);
+      assert.equal(result.failed[0].header_cwd, deletedCwd);
+      assert.equal(result.failed[0].used_path, null);
+      assert.ok(result.detail.includes(deletedCwd), `the refusal names the cwd string: ${result.detail}`);
+      assert.match(result.detail, /w2m-backup register --session … --watch <minutes>/u);
+      assert.match(result.detail, /with the client stopped when possible/u);
+      assert.match(result.detail, /the watch re-applies on clobber/u);
+      assert.deepEqual(service.resolved, [], 'nothing is attached and no workspace is created');
+      assert.deepEqual(service.created, []);
+      assert.deepEqual(service.attached, []);
+      assert.deepEqual(result.cwd_fallback, []);
+      assert.ok(fs.readFileSync(join(home.home, 'storages', 'workspace.json')).equals(before));
+    } finally {
+      home.cleanup();
+    }
+  });
+
+  it('refuses in the same shape when attachSession rejects even after the header-cwd fallback', async () => {
+    const home = hostHome();
+    try {
+      const movedCwd = join(home.home, 'moved-project');
+      fs.mkdirSync(movedCwd, { recursive: true });
+      put(home.files[SESSION], sessionLog(SESSION, [event(0), event(1)], { cwd: movedCwd }));
+      const before = fs.readFileSync(join(home.home, 'storages', 'workspace.json'));
+      const service = fakeWorkspaceService({ resolve: false, attachThrows: true, attachError: 'its cwd does not resolve to the workspace path' });
+      const result = await registerThroughHost({
+        dshHome: home.home,
+        sessionIds: [SESSION],
+        workspaceRegistry: service,
+        workspacePath: join(home.home, 'requested-workspace'),
+      });
+      assert.equal(result.ok, false);
+      assert.equal(result.reason_code, REGISTER_CODES.HOST_ATTACH_FAILED);
+      assert.equal(result.via, 'host-service');
+      assert.equal(result.residual_risk, REGISTER_RESIDUAL_RISK_LINE);
+      assert.equal(result.failed.length, 1);
+      assert.equal(result.failed[0].session_id, SESSION);
+      assert.equal(result.failed[0].used_path, fs.realpathSync(movedCwd), 'the attempted target was the header cwd, not the requested workspace');
+      assert.ok(result.detail.includes(movedCwd), `the refusal names the cwd string: ${result.detail}`);
+      assert.match(result.detail, /w2m-backup register --session … --watch <minutes>/u);
+      assert.deepEqual(service.attached, [], 'the failed attach recorded nothing');
+      assert.deepEqual(result.registered, []);
+      assert.deepEqual(result.cwd_fallback, []);
+      assert.ok(fs.readFileSync(join(home.home, 'storages', 'workspace.json')).equals(before));
+    } finally {
+      home.cleanup();
+    }
+  });
+
+  it('keeps the matching-workspace happy path unchanged: no cwd_fallback entry and no create', async () => {
+    const home = hostHome();
+    try {
+      const ranIn = join(home.home, 'where-it-ran');
+      fs.mkdirSync(ranIn, { recursive: true });
+      put(home.files[SESSION], sessionLog(SESSION, [event(0), event(1)], { cwd: ranIn }));
+      const before = fs.readFileSync(join(home.home, 'storages', 'workspace.json'));
+      const service = fakeWorkspaceService();
+      const result = await registerThroughHost({ dshHome: home.home, sessionIds: [SESSION], workspaceRegistry: service, workspacePath: ranIn });
+      assert.equal(result.ok, true, result.detail);
+      assert.deepEqual(result.cwd_fallback, [], 'the requested workspace IS the header cwd: no substitution');
+      assert.deepEqual(service.resolved, [ranIn]);
+      assert.deepEqual(service.created, []);
+      assert.deepEqual(service.attached, [SESSION]);
+      const row = result.sessions[0];
+      assert.equal(row.cwd_fallback, false);
+      assert.equal(row.header_cwd, ranIn);
+      assert.equal(row.workspace_path_used, ranIn);
+      assert.deepEqual(result.failed, []);
       assert.ok(fs.readFileSync(join(home.home, 'storages', 'workspace.json')).equals(before));
     } finally {
       home.cleanup();

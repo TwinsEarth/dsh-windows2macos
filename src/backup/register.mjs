@@ -41,15 +41,24 @@
  * why the plugin route prefers it, and why the file path (+ its bounded watch) is kept for the offline CLI and for
  * a profile that hides the service -- where the route says `via: 'file-write'` and repeats the residual risk
  * instead of pretending the race does not exist.
+ *
+ * The service validates `attachSession` against the session's **header cwd**, which is why the in-host path now
+ * reads that header itself: a folder that was moved or renamed after the session was written still has a header
+ * naming the directory it ran in, and the session is attached there (`cwd_fallback`) rather than refused. Only a
+ * header cwd that is missing or no longer resolves falls back to the offline CLI + bounded watch, and that
+ * refusal states the residual window.
  */
 
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
 import { clientGate } from './client.mjs';
 import { applyRegistryRestore, CLIENT_OVERWRITE_WARNING, findWorkspaceForSlug, planRegistryRestores, workspaceRegistryPath } from './registry.mjs';
+import { REGISTER_RESIDUAL_RISK_LINE } from './register-watch.mjs';
 import { preRestoreRoot } from './restore.mjs';
-import { listSessionDirs } from '../fix/session.mjs';
+import { readSessionHeader } from './scan.mjs';
+import { listSessionDirs, pickSessionFile } from '../fix/session.mjs';
 import { readWorkspaceRegistry } from '../util/dsh-workspace.mjs';
 
 /** Named register refusals. */
@@ -62,9 +71,12 @@ export const REGISTER_CODES = Object.freeze({
   BACKUP_FAILED: 'BACKUP_REGISTER_BACKUP_FAILED',
   /** The in-host path was asked for but this profile exposes no `workspaceRegistry` service. */
   HOST_UNAVAILABLE: 'BACKUP_REGISTER_HOST_UNAVAILABLE',
-  /** The workspace a session belongs to could not be resolved to a path the host service can open. */
+  /** No workspace — from the caller, the registry view, or the session's own header cwd — can hold a session. */
   HOST_WORKSPACE_UNKNOWN: 'BACKUP_REGISTER_HOST_WORKSPACE_UNKNOWN',
-  /** The host workspace service refused `attachSession` for a session (its own validation, verbatim). */
+  /**
+   * The host workspace service refused `attachSession` for a session: the service's own validation, or the
+   * session's header cwd is missing/does not resolve so no host workspace may accept it.
+   */
   HOST_ATTACH_FAILED: 'BACKUP_REGISTER_HOST_ATTACH_FAILED',
 });
 
@@ -401,13 +413,113 @@ function usableWorkspaceRegistry(candidate) {
 }
 
 /**
+ * The one next step when the in-host service cannot attach a session: the file-level G2 path, whose bounded watch
+ * is the part of the protocol the host route cannot provide for a cwd that no longer exists.
+ */
+export const HOST_ATTACH_ADVICE =
+  'run the offline CLI `w2m-backup register --session … --watch <minutes>` with the client stopped when possible; ' +
+  'the watch re-applies on clobber';
+
+/**
+ * The canonical path of an existing directory, or `null`.
+ *
+ * The installed `attachSession` validates a session by realpathing its header cwd and comparing that canonical
+ * string with the workspace's stored path. The fallback uses **the same** fact for the same reason: a lexical
+ * comparison would attach a session to a directory the service then refuses, and a weaker one would attach it to
+ * the wrong real path.
+ *
+ * @param {string|null|undefined} candidate
+ * @returns {string|null}
+ */
+function realDirectoryOrNull(candidate) {
+  if (typeof candidate !== 'string' || candidate.trim() === '') return null;
+  try {
+    const real = fs.realpathSync(path.resolve(candidate.trim()));
+    return fs.statSync(real).isDirectory() ? real : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A display title for a workspace created from a session's own header cwd: the sanitized final segment plus a short
+ * stable id derived from the canonical path, so two directories with the same basename do not read as one project.
+ *
+ * @param {string} realCwd
+ * @returns {string}
+ */
+function workspaceTitleForCwd(realCwd) {
+  const base = path.basename(realCwd).replace(/[^\p{L}\p{N}._ -]/gu, '').replace(/\s+/gu, ' ').trim().slice(0, 40);
+  const shortId = createHash('sha256').update(realCwd).digest('hex').slice(0, 8);
+  return `${base || 'workspace'} ${shortId}`;
+}
+
+/**
+ * The cwd a session's own log header declares, resolved through the filesystem.
+ *
+ * This is the fact the installed `attachSession` validates: it reads the header, realpaths `cwd`, and refuses when
+ * the result is not the workspace's own path. Reading the same header here is what lets a moved folder be attached
+ * to the directory the session actually ran in instead of the folder that replaced it.
+ *
+ * `problem: 'missing'` means the header is readable but carries no cwd; `'unresolvable'` means the cwd string is
+ * known but no longer resolves to an existing directory; `'unreadable'` means the log/header itself could not be
+ * read (no zstd support, a torn first frame, no session log). The first two are facts about the session; the third
+ * is a fact about this reader, so a caller must not treat it as "the cwd is gone".
+ *
+ * @param {string} sessionDir
+ * @returns {{cwd: string|null, real_cwd: string|null, problem: 'missing'|'unresolvable'|'unreadable'|null,
+ *   detail: string|null}}
+ */
+function readSessionCwd(sessionDir) {
+  let file = null;
+  try {
+    file = pickSessionFile(sessionDir);
+  } catch (error) {
+    return { cwd: null, real_cwd: null, problem: 'unreadable', detail: `the session directory could not be read: ${error?.message ?? error}` };
+  }
+  if (file === null) return { cwd: null, real_cwd: null, problem: 'unreadable', detail: 'the session directory holds no session.vN.jsonl.zstd log' };
+  const header = readSessionHeader(file);
+  if (header.ok !== true) return { cwd: null, real_cwd: null, problem: 'unreadable', detail: header.detail };
+  const cwd = typeof header.header.cwd === 'string' && header.header.cwd.trim() !== '' ? header.header.cwd.trim() : null;
+  if (cwd === null) return { cwd: null, real_cwd: null, problem: 'missing', detail: 'the session header carries no cwd' };
+  const real = realDirectoryOrNull(cwd);
+  if (real === null) {
+    return { cwd, real_cwd: null, problem: 'unresolvable', detail: `the header cwd '${cwd}' does not resolve to an existing directory` };
+  }
+  return { cwd, real_cwd: real, problem: null, detail: null };
+}
+
+/** One failed session's `detail`: the id, the reason (which names its cwd string), and the offline CLI advice. */
+function hostAttachFailureDetail(sessionId, reason) {
+  return `session ${sessionId} could not be attached through the host workspace service: ${reason}. ${HOST_ATTACH_ADVICE}`;
+}
+
+/** The result `detail` for a failed host-service register: every refused session, then the next step. */
+function hostRefusalDetail(failures, total) {
+  const rows = failures.map((row) => {
+    const cwd = typeof row.header_cwd === 'string' && row.header_cwd !== '' ? `header cwd '${row.header_cwd}'` : 'header cwd unknown';
+    return `${row.session_id} (${cwd}${typeof row.cause === 'string' && row.cause !== '' ? `: ${row.cause}` : ''})`;
+  });
+  return `the host workspace service refused ${failures.length} of ${total} session(s): ${rows.join('; ')}. ${HOST_ATTACH_ADVICE}`;
+}
+
+/**
  * Register on-disk sessions **through the host's `workspaceRegistry` service** instead of writing the file.
  *
  * This is the in-host path: the service persists the domain before mutating memory and emits `domain/changed`, so
  * the GUI projection and `storages/workspace.json` move together. There is no file-level race to watch, which is
  * exactly why the plugin route prefers it; a session the service refuses (its `attachSession` validates that the
- * session is known to `sessionPersistence` and that the header cwd resolves to the workspace's path) is reported
- * with the service's own refusal rather than silently falling back to a file write.
+ * session is known to `sessionPersistence` and that the header cwd realpaths to the workspace's own path) is
+ * reported with a named refusal rather than silently falling back to a file write.
+ *
+ * ## The moved-folder case
+ *
+ * `attachSession` compares the session's **header cwd** with the workspace path, so a home whose folder was moved
+ * or renamed after the session was written cannot be registered against the current folder. The session's own
+ * header still names the directory it ran in; when that directory **exists**, this function attaches there
+ * (`resolveByPath`, then `create`) and reports the substitution in `cwd_fallback`. It never attaches to a different
+ * real path than the header names. Only a header cwd that is missing, empty, or cannot be realpath'd (a deleted
+ * drive or directory) is refused, and that refusal names the file-level path + bounded watch as the next step.
  *
  * `already_registered` is computed from the registry view for the same reporting semantics as the file path; a
  * registered session is never attached twice.
@@ -416,7 +528,10 @@ function usableWorkspaceRegistry(candidate) {
  *   dshHome: string, sessionIds: string[], workspaceRegistry?: object|null, workspacePath?: string|null,
  *   now?: Date,
  * }} input
- * @returns {Promise<object>} the apply-shaped result plus `via:'host-service'`, `failed: []`, `residual_risk: null`
+ * @returns {Promise<object>} the apply-shaped result plus `via:'host-service'`, `failed: []`,
+ *   `cwd_fallback: Array<{session_id, requested_path, used_path}>`, per-session `attached_workspace_id` /
+ *   `workspace_path_used`, and `residual_risk: null` on success (a named refusal states the file path's residual
+ *   window instead)
  */
 export async function registerThroughHost(input = {}) {
   const dshHome = typeof input.dshHome === 'string' && input.dshHome.trim() !== '' ? path.resolve(input.dshHome) : null;
@@ -424,7 +539,8 @@ export async function registerThroughHost(input = {}) {
   const now = input.now instanceof Date ? input.now : new Date();
   const workspacePath = typeof input.workspacePath === 'string' && input.workspacePath.trim() !== '' ? path.resolve(input.workspacePath.trim()) : null;
   const service = input.workspaceRegistry ?? null;
-  const base = {    ok: false,
+  const base = {
+    ok: false,
     reason_code: null,
     detail: null,
     via: 'host-service',
@@ -437,6 +553,7 @@ export async function registerThroughHost(input = {}) {
     unknown: [],
     failed: [],
     actions: [],
+    cwd_fallback: [],
     changed: false,
     verified: false,
     backup_file: null,
@@ -475,7 +592,16 @@ export async function registerThroughHost(input = {}) {
   const view = readWorkspaceRegistry(dshHome);
   const sessions = requested.map((sessionId) => {
     const row = onDisk.get(sessionId);
-    return { session_id: sessionId, workspace: row.workspace, dir: row.dir };
+    return {
+      session_id: sessionId,
+      workspace: row.workspace,
+      dir: row.dir,
+      header_cwd: null,
+      requested_path: null,
+      workspace_path_used: null,
+      attached_workspace_id: null,
+      cwd_fallback: false,
+    };
   });
   const alreadyRegistered = sessions
     .filter((session) => view.ok === true && view.registered.has(session.session_id))
@@ -485,40 +611,95 @@ export async function registerThroughHost(input = {}) {
   const registered = [];
   const failed = [];
   const actions = [];
+  const cwdFallback = [];
   for (const session of fresh) {
-    // The service needs the workspace's canonical path. Prefer a caller-named path (the disaster-recovery case),
-    // otherwise the registry view's own record for this slug; the slug is what the backup recorded.
+    // Which workspace may hold this session, in preference order: the caller-named path (the disaster-recovery
+    // case), the registry view's own record for the recorded slug, then the session's own header cwd. The last one
+    // is the only source that survives a moved/renamed folder, and it is the fact the service validates against.
     const matched = findWorkspaceForSlug(view, session.workspace);
-    const targetPath = workspacePath ?? (typeof matched?.path === 'string' && matched.path !== '' ? matched.path : null);
+    const namedPath = workspacePath ?? (typeof matched?.path === 'string' && matched.path !== '' ? matched.path : null);
+    const namedCanonical = namedPath === null ? null : path.resolve(namedPath);
+    const namedReal = namedCanonical === null ? null : realDirectoryOrNull(namedCanonical);
+    const header = readSessionCwd(session.dir);
+    session.header_cwd = header.cwd;
+    session.requested_path = namedCanonical;
+
+    // The one real path this session may be attached to. A header cwd that exists and differs from the requested
+    // workspace is a moved folder (or a registry record that no longer names where the session ran): attach there.
+    let targetPath = namedCanonical;
+    let fallback = null;
+    if (header.real_cwd !== null) {
+      if (namedReal !== header.real_cwd) {
+        fallback = { session_id: session.session_id, requested_path: namedCanonical, used_path: header.real_cwd };
+        targetPath = header.real_cwd;
+      }
+    } else if (header.problem !== 'unreadable' && namedReal !== null) {
+      // The header cwd is known and gone while the requested workspace exists. Attaching the session there would
+      // put it in a directory it never ran in -- the silent mis-attach the service's own check prevents -- so
+      // refuse, name the cwd string, and point at the file path + watch.
+      failed.push({
+        session_id: session.session_id,
+        reason_code: REGISTER_CODES.HOST_ATTACH_FAILED,
+        detail: hostAttachFailureDetail(session.session_id, header.detail ?? `its header cwd '${header.cwd ?? ''}' cannot be used`),
+        header_cwd: header.cwd,
+        requested_path: namedCanonical,
+        used_path: null,
+        cause: header.detail,
+      });
+      continue;
+    }
     if (targetPath === null) {
       failed.push({
         session_id: session.session_id,
         reason_code: REGISTER_CODES.HOST_WORKSPACE_UNKNOWN,
-        detail: `no workspace path is known for slug ${session.workspace}; pass an explicit workspace path`,
+        detail: `no workspace path is known for slug ${session.workspace}, and the session's header cwd cannot stand in for one (${header.detail ?? 'unreadable'}); pass an explicit workspace path, or ${HOST_ATTACH_ADVICE}`,
+        header_cwd: header.cwd,
+        requested_path: null,
+        used_path: null,
+        cause: header.detail,
       });
       continue;
     }
+    session.workspace_path_used = targetPath;
     try {
       let workspace = typeof service.resolveByPath === 'function' ? await service.resolveByPath(path.resolve(targetPath)) : null;
       if (workspace === null || workspace === undefined) {
         if (typeof service.create !== 'function') {
-          failed.push({ session_id: session.session_id, reason_code: REGISTER_CODES.HOST_WORKSPACE_UNKNOWN, detail: `the host service has no workspace at ${targetPath} and cannot create one` });
+          failed.push({ session_id: session.session_id, reason_code: REGISTER_CODES.HOST_WORKSPACE_UNKNOWN, detail: `the host service has no workspace at ${targetPath} and cannot create one; ${HOST_ATTACH_ADVICE}`, header_cwd: header.cwd, requested_path: namedCanonical, used_path: targetPath });
           continue;
         }
-        workspace = await service.create(path.resolve(targetPath));
+        // A workspace created for a moved folder is titled by the folder it is, not by the folder that replaced it.
+        workspace = fallback === null
+          ? await service.create(path.resolve(targetPath))
+          : await service.create(path.resolve(targetPath), workspaceTitleForCwd(targetPath));
       }
       if (workspace === null || workspace === undefined || typeof workspace.attachSession !== 'function') {
-        failed.push({ session_id: session.session_id, reason_code: REGISTER_CODES.HOST_WORKSPACE_UNKNOWN, detail: `the host service returned no attachable workspace for ${targetPath}` });
+        failed.push({ session_id: session.session_id, reason_code: REGISTER_CODES.HOST_WORKSPACE_UNKNOWN, detail: `the host service returned no attachable workspace for ${targetPath}; ${HOST_ATTACH_ADVICE}`, header_cwd: header.cwd, requested_path: namedCanonical, used_path: targetPath });
         continue;
       }
       await workspace.attachSession(session.session_id);
       registered.push(session.session_id);
-      actions.push(`attached ${session.session_id} to the host workspace ${workspacePath ?? targetPath}`);
+      session.attached_workspace_id = typeof workspace.id === 'string' && workspace.id !== '' ? workspace.id : null;
+      if (fallback === null) {
+        actions.push(`attached ${session.session_id} to the host workspace ${targetPath}`);
+      } else {
+        session.cwd_fallback = true;
+        cwdFallback.push(fallback);
+        actions.push(`attached ${session.session_id} to the host workspace ${fallback.used_path} (its own header cwd; requested ${fallback.requested_path ?? 'none'})`);
+      }
     } catch (error) {
+      const cause = error instanceof Error ? error.message : String(error);
+      const reason = header.cwd === null
+        ? `its header carries no readable cwd (${cause})`
+        : `its header cwd '${header.cwd}' could not be attached (${cause})`;
       failed.push({
         session_id: session.session_id,
         reason_code: REGISTER_CODES.HOST_ATTACH_FAILED,
-        detail: error instanceof Error ? error.message : String(error),
+        detail: hostAttachFailureDetail(session.session_id, reason),
+        header_cwd: header.cwd,
+        requested_path: namedCanonical,
+        used_path: targetPath,
+        cause,
       });
     }
   }
@@ -528,15 +709,18 @@ export async function registerThroughHost(input = {}) {
     return {
       ...base,
       reason_code: failed[0].reason_code,
-      detail: `the host workspace service refused ${failed.length} of ${fresh.length} session(s): ${failed.map((row) => row.session_id).join(', ')}`,
+      detail: hostRefusalDetail(failed, fresh.length),
       sessions,
       registered,
       already_registered: alreadyRegistered,
       failed,
       actions,
+      cwd_fallback: cwdFallback,
       changed,
       // A partial attach changed something but not the promise: "verified" only when every fresh session landed.
       verified: false,
+      // The next step is the file path + its bounded watch, so its residual window is stated here, not null.
+      residual_risk: REGISTER_RESIDUAL_RISK_LINE,
     };
   }
   return {
@@ -548,6 +732,7 @@ export async function registerThroughHost(input = {}) {
     already_registered: alreadyRegistered,
     failed: [],
     actions,
+    cwd_fallback: cwdFallback,
     changed,
     // The service persists before it mutates memory (dsh-storage-domain), so a resolved attachSession call is
     // durable by construction -- there is no read-back of a file we wrote.

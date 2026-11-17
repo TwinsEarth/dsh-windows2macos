@@ -920,22 +920,34 @@ v3.4.9 面板与 v3.5.0 非 UI 半之后，复盘门禁的四个"最后一段"�
   发 `domain/changed`，GUI 读的是该投影。因此 `registerThroughHost()` 用 `resolveByPath`/`create` +
   `attachSession(sessionId)` 登记，**不写文件，也就没有客户端保存可覆盖**（`residual_risk:null`）。面板路由
   `POST /api/w2m/backup/register {confirm:'register', session_ids}` 优先走它；宿主没有该服务（或离线 CLI）时才退回上面的
-  文件路径（响应 `via:'file-write'`，带 watch 与残余风险），**不会静默降级**。服务自己的 `attachSession` 校验
-  （会话必须被 `sessionPersistence` 认识、header cwd 必须 realpath 到工作区路径）拒绝时按 `BACKUP_REGISTER_HOST_*`
-  具名报告，不回退文件写。
+  文件路径（响应 `via:'file-write'`，带 watch 与残余风险），**不会静默降级**。
+* **移动/改名目录（v3.5.x 补，收掉宿主服务的剩余边界）**：`attachSession` 用**会话自己的 header cwd** realpath 比
+  工作区路径，所以目录在会话写盘后被移动/改名时，按"当前目录"登记必然被服务拒绝、此前只能落到离线 CLI + watch。
+  现在 `registerThroughHost()` 先读会话日志首帧（`readSessionHeader`，与扫描/doctor 同一解析器）拿 header cwd：
+  cwd **存在且能 realpath** 时，就把它当作唯一目标 → `resolveByPath(realCwd)`（命中则复用）→ 否则
+  `create(realCwd, '<目录名> <短 id>')` → `attachSession`。每会话报告 `attached_workspace_id` / `workspace_path_used`，
+  结果新增 `cwd_fallback:[{session_id, requested_path, used_path}]`（`requested_path` 为调用方/注册表视图给的目标，
+  可为 null）。**绝不**静默挂到与 header cwd 不同的真实路径。header cwd 缺失/为空/无法 realpath（盘符或目录已删），
+  或服务在 fallback 后仍拒绝时，按 `BACKUP_REGISTER_HOST_ATTACH_FAILED` 具名拒绝：`detail` 写出会话 id、它的 cwd
+  字符串和下一步 `run the offline CLI \`w2m-backup register --session … --watch <minutes>\` with the client stopped
+  when possible; the watch re-applies on clobber`，且 `residual_risk` 非空（文件路径的窗口仍在）。
 * 退出码与 restore 一致：0 成功、1 具名拒绝、2 用法错误。
 * 归档/置顶 = **读出来再写回**，绝不默认；已登记会话不进 plan，因此第二次运行是 no-op（`already_registered`），
   连注册表副本都不写。`register-*` 目录只由 register 自己按份数保留（默认 10，0 = 全留，当前次副本永不删）；
   `listPreRestoreSnapshots` 只认时间戳目录，restore 的保留策略不会把注册表副本算进去、也不会删它。
-* 测试：`test/backup-g2.test.mjs` 新增 15 条（watch 调度/预算/时钟注入、无覆盖 `clobbered:0`、模拟覆盖后
+* 测试：`test/backup-g2.test.mjs` 新增 19 条（watch 调度/预算/时钟注入、无覆盖 `clobbered:0`、模拟覆盖后
   `reapplied:1` 且不写第二份副本、CLI `--watch` 的 JSON/文本/残余风险行/参数错误、`registerThroughHost` 的
-  服务写入/已登记 no-op/无服务具名拒绝/attach 拒绝不回退）；`test/backup-run.test.mjs` 新增 2 条路由测试
+  服务写入/已登记 no-op/无服务具名拒绝/attach 拒绝不回退、**移动目录会话按 header cwd 登记**（`create` 收到 header
+  cwd 且标题=目录名+短 id、`cwd_fallback` 报告、workspace.json 字节不变、第二次走 `resolveByPath` 复用）、**header
+  cwd 已删时具名拒绝**（detail 含 cwd 字符串与 CLI+watch 建议、零 attach/零 create）、匹配路径 happy path 无
+  fallback、**fallback 后 attach 仍拒绝时拒绝形状正确**）；`test/backup-run.test.mjs` 新增 2 条路由测试
   （无服务时 file-write + 30 s 有界 watch + residual_risk；有 `ctx.workspaceRegistry` 时 host-service、
   workspace.json 字节不变、不跑 watch）；面板代价见 §22.4。
 * 残余风险：**只有文件路径有**（离线 CLI，或配置隐藏了 workspace 服务的宿主）——watch 窗口之后的客户端保存仍可能
   覆盖；要彻底消除，必须在宿主内走 `workspaceRegistry` 服务（面板路由已优先这样做），或停掉客户端再跑 CLI。
-  服务路径的残留边界是 Harness 自己的 `attachSession` 校验范围（cwd 已不存在等灾难恢复场景它不接），那种 case 由
-  CLI 文件路径 + watch 兜住。
+  宿主服务路径的残留边界**只剩 header cwd 真正无法解析**的会话（盘符/目录已删）：目录只是被移动/改名时，服务路径
+  现在会按会话自己的 header cwd 挂接（见上），不再落到 CLI + watch；header cwd 已消失的 case 仍由 CLI 文件路径 +
+  watch 兜住，拒绝 `detail` 已给出该命令。
 
 ### 22.2 G3：一条证据测试覆盖每条"会改字节/改声明"的路径
 
@@ -1004,8 +1016,9 @@ cachedNone/stale/fresh`。测试：`test/client-bundle.test.mjs` 新增 3 条（
 * register 的文件路径仍依赖客户端门禁 + 保存后复查/有界 watch；**窗口之后的客户端保存仍可能覆盖**（§16 末同一条
   残余风险）。watch 把它缩小到一个明确预算并给出 `clobbered/reapplied` 数据，不声称消除。消除路径只有一条：
   在宿主内走 `ctx.workspaceRegistry`（面板路由在有该服务时优先走它；离线 CLI 没有宿主上下文）；该服务也有自己的
-  边界——`attachSession` 要求会话被 `sessionPersistence` 认识且 header cwd realpath 到工作区，cwd 已消失的灾难
-  恢复场景它不接，那种 case 仍要离线 CLI + watch。
+  边界——`attachSession` 要求会话被 `sessionPersistence` 认识且 header cwd realpath 到工作区。**移动/改名目录不再
+  是这个边界**：`registerThroughHost` 会读会话 header cwd，并挂到那个仍存在的目录（`cwd_fallback`）；只有 header cwd
+  缺失/无法 realpath（盘符或目录已删）或服务在 fallback 后仍拒绝时，才退回离线 CLI + watch。
 * 面板运行时终审仍是 opt-in（慢）：勾选框让「全量校验」同步跑 `?runtime=1`，或点「立即运行（慢）」按钮；缓存块
   只读最近一次记录并明确标 stale（>24 h）。nightly 只在配置 `backupRuntimeVerify: 'nightly'` 时启用，默认 `off`；
   失败的终审只记 warning 并持久化失败记录，**不**让备份/调度失败，也**不**回滚已提交备份。

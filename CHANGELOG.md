@@ -4,6 +4,15 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### 宿主 register 的移动目录回退：按会话 header cwd 挂接（未发布）
+
+- **问题**：面板/插件登记的宿主路径 `registerThroughHost()` 走 `ctx.workspaceRegistry.attachSession`；该服务用会话 header cwd 的 realpath 比工作区路径，目录被移动/改名后必然拒绝，只能回退离线 CLI + 有界 watch，留下残余窗口。
+- **行为**：`registerThroughHost()` 先读会话日志首帧（复用 `src/backup/scan.mjs#readSessionHeader`，不新增解析器）拿 header cwd；cwd 存在且能 realpath → 以它为**唯一**目标：`resolveByPath(realCwd)` 命中则复用，否则 `create(realCwd, '<目录名> <短 id>')`，再 `attachSession`。每会话报告 `attached_workspace_id`/`workspace_path_used`，结果新增 `cwd_fallback: [{session_id, requested_path, used_path}]`（`requested_path` 为调用方/注册表视图给的目标，可为 null）。绝不静默挂到与 header cwd 不同的真实路径；请求路径与 header cwd 一致时 happy path 不变（无 fallback 条目），宿主路径仍不写 `workspace.json`。
+- **拒绝**：header cwd 缺失/为空/无法 realpath（盘符或目录已删），或 fallback 后 `attachSession` 仍拒绝 → `BACKUP_REGISTER_HOST_ATTACH_FAILED`，`detail` 写出会话 id、它的 cwd 字符串与下一步：离线 CLI `w2m-backup register --session … --watch <minutes>`（客户端尽量停掉；watch 会在被覆盖后重放），`via:'host-service'` 与 `residual_risk` 非空（文件路径 + watch 是下一步）。
+- **文档/测试**：`docs/BACKUP-DESIGN.md` §22.1/§22.5 更新边界（移动/改名目录在宿主内解决，只有 cwd 真正缺失/无法解析才回退 CLI + watch）；`test/backup-g2.test.mjs` +4（移动目录 `create`/`resolveByPath` 复用与 `cwd_fallback`、header cwd 已删具名拒绝且 detail 含 cwd 与 CLI+watch 建议、匹配路径无 fallback、fallback 后 attach 仍拒绝）。`npx eslint .` 0 error、`node scripts/layer-check.mjs` clean、`node scripts/scan-mojibake.mjs` clean、相关 suite 全绿。
+- **实现说明**：宿主 `create` 用真实签名 `create(path, title?)`（标题 = 清洗后的目录名 + 8 位路径短 id）；`cwd_fallback` 只记录成功挂接的会话，尝试过但被拒绝的会话由 `sessions[].workspace_path_used` 与 `failed[].used_path` 体现。
+- **声明**：不 bump 版本（仍 3.5.0）、不跑 preflight、不提交。
+
 ### old/ 总量不设上限：每增长 10 GB 提醒、由用户决定是否手动清理（未发布）
 
 - **用户决定**：`old/` **总量不设上限**；每增加 10 GB 提醒一次，是否手动清理由用户决定。所以本次不加上限，只加"测量 + 提醒 + 确认"三件事：每会话保留规则与单份整文件副本 300 MB 上限都不变。
