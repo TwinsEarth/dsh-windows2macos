@@ -754,6 +754,33 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
       }
     }
 
+    // v3.5.x: the unlock dialog in the real page. Independent of the decision probe for the same reason that
+    // probe gates the backup panel probe: the backup seat lives on the session-less left sidebar, so the dialog
+    // is reachable on the landing page without a conversation.
+    if (process.env.W2M_BACKUP_PROBE === '1') {
+      const unlock = page.backupProbe ?? {};
+      assert.equal(unlock.backupOpened?.found, true, 'the left sidebar carries the backup entry');
+      assert.equal(unlock.backupPanel?.open, true, 'clicking it opens the backup panel page');
+      assert.equal(unlock.backupPanel?.trigger, true, 'the unlock card carries the dialog trigger');
+      assert.equal(unlock.unlockOpened?.found, true, 'clicking the trigger opens the unlock dialog');
+      const dialog = unlock.unlockDialog ?? {};
+      assert.equal(dialog.found, true, `the unlock dialog is in the page: ${JSON.stringify(dialog)}`);
+      assert.equal(dialog.role, 'dialog', 'the unlock surface has role="dialog"');
+      assert.equal(dialog.ariaModal, 'true', 'the unlock dialog is modal');
+      assert.equal(dialog.overlay, true, 'the unlock dialog renders on its own overlay');
+      assert.ok(typeof dialog.labelledBy === 'string' && dialog.labelledBy !== '',
+        'the unlock dialog is labelled by its title');
+      assert.equal(dialog.optionA, true, 'the local/account option is rendered');
+      assert.equal(dialog.command, 'w2m-backup unlock --check --password-stdin',
+        'the terminal password command is shown as copyable text');
+      assert.equal(dialog.copy, true, 'the command has a copy button');
+      assert.equal(dialog.refresh, true, 'the command has the refresh-state button');
+      assert.equal(dialog.passwordFields, 0,
+        'the unlock dialog has no text/password field: a password never enters the browser');
+      assert.equal(unlock.unlockClosed?.closed, true, 'Escape closes the unlock dialog');
+      assert.equal(unlock.unlockClosed?.overlayGone, true, 'Escape removes the unlock overlay too');
+    }
+
     if (process.env.W2M_CAPABILITY_PROBE === '1') {
       const probe = page.capabilityProbe ?? {};
       assert.equal(probe.menu?.menu, true, `the Node-execution menu never opened: ${JSON.stringify(probe)}`);

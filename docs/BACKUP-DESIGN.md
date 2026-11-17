@@ -1300,11 +1300,35 @@ node --input-type=module -e "import { bindAccount } from 'file:///E:/GPT/w2m/w2m
   `w2m-backup run --account-id <id>`（成功后绑定）。CLI 不会自己读宿主 id：id 只能由宿主或操作员提供，避免又造一个
   "可手填的账户凭据"（见 `src/chatops/account.mjs` 开头的原则）。`--account-id` 是高级/手动参数，其余命令不变。
 
-### 25.5 面板文案（`lib/client.js`）
+### 25.5 面板文案与解锁对话框（`lib/client.js`）
 
-解锁卡按仓库的 `encryption` 画三种状态（HTTP 仍不接收任何凭据，按钮只发 `{"confirm":"unlock"}`）：
+解锁卡按仓库的 `encryption` 画三种状态（HTTP 仍不接收任何凭据，按钮只发 `{"confirm":"unlock"}`）。卡片保留只读说明
+和原有按钮，**动作面**是卡片标题栏的「解锁…」按钮（`data-w2m-backup-unlock-open`）打开的模态对话框：
 
-| 状态 | 文案（中） | 按钮 |
+* 对话框是 `data-w2m-backup-unlock-dialog`，带 `role="dialog"`、`aria-modal="true"`、`aria-labelledby` 指向标题；
+  遮罩是 `data-w2m-backup-unlock-overlay`。关闭路径：× 按钮、Esc、点击遮罩。打开时焦点进入第一个可用控件
+  （`disabled` 与 `aria-disabled="true"` 跳过，没有可用控件时落在对话框容器上），关闭后焦点回到触发按钮；
+  不锁 body 滚动（窄宽度下面板自身滚动）。
+* 标题下按 `GET /api/w2m/backup/unlock` 的 describe 渲染当前保护状态，五态写进
+  `data-w2m-backup-unlock-dialog-state`：`none`（未加密）/ `account-matched`（账户一致）/ `account-mismatch`
+  （账户不一致）/ `unbound`（未绑定原账户）/ `unknown`（读不到 describe，不猜凭据是否可用）。打开对话框本身
+  不重新请求；「我已运行，刷新状态」才重新读 `GET /unlock` 与 `/run` 内嵌状态并重画。
+* **选项 A「用本机/原账户解锁」**：只 `POST /api/w2m/backup/unlock`，请求体**恰好** `{"confirm":"unlock"}`，
+  没有密码或任何其他凭据字段；本机/原账户路径不可用时按钮禁用并说明原因；失败走 `backupReasonText`
+  （`panel.backup.reason.*`，未知码原样显示）。
+* **选项 B「使用解锁密码（在终端输入）」**：**浏览器里没有密码输入框**，整个对话框 DOM 里没有任何
+  `input`/`textarea`。显示可复制的 `<code>` 命令 `w2m-backup unlock --check --password-stdin`（复制走
+  `navigator.clipboard.writeText`，失败回退 `document.execCommand('copy')`）与「我已运行，刷新状态」；未加密时
+  明确说明不需要密码。
+* 末尾一行 `w2m-backup unlock --disable-protection --confirm disable-protection`（关闭保护）**只作为可复制文本**
+  展示，面板从不执行它。
+* **密码永远不进浏览器、不过 HTTP**：对话框里常驻 `panel.backup.unlock.dialog.passwordNeverInBrowser` 的说明；
+  新增文案键（zh+en）为 `panel.backup.unlock.dialog.*`：`open`、`title`、`subtitle`、`state.*`、`optionA`、
+  `optionAHint`、`localUnavailable`、`optionB`、`optionBHint`、`noPasswordNeeded`、`commandCaption`、`copy`、
+  `copied`、`refresh`、`refreshing`、`close`、`busy`、`failed`、`success`、`passwordNeverInBrowser`、
+  `disableProtection`。
+
+| 状态 | 文案（中） | 按钮（卡片与对话框） |
 |---|---|---|
 | `encryption: none`（默认） | 「未加密：任何能访问该目录的人都能还原备份」+「仓库未加密：不需要账户或 PIN，直接可以解锁」+ 关闭保护说明 | 「解锁」可点（无凭据） |
 | `sealed`，`bound: true, matched: true` | 本机账户与原账户一致，可直接解锁。 | 「用原账户解锁」可点 |
@@ -1337,6 +1361,11 @@ node --input-type=module -e "import { bindAccount } from 'file:///E:/GPT/w2m/w2m
   restore。
 * `test/client-bundle.test.mjs`：解锁卡三态（未加密/账户一致/账户不一致 + PIN 提示）、状态卡模式徽标、未加密
   警告、新 i18n 键与 `BACKUP_CONFIG_INVALID` 映射。
+* `test/client-bundle.test.mjs`（解锁对话框，v3.5.x）：卡片触发器打开模态（`role`/`aria-modal`/`aria-labelledby`/
+  遮罩）、Esc 与遮罩关闭、焦点进入对话框与回到触发器、选项 A 请求体恰好 `{"confirm":"unlock"}` 且全程无密码、
+  选项 B 命令复制（clipboard + `execCommand` 回退）与「刷新状态」重读 describe、失败原因文案、五态映射与中英字典键。
+* `test/loader-entry.test.mjs` + `test/helpers/dsh-page-boot.mjs`（真实浏览器）：打开备份面板 → 点「解锁…」→
+  `[data-w2m-backup-unlock-dialog]` 带 `role="dialog"` 且焦点在对话框内 → Esc 后对话框与遮罩消失。
 * `docs/SPIKE-ACCOUNT-KEK.md` §9 记录"用户最终决定：便捷优先"。
 
 ### 25.7 诚实边界（本次不承诺的）

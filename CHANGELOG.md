@@ -4,6 +4,18 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### 备份面板解锁对话框（真正的模态，未发布）
+
+- **交互**：解锁卡标题栏新增可见的「解锁…」按钮（`data-w2m-backup-unlock-open`），打开真正的模态对话框（`data-w2m-backup-unlock-dialog`，`role="dialog"`、`aria-modal="true"`、`aria-labelledby` 指向标题；遮罩 `data-w2m-backup-unlock-overlay`）。×、Esc、点击遮罩关闭；打开时焦点进入对话框内第一个可用控件（`disabled`/`aria-disabled` 跳过），关闭后回到触发按钮；不锁 body 滚动。卡片的既有说明与按钮全部保留，行为不变。
+- **状态**：标题下按面板已取到的 `GET /api/w2m/backup/unlock` describe 渲染当前保护状态，五态 `none` / `account-matched` / `account-mismatch` / `unbound` / `unknown`（`data-w2m-backup-unlock-dialog-state`）；打开对话框不再发请求，「刷新状态」才重读 `GET /unlock` 与 `/run` 内嵌状态。
+- **选项 A（用本机/原账户解锁）**：仍是 `POST /api/w2m/backup/unlock`，请求体**恰好** `{"confirm":"unlock"}`，没有任何密码/凭据字段；路径不可用时按钮禁用，失败经 `backupReasonText` 映射为可操作文案。
+- **选项 B（使用解锁密码，在终端输入）**：浏览器里**没有密码输入框**，整个对话框 DOM 无 `input`/`textarea`；显示可复制的 `<code>` 命令 `w2m-backup unlock --check --password-stdin`（clipboard，失败回退 `document.execCommand('copy')`）与「我已运行，刷新状态」；未加密时说明不需要密码。`w2m-backup unlock --disable-protection --confirm disable-protection` 只作为可复制文本出现，面板从不执行。
+- **i18n**：新增 `panel.backup.unlock.dialog.*` 中英文案（open/title/subtitle/state.*/optionA/optionAHint/localUnavailable/optionB/optionBHint/noPasswordNeeded/commandCaption/copy/copied/refresh/refreshing/close/busy/failed/success/passwordNeverInBrowser/disableProtection），中文默认。
+- **样式**：overlay + 居中面板，只使用宿主 `--dsw-alias-*` 变量（无字面色值），z-index 复用文件既有浮层层级（70），窄宽度下占满可用宽度并在内部滚动。
+- **测试**：`test/client-bundle.test.mjs` +10（打开/关闭/Esc/遮罩/焦点、选项 A 请求体恰好 `{"confirm":"unlock"}` 且全程无密码、选项 B 命令复制与 `execCommand` 回退、刷新重读、失败原因文案、五态映射、中英字典键）；`test/helpers/dsh-page-boot.mjs` + `test/loader-entry.test.mjs` 真实 Chromium：打开备份面板 → 点「解锁…」→ `[data-w2m-backup-unlock-dialog]` 带 `role="dialog"` 且焦点在框内 → Esc 后对话框与遮罩消失。
+- **文档**：`docs/BACKUP-DESIGN.md` §25.5 更新为对话框行为与「密码永远不进浏览器、命令可复制」的说明（保留模式表）。
+- **声明**：不 bump 版本、不跑 preflight、不提交；安全策略未改（HTTP 仍只接收确认令牌，浏览器从不接收/发送密码）。
+
 ### Relay Phase 2 合并（chat / 项目房间跨 relay 同步，条件已收口，未发布）
 
 - **合并**：`work/v3.4.6` ← `wip/relay-phase2-20261117`（merge）。分支侧先 `eee9c16` 把主线合入 Phase 2 分支，`aee1a9b` 是独立编码修复 commit（5 个文件在 8e90aed 里被 GBK/UTF-8 双重编码损坏：`server.mjs` 的 49 个 `§`、27 个 `—`、2 个 `–`、2 个 `→` 与 `SIGNATURE_MISMATCH/EXPIRED/REPLAY`、device_token 提示等对外文案全部恢复；`git diff work/v3.4.6 -- <file>` 只剩 Phase 2 真实改动）。

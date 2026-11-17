@@ -567,6 +567,48 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
       await evaluate(`fetch('/api/w2m/composer/journal', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ key: 'probe-ui', draft: '', queue: [] }) })`);
       await evaluate(`fetch('/api/w2m/composer/journal', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ key: 'session-probe-ui', draft: '', queue: [] }) })`);
     }
+    // v3.5.x: the unlock dialog probe. It is independent of the decision-center probe because the backup
+    // panel lives on the session-less left sidebar: its seat and main page are visible on the landing page,
+    // while the decision probe's GPW launcher/composer checks need an open conversation.
+    if (process.env.W2M_BACKUP_PROBE === '1') {
+      const read = async (expression) => {
+        const value = await evaluate(`JSON.stringify((() => { ${expression} })())`);
+        return value === null ? null : JSON.parse(value);
+      };
+      const backupOpened = await read(`const b=document.querySelector('[data-w2m-backup-sidebar]'); if(b===null)return{found:false}; b.click(); return{found:true};`);
+      await new Promise((resolve) => setTimeout(resolve, 900));
+      const backupPanel = await read(`
+        const p=document.querySelector('[data-w2m-backup-panel="page"]');
+        return {
+          open: p!==null,
+          title: (document.querySelector('.w2mBackup_title')?.textContent ?? null),
+          unlockCard: document.querySelector('[data-w2m-backup-panel="unlock"]')!==null,
+          trigger: document.querySelector('[data-w2m-backup-unlock-open]')!==null,
+        };
+      `);
+      const unlockOpened = await read(`const b=document.querySelector('[data-w2m-backup-unlock-open]'); if(b===null)return{found:false}; b.click(); return{found:true};`);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      const unlockDialog = await read(`
+        const d=document.querySelector('[data-w2m-backup-unlock-dialog]');
+        const o=document.querySelector('[data-w2m-backup-unlock-overlay]');
+        return {
+          found: d!==null,
+          role: d?.getAttribute('role') ?? null,
+          ariaModal: d?.getAttribute('aria-modal') ?? null,
+          labelledBy: d?.getAttribute('aria-labelledby') ?? null,
+          overlay: o!==null,
+          optionA: d!==null && d.querySelector('[data-w2m-backup-unlock-dialog-local]')!==null,
+          command: (d?.querySelector('[data-w2m-backup-unlock-command]')?.textContent ?? '').trim(),
+          copy: d!==null && d.querySelector('[data-w2m-backup-unlock-copy]')!==null,
+          refresh: d!==null && d.querySelector('[data-w2m-backup-unlock-refresh]')!==null,
+          passwordFields: d===null ? 0 : d.querySelectorAll('input[type="password"], input[type="text"], textarea').length,
+        };
+      `);
+      await read(`document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true})); return{sent:true};`);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      const unlockClosed = await read(`return {closed: document.querySelector('[data-w2m-backup-unlock-dialog]')===null, overlayGone: document.querySelector('[data-w2m-backup-unlock-overlay]')===null};`);
+      report.backupProbe = { backupOpened, backupPanel, unlockOpened, unlockDialog, unlockClosed };
+    }
     socket.close();
     return report;
   } finally {

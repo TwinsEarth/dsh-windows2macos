@@ -214,6 +214,9 @@ function makeFakeDocument() {
   const bySelector = new Map();
   const appended = [];
   const removed = [];
+  // A keyed listener registry, so a test can drive document-level effects (the unlock dialog's Escape
+  // handler) the way the browser would: dispatch the event and let every registered listener see it.
+  const listeners = new Map();
   const document = {
     head: {
       appendChild: (tag) => {
@@ -227,11 +230,32 @@ function makeFakeDocument() {
       tagName: tagName.toUpperCase(),
       dataset: {},
       textContent: '',
+      value: '',
+      style: {},
+      select: () => {},
       remove: () => {
         removed.push(tagName);
         bySelector.delete(`style[data-plugin-css="${bySelector.size === 0 ? '' : ''}"]`);
       },
     }),
+    addEventListener: (type, callback) => {
+      const key = String(type);
+      const set = listeners.get(key) ?? new Set();
+      set.add(callback);
+      listeners.set(key, set);
+    },
+    removeEventListener: (type, callback) => {
+      const set = listeners.get(String(type));
+      if (set !== undefined) set.delete(callback);
+    },
+    dispatchEvent: (event) => {
+      const set = listeners.get(String(event?.type ?? ''));
+      if (set !== undefined) {
+        for (const callback of [...set]) callback(event);
+      }
+      return true;
+    },
+    listeners,
     appended,
     removed,
   };
@@ -847,6 +871,8 @@ function makeMountReact() {
   let dirty = false;
   let mounted = false;
   let lastTree = null;
+  /** What a fake DOM ref's focus effect called: `focusable` (first enabled control), `panel`, `disabled`. */
+  const refFocus = [];
   const runPending = () => {
     const effects = pending;
     pending = [];
@@ -880,7 +906,23 @@ function makeMountReact() {
     return node;
   };
   const React = {
-    createElement: (type, props, ...children) => ({ type, props: props ?? {}, children }),
+    // React attaches a DOM ref during commit. The one mounted component that relies on it here is the
+    // unlock dialog's focus effect, so the fake resolves a ref to a small stand-in and records the focus
+    // call — that is what lets the "focus enters the dialog" assertion exercise the real effect.
+    createElement: (type, props, ...children) => {
+      const resolved = props ?? {};
+      if (resolved.ref !== null && resolved.ref !== undefined && typeof resolved.ref === 'object'
+        && (resolved.ref.current === null || resolved.ref.current === undefined)) {
+        resolved.ref.current = {
+          focus: () => refFocus.push('panel'),
+          querySelectorAll: () => [
+            { disabled: true, focus: () => refFocus.push('disabled') },
+            { getAttribute: () => null, focus: () => refFocus.push('focusable') },
+          ],
+        };
+      }
+      return { type, props: resolved, children };
+    },
     useState(initial) {
       const at = index++;
       if (!(at in hooks)) hooks[at] = typeof initial === 'function' ? initial() : initial;
@@ -908,6 +950,7 @@ function makeMountReact() {
   };
   return {
     React,
+    refFocus,
     mount(component, props) {
       index = 0;
       cleanups = [];
@@ -1357,15 +1400,21 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
    * `{status: 404}` for a missing route. Returning `undefined` marks the request as unexpected: it is
    * recorded in `unexpected` (and answered with a 404) instead of throwing, because `callBackup`
    * never throws and a silent catch would turn a wrong route into a green test.
+   *
+   * `options.document` / `options.globals` replace the defaults for the dialog tests: the fake
+   * document's listener registry is how Escape is dispatched, and the legacy clipboard test needs a
+   * document with `execCommand` and a `body`.
    */
-  function mountBackupPage(respond) {
+  function mountBackupPage(respond, options = {}) {
     const requests = [];
     const unexpected = [];
+    const hostDocument = options.document ?? makeFakeDocument();
     const hostFetch = async (url, init = {}) => {
       const method = init.method ?? 'GET';
-      const body = init.body === undefined ? null : JSON.parse(init.body);
+      const rawBody = init.body === undefined ? null : init.body;
+      const body = rawBody === null ? null : JSON.parse(rawBody);
       const answer = respond({ url, method, body });
-      requests.push({ url, method, body });
+      requests.push({ url, method, body, rawBody });
       if (answer === undefined) {
         unexpected.push(method + ' ' + url);
         return { ok: false, status: 404, json: async () => ({ ok: false, reason_code: 'BACKUP_ROUTE_MISSING', detail: 'unexpected in this test' }) };
@@ -1378,12 +1427,12 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
     const mountReact = makeMountReact();
     const registry = makeRegistry();
     const bundle = loadBundle({
-      document: makeFakeDocument(),
+      document: hostDocument,
       requireImpl: (specifier) => {
         if (specifier === 'react') return mountReact.React;
         throw new Error(`unexpected require(${specifier})`);
       },
-      globals: { fetch: hostFetch },
+      globals: { fetch: hostFetch, ...(options.globals ?? {}) },
     });
     bundle.exports.apply({ slots: registry, effect: (callback) => callback(), get: () => undefined });
     const page = registry.registered.find((entry) => entry.options.key === 'w2m-backup');
@@ -1394,6 +1443,8 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
       handle,
       requests,
       unexpected,
+      document: hostDocument,
+      refFocus: mountReact.refFocus,
       settle: async () => {
         await new Promise((resolve) => { setTimeout(resolve, 0); });
         handle.rerender();
@@ -1437,6 +1488,55 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
       totals: { sessions: 3 },
       registry: { ok: true, workspaces: 3, registered: 2, archived: 1, pinned: 0 },
     };
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // v3.5.x unlock dialog
+  // -------------------------------------------------------------------------------------------
+
+  /** A describe payload for a sealed repository whose account matches this machine. */
+  function sealedUnlockDescribe(overrides = {}) {
+    return {
+      ok: true,
+      initialized: true,
+      envelopes: ['machine', 'account', 'password'],
+      encryption: 'sealed',
+      available_paths: ['machine', 'account', 'password'],
+      warning: null,
+      machine_available: true,
+      machine_reason: null,
+      password_required: true,
+      account: { bound: true, matched: true, id_hint: '…abcd' },
+      ...overrides,
+    };
+  }
+
+  /** The ordinary host with the unlock describe replaced (used to drive the dialog's five states). */
+  function unlockDialogHost(unlockOverrides = {}) {
+    const base = standardBackupHost();
+    const describe = sealedUnlockDescribe(unlockOverrides);
+    return (request) => (request.url === '/api/w2m/backup/unlock' && request.method === 'GET' ? describe : base(request));
+  }
+
+  /** Open the dialog from the card trigger and hand back the dialog node. */
+  async function openUnlockDialog(host, currentTarget = null) {
+    await host.settle();
+    const trigger = findBy(host.handle.tree, (node) => node.props?.['data-w2m-backup-unlock-open'] === 'true')[0];
+    assert.ok(trigger !== undefined, 'the unlock card carries a dialog trigger');
+    trigger.props.onClick({ currentTarget });
+    await host.settle();
+    return findBy(host.handle.tree, (node) => node.props?.['data-w2m-backup-unlock-dialog'] !== undefined)[0];
+  }
+
+  /** One dialog node by its stable marker (or undefined when the dialog is closed). */
+  function dialogNode(tree) {
+    return findBy(tree, (node) => node.props?.['data-w2m-backup-unlock-dialog'] !== undefined)[0];
+  }
+
+  /** Every node inside the dialog subtree matching a predicate. */
+  function inDialog(tree, predicate) {
+    const dialog = dialogNode(tree);
+    return dialog === undefined ? [] : findBy(dialog, predicate);
   }
 
   it('takes a sidebar seat after GPW and a main page keyed by the same id', () => {
@@ -1679,6 +1779,322 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
     assert.ok(mismatchText.includes('w2m-backup unlock --check --password-stdin'), 'the CLI command is still named');
     assert.equal(findBy(mismatch, (node) => node.props?.['data-w2m-backup-unlock-password-hint'] !== undefined).length, 1);
     assert.equal(findBy(mismatch, (node) => node.props?.['data-w2m-backup-unlock-weak-pin'] !== undefined).length, 1);
+  });
+
+  it('opens a real modal unlock dialog from the unlock card', async () => {
+    const host = mountBackupPage(unlockDialogHost());
+    try {
+      await host.settle();
+      assert.equal(dialogNode(host.handle.tree), undefined, 'the dialog is closed by default');
+      const dialog = await openUnlockDialog(host);
+      assert.ok(dialog !== undefined, 'clicking the card trigger opens the dialog');
+      assert.ok(host.refFocus.includes('focusable'),
+        'opening the dialog moves focus to its first enabled control');
+      assert.equal(host.refFocus.includes('disabled'), false, 'a disabled control is never the focus target');
+      assert.equal(dialog.props.role, 'dialog', 'the surface is a dialog, not a card');
+      assert.equal(dialog.props['aria-modal'], 'true', 'it is a modal dialog');
+      assert.equal(dialog.props.tabIndex, -1, 'the panel itself is the focus fallback');
+      assert.equal(dialog.props['aria-labelledby'], 'w2m-backup-unlock-dialog-title', 'the title names the dialog');
+      assert.equal(dialog.props['data-w2m-backup-unlock-dialog-state'], 'account-matched', 'the state comes from the describe payload');
+      const title = findBy(dialog, (node) => node.props?.id === 'w2m-backup-unlock-dialog-title')[0];
+      assert.ok(title !== undefined, 'the labelled title element exists');
+      assert.ok(collectText(title).join('').includes('解锁备份仓库'), 'the real Chinese title is rendered');
+      assert.equal(findBy(host.handle.tree, (node) => node.props?.['data-w2m-backup-unlock-overlay'] === 'true').length, 1,
+        'the dialog renders on its own overlay');
+      assert.ok(collectText(dialog).join('\n').includes('当前保护：本机账户与原账户一致'), 'the protection state is spelled out');
+      assert.ok(collectText(dialog).join('\n').includes('解锁只影响本机，不会改动仓库内容。'), 'the subtitle says what unlocking does');
+      assert.equal(inDialog(host.handle.tree, (node) => node.props?.['data-w2m-backup-unlock-option'] === 'local').length, 1,
+        'option A (machine / original account) is rendered');
+      assert.equal(inDialog(host.handle.tree, (node) => node.props?.['data-w2m-backup-unlock-option'] === 'password').length, 1,
+        'option B (terminal password) is rendered');
+      const command = inDialog(host.handle.tree, (node) => node.props?.['data-w2m-backup-unlock-command'] === 'true')[0];
+      assert.equal(collectText(command).join(''), 'w2m-backup unlock --check --password-stdin',
+        'the exact terminal command is shown in a code block');
+      assert.ok(collectText(dialog).join('\n').includes('密码永远不会进入浏览器'), 'the password-never-in-browser notice is rendered');
+      assert.equal(inDialog(host.handle.tree, (node) => node.type === 'input' || node.type === 'textarea').length, 0,
+        'the dialog has no input at all, so a password can never be typed into the browser');
+      assert.equal(inDialog(host.handle.tree, (node) => node.props?.['data-w2m-backup-unlock-copy'] === 'true').length, 1,
+        'option B carries a copy button');
+      assert.equal(inDialog(host.handle.tree, (node) => node.props?.['data-w2m-backup-unlock-refresh'] === 'true').length, 1,
+        'option B carries the refresh button');
+      assert.equal(inDialog(host.handle.tree, (node) => node.props?.['data-w2m-backup-unlock-disable-command'] === 'true').length, 1,
+        'the disable-protection command is copyable text, never an executed action');
+      assert.equal(inDialog(host.handle.tree, (node) => node.type === 'button' && node.props?.['data-w2m-backup-unlock-disable-command'] !== undefined).length, 0,
+        'there is no button that would run disable-protection from the panel');
+    } finally {
+      host.handle.unmount();
+    }
+  });
+
+  it('closes the unlock dialog with Escape and puts focus back on the card trigger', async () => {
+    const host = mountBackupPage(unlockDialogHost());
+    try {
+      await host.settle();
+      const focusCalls = [];
+      const triggerNode = { focus: () => focusCalls.push('trigger') };
+      const dialog = await openUnlockDialog(host, triggerNode);
+      assert.ok(dialog !== undefined, 'the dialog opened');
+      host.document.dispatchEvent({ type: 'keydown', key: 'Escape' });
+      await host.settle();
+      assert.equal(dialogNode(host.handle.tree), undefined, 'Escape closes the dialog');
+      assert.deepEqual(focusCalls, ['trigger'], 'focus goes back to the trigger that opened it');
+    } finally {
+      host.handle.unmount();
+    }
+  });
+
+  it('closes the unlock dialog on a backdrop click but not when the click lands inside it', async () => {
+    const host = mountBackupPage(unlockDialogHost());
+    try {
+      await host.settle();
+      const dialog = await openUnlockDialog(host);
+      let stopped = 0;
+      dialog.props.onClick({ stopPropagation: () => { stopped += 1; } });
+      assert.equal(stopped, 1, 'a click inside the dialog stops at the panel and never reaches the backdrop');
+      const overlay = findBy(host.handle.tree, (node) => node.props?.['data-w2m-backup-unlock-overlay'] === 'true')[0];
+      const inner = dialogNode(host.handle.tree);
+      overlay.props.onClick({ target: inner, currentTarget: overlay });
+      await host.settle();
+      assert.ok(dialogNode(host.handle.tree) !== undefined, 'a bubbled click whose target is not the backdrop does not close it');
+      const overlayNow = findBy(host.handle.tree, (node) => node.props?.['data-w2m-backup-unlock-overlay'] === 'true')[0];
+      overlayNow.props.onClick({ target: overlayNow, currentTarget: overlayNow });
+      await host.settle();
+      assert.equal(dialogNode(host.handle.tree), undefined, 'a click on the backdrop closes the dialog');
+    } finally {
+      host.handle.unmount();
+    }
+  });
+
+  it('moves focus to the first enabled control inside the dialog (focus fallback included)', () => {
+    const { exports } = loadBundle();
+    const calls = [];
+    const panel = {
+      querySelectorAll: () => [
+        { disabled: true, focus: () => calls.push('disabled') },
+        { getAttribute: () => 'true', focus: () => calls.push('aria-disabled') },
+        { getAttribute: () => null, focus: () => calls.push('first-enabled') },
+        { getAttribute: () => null, focus: () => calls.push('second-enabled') },
+      ],
+      focus: () => calls.push('panel'),
+    };
+    assert.equal(exports.focusBackupDialogFirst(panel), true);
+    assert.deepEqual(calls, ['first-enabled'], 'the first enabled, non-aria-disabled control takes focus');
+    calls.length = 0;
+    const fallback = { querySelectorAll: () => [], focus: () => calls.push('panel') };
+    assert.equal(exports.focusBackupDialogFirst(fallback), true);
+    assert.deepEqual(calls, ['panel'], 'an empty dialog focuses the panel itself');
+    assert.equal(exports.focusBackupDialogFirst(null), false, 'a missing panel is a safe false, never an exception');
+  });
+
+  it('maps the unlock describe to the five dialog states and the local-path availability', () => {
+    const { exports } = loadBundle();
+    assert.equal(exports.backupUnlockStateKey(null), 'unknown', 'no describe means unknown');
+    assert.equal(exports.backupUnlockStateKey({ encryption: 'none' }), 'none');
+    assert.equal(exports.backupUnlockStateKey({ encryption: 'sealed', account: { bound: false, matched: null } }), 'unbound');
+    assert.equal(exports.backupUnlockStateKey({ encryption: 'sealed', account: { bound: true, matched: true } }), 'account-matched');
+    assert.equal(exports.backupUnlockStateKey({ encryption: 'sealed', account: { bound: true, matched: false } }), 'account-mismatch');
+    assert.equal(exports.backupUnlockStateKey({ encryption: 'sealed', account: { bound: true, matched: null } }), 'unknown');
+    assert.equal(exports.backupUnlockStateKey({ encryption: 'sealed' }), 'unbound');
+    assert.equal(exports.backupUnlockStateKey({ encryption: 'weird' }), 'unknown', 'an unrecognised mode is never guessed');
+    assert.equal(exports.backupUnlockLocalAvailable(null), false);
+    assert.equal(exports.backupUnlockLocalAvailable({ encryption: 'none' }), true, 'an unencrypted repository needs no credential');
+    assert.equal(exports.backupUnlockLocalAvailable({ encryption: 'sealed', machine_available: true }), true);
+    assert.equal(exports.backupUnlockLocalAvailable({ encryption: 'sealed', machine_available: false, account: { bound: true, matched: true } }), true);
+    assert.equal(exports.backupUnlockLocalAvailable({ encryption: 'sealed', machine_available: false, account: { bound: true, matched: false } }), false);
+    assert.equal(exports.BACKUP_UNLOCK_COMMAND, 'w2m-backup unlock --check --password-stdin');
+    assert.equal(exports.BACKUP_DISABLE_PROTECTION_COMMAND, 'w2m-backup unlock --disable-protection --confirm disable-protection');
+  });
+
+  it('posts exactly {confirm:"unlock"} from the dialog and never sends a password', async () => {
+    const posts = [];
+    const base = unlockDialogHost();
+    const host = mountBackupPage((request) => {
+      if (request.url === '/api/w2m/backup/unlock' && request.method === 'POST') {
+        posts.push(request.body);
+        return {
+          ok: true,
+          via: 'account',
+          encryption: 'sealed',
+          account: { bound: true, matched: true, id_hint: '…abcd' },
+          reason_code: null,
+          detail: null,
+          attempts: [],
+        };
+      }
+      return base(request);
+    });
+    try {
+      assert.ok(await openUnlockDialog(host) !== undefined, 'the dialog opened from the card trigger');
+      const local = inDialog(host.handle.tree, (node) => node.props?.['data-w2m-backup-unlock-dialog-local'] === 'true')[0];
+      assert.ok(local !== undefined, 'option A has its button');
+      assert.equal(local.props.disabled, false, 'the matched machine/account path is available');
+      local.props.onClick();
+      await host.settle();
+      assert.deepEqual(posts, [{ confirm: 'unlock' }], 'the dialog posts the plain confirmation token');
+      assert.deepEqual(Object.keys(posts[0]), ['confirm'], 'no other field travels with it');
+      for (const request of host.requests) {
+        if (request.rawBody === null) continue;
+        assert.equal(/pass(word)?/i.test(String(request.rawBody)), false,
+          `no request body mentions a password (${request.method} ${request.url})`);
+        assert.equal(Object.keys(request.body ?? {}).some((key) => /pass(word)?/i.test(key)), false,
+          `no request field is a password (${request.method} ${request.url})`);
+      }
+      assert.ok(host.text().includes('解锁成功（account）'), 'the dialog reports the success and the path used');
+      assert.ok(dialogNode(host.handle.tree) !== undefined, 'the dialog stays open to show the result');
+      assert.deepEqual(host.unexpected, [], 'every dialog request went to a route the panel knows');
+      // The same dialog on a host where neither the machine nor the account path works: option A is disabled.
+      const blockedHost = mountBackupPage(unlockDialogHost({
+        machine_available: false,
+        account: { bound: true, matched: false, id_hint: '…abcd' },
+      }));
+      try {
+        const blocked = await openUnlockDialog(blockedHost);
+        const blockedLocal = inDialog(blockedHost.handle.tree, (node) => node.props?.['data-w2m-backup-unlock-dialog-local'] === 'true')[0];
+        assert.equal(blockedLocal.props.disabled, true, 'an unavailable machine/account path disables option A');
+        assert.ok(collectText(blocked).join('\n').includes('本机凭据和原账户都不可用'),
+          'the disabled option says why and points at the terminal path');
+      } finally {
+        blockedHost.handle.unmount();
+      }
+    } finally {
+      host.handle.unmount();
+    }
+  });
+
+  it('maps an unlock failure through the reason sentence and keeps the dialog open', async () => {
+    const base = unlockDialogHost();
+    const host = mountBackupPage((request) => {
+      if (request.url === '/api/w2m/backup/unlock' && request.method === 'POST') {
+        return { ok: false, reason_code: 'BACKUP_NO_PERMISSION', detail: 'the credential did not open the repository' };
+      }
+      return base(request);
+    });
+    try {
+      await openUnlockDialog(host);
+      inDialog(host.handle.tree, (node) => node.props?.['data-w2m-backup-unlock-dialog-local'] === 'true')[0].props.onClick();
+      await host.settle();
+      const result = inDialog(host.handle.tree, (node) => node.props?.['data-w2m-backup-unlock-dialog-result'] !== undefined)[0];
+      assert.ok(result !== undefined, 'the failure is rendered inside the dialog');
+      assert.equal(result.props['data-w2m-backup-unlock-dialog-result'], 'err');
+      const text = collectText(result).join('');
+      assert.ok(text.includes('没有权限：请用原账户登录，或输入解锁密码'), 'the stable reason code is translated for the operator');
+      assert.ok(text.includes('the credential did not open the repository'), 'the host detail stays visible');
+      assert.ok(dialogNode(host.handle.tree) !== undefined, 'a failed unlock does not close the dialog');
+    } finally {
+      host.handle.unmount();
+    }
+  });
+
+  it('copies the terminal command and re-reads the describe on refresh', async () => {
+    const writes = [];
+    let unlockReads = 0;
+    const unlockPayload = sealedUnlockDescribe();
+    const base = standardBackupHost();
+    const host = mountBackupPage((request) => {
+      if (request.url === '/api/w2m/backup/unlock' && request.method === 'GET') {
+        unlockReads += 1;
+        return unlockPayload;
+      }
+      return base(request);
+    }, { globals: { navigator: { clipboard: { writeText: async (text) => { writes.push(text); } } } } });
+    try {
+      assert.ok(await openUnlockDialog(host) !== undefined, 'the dialog opened');
+      assert.ok(unlockReads >= 1, 'mounting the panel reads the unlock describe');
+      const readsBefore = unlockReads;
+      inDialog(host.handle.tree, (node) => node.props?.['data-w2m-backup-unlock-copy'] === 'true')[0].props.onClick();
+      await host.settle();
+      assert.deepEqual(writes, ['w2m-backup unlock --check --password-stdin'], 'the clipboard receives the exact command');
+      const copied = inDialog(host.handle.tree, (node) => node.props?.['data-w2m-backup-unlock-copy'] === 'true')[0];
+      assert.equal(copied.props['data-copied'], 'true', 'the copied state is visible');
+      assert.ok(collectText(copied).join('').includes('已复制'), 'the label changes to the copied copy');
+      // The host now reports another account; the refresh must re-read and re-render the state.
+      unlockPayload.machine_available = false;
+      unlockPayload.account = { bound: true, matched: false, id_hint: '…abcd' };
+      const runReadsBefore = host.requests.filter((request) => request.url === '/api/w2m/backup/run' && request.method === 'GET').length;
+      inDialog(host.handle.tree, (node) => node.props?.['data-w2m-backup-unlock-refresh'] === 'true')[0].props.onClick();
+      await host.settle();
+      assert.equal(unlockReads, readsBefore + 1, 'the refresh re-reads GET /unlock once');
+      assert.ok(host.requests.filter((request) => request.url === '/api/w2m/backup/run' && request.method === 'GET').length > runReadsBefore,
+        'the refresh also re-reads the status');
+      const stateLabel = inDialog(host.handle.tree, (node) => node.props?.['data-w2m-backup-unlock-dialog-state-label'] !== undefined)[0];
+      assert.equal(stateLabel.props['data-w2m-backup-unlock-dialog-state-label'], 'account-mismatch',
+        'the refreshed describe re-renders the protection state');
+      assert.ok(dialogNode(host.handle.tree) !== undefined, 'refreshing keeps the dialog open');
+    } finally {
+      host.handle.unmount();
+    }
+  });
+
+  it('falls back to document.execCommand when the clipboard is unavailable', async () => {
+    let copyCalls = 0;
+    let appended = 0;
+    const legacyDocument = Object.assign(makeFakeDocument(), {
+      body: { appendChild: () => { appended += 1; }, removeChild: () => {} },
+      execCommand: (command) => { copyCalls += 1; return command === 'copy'; },
+    });
+    const host = mountBackupPage(unlockDialogHost(), { document: legacyDocument });
+    try {
+      await openUnlockDialog(host);
+      inDialog(host.handle.tree, (node) => node.props?.['data-w2m-backup-unlock-copy'] === 'true')[0].props.onClick();
+      await host.settle();
+      assert.equal(copyCalls, 1, 'the legacy copy path ran exactly once');
+      assert.equal(appended, 1, 'a textarea was attached for execCommand');
+      const copied = inDialog(host.handle.tree, (node) => node.props?.['data-w2m-backup-unlock-copy'] === 'true')[0];
+      assert.equal(copied.props['data-copied'], 'true', 'the fallback path reports the copy');
+    } finally {
+      host.handle.unmount();
+    }
+  });
+
+  it('registers the unlock-dialog strings in both dictionaries', () => {
+    const { exports } = loadBundle();
+    const registry = makeRegistry();
+    const locale = makeLocale();
+    const ctx = makeStrictContext({ inject: [...exports.inject], services: { slots: registry, locale } });
+    exports.apply(ctx);
+    const dictionary = locale.registered.get('w2m.target');
+    assert.ok(dictionary !== undefined, 'the dictionaries reach the locale service');
+    const keys = [
+      'panel.backup.unlock.dialog.open',
+      'panel.backup.unlock.dialog.title',
+      'panel.backup.unlock.dialog.subtitle',
+      'panel.backup.unlock.dialog.state.none',
+      'panel.backup.unlock.dialog.state.accountMatched',
+      'panel.backup.unlock.dialog.state.accountMismatch',
+      'panel.backup.unlock.dialog.state.unbound',
+      'panel.backup.unlock.dialog.state.unknown',
+      'panel.backup.unlock.dialog.optionA',
+      'panel.backup.unlock.dialog.optionAHint',
+      'panel.backup.unlock.dialog.localUnavailable',
+      'panel.backup.unlock.dialog.optionB',
+      'panel.backup.unlock.dialog.optionBHint',
+      'panel.backup.unlock.dialog.noPasswordNeeded',
+      'panel.backup.unlock.dialog.commandCaption',
+      'panel.backup.unlock.dialog.copy',
+      'panel.backup.unlock.dialog.copied',
+      'panel.backup.unlock.dialog.refresh',
+      'panel.backup.unlock.dialog.refreshing',
+      'panel.backup.unlock.dialog.close',
+      'panel.backup.unlock.dialog.busy',
+      'panel.backup.unlock.dialog.failed',
+      'panel.backup.unlock.dialog.success',
+      'panel.backup.unlock.dialog.passwordNeverInBrowser',
+      'panel.backup.unlock.dialog.disableProtection',
+    ];
+    for (const key of keys) {
+      assert.equal(typeof dictionary.zh[key], 'string', `the zh dictionary has ${key}`);
+      assert.equal(typeof dictionary.en[key], 'string', `the en dictionary has ${key}`);
+      assert.notEqual(dictionary.zh[key].trim(), '', `the zh value for ${key} is not empty`);
+      assert.notEqual(dictionary.en[key].trim(), '', `the en value for ${key} is not empty`);
+    }
+    assert.equal(dictionary.zh['panel.backup.unlock.dialog.open'], '解锁…', 'Chinese is the default');
+    assert.equal(dictionary.zh['panel.backup.unlock.dialog.title'], '解锁备份仓库');
+    assert.ok(dictionary.zh['panel.backup.unlock.dialog.passwordNeverInBrowser'].includes('浏览器'),
+      'the notice says the password never enters the browser');
+    assert.ok(dictionary.zh['panel.backup.unlock.dialog.optionBHint'].includes('终端'),
+      'option B says the password is typed in a terminal');
+    assert.notEqual(dictionary.zh['panel.backup.unlock.dialog.copy'], dictionary.en['panel.backup.unlock.dialog.copy'],
+      'the copy label is translated, not copied');
   });
 
   it('never carries a password into a request body (the section posts confirmation tokens only)', () => {
