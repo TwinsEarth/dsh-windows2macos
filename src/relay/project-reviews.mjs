@@ -6,7 +6,7 @@
  * status follows from those records. That is what lets a merge gate ask "does this exact patch sha have an approval?" and get
  * an answer that cannot be edited afterwards.
  *
- * Rules (docs/COLLAB/M5-MULTI-CLIENT-PRIMITIVES.md 搂3):
+ * Rules (docs/COLLAB/M5-MULTI-CLIENT-PRIMITIVES.md §3):
  *  - only maintainer/owner may be a reviewer, and only the listed reviewers may decide;
  *  - nobody reviews their own request (an owner may override, and the override is recorded);
  *  - a reviewer may not record the same verdict twice; a second approve on the same review is a refusal, not a no-op;
@@ -217,7 +217,7 @@ export function createProjectReviews({ now = () => Date.now(), onEvent = null, i
         .filter((review) => review.project_id === projectId && (status === null || review.status === status))
         .map((review) => ({ review_id: review.review_id, target: review.target, status: review.status, approvals: approvalsOf(review), required_approvals: review.required_approvals, created_at: review.created_at, due_at: review.due_at }));
     },
-    /** Merge gate (搂3.2): is this exact patch sha approved by a review on this project? */
+    /** Merge gate (§3.2): is this exact patch sha approved by a review on this project? */
     approvedFor({ projectId, sha256 }) {
       expireDue();
       const approved = [...reviews.values()].find((review) => review.project_id === projectId && review.status === 'approved' && review.target.sha256 === sha256);

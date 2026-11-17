@@ -1,5 +1,5 @@
 /**
- * Cluster domain (Phase 2) unit tests 鈥?chat + project pull, without the real store modules.
+ * Cluster domain (Phase 2) unit tests — chat + project pull, without the real store modules.
  *
  * The transport (signed GET, encrypted+gzip envelope, cursor/offset) is exercised end to end between
  * two in-process ClusterSync instances; the chat store and project source are deterministic fakes so

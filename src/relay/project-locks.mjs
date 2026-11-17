@@ -5,7 +5,7 @@
  * disagree about *who is editing what* before they disagree about merge conflicts, and so a crashed client's claim expires
  * instead of blocking the project forever.
  *
- * Rules (docs/COLLAB/M5-MULTI-CLIENT-PRIMITIVES.md 搂2):
+ * Rules (docs/COLLAB/M5-MULTI-CLIENT-PRIMITIVES.md §2):
  *  - one exclusive holder per (project, branch) or (project, path);
  *  - a lock has a lease and is renewed by its holder; an expired lock does not block a newcomer (it is released as it is taken,
  *    and both the expiry and the new acquisition are events);
@@ -208,7 +208,7 @@ export function createProjectLocks({ now = () => Date.now(), defaultLeaseMs = DE
         .filter((lock) => lock.projectId === projectId && lock.state === 'held')
         .map((lock) => describe(lock));
     },
-    /** Would a write to this branch / these paths collide with someone else's claim? Used by the merge preflight (搂2.3). */
+    /** Would a write to this branch / these paths collide with someone else's claim? Used by the merge preflight (§2.3). */
     conflicts({ projectId, branch = null, paths = [] }) {
       expireDue();
       const result = [];

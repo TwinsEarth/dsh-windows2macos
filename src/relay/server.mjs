@@ -3,11 +3,11 @@ import { CLUSTER_ROUTES, createClusterSync } from './cluster-sync.mjs';
 import { createChatStore } from './chat-store.mjs';
 import { exportProjectState, mergeProjectState } from './project-sync.mjs';
 /**
- * W2M Rabbit relay 鈥?node:http / node:https server.
+ * W2M Rabbit relay — node:http / node:https server.
  *
- * PROTOCOL.md 搂1 endpoints, 搂3 SSE, 搂7 errors
- * PROTOCOL-v0.1.2.md 搂3 deployment params, 搂4 /healthz, 搂5 operator token,
- *                     搂6 pair rate limit, 搂7 persistence, 搂8 SSE hardening.
+ * PROTOCOL.md §1 endpoints, §3 SSE, §7 errors
+ * PROTOCOL-v0.1.2.md §3 deployment params, §4 /healthz, §5 operator token,
+ *                     §6 pair rate limit, §7 persistence, §8 SSE hardening.
  *
  * Zero third-party dependencies: only `node:` builtins.
  */
@@ -90,7 +90,7 @@ import { Persistence } from './persistence.mjs';
 import { PeerRegistry } from './peers.mjs';
 import { aggregateTask, buildReport, taskProgress } from './report.mjs';
 import { renderMetrics, METRICS_CONTENT_TYPE } from './metrics.mjs';
-// v0.3.0 搂9: request signing. This import is the entire point of the module --
+// v0.3.0 §9: request signing. This import is the entire point of the module --
 // until the HTTP layer calls it, HMAC support does not exist for any real request.
 import { DEFAULT_SKEW_SECONDS, NonceCache, verifyRequest } from '../signing.mjs';
 // v0.7.11: per-device Ed25519 verification, tried before the shared secret.
@@ -99,9 +99,9 @@ import {
   verifyDeviceSignature,
 } from '../chatops/device-signing.mjs';
 
-export const DEFAULT_SSE_KEEPALIVE_MS = 15_000; // 搂3.2: every 15s a `: keepalive` line
+export const DEFAULT_SSE_KEEPALIVE_MS = 15_000; // §3.2: every 15s a `: keepalive` line
 export const DEFAULT_SWEEP_INTERVAL_MS = 1_000;
-export const DEFAULT_PAIR_RATE_LIMIT_PER_MINUTE = 5; // v0.1.2 搂6
+export const DEFAULT_PAIR_RATE_LIMIT_PER_MINUTE = 5; // v0.1.2 §6
 // The window length is a unit and lives with the limiter. Both names are kept: `DEFAULT_WINDOW_MS` is the
 // local binding this module uses, and `RATE_LIMIT_WINDOW_MS` is the name this module has always exported.
 // `export ... from` would NOT have worked here -- it re-exports without creating a local binding, so the
@@ -116,7 +116,7 @@ export const DEFAULT_STATE_DIR = path.join(os.homedir(), '.w2m');
  *
  * The value is printed **once, on the start that generated it**, because that is the only moment at
  * which it exists nowhere else yet; every other start has `<state>/operator-token.txt` to read it
- * from, and a relay's stdout ends up in journald, a container log or a CI transcript 鈥?where a
+ * from, and a relay's stdout ends up in journald, a container log or a CI transcript — where a
  * credential that authorises dispatching to the whole fleet does not belong. `W2M_PRINT_OPERATOR_TOKEN=1`
  * (or `printOperatorToken: true`, which is the same switch for an embedder) restores the old
  * behaviour for an operator who genuinely needs it in the log, and says so in the banner when it does.
@@ -140,7 +140,7 @@ export function printOperatorTokenOptIn(options = {}) {
 /* helpers                                                             */
 /* ------------------------------------------------------------------ */
 
-/** v0.1.2 搂3: `/w2m/` 鈫?`/w2m`; '' / '/' 鈫?'/'. Never returns a trailing slash. */
+/** v0.1.2 §3: `/w2m/` → `/w2m`; '' / '/' → '/'. Never returns a trailing slash. */
 export function normalizeBasePath(value) {
   if (value === undefined || value === null || value === '') return '/';
   let p = String(value).trim();
@@ -170,8 +170,8 @@ function sendJson(res, status, body, extraHeaders = {}) {
 function sendError(res, err) {
   if (err instanceof ProtocolError) {
     const body = err.toBody();
-    // 搂6 just says the 429 "carries retry_after_seconds" without pinning the
-    // location, so it is emitted both inside error.detail (the 搂7 shape) and as a
+    // §6 just says the 429 "carries retry_after_seconds" without pinning the
+    // location, so it is emitted both inside error.detail (the §7 shape) and as a
     // top-level convenience field. Both are additive.
     const retryAfter = err.detail?.retry_after_seconds;
     if (typeof retryAfter === 'number') body.retry_after_seconds = retryAfter;
@@ -253,7 +253,7 @@ function readBody(req, limit) {
 /**
  * Read the raw body bytes with a hard byte cap.
  *
- * v0.3.0 搂9: the body is read exactly ONCE per request and the bytes are kept,
+ * v0.3.0 §9: the body is read exactly ONCE per request and the bytes are kept,
  * because an HMAC covers the exact received octets -- re-serialising parsed JSON
  * would produce different bytes (key order, whitespace) and break every signature.
  */
@@ -288,7 +288,7 @@ function methodHasBody(method) {
 }
 
 /* ------------------------------------------------------------------ */
-/* request signing (v0.3.0 搂9)                                         */
+/* request signing (v0.3.0 §9)                                         */
 /* ------------------------------------------------------------------ */
 
 /**
@@ -296,11 +296,11 @@ function methodHasBody(method) {
  * about it, because "signature mismatch" without a direction is a support ticket.
  */
 const SIGNATURE_HINTS = Object.freeze({
-  SIGNATURE_REQUIRED: 'this relay runs with --require-signature; sign the request (PROTOCOL-v0.3.0.md 搂9)',
+  SIGNATURE_REQUIRED: 'this relay runs with --require-signature; sign the request (PROTOCOL-v0.3.0.md §9)',
   SIGNATURE_INCOMPLETE: 'all three of X-W2M-Signature, X-W2M-Timestamp and X-W2M-Nonce must be present together',
-  SIGNATURE_MISMATCH: 'the signature matches no configured secret 鈥?check for a stale or half-rotated secret',
-  SIGNATURE_EXPIRED: 'the timestamp is outside the accepted clock-skew window 鈥?check the sending machine clock',
-  SIGNATURE_REPLAY: 'this nonce was already used 鈥?generate a fresh nonce for every request',
+  SIGNATURE_MISMATCH: 'the signature matches no configured secret — check for a stale or half-rotated secret',
+  SIGNATURE_EXPIRED: 'the timestamp is outside the accepted clock-skew window — check the sending machine clock',
+  SIGNATURE_REPLAY: 'this nonce was already used — generate a fresh nonce for every request',
   SIGNATURE_BAD_TIMESTAMP: 'X-W2M-Timestamp must be whole unix seconds',
   SIGNATURE_BAD_NONCE: 'X-W2M-Nonce must be at least 8 characters',
   SIGNING_NOT_CONFIGURED:
@@ -310,7 +310,7 @@ const SIGNATURE_HINTS = Object.freeze({
 
 const SIGNATURE_PROTOCOL_CODES = new Set(Object.keys(SIGNATURE_HINTS));
 
-/** Turn a `verifyRequest` rejection into the 搂7 error envelope.
+/** Turn a `verifyRequest` rejection into the §7 error envelope.
  *  `ProtocolError` resolves the HTTP status from `ERROR_STATUS`, so the mapping
  *  table lives in exactly one place (state.mjs) instead of being duplicated here. */
 function signatureError(decision) {
@@ -340,7 +340,7 @@ function readSecretValue(value, label) {
 }
 
 /* ------------------------------------------------------------------ */
-/* pair rate limiting (v0.1.2 搂6)                                      */
+/* pair rate limiting (v0.1.2 §6)                                      */
 /* ------------------------------------------------------------------ */
 
 /**
@@ -375,7 +375,7 @@ export class RelayServer {
     this.pairRateLimitPerMinute = Number.isFinite(options.pairRateLimitPerMinute)
       ? options.pairRateLimitPerMinute : DEFAULT_PAIR_RATE_LIMIT_PER_MINUTE;
 
-    // 搂3: `logger: null` silences. The default writes to STDERR on purpose 鈥?
+    // §3: `logger: null` silences. The default writes to STDERR on purpose —
     // stdout belongs to protocol output (e.g. the CLI's `--json` line), and mixing
     // prose into it breaks `| ConvertFrom-Json` / `| jq`.
     this.logger = options.logger === undefined
@@ -383,7 +383,7 @@ export class RelayServer {
       : options.logger;
     this.startupMessages = [];
 
-    /* ---- persistence (搂7) ---- */
+    /* ---- persistence (§7) ---- */
     const rawStateDir = options.stateDir ?? (typeof options.state === 'string' ? options.state : null);
     const persistEnabled = options.persist !== false && rawStateDir !== '';
     const stateDir = persistEnabled
@@ -457,7 +457,7 @@ export class RelayServer {
     }
     this.fleetMessages ??= createFleetMessages({ now: () => this.state.nowMs() });
 
-    /* ---- startup recovery (搂7) ---- */
+    /* ---- startup recovery (§7) ---- */
     if (this.persistence.enabled) {
       const snapshot = this.persistence.loadDevices();
       this.persistence.devicesMissing = snapshot.missing;
@@ -508,10 +508,10 @@ export class RelayServer {
       }
     }
 
-    /* ---- operator token (搂5) ---- */
+    /* ---- operator token (§5) ---- */
     this._initOperatorToken(options);
 
-    /* ---- v0.3.0 搂9 request signing ---- */
+    /* ---- v0.3.0 §9 request signing ---- */
     this.signingSecrets = [
       readSecretValue(options.signingSecret, 'signingSecret'),
       readSecretValue(options.signingSecretPrevious, 'signingSecretPrevious'),
@@ -535,7 +535,7 @@ export class RelayServer {
     });
     this.nonceRetentionMs = options.nonceCacheRetentionMs ?? 10 * 60_000;
 
-    /* ---- /v1/pair rate limit (搂6) ---- */
+    /* ---- /v1/pair rate limit (§6) ---- */
     this.pairLimiter = new SlidingWindowRateLimiter({
       limit: this.pairRateLimitPerMinute,
       windowMs: DEFAULT_WINDOW_MS,
@@ -573,7 +573,7 @@ export class RelayServer {
     }
 
     // v0.1.2 BUG-1: an externally supplied code must be REGISTERED, not merely
-    // assigned 鈥?otherwise the banner advertises a code /v1/pair does not know.
+    // assigned — otherwise the banner advertises a code /v1/pair does not know.
     this.pairingCode = typeof options.pairingCode === 'string' && options.pairingCode.trim() !== ''
       ? this.state.registerPairingCode(options.pairingCode, { ttlMs: options.pairingCodeTtlMs })
       : this.state.createPairingCode();
@@ -591,7 +591,7 @@ export class RelayServer {
 
   /**
    * Diagnostics sink. `logger: null` is the documented "silent" value, and a
-   * caller-supplied logger may throw 鈥?neither may break a request. (A direct
+   * caller-supplied logger may throw — neither may break a request. (A direct
    * `this.logger(...)` call after `res.writeHead()` once threw a TypeError that
    * surfaced as "Cannot write headers after they are sent to the client".)
    */
@@ -700,7 +700,7 @@ export class RelayServer {
   /**
    * Last-resort error path for a request whose handler rejected.
    * Once the status line is on the wire (SSE, streamed report) the response can no
-   * longer be rewritten 鈥?the only honest action is to end the stream, loudly.
+   * longer be rewritten — the only honest action is to end the stream, loudly.
    */
   reportError(req, res, err) {
     if (res.headersSent) {
@@ -737,7 +737,7 @@ export class RelayServer {
       this.operatorTokenSource = 'option';
       this.persistence.writeOperatorToken(explicit);
     } else if (persisted) {
-      // 搂5.1 + 搂7: keep the token stable across restarts, otherwise every restart
+      // §5.1 + §7: keep the token stable across restarts, otherwise every restart
       // would silently invalidate the plugin's configured operatorToken.
       this.operatorToken = persisted;
       this.operatorTokenSource = 'restored';
@@ -760,7 +760,7 @@ export class RelayServer {
     m.push(`[w2m-rabbit] base_path=${this.basePath}${this.basePath === '/' ? ' (root)' : ''}`);
     m.push(`[w2m-rabbit] trust_proxy=${this.trustProxy}${this.trustProxy ? '' : ' (X-Forwarded-* ignored)'}`);
     m.push(`[w2m-rabbit] pair_rate_limit=${this.pairRateLimitPerMinute === 0 ? 'disabled' : `${this.pairRateLimitPerMinute}/min/IP`}`);
-    // 搂9: report the posture, never the material.
+    // §9: report the posture, never the material.
     if (this.signingConfigured) {
       m.push(`[w2m-rabbit] request signing=ON (${this.signingSecrets.length} secret(s)`
         + `${this.signingSecrets.length > 1 ? ', rotation active' : ''})`
@@ -788,22 +788,22 @@ export class RelayServer {
       m.push('[w2m-rabbit] cluster sync=off (single relay; set --cluster-peers/--cluster-secret to enable)');
     }
     if (this.persistence.devicesCorrupt) {
-      m.push('[w2m-rabbit] !! WARNING: devices.json was CORRUPT 鈥?started from an EMPTY device table; '
+      m.push('[w2m-rabbit] !! WARNING: devices.json was CORRUPT — started from an EMPTY device table; '
         + 'every machine must pair again. The damaged file was left untouched.');
     }
     for (const w of this.persistence.warnings) {
       m.push(`[w2m-rabbit] !! ${w.file}: ${w.message}`);
     }
     if (this.operatorTokenRequired) {
-      // MEDIUM-6: the token is material, not posture, so it is printed as rarely as it can be 鈥?on the
+      // MEDIUM-6: the token is material, not posture, so it is printed as rarely as it can be — on the
       // start that generated it (`operatorTokenSource === 'generated'`) or when `printOperatorToken` /
-      // `W2M_PRINT_OPERATOR_TOKEN=1` asked for it 鈥?and once, never twice. Where it is stored is said in
+      // `W2M_PRINT_OPERATOR_TOKEN=1` asked for it — and once, never twice. Where it is stored is said in
       // every case, including the case where there is nowhere to store it.
       //
       // DELIBERATE, do not "fix": on that one start the CLI prints the value a second time, in its own
-      // stdout banner. Two sinks for one start is not a leak 鈥?the defect was printing it on *every*
-      // start, restored ones included 鈥?and the box is the documented first-start handoff a human reads
-      // (docs/DEPLOY.md 搂2.4, test/crossnetwork.test.mjs). Collapsing the pair would trade a documented
+      // stdout banner. Two sinks for one start is not a leak — the defect was printing it on *every*
+      // start, restored ones included — and the box is the documented first-start handoff a human reads
+      // (docs/DEPLOY.md §2.4, test/crossnetwork.test.mjs). Collapsing the pair would trade a documented
       // behaviour for one saved line on one start.
       const tokenFile = this.persistence.operatorTokenFile ?? null;
       const stored = tokenFile === null
@@ -847,7 +847,7 @@ export class RelayServer {
           this.maintenance();
         }, this.sweepIntervalMs);
         this._sweepTimer.unref?.();
-        // v3.0.0: the first peer pull is scheduled 60鈥?00 s from now (random), never at listen time 鈥?
+        // v3.0.0: the first peer pull is scheduled 60–600 s from now (random), never at listen time —
         // a rolling restart of three relays must not make them all pull at the same instant.
         this.cluster?.start();
         if (this.logger) {
@@ -892,7 +892,7 @@ export class RelayServer {
     });
   }
 
-  /* ---------------- proxy awareness (v0.1.2 搂3) ---------------- */
+  /* ---------------- proxy awareness (v0.1.2 §3) ---------------- */
 
   /** `X-Forwarded-For` first hop is honoured ONLY under `trustProxy`. */
   clientIp(req) {
@@ -924,7 +924,7 @@ export class RelayServer {
     const rawPath = url.pathname;
     const method = (req.method ?? 'GET').toUpperCase();
 
-    // 搂3: strip the deployment prefix, then route. `/healthz` also answers at the
+    // §3: strip the deployment prefix, then route. `/healthz` also answers at the
     // root because health checks are usually pointed straight at the container.
     // `stripped` keeps the literal request path (no trailing-slash normalisation)
     // because that is what a signature covers; `path` is the normalised route key.
@@ -944,8 +944,8 @@ export class RelayServer {
       });
     }
     const path = normalizePath(stripped);
-    // B3/V12锛歜asePath 鍓ョ涓?URL 瑙勮寖鍖栦箣鍚庣珛鍗虫嫆缁濇暟鎹潰 blob 璺敱锛?
-    // 瑕嗙洊 `..`銆乣%2e%2e`銆乥asePath 鍓嶇紑绛夊彉褰紱鍦ㄨ鍙?body 涔嬪墠杩斿洖銆?
+    // B3/V12：basePath 剥离与 URL 规范化之后立即拒绝数据面 blob 路由，
+    // 覆盖 `..`、`%2e%2e`、basePath 前缀等变形；在读取 body 之前返回。
     // Percent-encoded dot segments are not resolved by WHATWG URL, so the gate resolves them itself:
     const gatePath = (() => {
       try { return normalizePath(new URL(decodeURIComponent(path), 'http://gate.invalid').pathname); } catch { return path; }
@@ -957,7 +957,7 @@ export class RelayServer {
     }
     const signedPath = `${stripped}${url.search}`;
 
-    // v0.3.0 搂9: read the body ONCE, before routing. An HMAC covers the exact
+    // v0.3.0 §9: read the body ONCE, before routing. An HMAC covers the exact
     // received bytes, so no route may consume the stream first and re-serialise.
     /** v1.2.7: only the blob channel gets the larger frame cap; every JSON route keeps the 64 KiB frame limit. */
     const blobFrameLimit = method === 'PUT' && path.startsWith('/v1/fleet/blobs/') ? BLOB_FRAME_BYTES : this.frameLimitBytes;
@@ -979,7 +979,7 @@ export class RelayServer {
       const result = this.state.pair(takeJson());
       return sendJson(res, 200, result);
     }
-    /* ---- v3.0.0: relay cluster sync (peer-only, cluster HMAC 鈥?never a device/operator token) ---- */
+    /* ---- v3.0.0: relay cluster sync (peer-only, cluster HMAC — never a device/operator token) ---- */
     if (CLUSTER_ROUTES.includes(path)) {
       if (this.cluster === null) {
         throw new ProtocolError('NOT_FOUND', 'cluster sync is not enabled on this relay', { hint: 'start the relay with --cluster-peers and --cluster-secret' });
@@ -991,7 +991,7 @@ export class RelayServer {
         query: url.searchParams,
         ip: this.clientIp(req),
       });
-      // Snapshots are pre-encoded (gzip) by cluster-sync: device caps and ledger JSON compress ~5鈥?0x,
+      // Snapshots are pre-encoded (gzip) by cluster-sync: device caps and ledger JSON compress ~5–10x,
       // and the uncompressed response was large enough to time out on slower relay-to-relay links.
       if (routed.raw !== undefined) {
         res.writeHead(routed.status, {
@@ -1022,7 +1022,7 @@ export class RelayServer {
       });
     }
     /**
-     * v1.2.5: a role is an operator decision, so this route sits with dispatch 鈥?before the device gate, where an operator
+     * v1.2.5: a role is an operator decision, so this route sits with dispatch — before the device gate, where an operator
      * token is accepted.
      */
     const memberMatch = path.match(/^\/v1\/fleet\/members\/([^/]+)$/);
@@ -1066,7 +1066,7 @@ export class RelayServer {
       });
       return res.end(body);
     }
-    // 搂5: dispatching tasks needs the operator token, not a device token.
+    // §5: dispatching tasks needs the operator token, not a device token.
     if (method === 'POST' && path === '/v1/task') {
       const principal = this.authorizeTaskDispatch(req);
       this.enforceSignature(req, { method, signedPath, body: rawBody });
@@ -1457,7 +1457,7 @@ export class RelayServer {
     }
 
 
-    // v0.3.0 搂9: writes are always checked (tolerating unsigned unless required);
+    // v0.3.0 §9: writes are always checked (tolerating unsigned unless required);
     // reads are only checked when the relay was explicitly told to require
     // signatures. See `enforceSignature` for the reasoning.
     this.enforceSignature(req, { method, signedPath, body: rawBody });
@@ -1519,7 +1519,7 @@ export class RelayServer {
     }
     if (method === 'POST' && path === '/v1/result') {
       const body = takeJson();
-      // B1 鏂规 A锛歸indow 妯″紡鎺ユ敹鏃т俊灏侊紙鍚?argv/head锛夊苟鎶曞奖鍚庡瓨鍌紱enforce 鎵嶇‖鎷掋€?
+      // B1 方案 A：window 模式接收旧信封（含 argv/head）并投影后存储；enforce 才硬拒。
     const dataPlaneGuardMode = String(process.env.W2M_DATA_PLANE_GUARD ?? 'window');
     // decision 5: enforce is not allowed. The flag is read and reported, but never changes behaviour.
     if (dataPlaneGuardMode === 'enforce' && this.allowDataPlaneGuardEnforce === true) {
@@ -1907,7 +1907,7 @@ export class RelayServer {
     throw new ProtocolError('NOT_FOUND', `no route for ${method} ${path}`, { method, path });
   }
 
-  /** 搂4: the operations answer 鈥?"is the relay there, did it restart, are my machines connected". */
+  /** §4: the operations answer — "is the relay there, did it restart, are my machines connected". */
   healthBody(req) {
     return {
       ...this.state.stats(),
@@ -1943,7 +1943,7 @@ export class RelayServer {
       // v0.3.0: fleet-wide latency. Every numeric field is null (never 0) when no
       // machine has reported a FRESH measurement.
       rtt: this.state.rttSummary(),
-      // v0.3.0 搂9: signature status only 鈥?never the secret, not even a prefix.
+      // v0.3.0 §9: signature status only — never the secret, not even a prefix.
       signing: {
         configured: this.signingConfigured,
         required: this.requireSignature,
@@ -1954,12 +1954,12 @@ export class RelayServer {
     };
   }
 
-  /* ---------------- request signing (v0.3.0 搂9) ---------------- */
+  /* ---------------- request signing (v0.3.0 §9) ---------------- */
 
   /**
    * Should this request be signature-checked at all?
    *
-   * RULING (see PROTOCOL-v0.3.0.md 搂9.4): every WRITE is checked; READS are
+   * RULING (see PROTOCOL-v0.3.0.md §9.4): every WRITE is checked; READS are
    * checked only when `--require-signature` is on.
    *
    * Reads are not checked in the default modes because unsigned reads are
@@ -1975,7 +1975,7 @@ export class RelayServer {
     return !isRead;
   }
 
-  /** Run `verifyRequest` and throw the mapped 搂7 error on rejection. */
+  /** Run `verifyRequest` and throw the mapped §7 error on rejection. */
   enforceSignature(req, { method, signedPath, body }) {
     if (!this.shouldCheckSignature(method)) return { skipped: true };
     const decision = this.verifySignature(req, { method, signedPath, body });
@@ -2003,7 +2003,7 @@ export class RelayServer {
    * fall back to the weaker mechanism by accident.
    *
    * **2. HMAC over a shared secret, otherwise.** Every device that paired before v0.7.10 arrives
-   * here 鈥?which is every device today 鈥?and nothing about its behaviour changes.
+   * here — which is every device today — and nothing about its behaviour changes.
    *
    * ## Why this converges with no second deployment
    *
@@ -2011,7 +2011,7 @@ export class RelayServer {
    * mechanism 2 answers exactly as before. A device that *has* been updated sends a signature, its
    * public key is on file from pairing, and it is verified with it. So a fleet updates one machine
    * at a time and each machine gets the strongest mechanism available **to it** the moment it
-   * starts sending one 鈥?no flag, no rollout step, no coordination.
+   * starts sending one — no flag, no rollout step, no coordination.
    *
    * ## What this deliberately does not do
    *
@@ -2039,8 +2039,8 @@ export class RelayServer {
   /**
    * Try the per-device Ed25519 path.
    *
-   * Returns `null` when the mechanism does not apply 鈥?no signature presented, or the signing
-   * machine is not a device whose public key we hold 鈥?so the caller falls through. Returns a
+   * Returns `null` when the mechanism does not apply — no signature presented, or the signing
+   * machine is not a device whose public key we hold — so the caller falls through. Returns a
    * decision when it *does* apply, **including when it fails**: a device that registered a key and
    * then presented a bad signature must not get a second chance through the shared secret, since
    * that would make the stronger mechanism optional for anyone able to produce a malformed one.
@@ -2074,7 +2074,7 @@ export class RelayServer {
    * Which machine a request claims to be, from either credential.
    *
    * An **operator token is not a machine**, so it resolves to `null` and the device path does not
-   * apply 鈥?consistent with `authorizeTaskDispatch`, which reports `machine_id: null` for an
+   * apply — consistent with `authorizeTaskDispatch`, which reports `machine_id: null` for an
    * operator. That is why an operator-token request keeps using the shared secret.
    */
   machineIdForRequest(req) {
@@ -2091,7 +2091,7 @@ export class RelayServer {
      * v0.9.1: presence expiry, alongside lease expiry.
      *
      * `this.sweep()` writes off lease *holds*; this writes off *presence*. They were conflated, so a
-     * machine that stopped existing was only ever noticed when its SSE stream detached 鈥?and a
+     * machine that stopped existing was only ever noticed when its SSE stream detached — and a
      * half-open stream never detaches.
      */
     const silent = this.state.sweepSilentDevices();
@@ -2108,7 +2108,7 @@ export class RelayServer {
 
   /* ---------------- auth helpers ---------------- */
 
-  /** 搂6: every /v1/pair attempt counts, success included. */
+  /** §6: every /v1/pair attempt counts, success included. */
   enforcePairRateLimit(req) {
     if (this.pairRateLimitPerMinute <= 0) return;
     const ip = this.clientIp(req);
@@ -2129,7 +2129,7 @@ export class RelayServer {
   }
 
   /**
-   * 搂5: `POST /v1/task` needs the operator token.
+   * §5: `POST /v1/task` needs the operator token.
    *  - required (default): operator token, else 401 OPERATOR_REQUIRED
    *  - disabled (`--operator-token ''`): falls back to v1 semantics, i.e. a paired device token
    */
@@ -2150,7 +2150,7 @@ export class RelayServer {
         throw new ProtocolError(
           'OPERATOR_REQUIRED',
           asDevice
-            ? 'this is a device_token (machine credentials); dispatching tasks requires the operator_token 鈥?'
+            ? 'this is a device_token (machine credentials); dispatching tasks requires the operator_token — '
               + 'they are two different credentials'
             : 'invalid operator token: it does not match the relay operator token',
           {
@@ -2173,7 +2173,7 @@ export class RelayServer {
     return { role: 'device', machine_id: device.machine_id };
   }
 
-  /* ---------------- SSE (搂3) ---------------- */
+  /* ---------------- SSE (§3) ---------------- */
 
   handleStream(req, res, url, device) {
     const machineId = device.machine_id;
@@ -2200,7 +2200,7 @@ export class RelayServer {
       from = last + 1;
     }
 
-    // 搂8.5: these two headers are the fix for "connects but no events" behind
+    // §8.5: these two headers are the fix for "connects but no events" behind
     // nginx-style proxies and tunnels, which buffer event streams by default.
     res.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',
@@ -2228,7 +2228,7 @@ export class RelayServer {
       deliver(entry);
     });
 
-    // 搂3.1: the first frame MUST be `ready`; 搂8.3 adds `relay_id`.
+    // §3.1: the first frame MUST be `ready`; §8.3 adds `relay_id`.
     const readySeq = this.state.reserveSeq();
     writeEvent({
       type: 'ready',
@@ -2259,7 +2259,7 @@ export class RelayServer {
       const tooOld = from < oldest && oldest > 1;
       const fromFuture = from > lastSeq + 1;
       if (tooOld || fromFuture) {
-        // 搂8.4: tell the client where to re-align, not just that replay failed.
+        // §8.4: tell the client where to re-align, not just that replay failed.
         writeEvent({
           type: 'notice',
           seq: this.state.reserveSeq(),
@@ -2291,7 +2291,7 @@ export class RelayServer {
     for (const entry of queue) deliver(entry);
     queue.length = 0;
 
-    // 搂8.6: re-state work this machine was handed while its stream was down.
+    // §8.6: re-state work this machine was handed while its stream was down.
     //
     // An offer is a single event; if the stream is not connected at that instant
     // -- after a relay restart, a tunnel drop, or any interruption -- the event
@@ -2306,7 +2306,7 @@ export class RelayServer {
       this._log(`[w2m-rabbit] re-offered ${redelivered.count} pending task(s) to ${machineId} on reconnect`);
     }
 
-    // 搂3.2: `: keepalive` comment every 15s.
+    // §3.2: `: keepalive` comment every 15s.
     sub.timer = setInterval(() => {
       if (res.writableEnded) return;
       res.write(': keepalive\n\n');

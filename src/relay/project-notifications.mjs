@@ -4,7 +4,7 @@
  * Notifications answer "what happened while I was away" without a websocket: every one is an event on the project stream
  * (live) and a row returned by the list route (catch-up), and each reader has a watermark rather than per-row read flags.
  *
- * Rules (docs/COLLAB/M5-MULTI-CLIENT-PRIMITIVES.md 搂4):
+ * Rules (docs/COLLAB/M5-MULTI-CLIENT-PRIMITIVES.md §4):
  *  - a notification is (project, kind, target, subject, refs, requires_action), addressed to a member or broadcast;
  *  - the same (kind, primary ref, target) inside 60s is one notification, not two;
  *  - more than 120 in a minute for one project collapses into a digest row carrying the count;
