@@ -78,7 +78,7 @@ import path from 'node:path';
 import { createDailyScheduler, DEFAULT_CATCH_UP_MS } from './schedule.mjs';
 import { runBackup, SCOPES } from '../backup/engine.mjs';
 import { buildStatus } from '../backup/routes.mjs';
-import { describeBackupSchedule, normalizeBackupSchedule } from '../backup/schedule.mjs';
+import { describeBackupSchedule, missedBackupAt, normalizeBackupSchedule } from '../backup/schedule.mjs';
 import { DEFAULT_FULL_COPY_MAX_BYTES, DEFAULT_KEEP_OLD, DEFAULT_OLD_FORMAT, DEFAULT_OLD_USAGE_REMINDER_BYTES, OLD_FORMATS, buildOldUsageReport, measureOldUsage } from '../backup/rotation.mjs';
 import { REPO_ENCRYPTION_MODES } from '../backup/layout.mjs';
 
@@ -87,6 +87,21 @@ export const DEFAULT_FULL_COPY_MAX_MB = DEFAULT_FULL_COPY_MAX_BYTES / (1024 * 10
 
 /** The row's `backupOldUsageReminderGb` default, in GB (the engine's threshold is in bytes). */
 export const DEFAULT_OLD_USAGE_REMINDER_GB = DEFAULT_OLD_USAGE_REMINDER_BYTES / (1024 ** 3);
+
+/**
+ * The row's `backupCatchUpOnStart` default (v3.5.1): **false**.
+ *
+ * 3.5.0 fired a missed-slot catch-up inside the mount path. On the real desktop 0.2.2-rc.5 host that ran the whole
+ * synchronous backup (scan, 118 MB session read, rotation, nightly runtime verdict) on the Electron main thread,
+ * the enable operation never settled, and the host died of `Scavenge ... heap out of memory`. A plugin mount must
+ * not start disk work: with this false, mount only records `pending_catch_up` in the status/panel/CLI state and
+ * schedules the next slot. The catch-up then runs only from an explicit panel/CLI action, or from the next
+ * in-window timer tick if the operator opts back in with `backupCatchUpOnStart: true`.
+ */
+export const DEFAULT_BACKUP_CATCH_UP_ON_START = false;
+
+/** The row's `backupMaxHeapMb` default: the memory guard's ceiling (~1.5 GB of a 4 GB host). */
+export const DEFAULT_BACKUP_MAX_HEAP_MB = 1536;
 
 /** The named engine refusal that means "a human must approve this full-copy write (特批)". */
 export const FULL_COPY_APPROVAL_CODE = 'BACKUP_FULL_COPY_APPROVAL_REQUIRED';
@@ -320,6 +335,27 @@ export function normalizeConfig(config = {}, deps = {}) {
       detail: `backupRuntimeVerify must be one of ${RUNTIME_VERDICT_MODES.join(', ')}, got ${JSON.stringify(runtimeVerify)}`,
     };
   }
+  // v3.5.1: the missed-slot catch-up is opt-in. Only the literal boolean counts, so a typo cannot silently
+  // re-enable the mount-path work that crashed the host; an explicitly given non-boolean is refused by name.
+  const catchUpOnStartRaw = config.backupCatchUpOnStart;
+  if (catchUpOnStartRaw !== undefined && catchUpOnStartRaw !== null && typeof catchUpOnStartRaw !== 'boolean') {
+    return {
+      ok: false,
+      reason_code: 'BACKUP_CONFIG_INVALID',
+      detail: `backupCatchUpOnStart must be a boolean, got ${JSON.stringify(catchUpOnStartRaw)}`,
+    };
+  }
+  const catchUpOnStart = catchUpOnStartRaw === true;
+  // The engine's memory guard ceiling, in MB. `0` disables the guard explicitly (documented, never inferred); a
+  // non-integer/negative value is refused here so a typo cannot silently turn the safety net off.
+  const maxHeapMb = config.backupMaxHeapMb ?? DEFAULT_BACKUP_MAX_HEAP_MB;
+  if (!Number.isSafeInteger(maxHeapMb) || maxHeapMb < 0) {
+    return {
+      ok: false,
+      reason_code: 'BACKUP_CONFIG_INVALID',
+      detail: `backupMaxHeapMb must be a non-negative integer number of MB (0 = guard off), got ${JSON.stringify(config.backupMaxHeapMb)}`,
+    };
+  }
   const dshHome = typeof config.dshHome === 'string' && config.dshHome.trim() !== ''
     ? path.resolve(config.dshHome.trim())
     : resolveDshHome(env);
@@ -348,6 +384,9 @@ export function normalizeConfig(config = {}, deps = {}) {
     mirror_dir: mirrorDir,
     registry_recheck_ms: registryRecheckMs,
     runtime_verify: runtimeVerify,
+    catch_up_on_start: catchUpOnStart,
+    max_heap_mb: maxHeapMb,
+    max_heap_bytes: maxHeapMb * 1024 * 1024,
     dsh_home: dshHome,
   };
 }
@@ -404,7 +443,18 @@ export function apply(ctx, config = {}, deps = {}) {
     last_error: null,
     last_runtime_verify: null,
     running: false,
+    // v3.5.1 mount-path safety: the row reports whether it is allowed to run a missed slot at mount, and the
+    // catch-up it found but deliberately did NOT run. The panel/CLI shows the pending state; an explicit run clears
+    // it, and `backupCatchUpOnStart: true` (opt-in) restores the old behaviour behind the same 12-hour window.
+    catch_up_on_start: cfg.catch_up_on_start,
+    max_heap_mb: cfg.max_heap_mb,
+    max_heap_bytes: cfg.max_heap_bytes,
+    pending_catch_up: null,
   };
+
+  // Deferral seam: heavy work must never begin synchronously inside the mount stack (v3.5.1). A test can replace
+  // this to observe the scheduling without running a real timer.
+  const defer = typeof deps.defer === 'function' ? deps.defer : (fn) => setImmediate(fn);
 
   // Restore the reminder state a previous process persisted: the panel must show a pending reminder left behind by
   // the 22:00 run, and the next run must measure growth against the operator's last acknowledgement. A corrupt or
@@ -418,6 +468,42 @@ export function apply(ctx, config = {}, deps = {}) {
   } catch {
     state.old_usage_ack_bytes = 0;
     state.old_usage = null;
+  }
+
+  // v3.5.1: a missed slot is recorded, never run from the mount path. The check is pure clock arithmetic (no scan,
+  // no I/O) so it cannot make the enable slow; the run itself happens only when `backupCatchUpOnStart` is true and
+  // the scheduler fires off the mount stack, or when an operator triggers an explicit run. The pending record is
+  // persisted so `w2m-backup status` and the panel (both read the state file) can see it after a refresh.
+  try {
+    const missed = missedBackupAt(Date.now(), cfg.times, cfg.time_zone, cfg.catch_up_ms);
+    if (missed !== null) {
+      state.pending_catch_up = {
+        detected_at: new Date().toISOString(),
+        missed_slot: missed.time,
+        scheduled_for_ms: missed.atMs,
+        scheduled_for: new Date(missed.atMs).toISOString(),
+        catch_up_ms: cfg.catch_up_ms,
+        on_start_enabled: cfg.catch_up_on_start,
+        action: cfg.catch_up_on_start ? 'run-on-start' : 'pending-explicit-run',
+        detail: cfg.catch_up_on_start
+          ? 'the missed slot will run off the mount stack; the backup itself is still bounded by the memory guard'
+          : 'nothing runs at mount (backupCatchUpOnStart is false); an explicit run now (panel/CLI) or the next slot clears this',
+      };
+      const persisted = writeBackupState(cfg.dsh_home, { pending_catch_up: state.pending_catch_up });
+      if (persisted.ok !== true) {
+        ctx.logger?.warn?.(`w2m-dsh-backup: the pending catch-up could not be persisted: ${persisted.error ?? 'unknown error'}`);
+      }
+      ctx.logger?.info?.(
+        `w2m-dsh-backup: missed slot ${missed.time} is pending; ` +
+          (cfg.catch_up_on_start ? 'it runs off the mount stack' : 'nothing runs at mount -- run a backup explicitly to clear it'),
+      );
+    } else {
+      state.pending_catch_up = null;
+    }
+  } catch (error) {
+    // Clock/zone arithmetic failing must not fail the mount: the schedule still arms, and the next run clears it.
+    state.pending_catch_up = null;
+    ctx.logger?.warn?.(`w2m-dsh-backup: the missed-slot check failed: ${error instanceof Error ? error.message : String(error)}`);
   }
 
   /**
@@ -480,7 +566,10 @@ export function apply(ctx, config = {}, deps = {}) {
    * record -- never a failed schedule slot.
    */
   const queueNightlyRuntimeVerify = () => {
-    runtimeVerdict.run({ trigger: 'nightly' })
+    // v3.5.1: off the caller's stack. The nightly verdict is expensive (it walks the store and spawns the Harness);
+    // it must never start synchronously inside a mount or a timer callback that also has to settle host state.
+    defer(() => {
+      runtimeVerdict.run({ trigger: 'nightly' })
       .then((outcome) => {
         state.last_runtime_verify = outcome.record;
         if (outcome.persisted !== true) {
@@ -500,6 +589,7 @@ export function apply(ctx, config = {}, deps = {}) {
       .catch((error) => {
         ctx.logger?.warn?.(`w2m-dsh-backup: nightly runtime verdict threw: ${error instanceof Error ? error.message : String(error)}`);
       });
+    });
   };
 
   /** Run one backup and never throw: the timer and the route both need a result, not an exception. */
@@ -538,10 +628,16 @@ export function apply(ctx, config = {}, deps = {}) {
         futureAppend: cfg.future_append,
         dryRun: request?.dryRun === true,
         accountId,
+        // The process-wide memory guard ceiling (v3.5.1): the engine refuses a materialisation it cannot afford
+        // and returns `BACKUP_MEMORY_GUARD` instead of letting the host's V8 heap die.
+        maxHeapBytes: cfg.max_heap_bytes,
       });
       if (result.ok === true) {
         state.runs += 1;
         state.last_run = new Date().toISOString();
+        // A completed run -- manual or scheduled -- is the resolution of a pending missed slot: clear it before the
+        // state write below so the panel/CLI stops showing it.
+        state.pending_catch_up = null;
         state.last_result = {
           snapshot_id: result.snapshot_id,
           sessions: result.sessions,
@@ -580,6 +676,7 @@ export function apply(ctx, config = {}, deps = {}) {
           const persistedUsage = writeBackupState(cfg.dsh_home, {
             old_usage: oldUsageRecord,
             old_usage_ack_bytes: state.old_usage_ack_bytes,
+            pending_catch_up: null,
           });
           if (persistedUsage.ok !== true) {
             ctx.logger?.warn?.(`w2m-dsh-backup: the old/ usage measurement could not be persisted: ${persistedUsage.error ?? 'unknown error'}`);
@@ -590,11 +687,19 @@ export function apply(ctx, config = {}, deps = {}) {
                 `(reminder at ${measuredOldUsage.reminder_bytes}); nothing was deleted -- manual cleanup is w2m-backup gc`,
             );
           }
+        } else {
+          // No `old/` measurement in the result (a narrower caller): still clear the pending catch-up on success.
+          writeBackupState(cfg.dsh_home, { pending_catch_up: null });
         }
         ctx.logger?.info?.(
           `w2m-dsh-backup: ${reason} backup ${result.snapshot_id}: ${result.sessions} session(s), ` +
             `${result.blocks_new} new block(s), ${result.blocks_reused} reused`,
         );
+        if (result.memory_guard?.refusals > 0) {
+          ctx.logger?.warn?.(
+            `w2m-dsh-backup: the memory guard refused ${result.memory_guard.refusals} materialisation(s) during this run`,
+          );
+        }
         if (result.mirror?.ok === false) {
           ctx.logger?.warn?.(`w2m-dsh-backup: ${reason} backup ${result.snapshot_id}: the offsite mirror failed: ${result.mirror.reason_code} ${result.mirror.reason}`);
         }
@@ -645,9 +750,13 @@ export function apply(ctx, config = {}, deps = {}) {
 
   const createScheduler = typeof deps.createScheduler === 'function' ? deps.createScheduler : createDailyScheduler;
   const scheduler = createScheduler({
-    // The scheduled path (and the missed-slot catch-up, which runs through this same function) is the one place
-    // the nightly runtime verdict is attached: after the backup result is produced, never before it.
+    // The scheduled path (and, only when the operator opted in, the missed-slot catch-up) runs through this
+    // function. The run starts on a deferred turn (v3.5.1): a timer callback or a mount must settle host state
+    // before the engine takes the thread for its synchronous scan/store/rotate pass.
     run: async () => {
+      await new Promise((resolve) => {
+        defer(resolve);
+      });
       const result = await runNow('scheduled');
       if (result?.ok === true && cfg.runtime_verify === 'nightly') queueNightlyRuntimeVerify();
       return result;
@@ -655,6 +764,10 @@ export function apply(ctx, config = {}, deps = {}) {
     times: cfg.times,
     timeZone: cfg.time_zone,
     catchUpMs: cfg.catch_up_ms || DEFAULT_CATCH_UP_MS,
+    // v3.5.1: false by default. The scheduler records the missed slot (pending_catch_up) and arms the next one
+    // instead of running the backup inside `apply()`; `backupCatchUpOnStart: true` restores the old catch-up,
+    // still behind the configured window and off the mount stack.
+    catchUpOnStart: cfg.catch_up_on_start,
     onError: (error) => ctx.logger?.warn?.(`w2m-dsh-backup: scheduler error: ${error.message}`),
   });
   scheduler.start();
@@ -711,6 +824,11 @@ export function apply(ctx, config = {}, deps = {}) {
               mirror_dir: cfg.mirror_dir,
               schedule: describeBackupSchedule({ enabled: true, times: cfg.times, timeZone: cfg.time_zone }),
               scheduler: scheduler.describe(),
+              // v3.5.1: mount-path safety is visible in the same payload as everything else -- whether a missed slot
+              // may run at start, whether one is currently pending, and the memory guard's ceiling in effect.
+              catch_up_on_start: cfg.catch_up_on_start,
+              pending_catch_up: state.pending_catch_up,
+              memory_guard: { max_heap_mb: cfg.max_heap_mb, max_heap_bytes: cfg.max_heap_bytes },
               status,
               // The cached runtime verdict is exposed by the embedded status so the panel can render it without a
               // second request; `cached: true` is spoken here too, because this record never spawns anything.

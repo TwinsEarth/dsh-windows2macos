@@ -218,7 +218,7 @@ export function planRestore(input) {
 
   const decoded = [];
   for (const entry of sessions) {
-    const rebuilt = rebuildFile({ root: input.root, entry, dek: key.dek });
+    const rebuilt = rebuildFile({ root: input.root, entry, dek: key.dek, maxHeapBytes: input.maxHeapBytes });
     if (rebuilt.ok !== true) return { ok: false, reason_code: rebuilt.code, detail: rebuilt.detail };
     if (sha256Hex(rebuilt.buffer) !== entry.sha256) {
       return { ok: false, reason_code: RESTORE_CODES.VERIFY_FAILED, detail: `${entry.rel}: the repository bytes do not match the manifest digest` };
@@ -227,7 +227,7 @@ export function planRestore(input) {
   }
   const decodedAttachments = [];
   for (const entry of attachments) {
-    const rebuilt = rebuildFile({ root: input.root, entry, dek: key.dek });
+    const rebuilt = rebuildFile({ root: input.root, entry, dek: key.dek, maxHeapBytes: input.maxHeapBytes });
     if (rebuilt.ok !== true) return { ok: false, reason_code: rebuilt.code, detail: rebuilt.detail };
     if (sha256Hex(rebuilt.buffer) !== entry.sha256) {
       return { ok: false, reason_code: RESTORE_CODES.VERIFY_FAILED, detail: `${entry.rel}: the repository bytes do not match the manifest digest` };
@@ -237,7 +237,7 @@ export function planRestore(input) {
   const decodedExtras = [];
   let registryDocument = null;
   for (const entry of extras) {
-    const rebuilt = rebuildFile({ root: input.root, entry, dek: key.dek });
+    const rebuilt = rebuildFile({ root: input.root, entry, dek: key.dek, maxHeapBytes: input.maxHeapBytes });
     if (rebuilt.ok !== true) return { ok: false, reason_code: rebuilt.code, detail: rebuilt.detail };
     if (sha256Hex(rebuilt.buffer) !== entry.sha256) {
       return { ok: false, reason_code: RESTORE_CODES.VERIFY_FAILED, detail: `${entry.rel}: the repository bytes do not match the manifest digest` };
@@ -284,7 +284,7 @@ export function planRestore(input) {
  * Plan one restore directly from a `.tar.zst` archive.
  *
  * The archive carries the same manifest a snapshot does (files, digests, session ids, flags), so the same gates
- * and the same writer apply. This is what makes an archive "鍙В鍘嬨€佸彲鏍￠獙銆佸彲杩樺師" rather than "鍙В鍘?.
+ * and the same writer apply. This is what makes an archive "閸欘垵袙閸樺鈧礁褰查弽锟犵崣閵嗕礁褰叉潻妯哄斧" rather than "閸欘垵袙閸?.
  *
  * @param {{file: string, dshHome: string, sessionIds?: string[], allowStaticValidation?: boolean,
  *   requireFutureAppend?: boolean, workspacePath?: string|null, keepBoth?: boolean, now?: Date,

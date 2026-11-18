@@ -33,7 +33,8 @@ import { repoPaths } from './layout.mjs';
 import { openRepo, readIndex, readSnapshot, listSnapshots } from './repo.mjs';
 import { openRepoKey } from './keystore.mjs';
 import { sha256Hex } from './manifest.mjs';
-import { rebuildFile, objectFile } from './materialize.mjs';
+import { DEFAULT_OLD_COPY_MAX_BYTES, DEFAULT_STREAM_THRESHOLD_BYTES, rebuildFile, digestEntryStreaming, objectFile } from './materialize.mjs';
+import { BACKUP_MEMORY_GUARD, createMemoryGuardReport, memoryGuard, resolveMaxHeapBytes } from './memory-guard.mjs';
 import { OLD_COPY_KIND, openObject } from './crypto.mjs';
 import { fullCopyPathFor, listOldVersions } from './rotation.mjs';
 import { readCurrentPointers } from './gc.mjs';
@@ -58,6 +59,7 @@ export const VERIFY_CODES = Object.freeze({
   FUTURE_APPEND_FAILED: 'BACKUP_FUTURE_APPEND_FAILED',
   RUNTIME_APPEND_FAILED: 'BACKUP_RUNTIME_APPEND_FAILED',
   COVERAGE_GAP: 'BACKUP_VERIFY_COVERAGE_GAP',
+  OLD_COPY_TOO_LARGE: 'BACKUP_VERIFY_OLD_COPY_TOO_LARGE',
 });
 
 /** The zeroed `old_copies` counter block (also the shape every early return reports). */
@@ -81,6 +83,7 @@ function emptyOldCopies() {
 function verifyOldFullCopy(input) {
   const { root, record } = input;
   const copyFile = fullCopyPathFor(root, record);
+  const maxCopyBytes = Number.isSafeInteger(input.maxCopyBytes) && input.maxCopyBytes >= 0 ? input.maxCopyBytes : DEFAULT_OLD_COPY_MAX_BYTES;
   if (copyFile === null) {
     return { missing: true, detail: 'full_copy.file does not name a path under old/, so it is never followed' };
   }
@@ -95,6 +98,27 @@ function verifyOldFullCopy(input) {
   if (typeof record.sha256 !== 'string' || !Number.isSafeInteger(record.size)) {
     return { missing: false, detail: 'the record has no usable sha256/size to verify the copy against' };
   }
+  let stat;
+  try {
+    stat = fs.statSync(copyFile);
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') {
+      return { missing: true, detail: `the full copy at ${copyFile} is missing` };
+    }
+    return { missing: false, detail: `the full copy at ${copyFile} is unreadable: ${error?.code ?? 'unknown'}` };
+  }
+  // v3.5.1: a single whole-file copy is materialised (its format is one sealed object), so it is bounded twice:
+  // by the configured per-copy limit and by the process-wide heap guard. Both refusals are named, never an OOM.
+  if (stat.size > maxCopyBytes) {
+    return {
+      missing: false,
+      code: VERIFY_CODES.OLD_COPY_TOO_LARGE,
+      oversized: true,
+      detail: `the full copy at ${copyFile} is ${stat.size} bytes, above the ${maxCopyBytes}-byte verify limit; it was not decrypted`,
+    };
+  }
+  const guard = memoryGuard({ requestedBytes: stat.size * 3, maxHeapBytes: input.maxHeapBytes, label: copyFile, heapUsedBytes: input.heapUsedBytes });
+  if (guard.ok !== true) return { missing: false, code: BACKUP_MEMORY_GUARD, guarded: true, detail: guard.detail };
   let sealed;
   try {
     sealed = fs.readFileSync(copyFile);
@@ -136,6 +160,11 @@ function verifyOldFullCopy(input) {
 export function simulateFutureAppend(buffer) {
   const verdict = futureAppendVerdict(buffer);
   return { ok: verdict.ok === true, codes: verdict.codes, detail: verdict.detail };
+}
+
+/** Resolve a byte-limit option: a non-negative integer wins, absent means the module default. */
+function resolveLimit(value, fallback) {
+  return Number.isSafeInteger(value) && value >= 0 ? value : fallback;
 }
 
 /** The scope a manifest file entry counts toward. */
@@ -303,10 +332,35 @@ export function verifyRepo(input) {
   const problems = [];
   const snapshots = [];
   const counts = { snapshots: 0, files: 0, blocks: 0, bytes: 0, old: 0, current: 0 };
-  const futureAppend = { checked: 0, failed: 0, evidence: 'static-prefilter' };
-  const runtimeChecked = { checked: 0, failed: 0, evidence: 'installed-harness' };
+  const streamThreshold = resolveLimit(input.streamThresholdBytes, DEFAULT_STREAM_THRESHOLD_BYTES);
+  const futureAppendLimit = resolveLimit(input.futureAppendMaxBytes, DEFAULT_STREAM_THRESHOLD_BYTES);
+  const runtimeMaxBytes = resolveLimit(input.runtimeMaxBytes, DEFAULT_STREAM_THRESHOLD_BYTES);
+  const oldCopyMaxBytes = resolveLimit(input.oldCopyMaxBytes, DEFAULT_OLD_COPY_MAX_BYTES);
+  const heapPolicy = resolveMaxHeapBytes(input.maxHeapBytes);
+  if (heapPolicy.ok !== true) {
+    return {
+      ok: false,
+      reason_code: heapPolicy.reason_code,
+      detail: heapPolicy.detail,
+      counts,
+      problems: [{ code: heapPolicy.reason_code, file: null, snapshot_id: null, detail: heapPolicy.detail }],
+      snapshots,
+      future_append: { checked: 0, failed: 0, evidence: 'static-prefilter' },
+      runtime_verified: { checked: 0, failed: 0, evidence: 'installed-harness' },
+      old_copies: emptyOldCopies(),
+    };
+  }
+  const maxHeapBytes = heapPolicy.maxHeapBytes;
+  const memoryReport = createMemoryGuardReport();
+  const futureAppend = { checked: 0, failed: 0, skipped: 0, skipped_sessions: [], evidence: 'static-prefilter' };
+  const runtimeChecked = { checked: 0, failed: 0, skipped: 0, skipped_sessions: [], evidence: 'installed-harness', snapshots: 0 };
   const oldCopies = emptyOldCopies();
+  // v3.5.1: entries at or above the threshold are digest-checked block-by-block (streaming.peak_block_bytes is
+  // one 4 MiB block); smaller entries still take the whole-buffer path, which is where the future-append
+  // simulation runs. The counters are part of the result so a reader can see which path verified what.
+  const streaming = { files: 0, bytes: 0, blocks: 0, threshold_bytes: streamThreshold, peak_block_bytes: 0 };
   let latestManifest = null;
+  let latestSnapshot = null;
   let coverage = null;
   const state = openRepo({ root: input.root, dshHome: input.dshHome });
   if (state.initialized !== true) {
@@ -320,6 +374,8 @@ export function verifyRepo(input) {
       future_append: futureAppend,
       runtime_verified: runtimeChecked,
       old_copies: oldCopies,
+      streaming,
+      memory_guard: { ...memoryReport, limit_bytes: maxHeapBytes },
     };
   }
   const key = openRepoKey({
@@ -342,6 +398,8 @@ export function verifyRepo(input) {
       future_append: futureAppend,
       runtime_verified: runtimeChecked,
       old_copies: oldCopies,
+      streaming,
+      memory_guard: { ...memoryReport, limit_bytes: maxHeapBytes },
     };
   }
 
@@ -366,7 +424,6 @@ export function verifyRepo(input) {
     problems.push({ code: VERIFY_CODES.SNAPSHOT_INVALID, file: repoPaths(input.root).descriptor, snapshot_id: null, detail: 'backup.json is missing or does not carry a format/version' });
   }
 
-  const runtimeQueue = [];
   for (const row of valid) {
     const summary = { snapshot_id: row.snapshot_id, files: 0, blocks: 0, bytes: 0, ok: true, problems: 0 };
     snapshots.push(summary);
@@ -378,7 +435,10 @@ export function verifyRepo(input) {
       continue;
     }
     const snapshot = readSnapshot({ root: input.root, snapshotId: row.snapshot_id });
-    if (latestManifest === null) latestManifest = snapshot.manifest;
+    if (latestManifest === null) {
+      latestManifest = snapshot.manifest;
+      latestSnapshot = snapshot;
+    }
     for (const entry of snapshot.manifest.files) {
       summary.files += 1;
       summary.blocks += entry.blocks.length;
@@ -386,7 +446,36 @@ export function verifyRepo(input) {
       counts.files += 1;
       counts.blocks += entry.blocks.length;
       counts.bytes += entry.size;
-      const rebuilt = rebuildFile({ root: input.root, entry, dek: key.dek });
+      // Large entries: digest without materialising. Peak memory is one block, not the file (v3.5.1).
+      if (Number.isSafeInteger(entry.size) && entry.size >= streamThreshold) {
+        const streamed = digestEntryStreaming({ root: input.root, entry, dek: key.dek, maxHeapBytes, memoryReport });
+        if (streamed.ok !== true) {
+          summary.ok = false;
+          summary.problems += 1;
+          problems.push({ code: streamed.code, file: entry.rel, snapshot_id: row.snapshot_id, detail: streamed.detail });
+          continue;
+        }
+        streaming.files += 1;
+        streaming.bytes += entry.size;
+        streaming.blocks += streamed.blocks;
+        streaming.peak_block_bytes = Math.max(streaming.peak_block_bytes, streamed.peak_block_bytes);
+        // G3's simulation needs the whole log, so a streamed entry never runs it here. It is deferred **by name**
+        // whether the size or the configured threshold is what streamed it -- a report must not imply a check that
+        // did not happen. The bytes themselves are still verified by digest.
+        if (entry.kind === 'session' && input.futureAppend !== false) {
+          futureAppend.skipped += 1;
+          futureAppend.skipped_sessions.push({
+            rel: entry.rel,
+            reason_code: entry.size > futureAppendLimit
+              ? 'BACKUP_FUTURE_APPEND_SKIPPED_LARGE'
+              : 'BACKUP_FUTURE_APPEND_SKIPPED_STREAMED',
+            snapshot_id: row.snapshot_id,
+            size: entry.size,
+          });
+        }
+        continue;
+      }
+      const rebuilt = rebuildFile({ root: input.root, entry, dek: key.dek, maxHeapBytes, memoryReport });
       if (rebuilt.ok !== true) {
         summary.ok = false;
         summary.problems += 1;
@@ -416,24 +505,6 @@ export function verifyRepo(input) {
           problems.push({ code: VERIFY_CODES.FUTURE_APPEND_FAILED, file: entry.rel, snapshot_id: row.snapshot_id, detail: `appending one legal event fails: ${simulation.codes.join(', ')}` });
         }
       }
-      if (entry.kind === 'session' && input.runtime === true) {
-        try {
-          runtimeQueue.push({
-            entry,
-            snapshot_id: row.snapshot_id,
-            summary,
-            artifact: buildArtifactFromBuffer(rebuilt.buffer),
-            // G3: the runtime is asked about the log *and* the log plus one legal append.
-            appended: buildArtifactFromBuffer(appendLegalEvent(rebuilt.buffer)),
-          });
-        } catch (error) {
-          summary.ok = false;
-          summary.problems += 1;
-          runtimeChecked.checked += 1;
-          runtimeChecked.failed += 1;
-          problems.push({ code: 'BACKUP_RUNTIME_REJECTED', file: entry.rel, snapshot_id: row.snapshot_id, detail: `could not decode for the runtime: ${error instanceof Error ? error.message : String(error)}` });
-        }
-      }
     }
   }
 
@@ -447,13 +518,18 @@ export function verifyRepo(input) {
       if (fs.existsSync(objectFile(input.root, block.sha256))) continue;
       problems.push({ code: VERIFY_CODES.OLD_RECORD_BLOCK_MISSING, file: record.file, snapshot_id: info.snapshot_id ?? null, detail: `block ${block.sha256} named by the version record is missing` });
     }
-    // An old record is a manifest entry too: rebuild it and compare the digest it recorded.
+    // An old record is a manifest entry too: verify the digest it recorded. Streamed like every other large
+    // entry (v3.5.1): a superseded 118 MB version is checked block-by-block, never materialised.
     if (typeof info.sha256 === 'string' && Number.isSafeInteger(info.size)) {
-      const rebuilt = rebuildFile({ root: input.root, entry: { blocks: info.blocks ?? [], size: info.size, sha256: info.sha256, rel: info.rel ?? 'old-record' }, dek: key.dek });
-      if (rebuilt.ok !== true) {
-        problems.push({ code: rebuilt.code, file: record.file, snapshot_id: info.snapshot_id ?? null, detail: rebuilt.detail });
-      } else if (rebuilt.buffer.length !== info.size || sha256Hex(rebuilt.buffer) !== info.sha256) {
-        problems.push({ code: VERIFY_CODES.DIGEST_MISMATCH, file: record.file, snapshot_id: info.snapshot_id ?? null, detail: 'the rebuilt old version does not hash to the digest the record stored' });
+      const streamed = digestEntryStreaming({
+        root: input.root,
+        entry: { blocks: info.blocks ?? [], size: info.size, sha256: info.sha256, rel: info.rel ?? 'old-record' },
+        dek: key.dek,
+        maxHeapBytes,
+        memoryReport,
+      });
+      if (streamed.ok !== true) {
+        problems.push({ code: streamed.code, file: record.file, snapshot_id: info.snapshot_id ?? null, detail: streamed.detail });
       }
     }
     // Records WITH a sealed whole-file copy promise those bytes are recoverable without `objects/`; verify that
@@ -461,7 +537,7 @@ export function verifyRepo(input) {
     // the whole claim), so the counters stay untouched for it.
     if (info.full_copy !== undefined && info.full_copy !== null) {
       oldCopies.checked += 1;
-      const failure = verifyOldFullCopy({ root: input.root, record: info, dek: key.dek });
+      const failure = verifyOldFullCopy({ root: input.root, record: info, dek: key.dek, maxHeapBytes, maxCopyBytes: oldCopyMaxBytes });
       if (failure === null) {
         oldCopies.ok += 1;
       } else if (failure.missing === true) {
@@ -475,7 +551,7 @@ export function verifyRepo(input) {
       } else {
         oldCopies.failed += 1;
         problems.push({
-          code: VERIFY_CODES.OLD_COPY_FAILED,
+          code: failure.code ?? VERIFY_CODES.OLD_COPY_FAILED,
           file: record.file,
           snapshot_id: info.snapshot_id ?? null,
           detail: `${record.file}: the version record's full copy is not usable: ${failure.detail}`,
@@ -510,32 +586,73 @@ export function verifyRepo(input) {
     }
   }
 
-  if (runtimeQueue.length > 0) {
-    const artifacts = runtimeQueue.flatMap((row) => [row.artifact, row.appended]);
-    const batch = runtimeValidateBatch({ artifacts, env: input.env });
-    runtimeChecked.checked += runtimeQueue.length;
-    for (const [offset, row] of runtimeQueue.entries()) {
-      const original = batch.verdicts[offset * 2] ?? { ok: false, detail: 'no verdict', events: 0 };
-      const appended = batch.verdicts[offset * 2 + 1] ?? { ok: false, detail: 'no verdict', events: 0 };
+  // G5 runtime evidence (v3.5.1): ONE session at a time, buffers released before the next, and only for the
+  // LATEST snapshot. 3.5.0 queued two decoded artifacts per session for every snapshot (924 on the real 21-snapshot
+  // repository) before spawning one batch -- the measured 4 GB-host OOM. Older snapshots were validated on the
+  // night they were latest; their blocks and digests are still verified here, and the cached record says when the
+  // runtime last looked. A session above the runtime byte limit is skipped by name, never buffered.
+  const latestSessionSummaries = new Map(snapshots.map((row) => [row.snapshot_id, row]));
+  if (input.runtime === true && latestSnapshot !== null) {
+    runtimeChecked.snapshots = 1;
+    const runBatch = typeof input.runtimeValidateBatch === 'function' ? input.runtimeValidateBatch : runtimeValidateBatch;
+    const latestSummary = latestSessionSummaries.get(latestSnapshot.snapshot_id) ?? null;
+    for (const entry of latestSnapshot.manifest.files) {
+      if (entry.kind !== 'session') continue;
+      if (Number.isSafeInteger(entry.size) && entry.size > runtimeMaxBytes) {
+        runtimeChecked.skipped += 1;
+        runtimeChecked.skipped_sessions.push({ rel: entry.rel, reason_code: 'BACKUP_RUNTIME_SKIPPED_LARGE', size: entry.size, limit_bytes: runtimeMaxBytes });
+        continue;
+      }
+      const rebuilt = rebuildFile({ root: input.root, entry, dek: key.dek, maxHeapBytes, memoryReport });
+      if (rebuilt.ok !== true) {
+        runtimeChecked.skipped += 1;
+        runtimeChecked.skipped_sessions.push({ rel: entry.rel, reason_code: rebuilt.code, detail: rebuilt.detail });
+        continue;
+      }
+      let artifacts;
+      try {
+        artifacts = [buildArtifactFromBuffer(rebuilt.buffer), buildArtifactFromBuffer(appendLegalEvent(rebuilt.buffer))];
+      } catch (error) {
+        runtimeChecked.checked += 1;
+        runtimeChecked.failed += 1;
+        if (latestSummary !== null) {
+          latestSummary.ok = false;
+          latestSummary.problems += 1;
+        }
+        problems.push({ code: 'BACKUP_RUNTIME_REJECTED', file: entry.rel, snapshot_id: latestSnapshot.snapshot_id, detail: `could not decode for the runtime: ${error instanceof Error ? error.message : String(error)}` });
+        continue;
+      }
+      const batch = runBatch({ artifacts, env: input.env });
+      runtimeChecked.checked += 1;
+      const original = batch.verdicts[0] ?? { ok: false, detail: 'no verdict', events: 0 };
+      const appended = batch.verdicts[1] ?? { ok: false, detail: 'no verdict', events: 0 };
       if (batch.available !== true) {
-        row.summary.ok = false;
-        row.summary.problems += 1;
-        problems.push({ code: 'BACKUP_RUNTIME_UNAVAILABLE', file: row.entry.rel, snapshot_id: row.snapshot_id, detail: original.detail });
+        if (latestSummary !== null) {
+          latestSummary.ok = false;
+          latestSummary.problems += 1;
+        }
+        problems.push({ code: 'BACKUP_RUNTIME_UNAVAILABLE', file: entry.rel, snapshot_id: latestSnapshot.snapshot_id, detail: original.detail });
         continue;
       }
       if (original.ok !== true) {
         runtimeChecked.failed += 1;
-        row.summary.ok = false;
-        row.summary.problems += 1;
-        problems.push({ code: 'BACKUP_RUNTIME_REJECTED', file: row.entry.rel, snapshot_id: row.snapshot_id, detail: original.detail });
+        if (latestSummary !== null) {
+          latestSummary.ok = false;
+          latestSummary.problems += 1;
+        }
+        problems.push({ code: 'BACKUP_RUNTIME_REJECTED', file: entry.rel, snapshot_id: latestSnapshot.snapshot_id, detail: original.detail });
         continue;
       }
       if (appended.ok !== true) {
         runtimeChecked.failed += 1;
-        row.summary.ok = false;
-        row.summary.problems += 1;
-        problems.push({ code: VERIFY_CODES.RUNTIME_APPEND_FAILED, file: row.entry.rel, snapshot_id: row.snapshot_id, detail: `after one legal append the Harness refuses the log: ${appended.detail}` });
+        if (latestSummary !== null) {
+          latestSummary.ok = false;
+          latestSummary.problems += 1;
+        }
+        problems.push({ code: VERIFY_CODES.RUNTIME_APPEND_FAILED, file: entry.rel, snapshot_id: latestSnapshot.snapshot_id, detail: `after one legal append the Harness refuses the log: ${appended.detail}` });
       }
+      // Explicitly drop the only whole-file buffer this iteration held before the next session is rebuilt.
+      artifacts = null;
     }
   }
 
@@ -550,5 +667,8 @@ export function verifyRepo(input) {
     runtime_verified: runtimeChecked,
     old_copies: oldCopies,
     coverage,
+    streaming,
+    limits: { stream_threshold_bytes: streamThreshold, future_append_max_bytes: futureAppendLimit, runtime_max_bytes: runtimeMaxBytes, old_copy_max_bytes: oldCopyMaxBytes },
+    memory_guard: { limit_bytes: maxHeapBytes, checks: memoryReport.checks, refusals: memoryReport.refusals, refused: memoryReport.refused },
   };
 }

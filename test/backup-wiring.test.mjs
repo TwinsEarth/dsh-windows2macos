@@ -67,7 +67,7 @@ describe('backup wiring: package and entry points', () => {
     const suites = [
   'backup-scopes',
   'backup-scope-run',
-  'backup-scope-restore','backup-layout', 'backup-scan', 'backup-crypto', 'backup-protocol', 'backup-repo', 'backup-engine', 'backup-rotation', 'backup-gc', 'backup-locks', 'backup-schedule', 'backup-run', 'backup-atomic', 'backup-keystore', 'backup-machine-key', 'backup-runtime', 'backup-restore', 'backup-archive', 'backup-verify', 'backup-access', 'backup-g2', 'backup-wiring', 'backup-mirror', 'fix-renumber'];
+  'backup-scope-restore','backup-layout', 'backup-scan', 'backup-crypto', 'backup-protocol', 'backup-repo', 'backup-engine', 'backup-rotation', 'backup-gc', 'backup-locks', 'backup-schedule', 'backup-run', 'backup-atomic', 'backup-keystore', 'backup-machine-key', 'backup-runtime', 'backup-restore', 'backup-archive', 'backup-verify', 'backup-access', 'backup-g2', 'backup-wiring', 'backup-mirror', 'backup-memory', 'fix-renumber'];
     for (const suite of suites) {
       assert.equal(pkg.scripts[`test:${suite}`], `node --test --test-force-exit test/${suite}.test.mjs`, `test:${suite} missing`);
       assert.ok(pkg.scripts.test.includes(`test/${suite}.test.mjs`), `${suite} missing from scripts.test`);

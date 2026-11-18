@@ -101,6 +101,10 @@ export {
  * @param {string[]} [options.times] `HH:mm:ss` slots; defaults to 00:00/03:00/05:00.
  * @param {string} [options.timeZone] IANA zone; defaults to Asia/Shanghai.
  * @param {number} [options.catchUpMs] How late a missed slot may be and still run.
+ * @param {boolean} [options.catchUpOnStart] Run the missed slot on `start()`. Default true (the auto-update
+ *   checker's behaviour since v3.4.0). The backup row passes `false` by default since v3.5.1: running a 20-minute
+ *   disk job inside the plugin mount path made the desktop host unresponsive and OOM. With false, `start()` only
+ *   arms the next slot; the caller decides what a missed slot means (the backup row reports `pending_catch_up`).
  * @param {(err: Error) => void} [options.onError] Error sink; defaults to a no-op.
  * @param {() => number} [options.nowMs] Clock, injectable for tests.
  * @param {(fn: () => void, ms: number) => any} [options.setTimer] Timer, injectable.
@@ -113,6 +117,7 @@ export function createDailyScheduler(options) {
     times,
     timeZone = DEFAULT_TIME_ZONE,
     catchUpMs = DEFAULT_CATCH_UP_MS,
+    catchUpOnStart = true,
     onError = () => {},
     nowMs = Date.now,
     setTimer = setTimeout,
@@ -179,11 +184,11 @@ export function createDailyScheduler(options) {
   }
 
   return {
-    /** Arm the first timer, running a catch-up check if a slot was just missed. */
+    /** Arm the first timer; run a catch-up check on startup only when the caller allowed it (v3.5.1). */
     start() {
       if (state.stopped) throw new Error('scheduler already stopped');
       const now = nowMs();
-      const missed = missedSlot(now, normalized.seconds, timeZone, catchUpMs);
+      const missed = catchUpOnStart === true ? missedSlot(now, normalized.seconds, timeZone, catchUpMs) : null;
       if (missed) {
         // Report the deadline that was actually missed, then continue normally. One catch-up run for any number
         // of missed slots: the user asked for a daily check, not one per skipped hour.
@@ -220,6 +225,7 @@ export function createDailyScheduler(options) {
         time_zone: timeZone,
         times: normalized.formatted,
         catch_up_ms: catchUpMs,
+        catch_up_on_start: catchUpOnStart === true,
         started: state.nextAtMs !== null,
         stopped: state.stopped,
         next_at_ms: state.nextAtMs,

@@ -1,0 +1,63 @@
+{
+  "version": "3.5.1",
+  "case": "RELEASE-3510-OOM-FIX",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-18T16:05:00.000Z",
+  "executor": "lead",
+  "task_id": "w2m-v351-oom-fix",
+  "requirement": "v3.5.1 incident fix: the 3.5.0 plugin made the DSH desktop host (0.2.2-rc.5, Node 24) run out of memory at startup / on re-enable (4 GB heap, plugin-manager enable never settled, crash loop). Root cause was reproduced headlessly: the missed-slot catch-up backup fired synchronously inside the plugin mount path (then the nightly runtime verdict on the same loop turn), readSessionHeader read whole session logs (118 MB) to parse a 255-byte header, verifyRepo materialised every snapshot file and 300 MB-level old/ .enc copies whole, G5 accumulated 924 decoded artifacts in one batch, storeFileBlocks read whole files, and there was no memory guard. 3.5.1 makes mount inert (backupCatchUpOnStart defaults false, pending catch-up recorded only), bounds the header read to the first 64 KiB frame (cap 1 MiB), streams large-entry verification (4 MiB block at a time), validates G5 one session at a time with bounded batches, streams storeFileBlocks, and refuses before materialising an over-budget buffer with the named BACKUP_MEMORY_GUARD.",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/backup-memory.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/backup-engine.test.mjs",
+      "test/backup-verify.test.mjs",
+      "test/backup-run.test.mjs",
+      "test/backup-wiring.test.mjs",
+      "test/client-bundle.test.mjs"
+    ],
+    [
+      "node",
+      "scripts/layer-check.mjs"
+    ],
+    [
+      "node",
+      "scripts/scan-mojibake.mjs"
+    ],
+    [
+      "node",
+      "scripts/pack.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "root_cause": "headless reproduction of a real-home-shaped fixture (44 logs incl. one 118 MB, .w2m-restore-backups 230 MB, old/ 1.36 GB) under a --max-old-space-size=1024 child with RSS sampled every 100 ms: apply() mount OOM after 17.8 s (1.36 GB, sampler never fired after mount -> event loop blocked); runBackup OOM 18.9 s; verifyRepo OOM 17.8 s; verifyRepo({runtime:true}) OOM 25.6 s. The missed-slot catch-up ran inside the mount path.",
+      "after_fix": "same fixture/caps: mount 28 ms / 46 MB peak and no run started; scan 46 MB; runBackup 7.7 s success / 379 MB peak; verifyRepo 191 s / 859 MB / 0 problems; verifyRepo({runtime:true}) 199 s / 894 MB / 0 problems (41 validated one at a time, 2 named skips).",
+      "mount_inert": "apply() only parses config, registers routes/scheduler description, reads tiny state, and arms the next slot; it persists pending_catch_up and never starts the engine. backupCatchUpOnStart defaults false (opt-in true defers off the mount stack); visible in describe, the status route and w2m-backup status.",
+      "bounded_reads": "readSessionHeader reads 64 KiB fs.read steps capped at 1 MiB and parses the first zstd frame only; hashFile is chunked; storeFileBlocks reuses one 4 MiB chunk; torn-frame walk is header-only (scanFramesFromFile).",
+      "bounded_verify": "digestEntryStreaming verifies one 4 MiB block at a time (4.19 MB peak measured) for entries >= 32 MiB and all old/ records; old/ .enc copies are bounded by oldCopyMaxBytes with the heap guard and a named refusal.",
+      "g5_bounded": "runtime verdict covers the latest snapshot only, one session at a time, two-artifact batch released per iteration, large sessions skipped by name.",
+      "memory_guard": "src/backup/memory-guard.mjs adds BACKUP_MEMORY_GUARD (1.5 GiB default, backupMaxHeapMb) checked before materialising large buffers; restore surfaces the named refusal.",
+      "tests": "test/backup-memory.test.mjs 15 tests (mount latency/heap with a 200 MB sparse log + 1.36 GB old/, default-off vs opt-in catch-up, bounded header via read counter + 64 MB-heap child, streaming verify, injected per-session G5 batches, guard refusals, pending visibility, scheduler both states), wired into scripts.test / test:all / test:backup-memory / backup-wiring suites; all backup suites + client-bundle 663 tests / 137 suites / 0 fail; eslint 0 errors; layer-check and mojibake clean.",
+      "artifact": "pack rebuilt from the fixed tree: 533 files, 2,527,458 bytes, sha256 61d0469810237268e180451a7651770ee891d4e705f04269a384ac9dc538fb64",
+      "deferred": "the engine call is still synchronous for the duration of an explicit/nightly run (memory is bounded and the host cannot OOM, but the GUI can be slower during a run); worker_threads migration next; large-file future-append/runtime artifacts are reported as named skips; old/ .enc still whole-file decrypt bounded by 512 MiB + guard; runtime verdict covers the latest snapshot only."
+    }
+  },
+  "artifacts": [
+    {
+      "sha256": "61d0469810237268e180451a7651770ee891d4e705f04269a384ac9dc538fb64",
+      "bytes": 2527458
+    }
+  ]
+}

@@ -64,6 +64,7 @@ import { createHash } from 'node:crypto';
 
 import { readJsonSafe, writeFileAtomic, writeJsonAtomic } from './atomic.mjs';
 import { OLD_COPY_KIND, isDek, sealObject } from './crypto.mjs';
+import { BACKUP_MEMORY_GUARD } from './memory-guard.mjs';
 import { rebuildFile } from './materialize.mjs';
 
 /** Format of one version record. */
@@ -410,10 +411,10 @@ function writeFullCopy(input) {
       'oldFormat "full" needs the repository DEK (32 bytes) to seal the whole-file copy',
     );
   }
-  const rebuilt = rebuildFile({ root: input.root, entry: previous, dek: input.dek });
+  const rebuilt = rebuildFile({ root: input.root, entry: previous, dek: input.dek, maxHeapBytes: input.maxHeapBytes, memoryReport: input.memoryReport ?? null });
   if (rebuilt.ok !== true) {
     throw new RotationError(
-      ROTATION_CODES.WRITE_FAILED,
+      rebuilt.code === BACKUP_MEMORY_GUARD ? BACKUP_MEMORY_GUARD : ROTATION_CODES.WRITE_FAILED,
       `the sealed whole-file copy cannot be built from the stored blocks: ${rebuilt.code}: ${rebuilt.detail}`,
     );
   }
@@ -465,7 +466,7 @@ export function recordSupersededVersion(input) {
   const approvedOverCap = input.approvedOverCap === true;
   const fullCopy = formatPolicy.format === 'full'
     ? {
-        ...writeFullCopy({ root: input.root, previous, stamp, dek: input.dek }),
+        ...writeFullCopy({ root: input.root, previous, stamp, dek: input.dek, maxHeapBytes: input.maxHeapBytes, memoryReport: input.memoryReport ?? null }),
         // Additive audit trail: the approval is written onto the record (not only into the run's result), so a
         // reader of `old/` can tell a deliberately approved oversized copy from one the cap never saw.
         ...(approvedOverCap
@@ -751,6 +752,8 @@ export function rotateForEntry(input) {
     dek: input.dek,
     approvedOverCap: input.approvedOverCap,
     capBytes: input.capBytes,
+    maxHeapBytes: input.maxHeapBytes,
+    memoryReport: input.memoryReport ?? null,
   });
   writeCurrentPointer({ root: input.root, entry, snapshotId: input.snapshotId, now: input.now });
   const pruned = pruneOldVersions({ root: input.root, keep: input.keep ?? DEFAULT_KEEP_OLD, maxAgeDays: agePolicy.maxAgeDays, now: input.now });

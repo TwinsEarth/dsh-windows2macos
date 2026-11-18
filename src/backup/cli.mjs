@@ -76,6 +76,7 @@ import {
   setRepositoryPassword,
 } from './keystore.mjs';
 import { verifyRepo } from './verify.mjs';
+import { BACKUP_MEMORY_GUARD } from './memory-guard.mjs';
 
 /** Human-readable bytes: `172.0 MB`, `1.2 GB`. */
 export function humanBytes(bytes) {
@@ -216,6 +217,22 @@ export function formatVerify(result) {
   if (result.old_copies !== undefined && result.old_copies !== null) {
     const copies = result.old_copies;
     lines.push(`old copies    : ${copies.ok} ok / ${copies.failed} failed / ${copies.missing} missing`);
+    // v3.5.1 bounded reader/guard: say which checks were skipped or refused rather than implying a clean pass.
+    if (result.streaming !== undefined && result.streaming !== null) {
+      lines.push(
+        `streamed      : ${result.streaming.files} file(s) (${humanBytes(result.streaming.bytes)}) above ` +
+          `${humanBytes(result.streaming.threshold_bytes)}; peak block ${humanBytes(result.streaming.peak_block_bytes)}`,
+      );
+    }
+    if (Number(result.future_append?.skipped) > 0) {
+      lines.push(`future append : ${result.future_append.skipped} session(s) deferred (large/streamed; bytes still digest-verified)`);
+    }
+    if (Number(result.runtime_verified?.skipped) > 0) {
+      lines.push(`runtime check : ${result.runtime_verified.skipped} session(s) skipped (above the runtime byte limit)`);
+    }
+    if (Number(result.memory_guard?.refusals) > 0) {
+      lines.push(`memory guard  : ${result.memory_guard.refusals} materialisation(s) REFUSED by ${BACKUP_MEMORY_GUARD}`);
+    }
   if (result.coverage !== null && result.coverage !== undefined) {
     const cov = result.coverage;
     lines.push(`coverage      : ${cov.percent}% (covered ${(cov.covered.bytes / 1024 ** 2).toFixed(1)} MB / home ${(cov.home.bytes / 1024 ** 2).toFixed(1)} MB), gaps: ${cov.gap_count}`);
@@ -804,6 +821,19 @@ export function formatStatus(payload) {
     }
   }
   lines.push(`schedule      : ${payload.schedule.times.join(', ')} ${payload.schedule.time_zone} (${payload.schedule.implemented ? 'active' : 'engine in v3.4.7'})`);
+  // v3.5.1: a missed slot is a PENDING state, not a run that happens inside the plugin mount. The CLI says which
+  // slot and what clears it, because "the backup will run at some point" is not an answer an operator can act on.
+  const pendingCatchUp = payload.pending_catch_up !== null && payload.pending_catch_up !== undefined && typeof payload.pending_catch_up === 'object'
+    ? payload.pending_catch_up
+    : null;
+  if (pendingCatchUp === null) {
+    lines.push('catch-up      : none pending');
+  } else {
+    lines.push(
+      `catch-up      : PENDING missed slot ${String(pendingCatchUp.missed_slot ?? '?')} (` +
+        `${pendingCatchUp.on_start_enabled === true ? 'runs at start: opt-in enabled' : 'not run at mount; run a backup explicitly to clear it'})`,
+    );
+  }
   if (payload.ok !== true) lines.push(`refusal       : ${payload.reason_code} ${payload.detail ?? ''}`.trimEnd());
   return lines.join('\n');
 }

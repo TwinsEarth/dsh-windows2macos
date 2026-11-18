@@ -198,6 +198,11 @@
         backupFullCopyMaxMb: 300
         # old/ 总量不设上限（用户决定）：每增加 10 GB 只提醒一次，由用户决定是否手动清理（w2m-backup gc）；0 = 关闭提醒。
         backupOldUsageReminderGb: 10
+        # v3.5.1 内存与启动安全：漏槽补跑默认不在挂载路径自动执行（只记 pending_catch_up 并排下一槽）；
+        # 显式人工 run（面板/CLI）或下一槽才跑。设 true 恢复旧行为（仍在 12 小时窗口内，且延迟到挂载栈外）。
+        backupCatchUpOnStart: false
+        # v3.5.1 内存护栏上限（MB）：引擎在物化大文件前检查 heapUsed，超出则以 BACKUP_MEMORY_GUARD 命名拒绝而非 OOM；0 = 关闭。
+        backupMaxHeapMb: 1536
         # 每次成功的定时备份后异步跑一次 G5 运行时终审并写缓存（面板默认显示最新记录；off 可关闭）。
         backupRuntimeVerify: nightly
         # P0/P3: registry/config/state and the w2m restore copies are on by default - a backup without them cannot

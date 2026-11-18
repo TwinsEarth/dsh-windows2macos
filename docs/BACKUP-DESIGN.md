@@ -1899,3 +1899,95 @@ restore copies 留在仓库快照里，归档 manifest 记 `counts.restore_copie
   它们自动变小，需要人工清理（副本的保留策略仍是 restore 的 `keep_pre_restore`）。
 - 启用 `restore_copies` 会增加快照的 manifest 条目数，`verify` 的 `coverage.covered.by_scope` 会多一个
   `restore_copies` bucket，`uncovered` 里该目录的类别从 `self-copy` 变为 `restore-copy`；`--scopes` 可随时把它排除。
+
+### 27.7 内存与启动安全（3.5.1）
+
+**事故（P0）**：DSH 桌面 0.2.2-rc.5（Node 24 / Electron 44，宿主 V8 堆 ~4 GB）启用
+`@twinsearth/w2m-dsh-plugin@3.5.0` 后，插件管理器 journal 的
+`reason:"bundle", stage:"enable", phase:"started"` 永不落定，几秒到两分钟后宿主以
+`Scavenge (during sweeping) ... Allocation failed - JavaScript heap out of memory` 崩溃。用户禁用全部第三方
+插件后启动正常，仅重新启用 w2m 立即复现 —— 炸点在**插件挂载/启用路径**，不在渲染进程。
+
+**根因（已 headless 复现，非推断）**：
+
+1. **补跑落在挂载路径上**。备份子插件的 `apply()` 调用 `scheduler.start()`；22:00 槽 + 默认 12 小时
+   补跑窗口，使每次开机都命中"漏槽"，`start()` 直接 `void fire()` 触发整个**同步** `runBackup`（扫描、
+   读取 118 MB 会话日志、轮转、写块），返回后（`result.ok`）又在同一事件循环轮次开始
+   `verifyRepo({runtime:true})`。实测：`apply()` 返回后 100 ms 采样器一次都没再运行（事件循环被占满），
+   `--max-old-space-size=1024` 子进程 17.8 s 后 OOM、峰值 WS 1.36 GB。宿主的 enable 操作同样在等这个
+   事件循环，所以它"永不落定"而不是"返回失败"。
+2. **逐项放大的分配**：
+   - `readSessionHeader` 用 `fs.readFileSync` 读**整个**会话日志（真实 118 MB/次；scan 阶段实测峰值
+     WS 163 MB）。header 只在第一个 zstd frame 里，实测 255 字节。
+   - `verifyRepo` 对**每个快照的每个文件**调 `rebuildFile` 整体物化（真实 21 个快照 × 118 MB），
+     `verify` 里的 `old/` 整文件 `.enc` 副本（上限 300 MiB/个）也整体解密；两处都无堆护栏。1 GB 堆下
+     `runtime:false` 17.8 s OOM（峰值 WS 1.34 GB）、`runtime:true` 25.6 s OOM。
+   - G5：`verifyRepo({runtime:true})` 在内存里**累积**每个快照每个会话的两份已解码 artifact（真实
+     21 快照 × 44 会话 = 924 份）后才启动一次 runtime 批。
+   - `storeFileBlocks` 整文件 `readFileSync` 后再分 4 MiB 块；真实形状 fixture 的整次备份
+     18.9 s OOM（峰值 WS 1.36 GB）。
+
+**修复（3.5.1）**：
+
+- **A. 挂载路径不再跑任何备份/校验**。新增行配置 `backupCatchUpOnStart`，**默认 `false`**：
+  - `false`：`apply()` 只做纯时钟算术，把漏槽写成一个 **`pending_catch_up` 记录**（missed slot、窗口、
+    detected_at、需要显式行动），持久化到 `<DSH_HOME>/xclient/w2m-backup/state.json`，在 describe
+    （`GET /api/w2m/backup/run`）、状态卡（`GET /api/w2m/backup/status`）和 `w2m-backup status` 可见；
+    然后只安排下一个 22:00 槽。补跑只能由**显式人工 run**（面板/CLI）或下一槽触发。
+  - `true`：保留旧行为（仍在 12 小时窗口内），但通过 `setImmediate`/可注入 `defer` **延迟到挂载栈之外**
+    执行；`createDailyScheduler` 新增 `catchUpOnStart` 选项（默认 true，自更新检查器行为不变）。
+  - 实测（fixture：真实 home 形状 + 200 MB 日志 + 1.36 GB `old/`）：`apply()` 28 ms，返回时 heap ~9 MB，
+    10 s 观察窗内事件循环间隔 5 ms、峰值 WS 46 MB；修复前同条件 OOM。
+- **B. header 有界读**。`readSessionHeader` 按 64 KiB `fs.read` 步进、上限
+  `SESSION_HEADER_SCAN_CAP_BYTES = 1 MiB`，只解析第一个 frame；header frame 超过上限按
+  `BACKUP_SCAN_HEADER_UNREADABLE` 命名拒绝，绝不整文件缓冲。`hashFile` 同样 64 KiB 分块哈希。
+  实测 123.8 MB 日志：实际读取 64 KiB、heap 增量 57 KB、arrayBuffers 增量 1.05 MB；scan 阶段峰值
+  163 MB → RSS 46 MB（external 155 MB → 38 MB）。
+- **C. verify / 物化有界**。新增 `digestEntryStreaming`：逐 4 MiB 块解密+哈希，峰值约一个块
+  （`streaming.peak_block_bytes` 实测 4.19 MB），`verifyRepo` 对 ≥32 MiB（`streamThresholdBytes`
+  可配，0 = 全部流式）的条目走该路径，`old/` 记录也走流式。`.enc` 整文件副本校验前先过
+  `oldCopyMaxBytes`（默认 512 MiB）与堆护栏，超限/拒绝返回命名 code
+  （`BACKUP_VERIFY_OLD_COPY_TOO_LARGE` / `BACKUP_MEMORY_GUARD`）。`rebuildFile` 物化前过护栏；
+  restore 的单条目超限同样以 `BACKUP_MEMORY_GUARD` 命名拒绝。`verify` 结果新增 `streaming` 计数。
+  实测同一 21 快照仓库：`runtime:false` 17.8 s OOM → 191 s、0 problem，峰值 WS 950→859 MB（1 GB 堆
+  限制下通过）；`runtime:true` → 199 s、0 problem、峰值 WS 894 MB。
+- **D. G5 有界**。runtime 终审只对**最新快照**的会话逐条进行：每会话一个 `[原始, 追加一帧]` 批次，
+  缓冲区在该次迭代后释放（`runtime_verified.snapshots = 1` 说明覆盖范围）；旧快照的块/摘要仍全量校验，
+  历史 runtime 结论由缓存记录承载。单会话超过 `runtimeMaxBytes`（默认 32 MiB）时按
+  `BACKUP_RUNTIME_SKIPPED_LARGE` 跳过并计数。实测：41 个会话逐个验证、2 个大日志命名跳过、0 problem；
+  不再出现 924 份 artifact 累积。
+- **E. 引擎护栏与流式存储**。新增 `src/backup/memory-guard.mjs`：
+  `BACKUP_MEMORY_GUARD`，默认上限 `DEFAULT_MAX_HEAP_BYTES = 1.5 GiB`（4 GB 宿主的合理份额）；
+  `0` 显式关闭（文档化，非推断）。`storeFileBlocks` 对 >16 MiB 文件改为**单块复用缓冲 + 增量哈希 +
+  逐块 seal**（峰值约 8 MB），帧结构用 `scanFramesFromFile`（只读帧头，不读 payload）做撕裂检测；大文件
+  的整文件 future-append 模拟 / runtime artifact 按 `BACKUP_FUTURE_APPEND_SKIPPED_LARGE` /
+  `BACKUP_RUNTIME_ARTIFACT_SKIPPED_LARGE` 命名跳过（字节仍原样存储，verify 后续可按需检查）。
+  `runBackup` 结果新增 `memory_guard`（limit/checks/refusals）。实测：真实形状 fixture 整次备份
+  18.9 s OOM（峰值 WS 1.36 GB）→ 7.7 s 成功（峰值 WS 379 MB、heap 156 MB）。
+
+**新默认（务必记住）**：`backupCatchUpOnStart: false` —— **挂载不跑补跑**。要恢复 3.5.0 的自动补跑，
+在 `cordis.patch.yml` 的 dsh-backup 行写 `backupCatchUpOnStart: true`；它依然受 12 小时窗口与内存护栏
+约束，并延迟到挂载栈外。漏槽是否待处理看 `pending_catch_up`；显式 run 成功后该记录清除。
+
+**测量汇总（before → after，同一 fixture：真实 home 形状 + 21 快照仓库 + 1.36 GB `old/`）**：
+
+| 阶段 | 3.5.0（1 GB 堆子进程） | 3.5.1 |
+| --- | --- | --- |
+| `apply()` 挂载 | 17.8 s 后 OOM，峰值 WS 1.36 GB；事件循环 0 次采样 | 28 ms 返回；10 s 峰值 WS 46 MB；事件循环间隔 5 ms |
+| `scanHome` | 峰值 WS 163 MB（整读 118 MB 日志） | 峰值 RSS 46 MB；header 实读 64 KiB |
+| `runBackup`（六 scope、full、300 MB cap） | 18.9 s OOM，峰值 WS 1.36 GB | 7.7 s 成功，峰值 WS 379 MB |
+| `verifyRepo({runtime:false})` | 17.8 s OOM，峰值 WS 1.34 GB | 191 s、0 problem，峰值 WS 859 MB |
+| `verifyRepo({runtime:true})` | 25.6 s OOM，峰值 WS 1.23 GB | 199 s、0 problem，峰值 WS 894 MB；41 验证 / 2 命名跳过 |
+
+**诚实边界（本版未做/不承诺）**：
+
+- 引擎是同步 API：显式 run / 到点的定时 run 仍会在宿主主线程上**占用事件循环直到完成**（现在内存有界、
+  块级 I/O，不会再 OOM，但 GUI 在那段时间仍会变慢）。交给 worker_threads（独立堆 +
+  `resourceLimits.maxOldGenerationSizeMb`）是下一步，本版未改，因为它是引擎 API 的结构性改动。
+- 大文件的整文件 future-append 预筛被命名跳过（`BACKUP_FUTURE_APPEND_SKIPPED_LARGE`）；verify 对
+  流式条目同样报告 skipped，不冒充 checked。字节本身仍按摘要逐块校验。
+- verify 的 runtime 终审只覆盖最新快照；旧快照的 runtime 结论来自其成为最新时的缓存记录。
+- `old/` 的 `.enc` 整文件副本校验仍需整体解密（格式是单一 sealed object），因此用
+  `oldCopyMaxBytes` + 堆护栏双重上限；超过 512 MiB 的副本会被命名跳过而不是流式校验。
+- mount 时会写一条很小的 `pending_catch_up` 状态（`state.json`，~1 KB）：这是可见性所需的最小 I/O，
+  不触发扫描/备份/校验。

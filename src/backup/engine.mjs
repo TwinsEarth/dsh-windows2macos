@@ -81,6 +81,7 @@
  * an invalid value is refused before the scan/layout/lock/key like every other policy option.
  */
 
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -99,6 +100,8 @@ import { DEFAULT_KEEP_OLD, buildOldUsageReport, measureOldUsage, oldUsageReminde
 import { MIRROR_CODES, resolveMirrorRoot, syncToMirror } from './mirror.mjs';
 import { commitSnapshot, makeSnapshotId } from './repo.mjs';
 import { scanFrames } from '../fix/zstd.mjs';
+import { scanFramesFromFile } from '../fix/zstd.mjs';
+import { BACKUP_MEMORY_GUARD, checkMemory, createMemoryGuardReport, resolveMaxHeapBytes } from './memory-guard.mjs';
 
 /** Backup scopes. `selected` is only meaningful with an explicit list of session ids. */
 export const SCOPES = Object.freeze(['all', 'active', 'archived', 'selected']);
@@ -118,6 +121,24 @@ export const ENGINE_CODES = Object.freeze({
 
 /** Block size used by the engine; identical to the manifest's, referenced for readability. */
 const BLOCK_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Files above this size are stored **block-by-block from disk** instead of being read whole (v3.5.1).
+ *
+ * 3.5.0 read every session log into one Buffer to hash/split it. The real 118 MB log made that a 118 MB external
+ * allocation per run on the host's main thread; the streaming path below reads one {@link BLOCK_BYTES} chunk at a
+ * time, so the same run costs ~8 MB regardless of the file. The future-append simulation is deferred for these
+ * files with a named, reported skip (`BACKUP_FUTURE_APPEND_SKIPPED_LARGE`): it needs the whole log, and a backup
+ * must not OOM to run a pre-filter. G3's bytes are still stored unchanged; `verify` does the same after the fact
+ * for files it can afford.
+ */
+export const DEFAULT_STREAM_STORE_THRESHOLD_BYTES = 16 * 1024 * 1024;
+
+/** Named skip reason for the deferred future-append simulation on a large log. */
+export const FUTURE_APPEND_SKIPPED_LARGE = 'BACKUP_FUTURE_APPEND_SKIPPED_LARGE';
+
+/** Named skip reason for the deferred runtime artifact on a large log. */
+export const RUNTIME_ARTIFACT_SKIPPED_LARGE = 'BACKUP_RUNTIME_ARTIFACT_SKIPPED_LARGE';
 
 /**
  * Validate a scope request.
@@ -192,6 +213,24 @@ export function blockObjectPath(root, sha256) {
  *   torn: boolean, container_error: string|null}}
  */
 export function storeFileBlocks(input) {
+  let stat;
+  try {
+    stat = fs.statSync(input.file);
+  } catch (error) {
+    return { error: { reason_code: ENGINE_CODES.WRITE_FAILED, detail: `${input.file}: ${error?.code ?? 'unreadable'}` } };
+  }
+  const streamThreshold = Number.isSafeInteger(input.streamThresholdBytes) && input.streamThresholdBytes >= 0
+    ? input.streamThresholdBytes
+    : DEFAULT_STREAM_STORE_THRESHOLD_BYTES;
+  if (stat.size > streamThreshold) return storeFileBlocksStreaming({ ...input, fileBytes: stat.size });
+  const guard = checkMemory(input.memoryReport ?? null, {
+    requestedBytes: stat.size * 3,
+    maxHeapBytes: input.maxHeapBytes,
+    label: input.file,
+  });
+  if (guard.ok !== true) {
+    return { error: { reason_code: BACKUP_MEMORY_GUARD, detail: guard.detail }, memory_guard: guard };
+  }
   let buffer;
   try {
     buffer = fs.readFileSync(input.file);
@@ -272,8 +311,128 @@ export function storeFileBlocks(input) {
     torn,
     container_error: containerError,
     future_append: future,
+    future_append_skipped: null,
     runtime_artifact: runtimeArtifact,
+    runtime_artifact_skipped: null,
+    streamed: false,
   };
+}
+
+/**
+ * Store one file block-by-block without ever holding the whole file (v3.5.1).
+ *
+ * Frame structure is checked with a header-only walk over the file descriptor ({@link scanFramesFromFile}), so the
+ * same torn-frame retry as the buffered path is preserved without a whole-file buffer. Blocks are read into one
+ * reusable {@link BLOCK_BYTES} chunk, hashed, sealed and written before the next chunk replaces it. The
+ * future-append simulation and the runtime artifact need whole-file bytes and are skipped by name here; verify
+ * reports the same deferral after the fact.
+ *
+ * @param {{root: string, file: string, dek: Buffer, dryRun: boolean, expectZstd?: boolean, futureAppend?: boolean,
+ *   runtimeFutureAppend?: boolean, maxHeapBytes?: number|null, memoryReport?: object|null, fileBytes: number}} input
+ * @returns {ReturnType<typeof storeFileBlocks>}
+ */
+export function storeFileBlocksStreaming(input) {
+  const { file } = input;
+  const size = input.fileBytes;
+  let torn = false;
+  let containerError = null;
+  if (input.expectZstd === true && size > 0) {
+    const check = () => {
+      try {
+        const walked = scanFramesFromFile(file);
+        return { tornStart: walked.tornStart !== undefined, error: null };
+      } catch (error) {
+        return { tornStart: false, error: error instanceof Error ? error.message : String(error) };
+      }
+    };
+    let verdict = check();
+    if (verdict.tornStart) {
+      const second = fs.existsSync(file) ? check() : null;
+      if (second !== null && second.tornStart === false && second.error === null) verdict = second;
+    }
+    torn = verdict.tornStart;
+    containerError = verdict.error;
+  }
+  const hash = createHashFile();
+  const blocks = [];
+  let blocksNew = 0;
+  let blocksReused = 0;
+  let bytesWritten = 0;
+  let bytesRead = 0;
+  const fd = fs.openSync(file, 'r');
+  try {
+    const chunk = Buffer.allocUnsafe(Math.min(BLOCK_BYTES, Math.max(1, size)));
+    let offset = 0;
+    let index = 0;
+    while (offset < size) {
+      const length = Math.min(BLOCK_BYTES, size - offset);
+      const read = fs.readSync(fd, chunk, 0, length, offset);
+      if (read !== length) {
+        return { error: { reason_code: ENGINE_CODES.WRITE_FAILED, detail: `${file}: short read at ${offset} (${read}/${length})` } };
+      }
+      const blockBytes = length === chunk.length ? chunk : chunk.subarray(0, length);
+      const sha256 = sha256Hex(blockBytes);
+      hash.update(blockBytes);
+      blocks.push({ index, offset, length, sha256 });
+      const object = blockObjectPath(input.root, sha256);
+      if (fs.existsSync(object)) {
+        blocksReused += 1;
+      } else if (input.dryRun) {
+        blocksNew += 1;
+        bytesWritten += length;
+      } else {
+        const guard = checkMemory(input.memoryReport ?? null, {
+          requestedBytes: length * 2,
+          maxHeapBytes: input.maxHeapBytes,
+          label: `${file}#${index}`,
+        });
+        if (guard.ok !== true) return { error: { reason_code: BACKUP_MEMORY_GUARD, detail: guard.detail }, memory_guard: guard };
+        const sealed = sealObject(blockBytes, input.dek, { sha256, length });
+        try {
+          writeFileAtomic(object, sealed);
+        } catch (error) {
+          return { error: { reason_code: error?.code ?? ENGINE_CODES.WRITE_FAILED, detail: error?.detail ?? String(error?.message ?? error) } };
+        }
+        blocksNew += 1;
+        bytesWritten += length;
+      }
+      offset += length;
+      index += 1;
+      bytesRead += read;
+    }
+  } finally {
+    try {
+      fs.closeSync(fd);
+    } catch {
+      /* the result is what matters */
+    }
+  }
+  const description = { size, mtime_ms: safeMtime(file), sha256: hash.digest('hex'), blocks };
+  const futureSkipped = input.expectZstd === true && input.futureAppend !== false
+    ? { reason_code: FUTURE_APPEND_SKIPPED_LARGE, detail: `${file}: ${size} bytes is above the ${DEFAULT_STREAM_STORE_THRESHOLD_BYTES}-byte streamed threshold; the whole-file future-append simulation was deferred` }
+    : null;
+  const runtimeSkipped = input.expectZstd === true && input.runtimeFutureAppend === true && input.dryRun !== true
+    ? { reason_code: RUNTIME_ARTIFACT_SKIPPED_LARGE, detail: `${file}: ${size} bytes is above the streamed threshold; the runtime artifact was deferred to verify` }
+    : null;
+  return {
+    description,
+    blocks_new: blocksNew,
+    blocks_reused: blocksReused,
+    bytes_written: bytesWritten,
+    bytes_read: bytesRead,
+    torn,
+    container_error: containerError,
+    future_append: null,
+    future_append_skipped: futureSkipped,
+    runtime_artifact: undefined,
+    runtime_artifact_skipped: runtimeSkipped,
+    streamed: true,
+  };
+}
+
+/** A SHA-256 hash object; split out so the streaming reader does not import crypto at module top level twice. */
+function createHashFile() {
+  return createHash('sha256');
 }
 
 /** Read a file, or `null` when it cannot be read. */
@@ -378,6 +537,14 @@ export function runBackup(input) {
   // The P1 credential opt-in. Only the exact boolean `true` includes credentials: `backupIncludeSecrets: 1` is a
   // caller bug, not consent.
   const includeSecrets = input.includeSecrets === true;
+  // The memory guard's ceiling (v3.5.1): every materialisation below asks before it allocates. It is a policy
+  // value like the caps above, so a non-numeric value is refused before the scan and nothing is written.
+  const heapPolicy = resolveMaxHeapBytes(input.maxHeapBytes);
+  if (heapPolicy.ok !== true) {
+    return { ok: false, reason_code: heapPolicy.reason_code, detail: heapPolicy.detail, dry_run: dryRun };
+  }
+  const maxHeapBytes = heapPolicy.maxHeapBytes;
+  const memoryReport = createMemoryGuardReport();
 
   // The offsite mirror is validated here too: a mirror path that points inside the repository (or the home it
   // copies) is refused before ensureLayout/lock/commit, so a refused configuration leaves no snapshot behind.
@@ -575,16 +742,29 @@ export function runBackup(input) {
     const entries = [];
     const tornSessions = [];
     const invalidContainers = [];
-    const futureAppend = { checked: 0, failed: 0, sessions: [], evidence: 'static-prefilter' };
+    const futureAppend = { checked: 0, failed: 0, skipped: 0, sessions: [], skipped_sessions: [], evidence: 'static-prefilter' };
     // G5 runtime evidence: appended logs are queued and validated once, at the end, by the installed Harness.
     const runtimeQueue = input.runtimeFutureAppend === true ? [] : null;
+    // Sessions whose whole-file artifact was deferred because the file is above the streamed threshold (named,
+    // reported; verify can ask the runtime about them later from the repository).
+    const runtimeSkipped = input.runtimeFutureAppend === true ? [] : null;
     let blocksNew = 0;
     let blocksReused = 0;
     let bytesWritten = 0;
     let bytesRead = 0;
 
     for (const session of selection.chosen) {
-      const stored = storeFileBlocks({ root, file: session.file, dek: key.dek, dryRun, expectZstd: true, futureAppend: input.futureAppend, runtimeFutureAppend: input.runtimeFutureAppend });
+      const stored = storeFileBlocks({
+        root,
+        file: session.file,
+        dek: key.dek,
+        dryRun,
+        expectZstd: true,
+        futureAppend: input.futureAppend,
+        runtimeFutureAppend: input.runtimeFutureAppend,
+        maxHeapBytes,
+        memoryReport,
+      });
       if (stored.error !== undefined) return { ok: false, ...stored.error, dry_run: dryRun };
       blocksNew += stored.blocks_new;
       blocksReused += stored.blocks_reused;
@@ -598,6 +778,15 @@ export function runBackup(input) {
           futureAppend.failed += 1;
           futureAppend.sessions.push({ rel: session.rel, codes: stored.future_append.codes });
         }
+      }
+      // A large log's whole-file simulation is deferred by name (v3.5.1): the backup still stores its bytes, and
+      // the result says exactly which sessions were not pre-screened and why, rather than quietly claiming a check.
+      if (stored.future_append_skipped !== null && stored.future_append_skipped !== undefined) {
+        futureAppend.skipped += 1;
+        futureAppend.skipped_sessions.push({ rel: session.rel, ...stored.future_append_skipped });
+      }
+      if (stored.runtime_artifact_skipped !== null && stored.runtime_artifact_skipped !== undefined && runtimeSkipped !== null) {
+        runtimeSkipped.push({ rel: session.rel, ...stored.runtime_artifact_skipped });
       }
       if (runtimeQueue !== null && stored.runtime_artifact !== undefined) {
         runtimeQueue.push({ rel: session.rel, artifact: stored.runtime_artifact });
@@ -618,7 +807,7 @@ export function runBackup(input) {
       });
     }
     for (const attachment of attachmentsToStore) {
-      const stored = storeFileBlocks({ root, file: attachment.file, dek: key.dek, dryRun, expectZstd: false });
+      const stored = storeFileBlocks({ root, file: attachment.file, dek: key.dek, dryRun, expectZstd: false, maxHeapBytes, memoryReport });
       if (stored.error !== undefined) return { ok: false, ...stored.error, dry_run: dryRun };
       blocksNew += stored.blocks_new;
       blocksReused += stored.blocks_reused;
@@ -635,7 +824,7 @@ export function runBackup(input) {
     // content-addressed blocks too; only the manifest entry differs (`kind`/`scope`/`reason`). No future-append
     // simulation and no rotation: they are not session logs.
     for (const extra of collected.files) {
-      const stored = storeFileBlocks({ root, file: extra.file, dek: key.dek, dryRun, expectZstd: false });
+      const stored = storeFileBlocks({ root, file: extra.file, dek: key.dek, dryRun, expectZstd: false, maxHeapBytes, memoryReport });
       if (stored.error !== undefined) return { ok: false, ...stored.error, dry_run: dryRun };
       blocksNew += stored.blocks_new;
       blocksReused += stored.blocks_reused;
@@ -677,17 +866,28 @@ export function runBackup(input) {
     // G5: one runtime process validates every appended log. A failed measurement is reported, never turned into
     // a pass; a refused appended log is reported with the Harness's own detail.
     let runtimeFutureAppend = null;
-    if (runtimeQueue !== null && runtimeQueue.length > 0) {
-      const batch = runtimeValidateBatch({ artifacts: runtimeQueue.map((row) => row.artifact), env: input.env });
-      const summary = { available: batch.available, evidence: 'installed-harness', checked: runtimeQueue.length, failed: 0, sessions: [] };
-      for (const [index, row] of runtimeQueue.entries()) {
-        const verdict = batch.verdicts[index] ?? { ok: false, detail: 'no verdict' };
-        if (verdict.ok !== true) {
-          summary.failed += 1;
-          summary.sessions.push({ rel: row.rel, detail: verdict.detail });
+    if (runtimeQueue !== null) {
+      if (runtimeQueue.length > 0) {
+        const batch = runtimeValidateBatch({ artifacts: runtimeQueue.map((row) => row.artifact), env: input.env });
+        const summary = { available: batch.available, evidence: 'installed-harness', checked: runtimeQueue.length, failed: 0, sessions: [] };
+        for (const [index, row] of runtimeQueue.entries()) {
+          const verdict = batch.verdicts[index] ?? { ok: false, detail: 'no verdict' };
+          if (verdict.ok !== true) {
+            summary.failed += 1;
+            summary.sessions.push({ rel: row.rel, detail: verdict.detail });
+          }
         }
+        runtimeFutureAppend = summary;
       }
-      runtimeFutureAppend = summary;
+      // The deferrals are reported even when every session was deferred (an empty queue must not look like "all
+      // checked"): v3.5.1 runs this pre-screen only for logs small enough to hold whole.
+      if (runtimeSkipped !== null && runtimeSkipped.length > 0) {
+        runtimeFutureAppend = {
+          ...(runtimeFutureAppend ?? { available: null, evidence: 'installed-harness', checked: 0, failed: 0, sessions: [] }),
+          skipped: runtimeSkipped.length,
+          skipped_sessions: runtimeSkipped,
+        };
+      }
     }
 
     if (dryRun) {
@@ -756,6 +956,10 @@ export function runBackup(input) {
         // is tied to the bytes that triggered it, not to the whole run.
         approvedOverCap: approvedOverCapIds.has(entry.session_id),
         capBytes: maxFullCopyBytes,
+        // The memory guard covers the whole-file rebuild a `full` copy needs (v3.5.1): a copy that would not fit
+        // is refused by name, and the run reports `committed: true` rather than dying after the snapshot landed.
+        maxHeapBytes,
+        memoryReport,
       }));
     } catch (error) {
       return {
@@ -886,6 +1090,15 @@ export function runBackup(input) {
       invalid_containers: invalidContainers,
       future_append: futureAppend,
       runtime_future_append: runtimeFutureAppend,
+      // What the guard decided during this run (v3.5.1): the ceiling, how many materialisations were checked and
+      // which ones were refused by name. `ok` is false only when something was refused, and the run's own `ok`
+      // already reflects that (the refusal is the reason the run stopped).
+      memory_guard: {
+        limit_bytes: memoryReport.limit_bytes,
+        checks: memoryReport.checks,
+        refusals: memoryReport.refusals,
+        refused: memoryReport.refused,
+      },
       dedupe_ratio: blocksNew + blocksReused === 0 ? 0 : blocksReused / (blocksNew + blocksReused),
       unlocked_via: key.unlocked_via,
       encryption: key.encryption ?? null,

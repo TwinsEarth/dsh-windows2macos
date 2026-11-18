@@ -147,6 +147,11 @@ export function buildStatus(options = {}) {
     password_hint: passwordHint,
     warning,
     old_usage: oldUsage,
+    // v3.5.1: a missed slot detected at mount is recorded (never run from the mount path by default). The card,
+    // the CLI status and the panel read the same persisted record; an explicit run clears it.
+    pending_catch_up: persistedState.pending_catch_up !== null && typeof persistedState.pending_catch_up === 'object'
+      ? persistedState.pending_catch_up
+      : null,
     schedule: { ...DEFAULT_SCHEDULE },
     read_only: true,
     ...(inspected.error === null ? {} : { reason_code: inspected.error.code, detail: inspected.error.detail }),

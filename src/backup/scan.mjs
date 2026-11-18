@@ -62,6 +62,20 @@ export const SCAN_CODES = Object.freeze({
   SESSION_NOT_ZSTD: 'BACKUP_SCAN_NOT_ZSTD',
 });
 
+/**
+ * How many bytes of a session log the header reader may look at (v3.5.1).
+ *
+ * The DSH format puts the session envelope in the **first zstd frame**, and that frame is one JSON line: measured
+ * at 255 bytes in the real 118 MB log. 3.5.0 read the whole file with `fs.readFileSync` to find those bytes --
+ * 118 MB of external memory per session, and the scheduled scan walks every log. The bounded read below stops at
+ * this cap and fails by name when the header frame does not fit in it, which is a format this build does not
+ * understand rather than a file to buffer whole.
+ */
+export const SESSION_HEADER_SCAN_CAP_BYTES = 1024 * 1024;
+
+/** Chunk size of the bounded header read: small enough that the cap, not the file size, bounds the buffer. */
+const HEADER_READ_CHUNK_BYTES = 64 * 1024;
+
 /** Convert an absolute path under `root` into a forward-slash relative path. */
 export function toRel(root, file) {
   return path.relative(path.resolve(root), path.resolve(file)).split(path.sep).join('/');
@@ -74,7 +88,19 @@ export function toRel(root, file) {
  * @returns {string}
  */
 export function hashFile(file) {
-  return createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+  const hash = createHash('sha256');
+  const fd = fs.openSync(file, 'r');
+  try {
+    const chunk = Buffer.allocUnsafe(HEADER_READ_CHUNK_BYTES);
+    for (;;) {
+      const read = fs.readSync(fd, chunk, 0, chunk.length, null);
+      if (read <= 0) break;
+      hash.update(read === chunk.length ? chunk : chunk.subarray(0, read));
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+  return hash.digest('hex');
 }
 
 /**
@@ -85,50 +111,111 @@ export function hashFile(file) {
  * R2), so this is both cheap and the correct place to look.
  *
  * @param {string} file
- * @returns {{ok: true, header: object, format_version: number} | {ok: false, code: string, detail: string}}
+ * @param {{maxBytes?: number}} [options] test/CLI seam: a smaller cap; production uses the module default.
+ * @returns {{ok: true, header: object, format_version: number, read_bytes: number}
+ *   | {ok: false, code: string, detail: string, read_bytes?: number}}
  */
-export function readSessionHeader(file) {
-  let buf;
+export function readSessionHeader(file, options = {}) {
+  const requestedCap = Number.isSafeInteger(options.maxBytes) && options.maxBytes > 0
+    ? options.maxBytes
+    : SESSION_HEADER_SCAN_CAP_BYTES;
+  let fd;
+  let size;
   try {
-    buf = fs.readFileSync(file);
+    fd = fs.openSync(file, 'r');
+    size = fs.fstatSync(fd).size;
   } catch (error) {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* the unreadable answer is what matters */
+      }
+    }
     return { ok: false, code: SCAN_CODES.SESSION_HEADER_UNREADABLE, detail: `${file}: ${error?.code ?? 'unreadable'}` };
   }
-  if (buf.length === 0) {
-    return { ok: false, code: SCAN_CODES.SESSION_HEADER_UNREADABLE, detail: `${file}: empty` };
-  }
-  if (buf.readUInt32LE(0) !== 0xfd2fb528) {
-    return { ok: false, code: SCAN_CODES.SESSION_NOT_ZSTD, detail: `${file}: not a zstd container` };
-  }
-  if (!hasZstd()) {
-    return { ok: false, code: SCAN_CODES.SESSION_HEADER_UNREADABLE, detail: 'this Node runtime has no zstd support' };
-  }
-  let frames;
   try {
-    frames = scanFrames(buf, 1).frames;
-  } catch (error) {
-    return { ok: false, code: SCAN_CODES.SESSION_NOT_ZSTD, detail: `${file}: ${error instanceof Error ? error.message : String(error)}` };
+    if (size === 0) {
+      return { ok: false, code: SCAN_CODES.SESSION_HEADER_UNREADABLE, detail: `${file}: empty`, read_bytes: 0 };
+    }
+    const cap = Math.min(size, requestedCap);
+    // One buffer, bounded by the cap (<= 1 MiB in production), never by the file size.
+    const buffer = Buffer.allocUnsafe(cap);
+    let filled = 0;
+    let firstFrame = null;
+    let sawMagic = false;
+    while (filled < cap) {
+      const want = Math.min(HEADER_READ_CHUNK_BYTES, cap - filled);
+      let read;
+      try {
+        read = fs.readSync(fd, buffer, filled, want, filled);
+      } catch (error) {
+        return { ok: false, code: SCAN_CODES.SESSION_HEADER_UNREADABLE, detail: `${file}: ${error?.code ?? 'unreadable'}`, read_bytes: filled };
+      }
+      if (read <= 0) break;
+      filled += read;
+      if (!sawMagic) {
+        if (filled < 4) continue;
+        sawMagic = true;
+        if (buffer.readUInt32LE(0) !== 0xfd2fb528) {
+          return { ok: false, code: SCAN_CODES.SESSION_NOT_ZSTD, detail: `${file}: not a zstd container`, read_bytes: filled };
+        }
+        if (!hasZstd()) {
+          return { ok: false, code: SCAN_CODES.SESSION_HEADER_UNREADABLE, detail: 'this Node runtime has no zstd support', read_bytes: filled };
+        }
+      }
+      let frames;
+      try {
+        frames = scanFrames(buffer.subarray(0, filled), 1).frames;
+      } catch (error) {
+        return {
+          ok: false,
+          code: SCAN_CODES.SESSION_NOT_ZSTD,
+          detail: `${file}: ${error instanceof Error ? error.message : String(error)}`,
+          read_bytes: filled,
+        };
+      }
+      if (frames.length === 0) continue;
+      firstFrame = frames[0];
+      break;
+    }
+    if (firstFrame === null) {
+      return {
+        ok: false,
+        code: SCAN_CODES.SESSION_HEADER_UNREADABLE,
+        detail: `${file}: no complete frame within the first ${cap} byte(s) (header scan cap ${requestedCap})`,
+        read_bytes: filled,
+      };
+    }
+    let text;
+    try {
+      text = decompressFrame(buffer.subarray(firstFrame.start, firstFrame.end));
+    } catch (error) {
+      return {
+        ok: false,
+        code: SCAN_CODES.SESSION_HEADER_UNREADABLE,
+        detail: `${file}: ${error instanceof Error ? error.message : String(error)}`,
+        read_bytes: filled,
+      };
+    }
+    const first = text.split('\n')[0];
+    let header;
+    try {
+      header = JSON.parse(first);
+    } catch {
+      return { ok: false, code: SCAN_CODES.SESSION_HEADER_UNREADABLE, detail: `${file}: the first line is not JSON`, read_bytes: filled };
+    }
+    if (header?.type !== 'session' || !Number.isSafeInteger(header?.version)) {
+      return { ok: false, code: SCAN_CODES.SESSION_HEADER_UNREADABLE, detail: `${file}: the first line is not a session header`, read_bytes: filled };
+    }
+    return { ok: true, header, format_version: header.version, read_bytes: filled };
+  } finally {
+    try {
+      fs.closeSync(fd);
+    } catch {
+      /* the parsed answer is what matters */
+    }
   }
-  if (frames.length === 0) {
-    return { ok: false, code: SCAN_CODES.SESSION_HEADER_UNREADABLE, detail: `${file}: no complete frame` };
-  }
-  let text;
-  try {
-    text = decompressFrame(buf.subarray(frames[0].start, frames[0].end));
-  } catch (error) {
-    return { ok: false, code: SCAN_CODES.SESSION_HEADER_UNREADABLE, detail: `${file}: ${error instanceof Error ? error.message : String(error)}` };
-  }
-  const first = text.split('\n')[0];
-  let header;
-  try {
-    header = JSON.parse(first);
-  } catch {
-    return { ok: false, code: SCAN_CODES.SESSION_HEADER_UNREADABLE, detail: `${file}: the first line is not JSON` };
-  }
-  if (header?.type !== 'session' || !Number.isSafeInteger(header?.version)) {
-    return { ok: false, code: SCAN_CODES.SESSION_HEADER_UNREADABLE, detail: `${file}: the first line is not a session header` };
-  }
-  return { ok: true, header, format_version: header.version };
 }
 
 /**
