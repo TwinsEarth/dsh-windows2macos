@@ -1391,12 +1391,21 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
   it('shows the backup scopes and a loud credentials warning when the row includes secrets', () => {
     const { bundle } = mountBackup();
     const plain = bundle.exports.BackupPanelView(viewProps({
-      status: { ok: true, scopes: ['sessions', 'attachments', 'registry', 'config', 'state'], include_secrets: false, state: {} },
+      status: {
+        ok: true,
+        scopes: ['sessions', 'attachments', 'registry', 'config', 'state'],
+        include_secrets: false,
+        state: {},
+        status: { latest: { counts_by_scope: { sessions: 40, attachments: 2, registry: 1, config: 6, state: 12 } } },
+      },
     }));
     const scopeRow = findBy(plain, (node) => node.props?.['data-w2m-backup-scopes'] !== undefined)[0];
     assert.ok(scopeRow !== undefined, 'the status card names the backup scopes');
     assert.equal(scopeRow.props['data-w2m-backup-scopes'], 'sessions,attachments,registry,config,state');
     assert.equal(findBy(plain, (node) => node.props?.['data-w2m-backup-secrets-warning'] !== undefined).length, 0, 'no warning when the row does not include credentials');
+    const countsRow = findBy(plain, (node) => node.props?.['data-w2m-backup-scope-counts'] !== undefined)[0];
+    assert.ok(countsRow !== undefined, 'the status card shows the latest snapshot per-scope counts');
+    assert.match(String(countsRow.props['data-w2m-backup-scope-counts']), /"sessions":40/);
 
     const secret = bundle.exports.BackupPanelView(viewProps({
       status: { ok: true, scopes: ['sessions', 'attachments', 'registry', 'config', 'state'], include_secrets: true, state: {} },

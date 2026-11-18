@@ -104,6 +104,8 @@ export function buildStatus(options = {}) {
                   sessions: repoState.latest.manifest?.sessions ?? 0,
                   bytes: repoState.latest.manifest?.session_bytes ?? 0,
                   digest: repoState.latest.digest,
+        // P0/P3: per-scope file counts of the latest snapshot; the panel renders them next to the scope list.
+        counts_by_scope: repoState.latest.manifest?.counts_by_scope ?? null,
                 },
           index: repoState.index,
         }),
