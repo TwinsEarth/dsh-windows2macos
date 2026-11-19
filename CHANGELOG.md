@@ -3,6 +3,14 @@
 All notable changes to this project are documented here.
 
 ## [Unreleased]
+
+### G4 renumber：`image/offload` 的 `data.targets[].seq` 引用改写（未发布）
+
+- **修复**：真实机器复核（2026-11-19，`g4_renumber_boundary`）发现 `src/backup/renumber.mjs` 的引用改写只认 `*Seq`/`*Seqs` 键，而 `image/offload` 事件把消息 seq 引用放在小写的 `data.targets[].seq` 里；删/插事件移位后该引用仍指向旧 seq，安装的 Harness 以 `RENUMBER_RUNTIME_REJECTED`（`invalid seed event ... image/offload: image index 0 does not exist`）安全拒绝（零写入）。现在只对 `type === 'image/offload'` 事件的 `data.targets[i].seq` 应用同一 old→new 映射；指向被删除/越界 seq 的 target 复用 `RENUMBER_DANGLING_REFERENCE` 具名拒绝；事件自身顶层 `seq` 仍只由密集重编号赋值，其他小写 `seq` 字段含义不变。
+- **测试**：`test/fix-renumber.test.mjs` 新增 8 项（单 target 删前事件后改写到 N−1 且安装 Harness 接受、多 target 全改、删 target 本身具名拒绝且零写入无 `.bak`、target seq 越界同样具名拒绝、删 target 之后 target 不变、offload 事件自身 seq 与 target seq 不混淆、非 `image/offload` 的小写 `seq` 不改写；安装 Harness 一项按既有模式无安装时跳过）。
+- **文档**：`docs/BACKUP-DESIGN.md` §20.1 引用规则与 §20.2 流水线补充 `image/offload` target 规则，§20.5 测试清单更新。
+- **验证**：`npx eslint .`（0 error）、`node scripts/layer-check.mjs`、`node scripts/scan-mojibake.mjs`、`node --test --test-force-exit test/fix-renumber.test.mjs`（38/38）、`node --test --test-force-exit test/backup-verify.test.mjs`（25/25）全绿。**不 bump 版本（仍 3.5.1）、不提交、不跑 preflight、不发布。**
+
 ## [3.5.1] - 2026-11-18
 
 ### P0 挂载即崩：3.5.0 启用 w2m 后宿主 OOM 的根因与内存护栏（未发布）

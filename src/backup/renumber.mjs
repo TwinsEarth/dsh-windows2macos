@@ -14,7 +14,8 @@
  *   parse (frames -> rows; torn / non-v4 / non-dense / bad edits are refused)
  *   -> apply delete/insert to the event list
  *   -> renumber: `seq` becomes the dense index 0..N-1
- *   -> rewrite every `*Seq` / `*Seqs` integer reference old->new; a reference to a deleted seq is a hard refusal
+ *   -> rewrite every `*Seq` / `*Seqs` integer reference old->new, plus the one lower-case reference
+ *      (`image/offload` `data.targets[].seq`); a reference to a deleted seq is a hard refusal
  *   -> recompute `inheritedEventCount` from the last `session/end-seed` with `data.inherited === true`
  *   -> encode (header alone in frame 1, then one frame per event)
  *   -> plan validates the RESULT: static doctor (G1 pre-filter) + future-append simulation (G3) + installed
@@ -72,8 +73,15 @@ export const RENUMBER_CODES = Object.freeze({
  * it is the same question ("does this number address a seq?") and the same regex, so a new `*Seq` field is
  * covered without a second list. `seq` itself does not match (case-sensitive), which is what keeps the
  * renumbering from rewriting the new seq values it just assigned.
+ *
+ * One reference shape is not a key at all: an `image/offload` event addresses the messages it marks through
+ * `data.targets[].seq` (lower case, inside an array). It is rewritten by {@link rewriteImageOffloadTargets},
+ * scoped to that event type and that array only.
  */
 const SEQ_REF_KEY = /(?:Seq|Seqs)$/;
+
+/** The one event type that addresses message events through `data.targets[].seq`. */
+const IMAGE_OFFLOAD_EVENT_TYPE = 'image/offload';
 
 /** How many dangling references a refusal quotes before truncating. */
 const MAX_DANGLING_DETAILS = 5;
@@ -253,6 +261,10 @@ function normalizeEdits(edits, eventCount) {
  * `data.messageSeqs`, `surfaceOp.startSeq`/`endSeq`, and deeper fields the client may add). An unmappable value
  * is recorded and left alone: guessing a replacement is exactly the failure class this gate exists to prevent.
  *
+ * The lower-case `image/offload` target reference is handled after the walk by
+ * {@link rewriteImageOffloadTargets}; the walk itself must not touch a plain `seq`, because that is the event's
+ * own dense position.
+ *
  * @param {object} event
  * @param {{alias: Map<number, number>, deleted: Set<number>, rewritten: number, dangling: object[]}} context
  */
@@ -278,6 +290,31 @@ function rewriteEventReferences(event, context) {
     }
   };
   walk(event, '');
+  rewriteImageOffloadTargets(event, context);
+}
+
+/**
+ * Rewrite the message references an `image/offload` event carries in `data.targets[].seq`.
+ *
+ * The event marks image occurrences by the seq of the message event that owns them; after an insert/delete that
+ * seq moves with the event. Only this one event type and this one array are touched: a lower-case `seq` anywhere
+ * else keeps the meaning it already has, and the event's own top-level `seq` is never a reference (it is assigned
+ * from its dense position later). A target naming a deleted or unknown seq goes through the same
+ * `RENUMBER_DANGLING_REFERENCE` refusal as a dangling `*Seq` key: guessing the corrected target is exactly the
+ * failure this gate exists to prevent.
+ *
+ * @param {object} event
+ * @param {{alias: Map<number, number>, deleted: Set<number>, rewritten: number, dangling: object[]}} context
+ */
+function rewriteImageOffloadTargets(event, context) {
+  if (event.type !== IMAGE_OFFLOAD_EVENT_TYPE) return;
+  const targets = event.data?.targets;
+  if (!Array.isArray(targets)) return;
+  for (const [index, target] of targets.entries()) {
+    if (target === null || typeof target !== 'object' || Array.isArray(target)) continue;
+    if (!Number.isInteger(target.seq)) continue;
+    target.seq = mapReference(target.seq, { at: `data.targets[${index}].seq`, key: 'seq', eventType: event.type }, context);
+  }
 }
 
 /**

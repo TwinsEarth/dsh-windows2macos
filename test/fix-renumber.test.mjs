@@ -134,6 +134,64 @@ function insertLog(sessionId = 'session-bbbbbbbb-0002') {
 
 const LEGAL_APPEND_EVENT = { type: 'permission/preset', time: 2005, data: { preset: 'workspace-write' } };
 
+/** The image block the runtime's own `image/offload` projection can mark as offloaded (index 0 of the message). */
+const OFFLOADABLE_IMAGE = {
+  type: 'image',
+  attachment: { attachmentId: `sha256:${'ab'.repeat(32)}`, mediaType: 'image/png', bytes: 10, width: 1, height: 1 },
+};
+
+/**
+ * An `image/offload`-bearing log the installed Harness accepts (verified against it; see the runtime-gated case).
+ *
+ * `seq 0` is session-level, so deleting it is a legal edit that shifts every following event: the referenced
+ * message moves 2 -> 1 and the `image/offload` event itself moves 4 -> 3. That is the measured G4 boundary: the
+ * target reference lives in the lower-case `data.targets[].seq` and used to keep pointing at the old index.
+ */
+function imageOffloadLog(sessionId = 'session-nnnnnnnn-0013') {
+  return framesFor([
+    header(sessionId),
+    { type: 'permission/preset', seq: 0, time: 1000, data: { preset: 'workspace-write' } },
+    { type: 'turn/start', seq: 1, time: 1001, data: { turn: 1 } },
+    {
+      type: 'user/message',
+      seq: 2,
+      time: 1002,
+      surfaceOp: 'append',
+      data: { id: 'm1', role: 'user', content: [OFFLOADABLE_IMAGE], source: { kind: 'human' } },
+    },
+    { type: 'turn/end', seq: 3, time: 1003, data: { turn: 1, reason: { kind: 'completed' } } },
+    { type: 'image/offload', seq: 4, time: 1004, data: { targets: [{ seq: 2, imageIndexes: [0] }] } },
+  ]);
+}
+
+/** An `image/offload` event with two targets (image-bearing messages at seqs 1 and 2). */
+function multiTargetOffloadLog(sessionId = 'session-nnnnnnnn-0014') {
+  return framesFor([
+    header(sessionId),
+    { type: 'turn/start', seq: 0, time: 2000, data: { turn: 1 } },
+    {
+      type: 'user/message',
+      seq: 1,
+      time: 2001,
+      surfaceOp: 'append',
+      data: { id: 'm1', role: 'user', content: [OFFLOADABLE_IMAGE], source: { kind: 'human' } },
+    },
+    {
+      type: 'user/message',
+      seq: 2,
+      time: 2002,
+      surfaceOp: 'append',
+      data: { id: 'm2', role: 'user', content: [OFFLOADABLE_IMAGE], source: { kind: 'human' } },
+    },
+    {
+      type: 'image/offload',
+      seq: 3,
+      time: 2003,
+      data: { targets: [{ seq: 1, imageIndexes: [0] }, { seq: 2, imageIndexes: [0] }] },
+    },
+  ]);
+}
+
 describe('renumber: deleting an event renumbers densely and rewrites every reference', () => {
   const sessionId = 'session-aaaaaaaa-0001';
 
@@ -308,6 +366,178 @@ describe('renumber: refusals are named and write nothing', () => {
     assert.deepEqual(renumberBuffer(buffer, { insert: [{ atSeq: 3, event: LEGAL_APPEND_EVENT }] }).codes, [RENUMBER_CODES.INPUT_INVALID]);
     assert.deepEqual(renumberBuffer(buffer, { insert: [{ atSeq: 1, event: { type: 'session' } }] }).codes, [RENUMBER_CODES.INPUT_INVALID]);
   });
+});
+
+/**
+ * The G4 renumber boundary found by real-machine verification of v3.5.1 (2026-11-19): `image/offload` events
+ * address the message events they mark through the lower-case `data.targets[].seq`, which the `*Seq`/`*Seqs`
+ * suffix rule does not match. A renumber that shifts a target seq therefore left the reference pointing at the
+ * old index and the installed Harness refused the result with a safe, zero-write `RENUMBER_RUNTIME_REJECTED`
+ * ("image index 0 does not exist"). These cases pin the reference: it follows the same old -> new mapping, a
+ * deleted target is the same named refusal as a deleted `*Seq` reference, and the event's own top-level `seq`
+ * is still never treated as a reference.
+ */
+describe('renumber: image/offload data.targets[].seq is a reference (G4 boundary)', () => {
+  it('rewrites data.targets[].seq through the old -> new mapping when an event before it is deleted', () => {
+    const sessionId = 'session-nnnnnnnn-0013';
+    const result = renumberBuffer(imageOffloadLog(sessionId), { deleteSeqs: [0] });
+
+    assert.equal(result.ok, true, JSON.stringify(result.detail));
+    assert.equal(result.changed, true);
+    assert.equal(result.events_before, 5);
+    assert.equal(result.events_after, 4);
+    assert.deepEqual(result.mapping, { 1: 0, 2: 1, 3: 2, 4: 3 }, 'every surviving event moved one seq down');
+    assert.equal(result.rewritten_references, 1, 'the target seq is the only reference in the fixture (the event own seq is not a reference)');
+
+    const { rows } = decodeLog(result.buffer);
+    assert.deepEqual(rows.slice(1).map((event) => event.seq), [0, 1, 2, 3]);
+    const offload = rows.find((event) => event.type === 'image/offload');
+    assert.deepEqual(offload.data, { targets: [{ seq: 1, imageIndexes: [0] }] }, 'exact JSON: the target now names the message at its new seq');
+    assert.equal(offload.seq, 3, 'the offload event own seq follows its dense position 4 -> 3');
+    assert.equal(rows[2].type, 'user/message', 'the referenced message is the one now at seq 1');
+    assert.equal(diagnoseSessionBuffer(result.buffer, { expectedSessionId: sessionId }).ok, true);
+  });
+
+  it('rewrites every target in one image/offload event', () => {
+    const result = renumberBuffer(multiTargetOffloadLog(), { deleteSeqs: [0] });
+
+    assert.equal(result.ok, true, JSON.stringify(result.detail));
+    assert.equal(result.rewritten_references, 2, 'both target seqs moved 1 -> 0 and 2 -> 1');
+    const { rows } = decodeLog(result.buffer);
+    const offload = rows.find((event) => event.type === 'image/offload');
+    assert.deepEqual(offload.data, { targets: [{ seq: 0, imageIndexes: [0] }, { seq: 1, imageIndexes: [0] }] });
+    assert.equal(offload.seq, 2, 'the offload event itself moved 3 -> 2');
+  });
+
+  it('refuses with the named dangling-reference code when the edit deletes a target message, and writes nothing', () => {
+    const sessionId = 'session-nnnnnnnn-0013';
+    const { file } = fixtureFile(imageOffloadLog(sessionId));
+    const before = fs.readFileSync(file);
+
+    const direct = renumberBuffer(before, { deleteSeqs: [2] });
+    assert.equal(direct.ok, false);
+    assert.deepEqual(direct.codes, [RENUMBER_CODES.DANGLING_REFERENCE], 'the same code a dangling *Seq reference gets');
+    assert.equal(direct.detail.references[0].event_type, 'image/offload');
+    assert.equal(direct.detail.references[0].key, 'seq');
+    assert.equal(direct.detail.references[0].at, 'data.targets[0].seq');
+    assert.equal(direct.detail.references[0].seq, 2);
+    assert.equal(direct.detail.references[0].deleted, true);
+    assert.match(direct.detail.message, /references seq 2/);
+
+    const plan = planRenumber({ file, deleteSeqs: [2], ...STATIC_ONLY });
+    assert.equal(plan.ok, false);
+    assert.equal(plan.reason_code, RENUMBER_CODES.DANGLING_REFERENCE);
+    assert.match(plan.detail, /seq 2/);
+    assert.equal(plan.new_bytes, null, 'a refusal carries no bytes to write');
+
+    const applied = applyRenumber({ plan });
+    assert.equal(applied.ok, false);
+    assert.equal(applied.reason_code, RENUMBER_CODES.DANGLING_REFERENCE);
+    assert.equal(fs.readFileSync(file).equals(before), true, 'the file is byte-identical');
+    assert.deepEqual(backupSiblings(file), [], 'no backup is written for a refusal');
+  });
+
+  it('refuses a target seq that no event carries (out of range) with the same named code', () => {
+    const buffer = framesFor([
+      header('session-nnnnnnnn-0016'),
+      { type: 'turn/start', seq: 0, time: 4000, data: { turn: 1 } },
+      {
+        type: 'user/message',
+        seq: 1,
+        time: 4001,
+        surfaceOp: 'append',
+        data: { id: 'm1', role: 'user', content: [OFFLOADABLE_IMAGE], source: { kind: 'human' } },
+      },
+      { type: 'image/offload', seq: 2, time: 4002, data: { targets: [{ seq: 9, imageIndexes: [0] }] } },
+    ]);
+
+    const result = renumberBuffer(buffer, {});
+    assert.equal(result.ok, false);
+    assert.deepEqual(result.codes, [RENUMBER_CODES.DANGLING_REFERENCE], 'an unresolvable target is a refusal, not a pass-through');
+    assert.equal(result.detail.references[0].event_type, 'image/offload');
+    assert.equal(result.detail.references[0].at, 'data.targets[0].seq');
+    assert.equal(result.detail.references[0].seq, 9);
+    assert.equal(result.detail.references[0].deleted, false);
+  });
+
+  it('leaves the target unchanged when the edit deletes an event after it', () => {
+    // seq 3 is the turn/end after the referenced message and before the offload event: the target does not move.
+    const result = renumberBuffer(imageOffloadLog(), { deleteSeqs: [3] });
+
+    assert.equal(result.ok, true, JSON.stringify(result.detail));
+    assert.equal(result.rewritten_references, 0, 'nothing references a seq that moved');
+    const { rows } = decodeLog(result.buffer);
+    const offload = rows.find((event) => event.type === 'image/offload');
+    assert.deepEqual(offload.data, { targets: [{ seq: 2, imageIndexes: [0] }] }, 'the target still names the message at seq 2');
+    assert.equal(offload.seq, 3, 'the offload event itself moved 4 -> 3, which is not a reference rewrite');
+  });
+
+  it('never confuses the event own top-level seq with its data.targets[].seq values', () => {
+    const result = renumberBuffer(imageOffloadLog(), { deleteSeqs: [0] });
+
+    assert.equal(result.ok, true, JSON.stringify(result.detail));
+    const { rows } = decodeLog(result.buffer);
+    const offload = rows.find((event) => event.type === 'image/offload');
+    assert.equal(offload.seq, 3, 'own seq = dense position (4 -> 3)');
+    assert.deepEqual(offload.data.targets, [{ seq: 1, imageIndexes: [0] }], 'target = referenced message seq (2 -> 1)');
+    assert.notEqual(offload.seq, offload.data.targets[0].seq, 'the two values are independent');
+  });
+
+  it('does not rewrite a lower-case seq inside a non-image/offload event', () => {
+    const buffer = framesFor([
+      header('session-nnnnnnnn-0015'),
+      { type: 'turn/start', seq: 0, time: 3000, data: { turn: 1 } },
+      { type: 'tool/call', seq: 1, time: 3001, data: { callId: 'c1', tool: { seq: 7, nested: { seq: 8 } } } },
+      { type: 'tool/result', seq: 2, time: 3002, data: { callId: 'c1' } },
+      { type: 'turn/end', seq: 3, time: 3003, data: { turn: 1, reason: { kind: 'completed' } } },
+    ]);
+    const result = renumberBuffer(buffer, { deleteSeqs: [0] });
+
+    assert.equal(result.ok, true, JSON.stringify(result.detail));
+    assert.equal(result.rewritten_references, 0, 'a plain lower-case seq is not a reference anywhere else');
+    const { rows } = decodeLog(result.buffer);
+    const call = rows.find((event) => event.type === 'tool/call');
+    assert.equal(call.seq, 0, 'the event own seq is still renumbered densely');
+    assert.equal(call.data.tool.seq, 7, 'the unrelated lower-case seq keeps its meaning');
+    assert.equal(call.data.tool.nested.seq, 8);
+  });
+
+  it(
+    'the installed Harness accepts the renumbered log (the measured boundary: without the rewrite it refuses)',
+    { skip: harness === null ? 'no DeepSeek Harness installation on this machine' : false },
+    () => {
+      const sessionId = 'session-nnnnnnnn-0013';
+      const original = imageOffloadLog(sessionId);
+
+      // Prove the fixture is the shape this case needs before asserting on the plan.
+      const preVerdict = runtimeValidate({ buffer: original, harness });
+      assert.equal(preVerdict.ok, true, `the fixture must be runtime-valid before the edit: ${preVerdict.detail}`);
+
+      // The boundary itself: the same delete WITHOUT the target rewrite is refused by the installed Harness
+      // (the 2026-11-19 finding). If this ever starts passing, the case no longer proves the rewrite matters.
+      const decoded = decodeLog(original);
+      const shifted = decoded.rows
+        .slice(1)
+        .filter((_event, index) => index !== 0)
+        .map((event, index) => ({ ...event, seq: index }));
+      const brokenVerdict = runtimeValidate({ buffer: framesFor([header(sessionId), ...shifted]), harness });
+      assert.equal(brokenVerdict.ok, false, 'the unrewritten target is refused by the installed Harness');
+      assert.match(brokenVerdict.detail, /image\/offload/);
+
+      const { file } = fixtureFile(original);
+      const plan = planRenumber({ file, deleteSeqs: [0] });
+      assert.equal(plan.ok, true, plan.detail);
+      assert.equal(plan.validation.runtime_verified, true, 'the installed Harness validated the renumbered result');
+      assert.equal(plan.validation.future_append_evidence, 'installed-harness');
+      assert.match(plan.detail, /1 reference\(s\) rewritten/);
+      const offload = decodeLog(plan.new_bytes).rows.find((event) => event.type === 'image/offload');
+      assert.deepEqual(offload.data, { targets: [{ seq: 1, imageIndexes: [0] }] });
+
+      const applied = applyRenumber({ plan });
+      assert.equal(applied.ok, true, applied.detail);
+      assert.equal(runtimeValidate({ buffer: fs.readFileSync(file), harness }).ok, true, 'the applied log still passes the installed Harness');
+    },
+  );
 });
 
 describe('renumber: a dense log with no edits is a no-op', () => {

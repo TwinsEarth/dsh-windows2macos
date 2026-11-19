@@ -698,7 +698,9 @@ v3.4.8 当时**没有做**（还原只发布原始字节，§15.6）；2026-11-1
 * **引用规则**：任何键名匹配 `/(?:Seq|Seqs)$/`、值为整数（或整数数组）的字段都是引用，一律 old→new 改写；
   递归遍历，所以 `data.sourceEventSeqs`、`data.messageSeqs`、`headerSeq`、`surfaceOp.startSeq/endSeq` 以及将来
   新增的 `*Seq` 字段都被覆盖。指向**被删除事件**的引用直接拒绝（`RENUMBER_DANGLING_REFERENCE`，detail 给出事件
-  类型/键/seq），不猜替代值。
+  类型/键/seq），不猜替代值。此外 `image/offload` 事件把消息引用放在小写的 `data.targets[].seq`（在数组内，不匹配
+  `*Seq` 后缀），同样按 old→new 映射；指向被删除或越界事件的 target 复用同一个 `RENUMBER_DANGLING_REFERENCE` 拒绝，
+  事件自身的顶层 `seq` 仍只由密集重编号赋值、从不按引用改写（2026-11-19 真实机器复核发现的 G4 边界）。
 * **插入事件**：`atSeq` 把事件插在"当前位于 atSeq 的事件之前"，`atSeq === 事件数` 追加。插入事件自身的 `seq`
   被覆盖为新的 dense 下标；它携带的 `*Seq` 引用按**编辑前**的 seq 解释（因此无法用新 seq 指向另一个插入事件）。
 * **inherited 计数**：按"最后一个 `session/end-seed` 且 `data.inherited === true` 的位置"重算
@@ -712,7 +714,7 @@ v3.4.8 当时**没有做**（还原只发布原始字节，§15.6）；2026-11-1
 parse（拆帧→解行；torn / 非 v4 / 非 dense / 非法编辑 → 具名拒绝）
   → 应用 delete/insert
   → renumber（seq = 0..N-1）
-  → 改写所有 *Seq 引用（悬空 → 拒绝，不猜）
+  → 改写所有 *Seq 引用与 image/offload 的 data.targets[].seq（悬空 → 拒绝，不猜）
   → 重算 inheritedEventCount
   → 编码（header 单帧 + 每事件一帧）
   → 校验 RESULT：doctor 预筛(G1) + "未来追加"模拟(G3) + 安装 Harness 终审(G5，唯一证据)
@@ -755,11 +757,14 @@ node bin/w2m-fix.mjs renumber --file <session.v4.jsonl.zstd> [--delete-seq <n>].
 
 ### 20.5 测试与诚实边界
 
-`test/fix-renumber.test.mjs`（21 项）覆盖：删中间事件（dense、递归引用改写、`surfaceOp` 改写、header/其他字段
+`test/fix-renumber.test.mjs`（38 项）覆盖：删中间事件（dense、递归引用改写、`surfaceOp` 改写、header/其他字段
 保留、mapping/持有计数正确）、插入/追加、悬空引用拒绝且零写入、torn 拒绝、no-op、apply 后再 plan 的幂等、运行时
 门禁（安装的 Harness 拒绝静态合法日志 → `RENUMBER_RUNTIME_REJECTED`；注入无安装 → `RENUMBER_RUNTIME_UNAVAILABLE`；
 `--allow-static-validation` 才降级且标 `runtime_verified:false`）、`.bak` 保留原始字节 + 写后 sha/doctor 复验、
-plan 后文件变化拒绝覆盖、dry-run 零写入、CLI 退出码/帮助/真实入口追加。
+plan 后文件变化拒绝覆盖、dry-run 零写入、CLI 退出码/帮助/真实入口追加；以及 `image/offload` 的
+`data.targets[].seq` 按 old→new 位移（删前事件后改写到 N−1 并过安装 Harness、多 target 全改、删 target 本身
+具名拒绝且零写入无 `.bak`、删 target 之后不动、事件自身 seq 与 target 不混淆、非 `image/offload` 的小写 `seq`
+不改写）。
 
 **"未来追加模拟失败"分支的可达性（2026-11-17 补齐论证）**：`planRenumber({futureAppendCheck})` 是一条**只有
 测试能走**的缝，因为对 `renumberBuffer` 的产出它在构造上不可达：
