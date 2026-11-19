@@ -1,0 +1,42 @@
+{
+  "version": "3.5.3",
+  "case": "RELEASE-3530-CONSOLIDATED",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-19T16:57:43.109Z",
+  "executor": "lead",
+  "task_id": "w2m-v353-release",
+  "requirement": "v3.5.3 consolidates four verified change sets: (1) the SSE header-deadline defect that aborted every healthy stream 5 s after attach (task.offer re-delivery and task.cancel could be lost; introduced in v2.0.5) is fixed with a dedicated header AbortController cleared when fetch settles, plus a regression test that fails on the previous code; (2) the queue-journal client is slot-based (conversation.input.left chip, shell.overlay drawer, sidebar.panellist visible fallback, window.__W2M_QUEUE_JOURNAL__ diagnostics) so a DSH layout change can no longer make it silently disappear, verified by a real Chromium page probe; (3) the decision center shows session names instead of raw session ids and humanizes decision option labels through a synchronous rules pass plus an optional LLM pass with tooltip provenance, manual re-run route and rate limiting; (4) the P1 refactor slices (tool surface snapshot guard, backup engine worker_threads with named OOM/timeout failures and inline fallback, tools/agent/relay-state decomposition, client budget meter fix) are all in the tree with their contract guards. Pre-flight is required to be GREEN twice before tagging, and the tag is pushed so the Release workflow can verify, pack and publish.",
+  "commands": [
+    [
+      "node",
+      "scripts/pack.mjs"
+    ],
+    [
+      "node",
+      "scripts/preflight.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/agent.test.mjs",
+      "test/queue-journal.test.mjs",
+      "test/dc-ux.test.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "sse_fix": "heartbeat.mjs uses a dedicated AbortController for the header deadline and clears it when fetch settles; the response body is bounded by the first-frame/idle watchdog. Regression: a task outliving a shortened 2 s header deadline still attaches exactly once (fails on the pre-fix tree: 3 !== 1).",
+      "sse_evidence": "isolated loop before fix 2/15 failures at 126-127 s (TimeoutError at 5019 ms after attach, no second offer); after fix 15/15 (3.0-3.4 s), 8/8 under 4 busy loops, 5/5 with W2M_SSE_FIRST_FRAME_MS=1000; test/agent.test.mjs 161 pass / 0 fail / 2 skip; test/p2p-*.test.mjs 257/257.",
+      "queue_journal": "slots conversation.input.left + shell.overlay (fallback shell.bottom, visible sidebar.panellist fallback), diagnostics window.__W2M_QUEUE_JOURNAL__ with status/surface/reasons/dshVersion, DOM composer path only behind a diagnosed compatibility branch; real Chromium probe passed (chip slotted, draft reached xclient/queue-journal, drawer listed it, restore wrote it back).",
+      "decision_center": "session titles resolved host-side (bounded session-log read + cache, GET /api/w2m/decisions/session-titles) with client fallback \"未命名会话 · 尾 6 位\" and raw id only in tooltips; option labels pass a synchronous rules humanizer (markdown/URL/numbering stripping, dedupe, imperative phrasing, CJK-aware 28-char cap) plus an optional strict-JSON LLM pass (10 s timeout, fallback on any error, LRU cache), optionsHumanized provenance, rawLabel tooltips, manual POST /api/w2m/decisions/humanize-options with rate limiting; existing choose/advise flows unchanged.",
+      "p1_slices": "tool surface digest pinned (18 tools sha256 409a6652...), backup engine runs on worker_threads with resourceLimits 1024 MB and named BACKUP_WORKER_OOM/TIMEOUT/FAILED plus inline fallback, tools.mjs 8,908->610, agent.mjs 4,770->638, relay state.mjs 3,713->1,174 with real-process phase2 9/9 and mixed 6/6, client budget meter corrected (real largest function 832, budget ceiling 1,200).",
+      "gates": "pre-flight is GREEN: 4,404 tests / 4,382 pass / 0 fail / 22 skip before this release-prep commit; eslint 0 errors; layer-check and mojibake clean. The release workflow additionally re-runs the entrypoint, join, lint and pack checks on the tag.",
+      "not_verified": "no real-machine RSS/GUI curve was measured for the worker_threads engine (synthetic host measurement only: inline 0 tick vs worker 12 ticks, max gap 19.3 ms); npm publication depends on the Stable environment approval in the Release workflow."
+    }
+  }
+}

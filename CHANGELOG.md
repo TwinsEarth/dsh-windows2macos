@@ -4,6 +4,8 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [3.5.3] — 2026-11-20
+
 ### 决策中心 UX：会话名替代裸 Session ID；决策选项口语化（可调用智能）（未发布）
 
 - **会话名**：本轮待选/暂停列表/会话 chip 不再显示裸 Session ID。宿主新增会话标题解析（`src/decision-center/lib/session-titles.mjs`，
@@ -91,7 +93,7 @@ All notable changes to this project are documented here.
   `409a6652675fc66608525b4437f07e17f3a5898ab7b61297e6c0309654a82f5a` 不变，注册顺序与导出面不变；
   4 个源码守卫测试仅改读取路径（断言未动）。
 
-## [3.5.2] - 2026-11-19
+## [3.5.2] — 2026-11-19
 
 ### G4 renumber：`image/offload` 的 `data.targets[].seq` 引用改写（未发布）
 
