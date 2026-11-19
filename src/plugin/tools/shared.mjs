@@ -2442,7 +2442,7 @@ async function startLocalStack(ctx, cfg) {
   if ((Array.isArray(cfg.relayUrls) ? cfg.relayUrls.length : 0) === 0
     && typeof cfg.bootstrapUrl === 'string' && typeof cfg.bootstrapOperatorKeyPem === 'string') {
     try {
-      const { resolveBootstrap } = await import(new URL('./bootstrap.mjs', import.meta.url).href);
+      const { resolveBootstrap } = await import(new URL('../bootstrap.mjs', import.meta.url).href);
       const { homedir } = await import('node:os');
       const { join } = await import('node:path');
       const cacheFile = join(cfg.stateDir ?? join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'xclient'), 'bootstrap.json');
@@ -2478,8 +2478,8 @@ async function startLocalStack(ctx, cfg) {
     cfg.bootstrap = { configured: typeof cfg.bootstrapUrl === 'string', url: cfg.bootstrapUrl ?? null, source: null, relays: [], expires_at: null, last_error: null };
   }
 
-  const relayUrl = new URL('../relay/server.mjs', import.meta.url);
-  const agentUrl = new URL('../agent/agent.mjs', import.meta.url);
+  const relayUrl = new URL('../../relay/server.mjs', import.meta.url);
+  const agentUrl = new URL('../../agent/agent.mjs', import.meta.url);
 
   let createRelay;
   let createAgent;
@@ -2748,7 +2748,7 @@ async function startLocalStack(ctx, cfg) {
       let last = null;
       for (let attempt = 1; attempt <= effectiveAttempts; attempt += 1) {
         try {
-          const { createAccountIdentity } = await import('../chatops/account.mjs');
+          const { createAccountIdentity } = await import('../../chatops/account.mjs');
           last = await createAccountIdentity({ ctx, platform: process.platform }).resolve();
         } catch (error) {
           last = { ok: false, reason: 'threw', detail: error instanceof Error ? error.message : String(error) };
@@ -2939,7 +2939,7 @@ async function startLocalStack(ctx, cfg) {
           if (alreadyPaired && effectiveFleetKey !== null) {
             let expectedFleetId = null;
             try {
-              const { planJoin } = await import('../chatops/fleet-join.mjs');
+              const { planJoin } = await import('../../chatops/fleet-join.mjs');
               const plan = planJoin({ fleetKeyEncoded: effectiveFleetKey });
               if (plan.ok === true) expectedFleetId = plan.fleetId;
             } catch { /* malformed key: binding cannot be compared, keep the token */ }
@@ -3161,7 +3161,7 @@ async function startLocalStack(ctx, cfg) {
       if (accountWatchBusy || cfg.fleetKeyPolicy === 'config') return;
       accountWatchBusy = true;
       try {
-        const { createAccountIdentity } = await import('../chatops/account.mjs');
+        const { createAccountIdentity } = await import('../../chatops/account.mjs');
         const identity = await createAccountIdentity({ ctx, platform: process.platform }).resolve();
         const derived = typeof identity?.fleetKey === 'string' && identity.fleetKey !== '' ? identity.fleetKey : null;
         if (derived === null) return;

@@ -701,7 +701,7 @@ export function registerStatus(ctx, deps) {
       let expectedFleetId = null;
       const statusFleetKey = resolvedFleetKey.value ?? cfg.fleetKey;
       try {
-        const { planJoin } = await import('../chatops/fleet-join.mjs');
+        const { planJoin } = await import('../../chatops/fleet-join.mjs');
         const plan = planJoin({ fleetKeyEncoded: statusFleetKey });
         if (plan.ok === true) expectedFleetId = plan.fleetId;
       } catch { /* malformed key: report without an expectation */ }
