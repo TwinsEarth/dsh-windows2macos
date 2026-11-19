@@ -10,6 +10,12 @@ yarn-error.log*
 *.spool
 spool/
 state/
+
+# P1/S5: the relay state machine's domain modules are SOURCE under src/relay/state/, not
+# runtime state. The pattern above targets adjacent runtime-state directories (e.g.
+# <DSH_HOME>/state/).
+!src/relay/state/
+!src/relay/state/**
 *.log
 
 # Test scratch space

@@ -11,7 +11,8 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 
-const agent = readFileSync(new URL('../src/agent/agent.mjs', import.meta.url), 'utf8');
+// P1/S4: the guarded wiring now lives in the execution phase (stage loop, blobs) and the envelope phase.
+const agent = ['agent.mjs', 'lifecycle/execute.mjs', 'lifecycle/deliver.mjs'].map((file) => readFileSync(new URL(`../src/agent/${file}`, import.meta.url), 'utf8')).join('\n');
 const tools = readFileSync(new URL('../src/plugin/tools/dispatch.mjs', import.meta.url), 'utf8');
 const orphans = readFileSync(new URL('../scripts/accepted-orphans.mjs', import.meta.url), 'utf8');
 
