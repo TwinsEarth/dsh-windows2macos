@@ -320,6 +320,22 @@ try {
     const rawUrl = `http://127.0.0.1:${String(webServer.port ?? 0)}`;
     const url = typeof connection.authenticatedUrl === 'function' ? connection.authenticatedUrl(rawUrl) : rawUrl;
     clientPage = await bootPage({ url, executable: browser.executable });
+    // v3.6.0: the queue journal's persistence is a file, so read the file the page's own host wrote.
+    // This is the assertion a route mock cannot make: the draft really landed under
+    // `$DSH_HOME/xclient/queue-journal`, the location the subplugin documents.
+    const journalFile = path.join(dshHome, 'xclient', 'queue-journal', 'composer-journal.json');
+    const journal = { path: journalFile, exists: fs.existsSync(journalFile), entries: null, probeDraft: null, error: null };
+    if (journal.exists) {
+      try {
+        const raw = JSON.parse(fs.readFileSync(journalFile, 'utf8'));
+        const rows = Object.values(raw).filter((row) => row !== null && typeof row === 'object');
+        journal.entries = rows.length;
+        journal.probeDraft = rows.find((row) => String(row?.draft ?? '').includes('probe-journal-draft'))?.draft ?? null;
+      } catch (error) {
+        journal.error = String(error?.message ?? error);
+      }
+    }
+    clientPage.journal = journal;
   }
 
   stage('read the composer control’s route from w2m_status');

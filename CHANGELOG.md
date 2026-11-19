@@ -4,6 +4,24 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### 队列日志抗版本更新加固（未发布）
+
+- **客户端槽位化**：队列日志 chip 注册到 `conversation.input.left`（id `w2m-queue-journal`，order 46），抽屉注册到
+  `shell.overlay`（order 91，候选 `shell.bottom`）——全部走 `ctx.slots.inject/register`；删除主路径的
+  `document.body.append(badge, overlay)` 与 `findComposer()` 面积启发式，DOM 只在 slot props 缺失时作为兼容分支使用，
+  并写入诊断（`dom-composer-fallback:*`）与一次 `console.warn`。
+- **永不静默消失**：`conversation.input.left` 注册失败/`shell.overlay` 缺失/缺 `inputActions` 时，注册可见的
+  `sidebar.panellist`「降级模式」入口（`data-w2m-jq-status="fallback"` + 提示文案）；页面级诊断对象
+  `window.__W2M_QUEUE_JOURNAL__ = {status, surface, reasons[], dshVersion, checkedAt}`，状态取
+  `slotted|fallback|disabled`，并检查 DSH 版本范围 `>=0.2.2-rc.1 <0.3.0`（超出范围保留 UI 并标注未验证）。
+- **宿主健壮性**：`xclient/queue-journal` 懒创建；损坏文件隔离并返回具名 `error` 而不是抛错；JSON body 具名拒绝、
+  draft/queue/title 上限、`fangAuthToken` 可选门。
+- **测试**：`client-bundle` 112/112、`queue-journal` 17/17、`client-budget` 3/3；真实 Edge 页面探针（`W2M_DSH_ROOT` +
+  `W2M_QUEUE_JOURNAL_PROBE=1`）**10/10 通过**：chip 槽位化、诊断正确（`slotted / conversation.input.left+shell.overlay`）、
+  输入草稿落到 `xclient/queue-journal/composer-journal.json`、drawer 列出条目、恢复写回 composer、关闭后 drawer 移除。
+- **体积**：`lib/client.js` 9,965 → 9,990 行，594,539 → **593,045 字节**（净 −1,494 B），预算守卫不变。
+- **文档**：新增 `docs/QUEUE-JOURNAL-COMPAT.md`（主/备槽位、诊断对象、升级检查命令、槽位改名时的单点更新与验收）。
+
 ### P1 重构：S4 agent 生命周期 + S5 relay 状态机拆分；P2-F 故障注入与 P2P 去重修复（未发布）
 
 - **S4 agent 生命周期拆分**：`src/agent/agent.mjs` 4,770 → **638 行**（`createAgent()` 365），拆为

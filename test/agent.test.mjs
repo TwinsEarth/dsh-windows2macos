@@ -2422,8 +2422,11 @@ describe('Localside agent end to end', () => {
     // Load-sensitive on purpose: this case performs a real child spawn plus three IPC round trips, and on a
     // loaded machine that chain once needed ~22 s and tripped the 15 s default budget. Every condition here is
     // event-based -- nothing sleeps for a fixed duration -- and the budgets are now large enough that "slow" is
-    // never reported as "broken". 60 s stays a ceiling: a genuine hang still fails, only later.
-    const BUDGET_MS = 60_000;
+    // never reported as "broken". 120 s is the ceiling: a genuine hang still fails, only later. It was raised
+    // from 60 s on 2026-11-19 because the release gate now also boots a real browser page (queue-journal probe)
+    // in the same run, and under that additional load the 60 s ceiling was reached on a healthy machine while
+    // this suite still passed in isolation -- i.e. the old ceiling was measuring the gate's load, not the code.
+    const BUDGET_MS = 120_000;
     const rabbit = await startFakeRabbit();
     const project = await makeRepo('e2e-dedupe');
     const marker = join(project, 'runs.txt');

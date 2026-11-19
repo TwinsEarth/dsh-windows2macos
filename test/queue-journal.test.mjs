@@ -7,7 +7,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as zlib from 'node:zlib';
@@ -46,7 +46,6 @@ function mount(config = {}, services = {}) {
       }
     },
     get(name) {
-      if (name === 'agents') return undefined;
       return provided.get(name);
     },
     provide(name, value) {
@@ -226,5 +225,146 @@ test('v3.3.18: an empty sessionKey is derived from the key for legacy rows', asy
     assert.equal(saved.sessionKey, 'session-new-1', 'a new human row stores the key as sessionKey');
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('v3.6.0: the state directory is created on first write, not on mount', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'w2m-qj-lazy-'));
+  const dataDir = join(root, 'nested', 'queue-journal');
+  try {
+    const { call } = mount({ dataDir });
+    assert.equal(existsSync(dataDir), false, 'mounting the subplugin must not create state');
+    const list = await call(`${QUEUE_JOURNAL_ROUTE_PREFIX}?list=1`);
+    assert.equal(list.status, 200);
+    assert.deepEqual(list.body.entries, [], 'a missing file is an empty journal, not an error');
+    assert.equal(Object.hasOwn(list.body, 'error'), false, 'ENOENT is not reported as an error');
+    assert.equal(existsSync(dataDir), false, 'a read must not create the directory either');
+    const saved = await call(QUEUE_JOURNAL_ROUTE_PREFIX, post({ key: 'session-lazy', draft: 'd', queue: [] }));
+    assert.equal(saved.status, 200);
+    assert.equal(existsSync(join(dataDir, 'composer-journal.json')), true, 'the first write creates the journal file');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('v3.6.0: a corrupt journal answers an empty list plus a named error and is quarantined on write', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'w2m-qj-corrupt-'));
+  const dataDir = join(root, 'journal');
+  try {
+    mkdirSync(dataDir, { recursive: true });
+    writeFileSync(join(dataDir, 'composer-journal.json'), '{"session-a": ', 'utf8');
+    const { call } = mount({ dataDir });
+    const list = await call(`${QUEUE_JOURNAL_ROUTE_PREFIX}?list=1`);
+    assert.equal(list.status, 200, 'a corrupt file must never crash the route');
+    assert.deepEqual(list.body.entries, []);
+    assert.equal(list.body.error, 'journal-unreadable');
+    const entry = await call(`${QUEUE_JOURNAL_ROUTE_PREFIX}?key=session-a`);
+    assert.equal(entry.status, 200);
+    assert.equal(entry.body.entry, null);
+    assert.equal(entry.body.error, 'journal-unreadable');
+    const saved = await call(QUEUE_JOURNAL_ROUTE_PREFIX, post({ key: 'session-recovered', draft: 'after corruption', queue: [] }));
+    assert.equal(saved.status, 200);
+    assert.deepEqual(JSON.parse(readFileSync(join(dataDir, 'composer-journal.json'), 'utf8'))['session-recovered'].draft, 'after corruption');
+    assert.ok(readdirSync(dataDir).some((name) => name.includes('.corrupt-')), 'the unreadable file is kept as a timestamped quarantine copy');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('v3.6.0: malformed, empty and non-object JSON bodies are refused by name', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'w2m-qj-body-'));
+  try {
+    const { call } = mount({ dataDir: root });
+    const malformed = await call(QUEUE_JOURNAL_ROUTE_PREFIX, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"key":' });
+    assert.equal(malformed.status, 400);
+    assert.equal(malformed.body.error, 'journal-body-invalid-json');
+    const empty = await call(QUEUE_JOURNAL_ROUTE_PREFIX, { method: 'POST', headers: { 'content-type': 'application/json' } });
+    assert.equal(empty.status, 400);
+    assert.equal(empty.body.error, 'journal-body-empty');
+    const array = await call(QUEUE_JOURNAL_ROUTE_PREFIX, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '[1,2]' });
+    assert.equal(array.status, 400);
+    assert.equal(array.body.error, 'journal-body-invalid');
+    const restore = await call(QUEUE_RESTORE_ROUTE_PATH, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{' });
+    assert.equal(restore.status, 400);
+    assert.equal(restore.body.error, 'journal-body-invalid-json');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('v3.6.0: the journal bounds queue length and text sizes instead of growing without limit', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'w2m-qj-caps-'));
+  try {
+    const { call } = mount({ dataDir: root });
+    const queue = Array.from({ length: 150 }, (_, index) => ({ text: 'item-' + index, at: index }));
+    const saved = await call(QUEUE_JOURNAL_ROUTE_PREFIX, post({ key: 'session-caps', draft: 'x'.repeat(120_000), queue, title: 't'.repeat(300) }));
+    assert.equal(saved.status, 200);
+    assert.equal(saved.body.entry.queue.length, 100, 'only the newest 100 queued messages are kept');
+    assert.equal(saved.body.entry.queue[0].text, 'item-50', 'the cap drops the oldest rows');
+    assert.equal(saved.body.entry.draft.length, 100_000, 'the draft cap is 100k characters');
+    assert.equal(saved.body.entry.title.length, 200, 'the title cap is 200 characters');
+    const longItem = await call(QUEUE_JOURNAL_ROUTE_PREFIX, post({ key: 'session-caps', draft: '', queue: [{ text: 'y'.repeat(5_000) }] }));
+    assert.equal(longItem.body.entry.queue[0].text.length, 4_000, 'one queued message is capped at 4000 characters');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('v3.6.0: clearing keeps the record and archives the content in history', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'w2m-qj-clear-'));
+  try {
+    const { call } = mount({ dataDir: root });
+    await call(QUEUE_JOURNAL_ROUTE_PREFIX, post({ key: 'session-clear', draft: 'unsent', queue: [{ text: 'queued' }] }));
+    const cleared = await call(QUEUE_JOURNAL_ROUTE_PREFIX, post({ key: 'session-clear', draft: '', queue: [] }));
+    assert.equal(cleared.status, 200);
+    assert.equal(cleared.body.entry.draft, '');
+    assert.equal(cleared.body.entry.queue.length, 0);
+    const history = await call(`${QUEUE_JOURNAL_ROUTE_PREFIX}/history?limit=10&sessionKey=session-clear`);
+    assert.equal(history.status, 200);
+    assert.ok(history.body.items.some((item) => item.draft === 'unsent' && item.queue.length === 1), 'clear-all archives before clearing');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('v3.6.0: the optional fang interop token gates the routes and its absence is a named 401', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'w2m-qj-auth-'));
+  const token = 'fang-token-0123456789abcdef0123456789abcdef';
+  try {
+    const { call } = mount({ dataDir: root, fangAuthToken: token });
+    const denied = await call(`${QUEUE_JOURNAL_ROUTE_PREFIX}?list=1`);
+    assert.equal(denied.status, 401);
+    assert.equal(denied.body.error, 'unauthorized');
+    assert.equal(denied.body.detail, 'x-fang-auth');
+    const wrong = await call(`${QUEUE_JOURNAL_ROUTE_PREFIX}?list=1`, { headers: { 'x-fang-auth': 'wrong-token' } });
+    assert.equal(wrong.status, 401);
+    const allowed = await call(`${QUEUE_JOURNAL_ROUTE_PREFIX}?list=1`, { headers: { 'x-fang-auth': token } });
+    assert.equal(allowed.status, 200);
+    assert.equal(allowed.body.ok, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('v3.6.0: restore forwards to a live agent only, capping text and counting refusals', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'w2m-qj-restore-'));
+  const sent = [];
+  try {
+    const { call } = mount({ dataDir: root }, {
+      agents: { get: (sessionId) => (sessionId === 'session-live' ? { send: (...args) => sent.push(args) } : undefined) },
+    });
+    const restored = await call(QUEUE_RESTORE_ROUTE_PATH, post({
+      sessionId: 'session-live',
+      items: [{ text: 'z'.repeat(5_000) }, { text: '   ' }, { text: 'ok' }],
+    }));
+    assert.equal(restored.status, 200);
+    assert.equal(restored.body.queued, 2);
+    assert.equal(restored.body.failed, 1, 'an empty queued row is counted as failed, never sent');
+    assert.equal(sent.length, 2);
+    assert.equal(sent[0][0].content[0].text.length, 4_000, 'restore caps a message at 4000 characters');
+    assert.equal(sent[1][0].content[0].text, 'ok');
+    assert.equal(sent[0][2], false, 'the restored message is not treated as a steering message');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });

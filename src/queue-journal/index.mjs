@@ -48,10 +48,15 @@ function queryOf(request) {
 
 async function bodyOf(request) {
   try {
-    const value = await request.json();
-    return value !== null && typeof value === 'object' && !Array.isArray(value) ? value : null;
+    const text = await request.text();
+    if (text.trim() === '') return { body: null, error: 'journal-body-empty' };
+    const value = JSON.parse(text);
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+      return { body: null, error: 'journal-body-invalid' };
+    }
+    return { body: value, error: null };
   } catch {
-    return null;
+    return { body: null, error: 'journal-body-invalid-json' };
   }
 }
 
@@ -103,6 +108,17 @@ export async function listSessionTitles(ctx) {
 export function registerQueueJournalRoutes(ctx, deps) {
   const status = { mounted: false, reason: 'the host has no Connection service' };
   if (typeof ctx?.inject !== 'function') return status;
+  // The host's authenticated connection fence is the real credential. An explicit `fangAuthToken`
+  // additionally covers the Fang interop path (`x-fang-auth`), which predates the same-origin
+  // cookie and may be spoken by an external orchestrator; unset means "cookie fence only", the
+  // shipped default, so existing callers are unaffected.
+  const fangAuthToken = typeof deps?.fangAuthToken === 'string' ? deps.fangAuthToken : '';
+  const guard = (handler) => async (request) => {
+    if (fangAuthToken !== '' && request.headers.get('x-fang-auth') !== fangAuthToken) {
+      return json(401, { ok: false, error: 'unauthorized', detail: 'x-fang-auth' });
+    }
+    return handler(request);
+  };
   ctx.inject(['connection'], (webCtx) => {
     const registry = webCtx?.connection?.fetch;
     if (registry === undefined || typeof registry.register !== 'function') {
@@ -110,7 +126,7 @@ export function registerQueueJournalRoutes(ctx, deps) {
       return;
     }
     const register = (routePath, methods, fetch) => {
-      registry.register({ path: routePath, methods, requestBody: 'buffered', fetch });
+      registry.register({ path: routePath, methods, requestBody: 'buffered', fetch: guard(fetch) });
     };
 
     register(QUEUE_JOURNAL_ROUTE_PREFIX, ['GET', 'POST'], async (request) => {
@@ -118,14 +134,19 @@ export function registerQueueJournalRoutes(ctx, deps) {
         const query = queryOf(request);
         const key = String(query.get('key') ?? '');
         if (key === '' && query.get('list') === '1') {
-          return json(200, { ok: true, entries: deps.journal.list() });
+          const entries = deps.journal.list();
+          const error = deps.journal.loadError?.() ?? null;
+          return json(200, { ok: true, entries, ...(error === null ? {} : { error }) });
         }
         if (key === '') return json(400, { ok: false, error: 'journal-key-required' });
-        return json(200, { ok: true, entry: deps.journal.get(key) });
+        const entry = deps.journal.get(key);
+        const error = deps.journal.loadError?.() ?? null;
+        return json(200, { ok: true, entry, ...(error === null ? {} : { error }) });
       }
-      const body = await bodyOf(request);
+      const parsed = await bodyOf(request);
+      const body = parsed.body;
       const key = String(body?.key ?? '');
-      if (key === '') return json(400, { ok: false, error: 'journal-key-required' });
+      if (key === '') return json(400, { ok: false, error: parsed.error ?? 'journal-key-required' });
       try {
         return json(200, {
           ok: true,
@@ -143,7 +164,9 @@ export function registerQueueJournalRoutes(ctx, deps) {
       const query = queryOf(request);
       const limit = Math.max(1, Math.min(200, Number(query.get('limit') ?? 20) || 20));
       const sessionKey = String(query.get('sessionKey') ?? '');
-      return json(200, { ok: true, items: deps.journal.history({ limit, sessionKey }) });
+      const items = deps.journal.history({ limit, sessionKey });
+      const error = deps.journal.historyLoadError?.() ?? null;
+      return json(200, { ok: true, items, ...(error === null ? {} : { error }) });
     });
 
     // v3.3.6：直接从 DSH 会话日志读取人类输入历史与最后一条 assistant 消息。
@@ -206,10 +229,11 @@ export function registerQueueJournalRoutes(ctx, deps) {
     });
 
     register(QUEUE_RESTORE_ROUTE_PATH, ['POST'], async (request) => {
-      const body = await bodyOf(request);
+      const parsed = await bodyOf(request);
+      const body = parsed.body;
       const sessionId = String(body?.sessionId ?? '').trim();
       const items = Array.isArray(body?.items) ? body.items : [];
-      if (sessionId === '') return json(400, { ok: false, error: 'session-id-required' });
+      if (sessionId === '') return json(400, { ok: false, error: parsed.error ?? 'session-id-required' });
       if (items.length === 0) return json(200, { ok: true, queued: 0, failed: 0 });
       let agents;
       try {
@@ -288,6 +312,11 @@ export function apply(ctx, config = {}) {
   } else if (typeof ctx?.provide === 'function') {
     ctx.provide(QUEUE_JOURNAL_SERVICE, service);
   }
-  registerQueueJournalRoutes(ctx, { journal, dataDir, sessionLogRoot: config?.sessionLogRoot });
+  registerQueueJournalRoutes(ctx, {
+    journal,
+    dataDir,
+    sessionLogRoot: config?.sessionLogRoot,
+    fangAuthToken: config?.fangAuthToken,
+  });
   return service;
 }

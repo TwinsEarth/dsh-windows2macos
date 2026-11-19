@@ -30,19 +30,55 @@ function sessionKeyFor(entry, fallbackKey = '') {
 
 export class ComposerJournal {
   constructor(dataDir) {
+    this.dataDir = dataDir
     this.file = path.join(dataDir, 'composer-journal.json')
     this.historyFile = path.join(dataDir, 'composer-journal-history.jsonl')
+    // Read errors are data, not exceptions: the route reports them as a named `error` field
+    // beside an empty list, so a corrupt file can never take the composer journal route down.
+    this.readError = null
+    this.historyReadError = null
+  }
+
+  /** mkdir -p on first write only: mounting the subplugin must not create state directories. */
+  ensureDataDir() {
+    fs.mkdirSync(this.dataDir, { recursive: true })
   }
 
   load() {
     try {
       const raw = JSON.parse(fs.readFileSync(this.file, 'utf8'))
+      this.readError = null
       return raw && typeof raw === 'object' ? raw : {}
-    } catch { return {} }
+    } catch (error) {
+      // ENOENT is the normal first-run state (the directory is created on first write), not an error.
+      this.readError = error?.code === 'ENOENT' ? null : 'journal-unreadable'
+      return {}
+    }
+  }
+
+  loadError() {
+    return this.readError
+  }
+
+  historyLoadError() {
+    return this.historyReadError
+  }
+
+  /**
+   * Move a corrupt journal out of the way before the next save overwrites it.
+   * Best effort: a failed rename must not turn a save into an error.
+   */
+  quarantineCorruptFile() {
+    if (this.readError === null) return
+    try {
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+      fs.copyFileSync(this.file, this.file + '.corrupt-' + stamp)
+    } catch { /* keep going: the new record is still worth saving */ }
+    this.readError = null
   }
 
   saveFile(all) {
-    fs.mkdirSync(path.dirname(this.file), { recursive: true })
+    this.ensureDataDir()
     const tmp = this.file + '.tmp'
     fs.writeFileSync(tmp, JSON.stringify(all, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 })
     fs.renameSync(tmp, this.file)
@@ -89,6 +125,7 @@ export class ComposerJournal {
       keys.sort((a, b) => String(all[a]?.updatedAt || '').localeCompare(String(all[b]?.updatedAt || '')))
       for (const stale of keys.slice(0, keys.length - 100)) delete all[stale]
     }
+    this.quarantineCorruptFile()
     this.saveFile(all)
     this.appendHistory({ ...entry, sessionKey: cleanText(input.sessionKey, 200) || entry.key })
     return entry
@@ -100,7 +137,7 @@ export class ComposerJournal {
       const queue = Array.isArray(entry?.queue) ? entry.queue : []
       const draft = String(entry?.draft ?? '')
       if (queue.length === 0 && draft.trim() === '') return
-      fs.mkdirSync(path.dirname(this.historyFile), { recursive: true })
+      this.ensureDataDir()
       fs.appendFileSync(this.historyFile, JSON.stringify({
         key: entry.key,
         queue,
@@ -121,6 +158,7 @@ export class ComposerJournal {
   history({ limit = 50, sessionKey = "" } = {}) {
     try {
       const raw = fs.readFileSync(this.historyFile, "utf8").trim().split("\n").filter(Boolean)
+      this.historyReadError = null
       const items = []
       for (const line of raw) {
         try {
@@ -130,7 +168,10 @@ export class ComposerJournal {
         } catch { /* 跳过坏行 */ }
       }
       return items.slice(-Math.max(1, Number(limit) || 50)).reverse()
-    } catch { return [] }
+    } catch (error) {
+      this.historyReadError = error?.code === 'ENOENT' ? null : 'journal-history-unreadable'
+      return []
+    }
   }
 
   /**

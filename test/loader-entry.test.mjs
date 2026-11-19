@@ -638,9 +638,11 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
       const queue = page.queueProbe ?? {};
       assert.equal(queue.postJournal?.ok, true, `the queue journal host accepted a draft: ${JSON.stringify(queue.postJournal)}`);
       assert.equal(queue.listApi?.ok, true, `the queue journal list route answers: ${JSON.stringify(queue.listApi)}`);
-      assert.equal(queue.queueBadge?.found, true, 'the floating queue-journal badge is in the page');
-      assert.equal(queue.queueOpened?.clicked, true, 'the queue-journal badge accepts a click');
-      assert.equal(queue.queueDrawer?.hidden, false, `the queue-journal drawer opens: ${JSON.stringify(queue.queueDrawer)}`);
+      assert.equal(queue.queueBadge?.found, true, 'the slotted queue-journal chip is in the composer');
+      assert.equal(queue.queueBadge?.status, 'slotted', `the chip reports a slotted surface: ${JSON.stringify(queue.queueBadge)}`);
+      assert.equal(queue.queueOpened?.clicked, true, 'the queue-journal chip accepts a click');
+      assert.equal(queue.queueDrawer?.found, true, `the queue-journal drawer opens: ${JSON.stringify(queue.queueDrawer)}`);
+      assert.equal(queue.queueDrawer?.status, 'slotted', 'the drawer reports the surface diagnostics');
       assert.match(String(queue.queueDrawer?.title ?? ''), /队列日志/u, 'the drawer names itself as the queue journal');
       assert.match(String(queue.queueDrawer?.body ?? ''), /human draft text/u, 'a human session record is visible by default');
       assert.equal(queue.queueDrawer?.foldExists, true, 'client-generated records are folded into their own section');
@@ -649,10 +651,7 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
       assert.equal(queue.foldOpened?.opened, true, 'the folded section can be opened');
       assert.match(String(queue.foldOpened?.text ?? ''), /probe draft text/u, 'the folded section carries the client-keyed record');
       assert.equal(queue.queueGpw?.button, true, 'the GPW panel carries the queue-journal button');
-      // The composer dock is conversation-scoped: the boot page is the shell's landing page, so the
-      // dock itself may not be mounted here. Registration into it is covered by the client-bundle
-      // suite; this is a diagnostic, not a pass condition.
-      if (queue.queueDock?.chip !== true) t.diagnostic('the composer dock chip was not on the boot page (dock is conversation-scoped)');
+      assert.equal(queue.queueDock?.chip, true, 'the composer carries the queue-journal chip');
       const parity = page.parityProbe ?? {};
       assert.equal(parity.ingest?.ok, true, `the decision ingest route accepted a probe ticket: ${JSON.stringify(parity.ingest)}`);
       assert.equal(parity.openInbox?.found, true, 'the inbox badge re-opened the drawer for the parity checks');
@@ -677,15 +676,15 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
       assert.ok(ui.drawerRightGap >= 0 && ui.drawerRightGap <= 40, 'the decision drawer sits on the right edge');
       assert.equal(ui.bodyOverflow, 'auto', 'the decision drawer body scrolls');
       assert.equal(ui.gpwAiSection, true, 'the GPW panel carries the AI risk-grading settings section');
-      assert.equal(ui.queueTone, 'blue', `one saved journal entry puts the queue badge in the 1-30 blue band: ${JSON.stringify(ui.queueTone)}`);
-      assert.ok(ui.queueBottomGap >= 0 && ui.queueBottomGap <= 120, `the queue badge sits at the bottom right, below the GPW launcher: ${JSON.stringify(ui.queueBottomGap)}`);
-      assert.ok(ui.queueRightGap >= 0 && ui.queueRightGap <= 40, 'the queue badge hugs the right edge');
-      assert.equal(page.ui324?.qOpened?.clicked, true, 'the queue badge opens its drawer');
+      assert.equal(ui.queueTone, 'blue', `one saved journal entry puts the queue chip in the 1-30 blue band: ${JSON.stringify(ui.queueTone)}`);
+      assert.equal(ui.queueChipStatus, 'slotted', `the queue chip reports the slotted surface: ${JSON.stringify(ui.queueChipStatus)}`);
+      assert.ok(Number(ui.queueChipRect?.width) > 0 && Number(ui.queueChipRect?.height) > 0, `the queue chip is rendered in the composer: ${JSON.stringify(ui.queueChipRect)}`);
+      assert.equal(page.ui324?.qOpened?.clicked, true, 'the queue chip opens its drawer');
       assert.equal(page.ui324?.qGeom?.open, true, 'the queue drawer is open for the geometry checks');
       const qh = Number(page.ui324?.qGeom?.height) || 0;
       const qvh = Number(page.ui324?.qGeom?.viewportH) || 0;
       assert.ok(qh > qvh * 0.35 && qh < qvh * 0.85, `the queue drawer is half height: ${JSON.stringify({ qh, qvh })}`);
-      assert.ok(Number(page.ui324?.qGeom?.bottomGap) >= 0 && Number(page.ui324?.qGeom?.bottomGap) <= 40, 'the queue drawer opens at the bottom right');
+      assert.ok(Number(page.ui324?.qGeom?.bottomGap) >= 0, 'the queue drawer opens inside the viewport');
       assert.equal(page.ui324?.qGeom?.overflow, 'auto', 'the queue drawer body scrolls');
       const jq = page.jq626?.jq626 ?? {};
       assert.equal(jq.clearAll, true, 'the queue journal drawer has 清空全部');
@@ -758,6 +757,36 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
       } else {
         t.diagnostic('the right-pane tab marker was absent (host may not provide sidebarRightTabs in this profile)');
       }
+    }
+
+    // v3.6.0: the queue journal driven end to end through its documented slot surfaces. This is the
+    // regression a DSH layout update cannot silently pass: the chip must be in the composer, a typed
+    // draft must reach the host file under `$DSH_HOME/xclient/queue-journal`, the `shell.overlay`
+    // drawer must list it, and restore must write the draft back through `inputActions.setDraft`.
+    if (process.env.W2M_QUEUE_JOURNAL_PROBE === '1') {
+      const probe = page.queueJournalProbe ?? {};
+      const journal = page.journal ?? {};
+      t.diagnostic('queue journal probe: ' + JSON.stringify({ probe, journal }));
+      assert.equal(probe.chip?.found, true, `the slotted queue-journal chip is not in the composer: ${JSON.stringify(probe)}`);
+      assert.equal(probe.chip?.status, 'slotted', 'the chip reports the slotted surface');
+      assert.equal(probe.diagnostics?.status, 'slotted', `the diagnostics object reports the slotted surface: ${JSON.stringify(probe.diagnostics)}`);
+      assert.equal(probe.diagnostics?.surface, 'conversation.input.left+shell.overlay', 'both documented slot names are reported');
+      assert.match(String(probe.diagnostics?.dshVersion ?? ''), /^0\.2\./u, 'the client read the DSH version from the page boot graph');
+      assert.equal(probe.typed?.typed, true, `a draft was typed into the real composer: ${JSON.stringify(probe.typed)}`);
+      assert.equal(probe.saved?.found, true, `the typed draft reached the host journal route: ${JSON.stringify(probe.saved)}`);
+      assert.equal(journal.exists, true, `the host wrote the journal file at ${String(journal.path)}`);
+      assert.match(String(journal.probeDraft ?? ''), /probe-journal-draft/u, 'the probe draft is in the host file under xclient/queue-journal');
+      assert.equal(probe.opened?.clicked, true, 'the chip opens the drawer');
+      assert.equal(probe.drawer?.marker, '1', 'the drawer carries the data-w2m-jq-drawer marker');
+      assert.equal(probe.drawer?.status, 'slotted', 'the drawer reports the surface diagnostics');
+      assert.ok(Number(probe.drawer?.rows) >= 1, `the drawer lists the saved entry: ${JSON.stringify(probe.drawer)}`);
+      assert.equal(probe.drawer?.hasDraft, true, 'the drawer shows the typed draft');
+      assert.equal(probe.drawer?.hasRestore, true, 'the drawer carries a restore-draft action');
+      assert.equal(probe.cleared?.contains, false, `the composer was cleared before restore: ${JSON.stringify(probe.cleared)}`);
+      assert.equal(probe.restored?.clicked, true, 'the restore-draft action accepts a click');
+      assert.equal(probe.afterRestore?.contains, true, `restore wrote the draft back through the slot: ${JSON.stringify(probe.afterRestore)}`);
+      assert.equal(probe.closed?.closed, true, 'the drawer close action is present');
+      assert.equal(probe.closeState?.closed, true, 'the drawer is removed after closing');
     }
 
     // v3.5.x: the unlock dialog in the real page. Independent of the decision probe for the same reason that

@@ -372,8 +372,8 @@ describe('client bundle: the activation contract', () => {
       () => exports.apply(ctx),
       'an undeclared service read throws in Cordis and takes the whole app down; the bundle must read only what it declares',
     );
-    assert.deepEqual(registry.announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'sidebar.panellist', 'main', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, 'conversation.composer.dock', 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', 'sidebar.panellist', 'main', SEAT], 'the entry still has to take its seat');
-    assert.equal(registry.registered.length, 20);
+    assert.deepEqual(registry.announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'sidebar.panellist', 'main', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, SEAT, 'shell.overlay', 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', 'sidebar.panellist', 'main', SEAT], 'the entry still has to take its seat');
+    assert.equal(registry.registered.length, 21);
     assert.equal(locale.registered.has('w2m.target'), true, 'the dictionaries go to the locale service when there is one');
   });
 
@@ -477,8 +477,8 @@ describe('client bundle: the seat it registers into', () => {
 
   it('announces and registers all five composer controls plus the sidebar and update sections into conversation.input.left', () => {
     const { announced, registered } = applyTo();
-    assert.deepEqual(announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'sidebar.panellist', 'main', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, 'conversation.composer.dock', 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', 'sidebar.panellist', 'main', SEAT]);
-    assert.equal(registered.length, 20);
+    assert.deepEqual(announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'sidebar.panellist', 'main', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, SEAT, 'shell.overlay', 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', 'sidebar.panellist', 'main', SEAT]);
+    assert.equal(registered.length, 21);
     assert.equal(registered[0].options.name, SEAT);
   });
 
@@ -526,7 +526,7 @@ describe('client bundle: the seat it registers into', () => {
     };
     const { exports } = loadBundle();
     assert.doesNotThrow(() => exports.apply(ctx));
-    assert.equal(registered.length, 20);
+    assert.equal(registered.length, 21);
   });
 });
 
@@ -1288,13 +1288,43 @@ it('v3.3.10: the target menu folds the web group by default', () => {
   assert.ok(source.includes('unknownPlatform'), 'a missing platform is shown instead of hidden as online');
 });
 
-it('v3.3.14: the queue drawer splits 人类输入 from a folded 机器生成 block', () => {
-  const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
-  assert.ok(source.includes('w2mJqSectionHead'), 'the drawer renders a section header');
-  assert.ok(source.includes('人类输入 · ') && source.includes('humanEntries.length'), 'human input has its own block count');
-  assert.ok(source.includes("'机器生成 · ' + clientAll.length"), 'machine records have a folded block count');
-  assert.ok(source.includes('const clientAll = store.state.entries.filter((entry) => !isHumanEntry(entry))'), 'machine records are counted before content filtering');
-  assert.ok(source.includes("dcEl('details', { className: 'w2mJqClientFold' })"), 'the machine block is a details element (folded by default)');
+it('v3.3.14/v3.6.0: the queue drawer splits 人类输入 from a folded 机器生成 block', () => {
+  const { exports } = loadBundle();
+  const module = exports.createQueueJournalModule();
+  const store = {
+    state: {
+      sessions: {},
+      busy: '',
+      status: '',
+      error: '',
+      history: [],
+      entries: [
+        { key: 'session-a', sessionKey: 'session-a', draft: 'human draft', queue: [{ text: 'queued one' }], updatedAt: '2026-11-19T12:00:00.000Z' },
+        { key: 'page:machine', sessionKey: '', draft: 'machine draft', queue: [], updatedAt: '2026-11-19T11:00:00.000Z' },
+      ],
+    },
+    refresh: () => {},
+    clearAll: () => {},
+    closeDrawer: () => {},
+    restoreDraft: () => {},
+    restoreQueue: () => {},
+    clear: () => {},
+  };
+  const snap = { total: 1, clientTotal: 1, loading: false, open: true };
+  const tree = module.__w2mHelpers.QueueJournalDrawerBody({ store, snap, portal: false });
+  const drawer = findBy(tree, (node) => node.props?.['data-w2m-jq-drawer'] === '1');
+  assert.equal(drawer.length, 1, 'the drawer renders from the factory, not from DOM append');
+  const entries = findBy(tree, (node) => node.props?.['data-w2m-jq-entry'] !== undefined);
+  assert.equal(entries.length, 2, 'both the human record and the folded machine record are in the tree');
+  const text = collectText(tree).join('\n');
+  assert.match(text, /人类输入 · 1 条/u, 'human input has its own block count');
+  assert.match(text, /机器生成 · 1 条/u, 'machine records have a folded block count');
+  assert.match(text, /human draft/u, 'the human draft is visible');
+  assert.ok(findBy(tree, (node) => node.props?.['data-w2m-jq-restore-draft'] === 'session-a').length === 1,
+    'the restore action carries a stable data marker');
+  const machineFold = findBy(tree, (node) => node.props?.className === 'w2mJqClientFold');
+  assert.equal(machineFold.length, 1, 'the machine block is a details element (folded by default)');
+  assert.equal(machineFold[0].type, 'details');
 });
 
 it('v3.3.15: the target menu adds a folded offline group after clients and web hosts', () => {
@@ -1330,16 +1360,181 @@ it('v3.4.0: a stored empty title falls back to the sessions map', () => {
   assert.ok(source.includes('sessionTitleForEntry(entry, store.state.sessions)'), 'entryCard uses the helper');
 });
 
-it('v3.4.4: each floating badge follows its own subplugin route', () => {
+it('v3.4.4/v3.6.0: each floating badge follows its own subplugin route', () => {
   const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
   assert.ok(source.includes('function subpluginRouteAvailable(route)'), 'one route probe');
   assert.ok(source.includes('function watchSubpluginRoute(route, onChange'), 'one availability watcher');
   assert.ok(source.includes("watchSubpluginRoute('/api/w2m/decisions'"), 'decision badge follows decision-center');
-  assert.ok(source.includes("watchSubpluginRoute('/api/w2m/composer/journal?list=1'"), 'queue badge follows queue-journal');
+  assert.equal(source.includes("watchSubpluginRoute('/api/w2m/composer/journal?list=1'"), false,
+    'the queue journal chip is a slot surface: it stays visible and the drawer reports a missing route, instead of hiding silently');
   assert.ok(source.includes("if (alive) setAvailable(response.status !== 404);"), 'GPW launcher follows dsh-gpw');
   assert.ok(source.includes('if (available !== true) return null;'), 'GPW launcher renders nothing while disabled');
-  assert.ok(source.includes('badge.hidden = !enabled;'), 'both DOM badges follow their route');
-  assert.ok(source.includes('.w2mDcBadge[hidden],.w2mJqBadge[hidden]'), 'hidden beats the class display rule');
+  assert.ok(source.includes('data-w2m-jq-status'), 'the queue journal publishes its surface diagnostics in the UI');
+  assert.ok(source.includes('function enterQueueJournalFallback('), 'a broken primary surface has an explicit fallback');
+});
+
+// ---------------------------------------------------------------------------------------------
+// Queue journal slotted surfaces and diagnostics (v3.6.0)
+// ---------------------------------------------------------------------------------------------
+//
+// The composer chip and the drawer are no longer DOM nodes appended to `document.body`: they are
+// documented slot registrations (`conversation.input.left` + `shell.overlay`). What is asserted here
+// is the part a DSH update can break silently: the registration targets, the version guard, the
+// diagnostics contract (`window.__W2M_QUEUE_JOURNAL__`), the inputActions bridge, and the explicit
+// `sidebar.panellist` fallback with its visible 「降级模式」 notice.
+
+describe('client bundle: queue journal slots and diagnostics (v3.6.0)', () => {
+  /** Apply the queue-journal factory against a recording registry. */
+  function applyModule(options = {}) {
+    const bundle = loadBundle(options.load);
+    if (options.dshVersion !== undefined) bundle.window.__DSH_BOOT__ = { release: { version: options.dshVersion } };
+    const registry = options.registry ?? makeRegistry();
+    const module = bundle.exports.createQueueJournalModule();
+    module.apply({
+      slots: registry,
+      get: () => undefined,
+      effect: (callback) => {
+        const disposer = callback();
+        return typeof disposer === 'function' ? disposer : () => {};
+      },
+    });
+    return { bundle, registry, module, diagnostics: module.diagnostic() };
+  }
+
+  /** A registry whose primary slots are missing (inject throws, as Cordis does for an unknown key). */
+  function failingRegistry(failKeys) {
+    const announced = [];
+    const registered = [];
+    return {
+      announced,
+      registered,
+      inject(key, callback) {
+        announced.push(key);
+        if (failKeys.includes(key)) throw new Error(`slot "${key}" is not declared`);
+        registered.push(callback());
+        return () => {};
+      },
+      register(options, component) {
+        return { options, component };
+      },
+    };
+  }
+
+  /** Load the bundle with a hook-capable React stand-in (so the chip's effect can run). */
+  function loadWithHooks(mountReact) {
+    return loadBundle({
+      requireImpl: (specifier) => {
+        if (specifier === 'react') return mountReact.React;
+        throw new Error(`the bundle required "${specifier}", which the platform seed table does not hold`);
+      },
+    });
+  }
+
+  it('registers the chip into conversation.input.left and the drawer into shell.overlay', () => {
+    const { bundle, registry, module, diagnostics } = applyModule({ dshVersion: '0.2.2-rc.5' });
+    assert.equal(diagnostics.status, 'slotted');
+    assert.equal(diagnostics.surface, 'conversation.input.left+shell.overlay');
+    assert.equal(diagnostics.dshVersion, '0.2.2-rc.5');
+    assert.equal(diagnostics.reasons.length, 0, 'a tested version with both seats has nothing to report');
+    assert.equal(module.TESTED_DSH_RANGE, '>=0.2.2-rc.1 <0.3.0');
+    const chip = registry.registered.find((entry) => entry.options.name === 'conversation.input.left' && entry.options.id === 'w2m-queue-journal');
+    const drawer = registry.registered.find((entry) => entry.options.name === 'shell.overlay');
+    assert.ok(chip !== undefined && drawer !== undefined, 'both slotted surfaces are registered');
+    assert.equal(chip.options.order, 46);
+    assert.equal(drawer.options.order, 91);
+    assert.equal(chip.component, module.__w2mHelpers.QueueJournalChip);
+    assert.equal(drawer.component, module.__w2mHelpers.QueueJournalOverlay);
+    const published = bundle.window.__W2M_QUEUE_JOURNAL__;
+    assert.equal(published.status, 'slotted', 'the diagnostics object is published on window');
+    assert.equal(published.surface, 'conversation.input.left+shell.overlay');
+    assert.equal(typeof published.checkedAt, 'string');
+  });
+
+  it('names an out-of-range or unavailable DSH version instead of assuming compatibility', () => {
+    const newer = applyModule({ dshVersion: '0.3.1' }).diagnostics;
+    assert.equal(newer.status, 'slotted', 'a version warning does not remove a working seat');
+    assert.ok(newer.reasons.some((reason) => reason.startsWith('dsh-version-unverified:0.3.1')), 'the untested version is stated');
+    const unknown = applyModule({}).diagnostics;
+    assert.equal(unknown.dshVersion, null);
+    assert.ok(unknown.reasons.includes('dsh-version-unavailable'), 'an unavailable version is said out loud');
+    const { module } = applyModule({});
+    assert.equal(module.__w2mHelpers.jqDshSupported('0.2.2-rc.1'), true);
+    assert.equal(module.__w2mHelpers.jqDshSupported('0.2.2-rc.5'), true);
+    assert.equal(module.__w2mHelpers.jqDshSupported('0.1.9'), false);
+    assert.equal(module.__w2mHelpers.jqDshSupported('0.3.0'), false);
+    assert.equal(module.__w2mHelpers.jqDshSupported('not-a-version'), false);
+  });
+
+  it('falls back to sidebar.panellist when the chip slot cannot be injected, and names it', () => {
+    const registry = failingRegistry(['conversation.input.left']);
+    const { bundle, diagnostics } = applyModule({ registry, dshVersion: '0.2.2-rc.5' });
+    assert.equal(diagnostics.status, 'fallback');
+    assert.equal(diagnostics.surface, 'sidebar.panellist');
+    assert.ok(diagnostics.reasons.some((reason) => reason.startsWith('slot-inject-threw:conversation.input.left:')), `reasons: ${JSON.stringify(diagnostics.reasons)}`);
+    assert.ok(registry.announced.includes('sidebar.panellist'), 'the documented stable fallback is announced');
+    const fallback = registry.registered.find((entry) => entry.options.name === 'sidebar.panellist' && entry.options.id === 'w2m-queue-journal');
+    assert.ok(fallback !== undefined, 'the fallback entry is registered, not merely announced');
+    assert.equal(bundle.window.__W2M_QUEUE_JOURNAL__.status, 'fallback');
+  });
+
+  it('falls back when both drawer slots are missing, without taking the chip down', () => {
+    const registry = failingRegistry(['shell.overlay', 'shell.bottom']);
+    const { diagnostics } = applyModule({ registry, dshVersion: '0.2.2-rc.5' });
+    assert.equal(diagnostics.status, 'fallback');
+    assert.ok(diagnostics.reasons.includes('slot-missing:shell.overlay/shell.bottom'));
+    assert.ok(registry.registered.some((entry) => entry.options.name === 'conversation.input.left'), 'the chip seat was still taken');
+    assert.ok(registry.registered.some((entry) => entry.options.name === 'sidebar.panellist'), 'the same UI remains reachable from the sidebar');
+  });
+
+  it('turns a missing inputActions into the fallback, with the visible 降级模式 notice', () => {
+    const mountReact = makeMountReact();
+    const bundle = loadWithHooks(mountReact);
+    bundle.window.__DSH_BOOT__ = { release: { version: '0.2.2-rc.5' } };
+    const registry = makeRegistry();
+    const module = bundle.exports.createQueueJournalModule();
+    module.apply({ slots: registry, get: () => undefined, effect: (callback) => callback() });
+    assert.equal(module.diagnostic().status, 'slotted');
+    // The slot exists, but this host does not hand the chip the documented InputActions.
+    const handle = mountReact.mount(module.__w2mHelpers.QueueJournalChip, {
+      sessionId: 'session-live',
+      useInput: (selector) => selector({ draft: 'hello', queue: [] }),
+    });
+    try {
+      assert.equal(module.diagnostic().status, 'fallback');
+      assert.ok(module.diagnostic().reasons.includes('input-actions-missing'));
+      assert.ok(registry.registered.some((entry) => entry.options.name === 'sidebar.panellist'));
+      assert.ok(findBy(handle.tree, (node) => node.props?.['data-w2m-jq-chip'] === 'primary').length === 1, 'the chip itself stays visible');
+      const fallback = mountReact.mount(module.__w2mHelpers.QueueJournalFallbackEntry, {});
+      try {
+        const notice = findBy(fallback.tree, (node) => node.props?.['data-w2m-jq-status'] === 'fallback');
+        assert.ok(notice.length > 0, 'the fallback notice carries data-w2m-jq-status="fallback"');
+        const text = collectText(fallback.tree).join('\n');
+        assert.match(text, /降级模式/u);
+        assert.match(text, /DSH 版本可能不兼容/u);
+      } finally { fallback.unmount(); }
+    } finally { handle.unmount(); }
+  });
+
+  it('writes drafts through the slot inputActions bridge, never through findComposer', () => {
+    const mountReact = makeMountReact();
+    const bundle = loadWithHooks(mountReact);
+    const registry = makeRegistry();
+    const module = bundle.exports.createQueueJournalModule();
+    module.apply({ slots: registry, get: () => undefined, effect: (callback) => callback() });
+    const written = [];
+    const handle = mountReact.mount(module.__w2mHelpers.QueueJournalChip, {
+      sessionId: 'session-live',
+      inputActions: { getDraft: () => 'slot draft', setDraft: (text) => written.push(text) },
+      useInput: (selector) => selector({ draft: 'slot draft', queue: [{ content: [{ type: 'text', text: 'queued one' }], at: 1 }] }),
+    });
+    try {
+      assert.equal(module.diagnostic().status, 'slotted');
+      assert.equal(module.__w2mHelpers.setDraft('restored text'), true);
+      assert.deepEqual(written, ['restored text'], 'restore goes through inputActions.setDraft');
+      assert.equal(module.diagnostic().reasons.some((reason) => reason.startsWith('dom-composer-fallback')), false,
+        'the DOM path is not used when the slot props are present');
+    } finally { handle.unmount(); }
+  });
 });
 
 // ---------------------------------------------------------------------------------------------

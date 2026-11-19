@@ -340,11 +340,11 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
           return JSON.stringify({ status: r.status, ok: b?.ok === true, entries: Array.isArray(b?.entries) ? b.entries.length : null });
         })()
       `));
-      const queueBadge = await read(`const b=document.querySelector('.w2mJqBadge'); return {found:b!==null, text:(b?.textContent??'').trim()};`);
-      const queueOpened = await read(`const b=document.querySelector('.w2mJqBadge'); if(b===null)return{clicked:false}; b.click(); return{clicked:true};`);
+      const queueBadge = await read(`const b=document.querySelector('[data-w2m-jq-chip]'); return {found:b!==null, text:(b?.textContent??'').trim(), status:b?.getAttribute('data-w2m-jq-status')??null};`);
+      const queueOpened = await read(`const b=document.querySelector('[data-w2m-jq-chip]'); if(b===null)return{clicked:false}; b.click(); return{clicked:true};`);
       await new Promise((resolve) => setTimeout(resolve, 900));
       const queueDrawer = await read(`
-        const d=document.querySelector('.w2mJqDrawer');
+        const d=document.querySelector('[data-w2m-jq-drawer]');
         const fold=d?.querySelector('.w2mJqClientFold') ?? null;
         return {
           found:d!==null,
@@ -362,9 +362,9 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
         return {opened:true, text:((document.querySelector('.w2mJqClientFoldBody')?.innerText ?? '')).slice(0,400)};
       `);
       const queueGpw = await read(`return {button:document.querySelector('.w2mJqGpwBtn')!==null};`);
-      const queueDock = await read(`return {chip:document.querySelector('.w2mJqDockChip')!==null, dock:document.querySelector('[data-fang-entry="queue-journal"]')!==null};`);
+      const queueDock = await read(`return {chip:document.querySelector('[data-w2m-jq-chip]')!==null, dock:false};`);
       await evaluate(`fetch('/api/w2m/composer/journal', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ key: 'probe-ui', draft: '', queue: [] }) })`);
-      const queueClosed = await read(`const b=[...document.querySelectorAll('.w2mJqDrawer .w2mDcBtn')].find((x)=>x.textContent==='关闭'); if(b===undefined)return{closed:false}; b.click(); return{closed:true};`);
+      const queueClosed = await read(`const b=document.querySelector('[data-w2m-jq-close]'); if(b===null)return{closed:false}; b.click(); return{closed:true};`);
       await new Promise((resolve) => setTimeout(resolve, 350));
       report.queueProbe = { postJournal, postHuman, listApi, queueBadge, queueOpened, queueDrawer, foldOpened, queueGpw, queueDock, queueClosed };
       const parseP = (value) => (typeof value === 'string' ? JSON.parse(value) : value);
@@ -408,7 +408,7 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
         const drawer=document.querySelector('.w2mDcDrawer');
         const bodyEl=document.querySelector('.w2mDcDrawer .w2mDcBody');
         const side=document.querySelector('.w2mDcSidebarBtn');
-        const qbadge=document.querySelector('.w2mJqBadge');
+        const qbadge=document.querySelector('[data-w2m-jq-chip]');
         const rect=(el)=>el===null?null:el.getBoundingClientRect();
         const br=rect(badge), dr=rect(drawer), qr=rect(qbadge);
         return {
@@ -428,12 +428,13 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
           chatButton:document.querySelector('.w2mChat_trigger')!==null,
           fleetStatusText:(document.querySelector('.w2mFleetStatus')?.innerText??null),
           queueTone:qbadge?.getAttribute('data-tone')??null,
-          queueBottomGap:qr===null?null:Math.round(innerHeight-qr.bottom),
-          queueRightGap:qr===null?null:Math.round(innerWidth-qr.right),
+          queueChipStatus:qbadge?.getAttribute('data-w2m-jq-status')??null,
+          queueChipRect:qr?{top:Math.round(qr.top),left:Math.round(qr.left),width:Math.round(qr.width),height:Math.round(qr.height)}:null,
+          queueDrawerStatus:document.querySelector('[data-w2m-jq-drawer]')?.getAttribute('data-w2m-jq-status')??null,
           viewport:{w:innerWidth,h:innerHeight},
         };
       `);
-      const qOpened = await read(`const b=document.querySelector('.w2mJqBadge'); if(b===null)return{clicked:false}; b.click(); return{clicked:true};`);
+      const qOpened = await read(`const b=document.querySelector('[data-w2m-jq-chip]'); if(b===null)return{clicked:false}; b.click(); return{clicked:true};`);
       await new Promise((resolve) => setTimeout(resolve, 700));
       const jq626 = await read(`
         const clearAll=document.querySelector('.w2mJqClearAll');
@@ -576,6 +577,143 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
       report.parityProbe = { ingest, openInbox, batch, keyboard, clickedBatch, afterBatch, relay, rightTab };
       await evaluate(`fetch('/api/w2m/composer/journal', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ key: 'probe-ui', draft: '', queue: [] }) })`);
       await evaluate(`fetch('/api/w2m/composer/journal', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ key: 'session-probe-ui', draft: '', queue: [] }) })`);
+    }
+    // v3.6.0: the queue journal's own end-to-end probe. Unlike the decision probe (which posts to the
+    // host route directly), this one drives the *slotted* chip: a real draft is typed into the real
+    // composer, the chip opens the drawer built from `shell.overlay`, and restore writes the draft back
+    // through the slot's `inputActions`. The host file under `$DSH_HOME/xclient/queue-journal` is
+    // checked by `dsh-loader-driver.mjs` after this page boot.
+    if (process.env.W2M_QUEUE_JOURNAL_PROBE === '1') {
+      const read = async (expression) => {
+        const value = await evaluate(`JSON.stringify((() => { ${expression} })())`);
+        return value === null ? null : JSON.parse(value);
+      };
+      const readAsync = async (expression) => {
+        const value = await evaluate(expression);
+        return typeof value === 'string' ? JSON.parse(value) : value;
+      };
+      let chip = { found: false };
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        chip = await read(`const b=document.querySelector('[data-w2m-jq-chip]'); return {found:b!==null, status:b?.getAttribute('data-w2m-jq-status')??null, text:(b?.textContent??'').trim()};`);
+        if (chip.found === true) break;
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+      const diagnostics = await read(`const d=window.__W2M_QUEUE_JOURNAL__; return d===undefined?null:{status:d.status,surface:d.surface,reasons:d.reasons,dshVersion:d.dshVersion,checkedAt:d.checkedAt};`);
+      // A throwaway profile boots with the Host-release modal open (the served page has no matching
+      // release). It traps focus, so dismiss it before driving the real composer. Programmatic clicks
+      // on the chip would still work under it; typing would not.
+      const dismissed = await read(`
+        const copy=[...document.querySelectorAll('p, div')].find((node)=>/预览阶段/u.test(String(node.textContent||'')) && node.children.length===0);
+        const scope=copy?.closest('[role="dialog"]') ?? copy?.closest('[class*="overlay" i], [class*="modal" i]') ?? copy?.parentElement?.parentElement ?? null;
+        const buttons=scope===null?[]:[...scope.querySelectorAll('button')];
+        const target=buttons.find((b)=>/稍后|以后|继续|关闭|later|LATER|Later|閉じる/u.test(String(b.textContent||''))) ?? buttons.find((b)=>b.hasAttribute('data-modal-autofocus')) ?? buttons[0] ?? null;
+        if(target!==null)target.click();
+        return {dismissed:target!==null, text:String(target?.textContent||'').trim(), scoped:scope!==null};
+      `);
+      // Wait for the modal's focus trap to actually leave the tree: its close animation makes a fixed
+      // 450 ms budget flaky, and the retry below must not race the trap.
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        const modal = await read(`return {open:document.querySelector('[role="dialog"]')!==null};`);
+        if (modal === null || modal.open === false) break;
+        await new Promise((resolve) => setTimeout(resolve, 150));
+      }
+      const composerExpression = `
+        const nodes=[...document.querySelectorAll('textarea, [contenteditable="true"]')].filter((el)=>{const r=el.getBoundingClientRect(); return r.width>80&&r.height>16;}).sort((a,b)=>{const ra=a.getBoundingClientRect(), rb=b.getBoundingClientRect(); return rb.width*rb.height-ra.width*ra.height;});
+        const el=nodes[0];
+      `;
+      const focused = await read(`
+        ${composerExpression}
+        if(!el)return {found:false};
+        const r=el.getBoundingClientRect();
+        el.focus();
+        if(el.tagName==='TEXTAREA'){const setter=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value')?.set; if(setter)setter.call(el,'probe-journal-draft'); else el.value='probe-journal-draft'; el.dispatchEvent(new Event('input',{bubbles:true}));}
+        return {found:true, tag:el.tagName, focused:document.activeElement===el, rect:{x:Math.round(r.left+r.width/2), y:Math.round(r.top+r.height/2)}};
+      `);
+      // A real pointer press focuses the Lexical editor; `element.click()` produces an untrusted event
+      // the editor may ignore, and `Input.insertText` only reaches a focused editing host. The press
+      // is retried because the Host-release modal's close animation may keep the focus trap briefly.
+      const readTyped = () => read(`
+        ${composerExpression}
+        const text=String(el?(el.tagName==='TEXTAREA'?el.value:el.innerText||''):'');
+        return {typed:text.includes('probe-journal-draft'), tag:el?.tagName??null, text:text.slice(0,80)};
+      `);
+      let typed = await readTyped();
+      if (focused.found === true && focused.tag !== 'TEXTAREA' && focused.rect !== undefined) {
+        const { x, y } = focused.rect;
+        for (let attempt = 0; attempt < 6 && typed.typed !== true; attempt += 1) {
+          await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 }, sessionId);
+          await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 }, sessionId);
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          const active = await read(`${composerExpression} return {focused:el!==undefined&&document.activeElement===el};`);
+          if (active !== null && active.focused === true) {
+            await cdp.send('Input.insertText', { text: 'probe-journal-draft' }, sessionId);
+            await new Promise((resolve) => setTimeout(resolve, 120));
+          }
+          typed = await readTyped();
+        }
+      }
+      // Headless runs occasionally lose the CDP editing session right after the Host-release modal
+      // closes. The journal pipeline is what this probe asserts, so fall back to the same trusted
+      // DOM insertion the compatibility path uses; a real `input` event is still what reaches React.
+      if (typed.typed !== true) {
+        typed = await read(`
+          ${composerExpression}
+          if(!el)return {typed:false, tag:null, text:''};
+          el.focus();
+          try { document.execCommand('selectAll', false, null); document.execCommand('insertText', false, 'probe-journal-draft'); } catch { /* reported below */ }
+          const text=String(el.tagName==='TEXTAREA'?el.value:el.innerText||'');
+          return {typed:text.includes('probe-journal-draft'), tag:el.tagName, text:text.slice(0,80)};
+        `);
+        // Lexical commits the DOM mutation a tick later; the immediate innerText read races it.
+        await new Promise((resolve) => setTimeout(resolve, 400));
+        typed = await readTyped();
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1_600));
+      const saved = await readAsync(`
+        (async () => {
+          const r = await fetch('/api/w2m/composer/journal?list=1');
+          const b = await r.json().catch(() => null);
+          const entries = Array.isArray(b?.entries) ? b.entries : [];
+          const mine = entries.find((e) => String(e?.draft ?? '').includes('probe-journal-draft')) ?? null;
+          return JSON.stringify({ status: r.status, found: mine !== null, key: mine?.key ?? null, queue: Array.isArray(mine?.queue) ? mine.queue.length : null });
+        })()
+      `);
+      const opened = await read(`const b=document.querySelector('[data-w2m-jq-chip]'); if(b===null)return{clicked:false}; b.click(); return{clicked:true};`);
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      const drawer = await read(`
+        const d=document.querySelector('[data-w2m-jq-drawer]');
+        const body=(d?.querySelector('.w2mDcBody')?.innerText??'');
+        return {found:d!==null, marker:d?.getAttribute('data-w2m-jq-drawer')??null, status:d?.getAttribute('data-w2m-jq-status')??null, rows:d===null?0:d.querySelectorAll('[data-w2m-jq-entry]').length, hasDraft:body.includes('probe-journal-draft'), hasRestore:d!==null&&d.querySelector('[data-w2m-jq-restore-draft]')!==null};
+      `);
+      const clearedFocus = await read(`
+        ${composerExpression}
+        if(!el)return{found:false};
+        el.focus(); return {found:true};
+      `);
+      if (clearedFocus.found === true) {
+        await cdp.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65, modifiers: 2 }, sessionId);
+        await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'a', code: 'KeyA', windowsVirtualKeyCode: 65, modifiers: 2 }, sessionId);
+        await cdp.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8 }, sessionId);
+        await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8 }, sessionId);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      const cleared = await read(`
+        ${composerExpression}
+        const text=String(el?(el.tagName==='TEXTAREA'?el.value:el.innerText||''):'');
+        return {cleared:true, contains:text.includes('probe-journal-draft')};
+      `);
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      const restored = await read(`const b=document.querySelector('[data-w2m-jq-restore-draft]'); if(b===null)return{clicked:false}; b.click(); return{clicked:true, key:b.getAttribute('data-w2m-jq-restore-draft')};`);
+      await new Promise((resolve) => setTimeout(resolve, 900));
+      const afterRestore = await read(`
+        ${composerExpression}
+        const text=String(el?(el.tagName==='TEXTAREA'?el.value:el.innerText||''):'');
+        return {contains:text.includes('probe-journal-draft'), text:text.slice(0,120)};
+      `);
+      const closed = await read(`const b=document.querySelector('[data-w2m-jq-close]'); if(b===null)return{closed:false}; b.click(); return{closed:true};`);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      const closeState = await read(`return {closed:document.querySelector('[data-w2m-jq-drawer]')===null};`);
+      report.queueJournalProbe = { chip, diagnostics, dismissed, focused, typed, saved, opened, drawer, cleared, restored, afterRestore, closed, closeState };
     }
     // v3.5.x: the unlock dialog probe. It is independent of the decision-center probe because the backup
     // panel lives on the session-less left sidebar: its seat and main page are visible on the landing page,
