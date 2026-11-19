@@ -4,6 +4,25 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### 决策中心 UX：会话名替代裸 Session ID；决策选项口语化（可调用智能）（未发布）
+
+- **会话名**：本轮待选/暂停列表/会话 chip 不再显示裸 Session ID。宿主新增会话标题解析（`src/decision-center/lib/session-titles.mjs`，
+  从会话日志首条消息有界读取 + 缓存，服务缺失/无标题返回 null）与 `GET /api/w2m/decisions/session-titles`；
+  客户端优先 `source.sessionTitle`，本地 sessions 服务兜底，都没有时显示「未命名会话 · 尾 6 位」；裸 ID 只留在 tooltip/详情里。
+- **选项口语化**：新增 `src/decision-center/lib/option-humanizer.mjs`——规则通道（去 markdown/代码块/URL/编号、合并空白、
+  去重、整句转动作短语、CJK 感知截断，默认 28 字符）始终同步生效；智能通道（配置了 AI provider 时）用一次严格 JSON
+  提示改写 label（值/数量不变、不得新增选项、10 s 超时、失败回退规则），内存 LRU 缓存，不记录原文与密钥。
+  ticket 记录 `optionsHumanized {mode: rules|ai|off, at, model?}`，每个 option 保留 `rawLabel` 供 tooltip。
+- **手动入口**：`POST /api/w2m/decisions/humanize-options`（id 走 body，因为插件不支持参数段路由），带限流；
+  客户端每张 ticket 增「调用智能优化」按钮（运行中禁用），选项按钮带 `data-w2m-dc-option-source`（ai 显示 ✦）。
+  创建 ticket 不等待智能通道（规则结果立即可用）。
+- **配置**：`optionHumanize: auto|off|rules-only`（默认 auto）、`optionLabelMaxChars`（默认 28）、
+  `optionHumanizeTimeoutMs`（默认 10 000）。
+- **测试**：`dc-ux` + `decision-routes` + `decision-center` + `decision-outbox` + `client-bundle` + `client-budget` 全绿
+  （规则矩阵、AI 假 fetch 成功/畸形/超时/数量不符→回退、缓存命中、手动路由限流、客户端渲染与按钮状态）；
+  eslint 0 error；layer/mojibake clean；`lib/client.js` 仍在预算内。
+- **文档**：新增 `docs/DECISION-CENTER-UX.md`（标题解析与选项人化流水线、配置、限流、失败回退、验证命令）。
+
 ### 修复：SSE 流被 5 秒头超时错误中断（未发布）
 
 - **根因**：`src/agent/lifecycle/heartbeat.mjs` 把 SSE 的「等响应头」deadline 用 `AbortSignal.timeout()` 混进传给

@@ -1152,7 +1152,7 @@ it('v3.3.5: the choice watcher mirrors prompts into the decision center and feed
   assert.ok(source.includes("event.type !== 'assistant/message'"), 'it reads the last assistant message');
   assert.ok(source.includes('本轮待选'), 'ticket title marks the pending choice');
   assert.ok(source.includes('dsh-choice:'), 'dedupe key prefix');
-  assert.ok(source.includes('writeComposer(String(option?.label'), 'picking an option fills the composer');
+  assert.ok(source.includes('writeComposer(String(view.label))'), 'picking an option fills the composer with the humanized label');
 });
 
 it('v3.3.6: history and choice detection read the host session log and clear-all archives first', () => {
@@ -3959,4 +3959,112 @@ describe('client bundle: the 编队版本 card (v3.5.0)', () => {
     assert.equal(exports.buildVersionGuidance({ supported_min: '' }, exports.makeTranslator(() => undefined)), '');
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+// The decision-center UX (v3.6.1): session names instead of ids, humanized option labels
+// ---------------------------------------------------------------------------------------------
+
+describe('client bundle: the decision inbox names sessions and humanizes option labels (v3.6.1)', () => {
+  it('shows a session title, keeps the raw id in the tooltip, and uses the documented fallback', () => {
+    const { exports } = loadBundle();
+    const titled = JSON.parse(JSON.stringify(exports.dcSessionView({
+      sessionId: 'session-0123456789abcdef',
+      sessionTitle: '修复队列并发',
+    })));
+    assert.deepEqual(titled, {
+      name: '修复队列并发',
+      raw: 'session-0123456789abcdef',
+      titleAttr: 'session-0123456789abcdef',
+      fallback: false,
+    });
+    const anonymous = JSON.parse(JSON.stringify(exports.dcSessionView({ sessionId: 'session-0123456789abcdef' })));
+    assert.equal(anonymous.name, '未命名会话 · 尾 abcdef', 'a resolvable-but-untitled session gets the friendly tail, not the id');
+    assert.equal(anonymous.raw, 'session-0123456789abcdef', 'the raw id survives for the tooltip/debug attribute');
+    assert.equal(anonymous.fallback, true);
+    const absent = JSON.parse(JSON.stringify(exports.dcSessionView({})));
+    assert.equal(absent.name, '未命名会话', 'no id at all is still a sentence, not an empty string');
+    assert.equal(absent.raw, '');
+    const unknown = JSON.parse(JSON.stringify(exports.dcSessionView({ sessionId: 'unknown' })));
+    assert.equal(unknown.name, '未命名会话');
+    assert.equal(unknown.titleAttr, '', 'a placeholder id is never promoted to a tooltip');
+    const external = JSON.parse(JSON.stringify(exports.dcSessionView({ sessionId: 'external', sessionTitle: '外部生产者' })));
+    assert.equal(external.name, '外部生产者', 'a title hint wins even for a synthetic source id');
+
+    const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
+    assert.ok(source.includes('dcSessionView'), 'the drawer renders through the shared view helper');
+    assert.ok(source.includes('title: session.titleAttr'), 'the raw id rides the meta tooltip');
+    assert.ok(source.includes("'data-w2m-dc-session-id'"), 'the raw id stays copyable for debugging');
+    assert.ok(source.includes('store.sessionNameFor(state.sessionId)'), 'the session chip shows the name');
+    assert.equal(source.includes("'会话 ' + String(ticket.source.sessionId).slice(0, 18)"), false, 'the raw id is gone from the primary meta text');
+    assert.equal(source.includes("'只看会话：' + String(state.sessionId ?? '').slice(0, 18)"), false, 'the chip no longer prints a sliced id');
+    assert.equal(source.includes('String(entry.sessionId).slice(0, 10)'), false, 'the quota footer no longer prints ids');
+  });
+
+  it('renders the humanized label with rawLabel only in the tooltip and a provenance marker', () => {
+    const { exports } = loadBundle();
+    const ai = JSON.parse(JSON.stringify(exports.dcOptionView(
+      { value: 'fix', label: '继续修复', rawLabel: '是否继续修复队列并发呢？' },
+      { optionsHumanized: { mode: 'ai' } },
+    )));
+    assert.deepEqual(ai, { label: '继续修复', rawLabel: '是否继续修复队列并发呢？', source: 'ai' });
+    const rules = JSON.parse(JSON.stringify(exports.dcOptionView(
+      { value: 'fix', label: '继续修复', rawLabel: '是否继续修复队列并发呢？' },
+      { optionsHumanized: { mode: 'rules' } },
+    )));
+    assert.equal(rules.source, 'rules');
+    const raw = JSON.parse(JSON.stringify(exports.dcOptionView({ value: 'fix', label: '继续修复' }, { optionsHumanized: { mode: 'ai' } })));
+    assert.equal(raw.rawLabel, '', 'no tooltip when the label was never rewritten');
+    assert.equal(raw.source, 'raw', 'a label identical to its raw text is not claimed as AI output');
+    const identical = JSON.parse(JSON.stringify(exports.dcOptionView({ value: 'fix', label: '继续', rawLabel: '继续' }, { optionsHumanized: { mode: 'ai' } })));
+    assert.equal(identical.rawLabel, '');
+    assert.equal(identical.source, 'raw');
+
+    const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
+    assert.ok(source.includes("'data-w2m-dc-option-source': view.source"), 'each option button carries its provenance');
+    assert.ok(source.includes("title: view.rawLabel === '' ? view.label : '原选项：' + view.rawLabel"), 'the tooltip only appears when the raw text differs');
+    assert.ok(source.includes('调用智能优化'), 'the per-ticket manual humanizer button exists');
+    assert.ok(source.includes("DC_PREFIX + '/humanize-options'"), 'it POSTs the exact static route the host registers');
+    assert.ok(source.includes('humanizeBtn.addEventListener'), 'the button is wired');
+    assert.ok(source.includes('disabled: busy'), 'the manual run is disabled while another action is running');
+    assert.ok(source.includes("'智能优化失败，可稍后重试：'"), 'a failed run gives retry guidance');
+  });
+
+  it('POSTs the ticket id, refreshes the inbox, and keeps the action disabled while running', async () => {
+    const calls = [];
+    let failing = false;
+    const fetchImpl = async (url, init = {}) => {
+      calls.push({ url: String(url), init });
+      if (String(url).includes('/humanize-options')) {
+        if (failing) return { ok: false, status: 409, async json() { return { ok: false, reason: 'ai-not-configured' }; } };
+        return { ok: true, status: 200, async json() { return { ok: true, mode: 'ai', ticket: { id: 'dec_1' } }; } };
+      }
+      return { ok: true, status: 200, async json() { return { ok: true, items: [], counts: {} }; } };
+    };
+    const bundle = loadBundle({ globals: { fetch: fetchImpl } });
+    assert.equal(typeof bundle.exports.createW2mDecisionStore, 'function', 'the store is exposed for the browser-less test');
+    const store = bundle.exports.createW2mDecisionStore();
+    const running = store.humanizeOptions({ id: 'dec_1' });
+    assert.equal(store.state.busy, 'humanize:dec_1', 'the ticket owns the busy slot while the model runs');
+    const out = await running;
+    assert.equal(out.mode, 'ai');
+    assert.equal(store.state.busy, '');
+    assert.equal(store.state.status, '选项已智能优化');
+    const humanizeCall = calls.find((entry) => entry.url.endsWith('/humanize-options'));
+    assert.ok(humanizeCall !== undefined, 'the manual route was called');
+    assert.equal(humanizeCall.init.method, 'POST');
+    assert.equal(humanizeCall.init.credentials, 'same-origin', 'the host fence is the same-origin cookie');
+    assert.deepEqual(JSON.parse(humanizeCall.init.body), { id: 'dec_1', by: 'w2m-ui' });
+    assert.ok(calls.some((entry) => entry.url.includes('includeArchived=1')), 'the inbox is refreshed after a successful run');
+
+    failing = true;
+    calls.length = 0;
+    const failed = await store.humanizeOptions({ id: 'dec_2' });
+    assert.equal(failed, null);
+    assert.match(store.state.status, /可稍后重试/u);
+    assert.equal(store.state.busy, '', 'a failure releases the busy slot so the operator can retry');
+    assert.equal(store.state.error, '', 'a humanizer failure is guidance, not a red inbox outage');
+    assert.ok(calls.some((entry) => entry.url.includes('includeArchived=1')), 'a failed run still refreshes (rules may have landed)');
+  });
+});
+
 

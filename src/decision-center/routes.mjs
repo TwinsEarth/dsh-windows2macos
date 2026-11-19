@@ -204,6 +204,19 @@ export function registerDecisionCenterRoutes(ctx) {
       return json(200, center.forkAggregation());
     });
 
+    // Read-only session titles for the pending list (no session id is rendered as primary text).
+    // `ids` is a comma-separated list; an unresolvable id answers null rather than the id.
+    register(`${DECISION_ROUTE_PREFIX}/session-titles`, ['GET'], async (request) => {
+      const center = centerOf(ctx);
+      if (center === undefined || typeof center.sessionTitles !== 'function') return unavailable();
+      const ids = String(queryOf(request).get('ids') ?? '')
+        .split(',')
+        .map((id) => id.trim())
+        .filter(Boolean)
+        .slice(0, 50);
+      return json(200, await center.sessionTitles(ids));
+    });
+
     register(`${DECISION_ROUTE_PREFIX}/producers`, ['GET'], () => {
       const center = centerOf(ctx);
       if (center === undefined || typeof center.producerCatalog !== 'function') return unavailable();
@@ -269,8 +282,25 @@ export function registerDecisionCenterRoutes(ctx) {
       return json(statusCode, out);
     });
 
-    register(`${DECISION_ROUTE_PREFIX}/abandon`, ['POST'], async (request) => {
+    // 选项智能改写的手动重跑。宿主 Connection 的 Fetch 路由是**精确路径**（按 url.pathname 查表），
+    // 插件无法注册 `/decisions/<id>/humanize-options` 这种带参数段的路径，所以 id 走请求体。
+    // 鉴权与其它精确路由相同：只有 owner peer 能到达（Connection 在注册表之上做了这一层）。
+    register(`${DECISION_ROUTE_PREFIX}/humanize-options`, ['POST'], async (request) => {
       const center = centerOf(ctx);
+      if (center === undefined || typeof center.humanizeOptions !== 'function') return unavailable();
+      const body = await bodyOf(request);
+      const id = String(body?.id ?? '').trim();
+      if (id === '') return json(400, { ok: false, error: 'id-required' });
+      const out = await center.humanizeOptions(id, { by: body?.by ?? 'w2m-api' });
+      const limited = out?.reason === 'option-humanize-rate-limited';
+      const headers =
+        limited && Number.isFinite(out?.retryAfterMs) && out.retryAfterMs > 0
+          ? { 'retry-after': String(Math.ceil(out.retryAfterMs / 1000)) }
+          : {};
+      return json(out.ok ? 200 : out.reason === 'not-found' ? 404 : limited ? 429 : 409, out, headers);
+    });
+
+    register(`${DECISION_ROUTE_PREFIX}/abandon`, ['POST'], async (request) => {      const center = centerOf(ctx);
       if (center === undefined || typeof center.abandon !== 'function') return unavailable();
       const body = await bodyOf(request);
       if (Array.isArray(body?.ids)) {

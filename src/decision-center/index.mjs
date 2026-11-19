@@ -32,8 +32,17 @@ import {
 } from './kernel.mjs'
 import { createAiSecretStore } from './lib/ai-secret-store.mjs'
 import { createDecisionOutbox, resolveMotherTarget } from './lib/decision-outbox.mjs'
+import {
+  buildOptionHumanizePrompt,
+  createOptionHumanizeCache,
+  humanizeOptionsByRules,
+  OPTION_LABEL_MAX_CHARS,
+  parseOptionHumanizeResponse,
+} from './lib/option-humanizer.mjs'
 import { producerCatalog } from './lib/producer-contract.mjs'
+import { createSessionTitleResolver } from './lib/session-titles.mjs'
 import { assertEndpointSafe, classifyEndpointHost } from './lib/ssrf-guard.mjs'
+import { SlidingWindowRateLimiter } from '../util/rate-limit.mjs'
 
 export const name = 'w2m-decision-center'
 export const inject = []
@@ -109,6 +118,9 @@ const DEFAULTS = Object.freeze({
   maxTicketsPerSessionPerDay: 50,
   sessionQuotaPolicy: 'reject',
   forkWaitTimeoutMs: 300000,
+  optionHumanize: 'auto',
+  optionLabelMaxChars: OPTION_LABEL_MAX_CHARS,
+  optionHumanizeTimeoutMs: 10000,
 })
 
 export const Config = z.object({
@@ -146,6 +158,12 @@ export const Config = z.object({
     .description('单会话日配额超限策略：reject=拒绝；demote=降一级并打标；merge=并入该会话最新 pending ticket'),
   forkWaitTimeoutMs: z.number().min(0).max(86400000).default(300000)
     .description('fork 代理模式下，红色 ticket 等待母体处理的最长时间（毫秒）'),
+  optionHumanize: z.union(['auto', 'off', 'rules-only']).default('auto')
+    .description('决策选项人化：auto=规则同步 + 配置了 AI 时异步智能改写；rules-only=只跑规则；off=保留原文'),
+  optionLabelMaxChars: z.number().min(4).max(120).default(OPTION_LABEL_MAX_CHARS)
+    .description('选项按钮文字的显示列上限（CJK 宽字符按 2 列计）；超长截断并加 …'),
+  optionHumanizeTimeoutMs: z.number().min(1000).max(60000).default(10000)
+    .description('智能改写选项的单次请求超时（毫秒），超时回退规则结果，不阻塞创建'),
 }).description('瓮城决策中心配置')
 
 function normalizeConfig(input = {}) {
@@ -173,6 +191,11 @@ function normalizeConfig(input = {}) {
       ? String(input.sessionQuotaPolicy)
       : DEFAULTS.sessionQuotaPolicy,
     forkWaitTimeoutMs: Math.max(0, Math.min(86400000, Math.floor(Number(input.forkWaitTimeoutMs ?? DEFAULTS.forkWaitTimeoutMs) || 0))),
+    optionHumanize: ['auto', 'off', 'rules-only'].includes(String(input.optionHumanize))
+      ? String(input.optionHumanize)
+      : DEFAULTS.optionHumanize,
+    optionLabelMaxChars: Math.max(4, Math.min(120, Math.floor(Number(input.optionLabelMaxChars ?? DEFAULTS.optionLabelMaxChars) || DEFAULTS.optionLabelMaxChars))),
+    optionHumanizeTimeoutMs: Math.max(1000, Math.min(60000, Math.floor(Number(input.optionHumanizeTimeoutMs ?? DEFAULTS.optionHumanizeTimeoutMs) || DEFAULTS.optionHumanizeTimeoutMs))),
   }
 }
 
@@ -195,6 +218,8 @@ function normalizeOptions(value) {
       id: String(option.id ?? option.value ?? '').slice(0, 200),
       value: String(option.value ?? option.id ?? '').slice(0, 200),
       label: String(option.label ?? option.value ?? option.id ?? '').slice(0, 500),
+      // 原文只在人化后保留：按钮显示 label，tooltip/调试用 rawLabel；value 永不改。
+      ...(option.rawLabel === undefined || option.rawLabel === null ? {} : { rawLabel: String(option.rawLabel).slice(0, 500) }),
       ...(option.isRecommended === true ? { isRecommended: true } : {}),
       ...(option.payload === undefined ? {} : { payload: option.payload }),
     }))
@@ -211,6 +236,7 @@ function publicTicket(ticket) {
     title: ticket.title,
     context: ticket.context,
     options: ticket.options.map((option) => ({ ...option })),
+    optionsHumanized: ticket.optionsHumanized ?? null,
     createdAt: ticket.createdAt,
     expiresAt: ticket.expiresAt ?? null,
     resolvedAt: ticket.resolvedAt ?? null,
@@ -459,6 +485,16 @@ export function apply(ctx, config) {
   const storeFile = path.join(dataDir, 'decision-center.json')
   const aiUsageFile = path.join(dataDir, 'decision-ai-usage.json')
   const sessionUsageFile = path.join(dataDir, 'decision-session-usage.json')
+  // 会话标题：只读、缓存、每次 list 有读取上限；解析不到返回 null（客户端用友好兜底，绝不显示裸 ID）。
+  const sessionTitleResolver = createSessionTitleResolver({ ctx })
+  const withSessionTitle = (view) => {
+    const source = view?.source && typeof view.source === 'object' ? view.source : {}
+    const id = String(source.sessionId ?? '').trim()
+    const hint = String(source.sessionTitle ?? '').trim()
+    const title = hint !== '' ? hint : sessionTitleResolver.resolve(id)
+    return { ...view, source: { ...source, sessionTitle: title === '' ? null : title } }
+  }
+  const ticketView = (ticket) => withSessionTitle(publicTicket(ticket))
   const aiSecretStore = createAiSecretStore({ dataDir, logger: ctx.logger })
   // 每会话每日创建配额：跨重启持久化，按本地日期滚动。
   const sessionUsage = (() => {
@@ -618,7 +654,7 @@ export function apply(ctx, config) {
   const save = () => { prune(); return persist() }
 
   const emitUpdated = (ticket) => {
-    emit('fang/decision-updated', publicTicket(ticket))
+    emit('fang/decision-updated', ticketView(ticket))
   }
 
   const settleWaiter = (id, result) => {
@@ -844,7 +880,9 @@ export function apply(ctx, config) {
     const title = String(raw.title ?? '').trim()
     if (!title) return { ok: false, reason: 'title-required' }
     const context = String(raw.context ?? '').trim()
-    const options = normalizeOptions(raw.options)
+    // 选项人化：规则 pass 同步完成（按钮立刻可用），智能 pass 由后面的队列异步补。
+    const prepared = prepareOptions(normalizeOptions(raw.options))
+    const options = prepared.options
     if (options.some((option) => option.value === '__ACK__' || option.id === '__ACK__')) {
       return { ok: false, reason: 'reserved-option-value' }
     }
@@ -855,11 +893,16 @@ export function apply(ctx, config) {
       // 幂等键跨状态生效：同 key 的重放返回原 ticket（哪怕已 resolved/abandoned），
       // 不允许重放再开一张新票。
       const existing = [...tickets.values()].find((ticket) => ticket.dedupeKey === dedupeKey)
-      if (existing) return { ok: true, deduped: true, ticket: publicTicket(existing) }
+      if (existing) return { ok: true, deduped: true, ticket: ticketView(existing) }
     }
     const sourceRaw = raw.source && typeof raw.source === 'object' ? raw.source : {}
+    // 调用方若已带标题提示（metadata/source.sessionTitle），先信它，宿主不再查。
+    const sessionTitleHint = sourceRaw.sessionTitle ?? sourceRaw.sessionName ?? raw.sessionTitle ?? null
     const source = {
       sessionId: String(sourceRaw.sessionId ?? raw.sessionId ?? '').slice(0, 200) || 'unknown',
+      sessionTitle: sessionTitleHint === null || sessionTitleHint === undefined
+        ? null
+        : (String(sessionTitleHint).trim().slice(0, 200) || null),
       agentRole: SOURCE_ROLES.includes(String(sourceRaw.agentRole ?? '')) ? String(sourceRaw.agentRole) : 'worker',
       // 角色来源标注：host:... = 宿主绑定；caller-* / service = 自报或服务调用，不作为权限依据。
       roleSource: String(sourceRaw.roleSource ?? '').slice(0, 80) || 'service',
@@ -885,7 +928,7 @@ export function apply(ctx, config) {
           .sort((a, b) => b.createdAt - a.createdAt)[0]
         if (latest) {
           audit('decision-ticket-merged', { id: latest.id, sessionId: source.sessionId, reason: 'session-daily-quota-merged' })
-          return { ok: true, merged: true, reason: 'session-daily-quota-merged', ticket: publicTicket(latest) }
+          return { ok: true, merged: true, reason: 'session-daily-quota-merged', ticket: ticketView(latest) }
         }
       }
       if (cfg.sessionQuotaPolicy === 'demote') {
@@ -948,6 +991,7 @@ export function apply(ctx, config) {
       title: title.slice(0, 500),
       context: context.slice(0, 12000),
       options,
+      optionsHumanized: prepared.humanized,
       createdAt: nowMs(),
       expiresAt: Number.isFinite(expiresAt) && expiresAt > 0 ? expiresAt : null,
       resolvedAt: null,
@@ -978,11 +1022,15 @@ export function apply(ctx, config) {
       return { ok: false, reason: 'store-unavailable', detail: storeHealth.lastError }
     }
     recordSessionTicket(source.sessionId, source.agentRole)
-    emit('fang/decision-created', publicTicket(ticket))
-    audit('decision-ticket-created', { id: ticket.id, level, source, title: ticket.title, blocking: ticket.isBlocking, budgetDemoted, attentionDemoted, attentionQuota, sessionQuotaDemoted, sessionQuota })
+    emit('fang/decision-created', ticketView(ticket))
+    audit('decision-ticket-created', { id: ticket.id, level, source, title: ticket.title, blocking: ticket.isBlocking, budgetDemoted, attentionDemoted, attentionQuota, sessionQuotaDemoted, sessionQuota, optionsHumanized: prepared.humanized?.mode ?? null })
     // 自动接线：AI 已配置时异步生成建议（不改变 ticket 状态，只写 ticket.ai）。
     try { queueAutoAdvise(ticket.id) } catch { /* auto advice must never block ticket creation */ }
-    return { ok: true, ticket: publicTicket(ticket) }
+    // 选项智能改写：只在规则 pass 真的改动了文字时才值得花一次模型调用；永远 fire-and-forget。
+    if (prepared.changed === true) {
+      try { queueOptionHumanize(ticket.id) } catch { /* option rewriting must never block ticket creation */ }
+    }
+    return { ok: true, ticket: ticketView(ticket) }
   }
 
   const wait = (id, signal = null) => {
@@ -1034,10 +1082,12 @@ export function apply(ctx, config) {
   const list = (options = {}) => {
     const includeArchived = options.includeArchived === true
     const since = Number(options.since) > 0 ? Number(options.since) : 0
+    // 每次列表重置标题读取预算：一次 list 最多读固定条会话日志，其余走缓存/下次轮询。
+    sessionTitleResolver.beginBatch()
     const items = [...tickets.values()]
       .filter((ticket) => includeArchived || ticket.status === 'pending')
       .filter((ticket) => since === 0 || (ticket.rev ?? 0) > since)
-      .map(publicTicket)
+      .map(ticketView)
       .sort((a, b) => {
         const levelDelta = (LEVEL_RANK[b.level] ?? 0) - (LEVEL_RANK[a.level] ?? 0)
         if (levelDelta !== 0) return levelDelta
@@ -1050,7 +1100,7 @@ export function apply(ctx, config) {
 
   const get = (id) => {
     const ticket = tickets.get(String(id ?? ''))
-    return ticket ? publicTicket(ticket) : null
+    return ticket ? ticketView(ticket) : null
   }
 
   // Restore persisted tickets. Pending tickets from a previous process have no
@@ -1070,6 +1120,7 @@ export function apply(ctx, config) {
         title: String(item.title ?? ''),
         context: String(item.context ?? ''),
         options: normalizeOptions(item.options),
+        optionsHumanized: item.optionsHumanized && typeof item.optionsHumanized === 'object' ? { ...item.optionsHumanized } : null,
         createdAt: Number(item.createdAt) || nowMs(),
         expiresAt: Number(item.expiresAt) || null,
         resolvedAt: Number(item.resolvedAt) || null,
@@ -1594,6 +1645,15 @@ export function apply(ctx, config) {
     lastError: aiUsage.reason ?? null,
     queue: autoAdviseQueue.length,
     active: autoAdviseActive,
+    optionHumanize: {
+      mode: cfg.optionHumanize,
+      maxChars: cfg.optionLabelMaxChars,
+      timeoutMs: cfg.optionHumanizeTimeoutMs,
+      cache: optionHumanizeCache.stats(),
+      queue: optionHumanizeQueue.length,
+      active: optionHumanizeActive,
+      rateLimit: optionHumanizeLimiter.limit,
+    },
   })
   const configureAi = (input = {}) => {
     const normalized = normalizeAiConfig(input)
@@ -1845,6 +1905,181 @@ export function apply(ctx, config) {
     return true
   }
 
+  // ---------------------------------------------------------------------------
+  // 选项人化（option humanizer）
+  //
+  // 规则 pass 同步落在 create() 里，按钮从第一帧就可读；智能 pass 复用 advise 的同一套
+  // provider 配置与 HTTP 管线（callAiChat / selectAiRuntime / aiGate / 配额与熔断），不新建
+  // 第二套 provider。智能 pass 永远异步（创建不等待），失败只回落规则结果。
+  // ---------------------------------------------------------------------------
+  const optionHumanizeCache = createOptionHumanizeCache({ limit: 500 })
+  // 手动重跑按 ticket 限流：复用 util 的滑动窗口；超限的调用连 AI 请求都不发。
+  const optionHumanizeLimiter = new SlidingWindowRateLimiter({ limit: 6, windowMs: 60_000 })
+  const optionHumanizeQueue = []
+  const optionHumanizeQueued = new Set()
+  const optionHumanizeInFlight = new Map()
+  let optionHumanizeActive = 0
+  const OPTION_HUMANIZE_CONCURRENCY = 1
+  const OPTION_HUMANIZE_MAX_QUEUE = 20
+
+  /** 规则 pass：同步、幂等；off 配置下原样返回（mode='off'）。 */
+  const prepareOptions = (options) => {
+    const list = Array.isArray(options) ? options : []
+    if (list.length === 0) return { options: list, changed: false, humanized: null }
+    if (cfg.optionHumanize === 'off') return { options: list, changed: false, humanized: { mode: 'off', at: nowMs() } }
+    const ruled = humanizeOptionsByRules(list, { maxChars: cfg.optionLabelMaxChars })
+    return {
+      options: ruled.options,
+      changed: ruled.changed === true,
+      humanized: { mode: 'rules', at: nowMs() },
+    }
+  }
+
+  const applyHumanizedOptions = (ticket, options, mode, model = null) => {
+    ticket.options = options
+    ticket.optionsHumanized = { mode, at: nowMs(), ...(model === null ? {} : { model }) }
+    ticket.rev = nextRevision()
+    save()
+    emitUpdated(ticket)
+  }
+
+  /**
+   * 智能 pass：一次 chat-completion + 严格校验。
+   * 返回 ok:false 时 ticket 保持规则结果；绝不因为模型失败而拒绝或回滚一张 ticket。
+   */
+  const runOptionHumanizeAi = async (ticket) => {
+    if (!aiConfig) return { ok: false, reason: 'ai-not-configured' }
+    if (ticket.status !== 'pending') return { ok: false, reason: 'not-pending' }
+    if (ticket.options.length === 0) return { ok: false, reason: 'options-required' }
+    const runtimeAi = selectAiRuntime(ticket.level) ?? aiConfig
+    // SSRF 预检与 advise 相同：公网域名解析到内网也要拒绝。
+    const ssrf = await assertEndpointSafe(runtimeAi.endpointHost ?? '', { allowHosts: [...privateHostAllowlist] })
+    if (!ssrf.ok) return { ok: false, reason: ssrf.reason, kind: 'security' }
+    const gate = aiGate()
+    if (gate.blocked) return { ok: false, reason: gate.reason, retryAfterMs: gate.retryAfterMs }
+    const model = runtimeAi.model ?? null
+    const cacheKeyOf = (option) => optionHumanizeCache.keyFor(option.value, option.rawLabel ?? option.label, model)
+    // 全命中缓存 => 不再发请求（手动重跑同一张票的常见情形）。
+    const cached = ticket.options.map((option) => optionHumanizeCache.get(cacheKeyOf(option)))
+    if (cached.every((label) => typeof label === 'string' && label !== '')) {
+      const options = ticket.options.map((option, index) => ({ ...option, label: cached[index], rawLabel: option.rawLabel ?? option.label }))
+      applyHumanizedOptions(ticket, options, 'ai', model)
+      audit('decision-option-humanize', { id: ticket.id, mode: 'ai', model, cached: true })
+      return { ok: true, mode: 'ai', cached: true, ticket: ticketView(ticket) }
+    }
+    const messages = buildOptionHumanizePrompt({
+      title: ticket.title, context: ticket.context, options: ticket.options, maxChars: cfg.optionLabelMaxChars,
+    })
+    const call = await callAiChat(runtimeAi, messages, { timeoutMs: cfg.optionHumanizeTimeoutMs, maxTokens: 400 })
+    if (!call.ok) {
+      const reason = call.status === 429 ? 'ai-rate-limited' : (call.error ?? (call.status ? `ai-http-${call.status}` : 'ai-failed'))
+      recordAiFailure(reason, { retryAfterMs: call.retryAfterMs })
+      // 审计只记 reason/model/mode，绝不落原始选项文本或 API Key。
+      audit('decision-option-humanize-failed', { id: ticket.id, reason })
+      return { ok: false, reason }
+    }
+    let body = null
+    try { body = call.text ? JSON.parse(call.text) : {} } catch { body = null }
+    const content = String(body?.choices?.[0]?.message?.content ?? '')
+    const usage = normalizeUsage(body?.usage) ?? call.usage
+    const parsed = parseOptionHumanizeResponse(content, ticket.options, { maxChars: cfg.optionLabelMaxChars })
+    if (!parsed.ok) {
+      // 结构不合规：计一次调用/token，但不写选项、不触发熔断（与 advise 的 schema 失败一致）。
+      recordAiSuccess(usage)
+      audit('decision-option-humanize-failed', { id: ticket.id, reason: parsed.reason })
+      return { ok: false, reason: parsed.reason }
+    }
+    const options = ticket.options.map((option, index) => ({
+      ...option, label: parsed.options[index].label, rawLabel: option.rawLabel ?? option.label,
+    }))
+    for (const option of options) optionHumanizeCache.set(cacheKeyOf(option), option.label)
+    applyHumanizedOptions(ticket, options, 'ai', model)
+    recordAiSuccess(usage)
+    audit('decision-option-humanize', {
+      id: ticket.id, mode: 'ai', model, cached: false,
+      promptTokens: usage?.promptTokens ?? null, completionTokens: usage?.completionTokens ?? null,
+    })
+    return { ok: true, mode: 'ai', cached: false, ticket: ticketView(ticket) }
+  }
+
+  /** 同一 ticket 的单飞：并发手动点击/队列重复只发一次请求（与 advise 同一模式）。 */
+  const singleFlightOptionHumanize = (ticketId, work) => {
+    const existing = optionHumanizeInFlight.get(ticketId)
+    if (existing !== undefined) return existing
+    const promise = Promise.resolve().then(work)
+      .finally(() => { if (optionHumanizeInFlight.get(ticketId) === promise) optionHumanizeInFlight.delete(ticketId) })
+    optionHumanizeInFlight.set(ticketId, promise)
+    return promise
+  }
+
+  /**
+   * 手动重跑（`POST /humanize-options`）：先同步落地规则结果让 UI 立刻可用，再可选地走智能。
+   * 限流在发请求前；规则 pass 不会因为限流被跳过。
+   */
+  const humanizeOptions = async (id, options = {}) => {
+    const ticketId = String(id ?? '')
+    if (!ticketId) return { ok: false, reason: 'id-required' }
+    if (optionHumanizeInFlight.has(ticketId)) return optionHumanizeInFlight.get(ticketId)
+    const limited = optionHumanizeLimiter.hit(ticketId)
+    if (!limited.allowed) {
+      return { ok: false, reason: 'option-humanize-rate-limited', retryAfterMs: limited.retry_after_seconds * 1000 }
+    }
+    return singleFlightOptionHumanize(ticketId, async () => {
+      const ticket = tickets.get(ticketId)
+      if (!ticket) return { ok: false, reason: 'not-found' }
+      if (ticket.status !== 'pending') return { ok: false, reason: 'not-pending', status: ticket.status }
+      if (cfg.optionHumanize === 'off') return { ok: false, reason: 'option-humanize-disabled', ticket: ticketView(ticket) }
+      const prepared = prepareOptions(ticket.options)
+      const applyRules = () => {
+        if (prepared.changed === true) applyHumanizedOptions(ticket, prepared.options, prepared.humanized?.mode ?? 'rules')
+      }
+      if (cfg.optionHumanize === 'rules-only') {
+        applyRules()
+        return { ok: true, mode: 'rules', ticket: ticketView(ticket), by: options.by ?? null }
+      }
+      if (!aiConfig) {
+        // 规则结果仍然落地：用户点了按钮，至少让按钮变短；再如实说明缺模型配置。
+        applyRules()
+        return { ok: false, reason: 'ai-not-configured', mode: 'rules', ticket: ticketView(ticket) }
+      }
+      const ai = await runOptionHumanizeAi(ticket)
+      if (ai.ok) return ai
+      // 智能失败：规则结果补上，按钮不会退回成段文字。
+      applyRules()
+      return { ok: false, reason: ai.reason, mode: 'rules', retryAfterMs: ai.retryAfterMs, ticket: ticketView(ticket) }
+    })
+  }
+
+  // 自动队列：创建时规则已生效，智能结果后到后补；并发 1、最多排队 20。
+  const drainOptionHumanize = () => {
+    while (optionHumanizeActive < OPTION_HUMANIZE_CONCURRENCY && optionHumanizeQueue.length > 0) {
+      const ticketId = optionHumanizeQueue.shift()
+      optionHumanizeQueued.delete(ticketId)
+      const ticket = tickets.get(ticketId)
+      if (!ticket || ticket.status !== 'pending' || ticket.options.length === 0) continue
+      optionHumanizeActive += 1
+      singleFlightOptionHumanize(ticketId, () => runOptionHumanizeAi(ticket))
+        .then((result) => {
+          if (result?.ok === true) return
+          try { audit('decision-option-humanize-failed', { id: ticketId, reason: result?.reason ?? 'ai-failed', auto: true }) } catch { /* ignore */ }
+        })
+        .catch(() => { /* auto option rewriting never breaks the store */ })
+        .finally(() => { optionHumanizeActive -= 1; drainOptionHumanize() })
+    }
+  }
+  /** @returns {boolean} true = 已入队 */
+  const queueOptionHumanize = (id) => {
+    if (cfg.optionHumanize !== 'auto' || !aiConfig) return false
+    const ticket = tickets.get(String(id ?? ''))
+    if (!ticket || ticket.status !== 'pending' || ticket.options.length === 0) return false
+    if (optionHumanizeQueued.has(ticket.id) || optionHumanizeInFlight.has(ticket.id)) return false
+    if (optionHumanizeQueue.length >= OPTION_HUMANIZE_MAX_QUEUE) return false
+    optionHumanizeQueue.push(ticket.id)
+    optionHumanizeQueued.add(ticket.id)
+    drainOptionHumanize()
+    return true
+  }
+
   const submit = (item = {}) => {
     const raw = item && typeof item === 'object' ? { ...item } : {}
     if (raw.context === undefined && raw.description !== undefined) raw.context = raw.description
@@ -1945,6 +2180,23 @@ export function apply(ctx, config) {
     testAi,
     advise,
     adviseStream: (id, onDelta) => advise(id, { onDelta }),
+    humanizeOptions,
+    /** 只读会话标题解析（GET /session-titles）：拿不到就是 null，绝不返回裸 ID。 */
+    sessionTitles: async (ids) => {
+      const list = Array.isArray(ids)
+        ? [...new Set(ids.map((id) => String(id ?? '').trim()).filter(Boolean))].slice(0, 50)
+        : []
+      try {
+        const resolved = await sessionTitleResolver.lookupMany(list)
+        const titles = {}
+        for (const id of list) titles[id] = resolved.get(id) ?? null
+        return { ok: true, titles }
+      } catch {
+        const titles = {}
+        for (const id of list) titles[id] = null
+        return { ok: true, titles }
+      }
+    },
     submit,
     ingest: (input = {}) => {
       const raw = input && typeof input === 'object' ? { ...input } : {}
@@ -1961,6 +2213,10 @@ export function apply(ctx, config) {
         context: raw.context ?? raw.description ?? '',
         source: {
           sessionId: String(raw.sessionId ?? raw.origin ?? 'external').slice(0, 200),
+          // 外部生产者可以带标题提示：宿主先信它，再谈自己的只读解析。
+          ...(String(raw.sessionTitle ?? raw.metadata?.sessionTitle ?? '').trim() === ''
+            ? {}
+            : { sessionTitle: String(raw.sessionTitle ?? raw.metadata?.sessionTitle).trim().slice(0, 200) }),
           agentRole,
           roleSource: `external:${producer}`,
           roleTrusted: false,
@@ -1980,7 +2236,7 @@ export function apply(ctx, config) {
         save()
         emitUpdated(ticket)
       }
-      return { ...created, ticket: publicTicket(tickets.get(created.ticket.id)) }
+      return { ...created, ticket: ticketView(tickets.get(created.ticket.id)) }
     },
     create,
     list,
@@ -2009,6 +2265,9 @@ export function apply(ctx, config) {
       attentionWeights: { ...ATTENTION_WEIGHTS },
       maxTicketsPerSessionPerDay: cfg.maxTicketsPerSessionPerDay,
       sessionQuotaPolicy: cfg.sessionQuotaPolicy,
+      optionHumanize: cfg.optionHumanize,
+      optionLabelMaxChars: cfg.optionLabelMaxChars,
+      optionHumanizeTimeoutMs: cfg.optionHumanizeTimeoutMs,
     }),
     status: () => ({
       ...list({ includeArchived: true }),
