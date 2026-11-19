@@ -40,12 +40,16 @@
 
 | # | 切片 | 内容 | 验收 |
 |---|---|---|---|
-| F1 | 注入式 UDP 故障层 | `test/helpers/fault-udp.mjs`：包装 `bindUdpSocket` 的假 socket（drop/reorder/duplicate/latency/close），可设随机种子 | 单元：注入层自身行为确定（同 seed 同结果） |
-| F2 | P2P 可靠通道矩阵 | 用 F1 驱动 `p2p-transport`：丢包/乱序/重复下消息最终有序；半途 close → 具名失败；重复包幂等 | `test/p2p-fault.test.mjs` 全绿，**不依赖真实网络** |
-| F3 | relay 租约竞争矩阵 | 假时钟 + 注入 state：心跳/过期/接管三方竞争；重启中途（persistence 截断）恢复；重复 offer 幂等 | `test/relay-concurrency.test.mjs`；现有 relay 套件不回归 |
+| F1 ✅ | 注入式 UDP 故障层 | **已实现** `test/helpers/fault-udp.mjs`（526 行）：seeded PRNG、内存端点 + 注入式 base socket、`drop/duplicate/reorder/latency/goSilent`、有界队列 | 7 项自测：同 seed 同顺序、计数、溢出报错 |
+| F2 ✅ | P2P 可靠通道矩阵 | **已实现** `test/p2p-fault.test.mjs`：0/5/20% 丢包、乱序、重复、半途 close、重开；**发现并修复产品 bug**（完成后重复包被二次投递 / incoming 永不清理），见下 | 24/24（含原 skip 转绿）；无真实 socket |
+| F3 ✅ | relay 租约竞争矩阵 | **已实现** `test/relay-concurrency.test.mjs`：心跳/过期边界、halt=never/now 接管、写任务拒绝接管、重启中途恢复、重复 offer/result 幂等 | 8/8；relay.test 189/189 不回归 |
 | F4 | 真实进程回归 | 把 F2/F3 的关键场景加进 `scripts/verify-relay-cluster-phase2.mjs` 的 mixed-version 场景 | 本机真实进程脚本 9/9 + 6/6 仍通过 |
 
 **风险控制**：故障注入只经注入接缝，不 monkey-patch 全局；随机种子显式化；测试失败信息必须给出"哪个包/哪个租约"。
+
+**F 的产出**：修复了 `P2PChannel` 的接收侧重复抑制缺口——新增完成消息有界 LRU（`recentMessageLimit` 1024 / `recentMessageTtlMs` 60 s）、
+`incoming` 过期清扫（`unref` 定时器 + 查找时过期）、计数器 `duplicateFragmentsDropped/messagesDeduped/staleAssembliesSwept`；
+ACK 语义与线协议不变。`test/p2p-fault.test.mjs` 24/24、p2p 回归 115/115 + 142/142。
 
 ---
 

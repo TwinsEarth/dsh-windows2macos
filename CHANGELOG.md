@@ -4,6 +4,19 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### P1 重构：S4 agent 生命周期 + S5 relay 状态机拆分；P2-F 故障注入与 P2P 去重修复（未发布）
+
+- **S4 agent 生命周期拆分**：`src/agent/agent.mjs` 4,770 → **638 行**（`createAgent()` 365），拆为
+  `src/agent/lifecycle/{shared,deliver,execute,offer,heartbeat}.mjs`（1,170/1,470/554/567/926）；导出面 45 项不变、
+  4,470/4,690 行逐字节一致；基线 568/566/0/2 与广回归 164/164 不变；`test/dataflow-wiring.test.mjs` 仅改读取路径。
+- **S5 relay 状态机拆分**：`src/relay/state.mjs` 3,713 → **1,174 行**，拆为
+  `src/relay/state/{shared,members,tasks,leases,results,events}.mjs`；42 导出与 100 个 prototype 方法名不变；
+  relay 517/516/0/1 不变；真实进程 phase2 **9/9**、mixed **6/6**；`.gitignore` 修正 `state/` 误忽略源码目录。
+- **P2-F 并发/故障注入矩阵**：新增 `test/helpers/fault-udp.mjs`（seeded 丢包/乱序/重复/静默/延迟）、
+  `test/p2p-fault.test.mjs`（24 例）、`test/relay-concurrency.test.mjs`（8 例：心跳/过期/接管/重启/幂等）。
+- **修复 P2P 重复投递 bug**（F2 命中）：完成后重复包不再二次投递、`incoming` 有 TTL 清理，新增有界完成记忆
+  （`recentMessageLimit` 1024 / `recentMessageTtlMs` 60 s）与计数器；线协议与 ACK 语义不变；p2p 回归 115/115 + 142/142。
+
 ### P1 重构进展：备份引擎 worker_threads 化 + tools 入口拆分（未发布）
 
 - **S8 备份引擎 worker_threads**：定时备份、`POST /api/w2m/backup/run`、verify 路由与 nightly 终审改由 worker 执行

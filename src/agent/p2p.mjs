@@ -156,7 +156,35 @@ export const DEFAULT_MAX_ATTEMPTS = 8;
 /** Largest message accepted, so a hostile length cannot make us allocate without bound. */
 export const MAX_MESSAGE_BYTES = 8 * 1024 * 1024;
 
+/**
+ * How many completed message ids one channel remembers, for duplicate suppression.
+ *
+ * `1024` bounds the completed-message memory at 1024 small records (message id -> completion
+ * time) however many messages pass through the channel: a later completion evicts the oldest
+ * record. `0` disables the memory entirely, so every duplicate is re-assembled — the escape
+ * hatch for a caller that prefers zero bookkeeping to exactly-once delivery, documented rather
+ * than hidden.
+ */
+export const DEFAULT_RECENT_MESSAGE_LIMIT = 1024;
+
+/**
+ * How long a completed message id stays remembered, and (same value) how long an incomplete
+ * reassembly may sit with no new fragment before it is abandoned.
+ *
+ * Two constraints set the default. It must be comfortably longer than the sender's worst-case
+ * retransmission budget for the *default* tuning (`DEFAULT_MAX_ATTEMPTS` × `MAX_RTO_MS` = 24 s
+ * at most), so the receiver cannot sweep an assembly the sender is still trying to complete —
+ * a caller that raises `tuning.maxAttempts` should raise the TTL with it. And it must be short
+ * enough that a hostile or crash-looping peer cannot pin memory with abandoned assemblies.
+ * 60 s satisfies both with margin.
+ */
+export const DEFAULT_RECENT_MESSAGE_TTL_MS = 60_000;
+
 const HEADER_BYTES = 5;
+
+/** Bounds for the stale-reassembly sweep interval derived from the TTL. */
+const SWEEP_INTERVAL_MIN_MS = 10;
+const SWEEP_INTERVAL_MAX_MS = 5000;
 
 /** @param {number} kind @param {number} session @param {Buffer} [body] */
 function frame(kind, session, body = Buffer.alloc(0)) {
@@ -1003,6 +1031,14 @@ export async function punch(options) {
  *     of looking like packet loss.
  *   * **The old epoch stays decryptable for a bounded window** (`crypto.mjs`), which is what keeps a
  *     rekey from losing a frame that was already in flight.
+ *
+ * Receiver-side duplicate suppression (the P2 F2 follow-up) is separate from all of that and changes
+ * no wire format: a fragment carrying a message id this channel has already delivered is acknowledged
+ * — the sender may still be waiting on a lost ACK — and then dropped without touching the in-flight
+ * `incoming` map. `incoming` entries that stop making progress are swept after a TTL, so a fragmented
+ * message whose tail never arrives cannot occupy memory forever. Both the memory and the TTL are
+ * bounded and configurable (`recentMessageLimit`, `recentMessageTtlMs`), and both are receive-side
+ * only: ACK/DONE/BYE semantics and the framing are exactly what they were.
  */
 export class P2PChannel extends EventEmitter {
   /**
@@ -1013,6 +1049,11 @@ export class P2PChannel extends EventEmitter {
    * @param {object} [options.tuning]
    * @param {{session: object, isInitiator: boolean, tuning?: object}|null} [options.crypto]
    *   An established session from `punch()`/`accept()`. Omitted means plaintext.
+   * @param {number} [options.recentMessageLimit=1024] How many completed message ids to remember
+   *   for duplicate suppression. `0` disables the memory. See {@link DEFAULT_RECENT_MESSAGE_LIMIT}.
+   * @param {number} [options.recentMessageTtlMs=60000] How long a completed message id is remembered
+   *   and how long an incomplete reassembly may go without a new fragment before it is swept. See
+   *   {@link DEFAULT_RECENT_MESSAGE_TTL_MS}.
    */
   constructor(options) {
     super();
@@ -1025,6 +1066,28 @@ export class P2PChannel extends EventEmitter {
       rtoMs: options.tuning?.rtoMs ?? DEFAULT_RTO_MS,
       maxAttempts: options.tuning?.maxAttempts ?? DEFAULT_MAX_ATTEMPTS,
     };
+    /**
+     * How many recently completed message ids the channel remembers, and for how long.
+     *
+     * Bounded, independent options rather than fields of `tuning`: `tuning` is the send-side
+     * retransmission contract the two ends should agree about, while these are pure receiver state
+     * — a peer cannot observe them, and changing them cannot change the wire format.
+     *
+     * @type {number}
+     */
+    this.recentMessageLimit = options.recentMessageLimit ?? DEFAULT_RECENT_MESSAGE_LIMIT;
+    /** @type {number} */
+    this.recentMessageTtlMs = options.recentMessageTtlMs ?? DEFAULT_RECENT_MESSAGE_TTL_MS;
+    if (!Number.isInteger(this.recentMessageLimit) || this.recentMessageLimit < 0) {
+      throw new TypeError(
+        `recentMessageLimit must be a non-negative integer, got ${JSON.stringify(this.recentMessageLimit)}`,
+      );
+    }
+    if (!Number.isFinite(this.recentMessageTtlMs) || this.recentMessageTtlMs <= 0) {
+      throw new TypeError(
+        `recentMessageTtlMs must be a positive finite number, got ${JSON.stringify(this.recentMessageTtlMs)}`,
+      );
+    }
     /** Adaptive send window: starts at the tuning value, grows on completed messages. */
     this.window = this.tuning.window;
     /** RTT/RTO measured from ACK arrival, instead of the fixed 300 ms default. */
@@ -1055,10 +1118,56 @@ export class P2PChannel extends EventEmitter {
       last_failure: null,
     };
 
-    /** messageId -> {fragments: Buffer[], received: Set<number>, total: number, timer} */
+    /**
+     * messageId -> `{fragments: Buffer[], received: Set<number>, total: number, lastSeenAtMs: number}`.
+     *
+     * `lastSeenAtMs` advances only when a fragment that was *not* already stored arrives, i.e. when
+     * the assembly actually made progress; a peer that keeps re-sending one fragment cannot keep a
+     * stalled assembly alive past the TTL.
+     */
     this.incoming = new Map();
     /** messageId -> {fragments: Buffer[], acked: Set<number>, resolve, reject, attempts: Map} */
     this.outgoing = new Map();
+    /**
+     * Message ids already delivered on this channel, oldest completion first.
+     *
+     * A fragment for a remembered id is a duplicate: it is acknowledged (the sender may still be
+     * waiting on a lost ACK) and dropped, never assembled again. Bounded by `recentMessageLimit` with
+     * the oldest record evicted first, and each record expires `recentMessageTtlMs` after completion.
+     *
+     * @type {Map<number, {at:number, deduped:boolean}>}
+     */
+    this.completed = new Map();
+    /**
+     * Receiver-side duplicate-suppression counters. Receive-only: nothing here changes what goes on
+     * the wire, so a peer that does not have this build is unaffected.
+     *
+     *   * `duplicateFragmentsDropped` — DATA fragments for an already-completed message id that were
+     *     acknowledged and discarded instead of assembled and delivered again.
+     *   * `messagesDeduped` — completed messages that had at least one such fragment (counted once per
+     *     completion record, so it is "messages saved from re-delivery", not "duplicates seen").
+     *   * `staleAssembliesSwept` — partial reassemblies abandoned by the stale-assembly TTL sweep.
+     *
+     * @type {{duplicateFragmentsDropped:number, messagesDeduped:number, staleAssembliesSwept:number}}
+     */
+    this.stats = { duplicateFragmentsDropped: 0, messagesDeduped: 0, staleAssembliesSwept: 0 };
+    /** Clock time the next opportunistic sweep is allowed; batching keeps a busy `onData` cheap. */
+    this.nextSweepAtMs = 0;
+    /** Sweep cadence derived from the TTL: often enough to be prompt, rare enough to be free. */
+    this.sweepIntervalMs = Math.max(
+      SWEEP_INTERVAL_MIN_MS,
+      Math.min(SWEEP_INTERVAL_MAX_MS, Math.floor(this.recentMessageTtlMs / 2)),
+    );
+    /**
+     * Low-frequency stale-reassembly timer.
+     *
+     * It exists because the entries that need sweeping are exactly the ones that produce no further
+     * activity: an assembly abandoned by a peer that vanished would otherwise sit in `incoming`
+     * forever. `unref()` so a quiet receiver does not hold the process open, and `close()` clears it,
+     * so a channel that ended leaves no timer behind.
+     */
+    this.sweepTimer = setInterval(() => this.sweepStaleAssemblies(), this.sweepIntervalMs);
+    this.sweepTimer.unref?.();
     this.nextMessageId = 1;
     this.closed = false;
 
@@ -1155,31 +1264,151 @@ export class P2PChannel extends EventEmitter {
     const total = body.readUInt32BE(8);
     if (total === 0 || total > 100000 || index >= total) return;
     const payload = body.subarray(12);
+    const now = Date.now();
+    if (now >= this.nextSweepAtMs) this.sweepStaleAssemblies(now);
+
+    // A fragment carrying a message id this channel has already delivered is a duplicate, and not
+    // of the in-flight kind: `incoming` was deleted when the message was assembled, so without this
+    // check the fragment is treated as the first fragment of a brand-new message and the payload is
+    // delivered a second time (a duplicate of the *final* fragment additionally leaves a permanently
+    // incomplete entry behind). Drop it before it can touch `incoming`, but still acknowledge it:
+    // the duplicate may be a retransmission whose ACK was lost, and staying silent would make the
+    // sender spend its whole attempt budget and fail a send that actually succeeded.
+    if (this.isRecentlyCompleted(messageId, now)) {
+      const record = this.completed.get(messageId);
+      this.stats.duplicateFragmentsDropped += 1;
+      if (record !== undefined && record.deduped !== true) {
+        record.deduped = true;
+        this.stats.messagesDeduped += 1;
+      }
+      this.ackFragment(messageId, index);
+      return;
+    }
 
     let entry = this.incoming.get(messageId);
+    if (entry !== undefined && now - entry.lastSeenAtMs > this.recentMessageTtlMs) {
+      // The TTL is enforced at lookup time as well as by the periodic sweep: an assembly that has
+      // gone quiet for longer than the TTL is stale even if the timer has not reached it yet, so a
+      // late fragment starts a fresh assembly instead of resurrecting the expired one.
+      this.incoming.delete(messageId);
+      this.stats.staleAssembliesSwept += 1;
+      entry = undefined;
+    }
     if (!entry) {
-      entry = { fragments: new Array(total).fill(null), received: new Set(), total };
+      entry = { fragments: new Array(total).fill(null), received: new Set(), total, lastSeenAtMs: now };
       this.incoming.set(messageId, entry);
     }
     if (!entry.received.has(index)) {
       entry.fragments[index] = Buffer.from(payload);
       entry.received.add(index);
+      // Progress, not mere traffic: a duplicate does not keep a stalled assembly alive (see the
+      // `incoming` doc comment).
+      entry.lastSeenAtMs = now;
     }
 
-    // Acknowledge every fragment, including duplicates: a duplicate means our ACK
+    // Acknowledge every fragment, including in-flight duplicates: a duplicate means our ACK
     // was lost, and re-acking is cheaper than a retransmit storm.
-    const ackBody = Buffer.alloc(8);
-    ackBody.writeUInt32BE(messageId, 0);
-    ackBody.writeUInt32BE(index, 4);
-    this.sendFrame(KIND.ACK, ackBody);
+    this.ackFragment(messageId, index);
 
     if (entry.received.size === entry.total) {
       this.incoming.delete(messageId);
+      // Remember the completion before emitting, so a listener that synchronously provokes another
+      // datagram (or a duplicate that is already queued) cannot re-assemble the message.
+      this.rememberCompleted(messageId, now);
       const assembled = Buffer.concat(entry.fragments, entry.fragments.reduce((n, f) => n + f.length, 0));
       const doneBody = Buffer.alloc(4);
       doneBody.writeUInt32BE(messageId, 0);
       this.sendFrame(KIND.DONE, doneBody);
       this.emit('message', assembled);
+    }
+  }
+
+  /**
+   * Send the ACK for one fragment.
+   *
+   * Every valid DATA fragment is acknowledged, including in-flight duplicates and fragments of a
+   * message that already completed: an ACK is a statement that the fragment arrived, and withholding
+   * it is exactly what turns a lost ACK into a retransmission storm ending in a false
+   * `P2P_FRAGMENT_UNACKED`. Extracted so the duplicate-suppression branch and the assembly path
+   * cannot drift apart.
+   *
+   * @param {number} messageId
+   * @param {number} index
+   */
+  ackFragment(messageId, index) {
+    const ackBody = Buffer.alloc(8);
+    ackBody.writeUInt32BE(messageId, 0);
+    ackBody.writeUInt32BE(index, 4);
+    this.sendFrame(KIND.ACK, ackBody);
+  }
+
+  /**
+   * Has this channel already delivered `messageId`, recently enough to suppress a duplicate?
+   *
+   * The TTL is applied at lookup time as well as in the sweep, so an expired record is never
+   * reported as completed even when the sweep has not run yet.
+   *
+   * @param {number} messageId
+   * @param {number} now
+   * @returns {boolean}
+   */
+  isRecentlyCompleted(messageId, now) {
+    const record = this.completed.get(messageId);
+    if (record === undefined) return false;
+    if (now - record.at > this.recentMessageTtlMs) {
+      this.completed.delete(messageId);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Remember a completed message id, evicting the oldest completion when the bound is reached.
+   *
+   * `recentMessageLimit === 0` means "remember nothing": duplicates are re-assembled instead of
+   * suppressed, and the memory stays empty. Every other value keeps the map at or below that size.
+   *
+   * @param {number} messageId
+   * @param {number} now
+   */
+  rememberCompleted(messageId, now) {
+    if (this.recentMessageLimit === 0) return;
+    // Delete before set so a re-completed id becomes the newest record rather than keeping its old
+    // position; with monotonic message ids this is defensive, not load-bearing.
+    this.completed.delete(messageId);
+    this.completed.set(messageId, { at: now, deduped: false });
+    while (this.completed.size > this.recentMessageLimit) {
+      this.completed.delete(this.completed.keys().next().value);
+    }
+  }
+
+  /**
+   * Drop what has expired: completed ids older than the TTL, and reassemblies that stopped making
+   * progress more than a TTL ago.
+   *
+   * Called from the low-frequency timer and opportunistically from `onData` (at most once per
+   * `sweepIntervalMs`, never more than one clock read per datagram because `now` is passed in).
+   * Synchronous and exception-free by construction: an interval callback must not throw.
+   *
+   * The completed map is iterated in completion order and the scan stops at the first record that is
+   * still live; expired records are always at the front, so the cost is proportional to what is
+   * actually removed. The incoming map is scanned whole and entries are only ever removed, never
+   * resurrected: a late fragment after a sweep starts a *fresh* assembly, and only if the message id
+   * is not in `completed`. The same expiry is applied on lookup in `onData`, so the TTL boundary does
+   * not depend on the timer's phase.
+   *
+   * @param {number} [now]
+   */
+  sweepStaleAssemblies(now = Date.now()) {
+    this.nextSweepAtMs = now + this.sweepIntervalMs;
+    for (const [messageId, record] of this.completed) {
+      if (now - record.at <= this.recentMessageTtlMs) break;
+      this.completed.delete(messageId);
+    }
+    for (const [messageId, entry] of this.incoming) {
+      if (now - entry.lastSeenAtMs <= this.recentMessageTtlMs) continue;
+      this.incoming.delete(messageId);
+      this.stats.staleAssembliesSwept += 1;
     }
   }
 
@@ -1377,6 +1606,14 @@ export class P2PChannel extends EventEmitter {
       }
     }
     this.closed = true;
+    // The stale-assembly timer is receiver state, not transport state: it must die with the channel
+    // or a closed channel would leave a repeating (if unref()ed) callback behind. The counter is
+    // set to `null` rather than left holding a cleared handle so "was the timer cleared?" is
+    // observable instead of inferred.
+    if (this.sweepTimer !== null) {
+      clearInterval(this.sweepTimer);
+      this.sweepTimer = null;
+    }
     this.socket.removeListener('message', this.onDatagram);
     for (const entry of this.outgoing.values()) {
       clearTimeout(entry.timer);
@@ -1384,6 +1621,7 @@ export class P2PChannel extends EventEmitter {
     }
     this.outgoing.clear();
     this.incoming.clear();
+    this.completed.clear();
     this.emit('close', reason);
   }
 }
