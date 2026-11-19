@@ -341,9 +341,18 @@ let attemptAttached = false;
     // Header deadline: a proxy that accepts the socket but never returns headers must not hang the
     // agent forever. Node >= 20.19 has AbortSignal.any, and every other HTTP call in the tree already
     // carries a timeout.
+    //
+    // The deadline must end when the headers arrive. A signal handed to `fetch` also covers the
+    // response *body*, so `AbortSignal.timeout()` in the combined signal would abort a healthy
+    // long-lived SSE stream once the deadline passed -- every stream would be torn down mid-body and
+    // re-attached, and a frame written in that window would be lost. The body is bounded by the
+    // watchdog below and by `stop()` instead, so the timer is cleared as soon as `fetch` settles.
     const headerTimeoutMs = Number(process.env.W2M_SSE_FIRST_FRAME_MS) > 0 ? Number(process.env.W2M_SSE_FIRST_FRAME_MS) : 5000;
+    const headerAbort = new AbortController();
+    const headerTimer = setTimeout(() => headerAbort.abort(), headerTimeoutMs);
+    if (typeof headerTimer.unref === 'function') headerTimer.unref();
     const headerSignal = typeof AbortSignal.any === 'function'
-      ? AbortSignal.any([streamAbort.signal, AbortSignal.timeout(headerTimeoutMs)])
+      ? AbortSignal.any([streamAbort.signal, headerAbort.signal])
       : streamAbort.signal;
     let response;
     try {
@@ -355,6 +364,9 @@ let attemptAttached = false;
       state.lastRelayError = { at: new Date().toISOString(), http_status: null, code: timeout.code, path: '/v1/stream' };
       publishState();
       throw timeout;
+    } finally {
+      // Never leave this armed: it is a header deadline, not a stream deadline.
+      clearTimeout(headerTimer);
     }
     if (!response.ok) {
       const body = await response.text().catch(() => '');

@@ -1503,6 +1503,14 @@ async function startFakeRabbit({
   heartbeatIdleStatus = 200,
   resultError = null,
   blobError = null,
+  // The real relay writes a keepalive comment every 15 s; the agent treats 45 s of silence as a
+  // dead stream. Without this, a fake-relay test whose first task is slow loses its stream and then
+  // silently writes its next offer into a superseded one.
+  keepaliveMs = 15_000,
+  // Sent automatically when a stream attaches, like the real relay's `ready`. Off by default:
+  // tests that manage `ready` themselves assert on when it arrives, and a second ready would change
+  // what they count.
+  autoReady = null,
 } = {}) {
   const state = {
     pairs: [],
@@ -1577,6 +1585,7 @@ async function startFakeRabbit({
           response,
           seq: 0,
           closed: false,
+          keepalive: null,
           /**
            * @param {string} type
            * @param {object} payload
@@ -1588,12 +1597,34 @@ async function startFakeRabbit({
           },
           close() {
             stream.closed = true;
+            if (stream.keepalive !== null) {
+              clearInterval(stream.keepalive);
+              stream.keepalive = null;
+            }
             response.end();
           },
         };
         state.streams.push(stream);
+        if (autoReady !== null) stream.send('ready', autoReady);
+        if (keepaliveMs > 0) {
+          stream.keepalive = setInterval(() => {
+            if (stream.closed) return;
+            try {
+              // A comment, not a frame: it sustains the agent's idle deadline without dispatching
+              // anything (the SSE parser ignores it, exactly as it ignores the real relay's).
+              response.write(': keepalive\n\n');
+            } catch {
+              stream.closed = true;
+            }
+          }, keepaliveMs);
+          stream.keepalive.unref?.();
+        }
         response.on('close', () => {
           stream.closed = true;
+          if (stream.keepalive !== null) {
+            clearInterval(stream.keepalive);
+            stream.keepalive = null;
+          }
         });
         return;
       }
@@ -1688,6 +1719,32 @@ async function startFakeRabbit({
       await new Promise((resolve) => server.close(resolve));
     },
   };
+}
+
+/**
+ * The stream the agent is reading right now: the newest one the fake relay still has open.
+ *
+ * A write to a superseded stream is a silent no-op in the fake relay, so a test that holds its
+ * first handle can lose a frame after an agent-initiated reconnect and report the missing answer
+ * as a product timeout. Re-acquiring before each send keeps the frame on the live stream.
+ *
+ * @param {Awaited<ReturnType<typeof startFakeRabbit>>} rabbit
+ * @param {number} timeoutMs
+ */
+async function currentStream(rabbit, timeoutMs) {
+  return waitFor(
+    () => {
+      const open = rabbit.state.streams.filter((entry) => !entry.closed);
+      return open.length === 0 ? null : open[open.length - 1];
+    },
+    { timeoutMs, label: 'a live SSE stream' },
+  );
+}
+
+/** Restore an environment variable after a test, including removing it when it was unset. */
+function restoreEnv(name, value) {
+  if (value === undefined) delete process.env[name];
+  else process.env[name] = value;
 }
 
 /**
@@ -2377,12 +2434,11 @@ describe('Localside agent end to end', () => {
     }
   });
 
-  it('stops a running command when task.cancel arrives', async () => {
+  it('stops a running command when task.cancel arrives', { timeout: 2 * 60_000 }, async () => {
     const rabbit = await startFakeRabbit();
     const project = await makeRepo('e2e-cancel');
     try {
       const agent = makeAgent({ rabbit: rabbit.url, project, allowed: [['node', '-e']], name: 'cancel' });
-      const started = Date.now();
       const running = agent.start();
       const stream = await rabbit.stream();
       stream.send('ready', { protocol_version: 1, machine_id: 'rabbit' });
@@ -2402,9 +2458,15 @@ describe('Localside agent end to end', () => {
       await waitFor(() => rabbit.state.heartbeats.some((beat) => beat.phase === 'running'), {
         label: 'running heartbeat',
       });
+      // Measured from the cancel to the result, not from `agent.start()`: starting the agent is
+      // setup (P2P node bind/announce, stream attach), and on a loaded machine setup time inside the
+      // window turns a prompt cancel into a reported `elapsed` overrun. Neither startup nor shutdown
+      // is cancel latency; the assertion is about how long the cancel itself takes to be honoured.
+      const cancelSentAt = Date.now();
       stream.send('task.cancel', { task_id: '01J-E2E-CANCEL', reason: 'superseded' });
+      await waitFor(() => rabbit.state.results.length === 1, { timeoutMs: 30_000, label: 'cancelled result' });
+      const elapsed = Date.now() - cancelSentAt;
       await running;
-      const elapsed = Date.now() - started;
 
       assert.equal(rabbit.state.results.length, 1);
       const envelope = rabbit.state.results[0];
@@ -2418,61 +2480,133 @@ describe('Localside agent end to end', () => {
     }
   });
 
-  it('answers a transport re-delivery from cache but re-runs a new attempt', async () => {
-    // Load-sensitive on purpose: this case performs a real child spawn plus three IPC round trips, and on a
-    // loaded machine that chain once needed ~22 s and tripped the 15 s default budget. Every condition here is
-    // event-based -- nothing sleeps for a fixed duration -- and the budgets are now large enough that "slow" is
-    // never reported as "broken". 120 s is the ceiling: a genuine hang still fails, only later. It was raised
-    // from 60 s on 2026-11-19 because the release gate now also boots a real browser page (queue-journal probe)
-    // in the same run, and under that additional load the 60 s ceiling was reached on a healthy machine while
-    // this suite still passed in isolation -- i.e. the old ceiling was measuring the gate's load, not the code.
-    const BUDGET_MS = 120_000;
-    const rabbit = await startFakeRabbit();
-    const project = await makeRepo('e2e-dedupe');
-    const marker = join(project, 'runs.txt');
-    const runCount = () => (existsSync(marker) ? readFileSync(marker, 'utf8').trim().split('\n').length : 0);
+  it(
+    'answers a transport re-delivery from cache but re-runs a new attempt',
+    { timeout: 5 * 60_000 },
+    async () => {
+      // Load-sensitive on purpose: this case performs a real child spawn plus three IPC round trips, and on a
+      // loaded machine that chain once needed ~22 s and tripped the 15 s default budget. Every condition here is
+      // event-based -- nothing sleeps for a fixed duration -- and the budgets are now large enough that "slow" is
+      // never reported as "broken". 120 s is the ceiling: a genuine hang still fails, only later. It was raised
+      // from 60 s on 2026-11-19 because the release gate now also boots a real browser page (queue-journal probe)
+      // in the same run, and under that additional load the 60 s ceiling was reached on a healthy machine while
+      // this suite still passed in isolation -- i.e. the old ceiling was measuring the gate's load, not the code.
+      //
+      // Two ordering facts make the re-delivery step deterministic:
+      //   * the fake relay records a result when the POST arrives, while the agent remembers it for dedupe
+      //     only after the relay's 200 has been read (`rememberCompleted` runs after the POST returns);
+      //   * `claimed` covers the whole attempt, and a duplicate that arrives inside that window is dropped
+      //     by design -- the in-flight result answers it. So wait for `state.handled`, which is set after
+      //     the cache entry is written and the claim is released, before asking for a re-delivery.
+      // The re-delivery is sent on the stream the agent is reading *now*: a write to a superseded stream is a
+      // silent no-op in the fake relay, and the agent may have re-attached after an idle timeout.
+      const BUDGET_MS = 120_000;
+      // After the attempt is over, answering a re-delivery is one local HTTP POST, not a child spawn. If the
+      // cached path regresses, this fails in 30 s instead of consuming a child-spawn budget.
+      const RESEND_BUDGET_MS = 30_000;
+      // `autoReady` gives every stream (including one the agent re-attaches after a reconnect) the
+      // `ready` frame the real relay sends, so a re-delivery cannot land on a stream that is still
+      // waiting for its first frame.
+      const rabbit = await startFakeRabbit({ autoReady: { protocol_version: 1, machine_id: 'rabbit' } });
+      const project = await makeRepo('e2e-dedupe');
+      const marker = join(project, 'runs.txt');
+      const runCount = () => (existsSync(marker) ? readFileSync(marker, 'utf8').trim().split('\n').length : 0);
+      try {
+        const agent = makeAgent({ rabbit: rabbit.url, project, allowed: [['node', '-e']], once: false, name: 'dedupe' });
+        const running = agent.start();
+        const stream = await currentStream(rabbit, BUDGET_MS);
+        const offer = {
+          task_id: '01J-E2E-DEDUPE',
+          attempt: 1,
+          mode: 'replicate',
+          index: 0,
+          index_total: 1,
+          command_argv: [
+            NODE,
+            '-e',
+            `require('node:fs').appendFileSync(${JSON.stringify(marker)}, 'run\\n')`,
+          ],
+          cwd_rel: '.',
+          write: false,
+          timeout_ms: 30_000,
+          dedupe_key: 'dk-e2e-dedupe',
+        };
+        stream.send('task.offer', offer);
+        await waitFor(() => rabbit.state.results.length === 1, { timeoutMs: BUDGET_MS, label: 'first result' });
+        // The POST is in, but the attempt may still be finishing: wait for the cache to be written and the
+        // claim released before asking for a re-delivery.
+        await waitFor(() => agent.state.handled >= 1, { timeoutMs: BUDGET_MS, label: 'attempt 1 handled' });
+
+        // Same (machine_id, dedupe_key, attempt) again: a transport re-delivery,
+        // so it must be answered without executing a second time.
+        (await currentStream(rabbit, RESEND_BUDGET_MS)).send('task.offer', { ...offer });
+        await waitFor(() => rabbit.state.results.length === 2, { timeoutMs: RESEND_BUDGET_MS, label: 'cached resend' });
+        assert.equal(runCount(), 1, 'command ran again for an identical attempt');
+        assert.equal(rabbit.state.results[1].attempt, 1);
+        assert.equal(rabbit.state.results[1].stdout_sha256, rabbit.state.results[0].stdout_sha256);
+
+        // attempt=2 is a genuine retry (§4.4 keeps attempt out of dedupe_key):
+        // it must execute and report its own attempt.
+        (await currentStream(rabbit, BUDGET_MS)).send('task.offer', { ...offer, attempt: 2 });
+        await waitFor(() => rabbit.state.results.length === 3, { timeoutMs: BUDGET_MS, label: 'retry result' });
+        assert.equal(runCount(), 2, 'a new attempt must actually run');
+        assert.equal(rabbit.state.results[2].attempt, 2);
+
+        agent.stop();
+        await running;
+      } finally {
+        await rabbit.close();
+      }
+    },
+  );
+
+  it('keeps a healthy event stream attached after its header deadline', { timeout: 60_000 }, async () => {
+    // Regression for a real defect: the header deadline was handed to `fetch` as an
+    // `AbortSignal.timeout(...)` composed with the stop signal, and that signal also covers the response
+    // body. Every SSE stream was therefore aborted `W2M_SSE_FIRST_FRAME_MS` (5 s by default) after it
+    // attached, healthy or not; the agent re-attached and any frame written into the gap was lost.
+    // Shorten the deadline and make the first task outlive it: the original stream must still be the
+    // attached one when the result is posted, with no re-attach.
+    const previous = process.env.W2M_SSE_FIRST_FRAME_MS;
+    process.env.W2M_SSE_FIRST_FRAME_MS = '2000';
+    // The relay's own `ready` arrives as soon as the stream attaches; with `autoReady` the shortened
+    // first-frame deadline is cleared by the relay, not by test scheduling.
+    const rabbit = await startFakeRabbit({ autoReady: { protocol_version: 1, machine_id: 'rabbit' } });
+    const project = await makeRepo('e2e-stream-header');
     try {
-      const agent = makeAgent({ rabbit: rabbit.url, project, allowed: [['node', '-e']], once: false, name: 'dedupe' });
+      const agent = makeAgent({ rabbit: rabbit.url, project, allowed: [['node', '-e']], once: false, name: 'stream-header' });
       const running = agent.start();
-      const stream = await rabbit.stream(BUDGET_MS);
-      stream.send('ready', { protocol_version: 1, machine_id: 'rabbit' });
-      const offer = {
-        task_id: '01J-E2E-DEDUPE',
-        attempt: 1,
-        mode: 'replicate',
-        index: 0,
-        index_total: 1,
-        command_argv: [
-          NODE,
-          '-e',
-          `require('node:fs').appendFileSync(${JSON.stringify(marker)}, 'run\\n')`,
-        ],
-        cwd_rel: '.',
-        write: false,
-        timeout_ms: 30_000,
-        dedupe_key: 'dk-e2e-dedupe',
-      };
-      stream.send('task.offer', offer);
-      await waitFor(() => rabbit.state.results.length === 1, { timeoutMs: BUDGET_MS, label: 'first result' });
-
-      // Same (machine_id, dedupe_key, attempt) again: a transport re-delivery,
-      // so it must be answered without executing a second time.
-      stream.send('task.offer', { ...offer });
-      await waitFor(() => rabbit.state.results.length === 2, { timeoutMs: BUDGET_MS, label: 'cached resend' });
-      assert.equal(runCount(), 1, 'command ran again for an identical attempt');
-      assert.equal(rabbit.state.results[1].attempt, 1);
-      assert.equal(rabbit.state.results[1].stdout_sha256, rabbit.state.results[0].stdout_sha256);
-
-      // attempt=2 is a genuine retry (§4.4 keeps attempt out of dedupe_key):
-      // it must execute and report its own attempt.
-      stream.send('task.offer', { ...offer, attempt: 2 });
-      await waitFor(() => rabbit.state.results.length === 3, { timeoutMs: BUDGET_MS, label: 'retry result' });
-      assert.equal(runCount(), 2, 'a new attempt must actually run');
-      assert.equal(rabbit.state.results[2].attempt, 2);
-
-      agent.stop();
-      await running;
+      try {
+        const stream = await currentStream(rabbit, 15_000);
+        stream.send('task.offer', {
+          task_id: '01J-E2E-STREAM-HEADER',
+          attempt: 1,
+          mode: 'replicate',
+          index: 0,
+          index_total: 1,
+          // Outlives the 2 s header deadline, so an armed body deadline would fire before the result.
+          command_argv: [NODE, '-e', 'setTimeout(() => {}, 3500)'],
+          cwd_rel: '.',
+          write: false,
+          timeout_ms: 30_000,
+          dedupe_key: 'dk-e2e-stream-header',
+        });
+        await waitFor(() => rabbit.state.results.length === 1, {
+          timeoutMs: 30_000,
+          label: 'result after the header deadline',
+        });
+        assert.equal(
+          rabbit.state.attaches.length,
+          1,
+          'a stream whose headers arrived must not be re-attached when its body outlives the header deadline',
+        );
+        assert.equal(rabbit.state.streams[0].closed, false, 'the first stream must still be attached when the result is posted');
+      } finally {
+        agent.stop();
+        await running;
+      }
     } finally {
+      restoreEnv('W2M_SSE_FIRST_FRAME_MS', previous);
       await rabbit.close();
     }
   });
