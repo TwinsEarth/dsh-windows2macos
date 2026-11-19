@@ -4,6 +4,18 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### P1 重构进展：备份引擎 worker_threads 化 + tools 入口拆分（未发布）
+
+- **S8 备份引擎 worker_threads**：定时备份、`POST /api/w2m/backup/run`、verify 路由与 nightly 终审改由 worker 执行
+  （`src/backup/engine-worker.mjs` + `src/plugin/backup-worker.mjs`）：`resourceLimits.maxOldGenerationSizeMb=1024`、
+  运行级超时（`backupWorkerTimeoutMs`，默认 30 min）、具名失败 `BACKUP_WORKER_OOM/TIMEOUT/FAILED`、进度写入
+  `<DSH_HOME>/xclient/w2m-backup/worker.json`（原子写、结束删除、不含密钥）、`W2M_BACKUP_INLINE=1` 或无 Worker 时
+  回退 inline（行为不变）。mount 仍惰性；CLI 仍 inline；`state` scope 排除 worker 进度文件避免自捕获。
+- **S2/S3 tools 入口拆分**：`src/plugin/tools.mjs` 8,908 → **610 行**（apply 450），按域拆为
+  `src/plugin/tools/{shared,dispatch,memory,fleet,governance}.mjs`；工具面摘要（18 工具）保持
+  `409a6652675fc66608525b4437f07e17f3a5898ab7b61297e6c0309654a82f5a` 不变，注册顺序与导出面不变；
+  4 个源码守卫测试仅改读取路径（断言未动）。
+
 ## [3.5.2] - 2026-11-19
 
 ### G4 renumber：`image/offload` 的 `data.targets[].seq` 引用改写（未发布）

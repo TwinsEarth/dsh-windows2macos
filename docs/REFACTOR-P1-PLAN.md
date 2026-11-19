@@ -25,21 +25,29 @@
 
 ## 1. 目标结构
 
-### 1.1 tools.mjs（8.9k → 装配 ~350 行 + 10 个子模块）
+### 1.1 tools.mjs（8.9k → 装配 610 行，其中 `apply()` 450 行 + 5 个新子模块）
 
 ```
-src/plugin/tools.mjs                 # apply(ctx)：只做 ctx 注入、工具注册、迁移/兼容
-src/plugin/tools/shared.mjs          # 工具共用：refusal、argv 校验、结果封装、时间/格式化
+src/plugin/tools.mjs                 # apply(ctx)：ctx 注入、store/route 装配、16 个注册器按原顺序调用
+src/plugin/tools/shared.mjs          # 两个及以上模块共用的一切：refusal/config/request/身份/P2P/结果封装/本地栈
 src/plugin/tools/fleet.mjs           # devices/stats/status/update
 src/plugin/tools/dispatch.mjs        # run/wait/tasks/history/report/cancel/reduce
 src/plugin/tools/memory.mjs          # memory/chat/intent
-src/plugin/tools/governance.mjs      # approvals/council/joint_plan/joint_status
+src/plugin/tools/governance.mjs      # approvals/council（joint_plan/joint_status 仍在既有 tools-joint.mjs，注册点仍在 apply 首位）
 ```
 
-- `apply` 仍从 `./tools.mjs` 导出（`lib/tools.js` / `lib/index.js` 的 re-export 不变）。
+- `apply` 仍从 `./tools.mjs` 导出（`lib/tools.js` / `lib/index.js` 的 re-export 不变）；工具面摘要仍钉在
+  `409a6652675fc66608525b4437f07e17f3a5898ab7b61297e6c0309654a82f5a`（18 个工具，名称/描述/参数/顺序不敏感形态全部不变）。
 - **工具快照测试**：先用当前实现导出 16 个工具的 `{name, description, parameters}` 快照（`test/tools-surface.test.mjs`），
   重构期间每次切片跑它；任何字段变化都会失败。
 - 切片顺序：shared → fleet → memory → governance → dispatch（最后动 run/wait，因为测试最多）。
+- **S2/S3 交付记录（2026-11-19，未提交）**：`tools.mjs` 8,909 → 610 行；新增 `shared.mjs` 3,356、
+  `dispatch.mjs` 2,239、`memory.mjs` 1,385、`fleet.mjs` 1,043、`governance.mjs` 413 行。每个工具改为
+  `register<Name>(ctx, deps)` 工厂（`deps` = 它原先闭包引用的 apply 局部量），`apply()` 按历史顺序依次调用
+  （joint ×2 位置不变，然后 devices→run→wait→report→status→update→history→stats→memory→approvals→chat→intent→
+  council→cancel→reduce→tasks）。`PLUGIN_VERSION` 占位符仍留在 `tools.mjs`（`scripts/pack.mjs` 只替换该文件），
+  用它的两个工具经 `deps.pluginVersion` 取值。唯一需要活引用的 apply 量是 `let approvals`，`w2m_status` 经
+  `currentApprovals()` 读取（值快照会永久冻结为 null）。工具套件 233/233 与广度回归 304/304（12 跳过）全绿。
 
 ### 1.2 agent.mjs（4.8k → createAgent 组装 ~400 行 + 阶段模块）
 
@@ -104,13 +112,13 @@ src/plugin/backup-worker.mjs         # 插件侧：spawn/复用、resourceLimits
 | # | 切片 | 产出 | 验收 |
 |---|---|---|---|
 | S1 | 工具面快照 + `tools/shared.mjs` | 基线快照测试；无行为改动 | pre-flight 绿；16 工具快照不变 |
-| S2 | `tools/fleet.mjs` + `tools/memory.mjs` | apply 减 ~800 行 | 快照 + `test/tools*.test.mjs` |
-| S3 | `tools/governance.mjs` + `tools/dispatch.mjs` | apply 降到 ~350 行 | 同上 + `test/agent*.test.mjs`（dispatch 走 agent） |
+| S2 | `tools/fleet.mjs` + `tools/memory.mjs` | apply 减 ~800 行 | 快照 + `test/tools*.test.mjs` — ✅ **已完成（2026-11-19，未提交）**：`tools/{shared,fleet,memory}.mjs` 落地，apply 4,243 → 2,313 行；快照摘要不变，`tools*` 233/233 全绿 |
+| S3 | `tools/governance.mjs` + `tools/dispatch.mjs` | apply 降到 ~350 行 | 同上 + `test/agent*.test.mjs`（dispatch 走 agent） — ✅ **已完成（2026-11-19，未提交）**：apply 4,243 → 450 行，`tools.mjs` 610 行；16 个工具全部搬入 4 个域模块、注册顺序逐字节保持；快照摘要不变，工具套件 233/233 + 广度回归 304/304 全绿 |
 | S4 | `agent/lifecycle/*` 四阶段 | createAgent 降到 ~400 行 | agent 套件 + 真机 localside 冒烟 |
 | S5 | `relay/state/*` 纯函数 → 方法搬移 | RabbitState 门面化 | relay 套件 + Phase 2 真机脚本 |
 | S6 | client.js 文件内分解（settings） | 单函数 <600 行 | client-bundle + loader-entry |
 | S7 | client.js 文件内分解（chat-text） | 同上 | 同上 |
-| S8 | `engine-worker.mjs` + 插件接线 + 回退 | 引擎默认 worker | backup-worker 新套件 + 真机备份 |
+| S8 | `engine-worker.mjs` + 插件接线 + 回退 | 引擎默认 worker | ✅ **已实现（3.6，2026-11-19，未提交）**：`test/backup-worker.test.mjs` 12/12 通过——真 Worker 成功且结果与 inline 等价（`files`/`counts` 一致、对齐随机 `snapshot_id` 后 manifest digest 相同）、真 Worker verify、进度阶段顺序、`resourceLimits.maxOldGenerationSizeMb=1024`、进度文件 schema/结束删除/无凭据、`scopes.mjs` 把 `xclient/w2m-backup/worker.json` 按 self-copy 跳过（扫描不捕获自身进度文件；`state.json` 仍在 scope 内）、`BACKUP_WORKER_OOM`（错误事件与退出码 134）、`BACKUP_WORKER_TIMEOUT`、其他崩溃 `BACKUP_WORKER_FAILED`、spawn 抛错与 `W2M_BACKUP_INLINE=1` 回退 inline、`deps.backupRunner` 插件接线（run/定时/verify 路线 + `engine_mode` + 具名失败不抛）、`backupWorkerTimeoutMs` 默认 30 分钟。回归 `backup-run`/`backup-engine`/`backup-verify`/`backup-memory`/`backup-wiring` 全绿（全部 backup-* 套件 569/569）。设计见 `docs/BACKUP-DESIGN.md` §27.8。真机 RSS 曲线延后（本切片不触真实 profile） |
 | S9 | 文档收尾 + 审计更新 | BACKUP-DESIGN/§27.7、AUDIT 风险表、CHANGELOG | pre-flight 绿 |
 
 **发布纪律**：每片只提交（本地），不 push/tag/publish；版本号在切片期间保持 3.5.2，等用户授权发布时统一 bump。

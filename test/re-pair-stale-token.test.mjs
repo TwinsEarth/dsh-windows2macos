@@ -13,7 +13,7 @@ import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const tools = readFileSync(join(here, '..', 'src', 'plugin', 'tools.mjs'), 'utf8');
+const tools = readFileSync(join(here, '..', 'src', 'plugin', 'tools', 'shared.mjs'), 'utf8');
 
 describe('stale device token triggers a re-pair (v1.7.4)', () => {
   it('probes the relay and treats 401/403 as a stale token', () => {

@@ -15,6 +15,18 @@
  * This file is a composition root: paths, configuration, logging, lifecycle. Nothing about hashing, encryption or
  * rotation is implemented here.
  *
+ * ## Execution location (S8, 3.6): the engine runs on a worker thread
+ *
+ * Every path that used to call `runBackup`/`verifyRepo` synchronously now goes through `./backup-worker.mjs`: the
+ * scheduled slot, the run route and the verify route (the default runtime verdict included). The worker gets its own
+ * V8 heap (`resourceLimits.maxOldGenerationSizeMb = 1024`), a run-scoped timeout (`backupWorkerTimeoutMs`, default 30
+ * minutes) and named failures (`BACKUP_WORKER_OOM` / `BACKUP_WORKER_TIMEOUT` / `BACKUP_WORKER_FAILED`) that are
+ * returned as `{ok:false, reason_code, detail}` exactly like an engine refusal; the host loop is never taken for the
+ * duration of the scan/store/commit pass. The pre-S8 inline path is kept unchanged as the fallback (no `Worker`, a
+ * synchronous spawn failure, or `W2M_BACKUP_INLINE=1`), in which case `describe()` reports `engine_mode: "inline"`.
+ * Mount stays inert: no worker is spawned and no timer is created until a run starts, and the progress file
+ * `<DSH_HOME>/xclient/w2m-backup/worker.json` is removed when the run settles (see docs/BACKUP-DESIGN.md §27.8).
+ *
  * ## Protection is convenience-first, and `none` is the default
  *
  * The user's decision (2026-11-17, `docs/BACKUP-DESIGN.md` §25) is explicit: this product does **not** pursue
@@ -70,13 +82,13 @@ import { applyRegister, planRegister, registerThroughHost, REGISTER_CODES } from
 import { DEFAULT_ROUTE_WATCH_CAP_MS, REGISTER_RESIDUAL_RISK_LINE, sampleWatchSchedule } from '../backup/register-watch.mjs';
 import { RUNTIME_VERDICT_MODES, createRuntimeVerdictStore, readBackupState, writeBackupState } from '../backup/runtime-verdict.mjs';
 import { describeUnlock, unlockRepo } from '../backup/unlock.mjs';
-import { verifyRepo } from '../backup/verify.mjs';
 import { createAccountIdentity } from '../chatops/account.mjs';
 import os from 'node:os';
 import path from 'node:path';
 
 import { createDailyScheduler, DEFAULT_CATCH_UP_MS } from './schedule.mjs';
-import { runBackup, SCOPES } from '../backup/engine.mjs';
+import { createBackupWorkerRunner, DEFAULT_WORKER_TIMEOUT_MS, readWorkerState, WORKER_CODES } from './backup-worker.mjs';
+import { SCOPES } from '../backup/engine.mjs';
 import { buildStatus } from '../backup/routes.mjs';
 import { describeBackupSchedule, missedBackupAt, normalizeBackupSchedule } from '../backup/schedule.mjs';
 import { DEFAULT_FULL_COPY_MAX_BYTES, DEFAULT_KEEP_OLD, DEFAULT_OLD_FORMAT, DEFAULT_OLD_USAGE_REMINDER_BYTES, OLD_FORMATS, buildOldUsageReport, measureOldUsage } from '../backup/rotation.mjs';
@@ -188,6 +200,9 @@ export function defaultBackupDir(platform = process.platform) {
  * `backupMirrorDir` is the offsite mirror directory; absent/empty means no mirror, and a non-string value is
  * refused rather than silently ignored (a typo in the row should not mount a plugin that silently copies
  * nowhere).
+ * `backupWorkerTimeoutMs` (S8) is the worker's wall-clock budget in milliseconds; the default is 30 minutes and a
+ * run past it fails with the named `BACKUP_WORKER_TIMEOUT` instead of holding a thread. Only a positive integer is
+ * accepted (`0` and negative values are refused, not read as "no timeout").
  * `backupEncryption` selects the **protection** mode used when a repository is first created: `none` (default)
  * stores the data key in clear next to the data (no credential needed), `sealed` keeps the account/machine/PIN
  * envelopes. It never changes an existing repository's mode; the CLI's `unlock --set-password` /
@@ -199,7 +214,8 @@ export function defaultBackupDir(platform = process.platform) {
  *   scope: string, keep_old_per_session: number, old_version_days: number, old_format: 'records'|'full',
  *   full_copy_max_mb: number, full_copy_max_bytes: number,
  *   old_usage_reminder_gb: number, old_usage_reminder_bytes: number,
- *   encryption: 'none'|'sealed', mirror_dir: string|null, account_binding: boolean, dsh_home: string}
+ *   encryption: 'none'|'sealed', mirror_dir: string|null, account_binding: boolean, dsh_home: string,
+ *   worker_timeout_ms: number}
  *   | {ok: false, reason_code: string, detail: string}}
  */
 export function normalizeConfig(config = {}, deps = {}) {
@@ -356,6 +372,16 @@ export function normalizeConfig(config = {}, deps = {}) {
       detail: `backupMaxHeapMb must be a non-negative integer number of MB (0 = guard off), got ${JSON.stringify(config.backupMaxHeapMb)}`,
     };
   }
+  // S8: the worker's wall-clock budget in milliseconds (default 30 min). A positive integer; `0` is deliberately
+  // NOT "no timeout" -- an unbounded job is exactly what the budget exists to stop -- so it is refused by name.
+  const workerTimeoutMs = config.backupWorkerTimeoutMs ?? DEFAULT_WORKER_TIMEOUT_MS;
+  if (!Number.isSafeInteger(workerTimeoutMs) || workerTimeoutMs <= 0) {
+    return {
+      ok: false,
+      reason_code: 'BACKUP_CONFIG_INVALID',
+      detail: `backupWorkerTimeoutMs must be a positive integer number of milliseconds, got ${JSON.stringify(config.backupWorkerTimeoutMs)}`,
+    };
+  }
   const dshHome = typeof config.dshHome === 'string' && config.dshHome.trim() !== ''
     ? path.resolve(config.dshHome.trim())
     : resolveDshHome(env);
@@ -387,6 +413,7 @@ export function normalizeConfig(config = {}, deps = {}) {
     catch_up_on_start: catchUpOnStart,
     max_heap_mb: maxHeapMb,
     max_heap_bytes: maxHeapMb * 1024 * 1024,
+    worker_timeout_ms: workerTimeoutMs,
     dsh_home: dshHome,
   };
 }
@@ -398,11 +425,13 @@ export function normalizeConfig(config = {}, deps = {}) {
  * @param {object} [config] row configuration (`backupDir`, `backupTimes`, `backupTimeZone`, `backupScope`,
  *   `keepOldPerSession`, `backupOldVersionDays`, `backupOldFormat`, `backupFullCopyMaxMb`, `backupMirrorDir`,
  *   `backupOldUsageReminderGb`, `backupEnabled`, `backupRuntimeVerify: 'off'|'nightly'` (default nightly))
- * @param {{runtimeVerify?: Function, registerWatch?: Function, createScheduler?: Function, now?: Function}} [deps]
+ * @param {{runtimeVerify?: Function, registerWatch?: Function, createScheduler?: Function, now?: Function,
+ *   backupRunner?: {run: Function}}} [deps]
  *   Injectable seams for tests. `runtimeVerify` replaces the real `verifyRepo({runtime:true})` call the cached
  *   verdict store runs (so a unit test never spawns the Harness); `registerWatch` replaces the bounded watch the
  *   register route awaits (so the route test does not sleep 30 s); `createScheduler` lets a test drive the
- *   nightly hook without waiting for 22:00.
+ *   nightly hook without waiting for 22:00. `backupRunner` replaces the real worker/inline runner (S8), so the
+ *   wiring suite can assert the route/schedule call it without spawning a thread.
  */
 export function apply(ctx, config = {}, deps = {}) {
   const cfg = normalizeConfig(config);
@@ -419,6 +448,9 @@ export function apply(ctx, config = {}, deps = {}) {
     mounted_at: new Date().toISOString(),
     backup_dir: cfg.backup_dir,
     dsh_home: cfg.dsh_home,
+    // S8: the last execution location the engine actually used (`worker`/`inline`), `idle` before the first run.
+    // The describe payload also carries the live progress record from `<DSH_HOME>/xclient/w2m-backup/worker.json`.
+    engine_mode: 'idle',
     times: cfg.times,
     time_zone: cfg.time_zone,
     scope: cfg.scope,
@@ -547,15 +579,65 @@ export function apply(ctx, config = {}, deps = {}) {
   });
 
   /**
+   * S8: the engine's execution location. Scheduled runs, the run route and the verify route go through this runner,
+   * which runs `runBackup`/`verifyRepo` on a worker thread by default and falls back to the unchanged inline path
+   * (documented in `docs/BACKUP-DESIGN.md` §27.8). `deps.backupRunner` is the test seam: a fake runner lets the
+   * suite assert the wiring without spawning a thread, exactly like `deps.createScheduler`/`deps.runtimeVerify`.
+   *
+   * Creating the runner does NOT spawn anything: the worker is created inside `run()`, so the mount path stays
+   * inert and no timer exists until a run is actually started (the run-scoped timeout is cleared when it settles).
+   */
+  const backupRunner = deps.backupRunner !== undefined && deps.backupRunner !== null && typeof deps.backupRunner.run === 'function'
+    ? deps.backupRunner
+    : createBackupWorkerRunner({
+        dshHome: cfg.dsh_home,
+        env: process.env,
+        timeoutMs: cfg.worker_timeout_ms,
+        logger: ctx.logger,
+      });
+
+  /**
+   * Map a runner-level failure (`{ok:false, code, error:{code, detail}}`) to the route/timer result shape the
+   * pre-S8 code already used for a caught engine exception: `{ok:false, reason_code, detail}`. Named, never thrown.
+   */
+  const workerFailure = (outcome) => {
+    const reason_code = typeof outcome?.code === 'string' && outcome.code !== '' ? outcome.code : WORKER_CODES.FAILED;
+    const detail = typeof outcome?.error?.detail === 'string' && outcome.error.detail !== ''
+      ? outcome.error.detail
+      : 'the backup engine worker failed without a result';
+    return { ok: false, reason_code, detail };
+  };
+
+  /** Record the execution location the runner actually used, for `describe().engine_mode`. */
+  const noteEngineMode = (outcome) => {
+    if (outcome?.mode === 'worker' || outcome?.mode === 'inline') state.engine_mode = outcome.mode;
+  };
+
+  /**
    * The cached runtime verdict (G5). `cached()` never spawns; `run()` spawns the installed Harness through
    * `verifyRepo({runtime:true})` (or the injected test runner) exactly once per in-flight request and persists the
    * record under `<dshHome>/xclient/w2m-backup/state.json`.
    */
   const runtimeVerdict = createRuntimeVerdictStore({
     dshHome: cfg.dsh_home,
+    // S8: the default runtime verify is an expensive `verifyRepo({runtime:true})`; it now runs on the worker too, so
+    // the nightly verdict path (and `?runtime=1`) no longer occupies the host loop. `deps.runtimeVerify` stays the
+    // first-class test seam; a worker-level failure is thrown here so the store records it as an unavailable runtime
+    // verdict (`BACKUP_RUNTIME_UNAVAILABLE`), which is what the pre-S8 code did for a throwing verifier.
     verify: typeof deps.runtimeVerify === 'function'
       ? deps.runtimeVerify
-      : async () => verifyRepo({ ...(await unlockInput()), futureAppend: true, runtime: true }),
+      : async () => {
+          const verifyInput = { ...(await unlockInput()), futureAppend: true, runtime: true };
+          const outcome = await backupRunner.run(verifyInput, { jobs: ['verify'], verifyOptions: verifyInput });
+          noteEngineMode(outcome);
+          if (outcome?.ok !== true) {
+            const failure = workerFailure(outcome);
+            const error = new Error(failure.detail);
+            error.code = failure.reason_code;
+            throw error;
+          }
+          return outcome.result;
+        },
     ...(typeof deps.now === 'function' ? { now: deps.now } : {}),
   });
   state.last_runtime_verify = runtimeVerdict.record();
@@ -602,7 +684,7 @@ export function apply(ctx, config = {}, deps = {}) {
       // Account binding: the id is read here (once per run) and passed to the engine, which binds it after a
       // successful commit. `null` means "no account path on this host", never an error.
       const accountId = await identifyAccountId();
-      const result = runBackup({
+      const runInput = {
         root: cfg.backup_dir,
         dshHome: cfg.dsh_home,
         scope: request?.scope ?? cfg.scope,
@@ -610,9 +692,9 @@ export function apply(ctx, config = {}, deps = {}) {
         keepOldPerSession: cfg.keep_old_per_session,
         maxOldVersionDays: cfg.old_version_days,
         oldFormat: cfg.old_format,
-            scopes: cfg.scopes,
-    includeSecrets: cfg.include_secrets === true,
-// The cap is bytes in the engine; the row configures MB. The schedule path never sets allowLargeFullCopy:
+        scopes: cfg.scopes,
+        includeSecrets: cfg.include_secrets === true,
+        // The cap is bytes in the engine; the row configures MB. The schedule path never sets allowLargeFullCopy:
         // a timer must not approve a write on a person's behalf, which is exactly what makes the refusal below a
         // named pending state instead of an unattended over-cap write.
         maxFullCopyBytes: cfg.full_copy_max_bytes,
@@ -631,7 +713,20 @@ export function apply(ctx, config = {}, deps = {}) {
         // The process-wide memory guard ceiling (v3.5.1): the engine refuses a materialisation it cannot afford
         // and returns `BACKUP_MEMORY_GUARD` instead of letting the host's V8 heap die.
         maxHeapBytes: cfg.max_heap_bytes,
-      });
+      };
+      // S8: the synchronous engine call runs on a worker thread by default, so the host loop stays free while the
+      // backup scans/stores/commits. `outcome.result` is the engine's own result object, unchanged. A runner-level
+      // failure (worker OOM/timeout/crash) is a value with a named code, never an exception out of the timer or route.
+      const outcome = await backupRunner.run(runInput, { jobs: ['run'] });
+      noteEngineMode(outcome);
+      if (outcome?.ok !== true || outcome.result === null || typeof outcome.result !== 'object') {
+        const failure = workerFailure(outcome);
+        state.failures += 1;
+        state.last_error = { at: new Date().toISOString(), reason_code: failure.reason_code, detail: failure.detail };
+        ctx.logger?.warn?.(`w2m-dsh-backup: ${reason} backup worker failed: ${failure.reason_code}: ${failure.detail}`);
+        return failure;
+      }
+      const result = outcome.result;
       if (result.ok === true) {
         state.runs += 1;
         state.last_run = new Date().toISOString();
@@ -807,6 +902,12 @@ export function apply(ctx, config = {}, deps = {}) {
               dsh_home: cfg.dsh_home,
               retention: { keep_old_per_session: cfg.keep_old_per_session, old_version_days: cfg.old_version_days },
               old_format: cfg.old_format,
+              // S8: where the engine last ran (`worker`/`inline`, `idle` before the first run) and the live progress
+              // record the runner mirrors to `<DSH_HOME>/xclient/w2m-backup/worker.json` while a run is in flight.
+              // The record contains only stage/done/total/timestamps/mode/pid -- never input, never a credential.
+              engine_mode: state.engine_mode,
+              progress: readWorkerState(cfg.dsh_home).state,
+              worker_timeout_ms: cfg.worker_timeout_ms,
               // P0/P1: the scopes this row runs with, and whether the row includes credentials. The panel
               // renders both (scope line + a red "credentials included" warning) from this payload.
               scopes: Array.isArray(cfg.scopes) && cfg.scopes.length > 0 ? cfg.scopes : null,
@@ -1024,7 +1125,18 @@ export function apply(ctx, config = {}, deps = {}) {
             };
             return Response.json(result, { headers: NO_STORE });
           }
-          const result = verifyRepo({ ...(await unlockInput()), futureAppend: true, runtime: false });
+          // S8: the verify pass is the other expensive synchronous engine call, so it runs through the same worker
+          // runner. A worker-level failure is answered as a named `{ok:false, reason_code}` (200, like every other
+          // refusal), never as a thrown 500.
+          const verifyInput = { ...(await unlockInput()), futureAppend: true, runtime: false };
+          const verified = await backupRunner.run(verifyInput, { jobs: ['verify'], verifyOptions: verifyInput });
+          noteEngineMode(verified);
+          if (verified?.ok !== true) {
+            const failure = workerFailure(verified);
+            state.last_verify = { at: new Date().toISOString(), ok: false, counts: null, problems: 1 };
+            return Response.json(failure, { headers: NO_STORE });
+          }
+          const result = verified.result;
           state.last_verify = { at: new Date().toISOString(), ok: result.ok, counts: result.counts, problems: result.problems.length };
           return Response.json(result, { headers: NO_STORE });
         },

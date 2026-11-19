@@ -114,6 +114,28 @@ export const CREDENTIAL_FILES = Object.freeze([
   'xclient/backup/machine.key',
 ]);
 
+/**
+ * The backup plugin's own **transient progress file** (`xclient/w2m-backup/worker.json`, v3.6/S8).
+ *
+ * It is host liveness state, not user state: the plugin-side worker runner rewrites it while a run is scanning the
+ * home. Backing it up would (a) race that scan — an atomic-write temp collected and then renamed away is a
+ * collected-then-ENOENT path for the engine — and (b) put "this run is at stage store" into the run's own snapshot.
+ * The settled `state.json` in the same directory stays in scope: it is verdict/reminder state a restore benefits
+ * from. Both the final name and its atomic-write temporaries are excluded.
+ */
+export const BACKUP_WORKER_STATE_REL = 'xclient/w2m-backup/worker.json';
+
+/** Is this home-relative path the backup plugin's transient progress file (or one of its temp writes)? */
+export function isBackupWorkerStateRel(rel) {
+  const clean = String(rel).replace(/\\/g, '/').replace(/^\/+/, '');
+  if (clean === BACKUP_WORKER_STATE_REL) return true;
+  const cut = clean.lastIndexOf('/') + 1;
+  if (cut === 0) return false;
+  const dir = clean.slice(0, cut);
+  const base = clean.slice(cut);
+  return dir === 'xclient/w2m-backup/' && base.startsWith('.worker.json.tmp-');
+}
+
 /** Root configuration file (the global plugin rows). */
 const ROOT_CONFIG_FILE = 'cordis.patch.yml';
 
@@ -261,6 +283,9 @@ export function classifyHomePath(rel) {
   if (top === 'sessions' && segments[1] === '.event-cache') return 'cache';
   if (top === 'storages' && segments[1] === 'session_projcache') return 'cache';
   if (isCredentialRel(clean)) return 'credential';
+  // v3.6/S8: the backup plugin's own transient progress file is skipped, never captured, and the coverage report
+  // must say so with a class instead of treating it as a gap.
+  if (isBackupWorkerStateRel(clean)) return 'self-copy';
   if (top === 'sessions' || top === 'attachments') return 'in-scope';
   if (clean === 'storages/workspace.json') return 'in-scope';
   if (top === 'storages' && segments[1] === 'dsh-context') return 'in-scope';
@@ -395,6 +420,12 @@ export function collectScopeFiles(input) {
       }
       if (/\.log$/i.test(entry.name)) {
         recordSkip(rel, 'log file: not state, and it can be large', 'cache', stat.size);
+        continue;
+      }
+      if (isBackupWorkerStateRel(rel)) {
+        // The backup plugin's in-flight progress file: the scan can be running against the same directory that the
+        // plugin rewrites, so it is never a backup candidate (see {@link BACKUP_WORKER_STATE_REL}).
+        recordSkip(rel, CLASS_REASON['self-copy'], 'self-copy', stat.size);
         continue;
       }
       if (isBackupCopyName(entry.name)) {

@@ -1996,3 +1996,109 @@ restore copies 留在仓库快照里，归档 manifest 记 `counts.restore_copie
   `oldCopyMaxBytes` + 堆护栏双重上限；超过 512 MiB 的副本会被命名跳过而不是流式校验。
 - mount 时会写一条很小的 `pending_catch_up` 状态（`state.json`，~1 KB）：这是可见性所需的最小 I/O，
   不触发扫描/备份/校验。
+
+### 27.8 执行位置：worker_threads（3.6，P1 S8）
+
+**目标**：行为不变，只改执行位置。`runBackup` / `verifyRepo` 的导出与返回形状、CLI（`bin/w2m-backup.mjs`）、
+inline 回退路径都不变；变的只是"谁在哪个线程上跑"——定时 run、面板 run、verify 路线（含默认的
+nightly runtime 终审）从"宿主主线程同步占用到完成"改为"worker 线程执行，宿主事件循环保持可响应"。
+
+**文件与协议**
+
+| 文件 | 职责 |
+| --- | --- |
+| `src/backup/engine.mjs` | 纯函数引擎，**本切片未改**（CLI 仍直接 inline 调用） |
+| `src/backup/engine-worker.mjs`（新） | worker 入口：收 `{type:'start', input, jobs:['run'\|'verify'], verifyOptions}`，执行后 post `progress` / `done` / `error` |
+| `src/plugin/backup-worker.mjs`（新） | 插件侧 runner：spawn、resourceLimits、超时、进度文件、具名失败、inline 回退 |
+| `src/plugin/backup.mjs` | 把定时 run、`POST /api/w2m/backup/run`、verify 路线和默认 runtime 终审接到 runner；`describe()` 增加 `engine_mode` / `progress` / `worker_timeout_ms` |
+
+协议是单向的：`{type:'start', input, jobs, verifyOptions}` → 若干 `{type:'progress', stage, done, total}` →
+恰好一条 `{type:'done', result}` 或 `{type:'error', code, detail}`。**引擎拒绝（`{ok:false, reason_code, detail}`）
+是 `done` 携带的 result，不是 `error`**：拒绝是数据，宿主必须照常展示；`error` 只表示"worker 没能产出结果"（抛异常）。
+
+**模式选择（顺序固定）**
+
+1. `W2M_BACKUP_INLINE=1` → inline（显式开关，最高优先级）；
+2. 运行环境没有可用的 `Worker`（旧 Node / 受限运行时）→ inline；
+3. `spawn` 同步抛错（worker 无法创建）→ inline；
+4. 其余情况 → worker。测试通过 `createBackupWorkerRunner({spawn})` 注入假 worker，所以 OOM/超时/崩溃路径
+   是确定性的，不依赖真机运气；真 worker 只出现在"成功 + 结果一致"的验收里。
+
+**资源与具名失败**
+
+- worker 使用独立 V8 堆：`resourceLimits: { maxOldGenerationSizeMb: 1024 }`；worker 内引擎的
+  `backupMaxHeapMb` 内存护栏（§27.7）仍然生效，两道护栏是叠加关系，不是替代关系。
+- OOM（`ERR_WORKER_OUT_OF_MEMORY` 错误事件，或退出码 134）→ `BACKUP_WORKER_OOM`；
+- 超过 `backupWorkerTimeoutMs`（默认 30 分钟，行配置；`0` 被拒绝而不是解释为"永不超时"）→
+  `BACKUP_WORKER_TIMEOUT`；
+- 其余崩溃/异常退出 → `BACKUP_WORKER_FAILED`；worker 内抛出且带 `error.code` 的异常保留该 code。
+- 三种失败**都不自动重试**（重试由用户/下一次调度决定），都是 `{ok:false, code, error:{code, detail}}` 值；
+  插件把它们映射为既有的 `{ok:false, reason_code, detail}`（面板/定时器看到的就是命名失败，不抛 500、不杀定时器）。
+  每条终止路径都会 `terminate()` worker 并删除进度文件，宿主事件循环不被遗留线程占用。
+
+**inline 回退（行为冻结）**
+
+回退就是 S8 之前的行为：同样的 `runBackup` / `verifyRepo` 调用、同样的同步 API、同样可能在宿主主线程上占用
+事件循环直到完成；返回值多一个 `mode:'inline'` 标记，并写一条 `engine: inline (<reason>)` 的 logger warning。
+`W2M_BACKUP_INLINE=1` 让运维可以在怀疑 worker 本身有问题时一键回到旧路径而不改代码。
+
+**进度文件（只用于观测）**
+
+- 路径：`<DSH_HOME>/xclient/w2m-backup/worker.json`（与 `state.json` 同目录，原子替换写，0600 等价权限；
+  Windows 无 POSIX 位时以目录 ACL 为边界）。
+- schema（**只有这些字段**）：
+  `{started_at, updated_at, stage, done, total, mode:'worker', pid}`。
+  `stage` ∈ `starting|scan|select|store|commit|rotate|mirror|verify`；`done/total` 是粗粒度计数，`0/0` 表示
+  "该检查点无法度量"。文件里**没有 input、没有路径、没有凭据**；run 结束后删除，失败/超时同样删除。
+- 写失败只记一次 warning，绝不让备份失败：进度是观测，不是结果。
+- `GET /api/w2m/backup/run`（describe）暴露 `engine_mode`（`worker`/`inline`/首次运行前 `idle`）、
+  `progress`（当前 worker.json，空闲或已结束时为 `null`）和 `worker_timeout_ms`。
+
+**进度语义的诚实说明**：引擎是一次同步调用且本切片**没有给它插桩**。因此 `scan`（扫描开始前）、
+`select`/`store`（扫描返回后、进入选块/写块阶段时）是在 run 进行中上报的；`commit`/`rotate`/`mirror` 是在
+同步 `runBackup` 返回后上报的**完成检查点**，含义是"包含该阶段的同步过程已经结束"，不是"该阶段正在执行"。
+dry run 不报 commit/rotate，未配置 mirror 的仓库不报 mirror。若未来需要逐块进度，应给引擎加回调（那是引擎
+API 改动，不属于 S8）。
+
+**验收与证据（2026-11-19，测试均为临时 fixture，无网络、无真实 DSH_HOME）**
+
+- `test/backup-worker.test.mjs`（12 项全绿）：
+  - 真 `worker_threads`：run 成功且 `mode:'worker'`，进度阶段顺序 scan→select→store→commit；
+    对同一 fixture 的 fresh repository 做 inline run，`files`/`counts`/`scopes`/`registry` 完全一致，且把随机
+    `snapshot_id` 对齐后 manifest digest 与 `result.digest` 完全相同（`snapshot_id` 由 `repo.mjs` 的 4 字节随机
+    entropy 生成，所以两次运行的原始 digest 本来就不可能相等；可比的"同内容摘要"已断言）。
+  - 真 worker 的 verify job：`counts.snapshots` 正确、`problems` 为数组、上报 `verify` 检查点。
+  - **扫描不捕获自身进度文件**：`scopes.mjs` 把 `xclient/w2m-backup/worker.json` 及其原子写临时文件按
+    `self-copy` 跳过（`state.json` 仍在 `state` scope 内）；真 Worker 的端到端测试断言 manifest 里没有该文件，
+    且 run 结果的 `scope_skipped` 把它报告为 deliberate skip。
+  - 假 worker 监督：progress→done 传播、`resourceLimits.maxOldGenerationSizeMb = 1024`、进度文件字段/schema、
+    运行中写入、结束后删除、哨兵密码不出现在文件或 `start` 之后的消息里。
+  - 具名失败：OOM 错误事件 → `BACKUP_WORKER_OOM`；退出码 134 → OOM；其他退出码 → `BACKUP_WORKER_FAILED`；
+    静默 worker 超时 → `BACKUP_WORKER_TIMEOUT`；每种都断言 `terminate()` 与进度文件删除。
+  - 回退：`spawn` 同步抛错 → inline（结果成功、有 warning、无进度文件）；`W2M_BACKUP_INLINE=1` → inline 且不 spawn。
+  - 插件接线：`apply(..., {backupRunner})` 下挂载不调用（inert），run 路线/定时槽/verify 路线都调用 runner，
+    `describe().engine_mode === 'worker'`，worker 失败变成 `{ok:false, reason_code:'BACKUP_WORKER_OOM'}` 的 200 拒绝；
+    `backupWorkerTimeoutMs` 默认 30 分钟且非法值在挂载时被 `BACKUP_CONFIG_INVALID` 拒绝。
+- 回归：`test/backup-run.test.mjs`、`backup-engine`、`backup-verify`、`backup-memory`、`backup-wiring` 全绿
+  （现有测试未改成注入假 runner：它们确实在测试进程里走真 worker，这同时验证了真实接线）。
+- **未做/延后**：真机（真实 `$DSH_HOME` + 真实 118 MB 会话 + 1.36 GB `old/`）的 RSS 曲线与 GUI 响应性实测。
+  本切片按任务边界不读写真实 profile，故该项留到 S9 或用户授权的真机 run；`--test-force-exit` 下的套件只证明
+  真 worker 能跑通并产出与 inline 相同的内容。
+
+**本版不承诺（诚实边界）**
+
+- inline 回退时 GUI 仍会像 3.5.x 一样在 run 期间变慢（回退就是旧行为，不假装 worker 的收益仍在）。
+- worker 不是池：一次 run 一个新线程，跑完即终止；没有复用/预热。调度本身已由 `state.running` 串行化，不需要
+  池来限流；若未来多个子插件都要用引擎，再引入池并单独评估内存占用。
+- worker 的 1 GiB 堆上限 + 引擎 1.5 GiB 内存护栏是**保守叠加**：真实 118 MB 会话的 run 曾实测峰值 WS
+  379 MB（§27.7），远低于 worker 上限；但一个异常输入在 worker 内仍可能 OOM——那会得到
+  `BACKUP_WORKER_OOM`，宿主不受影响，这是设计目标而非缺陷。
+- 进度文件在 `<DSH_HOME>/xclient/` 下。它**不会**进入自己的快照：`scopes.mjs` 把
+  `xclient/w2m-backup/worker.json`（含其 `.worker.json.tmp-*` 原子写临时文件）按 `self-copy` 跳过——否则一次
+  run 扫描目录时会与自己的进度写入竞争（被收集后又被 rename 走的 tmp 文件会变成 ENOENT 读失败），且"本次 run
+  跑到 store"会进入本次快照。同目录的 `state.json`（verdict/reminder 状态）仍在 `state` scope 内，行为与 3.5.x
+  一致。
+- worker 与 verify/restore 路线现在可以并发（前者在独立线程，后者的请求不再被宿主事件循环自动串行化）：
+  仓库写者仍有写锁，但"备份进行中同时发起 verify"可能读到正在提交的快照并报告瞬时问题。S8 只改执行位置，
+  未新增运行时互斥；面板/调度层的并发策略是后续切片的事。
+

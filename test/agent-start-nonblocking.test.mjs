@@ -21,7 +21,7 @@ import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const tools = readFileSync(join(here, '..', 'src', 'plugin', 'tools.mjs'), 'utf8');
+const tools = readFileSync(join(here, '..', 'src', 'plugin', 'tools', 'shared.mjs'), 'utf8');
 
 /** The text of one function: from its `function name(` line to the next `\nasync function` or `\nfunction`. */
 function functionBody(name) {

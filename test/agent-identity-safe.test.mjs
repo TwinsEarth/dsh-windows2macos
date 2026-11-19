@@ -13,7 +13,7 @@ import { dirname, join } from 'node:path';
 import { describe, it } from 'node:test';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const tools = readFileSync(join(here, '..', 'src', 'plugin', 'tools.mjs'), 'utf8');
+const tools = readFileSync(join(here, '..', 'src', 'plugin', 'tools', 'shared.mjs'), 'utf8');
 
 describe('agent identity access is type-safe (v1.7.4)', () => {
   it('does not use the optional-call form that crashed the desktop host', () => {
