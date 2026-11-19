@@ -4,6 +4,8 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+## [3.5.2] - 2026-11-19
+
 ### G4 renumber：`image/offload` 的 `data.targets[].seq` 引用改写（未发布）
 
 - **修复**：真实机器复核（2026-11-19，`g4_renumber_boundary`）发现 `src/backup/renumber.mjs` 的引用改写只认 `*Seq`/`*Seqs` 键，而 `image/offload` 事件把消息 seq 引用放在小写的 `data.targets[].seq` 里；删/插事件移位后该引用仍指向旧 seq，安装的 Harness 以 `RENUMBER_RUNTIME_REJECTED`（`invalid seed event ... image/offload: image index 0 does not exist`）安全拒绝（零写入）。现在只对 `type === 'image/offload'` 事件的 `data.targets[i].seq` 应用同一 old→new 映射；指向被删除/越界 seq 的 target 复用 `RENUMBER_DANGLING_REFERENCE` 具名拒绝；事件自身顶层 `seq` 仍只由密集重编号赋值，其他小写 `seq` 字段含义不变。

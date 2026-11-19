@@ -1,0 +1,51 @@
+{
+  "version": "3.5.2",
+  "case": "RELEASE-3520-OFFLOAD-TARGETS",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-19T05:11:20.908Z",
+  "executor": "lead",
+  "task_id": "w2m-v352-offload-targets",
+  "requirement": "v3.5.2 fixes the G4 renumber boundary found by the 2026-11-19 dsh-fix real-machine reverification: image/offload events store event references in data.targets[].seq, which the renumber traversal did not rewrite because it only maps *Seq/*Seqs keys. After an edit that shifts indices the installed Harness refused the log with RENUMBER_RUNTIME_REJECTED (a safe, zero-write refusal), so a repaired session could not be renumbered when the edit preceded a target. The fix maps every image/offload data.targets[i].seq through the same old->new mapping, refuses a deleted/out-of-range target with the named RENUMBER_DANGLING_REFERENCE code (zero write, no .bak), keeps the event's own top-level seq assigned only from its dense position, and leaves other lowercase seq fields untouched. No other behaviour changes.",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/fix-renumber.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/backup-verify.test.mjs"
+    ],
+    [
+      "node",
+      "scripts/layer-check.mjs"
+    ],
+    [
+      "node",
+      "scripts/scan-mojibake.mjs"
+    ],
+    [
+      "node",
+      "scripts/pack.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "boundary_source": "docs/acceptance/3.5.1/RELEASE-3510-DSH-FIX-REAL-MACHINE.json records the real-machine finding: --delete-seq 0 on the repaired log is refused by the installed Harness with RENUMBER_RUNTIME_REJECTED (\"invalid seed event at index 2795: image/offload: image index 0 does not exist\", zero write) while --delete-seq 2795 (post-target) passes runtime_verified true",
+      "fix_scope": "src/backup/renumber.mjs runs rewriteImageOffloadTargets() after the *Seq/*Seqs walk, scoped to events whose top-level type is image/offload; each integer data.targets[i].seq is mapped old->new; the event top-level seq is still assigned from its dense position; inserted image/offload events are mapped against pre-edit seqs",
+      "refusal": "a deleted or out-of-range target returns the reused named code RENUMBER_DANGLING_REFERENCE with detail.references[0] = {event_type:\"image/offload\", key:\"seq\", at:\"data.targets[0].seq\", seq, deleted}, writes nothing and leaves no .bak",
+      "tests": "test/fix-renumber.test.mjs 38/38 (+8): single target rewritten with exact data JSON and mapping, multiple targets all rewritten, deleting the target event itself -> named refusal + zero write + no .bak, deleting an event after the target -> target unchanged, own seq vs target seq not confused, non-image/offload lowercase seq not rewritten, out-of-range target -> same refusal; one runtime-gated case proves the fixture is runtime-valid, shows the unrewritten variant refused by the installed Harness, then asserts plan.validation.runtime_verified true / future_append_evidence installed-harness and that the applied log passes",
+      "regression": "test/backup-verify.test.mjs 25/25; combined affected suites green; eslint 0 errors; layer-check clean; mojibake clean",
+      "docs": "docs/BACKUP-DESIGN.md §20.1 reference rule and §20.2 pipeline now state the image/offload data.targets[].seq rule and the RENUMBER_DANGLING_REFERENCE refusal; §20.5 coverage list updated; CHANGELOG has the 3.5.2 entry",
+      "release_note": "the 3.5.2 pack is built from this tree (version 3.5.2 everywhere); its exact sha256 is quoted in the v3.5.2 GitHub Release notes and npm metadata rather than in this record, because a record shipped inside the pack cannot consistently contain the pack hash it participates in",
+      "not_verified": "no live DSH agent turn with a naturally broken session exists on this machine (the 3.5.1 real-machine drink covered the repair path synthetically); this release is a pure G4 reference-rewriting fix verified by tests plus the recorded real-machine boundary"
+    }
+  }
+}
