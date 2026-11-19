@@ -4,6 +4,31 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### 修复：SSE 流被 5 秒头超时错误中断（未发布）
+
+- **根因**：`src/agent/lifecycle/heartbeat.mjs` 把 SSE 的「等响应头」deadline 用 `AbortSignal.timeout()` 混进传给
+  `fetch` 的 signal；而 fetch 的 signal 也覆盖**响应体**，所以每条健康 SSE 流在 attach 后 5 s 被 abort 并重连，
+  恰好落在那窗口里的帧（如 task.offer 重投）会丢失。该缺陷自 v2.0.5 `edf6333` 引入（与 S4 拆分无关）。
+- **修复**：独立的 `AbortController` + header 计时器，`fetch` settle 后立即 `clearTimeout`；响应体由既有
+  first-frame/idle watchdog 与 `stop()` 兜底。永不发头的服务端仍会得到 `SSE_FIRST_FRAME_TIMEOUT`。
+- **证据**：隔离循环 **2/15 失败**（126–127 s，`timed out waiting for cached resend`，trace 显示 stream 在
+  attach 后 5.02 s 被 TimeoutError abort）；修复后目标用例 **15/15**（3.0–3.4 s），4 路忙循环加压 **8/8**，
+  `W2M_SSE_FIRST_FRAME_MS=1000` 强制复现后 **5/5**；`test/agent.test.mjs` 161 pass / 0 fail / 2 skip；
+  `test/p2p-*.test.mjs` 257/257。新增回归用例「任务跨越缩短的头超时仍只 attach 一次」（HEAD 上失败、修复后通过）。
+- **影响**：已发布的 3.5.2 含该缺陷（`task.cancel` 与缓存重投路径都可能受 5 s 流中断影响）；建议下一版本（3.5.3）携带。
+
+### P1 S6/S7：client 预算计量修正 + chat 渲染提取（未发布）
+
+- **计量缺陷**：`test/client-budget.test.mjs` 的旧计量只认列 0 `function` 并把后续并列组件全算进上一个函数，
+  误报 `UpdateSettingsSection` 3,454 行 / `renderChatText` 1,131 行；实际分别是 **63 行 / 10 行**，真实最大为
+  `BackupPanelView` 832 行。
+- **修正**：重写为花括号匹配计量（屏蔽注释/字符串/模板/正则、跳过嵌套函数、加非空守卫 140 函数/最大 ≥400），
+  预算单函数上限 3,600 → **1,200**（832+余量），并钉住 63/10 两个回归值。
+- **提取**：`renderChatText` 与 `CHAT_COMMANDS/STICKER_GLYPHS/STICKER_RE/EMOJIS` 从 `FleetChat` 提到模块作用域
+  （逐字节等价，仅缩进/注释），`FleetChat` 351→335；`lib/client.js` 593,045→593,540 B（预算内）。
+- **验证**：client 套件 143/143（含真实 Edge 页面 21.4 s 全通过、queue-journal 探针 slotted/草稿落盘/抽屉/恢复）；
+  eslint 0 error；layer/mojibake clean。
+
 ### 队列日志抗版本更新加固（未发布）
 
 - **客户端槽位化**：队列日志 chip 注册到 `conversation.input.left`（id `w2m-queue-journal`，order 46），抽屉注册到

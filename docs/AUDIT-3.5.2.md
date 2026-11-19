@@ -924,18 +924,19 @@ flowchart LR
 3. **分层门禁 + 验收门禁 + 发布纪律**：三层约束同时存在，这在同规模仓库里少见。
 4. **事故驱动演进**：3.5.0 OOM → 3.5.1 惰性 mount/有界内存 → 3.5.2 G4 边界修复，均有复现数字与验收记录。
 
-### 6.2 风险登记（按严重度）
+### 6.2 风险登记（按严重度，2026-11-19 更新：P1 重构后实测）
 
-| 级别 | 风险 | 说明 / 建议 |
+| 级别 | 风险 | 现状 / 说明 |
 |---|---|---|
-| P1 | 巨型入口文件（tools.mjs 8.9k、agent.mjs 4.8k、state.mjs 3.7k、client.js ~10k） | 变更冲突面大、代码评审难；建议按子域拆包，保持导出面稳定 |
-| P1 | 备份引擎仍同步执行 | 内存已封顶不会 OOM，但大仓库运行时 GUI 可能变慢；worker_threads 迁移是 3.6 的首要项 |
-| P2 | P2P/relay 并发路径单测有限 | 建议补"丢包/乱序/重启中途"的可重复故障注入测试 |
-| P2 | `old/ .enc` 整文件解密（512 MiB + 守卫，非流式） | 与 verify 流式化对齐 |
-| P2 | `lib/client.js` 单 bundle 过大 | 面板/GPW/fleet 可拆为独立客户端插件，降低单文件风险 |
-| P3 | 文档与代码双写（BACKUP-DESIGN 与实现同步成本） | 已有 protocol 测试兜底，可接受；建议在 PR 模板里加"文档同步"勾选 |
-| P3 | 决策中心含第三方版权头 | 明确许可边界（AGPL-3.0-or-later + LICENSE-CORE），对外发布需保留声明 |
+| **已关闭** | 巨型入口文件 | **结论修正**：审计时的"8.9k/4.8k/3.7k/10k 行"中，真正的大函数是 `apply(4251)`、`createAgent(3685)`、RabbitState 巨类；client.js 的 3,454 行是**预算计量器误报**（实际 63 行，真实最大 `BackupPanelView` 832）。P1 已完成：tools 8,908→610、agent 4,770→638、relay state 3,713→1,174；计量器重写、预算收紧到单函数 1,200 |
+| **已关闭** | 备份引擎同步执行 | S8 已交付 worker_threads（`engine-worker.mjs` + `backup-worker.mjs`，resourceLimits 1024 MiB、具名 OOM/TIMEOUT/FAILED、inline 回退）；合成宿主实测 inline 0 tick → worker 12 tick / 最大间隔 19.3 ms；**真机 RSS/GUI 曲线待授权真机运行** |
+| P2 | P2P/relay 并发测试 | P2-F 已交付故障注入矩阵（24 例 P2P + 8 例 relay，真实修复完成消息重复投递 bug）；仍建议补持续模糊（random seeds in CI） |
+| P2 | `old/ .enc` 整文件解密 | 未变：单块 AEAD，需 v2 分块格式（P2 计划 O1–O4，未开始） |
+| P2 | client bundle 体积 | 预算守卫已重写并收紧（单函数 1,200 / 610 KB / 10,050 行），当前 593,540 B；真实最大函数 832，建议下一轮 <600 |
+| P3 | 文档与代码双写 | 已有 protocol 测试兜底；本轮补齐 QUEUE-JOURNAL-COMPAT、P1/P2 计划与审计更新 |
+| P3 | 决策中心含第三方版权头 | 许可边界不变（AGPL-3.0-or-later + LICENSE-CORE） |
 
+> 负载敏感的 e2e（`agent.test.mjs` 的 cancel/cached-resend）在发布门禁里偶发超时：已独立跟踪（产品竞态 vs 负载敏感），`test`/`test:all` 固定 `--test-concurrency=1` 以降低抖动。
 ### 6.3 建议的下一步（与当前路线一致）
 
 1. 3.5.2 staged 批准后核对 npm；真实 profile 从 3.5.1 tarball 切到 registry 版本（用户授权后）。

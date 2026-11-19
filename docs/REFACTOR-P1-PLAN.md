@@ -116,10 +116,10 @@ src/plugin/backup-worker.mjs         # 插件侧：spawn/复用、resourceLimits
 | S3 | `tools/governance.mjs` + `tools/dispatch.mjs` | apply 降到 ~350 行 | 同上 + `test/agent*.test.mjs`（dispatch 走 agent） — ✅ **已完成（2026-11-19，未提交）**：apply 4,243 → 450 行，`tools.mjs` 610 行；16 个工具全部搬入 4 个域模块、注册顺序逐字节保持；快照摘要不变，工具套件 233/233 + 广度回归 304/304 全绿 |
 | S4 ✅ | `agent/lifecycle/*` 四阶段 | **已实现**：agent.mjs 4,770 → 638 行（createAgent 365）；lifecycle/{shared,deliver,execute,offer,heartbeat} = 1,170/1,470/554/567/926；导出面 45 项一致、4,470/4,690 行逐字节一致 | 基线 568/566/0/2 不变；agent*+p2p-* 441/438/0/3；广回归 164/164；lint/layer/mojibake clean |
 | S5 ✅ | `relay/state/*` 纯函数 → 方法搬移 | **已实现**：state.mjs 3,713 → 1,174 行；state/{shared,members,tasks,leases,results,events}=348/763/1,019/487/97/61；42 导出与 100 个 prototype 名一致；`.gitignore` 修正 `state/` 规则误忽略源码 | relay 517/516/0/1 不变；真实进程 phase2 **9/9** + mixed **6/6**；lint/layer/mojibake clean |
-| S6 | client.js 文件内分解（settings） | 单函数 <600 行 | client-bundle + loader-entry |
-| S7 | client.js 文件内分解（chat-text） | 同上 | 同上 |
+| S6 ✅ | client.js 文件内分解（settings） | **结论修正**：所谓 3,454 行的 `UpdateSettingsSection` 实际只有 **63 行**，是 C1 预算计量器（只认列 0 `function`、把后续并列组件全算进上一个函数）的误报。已重写计量器（花括号匹配/注释字符串屏蔽/嵌套跳过/非空守卫）、预算单函数上限 3,600→**1,200**（真实最大 `BackupPanelView` 832），`renderChatText` 提取到模块作用域 | client-bundle 112/112、真实页面 143/143、eslint 0 |
+| S7 ✅ | client.js 文件内分解（chat-text） | `renderChatText`(10 行) + `CHAT_COMMANDS/STICKER_GLYPHS/STICKER_RE/EMOJIS` 提到模块作用域（逐字节等价），`FleetChat` 351→335；文件 593,045→593,540 B（仍在预算内） | 同上 |
 | S8 | `engine-worker.mjs` + 插件接线 + 回退 | 引擎默认 worker | ✅ **已实现（3.6，2026-11-19，未提交）**：`test/backup-worker.test.mjs` 12/12 通过——真 Worker 成功且结果与 inline 等价（`files`/`counts` 一致、对齐随机 `snapshot_id` 后 manifest digest 相同）、真 Worker verify、进度阶段顺序、`resourceLimits.maxOldGenerationSizeMb=1024`、进度文件 schema/结束删除/无凭据、`scopes.mjs` 把 `xclient/w2m-backup/worker.json` 按 self-copy 跳过（扫描不捕获自身进度文件；`state.json` 仍在 scope 内）、`BACKUP_WORKER_OOM`（错误事件与退出码 134）、`BACKUP_WORKER_TIMEOUT`、其他崩溃 `BACKUP_WORKER_FAILED`、spawn 抛错与 `W2M_BACKUP_INLINE=1` 回退 inline、`deps.backupRunner` 插件接线（run/定时/verify 路线 + `engine_mode` + 具名失败不抛）、`backupWorkerTimeoutMs` 默认 30 分钟。回归 `backup-run`/`backup-engine`/`backup-verify`/`backup-memory`/`backup-wiring` 全绿（全部 backup-* 套件 569/569）。设计见 `docs/BACKUP-DESIGN.md` §27.8。真机 RSS 曲线延后（本切片不触真实 profile） |
-| S9 | 文档收尾 + 审计更新 | BACKUP-DESIGN/§27.7、AUDIT 风险表、CHANGELOG | pre-flight 绿 |
+| S9 | 文档收尾 + 审计更新 | **进行中**：AUDIT §6.2 风险表已按实测更新（巨型入口结论修正、worker_threads 已交付、client 预算计量修正）；真机 RSS 曲线待用户授权在真实 profile 安装新构建后跑一次备份 | pre-flight 绿 |
 
 **发布纪律**：每片只提交（本地），不 push/tag/publish；版本号在切片期间保持 3.5.2，等用户授权发布时统一 bump。
 
