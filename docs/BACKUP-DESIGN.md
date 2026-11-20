@@ -682,6 +682,57 @@ UI 半只有一个文件：`lib/client.js`（手写、由 `window.__ModuleLoader
   跑一次、失败只 warning 且记录持久化、默认 nightly（`off` 可显式关闭）。
 * `test/loader-entry.test.mjs`：真实 Chromium 页面（抛空 profile 安装当前 tarball）断言面板入口与四操作标记。
 
+### 19.4 `future-append` 真实误报的修正（2026-11-21，真实日志 `session-9603c5c8…`）
+
+2026-11-20 的真机演练里，verify 对同一会话报了两遍 `BACKUP_FUTURE_APPEND_FAILED`（每个快照一遍），detail 是
+`ZSTD_HEADER_FRAME_INVALID, SEQ_GAP, PROTECTED_HEAD_MISSING, SEQ_REF_DANGLING`。复核结论分三层：
+
+1. **日志形状（只读实测）**：7,835,561 B / 138 帧 / 11,046 事件，`seq` 0..11045 稠密，3007 个 `*Seq` 引用全部可解析
+   （没有真 dangling）。唯一异常是**首帧 93 行**（header + 前 92 个事件）。本机 394 个真实日志里 **393 个首帧只有
+   1 行**；而这 394 个的**事件帧**全部是批式（2..160 行/帧）——所以"批式事件帧"是正常形状，"首帧带事件"不是。
+2. **四个码里只有一个是真的**。安装版 `@deepseek-ai/dsh-session-persistence-jsonl` 的 `assertZstdHeaderFrame`
+   （`src/index.ts`）要求首帧 plaintext 非空且 `indexOf(0x0A) === length-1`，即**恰好一行**；`readZstdPrefix`、
+   header-only 读路径与 `generation.ts` 都调用它，README 也写明 "one checksummed frame containing only the header
+   line"。因此 `ZSTD_HEADER_FRAME_INVALID` 是真发现（客户端在读到事件前就拒绝这个文件）；而
+   `SEQ_GAP` / `PROTECTED_HEAD_MISSING` / `SEQ_REF_DANGLING` 只是静态 doctor 把首帧里的行**排除出事件表**造成的
+   假阳性：gap 落在 0、保护头其实是第一条 surface 事件、引用指向 `seq 61` / `seq 88` 等确实存在的行。
+3. **追加本身是合法的**：`lastSeq + 1 = 11046`（与旧的 `rows-1` 恰好相同，因为这条日志 seq 稠密）；运行时终审对
+   原 artifact 与 +append artifact 都是 `ok`（11,046 / 11,047 events）。**但运行时长看不到帧边界**（driver 用
+   `buildArtifactFromBuffer` 把"行"喂给 `createRestore`），所以它不能证明这个文件能被客户端 `open`。两条通道
+   各管一半，谁都替代不了谁——这也是本节要写明的边界。
+
+修正（`src/backup/future-append.mjs` 重写 + `src/util/session-validate.mjs` 新增选项）：
+
+| 点 | 之前 | 现在 |
+|---|---|---|
+| 读日志 | 只把 header 帧之后的帧算作事件 | `readLogContainer` 解析**所有行**（与 `buildArtifactFromBuffer` 同一读法）；doctor 新增 `includeHeaderFrameEvents` 选项，**默认行为不变**，只有 append 预筛打开它 |
+| append 的 seq | `countLogRows().rows - 1` | `lastEventSeq(bytes) + 1`（与 `src/fix/session.mjs#readSession` 的 `lastSeq` 同一派生）；行数只在读不出容器时兜底 |
+| 判定 | appended 的全部 code 混在一起 | 拆成 `append_codes`（追加**引入**的）/ `graph_codes`（既有事件图）/ `container_codes`（既有物理容器），再加具名观察 `BACKUP_FUTURE_APPEND_UNSUPPORTED` |
+| `ok` | appended 全过 | 不变（严格）：engine 的 "N/N still load after one legal append" 和 renumber 的静态门不能把"容器不可读"算成通过 |
+| verify | 每个快照一条 problem，detail 是 4 个码 | **每个 distinct 会话一条** problem（`snapshot_ids` / `occurrences` / `sha256s` 记录它出现在几个快照、几个版本）＋每个 distinct 会话一条具名观察（`future_append.observations` / `unsupported`，`versions[]` 记每个内容版本）；`checked` / `failed` 仍是 occurrence 计数，`failed_sessions` 是 distinct 会话；相同内容的判定结果按 `sha256` 缓存，活跃会话在两次备份之间增长时也只判一次、报一条 |
+
+**具名观察的语义**：`BACKUP_FUTURE_APPEND_UNSUPPORTED` **不是** problem code，它只说"这份 artifact 不能用 append
+探针作证"——探针无法在一个客户端打不开的容器上模拟"下一次追加"。造成它的容器缺陷仍然作为 problem 报
+（`BACKUP_FUTURE_APPEND_FAILED`，detail 写 "not a readable v4 container before any append"、首帧行数，并注明
+"the appended event itself adds nothing"）。观察本身单独出现时**不产生 problem**（当前没有这种形状，`ok` 仍为
+false）；"可读容器 + 合法事件图"则 `ok: true`。
+
+**诚实边界**：
+
+* **运行时长是行级门**：`--runtime` 对这条日志会 ok，而静态预筛报容器缺陷。这不是互相推翻，是两条通道能力不同；
+  verify 仍失败（problem 非空），方向安全。要证明"客户端能 `open`"必须走 `open()` 那条读路径，而
+  `assertZstdHeaderFrame` 正在那里，运行时 driver 调不到它。
+* **没有放宽 restore 的静态门**：`validateCandidates` 仍用默认（严格）doctor，因此这条 artifact 在还原计划里仍被
+  `BACKUP_CANDIDATE_INVALID` 拒绝。本修正只把"误报成 3 条追加失败"变成"1 条真实容器发现 + 1 条具名观察"，
+  **不**把不可读日志变成可还原。
+* **未覆盖**：torn tail（客户端会先截断重写再追加，append 探针不是它的模型）；`compression: 'none'` 的
+  `session.vN.jsonl`（扫描层只收 `.zstd`）；本机 394 个日志之外的其它物理编码。
+* **测试**：`test/backup-future-append.test.mjs` 10 项——合成 fixture 复现"首帧带 5 个种子事件 + protected head +
+  tail `sourceEventSeqs`/`shadowedSeqs` 引用"的真实形状，先断言严格 doctor 的 4 个码（旧失败模式），再断言修正后
+  只剩 1 个容器码 + 观察；plain 与"首帧 1 行 + 批式事件帧"两种形状必须 `ok`；seq gap、late `system/message`、
+  真 dangling 引用必须继续失败；同一会话出现在两个快照时（内容相同、以及两次备份之间增长成两个版本各一条）
+  verify 都只报 1 条 problem + 1 条 observation，且 `versions[]` 仍列出全部内容版本。
+
 ## 20. G4 收口：seq 重编号工具（v3.4.8/v3.4.9）
 
 复盘 G4 的原文是"删/插事件的唯一合法方式是重编号工具：全局 renumber + 改写所有指向 seq 的引用 + 医生校验"。

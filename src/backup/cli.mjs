@@ -243,6 +243,20 @@ export function formatVerify(result) {
   }
   lines.push(`current ptrs  : ${result.counts.current}`);
   lines.push(`future append : ${result.future_append.checked - result.future_append.failed}/${result.future_append.checked} passed`);
+  // A distinct session can appear in many snapshots; the problems list is deduplicated per session content, so the
+  // occurrence count and the distinct-session count are both worth saying out loud.
+  if (Array.isArray(result.future_append.failed_sessions) && result.future_append.failed_sessions.length !== result.future_append.failed) {
+    lines.push(`future append : ${result.future_append.failed_sessions.length} distinct session(s) across ${result.future_append.failed} failing snapshot check(s)`);
+  }
+  // The named observation is not a problem: it says the append probe could not certify the artifact, and the reason
+  // names the container finding that IS reported as one.
+  const futureObservations = result.future_append.observations ?? [];
+  if (futureObservations.length > 0) {
+    lines.push(`future append : ${futureObservations.length} session(s) the append probe cannot certify (${futureObservations[0].code})`);
+    for (const observation of futureObservations.slice(0, 5)) {
+      lines.push(`  - observation ${observation.code} ${observation.file ?? ''}`.trimEnd());
+    }
+  }
   if (result.runtime_verified.checked > 0) lines.push(`runtime check : ${result.runtime_verified.checked - result.runtime_verified.failed}/${result.runtime_verified.checked} passed`);
   lines.push(`result        : ${result.ok ? 'every claim holds' : `${result.problems.length} problem(s)`}`);
   for (const problem of result.problems.slice(0, 12)) lines.push(`  - ${problem.code} ${problem.file ?? ''} ${problem.detail}`.trimEnd());

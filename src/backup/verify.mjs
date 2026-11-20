@@ -79,6 +79,80 @@ function emptyOldCopies() {
   return { checked: 0, ok: 0, failed: 0, missing: 0 };
 }
 
+/** The zeroed `future_append` block (also the shape every early return reports). */
+function emptyFutureAppend() {
+  return {
+    checked: 0,
+    failed: 0,
+    failed_sessions: [],
+    observations: [],
+    unsupported: 0,
+    skipped: 0,
+    skipped_sessions: [],
+    evidence: 'static-prefilter',
+  };
+}
+
+/**
+ * The one-line detail of a failed future-append verdict, split by what the append did.
+ *
+ * A reader must be able to tell "the append broke this log" (`append_codes`) from "this log was already broken, the
+ * append did not change that" (`preexisting_codes`), and -- when the container itself is unreadable -- from the
+ * appended event's own verdict, which is not evidence in that case (`src/backup/future-append.mjs`).
+ *
+ * @param {ReturnType<typeof simulateFutureAppend>} simulation
+ * @returns {string}
+ */
+function futureAppendFailureDetail(simulation) {
+  const append = simulation.append_codes ?? [];
+  const container = simulation.container_codes ?? [];
+  const graph = simulation.graph_codes ?? [];
+  const already = [...container, ...graph];
+  if (append.length > 0) {
+    return `appending one legal event introduces: ${append.join(', ')}${already.length === 0 ? '' : ` (already present: ${already.join(', ')})`}`;
+  }
+  const parts = [];
+  if (container.length > 0) parts.push(`the log is not a readable v4 container before any append: ${container.join(', ')}`);
+  if (container.includes('ZSTD_HEADER_FRAME_INVALID') && Number.isSafeInteger(simulation.detail?.header_frame_rows)) {
+    parts.push(`the first frame carries ${simulation.detail.header_frame_rows} row(s); the installed Harness requires exactly one header line`);
+  }
+  if (graph.length > 0) parts.push(`the event graph is already invalid before the append: ${graph.join(', ')}`);
+  return `${parts.join('; ')} (the appended event itself adds nothing)`;
+}
+
+/** The session id a manifest `rel` belongs to (`sessions/<workspace>/<session>/session.v4.jsonl.zstd`). */
+function sessionOfRel(rel) {
+  const parts = String(rel ?? '').split('/');
+  return parts.length >= 2 ? parts.at(-2) : null;
+}
+
+/** Union `source` into `target`, preserving first-seen order and never repeating a code. */
+function mergeCodes(target, source) {
+  for (const code of source ?? []) if (!target.includes(code)) target.push(code);
+}
+
+/**
+ * Record that one `(sha256, snapshot)` pair is evidence for a per-session record (`observation` or `failure`).
+ *
+ * A session can appear in many snapshots and, if it was active, with different bytes in each. The record is keyed by
+ * the session, so the versions are what keeps the evidence complete: `versions[]` names every distinct content once,
+ * with the snapshots that hold it, while `snapshot_ids` keeps the flat list for a report.
+ *
+ * @param {{versions: object[], snapshot_ids: string[]}} record
+ * @param {{sha256: string, snapshot_id: string, reason?: string|null}} version
+ * @returns {object} the version record that now holds this snapshot
+ */
+function noteVersion(record, version) {
+  if (!record.snapshot_ids.includes(version.snapshot_id)) record.snapshot_ids.push(version.snapshot_id);
+  let entry = record.versions.find((candidate) => candidate.sha256 === version.sha256);
+  if (entry === undefined) {
+    entry = { sha256: version.sha256, snapshot_ids: [], reason: version.reason ?? null };
+    record.versions.push(entry);
+  }
+  if (!entry.snapshot_ids.includes(version.snapshot_id)) entry.snapshot_ids.push(version.snapshot_id);
+  return entry;
+}
+
 /**
  * Check one old record's sealed whole-file copy, if it has one.
  *
@@ -230,16 +304,30 @@ function verifyOldFullCopyChunked(input) {
 /**
  * Append one legal event to a session log, in memory, and validate the result.
  *
- * The event is not written anywhere. `turn/start` with the next dense seq is the weakest legal append: it changes no
- * surface state and carries no references, so a failure here means the log's own invariants (header frame, dense
- * seqs, protected head, surface ops) are wrong -- exactly what the next real append would trip over.
+ * The event is not written anywhere. `permission/preset` with the next dense seq is the weakest legal append: it
+ * changes no surface state and carries no references, so a failure in `append_codes` means the *append* broke the
+ * log -- exactly what the next real append would trip over. Failures that predate the append are returned separately
+ * (`preexisting_codes`), and an artifact whose container the installed Harness refuses is marked with the named
+ * observation `BACKUP_FUTURE_APPEND_UNSUPPORTED` instead of being quoted as append evidence (see
+ * `src/backup/future-append.mjs`).
  *
  * @param {Buffer} buffer
- * @returns {{ok: boolean, codes: string[], detail: object|null}}
+ * @returns {{ok: boolean, codes: string[], append_codes: string[], preexisting_codes: string[],
+ *   container_codes: string[], graph_codes: string[], observation: {code: string, reason: string}|null,
+ *   detail: object|null}}
  */
 export function simulateFutureAppend(buffer) {
   const verdict = futureAppendVerdict(buffer);
-  return { ok: verdict.ok === true, codes: verdict.codes, detail: verdict.detail };
+  return {
+    ok: verdict.ok === true,
+    codes: verdict.codes,
+    append_codes: verdict.append_codes ?? [],
+    preexisting_codes: verdict.preexisting_codes ?? [],
+    container_codes: verdict.container_codes ?? [],
+    graph_codes: verdict.graph_codes ?? [],
+    observation: verdict.observation ?? null,
+    detail: verdict.detail ?? null,
+  };
 }
 
 /** Resolve a byte-limit option: a non-negative integer wins, absent means the module default. */
@@ -403,7 +491,8 @@ export function buildCoverage(input) {
  *   counts: {snapshots: number, files: number, blocks: number, bytes: number, old: number, current: number},
  *   problems: Array<{code: string, file: string|null, snapshot_id: string|null, detail: string}>,
  *   snapshots: Array<{snapshot_id: string, files: number, blocks: number, bytes: number, ok: boolean, problems: number}>,
- *   future_append: {checked: number, failed: number},
+ *   future_append: {checked: number, failed: number, failed_sessions: object[], observations: object[],
+ *     unsupported: number},
  *   runtime_verified: {checked: number, failed: number},
  *   old_copies: {checked: number, ok: number, failed: number, missing: number},
  * }}
@@ -425,14 +514,20 @@ export function verifyRepo(input) {
       counts,
       problems: [{ code: heapPolicy.reason_code, file: null, snapshot_id: null, detail: heapPolicy.detail }],
       snapshots,
-      future_append: { checked: 0, failed: 0, evidence: 'static-prefilter' },
+      future_append: emptyFutureAppend(),
       runtime_verified: { checked: 0, failed: 0, evidence: 'installed-harness' },
       old_copies: emptyOldCopies(),
     };
   }
   const maxHeapBytes = heapPolicy.maxHeapBytes;
   const memoryReport = createMemoryGuardReport();
-  const futureAppend = { checked: 0, failed: 0, skipped: 0, skipped_sessions: [], evidence: 'static-prefilter' };
+  const futureAppend = emptyFutureAppend();
+  // One finding per **session**, not per snapshot: the same session appears in every later snapshot (and an active
+  // one appears with different bytes), and repeating the same conclusion once per snapshot is noise (the 2026-11-20
+  // drill saw one session reported twice). The versions that failed are kept inside the finding, so deduplicating the
+  // report never drops evidence. Verdicts are cached by content because diagnosing the same bytes twice is pure cost.
+  const futureFindings = new Map();
+  const futureVerdicts = new Map();
   const runtimeChecked = { checked: 0, failed: 0, skipped: 0, skipped_sessions: [], evidence: 'installed-harness', snapshots: 0 };
   const oldCopies = emptyOldCopies();
   // v3.5.1: entries at or above the threshold are digest-checked block-by-block (streaming.peak_block_bytes is
@@ -576,13 +671,107 @@ export function verifyRepo(input) {
         continue;
       }
       if (entry.kind === 'session' && input.futureAppend !== false) {
-        const simulation = simulateFutureAppend(rebuilt.buffer);
+        // One simulation per distinct content: a session that did not change between snapshots is the same bytes,
+        // and diagnosing the same multi-megabyte log once per snapshot is pure cost. `checked` still counts every
+        // occurrence, because that is the work the report claims was done on each snapshot.
+        let simulation = futureVerdicts.get(entry.sha256);
+        if (simulation === undefined) {
+          simulation = simulateFutureAppend(rebuilt.buffer);
+          futureVerdicts.set(entry.sha256, simulation);
+        }
         futureAppend.checked += 1;
+        let finding = futureFindings.get(entry.rel);
+        if (finding === undefined) {
+          finding = { problem: null, failure: null, observation: null };
+          futureFindings.set(entry.rel, finding);
+        }
+        // The named observation is about the PROBE, not about the log: an artifact whose container the installed
+        // Harness refuses has no legal next append to simulate, so the simulation must not be quoted as evidence.
+        // It is surfaced once per **session**, not once per snapshot or per version, and it is not a problem by
+        // itself -- the container defect that causes it is reported as a problem below.
+        if (simulation.observation !== null) {
+          if (finding.observation === null) {
+            finding.observation = {
+              code: simulation.observation.code,
+              file: entry.rel,
+              session: sessionOfRel(entry.rel),
+              reason: simulation.observation.reason,
+              versions: [],
+              snapshot_ids: [],
+            };
+            futureAppend.unsupported += 1;
+            futureAppend.observations.push(finding.observation);
+          }
+          noteVersion(finding.observation, { sha256: entry.sha256, snapshot_id: row.snapshot_id, reason: simulation.observation.reason });
+        }
         if (simulation.ok !== true) {
-          futureAppend.failed += 1;
           summary.ok = false;
           summary.problems += 1;
-          problems.push({ code: VERIFY_CODES.FUTURE_APPEND_FAILED, file: entry.rel, snapshot_id: row.snapshot_id, detail: `appending one legal event fails: ${simulation.codes.join(', ')}` });
+          futureAppend.failed += 1;
+          if (finding.problem === null) {
+            finding.problem = {
+              code: VERIFY_CODES.FUTURE_APPEND_FAILED,
+              file: entry.rel,
+              snapshot_id: row.snapshot_id,
+              detail: futureAppendFailureDetail(simulation),
+              snapshot_ids: [],
+              sha256s: [],
+              occurrences: 0,
+            };
+            problems.push(finding.problem);
+            finding.failure = {
+              rel: entry.rel,
+              session: sessionOfRel(entry.rel),
+              codes: [],
+              append_codes: [],
+              container_codes: [],
+              graph_codes: [],
+              versions: [],
+              snapshot_ids: [],
+              detail: null,
+              occurrences: 0,
+            };
+            futureAppend.failed_sessions.push(finding.failure);
+          }
+          const failure = finding.failure;
+          const problem = finding.problem;
+          failure.occurrences += 1;
+          problem.occurrences += 1;
+          mergeCodes(failure.codes, simulation.codes);
+          mergeCodes(failure.append_codes, simulation.append_codes);
+          mergeCodes(failure.container_codes, simulation.container_codes);
+          mergeCodes(failure.graph_codes, simulation.graph_codes);
+          if (!failure.snapshot_ids.includes(row.snapshot_id)) failure.snapshot_ids.push(row.snapshot_id);
+          if (!problem.snapshot_ids.includes(row.snapshot_id)) problem.snapshot_ids.push(row.snapshot_id);
+          if (!problem.sha256s.includes(entry.sha256)) problem.sha256s.push(entry.sha256);
+          let version = failure.versions.find((candidate) => candidate.sha256 === entry.sha256);
+          if (version === undefined) {
+            version = {
+              sha256: entry.sha256,
+              snapshot_ids: [],
+              codes: [...(simulation.codes ?? [])],
+              append_codes: [...(simulation.append_codes ?? [])],
+              container_codes: [...(simulation.container_codes ?? [])],
+              graph_codes: [...(simulation.graph_codes ?? [])],
+              header_frame_rows: simulation.detail?.header_frame_rows ?? null,
+              detail: futureAppendFailureDetail(simulation),
+            };
+            failure.versions.push(version);
+          }
+          if (!version.snapshot_ids.includes(row.snapshot_id)) version.snapshot_ids.push(row.snapshot_id);
+          // One problem per session, recomputed from the union of every failing version: a reader sees the first
+          // version's message, and -- when a *different* version of the same session failed too -- how many and where
+          // to find them. The per-version detail lives in `future_append.failed_sessions`.
+          const base = futureAppendFailureDetail({
+            append_codes: failure.append_codes,
+            container_codes: failure.container_codes,
+            graph_codes: failure.graph_codes,
+            detail: { header_frame_rows: failure.versions[0].header_frame_rows },
+          });
+          failure.detail = base;
+          problem.detail = failure.versions.length > 1
+            ? `${base} (${failure.versions.length} different version(s) of this session failed across ${failure.snapshot_ids.length} snapshot(s); see future_append.failed_sessions)`
+            : base;
         }
       }
     }

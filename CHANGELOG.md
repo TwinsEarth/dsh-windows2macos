@@ -4,6 +4,22 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### fix(backup): future-append 真实日志误报——容器层发现 + 按会话去重（未发布）
+
+- 真机演练发现 verify 对真实会话 `session-9603c5c8…` 报 `BACKUP_FUTURE_APPEND_FAILED`。根因不是追加模拟器：
+  该日志**首帧含 93 行**（header 与事件同帧），而安装版 DSH 客户端 `assertZstdHeaderFrame` 要求首帧恰好一行 header
+  ——该日志 Container 本身不被客户端接受（394 个真实日志中唯一一例，疑似早期 retro 恢复产物）。因此**不放松为 ok**，
+  而是把"形状不支持"与"真实损坏"分开：新增 `BACKUP_FUTURE_APPEND_UNSUPPORTED` 具名 observation，保留真实容器码。
+- `future-append.mjs`：`readLogContainer` 解析全部行、`lastEventSeq` 取真实最大 seq、`appendLegalEvent` 用 `lastSeq+1`；
+  `futureAppendVerdict` 拆 `append_codes/graph_codes/container_codes`。
+- `verify.mjs`：按会话 rel 去重（同一会话在 N 个快照只报 1 个 problem + 1 个 observation，附 `occurrences/snapshot_ids/sha256s`），
+  避免 N 倍噪音；CLI 人类输出区分"不同会话数/失败检查数"并列出 observations。
+- `session-validate.mjs`：新增 opt-in `includeHeaderFrameEvents`（默认行为不变，doctor 仍按原四码报告）。
+- 新 `test/backup-future-append.test.mjs`（10 例）：先断言严格 doctor 的四码失败模式，再断言修复后的 verdict；
+  plain/仅 header 批量形状必须通过；真实 seq gap、迟到 `system/message`、真实悬空引用仍必须失败；同字节/增长为两版本的两种去重。
+- `docs/BACKUP-DESIGN.md` §19.4：三层发现、语义表与边界（含"修好此日志需重新分帧 frame 0，属 fix 工具工作而非放松门禁"）。
+- 验证：30 个 backup 套件 621/621；新套件 10/10；eslint 0 error；layer/mojibake clean。
+
 ### P2-F4：故障场景并入真实进程回归（phase2 11/11、mixed 7/7）（未发布）
 
 - `scripts/verify-relay-cluster-phase2.mjs` 新增两查（真实 relay 子进程 + 真实 HTTP）：重复 dispatch 的既定语义

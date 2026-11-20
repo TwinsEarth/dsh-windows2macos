@@ -139,8 +139,23 @@ export function splitFrames(buf) {
 /**
  * Diagnose one log file.
  *
+ * `includeHeaderFrameEvents` exists because reading a log has two defensible readings, and they disagree about what
+ * the rows *inside the header frame* are:
+ *
+ * - the **strict** one (default) treats that frame as the header and nothing else, so its extra rows are not events.
+ *   That is right when the question is "is this container the one the installed Harness writes?" -- the Harness's
+ *   own `assertZstdHeaderFrame` requires exactly one header line, so such an artifact is refused before any event is
+ *   read and the other findings about it would only be noise;
+ * - the **append pre-filter** (`src/backup/future-append.mjs`) asks a different question: "is the event graph legal,
+ *   so that the next append will be read?". There the rows are durable events (the runtime validator decodes them
+ *   exactly like any other frame's rows), and dropping them manufactures a `SEQ_GAP` at 0, a `PROTECTED_HEAD_MISSING`
+ *   for a head that IS first, and `SEQ_REF_DANGLING` for references that DO resolve.
+ *
+ * The rule itself is unchanged in both readings: a first frame that carries more than the header line is still
+ * `ZSTD_HEADER_FRAME_INVALID`. Only the event list (and therefore the seq/surface/ref rules) differs.
+ *
  * @param {string} file
- * @param {{expectedSessionId?: string|null}} [options]
+ * @param {{expectedSessionId?: string|null, includeHeaderFrameEvents?: boolean}} [options]
  * @returns {{ok: boolean, file: string, codes: string[], detail: object, events: number}}
  */
 export function diagnoseBuffer(buffer, options = {}) {
@@ -179,11 +194,18 @@ export function diagnoseBuffer(buffer, options = {}) {
     detail.session_id = details(header.id);
   }
 
-  // Events after the header frame, in file order.
+  // Events after the header frame, in file order. With `includeHeaderFrameEvents`, rows that share the first frame
+  // with the header are events too (they are not when the reader's only question is the container's shape -- see
+  // the option's documentation above). The header row itself is never an event.
   const events = [];
   for (const [frameIndex, frame] of frames.entries()) {
-    if (frameIndex === 0) continue;
-    for (const event of frame.events) events.push(event);
+    for (const event of frame.events) {
+      if (frameIndex === 0) {
+        if (options.includeHeaderFrameEvents !== true) continue;
+        if (event?.type === 'session') continue;
+      }
+      events.push(event);
+    }
   }
   detail.events = events.length;
 
@@ -411,9 +433,13 @@ export function diagnoseSessionFile(file, options = {}) {
  * to validate would be a second I/O path with its own failure modes.
  *
  * @param {Buffer} buffer
- * @param {{expectedSessionId?: string|null}} [options]
+ * @param {{expectedSessionId?: string|null, includeHeaderFrameEvents?: boolean}} [options]
  * @returns {object}
  */
 export function diagnoseSessionBuffer(buffer, options = {}) {
-  return diagnoseBuffer(buffer, { expectedSessionId: options.expectedSessionId ?? null, file: null });
+  return diagnoseBuffer(buffer, {
+    expectedSessionId: options.expectedSessionId ?? null,
+    includeHeaderFrameEvents: options.includeHeaderFrameEvents === true,
+    file: null,
+  });
 }
