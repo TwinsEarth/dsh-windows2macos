@@ -41,7 +41,7 @@ src/plugin/tools/governance.mjs      # approvals/council（joint_plan/joint_stat
 - **工具快照测试**：先用当前实现导出 16 个工具的 `{name, description, parameters}` 快照（`test/tools-surface.test.mjs`），
   重构期间每次切片跑它；任何字段变化都会失败。
 - 切片顺序：shared → fleet → memory → governance → dispatch（最后动 run/wait，因为测试最多）。
-- **S2/S3 交付记录（2026-11-19，未提交）**：`tools.mjs` 8,909 → 610 行；新增 `shared.mjs` 3,356、
+- **S2/S3 交付记录（已提交 `c173981`）**：`tools.mjs` 8,909 → 610 行；新增 `shared.mjs` 3,356、
   `dispatch.mjs` 2,239、`memory.mjs` 1,385、`fleet.mjs` 1,043、`governance.mjs` 413 行。每个工具改为
   `register<Name>(ctx, deps)` 工厂（`deps` = 它原先闭包引用的 apply 局部量），`apply()` 按历史顺序依次调用
   （joint ×2 位置不变，然后 devices→run→wait→report→status→update→history→stats→memory→approvals→chat→intent→
@@ -111,15 +111,15 @@ src/plugin/backup-worker.mjs         # 插件侧：spawn/复用、resourceLimits
 
 | # | 切片 | 产出 | 验收 |
 |---|---|---|---|
-| S1 | 工具面快照 + `tools/shared.mjs` | 基线快照测试；无行为改动 | pre-flight 绿；16 工具快照不变 |
-| S2 | `tools/fleet.mjs` + `tools/memory.mjs` | apply 减 ~800 行 | 快照 + `test/tools*.test.mjs` — ✅ **已完成（2026-11-19，未提交）**：`tools/{shared,fleet,memory}.mjs` 落地，apply 4,243 → 2,313 行；快照摘要不变，`tools*` 233/233 全绿 |
-| S3 | `tools/governance.mjs` + `tools/dispatch.mjs` | apply 降到 ~350 行 | 同上 + `test/agent*.test.mjs`（dispatch 走 agent） — ✅ **已完成（2026-11-19，未提交）**：apply 4,243 → 450 行，`tools.mjs` 610 行；16 个工具全部搬入 4 个域模块、注册顺序逐字节保持；快照摘要不变，工具套件 233/233 + 广度回归 304/304 全绿 |
+| S1 ✅ | 工具面快照 + `tools/shared.mjs` | **已实现**：`test/tools-surface.test.mjs`（18 工具、注册顺序无关的规范 JSON 摘要 `409a6652…a82f5a`） | 快照套件绿；后续 tools 切片的机械性证明 |
+| S2 | `tools/fleet.mjs` + `tools/memory.mjs` | apply 减 ~800 行 | 快照 + `test/tools*.test.mjs` — ✅ **已完成（已提交 `c173981`）**：`tools/{shared,fleet,memory}.mjs` 落地，apply 4,243 → 2,313 行；快照摘要不变，`tools*` 233/233 全绿 |
+| S3 | `tools/governance.mjs` + `tools/dispatch.mjs` | apply 降到 ~350 行 | 同上 + `test/agent*.test.mjs`（dispatch 走 agent） — ✅ **已完成（已提交 `c173981`）**：apply 4,243 → 450 行，`tools.mjs` 610 行；16 个工具全部搬入 4 个域模块、注册顺序逐字节保持；快照摘要不变，工具套件 233/233 + 广度回归 304/304 全绿 |
 | S4 ✅ | `agent/lifecycle/*` 四阶段 | **已实现**：agent.mjs 4,770 → 638 行（createAgent 365）；lifecycle/{shared,deliver,execute,offer,heartbeat} = 1,170/1,470/554/567/926；导出面 45 项一致、4,470/4,690 行逐字节一致 | 基线 568/566/0/2 不变；agent*+p2p-* 441/438/0/3；广回归 164/164；lint/layer/mojibake clean |
 | S5 ✅ | `relay/state/*` 纯函数 → 方法搬移 | **已实现**：state.mjs 3,713 → 1,174 行；state/{shared,members,tasks,leases,results,events}=348/763/1,019/487/97/61；42 导出与 100 个 prototype 名一致；`.gitignore` 修正 `state/` 规则误忽略源码 | relay 517/516/0/1 不变；真实进程 phase2 **9/9** + mixed **6/6**；lint/layer/mojibake clean |
 | S6 ✅ | client.js 文件内分解（settings） | **结论修正**：所谓 3,454 行的 `UpdateSettingsSection` 实际只有 **63 行**，是 C1 预算计量器（只认列 0 `function`、把后续并列组件全算进上一个函数）的误报。已重写计量器（花括号匹配/注释字符串屏蔽/嵌套跳过/非空守卫）、预算单函数上限 3,600→**1,200**（真实最大 `BackupPanelView` 832），`renderChatText` 提取到模块作用域 | client-bundle 112/112、真实页面 143/143、eslint 0 |
 | S7 ✅ | client.js 文件内分解（chat-text） | `renderChatText`(10 行) + `CHAT_COMMANDS/STICKER_GLYPHS/STICKER_RE/EMOJIS` 提到模块作用域（逐字节等价），`FleetChat` 351→335；文件 593,045→593,540 B（仍在预算内） | 同上 |
-| S8 | `engine-worker.mjs` + 插件接线 + 回退 | 引擎默认 worker | ✅ **已实现（3.6，2026-11-19，未提交）**：`test/backup-worker.test.mjs` 12/12 通过——真 Worker 成功且结果与 inline 等价（`files`/`counts` 一致、对齐随机 `snapshot_id` 后 manifest digest 相同）、真 Worker verify、进度阶段顺序、`resourceLimits.maxOldGenerationSizeMb=1024`、进度文件 schema/结束删除/无凭据、`scopes.mjs` 把 `xclient/w2m-backup/worker.json` 按 self-copy 跳过（扫描不捕获自身进度文件；`state.json` 仍在 scope 内）、`BACKUP_WORKER_OOM`（错误事件与退出码 134）、`BACKUP_WORKER_TIMEOUT`、其他崩溃 `BACKUP_WORKER_FAILED`、spawn 抛错与 `W2M_BACKUP_INLINE=1` 回退 inline、`deps.backupRunner` 插件接线（run/定时/verify 路线 + `engine_mode` + 具名失败不抛）、`backupWorkerTimeoutMs` 默认 30 分钟。回归 `backup-run`/`backup-engine`/`backup-verify`/`backup-memory`/`backup-wiring` 全绿（全部 backup-* 套件 569/569）。设计见 `docs/BACKUP-DESIGN.md` §27.8。真机 RSS 曲线延后（本切片不触真实 profile） |
-| S9 | 文档收尾 + 审计更新 | **进行中**：AUDIT §6.2 风险表已按实测更新（巨型入口结论修正、worker_threads 已交付、client 预算计量修正）；真机 RSS 曲线待用户授权在真实 profile 安装新构建后跑一次备份 | pre-flight 绿 |
+| S8 | `engine-worker.mjs` + 插件接线 + 回退 | 引擎默认 worker | ✅ **已实现（已提交 `c173981`）**：`test/backup-worker.test.mjs` 12/12 通过——真 Worker 成功且结果与 inline 等价（`files`/`counts` 一致、对齐随机 `snapshot_id` 后 manifest digest 相同）、真 Worker verify、进度阶段顺序、`resourceLimits.maxOldGenerationSizeMb=1024`、进度文件 schema/结束删除/无凭据、`scopes.mjs` 把 `xclient/w2m-backup/worker.json` 按 self-copy 跳过（扫描不捕获自身进度文件；`state.json` 仍在 scope 内）、`BACKUP_WORKER_OOM`（错误事件与退出码 134）、`BACKUP_WORKER_TIMEOUT`、其他崩溃 `BACKUP_WORKER_FAILED`、spawn 抛错与 `W2M_BACKUP_INLINE=1` 回退 inline、`deps.backupRunner` 插件接线（run/定时/verify 路线 + `engine_mode` + 具名失败不抛）、`backupWorkerTimeoutMs` 默认 30 分钟。回归 `backup-run`/`backup-engine`/`backup-verify`/`backup-memory`/`backup-wiring` 全绿（全部 backup-* 套件 569/569）。设计见 `docs/BACKUP-DESIGN.md` §27.8。真机 RSS 曲线延后（本切片不触真实 profile） |
+| S9 ✅ | 文档收尾 + 审计更新 | **已完成（本次提交）**：AUDIT §0 结论 5/10、§6.2 风险表、§6.3 建议、附录 D（3.5.3 进展）全部按实测更新；本计划 S1–S8 状态全部改为"已提交"并附提交号 | pre-flight 绿；仅剩**真机 RSS 曲线**待用户授权（真实 profile 安装 3.5.3 后跑一次备份并采样） |
 
 **发布纪律**：每片只提交（本地），不 push/tag/publish；版本号在切片期间保持 3.5.2，等用户授权发布时统一 bump。
 

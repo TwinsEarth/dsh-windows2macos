@@ -18,14 +18,14 @@
 4. **备份子系统是当前质量最高的部分**：协议冻结（manifest v1 + AAD 身份字符串）、六 scope、覆盖率报告、
    G4 重编号、G5 运行时终审、P0–P3 扩围、3.5.1 内存有界化，全部有测试与真机证据链（`docs/acceptance`）。
 5. **3.5.0 的 OOM 事故暴露了"mount 即可执行重活"的架构风险**：3.5.1 已把 mount 惰性化（`backupCatchUpOnStart=false`）
-   并加了内存守卫；**仍未做**的是把引擎迁到 worker_threads（运行期间 GUI 可能变慢）。
+   并加了内存守卫；**3.5.3 已交付** worker_threads 化的备份引擎（S8：`engine-worker.mjs` + 插件侧调度、`resourceLimits` 1024 MiB、具名 `BACKUP_WORKER_OOM/TIMEOUT/FAILED`、inline 回退；CLI 仍 inline）。
 6. **测试规模 318 个测试文件（307 个 .test.mjs）/ 约 9.6 万行**，pre-flight 16 项门禁；最近一次 3.5.2 发版前 **4314 tests / 4292 pass / 0 fail / 22 skip**。
 7. **发布纪律已成文**：`E:\GPT\w2m\AGENTS.md` 2026-11-19 条目规定未经明确要求不得主动发布，只提示"准备完毕"。
 8. **安全边界**：仓库密码/DPAPI 信封、浏览器不接收密码、P2P 设备密钥、GPW 文件夹门禁、relay 操作员 token——
    但**凭据备份默认关闭**是刻意选择（P1 开关），开启即"仓库=身份"。
 9. **跨项目边界清楚**：与 dsh-fang/dsh-master 只经 `@twinsearth/dsh-fang-contract` 契约 SDK 互联（local→http→file→legacy 兜底），
    无源码互相 import；`src/decision-center` 含第三方版权头，属跨项目贡献代码。
-10. **主要风险**：巨型入口文件、P2P/relay 并发路径单测覆盖有限、`lib/client.js` 单文件过大、备份运行仍同步、
+10. **主要风险**：巨型入口文件、P2P/relay 并发路径单测覆盖有限、`lib/client.js` 单文件过大、备份引擎已迁 worker_threads（CLI 仍 inline）、
    以及 `old/ .enc` 仍整文件解密（有 512 MiB + 守卫但非流式）。
 
 ---
@@ -940,12 +940,28 @@ flowchart LR
 ### 6.3 建议的下一步（与当前路线一致）
 
 1. 3.5.2 staged 批准后核对 npm；真实 profile 从 3.5.1 tarball 切到 registry 版本（用户授权后）。
-2. 3.6：worker_threads 化备份引擎 + 运行进度推送；`old/ .enc` 流式校验。
-3. 拆分 `lib/client.js` 为多客户端插件；tools.mjs 按域拆分。
-4. 补 P2P/relay 故障注入测试；把"备份运行期间 GUI 响应"纳入性能验收指标。
+2. 已完成：worker_threads 化备份引擎 + 具名失败/回退（3.5.3，S8）；剩余：`old/ .enc` 分块封存 v2 与流式校验（P2-O）、运行进度推送细化。
+3. 已完成：tools.mjs 按域拆分（S2/S3），client.js 保持单 bundle 但已文件内分解（S6/S7）+ 体积预算守卫（C1）；剩余：多客户端模块可行性（P2-C4）。
+4. 已完成：P2P/relay 故障注入矩阵与 P2P 重复投递修复（P2-F，F1–F3）；剩余：把故障场景并入真实进程回归（F4），以及把"备份运行期间 GUI 响应"纳入性能验收（真机 RSS 曲线）。
 
 ---
 
+## 附录 D：3.5.3 进展补充（2026-11-20）
+
+> 本文评估基线是 3.5.2；以下为随后 3.5.3 已交付的内容，代替散落在正文中的旧结论。
+
+| 项 | 3.5.2 评估 | 3.5.3 现状 |
+|---|---|---|
+| P1 巨型入口（tools/agent/relay） | 待重构 | ✅ S2/S3（`tools.mjs` 8,909→611 行）、S4（`agent.mjs` 4,770→638）、S5（`state.mjs` 3,713→1,174）；工具面/导出面摘要不变 |
+| 备份引擎同步 | 未做 | ✅ S8 worker_threads（`engine-worker.mjs` + `backup-worker.mjs`；resourceLimits 1024 MiB、具名 OOM/TIMEOUT/FAILED、inline 回退；CLI inline）；合成宿主实测 inline 0 次事件循环 tick → worker 12 次/最大间隔 19.3 ms |
+| client bundle 过大 | 9,965 行/594 KB | S6/S7 文件内分解 + C1 体积预算守卫（字节/行数/单函数上限）；真实最大函数 `BackupPanelView` 832 行；文件 ~593 KB 仍受预算约束 |
+| 队列日志在 DSH 更新后消失 | 未覆盖 | ✅ 槽位化（`conversation.input.left` + `shell.overlay`）+ `sidebar.panellist` 降级入口 + `window.__W2M_QUEUE_JOURNAL__` 诊断 + 真实页面回归 + `docs/QUEUE-JOURNAL-COMPAT.md`（`4fa936c`） |
+| P2P 重复投递 | 未发现 | ✅ P2-F 故障注入矩阵发现并修复（完成后重复包二次投递 / incoming 永不清理），p2p 回归 115/115 |
+| SSE 缓存重投抖动 | 未覆盖 | ✅ `fc66551`：SSE「等头」超时不再连带 abort 响应体 |
+| 决策中心可读性 | 审计未列 | ✅ `d460aff`：会话名替代裸 ID + 选项口语化（规则/智能双通道） |
+| 发布状态 | — | tag `v3.5.3` 已推送；npm 3.5.3 与 GitHub Release 待用户授权发布；pre-flight GREEN 4406/4382/0/24 |
+
+**仍待做**：P2-O（`old/ .enc` 分块封存 v2 + 流式 verify/restore）、P2-F4（故障场景并入真实进程 mixed-version）、P2-C4（多客户端模块可行性）、S9 真机 RSS 曲线（需真实 profile 安装 3.5.3 后执行）。
 ## 附录 A：数据与方法
 
 - 清点脚本：`E:\GPT\.tmp\w2m-inventory.mjs` → `E:\GPT\.tmp\w2m-inventory.json`（902 文件；LOC 按行分割计）。
