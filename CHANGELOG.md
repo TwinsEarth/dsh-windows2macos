@@ -4,6 +4,16 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### P2-F4：故障场景并入真实进程回归（phase2 11/11、mixed 7/7）（未发布）
+
+- `scripts/verify-relay-cluster-phase2.mjs` 新增两查（真实 relay 子进程 + 真实 HTTP）：重复 dispatch 的既定语义
+  （每次一个新 task、各自一个 lease、均可独立读取）；重复 result 去重（首次 deduped=false、重复 deduped=true）且
+  去重索引在 SIGKILL 重启后仍生效（重启后重投仍 deduped=true）。9/9 → **11/11**。
+- `scripts/verify-relay-cluster-mixed.mjs` 新增一查：滚动升级后（一个 relay 3.1.0、另一个仍 3.0.0）在升级后的 relay 上
+  dispatch + 重复 result 去重成功；6/6 → **7/7**。
+- 脚本头注明分层：socket 级丢包/乱序/重复由 `test/p2p-fault.test.mjs`（F2）确定性覆盖；租约竞争/时钟边界由
+  `test/relay-concurrency.test.mjs`（F3）覆盖；本脚本覆盖"真实进程 + 真实 HTTP + SIGKILL 重启"这一层。
+
 ### P2-O3/O4：chunked-v2 恢复流式读与 rotation 默认写 v2（未发布）
 
 - **O3 恢复**：`old-restore` 按文件自身 magic 判定格式；v1 路径逐字节不变，v2 流式解密到目标同目录临时文件 → fsync →

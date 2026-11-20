@@ -21,7 +21,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const RELAY = join(repoRoot, 'bin', 'w2m-rabbit.mjs');
@@ -31,6 +31,9 @@ const DEVICE_TOKEN = 'token-phase2-b1';
 const DEVICE_ID = 'm-b1';
 const SESSION_ID = 'verify-chat-session';
 const PROJECT_ID = 'prj-verify';
+// F4: dispatch needs the operator credential; the fault scenarios below are the real-process half of
+// `test/p2p-fault.test.mjs` / `test/relay-concurrency.test.mjs` (which cover sockets and clock races in-process).
+const OPERATOR_TOKEN = 'verify-f4-operator';
 
 const results = [];
 function check(name, fn) {
@@ -69,6 +72,8 @@ function startRelay({ nodeId, port, stateDir, peers }) {
     W2M_RELAY_CHAT_SYNC_BOOT_MIN_MS: '800',
     W2M_RELAY_CHAT_SYNC_BOOT_MAX_MS: '1500',
     W2M_RELAY_SYNC_CHUNK_BYTES: '262144',
+    // F4: allow POST /v1/task in this harness (dispatch is the operator's act, not a device's).
+    W2M_OPERATOR_TOKEN: OPERATOR_TOKEN,
   };
   const child = spawn(process.execPath, [RELAY, '--port', String(port), '--json', '--state', stateDir], {
     cwd: repoRoot,
@@ -321,6 +326,132 @@ try {
       }
     }
     return '401 on chat/projects routes for 3/3 relays';
+  });
+
+  /**
+   * Build one §5.1-complete result envelope for a dispatched task.
+   *
+   * The relay ignores `envelope_sha256` (the client signs it; the relay re-derives its own judgement from the
+   * fields), so this object only has to be *complete* and self-consistent. Dispatch is per-call by design
+   * (the relay mints a new ULID each POST); idempotency lives at the result layer via `dedupe_key`, which is
+   * exactly what these checks exercise.
+   */
+  function resultEnvelope(taskId, over = {}) {
+    const empty = createHash('sha256').update('').digest('hex');
+    const stdout = createHash('sha256').update('f4-stdout\n').digest('hex');
+    return {
+      envelope_version: '1.0',
+      task_id: taskId,
+      attempt: 1,
+      dedupe_key: 'dk-f4-' + taskId,
+      machine_id: DEVICE_ID,
+      machine_name: 'verify-machine',
+      platform: { os: 'linux', arch: 'x64' },
+      caps: {},
+      index: 0,
+      index_total: 1,
+      mode: 'replicate',
+      cwd_rel: '.',
+      base_commit: 'c0ffee1',
+      base_tree: 'tree-abc',
+      pre_tree_fingerprint: 'tree-abc',
+      post_tree_fingerprint: 'tree-abc',
+      fingerprint_algo: 'git-temp-index-tree/v1',
+      fingerprint_error: null,
+      head_commit: 'c0ffee1',
+      dirty_before: false,
+      command_argv: [process.execPath, '-e', 'process.stdout.write("f4-duplicate\\n")'],
+      command_hash: 'a'.repeat(64),
+      shell_id: 'direct-exec',
+      started_at: '2026-01-01T00:00:00Z',
+      ended_at: '2026-01-01T00:00:01Z',
+      duration_ms: 5,
+      exit_code: 0,
+      status: 'ok',
+      refusal_reason: null,
+      stdout_sha256: stdout,
+      stdout_bytes: 11,
+      stderr_sha256: empty,
+      stderr_bytes: 0,
+      warnings: [],
+      envelope_sha256: 'ignored-by-the-relay',
+      ...over,
+    };
+  }
+
+  // F4-a: dispatch is per-call (documented), and every dispatch is readable with exactly one lease.
+  await check('F4: two dispatches are two independently readable tasks (dispatch is per-call, not idempotent)', async () => {
+    const body = {
+      mode: 'replicate',
+      command_argv: [process.execPath, '-e', 'process.stdout.write("f4-duplicate\\n")'],
+      cwd_rel: '.',
+      index_total: 1,
+      timeout_ms: 30_000,
+      write: false,
+      base_commit: 'c0ffee1',
+      base_tree: 'tree-abc',
+      compare_policy: { strip_ansi: true, normalize_crlf: true },
+      halt: 'never',
+      created_by: 'verify-f4',
+    };
+    const first = await postJson(`${relays[0].url}/v1/task`, { authorization: `Bearer ${OPERATOR_TOKEN}` }, body);
+    if (first.status !== 200 || typeof first.body?.task_id !== 'string') throw new Error(`first dispatch: ${first.status} ${JSON.stringify(first.body).slice(0, 200)}`);
+    const taskId = first.body.task_id;
+    const second = await postJson(`${relays[0].url}/v1/task`, { authorization: `Bearer ${OPERATOR_TOKEN}` }, body);
+    if (second.status !== 200) throw new Error(`second dispatch status ${second.status}`);
+    if (second.body.task_id === taskId) throw new Error(`dispatch returned the same task_id twice; the contract is per-call (${taskId})`);
+    for (const id of [taskId, second.body.task_id]) {
+      const read = await getJson(`${relays[0].url}/v1/tasks/${encodeURIComponent(id)}`, { authorization: `Bearer ${DEVICE_TOKEN}` });
+      if (read.status !== 200) throw new Error(`task ${id} read status ${read.status}`);
+      const leases = read.body.task?.leases ?? [];
+      if (leases.length !== 1) throw new Error(`task ${id}: expected exactly one lease, got ${JSON.stringify(leases).slice(0, 160)}`);
+    }
+    return `two dispatches -> ${taskId} + ${second.body.task_id}, one lease each`;
+  });
+
+  // F4-b: result redelivery is idempotent, and that dedupe survives a relay restart.
+  await check('F4: duplicate result deduped, and the dedupe index survives a relay restart', async () => {
+    const created = await postJson(`${relays[0].url}/v1/task`, { authorization: `Bearer ${OPERATOR_TOKEN}` }, {
+      mode: 'replicate',
+      command_argv: [process.execPath, '-e', 'process.stdout.write("f4-duplicate\\n")'],
+      cwd_rel: '.',
+      index_total: 1,
+      timeout_ms: 30_000,
+      write: false,
+      base_commit: 'c0ffee1',
+      base_tree: 'tree-abc',
+      compare_policy: { strip_ansi: true, normalize_crlf: true },
+      halt: 'never',
+      created_by: 'verify-f4',
+    });
+    if (created.status !== 200 || typeof created.body?.task_id !== 'string') throw new Error(`dispatch before result: ${created.status}`);
+    const taskId = created.body.task_id;
+    const env = resultEnvelope(taskId);
+    const first = await postJson(`${relays[0].url}/v1/result`, { authorization: `Bearer ${DEVICE_TOKEN}` }, env);
+    if (first.status !== 200) throw new Error(`first result: ${first.status} ${JSON.stringify(first.body).slice(0, 220)}`);
+    if (first.body.deduped !== false) throw new Error(`first result deduped=${JSON.stringify(first.body.deduped)}; expected false`);
+    const repeat = await postJson(`${relays[0].url}/v1/result`, { authorization: `Bearer ${DEVICE_TOKEN}` }, env);
+    if (repeat.status !== 200) throw new Error(`repeat result: ${repeat.status}`);
+    if (repeat.body.deduped !== true) throw new Error(`repeat result deduped=${JSON.stringify(repeat.body.deduped)}; expected true`);
+
+    const restartedOld = relays[0];
+    restartedOld.child.kill('SIGKILL');
+    await new Promise((resolveExit) => restartedOld.child.once('exit', resolveExit));
+    await sleep(300);
+    const relay = startRelay({ nodeId: NODE.a, port: ports.a, stateDir: dirs.a, peers: peersOf('a', ['b', 'c']) });
+    relays[0] = relay;
+    await waitFor(async () => /"event":"listening"/.test(relay.log.stdout), { timeoutMs: 20_000, label: 'relay A restarted for F4' });
+    await waitFor(async () => {
+      const { status } = await getJson(`${relay.url}/healthz`).catch(() => ({ status: 0 }));
+      return status === 200;
+    }, { timeoutMs: 20_000, label: 'relay A healthz after F4 restart' });
+
+    const afterRestart = await postJson(`${relay.url}/v1/result`, { authorization: `Bearer ${DEVICE_TOKEN}` }, env);
+    if (afterRestart.status !== 200) throw new Error(`post-restart result: ${afterRestart.status}`);
+    if (afterRestart.body.deduped !== true) throw new Error(`post-restart result deduped=${JSON.stringify(afterRestart.body.deduped)}; the dedupe index did not survive the restart`);
+    const task = await getJson(`${relay.url}/v1/tasks/${encodeURIComponent(taskId)}`, { authorization: `Bearer ${DEVICE_TOKEN}` });
+    if (task.status !== 200) throw new Error(`post-restart task read: ${task.status}`);
+    return `task ${taskId}: duplicate result deduped before and after restart`;
   });
 
   console.log('  --- failure diagnostics (only printed on failure) ---');

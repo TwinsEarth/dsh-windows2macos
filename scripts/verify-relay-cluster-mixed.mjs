@@ -21,7 +21,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from 'node:
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const NEW_RELAY = join(repoRoot, 'bin', 'w2m-rabbit.mjs');
@@ -30,6 +30,8 @@ const OLD_TGZ = process.env.W2M_RELAY_OLD_TGZ
 const SECRET = randomBytes(32).toString('base64');
 const NODE = { a: 'node-aaaa1111', b: 'node-bbbb2222', c: 'node-cccc3333' };
 const DEVICE_TOKEN = 'token-mixed-b1';
+// F4 (mixed): dispatch/result paths must work on the upgraded relay while an old relay is still 3.0.0.
+const OPERATOR_TOKEN = 'verify-f4-mixed-operator';
 const DEVICE_ID = 'm-b1';
 const SESSION_ID = 'mixed-chat-session';
 
@@ -96,6 +98,7 @@ function startRelay({ bin, nodeId, port, stateDir, peers, label }) {
     W2M_RELAY_CHAT_SYNC_MS: '5000',
     W2M_RELAY_CHAT_SYNC_BOOT_MIN_MS: '800',
     W2M_RELAY_CHAT_SYNC_BOOT_MAX_MS: '1500',
+    W2M_OPERATOR_TOKEN: OPERATOR_TOKEN,
   };
   const child = spawn(process.execPath, [bin, '--port', String(port), '--json', '--state', stateDir], {
     cwd: dirname(bin),
@@ -244,6 +247,76 @@ try {
       return status === 200 && body.messages?.some((message) => message.message_id === messageId);
     }, { timeoutMs: 30_000, intervalMs: 250, label: 'chat on upgraded A' });
     return `chat ${messageId} reached upgraded A while B is still 3.0.0`;
+  });
+
+  /** One §5.1-complete result envelope; the relay ignores envelope_sha256 (dedupe is by dedupe_key). */
+  function resultEnvelope(taskId) {
+    const empty = createHash('sha256').update('').digest('hex');
+    return {
+      envelope_version: '1.0',
+      task_id: taskId,
+      attempt: 1,
+      dedupe_key: 'dk-mixed-f4-' + taskId,
+      machine_id: DEVICE_ID,
+      machine_name: 'mixed-machine',
+      platform: { os: 'linux', arch: 'x64' },
+      caps: {},
+      index: 0,
+      index_total: 1,
+      mode: 'replicate',
+      cwd_rel: '.',
+      base_commit: 'c0ffee1',
+      base_tree: 'tree-abc',
+      pre_tree_fingerprint: 'tree-abc',
+      post_tree_fingerprint: 'tree-abc',
+      fingerprint_algo: 'git-temp-index-tree/v1',
+      fingerprint_error: null,
+      head_commit: 'c0ffee1',
+      dirty_before: false,
+      command_argv: [process.execPath, '-e', 'process.stdout.write("mixed-f4\\n")'],
+      command_hash: 'a'.repeat(64),
+      shell_id: 'direct-exec',
+      started_at: '2026-01-01T00:00:00Z',
+      ended_at: '2026-01-01T00:00:01Z',
+      duration_ms: 4,
+      exit_code: 0,
+      status: 'ok',
+      refusal_reason: null,
+      stdout_sha256: createHash('sha256').update('mixed-f4\n').digest('hex'),
+      stdout_bytes: 9,
+      stderr_sha256: empty,
+      stderr_bytes: 0,
+      warnings: [],
+      envelope_sha256: 'ignored-by-the-relay',
+    };
+  }
+
+  await check('F4 (mixed): dispatch and duplicate-result dedupe work on the upgraded relay', async () => {
+    const dispatched = await postJson(`${relays.a.url}/v1/task`, { authorization: `Bearer ${OPERATOR_TOKEN}` }, {
+      mode: 'replicate',
+      command_argv: [process.execPath, '-e', 'process.stdout.write("mixed-f4\\n")'],
+      cwd_rel: '.',
+      index_total: 1,
+      timeout_ms: 30_000,
+      write: false,
+      base_commit: 'c0ffee1',
+      base_tree: 'tree-abc',
+      compare_policy: { strip_ansi: true, normalize_crlf: true },
+      halt: 'never',
+      created_by: 'verify-f4',
+    });
+    if (dispatched.status !== 200 || typeof dispatched.body?.task_id !== 'string') {
+      throw new Error(`dispatch on upgraded relay: ${dispatched.status} ${JSON.stringify(dispatched.body).slice(0, 200)}`);
+    }
+    const env = resultEnvelope(dispatched.body.task_id);
+    const first = await postJson(`${relays.a.url}/v1/result`, { authorization: `Bearer ${DEVICE_TOKEN}` }, env);
+    if (first.status !== 200) throw new Error(`first result: ${first.status} ${JSON.stringify(first.body).slice(0, 220)}`);
+    if (first.body.deduped !== false) throw new Error(`first result deduped=${JSON.stringify(first.body.deduped)}; expected false`);
+    const repeat = await postJson(`${relays.a.url}/v1/result`, { authorization: `Bearer ${DEVICE_TOKEN}` }, env);
+    if (repeat.status !== 200 || repeat.body.deduped !== true) {
+      throw new Error(`duplicate result was not deduped on the upgraded relay: ${repeat.status} ${JSON.stringify(repeat.body).slice(0, 220)}`);
+    }
+    return `task ${dispatched.body.task_id}: dispatch + duplicate result dedupe on 3.1.0 relay while B is 3.0.0`;
   });
 
   await check('remaining old relay is still healthy after the rolling restart', async () => {
