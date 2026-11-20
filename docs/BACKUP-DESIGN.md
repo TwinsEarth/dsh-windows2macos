@@ -2102,3 +2102,165 @@ API 改动，不属于 S8）。
   仓库写者仍有写锁，但"备份进行中同时发起 verify"可能读到正在提交的快照并报告瞬时问题。S8 只改执行位置，
   未新增运行时互斥；面板/调度层的并发策略是后续切片的事。
 
+## 28. `old/` 整文件副本的分块封存 v2（P2-O3/O4，2026-11-20）
+
+**问题（为什么又要一个容器）**：§24 的整文件副本是**一个** AES-256-GCM 对象。`verify` 要在读之前用
+`oldCopyMaxBytes` 和进程堆护栏把它限住，因为 `openObject` 必须持有整份密文才能验 tag；一份 500 MB 的副本就是
+500 MB 的分配，而且是"密文 + 明文"两份。P2-O1 定义了分块容器、O2 让 `verify` 逐块读；O3/O4 把它接到**恢复**
+和**写入**两端：新副本写 v2，`old-restore` 按文件头分支（v1 原样、v2 流式写回）。
+
+### 28.1 字节布局与 AAD
+
+```
+magic    "W2MOLD2\n"                                                        8 B（ASCII）
+header   {"v":2,"alg":"aes-256-gcm","chunkBytes":N,"size":S,"sha256":"<hex>"}\n   明文 JSON + '\n'
+chunks   [ nonce(12) | ciphertext | tag(16) ] × M                            M = ceil(S / chunkBytes)，S == 0 时 0 条
+AAD      w2m-session-backup/old-chunked|<sha256>|<size>|<chunkIndex>
+```
+
+- `chunkBytes` 默认 **4 MiB**（与去重对象块同尺寸），本版写入/接受的上限 **16 MiB**：读取端峰值就是一条记录
+  （`chunkBytes + 28` 字节），攻击者写的头不能成为主机分配无限缓冲的理由。头部明文 JSON 上限 4096 B。
+- 头部**明文是有意的**：它只写算法名、块大小、明文长度和摘要——这些在 `manifest.json`/记录里本来就是明文。
+  它的身份不是"可信"，而是"改了必被察觉"：每条记录的 AAD 都绑定头部的 `sha256`/`size`，改任一个则所有块认证
+  失败；`v`/`chunkBytes` 决定分帧，改了要么认证失败、要么具名 `BACKUP_CHUNKED_HEADER_INVALID`。
+- 每块独立随机 nonce，**序号进 AAD** ⇒ 乱序、重复、截断、尾随都可检出并具名（GCM 本身只能告诉你"认证失败"，
+  所以这里额外用"该记录能按邻居序号认证"和"nonce 已出现过"两种**可从字节证明**的证据来区分 `ORDER`）。
+- 容器名与前缀和 v1 副本（`w2m-session-backup/old|…`）、块对象（`…/object|…`）都不同：v2 副本不能冒充块或 v1
+  副本，反之亦然。
+- 写端 `chunked.sealChunkedToFile`：临时同目录兄弟文件 → `fsync` → 原子 `rename`；崩溃不会留下"头里承诺了块、
+  文件里没有"的半份副本。
+
+**具名拒绝（`chunked.mjs` 的 `BACKUP_CHUNKED_*`）**
+
+| code | 含义 |
+| --- | --- |
+| `BACKUP_CHUNKED_HEADER_INVALID` | 不是这个格式、头部坏了/多字段/版本、算法或块大小不接受、身份与调用者声明的不一致 |
+| `BACKUP_CHUNKED_AUTH_FAILED` | 记录认证失败，且无法从字节证明是乱序（错 DEK / 改动 / 换到别的版本同一位置） |
+| `BACKUP_CHUNKED_ORDER` | 该记录按**邻居序号**认证成功，或 nonce 已在别的序号出现过（重复） |
+| `BACKUP_CHUNKED_TRUNCATED` | 文件在头部声明的块数走完之前结束 |
+| `BACKUP_CHUNKED_TRAILING` | 声明的块都解出来了，文件还在继续（写端不会产生这种形状） |
+| `BACKUP_CHUNKED_ARGUMENT_INVALID` / `READ_FAILED` / `WRITE_FAILED` | 调用参数 / 读 / 写失败 |
+
+### 28.2 兼容矩阵
+
+| 读取方 | v1 副本（记录无 `full_copy.format`） | v2 副本（`full_copy.format: "chunked-v2"`） |
+| --- | --- | --- |
+| O1–O4 之前的构建（3.5.3 及更早的 `old-restore`/`verify`） | ✅ 原路径（整份 `openObject`） | ❌ **具名拒绝**：魔数不是 `W2MBLOB1`，`openObject` 报 `BACKUP_ENVELOPE_MALFORMED`；`verify` 报 `BACKUP_VERIFY_OLD_COPY_FAILED` 并在细节里说明不是 v1 容器。升级提示：用含 O3/O4 的构建读取 |
+| 本构建（含 P2-O1–O4） | ✅ 原路径逐字节不变 | ✅ 流式（`openChunkedStream`，峰值一块） |
+| 本版写新副本 | 仅 `old-backfill` 的修复/补写（冻结形状） | ✅ `rotation` 的 `oldFormat: "full"` 默认 |
+
+- **不迁移**：已存在的 v1 副本不会被重写；`verify`/`old-restore` 继续按它们原来的容器读。
+- **`full_copy.format` 只是声明**：`verify` 和 `old-restore` 都先读文件自己的 8 字节 magic 再分支（verify 的 O2、
+  old-restore 的 §28.4），记录字段与文件不一致时以文件为准：字段是声明，字节是事实。
+- **降级路径**：新版写出的 v2 副本**旧版读不了**。要回退旧版本，先用本版 `old-restore` 把需要的版本导出为普通
+  文件，或保留旧仓库里的 v1 副本（它们不会被改写）。另一个旧版降级行为必须写明：**旧版的 `old-backfill`** 会把
+  v2 副本当成"长度不符的 v1"并重写成 v1；它不认识 `format` 字段，所以记录上的 `chunked-v2` 声明会留下（声明与
+  文件不再一致）——字节没有损坏，本版读取器仍以 magic 为准，按 v1 读；回退旧版前应先确认不需要 v2 的流式读取。
+- 版本号本次**不 bump**；v2 只在本切片之后的新写入出现。
+
+### 28.3 rotation：新副本默认 v2
+
+- `oldFormat: "full"` 的副本改用 `chunked.sealChunkedToFile` 写 v2，记录增加 `full_copy.format: "chunked-v2"`。
+  记录本身的 `format`/`version` 不变（仍是 `w2m-session-backup/old-version` v1），旧读者仍能**列出**记录。
+- 失败顺序不变：**先副本、后记录**。副本写不出来 → `BACKUP_ROTATION_WRITE_FAILED` 且没有记录；记录写失败 →
+  留下孤儿 `.enc`（无记录引用），由 `gc` 清掉。
+- **300 MiB 上限与「特批」逻辑不变**：`maxFullCopyBytes`（默认 300 MiB，`0` = 不设限）、`allowLargeFullCopy`、
+  记录上的 `full_copy.approved_over_cap` + `cap_bytes` 原样；被拒绝时仍然"零写入"。
+- 写端**仍然重建整份明文**（`materialize.rebuildFile`，由上限/内存护栏约束）：v2 限定的是读取端和"不再把整份
+  密文当一个缓冲"，不是重建；这一点在 28.8 里如实写明，不夸大。
+- 旧 v1 副本不重写；`old-backfill` 的判断与修复见 28.5。
+
+### 28.4 old-restore：按 magic 分支，v2 流式写回
+
+```
+选记录（--record / --latest-for / 唯一 --session）
+  → 检查副本存在（在打开 key 之前，缺失是常见失败且不该依赖凭据）
+  → 打开仓库 key（machine → account → password；未加密仓库的 open 信封无需凭据）
+  → 嗅探副本的 8 字节 magic
+      v1: 读整份密文 → openObject({sha256, length, kind:'old'}) → 校验 sha256/length   （与 §24.4 一致）
+      v2: openChunkedStream({sha256, size} = 记录身份) → 逐块认证 → 按 offset 组装 → 校验
+  → 静态 doctor（diagnoseSessionBuffer）
+  → 目标决策（--out、是否已存在、.bak / keep-both）
+```
+
+plan 新增（**既有键一个不改**）：`copy_format`（`v1` / `chunked-v2`）、`streamed`（bool）、`peakChunkBytes`
+（v1 为 `null`）。记录摘要里多一个 `full_copy.format`（声明）。
+
+- **v1 不变**：明文以不可枚举 `plan.plaintext` 挂在 plan 上，apply 用 `atomic.writeFileAtomic` 写，回读整份并比对
+  sha256。
+- **v2 不保留明文**：plan 上挂的是不可枚举的 `streamCopy(sink)` 闭包。apply 时重新流式解密（重新校验身份），把
+  明文逐块写进目标的**同目录临时兄弟**文件 → `fsync` → 原子 `rename`；回读用 1 MiB 有界缓冲算 sha256。目标名
+  从不出现半份日志。plan 与 apply 之间副本被换掉 → `BACKUP_OLD_RESTORE_CORRUPT` + `BACKUP_CHUNKED_*`，零写入。
+- **`.bak-<ts>`、target-changed、keep-both、doctor / `--force-invalid` 的语义与顺序和 v1 完全相同**（都在写之前
+  判定）；v2 只把最后那次写从"整份 buffer + 原子写"换成"流式写 + 原子 rename"。
+- 具名拒绝统一走 `BACKUP_OLD_RESTORE_CORRUPT`，`detail` 里带底层 `BACKUP_CHUNKED_*`（v1 带 `BACKUP_DECRYPT_*`），
+  所以终端和 `--json` 都能看到具体原因，而不是一句"打不开"。
+
+### 28.5 其它读 `old/` 的组件
+
+| 组件 | 与 v2 的关系 |
+| --- | --- |
+| `verify.mjs`（O2） | 先嗅探 magic：v1 走原路径（`oldCopyMaxBytes` + 堆护栏 + `openObject`），v2 走 `openChunkedStream`（峰值一块，不受 v1 上限约束）。`old_copies` 计数、`BACKUP_VERIFY_OLD_COPY_FAILED`/`_MISSING` 形状不变，细节里带 `BACKUP_CHUNKED_*` |
+| `gc.mjs` | **未改**。只按名字找 `.json.enc`、按记录的引用集删孤儿，不解密、不看格式；v2 副本同样被引用集保护，孤儿同样被清 |
+| `mirror.mjs` | **未改**。`old/` 按字节复制 `.json`/`.json.enc`，与格式无关；v2 副本原样镜像，重同步仍然 0 写入 |
+| `old-backfill.mjs` | 判断"已有副本是否完整"时按**文件头**分支：v1 用定长（`size + SEALED_COPY_OVERHEAD`），v2 用 `chunked.measureChunkedFile` 的帧长（块数由头部的 `chunkBytes` 决定，v1 的定长算法对 v2 恒不成立）。修复/补写仍产出 **v1**（冻结形状），并把记录上的 `format` 声明去掉——记录必须描述它指向的文件 |
+| `restore.mjs` | 不读 `old/`（`restore` 走 manifest/objects）；本次无需改动 |
+
+### 28.6 测试与验收证据（2026-11-20，全部临时 fixture）
+
+| 套件 | 例数 | 覆盖 |
+| --- | --- | --- |
+| `test/backup-old-chunked.test.mjs`（新） | 12 | v2 plan/apply 逐字节 + `streamed`/`peakChunkBytes`/无整份明文；v1 副本原路径；`.bak` 冲突（拒绝 / `--overwrite` 先备份）；target-changed；plan 与 apply 之间换副本被流式重校验拒绝；混合 v1+v2 仓库两条都恢复；损坏（翻字节 / 截断 / 改头部身份）具名且零写入；gc 孤儿删除、引用保护；mirror 混合仓库逐字节一致 + 重同步 0 写入；32 MiB / 4 MiB 块 / `--max-old-space-size=64` 子进程恢复 |
+| `test/backup-chunked.test.mjs` | 29 | O1 布局/往返/损坏码（不变）；`measureChunkedFile`（v2 帧长完整性检查，O4 的 old-backfill 用）；新增"rotation 默认写出的 v2 副本 `verify` 不再受 v1 上限约束"；v1 用例改为**显式构造 v1 副本**，v1 上限仍被断言 |
+| `test/backup-rotation.test.mjs` | 60 | full 模式断言 `isChunkedV2` + `full_copy.format` + v2 解出原字节；新增"v1 副本仍按 v1 恢复（记录声明不决定读取器）"；approval 用例改读 v2 |
+| `test/backup-restore.test.mjs` | 14 | 整快照恢复回归（未改） |
+| `test/backup-gc.test.mjs` | 22 | 孤儿副本/引用保护回归（未改） |
+| `test/backup-mirror.test.mjs` | 27 | 镜像逐字节一致；断言镜像里的副本是 v2 并能用镜像自己的 keys 解开 |
+| `test/backup-verify.test.mjs` | 25 | v1/v2 两条 verify 路径；损坏 v2 的细节带 `BACKUP_CHUNKED_*` |
+
+- 七套件合计 **189 例全绿**（`node --test --test-force-exit`）；全部 `test/backup-*.test.mjs` **611 例全绿**；
+  `npx eslint .` **0 error**（252 条既有 warning）；`node scripts/layer-check.mjs` clean；
+  `node scripts/scan-mojibake.mjs` clean。
+- 内存证据（子进程）：32 MiB 明文 / 4 MiB 块，`--max-old-space-size=64` 下 plan+apply 完成；plan 报
+  `peakChunkBytes = 4,194,332 B = 4 MiB + 28 B`（一条记录，精确值），恢复文件 sha256 与明文一致，子进程
+  `heapUsed` < 64 MiB。**注意**：这是"副本读取端"的峰值；静态 doctor 仍会物化整份日志（见 28.8）。
+- 回归：`test/backup-engine.test.mjs`（38 例）也全绿——它的 full 模式断言改用 v2 读取。
+
+### 28.7 真机演练（**需要用户明确授权**）
+
+本切片按任务边界**不读写真实 profile / 真实仓库**；以下是用户授权后的一次"读真实 home、写临时目录"演练，仍然
+属于真机操作。
+
+1. 生成 full 副本（真实 home，临时仓库）：
+   `w2m-backup run --backup-dir D:\tmp\drill-repo --dsh-home <真实 DSH_HOME> --old-format full`
+   第一次 run 只提交快照；副本在**同一会话下一次内容变化**时写入。
+2. 制造第二个版本后重跑同一个命令；结果 `rotated: 1` 且 `full_old_versions` 非空。单文件 > 300 MiB 会被拒绝，
+   需要 `--allow-large-full-copy`（特批）——被拒绝时零写入。
+3. 看字节：副本前 8 字节是 `W2MOLD2`，头部 `"v":2`/`"chunkBytes":4194304`；记录里
+   `full_copy.format: "chunked-v2"`。
+4. `w2m-backup verify --backup-dir D:\tmp\drill-repo`：`old_copies.checked == old_copies.ok`、`problems` 为空
+   （若仓库里还有旧 v1 副本，它走整文件路径，同样应 ok）。
+5. 恢复到临时目录：
+   `w2m-backup old-restore --backup-dir D:\tmp\drill-repo --latest-for <session-id> --out D:\tmp\drill-out\session.v4.jsonl.zstd`
+   先看 plan（`copy_format: chunked-v2`、`streamed: true`、`peakChunkBytes`），再加 `--apply`；结果 `sha256` 应等于
+   plan 的 `source_sha256`。
+6. 把恢复出的日志放进一个**临时 DSH_HOME**（不是真实 home）做一次 `w2m-fix`/`restore --dry-run` 级别的检查；
+   真实 home 的替换仍走 `w2m-backup restore` 的冲突/回滚协议（§15.1），不要手工覆盖。
+7. 清理临时仓库与临时 home。**未做**：真实 1.36 GB `old/` + 118 MB 会话的 RSS 曲线与 GUI 响应性；这一项留到
+   用户授权的真机 run（与 §27.8 的 S8 延后项一并做）。
+
+### 28.8 诚实边界
+
+- v2 是**协议扩展**，不是纯重构：v1 读取逐字节不变；新写入默认 v2；旧版本读不了 v2（见 28.2）。
+- 写端仍重建整份明文：v2 不减少 rotation 的**写**内存，减少的是"密文 + 明文同时驻留"（峰值从 ~2× 降到 ~1×）、
+  恢复写回的整份分配，以及 verify 的整份密文读取（O2）。
+- 静态 doctor 仍需要整份日志在内存（`diagnoseSessionBuffer`），两种格式相同——这是被恢复日志自身的大小，容器
+  去不掉。因此 `old-restore` 的整体峰值下限是日志大小；文档不声称"恢复只要一个块"（28.6 的 64 MiB 子进程证据
+  断言的是读取端报告的峰值，不是进程总 RSS）。
+- 不自动迁移旧 v1 副本；`old-backfill` 的修复写 v1（旧版本可读），新副本由 rotation 写 v2。
+- 流式写盘用一个目标目录内的 `.restore-tmp-*` 临时文件；进程被硬杀会留下半份明文（不是目标、没有记录引用），
+  而 `gc` 只扫 `objects/` 与 `tmp/`、不会进目标目录，所以它需要操作者手动删除——文档写明，而不是让命令去猜一个
+  调用者指定的目录里哪些文件是"自己的"。
+- `gc`/`mirror` 未改代码（只被测试覆盖），它们对格式无感知；`restore` 不读 `old/`，未改。
+- 本次不 bump 版本号、不跑 preflight、不提交。
+

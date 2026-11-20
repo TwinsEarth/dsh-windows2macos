@@ -16,11 +16,21 @@
  *
  * An operator who wants the plan's original shape can ask for it: `oldFormat: 'full'` additionally writes ONE
  * sealed whole-file copy of the superseded version beside the record, named `<ts>-<sha12>.json.enc`, and the
- * record gains `full_copy: {file, sha256, size}` pointing at it. The copy is sealed with the repository DEK via
- * `crypto.sealObject` under the distinct identity `w2m-session-backup/old|<sha256>|<length>` (see
- * `crypto.OLD_COPY_KIND`), so it can never be mistaken for a block object. The plaintext is rebuilt from the
- * version's own blocks through `materialize.rebuildFile` -- the same single implementation restore uses -- so
- * the copy really is the superseded bytes and not a re-read of a file that has already moved on.
+ * record gains `full_copy: {file, sha256, size, format: 'chunked-v2'}` pointing at it. The copy is the **chunked
+ * v2** format (`chunked.mjs`, `docs/BACKUP-DESIGN.md` §28): one AES-256-GCM record per 4 MiB of plaintext, each
+ * bound by its own AAD (`w2m-session-backup/old-chunked|<sha256>|<size>|<chunkIndex>`), so a reader authenticates
+ * one record at a time and holds one chunk, not the file. `sealChunkedToFile` writes it through a temporary
+ * sibling and an atomic rename, so a crash cannot leave a header promising chunks that are not there.
+ *
+ * A copy written by an **older build** stays a v1 whole-file object (one `crypto.sealObject` under
+ * `w2m-session-backup/old|<sha256>|<length>`), and its record has no `format` field. Nothing rewrites those
+ * copies: `verify`/`old-restore` sniff the file's own magic and keep the v1 path exactly as it was, and the
+ * record field is only a claim (`chunked.mjs` / §28). The plaintext is rebuilt from the version's own blocks
+ * through `materialize.rebuildFile` -- the same single implementation restore uses -- so the copy really is the
+ * superseded bytes and not a re-read of a file that has already moved on.
+ *
+ * The **writer** still materialises the rebuilt plaintext (the cap and the heap guard bound it, unchanged): what
+ * v2 bounds is the reader, and the write is record-by-record with no whole sealed file in memory.
  *
  * **Storage honesty**: `full` doubles a superseded version's bytes on top of the deduplicated blocks. That is
  * exactly the cost the default avoids, which is why `records` stays the default and `full` is opt-in.
@@ -62,8 +72,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 
-import { readJsonSafe, writeFileAtomic, writeJsonAtomic } from './atomic.mjs';
-import { OLD_COPY_KIND, isDek, sealObject } from './crypto.mjs';
+import { readJsonSafe, writeJsonAtomic } from './atomic.mjs';
+import { CHUNKED_FORMAT, sealChunkedToFile } from './chunked.mjs';
+import { isDek } from './crypto.mjs';
 import { BACKUP_MEMORY_GUARD } from './memory-guard.mjs';
 import { rebuildFile } from './materialize.mjs';
 
@@ -397,11 +408,14 @@ function relFromRoot(root, file) {
  *
  * The plaintext is rebuilt from the version's stored blocks and checked against the digest/size the record
  * carries before it is sealed, so a corrupt store can never produce a copy that is silently not the version it
- * claims to be. Any failure (missing block, bad digest, unwritable target) is `BACKUP_ROTATION_WRITE_FAILED`:
- * rotation refuses rather than writing a record that promises a copy which is not there.
+ * claims to be. The copy is the chunked-v2 format: `sealChunkedToFile` writes one record per 4 MiB chunk through a
+ * temporary sibling and an atomic rename, so neither the sealed file nor the renamed target can exist half-written
+ * and the writer never holds the sealed bytes as one buffer. Any failure (missing block, bad digest, unwritable
+ * target) is `BACKUP_ROTATION_WRITE_FAILED`: rotation refuses rather than writing a record that promises a copy
+ * which is not there.
  *
  * @param {{root: string, previous: object, stamp: string, dek: Buffer}} input
- * @returns {{file: string, sha256: string, size: number}}
+ * @returns {{file: string, sha256: string, size: number, format: string}}
  */
 function writeFullCopy(input) {
   const { previous } = input;
@@ -427,15 +441,16 @@ function writeFullCopy(input) {
     );
   }
   const file = oldFullCopyPath(input.root, previous, input.stamp);
-  // Same identity rule as a block object, with the container name set to `old`: the copy is bound to the whole
-  // file's digest and length, so it cannot be opened as a block and a block cannot be opened as a copy.
-  const sealed = sealObject(buffer, input.dek, { sha256: previous.sha256, length: buffer.length, kind: OLD_COPY_KIND });
+  // The identity is bound per chunk (AAD `old-chunked|sha256|size|index`) and by the plaintext header, so the copy
+  // cannot be opened as a block object, cannot be opened as a v1 `old` copy, and cannot be retargeted at another
+  // version. `sha256`/`size` are passed so a corrupted rebuild is refused here rather than sealed under an
+  // identity it does not have.
   try {
-    writeFileAtomic(file, sealed);
+    sealChunkedToFile(buffer, { dek: input.dek, sha256: previous.sha256, size: buffer.length, writeToFile: file });
   } catch (error) {
-    throw new RotationError(ROTATION_CODES.WRITE_FAILED, `${file}: ${error?.detail ?? error?.message ?? String(error)}`);
+    throw new RotationError(ROTATION_CODES.WRITE_FAILED, `${file}: ${error?.code ?? ''} ${error?.detail ?? error?.message ?? String(error)}`.trim());
   }
-  return { file: relFromRoot(input.root, file), sha256: previous.sha256, size: buffer.length };
+  return { file: relFromRoot(input.root, file), sha256: previous.sha256, size: buffer.length, format: CHUNKED_FORMAT };
 }
 
 /**
@@ -443,8 +458,9 @@ function writeFullCopy(input) {
  *
  * With `format: 'full'` (or `input.format` left undefined for the default `records`) the record is written
  * exactly as before; `full` first writes the sealed whole-file copy described in this module's header and then
- * adds `full_copy` to the record. The record's own `format`/`version` fields are unchanged in both modes, so a
- * `full` record is still a `w2m-session-backup/old-version` v1 that older readers can list and restore from.
+ * adds `full_copy: {file, sha256, size, format: 'chunked-v2'}` to the record. The record's own `format`/`version`
+ * fields are unchanged in both modes, so a `full` record is still a `w2m-session-backup/old-version` v1 that older
+ * readers can list; `full_copy.format` is additive, and a record without it means a v1 copy.
  *
  * @param {{root: string, previous: object, snapshotId: string, now?: Date, format?: 'records'|'full',
  *   dek?: Buffer, approvedOverCap?: boolean, capBytes?: number}} input `dek` is required for `full` and unused for
@@ -489,8 +505,8 @@ export function recordSupersededVersion(input) {
     snapshot_id: previous.snapshot_id ?? null,
     superseded_by: input.snapshotId,
     recorded_at: (input.now ?? new Date()).toISOString(),
-    // Additive and only present in `full` mode; `sha256`/`size` are the whole-file plaintext identity that
-    // `openObject(bytes, dek, {sha256, length, kind: OLD_COPY_KIND})` verifies.
+    // Additive and only present in `full` mode; `sha256`/`size` are the whole-file plaintext identity the copy's
+    // header and each chunk's AAD bind, and `format` names the container (`chunked-v2`; a v1 copy omits it).
     ...(fullCopy === null ? {} : { full_copy: fullCopy }),
   };
   try {

@@ -17,14 +17,26 @@
  * ## What it will and will not do
  *
  *   * a record that already has a usable copy is **skipped**: a second run writes nothing (idempotent);
- *   * a copy whose file length is not `size + SEALED_COPY_OVERHEAD` (a crash during the copy write leaves a
- *     short file, and the record's length is the authoritative statement about it), or whose metadata
- *     disagrees with the record, is rebuilt and rewritten (`repaired`);
+ *   * a copy is judged complete **by its own format** (the rule `verify`/`old-restore` use):
+ *     a v1 object must be exactly `size + SEALED_COPY_OVERHEAD` bytes (a crash during the copy write leaves a
+ *     short file, and the record's length is the authoritative statement about it), and a chunked-v2 file must
+ *     match the length its own plaintext header implies (`chunked.measureChunkedFile` -- the record count comes
+ *     from the header's `chunkBytes`, so the v1 arithmetic is wrong for it by construction). Anything else, or
+ *     metadata that disagrees with the record, is rebuilt and rewritten (`repaired`);
  *   * a `.json.enc` no record references is counted as an `orphan` and **left alone**: `gc` deletes
  *     unreferenced copies on its next safe run, which is the only place deletion of them belongs;
  *   * a record whose blocks cannot rebuild its recorded bytes is reported (`BACKUP_OLD_RECORD_INVALID` /
  *     `BACKUP_OLD_BACKFILL_FAILED`), never guessed around: writing a copy of something else beside the record
  *     would be worse than leaving the copy absent.
+ *
+ * ## Which format a repair writes (and why it is v1)
+ *
+ * A repair/backfill writes the **v1** whole-file object under the `old` identity: that is the shape this
+ * migration command has always produced, it is readable by every build that can read `old/` at all, and its
+ * fixed overhead is what `SEALED_COPY_OVERHEAD` names. New copies written by **rotation** are chunked-v2 (§28);
+ * this command does not rewrite those either. The one record edit a repair can therefore need even when the
+ * copy's metadata matched is to **drop** a `full_copy.format` claim a v2 record carries, because the file it
+ * just put back is a v1 object -- the record must describe the file it names.
  *
  * The copy name is the record's own name plus {@link FULL_COPY_SUFFIX} -- the same `<record>.json.enc` that
  * `rotation.oldFullCopyPath` produces in `full` mode. It is derived from the record file on disk rather than
@@ -54,6 +66,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 
 import { writeFileAtomic, writeJsonAtomic } from './atomic.mjs';
+import { isChunkedV2, measureChunkedFile } from './chunked.mjs';
 import { NONCE_LENGTH, OBJECT_MAGIC, OLD_COPY_KIND, TAG_LENGTH, isDek, sealObject } from './crypto.mjs';
 import { listFullCopies } from './gc.mjs';
 import { LAYOUT_CODES, readDescriptor, validateDescriptor } from './layout.mjs';
@@ -79,10 +92,11 @@ export const BACKFILL_CODES = Object.freeze({
 });
 
 /**
- * Bytes a sealed whole-file copy adds around its plaintext: `MAGIC | nonce | ciphertext | tag`.
+ * Bytes a **v1** sealed whole-file copy adds around its plaintext: `MAGIC | nonce | ciphertext | tag`.
  *
- * The expected on-disk length of a copy is therefore the plaintext size (the record's `size`) plus this
- * constant. A `.enc` of any other length is a torn write and is repaired.
+ * The expected on-disk length of a v1 copy is therefore the plaintext size (the record's `size`) plus this
+ * constant. A `.enc` of any other length is a torn write and is repaired. A chunked-v2 copy has no such constant
+ * -- its length follows the header's `chunkBytes` -- so {@link copyIsComplete} asks `measureChunkedFile` instead.
  */
 export const SEALED_COPY_OVERHEAD = OBJECT_MAGIC.length + NONCE_LENGTH + TAG_LENGTH;
 
@@ -142,6 +156,30 @@ function fileSize(file) {
     return stat.isFile() ? stat.size : null;
   } catch {
     return null;
+  }
+}
+
+/**
+ * True when the copy on disk is a complete copy of `record`'s bytes **in the format the file actually is**.
+ *
+ * The format is decided by the file's own magic, never by `full_copy.format` (a record field is a claim; §28):
+ * a v1 object must have the exact `size + SEALED_COPY_OVERHEAD` length, and a chunked-v2 file must have the
+ * length its own plaintext header implies and name the record's identity. A v2 header that does not parse (a file
+ * torn inside its header) is incomplete, so it is repaired like a short v1 copy rather than skipped forever. A
+ * missing file is incomplete, which is what makes the "repair a deleted `.enc`" path work.
+ *
+ * @param {string} copyFile
+ * @param {object} record
+ * @param {number} expectedSize `record.size + SEALED_COPY_OVERHEAD` (the v1 length)
+ * @returns {boolean}
+ */
+function copyIsComplete(copyFile, record, expectedSize) {
+  if (!isChunkedV2(copyFile)) return fileSize(copyFile) === expectedSize;
+  try {
+    const layout = measureChunkedFile(copyFile);
+    return layout.complete === true && layout.sha256 === record.sha256 && layout.size === record.size;
+  } catch {
+    return false;
   }
 }
 
@@ -275,19 +313,23 @@ function backfillOne(input) {
     }
     const metadataMatches = record.full_copy.sha256 === record.sha256 && record.full_copy.size === record.size;
     const expectedSize = record.size + SEALED_COPY_OVERHEAD;
-    if (metadataMatches && fileSize(copyFile) === expectedSize) {
+    if (metadataMatches && copyIsComplete(copyFile, record, expectedSize)) {
       return { ok: true, action: 'skipped', copy: copyFile, bytes: 0 };
     }
     if (input.dryRun === true) return { ok: true, action: 'repaired', copy: copyFile, bytes: 0 };
+    // A repair writes the v1 object (this command's frozen shape), so a record that claimed the chunked-v2 format
+    // must be rewritten to drop that claim -- otherwise the record would describe a container it does not name.
+    const rewritesRecord = metadataMatches === false || record.full_copy.format !== undefined;
     return writeSealedCopy({
       root,
       file,
       record,
       copyFile,
-      // Only rewrite the record when its metadata is what was wrong; a torn file alone needs no record write.
-      updateRecord: metadataMatches
-        ? null
-        : { file: relFromRoot(root, copyFile), sha256: record.sha256, size: record.size },
+      // Only rewrite the record when its metadata is what was wrong, or when the repaired file's format differs
+      // from the one the record claims; a torn v1 file alone needs no record write.
+      updateRecord: rewritesRecord
+        ? { file: relFromRoot(root, copyFile), sha256: record.sha256, size: record.size }
+        : null,
       dek: input.dek,
       action: 'repaired',
     });

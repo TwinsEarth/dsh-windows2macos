@@ -614,7 +614,9 @@ describe('verify: sealed old/ full copies are decrypted, not trusted', () => {
       assert.equal(result.old_copies.missing, 0);
       const problem = result.problems.find((row) => row.code === 'BACKUP_VERIFY_OLD_COPY_FAILED');
       assert.ok(problem, JSON.stringify(result.problems));
-      assert.match(problem.detail, /BACKUP_DECRYPT_AUTH_FAILED|does not decrypt/u);
+      // Rotation writes chunked v2 since O3, so the damage is named by the chunked reader; the v1 wording stays
+      // accepted because a pre-O3 repository is still a supported input (its old path is unchanged).
+      assert.match(problem.detail, /BACKUP_CHUNKED_AUTH_FAILED|BACKUP_DECRYPT_AUTH_FAILED|does not (decrypt|open)/u);
       assert.equal(problem.file.endsWith('.json'), true, 'the problem names the version record');
       assert.ok(problem.detail.includes(problem.file), 'the detail names the record it belongs to');
     } finally {

@@ -36,6 +36,7 @@ import {
   MAX_CHUNK_BYTES,
   chunkedAad,
   isChunkedV2,
+  measureChunkedFile,
   openChunkedBuffer,
   openChunkedStream,
   resolveChunkBytes,
@@ -269,6 +270,36 @@ describe('chunked v2: roundtrip', () => {
     }
   });
 
+  it('measures the declared layout of a file without decrypting it (the completeness check old-backfill uses)', () => {
+    const { dir, cleanup } = tempDir('w2m-chunked-measure-');
+    try {
+      const { plaintext, sha256, dek, size } = sealedFor(2 * 64 + 7, 64);
+      const target = path.join(dir, 'copy.json.enc');
+      sealChunkedToFile(plaintext, { dek, sha256, size, chunkBytes: 64, writeToFile: target });
+      const layout = measureChunkedFile(target);
+      assert.equal(layout.ok, true);
+      assert.equal(layout.sha256, sha256);
+      assert.equal(layout.size, size);
+      assert.equal(layout.chunkBytes, 64);
+      assert.equal(layout.chunks, 3);
+      assert.equal(layout.fileBytes, fs.statSync(target).size);
+      assert.equal(layout.expectedBytes, layout.fileBytes, 'a complete file is exactly the length its framing implies');
+      assert.equal(layout.complete, true);
+      // The v1 arithmetic a pre-v2 reader would apply is wrong by construction, which is why this exists.
+      assert.notEqual(layout.expectedBytes, size + 28);
+      // A torn file is measured, not mistaken for complete (and no decryption is attempted).
+      const bytes = fs.readFileSync(target);
+      fs.writeFileSync(target, bytes.subarray(0, bytes.length - 1));
+      const torn = measureChunkedFile(target);
+      assert.equal(torn.complete, false);
+      assert.equal(torn.fileBytes, torn.expectedBytes - 1);
+      assert.equal(codeOf(() => measureChunkedFile(path.join(dir, 'missing.enc'))), CHUNKED_CODES.READ_FAILED);
+      assert.equal(codeOf(() => measureChunkedFile(Buffer.from('NOTMAGIC\n'))), CHUNKED_CODES.HEADER_INVALID);
+    } finally {
+      cleanup();
+    }
+  });
+
   it('does not treat a v1 sealed object as v2, and refuses it by name if asked to open it', () => {
     const dek = randomDek();
     const plaintext = plaintextOf(40);
@@ -480,7 +511,31 @@ function repositoryDek(root, homeDir) {
 }
 
 /**
- * Replace a v1 `.json.enc` with a v2 chunked copy of the same version.
+ * Replace the rotation-written `.json.enc` with the historical **v1** sealed object (one whole-file AEAD).
+ *
+ * Rotation writes chunked v2 since O3, so the v1 path needs an explicit fixture: the plaintext is rebuilt from the
+ * record's own blocks (the reader restore uses), so this v1 copy really is the superseded bytes -- not a
+ * hand-written object that could disagree with the record.
+ */
+function convertCopyToV1(root, homeDir) {
+  const recordFile = oldFiles(root).find((file) => file.endsWith('.json'));
+  assert.ok(recordFile, 'the fixture must hold a version record');
+  const record = JSON.parse(fs.readFileSync(recordFile, 'utf8'));
+  assert.ok(record.full_copy, 'the fixture must hold a sealed full copy');
+  const copyFile = path.join(root, ...record.full_copy.file.split('/'));
+  const dek = repositoryDek(root, homeDir);
+  const rebuilt = rebuildFile({ root, entry: record, dek });
+  assert.equal(rebuilt.ok, true, rebuilt.detail);
+  assert.equal(sha256Hex(rebuilt.buffer), record.sha256, 'the rebuilt bytes are the version the record names');
+  fs.writeFileSync(
+    copyFile,
+    sealObject(rebuilt.buffer, dek, { sha256: record.sha256, length: record.size, kind: OLD_COPY_KIND }),
+  );
+  return { recordFile, record, copyFile, dek };
+}
+
+/**
+ * Re-seal the rotation-written v2 copy with a smaller chunk size.
  *
  * The plaintext is rebuilt from the record's own blocks (the same reader restore uses), so the v2 copy really is
  * the superseded bytes the record claims -- not a hand-written fixture that could disagree with it.
@@ -511,9 +566,10 @@ describe('verify: a chunked-v2 old/ full copy is checked chunk by chunk (O2)', (
     const home = runtimeValidHome();
     const repo = repoWithFullCopy(home.home);
     try {
-      const copyFile = oldFiles(repo.dir).find((file) => file.endsWith('.json.enc'));
-      assert.ok(copyFile);
-      assert.equal(isChunkedV2(copyFile), false, 'rotation still writes v1 in this slice (O4)');
+      // Rotation writes v2 since O3; this fixture rewrites that copy as the pre-O3 v1 object, so the v1 path
+      // (and its whole-file bound) stays covered rather than disappearing from the suite.
+      const { copyFile } = convertCopyToV1(repo.dir, home.home);
+      assert.equal(isChunkedV2(copyFile), false);
       const result = verifyRepo({ root: repo.dir, dshHome: home.home, platform: 'linux', machineKey: false });
       assert.equal(result.ok, true, result.problems.map((problem) => `${problem.code}: ${problem.detail}`).join('; '));
       assert.deepEqual(result.old_copies, { checked: 1, ok: 1, failed: 0, missing: 0 });
@@ -527,6 +583,31 @@ describe('verify: a chunked-v2 old/ full copy is checked chunk by chunk (O2)', (
       });
       assert.equal(bounded.ok, false);
       assert.ok(bounded.problems.some((problem) => problem.code === 'BACKUP_VERIFY_OLD_COPY_TOO_LARGE'), JSON.stringify(bounded.problems));
+    } finally {
+      repo.cleanup();
+      home.cleanup();
+    }
+  });
+
+  it('verifies the chunked copy rotation writes by default, without the v1-only size bound (O3)', () => {
+    const home = runtimeValidHome();
+    const repo = repoWithFullCopy(home.home);
+    try {
+      const copyFile = oldFiles(repo.dir).find((file) => file.endsWith('.json.enc'));
+      assert.ok(copyFile, 'the fixture must hold the copy rotation wrote');
+      assert.equal(isChunkedV2(copyFile), true, 'rotation writes chunked v2 for every new full copy');
+      const recordFile = oldFiles(repo.dir).find((file) => file.endsWith('.json'));
+      assert.equal(JSON.parse(fs.readFileSync(recordFile, 'utf8')).full_copy.format, CHUNKED_FORMAT);
+      // `oldCopyMaxBytes: 1` refuses any v1 copy on sight; a copy rotation just wrote is v2, so verify streams it.
+      const result = verifyRepo({
+        root: repo.dir,
+        dshHome: home.home,
+        platform: 'linux',
+        machineKey: false,
+        oldCopyMaxBytes: 1,
+      });
+      assert.equal(result.ok, true, result.problems.map((problem) => `${problem.code}: ${problem.detail}`).join('; '));
+      assert.deepEqual(result.old_copies, { checked: 1, ok: 1, failed: 0, missing: 0 });
     } finally {
       repo.cleanup();
       home.cleanup();

@@ -31,28 +31,65 @@
  * bytes are then written, and the result carries `doctor_ok: false` so no later reader can mistake it for a
  * validated restore.
  *
+ * ## Which format the copy is (`docs/BACKUP-DESIGN.md` §28)
+ *
+ * A copy is read by **the file's own magic**, never by `full_copy.format` on the record: a record field is a
+ * claim, and the eight bytes at the head of the file are the fact (`verify.mjs` takes the same position). Two
+ * formats exist:
+ *
+ *   * **v1** -- one sealed `crypto.openObject` under the `old` identity. The path is exactly what it was before
+ *     the chunked format existed: read the file whole, decrypt in one call, verify digest/length.
+ *   * **v2** (`chunked.mjs`) -- magic `W2MOLD2`, a plaintext header, then one AEAD record per chunk. The reader
+ *     authenticates one record at a time and holds one chunk (default 4 MiB, 16 MiB ceiling), never the whole
+ *     sealed file. Every record's AAD names the header's `sha256`/`size` and its index, so a copy retargeted at
+ *     another version, a truncated file, and a reordered or duplicated record are all refused by name
+ *     (`BACKUP_CHUNKED_*`), not averaged into one "authentication failed".
+ *
+ * Both formats refuse through the same command code: a copy that does not open as the recorded version is
+ * `BACKUP_OLD_RESTORE_CORRUPT`, and the detail carries the underlying `BACKUP_CHUNKED_*` (or
+ * `BACKUP_DECRYPT_*`) code so the cause survives into the operator's terminal and the `--json` payload.
+ *
+ * ## v2 restore streams; v1 is unchanged
+ *
+ * For a v2 copy the plan does not keep the recovered log: it streams the copy into the plan's own verification
+ * (peak one chunk, reported as `peakChunkBytes`) and keeps a re-open closure, so `applyOldRestore` writes the
+ * copy back **record by record** into a temporary sibling of the target, `fsync`s, and renames it into place --
+ * the target name never holds a partially written log. The plan's `streamed` flag and `peakChunkBytes` say which
+ * shape it will use; the v1 path keeps the whole recovered buffer on the plan (non-enumerable, as before) and
+ * writes it with `writeFileAtomic`.
+ *
+ * The static doctor is the one step that still wants the whole log in memory (`diagnoseSessionBuffer` parses it),
+ * and that is true for both formats: it is the recovered file's own size, so a v2 restore's *copy* reader is
+ * bounded by a chunk while the doctor's materialisation is not something the container can remove. §28 states
+ * that boundary rather than claiming a peak the doctor does not have.
+ *
  * ## Plan and apply
  *
  * `planOldRestore` opens the record, opens the repository key (machine -> account -> password; an unencrypted
  * repository's `open` envelope works with no credential), reads and decrypts the `.enc` with the `old` identity
- * (`{sha256, length: size, kind: 'old'}`), verifies both the digest and the length, runs the static doctor, and
- * decides the target. It writes nothing to the target: the only side effect is `openRepoKey`'s documented
- * best-effort machine-envelope upgrade, which belongs to key handling, not to this command. The recovered
- * plaintext travels on the plan as a **non-enumerable** `plaintext` Buffer, so `JSON.stringify(plan)` stays a
- * small report while `applyOldRestore` writes exactly the bytes the plan verified.
+ * (`{sha256, length: size, kind: 'old'}` for v1; the chunked header/AAD for v2), verifies both the digest and the
+ * length, runs the static doctor, and decides the target. It writes nothing to the target: the only side effect
+ * is `openRepoKey`'s documented best-effort machine-envelope upgrade, which belongs to key handling, not to this
+ * command. For a v1 copy the recovered plaintext travels on the plan as a **non-enumerable** `plaintext` Buffer,
+ * so `JSON.stringify(plan)` stays a small report while `applyOldRestore` writes exactly the bytes the plan
+ * verified. For a v2 copy no plaintext travels: the plan carries a non-enumerable `streamCopy(sink)` closure that
+ * re-opens the copy (and re-verifies it, so a copy that changed after the plan is refused, not written).
  *
  * `applyOldRestore` re-checks the target against what the plan saw: a target that changed in between is refused
  * (`BACKUP_OLD_RESTORE_TARGET_CHANGED`) instead of overwritten, an existing target still needs
  * `overwrite`/`keepBoth` (`BACKUP_OLD_RESTORE_TARGET_EXISTS`), an overwrite first writes a byte-for-byte
  * `.bak-<ts>` copy, `keepBoth` leaves the existing file alone and writes `<target>.restored-<ts>` instead, and
- * the result is read back and hashed. A failed read-back is reported, never hidden.
+ * the result is read back and hashed. A failed read-back is reported, never hidden. Those checks and their order
+ * are identical for both formats; only the final write differs (a v2 copy is streamed into a temporary sibling
+ * and renamed, so its digest is read back through a bounded buffer instead of `readFileSync`).
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 
-import { readJsonSafe, writeFileAtomic } from './atomic.mjs';
+import { atomicWriteFailure, readJsonSafe, writeFileAtomic } from './atomic.mjs';
+import { CHUNKED_FORMAT, ChunkedError, isChunkedV2, openChunkedStream } from './chunked.mjs';
 import { OLD_COPY_KIND, isDek, openObject } from './crypto.mjs';
 import { LAYOUT_CODES, readDescriptor, validateDescriptor } from './layout.mjs';
 import { NO_PERMISSION, openRepoKey } from './keystore.mjs';
@@ -122,6 +159,202 @@ function readRegularFile(file) {
   }
 }
 
+/** The plan label of a v1 copy; a v2 copy is labelled with `CHUNKED_FORMAT` (`chunked-v2`). */
+const V1_COPY_FORMAT = 'v1';
+
+/** Byte limit of the bounded read-back after a streamed write: one buffer, never the whole restored log. */
+const READBACK_CHUNK_BYTES = 1024 * 1024;
+
+/** The non-enumerable plan property carrying a v2 copy's re-open closure (see {@link planOldRestore}). */
+const STREAM_COPY = 'streamCopy';
+
+/** The bounded digest read-back a streamed write uses: `{bytes, sha256}`, or `null` when unreadable. */
+function hashFileBounded(file) {
+  let fd = null;
+  try {
+    const stat = fs.statSync(file);
+    if (!stat.isFile()) return null;
+    fd = fs.openSync(file, 'r');
+    const hash = createHash('sha256');
+    const buffer = Buffer.allocUnsafe(READBACK_CHUNK_BYTES);
+    let bytes = 0;
+    for (;;) {
+      const read = fs.readSync(fd, buffer, 0, buffer.length, null);
+      if (read === 0) break;
+      hash.update(buffer.subarray(0, read));
+      bytes += read;
+    }
+    return { bytes, sha256: hash.digest('hex') };
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* the read verdict is already decided */
+      }
+    }
+  }
+}
+
+/**
+ * Read and verify one sealed `old/` full copy, deciding the format by the file's own magic.
+ *
+ * v1 is the historical path, unchanged: the whole sealed object is read, opened with the `old` identity, and the
+ * plaintext digest/length are compared with the record's. v2 is opened as a chunk stream: every record is
+ * authenticated against the header's `sha256`/`size` and its own index, the plaintext is assembled at the offsets
+ * the reader reports (peak: the log + one chunk, and the caller releases it after the doctor), and the reader's
+ * report carries the peak chunk size the plan reports. `sha256`/`size` are passed as the *expected* identity, so a
+ * copy that belongs to another version is refused with a header mismatch naming both identities.
+ *
+ * @param {{copyFile: string, dek: Buffer, record: object}} input
+ * @returns {{ok: true, format: string, streamed: boolean, plaintext: Buffer, peakChunkBytes: number|null,
+ *   chunks: number|null, chunkBytes: number|null} | {ok: false, detail: string}}
+ */
+function readFullCopy(input) {
+  const { copyFile, dek, record } = input;
+  if (!isChunkedV2(copyFile)) {
+    const sealed = readRegularFile(copyFile);
+    if (sealed === null) {
+      return { ok: false, detail: `the sealed full copy at ${copyFile} is missing or not a regular file` };
+    }
+    let plaintext;
+    try {
+      plaintext = openObject(sealed, dek, { sha256: record.sha256, length: record.size, kind: OLD_COPY_KIND });
+    } catch (error) {
+      return {
+        ok: false,
+        detail:
+          `the sealed full copy at ${copyFile} does not open as the recorded version: ` +
+          `${error?.code ?? 'BACKUP_DECRYPT_AUTH_FAILED'}: ${error?.detail ?? error?.message ?? String(error)}`,
+      };
+    }
+    const digest = sha256Hex(plaintext);
+    if (plaintext.length !== record.size || digest !== record.sha256) {
+      return {
+        ok: false,
+        detail: `the full copy at ${copyFile} decrypts to ${plaintext.length} bytes / ${digest}, not the recorded ${record.size} bytes / ${record.sha256}`,
+      };
+    }
+    return {
+      ok: true,
+      format: V1_COPY_FORMAT,
+      streamed: false,
+      plaintext,
+      peakChunkBytes: null,
+      chunks: null,
+      chunkBytes: null,
+    };
+  }
+
+  // v2: the file must at least be able to hold the plaintext it claims before a buffer of that size is asked for.
+  let fileBytes;
+  try {
+    fileBytes = fs.statSync(copyFile).size;
+  } catch (error) {
+    return { ok: false, detail: `the ${CHUNKED_FORMAT} full copy at ${copyFile} is unreadable: ${error?.code ?? 'stat failed'}` };
+  }
+  if (fileBytes < record.size) {
+    return {
+      ok: false,
+      detail:
+        `the ${CHUNKED_FORMAT} full copy at ${copyFile} is ${fileBytes} bytes, smaller than the ${record.size} ` +
+        'recorded plaintext bytes: it is truncated',
+    };
+  }
+  // One preallocated plaintext buffer (the doctor needs the whole log anyway) filled from the reader's offsets:
+  // no part of the sealed file is ever held as one buffer, and no second copy of the plaintext is made.
+  const plaintext = Buffer.allocUnsafe(record.size);
+  let opened;
+  try {
+    opened = openChunkedStream(copyFile, {
+      dek,
+      sha256: record.sha256,
+      size: record.size,
+      onChunk: (chunk) => {
+        chunk.plaintext.copy(plaintext, chunk.offset);
+      },
+    });
+  } catch (error) {
+    return {
+      ok: false,
+      detail:
+        `the ${CHUNKED_FORMAT} full copy at ${copyFile} does not open as the recorded version: ` +
+        `${error?.code ?? 'BACKUP_CHUNKED_AUTH_FAILED'}: ${error?.detail ?? error?.message ?? String(error)}`,
+    };
+  }
+  const digest = sha256Hex(plaintext);
+  if (opened.size !== record.size || digest !== record.sha256) {
+    return {
+      ok: false,
+      detail:
+        `the ${CHUNKED_FORMAT} full copy at ${copyFile} decrypts to ${opened.size} bytes / ${digest}, ` +
+        `not the recorded ${record.size} bytes / ${record.sha256}`,
+    };
+  }
+  return {
+    ok: true,
+    format: CHUNKED_FORMAT,
+    streamed: true,
+    plaintext,
+    peakChunkBytes: opened.peakChunkBytes,
+    chunks: opened.chunks,
+    chunkBytes: opened.chunkBytes,
+  };
+}
+
+/**
+ * Write a streamed restore into a temporary sibling of `target`, then rename it into place.
+ *
+ * The temporary file lives in the target's own directory (so the rename never crosses a filesystem) and its name
+ * never holds a partial log: `fsync` then `rename` are the same durability order `atomic.writeFileAtomic` uses.
+ * `streamCopy(write)` re-opens the sealed copy through the plan's closure, so the identity recorded at plan time
+ * is verified again here -- a copy that changed in between refuses instead of writing different bytes.
+ *
+ * A process killed mid-write leaves a partial `.restore-tmp-*` file in the target's directory: it is plaintext,
+ * it is not a target and no record refers to it, and nothing sweeps the target's directory for it (gc only walks
+ * `objects/` and `tmp/`). §28 states that; the honest handling is the operator deleting it, not this function
+ * guessing which files in a caller-chosen directory are its own.
+ *
+ * @param {{streamCopy: (write: (buffer: Buffer) => void) => object, target: string}} input
+ * @returns {object} the reader's report
+ * @throws {ChunkedError} when the copy no longer opens (a changed or damaged copy)
+ * @throws {AtomicWriteError} `BACKUP_DISK_FULL` / `BACKUP_DIR_NOT_WRITABLE` / `BACKUP_WRITE_FAILED`
+ */
+function writeStreamedCopy(input) {
+  const target = path.resolve(input.target);
+  const dir = path.dirname(target);
+  const tmp = path.join(dir, `.${path.basename(target)}.restore-tmp-${process.pid}-${randomBytes(6).toString('hex')}`);
+  let fd = null;
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fd = fs.openSync(tmp, 'wx', 0o600);
+    const opened = input.streamCopy((buffer) => {
+      fs.writeSync(fd, buffer, 0, buffer.length);
+    });
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = null;
+    fs.renameSync(tmp, target);
+    return opened;
+  } catch (error) {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        /* the failure being reported is the write */
+      }
+    }
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {
+      /* best effort: a leaked temp file is a directory entry, not a wrong byte */
+    }
+    throw error instanceof ChunkedError ? error : atomicWriteFailure(error, target);
+  }
+}
+
 /** A lookup/target failure in the house result shape (so every caller can read the same fields). */
 function refusal(code, detail) {
   return {
@@ -131,6 +364,9 @@ function refusal(code, detail) {
     record: null,
     copy_file: null,
     source_sha256: null,
+    copy_format: null,
+    streamed: false,
+    peakChunkBytes: null,
     recovered: { bytes: 0, sha256: null, doctor_ok: false, doctor_codes: [] },
     target: null,
     apply_plan: null,
@@ -155,6 +391,9 @@ function recordSummary(file, record) {
       file: record.full_copy.file,
       sha256: record.full_copy.sha256,
       size: record.full_copy.size,
+      // The record's claim (`chunked-v2`, or absent for a v1 copy); the plan's `copy_format` is what the magic
+      // bytes said, and `streamed`/`peakChunkBytes` report the reader that will actually run.
+      format: record.full_copy.format ?? V1_COPY_FORMAT,
     },
   };
 }
@@ -342,8 +581,15 @@ export function planOldRestore(input) {
         `version's own identity (${record.sha256} / ${record.size})`,
     );
   }
-  const sealed = readRegularFile(copyFile);
-  if (sealed === null) {
+  // Presence is checked before the key is opened (a missing copy is the common failure and must not depend on a
+  // credential); the format is decided by the file's own magic inside `readFullCopy`, never by the record field.
+  let copyStat;
+  try {
+    copyStat = fs.statSync(copyFile);
+  } catch {
+    copyStat = null;
+  }
+  if (copyStat === null || !copyStat.isFile()) {
     return refusal(OLD_RESTORE_CODES.CORRUPT, `${recordFile} claims a full copy at ${copyFile}, but it is missing or not a regular file`);
   }
 
@@ -359,24 +605,12 @@ export function planOldRestore(input) {
   if (key.ok !== true) return refusal(NO_PERMISSION, `${key.reason_code}: ${key.detail}`);
   if (!isDek(key.dek)) return refusal(NO_PERMISSION, 'the repository key opened without a usable DEK');
 
-  let plaintext;
-  try {
-    plaintext = openObject(sealed, key.dek, { sha256: record.sha256, length: record.size, kind: OLD_COPY_KIND });
-  } catch (error) {
-    return refusal(
-      OLD_RESTORE_CODES.CORRUPT,
-      `${recordFile}: the sealed full copy at ${copyFile} does not open as the recorded version: ` +
-        `${error?.code ?? 'BACKUP_DECRYPT_AUTH_FAILED'}: ${error?.detail ?? error?.message ?? String(error)}`,
-    );
+  const recovered = readFullCopy({ copyFile, dek: key.dek, record });
+  if (recovered.ok !== true) {
+    return refusal(OLD_RESTORE_CODES.CORRUPT, `${recordFile}: ${recovered.detail}`);
   }
+  const plaintext = recovered.plaintext;
   const recoveredSha = sha256Hex(plaintext);
-  if (recoveredSha !== record.sha256 || plaintext.length !== record.size) {
-    return refusal(
-      OLD_RESTORE_CODES.CORRUPT,
-      `${recordFile}: the full copy decrypts to ${plaintext.length} bytes / ${recoveredSha}, ` +
-        `not the recorded ${record.size} bytes / ${record.sha256}`,
-    );
-  }
 
   const doctor = diagnoseSessionBuffer(plaintext, { expectedSessionId: record.session_id ?? null });
   const doctorOk = doctor.ok === true;
@@ -419,6 +653,12 @@ export function planOldRestore(input) {
     record: recordSummary(recordFile, record),
     copy_file: copyFile,
     source_sha256: record.sha256,
+    // Additive format facts (the existing plan keys are unchanged): which container the copy actually is, whether
+    // the reader streams it, and the largest record it held. A v1 copy reports the whole file, so its peak is
+    // reported as null rather than pretending the chunked bound applies.
+    copy_format: recovered.format,
+    streamed: recovered.streamed,
+    peakChunkBytes: recovered.peakChunkBytes,
     recovered: {
       bytes: plaintext.length,
       sha256: recoveredSha,
@@ -431,9 +671,25 @@ export function planOldRestore(input) {
     keep_both: keepBoth,
     force_invalid: forceInvalid,
   };
-  // The verified bytes travel ON the plan but are not enumerable: a plan is a report (`--json` prints it) and a
-  // full session log inside a JSON report would be megabytes of Buffer notation. apply writes exactly these bytes.
-  Object.defineProperty(plan, 'plaintext', { value: plaintext, enumerable: false, writable: false });
+  // A v1 plan carries the verified bytes (non-enumerable: `--json` prints a small report, apply writes exactly
+  // these bytes). A v2 plan carries a re-open closure instead -- the log is not kept in memory after the doctor,
+  // and apply streams it out record by record, re-verifying the identity on the way (a copy that changed after
+  // the plan is refused, not written). Neither property is enumerable, so `JSON.stringify(plan)` stays a report.
+  if (recovered.streamed) {
+    Object.defineProperty(plan, STREAM_COPY, {
+      value: (write) =>
+        openChunkedStream(copyFile, {
+          dek: key.dek,
+          sha256: record.sha256,
+          size: record.size,
+          onChunk: (chunk) => write(chunk.plaintext),
+        }),
+      enumerable: false,
+      writable: false,
+    });
+  } else {
+    Object.defineProperty(plan, 'plaintext', { value: plaintext, enumerable: false, writable: false });
+  }
   Object.defineProperty(plan, 'record_file', { value: recordFile, enumerable: false, writable: false });
   Object.defineProperty(plan, 'source_file', { value: copyFile, enumerable: false, writable: false });
   Object.defineProperty(plan, 'copy_rel', {
@@ -462,9 +718,14 @@ function applyFailure(code, detail) {
 /**
  * Write the bytes a plan verified.
  *
- * Order: re-check the target -> (overwrite) copy the existing bytes to `.bak-<ts>` -> atomic write -> read back
- * and compare the digest. The read-back is the last line of defence against a disk or filesystem that lied; it
- * never replaces the check of what the plan saw.
+ * Order: re-check the target -> (overwrite) copy the existing bytes to `.bak-<ts>` -> write -> read back and
+ * compare the digest. The read-back is the last line of defence against a disk or filesystem that lied; it never
+ * replaces the check of what the plan saw.
+ *
+ * The write differs by the format the plan reported, and only there: a v1 plan carries the verified bytes and
+ * writes them with `atomic.writeFileAtomic`; a v2 plan carries a re-open closure and streams the copy into a
+ * temporary sibling of the target, `fsync`s and renames it (see {@link writeStreamedCopy}), then reads the digest
+ * back through a bounded buffer. The `.bak`, the target-changed check and their order are the same for both.
  *
  * @param {{plan: object, now?: Date}} input
  * @returns {{ok: boolean, reason_code: string|null, detail: string|null, file: string|null,
@@ -478,8 +739,17 @@ export function applyOldRestore(input) {
       plan?.detail ?? 'applyOldRestore needs a successful plan from planOldRestore',
     );
   }
+  const streamed = plan.streamed === true;
   const plaintext = plan.plaintext;
-  if (!Buffer.isBuffer(plaintext)) {
+  const streamCopy = plan[STREAM_COPY];
+  if (streamed) {
+    if (typeof streamCopy !== 'function') {
+      return applyFailure(
+        OLD_RESTORE_CODES.CORRUPT,
+        'the plan does not carry the streaming reader for its chunked full copy; make a new plan with planOldRestore',
+      );
+    }
+  } else if (!Buffer.isBuffer(plaintext)) {
     return applyFailure(
       OLD_RESTORE_CODES.CORRUPT,
       'the plan does not carry the recovered bytes; make a new plan with planOldRestore',
@@ -492,6 +762,10 @@ export function applyOldRestore(input) {
   }
   const now = input.now instanceof Date ? input.now : new Date();
   const expectedSha = plan.recovered?.sha256 ?? null;
+  const expectedBytes = streamed ? plan.recovered?.bytes : plaintext.length;
+  if (!Number.isSafeInteger(expectedBytes) || expectedBytes < 0) {
+    return applyFailure(OLD_RESTORE_CODES.CORRUPT, 'the plan does not carry the recovered length; make a new plan');
+  }
 
   // Read the target once, reusing those bytes for both the "did it change?" check and the `.bak` copy: reading it
   // twice would let a concurrent writer make the backup differ from the file the check approved.
@@ -528,23 +802,47 @@ export function applyOldRestore(input) {
       backupFile = `${targetPath}.bak-${compactStamp(now)}`;
       writeFileAtomic(backupFile, existing);
     }
-    writeFileAtomic(writePath, plaintext);
+    if (streamed) {
+      // The stream re-verifies the copy's identity before any byte lands under the target name; the read-back below
+      // then checks the file that was renamed into place, exactly as it does for a v1 write.
+      writeStreamedCopy({ streamCopy, target: writePath });
+    } else {
+      writeFileAtomic(writePath, plaintext);
+    }
   } catch (error) {
+    if (error instanceof ChunkedError) {
+      return applyFailure(
+        OLD_RESTORE_CODES.CORRUPT,
+        `${writePath}: the ${CHUNKED_FORMAT} full copy no longer opens as the recorded version ` +
+          `(it changed or was damaged after the plan): ${error.code}: ${error.detail}`,
+      );
+    }
     return applyFailure(
       error?.code ?? OLD_RESTORE_CODES.CORRUPT,
       `${writePath}: ${error?.detail ?? error?.message ?? String(error)}`,
     );
   }
 
-  const readBack = readRegularFile(writePath);
-  const readBackSha = readBack === null ? null : sha256Hex(readBack);
-  if (readBack === null || readBack.length !== plaintext.length || readBackSha !== expectedSha) {
+  // v1's read-back is exactly the old one (the whole buffer, hashed); a streamed write hashes the file through a
+  // bounded buffer instead of re-materialising a log that may be hundreds of megabytes.
+  let readBackBytes = null;
+  let readBackSha = null;
+  if (streamed) {
+    const hashed = hashFileBounded(writePath);
+    readBackBytes = hashed === null ? null : hashed.bytes;
+    readBackSha = hashed === null ? null : hashed.sha256;
+  } else {
+    const readBack = readRegularFile(writePath);
+    readBackBytes = readBack === null ? null : readBack.length;
+    readBackSha = readBack === null ? null : sha256Hex(readBack);
+  }
+  if (readBackBytes === null || readBackBytes !== expectedBytes || readBackSha !== expectedSha) {
     return {
       ok: false,
       reason_code: OLD_RESTORE_CODES.CORRUPT,
       detail:
-        `${writePath} was written but reads back as ${readBack === null ? 'missing' : `${readBack.length} bytes / ${readBackSha}`}, ` +
-        `not the recovered ${plaintext.length} bytes / ${expectedSha}`,
+        `${writePath} was written but reads back as ${readBackBytes === null ? 'missing' : `${readBackBytes} bytes / ${readBackSha}`}, ` +
+        `not the recovered ${expectedBytes} bytes / ${expectedSha}`,
       file: writePath,
       backup_file: backupFile,
       bytes: 0,
@@ -559,7 +857,7 @@ export function applyOldRestore(input) {
     detail: null,
     file: writePath,
     backup_file: backupFile,
-    bytes: plaintext.length,
+    bytes: expectedBytes,
     sha256: readBackSha,
     doctor_ok: plan.recovered?.doctor_ok === true,
     dry_run: false,

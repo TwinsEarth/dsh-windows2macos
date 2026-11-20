@@ -21,7 +21,7 @@ import { repoPaths } from '../src/backup/layout.mjs';
 import { openRepoKey } from '../src/backup/keystore.mjs';
 import { rebuildFile } from '../src/backup/materialize.mjs';
 import { sha256Hex } from '../src/backup/manifest.mjs';
-import { OLD_COPY_KIND, openObject } from '../src/backup/crypto.mjs';
+import { isChunkedV2, openChunkedBuffer } from '../src/backup/chunked.mjs';
 import { framesFor, header, makeHome, registryDocument, tempDir } from './helpers/backup-fixture.mjs';
 
 const PASSWORD = 'correct horse battery staple';
@@ -791,12 +791,16 @@ describe('mirror: the old/ version tree', () => {
       const mirrorKey = openRepoKey({ root: mirrorRoot, dshHome: repo.fixture.home, password: PASSWORD, platform: PLATFORM, machineKey: false });
       assert.equal(mirrorKey.ok, true, mirrorKey.detail);
       const copyFile = join(mirrorRoot, 'old', record.full_copy.file.split('/').slice(1).join('/'));
-      const plaintext = openObject(fs.readFileSync(copyFile), mirrorKey.dek, {
+      // The mirrored copy is format-agnostic (mirror copies bytes); it happens to be the chunked v2 file rotation
+      // writes, so read it the way a backup build reads it: by the file's own magic.
+      assert.equal(isChunkedV2(copyFile), true, 'rotation writes chunked v2 for new full copies');
+      const plaintext = openChunkedBuffer(fs.readFileSync(copyFile), {
+        dek: mirrorKey.dek,
         sha256: record.full_copy.sha256,
-        length: record.full_copy.size,
-        kind: OLD_COPY_KIND,
-      });
+        size: record.full_copy.size,
+      }).bytes;
       assert.equal(sha256Hex(plaintext), record.sha256, 'the mirrored copy decrypts to the recorded digest');
+      assert.equal(plaintext.length, record.size);
 
       const stampsBeforeResync = fileStamps(mirrorRoot);
       const second = syncToMirror({ root: repo.root, mirrorRoot, dshHome: repo.fixture.home, snapshotId: repo.snapshotId });

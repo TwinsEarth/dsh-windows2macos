@@ -79,8 +79,8 @@ AAD     "w2m-session-backup/old-chunked|sha256|size|chunkIndex"
 |---|---|---|---|
 | O1 ✅ | 格式 v2 编解码 + 单测 | **已实现** `src/backup/chunked.mjs`（817 行）：magic `W2MOLD2` + 明文 JSON header + 逐块 `nonce|ct|tag`，逐块 AAD `…old-chunked|sha|size|chunkIndex`；写端支持内存/临时文件+fsync+原子 rename/sink；读端流式逐块认证并校验 size/块序/尾随；错误码 `BACKUP_CHUNKED_AUTH_FAILED/TRUNCATED/ORDER/HEADER_INVALID/TRAILING/ARGUMENT_INVALID/READ_FAILED/WRITE_FAILED` | `test/backup-chunked.test.mjs` 27 例：字节布局、往返（1B/整块/多块/0B）、篡改/截断/乱序/尾随/错 DEK/身份绑定全部拒绝 |
 | O2 ✅ | verify 流式化 | **已实现**：`verify.mjs` 先读文件自身 8 字节 magic（不信任记录里的 `full_copy.format`）再分支；v1 路径逐字节保持原实现（`oldCopyMaxBytes` + `BACKUP_MEMORY_GUARD` + 整文件 openObject），v2 走 `openChunkedStream`（峰值 = 一个 ≤16 MiB 块）；`old_copies`/`streaming`/`limits`/coverage 返回形状不变 | 32 MiB 明文 / 4 MiB 块 / `--max-old-space-size=64` 子进程：reader 峰值 **4,194,332 B = 4 MiB + 28 B（12.5% 文件体积）**，写入峰值相同，断言为**精确值**；v1 套件未改且全绿 |
-| O3 | restore/old-restore 流式化 | 从 v2 副本恢复时流式写回（临时文件 → 原子 rename）；v1 保持现状 | restore 套件 + v1/v2 混合仓库 |
-| O4 | rotation 写 v2 + 文档 | 新副本写 v2；BACKUP-DESIGN §28；验收记录 | 真机跑一次 full 副本 + 恢复演练 |
+| O3 ✅ | restore/old-restore 流式化 | **已实现**：`old-restore` 按文件 magic 判定格式（不信任记录里的 format）；v1 路径逐字节不变，v2 走 `openChunkedStream` → 目标同目录临时文件 → fsync → 原子 rename，读回用有界 1 MiB 哈希；计划新增（仅 additive）`copy_format/streamed/peakChunkBytes`；损坏/计划后被换 → `BACKUP_OLD_RESTORE_CORRUPT` + `BACKUP_CHUNKED_*` detail、零写入；`.bak`/target-changed 语义与 v1 一致 | 32 MiB / 4 MiB 块在 `--max-old-space-size=64` 子进程恢复成功，计划报告的 peak **4,194,332 B = 4 MiB+28 B**；v1/v2 混合仓库两种都能恢复 |
+| O4 ✅（真机演练待授权） | rotation 写 v2 + 文档 | **已实现**：新 full 副本用 `sealChunkedToFile` 写 v2，记录增 `full_copy.format:"chunked-v2"`（v1 记录无字段仍可读）；300 MB 上限/特批逻辑与失败顺序（先副本后记录）不变；`old-backfill` 的完整性判断改为格式感知（v2 不再被误判为 torn v1）；`docs/BACKUP-DESIGN.md` 新增 §28（字节布局/AAD/错误码/兼容矩阵/恢复流式/gc·mirror 不变/真机演练步骤/诚实边界） | 新 `test/backup-old-chunked.test.mjs` 12 例；rotation/restore/gc/mirror/verify 全绿（backup 全组 611/611）；**真机 full 副本 + 恢复演练待用户授权执行**（步骤见 §28.7） |
 
 **O 组进展（2026-11-20）**：O1/O2 已实现并有 27 例新测试（v1 行为逐字节不变）；O3（restore/old-restore 流式读 v2）与 O4（rotation 写 v2 + 真机恢复演练）待做。
 

@@ -4,6 +4,21 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### P2-O3/O4：chunked-v2 恢复流式读与 rotation 默认写 v2（未发布）
+
+- **O3 恢复**：`old-restore` 按文件自身 magic 判定格式；v1 路径逐字节不变，v2 流式解密到目标同目录临时文件 → fsync →
+  原子 rename（读回用有界 1 MiB 哈希）；计划仅新增 `copy_format/streamed/peakChunkBytes`；损坏或计划后被替换 →
+  `BACKUP_OLD_RESTORE_CORRUPT`（detail 带 `BACKUP_CHUNKED_*`）、零写入；`.bak` 与 target-changed 语义同 v1。
+- **O4 rotation**：新 full 副本默认写 chunked-v2，记录增 `full_copy.format:"chunked-v2"`；v1 记录无字段仍可读；
+  300 MB 上限/特批与"先写副本后写记录"顺序不变；`old-backfill` 完整性判断格式感知（v2 不再被误判 torn v1）；
+  CLI 计划行区分 `chunked-v2 (streamed…)` 与 `v1 sealed object (whole file)`。
+- **文档**：`docs/BACKUP-DESIGN.md` 新增 §28（字节布局+AAD、`BACKUP_CHUNKED_*` 错误码表、兼容矩阵：v1 处处可读 /
+  v2 仅本版及以后 / 旧版用具名码拒绝、rotation 默认、恢复流式、gc/mirror/verify/backfill 表、真机演练步骤、诚实边界）。
+- **测试**：新 `test/backup-old-chunked.test.mjs` 12 例（v2 计划/应用精确字节、`.bak` 冲突、target-changed、混合仓库、
+  损坏 v2 具名拒绝、gc 孤儿、mirror 逐字节、32 MiB/4 MiB 块 `--max-old-space-size=64` 恢复 peak 精确断言）；
+  rotation 用例改为断言 v2 + 记录 format，并保留一条 v1 副本恢复用例；backup 全组 **611/611**。
+- **未做**：真机 full 副本 + 恢复演练（需用户授权，步骤见 §28.7）；F4（故障场景并入真实进程回归）仍待做。
+
 ### 队列日志二次加固：候选槽链、DSH 版本带内告警、宿主诊断路由（未发布）
 
 - **候选槽链（单一事实源）**：`JQ_CHIP_SLOT_CANDIDATES = [conversation.input.left, conversation.composer.dock]`、

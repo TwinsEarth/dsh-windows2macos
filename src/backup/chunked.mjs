@@ -9,8 +9,9 @@
  * copy is a 500 MB allocation. That is the P2 risk this format removes: `v2` splits the plaintext into
  * independent records so a reader can authenticate one chunk at a time and hold **one chunk**, not the file.
  *
- * This file is additive. Nothing in `rotation`/`old-restore` writes or reads v2 yet (that is O3/O4), and every
- * existing `.enc` stays a v1 object: `verify` sniffs the magic and keeps the v1 path exactly as it was.
+ * `rotation` writes every **new** whole-file copy as v2 (`sealChunkedToFile`) and records
+ * `full_copy.format: 'chunked-v2'`; `verify` and `old-restore` sniff the magic and keep the v1 path exactly as it
+ * was for every existing `.enc`. A record's `full_copy.format` is only a claim -- the eight magic bytes decide.
  *
  * ## Byte layout
  *
@@ -74,7 +75,7 @@ export const CHUNKED_MAGIC = Buffer.from('W2MOLD2\n', 'ascii');
 /** Version written in the header and accepted by this build. */
 export const CHUNKED_VERSION = 2;
 
-/** Value a future `full_copy.format` record field will carry for a v2 copy (O4); v1 records omit the field. */
+/** Value a v2 copy's `full_copy.format` record field carries (O4); a v1 copy's record omits the field. */
 export const CHUNKED_FORMAT = 'chunked-v2';
 
 /** Default chunk size: 4 MiB, the same block size the deduplicated object store uses. */
@@ -787,6 +788,71 @@ export function openChunkedStream(source, options = {}) {
       chunks,
       bytesRead,
       peakChunkBytes,
+    };
+  } finally {
+    reader.close();
+  }
+}
+
+/**
+ * The declared layout of a chunked-v2 file, read from its magic and plaintext header **without decrypting it**.
+ *
+ * This exists for the one question a non-reader legitimately asks of a sealed copy: "is the file the length its
+ * own framing implies?" `old-backfill` needs it to tell a complete v2 copy from a torn one without doing the v1
+ * arithmetic (`size + fixed overhead`), which is wrong for v2 by construction -- v2's length depends on the
+ * `chunkBytes` its header names. The arithmetic here is the same `chunkCountFor`/record-size rule the reader
+ * uses, so the two cannot drift; `complete` is an exact framing check, not an authentication check (only
+ * {@link openChunkedStream} can say whether the bytes authenticate).
+ *
+ * @param {Buffer|string} source the sealed file's bytes or path
+ * @returns {{ok: true, format: string, alg: string, sha256: string, size: number, chunkBytes: number,
+ *   chunks: number, headerBytes: number, recordBytes: number, expectedBytes: number, fileBytes: number,
+ *   complete: boolean}}
+ * @throws {ChunkedError} `BACKUP_CHUNKED_HEADER_INVALID` for a non-v2 file or a header this build refuses /
+ *   `BACKUP_CHUNKED_READ_FAILED` when the file cannot be read or stat'ed / `BACKUP_CHUNKED_ARGUMENT_INVALID`
+ */
+export function measureChunkedFile(source) {
+  if (typeof source !== 'string' && !Buffer.isBuffer(source)) {
+    throw new ChunkedError(CHUNKED_CODES.ARGUMENT_INVALID, 'the source must be a Buffer or a file path');
+  }
+  const reader = createSource(source);
+  try {
+    const magic = reader.readUpTo(CHUNKED_MAGIC.length);
+    if (magic.length !== CHUNKED_MAGIC.length || !magic.equals(CHUNKED_MAGIC)) {
+      throw new ChunkedError(
+        CHUNKED_CODES.HEADER_INVALID,
+        `the file does not start with the ${JSON.stringify(CHUNKED_MAGIC.toString('ascii'))} v2 magic`,
+      );
+    }
+    const parsed = readHeader(reader);
+    const { header } = parsed;
+    const chunks = chunkCountFor(header.size, header.chunkBytes);
+    const headerBytes = CHUNKED_MAGIC.length + parsed.bytes;
+    const recordBytes = (NONCE_LENGTH + TAG_LENGTH) * chunks;
+    const expectedBytes = headerBytes + header.size + recordBytes;
+    let fileBytes;
+    if (Buffer.isBuffer(source)) {
+      fileBytes = source.length;
+    } else {
+      try {
+        fileBytes = fs.statSync(source).size;
+      } catch (error) {
+        throw new ChunkedError(CHUNKED_CODES.READ_FAILED, `${source}: ${error?.code ?? 'stat failed'}`);
+      }
+    }
+    return {
+      ok: true,
+      format: CHUNKED_FORMAT,
+      alg: header.alg,
+      sha256: header.sha256,
+      size: header.size,
+      chunkBytes: header.chunkBytes,
+      chunks,
+      headerBytes,
+      recordBytes,
+      expectedBytes,
+      fileBytes,
+      complete: fileBytes === expectedBytes,
     };
   } finally {
     reader.close();

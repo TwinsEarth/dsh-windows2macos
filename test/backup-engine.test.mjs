@@ -23,6 +23,7 @@ import { readCurrent, listOldVersions } from '../src/backup/rotation.mjs';
 import { readSnapshot } from '../src/backup/repo.mjs';
 import { scanHome } from '../src/backup/scan.mjs';
 import { openObject } from '../src/backup/crypto.mjs';
+import { openChunkedBuffer } from '../src/backup/chunked.mjs';
 import { openRepoKey, readRepoKeys } from '../src/backup/keystore.mjs';
 import { findHarnessInstallation } from '../src/backup/runtime-validate.mjs';
 
@@ -719,11 +720,13 @@ describe('engine: oldFormat full (a literal sealed copy of the superseded versio
       assert.equal(record.full_copy.file, second.full_old_versions[0]);
       const key = openRepoKey({ root, dshHome: home, password: PASSWORD, platform: PLATFORM });
       assert.equal(key.ok, true, key.detail ?? '');
-      const opened = openObject(readFileSync(join(root, ...record.full_copy.file.split('/'))), key.dek, {
+      // Rotation writes chunked v2 (O3), so the copy is read by its own magic; the record names the container too.
+      assert.equal(record.full_copy.format, 'chunked-v2');
+      const opened = openChunkedBuffer(readFileSync(join(root, ...record.full_copy.file.split('/'))), {
+        dek: key.dek,
         sha256: record.full_copy.sha256,
-        length: record.full_copy.size,
-        kind: 'old',
-      });
+        size: record.full_copy.size,
+      }).bytes;
       assert.deepEqual(opened, superseded, 'the copy must be the superseded version, byte for byte');
       assert.equal(sha256Hex(opened), sha256Hex(superseded));
 
@@ -858,14 +861,14 @@ describe('engine: the oldFormat full whole-file copy cap and its explicit approv
       assert.ok(record?.full_copy, 'the rotation wrote the sealed copy');
       assert.equal(record.full_copy.approved_over_cap, true);
       assert.equal(record.full_copy.cap_bytes, CAP);
-      // The copy is still the superseded version, byte for byte, under the old-copy identity.
+      // The copy is still the superseded version, byte for byte, in the chunked container rotation writes (O3).
       const key = openRepoKey({ root, dshHome: home, password: PASSWORD, platform: PLATFORM });
       assert.equal(key.ok, true, key.detail ?? '');
-      const opened = openObject(readFileSync(join(root, ...record.full_copy.file.split('/'))), key.dek, {
+      const opened = openChunkedBuffer(readFileSync(join(root, ...record.full_copy.file.split('/'))), {
+        dek: key.dek,
         sha256: record.full_copy.sha256,
-        length: record.full_copy.size,
-        kind: 'old',
-      });
+        size: record.full_copy.size,
+      }).bytes;
       assert.deepEqual(opened, superseded);
       assert.equal(sha256Hex(opened), record.sha256);
     } finally {

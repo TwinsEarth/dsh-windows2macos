@@ -1118,6 +1118,15 @@ export function formatOldRestore(plan, applied) {
   lines.push(`record        : ${plan.record.file}`);
   lines.push(`session       : ${plan.record.session_id ?? '—'}${plan.record.rel === null ? '' : ` (${plan.record.rel})`}`);
   lines.push(`source digest : ${plan.source_sha256}`);
+  // Which container the copy is (decided by the file's own magic, §28) and what that means for the write: a v2 copy
+  // is streamed back in one-record pieces; a v1 copy is decrypted whole and written whole.
+  lines.push(
+    `copy          : ${
+      plan.copy_format === 'chunked-v2'
+        ? `chunked-v2 (streamed, peak one ${humanBytes(plan.peakChunkBytes)} record)`
+        : 'v1 sealed object (whole file)'
+    }`,
+  );
   lines.push(`recovered     : ${humanBytes(plan.recovered.bytes)} sha256 ${plan.recovered.sha256}`);
   const doctorText = plan.recovered.doctor_ok
     ? 'passed (static pre-filter)'

@@ -44,6 +44,7 @@ import {
   writeCurrentPointer,
 } from '../src/backup/rotation.mjs';
 import { MIN_SCRYPT, OLD_COPY_KIND, openObject, randomDek, sealObject } from '../src/backup/crypto.mjs';
+import { CHUNKED_FORMAT, isChunkedV2, openChunkedBuffer } from '../src/backup/chunked.mjs';
 import { ensureLayout, repoPaths } from '../src/backup/layout.mjs';
 import { openRepoKey } from '../src/backup/keystore.mjs';
 import { SEALED_COPY_OVERHEAD, backfillOldFullCopies } from '../src/backup/old-backfill.mjs';
@@ -453,7 +454,7 @@ describe('rotation: oldFormat (records vs the literal full copy)', () => {
     }
   });
 
-  it('writes the record plus one sealed whole-file copy, which decrypts to the superseded bytes', () => {
+  it('writes the record plus one chunked-v2 whole-file copy, which decrypts to the superseded bytes', () => {
     const { dir, cleanup } = tempDir('w2m-rot-full-');
     try {
       const dek = randomDek();
@@ -470,23 +471,29 @@ describe('rotation: oldFormat (records vs the literal full copy)', () => {
       assert.equal(record.version, OLD_VERSION);
       assert.equal(record.full_copy.sha256, previous.sha256);
       assert.equal(record.full_copy.size, bytes.length);
+      assert.equal(record.full_copy.format, CHUNKED_FORMAT, 'new copies name their container on the record');
       assert.equal(record.full_copy.file, result.full_copy.file);
       assert.match(record.full_copy.file, /^old\/--E-GPT--\/session-aaaaaaaa-0001\/20261117T140000Z-[0-9a-f]{12}\.json\.enc$/u);
       const copyFile = fullCopyPathFor(dir, record);
       assert.equal(copyFile, oldFullCopyPath(dir, previous, '20261117T140000Z'));
       assert.equal(existsSync(copyFile), true);
-      const opened = openObject(readFileSync(copyFile), dek, {
-        sha256: record.full_copy.sha256,
-        length: record.full_copy.size,
-        kind: OLD_COPY_KIND,
-      });
-      assert.deepEqual(opened, bytes, 'the copy must decrypt to the superseded bytes');
-      assert.equal(createHash('sha256').update(opened).digest('hex'), record.full_copy.sha256);
-      // The copy is NOT a block: the same bytes under the block identity must not authenticate.
+      // The file is chunked v2, and the record's format claim agrees with the magic bytes rather than replacing
+      // them: the reader decides by the file (docs/BACKUP-DESIGN.md §28).
+      assert.equal(isChunkedV2(copyFile), true, 'rotation writes the chunked format (O3)');
+      const opened = openChunkedBuffer(readFileSync(copyFile), { dek });
+      assert.deepEqual(opened.bytes, bytes, 'the copy must decrypt to the superseded bytes');
+      assert.equal(opened.sha256, record.full_copy.sha256);
+      assert.equal(createHash('sha256').update(opened.bytes).digest('hex'), record.full_copy.sha256);
+      // A v2 copy is not a v1 object and not a block: the v1 container's magic check refuses it by name.
+      assert.throws(
+        () => openObject(readFileSync(copyFile), dek, { sha256: record.full_copy.sha256, length: record.full_copy.size, kind: OLD_COPY_KIND }),
+        (error) => error.code === 'BACKUP_ENVELOPE_MALFORMED',
+        'a chunked copy must not open as a v1 whole-file copy',
+      );
       assert.throws(
         () => openObject(readFileSync(copyFile), dek, { sha256: record.full_copy.sha256, length: record.full_copy.size }),
-        (error) => error.code === 'BACKUP_DECRYPT_AUTH_FAILED',
-        'a whole-file copy must not open as a block object',
+        (error) => error.code === 'BACKUP_ENVELOPE_MALFORMED',
+        'a chunked copy must not open as a block object either',
       );
     } finally {
       cleanup();
@@ -1065,7 +1072,7 @@ describe('rotation: the full-copy cap and its approval annotation', () => {
       assert.equal(record.full_copy.size, bytes.length);
       const copyFile = fullCopyPathFor(dir, record);
       assert.deepEqual(
-        openObject(readFileSync(copyFile), dek, { sha256: record.full_copy.sha256, length: record.full_copy.size, kind: OLD_COPY_KIND }),
+        openChunkedBuffer(readFileSync(copyFile), { dek, sha256: record.full_copy.sha256, size: record.full_copy.size }).bytes,
         bytes,
         'the annotated copy is still the superseded bytes',
       );
@@ -1272,6 +1279,22 @@ describe('rotation: old-restore (restoring a version from its full copy)', () =>
     return { lines, io };
   }
 
+  /** Replace a fixture's chunked-v2 copy with the historical v1 seal (what a pre-O3 build wrote). */
+  function downgradeCopyToV1(repo) {
+    const copyFile = fullCopyFiles(repo.root)[0];
+    assert.equal(isChunkedV2(copyFile), true, 'the fixture starts with the format rotation writes');
+    writeFileSync(
+      copyFile,
+      sealObject(repo.bytes, repo.dek, {
+        sha256: repo.record.record.sha256,
+        length: repo.bytes.length,
+        kind: OLD_COPY_KIND,
+      }),
+    );
+    assert.equal(isChunkedV2(copyFile), false);
+    return copyFile;
+  }
+
   it('plans and applies a byte-identical restore from the copy alone (primary blocks deleted)', () => {
     const bytes = runtimeValidSessionLog(RESTORE_SESSION);
     const repo = fullCopyFixture('w2m-rot-old-restore-bytes-', bytes);
@@ -1285,6 +1308,11 @@ describe('rotation: old-restore (restoring a version from its full copy)', () =>
       assert.equal(plan.recovered.doctor_ok, true, 'the fixture version is a valid session log');
       assert.equal(plan.target.exists, false);
       assert.equal(plan.apply_plan.mode, 'create');
+      // The plan reports the streaming facts without changing any of the plan keys it already had (O3).
+      assert.equal(plan.copy_format, CHUNKED_FORMAT);
+      assert.equal(plan.streamed, true, 'a v2 copy is streamed, not held as one object');
+      assert.equal(plan.peakChunkBytes, bytes.length + 28, 'the whole fixture fits one record');
+      assert.equal('plaintext' in plan, false, 'a v2 plan does not keep the recovered log in memory');
 
       const applied = applyOldRestore({ plan, now: FIXED_NOW });
       assert.equal(applied.ok, true, applied.detail);
@@ -1293,6 +1321,29 @@ describe('rotation: old-restore (restoring a version from its full copy)', () =>
       assert.equal(applied.bytes, bytes.length);
       assert.equal(applied.doctor_ok, true);
       assert.deepEqual(readFileSync(applied.file), bytes, 'the restored file is the superseded version byte for byte');
+      assert.deepEqual(readdirSync(repo.dir).filter((name) => name.includes('restore-tmp')), [], 'the temp sibling was renamed, not left behind');
+    } finally {
+      repo.cleanup();
+    }
+  });
+
+  it('restores a v1 copy on disk exactly as before (the record claim does not decide the reader)', () => {
+    const bytes = runtimeValidSessionLog(RESTORE_SESSION);
+    const repo = fullCopyFixture('w2m-rot-old-restore-v1-', bytes);
+    try {
+      downgradeCopyToV1(repo);
+      const plan = planFor(repo);
+      assert.equal(plan.ok, true, plan.detail);
+      // The record still says chunked-v2 (rotation wrote it); the magic bytes say v1, and the magic wins.
+      assert.equal(plan.record.full_copy.format, CHUNKED_FORMAT);
+      assert.equal(plan.copy_format, 'v1');
+      assert.equal(plan.streamed, false);
+      assert.equal(plan.peakChunkBytes, null);
+      assert.equal(plan.recovered.doctor_ok, true);
+      const applied = applyOldRestore({ plan, now: FIXED_NOW });
+      assert.equal(applied.ok, true, applied.detail);
+      assert.equal(applied.bytes, bytes.length);
+      assert.deepEqual(readFileSync(applied.file), bytes);
     } finally {
       repo.cleanup();
     }
@@ -1311,6 +1362,7 @@ describe('rotation: old-restore (restoring a version from its full copy)', () =>
       assert.equal(plan.ok, false);
       assert.equal(plan.reason_code, OLD_RESTORE_CODES.CORRUPT);
       assert.match(plan.detail, /does not open as the recorded version/u);
+      assert.match(plan.detail, /BACKUP_CHUNKED_/u, 'the chunked code names the cause instead of one flat refusal');
       assert.equal(existsSync(outFile), false, 'a refused plan writes nothing');
 
       const applied = applyOldRestore({ plan });

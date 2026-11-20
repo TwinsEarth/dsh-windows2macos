@@ -37,8 +37,14 @@ export class AtomicWriteError extends Error {
   }
 }
 
-/** Map a filesystem failure to the code an operator can act on. */
-function writeFailure(error, file) {
+/**
+ * Map a filesystem failure to the code an operator can act on.
+ *
+ * Exported because a **streaming** durable write (`old-restore`'s chunked copy) cannot use {@link writeFileAtomic}
+ * -- it never holds the bytes as one Buffer -- but must still report `ENOSPC`/`EACCES` as the same named codes
+ * rather than leaking a raw `errno` into a refusal.
+ */
+export function atomicWriteFailure(error, file) {
   const code = error?.code;
   if (code === 'ENOSPC') return new AtomicWriteError(ATOMIC_CODES.DISK_FULL, `${file}: the volume is full (ENOSPC)`);
   if (code === 'EACCES' || code === 'EPERM' || code === 'EROFS') {
@@ -82,7 +88,7 @@ export function writeFileAtomic(file, data) {
     } catch {
       /* best effort: a leaked temp file is reported by gc, not hidden */
     }
-    throw writeFailure(error, target);
+    throw atomicWriteFailure(error, target);
   }
 }
 
