@@ -10,6 +10,7 @@
  *   GET  /api/w2m/composer/journal?list=1         -> { ok, entries }   (recovery list, newest first)
  *   POST /api/w2m/composer/journal                { key, draft, queue, path, sessionKey }
  *   GET  /api/w2m/composer/journal/history?limit=&sessionKey= -> { ok, items }
+ *   GET  /api/w2m/composer/journal/diagnostics     -> { ok, dir, entries, lastWriteAt, writable, errors }
  *   POST /api/w2m/composer/queue                  { sessionId, items:[{text}] }
  *
  * The journal only stores what the user has not sent. Nothing here sends a message: the queue
@@ -167,6 +168,24 @@ export function registerQueueJournalRoutes(ctx, deps) {
       const items = deps.journal.history({ limit, sessionKey });
       const error = deps.journal.historyLoadError?.() ?? null;
       return json(200, { ok: true, items, ...(error === null ? {} : { error }) });
+    });
+
+    // v3.6.1: read-only host diagnostics for the client's failure copy. The shape is fixed even when
+    // the store itself throws, because this route is what a broken journal is diagnosed with.
+    // `writable` is a best-effort W_OK probe: it creates no file and no directory.
+    register(`${QUEUE_JOURNAL_ROUTE_PREFIX}/diagnostics`, ['GET'], () => {
+      try {
+        return json(200, { ok: true, ...deps.journal.diagnostics() });
+      } catch (error) {
+        return json(200, {
+          ok: false,
+          dir: String(deps.dataDir ?? ''),
+          entries: 0,
+          lastWriteAt: null,
+          writable: false,
+          errors: [String(error?.message ?? error)],
+        });
+      }
     });
 
     // v3.3.6：直接从 DSH 会话日志读取人类输入历史与最后一条 assistant 消息。

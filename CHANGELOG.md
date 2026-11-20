@@ -4,6 +4,29 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### 队列日志二次加固：候选槽链、DSH 版本带内告警、宿主诊断路由（未发布）
+
+- **候选槽链（单一事实源）**：`JQ_CHIP_SLOT_CANDIDATES = [conversation.input.left, conversation.composer.dock]`、
+  `JQ_OVERLAY_SLOT_CANDIDATES = [shell.overlay, shell.bottom]`，按顺序尝试并把每次尝试写入
+  `diagnostics.slotAttempts [{slot, ok, reason}]`；全部失败仍注册可见的 `sidebar.panellist` 降级入口。
+- **测试带告警（不隐藏 UI）**：读取 `window.__DSH_BOOT__.release.version`（客户端模块系统同源字段）与
+  `JQ_TESTED_DSH_RANGE` 比较；带外 → 状态 `unverified` + `data-w2m-jq-status="unverified"` 一行提示（含检测到的版本与测试范围），
+  功能照常渲染；版本不可读 → `unknown`，不当作失败。
+- **宿主诊断路由**：`GET /api/w2m/composer/journal/diagnostics` → `{ok, dir, entries, lastWriteAt, writable, errors}`，
+  与其他路由同一 guard/fang 令牌栅栏；只读探测不创建文件；目录缺失/文件损坏仍 200 并给具名原因。
+- **客户端失败原因可判读**：刷新失败时区分「路由缺失（404）」与「宿主错误（HTTP n）+ 诊断路由可用性/可写性/存储错误」，
+  显示在 drawer 与降级提示（`data-w2m-jq-host-error`）；不新增轮询。
+- **文档**：`docs/QUEUE-JOURNAL-COMPAT.md` 重写——候选链、版本来源、状态优先级 `disabled > fallback > unverified > slotted`、
+  `slotAttempts`、诊断路由契约、升级后如何放宽版本带与验收清单。
+- **测试**：候选链降级（第一 miss → 第二命中；`shell.overlay`→`shell.bottom`；全 miss → sidebar 降级 + 完整 slotAttempts）、
+  带外版本告警不隐藏、失败原因 404 vs host-error、诊断路由（形状/空目录/缺失/损坏/不创建文件/鉴权）、真实页面探针
+  （`W2M_DSH_ROOT=D:\DSH` + `W2M_QUEUE_JOURNAL_PROBE=1` → loader-entry 10/10，运行时诊断 `status: slotted`、
+  `surface: conversation.input.left+shell.overlay`、`dshVersion: 0.2.2-rc.5`、slotAttempts 两项 accepted、宿主诊断路由 200、
+  drawer rows=1/hasDraft/hasRestore、draft 落盘到临时 `$DSH_HOME/xclient/queue-journal` 并恢复）。
+- **备份覆盖**：`xclient/queue-journal/**` 属 state scope（新增 `backup-scopes` 断言：journal.json/history.jsonl 被采集，
+  `*.bak-*` 按 self-copy 跳过）——队列日志不再可能"进了备份又被漏掉"。
+- 客户端体积仍在预算内：599,710 B / ≤610,000，单函数上限 1,200 未变。
+
 ### P2-O1/O2：`old/ .enc` 分块封存格式 v2 + verify 流式校验（未发布）
 
 - 新增 `src/backup/chunked.mjs`（分块封存格式 v2）：magic `W2MOLD2\n` + 明文 JSON header + 逐块

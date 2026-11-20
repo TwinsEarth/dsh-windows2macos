@@ -598,7 +598,7 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
         if (chip.found === true) break;
         await new Promise((resolve) => setTimeout(resolve, 250));
       }
-      const diagnostics = await read(`const d=window.__W2M_QUEUE_JOURNAL__; return d===undefined?null:{status:d.status,surface:d.surface,reasons:d.reasons,dshVersion:d.dshVersion,checkedAt:d.checkedAt};`);
+      const diagnostics = await read(`const d=window.__W2M_QUEUE_JOURNAL__; return d===undefined?null:{status:d.status,surface:d.surface,reasons:d.reasons,dshVersion:d.dshVersion,checkedAt:d.checkedAt,slotAttempts:d.slotAttempts};`);
       // A throwaway profile boots with the Host-release modal open (the served page has no matching
       // release). It traps focus, so dismiss it before driving the real composer. Programmatic clicks
       // on the chip would still work under it; typing would not.
@@ -680,10 +680,27 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
       `);
       const opened = await read(`const b=document.querySelector('[data-w2m-jq-chip]'); if(b===null)return{clicked:false}; b.click(); return{clicked:true};`);
       await new Promise((resolve) => setTimeout(resolve, 700));
+      // v3.6.1: the host diagnostics route the client uses to explain a failed read.
+      const diagnosticsRoute = await readAsync(`
+        (async () => {
+          const r = await fetch('/api/w2m/composer/journal/diagnostics');
+          const b = await r.json().catch(() => null);
+          return JSON.stringify({
+            status: r.status,
+            ok: b?.ok === true,
+            dirType: typeof b?.dir,
+            dirEndsWith: typeof b?.dir === 'string' ? b.dir.replace(/\\\\/g, '/').endsWith('/queue-journal') : false,
+            entries: Number.isInteger(b?.entries),
+            writable: typeof b?.writable,
+            lastWriteAt: b?.lastWriteAt === null || typeof b?.lastWriteAt === 'string',
+            errors: Array.isArray(b?.errors),
+          });
+        })()
+      `);
       const drawer = await read(`
         const d=document.querySelector('[data-w2m-jq-drawer]');
         const body=(d?.querySelector('.w2mDcBody')?.innerText??'');
-        return {found:d!==null, marker:d?.getAttribute('data-w2m-jq-drawer')??null, status:d?.getAttribute('data-w2m-jq-status')??null, rows:d===null?0:d.querySelectorAll('[data-w2m-jq-entry]').length, hasDraft:body.includes('probe-journal-draft'), hasRestore:d!==null&&d.querySelector('[data-w2m-jq-restore-draft]')!==null};
+        return {found:d!==null, marker:d?.getAttribute('data-w2m-jq-drawer')??null, status:d?.getAttribute('data-w2m-jq-status')??null, rows:d===null?0:d.querySelectorAll('[data-w2m-jq-entry]').length, hasDraft:body.includes('probe-journal-draft'), hasRestore:d!==null&&d.querySelector('[data-w2m-jq-restore-draft]')!==null, unverifiedNotice:d!==null&&d.querySelector('.w2mJqNotice')!==null};
       `);
       const clearedFocus = await read(`
         ${composerExpression}
@@ -713,7 +730,7 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
       const closed = await read(`const b=document.querySelector('[data-w2m-jq-close]'); if(b===null)return{closed:false}; b.click(); return{closed:true};`);
       await new Promise((resolve) => setTimeout(resolve, 300));
       const closeState = await read(`return {closed:document.querySelector('[data-w2m-jq-drawer]')===null};`);
-      report.queueJournalProbe = { chip, diagnostics, dismissed, focused, typed, saved, opened, drawer, cleared, restored, afterRestore, closed, closeState };
+      report.queueJournalProbe = { chip, diagnostics, diagnosticsRoute, dismissed, focused, typed, saved, opened, drawer, cleared, restored, afterRestore, closed, closeState };
     }
     // v3.5.x: the unlock dialog probe. It is independent of the decision-center probe because the backup
     // panel lives on the session-less left sidebar: its seat and main page are visible on the landing page,

@@ -64,6 +64,9 @@ function scopeHome() {
     'xclient/gpw-folders.json.key': 'private',
     'xclient/spool/outbox.json': '[]',
     'xclient/w2m-backup/state.json': '{}',
+    'xclient/queue-journal/journal.json': '{"entries":[]}',
+    'xclient/queue-journal/history.jsonl': '{"at":1}\n',
+    'xclient/queue-journal/state.json.bak-20260101': 'old',
     'xclient/agent.log': 'log line',
     'xclient/agent.json.bak-20260101': 'old',
     'storages/dsh-context/state.json': '{}',
@@ -139,6 +142,10 @@ describe('backup scopes: collectScopeFiles', () => {
         'xclient/gpw-folders.json': ['state', 'state'],
         'xclient/spool/outbox.json': ['state', 'state'],
         'xclient/w2m-backup/state.json': ['state', 'state'],
+        // The queue journal is durable user data (drafts/queued messages), not a cache: the state scope must
+        // capture it so a restore can bring the journal back (the drawer otherwise shows an empty list).
+        'xclient/queue-journal/journal.json': ['state', 'state'],
+        'xclient/queue-journal/history.jsonl': ['state', 'state'],
         'storages/dsh-context/state.json': ['state', 'state'],
         'llm-deepseek/config.json': ['state', 'state'],
         'fang/contract.json': ['state', 'state'],
@@ -175,6 +182,7 @@ describe('backup scopes: collectScopeFiles', () => {
         'storages/workspace.json.bak-20260101',
         'xclient/agent.log',
         'xclient/agent.json.bak-20260101',
+        'xclient/queue-journal/state.json.bak-20260101',
         'dsh-runtimes/node/bin/node',
         'xray-proxy/xray.exe',
         'sessions/.event-cache/projection.json',

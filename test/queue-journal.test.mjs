@@ -76,7 +76,7 @@ test('queue journal: save, read back and list newest first', async () => {
   const { routes, service, call } = mount({ dataDir: root });
   assert.deepEqual(
     [...routes.keys()].sort(),
-    [QUEUE_JOURNAL_ROUTE_PREFIX, `${QUEUE_JOURNAL_ROUTE_PREFIX}/history`, `${QUEUE_JOURNAL_ROUTE_PREFIX}/sessions`, `${QUEUE_JOURNAL_ROUTE_PREFIX}/session-log`, QUEUE_RESTORE_ROUTE_PATH].sort(),
+    [QUEUE_JOURNAL_ROUTE_PREFIX, `${QUEUE_JOURNAL_ROUTE_PREFIX}/history`, `${QUEUE_JOURNAL_ROUTE_PREFIX}/sessions`, `${QUEUE_JOURNAL_ROUTE_PREFIX}/session-log`, `${QUEUE_JOURNAL_ROUTE_PREFIX}/diagnostics`, QUEUE_RESTORE_ROUTE_PATH].sort(),
   );
   assert.ok(service, 'the journal service is provided');
   const saved = await call(
@@ -341,6 +341,10 @@ test('v3.6.0: the optional fang interop token gates the routes and its absence i
     const allowed = await call(`${QUEUE_JOURNAL_ROUTE_PREFIX}?list=1`, { headers: { 'x-fang-auth': token } });
     assert.equal(allowed.status, 200);
     assert.equal(allowed.body.ok, true);
+    const deniedDiagnostics = await call(`${QUEUE_JOURNAL_ROUTE_PREFIX}/diagnostics`);
+    assert.equal(deniedDiagnostics.status, 401, 'the diagnostics route follows the same guard');
+    const allowedDiagnostics = await call(`${QUEUE_JOURNAL_ROUTE_PREFIX}/diagnostics`, { headers: { 'x-fang-auth': token } });
+    assert.equal(allowedDiagnostics.status, 200);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -364,6 +368,96 @@ test('v3.6.0: restore forwards to a live agent only, capping text and counting r
     assert.equal(sent[0][0].content[0].text.length, 4_000, 'restore caps a message at 4000 characters');
     assert.equal(sent[1][0].content[0].text, 'ok');
     assert.equal(sent[0][2], false, 'the restored message is not treated as a steering message');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('v3.6.1: the diagnostics route reports the journal directory without creating files', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'w2m-qj-diag-'));
+  try {
+    const { call } = mount({ dataDir: root });
+    assert.equal(existsSync(root), true, 'the caller owns the temporary directory');
+    const empty = await call(`${QUEUE_JOURNAL_ROUTE_PREFIX}/diagnostics`);
+    assert.equal(empty.status, 200);
+    assert.equal(empty.body.ok, true);
+    assert.equal(empty.body.dir, root);
+    assert.equal(empty.body.entries, 0);
+    assert.equal(empty.body.lastWriteAt, null, 'an empty directory has no last write');
+    assert.equal(empty.body.writable, true);
+    assert.deepEqual(empty.body.errors, []);
+
+    const before = readdirSync(root).sort();
+    await call(QUEUE_JOURNAL_ROUTE_PREFIX, post({ key: 'session-diag', draft: 'a draft', queue: [{ text: 'queued one' }] }));
+    const afterWrite = readdirSync(root).sort();
+    const out = await call(`${QUEUE_JOURNAL_ROUTE_PREFIX}/diagnostics`);
+    assert.equal(out.status, 200);
+    assert.equal(out.body.ok, true);
+    assert.equal(out.body.dir, root);
+    assert.equal(out.body.entries, 1);
+    assert.equal(out.body.writable, true);
+    assert.match(String(out.body.lastWriteAt), /^\d{4}-\d{2}-\d{2}T/u, 'lastWriteAt is the newest file mtime');
+    assert.deepEqual(out.body.errors, []);
+    assert.deepEqual(readdirSync(root).sort(), afterWrite, 'a diagnostics read leaves no probe/temp file behind');
+    assert.ok(afterWrite.length > before.length, 'the save created the journal files (the read did not)');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('v3.6.1: a missing journal directory answers zero entries and creates nothing', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'w2m-qj-diag-missing-'));
+  const dataDir = join(root, 'nested', 'queue-journal');
+  try {
+    const { call } = mount({ dataDir });
+    const out = await call(`${QUEUE_JOURNAL_ROUTE_PREFIX}/diagnostics`);
+    assert.equal(out.status, 200);
+    assert.equal(out.body.ok, true);
+    assert.equal(out.body.dir, dataDir);
+    assert.equal(out.body.entries, 0);
+    assert.equal(out.body.lastWriteAt, null);
+    assert.equal(out.body.writable, true, 'the nearest existing ancestor is writable, so the first write can create the directory');
+    assert.deepEqual(out.body.errors, []);
+    assert.equal(existsSync(dataDir), false, 'the diagnostics read neither creates the directory nor a file');
+    assert.deepEqual(readdirSync(root), [], 'nothing is created beside it either');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('v3.6.1: a corrupt journal is still a 200 with its named error in the diagnostics', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'w2m-qj-diag-corrupt-'));
+  const dataDir = join(root, 'journal');
+  try {
+    mkdirSync(dataDir, { recursive: true });
+    writeFileSync(join(dataDir, 'composer-journal.json'), '{"session-a": ', 'utf8');
+    const { call } = mount({ dataDir });
+    const out = await call(`${QUEUE_JOURNAL_ROUTE_PREFIX}/diagnostics`);
+    assert.equal(out.status, 200, 'a corrupt file cannot take the diagnostics route down');
+    assert.equal(out.body.ok, true);
+    assert.equal(out.body.entries, 0);
+    assert.deepEqual(out.body.errors, ['journal-unreadable'], 'the store error is named, not swallowed');
+    const list = await call(`${QUEUE_JOURNAL_ROUTE_PREFIX}?list=1`);
+    assert.equal(list.status, 200, 'the list route still answers beside it');
+    assert.equal(list.body.error, 'journal-unreadable');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('v3.6.1: a regular file where the journal directory belongs is not writable and creates nothing', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'w2m-qj-diag-file-'));
+  try {
+    const dataDir = join(root, 'not-a-dir');
+    writeFileSync(dataDir, 'x', 'utf8');
+    const before = readdirSync(root).sort();
+    const { call } = mount({ dataDir });
+    const out = await call(`${QUEUE_JOURNAL_ROUTE_PREFIX}/diagnostics`);
+    assert.equal(out.status, 200);
+    assert.equal(out.body.dir, dataDir);
+    assert.equal(out.body.writable, false, 'a regular file cannot hold the journal');
+    assert.equal(out.body.entries, 0);
+    assert.deepEqual(readdirSync(root).sort(), before, 'the read-only probe creates no file');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

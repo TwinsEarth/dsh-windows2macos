@@ -65,6 +65,52 @@ export class ComposerJournal {
   }
 
   /**
+   * Read-only snapshot for `GET …/diagnostics` (v3.6.1).
+   *
+   * The probe must never create state: writability is `W_OK` on the journal directory, or on its
+   * nearest existing ancestor while the directory itself has not been created yet. No temp file is
+   * written and no directory is made, so asking "can this journal be written?" cannot change the
+   * answer or leave a file behind. A missing directory is the normal first-run state (entries 0),
+   * not an error; a corrupt journal keeps its named error in `errors` and still answers 200.
+   *
+   * @returns {{dir: string, entries: number, lastWriteAt: string|null, writable: boolean, errors: string[]}}
+   */
+  diagnostics() {
+    let entries = 0
+    let lastWriteAt = null
+    try {
+      entries = this.list().length
+      for (const row of fs.readdirSync(this.dataDir, { withFileTypes: true })) {
+        if (!row.isFile()) continue
+        try {
+          const at = fs.statSync(path.join(this.dataDir, row.name)).mtime.toISOString()
+          if (lastWriteAt === null || at > lastWriteAt) lastWriteAt = at
+        } catch { /* a file may vanish between readdir and stat */ }
+      }
+    } catch { /* a missing directory is an empty journal, not a read failure */ }
+    const errors = [this.readError, this.historyReadError].filter((value) => value !== null && value !== undefined)
+    return { dir: this.dataDir, entries, lastWriteAt, writable: this.isWritable(), errors }
+  }
+
+  /** `W_OK` on the nearest existing directory up from the data dir; a file where the dir belongs is not writable. */
+  isWritable() {
+    let candidate = this.dataDir
+    for (;;) {
+      try {
+        const stat = fs.statSync(candidate)
+        if (!stat.isDirectory()) return false
+        fs.accessSync(candidate, fs.constants.W_OK)
+        return true
+      } catch (error) {
+        if (error?.code !== 'ENOENT') return false
+      }
+      const parent = path.dirname(candidate)
+      if (parent === candidate) return false
+      candidate = parent
+    }
+  }
+
+  /**
    * Move a corrupt journal out of the way before the next save overwrites it.
    * Best effort: a failed rename must not turn a save into an error.
    */

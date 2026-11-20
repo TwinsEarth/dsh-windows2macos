@@ -1420,6 +1420,19 @@ describe('client bundle: queue journal slots and diagnostics (v3.6.0)', () => {
     };
   }
 
+  /** A queue-journal store stand-in for the pure drawer view (no refresh, no timers). */
+  function stubStore(overrides = {}) {
+    return {
+      state: { sessions: {}, busy: '', status: '', error: '', history: [], entries: [], ...overrides.state },
+      refresh: () => {},
+      clearAll: () => {},
+      closeDrawer: () => {},
+      restoreDraft: () => {},
+      restoreQueue: () => {},
+      clear: () => {},
+    };
+  }
+
   /** Load the bundle with a hook-capable React stand-in (so the chip's effect can run). */
   function loadWithHooks(mountReact) {
     return loadBundle({
@@ -1436,6 +1449,9 @@ describe('client bundle: queue journal slots and diagnostics (v3.6.0)', () => {
     assert.equal(diagnostics.surface, 'conversation.input.left+shell.overlay');
     assert.equal(diagnostics.dshVersion, '0.2.2-rc.5');
     assert.equal(diagnostics.reasons.length, 0, 'a tested version with both seats has nothing to report');
+    assert.equal(diagnostics.slotAttempts.map((attempt) => attempt.slot).join(','), 'conversation.input.left,shell.overlay',
+      'every candidate tried is recorded, in order');
+    assert.ok(diagnostics.slotAttempts.every((attempt) => attempt.ok === true && attempt.reason === 'accepted'));
     assert.equal(module.TESTED_DSH_RANGE, '>=0.2.2-rc.1 <0.3.0');
     const chip = registry.registered.find((entry) => entry.options.name === 'conversation.input.left' && entry.options.id === 'w2m-queue-journal');
     const drawer = registry.registered.find((entry) => entry.options.name === 'shell.overlay');
@@ -1448,14 +1464,17 @@ describe('client bundle: queue journal slots and diagnostics (v3.6.0)', () => {
     assert.equal(published.status, 'slotted', 'the diagnostics object is published on window');
     assert.equal(published.surface, 'conversation.input.left+shell.overlay');
     assert.equal(typeof published.checkedAt, 'string');
+    assert.equal(published.slotAttempts.length, 2, 'the published object carries the attempt log');
   });
 
-  it('names an out-of-range or unavailable DSH version instead of assuming compatibility', () => {
+  it('warns about an out-of-range DSH version without hiding the working seat', () => {
     const newer = applyModule({ dshVersion: '0.3.1' }).diagnostics;
-    assert.equal(newer.status, 'slotted', 'a version warning does not remove a working seat');
+    assert.equal(newer.status, 'unverified', 'an untested version is a warning state, not a removal');
+    assert.equal(newer.surface, 'conversation.input.left+shell.overlay', 'both seats stay reported');
     assert.ok(newer.reasons.some((reason) => reason.startsWith('dsh-version-unverified:0.3.1')), 'the untested version is stated');
     const unknown = applyModule({}).diagnostics;
     assert.equal(unknown.dshVersion, null);
+    assert.equal(unknown.status, 'slotted', 'a version that cannot be read is unknown, not a failure');
     assert.ok(unknown.reasons.includes('dsh-version-unavailable'), 'an unavailable version is said out loud');
     const { module } = applyModule({});
     assert.equal(module.__w2mHelpers.jqDshSupported('0.2.2-rc.1'), true);
@@ -1465,8 +1484,74 @@ describe('client bundle: queue journal slots and diagnostics (v3.6.0)', () => {
     assert.equal(module.__w2mHelpers.jqDshSupported('not-a-version'), false);
   });
 
-  it('falls back to sidebar.panellist when the chip slot cannot be injected, and names it', () => {
+  it('keeps the drawer and chip visible with a one-line unverified notice and the detected version', () => {
+    const mountReact = makeMountReact();
+    const bundle = loadWithHooks(mountReact);
+    bundle.window.__DSH_BOOT__ = { release: { version: '0.3.1' } };
+    const module = bundle.exports.createQueueJournalModule();
+    module.apply({ slots: makeRegistry(), get: () => undefined, effect: (callback) => callback() });
+    assert.equal(module.diagnostic().status, 'unverified');
+    const tree = module.__w2mHelpers.QueueJournalDrawerBody({
+      store: stubStore(),
+      snap: { total: 0, clientTotal: 0, loading: false, open: true },
+      portal: false,
+    });
+    const notice = findBy(tree, (node) => node.props?.['data-w2m-jq-status'] === 'unverified' && node.props?.className === 'w2mJqNotice');
+    assert.equal(notice.length, 1, 'exactly one notice carries data-w2m-jq-status="unverified"');
+    const text = collectText(notice[0]).join('\n');
+    assert.match(text, /0\.3\.1/u, 'the notice names the detected version');
+    assert.match(text, /测试范围/u, 'the notice names the tested range');
+    assert.ok(findBy(tree, (node) => node.props?.['data-w2m-jq-drawer'] === '1').length === 1, 'the drawer still renders');
+    assert.ok(findBy(tree, (node) => node.props?.['data-w2m-jq-drawer'] === '1')[0].props['data-w2m-jq-status'] === 'unverified', 'the drawer carries the warning state');
+    const handle = mountReact.mount(module.__w2mHelpers.QueueJournalChip, {
+      sessionId: 'session-unverified',
+      inputActions: { setDraft: () => {} },
+      useInput: (selector) => selector({ draft: '', queue: [] }),
+    });
+    try {
+      const chip = findBy(handle.tree, (node) => node.props?.['data-w2m-jq-chip'] === 'primary')[0];
+      assert.equal(chip?.props?.['data-w2m-jq-status'], 'unverified', 'the chip reports the warning state and stays visible');
+      assert.match(String(chip?.props?.title ?? ''), /0\.3\.1/u, 'the chip tooltip names the version');
+    } finally { handle.unmount(); }
+  });
+
+  it('walks the chip candidate chain: a renamed first seat is named and the next candidate wins', () => {
     const registry = failingRegistry(['conversation.input.left']);
+    const { bundle, diagnostics } = applyModule({ registry, dshVersion: '0.2.2-rc.5' });
+    assert.equal(diagnostics.status, 'slotted');
+    assert.equal(diagnostics.surface, 'conversation.composer.dock+shell.overlay', 'the second candidate is the surface');
+    assert.equal(diagnostics.slotAttempts.map((attempt) => attempt.slot + ':' + attempt.ok).join(','),
+      'conversation.input.left:false,conversation.composer.dock:true,shell.overlay:true');
+    assert.ok(diagnostics.reasons.some((reason) => reason.startsWith('slot-inject-threw:conversation.input.left:')),
+      `the failed candidate is named: ${JSON.stringify(diagnostics.reasons)}`);
+    assert.ok(registry.registered.some((entry) => entry.options.name === 'conversation.composer.dock' && entry.options.id === 'w2m-queue-journal'));
+    assert.equal(bundle.window.__W2M_QUEUE_JOURNAL__.surface, 'conversation.composer.dock+shell.overlay');
+  });
+
+  it('uses the second drawer candidate when shell.overlay is gone, keeping the chip seat', () => {
+    const registry = failingRegistry(['shell.overlay']);
+    const { diagnostics } = applyModule({ registry, dshVersion: '0.2.2-rc.5' });
+    assert.equal(diagnostics.status, 'slotted');
+    assert.equal(diagnostics.surface, 'conversation.input.left+shell.bottom');
+    assert.ok(registry.registered.some((entry) => entry.options.name === 'shell.bottom' && entry.options.id === 'w2m-queue-journal'));
+  });
+
+  it('falls back to the visible sidebar entry when every candidate is missing, and records each attempt', () => {
+    const registry = failingRegistry(['conversation.input.left', 'conversation.composer.dock', 'shell.overlay', 'shell.bottom']);
+    const { bundle, diagnostics } = applyModule({ registry, dshVersion: '0.2.2-rc.5' });
+    assert.equal(diagnostics.status, 'fallback');
+    assert.equal(diagnostics.surface, 'sidebar.panellist');
+    assert.ok(diagnostics.reasons.includes('slot-missing:conversation.input.left/conversation.composer.dock'));
+    assert.ok(diagnostics.reasons.includes('slot-missing:shell.overlay/shell.bottom'));
+    assert.equal(diagnostics.slotAttempts.map((attempt) => attempt.slot + ':' + attempt.ok).join(','),
+      'conversation.input.left:false,conversation.composer.dock:false,sidebar.panellist:true,shell.overlay:false,shell.bottom:false');
+    assert.ok(registry.registered.some((entry) => entry.options.name === 'sidebar.panellist' && entry.options.id === 'w2m-queue-journal'),
+      'the same UI is still reachable from the sidebar');
+    assert.equal(bundle.window.__W2M_QUEUE_JOURNAL__.status, 'fallback');
+  });
+
+  it('falls back to sidebar.panellist when no chip candidate can be injected, and names it', () => {
+    const registry = failingRegistry(['conversation.input.left', 'conversation.composer.dock']);
     const { bundle, diagnostics } = applyModule({ registry, dshVersion: '0.2.2-rc.5' });
     assert.equal(diagnostics.status, 'fallback');
     assert.equal(diagnostics.surface, 'sidebar.panellist');
@@ -1484,6 +1569,34 @@ describe('client bundle: queue journal slots and diagnostics (v3.6.0)', () => {
     assert.ok(diagnostics.reasons.includes('slot-missing:shell.overlay/shell.bottom'));
     assert.ok(registry.registered.some((entry) => entry.options.name === 'conversation.input.left'), 'the chip seat was still taken');
     assert.ok(registry.registered.some((entry) => entry.options.name === 'sidebar.panellist'), 'the same UI remains reachable from the sidebar');
+  });
+
+  it('turns a failed refresh into a short reason that names route-missing vs host-error', async () => {
+    const missing = loadBundle({ globals: { fetch: async () => ({ ok: false, status: 404, json: async () => ({}) }) } }).exports.createQueueJournalModule();
+    assert.equal(
+      await missing.__w2mHelpers.jqFailureReason(Object.assign(new Error('HTTP 404'), { status: 404 })),
+      '路由缺失（404）：宿主未挂载队列日志路由',
+      'a 404 is a missing host route, not a broken journal',
+    );
+    assert.match(
+      await missing.__w2mHelpers.jqFailureReason(Object.assign(new Error('HTTP 500'), { status: 500 })),
+      /诊断路由也不可用/u,
+      'when the diagnostics route is missing too, the reason says so instead of guessing',
+    );
+    const broken = loadBundle({
+      globals: { fetch: async () => ({ ok: true, status: 200, json: async () => ({ ok: true, dir: 'xclient/queue-journal', entries: 2, lastWriteAt: null, writable: false, errors: ['journal-unreadable'] }) }) },
+    }).exports.createQueueJournalModule();
+    const reason = await broken.__w2mHelpers.jqFailureReason(Object.assign(new Error('HTTP 500'), { status: 500 }));
+    assert.match(reason, /宿主错误（HTTP 500）/u, `the host error is stated: ${reason}`);
+    assert.match(reason, /诊断路由可用：2 条记录/u, 'the diagnostics route is reported when it answers');
+    assert.match(reason, /目录只读/u);
+    assert.match(reason, /journal-unreadable/u);
+    const drawer = broken.__w2mHelpers.QueueJournalDrawerBody({
+      store: stubStore({ state: { error: reason } }),
+      snap: { total: 0, clientTotal: 0, loading: false, open: true },
+      portal: false,
+    });
+    assert.match(collectText(drawer).join('\n'), /路由缺失|宿主错误/u, 'the drawer shows the reason, not a bare failure');
   });
 
   it('turns a missing inputActions into the fallback, with the visible 降级模式 notice', () => {
@@ -1534,6 +1647,18 @@ describe('client bundle: queue journal slots and diagnostics (v3.6.0)', () => {
       assert.equal(module.diagnostic().reasons.some((reason) => reason.startsWith('dom-composer-fallback')), false,
         'the DOM path is not used when the slot props are present');
     } finally { handle.unmount(); }
+  });
+
+  it('keeps the slot candidate chains in exactly one ordered list each', () => {
+    const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
+    assert.ok(source.includes("const JQ_CHIP_SLOT_CANDIDATES = ['conversation.input.left', 'conversation.composer.dock']"),
+      'the chip chain is one ordered list, so a renamed seat is a one-line change');
+    assert.ok(source.includes("const JQ_OVERLAY_SLOT_CANDIDATES = ['shell.overlay', 'shell.bottom']"),
+      'the drawer chain is one ordered list');
+    assert.equal(source.includes('const JQ_CHIP_SLOT '), false, 'the old single-slot constant is gone');
+    assert.equal(source.includes('JQ_OVERLAY_FALLBACK_SLOT'), false, 'the old drawer fallback constant is gone');
+    assert.ok(source.includes('slotAttempts.push({ slot, ok: true, reason: \'accepted\' })'), 'every accepted attempt is recorded');
+    assert.ok(source.includes('slotAttempts.push({ slot, ok: false, reason: \'inject-threw:\''), 'every refused attempt is recorded');
   });
 });
 

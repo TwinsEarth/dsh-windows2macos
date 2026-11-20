@@ -771,14 +771,29 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
       assert.equal(probe.chip?.status, 'slotted', 'the chip reports the slotted surface');
       assert.equal(probe.diagnostics?.status, 'slotted', `the diagnostics object reports the slotted surface: ${JSON.stringify(probe.diagnostics)}`);
       assert.equal(probe.diagnostics?.surface, 'conversation.input.left+shell.overlay', 'both documented slot names are reported');
+      const attempts = Array.isArray(probe.diagnostics?.slotAttempts) ? probe.diagnostics.slotAttempts : [];
+      assert.equal(
+        attempts.map((attempt) => attempt.slot + ':' + attempt.ok).join(','),
+        'conversation.input.left:true,shell.overlay:true',
+        `the diagnostics record every slot attempt in order: ${JSON.stringify(attempts)}`,
+      );
       assert.match(String(probe.diagnostics?.dshVersion ?? ''), /^0\.2\./u, 'the client read the DSH version from the page boot graph');
       assert.equal(probe.typed?.typed, true, `a draft was typed into the real composer: ${JSON.stringify(probe.typed)}`);
       assert.equal(probe.saved?.found, true, `the typed draft reached the host journal route: ${JSON.stringify(probe.saved)}`);
       assert.equal(journal.exists, true, `the host wrote the journal file at ${String(journal.path)}`);
       assert.match(String(journal.probeDraft ?? ''), /probe-journal-draft/u, 'the probe draft is in the host file under xclient/queue-journal');
+      const diagnosticsRoute = probe.diagnosticsRoute ?? {};
+      assert.equal(diagnosticsRoute.status, 200, `the host diagnostics route answers in the real page: ${JSON.stringify(diagnosticsRoute)}`);
+      assert.equal(diagnosticsRoute.ok, true, 'the diagnostics route reports ok');
+      assert.equal(diagnosticsRoute.dirEndsWith, true, 'the diagnostics route names the queue-journal data directory');
+      assert.equal(diagnosticsRoute.entries, true, 'the diagnostics route reports an integer entry count');
+      assert.equal(diagnosticsRoute.writable, 'boolean', 'the diagnostics route probes writability without failing');
+      assert.equal(diagnosticsRoute.lastWriteAt, true, 'the diagnostics route reports lastWriteAt (string or null)');
+      assert.equal(diagnosticsRoute.errors, true, 'the diagnostics route reports its errors as an array');
       assert.equal(probe.opened?.clicked, true, 'the chip opens the drawer');
       assert.equal(probe.drawer?.marker, '1', 'the drawer carries the data-w2m-jq-drawer marker');
       assert.equal(probe.drawer?.status, 'slotted', 'the drawer reports the surface diagnostics');
+      assert.equal(probe.drawer?.unverifiedNotice, false, 'an in-range version renders no unverified notice');
       assert.ok(Number(probe.drawer?.rows) >= 1, `the drawer lists the saved entry: ${JSON.stringify(probe.drawer)}`);
       assert.equal(probe.drawer?.hasDraft, true, 'the drawer shows the typed draft');
       assert.equal(probe.drawer?.hasRestore, true, 'the drawer carries a restore-draft action');
