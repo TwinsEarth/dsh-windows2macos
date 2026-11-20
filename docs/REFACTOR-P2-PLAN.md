@@ -77,10 +77,12 @@ AAD     "w2m-session-backup/old-chunked|sha256|size|chunkIndex"
 
 | # | 切片 | 内容 | 验收 |
 |---|---|---|---|
-| O1 | 格式 v2 编解码 + 单测 | `sealObjectChunked/openObjectChunked`（含流式 sink），AAD/截断/错块/错序拒绝 | `test/backup-chunked.test.mjs`：往返、篡改、截断、乱序、v1/v2 自动识别 |
-| O2 | verify 流式化 | verify 对 v2 副本逐块校验；峰值内存断言（子进程 `--max-old-space-size`） | verify 套件 + 内存门槛 |
+| O1 ✅ | 格式 v2 编解码 + 单测 | **已实现** `src/backup/chunked.mjs`（817 行）：magic `W2MOLD2` + 明文 JSON header + 逐块 `nonce|ct|tag`，逐块 AAD `…old-chunked|sha|size|chunkIndex`；写端支持内存/临时文件+fsync+原子 rename/sink；读端流式逐块认证并校验 size/块序/尾随；错误码 `BACKUP_CHUNKED_AUTH_FAILED/TRUNCATED/ORDER/HEADER_INVALID/TRAILING/ARGUMENT_INVALID/READ_FAILED/WRITE_FAILED` | `test/backup-chunked.test.mjs` 27 例：字节布局、往返（1B/整块/多块/0B）、篡改/截断/乱序/尾随/错 DEK/身份绑定全部拒绝 |
+| O2 ✅ | verify 流式化 | **已实现**：`verify.mjs` 先读文件自身 8 字节 magic（不信任记录里的 `full_copy.format`）再分支；v1 路径逐字节保持原实现（`oldCopyMaxBytes` + `BACKUP_MEMORY_GUARD` + 整文件 openObject），v2 走 `openChunkedStream`（峰值 = 一个 ≤16 MiB 块）；`old_copies`/`streaming`/`limits`/coverage 返回形状不变 | 32 MiB 明文 / 4 MiB 块 / `--max-old-space-size=64` 子进程：reader 峰值 **4,194,332 B = 4 MiB + 28 B（12.5% 文件体积）**，写入峰值相同，断言为**精确值**；v1 套件未改且全绿 |
 | O3 | restore/old-restore 流式化 | 从 v2 副本恢复时流式写回（临时文件 → 原子 rename）；v1 保持现状 | restore 套件 + v1/v2 混合仓库 |
 | O4 | rotation 写 v2 + 文档 | 新副本写 v2；BACKUP-DESIGN §28；验收记录 | 真机跑一次 full 副本 + 恢复演练 |
+
+**O 组进展（2026-11-20）**：O1/O2 已实现并有 27 例新测试（v1 行为逐字节不变）；O3（restore/old-restore 流式读 v2）与 O4（rotation 写 v2 + 真机恢复演练）待做。
 
 **风险**：这是**协议扩展**（不是纯重构）。要求 v1 读取永不改变；v2 只对新写入生效；`verify` 必须同时覆盖两种格式；
 升级/降级路径（新版写 v2、旧版读不了 v2）需在文档明确"旧版不能读 v2 副本，请用 ≥3.6 读取"。
@@ -101,10 +103,10 @@ AAD     "w2m-session-backup/old-chunked|sha256|size|chunkIndex"
 | # | 切片 | 内容 | 验收 |
 |---|---|---|---|
 | C1 | 体积预算守卫（**本提交已完成**） | `test/client-budget.test.mjs`：文件字节/行数预算 + 单函数行数上限（当前最大 3,454，阈值 3,600），越界即失败 | 新套件绿；进入 `scripts.test`/`test:all` |
-| C2 | 设置面板分解 | `UpdateSettingsSection` → 壳 + 4 个子组件（同文件内 module scope），目标单函数 <600 行 | client-bundle 106/106 + loader-entry |
-| C3 | chat 渲染分解 | `renderChatText` → markdown/代码块/附件三段 | 同上 |
-| C4 | 多客户端模块可行性 | 查 `dsh-doc` 与 `test/loader-entry.test.mjs` 的加载契约：能否一个包注册多个 client 模块（独立 specifier），能则拆 2–3 个文件并保持 compose | loader-entry 真实 Loader 测试通过；面板功能无变化 |
-| C5 | 文档收尾 | AUDIT 风险表更新、README 客户端说明 | pre-flight 绿 |
+| C2 ✅ | 设置面板分解 | **结论修正（S6）**：所谓 3,454 行的 `UpdateSettingsSection` 实为 **63 行**，是 C1 预算计量器（只认列 0 `function`）的误报；已重写计量器（花括号匹配/注释与字符串屏蔽/嵌套跳过），真实最大函数 `BackupPanelView` 832 行，预算单函数上限 1,200 | client-bundle 112/112、真实页面 143/143 |
+| C3 ✅ | chat 渲染分解 | **已实现（S7）**：`renderChatText`(10 行) + `CHAT_COMMANDS/STICKER_GLYPHS/STICKER_RE/EMOJIS` 提到模块作用域（逐字节等价），`FleetChat` 351→335 行；文件 593,540 B 仍在预算内 | 同上 |
+| C4 ✅（结论：不拆） | 多客户端模块可行性 | **调查结论**：`@deepseek-ai/dsh-client-modules` 按 Loader 行携带的**精确包 specifier**（`exactPackageSpecifier`）识别客户端包，`dsh.client` 是**每包一个**客户端清单 → 一个包无法注册多个独立 client 模块；拆多个文件即需拆成多个 npm 包（分发/版本/契约成本高于收益）。维持单 bundle + C1 预算守卫 + S6/S7 文件内分解 | 结论写入本文档与 AUDIT 附录 D；不实施拆包 |
+| C5 ✅ | 文档收尾 | AUDIT 附录 D 与 §6.3 已更新（client 分解/预算/worker/队列日志），本文档 C 组结论落定；README 客户端说明由 S9 收尾记录覆盖 | pre-flight 绿 |
 
 **风险控制**：C2/C3 是纯视图分解，必须"文件内"完成、不改 `load()` 表；C4 未验证契约前不实施。
 

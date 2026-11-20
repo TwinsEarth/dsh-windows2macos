@@ -4,6 +4,18 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### P2-O1/O2：`old/ .enc` 分块封存格式 v2 + verify 流式校验（未发布）
+
+- 新增 `src/backup/chunked.mjs`（分块封存格式 v2）：magic `W2MOLD2\n` + 明文 JSON header + 逐块
+  `nonce|ciphertext|tag`，AAD `w2m-session-backup/old-chunked|<sha256>|<size>|<chunkIndex>`；写端支持
+  内存/临时文件+fsync+原子 rename/sink，读端流式逐块认证并校验 size、块序与尾随字节；具名错误码
+  `BACKUP_CHUNKED_AUTH_FAILED/TRUNCATED/ORDER/HEADER_INVALID/TRAILING/ARGUMENT_INVALID/READ_FAILED/WRITE_FAILED`。
+- `verify` 先嗅探文件自身 magic 再分支：v1（`W2MBLOB1`）路径逐字节保持原实现；v2 走流式校验，
+  峰值内存 = 一个块（32 MiB 文件/4 MiB 块实测峰值 4,194,332 B，12.5%）；`old_copies` 等返回形状不变。
+- 测试：`test/backup-chunked.test.mjs` 27 例（字节布局、往返、篡改/截断/乱序/尾随/错误 DEK/身份绑定、
+  64 MiB 子进程内存门槛、verify 集成）；全部 28 个 backup 套件 596/596；eslint 0 error；layer/mojibake clean。
+- 未做：O3（restore/old-restore 流式读 v2）、O4（rotation 写 v2 + 真机恢复演练）。
+
 ## [3.5.3] — 2026-11-20
 
 ### 决策中心 UX：会话名替代裸 Session ID；决策选项口语化（可调用智能）（未发布）

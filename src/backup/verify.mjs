@@ -24,6 +24,17 @@
  * the offending record. The counters live in `old_copies: {checked, ok, failed, missing}`; a record without a copy
  * is not counted, because there is nothing extra to verify. This works for an unencrypted repository too: the
  * `open` envelope supplies the DEK without any credential.
+ *
+ * ## Two copy formats, decided by the file's own magic (v3.5.x, P2/O2)
+ *
+ * A copy written before the chunked format is ONE sealed object (`W2MBLOB1`), and it keeps exactly the path it had:
+ * the `oldCopyMaxBytes` bound, the heap guard, one whole-file read, `openObject` with the `old` identity. A copy
+ * written in the chunked v2 format (`W2MOLD2`, `chunked.mjs`) is read record by record instead, so its peak memory
+ * is one chunk (at most 16 MiB) rather than its size, and the whole-file bound does not apply to it -- that bound
+ * exists because a v1 copy cannot be read any other way. **The counters and the problem codes do not change**: a v2
+ * copy that fails is still `BACKUP_VERIFY_OLD_COPY_FAILED`, with the chunked code (`BACKUP_CHUNKED_*`) named in the
+ * detail, so a report reader sees one shape and one place to look. The sniff is the file's first eight bytes, never
+ * the record's `full_copy.format`: a record field is a claim, and this is the one check whose job is to test claims.
  */
 
 import fs from 'node:fs';
@@ -36,6 +47,7 @@ import { sha256Hex } from './manifest.mjs';
 import { DEFAULT_OLD_COPY_MAX_BYTES, DEFAULT_STREAM_THRESHOLD_BYTES, rebuildFile, digestEntryStreaming, objectFile } from './materialize.mjs';
 import { BACKUP_MEMORY_GUARD, createMemoryGuardReport, memoryGuard, resolveMaxHeapBytes } from './memory-guard.mjs';
 import { OLD_COPY_KIND, openObject } from './crypto.mjs';
+import { CHUNKED_FORMAT, isChunkedV2, openChunkedStream } from './chunked.mjs';
 import { fullCopyPathFor, listOldVersions } from './rotation.mjs';
 import { readCurrentPointers } from './gc.mjs';
 import { buildArtifactFromBuffer, runtimeValidateBatch } from './runtime-validate.mjs';
@@ -73,17 +85,21 @@ function emptyOldCopies() {
  * A record without `full_copy` is not checked at all: there is no copy to verify, and the record's own blocks are
  * already verified above. A record WITH one promises the bytes are recoverable without `objects/`, so absence,
  * malformed metadata, a failed authentication and a digest/size mismatch are all divergences that must be named.
- * The identity passed to `openObject` is the record's plaintext identity (`sha256`, `length: size`) under
- * `kind: 'old'`: exactly what rotation/backfill sealed with, and the reason a block object cannot be passed off as
- * a whole-file copy.
+ * The identity passed to the reader is the record's plaintext identity (`sha256`, `length: size`): exactly what
+ * rotation/backfill sealed with, and the reason a copy sealed for another version cannot be passed off as this one.
  *
- * @param {{root: string, record: object, dek: Buffer}} input
- * @returns {null | {missing: boolean, detail: string}} `null` when the copy is fine
+ * The **format is decided by the file's own magic**, never by a field on the record: a v1 copy is one sealed object
+ * (`W2MBLOB1`) read whole under `oldCopyMaxBytes`; a chunked v2 copy (`W2MOLD2`) is read one record at a time
+ * ({@link verifyOldFullCopyChunked}). Both report through the same `null | {missing, detail}` shape, so `verifyRepo`
+ * counts and names them identically.
+ *
+ * @param {{root: string, record: object, dek: Buffer, maxCopyBytes?: number, maxHeapBytes?: number,
+ *   heapUsedBytes?: number}} input
+ * @returns {null | {missing: boolean, detail: string, code?: string}} `null` when the copy is fine
  */
 function verifyOldFullCopy(input) {
   const { root, record } = input;
   const copyFile = fullCopyPathFor(root, record);
-  const maxCopyBytes = Number.isSafeInteger(input.maxCopyBytes) && input.maxCopyBytes >= 0 ? input.maxCopyBytes : DEFAULT_OLD_COPY_MAX_BYTES;
   if (copyFile === null) {
     return { missing: true, detail: 'full_copy.file does not name a path under old/, so it is never followed' };
   }
@@ -107,6 +123,29 @@ function verifyOldFullCopy(input) {
     }
     return { missing: false, detail: `the full copy at ${copyFile} is unreadable: ${error?.code ?? 'unknown'}` };
   }
+  // The sniff reads eight bytes and happens BEFORE the v1 size bound: a chunked copy is exactly the case in which
+  // "the file is larger than one allocation" is no longer a reason to refuse, because its reader never allocates
+  // the file. A v1 copy keeps the bound below, unchanged.
+  if (isChunkedV2(copyFile)) {
+    return verifyOldFullCopyChunked({ copyFile, record, dek: input.dek });
+  }
+  return verifyOldFullCopyV1({ ...input, copyFile, stat });
+}
+
+/**
+ * Check a **v1** whole-file copy: one sealed object, read whole.
+ *
+ * Unchanged from v3.5.1 in behaviour: bounded twice (the per-copy limit and the heap guard), then `openObject` with
+ * the `old` identity, then the plaintext digest and length. The bound exists because this reader materialises the
+ * file; it is not applied to the chunked format, which does not.
+ *
+ * @param {{record: object, copyFile: string, dek: Buffer, stat: fs.Stats, maxCopyBytes?: number,
+ *   maxHeapBytes?: number, heapUsedBytes?: number}} input
+ * @returns {null | {missing: boolean, detail: string, code?: string}}
+ */
+function verifyOldFullCopyV1(input) {
+  const { record, copyFile, stat } = input;
+  const maxCopyBytes = Number.isSafeInteger(input.maxCopyBytes) && input.maxCopyBytes >= 0 ? input.maxCopyBytes : DEFAULT_OLD_COPY_MAX_BYTES;
   // v3.5.1: a single whole-file copy is materialised (its format is one sealed object), so it is bounded twice:
   // by the configured per-copy limit and by the process-wide heap guard. Both refusals are named, never an OOM.
   if (stat.size > maxCopyBytes) {
@@ -142,6 +181,47 @@ function verifyOldFullCopy(input) {
     return {
       missing: false,
       detail: `the full copy at ${copyFile} decrypts to ${plaintext.length} bytes / ${digest}, not the recorded ${record.size} bytes / ${record.sha256}`,
+    };
+  }
+  return null;
+}
+
+/**
+ * Check a **chunked-v2** whole-file copy: one record at a time, peak one chunk (P2/O2).
+ *
+ * No `oldCopyMaxBytes` bound and no whole-file heap guard, because neither is needed: the format caps one chunk at
+ * 16 MiB, so the reader's peak is bounded by the format itself, whatever the copy's size.
+ * The record's identity is passed as the expected one, so a copy that belongs to ANOTHER version is refused with a
+ * header mismatch naming both identities instead of a generic authentication failure. The plaintext digest/size are
+ * still compared here as the last line: the reader returns what it decrypted, and this check decides whether it is
+ * the version the record claims.
+ *
+ * @param {{copyFile: string, record: object, dek: Buffer}} input
+ * @returns {null | {missing: boolean, detail: string}}
+ */
+function verifyOldFullCopyChunked(input) {
+  const { copyFile, record } = input;
+  let opened;
+  try {
+    opened = openChunkedStream(copyFile, {
+      dek: input.dek,
+      sha256: record.sha256,
+      size: record.size,
+    });
+  } catch (error) {
+    return {
+      missing: false,
+      detail:
+        `the ${CHUNKED_FORMAT} full copy at ${copyFile} does not open as the recorded version: ` +
+        `${error?.code ?? 'BACKUP_CHUNKED_AUTH_FAILED'}: ${error?.detail ?? error?.message ?? String(error)}`,
+    };
+  }
+  if (opened.size !== record.size || opened.sha256 !== record.sha256) {
+    return {
+      missing: false,
+      detail:
+        `the ${CHUNKED_FORMAT} full copy at ${copyFile} decrypts to ${opened.size} bytes / ${opened.sha256}, ` +
+        `not the recorded ${record.size} bytes / ${record.sha256}`,
     };
   }
   return null;
