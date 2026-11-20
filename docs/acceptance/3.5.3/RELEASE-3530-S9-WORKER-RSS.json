@@ -2,14 +2,22 @@
   "version": "3.5.3",
   "case": "S9-WORKER-RSS-REAL-MACHINE",
   "kind": "positive",
-  "machines": ["b53a37f4-1464-4512-9259-33a7df091e3e"],
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
   "executed_at": "2026-11-21T05:20:00.000Z",
   "executor": "lead",
   "task_id": "w2m-s9-rss-real-machine",
   "requirement": "S9 real-machine evidence: install the HEAD build (O1–O4 + F4 + queue-journal hardening on top of 3.5.3) into the real desktop profile through the plugin manager, then run the shipped worker-backed backup path against the real DSH home (read-only) with a temporary repository and sample process RSS every 100 ms, proving the S8 worker delivers a bounded, plateau-shaped memory profile on real data (no inline OOM-class growth).",
   "commands": [
-    ["node", "scripts/pack.mjs"],
-    ["node", "E:\\GPT\\.tmp\\s9-rss-probe.mjs"]
+    [
+      "node",
+      "scripts/pack.mjs"
+    ],
+    [
+      "node",
+      "E:\\GPT\\.tmp\\s9-rss-probe.mjs"
+    ]
   ],
   "result": {
     "outcome": "ok",
@@ -18,7 +26,8 @@
       "probe": "installed package's createBackupWorkerRunner ran a real backup in worker mode over the real DSH home (read-only) into a temp repo: mode=worker, ok=true, 31.3 s for 426 files / 679.9 MB plaintext with all six scopes; 281 RSS samples at 100 ms.",
       "rss_curve": "baseline 56 MB -> peak 450 MB (delta +394 MB), p95 423 MB; curve climbs 56->116 MB in the first ~0.5 s then holds a 380-450 MB plateau and releases at the end; the engine never approaches the 1024 MB worker heap cap.",
       "no_regression": "the same run on the 3.2x larger real dataset (679.9 MB vs the 212 MB fixture) peaks below the fixture's 379 MB full-run figure reported in 3.5.1 because the worker path keeps the execution heap separate from the host; proves bounded memory on real data, not only fixtures.",
-      "gui_curve": "A GUI-triggered run (panel 立即备份) was additionally requested; host-process sampling at 200 ms was started (E:\\GPT\\.tmp\\s9-gui-rss.jsonl, host pid 17000, baseline 149 MB) and its result is recorded operationally when the run completes. This record's pass is based on the worker-path measurement above; the GUI curve is corroborating, not gating."
+      "gui_curve": "GUI run on the real profile (panel 立即备份, dev build, worker path confirmed): host process sampled every 200 ms for the whole run (1857 samples / 402.9 s window); baseline RSS 1487 MB, min 1368 MB, peak 2187 MB at ms=182031 (≈ run teardown), P95 1637 MB, delta +700 MB; worker progress file showed mode:\"worker\" pid 8460, stages starting×1 → scan×4 → store×186; snapshot 20261120T213558Z-6fcf8b45 committed 21:35:58.163Z with 427 files / 680,407,361 B; old_usage.at 21:36:40.284Z → run ≈ 42 s; panel returned to 空闲 with no hang or crash, and the host peak stayed well below the 4 GB heap ceiling and the worker 1024 MB quota.",
+      "gui_curve_evidence": "E:\\GPT\\.tmp\\s9-gui-rss2.jsonl (200 ms host RSS + worker.json snapshots); samples taken by a harness-managed background job that outlived the shell that started it."
     }
   }
 }
