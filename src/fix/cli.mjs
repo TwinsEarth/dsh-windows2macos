@@ -1,6 +1,7 @@
 /**
- * Offline CLI for the session-attachment repair, and for the one legal way to
- * delete or insert events in a v4 session log (retrospective gate G4).
+ * Offline CLI for the session-attachment repair, for the one legal way to
+ * delete or insert events in a v4 session log (retrospective gate G4), and for
+ * the frame-shape repair (`session-reframe`).
  *
  *   w2m-fix scan                       only report: which sessions are broken, how many places need a repair
  *   w2m-fix fix [--apply]              append one image/offload event (needs --apply; requires DSH to be stopped)
@@ -11,9 +12,13 @@
  *                                      then validate the result (doctor + future append + installed Harness) and
  *                                      only then write (`--dry-run` plans without writing; the original is always
  *                                      copied to `<file>.bak-<timestamp>` first)
+ *   w2m-fix session-reframe --file <log> --out <path> [--dry-run] [--json] [--allow-static] [--in-place]
+ *                                      rebuild a log whose first zstd frame holds the header together with events
+ *                                      (the installed client refuses it as "first frame is not exactly one header
+ *                                      line"); writes a COPY at --out, never the source, unless --in-place --force
  *
  * Exit codes: 0 ok, 1 refused/failed, 2 usage error (or this Node has no synchronous
- * zstd API), 3 refused (DSH running / restore without --apply). 0 and non-zero are
+ * zstd API), 3 refused (DSH running / shell safety precondition). 0 and non-zero are
  * the contract; the numbers exist so a wrapper can tell "refused" from "broke".
  *
  * Two safety rules are enforced here rather than left to the caller:
@@ -35,6 +40,7 @@ import { execSync } from 'node:child_process';
 import { hasZstd } from './zstd.mjs';
 import { listSessionDirs, pickSessionFile, readSession } from './session.mjs';
 import { applyFix, groupTargets, listBackups, pendingFixes, restoreBackup, BACKUP_MARK } from './repair.mjs';
+import { applySessionReframe, planSessionReframe, REFRAME_CODES } from './session-reframe.mjs';
 // Gate G4 lives in `src/backup/renumber.mjs`: the renumber tool is gated by the backup validator (static doctor +
 // future append + the installed Harness), so its one implementation sits with those gates instead of growing a
 // second validator here. The layer edge (`fix -> backup`) is declared in `scripts/layer-model.mjs`.
@@ -57,6 +63,9 @@ image attachment object referenced by its history has been deleted.
   node bin/w2m-fix.mjs renumber --file <log> [--delete-seq <n>]... [--insert-file <json>] [--keep-backups <n>] [--dry-run]
                                                     delete/insert events, renumber seq densely, rewrite
                                                     every *Seq reference, validate, then write
+  node bin/w2m-fix.mjs session-reframe --file <log> [--out <path>] [--dry-run] [--json] [--allow-static] [--in-place]
+                                                    rebuild a log whose first zstd frame holds the header
+                                                    together with events; writes a copy, never the source
 
 Options
   --session <part>        only sessions whose directory name contains this part
@@ -91,6 +100,32 @@ Renumber notes
     renumbering. Renumber is the fallback when there is no way to recover the original bytes; it
     edits history on purpose, and the .bak copy is only the last resort, not a substitute for a backup.
 
+Session-reframe options (repair an illegal FIRST FRAME, not the event graph)
+  --file <path>           the v4 session log to repair (required; only read)
+  --out <path>            write the repaired copy HERE (a new file). Refused if it already exists
+                          unless --force. The source's bytes and mtime are not touched.
+  --in-place              replace the log itself; requires --force, refuses while DeepSeek Harness is
+                          running, and writes a verified <file>.bak-<stamp> copy first (the way back)
+  --dry-run               plan and validate only: report the numbers, write nothing
+  --allow-static          accept static-only evidence when no installed Harness is found (the report
+                          then says runtime_verified:false; the runtime verdict is the evidence)
+  --json                  one JSON object: {command, ok, dry_run, plan, applied}
+
+Session-reframe notes
+  * the defect: the installed client requires the first zstd frame to be EXACTLY one header line
+    (its assertZstdHeaderFrame). A log whose frame 0 also carries events is refused and never loads.
+  * the repair is byte-conserving by construction: frame 0 is decompressed once, split at the first
+    newline, and rebuilt as (header alone) + (those events, verbatim, as one batch frame); every
+    later frame is copied byte-identically. The row-stream sha256 must stay equal, before and after
+    the write, or the command refuses.
+  * frame 0 already legal -> NOOP_ALREADY_LEGAL and nothing is written (not even a copy).
+  * gate order: transcribed first-frame rule -> static doctor -> future-append simulation ->
+    installed Harness (the evidence). The static doctor alone is a pre-filter; --allow-static is
+    the documented downgrade. The client's own open() is the authoritative gate and this command
+    cannot call it (it lives inside app.asar), so open the repaired session once in the app.
+  * refusals are named: FIX_REFUSED_TORN_TAIL, _CONTAINER, _HEADER, _ROW, _ROW_MISMATCH, _BUSY,
+    _NO_RUNTIME, _WRITE; exit codes: 0 ok/noop, 1 refused, 2 usage, 3 write precondition busy.
+
 Standard flow
   1. quit DeepSeek Harness;
   2. node bin/w2m-fix.mjs scan
@@ -112,7 +147,8 @@ function writeErr(text) {
  * @param {string[]} argv
  * @returns {{command: string, session: string|null, dshHome: string, stamp: string|null, apply: boolean,
  *   force: boolean, json: boolean, help: boolean, file: string|null, deleteSeqs: number[], insertFile: string|null,
- *   dryRun: boolean, allowStaticValidation: boolean, keepBackups: number, error: string|null}}
+ *   dryRun: boolean, allowStaticValidation: boolean, allowStatic: boolean, inPlace: boolean, out: string|null,
+ *   keepBackups: number, error: string|null}}
  */
 function parseArgs(argv) {
   const opts = {
@@ -129,10 +165,13 @@ function parseArgs(argv) {
     insertFile: null,
     dryRun: false,
     allowStaticValidation: false,
+    allowStatic: false,
+    inPlace: false,
+    out: null,
     keepBackups: DEFAULT_KEEP_RENUMBER_BACKUPS,
     error: null,
   };
-  const commands = new Set(['scan', 'fix', 'backups', 'restore', 'renumber']);
+  const commands = new Set(['scan', 'fix', 'backups', 'restore', 'renumber', 'session-reframe']);
   const rest = [...argv];
   while (rest.length > 0) {
     const arg = rest.shift();
@@ -146,6 +185,10 @@ function parseArgs(argv) {
     else if (arg === '-h' || arg === '--help') opts.help = true;
     else if (arg === '--file') opts.file = rest.shift() ?? null;
     else if (arg.startsWith('--file=')) opts.file = arg.slice('--file='.length);
+    else if (arg === '--out') opts.out = rest.shift() ?? null;
+    else if (arg.startsWith('--out=')) opts.out = arg.slice('--out='.length);
+    else if (arg === '--in-place') opts.inPlace = true;
+    else if (arg === '--allow-static') opts.allowStatic = true;
     else if (arg === '--delete-seq') {
       const raw = rest.shift() ?? '';
       const value = Number(raw);
@@ -658,6 +701,192 @@ function runRenumber(opts) {
 }
 
 /**
+ * The serializable half of a `session-reframe` plan (a plan carries `newBytes` for apply).
+ *
+ * @param {object} plan
+ * @returns {object}
+ */
+function summarizeReframePlan(plan) {
+  return {
+    ok: plan.ok === true,
+    refused: plan.refused === true,
+    noop: plan.noop === true,
+    code: plan.code ?? null,
+    detail: plan.detail ?? '',
+    stage: plan.stage ?? null,
+    file: plan.file ?? null,
+    out_path: plan.outPath ?? null,
+    dry_run: plan.dryRun === true,
+    in_place: plan.inPlace === true,
+    file_bytes: plan.fileBytes ?? 0,
+    file_bytes_after: plan.fileBytesAfter ?? 0,
+    frames: plan.frames ?? 0,
+    frames_after: plan.framesAfter ?? 0,
+    rows: plan.rows ?? 0,
+    events: plan.events ?? 0,
+    last_seq: plan.lastSeq,
+    next_seq: plan.nextSeq,
+    header_frame_rows: plan.headerFrameRows ?? 0,
+    header_bytes: plan.headerBytes ?? 0,
+    event_bytes: plan.eventBytes ?? 0,
+    tail_bytes: plan.tailBytes ?? 0,
+    tail_frames: plan.tailFrames ?? 0,
+    header_frame_bytes_after: plan.headerFrameBytesAfter ?? 0,
+    event_frame_bytes_after: plan.eventFrameBytesAfter ?? 0,
+    sha256_before: plan.sha256Before ?? null,
+    sha256_after: plan.sha256After ?? null,
+    file_sha256_before: plan.fileSha256Before ?? null,
+    file_sha256_after: plan.fileSha256After ?? null,
+    tail_sha256: plan.tailSha256 ?? null,
+    backup_path: plan.backupPath ?? null,
+    codes: plan.codes ?? [],
+    mismatches: plan.mismatches ?? [],
+    validation: plan.validation ?? null,
+    peak_rss_mb: plan.peakRssMb ?? 0,
+    duration_ms: plan.durationMs ?? 0,
+  };
+}
+
+/**
+ * Render one `session-reframe` plan (and, when it was applied, the result).
+ *
+ * @param {object} plan
+ * @param {object|null} applied
+ * @returns {string}
+ */
+function formatReframe(plan, applied) {
+  const lines = ['w2m-fix session-reframe', ''];
+  lines.push(`file          : ${plan.file ?? '(none)'}`);
+  if (plan.noop === true) {
+    lines.push(`frames        : ${plan.frames}`);
+    lines.push(`rows          : ${plan.rows} (${plan.events} event(s))`);
+    lines.push('already legal : frame 0 holds exactly one header line; nothing was written (not even a copy)');
+    return lines.join('\n');
+  }
+  if (plan.ok !== true) {
+    lines.push(`refused       : ${plan.code ?? 'unknown'} ${plan.detail ?? ''}`.trimEnd());
+    if (plan.stage !== null && plan.stage !== undefined) lines.push(`stage         : ${plan.stage}`);
+    if (Array.isArray(plan.codes) && plan.codes.length > 0) lines.push(`codes         : ${plan.codes.join(', ')}`);
+    if (Array.isArray(plan.mismatches) && plan.mismatches.length > 0) {
+      lines.push('mismatches    :');
+      for (const mismatch of plan.mismatches) lines.push(`  - ${mismatch}`);
+    }
+    lines.push('');
+    lines.push('nothing was written.');
+    return lines.join('\n');
+  }
+  const validation = plan.validation ?? {};
+  lines.push(`size          : ${human(plan.fileBytes)} (${plan.fileBytes} B) -> ${human(plan.fileBytesAfter)} (${plan.fileBytesAfter} B)`);
+  lines.push(`frames        : ${plan.frames} -> ${plan.framesAfter}`);
+  lines.push(`frame 0       : ${plan.headerFrameRows} row(s) today (${plan.headerBytes} B header + ${plan.eventBytes} B of event rows) -> 1 row (${plan.headerFrameBytesAfter} B) + ${plan.eventFrameBytesAfter} B event batch`);
+  lines.push(`rows          : ${plan.rows} total, ${plan.events} event(s), last seq ${plan.lastSeq === null ? '?' : plan.lastSeq}, next append ${plan.nextSeq === null ? '?' : plan.nextSeq}`);
+  lines.push(`tail          : ${plan.tailFrames} frame(s), ${plan.tailBytes} B, copied byte-identically`);
+  lines.push(`row stream    : sha256 ${plan.sha256Before === plan.sha256After ? plan.sha256Before : `${plan.sha256Before} != ${plan.sha256After}`}`);
+  lines.push(`file sha256   : ${plan.fileSha256Before} -> ${plan.fileSha256After}`);
+  lines.push(`static doctor : ${validation.static?.ok === true ? 'ok (static pre-filter, not evidence)' : 'REFUSED'}${(validation.static?.codes ?? []).length > 0 ? ` [${validation.static.codes.join(', ')}]` : ''}`);
+  lines.push(`future append : ${validation.future_append?.ok === true ? 'ok' : 'not confirmed'} (next seq ${validation.future_append?.next_seq ?? '?'}, evidence ${validation.future_append?.evidence ?? 'static-prefilter'})`);
+  lines.push(`container gate: ${validation.container_gate ?? 'transcribed'} (the client's open() is the authoritative gate and is not callable here)`);
+  lines.push(`runtime       : ${validation.runtime_verified === true ? `verified by the installed Harness (${validation.runtime?.events ?? '?'} event(s))` : validation.runtime_required === true ? 'not run' : 'not run (--allow-static; static-only evidence)'}`);
+  if (applied === null) {
+    lines.push('out           : (not applied)');
+    if (plan.dryRun === true) {
+      lines.push('');
+      lines.push('dry run: nothing was written. Re-run without --dry-run and with --out to write the copy.');
+    }
+    return lines.join('\n');
+  }
+  if (applied.ok !== true) {
+    lines.push(`failed        : ${applied.code ?? 'unknown'} ${applied.detail ?? ''}`.trimEnd());
+    if (applied.backupPath !== null && applied.backupPath !== undefined) lines.push(`backup        : ${applied.backupPath}`);
+    return lines.join('\n');
+  }
+  if (applied.dry_run === true) {
+    lines.push('out           : (dry run: nothing was written)');
+    return lines.join('\n');
+  }
+  lines.push(`out           : ${applied.outPath} (${applied.bytes} B written)`);
+  if (applied.backupPath !== null && applied.backupPath !== undefined) lines.push(`backup        : ${applied.backupPath} (the way back)`);
+  if (applied.restored_from_backup === true) lines.push('restored      : the original bytes were put back after a failed verification');
+  lines.push('');
+  lines.push('verify        : the written file re-decodes to the same row stream, row count, last seq and tail bytes.');
+  lines.push('next step     : open the repaired session once in the app. The client rule is transcribed here, not executed:');
+  lines.push('                its own open() is the authoritative gate and lives inside app.asar.');
+  return lines.join('\n');
+}
+
+/**
+ * `session-reframe`: repair a log whose first zstd frame carries the header plus events.
+ *
+ * Default is a COPY at `--out`; `--dry-run` only plans; `--in-place` (with `--force`) is the one
+ * deliberate way to replace the source, and it keeps a verified `<file>.bak-<stamp>`.
+ *
+ * @param {object} opts parsed options
+ * @returns {number} exit code
+ */
+function runSessionReframe(opts) {
+  if (opts.file === null || opts.file === '') {
+    writeErr('session-reframe needs --file <path>');
+    writeErr('usage: node bin/w2m-fix.mjs session-reframe --file <session.v4.jsonl.zstd> [--out <path>] [--dry-run] [--json] [--allow-static] [--in-place]');
+    return EXIT.USAGE;
+  }
+  if (opts.out !== null && opts.out !== '' && opts.inPlace) {
+    writeErr('error: --out and --in-place are mutually exclusive');
+    writeErr('run with --help to see usage');
+    return EXIT.USAGE;
+  }
+  if (!opts.dryRun && (opts.out === null || opts.out === '') && !opts.inPlace) {
+    writeErr('error: session-reframe writes a copy: pass --out <path>, or --in-place --force, or --dry-run to only report');
+    writeErr('run with --help to see usage');
+    return EXIT.USAGE;
+  }
+  if (opts.inPlace && !opts.force) {
+    writeErr('error: --in-place needs --force as well (it replaces the log; a verified .bak copy is made first)');
+    writeErr('run with --help to see usage');
+    return EXIT.USAGE;
+  }
+
+  const running = dshRunning();
+  let plan;
+  try {
+    plan = planSessionReframe({
+      file: opts.file,
+      out: opts.out,
+      dryRun: opts.dryRun === true,
+      inPlace: opts.inPlace === true,
+      force: opts.force === true,
+      allowStatic: opts.allowStatic === true,
+      dshRunning: running,
+    });
+  } catch (error) {
+    writeErr(`error: session-reframe planning crashed: ${error?.message ?? String(error)}`);
+    return EXIT.FAILED;
+  }
+  const applied = plan.ok === true && plan.outPath !== null && plan.dryRun !== true ? applySessionReframe(plan) : null;
+  const outcome = applied ?? plan;
+
+  if (opts.json) {
+    writeOut(
+      JSON.stringify(
+        {
+          command: 'session-reframe',
+          ok: outcome.ok === true,
+          dry_run: opts.dryRun === true,
+          dsh_running: running,
+          plan: summarizeReframePlan(plan),
+          applied: applied === null ? null : { ...applied },
+        },
+        null,
+        2,
+      ),
+    );
+  } else {
+    writeOut(formatReframe(plan, applied));
+  }
+  if (outcome.ok === true) return EXIT.OK;
+  return outcome.code === REFRAME_CODES.BUSY ? EXIT.REFUSED : EXIT.FAILED;
+}
+
+/**
  * CLI entry point: parse arguments, resolve paths, dispatch one command.
  *
  * @param {string[]} argv arguments after the script name
@@ -680,6 +909,8 @@ export function main(argv) {
   }
   // Renumber needs only `--file`: it must not require a full `$DSH_HOME` layout the way scan/fix do.
   if (opts.command === 'renumber') return runRenumber(opts);
+  // session-reframe reads/writes explicit paths only, for the same reason.
+  if (opts.command === 'session-reframe') return runSessionReframe(opts);
   const { sessionsRoot, storeRoot } = resolvePaths(opts);
   const dirs = selectSessions(sessionsRoot, opts.session);
   const shared = { sessionsRoot, storeRoot, dirs };

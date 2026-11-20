@@ -4,6 +4,25 @@ All notable changes to this project are documented here.
 
 ## [Unreleased]
 
+### feat(fix): `session-reframe`——修复"首帧带事件"的 v4 会话日志（未发布）
+
+- 新命令 `w2m-fix session-reframe --file <log> [--out <path>] [--dry-run] [--json] [--allow-static] [--in-place]`：
+  把"首帧 = header + 事件"的日志重建为 **header 单帧 + 事件批帧 + 尾部逐字节复制**，不重新序列化任何行；
+  行流 sha256 前后一致。针对真机发现（394 个真实日志中唯一一例：`session-9603c5c8` 首帧 93 行，安装版客户端
+  `assertZstdHeaderFrame` 在读到事件前即拒绝）。
+- 默认写副本（临时兄弟文件 → fsync → 原子 rename）；`--in-place` 需 `--force`，先写并验证 `<file>.bak-<stamp>`，
+  失败则原子回滚；已合法日志 → `NOOP_ALREADY_LEGAL`（零写入）；计划后被改 → `FIX_REFUSED_BUSY`。
+- 门禁：转写版 `assertZstdHeaderFrame`（对重建字节）→ `diagnoseSessionBuffer` → `futureAppendVerdict`
+  （要求 `next_seq === lastSeq + 1`）→ `runtimeValidateBatch`（`--allow-static` 可跳过并标注 `runtime_verified:false`）
+  → 写后重读校验（帧数、首帧单行、行数/last seq、行流 sha256、尾帧字节、文件 sha256）。
+- 具名拒绝：`FIX_REFUSED_TORN_TAIL/CONTAINER/HEADER/ROW/ROW_MISMATCH/BUSY/NO_RUNTIME/WRITE`，退出码沿用 0/1/2/3。
+- 真机 dry-run + 应用（只写临时副本）：源 7,835,561 B / 138 帧 / 11,047 行 → 7,835,719 B / 139 帧；
+  frame 0 93 行 → 1 行（header 192 B + events 278,272 B）；尾部 137 帧逐字节一致；行流 sha256 `a334d8d9…099f`
+  前后相同；四门禁全 PASS；源文件 size/mtime/sha256 未变；输出与独立演练的修复字节完全一致。
+- 新套件 `test/fix-session-reframe.test.mjs` 23 例；相关套件 84/84；eslint 0 error；layer/mojibake clean。
+- 边界：`open()`（权威帧规则门）位于 `app.asar`，此处不可调用，只做规则转写 + 演练期已执行的客户端 `open()` 证明；
+  运行时门只看到行、看不到帧边界（对坏日志也会通过），不能替代容器规则；尾帧本就无 zstd checksum，保持原样。
+
 ### fix(backup): future-append 真实日志误报——容器层发现 + 按会话去重（未发布）
 
 - 真机演练发现 verify 对真实会话 `session-9603c5c8…` 报 `BACKUP_FUTURE_APPEND_FAILED`。根因不是追加模拟器：

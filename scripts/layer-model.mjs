@@ -111,6 +111,10 @@ export const ALLOWED_EDGES = Object.freeze([
   // is same-rank (1 -> 1); it does not point upward, and there is no module-level cycle: backup/renumber imports
   // fix/zstd, never fix/cli.
   ['fix', 'backup'],
+  // v3.5.x `session-reframe`: the frame-shape repair's static pre-filter is the SAME doctor the backup gate uses
+  // (`src/util/session-validate.mjs`), so the fix layer reaches down to util instead of growing a second
+  // validator. Downward (fix 1 -> util 0), and it makes the fix layer's doctor evidence identical to restore's.
+  ['fix', 'util'],
 ]);
 
 /** Layer names, for a caller that wants just the vocabulary. */
