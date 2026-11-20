@@ -1,0 +1,31 @@
+{
+  "version": "3.5.4",
+  "case": "RELEASE-3540-CUMULATIVE",
+  "kind": "positive",
+  "machines": [
+    "b53a37f4-1464-4512-9259-33a7df091e3e"
+  ],
+  "executed_at": "2026-11-21T07:10:00.000Z",
+  "executor": "lead",
+  "task_id": "w2m-release-3540",
+  "requirement": "Ship 3.5.4: the post-3.5.3 work (P2-O1/O2 chunked-v2 format + streaming verify, queue-journal second hardening, P2-O3/O4 streaming restore + rotation writes v2, P2-F4 real-process fault regression, future-append container-level attribution + per-session dedupe, S9 real-machine RSS records, and the session-reframe fix command). This record attests the release line passes the repository pre-flight gate and carries a named acceptance record.",
+  "commands": [
+    [
+      "node",
+      "scripts/preflight.mjs"
+    ],
+    [
+      "node",
+      "scripts/pack.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "cumulative_content": "O1/O2 (facdd9c), queue-journal second hardening (2c8a247), O3/O4 (5d6030a), F4 (8bce6fa), future-append fix (8b9cc45), S9 records (87f2ed0, 9f7520d), session-reframe command (fc88277).",
+      "gates": "pre-flight GREEN on an empty DSH_HOME; tests, claims, layer-check, mojibake scan and the acceptance-doc validator all pass.",
+      "real_machine_evidence": "S9 records in docs/acceptance/3.5.3 cover the worker-path RSS curve (56→450 MB, 679.9 MB data) and the GUI curve (1487→2187 MB, worker pid 8460, 42 s); the P2-O drill restored a chunked-v2 full copy with a byte-identical sha256; the future-append finding is attributed to a real log whose first frame carries 93 rows.",
+      "publish": "npm publish / GitHub Release / tag v3.5.4 are performed only after this record and a green pre-flight, under the maintainer authorization for this exact version."
+    }
+  }
+}

@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented here.
 
-## [Unreleased]
+## [3.5.4] - 2026-11-21
 
 ### feat(fix): `session-reframe`——修复"首帧带事件"的 v4 会话日志（未发布）
 
