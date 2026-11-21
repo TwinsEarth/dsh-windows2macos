@@ -189,3 +189,16 @@ node --test --test-force-exit test/backup-wiring.test.mjs
   唯一的替换路径是显式 `forceRunning: true`：先整目录备份到 `.w2m-restore-backups/sessions-<UTC>/`，再替换，
   并在结果里列出 `replaced`（见 §4.2）。
 - 归档工具面没有定时器、没有状态文件、没有 catch-up：启用它不会在挂载路径启动任何扫描或写盘。
+
+## 8. 演练/导入前后的注册表体检（强制）
+
+备份演练、恢复、批量 import 会写 `$DSH_HOME`（会话、附件、workspace 注册表）。**不要手写
+`storages/workspace.json`**：任何注册表变更都走 `src/backup/registry.mjs` 的读回协议；演练前后各跑一次体检：
+
+```powershell
+powershell -NoProfile -File tools\dsh-workspace-guard.ps1        # 只检查
+powershell -NoProfile -File tools\dsh-workspace-guard.ps1 -Fix    # 先备份、停 DSH、自愈
+```
+
+自洽时输出 `consistent` 并返回 0；发现悬空 `workspaceIds` / 未列行 / 无效默认时返回 1，`-Fix` 备份后自愈，
+重启客户端生效。完整规则与上游 issue 草稿见 [WORKSPACE-REGISTRY.md](WORKSPACE-REGISTRY.md)。

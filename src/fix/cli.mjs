@@ -45,6 +45,7 @@ import { applySessionReframe, planSessionReframe, REFRAME_CODES } from './sessio
 // future append + the installed Harness), so its one implementation sits with those gates instead of growing a
 // second validator here. The layer edge (`fix -> backup`) is declared in `scripts/layer-model.mjs`.
 import { applyRenumber, DEFAULT_KEEP_RENUMBER_BACKUPS, planRenumber } from '../backup/renumber.mjs';
+import { inspectWorkspaceRegistry, repairWorkspaceRegistry } from '../backup/workspace-registry-guard.mjs';
 
 const EXIT = { OK: 0, FAILED: 1, USAGE: 2, UNSUPPORTED_NODE: 2, REFUSED: 3 };
 
@@ -66,6 +67,9 @@ image attachment object referenced by its history has been deleted.
   node bin/w2m-fix.mjs session-reframe --file <log> [--out <path>] [--dry-run] [--json] [--allow-static] [--in-place]
                                                     rebuild a log whose first zstd frame holds the header
                                                     together with events; writes a copy, never the source
+  node bin/w2m-fix.mjs workspace-registry [--check|--repair]
+                                                    inspect/repair storages/workspace.json invariants:
+                                                    ids<->rows, default, and row sessionIds that exist
 
 Options
   --session <part>        only sessions whose directory name contains this part
@@ -126,6 +130,25 @@ Session-reframe notes
   * refusals are named: FIX_REFUSED_TORN_TAIL, _CONTAINER, _HEADER, _ROW, _ROW_MISMATCH, _BUSY,
     _NO_RUNTIME, _WRITE; exit codes: 0 ok/noop, 1 refused, 2 usage, 3 write precondition busy.
 
+Workspace-registry options (registry invariants; no session log is read or written)
+  --check                 inspect only (default): dangling workspaceIds, unlisted rows, row sessionIds with
+                          no log on disk, invalid defaultWorkspaceId
+  --repair                back the document up to workspace.json.bak-guard-<stamp>, drop dangling ids, keep
+                          unlisted rows by appending them to workspaceIds, prune sessionIds with no log,
+                          reassign an invalid default; atomic write + read-back + re-inspect (idempotent)
+  --dsh-home <path>       the home whose storages/workspace.json is inspected (default: $DSH_HOME or ~/.dsh)
+  --json                  one JSON object: {command, ok, changed, before, after, ...}
+
+Workspace-registry notes
+  * QUIT DeepSeek Harness before --repair: the client holds the document in memory and writes it on its own
+    schedule, so a repair underneath a running client is overwritten.
+  * a dangling id is fatal (the client's workspaceController refuses to mount, and every workspace operation
+    reports "active Service workspaceController is unavailable"); an unlisted row is invisible; a missing
+    session reference hides history. Nothing here deletes a workspace row or a session log.
+  * this is the ONLY supported repair path. Programmatic registry changes go through
+    src/backup/registry.mjs (plan -> atomic write -> read-back), never a hand-written JSON edit;
+    test/registry-write-policy.test.mjs enforces that for this repository's scripts.
+
 Standard flow
   1. quit DeepSeek Harness;
   2. node bin/w2m-fix.mjs scan
@@ -169,9 +192,10 @@ function parseArgs(argv) {
     inPlace: false,
     out: null,
     keepBackups: DEFAULT_KEEP_RENUMBER_BACKUPS,
+    workspaceRepair: false,
     error: null,
   };
-  const commands = new Set(['scan', 'fix', 'backups', 'restore', 'renumber', 'session-reframe']);
+  const commands = new Set(['scan', 'fix', 'backups', 'restore', 'renumber', 'session-reframe', 'workspace-registry']);
   const rest = [...argv];
   while (rest.length > 0) {
     const arg = rest.shift();
@@ -206,6 +230,8 @@ function parseArgs(argv) {
     } else if (arg === '--insert-file') opts.insertFile = rest.shift() ?? null;
     else if (arg.startsWith('--insert-file=')) opts.insertFile = arg.slice('--insert-file='.length);
     else if (arg === '--dry-run') opts.dryRun = true;
+    else if (arg === '--repair') opts.workspaceRepair = true;
+    else if (arg === '--check') opts.workspaceRepair = false;
     else if (arg === '--allow-static-validation') opts.allowStaticValidation = true;
     else if (arg === '--keep-backups') {
       const raw = rest.shift() ?? '';
@@ -887,6 +913,41 @@ function runSessionReframe(opts) {
 }
 
 /**
+ * `workspace-registry`: inspect or repair `storages/workspace.json`.
+ *
+ * The invariant this command exists for: `global.workspaceIds` must name rows that exist. One dangling id
+ * makes the DSH `workspaceController` fail to mount, so every workspace operation stops. `--repair` keeps
+ * every visible row, drops only dangling ids, prunes session references that no longer resolve, fixes the
+ * default, and backs the document up first.
+ *
+ * @param {ReturnType<typeof parseArgs>} opts
+ * @returns {number} process exit code
+ */
+function runWorkspaceRegistry(opts) {
+  const report = opts.workspaceRepair === true ? repairWorkspaceRegistry(opts.dshHome) : inspectWorkspaceRegistry(opts.dshHome);
+  const after = report.after ?? report;
+  if (opts.json) {
+    writeOut(JSON.stringify({ command: 'workspace-registry', repair: opts.workspaceRepair === true, ...report }, null, 2));
+  } else {
+    writeOut(`file: ${report.file}`);
+    if (report.error) writeOut(`error: ${report.error}`);
+    writeOut(
+      `workspaceIds=${after.ids?.length ?? 0} rows=${after.rows?.length ?? 0} ` +
+        `default_ok=${after.defaultOk === true} sessions_missing=${after.missingSessions?.length ?? 0}`,
+    );
+    for (const problem of after.problems ?? []) writeOut(`  ${problem.code}: ${problem.detail}`);
+    if (opts.workspaceRepair === true) {
+      writeOut(report.changed === true ? `repaired; backup: ${report.backup}` : 'nothing to repair');
+      if (report.ok === true) writeOut('restart DeepSeek Harness to reload the registry.');
+    } else {
+      writeOut(report.ok === true ? 'consistent' : 'inconsistent - run with --repair (quit DeepSeek Harness first)');
+    }
+  }
+  if (report.ok === true) return EXIT.OK;
+  return after.error === 'registry file is missing' ? EXIT.USAGE : EXIT.FAILED;
+}
+
+/**
  * CLI entry point: parse arguments, resolve paths, dispatch one command.
  *
  * @param {string[]} argv arguments after the script name
@@ -903,6 +964,8 @@ export function main(argv) {
     writeErr('run with --help to see usage');
     return EXIT.USAGE;
   }
+  // workspace-registry is pure JSON + directory inspection: it must work on a Node without the zstd API.
+  if (opts.command === 'workspace-registry') return runWorkspaceRegistry(opts);
   if (!hasZstd()) {
     writeErr(`this Node has no synchronous zstd API (needs >= 22.15 or >= 23); current ${process.version}`);
     return EXIT.UNSUPPORTED_NODE;
