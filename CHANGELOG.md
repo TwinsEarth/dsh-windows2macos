@@ -2,6 +2,28 @@
 
 All notable changes to this project are documented here.
 
+## [3.5.7] - 2026-11-21
+
+### fix(surfaces): 子插件开关真正决定侧栏标签/面板/浮标是否出现（探测语义修正）
+
+- **真机根因**：真实宿主对任何未认证的 `/api/w2m/*`（含根本不存在的路径）**在路由之前**返回 401；
+  3.5.6 的客户端把 `401` 当作"已挂载"，于是四个 UI 行全部 `disabled` 时侧栏条目仍然注册。
+  修正后的契约：**仅 2xx = 已挂载；401/403 = 权威的"不可用"；其它状态 = 权威不可用；只有全部探测完全
+  没有 HTTP 应答（超时/网络错误）才回退到旧的全量注册行为**（单次 401/404 不触发回退）。
+  诊断对象 `window.__W2M_SURFACES__ = {ok, available, reasons, definite, probeBlocked, probedAt, fallback}`：
+  `probeBlocked:true`（全部 401/403）= 探测被认证拦截；`fallback:true`（全部 timeout）= 旧宿主。
+- **补齐两个面**：队列日志行新增 `GET /api/w2m/composer/journal/health`，决策中心行新增
+  `GET /api/w2m/decisions/health`（常量 200、`no-store`、无文件读写、仅该行挂载时存在）。
+  客户端 surface 账本扩到六个（gpw/backup/desktop/archive/journal/decisions），JQ 的 chip/抽屉/降级侧栏项与
+  DC 的浮标/收件箱都按行可用性挂载/卸载（模块 apply 返回注销器，卸载时 dispose，重复探测幂等）。
+- **归档入口文案**：只有 `dsh-backup-plugin`（归档）行可用、仓库行关闭时，侧栏与主页面标题显示「归档备份」；
+  仓库行可用时仍是「备份&还原」。
+- **文档**：新增 `docs/SURFACES.md`（探测契约、回退规则、"认证 401 绝不算已挂载"、per-row→UI 表、排障表）；
+  `docs/BACKUP-SUBPLUGIN.md` §9、`docs/PLAN-3.5.6-BACKUP-UI-AND-SURFACES.md` 增补修订说明。
+- **测试**：surface 矩阵（单启用/全禁用/全 401/全超时/混合 401+404/热出现/热消失/archive-only 标签）；
+  真实页面回归（JQ/DC 行开关 vs chip/inbox）；`W2M_SURFACES_PROBE=1` 13/13、`W2M_DECISION_PROBE=1`、
+  `W2M_BACKUP_PROBE=1` 均真实驱动页面通过；8 个指定套件 310 tests（无安装 297 pass/13 skip，装有安装 309 pass/1 skip）。
+- `lib/client.js` 609,722 B / 10,048 行（预算 610,000 / 10,050，未提高上限）。
 ## [3.5.6] - 2026-11-21
 
 ### 归档备份子插件 UI（「备份&还原」的「归档」tab）+ 侧边栏随启用状态显示/隐藏（未发布）

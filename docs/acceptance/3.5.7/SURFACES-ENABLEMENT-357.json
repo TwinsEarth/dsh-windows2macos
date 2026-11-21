@@ -1,0 +1,54 @@
+{
+  "version": "3.5.7",
+  "case": "SURFACES-ENABLEMENT-357",
+  "kind": "positive",
+  "machines": [
+    "TOFUTURE"
+  ],
+  "executed_at": "2026-11-21T07:20:00.000Z",
+  "executor": "agent",
+  "task_id": "w2m-v357-surface-enablement",
+  "requirement": "v3.5.7: make a subplugin row actually decide whether its UI exists. (1) Correct the surface probe: a real host answers 401 before routing for any unauthenticated /api/w2m path (including nonexistent ones), so 401 must never mean mounted — 2xx=mounted, 401/403=authoritatively unavailable, any other status=authoritatively unavailable, and the legacy all-registered fallback applies only when no probe got any HTTP answer at all (all timeout/network-error). (2) Put the queue-journal UI (chip/drawer/sidebar fallback) and the decision-center UI (floating inbox/drawer) under the same surface book, with new /api/w2m/composer/journal/health and /api/w2m/decisions/health routes. (3) Label the backup entry 「归档备份」 when only the archive row is enabled. (4) Add a surface matrix test and a real-page toggle regression.",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/client-bundle.test.mjs",
+      "test/client-budget.test.mjs",
+      "test/queue-journal.test.mjs",
+      "test/decision-routes.test.mjs",
+      "test/decision-center.test.mjs",
+      "test/loader-entry.test.mjs",
+      "test/backup-wiring.test.mjs",
+      "test/backup-subplugin.test.mjs"
+    ],
+    [
+      "npx",
+      "eslint",
+      "."
+    ],
+    [
+      "node",
+      "scripts/layer-check.mjs"
+    ],
+    [
+      "node",
+      "scripts/scan-mojibake.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "root_cause": "Live evidence on the real host: 127.0.0.1:52334 answered 401 for GET /api/w2m/nonexistent-xyz and for /api/w2m/{backup,gpw}/health (the auth layer runs before routing), while the non-API listener 9230 answered 404. The 3.5.6 client treated 401 as \"mounted\", so all four shipped-disabled rows still registered their sidebar entries.",
+      "probe_contract": "Available only on 2xx (204 included). 401/403 = unauthorized and definitive. Any other status = definitive unavailable (http-<code>). Abort/timeout and transport errors are non-definitive. Fallback is true only when every probe is non-definitive; all-401, all-404 and mixed 401/404 mount nothing. window.__W2M_SURFACES__ publishes {ok, available, reasons, definite, probeBlocked, probedAt, fallback}.",
+      "surface_book": "Six surfaces: gpw (launcher + sidebar + main), backup (sidebar + main; also reachable via archive), desktop (远程桌面 sidebar + main), archive (no entry; A1 tab), journal (queue chip conversation.input.left + drawer shell.overlay + sidebar fallback w2m-queue-journal), decisions (floating inbox + drawer). Slot entries and custom mount/unmount callbacks share one idempotent diff: removals call the slot disposers or the module disposer (the queue-journal module apply now returns a disposer that unregisters every seat and the sidebar fallback; MountW2mDecisionCenterUI already returned one).",
+      "routes": "GET /api/w2m/composer/journal/health and GET /api/w2m/decisions/health are constant-200 {ok:true,row,mounted:true} with cache-control: no-store, read no store and create no files; they exist only while their row is mounted (disabled row → no route → 404).",
+      "label": "When only the archive row is enabled the sidebar entry and the main-page title read 「归档备份」; when the repository row is enabled they keep 「备份&还原」 (real-page assertions cover both directions).",
+      "tests": "Eight mandated suites: without env 310 tests / 297 pass / 0 fail / 13 skipped (all 13 are loader-entry honest skips: no installation under E:); with W2M_DSH_ROOT=D:\\DSH 310 / 309 pass / 0 fail / 1 skipped (archive-tab probe is opt-in via W2M_SURFACES_PROBE=1). New matrix covers single-surface-enabled, all-disabled (all 404 → nothing, fallback:false), all-401 (nothing, probeBlocked:true), all-timeout (fallback:true legacy), mixed 401+404 (nothing, no fallback), enable-after-load appears, disable-after-load disappears with disposers, archive-only label. Opt-in real-page probes: W2M_SURFACES_PROBE=1 13/13; W2M_DECISION_PROBE=1 12 pass/1 skip; W2M_BACKUP_PROBE=1 12 pass/1 skip (the backup probe redirects the installed copy’s backupDir into the throwaway home, so the operator repository is never written). The new real-page toggle regression enables then disables the queue-journal and decision-center rows in the installed copy and asserts the chip/fallback entry/inbox appear only when enabled, with fallback:false.",
+      "budget": "lib/client.js 609,722 B / 10,048 lines against 610,000 B / 10,050 line ceilings; the ceiling was not raised; largest function 851 lines (BackupPanelView, ceiling 1,200).",
+      "gates": "eslint 0 errors; layer-check clean; scan-mojibake clean; pre-flight GREEN (packed 578 files).",
+      "honesty": "All runs were local on the Windows host TOFUTURE. The real-page probes use a throwaway DSH_HOME and only reference the installed runtime on D: via W2M_DSH_ROOT; the operator profile/repository was not written. The 401 evidence is an unauthenticated request to the real host API port, which is exactly the shape that falsified the old 401-means-mounted rule; the authenticated page probes are what the matrix measures."
+    }
+  }
+}
