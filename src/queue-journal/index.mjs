@@ -33,6 +33,16 @@ export const QUEUE_JOURNAL_ROUTE_PREFIX = '/api/w2m/composer/journal';
 export const QUEUE_RESTORE_ROUTE_PATH = '/api/w2m/composer/queue';
 export const QUEUE_JOURNAL_SERVICE = 'w2mQueueJournal';
 
+/**
+ * Availability probe (v3.5.7): a constant 200 while this row is mounted.
+ *
+ * The client polls it before it registers the queue-journal chip, drawer and sidebar fallback. It answers
+ * without touching the store, the data directory or `$DSH_HOME` — a probe that created state would change
+ * the very thing it reports on — and it is registered from this row's own `apply`, so a disabled row has no
+ * route at all and the answer is 404.
+ */
+export const QUEUE_JOURNAL_HEALTH_ROUTE = `${QUEUE_JOURNAL_ROUTE_PREFIX}/health`;
+
 const NO_STORE = { 'cache-control': 'no-store' };
 
 function json(status, body) {
@@ -129,6 +139,15 @@ export function registerQueueJournalRoutes(ctx, deps) {
     const register = (routePath, methods, fetch) => {
       registry.register({ path: routePath, methods, requestBody: 'buffered', fetch: guard(fetch) });
     };
+
+    // v3.5.7/B1: the availability probe the client polls. Constant, side-effect free, and outside the Fang
+    // interop guard: the shell's same-origin fence is the credential, and the probe must answer for the page.
+    registry.register({
+      path: QUEUE_JOURNAL_HEALTH_ROUTE,
+      methods: ['GET'],
+      requestBody: 'buffered',
+      fetch: async () => json(200, { ok: true, row: 'dsh-queue-journal', mounted: true }),
+    });
 
     register(QUEUE_JOURNAL_ROUTE_PREFIX, ['GET', 'POST'], async (request) => {
       if (request.method === 'GET') {

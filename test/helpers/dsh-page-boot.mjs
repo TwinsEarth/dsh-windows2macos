@@ -239,14 +239,25 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
       report.composer = state.composer;
     }
     report.bootFailure = report.consoleErrors.find((line) => BOOT_FAILURE_PATTERN.test(line)) ?? null;
-    // v3.5.6/B1: the surface diagnostics and the DOM markers. Read on every boot (they are cheap and
-    // profile-independent): `__W2M_SURFACES__` says what the four probes answered, and every entry the
-    // bundle registered renders inside a `[data-w2m-surface]` box. A disabled row is absent, not greyed.
+    // v3.5.7: the surface diagnostics and the surfaces themselves. Read on every boot (they are cheap and
+    // profile-independent): `__W2M_SURFACES__` says what the six probes answered, every slot entry the bundle
+    // registered renders inside a `[data-w2m-surface]` box, and the two DOM-mounted surfaces -- the queue
+    // journal's chip/sidebar fallback and the decision inbox badge -- are read by their markers. A disabled
+    // row is absent, not greyed. The probe is async, so wait for it (bounded) and give React one render.
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      if ((await evaluate('window.__W2M_SURFACES__ !== undefined')) === true) break;
+      await new Promise((resolve) => { setTimeout(resolve, 300); });
+    }
+    await new Promise((resolve) => { setTimeout(resolve, 600); });
     const surfacesRead = await evaluate(`JSON.stringify((() => {
       const d = window.__W2M_SURFACES__ ?? null;
+      const has = (selector) => document.querySelector(selector) !== null;
       return {
-        diag: d === null ? null : { ok: d.ok, fallback: d.fallback, available: d.available, reasons: d.reasons, probedAt: d.probedAt },
+        diag: d === null ? null : { ok: d.ok, fallback: d.fallback, definite: d.definite, probeBlocked: d.probeBlocked, available: d.available, reasons: d.reasons, probedAt: d.probedAt },
         markers: [...document.querySelectorAll('[data-w2m-surface]')].map((node) => node.getAttribute('data-w2m-surface')),
+        journalChip: has('[data-w2m-jq-chip]'),
+        journalFallback: has('[data-w2m-jq-fallback]'),
+        decisionInbox: has('.w2mDcBadge'),
       };
     })())`);
     report.surfaces = typeof surfacesRead === 'string' ? JSON.parse(surfacesRead) : null;
@@ -258,6 +269,16 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
         const value = await evaluate(`JSON.stringify((() => { ${expression} })())`);
         return value === null ? null : JSON.parse(value);
       };
+      // v3.5.7: the archive row has no entry of its own, so the backup seat is the door it opens. With the
+      // repository row disabled that seat must read 「归档备份」 -- the repository label would promise a
+      // backend this profile does not have. Read it before the click switches the main page.
+      const seat = await read(`
+        const b=document.querySelector('[data-w2m-backup-sidebar]');
+        if(b===null)return{found:false};
+        const row=b.closest('.w2mBackup_sideEntry') ?? b.parentElement ?? b;
+        const text=(row.innerText || row.textContent || '').trim();
+        return {found:true, text:text.slice(0,120), archiveLabel:(text.match(/归档备份/g)??[]).length, backupLabel:(text.match(/备份&还原/g)??[]).length};
+      `);
       const opened = await read(`const b=document.querySelector('[data-w2m-backup-sidebar]'); if(b===null)return{found:false}; b.click(); return{found:true};`);
       await new Promise((resolve) => setTimeout(resolve, 900));
       const panel = await read(`
@@ -298,7 +319,7 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
           markers:[...document.querySelectorAll('[data-w2m-surface]')].map((node)=>node.getAttribute('data-w2m-surface')),
         };
       `);
-      report.surfacesProbe = { opened, panel, clicked, created, listed, verified, verifiedCard, archive };
+      report.surfacesProbe = { seat, opened, panel, clicked, created, listed, verified, verifiedCard, archive };
     }
     if (process.env.W2M_CAPABILITY_PROBE === '1') {
       const read = async (expression) => {
@@ -410,6 +431,7 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
         return {
           found:d!==null,
           hidden:d===null?null:d.hidden,
+          status:d?.getAttribute('data-w2m-jq-status') ?? null,
           title:(d?.querySelector('.w2mDcDrawerTitle')?.textContent ?? null),
           body:((d?.querySelector('.w2mDcBody')?.innerText ?? '')).slice(0,600),
           foldExists:fold!==null,
@@ -546,8 +568,11 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
       const opsOpened = await read(`const b=document.querySelector('.w2mGpw_sideEntry'); if(b===null)return{found:false}; b.click(); return{found:true};`);
       await new Promise((resolve) => setTimeout(resolve, 800));
       const opsPanel = await read(`const p=document.querySelector('.w2mOpsPanel'); return {open:p!==null, tabs:[...document.querySelectorAll('.w2mOpsTab')].map((x)=>x.textContent), active:(document.querySelector('.w2mOpsTab[data-active=true]')?.textContent??null)};`);
-      // v3.5.0: the fleet version-drift card lives in the operation panel's action section; the profile may have
-      // no relay configured, in which case the card must render its neutral "unavailable" state instead of blank.
+      // v3.5.0: the fleet version-drift card lives in the operation panel's action section (「操作入口」 tab), and
+      // the profile may have no relay configured, in which case the card must render its neutral "unavailable"
+      // state instead of blank. Switch to that tab before reading the card.
+      const opsActionsTab = await read(`const tabs=[...document.querySelectorAll('.w2mOpsTab')]; const a=tabs.find((x)=>x.textContent.includes('操作入口')); if(a===undefined)return{clicked:false}; a.click(); return{clicked:true};`);
+      await new Promise((resolve) => setTimeout(resolve, 500));
       const opsFleetVersion = await read(`
         const card=document.querySelector('[data-w2m-fleet-version-card]');
         const title=card?.querySelector('.w2mVerTitle');
@@ -566,17 +591,17 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
       const opsClosed = await read(`const b=document.querySelector('.w2mGpw_fullPage .w2mGpw_close'); if(b===null)return{closed:false}; b.click(); return{clicked:true};`);
       await new Promise((resolve) => setTimeout(resolve, 400));
       const opsGone = await read(`return {closed:document.querySelector('.w2mGpw_fullPage')===null};`);
-      report.opsProbe = { opsOpened, opsPanel, opsFleetVersion, opsQueueTab, opsQueueSection, opsClosed, opsGone };
-      // v3.4.9: the backup entry and the page it switches to. The profile ships the dsh-backup row disabled by
-      // default, so the panel is expected to render its "route missing / needs enabling" state: the probe checks
-      // the seat, the page, and the four action markers, not the host routes (those have their own tests).
-      // The seat must show ONE label: the component draws icon + text, so a host-side label would print the
-      // text twice in the same row ("备份&还原 备份&还原"). Read the enclosing row's text and count.
+      report.opsProbe = { opsOpened, opsPanel, opsActionsTab, opsFleetVersion, opsQueueTab, opsQueueSection, opsClosed, opsGone };
+      // v3.4.9: the backup entry and the page it switches to. The opt-in probes enable the backup row in the
+      // installed copy (see `W2M_DECISION_PROBE` / `W2M_BACKUP_PROBE`), so the panel reads live host state; the
+      // four action markers and the log are what this step measures, not the host routes (those have their own
+      // suites). The seat must show ONE label: the component draws icon + text, so a host-side label would print
+      // the text twice in the same row ("备份&还原 备份&还原"). Read the enclosing row and count.
       const backupSeatText = await read(`
         const b=document.querySelector('[data-w2m-backup-sidebar]');
         if(b===null) return {found:false};
         const row=b.closest('.w2mBackup_sideEntry') ?? b.parentElement ?? b;
-        const text=(row.innerText ?? row.textContent ?? '').trim();
+        const text=(row.innerText || row.textContent || '').trim();
         const count=(text.match(/备份&还原/g) ?? []).length;
         return {found:true, text:text.slice(0,120), count};
       `);

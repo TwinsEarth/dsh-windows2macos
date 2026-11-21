@@ -198,13 +198,27 @@ const ROUTE_DEFECT_ENV = 'W2M_ROUTE_DEFECT';
 /**
  * v3.5.6/B1: the mixed-availability probe.
  *
- * The throwaway profile ships every UI row `disabled: true`, so the client can only ever take its
- * all-failed fallback there. Setting this makes the test enable **the archive row and nothing else** in
- * the installed profile's copy of the bundle patch (never in the tree under test), which is the one state
- * that proves both halves of B1 at once: an enabled row registers, a disabled row does not, and the
- * archive tab appears only because its row answered.
+ * The throwaway profile ships every UI row `disabled: true`, so a plain boot has no UI row to show. Setting
+ * this makes the test enable **the archive row and nothing else** in the installed profile's copy of the
+ * bundle patch (never in the tree under test), which is the one state that proves both halves of B1 at once:
+ * an enabled row registers, a disabled row does not, and the archive tab appears only because its row
+ * answered. Since v3.5.7 a 404 is authoritative, so this probe owns the archive row exclusively and cannot
+ * be combined with the two row-state probes below.
  */
 const SURFACES_PROBE_ENV = 'W2M_SURFACES_PROBE';
+
+/**
+ * v3.5.7: opt-in real-page probes that need a UI row enabled.
+ *
+ * The same rule as {@link SURFACES_PROBE_ENV}: the shipped patch leaves these rows disabled, and a disabled
+ * row now answers 404 and mounts nothing, so each probe enables the rows it asserts on in the *installed*
+ * copy of the patch before the boot. `DECISION_PROBE_ENV` drives the decision inbox and also reads the GPW
+ * panel and the backup seats, so it enables the GPW and backup rows; `BACKUP_PROBE_ENV` drives the backup
+ * panel and its unlock dialog, so it enables the backup row only (the archive row stays off, and the probe
+ * asserts its tab is absent).
+ */
+const DECISION_PROBE_ENV = 'W2M_DECISION_PROBE';
+const BACKUP_PROBE_ENV = 'W2M_BACKUP_PROBE';
 
 /** The web app's own flags: an OS-chosen port, and no browser launch from a test. */
 const APP_ARGS = ['--port', '0', '--no-open'];
@@ -373,6 +387,11 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
   let driverStderr = '';
   /** @type {object|null} */
   let entry = null;
+  /**
+   * What the toggled-rows regression needs to boot the same throwaway profile a second time.
+   * @type {{installation: {root: string, runtime: string}, home: string, profileDir: string, overlayPath: string, env: object, cwd: string}|null}
+   */
+  let bootContext = null;
   /** @type {string[]} */
   const temporary = [];
 
@@ -420,6 +439,7 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
 
     const overlayPath = path.join(workDir, 'overlay.yml');
     await fsp.writeFile(overlayPath, OVERLAY, 'utf8');
+    bootContext = { installation, home, profileDir, overlayPath, env, cwd: workDir };
 
     if (process.env[ROUTE_DEFECT_ENV] === '1') {
       // Restore v0.5.4's route in the installed copy only: the child fiber that registers it then
@@ -439,15 +459,45 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
       await fsp.writeFile(installedRoute, patched, 'utf8');
     }
 
-    if (process.env[SURFACES_PROBE_ENV] === '1') {
-      // Enable the archive row in the installed profile's copy of the bundle patch (never in the tree under
-      // test). The other three UI rows keep their shipped `disabled: true`, so the page sees one mounted row
-      // and three absent ones -- the mixed state that proves both directions of B1.
+    // v3.5.7: each opt-in page probe asserts on a UI row that the shipped patch leaves `disabled: true`, and a
+    // disabled row answers 404 and mounts nothing -- by design. So the probe enables the rows it drives in the
+    // *installed copy* of the bundle patch (never in the tree under test). `W2M_SURFACES_PROBE` is the mixed
+    // state (archive on, everything else off) and is therefore exclusive.
+    assert.equal(
+      process.env[SURFACES_PROBE_ENV] === '1'
+        && (process.env[DECISION_PROBE_ENV] === '1' || process.env[BACKUP_PROBE_ENV] === '1'),
+      false,
+      `${SURFACES_PROBE_ENV}=1 enables the archive row and nothing else; run the decision/backup probes without it.`,
+    );
+    const enableRows = new Set();
+    if (process.env[SURFACES_PROBE_ENV] === '1') enableRows.add('dsh-backup-plugin');
+    if (process.env[DECISION_PROBE_ENV] === '1') {
+      enableRows.add('dsh-gpw');
+      enableRows.add('dsh-backup');
+    }
+    if (process.env[BACKUP_PROBE_ENV] === '1') enableRows.add('dsh-backup');
+    if (enableRows.size > 0) {
       const patchPath = path.join(profileDir, 'node_modules', '@twinsearth', 'w2m-dsh-plugin', 'cordis.patch.yml');
-      const patchSource = await fsp.readFile(patchPath, 'utf8');
-      const patched = patchSource.replace(/(- id: dsh-backup-plugin[\s\S]*?disabled: )true/u, '$1false');
-      assert.notEqual(patched, patchSource, `${SURFACES_PROBE_ENV}=1 could not find the archive row to enable in ${patchPath}`);
-      await fsp.writeFile(patchPath, patched, 'utf8');
+      let patchSource = await fsp.readFile(patchPath, 'utf8');
+      for (const row of enableRows) {
+        const pattern = new RegExp(`(- id: ${row}\\n[ \\t]+name: '[^']+'\\n[ \\t]+disabled: )true`, 'u');
+        const patched = patchSource.replace(pattern, (match, prefix) => `${prefix}false`);
+        assert.notEqual(patched, patchSource, `could not enable the ${row} row in ${patchPath}`);
+        patchSource = patched;
+      }
+      if (enableRows.has('dsh-backup')) {
+        // The shipped backup row points at the operator's real repository (`D:\DeepSeekHarness\BackUP`). A probe
+        // that clicks 「运行」/「归档」 must never write there, so its installed copy is pointed at a repository
+        // inside this test's throwaway home. Every other key of the row is left exactly as shipped.
+        const repoDir = path.join(workDir, 'backup-repo').replace(/\\/gu, '/');
+        const redirected = patchSource.replace(
+          /(- id: dsh-backup\n(?:[ \t]+[^\n]*\n)*?[ \t]+backupDir: )'[^']*'/u,
+          (match, prefix) => `${prefix}'${repoDir}'`,
+        );
+        assert.notEqual(redirected, patchSource, `could not point the dsh-backup row at ${repoDir}`);
+        patchSource = redirected;
+      }
+      await fsp.writeFile(patchPath, patchSource, 'utf8');
     }
 
     const booted = await run(
@@ -621,7 +671,7 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
     const surfaces = page.surfaces;
     assert.ok(surfaces !== null && surfaces?.diag !== null, `the page exposed no surface diagnostics: ${JSON.stringify(surfaces)}`);
     const { available = {}, fallback } = surfaces.diag;
-    for (const key of ['gpw', 'backup', 'desktop', 'archive']) {
+    for (const key of ['gpw', 'backup', 'desktop', 'archive', 'journal', 'decisions']) {
       assert.equal(typeof available[key], 'boolean', `__W2M_SURFACES__.available.${key} is a boolean`);
       assert.equal(typeof surfaces.diag.reasons?.[key], 'string', `__W2M_SURFACES__.reasons.${key} names the probe outcome`);
     }
@@ -647,6 +697,61 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
     }
   });
 
+  it('mounts the queue journal and the decision inbox only for their enabled rows', async (t) => {
+    if (skipReason !== null) return t.skip(skipReason);
+    const base = report?.clientPage;
+    assert.ok(base !== undefined, 'the driver reported no page boot');
+    if (typeof base.skipped === 'string') return t.skip(base.skipped);
+    // The shipped profile enables dsh-queue-journal and dsh-decision-center, so both surfaces are in the page
+    // and both probes answered for themselves.
+    const diag = base.surfaces?.diag ?? {};
+    assert.equal(diag.fallback, false, `the probes answer for themselves: ${JSON.stringify(diag)}`);
+    assert.equal(diag.available?.journal, true, `the queue-journal row is enabled in this profile: ${JSON.stringify(diag.reasons)}`);
+    assert.equal(diag.available?.decisions, true, `the decision-center row is enabled in this profile: ${JSON.stringify(diag.reasons)}`);
+    assert.equal(base.surfaces?.journalChip, true, 'the queue-journal chip is in the composer');
+    assert.equal(base.surfaces?.decisionInbox, true, 'the decision inbox badge is in the page');
+    assert.ok(bootContext !== null, 'the throwaway profile is installed');
+    const { installation: mounted, home, profileDir, overlayPath, env, cwd } = bootContext;
+
+    // Toggle both rows off in the *installed* copy only (never in the tree under test), boot the same profile
+    // again, and measure the other direction: a 404 hides the surface and the diagnostics stay authoritative.
+    const patchPath = path.join(profileDir, 'node_modules', '@twinsearth', 'w2m-dsh-plugin', 'cordis.patch.yml');
+    const original = await fsp.readFile(patchPath, 'utf8');
+    let patched = original;
+    for (const row of ['dsh-queue-journal', 'dsh-decision-center']) {
+      const pattern = new RegExp(`(- id: ${row}\\n\\s+name: '[^']+'\\n)(\\s+config:)`, 'u');
+      const next = patched.replace(pattern, '$1      disabled: true\n$2');
+      assert.notEqual(next, patched, `could not disable the ${row} row in ${patchPath}`);
+      patched = next;
+    }
+    await fsp.writeFile(patchPath, patched, 'utf8');
+    try {
+      const booted = await run(
+        mounted.runtime,
+        ['--expose-internals', DRIVER, mounted.root, home, PROFILE, JSON.stringify(APP_ARGS), overlayPath],
+        { env, cwd, timeoutMs: BOOT_TIMEOUT_MS },
+      );
+      const toggled = parseReport(booted.stdout);
+      assert.ok(
+        toggled !== null,
+        `the toggled profile produced no report (exit ${booted.code}, timed out: ${booted.timedOut}):\n${booted.stdout}\n${booted.stderr}`,
+      );
+      assert.equal(toggled.ok, true, `the toggled profile failed to boot: ${toggled.error}`);
+      const page = toggled.clientPage;
+      assert.ok(page !== undefined, 'the toggled boot reported no page');
+      if (typeof page.skipped === 'string') return t.skip(page.skipped);
+      const off = page.surfaces?.diag ?? {};
+      assert.equal(off.available?.journal, false, `a disabled queue-journal row answers 404: ${JSON.stringify(off.reasons)}`);
+      assert.equal(off.available?.decisions, false, `a disabled decision-center row answers 404: ${JSON.stringify(off.reasons)}`);
+      assert.equal(off.fallback, false, 'two 404s are authoritative answers, not a probe failure');
+      assert.equal(page.surfaces?.journalChip, false, 'the queue-journal chip is gone with its row');
+      assert.equal(page.surfaces?.journalFallback, false, 'and so is the sidebar fallback entry');
+      assert.equal(page.surfaces?.decisionInbox, false, 'the decision inbox badge is gone with its row');
+    } finally {
+      await fsp.writeFile(patchPath, original, 'utf8');
+    }
+  });
+
   it('shows the archive tab only for an enabled archive row', async (t) => {
     if (skipReason !== null) return t.skip(skipReason);
     if (process.env[SURFACES_PROBE_ENV] !== '1') {
@@ -657,6 +762,13 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
     assert.equal(page.surfaces?.diag?.ok, true, `the probes must be authoritative with one row enabled: ${JSON.stringify(page.surfaces?.diag)}`);
     assert.equal(page.surfaces?.diag?.available?.archive, true, 'the enabled archive row answers');
     assert.equal(page.surfaces?.diag?.available?.backup, false, 'the repository row stays disabled');
+    assert.equal(probe.seat?.found, true, 'the archive row makes the backup entry reachable');
+    assert.equal(
+      probe.seat?.archiveLabel,
+      1,
+      `the entry reads 「归档备份」 when only the archive row is enabled: ${JSON.stringify(probe.seat)}`,
+    );
+    assert.equal(probe.seat?.backupLabel, 0, 'the repository label must not claim a backend this profile does not have');
     assert.equal(probe.opened?.found, true, 'the panel is reachable because the archive row made it so, with the repository row off');
     assert.equal(probe.panel?.panel, true, 'clicking the backup entry opens the panel page');
     assert.equal(probe.panel?.tabs, true, 'the tab bar appears only with an available archive surface');
@@ -705,7 +817,15 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
       `the page never finished booting (boot surface still up after ${String(page.settledAfterMs)}ms; ` +
         `body: ${String(page.bodyText ?? '').slice(0, 300)})`,
     );
-    if (process.env.W2M_DECISION_PROBE === '1') {
+    if (process.env[DECISION_PROBE_ENV] === '1') {
+      // v3.5.7: this probe enables the GPW and backup rows in the installed copy (the shipped patch has them
+      // disabled), so the probe contract itself is asserted first: every row it drives answered, and the
+      // answer was authoritative rather than the legacy "nothing answered" fallback.
+      const diag = page.surfaces?.diag ?? {};
+      assert.equal(diag.fallback, false, `the probes answered authoritatively: ${JSON.stringify(diag)}`);
+      assert.equal(diag.available?.gpw, true, `the GPW row is enabled for this probe: ${JSON.stringify(diag.reasons)}`);
+      assert.equal(diag.available?.backup, true, `the backup row is enabled for this probe: ${JSON.stringify(diag.reasons)}`);
+      assert.equal(diag.available?.decisions, true, `the decision-center row is enabled: ${JSON.stringify(diag.reasons)}`);
       const probe = page.decisionProbe ?? {};
       assert.equal(probe.badge?.found, true, `the floating decision inbox badge is not in the page: ${JSON.stringify(probe)}`);
       assert.equal(probe.opened?.clicked, true, `the badge did not accept a click: ${JSON.stringify(probe.opened)}`);
@@ -785,7 +905,7 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
       assert.equal(history.historyOpened?.found, true, 'the history button exists in the real page');
       assert.equal(history.historyWindow?.open, true, 'clicking the history button expands its window');
       assert.equal(history.historyWindow?.title, '历史对话');
-      assert.equal(history.historyWindow?.hint, '仅人类输入');
+      assert.match(String(history.historyWindow?.hint ?? ''), /^仅人类输入/u, 'the window states that it lists human input only');
       assert.equal(history.historyWindow?.wrapped, true, 'the history window is anchored to the composer, not fixed at the page bottom');
       assert.equal(history.historyWindow?.position, 'absolute', 'the window is absolutely positioned above the input row');
       assert.equal(history.historyClosed?.closed, true, 'the window closes again');
@@ -799,6 +919,7 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
       const ops = page.opsProbe ?? {};
       assert.equal(ops.opsOpened?.found, true, 'the sidebar operation-panel button exists');
       assert.equal(ops.opsPanel?.open, true, 'clicking the sidebar button opens the operation panel');
+      assert.equal(ops.opsActionsTab?.clicked, true, 'the 操作入口 tab exists and accepts a click');
       for (const label of ['智能分级&审批', '消息与草稿', '决策中心', '操作入口']) {
         assert.ok(Array.isArray(ops.opsPanel?.tabs) && ops.opsPanel.tabs.some((tab) => String(tab).includes(label)), `the operation panel has the ${label} tab`);
       }
@@ -893,10 +1014,18 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
     // v3.5.x: the unlock dialog in the real page. Independent of the decision probe for the same reason that
     // probe gates the backup panel probe: the backup seat lives on the session-less left sidebar, so the dialog
     // is reachable on the landing page without a conversation.
-    if (process.env.W2M_BACKUP_PROBE === '1') {
+    if (process.env[BACKUP_PROBE_ENV] === '1') {
+      // v3.5.7: the probe enables the backup row in the installed copy; the archive row stays disabled, which
+      // is the state its "no tab bar" assertions below describe. Assert the probe contract first.
+      const diag = page.surfaces?.diag ?? {};
+      assert.equal(diag.fallback, false, `the probes answered authoritatively: ${JSON.stringify(diag)}`);
+      assert.equal(diag.available?.backup, true, `the backup row is enabled for this probe: ${JSON.stringify(diag.reasons)}`);
+      assert.equal(diag.available?.archive, false, `the archive row stays disabled for this probe: ${JSON.stringify(diag.reasons)}`);
       const unlock = page.backupProbe ?? {};
       assert.equal(unlock.backupOpened?.found, true, 'the left sidebar carries the backup entry');
       assert.equal(unlock.backupPanel?.open, true, 'clicking it opens the backup panel page');
+      assert.match(String(unlock.backupPanel?.title ?? ''), /备份&还原/u, 'the enabled repository row keeps its own label');
+      assert.doesNotMatch(String(unlock.backupPanel?.title ?? ''), /归档备份/u, 'the archive-only label needs the archive row, not this one');
       // v3.5.6/A1: this profile has the archive row disabled, so its probe answers 404 and the tab must be
       // absent -- the other direction of "the tab appears only for an enabled archive row".
       assert.equal(unlock.backupPanel?.tabs, false, 'a disabled archive row renders no tab bar');

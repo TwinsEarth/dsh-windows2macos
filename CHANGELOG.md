@@ -15,7 +15,7 @@ All notable changes to this project are documented here.
   （否则出厂 profile（`dsh-backup` 关、`dsh-backup-plugin` 开）就没有入口）。
 - **B1 侧边栏同步**：三行（backup / gpw / desktop）新增只读 `GET /api/w2m/<row>/health`（200 常量、无副作用、
   行缺席即 404；desktop 的 health 只由 `dsh-desktop` 行的 `apply` 挂载）；客户端并发探测四个端点（800 ms 总预算、
-  `same-origin`、`401`=可用、404/超时/网络错误=缺席），按"每 surface 一本账"做**注册/注销差分**（30 s 仅在页面可见时
+  `same-origin`；**200=已挂载，401/403=被认证拦截（权威的"不可用"），只有全部探测完全无应答才回退**），按"每 surface 一本账"做**注册/注销差分**（30 s 仅在页面可见时
   + `visibilitychange` 复探；结果不变时零动作，无闪烁、无重复 id）。注销用 slots API 自身的 disposer（`inject` 返回的
   幂等 controller disposer + `register` 返回的 disposer，逆序调用）。
 - **回退**：四个探测全挂（旧宿主无 health 路由）→ 完全按 3.5.5 行为注册所有表面（归档 tab 隐藏），
@@ -26,6 +26,12 @@ All notable changes to this project are documented here.
   归档 tab 出现并完成 create→list→verify；归档行禁用：无 tab 栏、无「归档」tab、解锁对话框不变）。
 - `lib/client.js`：609,402 B / 10,035 行（预算 610,000 / 10,050）；为守住字节预算压缩了历史注释并把 12 处 slot 注册
   收敛到 `mountSlotEntry` 助手——**评审可见的注释删减**，行为不变。
+**更正（2026-11-21）**：v3.5.6 的 surface 探测把 `401` 当成"已挂载"是错的——真实宿主对任何未认证的
+`/api/w2m/*`（包括根本不存在的路径）都在路由之前返回 401。于是"禁用行也注册侧栏条目"这一现象在真实 GUI 上
+依然存在。后续构建已修正为：**仅 2xx = 已挂载；401/403 = 权威的"不可用"；任何 HTTP 应答（401/403/404/5xx）都
+不触发回退；只有全部探测完全没有应答（超时/网络错误）才回退旧行为**，并把队列日志（`journal`）与决策中心
+（`decisions`）两个面纳入同一本账（行禁用→ chip/抽屉/inbox 不挂载）。契约与排障表见 `docs/SURFACES.md`。
+
 ## [3.5.5] - 2026-11-21
 
 ### feat(backup): `dsh-backup-plugin`——备份拆成两个独立挂载行，归档工具面带确认令牌与 pre-restore 副本

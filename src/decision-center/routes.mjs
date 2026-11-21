@@ -18,6 +18,14 @@ import { SERVICE, bus } from './kernel.mjs';
 /** Route prefix shared with lib/client.js. */
 export const DECISION_ROUTE_PREFIX = '/api/w2m/decisions';
 
+/**
+ * Availability probe (v3.5.7): a constant 200 while the decision-center row is mounted.
+ *
+ * The client polls it before it mounts the floating inbox. It reads no store and writes nothing, so it is
+ * safe on any page, and a disabled row registers no route at all — the answer is 404.
+ */
+export const DECISION_HEALTH_ROUTE = `${DECISION_ROUTE_PREFIX}/health`;
+
 const NO_STORE = { 'cache-control': 'no-store' };
 const EVENT_TOPICS = Object.freeze(['fang/decision-created', 'fang/decision-updated']);
 const MAX_EVENT_STREAMS = 20;
@@ -172,6 +180,10 @@ export function registerDecisionCenterRoutes(ctx) {
     const register = (path, methods, fetch) => {
       registry.register({ path, methods, requestBody: 'buffered', fetch });
     };
+
+    // v3.5.7/B1: the availability probe the client polls before it mounts the floating inbox. Constant and
+    // side-effect free: it reads no store, so a row that is not mounted has no route and answers 404.
+    register(DECISION_HEALTH_ROUTE, ['GET'], () => json(200, { ok: true, row: 'dsh-decision-center', mounted: true }));
 
     // GET /api/w2m/decisions — pending tickets plus counts.
     register(`${DECISION_ROUTE_PREFIX}`, ['GET'], (request) => {

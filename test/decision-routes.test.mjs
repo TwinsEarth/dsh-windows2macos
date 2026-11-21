@@ -8,12 +8,12 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { apply } from '../src/decision-center/mount.mjs';
-import { DECISION_ROUTE_PREFIX } from '../src/decision-center/routes.mjs';
+import { DECISION_HEALTH_ROUTE, DECISION_ROUTE_PREFIX, registerDecisionCenterRoutes } from '../src/decision-center/routes.mjs';
 import { SERVICE } from '../src/decision-center/kernel.mjs';
 
 const EXPECTED_ROUTES = [
@@ -26,6 +26,7 @@ const EXPECTED_ROUTES = [
   '/ai/test',
   '/events',
   '/forks',
+  '/health',
   '/humanize-options',
   '/ingest',
   '/item',
@@ -80,7 +81,7 @@ function mount(options = {}) {
     const response = await entry.fetch(new Request(`http://127.0.0.1${path}`, init));
     return { status: response.status, headers: response.headers, body: await response.json() };
   };
-  return { ctx, routes, service: provided.get(SERVICE.decisionCenter), call };
+  return { ctx, routes, service: provided.get(SERVICE.decisionCenter), call, dataRoot };
 }
 
 test('decision routes: every handler the panel polls is registered', () => {
@@ -219,4 +220,26 @@ test('decision routes: the exact-route registry sees one static humanize path (a
   assert.equal(routes.has(`${DECISION_ROUTE_PREFIX}/dec_x/humanize-options`), false);
   const titles = routes.get(`${DECISION_ROUTE_PREFIX}/session-titles`);
   assert.deepEqual([...titles.methods], ['GET']);
+});
+
+test('decision routes: the health route is a constant 200 that reads nothing, and an unmounted row registers none', async () => {
+  const { routes, call, dataRoot } = mount();
+  const health = routes.get(DECISION_HEALTH_ROUTE);
+  assert.ok(health !== undefined, 'a mounted row registers its health route');
+  assert.deepEqual([...health.methods], ['GET'], 'the probe is a GET only');
+  const before = readdirSync(dataRoot, { recursive: true }).map(String).sort();
+  const answer = await call(DECISION_HEALTH_ROUTE);
+  assert.equal(answer.status, 200);
+  assert.equal(answer.headers.get('cache-control'), 'no-store');
+  assert.deepEqual(answer.body, { ok: true, row: 'dsh-decision-center', mounted: true });
+  assert.deepEqual(
+    readdirSync(dataRoot, { recursive: true }).map(String).sort(),
+    before,
+    'a probe must not create state: it reads no store and writes nothing',
+  );
+  // A row that is not mounted never calls apply, so its health path has no route at all: the 404 the client
+  // reads as a definitive "not mounted".
+  const absent = registerDecisionCenterRoutes({});
+  assert.equal(absent.mounted, false);
+  assert.equal(absent.reason, 'the host has no Connection service');
 });

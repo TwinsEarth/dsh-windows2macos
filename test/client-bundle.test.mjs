@@ -389,9 +389,9 @@ describe('client bundle: the activation contract', () => {
       () => exports.apply(ctx),
       'an undeclared service read throws in Cordis and takes the whole app down; the bundle must read only what it declares',
     );
-    // v3.5.6/B1: the GPW, backup and desktop entries now come from the surface book (probe-driven), in one
-    // block right after the target control; only the remote-view settings section is registered later.
-    assert.deepEqual(registry.announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'sidebar.panellist', 'main', 'sidebar.panellist', 'main', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, SEAT, 'shell.overlay', 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', SEAT], 'the entry still has to take its seat');
+    // v3.5.6/B1 + v3.5.7: the GPW, backup, desktop and queue-journal entries come from the surface book
+    // (probe-driven), in one block right after the target control; the settings and composer entries follow.
+    assert.deepEqual(registry.announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'sidebar.panellist', 'main', 'sidebar.panellist', 'main', SEAT, 'shell.overlay', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', SEAT], 'the entry still has to take its seat');
     assert.equal(registry.registered.length, 21);
     assert.equal(locale.registered.has('w2m.target'), true, 'the dictionaries go to the locale service when there is one');
   });
@@ -496,7 +496,9 @@ describe('client bundle: the seat it registers into', () => {
 
   it('announces and registers all five composer controls plus the sidebar and update sections into conversation.input.left', () => {
     const { announced, registered } = applyTo();
-    assert.deepEqual(announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'sidebar.panellist', 'main', 'sidebar.panellist', 'main', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, SEAT, 'shell.overlay', 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', SEAT]);
+    // The order is the mount order: the target control first, then the surface book (gpw, backup, desktop,
+    // journal), then the settings/update sections, and finally the composer's own controls.
+    assert.deepEqual(announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'sidebar.panellist', 'main', 'sidebar.panellist', 'main', SEAT, 'shell.overlay', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', SEAT]);
     assert.equal(registered.length, 21);
     assert.equal(registered[0].options.name, SEAT);
   });
@@ -1779,9 +1781,10 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
     const unexpected = [];
     const hostDocument = options.document ?? makeFakeDocument();
     const hostFetch = async (url, init = {}) => {
-      // v3.5.6/B1: the surface probes run on every mount. A host with no such route answers 404, which is
-      // the "all rows disabled" state and therefore the fallback registration this suite has always used;
-      // the probes are not part of any test's request log.
+      // v3.5.7: the surface probes run on every mount. This host serves the backup routes, so its health
+      // answer says the row is mounted; the other rows stay 404 and their entries stay absent. The probes are
+      // not part of any test's request log.
+      if (url === '/api/w2m/backup/health') return { ok: true, status: 200, json: async () => ({ ok: true, row: 'dsh-backup', mounted: true }) };
       if (url.endsWith('/health')) return { ok: false, status: 404, json: async () => ({ ok: false, reason_code: 'ROUTE_MISSING' }) };
       const method = init.method ?? 'GET';
       const rawBody = init.body === undefined ? null : init.body;
@@ -2858,7 +2861,9 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
       candidates: [{ session_id: 'sess-a', workspace: 'proj-a', size: 10, conflict: 'new' }],
     };
     const hostFetch = async (url, init = {}) => {
-      // v3.5.6/B1: the four surface probes are not part of this test's request log.
+      // v3.5.7: the surface probes are not part of this test's request log. The backup row is mounted on
+      // this host; every other row is absent, so only the backup page registers.
+      if (url === '/api/w2m/backup/health') return { ok: true, status: 200, json: async () => ({ ok: true, row: 'dsh-backup', mounted: true }) };
       if (url.endsWith('/health')) return { ok: false, status: 404, json: async () => ({ ok: false, reason_code: 'ROUTE_MISSING' }) };
       const method = init.method ?? 'GET';
       const body = init.body === undefined ? null : JSON.parse(init.body);
@@ -3000,6 +3005,9 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
       runtime_verified: { checked: 1, failed: 0, evidence: 'installed-harness' },
     };
     const hostFetch = async (url, init = {}) => {
+      // v3.5.7: the backup surface probe answers 200 so this page exists; the other rows are absent and their
+      // health requests (a transport mode this test does not serve) are not part of the request log.
+      if (url === '/api/w2m/backup/health') return { ok: true, status: 200, json: async () => ({ ok: true, row: 'dsh-backup', mounted: true }) };
       requests.push({ url, method: init.method ?? 'GET' });
       const send = (payload) => ({ ok: true, status: 200, json: async () => payload });
       if (url === '/api/w2m/backup/run') {
@@ -4225,20 +4233,27 @@ describe('client bundle: the decision inbox names sessions and humanizes option 
 });
 
 // ---------------------------------------------------------------------------------------------
-// v3.5.6/B1: surface probes and conditional registration
+// v3.5.6/B1 + v3.5.7: six surface probes and conditional registration
 // ---------------------------------------------------------------------------------------------
 //
-// The rows that own a sidebar surface (`dsh-gpw`, `dsh-backup`, `dsh-desktop` and the archive row inside
-// the backup panel) answer a cheap `/health`. These tests drive the probe with an injected fetch and a
-// fake slot registry, so the diff -- register what answered, dispose what went away, fall back when
-// nothing answers -- is measured rather than described.
+// Every UI row that owns a surface answers a cheap `/health`: gpw, backup, desktop, archive (the tab inside
+// the backup panel), journal (chip + overlay + sidebar fallback) and decisions (the floating inbox). These
+// tests drive the probe with an injected fetch and a fake slot registry, so the contract -- 2xx means
+// mounted; 401/403 and every other status are an authoritative "no"; only a timeout/transport error leaves
+// the question open; and the legacy always-register fallback happens only when nothing answered at all --
+// is measured rather than described.
 
 const HEALTH = {
   gpw: '/api/w2m/gpw/health',
   backup: '/api/w2m/backup/health',
   desktop: '/api/w2m/desktop/health',
   archive: '/api/w2m/backup/archive/health',
+  journal: '/api/w2m/composer/journal/health',
+  decisions: '/api/w2m/decisions/health',
 };
+
+/** Every surface key, in the order the book declares them. */
+const SURFACES = ['gpw', 'backup', 'desktop', 'archive', 'journal', 'decisions'];
 
 /** A minimal fetch answer: the bundle only reads `ok`, `status` and `json()`. */
 const answer = (status, body = {}) => ({ ok: status >= 200 && status < 300, status, json: async () => body });
@@ -4246,47 +4261,102 @@ const answer = (status, body = {}) => ({ ok: status >= 200 && status < 300, stat
 /** vm-realm values have that realm's prototypes; compare their plain data shape. */
 const plain = (value) => JSON.parse(JSON.stringify(value));
 
-describe('v3.5.6/B1: surface probes', () => {
-  it('treats 401 as available, 404 as absent, and a transport error as absent', async () => {
+/** The error the probe classifies as a timeout (the abort path) or as a transport failure. */
+const stalled = () => Object.assign(new Error('aborted'), { name: 'AbortError' });
+
+describe('v3.5.7: the surface probe contract', () => {
+  it('answers available only on 2xx, and treats 401/403 and every other status as a definitive no', async () => {
     const { exports } = loadBundle({ globals: { AbortController, setTimeout, clearTimeout } });
     const probe = await exports.probeW2mSurfaces(async (url) => {
-      if (url === HEALTH.gpw) return answer(401);
-      if (url === HEALTH.backup) return answer(200, { ok: true });
-      if (url === HEALTH.desktop) return answer(404);
+      if (url === HEALTH.gpw) return answer(200, { ok: true });
+      if (url === HEALTH.backup) return answer(204);
+      if (url === HEALTH.desktop) return answer(401);
+      if (url === HEALTH.archive) return answer(403);
+      if (url === HEALTH.journal) return answer(404);
       throw new Error('connection reset');
     });
-    assert.deepEqual(plain(probe.available), { gpw: true, backup: true, desktop: false, archive: false });
-    assert.equal(probe.reasons.gpw, 'unauthorized', '401 is "mounted, wants the page session", never "absent"');
-    assert.equal(probe.reasons.backup, 'ok');
-    assert.equal(probe.reasons.desktop, 'not-found');
-    assert.equal(probe.reasons.archive, 'network-error');
+    assert.deepEqual(plain(probe.available), { gpw: true, backup: true, desktop: false, archive: false, journal: false, decisions: false });
+    assert.equal(probe.reasons.gpw, 'ok');
+    assert.equal(probe.reasons.backup, 'ok', '204 is a 2xx answer: mounted and nothing to say');
+    assert.equal(probe.reasons.desktop, 'unauthorized', '401 is a definitive no: the fence answered before routing');
+    assert.equal(probe.reasons.archive, 'unauthorized', '403 is the same answer as 401');
+    assert.equal(probe.reasons.journal, 'http-404', 'any other status keeps its own spelling');
+    assert.equal(probe.reasons.decisions, 'network-error');
     assert.equal(probe.ok, true);
-    assert.equal(probe.fallback, false);
+    assert.equal(probe.fallback, false, 'http answers are authoritative even when one probe never answered');
+    assert.equal(probe.definite, true, 'one answered row is enough to decide; the unanswered row is named in reasons');
+    assert.equal(probe.probeBlocked, false);
     assert.equal(typeof probe.probedAt, 'string');
   });
 
-  it('reports a timeout as unavailable, inside the one budget', async () => {
+  it('reports a timeout as unavailable and non-definitive, inside the one budget', async () => {
     const { exports } = loadBundle({ globals: { AbortController, setTimeout, clearTimeout } });
     // A fetch that never answers on its own and rejects only because the probe's controller aborted it:
     // that is the only way the timeout reason can be observed instead of hanging the suite.
-    const stalled = (url, init) => new Promise((resolve, reject) => {
-      init.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true });
+    const stalling = (url, init) => new Promise((resolve, reject) => {
+      init.signal.addEventListener('abort', () => reject(stalled()), { once: true });
     });
-    const probe = await exports.probeW2mSurface('gpw', stalled, 5);
-    assert.deepEqual(plain(probe), { available: false, reason: 'timeout' });
+    const probe = await exports.probeW2mSurface('gpw', stalling, 5);
+    assert.deepEqual(plain(probe), { available: false, reason: 'timeout', definite: false });
   });
 
-  it('flags the all-failed case as the fallback the caller must honour', async () => {
+  it('publishes probeBlocked for an all-401 host and fallback only for an all-timeout one', async () => {
     const { exports } = loadBundle({ globals: { AbortController, setTimeout, clearTimeout } });
-    const probe = await exports.probeW2mSurfaces(async () => answer(404));
-    assert.equal(probe.ok, false);
-    assert.equal(probe.fallback, true);
-    assert.deepEqual(plain(Object.values(probe.available)), [false, false, false, false]);
+    const blocked = await exports.probeW2mSurfaces(async () => answer(401));
+    assert.equal(blocked.ok, false);
+    assert.equal(blocked.fallback, false, 'an all-401 host answered every probe');
+    assert.equal(blocked.definite, true);
+    assert.equal(blocked.probeBlocked, true);
+    assert.deepEqual(plain(Object.values(blocked.reasons)), Array(6).fill('unauthorized'));
+    const legacy = await exports.probeW2mSurfaces(async () => { throw stalled(); });
+    assert.equal(legacy.fallback, true, 'nothing answered: keep the pre-v3.5.6 always-register behaviour');
+    assert.equal(legacy.definite, false);
+    assert.equal(legacy.probeBlocked, false, 'a timeout is not an auth answer');
   });
 });
 
-describe('v3.5.6/B1: conditional registration', () => {
-  /** Load the bundle with a mutable health answer and a live window listener registry. */
+describe('v3.5.7: the surface book owns every UI row', () => {
+  /** A fake DOM node, deep enough for the decision inbox to mount and be removed again. */
+  function makeNode(tagName = 'div') {
+    const node = {
+      tagName: String(tagName).toUpperCase(),
+      children: [],
+      dataset: {},
+      style: {},
+      className: '',
+      textContent: '',
+      value: '',
+      title: '',
+      hidden: false,
+      disabled: false,
+      removed: false,
+      classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+      append(...items) { node.children.push(...items); },
+      appendChild(item) { node.children.push(item); return item; },
+      replaceChildren(...items) { node.children = items; },
+      addEventListener() {},
+      removeEventListener() {},
+      setAttribute() {},
+      getAttribute() { return null; },
+      querySelector() { return null; },
+      querySelectorAll() { return []; },
+      closest() { return null; },
+      remove() { node.removed = true; },
+      get lastChild() { return node.children[node.children.length - 1] ?? node; },
+    };
+    return node;
+  }
+
+  /** The bundle's fake document plus a body: the decision inbox mounts DOM nodes, not slot entries. */
+  function surfaceDocument() {
+    const document = makeFakeDocument();
+    document.body = makeNode('body');
+    document.createElement = (tagName) => makeNode(tagName);
+    document.createTextNode = (text) => ({ textContent: String(text) });
+    return document;
+  }
+
+  /** Load the bundle with a mutable health answer and a driveable visibility listener. */
   function mountSurfaces(initial) {
     const state = { ...initial };
     const calls = [];
@@ -4294,11 +4364,15 @@ describe('v3.5.6/B1: conditional registration', () => {
       const key = Object.keys(HEALTH).find((name) => HEALTH[name] === url);
       if (key === undefined) return answer(404);
       calls.push(key);
-      return state[key] === true ? answer(200, { ok: true }) : answer(404);
+      const mode = state[key];
+      if (mode === 'timeout') throw stalled();
+      if (mode === 'unauthorized') return answer(401);
+      return mode === true ? answer(200, { ok: true }) : answer(404);
     };
     const bundle = loadBundle({
-      // A no-op interval: the poll must be installable so the visibility listener (the path this test
-      // drives) is registered, but nothing should actually fire on a 30 s timer inside a test.
+      document: surfaceDocument(),
+      // A no-op interval: the poll must be installable so the visibility listener (the path these tests
+      // drive) is registered, but nothing should actually fire on a 30 s timer inside a test.
       globals: { fetch: hostFetch, AbortController, setTimeout, clearTimeout, setInterval: () => 0, clearInterval: () => {} },
     });
     const listeners = new Map();
@@ -4308,59 +4382,179 @@ describe('v3.5.6/B1: conditional registration', () => {
     bundle.window.removeEventListener = () => {};
     const registry = makeRegistry();
     bundle.exports.apply({ slots: registry, effect: (callback) => callback(), get: () => undefined });
-    // Only the *sidebar* entry is the surface: the settings sections reuse the same ids (`w2m-gpw`,
+    // Only the *sidebar* entry is a surface: the settings sections reuse the same ids (`w2m-gpw`,
     // `w2m-remote-view`) on purpose and stay registered so a disabled row remains discoverable.
     const ids = () => registry.registered.filter((entry) => entry.options.name === 'sidebar.panellist').map((entry) => entry.options.id);
     const mainKeys = () => registry.registered.filter((entry) => entry.options.name === 'main').map((entry) => entry.options.key);
+    const journalSlots = () => registry.registered.filter((entry) => entry.options.id === 'w2m-queue-journal').map((entry) => entry.options.name);
+    const badges = () => bundle.document.body.children.filter((node) => node.className === 'w2mDcBadge' && node.removed !== true);
     const reprobe = async () => {
       for (const listener of listeners.get('visibilitychange') ?? []) listener();
       await settleW2mSurfaces();
     };
-    return { bundle, registry, ids, mainKeys, reprobe, calls, state };
+    const diag = () => plain(bundle.window.__W2M_SURFACES__);
+    return { bundle, registry, ids, mainKeys, journalSlots, badges, reprobe, calls, state, diag };
   }
 
-  it('registers only what answered, then follows a re-probe in both directions', async () => {
-    const host = mountSurfaces({ gpw: true, backup: false, desktop: false, archive: false });
+  /** Render a registered surface component: the label lives in the component, not in the host row. */
+  function renderEntry(host, name, matcher, properties) {
+    const entry = host.registry.registered.find((row) => row.options.name === name && matcher(row.options));
+    assert.ok(entry !== undefined, `the ${name} entry is registered`);
+    // `marked(...)` wraps the component in the `data-w2m-surface` box, so the inner element is the component.
+    const [inner] = entry.component(properties).children;
+    const rendered = inner.type(inner.props);
+    // BackupMainPage delegates its layout to BackupPanelView, which renders the page title.
+    return typeof rendered?.type === 'function' ? rendered.type(rendered.props) : rendered;
+  }
+
+  /** The visible text of the backup entry or page, translated the way the host would. */
+  const backupText = (host, name, matcher) => collectText(renderEntry(host, name, matcher, {
+    t: (key) => (key === 'panel.backup.title' ? '备份&还原' : key),
+  })).join('');
+
+  it('mounts exactly the gpw entries when only the gpw row answers', async () => {
+    const host = mountSurfaces({ gpw: true, backup: false, desktop: false, archive: false, journal: false, decisions: false });
     await settleW2mSurfaces();
-    assert.ok(host.ids().includes('w2m-gpw'), 'the row that answered is registered');
-    assert.equal(host.ids().includes('w2m-backup'), false, 'a disabled row has no sidebar entry');
-    assert.equal(host.ids().includes('w2m-remote-view'), false, 'a disabled desktop row has no sidebar entry');
-    assert.equal(host.mainKeys().includes('w2m-backup'), false, 'a disabled row has no main page either');
-    assert.equal(host.bundle.window.__W2M_SURFACES__.available.backup, false);
-    assert.equal(host.bundle.window.__W2M_SURFACES__.reasons.backup, 'not-found');
-    assert.equal(typeof host.bundle.window.__W2M_SURFACES__.probedAt, 'string');
-
-    host.state.backup = true;
-    await host.reprobe();
-    assert.ok(host.ids().includes('w2m-backup'), 'an enabled row appears after a re-probe');
-    assert.ok(host.mainKeys().includes('w2m-backup'), 'its main page appears with the sidebar entry');
-    assert.equal(host.ids().filter((id) => id === 'w2m-backup').length, 1, 're-probing never duplicates an entry');
-
-    host.state.gpw = false;
-    await host.reprobe();
-    assert.equal(host.ids().includes('w2m-gpw'), false, 'a row that went away is disposed');
-    assert.ok(host.ids().includes('w2m-backup'), 'the other surface is untouched');
-    assert.ok(host.calls.length >= 8, 'every re-probe asks all four rows');
+    assert.deepEqual(host.ids(), ['w2m-gpw']);
+    assert.deepEqual(host.mainKeys(), ['w2m-gpw']);
+    assert.deepEqual(host.journalSlots(), [], 'a disabled journal row registers no chip, overlay or fallback');
+    assert.deepEqual(host.badges(), [], 'a disabled decision row mounts no inbox');
+    assert.equal(host.diag().fallback, false);
   });
 
-  it('falls back to registering every surface when nothing answers (an older host)', async () => {
-    const host = mountSurfaces({ gpw: false, backup: false, desktop: false, archive: false });
+  it('mounts exactly the backup entries when only the backup row answers', async () => {
+    const host = mountSurfaces({ gpw: false, backup: true, desktop: false, archive: false, journal: false, decisions: false });
+    await settleW2mSurfaces();
+    assert.deepEqual(host.ids(), ['w2m-backup']);
+    assert.deepEqual(host.mainKeys(), ['w2m-backup']);
+    const label = backupText(host, 'sidebar.panellist', (options) => options.id === 'w2m-backup');
+    assert.match(label, /备份&还原/u, 'the repository row keeps its own label');
+    assert.doesNotMatch(backupText(host, 'main', (options) => options.key === 'w2m-backup'), /归档备份/u);
+    assert.deepEqual(host.journalSlots(), []);
+    assert.deepEqual(host.badges(), []);
+  });
+
+  it('mounts exactly the desktop entries when only the desktop row answers', async () => {
+    const host = mountSurfaces({ gpw: false, backup: false, desktop: true, archive: false, journal: false, decisions: false });
+    await settleW2mSurfaces();
+    assert.deepEqual(host.ids(), ['w2m-remote-view']);
+    assert.deepEqual(host.mainKeys(), ['w2m-remote-view']);
+    assert.deepEqual(host.journalSlots(), []);
+    assert.deepEqual(host.badges(), []);
+  });
+
+  it('gives the archive row the backup panel as 「归档备份」 when the repository row is disabled', async () => {
+    const host = mountSurfaces({ gpw: false, backup: false, desktop: false, archive: true, journal: false, decisions: false });
+    await settleW2mSurfaces();
+    assert.deepEqual(host.ids(), ['w2m-backup'], 'the archive row makes the backup panel reachable');
+    assert.deepEqual(host.mainKeys(), ['w2m-backup']);
+    const sidebar = backupText(host, 'sidebar.panellist', (options) => options.id === 'w2m-backup');
+    assert.match(sidebar, /归档备份/u);
+    assert.doesNotMatch(sidebar, /备份&还原/u, 'the repository label would claim a backend this host does not have');
+    const page = backupText(host, 'main', (options) => options.key === 'w2m-backup');
+    assert.match(page, /归档备份/u, 'the main-page title follows the same label');
+    assert.doesNotMatch(page, /备份&还原/u);
+    const tree = renderEntry(host, 'main', (options) => options.key === 'w2m-backup', { t: (key) => key });
+    assert.equal(findBy(tree, (node) => node.props?.['data-w2m-backup-tabs'] === 'true').length, 1, 'the archive tab is reachable');
+    assert.deepEqual(host.journalSlots(), []);
+    assert.deepEqual(host.badges(), []);
+  });
+
+  it('mounts the queue-journal module only while its row answers', async () => {
+    const host = mountSurfaces({ gpw: false, backup: false, desktop: false, archive: false, journal: true, decisions: false });
+    await settleW2mSurfaces();
+    assert.deepEqual(host.journalSlots(), ['conversation.input.left', 'shell.overlay'], 'the chip and the drawer are the module');
+    assert.deepEqual(host.ids(), [], 'the journal chip is a slot entry, not a sidebar surface');
+    assert.equal(host.diag().available.journal, true);
+    assert.equal(host.bundle.window.__W2M_QUEUE_JOURNAL__?.status, 'slotted');
+    host.state.journal = false;
+    await host.reprobe();
+    assert.deepEqual(host.journalSlots(), [], 'the module is disposed with its row');
+  });
+
+  it('mounts the decision inbox only while its row answers', async () => {
+    const host = mountSurfaces({ gpw: false, backup: false, desktop: false, archive: false, journal: false, decisions: true });
+    await settleW2mSurfaces();
+    assert.equal(host.badges().length, 1, 'the inbox badge is in the page');
+    assert.equal(host.diag().available.decisions, true);
+    host.state.decisions = false;
+    await host.reprobe();
+    assert.equal(host.badges().length, 0, 'the disposer removes the badge when the row goes away');
+  });
+
+  it('hides every surface for an all-401 host and says the probe was blocked', async () => {
+    const host = mountSurfaces(Object.fromEntries(SURFACES.map((key) => [key, 'unauthorized'])));
+    await settleW2mSurfaces();
+    assert.deepEqual(host.ids(), []);
+    assert.deepEqual(host.mainKeys(), []);
+    assert.deepEqual(host.journalSlots(), []);
+    assert.deepEqual(host.badges(), []);
+    const diag = host.diag();
+    assert.equal(diag.ok, false);
+    assert.equal(diag.fallback, false, 'all-401 is an authoritative answer, not a probe failure');
+    assert.equal(diag.definite, true);
+    assert.equal(diag.probeBlocked, true);
+  });
+
+  it('hides every surface for an all-404 host: the shipped disabled rows', async () => {
+    const host = mountSurfaces(Object.fromEntries(SURFACES.map((key) => [key, false])));
+    await settleW2mSurfaces();
+    assert.deepEqual(host.ids(), []);
+    assert.deepEqual(host.mainKeys(), []);
+    assert.deepEqual(host.journalSlots(), []);
+    assert.deepEqual(host.badges(), []);
+    assert.equal(host.diag().fallback, false);
+    assert.equal(host.diag().probeBlocked, false);
+  });
+
+  it('treats a mixed 401/404 host as authoritative too', async () => {
+    const host = mountSurfaces({ gpw: 'unauthorized', backup: 'unauthorized', desktop: false, archive: false, journal: false, decisions: false });
+    await settleW2mSurfaces();
+    assert.deepEqual(host.ids(), []);
+    assert.deepEqual(host.journalSlots(), []);
+    assert.deepEqual(host.badges(), []);
+    assert.equal(host.diag().fallback, false);
+    assert.equal(host.diag().definite, true);
+    assert.equal(host.diag().probeBlocked, false);
+  });
+
+  it('registers every legacy entry only when nothing answered at all', async () => {
+    const host = mountSurfaces(Object.fromEntries(SURFACES.map((key) => [key, 'timeout'])));
     await settleW2mSurfaces();
     for (const id of ['w2m-gpw', 'w2m-backup', 'w2m-remote-view']) {
       assert.ok(host.ids().includes(id), `${id} must stay registered when the probe cannot decide`);
     }
-    assert.equal(host.bundle.window.__W2M_SURFACES__.ok, false);
-    assert.equal(host.bundle.window.__W2M_SURFACES__.fallback, true, 'the diagnostics say why the entries are unconditional');
+    assert.deepEqual(host.journalSlots(), ['conversation.input.left', 'shell.overlay'], 'the journal was unconditional before v3.5.7 too');
+    assert.equal(host.badges().length, 1, 'and so was the inbox');
+    const diag = host.diag();
+    assert.equal(diag.fallback, true, 'the diagnostics say why the entries are unconditional');
+    assert.equal(diag.definite, false);
+    assert.equal(diag.probeBlocked, false);
   });
 
-  it('keeps the archive tab hidden in the fallback: an old host has no route to drive it', async () => {
-    const host = mountSurfaces({ gpw: false, backup: false, desktop: false, archive: false });
+  it('enables a surface after load and disposes it again without duplicating an entry', async () => {
+    const host = mountSurfaces({ gpw: false, backup: false, desktop: false, archive: false, journal: false, decisions: false });
     await settleW2mSurfaces();
-    assert.equal(host.bundle.window.__W2M_SURFACES__.available.archive, false);
-    const main = host.registry.registered.find((entry) => entry.options.key === 'w2m-backup');
-    const translator = host.bundle.exports.makeTranslator(() => undefined);
-    const tree = main.component({ t: translator });
-    assert.equal(findBy(tree, (node) => node.props?.['data-w2m-backup-tabs'] === 'true').length, 0, 'no tab bar without an archive surface');
+    assert.deepEqual(host.ids(), []);
+    host.state.gpw = true;
+    host.state.journal = true;
+    host.state.decisions = true;
+    await host.reprobe();
+    assert.deepEqual(host.ids(), ['w2m-gpw'], 'the enabled row appears after a re-probe');
+    assert.equal(host.journalSlots().filter((name) => name === 'conversation.input.left').length, 1);
+    assert.equal(host.badges().length, 1);
+    await host.reprobe();
+    assert.deepEqual(host.ids(), ['w2m-gpw'], 'a second re-probe duplicates nothing');
+    assert.deepEqual(host.journalSlots(), ['conversation.input.left', 'shell.overlay'], 'one chip and one drawer, not four entries');
+    assert.equal(host.badges().length, 1, 'one inbox, not two');
+    host.state.gpw = false;
+    host.state.journal = false;
+    host.state.decisions = false;
+    await host.reprobe();
+    assert.deepEqual(host.ids(), [], 'the disposer removed the sidebar entry');
+    assert.deepEqual(host.journalSlots(), []);
+    assert.equal(host.badges().length, 0);
+    assert.ok(host.calls.length >= 24, 'every re-probe asks all six rows');
   });
 });
 

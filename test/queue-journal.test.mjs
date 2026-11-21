@@ -17,9 +17,11 @@ const ZSTD_READY = typeof zlib.zstdCompressSync === 'function';
 import { ComposerJournal } from '../src/queue-journal/lib/composer-journal.mjs';
 import {
   apply,
+  QUEUE_JOURNAL_HEALTH_ROUTE,
   QUEUE_JOURNAL_ROUTE_PREFIX,
   QUEUE_JOURNAL_SERVICE,
   QUEUE_RESTORE_ROUTE_PATH,
+  registerQueueJournalRoutes,
 } from '../src/queue-journal/index.mjs';
 
 function mount(config = {}, services = {}) {
@@ -71,12 +73,37 @@ const post = (body) => ({
   body: JSON.stringify(body),
 });
 
+test('v3.5.7: the health route is a constant 200 that writes nothing, and an unmounted row has no route', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'w2m-qj-health-'));
+  try {
+    const dataDir = join(root, 'journal');
+    const { routes } = mount({ dataDir });
+    const health = routes.get(QUEUE_JOURNAL_HEALTH_ROUTE);
+    assert.ok(health !== undefined, 'a mounted row registers its health route');
+    assert.deepEqual([...health.methods], ['GET'], 'the probe is a GET only');
+    const before = readdirSync(root).sort();
+    const response = await health.fetch(new Request(`http://127.0.0.1${QUEUE_JOURNAL_HEALTH_ROUTE}`));
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('cache-control'), 'no-store');
+    assert.deepEqual(await response.json(), { ok: true, row: 'dsh-queue-journal', mounted: true });
+    assert.deepEqual(readdirSync(root).sort(), before, 'a probe creates no file and no directory');
+    assert.equal(existsSync(dataDir), false, 'the probe does not create the journal directory');
+    // A row that is not mounted never calls apply, so its health path has no route at all: the 404 the
+    // client reads as a definitive "not mounted".
+    const absent = registerQueueJournalRoutes({}, { journal: null, dataDir });
+    assert.equal(absent.mounted, false);
+    assert.equal(absent.reason, 'the host has no Connection service');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('queue journal: save, read back and list newest first', async () => {
   const root = mkdtempSync(join(tmpdir(), 'w2m-qj-'));
   const { routes, service, call } = mount({ dataDir: root });
   assert.deepEqual(
     [...routes.keys()].sort(),
-    [QUEUE_JOURNAL_ROUTE_PREFIX, `${QUEUE_JOURNAL_ROUTE_PREFIX}/history`, `${QUEUE_JOURNAL_ROUTE_PREFIX}/sessions`, `${QUEUE_JOURNAL_ROUTE_PREFIX}/session-log`, `${QUEUE_JOURNAL_ROUTE_PREFIX}/diagnostics`, QUEUE_RESTORE_ROUTE_PATH].sort(),
+    [QUEUE_JOURNAL_ROUTE_PREFIX, `${QUEUE_JOURNAL_ROUTE_PREFIX}/health`, `${QUEUE_JOURNAL_ROUTE_PREFIX}/history`, `${QUEUE_JOURNAL_ROUTE_PREFIX}/sessions`, `${QUEUE_JOURNAL_ROUTE_PREFIX}/session-log`, `${QUEUE_JOURNAL_ROUTE_PREFIX}/diagnostics`, QUEUE_RESTORE_ROUTE_PATH].sort(),
   );
   assert.ok(service, 'the journal service is provided');
   const saved = await call(

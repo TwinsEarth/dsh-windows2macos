@@ -211,8 +211,17 @@ powershell -NoProfile -File tools\dsh-workspace-guard.ps1 -Fix    # 先备份、
 所以"面板做的"与"Agent 调工具做的"是同一份实现。UI 上它是「备份&还原」面板里的**「归档」tab**，不新增第四个侧边栏按钮；
 恢复仍要求 `confirm:"restore"`，覆盖前仍有 pre-restore 副本。
 
-同一版本里，三个 UI 行（backup / gpw / desktop）各有一个只读 `GET /api/w2m/<row>/health`。客户端启动时并发探测，
-只有答 200（或 401 = 需要授权但已挂载）的 surface 才注册侧边栏/main 条目；页面可见时每 30 s 与 `visibilitychange`
-复探，按差分注册/注销。**四个探测全失败时回退到旧行为**（全部注册，面板内提示未启用），并把
-`window.__W2M_SURFACES__` 留在页面上供排障。
+同一版本里，六个可挂载行各有一个只读 `GET /api/w2m/<row>/health`：`gpw`、`backup`、`desktop`、
+`backup/archive`（归档行）、`composer/journal`（队列日志行）、`decisions`（决策中心行）。客户端启动时并发探测，
+只有 **2xx** 才算该行已挂载并注册对应 UI。**401/403 是"未授权、确定不可用"**：真实宿主的认证网关在路由之前
+就回答了，所以它绝不能等价于"已挂载"；其它状态码同样是确定不可用（`http-<status>`）。只有**请求根本没有回答**
+（超时/网络错误）才是"判断不了"，并且只有六个探测全部"判断不了"时才回退到旧行为（全部注册，面板内提示未启用）。
+
+`window.__W2M_SURFACES__` 暴露诊断：`{ok, available, reasons, definite, probeBlocked, probedAt, fallback}`。
+排障读法：`reasons` 全为 `unauthorized` 且 `probeBlocked:true` = 探测被认证挡在路由之前；全为 `timeout` 且
+`fallback:true` = 旧宿主（没有 health 路由）；全为 `http-404` 且 `fallback:false` = 这些行确实未启用，UI 隐藏
+才是正确结果。完整契约与逐行 UI 表见 [SURFACES.md](SURFACES.md)。
+
+只有归档行可用、仓库行（`dsh-backup`）未启用时，备份面板的侧边栏图标与页面标题读「归档备份」而不是
+「备份&还原」——此时面板里只有归档 tab 有后端。仓库行可用时标签保持「备份&还原」。
 
