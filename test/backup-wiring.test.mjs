@@ -23,7 +23,10 @@ import {
 import { formatScan, formatStatus, main, parseArgs } from '../src/backup/cli.mjs';
 import { runBackup } from '../src/backup/engine.mjs';
 import { BACKUP_SCOPES } from '../src/backup/scopes.mjs';
-import { normalizeConfig } from '../src/plugin/backup.mjs';
+import { normalizeConfig, apply as applyBackup, BACKUP_HEALTH_ROUTE_PATH } from '../src/plugin/backup.mjs';
+import { apply as applyGpw, GPW_HEALTH_ROUTE } from '../src/plugin/gpw.mjs';
+import { apply as applyDesktop, registerDesktop, DESKTOP_HEALTH_ROUTE } from '../src/plugin/desktop.mjs';
+import { apply as applyArchive, ARCHIVE_ROUTE_PATHS } from '../src/plugin/backup-plugin.mjs';
 import { makeHome, registryDocument, tempDir } from './helpers/backup-fixture.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
@@ -354,5 +357,127 @@ describe('backup wiring: the CLI', () => {
     assert.match(status, /22:00:00/u);
     const scan = formatScan({ dsh_home: 'C:\\x', exists: true, totals: { sessions: 1, session_bytes: 10 }, registry: { ok: true, workspaces: 1, registered: 1 }, exclusions: [] });
     assert.match(scan, /sessions\s+: 1/u);
+  });
+});
+
+/**
+ * v3.5.6/B1: the four availability probes the client polls.
+ *
+ * Each row answers a constant 200 while it is mounted, and a row that is not mounted has no route at all
+ * (404 -- the answer the client treats as "hide that surface"). The probes are asserted here because a
+ * missing one silently returns the whole client to its always-on fallback, which looks like the feature
+ * never shipped.
+ */
+describe('v3.5.6/B1: the surface availability probes', () => {
+  /** Fetch one registered route and return its JSON. */
+  async function readRoute(route) {
+    const response = await route.fetch(new Request('http://local.invalid' + route.path));
+    return { status: response.status, body: await response.json() };
+  }
+
+  it('the backup row answers /api/w2m/backup/health while it is mounted', async () => {
+    const home = makeHome({ sessions: [] });
+    const dir = tempDir('w2m-health-backup-');
+    try {
+      const routes = [];
+      const ctx = {
+        logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+        effect: (callback) => callback(),
+        inject(_names, callback) { callback({ connection: { fetch: { register: (route) => routes.push(route) } } }); },
+      };
+      applyBackup(ctx, {
+        dshHome: home.home,
+        backupDir: join(dir.dir, 'repository'),
+        backupRuntimeVerify: 'off',
+        backupCatchUpOnStart: false,
+      });
+      const health = routes.find((route) => route.path === BACKUP_HEALTH_ROUTE_PATH);
+      assert.ok(health !== undefined, 'the backup row registered no availability probe');
+      const answer = await readRoute(health);
+      assert.equal(answer.status, 200);
+      assert.deepEqual(answer.body, { ok: true, row: 'dsh-backup', mounted: true });
+      assert.equal(existsSync(join(dir.dir, 'repository')), false, 'the probe created the repository directory');
+    } finally {
+      home.cleanup();
+      dir.cleanup();
+    }
+  });
+
+  it('the GPW row answers /api/w2m/gpw/health while it is mounted', async () => {
+    const dir = tempDir('w2m-health-gpw-');
+    try {
+      const routes = [];
+      const ctx = {
+        logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+        on: () => () => {},
+        effect: (callback) => callback(),
+        permissionPresets: { current: () => 'danger-full-access' },
+        tools: { guard: () => () => {} },
+        inject(_names, callback) { callback({ ...ctx, connection: { fetch: { register: (route) => routes.push(route) } } }); },
+      };
+      applyGpw(ctx, { foldersFile: join(dir.dir, 'gpw-folders.json'), requireFullAccess: false });
+      const health = routes.find((route) => route.path === GPW_HEALTH_ROUTE);
+      assert.ok(health !== undefined, 'the GPW row registered no availability probe');
+      const answer = await readRoute(health);
+      assert.equal(answer.status, 200);
+      assert.deepEqual(answer.body, { ok: true, row: 'dsh-gpw', mounted: true });
+    } finally {
+      dir.cleanup();
+    }
+  });
+
+  it('the desktop row answers /api/w2m/desktop/health while it is mounted', async () => {
+    const dir = tempDir('w2m-health-desktop-');
+    try {
+      const routes = [];
+      const ctx = {
+        logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+        inject(_names, callback) { callback({ connection: { fetch: { register: (route) => routes.push(route) } } }); },
+      };
+      // The row's own `apply` is what claims the desktop surface; `registerDesktop` alone is also called by
+      // the root row (tools.mjs) and must NOT answer the probe, or the entry would show on every profile.
+      applyDesktop(ctx);
+      const health = routes.find((route) => route.path === DESKTOP_HEALTH_ROUTE);
+      assert.ok(health !== undefined, 'the desktop row registered no availability probe');
+      const answer = await readRoute(health);
+      assert.equal(answer.status, 200);
+      assert.deepEqual(answer.body, { ok: true, row: 'dsh-desktop', mounted: true });
+    } finally {
+      dir.cleanup();
+    }
+  });
+
+  it('does not claim the desktop surface from the root row, which also mounts the remote-view routes', () => {
+    const routes = [];
+    const ctx = {
+      logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+      inject(_names, callback) { callback({ connection: { fetch: { register: (route) => routes.push(route) } } }); },
+    };
+    registerDesktop(ctx, { stateDir: '' });
+    assert.equal(routes.some((route) => route.path === DESKTOP_HEALTH_ROUTE), false, 'the probe belongs to the dsh-desktop row, not to the root row that ships the remote-view host routes');
+  });
+
+  it('the archive row answers its own probe and no other row claims that path', async () => {
+    const home = makeHome({ sessions: [] });
+    const dir = tempDir('w2m-health-archive-');
+    try {
+      const routes = [];
+      const ctx = {
+        logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+        effect: (callback) => callback(),
+        tools: { register: () => {} },
+        inject(_names, callback) { callback({ connection: { fetch: { register: (route) => routes.push(route) } } }); },
+      };
+      await applyArchive(ctx, { dshHome: home.home, backupRoot: join(dir.dir, 'archives'), projectRoot: dir.dir, workspace: dir.dir });
+      const health = routes.find((route) => route.path === ARCHIVE_ROUTE_PATHS.health);
+      assert.ok(health !== undefined, 'the archive row registered no availability probe');
+      const answer = await readRoute(health);
+      assert.equal(answer.status, 200);
+      assert.deepEqual(answer.body, { ok: true, row: 'dsh-backup-plugin', mounted: true });
+      assert.equal(routes.filter((route) => route.path === ARCHIVE_ROUTE_PATHS.health).length, 1, 'the probe is registered exactly once');
+    } finally {
+      home.cleanup();
+      dir.cleanup();
+    }
   });
 });

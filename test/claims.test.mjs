@@ -1228,6 +1228,16 @@ function tapCapture(rows) {
 /** All the deterministic assertions present and passing. */
 const GREEN_ROWS = () => LOADER_TITLES.map((title) => ({ title, ok: true, skip: null }));
 
+/**
+ * Every declared assertion except the page half (the one that needs a browser).
+ *
+ * Derived, not a magic count: the loader suite grew from ten assertions to twelve in 3.5.6 (surface
+ * markers, the archive tab), and a fixture that hard-coded `slice(0, 9)` handed the verdict program a
+ * capture missing three declarations, which reads as "the compat case failed".
+ */
+const PAGE_TITLE_MATCH = 'boots the profile';
+const DETERMINISTIC_ROWS = () => GREEN_ROWS().filter((row) => !row.title.includes(PAGE_TITLE_MATCH));
+
 const HONEST_NO_BROWSER_REASON =
   'no Chromium-based browser found (set W2M_DSH_BROWSER to one); tried: /usr/bin/google-chrome, ' +
   '/usr/bin/chromium, /usr/bin/chromium-browser, /usr/bin/microsoft-edge';
@@ -1436,7 +1446,7 @@ describe('the compat verdict program (skipped, failed or missing is a failure)',
   test('the honest no-browser skip is accepted, and a fully passing capture passes', () => {
     const honest = runVerdictProgram({
       capture: tapCapture([
-        ...GREEN_ROWS().slice(0, 9),
+        ...DETERMINISTIC_ROWS(),
         { title: PAGE_TITLE, ok: true, skip: HONEST_NO_BROWSER_REASON },
       ]),
       browser: '',
@@ -1464,7 +1474,7 @@ describe('the compat verdict program (skipped, failed or missing is a failure)',
     // reason on the environment (`BROWSER === '' ? 'no-browser' : 'unknown'`) and exited 0.
     const refused = runVerdictProgram({
       capture: tapCapture([
-        ...GREEN_ROWS().slice(0, 9),
+        ...DETERMINISTIC_ROWS(),
         { title: PAGE_TITLE, ok: true, skip: 'the Web app did not boot, so there was no page to open' },
       ]),
       browser: '',
@@ -1482,7 +1492,7 @@ describe('the compat verdict program (skipped, failed or missing is a failure)',
     const extra = 'a brand new assertion added this week';
     const refused = runVerdictProgram({
       capture: tapCapture([
-        ...GREEN_ROWS().slice(0, 9),
+        ...DETERMINISTIC_ROWS(),
         { title: PAGE_TITLE, ok: true, skip: HONEST_NO_BROWSER_REASON },
         { title: extra, ok: true, skip: 'not today' },
       ]),
@@ -1500,7 +1510,7 @@ describe('the compat verdict program (skipped, failed or missing is a failure)',
       // declares eleven. Nothing in the capture is skipped or failed, so only the declared-versus-run
       // comparison can notice.
       capture: tapCapture([
-        ...GREEN_ROWS().slice(0, 9),
+        ...DETERMINISTIC_ROWS(),
         { title: PAGE_TITLE, ok: true, skip: HONEST_NO_BROWSER_REASON },
       ]),
       browser: '',

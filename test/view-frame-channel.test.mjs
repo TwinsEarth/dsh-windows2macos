@@ -56,7 +56,17 @@ describe('P2P view frame channel', () => {
     target.handle(clientSent[0]);
     client.accept(targetSent[0]);
     target.handle(clientSent[1]);
-    await new Promise((resolve) => setTimeout(resolve, 80));
+    // Wait for the frame budget instead of assuming the event loop is idle: a loaded CI/pre-flight run can
+    // delay several 10 ms timers past a fixed 80 ms sleep, which made this assertion fail while alone it passed.
+    await new Promise((resolve) => {
+      const startedAt = Date.now();
+      const poll = () => {
+        const sentFrames = targetSent.filter((frame) => frame.type === VIEW_FRAME.FRAME).length;
+        if (sentFrames >= 3 || Date.now() - startedAt > 2_000) resolve();
+        else setTimeout(poll, 5);
+      };
+      poll();
+    });
     target.stop();
     const frames = targetSent.filter((frame) => frame.type === VIEW_FRAME.FRAME);
     assert.equal(frames.length, 3, 'the configured frame budget is streamed at one frame per interval');

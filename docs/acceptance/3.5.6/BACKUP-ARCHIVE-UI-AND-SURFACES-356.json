@@ -1,0 +1,54 @@
+{
+  "version": "3.5.6",
+  "case": "BACKUP-ARCHIVE-UI-AND-SURFACES-356",
+  "kind": "positive",
+  "machines": [
+    "TOFUTURE"
+  ],
+  "executed_at": "2026-11-21T04:30:00.000Z",
+  "executor": "agent",
+  "task_id": "w2m-v356-archive-ui-surfaces",
+  "requirement": "v3.5.6: (A1) give the archive backup subplugin a usable UI — six guarded /api/w2m/backup/archive/* routes sharing the six backup_* tool runners, and an 「归档」tab inside the existing 「备份&还原」 panel (list/create/verify/restore plan+confirm/import ZIP), without adding a fourth sidebar button; (B1) make sidebar entries follow row enablement — a read-only GET /api/w2m/<row>/health per UI row (backup/gpw/desktop/archive), client-side concurrent probing with an 800 ms budget, diffed register/unregister on re-probe, and an all-probes-failed fallback to the pre-3.5.6 always-registered behaviour so a transient probe failure never hides every button.",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/backup-subplugin.test.mjs",
+      "test/backup-subplugin-e2e.test.mjs",
+      "test/backup-wiring.test.mjs",
+      "test/client-bundle.test.mjs",
+      "test/client-budget.test.mjs",
+      "test/loader-entry.test.mjs",
+      "test/queue-journal.test.mjs",
+      "test/workspace-registry-guard.test.mjs",
+      "test/registry-write-policy.test.mjs"
+    ],
+    [
+      "node",
+      "scripts/layer-check.mjs"
+    ],
+    [
+      "node",
+      "scripts/scan-mojibake.mjs"
+    ],
+    [
+      "npx",
+      "eslint",
+      "."
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "routes": "The archive row mounts six guarded routes under /api/w2m/backup/archive/: GET status, POST create (dry_run supported as an option of createZipBackup, not a second planner), POST verify, POST restore (mode=plan|apply; apply requires confirm:\"restore\" — engine-enforced), POST import-zip (server path refused with 403 BACKUP_IMPORT_PATH_REFUSED outside archive root/DSH home/project/workspace/temp, or base64 upload), GET health (constant 200, no side effects, creates no files). Routes and the six tools call the same runners (runListArchives/runCreateArchive/runVerifyArchive/runRestoreArchive/runImportSessionZip).",
+      "panel": "BackupPanelView gained tab/onTab/archiveAvailable and an ArchiveBackupView: archive list newest-first, create (label + dry-run), verify table (checked/missing/mismatched/extras), restore plan with pre-restore notice and overwrite/profile options, armed apply that sends confirm:\"restore\", import by server path or file picker. The repository tab is unchanged when the archive surface is absent. The backup panel entry registers when backup OR archive is available (otherwise the shipped profile — dsh-backup off, dsh-backup-plugin on — would have no door to the archive tab).",
+      "surfaces": "GET /api/w2m/{backup,gpw,desktop,backup/archive}/health exist; desktop health is mounted only by the dsh-desktop row apply (the root row also mounts remote-view routes, so the probe answers for the row, not the package). The client probes the four endpoints concurrently within one 800 ms budget with credentials same-origin; 401 counts as available; 404/timeout/network error counts as absent. Entries are registered from a per-surface book and diffed on re-probe (30 s while visible + visibilitychange); unchanged results do zero work. Removal uses the slot API disposers (the idempotent controller disposer returned by inject plus the register disposer, called in reverse order).",
+      "fallback": "If none of the four probes answers, every surface is registered exactly as in 3.5.5 (archive tab hidden), so an old host or a transient network failure never hides every button. window.__W2M_SURFACES__ reports {ok, available, reasons, probedAt, fallback}; each registered entry renders inside [data-w2m-surface=\"<row>\"] (display:contents).",
+      "tests": "Required suite: 248 tests, 236 pass, 0 fail, 12 skipped (the 12 skips are loader-entry's own \"no DSH installation found on this drive\" skip: the installed harness is on D: and the repo on E:). loader-entry re-run with W2M_DSH_ROOT=D:\\DSH W2M_DSH_RUNTIME=D:\\DSH\\DeepSeek Harness.exe: 12/12 pass with W2M_SURFACES_PROBE=1 (archive row enabled: diagnostics authoritative, GPW/desktop markers absent, 归档 tab appears, create->list->verify driven in the real page); 11 pass / 1 skip with W2M_BACKUP_PROBE=1 (archive row disabled: no tab bar, no 归档 tab, unlock dialog unchanged). client-budget 4/4; client-bundle 130/130; backup-subplugin 19/19; backup-wiring 31/31; extra sweep 191+31+35 pass, 0 fail.",
+      "budget": "lib/client.js is 609,402 B / 10,035 lines against the 610,000 B / 10,050 line ceilings; largest top-level function unchanged. Historical comments were condensed and the 12 slot registrations were routed through one mountSlotEntry helper — reviewer-visible, behaviour-neutral.",
+      "gates": "eslint 0 errors (264 pre-existing demoted warnings), layer-check clean, scan-mojibake clean.",
+      "honesty": "Every command ran locally on the Windows host TOFUTURE in this checkout, against mkdtemp homes and the throwaway DSH profile used by loader-entry; no real DSH profile or real DSH_HOME was mounted, enabled, restored into or written, and no real machine upgrade or GUI assertion beyond the throwaway real-page probe is claimed."
+    }
+  }
+}

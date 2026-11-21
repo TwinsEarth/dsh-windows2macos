@@ -220,9 +220,10 @@ function archiveReadme(manifest) {
 /**
  * Create one archive.
  *
- * @param {{config: object, label?: string, now?: Date}} input `config` is the resolved tool configuration
- *   (`backupRoot`, `projectRoot`, `workspace`, `profileDir`, `dshHome`, `includeProject`,
+ * @param {{config: object, label?: string, now?: Date, dryRun?: boolean}} input `config` is the resolved tool
+ *   configuration (`backupRoot`, `projectRoot`, `workspace`, `profileDir`, `dshHome`, `includeProject`,
  *   `includeSessions`, `includeProfile`, `exclude`, `maxFileBytes`, `keepBackups`, `projectRootSource`).
+ *   `dryRun: true` runs the whole planning pass and returns the summary with `dry_run: true` without writing.
  * @returns {object} a summary, or `{ok:false, reason_code, detail}`
  */
 export function createZipBackup(input) {
@@ -351,6 +352,27 @@ export function createZipBackup(input) {
 
   const suffix = sanitizeLabel(input.label);
   const archive = path.join(path.resolve(config.backupRoot), `backup-${archiveStamp(now)}${suffix === '' ? '' : `-${suffix}`}.zip`);
+  // `dryRun` is the same planning pass the panel's archive tab asks for: the scan, the manifest and the
+  // planned path are all real, and the only thing skipped is the write (and the prune that follows it).
+  // It is an option on this function rather than a second planner so the two cannot disagree about what
+  // a create would do.
+  if (input.dryRun === true) {
+    return {
+      ok: true,
+      dry_run: true,
+      archive,
+      would_write: true,
+      files: manifest.counts.project,
+      sessions: manifest.counts.sessions,
+      profile_files: manifest.counts.profile,
+      skipped: manifest.counts.skipped,
+      skipped_entries: manifest.skipped,
+      bytes: manifest.counts.bytes,
+      workspace: manifest.workspace,
+      project_root: manifest.project_root,
+      project_root_source: manifest.project_root_source,
+    };
+  }
   let buffer;
   try {
     buffer = writeZip([

@@ -239,6 +239,67 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
       report.composer = state.composer;
     }
     report.bootFailure = report.consoleErrors.find((line) => BOOT_FAILURE_PATTERN.test(line)) ?? null;
+    // v3.5.6/B1: the surface diagnostics and the DOM markers. Read on every boot (they are cheap and
+    // profile-independent): `__W2M_SURFACES__` says what the four probes answered, and every entry the
+    // bundle registered renders inside a `[data-w2m-surface]` box. A disabled row is absent, not greyed.
+    const surfacesRead = await evaluate(`JSON.stringify((() => {
+      const d = window.__W2M_SURFACES__ ?? null;
+      return {
+        diag: d === null ? null : { ok: d.ok, fallback: d.fallback, available: d.available, reasons: d.reasons, probedAt: d.probedAt },
+        markers: [...document.querySelectorAll('[data-w2m-surface]')].map((node) => node.getAttribute('data-w2m-surface')),
+      };
+    })())`);
+    report.surfaces = typeof surfacesRead === 'string' ? JSON.parse(surfacesRead) : null;
+    if (process.env.W2M_SURFACES_PROBE === '1') {
+      // The row-enablement direction, driven in the page: `W2M_SURFACES_PROBE=1` makes the caller enable
+      // the archive row in its throwaway profile. This reads the panel and, when the archive surface is
+      // available, opens its tab and checks the archive view is the page body.
+      const read = async (expression) => {
+        const value = await evaluate(`JSON.stringify((() => { ${expression} })())`);
+        return value === null ? null : JSON.parse(value);
+      };
+      const opened = await read(`const b=document.querySelector('[data-w2m-backup-sidebar]'); if(b===null)return{found:false}; b.click(); return{found:true};`);
+      await new Promise((resolve) => setTimeout(resolve, 900));
+      const panel = await read(`
+        const p=document.querySelector('[data-w2m-backup-panel="page"]');
+        const archiveTab=document.querySelector('[data-w2m-backup-tab="archive"]');
+        return {panel:p!==null, tabs:document.querySelector('[data-w2m-backup-tabs]')!==null, archiveTab:archiveTab!==null, active:archiveTab?.getAttribute('aria-selected')??null};
+      `);
+      const clicked = await read(`const b=document.querySelector('[data-w2m-backup-tab="archive"]'); if(b===null)return{clicked:false}; b.click(); return{clicked:true};`);
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      // One real archive in the throwaway home, created from the page, then verified from the page: the
+      // tab's whole loop, not just its first paint.
+      const created = await read(`const b=document.querySelector('[data-w2m-archive-action="create"]'); if(b===null)return{clicked:false}; b.click(); return{clicked:true};`);
+      await new Promise((resolve) => setTimeout(resolve, 2_500));
+      const listed = await read(`
+        return {
+          rows: document.querySelectorAll('[data-w2m-archive-row]').length,
+          verifyButtons: document.querySelectorAll('[data-w2m-archive-action="verify"]').length,
+          planButtons: document.querySelectorAll('[data-w2m-archive-action="plan"]').length,
+        };
+      `);
+      const verified = await read(`const b=document.querySelector('[data-w2m-archive-action="verify"]'); if(b===null)return{clicked:false}; b.click(); return{clicked:true};`);
+      await new Promise((resolve) => setTimeout(resolve, 1_500));
+      const verifiedCard = await read(`
+        const card=document.querySelector('[data-w2m-archive-verify="true"]');
+        return {
+          present:card!==null,
+          counts:[...document.querySelectorAll('[data-w2m-archive-count]')].map((x)=>x.getAttribute('data-w2m-archive-count')),
+          text:(card?.innerText ?? '').slice(0,240),
+        };
+      `);
+      const archive = await read(`
+        const status=document.querySelector('[data-w2m-archive-status="true"]');
+        return {
+          status:status!==null,
+          create:document.querySelector('[data-w2m-archive-create="true"]')!==null,
+          import:document.querySelector('[data-w2m-archive-import="true"]')!==null,
+          repoStatus:document.querySelector('[data-w2m-backup-panel="status"]')!==null,
+          markers:[...document.querySelectorAll('[data-w2m-surface]')].map((node)=>node.getAttribute('data-w2m-surface')),
+        };
+      `);
+      report.surfacesProbe = { opened, panel, clicked, created, listed, verified, verifiedCard, archive };
+    }
     if (process.env.W2M_CAPABILITY_PROBE === '1') {
       const read = async (expression) => {
         const value = await evaluate(`JSON.stringify((() => { ${expression} })())`);
@@ -749,6 +810,8 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
           title: (document.querySelector('.w2mBackup_title')?.textContent ?? null),
           unlockCard: document.querySelector('[data-w2m-backup-panel="unlock"]')!==null,
           trigger: document.querySelector('[data-w2m-backup-unlock-open]')!==null,
+          tabs: document.querySelector('[data-w2m-backup-tabs]')!==null,
+          archiveTab: document.querySelector('[data-w2m-backup-tab="archive"]')!==null,
         };
       `);
       const unlockOpened = await read(`const b=document.querySelector('[data-w2m-backup-unlock-open]'); if(b===null)return{found:false}; b.click(); return{found:true};`);

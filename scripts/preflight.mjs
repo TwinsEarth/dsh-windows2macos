@@ -894,7 +894,10 @@ export const ACCEPTED_SKIPS = [
     key: 'no-loader-installation',
     suite: /^loader entry: the packed artifact/,
     match: /^no DeepSeek Harness installation found to drive the real Loader\b/,
-    maxCount: 10,
+    // 3.5.6 added two assertions to the suite (surface markers, the archive tab), so a host without an
+    // installation now skips all twelve. The budget is exactly the suite size on purpose: a further added
+    // assertion has to update this entry, which keeps "accepted skip" from silently absorbing new skips.
+    maxCount: 12,
     why:
       'test/loader-entry.test.mjs drives a real DSH installation; on a machine without one every ' +
       'assertion in that single suite skips, and .github/workflows/compat.yml is where it runs ' +

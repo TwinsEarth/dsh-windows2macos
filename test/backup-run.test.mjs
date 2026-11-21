@@ -14,6 +14,7 @@ import { join } from 'node:path';
 import {
   ARCHIVE_CONFIRM_TOKEN,
   BACKUP_ARCHIVE_ROUTE_PATH,
+  BACKUP_HEALTH_ROUTE_PATH,
   BACKUP_OLD_USAGE_ACK_ROUTE_PATH,
   BACKUP_REGISTER_ROUTE_PATH,
   BACKUP_RESTORE_ROUTE_PATH,
@@ -286,10 +287,10 @@ describe('subplugin: the route and the timer', () => {
     try {
       const fake = fakeCtx();
       apply(fake.ctx, { backupDir: join(dir, 'repo'), dshHome: home, backupMachineKey: false, ...NO_FIRE });
-      assert.equal(fake.registrations.length, 7, 'v3.4.8 adds restore/archive/verify/unlock; the register repair adds the sixth; the old/ usage ack route is the seventh');
+      assert.equal(fake.registrations.length, 8, 'v3.4.8 adds restore/archive/verify/unlock; the register repair adds the sixth; the old/ usage ack route is the seventh; 3.5.6 adds the health probe');
       assert.deepEqual(
         fake.registrations.map((row) => row.path).sort(),
-        [BACKUP_RUN_ROUTE_PATH, BACKUP_RESTORE_ROUTE_PATH, BACKUP_ARCHIVE_ROUTE_PATH, BACKUP_VERIFY_ROUTE_PATH, BACKUP_UNLOCK_ROUTE_PATH, BACKUP_REGISTER_ROUTE_PATH, BACKUP_OLD_USAGE_ACK_ROUTE_PATH].sort(),
+        [BACKUP_RUN_ROUTE_PATH, BACKUP_HEALTH_ROUTE_PATH, BACKUP_RESTORE_ROUTE_PATH, BACKUP_ARCHIVE_ROUTE_PATH, BACKUP_VERIFY_ROUTE_PATH, BACKUP_UNLOCK_ROUTE_PATH, BACKUP_REGISTER_ROUTE_PATH, BACKUP_OLD_USAGE_ACK_ROUTE_PATH].sort(),
       );
       assert.deepEqual(fake.registrations.find((row) => row.path === BACKUP_RUN_ROUTE_PATH).methods, ['GET', 'POST']);
       assert.deepEqual(fake.registrations.find((row) => row.path === BACKUP_RUN_ROUTE_PATH).methods, ['GET', 'POST']);

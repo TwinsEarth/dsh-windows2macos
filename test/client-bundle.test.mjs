@@ -174,13 +174,30 @@ function makeRegistry() {
     registered,
     inject(key, callback) {
       announced.push(key);
-      registered.push(callback());
-      return () => {};
+      const entry = callback();
+      registered.push(entry);
+      // The real `slots.inject` returns the disposer that removes the declaration (and with it the
+      // registration), which is what the v3.5.6 surface diff relies on to unregister a row.
+      return () => {
+        const at = registered.indexOf(entry);
+        if (at >= 0) registered.splice(at, 1);
+      };
     },
     register(options, component) {
       return { options, component };
     },
   };
+}
+
+/**
+ * Let the surface probes (v3.5.6/B1) settle.
+ *
+ * Registration follows a probe by design -- that is the whole feature -- so a test that wants to see an
+ * entry has to let the probe's microtasks and the fallback decision run first. Three macrotasks is more
+ * than the four concurrent probes need, and it keeps the helper independent of timer implementation.
+ */
+async function settleW2mSurfaces() {
+  for (let turn = 0; turn < 3; turn += 1) await new Promise((resolve) => { setTimeout(resolve, 0); });
 }
 
 /** A locale-service stand-in: `register` hands back the unregister disposer, `bind` a translator. */
@@ -372,7 +389,9 @@ describe('client bundle: the activation contract', () => {
       () => exports.apply(ctx),
       'an undeclared service read throws in Cordis and takes the whole app down; the bundle must read only what it declares',
     );
-    assert.deepEqual(registry.announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'sidebar.panellist', 'main', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, SEAT, 'shell.overlay', 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', 'sidebar.panellist', 'main', SEAT], 'the entry still has to take its seat');
+    // v3.5.6/B1: the GPW, backup and desktop entries now come from the surface book (probe-driven), in one
+    // block right after the target control; only the remote-view settings section is registered later.
+    assert.deepEqual(registry.announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'sidebar.panellist', 'main', 'sidebar.panellist', 'main', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, SEAT, 'shell.overlay', 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', SEAT], 'the entry still has to take its seat');
     assert.equal(registry.registered.length, 21);
     assert.equal(locale.registered.has('w2m.target'), true, 'the dictionaries go to the locale service when there is one');
   });
@@ -477,7 +496,7 @@ describe('client bundle: the seat it registers into', () => {
 
   it('announces and registers all five composer controls plus the sidebar and update sections into conversation.input.left', () => {
     const { announced, registered } = applyTo();
-    assert.deepEqual(announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'sidebar.panellist', 'main', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, SEAT, 'shell.overlay', 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', 'sidebar.panellist', 'main', SEAT]);
+    assert.deepEqual(announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'sidebar.panellist', 'main', 'sidebar.panellist', 'main', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, SEAT, 'shell.overlay', 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', SEAT]);
     assert.equal(registered.length, 21);
     assert.equal(registered[0].options.name, SEAT);
   });
@@ -1092,7 +1111,9 @@ it('v3.3.2: the history window is anchored in the composer and the original cont
   assert.ok(source.includes("'.w2mJqDockChip{display:none!important}'"), 'the bottom queue dock chip stays hidden');
   assert.ok(source.includes('w2mHistWrap'), 'the history window is wrapped next to the history button');
   assert.ok(source.includes("'.w2mHistWindow{position:absolute"), 'the window is anchored above the composer, not fixed to the page bottom');
-  assert.equal(source.split('}, FleetChat));').length - 1, 2, 'the fleet-chat composer panel and view tab are both back');
+  // v3.5.6: registrations go through `mountSlotEntry`, so the two FleetChat contributions are counted by the
+  // entry they mount, not by a call-site spelling.
+  assert.equal((source.match(/}, FleetChat\)|, FleetChat, '/g) ?? []).length, 2, 'the fleet-chat composer panel and view tab are both back');
   assert.ok(source.includes('w2mChat_shotButton'), 'the restored fleet-chat panel is the v2.2.6 module');
   assert.ok(source.includes('全部机器'), 'the 全部机器 label is back');
   assert.ok(source.includes('pendingSubmissions'), 'the history window still lists pending human submissions');
@@ -1753,11 +1774,15 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
    * document's listener registry is how Escape is dispatched, and the legacy clipboard test needs a
    * document with `execCommand` and a `body`.
    */
-  function mountBackupPage(respond, options = {}) {
+  async function mountBackupPage(respond, options = {}) {
     const requests = [];
     const unexpected = [];
     const hostDocument = options.document ?? makeFakeDocument();
     const hostFetch = async (url, init = {}) => {
+      // v3.5.6/B1: the surface probes run on every mount. A host with no such route answers 404, which is
+      // the "all rows disabled" state and therefore the fallback registration this suite has always used;
+      // the probes are not part of any test's request log.
+      if (url.endsWith('/health')) return { ok: false, status: 404, json: async () => ({ ok: false, reason_code: 'ROUTE_MISSING' }) };
       const method = init.method ?? 'GET';
       const rawBody = init.body === undefined ? null : init.body;
       const body = rawBody === null ? null : JSON.parse(rawBody);
@@ -1783,6 +1808,8 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
       globals: { fetch: hostFetch, ...(options.globals ?? {}) },
     });
     bundle.exports.apply({ slots: registry, effect: (callback) => callback(), get: () => undefined });
+    // The registration is probe-driven, so the first probe has to settle before the entries exist.
+    await settleW2mSurfaces();
     const page = registry.registered.find((entry) => entry.options.key === 'w2m-backup');
     assert.ok(page !== undefined, 'the backup page is registered');
     const handle = mountReact.mount(page.component, { t: bundle.exports.makeTranslator(() => undefined) });
@@ -2135,7 +2162,7 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
   });
 
   it('opens a real modal unlock dialog from the unlock card', async () => {
-    const host = mountBackupPage(unlockDialogHost());
+    const host = await mountBackupPage(unlockDialogHost());
     try {
       await host.settle();
       assert.equal(dialogNode(host.handle.tree), undefined, 'the dialog is closed by default');
@@ -2180,7 +2207,7 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
   });
 
   it('shows the public password hint in the dialog and the terminal rotation command', async () => {
-    const host = mountBackupPage(unlockDialogHost({ password_hint: { set: true, text: '周六生日' } }));
+    const host = await mountBackupPage(unlockDialogHost({ password_hint: { set: true, text: '周六生日' } }));
     try {
       await host.settle();
       const dialog = await openUnlockDialog(host);
@@ -2208,7 +2235,7 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
     }
 
     // A repository with a machine envelope but no PIN: the password section says no PIN is set.
-    const noPinHost = mountBackupPage(unlockDialogHost({
+    const noPinHost = await mountBackupPage(unlockDialogHost({
       envelopes: ['machine'],
       password_required: false,
       password_hint: { set: false, text: null },
@@ -2227,7 +2254,7 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
   });
 
   it('closes the unlock dialog with Escape and puts focus back on the card trigger', async () => {
-    const host = mountBackupPage(unlockDialogHost());
+    const host = await mountBackupPage(unlockDialogHost());
     try {
       await host.settle();
       const focusCalls = [];
@@ -2244,7 +2271,7 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
   });
 
   it('closes the unlock dialog on a backdrop click but not when the click lands inside it', async () => {
-    const host = mountBackupPage(unlockDialogHost());
+    const host = await mountBackupPage(unlockDialogHost());
     try {
       await host.settle();
       const dialog = await openUnlockDialog(host);
@@ -2310,7 +2337,7 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
   it('posts exactly {confirm:"unlock"} from the dialog and never sends a password', async () => {
     const posts = [];
     const base = unlockDialogHost();
-    const host = mountBackupPage((request) => {
+    const host = await mountBackupPage((request) => {
       if (request.url === '/api/w2m/backup/unlock' && request.method === 'POST') {
         posts.push(request.body);
         return {
@@ -2345,7 +2372,7 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
       assert.ok(dialogNode(host.handle.tree) !== undefined, 'the dialog stays open to show the result');
       assert.deepEqual(host.unexpected, [], 'every dialog request went to a route the panel knows');
       // The same dialog on a host where neither the machine nor the account path works: option A is disabled.
-      const blockedHost = mountBackupPage(unlockDialogHost({
+      const blockedHost = await mountBackupPage(unlockDialogHost({
         machine_available: false,
         account: { bound: true, matched: false, id_hint: '…abcd' },
       }));
@@ -2365,7 +2392,7 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
 
   it('maps an unlock failure through the reason sentence and keeps the dialog open', async () => {
     const base = unlockDialogHost();
-    const host = mountBackupPage((request) => {
+    const host = await mountBackupPage((request) => {
       if (request.url === '/api/w2m/backup/unlock' && request.method === 'POST') {
         return { ok: false, reason_code: 'BACKUP_NO_PERMISSION', detail: 'the credential did not open the repository' };
       }
@@ -2392,7 +2419,7 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
     let unlockReads = 0;
     const unlockPayload = sealedUnlockDescribe();
     const base = standardBackupHost();
-    const host = mountBackupPage((request) => {
+    const host = await mountBackupPage((request) => {
       if (request.url === '/api/w2m/backup/unlock' && request.method === 'GET') {
         unlockReads += 1;
         return unlockPayload;
@@ -2441,7 +2468,7 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
       body: { appendChild: () => { appended += 1; }, removeChild: () => {} },
       execCommand: (command) => { copyCalls += 1; return command === 'copy'; },
     });
-    const host = mountBackupPage(unlockDialogHost(), { document: legacyDocument });
+    const host = await mountBackupPage(unlockDialogHost(), { document: legacyDocument });
     try {
       await openUnlockDialog(host);
       inDialog(host.handle.tree, (node) => node.props?.['data-w2m-backup-unlock-copy'] === 'true')[0].props.onClick();
@@ -2617,7 +2644,7 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
       dry_run: false,
     };
     const base = standardBackupHost();
-    const host = mountBackupPage((request) => {
+    const host = await mountBackupPage((request) => {
       if (request.url === '/api/w2m/backup/run' && request.method === 'POST') {
         posts.push(request.body);
         if (request.body?.allowLargeFullCopy === true) {
@@ -2703,7 +2730,7 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
       },
     };
     const base = standardBackupHost();
-    const host = mountBackupPage((request) => {
+    const host = await mountBackupPage((request) => {
       if (request.url === '/api/w2m/backup/run' && request.method === 'GET') return runGet;
       if (request.url === '/api/w2m/backup/run' && request.method === 'POST') {
         posts.push(request.body);
@@ -2831,6 +2858,8 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
       candidates: [{ session_id: 'sess-a', workspace: 'proj-a', size: 10, conflict: 'new' }],
     };
     const hostFetch = async (url, init = {}) => {
+      // v3.5.6/B1: the four surface probes are not part of this test's request log.
+      if (url.endsWith('/health')) return { ok: false, status: 404, json: async () => ({ ok: false, reason_code: 'ROUTE_MISSING' }) };
       const method = init.method ?? 'GET';
       const body = init.body === undefined ? null : JSON.parse(init.body);
       requests.push({ url, method, body });
@@ -2895,6 +2924,7 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
       globals: { fetch: hostFetch },
     });
     bundle.exports.apply({ slots: registry, effect: (callback) => callback(), get: () => undefined });
+    await settleW2mSurfaces();
     const page = registry.registered.find((entry) => entry.options.key === 'w2m-backup');
     assert.ok(page !== undefined);
     const handle = mountReact.mount(page.component, { t: (key) => key });
@@ -2993,6 +3023,7 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
       globals: { fetch: hostFetch },
     });
     bundle.exports.apply({ slots: registry, effect: (callback) => callback(), get: () => undefined });
+    await settleW2mSurfaces();
     const page = registry.registered.find((entry) => entry.options.key === 'w2m-backup');
     assert.ok(page !== undefined, 'the backup page is registered');
     const handle = mountReact.mount(page.component, { t: (key) => key });
@@ -3168,7 +3199,7 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
   });
 
   it('drives the read-only scan and the two backup-scope entries through the run contract', async () => {
-    const { handle, requests, unexpected, settle } = mountBackupPage(standardBackupHost({ scanBody: scanSessionsBody() }));
+    const { handle, requests, unexpected, settle } = await mountBackupPage(standardBackupHost({ scanBody: scanSessionsBody() }));
     await settle();
     assert.deepEqual(unexpected, [],
       'the first render reads only the status/run/unlock/scan routes the panel knows');
@@ -3233,7 +3264,7 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
 
   it('renders the neutral unavailable state for a host without the scan route, without blocking the panel', async () => {
     const host = standardBackupHost();
-    const { handle, settle, text } = mountBackupPage(({ url, method }) => (
+    const { handle, settle, text } = await mountBackupPage(({ url, method }) => (
       url === '/api/w2m/backup/scan?detail=1' ? { status: 404 } : host({ url, method })
     ));
     await settle();
@@ -3249,7 +3280,7 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
   });
 
   it('renders the empty hint when the scan reports no sessions', async () => {
-    const { handle, settle, text } = mountBackupPage(standardBackupHost());
+    const { handle, settle, text } = await mountBackupPage(standardBackupHost());
     await settle();
     assert.equal(findBy(handle.tree, (node) => node.props?.['data-w2m-backup-scan-state'] === 'empty').length, 1);
     assert.ok(text().includes('没有可备份的会话'));
@@ -3260,7 +3291,7 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
   });
 
   it('shows the host reason text when a scope run is refused, instead of throwing', async () => {
-    const { handle, settle, text } = mountBackupPage(standardBackupHost({
+    const { handle, settle, text } = await mountBackupPage(standardBackupHost({
       scanBody: scanSessionsBody(),
       runPost: () => ({ ok: false, reason_code: 'BACKUP_SCOPED_NOTHING', detail: 'no active sessions' }),
     }));
@@ -3498,7 +3529,7 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
     };
     let verifyCalls = 0;
     let registerBody = null;
-    const host = mountBackupPage(({ url, method, body }) => {
+    const host = await mountBackupPage(({ url, method, body }) => {
       if (url === '/api/w2m/backup/run') {
         if (method === 'POST') return { ok: true, snapshot_id: 'snap', sessions: 1, files: 1, blocks_new: 0, blocks_reused: 0, duration_ms: 1 };
         return {
@@ -3577,7 +3608,7 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
     assert.equal(exports.backupReasonText(failure.code, t), '没有权限：请用原账户登录，或输入解锁密码');
   });
 
-  it('mounts the page twice on one document without leaking a stylesheet or a poll timer', () => {
+  it('mounts the page twice on one document without leaking a stylesheet or a poll timer', async () => {
     const document = makeFakeDocument();
     const intervals = new Set();
     const globals = {
@@ -3589,7 +3620,7 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
       clearInterval: (timer) => { intervals.delete(timer); },
       fetch: async () => ({ ok: true, status: 200, json: async () => ({ ok: true }) }),
     };
-    const mountOnce = () => {
+    const mountOnce = async () => {
       const mountReact = makeMountReact();
       const registry = makeRegistry();
       const bundle = loadBundle({
@@ -3601,6 +3632,7 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
         globals,
       });
       bundle.exports.apply({ slots: registry, effect: (callback) => callback(), get: () => undefined });
+      await settleW2mSurfaces();
       // Other subplugins own timers of their own (they are disposed through ctx.effect); this test is
       // about the backup page's poll, so count the delta the page itself adds.
       const baseline = intervals.size;
@@ -3615,11 +3647,11 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
         },
       };
     };
-    const first = mountOnce();
+    const first = await mountOnce();
     assert.equal(document.appended.length, 1, 'the first mount installs exactly one stylesheet');
     first.unmount();
     assert.equal(document.removed.length, 0, 'unmounting does not remove the shared stylesheet');
-    const second = mountOnce();
+    const second = await mountOnce();
     assert.equal(document.appended.length, 1, 'a second mount in the same document reuses the one stylesheet');
     second.unmount();
   });
@@ -3726,7 +3758,7 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
     const dueState = { running: false, old_usage: { due: true, bytes: 12 * GiB, files: 4, ack_bytes: 2 * GiB, reminder_bytes: 10 * GiB } };
     const quietState = { running: false, old_usage: { due: false, bytes: 12 * GiB, files: 4, ack_bytes: 12 * GiB, reminder_bytes: 10 * GiB } };
     const base = standardBackupHost();
-    const host = mountBackupPage((request) => {
+    const host = await mountBackupPage((request) => {
       if (request.url === '/api/w2m/backup/run' && request.method === 'GET') {
         return {
           ok: true,
@@ -4189,6 +4221,264 @@ describe('client bundle: the decision inbox names sessions and humanizes option 
     assert.equal(store.state.busy, '', 'a failure releases the busy slot so the operator can retry');
     assert.equal(store.state.error, '', 'a humanizer failure is guidance, not a red inbox outage');
     assert.ok(calls.some((entry) => entry.url.includes('includeArchived=1')), 'a failed run still refreshes (rules may have landed)');
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// v3.5.6/B1: surface probes and conditional registration
+// ---------------------------------------------------------------------------------------------
+//
+// The rows that own a sidebar surface (`dsh-gpw`, `dsh-backup`, `dsh-desktop` and the archive row inside
+// the backup panel) answer a cheap `/health`. These tests drive the probe with an injected fetch and a
+// fake slot registry, so the diff -- register what answered, dispose what went away, fall back when
+// nothing answers -- is measured rather than described.
+
+const HEALTH = {
+  gpw: '/api/w2m/gpw/health',
+  backup: '/api/w2m/backup/health',
+  desktop: '/api/w2m/desktop/health',
+  archive: '/api/w2m/backup/archive/health',
+};
+
+/** A minimal fetch answer: the bundle only reads `ok`, `status` and `json()`. */
+const answer = (status, body = {}) => ({ ok: status >= 200 && status < 300, status, json: async () => body });
+
+/** vm-realm values have that realm's prototypes; compare their plain data shape. */
+const plain = (value) => JSON.parse(JSON.stringify(value));
+
+describe('v3.5.6/B1: surface probes', () => {
+  it('treats 401 as available, 404 as absent, and a transport error as absent', async () => {
+    const { exports } = loadBundle({ globals: { AbortController, setTimeout, clearTimeout } });
+    const probe = await exports.probeW2mSurfaces(async (url) => {
+      if (url === HEALTH.gpw) return answer(401);
+      if (url === HEALTH.backup) return answer(200, { ok: true });
+      if (url === HEALTH.desktop) return answer(404);
+      throw new Error('connection reset');
+    });
+    assert.deepEqual(plain(probe.available), { gpw: true, backup: true, desktop: false, archive: false });
+    assert.equal(probe.reasons.gpw, 'unauthorized', '401 is "mounted, wants the page session", never "absent"');
+    assert.equal(probe.reasons.backup, 'ok');
+    assert.equal(probe.reasons.desktop, 'not-found');
+    assert.equal(probe.reasons.archive, 'network-error');
+    assert.equal(probe.ok, true);
+    assert.equal(probe.fallback, false);
+    assert.equal(typeof probe.probedAt, 'string');
+  });
+
+  it('reports a timeout as unavailable, inside the one budget', async () => {
+    const { exports } = loadBundle({ globals: { AbortController, setTimeout, clearTimeout } });
+    // A fetch that never answers on its own and rejects only because the probe's controller aborted it:
+    // that is the only way the timeout reason can be observed instead of hanging the suite.
+    const stalled = (url, init) => new Promise((resolve, reject) => {
+      init.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true });
+    });
+    const probe = await exports.probeW2mSurface('gpw', stalled, 5);
+    assert.deepEqual(plain(probe), { available: false, reason: 'timeout' });
+  });
+
+  it('flags the all-failed case as the fallback the caller must honour', async () => {
+    const { exports } = loadBundle({ globals: { AbortController, setTimeout, clearTimeout } });
+    const probe = await exports.probeW2mSurfaces(async () => answer(404));
+    assert.equal(probe.ok, false);
+    assert.equal(probe.fallback, true);
+    assert.deepEqual(plain(Object.values(probe.available)), [false, false, false, false]);
+  });
+});
+
+describe('v3.5.6/B1: conditional registration', () => {
+  /** Load the bundle with a mutable health answer and a live window listener registry. */
+  function mountSurfaces(initial) {
+    const state = { ...initial };
+    const calls = [];
+    const hostFetch = async (url) => {
+      const key = Object.keys(HEALTH).find((name) => HEALTH[name] === url);
+      if (key === undefined) return answer(404);
+      calls.push(key);
+      return state[key] === true ? answer(200, { ok: true }) : answer(404);
+    };
+    const bundle = loadBundle({
+      // A no-op interval: the poll must be installable so the visibility listener (the path this test
+      // drives) is registered, but nothing should actually fire on a 30 s timer inside a test.
+      globals: { fetch: hostFetch, AbortController, setTimeout, clearTimeout, setInterval: () => 0, clearInterval: () => {} },
+    });
+    const listeners = new Map();
+    bundle.window.addEventListener = (type, listener) => {
+      listeners.set(type, [...(listeners.get(type) ?? []), listener]);
+    };
+    bundle.window.removeEventListener = () => {};
+    const registry = makeRegistry();
+    bundle.exports.apply({ slots: registry, effect: (callback) => callback(), get: () => undefined });
+    // Only the *sidebar* entry is the surface: the settings sections reuse the same ids (`w2m-gpw`,
+    // `w2m-remote-view`) on purpose and stay registered so a disabled row remains discoverable.
+    const ids = () => registry.registered.filter((entry) => entry.options.name === 'sidebar.panellist').map((entry) => entry.options.id);
+    const mainKeys = () => registry.registered.filter((entry) => entry.options.name === 'main').map((entry) => entry.options.key);
+    const reprobe = async () => {
+      for (const listener of listeners.get('visibilitychange') ?? []) listener();
+      await settleW2mSurfaces();
+    };
+    return { bundle, registry, ids, mainKeys, reprobe, calls, state };
+  }
+
+  it('registers only what answered, then follows a re-probe in both directions', async () => {
+    const host = mountSurfaces({ gpw: true, backup: false, desktop: false, archive: false });
+    await settleW2mSurfaces();
+    assert.ok(host.ids().includes('w2m-gpw'), 'the row that answered is registered');
+    assert.equal(host.ids().includes('w2m-backup'), false, 'a disabled row has no sidebar entry');
+    assert.equal(host.ids().includes('w2m-remote-view'), false, 'a disabled desktop row has no sidebar entry');
+    assert.equal(host.mainKeys().includes('w2m-backup'), false, 'a disabled row has no main page either');
+    assert.equal(host.bundle.window.__W2M_SURFACES__.available.backup, false);
+    assert.equal(host.bundle.window.__W2M_SURFACES__.reasons.backup, 'not-found');
+    assert.equal(typeof host.bundle.window.__W2M_SURFACES__.probedAt, 'string');
+
+    host.state.backup = true;
+    await host.reprobe();
+    assert.ok(host.ids().includes('w2m-backup'), 'an enabled row appears after a re-probe');
+    assert.ok(host.mainKeys().includes('w2m-backup'), 'its main page appears with the sidebar entry');
+    assert.equal(host.ids().filter((id) => id === 'w2m-backup').length, 1, 're-probing never duplicates an entry');
+
+    host.state.gpw = false;
+    await host.reprobe();
+    assert.equal(host.ids().includes('w2m-gpw'), false, 'a row that went away is disposed');
+    assert.ok(host.ids().includes('w2m-backup'), 'the other surface is untouched');
+    assert.ok(host.calls.length >= 8, 'every re-probe asks all four rows');
+  });
+
+  it('falls back to registering every surface when nothing answers (an older host)', async () => {
+    const host = mountSurfaces({ gpw: false, backup: false, desktop: false, archive: false });
+    await settleW2mSurfaces();
+    for (const id of ['w2m-gpw', 'w2m-backup', 'w2m-remote-view']) {
+      assert.ok(host.ids().includes(id), `${id} must stay registered when the probe cannot decide`);
+    }
+    assert.equal(host.bundle.window.__W2M_SURFACES__.ok, false);
+    assert.equal(host.bundle.window.__W2M_SURFACES__.fallback, true, 'the diagnostics say why the entries are unconditional');
+  });
+
+  it('keeps the archive tab hidden in the fallback: an old host has no route to drive it', async () => {
+    const host = mountSurfaces({ gpw: false, backup: false, desktop: false, archive: false });
+    await settleW2mSurfaces();
+    assert.equal(host.bundle.window.__W2M_SURFACES__.available.archive, false);
+    const main = host.registry.registered.find((entry) => entry.options.key === 'w2m-backup');
+    const translator = host.bundle.exports.makeTranslator(() => undefined);
+    const tree = main.component({ t: translator });
+    assert.equal(findBy(tree, (node) => node.props?.['data-w2m-backup-tabs'] === 'true').length, 0, 'no tab bar without an archive surface');
+  });
+});
+
+describe('v3.5.6/A1: the 归档 tab inside the backup panel', () => {
+  const loadForView = () => loadBundle();
+
+  it('renders the tab only when the archive surface is available', () => {
+    const { exports } = loadForView();
+    const t = exports.makeTranslator(() => undefined);
+    const hidden = exports.BackupPanelView({ t, archiveAvailable: false });
+    assert.equal(findBy(hidden, (node) => node.props?.['data-w2m-backup-tabs'] === 'true').length, 0);
+    assert.equal(findBy(hidden, (node) => node.type === exports.ArchiveBackupView).length, 0, 'the archive view is not even referenced');
+
+    const shown = exports.BackupPanelView({ t, archiveAvailable: true, tab: 'repo', onTab: () => {} });
+    assert.equal(findBy(shown, (node) => node.props?.['data-w2m-backup-tabs'] === 'true').length, 1);
+    const archiveTab = findBy(shown, (node) => node.props?.['data-w2m-backup-tab'] === 'archive');
+    assert.equal(archiveTab.length, 1);
+    assert.equal(archiveTab[0].props['aria-selected'], 'false');
+    assert.ok(findBy(shown, (node) => node.props?.['data-w2m-backup-panel'] === 'status').length > 0, 'the repository tab stays untouched');
+
+    const active = exports.BackupPanelView({ t, archiveAvailable: true, tab: 'archive' });
+    assert.equal(findBy(active, (node) => node.type === exports.ArchiveBackupView).length, 1, 'the active tab switches the page body');
+    assert.equal(findBy(active, (node) => node.props?.['data-w2m-backup-panel'] === 'status').length, 0, 'the repository cards are not rendered behind the archive tab');
+  });
+
+  it('asks the page to switch tabs without touching anything else', () => {
+    const { exports } = loadForView();
+    const t = exports.makeTranslator(() => undefined);
+    let wanted = null;
+    const tree = exports.BackupPanelView({ t, archiveAvailable: true, tab: 'repo', onTab: (next) => { wanted = next; } });
+    findBy(tree, (node) => node.props?.['data-w2m-backup-tab'] === 'archive')[0].props.onClick();
+    assert.equal(wanted, 'archive');
+  });
+
+  it('drives create/verify/restore/import, and gates the apply on the confirmation checkbox', async () => {
+    const requests = [];
+    const archive = 'C:\\backups\\backup-20261121-120000.zip';
+    const statusBody = {
+      ok: true,
+      archive_root: 'C:\\backups',
+      archive_count: 1,
+      archives: [{ archive, name: 'backup-20261121-120000.zip', size: 2048, created_at: '2026-11-21T04:00:00.000Z', label: 'before-upgrade', error: null }],
+    };
+    const hostFetch = async (url, init = {}) => {
+      const body = init.body === undefined ? null : JSON.parse(init.body);
+      requests.push({ url, method: init.method ?? 'GET', body });
+      if (url === '/api/w2m/backup/archive/status') return answer(200, statusBody);
+      if (url === '/api/w2m/backup/archive/create') return answer(200, { ok: true, dry_run: body.dry_run === true, files: 2, sessions: 1, archive });
+      if (url === '/api/w2m/backup/archive/verify') return answer(200, { ok: true, archive, checked: 2, missing: [], mismatched: [], extras: [] });
+      if (url === '/api/w2m/backup/archive/restore') {
+        return body.mode === 'apply'
+          ? answer(200, { ok: true, mode: 'apply', restored: { files: 2, sessions: 1 }, pre_restore: { dir: 'C:\\dsh\\.w2m-restore-backups', files: [] } })
+          : answer(200, { ok: true, mode: 'plan', plan: { project_target: 'D:\\project', project: { create: 2, same: 0, conflicts: [] }, sessions: { planned: 1 }, profile: { files: 0 }, pre_restore: { dir: null, files: ['project/src/app.txt'] } } });
+      }
+      if (url === '/api/w2m/backup/archive/import-zip') return answer(200, { ok: true, workspace: 'D:\\project', written: [{ session_id: 'session-new' }], attach: { ok: true } });
+      return answer(404);
+    };
+    const mountReact = makeMountReact();
+    const { exports } = loadBundle({
+      requireImpl: (specifier) => {
+        if (specifier === 'react') return mountReact.React;
+        throw new Error(`unexpected require(${specifier})`);
+      },
+      globals: { fetch: hostFetch },
+    });
+    const handle = mountReact.mount(exports.ArchiveBackupView, {});
+    const settle = async () => {
+      for (let turn = 0; turn < 3; turn += 1) await new Promise((resolve) => { setTimeout(resolve, 0); });
+      handle.rerender();
+    };
+    await settle();
+
+    assert.equal(findBy(handle.tree, (node) => node.props?.['data-w2m-archive-status'] === 'true').length, 1, 'the tab loads the archive list');
+    assert.equal(findBy(handle.tree, (node) => node.props?.['data-w2m-archive-row'] === archive).length, 1);
+
+    const labelInput = findBy(handle.tree, (node) => node.props?.['data-w2m-archive-label'] === 'true')[0];
+    labelInput.props.onChange({ target: { value: 'before-upgrade' } });
+    await settle();
+    findBy(handle.tree, (node) => node.props?.['data-w2m-archive-dry'] === 'true')[0].props.onChange({ target: { checked: true } });
+    await settle();
+    const dry = findBy(handle.tree, (node) => node.props?.['data-w2m-archive-action'] === 'dry-run')[0];
+    assert.ok(dry !== undefined, 'ticking "仅预演" turns the create button into the dry-run action');
+    dry.props.onClick();
+    await settle();
+    const createBody = requests.filter((entry) => entry.url.endsWith('/create')).at(-1);
+    assert.deepEqual(createBody.body, { label: 'before-upgrade', dry_run: true }, 'the create sends the label and the dry-run flag it is showing');
+
+    findBy(handle.tree, (node) => node.props?.['data-w2m-archive-action'] === 'verify')[0].props.onClick();
+    await settle();
+    const counts = findBy(handle.tree, (node) => node.props?.['data-w2m-archive-count'] === 'checked');
+    assert.equal(counts.length, 1);
+    assert.match(collectText(counts[0]).join(' '), /已核对 2/u, 'the verification table shows the engine counts');
+
+    findBy(handle.tree, (node) => node.props?.['data-w2m-archive-action'] === 'plan')[0].props.onClick();
+    await settle();
+    assert.equal(findBy(handle.tree, (node) => node.props?.['data-w2m-archive-pre-restore'] === 'true').length, 1, 'the plan shows the pre-restore notice');
+    const applyBefore = findBy(handle.tree, (node) => node.props?.['data-w2m-archive-run'] === 'apply')[0];
+    assert.equal(applyBefore.props.disabled, true, 'apply is disabled until the operator confirms');
+
+    const confirm = findBy(handle.tree, (node) => node.props?.['data-w2m-archive-confirm'] === 'true')[0];
+    confirm.props.onChange({ target: { checked: true } });
+    await settle();
+    const applyAfter = findBy(handle.tree, (node) => node.props?.['data-w2m-archive-run'] === 'apply')[0];
+    assert.equal(applyAfter.props.disabled, false);
+    applyAfter.props.onClick();
+    await settle();
+    const restoreBody = requests.filter((entry) => entry.url.endsWith('/restore') && entry.body?.mode === 'apply').at(-1);
+    assert.equal(restoreBody.body.confirm, 'restore', 'the apply carries the literal confirmation token');
+    assert.equal(restoreBody.body.archive, archive);
+
+    const importInput = findBy(handle.tree, (node) => node.props?.['data-w2m-archive-import-path'] === 'true')[0];
+    importInput.props.onChange({ target: { value: 'D:\\exports\\dsh-session-x.zip' } });
+    await settle();
+    findBy(handle.tree, (node) => node.props?.['data-w2m-archive-action'] === 'import')[0].props.onClick();
+    await settle();
+    const importBody = requests.filter((entry) => entry.url.endsWith('/import-zip')).at(-1);
+    assert.deepEqual(importBody.body, { zip: 'D:\\exports\\dsh-session-x.zip' });
+    handle.unmount();
   });
 });
 

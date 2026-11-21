@@ -2,6 +2,30 @@
 
 All notable changes to this project are documented here.
 
+## [3.5.6] - 2026-11-21
+
+### 归档备份子插件 UI（「备份&还原」的「归档」tab）+ 侧边栏随启用状态显示/隐藏（未发布）
+
+- **A1 归档 UI**：`dsh-backup-plugin` 行新增六条受保护路由 `GET /api/w2m/backup/archive/status`、
+  `POST …/create`（`dry_run?`）、`POST …/verify`、`POST …/restore`（plan/apply，apply 需 `confirm:"restore"`）、
+  `POST …/import-zip`（服务端路径或 base64 上传；越界路径 403 `BACKUP_IMPORT_PATH_REFUSED`）、`GET …/health`；
+  路由与六个 `backup_*` 工具调用同一组 runner（无第二份实现），`dry_run` 是 `createZipBackup` 的选项。
+  面板：「备份&还原」新增**「归档」tab**（归档列表 / 创建（含 dry-run）/ 校验结果表 / 恢复计划→确认 apply /
+  导入 ZIP），仓库 tab 在归档行缺席时保持原样；备份面板入口在 **backup 或 archive 任一可用**时注册
+  （否则出厂 profile（`dsh-backup` 关、`dsh-backup-plugin` 开）就没有入口）。
+- **B1 侧边栏同步**：三行（backup / gpw / desktop）新增只读 `GET /api/w2m/<row>/health`（200 常量、无副作用、
+  行缺席即 404；desktop 的 health 只由 `dsh-desktop` 行的 `apply` 挂载）；客户端并发探测四个端点（800 ms 总预算、
+  `same-origin`、`401`=可用、404/超时/网络错误=缺席），按"每 surface 一本账"做**注册/注销差分**（30 s 仅在页面可见时
+  + `visibilitychange` 复探；结果不变时零动作，无闪烁、无重复 id）。注销用 slots API 自身的 disposer（`inject` 返回的
+  幂等 controller disposer + `register` 返回的 disposer，逆序调用）。
+- **回退**：四个探测全挂（旧宿主无 health 路由）→ 完全按 3.5.5 行为注册所有表面（归档 tab 隐藏），
+  不让"探测失败"变成"按钮全没"。诊断对象 `window.__W2M_SURFACES__ = {ok, available, reasons, probedAt, fallback}`，
+  每个已注册入口带 `[data-w2m-surface="<row>"]`（`display:contents`，不占布局）。
+- **测试**：宿主 health/归档路由（常驻 200、无副作用；归档六路由 + 鉴权 + confirm 门禁 + 路径拒绝）、
+  客户端条件注册（可用/禁用/后启用/后禁用/401/全失败回退）、真实页面探针（归档行启用：诊断权威、GPW/desktop 标记不出现、
+  归档 tab 出现并完成 create→list→verify；归档行禁用：无 tab 栏、无「归档」tab、解锁对话框不变）。
+- `lib/client.js`：609,402 B / 10,035 行（预算 610,000 / 10,050）；为守住字节预算压缩了历史注释并把 12 处 slot 注册
+  收敛到 `mountSlotEntry` 助手——**评审可见的注释删减**，行为不变。
 ## [3.5.5] - 2026-11-21
 
 ### feat(backup): `dsh-backup-plugin`——备份拆成两个独立挂载行，归档工具面带确认令牌与 pre-restore 副本

@@ -29,8 +29,9 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { gunzipSync } from 'node:zlib';
 
 import { documentContract, packageFilesExpansion, requiredShippedEntries } from '../scripts/preflight.mjs';
-import { apply as applyArchivePlugin, TOOL_NAMES } from '../src/plugin/backup-plugin.mjs';
-import { makeHome, tempDir } from './helpers/backup-fixture.mjs';
+import { apply as applyArchivePlugin, ARCHIVE_ROUTE_PATHS, registerArchiveRoutes, TOOL_NAMES } from '../src/plugin/backup-plugin.mjs';
+import { event, header, makeHome, put, tempDir } from './helpers/backup-fixture.mjs';
+import { plaintextSession, writeStoredZip } from './helpers/official-session-zip.mjs';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
@@ -296,14 +297,20 @@ describe('default-disabled and individual enablement, measured by mounting the p
     assert.deepEqual(backupTools, [], 'the repository row must not claim the archive tool surface');
   });
 
-  it('only dsh-backup-plugin enabled: exactly the six tools mount, and no repository route', async () => {
+  it('only dsh-backup-plugin enabled: exactly the six tools mount, and only the archive panel routes', async () => {
     const mounted = await mountRows(rows, ['dsh-backup-plugin']);
     assert.deepEqual(
       mounted.registered.map((definition) => definition.name).sort(),
       [...TOOL_NAMES].sort(),
       'the archive row did not register exactly the six contract tools',
     );
-    assert.deepEqual(mounted.routes, [], 'the archive row must not mount the repository panel routes');
+    // v3.5.6/A1: the row gained its own panel routes (they are what makes the six tools clickable). The
+    // *repository* routes must still be absent: this row has no timer and no repository.
+    assert.deepEqual(
+      mounted.routes.map((route) => route.path).sort(),
+      Object.values(ARCHIVE_ROUTE_PATHS).sort(),
+      'the archive row must mount its own routes and none of the repository routes',
+    );
   });
 
   it('both rows enabled: the two surfaces coexist (one timer/repository, one on-demand archive)', async () => {
@@ -358,5 +365,189 @@ describe('the archive tool surface: definitions', () => {
       cleanup();
       cleanTemp();
     }
+  });
+});
+
+/**
+ * v3.5.6/A1: the archive row's own panel routes.
+ *
+ * These are the routes the panel's 「归档」tab calls. They must be the *same* functions the six tools
+ * call -- the tests below create/verify/plan/apply/import through the routes and read the engine's
+ * results, so a route that re-implemented any of it would fail here as a divergence rather than as a
+ * duplicate the reviewer has to notice.
+ */
+describe('v3.5.6/A1: the archive panel routes', () => {
+  /** Mount the row against a fake context that records its routes, and return a request helper. */
+  async function mountRoutes(overrides = {}) {
+    const home = makeHome({ sessions: [] });
+    const project = tempDir('w2m-a1-project-');
+    const archiveParent = tempDir('w2m-a1-archives-');
+    put(join(project.dir, 'README.md'), '# archive route fixture\n');
+    const backupRoot = join(archiveParent.dir, 'archives');
+    const routes = [];
+    const ctx = {
+      logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
+      tools: { register: () => {} },
+      effect: (callback) => callback(),
+      inject: (_names, callback) => callback({ connection: { fetch: { register: (route) => routes.push(route) } } }),
+    };
+    await applyArchivePlugin(ctx, {
+      dshHome: home.home,
+      backupRoot,
+      projectRoot: project.dir,
+      workspace: project.dir,
+      includeProject: true,
+      includeSessions: false,
+      includeProfile: false,
+      ...overrides,
+    });
+    const call = async (path, method = 'GET', body) => {
+      const route = routes.find((entry) => entry.path === path);
+      assert.ok(route !== undefined, `no route registered for ${path}`);
+      const init = { method };
+      if (body !== undefined) {
+        init.body = JSON.stringify(body);
+        init.headers = { 'content-type': 'application/json' };
+      }
+      const response = await route.fetch(new Request('http://local.invalid' + path, init));
+      return { status: response.status, body: await response.json() };
+    };
+    return {
+      home: home.home,
+      project: project.dir,
+      backupRoot,
+      routes,
+      call,
+      cleanup: () => {
+        home.cleanup();
+        project.cleanup();
+        archiveParent.cleanup();
+      },
+    };
+  }
+
+  it('registers the five panel routes plus the probe, and the probe creates nothing', async () => {
+    const fx = await mountRoutes();
+    try {
+      assert.deepEqual(fx.routes.map((route) => route.path).sort(), Object.values(ARCHIVE_ROUTE_PATHS).sort());
+      const health = await fx.call(ARCHIVE_ROUTE_PATHS.health);
+      assert.equal(health.status, 200);
+      assert.deepEqual(health.body, { ok: true, row: 'dsh-backup-plugin', mounted: true });
+      assert.equal(existsSync(fx.backupRoot), false, 'the availability probe must not create the archive root');
+      const status = await fx.call(ARCHIVE_ROUTE_PATHS.status);
+      assert.equal(status.status, 200);
+      assert.equal(status.body.ok, true);
+      assert.equal(status.body.archive_root, fx.backupRoot);
+      assert.deepEqual(status.body.archives, []);
+      assert.equal(status.body.archive_count, 0);
+      assert.equal(status.body.restore_confirm_token, 'restore', 'the panel reads the token it must send');
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  it('plans a create with dry_run without writing, then writes one and verifies it', async () => {
+    const fx = await mountRoutes();
+    try {
+      const dry = await fx.call(ARCHIVE_ROUTE_PATHS.create, 'POST', { label: 'route', dry_run: true });
+      assert.equal(dry.body.ok, true, dry.body.detail);
+      assert.equal(dry.body.dry_run, true);
+      assert.equal(dry.body.files, 1);
+      assert.equal(existsSync(fx.backupRoot), false, 'dry_run must write nothing');
+
+      const created = await fx.call(ARCHIVE_ROUTE_PATHS.create, 'POST', { label: 'route' });
+      assert.equal(created.body.ok, true, created.body.detail);
+      assert.equal(existsSync(created.body.archive), true);
+
+      const status = await fx.call(ARCHIVE_ROUTE_PATHS.status);
+      assert.equal(status.body.archive_count, 1);
+      assert.equal(status.body.archives[0].archive, created.body.archive, 'the list is newest first');
+
+      const verified = await fx.call(ARCHIVE_ROUTE_PATHS.verify, 'POST', { archive: created.body.archive });
+      assert.equal(verified.body.ok, true);
+      assert.equal(verified.body.checked, 1);
+      assert.deepEqual(verified.body.missing, []);
+      assert.deepEqual(verified.body.mismatched, []);
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  it('plans a restore, refuses apply without the confirmation token, and applies with it', async () => {
+    const fx = await mountRoutes();
+    const target = tempDir('w2m-a1-restore-');
+    try {
+      const created = await fx.call(ARCHIVE_ROUTE_PATHS.create, 'POST', {});
+      const archive = created.body.archive;
+      const plan = await fx.call(ARCHIVE_ROUTE_PATHS.restore, 'POST', { archive, mode: 'plan', targetProject: target.dir });
+      assert.equal(plan.body.ok, true, plan.body.detail);
+      assert.equal(plan.body.mode, 'plan');
+      assert.equal(existsSync(join(target.dir, 'README.md')), false, 'a plan writes nothing');
+
+      const refused = await fx.call(ARCHIVE_ROUTE_PATHS.restore, 'POST', { archive, mode: 'apply', targetProject: target.dir });
+      assert.equal(refused.body.ok, false);
+      assert.equal(refused.body.reason_code, 'BACKUP_RESTORE_CONFIRM_REQUIRED');
+      assert.equal(existsSync(join(target.dir, 'README.md')), false, 'the refusal wrote nothing');
+
+      const applied = await fx.call(ARCHIVE_ROUTE_PATHS.restore, 'POST', { archive, mode: 'apply', confirm: 'restore', targetProject: target.dir });
+      assert.equal(applied.body.ok, true, applied.body.detail);
+      assert.equal(readFileSync(join(target.dir, 'README.md'), 'utf8'), '# archive route fixture\n');
+      assert.ok(applied.body.pre_restore !== undefined, 'the apply result carries the pre-restore record');
+    } finally {
+      target.cleanup();
+      fx.cleanup();
+    }
+  });
+
+  it('refuses an import path outside the allowed roots, and a body with nothing to import', async () => {
+    const fx = await mountRoutes();
+    try {
+      // One level above the OS temp directory: every allowed root (home, project, archive root, temp) is
+      // inside tmpdir, so this path cannot be named by an allowed root.
+      const outside = await fx.call(ARCHIVE_ROUTE_PATHS.importZip, 'POST', { zip: join(tmpdir(), '..', 'outside-the-roots-9f3a.zip') });
+      assert.equal(outside.status, 403);
+      assert.equal(outside.body.reason_code, 'BACKUP_IMPORT_PATH_REFUSED');
+      assert.match(outside.body.detail, /outside the allowed roots/u);
+
+      const empty = await fx.call(ARCHIVE_ROUTE_PATHS.importZip, 'POST', {});
+      assert.equal(empty.status, 400);
+      assert.equal(empty.body.reason_code, 'BACKUP_ARCHIVE_MISSING');
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  it('imports an uploaded official ZIP through the same importer the tool uses', async () => {
+    const fx = await mountRoutes();
+    try {
+      const exportedId = 'session-99999999-8888-7777-6666-555555555555';
+      const zip = writeStoredZip([
+        { name: 'session.v4.jsonl', data: plaintextSession(header(exportedId, { cwd: fx.project }), [event(0), event(1)]) },
+      ]);
+      const imported = await fx.call(ARCHIVE_ROUTE_PATHS.importZip, 'POST', { name: 'dsh-session-route.zip', data_base64: zip.toString('base64') });
+      assert.equal(imported.body.ok, true, imported.body.detail);
+      assert.equal(imported.body.written.length, 1);
+      assert.notEqual(imported.body.written[0].session_id, exportedId, 'the import allocates a new session id');
+      assert.equal(imported.body.workspace, fx.project);
+      assert.equal(imported.body.attach.ok, true, JSON.stringify(imported.body.attach));
+    } finally {
+      fx.cleanup();
+    }
+  });
+
+  it('answers a wrong method with the named 405, and mounts nothing without the Connection service', async () => {
+    const fx = await mountRoutes();
+    try {
+      const wrong = await fx.call(ARCHIVE_ROUTE_PATHS.verify, 'GET');
+      assert.equal(wrong.status, 405);
+      assert.equal(wrong.body.reason_code, 'METHOD_NOT_ALLOWED');
+    } finally {
+      fx.cleanup();
+    }
+    // No Connection service means no route at all, which is the "row not mounted" answer: 404.
+    const status = registerArchiveRoutes({}, {});
+    assert.equal(status.mounted, false);
+    assert.match(status.reason, /Connection/u);
+    assert.deepEqual([...status.paths].sort(), Object.values(ARCHIVE_ROUTE_PATHS).sort());
   });
 });

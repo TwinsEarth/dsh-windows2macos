@@ -195,6 +195,17 @@ const OVERLAY = `# Written by test/loader-entry.test.mjs: keep the plugin's stat
  */
 const ROUTE_DEFECT_ENV = 'W2M_ROUTE_DEFECT';
 
+/**
+ * v3.5.6/B1: the mixed-availability probe.
+ *
+ * The throwaway profile ships every UI row `disabled: true`, so the client can only ever take its
+ * all-failed fallback there. Setting this makes the test enable **the archive row and nothing else** in
+ * the installed profile's copy of the bundle patch (never in the tree under test), which is the one state
+ * that proves both halves of B1 at once: an enabled row registers, a disabled row does not, and the
+ * archive tab appears only because its row answered.
+ */
+const SURFACES_PROBE_ENV = 'W2M_SURFACES_PROBE';
+
 /** The web app's own flags: an OS-chosen port, and no browser launch from a test. */
 const APP_ARGS = ['--port', '0', '--no-open'];
 
@@ -428,6 +439,17 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
       await fsp.writeFile(installedRoute, patched, 'utf8');
     }
 
+    if (process.env[SURFACES_PROBE_ENV] === '1') {
+      // Enable the archive row in the installed profile's copy of the bundle patch (never in the tree under
+      // test). The other three UI rows keep their shipped `disabled: true`, so the page sees one mounted row
+      // and three absent ones -- the mixed state that proves both directions of B1.
+      const patchPath = path.join(profileDir, 'node_modules', '@twinsearth', 'w2m-dsh-plugin', 'cordis.patch.yml');
+      const patchSource = await fsp.readFile(patchPath, 'utf8');
+      const patched = patchSource.replace(/(- id: dsh-backup-plugin[\s\S]*?disabled: )true/u, '$1false');
+      assert.notEqual(patched, patchSource, `${SURFACES_PROBE_ENV}=1 could not find the archive row to enable in ${patchPath}`);
+      await fsp.writeFile(patchPath, patched, 'utf8');
+    }
+
     const booted = await run(
       installation.runtime,
       [
@@ -589,6 +611,70 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
       activation.seats.includes('conversation.input.left'),
       `the entry activated without registering into the composer: seats ${JSON.stringify(activation.seats)}`,
     );
+  });
+
+  it('reports the surface diagnostics and marks every registered entry', async (t) => {
+    if (skipReason !== null) return t.skip(skipReason);
+    const page = report.clientPage;
+    assert.ok(page !== undefined, 'the driver reported no page boot');
+    if (typeof page.skipped === 'string') return t.skip(page.skipped);
+    const surfaces = page.surfaces;
+    assert.ok(surfaces !== null && surfaces?.diag !== null, `the page exposed no surface diagnostics: ${JSON.stringify(surfaces)}`);
+    const { available = {}, fallback } = surfaces.diag;
+    for (const key of ['gpw', 'backup', 'desktop', 'archive']) {
+      assert.equal(typeof available[key], 'boolean', `__W2M_SURFACES__.available.${key} is a boolean`);
+      assert.equal(typeof surfaces.diag.reasons?.[key], 'string', `__W2M_SURFACES__.reasons.${key} names the probe outcome`);
+    }
+    assert.equal(typeof surfaces.diag.probedAt, 'string', 'the diagnostics say when they were probed');
+    const markers = new Set(surfaces.markers ?? []);
+    assert.equal(markers.has('archive'), false, 'the archive surface has no slot entry of its own: it is a tab');
+    if (fallback === true) {
+      // The throwaway profile disables every UI row, which is exactly the "probe cannot decide" case: the
+      // entries must stay, because a probe failure must never make working buttons disappear.
+      for (const key of ['gpw', 'backup', 'desktop']) assert.ok(markers.has(key), `the fallback keeps the ${key} entry`);
+      assert.equal(available.archive, false, 'the fallback does not invent an archive surface');
+    } else {
+      for (const key of ['gpw', 'desktop']) {
+        assert.equal(markers.has(key), available[key] === true, `the ${key} entry follows its probe (available=${String(available[key])})`);
+      }
+      // The backup panel is reachable when *either* backend row answers, because the archive tab lives
+      // inside it (design A1): an enabled archive row with a disabled repository row still needs a door.
+      assert.equal(
+        markers.has('backup'),
+        available.backup === true || available.archive === true,
+        `the backup panel follows its row or the archive row (backup=${String(available.backup)}, archive=${String(available.archive)})`,
+      );
+    }
+  });
+
+  it('shows the archive tab only for an enabled archive row', async (t) => {
+    if (skipReason !== null) return t.skip(skipReason);
+    if (process.env[SURFACES_PROBE_ENV] !== '1') {
+      return t.skip(`${SURFACES_PROBE_ENV}=1 enables the archive row in the throwaway profile and drives this probe`);
+    }
+    const page = report.clientPage ?? {};
+    const probe = page.surfacesProbe ?? {};
+    assert.equal(page.surfaces?.diag?.ok, true, `the probes must be authoritative with one row enabled: ${JSON.stringify(page.surfaces?.diag)}`);
+    assert.equal(page.surfaces?.diag?.available?.archive, true, 'the enabled archive row answers');
+    assert.equal(page.surfaces?.diag?.available?.backup, false, 'the repository row stays disabled');
+    assert.equal(probe.opened?.found, true, 'the panel is reachable because the archive row made it so, with the repository row off');
+    assert.equal(probe.panel?.panel, true, 'clicking the backup entry opens the panel page');
+    assert.equal(probe.panel?.tabs, true, 'the tab bar appears only with an available archive surface');
+    assert.equal(probe.clicked?.clicked, true, 'the 归档 tab accepts a click');
+    assert.equal(probe.archive?.status, true, 'the 归档 tab renders the archive view');
+    assert.equal(probe.created?.clicked, true, 'the 归档 tab offers a create action');
+    assert.ok(Number(probe.listed?.rows) >= 1, `the created archive appears in the list: ${JSON.stringify(probe.listed)}`);
+    assert.ok(Number(probe.listed?.verifyButtons) >= 1, 'each archive row offers 校验');
+    assert.ok(Number(probe.listed?.planButtons) >= 1, 'each archive row offers 恢复计划');
+    assert.equal(probe.verified?.clicked, true, 'the verify action accepts a click');
+    assert.equal(probe.verifiedCard?.present, true, `the verification result renders: ${JSON.stringify(probe.verifiedCard)}`);
+    assert.deepEqual([...(probe.verifiedCard?.counts ?? [])].sort(), ['checked', 'extras', 'mismatched', 'missing'], 'the result table reports checked/missing/mismatched/extras');
+    assert.equal(probe.archive?.create, true, 'the tab offers create');
+    assert.equal(probe.archive?.import, true, 'the tab offers the ZIP import');
+    assert.equal(probe.archive?.repoStatus, false, 'the repository cards are not rendered behind the archive tab');
+    for (const key of ['gpw', 'desktop']) {
+      assert.equal((probe.archive?.markers ?? []).includes(key), false, `the disabled ${key} row has no entry`);
+    }
   });
 
   it('boots the profile’s own page in a browser, and the control arrives', async (t) => {
@@ -811,6 +897,10 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
       const unlock = page.backupProbe ?? {};
       assert.equal(unlock.backupOpened?.found, true, 'the left sidebar carries the backup entry');
       assert.equal(unlock.backupPanel?.open, true, 'clicking it opens the backup panel page');
+      // v3.5.6/A1: this profile has the archive row disabled, so its probe answers 404 and the tab must be
+      // absent -- the other direction of "the tab appears only for an enabled archive row".
+      assert.equal(unlock.backupPanel?.tabs, false, 'a disabled archive row renders no tab bar');
+      assert.equal(unlock.backupPanel?.archiveTab, false, 'a disabled archive row renders no 归档 tab');
       assert.equal(unlock.backupPanel?.trigger, true, 'the unlock card carries the dialog trigger');
       assert.equal(unlock.unlockOpened?.found, true, 'clicking the trigger opens the unlock dialog');
       const dialog = unlock.unlockDialog ?? {};

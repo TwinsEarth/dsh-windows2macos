@@ -106,6 +106,13 @@ export const GPW_RESET_ROUTE = '/api/w2m/gpw/reset';
 export const GPW_AI_ROUTE = '/api/w2m/gpw/ai';
 export const GPW_AI_CONFIG_ROUTE = '/api/w2m/gpw/ai/config';
 export const GPW_AI_TEST_ROUTE = '/api/w2m/gpw/ai/test';
+/**
+ * Availability probe (v3.5.6/B1): a constant 200 while this row is mounted.
+ *
+ * The client polls it before registering the GPW launcher, sidebar entry and main page. It reads no
+ * policy file and creates nothing -- a disabled row has no route at all, so the answer is 404.
+ */
+export const GPW_HEALTH_ROUTE = '/api/w2m/gpw/health';
 
 const DEFAULT_BUDGET = { maxPerWindow: 10, windowMs: 60_000, minGapMs: 3_000 };
 const DEFAULT_PENDING_TIMEOUT_MS = 10_000;
@@ -796,6 +803,14 @@ export function apply(ctx, config = {}) {
     const registry = webCtx?.connection?.fetch;
     if (registry === undefined || typeof registry.register !== 'function') return;
     const json = (body, status = 200) => Response.json(body, { status, headers: NO_STORE });
+
+    // v3.5.6/B1: the availability probe the client polls before it registers any GPW surface.
+    registry.register({
+      path: GPW_HEALTH_ROUTE,
+      methods: ['GET'],
+      requestBody: 'buffered',
+      fetch: async () => json({ ok: true, row: 'dsh-gpw', mounted: true }),
+    });
 
     registry.register({
       path: GPW_ROUTE,

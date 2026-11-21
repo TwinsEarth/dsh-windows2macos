@@ -13,7 +13,7 @@
       "name": "w2m-fleet",
       "source": "./",
       "description": "Read fleet state and dispatch commands across the machines registered to one account. Read-only MCP surface: the five exposed tools cannot change anything.",
-      "version": "3.5.5",
+      "version": "3.5.6",
       "author": {
         "name": "TwinsEarth"
       },
@@ -27,5 +27,5 @@
       ]
     }
   ],
-  "version": "3.5.5"
+  "version": "3.5.6"
 }

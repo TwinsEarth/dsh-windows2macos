@@ -202,3 +202,17 @@ powershell -NoProfile -File tools\dsh-workspace-guard.ps1 -Fix    # 先备份、
 
 自洽时输出 `consistent` 并返回 0；发现悬空 `workspaceIds` / 未列行 / 无效默认时返回 1，`-Fix` 备份后自愈，
 重启客户端生效。完整规则与上游 issue 草稿见 [WORKSPACE-REGISTRY.md](WORKSPACE-REGISTRY.md)。
+
+## 9. 归档面板与 surface 探测（3.5.6）
+
+归档行不再只有工具：它挂六条面板路由 `GET /api/w2m/backup/archive/status`、`POST …/create`、`POST …/verify`、
+`POST …/restore`、`POST …/import-zip`、`GET …/health`，路由与六个 `backup_*` 工具**共用同一组 runner**
+（`runListArchives` / `runCreateArchive` / `runVerifyArchive` / `runRestoreArchive` / `runImportSessionZip`），
+所以"面板做的"与"Agent 调工具做的"是同一份实现。UI 上它是「备份&还原」面板里的**「归档」tab**，不新增第四个侧边栏按钮；
+恢复仍要求 `confirm:"restore"`，覆盖前仍有 pre-restore 副本。
+
+同一版本里，三个 UI 行（backup / gpw / desktop）各有一个只读 `GET /api/w2m/<row>/health`。客户端启动时并发探测，
+只有答 200（或 401 = 需要授权但已挂载）的 surface 才注册侧边栏/main 条目；页面可见时每 30 s 与 `visibilitychange`
+复探，按差分注册/注销。**四个探测全失败时回退到旧行为**（全部注册，面板内提示未启用），并把
+`window.__W2M_SURFACES__` 留在页面上供排障。
+

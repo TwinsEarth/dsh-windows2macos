@@ -126,6 +126,15 @@ export const inject = [];
 /** Path of the write route (GET reads the state, POST runs a backup). */
 export const BACKUP_RUN_ROUTE_PATH = '/api/w2m/backup/run';
 
+/**
+ * Availability probe (v3.5.6/B1): a constant 200 while this row is mounted.
+ *
+ * The client polls it to decide whether the backup sidebar entry exists at all. It answers without
+ * reading the repository, writing state, or touching `$DSH_HOME`: a probe that created a directory would
+ * change the very thing it reports on. A disabled/unmounted row has no route, so the answer is 404.
+ */
+export const BACKUP_HEALTH_ROUTE_PATH = '/api/w2m/backup/health';
+
 /** Restore plan/apply route (v3.4.8). A POST needs `{"confirm":"restore"}`. */
 export const BACKUP_RESTORE_ROUTE_PATH = '/api/w2m/backup/restore';
 
@@ -881,6 +890,14 @@ export function apply(ctx, config = {}, deps = {}) {
     ctx.inject(['connection'], (webCtx) => {
       const registry = webCtx?.connection?.fetch;
       if (registry === undefined || typeof registry.register !== 'function') return;
+      // v3.5.6/B1: the availability probe the client polls. Mounting this row is the answer, so the payload is
+      // a constant: no repository read, no state write, no directory creation.
+      registry.register({
+        path: BACKUP_HEALTH_ROUTE_PATH,
+        methods: ['GET'],
+        requestBody: 'buffered',
+        fetch: async () => Response.json({ ok: true, row: 'dsh-backup', mounted: true }, { headers: NO_STORE }),
+      });
       registry.register({
         path: BACKUP_RUN_ROUTE_PATH,
         methods: ['GET', 'POST'],
