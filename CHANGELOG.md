@@ -2,6 +2,38 @@
 
 All notable changes to this project are documented here.
 
+## [3.5.5] - 2026-11-21
+
+### feat(backup): `dsh-backup-plugin`——备份拆成两个独立挂载行，归档工具面带确认令牌与 pre-restore 副本
+
+- 包新增子路径导出 `./dsh-backup-plugin` → `lib/backup-plugin.js`（组合根 `src/plugin/backup-plugin.mjs`），
+  挂载六个 `backup_*` 工具：`backup_status` / `backup_list` / `backup_create` / `backup_verify` /
+  `backup_restore` / `backup_import_session_zip`。归档是自包含明文 ZIP（容器 `src/backup/zip.mjs`、
+  引擎 `src/backup/zip-archive.mjs`），与 `dsh-backup` 的内容寻址仓库是**两个产品**：归档行不挂定时器、
+  不挂面板路由、不碰仓库。
+- `cordis.patch.yml` 现在带**两个都 `disabled: true`** 的备份行：`dsh-backup`（定时仓库）与
+  `dsh-backup-plugin`（按需归档工具面）。启用是操作者的决定；两行可以同时启用（一个定时仓库 + 一个按需
+  归档），不再有 `BACKUP_ALREADY_MOUNTED` 式互斥——3.5.4 草稿把归档行写成第二个定时器，那个冲突在
+  3.5.5 的实现里不存在。
+- 归档行默认值：`backupRoot: ''`（解析为 `<DSH_HOME>/backups/w2m-dsh-backup-plugin`）、
+  `includeProject: true`、`includeSessions: true`、`includeProfile: false`、`keepBackups: 0`、
+  `maxFileBytes: 67108864`（64 MiB/条目，超限记入 `skipped` 而不是截断）。
+- `backup_restore`：`plan` 零写入；`apply` 必须 `confirm: "restore"`，缺令牌返回
+  `BACKUP_RESTORE_CONFIRM_REQUIRED` 且不写任何文件；写盘前把每个将被覆盖的文件复制到
+  `<DSH_HOME>/.w2m-restore-backups/archive-<UTC stamp>/<project|profile>/…`（结果里的 `pre_restore`），
+  副本失败则整次拒绝。会话默认分配新 id；`keepSessionIds` 冲突即拒绝（`BACKUP_SESSION_ID_CONFLICT`）；
+  根会话经 `src/backup/registry.mjs` 的"计划 → 原子写 → 读回"协议挂到目标 workspace。
+- `backup_import_session_zip`：导入 DSH 官方会话导出 ZIP（`session.v4.jsonl` + `subagents/` + `media/` +
+  `files/`），把明文 JSONL 重编码成存储 zstd 帧序列（首帧恰好一行 header），默认分配新 id，附件落到
+  `attachments/v1/{objects,files}/…`，根会话挂到目标 workspace。实现是 `src/backup/session-zip.mjs`，
+  不新增第二套注册表逻辑。
+- 测试：`test/backup-subplugin.test.mjs`（13 项：导出解析、两行默认值、逐行挂载、六个工具定义、文档与
+  tarball）+ 新增 `test/backup-subplugin-e2e.test.mjs`（9 项：临时 HOME 上 status → list → create → verify →
+  restore(plan/缺 confirm 拒绝/apply/覆盖前副本) → import 官方 ZIP）；`test/backup-wiring.test.mjs` 的仓库行
+  断言同步改为 `disabled: true`。
+- 文档：新增 `docs/BACKUP-SUBPLUGIN.md`（随 `docs/` 发布），按 3.5.5 实现描述两行、默认值、六个工具、
+  确认令牌与 pre-restore 副本、ZIP 导入；协议本身仍以 `docs/BACKUP-DESIGN.md` 为准。
+
 ## [3.5.4] - 2026-11-21
 
 ### feat(fix): `session-reframe`——修复"首帧带事件"的 v4 会话日志（未发布）

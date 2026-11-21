@@ -1,0 +1,74 @@
+{
+  "version": "3.5.5",
+  "case": "BACKUP-SUBPLUGIN-355",
+  "kind": "positive",
+  "machines": [
+    "TOFUTURE"
+  ],
+  "executed_at": "2026-11-21T01:53:00.000Z",
+  "executor": "agent",
+  "task_id": "w2m-v355-backup-subplugin",
+  "requirement": "v3.5.5: finish the archive backup subplugin (>=3.5.5 spec in test/backup-subplugin.test.mjs). The package must export ./dsh-backup-plugin -> lib/backup-plugin.js, mount exactly the six backup_* tools with no timer or panel route, ship BOTH backup rows as disabled: true in cordis.patch.yml (dsh-backup and dsh-backup-plugin), configure the archive row with an empty backupRoot default plus includeProject/includeSessions/includeProfile/keepBackups/maxFileBytes, let the two rows coexist (one scheduled repository + one on-demand archive), and pass the reconstructed end-to-end flow (status/list/create/verify/restore plan+apply with confirm and pre-restore copies/import official session ZIP).",
+  "commands": [
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/backup-subplugin.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/backup-subplugin-e2e.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/backup-subplugin.test.mjs",
+      "test/backup-subplugin-e2e.test.mjs",
+      "test/backup-wiring.test.mjs"
+    ],
+    [
+      "node",
+      "--test",
+      "--test-force-exit",
+      "test/claims.test.mjs",
+      "test/acceptance-doc.test.mjs"
+    ],
+    [
+      "node",
+      "scripts/layer-check.mjs"
+    ],
+    [
+      "node",
+      "scripts/scan-mojibake.mjs"
+    ],
+    [
+      "npx",
+      "eslint",
+      "."
+    ],
+    [
+      "node",
+      "scripts/pack.mjs"
+    ]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "test_spec": "test/backup-subplugin.test.mjs: 13/13 pass, 0 fail. Covers the whole package export map resolving to real files, ./dsh-backup-plugin -> ./lib/backup-plugin.js and ./dsh-backup -> ./lib/backup.js, Node self-reference imports of both subpaths, the six-tool export (~TOOL_NAMES length 6), every named module present in package.json#files and in a freshly packed tarball, the shipped document naming both rows and all six tools, both patch rows disabled:true, the archive row's empty backupRoot and tool-surface config, and four mount scenarios measured through the real package entries against a fake Cordis context (neither row enabled: no tools/no route; dsh-backup only: routes and no backup_* tool; dsh-backup-plugin only: exactly six tools and no route; both rows: both surfaces).",
+      "e2e": "test/backup-subplugin-e2e.test.mjs: 9/9 pass, 0 fail, ~0.34 s. Temp DSH home + temp project + temp archive root: mount registers six tools; backup_status creates no archive directory and no recovery directory; backup_list reports an absent root as an empty list; backup_create writes one archive (2 project files + 1 bound session, node_modules excluded, skipped=0); backup_verify checks 3 entries with no missing/mismatched/extras; backup_restore plan writes nothing; apply without confirm is refused with BACKUP_RESTORE_CONFIRM_REQUIRED and writes no project file, no session and no copy; apply with confirm:\"restore\" restores 2 files, allocates a new session id and registers it in the restored workspace; a second apply with overwrite:true copies the pre-write bytes to <DSH_HOME>/.w2m-restore-backups/archive-<stamp>/project/README.md before restoring and reports restored.pre_restore_files=1; backup_import_session_zip imports an official stored-ZIP export (written by test/helpers/official-session-zip.mjs, not by the production writer) under a new id, lands both media and files/ attachments, and registers the root session.",
+      "regressions": "The combined run of the two new suites plus test/backup-wiring.test.mjs is 44/44 pass, 0 fail. backup-wiring.test.mjs's old assertion that the dsh-backup row ships enabled was updated to the v3.5.5 contract (disabled: true), and its row/schedule/scope assertions still pass.",
+      "shipped_defaults": "cordis.patch.yml: dsh-backup disabled:true (repository timer/routes, backupTimes ['22:00:00'], backupScopes six-scope default unchanged) and dsh-backup-plugin disabled:true with backupRoot: '', includeProject: true, includeSessions: true, includeProfile: false, keepBackups: 0, maxFileBytes: 67108864. normalizePluginConfig() resolves backupRoot '' to <DSH_HOME>/backups/w2m-dsh-backup-plugin and defaults dshHome to DSH_HOME/~/.dsh; tool arguments cannot change those base paths.",
+      "tool_surface": "Exactly six tools mount from the archive row: backup_status, backup_list, backup_create, backup_verify, backup_restore, backup_import_session_zip. Each definition has a name, non-empty description, parameters object and output.render; backup_status declares zero parameters; the definitions test also asserts backup_create's projectRoot/workspace/includeProject/includeSessions/includeProfile keys, backup_verify's archive, backup_restore's mode and backup_import_session_zip's zip.",
+      "coexistence": "Both rows can be enabled together by design: dsh-backup mounts the scheduled content-addressed repository plus panel routes, dsh-backup-plugin mounts only the stateless archive tool surface. There is no second timer or duplicate route, so no BACKUP_ALREADY_MOUNTED refusal exists in this shape; the 3.5.4 prose that described the archive row as a second scheduler was corrected in docs/BACKUP-SUBPLUGIN.md and in the patch comments.",
+      "restore_safety": "restoreZipBackup() is plan-first: plan performs no writes and reports the exact files pre_restore would copy. apply requires confirm === \"restore\" (BACKUP_RESTORE_CONFIRM_REQUIRED otherwise) and copies every existing file it would overwrite into <DSH_HOME>/.w2m-restore-backups/archive-<UTC stamp>/{project,profile}/... before the first write; a copy failure refuses the restore with BACKUP_WRITE_FAILED. Sessions are allocated new ids by default; keepSessionIds collisions refuse with BACKUP_SESSION_ID_CONFLICT instead of overwriting.",
+      "zip_import": "Official export ZIP (session.v4.jsonl + optional subagents/... + media/<sha256:hex>.<ext> + files/<ab>/<digest>/<name>) is decoded as plaintext JSONL, re-encoded as the stored zstd frame sequence with the header alone in frame 0, written under sessions/<projectKey(workspace)>/<new-id>/session.v4.jsonl.zstd, and attached to the workspace registry through src/backup/registry.mjs. Media lands at attachments/v1/objects/<ab>/<digest>; files/ entries land at attachments/v1/files/<ab>/<digest>/<name>; unsafe names are skipped, not written. Exactly one root session is required (NO_ROOT / ROOT_AMBIGUOUS otherwise).",
+      "docs_and_version": "docs/BACKUP-SUBPLUGIN.md was rewritten to the implemented 3.5.5 design (rows/defaults/tool surface/restore confirmation/pre-restore copies/zip import); it remains covered by package.json#files and is named by the spec's shipped-document test. CHANGELOG.md gained an additive 3.5.5 section: git diff --numstat reports 32 insertions / 0 deletions and the file's pre-existing mixed line endings (12259 CRLF + 145 LF lines, plus one line ending in a doubled carriage return before its newline) are byte-preserved. Version 3.5.5 is set in package.json, plugin.json, .claude-plugin/plugin.json, .claude-plugin/marketplace.json (metadata, plugin entry and top-level) and codex/mcp-servers.toml.",
+      "pack": "node scripts/pack.mjs succeeds from the edited tree; the tarball carries lib/backup-plugin.js, src/plugin/backup-plugin.mjs, src/backup/zip.mjs, src/backup/zip-archive.mjs, src/backup/session-zip.mjs and docs/BACKUP-SUBPLUGIN.md, and its packed package.json is the tree manifest at 3.5.5.",
+      "honesty": "Every command above ran locally on the Windows host TOFUTURE in this checkout. The suites use mkdtempSync DSH homes, projects, workspaces and archive roots only; no real DSH profile or DSH_HOME was mounted, enabled, restored into or written, no real machine was upgraded, and no GUI, relay or real-machine behaviour is claimed here."
+    }
+  }
+}

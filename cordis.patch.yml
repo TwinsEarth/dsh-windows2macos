@@ -179,15 +179,18 @@
       config:
         maxRepairsPerTurn: 3
 
-    # 备份&还原 (dsh-backup): scheduled session backup (default 22:00 Asia/Shanghai) plus the
-    # `POST /api/w2m/backup/run` route the panel calls. It ships `disabled: false`: the panel and the 22:00 timer ARE the product, and the operator can switch the row off
-    # dsh-gpw does: this is the first W2M row whose timer WRITES to disk, so it must be discoverable in
-    # the plugin manager and turned on by an explicit operator action -- not arrive with the package.
+    # 备份&还原 (dsh-backup): the scheduled, content-addressed repository engine -- the 22:00 timer (default
+    # Asia/Shanghai) and the `POST /api/w2m/backup/run` route the panel calls. The engine keeps sealed/plaintext
+    # repository state, rotation and the panel routes; docs/BACKUP-DESIGN.md is its protocol.
+    #
+    # It ships `disabled: true`: this is the first W2M row whose timer WRITES to disk unattended, so it must be
+    # discoverable in the plugin manager and turned on by an explicit operator action -- not arrive with the package.
+    # Enabling the row is the decision; `ctx.effect` guarantees its timer dies with the row.
     # Offline CLI: `w2m-backup` (`run` / `status` / `scan` / `list` / `gc` / `selftest`).
-    # Design + protocol: docs/BACKUP-DESIGN.md.
+    # Archive tool surface (a separate, stateless row): docs/BACKUP-SUBPLUGIN.md.
     - id: dsh-backup
       name: '@twinsearth/w2m-dsh-plugin/dsh-backup'
-      disabled: false
+      disabled: true
       config:
         backupDir: 'D:\DeepSeekHarness\BackUP'
         backupTimes: ['22:00:00']
@@ -219,5 +222,31 @@
         # §25 账户 ID 绑定解锁（用户决定）：只读取账户唯一识别码做比对，一致免密放行；不是机密性路径。
         # 只对 sealed 仓库生效；none 仓库永不绑定（它本来就不需要凭据）。
         backupAccountBinding: true
+
+    # 备份&还原 · 独立挂载 (dsh-backup-plugin): the **stateless archive tool surface** as its own row -- the six
+    # `backup_*` tools (`status` / `list` / `create` / `verify` / `restore` / `import_session_zip`) whose backups are
+    # self-contained ZIP files rather than a repository.
+    #
+    # It mounts NO timer, NO panel route and NO repository: every call reads or writes exactly one archive. That is
+    # why it **coexists** with the `dsh-backup` row above instead of replacing it -- one scheduler/repository plus one
+    # on-demand archive surface, with no second timer and no duplicate route to conflict with. The older
+    # `BACKUP_ALREADY_MOUNTED` rule was about two *repository* mounts; this row has no repository to double-mount.
+    #
+    # It ships `disabled: true`: a tool surface that writes archives, and can restore one over a project, must not
+    # arrive because someone installed the fleet plugin. Enabling it is the operator's decision.
+    # Docs: docs/BACKUP-SUBPLUGIN.md. Protocol: docs/BACKUP-DESIGN.md.
+    - id: dsh-backup-plugin
+      name: '@twinsearth/w2m-dsh-plugin/dsh-backup-plugin'
+      disabled: true
+      config:
+        # Empty = resolve the default, <DSH_HOME>/backups/w2m-dsh-backup-plugin. Set a path to collect archives elsewhere.
+        backupRoot: ''
+        includeProject: true
+        includeSessions: true
+        includeProfile: false
+        # 0 = keep every archive; the archive engine prunes only when this is a positive integer.
+        keepBackups: 0
+        # Per-entry size cap (64 MiB): a larger project file is reported as skipped, never truncated.
+        maxFileBytes: 67108864
 
 
