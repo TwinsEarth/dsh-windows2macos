@@ -560,9 +560,15 @@ export function verifyZipBackup(input) {
  * does not verify is refused before a single file is planned, and an archive whose stored sessions cannot be decoded
  * is refused by name rather than restored without them.
  *
+ * `keepSessionIds` collides by refusal (`BACKUP_SESSION_ID_CONFLICT`); `forceRunning` is the explicit way past that
+ * collision: the existing session directory is copied to
+ * `<DSH_HOME>/.w2m-restore-backups/sessions-<UTC>/<projectKey>/<id>/` and replaced, and every replacement is
+ * reported in `replaced` (`{session_id, backup, file}`). Without `keepSessionIds` new ids are allocated, so
+ * `forceRunning` changes nothing there.
+ *
  * @param {{archive: string, config: object, mode?: 'plan'|'apply', confirm?: string, targetProject?: string,
  *   overwrite?: boolean, includeSessions?: boolean, includeProfile?: boolean, keepSessionIds?: boolean,
- *   skipVerify?: boolean, now?: Date}} input
+ *   forceRunning?: boolean, skipVerify?: boolean, now?: Date}} input
  * @returns {object} a plan (mode=plan) or a plan plus what was written (mode=apply)
  */
 export function restoreZipBackup(input) {
@@ -591,6 +597,7 @@ export function restoreZipBackup(input) {
   const includeProfile = input.includeProfile === true;
   const overwrite = input.overwrite === true;
   const keepSessionIds = input.keepSessionIds === true;
+  const forceRunning = input.forceRunning === true;
 
   const plan = {
     archive: read.archive,
@@ -598,7 +605,7 @@ export function restoreZipBackup(input) {
     created_at: manifest.created_at ?? null,
     project_target: projectTarget,
     project: { create: 0, same: 0, conflicts: [] },
-    sessions: { planned: 0, roots: 0, existing_ids: [] },
+    sessions: { planned: 0, roots: 0, existing_ids: [], replace_existing: false },
     profile: { files: 0, conflicts: [] },
     // Filled below: what `apply` would copy to `<DSH_HOME>/.w2m-restore-backups/` before touching the target.
     pre_restore: { dir: null, files: [] },
@@ -668,16 +675,19 @@ export function restoreZipBackup(input) {
     if (keepSessionIds && existing.has(headerId)) plan.sessions.existing_ids.push(headerId);
   }
   if (keepSessionIds && plan.sessions.existing_ids.length > 0) {
-    return {
-      ok: false,
-      mode,
-      reason_code: ZIP_ARCHIVE_CODES.SESSION_ID_CONFLICT,
-      detail: `keepSessionIds was requested but these ids already exist: ${plan.sessions.existing_ids.join(', ')}`,
-      plan,
-      verification,
-    };
+    if (!forceRunning) {
+      return {
+        ok: false,
+        mode,
+        reason_code: ZIP_ARCHIVE_CODES.SESSION_ID_CONFLICT,
+        detail: `keepSessionIds was requested but these ids already exist: ${plan.sessions.existing_ids.join(', ')}; pass forceRunning=true to back each one up and replace it`,
+        plan,
+        verification,
+      };
+    }
+    plan.sessions.replace_existing = true;
   }
-  if (mode === 'plan') return { ok: true, mode: 'plan', plan, verification };
+  if (mode === 'plan') return { ok: true, mode: 'plan', plan, verification, force_running: forceRunning };
 
   // The way back exists BEFORE the first write. A copy that cannot be made refuses the restore rather than leaving a
   // half-restored tree with no recovery material.
@@ -724,10 +734,16 @@ export function restoreZipBackup(input) {
 
   let sessionRestore = null;
   if (includeSessions && sessionRecords.length > 0) {
-    const written = writeSessionSet(sessionRecords, { dshHome: config.dshHome, workspace: projectTarget, keepIds: keepSessionIds });
+    const written = writeSessionSet(sessionRecords, {
+      dshHome: config.dshHome,
+      workspace: projectTarget,
+      keepIds: keepSessionIds,
+      replaceExisting: forceRunning,
+      now: input.now,
+    });
     if (written.ok !== true) return { ok: false, mode, reason_code: written.reason_code, detail: written.detail, plan, verification };
     const attach = attachRootSessions({ dshHome: config.dshHome, workspacePath: projectTarget, written: written.written });
-    sessionRestore = { written: written.written, attach };
+    sessionRestore = { written: written.written, replaced: written.replaced, attach };
   }
 
   let profileFiles = 0;
@@ -751,8 +767,11 @@ export function restoreZipBackup(input) {
       sessions: sessionRestore?.written?.length ?? 0,
       profile_files: profileFiles,
       pre_restore_files: preRestoreFiles.length,
+      replaced: sessionRestore?.replaced?.length ?? 0,
     },
     pre_restore: { dir: preRestoreDir, files: preRestoreFiles },
+    force_running: forceRunning,
+    replaced: sessionRestore?.replaced ?? [],
     sessions: sessionRestore,
   };
 }

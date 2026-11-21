@@ -340,6 +340,20 @@ describe('the archive tool surface: definitions', () => {
       assert.ok('mode' in byName.get('backup_restore').parameters);
       assert.ok('zip' in byName.get('backup_import_session_zip').parameters);
       assert.equal(Object.keys(byName.get('backup_status').parameters).length, 0, 'backup_status must stay read-only with no parameters');
+
+      // `forceRunning` must describe the replacement it performs, not a flag that is merely accepted and echoed:
+      // the old "accepted for contract compatibility" text was the lie this assertion keeps from coming back.
+      for (const tool of ['backup_restore', 'backup_import_session_zip']) {
+        const forceRunning = byName.get(tool).parameters.forceRunning;
+        assert.equal(forceRunning?.type, 'boolean', `${tool} must expose forceRunning`);
+        assert.match(forceRunning.description, /sessions-<UTC>/u, `${tool}: forceRunning must name the recovery copy it makes`);
+        assert.match(forceRunning.description, /replac/iu, `${tool}: forceRunning must say what it replaces`);
+        assert.equal(
+          /accepted for contract compatibility/iu.test(forceRunning.description),
+          false,
+          `${tool}: forceRunning is real semantics now, not an accepted-and-reported flag`,
+        );
+      }
     } finally {
       cleanup();
       cleanTemp();

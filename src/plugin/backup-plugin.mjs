@@ -37,11 +37,14 @@
  *
  * ## `forceRunning`
  *
- * Accepted for contract compatibility on `backup_restore` / `backup_import_session_zip`. The DSH client
- * owns `storages/workspace.json` and rewrites it from memory, so this build never edits that document
- * directly: it plans through `registry.mjs`, writes atomically, reads back, and returns the residual
- * client-overwrite warning with every successful registration. A boolean that changed none of that would
- * be a lie in the tool schema, so it is documented as accepted-and-reported rather than honoured.
+ * The explicit way past a session-id collision on `backup_restore` / `backup_import_session_zip`. With
+ * `keepSessionIds` / `keepIds`, an id that already exists is refused (`BACKUP_SESSION_ID_CONFLICT`) because
+ * overwriting a log in place is data loss. `forceRunning: true` is the caller saying it accepts that risk after a
+ * copy has been made: the existing session directory is moved to
+ * `<DSH_HOME>/.w2m-restore-backups/sessions-<UTC>/<projectKey>/<id>/` first, then replaced by the restored log, and
+ * the replacement is reported in `replaced` (`{session_id, backup, file}`). It is not about the DSH client running:
+ * registry writes still go through `registry.mjs`'s plan -> atomic write -> read-back protocol and still return the
+ * residual client-overwrite warning, because no tool can stop the client from saving its in-memory registry.
  */
 
 import fs from 'node:fs';
@@ -332,7 +335,7 @@ export function buildTools(input) {
   register({
     name: 'backup_restore',
     description:
-      'Plan or apply a restore. mode="plan" (default) reports files to create/conflicts and sessions to import; mode="apply" writes them and requires confirm:"restore". Every file overwritten is copied to <DSH_HOME>/.w2m-restore-backups/ first. Sessions always get new ids unless keepSessionIds=true (refused on collision). Profile files are only touched with includeProfile=true.',
+      'Plan or apply a restore. mode="plan" (default) reports files to create/conflicts and sessions to import; mode="apply" writes them and requires confirm:"restore". Every file overwritten is copied to <DSH_HOME>/.w2m-restore-backups/ first. Sessions always get new ids unless keepSessionIds=true (refused on collision; forceRunning=true copies each existing session directory to .w2m-restore-backups/sessions-<UTC>/ first and replaces it). Profile files are only touched with includeProfile=true.',
     parameters: {
       archive: { type: 'string', required: true, description: 'Absolute path to a backup ZIP.' },
       mode: { type: 'string', description: 'plan (default) or apply.' },
@@ -348,7 +351,7 @@ export function buildTools(input) {
       forceRunning: {
         type: 'boolean',
         description:
-          'Accepted for contract compatibility. This build always plans/writes the workspace registry through the read-back protocol and reports the client-overwrite warning instead of refusing while the client runs.',
+          'Resolve a keepSessionIds collision instead of refusing: copy the existing session directory to <DSH_HOME>/.w2m-restore-backups/sessions-<UTC>/<projectKey>/<id>/ first, then replace it with the restored log. The replacements are reported in replaced[].',
       },
     },
     output: textOutput,
@@ -365,6 +368,7 @@ export function buildTools(input) {
             includeSessions: args.includeSessions !== false,
             includeProfile: args.includeProfile === true,
             keepSessionIds: args.keepSessionIds === true,
+            forceRunning: args.forceRunning === true,
           }),
         );
       } catch (error) {
@@ -376,15 +380,16 @@ export function buildTools(input) {
   register({
     name: 'backup_import_session_zip',
     description:
-      'Import an official DSH session export ZIP (session.v4.jsonl + subagents/media/files) into a workspace. New session ids are allocated unless keepIds=true; the root session is attached to the workspace registry.',
+      'Import an official DSH session export ZIP (session.v4.jsonl + subagents/media/files) into a workspace. New session ids are allocated unless keepIds=true; a keepIds collision is refused unless forceRunning=true, which copies the existing session directory to .w2m-restore-backups/sessions-<UTC>/ first and replaces it. The root session is attached to the workspace registry.',
     parameters: {
       zip: { type: 'string', required: true, description: 'Absolute path to the official dsh-session-*.zip.' },
       workspace: { type: 'string', description: 'Target workspace; defaults to the configured workspace/project root.' },
-      keepIds: { type: 'boolean', description: 'Keep the exported session ids; refused when they already exist.' },
+      keepIds: { type: 'boolean', description: 'Keep the exported session ids; refused when they already exist unless forceRunning=true.' },
       attach: { type: 'boolean', description: 'Attach the imported root session to the workspace (default true).' },
       forceRunning: {
         type: 'boolean',
-        description: 'Accepted for contract compatibility; see backup_restore (registry writes always use the read-back protocol).',
+        description:
+          'Resolve a keepIds collision instead of refusing: copy the existing session directory to <DSH_HOME>/.w2m-restore-backups/sessions-<UTC>/<projectKey>/<id>/ first, then replace it with the imported log. The replacements are reported in replaced[].',
       },
     },
     output: textOutput,
@@ -400,6 +405,7 @@ export function buildTools(input) {
           dshHome: cfg.dsh_home,
           workspace,
           keepIds: args.keepIds === true,
+          replaceExisting: args.forceRunning === true,
         });
       } catch (error) {
         return jsonText(failed(ZIP_ARCHIVE_CODES.ARCHIVE_UNREADABLE, error));
@@ -414,6 +420,7 @@ export function buildTools(input) {
         workspace,
         workspace_slug: sessionWorkspaceSlug(workspace),
         written: imported.written,
+        replaced: imported.replaced,
         attachments: imported.attachments,
         roots: imported.roots,
         skipped: imported.skipped,
@@ -467,12 +474,22 @@ export async function apply(ctx, config = {}, deps = {}) {
     install(ctx);
   }
 
-  return {
+  // A Cordis host treats a plugin's return value as an **effect**: a function is a disposer, anything else
+  // is "Invalid effect". The mount report the tests read is therefore carried *on* the disposer (properties
+  // on a function are legal), not returned as a bare object — that shape failed to mount in the real host
+  // (`include:dsh-backup-plugin` fiber `failed`, diagnostic "Invalid effect") while every fake-ctx test passed.
+  const dispose = () => {
+    disposed = true;
+  };
+  for (const [key, value] of Object.entries({
     ok: true,
     mounted: true,
-    name,
     registered,
     disposed: () => disposed,
     config: describeConfig(cfg),
-  };
+  })) {
+    dispose[key] = value;
+  }
+  Object.defineProperty(dispose, 'name', { value: name, configurable: true });
+  return dispose;
 }

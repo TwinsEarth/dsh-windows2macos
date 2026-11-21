@@ -90,8 +90,8 @@ dispose 归属。`backup_status` 同样只做只读解析，所以"挂载/查询
 | `backup_list` | `limit?` | `backupRoot` 下的归档（新→旧），带清单摘要；读不懂的归档仍列出并带 `error` |
 | `backup_create` | `label?`, `projectRoot?`, `workspace?`, `includeProject?`, `includeSessions?`, `includeProfile?` | 写一个 `backup-<stamp>[-label].zip`；返回路径、字节数、sha256、每类计数与 `skipped` |
 | `backup_verify` | `archive`（必填） | 用归档自己的 `manifest.json` 重算每个条目的 sha256；返回 `missing` / `mismatched` / `extras` |
-| `backup_restore` | `archive`（必填）, `mode?`, `confirm?`, `targetProject?`, `overwrite?`, `includeSessions?`, `includeProfile?`, `keepSessionIds?`, `forceRunning?` | `plan` 只读；`apply` 必须带 `confirm: "restore"`，先写 pre-restore 副本再写目标 |
-| `backup_import_session_zip` | `zip`（必填）, `workspace?`, `keepIds?`, `attach?`, `forceRunning?` | 导入 DSH 官方会话导出 ZIP；默认分配新 id，附件一并落盘并挂到 workspace 注册表 |
+| `backup_restore` | `archive`（必填）, `mode?`, `confirm?`, `targetProject?`, `overwrite?`, `includeSessions?`, `includeProfile?`, `keepSessionIds?`, `forceRunning?` | `plan` 只读；`apply` 必须带 `confirm: "restore"`，先写 pre-restore 副本再写目标；`keepSessionIds` 冲突默认拒绝，`forceRunning` 先备份会话目录再替换 |
+| `backup_import_session_zip` | `zip`（必填）, `workspace?`, `keepIds?`, `attach?`, `forceRunning?` | 导入 DSH 官方会话导出 ZIP；默认分配新 id，`keepIds` 冲突默认拒绝，`forceRunning` 先备份会话目录再替换；附件一并落盘并挂到 workspace 注册表 |
 
 ### 4.1 `backup_restore` 的确认令牌与 pre-restore 副本
 
@@ -111,9 +111,16 @@ dispose 归属。`backup_status` 同样只做只读解析，所以"挂载/查询
 
 - 默认分配新 id（根 `session-<uuid>`，子代理 `<uuid>`），并把事件行与 `parentSession` 里的旧 id 一起重写；
 - `keepSessionIds: true` 沿用原 id，但目标 home 已存在同 id 时**拒绝**（`BACKUP_SESSION_ID_CONFLICT`），不覆盖；
+- `forceRunning: true` 是这条拒绝的**显式出路**，不是"接受并回报"：先把已存在的会话目录整个复制到
+  `<DSH_HOME>/.w2m-restore-backups/sessions-<UTC>/<projectKey>/<id>/`（保留客户端留在目录里的每个文件），
+  删除原目录，再写入还原日志；每个被替换的会话在结果里以
+  `replaced: [{session_id, backup, file}]` 出现（`backup` 是旧目录的副本，`file` 是新写入的日志）。
+  `plan` 只报告 `plan.sessions.existing_ids` 与 `plan.sessions.replace_existing`，不复制、不删除；
+  扫描之后才出现的同 id 日志仍然拒绝，除非显式给了 `forceRunning`；
 - 根会话通过 `src/backup/registry.mjs` 的"计划 → 原子写 → 读回比对"协议挂到目标 workspace；子代理只通过父会话
   出现，不单独注册；
-- 每次成功注册都带上客户端可能覆盖注册表的残留风险说明（`CLIENT_OVERWRITE_WARNING`）。
+- 每次成功注册都带上客户端可能覆盖注册表的残留风险说明（`CLIENT_OVERWRITE_WARNING`）。这条风险与
+  `forceRunning` 无关：`forceRunning` 解决的是**磁盘上的会话 id 冲突**，不是"客户端正在运行"。
 
 ### 4.3 `backup_import_session_zip`
 
@@ -125,14 +132,18 @@ dispose 归属。`backup_status` 同样只做只读解析，所以"挂载/查询
 - ZIP 里是**明文 JSONL**，不是磁盘上的 zstd 字节；导入按存储规则重编码（首帧恰好一行 header）；
 - 必须恰好一个根会话（0 个 → `BACKUP_SESSION_NO_ROOT`，多个 → `BACKUP_SESSION_ROOT_AMBIGUOUS`）：官方导出就是
   一棵树，猜根会把子代理导入成 workspace；
-- 磁盘目录名由 `cwd` 推导（`projectKey`），所以默认分配新 id，`keepIds` 冲突即拒绝；
+- 磁盘目录名由 `cwd` 推导（`projectKey`），所以默认分配新 id，`keepIds` 冲突即拒绝；`forceRunning` 是显式出路：
+  先按 §4.2 的规则把旧会话目录备份到 `.w2m-restore-backups/sessions-<UTC>/` 再替换，结果带 `replaced`；
 - 媒体对象写到 `<DSH_HOME>/attachments/v1/objects/<ab>/<sha256>`，`files/` 条目写到
   `<DSH_HOME>/attachments/v1/files/<ab>/<digest>/<name>`；越界文件名拒绝并记入 `skipped`；
 - 注册表写入复用 `src/backup/registry.mjs`，不另写一套。
 
-`forceRunning` 在 `backup_restore` / `backup_import_session_zip` 上是**接受并回报**（`force_running`），不改变
-任何行为：DSH 客户端拥有 `storages/workspace.json` 并从内存重写，本实现永远走"计划 → 原子写 → 读回 → 报告
-残留风险"，而不是假装能阻止客户端覆盖。
+`forceRunning` 在 `backup_restore` / `backup_import_session_zip` 上都只有这一个含义：**解决 `keepSessionIds` /
+`keepIds` 的会话 id 冲突**。默认冲突即拒绝；显式 `forceRunning: true` 时先把已存在的会话目录备份到
+`.w2m-restore-backups/sessions-<UTC>/` 再替换，并在结果里回报 `force_running` 与 `replaced`。两个工具都走
+`src/backup/session-zip.mjs#writeSessionSet()` 的同一条实现，所以归档还原与官方 ZIP 导入的替换语义不可能分叉。
+它**不**表示"停止 DSH 客户端"或"绕过注册表竞态"：注册表仍然走"计划 → 原子写 → 读回 → 报告残留风险"，
+因为本实现没有任何办法阻止客户端用内存里的副本覆盖 `storages/workspace.json`。
 
 ## 5. 启用
 
@@ -174,5 +185,7 @@ node --test --test-force-exit test/backup-wiring.test.mjs
 - **不新增**第二条写盘实现：归档写 `backupRoot`，还原写目标项目/`$DSH_HOME`，导入写 `$DSH_HOME`，都走
   `src/backup/zip.mjs`、`session-zip.mjs`、`atomic.mjs` 这些被其它测试覆盖的底层。
 - 归档是**明文** ZIP（按契约）；需要信封/账户绑定的场景是 `dsh-backup` 的 sealed 仓库，不是这个工具面。
-- 导入/还原**不会修改已有会话**：只创建新 id 的目录；`keepIds`/`keepSessionIds` 冲突时拒绝而不是覆盖。
+- 导入/还原**默认不会修改已有会话**：只创建新 id 的目录；`keepIds`/`keepSessionIds` 冲突时拒绝而不是覆盖。
+  唯一的替换路径是显式 `forceRunning: true`：先整目录备份到 `.w2m-restore-backups/sessions-<UTC>/`，再替换，
+  并在结果里列出 `replaced`（见 §4.2）。
 - 归档工具面没有定时器、没有状态文件、没有 catch-up：启用它不会在挂载路径启动任何扫描或写盘。

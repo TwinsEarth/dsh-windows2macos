@@ -1,0 +1,34 @@
+{
+  "version": "3.5.5",
+  "case": "BACKUP-SUBPLUGIN-355-REAL-MACHINE",
+  "kind": "positive",
+  "machines": [
+    "TOFUTURE"
+  ],
+  "executed_at": "2026-11-21T02:12:00.000Z",
+  "executor": "agent",
+  "task_id": "w2m-v355-real-machine-drill",
+  "requirement": "v3.5.5 real-machine drill: install the packed 3.5.5 build into the real desktop profile through the plugin manager, then drive the six backup_* tools of the installed artifact against the real DSH_HOME (create over real sessions, read-only for the home) and a throwaway archive root, and finish with verify, a restore into a throwaway target, and an official-session-ZIP import into a throwaway home.",
+  "commands": [
+    ["plugin_manager", "install_bundle", "E:\\DSH\\DS\\W2M\\dist\\twinsearth-w2m-dsh-plugin-3.5.5.tgz"],
+    ["node", ".w2m\\drill-355.mjs"]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "installed_build": "plugin_manager install_bundle replaced 3.5.4 with 3.5.5 in C:\\Users\\fangw\\.dsh\\profiles\\desktop (pnpm 3.5.4 -> 3.5.5, stage enable applied). The profile dependency is the local packed artifact file:E:/DSH/DS/W2M/dist/twinsearth-w2m-dsh-plugin-3.5.5.tgz; the installed package resolves ./dsh-backup-plugin, ships lib/backup-plugin.js (1711 B) and src/plugin/backup-plugin.mjs (20840 B).",
+      "six_tools": "Mounting the installed package entry (lib/backup-plugin.js) with a recording Cordis context registers exactly six tools: backup_status, backup_list, backup_create, backup_verify, backup_restore, backup_import_session_zip. No timer and no panel route are mounted.",
+      "status": "backup_status returns ok:true over the real DSH_HOME (read-only): resolved dsh_home=C:\\Users\\fangw\\.dsh, archive root = throwaway temp directory that does not exist before the first create, project_root = throwaway project, workspace = a real workspace path taken from the real storages/workspace.json, archive_count 0 before the run.",
+      "create": "backup_create {label:'real-drill-355'} over real DSH_HOME sessions (read-only) produced backup-20261121-101126-real-drill-355.zip: 216,039,319 B, 193 real sessions, 2 project files, node_modules excluded.",
+      "verify": "backup_verify recomputed every entry: ok:true, 195 entries checked (193 sessions + manifest + 2 project files), mismatched 0, missing 0.",
+      "list": "backup_list {limit:5} returned exactly the one archive with its manifest summary.",
+      "restore": "backup_restore plan reported the files and sessions without writing; apply without confirm was refused with BACKUP_RESTORE_CONFIRM_REQUIRED and wrote nothing; apply with confirm:'restore' into a throwaway target restored project/README.md byte-identically ('# drill project') and allocated/restored sessions under the throwaway home.",
+      "import": "backup_import_session_zip imported an official stored-ZIP export (session.v4.jsonl + media + files/): ok:true, one root written under a NEW id (old_id session-import-0001 -> session-ac5c77e1-02bf-4eed-b8af-c2b68ad9d20a, 2 events), media 1, files 1, skipped [], root session attached through the registry read-back protocol.",
+      "profile_row": "The archive row was added to the real profile patch (profile cordis.patch.yml.bak-drill355-* backup kept). First mount failed for a real reason: apply() returned a plain object, and a Cordis host treats a plugin's return value as an effect, so include:dsh-backup-plugin came up enabled with fiberPhase 'failed' / diagnostic 'Invalid effect' while every fake-ctx test passed. Fixed by returning a disposer function carrying the mount report as properties (src/plugin/backup-plugin.mjs); after reinstalling the rebuilt tarball the plugin manager reports include:dsh-backup-plugin enabled:true, fiberPhase:'active'. dsh-backup remains disabled as shipped.",
+      "host_level_tools": "With the row active in the real host, the six tools are exposed to the agent session and were driven from the host (not from a script): backup_status reported dsh_home=C:\\Users\\fangw\\.dsh, backup_root=D:\\DeepSeekHarness\\Backup-Archives, project_root_source 'cwd', archive_count 0; backup_create {projectRoot: host-drill project, includeProject:true, includeSessions:false} wrote D:\\DeepSeekHarness\\Backup-Archives\\backup-20261121-102931-host-drill-355.zip (1302 B, sha256 e4dea3e7c037abfc8859965e0b682df0b676bafc398daf150ed81f2b54b47d76, 2 files, sessions 0); backup_verify checked 2 entries, missing/mismatched/extras all empty; backup_restore plan reported project.create 2 and no writes; apply without confirm was refused with BACKUP_RESTORE_CONFIRM_REQUIRED; apply with confirm:'restore', includeSessions:false restored 2 files into a throwaway target (restored.files 2, replaced 0).",
+      "import_scope": "backup_import_session_zip was exercised end-to-end in the installed-artifact drill above (new id, media 1, files 1, attached through the registry read-back protocol) against a throwaway home. It was deliberately not repeated through the real host because that tool always writes cfg.dsh_home (the real home); the confirmed behaviour is the same code path.",
+      "honesty_incident": "The first artifact-level drill resolved dshHome from the shell environment instead of the intended throwaway home for the restore/import mounts, so those two steps wrote into the real home: two drill session directories under sessions/--E-DSH-DS-W2M-.w2m-drill-355-*--, one attachment object+file, and two registry workspace rows (restored-...-drill-355-*). All of it was removed afterwards with the registry file backed up first (workspace.json.bak-drill355-*); the create/verify steps only read the real home and wrote the throwaway archive. No real session was modified or deleted.",
+      "not_claimed": "No GUI-level assertion is made here: the six tools were driven through the host agent session and through the installed package entry, not by clicking panel widgets. The profile row is confirmed active by the plugin manager's fiberPhase."
+    }
+  }
+}
