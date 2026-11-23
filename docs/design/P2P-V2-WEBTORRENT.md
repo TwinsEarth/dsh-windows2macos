@@ -2,7 +2,7 @@
 
 状态：设计冻结，按本文件实现
 适用范围：`@twinsearth/w2m-dsh-plugin/dsh-p2p-v2`，复用 `@twinsearth/w2m-dsh-plugin/dsh-p2p-webrtc` 的共享 pool
-版本：新增子插件 `dsh-p2p-v2`；package 版本由发布窗口决定，本文件不预判
+版本：随 `@twinsearth/w2m-dsh-plugin@3.7.1` 发布；V2 是新增子插件 `dsh-p2p-v2`
 
 ## 1. 裁决
 
@@ -64,6 +64,23 @@ P2PV2Service
 - 同一进程可以注册 fake transport 做确定性测试；服务只从 `transportRegistry` 取定义，不直接对 pool 发字节。
 - `multiplex.mjs` 不感知传输：帧标签仍是 `magic | info hash | chunk`，任何 transport 都只搬运带标签的 Buffer。
 
+### 3.2 transport 接口（P6 冻结）
+
+传输是**定义**，不是连接。注册表只保存 `{name, create({pool, service?, now?})}`；每次 `share` / `add` 在服务实例内 `create` 一个绑定，绑定才持有该进程的 pool 引用。
+
+绑定契约（`webrtc-v1` 是唯一内置实现）：
+
+| 成员 | 语义 | 失败 |
+|---|---|---|
+| `name` | 与注册名一致；不一致在注册时拒绝 | `P2P_V2_TRANSPORT_INVALID` |
+| `ensure(peer)` | 确保 V1 pair 可用；不创建第二个调度器 | 透传 pool 的命名失败，如 `P2P_V2_PEER_UNREACHABLE` |
+| `send(peer, payload)` | 发送一个**已带 V2 标签**的 Buffer；传输层不解析 BitTorrent wire | `P2P_V2_TRANSPORT_CLOSED` 或 pool 错误 |
+| `onMessage(handler)` | 订阅 pool 广播，返回幂等退订函数；单个 handler 抛错不影响其他订阅者 | 非函数参数抛 `TypeError` |
+| `destroy()` | 只释放本绑定与订阅，**绝不** `pool.closePeer()` / `pool.stop()` | 重复调用返回 `{already:true}` |
+| `diagnostics()` | `name`、`destroyed`、`subscribers`、`machine_id` | 只读 |
+
+选择规则：`share` / `add` / `attach` 的 `transport` 缺省为 `webrtc-v1`；未知名字返回 `P2P_V2_TRANSPORT_UNKNOWN`，不静默回落到默认。一个进程可以注册 fake transport 做确定性测试，但生产只从注册表单例取定义；`multiplex.mjs` 不感知 transport，只负责 `magic | info hash | chunk`。
+
 不变式：
 
 1. **不拥有 pool**。V2 只 `getSharedWebRtcPool()`；`stop`/`detach` 只销毁 adapter，绝不 `closePeer`。
@@ -86,6 +103,29 @@ P2PV2Service
 | `p2p_v2_stop` | 停一个 share / 全部 | 销毁 torrent；不停止 pool |
 
 多对多不是“自动发现”：`share`/`add` 的 `peers` 是机器 id 数组，按集合去重、逐项 attach，本机 id 直接拒绝；`p2p_v2_peers` 只展示已经连上的 pair，不发起 dial。单个 peer 失败只记入 `peer_errors`，不阻断其他 peer；`add` 的全部 peer 都失败时返回 `P2P_V2_PEERS_UNREACHABLE` 并销毁刚建的 torrent。
+
+### 4.1 多 peer 编排
+
+| 场景 | 行为 | 边界 |
+|---|---|---|
+| 一个 seed 对多个 leecher | 同一 torrent 对每个 `machine_id` 建一个 adapter，路由键 `peer\0info_hash` | 每个 peer 独立成败；不共享 adapter 状态 |
+| 多个 seed 提供同一文件 | 每个 seed 各自 `share`，返回同一 info hash；leecher 可在 `peers` 里给多个 seed | 单 leecher 同时从多 seed 拉取的真实 provider 组合仍属 P5 限制，见验收文档 |
+| 同一 peer 参与多个 torrent | 每个 info hash 一条逻辑 Duplex，底层复用同一 V1 pair | 帧按 `peer + info hash` 定向，JSON 控制面不误判 |
+| 重复 attach | `(share_id, machine_id)` 幂等 | 不重复建 adapter，不重复计数 |
+| peer 上限 | 超过 `maxPeersPerShare`（默认 16）或 `maxConns`（默认 32）命名拒绝 | 不静默淘汰已有 peer |
+| 部分失败 | 成功 peer 继续；失败写 `peer_errors`，share 仍可用 | `add` 全失败才整体失败并销毁空 torrent |
+| `detach` | 移除该 peer 的 adapter 与 `torrent.removePeer` | V1 pair 保留，其他 torrent 不受影响 |
+
+角色由记录决定：seed 记录 `mode:'seed'`，下载记录 `mode:'download'`；同一个 service 可以同时持有两个角色，但 `swarm` 摘要按 info hash 聚合，`peers()` 只读。
+
+### 4.2 配额、staging 与恢复
+
+- **数量配额**：`maxShares`（默认 8）、`maxPeersPerShare`（16）、`maxConns`（32）；超限返回命名错误，不淘汰现有 share。
+- **字节配额**：`maxFileBytes`（默认 10 GiB/文件）、`maxDownloadBytes`（默认 10 GiB/次下载）；另用 `statfsSync` 检查 staging 所在卷可用空间，拿不到 statfs 时只保留配置上限（best-effort）。
+- **staging**：下载先写目标同卷 `.w2m-partial-<infoHash>`；目标目录只在 `finalize` 成功后才出现完整文件。`torrent.files[].path` 必须是 staging 内相对路径，绝对路径、盘符、`..` 一律拒绝。
+- **恢复**：`shares.json` 原子保存 info hash、download/staging 路径、peers、状态；进程重启只把记录放进 `status.restore` 候选，**不会自动下载**。操作者再次 `add` 同一 magnet 时复用稳定 staging，WebTorrent 从已有 piece 继续；P5 `p2p-v2-p5-resume.test.mjs` 证明只追加缺失字节、不重下全量。
+- **停止**：`stop` 销毁 torrent 与 adapter、删除 share 记录，但保留 staging；`stopAll` 才销毁 engine 并退订 pool。`detach` 只移除逻辑 peer，不关闭 V1 pair。
+- **失败保留**：metadata 超时、finalize 失败都保留 staging 与 `staging_path`；不把半文件发布到目标目录。
 
 ## 5. 生命周期
 

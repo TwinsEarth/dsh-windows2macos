@@ -861,7 +861,13 @@ describe('p2p v2 multi-peer orchestration', () => {
 
 describe('dsh-p2p-v2 wiring', () => {
   it('declares the export, the lib seam and a disabled patch row', () => {
+    assert.equal(pkg.version, '3.7.1');
     assert.equal(pkg.exports['./dsh-p2p-v2'], './lib/p2p-v2-plugin.js');
+    assert.equal(pkg.dependencies?.webtorrent, undefined);
+    assert.equal(pkg.optionalDependencies?.webtorrent, undefined);
+    assert.ok(pkg.scripts.test.includes('test/p2p-v2.test.mjs'));
+    assert.ok(pkg.scripts['test:all'].includes('test/p2p-v2.test.mjs'));
+    assert.ok(existsSync(join(ROOT, 'docs/P2P-V2.md')));
     assert.ok(existsSync(join(ROOT, 'lib/p2p-v2-plugin.js')));
     assert.ok(existsSync(join(ROOT, 'src/plugin/p2p-v2-plugin.mjs')));
     const row = patchRow(P2P_V2_ROW_ID);

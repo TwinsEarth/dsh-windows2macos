@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented here.
 
+## [3.7.1] — 2026-11-24
+
+### release(p2p-v2): package, operator guide and rollback
+
+- **版本与出口**：`package.json` 升到 `3.7.1`；`exports['./dsh-p2p-v2']` 指向 `lib/p2p-v2-plugin.js`；`test` / `test:all` 都运行 `test/p2p-v2.test.mjs`。
+- **零依赖边界**：`webtorrent` 仍不进入 `dependencies` / `optionalDependencies`。生产由操作者外部安装，或在 row 的 `webTorrentModule` 指向绝对入口。
+- **发布默认**：`cordis.patch.yml` 的 `dsh-p2p-v2` 行保持 `disabled: true`；生产 profile 必须显式启用。默认 `webTorrentModule: 'webtorrent'`、`trackers: []`、`allowNativeTrackers: false`。
+- **文档**：`docs/design/P2P-V2-WEBTORRENT.md` 补充多 peer 编排、配额与恢复、transport 接口；新增操作者指南 `docs/P2P-V2.md`。
+- **回滚**：禁用 `dsh-p2p-v2` 行即回到 V1 任务分发；V1 配置不变、共享 pool 不停、已下载文件不删除，只停止 torrent。
+- **验证**：P5 的单元/集成/live/resume 与 P6 打包、claims、acceptance 文档检查在本发布窗口执行。
+
 ## [3.6.0] — 2026-11-24
 
 ### feat(desktop): 远程桌面默认走共享 WebRTC 传输层

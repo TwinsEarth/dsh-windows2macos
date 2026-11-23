@@ -180,6 +180,8 @@ replicate 在每台在线机器上运行，只有所有机器返回相同结果�
 
 P2P WebRTC 是显式启用的第二传输栈（`webrtc-v1`），默认关闭：DataChannel 承载经 Noise_IK_25519_ChaChaPoly_SHA256 加密的 RPC/事件流，独立 WebSocket 信令服务器交换 SDP/ICE，ICE/STUN 直连、TURN 中继降级，失败时保留 UDP/relay 路径。零 WebRTC 运行时依赖，真实引擎通过外部 provider 子进程接入。多机编队通过 `WebRtcTransportPool`（`./p2p-webrtc-pool`）按 peer pair 管理 1:1 transport：机器 ID 字典序决定 host/client，哈希生成确定性房间，relay 的 `peer.static_key` 作为 Noise 固定密钥。架构、配置与 provider 协议见 [docs/P2P-WEBRTC.md](./docs/P2P-WEBRTC.md)。生产部署、signal/provider 安装与 `bin/w2m-desktop-readiness.mjs` 只读验收见 [docs/DESKTOP-PRODUCTION.md](./docs/DESKTOP-PRODUCTION.md)。
 
+P2P V2 文件面（`dsh-p2p-v2`，package 子路径 `./dsh-p2p-v2`）默认关闭：WebTorrent 负责多 peer 分片，V1 共享 pool 只搬运带标签的加密字节。它不替换任务分发、不新建调度器、文件字节不走 relay；`webtorrent` 不进运行时依赖，由操作者外部安装。安装、生产启用、配额/续传/回滚与示例见 [docs/P2P-V2.md](./docs/P2P-V2.md)，设计见 [docs/design/P2P-V2-WEBTORRENT.md](./docs/design/P2P-V2-WEBTORRENT.md)。
+
 Teams 也是显式启用的子插件（`dsh-teams`），默认关闭，且提供 `w2m_team_status` / `w2m_team_room` 两个只读视图与 `w2m_team_artifact` 一个 WebRTC 数据面发送工具：它把共享项目房间、成员/心跳可见性和既有五类协作工具（`w2m_joint_plan`、`w2m_joint_status`、`w2m_run`、`w2m_council`、`w2m_tasks`）组合成统一的编队视图，但不新增审批或派发入口。传输策略固定为控制面（心跳/用户信息/计划/审批/租约）走 Relay TCP，数据面（图片/文件/artifact/数据同步）走 WebRTC DataChannel（同一个 `WebRtcTransportPool`）；固定最多 33 次，全部失败即放弃并告警，**不回落 Relay**。artifact 接收端写入 artifact sink，`w2m-joint merge --peer` 的补丁清单也走同一数据面。派发仍须 `w2m-joint` 的 Ed25519 人签审批与显式 `target_machines`。见 [docs/TEAMS.md](./docs/TEAMS.md)。
 
 ## Security posture
