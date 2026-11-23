@@ -4,7 +4,7 @@
 工作树：`E:\DB\W2M`  
 分支：`work/v3.7.0-v2-baseline`  
 代码基线提交：`3fb1ed0020679cc4f9a2c18b327deaf8aadf840c`（`fix(ci): run the declared suite through an argv spawner on Windows`）  
-本记录提交：`d3bdbfd`（只增加本文档，不改变代码）  
+本记录提交：本分支 HEAD（仅增加本文档，不改变代码）  
 基线 tag：`v3.6.0` 指向代码基线提交  
 package 版本：`3.6.0`
 
