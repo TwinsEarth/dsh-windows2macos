@@ -881,7 +881,8 @@ describe('fleet-target: the selection routes w2m_run', () => {
       // v1.6.8 adds the plugin-update route to the same registry.
         // v1.7.1 adds the host capture + host clipboard fallbacks to the same registry.
         // v3.4.6 adds the two READ-ONLY backup routes (status, scan) to the same registry.
-        assert.equal(routes.length, 17, 'the control is mounted as its routes (target, chat GET/POST, task board, execution capability, plugin update, operator token, data-plane sink, project stream, host capture, host clipboard, remote-view config/start/frame/stop, fleet-config GET/POST, backup status/scan)');
+        // v3.6.0 adds the remote-view one-shot ack route to the same registry.
+        assert.equal(routes.length, 18, 'the control is mounted as its routes (target, chat GET/POST, task board, execution capability, plugin update, operator token, data-plane sink, project stream, host capture, host clipboard, remote-view config/start/frame/stop/ack, fleet-config GET/POST, backup status/scan)');
       const value = JSON.parse(await tools.get('w2m_status').execute({}, {}));
       assert.equal(value.target_selection.attached, true);
       assert.equal(value.target_selection.route, TARGET_ROUTE_PATH);

@@ -14,11 +14,11 @@ import {
   checkRemoteConfig,
   checkStaticKey,
   signalHealthUrl,
-} from '../scripts/desktop-webrtc-readiness.mjs';
+} from '../bin/w2m-desktop-readiness.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = join(HERE, '..');
-const SCRIPT = join(REPO, 'scripts', 'desktop-webrtc-readiness.mjs');
+const SCRIPT = join(REPO, 'bin', 'w2m-desktop-readiness.mjs');
 
 function tempDir(prefix) {
   return mkdtempSync(join(tmpdir(), prefix));

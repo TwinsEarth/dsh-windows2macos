@@ -13,7 +13,7 @@
  * named block rather than a guessed green.
  *
  * Usage:
- *   node scripts/desktop-webrtc-readiness.mjs \
+ *   node bin/w2m-desktop-readiness.mjs \
  *     --state ~/.dsh/xclient \
  *     --signal wss://signal.example.com/w2m/webrtc \
  *     --provider-cwd ~/.w2m/webrtc-provider \

@@ -307,10 +307,10 @@ WebRTC pool。
 
 ### 5.2 只读 readiness
 
-脚本：`scripts/desktop-webrtc-readiness.mjs`。
+脚本：`bin/w2m-desktop-readiness.mjs`。
 
 ```bash
-node "$W2M_PLUGIN_DIR/scripts/desktop-webrtc-readiness.mjs" \
+node "$W2M_PLUGIN_DIR/bin/w2m-desktop-readiness.mjs" \
   --state "${DSH_HOME:-$HOME/.dsh}/xclient" \
   --signal "wss://signal.example.com/w2m/webrtc" \
   --health-url "https://signal.example.com/w2m/signal-health" \
@@ -354,7 +354,7 @@ curl -fsS \
 
 ```bash
 W2M_DIAGNOSTICS_COOKIE="$W2M_DESKTOP_COOKIE" \
-node "$W2M_PLUGIN_DIR/scripts/desktop-webrtc-readiness.mjs" \
+node "$W2M_PLUGIN_DIR/bin/w2m-desktop-readiness.mjs" \
   --state "$HOME/.dsh/xclient" \
   --signal "wss://signal.example.com/w2m/webrtc" \
   --provider-cwd "$HOME/.w2m/webrtc-provider" \
@@ -472,7 +472,7 @@ HTML，说明 relay 版本没有这个路由，`auto`/`webrtc` 都无法按预�
 
 ## 9. P6 验收边界与 P7 结果
 
-本文和 `scripts/desktop-webrtc-readiness.mjs` 只做部署与只读 readiness。真实多机 ICE/DTLS
+本文和 `bin/w2m-desktop-readiness.mjs` 只做部署与只读 readiness。真实多机 ICE/DTLS
 矩阵、30 分钟 1 Hz soak 与最终验收 JSON 属于 P7；P7 的实测结果与现网 NAT 限制见
 `docs/acceptance/3.7.0/DESKTOP-WEBRTC-DEFAULT.md` 和 `.json`。本文件不伪造这些结果。
 

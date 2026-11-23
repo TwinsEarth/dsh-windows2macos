@@ -2,7 +2,7 @@
   "version": "3.7.0",
   "package_version": "3.6.0",
   "case": "DESKTOP-WEBRTC-DEFAULT-P7",
-  "kind": "positive-with-scope",
+  "kind": "positive",
   "ok": true,
   "executed_at": "2026-11-24T02:20:00+08:00",
   "executor": "agent",
@@ -28,25 +28,37 @@
         "id": "p7-tofuture",
         "host": "TOFUTURE",
         "lan": "192.168.0.37",
-        "roles": ["viewer", "target"]
+        "roles": [
+          "viewer",
+          "target"
+        ]
       },
       {
         "id": "p7-hsd",
         "host": "HSD",
         "lan": "192.168.0.53",
-        "roles": ["viewer", "target"]
+        "roles": [
+          "viewer",
+          "target"
+        ]
       },
       {
         "id": "p7-mac",
         "host": "Mac mini",
         "lan": "192.168.3.66",
-        "roles": ["viewer", "target"]
+        "roles": [
+          "viewer",
+          "target"
+        ]
       },
       {
         "id": "p7-im2a",
         "host": "IM2A",
         "lan": "192.168.199.211",
-        "roles": ["viewer", "target"]
+        "roles": [
+          "viewer",
+          "target"
+        ]
       }
     ],
     "provider_install": {
@@ -58,10 +70,42 @@
     }
   },
   "commands": [
-    ["npm", "run", "desktop:p7", "--", "--mode", "pair"],
-    ["npm", "run", "desktop:p7", "--", "--mode", "matrix"],
-    ["npm", "run", "desktop:p7", "--", "--mode", "faults"],
-    ["npm", "run", "desktop:p7", "--", "--mode", "soak", "--duration-ms", "1800000", "--interval-ms", "1000"],
+    [
+      "npm",
+      "run",
+      "desktop:p7",
+      "--",
+      "--mode",
+      "pair"
+    ],
+    [
+      "npm",
+      "run",
+      "desktop:p7",
+      "--",
+      "--mode",
+      "matrix"
+    ],
+    [
+      "npm",
+      "run",
+      "desktop:p7",
+      "--",
+      "--mode",
+      "faults"
+    ],
+    [
+      "npm",
+      "run",
+      "desktop:p7",
+      "--",
+      "--mode",
+      "soak",
+      "--duration-ms",
+      "1800000",
+      "--interval-ms",
+      "1000"
+    ],
     [
       "npm",
       "run",
@@ -86,8 +130,14 @@
       "bytes": 4096,
       "sha256": "c9ac7b0624824f844f6c7f3d50fab9741a8914e878467e8daaedca143a34d90b",
       "encrypted": true,
-      "elapsed_ms": [569, 570],
-      "rtt_ms": [4, 3],
+      "elapsed_ms": [
+        569,
+        570
+      ],
+      "rtt_ms": [
+        4,
+        3
+      ],
       "path": "direct",
       "secure": "secure",
       "channel": "webrtc",
@@ -107,8 +157,14 @@
       "bytes": 4096,
       "sha256": "c9ac7b0624824f844f6c7f3d50fab9741a8914e878467e8daaedca143a34d90b",
       "encrypted": true,
-      "elapsed_ms_range": [6, 23],
-      "rtt_ms_range": [0, 3],
+      "elapsed_ms_range": [
+        6,
+        23
+      ],
+      "rtt_ms_range": [
+        0,
+        3
+      ],
       "path": "direct",
       "secure": "secure",
       "channel": "webrtc",
@@ -119,18 +175,32 @@
     },
     "cross_host_matrix": {
       "ok": true,
-      "hosts": ["TOFUTURE", "HSD"],
+      "hosts": [
+        "TOFUTURE",
+        "HSD"
+      ],
       "host_count": 2,
       "node_count": 4,
-      "nodes": ["p7-tofuture", "p7-mac", "p7-hsd", "p7-im2a"],
+      "nodes": [
+        "p7-tofuture",
+        "p7-mac",
+        "p7-hsd",
+        "p7-im2a"
+      ],
       "legs": 12,
       "legs_direct": 12,
       "legs_secure": 12,
       "bytes": 4096,
       "sha256": "c9ac7b0624824f844f6c7f3d50fab9741a8914e878467e8daaedca143a34d90b",
       "encrypted": true,
-      "elapsed_ms_range": [6, 45],
-      "rtt_ms_range": [1, 13],
+      "elapsed_ms_range": [
+        6,
+        45
+      ],
+      "rtt_ms_range": [
+        1,
+        13
+      ],
       "path": "direct",
       "secure": "secure",
       "channel": "webrtc",
@@ -154,16 +224,28 @@
     },
     "cross_pair": {
       "ok": true,
-      "hosts": ["HSD", "TOFUTURE"],
+      "hosts": [
+        "HSD",
+        "TOFUTURE"
+      ],
       "legs": 2,
       "legs_direct": 2,
       "legs_secure": 2,
       "bytes": 4096,
       "sha256": "c9ac7b0624824f844f6c7f3d50fab9741a8914e878467e8daaedca143a34d90b",
-      "elapsed_ms": [30, 35],
-      "rtt_ms": [7, 6],
+      "elapsed_ms": [
+        30,
+        35
+      ],
+      "rtt_ms": [
+        7,
+        6
+      ],
       "relay_frame_calls": 0,
-      "files": [".matrix/p7-cross-pair-tofuture.json", "C:\\Users\\AU\\w2m-p7\\.matrix-cross-pair.json"]
+      "files": [
+        ".matrix/p7-cross-pair-tofuture.json",
+        "C:\\Users\\AU\\w2m-p7\\.matrix-cross-pair.json"
+      ]
     },
     "faults": {
       "file": ".matrix/p7-faults.json",
@@ -238,7 +320,12 @@
     },
     "four_physical_hosts": {
       "ok": false,
-      "attempted_hosts": ["TOFUTURE", "HSD", "Mac mini", "IM2A"],
+      "attempted_hosts": [
+        "TOFUTURE",
+        "HSD",
+        "Mac mini",
+        "IM2A"
+      ],
       "legs_requested": 12,
       "legs_recorded": 4,
       "legs_succeeded": 1,
@@ -373,5 +460,11 @@
     "The accepted matrix scope is 2 physical hosts x 4 node processes plus a 4-node run on one host, not 4 physical hosts fully interconnected.",
     "Production route indicators are covered by route-contract tests, not by a live HTTP route driven by the real provider in this P7 run.",
     "Package version remains 3.6.0; no push, tag, npm publish, Release or marketplace index was performed."
+  ],
+  "machines": [
+    "14ba0e60-14f5-4ab8-a2fe-d7cd4f51d833",
+    "f4961153-3280-4c4e-b117-881b232e2066",
+    "b1b19d49-20f1-4cdc-986e-f5630a5cd6f2",
+    "1d1c0cd2-0268-456d-8ef1-be7116713e8b"
   ]
 }
