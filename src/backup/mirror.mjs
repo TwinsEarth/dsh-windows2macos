@@ -179,26 +179,20 @@ function realPathTolerant(target) {
  */
 function guardWritablePath(realRoot, target) {
   const wanted = path.resolve(target);
-  if (containmentRelative(realRoot, wanted) === null) {
-    throw new MirrorError(MIRROR_CODES.SYMLINK, `${wanted} is not inside the validated mirror root ${realRoot}`);
+  const resolved = realPathTolerant(wanted);
+  if (resolved.ok !== true) {
+    throw new MirrorError(MIRROR_CODES.INVALID, `cannot resolve ${wanted} before writing it: ${resolved.code}`);
   }
-  let current = path.dirname(wanted);
-  for (;;) {
-    const real = realPathTolerant(current);
-    if (real.ok !== true) {
-      throw new MirrorError(MIRROR_CODES.INVALID, `cannot resolve ${current} before writing ${wanted}: ${real.code}`);
-    }
-    const lexical = path.resolve(current);
-    if (path.resolve(real.real) !== lexical && lexical !== path.resolve(realRoot)) {
-      throw new MirrorError(
-        MIRROR_CODES.SYMLINK,
-        `${current} resolves to ${real.real} through a symbolic link or junction; refusing to write ${wanted} through it`,
-      );
-    }
-    if (lexical === path.resolve(realRoot)) break;
-    const parent = path.dirname(current);
-    if (parent === current) break;
-    current = parent;
+  // Compare the canonical target with the canonical root. On macOS `/var` is a symlink to `/private/var`, so a
+  // lexical prefix comparison would reject an honest path whose *parent* was already resolved while the target
+  // still carries the unresolved alias. Resolving first keeps the containment rule without treating the system
+  // alias above the root as an escape inside it.
+  const canonical = path.resolve(resolved.real);
+  if (containmentRelative(realRoot, canonical) === null) {
+    throw new MirrorError(
+      MIRROR_CODES.SYMLINK,
+      `${wanted} resolves to ${canonical}, outside the validated mirror root ${realRoot}`,
+    );
   }
 }
 
