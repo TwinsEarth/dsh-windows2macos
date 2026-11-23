@@ -364,10 +364,13 @@ export const DOCUMENT_EXCLUSIONS = [
   },
   {
     path: 'WORKSPACE.md',
+    optionalIfAbsent: true,
     reason:
       'a local-only workspace note naming E:\\DB\\W2M as the sole development copy and the old ' +
       'E:\\DSH\\DS\\W2M as read-only; it is a machine-local operator rule, not a document that ' +
-      'describes the shipped plugin, and packing it would put one developer path in every install.',
+      'describes the shipped plugin, and packing it would put one developer path in every install. ' +
+      'It is gitignored, so a clean checkout legitimately has no such file: the row is optional-if-absent ' +
+      'rather than stale.',
   },
 ];
 
@@ -477,6 +480,10 @@ export function documentContract({ root, files, exclusions = DOCUMENT_EXCLUSIONS
       );
     }
     if (!existsSync(join(root, path))) {
+      if (row.optionalIfAbsent === true) {
+        rows.delete(path);
+        continue;
+      }
       problems.push(
         `the exclusion of ${path} is stale: there is no such file in the tree, so the row excuses ` +
           'nothing and hides the next document that takes its name',
@@ -1034,7 +1041,6 @@ export const ACCEPTED_SKIPS = [
     suite: /.*/,
     match: /^no DeepSeek Harness installation on this machine$/,
     maxCount: 12,
-    platforms: ['linux', 'darwin'],
     why:
       'twelve assertions in backup-engine, backup-runtime, backup-verify and fix-renumber ask an installed ' +
       'DeepSeek Harness about a log; a host without one cannot answer, so each skips by this exact reason. ' +
@@ -1048,9 +1054,9 @@ export const ACCEPTED_SKIPS = [
     maxCount: 7,
     platforms: ['linux', 'darwin'],
     why:
-      'seven assertions drive the real DPAPI transport (two in backup-machine-key, one in backup-access, four ' +
-      'subplugin route cases); DPAPI exists only on Windows. The file-lifecycle paths run everywhere with an ' +
-      'injected runner, and the real transport runs on Windows in the compatibility job',
+      'six assertions drive the real DPAPI transport (unlock, machine-key, and four subplugin route cases); ' +
+      'DPAPI exists only on Windows. The same code paths are exercised on Windows in the compatibility job, ' +
+      'and the envelope/serialisation assertions that do not need DPAPI run on every host',
   },
   {
     key: 'drive-letters-are-windows-only',
@@ -1061,16 +1067,6 @@ export const ACCEPTED_SKIPS = [
     why:
       'two assertions reason about another drive letter (a missing drive in ensureLayout, an off-drive path ' +
       'in the mirror resolver); only Windows has drive letters, so a POSIX host skips them by name',
-  },
-{
-    key: 'surfaces-probe-archive-tab-opt-in',
-    suite: /^loader entry: the packed artifact/,
-    match: /^W2M_SURFACES_PROBE=1 enables the archive row in the throwaway profile and drives this probe$/,
-    maxCount: 1,
-    why:
-      'the archive-tab probe deliberately requires W2M_SURFACES_PROBE=1, which enables the dsh-backup-plugin row in a ' +
-      'throwaway profile; the release gate runs the loader suite without that opt-in because the other probes assert the ' +
-      'shipped disabled state. The probe runs when the variable is set, and the skip names the exact switch',
   },
 ];
 
