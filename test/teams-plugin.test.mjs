@@ -287,6 +287,26 @@ describe('dsh-teams wiring', () => {
     assert.equal(JSON.stringify(report).includes('authorization'), false);
   });
 
+  it('resolves defineTool from the shared loader when no dependency injects one', async () => {
+    const { ctx, registered } = fakeContext();
+    const dispose = await apply(
+      ctx,
+      { rabbitUrl: 'http://relay.test:8787', projectId: 'default', stateDir: 'C:/w2m-state', dataRetryDelayMs: 0 },
+      {
+        env: {},
+        device: { machine_id: 'machine-a' },
+        deviceToken: 'secret-token',
+        now: () => NOW,
+        requestImpl: async () => {
+          throw new Error('mount must not call the relay');
+        },
+        listPlansImpl: () => ({ ok: true, plans: [], total: 0 }),
+      },
+    );
+    assert.equal(typeof dispose, 'function');
+    assert.deepEqual(registered, [...TOOL_NAMES]);
+  });
+
   it('degrades to a useful status when this machine is not paired', async () => {
     const { ctx, definitions } = fakeContext();
     await apply(

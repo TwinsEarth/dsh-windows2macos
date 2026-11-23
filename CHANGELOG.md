@@ -2,6 +2,12 @@
 
 All notable changes to this project are documented here.
 
+## [3.5.9] — 2026-11-23
+
+### Fixed
+
+- **dsh-teams 子插件启动报错**：src/plugin/teams-plugin.mjs 不再 require 不存在的 ../../lib/tool-kit.js，改为复用 src/plugin/tools/shared.mjs 的 loadDefineTool（优先 @deepseek-ai/dsh-tools，缺包时回退）；新增回归用例，未注入 defineTool 时也能挂载 3 个工具。
+
 ## [3.5.8] — 2026-11-23
 
 ### feat(teams): WebRTC 数据面接线（shared pool + artifact sink + merge CLI）

@@ -6,7 +6,6 @@
  * page; this plugin exposes two reads plus one data-plane send so a model can see the team and move artifact bytes without acquiring dispatch authority.
  */
 
-import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
 import {
   TEAMS_DEFAULT_PROJECT_ID,
@@ -20,8 +19,7 @@ import {
   TEAM_DATA_MAX_ATTEMPTS,
 } from './teams/transport-policy.mjs';
 import { getSharedWebRtcPool } from './webrtc-pool-registry.mjs';
-
-const require = createRequire(import.meta.url);
+import { loadDefineTool } from './tools/shared.mjs';
 
 /** Plugin row id in `cordis.patch.yml`. */
 export const TEAMS_ROW_ID = 'dsh-teams';
@@ -39,14 +37,6 @@ export const TOOL_NAMES = ['w2m_team_status', 'w2m_team_room', 'w2m_team_artifac
 export const DEFAULT_STALE_AFTER_MS = 90_000;
 
 const json = (value) => JSON.stringify(value, null, 2);
-
-/**
- * @param {string} id
- * @returns {typeof import('../../lib/tool-kit.js').defineTool}
- */
-function loadDefineTool() {
-  return require('../../lib/tool-kit.js').defineTool;
-}
 
 /**
  * Normalize the row config. Accepts both camelCase (the yml style used by other rows) and
