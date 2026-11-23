@@ -186,6 +186,11 @@ getWebRtcPoolRuntime()
 
 ### P4：桌面生产默认与回落收紧（1 天）
 
+> 状态：已落地（2026-11-24）。`dsh-desktop` 行可配置 `transport` / `allowLegacyP2P` /
+> `prepareTimeoutMs` / `handshakeTimeoutMs`，`remote-view.json` 存在时覆盖行默认；`auto` 仅在
+> `allowLegacyP2P:true` 时尝试旧 UDP，否则固定 WebRTC -> relay；`/start` 五个固定字段与
+> `/config` 四个运行态字段均已落地。验收记录：`docs/acceptance/3.6.0/P4-DESKTOP-ROW-CONFIG.md`。
+
 修改 `src/plugin/desktop.mjs` / `src/plugin/remote-view-route.mjs`：
 
 - `registerDesktop(ctx, deps)` 接受 `transport`、`allowLegacyP2P`、`prepareTimeoutMs`、`handshakeTimeoutMs`。
