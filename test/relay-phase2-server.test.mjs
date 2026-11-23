@@ -388,6 +388,91 @@ describe('Phase 2 server wiring: cross-relay pull over real HTTP', () => {
   });
 });
 
+describe('remote view WebRTC warm-up control plane', () => {
+  it('carries the transport intent and a one-shot target ack, and refuses impostors', async () => {
+    const a = await startRelay('w2m-phase2-remote-ack-');
+    try {
+      const target = await pairDevice(a, 'target-1');
+      const viewer = await pairDevice(a, 'viewer-1');
+      const intruder = await pairDevice(a, 'viewer-2');
+      const key = Buffer.alloc(32, 21).toString('base64');
+
+      const posted = await call(a.url, '/v1/remote/request', {
+        method: 'POST',
+        token: viewer,
+        body: {
+          session_id: 's-web',
+          target: 'target-1',
+          viewer_public_key: key,
+          viewer_machine_id: 'viewer-1',
+          transport: 'webrtc',
+        },
+      });
+      assert.equal(posted.status, 200, posted.text);
+
+      const taken = await call(a.url, '/v1/remote/request?target=target-1', { token: target });
+      assert.equal(taken.status, 200, taken.text);
+      assert.equal(taken.json.transport, 'webrtc');
+      assert.equal(taken.json.viewer_machine_id, 'viewer-1');
+
+      const wrongTarget = await call(a.url, '/v1/remote/ack', {
+        method: 'POST',
+        token: viewer,
+        body: { session_id: 's-web', target: 'target-1', viewer_machine_id: 'viewer-1', ok: true },
+      });
+      assert.equal(wrongTarget.status, 403, 'only the target may answer');
+
+      const answered = await call(a.url, '/v1/remote/ack', {
+        method: 'POST',
+        token: target,
+        body: {
+          session_id: 's-web',
+          target: 'target-1',
+          viewer_machine_id: 'viewer-1',
+          ok: true,
+          code: 'WEBRTC_PREPARED',
+        },
+      });
+      assert.equal(answered.status, 200, answered.text);
+
+      const stolen = await call(a.url, '/v1/remote/ack?session_id=s-web&target=target-1', { token: intruder });
+      assert.equal(stolen.status, 403, 'another machine cannot consume the ack');
+      assert.equal(stolen.json.error.code, 'REMOTE_ACK_FORBIDDEN');
+
+      const read = await call(a.url, '/v1/remote/ack?session_id=s-web&target=target-1', { token: viewer });
+      assert.equal(read.status, 200, read.text);
+      assert.equal(read.json.prepared, true);
+
+      const again = await call(a.url, '/v1/remote/ack?session_id=s-web&target=target-1', { token: viewer });
+      assert.equal(again.status, 404, 'an ack is one-shot');
+    } finally {
+      await closeAll([a.relay]);
+    }
+  });
+
+  it('refuses a viewer that speaks for another machine', async () => {
+    const a = await startRelay('w2m-phase2-remote-spoof-');
+    try {
+      const viewer = await pairDevice(a, 'viewer-1');
+      await pairDevice(a, 'target-1');
+      const posted = await call(a.url, '/v1/remote/request', {
+        method: 'POST',
+        token: viewer,
+        body: {
+          session_id: 's-spoof',
+          target: 'target-1',
+          viewer_public_key: Buffer.alloc(32, 3).toString('base64'),
+          viewer_machine_id: 'viewer-2',
+          transport: 'webrtc',
+        },
+      });
+      assert.equal(posted.status, 403, posted.text);
+    } finally {
+      await closeAll([a.relay]);
+    }
+  });
+});
+
 describe('Phase 2 server wiring: the restored user-facing signature error', () => {
   it('a wrong signing secret returns SIGNATURE_MISMATCH and the readable sentence from server.mjs', async () => {
     const a = await startRelay('w2m-phase2-signature-', { signingSecret: 'the-real-shared-secret' });

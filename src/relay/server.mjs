@@ -1754,9 +1754,11 @@ export class RelayServer {
       if (method === 'POST') {
         const body = takeJson();
         const target = typeof body?.target === 'string' ? body.target : '';
-        const targetDevice = target === '' ? null : this.state.devices.get(target);
-        if (targetDevice === undefined || targetDevice === null || targetDevice.fleet_id !== device.fleet_id) {
+        if (target === '' || this.state.devices.get(target)?.fleet_id !== device.fleet_id) {
           return sendJson(res, 403, { protocol_version: PROTOCOL_VERSION, ok: false, error: { code: 'REMOTE_REQUEST_BAD', message: 'target is not in this fleet' } });
+        }
+        if (body?.viewer_machine_id !== undefined && body.viewer_machine_id !== device.machine_id) {
+          return sendJson(res, 403, { protocol_version: PROTOCOL_VERSION, ok: false, error: { code: 'REMOTE_REQUEST_BAD', message: 'viewer_machine_id must be this machine' } });
         }
         const posted = this.remoteRequests.post(body);
         if (posted.ok !== true) return sendJson(res, 400, { protocol_version: PROTOCOL_VERSION, ok: false, error: { code: posted.code, message: 'remote.request refused' } });
@@ -1768,6 +1770,51 @@ export class RelayServer {
         const taken = this.remoteRequests.take(target);
         if (taken.ok !== true) return sendJson(res, 404, { protocol_version: PROTOCOL_VERSION, ok: false, error: { code: taken.code, message: 'remote.request unavailable' } });
         return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, ok: true, ...taken });
+      }
+      return sendJson(res, 405, { protocol_version: PROTOCOL_VERSION, ok: false, error: { code: 'METHOD_NOT_ALLOWED', message: 'GET or POST only' } });
+    }
+
+    if (path === '/v1/remote/ack') {
+      /**
+       * v3.6.0: the target's warm-up answer for a WebRTC remote-view request.
+       *
+       * This is control plane only: no frame bytes, no capture, no key material
+       * beyond the session id. A target may only answer for itself; a viewer may
+       * only read an ack recorded for its own machine id.
+       */
+      this.remoteRequests ??= createRemoteRequestBroker();
+      if (method === 'POST') {
+        const body = takeJson();
+        const target = typeof body?.target === 'string' ? body.target : '';
+        if (target !== device.machine_id) {
+          return sendJson(res, 403, { protocol_version: PROTOCOL_VERSION, ok: false, error: { code: 'REMOTE_ACK_BAD', message: 'only the target may answer' } });
+        }
+        const posted = this.remoteRequests.ack(body);
+        if (posted.ok !== true) return sendJson(res, 400, { protocol_version: PROTOCOL_VERSION, ok: false, error: { code: posted.code, message: 'remote.ack refused' } });
+        return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, ok: true, target: posted.target, session_id: posted.session_id });
+      }
+      if (method === 'GET') {
+        const sessionId = url.searchParams.get('session_id');
+        const target = url.searchParams.get('target');
+        if (typeof sessionId !== 'string' || sessionId === '') {
+          return sendJson(res, 400, { protocol_version: PROTOCOL_VERSION, ok: false, error: { code: 'REMOTE_ACK_BAD', message: 'session_id is required' } });
+        }
+        if (typeof target !== 'string' || target === '') {
+          return sendJson(res, 400, { protocol_version: PROTOCOL_VERSION, ok: false, error: { code: 'REMOTE_ACK_BAD', message: 'target is required' } });
+        }
+        const taken = this.remoteRequests.takeAck(target, sessionId, device.machine_id);
+        if (taken.ok !== true) {
+          const status = taken.code === 'REMOTE_ACK_FORBIDDEN' ? 403 : 404;
+          return sendJson(res, status, { protocol_version: PROTOCOL_VERSION, ok: false, error: { code: taken.code, message: 'remote.ack unavailable' } });
+        }
+        return sendJson(res, 200, {
+          protocol_version: PROTOCOL_VERSION,
+          ok: true,
+          session_id: taken.session_id,
+          target: taken.target,
+          prepared: taken.prepared,
+          reason: taken.reason,
+        });
       }
       return sendJson(res, 405, { protocol_version: PROTOCOL_VERSION, ok: false, error: { code: 'METHOD_NOT_ALLOWED', message: 'GET or POST only' } });
     }

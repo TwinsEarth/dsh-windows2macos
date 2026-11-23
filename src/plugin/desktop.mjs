@@ -7,6 +7,7 @@
  * idempotency guard because both entries share this module instance.
  */
 import { registerRemoteViewRoutes } from './remote-view-route.mjs';
+import { getSharedWebRtcPool } from './webrtc-pool-registry.mjs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -28,16 +29,23 @@ const registered = new WeakSet();
 
 /**
  * @param {object} ctx Cordis context
- * @param {{stateDir?:string, p2p?:object|null}} [deps]
+ * @param {{stateDir?:string, p2p?:object|null, getPool?:()=>object|null}} [deps]
+ *   `getPool` is optional: when omitted, the route resolves the process-wide shared pool on every
+ *   `/start`, so a root row mounted before the pool exists is not frozen to relay.
  */
 export function registerDesktop(ctx, deps = {}) {
   if (ctx === null || typeof ctx !== 'object') return { mounted: false, reason: 'no ctx' };
   if (registered.has(ctx)) return { mounted: false, reason: 'already registered' };
   registered.add(ctx);
-  return registerRemoteViewRoutes(ctx, {
+  const options = {
     stateDir: typeof deps.stateDir === 'string' ? deps.stateDir : '',
     p2p: deps.p2p ?? null,
-  });
+  };
+  // Omit `getPool` when the caller has none: `remote-view-route` then falls back to the process-wide
+  // registry at request time. Passing `() => null` here would freeze the root row to relay forever if
+  // it mounted before the shared pool existed.
+  if (typeof deps.getPool === 'function') options.getPool = deps.getPool;
+  return registerRemoteViewRoutes(ctx, options);
 }
 
 /**
@@ -74,7 +82,7 @@ export function registerDesktopHealthRoute(ctx) {
 export function apply(ctx) {
   const stateDir = process.env.W2M_STATE_DIR
     ?? (process.env.DSH_HOME ? join(process.env.DSH_HOME, 'xclient') : join(homedir(), '.dsh', 'xclient'));
-  const status = registerDesktop(ctx, { stateDir, p2p: null });
+  const status = registerDesktop(ctx, { stateDir, p2p: null, getPool: getSharedWebRtcPool });
   registerDesktopHealthRoute(ctx);
   return status;
 }

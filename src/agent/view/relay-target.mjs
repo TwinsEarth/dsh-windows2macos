@@ -15,10 +15,12 @@ import { createViewSide, sealViewFrame } from './session-key.mjs';
 
 export const REMOTE_REQUEST_PATH = '/v1/remote/request';
 export const REMOTE_FRAME_PATH = '/v1/remote/frame';
+export const REMOTE_ACK_PATH = '/v1/remote/ack';
 
 /**
  * @param {{rabbitUrl:string, token:()=>string|null, machineId:string, capture:Function,
  *   allow?:()=>boolean, intervalMs?:number, maxBytes?:number, maxFrames?:number,
+ *   prepareWebRtc?:(viewerMachineId:string)=>Promise<{ok:boolean, code?:string, detail?:string}>,
  *   fetchImpl?:Function, log?:Function}} deps
  */
 export function startRelayViewTarget(deps) {
@@ -91,11 +93,61 @@ export function startRelayViewTarget(deps) {
     if (stopped || !response.ok) return;
     const body = await response.json().catch(() => null);
     if (body?.ok !== true || typeof body.viewer_public_key !== 'string' || typeof body.session_id !== 'string') return;
+    const viewerMachineId = typeof body.viewer_machine_id === 'string' ? body.viewer_machine_id : '';
+    if (body.transport === 'webrtc' && viewerMachineId !== '') {
+      await prepareWebRtc(viewerMachineId, body.session_id, token);
+      return;
+    }
     const side = createViewSide();
     let vk;
     try { vk = side.finish(body.viewer_public_key).key; } catch { return; }
     active = { sessionId: body.session_id, side, vk, frames: 0, inFlight: false };
     await tick();
+  };
+
+  /**
+   * Warm this machine's shared pool for the viewer, then tell the viewer over
+   * the authenticated relay control plane.
+   *
+   * The target must start its half of the pair; a viewer cannot make a
+   * DataChannel alone. This runs before `active` is set, so a webrtc-intent
+   * request never also starts a relay frame stream. If warm-up fails, the
+   * `ok:false` ack is what lets the viewer fall back immediately instead of
+   * waiting for a media timeout.
+   */
+  const prepareWebRtc = async (viewerMachineId, sessionId, token) => {
+    let prepared;
+    try {
+      prepared = typeof deps.prepareWebRtc === 'function'
+        ? await deps.prepareWebRtc(viewerMachineId)
+        : { ok: false, code: 'WEBRTC_POOL_UNAVAILABLE', detail: 'this host has no shared WebRTC pool' };
+    } catch (error) {
+      prepared = {
+        ok: false,
+        code: 'WEBRTC_PREPARE_FAILED',
+        detail: error instanceof Error ? error.message : String(error),
+      };
+    }
+    try {
+      await fetchImpl(base + REMOTE_ACK_PATH, {
+        method: 'POST',
+        headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          session_id: sessionId,
+          target: deps.machineId,
+          viewer_machine_id: viewerMachineId,
+          ok: prepared?.ok === true,
+          code: prepared?.ok === true ? 'WEBRTC_PREPARED' : (prepared?.code ?? 'WEBRTC_PREPARE_FAILED'),
+        }),
+      });
+    } catch {
+      /* The viewer's ack poll times out and falls back to relay; never fatal here. */
+    }
+    deps.log?.('info', 'remote view WebRTC warm-up', {
+      viewer: viewerMachineId,
+      ok: prepared?.ok === true,
+      code: prepared?.ok === true ? 'WEBRTC_PREPARED' : (prepared?.code ?? 'WEBRTC_PREPARE_FAILED'),
+    });
   };
 
   pollTimer = setInterval(() => { void poll(); }, intervalMs);

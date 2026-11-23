@@ -291,6 +291,33 @@
         # autoStart is still opt-in even when the row is enabled; mount-time has no process side effects.
         autoStart: false
 
+    # P2P V2 文件面 (dsh-p2p-v2): WebTorrent 负责多对多分片，V1 WebRTC 是它的 peer 传输层。
+    #
+    # 任务分发仍走上面的 `dsh-p2p-webrtc` 共享 pool；V2 不建立第二个调度器，也不把文件字节塞进
+    # relay。`share`/`add` 惰性加载 WebTorrent；`attach` 才打开 V1 pair；`stop`/`detach` 只销毁
+    # 逻辑 torrent 流，绝不 `closePeer`。WebTorrent 是可选引擎：包本身仍是零运行时依赖，生产需要
+    # 单独安装并把 `webTorrentModule` 指向入口文件，缺失时按名称拒绝。
+    #
+    # 默认关闭 tracker/DHT/LSD/uTP/UPnP/NAT-PMP，只连显式传入的编队 machine id。开启
+    # `allowNativeTrackers` 才会把 `trackers` 发布给公共 tracker；这是不同的隐私合同。
+    # Docs: docs/design/P2P-V2-WEBTORRENT.md.
+    - id: dsh-p2p-v2
+      name: '@twinsearth/w2m-dsh-plugin/dsh-p2p-v2'
+      disabled: true
+      config:
+        # 'webtorrent' uses the host's resolution; absolute/file path points at an external install.
+        webTorrentModule: 'webtorrent'
+        # Empty state dir means <DSH_HOME>/p2p-v2. Reserved for metadata/cache; no bytes are stored here.
+        stateDir: ''
+        trackers: []
+        allowNativeTrackers: false
+        maxShares: 8
+        maxPeersPerShare: 16
+        maxConns: 32
+        readyTimeoutMs: 30000
+        metadataTimeoutMs: 10000
+        writeTimeoutMs: 15000
+
 
     # Teams 子插件 (dsh-teams): opt-in 编队联合开发与多机实时协同的产品面与 WebRTC 数据面。它不是新的派发入口：
     # 审批与派发仍在 `w2m-joint`（操作员 CLI）和设置页，模型只能看到房间和状态，不能签审批、不能发命令。

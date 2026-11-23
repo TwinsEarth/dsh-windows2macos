@@ -31,6 +31,7 @@ import { redactEnvelope } from '../../util/redact.mjs';
 import { canonicalSignedPayload } from '../../util/envelope-signature.mjs';
 import { CRYPTO_REASON, deriveSigningKey } from '../crypto.mjs';
 import { P2P_DEFAULTS, P2PNode } from '../p2p-node.mjs';
+import { isTorrentFrame } from '../webtorrent/multiplex.mjs';
 import { punchSession, reverseDialSession } from '../p2p.mjs';
 import {
   ENVELOPE_VERSION,
@@ -1341,6 +1342,10 @@ export function createDeliverPhase(deps) {
     const peer = typeof event?.peer === 'string' && event.peer !== '' ? event.peer : null;
     if (peer === null || event?.payload === undefined || event?.payload === null) return;
     const raw = Buffer.isBuffer(event.payload) ? event.payload : Buffer.from(String(event.payload), 'utf8');
+    // P2P V2 tags its WebTorrent wire chunks so one shared pair can carry both file pieces and the
+    // JSON dispatcher. This consumer owns task/Teams/view frames only; silently leave the tagged
+    // bytes to the V2 service instead of logging one warning per BitTorrent chunk.
+    if (isTorrentFrame(raw)) return;
     let frame = null;
     try {
       frame = JSON.parse(raw.toString('utf8'));

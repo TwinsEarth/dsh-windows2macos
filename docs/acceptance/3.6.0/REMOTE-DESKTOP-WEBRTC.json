@@ -1,0 +1,31 @@
+{
+  "version": "3.6.0",
+  "case": "REMOTE-DESKTOP-WEBRTC-DEFAULT-360",
+  "kind": "positive",
+  "machines": [
+    "14ba0e60-14f5-4ab8-a2fe-d7cd4f51d833"
+  ],
+  "executed_at": "2026-11-23T21:07:54+08:00",
+  "executor": "agent",
+  "task_id": "remote-desktop-webrtc-default",
+  "requirement": "v3.6.0 release candidate: prove the remote-desktop /start path borrows the shared WebRtcTransportPool by default, warms the target half over the relay ack control plane, keeps view frames off the relay, falls back only when transport=auto and names why, and never closes a shared peer on stop.",
+  "commands": [
+    ["node", "--test", "--test-force-exit", "test/remote-view-route.test.mjs", "test/remote-requests.test.mjs", "test/relay-target.test.mjs", "test/relay-phase2-server.test.mjs"],
+    ["node", "--test", "--test-force-exit", "test/client-bundle.test.mjs", "test/client-budget.test.mjs", "test/p2p-webrtc-pool.test.mjs", "test/p2p-webrtc-deliver.test.mjs", "test/p2p-webrtc-dispatch.test.mjs"],
+    ["npx", "eslint", ".", "--quiet"]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "viewer_happy_path": "remote-view-route starts channel=webrtc; the first pool payload is view.hello; view.hello_ack drives view.request; a 4 KiB sealed view.frame is opened locally; relay request count is 1 and relay frame count is 0.",
+      "viewer_target_order": "The viewer calls pool.ensure(target) before the ack poll completes; a target that cannot answer until a peer is in the room does not deadlock the start path.",
+      "stop_shared_pool": "POST /api/w2m/remote/stop sends view.stop, removes the desktop pool subscription, and does not call closePeer on the shared transport.",
+      "fallback_and_strict": "ack prepared=false yields channel=relay with fallback_reason=WEBRTC_POOL_UNAVAILABLE; transport=webrtc returns 502 WEBRTC_UNAVAILABLE and never dials UDP or relay.",
+      "target_warmup": "A transport=webrtc request calls prepareWebRtc(viewer_machine_id), posts one ack with ok/code, and starts no relay frame stream; a prepare failure posts ok:false; an old request without transport still streams relay frames.",
+      "relay_ack_security": "POST /v1/remote/ack is refused for a non-target; GET is 403 REMOTE_ACK_FORBIDDEN for a different machine without consuming the record; the real viewer reads prepared=true once and the second read is 404; a viewer cannot post another machine's viewer_machine_id.",
+      "mailbox": "remote-requests keeps transport=webrtc and viewer_machine_id, defaults old requests to relay, and expires acks.",
+      "late_registry_binding": "registerDesktop mounted before the shared pool exists still borrows the process-wide registry at /start time; it never freezes to the no-pool closure.",
+      "regression": "193 tests passed, 0 failed across the 9 named suites; full-repository ESLint exited 0 with 0 errors."
+    }
+  }
+}

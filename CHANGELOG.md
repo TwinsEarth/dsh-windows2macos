@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented here.
 
+## [3.6.0] — 2026-11-23
+
+### feat(desktop): 远程桌面默认走共享 WebRTC 传输层
+
+- **生产默认路径**：`/api/w2m/remote/start` 在 `transport=auto`（默认）下先借用进程级 `WebRtcTransportPool`，在 Noise-sealed DataChannel 上跑 `view.hello` / `view.hello_ack` / `view.request` / `view.frame`；WebRTC 帧绝不进入 relay。
+- **目标端冷启动预热**：viewer 先经加密 relay 控制面发布 `transport:'webrtc'` + `viewer_machine_id`；目标端 `relay-target` 调用共享 pool 的 `prepare(viewerId)`，再通过新增的一比特 `/v1/remote/ack` 邮箱回写 `{ok,code}`。目标端在 webrtc intent 下不启动 relay 帧流。
+- **共享 pool 生命周期**：桌面子插件只通过 `getSharedWebRtcPool()` 借用，不拥有 pool；`/stop` 只发 `view.stop` 并退订 `onMessage`，不调用 `closePeer()`，避免拆掉同 peer 上的 Teams / 任务数据面。
+- **三态与命名失败**：`transport=auto|webrtc|relay`；`webrtc` 严格不回落，失败返回 `WEBRTC_UNAVAILABLE`；`auto` 回落时 `/start` 明确给出 `channel`、`fallback_reason`、`webrtc_error`；旧 relay 无 ack 路由时 viewer 快速回落，不等待超时。
+- **挂载顺序不再影响传输**：`registerDesktop` 只在调用方显式注入 `getPool` 时覆盖；root 行先挂载、共享 pool 后到时，路由在每次 `/start` 从进程级 registry 晚绑定，避免被 `() => null` 永久锁死在 relay。
+- **控制面超时**：`/v1/remote/request`、ack 轮询、relay 帧各带 3-5s abort 超时，单次挂起的 fetch 不会拖死 8s ack 预算。
+- **控制面安全**：relay 只允许目标端为自己的 machine id 写 ack，且只允许对应 viewer 读取/消费一次；viewer 不得在 `viewer_machine_id` 里冒充其他机器。
+- **测试**：`test/remote-view-route.test.mjs` 新增共享 pool happy path（帧不走 relay）、stop 不 closePeer、ack=false 回落、strict 502、目标端预热/拒绝/旧 viewer 兼容，以及“先挂载、后拿到 pool”的晚绑定项；`test/remote-requests.test.mjs` 覆盖 transport 意图与一次性 ack；`test/relay-phase2-server.test.mjs` 覆盖 `/v1/remote/ack` 的越权拒绝与冒充拒绝。
+- **版本**：package/plugin/marketplace/codex 清单统一升到 3.6.0。
+
 ## [3.5.9] — 2026-11-23
 
 ### Fixed

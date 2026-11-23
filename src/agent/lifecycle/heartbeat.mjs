@@ -824,6 +824,21 @@ let attemptAttached = false;
       machineId: identity.machine_id,
       capture: (options) => captureScreen({ ...(options ?? {}), fast: true }),
       allow: () => viewAllowed(stateDir),
+      prepareWebRtc: async (viewerMachineId) => {
+        const pool = deps.webrtcPool;
+        if (pool === null || typeof pool?.prepare !== 'function') {
+          return { ok: false, code: 'WEBRTC_POOL_UNAVAILABLE', detail: 'this host has no shared WebRTC pool' };
+        }
+        try {
+          return await pool.prepare(viewerMachineId);
+        } catch (error) {
+          return {
+            ok: false,
+            code: 'WEBRTC_PREPARE_FAILED',
+            detail: error instanceof Error ? error.message : String(error),
+          };
+        }
+      },
       log,
     });
     if (statePublishIntervalMs > 0) {

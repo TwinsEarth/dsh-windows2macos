@@ -177,7 +177,7 @@ const REGISTERED = registered.map((d) => d.name).sort();
  * mount them; a fleet install must not start a WebRTC engine or read a Teams room.
  */
 const SUBPLUGIN_TOOL_NAMES = new Set();
-for (const entry of ['lib/teams-plugin.js', 'lib/p2p-webrtc-plugin.js']) {
+for (const entry of ['lib/teams-plugin.js', 'lib/p2p-webrtc-plugin.js', 'lib/p2p-v2-plugin.js']) {
   const plugin = await import(pathToFileURL(join(ROOT, entry)).href);
   for (const toolName of plugin.TOOL_NAMES ?? []) SUBPLUGIN_TOOL_NAMES.add(toolName);
 }
