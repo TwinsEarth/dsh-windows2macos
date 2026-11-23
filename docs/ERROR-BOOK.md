@@ -58,7 +58,13 @@ and that reason is not on the accepted list
 
 **修复**
 
-在 `ACCEPTED_SKIPS` 新增 `surfaces-probe-archive-tab-opt-in`：suite `/^loader entry: the packed artifact/`、match `/^W2M_SURFACES_PROBE=1 enables the archive row in the throwaway profile and drives this probe$/`、maxCount 1，并写明这是 opt-in 开关。提交 `21976d2`（因 git 端口被重置，用 GitHub Contents API 推送到 `work/v3.4.6`）。`test/claims.test.mjs` 47 通过 0 失败。
+真正的白名单有两处：`scripts/preflight.mjs` 的 `ACCEPTED_SKIPS`（整仓 preflight），以及 `.github/workflows/compat.yml` 内联 verdict 程序的 `ACCEPTED_UNVERIFIABLE` / `acceptedFor`（Compat 的 loader gate）。后者原本只接受 page half “boots the profile” 的跳过，opt-in 探针一律判红。
+
+修复：
+- `scripts/preflight.mjs` 新增 `surfaces-probe-archive-tab-opt-in`（suite `/^loader entry: the packed artifact/`、match 同上、maxCount 1）。
+- `compat.yml` 新增 `OPT_IN_SKIPS` 名单，`acceptedFor` 对非 page 的跳过按“测试名 + 原因”精确匹配；错误文案改为“accepted lists cover only page half and named opt-in probes”。
+
+提交：`21976d2`（preflight）与后续 compat 修复（因 git 端口被重置，用 GitHub Contents API 推送到 `work/v3.4.6`）。
 
 **防复发**
 
