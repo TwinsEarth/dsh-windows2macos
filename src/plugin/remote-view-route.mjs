@@ -21,10 +21,10 @@
  * deliberately not called here, because Teams and task delivery share that
  * transport.
  */
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { captureHostScreen } from './capture-route.mjs';
-import { getSharedWebRtcPool } from './webrtc-pool-registry.mjs';
+import { getSharedWebRtcPool, getSharedWebRtcPoolState } from './webrtc-pool-registry.mjs';
 import { createViewSide, openViewFrame } from '../agent/view/session-key.mjs';
 import { resolveStateDir } from '../util/cli.mjs';
 
@@ -40,12 +40,30 @@ function normalizeTransport(value) {
   return 'auto';
 }
 
-function readConfig(file) {
+function readConfig(file, defaults = {}) {
+  const defaultTransport = normalizeTransport(defaults.transport);
+  const defaultSource = defaults.transportSource === 'row' ? 'row' : 'default';
+  if (!existsSync(file)) {
+    return { ok: true, enabled: false, transport: defaultTransport, transport_source: defaultSource };
+  }
   try {
     const parsed = JSON.parse(readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
-    return { ok: true, enabled: parsed?.enabled === true, transport: normalizeTransport(parsed?.transport) };
+    return {
+      ok: true,
+      enabled: parsed?.enabled === true,
+      transport: normalizeTransport(parsed?.transport),
+      transport_source: 'json',
+    };
   } catch {
-    return { ok: true, enabled: false, transport: 'auto' };
+    // The file exists but is not usable. Do not silently resurrect a row default: enabled stays
+    // false, so /start refuses, and the caller can see that the JSON itself is broken.
+    return {
+      ok: false,
+      enabled: false,
+      transport: 'auto',
+      transport_source: 'json',
+      error: 'REMOTE_CONFIG_INVALID',
+    };
   }
 }
 
@@ -95,9 +113,13 @@ const timeoutSignal = (ms) => (
 
 /**
  * @param {object} ctx Cordis context
- * @param {{stateDir:string, p2p?:object, getPool?:()=>object|null, pool?:object|null, capture?:Function,
- *   platform?:string, maxBytes?:number, prepareTimeoutMs?:number, handshakeTimeoutMs?:number,
- *   ackPollMs?:number}} deps
+ * @param {{stateDir:string, p2p?:object, getPool?:()=>object|null, getPoolState?:()=>object|null,
+ *   pool?:object|null, capture?:Function, platform?:string, maxBytes?:number,
+ *   prepareTimeoutMs?:number, handshakeTimeoutMs?:number, ackPollMs?:number,
+ *   transport?:'auto'|'webrtc'|'relay', allowLegacyP2P?:boolean}} deps
+ *   `transport` and `allowLegacyP2P` are row defaults: they apply only until `remote-view.json`
+ *   exists. `allowLegacyP2P` defaults to false, so `auto` never dials the old UDP path unless a
+ *   row explicitly opts in.
  */
 export function registerRemoteViewRoutes(ctx, deps = {}) {
   const status = { mounted: false, reason: 'the host has no Connection service', configPath: null };
@@ -109,9 +131,20 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
   const capture = deps.capture ?? captureHostScreen;
   const platform = deps.platform ?? process.platform;
   const p2p = deps.p2p ?? null;
+  const hasExplicitPool = typeof deps.getPool === 'function'
+    || (typeof deps.pool === 'object' && deps.pool !== null);
   const getPool = typeof deps.getPool === 'function'
     ? deps.getPool
     : (typeof deps.pool === 'object' && deps.pool !== null ? () => deps.pool : getSharedWebRtcPool);
+  // Owner/ready only make sense for the registry-backed pool. A test-injected pool has no registry
+  // record, so it reports no state rather than borrowing the process-wide owner by accident.
+  const getPoolState = typeof deps.getPoolState === 'function'
+    ? deps.getPoolState
+    : (hasExplicitPool ? () => null : getSharedWebRtcPoolState);
+  const rowTransportSpecified = Object.hasOwn(deps, 'transport');
+  const defaultTransport = rowTransportSpecified ? normalizeTransport(deps.transport) : 'auto';
+  const defaultTransportSource = rowTransportSpecified ? 'row' : 'default';
+  const allowLegacyP2P = deps.allowLegacyP2P === true;
   const maxBytes = Number.isInteger(deps.maxBytes) ? deps.maxBytes : 96 * 1024;
   const prepareTimeoutMs = Number.isInteger(deps.prepareTimeoutMs) && deps.prepareTimeoutMs > 0
     ? deps.prepareTimeoutMs
@@ -238,19 +271,38 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
     return sent;
   };
 
-  const connectWebrtc = async ({ pool, machineId, sessionId, side }) => {
+  const connectWebrtc = async ({ pool, poolState, machineId, sessionId, side }) => {
+    const startedAt = Date.now();
+    const state = poolState !== null && typeof poolState === 'object' ? poolState : null;
+    const poolMachineId = typeof pool?.machineId === 'string' && pool.machineId !== ''
+      ? pool.machineId
+      : (typeof state?.machine_id === 'string' ? state.machine_id : null);
+    // `pool_owner` is this viewer's pool owner (the process that published the transport), not the
+    // target's. The target's owner travels back in the ack and is surfaced as `ack_pool_owner`, so a
+    // reader can tell which side of the pair is borrowed.
+    const finish = (result) => {
+      const ackBody = result.ack !== null && typeof result.ack === 'object' ? result.ack : null;
+      return {
+        ...result,
+        pool_owner: state?.owner ?? null,
+        pool_machine_id: poolMachineId,
+        prepare_ms: Date.now() - startedAt,
+        ack_code: result.ack_code ?? ackBody?.code ?? (result.ok === true ? 'WEBRTC_PREPARED' : null),
+        ack_pool_owner: result.ack_pool_owner ?? ackBody?.pool_owner ?? null,
+      };
+    };
     if (pool === null || typeof pool !== 'object' || typeof pool.ensure !== 'function' || typeof pool.send !== 'function') {
-      return { ok: false, code: 'WEBRTC_POOL_UNAVAILABLE', detail: 'this host has no shared WebRTC pool' };
+      return finish({ ok: false, code: 'WEBRTC_POOL_UNAVAILABLE', detail: 'this host has no shared WebRTC pool' });
     }
     if (typeof pool.onMessage !== 'function') {
-      return { ok: false, code: 'WEBRTC_POOL_INVALID', detail: 'the shared pool has no onMessage()' };
+      return finish({ ok: false, code: 'WEBRTC_POOL_INVALID', detail: 'the shared pool has no onMessage()' });
     }
     const device = readDevice(stateDir);
     const viewerMachineId = device.machineId !== ''
       ? device.machineId
       : (typeof pool.machineId === 'string' ? pool.machineId : '');
     if (viewerMachineId === '') {
-      return { ok: false, code: 'WEBRTC_VIEWER_ID_UNAVAILABLE', detail: 'device.json has no machine_id' };
+      return finish({ ok: false, code: 'WEBRTC_VIEWER_ID_UNAVAILABLE', detail: 'device.json has no machine_id' });
     }
     const asked = await postRelayRequest({
       machineId,
@@ -260,7 +312,7 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
       viewerMachineId,
     });
     if (asked.ok !== true) {
-      return { ok: false, code: 'WEBRTC_ACK_UNAVAILABLE', detail: asked.error };
+      return finish({ ok: false, code: 'WEBRTC_ACK_UNAVAILABLE', detail: asked.error });
     }
 
     // The target's `prepare()` and this `ensure()` must be in flight together: each side of the pair
@@ -296,17 +348,24 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
         readyFailure,
       ]);
     } catch (error) {
-      return {
+      return finish({
         ok: false,
         code: error?.viewResult?.code ?? 'WEBRTC_POOL_START_FAILED',
         detail: error?.viewResult?.detail ?? (error instanceof Error ? error.message : String(error)),
-      };
+      });
     }
-    if (ack.ok !== true) return { ok: false, code: ack.code, detail: ack.detail ?? null, ack: ack.body ?? null };
+    if (ack.ok !== true) {
+      return finish({ ok: false, code: ack.code, detail: ack.detail ?? null, ack: ack.body ?? null });
+    }
 
     const ready = await readyPromise;
     if (ready.ok !== true) {
-      return { ok: false, code: ready.code ?? 'WEBRTC_POOL_START_FAILED', detail: ready.detail ?? null, ack: ack.body };
+      return finish({
+        ok: false,
+        code: ready.code ?? 'WEBRTC_POOL_START_FAILED',
+        detail: ready.detail ?? null,
+        ack: ack.body,
+      });
     }
 
     const send = makeWebrtcSend(pool, machineId);
@@ -369,14 +428,21 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
       await send({ type: 'view.hello', session_id: sessionId, public_key: side.public_key });
     } catch (error) {
       session.unsubscribe();
-      return {
+      return finish({
         ok: false,
         code: error?.code ?? 'VIEW_WEBRTC_SEND_FAILED',
         detail: error instanceof Error ? error.message : String(error),
         ack: ack.body,
-      };
+      });
     }
-    return { ok: true, session, channel: 'webrtc', preferred: 'webrtc', fallback_reason: null, ack: ack.body };
+    return finish({
+      ok: true,
+      session,
+      channel: 'webrtc',
+      preferred: 'webrtc',
+      fallback_reason: null,
+      ack: ack.body,
+    });
   };
 
   const connectP2P = async ({ machineId, sessionId, side }) => {
@@ -498,6 +564,57 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
     };
   };
 
+  const readCurrentConfig = () => readConfig(file, {
+    transport: defaultTransport,
+    transportSource: defaultTransportSource,
+  });
+  // `preferred` is the product policy, not the mode the caller forced: WebRTC stays the preferred
+  // path even when `transport:'relay'` explicitly bypasses it.
+  const preferredFor = () => 'webrtc';
+  const currentPoolState = () => {
+    try {
+      const state = getPoolState();
+      return state !== null && typeof state === 'object' ? state : null;
+    } catch {
+      return null;
+    }
+  };
+  const webrtcFacts = (attempt) => {
+    if (attempt === null) {
+      return {
+        attempted: false,
+        ok: false,
+        code: null,
+        detail: null,
+        pool_owner: null,
+        pool_machine_id: null,
+        prepare_ms: null,
+        ack_code: null,
+        ack_pool_owner: null,
+      };
+    }
+    return {
+      attempted: true,
+      ok: attempt.ok === true,
+      code: attempt.code ?? null,
+      detail: attempt.detail ?? null,
+      pool_owner: attempt.pool_owner ?? null,
+      pool_machine_id: attempt.pool_machine_id ?? null,
+      prepare_ms: attempt.prepare_ms ?? null,
+      ack_code: attempt.ack_code ?? null,
+      ack_pool_owner: attempt.ack_pool_owner ?? null,
+    };
+  };
+  // Every /start response carries these five fields whether it succeeded, failed strictly, or fell
+  // back. Callers should not have to infer "did we use relay?" from the presence of `relay_ttl_ms`.
+  const startFacts = ({ channel = null, preferred, fallbackReason = null, attempt = null, relayUsed = false }) => ({
+    channel,
+    preferred,
+    fallback_reason: fallbackReason ?? null,
+    webrtc: webrtcFacts(attempt),
+    relay_used: relayUsed === true,
+  });
+
   ctx.inject(['connection'], (webCtx) => {
     const registry = webCtx?.connection?.fetch;
     if (registry === undefined || typeof registry.register !== 'function') {
@@ -510,11 +627,17 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
       requestBody: 'buffered',
       fetch: async (request) => {
         if (request.method === 'GET') {
-          const config = readConfig(file);
+          const config = readCurrentConfig();
+          const pool = getPool();
+          const poolState = currentPoolState();
           return Response.json({
             ok: true,
             enabled: config.enabled,
             transport: config.transport,
+            transport_source: config.transport_source,
+            pool_available: pool !== null && typeof pool === 'object' && poolState?.ready !== false,
+            pool_owner: poolState?.owner ?? null,
+            legacy_p2p: allowLegacyP2P,
             session: active === null
               ? null
               : { machine_id: active.machineId, encrypted: active.encrypted === true, channel: active.mode },
@@ -525,7 +648,7 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
         if (body === null || typeof body.enabled !== 'boolean') {
           return Response.json({ ok: false, error: 'a JSON body with {"enabled": true|false} is required' }, { status: 400, headers: NO_STORE });
         }
-        let transport = readConfig(file).transport;
+        let transport = readCurrentConfig().transport;
         if (body.transport !== undefined) {
           if (body.transport !== 'auto' && body.transport !== 'webrtc' && body.transport !== 'relay') {
             return Response.json({ ok: false, error: 'transport must be auto, webrtc or relay' }, { status: 400, headers: NO_STORE });
@@ -543,7 +666,7 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
       methods: ['POST'],
       requestBody: 'buffered',
       fetch: async (request) => {
-        const config = readConfig(file);
+        const config = readCurrentConfig();
         if (config.enabled !== true) return Response.json({ ok: false, code: 'VIEW_DISABLED' }, { status: 403, headers: NO_STORE });
         let body = null;
         try { body = await request.json(); } catch { /* refused below */ }
@@ -554,11 +677,13 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
         await stopActive();
         const side = createViewSide();
         const sessionId = 'view-' + Date.now().toString(36);
+        const preferred = preferredFor();
         let webrtcError = null;
 
         if (config.transport !== 'relay') {
           const attempt = await connectWebrtc({
             pool: getPool(),
+            poolState: currentPoolState(),
             machineId,
             sessionId,
             side,
@@ -570,9 +695,7 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
               machine_id: machineId,
               session_id: sessionId,
               encrypted: true,
-              channel: 'webrtc',
-              preferred: 'webrtc',
-              fallback_reason: null,
+              ...startFacts({ channel: 'webrtc', preferred, attempt }),
               websocket_transport: 'webrtc-v1',
             }, { headers: NO_STORE });
           }
@@ -581,13 +704,15 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
             return Response.json({
               ok: false,
               code: 'WEBRTC_UNAVAILABLE',
-              preferred: 'webrtc',
+              ...startFacts({ channel: null, preferred, attempt }),
               detail: { code: attempt.code ?? null, reason: attempt.detail ?? null, ack: attempt.ack ?? null },
             }, { status: 502, headers: NO_STORE });
           }
         }
 
-        if (config.transport === 'auto' && p2p?.node !== null && p2p?.node !== undefined) {
+        // `auto` used to dial the old UDP path whenever a node happened to exist, which made the
+        // production default implicitly legacy. P4 removes that: only an explicit opt-in may try it.
+        if (config.transport === 'auto' && allowLegacyP2P && p2p?.node !== null && p2p?.node !== undefined) {
           const p2pAttempt = await connectP2P({ machineId, sessionId, side });
           if (p2pAttempt.ok === true) {
             active = p2pAttempt.session;
@@ -596,21 +721,15 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
               machine_id: machineId,
               session_id: sessionId,
               encrypted: active.encrypted === true,
-              channel: 'p2p',
-              preferred: 'webrtc',
-              fallback_reason: webrtcError?.code ?? null,
+              ...startFacts({
+                channel: 'p2p',
+                preferred,
+                fallbackReason: webrtcError?.code ?? null,
+                attempt: webrtcError,
+              }),
             }, { headers: NO_STORE });
           }
           if (webrtcError === null) webrtcError = p2pAttempt;
-        }
-
-        if (config.transport === 'webrtc') {
-          return Response.json({
-            ok: false,
-            code: 'WEBRTC_UNAVAILABLE',
-            preferred: 'webrtc',
-            detail: { code: webrtcError?.code ?? null, reason: webrtcError?.detail ?? null },
-          }, { status: 502, headers: NO_STORE });
         }
 
         const relayAttempt = await connectRelay({ machineId, sessionId, side, webrtcError });
@@ -618,9 +737,14 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
           return Response.json({
             ok: false,
             code: 'P2P_UNAVAILABLE',
+            ...startFacts({
+              channel: null,
+              preferred,
+              fallbackReason: webrtcError?.code ?? null,
+              attempt: webrtcError,
+            }),
             error: webrtcError?.detail ?? webrtcError?.code ?? null,
             relay_error: relayAttempt.relay_error ?? null,
-            preferred: 'webrtc',
           }, { status: 502, headers: NO_STORE });
         }
         active = relayAttempt.session;
@@ -629,9 +753,13 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
           machine_id: machineId,
           session_id: sessionId,
           encrypted: true,
-          channel: 'relay',
-          preferred: 'webrtc',
-          fallback_reason: relayAttempt.fallback_reason,
+          ...startFacts({
+            channel: 'relay',
+            preferred,
+            fallbackReason: relayAttempt.fallback_reason,
+            attempt: webrtcError,
+            relayUsed: true,
+          }),
           relay_ttl_ms: relayAttempt.ttl_ms ?? null,
           webrtc_error: webrtcError?.code ?? null,
         }, { headers: NO_STORE });
@@ -648,7 +776,7 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
       path: REMOTE_FRAME_PATH,
       methods: ['POST'],
       fetch: async () => {
-        if (readConfig(file).enabled !== true) {
+        if (readCurrentConfig().enabled !== true) {
           return Response.json({ ok: false, code: 'VIEW_DISABLED' }, { status: 403, headers: NO_STORE });
         }
         if (active !== null) {

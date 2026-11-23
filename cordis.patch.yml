@@ -130,6 +130,12 @@
     - id: dsh-desktop
       name: '@twinsearth/w2m-dsh-plugin/desktop'
       disabled: true
+      # v3.6.0 P4 row config. All fields are defaults and lose to `remote-view.json` once the panel
+      # writes it:
+      #   transport:        auto | webrtc | relay   (default auto: WebRTC, then relay)
+      #   allowLegacyP2P:   true | false            (default false: `auto` never dials old UDP)
+      #   prepareTimeoutMs: integer > 0             (default 8000)
+      #   handshakeTimeoutMs: integer > 0           (default 10000)
       config: {}
     - id: dsh-gpw
       name: '@twinsearth/w2m-dsh-plugin/gpw'
@@ -308,7 +314,7 @@
     #     providerArgs: ['/opt/w2m/webrtc-provider.mjs']
     # - id: dsh-desktop
     #   disabled: false
-    #   config: { transport: 'webrtc', allowLegacyP2P: false }
+    #   config: { transport: 'webrtc', allowLegacyP2P: false, prepareTimeoutMs: 8000, handshakeTimeoutMs: 10000 }
 
     # P2P V2 文件面 (dsh-p2p-v2): WebTorrent 负责多对多分片，V1 WebRTC 是它的 peer 传输层。
     #

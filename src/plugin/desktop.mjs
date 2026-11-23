@@ -7,7 +7,7 @@
  * idempotency guard because both entries share this module instance.
  */
 import { registerRemoteViewRoutes } from './remote-view-route.mjs';
-import { getSharedWebRtcPool } from './webrtc-pool-registry.mjs';
+import { getSharedWebRtcPool, getSharedWebRtcPoolState } from './webrtc-pool-registry.mjs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -29,9 +29,12 @@ const registered = new WeakSet();
 
 /**
  * @param {object} ctx Cordis context
- * @param {{stateDir?:string, p2p?:object|null, getPool?:()=>object|null}} [deps]
+ * @param {{stateDir?:string, p2p?:object|null, getPool?:()=>object|null, getPoolState?:()=>object|null,
+ *   transport?:'auto'|'webrtc'|'relay', allowLegacyP2P?:boolean,
+ *   prepareTimeoutMs?:number, handshakeTimeoutMs?:number}} [deps]
  *   `getPool` is optional: when omitted, the route resolves the process-wide shared pool on every
- *   `/start`, so a root row mounted before the pool exists is not frozen to relay.
+ *   `/start`, so a root row mounted before the pool exists is not frozen to relay. Row options are
+ *   defaults only: an existing `remote-view.json` always wins.
  */
 export function registerDesktop(ctx, deps = {}) {
   if (ctx === null || typeof ctx !== 'object') return { mounted: false, reason: 'no ctx' };
@@ -41,10 +44,21 @@ export function registerDesktop(ctx, deps = {}) {
     stateDir: typeof deps.stateDir === 'string' ? deps.stateDir : '',
     p2p: deps.p2p ?? null,
   };
+  // Only forward options the row actually supplied. Passing `transport: undefined` would make the
+  // route believe an explicit row choice existed and would hide `transport_source:'default'`.
+  if (Object.hasOwn(deps, 'transport')) options.transport = deps.transport;
+  if (Object.hasOwn(deps, 'allowLegacyP2P')) options.allowLegacyP2P = deps.allowLegacyP2P === true;
+  if (Number.isInteger(deps.prepareTimeoutMs) && deps.prepareTimeoutMs > 0) {
+    options.prepareTimeoutMs = deps.prepareTimeoutMs;
+  }
+  if (Number.isInteger(deps.handshakeTimeoutMs) && deps.handshakeTimeoutMs > 0) {
+    options.handshakeTimeoutMs = deps.handshakeTimeoutMs;
+  }
   // Omit `getPool` when the caller has none: `remote-view-route` then falls back to the process-wide
   // registry at request time. Passing `() => null` here would freeze the root row to relay forever if
   // it mounted before the shared pool existed.
   if (typeof deps.getPool === 'function') options.getPool = deps.getPool;
+  if (typeof deps.getPoolState === 'function') options.getPoolState = deps.getPoolState;
   return registerRemoteViewRoutes(ctx, options);
 }
 
@@ -78,11 +92,31 @@ export function registerDesktopHealthRoute(ctx) {
 /**
  * Profile row `@twinsearth/w2m-dsh-plugin/desktop` mounts this. The root bundle
  * owns the UI; this half only registers the host routes.
+ *
+ * @param {object} ctx
+ * @param {{transport?:'auto'|'webrtc'|'relay', allowLegacyP2P?:boolean,
+ *   prepareTimeoutMs?:number, handshakeTimeoutMs?:number}} [config] Row config, used only when
+ *   `remote-view.json` does not exist yet.
  */
-export function apply(ctx) {
+export function apply(ctx, config = {}) {
+  const row = config ?? {};
   const stateDir = process.env.W2M_STATE_DIR
     ?? (process.env.DSH_HOME ? join(process.env.DSH_HOME, 'xclient') : join(homedir(), '.dsh', 'xclient'));
-  const status = registerDesktop(ctx, { stateDir, p2p: null, getPool: getSharedWebRtcPool });
+  const options = {
+    stateDir,
+    p2p: null,
+    getPool: getSharedWebRtcPool,
+    getPoolState: getSharedWebRtcPoolState,
+    allowLegacyP2P: row.allowLegacyP2P === true,
+  };
+  if (Object.hasOwn(row, 'transport')) options.transport = row.transport;
+  if (Number.isInteger(row.prepareTimeoutMs) && row.prepareTimeoutMs > 0) {
+    options.prepareTimeoutMs = row.prepareTimeoutMs;
+  }
+  if (Number.isInteger(row.handshakeTimeoutMs) && row.handshakeTimeoutMs > 0) {
+    options.handshakeTimeoutMs = row.handshakeTimeoutMs;
+  }
+  const status = registerDesktop(ctx, options);
   registerDesktopHealthRoute(ctx);
   return status;
 }

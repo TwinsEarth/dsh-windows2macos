@@ -10,7 +10,7 @@ import { setSharedWebRtcPool } from '../src/plugin/webrtc-pool-registry.mjs';
 import { startRelayViewTarget } from '../src/agent/view/relay-target.mjs';
 import { createViewSide, sealViewFrame } from '../src/agent/view/session-key.mjs';
 
-function harness() {
+function harness(options = {}) {
   const routes = new Map();
   const sent = [];
   let dialed = null;
@@ -26,7 +26,15 @@ function harness() {
   };
   const ctx = { inject: (_deps, callback) => callback({ connection: { fetch: { register: (route) => routes.set(route.path, route) } } }) };
   const stateDir = mkdtempSync(join(tmpdir(), 'w2m-view-route-'));
-  registerRemoteViewRoutes(ctx, { stateDir, p2p: { node }, platform: 'linux', capture: async () => ({ ok: false, error: 'local capture must not run for a remote session' }) });
+  const deps = {
+    stateDir,
+    p2p: { node },
+    platform: 'linux',
+    capture: async () => ({ ok: false, error: 'local capture must not run for a remote session' }),
+    allowLegacyP2P: options.allowLegacyP2P === true,
+  };
+  if (Object.hasOwn(options, 'transport')) deps.transport = options.transport;
+  registerRemoteViewRoutes(ctx, deps);
   return { routes, sent, node, stateDir, get dialed() { return dialed; }, get handler() { return handler; } };
 }
 
@@ -51,11 +59,16 @@ describe('remote-view host routes', () => {
     }
   });
 
-  it('starts a P2P session, caches one frame, and stops it', async () => {
-    const h = harness();
+  it('starts a P2P session only when the row opts into legacy, caches one frame, and stops it', async () => {
+    const h = harness({ allowLegacyP2P: true });
     await h.routes.get('/api/w2m/remote/config').fetch(request({ enabled: true }));
     const started = await h.routes.get('/api/w2m/remote/start').fetch(request({ machine_id: 'm-1' }));
     assert.equal(started.status, 200);
+    const startedBody = await started.json();
+    assert.equal(startedBody.channel, 'p2p');
+    assert.equal(startedBody.preferred, 'webrtc');
+    assert.equal(startedBody.relay_used, false);
+    assert.equal(typeof startedBody.webrtc.attempted, 'boolean');
     assert.equal(h.dialed, 'm-1');
     assert.equal(h.sent[0].type, 'view.hello');
     assert.equal(h.sent[0].session_id.startsWith('view-'), true);
@@ -78,6 +91,81 @@ describe('remote-view host routes', () => {
     const stopped = await h.routes.get('/api/w2m/remote/stop').fetch(request({}));
     assert.equal(stopped.status, 200);
     assert.equal(h.sent.some((frame) => frame.type === 'view.stop'), true);
+  });
+
+  it('does not dial the legacy UDP path from auto unless the row opts in', async () => {
+    const h = harness();
+    await h.routes.get('/api/w2m/remote/config').fetch(request({ enabled: true }));
+    const started = await h.routes.get('/api/w2m/remote/start').fetch(request({ machine_id: 'm-legacy' }));
+    assert.equal(started.status, 502);
+    assert.equal(h.dialed, null, 'auto must not treat the presence of a p2p node as consent');
+  });
+
+  it('reports row transport defaults and the live pool in /config, and lets json win', async () => {
+    const { writeFileSync } = await import('node:fs');
+    const routes = new Map();
+    const ctx = { inject: (_deps, callback) => callback({ connection: { fetch: { register: (route) => routes.set(route.path, route) } } }) };
+    const stateDir = mkdtempSync(join(tmpdir(), 'w2m-view-row-config-'));
+    const mounted = registerDesktop(ctx, { stateDir, p2p: null, transport: 'webrtc', allowLegacyP2P: false });
+    assert.equal(mounted.mounted, true);
+    const before = await routes.get('/api/w2m/remote/config').fetch(request({}, 'GET'));
+    const beforeBody = await before.json();
+    assert.equal(beforeBody.transport, 'webrtc');
+    assert.equal(beforeBody.transport_source, 'row');
+    assert.equal(beforeBody.legacy_p2p, false);
+    assert.equal(beforeBody.pool_available, false);
+    assert.equal(beforeBody.pool_owner, null);
+
+    writeFileSync(join(stateDir, 'remote-view.json'), JSON.stringify({ enabled: true, transport: 'relay' }));
+    const after = await routes.get('/api/w2m/remote/config').fetch(request({}, 'GET'));
+    const afterBody = await after.json();
+    assert.equal(afterBody.transport, 'relay', 'the on-disk file always wins over row defaults');
+    assert.equal(afterBody.transport_source, 'json');
+    assert.equal(afterBody.enabled, true);
+  });
+
+  it('uses the default transport when the row supplies none', async () => {
+    const routes = new Map();
+    const ctx = { inject: (_deps, callback) => callback({ connection: { fetch: { register: (route) => routes.set(route.path, route) } } }) };
+    const stateDir = mkdtempSync(join(tmpdir(), 'w2m-view-default-config-'));
+    registerDesktop(ctx, { stateDir, p2p: null });
+    const config = await routes.get('/api/w2m/remote/config').fetch(request({}, 'GET'));
+    const body = await config.json();
+    assert.equal(body.transport, 'auto');
+    assert.equal(body.transport_source, 'default');
+    assert.equal(body.legacy_p2p, false);
+  });
+
+  it('explicit relay mode never probes WebRTC and keeps WebRTC as the policy preference', async () => {
+    const { writeFileSync } = await import('node:fs');
+    const h = harness();
+    writeFileSync(join(h.stateDir, 'device.json'), JSON.stringify({
+      machine_id: 'viewer-1',
+      rabbit_url: 'http://relay.invalid',
+      device_token: 't',
+    }));
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      if (String(url).includes('/v1/remote/request')) {
+        return { ok: true, status: 200, json: async () => ({ ok: true, ttl_ms: 15000 }) };
+      }
+      return { ok: false, status: 404, json: async () => ({ ok: false }) };
+    };
+    try {
+      await h.routes.get('/api/w2m/remote/config').fetch(request({ enabled: true, transport: 'relay' }));
+      const started = await h.routes.get('/api/w2m/remote/start').fetch(request({ machine_id: 'm-relay' }));
+      assert.equal(started.status, 200);
+      const body = await started.json();
+      assert.equal(body.channel, 'relay');
+      assert.equal(body.preferred, 'webrtc', 'the policy preference stays WebRTC even when relay is forced');
+      assert.equal(body.fallback_reason, null);
+      assert.equal(body.relay_used, true);
+      assert.equal(body.webrtc.attempted, false);
+      assert.equal(h.dialed, null);
+    } finally {
+      globalThis.fetch = originalFetch;
+      await h.routes.get('/api/w2m/remote/stop').fetch(request({}));
+    }
   });
 
   it('reports P2P_UNAVAILABLE instead of falling back to local capture', async () => {
@@ -153,16 +241,31 @@ describe('remote-view host routes', () => {
         return { ok: true, status: 200, json: async () => ({ ok: true, ttl_ms: 15000 }) };
       }
       if (text.includes('/v1/remote/ack')) {
-        return { ok: true, status: 200, json: async () => ({ ok: true, prepared: true }) };
+        return { ok: true, status: 200, json: async () => ({ ok: true, prepared: true, code: 'WEBRTC_PREPARED', pool_owner: 'dsh-target' }) };
       }
       throw new Error('unexpected relay call: ' + text);
     };
     try {
       await h.routes.get('/api/w2m/remote/config').fetch(request({ enabled: true, transport: 'webrtc' }));
+      const cfg = await h.routes.get('/api/w2m/remote/config').fetch(request({}, 'GET'));
+      const cfgBody = await cfg.json();
+      assert.equal(cfgBody.pool_available, true);
+      assert.equal(cfgBody.pool_owner, 'dsh-p2p-webrtc');
+      assert.equal(cfgBody.transport_source, 'json');
+      assert.equal(cfgBody.legacy_p2p, false);
       const started = await h.routes.get('/api/w2m/remote/start').fetch(request({ machine_id: 'target-1' }));
       assert.equal(started.status, 200);
       const startedBody = await started.json();
       assert.equal(startedBody.channel, 'webrtc');
+      assert.equal(startedBody.preferred, 'webrtc');
+      assert.equal(startedBody.fallback_reason, null);
+      assert.equal(startedBody.relay_used, false);
+      assert.equal(startedBody.webrtc.ok, true);
+      assert.equal(startedBody.webrtc.pool_owner, 'dsh-p2p-webrtc', 'the viewer reports which pool owner served it');
+      assert.equal(startedBody.webrtc.pool_machine_id, 'viewer-1');
+      assert.equal(startedBody.webrtc.ack_code, 'WEBRTC_PREPARED');
+      assert.equal(startedBody.webrtc.ack_pool_owner, 'dsh-target');
+      assert.equal(Number.isInteger(startedBody.webrtc.prepare_ms), true);
       assert.equal(startedBody.encrypted, true);
       assert.equal(h.dialed, null, 'strict webrtc must not touch the legacy UDP dial');
       assert.equal(relayCalls.filter((call) => call.url.includes('/v1/remote/frame')).length, 0);
@@ -333,7 +436,11 @@ describe('remote-view host routes', () => {
       assert.equal(started.status, 200);
       const body = await started.json();
       assert.equal(body.channel, 'relay');
+      assert.equal(body.preferred, 'webrtc');
       assert.equal(body.fallback_reason, 'WEBRTC_POOL_UNAVAILABLE');
+      assert.equal(body.relay_used, true);
+      assert.equal(body.webrtc.ok, false);
+      assert.equal(body.webrtc.code, 'WEBRTC_POOL_UNAVAILABLE');
       assert.equal(body.webrtc_error, 'WEBRTC_POOL_UNAVAILABLE');
       assert.equal(requests >= 2, true, 'a relay request follows the refused warm-up');
     } finally {
@@ -360,6 +467,12 @@ describe('remote-view host routes', () => {
       assert.equal(started.status, 502);
       const body = await started.json();
       assert.equal(body.code, 'WEBRTC_UNAVAILABLE');
+      assert.equal(body.channel, null);
+      assert.equal(body.preferred, 'webrtc');
+      assert.equal(body.fallback_reason, null, 'strict mode never falls back, so it names no fallback');
+      assert.equal(body.relay_used, false);
+      assert.equal(body.webrtc.attempted, true);
+      assert.equal(body.webrtc.ok, false);
       assert.equal(body.detail.code, 'WEBRTC_POOL_UNAVAILABLE');
       assert.equal(h.dialed, null, 'strict mode must not fall back to UDP p2p either');
     } finally {
@@ -508,6 +621,10 @@ function harnessWithPool(options = {}) {
     stateDir,
     p2p: { node },
     getPool: () => (options.poolAvailable === false ? null : pool),
+    getPoolState: () => (options.poolAvailable === false
+      ? { pool: null, owner: null, ready: false, epoch: 0 }
+      : { pool, owner: 'dsh-p2p-webrtc', ready: true, epoch: 1 }),
+    allowLegacyP2P: options.allowLegacyP2P === true,
     platform: 'linux',
     prepareTimeoutMs: 200,
     ackPollMs: 10,
