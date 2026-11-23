@@ -4677,3 +4677,21 @@ describe('v3.5.6/A1: the 归档 tab inside the backup panel', () => {
 });
 
 
+
+describe('client bundle: remote-view channel labels (P5)', () => {
+  const source = fs.readFileSync(BUNDLE_PATH, 'utf8');
+
+  it('names WebRTC and encrypted relay explicitly, with no ambiguous P2P fallback', () => {
+    assert.match(source, /if \(channel === 'webrtc'\) return 'WebRTC'/);
+    assert.match(source, /if \(channel === 'relay'\) return '加密 relay'/);
+    assert.match(source, /if \(channel === 'p2p'\) return '旧 P2P'/);
+    assert.equal(source.includes("'加密中继'"), false);
+  });
+
+  it('preflights pool availability and reads the diagnostics route', () => {
+    assert.match(source, /REMOTE_DIAGNOSTICS_URL = '\/api\/w2m\/remote\/diagnostics'/);
+    assert.match(source, /pool_available === true/);
+    assert.match(source, /WebRTC 未就绪/);
+    assert.match(source, /remoteDirectLabel\(session, diagnostics\)/);
+  });
+});

@@ -32,6 +32,7 @@ export const REMOTE_CONFIG_PATH = '/api/w2m/remote/config';
 export const REMOTE_FRAME_PATH = '/api/w2m/remote/frame';
 export const REMOTE_START_PATH = '/api/w2m/remote/start';
 export const REMOTE_STOP_PATH = '/api/w2m/remote/stop';
+export const REMOTE_DIAGNOSTICS_PATH = '/api/w2m/remote/diagnostics';
 const NO_STORE = { 'cache-control': 'no-store' };
 const RELAY_ACK_PATH = '/v1/remote/ack';
 
@@ -154,8 +155,37 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
     : 10_000;
   const ackPollMs = Number.isInteger(deps.ackPollMs) && deps.ackPollMs > 0 ? deps.ackPollMs : 300;
   let active = null;
+  // P5 read-only diagnostics. Counters are process-local and never persisted: they describe this
+  // viewer's current host lifetime, not a fleet-wide metric. `last_error` keeps the most recent named
+  // failure so a diagnostics read after a failed attempt still explains what happened.
+  const counters = {
+    ack_polls: 0,
+    ack_count: 0,
+    last_ack_code: null,
+    last_ack_at: null,
+    relay_frame_calls: 0,
+    relay_frames: 0,
+    last_relay_frame_at: null,
+    last_error: null,
+    last_start_at: null,
+    last_stop_at: null,
+    started_at: new Date().toISOString(),
+  };
+  const noteError = (code, detail = null) => {
+    if (typeof code !== 'string' || code === '') return;
+    counters.last_error = {
+      code,
+      detail: detail === null || detail === undefined ? null : String(detail).slice(0, 300),
+      at: new Date().toISOString(),
+    };
+  };
+  const setActiveError = (code) => {
+    if (active !== null) active.error = code;
+    noteError(code);
+  };
 
   const stopActive = async () => {
+    counters.last_stop_at = new Date().toISOString();
     if (active === null) return;
     const session = active;
     active = null;
@@ -207,6 +237,7 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
    * ack route (an older build), which is a named fallback rather than a timeout.
    */
   const fetchRelayAck = async ({ machineId, sessionId }) => {
+    counters.ack_polls += 1;
     const device = readDevice(stateDir);
     if (device.base === '' || device.token === '') return { ok: false, code: 'WEBRTC_ACK_UNAVAILABLE' };
     try {
@@ -215,15 +246,22 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
         + '&target=' + encodeURIComponent(machineId);
       const response = await fetch(url, { headers: { authorization: 'Bearer ' + device.token }, signal: timeoutSignal(3_000) });
       const body = await response.json().catch(() => null);
-      if (response.ok && body?.ok === true) return { ok: true, body };
+      if (response.ok && body?.ok === true) {
+        counters.ack_count += 1;
+        counters.last_ack_code = typeof body?.code === 'string'
+          ? body.code
+          : (body?.prepared === true ? 'WEBRTC_PREPARED' : 'WEBRTC_PREPARE_FAILED');
+        counters.last_ack_at = new Date().toISOString();
+        return { ok: true, body };
+      }
       if (response.status === 404 && body?.error?.code === 'REMOTE_ACK_NOT_FOUND') {
         return { ok: false, pending: true, code: 'REMOTE_ACK_NOT_FOUND' };
       }
-      return {
-        ok: false,
-        code: response.status === 404 ? 'WEBRTC_ACK_UNAVAILABLE' : (body?.error?.code ?? 'WEBRTC_ACK_FAILED'),
-      };
+      const code = response.status === 404 ? 'WEBRTC_ACK_UNAVAILABLE' : (body?.error?.code ?? 'WEBRTC_ACK_FAILED');
+      noteError(code, body?.error?.detail ?? null);
+      return { ok: false, code };
     } catch (error) {
+      noteError('WEBRTC_ACK_UNAVAILABLE', error instanceof Error ? error.message : String(error));
       return { ok: false, code: 'WEBRTC_ACK_UNAVAILABLE', detail: error instanceof Error ? error.message : String(error) };
     }
   };
@@ -249,6 +287,7 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
   const fetchRelayFrame = async ({ sessionId, machineId }) => {
     const device = readDevice(stateDir);
     if (device.base === '' || device.token === '') return { ok: false };
+    counters.relay_frame_calls += 1;
     try {
       const url = device.base + '/v1/remote/frame?session_id=' + encodeURIComponent(sessionId) + '&target=' + encodeURIComponent(machineId);
       const response = await fetch(url, { headers: { authorization: 'Bearer ' + device.token }, signal: timeoutSignal(3_000) });
@@ -615,6 +654,128 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
     relay_used: relayUsed === true,
   });
 
+  // Diagnostics must be safe to read from a browser: no token, no private key, no full signaling
+  // URL. `last_error.detail` is the one free-form field, so URLs and bearer material are redacted.
+  const redactDiagnosticText = (value) => String(value)
+    .replace(/(?:wss?|https?):\/\/[^\s]+/gi, '<signaling-url>')
+    .replace(/bearer\s+[^\s]+/gi, 'Bearer <redacted>')
+    .replace(/(token=)[^&\s]+/gi, '$1<redacted>');
+  const peerDiagnostic = (entry) => ({
+    peer: entry?.peer ?? null,
+    role: entry?.role ?? null,
+    state: entry?.state ?? null,
+    path: entry?.path ?? null,
+    path_reason: entry?.path_reason === null || entry?.path_reason === undefined
+      ? null
+      : redactDiagnosticText(entry.path_reason),
+    rtt_ms: entry?.rtt_ms ?? null,
+    secure: entry?.secure ?? null,
+    provider_ready: entry?.provider_ready ?? null,
+    started_at: entry?.started_at ?? null,
+    last_used_at: entry?.last_used_at ?? null,
+    starts: entry?.starts ?? 0,
+    sends: entry?.sends ?? 0,
+    bytes_sent: entry?.bytes_sent ?? 0,
+    last_error: entry?.last_error === null || entry?.last_error === undefined
+      ? null
+      : (typeof entry.last_error === 'string'
+        ? { code: null, detail: redactDiagnosticText(entry.last_error) }
+        : {
+          code: entry.last_error.code ?? null,
+          detail: entry.last_error.detail === null || entry.last_error.detail === undefined
+            ? null
+            : redactDiagnosticText(entry.last_error.detail),
+        }),
+  });
+  const poolDiagnostic = () => {
+    const pool = getPool();
+    const state = currentPoolState();
+    const available = pool !== null && typeof pool === 'object' && state?.ready !== false;
+    let snapshot = null;
+    if (available && typeof pool.diagnostics === 'function') {
+      try { snapshot = pool.diagnostics(); } catch { snapshot = null; }
+    }
+    const peers = Array.isArray(snapshot?.peers)
+      ? snapshot.peers.map(peerDiagnostic).filter((entry) => entry.peer !== null)
+      : [];
+    return {
+      available,
+      owner: state?.owner ?? null,
+      ready: state?.ready ?? null,
+      epoch: state?.epoch ?? null,
+      machine_id: typeof pool?.machineId === 'string' ? pool.machineId : (snapshot?.machine_id ?? null),
+      peer_count: peers.length,
+      peers,
+      stats: snapshot?.stats === undefined || snapshot.stats === null
+        ? null
+        : {
+          sends: snapshot.stats.sends ?? 0,
+          send_failures: snapshot.stats.send_failures ?? 0,
+          start_failures: snapshot.stats.start_failures ?? 0,
+          bytes_sent: snapshot.stats.bytes_sent ?? 0,
+        },
+    };
+  };
+  const diagnosticsBody = () => {
+    const config = readCurrentConfig();
+    const pool = poolDiagnostic();
+    const peer = active === null
+      ? null
+      : pool.peers.find((entry) => entry.peer === active.machineId) ?? null;
+    const direct = active === null
+      ? null
+      : active.mode === 'relay'
+        ? false
+        : active.mode === 'p2p'
+          ? true
+          : (peer?.path === 'direct' ? true : (peer?.path === null || peer?.path === undefined ? null : false));
+    return {
+      ok: true,
+      at: new Date().toISOString(),
+      uptime_ms: Date.now() - Date.parse(counters.started_at),
+      pool_available: pool.available,
+      pool_owner: pool.owner,
+      transport_source: config.transport_source,
+      legacy_p2p: allowLegacyP2P,
+      config: {
+        enabled: config.enabled,
+        transport: config.transport,
+        transport_source: config.transport_source,
+        legacy_p2p: allowLegacyP2P,
+      },
+      pool,
+      session: active === null
+        ? null
+        : {
+          machine_id: active.machineId,
+          channel: active.mode,
+          encrypted: active.encrypted === true,
+          direct,
+          error: active.error ?? null,
+          started_at: active.startedAt ?? null,
+          last_frame_at: active.latest?.at ?? null,
+        },
+      counters: {
+        ack_polls: counters.ack_polls,
+        ack_count: counters.ack_count,
+        last_ack_code: counters.last_ack_code,
+        last_ack_at: counters.last_ack_at,
+        relay_frame_calls: counters.relay_frame_calls,
+        relay_frames: counters.relay_frames,
+        last_relay_frame_at: counters.last_relay_frame_at,
+      },
+      last_error: counters.last_error === null
+        ? (active?.error === null || active?.error === undefined
+          ? null
+          : { code: active.error, detail: null, at: null })
+        : {
+          code: counters.last_error.code,
+          detail: counters.last_error.detail === null ? null : redactDiagnosticText(counters.last_error.detail),
+          at: counters.last_error.at,
+        },
+    };
+  };
+
   ctx.inject(['connection'], (webCtx) => {
     const registry = webCtx?.connection?.fetch;
     if (registry === undefined || typeof registry.register !== 'function') {
@@ -661,6 +822,14 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
       },
     });
 
+    // Read-only and deliberately on the same authenticated Connection.fetch registry as the rest of
+    // the remote-view routes: the host's connection layer owns auth, this route only shapes state.
+    registry.register({
+      path: REMOTE_DIAGNOSTICS_PATH,
+      methods: ['GET'],
+      fetch: async () => Response.json(diagnosticsBody(), { headers: NO_STORE }),
+    });
+
     registry.register({
       path: REMOTE_START_PATH,
       methods: ['POST'],
@@ -677,6 +846,7 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
         await stopActive();
         const side = createViewSide();
         const sessionId = 'view-' + Date.now().toString(36);
+        counters.last_start_at = new Date().toISOString();
         const preferred = preferredFor();
         let webrtcError = null;
 
@@ -700,6 +870,7 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
             }, { headers: NO_STORE });
           }
           webrtcError = attempt;
+          noteError(attempt.code ?? 'WEBRTC_UNAVAILABLE', attempt.detail ?? null);
           if (config.transport === 'webrtc') {
             return Response.json({
               ok: false,
@@ -730,10 +901,12 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
             }, { headers: NO_STORE });
           }
           if (webrtcError === null) webrtcError = p2pAttempt;
+          noteError(p2pAttempt.code ?? 'P2P_UNAVAILABLE', p2pAttempt.detail ?? null);
         }
 
         const relayAttempt = await connectRelay({ machineId, sessionId, side, webrtcError });
         if (relayAttempt.ok !== true) {
+          noteError(relayAttempt.code ?? 'P2P_UNAVAILABLE', relayAttempt.relay_error ?? null);
           return Response.json({
             ok: false,
             code: 'P2P_UNAVAILABLE',
@@ -782,14 +955,14 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
         if (active !== null) {
           if (active.mode === 'webrtc') {
             if (active.vk === null && Date.now() >= active.handshakeDeadline) {
-              active.error = 'VIEW_WEBRTC_HANDSHAKE_TIMEOUT';
+              setActiveError('VIEW_WEBRTC_HANDSHAKE_TIMEOUT');
             }
             if (active.vk !== null && Date.now() >= active.renewAt) {
               active.renewAt = Date.now() + 10_000;
               try {
                 await active.send({ type: 'view.request', session_id: active.sessionId, machine_id: active.machineId, fps: 1, max_bytes: maxBytes });
               } catch (error) {
-                active.error = error?.code ?? 'VIEW_WEBRTC_SEND_FAILED';
+                setActiveError(error?.code ?? 'VIEW_WEBRTC_SEND_FAILED');
               }
             }
             if (active.latest !== null) return Response.json({ ok: true, ...active.latest, channel: 'webrtc' }, { headers: NO_STORE });
@@ -827,7 +1000,7 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
               try {
                 if (typeof got.public_key === 'string') active.vk = active.side.finish(got.public_key).key;
                 if (active.vk === null) {
-                  active.error = 'VIEW_VK_REQUIRED';
+                  setActiveError('VIEW_VK_REQUIRED');
                   return Response.json({ ok: false, code: active.error, channel: 'relay' }, { status: 502, headers: NO_STORE });
                 }
                 const plaintext = openViewFrame(active.vk, got.ct);
@@ -841,13 +1014,15 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
                     encrypted: true,
                     channel: 'relay',
                   };
+                  counters.relay_frames += 1;
+                  counters.last_relay_frame_at = active.latest.at;
                   active.error = null;
                 }
               } catch {
-                active.error = 'VIEW_VK_BAD';
+                setActiveError('VIEW_VK_BAD');
               }
             } else if (got.waiting !== true) {
-              active.error = 'VIEW_RELAY_UNAVAILABLE';
+              setActiveError('VIEW_RELAY_UNAVAILABLE');
             }
           }
           if (active.latest !== null) return Response.json({ ok: true, ...active.latest, channel: 'relay' }, { headers: NO_STORE });

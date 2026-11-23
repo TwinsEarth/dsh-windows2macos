@@ -217,6 +217,13 @@ describe('remote-view host routes', () => {
       const secondBody = await second.json();
       assert.equal(second.status, 200);
       assert.notEqual(secondBody.data_base64, firstBody.data_base64, 'the second poll carries a new frame');
+      const diagnostics = await h.routes.get('/api/w2m/remote/diagnostics').fetch(request({}, 'GET'));
+      const diagnosticsBody = await diagnostics.json();
+      assert.equal(diagnosticsBody.session.channel, 'relay');
+      assert.equal(diagnosticsBody.session.direct, false);
+      assert.equal(diagnosticsBody.counters.relay_frame_calls, 2);
+      assert.equal(diagnosticsBody.counters.relay_frames, 2);
+      assert.equal(diagnosticsBody.counters.ack_polls, 0, 'relay-only start must not poll a WebRTC ack');
     } finally {
       globalThis.fetch = originalFetch;
       await h.routes.get('/api/w2m/remote/stop').fetch(request({}));
@@ -269,6 +276,14 @@ describe('remote-view host routes', () => {
       assert.equal(startedBody.encrypted, true);
       assert.equal(h.dialed, null, 'strict webrtc must not touch the legacy UDP dial');
       assert.equal(relayCalls.filter((call) => call.url.includes('/v1/remote/frame')).length, 0);
+      const diagnostics = await h.routes.get('/api/w2m/remote/diagnostics').fetch(request({}, 'GET'));
+      const diagnosticsBody = await diagnostics.json();
+      assert.equal(diagnosticsBody.session.channel, 'webrtc');
+      assert.equal(diagnosticsBody.session.encrypted, true);
+      assert.equal(diagnosticsBody.counters.ack_polls >= 1, true);
+      assert.equal(diagnosticsBody.counters.ack_count, 1);
+      assert.equal(diagnosticsBody.counters.last_ack_code, 'WEBRTC_PREPARED');
+      assert.equal(diagnosticsBody.counters.relay_frames, 0);
 
       const hello = h.sent[0];
       assert.equal(hello.type, 'view.hello');
@@ -614,6 +629,20 @@ function harnessWithPool(options = {}) {
     async send(_peer, payload) { sent.push(JSON.parse(payload)); return { ok: true }; },
     onMessage(fn) { listeners.add(fn); return () => listeners.delete(fn); },
     closePeer() { this.closed = true; },
+    diagnostics() {
+      return {
+        ok: true,
+        name: 'fake-pool',
+        machine_id: 'viewer-1',
+        signal_url: options.signalUrl ?? 'wss://signal.example/ws?token=signal-secret',
+        signal_token: options.signalToken ?? 'signal-secret',
+        closed: false,
+        max_peers: 8,
+        peer_count: (options.peers ?? []).length,
+        peers: options.peers ?? [],
+        stats: { sends: 3, send_failures: 1, start_failures: 0, bytes_sent: 2048 },
+      };
+    },
   };
   const ctx = { inject: (_deps, callback) => callback({ connection: { fetch: { register: (route) => routes.set(route.path, route) } } }) };
   const stateDir = mkdtempSync(join(tmpdir(), 'w2m-view-webrtc-'));
@@ -643,3 +672,55 @@ function harnessWithPool(options = {}) {
     ack: options.ack ?? { ok: true, prepared: true },
   };
 }
+
+describe('remote-view diagnostics', () => {
+  it('serves a read-only pool/session snapshot without signaling credentials', async () => {
+    const h = harnessWithPool({
+      peers: [{
+        peer: 'm-secret',
+        role: 'client',
+        state: 'ready',
+        path: 'direct',
+        path_reason: 'wss://signal.example/ws?token=signal-secret',
+        rtt_ms: 12,
+        secure: true,
+        last_error: { code: 'HANDSHAKE_FAILED', detail: 'connect wss://signal.example/ws?token=signal-secret with Bearer signal-secret' },
+      }],
+    });
+    const response = await h.routes.get('/api/w2m/remote/diagnostics').fetch(request({}, 'GET'));
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.ok, true);
+    assert.equal(body.pool_available, true);
+    assert.equal(body.pool_owner, 'dsh-p2p-webrtc');
+    assert.equal(body.pool.available, true);
+    assert.equal(body.pool.machine_id, 'viewer-1');
+    assert.equal(body.pool.peer_count, 1);
+    assert.equal(body.pool.peers[0].peer, 'm-secret');
+    assert.equal(body.pool.peers[0].path, 'direct');
+    assert.equal(body.pool.stats.sends, 3);
+    assert.equal(body.session, null);
+    assert.equal(typeof body.counters.ack_polls, 'number');
+    assert.equal(typeof body.counters.relay_frames, 'number');
+    const text = JSON.stringify(body);
+    assert.equal(text.includes('signal-secret'), false);
+    assert.equal(text.includes('wss://'), false);
+    assert.equal(text.includes('signal_token'), false);
+    assert.equal(text.includes('signal_url'), false);
+  });
+
+  it('records the last start failure and keeps it readable after a failed attempt', async () => {
+    const h = harness();
+    await h.routes.get('/api/w2m/remote/config').fetch(request({ enabled: true }));
+    const started = await h.routes.get('/api/w2m/remote/start').fetch(request({ machine_id: 'm-1' }));
+    assert.equal(started.status, 502);
+    const diagnostics = await h.routes.get('/api/w2m/remote/diagnostics').fetch(request({}, 'GET'));
+    const body = await diagnostics.json();
+    assert.equal(body.ok, true);
+    assert.equal(body.pool_available, false);
+    assert.equal(body.session, null);
+    assert.notEqual(body.last_error, null);
+    assert.equal(typeof body.last_error.code, 'string');
+    assert.equal(typeof body.last_error.at, 'string');
+  });
+});
