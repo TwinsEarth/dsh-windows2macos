@@ -44,8 +44,7 @@ import { loadOrCreateIdentity, saveDeviceToken } from '../../agent/identity.mjs'
 import { probeCapsDetailed, detectPlatform } from '../../agent/caps.mjs';
 import { resolveStateDir } from '../../util/cli.mjs';
 import { parseServer } from '../../agent/stun.mjs';
-import { createRelayPeerKeyResolver, createWebRtcTransportPool } from '../../agent/webrtc/pool.mjs';
-import { setSharedWebRtcPool } from '../webrtc-pool-registry.mjs';
+import { createWebRtcPoolRuntime } from '../p2p-webrtc/pool-runtime.mjs';
 import { findProfileDir } from '../auto-update.mjs';
 import { readOperatorToken } from '../operator-token.mjs';
 import { schemaProblems, strayParameterProblems } from '../schema-spec.mjs';
@@ -2691,17 +2690,32 @@ async function startLocalStack(ctx, cfg) {
      * started in-process.
      */
     let webrtcPool = null;
+    let webrtcRuntime = null;
     if (cfg.webrtc?.buildable === true) {
-      const keyLoad = loadDeviceKey(null, loaded.path);
       const relayTransport = createP2PTransport(cfg);
-      const built = createWebRtcTransportPool({
-        machineId: loaded.identity.machine_id,
+      /**
+       * Build through the registry instead of `createWebRtcTransportPool` directly. If a
+       * `dsh-p2p-webrtc` row already published the process pool, `ensure()` borrows it and never
+       * constructs a second pool on this machine id. `loadDeviceKey` stays lazy for that case: a
+       * borrowed pool must not fail the root start because the local key file is missing.
+       */
+      webrtcRuntime = createWebRtcPoolRuntime({
+        owner: 'w2m-root',
+        identity: loaded.identity,
         signalUrl: cfg.webrtc.signal_url,
         signalToken: cfg.webrtc.signal_token,
-        deviceKey: keyLoad.key,
         deviceKeyDir: path.dirname(loaded.path),
         allowCreateDeviceKey: false,
-        resolvePeerKey: createRelayPeerKeyResolver({ getJson: relayTransport.getJson }),
+        getJson: relayTransport.getJson,
+        loadDeviceKey: () => {
+          const keyLoad = loadDeviceKey(null, loaded.path);
+          if (keyLoad.key === null || keyLoad.key === undefined) {
+            const error = new Error(keyLoad.error ?? 'device key unavailable');
+            error.code = 'DEVICE_KEY_UNAVAILABLE';
+            throw error;
+          }
+          return { key: keyLoad.key };
+        },
         providerCommand: cfg.webrtc.provider_command,
         providerArgs: cfg.webrtc.provider_args,
         providerCwd: cfg.webrtc.provider_cwd,
@@ -2715,14 +2729,19 @@ async function startLocalStack(ctx, cfg) {
         statsPollMs: cfg.webrtc.stats_poll_ms,
         maxFragmentBytes: cfg.webrtc.max_fragment_bytes,
       });
-      if (built.ok === true) {
-        webrtcPool = built.pool;
-        inProcessWebRtcPool = built.pool;
-        setSharedWebRtcPool(built.pool);
-        ctx.logger?.info?.(`w2m: WebRTC pool ready (${cfg.webrtc.signal_url.replace(/token=[^&]*/, 'token=<redacted>')})`);
+      const ensured = await webrtcRuntime.ensure();
+      if (ensured.ok === true) {
+        webrtcPool = ensured.pool;
+        inProcessWebRtcPool = ensured.pool;
+        const quietUrl = webrtcRuntime.status().signal_url ?? cfg.webrtc.signal_url;
+        ctx.logger?.info?.(
+          `w2m: WebRTC pool ${ensured.reused === true ? 'borrowed' : 'ready'} ` +
+            `(owner=${ensured.owner}, ${quietUrl})`,
+        );
       } else {
-        cfg.webrtc.reason = `WEBRTC_POOL_BAD_CONFIG: ${built.detail}`;
-        ctx.logger?.warn?.(`w2m: WebRTC pool not built (${built.code}: ${built.detail})`);
+        // eslint-disable-next-line require-atomic-updates -- cfg.webrtc is this start's own config
+        cfg.webrtc.reason = `${ensured.code}: ${ensured.detail}`;
+        ctx.logger?.warn?.(`w2m: WebRTC pool not built (${ensured.code}: ${ensured.detail})`);
       }
     } else if (cfg.webrtc?.reason) {
       ctx.logger?.info?.(`w2m: WebRTC data plane inactive: ${cfg.webrtc.reason}`);
@@ -3486,13 +3505,13 @@ async function startLocalStack(ctx, cfg) {
     ensureFleetJoin = null;
     inProcessAgentStatus = null;
     inProcessWebRtcPool = null;
-    setSharedWebRtcPool(null);
     await agent.stop();
-    if (webrtcPool !== null) {
-      try {
-        await webrtcPool.stop();
-      } catch (error) {
-        ctx.logger?.warn?.('w2m: WebRTC pool close failed: ' + (error instanceof Error ? error.message : String(error)));
+    if (webrtcRuntime !== null) {
+      const stopped = await webrtcRuntime.stop();
+      if (stopped.ok !== true && stopped.code !== 'WEBRTC_POOL_NOT_OWNER') {
+        ctx.logger?.warn?.(
+          'w2m: WebRTC pool close failed: ' + (stopped.detail ?? stopped.code ?? 'unknown error'),
+        );
       }
     }
     // v1.6.7: `relay` is only a real relay object when THIS stack started a local relay; a remote-

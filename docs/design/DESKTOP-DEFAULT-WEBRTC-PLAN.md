@@ -105,6 +105,8 @@ getWebRtcPoolRuntime()
 
 ### P1：共享 pool 运行时（1.5 天）
 
+状态：已落地（2026-11-23），验收见 `docs/acceptance/3.6.0/P1-POOL-RUNTIME.md`。owner 冲突码实际采用 `WEBRTC_POOL_OWNER_CONFLICT`，非 owner teardown 采用 `WEBRTC_POOL_NOT_OWNER`。
+
 新增/修改：
 
 - `src/plugin/p2p-webrtc/pool-runtime.mjs`
