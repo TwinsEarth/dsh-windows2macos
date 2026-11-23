@@ -362,13 +362,9 @@ export const DOCUMENT_EXCLUSIONS = [
       'records past release actions for the maintainer and makes no claim about the shipped ' +
       'artifact, so it is not part of the documentation set the package ships.',
   },
-  {
-    path: 'WORKSPACE.md',
-    reason:
-      'a local-only workspace note naming E:\\DB\\W2M as the sole development copy and the old ' +
-      'E:\\DSH\\DS\\W2M as read-only; it is a machine-local operator rule, not a document that ' +
-      'describes the shipped plugin, and packing it would put one developer path in every install.',
-  },
+  // WORKSPACE.md is ignored by .gitignore and absent from a clean checkout. documentContract()
+  // refuses an exclusion row for a file that is not in the tree, so it must not appear here: a
+  // local-only operator note cannot be excused by a package manifest it is not part of.
 ];
 
 /** Below this many characters a "reason" is a shrug, not a reason. */

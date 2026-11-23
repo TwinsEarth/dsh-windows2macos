@@ -16,6 +16,7 @@ All notable changes to this project are documented here.
 - **测试**：`test/remote-view-route.test.mjs` 新增共享 pool happy path（帧不走 relay）、stop 不 closePeer、ack=false 回落、strict 502、目标端预热/拒绝/旧 viewer 兼容，以及“先挂载、后拿到 pool”的晚绑定项；`test/remote-requests.test.mjs` 覆盖 transport 意图与一次性 ack；`test/relay-phase2-server.test.mjs` 覆盖 `/v1/remote/ack` 的越权拒绝与冒充拒绝。
 - **P7 真实引擎验收**：新增 `scripts/desktop-webrtc-p7.mjs`（`desktop:p7`），用外部 `node-datachannel@0.33.6` 在真实进程上跑 pair、四节点矩阵、故障注入、跨机队列与 30 分钟 1 Hz soak。本机四节点 12/12、两主机 × 四节点 12/12，全部 `direct`+`secure`、4096 B、SHA-256 一致、`relay_frame_calls=0`、每进程 `pool_count=1`；30 分钟 1800/1800 帧，RSS 末-首 -4 KiB，句柄 7/8/7；故障 4/4。四台物理机 full mesh 受现网 NAT（三台同一出口、无 TURN）限制，已作为限制记录，不声明为 4 台全互连。证据：`docs/acceptance/3.7.0/DESKTOP-WEBRTC-DEFAULT.{md,json}`。
 - **发布包调整**：只读 readiness 从 `scripts/desktop-webrtc-readiness.mjs` 移到 `bin/w2m-desktop-readiness.mjs`，随 npm 包发布，`scripts/` 保持禁止入包；`desktop:readiness` 与文档路径同步更新。
+- **发布门禁**：`DOCUMENT_EXCLUSIONS` 移除 `WORKSPACE.md` 行；该文件只在本机被 `.gitignore` 忽略、干净检出中不存在，旧的排除行会被 `documentContract()` 判为 stale。
 - **版本**：package/plugin/marketplace/codex 清单统一升到 3.6.0。
 
 ## [3.5.9] — 2026-11-23
