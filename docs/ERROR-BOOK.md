@@ -9,7 +9,7 @@
 | EB-003 | 3.5.8 npm 暂存包 | 待 reject，禁止批准 |
 | EB-004 | WORKSPACE.md 排除在干净检出失效 | 已修复，待分支 CI 验证 |
 | EB-005 | 3.5.9 缺少验收证据 | 已补记录，待分支 CI 验证 |
-| EB-006 | Windows CI 命令行超长跑不了套件 | 改用 bash，待 CI 验证 |
+| EB-006 | Windows CI 命令行超长跑不了套件 | 改用分批 runner，待 CI 验证 |
 
 ## EB-001 dsh-teams 启动报 `Cannot find module '../../lib/tool-kit.js'`
 
@@ -176,7 +176,7 @@ The command line is too long.
 
 **修复**
 
-在 `.github/workflows/ci.yml` 的“Unit and release suites”步骤加 `shell: bash`。Git Bash 直接把 argv 交给 `CreateProcess`，走 Windows 的 32,767 字符上限，9.7 KB 可以正常执行；套件清单仍只由 `package.json#scripts.test` 维护。
+新增 `scripts/run-suite.mjs`：从 `package.json#scripts.test` 读出同一份文件清单，按 6,500 字符一批拆成两次 `node --test` 调用。CI 的 Windows 腿走这个 runner，Linux/macOS 仍跑 `npm test`。第一次尝试只把步骤 shell 换成 bash 不够——npm 在 Windows 上仍经 `cmd.exe` 启动脚本，8,191 字符上限照旧生效。套件清单仍只由 `package.json#scripts.test` 维护。
 
 **防复发**
 
