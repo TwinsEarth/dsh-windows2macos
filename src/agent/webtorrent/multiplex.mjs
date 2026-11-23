@@ -26,8 +26,8 @@ export const TORRENT_INFO_HASH_BYTES = 20;
 /** Header size in bytes. */
 export const TORRENT_FRAME_HEADER_BYTES = TORRENT_FRAME_MAGIC.length + TORRENT_INFO_HASH_BYTES;
 
-/** Largest chunk WebTorrent may hand to one frame. The V1 transport cap is 4 MiB; leave the header room. */
-export const TORRENT_FRAME_MAX_CHUNK_BYTES = 4 * 1024 * 1024 - 64;
+/** Largest chunk WebTorrent may hand to one frame. One encoded frame is 4 MiB including the header. */
+export const TORRENT_FRAME_MAX_CHUNK_BYTES = 4 * 1024 * 1024 - TORRENT_FRAME_HEADER_BYTES;
 
 const HEX_40 = /^[0-9a-f]{40}$/i;
 

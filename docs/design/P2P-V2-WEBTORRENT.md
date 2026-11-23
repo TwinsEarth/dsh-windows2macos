@@ -77,10 +77,10 @@ P2PV2Service
 
 | 工具 | 作用 | 关键约束 |
 |---|---|---|
-| `p2p_v2_status` | 引擎、share、peer、进度、swarm 计数、pool 状态 | 只读；不加载引擎；含 `transport`/`peer_count`/`seeders`/`leechers` |
+| `p2p_v2_status` | 引擎、share、peer、进度、restore 候选、存储上限、背压指标 | 只读；不加载引擎；含 `transport`/`peer_count`/`seeders`/`leechers`/`storage`/`backpressure` |
 | `p2p_v2_peers` | 已连接的 pool peer + 各 share 的 attach 状态 | 只读；不 dial；不返回 signal URL/token |
-| `p2p_v2_share` | 种子一个文件/目录，返回 magnet | `confirm:"share"`；敏感路径拒绝；`peers` 数组逐个 attach |
-| `p2p_v2_add` | 从 magnet 下载到目录 | `confirm:"add"`；先 infoHash 再 attach；`peers` 可含多个 seeder |
+| `p2p_v2_share` | 种子一个文件/目录，返回 magnet | `confirm:"share"`；敏感路径 + 允许根 + symlink 拒绝；`peers` 数组逐个 attach |
+| `p2p_v2_add` | 从 magnet 下载到目录或默认下载根 | `confirm:"add"`；`path` 可选；先 infoHash 再 attach；staging + 配额 |
 | `p2p_v2_attach` | 给一个 share 增加 V1 peer | 幂等 per (share, machine)；达到 `maxPeersPerShare` 拒绝；不 closePeer |
 | `p2p_v2_detach` | 移除一个逻辑 peer 流 | 保留 V1 pair |
 | `p2p_v2_stop` | 停一个 share / 全部 | 销毁 torrent；不停止 pool |
@@ -93,33 +93,45 @@ P2PV2Service
 
 ```text
 p2p_v2_share(path, peers)
-  -> path 存在性/类型检查
-  -> 同路径已有 seed 记录：复用
+  -> service 层 sensitive + allowed_roots + realpath(symlink) 检查
+  -> 存在性/类型/R_OK 检查；目录额外 readdirSync
+  -> source_key 相同已有 seed 记录：复用
+  -> 单文件超过 max_file_bytes：P2P_V2_FILE_TOO_LARGE
   -> ensureClient()
   -> client.seed(path) 等待 seed callback
-  -> record share
+  -> record share（input_path/source_key）
   -> peers 去重、逐个 attach：pool.ensure(machine) -> adapter -> torrent.addPeer
   -> 单个失败记入 peer_errors，share 仍成功
 ```
 
+默认允许根为用户目录、`tmpdir()`、项目 cwd 和 `download_root`；显式 `allowedRoots` 时仍加入 `download_root`。symlink 解析到根外返回 `P2P_V2_PATH_OUTSIDE_ROOT`，敏感段/名/扩展名返回 `P2P_V2_SENSITIVE_PATH`。
+
 ### 5.2 download
 
 ```text
-p2p_v2_add(magnet, dest, peers)
-  -> 目录创建/类型检查
-  -> client.add(magnet) 返回 torrent
-  -> 等 infoHash 事件
-  -> record share
+p2p_v2_add(magnet, path?, peers)
+  -> magnet 的 btih 解析失败：P2P_V2_MAGNET_INVALID（不加载引擎）
+  -> path 缺省 = <download_root>/<infoHash>；持久化记录优先复用 download_path/staging_path
+  -> service 层 allowed_roots + sensitive 检查；目录存在或可创建，否则 DEST_INVALID
+  -> staging = 目标同卷 .w2m-partial-<infoHash>
+  -> client.add(magnet, { path: staging })
+  -> 等 infoHash；实际 hash 与 magnet 不一致：销毁并 P2P_V2_MAGNET_INVALID
+  -> max_file_bytes / max_download_bytes / statfs 可用空间检查
+  -> record share（staging_path）
   -> peers 去重、逐个 attach（在 ready 之前）
   -> 全部失败：销毁 torrent + P2P_V2_PEERS_UNREACHABLE
   -> 部分成功：继续有界等待 ready；返回 metadata_ready，不等待整个文件完成
+  -> torrent.done：校验每个 file 的 staging 大小，rename/merge 到目标，删除 staging
 ```
 
-### 5.3 attach / stop
+目标目录只在最终发布时接收文件；下载过程中只有 staging 里有 partial。`done` 事件后若 staging 不完整，保持 `finalized:false` 并每 100ms 重试最多 20 次，状态里暴露 `finalize_error`。`torrent.files[].path` 必须是 staging 内相对路径，绝对路径、盘符和 `..` 均拒绝。
+
+### 5.3 attach / stop / restore
 
 - `attach`：`pool.ensure` 失败 -> `P2P_V2_PEER_UNREACHABLE`；`torrent.addPeer` 失败 -> `P2P_V2_TORRENT_PEER_FAILED`；成功后 adapter 加入 `peer\0infoHash` 路由表。
-- `detach`：`torrent.removePeer(machine)` + adapter.destroy；V1 pair 保留。
-- `stop`：adapter 全销毁 -> 路由表清理 -> `torrent.destroy()`；share 记录删除；`stopAll` 才 `client.destroy()` 和退订 pool。
+- `detach`：`torrent.removePeer(machine)` + adapter.destroy；V1 pair 保留；share metadata 重写。
+- `stop`：adapter 全销毁 -> 路由表清理 -> `torrent.destroy()`；share 记录删除；staging 保留以便显式恢复；`stopAll` 才 `client.destroy()` 和退订 pool，并清空 restore 候选。
+- `<state_dir>/shares.json` 原子写入 share metadata（info hash、路径、peers）；进程重启只加载候选到 `status.restore`，不自动 add。
 
 ## 6. 失败矩阵
 
@@ -131,18 +143,27 @@ p2p_v2_add(magnet, dest, peers)
 | `pool.ensure` 失败 | `P2P_V2_PEER_UNREACHABLE`，保留 `pool_code`；其他 peer 继续 |
 | `add` 的每个 peer 都失败 | `P2P_V2_PEERS_UNREACHABLE`；刚建的 torrent 被销毁，不留空 share |
 | magnet 无 metadata 且 peer 未连上 | `metadata_ready:false` + `P2P_V2_TORRENT_READY_TIMEOUT`；torrent 仍保留，可后补 attach |
-| 同路径重复 share | `reused:true`，不重复 seed |
+| infoHash 等待超时 | `P2P_V2_TORRENT_METADATA_TIMEOUT`；staging 保留供显式重试 |
+| 同路径/同 source_key 重复 share | `reused:true`，不重复 seed |
 | 重复 add 同 info hash | `reused:true` |
+| 路径在允许根外 / symlink 逃逸 | `P2P_V2_PATH_OUTSIDE_ROOT` |
+| 敏感路径 | `P2P_V2_SENSITIVE_PATH` |
+| magnet 无 40-hex btih / hash 不一致 | `P2P_V2_MAGNET_INVALID` |
+| 单文件 > max_file_bytes | `P2P_V2_FILE_TOO_LARGE`；销毁 torrent、删除 staging |
+| 总量 > max_download_bytes / 卷空间不足 | `P2P_V2_QUOTA_EXCEEDED` / `P2P_V2_DISK_FULL` |
+| staging 不完整 / 文件路径越界 | `finalized:false` + `P2P_V2_FINALIZE_FAILED`；目标不出现半文件 |
 | peer 超限/share 超限 | 命名拒绝，不静默淘汰 |
 | 适配器写入超时 | `P2P_V2_SEND_TIMEOUT`；torrent peer 失败，pool 不关闭 |
 
 ## 7. 安全与隐私
 
-- 文件路径由操作员显式给出；`p2p_v2_share`/`add` 先过 `sensitiveMatch`，`.ssh`、`.env`、私钥等直接拒绝。
+- `share`/`add` 在插件 `guardPath` 之外，service 再做一次 `sensitiveMatch` + allowed roots + realpath 检查；直接调用 service 不能绕过。
+- 默认下载目录固定为 `<dsh_home>/p2p-v2/downloads/<infoHash>`，不直接写调用方任意目录；显式 `path` 仍必须落在允许根内。
 - 默认没有公共 announce，info hash 不离开编队；magnet 只返回给调用方，由调用方决定发给谁。
 - V2 帧经过 V1 Noise 通道；BitTorrent 的 wire 是内层协议，不额外暴露明文。
 - `stop` 不关闭共享 pair，避免把任务分发、远程桌面、Teams 数据面一起拆掉。
 - 文件写入需要 `confirm:"add"`；不实现目标端自动接受远程 offer。
+- metadata 只保存路径、hash、peers 和状态；`last_error` 只带 code 和结构化 detail，不打印文件内容。
 
 ## 8. 测试矩阵
 
@@ -151,6 +172,7 @@ p2p_v2_add(magnet, dest, peers)
 | 字节标签 | `test/p2p-v2.test.mjs` round-trip、坏 hash、空 chunk、JSON 不命中 |
 | 传输抽象 | 注册表默认 `webrtc-v1`、未知名字命名拒绝；fake transport 上的同一 adapter 收发；V1 binding destroy 不关闭 pool/pair |
 | 多 peer 编排 | `test/p2p-v2.test.mjs`：1 seed + 2 leecher、2 seed + 2 leecher、单 peer 失败其余成功、全部失败聚合、peer 上限/重复 attach、`p2p_v2_peers` 只读无 dial、同一 V1 pair 上任务 JSON 与 torrent 帧并发 |
+| 生产边界 | `test/p2p-v2.test.mjs`：允许根越界、symlink 逃逸、service 层敏感路径、缺省下载根、staging 原子发布、半文件、单文件/总量上限、坏 magnet/hash 不一致、metadata 超时、restore 候选、4 MiB 帧边界、outbound 指标 |
 | service | seed 真实临时文件、add 先 infoHash 后 attach、detach/stop 不 closePeer、缺引擎命名、share 复用/上限 |
 | 接线 | package export、lib seam、cordis row disabled、7 工具 inert mount、confirm 拒绝 |
 | 真实 WebTorrent | `test/p2p-v2-live.mjs`：两个真实 pool + 真实 signaling/Noise + 真实 WebTorrent，传输 256 KiB 文件并比对字节；用 `W2M_WEBTORRENT_MODULE` 指定外部引擎，默认 suite 不依赖 |
@@ -160,4 +182,7 @@ p2p_v2_add(magnet, dest, peers)
 - 不新增 package runtime dependency；WebTorrent 只能通过外部入口或注入工厂。
 - 不自动接受远程文件写入；没有 `offer` 协议。
 - 不做公共 swarm / tracker 浏览器；`allowNativeTrackers` 是显式 opt-in。
-- 不在本版做 fleet roster 自动发现、断点续传恢复、Teams artifact 迁移；这些需要单独的授权与验收。
+- 不在本版做 fleet roster 自动发现；重启恢复必须显式 `add`，没有后台守护。
+- 物理磁盘配额是 best-effort：`statfsSync` 不可用时只保留配置上限。
+- 多文件最终发布按 entry 逐个 rename；只有单文件是整文件原子 rename。中途失败时已移动文件完整，剩余文件留在 staging。
+- `max_frames_per_second`/`max_buffered_bytes` 是诊断阈值，不主动丢帧；4 MiB 协议上限不变。

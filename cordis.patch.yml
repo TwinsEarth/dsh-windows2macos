@@ -332,13 +332,22 @@
       config:
         # 'webtorrent' uses the host's resolution; absolute/file path points at an external install.
         webTorrentModule: 'webtorrent'
-        # Empty state dir means <DSH_HOME>/p2p-v2. Reserved for metadata/cache; no bytes are stored here.
+        # Empty state dir means <DSH_HOME>/p2p-v2. Share metadata lives here; downloads default to
+        # <stateDir>/downloads/<infoHash> and never to an arbitrary caller directory.
         stateDir: ''
+        # Empty means <stateDir>/downloads. Both share and add are confined to allowedRoots; the
+        # defaults are the user home, the project cwd, the OS temp dir and the download root.
+        downloadRoot: ''
+        allowedRoots: []
         trackers: []
         allowNativeTrackers: false
         maxShares: 8
         maxPeersPerShare: 16
         maxConns: 32
+        maxFileBytes: 10737418240
+        maxDownloadBytes: 10737418240
+        maxFramesPerSecond: 2048
+        maxBufferedBytes: 4194304
         readyTimeoutMs: 30000
         metadataTimeoutMs: 10000
         writeTimeoutMs: 15000

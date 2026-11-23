@@ -10,7 +10,7 @@
  * `webTorrentFactory`. A missing engine is a named status, not a broken mount.
  */
 
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join, resolve as resolvePath } from 'node:path';
 
 import { getSharedWebRtcPool } from './webrtc-pool-registry.mjs';
@@ -52,21 +52,41 @@ function stringArray(value) {
  * Normalize the row config into the service's flat shape.
  *
  * @param {Record<string, any>} [config]
- * @param {{env?: Record<string,string|undefined>, dshHome?: string, webTorrentFactory?: Function|null,
- *   getPool?: () => object|null}} [deps]
+ * @param {{env?: Record<string,string|undefined>, dshHome?: string, projectDir?: string,
+ *   webTorrentFactory?: Function|null, getPool?: () => object|null}} [deps]
  * @returns {object}
  */
 export function normalizePluginConfig(config = {}, deps = {}) {
   const env = deps.env ?? process.env;
   const dshHome =
     typeof deps.dshHome === 'string' && deps.dshHome !== '' ? resolvePath(deps.dshHome) : defaultDshHome(env);
+  const stateDir =
+    typeof config.stateDir === 'string' && config.stateDir !== ''
+      ? resolvePath(config.stateDir)
+      : join(dshHome, 'p2p-v2');
+  const downloadRoot =
+    typeof config.downloadRoot === 'string' && config.downloadRoot !== ''
+      ? resolvePath(config.downloadRoot)
+      : join(stateDir, 'downloads');
+  const projectDir =
+    typeof deps.projectDir === 'string' && deps.projectDir !== ''
+      ? resolvePath(deps.projectDir)
+      : typeof config.projectDir === 'string' && config.projectDir !== ''
+        ? resolvePath(config.projectDir)
+        : process.cwd();
+  const allowedRoots = stringArray(config.allowedRoots).map((entry) => resolvePath(entry));
   const rawTrackers = config.trackers ?? config.announce ?? [];
   const trackers = Array.isArray(rawTrackers)
     ? rawTrackers.filter((entry) => typeof entry === 'string' && entry.trim() !== '').map((entry) => entry.trim())
     : [];
   return {
     dsh_home: dshHome,
-    state_dir: typeof config.stateDir === 'string' && config.stateDir !== '' ? resolvePath(config.stateDir) : join(dshHome, 'p2p-v2'),
+    state_dir: stateDir,
+    download_root: downloadRoot,
+    project_dir: projectDir,
+    allowed_roots: allowedRoots.length > 0
+      ? allowedRoots
+      : [homedir(), tmpdir(), projectDir, downloadRoot].map((entry) => resolvePath(entry)),
     web_torrent_module:
       typeof config.webTorrentModule === 'string' && config.webTorrentModule !== ''
         ? config.webTorrentModule
@@ -79,6 +99,22 @@ export function normalizePluginConfig(config = {}, deps = {}) {
         ? Number(config.maxPeersPerShare)
         : 16,
     max_conns: Number.isInteger(Number(config.maxConns)) && Number(config.maxConns) > 0 ? Number(config.maxConns) : 32,
+    max_file_bytes:
+      Number.isFinite(Number(config.maxFileBytes)) && Number(config.maxFileBytes) >= 1
+        ? Number(config.maxFileBytes)
+        : 10 * 1024 * 1024 * 1024,
+    max_download_bytes:
+      Number.isFinite(Number(config.maxDownloadBytes)) && Number(config.maxDownloadBytes) >= 1
+        ? Number(config.maxDownloadBytes)
+        : 10 * 1024 * 1024 * 1024,
+    max_frames_per_second:
+      Number.isFinite(Number(config.maxFramesPerSecond)) && Number(config.maxFramesPerSecond) >= 0
+        ? Number(config.maxFramesPerSecond)
+        : 2_048,
+    max_buffered_bytes:
+      Number.isFinite(Number(config.maxBufferedBytes)) && Number(config.maxBufferedBytes) >= 0
+        ? Number(config.maxBufferedBytes)
+        : 4 * 1024 * 1024,
     ready_timeout_ms:
       Number.isFinite(Number(config.readyTimeoutMs)) && Number(config.readyTimeoutMs) >= 1000
         ? Number(config.readyTimeoutMs)
@@ -107,11 +143,18 @@ export function describeConfig(cfg) {
   return {
     module: cfg.web_torrent_module,
     state_dir: cfg.state_dir,
+    download_root: cfg.download_root,
+    project_dir: cfg.project_dir,
+    allowed_roots: cfg.allowed_roots,
     trackers: cfg.trackers,
     allow_native_trackers: cfg.allow_native_trackers,
     max_shares: cfg.max_shares,
     max_peers_per_share: cfg.max_peers_per_share,
     max_conns: cfg.max_conns,
+    max_file_bytes: cfg.max_file_bytes,
+    max_download_bytes: cfg.max_download_bytes,
+    max_frames_per_second: cfg.max_frames_per_second,
+    max_buffered_bytes: cfg.max_buffered_bytes,
     ready_timeout_ms: cfg.ready_timeout_ms,
     metadata_timeout_ms: cfg.metadata_timeout_ms,
     write_timeout_ms: cfg.write_timeout_ms,
@@ -242,7 +285,11 @@ export function buildTools({ service, defineTool }) {
       'Join an existing WebTorrent swarm from a magnet URI and download into a directory, optionally attaching peers by machine id over a named transport. Requires confirm:"add" because it writes files. The peer must be attached before metadata can be fetched from a trackerless magnet.',
     parameters: {
       magnet: { type: 'string', required: true, description: 'Magnet URI returned by p2p_v2_share.' },
-      path: { type: 'string', required: true, description: 'Destination directory; created when absent.' },
+      path: {
+        type: 'string',
+        description:
+          'Optional destination directory; defaults to <dshHome>/p2p-v2/downloads/<infoHash>. Created when absent, but only under the configured allowed roots.',
+      },
       peers: {
         type: 'array',
         items: { type: 'string' },
@@ -266,8 +313,10 @@ export function buildTools({ service, defineTool }) {
       if (typeof args.magnet !== 'string' || args.magnet === '') {
         return jsonText({ ok: false, code: 'P2P_V2_MAGNET_REQUIRED', detail: 'magnet is required' });
       }
-      const guard = guardPath(args.path);
-      if (guard.ok !== true) return jsonText(guard);
+      if (typeof args.path === 'string' && args.path !== '') {
+        const guard = guardPath(args.path);
+        if (guard.ok !== true) return jsonText(guard);
+      }
       return jsonText(
         await service.add({
           magnet: args.magnet,

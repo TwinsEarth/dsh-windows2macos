@@ -7,13 +7,14 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, readdirSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
   TORRENT_FRAME_HEADER_BYTES,
+  TORRENT_FRAME_MAX_CHUNK_BYTES,
   TORRENT_FRAME_MAGIC,
   decodeTorrentFrame,
   encodeTorrentFrame,
@@ -36,7 +37,7 @@ import {
 import {
   apply,
   buildTools,
-  normalizePluginConfig,
+  normalizePluginConfig as normalizePluginConfigBase,
   P2P_V2_ROW_ID,
   TOOL_NAMES,
 } from '../src/plugin/p2p-v2-plugin.mjs';
@@ -44,7 +45,17 @@ import {
 const HASH_A = 'a'.repeat(40);
 const HASH_B = 'b'.repeat(40);
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
+const TEST_STATE = mkdtempSync(join(tmpdir(), 'w2m-p2p-v2-state-'));
 const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
+
+/** Keep every service test's metadata file out of the real `~/.dsh`. */
+function normalizePluginConfig(config = {}, deps = {}) {
+  return normalizePluginConfigBase(config, {
+    dshHome: join(TEST_STATE, 'dsh'),
+    projectDir: ROOT,
+    ...deps,
+  });
+}
 const patch = readFileSync(join(ROOT, 'cordis.patch.yml'), 'utf8');
 
 function patchRow(id) {
@@ -233,6 +244,31 @@ function tempFile(name = 'sample.bin') {
   return { dir, path: join(dir, name) };
 }
 
+/** A service config whose state and download roots live under one disposable test directory. */
+function scopedConfig(overrides = {}) {
+  const root = mkdtempSync(join(tmpdir(), 'w2m-p2p-v2-scope-'));
+  return {
+    root,
+    cfg: normalizePluginConfig({
+      stateDir: join(root, 'state'),
+      downloadRoot: join(root, 'downloads'),
+      allowedRoots: [root],
+      ...overrides,
+    }),
+  };
+}
+
+/** Poll a synchronous predicate without turning every wait into a fixed sleep. */
+async function waitFor(predicate, timeoutMs = 3_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const value = await predicate();
+    if (value) return value;
+    await new Promise((resolve) => { setTimeout(resolve, 25); });
+  }
+  throw new Error(`waitFor timed out after ${timeoutMs} ms`);
+}
+
 function fakeContext() {
   const definitions = [];
   const registered = [];
@@ -264,6 +300,9 @@ describe('p2p v2 multiplex', () => {
   it('refuses a bad hash or an oversized chunk before putting bytes on the pool', () => {
     assert.throws(() => encodeTorrentFrame('not-a-hash', Buffer.from('x')), /infoHash/);
     assert.throws(() => encodeTorrentFrame(HASH_A, Buffer.alloc(0)), /empty chunk/);
+    const frame = encodeTorrentFrame(HASH_A, Buffer.alloc(TORRENT_FRAME_MAX_CHUNK_BYTES));
+    assert.equal(frame.length, 4 * 1024 * 1024);
+    assert.throws(() => encodeTorrentFrame(HASH_A, Buffer.alloc(TORRENT_FRAME_MAX_CHUNK_BYTES + 1)), /cap/);
   });
 });
 
@@ -830,9 +869,11 @@ describe('dsh-p2p-v2 wiring', () => {
 
   it('mounts seven tools inertly and refuses share/add without confirmation', async () => {
     const { ctx, definitions, registered, effects } = fakeContext();
+    const dshHome = mkdtempSync(join(tmpdir(), 'w2m-p2p-v2-mount-'));
     let factoryCalls = 0;
     const dispose = await apply(ctx, {}, {
       defineTool: (definition) => definition,
+      dshHome,
       webTorrentFactory: () => {
         factoryCalls += 1;
         return fakeClient();
@@ -865,6 +906,7 @@ describe('dsh-p2p-v2 wiring', () => {
     assert.equal(peersView.pool.available, false);
     assert.deepEqual(peersView.shares, []);
     await dispose();
+    assert.equal(existsSync(join(dshHome, 'p2p-v2', 'shares.json')), false);
   });
 
   it('builds the same tool set over a pure service', () => {
@@ -872,5 +914,284 @@ describe('dsh-p2p-v2 wiring', () => {
     const definitions = buildTools({ service, defineTool: (definition) => definition });
     assert.deepEqual(definitions.map((definition) => definition.name), [...TOOL_NAMES]);
     assert.equal(P2P_V2_ROW_ID, 'dsh-p2p-v2');
+  });
+});
+
+describe('p2p v2 production boundaries', () => {
+  it('refuses a source outside every allowed root before loading the engine', async () => {
+    const { dir } = tempFile();
+    const outside = mkdtempSync(join(tmpdir(), 'w2m-p2p-v2-outside-'));
+    const outsideFile = join(outside, 'secret.bin');
+    writeFileSync(outsideFile, Buffer.alloc(32, 3));
+    let factoryCalls = 0;
+    const service = new P2PV2Service(
+      normalizePluginConfig({ stateDir: join(dir, 'state'), allowedRoots: [dir] }),
+      {
+        getPool: () => fakePool(),
+        webTorrentFactory: () => {
+          factoryCalls += 1;
+          return fakeClient();
+        },
+      },
+    );
+    const result = await service.share({ path: outsideFile });
+    assert.equal(result.ok, false, JSON.stringify(result));
+    assert.equal(result.code, P2P_V2_CODE.PATH_OUTSIDE_ROOT);
+    assert.equal(factoryCalls, 0);
+    rmSync(outside, { recursive: true, force: true });
+  });
+
+  it('resolves a symlink before the root check and refuses when it escapes', async () => {
+    const { dir } = tempFile();
+    const outside = mkdtempSync(join(tmpdir(), 'w2m-p2p-v2-link-outside-'));
+    writeFileSync(join(outside, 'secret.bin'), Buffer.alloc(16, 5));
+    const link = join(dir, 'jump');
+    try {
+      symlinkSync(outside, link, 'junction');
+    } catch {
+      rmSync(outside, { recursive: true, force: true });
+      return;
+    }
+    let factoryCalls = 0;
+    const service = new P2PV2Service(
+      normalizePluginConfig({ stateDir: join(dir, 'state'), allowedRoots: [dir] }),
+      {
+        getPool: () => fakePool(),
+        webTorrentFactory: () => {
+          factoryCalls += 1;
+          return fakeClient();
+        },
+      },
+    );
+    const result = await service.share({ path: join(link, 'secret.bin') });
+    assert.equal(result.ok, false, JSON.stringify(result));
+    assert.equal(result.code, P2P_V2_CODE.PATH_OUTSIDE_ROOT);
+    assert.equal(factoryCalls, 0);
+    rmSync(outside, { recursive: true, force: true });
+  });
+
+  it('applies the sensitive floor inside the service, not only in the plugin guard', async () => {
+    const { dir } = tempFile();
+    const sshDir = join(dir, '.ssh');
+    mkdirSync(sshDir);
+    const keyFile = join(sshDir, 'key.txt');
+    writeFileSync(keyFile, Buffer.alloc(16, 1));
+    const service = new P2PV2Service(
+      normalizePluginConfig({ stateDir: join(dir, 'state'), allowedRoots: [dir] }),
+      { getPool: () => fakePool() },
+    );
+    const result = await service.share({ path: keyFile });
+    assert.equal(result.ok, false, JSON.stringify(result));
+    assert.equal(result.code, P2P_V2_CODE.SENSITIVE_PATH);
+  });
+
+  it('uses the download root when add has no path and moves only completed files', async () => {
+    const { root, cfg } = scopedConfig();
+    const service = new P2PV2Service(cfg, {
+      getPool: () => fakePool(),
+      webTorrentFactory: () => fakeClient(),
+    });
+    const added = await service.add({ magnet: `magnet:?xt=urn:btih:${HASH_B}&dn=sample.bin` });
+    assert.equal(added.ok, true, JSON.stringify(added));
+    assert.equal(added.download_path, join(root, 'downloads', HASH_B));
+    assert.equal(added.share.staging_path, join(root, 'downloads', `.w2m-partial-${HASH_B}`));
+    assert.deepEqual(readdirSync(added.download_path), []);
+
+    const stagingFile = join(added.share.staging_path, 'sample.bin');
+    writeFileSync(stagingFile, Buffer.alloc(1024, 9));
+    const torrent = service.client.torrents[0];
+    torrent.done = true;
+    torrent.progress = 1;
+    torrent.emit('done');
+
+    await waitFor(() => service.status().shares[0]?.done === true);
+    const finalFile = join(added.download_path, 'sample.bin');
+    assert.equal(existsSync(finalFile), true);
+    assert.equal(readFileSync(finalFile).length, 1024);
+    assert.equal(existsSync(added.share.staging_path), false);
+    await service.stopAll();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('refuses a torrent whose single file is above maxFileBytes and leaves no staging tree', async () => {
+    const { root, cfg } = scopedConfig({ maxFileBytes: 2048 });
+    const client = fakeClient();
+    client.add = () => {
+      const torrent = fakeTorrent(HASH_B, 'big.bin');
+      torrent.files = [{ name: 'big.bin', path: 'big.bin', length: 4096 }];
+      setTimeout(() => torrent.emit('infoHash'), 0);
+      return torrent;
+    };
+    const service = new P2PV2Service(cfg, {
+      getPool: () => fakePool(),
+      webTorrentFactory: () => client,
+    });
+    const result = await service.add({
+      magnet: `magnet:?xt=urn:btih:${HASH_B}&dn=big.bin`,
+      path: join(root, 'downloads'),
+    });
+    assert.equal(result.ok, false, JSON.stringify(result));
+    assert.equal(result.code, P2P_V2_CODE.FILE_TOO_LARGE);
+    assert.equal(existsSync(join(root, 'downloads', `.w2m-partial-${HASH_B}`)), false);
+      rmSync(root, { recursive: true, force: true });
+  });
+
+  it('refuses a torrent whose aggregate exceeds maxDownloadBytes', async () => {
+    const { root, cfg } = scopedConfig({ maxDownloadBytes: 1500 });
+    const client = fakeClient();
+    client.add = () => {
+      const torrent = fakeTorrent(HASH_B, 'two');
+      torrent.files = [
+        { name: 'a.bin', path: 'a.bin', length: 1024 },
+        { name: 'b.bin', path: 'b.bin', length: 1024 },
+      ];
+      setTimeout(() => torrent.emit('infoHash'), 0);
+      return torrent;
+    };
+    const service = new P2PV2Service(cfg, {
+      getPool: () => fakePool(),
+      webTorrentFactory: () => client,
+    });
+    const result = await service.add({
+      magnet: `magnet:?xt=urn:btih:${HASH_B}&dn=two`,
+      path: join(root, 'downloads'),
+    });
+    assert.equal(result.ok, false, JSON.stringify(result));
+    assert.equal(result.code, P2P_V2_CODE.QUOTA_EXCEEDED);
+    assert.equal(existsSync(join(root, 'downloads', `.w2m-partial-${HASH_B}`)), false);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('names a bad magnet before touching the engine and a hash mismatch after parsing', async () => {
+    const { root, cfg } = scopedConfig();
+    let factoryCalls = 0;
+    const service = new P2PV2Service(cfg, {
+      getPool: () => fakePool(),
+      webTorrentFactory: () => {
+        factoryCalls += 1;
+        return fakeClient();
+      },
+    });
+    const bad = await service.add({ magnet: 'magnet:?xt=urn:btih:not-hex', path: root });
+    assert.equal(bad.ok, false);
+    assert.equal(bad.code, P2P_V2_CODE.MAGNET_INVALID);
+    assert.equal(factoryCalls, 0);
+
+    const client = fakeClient();
+    let parsedTorrent = null;
+    client.add = () => {
+      parsedTorrent = fakeTorrent(HASH_A, 'wrong.bin');
+      setTimeout(() => parsedTorrent.emit('infoHash'), 0);
+      return parsedTorrent;
+    };
+    const mismatched = new P2PV2Service(cfg, {
+      getPool: () => fakePool(),
+      webTorrentFactory: () => client,
+    });
+    const result = await mismatched.add({
+      magnet: `magnet:?xt=urn:btih:${HASH_B}&dn=wrong.bin`,
+      path: join(root, 'downloads'),
+    });
+    assert.equal(result.ok, false, JSON.stringify(result));
+    assert.equal(result.code, P2P_V2_CODE.MAGNET_INVALID);
+    assert.equal(parsedTorrent.destroyed, true);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('returns a named metadata timeout and leaves the staging path for an explicit retry', async () => {
+    const { root, cfg } = scopedConfig({ metadataTimeoutMs: 1_000 });
+    const client = fakeClient();
+    client.add = () => {
+      const torrent = fakeTorrent(HASH_B, 'slow.bin');
+      torrent.infoHash = undefined;
+      torrent.infoHashBuffer = undefined;
+      return torrent;
+    };
+    const service = new P2PV2Service(cfg, {
+      getPool: () => fakePool(),
+      webTorrentFactory: () => client,
+    });
+    const result = await service.add({
+      magnet: `magnet:?xt=urn:btih:${HASH_B}&dn=slow.bin`,
+      path: join(root, 'downloads'),
+    });
+    assert.equal(result.ok, false, JSON.stringify(result));
+    assert.equal(result.code, P2P_V2_CODE.TORRENT_METADATA_TIMEOUT);
+    assert.equal(typeof result.staging_path, 'string');
+    assert.equal(existsSync(result.staging_path), true);
+    await service.stopAll();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('does not publish a half-written file and finalizes after the missing bytes arrive', async () => {
+    const { root, cfg } = scopedConfig();
+    const service = new P2PV2Service(cfg, {
+      getPool: () => fakePool(),
+      webTorrentFactory: () => fakeClient(),
+    });
+    const added = await service.add({ magnet: `magnet:?xt=urn:btih:${HASH_B}&dn=sample.bin` });
+    assert.equal(added.ok, true, JSON.stringify(added));
+    const stagingFile = join(added.share.staging_path, 'sample.bin');
+    writeFileSync(stagingFile, Buffer.alloc(512, 4));
+    const torrent = service.client.torrents[0];
+    torrent.done = true;
+    torrent.progress = 1;
+    torrent.emit('done');
+
+    await waitFor(() => service.status().shares[0]?.finalize_error?.code === P2P_V2_CODE.FINALIZE_FAILED);
+    assert.equal(existsSync(join(added.download_path, 'sample.bin')), false);
+    assert.equal(service.status().shares[0].finalized, false);
+
+    writeFileSync(stagingFile, Buffer.alloc(1024, 4));
+    torrent.emit('done');
+    await waitFor(() => service.status().shares[0]?.done === true);
+    assert.equal(readFileSync(join(added.download_path, 'sample.bin')).length, 1024);
+    await service.stopAll();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('persists share metadata and exposes it as an explicit-add candidate after restart', async () => {
+    const { root, cfg } = scopedConfig();
+    const seedFile = join(root, 'seed.bin');
+    writeFileSync(seedFile, Buffer.alloc(64, 2));
+    const seedService = new P2PV2Service(cfg, {
+      getPool: () => fakePool(),
+      webTorrentFactory: () => fakeClient(),
+    });
+    const shared = await seedService.share({ path: seedFile });
+    assert.equal(shared.ok, true, JSON.stringify(shared));
+    const readService = new P2PV2Service(cfg, { getPool: () => fakePool() });
+    const status = readService.status();
+    assert.equal(status.shares.length, 0);
+    assert.equal(status.restore.count, 1);
+    assert.equal(status.restore.shares[0].info_hash, HASH_A);
+    assert.equal(status.restore.shares[0].mode, 'seed');
+    assert.equal(status.restore.shares[0].input_path, seedFile);
+    assert.equal(status.state.error, null);
+    await seedService.stopAll();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it('reports outbound frame metrics and backpressure diagnostics in status', async () => {
+    const service = new P2PV2Service(normalizePluginConfig({}), {
+      getPool: () => fakePool(),
+      webTorrentFactory: () => fakeClient(),
+    });
+    const { path } = tempFile();
+    const shared = await service.share({ path });
+    assert.equal(shared.ok, true, JSON.stringify(shared));
+    const attached = await service.attach({ share_id: shared.share.share_id, machine_id: 'machine-b' });
+    assert.equal(attached.ok, true, JSON.stringify(attached));
+    const adapter = service.adapters.get(`machine-b\u0000${HASH_A}`);
+    await new Promise((resolve, reject) => {
+      adapter.write(Buffer.alloc(128, 6), (error) => (error ? reject(error) : resolve()));
+    });
+    const status = service.status();
+    assert.ok(status.stats.frames_out >= 1);
+    assert.ok(status.stats.bytes_out >= 128);
+    assert.equal(status.backpressure.max_buffered_bytes, 4 * 1024 * 1024);
+    assert.ok(status.backpressure.frames_per_second_out >= 0);
+    assert.equal(status.storage.max_file_bytes, 10 * 1024 * 1024 * 1024);
+    await service.stopAll();
   });
 });

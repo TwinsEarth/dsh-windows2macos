@@ -90,11 +90,17 @@ describe('p2p v2 live WebTorrent over webrtc-v1', { skip }, () => {
         natUpnp: false,
         natPmp: false,
       });
-    const cfg = normalizePluginConfig({ readyTimeoutMs: 30_000, metadataTimeoutMs: 15_000 });
+    const base = mkdtempSync(join(tmpdir(), 'w2m-p2p-v2-live-'));
+    const cfg = normalizePluginConfig({
+      readyTimeoutMs: 30_000,
+      metadataTimeoutMs: 15_000,
+      stateDir: join(base, 'state'),
+      downloadRoot: join(base, 'downloads'),
+      allowedRoots: [base],
+    });
     const serviceA = new P2PV2Service(cfg, { getPool: () => poolA, webTorrentFactory: factory });
     const serviceB = new P2PV2Service(cfg, { getPool: () => poolB, webTorrentFactory: factory });
 
-    const base = mkdtempSync(join(tmpdir(), 'w2m-p2p-v2-live-'));
     const seedDir = join(base, 'seed');
     const destDir = join(base, 'dest');
     mkdirSync(seedDir);

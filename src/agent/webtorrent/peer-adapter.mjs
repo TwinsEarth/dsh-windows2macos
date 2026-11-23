@@ -15,10 +15,13 @@
 
 import { Duplex } from 'node:stream';
 
-import { encodeTorrentFrame, normalizeInfoHash } from './multiplex.mjs';
+import { TORRENT_FRAME_MAX_CHUNK_BYTES, encodeTorrentFrame, normalizeInfoHash } from './multiplex.mjs';
 
-/** Largest single write accepted from WebTorrent, matching the V1 logical message cap with margin. */
-export const TORRENT_ADAPTER_MAX_WRITE_BYTES = 4 * 1024 * 1024 - 128;
+/**
+ * Largest single write accepted from WebTorrent. One encoded frame is header + payload and the
+ * multiplex cap is 4 MiB - header, so this is the same ceiling rather than a second, tighter one.
+ */
+export const TORRENT_ADAPTER_MAX_WRITE_BYTES = TORRENT_FRAME_MAX_CHUNK_BYTES;
 
 /**
  * @param {unknown} value
@@ -46,6 +49,7 @@ function toBuffer(chunk) {
  * @param {string|Buffer} input.infoHash
  * @param {{send: Function, name?: string}} input.transport Byte transport binding; only `send` is used.
  * @param {number} [input.writeTimeoutMs]
+ * @param {(bytes: Buffer) => void} [input.onWrite] Called after one frame is accepted by transport.send.
  * @param {(error: Error) => void} [input.onError]
  * @returns {Duplex & {id: string, peer: string, infoHash: string, transport: string|null, feed: (chunk: Buffer) => void, stats: object}}
  */
@@ -54,6 +58,7 @@ export function createTorrentPeerAdapter({
   infoHash,
   transport,
   writeTimeoutMs = 15_000,
+  onWrite = null,
   onError = null,
 }) {
   const hash = normalizeInfoHash(infoHash);
@@ -132,6 +137,7 @@ export function createTorrentPeerAdapter({
           }
           stats.chunks_out += 1;
           stats.bytes_out += bytes.length;
+          onWrite?.(bytes);
           finish(null);
         },
         (error) => {
