@@ -218,6 +218,11 @@ getWebRtcPoolRuntime()
 
 ### P5：可观测性与客户端标签（0.5 天）
 
+> 状态：已落地（2026-11-24）。客户端通道标签统一为 `WebRTC` / `加密 relay` / `旧 P2P`（仅兼容模式），
+> 面板显示通道、直连、pool 就绪与 owner；pool 未就绪时在连接前提示“WebRTC 未就绪”。
+> 新增只读 `GET /api/w2m/remote/diagnostics`，输出 pool owner/peer state、ack 次数、relay 帧计数与脱敏后的
+> `last_error`，不返回 token、私钥、完整 signaling URL。验收记录：`docs/acceptance/3.6.0/P5-DIAGNOSTICS.md`。
+
 - `lib/client.js` 的通道标签固定为 `WebRTC` / `加密 relay`，不再出现含糊的 `P2P`。
 - 远程桌面面板显示：
   - 当前通道
