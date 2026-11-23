@@ -2,6 +2,7 @@
 
 - 版本：`3.6.0`
 - 分支：`work/v3.6.0-desktop-v2`
+- P2 提交：`ea5d296 feat(webrtc): make dsh-p2p-webrtc the shared pool provider`
 - 前置：P1 `32b5a15 feat(webrtc): add owner-aware process pool runtime`
 - 范围：`dsh-p2p-webrtc` 的 `mode: 'pool'`、root `w2m` 的 consumer 化、工具面 pool 状态与 stop 语义。
 
