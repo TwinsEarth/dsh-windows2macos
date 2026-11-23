@@ -1062,6 +1062,16 @@ export const ACCEPTED_SKIPS = [
       'two assertions reason about another drive letter (a missing drive in ensureLayout, an off-drive path ' +
       'in the mirror resolver); only Windows has drive letters, so a POSIX host skips them by name',
   },
+{
+    key: 'surfaces-probe-archive-tab-opt-in',
+    suite: /^loader entry: the packed artifact/,
+    match: /^W2M_SURFACES_PROBE=1 enables the archive row in the throwaway profile and drives this probe$/,
+    maxCount: 1,
+    why:
+      'the archive-tab probe deliberately requires W2M_SURFACES_PROBE=1, which enables the dsh-backup-plugin row in a ' +
+      'throwaway profile; the release gate runs the loader suite without that opt-in because the other probes assert the ' +
+      'shipped disabled state. The probe runs when the variable is set, and the skip names the exact switch',
+  },
 ];
 
 /**
