@@ -8,6 +8,7 @@
 | EB-002 | 3.5.9 发布门禁 | 已修复，Compat 重跑验证中 |
 | EB-003 | 3.5.8 npm 暂存包 | 待 reject，禁止批准 |
 | EB-004 | WORKSPACE.md 排除在干净检出失效 | 已修复，待分支 CI 验证 |
+| EB-005 | 3.5.9 缺少验收证据 | 已补记录，待分支 CI 验证 |
 
 ## EB-001 dsh-teams 启动报 `Cannot find module '../../lib/tool-kit.js'`
 
@@ -123,3 +124,35 @@ claims 同时有 2 条断言不一致（树文档计数 198 !== 197，excluded 2
 - 文档计数断言应基于“实际存在的排除项”，而不是常量数组长度。
 
 - 批准 npm stage 前，用 `npm stage download` 解包核对关键文件内容，而不是只看版本号。
+
+
+## EB-005 升版本后未补 acceptance evidence，发布门禁判红
+
+**现象**
+
+3.5.9 的发布门禁报：
+
+```
+FAIL acceptance evidence (every committed record validates, and the release line has one):
+no acceptance evidence record for the 3.5.9 release line
+```
+
+**根因**
+
+版本从 3.5.8 升到 3.5.9，但没有在 `docs/acceptance/3.5.9/` 放任何记录。门禁按 `package.json.version` 找对应行的证据，找不到就失败。
+
+**修复**
+
+新增 `docs/acceptance/3.5.9/TEAMS-SUBPLUGIN-DEFINETOOL-359.json`，记录：
+
+- 启动报错原文与缺失的 `lib/tool-kit.js`；
+- 改用 `tools/shared.mjs` 的 `loadDefineTool`；
+- 回归测试 `test/teams-plugin.test.mjs` 12/12；
+- 打包后 `test/claims.test.mjs` 47 通过、1 个已接受跳过；
+- 本机安装副本入口导入 `apply` / `buildTools` 均为函数；
+- 三个子插件默认 `disabled: true`。
+
+**防复发**
+
+- 每次升版本必须同步新建 `docs/acceptance/<version>/` 记录，即使在打 tag 前。
+- 用 `validateEvidence` 先本地校验 JSON，再提交。
