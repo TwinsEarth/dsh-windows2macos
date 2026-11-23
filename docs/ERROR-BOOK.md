@@ -9,6 +9,7 @@
 | EB-003 | 3.5.8 npm 暂存包 | 待 reject，禁止批准 |
 | EB-004 | WORKSPACE.md 排除在干净检出失效 | 已修复，待分支 CI 验证 |
 | EB-005 | 3.5.9 缺少验收证据 | 已补记录，待分支 CI 验证 |
+| EB-006 | Windows CI 命令行超长跑不了套件 | 改用 bash，待 CI 验证 |
 
 ## EB-001 dsh-teams 启动报 `Cannot find module '../../lib/tool-kit.js'`
 
@@ -156,3 +157,28 @@ no acceptance evidence record for the 3.5.9 release line
 
 - 每次升版本必须同步新建 `docs/acceptance/<version>/` 记录，即使在打 tag 前。
 - 用 `validateEvidence` 先本地校验 JSON，再提交。
+
+
+## EB-006 Windows CI 的 npm test 命令行超过 PowerShell 上限
+
+**现象**
+
+分支 CI 的 `windows-latest / node 20` 与 `windows-latest / node 22` 在“Unit and release suites”一步失败：
+
+```
+> node --test --test-force-exit --test-concurrency=1 test/relay.test.mjs ...（约 380 个路径）
+The command line is too long.
+```
+
+**根因**
+
+`package.json#scripts.test` 明确列出全部 380 个套件，命令长度约 9.7 KB。GitHub Actions 在 Windows 上默认用 PowerShell 执行，PowerShell 经 `CreateProcess` 传递命令行，上限 8,191 字符；Linux/macOS 的 shell 没有这个限制，所以只有 Windows 腿红。
+
+**修复**
+
+在 `.github/workflows/ci.yml` 的“Unit and release suites”步骤加 `shell: bash`。Git Bash 直接把 argv 交给 `CreateProcess`，走 Windows 的 32,767 字符上限，9.7 KB 可以正常执行；套件清单仍只由 `package.json#scripts.test` 维护。
+
+**防复发**
+
+- 不要为 Windows 单独裁剪测试清单；那会让“发布套件”在目标平台上静默缺失。
+- 如果套件继续增长到超过 32 KB，再改为按批 spawn 的 runner，并保留 preflight 的套件清单校验。
