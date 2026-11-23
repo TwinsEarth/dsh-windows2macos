@@ -18,6 +18,7 @@ All notable changes to this project are documented here.
 - **发布包调整**：只读 readiness 从 `scripts/desktop-webrtc-readiness.mjs` 移到 `bin/w2m-desktop-readiness.mjs`，随 npm 包发布，`scripts/` 保持禁止入包；`desktop:readiness` 与文档路径同步更新。
 - **发布门禁**：`DOCUMENT_EXCLUSIONS` 移除 `WORKSPACE.md` 行；该文件只在本机被 `.gitignore` 忽略、干净检出中不存在，旧的排除行会被 `documentContract()` 判为 stale。`compat.yml` 的 loader gate 现在设置 `W2M_SURFACES_PROBE=1`，让归档页签断言真正执行，而不是以未接受的 skip 判红。
 - **跨平台备份镜像**：`guardWritablePath` 先 realpath 目标再做包含判断；修复 macOS `/var` → `/private/var` 系统别名导致的 `BACKUP_MIRROR_SYMLINK` 误报（Mac 27 项镜像测试 26 pass + 1 skip）。
+- **Windows CI 命令行超限**：337 个 suite 的 `npm test` 超过 `cmd.exe` 的 8191 字符上限（CI 报 `The command line is too long`，一条测试都没跑）。新增 `scripts/run-declared-tests.mjs`，读同一份 `package.json#scripts.test` 并用 argv 数组 spawn `node`；`ci.yml` 的 Windows leg 走它，macOS/Linux 仍走 `npm test`，声明清单仍只有一处。
 - **版本**：package/plugin/marketplace/codex 清单统一升到 3.6.0。
 
 ## [3.5.9] — 2026-11-23

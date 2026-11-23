@@ -174,7 +174,20 @@ jobs:
         # one edit in one place. `scripts/preflight.mjs` verifies that this workflow still covers
         # every suite that script declares (check name: "workflow wiring"), and refuses a workflow
         # that hand-lists two or more suite paths on one `node --test` line.
-        run: npm test
+        #
+        # WINDOWS RUNS THE SAME LIST THROUGH A SPAWNER, NOT THROUGH `npm test`. v3.6.0's first CI run
+        # failed before a single test executed: `cmd.exe`, which npm uses for scripts on Windows,
+        # caps a command line at 8191 characters and the declared suite is now longer than that
+        # ("The command line is too long"). `scripts/run-declared-tests.mjs` reads the same
+        # `package.json#scripts.test` and spawns `node` with an argv array, which Windows accepts.
+        # The list still lives in one place; only the way it reaches the process differs.
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            node scripts/run-declared-tests.mjs
+          else
+            npm test
+          fi
 
       - name: End-to-end suites (package.json#scripts.test:e2e, via npm run test:e2e)
         # Same rule, same reason. `--test-force-exit` is inside the script: each simulated machine
