@@ -385,10 +385,34 @@ jobs:
             },
           ];
 
-          /** The accepted entry for a skipped row, or null. Only the page half has one. */
+          /**
+           * OPT-IN PROBES. Assertions that are skipped by design unless a switch is set are listed
+           * here by name and reason, so a missing switch cannot silently drop evidence. These are not
+           * page-half unverifiables: the assertion runs and passes when the switch is on.
+           */
+          const OPT_IN_SKIPS = [
+            {
+              key: 'surfaces-probe-archive-tab',
+              name: 'shows the archive tab only for an enabled archive row',
+              match: /^W2M_SURFACES_PROBE=1 enables the archive row in the throwaway profile and drives this probe$/,
+              why:
+                'the archive-tab probe needs W2M_SURFACES_PROBE=1 to enable the dsh-backup-plugin row in the ' +
+                'throwaway profile; the rest of this suite deliberately asserts the shipped disabled state, so ' +
+                'the variable is per-probe and not set for the whole job',
+            },
+          ];
+
+          /** The accepted entry for a skipped row, or null. */
           const acceptedFor = (row) => {
-            if (!row.skipped || !row.name.includes(PAGE)) return null;
-            return ACCEPTED_UNVERIFIABLE.find((entry) => entry.match.test(row.skipReason ?? '')) ?? null;
+            if (!row.skipped) return null;
+            if (row.name.includes(PAGE)) {
+              return ACCEPTED_UNVERIFIABLE.find((entry) => entry.match.test(row.skipReason ?? '')) ?? null;
+            }
+            return (
+              OPT_IN_SKIPS.find(
+                (entry) => row.name.includes(entry.name) && entry.match.test(row.skipReason ?? ''),
+              ) ?? null
+            );
           };
 
           const rows = [];
@@ -474,7 +498,7 @@ jobs:
             const accepted = acceptedFor(row);
             if (row.skipped) {
               if (accepted === null) {
-                problems.push(`"${row.name}" was SKIPPED (${row.skipReason}) and that reason is not on the accepted list; an un-evaluated assertion fails this gate, and the accepted list covers only "${PAGE}"`);
+                problems.push(`"${row.name}" was SKIPPED (${row.skipReason}) and that reason is not on the accepted list; an un-evaluated assertion fails this gate, and the accepted lists cover only "${PAGE}" and the named opt-in probes`);
                 continue;
               }
               allowedSkips.push({ row, accepted });
