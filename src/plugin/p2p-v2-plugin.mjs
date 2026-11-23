@@ -27,9 +27,10 @@ export const P2P_V2_ROW_ID = 'dsh-p2p-v2';
 /** No host service is required to register the tool surface. */
 export const inject = [];
 
-/** The six tools this row owns. */
+/** The seven tools this row owns. */
 export const TOOL_NAMES = Object.freeze([
   'p2p_v2_status',
+  'p2p_v2_peers',
   'p2p_v2_share',
   'p2p_v2_add',
   'p2p_v2_attach',
@@ -154,7 +155,7 @@ function transportOf(args) {
 }
 
 /**
- * Build the six tools once per mount.
+ * Build the seven tools once per mount.
  *
  * @param {{service: P2PV2Service, defineTool: Function}} input
  * @returns {Array<object>}
@@ -175,6 +176,23 @@ export function buildTools({ service, defineTool }) {
     output: textOutput,
     async execute() {
       return jsonText(service.status());
+    },
+  });
+
+  register({
+    name: 'p2p_v2_peers',
+    description:
+      'List peers already connected in the shared WebRTC pool and each active share\'s attach state. Strictly read-only: it never dials, never opens a pair and never exposes the signal URL or token.',
+    parameters: {
+      shareId: { type: 'string', description: 'Optional share id; defaults to every active share.' },
+      infoHash: { type: 'string', description: 'Optional torrent info hash used instead of shareId.' },
+    },
+    output: textOutput,
+    async execute(args = {}) {
+      const query = {};
+      if (typeof args.shareId === 'string' && args.shareId !== '') query.share_id = args.shareId;
+      if (typeof args.infoHash === 'string' && args.infoHash !== '') query.info_hash = args.infoHash;
+      return jsonText(service.peers(query));
     },
   });
 

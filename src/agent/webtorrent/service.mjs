@@ -46,6 +46,7 @@ export const P2P_V2_CODE = Object.freeze({
   PEER_SELF: 'P2P_V2_PEER_SELF',
   PEER_LIMIT: 'P2P_V2_PEER_LIMIT',
   PEER_UNREACHABLE: 'P2P_V2_PEER_UNREACHABLE',
+  PEERS_UNREACHABLE: 'P2P_V2_PEERS_UNREACHABLE',
   PEER_ATTACH_FAILED: 'P2P_V2_PEER_ATTACH_FAILED',
   TORRENT_PEER_FAILED: 'P2P_V2_TORRENT_PEER_FAILED',
   SHARE_STOP_FAILED: 'P2P_V2_SHARE_STOP_FAILED',
@@ -563,6 +564,31 @@ export class P2PV2Service {
           length: Number.isInteger(file.length) ? file.length : null,
         }))
       : [];
+    const localRole = record.mode === 'seed' ? 'seeder' : 'leecher';
+    const peerRows = [...record.peers.values()].map((peer) => {
+      const chunksIn = peer.adapter?.stats?.chunks_in ?? 0;
+      const chunksOut = peer.adapter?.stats?.chunks_out ?? 0;
+      const bytesIn = peer.adapter?.stats?.bytes_in ?? 0;
+      const bytesOut = peer.adapter?.stats?.bytes_out ?? 0;
+      return {
+        machine_id: peer.machine_id,
+        role: peer.role ?? (localRole === 'seeder' ? 'leecher' : 'seeder'),
+        transport: peer.transport ?? record.transport ?? TORRENT_DEFAULT_TRANSPORT,
+        attached_at: peer.attached_at,
+        state: peer.adapter?.destroyed === true ? 'closed' : 'open',
+        chunks_in: chunksIn,
+        chunks_out: chunksOut,
+        chunks: chunksIn + chunksOut,
+        bytes_in: bytesIn,
+        bytes_out: bytesOut,
+        bytes: bytesIn + bytesOut,
+        last_error: peer.adapter?.stats?.last_error ?? null,
+      };
+    });
+    const peerCount = 1 + peerRows.length;
+    const seeders = (localRole === 'seeder' ? 1 : 0) + peerRows.filter((peer) => peer.role === 'seeder').length;
+    const leechers = (localRole === 'leecher' ? 1 : 0) + peerRows.filter((peer) => peer.role === 'leecher').length;
+    const progress = Number.isFinite(torrent.progress) ? torrent.progress : 0;
     return {
       share_id: record.share_id,
       info_hash: record.info_hash,
@@ -576,25 +602,29 @@ export class P2PV2Service {
       length: Number.isFinite(torrent.length) ? torrent.length : null,
       downloaded: Number.isFinite(torrent.downloaded) ? torrent.downloaded : null,
       uploaded: Number.isFinite(torrent.uploaded) ? torrent.uploaded : null,
-      progress: Number.isFinite(torrent.progress) ? torrent.progress : 0,
+      progress,
       done: torrent.done === true,
+      peer_count: peerCount,
+      seeders,
+      leechers,
       num_peers: Number.isInteger(torrent.numPeers) ? torrent.numPeers : record.peers.size,
       download_speed: Number.isFinite(torrent.downloadSpeed) ? torrent.downloadSpeed : null,
       upload_speed: Number.isFinite(torrent.uploadSpeed) ? torrent.uploadSpeed : null,
-      peers: [...record.peers.values()].map((peer) => ({
-        machine_id: peer.machine_id,
-        transport: peer.transport ?? record.transport ?? TORRENT_DEFAULT_TRANSPORT,
-        attached_at: peer.attached_at,
-        state: peer.adapter?.destroyed === true ? 'closed' : 'open',
-        chunks_in: peer.adapter?.stats?.chunks_in ?? 0,
-        chunks_out: peer.adapter?.stats?.chunks_out ?? 0,
-        bytes_in: peer.adapter?.stats?.bytes_in ?? 0,
-        bytes_out: peer.adapter?.stats?.bytes_out ?? 0,
-        last_error: peer.adapter?.stats?.last_error ?? null,
-      })),
+      peers: peerRows,
       files,
       file_count: Array.isArray(torrent.files) ? torrent.files.length : null,
       last_error: record.last_error,
+      swarm: {
+        info_hash: record.info_hash,
+        transport: record.transport ?? TORRENT_DEFAULT_TRANSPORT,
+        peer_count: peerCount,
+        seeders,
+        leechers,
+        progress,
+        done: torrent.done === true,
+        files,
+        file_count: Array.isArray(torrent.files) ? torrent.files.length : null,
+      },
     };
   }
 
@@ -670,12 +700,13 @@ export class P2PV2Service {
     });
     if (made.ok !== true) return made;
     this.#recordShare(torrent, made.record);
-    const attached = await this.#attachPeers(made.record, input.peers, transportName);
+    const attached = await this.#attachPeers(made.record, input.peers, transportName, 'leecher');
     return {
       ok: true,
       share: this.#torrentSummary(made.record),
       peers: attached.attached,
       peer_errors: attached.errors,
+      peers_requested: attached.requested,
     };
   }
 
@@ -770,7 +801,23 @@ export class P2PV2Service {
     }
     this.#recordShare(torrent, made.record);
     this.stats.downloads += 1;
-    const attached = await this.#attachPeers(made.record, input.peers, transportName);
+    const attached = await this.#attachPeers(made.record, input.peers, transportName, 'seeder');
+    if (attached.requested > 0 && attached.attached.length === 0) {
+      const cleanup = await this.stop({ share_id: made.record.share_id });
+      return {
+        ok: false,
+        code: P2P_V2_CODE.PEERS_UNREACHABLE,
+        detail: `all ${attached.requested} requested peer(s) failed to attach`,
+        share_id: made.record.share_id,
+        info_hash: made.record.info_hash,
+        transport: transportName,
+        peers_requested: attached.requested,
+        peers: [],
+        peer_errors: attached.errors,
+        cleanup_errors: cleanup.errors ?? [],
+        metadata_ready: false,
+      };
+    }
     // Metadata may be available before attach; this wait is bounded and does not hold the tool
     // call until the whole file downloads. A later status poll reports progress.
     const ready = await waitForEvent(torrent, 'ready', this.#metadataTimeoutMs(), () => torrentReady(torrent));
@@ -779,6 +826,7 @@ export class P2PV2Service {
       share: this.#torrentSummary(made.record),
       peers: attached.attached,
       peer_errors: attached.errors,
+      peers_requested: attached.requested,
       metadata_ready: ready.ok === true,
       metadata_failure: ready.ok === true ? null : { code: ready.code, detail: ready.detail },
     };
@@ -799,11 +847,12 @@ export class P2PV2Service {
     }
     const machineId = text(input.machine_id, '');
     if (machineId === '') return { ok: false, code: P2P_V2_CODE.PEER_REQUIRED, detail: 'machine_id is required' };
-    return this.#attachPeer(record, machineId, input.transport ?? record.transport);
+    return this.#attachPeer(record, machineId, input.transport ?? record.transport, null);
   }
 
-  async #attachPeer(record, machineId, transportName) {
+  async #attachPeer(record, machineId, transportName, role = null) {
     const selected = this.#transportName(transportName ?? record.transport);
+    const selectedRole = role ?? (record.mode === 'seed' ? 'leecher' : 'seeder');
     const knownTransport = this.#transportDefinition(selected);
     if (knownTransport.ok !== true) {
       return {
@@ -812,6 +861,7 @@ export class P2PV2Service {
         share_id: record.share_id,
         machine_id: machineId,
         transport: selected,
+        role: selectedRole,
         detail: knownTransport.detail,
       };
     }
@@ -822,6 +872,7 @@ export class P2PV2Service {
         share_id: record.share_id,
         machine_id: machineId,
         transport: record.peers.get(machineId)?.transport ?? selected,
+        role: record.peers.get(machineId)?.role ?? selectedRole,
       };
     }
     if (record.peers.size >= this.#maxPeersPerShare()) {
@@ -831,6 +882,7 @@ export class P2PV2Service {
         share_id: record.share_id,
         machine_id: machineId,
         transport: selected,
+        role: selectedRole,
         detail: `peer limit ${this.#maxPeersPerShare()} reached`,
       };
     }
@@ -843,6 +895,7 @@ export class P2PV2Service {
         share_id: record.share_id,
         machine_id: machineId,
         transport: selected,
+        role: selectedRole,
         detail: ensured.detail,
       };
     }
@@ -854,6 +907,7 @@ export class P2PV2Service {
         share_id: record.share_id,
         machine_id: machineId,
         transport: selected,
+        role: selectedRole,
       };
     }
     const key = `${machineId}\u0000${record.info_hash}`;
@@ -868,6 +922,7 @@ export class P2PV2Service {
           share_id: record.share_id,
           machine_id: machineId,
           transport: selected,
+          role: selectedRole,
           detail: ready?.detail ?? ready?.code ?? `${selected}.ensure failed`,
           pool_code: ready?.code ?? null,
           transport_code: ready?.code ?? null,
@@ -892,6 +947,7 @@ export class P2PV2Service {
           share_id: record.share_id,
           machine_id: machineId,
           transport: selected,
+          role: selectedRole,
           detail: errorDetail(error),
         };
       }
@@ -906,10 +962,11 @@ export class P2PV2Service {
           share_id: record.share_id,
           machine_id: machineId,
           transport: selected,
+          role: selectedRole,
           detail: errorDetail(error),
         };
       }
-      const peer = { machine_id: machineId, transport: selected, adapter, attached_at: this.now() };
+      const peer = { machine_id: machineId, transport: selected, role: selectedRole, adapter, attached_at: this.now() };
       record.peers.set(machineId, peer);
       this.adapters.set(key, adapter);
       this.stats.peers_attached += 1;
@@ -924,6 +981,7 @@ export class P2PV2Service {
         share_id: record.share_id,
         machine_id: machineId,
         transport: selected,
+        role: selectedRole,
         peer: this.#torrentSummary(record).peers.find((entry) => entry.machine_id === machineId) ?? null,
       };
     })();
@@ -935,17 +993,17 @@ export class P2PV2Service {
     }
   }
 
-  async #attachPeers(record, peers, transportName) {
+  async #attachPeers(record, peers, transportName, role = null) {
     const attached = [];
     const errors = [];
-    if (!Array.isArray(peers)) return { attached, errors };
+    if (!Array.isArray(peers)) return { attached, errors, requested: 0 };
     const unique = [...new Set(peers.filter((peer) => typeof peer === 'string' && peer !== ''))];
     for (const machineId of unique) {
-      const result = await this.#attachPeer(record, machineId, transportName);
+      const result = await this.#attachPeer(record, machineId, transportName, role);
       if (result.ok === true) attached.push(result);
       else errors.push(result);
     }
-    return { attached, errors };
+    return { attached, errors, requested: unique.length };
   }
 
   /**
@@ -1029,6 +1087,63 @@ export class P2PV2Service {
     return { ok: errors.length === 0, shares: ids.length, errors };
   }
 
+  /**
+   * A read-only view of already-connected pool peers and each share's attach state. It never
+   * dials, never starts a transport, and never copies the pool's signal URL or token.
+   *
+   * @param {{share_id?: string, info_hash?: string, magnet?: string}} [input]
+   * @returns {object}
+   */
+  peers(input = {}) {
+    const pool = this.getPool?.() ?? this.pool;
+    const wantsShare = input !== null && typeof input === 'object' &&
+      (input.share_id !== undefined || input.info_hash !== undefined || input.magnet !== undefined);
+    const selected = wantsShare ? this.#resolveShare(input) : null;
+    if (wantsShare && selected === null) {
+      return { ok: false, code: P2P_V2_CODE.SHARE_NOT_FOUND, detail: 'share is not active on this machine' };
+    }
+    const diagnostics = pool?.diagnostics?.() ?? null;
+    const poolPeers = Array.isArray(diagnostics?.peers)
+      ? diagnostics.peers.map((entry) => ({
+          peer: text(entry?.peer, ''),
+          role: text(entry?.role, '') || null,
+          state: text(entry?.state, '') || null,
+          ok: entry?.ok === true,
+          path: text(entry?.path, '') || null,
+          rtt_ms: Number.isFinite(entry?.rtt_ms) ? entry.rtt_ms : null,
+          secure: typeof entry?.secure === 'string' ? entry.secure : null,
+          sends: Number.isInteger(entry?.sends) ? entry.sends : 0,
+          bytes_sent: Number.isInteger(entry?.bytes_sent) ? entry.bytes_sent : 0,
+          last_error: entry?.last_error ?? null,
+        }))
+      : [];
+    const records = selected === null ? [...this.shares.values()] : [selected];
+    return {
+      ok: true,
+      machine_id: typeof pool?.machineId === 'string' ? pool.machineId : null,
+      pool: {
+        available: pool !== null,
+        closed: diagnostics?.closed === true,
+        peer_count: Number.isInteger(diagnostics?.peer_count) ? diagnostics.peer_count : poolPeers.length,
+        peers: poolPeers,
+      },
+      shares: records.map((record) => {
+        const summary = this.#torrentSummary(record);
+        return {
+          share_id: summary.share_id,
+          info_hash: summary.info_hash,
+          name: summary.name,
+          mode: summary.mode,
+          transport: summary.transport,
+          peer_count: summary.peer_count,
+          seeders: summary.seeders,
+          leechers: summary.leechers,
+          peers: summary.peers,
+        };
+      }),
+    };
+  }
+
   /** A diagnostics snapshot for `p2p_v2_status`. */
   status() {
     const pool = this.getPool?.() ?? this.pool;
@@ -1043,6 +1158,8 @@ export class P2PV2Service {
     return {
       plugin: 'w2m-dsh-p2p-v2',
       created_at: this.createdAt,
+      transport: TORRENT_DEFAULT_TRANSPORT,
+      peer_count: [...this.adapters.values()].filter((adapter) => adapter.destroyed !== true).length,
       planes: {
         task_dispatch: { transport: TORRENT_DEFAULT_TRANSPORT, scheduler: 'w2m_run' },
         file_distribution: {

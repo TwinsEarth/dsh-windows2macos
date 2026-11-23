@@ -131,13 +131,38 @@ function fakeClient() {
 function fakePool(machineId = 'machine-a') {
   const handlers = new Set();
   const sent = [];
+  const connected = new Map();
+  const failures = new Set();
   const pool = {
     machineId,
     sent,
     ensureCalls: [],
     closed: false,
+    connected,
+    failures,
+    failPeer(peer) {
+      failures.add(peer);
+    },
+    connectPeer(peer, patch = {}) {
+      connected.set(peer, {
+        peer,
+        role: 'client',
+        state: 'connected',
+        ok: true,
+        path: 'direct',
+        rtt_ms: 12,
+        secure: 'dtls',
+        sends: 3,
+        bytes_sent: 512,
+        last_error: null,
+        ...patch,
+      });
+    },
     async ensure(peer) {
       pool.ensureCalls.push(peer);
+      if (failures.has(peer)) {
+        return { ok: false, code: 'WEBRTC_PEER_UNREACHABLE', detail: `${peer} is offline` };
+      }
       return { ok: true, peer };
     },
     async send(peer, payload) {
@@ -152,7 +177,13 @@ function fakePool(machineId = 'machine-a') {
       for (const handler of handlers) handler({ peer, payload });
     },
     diagnostics() {
-      return { peer_count: 1 };
+      return {
+        peer_count: connected.size,
+        closed: pool.closed,
+        peers: [...connected.values()],
+        signal_url: 'wss://signal.example/room?token=secret-token',
+        signal_token: '<redacted>',
+      };
     },
     closePeer: () => {
       pool.closed = true;
@@ -514,6 +545,276 @@ describe('p2p v2 service', () => {
   });
 });
 
+describe('p2p v2 multi-peer orchestration', () => {
+  it('attaches one seed with two leechers, dedupes peers, rejects self and reports swarm counts', async () => {
+    const { path } = tempFile();
+    const pool = fakePool();
+    const client = fakeClient();
+    const service = new P2PV2Service(normalizePluginConfig({}), {
+      getPool: () => pool,
+      webTorrentFactory: () => client,
+    });
+    const result = await service.share({
+      path,
+      peers: ['machine-b', 'machine-c', 'machine-b', 'machine-a'],
+    });
+    assert.equal(result.ok, true, JSON.stringify(result));
+    assert.equal(result.peers_requested, 3);
+    assert.equal(result.peers.length, 2, JSON.stringify(result.peers));
+    assert.equal(result.peer_errors.length, 1, JSON.stringify(result.peer_errors));
+    assert.equal(result.peer_errors[0].code, P2P_V2_CODE.PEER_SELF);
+    assert.deepEqual(pool.ensureCalls, ['machine-b', 'machine-c']);
+    assert.deepEqual(result.peers.map((peer) => peer.role), ['leecher', 'leecher']);
+
+    const summary = result.share;
+    assert.equal(summary.peer_count, 3);
+    assert.equal(summary.seeders, 1);
+    assert.equal(summary.leechers, 2);
+    assert.equal(summary.swarm.peer_count, 3);
+    assert.equal(summary.swarm.seeders, 1);
+    assert.equal(summary.swarm.leechers, 2);
+    assert.equal(summary.swarm.info_hash, HASH_A);
+    assert.equal(summary.swarm.files.length, 1);
+    assert.equal(summary.transport, 'webrtc-v1');
+
+    const status = service.status();
+    assert.equal(status.transport, 'webrtc-v1');
+    assert.equal(status.peer_count, 2);
+    assert.equal(status.shares[0].peer_count, 3);
+    assert.equal(status.shares[0].seeders, 1);
+    assert.equal(status.shares[0].leechers, 2);
+    await service.stopAll();
+  });
+
+  it('joins two seeders from two leechers and reports both sides of the swarm', async () => {
+    const seedA = new P2PV2Service(normalizePluginConfig({}), {
+      getPool: () => fakePool('seed-a'),
+      webTorrentFactory: () => fakeClient(),
+    });
+    const seedB = new P2PV2Service(normalizePluginConfig({}), {
+      getPool: () => fakePool('seed-b'),
+      webTorrentFactory: () => fakeClient(),
+    });
+    const sharedA = await seedA.share({ path: tempFile().path });
+    const sharedB = await seedB.share({ path: tempFile().path });
+    assert.equal(sharedA.ok, true, JSON.stringify(sharedA));
+    assert.equal(sharedB.ok, true, JSON.stringify(sharedB));
+
+    const leechers = [];
+    for (const machineId of ['leech-a', 'leech-b']) {
+      const pool = fakePool(machineId);
+      const service = new P2PV2Service(normalizePluginConfig({}), {
+        getPool: () => pool,
+        webTorrentFactory: () => fakeClient(),
+      });
+      const added = await service.add({
+        magnet: sharedA.share.magnet_uri,
+        path: tempFile().dir,
+        peers: ['seed-a', 'seed-b'],
+      });
+      assert.equal(added.ok, true, JSON.stringify(added));
+      assert.equal(added.peers_requested, 2);
+      assert.equal(added.peers.length, 2);
+      assert.equal(added.peer_errors.length, 0);
+      assert.deepEqual(pool.ensureCalls, ['seed-a', 'seed-b']);
+      assert.equal(added.share.peer_count, 3);
+      assert.equal(added.share.seeders, 2);
+      assert.equal(added.share.leechers, 1);
+      assert.equal(added.share.swarm.seeders, 2);
+      leechers.push(service);
+    }
+    assert.equal(leechers.length, 2);
+    for (const service of [...leechers, seedA, seedB]) await service.stopAll();
+  });
+
+  it('lets one unreachable peer fail while the rest attach', async () => {
+    const { path } = tempFile();
+    const pool = fakePool();
+    pool.failPeer('machine-bad');
+    const service = new P2PV2Service(normalizePluginConfig({}), {
+      getPool: () => pool,
+      webTorrentFactory: () => fakeClient(),
+    });
+    const shared = await service.share({
+      path,
+      peers: ['machine-good', 'machine-bad', 'machine-good2'],
+    });
+    assert.equal(shared.ok, true, JSON.stringify(shared));
+    assert.equal(shared.peers.length, 2);
+    assert.equal(shared.peer_errors.length, 1);
+    assert.equal(shared.peer_errors[0].code, P2P_V2_CODE.PEER_UNREACHABLE);
+    assert.equal(shared.share.peer_count, 3);
+    assert.equal(service.status().peer_count, 2);
+
+    const addPool = fakePool('leech-a');
+    addPool.failPeer('seed-bad');
+    const leecher = new P2PV2Service(normalizePluginConfig({}), {
+      getPool: () => addPool,
+      webTorrentFactory: () => fakeClient(),
+    });
+    const added = await leecher.add({
+      magnet: shared.share.magnet_uri,
+      path: tempFile().dir,
+      peers: ['seed-good', 'seed-bad'],
+    });
+    assert.equal(added.ok, true, JSON.stringify(added));
+    assert.equal(added.metadata_ready, true, JSON.stringify(added));
+    assert.equal(added.peers.length, 1);
+    assert.equal(added.peer_errors.length, 1);
+    assert.equal(added.peer_errors[0].code, P2P_V2_CODE.PEER_UNREACHABLE);
+    assert.equal(added.share.seeders, 1);
+    assert.equal(added.share.leechers, 1);
+    await service.stopAll();
+    await leecher.stopAll();
+  });
+
+  it('names the aggregate failure and cleans up when every requested peer fails', async () => {
+    const { dir } = tempFile();
+    const pool = fakePool('leech-a');
+    pool.failPeer('seed-a');
+    pool.failPeer('seed-b');
+    const client = fakeClient();
+    const service = new P2PV2Service(normalizePluginConfig({}), {
+      getPool: () => pool,
+      webTorrentFactory: () => client,
+    });
+    const added = await service.add({
+      magnet: `magnet:?xt=urn:btih:${HASH_B}&dn=sample.bin`,
+      path: dir,
+      peers: ['seed-a', 'seed-b'],
+    });
+    assert.equal(added.ok, false, JSON.stringify(added));
+    assert.equal(added.code, P2P_V2_CODE.PEERS_UNREACHABLE);
+    assert.equal(added.peers_requested, 2);
+    assert.equal(added.peers.length, 0);
+    assert.equal(added.peer_errors.length, 2);
+    assert.deepEqual(added.cleanup_errors, []);
+    assert.equal(service.status().shares.length, 0);
+    assert.equal(service.status().peer_count, 0);
+    assert.equal(client.torrents[0].destroyed, true);
+    await service.stopAll();
+  });
+
+  it('refuses a new peer at the limit but keeps repeated attach idempotent', async () => {
+    const { path } = tempFile();
+    const pool = fakePool();
+    const service = new P2PV2Service(normalizePluginConfig({ maxPeersPerShare: 1 }), {
+      getPool: () => pool,
+      webTorrentFactory: () => fakeClient(),
+    });
+    const shared = await service.share({ path });
+    assert.equal(shared.ok, true, JSON.stringify(shared));
+    const first = await service.attach({ share_id: shared.share.share_id, machine_id: 'machine-b' });
+    assert.equal(first.ok, true, JSON.stringify(first));
+    assert.equal(first.role, 'leecher');
+    const repeated = await service.attach({ share_id: shared.share.share_id, machine_id: 'machine-b' });
+    assert.equal(repeated.ok, true);
+    assert.equal(repeated.reused, true);
+    assert.equal(repeated.role, 'leecher');
+    const overflow = await service.attach({ share_id: shared.share.share_id, machine_id: 'machine-c' });
+    assert.equal(overflow.ok, false);
+    assert.equal(overflow.code, P2P_V2_CODE.PEER_LIMIT);
+    assert.deepEqual(pool.ensureCalls, ['machine-b']);
+    assert.equal(service.status().shares[0].peer_count, 2);
+    await service.stopAll();
+  });
+
+  it('lists connected peers and attach state without dialing or leaking the signal token', async () => {
+    const pool = fakePool();
+    pool.connectPeer('machine-z', { role: 'server', last_error: { code: 'E_OLD' } });
+    const service = new P2PV2Service(normalizePluginConfig({}), {
+      getPool: () => pool,
+      webTorrentFactory: () => fakeClient(),
+    });
+    const view = service.peers();
+    assert.equal(view.ok, true);
+    assert.equal(view.pool.available, true);
+    assert.equal(view.pool.peer_count, 1);
+    assert.equal(view.pool.peers[0].peer, 'machine-z');
+    assert.equal(view.pool.peers[0].role, 'server');
+    assert.equal(view.pool.peers[0].last_error.code, 'E_OLD');
+    assert.deepEqual(pool.ensureCalls, []);
+    const serialised = JSON.stringify(view);
+    assert.equal(serialised.includes('secret-token'), false);
+    assert.equal(serialised.includes('signal_url'), false);
+    assert.equal(serialised.includes('signal_token'), false);
+
+    pool.connectPeer('machine-b');
+    const shared = await service.share({ path: tempFile().path, peers: ['machine-b'] });
+    assert.equal(shared.ok, true, JSON.stringify(shared));
+    const before = pool.ensureCalls.length;
+    const scoped = service.peers({ share_id: shared.share.share_id });
+    assert.equal(scoped.ok, true);
+    assert.equal(scoped.shares.length, 1);
+    assert.equal(scoped.shares[0].peers.length, 1);
+    assert.equal(scoped.shares[0].peers[0].role, 'leecher');
+    assert.equal(pool.ensureCalls.length, before);
+    assert.equal(service.peers({ share_id: 'missing-share' }).code, P2P_V2_CODE.SHARE_NOT_FOUND);
+
+    const definitions = buildTools({ service, defineTool: (definition) => definition });
+    const peersTool = definitions.find((definition) => definition.name === 'p2p_v2_peers');
+    const viaTool = json(await peersTool.execute({ shareId: shared.share.share_id }));
+    assert.equal(viaTool.ok, true);
+    assert.equal(viaTool.shares[0].share_id, shared.share.share_id);
+    assert.equal(JSON.stringify(viaTool).includes('secret-token'), false);
+    await service.stopAll();
+  });
+
+  it('carries task JSON and torrent frames concurrently on the same V1 pair', async () => {
+    const { path } = tempFile();
+    const pool = fakePool();
+    const client = fakeClient();
+    const service = new P2PV2Service(normalizePluginConfig({}), {
+      getPool: () => pool,
+      webTorrentFactory: () => client,
+    });
+    const shared = await service.share({ path, peers: ['machine-b'] });
+    assert.equal(shared.ok, true, JSON.stringify(shared));
+    const adapter = client.torrents[0].added[0];
+    const torrentBytes = [];
+    adapter.on('data', (chunk) => torrentBytes.push(chunk));
+    const taskFrames = [];
+    const offTask = pool.onMessage((event) => {
+      if (isTorrentFrame(event.payload)) return;
+      try {
+        taskFrames.push(JSON.parse(event.payload.toString()));
+      } catch {
+        // A non-JSON non-torrent frame is not a task frame.
+      }
+    });
+
+    const jsonFrame = Buffer.from(JSON.stringify({ type: 'task.offer', task_id: 'task-1' }));
+    const torrentFrame = encodeTorrentFrame(HASH_A, Buffer.from('concurrent-in'));
+    await Promise.all([
+      new Promise((resolve, reject) => {
+        adapter.write(Buffer.from('concurrent-out'), (error) => (error ? reject(error) : resolve()));
+      }),
+      Promise.resolve().then(() => pool.emit('machine-b', jsonFrame)),
+      Promise.resolve().then(() => pool.emit('machine-b', torrentFrame)),
+    ]);
+    await new Promise((resolve) => { setImmediate(resolve); });
+    await new Promise((resolve) => { setImmediate(resolve); });
+
+    assert.deepEqual(taskFrames, [{ type: 'task.offer', task_id: 'task-1' }]);
+    assert.equal(torrentBytes.length, 1);
+    assert.equal(torrentBytes[0].toString(), 'concurrent-in');
+    assert.equal(pool.sent.length, 1);
+    assert.equal(pool.sent[0].peer, 'machine-b');
+    const decoded = decodeTorrentFrame(pool.sent[0].payload);
+    assert.equal(decoded.infoHash, HASH_A);
+    assert.equal(decoded.payload.toString(), 'concurrent-out');
+    assert.equal(adapter.stats.chunks_in, 1);
+    assert.equal(adapter.stats.chunks_out, 1);
+    assert.equal(service.status().stats.frames_in, 1);
+    const peer = service.status().shares[0].peers[0];
+    assert.equal(peer.machine_id, 'machine-b');
+    assert.equal(peer.chunks, 2);
+    assert.equal(peer.bytes > 0, true);
+    offTask();
+    await service.stopAll();
+  });
+});
+
 describe('dsh-p2p-v2 wiring', () => {
   it('declares the export, the lib seam and a disabled patch row', () => {
     assert.equal(pkg.exports['./dsh-p2p-v2'], './lib/p2p-v2-plugin.js');
@@ -527,7 +828,7 @@ describe('dsh-p2p-v2 wiring', () => {
     assert.match(row, /maxShares: 8/);
   });
 
-  it('mounts six tools inertly and refuses share/add without confirmation', async () => {
+  it('mounts seven tools inertly and refuses share/add without confirmation', async () => {
     const { ctx, definitions, registered, effects } = fakeContext();
     let factoryCalls = 0;
     const dispose = await apply(ctx, {}, {
@@ -539,7 +840,7 @@ describe('dsh-p2p-v2 wiring', () => {
     });
     assert.equal(typeof dispose, 'function');
     assert.deepEqual(registered, [...TOOL_NAMES]);
-    assert.equal(definitions.length, 6);
+    assert.equal(definitions.length, 7);
     assert.equal(factoryCalls, 0);
     assert.equal(dispose.mounted, true);
     assert.equal(effects.length, 1);
@@ -557,6 +858,12 @@ describe('dsh-p2p-v2 wiring', () => {
     assert.equal(attach.parameters.transport.type, 'string');
     const status = definitions.find((definition) => definition.name === 'p2p_v2_status');
     assert.equal(json(await status.execute({})).engine.available, false);
+    const peers = definitions.find((definition) => definition.name === 'p2p_v2_peers');
+    assert.equal(peers.parameters.shareId.type, 'string');
+    const peersView = json(await peers.execute({}));
+    assert.equal(peersView.ok, true);
+    assert.equal(peersView.pool.available, false);
+    assert.deepEqual(peersView.shares, []);
     await dispose();
   });
 

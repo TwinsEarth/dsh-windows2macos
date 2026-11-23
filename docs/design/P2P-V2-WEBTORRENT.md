@@ -77,14 +77,15 @@ P2PV2Service
 
 | 工具 | 作用 | 关键约束 |
 |---|---|---|
-| `p2p_v2_status` | 引擎、share、peer、进度、pool 状态 | 只读；不加载引擎 |
-| `p2p_v2_share` | 种子一个文件/目录，返回 magnet | `confirm:"share"`；敏感路径拒绝；可带 `peers` |
-| `p2p_v2_add` | 从 magnet 下载到目录 | `confirm:"add"`；先 infoHash 再 attach；可带 `peers` |
-| `p2p_v2_attach` | 给一个 share 增加 V1 peer | 幂等 per (share, machine)；不 closePeer |
+| `p2p_v2_status` | 引擎、share、peer、进度、swarm 计数、pool 状态 | 只读；不加载引擎；含 `transport`/`peer_count`/`seeders`/`leechers` |
+| `p2p_v2_peers` | 已连接的 pool peer + 各 share 的 attach 状态 | 只读；不 dial；不返回 signal URL/token |
+| `p2p_v2_share` | 种子一个文件/目录，返回 magnet | `confirm:"share"`；敏感路径拒绝；`peers` 数组逐个 attach |
+| `p2p_v2_add` | 从 magnet 下载到目录 | `confirm:"add"`；先 infoHash 再 attach；`peers` 可含多个 seeder |
+| `p2p_v2_attach` | 给一个 share 增加 V1 peer | 幂等 per (share, machine)；达到 `maxPeersPerShare` 拒绝；不 closePeer |
 | `p2p_v2_detach` | 移除一个逻辑 peer 流 | 保留 V1 pair |
 | `p2p_v2_stop` | 停一个 share / 全部 | 销毁 torrent；不停止 pool |
 
-多对多不是“自动发现”：每个机器由调用方给出 peer ids。V2 的 mesh 是显式的、可审计的；自动 fleet roster 发现留到下一版，因为它需要额外的控制面授权，不应藏在文件工具里。
+多对多不是“自动发现”：`share`/`add` 的 `peers` 是机器 id 数组，按集合去重、逐项 attach，本机 id 直接拒绝；`p2p_v2_peers` 只展示已经连上的 pair，不发起 dial。单个 peer 失败只记入 `peer_errors`，不阻断其他 peer；`add` 的全部 peer 都失败时返回 `P2P_V2_PEERS_UNREACHABLE` 并销毁刚建的 torrent。
 
 ## 5. 生命周期
 
@@ -97,7 +98,8 @@ p2p_v2_share(path, peers)
   -> ensureClient()
   -> client.seed(path) 等待 seed callback
   -> record share
-  -> peers 逐个 attach：pool.ensure(machine) -> adapter -> torrent.addPeer
+  -> peers 去重、逐个 attach：pool.ensure(machine) -> adapter -> torrent.addPeer
+  -> 单个失败记入 peer_errors，share 仍成功
 ```
 
 ### 5.2 download
@@ -108,8 +110,9 @@ p2p_v2_add(magnet, dest, peers)
   -> client.add(magnet) 返回 torrent
   -> 等 infoHash 事件
   -> record share
-  -> peers 逐个 attach（在 ready 之前）
-  -> 有界等待 ready；返回 metadata_ready，不等待整个文件完成
+  -> peers 去重、逐个 attach（在 ready 之前）
+  -> 全部失败：销毁 torrent + P2P_V2_PEERS_UNREACHABLE
+  -> 部分成功：继续有界等待 ready；返回 metadata_ready，不等待整个文件完成
 ```
 
 ### 5.3 attach / stop
@@ -125,7 +128,8 @@ p2p_v2_add(magnet, dest, peers)
 | `webtorrent` 未安装/入口不存在 | `P2P_V2_WEBTORRENT_UNAVAILABLE`；mount 正常 |
 | WebTorrent 构造失败 | `P2P_V2_WEBTORRENT_INVALID` / `P2P_V2_WEBTORRENT_LOAD_FAILED` |
 | pool 未启动 | `P2P_V2_POOL_UNAVAILABLE`；不尝试 relay 文件搬运 |
-| `pool.ensure` 失败 | `P2P_V2_PEER_UNREACHABLE`，保留 `pool_code` |
+| `pool.ensure` 失败 | `P2P_V2_PEER_UNREACHABLE`，保留 `pool_code`；其他 peer 继续 |
+| `add` 的每个 peer 都失败 | `P2P_V2_PEERS_UNREACHABLE`；刚建的 torrent 被销毁，不留空 share |
 | magnet 无 metadata 且 peer 未连上 | `metadata_ready:false` + `P2P_V2_TORRENT_READY_TIMEOUT`；torrent 仍保留，可后补 attach |
 | 同路径重复 share | `reused:true`，不重复 seed |
 | 重复 add 同 info hash | `reused:true` |
@@ -146,8 +150,9 @@ p2p_v2_add(magnet, dest, peers)
 |---|---|
 | 字节标签 | `test/p2p-v2.test.mjs` round-trip、坏 hash、空 chunk、JSON 不命中 |
 | 传输抽象 | 注册表默认 `webrtc-v1`、未知名字命名拒绝；fake transport 上的同一 adapter 收发；V1 binding destroy 不关闭 pool/pair |
+| 多 peer 编排 | `test/p2p-v2.test.mjs`：1 seed + 2 leecher、2 seed + 2 leecher、单 peer 失败其余成功、全部失败聚合、peer 上限/重复 attach、`p2p_v2_peers` 只读无 dial、同一 V1 pair 上任务 JSON 与 torrent 帧并发 |
 | service | seed 真实临时文件、add 先 infoHash 后 attach、detach/stop 不 closePeer、缺引擎命名、share 复用/上限 |
-| 接线 | package export、lib seam、cordis row disabled、6 工具 inert mount、confirm 拒绝 |
+| 接线 | package export、lib seam、cordis row disabled、7 工具 inert mount、confirm 拒绝 |
 | 真实 WebTorrent | `test/p2p-v2-live.mjs`：两个真实 pool + 真实 signaling/Noise + 真实 WebTorrent，传输 256 KiB 文件并比对字节；用 `W2M_WEBTORRENT_MODULE` 指定外部引擎，默认 suite 不依赖 |
 
 ## 9. 落地边界

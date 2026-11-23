@@ -159,11 +159,11 @@ function serviceConfig(overrides = {}) {
 }
 
 describe('dsh-teams wiring', () => {
-  it('declares the export, the lib seam, and the 31-tool package description', () => {
+  it('declares the export, the lib seam, and the 32-tool package description', () => {
     assert.equal(pkg.exports['./dsh-teams'], './lib/teams-plugin.js');
     assert.ok(existsSync(join(ROOT, 'lib/teams-plugin.js')));
     assert.ok(existsSync(join(ROOT, 'src/plugin/teams-plugin.mjs')));
-    assert.match(pkg.description, /31 tools/);
+    assert.match(pkg.description, /32 tools/);
     assert.equal(
       pkg.scripts['test:teams'],
       'node --test --test-force-exit test/teams-data-plane.test.mjs test/teams-plugin.test.mjs test/teams-policy.test.mjs test/teams-presence.test.mjs',
