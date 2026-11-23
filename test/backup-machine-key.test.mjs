@@ -40,8 +40,8 @@ function fakeRunner(command, args, input = '') {
   return { ok: true, status: 0, stdout: 'ok', stderr: '', error: '' };
 }
 
-describe('machine-key: DPAPI transport on this machine', { skip: WIN32 ? false : 'DPAPI is Windows-only' }, () => {
-  it('protects and unprotects 32 bytes through a real PowerShell round trip', () => {
+describe('machine-key: DPAPI transport on this machine', () => {
+  it('protects and unprotects 32 bytes through a real PowerShell round trip', { skip: WIN32 ? false : 'DPAPI is Windows-only' }, () => {
     const secret = Buffer.from(Array.from({ length: 32 }, (_, index) => index + 1));
     const protectedSecret = protectSecret(secret);
     assert.equal(protectedSecret.ok, true, protectedSecret.detail ?? '');
@@ -51,7 +51,7 @@ describe('machine-key: DPAPI transport on this machine', { skip: WIN32 ? false :
     assert.deepEqual(back.secret, secret);
   });
 
-  it('reports this machine as able to keep a machine envelope', () => {
+  it('reports this machine as able to keep a machine envelope', { skip: WIN32 ? false : 'DPAPI is Windows-only' }, () => {
     const support = detectMachineKeySupport();
     assert.equal(support.available, true, support.reason ?? '');
     assert.equal(support.backend, 'dpapi-user');

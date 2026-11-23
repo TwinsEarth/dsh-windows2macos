@@ -72,6 +72,8 @@ function workspaceIdForPath(workspacePath) {
 /** A fresh registry document in the shape the client writes. */
 function newRegistryDocument(workspaceId, workspacePath) {
   const now = new Date().toISOString();
+  const pathApi =
+    /^[A-Za-z]:[\\/]/u.test(workspacePath) || workspacePath.startsWith('\\\\') ? path.win32 : path;
   return {
     unit: { name: 'workspace', version: 2 },
     global: {
@@ -85,7 +87,7 @@ function newRegistryDocument(workspaceId, workspacePath) {
       workspaces: {
         [workspaceId]: {
           path: workspacePath,
-          title: path.basename(workspacePath) || workspacePath,
+          title: pathApi.basename(workspacePath) || workspacePath,
           sessionIds: [],
           createdAt: now,
           updatedAt: now,
@@ -184,7 +186,16 @@ export function planRegistryRestores(input) {
   if (!useBaseDocument && document !== null && (typeof document !== 'object' || document.tables === undefined)) {
     return refusal(REGISTRY_CODES.UNREADABLE, `${file}: not a workspace registry document`, file, document);
   }
-  const workspacePath = typeof input.workspacePath === 'string' && input.workspacePath.trim() !== '' ? path.resolve(input.workspacePath.trim()) : null;
+  const requestedWorkspacePath = typeof input.workspacePath === 'string' && input.workspacePath.trim() !== ''
+    ? input.workspacePath.trim()
+    : null;
+  // A Windows-shaped workspace in a backup can be restored into a POSIX test runner. `path.resolve` would prefix
+  // the host cwd and turn `E:\GPT` into `<cwd>/E:\GPT`, changing the slug to `restored-...-e:-gpt`; the path's own
+  // shape picks the parser, the same way `toRel` does.
+  const workspacePathApi = requestedWorkspacePath !== null && (/^[A-Za-z]:[\\/]/u.test(requestedWorkspacePath) || requestedWorkspacePath.startsWith('\\\\'))
+    ? path.win32
+    : path;
+  const workspacePath = requestedWorkspacePath === null ? null : workspacePathApi.resolve(requestedWorkspacePath);
 
   if (document === null) {
     if (exists) return refusal(REGISTRY_CODES.UNREADABLE, `${file}: not readable JSON`, file, null);
@@ -232,7 +243,7 @@ export function planRegistryRestores(input) {
       if (next.tables.workspaces[workspaceId] === undefined) {
         next.tables.workspaces[workspaceId] = {
           path: workspacePath,
-          title: path.basename(workspacePath) || workspacePath,
+          title: workspacePathApi.basename(workspacePath) || workspacePath,
           sessionIds: [],
           createdAt: new Date().toISOString(),
           updatedAt: new Date().toISOString(),

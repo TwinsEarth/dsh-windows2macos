@@ -30,7 +30,7 @@ import { verifyEnvelopeSignature } from '../../util/envelope-signature.mjs';
 import { buildReducePlan } from '../../util/dataflow.mjs';
 import { suggestReduce } from '../../util/reduce-suggestion.mjs';
 
-import { AGGREGATE_STATES, configError, MAX_EXCERPT_BYTES, NON_TERMINAL_AGGREGATE, NON_TERMINAL_OUTCOME, offerP2PFor, PROTOCOL_VERSION, reasonCodeOf, REFUSAL_CODE, request, requestFleetJoin, requireRabbit, resolveGitAnchors, resolveToken, throwIfAborted, W2MError } from './shared.mjs';
+import { AGGREGATE_STATES, configError, inProcessWebRtcPool, MAX_EXCERPT_BYTES, NON_TERMINAL_AGGREGATE, NON_TERMINAL_OUTCOME, offerP2PFor, PROTOCOL_VERSION, reasonCodeOf, REFUSAL_CODE, request, requestFleetJoin, requireRabbit, resolveGitAnchors, resolveToken, throwIfAborted, W2MError } from './shared.mjs';
 
 /**
  * Upper bound on how many tasks w2m_history will ask the relay for.
@@ -341,6 +341,122 @@ async function pushOffer(node, frame, crypto = {}) {
 }
 
 /**
+ * Send one offer over the WebRTC data plane.
+ *
+ * This deliberately sits *before* the UDP dial and never replaces the relay ledger. The task has
+ * already been created by `POST /v1/task`; this is only the fast delivery of the same offer the
+ * relay also publishes as SSE. A failure here is therefore a fallback signal, not a dispatch
+ * failure, and the caller must still try the old path.
+ *
+ * @param {object|null} pool
+ * @param {object} frame
+ * @returns {Promise<{ok: boolean, transport: 'webrtc-v1'|null, reason_code: string|null,
+ *   error: string|null, code: string|null, encrypted: boolean}>}
+ */
+export async function pushOfferWebRtc(pool, frame) {
+  if (pool === null || pool === undefined || typeof pool.send !== 'function') {
+    return {
+      ok: false,
+      transport: null,
+      reason_code: REFUSAL_CODE.P2P_DIAL_FAILED,
+      error: 'WEBRTC_POOL_UNAVAILABLE: no WebRTC transport pool is running in this plugin',
+      code: 'WEBRTC_POOL_UNAVAILABLE',
+      encrypted: false,
+    };
+  }
+  try {
+    const sent = await pool.send(frame.machine_id, JSON.stringify(frame));
+    if (sent?.ok !== true) {
+      return {
+        ok: false,
+        transport: null,
+        reason_code: REFUSAL_CODE.P2P_DIAL_FAILED,
+        error: `${sent?.code ?? 'WEBRTC_SEND_FAILED'}: ${sent?.detail ?? 'send failed'}`,
+        code: sent?.code ?? 'WEBRTC_SEND_FAILED',
+        encrypted: false,
+      };
+    }
+    return {
+      ok: true,
+      transport: 'webrtc-v1',
+      reason_code: null,
+      error: null,
+      code: null,
+      encrypted: true,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      transport: null,
+      reason_code: REFUSAL_CODE.P2P_PUSH_THREW,
+      error: `WEBRTC_PUSH_THREW: ${error instanceof Error ? error.message : String(error)}`,
+      code: 'WEBRTC_PUSH_THREW',
+      encrypted: false,
+    };
+  }
+}
+
+/**
+ * Deliver one offer over WebRTC first and the legacy UDP dial second.
+ *
+ * The returned `transport` is the stack that actually carried the frame; `fallback_from` records
+ * that WebRTC was attempted and refused. `relay_ledger` is not a field here on purpose: the relay's
+ * copy is written before this function runs and is never conditional on its result.
+ *
+ * @param {object|null} node
+ * @param {object|null} webrtcPool
+ * @param {object} frame
+ * @param {{peerKey?: string|null, peerKeys?: object|null}} [crypto]
+ * @returns {Promise<{ok: boolean, transport: 'webrtc-v1'|'udp-v1'|'relay', reason_code: string|null,
+ *   error: string|null, session: number|null, reused: boolean, encrypted: boolean,
+ *   encryption_reason: string|null, fallback_from: 'webrtc-v1'|null, webrtc_error: string|null}>}
+ *   `transport` is never null: after both direct attempts fail, the relay's SSE offer is the
+ *   delivery that remains, so the value is `relay`.
+ */
+export async function pushOfferBestPath(node, webrtcPool, frame, crypto = {}) {
+  const attemptedWebrtc = webrtcPool !== null && webrtcPool !== undefined && typeof webrtcPool.send === 'function';
+  const webrtc = attemptedWebrtc ? await pushOfferWebRtc(webrtcPool, frame) : null;
+  if (webrtc !== null && webrtc.ok === true) {
+    return {
+      ok: true,
+      transport: 'webrtc-v1',
+      reason_code: null,
+      error: null,
+      session: null,
+      reused: false,
+      encrypted: true,
+      encryption_reason: null,
+      fallback_from: null,
+      webrtc_error: null,
+    };
+  }
+  if (node === null || node === undefined) {
+    return {
+      ok: false,
+      // The relay's own SSE offer is the delivery that remains; naming it `relay` is the honest
+      // transport for this lease, not a null that hides which path actually carried the offer.
+      transport: 'relay',
+      reason_code: webrtc?.reason_code ?? REFUSAL_CODE.P2P_DIAL_FAILED,
+      error: webrtc?.error ?? 'P2P_UNAVAILABLE: neither a WebRTC pool nor a UDP node is running',
+      session: null,
+      reused: false,
+      encrypted: false,
+      encryption_reason: null,
+      fallback_from: attemptedWebrtc ? 'webrtc-v1' : null,
+      webrtc_error: webrtc?.error ?? null,
+    };
+  }
+  const udp = await pushOffer(node, frame, crypto);
+  return {
+    ...udp,
+    // A failed UDP dial still leaves the relay SSE copy as the delivered offer.
+    transport: udp.ok === true ? 'udp-v1' : 'relay',
+    fallback_from: attemptedWebrtc ? 'webrtc-v1' : null,
+    webrtc_error: webrtc?.error ?? null,
+  };
+}
+
+/**
  * Push an offer for one task to every machine the relay leased it to.
  *
  * Called after the relay has created the task, so the relay's own SSE offer has already gone out:
@@ -357,13 +473,18 @@ async function pushOffer(node, frame, crypto = {}) {
  * executor records `P2P_CRYPTO_NO_KEY` for its plaintext channel, which is the documented outcome for
  * a peer that never announced.
  *
- * @param {P2PNode} node
+ * v3.5.8: WebRTC is tried first. A WebRTC failure falls through to the same UDP dial as before; a
+ * null node is legal when only the WebRTC pool is configured. The relay's SSE offer remains the
+ * final fallback and the ledger, so this function is never allowed to fail a dispatch.
+ *
+ * @param {object|null} node
  * @param {object} options
- * @returns {Promise<Array<object>>} One entry per lease considered, in lease order. A machine that was
- *   not pushed to carries `ok: false` **and** a `reason_code` naming which gate refused it  - this
- *   block is a tool result, so a bare boolean here would be exactly the reduction the verdicts refuse.
+ * @returns {Promise<Array<object>>} One entry per lease considered, in lease order. Every entry
+ *   carries `transport: 'webrtc-v1'|'udp-v1'|'relay'` and, when `ok: false`, both `reason_code` and
+ *   `failure_code`. A rejected/unrunnable lease is `relay` because the relay ledger decided its
+ *   state and its SSE record is the only delivery surface for it.
  */
-async function pushOffers(node, { taskId, leases, payload, originMachineId, getJson = null }) {
+export async function pushOffers(node, { taskId, leases, payload, originMachineId, getJson = null, webrtcPool = null }) {
   const out = [];
   for (const lease of leases) {
     const machineId = typeof lease?.machine_id === 'string' && lease.machine_id !== '' ? lease.machine_id : null;
@@ -372,8 +493,11 @@ async function pushOffers(node, { taskId, leases, payload, originMachineId, getJ
       out.push({
         machine_id: null,
         ok: false,
+        transport: 'relay',
         reason_code: REFUSAL_CODE.P2P_LEASE_NO_MACHINE_ID,
+        failure_code: REFUSAL_CODE.P2P_LEASE_NO_MACHINE_ID,
         error: 'the relay returned a lease with no machine_id',
+        relay_fallback: true,
       });
       continue;
     }
@@ -381,8 +505,11 @@ async function pushOffers(node, { taskId, leases, payload, originMachineId, getJ
       out.push({
         machine_id: machineId,
         ok: false,
+        transport: 'relay',
         reason_code: REFUSAL_CODE.P2P_LEASE_NOT_RUNNABLE,
+        failure_code: REFUSAL_CODE.P2P_LEASE_NOT_RUNNABLE,
         error: `lease state is ${JSON.stringify(state ?? null)}, so this machine was not handed the command`,
+        relay_fallback: true,
         // What would change it: nothing the dispatcher can do. The relay decided, and the honest
         // report is that the decision was the relay's rather than a delivery failure.
         detail:
@@ -397,17 +524,32 @@ async function pushOffers(node, { taskId, leases, payload, originMachineId, getJ
       out.push({
         machine_id: machineId,
         ok: false,
+        transport: 'relay',
         reason_code: built.skipped.reason_code,
+        failure_code: built.skipped.reason_code,
         error: built.skipped.message,
+        relay_fallback: true,
       });
       continue;
     }
-    const result = await pushOffer(node, built.frame, { peerKey, peerKeys: node?.peerKeys ?? null });
+    const result = await pushOfferBestPath(node, webrtcPool, built.frame, { peerKey, peerKeys: node?.peerKeys ?? null });
+    const failureCode = result.ok === true ? null : (result.reason_code ?? REFUSAL_CODE.P2P_DIAL_FAILED);
     out.push({
       machine_id: machineId,
       ok: result.ok,
-      reason_code: result.ok ? null : (result.reason_code ?? REFUSAL_CODE.P2P_DIAL_FAILED),
+      // One of the three real delivery paths. A failed direct push is `relay`, because the relay's
+      // SSE offer is then the copy that actually reaches the machine -- `null` would hide that.
+      transport: result.transport ?? 'relay',
+      reason_code: failureCode,
+      failure_code: failureCode,
       error: result.error,
+      relay_fallback: result.ok !== true,
+      ...(result.fallback_from === null || result.fallback_from === undefined
+        ? {}
+        : { fallback_from: result.fallback_from }),
+      ...(result.webrtc_error === null || result.webrtc_error === undefined
+        ? {}
+        : { webrtc_error: result.webrtc_error }),
       dedupe_key: built.frame.dedupe_key === null ? null : 'relay-formula',
       // The session this push and the executor's reverse dial meet on, so a machine's own
       // `p2p.session` in the ledger can be matched to the dispatcher's attempt without reading two
@@ -1536,8 +1678,17 @@ const result = await request({
         delivered: 0,
         failed: 0,
         pushes: [],
+        data_plane: {
+          preferred: 'webrtc-v1',
+          fallback: 'udp-v1',
+          relay_ledger: 'always',
+          webrtc_pushes: 0,
+          udp_fallbacks: 0,
+          failed_without_direct: 0,
+        },
       };
-      if (cfg.p2pMode !== 'relay' && p2p.node !== null && p2p.start?.ok === true) {
+      const webrtcPool = inProcessWebRtcPool;
+      if ((webrtcPool !== null && typeof webrtcPool.send === 'function') || (cfg.p2pMode !== 'relay' && p2p.node !== null && p2p.start?.ok === true)) {
         try {
           const pushes = await pushOffers(p2p.node, {
             taskId: result.json?.task_id ?? null,
@@ -1547,6 +1698,9 @@ const result = await request({
             // v0.6.0: where each target's static public key is read from, so the offer addressed to a
             // machine can carry the key that machine needs to authenticate the dispatcher's handshake.
             getJson: p2p.node?.getJson ?? null,
+            // v3.5.8: the shared pool built by `startLocalStack`; the dispatcher and its own agent
+            // deliberately share one machine identity and one signaling role.
+            webrtcPool,
           });
           directPushes = {
             ...directPushes,
@@ -1559,6 +1713,16 @@ const result = await request({
             // fleet where only the dispatcher initiates, which is what makes the two-way punch
             // visible in one dispatch's own answer instead of only in the ledger.
             reused_channels: pushes.filter((entry) => entry.reused === true).length,
+            // v3.5.8: the data-plane split, stated per dispatch so "the result came back over
+            // WebRTC" cannot be confused with "the ledger did not go through the relay".
+            data_plane: {
+              preferred: 'webrtc-v1',
+              fallback: 'udp-v1',
+              relay_ledger: 'always',
+              webrtc_pushes: pushes.filter((entry) => entry.transport === 'webrtc-v1').length,
+              udp_fallbacks: pushes.filter((entry) => entry.transport === 'udp-v1' && entry.fallback_from === 'webrtc-v1').length,
+              failed_without_direct: pushes.filter((entry) => entry.ok !== true && entry.transport === 'relay').length,
+            },
           };
         } catch (error) {
           // `pushOffers` is written not to throw; this is here so a future edit cannot turn a

@@ -68,12 +68,6 @@ export const ACCEPTED_ORPHANS = Object.freeze([
     removedBy: 'the 1.9.3 wiring slice that gives this module its production caller',
   },
   {
-    file: 'src/agent/transport.mjs',
-    reason: REASON.LIBRARY,
-    why: 'W0 P2PTransport contract + udp-v1 adapter; the agent still calls P2PNode directly, so wiring it into the dispatch path is the next slice',
-    removedBy: 'the agent dispatch path selecting a transport through this registry instead of calling P2PNode.dial directly',
-  },
-  {
     file: 'src/agent/p2p-race.mjs',
     reason: REASON.LIBRARY,
     why: 'capability negotiation + first-usable-path race; no second transport exists yet, so there is nothing to race',
@@ -162,6 +156,18 @@ export const ACCEPTED_ORPHANS = Object.freeze([
     reason: REASON.LIBRARY,
     why: 'parses a `node --test` summary in both the `#` and `ℹ` forms; written to fix a real misreading and used by suites rather than by the program',
     removedBy: 'a tool that runs a suite and reports it, which is the job `machine-test-packet.mjs` does for exit codes',
+  },
+  {
+    file: 'src/plugin/p2p-webrtc-plugin.mjs',
+    reason: REASON.LIBRARY,
+    why: 'the opt-in dsh-p2p-webrtc sub-plugin composition root, loaded through cordis.patch.yml and exported as lib/p2p-webrtc-plugin.js; it is deliberately not re-exported from lib/index.js so installing the fleet plugin starts no engine',
+    removedBy: 'an import edge from lib/index.js, which would make every fleet install mount the WebRTC engine row instead of leaving it disabled until the operator enables it',
+  },
+  {
+    file: 'src/plugin/teams-plugin.mjs',
+    reason: REASON.LIBRARY,
+    why: 'the opt-in dsh-teams sub-plugin composition root, loaded through cordis.patch.yml and exported as lib/teams-plugin.js; it is deliberately not re-exported from lib/index.js so a fleet install performs no relay read for Teams',
+    removedBy: 'an import edge from lib/index.js, which would make the Teams room and roster mount on every fleet install rather than only when the operator enables the row',
   },
 ]);
 

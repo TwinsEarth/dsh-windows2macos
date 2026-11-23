@@ -2,6 +2,54 @@
 
 All notable changes to this project are documented here.
 
+## [3.5.8] — 2026-11-23
+
+### feat(teams): WebRTC 数据面接线（shared pool + artifact sink + merge CLI）
+
+- **同一个 pool**：新增 `TeamsDataPlane`（`src/plugin/teams/data-plane.mjs`），接收 `WebRtcTransportPool` 实例；`tools/shared.mjs` 构建 pool 后通过 `webrtc-pool-registry.mjs` 发布，`dsh-teams` 按需取得，避免同一 machine_id 争用 signaling role。
+- **真实 33 次尝试**：`sendArtifact()` 按帧调用 `transport-policy.bulk()`；每帧固定最多 33 次 `pool.send()`，成功时报告真实 attempt 数，耗尽返回 `TEAM_DATA_P2P_EXHAUSTED` + `alert`，数据面不调用 `sendControl()`、不回落 Relay。
+- **artifact.ack**：接收端重组分片、校验 SHA-256 并写入 sink 后才回 `team.artifact.ack`；发送端等到 ACK 才返回 `ok:true`，ACK 超时返回 `TEAM_DATA_ACK_TIMEOUT`、摘要不匹配返回 `TEAM_DATA_ACK_MISMATCH`，仍不回落 Relay。ACK 是独立确认帧，不占 33 次重试预算。
+- **peerStatus last_error**：`peerStatus()` 的 `last_error` 改为 `record.last_error ?? transport.diagnostics().last_error ?? null`，transport 在 `start()` 之后因 ICE/provider 关闭而失败时不再吞成 `null`。
+- **artifact sink 接线**：`deliverArtifact({dataPlane, peer})` 优先走 WebRTC；接收端重组分片、校验 SHA-256 后写入 dir/lan-git/ssh sink；摘要不匹配不入 sink。无 `peer` 时保留原有本地 sink 行为。
+- **merge CLI 接线**：`w2m-joint merge --peer <machine_id>` 先把 patch manifest 经同一数据面送达 peer 的 artifact sink，再执行本地 merge；报告新增 `data_plane.transport/channel/sha256/bytes`。
+- **Teams 工具面**：新增 `w2m_team_artifact`（发送本地文件到 peer 的 sink），`w2m_team_status` 的 `transport.data` 增加 `transport:'webrtc-v1'` 与 `data_plane` 诊断（pool 可用性、计数、最近告警）。
+- **测试**：`npm run test:teams` 38/38 通过（新增 `test/teams-data-plane.test.mjs` 11 项：33 次耗尽、第 33 次成功、ACK 超时、分片重组入 sink、无 pool 拒绝、`deliverArtifact` 远端成功/失败路径、Service 委托、CLI 工厂拒绝猜配置、`w2m_team_artifact` 工具）；`test:p2p-webrtc` 52/52、`node --test test/relay-ledger.test.mjs test/peer-status-last-error.test.mjs` 2/2、入口检查 ALL OK、ESLint 改动文件 0 error。
+- **同机真实引擎冒烟**：`scripts/webrtc-real-pair.mjs` 用两个独立 `node-datachannel` provider 进程跑真实 ICE/DTLS/DataChannel，Teams 数据面送达 1 MiB artifact（6 帧、6 次尝试、`transport=webrtc-v1`），host 侧 dir sink 读回字节与发送内容逐字节一致；建链约 200 ms、`path: direct`、`secure: secure`。这是同机双 provider，不是跨机器矩阵。
+- **跨机器矩阵**：云主机、MacMini、IM2A、HSD 四节点 12 条有向腿全部端到端通过；发送端 `ok:true` 且 `ack.ok:true`，接收端 sink 文件 SHA-256 与发送端一致。1 MiB 与 256 KiB 两种载荷分别覆盖 6 次与 2 次分帧尝试；含此前反复超时的 HSD ↔ IM2A 双向腿。
+
+### feat(p2p-webrtc): 新增 WebRtcTransportPool（按 peer pair 管理 1:1 transport）
+
+- **确定性配对**：`pairRole(a,b)` 以机器 ID 字典序决定 signaling `host/client`；`pairRoom(a,b)` 用 `sha256(sorted(a,b))[0:24]` 生成两端一致的房间名，不需要额外协商字段。
+- **按 peer 生命周期**：`WebRtcTransportPool` 提供 `ensure` / `prepare` / `send` / `onMessage` / `closePeer` / `stop` / `diagnostics`；并发 `ensure` 共享一次 start，失败不缓存，下一次调用关闭旧 transport 后重建。
+- **固定密钥解析**：`createRelayPeerKeyResolver({getJson})` 从 relay `GET /v1/peer/<machine_id>` 的 `peer.static_key` 取 Noise 固定密钥，5 分钟缓存；缺失返回命名拒绝 `WEBRTC_POOL_PEER_KEY_MISSING`，绝不生成临时密钥。
+- **诊断快照**：每 peer 报告 role/room/state/path/rtt/secure/provider/last_error，不输出 signalToken；`signal_url` 走 `redactSignalingUrl`。
+- **包导出**：新增 `./p2p-webrtc-pool` -> `lib/p2p-webrtc-pool.js`，导入不产生 socket/子进程副作用。
+- **测试**：新增 `test/p2p-webrtc-pool.test.mjs`；`npm run test:p2p-webrtc` 52/52 通过。
+- **边界**：本条目只记录 pool 本身；`deliver.mjs` 调度、dispatch 推送、Teams 数据面与真实双机矩阵已在上方条目接入并跑通。
+
+### feat(p2p-webrtc): P2P 优先的 WebRTC 传输层子插件
+
+- **新增第二传输栈 `webrtc-v1`**（显式 opt-in，默认仍为 `udp`）：WebRTC DataChannel 承载 RPC/事件流，独立 WebSocket 信令服务器交换 SDP/ICE，ICE/STUN 直连、TURN 中继，失败按 `direct → relay → degraded → fallback` 选路并可回落现有 UDP/relay。核心实现在 `src/agent/webrtc/`。
+- **统一端到端加密边界**：所有业务帧先走 Noise_IK_25519_ChaChaPoly_SHA256（复用 `crypto.mjs` 的 X25519/HKDF/BLAKE2s/ChaCha20-Poly1305、重放窗口与 rekey）；SDP 不作为信任材料，client 必须预置 `peerPublicKey`，host 必须持有 `peerKeys`。
+- **零运行时依赖**：真实 WebRTC 引擎经 `ProviderBridge` 外部 JSON-line 子进程接入，仓库不捆绑原生库；测试通过 in-process provider 驱动真实信令/真实 Noise/真实分片。
+- **子插件与工具**：`dsh-p2p-webrtc`（`cordis.patch.yml` 默认 `disabled: true`）提供 `p2p_webrtc_status` / `p2p_webrtc_start` / `p2p_webrtc_stop` / `p2p_webrtc_probe`；`p2p_webrtc_start` 需 `confirm:"start"`。CLI：`w2m-webrtc-signal`。
+- **协议**：16 KiB 分片、4 MiB 消息上限、8 个未完成消息、30 s TTL、发送串行化与有界恢复；帧头 `kind u8 | session u32be | body`。
+- **参考引擎**：`src/agent/webrtc/providers/node-datachannel-provider.mjs` 提供可运行的 JSON-line provider；`node-datachannel` 仍安装在包外，包本身零运行时依赖。
+- **测试**：新增 `test/p2p-webrtc-*.test.mjs` 九个文件与 fake engine helper，`npm run test:p2p-webrtc` 52/52 通过；P2P 回归 209/209、工具面 3/3、transport/iroh 7/7 通过；Prettier 全绿、ESLint 0 error。
+- **文档**：新增 `docs/P2P-WEBRTC.md`；README 工具数与工具清单随 Teams 子插件同步为 25 个。
+- 本版本已接入 `deliver.mjs` 生产调度并完成四节点矩阵；真实 `node-datachannel` provider 由外部安装，包本身保持零运行时依赖。
+
+### feat(teams): 编队联合开发 & 多机跨机实时协同的产品面
+
+- **新增 opt-in 子插件 `dsh-teams`**（`cordis.patch.yml` 默认 `disabled: true`），包导出 `./dsh-teams`，提供 `w2m_team_status` / `w2m_team_room` 两个只读工具（后续另有 `w2m_team_artifact` 数据面发送）。它不替代主插件，也不新增派发入口：审批与派发仍由 `w2m-joint`（Ed25519 人签、显式 `target_machines`、409 读回、死租约拒绝）和设置页完成。
+- **传输分层强制**：控制面（heartbeat / presence / user_info / roster / plan / approval / lease / task_control / council / room_event）固定 `relay-tcp`，每条消息仅 1 次；数据面（file / image / artifact / blob / data_sync）固定 `webrtc-v1`，默认最多 33 次，全部失败返回 `TEAM_DATA_P2P_EXHAUSTED` 并携带 `alert` 告警，**不回落 Relay**。未知 kind 默认按控制面并标记 `needs_review`。
+- **在线状态**：`TeamPresence` 以注入时钟判断 `online`/`stale`（默认 90 s），保留 `machine_id`、用户信息、角色、caps、心跳次数；`presenceFromDevices` 将 relay `/v1/devices` 的 `last_seen` / `last_seen_at` 映射为同一 roster 形状，不虚构新鲜度。
+- **共享项目房间**：`w2m_team_room` 只读 `GET /v1/projects`、`GET /v1/projects/:id`、`GET /v1/projects/:id/events?since_seq=`；项目创建/成员变更仍是 operator 行为。设备 token 从 `device.json` 读取，绝不写入配置或输出。
+- **联合计划索引**：`w2m_team_status` 只列出本地 `listPlans()` 摘要与最新 plan sha，不在工具面 approve / dispatch；`w2m_run` 的四种协作模式（`replicate` / `split` / `pipeline` / `broadcast`）仅作为能力索引展示。
+- **错误码**：`TEAM_DATA_P2P_EXHAUSTED`、`TEAM_DATA_POOL_REQUIRED`、`TEAM_DATA_PEER_REQUIRED`、`TEAM_ROOM_ACTION_INVALID`、`TEAM_PROJECT_ID_REQUIRED`、`TEAM_PROJECT_ID_INVALID`、`TEAM_SINCE_SEQ_INVALID`、`TEAM_DEVICE_TOKEN_REQUIRED`。
+- **测试**：新增 `test/teams-policy.test.mjs`、`test/teams-presence.test.mjs`、`test/teams-plugin.test.mjs`，`npm run test:teams` 当时 27/27 通过（2026-11-23 数据面接线与 ACK 完成后为 38/38）；覆盖 33 次耗尽、第 33 次成功、无 relay 回落、心跳 stale 判定、包导出/row disabled、只读挂载、token 与 URL 凭据不泄露。
+- **边界**：本条目只描述产品面；artifact sink 数据面投递与合并 CLI 的接线见上方 `feat(teams): WebRTC 数据面接线`。relay 部署独立于插件发布。本版本随 v3.5.8 发布。
+
 ## [3.5.7] - 2026-11-21
 
 ### fix(surfaces): 子插件开关真正决定侧栏标签/面板/浮标是否出现（探测语义修正）
@@ -1057,7 +1105,7 @@ All notable changes to this project are documented here.
   在 CI 的受控事件循环里可能先于测试结束，导致 `gpw-auto-approve` 第一个子测试失败、发布流水线在
   `End-to-end suites` 步骤挂掉。现恢复 timer 强引用（与原始实现一致），红/黄/蓝/绿倒计时与自动动作语义不变。
 - 验证：`gpw-auto-approve`、`gpw-ai-priority`、`gpw-modes` 本地全绿；CI 诊断 run 已定位失败子测试为
-  “approves a yellow call after the timeout and makes its next occurrence blue”。
+  “approves a yellow call after the timeout and makes its next occurrence blue”。
 - 同一轮 CI 还暴露出分层模型（layer-model）未声明的新依赖边 `plugin -> decision-center`（GPW 复用决策中心的密钥存储），已在 `scripts/layer-model.mjs` 的 ALLOWED_EDGES 显式声明，`layer-model 24/24` 通过。
 - 发布会话的 e2e 改为**自诊断**（保持 `npm run test:e2e` 单一入口，符合 claims 的“单一事实源”约束）：
   步骤内捕获输出，把失败文件名以 `::error title=e2e::FAILED <file>` 注解写出并写入 step summary；即使读不到日志，也能从注解/摘要看到是哪个 e2e 文件挂了。

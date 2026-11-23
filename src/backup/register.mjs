@@ -53,6 +53,12 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
+/** A workspace path is resolved with its own shape's parser: a backup from Windows restores on a POSIX runner. */
+function resolveWorkspacePath(value) {
+  const windowsShaped = /^[A-Za-z]:[\\/]/u.test(value) || value.startsWith('\\\\');
+  return (windowsShaped ? path.win32 : path).resolve(value);
+}
+
 import { clientGate } from './client.mjs';
 import { applyRegistryRestore, CLIENT_OVERWRITE_WARNING, findWorkspaceForSlug, planRegistryRestores, workspaceRegistryPath } from './registry.mjs';
 import { REGISTER_RESIDUAL_RISK_LINE } from './register-watch.mjs';
@@ -223,7 +229,7 @@ export function planRegister(input = {}) {
   const dshHome = typeof input.dshHome === 'string' && input.dshHome.trim() !== '' ? path.resolve(input.dshHome) : null;
   const requested = [...new Set((Array.isArray(input.sessionIds) ? input.sessionIds : []).map((value) => String(value ?? '')).filter((value) => value !== ''))];
   const now = input.now instanceof Date ? input.now : new Date();
-  const workspacePath = typeof input.workspacePath === 'string' && input.workspacePath.trim() !== '' ? path.resolve(input.workspacePath.trim()) : null;
+  const workspacePath = typeof input.workspacePath === 'string' && input.workspacePath.trim() !== '' ? resolveWorkspacePath(input.workspacePath.trim()) : null;
   const keepPreRestore = Number.isSafeInteger(input.keepPreRestoreBackups) && input.keepPreRestoreBackups >= 0
     ? input.keepPreRestoreBackups
     : DEFAULT_KEEP_REGISTER_BACKUPS;
@@ -537,7 +543,7 @@ export async function registerThroughHost(input = {}) {
   const dshHome = typeof input.dshHome === 'string' && input.dshHome.trim() !== '' ? path.resolve(input.dshHome) : null;
   const requested = [...new Set((Array.isArray(input.sessionIds) ? input.sessionIds : []).map((value) => String(value ?? '')).filter((value) => value !== ''))];
   const now = input.now instanceof Date ? input.now : new Date();
-  const workspacePath = typeof input.workspacePath === 'string' && input.workspacePath.trim() !== '' ? path.resolve(input.workspacePath.trim()) : null;
+  const workspacePath = typeof input.workspacePath === 'string' && input.workspacePath.trim() !== '' ? resolveWorkspacePath(input.workspacePath.trim()) : null;
   const service = input.workspaceRegistry ?? null;
   const base = {
     ok: false,

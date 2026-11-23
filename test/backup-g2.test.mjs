@@ -110,6 +110,7 @@ describe('G2: the pause gate', () => {
         dshHome: source.home,
         platform: 'linux',
         machineKey: false,
+        allowStaticValidation: true,
         clientCheck: () => ({ running: true, detail: 'DeepSeek Harness.exe is running' }),
       });
       assert.equal(refused.ok, false);
@@ -121,6 +122,7 @@ describe('G2: the pause gate', () => {
         password: PASSWORD,
         platform: 'linux',
         machineKey: false,
+        allowStaticValidation: true,
         clientCheck: () => ({ running: true, detail: 'DeepSeek Harness.exe is running' }),
         allowLiveHome: true,
       });
@@ -886,7 +888,7 @@ describe('G2: the CLI gate', () => {
     const { source, repo } = cliFixture();
     try {
       const env = { ...process.env, DSH_HOME: source.home };
-      const base = ['restore', '--apply', '--dsh-home', source.home, '--backup-dir', repo.dir, '--no-machine-key'];
+      const base = ['restore', '--apply', '--dsh-home', source.home, '--backup-dir', repo.dir, '--no-machine-key', '--allow-static-validation'];
       const refused = runCli(base, { env, password: PASSWORD, clientCheck: () => ({ running: true, detail: 'client is running' }) });
       assert.equal(refused.code, 1);
       assert.match(refused.stdout, /BACKUP_CLIENT_RUNNING/u);

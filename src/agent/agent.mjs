@@ -172,6 +172,9 @@ export {
  * @property {(status: object) => void} [onP2PStatus] Called with a snapshot of the agent's
  *   P2P facts whenever they change (the node starting, an announcement, an error). Push,
  *   not poll: the plugin's `w2m_status` must not have to ask repeatedly.
+ * @property {object|null} [webrtcPool] The per-peer `webrtc-v1` pool owned by the composition
+ *   root. When present, result delivery tries WebRTC first, falls back to the UDP channel, and
+ *   always posts the envelope to the relay. The agent borrows it and never stops it.
  */
 
 /**
@@ -205,6 +208,9 @@ export function createAgent(options) {
     onP2PStatus = () => {},
     p2pAckTimeoutMs = P2P_RESULT_ACK_TIMEOUT_MS,
     p2pChannelLingerMs = P2P_CHANNEL_LINGER_MS,
+    // v3.5.8: the per-peer WebRTC pool, injected by the composition root that owns it. Null means
+    // "this process has no WebRTC data plane"; the UDP and relay paths are unchanged.
+    webrtcPool = null,
   } = options;
 
   // Normalise here so every caller gets the same contract: the documented
@@ -241,6 +247,14 @@ export function createAgent(options) {
   if (typeof onP2PStatus !== 'function') throw new TypeError('createAgent: onP2PStatus must be a function');
   if (typeof p2pAckTimeoutMs !== 'number' || !Number.isFinite(p2pAckTimeoutMs) || p2pAckTimeoutMs < 0) {
     throw new TypeError('createAgent: p2pAckTimeoutMs must be a non-negative number of milliseconds');
+  }
+  if (
+    webrtcPool !== null &&
+    (typeof webrtcPool !== 'object' ||
+      typeof webrtcPool.send !== 'function' ||
+      typeof webrtcPool.onMessage !== 'function')
+  ) {
+    throw new TypeError('createAgent: webrtcPool must expose send() and onMessage()');
   }
 
   // Validate + normalise once, at construction: a `rabbitUrl` carrying a query
@@ -436,6 +450,7 @@ export function createAgent(options) {
     onP2PStatus,
     p2pAckTimeoutMs,
     p2pChannelLingerMs,
+    webrtcPool,
     heartbeatIntervalMs,
     idleHeartbeatIntervalMs,
     statePublishIntervalMs,
@@ -499,6 +514,20 @@ export function createAgent(options) {
      */
     get p2pNode() {
       return deliver.p2pNode;
+    },
+    /**
+     * The injected per-peer WebRTC pool, or null.
+     *
+     * Exposed so a dispatcher in the same process can reuse the one pool rather than constructing a
+     * second one on the same machine id -- two pools would claim the same signaling role for every
+     * pair. The agent does not own the pool's lifetime; the composition root that built it does.
+     */
+    get webrtcPool() {
+      return webrtcPool;
+    },
+    /** A snapshot of the WebRTC data-plane facts, safe to serialise. */
+    get webrtcStatus() {
+      return deliver.webrtcStatusSnapshot();
     },
     /** The mode this agent was built with, validated at construction. */
     p2pMode,

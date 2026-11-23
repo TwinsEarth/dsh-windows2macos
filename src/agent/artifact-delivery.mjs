@@ -41,9 +41,11 @@ export function loadArtifactSink(stateDir) {
  * Deliver one artifact.
  *
  * @param {{stateDir: string, kind?: 'stdout'|'stderr'|'patch'|'commit'|'reduce-input', bytes: Buffer|string,
- *          taskId: string, machineId: string, stepId?: string|null, sink?: object|null}} input
- * @returns {Promise<{ok: true, ref: object, sha256: string, bytes: number}
- *                 | {ok: false, code: 'ARTIFACT_NOT_DELIVERED', reason: string, local: object}>}
+ *          taskId: string, machineId: string, stepId?: string|null, sink?: object|null,
+ *          dataPlane?: object|null, peer?: string|null, name?: string|null}} input
+ * @returns {Promise<{ok: true, ref?: object, sha256: string, bytes: number, transport?: string}
+ *                 | {ok: false, code: string, reason?: string, local?: object, transport?: string,
+ *                    alert?: object|null}>}
  */
 export async function deliverArtifact(input) {
   const bytes = Buffer.isBuffer(input?.bytes) ? input.bytes : Buffer.from(String(input?.bytes ?? ''), 'utf8');
@@ -63,6 +65,36 @@ export async function deliverArtifact(input) {
       return { sha256: digest, bytes: bytes.length, path: null };
     }
   };
+  const dataPlane = input?.dataPlane ?? null;
+  const peer = typeof input?.peer === 'string' && input.peer !== '' ? input.peer : null;
+  if (dataPlane !== null && peer !== null) {
+    const sent = await dataPlane.sendArtifact({
+      peer,
+      bytes,
+      taskId,
+      kind,
+      name: typeof input?.name === 'string' ? input.name : null,
+    });
+    if (sent.ok === true) {
+      return {
+        ok: true,
+        transport: sent.transport ?? 'webrtc-v1',
+        channel: sent.channel ?? 'webrtc-v1',
+        sha256: digest,
+        bytes: bytes.length,
+        peer,
+        remote: sent,
+      };
+    }
+    return {
+      ok: false,
+      code: sent.code ?? 'TEAM_DATA_P2P_EXHAUSTED',
+      reason: sent.code ?? 'TEAM_DATA_P2P_EXHAUSTED',
+      transport: sent.transport ?? 'webrtc-v1',
+      alert: sent.alert ?? null,
+      local: keepLocal(),
+    };
+  }
   const sink = input?.sink === undefined ? loadArtifactSink(stateDir) : input.sink;
   if (sink === null || sink === undefined) {
     return { ok: false, code: 'ARTIFACT_NOT_DELIVERED', reason: 'DATA_PLANE_SINK_REQUIRED', local: keepLocal() };

@@ -63,33 +63,45 @@ export function atomicWriteFailure(error, file) {
 export function writeFileAtomic(file, data) {
   const target = path.resolve(file);
   const dir = path.dirname(target);
-  const tmp = path.join(dir, `.${path.basename(target)}.tmp-${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`);
   const buffer = Buffer.isBuffer(data) ? data : Buffer.from(String(data), 'utf8');
-  let fd = null;
-  try {
-    fs.mkdirSync(dir, { recursive: true });
-    fd = fs.openSync(tmp, 'wx', 0o600);
-    fs.writeSync(fd, buffer, 0, buffer.length, 0);
-    fs.fsyncSync(fd);
-    fs.closeSync(fd);
-    fd = null;
-    fs.renameSync(tmp, target);
-    return { file: target, bytes: buffer.length, tmp };
-  } catch (error) {
-    if (fd !== null) {
-      try {
-        fs.closeSync(fd);
-      } catch {
-        /* the failure being reported is the write */
-      }
-    }
+  let lastError = null;
+  // A temporary file can disappear between `open` and `rename` when a test runner or a cleanup sweep removes the
+  // scratch directory. That is an ENOENT about the *temp name*, not a refusal to accept the bytes; retrying once
+  // writes a fresh temp beside the target and keeps a transient cleanup from surfacing as BACKUP_WRITE_FAILED.
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const tmp = path.join(
+      dir,
+      `.${path.basename(target)}.tmp-${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`,
+    );
+    let fd = null;
     try {
-      fs.rmSync(tmp, { force: true });
-    } catch {
-      /* best effort: a leaked temp file is reported by gc, not hidden */
+      fs.mkdirSync(dir, { recursive: true });
+      fd = fs.openSync(tmp, 'wx', 0o600);
+      fs.writeSync(fd, buffer, 0, buffer.length, 0);
+      fs.fsyncSync(fd);
+      fs.closeSync(fd);
+      fd = null;
+      fs.renameSync(tmp, target);
+      return { file: target, bytes: buffer.length, tmp };
+    } catch (error) {
+      if (fd !== null) {
+        try {
+          fs.closeSync(fd);
+        } catch {
+          /* the failure being reported is the write */
+        }
+      }
+      try {
+        fs.rmSync(tmp, { force: true });
+      } catch {
+        /* best effort: a leaked temp file is reported by gc, not hidden */
+      }
+      lastError = atomicWriteFailure(error, target);
+      if (attempt === 0 && error?.code === 'ENOENT') continue;
+      throw lastError;
     }
-    throw atomicWriteFailure(error, target);
   }
+  throw lastError;
 }
 
 /** Write JSON atomically, with a trailing newline (a diff-friendly file, and a complete one). */

@@ -249,4 +249,72 @@
         # Per-entry size cap (64 MiB): a larger project file is reported as skipped, never truncated.
         maxFileBytes: 67108864
 
+    # P2P 优先传输层 · WebRTC (dsh-p2p-webrtc): an opt-in second transport stack. It is **not** a
+    # replacement for the UDP punch or the relay: `deliver.mjs` still owns dispatch, and the row
+    # ships disabled. Enabling it requires an external WebRTC engine process (`providerCommand`)
+    # because the package deliberately has zero runtime dependencies; the transport owns signaling,
+    # ICE policy and Noise_IK_25519_ChaChaPoly_SHA256, and the engine owns only the DataChannel.
+    #
+    # The client needs the peer's pinned static key (`peerPublicKey`); the host needs `peerKeys`.
+    # SDP/ICE are exchanged through a standalone WebSocket signaling server (`w2m-webrtc-signal`),
+    # never learned as trust material. Docs: docs/P2P-WEBRTC.md.
+    - id: dsh-p2p-webrtc
+      name: '@twinsearth/w2m-dsh-plugin/dsh-p2p-webrtc'
+      disabled: true
+      config:
+        # Both sides connect outbound; the server only forwards SDP/ICE and never sees data bytes.
+        signalUrl: ''
+        signalToken: ''
+        room: 'w2m'
+        # host or client. Empty means "must be supplied at start"; there is no guessed default.
+        role: ''
+        peerMachineId: ''
+        machineId: ''
+        peerPublicKey: ''
+        peerKeys: {}
+        # Empty = <DSH_HOME>/xclient/device.key, beside the agent's device.json. Creation is opt-in.
+        deviceKeyDir: ''
+        allowCreateDeviceKey: false
+        # An executable that speaks the JSON-line provider protocol in docs/P2P-WEBRTC.md.
+        providerCommand: ''
+        providerArgs: []
+        providerCwd: ''
+        providerEnv: {}
+        iceServers: []
+        preferP2p: true
+        allowRelay: true
+        maxRttMs: 350
+        connectTimeoutMs: 30000
+        handshakeTimeoutMs: 15000
+        peerTimeoutMs: 20000
+        statsPollMs: 2000
+        # autoStart is still opt-in even when the row is enabled; mount-time has no process side effects.
+        autoStart: false
 
+
+    # Teams 子插件 (dsh-teams): opt-in 编队联合开发与多机实时协同的产品面与 WebRTC 数据面。它不是新的派发入口：
+    # 审批与派发仍在 `w2m-joint`（操作员 CLI）和设置页，模型只能看到房间和状态，不能签审批、不能发命令。
+    #
+    # 网络分层由插件强制，不由调用方选择：
+    #   控制面 / 心跳 / 用户信息 / 计划 / 审批 / 租约 -> Relay TCP（每消息仅 1 次）
+    #   图片 / 文件 / artifact / 数据同步            -> WebRTC DataChannel（同一个 pool，固定最多 33 次，失败即放弃并告警，不回落 Relay）
+    # The `dsh-p2p-webrtc` row above builds the shared WebRTC pool; this row consumes it for Teams data:
+    # orchestration views plus `w2m_team_artifact` (bytes only, never dispatch).
+    # Docs: docs/TEAMS.md.
+    - id: dsh-teams
+      name: '@twinsearth/w2m-dsh-plugin/dsh-teams'
+      disabled: true
+      config:
+        # Empty rabbitUrl = use W2M_RABBIT_URL, then this machine's device.json. No shared-server guess.
+        rabbitUrl: ''
+        # Empty stateDir = resolve from DSH_HOME; plans are read-only summaries, never dispatched here.
+        stateDir: ''
+        # Empty deviceFile = <DSH_HOME>/xclient/device.json, the same identity every other tool uses.
+        deviceFile: ''
+        projectId: 'default'
+        staleAfterMs: 90000
+        # Fixed ceiling in code; shown here for operators. Raising this value does not raise the policy.
+        dataMaxAttempts: 33
+        dataRetryDelayMs: 1000
+        # Reserved: mount never opens a socket, so enabling a row is still an explicit operator act.
+        autoStart: false

@@ -362,6 +362,13 @@ export const DOCUMENT_EXCLUSIONS = [
       'records past release actions for the maintainer and makes no claim about the shipped ' +
       'artifact, so it is not part of the documentation set the package ships.',
   },
+  {
+    path: 'WORKSPACE.md',
+    reason:
+      'a local-only workspace note naming E:\\DB\\W2M as the sole development copy and the old ' +
+      'E:\\DSH\\DS\\W2M as read-only; it is a machine-local operator rule, not a document that ' +
+      'describes the shipped plugin, and packing it would put one developer path in every install.',
+  },
 ];
 
 /** Below this many characters a "reason" is a shrug, not a reason. */
@@ -1021,6 +1028,39 @@ export const ACCEPTED_SKIPS = [
       'the 0600/0700 chat-store permission assertions are POSIX facts; the on-disk round trip, the log ' +
       'shape and the damaged-file cases in the same suite run on every host. This suite is in the release ' +
       'gate since the Phase 2 wiring, which is when the unqualified Windows skip surfaced',
+  },
+  {
+    key: 'harness-assertions-need-an-installation',
+    suite: /.*/,
+    match: /^no DeepSeek Harness installation on this machine$/,
+    maxCount: 12,
+    platforms: ['linux', 'darwin'],
+    why:
+      'twelve assertions in backup-engine, backup-runtime, backup-verify and fix-renumber ask an installed ' +
+      'DeepSeek Harness about a log; a host without one cannot answer, so each skips by this exact reason. ' +
+      'The static halves of the same files run everywhere; the release workflow runs these against the pinned ' +
+      'compatibility host',
+  },
+  {
+    key: 'dpapi-transport-is-windows-only',
+    suite: /.*/,
+    match: /^DPAPI is Windows-only$/,
+    maxCount: 7,
+    platforms: ['linux', 'darwin'],
+    why:
+      'seven assertions drive the real DPAPI transport (two in backup-machine-key, one in backup-access, four ' +
+      'subplugin route cases); DPAPI exists only on Windows. The file-lifecycle paths run everywhere with an ' +
+      'injected runner, and the real transport runs on Windows in the compatibility job',
+  },
+  {
+    key: 'drive-letters-are-windows-only',
+    suite: /.*/,
+    match: /^drive letters are Windows-only$/,
+    maxCount: 2,
+    platforms: ['linux', 'darwin'],
+    why:
+      'two assertions reason about another drive letter (a missing drive in ensureLayout, an off-drive path ' +
+      'in the mirror resolver); only Windows has drive letters, so a POSIX host skips them by name',
   },
 ];
 

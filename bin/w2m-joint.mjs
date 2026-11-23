@@ -28,6 +28,8 @@ import { consumeMergeApproval, createMergeApproval, loadMergeApproval } from '..
 import { resolve as resolvePath } from 'node:path';
 import { negotiateFeatures, readRelayCapabilities } from '../src/plugin/relay-capabilities.mjs';
 import { dispatchPlanToRelay } from '../src/plugin/joint-dev/relay-dispatch.mjs';
+import { deliverArtifact } from '../src/agent/artifact-delivery.mjs';
+import { createTeamsDataPlaneFromEnv } from '../src/plugin/teams/data-plane.mjs';
 import { readOperatorToken } from '../src/plugin/operator-token.mjs';
 import { ensureOperatorKey, signApprovalPayload } from '../src/plugin/operator-key.mjs';
 import {
@@ -234,10 +236,47 @@ if (command === 'merge') {
   let patches = null;
   try { patches = JSON.parse(readFileSync(args.patches, 'utf8').replace(/^\uFEFF/, '')); } catch (error) { fail('MERGE_PATCHES_UNREADABLE', error instanceof Error ? error.message : String(error)); }
   if (!Array.isArray(patches) || patches.length === 0) fail('MERGE_PATCHES_INVALID', 'manifest must be a non-empty JSON array of {step_id, patch}');
+  let dataPlaneReport = null;
+  if (typeof args.peer === 'string') {
+    const built = createTeamsDataPlaneFromEnv({
+      stateDir,
+      deviceFile: deviceFilePath({}),
+      signalUrl: typeof args['signal-url'] === 'string' ? args['signal-url'] : undefined,
+      signalToken: typeof args['signal-token'] === 'string' ? args['signal-token'] : undefined,
+      providerCommand: typeof args['provider-command'] === 'string' ? args['provider-command'] : undefined,
+      providerCwd: typeof args['provider-cwd'] === 'string' ? args['provider-cwd'] : undefined,
+      dataRetryDelayMs: Number.isFinite(Number(args['retry-delay-ms'])) ? Number(args['retry-delay-ms']) : 0,
+    });
+    if (built.ok !== true) fail(built.code ?? 'TEAM_DATA_PLANE_UNAVAILABLE', built.detail ?? null);
+    const sent = await (async () => {
+      try {
+        return await deliverArtifact({
+          stateDir,
+          dataPlane: built.dataPlane,
+          peer: args.peer,
+          taskId: 'merge-' + String(args.plan ?? 'plan').slice(0, 32),
+          kind: 'patch',
+          name: 'patches.json',
+          bytes: JSON.stringify(patches),
+        });
+      } finally {
+        await built.pool.stop();
+        built.dataPlane.close();
+      }
+    })();
+    if (sent.ok !== true) fail(sent.code ?? 'TEAM_DATA_P2P_EXHAUSTED', { alert: sent.alert ?? null, local: sent.local ?? null });
+    dataPlaneReport = {
+      transport: sent.transport,
+      channel: sent.channel,
+      peer: args.peer,
+      sha256: sent.sha256,
+      bytes: sent.bytes,
+    };
+  }
   const merged = mergePatches({ repoDir: repo, baseCommit, patches });
   if (merged.ok !== true) fail(merged.code ?? 'MERGE_FAILED', merged.detail ?? null);
   const dryRun = args.apply !== true;
-  print({ ok: true, dry_run: dryRun, integration_head: merged.integration_head, applied: merged.applied, target_ref: targetRef, expected_old: expectedOld });
+  print({ ok: true, dry_run: dryRun, integration_head: merged.integration_head, applied: merged.applied, target_ref: targetRef, expected_old: expectedOld, data_plane: dataPlaneReport });
   if (dryRun) { abortMerge({ repoDir: repo, worktree: merged.worktree }); process.exit(0); }
   if (typeof args.approval !== 'string') { abortMerge({ repoDir: repo, worktree: merged.worktree }); fail('MERGE_APPROVAL_REQUIRED', '--apply needs --approval <merge_approval_sha256>'); }
   const gate = loadMergeApproval({ stateDir, approvalSha: args.approval, repo, baseCommit, targetRef, expectedOld, integrationHead: merged.integration_head, planSha: typeof args.plan === 'string' ? args.plan : null });
@@ -249,7 +288,7 @@ if (command === 'merge') {
   const advanced = advanceTarget({ repoDir: repo, targetRef, expectedOld, newCommit: merged.integration_head, rollbackRef });
   abortMerge({ repoDir: repo, worktree: merged.worktree });
   if (advanced.ok !== true) fail(advanced.code ?? 'MERGE_CAS_FAILED', advanced.detail ?? null);
-  print({ ok: true, dry_run: false, integration_head: merged.integration_head, target_ref: targetRef, rollback_ref: rollbackRef });
+  print({ ok: true, dry_run: false, integration_head: merged.integration_head, target_ref: targetRef, rollback_ref: rollbackRef, data_plane: dataPlaneReport });
   process.exit(0);
 }
 

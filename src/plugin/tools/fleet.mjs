@@ -26,7 +26,7 @@ import { summarizeVersionDashboard } from '../version-gate.mjs';
 import { fingerprintOf } from '../operator-token.mjs';
 import { describeSharedConfig } from '../shared-config.mjs';
 
-import { AGENT_STATE_FILES, devicePathFor, inProcessAgentStatus, PROTOCOL_VERSION, readDevice, relayFailoverStatus, request, requestFleetJoin, requireRabbit, resolvedFleetKey, resolveGitAnchors, resolveToken, round, throwIfAborted, W2MError } from './shared.mjs';
+import { AGENT_STATE_FILES, devicePathFor, inProcessAgentStatus, inProcessWebRtcPool, PROTOCOL_VERSION, readDevice, relayFailoverStatus, request, requestFleetJoin, requireRabbit, resolvedFleetKey, resolveGitAnchors, resolveToken, round, throwIfAborted, W2MError } from './shared.mjs';
 
 /** How long `w2m_status`'s reachability probe may take, in milliseconds. */
 const PROBE_TIMEOUT_MS = 3_000;
@@ -143,6 +143,24 @@ async function readP2PStatus(cfg, runtime, peersAnnounced = null) {
     },
     last_error: runtime.error ?? runtime.events.last_error ?? status?.last_error ?? null,
     reason: runtime.reason,
+    // v3.5.8: the WebRTC data plane, separate from the UDP node. `preferred` is the delivery order
+    // `deliver.mjs` implements; `relay` is always the ledger. A null pool with a named `reason` is
+    // an honest "configured but not running", never indistinguishable from "not configured".
+    webrtc: {
+      enabled: cfg.webrtc?.enabled === true,
+      buildable: cfg.webrtc?.buildable === true,
+      reason: cfg.webrtc?.reason ?? null,
+      signal_url: typeof cfg.webrtc?.signal_url === 'string' && cfg.webrtc.signal_url !== ''
+        ? cfg.webrtc.signal_url.replace(/token=[^&]*/, 'token=<redacted>')
+        : null,
+      provider_command: cfg.webrtc?.provider_command || null,
+      data_max_attempts: cfg.webrtc?.data_max_attempts ?? null,
+      result_budget_ms: cfg.webrtc?.result_budget_ms ?? null,
+      preferred: 'webrtc-v1',
+      fallback: 'udp-v1',
+      relay_role: 'ledger-and-final-fallback',
+      pool: typeof inProcessWebRtcPool?.diagnostics === 'function' ? inProcessWebRtcPool.diagnostics() : null,
+    },
     // Whether the node has been started in this process yet. `running` alone cannot say: a node that
     // has not been asked to start and a node that failed to start both report `false`.
     started: runtime.start !== null,

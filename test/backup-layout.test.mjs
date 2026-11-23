@@ -8,7 +8,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 
 import {
   BackupLayoutError,
@@ -183,7 +183,7 @@ describe('backup layout: ensureLayout', () => {
     }
   });
 
-  it('reports a missing drive as BACKUP_DRIVE_MISSING, not as a permission problem', { skip: process.platform !== 'win32' }, () => {
+  it('reports a missing drive as BACKUP_DRIVE_MISSING, not as a permission problem', { skip: process.platform !== 'win32' ? 'drive letters are Windows-only' : false }, () => {
     const { cleanup } = tempDir('w2m-layout-drive-');
     try {
       // A drive letter that does not exist on the reference machine; the test names why it is skipped elsewhere.
@@ -219,10 +219,10 @@ describe('backup layout: descriptor and containment helpers', () => {
 
   it('derives every repository path from the root', () => {
     const paths = repoPaths('D:\\BackUP');
-    assert.equal(paths.descriptor, join('D:\\BackUP', DESCRIPTOR_FILE));
-    assert.equal(paths.objects, join('D:\\BackUP', REPO_DIRS.objects));
-    assert.equal(paths.snapshots, join('D:\\BackUP', REPO_DIRS.snapshots));
-    assert.equal(paths.index, join('D:\\BackUP', 'index.jsonl'));
+    assert.equal(paths.descriptor, join(resolve('D:\\BackUP'), DESCRIPTOR_FILE));
+    assert.equal(paths.objects, join(resolve('D:\\BackUP'), REPO_DIRS.objects));
+    assert.equal(paths.snapshots, join(resolve('D:\\BackUP'), REPO_DIRS.snapshots));
+    assert.equal(paths.index, join(resolve('D:\\BackUP'), 'index.jsonl'));
   });
 
   it('reports free space as a number or null, never throws', () => {

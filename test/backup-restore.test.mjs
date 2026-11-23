@@ -11,7 +11,7 @@ import fs from 'node:fs';
 import { join } from 'node:path';
 
 import { runBackup } from '../src/backup/engine.mjs';
-import { applyRestore, listPreRestoreSnapshots, planRestore, planRestoreFromArchive, prunePreRestoreSnapshots } from '../src/backup/restore.mjs';
+import { applyRestore, listPreRestoreSnapshots, planRestore as planRestoreRaw, planRestoreFromArchive, prunePreRestoreSnapshots } from '../src/backup/restore.mjs';
 import { compressFrame } from '../src/fix/zstd.mjs';
 import { diagnoseSessionBuffer } from '../src/util/session-validate.mjs';
 import { buildArchive } from '../src/backup/archive.mjs';
@@ -28,6 +28,16 @@ import {
 const PASSWORD = 'correct horse battery staple';
 const SESSION = 'session-aaaaaaaa-0001';
 const HARNESS = findHarnessInstallation();
+
+/** Apply a restore with static-only runtime evidence when this host has no Harness installation. */
+function applyRestoreTest(input) {
+  return applyRestore({ allowStaticValidation: true, ...input });
+}
+
+/** Apply a restore plan with static-only runtime evidence when this host has no Harness installation. */
+function planRestoreTest(input) {
+  return planRestoreRaw({ allowStaticValidation: true, ...input });
+}
 
 /** Run one backup of `home` into a new temporary repository. */
 function repoFor(home) {
@@ -58,12 +68,12 @@ describe('restore: the plan refuses what the gates refuse', () => {
     const repo = repoFor(formatOnly.home);
     const target = emptyTargetHome();
     try {
-      const plan = planRestore({ root: repo.dir, dshHome: target.home, password: PASSWORD, platform: 'linux', machineKey: false });
+      const plan = planRestoreRaw({ root: repo.dir, dshHome: target.home, password: PASSWORD, platform: 'linux', machineKey: false });
       assert.equal(plan.ok, false);
       const expected = HARNESS === null ? ['BACKUP_RUNTIME_UNAVAILABLE', 'BACKUP_RUNTIME_REJECTED'] : ['BACKUP_RUNTIME_REJECTED'];
       assert.ok(expected.includes(plan.reason_code), `${plan.reason_code}: ${plan.detail}`);
 
-      const allowed = planRestore({
+      const allowed = planRestoreTest({
         root: repo.dir,
         dshHome: target.home,
         password: PASSWORD,
@@ -96,7 +106,7 @@ describe('restore: the plan refuses what the gates refuse', () => {
       // P0: the snapshot carries `storages/workspace.json`, so the restore starts from the BACKUP document. The
       // live registry of the target home (a different workspace) is replaced by it, instead of failing on a slug
       // mismatch and demanding one `--workspace-path` per workspace.
-      const fromDocument = planRestore({ root: repo.dir, dshHome: other.home, password: PASSWORD, platform: 'linux', machineKey: false });
+      const fromDocument = planRestoreTest({ root: repo.dir, dshHome: other.home, password: PASSWORD, platform: 'linux', machineKey: false });
       assert.equal(fromDocument.ok, true, fromDocument.detail);
       assert.equal(fromDocument.registry_from_backup_document, true);
       assert.equal(fromDocument.registry.base_document_restored, true);
@@ -119,7 +129,7 @@ describe('restore: the plan refuses what the gates refuse', () => {
       assert.equal(attached.ok, true, attached.detail);
       assert.equal(attached.registry.assignments[0].workspace_id, 'restored-e-gpt');
 
-      const applied = applyRestore({ plan: fromDocument, dshHome: other.home });
+      const applied = applyRestoreTest({ plan: fromDocument, dshHome: other.home });
       assert.equal(applied.ok, true, applied.detail);
       assert.equal(applied.registry_from_backup_document, true);
       const registry = JSON.parse(fs.readFileSync(join(other.home, 'storages', 'workspace.json'), 'utf8'));
@@ -140,18 +150,18 @@ describe('restore: the round trip', () => {
     const repo = repoFor(source.home);
     const target = emptyTargetHome();
     try {
-      const plan = planRestore({ root: repo.dir, dshHome: target.home, password: PASSWORD, platform: 'linux', machineKey: false });
+      const plan = planRestoreTest({ root: repo.dir, dshHome: target.home, password: PASSWORD, platform: 'linux', machineKey: false });
       assert.equal(plan.ok, true, plan.detail);
       assert.equal(plan.summary.conflicts, 0);
       assert.equal(plan.summary.new, 1);
       assert.equal(plan.summary.runtime_verified, HARNESS === null ? 0 : 1);
 
-      const dry = applyRestore({ plan, dshHome: target.home, dryRun: true });
+      const dry = applyRestoreTest({ plan, dshHome: target.home, dryRun: true });
       assert.equal(dry.ok, true);
       assert.equal(dry.dry_run, true);
       assert.equal(fs.existsSync(logPath(target.home)), false, 'a dry run must not write the session');
 
-      const applied = applyRestore({ plan, dshHome: target.home });
+      const applied = applyRestoreTest({ plan, dshHome: target.home });
       assert.equal(applied.ok, true, applied.detail);
       assert.equal(applied.restored.length, 1);
       const written = fs.readFileSync(logPath(target.home));
@@ -176,12 +186,12 @@ describe('restore: the round trip', () => {
     fs.mkdirSync(join(target.home, 'sessions', '--E-GPT--', SESSION), { recursive: true });
     fs.writeFileSync(logPath(target.home), oldBytes);
     try {
-      const plan = planRestore({ root: repo.dir, dshHome: target.home, password: PASSWORD, platform: 'linux', machineKey: false });
+      const plan = planRestoreTest({ root: repo.dir, dshHome: target.home, password: PASSWORD, platform: 'linux', machineKey: false });
       assert.equal(plan.ok, true, plan.detail);
       assert.equal(plan.summary.conflicts, 1);
       assert.equal(plan.candidates[0].resolution, 'backup-and-replace');
 
-      const applied = applyRestore({ plan, dshHome: target.home });
+      const applied = applyRestoreTest({ plan, dshHome: target.home });
       assert.equal(applied.ok, true, applied.detail);
       assert.ok(fs.readFileSync(logPath(target.home)).equals(runtimeValidSessionLog(SESSION)));
       const copies = fs.readdirSync(plan.pre_restore.dir, { recursive: true }).map(String);
@@ -203,9 +213,9 @@ describe('restore: the round trip', () => {
     fs.mkdirSync(join(target.home, 'sessions', '--E-GPT--', SESSION), { recursive: true });
     fs.writeFileSync(logPath(target.home), oldBytes);
     try {
-      const plan = planRestore({ root: repo.dir, dshHome: target.home, password: PASSWORD, platform: 'linux', machineKey: false, keepBoth: true });
+      const plan = planRestoreTest({ root: repo.dir, dshHome: target.home, password: PASSWORD, platform: 'linux', machineKey: false, keepBoth: true });
       assert.equal(plan.candidates[0].resolution, 'keep-both');
-      const applied = applyRestore({ plan, dshHome: target.home });
+      const applied = applyRestoreTest({ plan, dshHome: target.home });
       assert.equal(applied.ok, true, applied.detail);
       assert.ok(fs.readFileSync(logPath(target.home)).equals(oldBytes), 'the original must be untouched');
       const restored = fs.readdirSync(join(target.home, 'sessions', '--E-GPT--', SESSION)).filter((name) => name.includes('.restored-'));
@@ -232,10 +242,10 @@ describe('restore: the round trip', () => {
     const repo = repoFor(home.home);
     const target = emptyTargetHome();
     try {
-      const plan = planRestore({ root: repo.dir, dshHome: target.home, password: PASSWORD, platform: 'linux', machineKey: false });
+      const plan = planRestoreTest({ root: repo.dir, dshHome: target.home, password: PASSWORD, platform: 'linux', machineKey: false });
       assert.equal(plan.ok, true, plan.detail);
       assert.equal(plan.candidates.length, 2);
-      const applied = applyRestore({ plan, dshHome: target.home });
+      const applied = applyRestoreTest({ plan, dshHome: target.home });
       assert.equal(applied.ok, true, applied.detail);
       const registry = JSON.parse(fs.readFileSync(join(target.home, 'storages', 'workspace.json'), 'utf8'));
       assert.deepEqual(registry.tables.workspaces.w1.sessionIds.sort(), ['session-aaaaaaaa-0001', 'session-bbbbbbbb-0002'].sort());
@@ -257,12 +267,12 @@ describe('restore: the round trip', () => {
       fs.mkdirSync(join(fresh.dir, 'sessions'), { recursive: true });
       fs.writeFileSync(join(fresh.dir, 'sessions', '.keep'), '');
       fs.rmSync(join(fresh.dir, 'sessions', '.keep'));
-      const plan = planRestore({ root: repo.dir, dshHome: fresh.dir, password: PASSWORD, platform: 'linux', machineKey: false });
+      const plan = planRestoreTest({ root: repo.dir, dshHome: fresh.dir, password: PASSWORD, platform: 'linux', machineKey: false });
       assert.equal(plan.ok, true, plan.detail);
       assert.equal(plan.registry_from_backup_document, true);
       assert.equal(plan.registry.created_document, true);
       assert.equal(plan.files_summary.registry, 1);
-      const applied = applyRestore({ plan, dshHome: fresh.dir });
+      const applied = applyRestoreTest({ plan, dshHome: fresh.dir });
       assert.equal(applied.ok, true, applied.detail);
       assert.equal(applied.files.registry, 1);
       assert.ok(fs.readFileSync(logPath(fresh.dir)).equals(runtimeValidSessionLog(SESSION)));
@@ -299,13 +309,13 @@ describe('restore: the round trip', () => {
     const repo = repoFor(source.home);
     const target = emptyTargetHome();
     try {
-      const first = planRestore({ root: repo.dir, dshHome: target.home, password: PASSWORD, platform: 'linux', machineKey: false });
-      applyRestore({ plan: first, dshHome: target.home });
+      const first = planRestoreTest({ root: repo.dir, dshHome: target.home, password: PASSWORD, platform: 'linux', machineKey: false });
+      applyRestoreTest({ plan: first, dshHome: target.home });
       const before = fs.statSync(logPath(target.home)).mtimeMs;
-      const second = planRestore({ root: repo.dir, dshHome: target.home, password: PASSWORD, platform: 'linux', machineKey: false });
+      const second = planRestoreTest({ root: repo.dir, dshHome: target.home, password: PASSWORD, platform: 'linux', machineKey: false });
       assert.equal(second.ok, true, second.detail);
       assert.equal(second.candidates[0].conflict, 'identical');
-      const applied = applyRestore({ plan: second, dshHome: target.home });
+      const applied = applyRestoreTest({ plan: second, dshHome: target.home });
       assert.equal(applied.ok, true);
       assert.equal(applied.restored.length, 0);
       assert.equal(applied.skipped, 1);
@@ -332,7 +342,7 @@ describe('restore: the round trip', () => {
       assert.equal(plan.ok, true, plan.detail);
       assert.equal(plan.source.kind, 'archive');
       assert.equal(plan.snapshot_id, plan.source.snapshot_id);
-      const applied = applyRestore({ plan, dshHome: target.home });
+      const applied = applyRestoreTest({ plan, dshHome: target.home });
       assert.equal(applied.ok, true, applied.detail);
       assert.ok(fs.readFileSync(logPath(target.home)).equals(runtimeValidSessionLog(SESSION)));
       const registry = JSON.parse(fs.readFileSync(join(target.home, 'storages', 'workspace.json'), 'utf8'));
@@ -365,11 +375,11 @@ describe('restore: the round trip', () => {
     try {
       fs.mkdirSync(join(target.home, 'sessions', '--E-GPT--', SESSION), { recursive: true });
       fs.writeFileSync(logPath(target.home), sessionLog(SESSION));
-      const plan = planRestore({ root: repo.dir, dshHome: target.home, password: PASSWORD, platform: 'linux', machineKey: false });
+      const plan = planRestoreTest({ root: repo.dir, dshHome: target.home, password: PASSWORD, platform: 'linux', machineKey: false });
       assert.equal(plan.ok, true, plan.detail);
       // The client appends between plan and apply.
       fs.writeFileSync(logPath(target.home), sessionLog(SESSION).length > 0 ? Buffer.concat([sessionLog(SESSION), Buffer.from('appended')]) : sessionLog(SESSION));
-      const applied = applyRestore({ plan, dshHome: target.home });
+      const applied = applyRestoreTest({ plan, dshHome: target.home });
       assert.equal(applied.ok, false);
       assert.equal(applied.reason_code, 'BACKUP_RESTORE_TARGET_CHANGED');
       assert.match(applied.detail, /changed after the plan/u);
@@ -389,14 +399,14 @@ describe('restore: the round trip', () => {
       const liveBytes = sessionLog(SESSION);
       fs.mkdirSync(join(target.home, 'sessions', '--E-GPT--', SESSION), { recursive: true });
       fs.writeFileSync(logPath(target.home), liveBytes);
-      const plan = planRestore({ root: repo.dir, dshHome: target.home, password: PASSWORD, platform: 'linux', machineKey: false });
+      const plan = planRestoreTest({ root: repo.dir, dshHome: target.home, password: PASSWORD, platform: 'linux', machineKey: false });
       assert.equal(plan.ok, true, plan.detail);
       assert.equal(plan.candidates[0].conflict, 'differs');
 
       // The seam below writes one legal event frame *after* the restore wrote the snapshot bytes, exactly like the
       // running client would -- the incident that motivated this repair.
       const tailEvent = compressFrame(Buffer.from(JSON.stringify({ type: 'permission/preset', seq: 2, time: Date.now(), data: { preset: 'workspace-write' } }) + '\n', 'utf8'));
-      const applied = applyRestore({
+      const applied = applyRestoreTest({
         plan,
         dshHome: target.home,
         afterWrite: ({ target: file }) => {
@@ -425,7 +435,7 @@ describe('restore: the round trip', () => {
     const repo = repoFor(source.home);
     const target = emptyTargetHome();
     try {
-      const plan = planRestore({ root: repo.dir, dshHome: target.home, password: PASSWORD, platform: 'linux', machineKey: false });
+      const plan = planRestoreTest({ root: repo.dir, dshHome: target.home, password: PASSWORD, platform: 'linux', machineKey: false });
       assert.equal(plan.ok, true, plan.detail);
       // Corrupt the object the plan is about to restore from.
       const objectDir = join(repo.dir, 'objects');
@@ -438,7 +448,7 @@ describe('restore: the round trip', () => {
       bytes[bytes.length - 1] ^= 0xff;
       fs.writeFileSync(file, bytes);
 
-      const after = planRestore({ root: repo.dir, dshHome: target.home, password: PASSWORD, platform: 'linux', machineKey: false });
+      const after = planRestoreTest({ root: repo.dir, dshHome: target.home, password: PASSWORD, platform: 'linux', machineKey: false });
       assert.equal(after.ok, false);
       assert.ok(['BACKUP_DECRYPT_AUTH_FAILED', 'BACKUP_MANIFEST_DIGEST_MISMATCH'].includes(after.reason_code), after.reason_code);
       assert.equal(after.reason_code, 'BACKUP_DECRYPT_AUTH_FAILED');
@@ -457,10 +467,10 @@ describe('restore: the round trip', () => {
       const run = runBackup({ root: join(dir, 'repo'), dshHome: source.home, platform: 'linux', machineKey: false });
       assert.equal(run.ok, true, run.detail);
       assert.equal(run.encryption, 'none');
-      const plan = planRestore({ root: join(dir, 'repo'), dshHome: target.home, platform: 'linux', machineKey: false });
+      const plan = planRestoreTest({ root: join(dir, 'repo'), dshHome: target.home, platform: 'linux', machineKey: false });
       assert.equal(plan.ok, true, plan.detail);
       assert.equal(plan.summary.new, 1);
-      const applied = applyRestore({ plan, dshHome: target.home });
+      const applied = applyRestoreTest({ plan, dshHome: target.home });
       assert.equal(applied.ok, true, applied.detail);
       assert.equal(applied.restored.length, 1);
       assert.ok(fs.readFileSync(logPath(target.home)).equals(runtimeValidSessionLog(SESSION)), 'the restored bytes must equal the source');

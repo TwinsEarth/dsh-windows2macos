@@ -523,13 +523,17 @@ describe('subplugin: the route and the timer', () => {
         const archived = await archive.json();
         assert.equal(archived.ok, true, archived.detail);
 
-        const restore = await post(BACKUP_RESTORE_ROUTE_PATH, { confirm: RESTORE_CONFIRM_TOKEN });
+        // This case measures the Windows machine envelope, the restore plan and the archive. The
+        // runtime verdict belongs to backup runtime validation, not to DPAPI, and this host may not
+        // have a Harness installation; ask for static-only evidence so the route's restore gate does
+        // not turn an absent runtime into a failure of the property under test.
+        const restore = await post(BACKUP_RESTORE_ROUTE_PATH, { confirm: RESTORE_CONFIRM_TOKEN, allowStaticValidation: true });
         const plan = await restore.json();
         assert.equal(plan.ok, true, plan.detail);
         assert.equal(plan.summary.sessions, 1);
         assert.equal(plan.summary.conflicts, 0, 'restoring into the same home sees its own log as identical');
 
-        const applied = await (await post(BACKUP_RESTORE_ROUTE_PATH, { confirm: RESTORE_CONFIRM_TOKEN, apply: true })).json();
+        const applied = await (await post(BACKUP_RESTORE_ROUTE_PATH, { confirm: RESTORE_CONFIRM_TOKEN, apply: true, allowStaticValidation: true })).json();
         assert.equal(applied.ok, true, applied.detail);
         assert.equal(applied.skipped, 1, 'an identical log must be skipped, not rewritten');
         assert.equal(applied.registry_recheck?.scheduled, true, 'G2 half three: the registry is re-checked after the client saves');

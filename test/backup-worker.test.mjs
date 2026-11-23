@@ -422,6 +422,10 @@ describe('backup worker: supervisor, progress file and named failures', () => {
 
   it('turns a silent worker into BACKUP_WORKER_TIMEOUT and terminates it', async () => {
     const { dir: stateHome, cleanup: cleanState } = tempDir('w2m-worker-timeout-state-');
+    // The runner's timeout is unref'd on purpose so a backup cannot keep a host process alive forever.
+    // This fake worker owns no real handle, so the test must hold the event loop open itself or Node
+    // resolves it before the 40 ms budget can fire and cancels the assertion.
+    const keepAlive = setInterval(() => {}, 1_000);
     try {
       const worker = fakeWorker();
       const { lines, logger } = recordingLogger();
@@ -436,6 +440,7 @@ describe('backup worker: supervisor, progress file and named failures', () => {
       assert.ok(Date.now() - startedAt >= 30, 'the timeout is the configured budget');
       assert.deepEqual(lines, [], 'a timeout is a return value, not a thrown warning');
     } finally {
+      clearInterval(keepAlive);
       cleanState();
     }
   });

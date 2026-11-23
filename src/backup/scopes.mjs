@@ -204,8 +204,10 @@ export function resolveBackupScopes(value) {
 
 /** True when `file` resolves inside `root` (both absolute, compared by resolved path, not by string prefix). */
 export function isInside(root, file) {
-  const rel = path.relative(path.resolve(root), path.resolve(file));
-  return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
+  const windowsShaped = (candidate) => /^[A-Za-z]:[\\/]/u.test(candidate) || candidate.startsWith('\\\\');
+  const pathApi = windowsShaped(root) || windowsShaped(file) ? path.win32 : path;
+  const rel = pathApi.relative(pathApi.resolve(root), pathApi.resolve(file));
+  return rel !== '' && !rel.startsWith('..') && !pathApi.isAbsolute(rel);
 }
 
 /** A dirent list, sorted by name, or `[]` when the directory cannot be read. */

@@ -391,14 +391,21 @@ export function normalizeConfig(config = {}, deps = {}) {
       detail: `backupWorkerTimeoutMs must be a positive integer number of milliseconds, got ${JSON.stringify(config.backupWorkerTimeoutMs)}`,
     };
   }
+  // `deps.platform` is the platform the configuration describes, not necessarily the host running the request.
+  // Resolving with the host's parser turns `E:\custom` into `<cwd>/E:\custom` on a POSIX test runner, so the
+  // same row would mean different things depending on where it was validated.
+  const resolveForPlatform = (value) => {
+    const windowsShaped = /^[A-Za-z]:[\\/]/u.test(value) || value.startsWith('\\\\');
+    return (platform === 'win32' || windowsShaped ? path.win32 : path.posix).resolve(value);
+  };
   const dshHome = typeof config.dshHome === 'string' && config.dshHome.trim() !== ''
-    ? path.resolve(config.dshHome.trim())
+    ? resolveForPlatform(config.dshHome.trim())
     : resolveDshHome(env);
 
   return {
     ok: true,
     enabled: schedule.enabled,
-    backup_dir: path.resolve(dirValue),
+    backup_dir: resolveForPlatform(dirValue),
     times: schedule.times,
     time_zone: schedule.time_zone,
     catch_up_ms: schedule.catch_up_ms,

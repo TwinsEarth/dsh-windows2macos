@@ -76,9 +76,20 @@ export const SESSION_HEADER_SCAN_CAP_BYTES = 1024 * 1024;
 /** Chunk size of the bounded header read: small enough that the cap, not the file size, bounds the buffer. */
 const HEADER_READ_CHUNK_BYTES = 64 * 1024;
 
-/** Convert an absolute path under `root` into a forward-slash relative path. */
+/**
+ * Convert an absolute path under `root` into a forward-slash relative path.
+ *
+ * `path.relative` is the platform's own parser: on POSIX it reads `C:\DSH` as a relative name, so a Windows-shaped
+ * pair would turn into `../C:\DSH\...` there. The pair is recognised by shape and routed to `path.win32`, which
+ * makes this conversion a fact about the paths rather than about the host running the tests.
+ */
 export function toRel(root, file) {
-  return path.relative(path.resolve(root), path.resolve(file)).split(path.sep).join('/');
+  const windowsShaped = (candidate) => /^[A-Za-z]:[\\/]/u.test(candidate) || candidate.startsWith('\\\\');
+  const relative =
+    windowsShaped(root) || windowsShaped(file)
+      ? path.win32.relative(root, file)
+      : path.relative(path.resolve(root), path.resolve(file));
+  return relative.split('\\').join('/');
 }
 
 /**

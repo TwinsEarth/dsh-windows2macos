@@ -44,6 +44,8 @@ import { loadOrCreateIdentity, saveDeviceToken } from '../../agent/identity.mjs'
 import { probeCapsDetailed, detectPlatform } from '../../agent/caps.mjs';
 import { resolveStateDir } from '../../util/cli.mjs';
 import { parseServer } from '../../agent/stun.mjs';
+import { createRelayPeerKeyResolver, createWebRtcTransportPool } from '../../agent/webrtc/pool.mjs';
+import { setSharedWebRtcPool } from '../webrtc-pool-registry.mjs';
 import { findProfileDir } from '../auto-update.mjs';
 import { readOperatorToken } from '../operator-token.mjs';
 import { schemaProblems, strayParameterProblems } from '../schema-spec.mjs';
@@ -473,6 +475,77 @@ export function configuredStateDir(config = {}, env = process.env) {
   return path.join(home, 'xclient');
 }
 
+/**
+ * Normalize the optional WebRTC data-plane block.
+ *
+ * The block is nested (`config.webrtc`) so a profile that only wants the relay does not grow ten
+ * unrelated top-level keys. A missing `signalUrl` does NOT disable silently: `enabled` stays true
+ * and the pool is simply not built, with `reason` naming the missing setting. That is what lets
+ * `w2m_status` say "WebRTC is configured but has no signaling server" instead of pretending the
+ * feature does not exist.
+ *
+ * @param {Record<string, unknown>} config
+ * @param {Record<string,string|undefined>} [env]
+ * @returns {object}
+ */
+export function normalizeWebRtcConfig(config = {}, env = process.env) {
+  const raw = config !== null && typeof config === 'object' && !Array.isArray(config) ? config : {};
+  const int = (value, fallback, min = 0) => {
+    const number = Number(value);
+    return Number.isFinite(number) && number >= min ? number : fallback;
+  };
+  const string = (value, fallback = '') => (typeof value === 'string' ? value.trim() : fallback);
+  const fromEnv = (name, fallback = '') => string(env?.[name], fallback);
+  const enabled = raw.enabled !== false && fromEnv('W2M_WEBRTC_ENABLED', '1') !== '0';
+  const signalUrl = string(raw.signalUrl, fromEnv('W2M_WEBRTC_SIGNAL_URL', ''));
+  const signalToken = string(raw.signalToken, fromEnv('W2M_WEBRTC_SIGNAL_TOKEN', ''));
+  const providerCommand = string(raw.providerCommand, fromEnv('W2M_WEBRTC_PROVIDER_COMMAND', ''));
+  const providerArgs = Array.isArray(raw.providerArgs)
+    ? raw.providerArgs.map(String)
+    : (() => {
+        const encoded = fromEnv('W2M_WEBRTC_PROVIDER_ARGS', '');
+        if (encoded === '') return [];
+        try {
+          const parsed = JSON.parse(encoded);
+          return Array.isArray(parsed) ? parsed.map(String) : [];
+        } catch {
+          return [];
+        }
+      })();
+  const providerCwd = string(raw.providerCwd, fromEnv('W2M_WEBRTC_PROVIDER_CWD', ''));
+  const iceServers = Array.isArray(raw.iceServers) ? raw.iceServers : [];
+  return {
+    enabled,
+    signal_url: signalUrl,
+    signal_token: signalToken,
+    provider_command: providerCommand,
+    provider_args: providerArgs,
+    provider_cwd: providerCwd,
+    ice_servers: iceServers,
+    prefer_p2p: raw.preferP2p !== false,
+    allow_relay: raw.allowRelay !== false,
+    max_rtt_ms: int(raw.maxRttMs, 350, 1),
+    connect_timeout_ms: int(raw.connectTimeoutMs, 30_000, 1),
+    handshake_timeout_ms: int(raw.handshakeTimeoutMs, 15_000, 1),
+    peer_timeout_ms: int(raw.peerTimeoutMs, 20_000, 1),
+    stats_poll_ms: int(raw.statsPollMs, 2_000, 0),
+    max_fragment_bytes: int(raw.maxFragmentBytes, 16 * 1024, 64),
+    data_max_attempts: int(raw.dataMaxAttempts, 33, 1),
+    ack_timeout_ms: int(raw.ackTimeoutMs, 500, 1),
+    retry_delay_ms: int(raw.retryDelayMs, 100, 0),
+    result_budget_ms: int(raw.resultBudgetMs, 5_000, 1),
+    // `true` only when the pool can actually be constructed. `reason` explains why not.
+    buildable: enabled && signalUrl !== '' && providerCommand !== '',
+    reason: !enabled
+      ? 'WebRTC data plane is disabled in config (webrtc.enabled: false)'
+      : signalUrl === ''
+        ? 'webrtc.signalUrl (or W2M_WEBRTC_SIGNAL_URL) is not set, so no signaling room can be joined'
+        : providerCommand === ''
+          ? 'webrtc.providerCommand (or W2M_WEBRTC_PROVIDER_COMMAND) is not set, so no WebRTC engine can be spawned'
+          : null,
+  };
+}
+
 export function readConfig(config = {}) {
   let operatorTokenSource = null;
   const cwd = process.cwd();
@@ -742,6 +815,9 @@ export function readConfig(config = {}) {
     p2pPortError: p2pPortResult.ok ? null : `P2P_PORT_INVALID: ${p2pPortResult.reason}`,
     p2pPublicPort: p2pPublicPortResult.ok ? p2pPublicPortResult.port : null,
     stunServers: stunList,
+    // v3.5.8: the WebRTC data plane. Nested so the relay-only profile stays short; `buildable` is
+    // the one bit `startLocalStack` uses, and `reason` is what status prints when it is false.
+    webrtc: normalizeWebRtcConfig(config.webrtc),
   };
 }
 
@@ -1704,6 +1780,18 @@ function toRequestUrl(url) {
 export let inProcessAgentStatus = null;
 
 /**
+ * The WebRTC pool owned by this process, when `startLocalStack` built one.
+ *
+ * The dispatcher half (`w2m_run`) reuses it rather than constructing a second pool on the same
+ * machine id: a signaling room has exactly one `host` and one `client`, and two pools for one
+ * machine would claim the same slot and make every pair flap. Null when this process does not
+ * own an agent (the agent may be a separate process) or when no signaling URL is configured.
+ *
+ * @type {object|null}
+ */
+export let inProcessWebRtcPool = null;
+
+/**
  * A way back into the fleet-join sequence, when the plugin started the agent itself.
  *
  * Set by {@link startLocalStack} and cleared by its disposer. Null in the normal case, where the
@@ -2594,6 +2682,53 @@ async function startLocalStack(ctx, cfg) {
     identityOptions.identity = loaded.identity;
 
     /**
+     * v3.5.8: build the one WebRTC pool this process owns, before the agent is created.
+     *
+     * The agent borrows it through the `webrtcPool` option; the dispatcher half reaches it through
+     * `inProcessWebRtcPool`. A machine that also runs a separate agent process must not build this
+     * pool here -- two pools on one machine id claim the same signaling role -- so `buildable` is
+     * decided from explicit configuration and `inProcessWebRtcPool` stays null when the agent is not
+     * started in-process.
+     */
+    let webrtcPool = null;
+    if (cfg.webrtc?.buildable === true) {
+      const keyLoad = loadDeviceKey(null, loaded.path);
+      const relayTransport = createP2PTransport(cfg);
+      const built = createWebRtcTransportPool({
+        machineId: loaded.identity.machine_id,
+        signalUrl: cfg.webrtc.signal_url,
+        signalToken: cfg.webrtc.signal_token,
+        deviceKey: keyLoad.key,
+        deviceKeyDir: path.dirname(loaded.path),
+        allowCreateDeviceKey: false,
+        resolvePeerKey: createRelayPeerKeyResolver({ getJson: relayTransport.getJson }),
+        providerCommand: cfg.webrtc.provider_command,
+        providerArgs: cfg.webrtc.provider_args,
+        providerCwd: cfg.webrtc.provider_cwd,
+        iceServers: cfg.webrtc.ice_servers,
+        preferP2p: cfg.webrtc.prefer_p2p,
+        allowRelay: cfg.webrtc.allow_relay,
+        maxRttMs: cfg.webrtc.max_rtt_ms,
+        connectTimeoutMs: cfg.webrtc.connect_timeout_ms,
+        handshakeTimeoutMs: cfg.webrtc.handshake_timeout_ms,
+        peerTimeoutMs: cfg.webrtc.peer_timeout_ms,
+        statsPollMs: cfg.webrtc.stats_poll_ms,
+        maxFragmentBytes: cfg.webrtc.max_fragment_bytes,
+      });
+      if (built.ok === true) {
+        webrtcPool = built.pool;
+        inProcessWebRtcPool = built.pool;
+        setSharedWebRtcPool(built.pool);
+        ctx.logger?.info?.(`w2m: WebRTC pool ready (${cfg.webrtc.signal_url.replace(/token=[^&]*/, 'token=<redacted>')})`);
+      } else {
+        cfg.webrtc.reason = `WEBRTC_POOL_BAD_CONFIG: ${built.detail}`;
+        ctx.logger?.warn?.(`w2m: WebRTC pool not built (${built.code}: ${built.detail})`);
+      }
+    } else if (cfg.webrtc?.reason) {
+      ctx.logger?.info?.(`w2m: WebRTC data plane inactive: ${cfg.webrtc.reason}`);
+    }
+
+    /**
      * v0.8.8: report what this machine IS, not just that it exists.
      *
      * `createAgent` accepts `platform` and `caps`, and the CLI has always supplied them. This path
@@ -2633,6 +2768,13 @@ async function startLocalStack(ctx, cfg) {
       allowedCommands: cfg.allowedCommands,
       // v1.2.6: on by default; a profile may turn it off for debugging, and the envelope then says `unredacted: true`.
       redactOutput: cfg.redactOutput !== false,
+      // v3.5.8: WebRTC is the preferred direct result path; `deliver.mjs` falls back to UDP and
+      // always posts the envelope to the relay. Null when this process built no pool.
+      webrtcPool,
+      webrtcDataMaxAttempts: cfg.webrtc?.data_max_attempts,
+      webrtcAckTimeoutMs: cfg.webrtc?.ack_timeout_ms,
+      webrtcRetryDelayMs: cfg.webrtc?.retry_delay_ms,
+      webrtcResultBudgetMs: cfg.webrtc?.result_budget_ms,
     });
     /**
      * v0.8.9: derive the fleet key, RETRYING until the account actually answers.
@@ -3343,7 +3485,16 @@ async function startLocalStack(ctx, cfg) {
     }
     ensureFleetJoin = null;
     inProcessAgentStatus = null;
+    inProcessWebRtcPool = null;
+    setSharedWebRtcPool(null);
     await agent.stop();
+    if (webrtcPool !== null) {
+      try {
+        await webrtcPool.stop();
+      } catch (error) {
+        ctx.logger?.warn?.('w2m: WebRTC pool close failed: ' + (error instanceof Error ? error.message : String(error)));
+      }
+    }
     // v1.6.7: `relay` is only a real relay object when THIS stack started a local relay; a remote-
     // relay stack has null here. The unconditional close() threw, which is what made the first
     // failover attempt stop the stack and never restart it.

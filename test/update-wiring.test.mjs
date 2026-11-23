@@ -53,12 +53,12 @@ import { findProfileDir } from '../src/plugin/auto-update.mjs';
 const cleanup = [];
 const previousDeviceFile = process.env.DSH_DEVICE_FILE;
 after(() => {
-  for (const dir of cleanup) rmSync(dir, { recursive: true, force: true });
+  for (const dir of cleanup) rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   // Put the environment back: a leaked variable would silently redirect the identity of anything that runs after
   // this file in the same process.
   if (previousDeviceFile === undefined) delete process.env.DSH_DEVICE_FILE;
   else process.env.DSH_DEVICE_FILE = previousDeviceFile;
-  rmSync(deviceDir, { recursive: true, force: true });
+  rmSync(deviceDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 /**

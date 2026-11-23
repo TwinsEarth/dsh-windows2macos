@@ -22,6 +22,7 @@ state/
 e2e-tmp/
 test-tmp/
 coverage/
+.matrix/
 
 # Build output. The release tarball is uploaded to the GitHub Release as an
 # asset rather than committed: a binary in the tree would be a second copy to
@@ -43,4 +44,7 @@ desktop.ini
 # Scratch scripts from live probing. Kept out of the tree: they are throwaway diagnostics,
 # not part of the product, and git add -A would otherwise commit them (which it did once).
 _*.mjs
+
+# Machine-local operator note; scripts/preflight.mjs excludes it from the package too.
+/WORKSPACE.md
 

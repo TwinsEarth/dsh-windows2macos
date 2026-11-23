@@ -171,6 +171,17 @@ const IN_PROCESS_INJECT = Array.from(new Set(injected));
 /** The measured set: what the artifact actually registers. */
 const REGISTERED = registered.map((d) => d.name).sort();
 
+/**
+ * The opt-in sub-plugin tool names, measured from their package-facing entries rather than copied
+ * from the documents. They are not in `REGISTERED` because the root entry deliberately does not
+ * mount them; a fleet install must not start a WebRTC engine or read a Teams room.
+ */
+const SUBPLUGIN_TOOL_NAMES = new Set();
+for (const entry of ['lib/teams-plugin.js', 'lib/p2p-webrtc-plugin.js']) {
+  const plugin = await import(pathToFileURL(join(ROOT, entry)).href);
+  for (const toolName of plugin.TOOL_NAMES ?? []) SUBPLUGIN_TOOL_NAMES.add(toolName);
+}
+
 // ---------------------------------------------------------------------------------------------
 // The claimed side: tool names and tool counts read out of the documents
 // ---------------------------------------------------------------------------------------------
@@ -198,6 +209,7 @@ function toolNamesIn(text) {
   const names = new Set();
   for (const [match] of text.matchAll(TOOL_TOKEN)) {
     if (METRIC_IDS.includes(match)) continue;
+    if (SUBPLUGIN_TOOL_NAMES.has(match)) continue;
     names.add(match);
   }
   return names;
@@ -1728,6 +1740,7 @@ describe('the documentation scan covers every shipped document, in both directio
       [],
       `shipped documents name tools that do not exist:\n  ${offenders.join('\n  ')}\n` +
         `registered: ${REGISTERED.join(', ')}\n` +
+        `exempt as opt-in sub-plugins: ${[...SUBPLUGIN_TOOL_NAMES].sort().join(', ')}\n` +
         `exempt as metrics (from src/relay/metrics.mjs): ${METRIC_IDS.join(', ')}`,
     );
   });

@@ -153,10 +153,14 @@ export function resolveBackupDir(options = {}) {
   if (explicit !== null && typeof explicit !== 'string') {
     throw new BackupLayoutError(LAYOUT_CODES.UNRESOLVED, 'backupDir must be a string when it is given');
   }
-  if (explicit !== null && explicit.trim() !== '') return path.resolve(explicit);
+  const resolveFor = (value) => {
+    const windowsShaped = /^[A-Za-z]:[\\/]/u.test(value) || value.startsWith('\\\\');
+    return (options.platform === 'win32' || windowsShaped ? path.win32 : path).resolve(value);
+  };
+  if (explicit !== null && explicit.trim() !== '') return resolveFor(explicit);
   const fromEnv = env.W2M_BACKUP_DIR;
-  if (typeof fromEnv === 'string' && fromEnv.trim() !== '') return path.resolve(fromEnv);
-  return path.resolve(defaultBackupDir({ platform: options.platform, home: options.home }));
+  if (typeof fromEnv === 'string' && fromEnv.trim() !== '') return resolveFor(fromEnv);
+  return resolveFor(defaultBackupDir({ platform: options.platform, home: options.home }));
 }
 
 /**
@@ -191,10 +195,12 @@ export function repoPaths(root) {
  * @returns {boolean}
  */
 export function isInside(parent, child) {
-  const from = path.resolve(parent);
-  const to = path.resolve(child);
-  const rel = path.relative(from, to);
-  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+  const windowsShaped = (candidate) => /^[A-Za-z]:[\\/]/u.test(candidate) || candidate.startsWith('\\\\');
+  const pathApi = windowsShaped(parent) || windowsShaped(child) ? path.win32 : path;
+  const from = pathApi.resolve(parent);
+  const to = pathApi.resolve(child);
+  const rel = pathApi.relative(from, to);
+  return rel === '' || (!rel.startsWith('..') && !pathApi.isAbsolute(rel));
 }
 
 /** Read the descriptor, or `null` when it does not exist. @throws {BackupLayoutError} when unreadable. */

@@ -207,6 +207,10 @@ export const P2P_OPENED_BY = Object.freeze({
   DISPATCHER_PUNCH: 'dispatcher-punch',
   SIMULTANEOUS_PUNCH: 'simultaneous-punch',
   RESULT_REVERSE_DIAL: 'result-reverse-dial',
+  // v3.5.8: the result travelled over the WebRTC DataChannel pool. It is distinct from a UDP
+  // punch because "WebRTC worked" and "UDP hole punching worked" are different operational facts,
+  // and an operator debugging a cross-network pair needs to know which one carried the bytes.
+  WEBRTC_DATA_CHANNEL: 'webrtc-data-channel',
 });
 
 /** Required envelope fields (§5.1). Missing any one makes a result unverifiable. */
@@ -484,6 +488,15 @@ export function p2pDeliveryMark(value = {}) {
     asked: value.asked === true,
     rtt_ms: typeof value.rtt_ms === 'number' && Number.isFinite(value.rtt_ms) ? value.rtt_ms : null,
     error: typeof value.error === 'string' && value.error !== '' ? value.error : null,
+    // v3.5.8: which direct stack actually carried the result. `null` when no direct attempt ran or
+    // when the attempt failed; `'webrtc-v1'` / `'udp-v1'` when one delivered. Kept separate from
+    // `path` because a reader that only knows `p2p` must keep working, while a fleet debugging a
+    // cross-network pair needs the exact stack.
+    transport: typeof value.transport === 'string' && value.transport !== '' ? value.transport : null,
+    attempts: Number.isInteger(value.attempts) && value.attempts >= 0 ? value.attempts : 0,
+    // The attempts made before a fallback delivered, when the preferred stack failed first. Kept
+    // as a fact rather than a boolean so "WebRTC failed once then UDP worked" is readable.
+    fallback_from: typeof value.fallback_from === 'string' && value.fallback_from !== '' ? value.fallback_from : null,
   };
 }
 

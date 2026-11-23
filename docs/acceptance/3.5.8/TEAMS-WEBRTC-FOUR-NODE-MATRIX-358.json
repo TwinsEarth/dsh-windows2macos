@@ -1,0 +1,37 @@
+{
+  "version": "3.5.8",
+  "case": "TEAMS-WEBRTC-FOUR-NODE-MATRIX-358",
+  "kind": "positive",
+  "machines": [
+    "cb8423db-69b0-44b5-ac8a-a452b9edffd9",
+    "b1b19d49-20f1-4cdc-986e-f5630a5cd6f2",
+    "1d1c0cd2-0268-456d-8ef1-be7116713e8b",
+    "f4961153-3280-4c4e-b117-881b232e2066"
+  ],
+  "executed_at": "2026-11-23T08:55:00+08:00",
+  "executor": "agent",
+  "task_id": "matrix-send",
+  "requirement": "v3.5.8 release candidate: prove the Teams WebRTC data plane sends an artifact end to end across four machines in both directions, returns only after the receiver acknowledges SHA-256 + sink completion, and never falls back to Relay when the 33-attempt budget is exhausted.",
+  "commands": [
+    ["node", "scripts/webrtc-cross-machine.mjs", "--receive", "--peer", "<sender-machine-id>"],
+    ["node", "scripts/webrtc-cross-machine.mjs", "--send", "--peer", "<receiver-machine-id>", "--bytes", "1048576"],
+    ["node", "scripts/webrtc-cross-machine.mjs", "--send", "--peer", "<receiver-machine-id>", "--bytes", "262144"],
+    ["node", "scripts/webrtc-cross-machine.mjs", "--expect-exhausted", "--peer", "<offline-peer>"]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "matrix": "12 of 12 directed legs passed across CloudHost, MacMini, IM2A and HSD: 1 MiB legs used 6 chunks/attempts and 256 KiB legs used 2; every sender returned ok:true with send.ack.ok:true, and every receiver reported artifact-received with a sink file whose SHA-256 and byte count match the sender's artifact.",
+      "ack": "ACK was emitted only after the receiver reassembled the chunks, verified SHA-256 and wrote the sink; ACK frames are separate from the 33-attempt chunk budget.",
+      "payload_sha256": {
+        "1MiB": "631b84027d6b9e52b539c4e8373622d23032dfadc64d60af87339c9037e4f769",
+        "256KiB": "31a1f9dea0169551092d05e8bf4a446228c8c3eb4c9b713c66adcb7fd53c89be"
+      },
+      "negative_33": "With no receiver and a short connect window, sendArtifact returned TEAM_DATA_P2P_EXHAUSTED after exactly 33 attempts in 41.283 s; the alert says the relay was not used, and peerStatus reported WEBRTC_CONNECT_TIMEOUT instead of null.",
+      "relay_ledger": "The deliver phase was driven with a WebRTC result path that failed 33 times; it still called POST /v1/result exactly once and delivered the envelope.",
+      "node_test": "node --test test/relay-ledger.test.mjs test/peer-status-last-error.test.mjs: 2 tests, 2 pass, 0 fail.",
+      "receiver_fallback": "A receiver path recorded as fallback_after_receive means the artifact had already passed SHA-256 and been written to the sink before the transport closed; it is not a data-plane failure.",
+      "scope": "TOFUTURE was offline during this run and is excluded from the four-node matrix; its code copy was not re-measured in this round."
+    }
+  }
+}

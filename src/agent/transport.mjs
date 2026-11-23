@@ -9,6 +9,10 @@
 export const TRANSPORT = Object.freeze({
   UDP: 'udp-v1',
   IROH: 'iroh-v1',
+  // v3.5.x: the P2P-first WebRTC stack. It is opt-in (`webrtc-v1` is not in TRANSPORT_DEFAULT);
+  // adding it to the vocabulary means `resolveTransports({transports:['webrtc-v1']})` can accept it
+  // without the scheduler having to know a private string.
+  WEBRTC: 'webrtc-v1',
 });
 
 export const TRANSPORT_DEFAULT = Object.freeze(['udp']);

@@ -11,7 +11,7 @@ import { createHash, createHmac, randomBytes } from 'node:crypto';
 
 export const ARTIFACT_REF_VERSION = 1;
 export const MAX_REF_BYTES = 4096;
-export const ARTIFACT_KINDS = Object.freeze(['stdout', 'stderr', 'patch', 'commit', 'reduce-input']);
+export const ARTIFACT_KINDS = Object.freeze(['stdout', 'stderr', 'patch', 'commit', 'reduce-input', 'file', 'image', 'artifact', 'blob', 'data_sync']);
 const HEX64 = /^[0-9a-f]{64}$/;
 const HEX32 = /^[0-9a-f]{32}$/;
 

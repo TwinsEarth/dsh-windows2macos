@@ -118,6 +118,55 @@ export function createDeliverPhase(deps) {
    */
   const p2pResultWaiters = new Map();
 
+  // -- WebRTC result path (v3.5.8) -----------------------------------------
+  //
+  // The pool is injected by the composition root, because one process must have exactly one pool
+  // per machine: two pools on the same machine id would claim the same `host`/`client` room slot and
+  // fight over every pair. `planDirectDelivery` therefore *borrows* it exactly as the UDP path
+  // borrows its node.
+  //
+  // The result notice is a small control frame, not the envelope. The envelope is still posted to the
+  // relay unconditionally; WebRTC is the preferred *data plane* for the direct copy, and the relay
+  // remains the ledger. That distinction is why a WebRTC failure can never lose a result and why the
+  // 33-attempt cap below never turns into "the result was dropped".
+  const webrtcPool = options.webrtcPool ?? null;
+  const webrtcDataMaxAttempts =
+    Number.isInteger(options.webrtcDataMaxAttempts) && options.webrtcDataMaxAttempts > 0
+      ? options.webrtcDataMaxAttempts
+      : 33;
+  const webrtcAckTimeoutMs =
+    Number.isFinite(options.webrtcAckTimeoutMs) && options.webrtcAckTimeoutMs > 0
+      ? options.webrtcAckTimeoutMs
+      : 500;
+  const webrtcRetryDelayMs =
+    Number.isFinite(options.webrtcRetryDelayMs) && options.webrtcRetryDelayMs >= 0
+      ? options.webrtcRetryDelayMs
+      : 100;
+  const webrtcResultBudgetMs =
+    Number.isFinite(options.webrtcResultBudgetMs) && options.webrtcResultBudgetMs > 0
+      ? options.webrtcResultBudgetMs
+      : 5_000;
+  const webrtcStats = {
+    enabled: webrtcPool !== null,
+    attempts: 0,
+    delivered: 0,
+    failed: 0,
+    last_error: null,
+    last_at: null,
+  };
+  /** @type {(() => void)|null} */
+  let webrtcUnsubscribe = null;
+  /**
+   * Per-task channel adapters for offers that arrived over WebRTC.
+   *
+   * The heartbeat and the result path both speak the UDP channel contract (`send`, `on('close')`,
+   * `encryption`). An adapter that forwards `send` to the pool lets those paths stay unchanged while
+   * the facts in the envelope (`offer_path`, `encrypted`) describe what actually happened.
+   *
+   * @type {Map<string, object>}
+   */
+  const webrtcChannels = new Map();
+
   /**
    * Live channels per `task_id`, for the direct result copy *and* for knowing which tasks the
    * dispatcher can already reach us about. Populated only from a `task.offer` that arrived on a
@@ -174,6 +223,27 @@ export function createDeliverPhase(deps) {
       : P2P_DEFAULTS.reverseDialTimeoutMs;
   }
 
+  /** The agent's WebRTC pool facts, always a fresh plain object. */
+  function webrtcStatusSnapshot() {
+    const diagnostics = typeof webrtcPool?.diagnostics === 'function' ? webrtcPool.diagnostics() : null;
+    return {
+      enabled: webrtcPool !== null,
+      available: diagnostics?.ok === true,
+      signal_url: diagnostics?.signal_url ?? null,
+      peer_count: diagnostics?.peer_count ?? 0,
+      peers: diagnostics?.peers ?? [],
+      stats: { ...webrtcStats, ...(diagnostics?.stats ?? {}) },
+      policy: {
+        role: 'preferred-direct-result',
+        relay: 'ledger-always',
+        data_max_attempts: webrtcDataMaxAttempts,
+        ack_timeout_ms: webrtcAckTimeoutMs,
+        result_budget_ms: webrtcResultBudgetMs,
+      },
+      last_error: webrtcStats.last_error ?? null,
+    };
+  }
+
   /** The agent's P2P facts, always a fresh plain object. */
   function p2pStatusSnapshot() {
     const nodeStatus = p2pNode?.status ?? null;
@@ -207,6 +277,7 @@ export function createDeliverPhase(deps) {
         refusals: nodeStatus?.encryption?.refusals ?? [],
       },
       channels: p2pChannels.size,
+      webrtc: webrtcStatusSnapshot(),
       start_error: startError,
       last_error: startError ?? nodeStatus?.last_error ?? null,
     };
@@ -331,6 +402,9 @@ export function createDeliverPhase(deps) {
    * @returns {Promise<{ok: boolean, enabled: boolean, error: string|null}>}
    */
   async function startP2P() {
+    // WebRTC is its own data plane: attach even in `relay` mode, because a Teams data plane or a
+    // WebRTC result path does not depend on the UDP socket being enabled.
+    attachWebRtc();
     if (p2pMode === 'relay') return { ok: true, enabled: false, error: null };
     configureP2P();
     if (p2pNode === null) return p2pStartResult ?? { ok: false, enabled: true, error: 'P2P_NODE_INVALID' };
@@ -373,6 +447,15 @@ export function createDeliverPhase(deps) {
 
   /** Stop the node and let go of every channel. Idempotent and awaitable. */
   async function closeP2P() {
+    if (webrtcUnsubscribe !== null) {
+      try {
+        webrtcUnsubscribe();
+      } catch {
+        /* unsubscribe must not be the reason stop fails */
+      }
+      webrtcUnsubscribe = null;
+    }
+    webrtcChannels.clear();
     // Await a start that is still in flight first: closing a node that is halfway through binding
     // would race the bind and could leave a socket nobody references.
     if (p2pStarting !== null) await p2pStarting.catch(() => null);
@@ -924,7 +1007,9 @@ export function createDeliverPhase(deps) {
     const usedChannel = channelFor(offer?.task_id);
     let openedBy = null;
     if (delivery.path === 'p2p') {
-      if (reverse?.ok === true && reverse.channel !== null && reverse.channel === usedChannel) {
+      if (delivery.transport === 'webrtc-v1') {
+        openedBy = P2P_OPENED_BY.WEBRTC_DATA_CHANNEL;
+      } else if (reverse?.ok === true && reverse.channel !== null && reverse.channel === usedChannel) {
         openedBy = reverse.stage === 'result'
           ? P2P_OPENED_BY.RESULT_REVERSE_DIAL
           : P2P_OPENED_BY.SIMULTANEOUS_PUNCH;
@@ -950,6 +1035,9 @@ export function createDeliverPhase(deps) {
       ...(encryption === null || encryption.encrypted === true ? {} : { encryption_reason: encryption.reason }),
       ...(encryption === null || encryption.session === null ? {} : { encryption_session: encryption.session }),
       ...(delivery.path === null ? {} : { result_path: delivery.path }),
+      ...(delivery.transport === null ? {} : { result_transport: delivery.transport }),
+      ...(delivery.attempts > 0 ? { result_attempts: delivery.attempts } : {}),
+      ...(delivery.fallback_from === null ? {} : { result_fallback_from: delivery.fallback_from }),
       ...(openedBy === null ? {} : { opened_by: openedBy }),
       ...(reverse === null || reverse.attempted !== true
         ? {}
@@ -1218,6 +1306,222 @@ export function createDeliverPhase(deps) {
   }
 
   /**
+   * Subscribe to the injected WebRTC pool once. Idempotent.
+   *
+   * The pool is the only object here that owns sockets and engine processes; the agent only consumes
+   * its frames. Subscribing at `startP2P()` time (including in `relay` mode) is deliberate: WebRTC is
+   * its own data plane and does not depend on the UDP node being enabled, so a machine configured
+   * `p2pMode: relay` can still use WebRTC for a Teams data plane.
+   */
+  function attachWebRtc() {
+    if (webrtcPool === null || webrtcUnsubscribe !== null) return;
+    if (typeof webrtcPool.onMessage !== 'function') {
+      webrtcStats.last_error = 'WEBRTC_POOL_INVALID: the injected pool has no onMessage()';
+      return;
+    }
+    webrtcUnsubscribe = webrtcPool.onMessage((event) => {
+      try {
+        handleWebRtcFrame(event);
+      } catch (error) {
+        webrtcStats.last_error = `WEBRTC_FRAME_HANDLER_FAILED: ${error?.message ?? String(error)}`;
+        log('warn', 'webrtc: frame handler failed', { error: webrtcStats.last_error });
+      }
+    });
+  }
+
+  /**
+   * Feed one WebRTC frame into the same dispatcher the UDP channel uses.
+   *
+   * `handleP2PMessage` already accepts a `{payload, channel, peer, session}` event and does the
+   * `result.ack` / `task.offer` / `xfer.*` / `view.*` routing. The adapter below is what makes a
+   * WebRTC pair look like a channel to that code without pretending it is a UDP channel: its
+   * `transport` field names the real stack, and `send` forwards to the pool.
+   */
+  function handleWebRtcFrame(event) {
+    const peer = typeof event?.peer === 'string' && event.peer !== '' ? event.peer : null;
+    if (peer === null || event?.payload === undefined || event?.payload === null) return;
+    const raw = Buffer.isBuffer(event.payload) ? event.payload : Buffer.from(String(event.payload), 'utf8');
+    let frame = null;
+    try {
+      frame = JSON.parse(raw.toString('utf8'));
+    } catch {
+      log('warn', 'webrtc: ignoring a non-JSON frame', { peer, bytes: raw.length });
+      return;
+    }
+    if (frame === null || typeof frame !== 'object' || Array.isArray(frame)) return;
+    const taskId = typeof frame.task_id === 'string' && frame.task_id !== '' ? frame.task_id : null;
+    const channel = webrtcChannelFor(peer, taskId);
+    webrtcStats.last_at = new Date().toISOString();
+    deps.heartbeat.handleP2PMessage({
+      from: peer,
+      channel,
+      peer: { machine_id: peer },
+      session: null,
+      payload: raw,
+    });
+  }
+
+  /**
+   * A channel-shaped adapter over one WebRTC peer.
+   *
+   * The adapter is per peer, not per pool, so `rememberChannel` can attach its `close` listener and
+   * `envelopeP2P` can read `encryption` from the same object. `send` forwards every frame through
+   * the pool's Noise-sealed DataChannel; a failure is thrown because the UDP channel contract is
+   * promise-based and `sendResultDirect` already catches it.
+   */
+  function webrtcChannelFor(peer, taskId) {
+    const existing = taskId === null ? null : webrtcChannels.get(taskId);
+    if (existing !== null && existing !== undefined && existing.peer?.machine_id === peer) return existing;
+    const adapter = {
+      peer: { machine_id: peer },
+      session: null,
+      // The shared dispatcher keys on `transport === 'p2p'` to decide that an ack is evidence about
+      // the direct path; the exact stack is named separately so the scheduler can still tell a
+      // WebRTC adapter from a UDP channel.
+      transport: 'p2p',
+      stack: 'webrtc-v1',
+      // The Noise handshake is a precondition of a started transport, so a frame that arrives here
+      // travelled sealed. There is no plaintext mode in `webrtc-v1`.
+      encryption: { encrypted: true, reason: null, epoch: 0 },
+      send: async (payload) => {
+        const result = await webrtcPool.send(peer, payload);
+        if (result?.ok !== true) {
+          const error = new Error(result?.detail ?? result?.code ?? 'WEBRTC_SEND_FAILED');
+          error.code = result?.code ?? 'WEBRTC_SEND_FAILED';
+          throw error;
+        }
+        return result;
+      },
+      on: () => adapter,
+      removeListener: () => adapter,
+      close: () => {},
+    };
+    if (taskId !== null) {
+      webrtcChannels.set(taskId, adapter);
+      // A frame that arrived over WebRTC is also the direct channel for this task. Register it in
+      // the shared map only when there is no UDP channel already, so a result.ack sent back on the
+      // same path is found by `channelFor` without displacing a real UDP channel.
+      if (channelFor(taskId) === null) rememberChannel(taskId, adapter);
+    }
+    return adapter;
+  }
+
+  /** Whether a pool failure is worth another attempt inside the result budget. */
+  function webrtcRetryable(code) {
+    return !(
+      code === 'WEBRTC_POOL_PEER_KEY_MISSING' ||
+      code === 'WEBRTC_POOL_SELF_PEER' ||
+      code === 'WEBRTC_POOL_BAD_CONFIG' ||
+      code === 'WEBRTC_POOL_CLOSED' ||
+      code === 'WEBRTC_PROVIDER_UNAVAILABLE' ||
+      code === 'WEBRTC_DEVICE_KEY_REQUIRED' ||
+      code === 'WEBRTC_PEER_KEY_REQUIRED'
+    );
+  }
+
+  /** Sleep without keeping the process alive. */
+  function webrtcSleep(ms) {
+    return new Promise((resolve) => {
+      const timer = setTimeout(resolve, ms);
+      timer.unref?.();
+    });
+  }
+
+  /**
+   * Register one `result.ack` waiter for a single attempt.
+   *
+   * The shared `p2pResultWaiters` map is reused so both transports settle the same fact, and a late
+   * ack from a slow attempt cannot resolve a newer attempt: `settle` removes itself and a second
+   * attempt installs a fresh registration.
+   */
+  function registerWebRtcAck(taskId, timeoutMs) {
+    let lastAckError = null;
+    let settled = false;
+    let registration = null;
+    const promise = new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        if (p2pResultWaiters.get(taskId) === registration) p2pResultWaiters.delete(taskId);
+        resolve(false);
+      }, timeoutMs);
+      timer.unref?.();
+      registration = {
+        settle: (value, reason) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          if (p2pResultWaiters.get(taskId) === registration) p2pResultWaiters.delete(taskId);
+          if (value === false && typeof reason === 'string' && reason !== '') lastAckError = reason;
+          resolve(value);
+        },
+      };
+      p2pResultWaiters.set(taskId, registration);
+    });
+    return { promise, error: () => lastAckError, settle: (value, reason) => registration.settle(value, reason) };
+  }
+
+  /**
+   * Try the WebRTC result path first, bounded by both an attempt count and a wall-clock budget.
+   *
+   * The attempt count is the Teams data-plane contract (33); the budget is what keeps a dispatcher
+   * that is simply offline from delaying the relay ledger by 33 connect windows. A retryable pool
+   * failure is retried until either bound; a deterministic refusal (missing key, no provider) stops
+   * immediately because 33 identical refusals are not a better answer.
+   *
+   * @param {string} taskId
+   * @param {string} peerMachineId The dispatcher that handed this task over.
+   * @returns {Promise<{delivered:boolean, attempts:number, rtt_ms:number|null, error:string|null}>}
+   */
+  async function sendResultWebRtc(taskId, peerMachineId) {
+    if (webrtcPool === null) return { delivered: false, attempts: 0, rtt_ms: null, error: null };
+    if (typeof peerMachineId !== 'string' || peerMachineId === '') {
+      return { delivered: false, attempts: 0, rtt_ms: null, error: null };
+    }
+    const deadline = Date.now() + webrtcResultBudgetMs;
+    let attempts = 0;
+    let lastError = null;
+    for (let index = 0; index < webrtcDataMaxAttempts; index += 1) {
+      if (Date.now() >= deadline) break;
+      if (index > 0 && webrtcRetryDelayMs > 0) await webrtcSleep(webrtcRetryDelayMs);
+      attempts += 1;
+      webrtcStats.attempts += 1;
+      const startedAt = process.hrtime.bigint();
+      const waiter = registerWebRtcAck(taskId, Math.max(1, Math.min(webrtcAckTimeoutMs, deadline - Date.now())));
+      const sent = await webrtcPool.send(peerMachineId, JSON.stringify({
+        type: 'task.result',
+        task_id: taskId,
+        machine_id: identity.machine_id,
+        transport: 'webrtc-v1',
+      }));
+      if (sent?.ok !== true) {
+        lastError = `${sent?.code ?? 'WEBRTC_SEND_FAILED'}: ${sent?.detail ?? 'send failed'}`;
+        webrtcStats.last_error = lastError;
+        waiter.settle(false, lastError);
+        if (!webrtcRetryable(sent?.code)) break;
+        continue;
+      }
+      const acked = await waiter.promise;
+      const elapsed = Number(process.hrtime.bigint() - startedAt) / 1e6;
+      if (acked === true) {
+        webrtcStats.delivered += 1;
+        webrtcStats.last_at = new Date().toISOString();
+        // The envelope's `p2p.encrypted` describes the channel that carried this attempt; a result
+        // that arrived over the relay but left over WebRTC must still say it was sealed.
+        rememberChannelEncryption(taskId, webrtcChannelFor(peerMachineId, taskId));
+        return {
+          delivered: true,
+          attempts,
+          rtt_ms: Math.round(elapsed * 100) / 100,
+          error: null,
+        };
+      }
+      lastError = waiter.error() ?? `WEBRTC_ACK_TIMEOUT: no result.ack within ${webrtcAckTimeoutMs}ms`;
+      webrtcStats.last_error = lastError;
+    }
+    webrtcStats.failed += 1;
+    return { delivered: false, attempts, rtt_ms: null, error: lastError };
+  }
+
+  /**
    * Try the direct path for one attempt, before the envelope exists.
    *
    * WHY THIS RUNS FIRST, AND WHY THE FRAME IS NOT THE ENVELOPE
@@ -1252,6 +1556,37 @@ export function createDeliverPhase(deps) {
    */
   async function planDirectDelivery(offer, status = null) {
     const taskId = typeof offer?.task_id === 'string' && offer.task_id !== '' ? offer.task_id : null;
+    const dispatcherId =
+      typeof offer?.origin_machine_id === 'string' && offer.origin_machine_id !== ''
+        ? offer.origin_machine_id
+        : null;
+
+    /**
+     * WebRTC first (v3.5.8). It is the preferred *data plane*, not the ledger: the relay copy is
+     * still posted unconditionally by `deliver()`, so a WebRTC failure changes latency and the
+     * `result_path` fact, never whether the result exists.
+     */
+    let webrtcAttempt = null;
+    if (taskId !== null && status !== 'refused' && webrtcPool !== null && dispatcherId !== null) {
+      webrtcAttempt = await sendResultWebRtc(taskId, dispatcherId);
+      if (webrtcAttempt.delivered === true) {
+        log('info', `result acknowledged over WebRTC for ${taskId}`, {
+          rtt_ms: webrtcAttempt.rtt_ms,
+          attempts: webrtcAttempt.attempts,
+        });
+        return p2pDeliveryMark({
+          path: 'p2p',
+          asked: true,
+          rtt_ms: webrtcAttempt.rtt_ms,
+          transport: 'webrtc-v1',
+          attempts: webrtcAttempt.attempts,
+        });
+      }
+      log('warn', `WebRTC result delivery failed for ${taskId}; trying the UDP direct path`, {
+        attempts: webrtcAttempt.attempts,
+        error: webrtcAttempt.error,
+      });
+    }
 
     if (taskId !== null && channelFor(taskId) === null) {
       // ---- the result-path reverse dial (v0.4.x) ---------------------------
@@ -1270,25 +1605,56 @@ export function createDeliverPhase(deps) {
       }
     }
 
-    if (channelFor(offer?.task_id) === null) {
+    const channel = channelFor(offer?.task_id);
+    if (channel === null) {
       // No channel at all, so nothing about this task's data plane was ever sealed  - and the reason
       // recorded here is the one `offerTransportOf` already decided for `p2p.reason`.
       rememberNoChannel(offer?.task_id, offerTransportOf(offer, p2pStatusSnapshot()).reason);
-      return p2pDeliveryMark();
+      return p2pDeliveryMark({
+        asked: webrtcAttempt !== null,
+        error: webrtcAttempt?.error ?? null,
+        attempts: webrtcAttempt?.attempts ?? 0,
+        fallback_from: webrtcAttempt !== null ? 'webrtc-v1' : null,
+      });
+    }
+    if (channel.stack === 'webrtc-v1') {
+      // The only direct channel this task has is the WebRTC adapter; retrying it through the UDP
+      // path would be a second attempt against the same stack, not the required UDP fallback.
+      log('warn', `WebRTC result delivery failed for ${offer.task_id}; no UDP channel exists for this task`, {
+        error: webrtcAttempt?.error ?? null,
+      });
+      return p2pDeliveryMark({
+        asked: true,
+        error: webrtcAttempt?.error ?? 'WEBRTC_RESULT_FAILED',
+        attempts: webrtcAttempt?.attempts ?? 0,
+      });
     }
     const direct = await sendResultDirect(offer.task_id);
     if (direct.delivered) {
       log('info', `result acknowledged over the direct channel for ${offer.task_id}`, {
         rtt_ms: direct.rtt_ms,
+        fallback_from: webrtcAttempt !== null ? 'webrtc-v1' : null,
       });
-      return p2pDeliveryMark({ path: 'p2p', asked: true, rtt_ms: direct.rtt_ms });
+      return p2pDeliveryMark({
+        path: 'p2p',
+        asked: true,
+        rtt_ms: direct.rtt_ms,
+        transport: 'udp-v1',
+        attempts: 1,
+        fallback_from: webrtcAttempt !== null ? 'webrtc-v1' : null,
+      });
     }
     // A timeout is a reported failure; "no channel at all" is not, and `asked` keeps the two
     // apart for anything reading the agent's own diagnostics.
     log('warn', `direct result delivery failed for ${offer.task_id}; the relay copy is unaffected`, {
       error: direct.error,
     });
-    return p2pDeliveryMark({ asked: true, error: direct.error });
+    return p2pDeliveryMark({
+      asked: true,
+      error: direct.error ?? webrtcAttempt?.error ?? null,
+      attempts: 1,
+      fallback_from: webrtcAttempt !== null ? 'webrtc-v1' : null,
+    });
   }
 
   /**
@@ -1457,6 +1823,9 @@ export function createDeliverPhase(deps) {
     makeEnvelope,
     planDirectDelivery,
     sendResultDirect,
+    sendResultWebRtc,
+    attachWebRtc,
+    webrtcStatusSnapshot,
     finish,
     deliver,
     settleResultAck,
