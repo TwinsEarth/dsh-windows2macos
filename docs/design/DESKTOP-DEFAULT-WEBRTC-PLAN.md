@@ -235,6 +235,11 @@ getWebRtcPoolRuntime()
 
 ### P6：部署与 provider 安装（1 天）
 
+> 状态：已落地（2026-11-24）。生产文档 `docs/DESKTOP-PRODUCTION.md` 覆盖 signal 部署、TLS、
+> provider 安装、DSH 行配置、readiness 与回滚；`scripts/desktop-webrtc-readiness.mjs` 只读检查
+> pool / signal / provider / device key / peer static key / relay ack，无诊断快照时把 pool 报为
+> 命名阻断而不是猜测通过。验收记录：`docs/acceptance/3.6.0/P6-PRODUCTION-READINESS.md`。
+
 - `docs/DESKTOP-PRODUCTION.md`：
   - relay 侧部署 `w2m-webrtc-signal`；
   - 每台机器安装 `node-datachannel` 到 `~/.w2m/webrtc-provider`；

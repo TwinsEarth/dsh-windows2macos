@@ -152,6 +152,9 @@ W2M_WEBRTC_SIGNAL_TOKEN=... w2m-webrtc-signal --port 8788
 For a remote deployment, terminate TLS and use `wss://`; the server itself speaks cleartext
 WebSocket so it can sit behind nginx/Caddy without duplicating certificate handling.
 
+Production deployment (signal systemd/nginx, per-machine provider install, DSH rows, and the
+read-only readiness script) is in [DESKTOP-PRODUCTION.md](./DESKTOP-PRODUCTION.md).
+
 ## Provider protocol
 
 The engine is a child process speaking one JSON object per line in each direction.
