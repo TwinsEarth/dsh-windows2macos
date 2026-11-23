@@ -250,4 +250,35 @@ describe('deliver.mjs WebRTC transport scheduling', () => {
     assert.ok(result.attempts >= 1);
     await deliver.closeP2P();
   });
+
+  it('uses a pool published after the deliver phase was built, without restarting the agent', async () => {
+    let pool = null;
+    const { deliver } = makeDeliver(null, {
+      getWebRtcPool: () => pool,
+      getWebRtcPoolState: () => ({ owner: pool === null ? null : 'dsh-p2p-webrtc', ready: pool !== null }),
+    });
+    assert.equal(deliver.webrtcStatusSnapshot().enabled, false);
+    assert.equal(deliver.webrtcStatusSnapshot().owner, null);
+
+    // The provider row publishes its pool after the root row mounted; no attachWebRtc() call.
+    pool = fakePool();
+    const mark = await deliver.planDirectDelivery(offer('late-pool-1'));
+    assert.equal(mark.path, 'p2p');
+    assert.equal(mark.transport, 'webrtc-v1');
+    assert.equal(pool.sent.length, 1);
+    const status = deliver.webrtcStatusSnapshot();
+    assert.equal(status.enabled, true);
+    assert.equal(status.owner, 'dsh-p2p-webrtc');
+    await deliver.closeP2P();
+  });
+
+  it('names WEBRTC_POOL_UNAVAILABLE when the late-bound getter still has no pool', async () => {
+    const { deliver } = makeDeliver(null, { getWebRtcPool: () => null });
+    const status = deliver.webrtcStatusSnapshot();
+    assert.equal(status.enabled, false);
+    assert.equal(status.last_error, null);
+    const result = await deliver.sendResultWebRtc('no-pool-1', 'machine-a');
+    assert.deepEqual(result, { delivered: false, attempts: 0, rtt_ms: null, error: null });
+    await deliver.closeP2P();
+  });
 });

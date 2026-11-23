@@ -6,7 +6,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { pushOfferBestPath, pushOffers } from '../src/plugin/tools/dispatch.mjs';
+import { pushOfferBestPath, pushOffers, resolveDispatchWebRtcPool } from '../src/plugin/tools/dispatch.mjs';
 
 function frameFor(machineId = 'machine-a') {
   return {
@@ -148,5 +148,20 @@ describe('dispatch offer transport order', () => {
     assert.equal(pushes[1].relay_fallback, true);
     assert.equal(pool.sent.length, 1, 'only the runnable lease is pushed');
     assert.equal(node.dials.length, 0);
+  });
+});
+
+describe('dispatch WebRTC pool late binding', () => {
+  it('prefers the live registry over the mount-time snapshot once the provider publishes', () => {
+    const snapshot = { name: 'mount-time' };
+    const published = { name: 'dsh-p2p-webrtc' };
+    let live = null;
+    assert.equal(resolveDispatchWebRtcPool(() => live, snapshot), snapshot);
+    live = published;
+    assert.equal(resolveDispatchWebRtcPool(() => live, snapshot), published);
+  });
+
+  it('returns null when neither the registry nor the snapshot has a pool', () => {
+    assert.equal(resolveDispatchWebRtcPool(() => null, null), null);
   });
 });

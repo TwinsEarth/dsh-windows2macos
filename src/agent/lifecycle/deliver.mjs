@@ -130,7 +130,16 @@ export function createDeliverPhase(deps) {
   // relay unconditionally; WebRTC is the preferred *data plane* for the direct copy, and the relay
   // remains the ledger. That distinction is why a WebRTC failure can never lose a result and why the
   // 33-attempt cap below never turns into "the result was dropped".
-  const webrtcPool = options.webrtcPool ?? null;
+  const getWebRtcPool =
+    typeof options.getWebRtcPool === 'function'
+      ? options.getWebRtcPool
+      : () => options.webrtcPool ?? null;
+  /**
+   * The current pool. It is intentionally a `let` rather than the old constructor-time constant:
+   * the production root row mounts before `dsh-p2p-webrtc` publishes the shared pool, so the agent
+   * must acquire it on the first operation that needs it, not only at `startP2P()`.
+   */
+  let webrtcPool = null;
   const webrtcDataMaxAttempts =
     Number.isInteger(options.webrtcDataMaxAttempts) && options.webrtcDataMaxAttempts > 0
       ? options.webrtcDataMaxAttempts
@@ -148,7 +157,7 @@ export function createDeliverPhase(deps) {
       ? options.webrtcResultBudgetMs
       : 5_000;
   const webrtcStats = {
-    enabled: webrtcPool !== null,
+    enabled: false,
     attempts: 0,
     delivered: 0,
     failed: 0,
@@ -224,12 +233,55 @@ export function createDeliverPhase(deps) {
       : P2P_DEFAULTS.reverseDialTimeoutMs;
   }
 
+  /**
+   * Re-read the pool getter and subscribe to the new pool when it appears or changes.
+   *
+   * P3 late binding: `dsh-p2p-webrtc` is mounted after the root row in the production profile, so
+   * the agent starts with no pool. Every operation that can use WebRTC calls this first; the first
+   * operation after publication attaches the frame subscription without restarting the agent. A
+   * getter that throws is recorded as a named diagnostic and treated as "no pool", never as a
+   * reason to fail the task.
+   */
+  function ensureWebRtcPool() {
+    let candidate = null;
+    try {
+      candidate = getWebRtcPool();
+    } catch (error) {
+      webrtcStats.last_error = `WEBRTC_POOL_GETTER_FAILED: ${error instanceof Error ? error.message : String(error)}`;
+      candidate = null;
+    }
+    const next = candidate !== null && typeof candidate === 'object' ? candidate : null;
+    if (next !== webrtcPool) {
+      if (webrtcUnsubscribe !== null) {
+        try {
+          webrtcUnsubscribe();
+        } catch {
+          /* a stale subscription must not block the new pool */
+        }
+        webrtcUnsubscribe = null;
+      }
+      webrtcPool = next;
+      // Channels built on the previous pool point at that pool's peer objects; drop them rather
+      // than let a stale adapter send through the new pool under an old peer identity.
+      webrtcChannels.clear();
+    }
+    webrtcStats.enabled = webrtcPool !== null;
+    if (webrtcPool !== null && webrtcUnsubscribe === null) subscribeWebRtc();
+    return webrtcPool;
+  }
+
   /** The agent's WebRTC pool facts, always a fresh plain object. */
   function webrtcStatusSnapshot() {
-    const diagnostics = typeof webrtcPool?.diagnostics === 'function' ? webrtcPool.diagnostics() : null;
+    const pool = ensureWebRtcPool();
+    const diagnostics = typeof pool?.diagnostics === 'function' ? pool.diagnostics() : null;
+    const owner =
+      typeof options.getWebRtcPoolState === 'function'
+        ? options.getWebRtcPoolState()?.owner ?? null
+        : null;
     return {
-      enabled: webrtcPool !== null,
+      enabled: pool !== null,
       available: diagnostics?.ok === true,
+      owner,
       signal_url: diagnostics?.signal_url ?? null,
       peer_count: diagnostics?.peer_count ?? 0,
       peers: diagnostics?.peers ?? [],
@@ -456,6 +508,8 @@ export function createDeliverPhase(deps) {
       }
       webrtcUnsubscribe = null;
     }
+    webrtcPool = null;
+    webrtcStats.enabled = false;
     webrtcChannels.clear();
     // Await a start that is still in flight first: closing a node that is halfway through binding
     // would race the bind and could leave a socket nobody references.
@@ -1307,14 +1361,17 @@ export function createDeliverPhase(deps) {
   }
 
   /**
-   * Subscribe to the injected WebRTC pool once. Idempotent.
+   * Subscribe to the current WebRTC pool once. Idempotent.
    *
    * The pool is the only object here that owns sockets and engine processes; the agent only consumes
    * its frames. Subscribing at `startP2P()` time (including in `relay` mode) is deliberate: WebRTC is
    * its own data plane and does not depend on the UDP node being enabled, so a machine configured
    * `p2pMode: relay` can still use WebRTC for a Teams data plane.
+   *
+   * A null pool at `startP2P()` is not final: `attachWebRtc()` re-reads the getter, and the first
+   * later operation that calls `ensureWebRtcPool()` attaches the newly published pool.
    */
-  function attachWebRtc() {
+  function subscribeWebRtc() {
     if (webrtcPool === null || webrtcUnsubscribe !== null) return;
     if (typeof webrtcPool.onMessage !== 'function') {
       webrtcStats.last_error = 'WEBRTC_POOL_INVALID: the injected pool has no onMessage()';
@@ -1328,6 +1385,11 @@ export function createDeliverPhase(deps) {
         log('warn', 'webrtc: frame handler failed', { error: webrtcStats.last_error });
       }
     });
+  }
+
+  /** Public late-binding entry point: re-read the getter and subscribe if a pool is now available. */
+  function attachWebRtc() {
+    return ensureWebRtcPool();
   }
 
   /**
@@ -1389,7 +1451,13 @@ export function createDeliverPhase(deps) {
       // travelled sealed. There is no plaintext mode in `webrtc-v1`.
       encryption: { encrypted: true, reason: null, epoch: 0 },
       send: async (payload) => {
-        const result = await webrtcPool.send(peer, payload);
+        const pool = ensureWebRtcPool();
+        if (pool === null) {
+          const error = new Error('WEBRTC_POOL_UNAVAILABLE: no shared pool is published');
+          error.code = 'WEBRTC_POOL_UNAVAILABLE';
+          throw error;
+        }
+        const result = await pool.send(peer, payload);
         if (result?.ok !== true) {
           const error = new Error(result?.detail ?? result?.code ?? 'WEBRTC_SEND_FAILED');
           error.code = result?.code ?? 'WEBRTC_SEND_FAILED';
@@ -1477,7 +1545,8 @@ export function createDeliverPhase(deps) {
    * @returns {Promise<{delivered:boolean, attempts:number, rtt_ms:number|null, error:string|null}>}
    */
   async function sendResultWebRtc(taskId, peerMachineId) {
-    if (webrtcPool === null) return { delivered: false, attempts: 0, rtt_ms: null, error: null };
+    const pool = ensureWebRtcPool();
+    if (pool === null) return { delivered: false, attempts: 0, rtt_ms: null, error: null };
     if (typeof peerMachineId !== 'string' || peerMachineId === '') {
       return { delivered: false, attempts: 0, rtt_ms: null, error: null };
     }
@@ -1491,7 +1560,7 @@ export function createDeliverPhase(deps) {
       webrtcStats.attempts += 1;
       const startedAt = process.hrtime.bigint();
       const waiter = registerWebRtcAck(taskId, Math.max(1, Math.min(webrtcAckTimeoutMs, deadline - Date.now())));
-      const sent = await webrtcPool.send(peerMachineId, JSON.stringify({
+      const sent = await pool.send(peerMachineId, JSON.stringify({
         type: 'task.result',
         task_id: taskId,
         machine_id: identity.machine_id,
@@ -1572,7 +1641,7 @@ export function createDeliverPhase(deps) {
      * `result_path` fact, never whether the result exists.
      */
     let webrtcAttempt = null;
-    if (taskId !== null && status !== 'refused' && webrtcPool !== null && dispatcherId !== null) {
+    if (taskId !== null && status !== 'refused' && ensureWebRtcPool() !== null && dispatcherId !== null) {
       webrtcAttempt = await sendResultWebRtc(taskId, dispatcherId);
       if (webrtcAttempt.delivered === true) {
         log('info', `result acknowledged over WebRTC for ${taskId}`, {

@@ -157,18 +157,28 @@ getWebRtcPoolRuntime()
 
 ### P3：目标端与任务面晚绑定（1 天）
 
+> 状态：已落地（2026-11-23）。`heartbeat` 的 viewer warm-up 每次请求重读 pool getter；
+> `deliver` 在每次调度/发送/状态读取时 `ensureWebRtcPool()`，pool 晚到后自动订阅；
+> `tools/shared` 把 `getSharedWebRtcPool` / `getSharedWebRtcPoolState` 注入 `createAgent`。
+> 由于 `agent` 层不能 import `plugin` 层，getter 由 composition root 注入，registry 仍是唯一
+> owner 来源。验收记录：`docs/acceptance/3.6.0/P3-LATE-BINDING.md`。
+
 修改：
 
 - `src/agent/lifecycle/heartbeat.mjs`
-  - `prepareWebRtc` 每次取 `getSharedWebRtcPool()`；
+  - `prepareWebRtc` 每次通过注入的 `getWebRtcPool` 重读共享 pool；
   - 取不到时再回退 `deps.webrtcPool`；
   - 返回 `pool_owner` 供 ack 诊断。
+- `src/agent/view/relay-target.mjs`
+  - `/v1/remote/ack` body 与 warm-up 日志增加 `pool_owner`，空值为 `null`。
 - `src/agent/lifecycle/deliver.mjs`
   - 增加 `getWebRtcPool`；
   - `handleWebRtcFrame` 订阅与 `send` 使用当前 pool；
   - pool 从 null 变为可用时，下一次操作自动订阅，不需要重启 agent。
 - `src/plugin/tools/shared.mjs`
   - `createAgent` 传 `getWebRtcPool: getSharedWebRtcPool`。
+- `src/plugin/tools/dispatch.mjs`
+  - 每次 dispatch 用 `getSharedWebRtcPool() ?? inProcessWebRtcPool`，不再只读 mount 时快照。
 - 测试：
   - pool 在 deliver 创建后出现，offer 仍走 WebRTC；
   - pool 晚到后 `prepareWebRtc` 成功；

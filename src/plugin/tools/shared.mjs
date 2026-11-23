@@ -44,7 +44,7 @@ import { loadOrCreateIdentity, saveDeviceToken } from '../../agent/identity.mjs'
 import { probeCapsDetailed, detectPlatform } from '../../agent/caps.mjs';
 import { resolveStateDir } from '../../util/cli.mjs';
 import { parseServer } from '../../agent/stun.mjs';
-import { getSharedWebRtcPool } from '../webrtc-pool-registry.mjs';
+import { getSharedWebRtcPool, getSharedWebRtcPoolState } from '../webrtc-pool-registry.mjs';
 import { findProfileDir } from '../auto-update.mjs';
 import { readOperatorToken } from '../operator-token.mjs';
 import { schemaProblems, strayParameterProblems } from '../schema-spec.mjs';
@@ -2749,8 +2749,12 @@ async function startLocalStack(ctx, cfg) {
       // v1.2.6: on by default; a profile may turn it off for debugging, and the envelope then says `unredacted: true`.
       redactOutput: cfg.redactOutput !== false,
       // v3.5.8: WebRTC is the preferred direct result path; `deliver.mjs` falls back to UDP and
-      // always posts the envelope to the relay. Null when this process built no pool.
+      // always posts the envelope to the relay. v3.6.0 P3: this is only the initial borrow --
+      // `getWebRtcPool` is re-read on every operation, because the p2p provider row may mount after
+      // this agent and publish the shared pool only then. The agent never builds or stops a pool.
       webrtcPool,
+      getWebRtcPool: getSharedWebRtcPool,
+      getWebRtcPoolState: () => getSharedWebRtcPoolState(),
       webrtcDataMaxAttempts: cfg.webrtc?.data_max_attempts,
       webrtcAckTimeoutMs: cfg.webrtc?.ack_timeout_ms,
       webrtcRetryDelayMs: cfg.webrtc?.retry_delay_ms,

@@ -414,7 +414,10 @@ describe('remote-view target warm-up', () => {
         viewer_machine_id: 'viewer-1',
         transport: 'webrtc',
       },
-      prepare: async (viewerMachineId) => { prepared.push(viewerMachineId); return { ok: true, code: 'WEBRTC_PREPARED' }; },
+      prepare: async (viewerMachineId) => {
+        prepared.push(viewerMachineId);
+        return { ok: true, code: 'WEBRTC_PREPARED', pool_owner: 'dsh-p2p-webrtc' };
+      },
     });
     try {
       await sleep(80);
@@ -426,6 +429,7 @@ describe('remote-view target warm-up', () => {
       assert.equal(body.ok, true);
       assert.equal(body.viewer_machine_id, 'viewer-1');
       assert.equal(body.session_id, 's-web');
+      assert.equal(body.pool_owner, 'dsh-p2p-webrtc');
     } finally {
       h.stop();
     }
@@ -449,6 +453,7 @@ describe('remote-view target warm-up', () => {
       const body = JSON.parse(ack.body);
       assert.equal(body.ok, false);
       assert.equal(body.code, 'WEBRTC_POOL_UNAVAILABLE');
+      assert.equal(body.pool_owner, null);
       assert.equal(h.calls.some((call) => call.url.includes('/v1/remote/frame')), false);
     } finally {
       h.stop();

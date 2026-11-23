@@ -175,6 +175,12 @@ export {
  * @property {object|null} [webrtcPool] The per-peer `webrtc-v1` pool owned by the composition
  *   root. When present, result delivery tries WebRTC first, falls back to the UDP channel, and
  *   always posts the envelope to the relay. The agent borrows it and never stops it.
+ * @property {(() => object|null)|null} [getWebRtcPool] Late-bound pool resolver (v3.6.0 P3).
+ *   The production profile mounts `dsh-p2p-webrtc` after the root row, so the pool may not exist
+ *   when this agent is built. Every WebRTC consumer calls this getter when it needs the pool;
+ *   `webrtcPool` above stays as the constructor-time fallback for isolated tests.
+ * @property {(() => {owner?: string|null}|null)|null} [getWebRtcPoolState] Optional late-bound
+ *   registry state reader, used only to put `pool_owner` in diagnostics and viewer acks.
  */
 
 /**
@@ -211,6 +217,8 @@ export function createAgent(options) {
     // v3.5.8: the per-peer WebRTC pool, injected by the composition root that owns it. Null means
     // "this process has no WebRTC data plane"; the UDP and relay paths are unchanged.
     webrtcPool = null,
+    getWebRtcPool = null,
+    getWebRtcPoolState = null,
   } = options;
 
   // Normalise here so every caller gets the same contract: the documented
@@ -255,6 +263,12 @@ export function createAgent(options) {
       typeof webrtcPool.onMessage !== 'function')
   ) {
     throw new TypeError('createAgent: webrtcPool must expose send() and onMessage()');
+  }
+  if (getWebRtcPool !== null && typeof getWebRtcPool !== 'function') {
+    throw new TypeError('createAgent: getWebRtcPool must be a function or null');
+  }
+  if (getWebRtcPoolState !== null && typeof getWebRtcPoolState !== 'function') {
+    throw new TypeError('createAgent: getWebRtcPoolState must be a function or null');
   }
 
   // Validate + normalise once, at construction: a `rabbitUrl` carrying a query
@@ -451,6 +465,8 @@ export function createAgent(options) {
     p2pAckTimeoutMs,
     p2pChannelLingerMs,
     webrtcPool,
+    getWebRtcPool,
+    getWebRtcPoolState,
     heartbeatIntervalMs,
     idleHeartbeatIntervalMs,
     statePublishIntervalMs,
@@ -523,6 +539,14 @@ export function createAgent(options) {
      * pair. The agent does not own the pool's lifetime; the composition root that built it does.
      */
     get webrtcPool() {
+      if (typeof getWebRtcPool === 'function') {
+        try {
+          const current = getWebRtcPool();
+          if (current !== null && typeof current === 'object') return current;
+        } catch {
+          /* fall through to the constructor-time pool */
+        }
+      }
       return webrtcPool;
     },
     /** A snapshot of the WebRTC data-plane facts, safe to serialise. */

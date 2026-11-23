@@ -43,6 +43,65 @@ import {
 } from './shared.mjs';
 
 /**
+ * Build the viewer warm-up's WebRTC prepare callback.
+ *
+ * P3 late binding: the production root row mounts before `dsh-p2p-webrtc` publishes its shared
+ * pool. Resolving the pool on every viewer request (rather than capturing it when the heartbeat
+ * phase starts) is what lets the remote-desktop warm-up use that same pool once it appears. The
+ * injected getter is the composition root's only WebRTC knowledge; the agent layer never imports
+ * the plugin registry. When no getter is supplied, the legacy fixed `deps.webrtcPool` remains the
+ * fallback so isolated agent tests keep their old contract.
+ *
+ * @param {object} deps
+ * @param {() => object|null} [deps.getWebRtcPool]
+ * @param {object|null} [deps.webrtcPool]
+ * @param {() => {owner?: string|null}|null} [deps.getWebRtcPoolState]
+ */
+export function createViewWebRtcPrepare(deps = {}) {
+  const resolvePool =
+    typeof deps.getWebRtcPool === 'function'
+      ? deps.getWebRtcPool
+      : () => deps.webrtcPool ?? null;
+  const resolveOwner =
+    typeof deps.getWebRtcPoolState === 'function'
+      ? () => deps.getWebRtcPoolState()?.owner ?? null
+      : () => null;
+  return async (viewerMachineId) => {
+    let pool = null;
+    try {
+      pool = resolvePool();
+    } catch (error) {
+      return {
+        ok: false,
+        code: 'WEBRTC_POOL_UNAVAILABLE',
+        detail: `WebRTC pool getter failed: ${error instanceof Error ? error.message : String(error)}`,
+        pool_owner: null,
+      };
+    }
+    if (pool === null || typeof pool?.prepare !== 'function') {
+      return {
+        ok: false,
+        code: 'WEBRTC_POOL_UNAVAILABLE',
+        detail: 'this host has no shared WebRTC pool',
+        pool_owner: resolveOwner(),
+      };
+    }
+    try {
+      const prepared = await pool.prepare(viewerMachineId);
+      if (prepared === null || typeof prepared !== 'object') return prepared;
+      return { ...prepared, pool_owner: prepared.pool_owner ?? resolveOwner() };
+    } catch (error) {
+      return {
+        ok: false,
+        code: 'WEBRTC_PREPARE_FAILED',
+        detail: error instanceof Error ? error.message : String(error),
+        pool_owner: resolveOwner(),
+      };
+    }
+  };
+}
+
+/**
  * @param {object} deps The composition bag assembled by `createAgent()`.
  */
 export function createHeartbeatPhase(deps) {
@@ -824,21 +883,7 @@ let attemptAttached = false;
       machineId: identity.machine_id,
       capture: (options) => captureScreen({ ...(options ?? {}), fast: true }),
       allow: () => viewAllowed(stateDir),
-      prepareWebRtc: async (viewerMachineId) => {
-        const pool = deps.webrtcPool;
-        if (pool === null || typeof pool?.prepare !== 'function') {
-          return { ok: false, code: 'WEBRTC_POOL_UNAVAILABLE', detail: 'this host has no shared WebRTC pool' };
-        }
-        try {
-          return await pool.prepare(viewerMachineId);
-        } catch (error) {
-          return {
-            ok: false,
-            code: 'WEBRTC_PREPARE_FAILED',
-            detail: error instanceof Error ? error.message : String(error),
-          };
-        }
-      },
+      prepareWebRtc: createViewWebRtcPrepare(deps),
       log,
     });
     if (statePublishIntervalMs > 0) {

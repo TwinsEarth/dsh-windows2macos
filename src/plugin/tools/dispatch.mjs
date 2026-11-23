@@ -31,6 +31,22 @@ import { buildReducePlan } from '../../util/dataflow.mjs';
 import { suggestReduce } from '../../util/reduce-suggestion.mjs';
 
 import { AGGREGATE_STATES, configError, inProcessWebRtcPool, MAX_EXCERPT_BYTES, NON_TERMINAL_AGGREGATE, NON_TERMINAL_OUTCOME, offerP2PFor, PROTOCOL_VERSION, reasonCodeOf, REFUSAL_CODE, request, requestFleetJoin, requireRabbit, resolveGitAnchors, resolveToken, throwIfAborted, W2MError } from './shared.mjs';
+import { getSharedWebRtcPool } from '../webrtc-pool-registry.mjs';
+
+/**
+ * Resolve the dispatch-time WebRTC pool.
+ *
+ * The registry is the live source; `inProcessWebRtcPool` is only the compatibility snapshot the
+ * root row took when it started. A provider that mounts later publishes into the registry, so the
+ * next dispatch sees it without restarting the root or rebuilding an agent.
+ *
+ * @param {() => object|null} [getShared]
+ * @param {object|null} [fallback]
+ * @returns {object|null}
+ */
+export function resolveDispatchWebRtcPool(getShared = getSharedWebRtcPool, fallback = inProcessWebRtcPool) {
+  return getShared() ?? fallback ?? null;
+}
 
 /**
  * Upper bound on how many tasks w2m_history will ask the relay for.
@@ -1687,7 +1703,10 @@ const result = await request({
           failed_without_direct: 0,
         },
       };
-      const webrtcPool = inProcessWebRtcPool;
+      // P3: dispatch must resolve the pool at dispatch time, not at stack mount. `dsh-p2p-webrtc`
+      // may publish the shared pool after the root row started; `inProcessWebRtcPool` is the
+      // compatibility snapshot, the registry is the live source.
+      const webrtcPool = resolveDispatchWebRtcPool();
       if ((webrtcPool !== null && typeof webrtcPool.send === 'function') || (cfg.p2pMode !== 'relay' && p2p.node !== null && p2p.start?.ok === true)) {
         try {
           const pushes = await pushOffers(p2p.node, {

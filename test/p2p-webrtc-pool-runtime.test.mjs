@@ -258,6 +258,9 @@ describe('root w2m wiring', () => {
   it('acquires the shared pool as a consumer and never builds or stops it', () => {
     const source = readFileSync(new URL('../src/plugin/tools/shared.mjs', import.meta.url), 'utf8');
     assert.match(source, /getSharedWebRtcPool\(\)/);
+    // P3: the agent must receive the getter, not only the constructor-time borrow.
+    assert.match(source, /getWebRtcPool: getSharedWebRtcPool/);
+    assert.match(source, /getWebRtcPoolState: \(\) => getSharedWebRtcPoolState\(\)/);
     assert.doesNotMatch(source, /createWebRtcPoolRuntime/);
     assert.doesNotMatch(source, /webrtcRuntime\.stop\(\)/);
     assert.doesNotMatch(source, /setSharedWebRtcPool/);

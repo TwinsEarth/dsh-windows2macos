@@ -138,6 +138,7 @@ export function startRelayViewTarget(deps) {
           viewer_machine_id: viewerMachineId,
           ok: prepared?.ok === true,
           code: prepared?.ok === true ? 'WEBRTC_PREPARED' : (prepared?.code ?? 'WEBRTC_PREPARE_FAILED'),
+          pool_owner: prepared?.pool_owner ?? null,
         }),
       });
     } catch {
@@ -147,6 +148,7 @@ export function startRelayViewTarget(deps) {
       viewer: viewerMachineId,
       ok: prepared?.ok === true,
       code: prepared?.ok === true ? 'WEBRTC_PREPARED' : (prepared?.code ?? 'WEBRTC_PREPARE_FAILED'),
+      pool_owner: prepared?.pool_owner ?? null,
     });
   };
 
