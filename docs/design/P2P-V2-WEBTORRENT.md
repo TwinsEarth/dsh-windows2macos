@@ -46,11 +46,23 @@ magic "W2MT2\0" (6B) | info hash (20B, hex-decoded) | BitTorrent wire chunk
 ```text
 P2PV2Service
   ├─ optional WebTorrent client (lazy dynamic import / injected factory)
+  ├─ transportRegistry.get(name) -> definition.create({pool}) -> binding
   ├─ shares: Map<share_id, record>            // one torrent
   ├─ byInfoHash: Map<info_hash, record>
   ├─ adapters: Map<peer\0info_hash, Duplex>   // one logical peer stream
-  └─ pool.onMessage -> decodeTorrentFrame -> adapter.feed
+  └─ binding.onMessage -> decodeTorrentFrame -> adapter.feed
 ```
+
+### 3.1 传输注册表（P1）
+
+`src/agent/webtorrent/transports/registry.mjs` 把“传输定义”和“某次进程内的具体绑定”分开：
+
+- `registerTorrentTransport(name, transport)` 注册 `{name, create({pool})}` 定义；同名的后注册覆盖前一条。
+- `getTorrentTransport(name)` 查找定义；未知名字抛出带 `code: P2P_V2_TRANSPORT_UNKNOWN` 的命名错误，不回落到默认。
+- 内置注册 `webrtc-v1`。`src/agent/webtorrent/transports/webrtc-v1.mjs#createWebRtcV1Transport({pool})` 只包装 `pool.ensure/send/onMessage`，`destroy()` 只退订自己的 handler，绝不调用 `pool.closePeer()` 或 `pool.stop()`。
+- `share`/`add`/`attach` 都接受 `transport` 参数，缺省 `webrtc-v1`；share 记录保存该名字，后续 attach 缺省沿用 share 的传输。
+- 同一进程可以注册 fake transport 做确定性测试；服务只从 `transportRegistry` 取定义，不直接对 pool 发字节。
+- `multiplex.mjs` 不感知传输：帧标签仍是 `magic | info hash | chunk`，任何 transport 都只搬运带标签的 Buffer。
 
 不变式：
 
@@ -133,7 +145,7 @@ p2p_v2_add(magnet, dest, peers)
 | 层 | 证据 |
 |---|---|
 | 字节标签 | `test/p2p-v2.test.mjs` round-trip、坏 hash、空 chunk、JSON 不命中 |
-| Duplex 适配 | 写入走 `pool.send` 并带标签；`feed` 只接收去标签字节；destroy 不 closePeer |
+| 传输抽象 | 注册表默认 `webrtc-v1`、未知名字命名拒绝；fake transport 上的同一 adapter 收发；V1 binding destroy 不关闭 pool/pair |
 | service | seed 真实临时文件、add 先 infoHash 后 attach、detach/stop 不 closePeer、缺引擎命名、share 复用/上限 |
 | 接线 | package export、lib seam、cordis row disabled、6 工具 inert mount、confirm 拒绝 |
 | 真实 WebTorrent | `test/p2p-v2-live.mjs`：两个真实 pool + 真实 signaling/Noise + 真实 WebTorrent，传输 256 KiB 文件并比对字节；用 `W2M_WEBTORRENT_MODULE` 指定外部引擎，默认 suite 不依赖 |

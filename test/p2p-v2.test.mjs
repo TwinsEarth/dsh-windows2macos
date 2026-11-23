@@ -24,6 +24,16 @@ import {
 import { createTorrentPeerAdapter } from '../src/agent/webtorrent/peer-adapter.mjs';
 import { P2PV2Service, P2P_V2_CODE } from '../src/agent/webtorrent/service.mjs';
 import {
+  TORRENT_DEFAULT_TRANSPORT,
+  TORRENT_TRANSPORT_CODE,
+  createTorrentTransportRegistry,
+  getTorrentTransport,
+} from '../src/agent/webtorrent/transports/registry.mjs';
+import {
+  WEBRTC_V1_TRANSPORT_CODE,
+  createWebRtcV1Transport,
+} from '../src/agent/webtorrent/transports/webrtc-v1.mjs';
+import {
   apply,
   buildTools,
   normalizePluginConfig,
@@ -151,6 +161,41 @@ function fakePool(machineId = 'machine-a') {
   return pool;
 }
 
+/** A transport with the same byte-plane contract as `webrtc-v1`, but no pool behind it. */
+function fakeTransport(name = 'fake-p1', machineId = 'machine-a') {
+  const handlers = new Set();
+  const sent = [];
+  const calls = { ensure: [], send: [], destroy: 0 };
+  const transport = {
+    name,
+    machineId,
+    sent,
+    calls,
+    async ensure(peer) {
+      calls.ensure.push(peer);
+      return { ok: true, peer };
+    },
+    async send(peer, payload) {
+      calls.send.push({ peer, payload });
+      sent.push({ peer, payload });
+      return { ok: true, peer, bytes: Buffer.byteLength(payload) };
+    },
+    onMessage(handler) {
+      handlers.add(handler);
+      return () => handlers.delete(handler);
+    },
+    emit(event) {
+      for (const handler of [...handlers]) handler(event);
+    },
+    destroy() {
+      calls.destroy += 1;
+      handlers.clear();
+      return { ok: true };
+    },
+  };
+  return transport;
+}
+
 function tempFile(name = 'sample.bin') {
   const dir = mkdtempSync(join(tmpdir(), 'w2m-p2p-v2-'));
   writeFileSync(join(dir, name), Buffer.alloc(1024, 7));
@@ -191,10 +236,71 @@ describe('p2p v2 multiplex', () => {
   });
 });
 
-describe('p2p v2 peer adapter', () => {
-  it('writes tagged frames through the pool and feeds decoded bytes back into the Duplex', async () => {
+describe('p2p v2 transports', () => {
+  it('registers webrtc-v1 by default and refuses an unknown name by code', () => {
+    assert.equal(TORRENT_DEFAULT_TRANSPORT, 'webrtc-v1');
+    const definition = getTorrentTransport(TORRENT_DEFAULT_TRANSPORT);
+    assert.equal(definition.name, 'webrtc-v1');
+    assert.equal(typeof definition.create, 'function');
+    assert.equal(getTorrentTransport('webrtc-v1').create, definition.create);
+    assert.throws(
+      () => getTorrentTransport('no-such-transport'),
+      (error) => error.code === TORRENT_TRANSPORT_CODE.UNKNOWN,
+    );
+
+    const registry = createTorrentTransportRegistry();
+    const fake = { name: 'fake-reg', create: () => fakeTransport('fake-reg') };
+    const registered = registry.register('fake-reg', fake);
+    assert.equal(registered.name, 'fake-reg');
+    assert.equal(registered.create, fake.create);
+    assert.equal(registry.get('fake-reg').create, fake.create);
+    assert.throws(
+      () => registry.get('missing'),
+      (error) => error.code === TORRENT_TRANSPORT_CODE.UNKNOWN,
+    );
+  });
+
+  it('forwards ensure/send/onMessage to the pool and destroys only its binding', async () => {
     const pool = fakePool();
-    const adapter = createTorrentPeerAdapter({ peer: 'machine-b', infoHash: HASH_A, pool, writeTimeoutMs: 100 });
+    const transport = createWebRtcV1Transport({ pool });
+    const seen = [];
+    const stop = transport.onMessage((event) => seen.push(event));
+
+    assert.deepEqual(await transport.ensure('machine-b'), { ok: true, peer: 'machine-b' });
+    assert.deepEqual(pool.ensureCalls, ['machine-b']);
+    const sent = await transport.send('machine-b', Buffer.from('raw-bytes'));
+    assert.equal(sent.ok, true);
+    assert.equal(pool.sent[0].peer, 'machine-b');
+    assert.equal(pool.sent[0].payload.toString(), 'raw-bytes');
+
+    pool.emit('machine-b', Buffer.from('pool-incoming'));
+    assert.equal(seen.length, 1);
+    assert.equal(seen[0].payload.toString(), 'pool-incoming');
+
+    stop();
+    pool.emit('machine-b', Buffer.from('after-stop'));
+    assert.equal(seen.length, 1);
+
+    const destroyed = transport.destroy();
+    assert.equal(destroyed.ok, true);
+    assert.equal(pool.closed, false);
+    assert.equal(transport.destroyed, true);
+    const afterDestroy = await transport.send('machine-b', Buffer.from('nope'));
+    assert.equal(afterDestroy.ok, false);
+    assert.equal(afterDestroy.code, WEBRTC_V1_TRANSPORT_CODE.CLOSED);
+  });
+});
+
+describe('p2p v2 peer adapter', () => {
+  it('writes tagged frames through the transport and feeds decoded bytes back into the Duplex', async () => {
+    const pool = fakePool();
+    const transport = createWebRtcV1Transport({ pool });
+    const adapter = createTorrentPeerAdapter({
+      peer: 'machine-b',
+      infoHash: HASH_A,
+      transport,
+      writeTimeoutMs: 100,
+    });
     const received = [];
     adapter.on('data', (chunk) => received.push(chunk));
     await new Promise((resolve, reject) => {
@@ -208,7 +314,7 @@ describe('p2p v2 peer adapter', () => {
 
     const incoming = encodeTorrentFrame(HASH_A, Buffer.from('incoming'));
     adapter.feed(decodeTorrentFrame(incoming).payload);
-    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => { setImmediate(resolve); });
     assert.equal(received[0].toString(), 'incoming');
     assert.equal(adapter.stats.chunks_in, 1);
     adapter.destroy();
@@ -216,9 +322,38 @@ describe('p2p v2 peer adapter', () => {
 
   it('does not close the shared pool when the logical torrent stream is destroyed', () => {
     const pool = fakePool();
-    const adapter = createTorrentPeerAdapter({ peer: 'machine-b', infoHash: HASH_A, pool });
+    const transport = createWebRtcV1Transport({ pool });
+    const adapter = createTorrentPeerAdapter({ peer: 'machine-b', infoHash: HASH_A, transport });
     adapter.destroy();
     assert.equal(pool.closed, false);
+    assert.equal(transport.destroyed, false);
+  });
+
+  it('sends and receives on a fake transport without the adapter owning it', async () => {
+    const transport = fakeTransport();
+    const adapter = createTorrentPeerAdapter({ peer: 'machine-b', infoHash: HASH_A, transport });
+    const received = [];
+    const stop = transport.onMessage((event) => {
+      const decoded = decodeTorrentFrame(event.payload);
+      if (decoded !== null && decoded.infoHash === HASH_A) adapter.feed(decoded.payload);
+    });
+    adapter.on('data', (chunk) => received.push(chunk));
+
+    await new Promise((resolve, reject) => {
+      adapter.write(Buffer.from('fake-outgoing'), (error) => (error ? reject(error) : resolve()));
+    });
+    assert.equal(transport.sent.length, 1);
+    assert.equal(transport.sent[0].peer, 'machine-b');
+    assert.equal(decodeTorrentFrame(transport.sent[0].payload).payload.toString(), 'fake-outgoing');
+
+    transport.emit({ peer: 'machine-b', payload: encodeTorrentFrame(HASH_A, Buffer.from('fake-incoming')) });
+    await new Promise((resolve) => { setImmediate(resolve); });
+    assert.equal(received[0].toString(), 'fake-incoming');
+    assert.equal(adapter.transport, 'fake-p1');
+
+    stop();
+    adapter.destroy();
+    assert.equal(transport.calls.destroy, 0);
   });
 });
 
@@ -295,6 +430,88 @@ describe('p2p v2 service', () => {
     assert.equal(second.code, P2P_V2_CODE.SHARE_LIMIT);
     await service.stopAll();
   });
+
+  it('refuses an unknown transport by name before touching paths or the engine', async () => {
+    const client = fakeClient();
+    let factoryCalls = 0;
+    const service = new P2PV2Service(normalizePluginConfig({}), {
+      getPool: () => fakePool(),
+      webTorrentFactory: () => {
+        factoryCalls += 1;
+        return client;
+      },
+    });
+    const { path } = tempFile();
+    const badShare = await service.share({ path, transport: 'no-such-transport' });
+    assert.equal(badShare.ok, false, JSON.stringify(badShare));
+    assert.equal(badShare.code, P2P_V2_CODE.TRANSPORT_UNKNOWN);
+    assert.equal(badShare.transport, 'no-such-transport');
+    assert.equal(factoryCalls, 0);
+
+    const missingDir = join(tmpdir(), `w2m-p2p-v2-missing-${process.pid}`);
+    const badAdd = await service.add({
+      magnet: `magnet:?xt=urn:btih:${HASH_B}`,
+      path: missingDir,
+      transport: 'no-such-transport',
+    });
+    assert.equal(badAdd.code, P2P_V2_CODE.TRANSPORT_UNKNOWN);
+    assert.equal(existsSync(missingDir), false);
+
+    const seeded = await service.share({ path });
+    assert.equal(seeded.ok, true, JSON.stringify(seeded));
+    const badAttach = await service.attach({
+      share_id: seeded.share.share_id,
+      machine_id: 'machine-b',
+      transport: 'no-such-transport',
+    });
+    assert.equal(badAttach.code, P2P_V2_CODE.TRANSPORT_UNKNOWN);
+    assert.equal(badAttach.transport, 'no-such-transport');
+    await service.stopAll();
+  });
+
+  it('routes adapter bytes through a registered fake transport and never calls pool.ensure', async () => {
+    const { path } = tempFile();
+    const pool = fakePool();
+    const client = fakeClient();
+    const registry = createTorrentTransportRegistry();
+    let created = null;
+    registry.register('fake-p1', {
+      name: 'fake-p1',
+      create: () => {
+        created = fakeTransport('fake-p1');
+        return created;
+      },
+    });
+    const service = new P2PV2Service(normalizePluginConfig({}), {
+      getPool: () => pool,
+      webTorrentFactory: () => client,
+      transportRegistry: registry,
+    });
+    const shared = await service.share({ path, peers: ['machine-b'], transport: 'fake-p1' });
+    assert.equal(shared.ok, true, JSON.stringify(shared));
+    assert.equal(shared.share.transport, 'fake-p1');
+    assert.equal(shared.share.peers[0].transport, 'fake-p1');
+    assert.deepEqual(created.calls.ensure, ['machine-b']);
+    assert.equal(pool.ensureCalls.length, 0);
+
+    const adapter = client.torrents[0].added[0];
+    const received = [];
+    adapter.on('data', (chunk) => received.push(chunk));
+    await new Promise((resolve, reject) => {
+      adapter.write(Buffer.from('service-outgoing'), (error) => (error ? reject(error) : resolve()));
+    });
+    assert.equal(created.sent.length, 1);
+    assert.equal(decodeTorrentFrame(created.sent[0].payload).payload.toString(), 'service-outgoing');
+
+    created.emit({ peer: 'machine-b', payload: encodeTorrentFrame(HASH_A, Buffer.from('service-incoming')) });
+    await new Promise((resolve) => { setImmediate(resolve); });
+    assert.equal(received[0].toString(), 'service-incoming');
+    assert.equal(service.status().transports.find((entry) => entry.name === 'fake-p1')?.active, true);
+
+    await service.stopAll();
+    assert.equal(created.calls.destroy, 1);
+    assert.equal(pool.closed, false);
+  });
 });
 
 describe('dsh-p2p-v2 wiring', () => {
@@ -327,13 +544,17 @@ describe('dsh-p2p-v2 wiring', () => {
     assert.equal(dispose.mounted, true);
     assert.equal(effects.length, 1);
     const share = definitions.find((definition) => definition.name === 'p2p_v2_share');
+    assert.equal(share.parameters.transport.type, 'string');
     assert.deepEqual(json(await share.execute({ path: 'x' })), {
       ok: false,
       code: 'P2P_V2_CONFIRM_REQUIRED',
       detail: 'confirm must be the literal "share"',
     });
     const add = definitions.find((definition) => definition.name === 'p2p_v2_add');
+    assert.equal(add.parameters.transport.type, 'string');
     assert.equal(json(await add.execute({ magnet: 'magnet:x', path: 'x' })).code, 'P2P_V2_CONFIRM_REQUIRED');
+    const attach = definitions.find((definition) => definition.name === 'p2p_v2_attach');
+    assert.equal(attach.parameters.transport.type, 'string');
     const status = definitions.find((definition) => definition.name === 'p2p_v2_status');
     assert.equal(json(await status.execute({})).engine.available, false);
     await dispose();

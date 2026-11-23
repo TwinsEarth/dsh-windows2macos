@@ -1,9 +1,10 @@
 /**
- * P2P V2 service: WebTorrent for file pieces, `webrtc-v1` for the peer transport.
+ * P2P V2 service: WebTorrent for file pieces, a named torrent transport for peer bytes.
  *
  * This module is intentionally below the Cordis plugin. It knows nothing about tools, routes or
  * DSH; it owns one optional WebTorrent client, a map of shares, and a map of logical torrent
- * streams over shared V1 pairs. The plugin layer normalizes configuration and exposes tools.
+ * streams over shared transport bindings. The plugin layer normalizes configuration and exposes
+ * tools.
  *
  * Two planes, one pair:
  *
@@ -11,8 +12,8 @@
  *   BitTorrent wire chunks                    -> tagged with TORRENT_FRAME_MAGIC + info hash
  *
  * The tag is what lets one DataChannel carry both without either consumer parsing the other's
- * bytes. The V2 service never closes a pair: `webrtc-v1` is borrowed from the process-wide pool and
- * may also carry task dispatch for the same peer.
+ * bytes. The V2 service never closes a pair: `webrtc-v1` is a transport binding borrowed from the
+ * process-wide pool and may also carry task dispatch for the same peer.
  */
 
 import { mkdirSync, statSync } from 'node:fs';
@@ -25,6 +26,7 @@ import {
 } from './engine.mjs';
 import { createTorrentPeerAdapter } from './peer-adapter.mjs';
 import { decodeTorrentFrame, normalizeInfoHash, shareIdFor } from './multiplex.mjs';
+import { TORRENT_DEFAULT_TRANSPORT, torrentTransportRegistry } from './transports/registry.mjs';
 
 /** Named failures the service and tools expose. */
 export const P2P_V2_CODE = Object.freeze({
@@ -47,6 +49,9 @@ export const P2P_V2_CODE = Object.freeze({
   PEER_ATTACH_FAILED: 'P2P_V2_PEER_ATTACH_FAILED',
   TORRENT_PEER_FAILED: 'P2P_V2_TORRENT_PEER_FAILED',
   SHARE_STOP_FAILED: 'P2P_V2_SHARE_STOP_FAILED',
+  TRANSPORT_UNKNOWN: 'P2P_V2_TRANSPORT_UNKNOWN',
+  TRANSPORT_INVALID: 'P2P_V2_TRANSPORT_INVALID',
+  TRANSPORT_CREATE_FAILED: 'P2P_V2_TRANSPORT_CREATE_FAILED',
 });
 
 function isRecord(value) {
@@ -181,13 +186,17 @@ export class P2PV2Service {
   /**
    * @param {object} cfg Normalized configuration from `normalizePluginConfig`.
    * @param {{getPool?: () => (object|null), webTorrentFactory?: Function|null,
-   *   webTorrentModule?: string|null, now?: () => string}} [deps]
+   *   webTorrentModule?: string|null, transportRegistry?: {get: Function}, now?: () => string}} [deps]
    */
   constructor(cfg = {}, deps = {}) {
     this.cfg = isRecord(cfg) ? cfg : {};
     this.getPool = typeof deps.getPool === 'function' ? deps.getPool : null;
     this.webTorrentFactory = typeof deps.webTorrentFactory === 'function' ? deps.webTorrentFactory : null;
     this.webTorrentModule = typeof deps.webTorrentModule === 'string' ? deps.webTorrentModule : null;
+    this.transportRegistry =
+      isRecord(deps.transportRegistry) && typeof deps.transportRegistry.get === 'function'
+        ? deps.transportRegistry
+        : torrentTransportRegistry;
     this.now = typeof deps.now === 'function' ? deps.now : nowIso;
 
     this.client = null;
@@ -195,7 +204,8 @@ export class P2PV2Service {
     this.clientSource = null;
     this.engineError = null;
     this.pool = null;
-    this.unsubscribe = null;
+    /** @type {Map<string, {binding: object, unsubscribe: Function, pool: object}>} */
+    this.transports = new Map();
     this.shares = new Map();
     this.byInfoHash = new Map();
     this.adapters = new Map();
@@ -242,23 +252,191 @@ export class P2PV2Service {
 
   /**
    * Resolve the shared pool at call time, not mount time. The root row can mount before the pool
-   * exists; the same late-binding rule as the desktop route.
+   * exists; the same late-binding rule as the desktop route. A pool swap drops every transport
+   * binding built over the previous pool, but never closes the pool itself.
    *
    * @returns {object|null}
    */
   #ensurePool() {
     const pool = this.getPool?.() ?? null;
-    if (pool === null) return null;
+    if (pool === null) {
+      if (this.pool !== null) {
+        this.#resetTransports();
+        this.pool = null;
+      }
+      return null;
+    }
     if (typeof pool !== 'object' || typeof pool.send !== 'function' || typeof pool.onMessage !== 'function') {
       this.lastError = { code: P2P_V2_CODE.POOL_INVALID, detail: 'pool must expose send() and onMessage()', at: this.now() };
       return null;
     }
     if (this.pool !== pool) {
-      this.unsubscribe?.();
+      this.#resetTransports();
       this.pool = pool;
-      this.unsubscribe = pool.onMessage((event) => this.#onPoolMessage(event));
     }
     return pool;
+  }
+
+  /** Release every transport binding. This drops subscriptions only; pairs/pool stay alive. */
+  #resetTransports() {
+    for (const name of [...this.transports.keys()]) this.#dropTransport(name);
+  }
+
+  #dropTransport(name) {
+    const entry = this.transports.get(name);
+    if (entry === undefined) return;
+    this.transports.delete(name);
+    try {
+      entry.unsubscribe?.();
+    } catch {
+      // A transport's unsubscribe is best effort; a broken binding must not block the others.
+    }
+    try {
+      entry.binding?.destroy?.();
+    } catch {
+      // See above: the pool is owned elsewhere and is never torn down here.
+    }
+  }
+
+  #transportName(value) {
+    return typeof value === 'string' && value.trim() !== '' ? value.trim() : TORRENT_DEFAULT_TRANSPORT;
+  }
+
+  /**
+   * Look up a transport definition without requiring a pool. This makes an unknown name a named
+   * refusal before `share` hashes a file, `add` creates a directory or `attach` starts a pair.
+   *
+   * @param {string} name
+   * @returns {{ok: true, name: string, definition: object}|{ok: false, code: string, detail: string}}
+   */
+  #transportDefinition(name) {
+    try {
+      const definition = this.transportRegistry.get(name);
+      if (!isRecord(definition) || typeof definition.create !== 'function') {
+        return {
+          ok: false,
+          code: P2P_V2_CODE.TRANSPORT_INVALID,
+          detail: `transport ${JSON.stringify(name)} did not provide a create({pool}) function`,
+        };
+      }
+      return { ok: true, name, definition };
+    } catch (error) {
+      return {
+        ok: false,
+        code: error?.code ?? P2P_V2_CODE.TRANSPORT_UNKNOWN,
+        detail: errorDetail(error),
+      };
+    }
+  }
+
+  /**
+   * Create or reuse the binding for one transport over the current pool.
+   *
+   * @param {string} name
+   * @returns {Promise<{ok: true, name: string, binding: object}|{ok: false, code: string, detail: string}>}
+   */
+  async #ensureTransport(name) {
+    const selected = this.#transportName(name);
+    const known = this.#transportDefinition(selected);
+    if (known.ok !== true) return known;
+
+    const pool = this.#ensurePool();
+    if (pool === null) {
+      return {
+        ok: false,
+        code: this.lastError?.code === P2P_V2_CODE.POOL_INVALID
+          ? P2P_V2_CODE.POOL_INVALID
+          : P2P_V2_CODE.POOL_UNAVAILABLE,
+        detail: this.lastError?.detail ?? 'the shared WebRTC pool is not running',
+      };
+    }
+
+    const cached = this.transports.get(selected);
+    if (cached !== undefined && cached.pool === pool && cached.binding?.destroyed !== true) {
+      return { ok: true, name: selected, binding: cached.binding };
+    }
+    if (cached !== undefined) this.#dropTransport(selected);
+
+    let binding;
+    try {
+      binding = await Promise.resolve(
+        known.definition.create({ pool, service: this, name: selected, now: this.now }),
+      );
+    } catch (error) {
+      return {
+        ok: false,
+        code: error?.code ?? P2P_V2_CODE.TRANSPORT_CREATE_FAILED,
+        detail: `transport ${JSON.stringify(selected)} failed to bind: ${errorDetail(error)}`,
+      };
+    }
+    if (
+      !isRecord(binding) ||
+      typeof binding.name !== 'string' ||
+      binding.name !== selected ||
+      typeof binding.ensure !== 'function' ||
+      typeof binding.send !== 'function' ||
+      typeof binding.onMessage !== 'function'
+    ) {
+      try {
+        binding?.destroy?.();
+      } catch {
+        // Invalid binding has no usable resources; nothing else to release.
+      }
+      return {
+        ok: false,
+        code: P2P_V2_CODE.TRANSPORT_INVALID,
+        detail: `transport ${JSON.stringify(selected)} did not return a named ensure/send/onMessage binding`,
+      };
+    }
+
+    let unsubscribe;
+    try {
+      unsubscribe = binding.onMessage((event) => this.#onTransportMessage(selected, event));
+    } catch (error) {
+      try {
+        binding.destroy?.();
+      } catch {
+        // Binding failed while subscribing; there is no live handler to keep.
+      }
+      return {
+        ok: false,
+        code: P2P_V2_CODE.TRANSPORT_CREATE_FAILED,
+        detail: `transport ${JSON.stringify(selected)} failed to subscribe: ${errorDetail(error)}`,
+      };
+    }
+    if (typeof unsubscribe !== 'function') {
+      try {
+        binding.destroy?.();
+      } catch {
+        // See above.
+      }
+      return {
+        ok: false,
+        code: P2P_V2_CODE.TRANSPORT_INVALID,
+        detail: `transport ${JSON.stringify(selected)} onMessage() must return an unsubscribe function`,
+      };
+    }
+
+    this.transports.set(selected, { binding, unsubscribe, pool });
+    return { ok: true, name: selected, binding };
+  }
+
+  #onTransportMessage(transportName, event) {
+    const peer = text(event?.peer, '');
+    const decoded = decodeTorrentFrame(event?.payload);
+    if (decoded === null) return;
+    this.stats.frames_in += 1;
+    this.stats.bytes_in += decoded.payload.length;
+    if (peer === '') {
+      this.stats.orphan_frames += 1;
+      return;
+    }
+    const adapter = this.adapters.get(`${peer}\u0000${decoded.infoHash}`);
+    if (adapter === undefined || adapter.destroyed || adapter.transport !== transportName) {
+      this.stats.orphan_frames += 1;
+      return;
+    }
+    adapter.feed(decoded.payload);
   }
 
   /**
@@ -327,24 +505,6 @@ export class P2PV2Service {
     }
   }
 
-  #onPoolMessage(event) {
-    const peer = text(event?.peer, '');
-    const decoded = decodeTorrentFrame(event?.payload);
-    if (decoded === null) return;
-    this.stats.frames_in += 1;
-    this.stats.bytes_in += decoded.payload.length;
-    if (peer === '') {
-      this.stats.orphan_frames += 1;
-      return;
-    }
-    const adapter = this.adapters.get(`${peer}\u0000${decoded.infoHash}`);
-    if (adapter === undefined || adapter.destroyed) {
-      this.stats.orphan_frames += 1;
-      return;
-    }
-    adapter.feed(decoded.payload);
-  }
-
   #resolveShare(input = {}) {
     const shareId = text(input.share_id, '');
     if (shareId !== '' && this.shares.has(shareId)) return this.shares.get(shareId);
@@ -366,7 +526,7 @@ export class P2PV2Service {
     this.stats.shares += 1;
   }
 
-  #recordFromTorrent(torrent, { mode, inputPath, downloadPath }) {
+  #recordFromTorrent(torrent, { mode, inputPath, downloadPath, transport }) {
     const infoHash = normalizeInfoHash(torrent.infoHash ?? torrent.infoHashBuffer);
     if (infoHash === null) {
       return {
@@ -383,6 +543,7 @@ export class P2PV2Service {
         magnet_uri: text(torrent.magnetURI, ''),
         name: text(torrent.name, ''),
         mode,
+        transport: transport ?? TORRENT_DEFAULT_TRANSPORT,
         input_path: inputPath ?? null,
         download_path: downloadPath ?? null,
         torrent,
@@ -408,6 +569,7 @@ export class P2PV2Service {
       magnet_uri: record.magnet_uri || text(torrent.magnetURI, ''),
       name: record.name || text(torrent.name, ''),
       mode: record.mode,
+      transport: record.transport ?? TORRENT_DEFAULT_TRANSPORT,
       input_path: record.input_path,
       download_path: record.download_path,
       created_at: record.created_at,
@@ -421,6 +583,7 @@ export class P2PV2Service {
       upload_speed: Number.isFinite(torrent.uploadSpeed) ? torrent.uploadSpeed : null,
       peers: [...record.peers.values()].map((peer) => ({
         machine_id: peer.machine_id,
+        transport: peer.transport ?? record.transport ?? TORRENT_DEFAULT_TRANSPORT,
         attached_at: peer.attached_at,
         state: peer.adapter?.destroyed === true ? 'closed' : 'open',
         chunks_in: peer.adapter?.stats?.chunks_in ?? 0,
@@ -436,12 +599,22 @@ export class P2PV2Service {
   }
 
   /**
-   * Seed one file or directory and, optionally, attach V1 peers immediately.
+   * Seed one file or directory and, optionally, attach peers.
    *
-   * @param {{path: string, name?: string, peers?: string[]}} input
+   * @param {{path: string, name?: string, peers?: string[], transport?: string}} input
    * @returns {Promise<object>}
    */
   async share(input = {}) {
+    const transportName = this.#transportName(input.transport);
+    const knownTransport = this.#transportDefinition(transportName);
+    if (knownTransport.ok !== true) {
+      return {
+        ok: false,
+        code: knownTransport.code,
+        transport: transportName,
+        detail: knownTransport.detail,
+      };
+    }
     const path = text(input.path, '');
     if (path === '' || path.includes('\u0000')) {
       return { ok: false, code: P2P_V2_CODE.SOURCE_INVALID, detail: 'path is required' };
@@ -489,10 +662,15 @@ export class P2PV2Service {
     if (torrent === null || typeof torrent !== 'object') {
       return { ok: false, code: P2P_V2_CODE.TORRENT_ADD_FAILED, detail: 'seed() returned no torrent' };
     }
-    const made = this.#recordFromTorrent(torrent, { mode: 'seed', inputPath: source, downloadPath: null });
+    const made = this.#recordFromTorrent(torrent, {
+      mode: 'seed',
+      inputPath: source,
+      downloadPath: null,
+      transport: transportName,
+    });
     if (made.ok !== true) return made;
     this.#recordShare(torrent, made.record);
-    const attached = await this.#attachPeers(made.record, input.peers);
+    const attached = await this.#attachPeers(made.record, input.peers, transportName);
     return {
       ok: true,
       share: this.#torrentSummary(made.record),
@@ -502,14 +680,25 @@ export class P2PV2Service {
   }
 
   /**
-   * Join an existing swarm and, optionally, attach V1 peers. The peer must be attached before the
+   * Join an existing swarm and, optionally, attach peers. The peer must be attached before the
    * `ready` event or a magnet with no tracker can never fetch metadata; this method therefore
    * waits for `infoHash`, attaches, and only then waits (bounded) for `ready`.
    *
-   * @param {{magnet?: string, torrent_file?: Buffer|string, path: string, peers?: string[]}} input
+   * @param {{magnet?: string, torrent_file?: Buffer|string, path: string, peers?: string[],
+   *   transport?: string}} input
    * @returns {Promise<object>}
    */
   async add(input = {}) {
+    const transportName = this.#transportName(input.transport);
+    const knownTransport = this.#transportDefinition(transportName);
+    if (knownTransport.ok !== true) {
+      return {
+        ok: false,
+        code: knownTransport.code,
+        transport: transportName,
+        detail: knownTransport.detail,
+      };
+    }
     const destination = text(input.path, '');
     if (destination === '' || destination.includes('\u0000')) {
       return { ok: false, code: P2P_V2_CODE.DEST_INVALID, detail: 'path is required as the download directory' };
@@ -565,7 +754,12 @@ export class P2PV2Service {
       }
       return { ok: false, code: hashed.code ?? P2P_V2_CODE.TORRENT_READY_TIMEOUT, detail: hashed.detail };
     }
-    const made = this.#recordFromTorrent(torrent, { mode: 'download', inputPath: null, downloadPath: dest });
+    const made = this.#recordFromTorrent(torrent, {
+      mode: 'download',
+      inputPath: null,
+      downloadPath: dest,
+      transport: transportName,
+    });
     if (made.ok !== true) {
       try {
         torrent.destroy?.();
@@ -576,7 +770,7 @@ export class P2PV2Service {
     }
     this.#recordShare(torrent, made.record);
     this.stats.downloads += 1;
-    const attached = await this.#attachPeers(made.record, input.peers);
+    const attached = await this.#attachPeers(made.record, input.peers, transportName);
     // Metadata may be available before attach; this wait is bounded and does not hold the tool
     // call until the whole file downloads. A later status poll reports progress.
     const ready = await waitForEvent(torrent, 'ready', this.#metadataTimeoutMs(), () => torrentReady(torrent));
@@ -591,9 +785,11 @@ export class P2PV2Service {
   }
 
   /**
-   * Attach one V1 peer to one share. Repeated calls are idempotent per (peer, info hash).
+   * Attach one peer to one share over a named transport. Repeated calls are idempotent per
+   * (peer, info hash).
    *
-   * @param {{share_id?: string, info_hash?: string, magnet?: string, machine_id: string}} input
+   * @param {{share_id?: string, info_hash?: string, magnet?: string, machine_id: string,
+   *   transport?: string}} input
    * @returns {Promise<object>}
    */
   async attach(input = {}) {
@@ -603,12 +799,30 @@ export class P2PV2Service {
     }
     const machineId = text(input.machine_id, '');
     if (machineId === '') return { ok: false, code: P2P_V2_CODE.PEER_REQUIRED, detail: 'machine_id is required' };
-    return this.#attachPeer(record, machineId);
+    return this.#attachPeer(record, machineId, input.transport ?? record.transport);
   }
 
-  async #attachPeer(record, machineId) {
+  async #attachPeer(record, machineId, transportName) {
+    const selected = this.#transportName(transportName ?? record.transport);
+    const knownTransport = this.#transportDefinition(selected);
+    if (knownTransport.ok !== true) {
+      return {
+        ok: false,
+        code: knownTransport.code,
+        share_id: record.share_id,
+        machine_id: machineId,
+        transport: selected,
+        detail: knownTransport.detail,
+      };
+    }
     if (record.peers.has(machineId)) {
-      return { ok: true, reused: true, share_id: record.share_id, machine_id: machineId };
+      return {
+        ok: true,
+        reused: true,
+        share_id: record.share_id,
+        machine_id: machineId,
+        transport: record.peers.get(machineId)?.transport ?? selected,
+      };
     }
     if (record.peers.size >= this.#maxPeersPerShare()) {
       return {
@@ -616,28 +830,36 @@ export class P2PV2Service {
         code: P2P_V2_CODE.PEER_LIMIT,
         share_id: record.share_id,
         machine_id: machineId,
+        transport: selected,
         detail: `peer limit ${this.#maxPeersPerShare()} reached`,
       };
     }
-    const pool = this.#ensurePool();
-    if (pool === null) {
+    const ensured = await this.#ensureTransport(selected);
+    if (ensured.ok !== true) {
+      this.stats.peer_attach_failures += 1;
       return {
         ok: false,
-        code: this.lastError?.code === P2P_V2_CODE.POOL_INVALID
-          ? P2P_V2_CODE.POOL_INVALID
-          : P2P_V2_CODE.POOL_UNAVAILABLE,
+        code: ensured.code,
         share_id: record.share_id,
         machine_id: machineId,
-        detail: this.lastError?.detail ?? 'the shared WebRTC pool is not running',
+        transport: selected,
+        detail: ensured.detail,
       };
     }
-    if (typeof pool.machineId === 'string' && pool.machineId === machineId) {
-      return { ok: false, code: P2P_V2_CODE.PEER_SELF, share_id: record.share_id, machine_id: machineId };
+    const transport = ensured.binding;
+    if (typeof transport.machineId === 'string' && transport.machineId === machineId) {
+      return {
+        ok: false,
+        code: P2P_V2_CODE.PEER_SELF,
+        share_id: record.share_id,
+        machine_id: machineId,
+        transport: selected,
+      };
     }
     const key = `${machineId}\u0000${record.info_hash}`;
     if (this.attaching.has(key)) return this.attaching.get(key);
     const promise = (async () => {
-      const ready = await pool.ensure(machineId);
+      const ready = await transport.ensure(machineId);
       if (ready?.ok !== true) {
         this.stats.peer_attach_failures += 1;
         return {
@@ -645,8 +867,10 @@ export class P2PV2Service {
           code: P2P_V2_CODE.PEER_UNREACHABLE,
           share_id: record.share_id,
           machine_id: machineId,
-          detail: ready?.detail ?? ready?.code ?? 'pool.ensure failed',
+          transport: selected,
+          detail: ready?.detail ?? ready?.code ?? `${selected}.ensure failed`,
           pool_code: ready?.code ?? null,
+          transport_code: ready?.code ?? null,
         };
       }
       let adapter;
@@ -654,7 +878,7 @@ export class P2PV2Service {
         adapter = createTorrentPeerAdapter({
           peer: machineId,
           infoHash: record.info_hash,
-          pool,
+          transport,
           writeTimeoutMs: this.#writeTimeoutMs(),
           onError: (error) => {
             record.last_error = { code: error.code ?? 'P2P_V2_TORRENT_PEER_ERROR', detail: error.message, at: this.now() };
@@ -667,6 +891,7 @@ export class P2PV2Service {
           code: P2P_V2_CODE.PEER_ATTACH_FAILED,
           share_id: record.share_id,
           machine_id: machineId,
+          transport: selected,
           detail: errorDetail(error),
         };
       }
@@ -680,10 +905,11 @@ export class P2PV2Service {
           code: P2P_V2_CODE.TORRENT_PEER_FAILED,
           share_id: record.share_id,
           machine_id: machineId,
+          transport: selected,
           detail: errorDetail(error),
         };
       }
-      const peer = { machine_id: machineId, adapter, attached_at: this.now() };
+      const peer = { machine_id: machineId, transport: selected, adapter, attached_at: this.now() };
       record.peers.set(machineId, peer);
       this.adapters.set(key, adapter);
       this.stats.peers_attached += 1;
@@ -693,7 +919,13 @@ export class P2PV2Service {
       };
       adapter.once('close', cleanup);
       adapter.once('end', cleanup);
-      return { ok: true, share_id: record.share_id, machine_id: machineId, peer: this.#torrentSummary(record).peers.find((entry) => entry.machine_id === machineId) ?? null };
+      return {
+        ok: true,
+        share_id: record.share_id,
+        machine_id: machineId,
+        transport: selected,
+        peer: this.#torrentSummary(record).peers.find((entry) => entry.machine_id === machineId) ?? null,
+      };
     })();
     this.attaching.set(key, promise);
     try {
@@ -703,13 +935,13 @@ export class P2PV2Service {
     }
   }
 
-  async #attachPeers(record, peers) {
+  async #attachPeers(record, peers, transportName) {
     const attached = [];
     const errors = [];
     if (!Array.isArray(peers)) return { attached, errors };
     const unique = [...new Set(peers.filter((peer) => typeof peer === 'string' && peer !== ''))];
     for (const machineId of unique) {
-      const result = await this.#attachPeer(record, machineId);
+      const result = await this.#attachPeer(record, machineId, transportName);
       if (result.ok === true) attached.push(result);
       else errors.push(result);
     }
@@ -781,8 +1013,7 @@ export class P2PV2Service {
       const result = await this.stop({ share_id: shareId });
       if (result.ok !== true || (result.errors?.length ?? 0) > 0) errors.push(result);
     }
-    this.unsubscribe?.();
-    this.unsubscribe = null;
+    this.#resetTransports();
     this.pool = null;
     if (this.client !== null) {
       try {
@@ -801,13 +1032,26 @@ export class P2PV2Service {
   /** A diagnostics snapshot for `p2p_v2_status`. */
   status() {
     const pool = this.getPool?.() ?? this.pool;
+    const transports = [...this.transports.entries()].map(([transportName, entry]) => ({
+      name: transportName,
+      active: entry.binding?.destroyed !== true,
+      machine_id: typeof entry.binding?.machineId === 'string' ? entry.binding.machineId : null,
+      peers: [...this.adapters.values()].filter(
+        (adapter) => adapter.transport === transportName && adapter.destroyed !== true,
+      ).length,
+    }));
     return {
       plugin: 'w2m-dsh-p2p-v2',
       created_at: this.createdAt,
       planes: {
-        task_dispatch: { transport: 'webrtc-v1', scheduler: 'w2m_run' },
-        file_distribution: { engine: 'webtorrent', transport: 'webrtc-v1' },
+        task_dispatch: { transport: TORRENT_DEFAULT_TRANSPORT, scheduler: 'w2m_run' },
+        file_distribution: {
+          engine: 'webtorrent',
+          transport: TORRENT_DEFAULT_TRANSPORT,
+          default_transport: TORRENT_DEFAULT_TRANSPORT,
+        },
       },
+      transports,
       engine: {
         available: this.client !== null,
         loading: this.clientPromise !== null,

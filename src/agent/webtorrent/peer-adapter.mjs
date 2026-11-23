@@ -5,11 +5,12 @@
  * `simple-peer`-like object. We use the latter: the object must expose `id`, `connected`, stream
  * methods, and `connect`/`error`/`end` events. `Peer.createWebRTCPeer()` then runs the standard
  * BitTorrent wire over it, so the torrent engine never learns that the underlying channel is the
- * W2M pool rather than a browser's `RTCPeerConnection`.
+ * W2M transport abstraction rather than a browser's `RTCPeerConnection`.
  *
- * Ownership rule: the adapter **borrows** the pair. `destroy()` ends only this logical torrent
- * stream and unsubscribes nothing from the pool; it never calls `closePeer`, exactly like the
- * desktop and Teams rows. The pool is shared with task dispatch and other artifacts.
+ * Ownership rule: the adapter **borrows** the transport binding. `destroy()` ends only this
+ * logical torrent stream and releases no transport resource; it never closes the shared pair,
+ * exactly like the desktop and Teams rows. The transport is shared with task dispatch and other
+ * artifacts.
  */
 
 import { Duplex } from 'node:stream';
@@ -43,23 +44,23 @@ function toBuffer(chunk) {
  * @param {object} input
  * @param {string} input.peer Target machine id.
  * @param {string|Buffer} input.infoHash
- * @param {{send: Function}} input.pool Shared WebRTC pool; only `send` is used.
+ * @param {{send: Function, name?: string}} input.transport Byte transport binding; only `send` is used.
  * @param {number} [input.writeTimeoutMs]
  * @param {(error: Error) => void} [input.onError]
- * @returns {Duplex & {id: string, peer: string, infoHash: string, feed: (chunk: Buffer) => void, stats: object}}
+ * @returns {Duplex & {id: string, peer: string, infoHash: string, transport: string|null, feed: (chunk: Buffer) => void, stats: object}}
  */
 export function createTorrentPeerAdapter({
   peer,
   infoHash,
-  pool,
+  transport,
   writeTimeoutMs = 15_000,
   onError = null,
 }) {
   const hash = normalizeInfoHash(infoHash);
   if (hash === null) throw new TypeError('torrent peer adapter: infoHash must be 40 hex or 20-byte Buffer');
   if (typeof peer !== 'string' || peer === '') throw new TypeError('torrent peer adapter: peer is required');
-  if (pool === null || typeof pool !== 'object' || typeof pool.send !== 'function') {
-    throw new TypeError('torrent peer adapter: pool must expose send()');
+  if (transport === null || typeof transport !== 'object' || typeof transport.send !== 'function') {
+    throw new TypeError('torrent peer adapter: transport must expose send()');
   }
 
   const stats = {
@@ -119,7 +120,7 @@ export function createTorrentPeerAdapter({
         return finish(wrapped);
       }
 
-      Promise.resolve(pool.send(peer, frame)).then(
+      Promise.resolve(transport.send(peer, frame)).then(
         (result) => {
           if (result?.ok !== true) {
             const error = new Error(result?.detail ?? result?.code ?? 'P2P_V2_SEND_FAILED');
@@ -155,6 +156,7 @@ export function createTorrentPeerAdapter({
   adapter.id = peer;
   adapter.peer = peer;
   adapter.infoHash = hash;
+  adapter.transport = typeof transport.name === 'string' ? transport.name : null;
   adapter.connected = true;
   // WebTorrent attaches its own error handler after `addPeer`; this guard closes the window before
   // that handler exists. Errors remain in `stats.last_error` and are still delivered to the torrent.
@@ -171,6 +173,7 @@ export function createTorrentPeerAdapter({
   adapter.diagnostics = () => ({
     peer,
     info_hash: hash,
+    transport: adapter.transport,
     connected: adapter.connected === true && !adapter.destroyed,
     destroyed: adapter.destroyed,
     ...stats,

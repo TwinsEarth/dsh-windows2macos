@@ -149,6 +149,10 @@ function peersOf(args) {
   return stringArray(args?.peers);
 }
 
+function transportOf(args) {
+  return typeof args?.transport === 'string' && args.transport.trim() !== '' ? args.transport.trim() : undefined;
+}
+
 /**
  * Build the six tools once per mount.
  *
@@ -177,14 +181,18 @@ export function buildTools({ service, defineTool }) {
   register({
     name: 'p2p_v2_share',
     description:
-      'Seed one file or directory with WebTorrent and optionally attach V1 WebRTC peers by machine id. Requires the optional WebTorrent engine and confirm:"share". The magnet URI is returned for other machines to join; file pieces travel over V1 DataChannels, not relay.',
+      'Seed one file or directory with WebTorrent and optionally attach peers by machine id over a named transport. Requires the optional WebTorrent engine and confirm:"share". The magnet URI is returned for other machines to join; file pieces travel over the transport DataChannels, not relay.',
     parameters: {
       path: { type: 'string', required: true, description: 'Absolute or project-relative file or directory to seed.' },
       name: { type: 'string', description: 'Optional torrent name (defaults to the file or directory name).' },
       peers: {
         type: 'array',
         items: { type: 'string' },
-        description: 'Machine ids to attach immediately. Each id opens or reuses one shared V1 pair.',
+        description: 'Machine ids to attach immediately. Each id opens or reuses one shared transport pair.',
+      },
+      transport: {
+        type: 'string',
+        description: 'Torrent transport name registered in this process; defaults to "webrtc-v1".',
       },
       confirm: {
         type: 'string',
@@ -204,6 +212,7 @@ export function buildTools({ service, defineTool }) {
           path: args.path,
           name: typeof args.name === 'string' ? args.name : '',
           peers: peersOf(args),
+          transport: transportOf(args),
         }),
       );
     },
@@ -212,7 +221,7 @@ export function buildTools({ service, defineTool }) {
   register({
     name: 'p2p_v2_add',
     description:
-      'Join an existing WebTorrent swarm from a magnet URI and download into a directory, optionally attaching V1 WebRTC peers by machine id. Requires confirm:"add" because it writes files. The V1 peer must be attached before metadata can be fetched from a trackerless magnet.',
+      'Join an existing WebTorrent swarm from a magnet URI and download into a directory, optionally attaching peers by machine id over a named transport. Requires confirm:"add" because it writes files. The peer must be attached before metadata can be fetched from a trackerless magnet.',
     parameters: {
       magnet: { type: 'string', required: true, description: 'Magnet URI returned by p2p_v2_share.' },
       path: { type: 'string', required: true, description: 'Destination directory; created when absent.' },
@@ -220,6 +229,10 @@ export function buildTools({ service, defineTool }) {
         type: 'array',
         items: { type: 'string' },
         description: 'Machine ids to attach immediately. The seed machine is usually one of them.',
+      },
+      transport: {
+        type: 'string',
+        description: 'Torrent transport name registered in this process; defaults to "webrtc-v1".',
       },
       confirm: {
         type: 'string',
@@ -237,18 +250,29 @@ export function buildTools({ service, defineTool }) {
       }
       const guard = guardPath(args.path);
       if (guard.ok !== true) return jsonText(guard);
-      return jsonText(await service.add({ magnet: args.magnet, path: args.path, peers: peersOf(args) }));
+      return jsonText(
+        await service.add({
+          magnet: args.magnet,
+          path: args.path,
+          peers: peersOf(args),
+          transport: transportOf(args),
+        }),
+      );
     },
   });
 
   register({
     name: 'p2p_v2_attach',
     description:
-      'Attach one V1 WebRTC peer to one active share. The peer is one logical torrent stream over the shared pool; this never closes the pair and never starts a relay data path. Idempotent per (share, machine).',
+      'Attach one peer to one active share over a named transport. The peer is one logical torrent stream over the shared transport binding; this never closes the pair and never starts a relay data path. Idempotent per (share, machine).',
     parameters: {
       shareId: { type: 'string', description: 'Share id returned by share/add.' },
       infoHash: { type: 'string', description: 'Torrent info hash, when shareId is not known.' },
       machineId: { type: 'string', required: true, description: 'Target machine id to attach.' },
+      transport: {
+        type: 'string',
+        description: 'Torrent transport name; defaults to the share transport, then "webrtc-v1".',
+      },
     },
     output: textOutput,
     async execute(args = {}) {
@@ -257,6 +281,7 @@ export function buildTools({ service, defineTool }) {
           share_id: args.shareId,
           info_hash: args.infoHash,
           machine_id: args.machineId,
+          transport: transportOf(args),
         }),
       );
     },
