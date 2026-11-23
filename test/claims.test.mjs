@@ -726,10 +726,12 @@ describe('the release tree', () => {
       contract.documents.length,
       `every tree document must be accounted for: ${contract.counts}`,
     );
+    // Optional-if-absent rows (WORKSPACE.md, gitignored) legitimately have no file in a clean checkout.
+    const presentExclusions = DOCUMENT_EXCLUSIONS.filter((row) => existsSync(join(ROOT, row.path)));
     assert.equal(
       contract.excluded.length,
-      DOCUMENT_EXCLUSIONS.length,
-      `every declared exclusion must correspond to a document in the tree: ${contract.counts}`,
+      presentExclusions.length,
+      `every declared exclusion that is present in the tree must be accounted for: ${contract.counts}`,
     );
   });
 
