@@ -167,6 +167,12 @@ jobs:
         run: npm install --no-audit --no-fund
 
       - name: Unit and release suites (package.json#scripts.test, via npm test)
+        # Git Bash on Windows, not the default PowerShell: the declared suite is now one
+        # `node --test ...` command of ~9.7 KB, and PowerShell's CreateProcess path caps the
+        # command line at 8,191 characters ("The command line is too long"). Bash passes the
+        # same argv directly, under Windows' 32,767-character limit, so the suite that every
+        # other platform runs is not silently unavailable on the platform this plugin targets.
+        shell: bash
         # THE LIST IS NOT HERE ON PURPOSE. It used to be: twenty-three paths, hand-maintained,
         # and stale -- six suites that exist, are named by `scripts.test`, and pass on a developer's
         # machine ran in no workflow at all, `test/claims.test.mjs` among them. `npm test` runs
