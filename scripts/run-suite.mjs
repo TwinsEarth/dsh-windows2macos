@@ -41,6 +41,7 @@ if (firstFile < 0) {
   process.exit(2);
 }
 const flags = tokens.slice(0, firstFile);
+if (flags[0] === 'node') flags.shift();
 const files = tokens.slice(firstFile).filter((token) => token.endsWith('.test.mjs'));
 
 const batches = [];
