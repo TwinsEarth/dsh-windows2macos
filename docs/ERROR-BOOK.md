@@ -7,6 +7,7 @@
 | EB-001 | 3.5.8 → 3.5.9 | 已修复，GitHub Release 已发布；npm 待 2FA 批准 |
 | EB-002 | 3.5.9 发布门禁 | 已修复，Compat 重跑验证中 |
 | EB-003 | 3.5.8 npm 暂存包 | 待 reject，禁止批准 |
+| EB-004 | WORKSPACE.md 排除在干净检出失效 | 已修复，待分支 CI 验证 |
 
 ## EB-001 dsh-teams 启动报 `Cannot find module '../../lib/tool-kit.js'`
 
@@ -91,4 +92,34 @@ and that reason is not on the accepted list
 **防复发**
 
 - 版本发布后若发现阻断性缺陷，先 reject 未批准的 stage，再升版本重发。
+
+## EB-004 干净检出时 WORKSPACE.md 排除被判定为 stale
+
+**现象**
+
+发布门禁报：
+
+```
+FAIL packed tarball (...): the exclusion of WORKSPACE.md is stale:
+there is no such file in the tree, so the row excuses nothing and hides the next document that takes its name
+```
+
+claims 同时有 2 条断言不一致（树文档计数 198 !== 197，excluded 2 但实际只有 RELEASE-STATUS.md 在树里）。
+
+**根因**
+
+`WORKSPACE.md` 是本机 `gitignore` 的开发说明，只在开发机存在。`DOCUMENT_EXCLUSIONS` 把它当必存在的文件排除，`documentContract` 对“文件不存在”直接判 stale；`test/claims.test.mjs` 又按 `DOCUMENT_EXCLUSIONS.length` 断言排除数，干净检出（CI）必然失败。
+
+**修复**
+
+- `DOCUMENT_EXCLUSIONS` 中 `WORKSPACE.md` 行增加 `optionalIfAbsent: true`。
+- `documentContract` 在文件不存在且 `optionalIfAbsent` 时跳过 stale 判定，并从 `rows` 中移除，保证 `shipped + excluded === documents`。
+- `claims` 改为只统计“在树中实际存在的排除行”数量。
+- 用临时移走 `WORKSPACE.md` 的方式模拟干净检出，`test/claims.test.mjs` 0 失败。
+
+**防复发**
+
+- 任何依赖开发者本机文件的排除都必须标 `optionalIfAbsent`，不能假定文件一定在树里。
+- 文档计数断言应基于“实际存在的排除项”，而不是常量数组长度。
+
 - 批准 npm stage 前，用 `npm stage download` 解包核对关键文件内容，而不是只看版本号。
