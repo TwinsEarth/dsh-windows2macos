@@ -1,0 +1,26 @@
+{
+  "version": "3.5.9",
+  "case": "TEAMS-SUBPLUGIN-DEFINETOOL-359",
+  "kind": "positive",
+  "machines": ["cb8423db-69b0-44b5-ac8a-a452b9edffd9"],
+  "executed_at": "2026-11-23T19:20:00+08:00",
+  "executor": "agent",
+  "task_id": "w2m-359-teams-subplugin-startup",
+  "requirement": "v3.5.9 release candidate: dsh-teams must activate without a missing module, resolving defineTool through the shared loader used by the other sub-plugins, and must still mount w2m_team_status, w2m_team_room and w2m_team_artifact.",
+  "commands": [
+    ["node", "--test", "--test-force-exit", "test/teams-plugin.test.mjs"],
+    ["node", "--test", "--test-force-exit", "test/claims.test.mjs"],
+    ["node", "--input-type=module", "-e", "import('.../src/plugin/teams-plugin.mjs').then(m => console.log(typeof m.apply, typeof m.buildTools))"]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "failure": "Before the fix, enabling dsh-teams failed with Error: Cannot find module '../../lib/tool-kit.js' from src/plugin/teams-plugin.mjs; the file is absent from both the tree and the tarball.",
+      "fix": "teams-plugin.mjs now imports loadDefineTool from ./tools/shared.mjs, the same loader p2p-webrtc-plugin and backup-plugin use; createRequire and the lib/tool-kit.js reference were removed.",
+      "regression": "A new case mounts the plugin without injecting defineTool and asserts the three tool names are registered; test/teams-plugin.test.mjs: 12 tests, 12 pass, 0 fail.",
+      "claims": "After repacking, test/claims.test.mjs: 48 assertions, 47 pass, 1 accepted skip, 0 fail.",
+      "installed_entry": "The module at the installed profile path imports cleanly and exposes apply and buildTools as functions after the same file was copied into the installed package.",
+      "subplugins": "dsh-desktop, dsh-backup and dsh-backup-plugin remain disabled: true in cordis.patch.yml; the Teams row is opt-in and only mounts when enabled."
+    }
+  }
+}
