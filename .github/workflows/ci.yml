@@ -167,12 +167,20 @@ jobs:
         run: npm install --no-audit --no-fund
 
       - name: Unit and release suites (package.json#scripts.test, via npm test)
-        # Git Bash on Windows, not the default PowerShell: the declared suite is now one
-        # `node --test ...` command of ~9.7 KB, and PowerShell's CreateProcess path caps the
-        # command line at 8,191 characters ("The command line is too long"). Bash passes the
-        # same argv directly, under Windows' 32,767-character limit, so the suite that every
-        # other platform runs is not silently unavailable on the platform this plugin targets.
+        # The declared suite is one `node --test ...` command of ~9.7 KB on Windows, where
+        # npm runs scripts through cmd.exe and the command line is capped at 8,191
+        # characters ("The command line is too long"). Windows therefore runs the batching
+        # wrapper, which reads package.json#scripts.test -- the same list npm test runs
+        # elsewhere -- and splits it into two argv batches under the limit. Trimming or
+        # forking the list for Windows would silently drop suites from the release gate on
+        # the platform this plugin targets.
         shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            node scripts/run-suite.mjs test
+          else
+            npm test
+          fi
         # THE LIST IS NOT HERE ON PURPOSE. It used to be: twenty-three paths, hand-maintained,
         # and stale -- six suites that exist, are named by `scripts.test`, and pass on a developer's
         # machine ran in no workflow at all, `test/claims.test.mjs` among them. `npm test` runs
@@ -180,7 +188,6 @@ jobs:
         # one edit in one place. `scripts/preflight.mjs` verifies that this workflow still covers
         # every suite that script declares (check name: "workflow wiring"), and refuses a workflow
         # that hand-lists two or more suite paths on one `node --test` line.
-        run: npm test
 
       - name: End-to-end suites (package.json#scripts.test:e2e, via npm run test:e2e)
         # Same rule, same reason. `--test-force-exit` is inside the script: each simulated machine
