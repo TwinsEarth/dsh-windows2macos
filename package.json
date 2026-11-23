@@ -255,7 +255,9 @@
     "workspace-guard:fix": "node scripts/workspace-registry-guard.mjs --fix",
     "test:relay-ledger": "node --test --test-force-exit test/relay-ledger.test.mjs",
     "test:peer-status-last-error": "node --test --test-force-exit test/peer-status-last-error.test.mjs",
-    "test:p2p-v2": "node --test --test-force-exit test/p2p-v2.test.mjs"
+    "test:p2p-v2": "node --test --test-force-exit test/p2p-v2.test.mjs",
+    "desktop:p7": "node scripts/desktop-webrtc-p7.mjs",
+    "test:desktop-p7": "node --test --test-force-exit test/remote-view-route.test.mjs test/p2p-webrtc-transport.test.mjs test/p2p-webrtc-pool-runtime.test.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
