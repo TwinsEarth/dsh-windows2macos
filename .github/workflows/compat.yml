@@ -549,6 +549,13 @@ jobs:
           W2M_DSH_ROOT: ${{ steps.host.outputs.root }}
           W2M_DSH_RUNTIME: ${{ steps.host.outputs.root }}/deepseek-harness
           W2M_DSH_BROWSER: ${{ steps.browser.outputs.path }}
+          # The archive-tab assertion is opt-in (`W2M_SURFACES_PROBE=1` enables the dsh-backup-plugin row
+          # in the throwaway profile and drives it in the real page). Without this the assertion SKIPs,
+          # and this gate classifies every skip as a failure -- which is what v3.6.0's first run hit:
+          # "shows the archive tab only for an enabled archive row was SKIPPED". Enable the probe here
+          # rather than teaching the verdict program to excuse it: a row this gate can run is a row it
+          # must run.
+          W2M_SURFACES_PROBE: '1'
           TAP_FILE: ${{ runner.temp }}/loader-entry.tap
           TEST_EXIT_FILE: ${{ runner.temp }}/loader-entry.exit
         run: |
