@@ -31,14 +31,14 @@ WebTorrent 文件面不在本文安装范围内。
 
 ## 1. 前置条件
 
-| 项 | 要求 |
-| --- | --- |
+| 项      | 要求                                                                                   |
+| ------- | -------------------------------------------------------------------------------------- |
 | Node.js | `>= 20.19.0`；生产建议 22 LTS，signal 的 WebSocket 探针要求 Node 22 的全局 `WebSocket` |
-| DSH | `>= 0.2.0 < 0.3.0` |
-| 插件 | `@twinsearth/w2m-dsh-plugin@3.6.0` 或包含 P4/P5 的同版本构建 |
-| relay | 已部署，且包含 `/v1/remote/ack` 与 `/v1/peer/<machine_id>` |
-| TLS | signal 对外必须是 `wss://`；relay 按现有部署要求 |
-| 包依赖 | **不新增 runtime dependency**；`node-datachannel` 只装在每台机器的 provider 目录 |
+| DSH     | `>= 0.2.0 < 0.3.0`                                                                     |
+| 插件    | `@twinsearth/w2m-dsh-plugin@3.6.0` 或包含 P4/P5 的同版本构建                           |
+| relay   | 已部署，且包含 `/v1/remote/ack` 与 `/v1/peer/<machine_id>`                             |
+| TLS     | signal 对外必须是 `wss://`；relay 按现有部署要求                                       |
+| 包依赖  | **不新增 runtime dependency**；`node-datachannel` 只装在每台机器的 provider 目录       |
 
 先确认 Node 与包入口：
 
@@ -121,7 +121,7 @@ curl -fsS http://127.0.0.1:8788/health
 健康响应示例：
 
 ```json
-{"ok":true,"protocol":"w2m-webrtc/1","uptime_ms":12345,"rooms":0}
+{ "ok": true, "protocol": "w2m-webrtc/1", "uptime_ms": 12345, "rooms": 0 }
 ```
 
 字段以实际服务器实现为准；关键是 `ok:true`。
@@ -278,7 +278,7 @@ providerCwd: 'C:/Users/me/.w2m/webrtc-provider'
 `remote-view.json` 的优先级高于行配置：
 
 ```json
-{"enabled":true,"transport":"webrtc","updatedAt":"2026-11-24T00:00:00.000Z"}
+{ "enabled": true, "transport": "webrtc", "updatedAt": "2026-11-24T00:00:00.000Z" }
 ```
 
 - 路径：`<DSH_HOME>/xclient/remote-view.json`，默认 `~/.dsh/xclient/remote-view.json`；
@@ -324,17 +324,17 @@ node "$W2M_PLUGIN_DIR/scripts/desktop-webrtc-readiness.mjs" \
 
 它检查：
 
-| 检查 | 语义 |
-| --- | --- |
-| `node_version` | `>= 20.19`；WebSocket 探针建议 22 |
-| `identity` | `device.json` 有 `machine_id` / `device_token`；不打印 token |
-| `device_key` | `device.key` 可加载；只输出公钥指纹 |
-| `remote_config` | `remote-view.json` 的 `transport` / `enabled`；文件不存在为 warn |
-| `provider_cwd` / `provider_script` / `provider_package` / `provider_module` | provider 目录、脚本、`node-datachannel` 可解析；不 spawn |
-| `signal_health` / `signal_websocket` | TLS `/health` 与一次短命 join；不发送应用数据 |
-| `pool` | 从 diagnostics 快照检查 `pool_available`、`pool_owner=dsh-p2p-webrtc`、`ready` |
-| `peer_static_key` | `GET /v1/peer/<peer>` 的 `peer.static_key` 是 32-byte base64；只输出指纹 |
-| `relay_ack` | `GET /v1/remote/ack` 返回 `REMOTE_ACK_NOT_FOUND`，证明路由存在；不伪造 ack |
+| 检查                                                                        | 语义                                                                           |
+| --------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| `node_version`                                                              | `>= 20.19`；WebSocket 探针建议 22                                              |
+| `identity`                                                                  | `device.json` 有 `machine_id` / `device_token`；不打印 token                   |
+| `device_key`                                                                | `device.key` 可加载；只输出公钥指纹                                            |
+| `remote_config`                                                             | `remote-view.json` 的 `transport` / `enabled`；文件不存在为 warn               |
+| `provider_cwd` / `provider_script` / `provider_package` / `provider_module` | provider 目录、脚本、`node-datachannel` 可解析；不 spawn                       |
+| `signal_health` / `signal_websocket`                                        | TLS `/health` 与一次短命 join；不发送应用数据                                  |
+| `pool`                                                                      | 从 diagnostics 快照检查 `pool_available`、`pool_owner=dsh-p2p-webrtc`、`ready` |
+| `peer_static_key`                                                           | `GET /v1/peer/<peer>` 的 `peer.static_key` 是 32-byte base64；只输出指纹       |
+| `relay_ack`                                                                 | `GET /v1/remote/ack` 返回 `REMOTE_ACK_NOT_FOUND`，证明路由存在；不伪造 ack     |
 
 **pool 为什么必须从快照读**：pool 是 DSH 进程内状态，独立脚本无法 import 到同一个 registry。
 脚本不会自己建 pool，也不会 spawn provider 来“凑一个 ready”。因此生产验收要么给
@@ -431,7 +431,7 @@ HTML，说明 relay 版本没有这个路由，`auto`/`webrtc` 都无法按预�
 单机回滚：
 
 ```json
-{"enabled":true,"transport":"relay"}
+{ "enabled": true, "transport": "relay" }
 ```
 
 写入 `~/.dsh/xclient/remote-view.json` 即可，无需重启；`/config` 会显示
@@ -447,17 +447,17 @@ HTML，说明 relay 版本没有这个路由，`auto`/`webrtc` 都无法按预�
 
 ## 7. 故障定位
 
-| 现象 | 命名错误 | 处理 |
-| --- | --- | --- |
-| pool 没发布 | `pool_available:false` / `WEBRTC_POOL_BAD_CONFIG` | 确认 `dsh-p2p-webrtc` 已启用、`mode:pool`、`autoStart:true`、`signalUrl` 非空 |
-| 机器没有设备密钥 | `WEBRTC_POOL_DEVICE_KEY_UNAVAILABLE` | 恢复 `device.key`，不要随意开启 `allowCreateDeviceKey` |
-| provider 目录没装 | `WEBRTC_PROVIDER_UNAVAILABLE` / readiness `PROVIDER_MODULE_MISSING` | 在 `providerCwd` 执行 `npm install --save-exact node-datachannel@...` |
-| provider 子进程失败 | `WEBRTC_PROVIDER_SPAWN_FAILED` | 用绝对路径跑 provider；确认 `node` 在 DSH 的 PATH 中 |
-| signal 不可达 | `SIGNAL_HEALTH_FAILED` / `WEBRTC_SIGNAL_*` | 检查 `wss://`、nginx Upgrade、token、`--path` |
-| ack 路由缺失 | `REMOTE_ACK_ROUTE_MISSING` / `WEBRTC_ACK_UNAVAILABLE` | 升级 relay 到含 `/v1/remote/ack` 的版本 |
-| peer 没有 static key | `PEER_STATIC_KEY_UNAVAILABLE` | 对方先 announce/上线；或显式提供 peer key 做离线核对 |
-| 严格 WebRTC 失败 | `webrtc.attempted:true, ok:false` | 查 `fallback_reason`、provider、ICE/TURN；不要悄悄改 relay |
-| 旧客户端仍想 P2P | `allowLegacyP2P` | 生产保持 false；旧路径只用于兼容，不是默认 |
+| 现象                 | 命名错误                                                            | 处理                                                                          |
+| -------------------- | ------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| pool 没发布          | `pool_available:false` / `WEBRTC_POOL_BAD_CONFIG`                   | 确认 `dsh-p2p-webrtc` 已启用、`mode:pool`、`autoStart:true`、`signalUrl` 非空 |
+| 机器没有设备密钥     | `WEBRTC_POOL_DEVICE_KEY_UNAVAILABLE`                                | 恢复 `device.key`，不要随意开启 `allowCreateDeviceKey`                        |
+| provider 目录没装    | `WEBRTC_PROVIDER_UNAVAILABLE` / readiness `PROVIDER_MODULE_MISSING` | 在 `providerCwd` 执行 `npm install --save-exact node-datachannel@...`         |
+| provider 子进程失败  | `WEBRTC_PROVIDER_SPAWN_FAILED`                                      | 用绝对路径跑 provider；确认 `node` 在 DSH 的 PATH 中                          |
+| signal 不可达        | `SIGNAL_HEALTH_FAILED` / `WEBRTC_SIGNAL_*`                          | 检查 `wss://`、nginx Upgrade、token、`--path`                                 |
+| ack 路由缺失         | `REMOTE_ACK_ROUTE_MISSING` / `WEBRTC_ACK_UNAVAILABLE`               | 升级 relay 到含 `/v1/remote/ack` 的版本                                       |
+| peer 没有 static key | `PEER_STATIC_KEY_UNAVAILABLE`                                       | 对方先 announce/上线；或显式提供 peer key 做离线核对                          |
+| 严格 WebRTC 失败     | `webrtc.attempted:true, ok:false`                                   | 查 `fallback_reason`、provider、ICE/TURN；不要悄悄改 relay                    |
+| 旧客户端仍想 P2P     | `allowLegacyP2P`                                                    | 生产保持 false；旧路径只用于兼容，不是默认                                    |
 
 ## 8. 安全检查清单
 
@@ -470,15 +470,16 @@ HTML，说明 relay 版本没有这个路由，`auto`/`webrtc` 都无法按预�
 - `transport:'webrtc'` 严格模式上线，`auto` 仅用于迁移/回滚窗口。
 - readiness 的 `pool` 必须来自真实 diagnostics 快照；`--skip-pool` 的结果不能当生产验收。
 
-## 9. P6 验收边界
+## 9. P6 验收边界与 P7 结果
 
 本文和 `scripts/desktop-webrtc-readiness.mjs` 只做部署与只读 readiness。真实多机 ICE/DTLS
-矩阵、30 分钟 1 Hz soak、9 台设备 soak 与最终 `docs/acceptance/3.7.0/DESKTOP-WEBRTC-DEFAULT.json`
-属于 P7；本文件不伪造这些结果。
+矩阵、30 分钟 1 Hz soak 与最终验收 JSON 属于 P7；P7 的实测结果与现网 NAT 限制见
+`docs/acceptance/3.7.0/DESKTOP-WEBRTC-DEFAULT.md` 和 `.json`。本文件不伪造这些结果。
 
 相关文档：
 
 - `docs/P2P-WEBRTC.md`：协议、provider JSON-line、pool 语义；
 - `docs/design/DESKTOP-DEFAULT-WEBRTC-PLAN.md`：P0–P7 计划；
 - `docs/acceptance/3.6.0/P4-DESKTOP-ROW-CONFIG.md`：行配置与回落；
-- `docs/acceptance/3.6.0/P5-DIAGNOSTICS.md`：诊断字段与客户端标签。
+- `docs/acceptance/3.6.0/P5-DIAGNOSTICS.md`：诊断字段与客户端标签；
+- `docs/acceptance/3.7.0/DESKTOP-WEBRTC-DEFAULT.md`：P7 真实引擎矩阵、故障与 soak 结果。
