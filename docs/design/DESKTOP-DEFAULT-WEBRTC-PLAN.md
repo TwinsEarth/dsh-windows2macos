@@ -133,6 +133,11 @@ getWebRtcPoolRuntime()
 
 ### P2：P2P 子插件成为 pool 提供者（1.5 天）
 
+> 状态：已落地（2026-11-23）。`dsh-p2p-webrtc` 在 `mode: 'pool'` 下成为共享 pool 的
+> owner；root `w2m` 改为只从 registry acquire，不再构建、也不再在 teardown 停止 pool。
+> `p2p_webrtc_stop` 默认只 `closePeer`，整池停止必须 `confirm:"pool-stop"`。
+> 验收记录：`docs/acceptance/3.6.0/P2-POOL-PROVIDER.md`。
+
 修改 `src/plugin/p2p-webrtc-plugin.mjs`：
 
 - `apply()` 在 `autoStart:true` 时 `await runtime.ensure()`，失败只记录命名原因，不阻塞 mount。
@@ -146,6 +151,9 @@ getWebRtcPoolRuntime()
   - 新增生产 profile 示例：`dsh-p2p-webrtc` enabled、`autoStart:true`、`signalUrl`、`providerCommand`；
   - `dsh-desktop` 在生产 profile enabled、`transport:webrtc`。
 - 测试：`test/p2p-webrtc-plugin.test.mjs` 增补 pool 模式、owner 冲突、stop 不拆桌面/Teams。
+- `src/plugin/tools/shared.mjs`：root 不再 `createWebRtcPoolRuntime`；它只 `getSharedWebRtcPool()`，
+  并把“尚未发布”记录为 `WEBRTC_POOL_UNAVAILABLE`，等待 P3 晚绑定。root teardown 不再 `pool.stop()`，
+  因为 pool 的生命周期属于 `dsh-p2p-webrtc`。
 
 ### P3：目标端与任务面晚绑定（1 天）
 

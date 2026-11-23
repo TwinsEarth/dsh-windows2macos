@@ -13,12 +13,16 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { DeviceKey } from '../src/agent/crypto.mjs';
+import { createWebRtcPoolRegistry } from '../src/plugin/webrtc-pool-registry.mjs';
 import {
   apply,
   buildTools,
   describeConfig,
   normalizePluginConfig,
   P2PWebRtcService,
+  P2P_WEBRTC_MODES,
+  P2P_WEBRTC_POOL_CODE,
+  P2P_WEBRTC_POOL_OWNER,
   P2P_WEBRTC_ROW_ID,
   TOOL_NAMES,
 } from '../src/plugin/p2p-webrtc-plugin.mjs';
@@ -79,10 +83,14 @@ describe('dsh-p2p-webrtc wiring', () => {
     const row = patchRow(P2P_WEBRTC_ROW_ID);
     assert.match(row, /name: '@twinsearth\/w2m-dsh-plugin\/dsh-p2p-webrtc'/);
     assert.match(row, /disabled: true/);
+    assert.match(row, /mode: 'pool'/);
     assert.match(row, /signalUrl: ''/);
+    assert.match(row, /rabbitUrl: ''/);
     assert.match(row, /providerCommand: ''/);
     assert.match(row, /autoStart: false/);
     assert.equal(row.includes('peerKeys: {}'), true);
+    assert.match(patch, /Production profile example/);
+    assert.match(patch, /transport: 'webrtc'/);
   });
 
   it('mounts four tools and stays inert until start', async () => {
@@ -170,5 +178,282 @@ describe('dsh-p2p-webrtc wiring', () => {
       [...TOOL_NAMES],
     );
     assert.equal(definitions[0].parameters && typeof definitions[0].parameters, 'object');
+  });
+});
+
+function fakePool() {
+  const peers = new Map();
+  const calls = { ensure: [], close: [], stops: 0, probes: [] };
+  const pool = {
+    peers,
+    calls,
+    async ensure(peer) {
+      calls.ensure.push(peer);
+      if (!peers.has(peer)) {
+        const transport = {
+          diagnostics: () => ({ state: 'ready', path: { verdict: 'direct' }, secure: { state: 'ready' } }),
+          probe: async (timeoutMs) => {
+            calls.probes.push({ peer, timeoutMs });
+            return { ok: true, peer, rtt_ms: 12 };
+          },
+        };
+        peers.set(peer, { peer, transport, role: 'client', room: 'pair' });
+      }
+      const record = peers.get(peer);
+      return { ok: true, peer, role: record.role, room: record.room, transport: record.transport };
+    },
+    peerStatus(peer) {
+      const record = peers.get(peer);
+      return record === undefined ? null : { peer, state: 'ready', role: record.role, room: record.room };
+    },
+    async closePeer(peer) {
+      calls.close.push(peer);
+      const existed = peers.delete(peer);
+      return { ok: true, peer, closed: existed };
+    },
+    async send(peer) {
+      return { ok: true, peer, fragments: 1 };
+    },
+    async stop() {
+      calls.stops += 1;
+      peers.clear();
+      return { ok: true, peers: 0 };
+    },
+    diagnostics() {
+      return {
+        peer_count: peers.size,
+        peers: [...peers.keys()].map((peer) => pool.peerStatus(peer)),
+      };
+    },
+  };
+  return pool;
+}
+
+function fakeRuntime({ pool = fakePool(), owner = P2P_WEBRTC_POOL_OWNER, ensureResult = null } = {}) {
+  const calls = { ensure: 0, stops: 0 };
+  return {
+    pool,
+    owner,
+    calls,
+    async ensure() {
+      calls.ensure += 1;
+      if (ensureResult !== null) return ensureResult;
+      return { ok: true, reused: false, created: true, pool, owner };
+    },
+    status() {
+      return {
+        ready: pool !== null,
+        owner: pool === null ? null : owner,
+        machine_id: 'machine-a',
+        signal_url: 'ws://signal.example/w2m/webrtc',
+        device_key_present: true,
+        diagnostics: pool === null ? null : pool.diagnostics(),
+      };
+    },
+    async stop() {
+      calls.stops += 1;
+      const stopped = pool === null ? { ok: true, peers: 0 } : await pool.stop();
+      return { ok: true, stopped: true, pool: stopped };
+    },
+  };
+}
+
+function poolConfig(extra = {}) {
+  return {
+    mode: 'pool',
+    autoStart: true,
+    signalUrl: 'ws://signal.example/w2m/webrtc',
+    providerCommand: 'node',
+    machineId: 'machine-a',
+    peerMachineId: '',
+    ...extra,
+  };
+}
+
+describe('dsh-p2p-webrtc pool mode (v3.6.0 P2)', () => {
+  it('normalizes pool mode as the autoStart default, single stays explicit', () => {
+    assert.deepEqual(P2P_WEBRTC_MODES, ['pool', 'single']);
+    const auto = normalizePluginConfig({ autoStart: true });
+    assert.equal(auto.mode, 'pool');
+    assert.equal(auto.pool_mode, true);
+    const explicit = normalizePluginConfig({ autoStart: true, mode: 'single' });
+    assert.equal(explicit.mode, 'single');
+    const idle = normalizePluginConfig({});
+    assert.equal(idle.mode, 'single');
+    assert.equal(describeConfig(auto).mode, 'pool');
+  });
+
+  it('autoStart publishes the shared pool and reports owner / peers through status', async () => {
+    const { ctx, definitions } = fakeContext();
+    const pool = fakePool();
+    const runtime = fakeRuntime({ pool });
+    const dispose = await apply(ctx, poolConfig(), {
+      defineTool: (definition) => definition,
+      poolRuntime: runtime,
+    });
+    assert.equal(dispose.ok, true);
+    assert.equal(runtime.calls.ensure, 1, 'autoStart must await the pool once');
+
+    const status = json(
+      await definitions.find((definition) => definition.name === 'p2p_webrtc_status').execute({}),
+    );
+    assert.equal(status.mode, 'pool');
+    assert.equal(status.pool.ready, true);
+    assert.equal(status.pool.owner, P2P_WEBRTC_POOL_OWNER);
+    assert.equal(status.pool.machine_id, 'machine-a');
+    assert.deepEqual(status.pool.peers, []);
+    assert.equal(status.pool.diagnostics.peer_count, 0);
+    assert.equal(status.last_ensure.ok, true);
+  });
+
+  it('start prepares one peer; stop closes only that peer and never stops the pool', async () => {
+    const pool = fakePool();
+    const service = new P2PWebRtcService(normalizePluginConfig(poolConfig()), {
+      poolRuntime: fakeRuntime({ pool }),
+    });
+    const started = await service.start({ peer_machine_id: 'machine-b' });
+    assert.equal(started.ok, true);
+    assert.equal(started.peer, 'machine-b');
+    assert.equal(started.pool.peer_count, 1);
+
+    const refused = await service.stop();
+    assert.equal(refused.ok, false);
+    assert.equal(refused.code, P2P_WEBRTC_POOL_CODE.STOP_REFUSED);
+
+    const closed = await service.stop({ peer_machine_id: 'machine-b' });
+    assert.equal(closed.ok, true);
+    assert.equal(closed.scope, 'peer');
+    assert.equal(closed.closed, true);
+    assert.equal(pool.calls.stops, 0, 'a peer close must not stop the pool desktop and Teams use');
+    assert.deepEqual(pool.calls.close, ['machine-b']);
+    assert.equal(closed.pool.peer_count, 0);
+
+    const stopped = await service.stop({ confirm: 'pool-stop' });
+    assert.equal(stopped.ok, true);
+    assert.equal(stopped.scope, 'pool');
+    assert.equal(pool.calls.stops, 1);
+  });
+
+  it('dispose closes the configured peer only; the pool stays published', async () => {
+    const pool = fakePool();
+    const service = new P2PWebRtcService(normalizePluginConfig(poolConfig({ peerMachineId: 'machine-b' })), {
+      poolRuntime: fakeRuntime({ pool }),
+    });
+    await service.start();
+    const disposed = await service.dispose();
+    assert.equal(disposed.ok, true);
+    assert.equal(disposed.scope, 'peer');
+    assert.deepEqual(pool.calls.close, ['machine-b']);
+    assert.equal(pool.calls.stops, 0);
+  });
+
+  it('probe uses the live pair transport and refuses an unknown peer', async () => {
+    const pool = fakePool();
+    const service = new P2PWebRtcService(normalizePluginConfig(poolConfig()), {
+      poolRuntime: fakeRuntime({ pool }),
+    });
+    await service.start({ peer_machine_id: 'machine-b' });
+    const probed = await service.probe(250, { peer_machine_id: 'machine-b' });
+    assert.equal(probed.ok, true);
+    assert.equal(probed.rtt_ms, 12);
+    assert.deepEqual(pool.calls.probes, [{ peer: 'machine-b', timeoutMs: 250 }]);
+
+    const missing = await service.probe(250, { peer_machine_id: 'machine-c' });
+    assert.equal(missing.ok, false);
+    assert.equal(missing.code, P2P_WEBRTC_POOL_CODE.PEER_NOT_LIVE);
+  });
+
+  it('an owner conflict is logged but does not block the mount', async () => {
+    const { ctx, definitions } = fakeContext();
+    const warnings = [];
+    ctx.logger.warn = (message) => warnings.push(message);
+    const runtime = fakeRuntime({
+      pool: null,
+      ensureResult: {
+        ok: false,
+        code: 'WEBRTC_POOL_OWNER_CONFLICT',
+        detail: 'a different pool is already published',
+      },
+    });
+    const dispose = await apply(ctx, poolConfig(), {
+      defineTool: (definition) => definition,
+      poolRuntime: runtime,
+    });
+    assert.equal(dispose.ok, true);
+    assert.equal(runtime.calls.stops, 0);
+    const status = json(
+      await definitions.find((definition) => definition.name === 'p2p_webrtc_status').execute({}),
+    );
+    assert.equal(status.pool.ready, false);
+    assert.equal(status.last_ensure.ok, false);
+    assert.equal(status.last_ensure.code, 'WEBRTC_POOL_OWNER_CONFLICT');
+    assert.equal(warnings.some((line) => line.includes('WEBRTC_POOL_OWNER_CONFLICT')), true);
+  });
+
+  it('autoStart refuses a pool without a provider and still mounts', async () => {
+    const { ctx, definitions } = fakeContext();
+    const warnings = [];
+    ctx.logger.warn = (message) => warnings.push(message);
+    const dispose = await apply(
+      ctx,
+      { ...poolConfig(), providerCommand: '' },
+      { defineTool: (definition) => definition },
+    );
+    assert.equal(dispose.ok, true);    const status = json(
+      await definitions.find((definition) => definition.name === 'p2p_webrtc_status').execute({}),
+    );
+    assert.equal(status.pool.ready, false);
+    assert.equal(status.last_ensure.code, 'WEBRTC_PROVIDER_UNAVAILABLE');
+    assert.equal(warnings.some((line) => line.includes('WEBRTC_PROVIDER_UNAVAILABLE')), true);
+  });
+
+  it('builds the real runtime with this row as owner and releases only on explicit pool stop', async () => {
+    const registry = createWebRtcPoolRegistry();
+    const pool = fakePool();
+    let builds = 0;
+    const service = new P2PWebRtcService(
+      normalizePluginConfig(
+        { mode: 'pool', autoStart: true, signalUrl: 'ws://signal.example/w2m/webrtc', providerCommand: 'node', machineId: 'machine-a' },
+        { dshHome: 'C:/dsh' },
+      ),
+      {
+        registry,
+        poolFactory: () => {
+          builds += 1;
+          return pool;
+        },
+        deviceKey: DeviceKey.generate('machine-a'),
+      },
+    );
+    const started = await service.start();
+    assert.equal(started.ok, true);
+    assert.equal(started.state, 'pool-ready');
+    assert.equal(builds, 1);
+    assert.equal(registry.state().owner, P2P_WEBRTC_POOL_OWNER);
+    assert.equal(registry.state().pool, pool);
+
+    const status = service.status();
+    assert.equal(status.pool.ready, true);
+    assert.equal(status.pool.owner, P2P_WEBRTC_POOL_OWNER);
+
+    const stopped = await service.stop({ confirm: 'pool-stop' });
+    assert.equal(stopped.ok, true);
+    assert.equal(pool.calls.stops, 1);
+    assert.equal(registry.state().ready, false);
+  });
+
+  it('stop tool refuses the whole pool without the explicit confirmation', async () => {
+    const { definitions, ctx } = fakeContext();
+    const pool = fakePool();
+    const runtime = fakeRuntime({ pool });
+    await apply(ctx, poolConfig(), { defineTool: (definition) => definition, poolRuntime: runtime });
+    const stop = definitions.find((definition) => definition.name === 'p2p_webrtc_stop');
+    const refused = json(await stop.execute({}));
+    assert.equal(refused.ok, false);
+    assert.equal(refused.code, P2P_WEBRTC_POOL_CODE.STOP_REFUSED);
+    const stopped = json(await stop.execute({ confirm: 'pool-stop' }));
+    assert.equal(stopped.ok, true);
+    assert.equal(pool.calls.stops, 1);
+    assert.equal(runtime.calls.stops, 1);
   });
 });

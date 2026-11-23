@@ -44,7 +44,7 @@ import { loadOrCreateIdentity, saveDeviceToken } from '../../agent/identity.mjs'
 import { probeCapsDetailed, detectPlatform } from '../../agent/caps.mjs';
 import { resolveStateDir } from '../../util/cli.mjs';
 import { parseServer } from '../../agent/stun.mjs';
-import { createWebRtcPoolRuntime } from '../p2p-webrtc/pool-runtime.mjs';
+import { getSharedWebRtcPool } from '../webrtc-pool-registry.mjs';
 import { findProfileDir } from '../auto-update.mjs';
 import { readOperatorToken } from '../operator-token.mjs';
 import { schemaProblems, strayParameterProblems } from '../schema-spec.mjs';
@@ -2681,67 +2681,28 @@ async function startLocalStack(ctx, cfg) {
     identityOptions.identity = loaded.identity;
 
     /**
-     * v3.5.8: build the one WebRTC pool this process owns, before the agent is created.
+     * v3.6.0 P2: the root row is a **consumer**, not a pool provider.
      *
-     * The agent borrows it through the `webrtcPool` option; the dispatcher half reaches it through
-     * `inProcessWebRtcPool`. A machine that also runs a separate agent process must not build this
-     * pool here -- two pools on one machine id claim the same signaling role -- so `buildable` is
-     * decided from explicit configuration and `inProcessWebRtcPool` stays null when the agent is not
-     * started in-process.
+     * `dsh-p2p-webrtc` owns the one process pool in the production profile. If this row applied
+     * first (the usual Cordis order), there is no pool yet; building one here would make the root
+     * the owner forever, and every later `dsh-p2p-webrtc` mount would silently borrow a pool whose
+     * signal URL / provider were chosen by the root row. The desktop route and Teams already resolve
+     * the registry on each use, and P3 adds the same late binding to dispatch, so a null here is a
+     * "not published yet" state rather than a second data plane.
      */
     let webrtcPool = null;
-    let webrtcRuntime = null;
     if (cfg.webrtc?.buildable === true) {
-      const relayTransport = createP2PTransport(cfg);
-      /**
-       * Build through the registry instead of `createWebRtcTransportPool` directly. If a
-       * `dsh-p2p-webrtc` row already published the process pool, `ensure()` borrows it and never
-       * constructs a second pool on this machine id. `loadDeviceKey` stays lazy for that case: a
-       * borrowed pool must not fail the root start because the local key file is missing.
-       */
-      webrtcRuntime = createWebRtcPoolRuntime({
-        owner: 'w2m-root',
-        identity: loaded.identity,
-        signalUrl: cfg.webrtc.signal_url,
-        signalToken: cfg.webrtc.signal_token,
-        deviceKeyDir: path.dirname(loaded.path),
-        allowCreateDeviceKey: false,
-        getJson: relayTransport.getJson,
-        loadDeviceKey: () => {
-          const keyLoad = loadDeviceKey(null, loaded.path);
-          if (keyLoad.key === null || keyLoad.key === undefined) {
-            const error = new Error(keyLoad.error ?? 'device key unavailable');
-            error.code = 'DEVICE_KEY_UNAVAILABLE';
-            throw error;
-          }
-          return { key: keyLoad.key };
-        },
-        providerCommand: cfg.webrtc.provider_command,
-        providerArgs: cfg.webrtc.provider_args,
-        providerCwd: cfg.webrtc.provider_cwd,
-        iceServers: cfg.webrtc.ice_servers,
-        preferP2p: cfg.webrtc.prefer_p2p,
-        allowRelay: cfg.webrtc.allow_relay,
-        maxRttMs: cfg.webrtc.max_rtt_ms,
-        connectTimeoutMs: cfg.webrtc.connect_timeout_ms,
-        handshakeTimeoutMs: cfg.webrtc.handshake_timeout_ms,
-        peerTimeoutMs: cfg.webrtc.peer_timeout_ms,
-        statsPollMs: cfg.webrtc.stats_poll_ms,
-        maxFragmentBytes: cfg.webrtc.max_fragment_bytes,
-      });
-      const ensured = await webrtcRuntime.ensure();
-      if (ensured.ok === true) {
-        webrtcPool = ensured.pool;
-        inProcessWebRtcPool = ensured.pool;
-        const quietUrl = webrtcRuntime.status().signal_url ?? cfg.webrtc.signal_url;
-        ctx.logger?.info?.(
-          `w2m: WebRTC pool ${ensured.reused === true ? 'borrowed' : 'ready'} ` +
-            `(owner=${ensured.owner}, ${quietUrl})`,
-        );
+      const shared = getSharedWebRtcPool();
+      if (shared !== null && shared !== undefined) {
+        webrtcPool = shared;
+        inProcessWebRtcPool = shared;
+        ctx.logger?.info?.('w2m: WebRTC pool borrowed from the shared registry');
       } else {
-        // eslint-disable-next-line require-atomic-updates -- cfg.webrtc is this start's own config
-        cfg.webrtc.reason = `${ensured.code}: ${ensured.detail}`;
-        ctx.logger?.warn?.(`w2m: WebRTC pool not built (${ensured.code}: ${ensured.detail})`);
+        cfg.webrtc.reason =
+          'WEBRTC_POOL_UNAVAILABLE: dsh-p2p-webrtc has not published the shared pool yet';
+        ctx.logger?.info?.(
+          'w2m: WebRTC pool not published yet; dispatch keeps the relay path until the provider row starts',
+        );
       }
     } else if (cfg.webrtc?.reason) {
       ctx.logger?.info?.(`w2m: WebRTC data plane inactive: ${cfg.webrtc.reason}`);
@@ -3506,14 +3467,8 @@ async function startLocalStack(ctx, cfg) {
     inProcessAgentStatus = null;
     inProcessWebRtcPool = null;
     await agent.stop();
-    if (webrtcRuntime !== null) {
-      const stopped = await webrtcRuntime.stop();
-      if (stopped.ok !== true && stopped.code !== 'WEBRTC_POOL_NOT_OWNER') {
-        ctx.logger?.warn?.(
-          'w2m: WebRTC pool close failed: ' + (stopped.detail ?? stopped.code ?? 'unknown error'),
-        );
-      }
-    }
+    // The pool is published and owned by `dsh-p2p-webrtc`; this row only borrowed it. Stopping the
+    // root agent must not close the desktop viewer or Teams underneath the operator.
     // v1.6.7: `relay` is only a real relay object when THIS stack started a local relay; a remote-
     // relay stack has null here. The unconditional close() threw, which is what made the first
     // failover attempt stop the stack and never restart it.

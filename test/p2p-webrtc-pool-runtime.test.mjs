@@ -255,12 +255,12 @@ describe('WebRTC pool runtime production singleton', () => {
 });
 
 describe('root w2m wiring', () => {
-  it('builds through the runtime and never publishes the pool directly', () => {
+  it('acquires the shared pool as a consumer and never builds or stops it', () => {
     const source = readFileSync(new URL('../src/plugin/tools/shared.mjs', import.meta.url), 'utf8');
-    assert.match(source, /createWebRtcPoolRuntime/);
-    assert.match(source, /owner: 'w2m-root'/);
+    assert.match(source, /getSharedWebRtcPool\(\)/);
+    assert.doesNotMatch(source, /createWebRtcPoolRuntime/);
+    assert.doesNotMatch(source, /webrtcRuntime\.stop\(\)/);
     assert.doesNotMatch(source, /setSharedWebRtcPool/);
-    assert.match(source, /webrtcRuntime\.stop\(\)/);
   });
 });
 

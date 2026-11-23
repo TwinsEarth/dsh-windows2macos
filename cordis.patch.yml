@@ -262,9 +262,15 @@
       name: '@twinsearth/w2m-dsh-plugin/dsh-p2p-webrtc'
       disabled: true
       config:
+        # 'pool' = publish the shared WebRTC pool for desktop / Teams / P2P V2 (production default);
+        # 'single' = one transport, kept for compatibility and one-pair diagnostics.
+        mode: 'pool'
         # Both sides connect outbound; the server only forwards SDP/ICE and never sees data bytes.
         signalUrl: ''
         signalToken: ''
+        # Empty = this machine's device.json rabbit_url, then W2M_RABBIT_URL. Used only to resolve
+        # peer static keys for the pool; task dispatch itself stays on the pool.
+        rabbitUrl: ''
         room: 'w2m'
         # host or client. Empty means "must be supplied at start"; there is no guessed default.
         role: ''
@@ -290,6 +296,19 @@
         statsPollMs: 2000
         # autoStart is still opt-in even when the row is enabled; mount-time has no process side effects.
         autoStart: false
+
+    # Production profile example (copy into the fleet profile patch, not into the package default):
+    # - id: dsh-p2p-webrtc
+    #   disabled: false
+    #   config:
+    #     mode: 'pool'
+    #     autoStart: true
+    #     signalUrl: 'wss://signal.example/w2m/webrtc'
+    #     providerCommand: 'node'
+    #     providerArgs: ['/opt/w2m/webrtc-provider.mjs']
+    # - id: dsh-desktop
+    #   disabled: false
+    #   config: { transport: 'webrtc', allowLegacyP2P: false }
 
     # P2P V2 文件面 (dsh-p2p-v2): WebTorrent 负责多对多分片，V1 WebRTC 是它的 peer 传输层。
     #
