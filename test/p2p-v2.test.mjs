@@ -48,6 +48,11 @@ const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const TEST_STATE = mkdtempSync(join(tmpdir(), 'w2m-p2p-v2-state-'));
 const pkg = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
 
+// The service's metadata/ready timers are deliberately unref'd so an idle agent can exit. A
+// test whose only pending work is such a timer needs one ref'd handle to keep the harness alive.
+const keepAlive = setInterval(() => {}, 1_000);
+process.on('exit', () => clearInterval(keepAlive));
+
 /** Keep every service test's metadata file out of the real `~/.dsh`. */
 function normalizePluginConfig(config = {}, deps = {}) {
   return normalizePluginConfigBase(config, {
