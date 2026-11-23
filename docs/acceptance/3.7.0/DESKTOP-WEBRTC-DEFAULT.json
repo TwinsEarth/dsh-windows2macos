@@ -1,0 +1,377 @@
+{
+  "version": "3.7.0",
+  "package_version": "3.6.0",
+  "case": "DESKTOP-WEBRTC-DEFAULT-P7",
+  "kind": "positive-with-scope",
+  "ok": true,
+  "executed_at": "2026-11-24T02:20:00+08:00",
+  "executor": "agent",
+  "task_id": "desktop-webrtc-default",
+  "requirement": "v3.7.0 gate: prove the desktop remote-view default on real node-datachannel providers - real ICE/DTLS, Noise-sealed 4 KiB view frames, four directed nodes each acting as viewer and target, named faults, 30-minute 1 Hz soak without memory or handle growth, and the eight production hard metrics.",
+  "scope": {
+    "real_engine": "node-datachannel@0.33.6 loaded from an external provider directory by each node process",
+    "matrix": "2 physical hosts x 2 node processes = 4 logical nodes, 12 directed legs; plus a 4-node / 12-leg run on one host",
+    "physical_full_mesh": "attempted on 4 physical hosts; blocked by the current NAT topology without TURN, recorded in evidence.four_physical_hosts",
+    "production_route": "route semantics asserted by P5/P6 integration tests; P7 adds real transport evidence rather than re-hosting the production HTTP route"
+  },
+  "environment": {
+    "signal": "wss://fruit-joel-signed-spelling.trycloudflare.com/w2m/webrtc",
+    "signal_health": {
+      "ok": true,
+      "protocol": "w2m-webrtc/1"
+    },
+    "controller": "https://oasis-rebates-stat-alaska.trycloudflare.com",
+    "controller_mode": "global serial queue, one leg at a time, 45 s claim timeout",
+    "provider": "node-datachannel@0.33.6",
+    "nodes": [
+      {
+        "id": "p7-tofuture",
+        "host": "TOFUTURE",
+        "lan": "192.168.0.37",
+        "roles": ["viewer", "target"]
+      },
+      {
+        "id": "p7-hsd",
+        "host": "HSD",
+        "lan": "192.168.0.53",
+        "roles": ["viewer", "target"]
+      },
+      {
+        "id": "p7-mac",
+        "host": "Mac mini",
+        "lan": "192.168.3.66",
+        "roles": ["viewer", "target"]
+      },
+      {
+        "id": "p7-im2a",
+        "host": "IM2A",
+        "lan": "192.168.199.211",
+        "roles": ["viewer", "target"]
+      }
+    ],
+    "provider_install": {
+      "tofuture": "E:\\DB\\w2m-webrtc-provider",
+      "hsd": "C:\\Users\\AU\\w2m-webrtc-provider",
+      "mac": "/Users/fang/w2m-webrtc-provider",
+      "im2a": "C:\\Users\\Administrator\\w2m-webrtc-provider",
+      "cloud": "/home/user/w2m-webrtc-provider"
+    }
+  },
+  "commands": [
+    ["npm", "run", "desktop:p7", "--", "--mode", "pair"],
+    ["npm", "run", "desktop:p7", "--", "--mode", "matrix"],
+    ["npm", "run", "desktop:p7", "--", "--mode", "faults"],
+    ["npm", "run", "desktop:p7", "--", "--mode", "soak", "--duration-ms", "1800000", "--interval-ms", "1000"],
+    [
+      "npm",
+      "run",
+      "desktop:p7",
+      "--",
+      "--mode",
+      "cross-matrix",
+      "--node-id",
+      "p7-tofuture",
+      "--controller",
+      "https://oasis-rebates-stat-alaska.trycloudflare.com"
+    ]
+  ],
+  "evidence": {
+    "pair": {
+      "file": ".matrix/p7-pair.json",
+      "generated_at": "2026-11-23T17:00:09.149Z",
+      "ok": true,
+      "legs": 2,
+      "legs_direct": 2,
+      "legs_secure": 2,
+      "bytes": 4096,
+      "sha256": "c9ac7b0624824f844f6c7f3d50fab9741a8914e878467e8daaedca143a34d90b",
+      "encrypted": true,
+      "elapsed_ms": [569, 570],
+      "rtt_ms": [4, 3],
+      "path": "direct",
+      "secure": "secure",
+      "channel": "webrtc",
+      "relay_frame_calls": 0,
+      "pool_count_per_process": 1,
+      "pool_count_total": 2,
+      "fallback_reason": null
+    },
+    "local_matrix": {
+      "file": ".matrix/p7-matrix.json",
+      "generated_at": "2026-11-23T17:06:58.566Z",
+      "ok": true,
+      "nodes": 4,
+      "legs": 12,
+      "legs_direct": 12,
+      "legs_secure": 12,
+      "bytes": 4096,
+      "sha256": "c9ac7b0624824f844f6c7f3d50fab9741a8914e878467e8daaedca143a34d90b",
+      "encrypted": true,
+      "elapsed_ms_range": [6, 23],
+      "rtt_ms_range": [0, 3],
+      "path": "direct",
+      "secure": "secure",
+      "channel": "webrtc",
+      "relay_frame_calls": 0,
+      "pool_count_per_process": 1,
+      "pool_count_total": 4,
+      "fallback_reason": null
+    },
+    "cross_host_matrix": {
+      "ok": true,
+      "hosts": ["TOFUTURE", "HSD"],
+      "host_count": 2,
+      "node_count": 4,
+      "nodes": ["p7-tofuture", "p7-mac", "p7-hsd", "p7-im2a"],
+      "legs": 12,
+      "legs_direct": 12,
+      "legs_secure": 12,
+      "bytes": 4096,
+      "sha256": "c9ac7b0624824f844f6c7f3d50fab9741a8914e878467e8daaedca143a34d90b",
+      "encrypted": true,
+      "elapsed_ms_range": [6, 45],
+      "rtt_ms_range": [1, 13],
+      "path": "direct",
+      "secure": "secure",
+      "channel": "webrtc",
+      "relay_frame_calls": 0,
+      "pool_count_per_process": 1,
+      "fallback_reason": null,
+      "controller_ready": {
+        "p7-hsd": true,
+        "p7-im2a": true,
+        "p7-mac": true,
+        "p7-tofuture": true
+      },
+      "queue": 0,
+      "files": [
+        ".matrix/p7-matrix2host-tofuture.json",
+        ".matrix/p7-matrix2host-mac.json",
+        "C:\\Users\\AU\\w2m-p7\\matrix2host-hsd.json",
+        "C:\\Users\\AU\\w2m-p7\\matrix2host-im2a.json",
+        "/home/user/p7-controller/state-matrix2host.json"
+      ]
+    },
+    "cross_pair": {
+      "ok": true,
+      "hosts": ["HSD", "TOFUTURE"],
+      "legs": 2,
+      "legs_direct": 2,
+      "legs_secure": 2,
+      "bytes": 4096,
+      "sha256": "c9ac7b0624824f844f6c7f3d50fab9741a8914e878467e8daaedca143a34d90b",
+      "elapsed_ms": [30, 35],
+      "rtt_ms": [7, 6],
+      "relay_frame_calls": 0,
+      "files": [".matrix/p7-cross-pair-tofuture.json", "C:\\Users\\AU\\w2m-p7\\.matrix-cross-pair.json"]
+    },
+    "faults": {
+      "file": ".matrix/p7-faults.json",
+      "generated_at": "2026-11-23T17:07:26.054Z",
+      "ok": true,
+      "checks": {
+        "provider_missing": "WEBRTC_PROVIDER_CLOSED",
+        "signal_down": "WEBRTC_SIGNAL_SEND_FAILED",
+        "ack_timeout": {
+          "status": 200,
+          "channel": "relay",
+          "fallback_reason": "WEBRTC_PREPARE_TIMEOUT",
+          "elapsed_ms": 678,
+          "ack_polls": 6
+        },
+        "stop_after_fallback": {
+          "status": 200
+        }
+      },
+      "total": 4,
+      "passed": 4,
+      "relay_frame_calls": 0,
+      "channel": "webrtc",
+      "fallback_reason": null
+    },
+    "soak": {
+      "file": ".matrix/p7-soak.json",
+      "log": ".matrix/p7-soak.log",
+      "generated_at": "2026-11-23T18:16:54.231Z",
+      "ok": true,
+      "duration_ms": 1800000,
+      "interval_ms": 1000,
+      "frames_expected": 1800,
+      "frames_received": 1800,
+      "frames_sent": 1800,
+      "last_seq": 1800,
+      "rss_first": 68608000,
+      "rss_peak": 69160960,
+      "rss_last": 68603904,
+      "rss_delta_bytes": -4096,
+      "rss_delta_ratio": -0.0000597,
+      "handles_first": 7,
+      "handles_peak": 8,
+      "handles_last": 7,
+      "handles_delta": 0,
+      "pool_count_per_process": 1,
+      "pool_count_total": 2,
+      "channel": "webrtc",
+      "relay_frame_calls": 0,
+      "fallback_reason": null,
+      "target": {
+        "frames": 1800,
+        "pool_peers": 1,
+        "pool_count": 1,
+        "pool_owner": "dsh-p2p-webrtc",
+        "rss_start": 63561728,
+        "rss_end": 68608000,
+        "handles_start": 2,
+        "handles_end": 7
+      },
+      "viewer": {
+        "frames": 1800,
+        "last_seq": 1800,
+        "pool_peers": 1,
+        "pool_count": 1,
+        "pool_owner": "dsh-p2p-webrtc",
+        "rss_start": 63447040,
+        "rss_end": 68255744,
+        "handles_start": 2,
+        "handles_end": 7
+      }
+    },
+    "four_physical_hosts": {
+      "ok": false,
+      "attempted_hosts": ["TOFUTURE", "HSD", "Mac mini", "IM2A"],
+      "legs_requested": 12,
+      "legs_recorded": 4,
+      "legs_succeeded": 1,
+      "results": [
+        {
+          "label": "p7-hsd->p7-im2a",
+          "ok": false,
+          "error": "no view.frame within 20s"
+        },
+        {
+          "label": "p7-hsd->p7-mac",
+          "ok": false,
+          "error": "no view.frame within 20s"
+        },
+        {
+          "label": "p7-hsd->p7-tofuture",
+          "ok": true,
+          "elapsed_ms": 38,
+          "path": "direct",
+          "secure": "secure"
+        },
+        {
+          "label": "p7-im2a->p7-hsd",
+          "ok": false,
+          "error": "claim_timeout"
+        }
+      ],
+      "reason": "TOFUTURE, HSD and IM2A share public 220.196.228.195 across different LAN segments, so hairpin does not work; Mac 101.81.77.177 and HSD/TOFUTURE fail both directions with no view.frame within 20s; no usable TURN in the environment (202.182.123.154:3478 does not answer Allocate).",
+      "files": [
+        "/home/user/p7-controller/state-snapshot.json",
+        "C:\\Users\\Administrator\\w2m-p7\\cross-matrix.json",
+        ".matrix/p7-cross-matrix-tofuture.log"
+      ]
+    }
+  },
+  "hard_metrics": {
+    "summary": "relay_frame_calls=0; pool_count=1; channel=webrtc; fallback_reason=null",
+    "relay_frame_calls": 0,
+    "pool_count": 1,
+    "channel": "webrtc",
+    "fallback_reason": null,
+    "checks": [
+      {
+        "id": "start_channel_webrtc",
+        "status": "route-contract-pass",
+        "evidence": "test/remote-view-route.test.mjs webrtc happy path; P6 P5/P6 regression 162/162",
+        "detail": "/start returns channel=webrtc for the production profile"
+      },
+      {
+        "id": "frame_relay_zero",
+        "status": "pass",
+        "evidence": ".matrix/p7-pair.json, p7-matrix.json, p7-matrix2host-*.json, p7-soak.json, test/remote-view-route.test.mjs",
+        "detail": "relay_frame_calls=0 in every real transport run; route test asserts relay frame count 0"
+      },
+      {
+        "id": "pool_count_one",
+        "status": "pass",
+        "evidence": "pair 2 processes x 1; local matrix 4 x 1; cross-host 4 x 1; soak 2 x 1",
+        "detail": "no process ever created a second pool"
+      },
+      {
+        "id": "transport_webrtc_failure_502",
+        "status": "route-contract-pass",
+        "evidence": "test/remote-view-route.test.mjs",
+        "detail": "transport=webrtc returns 502 WEBRTC_UNAVAILABLE and does not create a relay session"
+      },
+      {
+        "id": "target_ack_no_relay_stream",
+        "status": "route-contract-pass",
+        "evidence": "test/remote-view-route.test.mjs; .matrix/p7-faults.json",
+        "detail": "prepare success posts ack and starts no relay frame stream; ack timeout falls back with WEBRTC_PREPARE_TIMEOUT"
+      },
+      {
+        "id": "stop_keeps_teams_dataplane",
+        "status": "route-contract-pass",
+        "evidence": "test/remote-view-route.test.mjs; npm run test:teams",
+        "detail": "stop removes the desktop subscription without closePeer; Teams/task data plane remains usable"
+      },
+      {
+        "id": "soak_30m_stable",
+        "status": "pass",
+        "evidence": ".matrix/p7-soak.json",
+        "detail": "1800/1800 frames, last_seq=1800, RSS -4 KiB, handles 7/8/7, pool 1 each"
+      },
+      {
+        "id": "four_node_matrix",
+        "status": "pass-with-scope",
+        "evidence": ".matrix/p7-matrix.json; cross-host matrix files",
+        "detail": "12/12 direct+secure on one host and 12/12 on 2 hosts x 4 nodes; 4-physical-host full mesh blocked by NAT and recorded, not claimed"
+      }
+    ]
+  },
+  "result": {
+    "outcome": "pass_with_scope",
+    "assertions": {
+      "real_engine": "Every leg used node-datachannel 0.33.6 with real ICE/DTLS; 4096-byte frames decrypted with encrypted=true and the same SHA-256 c9ac7b06...d90b.",
+      "direct_and_secure": "pair 2/2, local matrix 12/12, cross-host matrix 12/12, cross pair 2/2 all path=direct and secure=secure.",
+      "pool": "Each process reported pool_count=1 and pool_owner=dsh-p2p-webrtc; no second pool appeared in pair, matrix, cross-host or soak.",
+      "faults": "4/4 named outcomes: WEBRTC_PROVIDER_CLOSED, WEBRTC_SIGNAL_SEND_FAILED, WEBRTC_PREPARE_TIMEOUT fallback at 678 ms, and stop 200.",
+      "soak": "1800/1800 frames at 1 Hz for 30 minutes; RSS stayed 68.6-69.2 MB, delta -4 KiB; handles 7/8/7; last_seq=1800.",
+      "production_route": "Route semantics come from the real route test suite with a fake transport; P7 does not re-host the production HTTP route, so those rows are labelled route-contract-pass rather than real-engine.",
+      "regression": "176 tests passed, 0 failed: test:desktop-p7 33/33, test:p2p-webrtc 87/87, test:teams 39/39, test:p2p-v2 11/11, test:acceptance-doc 6/6; layer-check clean over 318 files and 13 declared layers."
+    }
+  },
+  "regression": {
+    "test:desktop-p7": {
+      "passed": 33,
+      "failed": 0
+    },
+    "test:p2p-webrtc": {
+      "passed": 87,
+      "failed": 0
+    },
+    "test:teams": {
+      "passed": 39,
+      "failed": 0
+    },
+    "test:p2p-v2": {
+      "passed": 11,
+      "failed": 0
+    },
+    "test:acceptance-doc": {
+      "passed": 6,
+      "failed": 0
+    },
+    "layer-check": "clean",
+    "total_passed": 176,
+    "total_failed": 0
+  },
+  "limitations": [
+    "4 physical hosts could not form a full mesh: 3 share one public NAT and hairpin fails, Mac cannot reach HSD/TOFUTURE in either direction, and no TURN is available. Only 4 legs were recorded, 1 succeeded.",
+    "The accepted matrix scope is 2 physical hosts x 4 node processes plus a 4-node run on one host, not 4 physical hosts fully interconnected.",
+    "Production route indicators are covered by route-contract tests, not by a live HTTP route driven by the real provider in this P7 run.",
+    "Package version remains 3.6.0; no push, tag, npm publish, Release or marketplace index was performed."
+  ]
+}
