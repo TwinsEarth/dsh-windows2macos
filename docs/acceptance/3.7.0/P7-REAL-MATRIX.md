@@ -3,7 +3,7 @@
 - 分支：`work/v3.7.0-v2-baseline`
 - P7 基线：`859422a`（P6 发布准备完毕）
 - 验收日期：2026-11-24
-- 结论：**P7 五项全部通过**：第 1–4 项通过；第 5 项的同机四节点 100 MiB、真实进程 kill 续传、4 MiB/安全拒绝、公网 TURN 三物理 1 MiB 三条链路、双机 100 MiB，以及三物理节点 100 MiB P2P V2 矩阵均已通过。公网 coturn 已在 `43.142.74.71:3479` 实际打通，Mac/IM2A/TOFUTURE 均取得 `typ relay` 候选。三物理节点 100 MiB 矩阵采用 TOFUTURE 单 seed、Mac 与 HSD 两个 leecher 同时接入；seed 对两端 attach 均成功，两个 leecher 均完成 100 MiB 且 SHA-256 匹配。第 ⑤ 项改判通过，P7 整体通过。
+- 结论：**P7 整体仍为“部分通过”**：第 1–4 项通过；第 5 项的同机四节点 100 MiB、真实进程 kill 续传、4 MiB/安全拒绝、公网 TURN 三条 1 MiB 链路和双机 100 MiB 已通过。第 ⑤ 项的“三物理节点 100 MiB P2P V2 矩阵”**未通过**：三台物理节点没有全部取得真实 `typ relay` 候选（HSD 未做 Allocate），且 HSD 的 100 MiB 结果没有 `path=relay` 证据。已完成的 TOFUTURE 单 seed + Mac/HSD 双 leecher 传输只能记为“三物理节点 100 MiB 传输完成”，不能记为“三物理 relay 矩阵通过”。
 
 ## 1. 五项补强对照
 
@@ -13,7 +13,7 @@
 | ② | 多 seed / 多 leecher 生产级编排：部分 attach 失败不阻断、peer 去重、上限、swarm 状态 | `service.mjs` 的 `maxPeersPerShare`、`peers()`、`swarm` 摘要、`peer_errors`、`P2P_V2_PEERS_UNREACHABLE` | P2/P5 单元与集成；P7 四节点真实矩阵：一个 leecher 同时从两个 seed 拉取 | 通过 |
 | ③ | 下载目录默认 `<dshHome>/p2p-v2/downloads`；路径越界、symlink、配额、半文件、断点恢复 | `downloadRoot` 默认 `<stateDir>/downloads`；`path-safety.mjs`；`.w2m-partial-<infoHash>` staging；`shares.json` 原子持久化；`status.restore` | `test/p2p-v2.test.mjs` 的 `PATH_OUTSIDE_ROOT` / `SENSITIVE_PATH`；`test/p2p-v2-p5-resume.test.mjs`；P7 真实进程 kill 续传 | 通过 |
 | ④ | 同一 pair 上任务 JSON 与 torrent 帧混合流量回归 | `test/p2p-v2-dispatch-isolation.test.mjs`：`task.offer` JSON + tagged torrent 帧 + `result.ack` JSON；`pushOfferBestPath` 仍走 `webrtc-v1`；`TOOL_NAMES` 7 个且无 `task.*` | 3/3 通过（P4/P6 回归） | 通过 |
-| ⑤ | 三节点以上真实矩阵、100 MiB、断线恢复、安全拒绝、4 MiB 帧边界 | P7 新增 `scripts/p7-v2-real-matrix.mjs`、`scripts/p7-v2-resume-matrix.mjs`；边界测试沿用 P5/P4 单元；公网 TURN 测试使用 `scripts/webrtc-cross-machine.mjs`、`scripts/webrtc-matrix-preflight.mjs`、`scripts/p5-v2-worker.mjs` | 同机四节点 100 MiB 通过；真实进程 kill 续传通过；4 MiB/安全拒绝单元通过；公网 TURN 三物理 1 MiB 三条链路全部 `path=relay` 通过；双机 100 MiB 通过；TOFUTURE 单 seed + Mac/HSD 双 leecher 的三物理 100 MiB 同时矩阵通过 | **通过** |
+| ⑤ | 三节点以上真实矩阵、100 MiB、断线恢复、安全拒绝、4 MiB 帧边界 | P7 新增 `scripts/p7-v2-real-matrix.mjs`、`scripts/p7-v2-resume-matrix.mjs`；边界测试沿用 P5/P4 单元；公网 TURN 测试使用 `scripts/webrtc-cross-machine.mjs`、`scripts/webrtc-matrix-preflight.mjs`、`scripts/p5-v2-worker.mjs` | 同机四节点 100 MiB 通过；真实进程 kill 续传通过；4 MiB/安全拒绝单元通过；公网 TURN 三条 1 MiB 链路 `path=relay` 通过；双机 100 MiB 通过；TOFUTURE 单 seed + Mac/HSD 双 leecher 完成 100 MiB，但 HSD 无 `typ relay` Allocate 与 `path=relay` 证据 | **部分通过** |
 
 ## 2. 四节点真实矩阵（100 MiB）
 
@@ -51,7 +51,7 @@
 | 坏 magnet / 坏 hash | `test/p2p-v2.test.mjs`：命名拒绝 | 通过 |
 | 混合流量 | `test/p2p-v2-dispatch-isolation.test.mjs`：3/3 | 通过 |
 
-## 5. 跨物理机 TURN 数据面：1 MiB、双机 100 MiB 与三物理 100 MiB 矩阵均已通过
+## 5. 跨物理机 TURN 数据面：1 MiB 与双机 100 MiB 已通过，三物理 100 MiB relay 矩阵未通过
 
 ### 5.1 公网 coturn 已实际可用
 
@@ -108,7 +108,7 @@
 
 关键编排事实：seed worker 的 pool 是惰性的；seed 未执行 `--attach <leecher>` 时不会加入信令房间，leecher 的 `pool.ensure()` 会一直等 `peer-joined`，最终报 `P2P_V2_PEER_UNREACHABLE` / `WEBRTC_CONNECT_TIMEOUT`。早期看到的 TOFUTURE 3 MiB 停滞和 0 字节，根因是 seed 未 attach，而不是 TOFUTURE 数据面故障；在 seed 主动 attach 后，TOFUTURE 能完整下载 100 MiB。
 
-### 5.4 三物理 100 MiB P2P V2 矩阵已通过
+### 5.4 三物理 100 MiB 传输完成，但三物理 relay 验收未通过
 
 最终矩阵使用新的临时公网信令 `8792`（`w2m-signal-test2.service`，token `w2m-matrix-20261124b`），三台物理节点同时参与：
 
@@ -127,7 +127,12 @@
 - Mac：`/Users/fang/w2m-p6/.matrix/p7-physical/leech-mac-8792e.json`、`leech-mac-8792e.status.jsonl`。
 - HSD：`C:\Users\AU\w2m-p7\.matrix\p7-physical\leech-hsd-8792e.json`。
 
-因此，第 ⑤ 项的“三物理节点 100 MiB P2P V2”子项**通过**：TOFUTURE seed 同时服务 Mac 与 HSD 两个物理 leecher，两个 leecher 都完成 100 MiB 且 SHA-256 匹配。这不是“两节点成功 + 第三节点进程在旁边运行”；第三节点 HSD 有实际 100 MiB 数据接收记录。
+因此，第 ⑤ 项的“三物理节点 100 MiB P2P V2”子项**未通过**。必须把边界写清楚：
+
+- 这次完成的是“TOFUTURE 单 seed 同时服务 Mac 与 HSD 两个物理 leecher”的 100 MiB 传输；Mac 与 HSD 都有实际 104,857,600 bytes 接收和 SHA 匹配，所以它不是“两节点成功 + 第三节点进程在旁边运行”。
+- 但它仍不是“三物理 relay 矩阵”：真实 `typ relay` Allocate 只在 Mac、IM2A、TOFUTURE 上取得；HSD 没有做 Allocate，没有自己的 `typ relay` 候选。
+- HSD 的 100 MiB 结果 JSON 没有 `path` 字段，不能用同向 1 MiB 的 `path=relay` 替代 100 MiB 路径证据。
+- 因此不能把这次传输写成“三台物理节点都在 relay 上完成 100 MiB”。按“真实 typ relay 候选 + 三机矩阵”的验收口径，第 ⑤ 项继续保持“未通过”。
 
 测试完成后，`8792` 临时信令服务已停止，Mac 侧探测 `http://43.142.74.71:8792/health` 连接失败；生产 `8790` 信令不受影响。Lighthouse 的临时 `TCP 8792` 放行规则未在本次命令中删除。
 
@@ -136,9 +141,10 @@
 ### 5.5 其余限制
 
 1. 4 MiB 帧边界与安全拒绝仍是单元/协议层证据，不是跨机真实链路证据。
-2. 本次三物理矩阵只验证了 TOFUTURE 作 seed、Mac/HSD 作 leecher 的拓扑；没有把“Mac/HSD 作 seed 同时服务另外两台”全部排列组合跑完。
+2. HSD 未做公网 TURN Allocate，三台物理节点没有全部取得 `typ relay` 候选；这是第 ⑤ 项不能改判通过的首要原因。
 3. HSD 旧版 worker 不输出 `path` 字段；本矩阵 HSD 100 MiB 的路径只能用同向 1 MiB `path=relay` 结果旁证，未对 HSD 100 MiB 单独下 `path=relay` 结论。
-4. Teams V2 的 50/50 测试与本地 MVP 属于本地交付，不进入 P7 跨机验收口径。
+4. 本次三物理矩阵只验证了 TOFUTURE 作 seed、Mac/HSD 作 leecher 的拓扑；没有把“Mac/HSD 作 seed 同时服务另外两台”全部排列组合跑完。
+5. Teams V2 的 50/50 测试与本地 MVP 属于本地交付，不进入 P7 跨机验收口径；同机多进程、Cloudflare tunnel `/health`、W2M relay 承载 JSON、Teams V2 本地 `done` 均不能替代真实 `typ relay` 候选和三机矩阵。
 
 ## 6. 复现
 
