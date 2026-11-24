@@ -47,7 +47,7 @@ async function probe(url, index) {
   await sleep(waitMs);
   const relay = candidates.filter((candidate) => /\btyp relay\b/.test(candidate));
   const result = {
-    url: url.replace(/^(turn|turns):[^@]*@/i, '$1:<redacted>@'),
+    url: url.replace(/^(turn|turns):.*@/i, '$1:<redacted>@'),
     ok: relay.length > 0,
     relay_count: relay.length,
     relay_candidates: relay,

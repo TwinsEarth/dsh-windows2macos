@@ -44,6 +44,18 @@ function normalizeUrls(value) {
 }
 
 /**
+ * Remove the userinfo from a TURN URL. The regex is greedy on purpose: a password may itself
+ * contain `@`, and stopping at the first one would leave the tail of the password in the output.
+ *
+ * @param {unknown} value
+ * @returns {string}
+ */
+export function redactTurnUrl(value) {
+  const text = String(value ?? '');
+  return text.replace(/^([a-z][a-z0-9+.-]*:)(\/\/)?[^/]*@/i, '$1$2<redacted>@');
+}
+
+/**
  * Normalize a `turnServers` value into the shape the transport already understands.
  *
  * Accepted entries:
@@ -73,7 +85,7 @@ export function normalizeTurnServers(value) {
     if (typeof entry === 'string') {
       const url = entry.trim();
       if (!TURN_SCHEME.test(url)) {
-        refused.push({ entry: url, reason: 'turnServers accepts only turn:/turns:' });
+        refused.push({ entry: redactTurnUrl(url), reason: 'turnServers accepts only turn:/turns:' });
         continue;
       }
       if (!seen.has(url)) {
@@ -90,11 +102,11 @@ export function normalizeTurnServers(value) {
     const clean = [];
     for (const url of urls) {
       if (!URL_SCHEME.test(url)) {
-        refused.push({ entry: url, reason: 'scheme must be stun/stuns/turn/turns' });
+        refused.push({ entry: redactTurnUrl(url), reason: 'scheme must be stun/stuns/turn/turns' });
         continue;
       }
       if (!TURN_SCHEME.test(url)) {
-        refused.push({ entry: url, reason: 'turnServers accepts only turn:/turns:' });
+        refused.push({ entry: redactTurnUrl(url), reason: 'turnServers accepts only turn:/turns:' });
         continue;
       }
       if (!seen.has(url)) {
@@ -119,7 +131,7 @@ export function turnServerKey(server) {
   if (!isRecord(server)) return '';
   const urls = Array.isArray(server.urls) ? server.urls : [];
   const first = typeof urls[0] === 'string' ? urls[0] : '';
-  return first === '' ? '' : first.replace(/^(turn|turns):[^@]*@/i, '$1:');
+  return first === '' ? '' : first.replace(/^(turn|turns):.*@/i, '$1:');
 }
 
 /** Both peers must build the same pair key; sorting the ids is what makes that true. */
@@ -151,13 +163,25 @@ export function orderTurnServersForPair(servers = [], { localId = '', peerId = '
     .map((entry) => entry.server);
 }
 
-/** A STUN-only view of the existing `iceServers` row, so a TURN entry cannot be duplicated. */
-function baseIceServers(iceServers) {
+/**
+ * A STUN-only view of the existing `iceServers` row, so a TURN entry cannot be duplicated.
+ *
+ * `iceServers` historically allowed TURN entries with embedded credentials. When a dedicated
+ * `turnServers` list exists it owns TURN: keeping the legacy TURN entry would bypass `primary`
+ * pinning and allocate a second relay. Without a dedicated list the original row is returned
+ * untouched, so legacy configurations keep working.
+ */
+function baseIceServers(iceServers, { dropTurn = false } = {}) {
   const list = Array.isArray(iceServers) ? iceServers : [];
-  return list.filter((server) => {
-    if (!isRecord(server)) return false;
-    const urls = Array.isArray(server.urls) ? server.urls : [];
-    return urls.length > 0 && urls.some((url) => typeof url === 'string' && !TURN_SCHEME.test(url));
+  return list.flatMap((server) => {
+    if (!isRecord(server)) return [];
+    const urls = Array.isArray(server.urls) ? server.urls : typeof server.url === 'string' ? [server.url] : [];
+    if (urls.length === 0) return [];
+    if (!dropTurn) {
+      return urls.some((url) => typeof url === 'string' && !TURN_SCHEME.test(url)) ? [server] : [];
+    }
+    const stun = urls.filter((url) => typeof url === 'string' && !TURN_SCHEME.test(url));
+    return stun.length === 0 ? [] : [{ urls: stun }];
   });
 }
 
@@ -180,14 +204,22 @@ export function buildIceServersForPeer({
 } = {}) {
   const ordered = orderTurnServersForPair(turnServers, { localId, peerId });
   const selected = policy === 'primary' ? ordered.slice(0, 1) : ordered;
-  return [...selected, ...baseIceServers(iceServers)];
+  return [...selected, ...baseIceServers(iceServers, { dropTurn: ordered.length > 0 })];
 }
 
 /** Redacted description for status output; credentials never leave the process. */
 export function describeTurnServers(servers = []) {
-  return (Array.isArray(servers) ? servers : []).map((server) => ({
-    urls: Array.isArray(server.urls) ? server.urls.map((url) => String(url).replace(/^(turn|turns):[^@]*@/i, '$1:<redacted>@')) : [],
-    weight: asWeight(server.weight),
-    has_credentials: typeof server.username === 'string' && typeof server.credential === 'string',
-  }));
+  return (Array.isArray(servers) ? servers : []).map((server) => {
+    const urls = Array.isArray(server.urls) ? server.urls.map((url) => redactTurnUrl(url)) : [];
+    const embeddedCredentials = (Array.isArray(server.urls) ? server.urls : []).some((url) =>
+      /^(turn|turns):.*@/i.test(String(url ?? '')),
+    );
+    return {
+      urls,
+      weight: asWeight(server.weight),
+      has_credentials:
+        (typeof server.username === 'string' && typeof server.credential === 'string') ||
+        embeddedCredentials,
+    };
+  });
 }

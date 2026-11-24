@@ -6,8 +6,10 @@ import assert from 'node:assert/strict';
 import { deriveTurns } from '../src/plugin/turn.mjs';
 import {
   buildIceServersForPeer,
+  describeTurnServers,
   normalizeTurnServers,
   orderTurnServersForPair,
+  redactTurnUrl,
   turnPairKey,
 } from '../src/agent/webrtc/turn-pool.mjs';
 
@@ -72,6 +74,14 @@ describe('multi-TURN ordering', () => {
     assert.equal(result.servers[0].urls[0].includes('secret'), true);
   });
 
+  it('redacts credentials in a refused non-TURN URL', () => {
+    const result = normalizeTurnServers([{ urls: ['http://user:refused-secret@host'] }]);
+    assert.equal(result.ok, true);
+    assert.equal(result.refused.length, 1);
+    assert.equal(JSON.stringify(result.refused).includes('refused-secret'), false);
+    assert.equal(result.refused[0].entry.includes('<redacted>@'), true);
+  });
+
   it('orders the same way from either side of a pair', () => {
     const fromA = orderTurnServersForPair([A, B], { localId: 'machine-a', peerId: 'machine-b' });
     const fromB = orderTurnServersForPair([B, A], { localId: 'machine-b', peerId: 'machine-a' });
@@ -110,5 +120,45 @@ describe('multi-TURN ordering', () => {
       policy: 'primary',
     });
     assert.equal(ice.length, 1);
+  });
+
+  it('redacts embedded credentials, including an @ inside the password', () => {
+    const described = describeTurnServers([
+      { urls: ['turn:user:p@ss@turn.example:3479'], weight: 1 },
+      { urls: ['turn:user:secret@turn-b.example:3479'], username: 'user', credential: 'secret' },
+    ]);
+    const serialized = JSON.stringify(described);
+    assert.equal(serialized.includes('p@ss'), false);
+    assert.equal(serialized.includes('secret'), false);
+    assert.equal(described[0].urls[0], 'turn:<redacted>@turn.example:3479');
+    assert.equal(described[0].has_credentials, true);
+    assert.equal(described[1].has_credentials, true);
+    assert.equal(redactTurnUrl('turn:user:p@ss@turn.example:3479'), 'turn:<redacted>@turn.example:3479');
+  });
+
+  it('does not keep a legacy TURN entry when a dedicated TURN list owns the relay', () => {
+    const ice = buildIceServersForPeer({
+      turnServers: [A],
+      iceServers: [
+        {
+          urls: ['stun:stun.example:19302', 'turn:w2m:legacy-secret@legacy.example:3479'],
+          username: 'w2m',
+          credential: 'legacy-secret',
+        },
+      ],
+      localId: 'machine-a',
+      peerId: 'machine-b',
+      policy: 'primary',
+    });
+    assert.deepEqual(ice, [
+      { urls: ['turn:w2m:secret@turn-a.example:3479'], weight: 1 },
+      { urls: ['stun:stun.example:19302'] },
+    ]);
+    assert.equal(JSON.stringify(ice).includes('legacy-secret'), false);
+  });
+
+  it('leaves the legacy TURN entry untouched when no dedicated TURN list exists', () => {
+    const legacy = [{ urls: ['stun:stun.example:19302', 'turn:w2m:legacy@legacy.example:3479'] }];
+    assert.deepEqual(buildIceServersForPeer({ iceServers: legacy }), legacy);
   });
 });

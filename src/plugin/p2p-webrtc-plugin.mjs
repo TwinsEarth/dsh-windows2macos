@@ -39,8 +39,13 @@ import { join, resolve as resolvePath } from 'node:path';
 
 import { loadIdentity } from '../agent/identity.mjs';
 import { createWebRtcTransport, WEBRTC_TRANSPORT_CODE } from '../agent/webrtc/transport.mjs';
-import { describeIceServers, normalizeIceServers } from '../agent/webrtc/path.mjs';
-import { buildIceServersForPeer, describeTurnServers, normalizeTurnServers } from '../agent/webrtc/turn-pool.mjs';
+import { describeIceServers, normalizeIceServers, redactCredentialedUrl } from '../agent/webrtc/path.mjs';
+import {
+  buildIceServersForPeer,
+  describeTurnServers,
+  normalizeTurnServers,
+  redactTurnUrl,
+} from '../agent/webrtc/turn-pool.mjs';
 import { redactSignalingUrl } from '../agent/webrtc/signaling.mjs';
 import { createWebRtcPoolRuntime } from './p2p-webrtc/pool-runtime.mjs';
 import { loadDefineTool, request } from './tools/shared.mjs';
@@ -158,9 +163,15 @@ export function normalizePluginConfig(config = {}, deps = {}) {
     provider_cwd: typeof config.providerCwd === 'string' ? config.providerCwd : '',
     provider_env: isRecord(config.providerEnv) ? config.providerEnv : undefined,
     ice_servers: ice.ok === true ? ice.servers : [],
-    ice_refused: ice.ok === true ? ice.refused : [{ entry: String(config.iceServers), reason: ice.detail }],
+    ice_refused:
+      ice.ok === true
+        ? ice.refused
+        : [{ entry: redactCredentialedUrl(config.iceServers), reason: ice.detail }],
     turn_servers: turn.ok === true ? turn.servers : [],
-    turn_refused: turn.ok === true ? turn.refused : [{ entry: String(config.turnServers), reason: turn.detail }],
+    turn_refused:
+      turn.ok === true
+        ? turn.refused
+        : [{ entry: redactTurnUrl(config.turnServers), reason: turn.detail }],
     turn_policy: config.turnPolicy === 'primary' ? 'primary' : 'balanced',
     prefer_p2p: config.preferP2p !== false,
     allow_relay: config.allowRelay !== false,

@@ -117,6 +117,17 @@ export function isRelayCandidate(candidate) {
 }
 
 /**
+ * Redact the userinfo of any URL that can carry credentials. The greedy match keeps an `@` inside
+ * a password from leaving its tail in a status response.
+ *
+ * @param {unknown} value
+ * @returns {string}
+ */
+export function redactCredentialedUrl(value) {
+  return String(value ?? '').replace(/^([a-z][a-z0-9+.-]*:)(\/\/)?[^/]*@/i, '$1$2<redacted>@');
+}
+
+/**
  * Redact ICE server credentials for a tool response. Usernames are kept (they identify a TURN
  * account) but the credential itself is replaced, because a status tool is often pasted into chat.
  *
@@ -126,11 +137,13 @@ export function isRelayCandidate(candidate) {
 export function describeIceServers(servers) {
   const list = Array.isArray(servers) ? servers : servers ? [servers] : [];
   return list.map((server) => {
-    if (server === null || typeof server !== 'object') return { urls: String(server) };
+    if (server === null || typeof server !== 'object') return { urls: redactCredentialedUrl(server) };
     const record = /** @type {Record<string, unknown>} */ (server);
     const urls = record.urls ?? record.url ?? [];
     return {
-      urls: Array.isArray(urls) ? urls.map(String) : [String(urls)],
+      urls: Array.isArray(urls)
+        ? urls.map(redactCredentialedUrl)
+        : [redactCredentialedUrl(urls)],
       username: typeof record.username === 'string' ? record.username : null,
       credential: record.credential === undefined ? null : '<redacted>',
       credential_type: typeof record.credentialType === 'string' ? record.credentialType : null,
@@ -164,7 +177,7 @@ export function normalizeIceServers(value) {
       if (typeof raw !== 'string' || raw.trim() === '') continue;
       const url = raw.trim();
       if (!/^(stun|stuns|turn|turns):/i.test(url)) {
-        refused.push({ entry: url, reason: 'scheme must be stun/stuns/turn/turns' });
+        refused.push({ entry: redactCredentialedUrl(url), reason: 'scheme must be stun/stuns/turn/turns' });
         continue;
       }
       // `turn:` over UDP is the normal WebRTC TURN deployment. The provider carries long-term

@@ -171,6 +171,19 @@ describe('dsh-p2p-webrtc wiring', () => {
     assert.equal(described.turn_servers[1].weight, 2);
   });
 
+  it('redacts a malformed TURN row and embedded ICE credentials', () => {
+    const badTurn = normalizePluginConfig({ turnServers: 'turn:w2m:turn-secret@turn-a.example:3479' });
+    const badIce = normalizePluginConfig({
+      iceServers: [{ urls: ['turn:w2m:ice-secret@turn-b.example:3479'] }],
+    });
+    const turnStatus = JSON.stringify(describeConfig(badTurn));
+    const iceStatus = JSON.stringify(describeConfig(badIce));
+    assert.equal(turnStatus.includes('turn-secret'), false);
+    assert.equal(iceStatus.includes('ice-secret'), false);
+    assert.equal(turnStatus.includes('<redacted>@'), true);
+    assert.equal(iceStatus.includes('<redacted>@'), true);
+  });
+
   it('detects an invalid ICE scheme before any process starts', () => {
     const cfg = normalizePluginConfig({ iceServers: [{ urls: ['http://not-ice'] }] });
     assert.equal(cfg.ice_servers.length, 0);
