@@ -71,10 +71,15 @@ npm run turn:probe -- \
 通过条件：每台 TURN 都返回至少一个 `typ relay` candidate，且 candidate 的地址是该节点的
 公网 IP、端口落在 relay 池内。只有 `host`/`srflx` candidate 不算通过。
 
-已有证据：
+已有证据（三台物理机，均为 `turn:probe` 的 relay-only Allocate）：
 
-- Mac：`.matrix/p7-physical/turn-allocate-dual-mac.json`，turn-a `49189`、turn-b `49171`，
-  两台均 `typ relay`。
+- Mac：`.matrix/p7-physical/turn-allocate-dual-mac.json`，turn-a `49189`、turn-b `49171`；
+  审计复测 `.matrix/p7-physical/turn-allocate-dual-mac-live.json`
+  （`2026-11-24T08:10:11Z`），turn-a `49194`、turn-b `49192`，两台均 `typ relay`。
+- HSD：`C:\Users\AU\w2m-p7\.matrix\p7-physical\hsd-turn-allocate-dual.json`，
+  turn-a `49165`、turn-b `49194`，两台均 `typ relay`。
+- TOFUTURE：`E:\DB\W2M\.matrix\p7-physical\tofuture-turn-allocate-dual.json`，
+  turn-a `49172`、turn-b `49195`，两台均 `typ relay`。
 
 数据面验收仍要看 `path=relay`：`PathSelector` 的 `relay` verdict 来自选中 candidate 的
 local/remote `type === 'relay'`，不是 W2M relay 回退。`turn:probe` 只证明 Allocate 成功，
