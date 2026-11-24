@@ -396,6 +396,33 @@ describe('client bundle: the activation contract', () => {
     assert.equal(locale.registered.has('w2m.target'), true, 'the dictionaries go to the locale service when there is one');
   });
 
+  it('does not fight an occupied single shell.bottom seat, and falls back to shell.overlay', () => {
+    const { exports } = loadBundle();
+    const registry = makeRegistry();
+    registry.entries = (seat) => (seat === 'shell.bottom' ? [{ options: { id: 'experimental-inspector' } }] : []);
+    const ctx = makeStrictContext({ inject: [...exports.inject], services: { slots: registry } });
+    exports.apply(ctx);
+    assert.equal(
+      registry.announced.includes('shell.bottom'),
+      false,
+      'the host single slot belongs to its first occupant; a second registration must not be attempted',
+    );
+    const overlay = registry.registered.find(
+      (entry) => entry.options.name === 'shell.overlay' && entry.options.id === 'w2m-fleet-status',
+    );
+    assert.ok(overlay, 'the status bar must still be mounted in the host list slot');
+  });
+
+  it('skips a duplicate mount of the same bundle on one slot service', () => {
+    const { exports } = loadBundle();
+    const registry = makeRegistry();
+    const ctx = makeStrictContext({ inject: [...exports.inject], services: { slots: registry } });
+    exports.apply(ctx);
+    const firstCount = registry.registered.length;
+    assert.doesNotThrow(() => exports.apply(ctx));
+    assert.equal(registry.registered.length, firstCount, 'a second bundle copy must not double every seat');
+  });
+
   it('mounts without a locale service at all, and says which strings it falls back to', () => {
     const { exports } = loadBundle();
     const registry = makeRegistry();
