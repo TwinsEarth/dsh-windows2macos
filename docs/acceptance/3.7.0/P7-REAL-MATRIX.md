@@ -3,7 +3,7 @@
 - 分支：`work/v3.7.0-v2-baseline`
 - P7 基线：`859422a`（P6 发布准备完毕）
 - 验收日期：2026-11-24
-- 结论：**第 1–4 项已落地并有回归证据；第 5 项的本地真实四节点、100 MiB、多 seed、真实进程 kill 续传已通过；跨物理机 WebRTC 仍受 NAT/TURN 限制，记为未通过，不计入整体通过。**
+- 结论：**P7 整体为“部分通过”**：第 1–4 项通过；第 5 项的同机四节点、100 MiB、多 seed、真实进程 kill 续传已通过；第 5 项的“三物理节点”子项因 NAT/TURN 未打通记为“未通过”，不计入整体通过。
 
 ## 1. 五项补强对照
 
@@ -54,9 +54,11 @@
 ## 5. 未通过项与限制
 
 1. **跨物理机三节点以上 WebRTC 仍未打通。** VM seed 对 Mac leecher 的真实尝试在 30 s 内返回 `P2P_V2_PEERS_UNREACHABLE`，底层 `WEBRTC_CONNECT_TIMEOUT`；Cloudflare quick tunnel 的 `/health` 可达，但 DataChannel 未建立。加 openrelay 测试 TURN 仍未成功；仓库既有 DESKTOP 记录也表明现网 NAT 下无可用 TURN。
-2. 因此第 5 项的“三节点以上真实物理矩阵”不拿“同机四进程”冒充通过。P7 的四节点是**同机独立进程 + 真实 WebTorrent + 真实 node-datachannel + 真实信号服务器**，证明数据面与编排，不证明 NAT 穿透。
-3. 4 MiB 帧边界与安全拒绝是单元/协议层证据，不是跨机真实链路证据。
-4. Windows 真实 provider 并发仍受 `WEBRTC_PROVIDER_SPAWN_FAILED: spawn UNKNOWN` 限制，P7 矩阵取 Linux。
+2. **Cloudflare tunnel 只解决 signaling 可达，不解决媒体路径。** 在 TURN 未打通前，没有可用于跨 NAT DataChannel 的媒体中继。
+3. **W2M relay 不能承载 torrent 字节。** 它只承载 `task.offer` / `result.ack` / Teams / `view.*` 这类 JSON 控制帧；V2 文件字节不经过 relay，这是架构裁决边界，不是性能优化项。
+4. 因此第 5 项的“三节点以上真实物理矩阵”不拿“同机四进程”冒充通过。P7 的四节点是**同机独立进程 + 真实 WebTorrent + 真实 node-datachannel + 真实信号服务器**，证明数据面与编排，不证明 NAT 穿透。
+5. 4 MiB 帧边界与安全拒绝是单元/协议层证据，不是跨机真实链路证据。
+6. Windows 真实 provider 并发仍受 `WEBRTC_PROVIDER_SPAWN_FAILED: spawn UNKNOWN` 限制，P7 矩阵取 Linux。
 
 ## 6. 复现
 
