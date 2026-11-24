@@ -291,10 +291,11 @@ The row ships disabled. Enable it only with a provider command and real peer ide
     providerCwd: '/Users/me/.w2m/webrtc-provider'
     iceServers:
       - urls: ['stun:stun.l.google.com:19302']
-      - urls: ['turns:turn.example.com:5349']
-        username: 'w2m'
-        credential: !!js process.env.W2M_TURN_CREDENTIAL
-        credentialType: 'password'
+    # Optional multi-TURN pool. Each pair gets a stable primary and the other node as fallback.
+    turnServers:
+      - urls: ['turn:w2m:<secret>@turn-a.example:3479']
+      - urls: ['turn:w2m:<secret>@turn-b.example:3479']
+    turnPolicy: balanced
     preferP2p: true
     allowRelay: true
     maxRttMs: 350
@@ -302,7 +303,8 @@ The row ships disabled. Enable it only with a provider command and real peer ide
 
 Security notes:
 
-- `turn:` (cleartext) with credentials is refused; use `turns:`. Public `stun:` is allowed.
+- `turn:` and `turns:` are both accepted. `turns:` is the TLS option; `turn:` is the normal UDP deployment. The DTLS/SCTP payload stays end-to-end encrypted even when TURN itself is cleartext, while TURN long-term credentials are only as private as the TURN transport.
+- Multi-TURN is a client-side ordering policy, not a network load balancer: see [DUAL-TURN.md](./DUAL-TURN.md).
 - `credential` is redacted in `p2p_webrtc_status`; `signalToken` is redacted in the URL and config.
 - `deviceKey` creation is **opt-in** (`allowCreateDeviceKey: true`). A new key changes this
   machine's identity and peers that pinned the old key will refuse it.

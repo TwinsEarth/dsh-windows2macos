@@ -19,6 +19,7 @@ import path from 'node:path';
 import { DEVICE_KEY_FILE, DeviceKey } from '../../agent/crypto.mjs';
 import { loadOrCreateIdentity } from '../../agent/identity.mjs';
 import { createRelayPeerKeyResolver, createWebRtcTransportPool } from '../../agent/webrtc/pool.mjs';
+import { buildIceServersForPeer, normalizeTurnServers } from '../../agent/webrtc/turn-pool.mjs';
 import { redactSignalingUrl } from '../../agent/webrtc/signaling.mjs';
 import {
   WEBRTC_POOL_REGISTRY_CODE,
@@ -110,6 +111,13 @@ export function normalizePoolRuntimeConfig(input = {}, deps = {}) {
     ice_servers: Array.isArray(pick(source, 'iceServers', 'ice_servers'))
       ? pick(source, 'iceServers', 'ice_servers')
       : null,
+    turn_servers: (() => {
+      const value = pick(source, 'turnServers', 'turn_servers');
+      if (value === undefined) return null;
+      const normalized = normalizeTurnServers(value);
+      return normalized.ok === true ? normalized.servers : [];
+    })(),
+    turn_policy: pick(source, 'turnPolicy', 'turn_policy') === 'primary' ? 'primary' : 'balanced',
     prefer_p2p: pick(source, 'preferP2p', 'prefer_p2p') !== false,
     allow_relay: pick(source, 'allowRelay', 'allow_relay') !== false,
     max_rtt_ms: asNumber(pick(source, 'maxRttMs', 'max_rtt_ms'), 0),
@@ -164,6 +172,18 @@ function poolOptions(config, machineId, deviceKey, resolvePeerKey) {
     ...(config.provider_cwd === '' ? {} : { providerCwd: config.provider_cwd }),
     ...(config.provider_env === null ? {} : { providerEnv: config.provider_env }),
     ...(config.ice_servers === null ? {} : { iceServers: config.ice_servers }),
+    ...(config.turn_servers === null
+      ? {}
+      : {
+          iceServersForPeer: (peerId) =>
+            buildIceServersForPeer({
+              turnServers: config.turn_servers,
+              iceServers: config.ice_servers ?? [],
+              localId: machineId,
+              peerId,
+              policy: config.turn_policy,
+            }),
+        }),
     preferP2p: config.prefer_p2p,
     allowRelay: config.allow_relay,
     ...(config.max_rtt_ms === null ? {} : { maxRttMs: config.max_rtt_ms }),

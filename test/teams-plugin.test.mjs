@@ -159,14 +159,14 @@ function serviceConfig(overrides = {}) {
 }
 
 describe('dsh-teams wiring', () => {
-  it('declares the export, the lib seam, and the 32-tool package description', () => {
+  it('declares the export, the lib seam, and the 37-tool package description', () => {
     assert.equal(pkg.exports['./dsh-teams'], './lib/teams-plugin.js');
     assert.ok(existsSync(join(ROOT, 'lib/teams-plugin.js')));
     assert.ok(existsSync(join(ROOT, 'src/plugin/teams-plugin.mjs')));
-    assert.match(pkg.description, /32 tools/);
+    assert.match(pkg.description, /37 tools/);
     assert.equal(
       pkg.scripts['test:teams'],
-      'node --test --test-force-exit test/teams-data-plane.test.mjs test/teams-plugin.test.mjs test/teams-policy.test.mjs test/teams-presence.test.mjs',
+      'node --test --test-force-exit test/teams-data-plane.test.mjs test/teams-plugin.test.mjs test/teams-policy.test.mjs test/teams-presence.test.mjs test/teams-v2.test.mjs',
     );
     assert.ok(pkg.files.includes('lib'));
   });
@@ -183,7 +183,7 @@ describe('dsh-teams wiring', () => {
     assert.equal(row.includes('deviceToken'), false);
   });
 
-  it('mounts three tools and performs no I/O at mount time', async () => {
+  it('mounts eight tools and performs no I/O at mount time', async () => {
     const { ctx, definitions, registered, effects } = fakeContext();
     let requests = 0;
     const dispose = await apply(
@@ -208,7 +208,7 @@ describe('dsh-teams wiring', () => {
     );
     assert.equal(typeof dispose, 'function');
     assert.deepEqual(registered, [...TOOL_NAMES]);
-    assert.equal(definitions.length, 3);
+    assert.equal(definitions.length, TOOL_NAMES.length);
     assert.equal(dispose.ok, true);
     assert.equal(requests, 0);
     assert.equal(effects.length, 1);
@@ -291,7 +291,12 @@ describe('dsh-teams wiring', () => {
     const { ctx, registered } = fakeContext();
     const dispose = await apply(
       ctx,
-      { rabbitUrl: 'http://relay.test:8787', projectId: 'default', stateDir: 'C:/w2m-state', dataRetryDelayMs: 0 },
+      {
+        rabbitUrl: 'http://relay.test:8787',
+        projectId: 'default',
+        stateDir: 'C:/w2m-state',
+        dataRetryDelayMs: 0,
+      },
       {
         env: {},
         device: { machine_id: 'machine-a' },

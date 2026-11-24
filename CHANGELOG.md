@@ -4,6 +4,25 @@ All notable changes to this project are documented here.
 
 ## [3.7.1] — 2026-11-24
 
+### feat(p2p): dual public TURN with per-pair rendezvous
+
+- **双 TURN**：新增 `src/agent/webrtc/turn-pool.mjs`，接受 `turn:`/`turns:` 多节点，按 `sha256(sorted(localId, peerId) + serverKey)` 做加权 rendezvous。同一 pair 两端得到相同主节点与 fallback，不同 pair 分布到不同 TURN，避免两端各选不同节点造成双重中继。
+- **接入**：`WebRtcTransportPool` 新增 `iceServersForPeer(peerMachineId)`；`p2p-webrtc` 子插件新增 `turnServers` / `turnPolicy`，single 模式按 peer 生成 ICE 列表，状态输出脱敏。
+- **部署**：新增 `deploy/server/deploy-turn.sh`（幂等安装/写配置/启动 coturn）与 `scripts/turn-allocate-probe.mjs`（多 TURN `typ relay` 探针）；`npm run turn:probe`。两台腾讯云 TURN 已上线：`43.142.74.71:3479`、`134.175.243.146:3479`，realm `w2m.webrtc`，relay 池 `49160-49200`。
+- **验收**：Mac、HSD、TOFUTURE 三台都对两台 TURN 取得 `typ relay`；TOFUTURE seed 同时 attach Mac/HSD，100 MiB 双 leecher 均完成，SHA-256 一致，HSD worker 输出 `path=relay`。证据 `docs/acceptance/3.7.1/DUAL-TURN-3NODE-100MIB.json`；P7 第 ⑤ 项据此改判通过。
+- **边界**：pair 级 rendezvous 不是严格 50/50 的 L4 VIP；本轮只跑 TOFUTURE-seed 拓扑，seed worker 不输出数据面 path。
+
+### feat(teams): V2 local MVP with five pillars
+
+- **动态编排**：新增 `w2m_team_orchestrate`（create/status/list/step/replan）。任务账本写入 `<stateDir>/teams-v2/plans/<plan_id>.json`，支持依赖图、ready frontier、attempts、事件与带原因的重规划。`done` 是硬门：必须带 `verification.verdict === 'pass'` 和非空 evidence，否则返回 `TEAM_V2_VERIFICATION_REQUIRED` / `TEAM_V2_EVIDENCE_REQUIRED`。
+- **框架适配层**：新增 `frameworks.mjs`，`builtin` 是唯一可执行适配器；LangGraph/CrewAI/AutoGen 仅声明能力，请求后返回 `effective: 'builtin'` 与 `adapter-not-installed`，不静默假装成功。没有引入 Python 依赖或隐藏 sidecar。
+- **对抗性验证**：新增 `w2m_team_verify`（score/reflexion/debate/process）。验证器只接收 checks/evidence/step_trace，拒绝 executor_context/executor_trace/raw_context；MVP 使用单一个小型确定性验证器，不做多验证器投票。
+- **成本账本**：新增 `w2m_team_cost`（quote/record/report），固定 cache-first、route-second；以抽象 `cost_units` 记账，不冒充真实账单。默认报价只用于验证顺序与杠杆，不作为生产价格承诺。
+- **自迭代**：新增 `w2m_team_evolve`（candidate/list/promote/rollback/stop-check）。promote 要求候选不劣于 baseline，rollback 可回到任意快照，stop-check 覆盖迭代上限、质量阈值、连续无改进三个条件。
+- **工具面**：Teams 从 3 个工具增至 8 个；`buildTools` 未传 V2 service 时仍只返回原有 3 个，`apply()` 总是传入 V2 service。包描述更新为 37 tools。
+- **测试**：新增 `test/teams-v2.test.mjs`，覆盖框架回退、依赖门、done 硬门、重规划锁、四种验证模式与上下文隔离、成本 hit/miss、演化回滚、工具面 JSON 边界与跨实例持久化；`test:teams` 已纳入该文件。
+- **边界**：V2 不接管 `w2m-joint` / `w2m_run` 的审批与派发，也没有跨机媒体声明；P7 三物理节点仍以 TURN 可达性为前置条件，保持“未通过”。
+
 ### release(p2p-v2): package, operator guide and rollback
 
 - **版本与出口**：`package.json` 升到 `3.7.1`；`exports['./dsh-p2p-v2']` 指向 `lib/p2p-v2-plugin.js`；`test` / `test:all` 都运行 `test/p2p-v2.test.mjs`。
@@ -12,6 +31,7 @@ All notable changes to this project are documented here.
 - **文档**：`docs/design/P2P-V2-WEBTORRENT.md` 补充多 peer 编排、配额与恢复、transport 接口；新增操作者指南 `docs/P2P-V2.md`。
 - **回滚**：禁用 `dsh-p2p-v2` 行即回到 V1 任务分发；V1 配置不变、共享 pool 不停、已下载文件不删除，只停止 torrent。
 - **验证**：P5 的单元/集成/live/resume 与 P6 打包、claims、acceptance 文档检查在本发布窗口执行。
+- **验收证据**：`docs/acceptance/3.7.1/P2P-V2-100MIB-RELAY.json` 记录单 pair 100 MiB relay；`docs/acceptance/3.7.1/DUAL-TURN-3NODE-100MIB.json` 记录双 TURN Allocate 与三物理 100 MiB 矩阵，P7 第 ⑤ 项改判通过。
 
 ## [3.6.0] — 2026-11-24
 

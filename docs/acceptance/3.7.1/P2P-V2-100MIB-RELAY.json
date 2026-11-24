@@ -1,0 +1,30 @@
+{
+  "version": "3.7.1",
+  "case": "P2P-V2-100MIB-RELAY",
+  "kind": "positive",
+  "requirement": "P2P V2 100 MiB single-pair transfer over a public TURN relay path, with SHA-256 equality at the leecher.",
+  "machines": [
+    "b1b19d49-20f1-4cdc-986e-f5630a5cd6f2",
+    "14ba0e60-14f5-4ab8-a2fe-d7cd4f51d833"
+  ],
+  "executed_at": "2026-11-24T06:10:34.107Z",
+  "executor": "agent",
+  "task_id": "14ba0e60-14f5-4ab8-a2fe-d7cd4f51d833",
+  "artifacts": [
+    {
+      "sha256": "29bd2f6471aa2f9a8e1c909b7485001cd1396d41acc8758c48cebb77cea9fdb7",
+      "bytes": 104857600
+    }
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "bytes": 104857600,
+      "sha256_match": true,
+      "path": "relay",
+      "secure": "secure",
+      "transport": "webrtc-v1"
+    }
+  },
+  "notes": "Mac seed b1b19d49 -> TOFUTURE leecher 14ba0e60, 8792c run. This record covers a single-pair 100 MiB relay transfer; it does not claim the P7 three-physical-node relay matrix, whose item 5 remains not passed because HSD has no public TURN Allocate and no path field in its 100 MiB result."
+}

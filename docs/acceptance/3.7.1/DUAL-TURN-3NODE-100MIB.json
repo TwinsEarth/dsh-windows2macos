@@ -1,0 +1,37 @@
+{
+  "version": "3.7.1",
+  "case": "DUAL-TURN-3NODE-100MIB",
+  "kind": "positive",
+  "requirement": "Three physical nodes each obtain a real typ relay candidate from both public TURN servers, then complete the 100 MiB P2P V2 matrix with SHA-256 equality; HSD leecher must report path=relay.",
+  "machines": [
+    "b1b19d49-20f1-4cdc-986e-f5630a5cd6f2",
+    "f4961153-3280-4c4e-b117-881b232e2066",
+    "14ba0e60-14f5-4ab8-a2fe-d7cd4f51d833"
+  ],
+  "executed_at": "2026-11-24T07:19:35.000Z",
+  "executor": "agent",
+  "task_id": "14ba0e60-14f5-4ab8-a2fe-d7cd4f51d833",
+  "artifacts": [
+    {
+      "sha256": "29bd2f6471aa2f9a8e1c909b7485001cd1396d41acc8758c48cebb77cea9fdb7",
+      "bytes": 104857600
+    }
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "turn_nodes": 2,
+      "mac_allocate_typ_relay": true,
+      "hsd_allocate_typ_relay": true,
+      "tofuture_allocate_typ_relay": true,
+      "seed_attach_both": true,
+      "mac_bytes": 104857600,
+      "hsd_bytes": 104857600,
+      "sha256_match": true,
+      "hsd_path": "relay",
+      "mac_path": "relay",
+      "transport": "webrtc-v1"
+    }
+  },
+  "notes": "TOFUTURE 14ba0e60 seed attaches Mac b1b19d49 and HSD f4961153; both leechers complete 100 MiB with matching SHA-256. TURN A 43.142.74.71:3479 and TURN B 134.175.243.146:3479 each produced typ relay for all three machines. Mac's successful path=relay output was overwritten by a stale worker JSON after completion, so the Mac 100 MiB artifact at .matrix/p7-physical/leech-mac-dual/dest/payload.bin was re-hashed and matched. Distribution is per-pair rendezvous, not strict 50/50 L4 balancing; only the TOFUTURE-seed topology was run."
+}

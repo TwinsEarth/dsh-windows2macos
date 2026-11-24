@@ -40,6 +40,7 @@ import { join, resolve as resolvePath } from 'node:path';
 import { loadIdentity } from '../agent/identity.mjs';
 import { createWebRtcTransport, WEBRTC_TRANSPORT_CODE } from '../agent/webrtc/transport.mjs';
 import { describeIceServers, normalizeIceServers } from '../agent/webrtc/path.mjs';
+import { buildIceServersForPeer, describeTurnServers, normalizeTurnServers } from '../agent/webrtc/turn-pool.mjs';
 import { redactSignalingUrl } from '../agent/webrtc/signaling.mjs';
 import { createWebRtcPoolRuntime } from './p2p-webrtc/pool-runtime.mjs';
 import { loadDefineTool, request } from './tools/shared.mjs';
@@ -120,6 +121,7 @@ export function normalizePluginConfig(config = {}, deps = {}) {
   }
   if (Array.isArray(config.providerArgs)) providerArgs = config.providerArgs.map(String);
   const ice = normalizeIceServers(config.iceServers ?? []);
+  const turn = normalizeTurnServers(config.turnServers ?? []);
   const peerKeys = new Map();
   if (config.peerKeys instanceof Map) {
     for (const [key, value] of config.peerKeys)
@@ -157,6 +159,9 @@ export function normalizePluginConfig(config = {}, deps = {}) {
     provider_env: isRecord(config.providerEnv) ? config.providerEnv : undefined,
     ice_servers: ice.ok === true ? ice.servers : [],
     ice_refused: ice.ok === true ? ice.refused : [{ entry: String(config.iceServers), reason: ice.detail }],
+    turn_servers: turn.ok === true ? turn.servers : [],
+    turn_refused: turn.ok === true ? turn.refused : [{ entry: String(config.turnServers), reason: turn.detail }],
+    turn_policy: config.turnPolicy === 'primary' ? 'primary' : 'balanced',
     prefer_p2p: config.preferP2p !== false,
     allow_relay: config.allowRelay !== false,
     max_rtt_ms:
@@ -218,6 +223,9 @@ export function describeConfig(cfg) {
     provider_cwd: cfg.provider_cwd || null,
     ice_servers: describeIceServers(cfg.ice_servers),
     ice_refused: cfg.ice_refused,
+    turn_servers: describeTurnServers(cfg.turn_servers),
+    turn_refused: cfg.turn_refused,
+    turn_policy: cfg.turn_policy,
     prefer_p2p: cfg.prefer_p2p,
     allow_relay: cfg.allow_relay,
     max_rtt_ms: cfg.max_rtt_ms,
@@ -303,6 +311,16 @@ export class P2PWebRtcService {
       ...this.cfg,
       ...overrides,
     };
+    const iceServers =
+      Array.isArray(cfg.turn_servers) && cfg.turn_servers.length > 0
+        ? buildIceServersForPeer({
+            turnServers: cfg.turn_servers,
+            iceServers: cfg.ice_servers,
+            localId: cfg.machine_id,
+            peerId: cfg.peer_machine_id,
+            policy: cfg.turn_policy,
+          })
+        : cfg.ice_servers;
     return {
       role: cfg.role,
       signalUrl: cfg.signal_url,
@@ -323,7 +341,9 @@ export class P2PWebRtcService {
       providerEnv: cfg.provider_env,
       providerFactory: this.deps.providerFactory ?? cfg.provider_factory,
       signalingFactory: this.deps.signalingFactory ?? cfg.signaling_factory,
-      iceServers: cfg.ice_servers,
+      iceServers,
+      turnServers: cfg.turn_servers,
+      turnPolicy: cfg.turn_policy,
       preferP2p: cfg.prefer_p2p,
       allowRelay: cfg.allow_relay,
       maxRttMs: cfg.max_rtt_ms,
@@ -356,6 +376,8 @@ export class P2PWebRtcService {
         provider_cwd: source.provider_cwd,
         provider_env: source.provider_env,
         ice_servers: source.ice_servers,
+        turn_servers: source.turn_servers,
+        turn_policy: source.turn_policy,
         prefer_p2p: source.prefer_p2p,
         allow_relay: source.allow_relay,
         max_rtt_ms: source.max_rtt_ms,

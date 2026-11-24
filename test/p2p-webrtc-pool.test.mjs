@@ -161,6 +161,49 @@ describe('webrtc-v1 pool', () => {
     await pool.stop();
   });
 
+  it('passes a per-peer ICE list to the transport factory', async () => {
+    const key = makePeerKeys().b.publicKeyBase64;
+    let seen = null;
+    const pool = new WebRtcTransportPool({
+      machineId: 'machine-a',
+      signalUrl: 'ws://127.0.0.1:9/signal',
+      resolvePeerKey: async () => ({ key, error: null, source: 'test' }),
+      iceServers: [{ urls: ['stun:stun.example:19302'] }],
+      iceServersForPeer: (peer) => [{ urls: [`turn:user:pass@${peer}.example:3479`] }],
+      transportFactory: (options) => {
+        seen = options;
+        return {
+          ok: true,
+          transport: {
+            name: 'webrtc-v1',
+            async start() {
+              return { ok: true };
+            },
+            async stop() {
+              return { ok: true };
+            },
+            async send() {
+              return { ok: true };
+            },
+            onMessage() {
+              return () => {};
+            },
+            paths() {
+              return [];
+            },
+            diagnostics() {
+              return { state: 'ready', path: { verdict: 'direct' } };
+            },
+          },
+        };
+      },
+    });
+    const ready = await pool.ensure('machine-b');
+    assert.equal(ready.ok, true, JSON.stringify(ready));
+    assert.deepEqual(seen.iceServers, [{ urls: ['turn:user:pass@machine-b.example:3479'] }]);
+    await pool.stop();
+  });
+
   it('resolves and caches a peer key from the relay record', async () => {
     let reads = 0;
     const resolver = createRelayPeerKeyResolver({

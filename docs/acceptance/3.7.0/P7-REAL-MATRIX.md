@@ -3,7 +3,7 @@
 - 分支：`work/v3.7.0-v2-baseline`
 - P7 基线：`859422a`（P6 发布准备完毕）
 - 验收日期：2026-11-24
-- 结论：**P7 整体仍为“部分通过”**：第 1–4 项通过；第 5 项的同机四节点 100 MiB、真实进程 kill 续传、4 MiB/安全拒绝、公网 TURN 三条 1 MiB 链路和双机 100 MiB 已通过。第 ⑤ 项的“三物理节点 100 MiB P2P V2 矩阵”**未通过**：三台物理节点没有全部取得真实 `typ relay` 候选（HSD 未做 Allocate），且 HSD 的 100 MiB 结果没有 `path=relay` 证据。已完成的 TOFUTURE 单 seed + Mac/HSD 双 leecher 传输只能记为“三物理节点 100 MiB 传输完成”，不能记为“三物理 relay 矩阵通过”。
+- 结论：**P7 整体通过（2026-11-24 追补）**。第 1–4 项此前已通过；第 ⑤ 项原记录为“部分通过”，原因是三台物理节点没有全部取得真实 `typ relay` 候选，且 HSD 的 100 MiB 结果没有 `path=relay`。追补的双 TURN 验收已补齐：Mac、HSD、TOFUTURE 三台都对两台公网 TURN 取得 `typ relay`；TOFUTURE seed 同时 attach Mac 与 HSD；Mac 与 HSD 的 100 MiB 下载均完成，SHA 与基准一致，且 HSD worker 明确输出 `path=relay`。原 5.4/5.5 的“未通过”记录保留为历史口径，最新判据见第 8 节。
 
 ## 1. 五项补强对照
 
@@ -13,7 +13,7 @@
 | ② | 多 seed / 多 leecher 生产级编排：部分 attach 失败不阻断、peer 去重、上限、swarm 状态 | `service.mjs` 的 `maxPeersPerShare`、`peers()`、`swarm` 摘要、`peer_errors`、`P2P_V2_PEERS_UNREACHABLE` | P2/P5 单元与集成；P7 四节点真实矩阵：一个 leecher 同时从两个 seed 拉取 | 通过 |
 | ③ | 下载目录默认 `<dshHome>/p2p-v2/downloads`；路径越界、symlink、配额、半文件、断点恢复 | `downloadRoot` 默认 `<stateDir>/downloads`；`path-safety.mjs`；`.w2m-partial-<infoHash>` staging；`shares.json` 原子持久化；`status.restore` | `test/p2p-v2.test.mjs` 的 `PATH_OUTSIDE_ROOT` / `SENSITIVE_PATH`；`test/p2p-v2-p5-resume.test.mjs`；P7 真实进程 kill 续传 | 通过 |
 | ④ | 同一 pair 上任务 JSON 与 torrent 帧混合流量回归 | `test/p2p-v2-dispatch-isolation.test.mjs`：`task.offer` JSON + tagged torrent 帧 + `result.ack` JSON；`pushOfferBestPath` 仍走 `webrtc-v1`；`TOOL_NAMES` 7 个且无 `task.*` | 3/3 通过（P4/P6 回归） | 通过 |
-| ⑤ | 三节点以上真实矩阵、100 MiB、断线恢复、安全拒绝、4 MiB 帧边界 | P7 新增 `scripts/p7-v2-real-matrix.mjs`、`scripts/p7-v2-resume-matrix.mjs`；边界测试沿用 P5/P4 单元；公网 TURN 测试使用 `scripts/webrtc-cross-machine.mjs`、`scripts/webrtc-matrix-preflight.mjs`、`scripts/p5-v2-worker.mjs` | 同机四节点 100 MiB 通过；真实进程 kill 续传通过；4 MiB/安全拒绝单元通过；公网 TURN 三条 1 MiB 链路 `path=relay` 通过；双机 100 MiB 通过；TOFUTURE 单 seed + Mac/HSD 双 leecher 完成 100 MiB，但 HSD 无 `typ relay` Allocate 与 `path=relay` 证据 | **部分通过** |
+| ⑤ | 三节点以上真实矩阵、100 MiB、断线恢复、安全拒绝、4 MiB 帧边界 | P7 新增 `scripts/p7-v2-real-matrix.mjs`、`scripts/p7-v2-resume-matrix.mjs`；边界测试沿用 P5/P4 单元；公网 TURN 测试使用 `scripts/webrtc-cross-machine.mjs`、`scripts/webrtc-matrix-preflight.mjs`、`scripts/p5-v2-worker.mjs`；双 TURN 使用 `scripts/turn-allocate-probe.mjs` 与 `--turn/--turn-policy` | 同机四节点 100 MiB 通过；真实进程 kill 续传通过；4 MiB/安全拒绝单元通过；公网 TURN 三条 1 MiB 链路 `path=relay` 通过；双机 100 MiB 通过；2026-11-24 追补：三台物理节点均对两台公网 TURN 取得 `typ relay`，TOFUTURE seed 同时服务 Mac/HSD 两 leecher，100 MiB 均完成且 SHA 一致，HSD `path=relay` | **通过** |
 
 ## 2. 四节点真实矩阵（100 MiB）
 
@@ -171,3 +171,16 @@ node scripts/p7-v2-resume-matrix.mjs \
 - `scripts/p7-v2-resume-matrix.mjs`：真实进程 kill、staging 保留、换 seed 续传、SHA 校验。
 - `package.json`：新增 `matrix:p2p-v2-p7`、`matrix:p2p-v2-p7-resume`。
 - 原始结果：`.matrix/p7-evidence/`（本地未提交，`.matrix/` 已在 `.gitignore`）。
+
+## 8. 追补：双 TURN 三物理 100 MiB 矩阵通过（2026-11-24）
+
+5.4/5.5 记录的是单 TURN、HSD 未做 Allocate 时的历史结论。双 TURN 上线后，同一套 P2P V2 worker 已重跑并补齐：
+
+1. **两台公网 TURN**：`43.142.74.71:3479` 与 `134.175.243.146:3479`，realm `w2m.webrtc`，relay 池 `49160-49200`。两台服务 `active`，Mac、HSD、TOFUTURE 三台分别对两台 TURN 取得 `typ relay`。
+2. **三机 Allocate 证据**：Mac `turn-allocate-dual-mac.json`；HSD `hsd-turn-allocate-dual.json`（A `49165`、B `49194`，均 `typ relay`）；TOFUTURE `tofuture-turn-allocate-dual.json`（A `49172`、B `49195`，均 `typ relay`）。
+3. **100 MiB 矩阵**：TOFUTURE 作 seed，Mac 与 HSD 同时作 leecher，`--ice/--turn` 同时配置两台 TURN；seed `attach` 两个 peer 均返回 `ok:true`。
+4. **结果**：Mac 与 HSD 都完成 `104,857,600` bytes，SHA-256 均为 `29bd2f6471aa2f9a8e1c909b7485001cd1396d41acc8758c48cebb77cea9fdb7`；HSD worker 明确输出 `path=relay`。Mac 的成功结果在控制台输出 `path=relay`，随后被一个超时退出的旧 worker 覆盖了 JSON，但 100 MiB 文件仍在 `.matrix/p7-physical/leech-mac-dual/dest/payload.bin`，已用 `shasum -a 256` 重新核验一致。
+
+结构化证据：`docs/acceptance/3.7.1/DUAL-TURN-3NODE-100MIB.json`。
+
+**边界仍然成立**：双 TURN 的“负载均衡”是 pair 级 rendezvous，不是严格 50/50 的 L4 VIP；三机矩阵只覆盖 TOFUTURE-seed 拓扑；seed worker 本身不输出数据面 `path`，seed 的 relay 证据由双 TURN Allocate 与两个 leecher 的 `path=relay` 共同支撑。按用户明确的验收口径（三台都有真实 `typ relay` + HSD 100 MiB `path=relay` + 同一轮三机 100 MiB），第 ⑤ 项改判**通过**。

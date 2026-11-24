@@ -233,10 +233,10 @@ node -e 'const m=require("node-datachannel"); if (typeof m.PeerConnection !== "f
     providerCwd: '/Users/me/.w2m/webrtc-provider'
     iceServers:
       - urls: ['stun:stun.example.com:3478']
-      - urls: ['turns:turn.example.com:5349']
-        username: 'w2m'
-        credential: !!js process.env.W2M_TURN_CREDENTIAL
-        credentialType: 'password'
+    turnServers:
+      - urls: ['turn:w2m:<secret>@turn-a.example:3479']
+      - urls: ['turn:w2m:<secret>@turn-b.example:3479']
+    turnPolicy: balanced
     preferP2p: true
     allowRelay: true
     maxRttMs: 350
@@ -257,7 +257,7 @@ providerCwd: 'C:/Users/me/.w2m/webrtc-provider'
 `signalToken` 的 `!!js` 读取发生在 DSH 进程启动时；启动 DSH 的环境必须有
 `W2M_WEBRTC_SIGNAL_TOKEN`，否则 pool 会以 `signalUrl`/token 缺失拒绝，而不是猜一个默认值。
 
-`turns:` 才能带凭证；`turn:` 是 cleartext，传输层会拒绝带凭证的 `turn:`。
+`turn:` 与 `turns:` 都可用；`turns:` 是 TLS 选项，`turn:` 是常规 UDP 部署。生产优先 `turns:`，并保留 `turnServers` 双节点与 `turnPolicy: balanced`。
 
 ### 4.2 `dsh-desktop`：默认 WebRTC
 
@@ -465,7 +465,7 @@ HTML，说明 relay 版本没有这个路由，`auto`/`webrtc` 都无法按预�
 - nginx 的 WebSocket location `access_log off`，避免 query token 写入访问日志。
 - `remote-view.json`、`device.key`、`device.json` 权限分别为 `600`；状态目录 `700`。
 - 不输出 `peer.static_key` 原值；只输出指纹或“present”。
-- TURN 使用 `turns:`；公共 `stun:` 可以，`turn:` 带凭证会被拒绝。
+- TURN 优先 `turns:`；`turn:` 也可用于内网/边缘部署，凭证只在配置与环境变量中。
 - `allowCreateDeviceKey:false`；换 key 等于换机器身份。
 - `transport:'webrtc'` 严格模式上线，`auto` 仅用于迁移/回滚窗口。
 - readiness 的 `pool` 必须来自真实 diagnostics 快照；`--skip-pool` 的结果不能当生产验收。

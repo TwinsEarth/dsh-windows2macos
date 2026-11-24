@@ -15,13 +15,14 @@
  */
 
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { DeviceKey } from '../src/agent/crypto.mjs';
 import { WebRtcTransportPool } from '../src/agent/webrtc/pool.mjs';
+import { buildIceServersForPeer, normalizeTurnServers } from '../src/agent/webrtc/turn-pool.mjs';
 import { P2PV2Service } from '../src/agent/webtorrent/service.mjs';
 import { loadWebTorrentModule } from '../src/agent/webtorrent/engine.mjs';
 import { normalizePluginConfig } from '../src/plugin/p2p-v2-plugin.mjs';
@@ -52,6 +53,12 @@ const ICE = (arg('ice', process.env.W2M_WEBRTC_ICE ?? 'stun:stun.l.google.com:19
   .split(',')
   .map((value) => value.trim())
   .filter(Boolean);
+const TURNS = (arg('turn', process.env.W2M_WEBRTC_TURN ?? '') ?? '')
+  .split(',')
+  .map((value) => value.trim())
+  .filter(Boolean);
+const TURN_POLICY = arg('turn-policy', 'balanced') === 'primary' ? 'primary' : 'balanced';
+const TURN_SERVERS = normalizeTurnServers(TURNS);
 
 const sha256 = (buffer) => createHash('sha256').update(buffer).digest('hex');
 const sleep = (ms) => new Promise((resolvePromise) => { setTimeout(resolvePromise, ms); });
@@ -103,12 +110,23 @@ async function makeService(machineId, keys, base, extraRoots = []) {
     providerCommand: process.execPath,
     providerArgs: [PROVIDER_SCRIPT],
     providerCwd: PROVIDER_CWD,
-    iceServers: ICE.map((urls) => ({ urls })),
+    ...(TURN_SERVERS.ok === true && TURN_SERVERS.servers.length > 0
+      ? {
+          iceServersForPeer: (peerId) =>
+            buildIceServersForPeer({
+              turnServers: TURN_SERVERS.servers,
+              iceServers: ICE.map((urls) => ({ urls })),
+              localId: machineId,
+              peerId,
+              policy: TURN_POLICY,
+            }),
+        }
+      : { iceServers: ICE.map((urls) => ({ urls })) }),
     preferP2p: true,
     allowRelay: true,
-    connectTimeoutMs: 30_000,
-    handshakeTimeoutMs: 30_000,
-    peerTimeoutMs: 35_000,
+    connectTimeoutMs: 180_000,
+    handshakeTimeoutMs: 180_000,
+    peerTimeoutMs: 200_000,
     statsPollMs: 500,
   });
   const loaded = await loadWebTorrentModule({ modulePath: process.env.W2M_WEBTORRENT_MODULE ?? '' });
@@ -150,6 +168,27 @@ async function main() {
   const file = MODE === 'seed' ? arg('file') : null;
   const extraRoots = file === null ? [] : [dirname(resolve(file))];
   const { service, pool } = await makeService(ID, keys, base, extraRoots);
+  const STATUS_FILE = arg('status-file');
+  const STATUS_MS = Number(arg('status-ms', '0'));
+  let statusTimer = null;
+  if (STATUS_FILE !== null && Number.isFinite(STATUS_MS) && STATUS_MS > 0) {
+    statusTimer = setInterval(() => {
+      try {
+        const status = service.status();
+        appendFileSync(
+          resolve(STATUS_FILE),
+          `${JSON.stringify({
+            at: new Date().toISOString(),
+            share: status.shares[0] ?? null,
+            pool: pool.diagnostics(),
+          })}\n`,
+        );
+      } catch {
+        // The probe must never change the run it observes.
+      }
+    }, STATUS_MS);
+    statusTimer.unref?.();
+  }
   const result = {
     ok: false,
     mode: MODE,
@@ -195,6 +234,13 @@ async function main() {
         result.progress = status.shares[0]?.progress ?? 0;
         result.peers = status.shares[0]?.peers?.length ?? 0;
       }
+      const poolSnapshot = pool.diagnostics();
+      const primaryPeer = poolSnapshot.peers[0] ?? null;
+      result.pool = poolSnapshot;
+      result.path = primaryPeer?.path ?? null;
+      result.path_reason = primaryPeer?.path_reason ?? null;
+      result.rtt_ms = primaryPeer?.rtt_ms ?? null;
+      result.secure = primaryPeer?.secure ?? null;
       writeOut({ ...result, ok: true, phase: 'done' });
       return;
     }
@@ -222,12 +268,20 @@ async function main() {
     result.done = status.done;
     result.progress = status.progress;
     result.peers = status.peers;
+    const poolSnapshot = pool.diagnostics();
+    const primaryPeer = poolSnapshot.peers[0] ?? null;
+    result.pool = poolSnapshot;
+    result.path = primaryPeer?.path ?? null;
+    result.path_reason = primaryPeer?.path_reason ?? null;
+    result.rtt_ms = primaryPeer?.rtt_ms ?? null;
+    result.secure = primaryPeer?.secure ?? null;
     result.ok =
       result.expected_sha256 === null ||
       result.expected_sha256 === '' ||
       result.sha256 === result.expected_sha256;
     writeOut({ ...result, finished_at: new Date().toISOString() });
   } finally {
+    if (statusTimer !== null) clearInterval(statusTimer);
     await service.stopAll();
     await pool.stop();
   }

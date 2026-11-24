@@ -4,6 +4,12 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { deriveTurns } from '../src/plugin/turn.mjs';
+import {
+  buildIceServersForPeer,
+  normalizeTurnServers,
+  orderTurnServersForPair,
+  turnPairKey,
+} from '../src/agent/webrtc/turn-pool.mjs';
 
 describe('deriveTurns', () => {
   it('groups messages by thread and then by turn', () => {
@@ -45,5 +51,64 @@ describe('deriveTurns', () => {
   it('handles an empty page', () => {
     assert.deepEqual(deriveTurns([]).threads, []);
     assert.deepEqual(deriveTurns({}).threads, []);
+  });
+});
+
+
+describe('multi-TURN ordering', () => {
+  const A = { urls: ['turn:w2m:secret@turn-a.example:3479'], weight: 1 };
+  const B = { urls: ['turn:w2m:secret@turn-b.example:3479'], weight: 1 };
+
+  it('normalizes only TURN entries and keeps credentials out of status', () => {
+    const result = normalizeTurnServers([
+      A,
+      'turn:w2m:secret@turn-c.example:3479',
+      'stun:stun.example:19302',
+      { urls: ['stun:stun.example:19302', 'turn:w2m:secret@turn-d.example:3479'] },
+    ]);
+    assert.equal(result.ok, true);
+    assert.equal(result.servers.length, 3);
+    assert.equal(result.refused.length, 2);
+    assert.equal(result.servers[0].urls[0].includes('secret'), true);
+  });
+
+  it('orders the same way from either side of a pair', () => {
+    const fromA = orderTurnServersForPair([A, B], { localId: 'machine-a', peerId: 'machine-b' });
+    const fromB = orderTurnServersForPair([B, A], { localId: 'machine-b', peerId: 'machine-a' });
+    assert.equal(turnPairKey('machine-a', 'machine-b'), turnPairKey('machine-b', 'machine-a'));
+    assert.deepEqual(fromA.map((server) => server.urls[0]), fromB.map((server) => server.urls[0]));
+  });
+
+  it('spreads pair primaries across both TURN servers', () => {
+    const counts = new Map();
+    for (let index = 0; index < 80; index += 1) {
+      const first = orderTurnServersForPair([A, B], { localId: 'node', peerId: `peer-${index}` })[0];
+      counts.set(first.urls[0], (counts.get(first.urls[0]) ?? 0) + 1);
+    }
+    assert.equal(counts.size, 2);
+    for (const count of counts.values()) assert.ok(count >= 20, `imbalanced: ${count}`);
+  });
+
+  it('puts the pair primary first and keeps the other TURN server as a fallback', () => {
+    const ice = buildIceServersForPeer({
+      turnServers: [A, B],
+      iceServers: [{ urls: ['stun:stun.example:19302'] }],
+      localId: 'machine-a',
+      peerId: 'machine-b',
+    });
+    assert.equal(ice.length, 3);
+    assert.equal(ice[0].urls[0].includes('turn-'), true);
+    assert.equal(ice[1].urls[0].includes('turn-'), true);
+    assert.deepEqual(ice[2], { urls: ['stun:stun.example:19302'] });
+  });
+
+  it('honours the primary-only policy', () => {
+    const ice = buildIceServersForPeer({
+      turnServers: [A, B],
+      localId: 'machine-a',
+      peerId: 'machine-b',
+      policy: 'primary',
+    });
+    assert.equal(ice.length, 1);
   });
 });

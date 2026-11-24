@@ -150,6 +150,27 @@ describe('dsh-p2p-webrtc wiring', () => {
     assert.equal(described.ice_servers.length, 2);
   });
 
+  it('normalizes a dual-TURN pool and redacts its URLs', () => {
+    const cfg = normalizePluginConfig(
+      {
+        iceServers: [{ urls: ['stun:stun.example:3478'] }],
+        turnServers: [
+          'turn:w2m:secret-a@turn-a.example:3479',
+          { urls: ['turn:w2m:secret-b@turn-b.example:3479'], weight: 2 },
+        ],
+        turnPolicy: 'balanced',
+      },
+      { dshHome: 'C:/dsh' },
+    );
+    assert.equal(cfg.turn_servers.length, 2);
+    assert.equal(cfg.turn_policy, 'balanced');
+    const described = describeConfig(cfg);
+    assert.equal(JSON.stringify(described).includes('secret-a'), false);
+    assert.equal(JSON.stringify(described).includes('secret-b'), false);
+    assert.equal(described.turn_servers.length, 2);
+    assert.equal(described.turn_servers[1].weight, 2);
+  });
+
   it('detects an invalid ICE scheme before any process starts', () => {
     const cfg = normalizePluginConfig({ iceServers: [{ urls: ['http://not-ice'] }] });
     assert.equal(cfg.ice_servers.length, 0);

@@ -168,6 +168,7 @@ export class WebRtcTransportPool {
    * @param {boolean} [options.preferP2p]
    * @param {boolean} [options.allowRelay]
    * @param {Array} [options.iceServers]
+   * @param {(peerMachineId: string) => Array} [options.iceServersForPeer] Per-pair ICE override.
    * @param {string} [options.providerCommand]
    * @param {string[]} [options.providerArgs]
    * @param {string} [options.providerCwd]
@@ -198,6 +199,8 @@ export class WebRtcTransportPool {
     this.maxPeers =
       Number.isInteger(options.maxPeers) && options.maxPeers > 0 ? options.maxPeers : Number.MAX_SAFE_INTEGER;
     this.deviceKey = options.deviceKey ?? null;
+    this.iceServersForPeer =
+      typeof options.iceServersForPeer === 'function' ? options.iceServersForPeer : null;
     this.transportOptions = {
       signalUrl,
       signalToken: this.signalToken,
@@ -533,8 +536,29 @@ export class WebRtcTransportPool {
     }
 
     const peerKeys = new Map([[record.peer, key]]);
+    let perPeerIce = null;
+    if (this.iceServersForPeer !== null) {
+      try {
+        const candidate = this.iceServersForPeer(record.peer);
+        if (Array.isArray(candidate)) perPeerIce = candidate;
+      } catch (error) {
+        record.ok = false;
+        record.last_error = {
+          code: WEBRTC_POOL_CODE.START_FAILED,
+          detail: `iceServersForPeer failed: ${error instanceof Error ? error.message : String(error)}`,
+        };
+        this.stats.start_failures += 1;
+        return {
+          ok: false,
+          code: record.last_error.code,
+          detail: record.last_error.detail,
+          peer: record.peer,
+        };
+      }
+    }
     const options = {
       ...this.transportOptions,
+      ...(perPeerIce === null ? {} : { iceServers: perPeerIce }),
       role: record.role,
       room: record.room,
       peerId: this.machineId,

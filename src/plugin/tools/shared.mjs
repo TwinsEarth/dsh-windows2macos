@@ -513,6 +513,7 @@ export function normalizeWebRtcConfig(config = {}, env = process.env) {
       })();
   const providerCwd = string(raw.providerCwd, fromEnv('W2M_WEBRTC_PROVIDER_CWD', ''));
   const iceServers = Array.isArray(raw.iceServers) ? raw.iceServers : [];
+  const turnServers = Array.isArray(raw.turnServers) ? raw.turnServers : [];
   return {
     enabled,
     signal_url: signalUrl,
@@ -521,6 +522,8 @@ export function normalizeWebRtcConfig(config = {}, env = process.env) {
     provider_args: providerArgs,
     provider_cwd: providerCwd,
     ice_servers: iceServers,
+    turn_servers: turnServers,
+    turn_policy: raw.turnPolicy === 'primary' ? 'primary' : 'balanced',
     prefer_p2p: raw.preferP2p !== false,
     allow_relay: raw.allowRelay !== false,
     max_rtt_ms: int(raw.maxRttMs, 350, 1),

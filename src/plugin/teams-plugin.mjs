@@ -20,6 +20,7 @@ import {
 } from './teams/transport-policy.mjs';
 import { getSharedWebRtcPool } from './webrtc-pool-registry.mjs';
 import { loadDefineTool } from './tools/shared.mjs';
+import { createTeamsV2Service, TEAMS_V2_VERSION } from './teams/v2-service.mjs';
 
 /** Plugin row id in `cordis.patch.yml`. */
 export const TEAMS_ROW_ID = 'dsh-teams';
@@ -31,7 +32,19 @@ export const name = 'w2m-dsh-teams';
 export const inject = [];
 
 /** Stable tool names; asserted against the main plugin so a duplicate fails the tests. */
-export const TOOL_NAMES = ['w2m_team_status', 'w2m_team_room', 'w2m_team_artifact'];
+export const TOOL_NAMES = [
+  'w2m_team_status',
+  'w2m_team_room',
+  'w2m_team_artifact',
+  'w2m_team_orchestrate',
+  'w2m_team_verify',
+  'w2m_team_cost',
+  'w2m_team_evolve',
+  'w2m_team_frameworks',
+];
+
+/** The original three read/data tools, kept for callers that mount without a V2 service. */
+export const LEGACY_TOOL_NAMES = ['w2m_team_status', 'w2m_team_room', 'w2m_team_artifact'];
 
 /** Default threshold for a heartbeat to be called stale. */
 export const DEFAULT_STALE_AFTER_MS = 90_000;
@@ -110,23 +123,314 @@ export function describeConfig(config = {}) {
     data_channel: TEAM_DATA_CHANNEL,
     data_max_attempts: TEAM_DATA_MAX_ATTEMPTS,
     auto_start: config.auto_start === true,
+    teams_v2_version: TEAMS_V2_VERSION,
     tools: [...TOOL_NAMES],
   };
+}
+
+/**
+ * The V2 tool surface: five local tools for orchestration, verification, cost, evolution and
+ * framework choice. They never register with `w2m_run`, `w2m-joint` or the relay; `create` and
+ * `step` only write a local JSON ledger.
+ *
+ * @param {{v2: object, defineTool: Function, output?: object}} args
+ * @returns {object[]}
+ */
+function buildV2Tools({ v2, defineTool, output }) {
+  const resultOutput = output ?? { type: 'json' };
+  const statusJson = (result) => json(result);
+
+  return [
+    defineTool({
+      name: 'w2m_team_orchestrate',
+      description:
+        'Create and edit a local Teams V2 task ledger. Actions: create, status, list, step, replan. ' +
+        'A step may move pending→running, running→done|failed, and failed→running; done requires a passing, ' +
+        'context-isolated verification and non-empty evidence (TEAM_V2_VERIFICATION_REQUIRED / ' +
+        'TEAM_V2_CONTEXT_NOT_ISOLATED / TEAM_V2_EVIDENCE_REQUIRED). ' +
+        'Replan adds/updates/removes pending steps with a reason and rejects completed/running edits. ' +
+        'This is not a dispatcher: it does not approve, relay or execute anything.',
+      parameters: {
+        action: {
+          type: 'string',
+          enum: ['create', 'status', 'list', 'step', 'replan'],
+          description: 'create (default) | status | list | step | replan',
+        },
+        plan_id: { type: 'string', description: 'plan id for status/step/replan' },
+        goal: { type: 'string', description: 'create: the user-facing outcome this ledger serves' },
+        steps: {
+          type: 'array',
+          items: { type: 'object', additionalProperties: true },
+          description:
+            'create: step objects with step_id/title/agent and optional depends_on, framework, acceptance, max_attempts',
+        },
+        framework: {
+          type: 'string',
+          enum: ['auto', 'builtin', 'langgraph', 'crewai', 'autogen'],
+          description:
+            'create: preferred framework; non-builtin adapters fall back to builtin and report the reason',
+        },
+        base_commit: { type: 'string', description: 'create: optional git commit the plan is anchored to' },
+        step_id: { type: 'string', description: 'step: step id to transition' },
+        status: {
+          type: 'string',
+          enum: ['pending', 'running', 'done', 'failed', 'skipped'],
+          description: 'step: target status; pending is never a write',
+        },
+        result: {
+          type: 'object',
+          additionalProperties: true,
+          description: 'step done/failed: a bounded result summary and/or digest source',
+        },
+        evidence: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'step done: non-empty evidence references; at least one is required',
+        },
+        verification: {
+          type: 'object',
+          additionalProperties: true,
+          description:
+            'step done: an isolated verification object with verdict=pass and optionally score/checks',
+        },
+        actor: { type: 'string', description: 'optional actor label recorded in the event ledger' },
+        reason: { type: 'string', description: 'replan: required reason for changing a running ledger' },
+        add: {
+          type: 'array',
+          items: { type: 'object', additionalProperties: true },
+          description: 'replan: steps to append',
+        },
+        update: {
+          type: 'array',
+          items: { type: 'object', additionalProperties: true },
+          description: 'replan: pending steps to replace fields on',
+        },
+        remove: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'replan: pending step ids to remove; no dependent may remain',
+        },
+      },
+      output: resultOutput,
+      async execute(args = {}) {
+        try {
+          const action = typeof args.action === 'string' ? args.action.toLowerCase() : 'create';
+          let result;
+          if (action === 'create') result = v2.createPlan(args);
+          else if (action === 'status') result = v2.planStatus(args.plan_id);
+          else if (action === 'list') result = v2.listPlans();
+          else if (action === 'step') result = v2.step(args);
+          else if (action === 'replan') result = v2.replan(args);
+          else result = { ok: false, code: 'TEAM_V2_ACTION_INVALID', detail: { action } };
+          return statusJson(result);
+        } catch (error) {
+          return statusJson({
+            ok: false,
+            code: 'TEAM_V2_ORCHESTRATE_FAILED',
+            detail: error instanceof Error ? error.message : String(error),
+          });
+        }
+      },
+      presentCall: () => ({ card: 'generic', title: 'w2m team orchestrate', kind: 'write', rawInput: {} }),
+    }),
+    defineTool({
+      name: 'w2m_team_verify',
+      description:
+        'Run one context-isolated verifier: score (weighted checks), reflexion (score plus a retry lesson), ' +
+        'debate (support vs challenge, with escalate when both hold), or process (step-trace integrity). ' +
+        'The verifier accepts checks/evidence/step_trace only; executor_context, executor_trace and raw_context ' +
+        'are rejected with TEAM_V2_CONTEXT_NOT_ISOLATED. The default is one small, deterministic verifier; ' +
+        'there is deliberately no multi-verifier vote.',
+      parameters: {
+        mode: {
+          type: 'string',
+          enum: ['score', 'reflexion', 'debate', 'process'],
+          description: 'verification mode; default score',
+        },
+        checks: {
+          type: 'array',
+          items: { type: 'object', additionalProperties: true },
+          description: 'check objects: id, status pass|fail|missing, weight, critical, detail',
+        },
+        evidence: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'evidence refs; used as checks when checks are absent',
+        },
+        step_trace: {
+          type: 'array',
+          items: { type: 'object', additionalProperties: true },
+          description: 'process: ordered step objects with step_id/status/depends_on/evidence',
+        },
+        artifact_summary: { type: 'string', description: 'optional summary of the artifact under review' },
+        support: {
+          type: 'array',
+          items: { type: 'object', additionalProperties: true },
+          description: 'debate: checks supporting the artifact',
+        },
+        challenge: {
+          type: 'array',
+          items: { type: 'object', additionalProperties: true },
+          description: 'debate: checks challenging the artifact',
+        },
+        threshold: { type: 'number', description: 'pass threshold between 0.5 and 1; default 0.8' },
+      },
+      output: resultOutput,
+      async execute(args = {}) {
+        try {
+          return statusJson(v2.verify(args));
+        } catch (error) {
+          return statusJson({
+            ok: false,
+            code: 'TEAM_V2_VERIFY_FAILED',
+            detail: error instanceof Error ? error.message : String(error),
+          });
+        }
+      },
+      presentCall: () => ({ card: 'generic', title: 'w2m team verify', kind: 'read', rawInput: {} }),
+    }),
+    defineTool({
+      name: 'w2m_team_cost',
+      description:
+        'Quote and record an abstract cost ledger in the fixed order cache-first, route-second. ' +
+        'quote returns assumption_based planning units (not a vendor bill); record stores cache hit/miss, ' +
+        'model tier and tokens under a plan; report returns totals, hit rate and the cache-vs-route lever. ' +
+        'No currency is claimed and no provider price sheet is embedded.',
+      parameters: {
+        op: {
+          type: 'string',
+          enum: ['quote', 'record', 'report'],
+          description: 'quote (default) | record | report',
+        },
+        plan_id: { type: 'string', description: 'record/report: plan id whose ledger receives the entry' },
+        step_id: { type: 'string', description: 'record: optional step id for the per-step breakdown' },
+        model: { type: 'string', enum: ['small', 'large'], description: 'record: model tier; default small' },
+        cache: {
+          type: 'string',
+          enum: ['hit', 'miss'],
+          description: 'record: a cache hit avoids the model call',
+        },
+        input_tokens: { type: 'number', description: 'record/quote: input token count' },
+        output_tokens: { type: 'number', description: 'record/quote: output token count' },
+        requests: { type: 'number', description: 'quote: request count; default 100' },
+        cache_hit_rate: { type: 'number', description: 'quote: expected hit rate 0..1; default 0.5' },
+        cache_read_cost_ratio: {
+          type: 'number',
+          description: 'quote: cache-read cost as a fraction of a normal call; default 0.05',
+        },
+        model_route_reduction: {
+          type: 'number',
+          description: 'quote: route saving fraction 0..1; default 0.05',
+        },
+        baseline_unit: { type: 'number', description: 'quote: abstract units per request; default 6' },
+      },
+      output: resultOutput,
+      async execute(args = {}) {
+        try {
+          return statusJson(v2.cost(args));
+        } catch (error) {
+          return statusJson({
+            ok: false,
+            code: 'TEAM_V2_COST_FAILED',
+            detail: error instanceof Error ? error.message : String(error),
+          });
+        }
+      },
+      presentCall: () => ({ card: 'generic', title: 'w2m team cost', kind: 'write', rawInput: {} }),
+    }),
+    defineTool({
+      name: 'w2m_team_evolve',
+      description:
+        'Maintain prompt-level evolution records per local agent: candidate (prompt plus metrics), list, ' +
+        'promote (only when no tracked metric regresses against the baseline), rollback to any prior version, ' +
+        'and stop-check for iteration limit, quality threshold and consecutive-no-improvement. ' +
+        'Every promotion keeps the previous version; this never rewrites a running prompt in place.',
+      parameters: {
+        op: {
+          type: 'string',
+          enum: ['candidate', 'list', 'promote', 'rollback', 'stop-check'],
+          description: 'candidate (default) | list | promote | rollback | stop-check',
+        },
+        agent_id: { type: 'string', description: 'stable local agent/role id, e.g. reviewer or planner' },
+        prompt: { type: 'string', description: 'candidate: the proposed prompt text' },
+        metrics: {
+          type: 'object',
+          additionalProperties: true,
+          description: 'candidate: pass_rate/quality/cost_units/latency_ms/hallucination_rate',
+        },
+        notes: { type: 'string', description: 'candidate: optional human note' },
+        candidate_id: { type: 'string', description: 'promote: candidate id such as cand_1' },
+        version_id: { type: 'string', description: 'rollback: version id such as v1' },
+        max_iterations: { type: 'number', description: 'stop-check: promoted-version limit; default 10' },
+        quality_threshold: { type: 'number', description: 'stop-check: metric threshold 0..1; default 0.9' },
+        patience: { type: 'number', description: 'stop-check: consecutive no-improvement count; default 3' },
+        metric: { type: 'string', description: 'stop-check: metric key; default pass_rate' },
+      },
+      output: resultOutput,
+      async execute(args = {}) {
+        try {
+          return statusJson(v2.evolve(args));
+        } catch (error) {
+          return statusJson({
+            ok: false,
+            code: 'TEAM_V2_EVOLVE_FAILED',
+            detail: error instanceof Error ? error.message : String(error),
+          });
+        }
+      },
+      presentCall: () => ({ card: 'generic', title: 'w2m team evolve', kind: 'write', rawInput: {} }),
+    }),
+    defineTool({
+      name: 'w2m_team_frameworks',
+      description:
+        'List or select the framework adapter boundary. builtin is the only runnable adapter in this package; ' +
+        'langgraph/crewai/autogen are declared with capabilities but are not installed. select reports both ' +
+        'the requested framework and the effective one, so a fallback is visible instead of silent.',
+      parameters: {
+        op: { type: 'string', enum: ['list', 'select'], description: 'list (default) | select' },
+        requested: {
+          type: 'string',
+          enum: ['auto', 'builtin', 'langgraph', 'crewai', 'autogen'],
+          description: 'select: preferred framework',
+        },
+        task_type: { type: 'string', description: 'select: a task shape such as dag, role-play or debate' },
+        complexity: { type: 'number', description: 'select: 0..1; >=0.6 prefers langgraph' },
+        requires: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'select: required capabilities such as dag, roles, debate',
+        },
+      },
+      output: resultOutput,
+      async execute(args = {}) {
+        try {
+          return statusJson(v2.frameworks(args));
+        } catch (error) {
+          return statusJson({
+            ok: false,
+            code: 'TEAM_V2_FRAMEWORKS_FAILED',
+            detail: error instanceof Error ? error.message : String(error),
+          });
+        }
+      },
+      presentCall: () => ({ card: 'generic', title: 'w2m team frameworks', kind: 'read', rawInput: {} }),
+    }),
+  ];
 }
 
 /**
  * Build the two tool definitions without registering them. A test can mount a fake context and
  * inspect exactly what would be registered.
  *
- * @param {{service: TeamsService, defineTool: Function, output?: object}} args
+ * @param {{service: TeamsService, defineTool: Function, output?: object, v2?: object}} args
  * @returns {object[]}
  */
-export function buildTools({ service, defineTool, output } = {}) {
+export function buildTools({ service, defineTool, output, v2 } = {}) {
   if (service === null || typeof service !== 'object') throw new TypeError('TeamsService is required');
   if (typeof defineTool !== 'function') throw new TypeError('defineTool is required');
   const resultOutput = output ?? { type: 'json' };
 
-  return [
+  const legacy = [
     defineTool({
       name: 'w2m_team_status',
       description:
@@ -251,6 +555,9 @@ export function buildTools({ service, defineTool, output } = {}) {
       presentCall: () => ({ card: 'generic', title: 'w2m team artifact', kind: 'write', rawInput: {} }),
     }),
   ];
+  return v2 === undefined || v2 === null
+    ? legacy
+    : [...legacy, ...buildV2Tools({ v2, defineTool, output: resultOutput })];
 }
 
 /**
@@ -261,17 +568,19 @@ export function buildTools({ service, defineTool, output } = {}) {
  * @param {object} [config] row configuration
  * @param {{defineTool?: Function, loadDefineTool?: Function, service?: TeamsService,
  *   requestImpl?: Function, env?: object, now?: () => number, deviceToken?: string,
- *   device?: object, listPlansImpl?: Function}} [deps]
+ *   device?: object, listPlansImpl?: Function, v2?: object}} [deps]
  * @returns {Promise<Function>} disposer carrying the mount report
  */
 export async function apply(ctx, config = {}, deps = {}) {
   const cfg = normalizePluginConfig(config);
-  const service = deps.service instanceof TeamsService
-    ? deps.service
-    : new TeamsService(cfg, {
-        ...deps,
-        getWebRtcPool: deps.getWebRtcPool ?? getSharedWebRtcPool,
-      });
+  const service =
+    deps.service instanceof TeamsService
+      ? deps.service
+      : new TeamsService(cfg, {
+          ...deps,
+          getWebRtcPool: deps.getWebRtcPool ?? getSharedWebRtcPool,
+        });
+  const v2 = deps.v2 ?? createTeamsV2Service({ stateDir: cfg.state_dir });
   ctx?.logger?.info?.(
     `${name}: configured; relay=${safeTeamRelayUrl(cfg.rabbit_url) || 'device-or-env'} room=${cfg.project_id} ` +
       `control=${TEAM_CONTROL_CHANNEL} data=${TEAM_DATA_CHANNEL} max_attempts=${TEAM_DATA_MAX_ATTEMPTS}`,
@@ -297,7 +606,7 @@ export async function apply(ctx, config = {}, deps = {}) {
       ctx?.logger?.warn?.(`${name}: the host provided no tools service; the Teams tools are not registered`);
       return;
     }
-    for (const definition of buildTools({ service, defineTool })) {
+    for (const definition of buildTools({ service, defineTool, v2 })) {
       child.tools.register(definition);
       registered.push(definition.name);
     }
@@ -315,6 +624,7 @@ export async function apply(ctx, config = {}, deps = {}) {
     registered,
     disposed: () => disposed,
     service,
+    v2,
     config: describeConfig(cfg),
   })) {
     dispose[key] = value;
