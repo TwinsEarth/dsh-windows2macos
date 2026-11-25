@@ -72,6 +72,28 @@ if (!existsSync(rootEntry)) {
 // all its imports and reached its argument parser.
 import { spawnSync } from 'node:child_process';
 
+// GPW-V2 is a separate opt-in subplugin. Its entry is a re-export; a missing symbol
+// here would mount as a dead row, so it gets the same import check as the root.
+const gpwV2Entry = join(ROOT, 'lib', 'gpw-v2.js');
+if (!existsSync(gpwV2Entry)) {
+  bad('lib/gpw-v2.js is missing; the documented GPW-V2 subpath is gone');
+} else {
+  try {
+    const mod = await import(pathToFileURL(gpwV2Entry).href);
+    if (typeof mod.apply === 'function') ok('lib/gpw-v2.js exports a callable apply');
+    else bad(`lib/gpw-v2.js exports apply as ${typeof mod.apply}`);
+    if (mod.name === 'dsh-gpw-v2') ok('lib/gpw-v2.js exports name = dsh-gpw-v2');
+    else bad(`lib/gpw-v2.js name is ${JSON.stringify(mod.name)}; expected "dsh-gpw-v2"`);
+    if (Array.isArray(mod.inject) && mod.inject.includes('permissionPresets')) {
+      ok(`lib/gpw-v2.js declares inject = ${JSON.stringify(mod.inject)}`);
+    } else {
+      bad(`lib/gpw-v2.js inject is ${JSON.stringify(mod.inject)}; expected "permissionPresets"`);
+    }
+  } catch (error) {
+    bad(`importing lib/gpw-v2.js threw: ${error.message}`);
+  }
+}
+
 for (const cli of ['bin/w2m-rabbit.mjs', 'bin/w2m-localside.mjs']) {
   const path = join(ROOT, cli);
   if (!existsSync(path)) { bad(`${cli} is missing`); continue; }

@@ -1,0 +1,68 @@
+{
+  "version": "3.7.3",
+  "case": "GPW-V2-FIVE-LEVEL-AUDIT",
+  "kind": "positive",
+  "requirement": "v3.7.3 release gate: the GPW-V2 five-level permission watchdog is reviewed, tested and deployable, with no path-traversal bypass, no missing Linux system-directory red line, and no regressions in the existing plugin surface.",
+  "machines": [
+    "ToFuture"
+  ],
+  "executed_at": "2026-11-25T17:20:54+08:00",
+  "executor": "agent",
+  "task_id": "w2m-v373-release-audit-2026-11-25",
+  "commands": [
+    ["node", "--test", "test/gpw-v2.test.mjs"],
+    ["npm", "run", "test:all"],
+    ["node", "scripts/check-entrypoints.mjs"],
+    ["node", "--test", "test/loader-entry.test.mjs"]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "gate_suite_tests": 20,
+      "gate_suite_passed": 20,
+      "gate_suite_failed": 0,
+      "full_suite_tests": 4175,
+      "full_suite_passed": 4145,
+      "full_suite_failed": 0,
+      "full_suite_skipped": 30,
+      "full_suite_suites": 929,
+      "full_suite_duration_ms": 969445,
+      "entrypoint_assertions": 8,
+      "real_loader_tests": 13,
+      "real_loader_passed": 12,
+      "real_loader_skipped": 1,
+      "classifier_us_per_call": 2.23,
+      "classifier_calls_benchmarked": 100000,
+      "client_bytes": 620298,
+      "relay_health_ok": true,
+      "relay_version": "3.1.0",
+      "relay_devices": 256,
+      "relay_fleets_online": 6,
+      "path_traversal_dotdot_covered": true,
+      "linux_system_paths_red": true,
+      "git_global_config_yellow": true,
+      "authorize_folder_yellow": true,
+      "pending_timers_disposed": true,
+      "held_calls_denied_on_unmount": true,
+      "shell_redirection_yellow": true,
+      "interpreter_pipe_red": true,
+      "relative_blacklist_red": true,
+      "format_drive_red": true
+    },
+    "preflight": {
+      "pass": 16,
+      "fail": 0,
+      "unverifiable": 1,
+      "verdict": "GREEN, cleared to bump",
+      "declared_suite_tests": 4842,
+      "declared_suite_passed": 4829,
+      "declared_suite_failed": 0,
+      "declared_suite_skipped": 13,
+      "declared_suite_duration_seconds": 807.6,
+      "env": "W2M_DSH_ROOT=D:\\DSH; W2M_DSH_RUNTIME=D:\\DSH\\DeepSeek Harness.exe; Windows PowerShell v1.0 and portable Git on PATH",
+      "unverifiable_reason": "host bundled-runtime layout: C:\\Users\\fangw\\.dsh has no dsh-runtimes/ and no throwaway home could be shaped; this observation is on the accepted list",
+      "log": ".tmp-v373-preflight-final3.log"
+    }
+  },
+  "notes": "Measured on the ToFuture Windows host against the 3.7.3 release tree. The full suite was run with the portable Git and Windows PowerShell v1.0 directories on PATH; without powershell.exe on PATH the two DPAPI claims fail for an environment reason, not a code reason. The suite was run with --test-concurrency=1. The GPW-V2 gate suite covers the five levels, workspace/outside classification, credential and system paths, blacklists, shell redirection/interpreter pipes, relative blacklists and the sub-plugin mount. The real Loader suite installed the packed 3.7.3 artifact into a throwaway DSH_HOME under the real DSH runtime; one archive-tab probe is explicitly skipped unless W2M_SURFACES_PROBE=1. The desktop profile was not mutated by this audit."
+}

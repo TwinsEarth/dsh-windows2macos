@@ -1,0 +1,31 @@
+{
+  "version": "3.7.3",
+  "case": "GPW-SIDEBAR-OPT-IN",
+  "kind": "positive",
+  "requirement": "v3.7.3 UI requirement: the GPW operations panel is not pinned to the left sidebar by default, even when the GPW subplugin is enabled; the operator must explicitly pin it, and unpinning removes the row again.",
+  "machines": [
+    "ToFuture"
+  ],
+  "executed_at": "2026-11-25T16:00:00+08:00",
+  "executor": "agent",
+  "task_id": "w2m-v373-sidebar-opt-in-2026-11-25",
+  "commands": [
+    ["node", "--test", "test/client-bundle.test.mjs"],
+    ["node", "--test", "test/client-budget.test.mjs"]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "default_gpw_sidebar_rows": 0,
+      "composer_launcher_registered": true,
+      "gpw_main_page_registered": true,
+      "opt_in_preference_key": "w2m.gpw.sidebar.pinned",
+      "opt_in_rows": 1,
+      "host_pin_api_available": false,
+      "client_bytes": 620298,
+      "client_bundle_tests": 143,
+      "client_bundle_failed": 0
+    }
+  },
+  "notes": "The DSH host starts every registered sidebar.panellist row pinned (createPanelPins initialises unpinned to NO_PANELS) and exposes no plugin API for 'default unpinned'. v3.7.3 therefore does not register the GPW sidebar row until the operator presses 「固定到左侧边栏」 in the GPW panel; the composer launcher and main page remain available meanwhile. The row is registered dynamically and the preference is stored in localStorage; neither path changes permissions or approval behaviour. Verified by the browser-less client bundle tests and the client budget test on the ToFuture Windows host."
+}

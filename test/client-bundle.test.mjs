@@ -391,8 +391,8 @@ describe('client bundle: the activation contract', () => {
     );
     // v3.5.6/B1 + v3.5.7: the GPW, backup, desktop and queue-journal entries come from the surface book
     // (probe-driven), in one block right after the target control; the settings and composer entries follow.
-    assert.deepEqual(registry.announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'sidebar.panellist', 'main', 'sidebar.panellist', 'main', SEAT, 'shell.overlay', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', SEAT], 'the entry still has to take its seat');
-    assert.equal(registry.registered.length, 21);
+    assert.deepEqual(registry.announced, [SEAT, SEAT, 'main', 'sidebar.panellist', 'main', 'sidebar.panellist', 'main', SEAT, 'shell.overlay', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', SEAT], 'the entry still has to take its seat');
+    assert.equal(registry.registered.length, 20);
     assert.equal(locale.registered.has('w2m.target'), true, 'the dictionaries go to the locale service when there is one');
   });
 
@@ -525,8 +525,8 @@ describe('client bundle: the seat it registers into', () => {
     const { announced, registered } = applyTo();
     // The order is the mount order: the target control first, then the surface book (gpw, backup, desktop,
     // journal), then the settings/update sections, and finally the composer's own controls.
-    assert.deepEqual(announced, [SEAT, SEAT, 'sidebar.panellist', 'main', 'sidebar.panellist', 'main', 'sidebar.panellist', 'main', SEAT, 'shell.overlay', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', SEAT]);
-    assert.equal(registered.length, 21);
+    assert.deepEqual(announced, [SEAT, SEAT, 'main', 'sidebar.panellist', 'main', 'sidebar.panellist', 'main', SEAT, 'shell.overlay', 'settings.section', 'settings.section', 'plugins.bundle.config', SEAT, SEAT, 'conversation.session.header.actions', 'conversation.view', 'shell.bottom', SEAT, 'settings.section', SEAT]);
+    assert.equal(registered.length, 20);
     assert.equal(registered[0].options.name, SEAT);
   });
 
@@ -574,7 +574,7 @@ describe('client bundle: the seat it registers into', () => {
     };
     const { exports } = loadBundle();
     assert.doesNotThrow(() => exports.apply(ctx));
-    assert.equal(registered.length, 21);
+    assert.equal(registered.length, 20);
   });
 });
 
@@ -1955,8 +1955,8 @@ describe('client bundle: the backup & restore panel (v3.4.9)', () => {
     assert.equal(main.options.key, sidebar.options.id, 'the main key must equal the panellist id');
     const gpw = registry.registered.find((entry) => entry.options.name === 'sidebar.panellist'
       && entry.options.id === 'w2m-gpw');
-    assert.ok(gpw !== undefined, 'the GPW sidebar entry is still registered');
-    assert.ok(sidebar.options.order > gpw.options.order, 'the entry is listed after GPW');
+    assert.equal(gpw, undefined, 'the GPW operations panel is opt-in: no left-sidebar row by default');
+    assert.ok(sidebar.options.order > 4, 'the entry is listed after the GPW order slot');
     assert.equal(typeof sidebar.component, 'function', 'the sidebar entry is a component');
     assert.equal(typeof main.component, 'function', 'the main page is a component');
     const injected = sidebar.options.inject();
@@ -4442,11 +4442,25 @@ describe('v3.5.7: the surface book owns every UI row', () => {
   it('mounts exactly the gpw entries when only the gpw row answers', async () => {
     const host = mountSurfaces({ gpw: true, backup: false, desktop: false, archive: false, journal: false, decisions: false });
     await settleW2mSurfaces();
-    assert.deepEqual(host.ids(), ['w2m-gpw']);
+    assert.deepEqual(host.ids(), [], 'the operations panel is not pinned to the left sidebar by default');
     assert.deepEqual(host.mainKeys(), ['w2m-gpw']);
     assert.deepEqual(host.journalSlots(), [], 'a disabled journal row registers no chip, overlay or fallback');
     assert.deepEqual(host.badges(), [], 'a disabled decision row mounts no inbox');
     assert.equal(host.diag().fallback, false);
+  });
+
+  it('registers the GPW sidebar row only when the operator has opted in', () => {
+    const bundle = loadBundle();
+    const registry = makeRegistry();
+    bundle.window.localStorage = {
+      getItem: (key) => (key === 'w2m.gpw.sidebar.pinned' ? '1' : null),
+      setItem: () => {},
+    };
+    bundle.exports.apply({ slots: registry, effect: (callback) => callback(), get: () => undefined });
+    const rows = registry.registered.filter((entry) => entry.options.name === 'sidebar.panellist'
+      && entry.options.id === 'w2m-gpw');
+    assert.equal(rows.length, 1, 'the opt-in preference mounts exactly one row');
+    assert.equal(rows[0].options.label(), '', 'the component draws the only label');
   });
 
   it('mounts exactly the backup entries when only the backup row answers', async () => {
@@ -4548,9 +4562,11 @@ describe('v3.5.7: the surface book owns every UI row', () => {
   it('registers every legacy entry only when nothing answered at all', async () => {
     const host = mountSurfaces(Object.fromEntries(SURFACES.map((key) => [key, 'timeout'])));
     await settleW2mSurfaces();
-    for (const id of ['w2m-gpw', 'w2m-backup', 'w2m-remote-view']) {
+    for (const id of ['w2m-backup', 'w2m-remote-view']) {
       assert.ok(host.ids().includes(id), `${id} must stay registered when the probe cannot decide`);
     }
+    assert.ok(host.mainKeys().includes('w2m-gpw'), 'the GPW main page still stays reachable, but its sidebar row is opt-in');
+    assert.equal(host.ids().includes('w2m-gpw'), false, 'the operations panel is not pinned by default, even in the fallback');
     assert.deepEqual(host.journalSlots(), ['conversation.input.left', 'shell.overlay'], 'the journal was unconditional before v3.5.7 too');
     assert.equal(host.badges().length, 1, 'and so was the inbox');
     const diag = host.diag();
@@ -4567,11 +4583,12 @@ describe('v3.5.7: the surface book owns every UI row', () => {
     host.state.journal = true;
     host.state.decisions = true;
     await host.reprobe();
-    assert.deepEqual(host.ids(), ['w2m-gpw'], 'the enabled row appears after a re-probe');
+    assert.deepEqual(host.ids(), [], 'the enabled GPW row stays opt-in on the left sidebar');
+    assert.ok(host.mainKeys().includes('w2m-gpw'), 'the enabled GPW main page appears after a re-probe');
     assert.equal(host.journalSlots().filter((name) => name === 'conversation.input.left').length, 1);
     assert.equal(host.badges().length, 1);
     await host.reprobe();
-    assert.deepEqual(host.ids(), ['w2m-gpw'], 'a second re-probe duplicates nothing');
+    assert.deepEqual(host.ids(), [], 'a second re-probe duplicates nothing');
     assert.deepEqual(host.journalSlots(), ['conversation.input.left', 'shell.overlay'], 'one chip and one drawer, not four entries');
     assert.equal(host.badges().length, 1, 'one inbox, not two');
     host.state.gpw = false;

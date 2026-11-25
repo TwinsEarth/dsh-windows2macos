@@ -106,6 +106,7 @@ const MANIFEST = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8'));
 
 /** Wall-clock ceiling for the declared suite. Measured at ~150 s on the release machine. */
 const TEST_TIMEOUT_MS = 15 * 60 * 1000;
+const SUITE_TIMEOUT_MS = 30 * 60 * 1000;
 /** Wall-clock ceiling for everything else; all of it is local and fast. */
 const SHORT_TIMEOUT_MS = 5 * 60 * 1000;
 /** Where the shipped tarball is written. `test/claims.test.mjs` reads this directory too. */
@@ -1565,19 +1566,27 @@ function checkTestSuite(suiteEnv) {
   const capture = mkdtempSync(join(tmpdir(), 'w2m-preflight-tap-'));
   const tapFile = join(capture, 'suite.tap');
   const started = Date.now();
+  // The declared suite is deliberately serial, exactly like `test:all`. The default (one child per
+  // CPU) and even two concurrent files exhausted this Windows host's job/memory budget: xiangqi
+  // hit spawn UNKNOWN, claims' verdict child hit V8 OOM, and a two-file run died with
+  // STATUS_MSVC_EXCEPTION before the TAP count existed. A serial run of the same 4,175 tests
+  // passed 4,145 / 0 in 16m09s, so this gate uses the matching serial ordering and a 30-minute
+  // ceiling; the other pre-flight checks keep their 15-minute ceiling.
+  const concurrency = '--test-concurrency=1';
   const result = child(
     'test',
     process.execPath,
     [
       '--test',
       '--test-force-exit',
+      concurrency,
       '--test-reporter=spec',
       '--test-reporter-destination=stdout',
       '--test-reporter=tap',
       `--test-reporter-destination=${tapFile}`,
       ...files,
     ],
-    { timeoutMs: TEST_TIMEOUT_MS, env: suiteEnv.env },
+    { timeoutMs: SUITE_TIMEOUT_MS, env: suiteEnv.env },
   );
   const seconds = ((Date.now() - started) / 1000).toFixed(1);
   const counts = parseTestCounts(result.stdout);

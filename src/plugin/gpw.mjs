@@ -40,7 +40,7 @@ import { dirname, join, resolve } from 'node:path';
 import { createHmac, randomBytes, randomUUID } from 'node:crypto';
 
 import { classifyToolCall, isInside, normalizeFolder } from './folder-policy.mjs';
-import { classifyGpwCall, fingerprintOf } from './gpw-colors.mjs';
+import { classifyGpwCall, fingerprintOf, GPW_COLORS } from './gpw-colors.mjs';
 import {
   autoActionOfLevel,
   classifyPendingWithAi,
@@ -50,6 +50,13 @@ import {
   normalizeGpwAiConfig,
 } from './gpw-ai.mjs';
 import { createAiSecretStore } from '../decision-center/lib/ai-secret-store.mjs';
+import {
+  classifyGpwV2Call,
+  GPW_V2_DEFAULT_TIMING,
+  GPW_V2_G_LEVELS,
+  GPW_V2_LABELS,
+  GPW_V2_LEVELS,
+} from './gpw-v2-risk.mjs';
 
 export const name = 'dsh-gpw';
 
@@ -331,6 +338,11 @@ function positiveInt(value, fallback) {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
 }
 
+/** Coerce a config value to a non-negative integer (zero is meaningful for the yellow timeout). */
+function nonNegativeInt(value, fallback) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.floor(value) : fallback;
+}
+
 /** Launch a native folder picker and resolve with its path, or null. Never rejects. */
 function pickFolder() {
   return new Promise((resolvePath) => {
@@ -390,14 +402,62 @@ function pickFolder() {
 }
 
 /**
+ * Mount the GPW-V2 variant on the same folder policy and operator routes as GPW.
+ *
+ * The two variants are not meant to run at once: they answer the same `/api/w2m/gpw/*` routes. GPW
+ * stays untouched as the fallback; the bundle patch ships both rows disabled, and the operator enables
+ * exactly one in the plugin manager.
+ *
  * @param {object} ctx Cordis context.
  * @param {object} [config]
  */
-export function apply(ctx, config = {}) {
+export function applyV2(ctx, config = {}) {
+  return apply(ctx, config, { variant: 'v2' });
+}
+
+/**
+ * @param {object} ctx Cordis context.
+ * @param {object} [config]
+ */
+export function apply(ctx, config = {}, internals = {}) {
+  const variant = internals.variant === 'v2' ? 'v2' : 'gpw';
+  const readService = (name) => {
+    try {
+      return typeof ctx?.get === 'function' ? (ctx.get(name) ?? null) : null;
+    } catch {
+      return null;
+    }
+  };
+  const provideService = (name, service) => {
+    try {
+      if (typeof ctx?.provide !== 'function') return;
+      if (readService(name) === null) ctx.provide(name, service);
+    } catch {
+      /* a host without the service registry still runs the gate */
+    }
+  };
+  // Two rows answer the same routes, so only one may mount. The bundle patch puts GPW-V2 first;
+  // if the original GPW is somehow earlier, V2 stands down and the original remains the fallback.
+  if (variant === 'v2') {
+    if (readService('dshGpw') !== null) {
+      ctx.logger?.warn?.('dsh-gpw-v2: standing down because dsh-gpw is already mounted');
+      return;
+    }
+    provideService('dshGpwV2', { active: true, variant: 'gpw-v2' });
+  } else {
+    if (readService('dshGpwV2') !== null) {
+      ctx.logger?.warn?.('dsh-gpw: standing down because dsh-gpw-v2 is mounted');
+      return;
+    }
+    provideService('dshGpw', { active: true, variant: 'gpw' });
+  }
   const maxPerWindow = positiveInt(config.maxPerWindow, DEFAULT_BUDGET.maxPerWindow);
   const windowMs = positiveInt(config.windowMs, DEFAULT_BUDGET.windowMs);
   const minGapMs = positiveInt(config.minGapMs, DEFAULT_BUDGET.minGapMs);
   const pendingTimeoutMs = positiveInt(config.pendingTimeoutMs, DEFAULT_PENDING_TIMEOUT_MS);
+  const v2BlueDelayMs = positiveInt(config.blueDelayMs, GPW_V2_DEFAULT_TIMING.blueDelayMs);
+  const v2GrayDelayMs = positiveInt(config.grayDelayMs, GPW_V2_DEFAULT_TIMING.grayDelayMs);
+  const v2YellowTimeoutMs = nonNegativeInt(config.yellowTimeoutMs, GPW_V2_DEFAULT_TIMING.yellowTimeoutMs);
   const requireFullAccess = config.requireFullAccess !== false;
   const configuredMode = config.gpwMode === 'advanced' ? 'advanced' : DEFAULT_GPW_MODE;
   const foldersFile = foldersFileOf(config);
@@ -507,7 +567,7 @@ export function apply(ctx, config = {}) {
   /** Newest-first record of calls the gate saw, so the panel can offer "add this folder" in one click. */
   const recent = [];
   /** Four-colour counters: every decision lands in exactly one bucket (v1.7.10). */
-  const colorCounts = { green: 0, blue: 0, yellow: 0, red: 0 };
+  const colorCounts = { green: 0, blue: 0, gray: 0, yellow: 0, red: 0 };
   /** Operation fingerprints approved earlier in this session -> the blue ("正常") state. */
   const sessionGrants = new Set();
 
@@ -621,6 +681,60 @@ export function apply(ctx, config = {}) {
       }
     }).catch(() => { /* classification is best-effort */ });
   });
+  /**
+   * Hold a GPW-V2 call according to its ladder rung.
+   *
+   * Blue/gray are not questions: they are a visible countdown that auto-allows when it reaches zero.
+   * Yellow is the only rung that waits for the operator, and it never auto-allows; a configured
+   * `yellowTimeoutMs` only bounds how long the process waits before denying.
+   */
+  const waitForV2 = (exec, risk) => new Promise((resolveDecision) => {
+    const id = randomUUID();
+    const call = toolCallOf(exec);
+    const delayMs = risk.level === 'blue' ? v2BlueDelayMs : risk.level === 'gray' ? v2GrayDelayMs : 0;
+    const entry = {
+      id,
+      resolve: resolveDecision,
+      createdAt: Date.now(),
+      tool: String(call.name ?? 'tool'),
+      reason: risk.reason,
+      paths: risk.paths,
+      color: risk.level,
+      level: risk.level,
+      g_level: risk.gLevel,
+      ai: null,
+      fingerprint: fingerprintOf(call),
+      sessionId: String(exec?.agent?.session?.header?.id ?? ''),
+      timer: null,
+      timeoutMs: 0,
+      deadlineAt: 0,
+    };
+    pending.set(id, entry);
+    pendingTotal += 1;
+    if (delayMs > 0) {
+      entry.timeoutMs = delayMs;
+      entry.deadlineAt = Date.now() + delayMs;
+      entry.timer = setTimeout(() => {
+        if (!pending.has(id)) return;
+        pending.delete(id);
+        allowedTotal += 1;
+        colorCounts[risk.level] = (colorCounts[risk.level] ?? 0) + 1;
+        noteRecent({ tool: entry.tool, decision: 'allow', color: risk.level, reason: `${risk.gLevel} 延迟结束，自动放行`, paths: risk.paths });
+        resolveDecision({ kind: 'allow', reason: `GPW-V2 ${risk.gLevel}: 延迟结束，自动放行` });
+      }, delayMs);
+    } else if (risk.level === 'yellow' && v2YellowTimeoutMs > 0) {
+      entry.timeoutMs = v2YellowTimeoutMs;
+      entry.deadlineAt = Date.now() + v2YellowTimeoutMs;
+      entry.timer = setTimeout(() => {
+        if (!pending.has(id)) return;
+        pending.delete(id);
+        deniedTotal += 1;
+        colorCounts.yellow += 1;
+        noteRecent({ tool: entry.tool, decision: 'deny', color: 'yellow', reason: 'G2 确认超时，默认拒绝', paths: risk.paths });
+        resolveDecision({ kind: 'deny', reason: 'GPW-V2 G2: 二次确认超时，默认拒绝' });
+      }, v2YellowTimeoutMs);
+    }
+  });
   const decidePending = (id, decision) => {
     const entry = pending.get(id);
     if (entry === undefined) return { ok: false, error: 'unknown pending request' };
@@ -630,13 +744,17 @@ export function apply(ctx, config = {}) {
     } catch {
       /* already fired */
     }
+    if (typeof entry.g_level === 'string') {
+      colorCounts[entry.level] = (colorCounts[entry.level] ?? 0) + 1;
+    }
+    const engineLabel = typeof entry.g_level === 'string' ? `GPW-V2 ${entry.g_level}` : 'GPW';
     if (decision === 'allow' || decision === 'allow-session') {
       allowedTotal += 1;
       if (typeof entry.fingerprint === 'string' && entry.fingerprint !== '') sessionGrants.add(entry.fingerprint);
-      entry.resolve({ kind: 'allow', reason: decision === 'allow-session' ? 'GPW: allowed for this session (blue)' : 'GPW: allowed by the operator' });
+      entry.resolve({ kind: 'allow', reason: decision === 'allow-session' ? `${engineLabel}: allowed for this session (blue)` : `${engineLabel}: allowed by the operator` });
     } else {
       deniedTotal += 1;
-      entry.resolve({ kind: 'deny', reason: 'GPW: denied by the operator' });
+      entry.resolve({ kind: 'deny', reason: `${engineLabel}: denied by the operator` });
     }
     return { ok: true };
   };
@@ -685,6 +803,21 @@ export function apply(ctx, config = {}) {
   });
   if (typeof ctx.effect === 'function') {
     ctx.effect(() => () => {
+      for (const entry of pending.values()) {
+        try {
+          clearTimeout(entry.timer);
+        } catch {
+          /* already fired */
+        }
+        // A held call must not keep the host waiting after the gate disappears. Resolve it as a
+        // denial before clearing the queue; the timer that was just cancelled can no longer do so.
+        try {
+          entry.resolve?.({ kind: 'deny', reason: 'GPW: the gate was unmounted before the operator answered' });
+        } catch {
+          /* the caller is already gone */
+        }
+      }
+      pending.clear();
       for (const dispose of agentGuards.values()) {
         try {
           dispose();
@@ -693,7 +826,7 @@ export function apply(ctx, config = {}) {
         }
       }
       agentGuards.clear();
-    }, 'dsh-gpw: per-agent blacklist guards');
+    }, 'dsh-gpw: per-agent blacklist guards and pending timers');
   }
 
 
@@ -710,6 +843,57 @@ export function apply(ctx, config = {}) {
       noteRecent({ tool: String(call.name ?? 'tool'), decision: 'deny', reason: lists.reason, paths: probe.paths });
       ctx.logger?.warn?.(`dsh-gpw: refused ${String(call.name ?? 'tool')} -- lists locked (${lists.reason})`);
       return { kind: 'deny', reason: `GPW: folder lists failed integrity check (${lists.reason}); reset them in the GPW panel` };
+    }
+    if (variant === 'v2' && lists.mode === 'novice') {
+      // GPW-V2 is the novice-mode ladder. Advanced mode deliberately falls through to the original
+      // four-colour queue below, so enabling V2 never removes the gate when the operator switches
+      // modes; the separate `dsh-gpw` row remains the fallback when V2 itself is disabled.
+      let v2Cwd = null;
+      try {
+        v2Cwd = await ctx.workingDirectory?.ensure?.(exec.agent, exec.signal);
+      } catch {
+        v2Cwd = null;
+      }
+      const v2Call = toolCallOf(exec);
+      const v2Classification = classifyToolCall({
+        ...v2Call,
+        blacklist: lists.effectiveBlacklist,
+        workspace: v2Cwd ?? null,
+        base: v2Cwd ?? undefined,
+        allowRelative: v2Cwd !== null,
+      });
+      if (v2Classification.decision === 'deny') {
+        deniedTotal += 1;
+        colorCounts.red += 1;
+        noteRecent({ tool: String(v2Call.name ?? 'tool'), decision: 'deny', color: 'red', reason: v2Classification.reason, paths: v2Classification.paths });
+        ctx.logger?.warn?.(`dsh-gpw-v2: red -- refused ${String(v2Call.name ?? 'tool')} -- ${v2Classification.reason}`);
+        return { kind: 'deny', reason: `GPW-V2 G3: ${v2Classification.reason}; the call was not executed` };
+      }
+      const risk = classifyGpwV2Call({
+        name: v2Call.name,
+        arguments: v2Call.arguments,
+        paths: v2Classification.paths,
+        workspace: v2Cwd ?? null,
+        blacklist: lists.effectiveBlacklist,
+      });
+      risk.paths = v2Classification.paths;
+      if (risk.level === 'red') {
+        deniedTotal += 1;
+        colorCounts.red += 1;
+        noteRecent({ tool: String(v2Call.name ?? 'tool'), decision: 'deny', color: 'red', reason: risk.reason, paths: risk.paths });
+        ctx.logger?.warn?.(`dsh-gpw-v2: red -- refused ${String(v2Call.name ?? 'tool')} -- ${risk.reason}`);
+        return { kind: 'deny', reason: `GPW-V2 G3: ${risk.reason}; the call was not executed` };
+      }
+      if (risk.level === 'green') {
+        allowedTotal += 1;
+        colorCounts.green += 1;
+        noteRecent({ tool: String(v2Call.name ?? 'tool'), decision: 'allow', color: 'green', reason: risk.reason, paths: risk.paths });
+        ctx.logger?.info?.(`dsh-gpw-v2: green -- ${String(v2Call.name ?? 'tool')} -- ${risk.reason}`);
+        return { kind: 'allow', reason: `GPW-V2 G0: ${risk.reason}` };
+      }
+      noteRecent({ tool: String(v2Call.name ?? 'tool'), decision: 'pending', color: risk.level, reason: risk.reason, paths: risk.paths });
+      ctx.logger?.info?.(`dsh-gpw-v2: ${risk.level} -- holding ${String(v2Call.name ?? 'tool')} -- ${risk.reason}`);
+      return waitForV2(exec, risk);
     }
     if (lists.mode === 'novice') {
       // 小白模式: only the blacklist restricts anything; every other call passes.
@@ -809,7 +993,7 @@ export function apply(ctx, config = {}) {
       path: GPW_HEALTH_ROUTE,
       methods: ['GET'],
       requestBody: 'buffered',
-      fetch: async () => json({ ok: true, row: 'dsh-gpw', mounted: true }),
+      fetch: async () => json({ ok: true, row: variant === 'v2' ? 'dsh-gpw-v2' : 'dsh-gpw', mounted: true }),
     });
 
     registry.register({
@@ -821,14 +1005,19 @@ export function apply(ctx, config = {}) {
         return json({
           ok: true,
           enabled: true,
+          engine: variant === 'v2' ? 'gpw-v2' : 'gpw',
+          levels: variant === 'v2' ? [...GPW_V2_LEVELS] : [...GPW_COLORS],
+          g_levels: variant === 'v2' ? { ...GPW_V2_G_LEVELS } : null,
+          level_labels: variant === 'v2' ? { ...GPW_V2_LABELS } : null,
           require_full_access: requireFullAccess,
           folders: { whitelist: lists.whitelist, blacklist: lists.blacklist },
           mode: lists.mode,
           modes: [...GPW_MODES],
           protected_folders: lists.mode === 'novice' ? [...DEFAULT_PROTECTED_FOLDERS, ...lists.blacklist] : [...lists.blacklist],
-          pending_timeout_ms: pendingTimeoutMs,
+          pending_timeout_ms: variant === 'v2' ? v2YellowTimeoutMs : pendingTimeoutMs,
           ai: aiStatus(),
-          novice_approve_gap_ms: NOVICE_APPROVE_GAP_MS,
+          novice_approve_gap_ms: variant === 'v2' ? 0 : NOVICE_APPROVE_GAP_MS,
+          v2_timing_ms: variant === 'v2' ? { blue: v2BlueDelayMs, gray: v2GrayDelayMs, yellow: v2YellowTimeoutMs } : null,
           tampered: lists.tampered,
           tampered_reason: lists.reason,
           counters: { allowedTotal, pendingTotal, deniedTotal, budgetWindow: approvals.length, maxPerWindow, colors: { ...colorCounts }, grants: sessionGrants.size },
@@ -854,6 +1043,7 @@ export function apply(ctx, config = {}) {
             pending_ms: Date.now() - entry.createdAt,
             color: entry.color ?? 'yellow',
             level: entry.level ?? entry.color ?? 'yellow',
+            g_level: entry.g_level ?? null,
             ai: entry.ai ?? null,
             countdown_ms: entry.timeoutMs ?? pendingTimeoutMs,
             deadline_at: entry.deadlineAt ?? 0,

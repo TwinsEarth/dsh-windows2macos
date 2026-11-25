@@ -137,6 +137,26 @@
       #   prepareTimeoutMs: integer > 0             (default 15000)
       #   handshakeTimeoutMs: integer > 0           (default 10000)
       config: {}
+    # GPW-V2: the five-level ladder (绿 G0 / 蓝 G1-1 / 灰 G1-2 / 黄 G2 / 红 G3), active only in
+    # 完全权限 + GPW 小白模式. It is a **separate subplugin** and ships `disabled: true`: installing the
+    # package must not install a permission gate. Enable it in the plugin manager by flipping this row.
+    #
+    # Enable exactly one of `dsh-gpw` / `dsh-gpw-v2`. They share the same `/api/w2m/gpw/*` panel routes.
+    # This row is deliberately placed before `dsh-gpw`: if both are enabled, GPW-V2 takes the gate and
+    # the original row stands down as the fallback.
+    - id: dsh-gpw-v2
+      name: '@twinsearth/w2m-dsh-plugin/gpw-v2'
+      disabled: true
+      config:
+        requireFullAccess: true
+        # 蓝：项目内常规变更，延迟 1 分钟放行（G1-1）
+        blueDelayMs: 60000
+        # 灰：依赖安装/测试/构建/长任务，延迟 10 分钟放行（G1-2）
+        grayDelayMs: 600000
+        # 黄：弹窗警告 + 二次确认（G2）。0 = 一直等待操作员，绝不自动放行。
+        yellowTimeoutMs: 0
+        whitelist: []
+        blacklist: []
     - id: dsh-gpw
       name: '@twinsearth/w2m-dsh-plugin/gpw'
       disabled: true

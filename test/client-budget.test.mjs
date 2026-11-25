@@ -44,9 +44,12 @@ const CLIENT = path.join(ROOT, 'lib', 'client.js');
 const BUDGET = Object.freeze({
   // P5 (v3.6.0) raised the ceiling by 6 KB / 100 lines: the previous 610,000-byte value had only 113 bytes
   // left before the remote-view diagnostics/UI work, and the comment's "593,540" baseline was stale.
-  // Current after P5: 612,329 bytes / 10,096 lines.
-  bytes: 616_000,
-  lines: 10_150,
+  // v3.7.3 raised it by 1 KB / 50 lines for the GPW-V2 G2 overlay and five-level legend: measured
+  // 616,521 bytes / 10,166 lines, so this left 479 bytes / 34 lines of reviewed headroom.
+  // The opt-in GPW sidebar row then added 3,777 bytes / 74 lines (preference, handler, mount/unmount and
+  // the pin control): measured 620,298 bytes / 10,240 lines, leaving 702 bytes / 10 lines of headroom.
+  bytes: 621_000,
+  lines: 10_250,
   largestFunctionLines: 1_200, // current largest is 832 (BackupPanelView); rule: max(largest + 100, 1_200)
 });
 
