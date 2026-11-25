@@ -12,9 +12,10 @@
  *      `/v1/remote/ack`;
  *   3. the viewer starts its half, sends `view.hello` over the Noise-sealed
  *      DataChannel, and every frame stays on that channel;
- *   4. only `transport: 'auto'` may fall back to the old encrypted-relay blind
- *      forwarding when warm-up or the pair fails. `transport: 'webrtc'` returns
- *      a named 502 and never silently switches paths.
+ *   4. `transport: 'webrtc'` is the default for remote desktop: it only uses the
+ *      shared pool and returns a named 502 when the pool or pair is unavailable.
+ *      Only an explicit `transport: 'auto'` may fall back to the old
+ *      encrypted-relay blind forwarding.
  *
  * The desktop row never owns the pool: it borrows the process-wide pool built
  * by `tools/shared.mjs` and only unsubscribes on stop. `closePeer()` is
@@ -36,9 +37,11 @@ export const REMOTE_DIAGNOSTICS_PATH = '/api/w2m/remote/diagnostics';
 const NO_STORE = { 'cache-control': 'no-store' };
 const RELAY_ACK_PATH = '/v1/remote/ack';
 
-function normalizeTransport(value) {
+const DEFAULT_TRANSPORT = 'webrtc';
+
+function normalizeTransport(value, fallback = DEFAULT_TRANSPORT) {
   if (value === 'webrtc' || value === 'relay' || value === 'auto') return value;
-  return 'auto';
+  return fallback;
 }
 
 function readConfig(file, defaults = {}) {
@@ -49,11 +52,13 @@ function readConfig(file, defaults = {}) {
   }
   try {
     const parsed = JSON.parse(readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
+    const fileTransport = parsed?.transport;
+    const hasTransport = fileTransport === 'webrtc' || fileTransport === 'relay' || fileTransport === 'auto';
     return {
       ok: true,
       enabled: parsed?.enabled === true,
-      transport: normalizeTransport(parsed?.transport),
-      transport_source: 'json',
+      transport: hasTransport ? fileTransport : defaultTransport,
+      transport_source: hasTransport ? 'json' : defaultSource,
     };
   } catch {
     // The file exists but is not usable. Do not silently resurrect a row default: enabled stays
@@ -61,7 +66,7 @@ function readConfig(file, defaults = {}) {
     return {
       ok: false,
       enabled: false,
-      transport: 'auto',
+      transport: defaultTransport,
       transport_source: 'json',
       error: 'REMOTE_CONFIG_INVALID',
     };
@@ -118,9 +123,11 @@ const timeoutSignal = (ms) => (
  *   pool?:object|null, capture?:Function, platform?:string, maxBytes?:number,
  *   prepareTimeoutMs?:number, handshakeTimeoutMs?:number, ackPollMs?:number,
  *   transport?:'auto'|'webrtc'|'relay', allowLegacyP2P?:boolean}} deps
- *   `transport` and `allowLegacyP2P` are row defaults: they apply only until `remote-view.json`
- *   exists. `allowLegacyP2P` defaults to false, so `auto` never dials the old UDP path unless a
- *   row explicitly opts in.
+ *   `transport` and `allowLegacyP2P` are row defaults: they apply until
+ *   `remote-view.json` supplies its own `transport`. The built-in default is
+ *   `webrtc`, so a fresh install never silently falls back to relay.
+ *   `allowLegacyP2P` defaults to false, so `auto` never dials the old UDP path
+ *   unless a row explicitly opts in.
  */
 export function registerRemoteViewRoutes(ctx, deps = {}) {
   const status = { mounted: false, reason: 'the host has no Connection service', configPath: null };
@@ -143,13 +150,13 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
     ? deps.getPoolState
     : (hasExplicitPool ? () => null : getSharedWebRtcPoolState);
   const rowTransportSpecified = Object.hasOwn(deps, 'transport');
-  const defaultTransport = rowTransportSpecified ? normalizeTransport(deps.transport) : 'auto';
+  const defaultTransport = rowTransportSpecified ? normalizeTransport(deps.transport) : DEFAULT_TRANSPORT;
   const defaultTransportSource = rowTransportSpecified ? 'row' : 'default';
   const allowLegacyP2P = deps.allowLegacyP2P === true;
   const maxBytes = Number.isInteger(deps.maxBytes) ? deps.maxBytes : 96 * 1024;
   const prepareTimeoutMs = Number.isInteger(deps.prepareTimeoutMs) && deps.prepareTimeoutMs > 0
     ? deps.prepareTimeoutMs
-    : 8_000;
+    : 15_000;
   const handshakeTimeoutMs = Number.isInteger(deps.handshakeTimeoutMs) && deps.handshakeTimeoutMs > 0
     ? deps.handshakeTimeoutMs
     : 10_000;

@@ -61,7 +61,7 @@ describe('remote-view host routes', () => {
 
   it('starts a P2P session only when the row opts into legacy, caches one frame, and stops it', async () => {
     const h = harness({ allowLegacyP2P: true });
-    await h.routes.get('/api/w2m/remote/config').fetch(request({ enabled: true }));
+    await h.routes.get('/api/w2m/remote/config').fetch(request({ enabled: true, transport: 'auto' }));
     const started = await h.routes.get('/api/w2m/remote/start').fetch(request({ machine_id: 'm-1' }));
     assert.equal(started.status, 200);
     const startedBody = await started.json();
@@ -131,7 +131,7 @@ describe('remote-view host routes', () => {
     registerDesktop(ctx, { stateDir, p2p: null });
     const config = await routes.get('/api/w2m/remote/config').fetch(request({}, 'GET'));
     const body = await config.json();
-    assert.equal(body.transport, 'auto');
+    assert.equal(body.transport, 'webrtc');
     assert.equal(body.transport_source, 'default');
     assert.equal(body.legacy_p2p, false);
   });
@@ -170,7 +170,7 @@ describe('remote-view host routes', () => {
 
   it('reports P2P_UNAVAILABLE instead of falling back to local capture', async () => {
     const h = harness();
-    await h.routes.get('/api/w2m/remote/config').fetch(request({ enabled: true }));
+    await h.routes.get('/api/w2m/remote/config').fetch(request({ enabled: true, transport: 'auto' }));
     h.node.dial = async () => ({ ok: false, error: 'P2P_PUNCH_TIMEOUT' });
     const started = await h.routes.get('/api/w2m/remote/start').fetch(request({ machine_id: 'm-2' }));
     assert.equal(started.status, 502);
@@ -206,7 +206,7 @@ describe('remote-view host routes', () => {
       return { ok: false, status: 404, json: async () => ({ ok: false }) };
     };
     try {
-      await h.routes.get('/api/w2m/remote/config').fetch(request({ enabled: true }));
+      await h.routes.get('/api/w2m/remote/config').fetch(request({ enabled: true, transport: 'auto' }));
       const started = await h.routes.get('/api/w2m/remote/start').fetch(request({ machine_id: 'm-relay' }));
       assert.equal(started.status, 200);
       const first = await h.routes.get('/api/w2m/remote/frame').fetch(request({}));
@@ -446,7 +446,7 @@ describe('remote-view host routes', () => {
       return { ok: false, status: 404, json: async () => ({ ok: false }) };
     };
     try {
-      await h.routes.get('/api/w2m/remote/config').fetch(request({ enabled: true }));
+      await h.routes.get('/api/w2m/remote/config').fetch(request({ enabled: true, transport: 'auto' }));
       const started = await h.routes.get('/api/w2m/remote/start').fetch(request({ machine_id: 'target-1' }));
       assert.equal(started.status, 200);
       const body = await started.json();

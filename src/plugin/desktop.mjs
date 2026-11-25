@@ -34,7 +34,8 @@ const registered = new WeakSet();
  *   prepareTimeoutMs?:number, handshakeTimeoutMs?:number}} [deps]
  *   `getPool` is optional: when omitted, the route resolves the process-wide shared pool on every
  *   `/start`, so a root row mounted before the pool exists is not frozen to relay. Row options are
- *   defaults only: an existing `remote-view.json` always wins.
+ *   defaults only: a `transport` written in `remote-view.json` always wins; when the file exists
+ *   without `transport`, the row default applies. The built-in default is `webrtc`.
  */
 export function registerDesktop(ctx, deps = {}) {
   if (ctx === null || typeof ctx !== 'object') return { mounted: false, reason: 'no ctx' };

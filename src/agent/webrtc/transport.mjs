@@ -457,6 +457,8 @@ export function createWebRtcTransport({
     });
   };
 
+  let remoteDescriptionSet = false;
+  const pendingRemoteCandidates = [];
   const attachSignal = () => {
     signal.on('signal', (message) => {
       if (bridge === null) return;
@@ -467,13 +469,21 @@ export function createWebRtcTransport({
           return;
         }
         bridge.call('setRemoteDescription', { type: message.kind, sdp }).then((result) => {
-          if (result.ok !== true) lastError = { code: result.code, detail: result.detail };
+          if (result.ok !== true) { lastError = { code: result.code, detail: result.detail }; return; }
+          remoteDescriptionSet = true;
+          for (const candidate of pendingRemoteCandidates.splice(0)) {
+            bridge.call('addIceCandidate', { candidate }).then((added) => {
+              if (added.ok !== true) lastError = { code: added.code, detail: added.detail };
+            });
+          }
         });
         return;
       }
       if (message.kind === 'candidate') {
+        const candidate = message.payload?.candidate ?? message.payload;
+        if (!remoteDescriptionSet) { pendingRemoteCandidates.push(candidate); return; }
         bridge
-          .call('addIceCandidate', { candidate: message.payload?.candidate ?? message.payload })
+          .call('addIceCandidate', { candidate })
           .then((result) => {
             if (result.ok !== true) lastError = { code: result.code, detail: result.detail };
           });

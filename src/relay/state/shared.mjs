@@ -25,6 +25,11 @@ export const PROTOCOL_VERSION = 1;
 export const ERROR_STATUS = Object.freeze({
   UNAUTHORIZED: 401,
   BAD_REQUEST: 400,
+  INVALID_ORIGIN: 400,
+  INVALID_TARGET: 400,
+  INVALID_LOCK_KIND: 400,
+  INVALID_HOLDER: 400,
+  INVALID_LEASE: 400,
   // v1.3.12-beta.1: dispatch refuses a grant written for another task or argv. Caller errors (400), not authorization verdicts.
   GRANT_TASK_MISMATCH: 400,
   GRANT_ARGV_MISMATCH: 400,

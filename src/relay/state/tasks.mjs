@@ -14,6 +14,7 @@ import { deleteOfferJournal, writeOfferJournal } from '../offer-journal.mjs';
 import { validateTaskDependencies } from '../task-deps.mjs';
 import {
   ACTIVE_LEASE_STATES,
+  FAILURE_STATUSES,
   MAX_ORIGIN_MACHINE_ID_LENGTH,
   MAX_PIPELINE_STAGES,
   P2P_MODES,
@@ -994,8 +995,18 @@ export function taskSummary(state, task) {
       const leases = [...task.leases.values()];
       if (leases.some((lease) => lease.state === 'waiting')) return 'waiting';
       if (leases.some((lease) => ACTIVE_LEASE_STATES.includes(lease.state))) return 'active';
+      // A lease that produced no result is not a success, however the scheduler settled it.
+      if (leases.some((lease) => lease.state === 'refused' || lease.state === 'expired')) return 'failed';
       const results = [...state.results.values()].filter((record) => record?.envelope?.task_id === task.task_id);
-      if (results.length > 0 && results.every((record) => ['failed', 'crashed', 'refused', 'timeout'].includes(record?.envelope?.status))) return 'failed';
+      const failures = results.filter((record) => {
+        const s = record?.envelope?.status;
+        // Missing required fields make the result unverifiable, not successful.
+        return (record?.validation?.missing?.length ?? 0) > 0
+          || FAILURE_STATUSES.includes(s) || s === 'refused' || s === 'failed' || s === 'unverifiable';
+      });
+      if (results.length > 0 && failures.length === results.length) return 'failed';
+      // Some machines failed while others reported: the task did not fully succeed.
+      if (failures.length > 0) return 'failed';
       return state._taskSettled(task) === true ? 'done' : 'unknown';
     })(),
     depends_on: Array.isArray(task.depends_on) ? task.depends_on : [],

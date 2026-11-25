@@ -1371,6 +1371,7 @@ describe('results & dedupe', () => {
       assert.equal(res.status, 200, 'a malformed envelope is accepted and booked, not rejected');
       const view = await request(`${relay.url}/v1/tasks/${created.json.task_id}`, { token: a.token });
       assert.equal(view.json.aggregate.status, 'unverifiable');
+      assert.equal(view.json.task.status, 'failed', 'a result missing required fields must not surface as task.status=done');
       assert.deepEqual(view.json.aggregate.machines[0].reasons[0], 'missing required fields: stdout_bytes,warnings');
     });
   });
@@ -4609,6 +4610,43 @@ describe('aggregate publishes dataflow facts (v1.2.7)', () => {
     });
   });
 });
+describe('task status reflects execution outcome', () => {
+  it('does not report done when every lease reports nonzero_exit', async () => {
+    await withRelay({}, async (relay) => {
+      const a = await pairDevice(relay, 'm1');
+      const created = await postTask(relay, taskBody());
+      const env = envelopeForTask(created.json.task_id, 'm1', { status: 'nonzero_exit', exit_code: 7 });
+      const posted = await request(relay.url + '/v1/result', { method: 'POST', token: a.token, body: env });
+      assert.equal(posted.status, 200, posted.text);
+
+      const view = await request(relay.url + '/v1/tasks/' + created.json.task_id, { token: a.token });
+      assert.equal(view.status, 200, view.text);
+      assert.equal(view.json.task.status, 'failed', 'a failed command must not surface as task.status=done');
+      assert.equal(view.json.aggregate.status, 'failed');
+    });
+  });
+
+  it('reports failed, not done, when one lease finished and a sibling expired', async () => {
+    await withRelay({}, async (relay) => {
+      const a = await pairDevice(relay, 'm1');
+      await pairDevice(relay, 'm2');
+      const created = await postTask(relay, taskBody({ target_machines: ['m1', 'm2'] }));
+      const env = envelopeForTask(created.json.task_id, 'm1');
+      const posted = await request(relay.url + '/v1/result', { method: 'POST', token: a.token, body: env });
+      assert.equal(posted.status, 200, posted.text);
+
+      const task = relay.state.getTask(created.json.task_id);
+      task.leases.get('m2').lease_until_ms = 0;
+      relay.state.sweepExpired();
+
+      const view = await request(relay.url + '/v1/tasks/' + created.json.task_id, { token: a.token });
+      assert.equal(view.status, 200, view.text);
+      assert.equal(view.json.task.status, 'failed', 'an expired sibling is not a success');
+      assert.equal(view.json.aggregate.status, 'partial');
+    });
+  });
+});
+
 describe('project room routes', () => {
   it('lists the default project and creates one with a machine member via the operator token', async () => {
     await withRelay({}, async (relay) => {
@@ -4629,6 +4667,7 @@ describe('project room routes', () => {
       const snapshot = await request(relay.url + '/v1/projects/' + projectId, { token: device.token });
       assert.equal(snapshot.status, 200, snapshot.text);
       assert.equal(snapshot.json.project.name, 'demo');
+      assert.deepEqual(snapshot.json.project.origin, { kind: 'git', url: 'https://example.invalid/repo.git' });
       assert.equal(snapshot.json.members.length, 2);
       assert.ok(snapshot.json.last_event_seq >= 2);
 
@@ -4659,6 +4698,24 @@ describe('project room routes', () => {
       const device = await pairDevice(relay, 'm-room-4');
       const missing = await request(relay.url + '/v1/projects/nope', { token: device.token });
       assert.equal(missing.status, 404);
+    });
+  });
+
+  it('rejects a non-object origin instead of storing a character map', async () => {
+    await withRelay({}, async (relay) => {
+      for (const origin of ['fleet4-test', ['x']]) {
+        const bad = await request(relay.url + '/v1/projects', {
+          method: 'POST', token: OP, body: { name: 'bad-origin', origin },
+        });
+        assert.equal(bad.status, 400, bad.text);
+        assert.equal(bad.json.error.code, 'INVALID_ORIGIN', bad.text);
+        assert.ok(bad.json.error.detail.received === 'string' || bad.json.error.detail.received === 'object');
+      }
+
+      const device = await pairDevice(relay, 'm-room-origin');
+      const listed = await request(relay.url + '/v1/projects', { token: device.token });
+      assert.equal(listed.status, 200, listed.text);
+      assert.ok(!listed.json.projects.some((project) => project.name === 'bad-origin'), 'a rejected create must not leak a poisoned project');
     });
   });
 });
@@ -4715,6 +4772,29 @@ describe('project lock routes', () => {
       const forced = await request(relay.url + '/v1/projects/' + projectId + '/locks/' + lockId + '?force=1&reason=stale', { method: 'DELETE', token: member.token });
       assert.equal(forced.status, 409);
       assert.equal(forced.json.code, 'LOCK_FORCE_DENIED');
+    });
+  });
+
+  it('maps a malformed lock target to 400 INVALID_TARGET, not 500 INTERNAL', async () => {
+    await withRelay({}, async (relay) => {
+      const member = await pairDevice(relay, 'm-lock-bad');
+      const created = await request(relay.url + '/v1/projects', {
+        method: 'POST', token: OP, body: { name: 'locks-bad', members: [{ kind: 'machine', id: 'm-lock-bad', role: 'worker' }] },
+      });
+      assert.equal(created.status, 200, created.text);
+      const projectId = created.json.project.project.project_id;
+
+      const stringTarget = await request(relay.url + '/v1/projects/' + projectId + '/locks', {
+        method: 'POST', token: member.token, body: { kind: 'file', target: 'README.md' },
+      });
+      assert.equal(stringTarget.status, 400, stringTarget.text);
+      assert.equal(stringTarget.json.error.code, 'INVALID_TARGET', stringTarget.text);
+
+      const missingTarget = await request(relay.url + '/v1/projects/' + projectId + '/locks', {
+        method: 'POST', token: member.token, body: { kind: 'file' },
+      });
+      assert.equal(missingTarget.status, 400, missingTarget.text);
+      assert.equal(missingTarget.json.error.code, 'INVALID_TARGET', missingTarget.text);
     });
   });
 });

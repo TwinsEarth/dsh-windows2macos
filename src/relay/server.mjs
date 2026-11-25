@@ -1159,6 +1159,9 @@ export class RelayServer {
         const added = this.state.projects.addMember({ projectId: target, member: { kind: body?.member?.kind, id: body?.member?.id, name: body?.member?.name ?? null }, role: body?.role ?? 'worker' });
         return sendJson(res, 200, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ok: true, member: added.member, snapshot: this.state.projects.snapshot({ projectId: target }) });
       }
+      if (body?.origin !== undefined && body?.origin !== null && (typeof body.origin !== 'object' || Array.isArray(body.origin))) {
+        throw new ProtocolError('INVALID_ORIGIN', 'origin must be a JSON object or null', { received: typeof body.origin });
+      }
       const created = this.state.projects.createProject({
         name: body?.name,
         origin: body?.origin ?? null,
@@ -1433,7 +1436,13 @@ export class RelayServer {
       if (method === 'POST' && lockId === null) {
         if (!canWrite) return sendJson(res, 403, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ok: false, error: { code: 'FORBIDDEN_ACTION', message: 'acquiring a lock needs worker or above', required_role: 'worker', current_role: membership.role } });
         const body = takeJson();
-        const acquired = this.state.locks.acquire({ projectId, kind: body?.kind, target: body?.target, holder: { kind: "machine", id: device.machine_id }, reason: body?.reason ?? null, leaseMs: Number.isFinite(body?.lease_ms) ? body.lease_ms : undefined });
+        let acquired;
+        try {
+          acquired = this.state.locks.acquire({ projectId, kind: body?.kind, target: body?.target, holder: { kind: "machine", id: device.machine_id }, reason: body?.reason ?? null, leaseMs: Number.isFinite(body?.lease_ms) ? body.lease_ms : undefined });
+        } catch (error) {
+          if (error?.name === 'LockError') throw new ProtocolError(error.code, error.message, error.detail ?? {});
+          throw error;
+        }
         if (acquired.ok === true) this.state.metrics?.inc('wm_lock_acquired_total', { kind: String(body?.kind ?? '') });
         else if (acquired.code === 'LOCK_HELD') this.state.metrics?.inc('wm_lock_conflict_total', { kind: String(body?.kind ?? '') });
         return sendJson(res, acquired.ok ? 200 : 409, { protocol_version: PROTOCOL_VERSION, rabbit_time: this.state.nowIso(), ...acquired });

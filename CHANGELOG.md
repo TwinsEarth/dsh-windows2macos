@@ -2,6 +2,36 @@
 
 All notable changes to this project are documented here.
 
+## [3.7.2] — 2026-11-25
+
+### fix(desktop): 远程桌面默认走 WebRTC，收紧 ICE 与超时
+
+- **默认传输改为 WebRTC**：`remote-view-route.mjs` 的内置默认从 `auto` 改为 `webrtc`；新安装或 `remote-view.json` 未写 `transport` 时不再静默回落到 W2M 加密 relay。只有显式 `transport:'auto'` 才允许回落，`webrtc` 失败返回有名字的 502。
+- **ICE candidate 缓冲**：远端 candidate 在 `setRemoteDescription` 完成前先入队，成功后再按序 `addIceCandidate`，避免 candidate 先于 offer/answer 到达被引擎丢弃。
+- **prepare 超时**：远程视图默认 `prepareTimeoutMs` 从 8 秒提高到 15 秒，覆盖目标端冷启动预热；行配置仍可覆盖。
+- **配置优先级**：`remote-view.json` 存在但没有 `transport` 时使用 row/default，不再强制改写成 `auto`。
+- **不带 fallback 的成功口径**：`/start` 继续返回 `channel`、`preferred`、`fallback_reason`、`webrtc`、`relay_used`；严格 WebRTC 下失败不写 `relay_used:true`。
+
+### fix(relay): 任务失败状态、project origin 与 lock 参数校验
+
+- **任务状态不再误报 done**：当 lease 为 `refused`/`expired`，或结果全部/部分为 `failed`、`crashed`、`timeout`、`unverifiable`、缺必填字段时，`task.status` 返回 `failed`，而不是 `done`；多机部分失败也不再被聚合成功掩盖。
+- **project origin 校验**：`POST /v1/projects` 只接受对象或 `null` 的 `origin`，字符串/数组返回 400 `INVALID_ORIGIN`，不写入脏项目。
+- **lock 参数错误映射**：project lock 的非法 target/kind/holder/lease 从 500 `INTERNAL` 映射为 400 业务错误。
+- **测试**：补齐 relay 的任务失败状态、origin 拒绝与 lock 参数错误用例；`test/desktop-p7` 覆盖默认 WebRTC、候选缓冲与远程视图池运行时。
+
+### 验证
+
+- 三台真实机器（MacMini、IM2A、ToFuture）六向 P2P 矩阵 6/6 建链并取到首帧，全部 `channel:"webrtc"`、`encrypted:true`、`relay_used:false`、`ack_code:"REMOTE_ACK_OK"`。
+- 当前三机网络组合仍需 TURN 才能打通 ICE；`relay_used:false` 只表示 W2M relay 未参与，不等同于无 TURN 的纯直连。
+- 全矩阵长稳、断线重连和 TURN 故障降级未在本版验证窗口执行，列为已知限制。
+
+### 明确不包含
+
+- 不改变 `transport:'auto'` 的旧回落语义；只有默认值和严格模式口径变化。
+- 不重新启用任何默认关闭的 P2P V2、Teams 或桌面输入控制能力。
+- 不包含键鼠注入、文件传输或跨平台输入协议。
+
+
 ## [3.7.1] — 2026-11-24
 
 ### feat(p2p): dual public TURN with per-pair rendezvous

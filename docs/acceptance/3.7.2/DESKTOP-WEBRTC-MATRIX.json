@@ -1,0 +1,39 @@
+{
+  "version": "3.7.2",
+  "case": "DESKTOP-WEBRTC-MATRIX-6DIR",
+  "kind": "positive",
+  "requirement": "v3.7.2 gate: prove the desktop remote-view default on three physical machines - six directed viewer/target legs build over the shared WebRTC pool, return WebRTC/encrypted/relay_used=false with REMOTE_ACK_OK, and deliver a first JPEG frame in every direction.",
+  "machines": [
+    "b1b19d49-20f1-4cdc-986e-f5630a5cd6f2",
+    "1d1c0cd2-0268-456d-8ef1-be7116713e8b",
+    "14ba0e60-14f5-4ab8-a2fe-d7cd4f51d833"
+  ],
+  "executed_at": "2026-11-25T00:00:00+08:00",
+  "executor": "agent",
+  "task_id": "remote-desktop-p2p-matrix-2026-11-25",
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "directed_legs": 6,
+      "passed_legs": 6,
+      "all_channel_webrtc": true,
+      "all_encrypted": true,
+      "all_relay_used_false": true,
+      "all_ack_code_remote_ack_ok": true,
+      "all_first_frame_jpeg": true,
+      "prepare_ms_min": 338,
+      "prepare_ms_max": 3215,
+      "turn_required_for_this_nat_pairing": true,
+      "thirty_minute_soak": false
+    },
+    "matrix": [
+      { "viewer": "Mac", "target": "IM2A", "prepare_ms": 338, "first_frame_seq": 1, "jpeg_bytes": 45395, "resolution": "960x540" },
+      { "viewer": "Mac", "target": "ToFuture", "prepare_ms": 3215, "first_frame_seq": 3, "jpeg_bytes": 38586, "resolution": "960x600" },
+      { "viewer": "IM2A", "target": "ToFuture", "prepare_ms": 1807, "first_frame_seq": 6, "jpeg_bytes": 45924, "resolution": "960x600" },
+      { "viewer": "IM2A", "target": "Mac", "prepare_ms": 1064, "first_frame_seq": 75, "jpeg_bytes": 34405, "resolution": "1920x1080" },
+      { "viewer": "ToFuture", "target": "Mac", "prepare_ms": 1693, "first_frame_seq": 6, "jpeg_bytes": 34405, "resolution": "1920x1080" },
+      { "viewer": "ToFuture", "target": "IM2A", "prepare_ms": 1615, "first_frame_seq": 56, "jpeg_bytes": 48250, "resolution": "960x540" }
+    ]
+  },
+  "notes": "Six directed legs were run directly through /api/w2m/remote/start and /frame, not as relay tasks; task_id labels the acceptance run. Mac-to-IM2A and Mac-to-ToFuture required the public TURN at 43.142.74.71:3479 for ICE; relay_used=false proves the W2M encrypted relay was not involved, not that TURN was absent. ToFuture target used the stable 8790 signal; the Mac target required disabling the standalone localside launchd consumer so the DSH host was the sole WebRTC pool owner. The IM2A viewer used a 25 s profile prepareTimeoutMs override because its cold target pool took about 20 s. Thirty-minute soak and TURN outage fallback were not run in the v3.7.2 window."
+}

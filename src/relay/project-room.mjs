@@ -63,6 +63,7 @@ export function createProjectRoom({ now = () => Date.now(), onEvent = null } = {
     /** Create a project; the creator becomes its owner. */
     createProject({ name, origin = null, createdBy, projectId = null }) {
       if (typeof name !== 'string' || name.trim() === '') throw new ProjectRoomError('BAD_REQUEST', 'project name is required');
+      if (origin !== null && (typeof origin !== 'object' || Array.isArray(origin))) throw new ProjectRoomError('BAD_REQUEST', 'origin must be an object or null', { code: 'INVALID_ORIGIN' });
       if (!createdBy || typeof createdBy.kind !== 'string' || typeof createdBy.id !== 'string') throw new ProjectRoomError('BAD_REQUEST', 'createdBy member is required');
       counter += 1;
       const assigned = typeof projectId === 'string' && projectId !== '' ? projectId : 'prj-' + String(counter).padStart(4, '0') + '-' + now().toString(36);

@@ -132,9 +132,9 @@
       disabled: true
       # v3.6.0 P4 row config. All fields are defaults and lose to `remote-view.json` once the panel
       # writes it:
-      #   transport:        auto | webrtc | relay   (default auto: WebRTC, then relay)
+      #   transport:        webrtc | auto | relay   (default webrtc: shared pool only, 502 on failure)
       #   allowLegacyP2P:   true | false            (default false: `auto` never dials old UDP)
-      #   prepareTimeoutMs: integer > 0             (default 8000)
+      #   prepareTimeoutMs: integer > 0             (default 15000)
       #   handshakeTimeoutMs: integer > 0           (default 10000)
       config: {}
     - id: dsh-gpw
