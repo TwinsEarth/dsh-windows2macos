@@ -1069,6 +1069,33 @@ export const ACCEPTED_SKIPS = [
       'throwaway profile; the release gate runs the loader suite without that opt-in because the other probes assert the ' +
       'shipped disabled state. The probe runs when the variable is set, and the skip names the exact switch',
   },
+  {
+    key: 'windows-only-sharing-violation',
+    suite: /^\(no enclosing suite name in the capture\)$/,
+    match: /^only Windows lets a process hold a file that shares nothing/,
+    maxCount: 1,
+    platforms: ['darwin', 'linux'],
+    why:
+      'the mirror image of posix-has-no-windows-filesystem: test/dsh-page-boot.test.mjs stages a real sharing ' +
+      'violation with a Windows handle that shares nothing (PowerShell and .NET, which every Windows has and no ' +
+      'POSIX host does), so the whole describe skips on Linux -- the host release.yml runs its gate on. It runs on ' +
+      'the windows-latest legs of ci.yml. `platforms` keeps this from becoming a blanket exemption: on win32 the ' +
+      'same reason is refused, because there that describe should have run. Found as the red release gate of ' +
+      'v3.7.5 (run 45747671386): the accepted-skip table carried the POSIX-only direction of this pair and not ' +
+      'the Windows-only one',
+  },
+  {
+    key: 'windows-only-8-3-names',
+    suite: /^entry guards$/,
+    match: /^8\.3 short names exist on Windows only/,
+    maxCount: 1,
+    platforms: ['darwin', 'linux'],
+    why:
+      'test/entry-guard.test.mjs proves the entry guard resolves a program by its 8.3 short name. An 8.3 name is ' +
+      'an NTFS/FAT directory-entry fact -- no Linux filesystem has one -- so that case skips on the ubuntu runner ' +
+      'release.yml uses, and runs on the windows-latest legs of ci.yml. Same red release gate as ' +
+      'windows-only-sharing-violation (v3.7.5), and the same platform qualifier keeps the reason refused on win32',
+  },
 ];
 
 /**
