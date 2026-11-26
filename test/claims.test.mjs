@@ -81,6 +81,7 @@ import {
   manifestDifferences,
   packageFilesExpansion,
   tapSkips,
+  tapSkipCounts,
   treeDocuments,
   workflowSuiteCoverage,
 } from '../scripts/preflight.mjs';
@@ -1666,6 +1667,39 @@ describe('the accepted lists (what this repository agrees not to measure)', () =
       `the skip census must name the suite, the assertion and the reason: ${JSON.stringify(skips)}`,
     );
     assert.deepEqual(tapSkips('TAP version 13\n# tests 0\n'), [], 'a capture with no skips must produce no skips');
+  });
+
+  test('a skipped suite is one row but zero assertions, and the tally counts it that way', () => {
+    // Measured shape, node 22 + the TAP reporter: a describe that skips writes one `# SKIP` row with
+    // `type: 'suite'`, while `# skipped` counts assertions only. Comparing the summary with the raw
+    // row count therefore failed on ubuntu-latest for v3.7.5 (46 vs 47). The gate compares like with
+    // like, so the suite row is counted separately and still classified by name.
+    const capture = [
+      'TAP version 13',
+      '# Subtest: a real sharing violation',
+      'ok 1 - a real sharing violation # SKIP only Windows lets a process hold a file that shares nothing',
+      '  ---',
+      "  type: 'suite'",
+      '  ...',
+      '# Subtest: plain',
+      '    # Subtest: real skip',
+      '    ok 1 - real skip # SKIP 8.3 short names exist on Windows only',
+      '      ---',
+      "      type: 'test'",
+      '      ...',
+      '    1..1',
+      'ok 2 - plain',
+      '1..2',
+      '# tests 1',
+      '# skipped 1',
+    ].join('\n');
+    assert.deepEqual(
+      tapSkipCounts(capture),
+      { tests: 1, suites: 1, rows: 2 },
+      'the suite row must not be counted as an assertion, and the test row must be',
+    );
+    assert.equal(tapSkips(capture).length, 2, 'both rows are still skips to classify');
+    assert.equal(tapSkipCounts('TAP version 13\n# tests 0\n').rows, 0, 'a capture with no skips has no rows');
   });
 });
 

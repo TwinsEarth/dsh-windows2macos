@@ -1137,6 +1137,43 @@ export function tapSkips(text) {
 }
 
 /**
+ * Split the capture's skip rows into the two kinds node's summary counts differently.
+ *
+ * A skipped *suite* prints one `# SKIP` row, but `# skipped N` counts assertions, not suites: a suite
+ * that skips contributes 0 to N. Comparing N with the raw row count therefore fails on any run where a
+ * describe is skipped -- measured on ubuntu-latest for v3.7.5 (summary 46, rows 47, the extra row being
+ * `a real sharing violation`, a suite that skips on every POSIX host). The rows are still all
+ * classified against ACCEPTED_SKIPS; this only makes the tally compare like with like.
+ *
+ * The kind is read from the diagnostic block under the row (`type: 'suite'`) rather than guessed from
+ * the name, because the reporter writes it and a name is not a type.
+ *
+ * @param {string} text
+ * @returns {{tests: number, suites: number, rows: number}}
+ */
+export function tapSkipCounts(text) {
+  const lines = String(text).replace(/\r\n/g, '\n').split('\n');
+  let tests = 0;
+  let suites = 0;
+  for (let index = 0; index < lines.length; index += 1) {
+    const row = /^[ \t]*(?:not ok|ok) \d+ - .* # skip/i.test(lines[index]);
+    if (!row) continue;
+    let kind = 'test';
+    for (let look = index + 1; look < Math.min(index + 12, lines.length); look += 1) {
+      if (/^[ \t]*# Subtest:/.test(lines[look]) || /^[ \t]*(?:not ok|ok) \d+ -/.test(lines[look])) break;
+      if (/^[ \t]*type: 'suite'/.test(lines[look])) {
+        kind = 'suite';
+        break;
+      }
+      if (/^[ \t]*type: 'test'/.test(lines[look])) break;
+    }
+    if (kind === 'suite') suites += 1;
+    else tests += 1;
+  }
+  return { tests, suites, rows: tests + suites };
+}
+
+/**
  * Classify every skip in a run against `ACCEPTED_SKIPS`.
  *
  * `host` is a parameter rather than a read of `process.platform` inside the loop so that the
@@ -1652,18 +1689,21 @@ function checkTestSuite(suiteEnv) {
       if (classified.problems.length > 0) {
         return fail(classified.problems.join(' '), `skips in this run:\n${classified.lines.join('\n') || '  (none)'}`);
       }
-      if ((counts.skipped ?? 0) !== skips.length) {
+      const tally = tapSkipCounts(readFileSync(tapFile, 'utf8'));
+      if ((counts.skipped ?? 0) !== tally.tests) {
         return fail(
           `the runner's summary says ${counts.skipped ?? 0} skip(s) and the TAP capture holds ` +
-            `${skips.length} skipped result line(s); the tally and the lines must agree before either ` +
-            'can be believed, or a skip can hide between them',
+            `${tally.tests} skipped test(s) plus ${tally.suites} skipped suite row(s); node counts a ` +
+            'skipped suite as zero assertions, so the two numbers are compared like for like -- a ' +
+            'mismatch means a skip is hiding between the tally and the lines',
           `capture: ${tapFile}`,
         );
       }
       skipReport =
         skips.length === 0
           ? 'no assertion skipped in this run'
-          : `${skips.length} skip(s), each on the accepted list, named here:\n${classified.lines.join('\n')}`;
+          : `${skips.length} skip row(s) (${tally.suites} of them a whole suite), each on the accepted ` +
+            `list, named here:\n${classified.lines.join('\n')}`;
     } else {
       skipReport = 'no TAP capture was written by this node, and the run reported no skips';
     }
