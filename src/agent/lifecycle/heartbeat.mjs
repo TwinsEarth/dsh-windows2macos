@@ -542,7 +542,7 @@ let attemptAttached = false;
       let target = viewTargets.get(key);
       if (target === undefined || payload.type === 'view.hello') {
         target = createViewTarget({
-          capture: () => captureScreen({ fast: true }),
+          capture: (options) => captureScreen({ ...(options ?? {}), fast: true }),
           allow: () => viewAllowed(stateDir),
           send: (frame) => { try { event.channel.send(frame); } catch { /* peer gone */ } },
         });

@@ -10,6 +10,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, wri
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { tierPreset } from './quality.mjs';
+
 export const VIEW_CAPTURE_CODE = Object.freeze({
   OK: 'CAPTURE_OK',
   UNSUPPORTED: 'CAPTURE_UNSUPPORTED_PLATFORM',
@@ -21,13 +23,19 @@ export const VIEW_CAPTURE_CODE = Object.freeze({
 
 export const DEFAULT_MAX_FRAME_BYTES = 96 * 1024;
 
+/** The legacy width/quality ladder, used when no tier was named (keeps the pre-tier behaviour). */
+const DEFAULT_WIDTHS = [960, 800, 640];
+const DEFAULT_QUALITIES = [70, 55, 40];
+
 const defaultRun = (argv, options = {}) => spawnSync(argv[0], argv.slice(1), {
   timeout: options.timeoutMs ?? 15000,
   encoding: options.encoding ?? 'utf8',
   env: options.env ?? process.env,
 });
 
-function windowsCaptureScript(maxBytes) {
+function windowsCaptureScript(maxBytes, widths = DEFAULT_WIDTHS, qualities = DEFAULT_QUALITIES) {
+  const widthList = widths.map(width => Math.max(1, Math.round(width))).join(',');
+  const qualityList = qualities.map(quality => Math.max(1, Math.min(95, Math.round(quality)))).join(',');
   return [
     'Add-Type -AssemblyName System.Windows.Forms,System.Drawing',
     '$b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds',
@@ -37,13 +45,13 @@ function windowsCaptureScript(maxBytes) {
     '$codec=[System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq "image/jpeg" }',
     '$max=' + String(maxBytes),
     '$best=$null',
-    'foreach($w in @(1280,1024,800,640)){',
+    'foreach($w in @(' + widthList + ')){',
     '  $h=[int]($b.Height*$w/$b.Width)',
     '  $dst=New-Object System.Drawing.Bitmap $w,$h',
     '  $dg=[System.Drawing.Graphics]::FromImage($dst)',
     '  $dg.InterpolationMode=[System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic',
     '  $dg.DrawImage($src,0,0,$w,$h)',
-    '  foreach($q in @(70,55,40)){',
+    '  foreach($q in @(' + qualityList + ')){',
     '    $p=New-Object System.Drawing.Imaging.EncoderParameters(1)',
     '    $p.Param[0]=New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality,[long]$q)',
     '    $ms=New-Object System.IO.MemoryStream',
@@ -74,10 +82,11 @@ using System.Windows.Forms;
 class W2MCapture {
   static void Main(string[] args) {
     int max = int.Parse(args[1]);
+    int[] widths = ParseInts(args.Length > 2 ? args[2] : "", new int[] { 960, 800, 640 });
+    int[] qualities = ParseInts(args.Length > 3 ? args[3] : "", new int[] { 40, 30 });
     var b = Screen.PrimaryScreen.Bounds;
     using (var src = new Bitmap(b.Width, b.Height)) {
       using (var g = Graphics.FromImage(src)) g.CopyFromScreen(b.Left, b.Top, 0, 0, src.Size);
-      int[] widths = new int[] { 960, 800, 640 };
       var codec = Array.Find(ImageCodecInfo.GetImageEncoders(), c => c.MimeType == "image/jpeg");
       foreach (int w in widths) {
         int h = Math.Max(1, (int)Math.Round(b.Height * (double)w / b.Width));
@@ -86,7 +95,7 @@ class W2MCapture {
             dg.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
             dg.DrawImage(src, 0, 0, w, h);
           }
-          foreach (int q in new int[] { 40, 30 }) {
+          foreach (int q in qualities) {
             using (var ms = new MemoryStream()) {
               var ep = new EncoderParameters(1);
               ep.Param[0] = new EncoderParameter(System.Drawing.Imaging.Encoder.Quality, (long)q);
@@ -102,6 +111,13 @@ class W2MCapture {
       }
     }
   }
+  static int[] ParseInts(string csv, int[] fallback) {
+    if (String.IsNullOrWhiteSpace(csv)) return fallback;
+    var parts = csv.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+    var values = new int[parts.Length];
+    for (int i = 0; i < parts.Length; i++) values[i] = int.Parse(parts[i].Trim());
+    return values.Length > 0 ? values : fallback;
+  }
 }`;
 
 let windowsHelperState;
@@ -112,9 +128,9 @@ function windowsFastHelper() {
   try {
     const dir = join(tmpdir(), 'w2m-view-fast');
     mkdirSync(dir, { recursive: true });
-    const exe = join(dir, 'w2m-capture-v1.exe');
+    const exe = join(dir, 'w2m-capture-v2.exe');
     if (existsSync(exe)) { windowsHelperState = exe; return exe; }
-    const source = join(dir, 'w2m-capture-v1.cs');
+    const source = join(dir, 'w2m-capture-v2.cs');
     writeFileSync(source, WINDOWS_HELPER_SOURCE, 'utf8');
     const cscCandidates = [
       join(process.env.WINDIR ?? 'C:\\Windows', 'Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe'),
@@ -145,14 +161,22 @@ function windowsFastHelper() {
 }
 
 /**
- * @param {{platform?: NodeJS.Platform, run?: Function, tempRoot?: string, maxBytes?: number, fast?: boolean}} [options]
+ * @param {{platform?: NodeJS.Platform, run?: Function, tempRoot?: string, maxBytes?: number, fast?: boolean,
+ *   tier?: 'relay'|'p2p'|string, widths?: number[], qualities?: number[]}} [options]
  * @returns {{ok: true, code: string, mime: string, data: Buffer, base64: string, bytes: number, capture_ms: number, width: number|null, height: number|null}
  *   | {ok: false, code: string, error: string, capture_ms: number}}
  */
 export function captureScreen(options = {}) {
   const platform = options.platform ?? process.platform;
   const run = options.run ?? defaultRun;
-  const maxBytes = Number.isInteger(options.maxBytes) ? options.maxBytes : DEFAULT_MAX_FRAME_BYTES;
+  const preset = tierPreset(options.tier);
+  const widths = Array.isArray(options.widths) && options.widths.length > 0
+    ? options.widths
+    : (options.tier === undefined ? DEFAULT_WIDTHS : preset.widths);
+  const qualities = Array.isArray(options.qualities) && options.qualities.length > 0
+    ? options.qualities
+    : (options.tier === undefined ? DEFAULT_QUALITIES : preset.qualities);
+  const maxBytes = Number.isInteger(options.maxBytes) ? options.maxBytes : (options.tier === undefined ? DEFAULT_MAX_FRAME_BYTES : preset.maxBytes);
   const started = Date.now();
   try {
     let base64 = null;
@@ -165,7 +189,7 @@ export function captureScreen(options = {}) {
           const dir = mkdtempSync(join(options.tempRoot ?? tmpdir(), 'w2m-view-fast-'));
           const file = join(dir, 'frame.jpg');
           try {
-            const result = run([helper, file, String(maxBytes)], { timeoutMs: 5000, encoding: 'utf8' });
+            const result = run([helper, file, String(maxBytes), widths.join(','), qualities.join(',')], { timeoutMs: 5000, encoding: 'utf8' });
             if (result.status === 0 && existsSync(file)) {
               const data = readFileSync(file);
               if (data.length >= 1000) base64 = data.toString('base64');
@@ -178,7 +202,7 @@ export function captureScreen(options = {}) {
         }
       }
       if (base64 === null) {
-        const result = run(['powershell.exe', '-NoProfile', '-NonInteractive', '-STA', '-ExecutionPolicy', 'Bypass', '-Command', windowsCaptureScript(maxBytes)], { timeoutMs: 20000 });
+        const result = run(['powershell.exe', '-NoProfile', '-NonInteractive', '-STA', '-ExecutionPolicy', 'Bypass', '-Command', windowsCaptureScript(maxBytes, widths, qualities)], { timeoutMs: 20000 });
         // `spawnSync` reports the exit code as `status`; `code` is the execFile-shaped field
         // and is undefined here, which made every successful capture look like a denial.
         if (result.status !== 0) return { ok: false, code: VIEW_CAPTURE_CODE.DENIED, error: `PowerShell capture failed (exit ${result.status ?? 'null'}${result.signal ? ', signal ' + result.signal : ''}${result.error?.message ? ', ' + result.error.message : ''})`, capture_ms: Date.now() - started };
@@ -193,8 +217,16 @@ export function captureScreen(options = {}) {
         // Same `spawnSync` contract: `status`, never `code`. S2 used the right field, which is
         // why the probe succeeded while the relay view target reported CAPTURE_DENIED.
         if (result.status !== 0) return { ok: false, code: VIEW_CAPTURE_CODE.DENIED, error: `screencapture failed (exit ${result.status})`, capture_ms: Date.now() - started };
-        const data = readFileSync(file);
-        base64 = data.toString('base64');
+        // screencapture always writes the native resolution; the tier is applied with sips, widest
+        // first, and the first width whose re-encode fits the cap is the frame.
+        for (const candidate of widths) {
+          const resized = join(dir, `frame-${candidate}.jpg`);
+          const resize = run(['sips', '-Z', String(candidate), '-s', 'formatOptions', String(Math.min(95, qualities[0] ?? 70)), file, '--out', resized], { timeoutMs: 8000 });
+          if (resize?.status !== 0 || !existsSync(resized)) continue;
+          const size = statSync(resized).size;
+          if (size <= maxBytes) { base64 = readFileSync(resized).toString('base64'); break; }
+        }
+        if (base64 === null) base64 = readFileSync(file).toString('base64');
         const sips = run(['sips', '-g', 'pixelWidth', '-g', 'pixelHeight', file], { timeoutMs: 5000 });
         const w = /pixelWidth:\s*(\d+)/.exec(sips?.stdout ?? '');
         const h = /pixelHeight:\s*(\d+)/.exec(sips?.stdout ?? '');

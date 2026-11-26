@@ -27,6 +27,7 @@ import { dirname, join } from 'node:path';
 import { captureHostScreen } from './capture-route.mjs';
 import { getSharedWebRtcPool, getSharedWebRtcPoolState } from './webrtc-pool-registry.mjs';
 import { createViewSide, openViewFrame } from '../agent/view/session-key.mjs';
+import { tierPreset, VIEW_ENVELOPE_BYTES } from '../agent/view/quality.mjs';
 import { resolveStateDir } from '../util/cli.mjs';
 
 export const REMOTE_CONFIG_PATH = '/api/w2m/remote/config';
@@ -153,7 +154,16 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
   const defaultTransport = rowTransportSpecified ? normalizeTransport(deps.transport) : DEFAULT_TRANSPORT;
   const defaultTransportSource = rowTransportSpecified ? 'row' : 'default';
   const allowLegacyP2P = deps.allowLegacyP2P === true;
-  const maxBytes = Number.isInteger(deps.maxBytes) ? deps.maxBytes : 96 * 1024;
+  // Two caps, because the two paths are different products: a DataChannel may carry 720P..4K, while
+  // the relay's own broker refuses anything above 100 KiB of ciphertext. The viewer checks each
+  // decoded frame against the cap of the channel it arrived on — the relay's check is stricter than
+  // the p2p one, never the other way round.
+  const p2pTier = tierPreset('p2p');
+  const relayTier = tierPreset('relay');
+  const maxBytes = Number.isInteger(deps.maxBytes) && deps.maxBytes > 0
+    ? Math.min(deps.maxBytes, p2pTier.maxBytes)
+    : p2pTier.maxBytes;
+  const relayMaxBytes = relayTier.maxBytes - VIEW_ENVELOPE_BYTES;
   const prepareTimeoutMs = Number.isInteger(deps.prepareTimeoutMs) && deps.prepareTimeoutMs > 0
     ? deps.prepareTimeoutMs
     : 15_000;
@@ -439,7 +449,7 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
         try {
           session.vk = session.side.finish(frame.public_key).key;
           session.encrypted = true;
-          void send({ type: 'view.request', session_id: sessionId, machine_id: machineId, fps: 1, max_bytes: maxBytes })
+          void send({ type: 'view.request', session_id: sessionId, machine_id: machineId, fps: 1, max_bytes: maxBytes, tier: 'p2p' })
             .catch((error) => { session.error = error?.code ?? 'VIEW_WEBRTC_SEND_FAILED'; });
         } catch {
           session.error = 'VIEW_VK_BAD';
@@ -528,7 +538,7 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
         try {
           session.vk = session.side.finish(frame.public_key).key;
           session.encrypted = true;
-          void channel.send(JSON.stringify({ type: 'view.request', session_id: sessionId, machine_id: machineId, fps: 1, max_bytes: maxBytes }));
+          void channel.send(JSON.stringify({ type: 'view.request', session_id: sessionId, machine_id: machineId, fps: 1, max_bytes: maxBytes, tier: 'p2p' }));
         } catch {
           session.error = 'VIEW_VK_BAD';
         }
@@ -967,7 +977,7 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
             if (active.vk !== null && Date.now() >= active.renewAt) {
               active.renewAt = Date.now() + 10_000;
               try {
-                await active.send({ type: 'view.request', session_id: active.sessionId, machine_id: active.machineId, fps: 1, max_bytes: maxBytes });
+                await active.send({ type: 'view.request', session_id: active.sessionId, machine_id: active.machineId, fps: 1, max_bytes: maxBytes, tier: 'p2p' });
               } catch (error) {
                 setActiveError(error?.code ?? 'VIEW_WEBRTC_SEND_FAILED');
               }
@@ -981,7 +991,7 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
             if (Date.now() >= active.renewAt) {
               active.renewAt = Date.now() + 10_000;
               try {
-                void active.channel.send(JSON.stringify({ type: 'view.request', session_id: active.sessionId, machine_id: active.machineId, fps: 1, max_bytes: maxBytes }));
+                void active.channel.send(JSON.stringify({ type: 'view.request', session_id: active.sessionId, machine_id: active.machineId, fps: 1, max_bytes: maxBytes, tier: 'p2p' }));
               } catch { /* peer gone */ }
             }
             if (active.latest !== null) return Response.json({ ok: true, ...active.latest, channel: 'p2p' }, { headers: NO_STORE });
@@ -1011,7 +1021,7 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
                   return Response.json({ ok: false, code: active.error, channel: 'relay' }, { status: 502, headers: NO_STORE });
                 }
                 const plaintext = openViewFrame(active.vk, got.ct);
-                if (plaintext.length <= maxBytes) {
+                if (plaintext.length <= relayMaxBytes) {
                   active.latest = {
                     seq: null,
                     mime: 'image/jpeg',

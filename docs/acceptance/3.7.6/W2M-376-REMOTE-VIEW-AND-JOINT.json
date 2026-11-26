@@ -1,0 +1,42 @@
+{
+  "version": "3.7.6",
+  "case": "W2M-376-REMOTE-VIEW-AND-JOINT",
+  "kind": "positive",
+  "requirement": "v3.7.6 remote view: one full-screen JPEG per second with no video codec; relay tier limited to 360P/540P and 100 KiB on the sealed frame (AES-GCM IV+tag included), 720P/2K/4K only on P2P; view.request carries the tier and unknown values fall back to relay; settings copy reads 已开放. Joint-dev P1/P2/P3 fixes: approval is consumed only immediately before the first task POST, after the pre-send audit line is durable, CLI state dir matches the plugin, failed dependencies propagate, normal dispatch reads the version-gate roster with the device token, dry-run shares ordering/redline/consumed checks, and a missing git binary reports MERGE_GIT_UNAVAILABLE.",
+  "machines": [
+    "ToFuture"
+  ],
+  "executed_at": "2026-11-26T16:46:42+08:00",
+  "executor": "agent",
+  "task_id": "w2m-task-376-remote-view-joint-2026-11-26",
+  "commands": [
+    ["node", "--test", "test/remote-view-3.7.6.test.mjs", "test/joint-dev-3.7.6.test.mjs", "test/joint-cli.test.mjs", "test/fleet-version-gate.test.mjs"],
+    ["node", "--test", "test/remote-view-route.test.mjs", "test/view-frame-channel.test.mjs", "test/view-capture.test.mjs", "test/relay-target.test.mjs", "test/remote-media.test.mjs", "test/remote-s2-capture.test.mjs"],
+    ["node", "--test", "--test-force-exit", "--test-concurrency=1", "test/relay.test.mjs", "test/task-deps.test.mjs", "test/remote-media.test.mjs"],
+    ["node", "--test", "--test-force-exit", "--test-concurrency=1", "test/p2p-v2.test.mjs", "test/p2p-v2-dispatch-isolation.test.mjs", "test/p2p-v2-p5.test.mjs", "test/p2p-v2-p5-integration.test.mjs", "test/p2p-v2-p5-resume.test.mjs"],
+    ["node", "--test", "test/joint-merge-engine.test.mjs"]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "targeted_3_7_6_tests": 54,
+      "targeted_3_7_6_failed": 0,
+      "remote_view_route_capture_media_tests": 33,
+      "remote_view_route_capture_media_failed": 0,
+      "relay_task_deps_media_tests": 208,
+      "relay_task_deps_media_failed": 0,
+      "p2p_v2_tests": 57,
+      "p2p_v2_failed": 0,
+      "merge_engine_tests": 5,
+      "merge_engine_failed": 0,
+      "relay_envelope_bytes": 28,
+      "relay_capture_budget_bytes": 102400,
+      "relay_capture_budget_after_envelope_bytes": 102372
+    },
+    "runtime_blockers": [
+      "execution: BLOCKED_COMMAND_NOT_ALLOWED (allowlist empty on the three online machines; untouched)",
+      "merge on a host without git: BLOCKED_NO_SYSTEM_GIT (the five merge-engine tests above ran with a temporary dugite git on PATH)"
+    ]
+  },
+  "notes": "The targeted suites are code-level evidence, not a claim that the runtime blockers are cleared. Execution remains BLOCKED by the empty allowlist and was not widened; merge is BLOCKED on a host without a system git, and the five merge-engine cases were run with a temporary portable git under E:\\tmp\\w2m-git-tool. The relay process in production is still 3.1.0, so the relay-side 100 KiB body limit and dependency-failure propagation only take effect after a relay upgrade."
+}

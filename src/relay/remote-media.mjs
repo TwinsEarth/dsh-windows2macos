@@ -17,7 +17,12 @@ export const REMOTE_MEDIA_CODE = Object.freeze({
   EXPIRED: 'REMOTE_MEDIA_EXPIRED',
 });
 
-export const DEFAULT_REMOTE_MEDIA_MAX_BYTES = 47 * 1024;
+/**
+ * The relay forwards opaque ciphertext and nothing else, so this cap is stated on the sealed
+ * frame — AES-GCM IV and tag included. 100 KiB is the product's floor for a legible 540P still:
+ * below roughly 60 KiB text stops being readable and the feature becomes a screenshot of a blur.
+ */
+export const DEFAULT_REMOTE_MEDIA_MAX_BYTES = 100 * 1024;
 export const DEFAULT_REMOTE_MEDIA_TTL_MS = 15_000;
 
 const isObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);

@@ -27,13 +27,15 @@ import { abortMerge, advanceTarget, mergePatches } from '../src/plugin/joint-dev
 import { consumeMergeApproval, createMergeApproval, loadMergeApproval } from '../src/plugin/joint-dev/merge-approval.mjs';
 import { resolve as resolvePath } from 'node:path';
 import { negotiateFeatures, readRelayCapabilities } from '../src/plugin/relay-capabilities.mjs';
-import { dispatchPlanToRelay } from '../src/plugin/joint-dev/relay-dispatch.mjs';
+import { dispatchPlanToRelay, orderSteps } from '../src/plugin/joint-dev/relay-dispatch.mjs';
+import { inspectControlMessage } from '../src/plugin/joint-dev/redline.mjs';
 import { deliverArtifact } from '../src/agent/artifact-delivery.mjs';
 import { createTeamsDataPlaneFromEnv } from '../src/plugin/teams/data-plane.mjs';
 import { readOperatorToken } from '../src/plugin/operator-token.mjs';
 import { ensureOperatorKey, signApprovalPayload } from '../src/plugin/operator-key.mjs';
 import {
   approvePlan,
+  approvalWasConsumed,
   assertDispatchAllowed,
   consumeApproval,
   listPlans,
@@ -62,7 +64,7 @@ const fail = (code, detail) => { print({ ok: false, code, detail: detail ?? null
 const args = parseArgs(process.argv.slice(2));
 const [command, action] = args._;
 if (args['allow-unsigned-approval'] === true) fail('UNKNOWN_FLAG', '--allow-unsigned-approval was removed: joint approvals must be signed');
-const stateDir = resolveStateDir(typeof args.state === 'string' ? args.state : (process.env.W2M_JOINT_STATE ?? null), 'joint-dev');
+const stateDir = resolveStateDir(typeof args.state === 'string' ? args.state : (process.env.W2M_JOINT_STATE ?? null), '');
 
 if (command === 'plan' && action === 'create') {
   if (typeof args.steps !== 'string') fail('STEPS_REQUIRED', 'pass --steps <steps.json>');
@@ -157,6 +159,11 @@ if (command === 'dispatch') {
   const trusted = key.ok === true ? [key.key_id] : [];
   const gate = assertDispatchAllowed({ stateDir, planSha: args.plan, requireSignature: true, trustedOperatorKeyIds: trusted });
   if (gate.ok !== true) fail(gate.code ?? 'APPROVAL_REQUIRED', 'dispatch refused before anything was sent');
+  // F-5 (3.7.6): a spent approval must not read as dispatchable in a dry run either. This is the
+  // same check the real path gets from `reserveApproval`, minus the write.
+  if (approvalWasConsumed({ stateDir, approvalSha: gate.approval.approval_sha256 })) {
+    fail('APPROVAL_ALREADY_USED', 'this approval has already authorised a dispatch; approve the plan again');
+  }
   const relayUrl = typeof args.relay === 'string' ? args.relay : null;
   if (args['dry-run'] !== true) {
     if (relayUrl === null) fail('RELAY_REQUIRED', 'real dispatch needs --relay <url>');
@@ -168,9 +175,6 @@ if (command === 'dispatch') {
       token = secure.configured === true ? secure.token : null;
     }
     if (token === null) fail('OPERATOR_TOKEN_MISSING', 'run w2m-operator set --file <token file>, or pass --token-file');
-    // decision 2: one approval authorises exactly one dispatch.
-    const consumed = consumeApproval({ stateDir, planSha: args.plan, approvalSha: gate.approval.approval_sha256 });
-    if (consumed.ok !== true) fail(consumed.code ?? 'APPROVAL_CONSUME_FAILED', consumed.detail ?? null);
       // D2/B5: the gate is on by default in warn mode; enforce is explicit.
       let deviceToken = '';
       if (typeof args['device-token-file'] === 'string') {
@@ -185,7 +189,20 @@ if (command === 'dispatch') {
         ? args['expect-version']
         : JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
       const versionGate = args['version-gate'] === 'off' || args['version-gate'] === 'enforce' ? args['version-gate'] : 'warn';
-      const sent = await dispatchPlanToRelay({ rabbitUrl: relayUrl, token, plan: gate.plan, approval: gate.approval, auditFile: stateDir + '/joint-dev/audit.jsonl', dispatchDir: stateDir + '/joint-dev/dispatches', deviceToken, expectedVersion, versionGate });
+      const sent = await dispatchPlanToRelay({
+        rabbitUrl: relayUrl,
+        token,
+        plan: gate.plan,
+        approval: gate.approval,
+        auditFile: stateDir + '/joint-dev/audit.jsonl',
+        dispatchDir: stateDir + '/joint-dev/dispatches',
+        deviceToken,
+        expectedVersion,
+        versionGate,
+        // F-1: one approval authorises exactly one dispatch, but only a dispatch that actually
+        // reaches its first POST. A gate refusal leaves this callback uncalled and the approval usable.
+        reserveApproval: () => consumeApproval({ stateDir, planSha: args.plan, approvalSha: gate.approval.approval_sha256 }),
+      });
     print({ ...sent, plan_sha256: gate.plan.plan_sha256, relay: relayUrl });
     process.exit(sent.ok === true ? 0 : 1);
   }
@@ -198,7 +215,15 @@ if (command === 'dispatch') {
       fail(negotiation.code ?? 'RELAY_CAPABILITIES_MISSING', { missing: negotiation.missing ?? null, relay: args.relay });
     }
   }
-  const envelopes = buildControlEnvelopes(gate.plan);
+  // F-5 (3.7.6): a dry run must be the same plan the real path would send — same Kahn order, same
+  // red-line check. Otherwise "dry run says fine" and "dispatch refuses" describe different objects.
+  const ordered = orderSteps(gate.plan.steps);
+  if (ordered.ok !== true) fail(ordered.code ?? 'PLAN_DEPENDENCY_CYCLE', ordered.detail ?? null);
+  const envelopes = buildControlEnvelopes({ ...gate.plan, steps: ordered.steps });
+  for (const envelope of envelopes) {
+    const check = inspectControlMessage(envelope);
+    if (check.ok !== true) fail(check.code ?? 'CONTROL_REFUSED', check.detail ?? null);
+  }
   print({
     ok: true,
     dry_run: true,

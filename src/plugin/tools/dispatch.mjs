@@ -1512,8 +1512,18 @@ export function registerRun(ctx, deps) {
        */
       let roster = null;
       if (narrowedTo !== null || versionGateActive) {
+        // F-4 (3.7.6): `GET /v1/devices` authenticates a *device*, not an operator. Reading the
+        // roster with the operator token returned 401, so the gate degraded to UNVERIFIABLE on
+        // every ordinary dispatch while joint-dev (which passes its device token) read the same
+        // list fine. The dispatch itself still uses the operator token below; only the roster read
+        // switches identity, and a machine without a device token simply keeps the unverified path.
+        let rosterToken = token;
         try {
-          roster = await readFleet({ rabbitUrl: base, token, localMachineId: null, signal: exec?.signal, request });
+          const deviceToken = await resolveToken(cfg);
+          if (typeof deviceToken === 'string' && deviceToken !== '') rosterToken = deviceToken;
+        } catch { /* unpaired machine: the gate reports UNVERIFIABLE, it does not invent a roster */ }
+        try {
+          roster = await readFleet({ rabbitUrl: base, token: rosterToken, localMachineId: null, signal: exec?.signal, request });
         } catch { roster = null; }
       }
 

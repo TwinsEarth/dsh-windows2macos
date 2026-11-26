@@ -24,7 +24,7 @@ const trimBase = (value) => (typeof value === 'string' ? value.replace(/\/+$/, '
 const taskIdOf = (planSha, stepId) => 'jd-' + sha256(planSha + '|' + stepId).slice(0, 26);
 
 /** Kahn order over the plan's dependency graph; unknown dependencies are a refusal, not a guess. */
-function orderSteps(steps) {
+export function orderSteps(steps) {
   const byId = new Map(steps.map((step) => [step.step_id, step]));
   for (const step of steps) {
     for (const dep of step.depends_on ?? []) {
@@ -55,7 +55,8 @@ function writeAudit(file, event) {
 
 /**
  * @param {{rabbitUrl: string, token: string, plan: object, approval: object, fetchImpl?: Function,
- *          timeoutMs?: number, includeOffline?: boolean, auditFile?: string}} input
+ *          timeoutMs?: number, includeOffline?: boolean, auditFile?: string,
+ *          reserveApproval?: () => ({ok: boolean, code?: string, detail?: unknown})|Promise<{ok: boolean, code?: string, detail?: unknown}>}} input
  */
 export async function dispatchPlanToRelay(input) {
   const rabbitUrl = trimBase(input?.rabbitUrl);
@@ -126,6 +127,20 @@ export async function dispatchPlanToRelay(input) {
 
   const dispatched = new Map(); // step_id -> task_id
   const tasks = [];
+  let approvalReserved = false;
+  // F-1 (3.7.6): an approval authorises a dispatch only once a task is really about to be posted.
+  // Every refusal that happens before the first POST — version skew in enforce, a relay without the
+  // required capabilities, a signing/token gate, or an audit tail that cannot be written — must leave
+  // the approval unspent, or the operator's only way forward is to approve the same plan again. The
+  // pre-send audit line is therefore written before the approval is consumed.
+  const reserveApproval = async () => {
+    if (approvalReserved === true) return { ok: true };
+    if (typeof input?.reserveApproval !== 'function') { approvalReserved = true; return { ok: true }; }
+    const reserved = await input.reserveApproval();
+    if (reserved?.ok !== true) return { ok: false, code: reserved?.code ?? 'APPROVAL_CONSUME_FAILED', detail: reserved?.detail ?? null };
+    approvalReserved = true;
+    return { ok: true };
+  };
   const dispatchDir = typeof input?.dispatchDir === 'string' && input.dispatchDir !== '' ? input.dispatchDir : null;
   for (const step of ordered.steps) {
     const taskId = taskIdOf(plan.plan_sha256, step.step_id);
@@ -155,6 +170,11 @@ export async function dispatchPlanToRelay(input) {
     const controlText = JSON.stringify(body);
     const audited = writeAudit(auditFile, { event: 'joint.dispatch.sending', plan_sha256: plan.plan_sha256, step_id: step.step_id, task_id: taskId, machine_id: step.machine_id, control_bytes: Buffer.byteLength(controlText), control_sha256: sha256(controlText) });
     if (audited.ok !== true) return { ok: false, code: 'AUDIT_UNAVAILABLE', detail: audited, partial: tasks.length > 0, tasks };
+    const reserved = await reserveApproval();
+    if (reserved.ok !== true) {
+      writeAudit(auditFile, { event: 'joint.dispatch.aborted', plan_sha256: plan.plan_sha256, step_id: step.step_id, task_id: taskId, reason_code: reserved.code ?? 'APPROVAL_CONSUME_FAILED' });
+      return { ok: false, code: reserved.code ?? 'APPROVAL_CONSUME_FAILED', detail: reserved.detail ?? null, partial: tasks.length > 0, tasks };
+    }
     let response;
     try {
       response = await fetchImpl(`${rabbitUrl}/v1/task`, { method: 'POST', headers, body: controlText, signal: signalOf() });

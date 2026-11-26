@@ -2,6 +2,51 @@
 
 All notable changes to this project are documented here.
 
+## [3.7.6] — 2026-11-26
+
+### feat(remote-view): 画面大小跟着通道走，relay 上限 100 KiB（含加密信封）
+
+- **分档**：新增 `src/agent/view/quality.mjs`，把"看一眼"的尺寸规则写成数据而不是散落的常量——`relay` 档只有 360P/540P（960/640 长边），`p2p` 档才是 720P/2K/4K（1280/2560/3840）。通道到档位的映射只有一处：`webrtc`/`p2p` → p2p，其余（含未知）→ relay，未知值永远不会被放宽。
+- **上限**：relay 侧口径统一为 **100 KiB 密文**（AES-GCM 的 12 B IV + 16 B tag 算在内），因此采集预算 = 100 KiB − 28 B；`src/relay/remote-media.mjs` 的 broker 默认值 47 KiB → 100 KiB，`/v1/remote/frame` 的 HTTP 请求体上限 70 KiB → 160 KiB（100 KiB 密文 base64 后约 137 KiB）。帧通道切到 relay 档时同样扣信封，未知档位按 relay 处理，不复用上一次请求的档位。
+- **可配置**：`capture.mjs` 不再写死宽度表——Windows C# helper 通过参数接收 `widths,qualities`（helper 升为 `w2m-capture-v2.exe`，首次采集重编译一次），PowerShell 兜底与 macOS `sips` 降采样同样按档执行；`view.request` 新增 `tier`，`max_bytes` 只能收紧档位上限，不能突破。
+- **不是视频**：仍然 1 帧/秒 JPEG，没有编解码、没有输入通道、不能远控或传文件；开关仍在设置页，勾选即开放。
+- **文案**：设置页状态 `已开启` → `已开放`。
+
+### fix(joint-dev): 版本门拒绝不再烧掉一次性审批（P1）
+
+- **缺陷**：`bin/w2m-joint.mjs` 在进入 `dispatchPlanToRelay` 之前就 `consumeApproval`，而版本门（enforce）、能力协商、签名门、operator token 门都在后者内部。任何"零任务已发送"的拒绝都会把审批消费掉：consumed 1→2、审计零新增、改 `--version-gate warn` 直接 `APPROVAL_ALREADY_USED`。
+- **修法**：消费点移到"第一条 `POST /v1/task` 即将发出之前"——`relay-dispatch.mjs` 新增 `reserveApproval` 回调，逐条过红线、预发送审计落盘后才调用；版本门、能力协商、签名门、token 门与审计写失败等所有前置拒绝路径都不再触碰审批。
+
+### fix(joint-dev): 依赖只排序不传播失败（P2）
+
+- **缺陷**：relay 的 `_taskSettled` 只表示"不会再有结果"，refused 也算 settled；`_releaseDependents` 把 settled 当 succeeded，于是 `chain-a refused` 后 `chain-b` 仍被 offer。
+- **修法**：新增 `taskOutcomeOf`（settled + 看执行者的 lease 终止状态与结果信封 `status`），创建与释放两处都改为"前置必须 ok 才放行"；前置失败的依赖被标 `cancelled` + `DEPENDENCY_FAILED`，不会执行。
+
+### fix(joint-dev): dry-run 与真实派发同图同检查（P3）
+
+- **修法**：dry-run 复用 `orderSteps` 的 Kahn 顺序，逐条跑 `inspectControlMessage` 红线；已消费的审批直接 `APPROVAL_ALREADY_USED`，不再打印成可派发。CLI 默认状态目录也改为与插件同源 `<DSH_HOME>/xclient`，`plan list` 不再默认落到多一层的 `xclient/joint-dev/joint-dev`。
+
+### fix(dispatch): 普通派发的版本门改用 device token 读名册（P2）
+
+- **缺陷**：`GET /v1/devices` 只认 device token，`w2m_run` 用 operator token 读，稳定 401 → `VERSION_GATE_UNVERIFIABLE`；联合开发用 device token 却能读。
+- **修法**：名册读取单独解析 device token（未配对的机器仍如实报 UNVERIFIABLE），派发本身继续用 operator token。
+
+### fix(merge): git 缺失不再误诊为基线不匹配（P3）
+
+- **修法**：`assertBaseCommit` 区分 spawn `ENOENT` → `MERGE_GIT_UNAVAILABLE`；真正的对象缺失仍是 `MERGE_BASE_MISMATCH`。
+
+### 明确不含
+
+- 不含 relay 侧部署（本版只改包内代码；线上 relay 仍为 3.1.0，F-3 的释放门要等 relay 升级后生效）。
+- 不含视频编码、远控、文件传输；不改变"只读"边界。
+- 不含 npm publish / tag / Release；发布动作另行授权。
+
+### 验证
+
+- 新增 `test/remote-view-3.7.6.test.mjs`（档位与通道、100 KiB 含信封边界、relay target 预算、tier 切换、文案）与 `test/joint-dev-3.7.6.test.mjs`（F-1 预留点/不烧审批、F-3 结果判定、F-5 排序与已消费、F-6 git 缺失）。
+- `test/joint-cli.test.mjs` 增加默认状态根、Kahn dry-run、已消费 dry-run 三条；`test/fleet-version-gate.test.mjs` 增加 device-token 名册一条。
+- 上述 4 个套件 54/54 通过。
+
 ## [3.7.5] — 2026-11-26
 
 ### fix(p2p): 握手检查脚本的默认 device.json 按本机状态目录解析

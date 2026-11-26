@@ -15,6 +15,8 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { after, describe, it } from 'node:test';
 
+import { consumeApproval } from '../src/plugin/joint-dev/plan-store.mjs';
+
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const CLI = join(ROOT, 'bin', 'w2m-joint.mjs');
 const state = mkdtempSync(join(tmpdir(), 'w2m-joint-cli-'));
@@ -31,6 +33,19 @@ after(async () => {
 
 const run = (...args) => new Promise((resolve) => {
   const child = spawn(process.execPath, [CLI, ...args], { cwd: ROOT, env });
+  let stdout = ''; let stderr = '';
+  child.stdout.on('data', (chunk) => { stdout += chunk; });
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+  child.on('close', (status) => {
+    let body = null;
+    try { body = JSON.parse(stdout); } catch { body = null; }
+    resolve({ status, body, stdout, stderr });
+  });
+});
+
+/** Same binary, a different state environment, for the default-root test. */
+const runEnv = (extraEnv, ...args) => new Promise((resolve) => {
+  const child = spawn(process.execPath, [CLI, ...args], { cwd: ROOT, env: { ...env, ...extraEnv } });
   let stdout = ''; let stderr = '';
   child.stdout.on('data', (chunk) => { stdout += chunk; });
   child.stderr.on('data', (chunk) => { stderr += chunk; });
@@ -108,5 +123,48 @@ describe('operator CLI dispatch', () => {
     const result = await run('dispatch', '--plan', 'x', '--allow-unsigned-approval', '--dry-run');
     assert.equal(result.status, 1);
     assert.equal(result.body?.code, 'UNKNOWN_FLAG');
+  });
+
+  it('dry-run prints the Kahn order, not the declaration order', async () => {
+    const stepsFile = join(state, 'steps-reversed.json');
+    writeFileSync(stepsFile, JSON.stringify([
+      { step_id: 'b', machine_id: 'm-2', command_argv: ['node', 'b.mjs'], depends_on: ['a'] },
+      { step_id: 'a', machine_id: 'm-1', command_argv: ['node', 'a.mjs'], depends_on: [] },
+    ]), 'utf8');
+    const created = await run('plan', 'create', '--state', state, '--steps', stepsFile, '--base-commit', 'c'.repeat(40));
+    assert.equal(created.status, 0, created.stderr || created.stdout);
+    const planSha = created.body?.plan_sha256;
+    const approved = await run('approve', '--state', state, '--plan', planSha, '--approver', 'operator', '--authority', '80');
+    assert.equal(approved.status, 0, approved.stderr || approved.stdout);
+    const dry = await run('dispatch', '--state', state, '--plan', planSha, '--dry-run');
+    assert.equal(dry.status, 0, dry.stderr || dry.stdout);
+    assert.deepEqual(dry.body.control.map((envelope) => envelope.body.step_id), ['a', 'b']);
+  });
+
+  it('dry-run refuses a spent approval instead of printing it as dispatchable', async () => {
+    const stepsFile = join(state, 'steps-spent.json');
+    writeFileSync(stepsFile, JSON.stringify([{ step_id: 's1', machine_id: 'm-1', command_argv: ['node', '-v'] }]), 'utf8');
+    const created = await run('plan', 'create', '--state', state, '--steps', stepsFile, '--base-commit', 'd'.repeat(40));
+    const planSha = created.body?.plan_sha256;
+    const approved = await run('approve', '--state', state, '--plan', planSha, '--approver', 'operator', '--authority', '80');
+    const approvalSha = approved.body?.approval?.approval_sha256;
+    assert.match(String(approvalSha ?? ''), /^[0-9a-f]{64}$/);
+    assert.equal(consumeApproval({ stateDir: state, planSha, approvalSha }).ok, true);
+    const dry = await run('dispatch', '--state', state, '--plan', planSha, '--dry-run');
+    assert.equal(dry.status, 1);
+    assert.equal(dry.body?.code, 'APPROVAL_ALREADY_USED');
+  });
+
+  it('plan list on the default state root finds a plan created on the same root', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'w2m-joint-home-'));
+    const stepsFile = join(state, 'steps-default-root.json');
+    writeFileSync(stepsFile, JSON.stringify([{ step_id: 's1', machine_id: 'm-1', command_argv: ['node', '-v'] }]), 'utf8');
+    // An empty W2M_JOINT_STATE must not override DSH_HOME, or this would test the explicit path again.
+    const created = await runEnv({ DSH_HOME: home, W2M_JOINT_STATE: '' }, 'plan', 'create', '--steps', stepsFile, '--base-commit', 'e'.repeat(40));
+    assert.equal(created.status, 0, created.stderr || created.stdout);
+    const listed = await runEnv({ DSH_HOME: home, W2M_JOINT_STATE: '' }, 'plan', 'list');
+    assert.equal(listed.status, 0, listed.stderr || listed.stdout);
+    assert.equal(listed.body.total, 1, 'the CLI default root must be <DSH_HOME>/xclient, same as the plugin');
+    assert.equal(listed.body.plans[0].plan_sha256, created.body.plan_sha256);
   });
 });

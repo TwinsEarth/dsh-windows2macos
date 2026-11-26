@@ -208,6 +208,16 @@ export function consumeApproval({ stateDir, planSha, approvalSha, now = Date.now
   }
 }
 
+/**
+ * Has this approval already been spent? Read-only, so a dry run can tell the operator the truth
+ * without changing anything: an approval that authorises nothing any more must not print as
+ * "ready to dispatch".
+ */
+export function approvalWasConsumed({ stateDir, approvalSha }) {
+  if (!PLAN_SHA.test(String(approvalSha ?? ''))) return false;
+  return existsSync(join(consumedDir(stateDir), approvalSha + '.json'));
+}
+
 /** dispatch 前置门：计划存在未篡改、审批有效且未过期；requireSignature 时必须是签名审批。 */
 export function assertDispatchAllowed(input) {
   const { stateDir, planSha, now = Date.now(), requireSignature = false, trustedOperatorKeyIds } = input;

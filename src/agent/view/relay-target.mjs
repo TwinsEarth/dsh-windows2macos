@@ -12,6 +12,7 @@
  * later enable does not lose the request to an earlier no-op.
  */
 import { createViewSide, sealViewFrame } from './session-key.mjs';
+import { tierPreset, VIEW_ENVELOPE_BYTES } from './quality.mjs';
 
 export const REMOTE_REQUEST_PATH = '/v1/remote/request';
 export const REMOTE_FRAME_PATH = '/v1/remote/frame';
@@ -26,8 +27,13 @@ export const REMOTE_ACK_PATH = '/v1/remote/ack';
 export function startRelayViewTarget(deps) {
   const fetchImpl = deps.fetchImpl ?? globalThis.fetch;
   const intervalMs = Number.isInteger(deps.intervalMs) && deps.intervalMs > 0 ? deps.intervalMs : 1000;
-  // Stay below the relay broker's 47 KiB ciphertext cap after base64 framing.
-  const maxBytes = Number.isInteger(deps.maxBytes) && deps.maxBytes > 0 ? deps.maxBytes : 40 * 1024;
+  // The relay carries 360P..540P and caps the **sealed** frame at 100 KiB; the capture budget is
+  // therefore the relay tier minus the AES-GCM envelope, so what leaves this machine can never be
+  // rejected by the broker for being one tag too large.
+  const relayTier = tierPreset('relay');
+  const maxBytes = Number.isInteger(deps.maxBytes) && deps.maxBytes > 0
+    ? Math.min(deps.maxBytes, relayTier.maxBytes - VIEW_ENVELOPE_BYTES)
+    : relayTier.maxBytes - VIEW_ENVELOPE_BYTES;
   const maxFrames = Number.isInteger(deps.maxFrames) && deps.maxFrames > 0 ? deps.maxFrames : 60;
   const allow = typeof deps.allow === 'function' ? deps.allow : () => process.env.W2M_VIEW_ALLOW === '1';
   const base = String(deps.rabbitUrl ?? '').replace(/\/+$/, '');
@@ -55,7 +61,7 @@ export function startRelayViewTarget(deps) {
     const current = active;
     const started = Date.now();
     try {
-      const captured = deps.capture({ maxBytes });
+      const captured = deps.capture({ maxBytes, tier: 'relay' });
       if (captured?.ok !== true) { endStream(); return; }
       let ct;
       try { ct = sealViewFrame(current.vk, captured.data ?? Buffer.from(captured.base64 ?? '', 'base64')); }

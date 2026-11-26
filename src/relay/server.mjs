@@ -998,9 +998,9 @@ export class RelayServer {
     // received bytes, so no route may consume the stream first and re-serialise.
     /** v1.2.7: only the blob channel gets the larger frame cap; every JSON route keeps the 64 KiB frame limit. */
     const blobFrameLimit = method === 'PUT' && path.startsWith('/v1/fleet/blobs/') ? BLOB_FRAME_BYTES : this.frameLimitBytes;
-    // P1.5: 47 KiB ciphertext is ~63 KiB once base64-encoded inside JSON; give this
-    // one opaque route the headroom it needs, and no other JSON route gets it.
-    const bodyFrameLimit = method === 'POST' && path === '/v1/remote/frame' ? 70 * 1024 : blobFrameLimit;
+    // P1.5/3.7.6: the sealed frame cap is 100 KiB, which is ~137 KiB once base64-encoded inside
+    // JSON; 160 KiB gives that one opaque route its headroom and no other JSON route gets it.
+    const bodyFrameLimit = method === 'POST' && path === '/v1/remote/frame' ? 160 * 1024 : blobFrameLimit;
     const rawBody = methodHasBody(method) ? await readRawBody(req, bodyFrameLimit) : null;
     const takeJson = () => parseJsonBody(rawBody);
 

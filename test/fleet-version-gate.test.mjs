@@ -614,3 +614,39 @@ describe('version gate: the target-route snapshot', () => {
     assert.deepEqual(snapshot.versions.outdated, []);
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+// 6. F-4: the roster is a device surface, and the gate must read it as a device
+// ---------------------------------------------------------------------------------------------
+
+describe('version gate: roster identity', () => {
+  it('checks versions with the device token when /v1/devices rejects the operator token', async () => {
+    const previousFetch = globalThis.fetch;
+    const seen = [];
+    globalThis.fetch = async (input, init = {}) => {
+      const path = new URL(typeof input === 'string' ? input : String(input?.url ?? input)).pathname;
+      const auth = String(init.headers?.authorization ?? '');
+      seen.push({ path, auth });
+      if (path === '/v1/devices') {
+        // The relay's /v1/devices is device-authenticated: the operator token gets 401.
+        if (auth !== 'Bearer tok-test-abc') return new Response('{"error":{"code":"UNAUTHORIZED"}}', { status: 401 });
+        return Response.json({ protocol_version: 1, devices: [rosterMachine('m-current', '3.7.6')] });
+      }
+      if (path === '/v1/task') return Response.json({ task_id: 'task-f4', seq: 1, leases: [] });
+      return new Response('{}', { status: 404 });
+    };
+    try {
+      const value = await withRunningVersion('3.7.6', async () => {
+        const { tools } = await register();
+        return JSON.parse(await tools.get('w2m_run').execute(RUN_ARGS, {}));
+      });
+      assert.equal(value.ok, true, JSON.stringify(value.error ?? value));
+      assert.equal(value.version_gate.checked, 1, 'the gate read one machine instead of degrading to UNVERIFIABLE');
+      assert.equal(value.version_gate.reason_code, undefined);
+      const rosterCall = seen.find((call) => call.path === '/v1/devices');
+      assert.equal(rosterCall.auth, 'Bearer tok-test-abc');
+    } finally {
+      globalThis.fetch = previousFetch;
+    }
+  });
+});

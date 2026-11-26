@@ -14,7 +14,17 @@ import { join } from 'node:path';
 const defaultRunGit = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 
 function assertBaseCommit(repoDir, baseCommit, runGit) {
-  try { runGit(['cat-file', '-e', `${baseCommit}^{commit}`], repoDir); return true; } catch { return false; }
+  try {
+    runGit(['cat-file', '-e', `${baseCommit}^{commit}`], repoDir);
+    return { ok: true };
+  } catch (error) {
+    // F-6 (3.7.6): a missing `git` is an environment fact, not a wrong base commit. Both used to
+    // collapse into MERGE_BASE_MISMATCH, which sent the operator looking at the wrong thing.
+    if (error?.code === 'ENOENT' || (error instanceof Error && error.message.includes('ENOENT'))) {
+      return { ok: false, code: 'MERGE_GIT_UNAVAILABLE', detail: { repo_dir: repoDir } };
+    }
+    return { ok: false, code: 'MERGE_BASE_MISMATCH', detail: { base_commit: baseCommit } };
+  }
 }
 
 /** @returns {{ok: true, worktree: string, integration_head: string, applied: object[]} | {ok: false, code: string, detail?: object}} */
@@ -22,7 +32,8 @@ export function mergePatches({ repoDir, baseCommit, patches, runGit = defaultRun
   if (typeof repoDir !== 'string' || repoDir === '') return { ok: false, code: 'MERGE_REPO_REQUIRED' };
   if (typeof baseCommit !== 'string' || !/^[0-9a-f]{7,40}$/.test(baseCommit)) return { ok: false, code: 'MERGE_BASE_INVALID' };
   if (!Array.isArray(patches) || patches.length === 0) return { ok: false, code: 'MERGE_PATCHES_REQUIRED' };
-  if (assertBaseCommit(repoDir, baseCommit, runGit) !== true) return { ok: false, code: 'MERGE_BASE_MISMATCH', detail: { base_commit: baseCommit } };
+  const base = assertBaseCommit(repoDir, baseCommit, runGit);
+  if (base.ok !== true) return { ok: false, code: base.code, detail: base.detail };
 
   const worktree = mkdtempSync(join(tmpdir(), 'w2m-merge-'));
   const cleanup = () => {

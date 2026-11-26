@@ -12,6 +12,7 @@
  * never accepts input frames.
  */
 import { createViewSide, openViewFrame, sealViewFrame } from './session-key.mjs';
+import { tierPreset, VIEW_ENVELOPE_BYTES } from './quality.mjs';
 
 export const VIEW_FRAME = Object.freeze({
   HELLO: 'view.hello',
@@ -48,8 +49,8 @@ export function parseViewFrame(payload) {
   return frame;
 }
 
-/** @param {{capture:Function, allow?:boolean|Function, send:Function, maxBytes?:number, fps?:number, intervalMs?:number, maxFrames?:number}} deps */
-export function createViewTarget({ capture, allow = false, send, maxBytes = 96 * 1024, fps = 1, intervalMs, maxFrames = 300 } = {}) {
+/** @param {{capture:Function, allow?:boolean|Function, send:Function, maxBytes?:number, fps?:number, intervalMs?:number, maxFrames?:number, tier?: string}} deps */
+export function createViewTarget({ capture, allow = false, send, maxBytes = 96 * 1024, fps = 1, intervalMs, maxFrames = 300, tier = 'p2p' } = {}) {
   if (typeof capture !== 'function' || typeof send !== 'function') return { ok: false, code: VIEW_CODE.BAD_FRAME };
   let seq = 0;
   let frames = 0;
@@ -57,6 +58,10 @@ export function createViewTarget({ capture, allow = false, send, maxBytes = 96 *
   let vk = null;
   let timer = null;
   let sessionId = null;
+  // The viewer names the tier on every request, because the transport it got is the viewer's fact,
+  // not the target's: the same target may be looked at over WebRTC (720P..4K) or the relay (360P..540P).
+  let activeTier = tier;
+  let activeMaxBytes = maxBytes;
   const delay = Number.isInteger(intervalMs) && intervalMs > 0 ? intervalMs : Math.max(100, Math.round(1000 / Math.max(1, fps)));
   const allowed = () => (typeof allow === 'function' ? allow() === true : allow === true);
   const reply = (frame) => { try { send(JSON.stringify(frame)); } catch { /* channel gone */ } };
@@ -76,7 +81,7 @@ export function createViewTarget({ capture, allow = false, send, maxBytes = 96 *
     if (!allowed()) { fail(VIEW_CODE.CONSENT_REQUIRED); return; }
     if (maxFrames > 0 && frames >= maxFrames) { stopTimer(); return; }
     const started = Date.now();
-    const result = capture({ maxBytes });
+    const result = capture({ maxBytes: activeMaxBytes, tier: activeTier });
     if (result?.ok !== true) { fail(result?.code ?? VIEW_CODE.CAPTURE_FAILED); return; }
     let ct;
     try { ct = sealViewFrame(vk, result.data ?? Buffer.from(result.base64 ?? '', 'base64')); }
@@ -115,6 +120,15 @@ export function createViewTarget({ capture, allow = false, send, maxBytes = 96 *
       if (stopped) { fail(VIEW_CODE.DISABLED); return true; }
       if (vk === null) { fail(VIEW_CODE.VK_REQUIRED); return true; }
       if (typeof frame.session_id === 'string' && frame.session_id !== '') sessionId = frame.session_id;
+      // `tier` is advisory in the sense that an unknown value falls back to `relay` (the tighter
+      // ladder); `max_bytes` can only tighten the tier's own cap, never widen it past what the
+      // transport was allowed to carry.
+      const preset = tierPreset(frame.tier ?? activeTier);
+      activeTier = preset.channel;
+      const ceiling = preset.channel === 'relay' ? preset.maxBytes - VIEW_ENVELOPE_BYTES : preset.maxBytes;
+      activeMaxBytes = Number.isInteger(frame.max_bytes) && frame.max_bytes > 0
+        ? Math.min(frame.max_bytes, ceiling)
+        : ceiling;
       // A renewal is a fresh viewer request; its budget starts over so an actively polling viewer
       // keeps the stream alive, while a viewer that disappears leaves the target to expire its budget.
       frames = 0;
@@ -123,19 +137,19 @@ export function createViewTarget({ capture, allow = false, send, maxBytes = 96 *
       return true;
     },
     stop() { stopped = true; stopTimer(); vk = null; sessionId = null; },
-    stats() { return { seq, frames, stopped, allow: allowed(), fps, intervalMs: delay, max_bytes: maxBytes, encrypted: vk !== null }; },
+    stats() { return { seq, frames, stopped, allow: allowed(), fps, intervalMs: delay, max_bytes: activeMaxBytes, tier: activeTier, encrypted: vk !== null }; },
   };
 }
 
-/** @param {{send:Function, onFrame:Function, maxBytes?:number}} deps */
-export function createViewClient({ send, onFrame, maxBytes = 96 * 1024 } = {}) {
+/** @param {{send:Function, onFrame:Function, maxBytes?:number, tier?:string}} deps */
+export function createViewClient({ send, onFrame, maxBytes = 2 * 1024 * 1024, tier = 'p2p' } = {}) {
   if (typeof send !== 'function' || typeof onFrame !== 'function') return { ok: false, code: VIEW_CODE.BAD_FRAME };
   let sessionId = null;
   let machineId = null;
   let side = null;
   let vk = null;
   let lastSeq = 0;
-  const sendRequest = () => send(JSON.stringify({ type: VIEW_FRAME.REQUEST, session_id: sessionId, machine_id: machineId, fps: 1, max_bytes: maxBytes }));
+  const sendRequest = () => send(JSON.stringify({ type: VIEW_FRAME.REQUEST, session_id: sessionId, machine_id: machineId, fps: 1, max_bytes: maxBytes, tier }));
   return {
     ok: true,
     request({ machineId: machine = null, session } = {}) {

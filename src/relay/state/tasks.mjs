@@ -31,6 +31,41 @@ import { gateMachine } from './members.mjs';
 /* ---------------- tasks (§4) ---------------- */
 
 /**
+ * Did a settled task actually succeed? `_taskSettled` only means "no lease can still produce a
+ * result", which a refusal also satisfies. Dependencies need the stronger fact: F-3 (3.7.6) —
+ * `chain-a` refused and `chain-b` was still offered, because `settled` was read as `completed`.
+ *
+ * @returns {'ok'|'failed'|'waiting'}
+ */
+export function taskOutcomeOf(state, task) {
+  if (task.cancelled === true) return 'failed';
+  if (state._taskSettled(task) !== true) return 'waiting';
+  const executor = typeof task.executor_machine_id === 'string' && task.executor_machine_id !== ''
+    ? task.executor_machine_id
+    : null;
+  let succeeded = false;
+  for (const lease of task.leases.values()) {
+    if (lease.state === 'observing') continue;
+    if (executor !== null && lease.machine_id !== executor) continue;
+    if (lease.state === 'refused' || lease.state === 'expired' || lease.state === 'cancelled') return 'failed';
+    if (lease.state === 'done') succeeded = true;
+  }
+  // A lease marked `done` can still carry a failed result envelope; the envelope is the outcome.
+  let latest = null;
+  for (const record of state.results.values()) {
+    if (record?.envelope?.task_id !== task.task_id) continue;
+    if (executor !== null && record.machine_id !== executor) continue;
+    if (latest === null || record.received_at_ms >= latest.received_at_ms) latest = record;
+  }
+  if (latest !== null) {
+    if (latest.envelope?.status !== 'ok') return 'failed';
+    return 'ok';
+  }
+  return succeeded === true ? 'ok' : 'failed';
+}
+
+
+/**
  * v0.4.0: validate the routing metadata a `POST /v1/task` body may carry.
  *
  * A machine, not a mode, is `origin_machine_id`: where the task was typed (`device.json`), so an
@@ -612,9 +647,11 @@ export function createTask(state, input = {}) {
     const dep = state.tasks.get(depId);
     if (dep === undefined) return 'unknown';
     if (dep.cancelled === true) return 'cancelled';
-    return state._taskSettled(dep) === true ? 'completed' : 'waiting';
+    if (state._taskSettled(dep) !== true) return 'waiting';
+    // A settled prerequisite that did not succeed must not release its dependents (F-3).
+    return taskOutcomeOf(state, dep) === 'ok' ? 'completed' : 'failed';
   });
-  const graphBlocked = dependencyStates.some((state) => state === 'cancelled' || state === 'unknown');
+  const graphBlocked = dependencyStates.some((state) => state === 'cancelled' || state === 'unknown' || state === 'failed');
   const graphReady = graphBlocked !== true && dependencyStates.every((state) => state === 'completed');
   const waitingOn = graphReady === true ? [] : (task.depends_on ?? []);
   /**
@@ -659,6 +696,16 @@ export function createTask(state, input = {}) {
       // No capability gate and no offer: the machine is not being asked to run anything, so there
       // is nothing to refuse and nothing to hand out. It is recorded so the task can tell it the
       // outcome afterwards.
+      task.leases.set(device.machine_id, lease);
+      return;
+    }
+    if (graphBlocked === true) {
+      // F-3: a prerequisite that ended refused/failed/cancelled is not "something to wait for".
+      // The dependent is marked cancelled with a named reason instead of being offered later.
+      lease.state = 'cancelled';
+      lease.refusal_reason = 'DEPENDENCY_FAILED';
+      lease.refusal_detail = { depends_on: waitingOn };
+      lease.finished_at_ms = now;
       task.leases.set(device.machine_id, lease);
       return;
     }
@@ -844,11 +891,26 @@ export function _releaseDependents(state, completedTaskId = null) {
     const waiting = [...candidate.leases.values()].filter((lease) => lease.state === 'waiting');
     if (waiting.length === 0) continue;
     let ready = true;
+    let blocked = false;
     for (const depId of candidate.depends_on) {
       const dep = state.tasks.get(depId);
-      if (dep === undefined) { ready = false; break; }
-      if (dep.cancelled === true) { ready = false; break; }
+      if (dep === undefined) { blocked = true; break; }
+      if (dep.cancelled === true) { blocked = true; break; }
       if (state._taskSettled(dep) !== true) { ready = false; break; }
+      if (taskOutcomeOf(state, dep) !== 'ok') { blocked = true; break; }
+    }
+    if (blocked === true) {
+      // F-3: release is not the same as "the blocker finished". A refused prerequisite cancels its
+      // dependents by name, so a build→test chain cannot run tests after the build failed.
+      const at = state.nowMs();
+      for (const lease of waiting) {
+        lease.state = 'cancelled';
+        lease.refusal_reason = 'DEPENDENCY_FAILED';
+        lease.refusal_detail = { depends_on: candidate.depends_on };
+        lease.finished_at_ms = at;
+      }
+      state.emit('notice', { level: 'warn', code: 'DEPENDENCY_FAILED', message: candidate.task_id + ' skipped: a prerequisite did not succeed', task_id: candidate.task_id });
+      continue;
     }
     if (ready !== true) continue;
     for (const lease of waiting) {
