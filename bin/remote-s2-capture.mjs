@@ -17,7 +17,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { isMainModule } from '../src/util/cli.mjs';
 
 export function parseArgs(argv) {
   const out = { fps: 1, exitSummary: false, json: false, keep: false };
@@ -141,5 +141,5 @@ function finish(result, opts, normalCode) {
   process.exit(normalCode);
 }
 
-const invoked = process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
+const invoked = isMainModule(import.meta.url);
 if (invoked) main();

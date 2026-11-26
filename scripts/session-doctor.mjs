@@ -16,6 +16,7 @@ import path from 'node:path';
 import process from 'node:process';
 
 import { diagnoseRoot, diagnoseSessionFile, formatReport } from '../src/util/session-validate.mjs';
+import { isMainModule } from '../src/util/cli.mjs';
 
 export {
   CODES,
@@ -80,6 +81,6 @@ function main() {
   return 2;
 }
 
-if (import.meta.url === `file://${process.argv[1]?.replace(/\\/g, '/')}` || process.argv[1]?.endsWith('session-doctor.mjs') === true) {
+if (isMainModule(import.meta.url) || process.argv[1]?.endsWith('session-doctor.mjs') === true) {
   process.exit(main());
 }

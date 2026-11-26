@@ -109,6 +109,19 @@ const FIND_EXEC = /\bfind\b[^\n]*\s-?(?:exec|execdir|delete|fprint|fprintf|fls)\
 /** Redirection to a real file is a write, even when the command name is a read-only prefix. */
 const SHELL_FILE_OUTPUT = /(?:^|[^0-9])(?:>>?|&>)\s*(?!&?\d+|\/dev\/null)[^\s|;&]+/i;
 const SHELL_TEE = /\b(?:tee|out-file)\b/i;
+/** A read-only first token must never lend its verdict to later pipeline/chain segments. */
+const SHELL_CHAIN = /&&|\|\||[;|]|(?<!>)&(?!>)|\r?\n|\r/;
+/** Command/process substitution hides another command even when the visible prefix is read-only. */
+const SHELL_SUBSTITUTION = /\$\(|`|<\(|>\(/;
+
+/** Allow only the deliberately simple case: unquoted separators and a closed read-only prefix per segment. */
+function isReadOnlyChain(text) {
+  // Quoting rules differ between POSIX shells and PowerShell. If a chain also contains quotes, do not
+  // guess where its real segment boundaries are; the caller keeps it at G2 instead of auto-allowing it.
+  if (/["']/.test(text)) return false;
+  const segments = text.split(SHELL_CHAIN).map((segment) => segment.trim());
+  return segments.length > 1 && segments.every((segment) => segment !== '' && READONLY_COMMAND.test(segment));
+}
 
 /** Credential-shaped paths are red even for reads. */
 const SENSITIVE_PATH = /(?:^|[\\/])(\.env(?:\..*)?|\.ssh|\.aws|id_rsa|id_ed25519|.*\.pem|.*\.key|credentials|passwd|shadow|\.gnupg)(?:[\\/]|$)/i;
@@ -284,6 +297,13 @@ function commandVerdict(command, paths, workspace) {
   }
   for (const pattern of YELLOW_COMMANDS) {
     if (pattern.test(text)) return verdict('yellow', `命令需要弹窗确认（G2，${pattern.source.slice(0, 40)}）`);
+  }
+  if (SHELL_SUBSTITUTION.test(text)) {
+    return verdict('yellow', '命令包含命令/进程替换，无法证明隐藏部分是只读（G2）');
+  }
+  if (SHELL_CHAIN.test(text)) {
+    if (isReadOnlyChain(text)) return verdict('green', '复合命令的每一段都是只读前缀（G0）');
+    return verdict('yellow', '复合命令不能逐段证明只读，按 G2 交人工确认');
   }
   for (const pattern of GRAY_COMMANDS) {
     if (pattern.test(text)) {

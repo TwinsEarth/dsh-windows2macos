@@ -35,7 +35,7 @@
 import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { pathToFileURL } from 'node:url';
+import { isMainModule } from '../src/util/cli.mjs';
 
 /** Versions this server can speak, newest first. */
 export const SUPPORTED_VERSIONS = Object.freeze(['2026-07-28', '2025-11-25']);
@@ -375,4 +375,4 @@ async function main() {
 }
 
 // Only when run as a program, so importing this module in a test starts no server.
-if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) main();
+if (isMainModule(import.meta.url)) main();

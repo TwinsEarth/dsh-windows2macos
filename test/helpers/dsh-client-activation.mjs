@@ -39,6 +39,7 @@
  * that second, independent measurement, and it is what tells us whether these stubs match the shell.
  */
 
+import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
 
@@ -63,6 +64,25 @@ const REACT_STUB = {
 };
 
 /**
+ * One spelling of a path: its real path.
+ *
+ * macOS reports its temp directory as `/var/folders/…`, which is a symbolic link to `/private/var/folders/…`, and a
+ * module path the Host resolved comes back in the real spelling. Comparing the two spellings with `path.relative`
+ * puts the profile's own packages *outside* the profile -- which is how every Mac reported "no client bundle of
+ * its own" for a package whose client row was composed and present.
+ *
+ * @param {string} file - Any path.
+ * @returns {string} The path with symbolic links resolved; the absolute path when it does not resolve.
+ */
+function canonical(file) {
+  try {
+    return fs.realpathSync(file);
+  } catch {
+    return path.resolve(file);
+  }
+}
+
+/**
  * Whether an absolute bundle path belongs to the profile (this package) rather than to the install.
  *
  * The installation ships dozens of client packages of its own; mounting those needs the real shell,
@@ -74,7 +94,7 @@ const REACT_STUB = {
  */
 function belongsToProfile(bundlePath, profileDir) {
   if (typeof bundlePath !== 'string') return false;
-  const relative = path.relative(profileDir, bundlePath);
+  const relative = path.relative(canonical(profileDir), canonical(bundlePath));
   return relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative);
 }
 
@@ -129,7 +149,17 @@ export async function activateClientEntries({ packages, registry, profileDir }) 
   const graph = registry.graph();
   const owned = graph.entries.filter((row) => belongsToProfile(registry.clientPath(row.id), profileDir));
   if (owned.length === 0) {
-    return { mounted: [], entries: [], seats: [], skipped: 'this profile contributes no client bundle of its own' };
+    // The skip says what it compared, so a path-spelling mismatch is visible in the report instead of silent.
+    const seen = graph.entries
+      .filter((row) => /twinsearth/u.test(row.id))
+      .slice(0, 4)
+      .map((row) => `${row.id} -> ${String(registry.clientPath(row.id))}`);
+    return {
+      mounted: [],
+      entries: [],
+      seats: [],
+      skipped: `this profile contributes no client bundle of its own (profileDir ${profileDir}; ${graph.entries.length} composed rows, e.g. ${seen.join('; ')})`,
+    };
   }
 
   const hostHalf = await import(`${packages}/@deepseek-ai/dsh-client-modules/lib/index.js`);

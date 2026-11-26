@@ -112,20 +112,50 @@ class Cdp {
 }
 
 /**
+ * Read the browser's DevTools endpoint file.
+ *
+ * Every way this comes back empty means "not written yet", never an error for the caller:
+ *
+ *   - the file is not there (not created yet, or replaced between the listing and the open);
+ *   - it cannot be opened: on Windows the browser holds the file without sharing while it writes,
+ *     and that arrives as `EBUSY`;
+ *   - it is half written: nothing on the first line, or something that is not a port.
+ *
+ * The last case used to come back as port `NaN`.
+ *
+ * @param {string} file - the `DevToolsActivePort` file.
+ * @param {(file: string) => string} readFile - reads a file as text. Injected so the failures above can be
+ *   produced on every platform: Node always opens with full sharing, so a real `EBUSY` cannot be staged
+ *   from inside a test process.
+ * @returns {{port: number, browserPath: string} | null} `null` until the file holds a port.
+ */
+function readDevToolsEndpoint(file, readFile) {
+  let text;
+  try {
+    text = readFile(file);
+  } catch {
+    return null;
+  }
+  const [port, browserPath] = text.split('\n');
+  const trimmed = (port ?? '').trim();
+  if (!/^[1-9]\d*$/u.test(trimmed)) return null;
+  return { port: Number(trimmed), browserPath: browserPath ?? '/devtools/browser' };
+}
+
+/**
  * Wait for the browser's DevTools endpoint file.
  *
  * @param {string} userDataDir - the browser profile directory.
  * @param {number} timeoutMs - how long to wait.
+ * @param {(file: string) => string} [readFile] - how the file is read; the default reads it from disk.
  * @returns {Promise<{port: number, browserPath: string}>}
  */
-async function waitForDevTools(userDataDir, timeoutMs) {
+export async function waitForDevTools(userDataDir, timeoutMs, readFile = (file) => fs.readFileSync(file, 'utf8')) {
   const file = path.join(userDataDir, 'DevToolsActivePort');
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (fs.existsSync(file)) {
-      const [port, browserPath] = fs.readFileSync(file, 'utf8').split('\n');
-      if (port !== undefined && port !== '') return { port: Number(port), browserPath: browserPath ?? '/devtools/browser' };
-    }
+    const endpoint = readDevToolsEndpoint(file, readFile);
+    if (endpoint !== null) return endpoint;
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
   throw new Error(`the browser wrote no DevToolsActivePort within ${String(timeoutMs)}ms`);
@@ -565,6 +595,23 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
       await new Promise((resolve) => setTimeout(resolve, 400));
       const escClosed = await read(`return {closed:document.querySelector('.w2mGpw_card')===null};`);
       report.gpwClose = { ensureClosed, gpwOpen, outsideClick, outsideClosed, reopened, escClosed };
+      // v3.7.3: the GPW operations row is opt-in. Measure the whole real-page transition, not just the
+      // presence of a button: no row/preference initially, explicit pin mounts one row, and unpin removes it.
+      const pinDefault = await read(`return {row:document.querySelector('[data-w2m-gpw-sidebar]')!==null, preference:window.localStorage?.getItem('w2m.gpw.sidebar.pinned') ?? null};`);
+      await read(`const l=document.querySelector('.w2mGpw_launcher'); if(l!==null) l.click(); return{opened:l!==null};`);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      const pinButton = await read(`const b=document.querySelector('[data-w2m-gpw-sidebar-pin]'); return {found:b!==null,state:b?.getAttribute('data-w2m-gpw-sidebar-pin') ?? null,text:(b?.textContent ?? '').trim()};`);
+      const pinClicked = await read(`const b=document.querySelector('[data-w2m-gpw-sidebar-pin]'); if(b===null)return{clicked:false}; b.click(); return{clicked:true};`);
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      const pinned = await read(`const b=document.querySelector('[data-w2m-gpw-sidebar-pin]'); return {row:document.querySelector('[data-w2m-gpw-sidebar]')!==null,state:b?.getAttribute('data-w2m-gpw-sidebar-pin') ?? null,preference:window.localStorage?.getItem('w2m.gpw.sidebar.pinned') ?? null};`);
+      const unpinClicked = await read(`const b=document.querySelector('[data-w2m-gpw-sidebar-pin]'); if(b===null)return{clicked:false}; b.click(); return{clicked:true};`);
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      const unpinned = await read(`const b=document.querySelector('[data-w2m-gpw-sidebar-pin]'); return {row:document.querySelector('[data-w2m-gpw-sidebar]')!==null,state:b?.getAttribute('data-w2m-gpw-sidebar-pin') ?? null,preference:window.localStorage?.getItem('w2m.gpw.sidebar.pinned') ?? null};`);
+      const repinClicked = await read(`const b=document.querySelector('[data-w2m-gpw-sidebar-pin]'); if(b===null)return{clicked:false}; b.click(); return{clicked:true};`);
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      const repinned = await read(`const b=document.querySelector('[data-w2m-gpw-sidebar-pin]'); return {row:document.querySelector('[data-w2m-gpw-sidebar]')!==null,state:b?.getAttribute('data-w2m-gpw-sidebar-pin') ?? null,preference:window.localStorage?.getItem('w2m.gpw.sidebar.pinned') ?? null};`);
+      await read(`const l=document.querySelector('.w2mGpw_launcher'); if(l!==null && document.querySelector('.w2mGpw_card')!==null) l.click(); return{closed:true};`);
+      await new Promise((resolve) => setTimeout(resolve, 300));
       const opsOpened = await read(`const b=document.querySelector('.w2mGpw_sideEntry'); if(b===null)return{found:false}; b.click(); return{found:true};`);
       await new Promise((resolve) => setTimeout(resolve, 800));
       const opsPanel = await read(`const p=document.querySelector('.w2mOpsPanel'); return {open:p!==null, tabs:[...document.querySelectorAll('.w2mOpsTab')].map((x)=>x.textContent), active:(document.querySelector('.w2mOpsTab[data-active=true]')?.textContent??null)};`);
@@ -591,6 +638,7 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
       const opsClosed = await read(`const b=document.querySelector('.w2mGpw_fullPage .w2mGpw_close'); if(b===null)return{closed:false}; b.click(); return{clicked:true};`);
       await new Promise((resolve) => setTimeout(resolve, 400));
       const opsGone = await read(`return {closed:document.querySelector('.w2mGpw_fullPage')===null};`);
+      report.gpwSidebarPin = { pinDefault, pinButton, pinClicked, pinned, unpinClicked, unpinned, repinClicked, repinned };
       report.opsProbe = { opsOpened, opsPanel, opsActionsTab, opsFleetVersion, opsQueueTab, opsQueueSection, opsClosed, opsGone };
       // v3.4.9: the backup entry and the page it switches to. The opt-in probes enable the backup row in the
       // installed copy (see `W2M_DECISION_PROBE` / `W2M_BACKUP_PROBE`), so the panel reads live host state; the

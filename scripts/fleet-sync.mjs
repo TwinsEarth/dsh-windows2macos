@@ -36,7 +36,7 @@
  */
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { pathToFileURL } from 'node:url';
+import { isMainModule } from '../src/util/cli.mjs';
 
 /**
  * Run git and hand back its answer without throwing; a missing repo is a state, not a crash.
@@ -276,21 +276,13 @@ export function report(state, outcome) {
 /**
  * Is this file the process entry point?
  *
- * `import.meta.url === 'file://' + argv[1]` is the idiom that looks right and is wrong on Windows: the
- * URL is `file:///E:/path/...` with three slashes and forward slashes, while `argv[1]` is
- * `E:\path\...` with backslashes. The comparison silently fails, the script body never runs, and the
- * process exits 0 having done nothing -- which is the worst possible failure mode for a tool whose job
- * is to tell you whether your tree is in sync.
+ * Asked through the shared helper. `import.meta.url === 'file://' + argv[1]` is the idiom that looks right and is
+ * wrong on Windows: the URL is `file:///E:/path/...` with three slashes and forward slashes, while `argv[1]` is
+ * `E:\path\...` with backslashes. The comparison silently fails, the script body never runs, and the process
+ * exits 0 having done nothing -- which is the worst possible failure mode for a tool whose job is to tell you
+ * whether your tree is in sync. The same silent branch is taken when the entry is reached through a symlink.
  */
-const isMain = (() => {
-  const entry = process.argv[1];
-  if (typeof entry !== 'string' || entry === '') return false;
-  try {
-    return import.meta.url === pathToFileURL(entry).href;
-  } catch {
-    return false;
-  }
-})();
+const isMain = isMainModule(import.meta.url);
 if (isMain) {
   const write = process.argv.includes('--write');
   const json = process.argv.includes('--json');

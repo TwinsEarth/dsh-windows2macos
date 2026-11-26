@@ -6,8 +6,10 @@
  * have to behave identically on Windows and macOS.
  */
 
+import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 /**
  * Resolve the directory a W2M process keeps its durable state in.
@@ -24,14 +26,15 @@ import { isAbsolute, join, resolve } from 'node:path';
  *
  * @param {string|undefined} explicit Value of `--state`, if given.
  * @param {string} kind Sub-directory name, e.g. `'rabbit'` or `'localside'`.
+ * @param {Record<string, string|undefined>} [env] Environment to read; tests pass a fake one.
  * @returns {string} Absolute path.
  */
-export function resolveStateDir(explicit, kind) {
+export function resolveStateDir(explicit, kind, env = process.env) {
   if (explicit && explicit.trim() !== '') {
     return isAbsolute(explicit) ? explicit : resolve(explicit);
   }
-  const home = process.env.DSH_HOME && process.env.DSH_HOME.trim() !== ''
-    ? process.env.DSH_HOME
+  const home = env.DSH_HOME && env.DSH_HOME.trim() !== ''
+    ? env.DSH_HOME
     : join(homedir(), '.dsh');
   return join(home, 'xclient', kind);
 }
@@ -67,4 +70,34 @@ export function formatError(error) {
   }
   if (typeof error.code === 'string') parts.push(`[${error.code}]`);
   return parts.join(' ');
+}
+
+/**
+ * Decide whether the calling module is the process entry point.
+ *
+ * `import.meta.url === pathToFileURL(process.argv[1]).href` looks right and fails two ways, both observed on real
+ * machines:
+ *
+ *   - a hand-built `file://${...}` template leaves `~` and `#` unescaped while the loader escapes them
+ *     (`ADMINI%7E1`, `%23`), so the comparison is false and the command exits 0 having done nothing;
+ *   - even with `pathToFileURL`, the two sides are two spellings of one file: `argv[1]` keeps the path the
+ *     caller typed, while `import.meta.url` has already been resolved. On macOS `/tmp` and `/var` are symlinks,
+ *     and `os.tmpdir()` lives behind `/var`, so every entry started from a temporary path took the silent
+ *     branch. A pnpm install has the same shape: `node_modules/@twinsearth/...` is a link into the store.
+ *
+ * Comparing the resolved paths answers the question that was actually asked -- "is this the same file?" -- and
+ * is indifferent to spelling. `realpathSync` needs the file to exist, so the URL comparison is kept as a fallback
+ * for the case where it does not.
+ *
+ * @param {string} moduleUrl The caller's own `import.meta.url`.
+ * @param {string|undefined} argv1 Defaults to the live `process.argv[1]`.
+ * @returns {boolean} True when the caller is the entry point.
+ */
+export function isMainModule(moduleUrl, argv1 = process.argv[1]) {
+  if (argv1 === undefined || argv1 === '') return false;
+  try {
+    return realpathSync(fileURLToPath(moduleUrl)) === realpathSync(argv1);
+  } catch {
+    return moduleUrl === pathToFileURL(argv1).href;
+  }
 }

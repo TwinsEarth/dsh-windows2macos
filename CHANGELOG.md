@@ -2,6 +2,37 @@
 
 All notable changes to this project are documented here.
 
+## [3.7.5] — 2026-11-26
+
+### fix(p2p): 握手检查脚本的默认 device.json 按本机状态目录解析
+
+- **缺陷**：`scripts/p2p-handshake-check.mjs` 的 `--device` 默认值硬编码成一个 Windows 用户路径，在 macOS / Linux 上不带参数直调必 `ENOENT`，把“这台机器还没配对”误报成“脚本坏了”。v3.7.3 五机实测在 Mac 上首次暴露。
+- **修法**：默认值改为 `resolveStateDir(null, '', env)` + `device.json`，与 `bin/w2m-rabbit.mjs`、`bin/w2m-localside.mjs` 等同源；`DSH_HOME` 指向一次性 profile 时也跟随。显式 `--device` 仍优先。
+- **可测性**：脚本改为 `main()` + `isMainModule` 守卫，导出 `resolveDevicePath()`；`resolveStateDir` 增加可选 `env` 参数（默认 `process.env`，向后兼容）。
+
+### fix(backup): macOS 上还原能找到 .app 内的 Harness
+
+- **缺陷**：`findHarnessInstallation` 只认 Windows 布局（`<root>/resources/app.asar` + `<root>/DeepSeek Harness.exe`）。macOS 上 `/Applications/DeepSeek Harness.app` 明明存在，restore 仍以 `BACKUP_RUNTIME_UNAVAILABLE` 拒绝，只能加 `--allow-static-validation` 走静态证据。
+- **修法**：darwin 增加两个候选根——`/Applications/DeepSeek Harness.app/Contents` 与 `$HOME/Applications/DeepSeek Harness.app/Contents`；ASAR 同时接受 `resources/` 与 `Resources/` 两种拼写（区分大小写的 APFS 卷上是两条不同路径）；可执行文件在 darwin 上额外查 `Contents/MacOS/DeepSeek Harness`。
+- **未改**：Windows 候选与 `--allow-static-validation` 的语义不变；没有安装时仍必须显式选择静态验证。
+
+### fix(surfaces): 六项探针首轮全灭时用 2000 ms 再问一轮，再判 fallback
+
+- **缺陷**：`probeW2mSurfaces` 的六条 `GET /api/w2m/*/health` 共用 800 ms 预算，任何一次冷启动争用都可能让六条同时 abort，快照把 `fallback` 定格为 `true`，要等 30 秒轮询才纠正；集成测试读的就是这个定格值（IM2A 因此出现过一次 `assert.equal(diag.fallback, false)` 失败）。
+- **修法**：首轮无任一确定答案（2xx / 401 / 403）时，用 `W2M_PROBE_RETRY_TIMEOUT_MS = 2000` 再并发问一轮，两轮都没有答案才发 `fallback: true`。最坏 800 + 2000 = 2.8 s，仍在页面驱动等待 `__W2M_SURFACES__` 的 6 s 窗口内；探针本身无副作用。
+
+### 明确不含
+
+- 不含 relay 侧改动，不部署 relay、不开公网隧道。
+- 不含 v3.7.4：该版本号未发布，改动直接进 3.7.5。
+
+### 验证
+
+- `test/portability-3.7.5.test.mjs` 8/8（device 路径两种环境、macOS bundle 与 Windows 布局、探针重试两条源码守卫）。
+- `test/client-budget.test.mjs` 4/4（bundle 体积与函数体上限未被突破）。
+- `eslint` 改动文件 0 error。
+- 全量 preflight **GREEN**：16 pass / 0 fail / 1 accepted UNVERIFIABLE（host 自身 bundled-runtime 布局）。declared suite 348 个文件、4879 条：4854 pass、0 fail、25 skip（用时 1088 s）；运行 Harness 的 12 条断言在 `D:\DSH` 上真跑（preflight 注入 `DSH_INSTALL_DIR`），未计入 skip。
+
 ## [3.7.3] — 2026-11-25
 
 ### feat(gpw): 新增 GPW-V2 五级风险子插件，原 GPW 保留兜底

@@ -48,9 +48,17 @@ import assert from 'node:assert/strict';
  * v1.1.6: \`autoStartAgent\` now defaults to true in the product, and every case in this file is about the P2P path,
  * not about joining a fleet. Pinning it off once keeps each case's environment explicit, instead of editing twelve
  * object literals by hand.
+ *
+ * Pinned **last**. The bundle's own config (\`cordis.patch.yml\`) carries \`autoStartAgent: true\`, and two cases
+ * below apply that config as it ships. With the pin written first they spread it away again, and the real failover
+ * stack came up inside the test process with no \`stateDir\` -- that is the machine's own \`<DSH_HOME>/xclient\`.
+ * Measured while it happened: the identity's machine name rewritten 1.2 s in, an agent rewriting
+ * \`agent-state.json\` and probing three production relays every ten seconds until the process was killed, and no
+ * way to stop it, because the fake \`ctx.effect\` in {@link makeCtx} has nothing to dispose.
+ * \`test/p2p-plugin-isolation.test.mjs\` runs the two cases and asserts none of that happens.
  */
 function applyPinned(ctx, config = {}) {
-  return plugin.apply(ctx, { autoStartAgent: false, ...config });
+  return plugin.apply(ctx, { ...config, autoStartAgent: false });
 }
 import { createHash } from 'node:crypto';
 import { promises as fs, readFileSync } from 'node:fs';

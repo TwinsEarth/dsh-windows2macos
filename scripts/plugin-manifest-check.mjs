@@ -28,7 +28,7 @@
  */
 import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { isMainModule } from '../src/util/cli.mjs';
 
 /** `plugin.json` section 5. `additionalProperties: false` is the schema's own, so this set is closed. */
 export const PLUGIN_FIELDS = new Set(['$schema', 'name', 'version', 'description', 'author', 'homepage', 'repository', 'license', 'keywords', 'extensions']);
@@ -167,4 +167,4 @@ function main(argv) {
   process.exit(problems.length === 0 ? 0 : 1);
 }
 
-if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) main(process.argv);
+if (isMainModule(import.meta.url)) main(process.argv);

@@ -67,11 +67,18 @@ export function clearVerdictCache() {
  * Checks, in order: explicit env overrides, the environment the desktop app exports, and the common install
  * locations. A candidate counts only when `resources/app.asar` exists under it.
  *
- * @param {{env?: Record<string, string|undefined>}} [options]
+ * macOS installs are bundles, so the installation root is `<app>.app/Contents`: the ASAR sits at
+ * `Contents/Resources/app.asar` (capital R) and the executable at `Contents/MacOS/DeepSeek Harness`. Without these
+ * two roots a restore on macOS refused with `BACKUP_RUNTIME_UNAVAILABLE` on a machine where the app was plainly
+ * installed at `/Applications/DeepSeek Harness.app` (v3.7.3 field finding). Both spellings of `Resources` are
+ * accepted, because a case-sensitive APFS volume makes the capital one a different path.
+ *
+ * @param {{env?: Record<string, string|undefined>, platform?: string}} [options]
  * @returns {{root: string, runtime: string, asar: string, source: string} | null}
  */
 export function findHarnessInstallation(options = {}) {
   const env = options.env ?? process.env;
+  const platform = options.platform ?? process.platform;
   const candidates = [];
   const add = (root, source, runtime = null) => {
     if (typeof root === 'string' && root.trim() !== '') candidates.push({ root: path.resolve(root.trim()), source, runtime });
@@ -86,7 +93,7 @@ export function findHarnessInstallation(options = {}) {
   if (typeof env.DSH_INSTALL_DIR === 'string' && env.DSH_INSTALL_DIR.trim() !== '') {
     let dir = path.resolve(env.DSH_INSTALL_DIR.trim());
     for (let depth = 0; depth < 8; depth += 1) {
-      if (fs.existsSync(path.join(dir, 'resources', 'app.asar'))) {
+      if (hasHarnessAsar(dir)) {
         add(dir, 'DSH_INSTALL_DIR');
         break;
       }
@@ -98,22 +105,46 @@ export function findHarnessInstallation(options = {}) {
   const local = env.LOCALAPPDATA;
   if (typeof local === 'string' && local !== '') add(path.join(local, 'Programs', 'DeepSeek Harness'), 'LOCALAPPDATA');
   if (typeof env.ProgramFiles === 'string' && env.ProgramFiles !== '') add(path.join(env.ProgramFiles, 'DeepSeek Harness'), 'ProgramFiles');
+  if (platform === 'darwin') {
+    const bundle = 'DeepSeek Harness.app';
+    add(path.join('/Applications', bundle, 'Contents'), 'Applications');
+    const homeDir = typeof env.HOME === 'string' && env.HOME.trim() !== '' ? env.HOME : os.homedir();
+    add(path.join(homeDir, 'Applications', bundle, 'Contents'), 'HOME-Applications');
+  }
 
   for (const candidate of candidates) {
-    const asar = path.join(candidate.root, 'resources', 'app.asar');
-    if (!fs.existsSync(asar)) continue;
-    const runtime = candidate.runtime ?? defaultRuntimeFor(candidate.root);
+    const asar = harnessAsarPath(candidate.root);
+    if (asar === null) continue;
+    const runtime = candidate.runtime ?? defaultRuntimeFor(candidate.root, platform);
     if (runtime === null || !fs.existsSync(runtime)) continue;
     return { root: candidate.root, runtime, asar, source: candidate.source };
   }
   return null;
 }
 
+/** The ASAR under an installation root, in either spelling; null when neither exists. */
+function harnessAsarPath(root) {
+  for (const directory of ['resources', 'Resources']) {
+    const asar = path.join(root, directory, 'app.asar');
+    if (fs.existsSync(asar)) return asar;
+  }
+  return null;
+}
+
+/** Whether an installation root carries the ASAR the runtime driver needs. */
+function hasHarnessAsar(root) {
+  return harnessAsarPath(root) !== null;
+}
+
 /** The executable inside an installation root, if one of the known names is present. */
-function defaultRuntimeFor(root) {
-  for (const name of ['DeepSeek Harness.exe', 'deepseek-harness.exe', 'DeepSeek Harness']) {
-    const candidate = path.join(root, name);
-    if (fs.existsSync(candidate)) return candidate;
+function defaultRuntimeFor(root, platform = process.platform) {
+  const names = ['DeepSeek Harness.exe', 'deepseek-harness.exe', 'DeepSeek Harness'];
+  const directories = platform === 'darwin' ? [root, path.join(root, 'MacOS'), path.join(root, 'Contents', 'MacOS')] : [root];
+  for (const directory of directories) {
+    for (const name of names) {
+      const candidate = path.join(directory, name);
+      if (fs.existsSync(candidate)) return candidate;
+    }
   }
   return null;
 }

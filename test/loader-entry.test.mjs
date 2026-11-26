@@ -270,6 +270,9 @@ function run(command, args, options = {}) {
 /** Candidate runtime executables inside an installation root, in probe order. */
 const RUNTIME_CANDIDATES = [
   'DeepSeek Harness.exe',
+  // The macOS bundle: the root that holds `resources/app.asar` is `…app/Contents`, and the executable sits one
+  // directory below it. Without this entry the five-machine run skipped every real-Loader test on a Mac.
+  path.join('MacOS', 'DeepSeek Harness'),
   path.join('DeepSeek Harness.app', 'Contents', 'MacOS', 'DeepSeek Harness'),
   'deepseek-harness',
 ];
@@ -322,7 +325,12 @@ function findInstallation() {
       continue;
     }
     const fromEnv = runtimes.find((runtime) => path.dirname(runtime) === root);
-    const runtime = fromEnv ?? RUNTIME_CANDIDATES.map((name) => path.join(root, name)).find((candidate) => fs.existsSync(candidate));
+    const runtime =
+      fromEnv ??
+      RUNTIME_CANDIDATES.map((name) => path.join(root, name)).find((candidate) => fs.existsSync(candidate)) ??
+      // A runtime named through the environment may sit below the root that holds the archive (the macOS bundle
+      // keeps it in `Contents/MacOS`); it is accepted only when that root really is one of its ancestors.
+      runtimes.find((candidate) => fs.existsSync(candidate) && candidate.startsWith(root + path.sep));
     if (runtime === undefined) {
       attempts.push(`${root}: no runtime executable among ${RUNTIME_CANDIDATES.join(', ')}`);
       continue;
@@ -757,7 +765,11 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
     if (process.env[SURFACES_PROBE_ENV] !== '1') {
       return t.skip(`${SURFACES_PROBE_ENV}=1 enables the archive row in the throwaway profile and drives this probe`);
     }
-    const page = report.clientPage ?? {};
+    // The page half of this probe needs a browser like its neighbours do: without one the driver reports
+    // `{ skipped }` and there is no page to read, which is a skip carrying the reason, not a failed probe.
+    const page = report.clientPage;
+    assert.ok(page !== undefined, 'the driver reported no page boot');
+    if (typeof page.skipped === 'string') return t.skip(page.skipped);
     const probe = page.surfacesProbe ?? {};
     assert.equal(page.surfaces?.diag?.ok, true, `the probes must be authoritative with one row enabled: ${JSON.stringify(page.surfaces?.diag)}`);
     assert.equal(page.surfaces?.diag?.available?.archive, true, 'the enabled archive row answers');
@@ -916,8 +928,26 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
       assert.equal(gpwClose.outsideClosed?.closed, true, 'clicking outside the GPW panel closes it');
       assert.equal(gpwClose.reopened?.open, true, 'the GPW panel reopens for the Escape check');
       assert.equal(gpwClose.escClosed?.closed, true, 'Escape closes the GPW panel');
+      const pin = page.gpwSidebarPin ?? {};
+      assert.equal(pin.pinDefault?.row, false, 'the GPW operations row is absent by default even though the GPW row is enabled');
+      assert.equal(pin.pinDefault?.preference, null, 'a fresh profile has no sidebar-pin preference');
+      assert.equal(pin.pinButton?.found, true, 'the GPW floating panel offers the explicit sidebar-pin control');
+      assert.equal(pin.pinButton?.state, 'false', 'the pin control starts unpinned');
+      assert.match(String(pin.pinButton?.text ?? ''), /固定到左侧边栏/u, 'the control tells the operator how to opt in');
+      assert.equal(pin.pinClicked?.clicked, true, 'the pin control accepts a real page click');
+      assert.equal(pin.pinned?.row, true, 'pinning mounts the operations row in the left sidebar');
+      assert.equal(pin.pinned?.state, 'true', 'the control reflects the pinned state');
+      assert.equal(pin.pinned?.preference, '1', 'pinning persists the opt-in preference');
+      assert.equal(pin.unpinClicked?.clicked, true, 'the same control accepts the unpin click');
+      assert.equal(pin.unpinned?.row, false, 'unpinning removes the operations row again');
+      assert.equal(pin.unpinned?.state, 'false', 'the control returns to the unpinned state');
+      assert.equal(pin.unpinned?.preference, '0', 'unpinning clears the persisted opt-in');
+      assert.equal(pin.repinClicked?.clicked, true, 'the control accepts a second pin for the operations-page check');
+      assert.equal(pin.repinned?.row, true, 'the second pin remounts exactly the row used below');
+      assert.equal(pin.repinned?.state, 'true', 'the second pin is reflected by the control');
+      assert.equal(pin.repinned?.preference, '1', 'the second pin restores the opt-in preference');
       const ops = page.opsProbe ?? {};
-      assert.equal(ops.opsOpened?.found, true, 'the sidebar operation-panel button exists');
+      assert.equal(ops.opsOpened?.found, true, 'the explicitly pinned sidebar operation-panel button exists');
       assert.equal(ops.opsPanel?.open, true, 'clicking the sidebar button opens the operation panel');
       assert.equal(ops.opsActionsTab?.clicked, true, 'the 操作入口 tab exists and accepts a click');
       for (const label of ['智能分级&审批', '消息与草稿', '决策中心', '操作入口']) {

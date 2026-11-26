@@ -21,9 +21,8 @@
 
 import { parseArgs as parseNodeArgs } from 'node:util';
 import process from 'node:process';
-import { pathToFileURL } from 'node:url';
 
-import { formatError, resolveStateDir } from '../src/util/cli.mjs';
+import { formatError, isMainModule, resolveStateDir } from '../src/util/cli.mjs';
 import { createAgent, parseAllowedCommands } from '../src/agent/agent.mjs';
 import { probeCapsDetailed, detectPlatform } from '../src/agent/caps.mjs';
 import { loadOrCreateIdentity, saveDeviceToken } from '../src/agent/identity.mjs';
@@ -335,7 +334,7 @@ async function main() {
  * guard and were published as importable paths** -- so the fix is to give them the same one, not to remove the
  * exports: a subpath that is importable *and* inert is strictly more useful than one that is neither.
  */
-if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isMainModule(import.meta.url)) {
   main().then(
     (code) => {
       process.exitCode = code;

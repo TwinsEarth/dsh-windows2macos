@@ -33,9 +33,10 @@
  */
 import { readFileSync } from 'node:fs';
 import { basename, dirname, resolve } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 
 import { analyse, collectFiles, importedNames, resolveSpecifier } from './reachability-check.mjs';
+import { isMainModule } from '../src/util/cli.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, '..');
@@ -263,7 +264,7 @@ export function classifyReport(classified) {
   return lines.join('\n');
 }
 
-if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isMainModule(import.meta.url)) {
   const { classified } = classifyAll();
   process.stdout.write(classifyReport(classified) + '\n');
   // Reported, never gated: the classification is an argument about shapes, and a shape can be argued with.

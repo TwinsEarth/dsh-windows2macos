@@ -29,15 +29,15 @@ import { existsSync, readFileSync, statSync, writeFileSync, mkdirSync } from 'no
 import { homedir } from 'node:os';
 import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 
 import { DeviceKey } from '../src/agent/crypto.mjs';
 import { buildSignalingUrl, redactSignalingUrl } from '../src/agent/webrtc/signaling.mjs';
-import { resolveStateDir } from '../src/util/cli.mjs';
+import { isMainModule, resolveStateDir } from '../src/util/cli.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, '..');
-const MAIN = process.argv[1] === undefined ? null : pathToFileURL(resolve(process.argv[1])).href;
+const MAIN = isMainModule(import.meta.url);
 
 export const READINESS_CODE = Object.freeze({
   NODE_VERSION: 'READINESS_NODE_VERSION',
@@ -550,7 +550,7 @@ async function main() {
   process.exitCode = result.ok ? 0 : 2;
 }
 
-if (import.meta.url === MAIN) {
+if (MAIN) {
   main().catch((error) => {
     process.stdout.write(JSON.stringify({
       ok: false,

@@ -19,6 +19,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { isMainModule } from '../src/util/cli.mjs';
 
 const ROOT = process.argv[2] ?? '.';
 
@@ -120,7 +121,7 @@ const main = async () => {
  * with no failure named. The same mistake was made in `skill-check.mjs` and `plugin-manifest-check.mjs`; this is
  * the third time, and the reason each of these files now keeps its CLI behind the same guard.
  */
-if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isMainModule(import.meta.url)) {
   main(process.argv)
     .then((count) => process.exit(count === 0 ? 0 : 1))
     .catch((error) => {

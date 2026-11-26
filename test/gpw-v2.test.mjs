@@ -203,6 +203,34 @@ describe('GPW-V2 risk ladder (pure)', () => {
     }).level, 'yellow', 'git --output writes a file');
   });
 
+  it('fails closed when a compound command cannot be proven read-only segment by segment', () => {
+    const workspace = 'E:\\DB\\W2M';
+    for (const command of [
+      'echo hi; New-GpwProbe',
+      'echo hi\nNew-GpwProbe',
+      'echo hi\r\nNew-GpwProbe',
+      'echo hi & New-GpwProbe',
+      'cat package.json | New-GpwProbe',
+      'echo $(whoami)',
+      'echo hi <(New-GpwProbe)',
+      'echo hi >(New-GpwProbe)',
+      'echo "a;b"',
+    ]) {
+      assert.equal(classifyGpwV2Call({
+        name: 'Bash',
+        arguments: { command },
+        workspace,
+      }).level, 'yellow', `an unrecognised compound/substitution command must not inherit the first segment's green verdict: ${command}`);
+    }
+    for (const command of ['git status && git log -1', 'cat package.json | grep name', 'echo hi\necho bye', 'echo hi & echo bye', 'echo hi 2>&1']) {
+      assert.equal(classifyGpwV2Call({
+        name: 'Bash',
+        arguments: { command },
+        workspace,
+      }).level, 'green', `simple chains made only of read-only segments remain G0: ${command}`);
+    }
+  });
+
   it('resolves a relative blacklist entry against the workspace', () => {
     assert.equal(classifyGpwV2Call({
       name: 'Write',

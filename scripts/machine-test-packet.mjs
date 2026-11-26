@@ -55,8 +55,9 @@
  */
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
+import { isMainModule } from '../src/util/cli.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, '..');
@@ -261,7 +262,7 @@ export function inlineCommand(files, budgetMs = DEFAULT_BUDGET_MS) {
  * import cannot be tested, and the failure looks like "the tests did not run" rather than "the module
  * objected to being loaded", which is the same shape as every other misdiagnosis in this project.
  */
-if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isMainModule(import.meta.url)) {
   const argv = process.argv.slice(2).filter((a) => !a.startsWith('-'));
   if (process.argv.includes('--inline')) {
     process.stdout.write(inlineCommand(argv) + '\n');

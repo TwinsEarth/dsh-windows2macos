@@ -861,7 +861,7 @@ describe('p2p v2 multi-peer orchestration', () => {
 
 describe('dsh-p2p-v2 wiring', () => {
   it('declares the export, the lib seam and a disabled patch row', () => {
-    assert.equal(pkg.version, '3.7.3');
+    assert.equal(pkg.version, '3.7.5');
     assert.equal(pkg.exports['./dsh-p2p-v2'], './lib/p2p-v2-plugin.js');
     assert.equal(pkg.dependencies?.webtorrent, undefined);
     assert.equal(pkg.optionalDependencies?.webtorrent, undefined);

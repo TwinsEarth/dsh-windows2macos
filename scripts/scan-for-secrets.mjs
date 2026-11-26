@@ -27,6 +27,7 @@
 
 import { readFileSync, statSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { isMainModule } from '../src/util/cli.mjs';
 
 export const SEVERITY = Object.freeze({ BLOCK: 'block', REVIEW: 'review' });
 
@@ -252,7 +253,7 @@ export const blocking = (findings) => findings.filter((f) => f.severity === SEVE
 export const reviews = (findings) => findings.filter((f) => f.severity === SEVERITY.REVIEW);
 
 /** CLI: exit non-zero when something blocking is tracked, so a release step can gate on it. */
-if (import.meta.url === `file://${process.argv[1]?.replace(/\\/g, '/')}` || process.argv[1]?.endsWith('scan-for-secrets.mjs')) {
+if (isMainModule(import.meta.url) || process.argv[1]?.endsWith('scan-for-secrets.mjs')) {
   const root = process.argv[2] ?? process.cwd();
   const findings = scanTree({ root, paths: trackedPaths({ root }) });
   const bad = blocking(findings);

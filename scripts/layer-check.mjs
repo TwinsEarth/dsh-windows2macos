@@ -14,6 +14,7 @@ import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { ALLOWED_EDGES, LAYERS, checkEdges } from './layer-model.mjs';
+import { isMainModule } from '../src/util/cli.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const SRC = resolve(HERE, '..', 'src');
@@ -137,4 +138,7 @@ function main() {
   process.exit(result.violations.length > 0 ? 2 : 3);
 }
 
-if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1].replace(/\\/g, '/')}`).href) main();
+// `pathToFileURL`, never a hand-built `file://${...}` template. The template leaves `~` (every 8.3 short
+// name, so every `%TEMP%` on such a machine) and `#` as they are while the loader percent-encodes them; the two
+// then disagree, `main()` never runs, and the process exits 0 having checked nothing.
+if (isMainModule(import.meta.url)) main();

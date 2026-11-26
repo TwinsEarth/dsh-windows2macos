@@ -18,6 +18,7 @@ import { dirname, join } from 'node:path';
 import os from 'node:os';
 
 import { buildHiddenWrapper, hiddenTaskArgs } from '../src/util/windows-hidden-task.mjs';
+import { isMainModule } from '../src/util/cli.mjs';
 
 /** Parse `--flag value` pairs plus repeatable `--arg`; unknown flags are refused by name. */
 export function parseHiddenTaskArgs(argv) {
@@ -87,7 +88,9 @@ async function main() {
   process.stdout.write(`scheduled ${args.name} every ${args.everyMinutes} min (hidden wrapper ${args.vbsPath})\n`);
 }
 
-const invokedDirectly = process.argv[1] !== undefined && import.meta.url === new URL(`file://${process.argv[1].replace(/\\/g, '/')}`).href;
+// `pathToFileURL`, not a hand-built `file://` template: on `~` and `#` the two encodings disagree and the
+// command would exit 0 without running.
+const invokedDirectly = isMainModule(import.meta.url);
 if (invokedDirectly) {
   main().catch((error) => {
     process.stderr.write(`w2m-hidden-task: ${error?.message ?? error}\n`);

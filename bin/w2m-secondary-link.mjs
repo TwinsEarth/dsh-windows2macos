@@ -42,6 +42,7 @@ import { spawn } from 'node:child_process';
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isMainModule } from '../src/util/cli.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DEFAULTS = Object.freeze({
@@ -228,7 +229,9 @@ async function main() {
   await runSupervisor(options, { log, stopSignal });
 }
 
-if (process.argv[1] !== undefined && import.meta.url === new URL(`file://${process.argv[1].replace(/\\/g, '/')}`).href) {
+// `pathToFileURL`, not a hand-built `file://` template: on `~` and `#` the two encodings disagree and the
+// command would exit 0 without running.
+if (isMainModule(import.meta.url)) {
   main().catch((error) => {
     process.stderr.write(`w2m-secondary-link: ${error?.stack ?? error}\n`);
     process.exit(1);

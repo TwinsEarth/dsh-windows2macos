@@ -36,7 +36,7 @@
 import { readdirSync, statSync, rmSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { pathToFileURL } from 'node:url';
+import { isMainModule } from '../src/util/cli.mjs';
 
 export const DEFAULT_HOME = join(homedir(), '.dsh');
 export const MiB = 1024 * 1024;
@@ -180,4 +180,4 @@ function main(argv) {
  * one `import` away from running.** `pathToFileURL` rather than a hand-built `file://` string, which does not
  * resolve on Windows.
  */
-if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) main(process.argv.slice(2));
+if (isMainModule(import.meta.url)) main(process.argv.slice(2));

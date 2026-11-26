@@ -27,9 +27,8 @@
  */
 
 import { parseArgs } from 'node:util';
-import { pathToFileURL } from 'node:url';
 import { createStunServer, DEFAULT_SOFTWARE } from '../src/relay/stun-server.mjs';
-import { formatError } from '../src/util/cli.mjs';
+import { formatError, isMainModule } from '../src/util/cli.mjs';
 
 const USAGE = `w2m-stun — W2M STUN responder (RFC 5389 Binding server)
 
@@ -167,7 +166,7 @@ function logRequest(entry) {
  * behaved, so the fix gives the others the same one rather than withdrawing the exports: **a subpath that is
  * importable and inert is strictly better than one that is neither.**
  */
-if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isMainModule(import.meta.url)) {
   let server;
   let listen;
   const startedAt = Date.now();

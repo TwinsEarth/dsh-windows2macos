@@ -23,13 +23,14 @@ import { fork } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 
 import { DeviceKey } from '../src/agent/crypto.mjs';
 import { createSignalingServer } from '../src/agent/webrtc/signaling-server.mjs';
 import { createWebRtcTransportPool } from '../src/agent/webrtc/pool.mjs';
 import { createViewClient, createViewTarget } from '../src/agent/view/frame-channel.mjs';
 import { registerRemoteViewRoutes } from '../src/plugin/remote-view-route.mjs';
+import { isMainModule } from '../src/util/cli.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, '..');
@@ -1020,7 +1021,7 @@ async function main() {
   throw new Error(`unknown --mode ${MODE}; use pair, matrix, soak or faults`);
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
+if (isMainModule(import.meta.url)) {
   main().catch((error) => {
     output({
       ok: false,

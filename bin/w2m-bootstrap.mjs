@@ -41,6 +41,7 @@ import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { fleetIdOf, resolveBootstrap } from '../src/plugin/bootstrap.mjs';
 import { decodeFleetKey } from '../src/chatops/fleet-join.mjs';
+import { isMainModule } from '../src/util/cli.mjs';
 
 export const CLI_REFUSAL = Object.freeze({
   BAD_BOOTSTRAP: 'BOOTSTRAP_CLI_BAD_SOURCE',
@@ -295,7 +296,9 @@ async function main() {
   ].join('\n') + '\n');
 }
 
-if (process.argv[1] !== undefined && import.meta.url === new URL(`file://${process.argv[1].replace(/\\/g, '/')}`).href) {
+// `pathToFileURL`, not a hand-built `file://` template: on `~` and `#` the two encodings disagree and the
+// command would exit 0 without running.
+if (isMainModule(import.meta.url)) {
   main().catch((error) => {
     process.stderr.write(`w2m-bootstrap: ${error?.stack ?? error}\n`);
     process.exit(1);

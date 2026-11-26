@@ -21,7 +21,7 @@
  */
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { isMainModule } from '../src/util/cli.mjs';
 
 /** From `@deepseek-ai/dsh-skill`: the only names the loader accepts. */
 export const SKILL_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
@@ -125,4 +125,4 @@ function main(argv) {
   process.exit(problems.length === 0 ? 0 : 1);
 }
 
-if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) main(process.argv);
+if (isMainModule(import.meta.url)) main(process.argv);

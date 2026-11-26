@@ -21,7 +21,7 @@
  */
 import { readFileSync, existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { pathToFileURL } from 'node:url';
+import { isMainModule } from '../src/util/cli.mjs';
 
 const API = 'https://api.github.com';
 
@@ -256,7 +256,7 @@ export async function publishRelease(options) {
  * this session that the same guard had to be corrected**, which is why it is written out here rather than
  * abbreviated.
  */
-if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isMainModule(import.meta.url)) {
   const argv = process.argv.slice(2);
   const arg = (name, dflt) => (argv.includes(name) ? argv[argv.indexOf(name) + 1] : dflt);
   const version = arg('--version');

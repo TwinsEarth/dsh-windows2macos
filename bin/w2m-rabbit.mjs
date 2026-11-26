@@ -18,10 +18,9 @@
  */
 
 import { parseArgs } from 'node:util';
-import { pathToFileURL } from 'node:url';
 import { createRelayServer } from '../src/relay/server.mjs';
 import { normalizeClusterConfig } from '../src/relay/cluster-sync.mjs';
-import { resolveStateDir, formatError } from '../src/util/cli.mjs';
+import { isMainModule, resolveStateDir, formatError } from '../src/util/cli.mjs';
 
 const USAGE = `w2m-rabbit — W2M relay (Rabbit)
 
@@ -349,7 +348,7 @@ const diag = (line) => process.stderr.write(`${line}\n`);
  * behaved, so the fix gives the others the same one rather than withdrawing the exports: **a subpath that is
  * importable and inert is strictly better than one that is neither.**
  */
-if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isMainModule(import.meta.url)) {
   let relay;
   let listenInfo;
   let pairingCode;

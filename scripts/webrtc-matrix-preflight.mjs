@@ -7,7 +7,9 @@
  * block *before* any ICE traffic is attempted.
  *
  * Checks are deliberately side-effect free apart from a short-lived signaling room and one device
- * key read. Nothing is written outside `--out`; the relay token is never printed.
+ * key read. Nothing is written outside `--out`, and neither secret this script is handed -- the relay's
+ * device token or the signaling token -- is printed or written: the signaling URL is reported with its
+ * token struck, and an output line that would echo a URL is struck the same way.
  *
  * Usage:
  *   node scripts/webrtc-matrix-preflight.mjs \
@@ -25,6 +27,8 @@ import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
+
+import { redactSignalingUrl } from '../src/agent/webrtc/signaling.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, '..');
@@ -407,7 +411,7 @@ async function main() {
       machine_name: identity.machine_name ?? null,
       relay_url: (RELAY_OVERRIDE ?? identity.rabbit_url ?? null),
     },
-    signal: SIGNAL,
+    signal: SIGNAL === null ? null : redactSignalingUrl(SIGNAL),
     peer: PEER,
     code_hash: manifest.digest,
     checks,
@@ -424,8 +428,19 @@ async function main() {
   process.exitCode = result.ok ? 0 : 2;
 }
 
+/**
+ * Strikes any `token=` value from text bound for stdout. The verdict above is built field by field; this
+ * covers the one path that echoes text it did not build -- an error whose message repeats its input.
+ * @param {unknown} text
+ * @returns {string}
+ */
+function withoutTokens(text) {
+  return String(text).replace(/token=[A-Za-z0-9_%.-]+/gu, 'token=<redacted>');
+}
+
 main().catch((error) => {
-  process.stdout.write(JSON.stringify({ ok: false, blocked_by: 'environment', error: error?.stack ?? String(error) }, null, 2) + '\n');
+  const failure = { ok: false, blocked_by: 'environment', error: withoutTokens(error?.stack ?? String(error)) };
+  process.stdout.write(`${JSON.stringify(failure, null, 2)}\n`);
   process.exitCode = 2;
 });
 

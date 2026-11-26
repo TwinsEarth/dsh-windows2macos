@@ -1,0 +1,36 @@
+{
+  "version": "3.7.5",
+  "case": "W2M-375-PORTABILITY",
+  "kind": "positive",
+  "requirement": "v3.7.5 portability fixes: (1) scripts/p2p-handshake-check.mjs resolves its default device.json from the shared state-dir resolver instead of a hardcoded Windows user path; (2) findHarnessInstallation accepts the macOS .app bundle layout (<root>/Resources/app.asar + <root>/MacOS/DeepSeek Harness) so restore no longer refuses with BACKUP_RUNTIME_UNAVAILABLE on a machine where the Harness is installed at /Applications; (3) the six-row surface probe retries once with a 2000 ms budget before it publishes fallback:true.",
+  "machines": [
+    "ToFuture"
+  ],
+  "executed_at": "2026-11-26T09:05:00+08:00",
+  "executor": "agent",
+  "task_id": "w2m-task-32-portability-375-2026-11-26",
+  "commands": [
+    ["node", "--test", "--test-force-exit", "--test-concurrency=1", "test/portability-3.7.5.test.mjs"],
+    ["node", "--test", "--test-force-exit", "--test-concurrency=1", "test/client-budget.test.mjs"],
+    ["node", "--test", "--test-force-exit", "--test-concurrency=1", "test/backup-runtime.test.mjs"],
+    ["node", "--test", "--test-force-exit", "--test-concurrency=1", "test/entry-guard.test.mjs"]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "portability_tests": 8,
+      "portability_failed": 0,
+      "client_budget_tests": 4,
+      "client_budget_failed": 0,
+      "backup_runtime_tests": 19,
+      "backup_runtime_failed": 0,
+      "backup_runtime_skipped": 5,
+      "entry_guard_tests": 12,
+      "entry_guard_failed": 0,
+      "hardcoded_device_path_removed": true,
+      "darwin_bundle_candidate": "/Applications/DeepSeek Harness.app/Contents",
+      "probe_retry_budget_ms": 2000
+    }
+  },
+  "notes": "Findings come from the v3.7.3 five-machine run: the handshake script failed with ENOENT on macOS because its --device default named one Windows profile; restore refused on macOS with BACKUP_RUNTIME_UNAVAILABLE while /Applications/DeepSeek Harness.app was installed; and one IM2A loader run failed on assert.equal(diag.fallback, false) after all six 800 ms probes timed out on a cold start. The macOS bundle layout is covered here by a fake install tree under a temporary HOME plus platform:'darwin' (the real Mac check is the v3.7.5 five-machine rerun); the Windows layout and the null case are asserted in the same suite. The probe retry is guarded at source level because lib/client.js is a single browser-bundle factory that no test can import; its behaviour on a live page is covered by test/loader-entry.test.mjs --probes surfaces."
+}
