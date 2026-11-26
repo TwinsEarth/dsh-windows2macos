@@ -59,8 +59,10 @@ export const TOOL_NAMES = Object.freeze([
   'p2p_webrtc_probe',
 ]);
 
-/** Route prefix, reserved for a later panel surface; no route is mounted in this version. */
+/** Route prefix for the one-click repair surface. */
 export const P2P_WEBRTC_ROUTE_PREFIX = '/api/w2m/p2p-webrtc';
+/** POST-only repair route used by the remote desktop panel. */
+export const P2P_WEBRTC_REPAIR_PATH = `${P2P_WEBRTC_ROUTE_PREFIX}/repair`;
 
 /** The patch row id. */
 export const P2P_WEBRTC_ROW_ID = 'dsh-p2p-webrtc';
@@ -920,6 +922,65 @@ export function buildTools({ service, defineTool }) {
 }
 
 /**
+ * Mount the POST-only repair route used by the remote desktop panel.
+ *
+ * The button is allowed to rebuild the shared pool, but never to stop it: stopping the pool would
+ * also disconnect Teams and task delivery, and the panel has no way to tell those consumers. An
+ * already-ready pool therefore answers `already_ready: true` without touching it.
+ *
+ * @param {object} ctx Cordis context
+ * @param {P2PWebRtcService} service the mounted p2p service
+ * @returns {boolean} whether an injectable connection context was available
+ */
+export function registerP2pWebRtcRepairRoute(ctx, service) {
+  if (typeof ctx?.inject !== 'function') return false;
+  ctx.inject(['connection'], (webCtx) => {
+    const registry = webCtx?.connection?.fetch;
+    if (registry === undefined || typeof registry.register !== 'function') return;
+    registry.register({
+      path: P2P_WEBRTC_REPAIR_PATH,
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: async () => {
+        let before = null;
+        try { before = service.status(); } catch { /* status is best-effort */ }
+        if (before?.pool?.ready === true) {
+          return Response.json(
+            { ok: true, already_ready: true, pool: before.pool, status: before },
+            { headers: { 'cache-control': 'no-store' } },
+          );
+        }
+        let result;
+        try {
+          result = await service.start();
+        } catch (error) {
+          result = {
+            ok: false,
+            code: 'WEBRTC_REPAIR_FAILED',
+            detail: error instanceof Error ? error.message : String(error),
+          };
+        }
+        let after = null;
+        try { after = service.status(); } catch { /* status is best-effort */ }
+        const ok = result?.ok === true && after?.pool?.ready === true;
+        const payload = { ...result, ok, pool: after?.pool ?? null, status: after };
+        if (!ok && typeof payload.code !== 'string') {
+          payload.code = 'WEBRTC_REPAIR_FAILED';
+          if (payload.detail === undefined || payload.detail === null) {
+            payload.detail = 'the repair call did not publish a ready shared pool';
+          }
+        }
+        return Response.json(payload, {
+          status: ok ? 200 : 502,
+          headers: { 'cache-control': 'no-store' },
+        });
+      },
+    });
+  });
+  return true;
+}
+
+/**
  * Mount the subplugin.
  *
  * @param {object} ctx Cordis context
@@ -943,6 +1004,7 @@ export async function apply(ctx, config = {}, deps = {}) {
     // desktop / Teams / P2P V2, so a pane unmount must not tear it down.
     void service.dispose();
   });
+  registerP2pWebRtcRepairRoute(ctx, service);
 
   const defineTool =
     typeof deps.defineTool === 'function'

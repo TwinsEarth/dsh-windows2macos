@@ -4722,20 +4722,29 @@ describe('v3.5.6/A1: the 归档 tab inside the backup panel', () => {
 
 
 
-describe('client bundle: remote-view channel labels (P5)', () => {
+describe('client bundle: remote-view action controls', () => {
   const source = fs.readFileSync(BUNDLE_PATH, 'utf8');
 
-  it('names WebRTC and encrypted relay explicitly, with no ambiguous P2P fallback', () => {
-    assert.match(source, /if \(channel === 'webrtc'\) return 'WebRTC'/);
-    assert.match(source, /if \(channel === 'relay'\) return '加密 relay'/);
-    assert.match(source, /if \(channel === 'p2p'\) return '旧 P2P'/);
-    assert.equal(source.includes("'加密中继'"), false);
-  });
-
-  it('preflights pool availability and reads the diagnostics route', () => {
-    assert.match(source, /REMOTE_DIAGNOSTICS_URL = '\/api\/w2m\/remote\/diagnostics'/);
-    assert.match(source, /pool_available === true/);
-    assert.match(source, /WebRTC 未就绪/);
-    assert.match(source, /remoteDirectLabel\(session, diagnostics\)/);
+  it('renders the P2P/Relay switch, the one-click repair entry, and the top-right status', () => {
+    assert.match(source, /REMOTE_REPAIR_URL = '\/api\/w2m\/p2p-webrtc\/repair'/);
+    assert.match(source, /const remoteMode = \(config\) =>/);
+    assert.match(source, /const switchMode = async \(next\) =>/);
+    assert.match(source, /const repairP2P = async \(\) =>/);
+    assert.match(source, /'一键修复 P2P'/);
+    assert.match(source, /role: 'status'/);
+    assert.match(source, /'aria-live': 'polite'/);
+    assert.match(source, /'data-w2m-remote-status': status\.key/);
+    assert.match(source, /label: '已连接'.*state-success-primary/s);
+    assert.match(source, /label: '无法连接'.*state-error-primary/s);
+    assert.match(source, /label: '待连接'.*label-secondary/s);
+    assert.match(source, /switchMode\('p2p'\)/);
+    assert.match(source, /switchMode\('relay'\)/);
+    assert.match(source, /if \(!enabled \|\| !live \|\| session === null\) return undefined;/);
+    assert.match(source, /const ready = enabled && session !== null && frame\?\.data_base64;/);
+    assert.match(source, /const \[repairNote, setRepairNote\] = React\.useState\(null\);/);
+    assert.match(source, /setRepairNote\(\{ tone: 'pending', text: '正在检查 P2P 共享 pool…' \}\);/);
+    assert.match(source, /'P2P 共享 pool 已就绪，无需重建'/);
+    assert.match(source, /'P2P 共享 pool 已重建'/);
+    assert.match(source, /'data-w2m-remote-repair-note': repairNote\.tone/);
   });
 });

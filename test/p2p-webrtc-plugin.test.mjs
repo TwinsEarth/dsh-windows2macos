@@ -23,7 +23,9 @@ import {
   P2P_WEBRTC_MODES,
   P2P_WEBRTC_POOL_CODE,
   P2P_WEBRTC_POOL_OWNER,
+  P2P_WEBRTC_REPAIR_PATH,
   P2P_WEBRTC_ROW_ID,
+  registerP2pWebRtcRepairRoute,
   TOOL_NAMES,
 } from '../src/plugin/p2p-webrtc-plugin.mjs';
 
@@ -48,6 +50,7 @@ function fakeContext() {
   const definitions = [];
   const registered = [];
   const effects = [];
+  const routes = new Map();
   const ctx = {
     logger: { debug: () => {}, info: () => {}, warn: () => {}, error: () => {} },
     tools: {
@@ -57,13 +60,16 @@ function fakeContext() {
       },
     },
     inject(services, callback) {
-      callback({ tools: { register: (definition) => ctx.tools.register(definition) } });
+      callback({
+        tools: { register: (definition) => ctx.tools.register(definition) },
+        connection: { fetch: { register: (route) => routes.set(route.path, route) } },
+      });
     },
     effect(setup) {
       effects.push(setup);
     },
   };
-  return { ctx, definitions, registered, effects };
+  return { ctx, definitions, registered, effects, routes };
 }
 
 function json(value) {
@@ -77,6 +83,72 @@ describe('dsh-p2p-webrtc wiring', () => {
     assert.ok(existsSync(join(ROOT, 'src/plugin/p2p-webrtc-plugin.mjs')));
     assert.equal(pkg.bin['w2m-webrtc-signal'], 'bin/w2m-webrtc-signal.mjs');
     assert.ok(existsSync(join(ROOT, 'bin/w2m-webrtc-signal.mjs')));
+  });
+
+  it('mounts a POST-only repair route and leaves an already-ready pool alone', async () => {
+    const routes = new Map();
+    const ctx = {
+      inject: (_services, callback) => callback({
+        connection: { fetch: { register: (route) => routes.set(route.path, route) } },
+      }),
+    };
+    let starts = 0;
+    const service = {
+      status: () => ({ ok: true, pool: { ready: true, owner: P2P_WEBRTC_POOL_OWNER } }),
+      start: async () => { starts += 1; return { ok: true }; },
+    };
+    assert.equal(registerP2pWebRtcRepairRoute(ctx, service), true);
+    const route = routes.get(P2P_WEBRTC_REPAIR_PATH);
+    assert.ok(route, 'the repair route must be registered');
+    assert.deepEqual(route.methods, ['POST']);
+    const response = await route.fetch({ method: 'POST' });
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.ok, true);
+    assert.equal(body.already_ready, true);
+    assert.equal(starts, 0, 'a ready pool must not be restarted');
+  });
+
+  it('repairs an absent pool and returns 502 when the rebuild is refused', async () => {
+    const routes = new Map();
+    const ctx = {
+      inject: (_services, callback) => callback({
+        connection: { fetch: { register: (route) => routes.set(route.path, route) } },
+      }),
+    };
+    let ready = false;
+    let starts = 0;
+    let refusal = null;
+    const service = {
+      status: () => ({ ok: true, pool: { ready } }),
+      start: async () => {
+        starts += 1;
+        if (refusal !== null) return refusal;
+        ready = true;
+        return { ok: true, state: 'pool-ready', pool: { ready: true } };
+      },
+    };
+    assert.equal(registerP2pWebRtcRepairRoute(ctx, service), true);
+    const route = routes.get(P2P_WEBRTC_REPAIR_PATH);
+
+    const repaired = await route.fetch({ method: 'POST' });
+    assert.equal(repaired.status, 200);
+    const repairedBody = await repaired.json();
+    assert.equal(repairedBody.ok, true);
+    assert.equal(starts, 1);
+
+    ready = false;
+    refusal = {
+      ok: false,
+      code: 'WEBRTC_PROVIDER_UNAVAILABLE',
+      detail: 'providerCommand is required',
+    };
+    const failed = await route.fetch({ method: 'POST' });
+    assert.equal(failed.status, 502);
+    const failedBody = await failed.json();
+    assert.equal(failedBody.ok, false);
+    assert.equal(failedBody.code, 'WEBRTC_PROVIDER_UNAVAILABLE');
+    assert.equal(starts, 2);
   });
 
   it('ships the patch row disabled, with no guessed identity or provider', () => {
@@ -94,7 +166,7 @@ describe('dsh-p2p-webrtc wiring', () => {
   });
 
   it('mounts four tools and stays inert until start', async () => {
-    const { ctx, definitions, registered, effects } = fakeContext();
+    const { ctx, definitions, registered, effects, routes } = fakeContext();
     const dispose = await apply(
       ctx,
       {
@@ -114,6 +186,7 @@ describe('dsh-p2p-webrtc wiring', () => {
     assert.equal(dispose.config.signal_token, '<redacted>');
     assert.equal(JSON.stringify(dispose.config).includes('secret'), false);
     assert.equal(effects.length, 1);
+    assert.ok(routes.has(P2P_WEBRTC_REPAIR_PATH), 'the mounted row registers the repair route');
 
     const statusTool = definitions.find((definition) => definition.name === 'p2p_webrtc_status');
     const status = json(await statusTool.execute({}));

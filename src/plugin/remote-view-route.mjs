@@ -826,14 +826,20 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
         if (body === null || typeof body.enabled !== 'boolean') {
           return Response.json({ ok: false, error: 'a JSON body with {"enabled": true|false} is required' }, { status: 400, headers: NO_STORE });
         }
-        let transport = readCurrentConfig().transport;
+        const current = readCurrentConfig();
+        let transport = current.transport;
+        let transportChanged = false;
         if (body.transport !== undefined) {
           if (body.transport !== 'auto' && body.transport !== 'webrtc' && body.transport !== 'relay') {
             return Response.json({ ok: false, error: 'transport must be auto, webrtc or relay' }, { status: 400, headers: NO_STORE });
           }
           transport = body.transport;
+          transportChanged = transport !== current.transport;
         }
-        if (body.enabled === false) await stopActive();
+        // A transport switch must not keep the old channel alive underneath the new setting: the
+        // panel labels the current mode from `/config`, while the session object still describes
+        // WebRTC/relay. Stop first, then persist, so the next `/start` uses the new transport.
+        if (body.enabled === false || transportChanged) await stopActive();
         writeConfig(file, body.enabled, transport);
         return Response.json({ ok: true, enabled: body.enabled, transport }, { headers: NO_STORE });
       },

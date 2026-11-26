@@ -101,6 +101,24 @@ describe('remote-view host routes', () => {
     assert.equal(h.dialed, null, 'auto must not treat the presence of a p2p node as consent');
   });
 
+  it('stops the live channel when the requested transport mode changes', async () => {
+    const h = harness({ allowLegacyP2P: true });
+    await h.routes.get('/api/w2m/remote/config').fetch(request({ enabled: true, transport: 'auto' }));
+    const started = await h.routes.get('/api/w2m/remote/start').fetch(request({ machine_id: 'm-mode' }));
+    assert.equal(started.status, 200);
+    assert.equal(h.sent[0].type, 'view.hello');
+
+    const switched = await h.routes.get('/api/w2m/remote/config').fetch(request({ enabled: true, transport: 'relay' }));
+    assert.equal(switched.status, 200);
+    const switchedBody = await switched.json();
+    assert.equal(switchedBody.transport, 'relay');
+    assert.equal(h.sent.some((frame) => frame.type === 'view.stop'), true, 'changing mode must stop the old channel');
+    const after = await h.routes.get('/api/w2m/remote/config').fetch(request({}, 'GET'));
+    const afterBody = await after.json();
+    assert.equal(afterBody.transport, 'relay');
+    assert.equal(afterBody.session, null);
+  });
+
   it('reports row transport defaults and the live pool in /config, and lets json win', async () => {
     const { writeFileSync } = await import('node:fs');
     const routes = new Map();

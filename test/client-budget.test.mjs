@@ -48,8 +48,11 @@ const BUDGET = Object.freeze({
   // 616,521 bytes / 10,166 lines, so this left 479 bytes / 34 lines of reviewed headroom.
   // The opt-in GPW sidebar row then added 3,777 bytes / 74 lines (preference, handler, mount/unmount and
   // the pin control): measured 620,298 bytes / 10,240 lines, leaving 702 bytes / 10 lines of headroom.
-  bytes: 621_000,
-  lines: 10_250,
+  // v3.7.7 raised it by 11 KB / 190 lines for the remote desktop P2P/Relay switch, the one-click P2P
+  // repair result note and the three-state status: measured 629,998 bytes / 10,412 lines, leaving
+  // 2,002 bytes / 28 lines of reviewed headroom.
+  bytes: 632_000,
+  lines: 10_440,
   largestFunctionLines: 1_200, // current largest is 832 (BackupPanelView); rule: max(largest + 100, 1_200)
 });
 

@@ -1,0 +1,47 @@
+{
+  "version": "3.7.7",
+  "case": "W2M-377-REMOTE-DESKTOP-CONTROLS",
+  "kind": "positive",
+  "requirement": "v3.7.7 remote desktop: a P2P/Relay transport switch in the control row with the selected transport persisted through /api/w2m/remote/config and the old channel stopped on change; a one-click P2P repair that always produces a visible pending/success/already_ready/error result instead of a silent no-op; and a top-right connection state that is gray while idle, green only after an active session with a frame, and red after an error.",
+  "machines": [
+    "TOFUTURE"
+  ],
+  "executed_at": "2026-11-27T00:17:14+08:00",
+  "executor": "agent",
+  "task_id": "w2m-377-remote-desktop-controls-2026-11-27",
+  "commands": [
+    ["node", "--check", "lib/client.js"],
+    ["node", "--test", "--test-force-exit", "test/client-budget.test.mjs", "test/client-bundle.test.mjs", "test/p2p-webrtc-plugin.test.mjs", "test/remote-view-route.test.mjs", "test/remote-view-3.7.6.test.mjs"],
+    ["node", "--test", "--test-force-exit", "test/p2p-v2.test.mjs", "test/claims.test.mjs", "test/agent-plugins.test.mjs", "test/installed-version.test.mjs"],
+    ["node", "scripts/preflight.mjs"]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "focused_tests": 192,
+      "focused_failed": 0,
+      "version_consistency_tests": 102,
+      "version_consistency_failed": 0,
+      "version_consistency_skipped": 4,
+      "client_bundle_bytes": 629998,
+      "client_bundle_lines": 10412,
+      "client_bundle_budget_bytes": 632000,
+      "client_bundle_budget_lines": 10440,
+      "cdp_repair_note_visible": true,
+      "cdp_repair_note_text": "P2P 共享 pool 已就绪，无需重建",
+      "cdp_repair_note_rgb": "rgb(34, 197, 94)",
+      "cdp_repair_note_rect": "968x18",
+      "remote_status_idle_rgb": "rgb(97, 102, 107)",
+      "transport_default": "webrtc",
+      "preflight": "GREEN",
+      "preflight_pass": 16,
+      "preflight_fail": 0,
+      "preflight_unverifiable": 1
+    },
+    "runtime_blockers": [
+      "P2P direct connection to IM2A still returns WEBRTC_UNAVAILABLE; Relay connects normally.",
+      "The repair route is idempotent when the local shared pool is already ready and does not force a stop/start; a forced rebuild would need a separate reviewed force contract."
+    ]
+  },
+  "notes": "The repair note was observed through CDP on the visible remote-view mount after a real button click: the pending text switched to the green already_ready sentence and remained visible in the rendered React tree. The local shared pool was ready (owner dsh-p2p-webrtc), so the route correctly returned already_ready rather than rebuilding. P2P to the remote IM2A target is still a target-side availability problem, not something the local repair button can fix."
+}

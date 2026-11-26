@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented here.
 
+## [3.7.7] — 2026-11-27
+
+### feat(remote-view): P2P/Relay 切换、一键修复 P2P 与三态连接状态
+
+- **模式切换**：远程桌面控制行新增 P2P / Relay 分段按钮；切换经 `POST /api/w2m/remote/config` 持久化 `transport: webrtc|relay`，成功后清空旧会话画面。所属模式来自 `/config`，不是上一次会话对象。
+- **一键修复 P2P**：按钮调用 `POST /api/w2m/p2p-webrtc/repair`；共享 pool 未就绪时重建，已就绪时幂等返回 `already_ready`。点击立即显示「正在检查 P2P 共享 pool…」，成功显示「P2P 共享 pool 已就绪，无需重建」或「P2P 共享 pool 已重建」，失败显示红色「修复失败：<code>」；不再出现点击后毫无反馈的静默路径。
+- **三态状态**：右上角状态点为「待连接」（灰）、「已连接」（绿，必须有活动会话与首帧）、「无法连接」（红，错误被设置）；带 `role="status"` 与 `aria-live="polite"`。
+- **切换安全**：`remote/config` 检测到 transport 变化时先停止旧通道，再写配置；避免面板显示新模式、底下仍跑旧 WebRTC/relay 会话。
+- **边界**：修复按钮不会强制 stop/start 已就绪的共享 pool，避免打断 Teams、任务投递等其他消费者；需要强制重建时必须另做带确认的 force 语义。
+- **明确不含**：不含 relay 部署、视频编码、远控输入或文件传输；仍为只读远程查看。
+- **测试**：`client-bundle`、`p2p-webrtc-plugin`、`remote-view-route` 共 180/180；`client-budget` 通过（bundle 629,998 B / 10,412 行，预算同步到 632,000 B / 10,440 行）。全量 preflight 16 pass / 0 fail / 1 个已接受的 UNVERIF（本机缺 bundled runtime 布局），EXIT 0。
+
 ## [3.7.6] — 2026-11-26
 
 ### feat(remote-view): 画面大小跟着通道走，relay 上限 100 KiB（含加密信封）
