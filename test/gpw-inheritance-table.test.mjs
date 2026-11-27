@@ -14,7 +14,7 @@ const D = (path) => ({ path, effect: 'deny', source: 'panel' });
  */
 const CASES = [
   { id: 'C01', target: '\\\\?\\C:\\work\\sub\\a.txt', rules: [W('C:\\work')], expect: DECISION.ALLOW },
-  { id: 'C02', target: '\\\\?\\UNC\\srv\\share\\a.txt', rules: [W('\\\\srv\\share')], expect: DECISION.ALLOW, skip: 'UNC 解析在 canonicalKey 中尚未正确归一（待修复）' },
+  { id: 'C02', target: '\\\\?\\UNC\\srv\\share\\a.txt', rules: [W('\\\\srv\\share')], expect: DECISION.ALLOW },
   { id: 'C04', target: 'C:\\work. \\sub\\a.txt', rules: [W('C:\\work')], expect: DECISION.ALLOW },
   { id: 'C06', target: 'C:\\WORK~1\\sub\\a.txt', rules: [W('C:\\work')], expect: DECISION.ALLOW, skip: '需要 GetLongPathName（FS 层未接入）' },
   { id: 'C13', target: 'C:\\wor\u212A\\x', rules: [W('C:\\work')], expect: DECISION.PASS },
@@ -45,6 +45,12 @@ describe('GPW 继承表驱动（C01–C48 可执行子集）', () => {
       if (testCase.reason !== undefined) assert.equal(verdict.reason, testCase.reason);
     });
   }
+
+  it('C02 补充：UNC 与扩展 UNC 归一到同一键', () => {
+    assert.equal(canonicalKey('\\\\?\\UNC\\srv\\share\\a.txt', { platform }), '\\\\srv\\share\\a.txt');
+    assert.equal(canonicalKey('\\\\srv\\share', { platform }), '\\\\srv\\share');
+    assert.equal(canonicalKey('srv\\share', { platform }), 'srv\\share', 'a relative path must not gain a UNC marker');
+  });
 
   it('C13 补充：U+212A 不能被折叠成 k 后放行', () => {
     assert.equal(canonicalKey('C:\\wor\u212A\\x', { platform }), 'c:\\wor\u212a\\x');

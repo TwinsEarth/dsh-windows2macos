@@ -418,6 +418,10 @@ describe('dsh-teams wiring', () => {
     assert.equal('device_token' in described, false);
     assert.equal(described.row, 'dsh-teams');
     assert.deepEqual(described.tools, [...TOOL_NAMES]);
+    const lowered = normalizePluginConfig({ dataMaxAttempts: 7 });
+    assert.equal(lowered.data_max_attempts, 7);
+    assert.equal(describeConfig(lowered).data_max_attempts, 7);
+    assert.equal(normalizePluginConfig({ dataMaxAttempts: 99 }).data_max_attempts, 33);
   });
 
   it('returns a project id that cannot escape the URL path', () => {

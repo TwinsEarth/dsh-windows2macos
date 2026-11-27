@@ -2,6 +2,28 @@
 
 All notable changes to this project are documented here.
 
+## [3.7.8] — 2026-11-28
+
+### feat(remote-view): 一键打通 P2P（provider 自动发现 + 三次重试）
+
+- **一键打通**：原「一键修复 P2P」升级为「一键打通 P2P」。一次点击完成四阶段：检查 WebRTC provider 与共享 pool → 切换并持久化 `transport: webrtc` → 建立 P2P 会话 → 失败按阶段重试；不再出现“pool 修好了但目标仍连不上”的假成功。
+- **有界重试**：可重试错误（`WEBRTC_POOL_UNAVAILABLE`、`WEBRTC_POOL_START_FAILED`、`WEBRTC_PREPARE_TIMEOUT`、`WEBRTC_PREPARE_FAILED`、`WEBRTC_ACK_FAILED`、`P2P_UNAVAILABLE`）最多 3 次，退避 700/1400ms，重试前重新 repair；确定性错误（provider 缺失、owner 冲突、viewer/target 不可用等）立即停止并显示 `打通失败：<code>（已尝试 N 次）`。
+- **provider 自动发现**：宿主 `POST /api/w2m/p2p-webrtc/repair` 在 `providerCommand` 为空时，按标准目录探测已安装的 `node-datachannel` provider，并只把结果传入本次 start；不安装、不下载、不修改 profile。探测失败返回 `WEBRTC_PROVIDER_UNAVAILABLE` 与 `checked` 目录，便于定位。
+- **状态与语义**：按钮、四阶段进度、成功（`P2P 已打通：<target>（<channel>）`）、失败（`打通失败：CODE（已尝试 N 次）`）和空目标提示均可读；远程画面文案同步改为「一键打通 P2P」或「连接」。
+- **池化边界**：repair 仍不强制 stop/start 已就绪的共享 pool，避免打断 Teams/任务投递；只有未就绪时才重建。自动发现仅影响 repair 路径，`autoStart` 仍保持“无 provider 就明确拒绝”的契约。
+- **测试**：新增自动发现、探测失败、标准目录三组宿主测试；client-bundle 断言改为 `punchP2P` / `一键打通 P2P` / 3 次尝试；client-budget 按本次 633,108 B / 10,475 行更新为 636,000 B / 10,520 行。
+- **明确不含**：不含 relay 部署、视频编码、远控输入、文件传输；不改用户的 signal/token/TURN 凭据；provider 仍需本机已安装 `node-datachannel`。
+
+### fix(audit): 参数暴露、desktop transport 回退与真机链路收口
+
+- **desktop 非法 transport**：非法 `transport` 不再静默回退；`/api/w2m/remote/config`、diagnostics 和面板同时返回 `W2M_DESKTOP_TRANSPORT_INVALID`、原始值与 `fallback: webrtc`，启动不中断。存量 profile 升级后远程桌面不会整体不可用，同时用户能明确看到配置未生效。
+- **参数可配置**：主 `w2m` row 补 `stateDir` / `projectDir` / `fleetKey` / `fleetKeyPolicy`；P2P WebRTC 补 `rabbitUrl` / `preferP2p` / `maxRttMs` / `connectTimeoutMs` / `handshakeTimeoutMs` / `peerTimeoutMs` / `statsPollMs` 的读取与边界；P2P V2 补 `allowedRootsMode`；Teams `dataMaxAttempts` 可在 1..33 内调低，33 仍是不可突破的硬上限；dsh-fix 补 `objectsRoot` / `statePath`。
+- **错误语义**：目标端 provider 脚本缺失时返回 `WEBRTC_PROVIDER_SCRIPT_MISSING`，不再被误报为信令超时；`WEBRTC_SIGNAL_PEER_TIMEOUT` 加入一键打通的可重试集合；远程目标 roster 改为 10 秒轮询，目标上线后不需要重开面板。
+- **回收与门禁**：远程桌面行卸载时按需回收 active session / peer handler；GPW 扩展 UNC 前缀（`\\?\UNC\...`）不再绕过黑白名单；全量测试隔离不再写入真实 `~/.w2m/devices.json` / `ledger.jsonl`。
+- **验证**：发布门禁 `4,921 tests / 4,909 pass / 0 fail / 12 skip / 806.8 s`（GREEN，16 pass / 0 fail / 1 accepted UNVERIF）；独立全量审计 `5,009 tests / 4,997 pass / 0 fail / 12 skip / 1,936.55 s`；定向 client bundle + budget `147/147`；remote-view `25/25`；P2P WebRTC `23/23`；P2P V2 `35/35`；Teams `35/35`；row 字段补齐 `29`（28 pass / 1 skip）+ `176/176`。
+- **真机证据**：ToFuture → macmini 的加密 Relay 会话成功（帧计数 96,998 / 97,418，画面黑屏由 macmini 锁屏导致）；P2P 一键打通面板显示“已尝试 3 次”但仍 `WEBRTC_SIGNAL_PEER_TIMEOUT`；Teams UI 因 ToFuture 锁屏未取得成功截图。证据目录 `E:\DBH\W2M-UI-EVIDENCE-2026-11-28`。
+- **明确不含**：不含 relay 部署；不把 P2P/Teams 的失败真机链路写成成功；发布动作由用户本次明确授权，只覆盖 tag、npm、GitHub Release、GitHub Packages。
+
 ## [3.7.7] — 2026-11-27
 
 ### feat(remote-view): P2P/Relay 切换、一键修复 P2P 与三态连接状态

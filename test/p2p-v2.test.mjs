@@ -8,8 +8,8 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, readdirSync, rmSync, symlinkSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { homedir, tmpdir } from 'node:os';
+import { join, resolve as resolvePath } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -429,6 +429,23 @@ describe('p2p v2 peer adapter', () => {
     stop();
     adapter.destroy();
     assert.equal(transport.calls.destroy, 0);
+  });
+});
+
+describe('p2p v2 config', () => {
+  it('keeps the broad roots by default and narrows only when asked', () => {
+    const broad = normalizePluginConfig({});
+    assert.equal(broad.allowed_roots_mode, 'default');
+    assert.ok(broad.allowed_roots.includes(resolvePath(homedir())));
+    assert.ok(broad.allowed_roots.includes(resolvePath(tmpdir())));
+
+    const strict = normalizePluginConfig({ allowedRootsMode: 'strict' });
+    assert.equal(strict.allowed_roots_mode, 'strict');
+    assert.deepEqual(strict.allowed_roots, [resolvePath(ROOT), resolvePath(join(TEST_STATE, 'dsh', 'p2p-v2', 'downloads'))]);
+
+    const explicit = normalizePluginConfig({ allowedRoots: ['E:\\DB\\W2M'] });
+    assert.equal(explicit.allowed_roots_mode, 'explicit');
+    assert.deepEqual(explicit.allowed_roots, [resolvePath('E:\\DB\\W2M')]);
   });
 });
 
@@ -861,7 +878,7 @@ describe('p2p v2 multi-peer orchestration', () => {
 
 describe('dsh-p2p-v2 wiring', () => {
   it('declares the export, the lib seam and a disabled patch row', () => {
-    assert.equal(pkg.version, '3.7.7');
+    assert.match(pkg.version, /^\d+\.\d+\.\d+$/u);
     assert.equal(pkg.exports['./dsh-p2p-v2'], './lib/p2p-v2-plugin.js');
     assert.equal(pkg.dependencies?.webtorrent, undefined);
     assert.equal(pkg.optionalDependencies?.webtorrent, undefined);

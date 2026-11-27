@@ -128,6 +128,8 @@ export class TeamsService {
             pool: deps.webrtcPool,
             stateDir: nonEmptyString(config.state_dir) ?? undefined,
             onAlert: deps.onDataPlaneAlert,
+            dataRetryDelayMs: config.data_retry_delay_ms,
+            dataMaxAttempts: config.data_max_attempts,
           })
         : null);
     this._lazyDataPlane = null;
@@ -397,6 +399,8 @@ export class TeamsService {
       pool,
       stateDir: nonEmptyString(this.config.state_dir) ?? undefined,
       onAlert: this.onDataPlaneAlert,
+      dataRetryDelayMs: this.config.data_retry_delay_ms,
+      dataMaxAttempts: this.config.data_max_attempts,
     });
     return this._lazyDataPlane;
   }

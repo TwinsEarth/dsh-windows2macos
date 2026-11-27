@@ -9,6 +9,9 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { createRelayServer } from '../src/relay/server.mjs';
 import {
@@ -61,12 +64,14 @@ function request(url, { method = 'GET', token, body } = {}) {
 }
 
 async function withRelay(fn) {
-  const relay = createRelayServer({ logger: null, operatorToken: OP });
+  const stateDir = mkdtempSync(join(tmpdir(), 'w2m-p2p-signaling-'));
+  const relay = createRelayServer({ logger: null, operatorToken: OP, stateDir, persist: true });
   await relay.listen({ host: '127.0.0.1', port: 0 });
   try {
     return await fn(relay);
   } finally {
     await relay.close();
+    rmSync(stateDir, { recursive: true, force: true });
   }
 }
 
@@ -285,7 +290,8 @@ describe('p2p signalling: routes', () => {
   it('does not persist announcements across a relay restart', async () => {
     // A candidate is a NAT mapping; a restart guarantees the mapping is gone. Serving
     // it after a restart would send a peer into a punch that cannot possibly work.
-    const first = createRelayServer({ logger: null, operatorToken: OP });
+    const stateDir = mkdtempSync(join(tmpdir(), 'w2m-p2p-signaling-restart-'));
+    const first = createRelayServer({ logger: null, operatorToken: OP, stateDir, persist: true });
     await first.listen({ host: '127.0.0.1', port: 0 });
     const device = await pairDevice(first, 'machine-a');
     await request(`${first.url}/v1/peer/announce`, {
@@ -296,7 +302,7 @@ describe('p2p signalling: routes', () => {
     assert.equal((await request(`${first.url}/v1/peer/machine-a`, { token: device.token })).status, 200);
     await first.close();
 
-    const second = createRelayServer({ logger: null, operatorToken: OP });
+    const second = createRelayServer({ logger: null, operatorToken: OP, stateDir, persist: true });
     await second.listen({ host: '127.0.0.1', port: 0 });
     try {
       const after = await request(`${second.url}/v1/peer/machine-a`, { token: device.token });
@@ -305,6 +311,7 @@ describe('p2p signalling: routes', () => {
       assert.equal(health.json.peers_announced, 0);
     } finally {
       await second.close();
+      rmSync(stateDir, { recursive: true, force: true });
     }
   });
 });

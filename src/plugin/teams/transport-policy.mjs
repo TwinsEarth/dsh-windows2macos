@@ -27,6 +27,9 @@ export const TEAM_DATA_CHANNEL = 'webrtc-v1';
 /** The operator's fixed ceiling. A caller cannot raise it by configuration. */
 export const TEAM_DATA_MAX_ATTEMPTS = 33;
 
+/** The floor: a transfer must be attempted at least once, or it was never a transfer. */
+export const TEAM_DATA_MIN_ATTEMPTS = 1;
+
 /** Stable reason codes, so a caller can branch without parsing prose. */
 export const TEAM_TRANSPORT_CODE = Object.freeze({
   CONTROL_RELAY_FAILED: 'TEAM_CONTROL_RELAY_FAILED',
@@ -139,19 +142,28 @@ export function classifyTeamPayload(input = {}) {
 }
 
 /**
- * Normalize the timing knobs. The attempt ceiling is not a knob.
+ * Normalize the timing knobs and the attempt count.
  *
- * @param {{dataRetryDelayMs?: number}} [config]
+ * `dataMaxAttempts` is a bounded dial, not a free knob: the operator may lower it to fail faster on
+ * a bad link, but `TEAM_DATA_MAX_ATTEMPTS` remains the ceiling. Values below one are clamped to one:
+ * a zero-attempt transfer would report "exhausted" without ever trying.
+ *
+ * @param {{dataRetryDelayMs?: number, dataMaxAttempts?: number, data_max_attempts?: number}} [config]
  * @returns {{control_channel: string, data_channel: string, data_max_attempts: number,
  *   data_retry_delay_ms: number}}
  */
 export function normalizeTeamTransportPolicy(config = {}) {
-  const rawDelay = Number(config?.dataRetryDelayMs);
+  const rawDelay = Number(config?.dataRetryDelayMs ?? config?.data_retry_delay_ms);
   const delay = Number.isFinite(rawDelay) && rawDelay >= 0 ? Math.min(5_000, rawDelay) : 1_000;
+  const rawAttempts = Number(config?.dataMaxAttempts ?? config?.data_max_attempts);
+  const attempts =
+    Number.isFinite(rawAttempts) && rawAttempts >= TEAM_DATA_MIN_ATTEMPTS
+      ? Math.min(TEAM_DATA_MAX_ATTEMPTS, Math.round(rawAttempts))
+      : TEAM_DATA_MAX_ATTEMPTS;
   return {
     control_channel: TEAM_CONTROL_CHANNEL,
     data_channel: TEAM_DATA_CHANNEL,
-    data_max_attempts: TEAM_DATA_MAX_ATTEMPTS,
+    data_max_attempts: attempts,
     data_retry_delay_ms: delay,
   };
 }

@@ -89,6 +89,11 @@ export function normalizePluginConfig(config = {}) {
   const rawDelay = Number(raw.dataRetryDelayMs ?? raw.data_retry_delay_ms);
   const dataRetryDelayMs =
     Number.isFinite(rawDelay) && rawDelay >= 0 ? Math.min(5_000, Math.round(rawDelay)) : 1_000;
+  const rawAttempts = Number(raw.dataMaxAttempts ?? raw.data_max_attempts);
+  const dataMaxAttempts =
+    Number.isFinite(rawAttempts) && rawAttempts >= 1
+      ? Math.min(TEAM_DATA_MAX_ATTEMPTS, Math.round(rawAttempts))
+      : TEAM_DATA_MAX_ATTEMPTS;
   return {
     rabbit_url: rabbitUrl,
     state_dir: stateDir,
@@ -97,6 +102,7 @@ export function normalizePluginConfig(config = {}) {
     project_id_input: rawProject ?? null,
     stale_after_ms: staleAfterMs,
     data_retry_delay_ms: dataRetryDelayMs,
+    data_max_attempts: dataMaxAttempts,
     auto_start: raw.autoStart === true || raw.auto_start === true,
     tool_count: TOOL_NAMES.length,
   };
@@ -121,7 +127,7 @@ export function describeConfig(config = {}) {
     data_retry_delay_ms: config.data_retry_delay_ms,
     control_channel: TEAM_CONTROL_CHANNEL,
     data_channel: TEAM_DATA_CHANNEL,
-    data_max_attempts: TEAM_DATA_MAX_ATTEMPTS,
+    data_max_attempts: config.data_max_attempts ?? TEAM_DATA_MAX_ATTEMPTS,
     auto_start: config.auto_start === true,
     teams_v2_version: TEAMS_V2_VERSION,
     tools: [...TOOL_NAMES],
@@ -435,7 +441,7 @@ export function buildTools({ service, defineTool, output, v2 } = {}) {
       name: 'w2m_team_status',
       description:
         'Report the Teams view: the two-plane transport policy (control over relay TCP, bulk data over ' +
-        'WebRTC with 33 attempts and an alert on exhaustion), the pairing/relay state, the machine ' +
+        'WebRTC with a configured attempt count (default 33, never above it) and an alert on exhaustion), the pairing/relay state, the machine ' +
         'roster with online/stale presence and user info, the shared project rooms this machine can ' +
         'read, local joint-plan summaries, and an index of the existing collaboration tools. Read-only; ' +
         'it never approves or dispatches.',
@@ -502,7 +508,7 @@ export function buildTools({ service, defineTool, output, v2 } = {}) {
       name: 'w2m_team_artifact',
       description:
         'Send one artifact to a paired machine over the Teams data plane: WebRTC DataChannel on the ' +
-        'shared pool, exactly 33 attempts, no relay fallback. On exhaustion it returns ' +
+        'shared pool, up to the configured attempt count (default 33, never above it), no relay fallback. On exhaustion it returns ' +
         'TEAM_DATA_P2P_EXHAUSTED with an alert. The receiver writes the verified bytes through its ' +
         'artifact sink. This moves bytes; it never approves or dispatches work.',
       parameters: {
@@ -583,7 +589,7 @@ export async function apply(ctx, config = {}, deps = {}) {
   const v2 = deps.v2 ?? createTeamsV2Service({ stateDir: cfg.state_dir });
   ctx?.logger?.info?.(
     `${name}: configured; relay=${safeTeamRelayUrl(cfg.rabbit_url) || 'device-or-env'} room=${cfg.project_id} ` +
-      `control=${TEAM_CONTROL_CHANNEL} data=${TEAM_DATA_CHANNEL} max_attempts=${TEAM_DATA_MAX_ATTEMPTS}`,
+      `control=${TEAM_CONTROL_CHANNEL} data=${TEAM_DATA_CHANNEL} max_attempts=${cfg.data_max_attempts}`,
   );
 
   let disposed = false;

@@ -1,0 +1,38 @@
+{
+  "version": "3.7.8",
+  "case": "W2M-378-P2P-ONE-CLICK-PUNCH",
+  "kind": "positive",
+  "requirement": "v3.7.8 remote desktop: the former one-click P2P repair becomes a one-click P2P punch that checks the provider and shared pool, persists transport=webrtc, attempts a real /api/w2m/remote/start, retries bounded transient failures, and never reports success until a session is established; the host repair route discovers an already-installed node-datachannel provider only when providerCommand is empty, without installing or editing the profile.",
+  "machines": ["TOFUTURE"],
+  "executed_at": "2026-11-27T18:45:00+08:00",
+  "executor": "agent",
+  "task_id": "w2m-378-p2p-one-click-punch-2026-11-27",
+  "commands": [
+    ["node", "--check", "lib/client.js"],
+    ["node", "--test", "--test-force-exit", "test/client-budget.test.mjs", "test/client-bundle.test.mjs", "test/p2p-webrtc-plugin.test.mjs", "test/remote-view-route.test.mjs", "test/remote-view-3.7.6.test.mjs"],
+    ["node", "--test", "--test-force-exit", "test/claims.test.mjs"]
+  ],
+  "result": {
+    "outcome": "ok",
+    "assertions": {
+      "focused_tests": 195,
+      "focused_failed": 0,
+      "claims_tests": 45,
+      "claims_skipped": 4,
+      "client_bundle_bytes": 633108,
+      "client_bundle_lines": 10475,
+      "client_bundle_budget_bytes": 636000,
+      "client_bundle_budget_lines": 10520,
+      "client_bundle_budget_headroom_bytes": 2892,
+      "client_bundle_budget_headroom_lines": 45,
+      "repair_stages": ["provider_pool", "transport", "start", "retry"],
+      "punch_attempts": 3,
+      "preflight": "pending"
+    },
+    "runtime_blockers": [
+      "The P2P one-click punch was exercised at the code and route-contract level; a live UI punch from TOFUTURE to a remote target was not re-executed after the DSH restart.",
+      "The local profile was repaired separately and the standalone pool reached pool-ready; that profile edit is not part of the package artifact."
+    ]
+  },
+  "notes": "The focused suite includes client budget, client bundle, p2p-webrtc plugin, remote-view routes and remote-view warm-up/diagnostics. The claims suite was re-run after the CHANGELOG entry so package.json, CHANGELOG and manifest versions agree. Preflight and packed-artifact verification are recorded in preflight-3.7.8.log once run."
+}

@@ -31,7 +31,8 @@ const registered = new WeakSet();
  * @param {object} ctx Cordis context
  * @param {{stateDir?:string, p2p?:object|null, getPool?:()=>object|null, getPoolState?:()=>object|null,
  *   transport?:'auto'|'webrtc'|'relay', allowLegacyP2P?:boolean,
- *   prepareTimeoutMs?:number, handshakeTimeoutMs?:number}} [deps]
+ *   prepareTimeoutMs?:number, handshakeTimeoutMs?:number, ackPollMs?:number,
+ *   punchAttempts?:number, punchBackoffMs?:number}} [deps]
  *   `getPool` is optional: when omitted, the route resolves the process-wide shared pool on every
  *   `/start`, so a root row mounted before the pool exists is not frozen to relay. Row options are
  *   defaults only: a `transport` written in `remote-view.json` always wins; when the file exists
@@ -54,6 +55,15 @@ export function registerDesktop(ctx, deps = {}) {
   }
   if (Number.isInteger(deps.handshakeTimeoutMs) && deps.handshakeTimeoutMs > 0) {
     options.handshakeTimeoutMs = deps.handshakeTimeoutMs;
+  }
+  if (Number.isInteger(deps.ackPollMs) && deps.ackPollMs > 0) {
+    options.ackPollMs = deps.ackPollMs;
+  }
+  if (Number.isInteger(deps.punchAttempts) && deps.punchAttempts > 0) {
+    options.punchAttempts = deps.punchAttempts;
+  }
+  if (Number.isInteger(deps.punchBackoffMs) && deps.punchBackoffMs > 0) {
+    options.punchBackoffMs = deps.punchBackoffMs;
   }
   // Omit `getPool` when the caller has none: `remote-view-route` then falls back to the process-wide
   // registry at request time. Passing `() => null` here would freeze the root row to relay forever if
@@ -96,7 +106,8 @@ export function registerDesktopHealthRoute(ctx) {
  *
  * @param {object} ctx
  * @param {{transport?:'auto'|'webrtc'|'relay', allowLegacyP2P?:boolean,
- *   prepareTimeoutMs?:number, handshakeTimeoutMs?:number}} [config] Row config, used only when
+ *   prepareTimeoutMs?:number, handshakeTimeoutMs?:number, ackPollMs?:number,
+ *   punchAttempts?:number, punchBackoffMs?:number}} [config] Row config, used only when
  *   `remote-view.json` does not exist yet.
  */
 export function apply(ctx, config = {}) {
@@ -116,6 +127,15 @@ export function apply(ctx, config = {}) {
   }
   if (Number.isInteger(row.handshakeTimeoutMs) && row.handshakeTimeoutMs > 0) {
     options.handshakeTimeoutMs = row.handshakeTimeoutMs;
+  }
+  if (Number.isInteger(row.ackPollMs) && row.ackPollMs > 0) {
+    options.ackPollMs = row.ackPollMs;
+  }
+  if (Number.isInteger(row.punchAttempts) && row.punchAttempts > 0) {
+    options.punchAttempts = row.punchAttempts;
+  }
+  if (Number.isInteger(row.punchBackoffMs) && row.punchBackoffMs > 0) {
+    options.punchBackoffMs = row.punchBackoffMs;
   }
   const status = registerDesktop(ctx, options);
   registerDesktopHealthRoute(ctx);

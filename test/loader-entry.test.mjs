@@ -716,7 +716,7 @@ describe('loader entry: the packed artifact, mounted by the real Loader', () => 
     assert.equal(diag.fallback, false, `the probes answer for themselves: ${JSON.stringify(diag)}`);
     assert.equal(diag.available?.journal, true, `the queue-journal row is enabled in this profile: ${JSON.stringify(diag.reasons)}`);
     assert.equal(diag.available?.decisions, true, `the decision-center row is enabled in this profile: ${JSON.stringify(diag.reasons)}`);
-    assert.equal(base.surfaces?.journalChip, true, 'the queue-journal chip is in the composer');
+    assert.equal(base.surfaces?.journalChip, true, `the queue-journal chip is in the composer; surfaces=${JSON.stringify(base.surfaces)}`);
     assert.equal(base.surfaces?.decisionInbox, true, 'the decision inbox badge is in the page');
     assert.ok(bootContext !== null, 'the throwaway profile is installed');
     const { installation: mounted, home, profileDir, overlayPath, env, cwd } = bootContext;

@@ -54,12 +54,34 @@ describe('teams transport policy', () => {
     assert.equal(classifyTeamPayload({}).needs_review, true);
   });
 
-  it('does not let configuration lower the 33-attempt ceiling', () => {
-    const policy = normalizeTeamTransportPolicy({ dataMaxAttempts: 1, dataRetryDelayMs: -5 });
-    assert.equal(policy.data_max_attempts, 33);
+  it('lowers attempts within 1..33 and never lets configuration raise the ceiling', () => {
+    assert.equal(normalizeTeamTransportPolicy({ dataMaxAttempts: 1, dataRetryDelayMs: -5 }).data_max_attempts, 1);
+    assert.equal(normalizeTeamTransportPolicy({ dataMaxAttempts: 7 }).data_max_attempts, 7);
+    assert.equal(normalizeTeamTransportPolicy({ dataMaxAttempts: 40 }).data_max_attempts, TEAM_DATA_MAX_ATTEMPTS);
+    assert.equal(normalizeTeamTransportPolicy({ dataMaxAttempts: 0 }).data_max_attempts, TEAM_DATA_MAX_ATTEMPTS);
+    const policy = normalizeTeamTransportPolicy({ dataRetryDelayMs: -5 });
     assert.equal(policy.control_channel, 'relay-tcp');
     assert.equal(policy.data_channel, 'webrtc-v1');
     assert.equal(policy.data_retry_delay_ms, 1000);
+  });
+
+  it('honors a lowered attempt count in the bulk loop and in the exhaustion alert', async () => {
+    let calls = 0;
+    const alerts = [];
+    const router = createTeamTransportRouter({
+      policy: { dataMaxAttempts: 2, dataRetryDelayMs: 0 },
+      sendBulk: async () => {
+        calls += 1;
+        return { ok: false, code: 'P2P_BLOCKED' };
+      },
+      onAlert: (notice) => alerts.push(notice),
+    });
+    const result = await router.bulk({ kind: 'file', bytes: 10 });
+    assert.equal(calls, 2);
+    assert.equal(result.ok, false);
+    assert.equal(result.attempts, 2);
+    assert.equal(result.alert.attempts, 2);
+    assert.equal(alerts.length, 1);
   });
 
   it('sends control exactly once and never touches the bulk sender', async () => {

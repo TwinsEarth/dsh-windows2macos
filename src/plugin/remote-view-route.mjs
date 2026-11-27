@@ -39,27 +39,60 @@ const NO_STORE = { 'cache-control': 'no-store' };
 const RELAY_ACK_PATH = '/v1/remote/ack';
 
 const DEFAULT_TRANSPORT = 'webrtc';
+const DEFAULT_PUNCH_ATTEMPTS = 3;
+const DEFAULT_PUNCH_BACKOFF_MS = 700;
 
 function normalizeTransport(value, fallback = DEFAULT_TRANSPORT) {
   if (value === 'webrtc' || value === 'relay' || value === 'auto') return value;
   return fallback;
 }
 
+/**
+ * A bounded integer knob. Invalid input falls back instead of taking the panel down: these values
+ * tune retry pacing, not a security boundary, and a hand-edited JSON file must not make remote
+ * desktop unusable. The bounds are low enough that a typo cannot turn one click into an unbounded
+ * retry loop.
+ */
+function boundedInt(value, min, max, fallback) {
+  if (!Number.isInteger(value) || value < min || value > max) return fallback;
+  return value;
+}
+
+function punchDefaults(defaults = {}) {
+  return {
+    punch_attempts: boundedInt(defaults.punchAttempts, 1, 10, DEFAULT_PUNCH_ATTEMPTS),
+    punch_backoff_ms: boundedInt(defaults.punchBackoffMs, 100, 10_000, DEFAULT_PUNCH_BACKOFF_MS),
+    punch_source: defaults.punchSource === 'row' ? 'row' : 'default',
+  };
+}
+
 function readConfig(file, defaults = {}) {
   const defaultTransport = normalizeTransport(defaults.transport);
   const defaultSource = defaults.transportSource === 'row' ? 'row' : 'default';
+  const punch = punchDefaults(defaults);
   if (!existsSync(file)) {
-    return { ok: true, enabled: false, transport: defaultTransport, transport_source: defaultSource };
+    return {
+      ok: true,
+      enabled: false,
+      transport: defaultTransport,
+      transport_source: defaultSource,
+      ...punch,
+    };
   }
   try {
     const parsed = JSON.parse(readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
     const fileTransport = parsed?.transport;
     const hasTransport = fileTransport === 'webrtc' || fileTransport === 'relay' || fileTransport === 'auto';
+    const hasPunchAttempts = Number.isInteger(parsed?.punch_attempts);
+    const hasPunchBackoff = Number.isInteger(parsed?.punch_backoff_ms);
     return {
       ok: true,
       enabled: parsed?.enabled === true,
       transport: hasTransport ? fileTransport : defaultTransport,
       transport_source: hasTransport ? 'json' : defaultSource,
+      punch_attempts: boundedInt(parsed?.punch_attempts, 1, 10, punch.punch_attempts),
+      punch_backoff_ms: boundedInt(parsed?.punch_backoff_ms, 100, 10_000, punch.punch_backoff_ms),
+      punch_source: hasPunchAttempts || hasPunchBackoff ? 'json' : punch.punch_source,
     };
   } catch {
     // The file exists but is not usable. Do not silently resurrect a row default: enabled stays
@@ -69,17 +102,24 @@ function readConfig(file, defaults = {}) {
       enabled: false,
       transport: defaultTransport,
       transport_source: 'json',
+      ...punch,
       error: 'REMOTE_CONFIG_INVALID',
     };
   }
 }
 
-function writeConfig(file, enabled, transport) {
+function writeConfig(file, enabled, transport, punch = {}) {
   mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
   const tmp = file + '.tmp-' + process.pid;
   writeFileSync(
     tmp,
-    JSON.stringify({ enabled: enabled === true, transport: normalizeTransport(transport), updatedAt: new Date().toISOString() }),
+    JSON.stringify({
+      enabled: enabled === true,
+      transport: normalizeTransport(transport),
+      punch_attempts: boundedInt(punch.punch_attempts, 1, 10, DEFAULT_PUNCH_ATTEMPTS),
+      punch_backoff_ms: boundedInt(punch.punch_backoff_ms, 100, 10_000, DEFAULT_PUNCH_BACKOFF_MS),
+      updatedAt: new Date().toISOString(),
+    }),
     { encoding: 'utf8', mode: 0o600 },
   );
   renameSync(tmp, file);
@@ -123,6 +163,7 @@ const timeoutSignal = (ms) => (
  * @param {{stateDir:string, p2p?:object, getPool?:()=>object|null, getPoolState?:()=>object|null,
  *   pool?:object|null, capture?:Function, platform?:string, maxBytes?:number,
  *   prepareTimeoutMs?:number, handshakeTimeoutMs?:number, ackPollMs?:number,
+ *   punchAttempts?:number, punchBackoffMs?:number,
  *   transport?:'auto'|'webrtc'|'relay', allowLegacyP2P?:boolean}} deps
  *   `transport` and `allowLegacyP2P` are row defaults: they apply until
  *   `remote-view.json` supplies its own `transport`. The built-in default is
@@ -151,8 +192,17 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
     ? deps.getPoolState
     : (hasExplicitPool ? () => null : getSharedWebRtcPoolState);
   const rowTransportSpecified = Object.hasOwn(deps, 'transport');
+  const rowTransportValid = deps.transport === 'auto' || deps.transport === 'webrtc' || deps.transport === 'relay';
   const defaultTransport = rowTransportSpecified ? normalizeTransport(deps.transport) : DEFAULT_TRANSPORT;
   const defaultTransportSource = rowTransportSpecified ? 'row' : 'default';
+  const transportWarning = rowTransportSpecified && !rowTransportValid
+    ? {
+      code: 'W2M_DESKTOP_TRANSPORT_INVALID',
+      configured: typeof deps.transport === 'string' ? deps.transport : String(deps.transport),
+      fallback: defaultTransport,
+      message: 'desktop transport must be auto, webrtc or relay; the row value was ignored and webrtc is in use',
+    }
+    : null;
   const allowLegacyP2P = deps.allowLegacyP2P === true;
   // Two caps, because the two paths are different products: a DataChannel may carry 720P..4K, while
   // the relay's own broker refuses anything above 100 KiB of ciphertext. The viewer checks each
@@ -171,7 +221,18 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
     ? deps.handshakeTimeoutMs
     : 10_000;
   const ackPollMs = Number.isInteger(deps.ackPollMs) && deps.ackPollMs > 0 ? deps.ackPollMs : 300;
+  const rowPunchAttempts = Number.isInteger(deps.punchAttempts) && deps.punchAttempts > 0
+    ? Math.min(10, Math.max(1, deps.punchAttempts))
+    : null;
+  const rowPunchBackoffMs = Number.isInteger(deps.punchBackoffMs) && deps.punchBackoffMs > 0
+    ? Math.min(10_000, Math.max(100, deps.punchBackoffMs))
+    : null;
   let active = null;
+  // The disposer for the row lifetime. Registered only when a session exists: an effect that owns
+  // nothing is a disposer that releases nothing, and every other row on this host would see an
+  // extra entry in `ctx.effect` for a view that never started. It is released when the session ends
+  // and re-armed by the next start.
+  let sessionDisposer = null;
   // P5 read-only diagnostics. Counters are process-local and never persisted: they describe this
   // viewer's current host lifetime, not a fleet-wide metric. `last_error` keeps the most recent named
   // failure so a diagnostics read after a failed attempt still explains what happened.
@@ -201,9 +262,24 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
     noteError(code);
   };
 
+  const releaseSessionDisposer = () => {
+    const dispose = sessionDisposer;
+    sessionDisposer = null;
+    if (typeof dispose === 'function') {
+      try {
+        dispose();
+      } catch {
+        /* the host is already tearing the row down */
+      }
+    }
+  };
+
   const stopActive = async () => {
     counters.last_stop_at = new Date().toISOString();
-    if (active === null) return;
+    if (active === null) {
+      releaseSessionDisposer();
+      return;
+    }
     const session = active;
     active = null;
     try {
@@ -219,6 +295,33 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
     if (session.mode === 'p2p') {
       try { session.channel?.close?.(); } catch { /* already closed */ }
     }
+    releaseSessionDisposer();
+  };
+
+  /**
+   * Own the live session for the rest of the row's lifetime.
+   *
+   * Registered at the moment the session becomes active, not at route-registration time: a row that
+   * never opens a view must leave the host's effect list exactly as it found it. The disposer nulls
+   * its own handle first, because `stopActive` calls `releaseSessionDisposer` on every path and must
+   * not re-enter the effect it is being disposed by.
+   */
+  const ownActiveSession = () => {
+    if (active === null || sessionDisposer !== null || typeof ctx.effect !== 'function') return;
+    try {
+      sessionDisposer = ctx.effect(() => () => {
+        sessionDisposer = null;
+        void stopActive();
+      }, 'w2m: remote view session');
+    } catch {
+      // A host that refuses an effect this late still has the /stop route; the session is usable.
+      sessionDisposer = null;
+    }
+  };
+
+  const setActive = (session) => {
+    active = session;
+    ownActiveSession();
   };
 
   const postRelayRequest = async ({ machineId, sessionId, publicKey, transport = 'relay', viewerMachineId = null }) => {
@@ -623,6 +726,8 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
   const readCurrentConfig = () => readConfig(file, {
     transport: defaultTransport,
     transportSource: defaultTransportSource,
+    ...(rowPunchAttempts === null ? {} : { punchAttempts: rowPunchAttempts, punchSource: 'row' }),
+    ...(rowPunchBackoffMs === null ? {} : { punchBackoffMs: rowPunchBackoffMs, punchSource: 'row' }),
   });
   // `preferred` is the product policy, not the mode the caller forced: WebRTC stays the preferred
   // path even when `transport:'relay'` explicitly bypasses it.
@@ -753,11 +858,16 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
       pool_available: pool.available,
       pool_owner: pool.owner,
       transport_source: config.transport_source,
+      transport_warning: transportWarning,
       legacy_p2p: allowLegacyP2P,
       config: {
         enabled: config.enabled,
         transport: config.transport,
         transport_source: config.transport_source,
+        transport_warning: transportWarning,
+        punch_attempts: config.punch_attempts,
+        punch_backoff_ms: config.punch_backoff_ms,
+        punch_source: config.punch_source,
         legacy_p2p: allowLegacyP2P,
       },
       pool,
@@ -813,6 +923,10 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
             enabled: config.enabled,
             transport: config.transport,
             transport_source: config.transport_source,
+            transport_warning: transportWarning,
+            punch_attempts: config.punch_attempts,
+            punch_backoff_ms: config.punch_backoff_ms,
+            punch_source: config.punch_source,
             pool_available: pool !== null && typeof pool === 'object' && poolState?.ready !== false,
             pool_owner: poolState?.owner ?? null,
             legacy_p2p: allowLegacyP2P,
@@ -829,6 +943,8 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
         const current = readCurrentConfig();
         let transport = current.transport;
         let transportChanged = false;
+        let punchAttempts = current.punch_attempts;
+        let punchBackoffMs = current.punch_backoff_ms;
         if (body.transport !== undefined) {
           if (body.transport !== 'auto' && body.transport !== 'webrtc' && body.transport !== 'relay') {
             return Response.json({ ok: false, error: 'transport must be auto, webrtc or relay' }, { status: 400, headers: NO_STORE });
@@ -836,12 +952,31 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
           transport = body.transport;
           transportChanged = transport !== current.transport;
         }
+        if (body.punch_attempts !== undefined) {
+          if (!Number.isInteger(body.punch_attempts) || body.punch_attempts < 1 || body.punch_attempts > 10) {
+            return Response.json({ ok: false, error: 'punch_attempts must be an integer from 1 to 10' }, { status: 400, headers: NO_STORE });
+          }
+          punchAttempts = body.punch_attempts;
+        }
+        if (body.punch_backoff_ms !== undefined) {
+          if (!Number.isInteger(body.punch_backoff_ms) || body.punch_backoff_ms < 100 || body.punch_backoff_ms > 10_000) {
+            return Response.json({ ok: false, error: 'punch_backoff_ms must be an integer from 100 to 10000' }, { status: 400, headers: NO_STORE });
+          }
+          punchBackoffMs = body.punch_backoff_ms;
+        }
         // A transport switch must not keep the old channel alive underneath the new setting: the
         // panel labels the current mode from `/config`, while the session object still describes
         // WebRTC/relay. Stop first, then persist, so the next `/start` uses the new transport.
-        if (body.enabled === false || transportChanged) await stopActive();
-        writeConfig(file, body.enabled, transport);
-        return Response.json({ ok: true, enabled: body.enabled, transport }, { headers: NO_STORE });
+        const enabled = body.enabled === true;
+        if (enabled === false || transportChanged) await stopActive();
+        writeConfig(file, enabled, transport, { punch_attempts: punchAttempts, punch_backoff_ms: punchBackoffMs });
+        return Response.json({
+          ok: true,
+          enabled,
+          transport,
+          punch_attempts: punchAttempts,
+          punch_backoff_ms: punchBackoffMs,
+        }, { headers: NO_STORE });
       },
     });
 
@@ -882,7 +1017,7 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
             side,
           });
           if (attempt.ok === true) {
-            active = attempt.session;
+            setActive(attempt.session);
             return Response.json({
               ok: true,
               machine_id: machineId,
@@ -909,7 +1044,7 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
         if (config.transport === 'auto' && allowLegacyP2P && p2p?.node !== null && p2p?.node !== undefined) {
           const p2pAttempt = await connectP2P({ machineId, sessionId, side });
           if (p2pAttempt.ok === true) {
-            active = p2pAttempt.session;
+            setActive(p2pAttempt.session);
             return Response.json({
               ok: true,
               machine_id: machineId,
@@ -943,7 +1078,7 @@ export function registerRemoteViewRoutes(ctx, deps = {}) {
             relay_error: relayAttempt.relay_error ?? null,
           }, { status: 502, headers: NO_STORE });
         }
-        active = relayAttempt.session;
+        setActive(relayAttempt.session);
         return Response.json({
           ok: true,
           machine_id: machineId,

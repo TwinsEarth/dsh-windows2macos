@@ -75,6 +75,10 @@ export function normalizePluginConfig(config = {}, deps = {}) {
         ? resolvePath(config.projectDir)
         : process.cwd();
   const allowedRoots = stringArray(config.allowedRoots).map((entry) => resolvePath(entry));
+  // `default` keeps the historical convenience roots (home/tmp/project/download). `strict` is an
+  // explicit opt-in that limits an otherwise-empty list to the project and download roots, so a
+  // user can narrow the default without changing it for everyone.
+  const allowedRootsMode = config.allowedRootsMode === 'strict' ? 'strict' : 'default';
   const rawTrackers = config.trackers ?? config.announce ?? [];
   const trackers = Array.isArray(rawTrackers)
     ? rawTrackers.filter((entry) => typeof entry === 'string' && entry.trim() !== '').map((entry) => entry.trim())
@@ -86,7 +90,10 @@ export function normalizePluginConfig(config = {}, deps = {}) {
     project_dir: projectDir,
     allowed_roots: allowedRoots.length > 0
       ? allowedRoots
-      : [homedir(), tmpdir(), projectDir, downloadRoot].map((entry) => resolvePath(entry)),
+      : (allowedRootsMode === 'strict'
+        ? [projectDir, downloadRoot].map((entry) => resolvePath(entry))
+        : [homedir(), tmpdir(), projectDir, downloadRoot].map((entry) => resolvePath(entry))),
+    allowed_roots_mode: allowedRoots.length > 0 ? 'explicit' : allowedRootsMode,
     web_torrent_module:
       typeof config.webTorrentModule === 'string' && config.webTorrentModule !== ''
         ? config.webTorrentModule

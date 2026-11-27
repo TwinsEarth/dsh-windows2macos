@@ -34,8 +34,10 @@
  * engine or opens a signaling socket.
  */
 
+import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve as resolvePath } from 'node:path';
+import { dirname, join, resolve as resolvePath } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { loadIdentity } from '../agent/identity.mjs';
 import { createWebRtcTransport, WEBRTC_TRANSPORT_CODE } from '../agent/webrtc/transport.mjs';
@@ -86,6 +88,119 @@ export const P2P_WEBRTC_POOL_CODE = Object.freeze({
 function defaultDshHome(env) {
   const value = env?.DSH_HOME ?? process.env.DSH_HOME;
   return typeof value === 'string' && value !== '' ? value : join(homedir(), '.dsh');
+}
+
+/**
+ * Provider scripts shipped in this package. Keep this as a path probe rather than a hard import:
+ * the package has no runtime dependency on `node-datachannel`, and an installed package may run
+ * from either `src/` (development) or `lib/` (published entrypoints).
+ *
+ * @returns {string[]}
+ */
+function packagedProviderScripts() {
+  const here = dirname(fileURLToPath(import.meta.url));
+  return [
+    join(here, '..', 'agent', 'webrtc', 'providers', 'node-datachannel-provider.mjs'),
+    join(here, '..', 'src', 'agent', 'webrtc', 'providers', 'node-datachannel-provider.mjs'),
+  ];
+}
+
+/**
+ * A one-click relay repair may need to find the provider the operator already installed but did
+ * not wire into `providerCommand`. Only known local directories are probed; nothing is installed
+ * or downloaded, and the configured provider always wins.
+ *
+ * @param {object} cfg normalized plugin config
+ * @param {{env?: Record<string,string|undefined>, providerDirs?: string[]}} [deps]
+ * @returns {{ok:true, source:'config'|'factory'|'auto', provider_command?:string, provider_args?:string[],
+ *   provider_cwd?:string, checked?:string[]}|{ok:false, code:string, detail:string, checked:string[]}}
+ */
+function providerNodeCommand(env) {
+  if (typeof env?.W2M_PROVIDER_NODE === 'string' && env.W2M_PROVIDER_NODE !== '') {
+    return env.W2M_PROVIDER_NODE;
+  }
+  // When the host itself is a Node process, use its exact binary instead of a PATH lookup: DSH's
+  // bundled runtime is often not on PATH, and `node` may resolve to an unrelated system install.
+  const execPath = typeof process.execPath === 'string' ? process.execPath : '';
+  if (/(?:^|[\\/])node(?:\.exe)?$/i.test(execPath)) return execPath;
+  return 'node';
+}
+
+function missingProviderScript(cfg) {
+  const args = Array.isArray(cfg.provider_args) ? cfg.provider_args : [];
+  for (const arg of args) {
+    if (typeof arg !== 'string' || !/\.(?:cjs|mjs|js)$/i.test(arg)) continue;
+    const candidates = [
+      resolvePath(arg),
+      ...(typeof cfg.provider_cwd === 'string' && cfg.provider_cwd !== ''
+        ? [resolvePath(cfg.provider_cwd, arg)]
+        : []),
+    ];
+    if (!candidates.some((candidate) => existsSync(candidate))) return arg;
+  }
+  return null;
+}
+
+function discoverProviderConfig(cfg, deps = {}) {
+  if (typeof cfg.provider_command === 'string' && cfg.provider_command !== '') {
+    const missing = missingProviderScript(cfg);
+    const missingCommand = /\.(?:cjs|mjs|js)$/i.test(cfg.provider_command)
+      && !existsSync(resolvePath(cfg.provider_command))
+      ? cfg.provider_command
+      : null;
+    const missingPath = missing ?? missingCommand;
+    if (missingPath !== null) {
+      return {
+        ok: false,
+        code: 'WEBRTC_PROVIDER_SCRIPT_MISSING',
+        detail: `provider config points at a missing script: ${missingPath}`,
+        source: 'config',
+        checked: [missingPath],
+      };
+    }
+    return { ok: true, source: 'config' };
+  }
+  if (typeof deps.poolFactory === 'function' || typeof cfg.pool_factory === 'function') {
+    return { ok: true, source: 'factory' };
+  }
+  const env = deps.env ?? process.env;
+  const dirs = [];
+  const add = (value) => {
+    if (typeof value !== 'string' || value === '') return;
+    const resolved = resolvePath(value);
+    if (!dirs.includes(resolved)) dirs.push(resolved);
+  };
+  if (Array.isArray(deps.providerDirs)) for (const value of deps.providerDirs) add(value);
+  add(cfg.provider_cwd);
+  add(env.W2M_PROVIDER_DIR);
+  add(join(homedir(), '.w2m', 'webrtc-provider'));
+  add(join(cfg.dsh_home, 'webrtc-provider'));
+  add(join(cfg.dsh_home, '..', 'w2m-webrtc-provider'));
+  add(join(homedir(), 'w2m-webrtc-provider'));
+
+  const scripts = packagedProviderScripts();
+  for (const dir of dirs) {
+    if (!existsSync(dir)) continue;
+    if (!existsSync(join(dir, 'node_modules', 'node-datachannel'))) continue;
+    const localScript = join(dir, 'node-datachannel-provider.mjs');
+    const script = existsSync(localScript) ? localScript : scripts.find((candidate) => existsSync(candidate));
+    if (!script) continue;
+    return {
+      ok: true,
+      source: 'auto',
+      provider_command: providerNodeCommand(env),
+      provider_args: [script],
+      provider_cwd: dir,
+      checked: dirs,
+    };
+  }
+  return {
+    ok: false,
+    code: 'WEBRTC_PROVIDER_UNAVAILABLE',
+    detail:
+      'providerCommand is empty and no installed node-datachannel provider was found in the standard directories',
+    checked: dirs,
+  };
 }
 
 /**
@@ -411,6 +526,18 @@ export class P2PWebRtcService {
   #peer(options = {}) {
     const value = options.peer_machine_id ?? options.peerMachineId ?? this.cfg.peer_machine_id;
     return typeof value === 'string' && value !== '' ? value : '';
+  }
+
+  /**
+   * Probe for an already-installed provider when the row has no `providerCommand`.
+   * The caller may pass the returned fields to {@link start}; this never mutates config or installs
+   * anything. It is deliberately separate from `ensurePool()` so autoStart keeps its explicit
+   * "no provider means a named refusal" contract.
+   *
+   * @returns {object}
+   */
+  discoverProvider() {
+    return discoverProviderConfig(this.cfg, this.deps);
   }
 
   /**
@@ -928,6 +1055,11 @@ export function buildTools({ service, defineTool }) {
  * also disconnect Teams and task delivery, and the panel has no way to tell those consumers. An
  * already-ready pool therefore answers `already_ready: true` without touching it.
  *
+ * When `providerCommand` is empty, the route probes the standard local provider directories and
+ * passes a discovered provider into this start only. It never installs, downloads, or writes the
+ * profile; a failed probe keeps the named `WEBRTC_PROVIDER_UNAVAILABLE` refusal with `checked`
+ * paths so the operator can act.
+ *
  * @param {object} ctx Cordis context
  * @param {P2PWebRtcService} service the mounted p2p service
  * @returns {boolean} whether an injectable connection context was available
@@ -946,13 +1078,65 @@ export function registerP2pWebRtcRepairRoute(ctx, service) {
         try { before = service.status(); } catch { /* status is best-effort */ }
         if (before?.pool?.ready === true) {
           return Response.json(
-            { ok: true, already_ready: true, pool: before.pool, status: before },
+            {
+              ok: true,
+              already_ready: true,
+              pool: before.pool,
+              status: before,
+              provider: null,
+              stages: [{ name: 'pool', ok: true, detail: 'already ready' }],
+            },
             { headers: { 'cache-control': 'no-store' } },
           );
         }
+        let discovery = null;
+        if (typeof service.discoverProvider === 'function') {
+          try {
+            discovery = service.discoverProvider();
+          } catch (error) {
+            discovery = {
+              ok: false,
+              code: 'WEBRTC_PROVIDER_UNAVAILABLE',
+              detail: error instanceof Error ? error.message : String(error),
+            };
+          }
+        }
+        const stages = [];
+        if (discovery !== null) {
+          stages.push({
+            name: 'provider',
+            ok: discovery.ok === true,
+            code: discovery.code ?? null,
+            detail: discovery.detail ?? null,
+            source: discovery.source ?? null,
+          });
+        }
+        if (discovery !== null && discovery.ok !== true) {
+          return Response.json(
+            {
+              ok: false,
+              code: discovery.code ?? 'WEBRTC_PROVIDER_UNAVAILABLE',
+              detail: discovery.detail ?? 'the provider probe failed',
+              provider: {
+                ok: false,
+                source: discovery.source ?? null,
+                checked: discovery.checked ?? null,
+              },
+              stages,
+            },
+            { status: 502, headers: { 'cache-control': 'no-store' } },
+          );
+        }
+        const overrides = discovery?.ok === true && discovery.source === 'auto'
+          ? {
+              provider_command: discovery.provider_command,
+              provider_args: discovery.provider_args,
+              provider_cwd: discovery.provider_cwd,
+            }
+          : {};
         let result;
         try {
-          result = await service.start();
+          result = await service.start(overrides);
         } catch (error) {
           result = {
             ok: false,
@@ -963,13 +1147,33 @@ export function registerP2pWebRtcRepairRoute(ctx, service) {
         let after = null;
         try { after = service.status(); } catch { /* status is best-effort */ }
         const ok = result?.ok === true && after?.pool?.ready === true;
-        const payload = { ...result, ok, pool: after?.pool ?? null, status: after };
+        const payload = {
+          ...result,
+          ok,
+          pool: after?.pool ?? null,
+          status: after,
+          provider: discovery === null
+            ? null
+            : {
+                ok: discovery.ok === true,
+                source: discovery.source ?? null,
+                provider_cwd: discovery.provider_cwd ?? null,
+                checked: discovery.checked ?? null,
+              },
+          stages,
+        };
         if (!ok && typeof payload.code !== 'string') {
           payload.code = 'WEBRTC_REPAIR_FAILED';
           if (payload.detail === undefined || payload.detail === null) {
             payload.detail = 'the repair call did not publish a ready shared pool';
           }
         }
+        stages.push({
+          name: 'pool',
+          ok,
+          code: ok ? null : (payload.code ?? null),
+          detail: ok ? 'pool ready' : (payload.detail ?? null),
+        });
         return Response.json(payload, {
           status: ok ? 200 : 502,
           headers: { 'cache-control': 'no-store' },

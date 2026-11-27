@@ -90,6 +90,19 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, '..');
 const DIST_DIR = join(ROOT, 'dist');
 
+/**
+ * The tarballs that claim to be **this tree's** artifact.
+ *
+ * A `dist/` directory accumulates builds across versions; a 3.7.7 file left beside a 3.7.6 checkout
+ * is a historical build output, not a claim about the current tree. Checking it against the current
+ * manifest makes a stale build directory look like a code regression and gives "which artifact did
+ * you install?" a false second answer. The version-named file for this tree is the one under test;
+ * an absent one is reported as a skip by each caller, exactly as before.
+ */
+function treeTarballs() {
+  return readdirSync(DIST_DIR).filter((f) => f.endsWith(`-${PACKAGE_JSON.version}.tgz`));
+}
+
 const read = (rel) => readFileSync(join(ROOT, rel), 'utf8');
 
 /** Repo files, read once. A missing file is a hard failure, not an empty string. */
@@ -856,9 +869,9 @@ describe('the release tree', () => {
       t.skip(`no ${relative(ROOT, DIST_DIR)}/ in this checkout: the packed tree was not verified here`);
       return;
     }
-    const tarballs = readdirSync(DIST_DIR).filter((f) => f.endsWith('.tgz'));
+    const tarballs = treeTarballs();
     if (tarballs.length === 0) {
-      t.skip(`no .tgz in ${relative(ROOT, DIST_DIR)}/: nothing to verify, and nothing is claimed about it`);
+      t.skip(`no .tgz for ${PACKAGE_JSON.version} in ${relative(ROOT, DIST_DIR)}/: nothing to verify, and nothing is claimed about it`);
       return;
     }
     for (const file of tarballs) {
@@ -884,9 +897,9 @@ describe('the release tree', () => {
       t.skip(`no ${relative(ROOT, DIST_DIR)}/ in this checkout: no packed manifest to compare`);
       return;
     }
-    const tarballs = readdirSync(DIST_DIR).filter((f) => f.endsWith('.tgz'));
+    const tarballs = treeTarballs();
     if (tarballs.length === 0) {
-      t.skip(`no .tgz in ${relative(ROOT, DIST_DIR)}/: no packed manifest to compare`);
+      t.skip(`no .tgz for ${PACKAGE_JSON.version} in ${relative(ROOT, DIST_DIR)}/: no packed manifest to compare`);
       return;
     }
     for (const file of tarballs) {
@@ -916,9 +929,9 @@ describe('the release tree', () => {
       t.skip(`no ${relative(ROOT, DIST_DIR)}/ in this checkout: no packed tree to measure`);
       return;
     }
-    const tarballs = readdirSync(DIST_DIR).filter((f) => f.endsWith('.tgz'));
+    const tarballs = treeTarballs();
     if (tarballs.length === 0) {
-      t.skip(`no .tgz in ${relative(ROOT, DIST_DIR)}/: nothing is claimed about a tarball that is not here`);
+      t.skip(`no .tgz for ${PACKAGE_JSON.version} in ${relative(ROOT, DIST_DIR)}/: nothing is claimed about a tarball that is not here`);
       return;
     }
     const contract = documentContract({ root: ROOT, files: PACKAGE_JSON.files });

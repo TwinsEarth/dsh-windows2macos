@@ -24,7 +24,21 @@ function harness(options = {}) {
     on(event, fn) { if (event === 'message') handler = fn; },
     off() { handler = null; },
   };
-  const ctx = { inject: (_deps, callback) => callback({ connection: { fetch: { register: (route) => routes.set(route.path, route) } } }) };
+  const disposers = [];
+  const ctx = {
+    inject: (_deps, callback) => callback({ connection: { fetch: { register: (route) => routes.set(route.path, route) } } }),
+    effect: (callback) => {
+      const dispose = callback();
+      if (typeof dispose !== 'function') return undefined;
+      const wrapped = async () => {
+        const index = disposers.indexOf(wrapped);
+        if (index >= 0) disposers.splice(index, 1);
+        return dispose();
+      };
+      disposers.push(wrapped);
+      return wrapped;
+    },
+  };
   const stateDir = mkdtempSync(join(tmpdir(), 'w2m-view-route-'));
   const deps = {
     stateDir,
@@ -35,7 +49,16 @@ function harness(options = {}) {
   };
   if (Object.hasOwn(options, 'transport')) deps.transport = options.transport;
   registerRemoteViewRoutes(ctx, deps);
-  return { routes, sent, node, stateDir, get dialed() { return dialed; }, get handler() { return handler; } };
+  return {
+    routes,
+    sent,
+    node,
+    stateDir,
+    get dialed() { return dialed; },
+    get handler() { return handler; },
+    get effectCount() { return disposers.length; },
+    dispose: async () => { for (const dispose of disposers.splice(0).reverse()) await dispose(); },
+  };
 }
 
 const request = (body, method = 'POST') => ({ method, json: async () => body });
@@ -119,6 +142,30 @@ describe('remote-view host routes', () => {
     assert.equal(afterBody.session, null);
   });
 
+  it('stops the live channel when the row is disposed', async () => {
+    const h = harness({ allowLegacyP2P: true });
+    await h.routes.get('/api/w2m/remote/config').fetch(request({ enabled: true, transport: 'auto' }));
+    const started = await h.routes.get('/api/w2m/remote/start').fetch(request({ machine_id: 'm-dispose' }));
+    assert.equal(started.status, 200);
+    assert.equal(h.sent[0].type, 'view.hello');
+
+    await h.dispose();
+    assert.equal(h.sent.some((frame) => frame.type === 'view.stop'), true, 'unloading the row must close the live session');
+    assert.equal(h.handler, null, 'unloading the row must unsubscribe from the peer');
+  });
+
+  it('registers no effect until a session exists, and releases it when the session stops', async () => {
+    const h = harness({ allowLegacyP2P: true });
+    assert.equal(h.effectCount, 0, 'a row that never opens a view owns nothing');
+    await h.routes.get('/api/w2m/remote/config').fetch(request({ enabled: true, transport: 'auto' }));
+    const started = await h.routes.get('/api/w2m/remote/start').fetch(request({ machine_id: 'm-effect' }));
+    assert.equal(started.status, 200);
+    assert.equal(h.effectCount, 1, 'the live session is owned for the row lifetime');
+    const stopped = await h.routes.get('/api/w2m/remote/stop').fetch(request({}));
+    assert.equal(stopped.status, 200);
+    assert.equal(h.effectCount, 0, 'the disposer is released when the live session ends');
+  });
+
   it('reports row transport defaults and the live pool in /config, and lets json win', async () => {
     const { writeFileSync } = await import('node:fs');
     const routes = new Map();
@@ -130,6 +177,9 @@ describe('remote-view host routes', () => {
     const beforeBody = await before.json();
     assert.equal(beforeBody.transport, 'webrtc');
     assert.equal(beforeBody.transport_source, 'row');
+    assert.equal(beforeBody.transport_warning, null);
+    assert.equal(beforeBody.punch_attempts, 3, 'the built-in retry count is visible');
+    assert.equal(beforeBody.punch_backoff_ms, 700, 'the built-in backoff is visible');
     assert.equal(beforeBody.legacy_p2p, false);
     assert.equal(beforeBody.pool_available, false);
     assert.equal(beforeBody.pool_owner, null);
@@ -140,6 +190,77 @@ describe('remote-view host routes', () => {
     assert.equal(afterBody.transport, 'relay', 'the on-disk file always wins over row defaults');
     assert.equal(afterBody.transport_source, 'json');
     assert.equal(afterBody.enabled, true);
+  });
+
+  it('persists punch retry settings and rejects values outside the bounds', async () => {
+    const routes = new Map();
+    const ctx = { inject: (_deps, callback) => callback({ connection: { fetch: { register: (route) => routes.set(route.path, route) } } }) };
+    const stateDir = mkdtempSync(join(tmpdir(), 'w2m-view-punch-config-'));
+    registerDesktop(ctx, { stateDir, p2p: null });
+
+    const saved = await routes.get('/api/w2m/remote/config').fetch(request({
+      enabled: true,
+      punch_attempts: 5,
+      punch_backoff_ms: 1200,
+    }));
+    assert.equal(saved.status, 200);
+    const savedBody = await saved.json();
+    assert.equal(savedBody.punch_attempts, 5);
+    assert.equal(savedBody.punch_backoff_ms, 1200);
+
+    const readBack = await routes.get('/api/w2m/remote/config').fetch(request({}, 'GET'));
+    const readBackBody = await readBack.json();
+    assert.equal(readBackBody.punch_attempts, 5, 'the value survives a later toggle');
+    assert.equal(readBackBody.punch_backoff_ms, 1200);
+    assert.equal(readBackBody.punch_source, 'json');
+
+    const tooMany = await routes.get('/api/w2m/remote/config').fetch(request({
+      enabled: true,
+      punch_attempts: 99,
+    }));
+    assert.equal(tooMany.status, 400);
+    const tooFast = await routes.get('/api/w2m/remote/config').fetch(request({
+      enabled: true,
+      punch_backoff_ms: 1,
+    }));
+    assert.equal(tooFast.status, 400);
+  });
+
+  it('reports an invalid row transport instead of silently accepting it', async () => {
+    const routes = new Map();
+    const ctx = { inject: (_deps, callback) => callback({ connection: { fetch: { register: (route) => routes.set(route.path, route) } } }) };
+    const stateDir = mkdtempSync(join(tmpdir(), 'w2m-view-bad-transport-'));
+    registerDesktop(ctx, { stateDir, p2p: null, transport: 'webRTC' });
+    const config = await routes.get('/api/w2m/remote/config').fetch(request({}, 'GET'));
+    const body = await config.json();
+    assert.equal(body.transport, 'webrtc', 'the safe fallback is still applied');
+    assert.equal(body.transport_source, 'row');
+    assert.equal(body.transport_warning.code, 'W2M_DESKTOP_TRANSPORT_INVALID');
+    assert.equal(body.transport_warning.configured, 'webRTC');
+    assert.equal(body.transport_warning.fallback, 'webrtc');
+  });
+
+  it('clamps out-of-range punch settings from the desktop row', async () => {
+    const routes = new Map();
+    const ctx = { inject: (_deps, callback) => callback({ connection: { fetch: { register: (route) => routes.set(route.path, route) } } }) };
+    const stateDir = mkdtempSync(join(tmpdir(), 'w2m-view-row-clamp-'));
+    registerDesktop(ctx, { stateDir, p2p: null, punchAttempts: 99, punchBackoffMs: 50 });
+    const config = await routes.get('/api/w2m/remote/config').fetch(request({}, 'GET'));
+    const body = await config.json();
+    assert.equal(body.punch_attempts, 10);
+    assert.equal(body.punch_backoff_ms, 100);
+  });
+
+  it('forwards punch retry settings from the desktop row', async () => {
+    const routes = new Map();
+    const ctx = { inject: (_deps, callback) => callback({ connection: { fetch: { register: (route) => routes.set(route.path, route) } } }) };
+    const stateDir = mkdtempSync(join(tmpdir(), 'w2m-view-row-punch-'));
+    registerDesktop(ctx, { stateDir, p2p: null, punchAttempts: 4, punchBackoffMs: 900 });
+    const config = await routes.get('/api/w2m/remote/config').fetch(request({}, 'GET'));
+    const body = await config.json();
+    assert.equal(body.punch_attempts, 4);
+    assert.equal(body.punch_backoff_ms, 900);
+    assert.equal(body.punch_source, 'row');
   });
 
   it('uses the default transport when the row supplies none', async () => {

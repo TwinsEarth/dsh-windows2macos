@@ -1112,6 +1112,13 @@ describe('client bundle: selecting a machine writes the @mention', () => {
     assert.deepEqual(JSON.parse(JSON.stringify(edits)), [{ text: '@beta ', span: { start: 0, end: 0, draftRev: 1 } }]);
   });
 });
+
+it('remote view refreshes its target roster while the panel stays open (v3.7.8)', () => {
+  const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
+  assert.match(source, /const loadRoster = \(\) => fetch\('\/api\/w2m\/target\?session_id=__global__'/u);
+  assert.match(source, /setInterval\(loadRoster, 10_000\)/u);
+  assert.match(source, /list\.some\(\(machine\) => machine\.machine_id === current\)/u, 'a stale selection is replaced instead of shown as the current target');
+});
 it('queue journal only records the official dock and real sessions (v3.2.6)', () => {
   const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8');
   assert.ok(!source.includes('[class*="queue" i]'), 'no generic queue class scan: it captured drawer and page text');
@@ -4725,12 +4732,21 @@ describe('v3.5.6/A1: the 归档 tab inside the backup panel', () => {
 describe('client bundle: remote-view action controls', () => {
   const source = fs.readFileSync(BUNDLE_PATH, 'utf8');
 
-  it('renders the P2P/Relay switch, the one-click repair entry, and the top-right status', () => {
+  it('renders the P2P/Relay switch, the one-click punch entry, and the top-right status', () => {
     assert.match(source, /REMOTE_REPAIR_URL = '\/api\/w2m\/p2p-webrtc\/repair'/);
     assert.match(source, /const remoteMode = \(config\) =>/);
     assert.match(source, /const switchMode = async \(next\) =>/);
-    assert.match(source, /const repairP2P = async \(\) =>/);
-    assert.match(source, /'一键修复 P2P'/);
+    assert.match(source, /const punchP2P = async \(\) =>/);
+    assert.match(source, /'一键打通 P2P'/);
+    assert.match(source, /P2P_PUNCH_ATTEMPTS = 3/);
+    assert.match(source, /const p2pPunchAttempts = \(config\) =>/);
+    assert.match(source, /config\?\.punch_attempts/);
+    assert.match(source, /config\?\.punch_backoff_ms/);
+    assert.match(source, /const punchAttemptsLimit = p2pPunchAttempts\(remoteConfig\)/);
+    assert.match(source, /P2P_PUNCH_RETRYABLE = new Set\(\[[\s\S]*?'WEBRTC_SIGNAL_PEER_TIMEOUT'[\s\S]*?\]\)/u, 'a signalling timeout is retried instead of reported after one attempt');
+    assert.match(source, /const waitMs = punchBackoffMs \* attempt/);
+    assert.match(source, /data-w2m-remote-transport-warning/);
+    assert.match(source, /transportWarning\.configured/);
     assert.match(source, /role: 'status'/);
     assert.match(source, /'aria-live': 'polite'/);
     assert.match(source, /'data-w2m-remote-status': status\.key/);
@@ -4742,9 +4758,11 @@ describe('client bundle: remote-view action controls', () => {
     assert.match(source, /if \(!enabled \|\| !live \|\| session === null\) return undefined;/);
     assert.match(source, /const ready = enabled && session !== null && frame\?\.data_base64;/);
     assert.match(source, /const \[repairNote, setRepairNote\] = React\.useState\(null\);/);
-    assert.match(source, /setRepairNote\(\{ tone: 'pending', text: '正在检查 P2P 共享 pool…' \}\);/);
-    assert.match(source, /'P2P 共享 pool 已就绪，无需重建'/);
-    assert.match(source, /'P2P 共享 pool 已重建'/);
+    assert.match(source, /setRepairNote\(\{ tone: 'pending', text: '1\/4 检查 WebRTC provider 与共享 pool…' \}\);/);
+    assert.match(source, /body\?\.provider\?\.source === 'auto'/);
+    assert.match(source, /'P2P 已打通：'/);
+    assert.match(source, /'WebRTC 未就绪：/);
+    assert.match(source, /'一键打通 P2P'/);
     assert.match(source, /'data-w2m-remote-repair-note': repairNote\.tone/);
   });
 });

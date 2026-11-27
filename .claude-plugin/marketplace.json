@@ -5,15 +5,15 @@
   },
   "metadata": {
     "description": "The w2m fleet plugins: one account, many machines, any of Windows, macOS or Linux.",
-    "version": "3.7.7",
-    "updatedAt": "2026-11-26T00:00:00.000Z"
+    "version": "3.7.8",
+    "updatedAt": "2026-11-27T10:43:53.494Z"
   },
   "plugins": [
     {
       "name": "w2m-fleet",
       "source": "./",
       "description": "Read fleet state and dispatch commands across the machines registered to one account. Read-only MCP surface: the five exposed tools cannot change anything.",
-      "version": "3.7.7",
+      "version": "3.7.8",
       "author": {
         "name": "TwinsEarth"
       },
@@ -27,5 +27,5 @@
       ]
     }
   ],
-  "version": "3.7.7"
+  "version": "3.7.8"
 }

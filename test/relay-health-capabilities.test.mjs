@@ -9,7 +9,7 @@ const fetchReturning = (doc, status = 200) => async () => ({ ok: status >= 200 &
 
 describe('relay health advertises version and features', () => {
   it('healthz carries relay_version and a features array', async () => {
-    const relay = createRelayServer({ logger: null, operatorToken: 'op-token-for-test' });
+    const relay = createRelayServer({ logger: null, operatorToken: 'op-token-for-test', persist: false });
     await relay.listen({ host: '127.0.0.1', port: 0 });
     try {
       const response = await fetch(`${relay.url}/healthz`);

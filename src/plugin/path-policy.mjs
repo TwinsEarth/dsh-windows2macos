@@ -23,12 +23,19 @@ export function canonicalKey(raw, { platform = process.platform } = {}) {
   let text = raw.trim();
   if (text === '' || text.includes('\u0000')) return null;
   const win = isWindows(platform);
+  let unc = false;
   if (win) {
     text = text.replace(/^\\\\[?.]\\UNC\\(.*)$/i, '\\\\$1').replace(/^\\\\[?.]\\(?=[A-Za-z]:)/, '');
     text = text.replace(/\//g, '\\');
+    // A UNC path keeps its leading `\\` marker: without it the server name would look like an
+    // ordinary relative segment, and `inside()` could never match a UNC rule to its children.
+    if (text.startsWith('\\\\')) {
+      unc = true;
+      text = text.slice(2);
+    }
   }
   const segments = [];
-  const drive = win ? /^([A-Za-z]):(.*)$/.exec(text) : null;
+  const drive = win && unc !== true ? /^([A-Za-z]):(.*)$/.exec(text) : null;
   let rest = text;
   if (drive !== null) {
     if (drive[2].startsWith('\\') === false) return null; // C:foo 盘符相对不可判定
@@ -41,13 +48,20 @@ export function canonicalKey(raw, { platform = process.platform } = {}) {
     if (win) segment = segment.replace(/[. ]+$/g, ''); // Win32 去尾点/空格
     if (segment !== '') segments.push(win ? segment.replace(/[A-Z]/g, (c) => c.toLowerCase()) : segment);
   }
-  if (win) return (drive === null ? '' : drive[1].toLowerCase() + ':\\') + segments.join('\\');
+  if (win) {
+    if (unc) return '\\\\' + segments.join('\\');
+    return (drive === null ? '' : drive[1].toLowerCase() + ':\\') + segments.join('\\');
+  }
   return '/' + segments.join('/');
 }
 
 function segmentsOf(key, platform) {
   if (typeof key !== 'string' || key === '') return null;
   if (isWindows(platform)) {
+    const unc = /^\\\\([^\\]+)(?:\\(.*))?$/.exec(key);
+    if (unc !== null) {
+      return ['\\\\' + unc[1], ...(unc[2] === undefined ? [] : unc[2].split('\\').filter(Boolean))];
+    }
     const match = /^([A-Za-z]):\\(.*)$/.exec(key);
     return match === null ? null : [match[1] + ':', ...match[2].split('\\').filter(Boolean)];
   }

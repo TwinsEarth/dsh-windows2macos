@@ -99,6 +99,25 @@ describe('teams data plane', () => {
     assert.equal(pool.sent.every((entry) => entry.peer === 'machine-b'), true);
   });
 
+  it('honors a lower configured attempt count and still alerts once', async () => {
+    const pool = fakePool(() => ({ ok: false, code: 'WEBRTC_SEND_FAILED' }));
+    const alerts = [];
+    const plane = new TeamsDataPlane({
+      pool,
+      dataRetryDelayMs: 0,
+      dataMaxAttempts: 2,
+      onAlert: (notice) => alerts.push(notice),
+      now: () => 1_750_000_000_000,
+    });
+    const result = await plane.sendArtifact({ peer: 'machine-b', bytes: Buffer.from('x') });
+    assert.equal(result.ok, false);
+    assert.equal(result.attempts, 2);
+    assert.equal(result.alert.attempts, 2);
+    assert.equal(alerts.length, 1);
+    assert.equal(pool.sent.length, 2);
+    assert.equal(plane.status().max_attempts, 2);
+  });
+
   it('reports the real attempt count when attempt 33 succeeds', async () => {
     const pool = fakePool((_peer, _payload, index) => {
       return index <= 32 ? { ok: false, code: 'WEBRTC_NOT_READY' } : { ok: true };

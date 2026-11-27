@@ -79,8 +79,8 @@ describe('test/p2p-plugin.test.mjs on a machine it has never met', () => {
         + `running. It left ${leftBehind()} in the identity directory.\n${output}`);
     }
     assert.equal(run.error, undefined, `node itself failed to start: ${String(run.error)}`);
-    assert.match(output, /# pass 2\b/u, `both cases that apply the bundle's config must have run:\n${output}`);
-    assert.match(output, /# fail 0\b/u, `the two cases must pass:\n${output}`);
+    assert.match(output, /pass 2\b/u, `both cases that apply the bundle's config must have run:\n${output}`);
+    assert.match(output, /fail 0\b/u, `the two cases must pass:\n${output}`);
 
     assert.equal(fs.existsSync(identity), false, `the suite wrote the machine's identity directory: ${leftBehind()}`);
     assert.equal(run.signal, null, `the child had to be killed (${String(run.signal)}): something it started was still running`);

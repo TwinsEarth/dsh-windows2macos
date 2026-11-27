@@ -17,7 +17,7 @@ let plan = null;
 let approval = null;
 
 before(async () => {
-  relay = createRelayServer({ logger: null, operatorToken: TOKEN });
+  relay = createRelayServer({ logger: null, operatorToken: TOKEN, persist: false });
   await relay.listen({ host: '127.0.0.1', port: 0 });
   const stateDir = mkdtempSync(join(tmpdir(), 'w2m-joint-relay-'));
   const built = buildPlan({ base_commit: 'a'.repeat(40), steps: [{ step_id: 's1', machine_id: MACHINE, command_argv: ['node', '-v'] }] });

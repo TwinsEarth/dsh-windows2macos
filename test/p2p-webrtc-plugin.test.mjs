@@ -8,7 +8,8 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -149,6 +150,117 @@ describe('dsh-p2p-webrtc wiring', () => {
     assert.equal(failedBody.ok, false);
     assert.equal(failedBody.code, 'WEBRTC_PROVIDER_UNAVAILABLE');
     assert.equal(starts, 2);
+  });
+
+  it('passes an auto-discovered provider into the repair start and reports stages', async () => {
+    const routes = new Map();
+    const ctx = {
+      inject: (_services, callback) => callback({
+        connection: { fetch: { register: (route) => routes.set(route.path, route) } },
+      }),
+    };
+    let overrides = null;
+    let ready = false;
+    const service = {
+      status: () => ({ ok: true, pool: { ready } }),
+      discoverProvider: () => ({
+        ok: true,
+        source: 'auto',
+        provider_command: 'node',
+        provider_args: ['C:\\provider\\node-datachannel-provider.mjs'],
+        provider_cwd: 'C:\\provider',
+      }),
+      start: async (value) => {
+        overrides = value;
+        ready = true;
+        return { ok: true, state: 'pool-ready', pool: { ready: true } };
+      },
+    };
+    assert.equal(registerP2pWebRtcRepairRoute(ctx, service), true);
+    const route = routes.get(P2P_WEBRTC_REPAIR_PATH);
+    const response = await route.fetch({ method: 'POST' });
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.ok, true);
+    assert.equal(body.provider.source, 'auto');
+    assert.deepEqual(overrides, {
+      provider_command: 'node',
+      provider_args: ['C:\\provider\\node-datachannel-provider.mjs'],
+      provider_cwd: 'C:\\provider',
+    });
+    assert.deepEqual(body.stages.map((stage) => stage.name), ['provider', 'pool']);
+  });
+
+  it('refuses repair before start when no installed provider can be found', async () => {
+    const routes = new Map();
+    const ctx = {
+      inject: (_services, callback) => callback({
+        connection: { fetch: { register: (route) => routes.set(route.path, route) } },
+      }),
+    };
+    let starts = 0;
+    const service = {
+      status: () => ({ ok: true, pool: { ready: false } }),
+      discoverProvider: () => ({
+        ok: false,
+        code: 'WEBRTC_PROVIDER_UNAVAILABLE',
+        detail: 'no installed provider',
+        checked: ['C:\\Users\\fangw\\.w2m\\webrtc-provider'],
+      }),
+      start: async () => { starts += 1; return { ok: true, pool: { ready: true } }; },
+    };
+    assert.equal(registerP2pWebRtcRepairRoute(ctx, service), true);
+    const route = routes.get(P2P_WEBRTC_REPAIR_PATH);
+    const response = await route.fetch({ method: 'POST' });
+    assert.equal(response.status, 502);
+    const body = await response.json();
+    assert.equal(body.code, 'WEBRTC_PROVIDER_UNAVAILABLE');
+    assert.deepEqual(body.provider.checked, ['C:\\Users\\fangw\\.w2m\\webrtc-provider']);
+    assert.equal(starts, 0, 'a failed provider probe must not attempt a pool start');
+  });
+
+  it('discovers a standard provider directory when providerCommand is empty', () => {
+    const root = mkdtempSync(join(tmpdir(), 'w2m-provider-test-'));
+    try {
+      const providerDir = join(root, 'webrtc-provider');
+      mkdirSync(join(providerDir, 'node_modules', 'node-datachannel'), { recursive: true });
+      writeFileSync(join(providerDir, 'node-datachannel-provider.mjs'), '// provider\n');
+      const service = new P2PWebRtcService(
+        { provider_command: '', provider_cwd: '', dsh_home: root, pool_factory: null },
+        { providerDirs: [providerDir], env: {} },
+      );
+      const found = service.discoverProvider();
+      assert.equal(found.ok, true);
+      assert.equal(found.source, 'auto');
+      assert.equal(found.provider_cwd, providerDir);
+      assert.equal(found.provider_command, process.execPath, 'auto-discovery must use the host Node binary when it is a Node process');
+      assert.deepEqual(found.provider_args, [join(providerDir, 'node-datachannel-provider.mjs')]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('names a missing provider script instead of starting a doomed pool', () => {
+    const root = mkdtempSync(join(tmpdir(), 'w2m-provider-missing-'));
+    try {
+      const missing = join(root, 'node-datachannel-provider.mjs');
+      const service = new P2PWebRtcService(
+        {
+          provider_command: process.execPath,
+          provider_args: [missing],
+          provider_cwd: root,
+          dsh_home: root,
+          pool_factory: null,
+        },
+        { env: {}, providerDirs: [] },
+      );
+      const found = service.discoverProvider();
+      assert.equal(found.ok, false);
+      assert.equal(found.code, 'WEBRTC_PROVIDER_SCRIPT_MISSING');
+      assert.match(found.detail, /node-datachannel-provider\.mjs/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('ships the patch row disabled, with no guessed identity or provider', () => {

@@ -111,6 +111,13 @@ describe('GPW-V2 risk ladder (pure)', () => {
     assert.equal(classifyGpwV2Call({ name: 'Bash', arguments: { command: 'rm -rf /' }, paths: [], workspace }).level, 'red');
   });
 
+  it('normalises an extended UNC prefix before containment checks', () => {
+    const workspace = '\\\\srv\\share\\project';
+    const inside = '\\\\?\\UNC\\srv\\share\\project\\a.mjs';
+    assert.equal(classifyGpwV2Call({ name: 'Read', paths: [inside], workspace }).level, 'green');
+    assert.equal(classifyGpwV2Call({ name: 'Write', paths: [inside], workspace }).level, 'green');
+  });
+
   it('treats system and credential paths as G3', () => {
     assert.equal(classifyGpwV2Call({ name: 'Read', paths: ['C:\\Windows\\win.ini'] }).level, 'red');
     assert.equal(classifyGpwV2Call({ name: 'Read', paths: ['C:\\Users\\x\\.env'] }).level, 'red');

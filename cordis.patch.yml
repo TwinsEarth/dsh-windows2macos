@@ -112,6 +112,14 @@
         operatorToken: ''
         autoStartAgent: true
         machineName: ''
+        # Empty stateDir = <DSH_HOME>/xclient, the same directory device.json and the ledger use.
+        stateDir: ''
+        # Empty projectDir = the host process cwd; relative task cwd resolves against this root.
+        projectDir: ''
+        # Fleet key is normally resolved from the signed-in account; pin it only for an isolated fleet.
+        fleetKey: ''
+        # home | account | config. 'config' pins fleetKey above; a typo is a startup error.
+        fleetKeyPolicy: home
         allowedCommands: []
         p2pMode: auto
         stunServers: []
@@ -136,7 +144,17 @@
       #   allowLegacyP2P:   true | false            (default false: `auto` never dials old UDP)
       #   prepareTimeoutMs: integer > 0             (default 15000)
       #   handshakeTimeoutMs: integer > 0           (default 10000)
-      config: {}
+      #   ackPollMs:        integer > 0             (default 300; target WebRTC ack poll interval)
+      #   punchAttempts:    integer 1..10           (default 3; P2P 一键打通 retry count)
+      #   punchBackoffMs:   integer 100..10000      (default 700; base retry backoff, grows linearly)
+      config:
+        transport: webrtc
+        allowLegacyP2P: false
+        prepareTimeoutMs: 15000
+        handshakeTimeoutMs: 10000
+        ackPollMs: 300
+        punchAttempts: 3
+        punchBackoffMs: 700
     # GPW-V2: the five-level ladder (绿 G0 / 蓝 G1-1 / 灰 G1-2 / 黄 G2 / 红 G3), active only in
     # 完全权限 + GPW 小白模式. It is a **separate subplugin** and ships `disabled: true`: installing the
     # package must not install a permission gate. Enable it in the plugin manager by flipping this row.
@@ -204,6 +222,10 @@
       name: '@twinsearth/w2m-dsh-plugin/dsh-fix'
       config:
         maxRepairsPerTurn: 3
+        # Empty = <DSH_HOME>/xclient/image-objects, the attachment store the repair reads.
+        objectsRoot: ''
+        # Empty = <DSH_HOME>/xclient/dsh-fix-state.json, the per-session repair counter.
+        statePath: ''
 
     # 备份&还原 (dsh-backup): the scheduled, content-addressed repository engine -- the 22:00 timer (default
     # Asia/Shanghai) and the `POST /api/w2m/backup/run` route the panel calls. The engine keeps sealed/plaintext
@@ -302,10 +324,13 @@
         role: ''
         peerMachineId: ''
         machineId: ''
+        peerId: ''
         peerPublicKey: ''
         peerKeys: {}
         # Empty = <DSH_HOME>/xclient/device.key, beside the agent's device.json. Creation is opt-in.
         deviceKeyDir: ''
+        # Optional explicit key file; takes precedence over deviceKeyDir when set.
+        deviceKeyFile: ''
         allowCreateDeviceKey: false
         # An executable that speaks the JSON-line provider protocol in docs/P2P-WEBRTC.md.
         providerCommand: ''
@@ -313,6 +338,9 @@
         providerCwd: ''
         providerEnv: {}
         iceServers: []
+        # Optional TURN servers, same shape as iceServers; turnPolicy='primary' prefers them.
+        turnServers: []
+        turnPolicy: balanced
         preferP2p: true
         allowRelay: true
         maxRttMs: 350
@@ -320,6 +348,7 @@
         handshakeTimeoutMs: 15000
         peerTimeoutMs: 20000
         statsPollMs: 2000
+        maxFragmentBytes: 16384
         # autoStart is still opt-in even when the row is enabled; mount-time has no process side effects.
         autoStart: false
 
@@ -334,7 +363,7 @@
     #     providerArgs: ['/opt/w2m/webrtc-provider.mjs']
     # - id: dsh-desktop
     #   disabled: false
-    #   config: { transport: 'webrtc', allowLegacyP2P: false, prepareTimeoutMs: 8000, handshakeTimeoutMs: 10000 }
+    #   config: { transport: 'webrtc', allowLegacyP2P: false, prepareTimeoutMs: 8000, handshakeTimeoutMs: 10000, ackPollMs: 300, punchAttempts: 3, punchBackoffMs: 700 }
 
     # P2P V2 文件面 (dsh-p2p-v2): WebTorrent 负责多对多分片，V1 WebRTC 是它的 peer 传输层。
     #
@@ -358,6 +387,11 @@
         # Empty means <stateDir>/downloads. Both share and add are confined to allowedRoots; the
         # defaults are the user home, the project cwd, the OS temp dir and the download root.
         downloadRoot: ''
+        # Workspace root for relative share/add paths. Empty means the host process cwd.
+        projectDir: ''
+        # Only used when allowedRoots is empty: 'default' keeps home + tmp + project + download;
+        # 'strict' narrows to project + download. Defaults stay unchanged.
+        allowedRootsMode: default
         allowedRoots: []
         trackers: []
         allowNativeTrackers: false
@@ -378,7 +412,7 @@
     #
     # 网络分层由插件强制，不由调用方选择：
     #   控制面 / 心跳 / 用户信息 / 计划 / 审批 / 租约 -> Relay TCP（每消息仅 1 次）
-    #   图片 / 文件 / artifact / 数据同步            -> WebRTC DataChannel（同一个 pool，固定最多 33 次，失败即放弃并告警，不回落 Relay）
+    #   图片 / 文件 / artifact / 数据同步            -> WebRTC DataChannel（同一个 pool，默认 33 次、可在 1..33 内调低，硬上限 33，失败即放弃并告警，不回落 Relay）
     # The `dsh-p2p-webrtc` row above builds the shared WebRTC pool; this row consumes it for Teams data:
     # orchestration views plus `w2m_team_artifact` (bytes only, never dispatch).
     # Docs: docs/TEAMS.md.
@@ -394,7 +428,7 @@
         deviceFile: ''
         projectId: 'default'
         staleAfterMs: 90000
-        # Fixed ceiling in code; shown here for operators. Raising this value does not raise the policy.
+        # Bounded retry count: 1..33. Lower it to fail faster; 33 is the hard ceiling and cannot be raised.
         dataMaxAttempts: 33
         dataRetryDelayMs: 1000
         # Reserved: mount never opens a socket, so enabling a row is still an explicit operator act.

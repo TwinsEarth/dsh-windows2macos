@@ -1,11 +1,12 @@
 /**
  * Teams data plane: artifact bytes over the shared WebRTC pool, never the relay.
  *
- * The transport policy owns the number 33. This module owns the bytes: it turns one artifact into
- * bounded JSON frames, hands every frame to `transport-policy.bulk()` (which retries exactly 33
- * times), and writes received frames into the configured artifact sink. If every attempt fails the
- * policy returns `TEAM_DATA_P2P_EXHAUSTED` plus an alert; there is deliberately no call to
- * `sendControl()` and therefore no relay fallback in this path.
+ * The transport policy owns the ceiling (33) and the configured attempt count. This module owns
+ * the bytes: it turns one artifact into bounded JSON frames, hands every frame to
+ * `transport-policy.bulk()` (which retries up to the configured count, never above 33), and writes
+ * received frames into the configured artifact sink. If every attempt fails the policy returns
+ * `TEAM_DATA_P2P_EXHAUSTED` plus an alert; there is deliberately no call to `sendControl()` and
+ * therefore no relay fallback in this path.
  *
  * The pool is injected, not constructed here. That is what makes this the *same* pool the agent's
  * deliver/dispatch paths use: one WebRTC connection per peer pair, not one per subsystem.
@@ -20,7 +21,6 @@ import { deviceFilePath } from '../../agent/identity.mjs';
 import { createRelayPeerKeyResolver, WebRtcTransportPool } from '../../agent/webrtc/pool.mjs';
 import {
   TEAM_DATA_CHANNEL,
-  TEAM_DATA_MAX_ATTEMPTS,
   TEAM_TRANSPORT_CODE,
   createTeamTransportRouter,
 } from './transport-policy.mjs';
@@ -60,7 +60,7 @@ const nonEmpty = (value) => (typeof value === 'string' && value.trim() !== '' ? 
 
 /**
  * @param {{pool: object, stateDir?: string, sink?: object|null, onAlert?: Function,
- *   onEvent?: Function, dataRetryDelayMs?: number, sleep?: Function, now?: Function,
+ *   onEvent?: Function, dataRetryDelayMs?: number, dataMaxAttempts?: number, sleep?: Function, now?: Function,
  *   chunkBytes?: number, ackTimeoutMs?: number}} [options]
  */
 export class TeamsDataPlane {
@@ -102,7 +102,10 @@ export class TeamsDataPlane {
     };
 
     this.router = createTeamTransportRouter({
-      policy: { dataRetryDelayMs: options.dataRetryDelayMs ?? 1000 },
+      policy: {
+        dataRetryDelayMs: options.dataRetryDelayMs ?? 1000,
+        ...(Number.isInteger(options.dataMaxAttempts) ? { dataMaxAttempts: options.dataMaxAttempts } : {}),
+      },
       ...(typeof options.sleep === 'function' ? { sleep: options.sleep } : {}),
       now: this.now,
       sendBulk: (payload) => this._sendFrame(payload),
@@ -125,7 +128,7 @@ export class TeamsDataPlane {
     return {
       channel: TEAM_DATA_CHANNEL,
       transport: 'webrtc-v1',
-      max_attempts: TEAM_DATA_MAX_ATTEMPTS,
+      max_attempts: this.router.policy.data_max_attempts,
       available: this.pool !== null,
       pool: typeof this.pool?.diagnostics === 'function' ? this.pool.diagnostics() : null,
       stats: { ...this.stats },

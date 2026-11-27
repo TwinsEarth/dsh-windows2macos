@@ -274,9 +274,21 @@ export async function bootPage({ url, executable, settleMs = 45_000 }) {
     // registered renders inside a `[data-w2m-surface]` box, and the two DOM-mounted surfaces -- the queue
     // journal's chip/sidebar fallback and the decision inbox badge -- are read by their markers. A disabled
     // row is absent, not greyed. The probe is async, so wait for it (bounded) and give React one render.
-    for (let attempt = 0; attempt < 20; attempt += 1) {
-      if ((await evaluate('window.__W2M_SURFACES__ !== undefined')) === true) break;
-      await new Promise((resolve) => { setTimeout(resolve, 300); });
+    // React commits the surface book one tick after the diagnostics object appears, and the queue
+    // journal chip needs the page's conversation/composer to exist. On a loaded machine 600 ms was
+    // not enough: the chip was present by the queue probe and absent in the earlier surface read.
+    // Wait for a stable render before reading the DOM markers (bounded so a disabled row never hangs).
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      const rendered = await evaluate(`(() => {
+        const d = window.__W2M_SURFACES__;
+        if (d === undefined) return false;
+        const has = (selector) => document.querySelector(selector) !== null;
+        const journalOk = d.available?.journal !== true || has('[data-w2m-jq-chip]') || has('[data-w2m-jq-fallback]');
+        const decisionsOk = d.available?.decisions !== true || has('.w2mDcBadge');
+        return journalOk && decisionsOk;
+      })()`);
+      if (rendered === true) break;
+      await new Promise((resolve) => { setTimeout(resolve, 250); });
     }
     await new Promise((resolve) => { setTimeout(resolve, 600); });
     const surfacesRead = await evaluate(`JSON.stringify((() => {

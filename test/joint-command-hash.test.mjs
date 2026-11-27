@@ -30,7 +30,7 @@ describe('joint command hash matches the relay definition', () => {
   });
 
   it('a real relay accepts a built plan body (no 400 command_hash mismatch)', async () => {
-    const relay = createRelayServer({ logger: null, operatorToken: 'op-token-0123456789abcdef', stateDir: null });
+    const relay = createRelayServer({ logger: null, operatorToken: 'op-token-0123456789abcdef', persist: false });
     await relay.listen({ host: '127.0.0.1', port: 0 });
     open.push(relay);
     const pair = await fetch(`${relay.url}/v1/pair`, {
@@ -63,7 +63,7 @@ describe('joint command hash matches the relay definition', () => {
   });
 
   it('rejects a body whose hash does not match (negative control)', async () => {
-    const relay = createRelayServer({ logger: null, operatorToken: 'op-token-0123456789abcdef', stateDir: null });
+    const relay = createRelayServer({ logger: null, operatorToken: 'op-token-0123456789abcdef', persist: false });
     await relay.listen({ host: '127.0.0.1', port: 0 });
     open.push(relay);
     const response = await fetch(`${relay.url}/v1/task`, {
@@ -87,7 +87,7 @@ describe('cwd_rel normalization', () => {
   });
 
   it('accepts a plan step with a non-default cwd_rel over a real relay', async () => {
-    const relay = createRelayServer({ logger: null, operatorToken: 'op-token-0123456789abcdef', stateDir: null });
+    const relay = createRelayServer({ logger: null, operatorToken: 'op-token-0123456789abcdef', persist: false });
     await relay.listen({ host: '127.0.0.1', port: 0 });
     open.push(relay);
     const pair = await fetch(`${relay.url}/v1/pair`, {

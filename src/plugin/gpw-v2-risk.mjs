@@ -179,7 +179,12 @@ function fold(value) {
 }
 
 function slash(value) {
-  const raw = String(value).replace(/\\/g, '/');
+  let raw = String(value).replace(/\\/g, '/');
+  // Extended-length prefixes are a Win32 alias, not a different volume. Normalize them before
+  // splitting so `\\?\UNC\srv\share` compares equal to `\\srv\share`.
+  if (/^\/\/\?\/UNC\//i.test(raw)) raw = '//' + raw.slice(8);
+  else if (/^\/\/\?\/[A-Za-z]:\//.test(raw)) raw = raw.slice(4);
+  else if (/^\/\/\.\/[A-Za-z]:\//.test(raw)) raw = raw.slice(4);
   const unc = raw.startsWith('//') ? '//' : '';
   const drive = /^[A-Za-z]:/.exec(raw)?.[0] ?? '';
   const absolute = unc !== '' || drive !== '' || raw.startsWith('/');
